@@ -1,18 +1,12 @@
-//! Prefix-cache LRU touch benchmark.
+//! Prefix-cache hit-walk benchmark.
 //!
-//! Reproduces the scenario from the "BlockAllocator LRU order O(n) touch"
-//! perf backlog item: a long shared prefix (e.g. a 4096-token system prompt
-//! at block_size=16 -> 256 blocks) re-touched by every new request that
-//! shares it, while `num_blocks` background entries (other concurrent
-//! requests' cached blocks) occupy the rest of the prefix cache.
+//! A long shared prefix (e.g. a 4096-token system prompt at block_size=16
+//! -> 256 blocks) is re-walked by every new request that shares it, while
+//! `num_blocks` background entries (other concurrent requests' cached
+//! blocks) occupy the rest of the prefix cache. A walk stamps only its tip,
+//! so the per-walk cost should not scale with `num_blocks`.
 //!
-//! Before the fix, `lookup_prefix`'s LRU touch was `VecDeque::retain()` +
-//! `push_back()` -- O(current lru_order length) per touched block, so one
-//! 256-block cache-hit walk costs O(256 * num_blocks). After the fix it's
-//! an O(1)-amortized `LinkedHashSet::insert()` per touched block, so the
-//! per-walk cost should stop scaling with `num_blocks`.
-//!
-//! Run with: cargo bench --package mlx-paged-attn --bench prefix_cache_lru_bench
+//! Run with: cargo bench --package mlx-paged-attn --bench prefix_cache_hit_walk_bench
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use mlx_paged_attn::BlockAllocator;
@@ -24,8 +18,8 @@ const PREFIX_BLOCKS: usize = 256;
 
 /// Build a `BlockAllocator` whose prefix cache holds exactly `num_blocks`
 /// entries: `PREFIX_BLOCKS` of them belonging to one long shared prefix
-/// (registered last, so it's the most-recently-touched segment of LRU
-/// order at the start of the benchmark), and the rest distinct
+/// (registered last, so it holds the newest stamps at the start of the
+/// benchmark), and the rest distinct
 /// single-block "background" prefixes standing in for other concurrent
 /// requests' cached blocks.
 ///
@@ -74,11 +68,11 @@ fn build_populated_allocator(num_blocks: usize) -> (BlockAllocator, Vec<u32>) {
 
 /// Simulates one new request walking in and hitting the full shared
 /// prefix: `find_longest_cache_hit` looks up all `PREFIX_BLOCKS` blocks in
-/// order, LRU-touching every one of them. `num_blocks` (500/2000/8000)
+/// order and stamps only the last. `num_blocks` (500/2000/8000)
 /// stands in for realistic prefix-cache population sizes (bigger
 /// `gpu_memory_mb`, or FP8 cache doubling block count).
 fn shared_prefix_cache_hit_walk(c: &mut Criterion) {
-    let mut group = c.benchmark_group("prefix_cache_lru_touch");
+    let mut group = c.benchmark_group("prefix_cache_hit_walk");
     for &num_blocks in &[500usize, 2000, 8000] {
         let (mut allocator, prefix_tokens) = build_populated_allocator(num_blocks);
         group.bench_with_input(

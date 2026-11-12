@@ -1070,7 +1070,8 @@ impl MuseGlimmerInner {
                 .paged
                 .as_ref()
                 .ok_or_else(|| Error::from_reason("Muse-Glimmer paged runtime is unavailable"))?;
-            rows.iter()
+            let planned = rows
+                .iter()
                 .map(|&(seq_id, _)| {
                     paged
                         .coordinator
@@ -1078,7 +1079,15 @@ impl MuseGlimmerInner {
                         .map(|position| (seq_id, position))
                         .map_err(Error::from_reason)
                 })
-                .collect::<Result<Vec<_>>>()?
+                .collect::<Result<Vec<_>>>()?;
+            let wave: Vec<(SeqId, u32)> = rows.iter().map(|&(seq_id, _)| (seq_id, 1)).collect();
+            paged
+                .coordinator
+                .check_wave_fits_all(&wave)
+                .map_err(|error| {
+                    Error::from_reason(format!("Muse-Glimmer batched token record: {error}"))
+                })?;
+            planned
         };
         let mut recorded = Vec::new();
         for &(seq_id, token) in rows {
@@ -1891,17 +1900,25 @@ mod spec_paged_settle_tests {
 
     /// Real grouped runtime over the tiny config (group 0 full, group 1
     /// sliding — the grouping contract). Returns `None` (skip) without Metal.
-    fn maybe_paged_runtime(config: &MuseGlimmerConfig) -> Option<MusePagedRuntime> {
+    /// The full group's pool is `full_blocks` of max `full_blocks`.
+    fn maybe_paged_runtime_sized(
+        config: &MuseGlimmerConfig,
+        full_blocks: u32,
+    ) -> Option<MusePagedRuntime> {
         let specs = compute_layer_kv_cache_specs(config, BLOCK_SIZE, KVCacheDType::BFloat16)
             .expect("tiny specs must build");
         let groups = compute_layer_kv_cache_groups(config, BLOCK_SIZE, KVCacheDType::BFloat16, 512)
             .expect("tiny groups must build");
         let mut adapters = Vec::with_capacity(groups.len());
         for group in &groups {
+            let blocks = match group.attention_kind {
+                AttentionKind::Full => full_blocks,
+                AttentionKind::SlidingWindow { .. } => 64,
+            };
             let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-                64, 64, BLOCK_SIZE,
+                blocks, blocks, BLOCK_SIZE,
             )));
-            let pool = maybe_test_pool(64)?;
+            let pool = maybe_test_pool(blocks)?;
             let adapter = match group.attention_kind {
                 AttentionKind::Full => PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE),
                 AttentionKind::SlidingWindow { sliding_window } => {
@@ -1933,11 +1950,15 @@ mod spec_paged_settle_tests {
     /// consumes — coordinator, config geometry, checkpoint map — is the
     /// production state.
     pub(super) fn maybe_tiny_inner() -> Option<MuseGlimmerInner> {
+        maybe_tiny_inner_sized(64)
+    }
+
+    fn maybe_tiny_inner_sized(full_blocks: u32) -> Option<MuseGlimmerInner> {
         if !crate::engine::persistence::compiled_forward_backend_available() {
             return None;
         }
         let config = tiny_paged_config();
-        let paged = maybe_paged_runtime(&config)?;
+        let paged = maybe_paged_runtime_sized(&config, full_blocks)?;
         Some(MuseGlimmerInner {
             embed_tokens: Embedding::new(
                 config.text_config.vocab_size as u32,
@@ -2277,6 +2298,79 @@ mod spec_paged_settle_tests {
             "a rejected tap must not record the chunk"
         );
         inner.release_paged_request(seq_id).expect("release");
+    }
+
+    /// At the max pool a batched wave records nothing it cannot cover: the
+    /// full group (3/3) holds rows 1 and 2 at one full block each plus one
+    /// dead cached block, so the wave needs 2 blocks against 1 evictable.
+    /// Mutation: drop the `check_wave_fits_all` call in
+    /// `run_paged_decode_step_batched` → red (row 1 takes the dead block, the
+    /// chain no longer hits, the error says 1 more block).
+    #[test]
+    fn max_pool_wave_records_nothing_it_cannot_cover() {
+        let Some(mut inner) = maybe_tiny_inner_sized(3) else {
+            eprintln!("skipping max_pool_wave_records_nothing_it_cannot_cover: Metal unavailable");
+            return;
+        };
+        let full: Vec<u32> = (0..BLOCK_SIZE).collect();
+        {
+            let coordinator = &mut inner
+                .paged
+                .as_mut()
+                .expect("tiny paged runtime")
+                .coordinator;
+            for seq_id in [1, 2] {
+                coordinator.reset_scheduled_request(seq_id).expect("reset");
+                coordinator
+                    .record_tokens_all(seq_id, &full)
+                    .expect("record");
+            }
+        }
+        let dead: Vec<u32> = (40..40 + BLOCK_SIZE).collect();
+        let allocator = Arc::clone(
+            inner
+                .paged
+                .as_ref()
+                .expect("tiny paged runtime")
+                .coordinator
+                .full_adapter()
+                .allocator(),
+        );
+        {
+            let mut guard = allocator.lock().unwrap();
+            let block = guard.allocate().expect("the third full-group block");
+            guard
+                .cache_full_blocks(&dead, &[Arc::clone(&block)], BLOCK_SIZE, &[], 0)
+                .expect("cache the dead chain");
+            guard.free(block);
+            assert_eq!(guard.num_free_blocks(), 0);
+        }
+
+        let error = match inner.run_paged_decode_step_batched(&[(1, 5), (2, 6)]) {
+            Ok(_) => panic!("the wave needs 2 blocks with 1 evictable"),
+            Err(error) => error.reason,
+        };
+        assert!(
+            error.contains("could not reserve 2 more block"),
+            "got: {error}"
+        );
+        let coordinator = &inner
+            .paged
+            .as_ref()
+            .expect("tiny paged runtime")
+            .coordinator;
+        for seq_id in [1, 2] {
+            assert_eq!(
+                coordinator.request_token_count_all(seq_id).expect("count"),
+                BLOCK_SIZE
+            );
+        }
+        let mut guard = allocator.lock().unwrap();
+        let (hit, _) = guard.find_longest_cache_hit(&dead, BLOCK_SIZE, &[], 0);
+        assert_eq!(hit.len(), 1, "the dead chain must still hit");
+        for block in hit {
+            guard.free(block);
+        }
     }
 
     /// The pure half of the tap contract: strictly ascending decoder indices

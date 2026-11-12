@@ -4,34 +4,43 @@
 //! to sequences on demand. Supports:
 //! - Reference counting for copy-on-write (beam search)
 //! - Prefix caching via content-based hashing
-//! - LRU eviction for cache management
+//! - Leaf-first eviction by one recency clock
 //!
 //! # Prefix-cache reference invariant
 //!
 //! Every entry in `prefix_cache` corresponds to **one logical reference
 //! held by the cache itself**. `register_prefix` increfs on the genuine
-//! insertion path; every cache-removal path (LRU eviction, Case 1
+//! insertion path; every cache-removal path (a take by `allocate`, Case 1
 //! stale-alias displacement, and `free()`'s ref_count→0 cleanup) is
 //! responsible for releasing that reference. Idempotent refresh of an
 //! already-present (block, hash) pair does NOT incref again — the
-//! existing logical reference is preserved across the LRU bump.
+//! existing logical reference is preserved and the stamp is unchanged.
 //!
 //! Consequence: callers do not need to manually `incref` blocks before
 //! registering them — registration itself takes the cache's ref. Once
 //! all external references are released via `free()`, the cache's ref
-//! is what keeps the block alive until LRU eviction (or another
-//! displacement path) decrefs it back to 0 and returns it to the pool.
+//! is what keeps the block alive until a take (or another displacement
+//! path) decrefs it back to 0 and returns it to the pool.
 //!
 //! # Allocation under cache pressure
 //!
-//! When `free_blocks` is empty, `allocate` falls back to evicting the
-//! LRU oldest cache-only block (one whose ref_count is exactly 1 — the
-//! cache's own logical ref, with no live request holding it) to satisfy
-//! the request. This mirrors vLLM's
-//! `vllm/v1/core/block_pool.py:_maybe_evict_cached_block` pattern and
-//! keeps the pool from going monotonically unreachable when many unique
-//! prompts cycle through `register_prefix` + `free()` faster than they
-//! age out by capacity.
+//! When `free_blocks` is empty, `allocate` takes a cache-only block (one
+//! whose ref_count is exactly 1: the cache's own logical ref). Every cached
+//! hash carries a stamp from one [`CacheRecency`] clock. The oldest dead
+//! leaf (a cached block no cached identity names as its parent, and no
+//! state mark protects) goes first, so a chain loses its tail and keeps its
+//! head, as Splash `KvCache::orders` puts only a block with no resident
+//! children and no users in a leaf order. A parent that becomes a leaf
+//! inherits its last child's stamp when nothing holds it (Splash
+//! `KvCache::inherit`).
+//!
+//! mlx-node choice, not in Splash: only when no dead leaf is left does
+//! `allocate` take a pinned interior (a cache-only block whose cached
+//! descendants are all held), deepest first. Splash moves a request onto
+//! the block it finds when it publishes, so it never has one; mlx-node's
+//! verified-duplicate skip keeps the request on its own block and links its
+//! new tail under the found one, and without this fallback such a block
+//! could never be reused.
 //!
 //! # SipHash collision limitation
 //!
@@ -57,13 +66,12 @@
 //! - For deterministic reproducibility across processes, switch to
 //!   xxhash with a fixed seed (vLLM's default).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use hashlink::LinkedHashSet;
-
 use crate::prefix_registry::{PrefixKeys, hash_block};
+use crate::recency::CacheRecency;
 #[cfg(test)]
 use crate::{chain_hashes, chain_hashes_per_block, hash_tokens};
 
@@ -148,18 +156,24 @@ pub struct BlockAllocator {
     /// Reverse mapping: block_id -> hash (for cleanup during free)
     block_hashes: HashMap<u32, u64>,
 
-    /// LRU order for prefix cache eviction (oldest first).
-    ///
-    /// Backed by an intrusive doubly-linked hash set (`hashlink`) rather
-    /// than a `VecDeque` so that "touch" (move-to-back on cache hit) and
-    /// single-entry removal are O(1) amortized instead of an O(n)
-    /// `retain()` over the whole order. Mirrors vLLM's
-    /// `FreeKVCacheBlockQueue` / `BlockPool.touch()` intent, without a
-    /// hand-rolled unsafe intrusive list.
-    lru_order: LinkedHashSet<u64>,
+    /// The clock every stamp comes from. Shared with the owner's other
+    /// caches when built with [`BlockAllocator::with_recency`].
+    recency: Arc<CacheRecency>,
 
-    /// Maximum entries in prefix cache
-    max_prefix_cache_entries: usize,
+    /// Cached hash -> last use.
+    stamps: HashMap<u64, u64>,
+
+    /// `(stamp, hash)` of every cached hash with no `child_count` row. Held
+    /// leaves stay here and are skipped when a take scans.
+    leaves: BTreeSet<(u64, u64)>,
+
+    /// Parent hash -> number of cached identities naming it. A row exists
+    /// only while its count is above 0; a forgotten parent keeps its row
+    /// while cached children still name it.
+    child_count: HashMap<u64, u32>,
+
+    /// Hashes a state needs: their chains are never taken.
+    state_marks: HashSet<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -246,6 +260,21 @@ impl BlockAllocator {
     ///   original fixed-size allocator.
     /// * `block_size` - Number of tokens per block
     pub fn new(num_blocks: u32, max_num_blocks: u32, block_size: u32) -> Self {
+        Self::with_recency(
+            num_blocks,
+            max_num_blocks,
+            block_size,
+            Arc::new(CacheRecency::new()),
+        )
+    }
+
+    /// [`Self::new`] on a clock the caller shares with its other caches.
+    pub fn with_recency(
+        num_blocks: u32,
+        max_num_blocks: u32,
+        block_size: u32,
+        recency: Arc<CacheRecency>,
+    ) -> Self {
         assert!(
             max_num_blocks >= num_blocks,
             "BlockAllocator::new: max_num_blocks ({max_num_blocks}) must be >= num_blocks \
@@ -262,118 +291,286 @@ impl BlockAllocator {
             prefix_cache: HashMap::new(),
             prefix_cache_identities: HashMap::new(),
             block_hashes: HashMap::new(),
-            lru_order: LinkedHashSet::new(),
-            // Scale the prefix-cache capacity to `num_blocks` so the cache
-            // can accommodate the full live block set. `num_blocks` is the
-            // natural upper bound — no more than that many blocks can ever
-            // be live, so this can't cause additional eviction beyond what
-            // `try_evict_lru_for_allocation` already performs on
-            // physical-pool exhaustion. Per-instance overrides remain
-            // available via `set_max_prefix_cache_entries`.
-            max_prefix_cache_entries: num_blocks as usize,
+            recency,
+            stamps: HashMap::new(),
+            leaves: BTreeSet::new(),
+            child_count: HashMap::new(),
+            state_marks: HashSet::new(),
         }
     }
 
-    /// Allocate a new block.
-    ///
-    /// Pops from `free_blocks` first. If the free pool is empty, falls
-    /// back to evicting the LRU oldest cache-only block (see
-    /// `try_evict_lru_for_allocation`). Returns None only when neither
-    /// path can produce a block (free pool empty AND every cached entry
-    /// is in-use by a live request).
+    /// The clock this allocator stamps with.
+    pub fn recency(&self) -> Arc<CacheRecency> {
+        Arc::clone(&self.recency)
+    }
+
+    fn ref_count_of(&self, hash: u64) -> Option<u32> {
+        self.prefix_cache
+            .get(&hash)
+            .map(|block| block.get_ref_count())
+    }
+
+    /// Give `hash` a stamp from the clock and re-key its leaf entry.
+    fn touch(&mut self, hash: u64) {
+        let stamp = self.recency.next();
+        self.set_stamp(hash, stamp);
+    }
+
+    fn set_stamp(&mut self, hash: u64, stamp: u64) {
+        let old = self.stamps.insert(hash, stamp);
+        if let Some(old) = old
+            && self.leaves.remove(&(old, hash))
+        {
+            self.leaves.insert((stamp, hash));
+        }
+    }
+
+    /// Drop one cached identity naming `parent`. At 0 the row goes, and a
+    /// cached parent becomes a leaf; one nothing holds takes the child's
+    /// stamp when that is newer.
+    fn unlink_child(&mut self, parent: u64, child_stamp: Option<u64>) {
+        let Some(count) = self.child_count.get_mut(&parent) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count > 0 {
+            return;
+        }
+        self.child_count.remove(&parent);
+        let Some(ref_count) = self.ref_count_of(parent) else {
+            return;
+        };
+        let own = self.stamps.get(&parent).copied().unwrap_or(0);
+        let stamp = match child_stamp {
+            Some(child) if ref_count == 1 => own.max(child),
+            _ => own,
+        };
+        self.stamps.insert(parent, stamp);
+        self.leaves.insert((stamp, parent));
+    }
+
+    fn link_child(&mut self, parent: u64) {
+        let count = self.child_count.entry(parent).or_insert(0);
+        *count += 1;
+        if *count == 1
+            && let Some(&stamp) = self.stamps.get(&parent)
+        {
+            self.leaves.remove(&(stamp, parent));
+        }
+    }
+
+    /// Drop `hash`'s identity and unlink it from its parent.
+    fn drop_identity(&mut self, hash: u64, stamp: Option<u64>) {
+        if let Some(identity) = self.prefix_cache_identities.remove(&hash)
+            && identity.parent_hash != 0
+        {
+            self.unlink_child(identity.parent_hash, stamp);
+        }
+    }
+
+    /// The one remover of a cached hash's bookkeeping. It leaves the
+    /// block's ref count and `allocated` to the caller.
+    fn forget(&mut self, hash: u64) -> Option<Arc<PhysicalBlock>> {
+        let block = self.prefix_cache.remove(&hash);
+        if let Some(block) = &block
+            && self.block_hashes.get(&block.block_id) == Some(&hash)
+        {
+            self.block_hashes.remove(&block.block_id);
+        }
+        let stamp = self.stamps.remove(&hash);
+        if let Some(stamp) = stamp {
+            self.leaves.remove(&(stamp, hash));
+        }
+        self.drop_identity(hash, stamp);
+        block
+    }
+
+    /// Marks and every cached ancestor of a mark.
+    fn marked_closure(&self) -> HashSet<u64> {
+        let mut closure = HashSet::with_capacity(self.state_marks.len());
+        for &mark in &self.state_marks {
+            let mut hash = mark;
+            while closure.insert(hash) {
+                let Some(identity) = self.prefix_cache_identities.get(&hash) else {
+                    break;
+                };
+                let parent = identity.parent_hash;
+                if parent == 0 || !self.prefix_cache.contains_key(&parent) {
+                    break;
+                }
+                hash = parent;
+            }
+        }
+        closure
+    }
+
+    /// The oldest cached leaf nothing holds and no mark protects.
+    fn oldest_dead_leaf(&self) -> Option<u64> {
+        self.leaves
+            .iter()
+            .map(|&(_, hash)| hash)
+            .find(|hash| !self.state_marks.contains(hash) && self.ref_count_of(*hash) == Some(1))
+    }
+
+    /// The deepest cache-only block that still has cached children (all of
+    /// them held), outside every marked chain; the oldest stamp breaks a tie.
+    /// mlx-node choice (see the module doc): Splash takes no interior.
+    fn deepest_pinned_interior(&self) -> Option<u64> {
+        let closure = self.marked_closure();
+        self.prefix_cache
+            .iter()
+            .filter(|(hash, block)| {
+                block.get_ref_count() == 1
+                    && self.child_count.contains_key(hash)
+                    && !closure.contains(hash)
+            })
+            .map(|(&hash, _)| {
+                let depth = self
+                    .prefix_cache_identities
+                    .get(&hash)
+                    .map_or(0, |identity| identity.block_index);
+                let stamp = self.stamps.get(&hash).copied().unwrap_or(0);
+                (
+                    depth,
+                    std::cmp::Reverse(stamp),
+                    std::cmp::Reverse(hash),
+                    hash,
+                )
+            })
+            .max()
+            .map(|(_, _, _, hash)| hash)
+    }
+
+    /// Release the cache's ref on a cache-only `hash` and return its id,
+    /// which leaves `allocated`.
+    fn take_cached(&mut self, hash: u64) -> Option<u32> {
+        let block = self.forget(hash)?;
+        let block_id = block.block_id;
+        let _ = block.decref();
+        self.allocated.remove(&block_id);
+        Some(block_id)
+    }
+
+    /// Allocate a new block: a free id first, else the oldest dead leaf,
+    /// else the deepest pinned interior (an mlx-node choice, see the module
+    /// doc). `None` when none exists.
     pub fn allocate(&mut self) -> Option<Arc<PhysicalBlock>> {
         let block_id = if let Some(id) = self.free_blocks.pop_front() {
             id
+        } else if let Some(hash) = self.oldest_dead_leaf() {
+            self.take_cached(hash)?
         } else {
-            self.try_evict_lru_for_allocation()?
+            let hash = self.deepest_pinned_interior()?;
+            self.take_cached(hash)?
         };
         let block = Arc::new(PhysicalBlock::new(block_id));
         self.allocated.insert(block_id, Arc::clone(&block));
         Some(block)
     }
 
-    /// Attempt to evict the LRU oldest cache-only block to make room for a
-    /// new allocation. Returns the freed `block_id` if successful.
-    ///
-    /// "Cache-only" means the block's `ref_count` is exactly 1 (the
-    /// cache's own logical ref — no request handle is alive on the
-    /// block). If the LRU oldest entry has `ref_count > 1` it's still
-    /// in use by a request, so it can't be evicted; we walk forward
-    /// through `lru_order` looking for the first cache-only candidate.
-    /// If NO entry is cache-only, returns None.
-    ///
-    /// Mirrors vLLM `vllm/v1/core/block_pool.py:_maybe_evict_cached_block`.
-    ///
-    /// Side effects on success: the chosen entry is removed from
-    /// `prefix_cache`, `block_hashes`, `lru_order`, AND `allocated`. Its
-    /// ref_count is decremented from 1 → 0 (releasing the cache's
-    /// logical ref). The block_id is NOT pushed onto `free_blocks` —
-    /// `allocate` will reuse it directly via the returned id.
-    fn try_evict_lru_for_allocation(&mut self) -> Option<u32> {
-        // Scan the LRU order oldest-first for the first cache-only entry.
-        // Unlike the old approach (cloning the ENTIRE `lru_order` into a
-        // fresh `Vec` on every call), this only visits entries up to the
-        // match and remembers a single `u64` — no whole-list allocation.
-        // The scan itself still has to walk past any entries that are
-        // in-use (ref_count > 1); that's inherent to "oldest cache-only
-        // wins" eviction, not an artifact of the container type.
-        let mut evict_hash = None;
-        for &hash in self.lru_order.iter() {
-            match self.prefix_cache.get(&hash) {
-                Some(block) if block.get_ref_count() == 1 => {
-                    evict_hash = Some(hash);
-                    break;
+    /// Allocate `n` blocks or none. At every pool size nothing is taken
+    /// unless free plus evictable blocks cover `n` (`Err(0)`), as Splash
+    /// `MemoryLedger::free` counts with `bound` and calls `take` only when
+    /// the count covers the need. Blocks the pool has not grown yet do not
+    /// count: the caller grows the pool first, as Splash
+    /// `KvPool::takeFreePages` grows an extent before the claim reaches the
+    /// ledger.
+    pub fn reserve(&mut self, n: u32) -> Result<Vec<Arc<PhysicalBlock>>, u32> {
+        if !self.can_allocate(n) {
+            return Err(0);
+        }
+        let mut taken = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            match self.allocate() {
+                Some(block) => taken.push(block),
+                None => {
+                    let count = taken.len() as u32;
+                    for block in taken {
+                        self.free(block);
+                    }
+                    return Err(count);
                 }
-                // ref_count > 1: in use by a live request — keep scanning.
-                // None: desync (shouldn't happen, but defensive) — keep scanning.
-                _ => continue,
             }
         }
-        let hash = evict_hash?;
+        Ok(taken)
+    }
 
-        // Re-borrow now that the scan's immutable borrow of `lru_order` has
-        // ended, so we're free to mutate `prefix_cache` / `lru_order` below.
-        // The hash was found during the scan above and no mutation happened
-        // in between, so this is `Some`; a desynced cache simply declines the
-        // eviction rather than panicking.
-        let block = self.prefix_cache.get(&hash)?;
-        let block_id = block.block_id;
-        // Release the cache's logical ref (1 → 0).
-        let _ = block.decref();
-        // Remove all bookkeeping for this entry.
-        self.prefix_cache.remove(&hash);
-        self.prefix_cache_identities.remove(&hash);
-        self.block_hashes.remove(&block_id);
-        self.lru_order.remove(&hash);
-        self.allocated.remove(&block_id);
+    /// Evict the oldest dead leaf and put its id back in the free queue.
+    pub fn evict_oldest_dead_leaf(&mut self) -> Option<u32> {
+        let hash = self.oldest_dead_leaf()?;
+        let block_id = self.take_cached(hash)?;
+        self.free_blocks.push_back(block_id);
         Some(block_id)
+    }
+
+    /// Replace the set of hashes a state needs.
+    pub fn set_state_marks(&mut self, hashes: impl IntoIterator<Item = u64>) {
+        self.state_marks = hashes.into_iter().collect();
+    }
+
+    /// The oldest marked leaf nothing holds, as `(stamp, hash)`.
+    pub fn oldest_marked_leaf(&self) -> Option<(u64, u64)> {
+        self.leaves.iter().copied().find(|(_, hash)| {
+            self.state_marks.contains(hash) && self.ref_count_of(*hash) == Some(1)
+        })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn block_stamp(&self, hash: u64) -> Option<u64> {
+        self.stamps.get(&hash).copied()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn child_count_rows(&self) -> usize {
+        self.child_count.len()
     }
 
     /// Free a block
     ///
     /// The block is only returned to the free pool if its ref_count reaches 0
     pub fn free(&mut self, block: Arc<PhysicalBlock>) {
+        self.free_at(block, None);
+    }
+
+    /// [`Self::free`] for a block whose last use was at `at`. A cached leaf
+    /// left with only the cache's ref is stamped `max(own, at)`, or with a
+    /// fresh stamp when `at` is `None`.
+    pub fn free_at(&mut self, block: Arc<PhysicalBlock>, at: Option<u64>) {
         let block_id = block.block_id;
-
-        // Decrement ref count
         if block.decref() {
-            // Ref count reached 0, return to free pool
             self.allocated.remove(&block_id);
-
-            // Remove from prefix cache if present
-            if let Some(hash) = self.block_hashes.remove(&block_id) {
-                self.prefix_cache.remove(&hash);
-                self.prefix_cache_identities.remove(&hash);
-                self.lru_order.retain(|&h| h != hash);
+            if let Some(&hash) = self.block_hashes.get(&block_id) {
+                self.forget(hash);
+                self.block_hashes.remove(&block_id);
             }
-
             self.free_blocks.push_back(block_id);
+            return;
         }
+        if block.get_ref_count() != 1 {
+            return;
+        }
+        let Some(&hash) = self.block_hashes.get(&block_id) else {
+            return;
+        };
+        if self.child_count.contains_key(&hash)
+            || self
+                .prefix_cache
+                .get(&hash)
+                .is_none_or(|cached| cached.block_id != block_id)
+        {
+            return;
+        }
+        let stamp = match at {
+            None => self.recency.next(),
+            Some(at) => self.stamps.get(&hash).copied().unwrap_or(0).max(at),
+        };
+        self.set_stamp(hash, stamp);
     }
 
     /// Evict EVERY prefix-cache entry, releasing the cache's logical
-    /// reference on each block (the same per-entry cleanup the capacity
-    /// eviction loop in [`Self::register_prefix`] performs). Blocks whose
+    /// reference on each block. Blocks whose
     /// `ref_count` drops to 0 are removed from `allocated` and returned to
     /// the free pool; blocks still held by a live request stay allocated
     /// but are no longer discoverable via `lookup_prefix` /
@@ -388,8 +585,11 @@ impl BlockAllocator {
     /// and can flip a greedy near-tie (observed on LFM2). Purging restores
     /// the documented "fully cold state" contract.
     pub fn purge_prefix_cache(&mut self) {
-        self.lru_order.clear();
         self.prefix_cache_identities.clear();
+        self.stamps.clear();
+        self.leaves.clear();
+        self.child_count.clear();
+        self.state_marks.clear();
         // `block_hashes` only carries reverse mappings for live
         // prefix-cache entries (the register/free invariants), so it
         // empties exactly when the cache does.
@@ -411,13 +611,11 @@ impl BlockAllocator {
     ///
     /// The `prefix_cache` holds **one logical reference per entry** (see
     /// the module-level invariant). `register_prefix` is the function that
-    /// takes that reference on the genuine-insert path; every removal path
-    /// in this method (Case 1 stale-alias displacement, capacity eviction
-    /// loop) is responsible for releasing it via `decref()`, returning the
-    /// block to the free pool if the count hits zero.
+    /// takes that reference on the genuine-insert path; the stale-alias
+    /// displacement below releases the old alias's reference via `decref()`.
     ///
-    /// Idempotent refresh (same block, same hash) does NOT incref — the
-    /// existing logical reference is reused across the LRU bump.
+    /// Idempotent refresh (same block, same hash) does NOT incref and does
+    /// not stamp: the block was committed already.
     ///
     /// # Aliasing policy & precedence
     ///
@@ -437,49 +635,27 @@ impl BlockAllocator {
     ///
     /// 2. **Stale-alias eviction — same block, different hash** (e.g. same
     ///    tokens cached under different `extra_keys`): the OLD hash is
-    ///    evicted from `prefix_cache` and `lru_order` before inserting the
-    ///    new alias. Otherwise the stale entry would survive `free()` and
-    ///    could hand out a returned-to-pool block on a future
-    ///    `lookup_prefix` — bypassing `extra_keys` isolation. The cache's
-    ///    logical reference for the OLD hash is released here (decref); the
-    ///    new alias takes a fresh ref via Step 4 below — net change in
-    ///    ref_count for this block is zero (one ref consumed for the old
-    ///    hash, one ref taken for the new hash; the same block stays in
-    ///    the cache, just under a different key).
+    ///    forgotten before inserting the new alias. Otherwise the stale
+    ///    entry would survive `free()` and could hand out a returned-to-pool
+    ///    block on a future `lookup_prefix` — bypassing `extra_keys`
+    ///    isolation. The cache's logical reference for the OLD hash is
+    ///    released here (decref); the new alias takes a fresh ref in step 3
+    ///    — net change in ref_count for this block is zero.
     ///
-    /// 3. **Capacity eviction — only on genuine insertion**: the LRU eviction
-    ///    loop runs only when we're about to ADD a new hash entry. A
-    ///    refresh of an already-present hash doesn't grow the cache, so
-    ///    skipping the loop in that case avoids evicting unrelated entries
-    ///    under capacity pressure. Each evicted entry releases the cache's
-    ///    logical reference (decref); if that drops the block to ref_count
-    ///    0 (no other holder), the block is removed from `allocated` and
-    ///    pushed back onto `free_blocks` — same cleanup `free()` performs.
-    ///
-    /// 4. **LRU refresh + insert**: bump the hash to the back of `lru_order`
-    ///    and (re)insert into `prefix_cache` / `block_hashes`. Incref iff
-    ///    this is a genuine new insertion (idempotent refresh skips the
-    ///    incref so the cache holds at most ONE logical reference per
-    ///    entry).
+    /// 3. **Insert**: (re)insert into `prefix_cache` / `block_hashes`. A
+    ///    genuine new insertion increfs, takes a fresh stamp, and enters the
+    ///    leaf set unless cached children already name the hash.
     ///
     /// # Return value
     ///
     /// Returns `true` when the registration was accepted — i.e. the
     /// passed-in `block` is now authoritative for `hash` in the prefix
-    /// cache. Specifically:
+    /// cache: a genuine insertion, an idempotent refresh, or a stale-alias
+    /// displacement.
     ///
-    /// - Genuine insertion (capacity-eviction path): `true`.
-    /// - Idempotent refresh (same `block`, same `hash`): `true` — the
-    ///   block was already authoritative; we just refreshed LRU.
-    /// - Case 1 stale-alias displacement (same `block`, different `hash`):
-    ///   `true` — old hash entry was released, new alias installed.
-    ///
-    /// Returns `false` only when the registration was rejected and the
-    /// caller's `block` was NOT inserted:
-    ///
-    /// - Cache disabled (`max_prefix_cache_entries == 0`).
-    /// - Case 2 hash collision (same `hash`, different `block`): the
-    ///   pre-existing entry stays authoritative.
+    /// Returns `false` only on a Case 2 hash collision (same `hash`,
+    /// different `block`): the pre-existing entry stays authoritative and
+    /// the caller's `block` was NOT inserted.
     ///
     /// Callers that walk a hash chain (notably `cache_full_blocks`) MUST
     /// abort on `false`: a chain block whose registration was dropped
@@ -487,130 +663,49 @@ impl BlockAllocator {
     /// producing a future `find_longest_cache_hit` return that mixes
     /// blocks across registration intents (silent KV corruption).
     pub(crate) fn register_prefix(&mut self, block: Arc<PhysicalBlock>, hash: u64) -> bool {
-        // If prefix caching is disabled (max_prefix_cache_entries == 0), do nothing
-        if self.max_prefix_cache_entries == 0 {
-            return false;
-        }
-
-        // Step 1 (collision drop, FIRST): this hash is already mapped to a
-        // DIFFERENT block. Reject the new registration as a true no-op —
-        // don't touch the incoming block's prior alias (if any), don't
-        // shuffle LRU, don't take the cache's ref (nothing was inserted).
-        // The existing entry stays authoritative.
-        // (Same block + same hash falls through to the LRU refresh below;
-        // no eviction needed since the entry is already correct.)
         if let Some(existing_block) = self.prefix_cache.get(&hash)
             && existing_block.block_id != block.block_id
         {
             return false;
         }
 
-        // Step 2 (stale-alias eviction): this block_id is already registered
-        // under a DIFFERENT hash. Evict the stale alias before installing the
-        // new one — otherwise the old prefix_cache entry would survive free()
-        // and could leak across extra_keys boundaries. (block_hashes will be
-        // overwritten below, no need to remove first.) Release the cache's
-        // logical reference for the OLD hash; the new alias takes its own
-        // ref in Step 4. The block survives this swap because at least one
-        // of {external request handle, cache's ref about to be retaken} keeps
+        // The block survives this swap because at least one of {external
+        // request handle, cache's ref about to be retaken} keeps
         // ref_count >= 1.
         if let Some(&existing_hash) = self.block_hashes.get(&block.block_id)
             && existing_hash != hash
+            && self.forget(existing_hash).is_some()
         {
-            if self.prefix_cache.remove(&existing_hash).is_some() {
-                self.prefix_cache_identities.remove(&existing_hash);
-                // Decref the cache's logical reference for the old alias.
-                // We deliberately ignore a true return here: callers that
-                // re-register a block they still hold (the common case)
-                // keep ref_count >= 1, and Step 4 below restores the
-                // cache's ref under the new hash. If a caller somehow ends
-                // up re-registering a block they no longer hold, ref_count
-                // could hit 0 — but that block is about to be re-inserted
-                // under the new hash anyway, so leaving it in `allocated`
-                // is safe and avoids a free→re-allocate flap.
-                let _ = block.decref();
-            }
-            self.lru_order.remove(&existing_hash);
+            let _ = block.decref();
         }
 
-        // Step 3 (capacity eviction, only on genuine insertion): if this
-        // call is a refresh of an already-present hash it won't grow the
-        // cache, so skip the eviction loop. Otherwise evict oldest entries
-        // until we have room for the new insertion. Each eviction releases
-        // the cache's logical reference for that block; if no external
-        // holder remains (ref_count hits 0), the block is fully reclaimed.
         let is_new_insertion = !self.prefix_cache.contains_key(&hash);
-        if is_new_insertion {
-            while self.prefix_cache.len() >= self.max_prefix_cache_entries {
-                match self.lru_order.pop_front() {
-                    Some(old_hash) => {
-                        // Remove evicted entry from both side tables, then
-                        // release the cache's logical reference. If that
-                        // drops ref_count to 0 the block goes back to the
-                        // free pool — same cleanup `free()` performs.
-                        if let Some(evicted_block) = self.prefix_cache.remove(&old_hash) {
-                            self.prefix_cache_identities.remove(&old_hash);
-                            let evicted_id = evicted_block.block_id;
-                            self.block_hashes.remove(&evicted_id);
-                            if evicted_block.decref() {
-                                self.allocated.remove(&evicted_id);
-                                self.free_blocks.push_back(evicted_id);
-                            }
-                        }
-                    }
-                    None => {
-                        // Safety: If lru_order is empty but cache still has entries,
-                        // this indicates a bug (desynchronization). Break to avoid infinite loop.
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Step 4: LRU refresh (move to back if present, insert if not) +
-        // insert into `prefix_cache`. Take the cache's logical reference
-        // iff this is a genuine new insertion. An idempotent refresh leaves
-        // ref_count unchanged so the cache continues to hold exactly ONE
-        // logical ref per entry. `LinkedHashSet::insert` is an O(1)
-        // amortized move-to-back when `hash` is already present, replacing
-        // the old O(n) retain()+push_back() pair.
-        self.lru_order.insert(hash);
-
-        // Track the hash for this block (for cleanup during free)
         self.block_hashes.insert(block.block_id, hash);
-
         if is_new_insertion {
             // Direct register_prefix callers do not provide enough
             // identity material to verify future duplicate-hash attempts.
             // cache_full_blocks repopulates this immediately after a
             // successful insertion.
-            self.prefix_cache_identities.remove(&hash);
+            self.drop_identity(hash, None);
             block.incref();
+            let stamp = self.recency.next();
+            self.stamps.insert(hash, stamp);
+            if !self.child_count.contains_key(&hash) {
+                self.leaves.insert((stamp, hash));
+            }
         }
-
-        // Insert into cache
         self.prefix_cache.insert(hash, block);
         true
     }
 
     /// Look up a block in the prefix cache
     ///
-    /// Returns the cached block if found, incrementing its ref count
+    /// Returns the cached block if found, incrementing its ref count. It
+    /// stamps nothing: a walk stamps its tip once.
     pub(crate) fn lookup_prefix(&mut self, hash: u64) -> Option<Arc<PhysicalBlock>> {
-        if let Some(block) = self.prefix_cache.get(&hash) {
-            // Update LRU order: O(1) amortized move-to-back (insert is a
-            // no-op re-link when `hash` is already present), replacing the
-            // old O(n) retain()+push_back() pair. This runs once per
-            // matched block on every prefix-cache hit, so it's the hottest
-            // of the four LRU-touch sites in this file.
-            self.lru_order.insert(hash);
-
-            // Increment ref count and return
-            block.incref();
-            Some(Arc::clone(block))
-        } else {
-            None
-        }
+        let block = self.prefix_cache.get(&hash)?;
+        block.incref();
+        Some(Arc::clone(block))
     }
 
     fn prefix_identity_matches(
@@ -654,7 +749,7 @@ impl BlockAllocator {
         cache_salt: u64,
         block_index: usize,
     ) {
-        self.prefix_cache_identities.insert(
+        let old = self.prefix_cache_identities.insert(
             hash,
             PrefixCacheBlockIdentity::new(
                 token_ids,
@@ -664,6 +759,18 @@ impl BlockAllocator {
                 block_index,
             ),
         );
+        let had_identity = old.is_some();
+        let old_parent = old.map_or(0, |identity| identity.parent_hash);
+        if had_identity && old_parent == parent_hash {
+            return;
+        }
+        if old_parent != 0 {
+            let stamp = self.stamps.get(&hash).copied();
+            self.unlink_child(old_parent, stamp);
+        }
+        if parent_hash != 0 {
+            self.link_child(parent_hash);
+        }
     }
 
     /// Walk a token sequence in `block_size`-aligned chunks, looking up each
@@ -782,6 +889,12 @@ impl BlockAllocator {
                 Some(block) => blocks.push(block),
                 None => break,
             }
+        }
+        // A hit is Splash `Cache::lookup` (`KvCache::touch` on the tip) and
+        // the attach after it (`KvCache::retainActive` on the chain's last
+        // block only): ancestors keep their stamps.
+        if let Some(&tip) = blocks.len().checked_sub(1).and_then(|n| hashes.get(n)) {
+            self.touch(tip);
         }
         let cached_tokens = blocks.len() * block_size_us;
         (blocks, cached_tokens)
@@ -940,11 +1053,13 @@ impl BlockAllocator {
                     // different physical block. This happens after a cold
                     // prefill recomputes an existing prefix: skip the
                     // duplicate leading block but keep walking so the new
-                    // tail can be published.
+                    // tail can be published. The found block is committed
+                    // again, so it is stamped.
+                    self.touch(block_hash);
                     previous_block_hash = block_hash;
                     continue;
                 } else {
-                    // Chain broke (collision drop or cache disabled). Stop
+                    // Chain broke (collision drop). Stop
                     // here: any further block we register would chain off a
                     // hash that resolves to someone else's block, which
                     // corrupts future find_longest_cache_hit walks. Return
@@ -1000,11 +1115,8 @@ impl BlockAllocator {
     ///
     /// The new ids (`old_num_blocks..new_num_blocks`) are pushed onto the
     /// back of the free queue, behind any previously freed ids; existing
-    /// allocations, prefix-cache entries, and LRU order are untouched.
-    /// `num_blocks` bumps to the new total and `max_prefix_cache_entries`
-    /// is rescaled with the same formula the constructor uses
-    /// (`num_blocks`), which discards any
-    /// [`Self::set_max_prefix_cache_entries`] override.
+    /// allocations, prefix-cache entries, and stamps are untouched.
+    /// `num_blocks` bumps to the new total.
     ///
     /// The caller must have already grown the backing `LayerKVPool` to cover
     /// the new id range (the allocator owns no GPU memory) — the adapter
@@ -1020,7 +1132,6 @@ impl BlockAllocator {
         let added = target - self.num_blocks;
         self.free_blocks.extend(self.num_blocks..target);
         self.num_blocks = target;
-        self.max_prefix_cache_entries = self.num_blocks as usize;
         added
     }
 
@@ -1114,8 +1225,8 @@ impl BlockAllocator {
 
     /// Apply a [`Self::shrink_plan`] after the pool copied every moved
     /// block: each moved entry keeps its hash under its new id, ids at or
-    /// above the cut leave the free queue, and `num_blocks` (with the
-    /// prefix-cache capacity, as [`Self::grow_by`] sets it) becomes the cut.
+    /// above the cut leave the free queue, and `num_blocks` becomes the cut.
+    /// Stamps, child rows and marks are keyed by hash, so they stay.
     /// Checks the whole plan first; on `Err` nothing changed.
     pub fn apply_shrink(&mut self, plan: &ShrinkPlan) -> Result<(), &'static str> {
         let cut = plan.num_blocks;
@@ -1154,36 +1265,7 @@ impl BlockAllocator {
         self.free_blocks
             .retain(|&id| id < cut && !taken.contains(&id));
         self.num_blocks = cut;
-        self.max_prefix_cache_entries = cut as usize;
         Ok(())
-    }
-
-    /// Evict the oldest cache-only prefix entry no other cached entry names
-    /// as its parent, so a chain loses its tail and keeps its head. Its id
-    /// goes back to the free queue. `None` when no such entry exists.
-    pub fn evict_oldest_cache_only_leaf(&mut self) -> Option<u32> {
-        let parents: HashSet<u64> = self
-            .prefix_cache_identities
-            .values()
-            .map(|identity| identity.parent_hash)
-            .collect();
-        let hash = self.lru_order.iter().copied().find(|hash| {
-            !parents.contains(hash)
-                && self
-                    .prefix_cache
-                    .get(hash)
-                    .is_some_and(|block| block.get_ref_count() == 1)
-        })?;
-        let block = self.prefix_cache.remove(&hash)?;
-        let block_id = block.block_id;
-        self.prefix_cache_identities.remove(&hash);
-        self.block_hashes.remove(&block_id);
-        self.lru_order.remove(&hash);
-        if block.decref() {
-            self.allocated.remove(&block_id);
-            self.free_blocks.push_back(block_id);
-        }
-        Some(block_id)
     }
 
     /// Get the block size
@@ -1191,13 +1273,8 @@ impl BlockAllocator {
         self.block_size
     }
 
-    /// Check if we can allocate the requested number of blocks.
-    ///
-    /// Counts both genuinely-free blocks AND evictable cache-only
-    /// blocks (ref_count == 1) — the same set `allocate` can draw from
-    /// via `try_evict_lru_for_allocation`. Without this, schedulers that
-    /// guard `allocate` with `can_allocate` would refuse work that the
-    /// allocator could in fact satisfy.
+    /// Check if we can allocate the requested number of blocks: free blocks
+    /// plus the cache-only blocks [`Self::allocate`] may take.
     pub fn can_allocate(&self, num_blocks: u32) -> bool {
         let free = self.num_free_blocks();
         if free >= num_blocks {
@@ -1207,10 +1284,22 @@ impl BlockAllocator {
         free + evictable >= num_blocks
     }
 
-    /// Cache-only blocks that admission may reclaim without touching a live
-    /// request. Active request blocks have refcount greater than one and are
-    /// deliberately excluded.
+    /// Cache-only blocks [`Self::allocate`] may take: every ref-1 cached
+    /// block outside a marked chain. Active request blocks have refcount
+    /// greater than one and are deliberately excluded.
     pub fn num_evictable_blocks(&self) -> u32 {
+        if self.state_marks.is_empty() {
+            return self.num_reusable_blocks();
+        }
+        let closure = self.marked_closure();
+        self.prefix_cache
+            .iter()
+            .filter(|(hash, block)| block.get_ref_count() == 1 && !closure.contains(hash))
+            .count() as u32
+    }
+
+    /// Every cache-only block, marked chains included.
+    pub fn num_reusable_blocks(&self) -> u32 {
         self.prefix_cache
             .values()
             .filter(|block| block.get_ref_count() == 1)
@@ -1218,22 +1307,11 @@ impl BlockAllocator {
     }
 
     /// Total blocks [`Self::allocate`] could currently hand out: genuinely
-    /// free blocks plus evictable cache-only prefix entries (the set
-    /// `try_evict_lru_for_allocation` draws from). Adapter growth
+    /// free blocks plus evictable cache-only prefix entries. Adapter growth
     /// pre-flights against this so `allocate` never evicts a cache-only
     /// block the pool could instead cover by growing.
     pub fn free_or_evictable_blocks(&self) -> u32 {
         self.num_free_blocks() + self.num_evictable_blocks()
-    }
-
-    /// Set the maximum number of entries the prefix cache will hold before
-    /// the LRU eviction loop fires on subsequent inserts.
-    ///
-    /// This setter does NOT shrink the cache below an existing population —
-    /// pre-existing entries are left in place and only the next genuine
-    /// insertion will trigger eviction.
-    pub fn set_max_prefix_cache_entries(&mut self, max_entries: usize) {
-        self.max_prefix_cache_entries = max_entries;
     }
 
     /// Publish a fully restored cold-cache block into the hot prefix cache.
@@ -1289,10 +1367,7 @@ impl BlockAllocator {
         if registrations.is_empty() {
             return Ok(true);
         }
-        if self.max_prefix_cache_entries == 0 {
-            return Ok(false);
-        }
-        if registrations.len() > self.max_prefix_cache_entries {
+        if registrations.len() > self.num_blocks as usize {
             return Err("restored prefix batch exceeds prefix-cache capacity");
         }
 
@@ -1363,9 +1438,6 @@ mod tests {
     #[test]
     fn test_free_or_evictable_blocks_counts_free_plus_cache_only() {
         let mut allocator = BlockAllocator::new(4, 4, 4);
-        // Prefix caching is off by default; enable it so register_prefix
-        // actually installs entries (same as the LRU tests below).
-        allocator.max_prefix_cache_entries = 4;
         assert_eq!(allocator.free_or_evictable_blocks(), 4);
 
         // A registered prefix entry is not evictable while the request
@@ -1432,9 +1504,9 @@ mod tests {
     fn test_prefix_cache_cleanup_on_free() {
         // With the cache-holds-its-own-ref design, freeing the only
         // external handle leaves the block alive at ref_count=1 (the
-        // cache's logical reference). LRU eviction is what eventually
-        // returns the block to the free pool — see
-        // `test_lru_eviction_returns_block_to_free_pool`.
+        // cache's logical reference). A take is what eventually returns
+        // the block to the free pool — see
+        // `evicted_dead_leaf_returns_to_the_free_pool`.
         let mut allocator = BlockAllocator::new(10, 10, 32);
 
         let block = allocator.allocate().unwrap();
@@ -1506,90 +1578,29 @@ mod tests {
 
     #[test]
     fn test_prefix_cache_eviction_cleanup() {
-        // This test verifies that evicted blocks are properly cleaned up
-        let mut allocator = BlockAllocator::new(10, 10, 32);
-        allocator.max_prefix_cache_entries = 2; // Small cache for testing
+        let mut allocator = BlockAllocator::new(2, 2, 32);
 
         let block1 = allocator.allocate().unwrap();
         let hash1 = hash_tokens(&[1], 0, &[]);
         allocator.register_prefix(Arc::clone(&block1), hash1);
-
         let block2 = allocator.allocate().unwrap();
         let hash2 = hash_tokens(&[2], 0, &[]);
         allocator.register_prefix(Arc::clone(&block2), hash2);
-
-        // Cache is at capacity (2 entries)
-        assert_eq!(allocator.prefix_cache.len(), 2);
-
-        // Add a third block, should evict the first (LRU)
-        let block3 = allocator.allocate().unwrap();
-        let hash3 = hash_tokens(&[3], 0, &[]);
-        allocator.register_prefix(Arc::clone(&block3), hash3);
-
-        // Verify hash1 was evicted
-        assert!(allocator.lookup_prefix(hash1).is_none());
-        assert!(allocator.lookup_prefix(hash2).is_some());
-        assert!(allocator.lookup_prefix(hash3).is_some());
-
-        // Verify block_hashes was also cleaned up
-        assert!(!allocator.block_hashes.contains_key(&block1.block_id));
-        assert!(allocator.block_hashes.contains_key(&block2.block_id));
-        assert!(allocator.block_hashes.contains_key(&block3.block_id));
-
-        // block1 (the evicted one) still has the external handle — its
-        // ref_count is now 1 (cache's ref was released by eviction). It
-        // remains in `allocated`. Drop the external handle to confirm
-        // free pool comes back to 8 (10 total - block2 - block3 still held).
-        assert_eq!(block1.get_ref_count(), 1, "cache ref released on eviction");
+        let id1 = block1.block_id;
         allocator.free(block1);
-        // block1 returns to pool. block2, block3, and the cached refs
-        // for hash2 and hash3 keep those blocks pinned.
-        assert_eq!(allocator.num_free_blocks(), 8);
-    }
+        allocator.free(block2);
+        assert_eq!(allocator.num_free_blocks(), 0);
 
-    #[test]
-    fn test_prefix_cache_disabled() {
-        // This test verifies that setting max_prefix_cache_entries = 0 disables caching
-        // and doesn't cause infinite loop
-        let mut allocator = BlockAllocator::new(10, 10, 32);
-        allocator.max_prefix_cache_entries = 0; // Disable prefix caching
-
-        let block = allocator.allocate().unwrap();
-        let hash = hash_tokens(&[1, 2, 3], 0, &[]);
-
-        // Should not cache when disabled — returns false to signal nothing was inserted.
-        assert!(!allocator.register_prefix(Arc::clone(&block), hash));
-
-        // Verify nothing was cached
-        assert_eq!(allocator.prefix_cache.len(), 0);
-        assert!(allocator.lookup_prefix(hash).is_none());
-    }
-
-    #[test]
-    fn test_prefix_cache_eviction_safety() {
-        // This test verifies that even if lru_order becomes desynchronized,
-        // we don't infinite loop
-        let mut allocator = BlockAllocator::new(10, 10, 32);
-        allocator.max_prefix_cache_entries = 1;
-
-        let block1 = allocator.allocate().unwrap();
-        let hash1 = hash_tokens(&[1], 0, &[]);
-        allocator.register_prefix(Arc::clone(&block1), hash1);
-
-        // Manually desynchronize: clear lru_order but leave prefix_cache populated
-        allocator.lru_order.clear();
-
-        // This should not infinite loop - it will break when pop_front returns None
-        let block2 = allocator.allocate().unwrap();
-        let hash2 = hash_tokens(&[2], 0, &[]);
-        allocator.register_prefix(Arc::clone(&block2), hash2);
-
-        // Verify we didn't infinite loop and the function completed
-        assert!(!allocator.prefix_cache.is_empty());
+        let taken = allocator.allocate().unwrap();
+        assert_eq!(taken.block_id, id1, "hash1 was released first");
+        assert!(allocator.lookup_prefix(hash1).is_none());
+        assert!(!allocator.block_hashes.contains_key(&id1));
+        assert_eq!(allocator.block_stamp(hash1), None);
+        assert!(allocator.block_stamp(hash2).is_some());
     }
 
     // hash_tokens(extra_keys), find_longest_cache_hit, cache_full_blocks,
-    // refcount lifecycle, LRU eviction order.
+    // refcount lifecycle, eviction order.
 
     #[test]
     fn test_hash_tokens_extra_keys() {
@@ -2182,52 +2193,37 @@ mod tests {
         assert_eq!(allocator.num_free_blocks(), 3);
 
         // Free the external handle: 2 -> 1, block STILL alive (cache's
-        // logical ref). No cleanup yet — that happens via LRU eviction or
-        // when the cache's ref is the last and it gets removed.
+        // logical ref). No cleanup yet — that happens when a take
+        // removes the cache's ref.
         allocator.free(block);
         assert_eq!(allocator.num_free_blocks(), 3);
         assert!(allocator.lookup_prefix(hash).is_some());
     }
 
     #[test]
-    fn test_lru_eviction_order() {
-        let mut allocator = BlockAllocator::new(8, 8, 4);
-        allocator.max_prefix_cache_entries = 3;
+    fn test_dead_leaves_go_oldest_stamp_first() {
+        let mut allocator = BlockAllocator::new(4, 4, 4);
+        let hashes = [
+            0xAAAA_AAAA_AAAA_AAAA,
+            0xBBBB_BBBB_BBBB_BBBB,
+            0xCCCC_CCCC_CCCC_CCCC,
+            0xDDDD_DDDD_DDDD_DDDD,
+        ];
+        let mut ids = Vec::new();
+        for &hash in &hashes {
+            let block = allocator.allocate().unwrap();
+            allocator.register_prefix(Arc::clone(&block), hash);
+            ids.push(block.block_id);
+            allocator.free(block);
+        }
+        assert_eq!(allocator.num_free_blocks(), 0);
 
-        // Register 4 blocks with distinct hashes; the oldest registration
-        // (hash1) should be evicted from the prefix_cache after the 4th insert.
-        let b1 = allocator.allocate().unwrap();
-        let b2 = allocator.allocate().unwrap();
-        let b3 = allocator.allocate().unwrap();
-        let b4 = allocator.allocate().unwrap();
-
-        let h1 = 0xAAAA_AAAA_AAAA_AAAA;
-        let h2 = 0xBBBB_BBBB_BBBB_BBBB;
-        let h3 = 0xCCCC_CCCC_CCCC_CCCC;
-        let h4 = 0xDDDD_DDDD_DDDD_DDDD;
-
-        allocator.register_prefix(Arc::clone(&b1), h1);
-        allocator.register_prefix(Arc::clone(&b2), h2);
-        allocator.register_prefix(Arc::clone(&b3), h3);
-        allocator.register_prefix(Arc::clone(&b4), h4);
-
-        // h1 (oldest) was evicted; h2/h3/h4 remain.
-        assert!(allocator.lookup_prefix(h1).is_none());
-        assert!(allocator.lookup_prefix(h2).is_some());
-        assert!(allocator.lookup_prefix(h3).is_some());
-        assert!(allocator.lookup_prefix(h4).is_some());
-
-        // block_hashes was also cleaned for the evicted entry.
-        assert!(!allocator.block_hashes.contains_key(&b1.block_id));
-        assert!(allocator.block_hashes.contains_key(&b2.block_id));
-        assert!(allocator.block_hashes.contains_key(&b3.block_id));
-        assert!(allocator.block_hashes.contains_key(&b4.block_id));
-
-        // The evicted block (b1) had its cache ref released — ref_count is
-        // now 1 (just the external b1 handle). The lookup_prefix(h1) call
-        // returned None, so it did NOT incref. b2/b3/b4 are at higher counts
-        // because lookup_prefix incref'd them.
-        assert_eq!(b1.get_ref_count(), 1);
+        assert_eq!(allocator.allocate().unwrap().block_id, ids[0]);
+        assert!(!allocator.prefix_cache.contains_key(&hashes[0]));
+        assert_eq!(allocator.allocate().unwrap().block_id, ids[1]);
+        assert!(!allocator.prefix_cache.contains_key(&hashes[1]));
+        assert!(allocator.prefix_cache.contains_key(&hashes[2]));
+        assert!(allocator.prefix_cache.contains_key(&hashes[3]));
     }
 
     // register_prefix must evict stale aliases when the same block is
@@ -2376,127 +2372,29 @@ mod tests {
         assert_eq!(allocator.num_free_blocks(), initial_free - 1);
     }
 
+    /// Mutation: stamp on an idempotent refresh in `register_prefix` -> red
+    /// (the stamp changes).
     #[test]
-    fn test_register_prefix_idempotent_at_capacity() {
-        // At capacity, re-registering the SAME (block, hash) pair must be a
-        // pure LRU refresh — it must NOT trigger capacity eviction of
-        // unrelated entries, since the cache size doesn't grow.
-        let mut allocator = BlockAllocator::new(8, 8, 4);
-        allocator.max_prefix_cache_entries = 3;
-
-        let block_1 = allocator.allocate().unwrap();
-        let block_2 = allocator.allocate().unwrap();
-        let block_3 = allocator.allocate().unwrap();
-
-        let h1 = 0x1111_1111_1111_1111;
-        let h2 = 0x2222_2222_2222_2222;
-        let h3 = 0x3333_3333_3333_3333;
-
-        allocator.register_prefix(Arc::clone(&block_1), h1);
-        allocator.register_prefix(Arc::clone(&block_2), h2);
-        allocator.register_prefix(Arc::clone(&block_3), h3);
-
-        // Cache at full capacity (3/3).
-        assert_eq!(allocator.prefix_cache.len(), 3);
+    fn refresh_keeps_the_stamp() {
+        let mut allocator = BlockAllocator::new(3, 3, 4);
+        let tokens: Vec<u32> = (0..8).collect();
+        let blocks = [allocator.allocate().unwrap(), allocator.allocate().unwrap()];
+        allocator
+            .cache_full_blocks(&tokens, &blocks, 4, &[], 0)
+            .unwrap();
+        let hashes = chain_hashes(&tokens, 4, &[], 0);
+        let before: Vec<Option<u64>> = hashes.iter().map(|h| allocator.block_stamp(*h)).collect();
         let free_before = allocator.num_free_blocks();
 
-        // Re-register the MIDDLE entry (block_2 under h2). This is an
-        // idempotent refresh — must not evict h1 or h3.
-        allocator.register_prefix(Arc::clone(&block_2), h2);
+        allocator
+            .cache_full_blocks(&tokens, &blocks, 4, &[], 0)
+            .unwrap();
 
-        // All three entries still resolvable.
-        assert!(
-            allocator.lookup_prefix(h1).is_some(),
-            "h1 must not be evicted by an idempotent re-register"
-        );
-        assert!(
-            allocator.lookup_prefix(h3).is_some(),
-            "h3 must not be evicted by an idempotent re-register"
-        );
-        assert!(allocator.lookup_prefix(h2).is_some());
-
-        // num_free_blocks unchanged (no extra allocations / frees).
+        let after: Vec<Option<u64>> = hashes.iter().map(|h| allocator.block_stamp(*h)).collect();
+        assert_eq!(after, before, "a refresh is not a commit");
+        assert_eq!(allocator.prefix_cache.len(), 2, "a refresh evicts nothing");
         assert_eq!(allocator.num_free_blocks(), free_before);
-
-        // After the refresh, h2 should be the most-recently-used entry.
-        // (lookup_prefix calls above also bumped h1, h3, h2 in order, so
-        // we re-check by triggering one more eviction: register a 4th hash
-        // and confirm h1 — currently the LRU after the lookups — gets
-        // evicted, not h2 or h3.)
-        let block_4 = allocator.allocate().unwrap();
-        let h4 = 0x4444_4444_4444_4444;
-        allocator.register_prefix(Arc::clone(&block_4), h4);
-
-        // h1 was the oldest (first in lru_order after the lookups).
-        assert!(
-            allocator.lookup_prefix(h1).is_none(),
-            "h1 should be the LRU after subsequent lookups bumped h3 and h2"
-        );
-        assert!(allocator.lookup_prefix(h2).is_some());
-        assert!(allocator.lookup_prefix(h3).is_some());
-        assert!(allocator.lookup_prefix(h4).is_some());
-    }
-
-    #[test]
-    fn test_register_prefix_refresh_moves_hash_to_mru() {
-        // Discriminating regression test for the core Task-13 semantic:
-        // `LinkedHashSet::insert` of an ALREADY-PRESENT key must move it to
-        // the back (MRU), exactly like the old `retain(..); push_back(..)`.
-        // A hypothetical broken swap (e.g. `replace`, which does NOT reposition
-        // an existing entry) would leave the refreshed hash at the front and
-        // get it wrongly evicted. This test fails under that broken variant.
-        //
-        // Unlike `test_register_prefix_idempotent_at_capacity`, this test
-        // never calls `lookup_prefix` before the final assertions (lookup also
-        // bumps LRU order and would confound the outcome). It refreshes the
-        // OLDEST entry via `register_prefix` and checks membership through the
-        // non-bumping `prefix_cache.contains_key`.
-        let mut allocator = BlockAllocator::new(8, 8, 4);
-        allocator.max_prefix_cache_entries = 3;
-
-        let block_1 = allocator.allocate().unwrap();
-        let block_2 = allocator.allocate().unwrap();
-        let block_3 = allocator.allocate().unwrap();
-
-        let h1 = 0x1111_1111_1111_1111;
-        let h2 = 0x2222_2222_2222_2222;
-        let h3 = 0x3333_3333_3333_3333;
-
-        // Insertion order → lru_order front..back = [h1, h2, h3]. h1 is oldest.
-        allocator.register_prefix(Arc::clone(&block_1), h1);
-        allocator.register_prefix(Arc::clone(&block_2), h2);
-        allocator.register_prefix(Arc::clone(&block_3), h3);
-        assert_eq!(allocator.prefix_cache.len(), 3);
-
-        // Idempotent refresh of the OLDEST entry (block_1 under h1). Correct
-        // move-to-back → order becomes [h2, h3, h1], making h2 the new LRU.
-        // (Broken no-reposition → order stays [h1, h2, h3], h1 still LRU.)
-        allocator.register_prefix(Arc::clone(&block_1), h1);
-
-        // Force exactly one capacity eviction with a genuinely new hash.
-        let block_4 = allocator.allocate().unwrap();
-        let h4 = 0x4444_4444_4444_4444;
-        allocator.register_prefix(Arc::clone(&block_4), h4);
-
-        // Correct move-to-back: h2 (new LRU after the refresh) is evicted;
-        // the refreshed h1 survives. Under a broken swap, h1 would be gone.
-        assert!(
-            allocator.prefix_cache.contains_key(&h1),
-            "refreshing h1 must move it to MRU so it survives the next eviction"
-        );
-        assert!(
-            !allocator.prefix_cache.contains_key(&h2),
-            "h2 became the LRU after h1's refresh and must be the evicted entry"
-        );
-        assert!(
-            allocator.prefix_cache.contains_key(&h3),
-            "h3 was newer than the evicted LRU and must survive"
-        );
-        assert!(
-            allocator.prefix_cache.contains_key(&h4),
-            "h4 is the freshly inserted entry"
-        );
-        assert_eq!(allocator.prefix_cache.len(), 3);
+        assert!(blocks.iter().all(|block| block.get_ref_count() == 2));
     }
 
     #[test]
@@ -2537,79 +2435,36 @@ mod tests {
         );
     }
 
-    /// Regression test for the orphaned-block leak: when the prefix_cache
-    /// exceeds capacity, the LRU eviction loop must release the cache's
-    /// logical reference. If the evicted block has no other holder, it
-    /// must return to the free pool (otherwise the pool drains
-    /// monotonically until allocation fails).
+    /// Mutation: skip `free_blocks.push_back` in `evict_oldest_dead_leaf`
+    /// -> red (the id leaks: not free, not allocated).
     #[test]
-    fn test_lru_eviction_returns_block_to_free_pool() {
-        let mut allocator = BlockAllocator::new(8, 8, 4);
-        allocator.max_prefix_cache_entries = 2;
-        let initial_free = allocator.num_free_blocks();
-
-        // Allocate three blocks, register all three. The third register
-        // exceeds capacity → LRU eviction of the first.
+    fn evicted_dead_leaf_returns_to_the_free_pool() {
+        let mut allocator = BlockAllocator::new(2, 2, 4);
         let b1 = allocator.allocate().unwrap();
         let h1 = 0x1111_1111_1111_1111;
         allocator.register_prefix(Arc::clone(&b1), h1);
-
-        let b2 = allocator.allocate().unwrap();
-        let h2 = 0x2222_2222_2222_2222;
-        allocator.register_prefix(Arc::clone(&b2), h2);
-
-        let b3 = allocator.allocate().unwrap();
-        let h3 = 0x3333_3333_3333_3333;
-
-        // Drop b1's external handle BEFORE the eviction so b1's only
-        // remaining ref is the cache's logical ref. Triggering eviction
-        // must drive ref_count to 0 and return b1 to the free pool.
         let b1_id = b1.block_id;
-        allocator.free(b1); // b1: alloc(1)+reg(1)=2 → 1 (cache only)
+        allocator.free(b1);
+        assert_eq!(allocator.num_free_blocks(), 1);
 
-        // b1 is still pinned in the cache — free pool didn't get it back.
-        assert_eq!(
-            allocator.num_free_blocks(),
-            initial_free - 3,
-            "before eviction: 3 blocks held (b1 by cache, b2/b3 external+cache)"
-        );
-
-        // Now register b3, evicting b1 (oldest in LRU order).
-        allocator.register_prefix(Arc::clone(&b3), h3);
-
-        // b1 was evicted, decref'd from 1 → 0, removed from `allocated`,
-        // pushed back to free_blocks.
-        assert!(allocator.lookup_prefix(h1).is_none());
+        assert_eq!(allocator.evict_oldest_dead_leaf(), Some(b1_id));
+        assert!(!allocator.prefix_cache.contains_key(&h1));
         assert!(!allocator.allocated.contains_key(&b1_id));
-        assert!(
-            allocator.free_blocks.contains(&b1_id),
-            "evicted block must return to free_blocks"
-        );
-
-        // b2 and b3 still alive (external handle + cache ref).
-        assert!(allocator.lookup_prefix(h2).is_some());
-        assert!(allocator.lookup_prefix(h3).is_some());
-
-        // Free pool: b1 came back; b2 and b3 are still held by the cache
-        // and their external handles. Net: initial_free - 2.
-        assert_eq!(
-            allocator.num_free_blocks(),
-            initial_free - 2,
-            "evicted block must return to the free pool"
-        );
+        assert!(allocator.free_blocks.contains(&b1_id));
+        assert_eq!(allocator.num_free_blocks(), 2);
+        assert_eq!(allocator.evict_oldest_dead_leaf(), None);
     }
 
     // -------------------------------------------------------------------
     // Allocation under cache pressure: when free_blocks is empty,
-    // allocate() must evict an LRU cache-only block to satisfy the
-    // request. Mirrors vLLM `_maybe_evict_cached_block`.
+    // allocate() must take a cache-only block to satisfy the request.
     // -------------------------------------------------------------------
 
-    /// `allocate()` must fall back to evicting the LRU oldest cache-only
-    /// block when the free pool is empty. The OLDEST entry (by LRU
-    /// order, not insertion-of-cache-only) is the one selected.
+    /// `allocate()` must fall back to the oldest dead leaf when the free
+    /// pool is empty. Bare `register_prefix` sets no identity, so every
+    /// entry is a root leaf, and the release order makes b1 oldest.
     #[test]
-    fn test_allocate_evicts_lru_when_pool_exhausted() {
+    fn test_allocate_takes_oldest_dead_leaf_when_pool_exhausted() {
         let mut allocator = BlockAllocator::new(3, 3, 4);
 
         // Allocate all three blocks.
@@ -2620,8 +2475,7 @@ mod tests {
         let b2_id = b2.block_id;
         let b3_id = b3.block_id;
 
-        // Register each under a distinct hash, in order. b1 is therefore
-        // the LRU oldest entry in `lru_order`.
+        // Register each under a distinct hash, in order.
         let h1 = 0x1111_1111_1111_1111;
         let h2 = 0x2222_2222_2222_2222;
         let h3 = 0x3333_3333_3333_3333;
@@ -2639,13 +2493,13 @@ mod tests {
         assert_eq!(allocator.num_free_blocks(), 0);
         assert_eq!(allocator.prefix_cache.len(), 3);
 
-        // Allocate again — must succeed by evicting the LRU oldest (b1).
+        // Allocate again — must succeed by taking the oldest dead leaf (b1).
         let new_block = allocator
             .allocate()
-            .expect("allocate must evict LRU cache-only block when pool empty");
+            .expect("allocate must take a dead leaf when the pool is empty");
         assert_eq!(
             new_block.block_id, b1_id,
-            "evicted block must be the LRU oldest (b1)"
+            "taken block must be the oldest dead leaf (b1)"
         );
 
         // b1's hash is gone from the cache; b2 and b3 remain.
@@ -2680,7 +2534,7 @@ mod tests {
 
         // Snapshot every cache-authority table before the failed allocation.
         // A no-candidate scan must be observationally neutral: in particular,
-        // it must not refresh any hit or disturb LRU ordering just because it
+        // it must not refresh any hit or disturb the stamps just because it
         // inspected in-use entries while looking for an evictable block.
         let mut prefix_cache_before: Vec<(u64, u32, usize)> = allocator
             .prefix_cache
@@ -2690,7 +2544,7 @@ mod tests {
         prefix_cache_before.sort_unstable();
         let identities_before = allocator.prefix_cache_identities.clone();
         let block_hashes_before = allocator.block_hashes.clone();
-        let lru_before: Vec<u64> = allocator.lru_order.iter().copied().collect();
+        let stamps_before = [allocator.block_stamp(h1), allocator.block_stamp(h2)];
         let mut allocated_before: Vec<(u32, usize)> = allocator
             .allocated
             .iter()
@@ -2723,9 +2577,9 @@ mod tests {
         assert_eq!(allocator.prefix_cache_identities, identities_before);
         assert_eq!(allocator.block_hashes, block_hashes_before);
         assert_eq!(
-            allocator.lru_order.iter().copied().collect::<Vec<_>>(),
-            lru_before,
-            "a failed allocation must not reorder cache hits"
+            [allocator.block_stamp(h1), allocator.block_stamp(h2)],
+            stamps_before,
+            "a failed allocation must not restamp cache hits"
         );
         assert_eq!(allocated_after, allocated_before);
         assert_eq!(
@@ -2780,7 +2634,6 @@ mod tests {
     #[test]
     fn test_register_prefix_returns_correct_bool() {
         let mut allocator = BlockAllocator::new(8, 8, 4);
-        allocator.max_prefix_cache_entries = 4;
 
         let b1 = allocator.allocate().unwrap();
         let b2 = allocator.allocate().unwrap();
@@ -3243,11 +3096,9 @@ mod tests {
         assert_eq!(n, 2 * block_size as usize);
     }
 
-    /// Turn 1 of a 31k-token prompt registers ~1942 blocks at
-    /// block_size=16. With a fixed cap of 1024 prefix-cache entries, the
-    /// first ~921 blocks would evict before finalize returned, so turn 2's
-    /// lookup walking from block 0 would miss instantly and report
-    /// cached_prefix_len=0. The cap scales to num_blocks to prevent this.
+    /// Turn 1 of a long prompt registers ~1100 blocks at block_size=16.
+    /// Registration evicts nothing, so turn 2's lookup walking from block 0
+    /// hits the whole chain.
     #[test]
     fn long_chain_survives_registration_without_head_eviction() {
         let mut a = BlockAllocator::new(2000, 2000, 16);
@@ -3405,8 +3256,8 @@ mod tests {
     }
 
     /// One leaf eviction of a cached 4-block chain takes its tail and keeps
-    /// the head: the chain still hits 3 blocks, then 2. Mutation: evict the
-    /// `lru_order` front instead → red (hit 0).
+    /// the head: the chain still hits 3 blocks, then 2. Mutation: take the
+    /// oldest stamp regardless of children → red (hit 0).
     #[test]
     fn evicting_a_leaf_keeps_the_chain_head() {
         let mut allocator = BlockAllocator::new(8, 8, 4);
@@ -3428,9 +3279,9 @@ mod tests {
             }
             cached / 4
         };
-        assert_eq!(allocator.evict_oldest_cache_only_leaf(), Some(3));
+        assert_eq!(allocator.evict_oldest_dead_leaf(), Some(3));
         assert_eq!(hit_blocks(&mut allocator), 3);
-        assert_eq!(allocator.evict_oldest_cache_only_leaf(), Some(2));
+        assert_eq!(allocator.evict_oldest_dead_leaf(), Some(2));
         assert_eq!(hit_blocks(&mut allocator), 2);
         assert_eq!(allocator.num_free_blocks(), 6);
     }
@@ -3462,10 +3313,9 @@ mod tests {
     }
 
     #[test]
-    fn test_grow_by_rescales_prefix_cache_capacity() {
-        // The constructor scales max_prefix_cache_entries to num_blocks;
-        // grow_by applies the same formula, so a pool grown 4 -> 8 holds 8
-        // cache entries without LRU capacity eviction.
+    fn test_grown_pool_registers_every_block_without_eviction() {
+        // A pool grown 4 -> 8 holds 8 cache entries: registration never
+        // evicts.
         let mut allocator = BlockAllocator::new(4, 8, 4);
         assert_eq!(allocator.grow_by(4), 4);
         for i in 0..8u64 {
@@ -3475,7 +3325,7 @@ mod tests {
         for i in 0..8u64 {
             assert!(
                 allocator.lookup_prefix(1000 + i).is_some(),
-                "entry {i} evicted despite rescaled capacity"
+                "entry {i} evicted by registration"
             );
         }
     }
@@ -3484,5 +3334,266 @@ mod tests {
     #[should_panic(expected = "max_num_blocks")]
     fn test_new_rejects_max_below_initial() {
         let _ = BlockAllocator::new(8, 4, 4);
+    }
+
+    fn cache_chain(
+        allocator: &mut BlockAllocator,
+        tokens: &[u32],
+    ) -> (Vec<Arc<PhysicalBlock>>, Vec<u64>) {
+        let n = tokens.len() / 4;
+        let blocks: Vec<_> = (0..n).map(|_| allocator.allocate().unwrap()).collect();
+        assert_eq!(
+            allocator
+                .cache_full_blocks(tokens, &blocks, 4, &[], 0)
+                .unwrap(),
+            n
+        );
+        (blocks, chain_hashes(tokens, 4, &[], 0))
+    }
+
+    fn hit_len(allocator: &mut BlockAllocator, tokens: &[u32]) -> usize {
+        let (hit, _) = allocator.find_longest_cache_hit(tokens, 4, &[], 0);
+        let n = hit.len();
+        for block in hit {
+            allocator.free(block);
+        }
+        n
+    }
+
+    /// Mutation: `allocate` takes the oldest stamp regardless of children
+    /// -> red (A goes, hit 0).
+    #[test]
+    fn allocate_takes_the_chain_tail_and_keeps_the_prefix_hit() {
+        let mut allocator = BlockAllocator::new(4, 4, 4);
+        let tokens: Vec<u32> = (0..16).collect();
+        let (blocks, _) = cache_chain(&mut allocator, &tokens);
+        let d = blocks[3].block_id;
+        for block in blocks {
+            allocator.free(block);
+        }
+        assert_eq!(allocator.allocate().unwrap().block_id, d);
+        assert_eq!(hit_len(&mut allocator, &tokens), 3);
+    }
+
+    /// Mutations: the parent keeps its own stamp -> red ((1, L)); the parent
+    /// gets `next()` -> red ((4, L)).
+    #[test]
+    fn parent_takes_its_child_stamp() {
+        let mut allocator = BlockAllocator::new(2, 2, 4);
+        let tokens: Vec<u32> = (0..8).collect();
+        let (blocks, hashes) = cache_chain(&mut allocator, &tokens);
+        let (l, k) = (hashes[0], hashes[1]);
+        allocator.set_state_marks([l]);
+        assert_eq!(allocator.block_stamp(l), Some(1));
+        assert_eq!(allocator.block_stamp(k), Some(2));
+        let k_id = blocks[1].block_id;
+        for block in blocks {
+            allocator.free(block);
+        }
+        assert_eq!(allocator.block_stamp(k), Some(3));
+
+        assert_eq!(allocator.allocate().unwrap().block_id, k_id);
+        assert_eq!(allocator.oldest_marked_leaf(), Some((3, l)));
+    }
+
+    /// Mutation: no touch after the walk in
+    /// `find_longest_cache_hit_with_keys` -> red (alloc 2 = B).
+    /// Mutation: the walk touches every hit block, not only the tip -> red
+    /// (A's stamp moves).
+    #[test]
+    fn a_hit_touches_its_tip_only() {
+        let mut allocator = BlockAllocator::new(4, 4, 4);
+        let x_tokens: Vec<u32> = (0..12).collect();
+        let y_tokens: Vec<u32> = (100..104).collect();
+        let (x_blocks, x_hashes) = cache_chain(&mut allocator, &x_tokens);
+        let (y_blocks, _) = cache_chain(&mut allocator, &y_tokens);
+        let d = x_blocks[2].block_id;
+        let c = y_blocks[0].block_id;
+        for block in x_blocks {
+            allocator.free(block);
+        }
+        for block in y_blocks {
+            allocator.free(block);
+        }
+        let a_stamp = allocator.block_stamp(x_hashes[0]);
+        assert_eq!(hit_len(&mut allocator, &x_tokens[..8]), 2);
+        assert_eq!(allocator.block_stamp(x_hashes[0]), a_stamp);
+
+        assert_eq!(allocator.allocate().unwrap().block_id, d);
+        assert_eq!(allocator.allocate().unwrap().block_id, c);
+    }
+
+    /// Mutation: `free` stamps nothing -> red (alloc 1 = X's tip).
+    #[test]
+    fn released_tip_is_stamped_newest() {
+        let mut allocator = BlockAllocator::new(2, 2, 4);
+        let x_tokens: Vec<u32> = (0..4).collect();
+        let y_tokens: Vec<u32> = (100..104).collect();
+        let (x_blocks, _) = cache_chain(&mut allocator, &x_tokens);
+        let (y_blocks, _) = cache_chain(&mut allocator, &y_tokens);
+        let y = y_blocks[0].block_id;
+        for block in y_blocks {
+            allocator.free(block);
+        }
+        for block in x_blocks {
+            allocator.free(block);
+        }
+        assert_eq!(allocator.allocate().unwrap().block_id, y);
+    }
+
+    /// Mutation: no touch in the verified-duplicate skip branch of
+    /// `cache_full_blocks_with_keys` -> red (a2 < z1 after B).
+    #[test]
+    fn verified_duplicate_is_stamped_on_commit() {
+        let mut allocator = BlockAllocator::new(6, 6, 4);
+        let a_tokens: Vec<u32> = (0..8).collect();
+        let z_tokens: Vec<u32> = (100..104).collect();
+        let (a_blocks, a_hashes) = cache_chain(&mut allocator, &a_tokens);
+        for block in a_blocks {
+            allocator.free(block);
+        }
+        let (z_blocks, z_hashes) = cache_chain(&mut allocator, &z_tokens);
+        for block in z_blocks {
+            allocator.free(block);
+        }
+        let (a2, z1) = (a_hashes[1], z_hashes[0]);
+        assert!(allocator.block_stamp(a2) < allocator.block_stamp(z1));
+
+        let b_blocks = [allocator.allocate().unwrap(), allocator.allocate().unwrap()];
+        assert_eq!(
+            allocator
+                .cache_full_blocks(&a_tokens, &b_blocks, 4, &[], 0)
+                .unwrap(),
+            0,
+            "both blocks are verified duplicates"
+        );
+        assert!(allocator.block_stamp(a2) > allocator.block_stamp(z1));
+        for block in b_blocks {
+            allocator.free(block);
+        }
+    }
+
+    /// Mutation: `child_count += 1` on every `remember_prefix_identity`
+    /// -> red (B, then `None`).
+    #[test]
+    fn republished_identity_does_not_double_count_its_parent() {
+        let mut allocator = BlockAllocator::new(4, 4, 4);
+        let tokens: Vec<u32> = (0..8).collect();
+        let (blocks, _) = cache_chain(&mut allocator, &tokens);
+        assert_eq!(
+            allocator
+                .cache_full_blocks(&tokens, &blocks, 4, &[], 0)
+                .unwrap(),
+            2
+        );
+        let (a, b) = (blocks[0].block_id, blocks[1].block_id);
+        for block in blocks {
+            allocator.free(block);
+        }
+        assert_eq!(allocator.evict_oldest_dead_leaf(), Some(b));
+        assert_eq!(allocator.evict_oldest_dead_leaf(), Some(a));
+    }
+
+    /// Mutation: `oldest_dead_leaf` ignores marks -> red (alloc 1 = B).
+    #[test]
+    fn marked_chain_is_never_allocated() {
+        let mut allocator = BlockAllocator::new(3, 3, 4);
+        let ab_tokens: Vec<u32> = (0..8).collect();
+        let c_tokens: Vec<u32> = (100..104).collect();
+        let (ab_blocks, ab_hashes) = cache_chain(&mut allocator, &ab_tokens);
+        let (c_blocks, _) = cache_chain(&mut allocator, &c_tokens);
+        allocator.set_state_marks([ab_hashes[1]]);
+        let c = c_blocks[0].block_id;
+        for block in ab_blocks.into_iter().chain(c_blocks) {
+            allocator.free(block);
+        }
+
+        assert_eq!(allocator.allocate().unwrap().block_id, c);
+        assert!(allocator.allocate().is_none());
+        assert_eq!(allocator.num_evictable_blocks(), 0);
+        assert_eq!(allocator.num_reusable_blocks(), 2);
+        assert_eq!(hit_len(&mut allocator, &ab_tokens), 2);
+    }
+
+    /// Mutations: drop the pinned-interior fallback in `allocate` -> red
+    /// (`None`); take the oldest interior instead of the deepest -> red
+    /// (A first, hit 0).
+    #[test]
+    fn pinned_interior_goes_deepest_first() {
+        let mut allocator = BlockAllocator::new(3, 3, 4);
+        let tokens: Vec<u32> = (0..12).collect();
+        let (mut blocks, _) = cache_chain(&mut allocator, &tokens);
+        let c_block = blocks.pop().unwrap();
+        let (a, b) = (blocks[0].block_id, blocks[1].block_id);
+        for block in blocks {
+            allocator.free(block);
+        }
+        assert_eq!(allocator.num_free_blocks(), 0);
+        assert_eq!(allocator.num_evictable_blocks(), 2);
+
+        assert_eq!(allocator.allocate().unwrap().block_id, b);
+        assert_eq!(hit_len(&mut allocator, &tokens[..4]), 1);
+        assert_eq!(allocator.allocate().unwrap().block_id, a);
+        allocator.free(c_block);
+    }
+
+    /// Mutation: skip the marked closure in `deepest_pinned_interior` only
+    /// below the max -> red (at the max it takes B).
+    #[test]
+    fn pinned_interior_skips_a_marked_chain_at_every_size() {
+        for max in [3, 6] {
+            let mut allocator = BlockAllocator::new(3, max, 4);
+            let tokens: Vec<u32> = (0..12).collect();
+            let (mut blocks, hashes) = cache_chain(&mut allocator, &tokens);
+            allocator.set_state_marks([hashes[1]]);
+            let c_block = blocks.pop().unwrap();
+            for block in blocks {
+                allocator.free(block);
+            }
+            assert!(allocator.allocate().is_none(), "pool 3/{max}");
+            assert_eq!(hit_len(&mut allocator, &tokens[..8]), 2, "pool 3/{max}");
+            allocator.free(c_block);
+        }
+    }
+
+    /// At the max (3/3) and below it (3/6) a reserve of 3 against 0 free
+    /// and 2 evictable blocks takes nothing, and X still hits 2 blocks.
+    /// Mutations: put `self.num_blocks >= self.max_num_blocks &&` back in
+    /// front of the `reserve` gate -> red at 3/6 (`Err(2)`, X evicted, hit
+    /// 0); drop the gate -> red at 3/3 and 3/6.
+    #[test]
+    fn reserve_evicts_nothing_it_cannot_cover() {
+        let x_tokens: Vec<u32> = (0..8).collect();
+        for max in [3, 6] {
+            let mut allocator = BlockAllocator::new(3, max, 4);
+            let (x_blocks, _) = cache_chain(&mut allocator, &x_tokens);
+            for block in x_blocks {
+                allocator.free(block);
+            }
+            let held = allocator.allocate().unwrap();
+            assert!(matches!(allocator.reserve(3), Err(0)), "pool 3/{max}");
+            assert_eq!(hit_len(&mut allocator, &x_tokens), 2, "pool 3/{max}");
+            assert_eq!(allocator.num_free_blocks(), 0, "pool 3/{max}");
+            allocator.free(held);
+        }
+    }
+
+    /// Mutation: keep a `child_count` row at 0 in `unlink_child` -> red
+    /// (1 row).
+    #[test]
+    fn child_count_rows_end_with_their_children() {
+        let mut allocator = BlockAllocator::new(2, 2, 4);
+        let tokens: Vec<u32> = (0..8).collect();
+        let (mut blocks, _) = cache_chain(&mut allocator, &tokens);
+        let b_block = blocks.pop().unwrap();
+        let a = blocks[0].block_id;
+        let b = b_block.block_id;
+        allocator.free(blocks.pop().unwrap());
+
+        assert_eq!(allocator.allocate().unwrap().block_id, a);
+        assert_eq!(allocator.child_count_rows(), 1);
+        allocator.free(b_block);
+        assert_eq!(allocator.allocate().unwrap().block_id, b);
+        assert_eq!(allocator.child_count_rows(), 0);
     }
 }

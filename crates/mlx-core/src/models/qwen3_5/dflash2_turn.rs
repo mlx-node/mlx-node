@@ -725,7 +725,7 @@ pub(crate) fn grow_paged_pool_for_prompt<T>(
             .and_then(|seq_id| pool.block_table_for(seq_id))
             .map_or(0, |table| table.num_blocks());
         let held = u64::from(blocks.free_blocks) + live as u64;
-        let cached = u64::from(blocks.reclaimable_blocks);
+        let cached = u64::from(blocks.evictable_blocks);
         let available = if pool.grows_by_extent() {
             held
         } else {

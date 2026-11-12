@@ -1847,6 +1847,13 @@ impl Qwen3Inner {
                 query_len,
             });
         }
+        let wave: Vec<(SeqId, u32)> = planned_rows
+            .iter()
+            .map(|row| (row.seq_id, row.query_len))
+            .collect();
+        adapter
+            .check_wave_fits(&wave)
+            .map_err(|error| Error::from_reason(format!("run_paged_ragged_step: {error}")))?;
 
         let mut recorded: Vec<usize> = Vec::with_capacity(rows.len());
         for (row_index, (seq_id, tokens)) in rows.iter().enumerate() {

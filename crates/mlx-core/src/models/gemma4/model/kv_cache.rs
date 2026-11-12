@@ -393,6 +393,18 @@ impl Gemma4KVCacheCoordinator {
         Ok(())
     }
 
+    /// [`PagedKVCacheAdapter::check_wave_fits`] for every KV group. Each group
+    /// has its own allocator, so each sums its own rows.
+    pub(crate) fn check_wave_fits_all(
+        &self,
+        rows: &[(u32, u32)],
+    ) -> std::result::Result<(), String> {
+        for group_id in 0..self.inner.groups().len() {
+            self.adapter(group_id)?.check_wave_fits(rows)?;
+        }
+        Ok(())
+    }
+
     /// Reserve block capacity for `rows` rows past `seq_id`'s cursor in EVERY
     /// KV group, or in none of them — the speculative lookahead region
     /// ([`PagedKVCacheAdapter::reserve_rows`]) held atomically across the
@@ -403,9 +415,9 @@ impl Gemma4KVCacheCoordinator {
     /// its allocator (reservation extends the block table in place), so
     /// cross-group atomicity is an exact admission pre-flight rather than a
     /// rollback: a group can satisfy `needed` new blocks iff its allocator
-    /// holds `free + reclaimable >= needed` (the `BlockAllocator::can_allocate`
-    /// contract — reclaimable counts exactly the cache-only blocks `allocate`
-    /// may evict), and nothing else can allocate between the pre-flight and
+    /// holds `free + evictable >= needed` (the `BlockAllocator::can_allocate`
+    /// contract — evictable counts exactly the cache-only blocks `allocate`
+    /// may take, outside every marked chain), and nothing else can allocate between the pre-flight and
     /// the reservation because every group's allocator is owned by this
     /// coordinator and driven only from the model thread. A reservation that
     /// still fails after its group passed the pre-flight is therefore an
@@ -461,7 +473,7 @@ impl Gemma4KVCacheCoordinator {
             let telemetry = adapter.block_telemetry()?;
             let available = telemetry
                 .free_blocks
-                .saturating_add(telemetry.reclaimable_blocks);
+                .saturating_add(telemetry.evictable_blocks);
             if needed_blocks > available {
                 return Err(format!(
                     "context_length_exceeded: Gemma4 KV group {group_id} needs \

@@ -1312,6 +1312,10 @@ impl Gemma4Inner {
                 .map_err(Error::from_reason)?;
             planned_rows.push((seq_id, position));
         }
+        let wave: Vec<(u32, u32)> = rows.iter().map(|&(seq_id, _)| (seq_id, 1)).collect();
+        coordinator
+            .check_wave_fits_all(&wave)
+            .map_err(|error| Error::from_reason(format!("Gemma4 batched record: {error}")))?;
 
         let mut recorded = Vec::with_capacity(rows.len());
         for &(seq_id, token_id) in rows {
