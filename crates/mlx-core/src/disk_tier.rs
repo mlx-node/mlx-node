@@ -6,6 +6,7 @@
 //! after a crash. `--persistent-cache` keeps it in a namespace directory of
 //! the cache root across restarts.
 
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::io::AsRawFd;
@@ -394,6 +395,9 @@ pub(crate) struct DiskTier {
     pub state_fingerprint: ColdCacheFingerprint,
     pub kv_fingerprint: ColdCacheFingerprint,
     hold: Mutex<Option<TierHold>>,
+    /// The root's other caches nobody held at open, oldest first; none for a
+    /// temporary tier.
+    others: Mutex<VecDeque<Idle>>,
 }
 
 impl DiskTier {
@@ -421,13 +425,49 @@ impl DiskTier {
             return true;
         };
         match hold {
-            TierHold::Persistent { _lock } => self
-                .manager
-                .close(deadline.saturating_duration_since(Instant::now())),
+            TierHold::Persistent { _lock } => {
+                self.manager.hold_until_writer_exits(Box::new(_lock));
+                self.manager
+                    .close(deadline.saturating_duration_since(Instant::now()))
+            }
             TierHold::Temp { dir, _lock } => {
                 self.manager.close(Duration::ZERO);
                 remove_temp_dir(&dir, deadline);
                 true
+            }
+        }
+    }
+
+    /// Splash `DiskSpace::measure` over the root: one someone else removed
+    /// stops counting, and while this tier and the others hold more than
+    /// the limit the oldest other goes.
+    pub(crate) fn measure(&self) {
+        let mut others = self
+            .others
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if others.is_empty() {
+            return;
+        }
+        others.retain(|cache| {
+            !matches!(fs::symlink_metadata(&cache.path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+        });
+        let own = self.manager.total_bytes();
+        let mut others_bytes = others.iter().map(|cache| cache.bytes).sum::<u64>();
+        while own.saturating_add(others_bytes) > self.limit {
+            let Some(oldest) = others.pop_front() else {
+                break;
+            };
+            others_bytes = others_bytes.saturating_sub(oldest.bytes);
+            if remove_idle(&oldest) {
+                tracing::info!(
+                    "Persistent cache: removed {} ({}), the oldest cache nobody holds, to keep \
+                     the cache root within {}",
+                    oldest.path.display(),
+                    gibibytes(oldest.bytes),
+                    gibibytes(self.limit)
+                );
             }
         }
     }
@@ -760,7 +800,12 @@ pub(crate) fn open_disk_tier(
     let mut others = remove_stale(caches);
     if let Some(tier) = tier.as_ref().filter(|tier| tier.persistent) {
         others.retain(|cache| cache.path != tier.manager.root());
-        fit_root(others, tier);
+        others.sort_by_key(|cache| cache.last_use);
+        *tier
+            .others
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = others.into();
+        tier.measure();
     }
     tier
 }
@@ -784,29 +829,6 @@ fn remove_stale(caches: Vec<Idle>) -> Vec<Idle> {
             !stale
         })
         .collect()
-}
-
-/// Splash `DiskSpace` over the root: the oldest caches nobody holds go
-/// until they fit the persistent tier's limit with it.
-fn fit_root(mut others: Vec<Idle>, tier: &DiskTier) {
-    let (own, _) = usage(tier.manager.root());
-    others.sort_by_key(|cache| cache.last_use);
-    let mut total = own.saturating_add(others.iter().map(|cache| cache.bytes).sum::<u64>());
-    for cache in &others {
-        if total <= tier.limit {
-            break;
-        }
-        if remove_idle(cache) {
-            total = total.saturating_sub(cache.bytes);
-            tracing::info!(
-                "Persistent cache: removed {} ({}), the oldest cache nobody holds, to keep the \
-                 cache root within {}",
-                cache.path.display(),
-                gibibytes(cache.bytes),
-                gibibytes(tier.limit)
-            );
-        }
-    }
 }
 
 fn open_tier(
@@ -906,6 +928,7 @@ fn open_temporary(
         state_fingerprint: fingerprint,
         kv_fingerprint: fingerprint,
         hold: Mutex::new(Some(TierHold::Temp { dir, _lock: lock })),
+        others: Mutex::new(VecDeque::new()),
     }))
 }
 
@@ -951,6 +974,7 @@ fn open_persistent(
         state_fingerprint: identity.state,
         kv_fingerprint: identity.kv,
         hold: Mutex::new(Some(TierHold::Persistent { _lock: lock })),
+        others: Mutex::new(VecDeque::new()),
     }))
 }
 

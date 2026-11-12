@@ -928,3 +928,136 @@ fn a_full_volume_refuses_before_writing() {
     assert_eq!(disk.counters.offloads, 0);
     assert_eq!(tier.tier.manager.stats().enqueued, 0);
 }
+
+/// Drains and ticks until `id`'s copy and its chain are on the tier.
+fn settle(inner: &mut Qwen35Inner, tier: &TestTier, id: EntryId) {
+    for _ in 0..8 {
+        drained(tier);
+        tick(inner, Tick::Full { command_pages: 0 });
+        if disk_copy(inner, id).is_some_and(|copy| copy.landed && !copy.chain_owed) {
+            return;
+        }
+    }
+    panic!("the point never landed whole");
+}
+
+/// Splash `Cache::freeDiskSpace`: the tier makes room only by evicting the
+/// state with its copy, so a disk-only state whose object a quota eviction
+/// cleared leaves the store, and one with a RAM copy keeps RAM and loses
+/// only its disk copy; no entry outlives its object.
+/// Mutation EV1 (`poll_offload` skips the tier's evictions) → red.
+#[test]
+fn a_quota_eviction_takes_the_disk_only_state() {
+    let Some((mut probe, probe_tier)) =
+        fixture_on(0x5713_4101, 16, 16, test_tier("s13-evict-probe", 1 << 30))
+    else {
+        return;
+    };
+    let id = park(&mut probe, 70, StateClass::Checkpoint);
+    assert_eq!(reclaim(&mut probe, id), Reclaimed::Written);
+    settle(&mut probe, &probe_tier, id);
+    let point = probe_tier.tier.manager.total_bytes();
+    drop(probe);
+    drop(probe_tier);
+
+    let limit = 2 * point + point / 2;
+    let Some((mut inner, tier)) = fixture_on(0x5713_4101, 16, 16, test_tier("s13-evict", limit))
+    else {
+        return;
+    };
+    let a = park(&mut inner, 70, StateClass::Checkpoint);
+    assert_eq!(reclaim(&mut inner, a), Reclaimed::Written);
+    settle(&mut inner, &tier, a);
+    let p = park(&mut inner, 71, StateClass::Ordinary);
+    assert_eq!(
+        stage(&mut inner, p, MakeRoom::Refuse, true),
+        Staged::Started
+    );
+    settle(&mut inner, &tier, p);
+    assert!(!ram(&inner, a) && ram(&inner, p));
+    let key = |inner: &Qwen35Inner, id: EntryId| disk_copy(inner, id).expect("a copy").key;
+    let (a_key, p_key) = (key(&inner, a), key(&inner, p));
+    let on_tier = |key: &ColdCacheKey| tier.tier.manager.contains_in(key, ColdGroup::DFlash2State);
+
+    let mut last = p;
+    for seed in 72..80 {
+        if !on_tier(&a_key) && !on_tier(&p_key) {
+            break;
+        }
+        last = park(&mut inner, seed, StateClass::Checkpoint);
+        assert_eq!(reclaim(&mut inner, last), Reclaimed::Written);
+        settle(&mut inner, &tier, last);
+    }
+    assert!(!on_tier(&a_key) && !on_tier(&p_key), "both objects went");
+    drained(&tier);
+    poll_offload(&mut inner);
+
+    assert!(
+        inner.dflash2_states.store.get(a).is_none(),
+        "the disk-only state left with its object"
+    );
+    assert!(ram(&inner, p) && disk_copy(&inner, p).is_none());
+    assert!(disk_copy(&inner, last).is_some_and(|copy| copy.landed));
+    let status = crate::models::qwen3_5::dflash2_turn::state_status(&inner);
+    let indexed = inner
+        .dflash2_states
+        .store
+        .entries()
+        .filter(|entry| entry.disk().is_some())
+        .filter(|entry| on_tier(&entry.disk().expect("a copy").key))
+        .count() as u64;
+    assert_eq!(
+        status.disk_entries, indexed,
+        "every disk entry has its object"
+    );
+}
+
+/// Splash `DiskSpace::measure` at every control pass: a Full tick of a
+/// persistent tier that grew past the root's limit with an idle sibling
+/// takes the sibling.
+/// Mutation Q1b (the Full tick does not measure) → red.
+#[test]
+fn a_full_tick_measures_the_cache_root() {
+    let Some((mut probe, probe_tier)) = fixture_on(
+        0x5713_4201,
+        16,
+        16,
+        persistent_test_tier("s13-measure-probe", 1 << 30),
+    ) else {
+        return;
+    };
+    let id = park(&mut probe, 81, StateClass::Checkpoint);
+    assert_eq!(reclaim(&mut probe, id), Reclaimed::Written);
+    settle(&mut probe, &probe_tier, id);
+    let point = probe_tier.tier.manager.total_bytes();
+    drop(probe);
+    drop(probe_tier);
+
+    let root = std::env::temp_dir().join(format!(
+        "mlx-s13-measure-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let sibling = root.join("cache").join("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    std::fs::create_dir_all(&sibling).expect("a sibling");
+    std::fs::File::create(sibling.join("object.safetensors"))
+        .and_then(|file| file.set_len(point))
+        .expect("the sibling's object");
+    let limit = point + point / 2;
+    let tier = TestTier {
+        tier: tier_at(&root, "s13-measure", limit, true),
+        root,
+    };
+    assert!(sibling.exists(), "the root fits its limit at open");
+    let Some((mut inner, tier)) = fixture_on(0x5713_4201, 16, 16, tier) else {
+        return;
+    };
+    let id = park(&mut inner, 81, StateClass::Checkpoint);
+    assert_eq!(reclaim(&mut inner, id), Reclaimed::Written);
+    settle(&mut inner, &tier, id);
+    tick(&mut inner, Tick::Full { command_pages: 0 });
+    assert!(!sibling.exists(), "the tier grew: the idle sibling went");
+}

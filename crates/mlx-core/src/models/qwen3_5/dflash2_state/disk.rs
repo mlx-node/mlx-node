@@ -421,7 +421,9 @@ pub(crate) fn stage<T: DFlash2Target>(
     }
 }
 
-/// Splash `StateCache::pollOffload` and `Cache::pollTransfers`: takes the
+/// Splash `StateCache::pollOffload` and `Cache::pollTransfers`: first the
+/// state objects the tier's evictions cleared (Splash `Cache::freeDiskSpace`:
+/// a state with a RAM copy keeps it, one without goes), then the
 /// writer's landings. A landed state's disk copy stands; a failed one
 /// leaves, and a state left with no copy goes. A chain block that failed
 /// fails its point: the state's disk copy leaves. True when anything
@@ -433,6 +435,27 @@ pub(crate) fn poll_offload<T: DFlash2Target>(target: &mut T) -> bool {
     };
     let mut landed = false;
     let mut resync = false;
+    for key in disk.tier.manager.take_evicted() {
+        let Some(id) = store
+            .entries()
+            .find(|entry| {
+                entry
+                    .disk()
+                    .is_some_and(|copy| copy.landed && copy.key == key)
+            })
+            .map(Entry::id)
+        else {
+            continue;
+        };
+        store.set_disk(id, None);
+        if store.get(id).is_some_and(|entry| entry.ram().is_none()) {
+            store.remove(id);
+        }
+        if disk.chain.as_ref().is_some_and(|cursor| cursor.id == id) {
+            disk.chain = None;
+        }
+        resync = true;
+    }
     while let Ok(landing) = disk.landed_rx.try_recv() {
         landed = true;
         let (key, ok, payload) = match landing {
@@ -716,6 +739,9 @@ pub(crate) fn tick<T: DFlash2Target>(target: &mut T, tick: Tick) -> bool {
         }
     }
     if let Tick::Full { command_pages } = tick {
+        if let Some(disk) = target.dflash2_states().disk.as_ref() {
+            disk.tier.measure();
+        }
         let governor = target
             .memory_registration()
             .map_or_else(crate::engine::governor::governor, |guard| guard.governor());

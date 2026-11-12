@@ -1289,6 +1289,12 @@ struct Shared {
     tracked_failed: AtomicBool,
     /// Called after every tracked job (state or tracked block) lands.
     landing_wake: Mutex<Option<LandingWake>>,
+    /// Dropped only once the writer has returned (Splash `~SlotFile` joins
+    /// its worker before `~CacheDirectory` closes the lock).
+    keep: Mutex<Option<Box<dyn Send>>>,
+    /// DFlash2 state objects a quota or room eviction cleared, oldest
+    /// first, until [`ColdCacheManager::take_evicted`].
+    evicted: Mutex<Vec<ColdCacheKey>>,
 }
 
 type LandingWake = Arc<dyn Fn() + Send + Sync>;
@@ -1436,6 +1442,8 @@ impl ColdCacheManager {
             stopped: AtomicBool::new(false),
             tracked_failed: AtomicBool::new(false),
             landing_wake: Mutex::new(None),
+            keep: Mutex::new(None),
+            evicted: Mutex::new(Vec::new()),
         });
         let (sender, receiver) = mpsc::sync_channel::<WriteJob>(queue_depth);
         let (state_sender, state_receiver) = mpsc::sync_channel::<StateJob>(1);
@@ -1789,6 +1797,24 @@ impl ColdCacheManager {
         if let Ok(mut slot) = self.shared.landing_wake.lock() {
             *slot = wake;
         }
+    }
+
+    /// Keeps `guard` alive until the writer thread returns, however long the
+    /// write it is in takes after [`Self::close`].
+    pub fn hold_until_writer_exits(&self, guard: Box<dyn Send>) {
+        if let Ok(mut slot) = self.shared.keep.lock() {
+            *slot = Some(guard);
+        }
+    }
+
+    /// The DFlash2 state objects evictions cleared since the last call
+    /// (Splash `Cache::freeDiskSpace` evicts the state with its copy).
+    pub fn take_evicted(&self) -> Vec<ColdCacheKey> {
+        self.shared
+            .evicted
+            .lock()
+            .map(|mut evicted| std::mem::take(&mut *evicted))
+            .unwrap_or_default()
     }
 
     /// Drain for at most `timeout`, then stop the writer: every later
@@ -2975,6 +3001,14 @@ fn writer_loop(
     states: &Receiver<StateJob>,
     wake: &Receiver<()>,
 ) {
+    struct ReleaseOnExit<'a>(&'a Shared);
+    impl Drop for ReleaseOnExit<'_> {
+        fn drop(&mut self) {
+            let kept = self.0.keep.lock().ok().and_then(|mut slot| slot.take());
+            drop(kept);
+        }
+    }
+    let _release = ReleaseOnExit(shared);
     // Whether any write since the last barrier failed to persist; reset after
     // each barrier so every drain reports only on its own window.
     let mut failed = false;
@@ -3459,6 +3493,11 @@ fn clear_oldest(
     if let Some(entry) = index.entries.remove(&key) {
         index.total_bytes = index.total_bytes.saturating_sub(entry.size);
         shared.stats.evictions.fetch_add(1, Ordering::Relaxed);
+        if entry.group == ColdGroup::DFlash2State
+            && let Ok(mut evicted) = shared.evicted.lock()
+        {
+            evicted.push(key);
+        }
     }
     Some(true)
 }
@@ -9460,6 +9499,43 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the writer never reached the gate");
         release_tx
+    }
+
+    // Splash `~SlotFile` joins its worker before `~CacheDirectory` closes the
+    // lock: a close whose drain timed out keeps the guard while the writer is
+    // still inside a commit, and lets it go once the writer returned.
+    // Mutation LK1 (the guard drops at once) → red.
+    #[test]
+    fn close_keeps_the_guard_until_the_writer_exits() {
+        use std::os::fd::AsRawFd;
+        let root = temp_root("close-guard");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let lock_path = root.join("guard.lock");
+        let lock = fs::File::create(&lock_path).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let release = park_writer(&manager);
+        manager.hold_until_writer_exits(Box::new(lock));
+        assert!(!manager.close(Duration::ZERO), "the writer is parked");
+        let probe = fs::File::open(&lock_path).unwrap();
+        let free = || unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        assert!(
+            !free(),
+            "the guard outlives a close while the writer writes"
+        );
+        drop(release);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !free() {
+            assert!(
+                Instant::now() < deadline,
+                "the guard goes once the writer exits"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
     }
 
     // K8: a state object costs the quota its file size, payload + header,

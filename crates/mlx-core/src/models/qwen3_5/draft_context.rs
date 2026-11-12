@@ -256,9 +256,19 @@ impl DraftContextWindow {
         if bytes.len() as u64 != self.nbytes() || begin > end || end - begin > self.slots {
             return Ok(false);
         }
-        let buffer = MxArray::from_uint8(bytes, &[bytes.len() as i64])?;
-        MxArray::eval_arrays_with_context(&[&buffer], "draft_context_read")?;
-        self.buffer = buffer;
+        self.eval()?;
+        let ptr = self.buffer.storage_ptr() as *mut u8;
+        if ptr.is_null() {
+            self.buffer = MxArray::zeros(&[0], Some(DType::Uint8))?;
+            let buffer = MxArray::from_uint8(bytes, &[bytes.len() as i64])?;
+            MxArray::eval_arrays_with_context(&[&buffer], "draft_context_read")?;
+            self.buffer = buffer;
+        } else {
+            // SAFETY: Splash `stateSpans` reads into the lane's own window:
+            // the settled buffer holds exactly `nbytes` unified-memory bytes
+            // and no GPU work is in flight on it after the eval.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+        }
         self.begin = begin;
         self.end = end;
         Ok(true)
@@ -448,6 +458,44 @@ mod tests {
         assert_eq!((lane.begin(), lane.end()), (8, 16));
         assert_eq!(lane.load_rows(8, 8)?.to_uint16_native()?, tail);
         assert!(window.store_rows(&rows, 3).is_err(), "rows must continue");
+        Ok(())
+    }
+
+    /// Splash `beginRestore` reads a disk state into the lane's own window
+    /// (`stateSpans` over `writableContents`): the restore allocates no
+    /// second window beside the one the governor admitted.
+    /// Mutation read_bytes_allocates (a fresh buffer per read) → red.
+    #[test]
+    fn a_disk_read_lands_in_the_window_it_has() -> Result<()> {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return Ok(());
+        }
+        let mut window = DraftContextWindow::new(128, 4)?;
+        window.eval()?;
+        let storage = window.buffer.storage_ptr();
+        assert!(!storage.is_null());
+        let allocations = WINDOW_ALLOCATIONS.with(std::cell::Cell::get);
+        let bytes: Vec<u8> = (0..window.nbytes() as usize)
+            .map(|i| (i * 13 % 251) as u8)
+            .collect();
+        assert!(window.read_bytes(&bytes, 3, 5)?);
+        assert_eq!(
+            window.buffer.storage_ptr(),
+            storage,
+            "the read lands in the window's storage"
+        );
+        assert_eq!(window.host_bytes()?, bytes);
+        assert_eq!((window.begin(), window.end()), (3, 5));
+        assert_eq!(WINDOW_ALLOCATIONS.with(std::cell::Cell::get), allocations);
+
+        let mut lazy = DraftContextWindow::new(128, 4)?;
+        assert!(lazy.read_bytes(&bytes, 0, 4)?);
+        assert!(!lazy.buffer.storage_ptr().is_null());
+        assert_eq!(lazy.host_bytes()?, bytes);
+        assert!(
+            !window.read_bytes(&bytes[1..], 0, 1)?,
+            "a short read is refused"
+        );
         Ok(())
     }
 

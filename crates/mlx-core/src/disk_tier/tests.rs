@@ -490,3 +490,88 @@ fn a_lock_whose_file_was_replaced_names_nothing() {
     File::create(dir.join(LOCK_FILE)).unwrap();
     assert!(!named(&dir, &held), "the path names another lock now");
 }
+
+/// Splash `DiskSpace::measure`: the root's idle caches counted at open
+/// keep counting, and as the tier grows past the root's limit with them
+/// the oldest goes; one whose lock someone took meanwhile is that
+/// process's and stays.
+/// Mutation Q1a (`measure` does nothing) → red.
+#[test]
+fn a_growing_tier_removes_the_oldest_idle_sibling() {
+    let root = Root::new("measure");
+    fs::create_dir_all(root.join("tmp")).unwrap();
+    let cache = root.join("cache");
+    fs::create_dir_all(&cache).unwrap();
+    set_volume(&root.0, Some(volume(4096, 2048)));
+    let day = Duration::from_secs(24 * 60 * 60);
+    let older = plant_namespace(&cache, NS_A, 600 << 10, 2 * day);
+    let newer = plant_namespace(&cache, NS_B, 100 << 10, day);
+    let options = persistent_options(&root, CacheDisk::Bytes(1 << 20));
+    let tier = open_disk_tier(&options, || identity(NS), 160).expect("persistent tier");
+    assert!(tier.persistent);
+    assert_eq!(tier.limit, 1 << 20);
+    assert!(older.exists() && newer.exists(), "the root fits at open");
+
+    let write = |payload: usize, salt: u32| {
+        let mut object = tiny_state(tier.state_fingerprint);
+        object.label.tokens = (salt..salt + 16).collect();
+        object.key = ColdCacheKey::chain(
+            ColdGroup::DFlash2State,
+            tier.state_fingerprint,
+            None,
+            &object.label.tokens,
+            &[],
+            0,
+            0,
+        );
+        object.layout.spans = vec![payload as u64 - 64, 64];
+        object.payload = vec![7u8; payload];
+        let (tx, rx) = mpsc::channel();
+        tier.manager
+            .enqueue_state(object, MakeRoom::Evict, tx)
+            .unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Landed::State { ok: true, .. }
+        ));
+    };
+    write(600 << 10, 0);
+    tier.measure();
+    assert!(!older.exists(), "the oldest idle sibling went");
+    assert!(newer.exists());
+    assert!(tier.manager.total_bytes() + (100 << 10) <= tier.limit);
+
+    let Taken::Lock(held) = take_lock(&newer) else {
+        panic!("the sibling's lock");
+    };
+    write(340 << 10, 100);
+    tier.measure();
+    assert!(newer.exists(), "a sibling someone holds stays");
+    drop(held);
+}
+
+/// Splash `~SlotFile` joins its worker before `~CacheDirectory` closes the
+/// lock: a closed persistent tier lets its namespace go once its writer
+/// exits, so the next open takes it.
+#[test]
+fn persistent_close_releases_the_namespace_after_the_writer() {
+    let root = Root::new("close-lock");
+    fs::create_dir_all(root.join("tmp")).unwrap();
+    set_volume(&root.0, Some(volume(4096, 2048)));
+    let options = persistent_options(&root, CacheDisk::Bytes(1 << 40));
+    let tier = open_disk_tier(&options, || identity(NS), 160).expect("persistent tier");
+    assert!(tier.persistent);
+    tier.close(Instant::now());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match open_persistent_dir(&root.join("cache"), NS) {
+            PersistentOpen::Open { .. } => break,
+            PersistentOpen::Held(_) => {
+                assert!(Instant::now() < deadline, "the namespace stays held");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            PersistentOpen::Failed(error) => panic!("{error}"),
+        }
+    }
+    drop(tier);
+}
