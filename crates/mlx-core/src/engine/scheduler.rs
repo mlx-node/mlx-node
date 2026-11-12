@@ -604,6 +604,17 @@ struct PrefillLane {
     overdue: bool,
 }
 
+fn prefill_lane<P>(turn: &TurnState<P>) -> PrefillLane {
+    debug_assert!(!turn.whole_prompt_prefill);
+    PrefillLane {
+        seq_id: turn.seq_id,
+        arrival_order: turn.arrival_order,
+        processed: turn.num_computed_tokens,
+        remaining: turn.prompt_tokens - turn.num_computed_tokens,
+        overdue: turn.overtaken >= MAX_OVERTAKES,
+    }
+}
+
 /// Splash `Scheduler::leadsBefore` without priority: overdue lanes first,
 /// oldest first; then the fewest remaining rows, then submission order.
 fn leads_before(a: &PrefillLane, b: &PrefillLane) -> bool {
@@ -1724,17 +1735,28 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                     && !turn.cancel_snapshot
                     && !excluded.contains(&turn.seq_id)
             })
-            .map(|turn| {
-                debug_assert!(!turn.whole_prompt_prefill);
-                PrefillLane {
-                    seq_id: turn.seq_id,
-                    arrival_order: turn.arrival_order,
-                    processed: turn.num_computed_tokens,
-                    remaining: turn.prompt_tokens - turn.num_computed_tokens,
-                    overdue: turn.overtaken >= MAX_OVERTAKES,
-                }
-            })
+            .map(prefill_lane)
             .collect()
+    }
+
+    /// Splash `Scheduler::prefillAdmissionOrder`'s resident lanes: Splash
+    /// `Scheduler::admit` makes a start a Prefill lane at once, so the
+    /// admitted turns not yet promoted are lanes too.
+    fn admission_lanes(&self, candidate: SeqId) -> Vec<PrefillLane> {
+        let mut lanes = self.ready_lanes(&[]);
+        lanes.extend(
+            self.waiting
+                .iter()
+                .filter(|turn| {
+                    turn.status == TurnStatus::Waiting
+                        && turn.seq_id != candidate
+                        && turn.num_computed_tokens < turn.prompt_tokens
+                        && turn.num_tokens > turn.num_computed_tokens
+                        && !turn.cancel_snapshot
+                })
+                .map(prefill_lane),
+        );
+        lanes
     }
 
     /// Splash `Scheduler::planPrefill`: the leader halves under the pair
@@ -1817,7 +1839,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             remaining: prompt_tokens - processed,
             overdue: overtaken >= MAX_OVERTAKES,
         };
-        let mut ready = self.ready_lanes(&[]);
+        let mut ready = self.admission_lanes(seq_id);
         ready.push(candidate);
         let Some(unit) = self.plan_unit(ready.clone(), self.contended()) else {
             return true;
@@ -3978,6 +4000,19 @@ mod tests {
             turn
         });
         assert!(fixed.serves_candidate(9, 0, 50_000, None, 0));
+    }
+
+    /// Splash `Scheduler::admit`: a start admitted earlier in the same pass
+    /// is a resident lane to the next candidate before it is promoted.
+    /// Mutation AW1: admitted waiters are left out → red.
+    #[test]
+    fn a_waiting_admitted_start_is_seen_by_the_next_candidate() {
+        let mut scheduler = measured_scheduler(262_144, DEFAULT_DECODE_SHARE);
+        scheduler
+            .enqueue_turn(TurnState::new(1, vec![1; 40_000], 0, Vec::new(), None, "p").unwrap())
+            .expect("enqueue");
+        assert!(!scheduler.serves_candidate(9, 0, 50_000, None, 0));
+        assert!(scheduler.serves_candidate(9, 0, 300, None, 0));
     }
 
     /// Splash `Engine::tick` commits a unit with the excluded lanes less
