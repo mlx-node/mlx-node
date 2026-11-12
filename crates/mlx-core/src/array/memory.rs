@@ -217,10 +217,11 @@ pub fn paged_prefill_eval_interval() -> i32 {
 
 /// Default paged-prefill chunk size in tokens.
 ///
-/// `0` means "do not chunk" — callers MUST treat 0 as a signal to take the
-/// legacy single-shot whole-suffix prefill path. Any positive value is the
-/// number of new (non-cached) tokens to feed through the model per chunk
-/// when the chunked-prefill driver is active.
+/// `0` means "the family default": single-shot for the families that have
+/// one; Qwen3.5 dense and MoE read `forward::paged_prefill_chunk_rows`, which
+/// runs 2,048-row chunks and caps a larger value at 2,048. Any positive value
+/// is the number of new (non-cached) tokens to feed through the model per
+/// chunk when the chunked-prefill driver is active.
 ///
 /// Override at runtime via `MLX_PAGED_PREFILL_CHUNK_SIZE`. Negative values,
 /// non-integer values, and unset env all collapse to this default. The env
@@ -232,8 +233,7 @@ pub const PAGED_PREFILL_CHUNK_SIZE_DEFAULT: i32 = 0;
 ///
 /// Reads `MLX_PAGED_PREFILL_CHUNK_SIZE` env var once via OnceLock.
 /// Returns 0 when env unset, set to 0, set to a negative number, or
-/// unparseable — callers MUST treat 0 as "do not chunk; run legacy
-/// single-shot prefill".
+/// unparseable — the family default (see `PAGED_PREFILL_CHUNK_SIZE_DEFAULT`).
 pub fn paged_prefill_chunk_size() -> i32 {
     use std::sync::OnceLock;
     static CACHED: OnceLock<i32> = OnceLock::new();

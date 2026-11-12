@@ -20,10 +20,10 @@
  *     to spread the user's own env under it if it wants shell values to win.
  *
  * Keeping the two apart matters. `MLX_PAGED_PREFILL_CHUNK_SIZE` reads as
- * `0` ("no chunking") in Rust when unset; 2048 is the value
- * `mlx launch claude` has historically applied to bound the cold-prefill
- * memory peak, and baking it into the engine would silently change every
- * other embedder's behaviour.
+ * the family default in Rust when unset: Qwen3.5 dense and MoE run 2,048-row
+ * chunks and cap a larger value at 2,048 (the memory plan prices that chunk);
+ * the other families run single-shot, and baking 2048 into the engine would
+ * silently change those embedders' behaviour.
  */
 
 /** Env var names this module owns. Exported so tests can assert the exact set. */
@@ -32,7 +32,7 @@ export const ENGINE_POLICY_ENV_VARS = ['MLX_PAGED_PREFILL_CHUNK_SIZE'] as const;
 export interface EnginePolicy {
   /**
    * `MLX_PAGED_PREFILL_CHUNK_SIZE` — tokens per paged-prefill chunk.
-   * `0` disables chunking (the Rust default when the var is unset).
+   * `0` is the family default; Qwen3.5 caps values above 2048.
    */
   pagedPrefillChunkSize?: number;
 }

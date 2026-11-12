@@ -18,7 +18,7 @@ import {
  * `mlx launch claude` has always written `MLX_PAGED_PREFILL_CHUNK_SIZE=2048`
  * before loading anything, to bound the cold-prefill memory peak. That is
  * LAUNCHER policy, not an engine default — unset, the Rust side reads the var
- * as `0` (no chunking) — and the var latches through a `OnceLock` on first
+ * as `0` (the family default) — and the var latches through a `OnceLock` on first
  * read, so a launcher that forgot to declare it would degrade silently rather
  * than fail. Pinning it here needs no `claude` binary and no model.
  */

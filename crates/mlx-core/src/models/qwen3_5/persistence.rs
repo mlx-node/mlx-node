@@ -2585,6 +2585,7 @@ pub async fn load_with_thread(
         &CheckpointSource::Dir(PathBuf::from(model_path)),
         draft_model_path,
         kv_format,
+        None,
     )
     .await
 }
@@ -2594,14 +2595,22 @@ pub(crate) async fn load_with_source(
     source: &CheckpointSource,
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
+    max_memory_bytes: Option<u64>,
 ) -> Result<Qwen3_5Model> {
-    load_with_thread_impl(source, draft_model_path, kv_format, false).await
+    load_with_thread_impl(source, draft_model_path, kv_format, max_memory_bytes, false).await
 }
 
 /// The caller releases `source`'s lease when this fails.
 pub(crate) async fn load_clef_with_source(source: &CheckpointSource) -> Result<Qwen3_5Model> {
     check_clef_assets(source)?;
-    load_with_thread_impl(source, None, Some(crate::transformer::KvFormat::Bf16), true).await
+    load_with_thread_impl(
+        source,
+        None,
+        Some(crate::transformer::KvFormat::Bf16),
+        None,
+        true,
+    )
+    .await
 }
 
 /// A GGUF carries the decision head itself; a directory must ship it as
@@ -2650,6 +2659,7 @@ async fn load_with_thread_impl(
     source: &CheckpointSource,
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
+    max_memory_bytes: Option<u64>,
     clef: bool,
 ) -> Result<Qwen3_5Model> {
     let model_assets_path = source.asset_dir().to_string_lossy().into_owned();
@@ -3054,6 +3064,7 @@ async fn load_with_thread_impl(
 
                 // Create inner model
                 let mut inner = Qwen35Inner::new(config.clone())?;
+                inner.max_memory_bytes = max_memory_bytes;
                 inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(path));
 
                 // Deterministic weight-byte total of the text checkpoint for
@@ -3373,7 +3384,7 @@ async fn load_with_thread_impl(
     })
 }
 /// Parse Qwen3.5 dense config from JSON.
-fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
+pub(crate) fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
     let text_cfg = raw.get("text_config");
     let paged = PagedCacheConfig::from_raw_json(raw);
 
@@ -3482,7 +3493,6 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         // override and bypass full-context sizing. Small MTP benchmark pools
         // remain available by setting `paged_cache_memory_mb` explicitly.
         paged_cache_memory_mb: paged.paged_cache_memory_mb,
-        paged_cache_initial_memory_mb: paged.paged_cache_initial_memory_mb,
         paged_block_size: paged.paged_block_size,
         // Block-paged attention is the production default for Qwen3.5. The
         // explicit config bit and MLX_QWEN35_PAGED_OVERRIDE remain useful for
@@ -3731,25 +3741,21 @@ mod tests {
                 "intermediate_size": 128,
                 "num_experts": 2,
                 "paged_cache_memory_mb": 999,
-                "paged_cache_initial_memory_mb": 999,
                 "paged_block_size": 999,
                 "persist_paged_cache": true
             }
         });
         let absent = parse_config(&raw).unwrap();
         assert_eq!(absent.paged_cache_memory_mb, None);
-        assert_eq!(absent.paged_cache_initial_memory_mb, None);
         assert_eq!(absent.paged_block_size, None);
         assert_eq!(absent.persist_paged_cache, None);
         raw["paged_cache_memory_mb"] = json!(4294967360_u64);
-        raw["paged_cache_initial_memory_mb"] = json!(16);
         raw["paged_block_size"] = json!(-1);
         raw["pagedBlockSize"] = json!(32);
         raw["use_block_paged_cache"] = json!(false);
         raw["persist_paged_cache"] = json!(false);
         let config = parse_config(&raw).unwrap();
         assert_eq!(config.paged_cache_memory_mb, Some(64));
-        assert_eq!(config.paged_cache_initial_memory_mb, Some(16));
         assert_eq!(config.paged_block_size, None);
         assert_eq!(config.persist_paged_cache, Some(false));
         let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
@@ -4551,62 +4557,19 @@ mod tests {
         })
     }
 
+    /// An absent pool size stays absent (the memory plan sizes the pool);
+    /// an explicit one stays the ceiling the plan checks.
     #[test]
-    fn dense_mtp_missing_paged_budget_reaches_full_context_default() {
-        let raw = qwen36_27b_mtp_config_json();
+    fn dense_mtp_paged_budget_absence_and_explicit_size_parse() {
+        let mut raw = qwen36_27b_mtp_config_json();
         let config = parse_config(&raw).expect("Qwen3.6-27B config must parse");
         assert_eq!(config.n_mtp_layers, 1, "fixture must exercise dense MTP");
-        assert_eq!(
-            config.paged_cache_memory_mb, None,
-            "an absent budget must remain distinguishable from an explicit override"
-        );
+        assert_eq!(config.paged_cache_memory_mb, None);
 
-        let default_memory_mb =
-            crate::models::qwen3_5::config::qwen35_default_paged_cache_memory_mb(
-                config.max_position_embeddings as u32,
-                config.paged_block_size.unwrap_or(16),
-                config.head_dim as u32,
-                config.num_kv_heads as u32,
-                config.full_attention_layer_count() as u32,
-            );
-        let (memory_mb, source) =
-            crate::models::qwen3_5::config::qwen35_resolve_paged_cache_memory_mb(
-                config.paged_cache_memory_mb,
-                default_memory_mb,
-            );
-        assert_eq!(memory_mb, 16_384);
-        assert_eq!(source, "auto_full_context");
-
-        let paged = mlx_paged_attn::PagedAttentionConfig {
-            block_size: 16,
-            gpu_memory_mb: memory_mb,
-            head_size: 256,
-            num_kv_heads: 4,
-            num_layers: 16,
-            use_fp8_cache: Some(false),
-            max_seq_len: Some(262_144),
-            max_batch_size: Some(32),
-        };
-        assert_eq!(paged.calculate_num_blocks(), 16_384);
-        assert_eq!(paged.max_cached_tokens(), 262_144);
-    }
-
-    #[test]
-    fn dense_mtp_explicit_paged_budget_stays_explicit() {
-        let mut raw = qwen36_27b_mtp_config_json();
         raw["paged_cache_memory_mb"] = json!(2_048);
-
         let config = parse_config(&raw).expect("Qwen3.6-27B config must parse");
         assert_eq!(config.n_mtp_layers, 1);
         assert_eq!(config.paged_cache_memory_mb, Some(2_048));
-
-        let (memory_mb, source) =
-            crate::models::qwen3_5::config::qwen35_resolve_paged_cache_memory_mb(
-                config.paged_cache_memory_mb,
-                16_384,
-            );
-        assert_eq!(memory_mb, 2_048);
-        assert_eq!(source, "config");
     }
 
     #[test]
@@ -4930,7 +4893,6 @@ mod tests {
             partial_rotary_factor: 0.25,
             rope_theta: 100_000.0,
             paged_cache_memory_mb: None,
-            paged_cache_initial_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: None,
             persist_paged_cache: None,

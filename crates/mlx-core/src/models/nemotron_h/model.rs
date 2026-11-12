@@ -779,17 +779,24 @@ impl NemotronHInner {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let coordinator = crate::cache_limit::coordinator();
+        let hard_budget = crate::engine::memory_plan::automatic_hard_budget().map_err(|error| {
+            Error::from_reason(format!(
+                "NemotronH paged cache sizing failed safely; refusing an uncapped pool request: \
+                 {error}"
+            ))
+        })?;
         let (selected_blocks, pool_guard) = {
             let mut reserved = None;
             for _ in 0..8 {
                 let sibling = coordinator.registered_pool_bytes();
-                let sizing = mlx_paged_attn::profile::load_time_pool_sizing_with_reserved(
+                let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
                     requested_blocks,
                     attn_layer_count,
                     num_kv_heads,
                     head_size,
                     block_size,
                     cache_dtype,
+                    hard_budget,
                     sibling,
                 )
                 .map_err(|error| {

@@ -41,7 +41,6 @@ fn tiny_cfg(use_block_paged: bool) -> Qwen3_5Config {
         partial_rotary_factor: 0.25,
         rope_theta: 100_000.0,
         paged_cache_memory_mb: Some(64),
-        paged_cache_initial_memory_mb: None,
         paged_block_size: Some(16),
         use_block_paged_cache: if use_block_paged { Some(true) } else { None },
         persist_paged_cache: None,
@@ -63,9 +62,7 @@ pub(super) fn tiny_paged_forward_cfg() -> Qwen3_5Config {
 }
 
 fn expected_scheduler_window(inner: &Qwen35Inner) -> (u32, u32, u32) {
-    use crate::engine::hybrid_scheduler::{
-        pool_tokens_after_recurrent, scheduled_turn_context, scheduler_per_seq_context_override,
-    };
+    use crate::engine::hybrid_scheduler::{pool_tokens_after_recurrent, scheduled_turn_context};
     let trained = inner.config.max_position_embeddings.max(0) as u32;
     let adapter = inner
         .paged_adapter
@@ -78,11 +75,7 @@ fn expected_scheduler_window(inner: &Qwen35Inner) -> (u32, u32, u32) {
         adapter.bytes_per_block().unwrap_or(0),
         inner.config.recurrent_state_bytes(),
     );
-    (
-        trained,
-        scheduled_turn_context(trained, usable, scheduler_per_seq_context_override()),
-        pool,
-    )
+    (trained, scheduled_turn_context(trained, usable, None), pool)
 }
 
 #[test]
@@ -105,36 +98,45 @@ fn tiny_hybrid_recurrent_bytes_make_usable_window_stricter_than_raw_pool() {
     );
 }
 
+/// Installs a memory plan whose pool lane holds `pool_window` tokens and,
+/// with `speculative`, a tiny DFlash2 draft and a lane of that window.
+fn install_plan(inner: &mut Qwen35Inner, pool_window: Option<u32>, speculative: Option<u32>) {
+    use crate::engine::memory_plan::{KvLayout, MemoryPlan};
+    let layout = KvLayout::of(
+        1,
+        1,
+        32,
+        DType::BFloat16,
+        crate::transformer::KvFormat::Bf16,
+    );
+    let mut plan = MemoryPlan::with_pool_window(0, 1, layout, 0, pool_window.unwrap_or(0));
+    if pool_window.is_none() {
+        plan.pool = None;
+    }
+    plan.speculative =
+        speculative.and_then(|window| MemoryPlan::with_speculative_window(window, 8).speculative);
+    if speculative.is_some() && inner.dflash2.is_none() {
+        inner.dflash2 = Some(
+            crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(&inner.config)
+                .expect("tiny DFlash2 companion"),
+        );
+    }
+    inner.memory_plan = Some(plan);
+}
+
 /// Gate: a DFlash2 window above the pool leaves paged preflight on the
-/// pool window. Mutation: preflight on `speculative_window()` → red.
+/// plan's pool window. Mutation: preflight on `speculative_window()` → red.
 #[test]
 fn preflight_keeps_the_pool_window_when_a_dflash2_window_is_published() {
-    // M3 Pro trigger inputs: 5,051 one-MiB BF16 blocks less 147 GDN blocks.
-    assert_eq!(
-        crate::engine::hybrid_scheduler::pool_tokens_after_recurrent(
-            5_051 * 16,
-            16,
-            1 << 20,
-            153_944_064
-        ),
-        78_464
-    );
     let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
         "preflight_keeps_the_pool_window_when_a_dflash2_window_is_published",
     ) else {
         return;
     };
-    let pool_window = inner.pool_context_limit();
     let trained = inner.config.max_position_embeddings as u32;
-    assert!(pool_window + 1 < trained, "{pool_window} vs {trained}");
-    inner.dflash2_window = Some(crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms {
-        trained,
-        draft_trained: trained,
-        pool: Some(trained),
-        reserve: None,
-        row_bytes: 1,
-        extent_rows: 256,
-    });
+    install_plan(&mut inner, Some(100), Some(trained));
+    let pool_window = inner.pool_context_limit();
+    assert_eq!(pool_window, 100);
     let speculative = inner.speculative_window().expect("a DFlash2 window");
     assert!(speculative > pool_window, "{speculative} vs {pool_window}");
 
@@ -157,10 +159,9 @@ fn preflight_keeps_the_pool_window_when_a_dflash2_window_is_published() {
     );
 }
 
-/// Gate: the native DFlash2 clamp reads the speculative window, after its
-/// trained and `MLX_PAGED_PER_SEQ_CTX` caps. Mutation: return
-/// `terms.window()` from `DFlash2Target::dflash2_window` → red (2,024 ≠
-/// 1,024 on the test adapter).
+/// Gate: the native DFlash2 clamp reads the plan's speculative window.
+/// Mutation: ignore the plan in `speculative_window` → red (the trained
+/// windows, not 700).
 #[test]
 fn dflash2_clamp_window_is_the_speculative_window() {
     use crate::models::qwen3_5::dflash2_turn::DFlash2Target;
@@ -169,39 +170,26 @@ fn dflash2_clamp_window_is_the_speculative_window() {
     else {
         return;
     };
-    let trained = inner.config.max_position_embeddings as u32;
-    inner.dflash2_window = Some(crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms {
-        trained: u32::MAX,
-        draft_trained: u32::MAX,
-        pool: Some(trained + 1_000),
-        reserve: None,
-        row_bytes: 1,
-        extent_rows: 256,
-    });
-    let speculative = inner.speculative_window().expect("a DFlash2 window");
-    assert!(speculative <= trained, "{speculative} vs {trained}");
-    assert_eq!(DFlash2Target::dflash2_window(&inner), Some(speculative));
+    install_plan(&mut inner, Some(100), Some(700));
+    assert_eq!(inner.speculative_window(), Some(700));
+    assert_eq!(DFlash2Target::dflash2_window(&inner), Some(700));
 }
 
-/// An omitted budget is the rest of a window only when memory sizes that
-/// window: the pool window of a paged load, the DFlash2 window with a pool
-/// or reservation term. A flat load's window is the trained length.
+/// An omitted budget is the rest of a window whenever the plan prices it:
+/// the pool window of a paged load, the DFlash2 window whenever the plan
+/// has its lane, whatever bounds it, and the flat lane's window of a load
+/// with neither pool nor draft. A flat load with a draft keeps the trained
+/// length.
 /// Mutation: set both omitted flags `true` in `from_parts` → red.
 /// Mutation: read the speculative flag from `memory_window` → red.
+/// Mutation: `pool_context_limit` ignores the plan's flat lane → red
+/// (the trained window, not 900).
 #[test]
 fn flat_load_publishes_no_rest_of_window() {
     let Some(mut inner) =
         dense_inner_with_test_adapter_or_skip("flat_load_publishes_no_rest_of_window")
     else {
         return;
-    };
-    let terms = |pool, reserve| crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms {
-        trained: u32::MAX,
-        draft_trained: u32::MAX,
-        pool,
-        reserve,
-        row_bytes: 1,
-        extent_rows: 256,
     };
     let limits = inner.context_limits_snapshot();
     assert!(limits.rest_of_window_output_budget);
@@ -215,19 +203,28 @@ fn flat_load_publishes_no_rest_of_window() {
         "the clamp stays Splash's"
     );
     assert!(!limits.omitted_budget_is_rest_of_window);
-    for (pool, reserve, memory_bound) in [
-        (None, Some(1_000), true),
-        (Some(1_000), None, true),
-        (None, None, false),
-    ] {
-        inner.dflash2_window = Some(terms(pool, reserve));
+    let trained = inner.config.max_position_embeddings as u32;
+    for (speculative, memory_bound) in [(Some(1_000), true), (Some(trained), true)] {
+        install_plan(&mut inner, None, speculative);
         let limits = inner.context_limits_snapshot();
         assert!(!limits.omitted_budget_is_rest_of_window);
         assert_eq!(
             limits.speculative_omitted_budget_is_rest_of_window, memory_bound,
-            "{pool:?} {reserve:?}"
+            "{speculative:?}"
         );
     }
+    inner.memory_plan = None;
+    let limits = inner.context_limits_snapshot();
+    assert!(!limits.speculative_omitted_budget_is_rest_of_window);
+
+    inner.dflash2 = None;
+    inner.memory_plan = Some(crate::engine::memory_plan::MemoryPlan::with_flat_window(
+        900,
+    ));
+    let limits = inner.context_limits_snapshot();
+    assert_eq!(limits.effective_window_tokens, 900);
+    assert!(limits.omitted_budget_is_rest_of_window);
+    assert_eq!(limits.speculative_window_tokens, None);
 }
 
 /// Gate: the load snapshot publishes the pool window as the effective
@@ -241,24 +238,16 @@ fn context_limits_publish_both_windows() {
     else {
         return;
     };
-    let pool_window = inner.pool_context_limit();
     let trained = inner.config.max_position_embeddings as u32;
-    assert!(pool_window + 1 < trained, "{pool_window} vs {trained}");
+    install_plan(&mut inner, Some(100), None);
     let limits = inner.context_limits_snapshot();
-    assert_eq!(limits.effective_window_tokens, pool_window);
+    assert_eq!(limits.effective_window_tokens, 100);
     assert_eq!(limits.speculative_window_tokens, None);
-    for draft_window in [pool_window + 1, (pool_window + trained) / 2] {
-        inner.dflash2_window = Some(crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms {
-            trained: u32::MAX,
-            draft_trained: u32::MAX,
-            pool: Some(draft_window),
-            reserve: None,
-            row_bytes: 1,
-            extent_rows: 256,
-        });
+    for draft_window in [101, (100 + trained) / 2] {
+        install_plan(&mut inner, Some(100), Some(draft_window));
         let limits = inner.context_limits_snapshot();
         assert_eq!(limits.trained_window_tokens, trained);
-        assert_eq!(limits.effective_window_tokens, pool_window);
+        assert_eq!(limits.effective_window_tokens, 100);
         assert_eq!(limits.speculative_window_tokens, Some(draft_window));
     }
 }
@@ -282,14 +271,7 @@ fn context_limits_publish_kv_formats() {
     assert_eq!(limits.kv_format, "bf16");
     assert_eq!(limits.speculative_kv_format, None);
 
-    inner.dflash2_window = Some(crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms {
-        trained: u32::MAX,
-        draft_trained: u32::MAX,
-        pool: Some(1_000),
-        reserve: None,
-        row_bytes: 1,
-        extent_rows: 256,
-    });
+    install_plan(&mut inner, Some(100), Some(1_000));
     let priced = crate::models::qwen3_5::dflash2_turn::dflash2_target_kv_format(&inner);
     assert_eq!(priced, crate::transformer::KvFormat::Int8);
     let limits = inner.context_limits_snapshot();
@@ -303,173 +285,186 @@ fn context_limits_publish_kv_formats() {
     assert_eq!(inner.context_limits_snapshot().kv_format, "int8");
 }
 
-/// Mutation: ignore `budget_blocks` in `dflash2_pool_budget` → red (5 blocks, not 6).
-#[test]
-fn dflash2_pool_budget_counts_allocated_blocks_once() {
-    const BLOCK_SIZE: u32 = 16;
-    let pool_config = mlx_paged_attn::PagedAttentionConfig {
-        block_size: BLOCK_SIZE,
-        num_kv_heads: 1,
-        head_size: 32,
-        num_layers: 2,
-        ..mlx_paged_attn::PagedAttentionConfig::default()
-    };
-    let pool = match mlx_paged_attn::LayerKVPool::new(
-        pool_config,
-        3,
-        8,
-        mlx_paged_attn::metal::MetalDtype::Float16,
-    ) {
-        Ok(pool) => Arc::new(pool),
-        Err(err) if crate::test_support::metal_device_absent(&err) => {
-            eprintln!("skipping dflash2_pool_budget_counts_allocated_blocks_once: {err}");
-            return;
-        }
-        Err(err) => panic!("unexpected LayerKVPool::new failure: {err}"),
-    };
-    let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
-        3, 8, BLOCK_SIZE,
-    )));
-    let adapter =
-        PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE).expect("test adapter constructs");
-    let bytes_per_block = adapter.bytes_per_block().expect("bytes per block");
-    let recurrent = tiny_cfg(true).recurrent_state_bytes();
-    let budget =
-        crate::models::qwen3_5::dflash2_turn::dflash2_pool_budget(&adapter, None, recurrent)
-            .expect("pool budget");
-    assert_eq!(budget.bytes, 5 * bytes_per_block);
-    // A runway pool's term is priced from the sizer's budget, above its max.
-    let sized =
-        crate::models::qwen3_5::dflash2_turn::dflash2_pool_budget(&adapter, Some(9), recurrent)
-            .expect("pool budget");
-    assert_eq!(sized.bytes, 6 * bytes_per_block);
-    assert_eq!(sized.floor_tokens, budget.floor_tokens);
-    assert_eq!(
-        budget.floor_tokens,
-        crate::engine::hybrid_scheduler::pool_tokens_after_recurrent(
-            8 * BLOCK_SIZE,
-            BLOCK_SIZE,
-            bytes_per_block,
-            recurrent,
-        )
-    );
+/// The device a planned test load sees: a working set of `working_set`, no
+/// active memory, no other pool.
+struct LiveMemory;
+
+impl LiveMemory {
+    fn set(working_set: u64, active: u64) -> Self {
+        crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|live| {
+            live.set(Some(crate::engine::memory_plan::LiveMemory {
+                working_set_bytes: working_set,
+                active_bytes: active,
+                registered_pool_bytes: 0,
+            }))
+        });
+        Self
+    }
 }
 
-/// Gate: the load limits freeze the DFlash2 window from the paged pool's
-/// unallocated budget and publish it as the speculative window.
-/// Mutation: pass `None` for the pool in `freeze_dflash2_window` → red.
-/// Mutation: drop the freeze from `finish_load_limits` → red.
-#[test]
-fn freeze_dflash2_window_publishes_pool_terms() {
-    const BLOCK_SIZE: u32 = 16;
-    let pool_config = mlx_paged_attn::PagedAttentionConfig {
-        block_size: BLOCK_SIZE,
-        num_kv_heads: 1,
-        head_size: 32,
-        num_layers: 2,
-        ..mlx_paged_attn::PagedAttentionConfig::default()
-    };
-    let pool = match mlx_paged_attn::LayerKVPool::new(
-        pool_config,
-        3,
-        8,
-        mlx_paged_attn::metal::MetalDtype::Float16,
-    ) {
-        Ok(pool) => Arc::new(pool),
-        Err(err) if crate::test_support::metal_device_absent(&err) => {
-            eprintln!("skipping freeze_dflash2_window_publishes_pool_terms: {err}");
-            return;
-        }
-        Err(err) => panic!("unexpected LayerKVPool::new failure: {err}"),
-    };
-    let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
-        3, 8, BLOCK_SIZE,
-    )));
-    let adapter =
-        PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE).expect("test adapter constructs");
-    let mut inner = Qwen35Inner::new(tiny_cfg(true)).expect("construct tiny model");
-    inner.paged_adapter = Some(adapter);
-
-    let limits = inner
-        .finish_load_limits()
-        .expect("load limits without a draft");
-    assert_eq!(inner.dflash2_window, None);
-    assert_eq!(limits.speculative_window_tokens, None);
-
-    inner.dflash2 = Some(
-        crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(&inner.config)
-            .expect("tiny DFlash2 companion"),
-    );
-    let limits = inner
-        .finish_load_limits()
-        .expect("load limits with a draft");
-    let budget = crate::models::qwen3_5::dflash2_turn::dflash2_pool_budget(
-        inner.paged_adapter.as_ref().expect("adapter"),
-        inner.paged_pool_budget_blocks,
-        inner.config.recurrent_state_bytes(),
-    )
-    .expect("pool budget");
-    assert!(budget.bytes > 0, "a growable pool leaves unallocated bytes");
-    let expected =
-        crate::models::qwen3_5::dflash2_turn::dflash2_published_window(&inner, Some(budget))
-            .expect("published window")
-            .expect("a draft publishes a window");
-    let frozen = inner.dflash2_window.expect("a frozen DFlash2 window");
-    assert!(frozen.pool.is_some());
-    assert_eq!(frozen.pool, expected.pool);
-    assert_eq!(frozen.extent_rows, expected.extent_rows);
-    assert_eq!(frozen.row_bytes, expected.row_bytes);
-    assert_eq!(frozen.reserve.is_some(), expected.reserve.is_some());
-    assert_eq!(limits.speculative_window_tokens, inner.speculative_window());
-    assert!(limits.speculative_window_tokens.is_some());
+impl Drop for LiveMemory {
+    fn drop(&mut self) {
+        crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|live| live.set(None));
+    }
 }
 
-/// Gate: a DFlash2 load ignores a configured initial size: it starts at the
-/// same runway, with the same max and the same frozen pool term, as a load
-/// with no initial size.
-/// Mutation: resolve the initial size for a draft load
-/// (`runway = initial_mb.is_none() && has_dflash2_draft` in
-/// `qwen35_initial_pool_request`) → red (8192 initial blocks ≠ 142).
-#[test]
-fn dflash2_load_starts_at_the_runway_whatever_the_initial_size() {
-    let load = |initial_mb: Option<u32>| {
-        let mut cfg = tiny_paged_forward_cfg();
-        cfg.paged_cache_initial_memory_mb = initial_mb;
-        let mut inner = Qwen35Inner::new(cfg).expect("construct tiny model");
+const GIB: u64 = 1 << 30;
+
+/// A tiny planned load on `cfg` against a 16 GiB working set, `None` with
+/// no Metal device.
+fn planned_load(cfg: Qwen3_5Config, draft: bool) -> Option<Result<Qwen35Inner>> {
+    planned_load_within(cfg, draft, None)
+}
+
+/// [`planned_load`] under a `--max-memory` of `max_memory` bytes.
+fn planned_load_within(
+    cfg: Qwen3_5Config,
+    draft: bool,
+    max_memory: Option<u64>,
+) -> Option<Result<Qwen35Inner>> {
+    if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+        return None;
+    }
+    let _live = LiveMemory::set(16 * GIB, 0);
+    let mut inner = Qwen35Inner::new(cfg).expect("construct tiny model");
+    inner.max_memory_bytes = max_memory;
+    if draft {
         inner.dflash2 = Some(
             crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(&inner.config)
                 .expect("tiny DFlash2 companion"),
         );
-        if let Err(err) = inner.initialize_paged_adapter() {
-            if crate::test_support::metal_device_absent(&err.reason) {
-                eprintln!(
-                    "skipping dflash2_load_starts_at_the_runway_whatever_the_initial_size: {}",
-                    err.reason
-                );
-                return None;
-            }
-            panic!("paged adapter init failed: {}", err.reason);
-        }
-        inner
-            .finish_load_limits()
-            .expect("load limits with a draft");
-        let adapter = inner
-            .paged_adapter
-            .as_ref()
-            .expect("a runway pool is installed");
-        Some((
-            adapter.block_capacity(),
-            adapter.layer_kv_pool().max_num_blocks(),
-            inner.paged_pool_budget_blocks,
-            inner.dflash2_window.as_ref().and_then(|terms| terms.pool),
-        ))
-    };
-    let Some(unset) = load(None) else {
+    }
+    Some(inner.initialize_paged_adapter().map(|()| inner))
+}
+
+/// Gate: every load starts at the runway (2,048 tokens and one GDN cell of
+/// blocks), with or without a draft, and grows by extents toward the plan's
+/// ceiling. Mutation: start at the runway only with a draft in
+/// `initialize_paged_adapter` → red (the no-draft pool starts at its max).
+#[test]
+fn every_load_starts_at_the_runway() {
+    for draft in [false, true] {
+        let mut cfg = tiny_paged_forward_cfg();
+        cfg.paged_cache_memory_mb = None;
+        let Some(inner) = planned_load(cfg, draft) else {
+            return;
+        };
+        let inner = inner.expect("planned load");
+        let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
+        let bytes_per_block = adapter.bytes_per_block().expect("bytes per block");
+        let runway = crate::models::qwen3_5::load_plan::qwen35_runway_blocks(
+            16,
+            bytes_per_block,
+            inner.config.recurrent_state_bytes(),
+        );
+        assert_eq!(adapter.block_capacity(), runway, "draft={draft}");
+        let plan = inner.memory_plan.as_ref().expect("plan");
+        let pool = plan.pool.as_ref().expect("pool plan");
+        assert_eq!(adapter.layer_kv_pool().max_num_blocks(), pool.max_blocks);
+        assert!(runway < pool.max_blocks, "draft={draft}");
+        assert!(adapter.grows_by_extent(), "draft={draft}");
+        assert_eq!(adapter.memory_ceiling(), Some(plan.ceiling_bytes()));
+        assert_eq!(inner.pool_context_limit(), pool.lane.window.maximum());
+        assert_eq!(plan.speculative.is_some(), draft);
+    }
+}
+
+/// Gate: an explicit pool size above the plan's fails the load with
+/// Splash's `--max-context` wording; one at or below it is the ceiling.
+/// Mutation: skip the `PoolAbovePlan` check in `explicit_pool` → red (the
+/// load succeeds).
+#[test]
+fn explicit_pool_size_above_the_plan_fails_load() {
+    let mut cfg = tiny_paged_forward_cfg();
+    cfg.paged_cache_memory_mb = Some(1 << 20);
+    let Some(load) = planned_load(cfg, false) else {
         return;
     };
-    assert!(unset.0 < unset.1, "a draft load starts below its max");
-    assert!(unset.3.is_some());
-    assert_eq!(load(Some(64)), Some(unset));
+    let err = match load {
+        Ok(_) => panic!("a pool above the plan must fail the load"),
+        Err(err) => err,
+    };
+    assert!(
+        err.reason
+            .starts_with("Qwen3.5: paged_cache_memory_mb 1048576 exceeds the ")
+            && err
+                .reason
+                .contains(" MiB of KV pool the model and this Mac's memory allow"),
+        "{}",
+        err.reason
+    );
+    let mut cfg = tiny_paged_forward_cfg();
+    cfg.paged_cache_memory_mb = Some(256);
+    let inner = planned_load(cfg, false)
+        .expect("Metal")
+        .expect("a pool inside the plan loads");
+    assert_eq!(
+        inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter")
+            .layer_kv_pool()
+            .max_num_blocks(),
+        256 * 1024 * 1024 / 8192
+    );
+}
+
+/// Gate: a planned pool under the 256 MiB config floor loads, from the
+/// plan (a 1,200 MiB `--max-memory`) and from an explicit 128 MiB above the lane
+/// minimum (Splash refuses only `KvPoolDoesNotFit`). Mutation: build the
+/// pool config from `max_mib()` in `initialize_paged_adapter` → red
+/// ("gpu_memory_mb too small").
+#[test]
+fn pool_below_the_config_floor_loads() {
+    for (explicit_mib, max_memory) in [(None, Some(1_200 << 20)), (Some(128), None)] {
+        let mut cfg = tiny_paged_forward_cfg();
+        cfg.paged_cache_memory_mb = explicit_mib;
+        let Some(load) = planned_load_within(cfg, false, max_memory) else {
+            return;
+        };
+        let inner = load.unwrap_or_else(|err| panic!("{explicit_mib:?}: {}", err.reason));
+        let pool = inner
+            .memory_plan
+            .as_ref()
+            .and_then(|plan| plan.pool)
+            .expect("pool plan");
+        assert!(pool.max_mib() < 256, "{explicit_mib:?}: {}", pool.max_mib());
+        let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
+        assert_eq!(adapter.layer_kv_pool().max_num_blocks(), pool.max_blocks);
+        if let Some(mib) = explicit_mib {
+            assert_eq!(pool.max_blocks, mib * 1024 * 1024 / 8192);
+        }
+    }
+}
+
+/// Gate: a load whose resident memory left the plan fails at its end
+/// (Splash `auditActualMemory`). Mutation: drop the `audit_qwen35_load`
+/// call from `finish_load_limits` → red (the load publishes its limits).
+#[test]
+fn load_audit_refuses_a_footprint_over_the_hard_budget() {
+    let mut cfg = tiny_paged_forward_cfg();
+    cfg.paged_cache_memory_mb = None;
+    let Some(inner) = planned_load(cfg, false) else {
+        return;
+    };
+    let mut inner = inner.expect("planned load");
+    {
+        let _within = LiveMemory::set(16 * GIB, 0);
+        inner
+            .finish_load_limits()
+            .expect("the footprint fits the plan");
+    }
+    let _over = LiveMemory::set(16 * GIB, 16 * GIB);
+    let err = inner
+        .finish_load_limits()
+        .expect_err("active memory over the hard budget fails the load");
+    assert!(
+        err.reason
+            .starts_with("Qwen3.5 memory plan audit: actual Metal footprint")
+            && err.reason.contains("exceeds hard budget"),
+        "{}",
+        err.reason
+    );
 }
 
 #[test]
@@ -2249,12 +2244,10 @@ fn test_dense_paged_prefill_single_shot_default_still_works() {
 fn test_dense_initial_pool_grows_to_hold_a_long_prefill() {
     let mut cfg = tiny_paged_forward_cfg();
     // Geometry: 2 attn layers × 2 KV heads × 32 head × 16 tokens × 2
-    // sides × 2 bytes = 8 KiB per block. 1 MiB initial → 128 blocks; the
-    // 3000-token prompt needs 188. The max stays at the config's 256 MiB
-    // (PagedAttentionConfig::validate floors gpu_memory_mb at 256), so
-    // the first grow lands on min(2×128, 128+60) = 256 blocks.
+    // sides × 2 bytes = 8 KiB per block. The pool starts at the 2,048-token
+    // runway and one GDN cell of blocks; the 3000-token prompt needs 188
+    // blocks, so it grows by an extent toward the config's 256 MiB.
     cfg.max_position_embeddings = 8192;
-    cfg.paged_cache_initial_memory_mb = Some(1);
     let Some((mut inner, cfg)) =
         paged_inner_with_cfg_or_skip("test_dense_initial_pool_grows_to_hold_a_long_prefill", cfg)
     else {
@@ -2589,53 +2582,43 @@ fn history_checkpoint_publish_asserts_the_paged_frontier() {
     );
 }
 
-/// The chunk size every paged prefill reads. Single-shot materializes no GDN
-/// checkpoint, so a sidecar has nothing to anchor on; an installed GdnState
-/// policy has to turn the ladder's rungs into real splits.
+/// The chunk size every paged prefill reads is the 2,048-row step the memory
+/// plan prices, with or without a GDN cold policy (the ladder's rungs are
+/// added as extra cuts).
 ///
-/// Catches: dropping the policy probe from `cold_gdn_prefill_chunk_size`
-/// (returns 0 with a policy installed) — the defect that leaves a persist-cold
-/// turn publishing no rung at all.
+/// Catches: a `0` (single-shot) arm without a policy, or an `i32::MAX` arm
+/// under a policy, in `cold_gdn_prefill_chunk_size`.
 #[test]
-fn dense_cold_gdn_prefill_chunk_size_follows_the_installed_sidecar_policy() {
+fn dense_cold_gdn_prefill_chunk_size_is_the_step_with_or_without_a_sidecar_policy() {
+    if crate::array::paged_prefill_chunk_size() != 0 {
+        return;
+    }
     let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
-        "dense_cold_gdn_prefill_chunk_size_follows_the_installed_sidecar_policy",
+        "dense_cold_gdn_prefill_chunk_size_is_the_step_with_or_without_a_sidecar_policy",
     ) else {
         return;
     };
-    assert_eq!(
-        inner.cold_gdn_prefill_chunk_size(),
-        0,
-        "without a cold GDN policy the prefill stays single-shot"
-    );
+    assert_eq!(inner.cold_gdn_prefill_chunk_size(), 2048);
 
     let root = temp_cold_root("dense-chunk-size-policy");
     install_gdn_cold_tier(&mut inner, &root);
-    assert!(
-        inner.cold_gdn_prefill_chunk_size() > 0,
-        "an installed GdnState policy must make the prefill split at the ladder"
-    );
+    assert_eq!(inner.cold_gdn_prefill_chunk_size(), 2048);
 
     let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Both hand-written cores prefill through `run_dense_core_paged_prefill`, so
 /// this drives that shared body directly: with a GdnState policy installed it
-/// must publish checkpoint ladder rungs, and with no cold tier it must stay
-/// single-shot.
+/// must publish checkpoint ladder rungs, and with no cold tier it takes the
+/// single pre-ladder boundary.
 ///
-/// Catches: passing a literal `0` or `crate::array::paged_prefill_chunk_size()`
-/// instead of `self.cold_gdn_prefill_chunk_size()` inside
-/// `run_dense_core_paged_prefill` — the cold arm then returns no rungs, which
-/// is exactly the MTP-turn defect.
+/// Catches: passing a literal `0` instead of
+/// `self.cold_gdn_prefill_chunk_size()` inside `run_dense_core_paged_prefill`
+/// — the cold arm then returns no rungs, which is exactly the MTP-turn defect.
 ///
-/// The last two arms use an EXPLICIT positive chunk size, which is the only
-/// way to reach the break-set decision with no policy installed — the shape
-/// a persist-off `mlx agent` turn has, since `run-agent.ts` seeds
-/// `MLX_PAGED_PREFILL_CHUNK_SIZE=2048` before any persistence decision. They
-/// catch hardcoding `gdn_cold_sidecar_ladder_wanted`'s result at the prefill
-/// body in either direction, which the arms above cannot: at 64 tokens the
-/// ladder is already a single rung, so both arms agree there.
+/// The 200-token arms catch hardcoding `gdn_cold_sidecar_ladder_wanted`'s
+/// result at the prefill body in either direction, which the 64-token arms
+/// cannot: at 64 tokens the ladder is already a single rung, so both agree.
 #[test]
 #[ignore = "requires Metal GPU; run with --ignored"]
 fn dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy() {
@@ -2663,9 +2646,13 @@ fn dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy() {
         )
         .expect("prefill with no cold tier");
     assert!(hidden.is_none());
-    assert!(
-        cold_checkpoints.is_empty(),
-        "with no cold GDN policy the cores must stay single-shot"
+    assert_eq!(
+        cold_checkpoints
+            .iter()
+            .map(|c| c.prefix_len)
+            .collect::<Vec<_>>(),
+        vec![48],
+        "with no cold GDN policy the cores take the single pre-ladder boundary"
     );
 
     // A prompt long enough that the two break sets DIFFER: ladder

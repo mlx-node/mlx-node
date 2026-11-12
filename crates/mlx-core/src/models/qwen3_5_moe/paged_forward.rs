@@ -16,8 +16,8 @@ use crate::inference_trace::{
 };
 use crate::models::qwen3_5::paged_forward::{
     MaterializedGdnPrefixCheckpoint, checkpoint_suffix_offsets, gdn_checkpoint_target,
-    gdn_cold_sidecar_ladder_wanted, materialize_linear_layer_caches, paged_prefill_ranges,
-    prefill_checkpoint_boundaries, snapshot_materialized_linear_layer_caches,
+    gdn_cold_sidecar_ladder_wanted, materialize_linear_layer_caches, media_prefill_ranges,
+    paged_prefill_ranges, prefill_checkpoint_boundaries, snapshot_materialized_linear_layer_caches,
 };
 use crate::nn::{Embedding, RMSNorm};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
@@ -91,12 +91,7 @@ pub(crate) fn run_gdn_only_prefill_materialized(
     caches: &mut [Qwen3_5LayerCache],
     turn_cancel: Option<&AtomicBool>,
 ) -> Result<()> {
-    let configured_chunk_size = crate::array::paged_prefill_chunk_size();
-    let chunk_size = if configured_chunk_size > 0 {
-        configured_chunk_size as usize
-    } else {
-        2048
-    };
+    let chunk_size = crate::models::forward::paged_prefill_chunk_rows();
     run_gdn_only_prefill_materialized_with_chunk_size(
         prefix_tokens,
         embed,
@@ -180,7 +175,7 @@ pub(crate) fn run_paged_prefill_chunk(
     // because exercising the env-configured default against an explicit size is
     // its whole purpose. Production callers pass
     // `Qwen35MoeInner::cold_gdn_prefill_chunk_size()`.
-    let chunk_size = crate::array::paged_prefill_chunk_size();
+    let chunk_size = crate::models::forward::paged_prefill_chunk_rows() as i32;
     run_paged_prefill_chunk_with_size_and_checkpoint(
         full_tokens,
         suffix_tokens,
@@ -203,7 +198,7 @@ pub(crate) fn run_paged_prefill_chunk(
 
 /// Chunk-size-parameterized worker for `run_paged_prefill_chunk`.
 ///
-/// `chunk_size <= 0` takes the legacy single-shot path
+/// `chunk_size <= 0` (tests only) takes the single-shot path
 /// (`run_paged_prefill_single_shot`). Positive sizes use the single-shot path
 /// only when the suffix fits and there is no reusable-block GDN checkpoint to
 /// capture; otherwise the worker splits at both chunk and checkpoint
@@ -532,8 +527,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
 }
 
 /// Single-shot prefill: feed the entire suffix through every layer in
-/// one forward pass. Identical to the pre-chunking implementation.
-/// Used both by the legacy code path (chunk_size <= 0) and the chunked
+/// one forward pass. Used both by `chunk_size <= 0` (tests only) and the chunked
 /// driver's fast path when no checkpoint boundary needs to be captured.
 ///
 /// The empty-suffix check is performed by the caller
@@ -671,23 +665,20 @@ pub(crate) fn run_paged_vlm_prefill_moe(
         .map_err(Error::from_reason)?;
 
     let suffix_tokens = &expanded_tokens[cached_prefix_len_us..];
-    let configured_chunk_size = crate::array::paged_prefill_chunk_size();
-    let chunk_size = if configured_chunk_size > 0 {
-        configured_chunk_size as usize
-    } else {
-        suffix_tokens.len()
-    };
-    // Image-aware KV reuse also needs an exact recurrent sidecar. Even when
-    // generic text prefill chunking is disabled, split once at the reusable
-    // block boundary so a later non-live image-prefix hit remains exact.
+    // Image-aware KV reuse also needs an exact recurrent sidecar: split once at
+    // the reusable block boundary so a later non-live image-prefix hit remains
+    // exact.
     // A media turn never writes a cold sidecar, so it keeps the single deepest
     // boundary rather than a ladder: the extra rungs would only cost memory.
     let checkpoint_boundaries: Vec<u32> =
         gdn_checkpoint_target(prompt_len, cached_prefix_len, paged_adapter.block_size())
             .into_iter()
             .collect();
-    let suffix_offsets = checkpoint_suffix_offsets(&checkpoint_boundaries, cached_prefix_len);
-    let chunk_ranges = paged_prefill_ranges(suffix_tokens.len(), chunk_size, &suffix_offsets);
+    let chunk_ranges = media_prefill_ranges(
+        suffix_tokens.len(),
+        &checkpoint_boundaries,
+        cached_prefix_len,
+    );
     let total_chunks = chunk_ranges.len();
     let mut last_logits = None;
     let mut checkpoints = Vec::new();
@@ -1250,7 +1241,6 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: None,
             paged_cache_memory_mb: Some(256),
-            paged_cache_initial_memory_mb: None,
             paged_block_size: Some(16),
             use_block_paged_cache: Some(true),
             persist_paged_cache: None,
@@ -2154,21 +2144,19 @@ mod tests {
 
     /// **Default-path guard**: the public entry point
     /// `run_paged_prefill_chunk` (which reads `MLX_PAGED_PREFILL_CHUNK_SIZE`
-    /// once via OnceLock) must be byte-equivalent to the explicit
-    /// single-shot path (`run_paged_prefill_chunk_with_size(..., 0)`)
-    /// when the env knob is unset. Skips if the env knob is set
-    /// (process-global OnceLock pollution would route through the
-    /// chunked branch and invalidate the comparison).
+    /// once via OnceLock) must be byte-equivalent to an explicit 2,048-row
+    /// chunk (`run_paged_prefill_chunk_with_size(..., 2048)`) when the env
+    /// knob is unset. Skips if the env knob is set (process-global OnceLock).
     /// Requires Metal GPU; run with `--ignored`.
     /// `Qwen35MoeInner::new` can throw a foreign C++ exception on
     /// machines without Metal, which aborts the test process before
     /// Rust can catch the failure.
     #[test]
     #[ignore = "requires Metal GPU; run with --ignored"]
-    fn test_run_paged_prefill_chunk_default_matches_single_shot_qwen3_5_moe() {
+    fn test_run_paged_prefill_chunk_default_matches_the_step_qwen3_5_moe() {
         if crate::array::memory::paged_prefill_chunk_size() != 0 {
             eprintln!(
-                "skipping test_run_paged_prefill_chunk_default_matches_single_shot_qwen3_5_moe: \
+                "skipping test_run_paged_prefill_chunk_default_matches_the_step_qwen3_5_moe: \
                  MLX_PAGED_PREFILL_CHUNK_SIZE is set, default-path coverage is environment-dependent"
             );
             return;
@@ -2181,7 +2169,7 @@ mod tests {
                 let msg = err.reason.to_string();
                 if msg.contains("No Metal device found") || msg.contains("No Metal device") {
                     eprintln!(
-                        "skipping test_run_paged_prefill_chunk_default_matches_single_shot_qwen3_5_moe \
+                        "skipping test_run_paged_prefill_chunk_default_matches_the_step_qwen3_5_moe \
                          (no Metal): {msg}"
                     );
                     return;
@@ -2239,7 +2227,7 @@ mod tests {
                     let msg = e.reason.to_string();
                     if msg.contains("Metal GPU not available") || msg.contains("No Metal device") {
                         eprintln!(
-                            "skipping test_run_paged_prefill_chunk_default_matches_single_shot_qwen3_5_moe: \
+                            "skipping test_run_paged_prefill_chunk_default_matches_the_step_qwen3_5_moe: \
                              {msg}"
                         );
                         return;
@@ -2263,7 +2251,7 @@ mod tests {
         inner.reset_caches_sync().expect("reset_caches");
         inner.init_caches_sync().expect("re-init_caches");
 
-        // Run 2: explicit chunk_size=0.
+        // Run 2: explicit chunk_size=2048.
         {
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
             adapter.reset_for_new_request(0).expect("reset");
@@ -2291,21 +2279,21 @@ mod tests {
                 &inner.lm_head,
                 &layer_kinds,
                 adapter,
-                0,
+                2048,
                 /* cached_rope_deltas */ 0,
                 None,
             )
-            .expect("explicit chunk_size=0 prefill")
+            .expect("explicit chunk_size=2048 prefill")
         };
         let explicit_vec = logits_to_f32_vec(&logits_explicit);
 
-        // Bytewise equality: both paths run the same code (single-shot
-        // helper). Any divergence here would be a wrapper bug.
+        // Bytewise equality: both paths run the same chunk size. Any
+        // divergence here would be a wrapper bug.
         for (i, (a, b)) in default_vec.iter().zip(explicit_vec.iter()).enumerate() {
             let abs_diff = (a - b).abs();
             assert!(
                 abs_diff <= 1e-6,
-                "MoE default path diverged from explicit chunk_size=0 at index {i}: \
+                "MoE default path diverged from explicit chunk_size=2048 at index {i}: \
                  default={a}, explicit={b}, abs_diff={abs_diff}"
             );
         }

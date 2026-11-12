@@ -21,7 +21,7 @@ use crate::transformer::paged_kv_cache_adapter::PagedPrefillMemorySnapshot;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use crate::transformer::paged_policy::{
     LivePrefillHeadroom, estimate_paged_pool_sdpa_bytes_with_portable,
-    estimate_varlen_paged_attention_bytes, live_prefill_headroom, prefill_sdpa_effective_dtype,
+    estimate_varlen_paged_attention_bytes, live_headroom, prefill_sdpa_effective_dtype,
 };
 #[cfg(test)]
 use crate::transformer::paged_policy::{
@@ -374,7 +374,7 @@ fn should_try_varlen_after_sdpa(mode: CacheHitPrefillMode, sdpa_constructed: boo
     !sdpa_constructed && mode != CacheHitPrefillMode::ForceSdpa
 }
 
-fn d256_full_sdpa_available(effective_dtype_is_float32: bool) -> bool {
+pub(crate) fn d256_full_sdpa_available(effective_dtype_is_float32: bool) -> bool {
     static LOW_PRECISION_AVAILABLE: OnceLock<bool> = OnceLock::new();
     static FLOAT32_AVAILABLE: OnceLock<bool> = OnceLock::new();
     let available = if effective_dtype_is_float32 {
@@ -1674,7 +1674,7 @@ impl Qwen3_5Attention {
                     graph_backend_available,
                 );
                 let live_headroom = if memory_probe_performed {
-                    live_prefill_headroom(adapter.prefill_memory_snapshot())
+                    live_headroom(adapter.prefill_memory_snapshot(), adapter.memory_ceiling())
                 } else {
                     LivePrefillHeadroom::default()
                 };
@@ -4897,14 +4897,17 @@ mod tests {
     #[test]
     fn live_headroom_includes_external_metal_pool_and_reclaimable_cache() {
         let gib = 1024 * 1024 * 1024;
-        let headroom = live_prefill_headroom(PagedPrefillMemorySnapshot {
-            allocator_active_bytes: Some(20 * gib),
-            allocator_cached_bytes: Some(4 * gib),
-            allocator_limit_bytes: Some(120 * gib),
-            metal_recommended_working_set_bytes: Some(100 * gib),
-            metal_current_allocated_bytes: Some(40 * gib),
-            paged_pool_allocated_bytes: Some(16 * gib),
-        });
+        let headroom = live_headroom(
+            PagedPrefillMemorySnapshot {
+                allocator_active_bytes: Some(20 * gib),
+                allocator_cached_bytes: Some(4 * gib),
+                allocator_limit_bytes: Some(120 * gib),
+                metal_recommended_working_set_bytes: Some(100 * gib),
+                metal_current_allocated_bytes: Some(40 * gib),
+                paged_pool_allocated_bytes: Some(16 * gib),
+            },
+            None,
+        );
 
         // MLX GC ceiling: min(120 GiB, 95% of 100 GiB) - 20 GiB active.
         assert_eq!(headroom.allocator_ceiling_bytes, Some(95 * gib));
@@ -4915,25 +4918,54 @@ mod tests {
         assert_eq!(headroom.selected_bytes, Some(64 * gib));
     }
 
+    /// A memory plan's ceiling replaces the 95% working-set rule on both
+    /// paths. Mutation: keep the recommended working set on the Metal path
+    /// in `live_headroom` → red (64 GiB).
+    #[test]
+    fn live_headroom_under_the_plan_ceiling() {
+        let gib = 1024 * 1024 * 1024;
+        let headroom = live_headroom(
+            PagedPrefillMemorySnapshot {
+                allocator_active_bytes: Some(20 * gib),
+                allocator_cached_bytes: Some(4 * gib),
+                allocator_limit_bytes: Some(120 * gib),
+                metal_recommended_working_set_bytes: Some(100 * gib),
+                metal_current_allocated_bytes: Some(40 * gib),
+                paged_pool_allocated_bytes: Some(16 * gib),
+            },
+            Some(50 * gib),
+        );
+        assert_eq!(headroom.allocator_ceiling_bytes, Some(50 * gib));
+        assert_eq!(headroom.allocator_available_bytes, Some(30 * gib));
+        assert_eq!(headroom.metal_available_bytes, Some(14 * gib));
+        assert_eq!(headroom.selected_bytes, Some(14 * gib));
+    }
+
     #[test]
     fn missing_metal_probe_subtracts_known_external_pool_from_allocator() {
         let gib = 1024 * 1024 * 1024;
-        let headroom = live_prefill_headroom(PagedPrefillMemorySnapshot {
-            allocator_active_bytes: Some(70 * gib),
-            allocator_cached_bytes: Some(2 * gib),
-            allocator_limit_bytes: Some(100 * gib),
-            paged_pool_allocated_bytes: Some(16 * gib),
-            ..PagedPrefillMemorySnapshot::default()
-        });
+        let headroom = live_headroom(
+            PagedPrefillMemorySnapshot {
+                allocator_active_bytes: Some(70 * gib),
+                allocator_cached_bytes: Some(2 * gib),
+                allocator_limit_bytes: Some(100 * gib),
+                paged_pool_allocated_bytes: Some(16 * gib),
+                ..PagedPrefillMemorySnapshot::default()
+            },
+            None,
+        );
         assert_eq!(headroom.allocator_available_bytes, Some(14 * gib));
         assert_eq!(headroom.selected_bytes, Some(14 * gib));
 
-        let exhausted = live_prefill_headroom(PagedPrefillMemorySnapshot {
-            allocator_active_bytes: Some(95 * gib),
-            allocator_limit_bytes: Some(100 * gib),
-            paged_pool_allocated_bytes: Some(16 * gib),
-            ..PagedPrefillMemorySnapshot::default()
-        });
+        let exhausted = live_headroom(
+            PagedPrefillMemorySnapshot {
+                allocator_active_bytes: Some(95 * gib),
+                allocator_limit_bytes: Some(100 * gib),
+                paged_pool_allocated_bytes: Some(16 * gib),
+                ..PagedPrefillMemorySnapshot::default()
+            },
+            None,
+        );
         assert_eq!(exhausted.selected_bytes, Some(0));
     }
 
@@ -5115,7 +5147,6 @@ mod tests {
             partial_rotary_factor: 0.5,
             rope_theta: 100_000.0,
             paged_cache_memory_mb: None,
-            paged_cache_initial_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: None,
             persist_paged_cache: None,

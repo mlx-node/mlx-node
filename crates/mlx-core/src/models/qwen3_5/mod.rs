@@ -14,6 +14,7 @@ pub(crate) mod gdn_blob;
 pub(crate) mod gdn_checkpoint_store;
 pub(crate) mod gdn_sidecar;
 pub mod layer_cache;
+pub(crate) mod load_plan;
 pub mod model;
 pub mod mtp;
 pub(crate) mod mtp_decode;

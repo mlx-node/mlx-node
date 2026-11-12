@@ -34,6 +34,11 @@
       "types": "./dist/host/env-policy.d.ts",
       "import": "./dist/host/env-policy.js"
     },
+    "./host/max-memory": {
+      "@mlx-node/source": "./src/host/max-memory.ts",
+      "types": "./dist/host/max-memory.d.ts",
+      "import": "./dist/host/max-memory.js"
+    },
     "./host/paths": {
       "@mlx-node/source": "./src/host/paths.ts",
       "types": "./dist/host/paths.d.ts",

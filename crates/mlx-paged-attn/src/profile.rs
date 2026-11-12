@@ -1,133 +1,26 @@
-//! Profile-run auto-sizer for the block pool (vLLM-aligned).
+//! Load-time sizing of a block pool against a hard memory budget.
 //!
-//! A runtime alternative to the static `gpu_memory_mb` /
-//! `calculate_num_blocks` config knob that:
-//!
-//! 1. Reads total unified-memory size from MLX (sysctl-backed on Apple
-//!    Silicon).
-//! 2. Resets the MLX peak-memory counter.
-//! 3. Runs a caller-supplied dummy forward at `(batch=1, seq=max_seq)`,
-//!    forcing eval so peak memory reflects weights + activations + working
-//!    set the model needs at max-context decode.
-//! 4. Reads the post-forward peak (this is the "non-KV" memory the model
-//!    will permanently consume during real serving).
-//! 5. Computes
-//!    `available = total * util - peak_non_kv - safety_margin`
-//!    and divides by
-//!    `2 * num_layers * num_kv_heads * head_size * block_size * dtype_size`
-//!    to get the maximum number of paged blocks the pool can carry.
-//!
-//! References:
-//! - vLLM `vllm/v1/worker/gpu_worker.py::Worker::determine_available_memory`
-//!   (lines 332–484) for the formula and env-knob shape (`gpu_memory_
-//!   utilization`, the equivalent of `MLX_KV_MEMORY_UTILIZATION`).
-//! - vLLM `vllm/v1/worker/gpu_model_runner.py::profile_run` for the
-//!   dummy-forward pattern (single max-seq request to produce an
-//!   accurate peak-activation estimate).
-//!
-//! The model loader is supplied as a closure rather than a trait — this is
-//! the auto-sizer utility, not a per-model wiring; each model plugs its own
-//! `model.forward(synthetic_input)` closure into this.
-//!
-//! Env knobs:
-//! - `MLX_KV_MEMORY_UTILIZATION` (default `0.85`): fraction of total memory
-//!   the auto-sizer is allowed to budget for everything (weights +
-//!   activations + KV pool). The remaining fraction stays free for the OS
-//!   and other processes — vLLM's docs explicitly call out the same
-//!   reserve-fraction logic. Values outside `(0.0, 1.0]` return
-//!   `ProfileError::InvalidUtil`.
-//! - `MLX_KV_SAFETY_MARGIN_BYTES` (default `1 GiB`): extra reserve subtracted
-//!   from the budget AFTER the utilization haircut. Catches MLX cache
-//!   regrowth between profile and steady-state, plus per-step temporaries
-//!   the profile can miss because they free immediately and don't move
-//!   the peak.
-//!
-//! On hosts where MLX/Metal aren't available (no GPU, no `hw.memsize`),
-//! `mlx_total_system_memory()` returns 0 and we surface
-//! `ProfileError::TotalMemoryUnavailable` so the caller can fall back to
-//! a static heuristic. The auto-sizer is opt-in: callers that don't want
-//! it keep using `PagedAttentionConfig::calculate_num_blocks`.
+//! The caller owns the budget: the hard Metal budget its memory plan derives
+//! from the recommended working set (Splash `EngineMemoryPolicy::
+//! hardBudgetBytes`). The sizer only reads MLX's live active bytes, subtracts
+//! them, the caller's other reservations and this pool's restore staging,
+//! and caps the requested pool at the whole blocks the rest holds.
 
 use crate::metal::MetalDtype;
 
-/// Default fraction of total memory we let the model + KV pool use
-/// (matches vLLM's `gpu_memory_utilization=0.85` default).
-pub const DEFAULT_KV_MEMORY_UTILIZATION: f64 = 0.85;
-
-/// Default extra reserve subtracted after the utilization haircut. 1 GiB is
-/// vLLM's "non_kv_extra" practical default — covers MLX cache regrowth
-/// between profile and steady-state plus per-step temporaries that the
-/// profile can miss.
-pub const DEFAULT_SAFETY_MARGIN_BYTES: u64 = 1024 * 1024 * 1024;
-
-const ENV_UTIL: &str = "MLX_KV_MEMORY_UTILIZATION";
-const ENV_SAFETY: &str = "MLX_KV_SAFETY_MARGIN_BYTES";
-
-/// Errors the auto-sizer can return.
+/// Errors the sizer can return.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileError {
-    /// `mlx_total_system_memory()` returned 0 — non-macOS host, or sysctl
-    /// failed. Caller should fall back to a static heuristic.
-    TotalMemoryUnavailable,
-    /// macOS host where sysctl works but Metal is unavailable (CPU-only
-    /// MLX build, no GPU, sandboxed environment without IOAccelerator,
-    /// or device init failed). The auto-sizer cannot proceed because
-    /// reading peak memory and the working-set bound require a live
-    /// `MetalAllocator`. Caller should fall back to a static heuristic.
-    ///
-    /// We surface this as a separate variant from `TotalMemoryUnavailable`
-    /// because the diagnostic is materially different — sysctl SUCCEEDED,
-    /// the GPU is just unreachable.
-    ///
-    /// Two routes can produce this variant:
-    ///   1. The fast-path `mlx_metal_is_available()` gate returns false
-    ///      before we touch any memory FFI (clean — no cerr noise).
-    ///   2. A memory FFI shim (`mlx_get_peak_memory`,
-    ///      `mlx_reset_peak_memory`, etc.) returns -1 because its
-    ///      internal C++ call threw and was caught. This catches the
-    ///      degraded-Metal case where `mlx_metal_is_available()` somehow
-    ///      reports true but the allocator construction still throws —
-    ///      previously the fallible contract handled this by returning
-    ///      the ambiguous sentinel `0`, which the auto-sizer then
-    ///      consumed as a real "peak=0" measurement and oversized the
-    ///      KV pool to billions of blocks. The new contract treats -1
-    ///      as MetalUnavailable so the auto-sizer can short-circuit
-    ///      cleanly.
+    /// Metal is unavailable, or a memory probe's C++ call threw.
     MetalUnavailable,
-    /// `MLX_KV_MEMORY_UTILIZATION` parsed but outside `(0.0, 1.0]`. The
-    /// value rounds to zero or exceeds total — neither is meaningful.
-    InvalidUtil(String),
-    /// `MLX_KV_SAFETY_MARGIN_BYTES` parsed but couldn't be converted to
-    /// u64.
-    InvalidSafetyMargin(String),
-    /// After subtracting peak + safety margin, no budget remains for KV
-    /// blocks. Either the model's weights + activations alone exceed the
-    /// utilization-fraction budget, or the safety margin is too large.
-    InsufficientMemory {
-        total_bytes: u64,
-        budget_bytes: u64,
-        peak_non_kv_bytes: u64,
-        safety_margin_bytes: u64,
-    },
-    /// The configured layer/head/block parameters multiply to zero — the
-    /// per-block size would divide by zero. Refuse to compute a block
-    /// count. This is a programmer error rather than a runtime condition.
+    /// The configured layer/head/block parameters multiply to zero.
     InvalidShape(String),
-    /// Profile produced an estimate of fewer than one block. The auto-sizer
-    /// will not return zero (it would silently disable paged attention).
-    /// Caller should reduce `num_layers`/`num_kv_heads`/`head_size`, raise
-    /// `MLX_KV_MEMORY_UTILIZATION`, or fall back to a static heuristic.
-    NotEnoughBlocks {
-        budget_bytes: u64,
-        bytes_per_block: u64,
-    },
-    /// Live load-time sizing could not fit a block. Retain the inputs so
-    /// callers can distinguish resident weights from sibling pools/reserves.
+    /// The budget left after active memory and the reservations holds no
+    /// block.
     LoadTimeBudgetExhausted {
-        limit_bytes: u64,
+        hard_budget_bytes: u64,
         active_bytes: u64,
         reserved_bytes: u64,
-        safety_margin_bytes: u64,
         available_bytes: u64,
         bytes_per_block: u64,
     },
@@ -136,74 +29,38 @@ pub enum ProfileError {
 impl std::fmt::Display for ProfileError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProfileError::TotalMemoryUnavailable => write!(
-                f,
-                "total system memory unavailable (mlx_total_system_memory returned 0); falling \
-                 back to static heuristic"
-            ),
-            ProfileError::MetalUnavailable => write!(
-                f,
-                "Metal device unavailable (mlx_metal_is_available returned false); cannot \
-                 profile peak memory or read working-set bound — falling back to static heuristic"
-            ),
-            ProfileError::InvalidUtil(s) => {
-                write!(f, "invalid {ENV_UTIL}={s}: must parse as f64 in (0.0, 1.0]")
+            ProfileError::MetalUnavailable => {
+                write!(f, "Metal device unavailable; cannot read MLX active memory")
             }
-            ProfileError::InvalidSafetyMargin(s) => write!(
-                f,
-                "invalid {ENV_SAFETY}={s}: must parse as non-negative integer bytes"
-            ),
-            ProfileError::InsufficientMemory {
-                total_bytes,
-                budget_bytes,
-                peak_non_kv_bytes,
-                safety_margin_bytes,
-            } => write!(
-                f,
-                "insufficient memory for KV pool: total={total_bytes}, budget={budget_bytes}, \
-                 peak_non_kv={peak_non_kv_bytes}, safety_margin={safety_margin_bytes}; \
-                 weights/activations alone exceed the utilization-fraction budget"
-            ),
             ProfileError::InvalidShape(s) => write!(f, "invalid shape parameter: {s}"),
-            ProfileError::NotEnoughBlocks {
-                budget_bytes,
-                bytes_per_block,
-            } => write!(
-                f,
-                "profile budget {budget_bytes} B is smaller than per-block size \
-                {bytes_per_block} B; would yield 0 blocks"
-            ),
             ProfileError::LoadTimeBudgetExhausted {
-                limit_bytes,
+                hard_budget_bytes,
                 active_bytes,
                 reserved_bytes,
-                safety_margin_bytes,
                 available_bytes,
                 bytes_per_block,
             } => write!(
                 f,
-                "profile budget {available_bytes} B is smaller than per-block size \
-                 {bytes_per_block} B; would yield 0 blocks (effective limit={limit_bytes} B, \
-                 MLX active={active_bytes} B, other pools/restore reserve={reserved_bytes} B, \
-                 safety margin={safety_margin_bytes} B)"
+                "pool budget {available_bytes} B is smaller than per-block size \
+                 {bytes_per_block} B; would yield 0 blocks (hard budget={hard_budget_bytes} B, \
+                 MLX active={active_bytes} B, other pools/restore reserve={reserved_bytes} B)"
             ),
         }
     }
 }
 
-/// Auditable result of the load-time, live-memory pool cap.
+impl std::error::Error for ProfileError {}
+
+/// Auditable result of the load-time pool cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadTimePoolSizing {
     pub requested_blocks: u32,
     pub selected_blocks: u32,
     pub bytes_per_block: u64,
     pub selected_bytes: u64,
-    pub total_memory_bytes: u64,
-    pub metal_working_set_bytes: Option<u64>,
+    pub hard_budget_bytes: u64,
     pub metal_active_bytes: u64,
 }
-
-impl std::error::Error for ProfileError {}
 
 /// Bytes-per-element for the KV cache storage dtype. Mirrors the kernel
 /// instantiation list — see `crates/mlx-paged-attn/src/metal/state.rs`'s
@@ -220,34 +77,6 @@ pub fn dtype_size_for(dtype: MetalDtype) -> u32 {
         // `LayerKVPool::new` rejects them at construction so we never
         // actually return a num_blocks for an F32 pool.
         MetalDtype::Float32 => 4,
-    }
-}
-
-/// Read `MLX_KV_MEMORY_UTILIZATION` (default `DEFAULT_KV_MEMORY_UTILIZATION`)
-/// and validate the value. Pulled out of the main flow so unit tests can
-/// hit the rejection paths without spawning a process per case.
-pub fn read_util_env() -> Result<f64, ProfileError> {
-    match std::env::var(ENV_UTIL) {
-        Ok(s) => {
-            let v: f64 = s
-                .parse()
-                .map_err(|_| ProfileError::InvalidUtil(s.clone()))?;
-            if !v.is_finite() || v <= 0.0 || v > 1.0 {
-                return Err(ProfileError::InvalidUtil(s));
-            }
-            Ok(v)
-        }
-        Err(_) => Ok(DEFAULT_KV_MEMORY_UTILIZATION),
-    }
-}
-
-/// Read `MLX_KV_SAFETY_MARGIN_BYTES` (default `DEFAULT_SAFETY_MARGIN_BYTES`).
-pub fn read_safety_margin_env() -> Result<u64, ProfileError> {
-    match std::env::var(ENV_SAFETY) {
-        Ok(s) => s
-            .parse::<u64>()
-            .map_err(|_| ProfileError::InvalidSafetyMargin(s)),
-        Err(_) => Ok(DEFAULT_SAFETY_MARGIN_BYTES),
     }
 }
 
@@ -273,314 +102,51 @@ pub fn bytes_per_block(
     Ok(2u64 * num_layers as u64 * num_kv_heads as u64 * head_size as u64 * block_size as u64 * dt)
 }
 
-/// Pure-formula step. Given the measured peak and the env-derived knobs,
-/// compute `(num_blocks, available_kv_bytes)`. Pulled out so we can test
-/// the math without mocking MLX or running a forward.
-pub fn compute_num_blocks_from_measurements(
-    total_bytes: u64,
-    peak_non_kv_bytes: u64,
-    util: f64,
-    safety_margin_bytes: u64,
-    bytes_per_block: u64,
-) -> Result<(u32, u64), ProfileError> {
-    if bytes_per_block == 0 {
-        // Caller built `bytes_per_block` via our helper above which rejects
-        // zero, so this is defense-in-depth against a future caller passing
-        // a precomputed zero.
-        return Err(ProfileError::InvalidShape(
-            "bytes_per_block == 0 (zero divisor)".to_string(),
-        ));
-    }
-
-    let total_f = total_bytes as f64;
-    let budget_f = total_f * util;
-    // Two ways the subtraction can underflow: `peak_non_kv` already exceeds
-    // the utilization budget, or the safety margin alone exceeds whatever
-    // remains. Both surface as `InsufficientMemory` with the input values
-    // for a debuggable error message.
-    let after_peak = budget_f - peak_non_kv_bytes as f64;
-    if after_peak <= 0.0 {
-        return Err(ProfileError::InsufficientMemory {
-            total_bytes,
-            budget_bytes: budget_f as u64,
-            peak_non_kv_bytes,
-            safety_margin_bytes,
-        });
-    }
-    let kv_bytes_f = after_peak - safety_margin_bytes as f64;
-    if kv_bytes_f <= 0.0 {
-        return Err(ProfileError::InsufficientMemory {
-            total_bytes,
-            budget_bytes: budget_f as u64,
-            peak_non_kv_bytes,
-            safety_margin_bytes,
-        });
-    }
-
-    let kv_bytes = kv_bytes_f as u64;
-    let num_blocks_u64 = kv_bytes / bytes_per_block;
-    if num_blocks_u64 == 0 {
-        return Err(ProfileError::NotEnoughBlocks {
-            budget_bytes: kv_bytes,
-            bytes_per_block,
-        });
-    }
-    let num_blocks = u32::try_from(num_blocks_u64).unwrap_or(u32::MAX);
-    Ok((num_blocks, kv_bytes))
-}
-
-/// Probe MLX/Metal for the total system memory budget. On macOS reads
-/// `mlx_total_system_memory()` (= `sysctl hw.memsize`); on other platforms
-/// returns `Err(TotalMemoryUnavailable)`.
-///
-/// Uses the fallible-FFI contract: a -1 return from the C++ shim becomes
-/// `TotalMemoryUnavailable` (sysctl failed or the call threw).
-fn read_total_memory_bytes() -> Result<u64, ProfileError> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut total: u64 = 0;
-        let rc = unsafe { mlx_sys::mlx_total_system_memory(&mut total) };
-        if rc != 0 || total == 0 {
-            return Err(ProfileError::TotalMemoryUnavailable);
-        }
-        Ok(total)
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err(ProfileError::TotalMemoryUnavailable)
-    }
-}
-
-/// Translate the raw FFI result `(rc, ws)` from
-/// `mlx_max_recommended_working_set_size` into the auto-sizer's
-/// `Result<Option<u64>, ProfileError>` contract.
-///
-/// Pulled out of [`read_working_set_bytes`] as a pure function so the
-/// translation is unit-testable without invoking the live FFI — the
-/// C++ shim's split status contract is exercised here directly via
-/// synthetic `(rc, ws)` pairs.
-///
-/// Contract (must match the C++ shim's status codes in
-/// `crates/mlx-sys/src/mlx_paged_profile.cpp::mlx_max_recommended_
-/// working_set_size`):
-/// - `(0, non_zero)` → `Ok(Some(non_zero))` — real bound published.
-/// - `(0, 0)` → `Ok(None)` — schema drift, missing key, wrong variant
-///   type, or Metal unavailable. NOT a failure mode.
-/// - `(-1, _)` → `Err(MetalUnavailable)` — C++ exception caught.
-fn translate_working_set_status(rc: i32, ws: u64) -> Result<Option<u64>, ProfileError> {
-    if rc != 0 {
-        // Caught C++ exception. Surface `MetalUnavailable` so the
-        // auto-sizer matches the peak-memory FFI's failure mode.
-        return Err(ProfileError::MetalUnavailable);
-    }
-    if ws == 0 {
-        // FFI succeeded but no bound is published — either the
-        // `device_info` map omits the entry, the entry has the wrong
-        // variant type, or Metal isn't available. All three are
-        // legitimate "no working-set bound" cases, NOT failures.
-        Ok(None)
-    } else {
-        Ok(Some(ws))
-    }
-}
-
-/// MLX's GPU-visible working-set bound (`MTLDevice
-/// recommendedMaxWorkingSetSize`), if available.
-///
-/// On Apple Silicon this is normally ~75% of unified memory — Metal
-/// will refuse to commit allocations beyond this point (or, worse,
-/// silently page out). The auto-sizer uses it as the upper bound when
-/// `MLX_KV_MEMORY_UTILIZATION` × `hw.memsize` would otherwise
-/// over-commit the GPU.
-///
-/// Return values map to the C++ shim's split status contract:
-/// - `Ok(Some(value))` — the FFI returned `0` AND wrote a non-zero
-///   value through `out_value`. The shim found a real
-///   `max_recommended_working_set_size` entry in the `device_info`
-///   map.
-/// - `Ok(None)` — the FFI returned `0` AND wrote `0`. This is the
-///   legitimate "no bound published" case: the `device_info` map
-///   does not contain the entry, the entry has the wrong variant
-///   type (schema drift across MLX versions), or `mlx_metal_is_
-///   available()` reports false. The auto-sizer falls back to the
-///   physical-RAM budget alone — schema/version drift should NOT
-///   abort profiling as if Metal failed.
-/// - `Err(MetalUnavailable)` — the FFI returned `-1` because the
-///   C++ shim caught an exception. Common cause: degraded-Metal
-///   hosts where `mlx_metal_is_available()` lies and reports true
-///   but the underlying `MetalAllocator` constructor still throws.
-///
-/// Previously the C++ shim returned `-1` for both schema drift and
-/// caught exceptions, which collapsed the legitimate "missing key"
-/// case into `MetalUnavailable` and aborted profiling on hosts that
-/// could otherwise have completed via the physical-RAM fallback.
-/// The split status now disambiguates the two: `0`/`Ok(None)` keeps
-/// the auto-sizer running on schema drift; `-1`/`Err(MetalUnavailable)`
-/// remains reserved for the genuine Metal-failure mode.
-#[cfg(target_os = "macos")]
-fn read_working_set_bytes() -> Result<Option<u64>, ProfileError> {
-    let mut ws: u64 = 0;
-    let rc = unsafe { mlx_sys::mlx_max_recommended_working_set_size(&mut ws) };
-    translate_working_set_status(rc, ws)
-}
-
-/// Pure-formula step that combines the physical-RAM budget with the
-/// optional working-set budget and returns the smaller. Pulled out of the
-/// main flow so unit tests can pin the clamp behaviour without spawning
-/// a Metal-aware process.
-///
-/// Returns `(num_blocks, kv_bytes, physical_budget_bytes,
-/// working_set_budget_bytes)` so the caller can log all three for
-/// auditability. `working_set_budget_bytes` is `None` when no working-set
-/// bound was reported (the formula then falls through to the physical
-/// budget alone).
-pub fn compute_num_blocks_with_working_set(
-    total_bytes: u64,
-    working_set_bytes: Option<u64>,
-    peak_non_kv_bytes: u64,
-    util: f64,
-    safety_margin_bytes: u64,
-    bytes_per_block: u64,
-) -> Result<(u32, u64, u64, Option<u64>), ProfileError> {
-    // Compute the physical-RAM budget first using the existing math.
-    let (physical_blocks, physical_kv_bytes) = compute_num_blocks_from_measurements(
-        total_bytes,
-        peak_non_kv_bytes,
-        util,
-        safety_margin_bytes,
-        bytes_per_block,
-    )?;
-    let physical_budget_bytes = physical_kv_bytes;
-
-    let Some(ws_total) = working_set_bytes else {
-        // No working-set bound reported → use the physical budget as-is.
-        return Ok((
-            physical_blocks,
-            physical_kv_bytes,
-            physical_budget_bytes,
-            None,
-        ));
-    };
-
-    // Compute the working-set budget the same way: util-haircut against
-    // the working-set total, minus peak, minus safety margin. We treat
-    // the working_set as the "memory ceiling" — util scales it the same
-    // way it scales hw.memsize so the operator's `MLX_KV_MEMORY_UTILIZATION`
-    // intent is preserved across both branches. Underflow here surfaces
-    // as a working-set budget of zero, which falls through to the
-    // physical budget (the only remaining option).
-    let ws_total_f = ws_total as f64;
-    let ws_budget_f = ws_total_f * util;
-    let ws_after_peak = ws_budget_f - peak_non_kv_bytes as f64;
-    let ws_kv_bytes_f = ws_after_peak - safety_margin_bytes as f64;
-    let ws_kv_bytes = if ws_kv_bytes_f <= 0.0 {
-        0u64
-    } else {
-        ws_kv_bytes_f as u64
-    };
-
-    // Choose the smaller of the two budgets. The working-set side is
-    // strictly tighter on Apple Silicon (recommended < total), so it
-    // wins in normal operation; we still keep the physical fallback
-    // for the (rare) case where working_set_bytes is misreported as
-    // larger than hw.memsize (e.g. driver bug, Paravirtual VM).
-    let chosen_kv_bytes = physical_kv_bytes.min(ws_kv_bytes);
-    if chosen_kv_bytes < bytes_per_block {
-        return Err(ProfileError::NotEnoughBlocks {
-            budget_bytes: chosen_kv_bytes,
-            bytes_per_block,
-        });
-    }
-    let num_blocks_u64 = chosen_kv_bytes / bytes_per_block;
-    let num_blocks = u32::try_from(num_blocks_u64).unwrap_or(u32::MAX);
-    Ok((
-        num_blocks,
-        chosen_kv_bytes,
-        physical_budget_bytes,
-        Some(ws_kv_bytes),
-    ))
-}
-
-/// Cap a requested pool against the live process and Metal budgets.
-///
-/// Each ceiling receives the same utilization haircut and safety margin.
-/// `requested_blocks` is always an upper bound: an explicit
-/// `paged_cache_memory_mb` can reduce the result, never override a live safety
-/// cap. All arithmetic saturates and the final result is rounded down to a
-/// whole block.
-#[allow(clippy::too_many_arguments)]
+/// `min(requested, (hard - active - reserved) / bytes_per_block)` whole
+/// blocks. `requested_blocks` is always an upper bound; the result is never
+/// zero.
 pub fn compute_load_time_pool_sizing(
     requested_blocks: u32,
-    total_memory_bytes: u64,
-    metal_working_set_bytes: Option<u64>,
+    hard_budget_bytes: u64,
     metal_active_bytes: u64,
-    util: f64,
-    safety_margin_bytes: u64,
     bytes_per_block: u64,
-    extra_reserved_bytes: u64,
+    reserved_bytes: u64,
 ) -> Result<LoadTimePoolSizing, ProfileError> {
     if requested_blocks == 0 || bytes_per_block == 0 {
         return Err(ProfileError::InvalidShape(format!(
             "requested_blocks={requested_blocks}, bytes_per_block={bytes_per_block}; both must be > 0"
         )));
     }
-    if !util.is_finite() || util <= 0.0 || util > 1.0 {
-        return Err(ProfileError::InvalidUtil(util.to_string()));
-    }
-
-    let budget = |ceiling: u64, used: u64| -> u64 {
-        ((ceiling as f64 * util) as u64)
-            .saturating_sub(used)
-            .saturating_sub(safety_margin_bytes)
-    };
-
-    // Total-memory and Metal ceilings are absolute. Subtract MLX active
-    // memory and any extra reserved bytes (sibling private Metal pools that
-    // those counters cannot see) before taking min(requested, safe).
-    let used = metal_active_bytes.saturating_add(extra_reserved_bytes);
-    let total_budget = budget(total_memory_bytes, used);
-    let metal_budget = metal_working_set_bytes.map(|ws| budget(ws, used));
-
-    // Total physical memory is the mandatory safety ceiling. Optional live
-    // probes may only tighten it; their absence must never restore the full
-    // requested pool.
-    let mut safe_bytes = total_budget;
-    if let Some(metal) = metal_budget {
-        safe_bytes = safe_bytes.min(metal);
-    }
-    let requested_bytes = requested_blocks as u64 * bytes_per_block;
-    let selected_bytes = requested_bytes.min(safe_bytes);
-    let selected_blocks_u64 = selected_bytes / bytes_per_block;
-    if selected_blocks_u64 == 0 {
-        let ceiling = total_memory_bytes.min(metal_working_set_bytes.unwrap_or(u64::MAX));
+    let safe_bytes = hard_budget_bytes
+        .saturating_sub(metal_active_bytes)
+        .saturating_sub(reserved_bytes);
+    let selected_bytes = (u64::from(requested_blocks) * bytes_per_block).min(safe_bytes);
+    let selected_blocks = selected_bytes / bytes_per_block;
+    if selected_blocks == 0 {
         return Err(ProfileError::LoadTimeBudgetExhausted {
-            limit_bytes: (ceiling as f64 * util) as u64,
+            hard_budget_bytes,
             active_bytes: metal_active_bytes,
-            reserved_bytes: extra_reserved_bytes,
-            safety_margin_bytes,
+            reserved_bytes,
             available_bytes: selected_bytes,
             bytes_per_block,
         });
     }
-    let selected_blocks = u32::try_from(selected_blocks_u64).unwrap_or(u32::MAX);
-
+    let selected_blocks = u32::try_from(selected_blocks).unwrap_or(u32::MAX);
     Ok(LoadTimePoolSizing {
         requested_blocks,
         selected_blocks,
         bytes_per_block,
-        selected_bytes: selected_blocks as u64 * bytes_per_block,
-        total_memory_bytes,
-        metal_working_set_bytes,
+        selected_bytes: u64::from(selected_blocks) * bytes_per_block,
+        hard_budget_bytes,
         metal_active_bytes,
     })
 }
 
-/// Read the live macOS/Metal probes and apply [`compute_load_time_pool_sizing`].
-/// Total system memory and current MLX active memory are mandatory. The Metal
-/// working-set ceiling optionally tightens the result when reported. Callers
-/// must fail closed on an error; restoring `requested_blocks` would turn an
-/// explicit value into an uncapped allocation request.
+/// [`compute_load_time_pool_sizing`] on MLX's live active bytes, with this
+/// pool's restore staging (direct Metal allocations MLX does not count)
+/// added to `extra_reserved_bytes` (other pools' private buffers). Callers
+/// must fail closed on an error.
+#[allow(clippy::too_many_arguments)]
 pub fn load_time_pool_sizing(
     requested_blocks: u32,
     num_layers: u32,
@@ -588,35 +154,11 @@ pub fn load_time_pool_sizing(
     head_size: u32,
     block_size: u32,
     dtype: MetalDtype,
-) -> Result<LoadTimePoolSizing, ProfileError> {
-    load_time_pool_sizing_with_reserved(
-        requested_blocks,
-        num_layers,
-        num_kv_heads,
-        head_size,
-        block_size,
-        dtype,
-        0,
-    )
-}
-
-/// Same as [`load_time_pool_sizing`], but `extra_reserved_bytes` (sibling
-/// private Metal pools) is subtracted from the safe budget *before*
-/// `min(requested, safe)`. Also reserves this pool's bounded restore staging,
-/// which uses direct Metal allocations outside MLX active memory.
-pub fn load_time_pool_sizing_with_reserved(
-    requested_blocks: u32,
-    num_layers: u32,
-    num_kv_heads: u32,
-    head_size: u32,
-    block_size: u32,
-    dtype: MetalDtype,
+    hard_budget_bytes: u64,
     extra_reserved_bytes: u64,
 ) -> Result<LoadTimePoolSizing, ProfileError> {
-    let total = read_total_memory_bytes()?;
-    let util = read_util_env()?;
-    let safety = read_safety_margin_env()?;
     let bpb = bytes_per_block(num_layers, num_kv_heads, head_size, block_size, dtype)?;
+    let reserved = extra_reserved_bytes.saturating_add(crate::layer_kv_pool::RESTORE_STAGING_BYTES);
 
     #[cfg(target_os = "macos")]
     {
@@ -627,30 +169,13 @@ pub fn load_time_pool_sizing_with_reserved(
         if unsafe { mlx_sys::mlx_get_active_memory(&mut active) } != 0 {
             return Err(ProfileError::MetalUnavailable);
         }
-        let working_set = read_working_set_bytes()?;
-        compute_load_time_pool_sizing(
-            requested_blocks,
-            total,
-            working_set,
-            active,
-            util,
-            safety,
-            bpb,
-            extra_reserved_bytes.saturating_add(crate::layer_kv_pool::RESTORE_STAGING_BYTES),
-        )
+        compute_load_time_pool_sizing(requested_blocks, hard_budget_bytes, active, bpb, reserved)
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (
-            requested_blocks,
-            total,
-            util,
-            safety,
-            bpb,
-            extra_reserved_bytes.saturating_add(crate::layer_kv_pool::RESTORE_STAGING_BYTES),
-        );
-        Err(ProfileError::TotalMemoryUnavailable)
+        let _ = (requested_blocks, hard_budget_bytes, bpb, reserved);
+        Err(ProfileError::MetalUnavailable)
     }
 }
 
@@ -696,441 +221,47 @@ mod tests {
         ));
     }
 
+    /// Mutation: subtract another 1 GiB in `compute_load_time_pool_sizing`
+    /// → the 4,096-block case selects 3,072 blocks.
     #[test]
-    fn load_time_sizing_treats_requested_pool_as_maximum() {
-        let gib = 1024u64 * 1024 * 1024;
-        let bpb = 1024 * 1024;
-        let sizing = compute_load_time_pool_sizing(
-            2048,
-            64 * gib,
-            Some(48 * gib),
-            20 * gib,
-            0.85,
-            gib,
-            bpb,
-            0,
-        )
-        .unwrap();
-        assert_eq!(sizing.requested_blocks, 2048);
-        assert_eq!(sizing.selected_blocks, 2048);
-        assert_eq!(sizing.selected_bytes, 2 * gib);
-    }
-
-    #[test]
-    fn extra_reserved_debits_safe_budget_not_the_request_cap() {
-        let gib = 1024u64 * 1024 * 1024;
-        let bpb = 1024 * 1024;
-        // Same machine as the request-cap test: 2 GiB request, ~20 GiB safe.
-        let sibling_2g = compute_load_time_pool_sizing(
-            2048,
-            64 * gib,
-            Some(48 * gib),
-            20 * gib,
-            0.85,
-            gib,
-            bpb,
-            2 * gib,
-        )
-        .unwrap();
-        assert_eq!(
-            sibling_2g.selected_blocks, 2048,
-            "ample headroom must still grant the full 2 GiB request"
-        );
-
-        let sibling_tight = compute_load_time_pool_sizing(
-            2048,
-            64 * gib,
-            Some(48 * gib),
-            20 * gib,
-            0.85,
-            gib,
-            bpb,
-            18 * gib,
-        )
-        .unwrap();
-        // metal safe = 48*0.85 - 20 - 18 - 1 = 1.8 GiB < 2 GiB request
-        let expected = ((48f64 * gib as f64 * 0.85) as u64)
-            .saturating_sub(20 * gib)
-            .saturating_sub(18 * gib)
-            .saturating_sub(gib);
-        assert_eq!(sibling_tight.selected_bytes, expected / bpb * bpb);
-        assert!(sibling_tight.selected_blocks < 2048);
-    }
-
-    #[test]
-    fn load_time_sizing_clamps_to_tightest_live_budget_and_whole_blocks() {
-        let gib = 1024u64 * 1024 * 1024;
-        let bpb = 3 * 1024 * 1024;
-        // Metal working-set headroom is tightest:
-        // floor(32 GiB * .85 - 20 GiB active - 1 GiB safety).
-        let sizing = compute_load_time_pool_sizing(
-            u32::MAX,
-            64 * gib,
-            Some(32 * gib),
-            20 * gib,
-            0.85,
-            gib,
-            bpb,
-            0,
-        )
-        .unwrap();
-        let expected_bytes = ((32f64 * gib as f64 * 0.85) as u64)
-            .saturating_sub(20 * gib)
-            .saturating_sub(gib);
-        assert_eq!(sizing.selected_blocks as u64, expected_bytes / bpb);
-        assert_eq!(sizing.selected_bytes % bpb, 0);
-        assert!(sizing.selected_blocks < sizing.requested_blocks);
-    }
-
-    #[test]
-    fn load_time_sizing_rejects_less_than_one_safe_block() {
-        let gib = 1024u64 * 1024 * 1024;
-        let err = compute_load_time_pool_sizing(
-            16,
-            8 * gib,
-            Some(6 * gib),
-            5 * gib,
-            0.85,
-            gib,
-            16 * 1024 * 1024,
-            0,
-        )
-        .unwrap_err();
-        assert!(matches!(err, ProfileError::LoadTimeBudgetExhausted { .. }));
-    }
-
-    #[test]
-    fn exhausted_load_time_budget_explains_memory_accounting() {
+    fn load_time_sizing_on_the_hard_budget() {
         let gib = 1u64 << 30;
         let mib = 1u64 << 20;
-        let error = compute_load_time_pool_sizing(
-            8192,
-            36 * gib,
-            Some(28 * gib),
-            24 * gib,
-            0.85,
-            gib,
-            mib,
-            64 * mib,
-        )
-        .unwrap_err();
-        let limit = (28.0 * gib as f64 * 0.85) as u64;
+        // hard 20 GiB - active 14 GiB - reserved 2 GiB = 4 GiB = 4,096 blocks.
+        let sizing =
+            compute_load_time_pool_sizing(u32::MAX, 20 * gib, 14 * gib, mib, 2 * gib).unwrap();
+        assert_eq!(sizing.selected_blocks, 4_096);
+        assert_eq!(sizing.selected_bytes, 4 * gib);
+        assert_eq!(sizing.hard_budget_bytes, 20 * gib);
+        // The request stays the maximum.
+        let capped =
+            compute_load_time_pool_sizing(2_048, 20 * gib, 14 * gib, mib, 2 * gib).unwrap();
+        assert_eq!(capped.selected_blocks, 2_048);
+        // Whole blocks, rounded down.
+        let odd =
+            compute_load_time_pool_sizing(u32::MAX, 20 * gib, 14 * gib, 3 * mib, 2 * gib).unwrap();
+        assert_eq!(odd.selected_blocks, 1_365);
+        assert_eq!(odd.selected_bytes, 1_365 * 3 * mib);
+    }
+
+    #[test]
+    fn load_time_sizing_rejects_less_than_one_block() {
+        let gib = 1u64 << 30;
+        let mib = 1u64 << 20;
+        let error = compute_load_time_pool_sizing(8_192, 20 * gib, 19 * gib, 2 * gib, 64 * mib)
+            .unwrap_err();
         assert_eq!(
             error,
             ProfileError::LoadTimeBudgetExhausted {
-                limit_bytes: limit,
-                active_bytes: 24 * gib,
+                hard_budget_bytes: 20 * gib,
+                active_bytes: 19 * gib,
                 reserved_bytes: 64 * mib,
-                safety_margin_bytes: gib,
-                available_bytes: 0,
-                bytes_per_block: mib,
+                available_bytes: gib - 64 * mib,
+                bytes_per_block: 2 * gib,
             }
         );
         let message = error.to_string();
-        assert!(message.contains("profile budget 0 B"));
-        assert!(message.contains(&format!("effective limit={limit} B")));
-        assert!(message.contains(&format!("MLX active={} B", 24 * gib)));
+        assert!(message.contains(&format!("hard budget={} B", 20 * gib)));
         assert!(message.contains(&format!("other pools/restore reserve={} B", 64 * mib)));
-        assert!(message.contains(&format!("safety margin={gib} B")));
-    }
-
-    #[test]
-    fn load_time_sizing_missing_optional_probes_still_caps_by_total_memory() {
-        let gib = 1024u64 * 1024 * 1024;
-        let bpb = 1024 * 1024;
-        let sizing =
-            compute_load_time_pool_sizing(u32::MAX, 16 * gib, None, 4 * gib, 0.85, gib, bpb, 0)
-                .unwrap();
-        let expected_budget = ((16f64 * gib as f64 * 0.85) as u64)
-            .saturating_sub(4 * gib)
-            .saturating_sub(gib);
-        assert_eq!(sizing.selected_blocks as u64, expected_budget / bpb);
-        assert_eq!(sizing.metal_working_set_bytes, None);
-        assert!(sizing.selected_blocks < sizing.requested_blocks);
-    }
-
-    #[test]
-    fn load_time_sizing_applies_optional_working_set_ceiling() {
-        let gib = 1024u64 * 1024 * 1024;
-        let bpb = 1024 * 1024;
-        let without_working_set =
-            compute_load_time_pool_sizing(u32::MAX, 64 * gib, None, 20 * gib, 0.85, gib, bpb, 0)
-                .unwrap();
-        let with_tight_working_set = compute_load_time_pool_sizing(
-            u32::MAX,
-            64 * gib,
-            Some(32 * gib),
-            20 * gib,
-            0.85,
-            gib,
-            bpb,
-            0,
-        )
-        .unwrap();
-        assert!(with_tight_working_set.selected_blocks < without_working_set.selected_blocks);
-    }
-
-    #[test]
-    fn formula_basic() {
-        // Hand-checked: total=128 GiB, peak=20 GiB, util=0.85, safety=1 GiB.
-        // budget = 128 * 0.85 = 108.8 GiB
-        // after_peak = 108.8 - 20 = 88.8 GiB
-        // kv = 88.8 - 1 = 87.8 GiB ≈ 94,253,830,963 bytes.
-        // bpb = 1 MiB → num_blocks ≈ 89,907.
-        let total = 128u64 * 1024 * 1024 * 1024;
-        let peak = 20u64 * 1024 * 1024 * 1024;
-        let util = 0.85;
-        let safety = 1024u64 * 1024 * 1024;
-        let bpb = 1024u64 * 1024;
-        let (num_blocks, kv) =
-            compute_num_blocks_from_measurements(total, peak, util, safety, bpb).unwrap();
-        // Allow ±1 fp rounding.
-        assert!((89_900..=89_915).contains(&num_blocks), "got {num_blocks}");
-        assert!(kv > 0);
-    }
-
-    #[test]
-    fn formula_rejects_peak_exceeds_budget() {
-        // peak ≥ total*util → no budget for KV.
-        let total = 32u64 * 1024 * 1024 * 1024;
-        let peak = 30u64 * 1024 * 1024 * 1024;
-        let util = 0.85; // budget = 27.2 GiB
-        let safety = 0u64;
-        let bpb = 1024u64;
-        assert!(matches!(
-            compute_num_blocks_from_measurements(total, peak, util, safety, bpb),
-            Err(ProfileError::InsufficientMemory { .. })
-        ));
-    }
-
-    #[test]
-    fn formula_rejects_safety_eats_budget() {
-        // peak fits, but safety wipes out the remainder.
-        let total = 32u64 * 1024 * 1024 * 1024;
-        let peak = 25u64 * 1024 * 1024 * 1024;
-        let util = 0.85; // budget = 27.2 GiB; after_peak = 2.2 GiB
-        let safety = 4u64 * 1024 * 1024 * 1024; // > 2.2 GiB
-        let bpb = 1024u64;
-        assert!(matches!(
-            compute_num_blocks_from_measurements(total, peak, util, safety, bpb),
-            Err(ProfileError::InsufficientMemory { .. })
-        ));
-    }
-
-    #[test]
-    fn formula_rejects_too_few_blocks() {
-        // Budget < bpb — would round to zero blocks. Auto-sizer refuses to
-        // disable paged attention silently.
-        let gib = 1024u64 * 1024 * 1024;
-        let total = 4 * gib;
-        let peak = gib;
-        let util = 1.0;
-        let safety = 0u64;
-        // budget = 4 GiB - 1 GiB = 3 GiB; bpb = 4 GiB.
-        let bpb = 4 * gib;
-        assert!(matches!(
-            compute_num_blocks_from_measurements(total, peak, util, safety, bpb),
-            Err(ProfileError::NotEnoughBlocks { .. })
-        ));
-    }
-
-    #[test]
-    fn formula_rejects_zero_bpb() {
-        let res = compute_num_blocks_from_measurements(1024, 0, 1.0, 0, 0);
-        assert!(matches!(res, Err(ProfileError::InvalidShape(_))));
-    }
-
-    #[test]
-    fn util_env_default() {
-        // Don't mutate global env state in tests — just verify the parser
-        // accepts the default constant. Env-overriding tests run in
-        // `tests/profile_run.rs` where they're isolated per process.
-        let _ = read_util_env(); // value depends on host env; just must not panic
-    }
-
-    /// vLLM's reference value: `gpu_memory_utilization=0.9`, peak=10GB,
-    /// total=80GB, safety=1GB. Verifies our formula matches their docs.
-    #[test]
-    fn formula_matches_vllm_reference() {
-        let total = 80u64 * 1024 * 1024 * 1024;
-        let peak = 10u64 * 1024 * 1024 * 1024;
-        let util = 0.9; // budget = 72 GB
-        let safety = 1024u64 * 1024 * 1024;
-        let bpb = 16 * 1024 * 1024; // 16 MiB / block
-        let (num_blocks, kv) =
-            compute_num_blocks_from_measurements(total, peak, util, safety, bpb).unwrap();
-        // 72 - 10 - 1 = 61 GiB / 16 MiB ≈ 3904 blocks.
-        assert!((3900..=3910).contains(&num_blocks), "got {num_blocks}");
-        assert!(kv > 0);
-    }
-
-    /// No working-set bound reported (CPU-only build / device_info missing
-    /// the entry) → the function falls through to the physical-RAM
-    /// budget and returns the same num_blocks as
-    /// `compute_num_blocks_from_measurements`.
-    #[test]
-    fn working_set_none_falls_through_to_physical() {
-        let total = 64u64 * 1024 * 1024 * 1024;
-        let peak = 10u64 * 1024 * 1024 * 1024;
-        let util = 0.85;
-        let safety = 1024u64 * 1024 * 1024;
-        let bpb = 1024u64 * 1024;
-        let (phys_blocks, _) =
-            compute_num_blocks_from_measurements(total, peak, util, safety, bpb).unwrap();
-        let (num_blocks, _, _, ws_bytes) =
-            compute_num_blocks_with_working_set(total, None, peak, util, safety, bpb).unwrap();
-        assert_eq!(num_blocks, phys_blocks);
-        assert_eq!(ws_bytes, None);
-    }
-
-    /// Working set < total → working-set budget bounds the result. The
-    /// Apple-Silicon-typical case: hw.memsize = 64 GiB, working set =
-    /// 48 GiB. A naive auto-sizer would over-commit by 16 GiB; the
-    /// clamp keeps the result inside the working-set budget.
-    #[test]
-    fn working_set_smaller_clamps_blocks() {
-        let total = 64u64 * 1024 * 1024 * 1024;
-        let working_set = 48u64 * 1024 * 1024 * 1024;
-        let peak = 10u64 * 1024 * 1024 * 1024;
-        let util = 0.85;
-        let safety = 1024u64 * 1024 * 1024;
-        let bpb = 1024u64 * 1024;
-
-        // Physical budget alone: 64 * 0.85 - 10 - 1 = 43.4 GiB ≈ 44_447 blocks.
-        // Working-set budget:    48 * 0.85 - 10 - 1 = 29.8 GiB ≈ 30_515 blocks.
-        // Working set is strictly tighter → wins.
-        let (phys_blocks, _) =
-            compute_num_blocks_from_measurements(total, peak, util, safety, bpb).unwrap();
-        let (clamped_blocks, kv_bytes, phys_budget, ws_budget) =
-            compute_num_blocks_with_working_set(total, Some(working_set), peak, util, safety, bpb)
-                .unwrap();
-
-        assert!(
-            clamped_blocks < phys_blocks,
-            "expected clamp to reduce blocks: physical={phys_blocks}, clamped={clamped_blocks}"
-        );
-        // Sanity: ~30,500 blocks for the working-set budget.
-        assert!(
-            (30_000..=31_000).contains(&clamped_blocks),
-            "expected ~30,515 blocks for working-set budget, got {clamped_blocks}"
-        );
-        // kv_bytes equals the working-set budget (since it's the smaller).
-        let ws_kv = ws_budget.expect("working-set budget reported");
-        assert_eq!(kv_bytes, ws_kv.min(phys_budget));
-        assert!(ws_kv < phys_budget);
-    }
-
-    /// Working set >= total (the rare misreport case: VM driver bug) →
-    /// the physical budget is tighter and wins. We still report both
-    /// budgets through the return tuple so the eprintln log can show
-    /// which side dominated.
-    #[test]
-    fn working_set_larger_falls_back_to_physical() {
-        let total = 32u64 * 1024 * 1024 * 1024;
-        let working_set = 64u64 * 1024 * 1024 * 1024; // > total: misreport
-        let peak = 4u64 * 1024 * 1024 * 1024;
-        let util = 0.85;
-        let safety = 1024u64 * 1024 * 1024;
-        let bpb = 1024u64 * 1024;
-        let (phys_blocks, _) =
-            compute_num_blocks_from_measurements(total, peak, util, safety, bpb).unwrap();
-        let (num_blocks, _, _, ws_bytes) =
-            compute_num_blocks_with_working_set(total, Some(working_set), peak, util, safety, bpb)
-                .unwrap();
-        assert_eq!(num_blocks, phys_blocks);
-        // Working-set budget IS still reported, but it's the larger of
-        // the two so the physical budget bounds the result.
-        assert!(ws_bytes.is_some());
-    }
-
-    /// Both budgets reject the same way when peak exceeds the
-    /// utilization haircut: physical leg returns InsufficientMemory
-    /// before we even consider the working set. Verifies the
-    /// short-circuit behaviour.
-    #[test]
-    fn working_set_rejects_when_physical_does() {
-        let total = 32u64 * 1024 * 1024 * 1024;
-        let peak = 30u64 * 1024 * 1024 * 1024; // > 32 * 0.85 = 27.2
-        let util = 0.85;
-        let safety = 0u64;
-        let bpb = 1024u64;
-        let res = compute_num_blocks_with_working_set(
-            total,
-            Some(48u64 * 1024 * 1024 * 1024),
-            peak,
-            util,
-            safety,
-            bpb,
-        );
-        assert!(matches!(res, Err(ProfileError::InsufficientMemory { .. })));
-    }
-
-    /// Pin the FFI status-code translation that bridges the C++ shim's
-    /// split status to the Rust `Result<Option<u64>, ProfileError>` the
-    /// auto-sizer consumes.
-    ///
-    /// The C++ shim
-    /// (`crates/mlx-sys/src/mlx_paged_profile.cpp::mlx_max_recommended_
-    /// working_set_size`) MUST return:
-    /// - `0` AND write a non-zero `out_value` on success with a real bound.
-    /// - `0` AND write `0` to `out_value` when the `device_info` map
-    ///   omits the entry, the entry has the wrong variant type, or Metal
-    ///   isn't available. Schema/version drift is NOT a failure — the
-    ///   auto-sizer falls back to the physical-RAM budget instead.
-    /// - `-1` ONLY when a C++ exception is caught.
-    ///
-    /// This test pins the Rust-side translation against synthetic
-    /// `(rc, ws)` pairs that mirror each shim status. Runs on every
-    /// platform — no FFI invocation required.
-    #[test]
-    fn working_set_status_translation_matches_ffi_contract() {
-        // Real bound published: `(0, non_zero)` → `Ok(Some(non_zero))`.
-        let real_bound = 48u64 * 1024 * 1024 * 1024;
-        assert_eq!(
-            translate_working_set_status(0, real_bound),
-            Ok(Some(real_bound))
-        );
-
-        // Missing-key path (schema drift): `(0, 0)` → `Ok(None)`. This
-        // is the regression-guarding case for finding 1 — previously the
-        // C++ shim returned `-1` here and the Rust translation collapsed
-        // it into `Err(MetalUnavailable)`, aborting profiling on hosts
-        // where the `device_info` map simply doesn't publish the entry.
-        // The fix splits the status so a missing/wrong-type key surfaces
-        // as success-with-zero, which translates to `Ok(None)` and keeps
-        // the auto-sizer running via the physical-RAM fallback.
-        assert_eq!(translate_working_set_status(0, 0), Ok(None));
-
-        // Caught-exception path: `(-1, _)` → `Err(MetalUnavailable)`.
-        // The shim leaves `out_value` untouched on this path, but the
-        // translation must NOT consume `ws` — it short-circuits on `rc`.
-        assert_eq!(
-            translate_working_set_status(-1, 0),
-            Err(ProfileError::MetalUnavailable)
-        );
-        assert_eq!(
-            translate_working_set_status(-1, 12345),
-            Err(ProfileError::MetalUnavailable)
-        );
-    }
-
-    /// Physical budget passes, but the working-set budget is too small
-    /// to fit even one block. The auto-sizer refuses to silently
-    /// disable paged attention even with a generous physical budget.
-    #[test]
-    fn working_set_too_small_rejects() {
-        let gib = 1024u64 * 1024 * 1024;
-        let total = 64 * gib;
-        // Working set so small the post-haircut budget can't fit one block.
-        let working_set = 5 * gib; // util * 5 GiB - 4 GiB peak - 1 GiB safety = -0.75 GiB
-        let peak = 4 * gib;
-        let util = 0.85;
-        let safety = gib;
-        let bpb = 4 * gib;
-        let res =
-            compute_num_blocks_with_working_set(total, Some(working_set), peak, util, safety, bpb);
-        // The clamp drives chosen_kv_bytes to 0; we surface NotEnoughBlocks
-        // (NOT InsufficientMemory — that's the physical-only short-circuit).
-        assert!(matches!(res, Err(ProfileError::NotEnoughBlocks { .. })));
     }
 }

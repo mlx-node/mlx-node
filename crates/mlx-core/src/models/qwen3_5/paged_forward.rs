@@ -364,6 +364,20 @@ pub(crate) fn paged_prefill_ranges(
     ranges
 }
 
+/// A media prefill's chunks: at most the step the memory plan prices, with a
+/// cut at each checkpoint boundary.
+pub(crate) fn media_prefill_ranges(
+    suffix_len: usize,
+    checkpoint_boundaries: &[u32],
+    cached_prefix_len: u32,
+) -> Vec<Range<usize>> {
+    paged_prefill_ranges(
+        suffix_len,
+        crate::models::forward::paged_prefill_chunk_rows(),
+        &checkpoint_suffix_offsets(checkpoint_boundaries, cached_prefix_len),
+    )
+}
+
 /// Forward the cached-prefix tokens through GDN layers ONLY. Used as
 /// "pass 1" of the paged prefill when there is a non-zero cached
 /// prefix.
@@ -428,12 +442,7 @@ pub(crate) fn run_gdn_only_prefill_materialized(
     caches: &mut [Qwen3_5LayerCache],
     turn_cancel: Option<&AtomicBool>,
 ) -> Result<()> {
-    let configured_chunk_size = crate::array::paged_prefill_chunk_size();
-    let chunk_size = if configured_chunk_size > 0 {
-        configured_chunk_size as usize
-    } else {
-        2048
-    };
+    let chunk_size = crate::models::forward::paged_prefill_chunk_rows();
     run_gdn_only_prefill_materialized_with_chunk_size(
         prefix_tokens,
         embed,
@@ -487,8 +496,8 @@ pub(crate) fn run_gdn_only_prefill_materialized_with_chunk_size(
 /// the suffix `&tokens[cached_prefix_len..]` is what gets recorded
 /// into the paged adapter and fed through the full forward pass.
 ///
-/// `chunk_size <= 0` keeps the single-shot path, which crosses no boundary and
-/// so returns an empty checkpoint vec. Positive chunk sizes split only the
+/// `chunk_size <= 0` (tests only) runs the single-shot path, which crosses no
+/// boundary and so returns an empty checkpoint vec. Positive chunk sizes split only the
 /// uncached suffix. Each chunk writes its K/V into the paged adapter, attends
 /// over the cumulative cached range, then clears MLX's transient graph before
 /// the next chunk. This matches the Qwen3/Qwen3.5 MoE driver shape and keeps
@@ -496,8 +505,8 @@ pub(crate) fn run_gdn_only_prefill_materialized_with_chunk_size(
 ///
 /// The size is the caller's to choose — nothing here reads
 /// `MLX_PAGED_PREFILL_CHUNK_SIZE`. Every production caller passes
-/// `Qwen35Inner::cold_gdn_prefill_chunk_size()`, so a persist-cold turn splits
-/// at the checkpoint ladder's rungs and every other turn stays single-shot.
+/// `Qwen35Inner::cold_gdn_prefill_chunk_size()`, so a persist-cold turn also
+/// splits at the checkpoint ladder's rungs.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_paged_prefill_chunk_with_size(
     full_tokens: &[u32],
@@ -524,10 +533,8 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         p.begin_prefill(suffix_tokens.len() as u32, cached_prefix_len)
     });
 
-    // Preserve the public `0 = legacy single-shot` contract. Capturing a
-    // sidecar at the stable reusable-block boundary may require splitting
-    // before the final chunk, so it is intentionally available only when
-    // chunking is enabled.
+    // Capturing a sidecar at the stable reusable-block boundary may require
+    // splitting before the final chunk, so the single-shot arm captures none.
     if chunk_size <= 0 {
         return run_paged_prefill_single_shot(
             full_tokens,
@@ -959,23 +966,20 @@ pub(crate) fn run_paged_vlm_prefill(
     crate::engine::progress::with_turn_progress(|p| {
         p.begin_prefill(suffix_tokens.len() as u32, cached_prefix_len)
     });
-    let configured_chunk_size = crate::array::paged_prefill_chunk_size();
-    let chunk_size = if configured_chunk_size > 0 {
-        configured_chunk_size as usize
-    } else {
-        suffix_tokens.len()
-    };
-    // Image-aware KV reuse also needs an exact recurrent sidecar. Even when
-    // generic text prefill chunking is disabled, split once at the reusable
-    // block boundary so a later non-live image-prefix hit remains exact.
+    // Image-aware KV reuse also needs an exact recurrent sidecar: split once at
+    // the reusable block boundary so a later non-live image-prefix hit remains
+    // exact.
     // A media turn never writes a cold sidecar, so it keeps the single deepest
     // boundary rather than a ladder: the extra rungs would only cost memory.
     let checkpoint_boundaries: Vec<u32> =
         gdn_checkpoint_target(prompt_len, cached_prefix_len, paged_adapter.block_size())
             .into_iter()
             .collect();
-    let suffix_offsets = checkpoint_suffix_offsets(&checkpoint_boundaries, cached_prefix_len);
-    let chunk_ranges = paged_prefill_ranges(suffix_tokens.len(), chunk_size, &suffix_offsets);
+    let chunk_ranges = media_prefill_ranges(
+        suffix_tokens.len(),
+        &checkpoint_boundaries,
+        cached_prefix_len,
+    );
     let total_chunks = chunk_ranges.len();
     let mut last_logits = None;
     let mut checkpoints = Vec::new();
@@ -1068,7 +1072,7 @@ pub(crate) fn run_paged_vlm_prefill(
 /// cover the full prompt and the prompt-prefix seed cannot use it.
 ///
 /// `chunk_size` carries the same contract as the non-hidden worker: `<= 0` is
-/// legacy single-shot (no checkpoints), and the value comes from the caller,
+/// single-shot (tests only, no checkpoints), and the value comes from the caller,
 /// never from `MLX_PAGED_PREFILL_CHUNK_SIZE` read here. An MTP turn is the only
 /// consumer, and it is a persist-cold turn like any other — reading the raw env
 /// default here is what kept MTP turns from publishing any ladder rung at all.
@@ -1099,8 +1103,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
         p.begin_prefill(suffix_tokens.len() as u32, cached_prefix_len)
     });
 
-    // Preserve the public `0 = legacy single-shot` contract. See the
-    // non-hidden worker above for why sidecar capture requires chunking.
+    // See the non-hidden worker above for why sidecar capture requires chunking.
     if chunk_size <= 0 {
         return run_paged_prefill_single_shot_with_hidden(
             full_tokens,
@@ -1779,8 +1782,8 @@ pub(crate) fn run_paged_verify_step(
 #[cfg(test)]
 mod gdn_checkpoint_tests {
     use super::{
-        gdn_checkpoint_target, gdn_prefill_checkpoint_boundaries, paged_prefill_ranges,
-        prefill_checkpoint_boundaries,
+        gdn_checkpoint_target, gdn_prefill_checkpoint_boundaries, media_prefill_ranges,
+        paged_prefill_ranges, prefill_checkpoint_boundaries,
     };
 
     /// A turn with no GDN cold policy must take the break set it took before the
@@ -1980,6 +1983,22 @@ mod gdn_checkpoint_tests {
         let ranges = paged_prefill_ranges(5000, 2048, &[]);
         assert_eq!(ranges, vec![0..2048, 2048..4096, 4096..5000]);
         assert_contiguous_cover(&ranges, 5000);
+    }
+
+    /// A media prefill runs in chunks of at most the 2,048-row step the
+    /// memory plan prices, never the whole suffix. Mutation: the whole suffix
+    /// as the chunk in `media_prefill_ranges` → red (2 ranges, one of
+    /// 49,152 rows).
+    #[test]
+    fn media_prefill_runs_in_step_sized_chunks() {
+        if crate::array::paged_prefill_chunk_size() != 0 {
+            return;
+        }
+        let ranges = media_prefill_ranges(50_000, &[49_152], 0);
+        assert_eq!(ranges.len(), 25);
+        assert!(ranges.iter().all(|range| range.len() <= 2048), "{ranges:?}");
+        assert!(ranges.iter().any(|range| range.end == 49_152));
+        assert_contiguous_cover(&ranges, 50_000);
     }
 }
 

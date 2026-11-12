@@ -54,7 +54,6 @@ fn tiny_moe_cfg() -> Qwen3_5MoeConfig {
         n_mtp_layers: 0,
         qwen35_gguf_gdn_layout: None,
         kv_format: None,
-        paged_cache_initial_memory_mb: None,
     }
 }
 

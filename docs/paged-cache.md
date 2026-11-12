@@ -18,49 +18,49 @@ attention to separate paged groups and aliases KV-shared layers to their anchor.
 
 `BlockAllocator` and `LayerKVPool` are intentionally split so the legacy `CacheEngineManager` path (used by `use_paged_attention`, a different flag — see below) is unaffected. `paged_cache_memory_mb` defaults to 2048 when `None`.
 
-## Pool growth: start small, double on exhaustion
+## Pool growth: the memory plan, runway, extents
 
-The `qwen3_5` and `qwen3_5_moe` loaders size the paged pool in two steps. The
-**initial** pool is allocated at load from `paged_cache_initial_memory_mb`
-(config.json) or `MLX_PAGED_CACHE_INITIAL_MB` (env wins over the config field;
-a set-but-unparseable env value falls back to config). A load with a DFlash2
-draft ignores both and starts at the 2048-token runway, as Splash builds its
-pool at `warmupKvPages` with no size knob. The **max** is the
-existing budget — `paged_cache_memory_mb`, or the auto one-full-context default
-when unset — minus whatever `load_time_pool_sizing` clamps for live unified
-memory.
+The `qwen3_5` and `qwen3_5_moe` loaders size the paged pool from one memory
+plan (`crates/mlx-core/src/engine/memory_plan.rs`, Splash
+`evaluateEngineMemoryPlan`), evaluated after the weights are resident:
 
-When a reservation outruns free + evictable blocks, the adapter grows before
-evicting LRU cache-only entries (`PagedKVCacheAdapter::try_grow_pool`): the new
-block count is `min(max, max(2 × current, current + needed))` — double the
-current pool, or jump straight to what the reservation needs when that is
-larger, never past the max. Each reservation gets one grow before allocation
-plus one retry on mid-loop exhaustion; a reservation that still cannot fit
-falls through to the existing eviction/error path. The load log reports both
-sides distinctly — `initial_blocks=` plus `effective_window_tokens=` computed
-from the max — and a dynamic pool adds a
-`paged pool is dynamic (grow-on-demand)` line.
+- **hard budget** = the Metal recommended working set less 15% and 1 GiB, or
+  the `maxMemoryBytes` load option when that is lower;
+- **fixed** = MLX active memory, other models' registered pools, restore
+  staging and the pipeline/runtime reserves;
+- the **pool max** is what the rest holds after one request's recurrent
+  state and its peak transient, in whole blocks. The recurrent state lives
+  outside the pool (Splash `availableForOneRequestKv = dynamic -
+  laneStateBytes`); the scheduler still also charges it inside the pool, so
+  the window pays it twice (48,601 against Splash's 50,585 on the M3 Pro
+  inputs).
 
-| Knob                            | Source                              | Role                                                                                                                      |
-| ------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `paged_cache_initial_memory_mb` | config.json (qwen3_5 / qwen3_5_moe) | Initial pool size in MiB. Unset = the max itself. Ignored with a DFlash2 draft: the pool starts at the 2048-token runway. |
-| `MLX_PAGED_CACHE_INITIAL_MB`    | env (wins over the config field)    | Same, u32 MiB. Unparseable values are ignored (config field, then the unset default). Ignored with a DFlash2 draft.       |
-| `paged_cache_memory_mb`         | config.json                         | MAX pool size in MiB (auto one-full-context when unset).                                                                  |
-| `MLX_PAGED_CACHE_MEMORY_MB`     | env (agent override manager only)   | Floor the manager writes for the max into the cloned config; unparseable falls back to the 16 GiB floor.                  |
+The peak transient is one prefill chunk of at most **2,048 rows**
+(Splash `ExecutionLimits::prefillTokenBudget`). Every Qwen3.5 dense and MoE
+paged prefill, text and media, runs in chunks of that size
+(`forward::paged_prefill_chunk_rows`); `MLX_PAGED_PREFILL_CHUNK_SIZE` can only
+make the chunks smaller, a larger value is capped at 2,048. The GDN checkpoint
+cuts come on top of the chunk cuts.
 
-The agent override manager (`packages/lm/src/models/paged-config-override.ts`)
-writes `paged_cache_initial_memory_mb = 2048` into the cloned config for
-`qwen3_5` / `qwen3_5_moe`, overridable with `MLX_PAGED_CACHE_INITIAL_MB`, and
-clamped to the resolved max so it never exceeds the pool ceiling. A load with a
-DFlash2 draft (the server host passes the draft flag) gets no initial size,
-even with `MLX_PAGED_CACHE_INITIAL_MB` set, and the loader ignores a source
-config's field: the pool starts at the DFlash2 runway. Without a
-draft, the override manager normalizes a larger configured initial down to the
-default; raise it
-via `MLX_PAGED_CACHE_INITIAL_MB`. Other families are not given the field —
-their loaders have no initial knob and must not receive one. Checkpoints
-resolved WITHOUT the manager (a library caller loading the path directly)
-keep the historical behavior: unset initial = static full-size pool.
+Every load starts the pool at the **runway**: 2048 tokens of blocks plus one
+GDN cell (`qwen35_runway_blocks`, Splash `warmupKvPages`; 275 blocks on the
+27B), and grows by whole extents of free blocks up to the max
+(`PagedKVCacheAdapter::set_extent_growth`). Each grow is probed against the
+plan's ceiling (hard budget less the reserves). A paged load whose working set
+is unreadable is a load error, and so is a load whose footprint at the end
+already exceeds the hard budget (Splash `auditActualMemory`). The load log
+prints the plan (`memory plan:`), with `initial_blocks=`, `max_blocks=` and
+`pool_window_tokens=`.
+
+| Knob                    | Source                                                                       | Role                                                                                                 |
+| ----------------------- | ---------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `paged_cache_memory_mb` | config.json                                                                  | MAX pool size in MiB, at most the plan's; above it the load fails and names the MiB the plan allows. |
+| `maxMemoryBytes`        | `Qwen35LoadOptions` (napi load), `--max-memory` on `mlx serve` / `mlx agent` | Metal memory budget in bytes; it can only lower the automatic hard budget.                           |
+
+The pool always starts at the runway. The host's paged-config overlay (`PagedConfigOverrideManager`)
+writes no pool size: it only forces `use_block_paged_cache`, and a source
+`paged_cache_memory_mb` passes through to the plan's check. Other families size their pools on the same hard budget
+(`automatic_hard_budget`) through `load_time_pool_sizing`.
 
 **Transient memory during grow.** `LayerKVPool::grow_to` grows one layer at
 a time: it allocates the layer's larger pair, copies the old bytes, waits,
@@ -68,10 +68,8 @@ swaps the pair in and drops the old one before the next layer, so the peak is
 the new pool plus one old layer (Splash grows by whole extents and copies
 nothing; this is the closest layout without extents). The adapter drops its
 cached MLX views before the grow so they do not keep old layers alive; the
-headroom probe reserves one old layer (`pool_grow_reserved_bytes`). A qwen3_5
-runway pool (DFlash2 draft, no initial size) publishes a max that leaves room
-for that layer: `floor(B * L / (L + 1))` of the sizer's budget `B` over `L`
-pool layers, while the DFlash2 pool term is still priced from `B`. A grow that
+headroom probe reserves one old layer (`pool_grow_reserved_bytes`). The
+memory plan's pool max keeps one layer's bytes free for that copy. A grow that
 fails part way keeps the grown layers (bytes intact, block count unchanged).
 The growth notifier (`CacheLimitCoordinator::update_pool`) re-debits the
 coordinator with the pool's measured buffer bytes, so the global cap tracks
@@ -566,8 +564,8 @@ a block-aligned quarter of the one above, and the ladder stops after four rungs 
 when the next would fall to zero or below what is already cached. A 1400-token prompt
 at `block_size` 16 therefore publishes `[16, 80, 336, 1392]`. The recurrent state is
 only materialized at a rung when the prefill **splits** there, so when a GDN cold
-policy is attached `paged_prefill` forces a split at **every** rung it crosses, even
-under the default single-shot chunk size (`Qwen35Inner::cold_gdn_prefill_chunk_size`).
+policy is attached `paged_prefill` forces a split at **every** rung it crosses, on top
+of the 2,048-row chunk cuts (`Qwen35Inner::cold_gdn_prefill_chunk_size`).
 
 Why a ladder rather than the single endpoint boundary: capture may only anchor a
 sidecar where the persisted K/V chain already reaches, and that chain advances by one
@@ -592,9 +590,7 @@ before anything has ever been restored.
 The converse also has to hold, and it is enforced rather than assumed. A turn with
 **no** GDN cold policy takes the break set it took before the ladder existed: the
 single deep `gdn_checkpoint_target`, never the rungs. That is not cosmetic. Chunking
-is on for a persist-off turn whenever `MLX_PAGED_PREFILL_CHUNK_SIZE` is positive, and
-`packages/agent/src/run-agent.ts` plus `packages/cli/src/commands/launch-claude/index.ts`
-both default it to 2048 unconditionally, before any persistence decision — so
+is always on for a Qwen3.5 persist-off turn (2,048-row chunks), so
 `mlx agent --no-persist-cache` reaches a positive chunk size with no policy installed.
 Without the guard a 1400-token prompt there would forward as 5 chunks
 (`M` = 16, 64, 256, 1056, 8) where it used to forward as 2 (`M` = 1392, 8), which by

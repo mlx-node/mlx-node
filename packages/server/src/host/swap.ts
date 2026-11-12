@@ -27,12 +27,17 @@ export interface SwapController {
  * The controller serializes every `resolveModel` invocation on a single
  * promise chain so two concurrent requests for different-but-currently-
  * unloaded models cannot race on the native compiled-path globals.
+ *
+ * `estimatedWindow` is the window an entry's load would serve, priced before
+ * it loads; `listModels` shows it between the trained window and the loaded
+ * model's own.
  */
 export function makeSwapController(
   discovered: DiscoveredModel[],
   registry: ModelRegistry,
   loadModelFn: (path: string) => Promise<LoadableModel>,
   defaultName?: string,
+  estimatedWindow?: (name: string) => number | undefined,
 ): SwapController {
   const byName = new Map<string, DiscoveredModel>();
   for (const entry of discovered) byName.set(entry.name, entry);
@@ -192,7 +197,8 @@ export function makeSwapController(
 
   function listModels(): PublicModelEntry[] {
     return ordered.map((entry) => {
-      const window = registry.servedContext(entry.name)?.windowTokens ?? entry.contextWindow;
+      const window =
+        registry.servedContext(entry.name)?.windowTokens ?? estimatedWindow?.(entry.name) ?? entry.contextWindow;
       return {
         id: entry.name,
         object: 'model',

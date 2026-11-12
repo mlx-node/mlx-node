@@ -16,7 +16,7 @@ use crate::transformer::paged_kv_cache_adapter::{
 use crate::transformer::paged_policy::mlx_sdpa_uses_fused_kernel;
 use crate::transformer::paged_policy::{
     LivePrefillHeadroom, estimate_paged_pool_sdpa_bytes, estimate_varlen_paged_attention_bytes,
-    live_prefill_headroom, prefill_sdpa_effective_dtype,
+    live_headroom, prefill_sdpa_effective_dtype,
 };
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -1135,7 +1135,7 @@ impl Gemma4Attention {
         };
         let context_bucket_end = decode_context_bucket_end(total_ctx);
         let memory_snapshot = adapter.decode_memory_snapshot(context_bucket_end);
-        let live_headroom = live_prefill_headroom(memory_snapshot).selected_bytes;
+        let live_headroom = live_headroom(memory_snapshot, None).selected_bytes;
         let (grouped_selector, grouped_stripe_override) = grouped_d512_diagnostic_config();
         let gpu_cores = gpu_core_count();
         let grouped_policy_eligible = grouped_d512_geometry_supported(
@@ -1528,7 +1528,7 @@ impl Gemma4Attention {
         let memory_probe_performed =
             mode == CacheHitPrefillMode::Auto && seq_len > 8 && graph_backend_available;
         let live_headroom = if memory_probe_performed {
-            live_prefill_headroom(adapter.prefill_memory_snapshot())
+            live_headroom(adapter.prefill_memory_snapshot(), None)
         } else {
             LivePrefillHeadroom::default()
         };

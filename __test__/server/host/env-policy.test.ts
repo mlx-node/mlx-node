@@ -9,7 +9,7 @@ import {
 
 /**
  * `MLX_PAGED_PREFILL_CHUNK_SIZE` is launcher POLICY, not an engine default:
- * unset, the Rust side reads it as `0` (no chunking), and 2048 is the value
+ * unset, the Rust side reads it as `0` (the family default), and 2048 is the value
  * `mlx launch claude` has historically applied to bound the cold-prefill
  * memory peak. The distinction only stays real if nothing writes the var
  * unless a caller explicitly asks — hence the assertions below on the
@@ -38,7 +38,7 @@ describe('engineEnvFor', () => {
   });
 
   it('renders an explicit 0 rather than dropping it', () => {
-    // 0 is the engine's "no chunking" value and a legitimate policy choice;
+    // 0 is the engine's "family default" value and a legitimate policy choice;
     // a falsy-check bug would silently turn it into "unset", which happens
     // to mean the same thing today but would stop meaning it the moment the
     // Rust default changes.

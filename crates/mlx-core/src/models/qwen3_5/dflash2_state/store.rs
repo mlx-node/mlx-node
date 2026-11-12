@@ -1471,25 +1471,6 @@ mod tests {
         );
     }
 
-    /// The KV budget is 9/10 of the headroom, so a freed byte raises it by
-    /// 9/10 of a byte: `dflash2_kv_headroom_for` is the least headroom whose
-    /// budget covers a need. Mutation: `budget / 9` for `budget.div_ceil(9)`
-    /// in `dflash2_kv_headroom_for` → red.
-    #[test]
-    fn kv_headroom_for_is_the_least_covering_headroom() {
-        use crate::models::qwen3_5::dflash2_decode::{
-            dflash2_kv_budget_of, dflash2_kv_headroom_for,
-        };
-        for budget in (0..2000).chain([u64::MAX / 20, 9 * GDN * ROW + 1]) {
-            let headroom = dflash2_kv_headroom_for(budget);
-            assert!(dflash2_kv_budget_of(headroom) >= budget, "{budget}");
-            assert!(
-                headroom == 0 || dflash2_kv_budget_of(headroom - 1) < budget,
-                "{budget}: {headroom} is not the least"
-            );
-        }
-    }
-
     /// Eviction remembers each resume point it removes: a demotion the end
     /// state, a drop every point the entry held. A prompt on that lineage
     /// reports the deepest one; another lineage, another salt, or a prompt

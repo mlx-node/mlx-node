@@ -493,37 +493,14 @@ impl Qwen35MoeInner {
         Ok(true)
     }
 
-    /// Effective paged-prefill chunk size for EVERY paged prefill this model
-    /// runs — the engine's `paged_prefill` and the hand-written sync/stream cores
-    /// alike. MoE mirror of `Qwen35Inner::cold_gdn_prefill_chunk_size`.
-    ///
-    /// When the SSD cold tier carries a GDN sidecar policy (persistence on),
-    /// return a chunk size large enough that the only breaks the prefill takes
-    /// are the `gdn_prefill_checkpoint_boundaries` ladder's rungs, which are the
-    /// only prefix lengths the sidecar can be anchored at. An explicit
-    /// `MLX_PAGED_PREFILL_CHUNK_SIZE` still wins.
-    ///
-    /// With no cold GDN policy and no env override this is the unchanged
-    /// single-shot default (0). With no cold GDN policy but the env var SET, the
-    /// break set is the single deep `gdn_checkpoint_target` — what a persist-off
-    /// turn split at before the ladder existed — because both this and the
-    /// prefill body read `paged_forward::gdn_cold_sidecar_ladder_wanted`.
-    /// Splitting is algebraically transparent but not numerically bit-identical
-    /// — see the dense doc for the accepted drift.
+    /// Paged-prefill chunk size for EVERY paged prefill this model runs. MoE
+    /// mirror of `Qwen35Inner::cold_gdn_prefill_chunk_size`.
     ///
     /// A caller must read this BEFORE it takes the `&mut self` borrows the
     /// prefill needs (`&mut self.layers` + `&mut self.paged_adapter`); an inline
     /// call in the argument list does not borrow-check.
     pub(super) fn cold_gdn_prefill_chunk_size(&self) -> i32 {
-        let env_chunk = crate::array::paged_prefill_chunk_size();
-        if env_chunk > 0 {
-            return env_chunk;
-        }
-        if self.wants_gdn_checkpoint_ladder() {
-            i32::MAX
-        } else {
-            0
-        }
+        crate::models::forward::paged_prefill_chunk_rows() as i32
     }
 
     /// Whether this turn's prefill should publish the whole checkpoint ladder.

@@ -19,6 +19,7 @@ import {
   Qwen35Model as NativeQwen35Model,
   Qwen35MoeModel as NativeQwen35MoeModel,
   Qwen4ExpModel as NativeQwen4ExpModel,
+  type Qwen35LoadOptions,
 } from '@mlx-node/core';
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
@@ -75,6 +76,24 @@ export interface LoadModelOptions {
    * ignores it; other model families reject it.
    */
   kvFormat?: 'int8' | 'bf16';
+  /**
+   * Metal memory budget in bytes for `qwen3_5` and `qwen3_5_moe` targets
+   * (`--max-memory`). It can only lower the automatic budget the load's memory
+   * plan derives from the working set; the plan sizes the KV pool and the
+   * windows from it. Other model families reject it.
+   */
+  maxMemoryBytes?: number;
+}
+
+/** The native Qwen3.5 load options of `options`; `null` when none is set. */
+function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOptions | null {
+  if (options?.draftModelPath === undefined && options?.kvFormat === undefined && options?.maxMemoryBytes === undefined)
+    return null;
+  return {
+    draftModelPath: options.draftModelPath,
+    kvFormat: options.kvFormat,
+    maxMemoryBytes: options.maxMemoryBytes,
+  };
 }
 
 type NativeModelClass = abstract new (...args: never[]) => object;
@@ -129,23 +148,11 @@ const LOADER_BINDINGS = {
     nativeModelClass: NativeQwen3Model,
   },
   qwen3_5: {
-    load: (modelPath: string, options?: LoadModelOptions) =>
-      Qwen35Model.load(
-        modelPath,
-        options?.draftModelPath === undefined && options?.kvFormat === undefined
-          ? null
-          : { draftModelPath: options.draftModelPath, kvFormat: options.kvFormat },
-      ),
+    load: (modelPath: string, options?: LoadModelOptions) => Qwen35Model.load(modelPath, qwen35LoadOptions(options)),
     nativeModelClass: NativeQwen35Model,
   },
   qwen3_5_moe: {
-    load: (modelPath: string, options?: LoadModelOptions) =>
-      Qwen35MoeModel.load(
-        modelPath,
-        options?.draftModelPath === undefined && options?.kvFormat === undefined
-          ? null
-          : { draftModelPath: options.draftModelPath, kvFormat: options.kvFormat },
-      ),
+    load: (modelPath: string, options?: LoadModelOptions) => Qwen35MoeModel.load(modelPath, qwen35LoadOptions(options)),
     nativeModelClass: NativeQwen35MoeModel,
   },
   qwen4_exp: {
@@ -232,6 +239,12 @@ function dispatchLoad(
   if (options?.draftModelPath !== undefined && requireFamilyData(modelType).acceptsDraftModel !== true) {
     throw new Error(
       `draftModelPath (speculative-decoding draft) is only supported by gemma4, qwen3_5 and qwen3_5_moe models; ` +
+        `${modelPath} has model_type "${modelType}"`,
+    );
+  }
+  if (options?.maxMemoryBytes !== undefined && requireFamilyData(modelType).acceptsMaxMemory !== true) {
+    throw new Error(
+      `maxMemoryBytes (Metal memory budget) is only supported by qwen3_5 and qwen3_5_moe models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }

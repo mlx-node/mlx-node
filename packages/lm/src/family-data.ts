@@ -246,6 +246,11 @@ interface ModelFamilyDataBase {
   /** Native `load` accepts `LoadModelOptions.kvFormat` (the flat K/V cache format). */
   readonly acceptsKvFormat?: true;
   /**
+   * Native `load` accepts `LoadModelOptions.maxMemoryBytes` (`--max-memory`):
+   * its memory plan sizes the KV pool and the windows from that budget.
+   */
+  readonly acceptsMaxMemory?: true;
+  /**
    * Native `load` accepts a matching auxiliary HF checkpoint directory — the
    * original checkpoint supplying qwen4_exp's MTP and vision weights that a
    * GGUF omits. Gates `LoadModelOptions.auxiliaryModelPath` in
@@ -428,6 +433,7 @@ export const MODEL_FAMILY_DATA = [
     match: { rawModelTypes: ['qwen3_5'] },
     acceptsDraftModel: true,
     acceptsKvFormat: true,
+    acceptsMaxMemory: true,
     coldRestoreEligible: true,
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen35'],
@@ -447,6 +453,7 @@ export const MODEL_FAMILY_DATA = [
     match: { rawModelTypes: ['qwen3_5_moe'] },
     acceptsDraftModel: true,
     acceptsKvFormat: true,
+    acceptsMaxMemory: true,
     coldRestoreEligible: true,
     streamOpts: { recordModelPath: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },

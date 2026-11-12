@@ -40,7 +40,12 @@
 
 import type { Server } from 'node:http';
 
-import { releaseNativeGgufLease } from '@mlx-node/core';
+import {
+  estimateQwen35ContextWindow,
+  releaseNativeGgufLease,
+  type Qwen35ContextEstimate,
+  type Qwen35LoadOptions,
+} from '@mlx-node/core';
 import {
   loadModel as loadModelNative,
   PagedConfigOverrideManager,
@@ -172,6 +177,12 @@ export interface InferenceHostOptions {
    * Omitted ⇒ the load default.
    */
   kvFormat?: 'int8' | 'bf16';
+  /**
+   * Metal memory budget in bytes (`--max-memory`) for the families whose load
+   * plans its memory (qwen3_5 / qwen3_5_moe); it can only lower the automatic
+   * budget. Other families never see it. Omitted ⇒ the automatic budget.
+   */
+  maxMemoryBytes?: number;
   /** See `ServerConfig.thinkingTokenBudget`. */
   thinkingTokenBudget?: number;
   /** Model types forced onto the block-paged KV cache. Default {@link DEFAULT_PAGED_MODEL_TYPES}. */
@@ -195,6 +206,12 @@ export interface InferenceHostOptions {
 
   /** Test seam: replaces the native model loader. */
   loadModel?: (path: string, options?: LoadModelOptions) => Promise<LoadableModel>;
+  /** Test seam: replaces the native load-free context estimate. */
+  estimateContextWindow?: (
+    path: string,
+    modelType: string,
+    options?: Qwen35LoadOptions,
+  ) => Promise<Qwen35ContextEstimate | null>;
   /** Test seam: replaces the verbose request logger. */
   attachLogger?: (server: Server, logDir: string) => Logger;
 }
@@ -370,12 +387,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     const entry = models.find((model) => model.path === path)!;
     // Resolve against the source directory before creating the paged config overlay.
     const draftModelPath = findDFlash2Draft(path, entry.modelType, modelsDir);
-    const resolvedPath = await pagedConfigOverrides.resolve(
-      path,
-      entry.modelType,
-      undefined,
-      draftModelPath !== undefined,
-    );
+    const resolvedPath = await pagedConfigOverrides.resolve(path, entry.modelType);
     // A muse_glimmer .gguf resolve leased the prepared asset dir; that
     // reference is this attempt's. A successful load keeps the lazy
     // tokenizer/template assets protected for the model's lifetime — a failed
@@ -387,6 +399,9 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       ...(opts.kvFormat !== undefined && familyDataFor(entry.modelType)?.acceptsKvFormat === true
         ? { kvFormat: opts.kvFormat }
         : {}),
+      ...(opts.maxMemoryBytes !== undefined && familyDataFor(entry.modelType)?.acceptsMaxMemory === true
+        ? { maxMemoryBytes: opts.maxMemoryBytes }
+        : {}),
     };
     try {
       return Object.keys(options).length === 0
@@ -397,7 +412,19 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       throw error;
     }
   };
-  const chatController = makeSwapController(models, server.registry, loadModelPagedAware, boundEntry.name);
+  const estimates = startContextEstimates(
+    models,
+    modelsDir,
+    opts.estimateContextWindow ?? estimateQwen35ContextWindow,
+    (entry) => pagedConfigOverrides.resolve(entry.path, entry.modelType),
+    {
+      ...(opts.kvFormat !== undefined ? { kvFormat: opts.kvFormat } : {}),
+      ...(opts.maxMemoryBytes !== undefined ? { maxMemoryBytes: opts.maxMemoryBytes } : {}),
+    },
+  );
+  const chatController = makeSwapController(models, server.registry, loadModelPagedAware, boundEntry.name, (name) =>
+    estimates.get(name),
+  );
   const controller = withCapabilityModels(
     [
       chatCapability(chatController, server.registry),
@@ -578,7 +605,43 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   };
 }
 
+/**
+ * The window a load of each qwen3_5 / qwen3_5_moe entry would serve, priced
+ * from its memory plan before it loads (`/v1/models` shows it until the
+ * load's own window replaces it). One estimate at a time, in the background:
+ * a GGUF's first estimate prepares its asset directory. A failed estimate
+ * leaves the trained window.
+ */
+function startContextEstimates(
+  models: readonly DiscoveredModel[],
+  modelsDir: string,
+  estimate: NonNullable<InferenceHostOptions['estimateContextWindow']>,
+  resolvePath: (entry: DiscoveredModel) => Promise<string>,
+  options: Pick<Qwen35LoadOptions, 'kvFormat' | 'maxMemoryBytes'>,
+): Map<string, number> {
+  const windows = new Map<string, number>();
+  void (async () => {
+    for (const entry of models) {
+      if (familyDataFor(entry.modelType)?.acceptsMaxMemory !== true) continue;
+      const draftModelPath = findDFlash2Draft(entry.path, entry.modelType, modelsDir);
+      try {
+        // Price the config the load reads: the paged overlay can flip use_block_paged_cache.
+        const path = await resolvePath(entry);
+        const result = await estimate(path, entry.modelType, {
+          ...options,
+          ...(draftModelPath !== undefined ? { draftModelPath } : {}),
+        });
+        if (result != null) windows.set(entry.name, result.speculativeWindowTokens ?? result.windowTokens);
+      } catch {
+        /* a load reports the same failure with its plan */
+      }
+    }
+  })();
+  return windows;
+}
+
 export { discoverModels, type DiscoveredModel } from './discover.js';
+export { MAX_MEMORY_ERROR, parseMaxMemory } from './max-memory.js';
 export {
   applyEnginePolicy,
   engineEnvFor,

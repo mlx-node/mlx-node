@@ -26,6 +26,7 @@ import { dirname, join, resolve } from 'node:path';
 // the family list must have exactly ONE definition (the drift guard's).
 import { CHAT_FAMILY_IDS, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { readAgentDefaultModel } from '@mlx-node/agent/paths';
+import { MAX_MEMORY_ERROR, parseMaxMemory } from '@mlx-node/server/host/max-memory';
 
 import {
   agentUpdateStatus,
@@ -61,6 +62,10 @@ export interface AgentArgScan {
   kvFormat?: 'int8' | 'bf16';
   /** `--kv-format` had a missing or unknown value (the raw value, `''` when missing) — usage error. */
   kvFormatInvalid?: string;
+  /** Bytes of `--max-memory` (lifted out of the argv, forwarded to `mlx serve`); unset for `auto`. */
+  maxMemoryBytes?: number;
+  /** `--max-memory` had a missing or unparseable value (the raw value, `''` when missing) — usage error. */
+  maxMemoryInvalid?: string;
   /**
    * `-h`/`--help` seen and this is NOT a binary-managed subcommand
    * (`models`/`export`/`doctor`/… print their own help inside the binary, so
@@ -224,6 +229,16 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       kvFormatInvalid = value;
     }
   };
+  let maxMemoryBytes: number | undefined;
+  let maxMemoryInvalid: string | undefined;
+  const takeMaxMemory = (value: string): void => {
+    try {
+      maxMemoryBytes = parseMaxMemory(value);
+      maxMemoryInvalid = undefined;
+    } catch {
+      maxMemoryInvalid = value;
+    }
+  };
   let helpSeen = false;
   let versionSeen = false;
 
@@ -293,6 +308,20 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       takeKvFormat(arg.slice('--kv-format='.length));
       continue;
     }
+    if (arg === '--max-memory') {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        maxMemoryInvalid = '';
+      } else {
+        takeMaxMemory(next);
+        i++;
+      }
+      continue;
+    }
+    if (arg.startsWith('--max-memory=')) {
+      takeMaxMemory(arg.slice('--max-memory='.length));
+      continue;
+    }
     if (arg === '--trace-dir') {
       trace = true;
       const next = argv[i + 1];
@@ -340,6 +369,8 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     persistPagedCache,
     ...(kvFormat !== undefined ? { kvFormat } : {}),
     ...(kvFormatInvalid !== undefined ? { kvFormatInvalid } : {}),
+    ...(maxMemoryBytes !== undefined ? { maxMemoryBytes } : {}),
+    ...(maxMemoryInvalid !== undefined ? { maxMemoryInvalid } : {}),
     help: helpSeen && !isSubcommand,
     update: leadingCommand === 'update',
     grokOneShot: versionSeen || (isSubcommand && (leadingCommand !== 'agent' || helpSeen)),
@@ -540,6 +571,8 @@ mlx options (handled before the agent binary sees the args):
                             else bf16).
                             Sets the flat cache DFlash2 turns use; the block-paged
                             pool ignores it and stays bf16. bf16 uses more memory.
+  --max-memory <size>       Metal memory budget, e.g. 28G; it can only lower the
+                            automatic budget (default: auto).
   --no-persist-cache        Disable the on-by-default SSD cold tier for persisted
                             paged prefix blocks. One switch for ALL restore-eligible
                             families (${coldTierRestoreFamilyList().join(', ')});
@@ -701,6 +734,12 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     return;
   }
 
+  if (scan.maxMemoryInvalid !== undefined) {
+    console.error(MAX_MEMORY_ERROR);
+    process.exitCode = 1;
+    return;
+  }
+
   // Must run before the spawned `mlx serve` starts so its native tracing
   // subscriber picks up the env we export here.
   configureAgentTracing(scan);
@@ -764,5 +803,6 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     needsServer: true,
     ...(preloadModel !== undefined ? { preloadModel } : {}),
     ...(scan.kvFormat !== undefined ? { kvFormat: scan.kvFormat } : {}),
+    ...(scan.maxMemoryBytes !== undefined ? { maxMemoryBytes: scan.maxMemoryBytes } : {}),
   });
 }

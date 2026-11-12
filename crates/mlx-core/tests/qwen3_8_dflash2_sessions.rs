@@ -1153,6 +1153,7 @@ async fn qwen38_dflash2_sessions_g1() {
         Some(Qwen35LoadOptions {
             draft_model_path: draft.clone(),
             kv_format: Some("int8".to_string()),
+            max_memory_bytes: None,
         }),
     )
     .await

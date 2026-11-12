@@ -82,6 +82,28 @@ describe('delegate agent arguments', () => {
     expect(options.argv).not.toContain('bf16');
   });
 
+  // Mutation: drop '--max-memory' from DELEGATE_VALUE_FLAGS → red (the spaced
+  // value folds into the prompt and the agent sees a bare --max-memory).
+  it.each([
+    [['--max-memory', '28G', 'Check PR #148']],
+    [['-p', 'Check PR #148', '--max-memory', '28G']],
+    [['github', '--repo', 'owner/repo', '--max-memory', '28G', 'Check PR #148']],
+  ])('reads the --max-memory value, not the prompt: %j', async (argv) => {
+    const launch = vi.fn<NonNullable<AgentRunDeps['launch']>>(async () => 0);
+    await run(argv, {
+      resolveModelsDir: () => '/models',
+      discoverModels: async () => [{ name: 'local' }],
+      readPersistedDefault: () => ({ modelId: 'local' }),
+      launch,
+    });
+    expect(launch).toHaveBeenCalledOnce();
+    const options = launch.mock.calls[0]![0];
+    expect(options).toMatchObject({ maxMemoryBytes: 30_064_771_072 });
+    expect(options.argv[options.argv.indexOf('-p') + 1]).toBe('Check PR #148');
+    expect(options.argv.filter((arg) => arg.startsWith('--max-memory'))).toEqual([]);
+    expect(options.argv).not.toContain('28G');
+  });
+
   it('rejects ambiguous approval values', () => {
     expect(() => parseDelegateArgs(['github', '--caller-approved=false', 'Task'])).toThrow('takes no value');
   });

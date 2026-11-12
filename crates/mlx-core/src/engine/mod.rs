@@ -18,6 +18,7 @@ pub(crate) mod dspark_turn;
 pub(crate) mod finalize;
 pub(crate) mod gen_prompt;
 pub(crate) mod hybrid_scheduler;
+pub(crate) mod memory_plan;
 pub(crate) mod model_command;
 pub(crate) mod mtp_turn;
 pub(crate) mod napi_glue;

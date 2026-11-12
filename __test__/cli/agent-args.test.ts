@@ -164,6 +164,36 @@ describe('scanAgentArgs', () => {
     });
   });
 
+  // Mutation: stop lifting `--max-memory` (forward it to grok) → red.
+  describe('--max-memory extraction', () => {
+    it('lifts both forms out of passthrough as bytes', () => {
+      const spaced = scanAgentArgs(['--max-memory', '28G', '-p', 'hi']);
+      expect(spaced.maxMemoryBytes).toBe(30_064_771_072);
+      expect(spaced.maxMemoryInvalid).toBeUndefined();
+      expect(spaced.passthrough).toEqual(['-p', 'hi']);
+      const inline = scanAgentArgs(['--max-memory=2.5G', '-c']);
+      expect(inline.maxMemoryBytes).toBe(2_684_354_560);
+      expect(inline.passthrough).toEqual(['-c']);
+      const auto = scanAgentArgs(['--max-memory', 'auto']);
+      expect('maxMemoryBytes' in auto).toBe(false);
+      expect(auto.maxMemoryInvalid).toBeUndefined();
+    });
+
+    it('keeps a --max-memory sitting in a grok value slot', () => {
+      const scan = scanAgentArgs(['--system-prompt-override', '--max-memory', '28G']);
+      expect(scan.maxMemoryBytes).toBeUndefined();
+      expect(scan.passthrough).toEqual(['--system-prompt-override', '--max-memory', '28G']);
+    });
+
+    it('reports a missing or bad value without swallowing the next option', () => {
+      expect(scanAgentArgs(['--max-memory', '2.5']).maxMemoryInvalid).toBe('2.5');
+      expect(scanAgentArgs(['--max-memory=']).maxMemoryInvalid).toBe('');
+      const missing = scanAgentArgs(['--max-memory', '--help']);
+      expect(missing.maxMemoryInvalid).toBe('');
+      expect(missing.passthrough).toEqual(['--help']);
+    });
+  });
+
   describe('update intercept', () => {
     it('detects a leading update positional', () => {
       expect(scanAgentArgs(['update']).update).toBe(true);
@@ -733,6 +763,32 @@ describe('run() argv routing', () => {
     expect(calls.launch).toHaveLength(1);
     expect(calls.launch[0]!.kvFormat).toBe('bf16');
     expect(calls.launch[0]!.argv).not.toContain('--kv-format');
+  });
+
+  // Mutation: drop the `maxMemoryInvalid` usage check in `run` → red (a bad
+  // size launches). Mutation: drop the launcher pass-through → red.
+  it('exits 1 on a bad --max-memory and hands a good one to the launcher', async () => {
+    for (const argv of [['--max-memory', '0'], ['--max-memory'], ['--max-memory=.5G']]) {
+      const { deps, calls } = makeDeps();
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const prevExitCode = process.exitCode;
+      try {
+        await run(argv, deps);
+        expect(process.exitCode).toBe(1);
+        expect(errorSpy.mock.calls.flat().join('\n')).toContain(
+          "--max-memory must be 'auto' or a positive byte count such as 32G or 2.5G",
+        );
+      } finally {
+        process.exitCode = prevExitCode;
+        errorSpy.mockRestore();
+      }
+      expect(calls.launch).toHaveLength(0);
+    }
+    const { deps, calls } = makeDeps();
+    await run(['--max-memory', '28G'], deps);
+    expect(calls.launch).toHaveLength(1);
+    expect(calls.launch[0]!.maxMemoryBytes).toBe(30_064_771_072);
+    expect(calls.launch[0]!.argv).not.toContain('--max-memory');
   });
 
   it('documents the mlx flags and the grok environment in the help preamble', async () => {

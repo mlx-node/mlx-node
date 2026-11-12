@@ -19,6 +19,7 @@ use crate::engine::decode::TurnStreaming;
 use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
 use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::gen_prompt::replay_point;
+use crate::engine::memory_plan::KvLayout;
 use crate::engine::params::generated_capacity_hint;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::engine::reclaim::{
@@ -34,12 +35,10 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use super::config::Qwen3_5Config;
 use super::dflash2::{DFlash2ContextCache, DFlash2Model};
 use super::dflash2_decode::{
-    DFlash2PoolBudget, DFlash2WindowTerms, SplashKvLayout, constrain_dflash2_context_params,
-    dflash2_decode_cache_limit, dflash2_decode_transient_bytes, dflash2_final_token_fits_context,
-    dflash2_kv_budget_of, dflash2_kv_headroom_bytes, dflash2_kv_headroom_for,
-    dflash2_kv_layer_copy_bytes, dflash2_memory_snapshot, dflash2_pool_budget_bytes,
-    dflash2_turn_transient_bytes, dflash2_window_terms, grow_dflash2_target_kv, kv_row_bytes,
-    min_fa_capacity, min_fa_reserved_rows, reusable_dflash2_prefix,
+    constrain_dflash2_context_params, dflash2_cycle_transient_bytes, dflash2_decode_cache_limit,
+    dflash2_final_token_fits_context, dflash2_kv_layer_copy_bytes, dflash2_memory_snapshot,
+    dflash2_turn_transient_bytes, grow_dflash2_target_kv, kv_row_bytes, min_fa_capacity,
+    min_fa_reserved_rows, reusable_dflash2_prefix,
 };
 use super::dflash2_state::flat::{
     FlatAnchor, FlatBacking, FlatStates, flat_attention_kv, join_flat_anchor, join_flat_caches,
@@ -183,11 +182,10 @@ pub(crate) trait DFlash2Target: ChatBackend {
     fn kv_heads(&self) -> i32;
     fn head_dim(&self) -> i32;
     fn max_position_embeddings(&self) -> i32;
-    /// The speculative context window once the DFlash2 window is fixed at
-    /// load, `None` before.
+    /// The speculative context window, `None` without a draft.
     fn dflash2_window(&self) -> Option<u32>;
-    /// Rows of the KV extent fixed at load with the window; `None` before.
-    fn dflash2_kv_extent_rows(&self) -> Option<u64>;
+    /// The load's memory plan; `None` when the working set is unreadable.
+    fn memory_plan(&self) -> Option<&crate::engine::memory_plan::MemoryPlan>;
     /// Dense-shaped config the decode-phase cache limit is sized from.
     fn dense_config(&self) -> Cow<'_, Qwen3_5Config>;
     fn set_cached_token_history(&mut self, history: Vec<u32>);
@@ -543,68 +541,21 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-fn dflash2_kv_headroom_now() -> Option<u64> {
+/// The plan's live headroom on `target`; `None` without a plan or a
+/// readable device.
+pub(crate) fn dflash2_kv_headroom_now<T: DFlash2Target>(target: &T) -> Option<u64> {
     #[cfg(test)]
     if let Some(bytes) = KV_BUDGET_OVERRIDE.with(std::cell::Cell::get) {
         return Some(bytes);
     }
-    dflash2_kv_headroom_bytes(dflash2_memory_snapshot())
-}
-
-/// The DFlash2 pool term inputs of `adapter`: the bytes of `budget_blocks`
-/// (the load-time sizer's pool budget; `None` prices the pool's maximum)
-/// past the blocks it has allocated, floored at the window it gives a paged
-/// turn after `recurrent_state_bytes`.
-pub(crate) fn dflash2_pool_budget(
-    adapter: &crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter,
-    budget_blocks: Option<u32>,
-    recurrent_state_bytes: u64,
-) -> Result<DFlash2PoolBudget> {
-    let bytes_per_block = adapter.bytes_per_block().map_err(Error::from_reason)?;
-    let block_size = adapter.block_size().max(1);
-    Ok(DFlash2PoolBudget {
-        bytes: dflash2_pool_budget_bytes(
-            budget_blocks.unwrap_or(adapter.max_capacity_tokens() / block_size),
-            adapter.block_capacity(),
-            bytes_per_block,
-        ),
-        floor_tokens: crate::engine::hybrid_scheduler::pool_tokens_after_recurrent(
-            adapter.max_capacity_tokens(),
-            block_size,
-            bytes_per_block,
-            recurrent_state_bytes,
-        ),
-    })
-}
-
-/// The DFlash2 window terms of `target` with its loaded draft, `None`
-/// without one. `pool` is [`dflash2_pool_budget`] of its paged pool; the
-/// reservation term reads the live headroom, so this runs once the pool is
-/// registered.
-pub(crate) fn dflash2_published_window<T: DFlash2Target>(
-    target: &T,
-    pool: Option<DFlash2PoolBudget>,
-) -> Result<Option<DFlash2WindowTerms>> {
-    let Some(draft) = target.dflash2() else {
-        return Ok(None);
-    };
-    let config = target.dense_config();
-    dflash2_window_terms(
-        &config,
-        dflash2_target_kv_format(target),
-        dflash2_target_kv_dtype(target)?,
-        draft.max_position_embeddings(),
-        draft.config.kv_ring_bytes(),
-        draft.config.block_size,
-        pool,
-        dflash2_kv_headroom_bytes(dflash2_memory_snapshot()),
-    )
-    .map(Some)
+    target
+        .memory_plan()?
+        .live_headroom(dflash2_memory_snapshot())
 }
 
 /// The target's full-attention KV geometry: its Splash layout and the
 /// bytes of one token row across every layer.
-fn target_kv_layout<T: DFlash2Target>(target: &T) -> Result<(SplashKvLayout, u64)> {
+fn target_kv_layout<T: DFlash2Target>(target: &T) -> Result<(KvLayout, u64)> {
     let config = target.dense_config();
     let full_attention_layers = match target.caches() {
         Some(caches) => caches
@@ -619,7 +570,7 @@ fn target_kv_layout<T: DFlash2Target>(target: &T) -> Result<(SplashKvLayout, u64
     let dtype = dflash2_target_kv_dtype(target)?;
     let (heads, head_dim) = (target.kv_heads(), target.head_dim());
     Ok((
-        SplashKvLayout::of(full_attention_layers, heads, head_dim, dtype, format),
+        KvLayout::of(full_attention_layers, heads, head_dim, dtype, format),
         kv_row_bytes(full_attention_layers, heads, head_dim, dtype, format),
     ))
 }
@@ -632,13 +583,16 @@ fn turn_memory<T: DFlash2Target>(
     context_rows: u64,
 ) -> Result<(u64, u64)> {
     let (_, row_bytes) = target_kv_layout(target)?;
-    let block_size = target.dflash2().map_or(1, |draft| draft.config.block_size);
+    let (block_size, tap_layers) = target.dflash2().map_or((1, 0), |draft| {
+        (draft.config.block_size, draft.config.target_layers.len())
+    });
     let transient = dflash2_turn_transient_bytes(
         &target.dense_config(),
         block_size,
         prompt_len,
         context_rows,
         dflash2_target_kv_format(target),
+        tap_layers,
     );
     Ok((row_bytes, transient))
 }
@@ -652,7 +606,7 @@ pub(crate) fn evict_parked_dflash2_for_flat_turn<T: DFlash2Target>(
     target: &mut T,
     prompt_len: usize,
 ) {
-    evict_parked_dflash2_for_flat_turn_with(target, prompt_len, |_| dflash2_kv_headroom_now());
+    evict_parked_dflash2_for_flat_turn_with(target, prompt_len, dflash2_kv_headroom_now);
 }
 
 pub(crate) fn evict_parked_dflash2_for_flat_turn_with<T: DFlash2Target>(
@@ -938,7 +892,7 @@ pub(crate) fn state_reach_bytes<T: DFlash2Target>(target: &T, keep: Keep<'_>, in
 
 /// One lossless store compaction; whether it freed anything.
 pub(crate) fn compact_one_state<T: DFlash2Target>(target: &mut T) -> bool {
-    let headroom = dflash2_kv_headroom_now().unwrap_or(0);
+    let headroom = dflash2_kv_headroom_now(&*target).unwrap_or(0);
     match target
         .dflash2_states_mut()
         .store
@@ -975,7 +929,7 @@ pub(crate) fn oldest_state_unit<T: DFlash2Target>(
         target
             .dflash2_states()
             .store
-            .next_lossy(dflash2_kv_headroom_now().unwrap_or(0), None)
+            .next_lossy(dflash2_kv_headroom_now(target).unwrap_or(0), None)
             .map(|(stamp, step)| Unit {
                 stamp,
                 key: UnitKey::Store(step),
@@ -1144,7 +1098,7 @@ thread_local! {
 }
 
 /// The KV plan of a turn whose context holds `context_capacity` tokens: the
-/// extent fixed at load, else the one the live headroom sizes.
+/// memory plan's extent, else the layout's smallest.
 pub(crate) fn dflash2_kv_plan<T: DFlash2Target>(
     target: &T,
     context_capacity: usize,
@@ -1163,11 +1117,14 @@ pub(crate) fn dflash2_kv_plan<T: DFlash2Target>(
             extent_rows,
         });
     }
-    let extent_rows = match target.dflash2_kv_extent_rows() {
-        Some(rows) => rows,
-        None => target_kv_layout(target)?
-            .0
-            .extent_rows_for(dflash2_kv_headroom_now().map_or(0, dflash2_kv_budget_of)),
+    let extent_rows = match target
+        .memory_plan()
+        .and_then(|plan| plan.speculative.as_ref())
+        .map(|lane| lane.extent_pages)
+        .filter(|&pages| pages > 0)
+    {
+        Some(pages) => pages * crate::engine::memory_plan::KV_PAGE_TOKENS,
+        None => target_kv_layout(target)?.0.extent_rows_for(0),
     };
     Ok(DFlash2KvPlan {
         cap_rows,
@@ -1223,7 +1180,7 @@ pub(crate) fn ensure_dflash2_target_rows<T: DFlash2Target>(
     plan: DFlash2KvPlan,
     phase: KvGrowthPhase,
 ) -> Result<KvGrowth> {
-    ensure_dflash2_target_rows_with(target, needed, plan, phase, |_| dflash2_kv_headroom_now())
+    ensure_dflash2_target_rows_with(target, needed, plan, phase, dflash2_kv_headroom_now)
 }
 
 /// One growth [`ensure_dflash2_target_rows`] would make next.
@@ -1269,8 +1226,8 @@ pub(crate) fn dflash2_kv_growth_need<T: DFlash2Target>(
         KvGrowthPhase::Decode => {
             let config = target.dense_config();
             let block_size = target.dflash2().map_or(1, |draft| draft.config.block_size);
-            dflash2_decode_transient_bytes(&config, block_size, rows as u64).saturating_sub(
-                dflash2_decode_transient_bytes(&config, block_size, from_rows as u64),
+            dflash2_cycle_transient_bytes(&config, block_size, rows as u64).saturating_sub(
+                dflash2_cycle_transient_bytes(&config, block_size, from_rows as u64),
             )
         }
     };
@@ -1317,9 +1274,7 @@ fn try_ensure_dflash2_target_rows_with<T: DFlash2Target>(
             return Ok(Ok(growth));
         };
         let live = headroom(target);
-        let grows = live.is_none_or(|live| {
-            live >= dflash2_kv_headroom_for(need.kv_bytes).saturating_add(need.transient_bytes)
-        });
+        let grows = live.is_none_or(|live| dflash2_growth_fits(live, &need));
         if !grows
             && reclaim
             && let Some(live) = live
@@ -1350,16 +1305,19 @@ fn try_ensure_dflash2_target_rows_with<T: DFlash2Target>(
         }
         if !grows
             && let Some(live) = live
-            && dflash2_kv_budget_of(live) < need.kv_bytes
+            && live < need.kv_bytes
         {
             return Ok(Err(Error::from_reason(format!(
                 "context_length_exceeded: {} DFlash2 target KV could not grow from {} to {} \
-                 rows: it needs {} bytes and the live budget holds {}",
+                 rows: it needs {} bytes and the memory plan's ceiling of {} bytes leaves {}",
                 target.label(),
                 need.from_rows,
                 need.rows,
                 need.kv_bytes,
-                dflash2_kv_budget_of(live)
+                target
+                    .memory_plan()
+                    .map_or(0, crate::engine::memory_plan::MemoryPlan::ceiling_bytes),
+                live
             ))));
         }
         grow_dflash2_target_kv(target.caches_mut(), need.rows)?;
@@ -1384,9 +1342,14 @@ fn try_ensure_dflash2_target_rows_with<T: DFlash2Target>(
     }
 }
 
+/// Whether `live` headroom holds a growth's KV and its transients.
+pub(crate) fn dflash2_growth_fits(live: u64, need: &KvGrowthNeed) -> bool {
+    live >= need.kv_bytes.saturating_add(need.transient_bytes)
+}
+
 /// Bytes a growth needing `need` is short of in `live` headroom.
 pub(crate) fn dflash2_kv_growth_shortfall(live: u64, need: &KvGrowthNeed) -> u64 {
-    dflash2_kv_headroom_for(need.kv_bytes)
+    need.kv_bytes
         .saturating_add(need.transient_bytes)
         .saturating_sub(live)
 }
@@ -1401,7 +1364,7 @@ fn flat_kv_in_reach<T: DFlash2Target>(target: &T, live: u64, need: &KvGrowthNeed
     live.saturating_add(cut)
         .saturating_add(state_reach_bytes(target, Keep::default(), false))
         .saturating_add(rebuilt_bytes(target))
-        >= dflash2_kv_headroom_for(need.kv_bytes)
+        >= need.kv_bytes
 }
 
 /// What one reclaim step gave back.
@@ -1549,16 +1512,17 @@ fn add_reclaimed(growth: &mut KvGrowth, step: Reclaimed) {
 }
 
 /// Brings parked states within the state budget. A demotion shrinks the
-/// demoted state's KV only when the live headroom holds the copy.
+/// demoted state's KV only when `headroom` holds the copy.
 pub(crate) fn evict_over_state_budget(
     store: &mut super::dflash2_state::store::HybridStateStore<FlatBacking>,
+    headroom: u64,
 ) -> Result<EvictReport> {
     store.evict_for(
         Reservation {
             state_bytes: 0,
             kv_bytes: 0,
         },
-        dflash2_kv_headroom_now().unwrap_or(0),
+        headroom,
         None,
     )
 }
@@ -1576,7 +1540,8 @@ pub(crate) fn reserve_dflash2_turn_kv<T: DFlash2Target>(
 ) -> Result<EvictReport> {
     let block_size = target.dflash2().map_or(1, |draft| draft.config.block_size);
     let needed = i64::try_from(prompt_len.saturating_add(block_size + 1)).unwrap_or(i64::MAX);
-    let over_budget = evict_over_state_budget(&mut target.dflash2_states_mut().store)?;
+    let headroom = dflash2_kv_headroom_now(&*target).unwrap_or(0);
+    let over_budget = evict_over_state_budget(&mut target.dflash2_states_mut().store, headroom)?;
     let mut growth = ensure_dflash2_target_rows(
         target,
         needed,
@@ -1588,7 +1553,7 @@ pub(crate) fn reserve_dflash2_turn_kv<T: DFlash2Target>(
     // scratch: reclaimed memory gives way to them, best effort.
     if let Some(rows) = min_fa_reserved_rows(target.caches())? {
         let transient = turn_memory(target, prompt_len, rows.max(0) as u64)?.1;
-        while let Some(live) = dflash2_kv_headroom_now().filter(|&live| live < transient) {
+        while let Some(live) = dflash2_kv_headroom_now(&*target).filter(|&live| live < transient) {
             let Some(step) = reclaim_one_for_dflash2_transient(target, live, transient - live)?
             else {
                 break;
@@ -1808,7 +1773,7 @@ pub(crate) fn dflash2_materialize_final<T: DFlash2Target>(
             needed,
             plan,
             KvGrowthPhase::Decode,
-            |_| dflash2_kv_headroom_now(),
+            dflash2_kv_headroom_now,
             false,
         )?;
         if let Err(refused) = growth {
@@ -2963,14 +2928,14 @@ mod tests {
         Ok(())
     }
 
-    /// A real turn grows its target KV during decode in the extent frozen at
-    /// load (`DFlash2WindowTerms::extent_rows`), not by the cache's own
-    /// 256-row step: a warm 300-token prompt books 320 rows of 40-row
-    /// extents and 63 decoded tokens grow them to 400. Mutations: install the turn state
-    /// with `kv: None` in `dflash2_chat_turn` → red (574); read `None` for
-    /// `dflash2_kv_extent_rows` in `dflash2_kv_plan` → red (1,026).
+    /// A real turn grows its target KV during decode in the memory plan's
+    /// extent, not by the cache's own 256-row step: a warm 300-token prompt
+    /// books 320 rows of 160-row extents and 63 decoded tokens grow them to
+    /// 480. Mutations: install the turn state with `kv: None` in
+    /// `dflash2_chat_turn` → red (574); ignore the plan's extent in
+    /// `dflash2_kv_plan` → red (1,026).
     #[test]
-    fn turn_grows_decode_kv_in_the_frozen_extent() -> Result<()> {
+    fn turn_grows_decode_kv_in_the_planned_extent() -> Result<()> {
         if !metal_is_default_device() {
             return Ok(());
         }
@@ -2986,20 +2951,14 @@ mod tests {
             let _budget = BudgetOverride;
             KV_BUDGET_OVERRIDE.with(|budget| budget.set(Some(1 << 40)));
             let trained = inner.config.max_position_embeddings as u32;
-            inner.dflash2_window = Some(DFlash2WindowTerms {
-                trained,
-                draft_trained: trained,
-                pool: None,
-                reserve: None,
-                row_bytes: 0,
-                extent_rows: 40,
-            });
+            inner.memory_plan =
+                Some(crate::engine::memory_plan::MemoryPlan::with_speculative_window(trained, 5));
             let cached =
                 run_tiny_dflash_turn(&mut inner, &tokenizer, &prompt, true, 64)?.cached_tokens;
             assert!(cached > 0, "{name}: the turn must continue the live state");
             let frontier = flat_attention_frontier(&inner).expect("frontier");
             assert!(frontier >= 363, "{name}: frontier {frontier}");
-            assert_eq!(min_fa_capacity(&inner.caches)?, Some(400), "{name}");
+            assert_eq!(min_fa_capacity(&inner.caches)?, Some(480), "{name}");
         }
         Ok(())
     }
@@ -3125,11 +3084,8 @@ mod tests {
             let (_, whole_transient) = turn_memory(&inner, prompt, plan.cap_rows as u64)?;
             assert!(whole_transient > need.transient_bytes, "{name}");
             let _override = BudgetOverride;
-            KV_BUDGET_OVERRIDE.with(|budget| {
-                budget.set(Some(
-                    dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes,
-                ))
-            });
+            KV_BUDGET_OVERRIDE
+                .with(|budget| budget.set(Some(need.kv_bytes + need.transient_bytes)));
             reserve_dflash2_turn_kv(&mut inner, prompt, plan)?;
             assert_eq!(inner.dflash2_states.store.bytes(), before, "{name}");
             assert_eq!(min_fa_capacity(&inner.caches)?, Some(512), "{name}");
@@ -3167,7 +3123,7 @@ mod tests {
                 bytes.kv_bytes + bytes.state_bytes
             };
             let start = held(&inner);
-            let base = dflash2_kv_headroom_for(need.kv_bytes) - 1;
+            let base = need.kv_bytes - 1;
             let growth = ensure_dflash2_target_rows_with(
                 &mut inner,
                 300,
@@ -3219,7 +3175,7 @@ mod tests {
                 bytes.kv_bytes + bytes.state_bytes
             };
             let start = held(&inner);
-            let base = dflash2_kv_headroom_for(need.kv_bytes) - 1;
+            let base = need.kv_bytes - 1;
             let growth = ensure_dflash2_target_rows_with(&mut inner, 300, plan, phase, |inner| {
                 Some(base + u64::from(held(inner) < start))
             })?;
@@ -3259,8 +3215,7 @@ mod tests {
                 .expect("the KV grows");
             assert_eq!(inner.dflash2_states.store.bytes().entries, 1, "{name}");
             assert!(
-                state_reach_bytes(&inner, Keep::default(), false)
-                    < dflash2_kv_headroom_for(need.kv_bytes),
+                state_reach_bytes(&inner, Keep::default(), false) < need.kv_bytes,
                 "{name}: the state cannot cover the KV"
             );
             let error = ensure_dflash2_target_rows_with(
@@ -3379,7 +3334,7 @@ mod tests {
         let (mut inner, runway, runway_bytes, tokens) = ar_grown_runway(1, true)?;
         let phase = KvGrowthPhase::TurnStart { prompt_len: 280 };
         let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
-        let base = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes + runway_bytes;
+        let base = need.kv_bytes + need.transient_bytes + runway_bytes;
         let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
             Some(base.saturating_sub(pool_bytes(inner)))
         })?;
@@ -3409,7 +3364,7 @@ mod tests {
         let (mut inner, runway, runway_bytes, _) = ar_grown_runway(1, true)?;
         let phase = KvGrowthPhase::Decode;
         let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
-        let base = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes + runway_bytes;
+        let base = need.kv_bytes + need.transient_bytes + runway_bytes;
         let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
             Some(base.saturating_sub(pool_bytes(inner)))
         })?;
@@ -3444,7 +3399,7 @@ mod tests {
         let start = held(&inner);
         let phase = KvGrowthPhase::Decode;
         let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
-        let base = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes + runway_bytes;
+        let base = need.kv_bytes + need.transient_bytes + runway_bytes;
         let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
             Some(base.saturating_sub(pool_bytes(inner)) + (start - held(inner)))
         })?;
@@ -3498,7 +3453,8 @@ mod tests {
         assert_eq!(states, start_held, "the store holds every state byte");
         let phase = KvGrowthPhase::Decode;
         let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
-        let base = dflash2_kv_headroom_for(need.kv_bytes)
+        let base = need
+            .kv_bytes
             .checked_sub(residual + states)
             .expect("the residual and states fall short of the KV");
         let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
@@ -3570,7 +3526,8 @@ mod tests {
         assert_eq!(states, start_held, "the store holds every state byte");
         let phase = KvGrowthPhase::Decode;
         let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
-        let base = dflash2_kv_headroom_for(need.kv_bytes)
+        let base = need
+            .kv_bytes
             .checked_sub(partial_bytes + states)
             .expect("the partial extent and states fall short of the KV");
         let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
@@ -3615,7 +3572,7 @@ mod tests {
         let start = parked_bytes(&inner);
         let phase = KvGrowthPhase::Decode;
         let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
-        let base = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes + runway_bytes;
+        let base = need.kv_bytes + need.transient_bytes + runway_bytes;
         clear_grow_reclaim_log();
         let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
             Some(base.saturating_sub(pool_bytes(inner)) + (start - parked_bytes(inner)))
@@ -3650,7 +3607,7 @@ mod tests {
             );
             let phase = KvGrowthPhase::Decode;
             let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
-            let bytes = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes;
+            let bytes = need.kv_bytes + need.transient_bytes;
             assert!(dflash2_kv_growth_shortfall(0, &need) <= bytes, "{name}");
             insert_unheld_image(&inner, bytes);
             clear_grow_reclaim_log();
@@ -3679,7 +3636,7 @@ mod tests {
         let (mut inner, runway, runway_bytes, tokens) = ar_grown_runway(1, true)?;
         let phase = KvGrowthPhase::Decode;
         let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
-        let base = dflash2_kv_headroom_for(need.kv_bytes) - 10 + runway_bytes;
+        let base = need.kv_bytes - 10 + runway_bytes;
         let error = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
             Some(base.saturating_sub(pool_bytes(inner)))
         })
@@ -3733,7 +3690,7 @@ mod tests {
         let start = parked_bytes(&inner);
         let phase = KvGrowthPhase::Decode;
         let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
-        let base = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes + runway_bytes;
+        let base = need.kv_bytes + need.transient_bytes + runway_bytes;
         clear_grow_reclaim_log();
         let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
             Some(base.saturating_sub(pool_bytes(inner)) + (start - parked_bytes(inner)))
@@ -3768,7 +3725,7 @@ mod tests {
         assert!(start > 0);
         let phase = KvGrowthPhase::Decode;
         let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
-        let full = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes;
+        let full = need.kv_bytes + need.transient_bytes;
         clear_grow_reclaim_log();
         let growth = ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {
             Some(full - 1 + (start - parked_bytes(inner)))
@@ -3813,7 +3770,7 @@ mod tests {
             let start = parked_bytes(&inner);
             let phase = KvGrowthPhase::Decode;
             let need = dflash2_kv_growth_need(&inner, 300, KV_PLAN, phase)?.expect("the KV grows");
-            let base = dflash2_kv_headroom_for(need.kv_bytes) + need.transient_bytes + runway_bytes;
+            let base = need.kv_bytes + need.transient_bytes + runway_bytes;
             clear_grow_reclaim_log();
             let growth =
                 ensure_dflash2_target_rows_with(&mut inner, 300, KV_PLAN, phase, |inner| {

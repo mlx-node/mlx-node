@@ -14,6 +14,7 @@ import {
   LAUNCHER_ENGINE_POLICY,
   ModelNotFoundError,
   NoModelsDiscoveredError,
+  parseMaxMemory,
   resolveLogDir,
   resolveMlxNodeHome,
   type InferenceHost,
@@ -52,6 +53,9 @@ Options:
                       Sets the flat cache DFlash2 turns use; the
                       block-paged pool ignores it and stays bf16. bf16
                       uses more memory.
+  --max-memory <size> Metal memory budget, e.g. 28G; it can only lower the
+                      automatic budget (default: auto). Qwen3.5 dense and
+                      MoE loads size their KV pool and windows from it.
   --thinking-token-budget <n>  Thinking tokens of a thinking request that
                       sets no budget, after which its thinking closes
                       (default: no cap).
@@ -85,6 +89,7 @@ export interface ServeArgs {
   authToken?: string;
   modelResidency?: 'capability' | 'single';
   kvFormat?: 'int8' | 'bf16';
+  maxMemoryBytes?: number;
   thinkingTokenBudget?: number;
   rerankConfig?: string;
   logDir?: string;
@@ -110,6 +115,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
       preload: { type: 'string' },
       'model-residency': { type: 'string' },
       'kv-format': { type: 'string' },
+      'max-memory': { type: 'string' },
       'thinking-token-budget': { type: 'string' },
       'rerank-config': { type: 'string' },
       'auth-token': { type: 'string' },
@@ -136,6 +142,8 @@ export function parseServeArgs(argv: string[]): ServeArgs {
   const kvFormat = values['kv-format'];
   if (kvFormat !== undefined && kvFormat !== 'int8' && kvFormat !== 'bf16')
     throw new Error('--kv-format must be int8 or bf16');
+  const maxMemoryText = values['max-memory'];
+  const maxMemoryBytes = maxMemoryText === undefined ? undefined : parseMaxMemory(maxMemoryText);
   const budgetText = values['thinking-token-budget'];
   const thinkingTokenBudget = budgetText === undefined ? undefined : parseThinkingTokenBudget(budgetText);
   const verbose = (values.verbose ?? false) || values['log-dir'] != null;
@@ -149,6 +157,7 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     ...(values.preload !== undefined ? { preload: values.preload } : {}),
     ...(modelResidency !== undefined ? { modelResidency } : {}),
     ...(kvFormat !== undefined ? { kvFormat } : {}),
+    ...(maxMemoryBytes !== undefined ? { maxMemoryBytes } : {}),
     ...(thinkingTokenBudget !== undefined ? { thinkingTokenBudget } : {}),
     ...(values['rerank-config'] !== undefined ? { rerankConfig: values['rerank-config'] } : {}),
     authToken: values['auth-token'],
@@ -211,6 +220,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       model: args.model,
       modelResidency: args.modelResidency,
       ...(args.kvFormat !== undefined ? { kvFormat: args.kvFormat } : {}),
+      ...(args.maxMemoryBytes !== undefined ? { maxMemoryBytes: args.maxMemoryBytes } : {}),
       ...(args.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: args.thinkingTokenBudget } : {}),
       ...(await readRerankConfig(args.rerankConfig)),
       authToken: args.authToken,

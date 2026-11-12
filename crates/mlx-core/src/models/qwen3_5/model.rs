@@ -17,10 +17,7 @@ use crate::engine::backend::{
     TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::{ChatCmd, FromTrainCmd, TrainCmd, handle_train_cmd};
-use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, pool_tokens_after_recurrent, scheduled_turn_context,
-    scheduler_per_seq_context_override,
-};
+use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
 use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
     SpeculativePlan,
@@ -174,13 +171,11 @@ pub(crate) struct Qwen35Inner {
     /// The one clock the allocator, the DFlash2 store, the GDN ladder and
     /// history entries and the scheduler's idle owners stamp with.
     pub(crate) cache_recency: Arc<mlx_paged_attn::CacheRecency>,
-    /// DFlash2 window terms fixed at load once the paged pool is
-    /// registered; `None` without a draft.
-    pub(crate) dflash2_window: Option<crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms>,
-    /// Blocks the load-time sizer gave the paged pool. A runway pool's
-    /// maximum sits below it by the one layer a grow holds; the DFlash2 pool
-    /// term is priced from it. `None` before the pool is built.
-    pub(crate) paged_pool_budget_blocks: Option<u32>,
+    /// The load's memory plan; `None` when the working set is unreadable
+    /// or the load serves no planned lane.
+    pub(crate) memory_plan: Option<crate::engine::memory_plan::MemoryPlan>,
+    /// `--max-memory`: it only lowers the automatic hard budget.
+    pub(crate) max_memory_bytes: Option<u64>,
     /// Latched when the compiled DFlash2 verify graph fails at trace or
     /// replay — the failure mode is structural, so the stepper stays on the
     /// eager path for the rest of the model's lifetime.
@@ -417,6 +412,10 @@ pub struct Qwen35LoadOptions {
     /// The block-paged cache ignores it.
     #[napi(ts_type = "'int8' | 'bf16' | undefined")]
     pub kv_format: Option<String>,
+    /// Metal memory budget in bytes (`--max-memory`): it can only lower the
+    /// automatic budget the load's memory plan derives from the working set.
+    #[napi(ts_type = "number | undefined")]
+    pub max_memory_bytes: Option<i64>,
 }
 
 /// Generation result
@@ -448,8 +447,9 @@ pub struct Qwen3_5ContextLimits {
     /// token and the budget is clamped to `window - prompt`.
     pub rest_of_window_output_budget: bool,
     /// An omitted budget on `effective_window_tokens` is the rest of that
-    /// window. Set only when a paged pool sizes the window from memory; a
-    /// flat load's window is the trained length, so it keeps the native
+    /// window. Set when the plan prices that window: the paged pool, or the
+    /// flat lane of a load with neither pool nor draft. A flat load with a
+    /// draft publishes the trained length there and keeps the native
     /// default.
     pub omitted_budget_is_rest_of_window: bool,
     /// The same for `speculative_window_tokens`: set when that window has a
@@ -465,8 +465,8 @@ pub struct Qwen3_5ContextLimits {
 
 impl Qwen3_5ContextLimits {
     /// `speculative` is the DFlash2 window, whether a memory term bounds it
-    /// and the K/V format it was priced at; `memory_window` whether a paged
-    /// pool sizes the effective window; `kv_format` the effective lane's.
+    /// and the K/V format it was priced at; `memory_window` whether the plan
+    /// sizes the effective window; `kv_format` the effective lane's.
     pub(crate) fn from_parts(
         value: (u32, u32, u32, u32),
         speculative: Option<(u32, bool, crate::transformer::KvFormat)>,
@@ -657,12 +657,18 @@ impl Qwen3_5Model {
             .map(|value| crate::transformer::KvFormat::parse(Some(value)))
             .transpose()
             .map_err(|message| Error::from_reason(format!("Qwen3.5 load: {message}")))?;
+        let max_memory_bytes = crate::models::qwen3_5::load_plan::max_memory_option(
+            "Qwen3.5",
+            options.max_memory_bytes,
+        )?;
         let source = crate::engine::checkpoint_source::CheckpointSource::resolve(
             std::path::Path::new(&path),
             crate::utils::gguf::NativeGgufFamily::Qwen35,
         )
         .await?;
-        let loaded = persistence::load_with_source(&source, draft_model_path, kv_format).await;
+        let loaded =
+            persistence::load_with_source(&source, draft_model_path, kv_format, max_memory_bytes)
+                .await;
         if loaded.is_err() {
             source.release_lease();
         }
