@@ -132,6 +132,20 @@ fn test_host_override() -> Option<HostMemory> {
         .or_else(|| std::env::var_os(FIXTURE_HOST_ENV).map(|_| fixture_host()))
 }
 
+/// The device a load plans against; a fixture-host child gets the working set
+/// of [`fixture_host`], not the runner's.
+pub(super) fn live_memory() -> Option<crate::engine::memory_plan::LiveMemory> {
+    let live = crate::engine::memory_plan::live_memory()?;
+    #[cfg(test)]
+    if std::env::var_os(FIXTURE_HOST_ENV).is_some() {
+        return Some(crate::engine::memory_plan::LiveMemory {
+            working_set_bytes: fixture_host().physical / 4 * 3,
+            ..live
+        });
+    }
+    Some(live)
+}
+
 /// The residency decision as a byte budget for anonymous direct banks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct BankGate {

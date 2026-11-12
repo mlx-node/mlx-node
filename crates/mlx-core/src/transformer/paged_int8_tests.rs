@@ -758,6 +758,7 @@ fn varlen_rows_match_single_rows(
 ///
 /// Mutation V1: the dispatch runs one tile → INT_MAX refusal → red.
 #[test]
+#[ignore = "heavy GPU: 2048 rows x 90k context; run with --ignored"]
 fn int8_varlen_prefill_reads_past_the_aux_cap() {
     let Some(mut adapter) = long_int8_adapter(90_000) else {
         return;

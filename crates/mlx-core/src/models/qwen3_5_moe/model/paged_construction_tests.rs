@@ -2484,6 +2484,11 @@ fn flat_context_window_is_the_capped_lane() {
 /// → red (`Err` "could not reserve").
 #[test]
 fn moe_cold_dflash2_prefill_reclaims_a_marked_live_chain() {
+    if crate::test_support::paged_prefill_unsupported(
+        "moe_cold_dflash2_prefill_reclaims_a_marked_live_chain",
+    ) {
+        return;
+    }
     use crate::engine::backend::PagedPrefix;
     use crate::engine::dspark_turn::PagedDsparkBackend;
     use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;

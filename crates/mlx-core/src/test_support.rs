@@ -384,6 +384,20 @@ pub(crate) fn metal_device_absent_when(require_metal: bool, msg: &str) -> bool {
     msg.contains("Metal GPU not available") || msg.contains("No Metal device found")
 }
 
+/// True, after printing `skipping {test}`, on a Metal device of no Apple GPU
+/// family (a hosted VM GPU): its compiler rejects the tensor ops the paged
+/// prefill kernels are built on, and that route has no fallback. A real Mac
+/// (Apple7 and up) runs the test, so a pipeline failure there stays red.
+pub(crate) fn paged_prefill_unsupported(test: &str) -> bool {
+    static LACKS: OnceLock<bool> = OnceLock::new();
+    // SAFETY: nullary predicate that catches internally.
+    let lacks = *LACKS.get_or_init(|| unsafe { mlx_sys::mlx_test_gpu_lacks_apple_family() });
+    if lacks {
+        eprintln!("skipping {test}: no Apple GPU family; the paged prefill kernels need Apple7+");
+    }
+    lacks
+}
+
 /// Runs the calling test's body alone in a child test process: `true` in the
 /// child (run the body), `false` in the parent once the child passed. `name`
 /// is the test's libtest path (`utils::gguf_plan::tests::foo`). The child

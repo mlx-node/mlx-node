@@ -2078,6 +2078,9 @@ unsafe extern "C-unwind" {
         report: *mut std::ffi::c_char,
         len: usize,
     ) -> bool;
+    /// TEST-ONLY: true on a Metal device of no Apple GPU family (a hosted VM
+    /// GPU), whose compiler rejects the paged prefill kernels.
+    pub fn mlx_test_gpu_lacks_apple_family() -> bool;
     /// TEST-ONLY: the error (NUL-terminated) a paged prefill attention
     /// pipeline request for function `name` throws; false without Metal,
     /// when the pipeline builds, or when `len` is too small.

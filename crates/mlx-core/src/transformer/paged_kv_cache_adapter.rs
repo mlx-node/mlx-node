@@ -16968,6 +16968,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_reset_drops_the_held_prefill_workspace() {
+        if crate::test_support::paged_prefill_unsupported(
+            "a_reset_drops_the_held_prefill_workspace",
+        ) {
+            return;
+        }
         const ROWS: usize = 16;
         const KV_HEADS: usize = 2;
         const QUERY_HEADS: usize = 8;

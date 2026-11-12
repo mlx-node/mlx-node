@@ -1084,6 +1084,9 @@ mod paged_dflash2_tests {
     /// launch).
     #[test]
     fn verify_takes_the_verify_split_rule() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("verify_takes_the_verify_split_rule") {
+            return Ok(());
+        }
         let probe = |kind| unsafe { mlx_sys::mlx_paged_prefill_test_probe_count(kind) };
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
@@ -1250,6 +1253,11 @@ mod paged_dflash2_tests {
     /// pending tape) turns it red.
     #[test]
     fn paged_moe_dflash2_lands_on_the_ar_cursor_for_every_keep() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "paged_moe_dflash2_lands_on_the_ar_cursor_for_every_keep",
+        ) {
+            return Ok(());
+        }
         use crate::models::qwen3_5::gdn_blob::trace::{assert_cells, kernel_fold, replay_chain};
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
@@ -1284,6 +1292,10 @@ mod paged_dflash2_tests {
     /// clamp removed) turns it red.
     #[test]
     fn paged_moe_verify_clamps_the_row_budget() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("paged_moe_verify_clamps_the_row_budget")
+        {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let mut inner = tiny_paged_int8_moe_dflash_inner(0x5_8102);
@@ -1338,6 +1350,11 @@ mod paged_dflash2_tests {
     /// Mutation MS1 (the prime skips the parked-state lookup) → red (hit 0).
     #[test]
     fn moe_parked_replay_point_resumes_the_next_session() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "moe_parked_replay_point_resumes_the_next_session",
+        ) {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let a1 = prompt(40);
@@ -1368,6 +1385,11 @@ mod paged_dflash2_tests {
     /// Mutation R1m (the stepper keeps its lane across the claim) → red.
     #[test]
     fn moe_suspended_dflash2_lane_drops_its_cells_and_idles_its_ring() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "moe_suspended_dflash2_lane_drops_its_cells_and_idles_its_ring",
+        ) {
+            return Ok(());
+        }
         use crate::engine::governor::governor::Governor;
         use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
         use crate::engine::governor::host::Pressure;
@@ -1465,6 +1487,11 @@ mod paged_dflash2_tests {
     /// (the MoE verify keeps its ring off the lane during its claim) → red.
     #[test]
     fn moe_suspension_replays_on_the_lane_buffers() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "moe_suspension_replays_on_the_lane_buffers",
+        ) {
+            return Ok(());
+        }
         use crate::engine::governor::governor::tests::{G, model};
         use crate::engine::governor::host::Pressure;
         use crate::engine::plan::{DecoderPlan, SpeculativeKind};

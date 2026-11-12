@@ -100,6 +100,9 @@ impl crate::engine::backend::ChunkSink for StopAt20<'_> {
 /// place of registering them; the hit stops inside the prompt.
 #[test]
 fn a_stopped_turn_commits_through_the_match() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("a_stopped_turn_commits_through_the_match") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -747,6 +750,9 @@ fn rung_key(inner: &Qwen35Inner, prefix_len: u32, final_block_hash: u64) -> Unit
 /// goes first).
 #[test]
 fn a_replay_point_in_use_is_not_a_unit() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("a_replay_point_in_use_is_not_a_unit") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -803,6 +809,11 @@ fn a_replay_point_in_use_is_not_a_unit() -> Result<()> {
 /// `remember_dense_gdn_history_checkpoint` → red (E below the history).
 #[test]
 fn use_end_stamps_the_replay_point_after_the_history() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "use_end_stamps_the_replay_point_after_the_history",
+    ) {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -973,6 +984,11 @@ fn cap_reclaim_takes_a_rung_over_a_held_tail() -> Result<()> {
 /// → red (E stays InUse).
 #[test]
 fn scheduled_turn_close_ends_the_replay_points_use() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "scheduled_turn_close_ends_the_replay_points_use",
+    ) {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1009,6 +1025,11 @@ impl crate::engine::backend::ChunkSink for NullSink {
 /// `paged_turn_stream_core` → red on `stream` (`Err`).
 #[test]
 fn serial_prepare_at_the_cap_frees_a_ladder_chain() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "serial_prepare_at_the_cap_frees_a_ladder_chain",
+    ) {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1216,6 +1237,11 @@ fn vlm_prepare_without_reuse_takes_the_prompts_own_rung() -> Result<()> {
 /// the history write → red on `reuse true`.
 #[test]
 fn a_released_serial_turn_ends_the_replay_points_use() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "a_released_serial_turn_ends_the_replay_points_use",
+    ) {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1273,6 +1299,11 @@ fn a_released_serial_turn_ends_the_replay_points_use() -> Result<()> {
 /// → red (`Err` "could not reserve").
 #[test]
 fn cold_dflash2_prefill_reclaims_a_marked_live_chain() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "cold_dflash2_prefill_reclaims_a_marked_live_chain",
+    ) {
+        return Ok(());
+    }
     use crate::engine::backend::PagedPrefix;
     use crate::engine::dspark_turn::PagedDsparkBackend;
     use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
@@ -1395,6 +1426,11 @@ impl crate::engine::backend::ChunkSink for LastChunk {
 /// Mutation M12: the cores force `</think>` alone → red on both.
 #[test]
 fn legacy_dense_cores_end_thinking_with_the_whole_close() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "legacy_dense_cores_end_thinking_with_the_whole_close",
+    ) {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -2359,6 +2395,9 @@ pub(crate) fn fake_governor(
 /// (a whole turn's wait syncs no claim) → red (0 bytes refused waiting).
 #[test]
 fn host_yield_vacates_and_waits_in_place() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("host_yield_vacates_and_waits_in_place") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::CancelScope;
     use crate::engine::governor::governor::tests::{G, host};
     use crate::engine::governor::host::Pressure;
@@ -2465,6 +2504,9 @@ fn host_yield_vacates_and_waits_in_place() -> Result<()> {
 /// wait checks its limit before the stop) → red (`resource_timeout`).
 #[test]
 fn a_stop_in_the_suspend_wait_completes() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("a_stop_in_the_suspend_wait_completes") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::CancelScope;
     use crate::engine::governor::governor::tests::{G, host};
     use crate::engine::governor::host::Pressure;
@@ -2537,6 +2579,9 @@ fn a_stop_in_the_suspend_wait_completes() -> Result<()> {
 /// (`prefill cancelled`).
 #[test]
 fn a_stop_during_the_replay_completes() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("a_stop_during_the_replay_completes") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::CancelScope;
     use crate::engine::governor::governor::tests::{G, host};
     use crate::engine::governor::host::Pressure;
@@ -2638,6 +2683,9 @@ fn gdn_gap(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
 /// target).
 #[test]
 fn suspended_turn_replays_to_the_solo_tokens() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("suspended_turn_replays_to_the_solo_tokens") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::tests::{G, host};
     use crate::engine::governor::host::Pressure;
     use std::sync::atomic::AtomicBool;
@@ -2704,6 +2752,11 @@ fn suspended_turn_replays_to_the_solo_tokens() -> Result<()> {
 /// (the raw MLX text, no recovery noted).
 #[test]
 fn a_verify_oom_outside_the_claim_arms_recovery() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "a_verify_oom_outside_the_claim_arms_recovery",
+    ) {
+        return Ok(());
+    }
     use crate::engine::governor::host::Pressure;
     use std::sync::atomic::AtomicBool;
     if !metal_is_default_device() {
@@ -2745,6 +2798,11 @@ fn a_verify_oom_outside_the_claim_arms_recovery() -> Result<()> {
 /// Mutation AP3 (the fresh cells keep the old pending rows) → red.
 #[test]
 fn a_suspended_dflash2_lane_drops_its_pending_rows() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "a_suspended_dflash2_lane_drops_its_pending_rows",
+    ) {
+        return Ok(());
+    }
     use crate::engine::governor::governor::tests::{G, host};
     use crate::engine::governor::host::Pressure;
     use std::sync::atomic::AtomicBool;
@@ -2815,6 +2873,11 @@ fn a_suspended_dflash2_lane_drops_its_pending_rows() -> Result<()> {
 /// Mutation R1m (the stepper keeps its lane across the claim) → red.
 #[test]
 fn a_suspended_dflash2_lane_drops_its_cells_and_idles_its_ring() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "a_suspended_dflash2_lane_drops_its_cells_and_idles_its_ring",
+    ) {
+        return Ok(());
+    }
     use crate::engine::governor::governor::tests::{G, host};
     use crate::engine::governor::host::Pressure;
     use crate::models::qwen3_5::dflash2_decode::lane_probe;
@@ -2886,6 +2949,10 @@ fn a_suspended_dflash2_lane_drops_its_cells_and_idles_its_ring() -> Result<()> {
 /// restore runs before the KV target is held) → red.
 #[test]
 fn vacate_of_a_dflash2_turn_publishes_nothing() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("vacate_of_a_dflash2_turn_publishes_nothing")
+    {
+        return Ok(());
+    }
     use crate::engine::governor::governor::tests::{G, model};
     use crate::engine::governor::host::Pressure;
     use crate::models::qwen3_5::dflash2_turn::{
@@ -3006,6 +3073,9 @@ fn vacate_of_a_dflash2_turn_publishes_nothing() -> Result<()> {
 /// Mutation JR1 (the lookup counts its junction, resumes included) → red.
 #[test]
 fn a_resumed_lane_counts_no_junction() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported("a_resumed_lane_counts_no_junction") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::tests::{G, model};
     use crate::engine::governor::host::Pressure;
     use crate::models::qwen3_5::dflash2_turn::YIELD_FROM;

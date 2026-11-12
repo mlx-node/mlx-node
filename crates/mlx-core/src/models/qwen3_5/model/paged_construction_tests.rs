@@ -3241,6 +3241,9 @@ fn mtp_gate_at_the_cap_reclaims_before_falling_back() {
 /// (`context_length_exceeded: paged decode could not reserve`).
 #[test]
 fn mtp_ar_step_waits_for_its_growth() {
+    if crate::test_support::paged_prefill_unsupported("mtp_ar_step_waits_for_its_growth") {
+        return;
+    }
     use crate::engine::governor::governor::Governor;
     use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
     use crate::engine::governor::host::Pressure;
@@ -3738,6 +3741,9 @@ fn pool_bytes(inner: &Qwen35Inner) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
 /// is never written → red.
 #[test]
 fn eval_reads_the_pool() {
+    if crate::test_support::paged_prefill_unsupported("eval_reads_the_pool") {
+        return;
+    }
     use crate::quality::runner::EvalBackend;
     let Some((mut inner, _cfg)) = paged_inner_or_skip("eval_reads_the_pool") else {
         return;
@@ -3946,6 +3952,9 @@ fn off_metal_load_serves_bf16_autoregressive_turns() {
 /// operand dtype through uncast → red (the bf16 pool refuses f32 rows).
 #[test]
 fn f32_checkpoint_chats_on_the_pool() {
+    if crate::test_support::paged_prefill_unsupported("f32_checkpoint_chats_on_the_pool") {
+        return;
+    }
     use crate::engine::backend::{ChatBackend, TurnOutput, WholeTurnArgs};
     use crate::engine::plan::{DecoderPlan, MediaCapabilities, MediaInputs, TurnPlan};
     use crate::engine::types::ChatConfig;
@@ -4029,6 +4038,9 @@ fn calibration_tokenizer() -> Arc<Qwen3Tokenizer> {
 /// → red (no amax under the site's key).
 #[test]
 fn calibration_reads_the_pool() {
+    if crate::test_support::paged_prefill_unsupported("calibration_reads_the_pool") {
+        return;
+    }
     use crate::calibration::activation_amax::{ActivationAmaxCollector, CALIB_TEST_LOCK};
     let Some(loaded) = planned_head256_load("bf16", true) else {
         return;
@@ -4093,6 +4105,11 @@ fn calibration_reads_the_pool() {
 /// → red (the f32 hidden panics the debug assertion).
 #[test]
 fn f32_checkpoint_calibrates_a_short_row_on_the_pool() {
+    if crate::test_support::paged_prefill_unsupported(
+        "f32_checkpoint_calibrates_a_short_row_on_the_pool",
+    ) {
+        return;
+    }
     use crate::calibration::activation_amax::{ActivationAmaxCollector, CALIB_TEST_LOCK};
     let Some(loaded) = planned_load(tiny_paged_forward_cfg(), false) else {
         return;

@@ -10591,6 +10591,11 @@ pub(crate) mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_vacated_stop_completes_beside_two_resident_qwen35_peers() {
+        if crate::test_support::paged_prefill_unsupported(
+            "a_vacated_stop_completes_beside_two_resident_qwen35_peers",
+        ) {
+            return;
+        }
         use crate::engine::governor::governor::tests::{G, model};
         if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
             return;
@@ -10615,6 +10620,11 @@ pub(crate) mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_vacated_stop_completes_beside_two_resident_qwen35_moe_peers() {
+        if crate::test_support::paged_prefill_unsupported(
+            "a_vacated_stop_completes_beside_two_resident_qwen35_moe_peers",
+        ) {
+            return;
+        }
         use crate::engine::governor::governor::tests::{G, model};
         if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
             return;
@@ -10753,6 +10763,11 @@ pub(crate) mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_stopped_running_turn_ends_in_its_qwen35_step() {
+        if crate::test_support::paged_prefill_unsupported(
+            "a_stopped_running_turn_ends_in_its_qwen35_step",
+        ) {
+            return;
+        }
         use crate::engine::governor::governor::tests::{G, model};
         if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
             return;
@@ -10775,6 +10790,11 @@ pub(crate) mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_stopped_running_turn_ends_in_its_qwen35_moe_step() {
+        if crate::test_support::paged_prefill_unsupported(
+            "a_stopped_running_turn_ends_in_its_qwen35_moe_step",
+        ) {
+            return;
+        }
         use crate::engine::governor::governor::tests::{G, model};
         if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
             return;

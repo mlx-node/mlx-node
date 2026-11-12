@@ -1646,6 +1646,11 @@ mod paged_dflash2_tests {
     /// Mutation K1 (the retained count is 8 whatever the keep) turns it red.
     #[test]
     fn paged_dflash2_matches_paged_ar_for_every_keep() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "paged_dflash2_matches_paged_ar_for_every_keep",
+        ) {
+            return Ok(());
+        }
         use crate::models::qwen3_5::gdn_blob::trace::{assert_cells, replay_chain};
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
@@ -1681,6 +1686,9 @@ mod paged_dflash2_tests {
     /// Mutation U1 (`finish` skips the settle) turns it red.
     #[test]
     fn finish_settles_the_pending_rows() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("finish_settles_the_pending_rows") {
+            return Ok(());
+        }
         use crate::models::qwen3_5::gdn_blob::trace::{assert_cells, kernel_fold};
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
@@ -1765,6 +1773,11 @@ mod paged_dflash2_tests {
     /// verify writes only the driver's rows) turns it red.
     #[test]
     fn dflash2_cycle_runs_eight_rows_and_commits_keep() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "dflash2_cycle_runs_eight_rows_and_commits_keep",
+        ) {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let mut inner = tiny_paged_int8_dflash_inner(0x5_8004);
@@ -1839,6 +1852,9 @@ mod paged_dflash2_tests {
     /// launch).
     #[test]
     fn verify_takes_the_verify_split_rule() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("verify_takes_the_verify_split_rule") {
+            return Ok(());
+        }
         let probe = |kind| unsafe { mlx_sys::mlx_paged_prefill_test_probe_count(kind) };
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
@@ -1892,6 +1908,11 @@ mod paged_dflash2_tests {
     /// (the row check removed) turns it red.
     #[test]
     fn paged_dflash2_verify_refuses_a_chunk_that_is_not_eight_rows() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "paged_dflash2_verify_refuses_a_chunk_that_is_not_eight_rows",
+        ) {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let mut inner = tiny_paged_int8_dflash_inner(0x5_8005);
@@ -1973,6 +1994,9 @@ mod paged_dflash2_tests {
     /// the whole prompt) turns it red.
     #[test]
     fn dflash2_prefill_books_each_chunk_end() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("dflash2_prefill_books_each_chunk_end") {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let mut inner = tiny_paged_int8_dflash_inner(0x5_8006);
@@ -2011,6 +2035,11 @@ mod paged_dflash2_tests {
     /// red.
     #[test]
     fn tapped_paged_prefill_keeps_plain_prefill_bits() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "tapped_paged_prefill_keeps_plain_prefill_bits",
+        ) {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let prompt = prompt(150);
@@ -2084,6 +2113,11 @@ mod paged_dflash2_tests {
     /// Mutation C11: the driver re-resolves the config → red (12 tokens).
     #[test]
     fn paged_dflash2_turn_honors_the_session_params() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "paged_dflash2_turn_honors_the_session_params",
+        ) {
+            return Ok(());
+        }
         use crate::engine::backend::{ChatBackend, TurnOutput, WholeTurnArgs};
         use crate::engine::plan::{
             DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
@@ -2209,6 +2243,11 @@ mod paged_dflash2_tests {
     /// replays the GDN prefix).
     #[test]
     fn parked_anchor_resume_matches_an_uninterrupted_run() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "parked_anchor_resume_matches_an_uninterrupted_run",
+        ) {
+            return Ok(());
+        }
         use crate::engine::plan::{DecoderPlan, SpeculativeKind};
         use crate::models::qwen3_5::model::dflash2_park_tests::{install_pool, passing_probe};
         let stream = Stream::generation();
@@ -2260,6 +2299,11 @@ mod paged_dflash2_tests {
     /// re-prefills its own copy: no shared ids, 31 >= 30 blocks).
     #[test]
     fn two_sessions_share_the_parked_prefix_blocks() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "two_sessions_share_the_parked_prefix_blocks",
+        ) {
+            return Ok(());
+        }
         use crate::engine::backend::{ChatBackend, PagedPrefix};
         use crate::engine::plan::{DecoderPlan, SpeculativeKind};
         let stream = Stream::generation();
@@ -2311,6 +2355,11 @@ mod paged_dflash2_tests {
     /// Mutation RD1 (the restore ignores the flag) → red.
     #[test]
     fn restore_rebuilds_the_draft_or_starts_empty() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "restore_rebuilds_the_draft_or_starts_empty",
+        ) {
+            return Ok(());
+        }
         use crate::engine::backend::{ChatBackend, PagedPrefix};
         use crate::engine::plan::{DecoderPlan, SpeculativeKind};
         let stream = Stream::generation();
@@ -2394,6 +2443,9 @@ mod paged_dflash2_tests {
     /// at 192, nothing parked).
     #[test]
     fn tapped_prefill_parks_the_replay_point() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("tapped_prefill_parks_the_replay_point") {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let suffix = [11u32, 12, 13, 14, 15];
@@ -2463,6 +2515,11 @@ mod paged_dflash2_tests {
     /// point retires it too: 80 gone) → red.
     #[test]
     fn rolling_checkpoint_keeps_one_and_the_one_below_r() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "rolling_checkpoint_keeps_one_and_the_one_below_r",
+        ) {
+            return Ok(());
+        }
         let _ctx = StreamContext::new(Stream::generation());
         let mut inner = tiny_paged_int8_dflash_inner(0x5_8130);
         tapped_prefill_by_four(&mut inner, &prompt(100))?;
@@ -2500,6 +2557,10 @@ mod paged_dflash2_tests {
     /// Mutation CN1 (the abort removes the turn's publications) → red.
     #[test]
     fn cancelled_prefill_keeps_reached_states() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("cancelled_prefill_keeps_reached_states")
+        {
+            return Ok(());
+        }
         use crate::models::qwen3_5::paged_forward::PREFILL_CANCEL_AT;
         let _ctx = StreamContext::new(Stream::generation());
         let prompt = prompt(100);
@@ -2569,6 +2630,9 @@ mod paged_dflash2_tests {
     /// restore goes cold) → red.
     #[test]
     fn capture_claims_follow_state_claim() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("capture_claims_follow_state_claim") {
+            return Ok(());
+        }
         use crate::engine::governor::allocate::Refusal;
         use crate::engine::governor::ledger::{ClaimClass, NeedTiming, ReachClass};
         use crate::models::qwen3_5::dflash2_state::paged::anchor_bytes;
@@ -2650,6 +2714,10 @@ mod paged_dflash2_tests {
     /// snapshots a `FromLane` point) → red.
     #[test]
     fn refused_checkpoint_comes_from_the_lane() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("refused_checkpoint_comes_from_the_lane")
+        {
+            return Ok(());
+        }
         use crate::models::qwen3_5::dflash2_turn::{LANE_SNAPSHOTS, ScriptedClaim};
         let _ctx = StreamContext::new(Stream::generation());
         let prompt = prompt(100);
@@ -2707,6 +2775,9 @@ mod paged_dflash2_tests {
     /// (the held capture leaves the grow no room: capacity_exhausted).
     #[test]
     fn chunk_kv_is_booked_before_its_capture() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("chunk_kv_is_booked_before_its_capture") {
+            return Ok(());
+        }
         use crate::engine::governor::governor::Governor;
         use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
         use crate::models::qwen3_5::model::dflash2_park_tests::{install_pool, passing_probe};
@@ -2783,6 +2854,9 @@ mod paged_dflash2_tests {
     /// Mutation JN1 (`state_below` sees nothing) → red (B finds no junction).
     #[test]
     fn junction_at_the_kv_hit() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("junction_at_the_kv_hit") {
+            return Ok(());
+        }
         use crate::engine::backend::ChatBackend;
         use crate::engine::plan::{DecoderPlan, SpeculativeKind};
         let stream = Stream::generation();
@@ -2869,6 +2943,11 @@ mod paged_dflash2_tests {
     /// (the history save checks the frontier of a released lane) → red.
     #[test]
     fn dflash2_turns_resume_at_the_deepest_state() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "dflash2_turns_resume_at_the_deepest_state",
+        ) {
+            return Ok(());
+        }
         use crate::engine::plan::{DecoderPlan, SpeculativeKind};
         use crate::models::qwen3_5::dflash2_turn::TURN_END_LOG;
         let stream = Stream::generation();
@@ -2927,6 +3006,9 @@ mod paged_dflash2_tests {
     /// Mutation LB1 (a lane never takes the idle buffers) → red.
     #[test]
     fn lane_buffers_are_reused_between_turns() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("lane_buffers_are_reused_between_turns") {
+            return Ok(());
+        }
         use crate::engine::plan::{DecoderPlan, SpeculativeKind};
         use crate::models::qwen3_5::dflash2::RING_ALLOCATIONS;
         use crate::models::qwen3_5::draft_context::WINDOW_ALLOCATIONS;
@@ -2957,6 +3039,11 @@ mod paged_dflash2_tests {
     /// dropped stepper keeps its ring) → red.
     #[test]
     fn aborted_turns_leave_their_lane_buffers_idle() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "aborted_turns_leave_their_lane_buffers_idle",
+        ) {
+            return Ok(());
+        }
         use crate::engine::backend::PagedPrefix;
         use crate::engine::dspark_turn::PagedDsparkBackend;
         let stream = Stream::generation();
@@ -3001,6 +3088,10 @@ mod paged_dflash2_tests {
     /// Mutation IA1 (the idle lane is not counted) → red.
     #[test]
     fn idle_lane_counts_in_the_states_account() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("idle_lane_counts_in_the_states_account")
+        {
+            return Ok(());
+        }
         use crate::engine::plan::{DecoderPlan, SpeculativeKind};
         use crate::models::qwen3_5::dflash2_turn::memory_accounts;
         let stream = Stream::generation();
@@ -3027,6 +3118,11 @@ mod paged_dflash2_tests {
     /// is) → red.
     #[test]
     fn the_idle_lane_holds_materialized_buffers() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "the_idle_lane_holds_materialized_buffers",
+        ) {
+            return Ok(());
+        }
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let prompt = prompt(40);
@@ -3059,6 +3155,10 @@ mod paged_dflash2_tests {
     /// Mutation RU1 (the plan ignores reuse) → red.
     #[test]
     fn a_turn_without_reuse_publishes_no_state() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("a_turn_without_reuse_publishes_no_state")
+        {
+            return Ok(());
+        }
         use crate::engine::backend::PagedPrefix;
         use crate::engine::dspark_turn::PagedDsparkBackend;
         let stream = Stream::generation();
@@ -3094,6 +3194,9 @@ mod paged_dflash2_tests {
     /// `AlwaysDrop` model) → red.
     #[test]
     fn length_exit_runs_no_terminal_forward() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("length_exit_runs_no_terminal_forward") {
+            return Ok(());
+        }
         use crate::engine::plan::{DecoderPlan, SpeculativeKind};
         use crate::models::qwen3_5::model::PAGED_STEPS;
         let stream = Stream::generation();
@@ -3119,6 +3222,11 @@ mod paged_dflash2_tests {
     /// replays the prefix).
     #[test]
     fn ar_turn_restores_gdn_from_a_composite_state() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "ar_turn_restores_gdn_from_a_composite_state",
+        ) {
+            return Ok(());
+        }
         use crate::engine::backend::ChatBackend;
         use crate::engine::governor::ledger::{
             CertainReuse, Need, Stage, TakeRights, UnitKey, VictimQuery,

@@ -521,7 +521,7 @@ impl Qwen4ExpModel {
                 )?);
                 let defaults =
                     crate::engine::persistence::parse_generation_defaults(Path::new(&assets));
-                let live = crate::engine::memory_plan::live_memory().ok_or_else(|| {
+                let live = memory::live_memory().ok_or_else(|| {
                     Error::from_reason(format!(
                         "{LABEL} memory plan: the Metal working set is unreadable; refusing an unplanned load"
                     ))
@@ -552,7 +552,7 @@ impl Qwen4ExpModel {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
                     let engine = |held_back: u64| {
-                        let live = crate::engine::memory_plan::live_memory().ok_or_else(|| {
+                        let live = memory::live_memory().ok_or_else(|| {
                             Error::from_reason(format!(
                                 "{LABEL} memory plan: the Metal working set is unreadable"
                             ))

@@ -146,12 +146,19 @@ fn every_paged_prefill_kernel_is_in_the_metallib() {
     assert_names("paged_prefill", PAGED_PREFILL_NAMES);
 }
 
-/// The only paged prefill route: every pipeline builds on every device.
+/// The only paged prefill route: every pipeline builds on every Apple GPU
+/// family. A hosted VM GPU has none and builds none.
 #[test]
 fn every_paged_prefill_kernel_builds_a_pipeline() {
     let c = check("paged_prefill", true);
     assert!(c.report.is_empty(), "{}", c.report);
-    assert_eq!(c.built, PAGED_PREFILL_NAMES, "pipelines built");
+    // SAFETY: nullary predicate that catches internally.
+    let lacks = unsafe { mlx_sys::mlx_test_gpu_lacks_apple_family() };
+    assert_eq!(
+        c.built,
+        if lacks { 0 } else { PAGED_PREFILL_NAMES },
+        "pipelines built (no Apple GPU family: {lacks})"
+    );
 }
 
 /// A paged prefill pipeline that does not build fails loudly with the
