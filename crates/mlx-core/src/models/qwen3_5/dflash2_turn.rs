@@ -999,6 +999,20 @@ pub(crate) fn lookahead_claimed<T: DFlash2Target>(
     }
 }
 
+/// Splash `NativeRuntime::executionFailed`: MLX reports a failed command
+/// at a later wait, so a whole turn's GPU OOM can surface outside every
+/// claim. At the turn's boundary it arms the model's recovery and fails
+/// the turn `metal_out_of_memory`.
+pub(crate) fn whole_turn_oom<T: DFlash2Target>(target: &T, error: Error) -> Error {
+    if error.reason.starts_with("metal_out_of_memory:") || !is_gpu_out_of_memory(&error.reason) {
+        return error;
+    }
+    if let Some(guard) = target.memory_registration() {
+        guard.governor().note_gpu_oom(guard.model_id());
+    }
+    Error::from_reason(metal_out_of_memory(&error.reason))
+}
+
 /// One serial paged decode step under [`claimed`], keeping no prompt: a
 /// token event of the whole turn this thread runs.
 pub(crate) fn paged_step_claimed<T: DFlash2Target, R>(

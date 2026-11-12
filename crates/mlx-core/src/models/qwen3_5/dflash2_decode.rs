@@ -69,6 +69,25 @@ pub(crate) fn missing_cells() -> Error {
     Error::from_reason("DFlash2 lane has no GDN cells")
 }
 
+/// A verify failure the next paged verify reports after its claim, as MLX
+/// reports a failed command at the accept's wait.
+#[cfg(test)]
+pub(crate) mod verify_fault {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static NEXT: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn set(reason: &str) {
+        NEXT.with(|next| *next.borrow_mut() = Some(reason.to_string()));
+    }
+
+    pub(crate) fn take() -> Option<String> {
+        NEXT.with(|next| next.borrow_mut().take())
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod lane_probe {
     use std::cell::RefCell;
@@ -493,6 +512,10 @@ impl Qwen35DFlash2Stepper<'_> {
         );
         claimed?;
         self.adopt_replayed_lane()?;
+        #[cfg(test)]
+        if let Some(reason) = verify_fault::take() {
+            return Err(Error::from_reason(reason));
+        }
         let ticket =
             crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq, full.len())
                 .map_err(Error::from_reason)?;

@@ -306,6 +306,18 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        self.paged_turn_entry(args)
+            .map_err(|error| crate::models::qwen3_5::dflash2_turn::whole_turn_oom(self, error))
+    }
+
+    fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        self.multimodal_turn_entry(args)
+            .map_err(|error| crate::models::qwen3_5::dflash2_turn::whole_turn_oom(self, error))
+    }
+}
+
+impl Qwen35MoeInner {
+    fn paged_turn_entry(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         // Sharing one driver is what keeps the two paged decoders on one epilogue.
         debug_assert!(args.plan.use_paged_attention);
         debug_assert!(self.paged_adapter.is_some());
@@ -336,7 +348,7 @@ impl ChatBackend for Qwen35MoeInner {
     /// decodes autoregressively (Splash serves images from the same pages).
     /// The media plan admits images only on a pool load with an encoder and
     /// a processor.
-    fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+    fn multimodal_turn_entry(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         self.invalidate_dflash2_context("run_multimodal_turn");
         let (tokenizer, p, report_perf) = self.vision_turn_params(args)?;
         let tokens = args.tokens.to_vec();

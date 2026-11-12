@@ -2433,6 +2433,47 @@ fn suspended_turn_replays_to_the_solo_tokens() -> Result<()> {
     Ok(())
 }
 
+/// Splash `NativeRuntime::executionFailed`: a GPU OOM a serial DFlash2
+/// verify reports after its claim (MLX throws a failed command at the
+/// accept's wait) fails the turn `metal_out_of_memory` and arms the
+/// model's recovery.
+/// Mutation WO1: the whole-turn boundary passes the error through → red
+/// (the raw MLX text, no recovery noted).
+#[test]
+fn a_verify_oom_outside_the_claim_arms_recovery() -> Result<()> {
+    use crate::engine::governor::host::Pressure;
+    use std::sync::atomic::AtomicBool;
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let (_io, governor) = fake_governor(Pressure::Normal);
+    let (mut inner, prompt) = suspending_lane(0xDFA5_4901, governor)?;
+    crate::models::qwen3_5::dflash2_decode::verify_fault::set(
+        "[METAL] Command buffer execution failed: Insufficient Memory \
+         (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)",
+    );
+    let sink = LoggingSink::new(None);
+    let error = run_streamed_turn(
+        &mut inner,
+        DecoderPlan::Speculative(crate::engine::plan::SpeculativeKind::DraftModel),
+        &prompt,
+        &sink,
+        &AtomicBool::new(false),
+    )
+    .expect_err("the verify fails");
+    assert!(
+        crate::models::qwen3_5::dflash2_decode::verify_fault::take().is_none(),
+        "the verify ran"
+    );
+    assert!(
+        error.reason.starts_with("metal_out_of_memory:"),
+        "{}",
+        error.reason
+    );
+    assert!(governor.take_gpu_oom(7), "the model's recovery is armed");
+    Ok(())
+}
+
 /// A DFlash2 lane suspended at its second verify holds the first commit's
 /// pending GDN rows (the deferred fold). The tapped replay feeds their
 /// tokens, so the fresh cells take none of them: the turn streams the

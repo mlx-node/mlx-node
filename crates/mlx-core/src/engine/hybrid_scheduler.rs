@@ -3308,12 +3308,42 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
     }
 
+    /// Splash `Engine::commit` ends a lane at its stop or length token, so
+    /// a decode row whose un-emitted pending token ends the turn writes
+    /// nothing: its step finishes it without a forward. The observer stop
+    /// is left out (observing mutates it).
+    fn pending_ends_turn(turn: &mut Turn<B>) -> bool {
+        if turn.payload.pending_token_emitted {
+            return false;
+        }
+        let Some(&token) = turn.token_history.last() else {
+            return false;
+        };
+        if token == turn.payload.eos_id
+            || turn.payload.extra_eos_ids.contains(&token)
+            || turn.payload.generated_tokens.len() + 1
+                >= turn.payload.params.max_new_tokens.max(0) as usize
+        {
+            return true;
+        }
+        turn.payload.generated_tokens.push(token);
+        let repetition = check_repetition_cutoff(
+            &turn.payload.generated_tokens,
+            turn.payload.params.max_consecutive_tokens,
+            turn.payload.params.max_ngram_repeats,
+            turn.payload.params.ngram_size,
+        );
+        turn.payload.generated_tokens.pop();
+        repetition.is_some()
+    }
+
     /// Splash `Engine::prepare`'s claims: in plan order each row grows its
     /// lane to its work end under its request's InService claim
-    /// (`growLane`), a speculative decode row's draft-state growth a
-    /// bytes claim under the same one. A granted row's wait ends; a denied
-    /// row notes its refusal. A row refused for anything but memory runs
-    /// and fails in its step.
+    /// (`growLane`), a speculative row's draft-state growth (a prefill
+    /// slice's draft K/V too) a bytes claim under the same one. A granted
+    /// row's wait ends; a denied row notes its refusal. A row refused for
+    /// anything but memory runs and fails in its step. A row whose pending
+    /// token ends its turn claims nothing.
     pub(crate) fn claim_rows_in_order(&mut self, plan: &StepPlan) -> StepClaims {
         self.inner.sync_state_marks();
         self.row_work_ends.clear();
@@ -3334,11 +3364,17 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 claims.grants.push(None);
                 continue;
             };
+            if row.kind == StepKind::Decode && Self::pending_ends_turn(turn) {
+                claims.grants.push(None);
+                continue;
+            }
             let work_end = Self::work_end(row, turn);
             let hold_ended = turn.resource_wait.hold_ended;
-            let draft_from = turn.num_computed_tokens;
-            let speculative =
-                row.kind == StepKind::Decode && turn.payload.scheduled_speculation.is_some();
+            let draft_from = match row.kind {
+                StepKind::Prefill => row.token_start,
+                StepKind::Decode => turn.num_computed_tokens,
+            };
+            let speculative = turn.payload.scheduled_speculation.is_some();
             let mut spec = ClaimSpec {
                 cls: ClaimClass::InService,
                 request_id: 0,
@@ -3446,8 +3482,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     }
 
     /// Splash `Engine::admit`'s state claim: the GDN cell `seq_id`
-    /// activates, a bytes reservation (its arrays are allocated lazily).
-    /// `None` when the request's row is live already.
+    /// activates and, for a speculative lane, its draft state's fixed part
+    /// (Splash `CompositeStateLayout::laneBytes`), a bytes reservation (the
+    /// arrays are allocated lazily). `None` when the request's row is live
+    /// already.
     fn claim_cell(
         &mut self,
         seq_id: SeqId,
@@ -3455,11 +3493,17 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         claim: ClaimRef<'static>,
         spec: ClaimSpec,
         hold_ended: bool,
+        speculative: bool,
     ) -> Option<crate::engine::governor::allocate::Allocation<StateAdmission<'static>>> {
         if self.inner.has_scheduled_recurrent(seq_id) {
             return None;
         }
-        let bytes = self.inner.recurrent_state_bytes();
+        let draft = if speculative {
+            self.inner.scheduled_draft_state_held_bytes(0)
+        } else {
+            0
+        };
+        let bytes = self.inner.recurrent_state_bytes().saturating_add(draft);
         let governor = claim.governor;
         let mut units = SchedUnits {
             state: &mut *self,
@@ -3518,11 +3562,20 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let spec = self.admission_spec(seq_id, request_id, rank);
         let claim = Self::request_claim(governor, model, &mut prepared.claim, spec);
         let hold_ended = prepared.resource_wait.hold_ended;
+        let speculative = matches!(
+            prepared.admitted.plan.decoder,
+            engine::plan::DecoderPlan::Speculative(_)
+        );
         let mut dropped_lease = false;
         loop {
-            let Some(allocation) =
-                self.claim_cell(seq_id, &prepared.admitted.tokens, claim, spec, hold_ended)
-            else {
+            let Some(allocation) = self.claim_cell(
+                seq_id,
+                &prepared.admitted.tokens,
+                claim,
+                spec,
+                hold_ended,
+                speculative,
+            ) else {
                 return Admitted::Granted(None);
             };
             if let Ok(reservation) = allocation.admission.0 {
@@ -3594,7 +3647,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         );
         let (claim, spec) = self.resume_claim(turn);
         let hold_ended = turn.resource_wait.hold_ended;
-        let Some(allocation) = self.claim_cell(seq_id, &kept, claim, spec, hold_ended) else {
+        let speculative = turn.payload.scheduled_speculation.is_some();
+        let Some(allocation) = self.claim_cell(seq_id, &kept, claim, spec, hold_ended, speculative)
+        else {
             return Admitted::Granted(None);
         };
         if let Ok(reservation) = allocation.admission.0 {
@@ -7721,6 +7776,80 @@ pub(crate) mod tests {
         assert_eq!(state.inner.scheduler_materialized_blocks(1), 2);
     }
 
+    /// Splash `Engine::commit` ends a lane at its stop or length token: a
+    /// decode row whose pending token is EOS, or reaches `max_new_tokens`,
+    /// at a block boundary (32 rows written) with no budget to grow the
+    /// pool is granted without a claim, so its step finishes it.
+    /// Mutation TB1: the terminal row claims its pending token's row → red
+    /// (a third block is claimed and refused).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_terminal_decode_row_claims_nothing() {
+        use crate::engine::governor::governor::tests::{G, model};
+        for at_length in [false, true] {
+            let Some((mut state, governor, io)) = ledger_state(16 * G, 0) else {
+                return;
+            };
+            let mut adapter = tiny_paged_adapter_with(Arc::clone(&state.inner.cache_recency), 2, 8);
+            adapter.set_grow_headroom_probe_override(Some(passing()));
+            adapter.set_extent_growth(1);
+            let pools = adapter.layer_kv_pool().total_bytes();
+            io.with(|fake| fake.stats.pools = pools);
+            state.inner.paged_adapter = Some(adapter);
+            state.inner.memory_registration = None;
+            state.inner.memory_registration =
+                Some(governor.register_model(model(pools, 0)).expect("register"));
+            state
+                .inner
+                .paged_adapter_mut()
+                .expect("paged adapter")
+                .set_admission(Arc::new(governor));
+            let prompt: Vec<u32> = (0..32).map(|token| 100 + token).collect();
+            let mut turn = speculative::tests::request(
+                &mut state.inner,
+                1,
+                prompt.clone(),
+                false,
+                Arc::new(AtomicBool::new(false)),
+            );
+            state
+                .inner
+                .paged_adapter_mut()
+                .expect("paged adapter")
+                .record_tokens_for(1, &prompt)
+                .expect("the prompt's rows");
+            turn.num_computed_tokens = 32;
+            if at_length {
+                turn.payload.params.max_new_tokens = 1;
+                turn.token_history.push(3);
+            } else {
+                turn.token_history.push(turn.payload.eos_id);
+            }
+            turn.num_tokens = 33;
+            state.scheduler.reinstate_running(turn);
+            assert_eq!(state.inner.scheduler_materialized_blocks(1), 2);
+            let plan = StepPlan {
+                global_step: 0,
+                rows: vec![engine::scheduler::StepRow {
+                    seq_id: 1,
+                    kind: StepKind::Decode,
+                    token_start: 32,
+                    num_tokens: 1,
+                    cancel_snapshot: false,
+                }],
+                token_budget: 64,
+            };
+            let claims = state.claim_rows_in_order(&plan);
+            assert!(
+                claims.grants[0].is_none(),
+                "at_length={at_length}: {:?}",
+                claims.grants[0]
+            );
+            assert!(!state.row_work_ends.contains_key(&1));
+            assert_eq!(state.inner.scheduler_materialized_blocks(1), 2);
+        }
+    }
+
     /// Two decode rows (the live GDN unit cap) at the max pool with room for
     /// one: the row that claims first runs, the other is refused with its
     /// denial and replans at the next step, and no turn is preempted
@@ -8201,6 +8330,49 @@ pub(crate) mod tests {
             "{}",
             error.reason
         );
+    }
+
+    /// Splash `Engine::admit` claims a speculative lane's whole state at
+    /// its start (`CompositeStateLayout::laneBytes`): an MTP turn's
+    /// admission reserves its GDN cell and its draft state's fixed part, so
+    /// with room one byte below both the lone start fails
+    /// `capacity_exhausted`, and with room for both it is admitted.
+    /// Mutation MB1: the admission reserves the GDN cell only → red (the
+    /// start is admitted one byte short).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_speculative_start_claims_its_draft_state() {
+        use crate::engine::governor::governor::tests::G;
+        let Some((state, _, _io)) = ledger_state(16 * G, 0) else {
+            return;
+        };
+        let lane =
+            state.inner.recurrent_state_bytes() + state.inner.scheduled_draft_state_held_bytes(0);
+        assert!(state.inner.scheduled_draft_state_held_bytes(0) > 0);
+        drop(state);
+        for (budget, admitted) in [(lane - 1, false), (lane, true)] {
+            let Some((mut state, _, _io)) = ledger_state(budget, 0) else {
+                return;
+            };
+            let (mut prepared, mut result) = prepared_turn(&mut state, 1, tokens_of(1, 1));
+            prepared.admitted.plan.decoder =
+                engine::plan::DecoderPlan::Speculative(engine::plan::SpeculativeKind::NativeMtp);
+            let turn = state.admit_prepared(prepared).ok().flatten();
+            assert_eq!(turn.is_some(), admitted, "budget {budget}");
+            if !admitted {
+                let error = result
+                    .try_recv()
+                    .expect("the turn has ended")
+                    .expect_err("the turn fails");
+                assert!(
+                    error
+                        .reason
+                        .starts_with("capacity_exhausted: could not allocate request state"),
+                    "{}",
+                    error.reason
+                );
+            }
+        }
     }
 
     /// Splash `Engine::suspendLane` → `admit`: a lone lane the host refused

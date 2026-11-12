@@ -1548,4 +1548,62 @@ pub(super) mod tests {
         let refusal = governor.ledger(|ledger| ledger.claim(claim).map(|state| state.refusal));
         assert_eq!(refusal.map(|need| need.bytes), Some(growth));
     }
+
+    /// An MTP prefill slice grows the draft K/V of its rows (Splash
+    /// `Engine::growLane` claims a lane's state to its work end for every
+    /// row): with room one byte short of that growth the slice is denied
+    /// with its bytes and no blocks, though its KV rows are booked.
+    /// Mutation MP1: only decode rows claim draft state → red (the slice
+    /// is granted).
+    #[test]
+    fn an_mtp_prefill_slice_claims_its_draft_growth() {
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use crate::engine::hybrid_scheduler::tests::mtp_step_state_with;
+        let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
+            return;
+        };
+        let turn = request(
+            &mut state.inner,
+            1,
+            (0..40).map(|token| token % 16).collect(),
+            true,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let growth = state.inner.scheduled_draft_state_held_bytes(16)
+            - state.inner.scheduled_draft_state_held_bytes(0);
+        assert!(growth > 0);
+        let io = FakeIo::new(
+            stats(0),
+            host(32 * G, crate::engine::governor::host::Pressure::Normal),
+        );
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+        state.inner.memory_registration = Some(
+            governor
+                .register_model(model(growth - 1, 0))
+                .expect("register"),
+        );
+        state.scheduler.reinstate_running(turn);
+        let plan = StepPlan {
+            global_step: 0,
+            rows: vec![engine::scheduler::StepRow {
+                seq_id: 1,
+                kind: StepKind::Prefill,
+                token_start: 0,
+                num_tokens: 16,
+                cancel_snapshot: false,
+            }],
+            token_budget: 64,
+        };
+        let claims = state.claim_rows_in_order(&plan);
+        let denial = claims.grants[0].expect("the draft growth is refused");
+        assert_eq!(denial.failure, Some(Failure::EngineBudget));
+        assert!(denial.blocks.is_none());
+        let claim = state
+            .scheduler
+            .running_turn_mut(1)
+            .and_then(|turn| turn.payload.claim.as_ref().map(ClaimHandle::id))
+            .expect("the row's claim");
+        let refusal = governor.ledger(|ledger| ledger.claim(claim).map(|state| state.refusal));
+        assert_eq!(refusal.map(|need| need.bytes), Some(growth));
+    }
 }

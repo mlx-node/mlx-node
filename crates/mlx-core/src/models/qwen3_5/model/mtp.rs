@@ -333,31 +333,38 @@ impl MtpStepper for DenseMtpStepper<'_> {
     ) -> Result<(MxArray, MxArray, bool)> {
         ids.eval();
         let token_id = ids.item_at_int32(0)? as u32;
-        let inner = &mut *self.inner;
-        let adapter = self
-            .owner
-            .resolve(
-                &mut inner.paged_adapter,
-                "eager paged MTP forward_with_hidden",
+        let owner = self.owner;
+        let layer_kinds = &self.layer_kinds;
+        // Splash `Engine::growLane`: the AR step's row is claimed like any
+        // decode step's, so a refused growth waits instead of failing the
+        // turn `context_length_exceeded`.
+        let step = |inner: &mut Qwen35Inner| {
+            let adapter = owner
+                .resolve(
+                    &mut inner.paged_adapter,
+                    "eager paged MTP forward_with_hidden",
+                )
+                .map_err(Error::from_reason)?;
+            // Cross-turn M-RoPE delta carried by a text turn that warm-
+            // continues an image prefill; 0 for pure-text sessions.
+            let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
+            let caches = inner.caches.as_mut().ok_or_else(|| {
+                Error::from_reason("eager paged MTP forward_with_hidden: caches is None")
+            })?;
+            crate::models::qwen3_5::paged_forward::run_paged_step_with_hidden(
+                token_id,
+                &inner.embedding,
+                &mut inner.layers,
+                caches,
+                &inner.final_norm,
+                &inner.lm_head,
+                layer_kinds,
+                adapter,
+                rope_deltas,
             )
-            .map_err(Error::from_reason)?;
-        // Cross-turn M-RoPE delta carried by a text turn that warm-
-        // continues an image prefill; 0 for pure-text sessions.
-        let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
-        let caches = inner.caches.as_mut().ok_or_else(|| {
-            Error::from_reason("eager paged MTP forward_with_hidden: caches is None")
-        })?;
-        let (logits, hidden) = crate::models::qwen3_5::paged_forward::run_paged_step_with_hidden(
-            token_id,
-            &inner.embedding,
-            &mut inner.layers,
-            caches,
-            &inner.final_norm,
-            &inner.lm_head,
-            &self.layer_kinds,
-            adapter,
-            rope_deltas,
-        )?;
+        };
+        let (logits, hidden) =
+            crate::models::qwen3_5::dflash2_turn::paged_step_claimed(&mut *self.inner, step)?;
         if let Some(frontier) = self.recurrent_frontier.as_mut() {
             // The main forward consumed one token on the GDN side.
             *frontier += 1;
