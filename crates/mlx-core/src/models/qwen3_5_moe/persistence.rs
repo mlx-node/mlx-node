@@ -1797,6 +1797,7 @@ pub async fn load_with_thread(
         kv_format,
         None,
         None,
+        crate::engine::scheduler::DEFAULT_DECODE_SHARE,
     )
     .await
 }
@@ -1832,6 +1833,7 @@ pub(crate) async fn load_with_source(
     kv_format: Option<crate::transformer::KvFormat>,
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
+    decode_share: f64,
 ) -> Result<Qwen3_5MoeModel> {
     // Snapshot once, before spawning; forward/compiled graphs never read this
     // diagnostic setting and another load cannot change an existing model.
@@ -2120,6 +2122,7 @@ pub(crate) async fn load_with_source(
                 let mut inner = Qwen35MoeInner::new(config.clone())?;
                 inner.max_memory_bytes = max_memory_bytes;
                 inner.max_context = max_context;
+                inner.decode_share = decode_share;
                 inner.configure_source_moe_policy(source_moe_policy);
                 if source_moe_policy.active() {
                     info!(

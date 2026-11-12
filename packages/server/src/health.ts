@@ -129,6 +129,28 @@ interface GapCauseHealth {
   ms: number;
 }
 
+/** Splash `/status` `scheduler`, one per loaded model. */
+export interface SchedulerHealth {
+  /** The resident name the model serves under, once it is known. */
+  model?: string;
+  model_id: number;
+  queued: number;
+  waiting_resources: number;
+  waiting_prefix: number;
+  prefilling: number;
+  decoding: number;
+  prefill_batches: number;
+  prefill_rows: number;
+  decode_batches: number;
+  /** `b1`, `b2`, …: decode batches of that width. */
+  decode_batches_by_width: Record<string, number>;
+  decode_gap_target_ms: number;
+  contended_prefill_ms: { p50: number; p95: number; p99: number; max: number; total: number; samples: number };
+  prefill_units: number;
+  bound_cuts: number;
+  replans: number;
+}
+
 /** Splash `/status` `memory_governor`, in its keys. */
 export interface MemoryGovernorHealth {
   limit: number;
@@ -178,6 +200,7 @@ export interface MemoryGovernorHealth {
   };
   decode_gap_ms: { p50: number; p99: number; max: number };
   decisions: string[];
+  scheduler: SchedulerHealth[];
 }
 
 /** The native status in `/health`'s keys. */
@@ -235,6 +258,25 @@ export function toMemoryGovernorHealth(status: MemoryGovernorStatus): MemoryGove
     },
     decode_gap_ms: { ...status.decodeGapMs },
     decisions: [...status.decisions],
+    scheduler: status.scheduler.map((scheduler) => ({
+      model_id: scheduler.modelId,
+      queued: scheduler.queued,
+      waiting_resources: scheduler.waitingResources,
+      waiting_prefix: scheduler.waitingPrefix,
+      prefilling: scheduler.prefilling,
+      decoding: scheduler.decoding,
+      prefill_batches: scheduler.prefillBatches,
+      prefill_rows: scheduler.prefillRows,
+      decode_batches: scheduler.decodeBatches,
+      decode_batches_by_width: Object.fromEntries(
+        scheduler.decodeBatchesByWidth.map((batches, index) => [`b${index + 1}`, batches]),
+      ),
+      decode_gap_target_ms: scheduler.decodeGapTargetMs,
+      contended_prefill_ms: { ...scheduler.contendedPrefillMs },
+      prefill_units: scheduler.prefillUnits,
+      bound_cuts: scheduler.boundCuts,
+      replans: scheduler.replans,
+    })),
   };
 }
 
@@ -361,7 +403,22 @@ export function createHealthReporter(deps: HealthReporterDeps): () => ServerHeal
       }
     }
 
-    const memoryGovernor = deps.memoryGovernor?.() ?? null;
+    const governed = new Map<number, string>();
+    for (const id of resident) {
+      const model = deps.registry.servedContext(id)?.governorModelId;
+      if (model !== undefined && !governed.has(model)) governed.set(model, id);
+    }
+    const polled = deps.memoryGovernor?.() ?? null;
+    const memoryGovernor =
+      polled === null
+        ? null
+        : {
+            ...polled,
+            scheduler: polled.scheduler.map((scheduler) => {
+              const model = governed.get(scheduler.model_id);
+              return model === undefined ? scheduler : { model, ...scheduler };
+            }),
+          };
     const status = deriveHealthStatus({
       writerActive,
       waitingWriters,

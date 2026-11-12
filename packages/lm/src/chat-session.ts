@@ -255,6 +255,8 @@ export interface SessionContextLimits {
   omittedBudgetIsRestOfWindow?: boolean;
   /** Format of the K/V a turn on `effectiveWindowTokens` writes. */
   kvFormat?: 'int8' | 'bf16';
+  /** The model's `modelId` in `memoryGovernorStatus().scheduler`. */
+  governorModelId?: number;
 }
 
 /** The window, K/V format and omitted-budget rule every turn takes. */

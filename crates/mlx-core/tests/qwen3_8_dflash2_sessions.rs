@@ -1155,6 +1155,7 @@ async fn qwen38_dflash2_sessions_g1() {
             kv_format: Some("int8".to_string()),
             max_memory_bytes: None,
             max_context_tokens: None,
+            decode_share: None,
         }),
     )
     .await

@@ -26,6 +26,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
  * that only checks behaviour.
  */
 const ADDON_FREE_SUBPATHS = [
+  'host/decode-share.ts',
   'host/env-policy.ts',
   'host/idle-release.ts',
   'host/max-context.ts',

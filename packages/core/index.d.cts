@@ -4763,6 +4763,16 @@ export interface MemoryGovernorHost {
   growthAllowed: boolean;
 }
 
+/** Splash `LatencyStats` in milliseconds. */
+export interface MemoryGovernorLatency {
+  p50: number;
+  p95: number;
+  p99: number;
+  max: number;
+  total: number;
+  samples: number;
+}
+
 export interface MemoryGovernorOwed {
   bytes: number;
   transfers: number;
@@ -4775,6 +4785,27 @@ export interface MemoryGovernorResourceWaits {
   draining: boolean;
   heldBehindRefusal: number;
   oldestMs: number;
+}
+
+/** One model's scheduler (Splash `Status.cpp` `writeScheduler`). */
+export interface MemoryGovernorScheduler {
+  /** The model's `governorModelId` in its context limits. */
+  modelId: number;
+  queued: number;
+  waitingResources: number;
+  waitingPrefix: number;
+  prefilling: number;
+  decoding: number;
+  prefillBatches: number;
+  prefillRows: number;
+  decodeBatches: number;
+  /** Decode batches of width `index + 1`. */
+  decodeBatchesByWidth: Array<number>;
+  decodeGapTargetMs: number;
+  contendedPrefillMs: MemoryGovernorLatency;
+  prefillUnits: number;
+  boundCuts: number;
+  replans: number;
 }
 
 /**
@@ -4805,6 +4836,8 @@ export interface MemoryGovernorStatus {
   decodeGapMs: MemoryGovernorGapLatency;
   /** The last 64 decision-log lines, oldest first. */
   decisions: Array<string>;
+  /** One per model whose scheduler registered. */
+  scheduler: Array<MemoryGovernorScheduler>;
 }
 
 /**
@@ -5384,6 +5417,11 @@ export interface Qwen35ContextLimits {
   omittedBudgetIsRestOfWindow: boolean;
   /** Format of the K/V a turn on `effective_window_tokens` writes. */
   kvFormat: 'int8' | 'bf16';
+  /**
+   * The model's `modelId` in `memoryGovernorStatus().scheduler`; unset
+   * when the load registered no pool with the memory governor.
+   */
+  governorModelId?: number;
 }
 
 export interface Qwen35LoadOptions {
@@ -5413,6 +5451,12 @@ export interface Qwen35LoadOptions {
    * YaRN, which is static and changes answers at every length.
    */
   maxContextTokens?: number | undefined;
+  /**
+   * Decode time owed per unit of prefill time while other requests
+   * generate (`--decode-share`, Splash's): nonnegative and finite,
+   * default 0.5; 0 alternates one prefill unit with one decode step.
+   */
+  decodeShare?: number;
 }
 
 /**

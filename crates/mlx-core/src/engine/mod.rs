@@ -19,6 +19,7 @@ pub(crate) mod finalize;
 pub(crate) mod gen_prompt;
 pub(crate) mod governor;
 pub(crate) mod hybrid_scheduler;
+pub(crate) mod latency;
 pub(crate) mod memory_plan;
 pub(crate) mod model_command;
 pub(crate) mod mtp_turn;

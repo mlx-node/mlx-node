@@ -187,6 +187,13 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
         true
     }
 
+    fn measured_prefill_cut(&self) -> Option<crate::engine::scheduler::MeasuredConfig> {
+        Some(crate::engine::scheduler::MeasuredConfig {
+            native_window: self.config.max_position_embeddings.max(0) as u32,
+            decode_share: self.decode_share,
+        })
+    }
+
     fn memory_accounts(&self) -> Option<crate::engine::governor::governor::MemoryAccounts> {
         Some(crate::models::qwen3_5::dflash2_turn::memory_accounts(
             self,

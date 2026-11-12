@@ -389,6 +389,18 @@ pub(crate) fn max_memory_option(label: &str, value: Option<i64>) -> Result<Optio
     }
 }
 
+/// The `decodeShare` load option (Splash `Engine::Engine`): nonnegative
+/// and finite; unset is Splash's 0.5.
+pub(crate) fn decode_share_option(label: &str, value: Option<f64>) -> Result<f64> {
+    match value {
+        None => Ok(crate::engine::scheduler::DEFAULT_DECODE_SHARE),
+        Some(share) if share.is_finite() && share >= 0.0 => Ok(share),
+        Some(_) => Err(Error::from_reason(format!(
+            "{label} load: decode share must be nonnegative and finite"
+        ))),
+    }
+}
+
 /// What a load of a Qwen3.5 checkpoint would serve, priced before it loads.
 #[napi(object)]
 #[derive(Debug, Clone, PartialEq, Eq)]

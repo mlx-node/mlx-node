@@ -95,6 +95,12 @@ export interface LoadModelOptions {
    * answers at every length. Other model families reject it.
    */
   maxContextTokens?: number;
+  /**
+   * Decode time owed per unit of prefill time while other requests generate,
+   * for `qwen3_5` and `qwen3_5_moe` targets (`--decode-share`): nonnegative
+   * and finite, default 0.5. Other model families reject it.
+   */
+  decodeShare?: number;
 }
 
 /** The native Qwen3.5 load options of `options`; `null` when none is set. */
@@ -103,7 +109,8 @@ function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOpt
     options?.draftModelPath === undefined &&
     options?.kvFormat === undefined &&
     options?.maxMemoryBytes === undefined &&
-    options?.maxContextTokens === undefined
+    options?.maxContextTokens === undefined &&
+    options?.decodeShare === undefined
   )
     return null;
   return {
@@ -111,6 +118,7 @@ function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOpt
     kvFormat: options.kvFormat,
     maxMemoryBytes: options.maxMemoryBytes,
     maxContextTokens: options.maxContextTokens,
+    decodeShare: options.decodeShare,
   };
 }
 
@@ -282,6 +290,12 @@ function dispatchLoad(
   if (options?.maxContextTokens !== undefined && requireFamilyData(modelType).acceptsMaxContext !== true) {
     throw new Error(
       `maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
+        `${modelPath} has model_type "${modelType}"`,
+    );
+  }
+  if (options?.decodeShare !== undefined && requireFamilyData(modelType).acceptsDecodeShare !== true) {
+    throw new Error(
+      `decodeShare (decode time owed per unit of prefill time) is only supported by qwen3_5 and qwen3_5_moe models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }

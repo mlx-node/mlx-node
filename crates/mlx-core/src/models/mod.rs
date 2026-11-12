@@ -96,13 +96,23 @@ mod free_released_wiring_tests {
                 "{fixture} resolved to a plain directory"
             );
             let outcome = match family {
-                NativeGgufFamily::Qwen35 => {
-                    super::qwen3_5::persistence::load_with_source(&source, None, None, None, None)
-                        .await
-                        .map(drop)
-                }
+                NativeGgufFamily::Qwen35 => super::qwen3_5::persistence::load_with_source(
+                    &source,
+                    None,
+                    None,
+                    None,
+                    None,
+                    crate::engine::scheduler::DEFAULT_DECODE_SHARE,
+                )
+                .await
+                .map(drop),
                 NativeGgufFamily::Qwen35Moe => super::qwen3_5_moe::persistence::load_with_source(
-                    &source, None, None, None, None,
+                    &source,
+                    None,
+                    None,
+                    None,
+                    None,
+                    crate::engine::scheduler::DEFAULT_DECODE_SHARE,
                 )
                 .await
                 .map(drop),

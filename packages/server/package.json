@@ -39,6 +39,11 @@
       "types": "./dist/host/idle-release.d.ts",
       "import": "./dist/host/idle-release.js"
     },
+    "./host/decode-share": {
+      "@mlx-node/source": "./src/host/decode-share.ts",
+      "types": "./dist/host/decode-share.d.ts",
+      "import": "./dist/host/decode-share.js"
+    },
     "./host/max-context": {
       "@mlx-node/source": "./src/host/max-context.ts",
       "types": "./dist/host/max-context.d.ts",

@@ -2556,6 +2556,7 @@ pub async fn load_with_thread(
         kv_format,
         None,
         None,
+        crate::engine::scheduler::DEFAULT_DECODE_SHARE,
     )
     .await
 }
@@ -2567,6 +2568,7 @@ pub(crate) async fn load_with_source(
     kv_format: Option<crate::transformer::KvFormat>,
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
+    decode_share: f64,
 ) -> Result<Qwen3_5Model> {
     load_with_thread_impl(
         source,
@@ -2574,6 +2576,7 @@ pub(crate) async fn load_with_source(
         kv_format,
         max_memory_bytes,
         max_context,
+        decode_share,
         false,
     )
     .await
@@ -2588,6 +2591,7 @@ pub(crate) async fn load_clef_with_source(source: &CheckpointSource) -> Result<Q
         Some(crate::transformer::KvFormat::Bf16),
         None,
         None,
+        crate::engine::scheduler::DEFAULT_DECODE_SHARE,
         true,
     )
     .await
@@ -2641,6 +2645,7 @@ async fn load_with_thread_impl(
     kv_format: Option<crate::transformer::KvFormat>,
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
+    decode_share: f64,
     clef: bool,
 ) -> Result<Qwen3_5Model> {
     let model_assets_path = source.asset_dir().to_string_lossy().into_owned();
@@ -3044,6 +3049,7 @@ async fn load_with_thread_impl(
                 let mut inner = Qwen35Inner::new(config.clone())?;
                 inner.max_memory_bytes = max_memory_bytes;
                 inner.max_context = max_context;
+                inner.decode_share = decode_share;
                 inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(path));
 
                 // Deterministic weight-byte total of the text checkpoint for

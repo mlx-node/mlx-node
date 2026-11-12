@@ -4,7 +4,40 @@ fn pass(prefill: &[SeqId], decode: bool) -> PassWork {
     PassWork {
         prefill: prefill.to_vec(),
         decode,
+        prefill_seconds: 0.0,
     }
+}
+
+/// Splash's batch completion adds a prefill command's wall to every lane
+/// outside it, and `Engine::decodeGap` names such a gap PrefillUnit with
+/// that wall: a 650 ms gap around a 600 ms prefill phase another lane ran is
+/// PrefillUnit with prefill_ms 600; the lane whose own row ran adds nothing.
+/// Mutation G1: the step's wall is not added to the lane → red (Other, 0).
+#[test]
+fn prefill_inside_a_gap_is_counted() {
+    let work = PassWork {
+        prefill: vec![9],
+        decode: true,
+        prefill_seconds: 0.6,
+    };
+    let mut metrics = Metrics::default();
+    let mut lane = GapClock::default();
+    assert_eq!(lane.token(10.0, 0, 0), None);
+    lane.worked(work.prefill_beside(4), false);
+    let gap = lane.token(10.65, 0, 0).expect("a gap");
+    assert_eq!(gap.cause, Some(GapCause::PrefillUnit), "{gap:?}");
+    metrics.gap(&gap);
+    assert!(
+        (metrics.gap_prefill_seconds * 1000.0 - 600.0).abs() < 1e-9,
+        "prefill_ms {}",
+        metrics.gap_prefill_seconds * 1000.0
+    );
+
+    let mut own = GapClock::default();
+    assert_eq!(own.token(10.0, 0, 0), None);
+    own.worked(work.prefill_beside(9), false);
+    let gap = own.token(10.65, 0, 0).expect("a gap");
+    assert_eq!(gap.cause, Some(GapCause::Other), "its own row: {gap:?}");
 }
 
 /// Splash `Engine::holds` / `holderOf` over one request's passes: its claim

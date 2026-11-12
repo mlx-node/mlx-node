@@ -45,7 +45,7 @@ function digitRun(text: string, start: number): { digits: string; end: number } 
  * `inf` / `nan` spellings parse there too but are never finite, so Splash
  * refuses them; they are refused here before any number is made.
  */
-function parsePythonFloat(raw: string): number | undefined {
+export function parsePythonFloat(raw: string): number | undefined {
   const text = raw.trim();
   let index = 0;
   let sign = '';

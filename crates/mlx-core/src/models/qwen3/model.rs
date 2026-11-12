@@ -892,6 +892,8 @@ impl QwenStepExecutor<'_> {
                 .iter()
                 .filter(|turn| turn.payload.allocation_failed)
                 .count() as u32,
+            prefill_wall_micros: 0,
+            decode_wall_micros: 0,
         })
     }
 }
