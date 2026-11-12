@@ -3299,15 +3299,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     }
 
     /// The tokens a planned row's step writes up to (Splash
-    /// `Engine::workEndOf`): a prefill slice's end, or past a decode
-    /// row's pending token and its draft rows.
+    /// `Engine::workEndOf`): a prefill slice's end, or a decode row's
+    /// pending token (already in `num_tokens`) and its draft rows.
     fn work_end(row: &engine::scheduler::StepRow, turn: &Turn<B>) -> u32 {
         match row.kind {
             StepKind::Prefill => row.token_start.saturating_add(row.num_tokens),
-            StepKind::Decode => turn
-                .num_tokens
-                .saturating_add(1)
-                .saturating_add(turn.decode_draft_allowance),
+            StepKind::Decode => turn.num_tokens.saturating_add(turn.decode_draft_allowance),
         }
     }
 
@@ -7657,6 +7654,73 @@ pub(crate) mod tests {
         turn
     }
 
+    /// Splash `Engine::growLane` claims a decode row's write end: at a
+    /// block boundary (31 rows written, the pending token in `num_tokens`)
+    /// the row writes into the two blocks it holds, so with no budget left
+    /// to grow the pool it is granted, not refused.
+    /// Mutation DC1: the decode claim adds one token past `num_tokens` →
+    /// red (a third block is claimed and refused).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_decode_row_at_a_block_boundary_claims_only_its_rows() {
+        use crate::engine::governor::governor::tests::{G, model};
+        let Some((mut state, governor, io)) = ledger_state(16 * G, 0) else {
+            return;
+        };
+        let mut adapter = tiny_paged_adapter_with(Arc::clone(&state.inner.cache_recency), 2, 8);
+        adapter.set_grow_headroom_probe_override(Some(passing()));
+        adapter.set_extent_growth(1);
+        let pools = adapter.layer_kv_pool().total_bytes();
+        io.with(|fake| fake.stats.pools = pools);
+        let notified = Arc::clone(&io);
+        adapter.set_pool_growth_notifier(Some(Arc::new(move |bytes| {
+            notified.with(|fake| fake.stats.pools = bytes);
+        })));
+        state.inner.paged_adapter = Some(adapter);
+        state.inner.memory_registration = None;
+        state.inner.memory_registration =
+            Some(governor.register_model(model(pools, 0)).expect("register"));
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_admission(Arc::new(governor));
+        let prompt: Vec<u32> = (0..31).map(|token| 100 + token).collect();
+        let mut turn = speculative::tests::request(
+            &mut state.inner,
+            1,
+            prompt.clone(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .record_tokens_for(1, &prompt)
+            .expect("the prompt's rows");
+        turn.num_computed_tokens = 31;
+        turn.token_history.push(3);
+        turn.num_tokens = 32;
+        state.scheduler.reinstate_running(turn);
+        assert_eq!(state.inner.scheduler_materialized_blocks(1), 2);
+        let plan = StepPlan {
+            global_step: 0,
+            rows: vec![engine::scheduler::StepRow {
+                seq_id: 1,
+                kind: StepKind::Decode,
+                token_start: 31,
+                num_tokens: 1,
+                cancel_snapshot: false,
+            }],
+            token_budget: 64,
+        };
+        let claims = state.claim_rows_in_order(&plan);
+        assert!(claims.grants[0].is_none(), "{:?}", claims.grants[0]);
+        assert!(!state.row_work_ends.contains_key(&1));
+        assert_eq!(state.inner.scheduler_materialized_blocks(1), 2);
+    }
+
     /// Two decode rows (the live GDN unit cap) at the max pool with room for
     /// one: the row that claims first runs, the other is refused with its
     /// denial and replans at the next step, and no turn is preempted
@@ -8783,16 +8847,17 @@ pub(crate) mod tests {
             .any(|&(_, hash, _)| hash == final_hash)
     }
 
-    /// Puts `turn` (its 40-token prompt recorded) at its 48th token, so its
-    /// next decode row claims a 4th block, then runs and settles one step.
+    /// Puts `turn` (its 40-token prompt recorded) at its 49th token, so its
+    /// next decode row writes into a 4th block, then runs and settles one
+    /// step.
     #[cfg(target_os = "macos")]
     fn claim_lone_step<B: HybridSchedulerBackend>(
         state: &mut HybridSchedulerState<B>,
         mut turn: TurnState<ScheduledTurn<B::PrefixState>>,
     ) {
-        turn.token_history.extend([3; 8]);
-        turn.num_computed_tokens = 47;
-        turn.num_tokens = 48;
+        turn.token_history.extend([3; 9]);
+        turn.num_computed_tokens = 48;
+        turn.num_tokens = 49;
         state.scheduler.reinstate_running(turn);
         let step = state.step_with(&mut RunEveryRow).expect("a step");
         state.settle_step(step);

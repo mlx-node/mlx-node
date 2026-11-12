@@ -1478,7 +1478,7 @@ pub(super) mod tests {
         turn.num_computed_tokens = 40;
         turn.token_history.push(3);
         turn.num_tokens = 41;
-        let growth = state.inner.scheduled_draft_state_held_bytes(45)
+        let growth = state.inner.scheduled_draft_state_held_bytes(44)
             - state.inner.scheduled_draft_state_held_bytes(40);
         assert!(growth > 0);
         let io = FakeIo::new(
