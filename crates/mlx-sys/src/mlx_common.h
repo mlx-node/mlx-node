@@ -126,6 +126,30 @@ mlx::core::array qmv_w8a16_lazy(const mlx::core::array& x,
                                 const mlx::core::array& s_w);
 }  // namespace na_int8
 
+// Splash `NativeRuntime::executionFailed`: the native exception a reader or
+// synchronize caught on this thread. Each such entry point clears it first;
+// `mlx_take_native_error` hands it to Rust and clears it.
+inline std::string& mlx_native_error_slot() {
+  thread_local std::string slot;
+  return slot;
+}
+
+// Test-only: the next eval, read or synchronize entry on this thread throws
+// this text once (`mlx_test_fail_next_native_call`).
+inline std::string& mlx_test_native_failure() {
+  thread_local std::string text;
+  return text;
+}
+
+inline void mlx_throw_test_native_failure() {
+  auto& text = mlx_test_native_failure();
+  if (!text.empty()) {
+    std::string message;
+    message.swap(text);
+    throw std::runtime_error(message);
+  }
+}
+
 namespace {
 using mlx::core::add;
 using mlx::core::arange;
@@ -179,6 +203,11 @@ inline void mlx_trace_native_error(const char* context, const char* detail) {
     }
   }
   out << "\"\n";
+}
+
+inline void mlx_record_native_error(const char* context, const char* detail) {
+  mlx_native_error_slot() = detail ? detail : "unknown exception";
+  mlx_trace_native_error(context, detail);
 }
 
 // Comparison operations

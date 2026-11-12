@@ -14,14 +14,20 @@ double mlx_steady_clock_now_s() {
 }
 
 // Synchronize with the default stream to ensure all operations complete
-void mlx_synchronize() {
+bool mlx_synchronize() {
+  mlx_native_error_slot().clear();
   try {
+    mlx_throw_test_native_failure();
     mlx::core::synchronize();
+    return true;
   } catch (const std::exception& e) {
     std::cerr << "[MLX] Exception in synchronize: " << e.what() << std::endl;
+    mlx_record_native_error("synchronize", e.what());
   } catch (...) {
     std::cerr << "[MLX] Unknown exception in synchronize" << std::endl;
+    mlx_record_native_error("synchronize", "unknown exception");
   }
+  return false;
 }
 
 // Clear the memory cache to prevent memory buildup

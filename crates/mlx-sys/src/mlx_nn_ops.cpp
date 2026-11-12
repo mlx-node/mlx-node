@@ -239,6 +239,7 @@ bool mlx_eval_with_error(mlx_array** handles,
         arrays.push_back(*reinterpret_cast<array*>(handles[i]));
       }
     }
+    mlx_throw_test_native_failure();
     mlx::core::eval(std::move(arrays));
     return true;
   } catch (const std::exception& e) {
@@ -250,6 +251,19 @@ bool mlx_eval_with_error(mlx_array** handles,
     mlx_trace_native_error("eval", "unknown exception");
     return false;
   }
+}
+
+size_t mlx_take_native_error(char* out, size_t capacity) {
+  auto& slot = mlx_native_error_slot();
+  const size_t length = slot.size();
+  mlx_copy_error(out, capacity, slot.c_str());
+  slot.clear();
+  return length;
+}
+
+// TEST-ONLY: no production caller.
+void mlx_test_fail_next_native_call(const char* text) {
+  mlx_test_native_failure() = text ? text : "";
 }
 
 // Compatibility wrapper for existing native callers that do not need the
@@ -314,15 +328,16 @@ namespace {
 // for already-available arrays. Returns false if evaluation threw.
 bool ensure_readable(array& arr, const char* context) {
   try {
+    mlx_throw_test_native_failure();
     if (!arr.is_available()) {
       arr.eval();
     }
     return true;
   } catch (const std::exception& e) {
-    mlx_trace_native_error(context, e.what());
+    mlx_record_native_error(context, e.what());
     return false;
   } catch (...) {
-    mlx_trace_native_error(context, "unknown exception");
+    mlx_record_native_error(context, "unknown exception");
     return false;
   }
 }
@@ -417,6 +432,7 @@ bool mlx_array_probability_index(mlx_array* handle, double threshold, int32_t* o
 }
 
 bool mlx_array_item_at_float32(mlx_array* handle, size_t index, float* out) {
+  mlx_native_error_slot().clear();
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) return false;
@@ -426,6 +442,7 @@ bool mlx_array_item_at_float32(mlx_array* handle, size_t index, float* out) {
 }
 
 bool mlx_array_item_at_int32(mlx_array* handle, size_t index, int32_t* out) {
+  mlx_native_error_slot().clear();
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) return false;
@@ -435,6 +452,7 @@ bool mlx_array_item_at_int32(mlx_array* handle, size_t index, int32_t* out) {
 }
 
 bool mlx_array_item_at_uint32(mlx_array* handle, size_t index, uint32_t* out) {
+  mlx_native_error_slot().clear();
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);
   if (index >= arr->size()) return false;

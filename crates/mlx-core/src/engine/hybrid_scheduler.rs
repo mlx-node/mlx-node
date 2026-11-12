@@ -1397,7 +1397,11 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         };
         turn.payload.profiler.end_prefill();
         if end < source_len {
-            crate::array::synchronize_and_clear_cache();
+            if let Err(error) =
+                crate::array::memory::synchronize_and_clear_cache_checked("scheduled_prefill_slice")
+            {
+                return Ok(Self::fail(turn, row, error));
+            }
             if let Some(progress) = turn
                 .payload
                 .response
@@ -1422,7 +1426,11 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             .as_ref()
             .is_some_and(|replay| replay.suppress_sample)
         {
-            crate::array::synchronize_and_clear_cache();
+            if let Err(error) =
+                crate::array::memory::synchronize_and_clear_cache_checked("scheduled_replay_slice")
+            {
+                return Ok(Self::fail(turn, row, error));
+            }
             turn.payload.preemption_replay = None;
             return Ok(RowStepResult {
                 seq_id: row.seq_id,
@@ -1477,8 +1485,17 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         {
             return Ok(Self::fail(turn, row, error));
         }
-        sampled.eval();
-        crate::array::synchronize_and_clear_cache();
+        if let Err(error) =
+            MxArray::eval_arrays_with_context(&[&sampled], "scheduled_prefill_sample").and_then(
+                |()| {
+                    crate::array::memory::synchronize_and_clear_cache_checked(
+                        "scheduled_prefill_sample_sync",
+                    )
+                },
+            )
+        {
+            return Ok(Self::fail(turn, row, error));
+        }
         if let Some(progress) = turn
             .payload
             .response
@@ -1750,11 +1767,20 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             Ok(Some(logits)) if engine::batch_sampling::can_batch_greedy_wave(greedy_wave) => {
                 engine::batch_sampling::batch_greedy_tokens_or_fallback(logits)
             }
-            _ => None,
+            _ => Ok(None),
         };
-        let executed_greedy_epilogue_batch = greedy_tokens.as_ref().map_or(0, Vec::len);
+        let executed_greedy_epilogue_batch = greedy_tokens
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map_or(0, Vec::len);
         let mut sampling_eval_time = None;
-        let mut next_tokens: Vec<_> = if let Some(tokens) = greedy_tokens {
+        let mut next_tokens: Vec<_> = if let Err(error) = &greedy_tokens {
+            batch_rows
+                .iter()
+                .map(|_| Some(Err(Error::from_reason(error.reason.clone()))))
+                .collect()
+        } else if let Ok(Some(tokens)) = greedy_tokens {
             tokens.into_iter().map(|token| Some(Ok(token))).collect()
         } else if let Ok(Some(logits)) = &logits {
             let mut pending = Vec::with_capacity(batch_rows.len());
@@ -10641,6 +10667,85 @@ pub(crate) mod tests {
                 in_reap,
             );
         }
+    }
+
+    /// Splash `NativeRuntime::executionFailed`: a GPU OOM thrown natively at
+    /// the first sample's eval or at the synchronize after it fails the turn
+    /// `metal_out_of_memory:` with MLX's text, and the ledger counts it.
+    /// Mutations F1_SAMPLE_EVAL (the sample eval drops its error) → red;
+    /// F1_SCHED_SYNC (the synchronize after the sample drops its error) → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_native_gpu_oom_at_the_first_sample_fails_the_turn() {
+        if crate::test_support::paged_prefill_unsupported(
+            "a_native_gpu_oom_at_the_first_sample_fails_the_turn",
+        ) {
+            return;
+        }
+        a_native_gpu_oom_fails_the_turn(
+            "scheduled_prefill_sample",
+            "MLX eval failed in scheduled_prefill_sample while materializing 1 arrays: ",
+        );
+        a_native_gpu_oom_fails_the_turn(
+            "scheduled_prefill_sample_sync",
+            "MLX synchronize failed in scheduled_prefill_sample_sync: ",
+        );
+    }
+
+    /// The same at the batched greedy decode sample: MLX throws a failed GPU
+    /// command's error once, so it fails the turn instead of decode going on.
+    /// Mutations F1_GREEDY_EVAL (the eval's error is ignored) and
+    /// F1_GREEDY_FALLBACK (a failed eval falls back to per-row sampling) → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_native_gpu_oom_at_the_decode_sample_fails_the_turn() {
+        if crate::test_support::paged_prefill_unsupported(
+            "a_native_gpu_oom_at_the_decode_sample_fails_the_turn",
+        ) {
+            return;
+        }
+        a_native_gpu_oom_fails_the_turn(
+            "scheduled_greedy_sampling",
+            "MLX eval failed in scheduled_greedy_sampling while materializing 1 arrays: ",
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    fn a_native_gpu_oom_fails_the_turn(at: &str, failed: &str) {
+        use crate::engine::governor::governor::tests::{G, model};
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        const OOM: &str = "[malloc] Unable to allocate 1073741824 bytes.";
+        let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(0x5730_0002);
+        inner.tokenizer = Some(vacated_stop_tokenizer());
+        let governor = roomy_governor().1;
+        let registration = governor.register_model(model(16 * G, 0)).expect("register");
+        let model_id = registration.model_id();
+        inner.memory_registration = Some(registration);
+        let mut state = HybridSchedulerState::new(inner).expect("scheduler");
+        state.enabled = true;
+        let _armed = crate::array::fail_native_call_at(at, OOM);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (command, mut result) = sync_peer("native-oom");
+        assert!(sender.send(ModelCommand::from_chat(command)).is_ok());
+        let mut reply = None;
+        for _ in 0..64 {
+            let _ = state.drive(&mut receiver);
+            if let Ok(done) = result.try_recv() {
+                reply = Some(done);
+                break;
+            }
+        }
+        let Some(Err(error)) = reply else {
+            panic!("{at}: the native OOM fails the turn");
+        };
+        assert_eq!(
+            error.reason,
+            crate::engine::governor::metal_out_of_memory(&format!("{failed}{OOM}")),
+            "{at}"
+        );
+        assert_eq!(governor.metal_out_of_memory(model_id), 1, "{at}");
     }
 
     /// When a running turn is stopped.

@@ -4355,3 +4355,33 @@ fn portable_prefill_turn_matches_the_tile_turn() {
         );
     }
 }
+
+/// A native failure at a dense paged prefill chunk's eval fails the prefill
+/// with MLX's text; MLX throws a failed command's error once, so a dropped
+/// one lets the next chunk run on what it wrote.
+/// Mutation F1_CHUNK (the chunk eval drops its error) → red.
+#[test]
+fn a_failed_dense_prefill_chunk_eval_fails_the_prefill() {
+    if crate::test_support::paged_prefill_unsupported(
+        "a_failed_dense_prefill_chunk_eval_fails_the_prefill",
+    ) {
+        return;
+    }
+    let Some((mut inner, _cfg)) =
+        paged_inner_or_skip("a_failed_dense_prefill_chunk_eval_fails_the_prefill")
+    else {
+        return;
+    };
+    cast_qwen35_inner_weights_bf16(&mut inner);
+    const OOM: &str = "[malloc] Unable to allocate 1073741824 bytes.";
+    let prompt: Vec<u32> = (0u32..40).map(|i| (i * 5 + 7) % 257).collect();
+    reset_paged_request(&mut inner, &prompt);
+    let _armed = crate::array::fail_native_call_at("paged_prefill_chunk", OOM);
+    let Err(error) = run_dense_paged_prefill_with_size(&mut inner, &prompt, &prompt, 0, 16) else {
+        panic!("the chunk eval fails");
+    };
+    assert_eq!(
+        error.reason,
+        format!("MLX eval failed in paged_prefill_chunk while materializing 1 arrays: {OOM}")
+    );
+}

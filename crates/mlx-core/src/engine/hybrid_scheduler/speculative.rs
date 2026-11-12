@@ -422,20 +422,19 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 && params.presence_penalty == 0.0
                 && params.frequency_penalty == 0.0
         });
+        // A failed eval or read fails every row: MLX throws a failed GPU
+        // command's error once, so a per-row fallback would read what it wrote.
         let greedy_tokens = if greedy {
-            logits
-                .argmax(-1, None)
-                .and_then(|tokens| {
-                    tokens.eval();
-                    (0..verify_rows.iter().map(|row| row.tokens.len()).sum())
-                        .map(|i| tokens.item_at_int32(i))
-                        .collect::<Result<Vec<_>>>()
-                })
-                .ok()
+            logits.argmax(-1, None).ok().map(|tokens| {
+                MxArray::eval_arrays_with_context(&[&tokens], "scheduled_verify_greedy")?;
+                (0..verify_rows.iter().map(|row| row.tokens.len()).sum())
+                    .map(|i| tokens.item_at_int32(i))
+                    .collect::<Result<Vec<_>>>()
+            })
         } else {
             None
         };
-        let greedy_occupancy = if greedy_tokens.is_some() {
+        let greedy_occupancy = if matches!(greedy_tokens, Some(Ok(_))) {
             work.len()
         } else {
             0
@@ -451,6 +450,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 .and_then(|row| row.transpose(Some(&[1, 0, 2])))
                 .and_then(|row| {
                     if let Some(tokens) = greedy_tokens.as_ref() {
+                        let tokens = tokens
+                            .as_ref()
+                            .map_err(|error| Error::from_reason(error.reason.clone()))?;
                         let target = &tokens[offset as usize..end as usize];
                         let mut count = 0;
                         while count < item.proposal.draft_ids.len()
@@ -460,7 +462,8 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                         }
                         Ok((count, target[count] as u32))
                     } else if let Some(forced) = item.forced {
-                        row.eval(); // forcing a host id must still complete target/cache writes
+                        // A forced host id must still complete the target/cache writes.
+                        MxArray::eval_arrays_with_context(&[&row], "scheduled_verify_forced")?;
                         Ok((0, forced))
                     } else if let Some(rng) = turn.payload.scheduled_speculation.as_mut() {
                         accept_dspark_proposal(
@@ -1170,6 +1173,52 @@ pub(super) mod tests {
         }
         check(|| crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(8107));
         check(|| crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(8107));
+    }
+
+    /// A native error at the greedy verify eval fails the speculative row with
+    /// MLX's text instead of the per-row acceptance reading what the failed
+    /// command wrote. Mutation F1_VERIFY_GREEDY (the eval's error is ignored)
+    /// → red.
+    #[test]
+    fn a_native_error_at_the_greedy_verify_fails_the_row() {
+        if crate::test_support::paged_prefill_unsupported(
+            "a_native_error_at_the_greedy_verify_fails_the_row",
+        ) {
+            return;
+        }
+        const OOM: &str = "[malloc] Unable to allocate 1073741824 bytes.";
+        let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(8107);
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 12).unwrap();
+        let turn = request(
+            &mut inner,
+            41,
+            vec![0, 1, 2, 3, 4, 5, 6],
+            true,
+            Arc::new(AtomicBool::new(false)),
+        );
+        scheduler.enqueue_turn(turn).unwrap();
+        let _armed = crate::array::fail_native_call_at("scheduled_verify_greedy", OOM);
+        let mut failure = None;
+        for _ in 0..100 {
+            let action = scheduler
+                .drive_once(&mut HybridStepExecutor::new(&mut inner))
+                .unwrap();
+            if let SchedulerAction::Stepped { completed, .. } = action
+                && let Some(turn) = completed.into_iter().next()
+            {
+                failure = Some(turn.payload.failure);
+                break;
+            }
+        }
+        let Some(Some(error)) = failure else {
+            panic!("the native error fails the row: {failure:?}");
+        };
+        assert_eq!(
+            error.reason,
+            format!(
+                "MLX eval failed in scheduled_verify_greedy while materializing 1 arrays: {OOM}"
+            )
+        );
     }
 
     #[test]

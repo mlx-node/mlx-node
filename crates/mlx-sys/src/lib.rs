@@ -293,6 +293,14 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_item_at_int32(handle: *mut mlx_array, index: usize, out: *mut i32) -> bool;
     pub fn mlx_array_item_at_uint32(handle: *mut mlx_array, index: usize, out: *mut u32) -> bool;
     pub fn mlx_array_item_at_float32(handle: *mut mlx_array, index: usize, out: *mut f32) -> bool;
+    /// Copies (NUL-terminated, truncated to `capacity`) and clears the text of
+    /// the native exception the last `mlx_array_item_at_*` or
+    /// `mlx_synchronize` on this thread caught; returns its full length, 0
+    /// when none.
+    pub fn mlx_take_native_error(out: *mut std::ffi::c_char, capacity: usize) -> usize;
+    /// TEST-ONLY: the next eval, read or synchronize entry on this thread
+    /// throws `text` once; null or empty disarms.
+    pub fn mlx_test_fail_next_native_call(text: *const std::ffi::c_char);
     /// Lazy device categorical draw with an explicit key; -1 means no valid mass.
     pub fn mlx_array_sample_probabilities_uniforms_for_test(
         handle: *mut mlx_array,
@@ -338,7 +346,9 @@ unsafe extern "C-unwind" {
     /// `std::chrono::steady_clock` seconds — the clock of the
     /// `MLX_METAL_COMMAND_TRACE` `encodeStartCpu`/`submitCpu` stamps.
     pub fn mlx_steady_clock_now_s() -> f64;
-    pub fn mlx_synchronize();
+    /// False when the native call threw; its text waits in
+    /// `mlx_take_native_error`.
+    pub fn mlx_synchronize() -> bool;
     pub fn mlx_clear_cache();
     pub fn mlx_compile_clear_cache() -> bool;
     pub fn mlx_stop_gradient(a: *mut mlx_array) -> *mut mlx_array;
