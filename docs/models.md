@@ -257,8 +257,12 @@ DFlash2 runs on the block-paged KV pool, like Splash: the tapped prefill
 writes the prompt into the pool and books each chunk end; every cycle drafts
 seven proposals and verifies the anchor plus seven in one fixed 8-row graph
 on the pool (dense and MoE), then commits the kept rows and rolls the rest
-back without freeing a page. The GDN state of the kept prefix comes from the
-verify's spare cell on a full accept, else from the fused commit or a replay.
+back without freeing a page. Like Splash, no GDN commit or replay runs per
+cycle: each verify folds the previous cycle's kept rows from their tape into
+the lane's other GDN cell before its own rows, the commit swaps the two cells
+and keeps the verify's tape, and `finish` folds the last kept rows once. A
+load whose GDN layers the fused verify kernel cannot run (non-bf16, missing
+f32 sidecars, heads not 128 wide) refuses the draft.
 The draft state (a second GDN cell and the draft's K/V ring) is priced into
 the one pool window, and every turn, DFlash2 or not, takes that window. A
 DFlash2 turn runs alone on the Barrier lane. An AR, image or MTP turn drops

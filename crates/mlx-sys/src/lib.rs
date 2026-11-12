@@ -2201,29 +2201,6 @@ unsafe extern "C-unwind" {
         out_state: *mut *mut mlx_array,
     ) -> bool;
 
-    // Fused DFlash2 GDN commit over every linear layer: replays `keep`
-    // recorded tokens of each layer's tape into the packed recurrent blob
-    // `[L, Hv, Dv, Dk]` and conv blob `[L, K-1, W]` (bit-identical to the
-    // per-layer `mlx_gated_delta_replay` + conv rebuild) in a few dispatches.
-    // The result is written in place into the spare `rec_next` / `conv_next`
-    // blobs (ping-pong); `k`/`v`/`g`/`beta`/`qkv` point at `layers` per-layer
-    // tape arrays.
-    pub fn mlx_gdn_commit_all(
-        rec_in: *mut mlx_array,
-        conv_in: *mut mlx_array,
-        rec_next: *mut mlx_array,
-        conv_next: *mut mlx_array,
-        layers: i32,
-        k: *const *mut mlx_array,
-        v: *const *mut mlx_array,
-        g: *const *mut mlx_array,
-        beta: *const *mut mlx_array,
-        qkv: *const *mut mlx_array,
-        keep: i32,
-        out_rec: *mut *mut mlx_array,
-        out_conv: *mut *mut mlx_array,
-    ) -> bool;
-
     // True when both arrays are evaluated and are the same bytes of the same
     // buffer (offset, size and shape equal).
     pub fn mlx_array_aliases(a: *const mlx_array, b: *const mlx_array) -> bool;
@@ -2275,8 +2252,11 @@ unsafe extern "C-unwind" {
     ) -> bool;
 
     // Ten outputs: the ordinary eight, packed uint32 SG8 operands and F32 sums.
-    /// Pending inputs are k,v,g,beta,qkv plus checked keep scalar [1].
-    /// Outputs retain complete-kernel order, but state/history mean the settled prior prefix.
+    // Splash `gdn_decode_batch_phase`: pending = the prior step's k, v,
+    // decay, beta, raw inputs and keep int32[1], folded before the window;
+    // state/history outputs are that folded state. One more output after
+    // the complete kernel's: the window's raw inputs [1, T, W]. `tiled_heads`
+    // picks hv % Hk (GGUF rows), else hv / (Hv / Hk).
     pub fn mlx_gdn_fused_complete_deferred(
         qkv: *mut mlx_array,
         a: *mut mlx_array,
@@ -2293,6 +2273,7 @@ unsafe extern "C-unwind" {
         history_dst: *mut mlx_array,
         pending: *const *mut mlx_array,
         prepared: bool,
+        tiled_heads: bool,
         outputs: *mut *mut mlx_array,
     ) -> bool;
 

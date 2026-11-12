@@ -193,7 +193,7 @@ pub(crate) struct GdnTail<'a> {
     pub norm_weight: &'a MxArray,
     pub eps: f32,
     /// Where the new state is written: a `[B, Hv, Dv, Dk]` f32 view whose
-    /// buffer the returned state shares (the DFlash2 spare blob row).
+    /// buffer the returned state shares (the DFlash2 lane's other cell row).
     pub state_dst: Option<&'a MxArray>,
 }
 
@@ -255,7 +255,7 @@ pub(crate) struct GdnPrologue<'a> {
     pub scale: &'a MxArray,
     pub dt_bias: &'a MxArray,
     /// Where the next history `[3, W]` is written: a view whose buffer the
-    /// returned history shares (the DFlash2 spare conv blob row).
+    /// returned history shares (the DFlash2 lane's other conv cell row).
     pub history_dst: Option<&'a MxArray>,
 }
 
@@ -267,13 +267,17 @@ pub(crate) struct GdnCompleteOut {
     pub state: MxArray,
     pub tape: GdnKernelTape,
     pub history: MxArray,
+    /// Deferred entry only: the window's raw conv inputs `[1, T, W]`, row
+    /// contiguous (Splash `step_tape.inputs`).
+    pub raw: Option<MxArray>,
 }
 
 /// One dispatch for the whole GDN core of a window: `gdn_prepare` (conv +
 /// SiLU + q/k norm + gates), the recurrence, the gated RMSNorm and the z
 /// gate — bit-identical to `gdn_prepare` followed by
 /// [`gated_delta_fused_step`]. `None` when the kernel is off-contract
-/// (B = 1, Dk = Dv = 128, T <= 16, compact tiled heads `hv % Hk`).
+/// (B = 1, Dk = Dv = 128, T <= 16, compact tiled heads `hv % Hk`; grouped
+/// heads only through [`gated_delta_fused_complete_deferred`]).
 #[cfg(test)]
 pub(crate) fn gated_delta_fused_complete(
     prologue: &GdnPrologue<'_>,
@@ -292,17 +296,28 @@ pub(crate) fn gated_delta_fused_complete_with_prepared(
     gated_delta_fused_complete_impl(prologue, state, tail, prepared, None)
 }
 
-/// Explicit prior tape [k,v,g,beta,qkv,keep] for a deferred verifier. State and
-/// history outputs settle only that prior prefix; the current window remains
-/// represented by its tape. Never reinterpret these outputs as window-final.
+/// Splash `gdn_decode_batch_phase`: `pending` is the prior step's tape
+/// `[k, v, g, beta, raw inputs, keep int32[1]]`; its first `keep` rows are
+/// folded into the state and conv history before the window. The returned
+/// state/history are that folded state, never the window-final one; the
+/// window lives on as its tape (`tape` k/v/g/beta and `raw`). Both head
+/// orders: `tiled_heads` maps value head `hv` to key head `hv % Hk`, else
+/// `hv / (Hv / Hk)` (Splash `key_head`).
 pub(crate) fn gated_delta_fused_complete_deferred(
     prologue: &GdnPrologue<'_>,
     state: &MxArray,
     tail: &GdnTail<'_>,
     prepared: bool,
     pending: [&MxArray; 6],
+    tiled_heads: bool,
 ) -> Option<GdnCompleteOut> {
-    gated_delta_fused_complete_impl(prologue, state, tail, prepared, Some(pending))
+    gated_delta_fused_complete_impl(
+        prologue,
+        state,
+        tail,
+        prepared,
+        Some((pending, tiled_heads)),
+    )
 }
 
 fn gated_delta_fused_complete_impl(
@@ -310,15 +325,16 @@ fn gated_delta_fused_complete_impl(
     state: &MxArray,
     tail: &GdnTail<'_>,
     prepared: bool,
-    pending: Option<[&MxArray; 6]>,
+    pending: Option<([&MxArray; 6], bool)>,
 ) -> Option<GdnCompleteOut> {
-    let mut outputs = [std::ptr::null_mut(); 10];
+    let mut outputs = [std::ptr::null_mut(); 11];
+    let deferred = pending.is_some();
     let launch = if prepared {
         sys::mlx_gdn_fused_complete_prepared
     } else {
         sys::mlx_gdn_fused_complete
     };
-    let ok = if let Some(pending) = pending {
+    let ok = if let Some((pending, tiled_heads)) = pending {
         let pending = pending.map(MxArray::as_raw_ptr);
         unsafe {
             sys::mlx_gdn_fused_complete_deferred(
@@ -340,6 +356,7 @@ fn gated_delta_fused_complete_impl(
                     .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
                 pending.as_ptr(),
                 prepared,
+                tiled_heads,
                 outputs.as_mut_ptr(),
             )
         }
@@ -391,6 +408,14 @@ fn gated_delta_fused_complete_impl(
             beta: take(6, "gdn_fused_complete:beta")?,
         },
         history: take(7, "gdn_fused_complete:history")?,
+        raw: if deferred {
+            Some(take(
+                if prepared { 10 } else { 8 },
+                "gdn_fused_complete:raw",
+            )?)
+        } else {
+            None
+        },
     })
 }
 
@@ -1485,8 +1510,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// The new invariant phase 2 (adopting the verify state on full accept)
-    /// rests on: with an f32 carried state the sequential T=1 AR chain over
+    /// With an f32 carried state the sequential T=1 AR chain over
     /// 8 tokens equals the windowed T=8 verify kernel's final state — and
     /// every `y` row — bit for bit. Production geometry (Hk 16, Hv 48,
     /// Dk = Dv = 128), so the 2-vcol per-step variant is the one exercised.
@@ -1681,7 +1705,7 @@ pub(crate) mod tests {
     }
 
     /// With a `state_dst`, the new state lands in that buffer (the DFlash2
-    /// spare blob row) and the returned state is that same memory.
+    /// lane's other cell row) and the returned state is that same memory.
     #[test]
     fn fused_tail_writes_state_into_destination() {
         if !fused_step_launches() {

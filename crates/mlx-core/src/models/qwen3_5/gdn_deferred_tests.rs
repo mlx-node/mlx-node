@@ -47,7 +47,9 @@ struct Window {
 }
 impl Window {
     fn new(rows: i64, hv: i64, seed: usize, strided: bool) -> Self {
-        let hk = hv / 2;
+        Self::with_heads(rows, hv / 2, hv, seed, strided)
+    }
+    fn with_heads(rows: i64, hk: i64, hv: i64, seed: usize, strided: bool) -> Self {
         let width = 2 * hk * 128 + hv * 128;
         // Odd element offsets and padded row strides exercise the actual split views.
         let packed = array(&[1, rows, 1 + width + hv * 130 + 3], seed, DType::BFloat16);
@@ -85,6 +87,14 @@ impl Window {
         prepared: bool,
         dst: Option<(&MxArray, &MxArray)>,
         pending: Option<[&MxArray; 6]>,
+    ) -> Option<GdnCompleteOut> {
+        self.complete_heads(prepared, dst, pending.map(|p| (p, true)))
+    }
+    fn complete_heads(
+        &self,
+        prepared: bool,
+        dst: Option<(&MxArray, &MxArray)>,
+        pending: Option<([&MxArray; 6], bool)>,
     ) -> Option<GdnCompleteOut> {
         let a = &self.a;
         let p = GdnPrologue {
@@ -256,7 +266,7 @@ unsafe extern "C" fn build(
         return false;
     }
     let ctx = unsafe { &*context.cast::<Builder>() };
-    if n_outputs != if ctx.prepared { 10 } else { 8 } {
+    if n_outputs != if ctx.prepared { 11 } else { 9 } {
         return false;
     }
     ctx.traces.fetch_add(1, Ordering::Relaxed);
@@ -282,11 +292,13 @@ unsafe extern "C" fn build(
             a[17],
             a[10..16].as_ptr(),
             ctx.prepared,
+            true,
             outputs,
         )
     }
 }
 fn from_outputs(mut outputs: Vec<MxArray>) -> GdnCompleteOut {
+    let raw = outputs.pop();
     let prepared_sg8 = if outputs.len() == 10 {
         let sums = outputs.pop().unwrap();
         let packed = outputs.pop().unwrap();
@@ -307,6 +319,7 @@ fn from_outputs(mut outputs: Vec<MxArray>) -> GdnCompleteOut {
         },
         history: iter.next().unwrap(),
         prepared_sg8,
+        raw,
     }
 }
 #[test]
@@ -359,7 +372,7 @@ fn deferred_gdn_one_trace_changes_counts_widths_strides_and_parity() {
                 .iter()
                 .map(|a| a.as_raw_ptr().cast_const())
                 .collect::<Vec<_>>();
-            let mut output = vec![std::ptr::null_mut(); if prepared { 10 } else { 8 }];
+            let mut output = vec![std::ptr::null_mut(); if prepared { 11 } else { 9 }];
             assert!(unsafe {
                 sys::mlx_compiled_graph_invoke(
                     key,
@@ -503,4 +516,269 @@ fn deferred_gdn_chain_settles_every_accepted_prefix_before_publication() {
     );
     exact(&published.0, &logical.0, "finish recurrent frontier");
     exact(&published.1, &logical.1, "finish convolution frontier");
+}
+
+/// Rows `>= keep` of a tape array replaced by NaN (Splash
+/// `replayAcrossBatches` poisons the bytes past the retained prefix).
+fn poison(a: &MxArray, keep: usize) -> MxArray {
+    let rows = a.shape_at(1).unwrap();
+    let keep = keep as i64;
+    if keep == rows {
+        return a.clone();
+    }
+    let mut shape = a.shape().unwrap().as_ref().to_vec();
+    shape[1] = rows - keep;
+    let nan = MxArray::full(&shape, Either::A(f64::NAN), Some(a.dtype().unwrap())).unwrap();
+    MxArray::concatenate(&a.slice_axis(1, 0, keep).unwrap(), &nan, 1).unwrap()
+}
+
+/// The zero one-row tape and keep 0 for `hk`/`hv` heads of a `width` conv.
+fn zero_pending(hk: i64, hv: i64, width: i64) -> [MxArray; 6] {
+    [
+        MxArray::zeros(&[1, 1, hk, 128], Some(DType::BFloat16)).unwrap(),
+        MxArray::zeros(&[1, 1, hv, 128], Some(DType::BFloat16)).unwrap(),
+        MxArray::zeros(&[1, 1, hv], Some(DType::Float32)).unwrap(),
+        MxArray::zeros(&[1, 1, hv], Some(DType::BFloat16)).unwrap(),
+        MxArray::zeros(&[1, 1, width], Some(DType::BFloat16)).unwrap(),
+        MxArray::from_int32(&[0], &[1]).unwrap(),
+    ]
+}
+
+fn refs(a: &[MxArray; 6]) -> [&MxArray; 6] {
+    [&a[0], &a[1], &a[2], &a[3], &a[4], &a[5]]
+}
+
+/// q/k one per value head for kernels that map `hv % Hk`.
+fn grouped_tape(tape: &GdnKernelTape, hk: i64, hv: i64) -> GdnKernelTape {
+    let expand = |a: &MxArray| a.repeat((hv / hk) as i32, 2).unwrap();
+    GdnKernelTape {
+        q: expand(&tape.q),
+        k: expand(&tape.k),
+        v: tape.v.clone(),
+        g: tape.g.clone(),
+        beta: tape.beta.clone(),
+    }
+}
+
+/// The fold on the 27B (Hk 16, Hv 48, W 10240) and 35B (Hk 16, Hv 32,
+/// W 8192) geometries, both head orders, both storage schedules: for every
+/// keep the deferred call's state and history equal the T=1 chain and
+/// `GdnLayerTape::replay_into` from the same start, the tape rows past the
+/// keep poisoned with NaN, and its output, tape and raw inputs equal a
+/// keep-0 run from the settled state. Grouped heads have no ordinary
+/// complete, so their producer and reference are the deferred entry with
+/// the zero tape. Mutation F1 (the kernel folds all 8 rows) turns it red.
+#[test]
+fn deferred_fold_matches_t1_settle_on_model_shapes() {
+    let _serial = SERIAL.lock().unwrap();
+    let _env = Environment::new();
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    for (scan, storage) in [("0", "0"), ("1", "1")] {
+        Environment::set(scan, storage);
+        for (hk, hv) in [(16i64, 48i64), (16, 32)] {
+            let width = 2 * hk * 128 + hv * 128;
+            let zero = zero_pending(hk, hv, width);
+            let prepared = hv == 32;
+            for tiled in [true, false] {
+                let run = |w: &Window, dst, pending: Option<[&MxArray; 6]>| {
+                    if tiled {
+                        w.complete(prepared, dst, pending)
+                    } else {
+                        w.complete_heads(
+                            prepared,
+                            dst,
+                            Some((pending.unwrap_or(refs(&zero)), false)),
+                        )
+                    }
+                };
+                let prior = Window::with_heads(8, hk, hv, 501 + hv as usize, true);
+                let prior_out = run(&prior, None, None).expect("producer");
+                let prior_raw = prior_out.raw.clone().unwrap_or_else(|| prior.a[0].clone());
+                let chain_tape = if tiled {
+                    prior_out.tape.clone()
+                } else {
+                    grouped_tape(&prior_out.tape, hk, hv)
+                };
+                for keep in 0..=8usize {
+                    let tag = format!(
+                        "hk={hk} hv={hv} tiled={tiled} keep={keep} scan={scan} storage={storage}"
+                    );
+                    let settled =
+                        settle_t1(&chain_tape, &prior.a[7], &prior.a[4], &prior_raw, keep);
+                    let mut replayed = crate::models::qwen3_5::arrays_cache::ArraysCache::new(2);
+                    crate::models::qwen3_5::gated_delta_net::GdnLayerTape {
+                        kernel: chain_tape.clone(),
+                        qkv: prior_raw.clone(),
+                        conv_kernel_dim: 4,
+                    }
+                    .replay_into(
+                        &mut replayed,
+                        Some(&prior.a[4].reshape(&[1, 3, width]).unwrap()),
+                        Some(&prior.a[7]),
+                        keep,
+                    )
+                    .unwrap();
+                    exact(
+                        replayed.get(1).unwrap(),
+                        &settled.0,
+                        &format!("{tag}: replay state"),
+                    );
+                    exact(
+                        &replayed.get(0).unwrap().squeeze(Some(&[0])).unwrap(),
+                        &settled.1,
+                        &format!("{tag}: replay history"),
+                    );
+                    let keep_array = MxArray::from_int32(&[keep as i32], &[1]).unwrap();
+                    let poisoned = [
+                        poison(&prior_out.tape.k, keep),
+                        poison(&prior_out.tape.v, keep),
+                        poison(&prior_out.tape.g, keep),
+                        poison(&prior_out.tape.beta, keep),
+                        poison(&prior_raw, keep),
+                        keep_array,
+                    ];
+                    let mut current = Window::with_heads(8, hk, hv, 611 + keep, keep % 2 == 0);
+                    current.a[4] = prior.a[4].clone();
+                    current.a[7] = prior.a[7].clone();
+                    let state_dst = MxArray::zeros(
+                        current.a[7].shape().unwrap().as_ref(),
+                        Some(DType::Float32),
+                    )
+                    .unwrap();
+                    let history_dst = MxArray::zeros(
+                        current.a[4].shape().unwrap().as_ref(),
+                        Some(DType::BFloat16),
+                    )
+                    .unwrap();
+                    let actual = current
+                        .complete_heads(
+                            prepared,
+                            Some((&state_dst, &history_dst)),
+                            Some((refs(&poisoned), tiled)),
+                        )
+                        .unwrap_or_else(|| panic!("{tag}: deferred declined"));
+                    current.a[4] = settled.1.clone();
+                    current.a[7] = settled.0.clone();
+                    let expected = run(&current, None, None).unwrap();
+                    compare(&actual, &expected, (&settled.0, &settled.1));
+                    exact(
+                        actual.raw.as_ref().expect("deferred raw inputs"),
+                        &current.a[0],
+                        &format!("{tag}: raw inputs"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Grouped heads on the 27B geometry: a keep-0 deferred call with the zero
+/// tape gives the `qwen4_gdn_prepare` -> fused tail (`tiled_gqa = false`)
+/// output and tape bits, with the incoming state and history untouched;
+/// folding its own tape at keep = T then gives the chain's window-final
+/// state and history. Mutation G1 (the deferred entry maps tiled heads)
+/// turns it red.
+#[test]
+fn grouped_deferred_matches_the_prepare_chain() {
+    let _serial = SERIAL.lock().unwrap();
+    let _env = Environment::new();
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let (hk, hv, width) = (16i64, 48i64, 10240i64);
+    let zero = zero_pending(hk, hv, width);
+    for rows in [1i64, 8] {
+        let tag = format!("rows={rows}");
+        let w = Window::with_heads(rows, hk, hv, 701 + rows as usize, true);
+        let a = &w.a;
+        let mut outputs = [std::ptr::null_mut(); 6];
+        assert!(unsafe {
+            sys::mlx_qwen4_gdn_prepare(
+                a[0].as_raw_ptr(),
+                a[1].as_raw_ptr(),
+                a[2].as_raw_ptr(),
+                a[3].as_raw_ptr(),
+                a[4].as_raw_ptr(),
+                a[5].as_raw_ptr(),
+                a[6].as_raw_ptr(),
+                true,
+                true,
+                outputs.as_mut_ptr(),
+            )
+        });
+        let [q, k, v, decay, beta, history] =
+            outputs.map(|o| MxArray::from_handle(o, "gdn_prepare").unwrap());
+        let mut sink = None;
+        let (out, state) = gated_delta_update_fused(
+            &q,
+            &k,
+            &v,
+            &a[1],
+            &a[2],
+            &a[5],
+            &a[6],
+            Some(&a[7]),
+            None,
+            true,
+            false,
+            Some((&decay, &beta)),
+            GdnTail {
+                z: &a[8],
+                norm_weight: &a[9],
+                eps: 1e-6,
+                state_dst: None,
+            },
+            Some(&mut sink),
+        )
+        .unwrap()
+        .expect("fused tail");
+        let first = w
+            .complete_heads(false, None, Some((refs(&zero), false)))
+            .expect("grouped deferred");
+        exact(&first.out, &out, &format!("{tag}: output"));
+        exact(&first.tape.k, &k, &format!("{tag}: compact k"));
+        exact(&first.tape.v, &v, &format!("{tag}: v"));
+        exact(&first.tape.g, &decay, &format!("{tag}: decay"));
+        exact(&first.tape.beta, &beta, &format!("{tag}: beta"));
+        exact(
+            &first.state,
+            &a[7],
+            &format!("{tag}: keep 0 leaves the state"),
+        );
+        exact(
+            &first.history,
+            &a[4],
+            &format!("{tag}: keep 0 leaves the history"),
+        );
+        let keep = MxArray::from_int32(&[rows as i32], &[1]).unwrap();
+        let raw = first.raw.clone().expect("raw inputs");
+        let mut next = Window::with_heads(8, hk, hv, 777, false);
+        next.a[4] = a[4].clone();
+        next.a[7] = a[7].clone();
+        let folded = next
+            .complete_heads(
+                false,
+                None,
+                Some((
+                    [
+                        &first.tape.k,
+                        &first.tape.v,
+                        &first.tape.g,
+                        &first.tape.beta,
+                        &raw,
+                        &keep,
+                    ],
+                    false,
+                )),
+            )
+            .expect("grouped fold");
+        exact(&folded.state, &state, &format!("{tag}: window-final state"));
+        exact(
+            &folded.history,
+            &history,
+            &format!("{tag}: window-final history"),
+        );
+    }
 }
