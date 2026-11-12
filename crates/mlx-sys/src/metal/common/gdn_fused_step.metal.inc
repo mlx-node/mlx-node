@@ -20,11 +20,18 @@
 //     the mean, q scaled by Dk^-1/2), decay/beta gates — into threadgroup
 //     memory, with the same arithmetic as that kernel (f32 products summed
 //     in tap order, no contraction, bf16 SiLU boundary), and the prepared
-//     tape (q, k, v, decay, beta, next_history) also written to device for
-//     the commit replay. Value head hv uses key head hv % Hk (tiled GGUF).
+//     tape (q, k, v, decay, beta, next_history) also written to device.
+//     GDN_FUSED_DEFERRED (Splash `gdn_decode_batch_phase`): the prior step's
+//     retained rows (`pending_*`, `pending_keep` of them) are folded into
+//     the state and the conv history first; state_out / history_out hold
+//     that folded state, the window's rows advance it for the outputs only,
+//     and the window's raw conv inputs go to `raw_out` (Splash
+//     `step_tape.inputs`).
+// Value head hv reads key head hv % Hk when `tiled_heads` (llama.cpp GGUF
+// rows), else hv / (Hv / Hk) (Splash `key_head`); the step kernel is tiled.
 // Common:
 //   state_in / state_out [B, Hv, Dv, Dk] f32 (state_out may alias a caller
-//   buffer: the DFlash2 spare blob row)
+//   buffer: the DFlash2 lane's other cell row)
 //   z    [B, T, Hv * Dv] bf16, read through its row strides (a split view)
 //   w    [Dv] bf16 norm weight;  out [B, T, Hv * Dv] bf16
 // Threadgroups: B * Hv of 8 * Dv threads (Dv / 4 simdgroups); T <= Dv / 4
@@ -47,6 +54,7 @@ struct GdnFusedParams {
   int b_stride_t;
   int b_stride_c;
   int pending_T; // prior tape rows; dynamic keep is a separate explicit input
+  int tiled_heads;
 };
 
 // `Sigmoid` from mlx/backend/metal/kernels/unary_ops.h, verbatim: the
@@ -97,6 +105,7 @@ inline T gdn_fused_sigmoid(T x) {
     const device bfloat16_t* pending_beta [[buffer(GDN_PENDING_SLOT + 3)]],
     const device bfloat16_t* pending_qkv [[buffer(GDN_PENDING_SLOT + 4)]],
     const device int* pending_keep [[buffer(GDN_PENDING_SLOT + 5)]],
+    device bfloat16_t* raw_out [[buffer(GDN_PENDING_SLOT + 6)]],
 #endif
 #else
 [[kernel]] void mlx_node_gdn_fused_step(
@@ -131,7 +140,8 @@ inline T gdn_fused_sigmoid(T x) {
   const uint Hv = uint(p.hv);
   const uint b_idx = n / Hv;
   const uint hv_idx = n % Hv;
-  const uint hk_idx = hv_idx % Hk;
+  const uint group = Hv / Hk;
+  const uint hk_idx = p.tiled_heads ? hv_idx % Hk : hv_idx / group;
 #if GDN_FUSED_DEFERRED
   // Production constructs this scalar only from a checked host keep count.
   // Clamp the internal raw-FFI operand defensively, without a device readback.
@@ -153,7 +163,8 @@ inline T gdn_fused_sigmoid(T x) {
     #pragma clang fp reassociate(off)
     constexpr uint KC = 4;
     const uint W = (2 * Hk) * Dk + Hv * Dv;
-    const bool writer = hv_idx < Hk;  // one of the Hv / Hk sharers writes q/k
+    // One of the Hv / Hk sharers of a key head writes its q/k channels.
+    const bool writer = p.tiled_heads ? hv_idx < Hk : hv_idx % group == 0;
     for (uint task = sg; task < 3 * T; task += SimdGroups) {
       const uint token = task % T;
       const uint kind = task / T;  // 0 = q, 1 = k, 2 = v
@@ -172,7 +183,11 @@ inline T gdn_fused_sigmoid(T x) {
           if (row < KC - 1) value = float(prior < KC - 1
               ? history[prior * uint(p.hist_stride_r) + ch * uint(p.hist_stride_c)]
               : pending_qkv[(prior - (KC - 1)) * W + ch]);
-          else value = float(qkv[(row - (KC - 1)) * uint(p.qkv_stride_t) + ch * uint(p.qkv_stride_c)]);
+          else {
+            const bfloat16_t raw = qkv[(row - (KC - 1)) * uint(p.qkv_stride_t) + ch * uint(p.qkv_stride_c)];
+            if (tap == KC - 1 && (kind == 2 || writer)) raw_out[token * W + ch] = raw;
+            value = float(raw);
+          }
 #else
           float value = float(row < KC - 1
               ? history[row * uint(p.hist_stride_r) + ch * uint(p.hist_stride_c)]

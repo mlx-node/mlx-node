@@ -88,12 +88,9 @@ fn captured_states(captured: Vec<GdnCarry>) -> Result<Vec<MxArray>> {
 ///     rebuild the conv state by slicing the accepted prefix).
 ///   * `conv_kernel_dim` — depthwise conv kernel size; `keep = conv_kernel_dim
 ///     - 1` is the conv-state window length.
-///   * `final_state` / `final_conv` — the recurrent state `[1, Hv, Dv, Dk]`
-///     and conv history `[K-1, W]` after the WHOLE window, when the verify
-///     wrote them into the DFlash2 spare blob rows (compiled verify with
-///     destinations; the layer records the history, the compiled unpack
-///     the state). With the f32 carry the state equals the replay of every
-///     window token, so a full accept adopts both instead of replaying.
+///
+/// On the deferred complete route (the DFlash2 verify) `qkv` is the kernel's
+/// own row-contiguous raw-input output, not a view of the projection.
 ///
 /// All array fields are lazy `MxArray` clones (no eval, no copy) so recording
 /// stays inside the fused lazy MLX graph.
@@ -102,8 +99,6 @@ pub(crate) struct GdnLayerTape {
     pub kernel: GdnKernelTape,
     pub qkv: MxArray,
     pub conv_kernel_dim: i32,
-    pub final_state: Option<MxArray>,
-    pub final_conv: Option<MxArray>,
 }
 
 /// Rebuild the convolution history from the pre-verify snapshot and accepted rows.
@@ -161,8 +156,6 @@ impl GdnLayerTape {
             },
             qkv: combine(|row| &row.qkv)?,
             conv_kernel_dim: first.conv_kernel_dim,
-            final_state: None,
-            final_conv: None,
         })
     }
 
@@ -188,8 +181,6 @@ impl GdnLayerTape {
             },
             qkv: select(&self.qkv)?,
             conv_kernel_dim: self.conv_kernel_dim,
-            final_state: None,
-            final_conv: None,
         })
     }
 
@@ -371,6 +362,7 @@ struct CompleteRun {
     state: MxArray,
     history: MxArray,
     tape: Option<GdnKernelTape>,
+    raw: Option<MxArray>,
     captured: Vec<MxArray>,
 }
 
@@ -886,17 +878,12 @@ impl GatedDeltaNet {
             note_route(GdnRoute::Complete);
             self.record_captures(capture, &qkv, incoming_conv.as_ref(), complete.captured)?;
             if let (Some(sink), Some(qkv), Some(kernel)) =
-                (tape_sink.take(), tape_qkv, complete.tape)
+                (tape_sink.take(), complete.raw.or(tape_qkv), complete.tape)
             {
-                // The kernel's own history output (not the reshaped cache
-                // view): a sibling of the gated output, so it is evaluated
-                // with it and a full accept can adopt it in place.
                 *sink = Some(GdnLayerTape {
                     kernel,
                     qkv,
                     conv_kernel_dim: self.conv_kernel_dim,
-                    final_state: None,
-                    final_conv: Some(complete.history),
                 });
             }
             return self.out_proj.forward_mixer_output(
@@ -906,9 +893,9 @@ impl GatedDeltaNet {
             );
         }
 
-        // A deferred cache describes a physical state before its logical
-        // frontier. A generic fallback cannot consume it. Fail the turn closed;
-        // the stepper settles pending before choosing an ordinary verifier.
+        // A deferred cache holds a state behind its logical frontier by the
+        // pending rows; no other route folds them. Fail closed (Splash
+        // `compiledGdn`).
         if cache.as_deref().and_then(|c| c.get(4)).is_some() {
             return Err(Error::from_reason("deferred GDN complete kernel declined"));
         }
@@ -1139,8 +1126,6 @@ impl GatedDeltaNet {
                         kernel,
                         qkv,
                         conv_kernel_dim: self.conv_kernel_dim,
-                        final_state: None,
-                        final_conv: None,
                     });
                 }
                 return self.out_proj.forward_mixer_output(&gated, None, residual);
@@ -1222,8 +1207,6 @@ impl GatedDeltaNet {
                     kernel,
                     qkv,
                     conv_kernel_dim: self.conv_kernel_dim,
-                    final_state: None,
-                    final_conv: None,
                 });
             }
             result
@@ -1292,7 +1275,9 @@ impl GatedDeltaNet {
     /// activations, the f32 conv/scale/dt sidecars) plus the fused tail's
     /// (unmasked, T <= 16, bf16 gate and norm weight, f32 state) and compact
     /// tiled heads (`hv % Hk`; standard checkpoints repeat-expand q/k and
-    /// stay on the chain below). `None` leaves the chain to run.
+    /// stay on the chain below). A deferred cache (slots 4..9, the DFlash2
+    /// verify) also takes grouped heads (`hv / (Hv / Hk)`), which only the
+    /// deferred entry maps. `None` leaves the chain to run.
     #[allow(clippy::too_many_arguments)]
     fn forward_complete(
         &self,
@@ -1316,8 +1301,11 @@ impl GatedDeltaNet {
             state: out.state,
             history: out.history,
             tape: Some(out.tape),
+            raw: out.raw,
             captured: Vec::new(),
         };
+        let deferred = cache.is_some_and(|c| c.get(4).is_some());
+        let grouped = deferred && self.num_k_heads > 0 && self.num_v_heads % self.num_k_heads == 0;
         if batch != 1
             || !(1..=16).contains(&seq_len)
             || mask.is_some()
@@ -1325,7 +1313,7 @@ impl GatedDeltaNet {
             || self.conv_kernel_dim != 4
             || self.key_head_dim != 128
             || self.value_head_dim != 128
-            || !(self.tiled_gguf_layout || self.num_k_heads == self.num_v_heads)
+            || !(self.tiled_gguf_layout || self.num_k_heads == self.num_v_heads || grouped)
             || !crate::engine::persistence::compiled_forward_backend_available()
         {
             return Ok(None);
@@ -1412,6 +1400,7 @@ impl GatedDeltaNet {
                 &tail,
                 prepared,
                 [p0, p1, p2, p3, p4, p5],
+                self.tiled_gguf_layout,
             )
             .map(whole))
         } else {
@@ -1519,6 +1508,7 @@ impl GatedDeltaNet {
             state,
             history,
             tape: None,
+            raw: None,
             captured: captured_states(split.captured)?,
         }))
     }
@@ -1925,6 +1915,31 @@ impl GatedDeltaNet {
         }
         self.conv1d.set_weight(&w)
     }
+    /// Splash `compiledGdn` (fail closed): why the DFlash2 verify's deferred
+    /// complete kernel would decline this layer. Checked when a draft is
+    /// attached, so a turn never fails after its prefill. The gated-norm
+    /// weight carries the compute dtype (`set_norm_weight`).
+    pub(crate) fn deferred_verify_refusal(&self) -> Option<&'static str> {
+        if self.conv_kernel_dim != 4 || self.key_head_dim != 128 || self.value_head_dim != 128 {
+            return Some("4 conv taps and 128-wide key and value heads");
+        }
+        if self.num_k_heads <= 0 || self.num_v_heads % self.num_k_heads != 0 {
+            return Some("value heads a multiple of key heads");
+        }
+        if self.conv1d_w4_f32.is_none()
+            || self.gdn_scale_f32.is_none()
+            || self.dt_bias_f32.is_none()
+        {
+            return Some("an f32 tap-major conv weight, scale and dt_bias");
+        }
+        if self.norm.weight().dtype().ok() != Some(DType::BFloat16) {
+            return Some("bf16 activations");
+        }
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return Some("Metal");
+        }
+        None
+    }
     pub fn set_norm_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
         // norm.weight may be stored as f32 in checkpoints for precision;
         // cast to the model's compute dtype — not to dt_bias's dtype
@@ -2180,6 +2195,11 @@ mod tests {
     }
 
     fn kernel_geometry_net_with(weight: impl Fn(&[i64]) -> MxArray) -> GatedDeltaNet {
+        kernel_geometry_net_heads(48, weight)
+    }
+
+    /// Hk 16 and `hv` value heads of 128 (48: the 27B, 32: the 35B MoE).
+    fn kernel_geometry_net_heads(hv: i64, weight: impl Fn(&[i64]) -> MxArray) -> GatedDeltaNet {
         let config = Qwen3_5Config {
             rope_scaling: None,
             qwen35_gguf_gdn_layout: None,
@@ -2198,7 +2218,7 @@ mod tests {
             pad_token_id: 0,
             eos_token_id: 1,
             bos_token_id: 2,
-            linear_num_value_heads: 48,
+            linear_num_value_heads: hv as i32,
             linear_num_key_heads: 16,
             linear_key_head_dim: 128,
             linear_value_head_dim: 128,
@@ -2212,16 +2232,18 @@ mod tests {
             n_mtp_layers: 0,
         };
         let mut net = GatedDeltaNet::new(&config).unwrap();
-        // key_dim*2 + value_dim*2 = 2048*2 + 6144*2 = 16384 rows out.
-        net.set_in_proj_qkvz_weight(&weight(&[16384, 64])).unwrap();
-        net.set_in_proj_ba_weight(&weight(&[96, 64])).unwrap();
-        net.set_conv1d_weight(&weight(&[10240, 1, 4]), DType::BFloat16)
+        // key_dim*2 + value_dim*2 rows out (27B: 2048*2 + 6144*2 = 16384).
+        let values = hv * 128;
+        net.set_in_proj_qkvz_weight(&weight(&[4096 + 2 * values, 64]))
+            .unwrap();
+        net.set_in_proj_ba_weight(&weight(&[2 * hv, 64])).unwrap();
+        net.set_conv1d_weight(&weight(&[4096 + values, 1, 4]), DType::BFloat16)
             .unwrap();
         net.set_norm_weight(&weight(&[128]), DType::BFloat16)
             .unwrap();
-        net.set_out_proj_weight(&weight(&[64, 6144])).unwrap();
-        net.set_dt_bias(&weight(&[48]));
-        net.set_a_log(&weight(&[48])).unwrap();
+        net.set_out_proj_weight(&weight(&[64, values])).unwrap();
+        net.set_dt_bias(&weight(&[hv]));
+        net.set_a_log(&weight(&[hv])).unwrap();
         net
     }
 
@@ -2784,14 +2806,18 @@ mod tests {
     /// first `c` rows of a window sees the same projected rows as the whole
     /// window: GEMM M cannot change the recurrence inputs.
     fn capture_net(tiled: bool) -> GatedDeltaNet {
-        let mut net = kernel_geometry_net();
-        net.set_in_proj_qkvz_weight(&exact_bf16(&[16384, 64], 11))
+        capture_net_heads(48, tiled)
+    }
+
+    fn capture_net_heads(hv: i64, tiled: bool) -> GatedDeltaNet {
+        let mut net = kernel_geometry_net_heads(hv, rand_bf16);
+        net.set_in_proj_qkvz_weight(&exact_bf16(&[4096 + 2 * hv * 128, 64], 11))
             .unwrap();
-        net.set_in_proj_ba_weight(&exact_bf16(&[96, 64], 12))
+        net.set_in_proj_ba_weight(&exact_bf16(&[2 * hv, 64], 12))
             .unwrap();
         net.tiled_gguf_layout = tiled;
-        net.set_dt_bias(&MxArray::random_normal(&[48], 0.0, 0.3, Some(DType::Float32)).unwrap());
-        net.set_a_log(&MxArray::random_normal(&[48], 0.0, 0.3, Some(DType::Float32)).unwrap())
+        net.set_dt_bias(&MxArray::random_normal(&[hv], 0.0, 0.3, Some(DType::Float32)).unwrap());
+        net.set_a_log(&MxArray::random_normal(&[hv], 0.0, 0.3, Some(DType::Float32)).unwrap())
             .unwrap();
         net
     }
@@ -3022,6 +3048,125 @@ mod tests {
             raw_bits(empty.get(1).unwrap()),
             raw_bits(plain.get(1).unwrap())
         );
+        Ok(())
+    }
+
+    /// The DFlash2 verify's layer: a cache with the pending tape (slots
+    /// 4..9) takes the deferred complete kernel for tiled and grouped heads,
+    /// 27B (Hv 48) and 35B (Hv 32) geometry. With the zero tape and keep 0
+    /// its cells keep the incoming bits; on the 27B its output equals the
+    /// same net's ordinary route (grouped: `qwen4_gdn_prepare` and the fused
+    /// tail) and folding its own tape at keep 8 lands on that route's
+    /// window-final state and conv history, bit for bit. The 35B's ordinary
+    /// grouped route is the MLX conv chain, whose q/k norm and decay round
+    /// differently from the prepare arithmetic the kernel shares (up to one
+    /// bf16 / f32 step): there the output and the fold match it only to that
+    /// rounding. Mutation G2 (the gate refuses grouped heads) turns it red.
+    #[test]
+    fn deferred_verify_takes_the_complete_kernel_for_both_orders() -> Result<()> {
+        if !gdn_prepare_backend_probe() {
+            eprintln!("SKIP deferred_verify_takes_the_complete_kernel_for_both_orders");
+            return Ok(());
+        }
+        for (hv, tiled) in [(48i64, false), (48, true), (32, false)] {
+            let tag = format!("hv={hv} tiled={tiled}");
+            let net = capture_net_heads(hv, tiled);
+            let width = 4096 + hv * 128;
+            let mut base = ArraysCache::new(2);
+            net.forward(&exact_bf16(&[1, 5, 64], 13), None, Some(&mut base), true)?;
+            MxArray::eval_arrays(&[base.get(0).unwrap(), base.get(1).unwrap()])?;
+            let x = exact_bf16(&[1, 8, 64], 21);
+            let mut plain = copy_cache(&base);
+            let out_plain = net.forward(&x, None, Some(&mut plain), true)?;
+            take_gdn_routes();
+            let deferred = |pending: [MxArray; 6],
+                            x: &MxArray|
+             -> Result<(MxArray, ArraysCache, GdnLayerTape)> {
+                let mut cache = ArraysCache::new(10);
+                cache.set(0, base.get(0).unwrap().clone())?;
+                cache.set(1, base.get(1).unwrap().clone())?;
+                cache.set(2, MxArray::zeros(&[1, hv, 128, 128], Some(DType::Float32))?)?;
+                cache.set(3, MxArray::zeros(&[3, width], Some(DType::BFloat16))?)?;
+                for (slot, array) in pending.into_iter().enumerate() {
+                    cache.set(4 + slot, array)?;
+                }
+                let mut tape = None;
+                unsafe { sys::mlx_test_kquant_counting(true) };
+                let run = net
+                    .forward_with_tape(x, None, Some(&mut cache), true, Some(&mut tape))
+                    .and_then(|out| {
+                        MxArray::eval_arrays(&[
+                            &out,
+                            cache.get(0).unwrap(),
+                            cache.get(1).unwrap(),
+                        ])?;
+                        Ok(out)
+                    });
+                let launches =
+                    unsafe { sys::mlx_test_kquant_family_count(c"gdn_fused_deferred".as_ptr()) };
+                unsafe { sys::mlx_test_kquant_counting(false) };
+                let out = run?;
+                assert_eq!(launches, 1, "{tag}: one deferred launch");
+                assert_eq!(take_gdn_routes(), [GdnRoute::Complete], "{tag}: route");
+                Ok((out, cache, tape.expect("verify tape")))
+            };
+            let zero = [
+                MxArray::zeros(&[1, 1, 16, 128], Some(DType::BFloat16))?,
+                MxArray::zeros(&[1, 1, hv, 128], Some(DType::BFloat16))?,
+                MxArray::zeros(&[1, 1, hv], Some(DType::Float32))?,
+                MxArray::zeros(&[1, 1, hv], Some(DType::BFloat16))?,
+                MxArray::zeros(&[1, 1, width], Some(DType::BFloat16))?,
+                MxArray::from_int32(&[0], &[1])?,
+            ];
+            let close = |got: &MxArray, want: &MxArray, what: &str| -> Result<()> {
+                if hv == 48 {
+                    assert_eq!(raw_bits(got), raw_bits(want), "{tag}: {what}");
+                    return Ok(());
+                }
+                let f32s = |v: &MxArray| v.astype(DType::Float32)?.to_float32();
+                let (got, want) = (f32s(got)?, f32s(want)?);
+                let range = want.iter().fold(0f32, |m, y| m.max(y.abs()));
+                let diff = got
+                    .iter()
+                    .zip(want.iter())
+                    .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                assert!(
+                    diff <= range / 64.0,
+                    "{tag}: {what}: {diff:e} > {range:e}/64"
+                );
+                Ok(())
+            };
+            let (out, cache, tape) = deferred(zero, &x)?;
+            close(&out, &out_plain, "output")?;
+            for slot in 0..2 {
+                assert_eq!(
+                    raw_bits(cache.get(slot).unwrap()),
+                    raw_bits(base.get(slot).unwrap()),
+                    "{tag}: keep 0 leaves slot {slot}"
+                );
+            }
+            assert_eq!(
+                tape.qkv.shape()?.as_ref(),
+                [1, 8, width],
+                "{tag}: raw inputs"
+            );
+            let pending = [
+                tape.kernel.k.clone(),
+                tape.kernel.v.clone(),
+                tape.kernel.g.clone(),
+                tape.kernel.beta.clone(),
+                tape.qkv.clone(),
+                MxArray::from_int32(&[8], &[1])?,
+            ];
+            let (_, folded, _) = deferred(pending, &exact_bf16(&[1, 8, 64], 22))?;
+            for slot in 0..2 {
+                close(
+                    folded.get(slot).unwrap(),
+                    plain.get(slot).unwrap(),
+                    &format!("the fold of 8 rows vs the window-final slot {slot}"),
+                )?;
+            }
+        }
         Ok(())
     }
 }

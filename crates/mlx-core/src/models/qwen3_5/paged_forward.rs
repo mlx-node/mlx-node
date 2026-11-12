@@ -1945,8 +1945,9 @@ pub(crate) fn require_verify_chunk(
 /// 8-row forward that stores every row in the pages before attending over
 /// them (Splash `PagedAttention::addVerify`), returns the logits of all
 /// rows, the output rows of every layer in `tap_layers` (Splash
-/// `Qwen3_5Target::addVerify` captures), and writes each linear layer's
-/// window-final state into `gdn_dst` (the spare GDN cell) when given.
+/// `Qwen3_5Target::addVerify` captures), and folds each linear layer's
+/// pending rows into the lane's other GDN cell before its window (Splash
+/// `gdn_decode_batch_phase`, see [`super::gdn_blob`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_paged_dflash2_verify_step(
     verify_ids: &[u32],
@@ -1960,7 +1961,7 @@ pub(crate) fn run_paged_dflash2_verify_step(
     tape: &mut Vec<Option<super::gated_delta_net::GdnLayerTape>>,
     cached_rope_deltas: i32,
     tap_layers: &[usize],
-    gdn_dst: Option<&super::gdn_blob::GdnDestinations>,
+    gdn: &super::gdn_blob::GdnStateBlobs,
     context_window: u32,
 ) -> Result<(MxArray, Vec<MxArray>)> {
     require_verify_chunk(verify_ids.len(), paged_adapter, context_window)?;
@@ -1976,7 +1977,7 @@ pub(crate) fn run_paged_dflash2_verify_step(
         tape,
         cached_rope_deltas,
         tap_layers,
-        gdn_dst,
+        Some(gdn),
     )
     .map(|(output, taps)| (output.logits, taps))
 }
@@ -1994,7 +1995,7 @@ fn paged_verify_core(
     tape: &mut Vec<Option<super::gated_delta_net::GdnLayerTape>>,
     cached_rope_deltas: i32,
     tap_layers: &[usize],
-    gdn_dst: Option<&super::gdn_blob::GdnDestinations>,
+    gdn: Option<&super::gdn_blob::GdnStateBlobs>,
 ) -> Result<(super::mtp_decode::MtpVerifyOutput, Vec<MxArray>)> {
     debug_assert_eq!(layers.len(), caches.len());
     debug_assert_eq!(layers.len(), layer_kinds.len());
@@ -2009,7 +2010,15 @@ fn paged_verify_core(
         .iter()
         .filter(|kind| matches!(kind, Qwen3_5LayerKind::Linear))
         .count();
-    let gdn_dst = gdn_dst.filter(|dst| dst.state.len() == n_linear && dst.conv.len() == n_linear);
+    if let Some(gdn) = gdn {
+        let dst = gdn.destinations();
+        if dst.state.len() != n_linear || dst.conv.len() != n_linear {
+            return Err(Error::from_reason(format!(
+                "DFlash2 paged verify: {} GDN cells for {n_linear} linear layers",
+                dst.state.len()
+            )));
+        }
+    }
     let chunk_first_position = paged_adapter.current_token_count();
     paged_adapter
         .record_tokens(verify_ids)
@@ -2039,15 +2048,18 @@ fn paged_verify_core(
             &mut *ptr
         };
         let mut slot: Option<super::gated_delta_net::GdnLayerTape> = None;
-        hidden_states = match (kind, gdn_dst) {
-            (Qwen3_5LayerKind::Linear, Some(dst)) => {
-                // Slots 2/3 are the spare cell's rows: the window-final
-                // state lands there, so the live and spare cells are the
-                // lane's two (Splash `QwenStateStorage::swapDecodeParity`).
+        hidden_states = match (kind, gdn) {
+            (Qwen3_5LayerKind::Linear, Some(gdn)) => {
+                // Slots 2/3 are the other cell's rows, 4..9 the pending
+                // tape and keep (Splash `GdnTapeLane`): the layer folds the
+                // pending rows into the other cell and runs its window from
+                // there, so the live and other cells are the lane's two
+                // (Splash `QwenStateStorage::swapDecodeParity`).
                 let live = cache_slot.as_arrays_cache_mut().ok_or_else(|| {
                     Error::from_reason("DFlash2 paged verify: linear layer has no GDN slot")
                 })?;
-                let mut detached = super::arrays_cache::ArraysCache::new(4);
+                let dst = gdn.destinations();
+                let mut detached = super::arrays_cache::ArraysCache::new(10);
                 if let Some(conv) = live.get(0) {
                     detached.set(0, conv.clone())?;
                 }
@@ -2056,6 +2068,9 @@ fn paged_verify_core(
                 }
                 detached.set(2, dst.state[linear_ordinal].clone())?;
                 detached.set(3, dst.conv[linear_ordinal].clone())?;
+                for (slot, array) in gdn.pending(linear_ordinal)?.into_iter().enumerate() {
+                    detached.set(4 + slot, array.clone())?;
+                }
                 linear_ordinal += 1;
                 let mut detached = Qwen3_5LayerCache::Linear(detached);
                 let hidden = layer.forward_paged_or_flat_with_tape(
@@ -2075,13 +2090,6 @@ fn paged_verify_core(
                     if let Some(array) = written.get(index) {
                         live.set(index, array.clone())?;
                     }
-                }
-                // The window-final state the commit may adopt (it checks the
-                // array is the spare row itself).
-                if let Some(tape) = slot.as_mut()
-                    && tape.final_state.is_none()
-                {
-                    tape.final_state = written.get(1).cloned();
                 }
                 hidden
             }

@@ -5,7 +5,6 @@ use napi::bindgen_prelude::*;
 use crate::array::{DType, MxArray};
 use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput};
 
-use super::layer_cache::{Qwen3_5LayerSnapshot, replay_mtp_snapshot_to, snapshot_all_mtp};
 use super::model::Qwen35MoeInner;
 use crate::models::qwen3_5::dflash2::DFlash2ContextCache;
 use crate::models::qwen3_5::dflash2_decode::{DraftedProposals, PagedVerifyLane, full_verify_ids};
@@ -17,21 +16,15 @@ pub(crate) struct Qwen35MoeDFlash2Stepper<'a> {
     context: DFlash2ContextCache,
     next_position: i32,
     tap_layers: Vec<usize>,
-    snapshot: Option<Vec<Qwen3_5LayerSnapshot>>,
     tape: Option<Vec<Option<super::gated_delta_net::GdnLayerTape>>>,
     tapped: Option<Vec<MxArray>>,
     verified_ids: Option<Vec<u32>>,
-    /// Packed recurrent and convolution state for one fused accepted-prefix commit.
-    gdn_blobs: Option<GdnStateBlobs>,
+    /// The lane's two GDN cells and pending tape: each verify folds the
+    /// last commit's retained rows, each commit swaps parity.
+    gdn_blobs: GdnStateBlobs,
     verify_confidence: Option<MxArray>,
     verify_row_budget: Option<MxArray>,
     paged: PagedVerifyLane,
-}
-
-fn dflash2_gdn_blob_enabled() -> bool {
-    std::env::var("MLX_DFLASH2_GDN_BLOB")
-        .ok()
-        .is_none_or(|v| v.trim() != "0")
 }
 
 // FC+merged-KV costs cross over between retained heights 6 and 7.
@@ -41,11 +34,7 @@ fn prefer_full_width_context(keep: usize) -> bool {
 
 impl Qwen35MoeDFlash2Stepper<'_> {
     fn ensure_clean(&self, operation: &str) -> Result<()> {
-        if self.snapshot.is_some()
-            || self.tape.is_some()
-            || self.tapped.is_some()
-            || self.verified_ids.is_some()
-        {
+        if self.tape.is_some() || self.tapped.is_some() || self.verified_ids.is_some() {
             return Err(Error::from_reason(format!(
                 "Qwen3.5 MoE DFlash2 {operation}: prior verify was not committed"
             )));
@@ -118,10 +107,6 @@ impl Qwen35MoeDFlash2Stepper<'_> {
                 .map(|_| ())
                 .map_err(Error::from_reason)
         })?;
-        let snapshot =
-            snapshot_all_mtp(self.inner.caches.as_ref().ok_or_else(|| {
-                Error::from_reason("Qwen3.5 MoE DFlash2 target caches are absent")
-            })?)?;
         let ticket =
             crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq, full.len())
                 .map_err(Error::from_reason)?;
@@ -144,7 +129,7 @@ impl Qwen35MoeDFlash2Stepper<'_> {
                         rope_deltas,
                         super::paged_forward::PagedVerifyExtras {
                             tap_layers: &self.tap_layers,
-                            gdn_dst: self.gdn_blobs.as_ref().map(GdnStateBlobs::destinations),
+                            gdn: Some(&self.gdn_blobs),
                             row_budget: self.verify_row_budget.as_ref(),
                         },
                         window,
@@ -164,7 +149,6 @@ impl Qwen35MoeDFlash2Stepper<'_> {
             }
         };
         self.paged.open_cycle = Some(ticket);
-        self.snapshot = Some(snapshot);
         self.tape = Some(tape);
         self.tapped = Some(taps);
         self.verified_ids = Some(ids.to_vec());
@@ -359,9 +343,6 @@ impl DsparkStepper for Qwen35MoeDFlash2Stepper<'_> {
                 "Qwen3.5 MoE DFlash2 invalid commit keep={keep}, total={total_written}"
             )));
         }
-        let snapshot = self.snapshot.take().ok_or_else(|| {
-            Error::from_reason("Qwen3.5 MoE DFlash2 commit has no target snapshot")
-        })?;
         let tape = self
             .tape
             .take()
@@ -380,63 +361,7 @@ impl DsparkStepper for Qwen35MoeDFlash2Stepper<'_> {
             )));
         }
         self.commit_paged_cycle(keep)?;
-        // The verify writes 8 rows; only keeping all of them is the
-        // window-final state its spare cell holds.
-        let written = crate::models::qwen3_5::dflash2::DFLASH2_VERIFY_ROWS;
-        let caches =
-            self.inner.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("Qwen3.5 MoE DFlash2 target caches are absent")
-            })?;
-        // Packed path. Full accept (every verified row kept; the bonus token
-        // is not in the state yet): the verify already wrote each layer's
-        // window-final state into the spare blob rows, and with the f32
-        // carry that equals replaying the whole window
-        // (`gated_delta::tests::ar_chain_matches_windowed_kernel_f32`), so
-        // adopting is a parity swap. Otherwise every linear layer's replay
-        // (plus its conv rebuild) runs in one fused primitive from the
-        // pre-verify blobs. The full-attention offsets rewind as before. A
-        // declined kernel drops back to the per-layer replay for the rest of
-        // the turn.
-        let next_blobs = match &self.gdn_blobs {
-            Some(blobs) => {
-                let adopted = if keep == written {
-                    blobs.adopt(&tape)?
-                } else {
-                    None
-                };
-                #[cfg(test)]
-                if adopted.is_some() {
-                    crate::models::qwen3_5::dflash2_decode::PAGED_ADOPTS
-                        .with(|count| count.set(count.get() + 1));
-                }
-                match adopted {
-                    Some(next) => Some(next),
-                    None => blobs.commit(&tape, keep)?,
-                }
-            }
-            None => None,
-        };
-        match next_blobs {
-            Some(next) => {
-                next.apply_views(caches)?;
-                self.gdn_blobs = Some(next);
-            }
-            None => {
-                if self.gdn_blobs.take().is_some() {
-                    tracing::debug!(
-                        keep,
-                        "Qwen3.5 MoE DFlash2 fused GDN commit declined; per-layer replay for the rest of the turn"
-                    );
-                }
-                replay_mtp_snapshot_to(
-                    caches,
-                    &snapshot,
-                    &tape,
-                    keep,
-                    "Qwen3.5 MoE DFlash2 commit",
-                )?;
-            }
-        }
+        self.gdn_blobs.retain(&tape, keep)?;
         self.append_tapped(&tapped, &verified_ids[..keep])
     }
 
@@ -470,6 +395,11 @@ impl DsparkStepper for Qwen35MoeDFlash2Stepper<'_> {
 
     fn finish(mut self) -> Result<()> {
         self.ensure_clean("finish")?;
+        let caches =
+            self.inner.caches.as_mut().ok_or_else(|| {
+                Error::from_reason("Qwen3.5 MoE DFlash2 target caches are absent")
+            })?;
+        self.gdn_blobs.settle(caches)?;
         let config = self
             .inner
             .dflash2
@@ -519,22 +449,19 @@ impl DsparkBackend for Qwen35MoeInner {
             .config
             .target_layers
             .clone();
-        // Pack the prefill's per-layer GDN states once per turn (two concats);
-        // every cycle's commit then rewrites the blobs in one fused primitive
-        // and re-points the per-layer slots at them.
-        let gdn_blobs = match &mut self.caches {
-            Some(caches) if dflash2_gdn_blob_enabled() => {
-                let blobs = GdnStateBlobs::pack(caches)?;
-                match &blobs {
-                    Some(blobs) => blobs.apply_views(caches)?,
-                    None => tracing::debug!(
-                        "Qwen3.5 MoE DFlash2: GDN state not packable; per-layer commit path"
-                    ),
-                }
-                blobs
-            }
-            _ => None,
-        };
+        // Pack the prefill's per-layer GDN states once per turn (two concats)
+        // into the lane's current cell; nothing is pending after a prefill.
+        let tiled = self.config.qwen35_gguf_gdn_layout.as_deref() == Some("tiled");
+        let caches = self
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Qwen3.5 MoE DFlash2 target caches are absent"))?;
+        let gdn_blobs = GdnStateBlobs::pack(caches, tiled)?.ok_or_else(|| {
+            Error::from_reason(
+                "Qwen3.5 MoE DFlash2 needs packed GDN state (bf16 conv, f32 recurrent)",
+            )
+        })?;
+        gdn_blobs.apply_views(caches)?;
         let seq = self
             .paged_adapter
             .as_ref()
@@ -564,7 +491,6 @@ impl DsparkBackend for Qwen35MoeInner {
             context: state.context,
             next_position: state.next_position,
             tap_layers,
-            snapshot: None,
             tape: None,
             tapped: None,
             verified_ids: None,
@@ -958,7 +884,7 @@ mod paged_dflash2_tests {
     use crate::engine::dspark_turn::PagedDsparkBackend;
     use crate::models::quantized_linear::LinearProj;
     use crate::models::qwen3_5::dflash2::DFLASH2_DRAFT_PROPOSALS;
-    use crate::models::qwen3_5::dflash2_decode::PAGED_ADOPTS;
+    use crate::models::qwen3_5::gdn_blob::trace::{GdnTrace, cells};
     use crate::nn::Linear;
     use crate::stream::{Stream, StreamContext};
     use rand::SeedableRng;
@@ -1123,9 +1049,18 @@ mod paged_dflash2_tests {
         prompt: &[u32],
         reference: &[u32],
         correct: usize,
-    ) -> Result<(Vec<u32>, u32, usize)> {
-        PAGED_ADOPTS.with(|count| count.set(0));
+    ) -> Result<(Vec<u32>, u32, Vec<u64>, u64, GdnTrace)> {
         let n = reference.len();
+        let linear = inner
+            .layer_kinds
+            .iter()
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind::Linear
+                )
+            })
+            .count() as u64;
         let prefix = inner.prime_dspark_prefix_state(prompt, true, 0)?;
         let suffix = prompt[prefix.effective_cached_prefix_len()..].to_vec();
         let logits =
@@ -1134,6 +1069,8 @@ mod paged_dflash2_tests {
         let params = greedy();
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         let mut step = inner.begin_dspark_decode(DFLASH2_DRAFT_PROPOSALS)?;
+        let mut gdn = GdnTrace::begin(&step.gdn_blobs, step.inner.caches.as_ref().expect("caches"));
+        let mut deferred = Vec::new();
         while generated.len() < n {
             let anchor = *generated.last().expect("one token");
             let at = generated.len();
@@ -1150,31 +1087,41 @@ mod paged_dflash2_tests {
                     (reference_id + 1) % VOCAB
                 });
             }
-            let rows = argmax_rows(&step.verify(&ids)?.logits)?;
+            unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+            let rows = step.verify(&ids).and_then(|out| argmax_rows(&out.logits));
+            deferred.push(unsafe {
+                mlx_sys::mlx_test_kquant_family_count(c"gdn_fused_deferred".as_ptr())
+            });
+            unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+            let rows = rows?;
             assert_eq!(rows.len(), ids.len(), "the driver sees 1 + L logits rows");
             let mut accepted = 0;
             while accepted < l_cap && rows[accepted] == ids[accepted + 1] {
                 accepted += 1;
             }
+            let tape = step.tape.clone().expect("verify tape");
             step.commit_with_provenance(accepted + 1, ids.len(), &ids)?;
+            gdn.cycles.push((tape, accepted + 1));
             generated.extend_from_slice(&ids[1..=accepted]);
             generated.push(rows[accepted]);
         }
+        gdn.before_finish(&step.gdn_blobs, step.inner.caches.as_ref().expect("caches"));
         step.finish()?;
-        Ok((
-            generated,
-            cursor(inner),
-            PAGED_ADOPTS.with(std::cell::Cell::get),
-        ))
+        gdn.after = cells(inner.caches.as_ref().expect("caches"), &gdn.layers);
+        Ok((generated, cursor(inner), deferred, linear, gdn))
     }
 
     /// MoE speculation on the int8 pool, every keep: paged DFlash2 lands on
-    /// the AR cursor, and a full accept adopts the spare GDN cell. Its tokens
-    /// are not compared with paged AR: the verify reads through the in-place
-    /// prefill attention, the AR decode through the decode kernel. Mutation
-    /// MM1 (the commit keeps all 8 rows) turns it red.
+    /// the AR cursor, every cycle launches one deferred GDN kernel per linear
+    /// layer, and the cells after `finish` equal every cycle's kept rows
+    /// replayed from the packed start and the deferred kernel's fold of the
+    /// last pending rows. Its tokens are not compared with paged AR: the
+    /// verify reads through the in-place prefill attention, the AR decode
+    /// through the decode kernel. Mutation MV1 (the verify core passes no
+    /// pending tape) turns it red.
     #[test]
     fn paged_moe_dflash2_lands_on_the_ar_cursor_for_every_keep() -> Result<()> {
+        use crate::models::qwen3_5::gdn_blob::trace::{assert_cells, kernel_fold, replay_chain};
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let prompt = prompt(40);
@@ -1183,17 +1130,21 @@ mod paged_dflash2_tests {
         let (reference, ar_cursor) = paged_ar(&mut ar_inner, &prompt, n)?;
         for correct in 0..=DFLASH2_DRAFT_PROPOSALS {
             let mut inner = tiny_paged_int8_moe_dflash_inner(0x5_8101);
-            let (tokens, end, adopts) = paged_dflash2(&mut inner, &prompt, &reference, correct)?;
+            let (tokens, end, deferred, linear, gdn) =
+                paged_dflash2(&mut inner, &prompt, &reference, correct)?;
             assert!(tokens.len() >= n, "{correct}: {} tokens", tokens.len());
             assert_eq!(
                 end, ar_cursor,
                 "paged MoE DFlash2 with {correct} correct proposals left the AR cursor"
             );
-            if correct == DFLASH2_DRAFT_PROPOSALS {
-                assert!(
-                    adopts > 0,
-                    "a full accept must adopt the spare GDN cell the verify wrote"
-                );
+            assert!(
+                deferred.iter().all(|&launches| launches == linear),
+                "{correct}: deferred launches per cycle {deferred:?} for {linear} linear layers"
+            );
+            let tag = format!("MoE correct={correct}");
+            assert_cells(&gdn.after, &replay_chain(&gdn), &tag);
+            if correct == 3 {
+                assert_cells(&gdn.after, &kernel_fold(&gdn), &tag);
             }
         }
         Ok(())

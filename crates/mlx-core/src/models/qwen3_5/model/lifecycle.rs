@@ -347,9 +347,25 @@ impl Qwen35Inner {
         }
     }
 
-    /// A DFlash2 companion verifies on the block-paged pool; a load that
-    /// builds none refuses it (Splash has no flat lane).
+    /// A DFlash2 companion verifies on the block-paged pool with the fused
+    /// GDN kernel; a load that builds no pool, or whose GDN layers that kernel
+    /// cannot run, refuses it (Splash has no flat lane, and `compiledGdn`
+    /// fails closed).
     pub(crate) fn require_dflash2_pool(&self) -> Result<()> {
+        if self.dflash2.is_some() {
+            for (index, layer) in self.layers.iter().enumerate() {
+                if let crate::models::qwen3_5::decoder_layer::AttentionType::Linear(gdn) =
+                    &layer.attn
+                    && let Some(needs) = gdn.deferred_verify_refusal()
+                {
+                    return Err(Error::from_reason(format!(
+                        "Qwen3.8 DFlash2 verifies with the fused GDN kernel, which needs {needs}; \
+                         GDN layer {index} has not; load without the companion \
+                         (autoLoadDraft: false)"
+                    )));
+                }
+            }
+        }
         if self.dflash2.is_some() && self.paged_adapter.is_none() {
             return Err(Error::from_reason(
                 "Qwen3.8 DFlash2 runs on the block-paged KV pool, which this load has none \

@@ -9,7 +9,6 @@ use crate::engine::memory_plan::EXTENT_TARGET_BYTES;
 use super::dflash2::DFlash2ContextCache;
 use super::dflash2_turn::{DFlash2Target, DFlash2TurnState};
 use super::gdn_blob::GdnStateBlobs;
-use super::layer_cache::{Qwen3_5LayerSnapshot, replay_mtp_snapshot_to, snapshot_all_mtp};
 use super::model::{PREFILL_STEP_SIZE, Qwen35Inner};
 
 pub(crate) struct Qwen35DFlash2Stepper<'a> {
@@ -17,14 +16,12 @@ pub(crate) struct Qwen35DFlash2Stepper<'a> {
     context: DFlash2ContextCache,
     next_position: i32,
     tap_layers: Vec<usize>,
-    snapshot: Option<Vec<Qwen3_5LayerSnapshot>>,
     tape: Option<Vec<Option<super::gated_delta_net::GdnLayerTape>>>,
     tapped: Option<Vec<MxArray>>,
     verified_ids: Option<Vec<u32>>,
-    /// Packed GDN state of every linear layer (the per-layer cache slots are
-    /// views of it) — the pre-verify state the fused commit replays from.
-    /// `None` keeps the per-layer replay path.
-    gdn_blobs: Option<GdnStateBlobs>,
+    /// The lane's two GDN cells and pending tape: each verify folds the
+    /// last commit's retained rows, each commit swaps parity.
+    gdn_blobs: GdnStateBlobs,
     paged: PagedVerifyLane,
 }
 
@@ -55,12 +52,6 @@ impl DraftedProposals {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Paged commits that adopted the verify's spare GDN cell.
-    pub(crate) static PAGED_ADOPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
 /// The 8 verify ids: `ids` (anchor + the driver's proposals) then the rest of
 /// the cycle's draft.
 pub(crate) fn full_verify_ids(ids: &[u32], drafted: &[u32]) -> Result<Vec<u32>> {
@@ -77,13 +68,6 @@ pub(crate) fn full_verify_ids(ids: &[u32], drafted: &[u32]) -> Result<Vec<u32>> 
     let mut full = ids.to_vec();
     full.extend_from_slice(&drafted[proposals..DFLASH2_VERIFY_ROWS - 1]);
     Ok(full)
-}
-
-/// Packed GDN state is on unless `MLX_DFLASH2_GDN_BLOB=0` (A/B switch).
-fn dflash2_gdn_blob_enabled() -> bool {
-    std::env::var("MLX_DFLASH2_GDN_BLOB")
-        .ok()
-        .is_none_or(|value| value.trim() != "0")
 }
 
 /// Blocks one growth adds to a runway paged pool: the whole blocks nearest
@@ -219,8 +203,9 @@ fn prefill_chunk_scratch_bytes(config: &super::config::Qwen3_5Config, window: u6
 /// workspace bound, or one decode step. With a DFlash2 draft (`draft_taps`
 /// tapped layers) the prefill also holds the chunk's taps, and the decode
 /// step is the 8-row verify on the pool with the free pool its decode cache
-/// limit keeps and the prefill-sized workspace the adapter holds (Splash
-/// prices the one 8-row verify graph).
+/// limit keeps, the prefill-sized workspace the adapter holds and the
+/// pending GDN tape the next verify folds (Splash prices the one 8-row
+/// verify graph and `DecodeTensor::GdnTape`).
 pub(crate) fn pool_lane_transient(
     config: &super::config::Qwen3_5Config,
     draft_taps: Option<usize>,
@@ -246,14 +231,39 @@ pub(crate) fn pool_lane_transient(
             // arena's `PrefillTensor::AttentionPartials` beside the decode
             // arena's). It is live, not cache: outside `decode_cache_limit`.
             let held = pool_held_workspace_bytes(config);
+            let pending = gdn_pending_tape_bytes(config);
             prefill.saturating_add(tapped).max(
                 cycle
                     .saturating_add(held)
+                    .saturating_add(pending)
                     .saturating_add(crate::cache_limit::decode_cache_limit(cycle)),
             )
         }
         None => prefill.max(dflash2_cycle_transient(config, 0, window).total()),
     }
+}
+
+/// The pending GDN tape a DFlash2 lane holds between cycles: per linear
+/// layer, 8 rows of raw conv inputs, k and v (bf16), decay (f32) and beta
+/// (bf16) (Splash `gdn_tape_layer_bytes`). The verify's own tape is in the
+/// cycle term; this is the other slot of Splash's two.
+pub(crate) fn gdn_pending_tape_bytes(config: &super::config::Qwen3_5Config) -> u64 {
+    let dim = |v: i32| v.max(0) as u64;
+    let keys = dim(config.linear_num_key_heads).saturating_mul(dim(config.linear_key_head_dim));
+    let values =
+        dim(config.linear_num_value_heads).saturating_mul(dim(config.linear_value_head_dim));
+    let conv_dim = keys.saturating_mul(2).saturating_add(values);
+    let row = conv_dim
+        .saturating_add(keys)
+        .saturating_add(values)
+        .saturating_mul(2)
+        .saturating_add(dim(config.linear_num_value_heads).saturating_mul(6));
+    let linear = (0..dim(config.num_layers) as usize)
+        .filter(|&index| config.is_linear_layer(index))
+        .count() as u64;
+    linear
+        .saturating_mul(super::dflash2::DFLASH2_VERIFY_ROWS as u64)
+        .saturating_mul(row)
 }
 
 /// Bytes the prefill workspace bound holds past the verify bound.
@@ -308,11 +318,7 @@ const SDPA_KEYS_PER_PARTITION: u64 = 64;
 
 impl Qwen35DFlash2Stepper<'_> {
     fn ensure_clean(&self, operation: &str) -> Result<()> {
-        if self.snapshot.is_some()
-            || self.tape.is_some()
-            || self.tapped.is_some()
-            || self.verified_ids.is_some()
-        {
+        if self.tape.is_some() || self.tapped.is_some() || self.verified_ids.is_some() {
             return Err(Error::from_reason(format!(
                 "Qwen3.8 DFlash2 {operation}: prior verify was not committed"
             )));
@@ -373,12 +379,6 @@ impl Qwen35DFlash2Stepper<'_> {
                 .map(|_| ())
                 .map_err(Error::from_reason)
         })?;
-        let snapshot = snapshot_all_mtp(
-            self.inner
-                .caches
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?,
-        )?;
         let ticket =
             crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq, full.len())
                 .map_err(Error::from_reason)?;
@@ -402,7 +402,7 @@ impl Qwen35DFlash2Stepper<'_> {
                         &mut tape,
                         rope_deltas,
                         &self.tap_layers,
-                        self.gdn_blobs.as_ref().map(GdnStateBlobs::destinations),
+                        &self.gdn_blobs,
                         window,
                     )
                 }
@@ -420,7 +420,6 @@ impl Qwen35DFlash2Stepper<'_> {
             }
         };
         self.paged.open_cycle = Some(ticket);
-        self.snapshot = Some(snapshot);
         self.tape = Some(tape);
         self.tapped = Some(taps);
         self.verified_ids = Some(ids.to_vec());
@@ -551,10 +550,6 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
                 "Qwen3.8 DFlash2 invalid commit keep={keep}, total={total_written}"
             )));
         }
-        let snapshot = self
-            .snapshot
-            .take()
-            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 commit has no target snapshot"))?;
         let tape = self
             .tape
             .take()
@@ -574,57 +569,7 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             )));
         }
         self.commit_paged_cycle(keep)?;
-        // The verify writes 8 rows; only keeping all of them is the
-        // window-final state its spare cell holds.
-        let written = super::dflash2::DFLASH2_VERIFY_ROWS;
-        let caches = self
-            .inner
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
-        // Packed path. Full accept (every verified row kept; the bonus token
-        // is not in the state yet): the verify already wrote each layer's
-        // window-final state into the spare blob rows, and with the f32
-        // carry that equals replaying the whole window
-        // (`gated_delta::tests::ar_chain_matches_windowed_kernel_f32`), so
-        // adopting is a parity swap. Otherwise every linear layer's replay
-        // (plus its conv rebuild) runs in one fused primitive from the
-        // pre-verify blobs. The full-attention offsets rewind as before. A
-        // declined kernel drops back to the per-layer replay for the rest of
-        // the turn.
-        let next_blobs = match &self.gdn_blobs {
-            Some(blobs) => {
-                let adopted = if keep == written {
-                    blobs.adopt(&tape)?
-                } else {
-                    None
-                };
-                #[cfg(test)]
-                if adopted.is_some() {
-                    PAGED_ADOPTS.with(|count| count.set(count.get() + 1));
-                }
-                match adopted {
-                    Some(next) => Some(next),
-                    None => blobs.commit(&tape, keep)?,
-                }
-            }
-            None => None,
-        };
-        match next_blobs {
-            Some(next) => {
-                next.apply_views(caches)?;
-                self.gdn_blobs = Some(next);
-            }
-            None => {
-                if self.gdn_blobs.take().is_some() {
-                    tracing::debug!(
-                        keep,
-                        "Qwen3.8 DFlash2 fused GDN commit declined; per-layer replay for the rest of the turn"
-                    );
-                }
-                replay_mtp_snapshot_to(caches, &snapshot, &tape, keep, "Qwen3.8 DFlash2 commit")?;
-            }
-        }
+        self.gdn_blobs.retain(&tape, keep)?;
         self.append_tapped(&tapped, &verified_ids[..keep])
     }
 
@@ -658,6 +603,12 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
 
     fn finish(mut self) -> Result<()> {
         self.ensure_clean("finish")?;
+        let caches = self
+            .inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
+        self.gdn_blobs.settle(caches)?;
         let config = self
             .inner
             .dflash2
@@ -707,22 +658,17 @@ impl DsparkBackend for Qwen35Inner {
             .config
             .target_layers
             .clone();
-        // Pack the prefill's per-layer GDN states once per turn (two concats);
-        // every cycle's commit then rewrites the blobs in one fused primitive
-        // and re-points the per-layer slots at them.
-        let gdn_blobs = match &mut self.caches {
-            Some(caches) if dflash2_gdn_blob_enabled() => {
-                let blobs = GdnStateBlobs::pack(caches)?;
-                match &blobs {
-                    Some(blobs) => blobs.apply_views(caches)?,
-                    None => tracing::debug!(
-                        "Qwen3.8 DFlash2: GDN state not packable; per-layer commit path"
-                    ),
-                }
-                blobs
-            }
-            _ => None,
-        };
+        // Pack the prefill's per-layer GDN states once per turn (two concats)
+        // into the lane's current cell; nothing is pending after a prefill.
+        let tiled = self.config.qwen35_gguf_gdn_layout.as_deref() == Some("tiled");
+        let caches = self
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?;
+        let gdn_blobs = GdnStateBlobs::pack(caches, tiled)?.ok_or_else(|| {
+            Error::from_reason("Qwen3.8 DFlash2 needs packed GDN state (bf16 conv, f32 recurrent)")
+        })?;
+        gdn_blobs.apply_views(caches)?;
         let seq = self
             .paged_adapter
             .as_ref()
@@ -750,7 +696,6 @@ impl DsparkBackend for Qwen35Inner {
             context: state.context,
             next_position: state.next_position,
             tap_layers,
-            snapshot: None,
             tape: None,
             tapped: None,
             verified_ids: None,
@@ -1281,20 +1226,39 @@ mod paged_dflash2_tests {
 
     const VOCAB: u32 = 16;
 
+    /// GDN head order of the fixture: Hk = Hv = 2, or Hk 2 / Hv 4 grouped
+    /// (MLX safetensors) or tiled (GGUF rows).
+    #[derive(Clone, Copy, Debug)]
+    enum Heads {
+        Same,
+        Grouped,
+        Tiled,
+    }
+
     /// The seeded paged fixture on an int8 pool, a sensitive random head and
     /// a draft that proposes the 7 tokens a cycle drafts.
     fn tiny_paged_int8_dflash_inner(seed: u64) -> Qwen35Inner {
+        tiny_paged_int8_dflash_inner_heads(seed, Heads::Same)
+    }
+
+    fn tiny_paged_int8_dflash_inner_heads(seed: u64, heads: Heads) -> Qwen35Inner {
         let mut inner =
             super::super::model::scheduled_mtp::seeded_inner_with_config(seed, |config| {
                 config.head_dim = 256;
                 config.hidden_size = 256;
                 config.kv_format = Some("int8".to_string());
-                // The 27B's GDN head geometry, so the verify takes the complete
-                // kernel that writes the spare cell.
+                // The 27B's GDN head width, so the verify takes the deferred
+                // complete kernel.
                 config.linear_key_head_dim = 128;
                 config.linear_value_head_dim = 128;
                 config.linear_num_key_heads = 2;
-                config.linear_num_value_heads = 2;
+                config.linear_num_value_heads = match heads {
+                    Heads::Same => 2,
+                    Heads::Grouped | Heads::Tiled => 4,
+                };
+                if matches!(heads, Heads::Tiled) {
+                    config.qwen35_gguf_gdn_layout = Some("tiled".to_string());
+                }
             });
         let mut head =
             Linear::new(inner.config.hidden_size as u32, VOCAB, Some(false)).expect("tiny head");
@@ -1382,9 +1346,12 @@ mod paged_dflash2_tests {
     struct Run {
         tokens: Vec<u32>,
         cursor: u32,
-        adopts: usize,
         cached: usize,
         logits: Vec<Vec<u32>>,
+        /// Deferred GDN launches per cycle, and the linear layer count.
+        deferred: Vec<u64>,
+        linear: u64,
+        gdn: crate::models::qwen3_5::gdn_blob::trace::GdnTrace,
     }
 
     fn bits(array: &MxArray) -> Result<Vec<u32>> {
@@ -1405,8 +1372,13 @@ mod paged_dflash2_tests {
         reference: &[u32],
         correct: usize,
     ) -> Result<Run> {
-        PAGED_ADOPTS.with(|count| count.set(0));
+        use crate::models::qwen3_5::gdn_blob::trace::{GdnTrace, cells};
         let n = reference.len();
+        let linear = inner
+            .layer_kinds
+            .iter()
+            .filter(|kind| matches!(kind, super::super::decoder_layer::Qwen3_5LayerKind::Linear))
+            .count() as u64;
         let prefix = inner.prime_dspark_prefix_state(prompt, true, 0)?;
         let cached = prefix.effective_cached_prefix_len();
         let suffix = prompt[cached..].to_vec();
@@ -1420,6 +1392,8 @@ mod paged_dflash2_tests {
         });
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         let mut step = inner.begin_dspark_decode(DFLASH2_DRAFT_PROPOSALS)?;
+        let mut gdn = GdnTrace::begin(&step.gdn_blobs, step.inner.caches.as_ref().expect("caches"));
+        let mut deferred = Vec::new();
         while generated.len() < n {
             let anchor = *generated.last().expect("one token");
             let at = generated.len();
@@ -1436,61 +1410,167 @@ mod paged_dflash2_tests {
                     (reference_id + 1) % VOCAB
                 });
             }
-            let verified = step.verify(&ids)?.logits;
-            all_logits.push(bits(&verified)?);
+            unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+            let verified = step.verify(&ids).and_then(|out| {
+                let row_bits = bits(&out.logits)?;
+                Ok((out.logits, row_bits))
+            });
+            deferred.push(unsafe {
+                mlx_sys::mlx_test_kquant_family_count(c"gdn_fused_deferred".as_ptr())
+            });
+            unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+            let (verified, row_bits) = verified?;
+            all_logits.push(row_bits);
             let rows = argmax_rows(&verified)?;
             assert_eq!(rows.len(), ids.len(), "the driver sees 1 + L logits rows");
             let mut accepted = 0;
             while accepted < l_cap && rows[accepted] == ids[accepted + 1] {
                 accepted += 1;
             }
+            let tape = step.tape.clone().expect("verify tape");
             step.commit_with_provenance(accepted + 1, ids.len(), &ids)?;
+            gdn.cycles.push((tape, accepted + 1));
             generated.extend_from_slice(&ids[1..=accepted]);
             generated.push(rows[accepted]);
         }
+        gdn.before_finish(&step.gdn_blobs, step.inner.caches.as_ref().expect("caches"));
         step.finish()?;
+        gdn.after = cells(inner.caches.as_ref().expect("caches"), &gdn.layers);
         Ok(Run {
             tokens: generated,
             cursor: cursor(inner),
-            adopts: PAGED_ADOPTS.with(std::cell::Cell::get),
             cached,
             logits: all_logits,
+            deferred,
+            linear,
+            gdn,
         })
     }
 
-    /// Lossless speculation on the int8 pool, every keep: paged DFlash2 emits
-    /// the paged AR tokens and lands on the AR cursor, and a full accept
-    /// adopts the spare GDN cell. Mutations: M1 (the commit keeps all 8
-    /// rows), M2 (the 8-row chunk skips the pool store) and A1 (the verify
-    /// writes no spare cell) turn it red.
+    /// Speculation on the int8 pool, every keep and head order: paged
+    /// DFlash2 lands on the AR cursor, every cycle launches one deferred GDN
+    /// kernel per linear layer, the cells after `finish` equal every cycle's
+    /// kept rows replayed from the packed start, and with Hk = Hv the tokens
+    /// are the paged AR tokens. The Hv 4 fixtures leave AR within 64 tokens
+    /// on rounding alone (8-row verify projections and attention vs 1-row
+    /// AR kernels; grouped heads also decode AR through the MLX conv chain,
+    /// whose q/k norm and decay round up to one step away from the verify
+    /// kernel's), so only their cursor and cells are compared.
+    /// Mutation K1 (the retained count is 8 whatever the keep) turns it red.
     #[test]
     fn paged_dflash2_matches_paged_ar_for_every_keep() -> Result<()> {
+        use crate::models::qwen3_5::gdn_blob::trace::{assert_cells, replay_chain};
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let prompt = prompt(40);
         let n = 64;
-        let mut ar_inner = tiny_paged_int8_dflash_inner(0x5_8001);
-        let (reference, ar_cursor) = paged_ar(&mut ar_inner, &prompt, n)?;
-        for correct in 0..=DFLASH2_DRAFT_PROPOSALS {
-            let mut inner = tiny_paged_int8_dflash_inner(0x5_8001);
-            let run = paged_dflash2(&mut inner, &prompt, &reference, correct)?;
-            assert_eq!(
-                run.tokens[..n],
-                reference[..],
-                "paged DFlash2 with {correct} correct proposals per cycle left the AR tokens"
-            );
-            assert_eq!(
-                run.cursor, ar_cursor,
-                "paged DFlash2 with {correct} correct proposals left the AR cursor"
-            );
-            if correct == DFLASH2_DRAFT_PROPOSALS {
+        for heads in [Heads::Same, Heads::Grouped, Heads::Tiled] {
+            let mut ar_inner = tiny_paged_int8_dflash_inner_heads(0x5_8001, heads);
+            let (reference, ar_cursor) = paged_ar(&mut ar_inner, &prompt, n)?;
+            for correct in 0..=DFLASH2_DRAFT_PROPOSALS {
+                let tag = format!("{heads:?} with {correct} correct proposals per cycle");
+                let mut inner = tiny_paged_int8_dflash_inner_heads(0x5_8001, heads);
+                let run = paged_dflash2(&mut inner, &prompt, &reference, correct)?;
                 assert!(
-                    run.adopts > 0,
-                    "a full accept must adopt the spare GDN cell the verify wrote"
+                    run.deferred.iter().all(|&launches| launches == run.linear),
+                    "{tag}: deferred launches per cycle {:?} for {} linear layers",
+                    run.deferred,
+                    run.linear
                 );
+                assert_cells(&run.gdn.after, &replay_chain(&run.gdn), &tag);
+                assert_eq!(run.cursor, ar_cursor, "{tag}: cursor");
+                if matches!(heads, Heads::Same) {
+                    assert_eq!(run.tokens[..n], reference[..], "{tag}: tokens");
+                }
             }
         }
         Ok(())
+    }
+
+    /// `finish` folds the last cycle's retained rows once: the cells after it
+    /// equal the deferred kernel's fold of the pending tape (Splash's fold
+    /// itself, into throwaway cells) and differ from the cells before it.
+    /// `second_dflash2_turn_resumes_the_live_window` covers the resumed turn.
+    /// Mutation U1 (`finish` skips the settle) turns it red.
+    #[test]
+    fn finish_settles_the_pending_rows() -> Result<()> {
+        use crate::models::qwen3_5::gdn_blob::trace::{assert_cells, kernel_fold};
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let prompt = prompt(40);
+        let n = 20;
+        for heads in [Heads::Same, Heads::Grouped, Heads::Tiled] {
+            let mut ar_inner = tiny_paged_int8_dflash_inner_heads(0x5_8011, heads);
+            let (reference, _) = paged_ar(&mut ar_inner, &prompt, n)?;
+            for correct in [0, 3, 7] {
+                let tag = format!("{heads:?} correct={correct}");
+                let mut inner = tiny_paged_int8_dflash_inner_heads(0x5_8011, heads);
+                let run = paged_dflash2(&mut inner, &prompt, &reference, correct)?;
+                assert_cells(&run.gdn.after, &kernel_fold(&run.gdn), &tag);
+            }
+        }
+        Ok(())
+    }
+
+    /// The pending GDN tape is priced beside the verify (Splash
+    /// `DecodeTensor::GdnTape`): 297,216 B per linear layer on the 27B
+    /// (`gdn_tape_layer_bytes`), 48 layers. Mutation X1 (the term left out
+    /// of the lane) turns it red.
+    #[test]
+    fn pool_lane_charges_the_pending_gdn_tape() {
+        let cfg = super::super::dflash2_decode::tests::qwen38_27b_cfg();
+        assert_eq!(gdn_pending_tape_bytes(&cfg), 48 * 297_216);
+        assert_eq!(gdn_pending_tape_bytes(&cfg), 14_266_368);
+        for window in [256u32, 2048, 65_536] {
+            let w = u64::from(window);
+            let chunk = w.min(PREFILL_STEP_SIZE as u64);
+            let prefill = prefill_chunk_scratch_bytes(&cfg, w)
+                + pool_attention_bytes(&cfg, chunk, mlx_paged_attn::prefill_plan::Pass::Prefill)
+                + chunk * 3 * 5120 * 2;
+            let cycle = pool_verify_cycle_bytes(&cfg, w);
+            let decode = cycle
+                + pool_held_workspace_bytes(&cfg)
+                + 14_266_368
+                + crate::cache_limit::decode_cache_limit(cycle);
+            if window == 256 {
+                assert!(decode > prefill, "the decode arm prices a short lane");
+            }
+            assert_eq!(
+                pool_lane_transient(&cfg, Some(3), window),
+                decode.max(prefill),
+                "window {window}"
+            );
+        }
+    }
+
+    /// Splash `compiledGdn` fails closed at plan time: a draft on a target
+    /// whose GDN the deferred complete kernel cannot run (here: an f16
+    /// gated-norm weight, i.e. f16 activations) is refused at load, not
+    /// after a turn's prefill. Mutation L2 (no GDN check) turns it red.
+    #[test]
+    fn dflash2_companion_needs_a_fused_gdn_target() {
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8013);
+        inner
+            .require_dflash2_pool()
+            .expect("the fixture's GDN runs the deferred kernel");
+        let layer = inner
+            .layers
+            .iter_mut()
+            .find_map(|layer| match &mut layer.attn {
+                super::super::decoder_layer::AttentionType::Linear(gdn) => Some(gdn),
+                _ => None,
+            })
+            .expect("a linear layer");
+        let w = layer.get_norm_weight().astype(DType::Float16).expect("f16");
+        layer.set_norm_weight(&w, DType::Float16).expect("f16 norm");
+        let refused = inner
+            .require_dflash2_pool()
+            .expect_err("an f16 GDN target refuses the draft");
+        assert!(
+            refused.reason.contains("bf16 activations"),
+            "{}",
+            refused.reason
+        );
     }
 
     /// A 3-proposal cycle runs the 8-row graph and commits 3; an `l_cap == 0`
@@ -1642,6 +1722,8 @@ mod paged_dflash2_tests {
         let verify = |inner: &mut Qwen35Inner, ids: &[u32], window: u32| -> Result<()> {
             let embed = inner.embedding.clone();
             let caches = inner.caches.as_mut().expect("caches");
+            let blobs = GdnStateBlobs::pack(caches, false)?.expect("packable GDN state");
+            blobs.apply_views(caches)?;
             let adapter = inner.paged_adapter.as_mut().expect("pool");
             let mut tape = Vec::new();
             run_paged_dflash2_verify_step(
@@ -1656,7 +1738,7 @@ mod paged_dflash2_tests {
                 &mut tape,
                 0,
                 &taps,
-                None,
+                &blobs,
                 window,
             )
             .map(|(logits, _)| logits.eval())

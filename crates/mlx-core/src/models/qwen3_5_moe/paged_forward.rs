@@ -1211,12 +1211,13 @@ pub(crate) fn run_paged_verify_step(
     .map(|(output, _)| output)
 }
 
-/// What the DFlash2 verify adds to the MTP one: the tapped layers, the spare
-/// GDN cell and the MoE row budget.
+/// What the DFlash2 verify adds to the MTP one: the tapped layers, the
+/// lane's GDN cells and pending tape (the fold, see
+/// [`crate::models::qwen3_5::gdn_blob`]) and the MoE row budget.
 #[derive(Default)]
 pub(crate) struct PagedVerifyExtras<'a> {
     pub tap_layers: &'a [usize],
-    pub gdn_dst: Option<&'a crate::models::qwen3_5::gdn_blob::GdnDestinations>,
+    pub gdn: Option<&'a crate::models::qwen3_5::gdn_blob::GdnStateBlobs>,
     pub row_budget: Option<&'a MxArray>,
 }
 
@@ -1288,14 +1289,22 @@ fn paged_verify_core(
     }
     let PagedVerifyExtras {
         tap_layers,
-        gdn_dst,
+        gdn,
         row_budget,
     } = extras;
     let n_linear = layer_kinds
         .iter()
         .filter(|kind| matches!(kind, Qwen3_5LayerKind::Linear))
         .count();
-    let gdn_dst = gdn_dst.filter(|dst| dst.state.len() == n_linear && dst.conv.len() == n_linear);
+    if let Some(gdn) = gdn {
+        let dst = gdn.destinations();
+        if dst.state.len() != n_linear || dst.conv.len() != n_linear {
+            return Err(Error::from_reason(format!(
+                "MoE DFlash2 paged verify: {} GDN cells for {n_linear} linear layers",
+                dst.state.len()
+            )));
+        }
+    }
     let chunk_first_position = paged_adapter.current_token_count();
     paged_adapter
         .record_tokens(verify_ids)
@@ -1328,14 +1337,18 @@ fn paged_verify_core(
             &mut *ptr
         };
         let mut slot: Option<super::gated_delta_net::GdnLayerTape> = None;
-        hidden_states = match (kind, gdn_dst) {
-            (Qwen3_5LayerKind::Linear, Some(dst)) => {
-                // Slots 2/3 are the spare cell's rows: the window-final
-                // state lands there (Splash `QwenStateStorage::swapDecodeParity`).
+        hidden_states = match (kind, gdn) {
+            (Qwen3_5LayerKind::Linear, Some(gdn)) => {
+                // Slots 2/3 are the other cell's rows, 4..9 the pending
+                // tape and keep (Splash `GdnTapeLane`): the layer folds the
+                // pending rows into the other cell and runs its window from
+                // there, so the live and other cells are the lane's two
+                // (Splash `QwenStateStorage::swapDecodeParity`).
                 let live = cache_slot.as_arrays_cache_mut().ok_or_else(|| {
                     Error::from_reason("MoE DFlash2 paged verify: linear layer has no GDN slot")
                 })?;
-                let mut detached = crate::models::qwen3_5::arrays_cache::ArraysCache::new(4);
+                let dst = gdn.destinations();
+                let mut detached = crate::models::qwen3_5::arrays_cache::ArraysCache::new(10);
                 if let Some(conv) = live.get(0) {
                     detached.set(0, conv.clone())?;
                 }
@@ -1344,6 +1357,9 @@ fn paged_verify_core(
                 }
                 detached.set(2, dst.state[linear_ordinal].clone())?;
                 detached.set(3, dst.conv[linear_ordinal].clone())?;
+                for (slot, array) in gdn.pending(linear_ordinal)?.into_iter().enumerate() {
+                    detached.set(4 + slot, array.clone())?;
+                }
                 linear_ordinal += 1;
                 let mut detached = Qwen3_5LayerCache::Linear(detached);
                 let hidden = layer.forward_paged_or_flat_with_tape(
@@ -1364,13 +1380,6 @@ fn paged_verify_core(
                     if let Some(array) = written.get(index) {
                         live.set(index, array.clone())?;
                     }
-                }
-                // The window-final state the commit may adopt (it checks the
-                // array is the spare row itself).
-                if let Some(tape) = slot.as_mut()
-                    && tape.final_state.is_none()
-                {
-                    tape.final_state = written.get(1).cloned();
                 }
                 hidden
             }
