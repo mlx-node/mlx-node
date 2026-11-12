@@ -742,6 +742,21 @@ describe('buildMessageDelta', () => {
     expect(event.usage.server_paged_decode_cache_clear_interval).toBe(64);
   });
 
+  it('attaches the measured prefill window when one is given', () => {
+    const perf = { ttftMs: 600, prefillTokensPerSecond: 500, decodeTokensPerSecond: 40 };
+    const measured = buildMessageDelta('end_turn', 5, 300, 0, perf, undefined, null, {
+      prefillMs: 200,
+      prefillTokens: 300,
+    });
+    expect(measured.usage.prefill_ms).toBe(200);
+    expect(measured.usage.prefill_tokens).toBe(300);
+    expect(measured.usage.prefill_tokens_per_second).toBe(500);
+
+    const unmeasured = buildMessageDelta('end_turn', 5, 300, 0, perf);
+    expect(unmeasured.usage).not.toHaveProperty('prefill_ms');
+    expect(unmeasured.usage).not.toHaveProperty('prefill_tokens');
+  });
+
   it('elides perf fields when performance is undefined', () => {
     const event = buildMessageDelta('end_turn', 5, 11, 0, undefined);
 

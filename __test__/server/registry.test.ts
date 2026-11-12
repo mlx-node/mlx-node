@@ -34,6 +34,24 @@ function createMockSessionModel(): SessionCapableModel {
 }
 
 describe('ModelRegistry', () => {
+  it("keeps the first registration's identity across alias registrations", () => {
+    const registry = new ModelRegistry();
+    const model = createMockSessionModel();
+    const identity = { modelId: 'Qwen3.6-27B', modelType: 'qwen3_5', contextWindow: 262144 };
+    registry.register('Qwen3.6-27B', model, { identity });
+    registry.register('claude-haiku-4-5', model, {
+      identity: { modelId: 'claude-haiku-4-5', modelType: 'other', contextWindow: 1 },
+    });
+    registry.register('claude-sonnet-4-5', model);
+
+    expect(registry.getSessionRegistry('claude-haiku-4-5')!.identity).toEqual(identity);
+    const resident = registry.listResidentModels();
+    expect(resident).toHaveLength(1);
+    expect(resident[0]!.names).toEqual(['Qwen3.6-27B', 'claude-haiku-4-5', 'claude-sonnet-4-5']);
+    expect(resident[0]!.model).toBe(model);
+    expect(resident[0]!.sessions.identity).toEqual(identity);
+  });
+
   it('registers and retrieves a model', () => {
     const registry = new ModelRegistry();
     const mockModel = createMockSessionModel();
@@ -445,6 +463,91 @@ describe('ModelRegistry', () => {
       expect(registry.unregister('foo')).toBe(true);
       registry.register('foo', model);
       expect(registry.getInstanceId('foo')).not.toBe(originalId);
+    });
+  });
+
+  describe('binding release listener', () => {
+    function listened(): { registry: ModelRegistry; count: () => number } {
+      const registry = new ModelRegistry();
+      let calls = 0;
+      registry.setBindingReleaseListener(() => {
+        calls += 1;
+      });
+      return { registry, count: () => calls };
+    }
+
+    it('fires once when the last name of a model goes, and not for a request with no drop', async () => {
+      const { registry, count } = listened();
+      registry.register('a', createMockSessionModel());
+      const lease = registry.acquireDispatchLease('a')!;
+      registry.releaseDispatchLease(lease.model);
+      registry.unregister('a');
+      await vi.waitFor(() => expect(count()).toBe(1));
+      registry.register('b', createMockSessionModel());
+      const other = registry.acquireDispatchLease('b')!;
+      registry.releaseDispatchLease(other.model);
+      registry.unregister('missing');
+      registry.register('marker', createMockSessionModel());
+      registry.unregister('marker');
+      await vi.waitFor(() => expect(count()).toBe(2));
+      expect(registry.get('b')).toBeDefined();
+    });
+
+    it('waits for the alias that still holds the model, and fires when the alias moves to another model', async () => {
+      const { registry, count } = listened();
+      const old = createMockSessionModel();
+      registry.register('a', old);
+      registry.register('mlx-local', old);
+      const marker = createMockSessionModel();
+      registry.register('marker', marker);
+      registry.unregister('a');
+      registry.unregister('marker');
+      await vi.waitFor(() => expect(count()).toBe(1));
+      registry.register('mlx-local', createMockSessionModel());
+      await vi.waitFor(() => expect(count()).toBe(2));
+    });
+
+    it('waits for a dispatch lease and a persist retention on the dropped model', async () => {
+      const { registry, count } = listened();
+      const model = createMockSessionModel();
+      registry.register('a', model);
+      registry.register('marker', createMockSessionModel());
+      const lease = registry.acquireDispatchLease('a')!;
+      registry.retainBinding(model);
+      registry.unregister('a');
+      registry.unregister('marker');
+      await vi.waitFor(() => expect(count()).toBe(1));
+      registry.releaseDispatchLease(lease.model);
+      registry.register('marker', createMockSessionModel());
+      registry.unregister('marker');
+      await vi.waitFor(() => expect(count()).toBe(2));
+      registry.releaseBinding(model);
+      await vi.waitFor(() => expect(count()).toBe(3));
+    });
+
+    it('fires only after the cached sessions of the dropped model are released', async () => {
+      const { registry, count } = listened();
+      let finishRelease = (): void => {};
+      const releaseCacheOwner = vi.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            finishRelease = resolve;
+          }),
+      );
+      const model = Object.assign(createMockSessionModel(), { releaseCacheOwner });
+      registry.register('a', model);
+      const sessions = registry.getSessionRegistry('a')!;
+      const { session } = sessions.getOrCreate(null, null);
+      await session.send('warm owner');
+      sessions.adopt('warm-response', session, null);
+      registry.register('marker', createMockSessionModel());
+
+      registry.unregister('a');
+      await vi.waitFor(() => expect(releaseCacheOwner).toHaveBeenCalledTimes(1));
+      registry.unregister('marker');
+      await vi.waitFor(() => expect(count()).toBe(1));
+      finishRelease();
+      await vi.waitFor(() => expect(count()).toBe(2));
     });
   });
 });

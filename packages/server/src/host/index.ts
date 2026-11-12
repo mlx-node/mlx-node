@@ -27,7 +27,8 @@
  * The returned host owns, and disposes on {@link InferenceHost.close}:
  *   1. the HTTP server,
  *   2. the verbose request logger (when `logDir` is set),
- *   3. the `PagedConfigOverrideManager`'s temp root.
+ *   3. the `PagedConfigOverrideManager`'s temp root,
+ *   4. the runtime sampler (series + `live-<pid>.json` heartbeat).
  *
  * The server goes first because the logger records a request from that
  * request's own `finish`/`close` handler. Ending the log streams while a
@@ -57,15 +58,18 @@ import type { AudioModel } from '../audio-registry.js';
 import type { AudioServiceOptions } from '../audio-service.js';
 import type { ServerHealth } from '../health.js';
 import { resolveRerankLimits, type RerankServiceOptions } from '../rerank-service.js';
+import type { HostKind, RuntimeCapability } from '../runtime-trace.js';
 import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance } from '../server.js';
 import { discoverAudioModels, loadAudioModel, audioCapabilities, type DiscoveredAudioModel } from './audio-models.js';
 import { chatCapability, withCapabilityModels } from './capability-models.js';
 import { discoverModels, type DiscoveredModel } from './discover.js';
 import { applyEnginePolicy, type EnginePolicy } from './env-policy.js';
 import { attachLogger as defaultAttachLogger, type Logger } from './logger.js';
+import { createModelReleaser, type Collector } from './model-release.js';
 import { hostUrl, isLoopbackBindHost, normalizeLoopbackBindHost, pickFreePort } from './net.js';
 import { resolveModelsDir } from './paths.js';
 import { loadRerankModel, rerankCapability } from './rerank-models.js';
+import { startRuntimeSampler, type RuntimeSampler } from './runtime-sampler.js';
 import { makeSwapController } from './swap.js';
 import { hostTempDirPrefix, sweepOrphanHostTempRoots } from './temp-root.js';
 
@@ -122,6 +126,8 @@ export class InferenceHostClosedError extends Error {
 }
 
 export interface InferenceHostOptions {
+  /** Who runs this host; stamped on the runtime series. Default `'embedded'`. */
+  hostKind?: HostKind;
   modelResidency?: 'capability' | 'single';
   audio?: AudioServiceOptions;
   rerank?: RerankServiceOptions;
@@ -188,6 +194,8 @@ export interface InferenceHostOptions {
   loadModel?: (path: string, options?: LoadModelOptions) => Promise<LoadableModel>;
   /** Test seam: replaces the verbose request logger. */
   attachLogger?: (server: Server, logDir: string) => Logger;
+  /** Test seam: replaces the V8 collector that releases a dropped chat model; `null` = none. */
+  collectGarbage?: Collector | null;
 }
 
 export interface InferenceHost {
@@ -319,6 +327,13 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   // server needs the controller's callbacks at construction. Bridge via a
   // late-bound holder: the callbacks capture `ctrlRef.current` by closure.
   const ctrlRef: { current: ReturnType<typeof makeSwapController> | null } = { current: null };
+  const chatRef: { current: ReturnType<typeof makeSwapController> | null } = { current: null };
+  // Started once the port is known; loads before that are not timed.
+  const samplerRef: { current: RuntimeSampler | null } = { current: null };
+  const timedLoad = <T>(
+    info: { model: string; modelType: string; capability: RuntimeCapability },
+    load: () => Promise<T>,
+  ): Promise<T> => (samplerRef.current === null ? load() : samplerRef.current.timedLoad(info, load));
   let acceptingHttpModelLoads = true;
   const activeHttpModelLoads = new Set<Promise<void>>();
 
@@ -340,12 +355,20 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     host: bindHost,
     resolveModel: resolveHttpModel,
     listModels: () => ctrlRef.current!.listModels(),
+    unloadModels: async (): Promise<string[]> => {
+      const names = models.filter((m) => server.registry.getAny(m.name) !== undefined).map((m) => m.name);
+      await chatRef.current!.disposeAll!();
+      return names;
+    },
     ...(opts.authToken !== undefined ? { authToken: opts.authToken } : {}),
     ...(opts.storePath !== undefined ? { storePath: opts.storePath } : {}),
     ...(opts.disableStore !== undefined ? { disableStore: opts.disableStore } : {}),
     ...(opts.maxQueueDepthPerModel !== undefined ? { maxQueueDepthPerModel: opts.maxQueueDepthPerModel } : {}),
   };
   const server = await createServer(serverConfig);
+  const collectGarbage = opts.collectGarbage;
+  const releaser = createModelReleaser(collectGarbage === undefined ? {} : { resolve: () => collectGarbage });
+  server.registry.setBindingReleaseListener(() => releaser.released());
 
   // Wrap the loader so managed families get `use_block_paged_cache: true`
   // injected via a temp-dir clone with a patched config.json. The temp root is
@@ -368,23 +391,30 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     // those assets from stale/debris cleanup until process exit.
     const leasedDir = pagedConfigOverrides.claimPreparedLease(resolvedPath);
     try {
-      return draftModelPath === undefined
-        ? await loadModelFn(resolvedPath)
-        : await loadModelFn(resolvedPath, { draftModelPath });
+      return await timedLoad({ model: entry.name, modelType: String(entry.modelType), capability: 'chat' }, () =>
+        draftModelPath === undefined ? loadModelFn(resolvedPath) : loadModelFn(resolvedPath, { draftModelPath }),
+      );
     } catch (error) {
       if (leasedDir !== undefined) releaseNativeGgufLease(leasedDir);
       throw error;
     }
   };
   const chatController = makeSwapController(models, server.registry, loadModelPagedAware, boundEntry.name);
+  chatRef.current = chatController;
+  const audioLoader = opts.loadAudioModel ?? loadAudioModel;
+  const rerankLoader =
+    opts.loadRerankModel ??
+    ((entry: DiscoveredReranker) => loadRerankModel(entry, familyLoadOptions(opts.reranker, entry.modelType)));
   const controller = withCapabilityModels(
     [
       chatCapability(chatController, server.registry),
-      ...audioCapabilities(audioModels, server.registry, opts.loadAudioModel ?? loadAudioModel),
-      rerankCapability(
-        rerankModels,
-        server.registry,
-        opts.loadRerankModel ?? ((entry) => loadRerankModel(entry, familyLoadOptions(opts.reranker, entry.modelType))),
+      ...audioCapabilities(audioModels, server.registry, (entry) =>
+        timedLoad({ model: entry.name, modelType: entry.modelType, capability: 'audio' }, () => audioLoader(entry)),
+      ),
+      rerankCapability(rerankModels, server.registry, (entry) =>
+        timedLoad({ model: entry.name, modelType: String(entry.modelType), capability: 'rerank' }, () =>
+          rerankLoader(entry),
+        ),
       ),
     ],
     opts.modelResidency ?? 'capability',
@@ -444,6 +474,14 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   let closeStarted = false;
   const activeHostLoads = new Set<Promise<void>>();
   let closePromise: Promise<void> | null = null;
+
+  const sampler = startRuntimeSampler({
+    registry: server.registry,
+    health: () => server.health(),
+    models: models.map((m) => ({ name: m.name, modelType: String(m.modelType), contextWindow: m.contextWindow })),
+    host: { kind: opts.hostKind ?? 'embedded', port: boundPort },
+  });
+  samplerRef.current = sampler;
 
   return {
     url: hostUrl(host, boundPort),
@@ -532,6 +570,11 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
           } catch (error) {
             disposalError ??= error;
           }
+        }
+        try {
+          await sampler.stop();
+        } catch {
+          /* telemetry is best effort; never block shutdown */
         }
         // Only once nothing is still serving. The logger writes a request's
         // record from that request's `finish` handler, so ending the streams

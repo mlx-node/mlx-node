@@ -13915,3 +13915,32 @@ describe('createHandler', () => {
     });
   });
 });
+
+describe('POST /v1/responses trace metadata', () => {
+  it('stamps turnMeta on the dispatched config', async () => {
+    const registry = new ModelRegistry();
+    const mockModel = createMockModel();
+    const resolveModel = vi.fn(async (name: string) => {
+      if (!registry.get(name)) registry.register(name, mockModel);
+    });
+    const handler = createHandler(registry, { resolveModel });
+    const { res, getStatus, waitForEnd } = createMockRes();
+
+    await handler(createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'Hello' }), res);
+    await waitForEnd();
+
+    expect(getStatus()).toBe(200);
+    // oxlint-disable-next-line @typescript-eslint/unbound-method
+    const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    const [, config] = startSpy.mock.calls[0] as [unknown, { modelAlias?: string; turnMeta?: Record<string, unknown> }];
+    expect(config.modelAlias).toBe('test-model');
+    expect(config.turnMeta).toEqual({
+      endpoint: 'responses',
+      queueMs: expect.any(Number),
+      loadWaitMs: expect.any(Number),
+      resolveMs: expect.any(Number),
+      preDispatchMs: expect.any(Number),
+    });
+  });
+});

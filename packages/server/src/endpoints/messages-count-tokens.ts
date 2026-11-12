@@ -72,7 +72,9 @@ export async function handleCountMessageTokens(
     return;
   }
 
-  if (resolveModel) {
+  // The writer bracket waits for every running answer; a resident name must not take it, as in `/v1/messages`.
+  const residentRegistry = registry.getSessionRegistry(body.model);
+  if (resolveModel && !residentRegistry) {
     try {
       const runResolve = () =>
         idleSweeper ? idleSweeper.withSuspendedDrains(() => resolveModel(body.model)) : resolveModel(body.model);

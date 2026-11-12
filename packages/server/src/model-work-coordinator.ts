@@ -1,4 +1,5 @@
 import type { ModelLoadRecord } from './health.js';
+import { noteQueueRejection } from './queue-rejections.js';
 import type { PreDispatchAdmission } from './session-registry.js';
 
 /** Minimal admission surface shared by chat sessions and decision inference. */
@@ -146,6 +147,7 @@ export class ModelWorkCoordinator {
       if (!admission.released && admission.coldCounted) coldFootprint += 1;
     }
     if (limit !== undefined && coldFootprint >= limit + 1) {
+      noteQueueRejection('load');
       throw new ModelLoadQueueFullError(coldFootprint, limit);
     }
     if (!this.requestLoadAdmissionsByModel.has(modelId)) {
@@ -260,6 +262,11 @@ export class ModelWorkCoordinator {
   /** Read-only unresolved/pre-FIFO request footprint for diagnostics/tests. */
   get requestLoadAdmissionCount(): number {
     return this.requestLoadAdmissions;
+  }
+
+  /** Read-only: inference calls holding a shared reader slot. */
+  get readerCount(): number {
+    return this.activeReaders;
   }
 
   /** Read-only: `true` while a load holds the exclusive writer slot. */
@@ -377,9 +384,13 @@ export class ModelWorkCoordinator {
       this.activeReaders += 1;
       return Promise.resolve();
     }
-    return this.parkWaiter(this.readerWaiters, () => {
-      this.activeReaders += 1;
-    }, signal);
+    return this.parkWaiter(
+      this.readerWaiters,
+      () => {
+        this.activeReaders += 1;
+      },
+      signal,
+    );
   }
 
   private acquireWrite(signal?: AbortSignal): Promise<void> {

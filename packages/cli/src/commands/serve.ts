@@ -179,6 +179,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       // Same paged-prefill chunking `mlx launch claude` applies. A value
       // already in the environment wins; see `env-policy.ts`.
       enginePolicy: LAUNCHER_ENGINE_POLICY,
+      hostKind: 'serve',
       ...deps.hostOverrides,
     });
   } catch (err) {

@@ -25,7 +25,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
  * and the symptom — a slower start and more memory — is invisible in a test suite
  * that only checks behaviour.
  */
-const ADDON_FREE_SUBPATHS = ['host/env-policy.ts', 'host/paths.ts'];
+const ADDON_FREE_SUBPATHS = ['host/env-policy.ts', 'host/paths.ts', 'host/desktop-endpoint.ts'];
 
 /** Modules that pull in the native addon, directly or by re-export. */
 const FORBIDDEN = ['@mlx-node/lm', '@mlx-node/core', '@mlx-node/vlm', '@mlx-node/trl'];

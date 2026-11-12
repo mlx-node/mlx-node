@@ -1767,6 +1767,8 @@ export async function handleCreateResponse(
   // 400 cannot burn a 30 s load or evict the resident model. BEFORE
   // `registry.get` below, and therefore before the dispatch lease, which needs
   // a registered name.
+  let serverLoadWaitMs: number | undefined;
+  let serverModelResolveMs: number | undefined;
   if (resolveModel && !preDispatchRegistry) {
     // Errors serialize through the OpenAI envelope here. Letting them reach
     // the outer `createHandler` catch would be right for this endpoint by
@@ -1778,10 +1780,20 @@ export async function handleCreateResponse(
       // armed by the previous request fires mid-materialization. `messages.ts`
       // nests these the other way round, which is safe only because
       // `withSuspendedDrains` is a counter rather than a mutex.
-      const load = (): Promise<void> =>
-        modelWorkCoordinator
-          ? modelWorkCoordinator.withModelLoad(() => resolveModel(body.model), 'responses')
-          : resolveModel(body.model);
+      const load = async (): Promise<void> => {
+        if (modelWorkCoordinator) {
+          const outcome = await modelWorkCoordinator.withModelLoadInstrumented(
+            () => resolveModel(body.model),
+            'responses',
+          );
+          serverLoadWaitMs = outcome.waitMs;
+          serverModelResolveMs = outcome.ownMs;
+        } else {
+          const resolveStartedAt = Date.now();
+          await resolveModel(body.model);
+          serverModelResolveMs = Date.now() - resolveStartedAt;
+        }
+      };
       await (idleSweeper ? idleSweeper.withSuspendedDrains(load) : load());
     } catch (err) {
       preDispatchAdmission?.release();
@@ -2492,6 +2504,13 @@ export async function handleCreateResponse(
             server_queue_ms: Date.now() - mutexQueuedAt,
             server_pre_inference_ms: Date.now() - handlerStartedAt,
             ...resolveServerTuningForUsage(),
+          };
+          (config as TracedChatConfig).turnMeta = {
+            endpoint: 'responses',
+            queueMs: serverTiming.server_queue_ms,
+            loadWaitMs: serverLoadWaitMs,
+            resolveMs: serverModelResolveMs,
+            preDispatchMs: serverTiming.server_pre_inference_ms,
           };
 
           // Hot-swap race guard inside the mutex.

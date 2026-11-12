@@ -106,7 +106,7 @@ import {
 } from '../streaming.js';
 import { sanitizeJsonString, stringifyStrictJson } from '../strict-json.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
-import { resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
+import { resolveServerTuningForUsage, type MeasuredPrefill, type ServerTimingForUsage } from '../timing.js';
 import {
   createVisibility,
   endJson,
@@ -115,7 +115,7 @@ import {
   type TransportVisibility,
   writeFallbackErrorSSE,
 } from '../transport-visibility.js';
-import type { TracedChatConfig } from '../turn-trace.js';
+import { measuredPrefillOf, type TracedChatConfig } from '../turn-trace.js';
 import type { AnthropicMessagesRequest } from '../types-anthropic.js';
 
 /**
@@ -432,6 +432,7 @@ async function handleStreamingNativeWithAbort(
   // bridge omits the field) — the mapper elides the fields rather
   // than emitting zeros.
   let terminalPerformance: PerformanceMetrics | undefined;
+  let terminalPrefill: MeasuredPrefill | undefined;
   let terminalErrorMessage: string | null = null;
   const allowToolUse = requestAllowsToolUse(body);
   let suppressedToolCalls = false;
@@ -706,6 +707,12 @@ async function handleStreamingNativeWithAbort(
         terminalPromptTokens = event.promptTokens;
         terminalCachedTokens = event.cachedTokens;
         terminalPerformance = event.performance;
+        // Read before the `break`: the bridge clears the reader once the loop is left.
+        try {
+          terminalPrefill = measuredPrefillOf(progressRef?.read?.() ?? null);
+        } catch {
+          terminalPrefill = undefined;
+        }
         break;
       }
 
@@ -907,6 +914,7 @@ async function handleStreamingNativeWithAbort(
         terminalPerformance,
         serverTiming,
         matchedStopSequence,
+        terminalPrefill,
       ),
     );
     // HTTP/1.1 chunked-encoding trailer: report the engine's cache-hit
@@ -1446,6 +1454,13 @@ export async function handleCreateMessage(
             server_queue_ms: Date.now() - mutexQueuedAt,
             server_pre_inference_ms: Date.now() - handlerStartedAt,
             ...resolveServerTuningForUsage(),
+          };
+          (config as TracedChatConfig).turnMeta = {
+            endpoint: 'messages',
+            queueMs: serverTiming.server_queue_ms,
+            loadWaitMs: serverLoadWaitMs,
+            resolveMs: serverModelResolveMs,
+            preDispatchMs: serverTiming.server_pre_inference_ms,
           };
           // Hot-swap race guard. `ModelRegistry.register()` is not coordinated with
           // `withExclusive`, so a concurrent re-register of the same friendly name

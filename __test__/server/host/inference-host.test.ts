@@ -1,12 +1,12 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { LoadableModel, LoadModelOptions } from '@mlx-node/lm';
-import { afterEach, describe, expect, it } from 'vite-plus/test';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { discoverMlxModels } from '../../../packages/agent/src/models.js';
 import { handleCodingAgentModels } from '../../../packages/dashboard/src/api/handlers/models.js';
@@ -173,7 +173,7 @@ describe('createInferenceHost — discovery and model binding', () => {
     }
     const agentModels = await discoverMlxModels(modelsDir);
     expect(agentModels.map(({ discovered }) => discovered.name)).toEqual(names);
-    expect(await handleCodingAgentModels({ modelsDir, tracesDir: '', cacheRoot: '' })).toEqual({
+    expect(await handleCodingAgentModels({ modelsDir, tracesDir: '', runtimeDir: '', cacheRoot: '' })).toEqual({
       models: names.map((name) => ({ name })),
     });
 
@@ -467,6 +467,72 @@ describe('createInferenceHost — lazy load on the first request', () => {
 
     expect(res.status).not.toBe(404);
     expect(loads).toHaveLength(1);
+  });
+});
+
+describe('createInferenceHost — a dropped chat model is released', () => {
+  const TOKEN = 'per-launch-secret';
+
+  async function select(host: InferenceHost, model: string): Promise<void> {
+    const res = await fetch(`${host.url}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': TOKEN },
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: '.' }] }),
+    });
+    await res.text();
+  }
+
+  it('collects once per swap and per unload, never for a request with no drop; the next request loads again', async () => {
+    const loads: string[] = [];
+    let collections = 0;
+    const host = await start({
+      modelsDir: await makeModelsDir(['alpha', 'beta']),
+      authToken: TOKEN,
+      loadModel: async (path: string) => {
+        loads.push(path);
+        return fakeModel();
+      },
+      collectGarbage: () => {
+        collections += 1;
+      },
+    });
+
+    await select(host, 'beta');
+    await select(host, 'mlx-local');
+    await select(host, 'beta');
+    expect(host.health().models.resident).toEqual(['beta', 'mlx-local']);
+    await select(host, 'alpha');
+    await vi.waitFor(() => expect(collections).toBe(1));
+    expect(host.health().models.resident).toEqual(['mlx-local', 'alpha']);
+    await select(host, 'alpha');
+    await select(host, 'mlx-local');
+
+    expect((await fetch(`${host.url}/v1/models/unload`, { method: 'POST' })).status).toBe(401);
+    expect(
+      (await fetch(`${host.url}/v1/models/unload`, { method: 'GET', headers: { 'x-api-key': TOKEN } })).status,
+    ).toBe(405);
+    const res = await fetch(`${host.url}/v1/models/unload`, { method: 'POST', headers: { 'x-api-key': TOKEN } });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ unloaded: ['alpha'] });
+    expect(host.health().models.resident).toEqual([]);
+    await vi.waitFor(() => expect(collections).toBe(2));
+
+    await select(host, 'mlx-local');
+    expect(loads).toHaveLength(3);
+    expect(host.health().models.resident).toEqual(['alpha', 'mlx-local']);
+  });
+
+  it('a host with no collector still unloads', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const host = await start({ modelsDir: await makeModelsDir(['alpha']), authToken: TOKEN, collectGarbage: null });
+      await select(host, 'alpha');
+      const res = await fetch(`${host.url}/v1/models/unload`, { method: 'POST', headers: { 'x-api-key': TOKEN } });
+      expect(await res.json()).toEqual({ unloaded: ['alpha'] });
+      await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(1));
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
@@ -999,5 +1065,41 @@ describe('createInferenceHost — paged-override temp roots', () => {
     await start({ modelsDir, sweepOrphanTempRoots: false });
 
     expect(existsSync(orphan)).toBe(true);
+  });
+});
+
+describe('createInferenceHost — runtime sampler', () => {
+  it('stops the sampler on close and removes the live file', async () => {
+    const savedHome = process.env.HOME;
+    const savedMetrics = process.env.MLX_AGENT_METRICS;
+    const home = await mkdtemp(join(tmpdir(), 'mlx-host-home-'));
+    scratchDirs.push(home);
+    process.env.HOME = home;
+    delete process.env.MLX_AGENT_METRICS;
+    try {
+      const host = await start({ modelsDir: await makeModelsDir(['alpha']), hostKind: 'serve' });
+      await host.loadModel('alpha');
+      const runtimeDir = join(home, '.mlx-node', 'metrics', 'runtime');
+      const liveFile = join(runtimeDir, `live-${process.pid}.json`);
+      for (let i = 0; i < 200 && !existsSync(liveFile); i++) await new Promise((r) => setTimeout(r, 10));
+      expect(existsSync(liveFile)).toBe(true);
+
+      await host.close({ timeoutMs: 250 });
+      expect(existsSync(liveFile)).toBe(false);
+      const series = (await readdir(runtimeDir)).filter((name) => name.endsWith('.jsonl'));
+      expect(series).toHaveLength(1);
+      const records = (await readFile(join(runtimeDir, series[0]!), 'utf8'))
+        .split('\n')
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as { k: string; host?: string; port?: number; model?: string; ok?: boolean });
+      expect(records[0]).toMatchObject({ k: 'proc', host: 'serve', port: host.port });
+      expect(records.find((r) => r.k === 'load')).toMatchObject({ model: 'alpha', ok: true });
+      expect(records.at(-1)!.k).toBe('exit');
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedMetrics === undefined) delete process.env.MLX_AGENT_METRICS;
+      else process.env.MLX_AGENT_METRICS = savedMetrics;
+    }
   });
 });

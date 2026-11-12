@@ -50,7 +50,7 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 - Phase breakdown: `forward`, `sample`, `eval_token`, `extract`, `async_eval`
 - Memory snapshots before / after each generation
 
-> Note: MLX lazy evaluation means `prefillMs` measures only graph construction (~1 ms). Use `timeToFirstTokenMs` as the real prefill latency indicator.
+> Note: MLX lazy evaluation means the profiler's `prefillMs` measures only graph construction (~1 ms). TTFT is not the prefill time either: it also holds setup (prefix lookup, cache restore, allocation) and, on most paths, the first decode step. The prefill window is `ChatStreamProgress.prefillElapsedMs` (`begin_prefill` to the first token sampled); the server records it per streamed call as `prefillMs` in the trace (with `prefillTokens`) and as `usage.prefill_ms` on `/v1/messages`.
 
 ## Environment variables
 
@@ -60,6 +60,7 @@ The per-generation profiler (`crates/mlx-core/src/decode_profiler.rs`) records:
 | ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `MLX_PROFILE_DECODE=1`        | Auto-enables profiling at startup                                                                                                                                                                                                                                                                                                                                                                           |
 | `MLX_PROFILE_DECODE` + trace  | Per-cycle timeline; set it with `MLX_METAL_COMMAND_TRACE=1`. A DSpark/DFlash2 turn dumps `[dspark-span]` JSON lines at turn end: a span per phase per cycle (`dspark_cycle`, `_propose`, `_verify`, `_accept`, `_commit`, `_emit_loop`, `_cache_clear`, `_eval_boundary`) on the `[metal-command]` clock, and a `cycle` marker (`depth`, `keep`). See [tools](research/splash-qwen38.md#tools)              |
+| `MLX_AGENT_METRICS=0`         | Turns off both telemetry sinks of the inference process: per-turn trace records (`metrics/traces/`) and the runtime sampler (`metrics/runtime/` series + `live-<pid>.json` heartbeat). `0` / `false` / `off`. Default on. The one switch for a telemetry on/off A/B; see [What telemetry costs](#what-telemetry-costs)                                                                                      |
 | `MLX_NODE_LOG`                | Tracing-level filter                                                                                                                                                                                                                                                                                                                                                                                        |
 | `MLX_INFERENCE_TRACE_FILE`    | Path for inference trace dump                                                                                                                                                                                                                                                                                                                                                                               |
 | `MLX_DEBUG_GEMMA4_DUMP`       | Diagnostic dumps for Gemma4                                                                                                                                                                                                                                                                                                                                                                                 |
@@ -316,6 +317,37 @@ The follow-up turn was slower with 2 layers at every cache size: the read-ahead 
 never used. Calls of fewer than 256 rows now read nothing ahead (cold, one process, 2-layer bank, no read-ahead vs
 read-ahead: 64 rows 7.39, 7.46 vs 7.69, 7.70 s; 256 rows 14.58, 14.56 vs 13.68, 13.69 s; 1K 26.35 vs 17.73 s). With
 that floor the follow-up measured 7.22 s (2 layers, cache 0; no expert read ahead) and the 1K prompt 18.51 s.
+
+## What telemetry costs
+
+The inference process writes two telemetry sinks for the Control Panel ([dashboard.md](dashboard.md#data-sources)).
+Both are on by default and both stop with `MLX_AGENT_METRICS=0`. Sizes below were measured from the real writers with
+one paged model resident. The workload sets the rate and the size; nothing here is capped unless the text says so.
+
+| Path                        | Added work                                                                                                                                                                                                                                                   | How often                                                                                                                                     |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| Model thread, per token     | none                                                                                                                                                                                                                                                         | —                                                                                                                                             |
+| JS thread, per stream chunk | none                                                                                                                                                                                                                                                         | —                                                                                                                                             |
+| JS thread, per turn end     | one memory snapshot, one trace line with one `appendFileSync`: about 1.4 KB for an `ok` turn with cold-tier fields, shorter for a failed one                                                                                                                 | once per turn                                                                                                                                 |
+| Sampler tick                | JS property reads, one memory snapshot, one async heartbeat write (tmp + rename; skipped while the previous one is still writing); one async ~310 B `sample` append when 5 s busy or 60 s idle have passed, when busy flips or when the resident set changes | 1 Hz busy, 0.2 Hz idle; each turn start or end and each load start or end pulls the next tick to 250 ms, so many short turns reach about 4 Hz |
+| Model thread, sampler       | no command while the model has work; one `schedulerStats()` per model after it loads, then one after each busy burst once the model has been idle 500 ms; each writes a ~775 B `sched` record (none for a scheduler that has done no work)                   | per load, per burst                                                                                                                           |
+
+Heartbeat size: about 0.6 KB, plus about 330 B per turn in flight, plus one entry per resident model. The file lists at
+most 32 turns (about 11 KB with one model) and does not cap the models, so it passes 8 KB at about 24 turns in flight.
+The reader has no size limit.
+
+Disk: the runtime series grows with busy time, with the number of bursts and with loads. Steady state with long bursts
+is about 0.45 MB a day idle (one sample a minute), about 1.7 MB with 6 busy hours and about 5.4 MB busy around the
+clock. Each short turn adds up to two samples (busy on, busy off) and one `sched` record, about 1.4 KB, so a day of
+many short agent turns writes more. At 16 MiB a series file stops taking `sample`, `sched` and `proc` records, but
+`load` and `exit` records still append (each led by a `proc` header when the file has none from this process yet), so
+a file can end past 16 MiB. Trace files have no size cap: one line per turn. Series files are kept 14 days, trace
+files 30 days. The sink queue holds at most 256 records and never waits on a slow disk: when full it drops the oldest queued
+`sample`, or the oldest record of any kind when no sample is queued.
+
+`schedulerStats()` is a barrier on the model thread (no new turn is admitted until the running batch drains), so the
+sampler only calls it on an idle model, through `SessionRegistry.tryIdleProbe`
+([concurrent-inference.md](concurrent-inference.md#telemetry-and-the-stats-barrier)).
 
 ## MTP speculative decoding
 

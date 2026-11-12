@@ -6710,6 +6710,51 @@ describe('handleCreateMessage progress pings', () => {
     }
   });
 
+  it('puts the measured prefill window on the final message_delta usage', async () => {
+    vi.useFakeTimers();
+    try {
+      const mock = createSteppedStreamModel();
+      const { getBody, done } = await startStream(mock);
+      mock.snapshot.current = {
+        phase: 'done',
+        prefillTotal: 400,
+        prefillDone: 400,
+        cachedTokens: 0,
+        prefillElapsedMs: 250,
+        generatedTokens: 1,
+        decodeElapsedMs: 30,
+      };
+      mock.push({ event: PROGRESS_DONE_EVENT });
+      await vi.advanceTimersByTimeAsync(0);
+      await done;
+      const delta = parseSSE(getBody()).find((e) => e.event === 'message_delta');
+      expect(delta?.data['usage']).toMatchObject({ prefill_ms: 250, prefill_tokens: 400 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('leaves the prefill fields off a stream native did not measure', async () => {
+    vi.useFakeTimers();
+    try {
+      const mock = createSteppedStreamModel();
+      const { getBody, done } = await startStream(mock);
+      mock.snapshot.current = { phase: 'done', prefillElapsedMs: 250, decodeElapsedMs: 30 };
+      mock.push({ event: PROGRESS_DONE_EVENT });
+      await vi.advanceTimersByTimeAsync(0);
+      await done;
+      const usage = parseSSE(getBody()).find((e) => e.event === 'message_delta')?.data['usage'] as Record<
+        string,
+        unknown
+      >;
+      expect(usage).toBeDefined();
+      expect('prefill_ms' in usage).toBe(false);
+      expect('prefill_tokens' in usage).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('stops pinging once the client disconnects', async () => {
     vi.useFakeTimers();
     try {
@@ -6730,5 +6775,58 @@ describe('handleCreateMessage progress pings', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('handleCreateMessage trace metadata', () => {
+  it('a non-streamed response carries no prefill window', async () => {
+    const registry = new ModelRegistry();
+    registry.register('test-model', createMockModel());
+    const { res, getStatus, getBody } = createMockRes();
+    await handleCreateMessage(
+      res,
+      { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], max_tokens: 100 },
+      registry,
+    );
+    expect(getStatus()).toBe(200);
+    const usage = (JSON.parse(getBody()) as { usage: Record<string, unknown> }).usage;
+    expect('prefill_ms' in usage).toBe(false);
+    expect('prefill_tokens' in usage).toBe(false);
+  });
+
+  it('stamps turnMeta on the dispatched config', async () => {
+    const registry = new ModelRegistry();
+    const coordinator = new ModelWorkCoordinator();
+    const mockModel = createMockModel();
+    const resolveModel = vi.fn(async (name: string) => {
+      if (!registry.get(name)) registry.register(name, mockModel);
+    });
+    const { res, getStatus } = createMockRes();
+
+    await handleCreateMessage(
+      res,
+      { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], max_tokens: 100 },
+      registry,
+      undefined,
+      null,
+      resolveModel,
+      coordinator,
+    );
+
+    expect(getStatus()).toBe(200);
+    // oxlint-disable-next-line @typescript-eslint/unbound-method
+    const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    const [, config] = startSpy.mock.calls[0] as [unknown, { modelAlias?: string; turnMeta?: Record<string, unknown> }];
+    expect(config.modelAlias).toBe('test-model');
+    expect(config.turnMeta).toEqual({
+      endpoint: 'messages',
+      queueMs: expect.any(Number),
+      loadWaitMs: expect.any(Number),
+      resolveMs: expect.any(Number),
+      preDispatchMs: expect.any(Number),
+    });
+    const meta = config.turnMeta as { queueMs: number; preDispatchMs: number };
+    expect(meta.preDispatchMs).toBeGreaterThanOrEqual(meta.queueMs);
   });
 });

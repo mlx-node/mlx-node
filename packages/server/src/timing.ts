@@ -6,10 +6,16 @@ export interface PerformanceMetricsForUsage {
   decodeTokensPerSecond?: number;
 }
 
+/** A prefill window native measured: `begin_prefill` to the first token sampled. */
+export interface MeasuredPrefill {
+  prefillMs: number;
+  prefillTokens: number;
+}
+
 interface TimingUsageExtensions {
   /** Server-extension: native time-to-first-token in milliseconds. */
   time_to_first_token_ms?: number;
-  /** Server-extension: prompt-token throughput for the tokens actually prefetched this turn. */
+  /** Server-extension: prompt tokens ÷ time to first token; includes setup. Not a prefill speed: use `prefill_tokens` / `prefill_ms`. */
   prefill_tokens_per_second?: number;
   /** Server-extension: generated-token throughput during decode. */
   decode_tokens_per_second?: number;
@@ -19,7 +25,7 @@ interface TimingUsageExtensions {
   server_time_to_first_token_ms?: number;
   /** Server-extension: handler-start to first native token, including model resolve/load and queue wait. */
   server_total_time_to_first_token_ms?: number;
-  /** Server-extension alias for native prefill throughput. */
+  /** Server-extension alias: prompt tokens ÷ time to first token; includes setup. Not a prefill speed: use `prefill_tokens` / `prefill_ms`. */
   server_prefill_tokens_per_second?: number;
   /** Server-extension alias for native decode throughput. */
   server_decode_tokens_per_second?: number;
@@ -27,6 +33,10 @@ interface TimingUsageExtensions {
   prefill_input_tokens?: number;
   /** Server-extension: prompt tokens skipped because a cached prefix was reused. */
   cached_prefix_tokens?: number;
+  /** Server-extension: the prefill window of this call in ms, `begin_prefill` to the first token sampled. Streamed calls only. */
+  prefill_ms?: number;
+  /** Server-extension: tokens that prefill window processed; present with `prefill_ms`, never alone. */
+  prefill_tokens?: number;
   /**
    * Server-extension: time spent resolving/loading/aliasing the requested model
    * before registry lookup. Includes both the synchronous lookup AND any time
@@ -149,6 +159,7 @@ function buildTimingUsageExtensions(
   outputTokens: number | undefined,
   cachedTokens: number | undefined,
   serverTiming?: ServerTimingForUsage,
+  prefill?: MeasuredPrefill,
 ): TimingUsageExtensions {
   const ttftMs = finitePositive(performance?.ttftMs);
   const prefillTokensPerSecond = finitePositive(performance?.prefillTokensPerSecond);
@@ -186,6 +197,11 @@ function buildTimingUsageExtensions(
         extensions.cached_prefix_tokens = cachedPrefix;
       }
     }
+  }
+
+  if (prefill !== undefined) {
+    extensions.prefill_ms = prefill.prefillMs;
+    extensions.prefill_tokens = prefill.prefillTokens;
   }
 
   const modelResolveMs = finiteNonNegative(serverTiming?.server_model_resolve_ms);
@@ -231,6 +247,10 @@ export function mergeTimingUsageExtensions<T extends TimingUsageExtensions>(
   outputTokens: number | undefined,
   cachedTokens: number | undefined,
   serverTiming?: ServerTimingForUsage,
+  prefill?: MeasuredPrefill,
 ): void {
-  Object.assign(usage, buildTimingUsageExtensions(performance, promptTokens, outputTokens, cachedTokens, serverTiming));
+  Object.assign(
+    usage,
+    buildTimingUsageExtensions(performance, promptTokens, outputTokens, cachedTokens, serverTiming, prefill),
+  );
 }

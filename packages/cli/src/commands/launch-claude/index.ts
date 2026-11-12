@@ -162,6 +162,7 @@ export function launchClaudeHostOptions(flags: LaunchClaudeFlags): InferenceHost
     model: flags.model,
     logDir: flags.logDir,
     authToken: flags.authToken,
+    hostKind: 'launch',
     // Launcher policy, not an engine default: the shared native var still
     // reads 0 as "disable chunking", and a value already set in the user's
     // shell wins (see `applyEnginePolicy`).

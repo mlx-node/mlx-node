@@ -778,6 +778,8 @@ mlx serve --verbose                              # capture every HTTP turn to a 
 
 `GET /health` is unauthenticated and reports readiness (`ok` / `loading` / `degraded` / `error`), uptime, pid, resident models, and the last load's outcome — the same body `ServerInstance.health()` returns.
 
+`POST /v1/models/unload` removes the resident chat model and its alias names and answers `200 {"unloaded": ["<name>"]}` (an empty list when no chat model is in memory). Like every other route except `/health`, it needs the token only when the server has one (`--auth-token` or `MLX_SERVER_AUTH_TOKEN`); with no token it is open to every client that can reach the port. It does not wait: while a request holds a model for an answer, or a load or a queued load runs, it answers `409` (`conflict_error`). The next request loads the last selected model again. Audio and rerank models stay. When a swap or an unload drops a chat model and no request holds it, the host runs one V8 garbage collection, so the model memory is free in less than a second; the idle cache drain (`MLX_IDLE_CLEAR_CACHE_MS`, default 30 s) then gives the MLX cache back.
+
 Like `mlx launch claude`, it applies the launcher engine policy (`MLX_PAGED_PREFILL_CHUNK_SIZE=2048`) unless the variable is already set in the environment.
 
 ### Progress pings on `/v1/messages`
@@ -799,6 +801,15 @@ data: {"type":"ping","mlx_progress":{"phase":"prefill","elapsed_ms":20000,"prefi
 | `prefill_tokens_per_second` | Prefill rate over the last window                      |
 | `generated_tokens`          | Tokens generated so far (from `decode` on)             |
 | `decode_tokens_per_second`  | Decode rate over the last window                       |
+
+The final `message_delta` of a streamed `/v1/messages` call also carries the measured prefill window in `usage` when
+native measured one. `prefill_tokens_per_second` in the same `usage` is prompt tokens ÷ time to first token and
+includes setup, so it is not a prefill speed.
+
+| `usage` field    | Meaning                                                                         |
+| ---------------- | ------------------------------------------------------------------------------- |
+| `prefill_ms`     | The prefill window of this call: `begin_prefill` to the first token sampled, ms |
+| `prefill_tokens` | Tokens that window prefilled; present with `prefill_ms`, never alone            |
 
 ## `mlx launch claude`
 
@@ -989,3 +1000,9 @@ to an internal SSD: decode speed follows the read rate.
 desktop app, opened from the tray — it is served over `app://` and a MessagePort, so
 there is no port to bind and no unauthenticated HTTP surface to guard. See
 [docs/dashboard.md](dashboard.md).
+
+Its Chat page runs the same `mlx-agent` binary. Work mode runs it as `mlx agent` would, in a folder the user
+chooses, with the real `HOME` and `~/.mlx-agent`: its sessions appear in `mlx agent -r` and on the Sessions page,
+and a grant saved from a Work permission card (Always allow this command / tool) also applies to `mlx agent` in a
+terminal. Chat mode uses its own agent home (`~/.mlx-node/chat/chat-agent`) and has no shell. See
+[Chat and Work](dashboard.md#chat-and-work).

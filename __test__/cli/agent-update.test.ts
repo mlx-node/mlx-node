@@ -19,12 +19,20 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { PassThrough } from 'node:stream';
 
+import {
+  agentTagFromBinPath,
+  managedAgentBinPath,
+  probeAgentInstall,
+  MLX_AGENT_BIN_ENV,
+  MLX_AGENT_TAG_ENV,
+  MLX_AGENT_MIN_RELEASE,
+  type AgentInstallProbe,
+} from '@mlx-node/agent/binary';
 import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest';
 
 import {
   acquireInstallLock,
   lockDirPath,
-  agentTagFromBinPath,
   agentUpdateStatus,
   launchGrokAgent,
   leasePinnedManaged,
@@ -32,19 +40,13 @@ import {
   writeLeaseMarker,
   applyAgentUpdate,
   downloadAgentBinary,
-  managedAgentBinPath,
   markerProbePath,
   parseLockMarker,
-  probeAgentInstall,
   releaseInstallLock,
   removeIfUnchanged,
   resolveAgentBinary,
   scanMembers,
   resolveReleaseTag,
-  MLX_AGENT_BIN_ENV,
-  MLX_AGENT_TAG_ENV,
-  MLX_AGENT_MIN_RELEASE,
-  type AgentInstallProbe,
 } from '../../packages/cli/src/commands/agent/grok-build.js';
 import { run } from '../../packages/cli/src/commands/agent/index.js';
 import { parseServeArgs } from '../../packages/cli/src/commands/serve.js';
@@ -145,7 +147,13 @@ describe('probeAgentInstall', () => {
       writeFileSync(versioned(root, 'mlx-agent-v0.3.3'), 'v033');
       writeFileSync(versioned(root, 'mlx-agent-v0.4.0'), 'v040');
       writeFileSync(`${managedAgentBinPath(root)}.tag`, 'mlx-agent-v0.4.0');
-      const probe = probeAgentInstall(root, { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.3.3' }, root);
+      const probe = probeAgentInstall(
+        root,
+        { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.3.3' },
+        root,
+        undefined,
+        writeLeaseMarker,
+      );
       // The pin selects its exact release even though the pointer names a newer one.
       expect(probe).toMatchObject({
         source: 'managed',

@@ -46,6 +46,7 @@ import { DecisionRegistry } from './decision-registry.js';
 import type { ModelAdmissionLane } from './model-work-coordinator.js';
 import { RerankRegistry } from './rerank-registry.js';
 import { SessionRegistry } from './session-registry.js';
+import type { ModelIdentity } from './turn-trace.js';
 
 interface ModelLoadAdmissionCoordinator {
   bindRequestLoadAdmissions(modelId: string, registry: ModelAdmissionLane): void;
@@ -152,6 +153,19 @@ export interface RegisterOptions {
    * clamp pathological values before dispatch.
    */
   maxOutputTokens?: number;
+  /**
+   * Identity stamped on the traces of the binding this call creates. An
+   * existing binding keeps the identity it was created with: aliases
+   * register against the same model object, so the first registration wins.
+   */
+  identity?: ModelIdentity;
+}
+
+/** One resident model binding, for the runtime sampler. */
+export interface ResidentModel {
+  names: string[];
+  model: ServableModel;
+  sessions: SessionRegistry;
 }
 
 export class ModelRegistry {
@@ -221,6 +235,7 @@ export class ModelRegistry {
    */
   private readonly retiredInstanceIds = new WeakMap<ServableModel, { instanceId: number; outstandingCount: number }>();
   private modelLoadAdmissionCoordinator: ModelLoadAdmissionCoordinator | undefined;
+  private bindingReleaseListener: (() => void) | undefined;
 
   constructor(opts?: ModelRegistryOptions) {
     this.maxQueueDepth = opts?.maxQueueDepth;
@@ -260,6 +275,15 @@ export class ModelRegistry {
         coordinator.bindRequestLoadAdmissions(name, entry.sessionRegistry);
       }
     }
+  }
+
+  /**
+   * Called once per model binding that no name, dispatch lease or persist
+   * retention holds any more, after its cached sessions are released. From
+   * then on the registry holds no reference to that model object.
+   */
+  setBindingReleaseListener(listener: (() => void) | undefined): void {
+    this.bindingReleaseListener = listener;
   }
 
   /**
@@ -332,6 +356,7 @@ export class ModelRegistry {
           // Resolve the trace name per turn — requests stamp their own alias,
           // and the binding outlives `name` whenever aliases rebind it.
           modelName: () => this.bindingDisplayName(model) ?? name,
+          identity: opts?.identity,
         }),
         refCount: 0,
         inFlight: 0,
@@ -464,9 +489,12 @@ export class ModelRegistry {
     // flush while the registry is still in hand: the promise retains it until
     // every pending disposal has settled and every transient failure observed
     // during this flush has received its one bounded retry.
-    void binding.registry.flushPendingDisposals().catch((error: unknown) => {
-      console.error('[server] failed to flush final chat-session owner disposals:', error);
-    });
+    void binding.registry
+      .flushPendingDisposals()
+      .catch((error: unknown) => {
+        console.error('[server] failed to flush final chat-session owner disposals:', error);
+      })
+      .then(() => this.bindingReleaseListener?.());
     this.sessionRegistriesByModel.delete(model);
     this.instanceIds.delete(model);
   }
@@ -700,6 +728,26 @@ export class ModelRegistry {
     const out: SessionRegistry[] = [];
     for (const binding of this.sessionRegistriesByModel.values()) {
       out.push(binding.registry);
+    }
+    return out;
+  }
+
+  /** Read-only: dispatch leases held on chat bindings, including requests not yet inside an inference slot. */
+  get dispatchLeaseCount(): number {
+    let leases = 0;
+    for (const binding of this.sessionRegistriesByModel.values()) leases += binding.inFlight;
+    return leases;
+  }
+
+  /** One entry per binding, with every registered name that resolves to it. */
+  listResidentModels(): ResidentModel[] {
+    const out: ResidentModel[] = [];
+    for (const [model, binding] of this.sessionRegistriesByModel) {
+      const names: string[] = [];
+      for (const [name, entry] of this.models) {
+        if (entry.model === model) names.push(name);
+      }
+      out.push({ names, model, sessions: binding.registry });
     }
     return out;
   }

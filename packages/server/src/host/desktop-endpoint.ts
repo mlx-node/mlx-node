@@ -1,6 +1,6 @@
 /** Native-free discovery of the desktop's existing inference host. */
 import { randomUUID } from 'node:crypto';
-import { chmod, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 
 import { resolveMlxNodeHome } from './paths.js';
@@ -65,4 +65,31 @@ export async function publishDesktopEndpoint(
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   };
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * The published endpoint, or null unless the file is a regular file owned by this user with no group or other bits,
+ * holds a valid endpoint, and names a live process. Never throws.
+ */
+export async function readDesktopEndpoint(path = desktopEndpointPath()): Promise<DesktopEndpoint | null> {
+  try {
+    const info = await lstat(path);
+    if (!info.isFile() || (info.mode & 0o077) !== 0) return null;
+    if (typeof process.getuid === 'function' && info.uid !== process.getuid()) return null;
+    const value = JSON.parse(await readFile(path, 'utf8')) as DesktopEndpoint;
+    if (typeof value !== 'object' || value === null) return null;
+    validate(value);
+    return pidAlive(value.pid) ? value : null;
+  } catch {
+    return null;
+  }
 }

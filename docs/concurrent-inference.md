@@ -70,6 +70,16 @@ rebuilds only that sequence's slot; it never resets a peer. Batched admission
 uses fresh JS sessions while retaining the native refcounted prefix cache, so
 correctness is independent of the warm single-slot registry.
 
+## Telemetry and the stats barrier
+
+`schedulerStats()` is a scheduler barrier: while it is queued, the model thread admits no new turn until the running
+batch drains. The runtime sampler (`packages/server/src/host/runtime-sampler.ts`) therefore never calls it on a busy
+model. It asks only when `shouldSnapshotScheduler` holds (no active dispatch, no queue, no live turn, idle for at least
+500 ms) and goes through `SessionRegistry.tryIdleProbe`, which refuses while a lane holds work and makes a dispatch that
+arrives during the probe wait until the reply settles. Scheduler counters are cumulative, so two idle snapshots give the
+exact totals of the burst between them. Live concurrency (turns in flight, queued) comes from TS-side state, not from
+the scheduler. See [perf.md](perf.md#what-telemetry-costs).
+
 ## Scheduler knobs
 
 The stable capacity knobs are read once per process. The ragged executor switch
