@@ -4774,10 +4774,14 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         defer_wait(wait);
         if let Some(claim) = prepared.claim.as_ref() {
             let id = claim.id();
+            // `sync_claims` never visits a held start, so its host refusal
+            // is cleared here (Splash `Engine::deferWait` resets the
+            // allocation failure `Engine::syncClaims` reads).
             governor.ledger(|ledger| {
                 if ledger.claim(id).is_some_and(|state| state.waiting) {
                     ledger.set_waiting(id, false);
                 }
+                ledger.set_host_refused_waiting(id, false);
             });
         }
     }
@@ -5908,6 +5912,31 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
     }
 
+    /// Splash `Engine::admitQueued` over the held starts, in order. Each
+    /// start stays in `self.held` until it is tried: a start's GPU OOM
+    /// restarts the model, which must fail the starts not yet tried.
+    /// Whether one was refused.
+    fn retry_held(&mut self, mut wired: Option<&mut crate::stream::WiredUse>) -> bool {
+        let mut deferred = false;
+        for _ in 0..self.held.len() {
+            let Some(prepared) = self.held.pop_front() else {
+                break;
+            };
+            if deferred
+                || self.scheduler.waiting_len() + self.scheduler.running_len()
+                    >= self.scheduler.max_num_seqs()
+            {
+                self.held.push_back(prepared);
+                continue;
+            }
+            if let Some(wired) = wired.as_mut() {
+                wired.mark();
+            }
+            deferred = self.start_prepared(prepared);
+        }
+        deferred
+    }
+
     pub(crate) fn drive(
         &mut self,
         receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ModelCommand<B::FamilyCommand>>,
@@ -5964,19 +5993,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         // suspended lane's priority: a held start's earlier order would
         // otherwise pass the suspended lane in `admit_waiting`.
         if !deferred && !self.scheduler.has_pending_control() && !self.scheduler.has_preempted() {
-            for prepared in std::mem::take(&mut self.held) {
-                if deferred
-                    || self.scheduler.waiting_len() + self.scheduler.running_len()
-                        >= self.scheduler.max_num_seqs()
-                {
-                    self.held.push_back(prepared);
-                    continue;
-                }
-                if let Some(wired) = wired.as_mut() {
-                    wired.mark();
-                }
-                deferred = self.start_prepared(prepared);
-            }
+            deferred = self.retry_held(wired.as_mut());
         }
         if deferred
             && let Some(blocked_owner_id) = self
@@ -9354,6 +9371,41 @@ pub(crate) mod tests {
         assert_eq!(governor.metal_out_of_memory(7), 1);
     }
 
+    /// Splash's engine restart fails every queued start: a held start's
+    /// prefix preparation that MLX failed for Metal memory restarts the
+    /// model, and a later held start the retry has not tried yet fails
+    /// `metal_out_of_memory:` too, never admitted without its owner.
+    /// Mutation HR1 (the retry takes the held starts out first) → red (the
+    /// later start is admitted).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_restart_fails_the_held_starts_not_yet_tried() {
+        const OOM: &str = "[METAL] Command buffer execution failed: Insufficient Memory \
+                           (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory).";
+        let Some((mut state, _governor, mut replies)) = judged_state(&[1]) else {
+            return;
+        };
+        let mut prompt = tokens_of(40, 2);
+        prompt.push(3);
+        let (first, mut first_result) = prepared_turn(&mut state, 2, prompt);
+        let (second, mut second_result) = prepared_turn(&mut state, 3, tokens_of(3, 1));
+        state.held.push_back(first);
+        state.held.push_back(second);
+        state.prefix_failure = Some(OOM);
+        assert!(!state.retry_held(None));
+        assert!(state.prefix_failure.is_none(), "the first was prepared");
+        assert_metal_oom(&mut first_result, "the first held start");
+        assert_metal_oom(&mut second_result, "the second held start");
+        assert_metal_oom(&mut replies[0], "the resident lane");
+        assert!(state.held.is_empty());
+        assert!(state.prepared_waiting.is_none());
+        assert_eq!(
+            state.scheduler.running_len() + state.scheduler.waiting_len(),
+            0
+        );
+        assert!(!state.owner_sequences.contains_key("owner-3"));
+    }
+
     /// A step that tells the test it runs, then waits for its release.
     #[cfg(target_os = "macos")]
     struct HeldStep {
@@ -11027,6 +11079,47 @@ pub(crate) mod tests {
                 pending_since: Some(1.0),
                 ..ResourceWait::default()
             }
+        );
+    }
+
+    /// Splash `Engine::deferWait` resets a held start's allocation failure,
+    /// so `Engine::syncClaims` no longer counts it: a start the host refused
+    /// leaves the host deficit once held.
+    /// Mutation HD1: the held start keeps its host refusal → red (1 G).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_held_start_leaves_the_host_deficit() {
+        use crate::engine::governor::governor::tests::G;
+        let (mut state, governor) = state_prefilling(40_000);
+        let (mut prepared, _reply) = prepared_turn(&mut state, 2, vec![1; 50_000]);
+        let claim = governor.open(
+            crate::engine::governor::governor::whole_turn_spec(0),
+            state.inner.memory_model(),
+        );
+        let id = claim.id();
+        governor.ledger(|ledger| {
+            ledger.refused(
+                id,
+                crate::engine::governor::ledger::Need {
+                    bytes: G,
+                    host_refused: true,
+                    ..Default::default()
+                },
+            );
+            ledger.set_host_refused_waiting(id, true);
+        });
+        assert_eq!(
+            governor.ledger(|ledger| ledger.host_refused_waiting_bytes()),
+            G
+        );
+        prepared.claim = Some(claim);
+        let Err(prepared) = state.admit_prepared(prepared) else {
+            panic!("the start was tried");
+        };
+        assert!(prepared.held);
+        assert_eq!(
+            governor.ledger(|ledger| ledger.host_refused_waiting_bytes()),
+            0
         );
     }
 
