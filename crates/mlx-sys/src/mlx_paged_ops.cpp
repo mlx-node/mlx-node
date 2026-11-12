@@ -1959,6 +1959,286 @@ array paged_attention_varlen(
   return array(std::move(out_shape), out_dtype, primitive, std::move(inputs));
 }
 
+namespace {
+
+[[noreturn]] void prefill_reject(const char* op_name, const std::string& what) {
+  std::ostringstream msg;
+  msg << "[validator] [" << op_name << "] " << what;
+  throw std::invalid_argument(msg.str());
+}
+
+int paged_prefill_stride(int rows) {
+  return (rows + 31) / 32 * 32;
+}
+
+// Every structural check of `PagedPrefillAttention`; the factory and
+// eval_gpu both run it (a compile re-trace rebuilds the primitive without
+// the factory).
+void validate_paged_prefill_inputs(
+    const array& q_staged,
+    const array& k_pool,
+    const array& v_pool,
+    const array& k_scale,
+    const array& v_scale,
+    const array& block_table,
+    const array& workspace,
+    int committed_tokens,
+    int rows,
+    int splits,
+    int max_splits,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    KvDtype kv_dtype,
+    const char* op_name) {
+  namespace paged = mlx::core::fast::paged;
+  require_row_contiguous_zero_offset(q_staged, op_name, "q_staged");
+  require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
+  require_row_contiguous_zero_offset(v_pool, op_name, "v_pool");
+  require_row_contiguous_zero_offset(k_scale, op_name, "k_scale");
+  require_row_contiguous_zero_offset(v_scale, op_name, "v_scale");
+  require_row_contiguous_zero_offset(block_table, op_name, "block_table");
+  require_row_contiguous_zero_offset(workspace, op_name, "workspace");
+  if (kv_dtype != KvDtype::Bf16 && kv_dtype != KvDtype::Int8) {
+    prefill_reject(op_name, "kv_dtype must be bf16 or int8");
+  }
+  if (num_kv_heads <= 0 || num_q_heads <= 0 || num_q_heads % num_kv_heads != 0) {
+    prefill_reject(
+        op_name,
+        "query heads (" + std::to_string(num_q_heads) +
+            ") must be a positive multiple of KV heads (" +
+            std::to_string(num_kv_heads) + ")");
+  }
+  const int group = num_q_heads / num_kv_heads;
+  if (!paged::paged_prefill_attention_geometry(group, head_size)) {
+    prefill_reject(
+        op_name,
+        "no paged prefill attention kernel for group " + std::to_string(group) +
+            ", head_size " + std::to_string(head_size));
+  }
+  if (block_size != 16 && block_size != 32) {
+    prefill_reject(op_name, "block_size must be 16 or 32; got " + std::to_string(block_size));
+  }
+  if (max_splits != paged::kPagedPrefillMaxSplits &&
+      max_splits != paged::kPagedVerifyMaxSplits) {
+    prefill_reject(op_name, "max_splits must be 32 (prefill) or 128 (verify)");
+  }
+  const int max_rows = max_splits == paged::kPagedVerifyMaxSplits
+      ? paged::kPagedVerifyRows
+      : paged::kPagedPrefillMaxRows;
+  if (rows <= 0 || rows > max_rows) {
+    prefill_reject(
+        op_name,
+        "rows (" + std::to_string(rows) + ") must be in 1.." + std::to_string(max_rows));
+  }
+  if (splits <= 0 || splits > max_splits) {
+    prefill_reject(
+        op_name,
+        "splits (" + std::to_string(splits) + ") must be in 1.." +
+            std::to_string(max_splits));
+  }
+  if (committed_tokens < 0) {
+    prefill_reject(op_name, "committed_tokens must be >= 0");
+  }
+  const Shape staged{num_kv_heads, paged_prefill_stride(rows), group, head_size};
+  if (q_staged.dtype() != mlx::core::bfloat16 || q_staged.shape() != staged) {
+    prefill_reject(op_name, "q_staged must be bf16 [kv heads, stride, group, head_size]");
+  }
+  const int x = x_pack_for(kv_dtype);
+  const auto cache_dtype = cache_dtype_for_kv_dtype(kv_dtype);
+  if (k_pool.dtype() != cache_dtype || v_pool.dtype() != cache_dtype) {
+    prefill_reject(op_name, "k_pool / v_pool dtype must match kv_dtype");
+  }
+  if (k_pool.ndim() != 5 || v_pool.ndim() != 4) {
+    prefill_reject(op_name, "k_pool must be rank 5 and v_pool rank 4");
+  }
+  const int num_blocks = k_pool.shape(0);
+  if (k_pool.shape() != Shape{num_blocks, num_kv_heads, head_size / x, block_size, x} ||
+      v_pool.shape() != Shape{num_blocks, num_kv_heads, head_size, block_size}) {
+    prefill_reject(op_name, "pool planes do not match [blocks, kv heads, head_size, block_size]");
+  }
+  validate_kv_scales(
+      k_pool, k_scale, v_scale, num_kv_heads, block_size, head_size, kv_dtype, true, op_name);
+  if (block_table.dtype() != mlx::core::int32) {
+    prefill_reject(op_name, "block_table must be int32");
+  }
+  const int64_t needed =
+      (static_cast<int64_t>(committed_tokens) + rows + block_size - 1) / block_size;
+  if (static_cast<int64_t>(block_table.size()) < needed) {
+    prefill_reject(
+        op_name,
+        "block_table holds " + std::to_string(block_table.size()) + " entries; " +
+            std::to_string(needed) + " cover the history and the rows");
+  }
+  if (workspace.dtype() != mlx::core::float32 ||
+      static_cast<int64_t>(workspace.size()) <
+          paged::paged_prefill_workspace_floats(rows, splits, num_q_heads, head_size)) {
+    prefill_reject(op_name, "workspace must be float32 of at least the launch's partials");
+  }
+}
+
+} // namespace
+
+void PagedPrefillAttention::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  if (inputs.size() != 7 || outputs.size() != 2) {
+    throw std::runtime_error(
+        "PagedPrefillAttention: expected 7 inputs and 2 outputs");
+  }
+  const array& q_staged = inputs[0];
+  const array& k_pool = inputs[1];
+  const array& v_pool = inputs[2];
+  const array& k_scale = inputs[3];
+  const array& v_scale = inputs[4];
+  const array& block_table = inputs[5];
+  const array& workspace = inputs[6];
+  validate_paged_prefill_inputs(
+      q_staged, k_pool, v_pool, k_scale, v_scale, block_table, workspace,
+      committed_tokens_, rows_, splits_, max_splits_, block_size_, num_q_heads_,
+      num_kv_heads_, head_size_, kv_dtype_, "PagedPrefillAttention::eval_gpu");
+
+  // The kernel reads table entries [0, ceil((committed + rows) / block_size))
+  // without bounds checks.
+  const int32_t* table = block_table.data<int32_t>();
+  const int32_t num_blocks = static_cast<int32_t>(k_pool.shape(0));
+  const int64_t used =
+      (static_cast<int64_t>(committed_tokens_) + rows_ + block_size_ - 1) / block_size_;
+  for (int64_t j = 0; j < used; ++j) {
+    if (table[j] < 0 || table[j] >= num_blocks) {
+      std::ostringstream msg;
+      msg << "[runtime] PagedPrefillAttention::eval_gpu: block_table[" << j
+          << "] (" << table[j] << ") out of range [0, " << num_blocks << ")";
+      throw std::invalid_argument(msg.str());
+    }
+  }
+  const int32_t visible = committed_tokens_ + rows_;
+  const int64_t live_blocks = distinct_live_blocks(
+      table, &visible, 1, static_cast<uint32_t>(used), block_size_, num_blocks);
+
+  array& out = outputs[0];
+  out.set_data(allocator::malloc(out.nbytes()));
+  outputs[1].copy_shared_buffer(workspace);
+
+  auto& s = stream();
+  auto& d = mlx::core::metal::device(s.device);
+  auto& encoder = mlx::core::metal::get_command_encoder(s);
+  mlx::core::fast::paged::PagedPrefillParams params{
+      static_cast<uint32_t>(committed_tokens_),
+      static_cast<uint32_t>(rows_),
+      static_cast<uint32_t>(q_staged.shape(1)),
+      static_cast<uint32_t>(block_table.size()),
+      static_cast<uint32_t>(splits_),
+      static_cast<uint32_t>(max_splits_),
+      static_cast<uint32_t>(block_size_),
+      static_cast<uint32_t>(num_kv_heads_)};
+  mlx::core::fast::paged::dispatch_paged_prefill_attention(
+      encoder,
+      d,
+      out,
+      outputs[1],
+      q_staged,
+      k_pool,
+      v_pool,
+      k_scale,
+      v_scale,
+      block_table,
+      params,
+      num_q_heads_,
+      head_size_,
+      to_paged_dtype(kv_dtype_),
+      live_blocks);
+}
+
+std::vector<array> PagedPrefillAttention::vjp(
+    const std::vector<array>& /*primals*/,
+    const std::vector<array>& /*cotangents*/,
+    const std::vector<int>& /*argnums*/,
+    const std::vector<array>& /*outputs*/) {
+  throw std::runtime_error("PagedPrefillAttention is inference-only");
+}
+
+std::vector<Shape> PagedPrefillAttention::output_shapes(
+    const std::vector<array>& inputs) {
+  if (inputs.size() != 7) {
+    throw std::runtime_error("PagedPrefillAttention::output_shapes: expected 7 inputs");
+  }
+  return {Shape{rows_, num_q_heads_, head_size_}, inputs[6].shape()};
+}
+
+bool PagedPrefillAttention::is_equivalent(const Primitive& other) const {
+  const auto& o = static_cast<const PagedPrefillAttention&>(other);
+  return committed_tokens_ == o.committed_tokens_ && rows_ == o.rows_ &&
+      splits_ == o.splits_ && max_splits_ == o.max_splits_ &&
+      block_size_ == o.block_size_ && num_q_heads_ == o.num_q_heads_ &&
+      num_kv_heads_ == o.num_kv_heads_ && head_size_ == o.head_size_ &&
+      kv_dtype_ == o.kv_dtype_;
+}
+
+std::array<array, 2> paged_prefill_attention(
+    const array& q,
+    const array& k_pool,
+    const array& v_pool,
+    const array& k_scale,
+    const array& v_scale,
+    const array& block_table,
+    const array& workspace,
+    int committed_tokens,
+    int splits,
+    int max_splits,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    KvDtype kv_dtype,
+    float scale,
+    StreamOrDevice s_) {
+  const char* op_name = "paged_prefill_attention";
+  auto s = to_stream(s_);
+  if (q.ndim() != 3 || q.shape(1) != num_q_heads || q.shape(2) != head_size) {
+    prefill_reject(op_name, "q must be [rows, num_q_heads, head_size]");
+  }
+  if (num_kv_heads <= 0 || num_q_heads % num_kv_heads != 0) {
+    prefill_reject(op_name, "query heads must be a multiple of KV heads");
+  }
+  // The kernels compile the score scale as a literal (Splash
+  // splash_attention_scale).
+  if (std::abs(scale * std::sqrt(static_cast<float>(head_size)) - 1.0f) > 1e-6f) {
+    prefill_reject(op_name, "scale must be 1/sqrt(head_size)");
+  }
+  const int rows = q.shape(0);
+  const int group = num_q_heads / num_kv_heads;
+  const int stride = paged_prefill_stride(rows);
+  // Splash Staging: queries [kv head][row][query head in group][dimension].
+  array staged = transpose(
+      reshape(astype(q, mlx::core::bfloat16, s), {rows, num_kv_heads, group, head_size}, s),
+      {1, 0, 2, 3},
+      s);
+  staged = stride == rows
+      ? contiguous(staged, false, s)
+      : pad(staged, {1}, {0}, {stride - rows}, array(0.0f, mlx::core::bfloat16), "constant", s);
+
+  validate_paged_prefill_inputs(
+      staged, k_pool, v_pool, k_scale, v_scale, block_table, workspace,
+      committed_tokens, rows, splits, max_splits, block_size, num_q_heads,
+      num_kv_heads, head_size, kv_dtype, op_name);
+
+  auto fallback = [](std::vector<array>) -> std::vector<array> {
+    throw std::runtime_error(
+        "paged_prefill_attention has no fallback implementation (inference-only)");
+  };
+  auto primitive = std::make_shared<PagedPrefillAttention>(
+      s, std::move(fallback), committed_tokens, rows, splits, max_splits,
+      block_size, num_q_heads, num_kv_heads, head_size, kv_dtype);
+  auto results = array::make_arrays(
+      {Shape{rows, num_q_heads, head_size}, workspace.shape()},
+      {mlx::core::bfloat16, mlx::core::float32},
+      primitive,
+      {staged, k_pool, v_pool, k_scale, v_scale, block_table, workspace});
+  return {std::move(results[0]), std::move(results[1])};
+}
+
 } // namespace mlx::core::fast
 
 extern "C" {
@@ -2169,6 +2449,67 @@ mlx_array* mlx_paged_attention_varlen_forward(
     mlx_trace_native_error(
         "paged_attention_varlen_forward", "unknown exception");
     return nullptr;
+  }
+}
+
+
+/// Production FFI: emit a `PagedPrefillAttention` (queries staged inside).
+/// Returns false on a validation error; the outputs stay lazy.
+bool mlx_paged_prefill_attention_forward(
+    mlx_array* q_ptr,
+    mlx_array* k_pool_ptr,
+    mlx_array* v_pool_ptr,
+    mlx_array* k_scale_ptr,
+    mlx_array* v_scale_ptr,
+    mlx_array* block_table_ptr,
+    mlx_array* workspace_ptr,
+    int committed_tokens,
+    int splits,
+    int max_splits,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    uint8_t kv_dtype_raw,
+    float scale,
+    mlx_array** out_attention,
+    mlx_array** out_workspace) {
+  if (out_attention) *out_attention = nullptr;
+  if (out_workspace) *out_workspace = nullptr;
+  if (!q_ptr || !k_pool_ptr || !v_pool_ptr || !k_scale_ptr || !v_scale_ptr ||
+      !block_table_ptr || !workspace_ptr || !out_attention || !out_workspace) {
+    return false;
+  }
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::fast;
+    require_known_kv_dtype(kv_dtype_raw);
+    auto results = paged_prefill_attention(
+        *reinterpret_cast<array*>(q_ptr),
+        *reinterpret_cast<array*>(k_pool_ptr),
+        *reinterpret_cast<array*>(v_pool_ptr),
+        *reinterpret_cast<array*>(k_scale_ptr),
+        *reinterpret_cast<array*>(v_scale_ptr),
+        *reinterpret_cast<array*>(block_table_ptr),
+        *reinterpret_cast<array*>(workspace_ptr),
+        committed_tokens,
+        splits,
+        max_splits,
+        block_size,
+        num_q_heads,
+        num_kv_heads,
+        head_size,
+        static_cast<KvDtype>(kv_dtype_raw),
+        scale);
+    *out_attention = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
+    *out_workspace = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
+    return true;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("paged_prefill_attention_forward", e.what());
+    return false;
+  } catch (...) {
+    mlx_trace_native_error("paged_prefill_attention_forward", "unknown exception");
+    return false;
   }
 }
 

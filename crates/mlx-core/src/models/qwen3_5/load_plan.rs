@@ -28,7 +28,7 @@ use crate::utils::safetensors::{SafeTensorDType, SafeTensorsFile, checkpoint_saf
 
 use super::config::Qwen3_5Config;
 use super::dflash2::DFlash2Config;
-use super::dflash2_decode::{PrefillSdpaKernels, flat_lane_transient, pool_lane_transient};
+use super::dflash2_decode::{flat_lane_transient, pool_lane_transient};
 use super::dflash2_turn::DFlash2Target;
 use super::persistence::{
     compute_dtype_of, mtp_sidecar_candidates, normalize_mtp_weight_key, qwen35_text_key,
@@ -36,32 +36,60 @@ use super::persistence::{
 use crate::models::qwen3_5_moe::persistence::{mtp_expert_keys, settled_compute_dtype};
 
 /// The pool's element type for `format`. BF16 pages hold any compute dtype
-/// cast to bf16. Int8 pages exist only where mlx-node has the int8 store and
-/// paged attention kernels: head 128 or 256, 16- or 32-token blocks, BF16
-/// rows; any other geometry fails the load, as Splash's start fails when
-/// `compiledAttention` has "no paged-attention kernel for layout" (Splash's
-/// bf16 kernels are geometry-bound the same way).
+/// cast to bf16; int8 pages need BF16 rows. Either format exists only where
+/// mlx-node has the in-place prefill attention kernel: a query group of 4,
+/// 6, 8 or 16, head 128 or 256, 16- or 32-token blocks. Any other load
+/// fails, as Splash's start fails when `compiledAttention` has "no
+/// paged-attention kernel for layout". Every GPU family loads: Splash's
+/// `kMinimumAppleGpuFamily` is an engine-wide floor, not this kernel's.
 pub(crate) fn qwen35_pool_cache_dtype(
     label: &str,
     format: KvFormat,
-    head_dim: u32,
+    heads: PoolHeads,
     block_size: u32,
     compute: DType,
 ) -> Result<mlx_paged_attn::metal::MetalDtype> {
     use mlx_paged_attn::metal::MetalDtype;
+    let group = if heads.kv > 0 && heads.query.is_multiple_of(heads.kv) {
+        heads.query / heads.kv
+    } else {
+        0
+    };
+    if !(matches!(group, 4 | 6 | 8 | 16)
+        && matches!(heads.dim, 128 | 256)
+        && matches!(block_size, 16 | 32))
+    {
+        return Err(Error::from_reason(format!(
+            "{label}: no paged prefill attention kernel for {}/{} heads, head_dim {}, block size \
+             {block_size}; load with useBlockPagedCache false",
+            heads.query, heads.kv, heads.dim
+        )));
+    }
     match format {
         KvFormat::Bf16 => Ok(MetalDtype::BFloat16),
-        KvFormat::Int8
-            if matches!(head_dim, 128 | 256)
-                && matches!(block_size, 16 | 32)
-                && compute == DType::BFloat16 =>
-        {
-            Ok(MetalDtype::Int8)
-        }
+        KvFormat::Int8 if compute == DType::BFloat16 => Ok(MetalDtype::Int8),
         KvFormat::Int8 => Err(Error::from_reason(format!(
-            "{label}: no int8 paged attention kernel for head_dim {head_dim}, block size \
-             {block_size}, {compute:?} compute; load with kvFormat 'bf16'"
+            "{label}: int8 pages need BF16 rows; this load computes in {compute:?}; load with \
+             kvFormat 'bf16'"
         ))),
+    }
+}
+
+/// Query heads, KV heads and head size of a pool's full-attention layers.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PoolHeads {
+    pub query: u32,
+    pub kv: u32,
+    pub dim: u32,
+}
+
+impl PoolHeads {
+    pub(crate) fn of(config: &Qwen3_5Config) -> Self {
+        Self {
+            query: config.num_heads.max(0) as u32,
+            kv: config.num_kv_heads.max(0) as u32,
+            dim: config.head_dim.max(0) as u32,
+        }
     }
 }
 
@@ -162,13 +190,8 @@ pub(crate) fn evaluate_qwen35_plan(
     let recurrent_state_bytes = lanes.recurrent_state_bytes;
     let trained = config.served_context_tokens();
     let fa_layers = config.full_attention_layer_count();
-    let kernels = PrefillSdpaKernels::probe(config.head_dim);
-    let pool_format = lanes
-        .pool
-        .map_or(KvFormat::Bf16, |geometry| geometry.format);
     let draft_taps = draft.map(|draft| draft.tap_layers);
-    let pool_transient =
-        |window| pool_lane_transient(config, pool_format, kernels, draft_taps, window);
+    let pool_transient = |window| pool_lane_transient(config, draft_taps, window);
     let mtp = lanes.mtp;
     // A DFlash2 turn runs alone on the Barrier lane, so its state is never
     // booked in the pool.
@@ -663,7 +686,7 @@ pub(crate) fn estimate_qwen35_load(
         let layers = config.full_attention_layer_count() as u32;
         let block_size = config.paged_block_size();
         let cache_dtype =
-            qwen35_pool_cache_dtype(label, format, config.head_dim as u32, block_size, compute)?;
+            qwen35_pool_cache_dtype(label, format, PoolHeads::of(&config), block_size, compute)?;
         let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
             layers,
             config.num_kv_heads as u32,

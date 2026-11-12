@@ -47,6 +47,7 @@ use crate::inference_trace::{
 use crate::nn::{Embedding, RMSNorm};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
+use super::attention::PagedPass;
 use super::decoder_layer::{DecoderLayer, Qwen3_5LayerKind};
 use super::layer_cache::Qwen3_5LayerCache;
 use crate::models::quantized_linear::LinearProj;
@@ -593,6 +594,18 @@ pub(crate) fn run_gdn_only_prefill_materialized_with_chunk_size(
     Ok(())
 }
 
+/// Splash `prefillPlan` refuses a chunk of 0 or more than 2048 rows; the
+/// in-place prefill attention launches at most that many.
+pub(crate) fn check_prefill_chunk_rows(chunk_size: i32) -> Result<()> {
+    if chunk_size <= 0 || chunk_size as u32 > mlx_paged_attn::prefill_plan::PREFILL_MAX_ROWS {
+        return Err(Error::from_reason(format!(
+            "paged prefill chunk size {chunk_size} is outside 1..={}",
+            mlx_paged_attn::prefill_plan::PREFILL_MAX_ROWS
+        )));
+    }
+    Ok(())
+}
+
 /// Run a paged prefill over the suffix tokens. Returns the last position's
 /// logits squeezed to `[vocab]` plus every GDN recurrent checkpoint the split
 /// materialized.
@@ -603,9 +616,8 @@ pub(crate) fn run_gdn_only_prefill_materialized_with_chunk_size(
 /// the suffix `&tokens[cached_prefix_len..]` is what gets recorded
 /// into the paged adapter and fed through the full forward pass.
 ///
-/// `chunk_size <= 0` (tests only) runs the single-shot path, which crosses no
-/// boundary and so returns an empty checkpoint vec. Positive chunk sizes split only the
-/// uncached suffix. Each chunk writes its K/V into the paged adapter, attends
+/// `chunk_size` is 1..=2048 rows ([`check_prefill_chunk_rows`]); only the
+/// uncached suffix is split. Each chunk writes its K/V into the paged adapter, attends
 /// over the cumulative cached range, then clears MLX's transient graph before
 /// the next chunk. This matches the Qwen3/Qwen3.5 MoE driver shape and keeps
 /// dense Qwen from building one giant prefill graph for 30k+ suffixes.
@@ -637,23 +649,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         p.begin_prefill(suffix_tokens.len() as u32, cached_prefix_len)
     });
 
-    // Capturing a sidecar at the stable reusable-block boundary may require
-    // splitting before the final chunk, so the single-shot arm captures none.
-    if chunk_size <= 0 {
-        return run_paged_prefill_single_shot(
-            full_tokens,
-            suffix_tokens,
-            cached_prefix_len,
-            gdn_prefix_already_primed,
-            embed,
-            target,
-            layer_kinds,
-            cached_rope_deltas,
-            taps.as_mut()
-                .map(|sink| &mut **sink as &mut dyn PrefillTapSink),
-        )
-        .map(|logits| (logits, Vec::new()));
-    }
+    check_prefill_chunk_rows(chunk_size)?;
 
     let checkpoint_boundaries = {
         let adapter = target.parts()?.adapter;
@@ -1216,9 +1212,8 @@ pub(crate) fn run_paged_vlm_prefill(
 /// prefill only processes the suffix, so the captured hidden would not
 /// cover the full prompt and the prompt-prefix seed cannot use it.
 ///
-/// `chunk_size` carries the same contract as the non-hidden worker: `<= 0` is
-/// single-shot (tests only, no checkpoints), and the value comes from the caller,
-/// never from `MLX_PAGED_PREFILL_CHUNK_SIZE` read here. An MTP turn is the only
+/// `chunk_size` carries the same contract as the non-hidden worker: 1..=2048
+/// rows, and the value comes from the caller, never from `MLX_PAGED_PREFILL_CHUNK_SIZE` read here. An MTP turn is the only
 /// consumer, and it is a persist-cold turn like any other — reading the raw env
 /// default here is what kept MTP turns from publishing any ladder rung at all.
 #[allow(clippy::too_many_arguments)]
@@ -1248,25 +1243,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
         p.begin_prefill(suffix_tokens.len() as u32, cached_prefix_len)
     });
 
-    // See the non-hidden worker above for why sidecar capture requires chunking.
-    if chunk_size <= 0 {
-        return run_paged_prefill_single_shot_with_hidden(
-            full_tokens,
-            suffix_tokens,
-            cached_prefix_len,
-            gdn_prefix_already_primed,
-            embed,
-            layers,
-            caches,
-            final_norm,
-            lm_head,
-            layer_kinds,
-            paged_adapter,
-            keep_last_hidden,
-            cached_rope_deltas,
-        )
-        .map(|(logits, hidden)| (logits, hidden, Vec::new()));
-    }
+    check_prefill_chunk_rows(chunk_size)?;
 
     let checkpoint_boundaries = prefill_checkpoint_boundaries(
         full_tokens.len(),
@@ -1646,8 +1623,7 @@ fn run_paged_prefill_one_chunk_tapped(
             kind,
             paged_adapter,
             chunk_first_position,
-            chunk_first_position,
-            /* is_prefill */ true,
+            PagedPass::Prefill,
             /* mask */ None,
             Some(cache_slot),
             layer_positions,
@@ -1788,8 +1764,7 @@ pub(crate) fn run_paged_decode_step(
             kind,
             paged_adapter,
             first_logical_position,
-            /* cached_prefix_len */ 0,
-            /* is_prefill */ false,
+            PagedPass::Decode,
             /* mask */ None,
             Some(cache_slot),
             /* position_ids */ None,
@@ -1865,8 +1840,7 @@ pub(crate) fn run_paged_step_with_hidden(
             kind,
             paged_adapter,
             first_logical_position,
-            /* cached_prefix_len */ 0,
-            /* is_prefill */ false,
+            PagedPass::Decode,
             /* mask */ None,
             Some(cache_slot),
             /* position_ids */ None,
@@ -2089,8 +2063,7 @@ fn paged_verify_core(
                     kind,
                     paged_adapter,
                     chunk_first_position,
-                    chunk_first_position,
-                    /* is_prefill */ true,
+                    PagedPass::Verify,
                     Some(&mut detached),
                     Some(&mut slot),
                     rope_position_offset,
@@ -2117,8 +2090,7 @@ fn paged_verify_core(
                 kind,
                 paged_adapter,
                 chunk_first_position,
-                chunk_first_position,
-                /* is_prefill */ true,
+                PagedPass::Verify,
                 Some(cache_slot),
                 Some(&mut slot),
                 rope_position_offset,

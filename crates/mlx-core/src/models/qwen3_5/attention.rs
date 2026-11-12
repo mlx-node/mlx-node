@@ -1,4 +1,3 @@
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -17,18 +16,7 @@ use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
 use crate::transformer::KvFormat;
 use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
-#[cfg(test)]
-use crate::transformer::paged_kv_cache_adapter::PagedPrefillMemorySnapshot;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
-use crate::transformer::paged_policy::{
-    LivePrefillHeadroom, estimate_paged_pool_sdpa_bytes_with_portable,
-    estimate_varlen_paged_attention_bytes, live_headroom, prefill_sdpa_effective_dtype,
-};
-#[cfg(test)]
-use crate::transformer::paged_policy::{
-    PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES, estimate_paged_pool_sdpa_bytes,
-    mlx_sdpa_uses_fused_kernel, select_live_prefill_headroom,
-};
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
@@ -91,147 +79,300 @@ pub struct Qwen3_5Attention {
     kv_proj: Option<(LinearProj, i64)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CacheHitPrefillMode {
-    /// Keep the paged pool authoritative and select the compute kernel from
-    /// live memory headroom.
-    Auto,
-    /// Force compact varlen PagedAttention for cache-hit prefill.
-    ForcePaged,
-    /// Force graph-native pool gather + MLX causal SDPA.
-    ForceSdpa,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CacheHitPrefillPath {
-    PagedVarlen,
-    PagedPoolSdpa,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CacheHitPrefillPlan {
-    path: CacheHitPrefillPath,
-    estimated_sdpa_bytes: u64,
-    estimated_varlen_bytes: u64,
-    live_headroom_bytes: Option<u64>,
-}
-
-const FAST_SDPA_HEADROOM_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 static NATIVE_KV_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
 static DECODE_GATHER_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
 
-fn parse_cache_hit_prefill_mode(value: Option<&str>) -> CacheHitPrefillMode {
-    match value.map(str::trim) {
-        Some(value) if crate::inference_trace::env_flag_value_enabled(value) => {
-            CacheHitPrefillMode::ForcePaged
+/// What a paged forward reads after storing its rows: one decode token, a
+/// prefill chunk (Splash `PagedAttention::addPrefill`) or a verify block
+/// (Splash `addVerify`, `kv::verifyAttentionSplits`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PagedPass {
+    Decode,
+    Prefill,
+    Verify,
+}
+
+/// Store a chunk's rows into the pool, then attend over the pool (Splash
+/// `QwenTarget::addPrefillMixer`: `addPrefillStore`, then `addPrefill` for
+/// a fresh, first or cache-hit chunk alike). `queries` `[B, T, Hq, D]`,
+/// `keys` / `values` `[B, T, Hkv, D]`; returns `[B, T, Hq * D]` in
+/// `out_dtype`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn paged_store_attend(
+    adapter: &mut PagedKVCacheAdapter,
+    attn_layer_idx: u32,
+    first_logical_position: u32,
+    pass: PagedPass,
+    queries: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    scale: f32,
+    out_dtype: DType,
+) -> Result<MxArray> {
+    let batch = queries.shape_at(0)?;
+    let seq_len = queries.shape_at(1)?;
+    let num_heads = queries.shape_at(2)?;
+    let head_dim = queries.shape_at(3)?;
+    let num_kv_heads = keys.shape_at(2)?;
+    let keys_paged = keys.reshape(&[batch * seq_len, num_kv_heads, head_dim])?;
+    let values_paged = values.reshape(&[batch * seq_len, num_kv_heads, head_dim])?;
+    let prefill = pass != PagedPass::Decode;
+
+    let trace_enabled = inference_trace_enabled();
+    let inference_info_enabled =
+        tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
+    let inference_debug_enabled =
+        tracing::enabled!(target: "mlx_core::inference", tracing::Level::DEBUG);
+    let report_prefill = inference_info_enabled && prefill && attn_layer_idx == 0 && seq_len > 8;
+    let write_trace_start = (trace_enabled || inference_debug_enabled).then(Instant::now);
+    let write_info_start = report_prefill.then(Instant::now);
+    // An int8 pool is written only by the native store (Splash
+    // `PagedAttention::addPrefillStore`); its error is the turn's error.
+    let int8_pool = adapter.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8;
+    let write_path = if native_kv_write_enabled() || int8_pool {
+        match adapter.update_keys_values_native(
+            attn_layer_idx,
+            &keys_paged,
+            &values_paged,
+            first_logical_position,
+        ) {
+            Ok(()) => "native",
+            Err(err) if int8_pool => return Err(napi::Error::from_reason(err)),
+            Err(err) => {
+                if trace_enabled {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-attn paged_kv_write_fallback \
+                         layer={} first_position={} seq_len={} error={}",
+                        attn_layer_idx, first_logical_position, seq_len, err
+                    ));
+                }
+                if inference_info_enabled && attn_layer_idx == 0 {
+                    let first_report = !NATIVE_KV_FALLBACK_REPORTED.swap(true, Ordering::Relaxed);
+                    if prefill || first_report || first_logical_position.is_multiple_of(32) {
+                        tracing::warn!(
+                            target: "mlx_core::inference",
+                            event = "paged_kv_write_fallback",
+                            layer = attn_layer_idx,
+                            first_position = first_logical_position,
+                            sequence_tokens = seq_len,
+                            error = %err,
+                            "native paged KV write failed; using legacy write path"
+                        );
+                    }
+                }
+                adapter
+                    .update_keys_values(
+                        attn_layer_idx,
+                        &keys_paged,
+                        &values_paged,
+                        first_logical_position,
+                    )
+                    .map_err(napi::Error::from_reason)?;
+                "legacy"
+            }
         }
-        Some(_) => CacheHitPrefillMode::ForceSdpa,
-        None => CacheHitPrefillMode::Auto,
-    }
-}
-
-fn cache_hit_prefill_mode() -> CacheHitPrefillMode {
-    static MODE: OnceLock<CacheHitPrefillMode> = OnceLock::new();
-    *MODE.get_or_init(|| {
-        parse_cache_hit_prefill_mode(
-            std::env::var("MLX_PAGED_PREFILL_PAGED_ATTENTION")
-                .ok()
-                .as_deref(),
-        )
-    })
-}
-
-/// An int8 pool always takes the varlen kernel: Splash reads int8 pages in
-/// place (`prefill_attention_q8_split*`) and has no dequantizing gather route.
-fn cache_hit_prefill_mode_for_pool(
-    configured: CacheHitPrefillMode,
-    int8_pool: bool,
-) -> CacheHitPrefillMode {
-    if int8_pool {
-        CacheHitPrefillMode::ForcePaged
     } else {
-        configured
-    }
-}
-
-fn should_probe_cache_hit_prefill_memory(
-    mode: CacheHitPrefillMode,
-    query_tokens: i64,
-    graph_backend_available: bool,
-) -> bool {
-    mode == CacheHitPrefillMode::Auto && query_tokens > 8 && graph_backend_available
-}
-
-fn should_try_varlen_after_sdpa(mode: CacheHitPrefillMode, sdpa_constructed: bool) -> bool {
-    !sdpa_constructed && mode != CacheHitPrefillMode::ForceSdpa
-}
-
-pub(crate) fn d256_full_sdpa_available(effective_dtype_is_float32: bool) -> bool {
-    static LOW_PRECISION_AVAILABLE: OnceLock<bool> = OnceLock::new();
-    static FLOAT32_AVAILABLE: OnceLock<bool> = OnceLock::new();
-    let available = if effective_dtype_is_float32 {
-        &FLOAT32_AVAILABLE
-    } else {
-        &LOW_PRECISION_AVAILABLE
+        adapter
+            .update_keys_values(
+                attn_layer_idx,
+                &keys_paged,
+                &values_paged,
+                first_logical_position,
+            )
+            .map_err(napi::Error::from_reason)?;
+        "legacy"
     };
-    *available.get_or_init(|| {
-        let mut supported = false;
-        let status = unsafe {
-            mlx_sys::mlx_metal_d256_full_sdpa_available(effective_dtype_is_float32, &mut supported)
-        };
-        status == 0 && supported
-    })
-}
+    if trace_enabled {
+        write_inference_trace(format_args!(
+            "[MLX_TRACE] qwen3.5-attn paged_kv_write_done \
+             layer={} first_position={} seq_len={} path={} elapsed_ms={:.1}",
+            attn_layer_idx,
+            first_logical_position,
+            seq_len,
+            write_path,
+            write_trace_start.map(elapsed_ms).unwrap_or(0.0)
+        ));
+    }
+    if inference_debug_enabled {
+        tracing::debug!(
+            target: "mlx_core::inference",
+            event = "paged_kv_write_done",
+            layer = attn_layer_idx,
+            first_position = first_logical_position,
+            sequence_tokens = seq_len,
+            path = write_path,
+            elapsed_ms = write_trace_start.map(elapsed_ms).unwrap_or(0.0),
+            "paged KV layer write completed"
+        );
+    }
+    if report_prefill {
+        tracing::info!(
+            target: "mlx_core::inference",
+            event = "paged_kv_write_done",
+            layer = attn_layer_idx,
+            first_position = first_logical_position,
+            sequence_tokens = seq_len,
+            path = write_path,
+            elapsed_ms = write_info_start.map(elapsed_ms).unwrap_or(0.0),
+            "paged prefill KV write completed"
+        );
+    }
 
-fn select_cache_hit_prefill_plan(
-    mode: CacheHitPrefillMode,
-    query_tokens: u64,
-    estimated_sdpa_bytes: u64,
-    estimated_varlen_bytes: u64,
-    live_headroom_bytes: Option<u64>,
-) -> CacheHitPrefillPlan {
-    let path = match mode {
-        CacheHitPrefillMode::ForcePaged => CacheHitPrefillPath::PagedVarlen,
-        CacheHitPrefillMode::ForceSdpa => CacheHitPrefillPath::PagedPoolSdpa,
-        CacheHitPrefillMode::Auto => match live_headroom_bytes {
-            Some(headroom) => {
-                // Keep a fixed process reserve plus a 10% cushion for the
-                // model's MLP/quantized-matmul transients. Multi-token SDPA is
-                // the fast path (including fused D=256 full attention on NAX)
-                // whenever its full transient fits. If that
-                // misses the budget, prefer compact varlen paging when it fits;
-                // if neither fits, choose the smaller estimated transient.
-                let budget = headroom
-                    .saturating_sub(FAST_SDPA_HEADROOM_RESERVE_BYTES)
-                    .saturating_mul(9)
-                    / 10;
-                if query_tokens <= 8 {
-                    CacheHitPrefillPath::PagedVarlen
-                } else if estimated_sdpa_bytes <= budget {
-                    CacheHitPrefillPath::PagedPoolSdpa
-                } else if estimated_varlen_bytes <= budget
-                    || estimated_varlen_bytes <= estimated_sdpa_bytes
-                {
-                    CacheHitPrefillPath::PagedVarlen
-                } else {
-                    CacheHitPrefillPath::PagedPoolSdpa
+    let attn = match pass {
+        PagedPass::Prefill | PagedPass::Verify => {
+            if batch != 1 {
+                return Err(napi::Error::from_reason(format!(
+                    "qwen3.5 paged prefill attention reads one sequence; got batch {batch}"
+                )));
+            }
+            let plan_pass = match pass {
+                PagedPass::Verify => mlx_paged_attn::prefill_plan::Pass::Verify,
+                _ => mlx_paged_attn::prefill_plan::Pass::Prefill,
+            };
+            let start = (trace_enabled || report_prefill).then(Instant::now);
+            let queries = queries.reshape(&[seq_len, num_heads, head_dim])?;
+            let attn = adapter
+                .paged_prefill_attention(
+                    attn_layer_idx,
+                    &queries,
+                    first_logical_position,
+                    plan_pass,
+                    scale,
+                )
+                .map_err(napi::Error::from_reason)?;
+            if trace_enabled {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-attn paged_prefill_attention \
+                     layer={} rows={} committed={} pass={:?} graph_ms={:.1}",
+                    attn_layer_idx,
+                    seq_len,
+                    first_logical_position,
+                    plan_pass,
+                    start.map(elapsed_ms).unwrap_or(0.0)
+                ));
+            }
+            if report_prefill {
+                tracing::info!(
+                    target: "mlx_core::inference",
+                    event = "paged_prefill_attention",
+                    layer = attn_layer_idx,
+                    rows = seq_len,
+                    committed = first_logical_position,
+                    pass = ?plan_pass,
+                    graph_ms = start.map(elapsed_ms).unwrap_or(0.0),
+                    "paged prefill attention graph constructed"
+                );
+            }
+            attn
+        }
+        PagedPass::Decode => {
+            // Graph-native paged attention keeps the native K/V write and
+            // the attention read in one MLX dependency graph.
+            let queries_3d = queries.reshape(&[1, num_heads, head_dim])?;
+            let gather_trace_start = (trace_enabled || inference_debug_enabled).then(Instant::now);
+            if !graph_decode_gather_enabled() {
+                let attn_3d = adapter
+                    .gather_kv_for_decode(
+                        attn_layer_idx,
+                        &queries_3d,
+                        scale,
+                        /* softcap */ 1.0,
+                    )
+                    .map_err(napi::Error::from_reason)?;
+                if trace_enabled {
+                    write_inference_trace(format_args!(
+                        "[MLX_TRACE] qwen3.5-attn decode_gather_done \
+                         layer={} path=legacy total_ctx={} elapsed_ms={:.1}",
+                        attn_layer_idx,
+                        adapter.current_token_count(),
+                        gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                    ));
+                }
+                attn_3d
+            } else {
+                match adapter.gather_kv_for_decode_graph(
+                    attn_layer_idx,
+                    &queries_3d,
+                    scale,
+                    /* softcap */ 1.0,
+                ) {
+                    Ok(attn_3d) => {
+                        if trace_enabled {
+                            write_inference_trace(format_args!(
+                                "[MLX_TRACE] qwen3.5-attn decode_gather_done \
+                                 layer={} path=graph total_ctx={} elapsed_ms={:.1}",
+                                attn_layer_idx,
+                                adapter.current_token_count(),
+                                gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                            ));
+                        }
+                        if inference_debug_enabled {
+                            tracing::debug!(
+                                target: "mlx_core::inference",
+                                event = "paged_attention_gather_done",
+                                layer = attn_layer_idx,
+                                path = "graph",
+                                context_tokens = adapter.current_token_count(),
+                                elapsed_ms = gather_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                                "paged attention layer gather completed"
+                            );
+                        }
+                        attn_3d
+                    }
+                    Err(err) => {
+                        if trace_enabled {
+                            write_inference_trace(format_args!(
+                                "[MLX_TRACE] qwen3.5-attn decode_gather_fallback \
+                                 layer={} path=raw total_ctx={} error={}",
+                                attn_layer_idx,
+                                adapter.current_token_count(),
+                                err
+                            ));
+                        }
+                        if inference_info_enabled && attn_layer_idx == 0 {
+                            let context_tokens = adapter.current_token_count();
+                            let first_report =
+                                !DECODE_GATHER_FALLBACK_REPORTED.swap(true, Ordering::Relaxed);
+                            if first_report || context_tokens.is_multiple_of(32) {
+                                tracing::warn!(
+                                    target: "mlx_core::inference",
+                                    event = "paged_attention_gather_fallback",
+                                    layer = attn_layer_idx,
+                                    context_tokens,
+                                    failed_path = "graph",
+                                    fallback_path = "raw",
+                                    error = %err,
+                                    "graph paged-attention gather failed; using raw gather"
+                                );
+                            }
+                        }
+                        let attn_3d = adapter
+                            .gather_kv_for_decode(
+                                attn_layer_idx,
+                                &queries_3d,
+                                scale,
+                                /* softcap */ 1.0,
+                            )
+                            .map_err(napi::Error::from_reason)?;
+                        if inference_debug_enabled {
+                            tracing::debug!(
+                                target: "mlx_core::inference",
+                                event = "paged_attention_gather_done",
+                                layer = attn_layer_idx,
+                                path = "raw_fallback",
+                                context_tokens = adapter.current_token_count(),
+                                elapsed_ms = gather_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                                "paged attention layer gather completed"
+                            );
+                        }
+                        attn_3d
+                    }
                 }
             }
-            None => {
-                if query_tokens > 8 && estimated_sdpa_bytes < estimated_varlen_bytes {
-                    CacheHitPrefillPath::PagedPoolSdpa
-                } else {
-                    CacheHitPrefillPath::PagedVarlen
-                }
-            }
-        },
+        }
     };
-    CacheHitPrefillPlan {
-        path,
-        estimated_sdpa_bytes,
-        estimated_varlen_bytes,
-        live_headroom_bytes,
-    }
+    attn.astype(out_dtype)?
+        .reshape(&[batch, seq_len, num_heads * head_dim])
 }
 
 impl Qwen3_5Attention {
@@ -848,13 +989,10 @@ impl Qwen3_5Attention {
     /// Forward pass routed through the block-paged KV adapter.
     ///
     /// Mirrors [`Self::forward`] (Q-gating, partial RoPE, Q/K layernorm)
-    /// but writes K/V into the paged pool instead of a flat `KVCache`
-    /// and reads attention K/V back via either an explicit
-    /// `read_kv_range` (cache-hit prefill) or a host-side
-    /// `read_kv_range` followed by SDPA (decode). Decode uses
-    /// `read_kv_range` instead of `gather_kv_for_decode` to keep BF16
-    /// reduction order bit-equal to the flat path's SDPA — matches
-    /// Qwen3 / Gemma4's paged decode strategy.
+    /// but stores K/V into the paged pool and then attends over the pool
+    /// pages ([`paged_store_attend`]): a prefill chunk or verify block reads
+    /// its own rows back from the pool, a decode token takes the paged
+    /// decode kernel.
     ///
     /// **Caller contract** (mirrors LFM2 / Gemma4):
     /// 1. `adapter.record_tokens(&[...suffix])` BEFORE this call so the
@@ -885,14 +1023,13 @@ impl Qwen3_5Attention {
     /// steps, which always pass `position_ids = None`) can pass `&mut None`
     /// — it is never touched on that path.
     #[allow(clippy::too_many_arguments)]
-    pub fn forward_paged(
+    pub(crate) fn forward_paged(
         &self,
         x: &MxArray,
         adapter: &mut PagedKVCacheAdapter,
         attn_layer_idx: u32,
         first_logical_position: u32,
-        cached_prefix_len: u32,
-        is_prefill: bool,
+        pass: PagedPass,
         position_ids: Option<&MxArray>,
         rope_position_offset: i32,
         mrope_cache: &mut Option<(MxArray, MxArray)>,
@@ -977,668 +1114,17 @@ impl Qwen3_5Attention {
         let queries = self.paged_attention_operand(&queries, operand_dtype)?;
         let keys = self.paged_attention_operand(&keys, operand_dtype)?;
         let values = self.paged_attention_operand(&values, operand_dtype)?;
-
-        // Transpose to [B, H, T, D] for SDPA.
-        let queries_bhtd = queries.transpose(Some(&[0, 2, 1, 3]))?;
-        let keys_bhtd = keys.transpose(Some(&[0, 2, 1, 3]))?;
-        let values_bhtd = values.transpose(Some(&[0, 2, 1, 3]))?;
-
-        // Paged-pool layout: `[num_tokens, num_kv_heads, head_dim]`.
-        // [B, H_kv, T, D] -> [B, T, H_kv, D] -> [B*T, H_kv, D].
-        let (keys_paged, values_paged) = crate::models::attention_core::paged_kv_layout(
-            &keys_bhtd,
-            &values_bhtd,
-            batch,
-            seq_len,
-            self.num_kv_heads as i64,
-            self.head_dim as i64,
+        let output = paged_store_attend(
+            adapter,
+            attn_layer_idx,
+            first_logical_position,
+            pass,
+            &queries,
+            &keys,
+            &values,
+            self.scale,
+            x.dtype()?,
         )?;
-
-        let trace_enabled = inference_trace_enabled();
-        let inference_info_enabled =
-            tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
-        let inference_debug_enabled =
-            tracing::enabled!(target: "mlx_core::inference", tracing::Level::DEBUG);
-        let write_trace_start = (trace_enabled || inference_debug_enabled).then(Instant::now);
-        let write_info_start =
-            (inference_info_enabled && is_prefill && attn_layer_idx == 0 && seq_len > 8)
-                .then(Instant::now);
-        // An int8 pool is written only by the native store (Splash
-        // `PagedAttention::addPrefillStore`); its error is the turn's error.
-        let int8_pool = adapter.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8;
-        let write_path = if native_kv_write_enabled() || int8_pool {
-            match adapter.update_keys_values_native(
-                attn_layer_idx,
-                &keys_paged,
-                &values_paged,
-                first_logical_position,
-            ) {
-                Ok(()) => "native",
-                Err(err) if int8_pool => return Err(napi::Error::from_reason(err)),
-                Err(err) => {
-                    if trace_enabled {
-                        write_inference_trace(format_args!(
-                            "[MLX_TRACE] qwen3.5-attn paged_kv_write_fallback \
-                             layer={} first_position={} seq_len={} error={}",
-                            attn_layer_idx, first_logical_position, seq_len, err
-                        ));
-                    }
-                    if inference_info_enabled && attn_layer_idx == 0 {
-                        let first_report =
-                            !NATIVE_KV_FALLBACK_REPORTED.swap(true, Ordering::Relaxed);
-                        if is_prefill || first_report || first_logical_position.is_multiple_of(32) {
-                            tracing::warn!(
-                                target: "mlx_core::inference",
-                                event = "paged_kv_write_fallback",
-                                layer = attn_layer_idx,
-                                first_position = first_logical_position,
-                                sequence_tokens = seq_len,
-                                error = %err,
-                                "native paged KV write failed; using legacy write path"
-                            );
-                        }
-                    }
-                    adapter
-                        .update_keys_values(
-                            attn_layer_idx,
-                            &keys_paged,
-                            &values_paged,
-                            first_logical_position,
-                        )
-                        .map_err(napi::Error::from_reason)?;
-                    "legacy"
-                }
-            }
-        } else {
-            adapter
-                .update_keys_values(
-                    attn_layer_idx,
-                    &keys_paged,
-                    &values_paged,
-                    first_logical_position,
-                )
-                .map_err(napi::Error::from_reason)?;
-            "legacy"
-        };
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3.5-attn paged_kv_write_done \
-                 layer={} first_position={} seq_len={} path={} elapsed_ms={:.1}",
-                attn_layer_idx,
-                first_logical_position,
-                seq_len,
-                write_path,
-                write_trace_start.map(elapsed_ms).unwrap_or(0.0)
-            ));
-        }
-        if inference_debug_enabled {
-            tracing::debug!(
-                target: "mlx_core::inference",
-                event = "paged_kv_write_done",
-                layer = attn_layer_idx,
-                first_position = first_logical_position,
-                sequence_tokens = seq_len,
-                path = write_path,
-                elapsed_ms = write_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                "paged KV layer write completed"
-            );
-        }
-        if inference_info_enabled && is_prefill && attn_layer_idx == 0 && seq_len > 8 {
-            tracing::info!(
-                target: "mlx_core::inference",
-                event = "paged_kv_write_done",
-                layer = attn_layer_idx,
-                first_position = first_logical_position,
-                sequence_tokens = seq_len,
-                path = write_path,
-                elapsed_ms = write_info_start.map(elapsed_ms).unwrap_or(0.0),
-                "paged prefill KV write completed"
-            );
-        }
-
-        // Compute attention output.
-        let attn_bhtd = if is_prefill {
-            if cached_prefix_len == 0 {
-                // Fresh prefill: SDPA over in-flight Q/K/V with internal
-                // causal mask.
-                if seq_len > 1 {
-                    scaled_dot_product_attention_causal(
-                        &queries_bhtd,
-                        &keys_bhtd,
-                        &values_bhtd,
-                        self.scale as f64,
-                    )?
-                } else {
-                    scaled_dot_product_attention(
-                        &queries_bhtd,
-                        &keys_bhtd,
-                        &values_bhtd,
-                        self.scale as f64,
-                        None,
-                    )?
-                }
-            } else {
-                // Cache-hit prefill keeps the paged pool authoritative. With
-                // sufficient live headroom, gather this layer's blocks inside
-                // the MLX graph and use MLX causal SDPA. Under
-                // pressure, use compact varlen PagedAttention directly over
-                // the pool. Decode remains paged regardless of this choice.
-                let total_ctx = cached_prefix_len + (seq_len as u32);
-                let graph_backend_available =
-                    crate::engine::persistence::compiled_forward_backend_available();
-                let query_dtype = queries.dtype()?;
-                let effective_sdpa_dtype =
-                    prefill_sdpa_effective_dtype(query_dtype, adapter.prefill_sdpa_cache_dtype());
-                let dtype_bytes = match effective_sdpa_dtype {
-                    Some(DType::Float16 | DType::BFloat16) => 2,
-                    Some(DType::Float32) | None => 4,
-                    Some(_) => 4,
-                };
-                let d256_full_sdpa_available = effective_sdpa_dtype
-                    .map(|dtype| d256_full_sdpa_available(dtype == DType::Float32))
-                    .unwrap_or(false);
-                let portable_d256_available = self.head_dim == 256
-                    && dtype_bytes == 2
-                    && seq_len > 8
-                    && unsafe { mlx_sys::mlx_metal_portable_d256_sdpa_available() };
-                let estimated_sdpa_bytes = estimate_paged_pool_sdpa_bytes_with_portable(
-                    seq_len as u64,
-                    total_ctx as u64,
-                    self.num_heads as u64,
-                    self.num_kv_heads as u64,
-                    self.head_dim as u64,
-                    dtype_bytes,
-                    d256_full_sdpa_available,
-                    portable_d256_available,
-                );
-                let estimated_varlen_bytes = if int8_pool {
-                    crate::transformer::paged_policy::estimate_int8_varlen_prefill_bytes(
-                        seq_len as u64,
-                        total_ctx as u64,
-                        self.num_heads as u64,
-                        self.head_dim as u64,
-                    )
-                } else {
-                    estimate_varlen_paged_attention_bytes(
-                        seq_len as u64,
-                        total_ctx as u64,
-                        self.num_heads as u64,
-                        self.num_kv_heads as u64,
-                        self.head_dim as u64,
-                        dtype_bytes,
-                    )
-                };
-                let varlen_aux_fits = estimated_varlen_bytes != u64::MAX;
-                let prefill_mode =
-                    cache_hit_prefill_mode_for_pool(cache_hit_prefill_mode(), int8_pool);
-                // Tiny MTP verification prefills are hard-routed to varlen,
-                // and explicit overrides ignore memory heuristics. Avoid all
-                // live probes on those hot paths. The adapter caches the
-                // snapshot for real prefills, so every full-attention layer in
-                // one chunk uses a single, consistent route decision.
-                let memory_probe_performed = should_probe_cache_hit_prefill_memory(
-                    prefill_mode,
-                    seq_len,
-                    graph_backend_available,
-                );
-                let live_headroom = if memory_probe_performed {
-                    live_headroom(adapter.prefill_memory_snapshot(), adapter.memory_ceiling())
-                } else {
-                    LivePrefillHeadroom::default()
-                };
-                let plan = select_cache_hit_prefill_plan(
-                    prefill_mode,
-                    seq_len as u64,
-                    estimated_sdpa_bytes,
-                    estimated_varlen_bytes,
-                    live_headroom.selected_bytes,
-                );
-                let planned_path = match plan.path {
-                    CacheHitPrefillPath::PagedVarlen => "paged_attention_varlen",
-                    CacheHitPrefillPath::PagedPoolSdpa => "paged_pool_sdpa",
-                };
-                let configured_mode = match prefill_mode {
-                    CacheHitPrefillMode::Auto => "auto",
-                    CacheHitPrefillMode::ForcePaged => "force_paged",
-                    CacheHitPrefillMode::ForceSdpa => "force_sdpa",
-                };
-                let report_prefill_route =
-                    inference_info_enabled && attn_layer_idx == 0 && seq_len > 8;
-                if report_prefill_route {
-                    tracing::info!(
-                        target: "mlx_core::inference",
-                        event = "cache_hit_prefill_plan",
-                        layer = attn_layer_idx,
-                        suffix_tokens = seq_len,
-                        cached_prefix_tokens = cached_prefix_len,
-                        total_context_tokens = total_ctx,
-                        configured_mode,
-                        planned_path,
-                        graph_backend_available,
-                        effective_sdpa_dtype = ?effective_sdpa_dtype,
-                        d256_full_sdpa_available,
-                        portable_d256_available,
-                        varlen_aux_fits,
-                        estimated_sdpa_mib = plan.estimated_sdpa_bytes as f64
-                            / (1024.0 * 1024.0),
-                        estimated_varlen_mib = plan.estimated_varlen_bytes as f64
-                            / (1024.0 * 1024.0),
-                        memory_probe_performed,
-                        allocator_headroom_reported = live_headroom
-                            .allocator_available_bytes
-                            .is_some(),
-                        allocator_headroom_mib = live_headroom
-                            .allocator_available_bytes
-                            .unwrap_or(0) as f64
-                            / (1024.0 * 1024.0),
-                        allocator_active_mib = live_headroom
-                            .allocator_active_bytes
-                            .unwrap_or(0) as f64
-                            / (1024.0 * 1024.0),
-                        allocator_cached_mib = live_headroom
-                            .allocator_cached_bytes
-                            .unwrap_or(0) as f64
-                            / (1024.0 * 1024.0),
-                        allocator_limit_mib = live_headroom
-                            .allocator_limit_bytes
-                            .unwrap_or(0) as f64
-                            / (1024.0 * 1024.0),
-                        allocator_ceiling_mib = live_headroom
-                            .allocator_ceiling_bytes
-                            .unwrap_or(0) as f64
-                            / (1024.0 * 1024.0),
-                        metal_headroom_reported = live_headroom.metal_available_bytes.is_some(),
-                        metal_headroom_mib = live_headroom
-                            .metal_available_bytes
-                            .unwrap_or(0) as f64
-                            / (1024.0 * 1024.0),
-                        metal_recommended_working_set_mib = live_headroom
-                            .metal_recommended_working_set_bytes
-                            .unwrap_or(0) as f64
-                            / (1024.0 * 1024.0),
-                        metal_current_allocated_mib = live_headroom
-                            .metal_current_allocated_bytes
-                            .unwrap_or(0) as f64
-                            / (1024.0 * 1024.0),
-                        paged_pool_allocated_mib = live_headroom
-                            .paged_pool_allocated_bytes
-                            .unwrap_or(0) as f64
-                            / (1024.0 * 1024.0),
-                        live_headroom_reported = plan.live_headroom_bytes.is_some(),
-                        live_headroom_mib = plan.live_headroom_bytes.unwrap_or(0) as f64
-                            / (1024.0 * 1024.0),
-                        "cache-hit prefill route selected"
-                    );
-                }
-
-                let maybe_sdpa = if batch == 1
-                    && graph_backend_available
-                    && plan.path == CacheHitPrefillPath::PagedPoolSdpa
-                {
-                    let sdpa_trace_start =
-                        (trace_enabled || report_prefill_route).then(Instant::now);
-                    match adapter.gather_kv_for_prefill_sdpa(attn_layer_idx, total_ctx) {
-                        Ok((k_full, v_full)) => match scaled_dot_product_attention_causal(
-                            &queries_bhtd,
-                            &k_full,
-                            &v_full,
-                            self.scale as f64,
-                        ) {
-                            Ok(attn) => {
-                                if trace_enabled {
-                                    write_inference_trace(format_args!(
-                                        "[MLX_TRACE] qwen3.5-attn cache_hit_prefill \
-                                         layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
-                                         path=paged_pool_sdpa estimated_sdpa_mib={:.1} \
-                                         estimated_varlen_mib={:.1} \
-                                         live_headroom_mib={:.1} elapsed_ms={:.1}",
-                                        attn_layer_idx,
-                                        seq_len,
-                                        cached_prefix_len,
-                                        total_ctx,
-                                        plan.estimated_sdpa_bytes as f64 / (1024.0 * 1024.0),
-                                        plan.estimated_varlen_bytes as f64 / (1024.0 * 1024.0),
-                                        plan.live_headroom_bytes.unwrap_or(0) as f64
-                                            / (1024.0 * 1024.0),
-                                        sdpa_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                                    ));
-                                }
-                                if report_prefill_route {
-                                    tracing::info!(
-                                        target: "mlx_core::inference",
-                                        event = "cache_hit_prefill_route",
-                                        layer = attn_layer_idx,
-                                        suffix_tokens = seq_len,
-                                        cached_prefix_tokens = cached_prefix_len,
-                                        total_context_tokens = total_ctx,
-                                        path = "paged_pool_sdpa",
-                                        elapsed_ms = sdpa_trace_start
-                                            .map(elapsed_ms)
-                                            .unwrap_or(0.0),
-                                        "cache-hit prefill attention graph constructed"
-                                    );
-                                }
-                                Some(attn)
-                            }
-                            Err(err) => {
-                                if trace_enabled {
-                                    write_inference_trace(format_args!(
-                                        "[MLX_TRACE] qwen3.5-attn cache_hit_prefill_sdpa_construction_fallback \
-                                         layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
-                                         stage=sdpa error={}",
-                                        attn_layer_idx, seq_len, cached_prefix_len, total_ctx, err
-                                    ));
-                                }
-                                tracing::warn!(
-                                    target: "mlx_core::inference",
-                                    event = "cache_hit_prefill_fallback",
-                                    layer = attn_layer_idx,
-                                    suffix_tokens = seq_len,
-                                    cached_prefix_tokens = cached_prefix_len,
-                                    total_context_tokens = total_ctx,
-                                    failed_path = "paged_pool_sdpa",
-                                    stage = "sdpa",
-                                    error = %err,
-                                    "cache-hit prefill SDPA construction failed"
-                                );
-                                None
-                            }
-                        },
-                        Err(err) => {
-                            if trace_enabled {
-                                write_inference_trace(format_args!(
-                                    "[MLX_TRACE] qwen3.5-attn cache_hit_prefill_sdpa_construction_fallback \
-                                     layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
-                                     stage=paged_pool_gather error={}",
-                                    attn_layer_idx, seq_len, cached_prefix_len, total_ctx, err
-                                ));
-                            }
-                            tracing::warn!(
-                                target: "mlx_core::inference",
-                                event = "cache_hit_prefill_fallback",
-                                layer = attn_layer_idx,
-                                suffix_tokens = seq_len,
-                                cached_prefix_tokens = cached_prefix_len,
-                                total_context_tokens = total_ctx,
-                                failed_path = "paged_pool_sdpa",
-                                stage = "paged_pool_gather",
-                                error = %err,
-                                "cache-hit prefill paged-pool gather failed"
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                let mut varlen_error = None;
-                let maybe_paged_attn = if should_try_varlen_after_sdpa(
-                    prefill_mode,
-                    maybe_sdpa.is_some(),
-                ) && batch == 1
-                    && graph_backend_available
-                {
-                    let paged_trace_start =
-                        (trace_enabled || report_prefill_route).then(Instant::now);
-                    let queries_paged =
-                        queries.reshape(&[seq_len, self.num_heads as i64, self.head_dim as i64])?;
-                    match adapter.gather_kv_for_prefill_chunk_varlen(
-                        attn_layer_idx,
-                        &queries_paged,
-                        cached_prefix_len,
-                        self.scale,
-                    ) {
-                        Ok(attn_t_h_d) => {
-                            let target_dtype = x.dtype()?;
-                            let attn_t_h_d = attn_t_h_d.astype(target_dtype)?;
-                            let attn = attn_t_h_d.reshape(&[
-                                batch,
-                                seq_len,
-                                self.num_heads as i64,
-                                self.head_dim as i64,
-                            ])?;
-                            let attn = attn.transpose(Some(&[0, 2, 1, 3]))?;
-                            if trace_enabled {
-                                write_inference_trace(format_args!(
-                                    "[MLX_TRACE] qwen3.5-attn cache_hit_prefill \
-                                     layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
-                                     path=paged_attention_varlen bridge_ms={:.1} \
-                                     estimated_sdpa_mib={:.1} estimated_varlen_mib={:.1} \
-                                     live_headroom_mib={:.1}",
-                                    attn_layer_idx,
-                                    seq_len,
-                                    cached_prefix_len,
-                                    total_ctx,
-                                    paged_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                                    plan.estimated_sdpa_bytes as f64 / (1024.0 * 1024.0),
-                                    plan.estimated_varlen_bytes as f64 / (1024.0 * 1024.0),
-                                    plan.live_headroom_bytes.unwrap_or(0) as f64
-                                        / (1024.0 * 1024.0)
-                                ));
-                            }
-                            if report_prefill_route {
-                                tracing::info!(
-                                    target: "mlx_core::inference",
-                                    event = "cache_hit_prefill_route",
-                                    layer = attn_layer_idx,
-                                    suffix_tokens = seq_len,
-                                    cached_prefix_tokens = cached_prefix_len,
-                                    total_context_tokens = total_ctx,
-                                    path = "paged_attention_varlen",
-                                    graph_build_ms = paged_trace_start
-                                        .map(elapsed_ms)
-                                        .unwrap_or(0.0),
-                                    "cache-hit prefill attention graph constructed"
-                                );
-                            }
-                            Some(attn)
-                        }
-                        Err(err) => {
-                            if trace_enabled {
-                                write_inference_trace(format_args!(
-                                    "[MLX_TRACE] qwen3.5-attn cache_hit_prefill_paged_construction_fallback \
-                                     layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
-                                     error={}",
-                                    attn_layer_idx, seq_len, cached_prefix_len, total_ctx, err
-                                ));
-                            }
-                            tracing::warn!(
-                                target: "mlx_core::inference",
-                                event = "cache_hit_prefill_fallback",
-                                layer = attn_layer_idx,
-                                suffix_tokens = seq_len,
-                                cached_prefix_tokens = cached_prefix_len,
-                                total_context_tokens = total_ctx,
-                                failed_path = "paged_attention_varlen",
-                                stage = "graph_construction",
-                                error = %err,
-                                "cache-hit varlen PagedAttention construction failed"
-                            );
-                            varlen_error = Some(err);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-
-                match maybe_sdpa.or(maybe_paged_attn) {
-                    Some(attn) => attn,
-                    // Splash reads int8 pages only in place; there is no
-                    // dequantizing host route.
-                    None if int8_pool => {
-                        return Err(napi::Error::from_reason(format!(
-                            "qwen3.5 int8 cache-hit prefill: the paged varlen read did not run \
-                             (batch {batch}, graph backend {graph_backend_available}): {}",
-                            varlen_error.as_deref().unwrap_or("not attempted")
-                        )));
-                    }
-                    None => {
-                        // Last-resort graph-construction path. Metal dispatch
-                        // errors surface later when the lazy graph evaluates.
-                        // This synchronously reads K/V through the host, so it
-                        // is intentionally never the normal route.
-                        let read_trace_start =
-                            (trace_enabled || inference_info_enabled).then(Instant::now);
-                        let (k_full, v_full) = adapter
-                            .read_kv_range(attn_layer_idx, 0, total_ctx)
-                            .map_err(napi::Error::from_reason)?;
-                        let read_kv_range_ms = read_trace_start.map(elapsed_ms);
-                        let sdpa_trace_start =
-                            (trace_enabled || inference_info_enabled).then(Instant::now);
-                        let attn = scaled_dot_product_attention_causal(
-                            &queries_bhtd,
-                            &k_full,
-                            &v_full,
-                            self.scale as f64,
-                        )?;
-                        if trace_enabled {
-                            write_inference_trace(format_args!(
-                                "[MLX_TRACE] qwen3.5-attn cache_hit_prefill \
-                                 layer={} suffix_tokens={} cached_prefix_tokens={} total_ctx={} \
-                                 path=host_read_fallback read_kv_range_ms={:.1} \
-                                 sdpa_mode=causal sdpa_graph_ms={:.1}",
-                                attn_layer_idx,
-                                seq_len,
-                                cached_prefix_len,
-                                total_ctx,
-                                read_kv_range_ms.unwrap_or(0.0),
-                                sdpa_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                            ));
-                        }
-                        tracing::warn!(
-                            target: "mlx_core::inference",
-                            event = "cache_hit_prefill_route",
-                            layer = attn_layer_idx,
-                            suffix_tokens = seq_len,
-                            cached_prefix_tokens = cached_prefix_len,
-                            total_context_tokens = total_ctx,
-                            path = "host_read_fallback",
-                            read_kv_range_ms = read_kv_range_ms.unwrap_or(0.0),
-                            sdpa_graph_ms = sdpa_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                            "cache-hit prefill used synchronous host-read fallback"
-                        );
-                        attn
-                    }
-                }
-            }
-        } else {
-            // Decode: prefer graph-native paged attention so native K/V
-            // writes and attention reads remain in one MLX dependency graph.
-            let queries_3d = queries_bhtd.squeeze(Some(&[2]))?.reshape(&[
-                1,
-                self.num_heads as i64,
-                self.head_dim as i64,
-            ])?;
-            let gather_trace_start = (trace_enabled || inference_debug_enabled).then(Instant::now);
-            let attn_3d = if !graph_decode_gather_enabled() {
-                let attn_3d = adapter
-                    .gather_kv_for_decode(
-                        attn_layer_idx,
-                        &queries_3d,
-                        self.scale,
-                        /* softcap */ 1.0,
-                    )
-                    .map_err(napi::Error::from_reason)?;
-                if trace_enabled {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-attn decode_gather_done \
-                         layer={} path=legacy total_ctx={} elapsed_ms={:.1}",
-                        attn_layer_idx,
-                        adapter.current_token_count(),
-                        gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                    ));
-                }
-                attn_3d
-            } else {
-                match adapter.gather_kv_for_decode_graph(
-                    attn_layer_idx,
-                    &queries_3d,
-                    self.scale,
-                    /* softcap */ 1.0,
-                ) {
-                    Ok(attn_3d) => {
-                        if trace_enabled {
-                            write_inference_trace(format_args!(
-                                "[MLX_TRACE] qwen3.5-attn decode_gather_done \
-                             layer={} path=graph total_ctx={} elapsed_ms={:.1}",
-                                attn_layer_idx,
-                                adapter.current_token_count(),
-                                gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                            ));
-                        }
-                        if inference_debug_enabled {
-                            tracing::debug!(
-                                target: "mlx_core::inference",
-                                event = "paged_attention_gather_done",
-                                layer = attn_layer_idx,
-                                path = "graph",
-                                context_tokens = adapter.current_token_count(),
-                                elapsed_ms = gather_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                                "paged attention layer gather completed"
-                            );
-                        }
-                        attn_3d
-                    }
-                    Err(err) => {
-                        if trace_enabled {
-                            write_inference_trace(format_args!(
-                                "[MLX_TRACE] qwen3.5-attn decode_gather_fallback \
-                             layer={} path=raw total_ctx={} error={}",
-                                attn_layer_idx,
-                                adapter.current_token_count(),
-                                err
-                            ));
-                        }
-                        if inference_info_enabled && attn_layer_idx == 0 {
-                            let context_tokens = adapter.current_token_count();
-                            let first_report =
-                                !DECODE_GATHER_FALLBACK_REPORTED.swap(true, Ordering::Relaxed);
-                            if first_report || context_tokens.is_multiple_of(32) {
-                                tracing::warn!(
-                                    target: "mlx_core::inference",
-                                    event = "paged_attention_gather_fallback",
-                                    layer = attn_layer_idx,
-                                    context_tokens,
-                                    failed_path = "graph",
-                                    fallback_path = "raw",
-                                    error = %err,
-                                    "graph paged-attention gather failed; using raw gather"
-                                );
-                            }
-                        }
-                        let attn_3d = adapter
-                            .gather_kv_for_decode(
-                                attn_layer_idx,
-                                &queries_3d,
-                                self.scale,
-                                /* softcap */ 1.0,
-                            )
-                            .map_err(napi::Error::from_reason)?;
-                        if inference_debug_enabled {
-                            tracing::debug!(
-                                target: "mlx_core::inference",
-                                event = "paged_attention_gather_done",
-                                layer = attn_layer_idx,
-                                path = "raw_fallback",
-                                context_tokens = adapter.current_token_count(),
-                                elapsed_ms = gather_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                                "paged attention layer gather completed"
-                            );
-                        }
-                        attn_3d
-                    }
-                }
-            };
-            let target_dtype = x.dtype()?;
-            let attn_3d = attn_3d.astype(target_dtype)?;
-            attn_3d.reshape(&[1, self.num_heads as i64, 1, self.head_dim as i64])?
-        };
-
-        // Transpose back: [B, H, T, D] -> [B, T, H*D].
-        let output = attn_bhtd.transpose(Some(&[0, 2, 1, 3]))?;
-        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
 
         // Apply gate: output * sigmoid(gate) — one compiled fusion.
         let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
@@ -3038,505 +2524,6 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_prefill_mode_preserves_explicit_override_semantics() {
-        assert_eq!(
-            parse_cache_hit_prefill_mode(None),
-            CacheHitPrefillMode::Auto
-        );
-        for value in ["1", "true", " yes ", "ON"] {
-            assert_eq!(
-                parse_cache_hit_prefill_mode(Some(value)),
-                CacheHitPrefillMode::ForcePaged,
-                "{value:?} should force paged prefill"
-            );
-        }
-        for value in ["0", "false", "off", "", "invalid"] {
-            assert_eq!(
-                parse_cache_hit_prefill_mode(Some(value)),
-                CacheHitPrefillMode::ForceSdpa,
-                "{value:?} should preserve the prior disabled-paged override"
-            );
-        }
-    }
-
-    #[test]
-    fn int8_pool_cache_hit_prefill_takes_varlen() {
-        for configured in [
-            CacheHitPrefillMode::Auto,
-            CacheHitPrefillMode::ForcePaged,
-            CacheHitPrefillMode::ForceSdpa,
-        ] {
-            let mode = cache_hit_prefill_mode_for_pool(configured, true);
-            assert_eq!(mode, CacheHitPrefillMode::ForcePaged);
-            let plan = select_cache_hit_prefill_plan(mode, 4_096, 1, u64::MAX, Some(u64::MAX));
-            assert_eq!(plan.path, CacheHitPrefillPath::PagedVarlen);
-            assert_eq!(
-                cache_hit_prefill_mode_for_pool(configured, false),
-                configured
-            );
-        }
-    }
-
-    #[test]
-    fn force_sdpa_never_falls_through_to_varlen_paged_attention() {
-        assert!(!should_try_varlen_after_sdpa(
-            CacheHitPrefillMode::ForceSdpa,
-            false,
-        ));
-        assert!(should_try_varlen_after_sdpa(
-            CacheHitPrefillMode::Auto,
-            false,
-        ));
-        assert!(should_try_varlen_after_sdpa(
-            CacheHitPrefillMode::ForcePaged,
-            false,
-        ));
-        assert!(!should_try_varlen_after_sdpa(
-            CacheHitPrefillMode::Auto,
-            true,
-        ));
-    }
-
-    #[test]
-    fn mlx_sdpa_fused_shape_gate_matches_metal_dispatcher() {
-        assert!(mlx_sdpa_uses_fused_kernel(2_048, 24, 4, 128, false));
-        assert!(!mlx_sdpa_uses_fused_kernel(2_048, 24, 4, 256, false));
-        assert!(mlx_sdpa_uses_fused_kernel(2_048, 24, 4, 256, true));
-        assert!(!mlx_sdpa_uses_fused_kernel(1_023, 24, 4, 256, true));
-        assert!(mlx_sdpa_uses_fused_kernel(1_024, 24, 4, 256, true));
-        assert!(mlx_sdpa_uses_fused_kernel(1, 24, 4, 256, false));
-        assert!(!mlx_sdpa_uses_fused_kernel(8, 24, 4, 256, true));
-        assert!(!mlx_sdpa_uses_fused_kernel(2_048, 24, 5, 128, true));
-    }
-
-    #[test]
-    fn paged_prefill_accounts_for_mlx_sdpa_dtype_promotion() {
-        assert_eq!(
-            prefill_sdpa_effective_dtype(DType::BFloat16, Some(DType::BFloat16)),
-            Some(DType::BFloat16)
-        );
-        assert_eq!(
-            prefill_sdpa_effective_dtype(DType::Float16, Some(DType::Float16)),
-            Some(DType::Float16)
-        );
-        assert_eq!(
-            prefill_sdpa_effective_dtype(DType::Float16, Some(DType::BFloat16)),
-            Some(DType::Float32)
-        );
-        assert_eq!(
-            prefill_sdpa_effective_dtype(DType::BFloat16, Some(DType::Float32)),
-            Some(DType::Float32)
-        );
-        assert_eq!(
-            prefill_sdpa_effective_dtype(DType::BFloat16, None),
-            None,
-            "int8 paged caches cannot feed graph-native SDPA without dequantization"
-        );
-    }
-
-    #[test]
-    fn qwen27b_long_prefill_fits_fast_sdpa_with_healthy_headroom() {
-        // Exact Qwen3.6-27B attention shape from the local checkpoint:
-        // 24 query heads, 4 KV heads, head_dim 256, bf16 activations.
-        let estimate = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2, false);
-        let varlen_estimate = estimate_varlen_paged_attention_bytes(2_048, 64_754, 24, 4, 256, 2);
-        assert_eq!(estimate, 7_063_814_144);
-        assert_eq!(varlen_estimate, 3_338_272_768);
-        let plan = select_cache_hit_prefill_plan(
-            CacheHitPrefillMode::Auto,
-            2_048,
-            estimate,
-            varlen_estimate,
-            Some(16 * 1024 * 1024 * 1024),
-        );
-        assert_eq!(plan.path, CacheHitPrefillPath::PagedPoolSdpa);
-    }
-
-    #[test]
-    fn m3_pro_recorded_continuation_uses_portable_sdpa_within_headroom() {
-        // Supplied M3 Pro trace: 1,012-token materialized chunk following
-        // 78,012 cached tokens; 3,318.9 MiB of Metal headroom. The old route
-        // estimated 4,389.7 MiB for SDPA and chose 1,942.8 MiB varlen scratch.
-        let portable =
-            estimate_paged_pool_sdpa_bytes_with_portable(1_012, 79_024, 24, 4, 256, 2, false, true);
-        let old = estimate_paged_pool_sdpa_bytes(1_012, 79_024, 24, 4, 256, 2, false);
-        let varlen = estimate_varlen_paged_attention_bytes(1_012, 79_024, 24, 4, 256, 2);
-        let headroom = Some((3318.9 * 1024.0 * 1024.0) as u64);
-        assert!(portable < 710 * 1024 * 1024);
-        assert!(old > 4 * 1024 * 1024 * 1024);
-        assert_eq!(
-            select_cache_hit_prefill_plan(CacheHitPrefillMode::Auto, 1_012, old, varlen, headroom)
-                .path,
-            CacheHitPrefillPath::PagedVarlen
-        );
-        assert_eq!(
-            select_cache_hit_prefill_plan(
-                CacheHitPrefillMode::Auto,
-                1_012,
-                portable,
-                varlen,
-                headroom
-            )
-            .path,
-            CacheHitPrefillPath::PagedPoolSdpa
-        );
-    }
-
-    #[test]
-    fn portable_estimate_covers_ragged_continuations() {
-        for query in [9_u64, 31, 32, 33, 531, 1_012, 1_024, 2_049] {
-            let total = 85_501 + query;
-            let estimate = estimate_paged_pool_sdpa_bytes_with_portable(
-                query, total, 24, 4, 256, 2, false, true,
-            );
-            let expected = total * 4 * 256 * 2 * 4
-                + query * 24 * 256 * 2 * 2
-                + PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES;
-            assert_eq!(estimate, expected);
-        }
-        for (query, dim, dtype) in [(8, 256, 2), (33, 256, 4), (33, 512, 2)] {
-            assert_eq!(
-                estimate_paged_pool_sdpa_bytes_with_portable(
-                    query, 4097, 24, 4, dim, dtype, false, true
-                ),
-                estimate_paged_pool_sdpa_bytes(query, 4097, 24, 4, dim, dtype, false),
-            );
-        }
-    }
-
-    #[test]
-    fn qwen27b_fused_d256_estimate_drops_scores_only_at_supported_boundary() {
-        let unfused = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2, false);
-        let fused = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2, true);
-        assert!(fused < unfused / 4, "fused={fused} unfused={unfused}");
-
-        let one_kv = 64_754_u64 * 4 * 256 * 2;
-        let one_query = 2_048_u64 * 24 * 256 * 2;
-        assert_eq!(
-            fused,
-            one_kv * 4 + one_query * 2 + PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES
-        );
-
-        // MLX's NAX D=256 kernel reads ragged tiles in place: no padded copies.
-        let ragged_query = estimate_paged_pool_sdpa_bytes(1_031, 4_129, 24, 4, 256, 2, true);
-        assert_eq!(
-            ragged_query,
-            4_129_u64 * 4 * 256 * 2 * 4
-                + 1_031_u64 * 24 * 256 * 2 * 2
-                + PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES
-        );
-
-        // Residual chunks below the upstream q_len=1024 routing boundary
-        // still use the primitives fallback and must retain score storage.
-        assert_eq!(
-            estimate_paged_pool_sdpa_bytes(1_023, 64_754, 24, 4, 256, 2, true),
-            estimate_paged_pool_sdpa_bytes(1_023, 64_754, 24, 4, 256, 2, false),
-        );
-
-        let varlen = estimate_varlen_paged_attention_bytes(2_048, 64_754, 24, 4, 256, 2);
-        let headroom = Some(4 * 1024 * 1024 * 1024);
-        assert_eq!(
-            select_cache_hit_prefill_plan(
-                CacheHitPrefillMode::Auto,
-                2_048,
-                unfused,
-                varlen,
-                headroom,
-            )
-            .path,
-            CacheHitPrefillPath::PagedVarlen,
-        );
-        assert_eq!(
-            select_cache_hit_prefill_plan(
-                CacheHitPrefillMode::Auto,
-                2_048,
-                fused,
-                varlen,
-                headroom,
-            )
-            .path,
-            CacheHitPrefillPath::PagedPoolSdpa,
-        );
-    }
-
-    #[test]
-    fn automatic_prefill_uses_varlen_when_sdpa_score_matrix_will_not_fit() {
-        let estimate = estimate_paged_pool_sdpa_bytes(2_048, 64_754, 24, 4, 256, 2, false);
-        let varlen_estimate = estimate_varlen_paged_attention_bytes(2_048, 64_754, 24, 4, 256, 2);
-        assert_eq!(
-            select_cache_hit_prefill_plan(
-                CacheHitPrefillMode::Auto,
-                2_048,
-                estimate,
-                varlen_estimate,
-                None,
-            )
-            .path,
-            CacheHitPrefillPath::PagedVarlen
-        );
-        assert_eq!(
-            select_cache_hit_prefill_plan(
-                CacheHitPrefillMode::Auto,
-                2_048,
-                estimate,
-                varlen_estimate,
-                Some(8 * 1024 * 1024 * 1024),
-            )
-            .path,
-            CacheHitPrefillPath::PagedVarlen
-        );
-
-        // Decode-shaped reuse prefills stay directly on varlen paging instead
-        // of gathering the full contiguous K/V for MLX's vector SDPA.
-        assert_eq!(
-            select_cache_hit_prefill_plan(CacheHitPrefillMode::Auto, 1, 1, 1, Some(u64::MAX),).path,
-            CacheHitPrefillPath::PagedVarlen
-        );
-    }
-
-    #[test]
-    fn qwen27b_varlen_estimate_respects_query_layout() {
-        // q_len=2, 24Q/4KV, D256, BF16 at >64K can select 1,024 stripes.
-        // Aux state is 49,152 rows * (two f32 stats + 256 BF16 values),
-        // plus final output and the planner's fixed 64 MiB headroom.
-        assert_eq!(
-            estimate_varlen_paged_attention_bytes(2, 114_688, 24, 4, 256, 2),
-            92_692_480
-        );
-        assert_eq!(
-            estimate_varlen_paged_attention_bytes(1, 114_688, 24, 4, 256, 2),
-            69_916_672,
-            "one varlen row uses generic 512-token partitions"
-        );
-    }
-
-    #[test]
-    fn automatic_prefill_rejects_varlen_beyond_metal_aux_element_limit() {
-        // At 114,688 tokens the generic V2 route has 224 partitions. With
-        // 24 heads and D=256, q=1,560 is the last shape whose partial-output
-        // tensor fits the bridge's signed 32-bit element count.
-        assert_ne!(
-            estimate_varlen_paged_attention_bytes(1_560, 114_688, 24, 4, 256, 2),
-            u64::MAX
-        );
-        assert_eq!(
-            estimate_varlen_paged_attention_bytes(1_561, 114_688, 24, 4, 256, 2),
-            u64::MAX
-        );
-
-        let sdpa = estimate_paged_pool_sdpa_bytes(2_048, 114_688, 24, 4, 256, 2, false);
-        let varlen = estimate_varlen_paged_attention_bytes(2_048, 114_688, 24, 4, 256, 2);
-        assert_eq!(varlen, u64::MAX);
-        assert_eq!(
-            select_cache_hit_prefill_plan(
-                CacheHitPrefillMode::Auto,
-                2_048,
-                sdpa,
-                varlen,
-                Some(4 * 1024 * 1024 * 1024),
-            )
-            .path,
-            CacheHitPrefillPath::PagedPoolSdpa,
-            "auto mode must not select a varlen graph the Metal bridge rejects"
-        );
-        assert_eq!(
-            select_cache_hit_prefill_plan(CacheHitPrefillMode::Auto, 2_048, sdpa, varlen, None,)
-                .path,
-            CacheHitPrefillPath::PagedPoolSdpa,
-            "the no-probe planner branch must reject the same invalid graph"
-        );
-        assert_eq!(
-            select_cache_hit_prefill_plan(
-                CacheHitPrefillMode::ForcePaged,
-                2_048,
-                sdpa,
-                varlen,
-                None,
-            )
-            .path,
-            CacheHitPrefillPath::PagedVarlen,
-            "an explicit diagnostic override retains its existing semantics"
-        );
-    }
-
-    #[test]
-    fn automatic_prefill_chooses_smaller_transient_when_neither_path_fits() {
-        let headroom = Some(2 * 1024 * 1024 * 1024);
-        assert_eq!(
-            select_cache_hit_prefill_plan(
-                CacheHitPrefillMode::Auto,
-                256,
-                622_739_456,
-                1_727_660_032,
-                headroom,
-            )
-            .path,
-            CacheHitPrefillPath::PagedPoolSdpa
-        );
-        assert_eq!(
-            select_cache_hit_prefill_plan(
-                CacheHitPrefillMode::Auto,
-                2_048,
-                7_063_814_144,
-                3_338_272_768,
-                headroom,
-            )
-            .path,
-            CacheHitPrefillPath::PagedVarlen
-        );
-    }
-
-    #[test]
-    fn automatic_prefill_uses_smaller_estimate_without_memory_probe() {
-        assert_eq!(
-            select_cache_hit_prefill_plan(
-                CacheHitPrefillMode::Auto,
-                256,
-                622_739_456,
-                1_727_660_032,
-                None,
-            )
-            .path,
-            CacheHitPrefillPath::PagedPoolSdpa
-        );
-    }
-
-    #[test]
-    fn allocator_and_metal_headroom_are_independent_bounds() {
-        assert_eq!(
-            select_live_prefill_headroom(None, Some(16 * 1024 * 1024 * 1024)),
-            Some(16 * 1024 * 1024 * 1024)
-        );
-        assert_eq!(select_live_prefill_headroom(Some(12), Some(8)), Some(8));
-        assert_eq!(select_live_prefill_headroom(Some(12), None), Some(12));
-        assert_eq!(select_live_prefill_headroom(None, None), None);
-    }
-
-    #[test]
-    fn live_headroom_includes_external_metal_pool_and_reclaimable_cache() {
-        let gib = 1024 * 1024 * 1024;
-        let headroom = live_headroom(
-            PagedPrefillMemorySnapshot {
-                allocator_active_bytes: Some(20 * gib),
-                allocator_cached_bytes: Some(4 * gib),
-                allocator_limit_bytes: Some(120 * gib),
-                metal_recommended_working_set_bytes: Some(100 * gib),
-                metal_current_allocated_bytes: Some(40 * gib),
-                paged_pool_allocated_bytes: Some(16 * gib),
-            },
-            None,
-        );
-
-        // MLX GC ceiling: min(120 GiB, 95% of 100 GiB) - 20 GiB active.
-        assert_eq!(headroom.allocator_ceiling_bytes, Some(95 * gib));
-        assert_eq!(headroom.allocator_available_bytes, Some(75 * gib));
-        // Metal sees the external 16 GiB pool in currentAllocatedSize; only
-        // the 4 GiB MLX cache is reclaimable.
-        assert_eq!(headroom.metal_available_bytes, Some(64 * gib));
-        assert_eq!(headroom.selected_bytes, Some(64 * gib));
-    }
-
-    /// A memory plan's ceiling replaces the 95% working-set rule on both
-    /// paths. Mutation: keep the recommended working set on the Metal path
-    /// in `live_headroom` → red (64 GiB).
-    #[test]
-    fn live_headroom_under_the_plan_ceiling() {
-        let gib = 1024 * 1024 * 1024;
-        let headroom = live_headroom(
-            PagedPrefillMemorySnapshot {
-                allocator_active_bytes: Some(20 * gib),
-                allocator_cached_bytes: Some(4 * gib),
-                allocator_limit_bytes: Some(120 * gib),
-                metal_recommended_working_set_bytes: Some(100 * gib),
-                metal_current_allocated_bytes: Some(40 * gib),
-                paged_pool_allocated_bytes: Some(16 * gib),
-            },
-            Some(50 * gib),
-        );
-        assert_eq!(headroom.allocator_ceiling_bytes, Some(50 * gib));
-        assert_eq!(headroom.allocator_available_bytes, Some(30 * gib));
-        assert_eq!(headroom.metal_available_bytes, Some(14 * gib));
-        assert_eq!(headroom.selected_bytes, Some(14 * gib));
-    }
-
-    #[test]
-    fn missing_metal_probe_subtracts_known_external_pool_from_allocator() {
-        let gib = 1024 * 1024 * 1024;
-        let headroom = live_headroom(
-            PagedPrefillMemorySnapshot {
-                allocator_active_bytes: Some(70 * gib),
-                allocator_cached_bytes: Some(2 * gib),
-                allocator_limit_bytes: Some(100 * gib),
-                paged_pool_allocated_bytes: Some(16 * gib),
-                ..PagedPrefillMemorySnapshot::default()
-            },
-            None,
-        );
-        assert_eq!(headroom.allocator_available_bytes, Some(14 * gib));
-        assert_eq!(headroom.selected_bytes, Some(14 * gib));
-
-        let exhausted = live_headroom(
-            PagedPrefillMemorySnapshot {
-                allocator_active_bytes: Some(95 * gib),
-                allocator_limit_bytes: Some(100 * gib),
-                paged_pool_allocated_bytes: Some(16 * gib),
-                ..PagedPrefillMemorySnapshot::default()
-            },
-            None,
-        );
-        assert_eq!(exhausted.selected_bytes, Some(0));
-    }
-
-    #[test]
-    fn memory_probe_is_skipped_for_mtp_and_explicit_routes() {
-        assert!(!should_probe_cache_hit_prefill_memory(
-            CacheHitPrefillMode::Auto,
-            2,
-            true,
-        ));
-        assert!(!should_probe_cache_hit_prefill_memory(
-            CacheHitPrefillMode::ForcePaged,
-            2_048,
-            true,
-        ));
-        assert!(!should_probe_cache_hit_prefill_memory(
-            CacheHitPrefillMode::ForceSdpa,
-            2_048,
-            true,
-        ));
-        assert!(!should_probe_cache_hit_prefill_memory(
-            CacheHitPrefillMode::Auto,
-            2_048,
-            false,
-        ));
-        assert!(should_probe_cache_hit_prefill_memory(
-            CacheHitPrefillMode::Auto,
-            2_048,
-            true,
-        ));
-    }
-
-    #[test]
-    fn explicit_prefill_override_wins_over_memory_heuristic() {
-        assert_eq!(
-            select_cache_hit_prefill_plan(
-                CacheHitPrefillMode::ForcePaged,
-                1,
-                1,
-                u64::MAX,
-                Some(u64::MAX),
-            )
-            .path,
-            CacheHitPrefillPath::PagedVarlen
-        );
-        assert_eq!(
-            select_cache_hit_prefill_plan(CacheHitPrefillMode::ForceSdpa, 1, u64::MAX, 1, Some(1),)
-                .path,
-            CacheHitPrefillPath::PagedPoolSdpa
-        );
-    }
-
-    #[test]
     fn prism_hadamard_paged_operands_cast_only_rotated_fp32() -> Result<()> {
         use crate::quant::prism_hadamard::HadamardTransform;
         let cfg = Qwen3_5Config {
@@ -4480,5 +3467,191 @@ mod tests {
         assert_eq!(bits_of(&a_cos), bits_of(&b_cos));
         assert_eq!(bits_of(&a_sin), bits_of(&b_sin));
         Ok(())
+    }
+
+    /// `n` values uniform in ±1 from `seed`; with `outlier`, dimension
+    /// `(row · 37) % dim` of each `dim`-wide row times 60.
+    fn paged_attend_values(n: usize, dim: usize, seed: u32, outlier: bool) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(11);
+        (0..n)
+            .map(|i| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let value = ((state >> 8) % 2001) as f32 / 1000.0 - 1.0;
+                let row = i / dim;
+                if outlier && i % dim == (row * 37) % dim {
+                    value * 60.0
+                } else {
+                    value
+                }
+            })
+            .collect()
+    }
+
+    fn bf16_array(values: &[f32], shape: &[i64]) -> MxArray {
+        MxArray::from_float32(values, shape)
+            .and_then(|a| a.astype(DType::BFloat16))
+            .expect("bf16 array")
+    }
+
+    fn f32_values(array: &MxArray) -> Vec<f32> {
+        array
+            .astype(DType::Float32)
+            .and_then(|a| a.to_float32())
+            .expect("f32 values")
+            .to_vec()
+    }
+
+    /// Layer 0's first `n` stored rows of `pool` over the block `ids` as f64
+    /// `[Hkv][n][D]` (an int8 row times its scale, exactly).
+    #[cfg(target_os = "macos")]
+    fn stored_rows(
+        pool: &mlx_paged_attn::LayerKVPool,
+        ids: &[u32],
+        n: usize,
+        hkv: usize,
+        d: usize,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let read = |raw: std::result::Result<*mut mlx_sys::mlx_array, String>| {
+            f32_values(&MxArray::from_handle(raw.expect("pool plane"), "pool plane").unwrap())
+        };
+        let int8 = pool.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8;
+        let (x, bs) = (if int8 { 16 } else { 8 }, pool.config().block_size as usize);
+        let k = read(pool.key_cache_array_raw(0));
+        let v = read(pool.value_cache_array_raw(0));
+        let (ks, vs) = if int8 {
+            (
+                read(pool.key_scale_array_raw(0)),
+                read(pool.value_scale_array_raw(0)),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let mut keys = vec![0f64; hkv * n * d];
+        let mut values = vec![0f64; hkv * n * d];
+        for h in 0..hkv {
+            for t in 0..n {
+                let block = ids[t / bs] as usize;
+                let slot = t % bs;
+                let scale = |plane: &[f32]| {
+                    if int8 {
+                        f64::from(plane[(block * hkv + h) * bs + slot])
+                    } else {
+                        1.0
+                    }
+                };
+                for dim in 0..d {
+                    let ki = (((block * hkv + h) * (d / x) + dim / x) * bs + slot) * x + dim % x;
+                    let vi = ((block * hkv + h) * d + dim) * bs + slot;
+                    keys[(h * n + t) * d + dim] = f64::from(k[ki]) * scale(&ks);
+                    values[(h * n + t) * d + dim] = f64::from(v[vi]) * scale(&vs);
+                }
+            }
+        }
+        (keys, values)
+    }
+
+    /// A paged prefill chunk stores its rows, then attends over the pool
+    /// pages: every row, the chunk's own included, reads back as stored
+    /// (int8 · scale on an int8 pool; Splash `addPrefillStore` then
+    /// `addPrefill`). 24 / 4 heads, D256, 16-token blocks: a cold 40-row
+    /// chunk at 0 and a 24-row chunk at 40, against an f64 softmax over
+    /// `read_kv_range` within Splash's `checkOutput` bound (`mass[d] / 256 +
+    /// ulp_bf16(ref)`). K / V rows carry one ×60 dimension each, so their
+    /// int8 rows differ clearly from bf16. Mutation O1: a prefill chunk at
+    /// position 0 attends its in-flight bf16 rows (MLX causal SDPA) → red
+    /// (int8, P = 0).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paged_attention_reads_its_own_rows_back() {
+        use crate::transformer::paged_int8_tests::adapter_for;
+        use mlx_paged_attn::metal::MetalDtype;
+        const HQ: usize = 24;
+        const HKV: usize = 4;
+        const D: usize = 256;
+        let config = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: 256,
+            head_size: D as u32,
+            num_kv_heads: HKV as u32,
+            num_layers: 1,
+            max_seq_len: Some(1024),
+            max_batch_size: Some(4),
+        };
+        let scale = 1.0 / (D as f32).sqrt();
+        for dtype in [MetalDtype::Int8, MetalDtype::BFloat16] {
+            let Some((mut adapter, _pool)) = adapter_for(config.clone(), 8, 8, dtype) else {
+                return;
+            };
+            adapter.reset_for_new_request(1).unwrap();
+            adapter.allocate_suffix_blocks(64).unwrap();
+            for (seed, (committed, rows)) in [(0usize, 40usize), (40, 24)].into_iter().enumerate() {
+                adapter
+                    .record_tokens(
+                        &(committed as u32..(committed + rows) as u32).collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                let seed = seed as u32 * 10;
+                let q = paged_attend_values(rows * HQ * D, D, seed + 1, false);
+                let k = paged_attend_values(rows * HKV * D, D, seed + 2, true);
+                let v = paged_attend_values(rows * HKV * D, D, seed + 3, true);
+                let queries = bf16_array(&q, &[1, rows as i64, HQ as i64, D as i64]);
+                let keys = bf16_array(&k, &[1, rows as i64, HKV as i64, D as i64]);
+                let values = bf16_array(&v, &[1, rows as i64, HKV as i64, D as i64]);
+                let got = paged_store_attend(
+                    &mut adapter,
+                    0,
+                    committed as u32,
+                    PagedPass::Prefill,
+                    &queries,
+                    &keys,
+                    &values,
+                    scale,
+                    DType::BFloat16,
+                )
+                .unwrap();
+                let got = f32_values(&got);
+                let q = f32_values(&queries);
+                let visible = committed + rows;
+                let ids = adapter.block_table().expect("table").block_ids();
+                let (k_pool, v_pool) = stored_rows(&_pool, &ids, visible, HKV, D);
+                let mut worst = 0f64;
+                for row in 0..rows {
+                    let end = committed + row + 1;
+                    for head in 0..HQ {
+                        let kv = head / (HQ / HKV);
+                        let query = &q[(row * HQ + head) * D..][..D];
+                        let scores: Vec<f64> = (0..end)
+                            .map(|t| {
+                                let key = &k_pool[(kv * visible + t) * D..][..D];
+                                query
+                                    .iter()
+                                    .zip(key)
+                                    .map(|(a, b)| f64::from(*a) * b)
+                                    .sum::<f64>()
+                                    * f64::from(scale)
+                            })
+                            .collect();
+                        let max = scores.iter().cloned().fold(f64::MIN, f64::max);
+                        let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                        let sum: f64 = weights.iter().sum();
+                        for d in 0..D {
+                            let (mut out, mut mass) = (0f64, 0f64);
+                            for (t, w) in weights.iter().enumerate() {
+                                let value = v_pool[(kv * visible + t) * D + d];
+                                out += w / sum * value;
+                                mass += w / sum * value.abs();
+                            }
+                            let ulp = f64::from(bf16_ulp(out as f32));
+                            let error = (f64::from(got[(row * HQ + head) * D + d]) - out).abs();
+                            worst = worst.max(error / (mass / 256.0 + ulp));
+                        }
+                    }
+                }
+                assert!(
+                    worst <= 1.0,
+                    "{dtype:?} P {committed} T {rows}: worst error {worst:.3} of the bound"
+                );
+            }
+        }
     }
 }

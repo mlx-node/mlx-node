@@ -27,6 +27,7 @@ mod config;
 #[cfg(target_os = "macos")]
 mod extern_c;
 mod layer_kv_pool;
+pub mod prefill_plan;
 mod prefix_registry;
 pub mod profile;
 mod recency;

@@ -34,6 +34,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 #include "mlx/array.h"
 
@@ -197,6 +199,73 @@ void dispatch_paged_attention_varlen_auto(
     float softcap,
     int sliding_window,
     KvDtype kv_dtype);
+
+/// Parameters of the in-place prefill / verify attention (Splash
+/// SplashPrefillAttentionParams over the mlx-node pool). Mirrored by
+/// `PagedPrefillParams` in `paged_prefill_attention.metal`.
+struct PagedPrefillParams {
+  uint32_t committed_tokens;
+  uint32_t rows;
+  uint32_t chunk_stride;
+  uint32_t table_entries;
+  uint32_t split_count;
+  uint32_t max_splits;
+  uint32_t block_size;
+  uint32_t kv_heads;
+};
+static_assert(sizeof(PagedPrefillParams) == 32, "matches the Metal struct");
+
+/// Query rows of a tile (Splash SPLASH_PREFILL_ATTENTION_TILE_ROWS).
+constexpr int kPagedPrefillTileRows = 8;
+/// Rows of one chunk (Splash SPLASH_PREFILL_TOKEN_BUDGET).
+constexpr int kPagedPrefillMaxRows = 2048;
+/// Splits of a prefill / verify launch (Splash
+/// SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS / kVerifyMaximumSplits).
+constexpr int kPagedPrefillMaxSplits = 32;
+constexpr int kPagedVerifyMaxSplits = 128;
+/// Rows of a verify launch (Splash SPLASH_TARGET_VERIFY_ROWS).
+constexpr int kPagedVerifyRows = 8;
+
+/// Whether a (query heads per KV head, head dim) pair has an instance.
+bool paged_prefill_attention_geometry(int group, int head_size);
+
+/// Every split and reduce function the dispatch can request.
+std::vector<std::string> paged_prefill_attention_kernel_names();
+
+/// The pipeline of split or reduce function `name`. A pipeline that does not
+/// build throws, naming the kernel and the device's Apple GPU family.
+MTL::ComputePipelineState* paged_prefill_pipeline(
+    mlx::core::metal::Device& device,
+    const std::string& name);
+
+/// Builds the split and reduce pipelines of every instance.
+int64_t build_paged_prefill_attention_pipelines(mlx::core::metal::Device& device);
+
+/// Floats of the workspace one launch writes: partials then statistics
+/// (Splash PagedAttention::prefillPlan, exact).
+int64_t paged_prefill_workspace_floats(
+    int rows, int splits, int num_q_heads, int head_size);
+
+/// Encodes the split then the reduce. `q_staged` is
+/// [kv heads][chunk_stride][group][D] bf16, `out` [rows][query heads][D]
+/// bf16, `workspace` the f32 partials + statistics the split writes and the
+/// reduce reads.
+void dispatch_paged_prefill_attention(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    mlx::core::array& out,
+    mlx::core::array& workspace,
+    const mlx::core::array& q_staged,
+    const mlx::core::array& k_pool,
+    const mlx::core::array& v_pool,
+    const mlx::core::array& k_scale,
+    const mlx::core::array& v_scale,
+    const mlx::core::array& block_table,
+    const PagedPrefillParams& params,
+    int num_q_heads,
+    int head_size,
+    KvDtype cache_dtype,
+    int64_t live_blocks);
 
 } // namespace mlx::core::fast::paged
 

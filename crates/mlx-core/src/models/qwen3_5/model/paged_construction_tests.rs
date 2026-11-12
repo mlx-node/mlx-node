@@ -51,11 +51,14 @@ fn tiny_cfg(use_block_paged: bool) -> Qwen3_5Config {
 
 pub(super) fn tiny_paged_forward_cfg() -> Qwen3_5Config {
     let mut cfg = tiny_cfg(true);
-    // Paged attention's Metal kernels require head_dim=32+, so the
-    // production-forward tests use a separate, larger shape.
+    // The paged prefill attention kernel needs a query group of 4, 6, 8 or
+    // 16 and head 128 or 256, so the production-forward tests use a
+    // separate, larger shape.
     cfg.hidden_size = 128;
     cfg.intermediate_size = 256;
-    cfg.head_dim = 32;
+    cfg.num_heads = 8;
+    cfg.num_kv_heads = 2;
+    cfg.head_dim = 128;
     cfg.linear_key_head_dim = 32;
     cfg.linear_value_head_dim = 32;
     cfg.paged_cache_memory_mb = Some(256);
@@ -311,7 +314,7 @@ fn pool_follows_kv_format() {
         Err(error) => error,
     };
     assert!(
-        error.reason.contains("no int8 paged attention kernel"),
+        error.reason.contains("int8 pages need BF16 rows"),
         "{}",
         error.reason
     );
@@ -397,7 +400,7 @@ fn explicit_pool_size_above_the_plan_fails_load() {
             .expect("adapter")
             .layer_kv_pool()
             .max_num_blocks(),
-        256 * 1024 * 1024 / 8192
+        256 * 1024 * 1024 / 32_768
     );
 }
 
@@ -424,7 +427,7 @@ fn pool_below_the_config_floor_loads() {
         let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
         assert_eq!(adapter.layer_kv_pool().max_num_blocks(), pool.max_blocks);
         if let Some(mib) = explicit_mib {
-            assert_eq!(pool.max_blocks, mib * 1024 * 1024 / 8192);
+            assert_eq!(pool.max_blocks, mib * 1024 * 1024 / 32_768);
         }
     }
 }

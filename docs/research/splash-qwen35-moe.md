@@ -215,6 +215,8 @@ Reading:
 - The tail figures assume the first chunk is bit-identical in both formats
   (empty prefix takes the BF16 route in `forward_int8_cached`); not measured
   separately. If it is not, the true tail top-1 is higher.
+  Since the in-place paged prefill attention, a paged first chunk reads its
+  own rows back as int8 too, so a paged score has no BF16 first chunk.
 - 27B: the teacher was captured, but the default score run failed while
   materializing weights (`kIOGPUCommandBufferCallbackErrorTimeout`, weight
   chunk 10 of 2.9 GB); the 27B bf16 control was not run (30-minute budget).

@@ -60,11 +60,13 @@ export const TINY_QWEN35_CONFIG: Qwen35Config = {
   vocabSize: 1000,
   hiddenSize: 128,
   numLayers: 4,
-  numHeads: 4,
+  // The paged prefill attention kernel needs a query group of 4, 6, 8 or 16
+  // and head 128 or 256.
+  numHeads: 8,
   numKvHeads: 2,
   intermediateSize: 256,
   rmsNormEps: 1e-6,
-  headDim: 32,
+  headDim: 128,
   tieWordEmbeddings: true,
   attentionBias: false,
   maxPositionEmbeddings: 512,

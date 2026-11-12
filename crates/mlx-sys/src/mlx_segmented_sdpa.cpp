@@ -1467,15 +1467,6 @@ mlx_array *segmented_sdpa_int8_forward_impl(
 
 } // namespace
 
-extern "C" mlx_array *
-mlx_segmented_sdpa_forward(mlx_array *q, mlx_array *prefix_k,
-                           mlx_array *prefix_v, mlx_array *new_k,
-                           mlx_array *new_v, float scale, bool causal) {
-  return segmented_sdpa_forward_impl(
-      q, prefix_k, prefix_v, new_k, new_v, scale, causal, false,
-      mlx::core::segmented_sdpa::SegmentedTileMode::automatic);
-}
-
 // INT8 K/V (per-row fp32 scales) production entry. The int8 primitive never
 // qualifies the dequantizing concat fallback silently: a compiled verify
 // trace over it would bake the prefix length, so an unsupported launch is an
@@ -1758,12 +1749,6 @@ extern "C" int mlx_segmented_sdpa_test_verify_pipeline_limits(int gqa, int rows,
 }
 
 #else
-
-extern "C" mlx_array *mlx_segmented_sdpa_forward(mlx_array *, mlx_array *,
-                                                 mlx_array *, mlx_array *,
-                                                 mlx_array *, float, bool) {
-  return nullptr;
-}
 
 extern "C" mlx_array *mlx_segmented_sdpa_test_forward(mlx_array *, mlx_array *,
                                                       mlx_array *, mlx_array *,

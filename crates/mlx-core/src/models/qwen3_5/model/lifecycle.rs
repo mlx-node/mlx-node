@@ -167,7 +167,7 @@ impl Qwen35Inner {
         let cache_dtype = crate::models::qwen3_5::load_plan::qwen35_pool_cache_dtype(
             "Qwen3.5 block-paged adapter",
             format,
-            head_size,
+            crate::models::qwen3_5::load_plan::PoolHeads::of(&self.config),
             block_size,
             crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&*self)?,
         )?;

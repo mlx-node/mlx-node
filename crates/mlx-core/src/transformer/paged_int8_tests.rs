@@ -326,38 +326,19 @@ pub(crate) fn bits(array: &MxArray) -> Vec<u16> {
     array.to_uint16_native().expect("bf16 bits")
 }
 
-/// The dense gather (sdpa and dense cache hit) and `read_kv_range` of an int8
-/// pool hand back exactly the flat int8 cache's BF16 rows: the flat quantizer
-/// then `dequantize_kv_rows`, the same op. Layer 1 rows are 4x layer 0's.
+/// `read_kv_range` of an int8 pool hands back exactly the flat int8 cache's
+/// BF16 rows: the flat quantizer then `dequantize_kv_rows`, the same op.
+/// Layer 1 rows are 4x layer 0's.
 ///
-/// Mutation M2: the dense gather takes the scale planes `[B, H, bs]` into
-/// `[1, H, B·bs]` with no transpose → red. Mutation M3: `read_kv_range`
-/// unpacks int8 K with x = 8 → red.
+/// Mutation M3: `read_kv_range` unpacks int8 K with x = 8 → red.
 #[test]
 fn int8_dense_reads_dequantize_like_the_flat_rows() {
     dense_reads_match_flat(pool_config_d256(), 53, &[(0, 53), (19, 30)]);
 }
 
-/// A dense gather inside one page hands the dequantize op V rows whose head
-/// dimension has a stride of the block size (the reshape after the page
-/// transpose is a view); they still read exactly the flat rows.
-///
-/// Mutation U1: the dequantize kernel reads the head dimension at stride 1
-/// → red (V).
-#[test]
-fn int8_one_page_dense_reads_dequantize_like_the_flat_rows() {
-    for block_size in [16, 32] {
-        let config = PagedAttentionConfig {
-            block_size,
-            ..pool_config_d256()
-        };
-        dense_reads_match_flat(config, 9, &[(0, 9), (2, 5)]);
-    }
-}
-
-/// Writes `tokens` rows per layer into a 4-block int8 pool, then checks the
-/// dense gathers over `[0, tokens)` and `read_kv_range` over each
-/// `(start, count)` bit for bit against the flat int8 rows' dequantize.
+/// Writes `tokens` rows per layer into a 4-block int8 pool, then checks
+/// `read_kv_range` over each `(start, count)` bit for bit against the flat
+/// int8 rows' dequantize.
 fn dense_reads_match_flat(config: PagedAttentionConfig, tokens: usize, ranges: &[(u32, u32)]) {
     let block_size = config.block_size;
     let Some((mut adapter, _)) = adapter_for(config, 4, 4, MetalDtype::Int8) else {
@@ -386,23 +367,7 @@ fn dense_reads_match_flat(config: PagedAttentionConfig, tokens: usize, ranges: &
 
     for layer in 0..LAYERS {
         let rows = &flat[layer as usize];
-        let mut reads: Vec<(String, (MxArray, MxArray), (i64, i64))> = vec![
-            (
-                "prefill sdpa".to_string(),
-                adapter
-                    .gather_kv_for_prefill_sdpa(layer, tokens as u32)
-                    .unwrap(),
-                (0, tokens as i64),
-            ),
-            (
-                "dense cache hit".to_string(),
-                adapter
-                    .gather_kv_for_dense_cache_hit_prefill(layer, tokens as u32)
-                    .map(|(keys, values, _)| (keys, values))
-                    .unwrap(),
-                (0, tokens as i64),
-            ),
-        ];
+        let mut reads: Vec<(String, (MxArray, MxArray), (i64, i64))> = Vec::new();
         for &(start, count) in ranges {
             reads.push((
                 format!("read_kv_range [{start}, +{count})"),

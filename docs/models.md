@@ -407,7 +407,7 @@ second GDN cell and the draft's K/V ring, Splash
 larger of the tapped prefill chunk and the 8-row verify cycle with the free
 pool MLX keeps of it (twice the cycle; MLX collects that pool only at 95% of
 the working set). On the M3 Pro inputs (27 GiB working set, the 27B and its
-draft, int8 pool) that is 94,201 tokens for every turn. DFlash2 runs only on
+draft, int8 pool) that is 98,297 tokens for every turn. DFlash2 runs only on
 the block-paged pool: a load with a draft and no pool fails. A load with no
 pool (`use_block_paged_cache: false`, a sym8 checkpoint, no compiled backend)
 is planned on its flat lane, so `maxMemoryBytes` bounds it and can refuse it

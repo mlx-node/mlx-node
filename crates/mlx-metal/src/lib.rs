@@ -18,7 +18,7 @@ use std::ptr::NonNull;
 use foreign_types::ForeignTypeRef;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2_foundation::{NSError, NSString};
+use objc2_foundation::{NSError, NSRange, NSString};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLFunction,
@@ -570,6 +570,17 @@ impl BlitCommandEncoder {
                     size as usize,
                 );
         }
+    }
+
+    #[inline]
+    pub fn fill_buffer(&self, buffer: &BufferRef, offset: u64, size: u64, value: u8) {
+        // Callers keep the range inside the buffer and the buffer alive until
+        // the enclosing command buffer completes.
+        self.0.fillBuffer_range_value(
+            buffer.inner(),
+            NSRange::new(offset as usize, size as usize),
+            value,
+        );
     }
 
     #[inline]

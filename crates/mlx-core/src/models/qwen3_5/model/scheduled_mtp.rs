@@ -138,12 +138,7 @@ impl ScheduledMtpTarget for Qwen35Inner {
 
 #[cfg(test)]
 pub(crate) fn seeded_inner(seed: u64) -> Qwen35Inner {
-    seeded_inner_with_attention_head_dim(seed, 32)
-}
-
-#[cfg(test)]
-pub(crate) fn seeded_inner_with_attention_head_dim(seed: u64, head_dim: i32) -> Qwen35Inner {
-    seeded_inner_with_config(seed, |config| config.head_dim = head_dim)
+    seeded_inner_with_config(seed, |_| {})
 }
 
 /// The seeded fixture with `adjust` applied to the tiny config before the

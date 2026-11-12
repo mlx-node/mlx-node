@@ -195,6 +195,42 @@ bool mlx_paged_kv_write_forward(
   return false;
 }
 
+bool mlx_paged_prefill_attention_forward(
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    mlx_array*,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    uint8_t,
+    float,
+    mlx_array** out_attention,
+    mlx_array** out_workspace) {
+  if (out_attention) {
+    *out_attention = nullptr;
+  }
+  if (out_workspace) {
+    *out_workspace = nullptr;
+  }
+  return false;
+}
+
+void mlx_paged_prefill_test_probe_reset() {}
+
+uint64_t mlx_paged_prefill_test_probe_count(int) { return 0; }
+
+uint32_t mlx_paged_prefill_test_last_splits() { return 0; }
+
+uint32_t mlx_paged_prefill_test_last_max_splits() { return 0; }
+
 } // extern "C"
 
 #endif // !defined(MLX_NODE_METAL_ENABLED)

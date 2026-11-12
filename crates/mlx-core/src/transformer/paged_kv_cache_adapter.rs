@@ -574,6 +574,18 @@ pub(crate) fn pool_extents_for_bytes(want_bytes: u64, extent_bytes: u64) -> u32 
         .max(1)
 }
 
+/// Pages per split of this device's prefill launches (Splash
+/// `KernelCalibration::of` over the planned GPU cores).
+#[cfg(target_os = "macos")]
+fn device_pages_per_split() -> u32 {
+    static PAGES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PAGES.get_or_init(|| {
+        let gpu_gen = unsafe { mlx_sys::mlx_gpu_architecture_gen() };
+        let cores = u32::try_from(unsafe { mlx_sys::mlx_gpu_reported_core_count() }).unwrap_or(0);
+        mlx_paged_attn::prefill_plan::pages_per_split(gpu_gen, cores)
+    })
+}
+
 /// The pages a decode query at context length `context` reads: the first
 /// retained logical block and the token count visible from it. Sliding
 /// groups omit whole blocks before their live window (the kernel masks the
@@ -1062,6 +1074,13 @@ pub struct PagedKVCacheAdapter {
     #[cfg(target_os = "macos")]
     native_pool_arrays: Vec<Option<NativePoolArrays>>,
 
+    /// The one f32 workspace every in-place prefill / verify attention
+    /// launch of this adapter writes, chained through each launch's second
+    /// output so the full-attention layers take it in turn (Splash
+    /// `RuntimeArenas` `AttentionPartials` / `AttentionStatistics`).
+    #[cfg(target_os = "macos")]
+    prefill_workspace: Option<MxArray>,
+
     /// Optional hook invoked once per pool grow or shrink with the pool's
     /// new total K/V bytes (all layers, both sides). The cache-limit pool
     /// re-registration lands through this (see `set_pool_growth_notifier`);
@@ -1145,6 +1164,7 @@ impl PagedKVCacheAdapter {
         self.native_pool_arrays
             .iter_mut()
             .for_each(|slot| *slot = None);
+        self.prefill_workspace = None;
         self.meta.invalidate(MetadataClear::ActiveRequest);
     }
 
@@ -1317,6 +1337,8 @@ impl PagedKVCacheAdapter {
             meta: PagedMetadataCache::default(),
             #[cfg(target_os = "macos")]
             native_pool_arrays: (0..num_layers).map(|_| None).collect(),
+            #[cfg(target_os = "macos")]
+            prefill_workspace: None,
             pool_growth_notifier: None,
             extent_growth_blocks: None,
             extent_runway_blocks: 0,
@@ -1349,6 +1371,7 @@ impl PagedKVCacheAdapter {
     }
 
     /// The memory plan's ceiling, once the load set it.
+    #[cfg(test)]
     pub(crate) fn memory_ceiling(&self) -> Option<u64> {
         self.memory_ceiling
     }
@@ -5889,6 +5912,120 @@ impl PagedKVCacheAdapter {
         })
     }
 
+    /// In-place attention of the active sequence's chunk over this layer's
+    /// pool pages, its rows already stored (Splash `PagedAttention::addPrefill`
+    /// and `addVerify`): `queries` `[rows, Hq, D]` at positions
+    /// `[committed, committed + rows)`; returns `[rows, Hq, D]` bf16. Every
+    /// launch writes the adapter's one workspace, sized by the pass's bound.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn paged_prefill_attention(
+        &mut self,
+        layer_idx: u32,
+        queries: &MxArray,
+        committed: u32,
+        pass: mlx_paged_attn::prefill_plan::Pass,
+        scale: f32,
+    ) -> Result<MxArray, String> {
+        use mlx_paged_attn::prefill_plan;
+        if self.sliding_window != 0 {
+            return Err(format!(
+                "paged_prefill_attention: refusing a sliding group (sliding_window = {}); \
+                 the kernel attends every visible page",
+                self.sliding_window
+            ));
+        }
+        if (layer_idx as usize) >= self.layer_kv_pool.num_layers() {
+            return Err(format!(
+                "paged_prefill_attention: layer_idx {layer_idx} out of range (num_layers = {})",
+                self.layer_kv_pool.num_layers()
+            ));
+        }
+        let q_meta = KvTensorMeta::from_array(queries, "prefill_queries")?;
+        if q_meta.ndim != 3 || q_meta.shape.len() < 3 {
+            return Err(format!(
+                "paged_prefill_attention: queries must be [rows, query heads, head size]; \
+                 got rank {}",
+                q_meta.ndim
+            ));
+        }
+        let config = self.layer_kv_pool.config();
+        let (num_kv_heads, head_size) = (config.num_kv_heads, config.head_size);
+        let rows = u32::try_from(q_meta.shape[0])
+            .map_err(|_| format!("paged_prefill_attention: invalid rows {}", q_meta.shape[0]))?;
+        let query_heads = u32::try_from(q_meta.shape[1]).map_err(|_| {
+            format!(
+                "paged_prefill_attention: invalid query heads {}",
+                q_meta.shape[1]
+            )
+        })?;
+        if q_meta.shape[2] != i64::from(head_size) {
+            return Err(format!(
+                "paged_prefill_attention: query head size {} != pool head size {head_size}",
+                q_meta.shape[2]
+            ));
+        }
+        let kv_dtype_raw = match self.layer_kv_pool.cache_dtype() {
+            mlx_paged_attn::metal::MetalDtype::BFloat16 => 1,
+            mlx_paged_attn::metal::MetalDtype::Int8 => 3,
+            other => {
+                return Err(format!(
+                    "paged_prefill_attention: the kernel reads bf16 or int8 pages; this pool \
+                     holds {other:?}"
+                ));
+            }
+        };
+        let (block_table, _, _, _, _) = self.varlen_prefill_attention_inputs(committed, rows)?;
+        let PoolLayerArrays {
+            key: k_pool,
+            value: v_pool,
+            k_scale,
+            v_scale,
+        } = self.native_pool_arrays_for_layer(layer_idx)?;
+        let splits = prefill_plan::splits(pass, rows, committed, device_pages_per_split());
+        let bound = prefill_plan::workspace_bound_floats(pass, query_heads, head_size);
+        let workspace = match self.prefill_workspace.take() {
+            Some(held) if held.size().map_err(|e| e.to_string())? >= bound => held,
+            _ => MxArray::zeros(&[bound as i64], Some(DType::Float32))
+                .map_err(|e| format!("paged_prefill_attention: workspace: {e}"))?,
+        };
+        let mut attention = std::ptr::null_mut();
+        let mut workspace_out = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_paged_prefill_attention_forward(
+                queries.as_raw_ptr(),
+                k_pool.as_raw_ptr(),
+                v_pool.as_raw_ptr(),
+                k_scale.as_raw_ptr(),
+                v_scale.as_raw_ptr(),
+                block_table.as_raw_ptr(),
+                workspace.as_raw_ptr(),
+                committed as i32,
+                splits as i32,
+                pass.max_splits() as i32,
+                self.block_size as i32,
+                query_heads as i32,
+                num_kv_heads as i32,
+                head_size as i32,
+                kv_dtype_raw,
+                scale,
+                &mut attention,
+                &mut workspace_out,
+            )
+        };
+        if !ok || attention.is_null() || workspace_out.is_null() {
+            return Err(format!(
+                "paged_prefill_attention: the op refused layer {layer_idx} (rows {rows}, \
+                 committed {committed}, splits {splits}, pass {pass:?})"
+            ));
+        }
+        let attention = MxArray::from_handle(attention, "paged_prefill_attention")
+            .map_err(|e| format!("paged_prefill_attention: {e}"))?;
+        let workspace = MxArray::from_handle(workspace_out, "paged_prefill_workspace")
+            .map_err(|e| format!("paged_prefill_attention: {e}"))?;
+        self.prefill_workspace = Some(workspace);
+        Ok(attention)
+    }
+
     /// Gather the first `total_context` paged K/V positions into flat,
     /// SDPA-ready arrays without leaving the MLX graph.
     ///
@@ -6017,9 +6154,8 @@ impl PagedKVCacheAdapter {
             ));
         }
         let cache_dtype = self.layer_kv_pool.cache_dtype();
-        let int8 = cache_dtype == mlx_paged_attn::metal::MetalDtype::Int8;
         let dtype_size = cache_dtype.size();
-        if dtype_size != 2 && !int8 {
+        if dtype_size != 2 || cache_dtype == mlx_paged_attn::metal::MetalDtype::Int8 {
             return Err(format!(
                 "gather_kv_for_prefill_sdpa: unsupported cache dtype \
                  {cache_dtype:?} with element size {dtype_size}"
@@ -6046,8 +6182,7 @@ impl PagedKVCacheAdapter {
         let PoolLayerArrays {
             key: k_pool,
             value: v_pool,
-            k_scale,
-            v_scale,
+            ..
         } = self.native_pool_arrays_for_layer(layer_idx)?;
 
         // K pool: [B,H,D/x,T,x] -> [H,B,T,D/x,x] -> [1,H,B*T,D].
@@ -6092,30 +6227,19 @@ impl PagedKVCacheAdapter {
             .copy()
             .map_err(|e| format!("gather_kv_for_prefill_sdpa: V contiguous copy failed: {e}"))?;
 
-        if !int8 {
-            return Ok((k, v));
-        }
-        // Scale planes: [B,H,T] -> [H,B,T] -> [1,H,B*T], the token order of
-        // the K / V rows above.
-        let scales = |plane: &MxArray, side: &str| -> Result<MxArray, String> {
-            plane
-                .take(&block_ids, 0)
-                .and_then(|taken| taken.transpose(Some(&[1, 0, 2])))
-                .and_then(|planes| planes.reshape(&[1, num_kv_heads as i64, padded_tokens as i64]))
-                .and_then(|planes| {
-                    planes.slice(&[0, 0, local_start], &[1, num_kv_heads as i64, local_end])
-                })
-                .and_then(|planes| planes.copy())
-                .map_err(|e| format!("gather_kv_for_prefill_sdpa: {side} scale gather failed: {e}"))
-        };
-        let dequantize = |rows: &MxArray, plane: &MxArray, side: &str| {
-            crate::array::kv_int8::dequantize_kv_rows(rows, &scales(plane, side)?)
-                .map_err(|e| format!("gather_kv_for_prefill_sdpa: {side} dequantize failed: {e}"))
-        };
-        Ok((
-            dequantize(&k, &k_scale, "K")?,
-            dequantize(&v, &v_scale, "V")?,
-        ))
+        Ok((k, v))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn paged_prefill_attention(
+        &mut self,
+        _layer_idx: u32,
+        _queries: &MxArray,
+        _committed: u32,
+        _pass: mlx_paged_attn::prefill_plan::Pass,
+        _scale: f32,
+    ) -> Result<MxArray, String> {
+        Err("paged_prefill_attention is only supported on macOS (Metal backend)".to_string())
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -7097,6 +7221,13 @@ impl PagedKVCacheAdapter {
     /// Returns the number of block Arc references that were freed (i.e.
     /// the number of blocks in the table at release time).
     pub fn release_request(&mut self) -> Result<u32, String> {
+        // A failed turn leaves the workspace lazy on its abandoned attention
+        // graph and pool writes; the next launch would evaluate that graph.
+        // Splash `AttentionPartials` is plain scratch with no graph.
+        #[cfg(target_os = "macos")]
+        {
+            self.prefill_workspace = None;
+        }
         if let Some(seq_id) = self.active_seq {
             self.clear_refusal(seq_id);
         }
@@ -16712,6 +16843,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A turn that fails after `paged_prefill_attention` built its graph
+    /// leaves the held workspace lazy on that graph; every reset must drop it
+    /// so the next launch does not evaluate the abandoned turn. Mutation WS1:
+    /// `release_request` keeps the workspace -> red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_reset_drops_the_held_prefill_workspace() {
+        const ROWS: usize = 16;
+        const KV_HEADS: usize = 2;
+        const QUERY_HEADS: usize = 8;
+        const DIM: usize = 128;
+        let new_adapter = || {
+            let cfg = mlx_paged_attn::PagedAttentionConfig {
+                block_size: 16,
+                num_kv_heads: KV_HEADS as u32,
+                head_size: DIM as u32,
+                num_layers: 1,
+                gpu_memory_mb: 256,
+                max_seq_len: Some(64),
+                max_batch_size: Some(1),
+            };
+            match mlx_paged_attn::LayerKVPool::new(
+                cfg,
+                4,
+                4,
+                mlx_paged_attn::metal::MetalDtype::BFloat16,
+            ) {
+                Ok(pool) => {
+                    let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 16)));
+                    Some(PagedKVCacheAdapter::new(allocator, Arc::new(pool), 16).unwrap())
+                }
+                Err(error) => {
+                    eprintln!("skipping prefill workspace reset: {error}");
+                    None
+                }
+            }
+        };
+        let bf16 = |salt: usize, heads: usize| {
+            let data = (0..ROWS * heads * DIM)
+                .map(|i| ((i * 7 + salt * 31) % 23) as f32 / 16.0 - 0.7)
+                .collect::<Vec<_>>();
+            MxArray::from_float32(&data, &[ROWS as i64, heads as i64, DIM as i64])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap()
+        };
+        let launch = |adapter: &mut PagedKVCacheAdapter, seq_id: u32, salt: usize| {
+            adapter.reset_for_new_request(seq_id).unwrap();
+            adapter.allocate_suffix_blocks(ROWS as u32).unwrap();
+            adapter
+                .record_tokens(&(0..ROWS as u32).collect::<Vec<_>>())
+                .unwrap();
+            adapter
+                .update_keys_values_native(0, &bf16(salt, KV_HEADS), &bf16(salt + 1, KV_HEADS), 0)
+                .unwrap();
+            let attention = adapter
+                .paged_prefill_attention(
+                    0,
+                    &bf16(salt + 2, QUERY_HEADS),
+                    0,
+                    mlx_paged_attn::prefill_plan::Pass::Prefill,
+                    1.0 / (DIM as f32).sqrt(),
+                )
+                .unwrap();
+            assert!(adapter.prefill_workspace.is_some());
+            attention
+        };
+        let Some(mut fresh) = new_adapter() else {
+            return;
+        };
+        let reference = launch(&mut fresh, 1, 5).to_float32().unwrap().to_vec();
+        let Some(mut adapter) = new_adapter() else {
+            return;
+        };
+
+        drop(launch(&mut adapter, 1, 40));
+        adapter.release_request().unwrap();
+        assert!(
+            adapter.prefill_workspace.is_none(),
+            "release_request kept the workspace of the abandoned launch"
+        );
+
+        drop(launch(&mut adapter, 2, 40));
+        adapter.release_request_and_purge_prefix_cache().unwrap();
+        assert!(
+            adapter.prefill_workspace.is_none(),
+            "release_request_and_purge_prefix_cache kept the workspace"
+        );
+
+        drop(launch(&mut adapter, 3, 40));
+        adapter.clear_native_graph_state();
+        assert!(
+            adapter.prefill_workspace.is_none(),
+            "clear_native_graph_state kept the workspace"
+        );
+
+        let reused = launch(&mut adapter, 4, 5).to_float32().unwrap().to_vec();
+        assert_eq!(reused, reference, "a launch on reused blocks drifted");
     }
 
     #[cfg(target_os = "macos")]
