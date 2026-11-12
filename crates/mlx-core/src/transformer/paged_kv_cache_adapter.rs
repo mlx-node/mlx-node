@@ -78,9 +78,7 @@
 //! sequential decode flip the argmax → token streams diverge from the
 //! flat path. See `finalize_turn_keep_live` for full discussion.
 
-use std::collections::HashMap;
-#[cfg(target_os = "macos")]
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1057,6 +1055,15 @@ pub struct PagedKVCacheAdapter {
     /// frees the table's blocks at this stamp.
     turn_end_stamps: HashMap<SeqId, u64>,
 
+    /// Blocks each sequence's last reservation was refused, per sequence
+    /// (Splash `MemoryLedger::refused`). A `Mutex` so `check_wave_fits`
+    /// stays `&self`; it is locked after the allocator, never before.
+    refusals: Mutex<BTreeMap<SeqId, u32>>,
+
+    /// Blocks the last [`Self::try_grow_pool`] could still have added when
+    /// its probe declined the full grow: the live room.
+    last_grow_room: u32,
+
     /// Test-only override for the pre-grow headroom probe: receives the
     /// grow-target block count and returns the probe's `selected_blocks`.
     #[cfg(test)]
@@ -1260,6 +1267,8 @@ impl PagedKVCacheAdapter {
             extent_runway_blocks: 0,
             recency,
             turn_end_stamps: HashMap::new(),
+            refusals: Mutex::new(BTreeMap::new()),
+            last_grow_room: 0,
             #[cfg(test)]
             grow_headroom_probe_override: None,
         })
@@ -1605,6 +1614,7 @@ impl PagedKVCacheAdapter {
         // This is the single-request migration shim. It deliberately retains
         // its historical destructive semantics; the scheduler uses
         // `begin_request` / `activate_request` to preserve other rows.
+        self.clear_refusal(seq_id);
         if self.active_seq.is_some() {
             self.release_request()?;
         }
@@ -2033,7 +2043,22 @@ impl PagedKVCacheAdapter {
             // allocation. A later allocation failure must not leave those
             // references (or an empty live request) pinned until another turn
             // happens to clean them up.
+            let refused = self.refusal_of(seq_id);
+            let held: HashSet<u32> = self
+                .block_table()
+                .map(|table| table.blocks().iter().map(|block| block.block_id).collect())
+                .unwrap_or_default();
             let _ = self.release_request();
+            // The release clears the refusal; the retry needs it. The hit
+            // blocks it hands back are evictable now, but the retry hits them
+            // again before it allocates its suffix, so they join the need.
+            if let Some(blocks) = refused {
+                let back = self
+                    .allocator
+                    .lock()
+                    .map_or(0, |allocator| allocator.cache_only_among(&held).0);
+                self.refuse(seq_id, blocks.saturating_add(back));
+            }
         }
         result
     }
@@ -2543,6 +2568,9 @@ impl PagedKVCacheAdapter {
     /// the prompt's blocks are reserved at prefill, decode allocates one
     /// block every `block_size` tokens.
     pub fn allocate_suffix_blocks(&mut self, total_tokens: u32) -> Result<u32, String> {
+        if let Some(seq_id) = self.active_seq {
+            self.clear_refusal(seq_id);
+        }
         let capacity = self.max_capacity_tokens();
         if total_tokens > capacity {
             return Err(format!(
@@ -2608,6 +2636,9 @@ impl PagedKVCacheAdapter {
                 self.grow_shortfall(&guard, needed_blocks)
             };
             if grow_attempted || !self.try_grow_pool(retry_shortfall) {
+                if let Some(seq_id) = self.active_seq {
+                    self.refuse(seq_id, needed_blocks);
+                }
                 return Err(format!(
                     "context_length_exceeded: paged cache could not reserve {needed_blocks} \
                      block(s) for {total_tokens} tokens (reserved {i} before rollback, \
@@ -2653,6 +2684,9 @@ impl PagedKVCacheAdapter {
     /// with the pre-call state and the next decode step can choose to
     /// abort gracefully).
     fn ensure_blocks_for_total_tokens(&mut self, new_total_tokens: u32) -> Result<u32, String> {
+        if let Some(seq_id) = self.active_seq {
+            self.clear_refusal(seq_id);
+        }
         let capacity = self.max_capacity_tokens();
         if new_total_tokens > capacity {
             return Err(format!(
@@ -2714,6 +2748,9 @@ impl PagedKVCacheAdapter {
                 self.grow_shortfall(&guard, to_allocate)
             };
             if grow_attempted || !self.try_grow_pool(retry_shortfall) {
+                if let Some(seq_id) = self.active_seq {
+                    self.refuse(seq_id, to_allocate);
+                }
                 return Err(format!(
                     "context_length_exceeded: paged decode could not reserve {to_allocate} \
                      more block(s) (request had {current_blocks}, needs {needed_total_blocks} \
@@ -2791,6 +2828,7 @@ impl PagedKVCacheAdapter {
     /// (`HybridSchedulerState::try_grow_reservation_pool`); admission runs
     /// on the model thread, so the same thread/contract holds there.
     pub(crate) fn try_grow_pool(&mut self, needed_additional_blocks: u32) -> bool {
+        self.last_grow_room = 0;
         // Serialize the whole probe → grow → notify sequence process-wide
         // (see crate::cache_limit::pool_growth_lock). Scope-drop releases
         // the guard on every exit path, including the decline/failure
@@ -2853,6 +2891,7 @@ impl PagedKVCacheAdapter {
                     );
                     new_num_blocks = selected;
                 } else {
+                    self.last_grow_room = selected.saturating_sub(current);
                     tracing::warn!(
                         target: "mlx_core::paged_kv",
                         "paged KV pool grow declined: headroom probe caps the pool at {selected} \
@@ -3584,6 +3623,9 @@ impl PagedKVCacheAdapter {
         if self.block_size == 0 {
             return Err("block_size must be > 0".to_string());
         }
+        for &(seq_id, _) in rows {
+            self.clear_refusal(seq_id);
+        }
         let guard = self
             .allocator
             .lock()
@@ -3593,6 +3635,7 @@ impl PagedKVCacheAdapter {
         }
         let capacity = self.max_capacity_tokens();
         let mut need = 0u64;
+        let mut row_needs = Vec::with_capacity(rows.len());
         for &(seq_id, tokens) in rows {
             let (Some(current), Some(table)) = (
                 self.current_token_count_for(seq_id),
@@ -3608,10 +3651,17 @@ impl PagedKVCacheAdapter {
                 ));
             }
             let needed_total = new_total.div_ceil(self.block_size);
-            need += u64::from(needed_total.saturating_sub(table.num_blocks() as u32));
+            let row_need = needed_total.saturating_sub(table.num_blocks() as u32);
+            need += u64::from(row_need);
+            if row_need > 0 {
+                row_needs.push((seq_id, row_need));
+            }
         }
         let need = u32::try_from(need).unwrap_or(u32::MAX);
         if need > 0 && !guard.can_allocate(need) {
+            for (seq_id, row_need) in row_needs {
+                self.refuse(seq_id, row_need);
+            }
             return Err(format!(
                 "context_length_exceeded: paged decode could not reserve {need} more block(s) \
                  for a {}-row wave at the max pool",
@@ -6754,6 +6804,9 @@ impl PagedKVCacheAdapter {
     /// Returns the number of block Arc references that were freed (i.e.
     /// the number of blocks in the table at release time).
     pub fn release_request(&mut self) -> Result<u32, String> {
+        if let Some(seq_id) = self.active_seq {
+            self.clear_refusal(seq_id);
+        }
         let Some(table) = self.block_table.as_ref() else {
             // Idempotent release is also the last-resort cleanup path after a
             // partially failed lifecycle transition. Never let graph arrays or
@@ -6818,6 +6871,7 @@ impl PagedKVCacheAdapter {
 
     /// Release exactly one logical request, leaving every other row live.
     pub fn release_request_for(&mut self, seq_id: SeqId) -> Result<u32, String> {
+        self.clear_refusal(seq_id);
         if self.active_seq != Some(seq_id) && !self.requests.contains_key(&seq_id) {
             return Ok(0);
         }
@@ -7234,9 +7288,236 @@ impl PagedKVCacheAdapter {
     }
 
     /// When `seq_id`'s kept table ended its last turn, if it is kept.
-    #[cfg(test)]
     pub(crate) fn turn_end_stamp(&self, seq_id: SeqId) -> Option<u64> {
         self.turn_end_stamps.get(&seq_id).copied()
+    }
+
+    /// The clock the allocator and this adapter stamp with.
+    pub(crate) fn recency(&self) -> Arc<CacheRecency> {
+        Arc::clone(&self.recency)
+    }
+
+    fn refusals(&self) -> std::sync::MutexGuard<'_, BTreeMap<SeqId, u32>> {
+        self.refusals.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn refuse(&self, seq_id: SeqId, blocks: u32) {
+        self.refusals().insert(seq_id, blocks);
+    }
+
+    fn clear_refusal(&self, seq_id: SeqId) {
+        self.refusals().remove(&seq_id);
+    }
+
+    fn refusal_of(&self, seq_id: SeqId) -> Option<u32> {
+        self.refusals().get(&seq_id).copied()
+    }
+
+    pub(crate) fn clear_refusals(&self) {
+        self.refusals().clear();
+    }
+
+    /// Blocks every refused reservation lacked, summed over sequences; the
+    /// record clears. `None` when nothing was refused.
+    pub(crate) fn take_refusal(&self) -> Option<u32> {
+        let mut refusals = self.refusals();
+        if refusals.is_empty() {
+            return None;
+        }
+        let blocks = refusals
+            .values()
+            .fold(0u32, |sum, &blocks| sum.saturating_add(blocks));
+        refusals.clear();
+        Some(blocks)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refuse_for_test(&self, seq_id: SeqId, blocks: u32) {
+        self.refuse(seq_id, blocks);
+    }
+
+    /// Blocks the last [`Self::try_grow_pool`] could still have added when
+    /// its probe declined.
+    pub(crate) fn last_grow_room(&self) -> u32 {
+        self.last_grow_room
+    }
+
+    fn allocator_guard(&self) -> std::sync::MutexGuard<'_, BlockAllocator> {
+        self.allocator.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether `blocks` are in place now, tried in `allocate_suffix_blocks`'
+    /// order: free blocks, a grow, then the cached blocks `reserve` evicts.
+    /// `over_takeable` grows by what free plus evictable blocks lack, as
+    /// admission sizes its grow. The grow it tries records the probe's room.
+    /// Met means covered, never grew (Splash `KvPool::takeFreePages`): a
+    /// grow clamped at the pool max can add less than the shortfall.
+    pub(crate) fn kv_need_met(&mut self, blocks: u32, over_takeable: bool) -> bool {
+        self.last_grow_room = 0;
+        let (takeable, shortfall, at_cap) = {
+            let guard = self.allocator_guard();
+            let takeable = guard.free_or_evictable_blocks();
+            let shortfall = if over_takeable {
+                blocks.saturating_sub(takeable)
+            } else {
+                self.grow_shortfall(&guard, blocks)
+            };
+            (
+                takeable,
+                shortfall,
+                guard.num_blocks() >= guard.max_num_blocks(),
+            )
+        };
+        if shortfall == 0 {
+            return takeable >= blocks;
+        }
+        if !at_cap && self.try_grow_pool(shortfall) {
+            return self.takeable_blocks() >= blocks;
+        }
+        takeable >= blocks
+    }
+
+    pub(crate) fn at_cap(&self) -> bool {
+        let guard = self.allocator_guard();
+        guard.num_blocks() >= guard.max_num_blocks()
+    }
+
+    /// Free blocks plus the cached blocks `allocate` may take.
+    pub(crate) fn takeable_blocks(&self) -> u32 {
+        self.allocator_guard().free_or_evictable_blocks()
+    }
+
+    pub(crate) fn ungrown_blocks(&self) -> u32 {
+        let guard = self.allocator_guard();
+        guard.max_num_blocks().saturating_sub(guard.num_blocks())
+    }
+
+    /// Cache-only blocks inside a marked chain.
+    pub(crate) fn marked_blocks(&self) -> u32 {
+        let guard = self.allocator_guard();
+        guard
+            .num_reusable_blocks()
+            .saturating_sub(guard.num_evictable_blocks())
+    }
+
+    pub(crate) fn tip_marks(&self) -> HashSet<u64> {
+        self.allocator_guard().tip_marks()
+    }
+
+    pub(crate) fn cache_only_count(&self, hashes: impl IntoIterator<Item = u64>) -> u32 {
+        self.allocator_guard().cache_only_count(hashes)
+    }
+
+    pub(crate) fn marked_hit(&self, chain: &[u64]) -> u32 {
+        self.allocator_guard().marked_hit(chain)
+    }
+
+    /// Blocks releasing every table of `seq_ids` together would leave free
+    /// or cache-only: a block two of them share counts, as Splash
+    /// `MemoryLedger::free` bounds what the whole take could free.
+    pub(crate) fn releasable_blocks_of(&self, seq_ids: &[SeqId]) -> HashSet<u32> {
+        let null_id = self.null_block.as_ref().map(|block| block.block_id);
+        let mut refs = HashMap::new();
+        for &seq_id in seq_ids {
+            let Some(table) = self.block_table_for(seq_id) else {
+                continue;
+            };
+            for block in table.blocks() {
+                if Some(block.block_id) != null_id {
+                    *refs.entry(block.block_id).or_insert(0) += 1;
+                }
+            }
+        }
+        if refs.is_empty() {
+            return HashSet::new();
+        }
+        self.allocator_guard().released_blocks(&refs)
+    }
+
+    /// Whether `seq_id`'s table holds one of `blocks`.
+    pub(crate) fn table_holds_any(&self, seq_id: SeqId, blocks: &HashSet<u32>) -> bool {
+        self.block_table_for(seq_id).is_some_and(|table| {
+            table
+                .blocks()
+                .iter()
+                .any(|block| blocks.contains(&block.block_id))
+        })
+    }
+
+    pub(crate) fn set_state_marks(&self, hashes: impl IntoIterator<Item = u64>) {
+        self.allocator_guard().set_state_marks(hashes);
+    }
+
+    /// Pool bytes a cut could hand back with every table released, plus
+    /// the layer bytes above the pool's block count that a cut or grow
+    /// which failed part way left behind: they cost nothing to give back
+    /// (Splash `MemoryLedger::takeUnsized`).
+    pub(crate) fn release_reach_bytes(&self) -> u64 {
+        let Some(extent) = self.extent_growth_blocks else {
+            return 0;
+        };
+        let Ok(bytes_per_block) = self.bytes_per_block() else {
+            return 0;
+        };
+        let refs = self.table_refs();
+        let guard = self.allocator_guard();
+        let num_blocks = guard.num_blocks();
+        // A grow capped by the pool max or by headroom can end inside an
+        // extent (Splash `KvPool` holds whole extents only); the cut takes
+        // that partial extent down to the runway, so the reach rounds up.
+        let extents = num_blocks
+            .saturating_sub(self.extent_runway_blocks)
+            .div_ceil(extent);
+        let cut =
+            guard.shrink_target_as_released(self.extent_runway_blocks, extent, extents, &refs);
+        drop(guard);
+        let pool = &self.layer_kv_pool;
+        let kept = pool.layer_bytes_for(pool.num_blocks()).unwrap_or(u64::MAX);
+        let residual = pool.layer_bytes().iter().fold(0u64, |sum, bytes| {
+            sum.saturating_add(bytes.saturating_sub(kept))
+        });
+        u64::from(num_blocks.saturating_sub(cut))
+            .saturating_mul(bytes_per_block)
+            .saturating_add(residual)
+    }
+
+    /// Whether releasing every table would let a cut sized for `want_bytes`
+    /// (as [`Self::try_release_pool_extents`] sizes it) hand back an extent.
+    pub(crate) fn extent_within_reach(&self, want_bytes: u64) -> bool {
+        let Some(extent) = self.extent_growth_blocks else {
+            return false;
+        };
+        if want_bytes == 0 {
+            return false;
+        }
+        let Ok(bytes_per_block) = self.bytes_per_block() else {
+            return false;
+        };
+        let extents = pool_extents_for_bytes(
+            want_bytes,
+            u64::from(extent).saturating_mul(bytes_per_block),
+        );
+        let refs = self.table_refs();
+        let guard = self.allocator_guard();
+        guard.shrink_target_as_released(self.extent_runway_blocks, extent, extents, &refs)
+            < guard.num_blocks()
+    }
+
+    /// Block id -> how many refs the live tables hold on it.
+    fn table_refs(&self) -> HashMap<u32, u32> {
+        let null_id = self.null_block.as_ref().map(|block| block.block_id);
+        let mut refs = HashMap::new();
+        for seq_id in self.live_seq_ids() {
+            let Some(table) = self.block_table_for(seq_id) else {
+                continue;
+            };
+            for block in table.blocks() {
+                if Some(block.block_id) != null_id {
+                    *refs.entry(block.block_id).or_insert(0) += 1;
+                }
+            }
+        }
+        refs
     }
 
     // ------------------------ Getters ------------------------
@@ -11658,6 +11939,200 @@ mod tests {
         assert_eq!(telemetry.reclaimable_blocks, 2);
         assert_eq!(telemetry.evictable_blocks, 0);
         assert_eq!(telemetry.free_blocks, 1);
+    }
+
+    /// A 4-block adapter at its max whose sequence 9 holds `held` blocks.
+    fn adapter_with_held_blocks(held: u32) -> Option<PagedKVCacheAdapter> {
+        let mut adapter = maybe_adapter(new_allocator(4, 4), 4)?;
+        adapter.begin_request(9).unwrap();
+        adapter.allocate_suffix_blocks_for(9, held * 4).unwrap();
+        Some(adapter)
+    }
+
+    /// A passing reservation clears only its own sequence's refusal.
+    /// Mutation: clear every refusal at the top of `allocate_suffix_blocks`
+    /// and `ensure_blocks_for_total_tokens` → red (`None`).
+    #[test]
+    fn a_retried_reservation_clears_only_its_own_refusal() {
+        let Some(mut adapter) = adapter_with_held_blocks(3) else {
+            eprintln!(
+                "skipping a_retried_reservation_clears_only_its_own_refusal: Metal unavailable"
+            );
+            return;
+        };
+        adapter.begin_request(1).unwrap();
+        assert!(adapter.allocate_suffix_blocks_for(1, 8).is_err());
+        assert_eq!(adapter.refusal_of(1), Some(2));
+        adapter.begin_request(2).unwrap();
+        assert!(adapter.reserve_rows_for(2, 8).is_err());
+        adapter.reserve_rows_for(2, 4).unwrap();
+        assert_eq!(adapter.take_refusal(), Some(2));
+        assert_eq!(adapter.take_refusal(), None);
+    }
+
+    /// A released sequence leaves no refusal, a failed prepare's sequence
+    /// (no table left) included.
+    /// Mutation: drop `clear_refusal` from `release_request` → red (seq 3);
+    /// move it after the early return in `release_request_for` → red (seq 4).
+    #[test]
+    fn a_released_sequence_leaves_no_refusal() {
+        let Some(mut adapter) = adapter_with_held_blocks(3) else {
+            eprintln!("skipping a_released_sequence_leaves_no_refusal: Metal unavailable");
+            return;
+        };
+        adapter.begin_request(3).unwrap();
+        assert!(adapter.allocate_suffix_blocks(8).is_err());
+        assert_eq!(adapter.refusal_of(3), Some(2));
+        adapter.release_request().unwrap();
+        assert_eq!(adapter.take_refusal(), None);
+
+        let prompt: Vec<u32> = (100..108).collect();
+        assert!(
+            adapter
+                .prepare_turn(4, &prompt, prompt.len() as u32, true, &[], 0, false)
+                .is_err()
+        );
+        assert!(adapter.block_table_for(4).is_none());
+        assert_eq!(adapter.refusal_of(4), Some(2));
+        adapter.release_request_for(4).unwrap();
+        assert_eq!(adapter.take_refusal(), None);
+    }
+
+    /// A failed prepare keeps its refusal across its own release, plus the
+    /// hit blocks that release hands back (the retry hits them again).
+    /// Mutations: drop the record after the release in `prepare_turn_inner`
+    /// → red (`None`); drop `back` → red (`Some(3)`).
+    #[test]
+    fn a_failed_prepare_keeps_its_refusal() {
+        let allocator = new_allocator(6, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!("skipping a_failed_prepare_keeps_its_refusal: Metal unavailable");
+            return;
+        };
+        let chain: Vec<u32> = (0..8).collect();
+        cache_dead_chain(&allocator, &chain);
+        adapter.begin_request(9).unwrap();
+        adapter.allocate_suffix_blocks_for(9, 16).unwrap();
+        let block_telemetry = adapter.block_telemetry().unwrap();
+        assert_eq!(
+            (
+                block_telemetry.free_blocks,
+                block_telemetry.evictable_blocks
+            ),
+            (0, 2)
+        );
+        let prompt: Vec<u32> = chain.iter().copied().chain(50..62).collect();
+        assert!(
+            adapter
+                .prepare_turn(1, &prompt, prompt.len() as u32, true, &[], 0, false)
+                .is_err()
+        );
+        assert_eq!(adapter.take_refusal(), Some(5));
+    }
+
+    /// The room a declined grow records is the probe's, and every later
+    /// grow or met check starts from 0.
+    /// Mutation: drop `self.last_grow_room = 0` at the top of
+    /// `try_grow_pool` → red (room 2 after the probe error).
+    #[test]
+    fn grow_room_is_read_from_the_last_grow() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(error) => {
+                eprintln!("skipping grow_room_is_read_from_the_last_grow: {error}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(6))));
+        assert!(!adapter.try_grow_pool(4));
+        assert_eq!(adapter.last_grow_room(), 2);
+        assert!(adapter.kv_need_met(1, false));
+        assert_eq!(adapter.last_grow_room(), 0);
+        assert!(!adapter.try_grow_pool(4));
+        assert_eq!(adapter.last_grow_room(), 2);
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(|_| Err("no probe".into()))));
+        assert!(!adapter.try_grow_pool(4));
+        assert_eq!(adapter.last_grow_room(), 0);
+    }
+
+    /// A 4-block pool, max 8, 4-block extents, every block held by the live
+    /// request: a 5-block need grows to the max (8) and stays short, since
+    /// 4 blocks are takeable; a 4-block need is met by the same grow.
+    /// Mutations: return the grow's result as met in `kv_need_met` → red
+    /// (5 met); return false after any grow → red (4 not met).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kv_need_met_recounts_after_a_capped_grow() {
+        let held = || {
+            let cfg = mlx_paged_attn::PagedAttentionConfig {
+                block_size: 8,
+                num_kv_heads: 1,
+                head_size: 64,
+                num_layers: 2,
+                gpu_memory_mb: 256,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(128),
+                max_batch_size: Some(2),
+            };
+            let pool = mlx_paged_attn::LayerKVPool::new(
+                cfg,
+                4,
+                8,
+                mlx_paged_attn::metal::MetalDtype::BFloat16,
+            )
+            .map_err(|error| error.to_string())?;
+            let pool = Arc::new(pool);
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8, 8)));
+            let mut adapter = PagedKVCacheAdapter::new(allocator, Arc::clone(&pool), 8)
+                .map_err(|e| e.to_string())?;
+            adapter.set_extent_growth(4);
+            adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+            adapter
+                .reset_for_new_request(7)
+                .map_err(|e| e.to_string())?;
+            assert_eq!(adapter.allocate_suffix_blocks(32).unwrap(), 4);
+            assert_eq!(adapter.takeable_blocks(), 0);
+            Ok::<_, String>((adapter, pool))
+        };
+        for over_takeable in [false, true] {
+            let (mut adapter, pool) = match held() {
+                Ok(held) => held,
+                Err(error) => {
+                    eprintln!("skipping kv_need_met_recounts_after_a_capped_grow: {error}");
+                    return;
+                }
+            };
+            assert!(
+                !adapter.kv_need_met(5, over_takeable),
+                "a grow clamped at the max covers 4 of 5 (over_takeable {over_takeable})"
+            );
+            assert_eq!(pool.num_blocks(), 8);
+            assert_eq!(adapter.takeable_blocks(), 4);
+
+            let (mut adapter, pool) = held().expect("same setup");
+            assert!(
+                adapter.kv_need_met(4, over_takeable),
+                "the grow covers 4 (over_takeable {over_takeable})"
+            );
+            assert_eq!(pool.num_blocks(), 8);
+        }
     }
 
     #[test]
@@ -16903,12 +17378,14 @@ mod tests {
 
     /// A 4-layer runway pool grown to 10 whose 10 -> 4 cut fails at layer 2:
     /// the allocator and pool report 4 blocks while layers 2 and 3 still hold
-    /// 10. The next reclaim, with no new cut left at the runway, gives those
-    /// bytes back and notifies the measured total; the cached chain head
-    /// still hits, a third reclaim frees nothing, and the pool grows again.
+    /// 10. The release reach counts those bytes; the next reclaim, with no
+    /// new cut left at the runway, gives them back and notifies the measured
+    /// total; the cached chain head still hits, a third reclaim frees
+    /// nothing, and the pool grows again.
     /// Mutations: drop `&& !pending` from the guard in
     /// `try_release_pool_extents` → red (retry returns 0); drop the notifier
-    /// call in `finish_pending_shrink` → red (stale last notification).
+    /// call in `finish_pending_shrink` → red (stale last notification); drop
+    /// the residual layer bytes from `release_reach_bytes` → red (0).
     #[cfg(target_os = "macos")]
     #[test]
     fn failed_pool_cut_is_finished_by_the_next_reclaim_at_the_runway() {
@@ -16979,6 +17456,11 @@ mod tests {
             "layers 2 and 3 keep 10 blocks"
         );
         assert_eq!(last_notified(), pool.total_bytes());
+        assert_eq!(
+            adapter.release_reach_bytes(),
+            2 * 6 * layer_block_bytes,
+            "the reach counts the unfinished layers at the runway"
+        );
 
         assert_eq!(
             adapter.try_release_pool_extents(extent_bytes, false),
@@ -16986,6 +17468,7 @@ mod tests {
             "the next reclaim finishes layers 2 and 3"
         );
         assert!(!pool.shrink_pending());
+        assert_eq!(adapter.release_reach_bytes(), 0);
         assert_eq!(pool.num_blocks(), 4);
         assert_eq!(pool.total_bytes(), 4 * block_bytes);
         assert_eq!(last_notified(), 4 * block_bytes);
@@ -17007,6 +17490,70 @@ mod tests {
         assert_eq!(pool.num_blocks(), 7, "the pool grows again from the runway");
         assert!(!pool.shrink_pending());
         assert_eq!(pool.total_bytes(), 7 * block_bytes);
+    }
+
+    /// A runway-4 pool with 4-block extents whose grow the pool max caps
+    /// inside an extent: max 6 ends 2 blocks into the first extent, max 10
+    /// 2 blocks into the second. With every table released the reach equals
+    /// what `try_release_pool_extents` frees down to the runway.
+    /// Mutations: floor division of the extents in `release_reach_bytes` →
+    /// red (max 6: 0); `.max(1)` in place of `div_ceil` → red (max 10:
+    /// 4 blocks).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn release_reach_counts_a_grow_capped_inside_an_extent() {
+        const NAME: &str = "release_reach_counts_a_grow_capped_inside_an_extent";
+        for (max_blocks, tokens, grown) in [(6u32, 48u32, 6u32), (10, 80, 10)] {
+            let cfg = mlx_paged_attn::PagedAttentionConfig {
+                block_size: 8,
+                num_kv_heads: 1,
+                head_size: 64,
+                num_layers: 4,
+                gpu_memory_mb: 256,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(128),
+                max_batch_size: Some(2),
+            };
+            let pool = match mlx_paged_attn::LayerKVPool::new(
+                cfg,
+                4,
+                max_blocks,
+                mlx_paged_attn::metal::MetalDtype::BFloat16,
+            ) {
+                Ok(p) => Arc::new(p),
+                Err(e) => {
+                    eprintln!("skipping {NAME}: {e}");
+                    return;
+                }
+            };
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, max_blocks, 8)));
+            let mut adapter =
+                PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+                    .expect("adapter");
+            adapter.set_extent_growth(4);
+            adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+            let block_bytes = adapter.bytes_per_block().expect("bytes per block");
+
+            adapter.reset_for_new_request(7).unwrap();
+            assert_eq!(adapter.allocate_suffix_blocks(tokens).unwrap(), grown);
+            assert_eq!(pool.num_blocks(), grown, "the pool max caps the grow");
+            adapter.release_request().unwrap();
+
+            let reach = adapter.release_reach_bytes();
+            assert_eq!(
+                reach,
+                u64::from(grown - 4) * block_bytes,
+                "max {max_blocks}: the reach counts the partial extent down to the runway"
+            );
+            assert_eq!(
+                adapter.try_release_pool_extents(reach, false),
+                reach,
+                "max {max_blocks}: the cut frees the reach"
+            );
+            assert_eq!(allocator.lock().unwrap().num_blocks(), 4);
+            assert_eq!(pool.num_blocks(), 4);
+            assert_eq!(adapter.release_reach_bytes(), 0);
+        }
     }
 
     /// A 4-layer pool whose 10 -> 4 cut fails at layer 2 holds layers

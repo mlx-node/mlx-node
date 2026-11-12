@@ -97,22 +97,38 @@ impl Qwen35MoeInner {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
         }
-        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(self, &tokens);
-        let plan_result = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("MoE paged_turn_sync_core: paged_adapter is None"))?
-            .prepare_turn_per_block_with_max_cache_hit_tokens(
-                seq_id,
-                &tokens,
-                total_budget,
-                true,
-                &lookup_extra_keys,
-                cache_salt,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(Error::from_reason);
+        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
+            self,
+            &tokens,
+            &lookup_extra_keys,
+            cache_salt,
+        );
+        let plan_result = crate::models::qwen3_5::dflash2_turn::reclaiming(
+            self,
+            crate::models::qwen3_5::dflash2_turn::Keep {
+                tokens: &tokens,
+                keys: Some((lookup_extra_keys.as_slice(), cache_salt)),
+            },
+            |inner| {
+                inner
+                    .paged_adapter
+                    .as_mut()
+                    .ok_or_else(|| {
+                        Error::from_reason("MoE paged_turn_sync_core: paged_adapter is None")
+                    })?
+                    .prepare_turn_per_block_with_max_cache_hit_tokens(
+                        seq_id,
+                        &tokens,
+                        total_budget,
+                        true,
+                        &lookup_extra_keys,
+                        cache_salt,
+                        false,
+                        max_cache_hit_tokens,
+                    )
+                    .map_err(Error::from_reason)
+            },
+        );
         let plan = match plan_result {
             Ok(plan) => plan,
             Err(error) => {
@@ -531,22 +547,38 @@ impl Qwen35MoeInner {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
         }
-        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(self, &tokens);
-        let plan_result = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("MoE paged_turn_stream_core: paged_adapter is None"))?
-            .prepare_turn_per_block_with_max_cache_hit_tokens(
-                seq_id,
-                &tokens,
-                total_budget,
-                true,
-                &lookup_extra_keys,
-                cache_salt,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(Error::from_reason);
+        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
+            self,
+            &tokens,
+            &lookup_extra_keys,
+            cache_salt,
+        );
+        let plan_result = crate::models::qwen3_5::dflash2_turn::reclaiming(
+            self,
+            crate::models::qwen3_5::dflash2_turn::Keep {
+                tokens: &tokens,
+                keys: Some((lookup_extra_keys.as_slice(), cache_salt)),
+            },
+            |inner| {
+                inner
+                    .paged_adapter
+                    .as_mut()
+                    .ok_or_else(|| {
+                        Error::from_reason("MoE paged_turn_stream_core: paged_adapter is None")
+                    })?
+                    .prepare_turn_per_block_with_max_cache_hit_tokens(
+                        seq_id,
+                        &tokens,
+                        total_budget,
+                        true,
+                        &lookup_extra_keys,
+                        cache_salt,
+                        false,
+                        max_cache_hit_tokens,
+                    )
+                    .map_err(Error::from_reason)
+            },
+        );
         let plan = match plan_result {
             Ok(plan) => plan,
             Err(error) => {

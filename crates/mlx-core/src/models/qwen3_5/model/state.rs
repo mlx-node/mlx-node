@@ -66,6 +66,8 @@ pub(super) struct DenseGdnPrefixCheckpoint {
     pub(super) block_hashes: Vec<u64>,
     pub(super) tokens: Vec<u32>,
     pub(super) caches: Vec<Qwen3_5LayerCache>,
+    /// Stamp of the shared cache clock at publish, lookup hit or use end.
+    pub(super) last_used: u64,
 }
 
 impl GdnCheckpointLineage for DenseGdnPrefixCheckpoint {
@@ -99,6 +101,8 @@ pub(super) struct DenseGdnHistoryCheckpoint {
     pub(super) image_key: Option<u64>,
     pub(super) tokens: Vec<u32>,
     pub(super) caches: Vec<Qwen3_5LayerCache>,
+    /// Stamp of the shared cache clock at the turn-end write or use end.
+    pub(super) last_used: u64,
 }
 
 pub(super) struct DenseGdnPrefixPreparation {

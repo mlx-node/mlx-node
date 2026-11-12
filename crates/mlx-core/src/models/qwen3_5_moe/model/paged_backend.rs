@@ -193,23 +193,37 @@ impl PagedBackend for Qwen35MoeInner {
             }
         }
         if self.active_scheduled_seq.is_none() {
-            crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(self, plan);
-        }
-        let turn_plan = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
-            .prepare_turn_per_block_with_max_cache_hit_tokens(
-                seq_id,
+            crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
+                self,
                 plan,
-                total_budget,
-                true,
                 &lookup_extra_keys,
                 cache_salt,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(Error::from_reason)?;
+            );
+        }
+        let turn_plan = crate::models::qwen3_5::dflash2_turn::reclaiming(
+            self,
+            crate::models::qwen3_5::dflash2_turn::Keep {
+                tokens: plan,
+                keys: Some((lookup_extra_keys.as_slice(), cache_salt)),
+            },
+            |inner| {
+                inner
+                    .paged_adapter
+                    .as_mut()
+                    .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
+                    .prepare_turn_per_block_with_max_cache_hit_tokens(
+                        seq_id,
+                        plan,
+                        total_budget,
+                        true,
+                        &lookup_extra_keys,
+                        cache_salt,
+                        false,
+                        max_cache_hit_tokens,
+                    )
+                    .map_err(Error::from_reason)
+            },
+        )?;
         let cached_prefix_len = turn_plan.cached_prefix_len;
         let continued_live_prefix = turn_plan.continued_live_prefix;
         if trace_enabled {
@@ -391,10 +405,17 @@ impl PagedBackend for Qwen35MoeInner {
         // surface as a turn error and invalidate the paged session.
         let rows = u32::try_from(crate::engine::mtp_turn::turn_lookahead_rows(plan, p))
             .unwrap_or(u32::MAX);
-        let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-            Error::from_reason("MoE paged speculative admission: paged_adapter is None")
-        })?;
-        match adapter.reserve_rows(rows) {
+        let reserved = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(self, |inner| {
+            inner
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason("MoE paged speculative admission: paged_adapter is None")
+                })?
+                .reserve_rows(rows)
+                .map_err(Error::from_reason)
+        });
+        match reserved.map_err(|error| error.reason) {
             Ok(_) => Ok(true),
             Err(e) if e.starts_with("context_length_exceeded:") => {
                 tracing::warn!(
@@ -494,6 +515,10 @@ impl PagedBackend for Qwen35MoeInner {
         // error must downgrade the session before the engine's unconditional
         // history save can publish image-placeholder history.
         self.paged_finalize_failed = false;
+        self.paged_turn_seq = self
+            .paged_adapter
+            .as_ref()
+            .and_then(PagedKVCacheAdapter::active_seq_id);
         let mut release_pending = false;
         let mut finalize_error = match self.paged_adapter.as_mut() {
             Some(adapter) if reuse_cache => {
@@ -570,6 +595,7 @@ impl PagedBackend for Qwen35MoeInner {
         _keep_all: bool,
         reuse_cache: bool,
     ) -> Result<()> {
+        let turn_seq = self.paged_turn_seq.take();
         if std::mem::take(&mut self.paged_finalize_failed) {
             self.cached_token_history.clear();
             self.cached_image_key = None;
@@ -593,6 +619,9 @@ impl PagedBackend for Qwen35MoeInner {
             self.cached_image_key = None;
             self.cached_paged_image_token_positions.clear();
             self.cached_rope_deltas = None;
+            if let Some(seq_id) = turn_seq {
+                self.end_gdn_use(seq_id);
+            }
             return Ok(());
         }
         let mut full_history = save_tokens.to_vec();
@@ -609,6 +638,9 @@ impl PagedBackend for Qwen35MoeInner {
         // must NOT be published as a reusable warm-continue checkpoint, or the
         // next turn reads corrupt recurrent state.
         let store = self.remember_moe_gdn_history_checkpoint()?;
+        if let Some(seq_id) = turn_seq {
+            self.end_gdn_use(seq_id);
+        }
         if inference_trace_enabled() {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-moe gdn_history_checkpoint stored={} tokens={} \

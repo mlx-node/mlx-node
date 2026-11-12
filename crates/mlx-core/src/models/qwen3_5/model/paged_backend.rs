@@ -195,23 +195,37 @@ impl PagedBackend for Qwen35Inner {
             }
         }
         if self.active_scheduled_seq.is_none() {
-            crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(self, plan);
-        }
-        let turn_plan = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
-            .prepare_turn_per_block_with_max_cache_hit_tokens(
-                seq_id,
+            crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
+                self,
                 plan,
-                total_budget,
-                true,
                 &lookup_extra_keys,
                 cache_salt,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(Error::from_reason)?;
+            );
+        }
+        let turn_plan = crate::models::qwen3_5::dflash2_turn::reclaiming(
+            self,
+            crate::models::qwen3_5::dflash2_turn::Keep {
+                tokens: plan,
+                keys: Some((lookup_extra_keys.as_slice(), cache_salt)),
+            },
+            |inner| {
+                inner
+                    .paged_adapter
+                    .as_mut()
+                    .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
+                    .prepare_turn_per_block_with_max_cache_hit_tokens(
+                        seq_id,
+                        plan,
+                        total_budget,
+                        true,
+                        &lookup_extra_keys,
+                        cache_salt,
+                        false,
+                        max_cache_hit_tokens,
+                    )
+                    .map_err(Error::from_reason)
+            },
+        )?;
         let cached_prefix_len = turn_plan.cached_prefix_len;
         let continued_live_prefix = turn_plan.continued_live_prefix;
         if trace_enabled {
@@ -400,6 +414,10 @@ impl PagedBackend for Qwen35Inner {
         // error must downgrade the session before the engine's unconditional
         // `save_paged_history` call can publish image-placeholder history.
         self.paged_finalize_failed = false;
+        self.paged_turn_seq = self
+            .paged_adapter
+            .as_ref()
+            .and_then(PagedKVCacheAdapter::active_seq_id);
         let mut release_pending = false;
         let mut finalize_error = match self.paged_adapter.as_mut() {
             Some(adapter) if reuse_cache => {
@@ -484,6 +502,7 @@ impl PagedBackend for Qwen35Inner {
         _keep_all: bool,
         reuse_cache: bool,
     ) -> Result<()> {
+        let turn_seq = self.paged_turn_seq.take();
         // `finalize_paged_turn` is an infallible trait hook. When its adapter
         // operation failed it already invalidated the native caches and left
         // this one-turn latch so the engine's unconditional save cannot revive
@@ -511,6 +530,9 @@ impl PagedBackend for Qwen35Inner {
             self.cached_image_key = None;
             self.cached_paged_image_token_positions.clear();
             self.cached_rope_deltas = None;
+            if let Some(seq_id) = turn_seq {
+                self.end_gdn_use(seq_id);
+            }
             return Ok(());
         }
         let mut full_history = save_tokens.to_vec();
@@ -533,6 +555,9 @@ impl PagedBackend for Qwen35Inner {
         // warm-continue checkpoint, or the next turn reads corrupt
         // recurrent state.
         let store = self.remember_dense_gdn_history_checkpoint()?;
+        if let Some(seq_id) = turn_seq {
+            self.end_gdn_use(seq_id);
+        }
         if inference_trace_enabled() {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] qwen3.5-dense gdn_history_checkpoint stored={} tokens={} \

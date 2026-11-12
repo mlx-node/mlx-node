@@ -23,6 +23,9 @@ use crate::engine::backend::{
 };
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::model_command::{FamilyCommand, ModelCommand, handle_model_command};
+use crate::engine::reclaim::{
+    Freed, KvNeed, KvReclaim, MetBefore, Reach, Unit, UnitKey, free_for_kv,
+};
 use crate::engine::scheduler::{
     BlockTelemetry, PreemptedTurn, PreemptionMode, PreemptionReplay, RowStepResult, Scheduler,
     SchedulerAction, SchedulerError, StepExecutor, StepKind, StepPlan, StepResult, TurnState,
@@ -167,12 +170,42 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
 
     fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter>;
     fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter>;
-    /// Frees one item of memory the family holds outside the page pool after
-    /// the pool grow's headroom probe declined. Returns whether anything was
-    /// freed, in which case the caller retries the grow and asks again only
-    /// if it is still declined (Splash's allocate loop, Engine.cpp:2056-2104).
-    fn release_one_for_pool_grow(&mut self) -> bool {
+    /// The family takes a refused KV reservation's units in one stamp order
+    /// (`crate::engine::reclaim`), at the pool's cap too.
+    fn reclaims_in_order(&self) -> bool {
         false
+    }
+    /// Moves an idle live state beside the pool where the take order sees it.
+    fn park_idle_live_state(&mut self) {}
+    fn sync_state_marks(&mut self) {}
+    /// Bytes every state unit could free (an upper bound); the states turns
+    /// use count only with `in_use`.
+    fn state_reach_bytes(&self, _in_use: bool) -> u64 {
+        0
+    }
+    fn compact_one_state(&mut self) -> bool {
+        false
+    }
+    fn oldest_state_unit(
+        &self,
+        _at_cap: bool,
+        _skip: &HashSet<UnitKey>,
+        _in_use: bool,
+    ) -> Option<Unit> {
+        None
+    }
+    /// Takes one state unit; false when it freed nothing.
+    fn take_state_unit(&mut self, _key: &UnitKey) -> bool {
+        false
+    }
+    /// The take order for `need`, keeping `keep`'s own entries.
+    fn reclaim_kv(&mut self, _need: KvNeed, _keep: &[u32]) -> Freed {
+        Freed::Short
+    }
+    /// Marked cache-only blocks `prompt` hits: its admission is charged no
+    /// block for them.
+    fn marked_hit_blocks(&self, _prompt: &[u32]) -> u32 {
+        0
     }
     fn scheduler_cache_available(&self) -> bool {
         self.paged_adapter().is_some()
@@ -200,7 +233,7 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
             blocks: BlockTelemetry {
                 total_blocks: blocks.total_blocks,
                 free_blocks: blocks.free_blocks,
-                reclaimable_blocks: blocks.reclaimable_blocks,
+                reclaimable_blocks: blocks.evictable_blocks,
                 allocated_blocks: blocks.allocated_blocks,
             },
             max_total_blocks: blocks.max_total_blocks,
@@ -675,6 +708,23 @@ fn grow_needed_blocks(
     (shortfall_blocks > 0).then_some(shortfall_blocks)
 }
 
+/// Blocks free plus evictable blocks lack for `need_bytes` at the pool's
+/// cap, where only a reclaim adds takeable blocks. `None` below the cap or
+/// when nothing is short.
+fn cap_shortfall_blocks(snapshot: &SchedulerCacheSnapshot, need_bytes: u64) -> Option<u32> {
+    if snapshot.blocks.total_blocks < snapshot.max_total_blocks {
+        return None;
+    }
+    let bytes_per_block = snapshot.bytes_per_block.max(1);
+    let available = u64::from(snapshot.blocks.free_blocks)
+        .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
+        .saturating_mul(bytes_per_block);
+    let short = need_bytes
+        .saturating_sub(available)
+        .div_ceil(bytes_per_block);
+    (short > 0).then(|| short.min(u64::from(u32::MAX)) as u32)
+}
+
 /// Keep-live blocks already allocated for `seq_id` that a continuation
 /// will reuse. Subtracted from `reservation_blocks` at admit so the
 /// full-prompt ISL is not charged on top of KV that is neither free nor
@@ -905,6 +955,41 @@ fn grow_needed_blocks_for(
         .max_total_blocks
         .saturating_sub(snapshot.blocks.total_blocks);
     (blocks <= f64::from(room)).then_some(blocks as u32)
+}
+
+/// `grow_needed_blocks_for` for a family whose grow takes in order: a need
+/// past the room grows to the max pool and takes the rest (Splash
+/// `Engine::allocate` frees before the claim waits). That count is sized
+/// for the max pool's watermark, or the take falls short of admission.
+fn grow_or_take_needed_blocks_for(
+    snapshot: &SchedulerCacheSnapshot,
+    decision: &engine::scheduler::MemoryAdmission,
+    watermark_fraction: f64,
+) -> Option<u32> {
+    if snapshot.blocks.total_blocks >= snapshot.max_total_blocks {
+        return None;
+    }
+    if let Some(blocks) = grow_needed_blocks_for(snapshot, decision, watermark_fraction) {
+        return Some(blocks);
+    }
+    let bytes_per_block = snapshot.bytes_per_block.max(1);
+    let available = u64::from(snapshot.blocks.free_blocks)
+        .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
+        .saturating_mul(bytes_per_block);
+    let watermark = if decision.watermark_bytes > 0 {
+        let capacity =
+            u64::from(snapshot.max_total_blocks).saturating_mul(snapshot.bytes_per_block);
+        ((capacity as f64) * watermark_fraction.clamp(0.0, 1.0)).ceil() as u64
+    } else {
+        0
+    };
+    let short = decision
+        .reserved_block_bytes
+        .saturating_add(decision.reserved_state_bytes)
+        .saturating_add(watermark)
+        .saturating_sub(available)
+        .div_ceil(bytes_per_block);
+    (short > 0).then(|| short.min(u64::from(u32::MAX)) as u32)
 }
 
 pub(crate) enum ScheduledReply {
@@ -1758,6 +1843,111 @@ impl<B: HybridSchedulerBackend> StepExecutor<ScheduledTurn<B::PrefixState>>
     }
 }
 
+/// The scheduler side of the take order for a blocked step: the family's
+/// states beside the idle owners, each by its own stamp.
+struct SchedReclaim<'a, B: HybridSchedulerBackend> {
+    state: &'a mut HybridSchedulerState<B>,
+    victim: SeqId,
+}
+
+impl<B: HybridSchedulerBackend> KvReclaim for SchedReclaim<'_, B> {
+    fn at_cap(&self) -> bool {
+        self.state
+            .inner
+            .paged_adapter()
+            .is_none_or(PagedKVCacheAdapter::at_cap)
+    }
+
+    fn takeable(&self) -> u32 {
+        self.state
+            .inner
+            .paged_adapter()
+            .map_or(0, PagedKVCacheAdapter::takeable_blocks)
+    }
+
+    fn ungrown(&self) -> u32 {
+        self.state
+            .inner
+            .paged_adapter()
+            .map_or(0, PagedKVCacheAdapter::ungrown_blocks)
+    }
+
+    fn bytes_per_block(&self) -> u64 {
+        self.state
+            .inner
+            .paged_adapter()
+            .and_then(|adapter| adapter.bytes_per_block().ok())
+            .unwrap_or(0)
+    }
+
+    fn met(&mut self, need: KvNeed) -> bool {
+        self.state
+            .inner
+            .paged_adapter_mut()
+            .is_some_and(|adapter| adapter.kv_need_met(need.blocks, need.over_takeable))
+    }
+
+    fn grow_room(&self) -> u32 {
+        self.state
+            .inner
+            .paged_adapter()
+            .map_or(0, PagedKVCacheAdapter::last_grow_room)
+    }
+
+    fn before_count(&mut self, at_cap: bool) {
+        if !at_cap {
+            self.state.inner.park_idle_live_state();
+        }
+    }
+
+    fn sync_marks(&mut self) {
+        self.state.inner.sync_state_marks();
+    }
+
+    fn reach(&self, at_cap: bool, in_use: bool) -> Reach {
+        let owners = self.state.idle_owners(self.victim);
+        let adapter = self.state.inner.paged_adapter();
+        let releasable =
+            adapter.map_or(0, |adapter| adapter.releasable_blocks_of(&owners).len()) as u64;
+        let rows = (owners
+            .iter()
+            .filter(|&&seq_id| self.state.inner.has_scheduled_recurrent(seq_id))
+            .count() as u64)
+            .saturating_mul(self.state.inner.recurrent_state_bytes());
+        Reach {
+            blocks: u64::from(adapter.map_or(0, PagedKVCacheAdapter::marked_blocks))
+                .saturating_add(releasable),
+            bytes: if at_cap {
+                0
+            } else {
+                self.state
+                    .inner
+                    .state_reach_bytes(in_use)
+                    .saturating_add(rows)
+            },
+        }
+    }
+
+    fn compact_one(&mut self) -> bool {
+        self.state.inner.compact_one_state()
+    }
+
+    fn oldest_state(&self, at_cap: bool, skip: &HashSet<UnitKey>, in_use: bool) -> Option<Unit> {
+        self.state.inner.oldest_state_unit(at_cap, skip, in_use)
+    }
+
+    fn oldest_kv(&self, at_cap: bool, skip: &HashSet<UnitKey>) -> Option<Unit> {
+        self.state.oldest_idle_owner(self.victim, at_cap, skip)
+    }
+
+    fn take(&mut self, key: &UnitKey) -> bool {
+        match key {
+            UnitKey::Owner(seq_id) => self.state.release_owner(*seq_id),
+            _ => self.state.inner.take_state_unit(key),
+        }
+    }
+}
+
 pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     pub(crate) inner: B,
     enabled: bool,
@@ -1771,6 +1961,13 @@ pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     pending_restores: HashMap<SeqId, B::RestoreTicket>,
     pub(crate) owner_sequences: HashMap<String, SeqId>,
     pub(crate) owner_states: HashMap<String, B::OwnerState>,
+    /// Turn-end stamp of each idle owner's kept table, on the model's one
+    /// cache clock.
+    owner_last_used: HashMap<SeqId, u64>,
+    /// Splash `Engine::allocate`'s met list for the blocked step's retries.
+    met_before: MetBefore<(SeqId, u32)>,
+    /// The prompt an admission grow keeps (Splash `VictimQuery::kept`).
+    reclaim_keep: Vec<u32>,
     next_seq_id: SeqId,
 }
 
@@ -1822,6 +2019,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             pending_restores: HashMap::new(),
             owner_sequences: HashMap::new(),
             owner_states: HashMap::new(),
+            owner_last_used: HashMap::new(),
+            met_before: MetBefore::default(),
+            reclaim_keep: Vec::new(),
             next_seq_id: 1,
         })
     }
@@ -2379,13 +2579,18 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// Idle owner that holds a recurrent row or a keep-live/cache table.
     /// Used by memory-denial reclaim only; unit-cap stays rec-only.
     fn idle_memory_victim(&self, seq_id: SeqId) -> Option<SeqId> {
+        self.idle_owners(seq_id).first().copied()
+    }
+
+    /// Every owner [`Self::idle_memory_victim`] may pick, lowest first.
+    fn idle_owners(&self, seq_id: SeqId) -> Vec<SeqId> {
         let mut candidates: Vec<SeqId> = self.owner_sequences.values().copied().collect();
         if let Some(adapter) = self.inner.paged_adapter() {
             candidates.extend(adapter.live_seq_ids());
         }
         candidates.sort_unstable();
         candidates.dedup();
-        candidates.into_iter().find(|&candidate| {
+        candidates.retain(|&candidate| {
             candidate != seq_id
                 && !self.scheduler.contains_seq(candidate)
                 && (self.inner.has_scheduled_recurrent(candidate)
@@ -2394,7 +2599,61 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                         .inner
                         .paged_adapter()
                         .is_some_and(|adapter| adapter.block_table_for(candidate).is_some()))
-        })
+        });
+        candidates
+    }
+
+    /// The idle owner with the oldest turn-end stamp that frees something: a
+    /// block at the cap, a block or a parked row below it. A block counts
+    /// when releasing every idle owner would free it. An owner the
+    /// scheduler never finished goes by its table's turn-end stamp.
+    fn oldest_idle_owner(
+        &self,
+        victim: SeqId,
+        at_cap: bool,
+        skip: &HashSet<UnitKey>,
+    ) -> Option<Unit> {
+        let adapter = self.inner.paged_adapter();
+        let owners = self.idle_owners(victim);
+        let freed = adapter
+            .map(|adapter| adapter.releasable_blocks_of(&owners))
+            .unwrap_or_default();
+        owners
+            .into_iter()
+            .filter(|&seq_id| !skip.contains(&UnitKey::Owner(seq_id)))
+            .filter(|&seq_id| {
+                adapter.is_some_and(|adapter| adapter.table_holds_any(seq_id, &freed))
+                    || (!at_cap && self.inner.has_scheduled_recurrent(seq_id))
+            })
+            .map(|seq_id| {
+                let stamp = self
+                    .owner_last_used
+                    .get(&seq_id)
+                    .copied()
+                    .or_else(|| adapter.and_then(|adapter| adapter.turn_end_stamp(seq_id)))
+                    .unwrap_or(0);
+                (stamp, seq_id)
+            })
+            .min()
+            .map(|(stamp, seq_id)| Unit {
+                stamp,
+                key: UnitKey::Owner(seq_id),
+            })
+    }
+
+    /// Releases an idle owner's row, draft state and table.
+    fn release_owner(&mut self, seq_id: SeqId) -> bool {
+        self.inner.release_scheduled_recurrent_for(seq_id);
+        self.inner.release_scheduled_speculation(seq_id);
+        if let Err(error) = self.inner.release_scheduled_cache(seq_id) {
+            tracing::warn!(
+                "{} could not release idle owner {seq_id} for a blocked step: {error:?}",
+                B::SCHEDULER_NAME
+            );
+            return false;
+        }
+        self.owner_last_used.remove(&seq_id);
+        true
     }
 
     /// Keep the two-unit residency cap as a queueing boundary. An idle warm
@@ -2478,17 +2737,52 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         Ok(true)
     }
 
-    /// Frees memory for a blocked step without preempting `victim`: below
-    /// the max pool, one item the family holds beside the pool at a time,
-    /// retrying a one-block grow after each (the step's own grow was
-    /// declined), until one grows; then idle owners, one at a time, until
-    /// one gives back pool blocks or a parked row (a speculative step's fit
-    /// counts idle rows). At the max no grow can use freed memory, so
-    /// nothing beside the pool is evicted. True only when free plus
-    /// reclaimable blocks grew or the parked rows shrank, so the blocked
-    /// rows retry and the loop is bounded by what is idle (Splash reclaims
-    /// idle state before it yields or fails, Engine.cpp:2066-2104).
-    fn reclaim_for_blocked_step(&mut self, victim: SeqId) -> bool {
+    /// Frees memory for a blocked step without preempting `victim`. A
+    /// family that reclaims in order sends the step's refused KV need
+    /// through the take order (Splash `MemoryLedger::free`): met in place, a
+    /// count that cannot cover it takes nothing, else states and idle owners
+    /// go oldest first until it is met; a need met or freed for once already
+    /// stops (Splash `Engine::allocate`). `reach_in_use`: the step's turn
+    /// runs alone, so its need goes on to the states suspended and running
+    /// turns use, last (Splash `Engine::growthClass`); a turn that yields
+    /// beside another keeps them. A blocked step that left no KV refusal,
+    /// and every other family, releases idle owners.
+    fn reclaim_for_blocked_step(&mut self, victim: SeqId, reach_in_use: bool) -> bool {
+        if !self.inner.reclaims_in_order() {
+            return self.reclaim_idle_owners(victim);
+        }
+        let Some(blocks) = self
+            .inner
+            .paged_adapter()
+            .and_then(PagedKVCacheAdapter::take_refusal)
+        else {
+            return self.reclaim_idle_owners(victim);
+        };
+        let need = (victim, blocks);
+        let retry = !self.met_before.seen(&need) && {
+            let freed = free_for_kv(
+                &mut SchedReclaim {
+                    state: self,
+                    victim,
+                },
+                KvNeed {
+                    reach_in_use,
+                    ..KvNeed::in_place(blocks)
+                },
+            );
+            self.met_before.retry(need, freed)
+        };
+        if !retry {
+            self.met_before.clear();
+        }
+        retry
+    }
+
+    /// Idle owners, one at a time, until one gives back pool blocks or a
+    /// parked row (a speculative step's fit counts idle rows). True only
+    /// when free plus reclaimable blocks grew or the parked rows shrank, so
+    /// the blocked rows retry and the loop is bounded by what is idle.
+    fn reclaim_idle_owners(&mut self, victim: SeqId) -> bool {
         let snapshot = |state: &Self| state.inner.scheduler_cache_snapshot().ok().flatten();
         let available = |snapshot: &SchedulerCacheSnapshot| {
             u64::from(snapshot.blocks.free_blocks) + u64::from(snapshot.blocks.reclaimable_blocks)
@@ -2498,25 +2792,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         };
         let before = available(&current);
         let rows_before = self.inner.scheduled_recurrent_bytes();
-        if current.blocks.total_blocks < current.max_total_blocks {
-            while self.inner.release_one_for_pool_grow() {
-                if self
-                    .inner
-                    .paged_adapter_mut()
-                    .is_some_and(|adapter| adapter.try_grow_pool(1))
-                {
-                    return true;
-                }
-            }
-        }
         while let Some(owner) = self.idle_memory_victim(victim) {
-            self.inner.release_scheduled_recurrent_for(owner);
-            self.inner.release_scheduled_speculation(owner);
-            if let Err(error) = self.inner.release_scheduled_cache(owner) {
-                tracing::warn!(
-                    "{} could not release idle owner {owner} for a blocked step: {error:?}",
-                    B::SCHEDULER_NAME
-                );
+            if !self.release_owner(owner) {
                 return false;
             }
             if snapshot(self).is_some_and(|after| available(&after) > before)
@@ -2547,10 +2824,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return false;
         }
         let Some(preempted) = preempted else {
+            self.met_before.clear();
             return true;
         };
         if self.inner.scheduler_books_on_demand()
-            && self.reclaim_for_blocked_step(preempted.turn.seq_id)
+            && self.reclaim_for_blocked_step(preempted.turn.seq_id, false)
         {
             self.scheduler.reinstate_running(preempted.turn);
         } else {
@@ -2563,7 +2841,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// first reclaims idle memory; with none left the turn cannot fit even
     /// alone, so it fails with `capacity_exhausted` and is released once,
     /// never preempted: a replay would block at the same step (Splash
-    /// `judge` fails a lone lane, Engine.cpp:2040-2054, 1800-1812). Other
+    /// `Engine::judge` fails a lone lane). Other
     /// families book the whole turn and keep the preempt-and-resume path.
     fn handle_blocked_alone(&mut self, seq_id: SeqId) {
         if !self.inner.scheduler_books_on_demand() {
@@ -2575,7 +2853,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
             return;
         }
-        if self.reclaim_for_blocked_step(seq_id) {
+        if self.reclaim_for_blocked_step(seq_id, true) {
             return;
         }
         let error = self.capacity_exhausted(seq_id);
@@ -2596,10 +2874,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             ),
             _ => format!("it holds {held} paged blocks"),
         };
+        let tried = if self.inner.reclaims_in_order() {
+            "even alone: the parked states and idle cache owners could not free what the step \
+             lacks (none is taken when their count falls short)"
+        } else {
+            "even alone after every idle cache owner was released"
+        };
         Error::from_reason(format!(
             "capacity_exhausted: could not allocate KV or draft state for this turn's next step \
-             ({pool}); the request does not fit in the memory the page pool may use, even alone \
-             after every idle cache owner was released"
+             ({pool}); the request does not fit in the memory the page pool may use, {tried}"
         ))
     }
 
@@ -2725,6 +3008,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     {
         let mut grown_for_live_turns = false;
         let mut grown_before_reclaim = false;
+        let mut met_before = MetBefore::default();
         loop {
             let decision =
                 self.reserve_memory_decision(&snapshot, reservation_blocks, candidate_state_bytes);
@@ -2772,14 +3056,31 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     if self.inner.scheduler_books_on_demand()
                         && !grown_for_live_turns
                         && state == ScheduledStateFit::Fits
-                        && let Some(needed) = grow_needed_blocks_for(
-                            &snapshot,
-                            &decision,
-                            scheduler_watermark_fraction(),
-                        )
+                        && let Some(needed) = if self.inner.reclaims_in_order() {
+                            grow_or_take_needed_blocks_for(
+                                &snapshot,
+                                &decision,
+                                scheduler_watermark_fraction(),
+                            )
+                            .or_else(|| {
+                                cap_shortfall_blocks(
+                                    &snapshot,
+                                    decision
+                                        .reserved_block_bytes
+                                        .saturating_add(decision.reserved_state_bytes)
+                                        .saturating_add(decision.watermark_bytes),
+                                )
+                            })
+                        } else {
+                            grow_needed_blocks_for(
+                                &snapshot,
+                                &decision,
+                                scheduler_watermark_fraction(),
+                            )
+                        }
                     {
                         grown_for_live_turns = true;
-                        if let Some(grown) = self.try_grow_pool_by(needed)? {
+                        if let Some(grown) = self.try_grow_pool_by(needed, &mut met_before)? {
                             snapshot = grown;
                             continue;
                         }
@@ -2799,6 +3100,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     &snapshot,
                     reservation_blocks,
                     candidate_state_bytes,
+                    &mut met_before,
                 )? {
                     snapshot = grown;
                     let decision = self.reserve_memory_decision(
@@ -2835,32 +3137,70 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         snapshot: &SchedulerCacheSnapshot,
         reservation_blocks: u32,
         candidate_state_bytes: u64,
+        met_before: &mut MetBefore<u32>,
     ) -> Result<Option<SchedulerCacheSnapshot>> {
+        let existing_state_bytes = self.inner.scheduled_recurrent_bytes();
         let Some(needed) = grow_needed_blocks(
             snapshot,
             reservation_blocks,
             candidate_state_bytes,
-            self.inner.scheduled_recurrent_bytes(),
-        ) else {
+            existing_state_bytes,
+        )
+        .or_else(|| {
+            (self.inner.reclaims_in_order()
+                && !exceeds_max_pool_ceiling(snapshot, reservation_blocks, candidate_state_bytes))
+            .then(|| {
+                cap_shortfall_blocks(
+                    snapshot,
+                    u64::from(reservation_blocks)
+                        .saturating_mul(snapshot.bytes_per_block.max(1))
+                        .saturating_add(candidate_state_bytes)
+                        .saturating_add(existing_state_bytes),
+                )
+            })
+            .flatten()
+        }) else {
             return Ok(None);
         };
-        self.try_grow_pool_by(needed)
+        self.try_grow_pool_by(needed, met_before)
     }
 
-    /// Grows the pool by `needed` blocks; while the grow is declined, frees
-    /// one item the family holds outside the pool and retries. Returns the
-    /// fresh snapshot, or `None` when the pool did not grow.
-    fn try_grow_pool_by(&mut self, needed: u32) -> Result<Option<SchedulerCacheSnapshot>> {
-        loop {
-            let Some(adapter) = self.inner.paged_adapter_mut() else {
-                return Ok(None);
-            };
-            if adapter.try_grow_pool(needed) {
-                return self.inner.scheduler_cache_snapshot();
+    /// Grows the pool by `needed` blocks. A family that reclaims in order
+    /// sends the need through the take order (at the cap too, where only a
+    /// take adds blocks), keeping the admitted prompt's entries; a `Short`
+    /// take or a need `met_before` saw is not grown. Returns the fresh
+    /// snapshot, or `None` when the pool did not grow.
+    fn try_grow_pool_by(
+        &mut self,
+        needed: u32,
+        met_before: &mut MetBefore<u32>,
+    ) -> Result<Option<SchedulerCacheSnapshot>> {
+        let Some(adapter) = self.inner.paged_adapter() else {
+            return Ok(None);
+        };
+        let grown = if self.inner.reclaims_in_order() {
+            let blocks = adapter.takeable_blocks().saturating_add(needed);
+            !met_before.seen(&blocks) && {
+                let freed = self.inner.reclaim_kv(
+                    KvNeed {
+                        blocks,
+                        over_takeable: true,
+                        checked: false,
+                        reach_in_use: false,
+                    },
+                    &self.reclaim_keep,
+                );
+                met_before.retry(blocks, freed)
             }
-            if !self.inner.release_one_for_pool_grow() {
-                return Ok(None);
-            }
+        } else {
+            self.inner
+                .paged_adapter_mut()
+                .is_some_and(|adapter| adapter.try_grow_pool(needed))
+        };
+        if grown {
+            self.inner.scheduler_cache_snapshot()
+        } else {
+            Ok(None)
         }
     }
 
@@ -2876,6 +3216,25 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             "context_length_exceeded: request requires {} paged blocks but the max pool holds {}",
             reservation_blocks, max_total_blocks
         ))
+    }
+
+    /// Blocks an admission charges: the reservation less the kept live
+    /// blocks it continues on and the marked chain its prompt hits.
+    fn admission_charge(
+        &self,
+        reservation_blocks: u32,
+        seq_id: SeqId,
+        tokens: &[u32],
+        reuse: bool,
+    ) -> u32 {
+        reservation_blocks
+            .saturating_sub(reusable_keep_live_blocks(
+                self.inner.paged_adapter(),
+                seq_id,
+                tokens,
+                reuse,
+            ))
+            .saturating_sub(self.inner.marked_hit_blocks(tokens))
     }
 
     fn admit_prepared(
@@ -2936,14 +3295,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let mut scheduled_state_bytes = 0u64;
         if let Some(snapshot) = cache_snapshot {
             let reuse = prepared.admitted.plan.is_delta || prepared.admitted.params.reuse_cache;
-            let charge = prepared
-                .reservation_blocks
-                .saturating_sub(reusable_keep_live_blocks(
-                    self.inner.paged_adapter(),
-                    prepared.seq_id,
-                    &prepared.admitted.tokens,
-                    reuse,
-                ));
+            let charge = self.admission_charge(
+                prepared.reservation_blocks,
+                prepared.seq_id,
+                &prepared.admitted.tokens,
+                reuse,
+            );
             let state_candidate_bytes = self.inner.scheduled_state_candidate_bytes(
                 prepared.seq_id,
                 prepared.requested_tokens,
@@ -2954,13 +3311,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             );
             scheduled_state_bytes = state_candidate_bytes
                 .saturating_add(self.inner.scheduled_state_held_bytes(prepared.seq_id));
-            match self.try_reserve_reclaiming_idle(
+            self.reclaim_keep.clone_from(&prepared.admitted.tokens);
+            let reserved = self.try_reserve_reclaiming_idle(
                 prepared.seq_id,
                 charge,
                 candidate_state_bytes,
                 state_candidate_bytes,
                 snapshot,
-            ) {
+            );
+            self.reclaim_keep.clear();
+            match reserved {
                 Ok(MemoryReserveOutcome::Admitted) => {}
                 Ok(MemoryReserveOutcome::Defer) => return Err(prepared),
                 Ok(MemoryReserveOutcome::Reject { total_blocks }) => {
@@ -3440,12 +3800,20 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return;
         }
         if let Some(snapshot) = cache_snapshot {
+            // The resume looks up the replay tokens, prompt and committed
+            // output (Splash `exactTokens`), so it keeps and charges by them.
+            let replay_tokens = turn
+                .payload
+                .preemption_replay
+                .as_ref()
+                .map_or(&turn.payload.prompt_tokens, |replay| &replay.tokens);
             let materialized = self.inner.scheduler_materialized_blocks(turn.seq_id);
             let charge = if materialized > 0 {
                 turn.block_reservation_total.saturating_sub(materialized)
             } else {
                 turn.block_reservation_total
-            };
+            }
+            .saturating_sub(self.inner.marked_hit_blocks(replay_tokens));
             let state_candidate_bytes = self.inner.scheduled_state_candidate_bytes(
                 turn.seq_id,
                 turn.payload.requested_tokens,
@@ -3456,7 +3824,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             } else {
                 self.scheduler.has_live_turns()
             };
-            match self.try_reserve_with_policy(
+            self.reclaim_keep.clone_from(replay_tokens);
+            let reserved = self.try_reserve_with_policy(
                 turn.seq_id,
                 charge,
                 turn.recurrent_state_bytes,
@@ -3464,7 +3833,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 snapshot,
                 may_wait,
                 B::release_scheduled_cache,
-            ) {
+            );
+            self.reclaim_keep.clear();
+            match reserved {
                 Ok(MemoryReserveOutcome::Admitted) => {
                     turn.scheduled_state_bytes = state_candidate_bytes
                         .saturating_add(self.inner.scheduled_state_held_bytes(turn.seq_id));
@@ -3580,6 +3951,14 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
     }
 
+    /// A step's refusals are its own: one left by a reservation outside the
+    /// step (admission, a prefix prepare) must not reach its reclaim.
+    fn begin_scheduled_step(&mut self) {
+        if let Some(adapter) = self.inner.paged_adapter() {
+            adapter.clear_refusals();
+        }
+    }
+
     fn finish_completed(&mut self, mut turn: TurnState<ScheduledTurn<B::PrefixState>>) {
         // Every arm below ends the turn, the error returns included.
         self.inner.scheduled_turn_closed(turn.seq_id);
@@ -3665,6 +4044,17 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.owner_states.remove(&turn.payload.owner_id);
             self.owner_sequences.remove(&turn.payload.owner_id);
         }
+        if self.owner_sequences.get(&turn.payload.owner_id) == Some(&turn.seq_id)
+            && let Some(adapter) = self.inner.paged_adapter()
+        {
+            let stamp = adapter
+                .turn_end_stamp(turn.seq_id)
+                .unwrap_or_else(|| adapter.recency().next());
+            self.owner_last_used.insert(turn.seq_id, stamp);
+        }
+        let live: HashSet<SeqId> = self.owner_sequences.values().copied().collect();
+        self.owner_last_used
+            .retain(|seq_id, _| live.contains(seq_id));
         let outcome = match (outcome, parked) {
             (Ok(output), Ok(())) => Ok(output),
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
@@ -3822,6 +4212,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
         }
 
+        self.begin_scheduled_step();
         let action = {
             let mut executor = self.inner.step_executor();
             self.scheduler.drive_once(&mut executor)
@@ -4903,6 +5294,16 @@ pub(crate) mod tests {
     /// Real adapter over a 4-block pool with a 16-block max so a scheduler
     /// grow is observable. Panics without Metal; callers must skip first.
     fn tiny_growable_paged_adapter() -> PagedKVCacheAdapter {
+        tiny_paged_adapter_with(Arc::new(mlx_paged_attn::CacheRecency::new()), 4, 16)
+    }
+
+    /// Real adapter over an `initial`-block pool growing to `max` blocks of
+    /// 16 tokens, its allocator on `recency`.
+    fn tiny_paged_adapter_with(
+        recency: Arc<mlx_paged_attn::CacheRecency>,
+        initial: u32,
+        max: u32,
+    ) -> PagedKVCacheAdapter {
         let cfg = mlx_paged_attn::PagedAttentionConfig {
             block_size: 16,
             num_kv_heads: 1,
@@ -4915,14 +5316,14 @@ pub(crate) mod tests {
         };
         let pool = mlx_paged_attn::LayerKVPool::new(
             cfg,
-            4,
-            16,
+            initial,
+            max,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         )
         .expect("growable test LayerKVPool");
-        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            4, 16, 16,
-        )));
+        let allocator = Arc::new(std::sync::Mutex::new(
+            mlx_paged_attn::BlockAllocator::with_recency(initial, max, 16, recency),
+        ));
         PagedKVCacheAdapter::new(allocator, Arc::new(pool), 16).expect("growable test adapter")
     }
 
@@ -5030,7 +5431,11 @@ pub(crate) mod tests {
     pub(crate) fn reserve_past_a_declined_grow<B: HybridSchedulerBackend>(
         mut inner: B,
     ) -> (bool, u32, B) {
-        let mut adapter = tiny_growable_paged_adapter();
+        let recency = inner.paged_adapter().map_or_else(
+            || Arc::new(mlx_paged_attn::CacheRecency::new()),
+            PagedKVCacheAdapter::recency,
+        );
+        let mut adapter = tiny_paged_adapter_with(recency, 4, 16);
         let probes = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let calls = Arc::clone(&probes);
         adapter.set_grow_headroom_probe_override(Some(Arc::new(move |requested| {
@@ -5183,7 +5588,11 @@ pub(crate) mod tests {
             eprintln!("skipping Qwen3.5 grow-path scheduler test: Metal unavailable");
             return None;
         }
-        inner.paged_adapter = Some(tiny_growable_paged_adapter());
+        inner.paged_adapter = Some(tiny_paged_adapter_with(
+            Arc::clone(&inner.cache_recency),
+            4,
+            16,
+        ));
         let state = HybridSchedulerState::new(inner).expect("construct Qwen3.5 scheduler");
         let snapshot = state
             .inner
@@ -5968,9 +6377,9 @@ pub(crate) mod tests {
 
     /// Admits `turn`, runs one step in which it blocks, and settles it.
     #[cfg(target_os = "macos")]
-    fn settle_blocked_step(
-        state: &mut HybridSchedulerState<Qwen35Inner>,
-        turn: TurnState<ScheduledTurn<<Qwen35Inner as PagedBackend>::PrefixState>>,
+    fn settle_blocked_step<B: HybridSchedulerBackend>(
+        state: &mut HybridSchedulerState<B>,
+        turn: TurnState<ScheduledTurn<B::PrefixState>>,
     ) {
         state.scheduler.enqueue_turn(turn).expect("enqueue");
         let Ok(SchedulerAction::Stepped {
@@ -6361,8 +6770,8 @@ pub(crate) mod tests {
 
     /// A blocked step frees an idle owner's blocks and keeps its victim
     /// running; with nothing idle left it preempts.
-    /// Mutation: skip the idle-owner release in `reclaim_for_blocked_step`
-    /// → red.
+    /// Mutation: never offer idle owners (`oldest_kv` returns `None` in
+    /// `SchedReclaim`) → red.
     #[test]
     fn blocked_step_releases_an_idle_owner_before_preempting() {
         let Some((mut state, _)) = growable_qwen35_state() else {
@@ -6370,12 +6779,21 @@ pub(crate) mod tests {
         };
         state.owner_sequences.insert("idle".into(), 1);
         let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
         adapter.begin_request(1).expect("begin idle request");
         adapter
             .allocate_suffix_blocks_for(1, 32)
             .expect("idle owner holds two blocks");
         assert_eq!(state.idle_memory_victim(2), Some(1));
-        assert!(state.reclaim_for_blocked_step(2));
+        let refuse = |state: &HybridSchedulerState<Qwen35Inner>, blocks| {
+            state
+                .inner
+                .paged_adapter()
+                .expect("paged adapter")
+                .refuse_for_test(2, blocks);
+        };
+        refuse(&state, 3);
+        assert!(state.reclaim_for_blocked_step(2, false));
         assert!(
             state
                 .inner
@@ -6384,7 +6802,8 @@ pub(crate) mod tests {
                 .is_none(),
             "the idle owner's table is released"
         );
-        assert!(!state.reclaim_for_blocked_step(2));
+        refuse(&state, 5);
+        assert!(!state.reclaim_for_blocked_step(2, false));
     }
 
     /// Qwen3.5 scheduler over the growable pool fixture (4 live blocks, 16
@@ -6398,6 +6817,16 @@ pub(crate) mod tests {
     /// `turns - 1` parked states and the last one live.
     fn qwen35_state_with_parked_dflash2_states(
         turns: u32,
+    ) -> Option<HybridSchedulerState<Qwen35Inner>> {
+        qwen35_dflash2_state(turns, 4, 16)
+    }
+
+    /// [`qwen35_state_with_parked_dflash2_states`] over an `initial`-block
+    /// pool growing to `max`.
+    fn qwen35_dflash2_state(
+        turns: u32,
+        initial: u32,
+        max: u32,
     ) -> Option<HybridSchedulerState<Qwen35Inner>> {
         use crate::models::qwen3_5::dflash2_decode::tests::{
             metal_is_default_device, run_tiny_dflash_turn, tiny_int8_dflash_inner,
@@ -6413,7 +6842,11 @@ pub(crate) mod tests {
                 .expect("tiny DFlash2 turn");
         }
         assert_eq!(parked_dflash2_states(&inner), turns as usize - 1);
-        inner.paged_adapter = Some(tiny_growable_paged_adapter());
+        inner.paged_adapter = Some(tiny_paged_adapter_with(
+            Arc::clone(&inner.cache_recency),
+            initial,
+            max,
+        ));
         let mut state = HybridSchedulerState::new(inner).expect("construct Qwen3.5 scheduler");
         state
             .inner
@@ -6438,11 +6871,47 @@ pub(crate) mod tests {
     }
 
     fn pool_grow_evictions() -> usize {
-        crate::models::qwen3_5::dflash2_turn::POOL_GROW_EVICTIONS.with(std::cell::Cell::get)
+        crate::models::qwen3_5::dflash2_turn::grow_reclaim_log().len()
     }
 
     fn parked_dflash2_states(inner: &Qwen35Inner) -> usize {
         inner.dflash2_states.store.bytes().entries
+    }
+
+    fn parked_bytes(state: &HybridSchedulerState<Qwen35Inner>) -> u64 {
+        let bytes = state.inner.dflash2_states.store.bytes();
+        bytes.kv_bytes + bytes.state_bytes
+    }
+
+    fn bytes_per_block(state: &HybridSchedulerState<Qwen35Inner>) -> u64 {
+        state
+            .inner
+            .paged_adapter()
+            .expect("paged adapter")
+            .bytes_per_block()
+            .expect("bytes per block")
+    }
+
+    fn clear_reclaim_log() {
+        crate::models::qwen3_5::dflash2_turn::clear_grow_reclaim_log();
+    }
+
+    fn reclaim_log() -> Vec<crate::models::qwen3_5::dflash2_turn::GrowReclaim> {
+        crate::models::qwen3_5::dflash2_turn::grow_reclaim_log()
+    }
+
+    type Probe = Arc<dyn Fn(u32) -> std::result::Result<u32, String> + Send + Sync>;
+
+    /// Declines with no room (the 4-block pool's own size) until the reclaim
+    /// log on this thread has `taken` entries.
+    fn decline_until_taken(taken: usize) -> Probe {
+        Arc::new(move |blocks| {
+            Ok(if reclaim_log().len() >= taken {
+                blocks
+            } else {
+                4
+            })
+        })
     }
 
     fn pool_total_blocks(state: &HybridSchedulerState<Qwen35Inner>) -> u32 {
@@ -6456,9 +6925,9 @@ pub(crate) mod tests {
     }
 
     /// A blocked step at the max pool evicts no parked DFlash2 state: no
-    /// grow can use the freed memory. Mutation: drop the
-    /// `total_blocks < max_total_blocks` guard in `reclaim_for_blocked_step`
-    /// → red (parked state dropped).
+    /// grow can use the freed memory, and the state sits on no block.
+    /// Mutation: park the live state at the cap too (drop `!at_cap` in
+    /// `SchedReclaim::before_count`) → red (the live state parks).
     #[test]
     fn blocked_step_at_the_max_pool_keeps_parked_dflash2_states() {
         let Some(mut state) = qwen35_state_with_a_parked_dflash2_state() else {
@@ -6466,18 +6935,23 @@ pub(crate) mod tests {
         };
         let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
         while adapter.try_grow_pool(16) {}
+        adapter.refuse_for_test(2, 17);
         assert_eq!(pool_total_blocks(&state), 16);
-        assert!(!state.reclaim_for_blocked_step(2));
+        assert!(!state.reclaim_for_blocked_step(2, false));
+        assert!(
+            state.inner.dflash2_context.is_some(),
+            "the live state stays"
+        );
         assert_eq!(parked_dflash2_states(&state.inner), 1);
     }
 
     /// A blocked step below the max pool parks the idle live DFlash2 state,
     /// evicts one parked state, and grows as soon as the grow passes: the
     /// other states stay.
-    /// Mutation: drop every parked state at once (`store.clear()` in
-    /// `evict_one_parked_dflash2`) → red (0 ≠ 2).
-    /// Mutation: skip the live-state park in `release_one_for_pool_grow` →
-    /// red (the live context stays).
+    /// Mutation: drop every parked state at once (`store.clear()` in place
+    /// of `apply_lossy` in `take_state_unit`) → red (0 ≠ 2).
+    /// Mutation: skip the park in `park_idle_live_state` → red (the live
+    /// context stays).
     #[test]
     fn blocked_scheduled_step_evicts_one_then_grows() {
         let Some(mut state) = qwen35_state_with_parked_dflash2_states(3) else {
@@ -6485,9 +6959,14 @@ pub(crate) mod tests {
         };
         let _no_compaction = no_compaction_headroom();
         assert_eq!(parked_dflash2_states(&state.inner), 2);
+        assert!(parked_bytes(&state) >= bytes_per_block(&state));
         let before = pool_total_blocks(&state);
+        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
+        adapter.set_grow_headroom_probe_override(Some(decline_until_taken(1)));
+        adapter.refuse_for_test(2, 5);
+        clear_reclaim_log();
         let evictions = pool_grow_evictions();
-        assert!(state.reclaim_for_blocked_step(2));
+        assert!(state.reclaim_for_blocked_step(2, false));
         assert_eq!(pool_grow_evictions() - evictions, 1);
         assert!(pool_total_blocks(&state) > before);
         assert!(
@@ -6497,12 +6976,13 @@ pub(crate) mod tests {
         assert_eq!(parked_dflash2_states(&state.inner), 2);
     }
 
-    /// A declined admission grow frees one item per retry and stops at the
+    /// A declined admission grow takes one unit at a time and stops at the
     /// first grant: two declines cost the live state's park plus two parked
     /// states, and one stays.
-    /// Mutation: release once and retry once (the old shape of
-    /// `try_grow_pool_by`) → red (`None`).
-    /// Mutation: drop every parked state at once → red (0 ≠ 1).
+    /// Mutation: re-check the need only once nothing is left in
+    /// `free_for_kv` → red (0 ≠ 1).
+    /// Mutation: drop every parked state at once (`store.clear()` in place
+    /// of `apply_lossy` in `take_state_unit`) → red (0 ≠ 1).
     #[test]
     fn admission_grow_evicts_one_per_retry() {
         use std::sync::atomic::AtomicUsize;
@@ -6523,15 +7003,1414 @@ pub(crate) mod tests {
                     blocks
                 })
             })));
+        assert!(parked_bytes(&state) >= 4 * bytes_per_block(&state));
+        clear_reclaim_log();
         let evictions = pool_grow_evictions();
         let grown = state
-            .try_grow_pool_by(4)
+            .try_grow_pool_by(4, &mut MetBefore::default())
             .expect("grow")
             .expect("the third grow passes");
         assert!(grown.blocks.total_blocks > 4);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(pool_grow_evictions() - evictions, 2);
         assert_eq!(parked_dflash2_states(&state.inner), 1);
+    }
+
+    // ---- take order (`crate::engine::reclaim`) on the scheduled lane ----
+
+    use crate::models::qwen3_5::dflash2_turn::GrowReclaim;
+
+    /// Qwen3.5 dense scheduler (no draft) over an `initial`-block pool
+    /// growing to `max`, on the model's clock, with `probe`.
+    fn qwen35_pool_state(
+        initial: u32,
+        max: u32,
+        probe: Probe,
+    ) -> Option<HybridSchedulerState<Qwen35Inner>> {
+        let (mut state, _) = growable_qwen35_state()?;
+        let recency = Arc::clone(&state.inner.cache_recency);
+        let mut adapter = tiny_paged_adapter_with(recency, initial, max);
+        adapter.set_grow_headroom_probe_override(Some(probe));
+        state.inner.paged_adapter = Some(adapter);
+        Some(state)
+    }
+
+    fn passing() -> Probe {
+        Arc::new(Ok)
+    }
+
+    fn tokens_of(seed: u32, blocks: u32) -> Vec<u32> {
+        (0..blocks * 16)
+            .map(|i| (seed * 11 + i * 7) % 15 + 1)
+            .collect()
+    }
+
+    /// Caches `tokens` as a chain nothing holds; returns its block hashes.
+    fn cache_dead_chain<B: HybridSchedulerBackend>(
+        state: &HybridSchedulerState<B>,
+        tokens: &[u32],
+    ) -> Vec<u64> {
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        let mut allocator = adapter.allocator().lock().expect("allocator");
+        let blocks: Vec<_> = (0..tokens.len() / 16)
+            .map(|_| allocator.allocate().expect("a chain block"))
+            .collect();
+        allocator
+            .cache_full_blocks(tokens, &blocks, 16, &[], 0)
+            .expect("cache the chain");
+        for block in blocks {
+            allocator.free(block);
+        }
+        mlx_paged_attn::chain_hashes(tokens, 16, &[], 0)
+    }
+
+    /// A ladder rung marking a cached `blocks`-block chain.
+    fn rung(
+        state: &mut HybridSchedulerState<Qwen35Inner>,
+        seed: u32,
+        blocks: u32,
+        last_used: u64,
+    ) -> Vec<u64> {
+        let tokens = tokens_of(seed, blocks);
+        let hashes = cache_dead_chain(state, &tokens);
+        state.inner.push_ladder_entry_for_test(
+            tokens.len() as u32,
+            hashes.clone(),
+            tokens,
+            Vec::new(),
+            last_used,
+        );
+        hashes
+    }
+
+    fn hold(state: &mut HybridSchedulerState<Qwen35Inner>, seq_id: SeqId, blocks: u32) {
+        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
+        adapter.begin_request(seq_id).expect("begin");
+        adapter
+            .allocate_suffix_blocks_for(seq_id, blocks * 16)
+            .expect("hold blocks");
+    }
+
+    /// `seq_id` already holds `held` blocks and is refused `more`.
+    fn refused(state: &mut HybridSchedulerState<Qwen35Inner>, seq_id: SeqId, held: u32, more: u32) {
+        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
+        if held == 0 {
+            adapter.begin_request(seq_id).expect("begin");
+        }
+        assert!(
+            adapter
+                .reserve_rows_for(seq_id, (held + more) * 16)
+                .is_err(),
+            "the reservation is refused"
+        );
+    }
+
+    fn table_of(state: &HybridSchedulerState<Qwen35Inner>, seq_id: SeqId) -> bool {
+        state
+            .inner
+            .paged_adapter()
+            .is_some_and(|adapter| adapter.block_table_for(seq_id).is_some())
+    }
+
+    fn rungs(state: &HybridSchedulerState<Qwen35Inner>) -> usize {
+        state.inner.ladder_entries_for_test().len()
+    }
+
+    /// A real KV refusal goes to the older of an idle owner and a parked
+    /// state, by their own stamps.
+    /// Mutations: offer owners before states always → red (case b); states
+    /// before owners always → red (case a).
+    #[test]
+    fn kv_denial_takes_the_older_of_an_idle_owner_and_a_state() {
+        for owner_older in [true, false] {
+            let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
+                return;
+            };
+            let _no_compaction = no_compaction_headroom();
+            state
+                .inner
+                .paged_adapter_mut()
+                .expect("paged adapter")
+                .set_grow_headroom_probe_override(Some(decline_until_taken(1)));
+            state.owner_sequences.insert("idle".into(), 1);
+            hold(&mut state, 1, 2);
+            state
+                .owner_last_used
+                .insert(1, if owner_older { 0 } else { u64::MAX });
+            refused(&mut state, 9, 0, 3);
+            clear_reclaim_log();
+            assert!(
+                state.reclaim_for_blocked_step(9, false),
+                "owner older {owner_older}"
+            );
+            if owner_older {
+                assert!(!table_of(&state, 1));
+                assert!(reclaim_log().is_empty());
+            } else {
+                assert!(table_of(&state, 1));
+                assert_eq!(reclaim_log(), vec![GrowReclaim::Store]);
+            }
+        }
+    }
+
+    /// An idle owner whose table frees no block (the blocked turn holds its
+    /// chain too) is passed over though it is older.
+    /// Mutation: drop the "frees something" filter in `oldest_idle_owner` →
+    /// red (owner 2's table is released).
+    #[test]
+    fn idle_owners_that_free_nothing_are_skipped() {
+        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
+            return;
+        };
+        let shared = tokens_of(1, 1);
+        {
+            let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
+            adapter.begin_request(3).expect("begin");
+            adapter.allocate_suffix_blocks_for(3, 16).expect("allocate");
+            adapter.record_tokens(&shared).expect("record");
+            adapter
+                .finalize_turn_keep_live(&[], 0)
+                .expect("keep the shared block held");
+            adapter.begin_request(2).expect("owner 2");
+            let mut prompt = shared.clone();
+            prompt.push(1);
+            let hit = adapter
+                .find_cached_prefix(&prompt, &[], 0, false)
+                .expect("owner 2 hits the shared block");
+            assert_eq!(hit.cached_token_count, 16);
+        }
+        hold(&mut state, 1, 1);
+        state.owner_sequences.insert("one".into(), 1);
+        state.owner_sequences.insert("two".into(), 2);
+        state.owner_last_used.insert(1, 20);
+        state.owner_last_used.insert(2, 10);
+        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
+        assert!(
+            adapter.reserve_rows_for(3, 48).is_err(),
+            "the blocked turn is refused 3 blocks"
+        );
+        assert!(state.reclaim_for_blocked_step(3, false));
+        assert!(!table_of(&state, 1));
+        assert!(table_of(&state, 2));
+    }
+
+    /// Two idle owners share a cached block: neither frees it alone, both
+    /// together do, so the count covers a need of the free blocks plus both
+    /// tables and the blocked turn runs.
+    /// Mutation: count each owner's blocks of ref at most 2 apart (the old
+    /// per-owner `releasable_blocks_for`) in `SchedReclaim::reach` → red
+    /// (`Short`: the step fails `capacity_exhausted`).
+    #[test]
+    fn idle_owners_sharing_a_block_free_it_together() {
+        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
+            return;
+        };
+        let shared = tokens_of(2, 1);
+        {
+            let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
+            adapter.begin_request(1).expect("owner 1");
+            adapter.allocate_suffix_blocks_for(1, 32).expect("allocate");
+            let mut owned = shared.clone();
+            owned.extend(tokens_of(3, 1));
+            adapter.record_tokens(&owned).expect("record");
+            adapter
+                .finalize_turn_keep_live(&[], 0)
+                .expect("keep owner 1's table");
+            adapter.begin_request(2).expect("owner 2");
+            let mut prompt = shared.clone();
+            prompt.push(1);
+            let hit = adapter
+                .find_cached_prefix(&prompt, &[], 0, false)
+                .expect("owner 2 hits the shared block");
+            assert_eq!(hit.cached_token_count, 16);
+        }
+        state.owner_sequences.insert("one".into(), 1);
+        state.owner_sequences.insert("two".into(), 2);
+        state.owner_last_used.insert(1, 10);
+        state.owner_last_used.insert(2, 20);
+        refused(&mut state, 9, 0, 4);
+        assert_eq!(
+            state
+                .inner
+                .paged_adapter()
+                .expect("paged adapter")
+                .takeable_blocks(),
+            2
+        );
+        assert!(state.reclaim_for_blocked_step(9, false));
+        assert!(!table_of(&state, 1));
+        assert!(!table_of(&state, 2));
+        assert_eq!(
+            state
+                .inner
+                .paged_adapter()
+                .expect("paged adapter")
+                .takeable_blocks(),
+            4
+        );
+    }
+
+    /// An idle table the scheduler never finished goes by its turn-end
+    /// stamp, newer than the parked state, so the state goes first.
+    /// Mutation: stamp an owner with no `owner_last_used` entry 0 in
+    /// `oldest_idle_owner` → red (the table is released).
+    #[test]
+    fn an_unfinished_idle_table_goes_by_its_turn_end_stamp() {
+        let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
+            return;
+        };
+        let _no_compaction = no_compaction_headroom();
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(decline_until_taken(1)));
+        state.owner_sequences.insert("idle".into(), 1);
+        hold(&mut state, 1, 2);
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .finalize_turn_keep_live_no_prefix()
+            .expect("keep the table");
+        assert!(
+            state
+                .inner
+                .paged_adapter()
+                .expect("paged adapter")
+                .turn_end_stamp(1)
+                .is_some()
+        );
+        assert!(!state.owner_last_used.contains_key(&1));
+        refused(&mut state, 9, 0, 3);
+        clear_reclaim_log();
+        assert!(state.reclaim_for_blocked_step(9, false));
+        assert!(table_of(&state, 1));
+        assert_eq!(reclaim_log(), vec![GrowReclaim::Store]);
+    }
+
+    /// A finished owned turn records its table's turn-end stamp for its
+    /// owner, and drops the stamps of owners no longer kept.
+    /// Mutations: drop the `owner_last_used` insert in `finish_completed` →
+    /// red (no stamp for owner 1); drop the `retain` there → red (seq 7's
+    /// stamp stays).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finished_turn_stamps_its_owner_and_drops_stale_stamps() {
+        let Some((mut state, _)) = growable_qwen35_state() else {
+            return;
+        };
+        let mut turn = speculative::tests::request(
+            &mut state.inner,
+            1,
+            (0..20).map(|token| token % 15 + 1).collect(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        turn.payload.reuse_cache = true;
+        let (reply, mut result) = tokio::sync::oneshot::channel();
+        turn.payload.response = ScheduledReply::Sync(reply);
+        state
+            .owner_sequences
+            .insert(turn.payload.owner_id.clone(), 1);
+        state.owner_last_used.insert(7, 3);
+        state.finish_completed(turn);
+        result
+            .try_recv()
+            .expect("the turn replied")
+            .expect("the turn completes");
+        let stamp = state.owner_last_used.get(&1).copied();
+        assert!(stamp.is_some(), "owner 1 is stamped");
+        let table = state
+            .inner
+            .paged_adapter()
+            .and_then(|adapter| adapter.turn_end_stamp(1));
+        if table.is_some() {
+            assert_eq!(stamp, table);
+        }
+        assert!(!state.owner_last_used.contains_key(&7));
+    }
+
+    /// At the cap a ladder rung and an idle owner go by their own stamps:
+    /// the rung's block was cached after the owner's turn ended, but the
+    /// rung itself is older.
+    /// Mutation: stamp ladder units with their final block's stamp → red
+    /// (the owner is released).
+    #[test]
+    fn cap_reclaim_orders_ladder_entries_and_owners_by_their_own_stamps() {
+        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
+            return;
+        };
+        let hashes = rung(&mut state, 2, 1, 0);
+        let block_stamp = state
+            .inner
+            .paged_adapter()
+            .expect("paged adapter")
+            .allocator()
+            .lock()
+            .expect("allocator")
+            .block_stamp(hashes[0])
+            .expect("block stamp");
+        assert!(block_stamp >= 2);
+        state.owner_sequences.insert("idle".into(), 1);
+        hold(&mut state, 1, 1);
+        state.owner_last_used.insert(1, block_stamp - 1);
+        hold(&mut state, 9, 2);
+        refused(&mut state, 9, 2, 1);
+        clear_reclaim_log();
+        assert!(state.reclaim_for_blocked_step(9, false));
+        assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
+        assert!(table_of(&state, 1));
+    }
+
+    /// A need no take could cover takes nothing.
+    /// Mutation: drop the count in `free_for_kv` → red (the rung and the
+    /// owner are both taken).
+    #[test]
+    fn cap_reclaim_evicts_nothing_it_cannot_cover() {
+        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
+            return;
+        };
+        rung(&mut state, 3, 1, 0);
+        state.owner_sequences.insert("idle".into(), 1);
+        hold(&mut state, 1, 1);
+        hold(&mut state, 9, 2);
+        state
+            .inner
+            .paged_adapter()
+            .expect("paged adapter")
+            .refuse_for_test(9, 5);
+        assert!(!state.reclaim_for_blocked_step(9, false));
+        assert_eq!(rungs(&state), 1);
+        assert!(table_of(&state, 1));
+    }
+
+    /// An admission grow at the cap takes the ladder rung, which frees
+    /// blocks, and passes over the older parked state, which frees none.
+    /// Mutation: drop the at-cap store skip in `oldest_state_unit` → red
+    /// (`[Store, Ladder]`).
+    #[test]
+    fn admission_grow_at_the_cap_skips_older_store_states() {
+        let Some(mut state) = qwen35_dflash2_state(2, 4, 4) else {
+            return;
+        };
+        let stamp = state.inner.cache_recency.next();
+        rung(&mut state, 4, 2, stamp);
+        clear_reclaim_log();
+        let grown = state
+            .try_grow_pool_by(1, &mut MetBefore::default())
+            .expect("grow");
+        assert!(grown.is_some());
+        assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
+        assert_eq!(parked_dflash2_states(&state.inner), 1);
+    }
+
+    /// A reservation refused outside the step leaves no refusal for the
+    /// step's reclaim.
+    /// Mutation: drop `clear_refusals` from `begin_scheduled_step` → red
+    /// (the rung is dropped).
+    #[test]
+    fn a_failed_reserve_outside_the_step_leaves_no_refusal() {
+        let Some(mut state) = qwen35_dflash2_state(2, 4, 4) else {
+            return;
+        };
+        rung(&mut state, 5, 2, 0);
+        hold(&mut state, 9, 2);
+        refused(&mut state, 9, 2, 1);
+        state.begin_scheduled_step();
+        assert!(!state.reclaim_for_blocked_step(9, false));
+        assert_eq!(rungs(&state), 1);
+    }
+
+    /// Below the cap with every grow declined, dropping the oldest rung
+    /// makes its chain takeable: the need is met, the newer state stays.
+    /// Mutation: read takeable blocks as free plus reusable (marked chains
+    /// in) in `kv_need_met` → red (the store state goes too).
+    #[test]
+    fn kv_denial_counts_a_freed_ladder_chain_as_progress() {
+        let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
+            return;
+        };
+        let _no_compaction = no_compaction_headroom();
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
+        rung(&mut state, 6, 2, 0);
+        hold(&mut state, 9, 2);
+        refused(&mut state, 9, 2, 1);
+        clear_reclaim_log();
+        assert!(state.reclaim_for_blocked_step(9, false));
+        assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
+        assert_eq!(parked_dflash2_states(&state.inner), 2);
+    }
+
+    /// A decode wave at the cap records each row's own need, so the gate
+    /// sees the wave's sum. Row 2, the one other table, shares its block
+    /// with the blocked row 1, so no idle owner frees a block.
+    /// Mutation: record only the first row's need in `check_wave_fits` →
+    /// red (the record is 1 and the rung is dropped).
+    #[test]
+    fn wave_need_feeds_the_cap_gate() {
+        let Some(mut state) = qwen35_pool_state(3, 3, passing()) else {
+            return;
+        };
+        let shared = tokens_of(7, 1);
+        {
+            let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
+            adapter.begin_request(1).expect("row 1");
+            adapter.allocate_suffix_blocks_for(1, 32).expect("allocate");
+            let mut owned = shared.clone();
+            owned.extend(tokens_of(8, 1));
+            adapter.record_tokens(&owned).expect("record");
+            adapter
+                .finalize_turn_keep_live(&[], 0)
+                .expect("keep row 1's table");
+            adapter.begin_request(2).expect("row 2");
+            let mut prompt = shared.clone();
+            prompt.push(1);
+            adapter
+                .find_cached_prefix(&prompt, &[], 0, false)
+                .expect("row 2 hits the shared block");
+        }
+        rung(&mut state, 9, 1, 0);
+        let wave = |state: &mut HybridSchedulerState<Qwen35Inner>| {
+            crate::transformer::paged_policy::record_decode_wave(
+                state.inner.paged_adapter_mut().expect("paged adapter"),
+                &[(1, 5), (2, 5)],
+                "test",
+            )
+        };
+        assert!(wave(&mut state).is_err());
+        assert_eq!(
+            state
+                .inner
+                .paged_adapter()
+                .expect("paged adapter")
+                .take_refusal(),
+            Some(2)
+        );
+        assert!(wave(&mut state).is_err());
+        assert!(!state.reclaim_for_blocked_step(1, false));
+        assert_eq!(rungs(&state), 1);
+    }
+
+    /// A lone turn whose need no take covers keeps every cache: the count
+    /// stops it after one cache clear.
+    /// Mutations: drop the count in `free_for_kv` → red (the store
+    /// empties); clear the cache only after the count → red (+0).
+    #[test]
+    fn doomed_lone_turn_keeps_the_cache() {
+        let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
+            return;
+        };
+        let _no_compaction = no_compaction_headroom();
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
+        let dead = tokens_of(10, 1);
+        cache_dead_chain(&state, &dead);
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        let need = adapter.takeable_blocks() + adapter.ungrown_blocks() + 1;
+        adapter.refuse_for_test(9, need);
+        let clears = crate::array::memory::TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get);
+        state.handle_blocked_alone(9);
+        assert_eq!(
+            crate::array::memory::TEST_CLEAR_CACHE_CALLS.with(std::cell::Cell::get) - clears,
+            1
+        );
+        assert_eq!(parked_dflash2_states(&state.inner), 2);
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        let mut allocator = adapter.allocator().lock().expect("allocator");
+        let (hit, cached) = allocator.find_longest_cache_hit(&dead, 16, &[], 0);
+        assert_eq!(cached, 16);
+        for block in hit {
+            allocator.free(block);
+        }
+    }
+
+    /// A need one state covers takes one state.
+    /// Mutation: re-check the need only once nothing is left in
+    /// `free_for_kv` → red (`[Store, Store]`).
+    #[test]
+    fn covered_need_stops_when_covered() {
+        let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
+            return;
+        };
+        let _no_compaction = no_compaction_headroom();
+        assert!(parked_bytes(&state) >= bytes_per_block(&state));
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(decline_until_taken(1)));
+        hold(&mut state, 9, 4);
+        refused(&mut state, 9, 4, 1);
+        clear_reclaim_log();
+        assert!(state.reclaim_for_blocked_step(9, false));
+        assert_eq!(reclaim_log(), vec![GrowReclaim::Store]);
+        assert_eq!(parked_dflash2_states(&state.inner), 1);
+    }
+
+    /// An admission grow no take could cover takes nothing.
+    /// Mutation: drop the count in `free_for_kv` → red (0 entries).
+    #[test]
+    fn admission_grow_takes_nothing_it_cannot_cover() {
+        let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
+            return;
+        };
+        let _no_compaction = no_compaction_headroom();
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
+        let needed = state
+            .inner
+            .paged_adapter()
+            .expect("paged adapter")
+            .ungrown_blocks()
+            + 1;
+        let grown = state
+            .try_grow_pool_by(needed, &mut MetBefore::default())
+            .expect("grow");
+        assert!(grown.is_none());
+        assert_eq!(parked_dflash2_states(&state.inner), 2);
+    }
+
+    /// A need a finished turn's released table already covers is met in
+    /// place: nothing is taken.
+    /// Mutation: drop the met check in `free_for_kv` → red (one `Store`).
+    #[test]
+    fn met_need_takes_nothing() {
+        let Some(mut state) = qwen35_dflash2_state(2, 4, 16) else {
+            return;
+        };
+        let _no_compaction = no_compaction_headroom();
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
+        hold(&mut state, 1, 2);
+        hold(&mut state, 2, 2);
+        refused(&mut state, 2, 2, 2);
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .release_request_for(1)
+            .expect("the finished turn's table");
+        clear_reclaim_log();
+        assert!(state.reclaim_for_blocked_step(2, false));
+        assert!(reclaim_log().is_empty());
+        assert_eq!(parked_dflash2_states(&state.inner), 1);
+    }
+
+    /// A lone admission at the cap whose only takeable blocks are a ladder
+    /// chain drops the rung and admits.
+    /// Mutations: fill the snapshot's `reclaimable_blocks` from
+    /// `num_reusable_blocks` → red (admitted with the rung kept); drop
+    /// `cap_shortfall_blocks` from `try_grow_reservation_pool` → red
+    /// (`Reject`).
+    #[test]
+    fn admission_at_the_cap_drops_a_ladder_entry_to_admit() {
+        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
+            return;
+        };
+        rung(&mut state, 11, 4, 0);
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, 2, 0, 0, snapshot)
+            .expect("reserve");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}"
+        );
+        assert_eq!(rungs(&state), 0);
+    }
+
+    /// A lone admission of 5 blocks on a 4-block pool, max 8, whose 4
+    /// blocks are a ladder chain: the grow clamps at the max and adds 4,
+    /// still short, so the take goes on to the rung and admits.
+    /// Mutation: count a passing grow as met in `kv_need_met` → red
+    /// (`Reject`: the grow came back `Met` with nothing taken).
+    #[test]
+    fn capped_admission_grow_takes_the_ladder() {
+        let Some(mut state) = qwen35_pool_state(4, 8, passing()) else {
+            return;
+        };
+        rung(&mut state, 16, 4, 0);
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        assert_eq!(
+            snapshot.blocks.free_blocks + snapshot.blocks.reclaimable_blocks,
+            0
+        );
+        clear_reclaim_log();
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, 5, 0, 0, snapshot)
+            .expect("reserve");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}"
+        );
+        assert!(reclaim_log().contains(&GrowReclaim::Ladder));
+        assert_eq!(rungs(&state), 0);
+        assert_eq!(pool_total_blocks(&state), 8);
+    }
+
+    fn reserve_waiting(
+        state: &mut HybridSchedulerState<Qwen35Inner>,
+        blocks: u32,
+    ) -> MemoryReserveOutcome {
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        state
+            .try_reserve_with_policy(2, blocks, 0, 0, snapshot, true, |_, _| Ok(()))
+            .expect("reserve")
+    }
+
+    /// A waiting admission of 5 blocks on a 4-block pool, max 8, whose 4
+    /// blocks are a ladder chain: the grow alone (room 4) cannot cover it,
+    /// so the need grows to the max and takes the rung before it waits.
+    /// Mutations: size the waiting need with the room-clamped
+    /// `grow_needed_blocks_for` → red (`Defer`); drop the `reclaims_in_order`
+    /// branch on the waiting edge → red (`Defer`).
+    #[test]
+    fn waiting_admission_below_the_cap_takes_the_ladder() {
+        let Some(mut state) = qwen35_pool_state(4, 8, passing()) else {
+            return;
+        };
+        rung(&mut state, 16, 4, 0);
+        clear_reclaim_log();
+        let outcome = reserve_waiting(&mut state, 5);
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}"
+        );
+        assert!(reclaim_log().contains(&GrowReclaim::Ladder));
+        assert_eq!(rungs(&state), 0);
+        assert_eq!(pool_total_blocks(&state), 8);
+    }
+
+    /// As above on a 6-block pool, max 10, 2 blocks held: the 9-block need
+    /// is more than the room plus the rung's 4 blocks, so it waits and the
+    /// rung stays.
+    /// Mutation: drop the `most < need` count in `free_for_kv` → red (the
+    /// rung is taken for a need it cannot cover).
+    #[test]
+    fn waiting_admission_below_the_cap_keeps_the_ladder_it_cannot_cover() {
+        let Some(mut state) = qwen35_pool_state(6, 10, passing()) else {
+            return;
+        };
+        hold(&mut state, 9, 2);
+        rung(&mut state, 17, 4, 0);
+        clear_reclaim_log();
+        let outcome = reserve_waiting(&mut state, 9);
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Defer),
+            "{outcome:?}"
+        );
+        assert_eq!(rungs(&state), 1, "the rung stays");
+        assert!(reclaim_log().is_empty());
+    }
+
+    /// A waiting turn holding no block: admission sees live turns, so it
+    /// keeps the watermark, and a later resume may wait on it.
+    #[cfg(target_os = "macos")]
+    fn waiting_peer(state: &mut HybridSchedulerState<Qwen35Inner>, seq: u32) {
+        let turn = speculative::tests::request(
+            &mut state.inner,
+            seq,
+            tokens_of(40 + seq, 1),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        state.inner.release_scheduled_recurrent_for(seq);
+        state.inner.release_scheduled_speculation(seq);
+        state
+            .inner
+            .release_scheduled_cache(seq)
+            .expect("release the peer");
+        state.scheduler.enqueue_turn(turn).expect("enqueue");
+    }
+
+    /// Beside a waiting peer, a 21-block admission on a 4-block pool, max
+    /// 24, whose 4 blocks are four 1-block rungs. The 5% watermark is 0.2
+    /// of a block at 4 blocks and 1.2 at 24: the grow fills the room (20)
+    /// and the take must cover 21 + 1.2, so 3 rungs go and 1 stays.
+    /// Mutation: size the take for the current pool's watermark → red (22
+    /// blocks: 2 rungs taken, then `Defer`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn waiting_admission_sizes_the_take_for_the_grown_watermark() {
+        let Some(mut state) = qwen35_pool_state(4, 24, passing()) else {
+            return;
+        };
+        waiting_peer(&mut state, 1);
+        for seed in 0..4 {
+            rung(&mut state, 50 + seed, 1, u64::from(seed));
+        }
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        assert_eq!(
+            (
+                snapshot.blocks.total_blocks,
+                snapshot.blocks.free_blocks + snapshot.blocks.reclaimable_blocks
+            ),
+            (4, 0)
+        );
+        let decision = state.reserve_memory_decision(&snapshot, 21, 0);
+        assert_eq!(
+            (decision.reserved_block_bytes, decision.reserved_state_bytes),
+            (21 * snapshot.bytes_per_block, 0)
+        );
+        assert!(decision.watermark_bytes > 0);
+        assert_eq!(
+            grow_needed_blocks_for(&snapshot, &decision, scheduler_watermark_fraction()),
+            None
+        );
+        let sized =
+            grow_or_take_needed_blocks_for(&snapshot, &decision, scheduler_watermark_fraction());
+        let outcome = reserve_waiting(&mut state, 21);
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}, {} rungs left",
+            rungs(&state)
+        );
+        assert_eq!(rungs(&state), 1);
+        assert_eq!(pool_total_blocks(&state), 24);
+        assert_eq!(sized, Some(23));
+    }
+
+    /// A preempted turn resumes behind an earlier waiter (`resume_may_wait`)
+    /// into 5 blocks on a 4-block pool, max 8, whose 4 blocks are a rung:
+    /// its need grows to the max and takes the rung, and it resumes.
+    /// Mutation: size the waiting need with the room-clamped
+    /// `grow_needed_blocks_for` → red (the resume waits).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn waiting_resume_below_the_cap_takes_the_ladder() {
+        let Some(mut state) = qwen35_pool_state(4, 8, passing()) else {
+            return;
+        };
+        waiting_peer(&mut state, 1);
+        let prompt = tokens_of(20, 2);
+        let turn = speculative::tests::request(
+            &mut state.inner,
+            2,
+            prompt.clone(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_block_reservation(5, 0, 16);
+        state.inner.release_scheduled_recurrent_for(2);
+        state.inner.release_scheduled_speculation(2);
+        state
+            .inner
+            .release_scheduled_cache(2)
+            .expect("release the victim");
+        state.scheduler.enqueue_turn(turn).expect("enqueue");
+        let mut turn = state.scheduler.take_waiting(2).expect("the victim");
+        rung(&mut state, 16, 4, 0);
+        turn.token_history.push(3);
+        turn.num_computed_tokens = 33;
+        let replay = install_preemption_replay(&mut turn, &prompt, 32).expect("decode replay");
+        turn.payload.preemption_replay = Some(replay);
+        assert!(state.scheduler.resume_may_wait(&turn));
+        assert_eq!(
+            state
+                .inner
+                .paged_adapter()
+                .expect("paged adapter")
+                .takeable_blocks(),
+            0
+        );
+        state.scheduler.prepend_preempted(turn);
+        clear_reclaim_log();
+        state.try_resume_preempted();
+        assert!(!state.scheduler.has_preempted(), "the turn resumed");
+        assert!(reclaim_log().contains(&GrowReclaim::Ladder));
+        assert_eq!(rungs(&state), 0);
+        assert_eq!(pool_total_blocks(&state), 8);
+    }
+
+    // ---- the lone blocked turn reaches in-use points (Splash `growthClass`) ----
+
+    fn has_rung(state: &HybridSchedulerState<Qwen35Inner>, final_hash: u64) -> bool {
+        state
+            .inner
+            .ladder_entries_for_test()
+            .iter()
+            .any(|&(_, hash, _)| hash == final_hash)
+    }
+
+    /// A running turn over a 40-token prompt (3 blocks) whose reply is
+    /// `result`, on a pool of exactly `max` blocks.
+    #[cfg(target_os = "macos")]
+    fn running_turn<B: HybridSchedulerBackend>(
+        state: &mut HybridSchedulerState<B>,
+        seq: u32,
+    ) -> (
+        TurnState<ScheduledTurn<B::PrefixState>>,
+        tokio::sync::oneshot::Receiver<Result<ChatResult>>,
+    ) {
+        let mut turn = speculative::tests::request(
+            &mut state.inner,
+            seq,
+            (0..40).map(|token| (token + seq) % 16).collect(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (reply, result) = tokio::sync::oneshot::channel();
+        turn.payload.response = ScheduledReply::Sync(reply);
+        assert_eq!(state.inner.scheduler_materialized_blocks(seq), 3);
+        (turn, result)
+    }
+
+    /// The step's only running turn T (3 blocks) blocks for one block at the
+    /// max pool; the rest of the pool is the 2-block cache-only chain of
+    /// rung R, which suspended turn 7 restored from. The lone turn's need
+    /// reaches R, takes it, and runs on.
+    /// Mutation: `handle_blocked_alone` reclaims with `reach_in_use` false
+    /// → red (T fails `capacity_exhausted`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lone_turn_takes_a_suspended_turns_replay_point_last() {
+        let Some(mut state) = qwen35_pool_state(5, 5, passing()) else {
+            return;
+        };
+        let (turn, mut result) = running_turn(&mut state, 1);
+        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
+        state.inner.use_ladder_entry_for_test(7, r);
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        assert!(adapter.at_cap());
+        assert_eq!(adapter.takeable_blocks(), 0);
+        adapter.refuse_for_test(1, 1);
+        settle_blocked_step(&mut state, turn);
+        assert!(
+            matches!(
+                result.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the turn is still running"
+        );
+        assert_eq!(state.scheduler.running().len(), 1);
+        assert!(!has_rung(&state, r), "R was taken");
+    }
+
+    /// As above beside an ordinary rung Q (1 block) newer than R: the
+    /// need takes Q and keeps R and its use.
+    /// Mutation: take in-use points in the ordinary loop by stamp in
+    /// `free_for_kv` → red (R, the older, goes first).
+    #[test]
+    fn ordinary_units_go_before_an_in_use_point() {
+        let Some(mut state) = qwen35_pool_state(6, 6, passing()) else {
+            return;
+        };
+        hold(&mut state, 9, 3);
+        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
+        let q = *rung(&mut state, 31, 1, 100).last().expect("Q");
+        state.inner.use_ladder_entry_for_test(7, r);
+        refused(&mut state, 9, 3, 1);
+        assert!(state.reclaim_for_blocked_step(9, true));
+        assert!(!has_rung(&state, q), "Q was taken");
+        assert!(has_rung(&state, r), "R stays");
+        assert!(matches!(
+            state.inner.gdn_in_use_for_test(7),
+            Some(UnitKey::Ladder { final_block_hash, .. }) if *final_block_hash == r
+        ));
+    }
+
+    /// Two running turns at the max pool beside rung R, which the later
+    /// one (2) restored from; both block, so the later one yields: its
+    /// reclaim keeps R and it is preempted, still using R.
+    #[cfg(target_os = "macos")]
+    fn yielding_pair() -> Option<(HybridSchedulerState<Qwen35Inner>, u64)> {
+        let mut state = qwen35_pool_state(8, 8, passing())?;
+        let (first, _) = running_turn(&mut state, 1);
+        let (second, _) = running_turn(&mut state, 2);
+        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
+        state.inner.use_ladder_entry_for_test(2, r);
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        assert!(adapter.at_cap());
+        assert_eq!(adapter.takeable_blocks(), 0);
+        adapter.refuse_for_test(2, 1);
+        state.scheduler.enqueue_turn(first).expect("enqueue");
+        state.scheduler.enqueue_turn(second).expect("enqueue");
+        let Ok(SchedulerAction::Stepped {
+            completed,
+            preempted,
+            blocked_alone,
+            ..
+        }) = state.scheduler.drive_once(&mut BlockEveryRow)
+        else {
+            panic!("expected a step");
+        };
+        assert!(blocked_alone.is_none());
+        assert_eq!(preempted.as_ref().map(|turn| turn.turn.seq_id), Some(2));
+        assert!(!state.settle_step(completed, preempted, blocked_alone));
+        Some((state, r))
+    }
+
+    /// Mutation: `settle_step` reclaims with `reach_in_use` true → red (R
+    /// taken, no preemption).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn yielding_lane_does_not_take_in_use() {
+        let Some((state, r)) = yielding_pair() else {
+            return;
+        };
+        assert!(has_rung(&state, r), "R stays");
+        assert_eq!(state.scheduler.stats().preemptions, 1);
+        assert_eq!(state.scheduler.running().len(), 1);
+    }
+
+    /// A preempted turn keeps its replay point in use, suspended or not
+    /// (Splash `Engine::Request::replayPoint`), through a resume that waits.
+    /// Mutation: end the use in `handle_preempted`
+    /// (`scheduled_turn_closed`) → red (`None`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn preemption_keeps_the_use() {
+        let Some((mut state, r)) = yielding_pair() else {
+            return;
+        };
+        let used = |state: &HybridSchedulerState<Qwen35Inner>| {
+            matches!(
+                state.inner.gdn_in_use_for_test(2),
+                Some(UnitKey::Ladder { final_block_hash, .. }) if *final_block_hash == r
+            )
+        };
+        assert!(used(&state));
+        state.try_resume_preempted();
+        assert_eq!(state.scheduler.running().len(), 1, "the resume waits");
+        assert!(used(&state));
+    }
+
+    /// The kept prompt wins over the in-use reach: a prompt that restores
+    /// R keeps it out of the in-use units too.
+    /// Mutation: drop `kept.keeps` from `gdn_unit_excluded` for in-use
+    /// units → red (R offered).
+    #[test]
+    fn kept_prompt_beats_in_use_reach() {
+        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
+            return;
+        };
+        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
+        state.inner.use_ladder_entry_for_test(7, r);
+        let mut prompt = tokens_of(30, 2);
+        prompt.push(1);
+        let skip = HashSet::new();
+        let offered = |keep: crate::models::qwen3_5::dflash2_turn::Keep<'_>, in_use| {
+            state
+                .inner
+                .oldest_gdn_state_unit(true, &skip, keep, in_use)
+                .map(|unit| unit.key)
+        };
+        let keep = crate::models::qwen3_5::dflash2_turn::Keep {
+            tokens: &prompt,
+            keys: None,
+        };
+        assert_eq!(offered(keep, true), None);
+        assert_eq!(offered(keep, false), None);
+        assert!(offered(Default::default(), true).is_some());
+        assert_eq!(offered(Default::default(), false), None);
+    }
+
+    /// A taken in-use point keeps its use, as Splash's `StateUse` outlives
+    /// the state: a rung rebuilt on the same chain is in use again until
+    /// the turn ends.
+    /// Mutation: drop the turn's record in `drop_gdn_state` → red (`None`).
+    #[test]
+    fn taken_in_use_point_keeps_its_use() {
+        let Some(mut state) = qwen35_pool_state(5, 5, passing()) else {
+            return;
+        };
+        hold(&mut state, 9, 3);
+        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
+        state.inner.use_ladder_entry_for_test(7, r);
+        refused(&mut state, 9, 3, 1);
+        assert!(state.reclaim_for_blocked_step(9, true));
+        assert!(!has_rung(&state, r));
+        assert!(state.inner.gdn_in_use_for_test(7).is_some());
+        let rebuilt = *rung(&mut state, 30, 2, 0).last().expect("R again");
+        assert_eq!(rebuilt, r);
+        let skip = HashSet::new();
+        let offered = |state: &HybridSchedulerState<Qwen35Inner>, in_use| {
+            state
+                .inner
+                .oldest_gdn_state_unit(false, &skip, Default::default(), in_use)
+                .map(|unit| unit.key)
+        };
+        assert_eq!(offered(&state, false), None, "the rebuilt rung is in use");
+        assert!(offered(&state, true).is_some());
+        state.inner.end_gdn_use(7);
+        assert!(offered(&state, false).is_some());
+    }
+
+    /// MoE twin of `lone_turn_takes_a_suspended_turns_replay_point_last`.
+    /// Mutation: `handle_blocked_alone` reclaims with `reach_in_use` false
+    /// → red (T fails `capacity_exhausted`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn moe_lone_turn_takes_a_suspended_turns_replay_point_last() {
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        let mut inner = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE");
+        let mut adapter = tiny_paged_adapter_with(Arc::clone(&inner.cache_recency), 5, 5);
+        adapter.set_grow_headroom_probe_override(Some(passing()));
+        inner.paged_adapter = Some(adapter);
+        let mut state = HybridSchedulerState::new(inner).expect("construct MoE scheduler");
+        let (turn, mut result) = running_turn(&mut state, 1);
+        let tokens = tokens_of(30, 2);
+        let hashes = cache_dead_chain(&state, &tokens);
+        let r = *hashes.last().expect("R");
+        state
+            .inner
+            .push_ladder_entry_for_test(32, hashes, tokens, Vec::new(), 0);
+        state.inner.use_ladder_entry_for_test(7, r);
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        assert!(adapter.at_cap());
+        assert_eq!(adapter.takeable_blocks(), 0);
+        adapter.refuse_for_test(1, 1);
+        settle_blocked_step(&mut state, turn);
+        assert!(
+            matches!(
+                result.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the turn is still running"
+        );
+        assert_eq!(state.scheduler.running().len(), 1);
+        assert!(
+            !state
+                .inner
+                .ladder_entries_for_test()
+                .iter()
+                .any(|&(_, hash, _)| hash == r),
+            "R was taken"
+        );
+    }
+
+    /// Marked chains are out of the snapshot's reclaimable blocks.
+    /// Mutation: fill it from `reclaimable_blocks` (reusable) → red (2).
+    #[test]
+    fn scheduler_snapshot_counts_only_takeable_blocks() {
+        let Some(state) = qwen35_pool_state(2, 2, passing()) else {
+            return;
+        };
+        let hashes = cache_dead_chain(&state, &tokens_of(12, 2));
+        let reclaimable = |state: &HybridSchedulerState<Qwen35Inner>| {
+            state
+                .inner
+                .scheduler_cache_snapshot()
+                .expect("snapshot")
+                .expect("adapter")
+                .blocks
+                .reclaimable_blocks
+        };
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        adapter.set_state_marks([hashes[1]]);
+        assert_eq!(reclaimable(&state), 0);
+        state
+            .inner
+            .paged_adapter()
+            .expect("paged adapter")
+            .set_state_marks([]);
+        assert_eq!(reclaimable(&state), 2);
+    }
+
+    /// An admission charges no block for the marked chain its prompt hits:
+    /// the free blocks hold the rest, so nothing is taken.
+    /// Mutation: drop `- marked_hit_blocks` from `admission_charge` → red
+    /// (not admitted).
+    #[test]
+    fn admission_charges_no_block_for_its_marked_hit() {
+        let Some(mut state) = qwen35_pool_state(7, 7, passing()) else {
+            return;
+        };
+        rung(&mut state, 13, 2, 0);
+        let own = tokens_of(14, 3);
+        let hashes = cache_dead_chain(&state, &own);
+        let stamp = state.inner.cache_recency.next();
+        state.inner.push_ladder_entry_for_test(
+            own.len() as u32,
+            hashes,
+            own.clone(),
+            Vec::new(),
+            stamp,
+        );
+        let mut prompt = own;
+        prompt.extend(tokens_of(15, 2));
+        let charge = state.admission_charge(5, 2, &prompt, false);
+        assert_eq!(charge, 2);
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        assert_eq!(snapshot.blocks.free_blocks, 2);
+        state.reclaim_keep.clone_from(&prompt);
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
+            .expect("reserve");
+        state.reclaim_keep.clear();
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}"
+        );
+        assert_eq!(rungs(&state), 2);
+    }
+
+    /// The MoE admission charges no block for the marked chain its prompt
+    /// hits.
+    /// Mutation: the MoE `HybridSchedulerBackend::marked_hit_blocks` returns
+    /// 0 → red (5 ≠ 2).
+    #[test]
+    fn moe_admission_charges_no_block_for_its_marked_hit() {
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        let Ok(mut inner) = Qwen35MoeInner::new(tiny_moe_config()) else {
+            return;
+        };
+        let recency = Arc::clone(&inner.cache_recency);
+        inner.paged_adapter = Some(tiny_paged_adapter_with(recency, 7, 7));
+        let own = tokens_of(14, 3);
+        let hashes = {
+            let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
+            let mut allocator = adapter.allocator().lock().expect("allocator");
+            let blocks: Vec<_> = (0..3)
+                .map(|_| allocator.allocate().expect("a chain block"))
+                .collect();
+            allocator
+                .cache_full_blocks(&own, &blocks, 16, &[], 0)
+                .expect("cache the chain");
+            for block in blocks {
+                allocator.free(block);
+            }
+            mlx_paged_attn::chain_hashes(&own, 16, &[], 0)
+        };
+        inner.push_ladder_entry_for_test(own.len() as u32, hashes, own.clone(), Vec::new(), 0);
+        let state = HybridSchedulerState::new(inner).expect("construct MoE scheduler");
+        let mut prompt = own;
+        prompt.extend(tokens_of(15, 2));
+        assert_eq!(state.admission_charge(5, 2, &prompt, false), 2);
+    }
+
+    /// A rung at the admitted prompt's own block-aligned end is no replay
+    /// point of it (the lookup leaves the last token out): at the max pool
+    /// the admission takes it and fits.
+    /// Mutation: pass the whole prompt to the token test in `Keep::points`
+    /// → red (`Reject`).
+    #[test]
+    fn admission_drops_a_rung_at_its_own_block_aligned_end() {
+        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
+            return;
+        };
+        rung(&mut state, 16, 4, 0);
+        let prompt = tokens_of(16, 4);
+        let charge = state.admission_charge(4, 2, &prompt, false);
+        assert_eq!(charge, 1);
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        state.reclaim_keep.clone_from(&prompt);
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
+            .expect("reserve");
+        state.reclaim_keep.clear();
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}"
+        );
+        assert_eq!(rungs(&state), 0);
+    }
+
+    /// MoE twin of `admission_drops_a_rung_at_its_own_block_aligned_end`.
+    /// Mutation: pass the whole prompt to the token test in `Keep::points`
+    /// → red (`Reject`).
+    #[test]
+    fn moe_admission_drops_a_rung_at_its_own_block_aligned_end() {
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        let Ok(mut inner) = Qwen35MoeInner::new(tiny_moe_config()) else {
+            return;
+        };
+        let mut adapter = tiny_paged_adapter_with(Arc::clone(&inner.cache_recency), 4, 4);
+        adapter.set_grow_headroom_probe_override(Some(passing()));
+        inner.paged_adapter = Some(adapter);
+        let mut state = HybridSchedulerState::new(inner).expect("construct MoE scheduler");
+        let prompt = tokens_of(16, 4);
+        let hashes = cache_dead_chain(&state, &prompt);
+        state
+            .inner
+            .push_ladder_entry_for_test(64, hashes, prompt.clone(), Vec::new(), 0);
+        let charge = state.admission_charge(4, 2, &prompt, false);
+        assert_eq!(charge, 1);
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        state.reclaim_keep.clone_from(&prompt);
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
+            .expect("reserve");
+        state.reclaim_keep.clear();
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "{outcome:?}"
+        );
+        assert!(state.inner.ladder_entries_for_test().is_empty());
+    }
+
+    /// A preempted turn whose 64-token prompt is a rung R's tokens, with one
+    /// output token committed, resumes from its replay tokens, whose lookup
+    /// can restore R: at the max pool its charge leaves R's 4 blocks out and
+    /// fits the free block, and R stays.
+    /// Mutation: the resume charges and keeps by `prompt_tokens` in
+    /// `try_resume_preempted` → red (R taken).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resume_keeps_a_rung_at_its_prompt_end() {
+        let Some(mut state) = qwen35_pool_state(5, 5, passing()) else {
+            return;
+        };
+        let prompt = tokens_of(16, 4);
+        let mut turn = speculative::tests::request(
+            &mut state.inner,
+            2,
+            prompt.clone(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_block_reservation(5, 0, 16);
+        state.inner.release_scheduled_recurrent_for(2);
+        state.inner.release_scheduled_speculation(2);
+        state
+            .inner
+            .release_scheduled_cache(2)
+            .expect("release the victim");
+        let r = *rung(&mut state, 16, 4, 0).last().expect("R");
+        turn.token_history.push(3);
+        turn.num_computed_tokens = 65;
+        let replay = install_preemption_replay(&mut turn, &prompt, 32).expect("decode replay");
+        assert_eq!(replay.tokens.len(), 65);
+        assert_eq!(
+            HybridSchedulerBackend::marked_hit_blocks(&state.inner, &replay.tokens),
+            4
+        );
+        turn.payload.preemption_replay = Some(replay);
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        assert!(adapter.at_cap());
+        assert_eq!(adapter.takeable_blocks(), 1, "one free block, R marked");
+        state.scheduler.prepend_preempted(turn);
+        state.try_resume_preempted();
+        assert!(has_rung(&state, r), "R stays");
+        assert!(!state.scheduler.has_preempted(), "the turn resumed");
+    }
+
+    /// A lone MTP turn at the cap fits its draft over a marked chain, as it
+    /// did before marks: the draft fit is a byte estimate.
+    /// Mutation: drop the `marked` term in `draft_growth_fits` → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lone_mtp_turn_at_the_cap_fits_its_draft_over_a_marked_chain() {
+        let Some((mut state, admission)) = mtp_step_state_with(64, 64) else {
+            return;
+        };
+        let lone = vec![mtp_step_turn(&mut state, 1, 250, admission)];
+        assert_eq!(
+            step_state_bytes(&state.inner, &lone[0], 254, 8_192),
+            463_104
+        );
+        let chain: Vec<u32> = (0..57 * 16).map(|i| i % 13 + 1).collect();
+        let hashes = cache_dead_chain(&state, &chain);
+        hold(&mut state, 99, 7);
+        let adapter = state.inner.paged_adapter().expect("paged adapter");
+        adapter.set_state_marks([*hashes.last().expect("final")]);
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        assert_eq!(
+            (
+                snapshot.blocks.free_blocks,
+                snapshot.blocks.reclaimable_blocks
+            ),
+            (0, 0)
+        );
+        assert!(
+            HybridStepExecutor::new(&mut state.inner)
+                .draft_growth_fits(&lone, 0, 4)
+                .expect("lone step")
+        );
+    }
+
+    /// The MoE family takes a refused step's need in the same order: at the
+    /// cap a ladder rung goes and the step's need is met.
+    /// Mutation: the MoE `reclaims_in_order` returns `false` → red (the
+    /// owner loop finds nothing).
+    #[test]
+    fn moe_cap_reclaim_takes_a_ladder_rung() {
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        let Ok(mut inner) = Qwen35MoeInner::new(tiny_moe_config()) else {
+            return;
+        };
+        let recency = Arc::clone(&inner.cache_recency);
+        inner.paged_adapter = Some(tiny_paged_adapter_with(recency, 4, 4));
+        let tokens = tokens_of(16, 2);
+        let hashes = {
+            let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
+            let mut allocator = adapter.allocator().lock().expect("allocator");
+            let blocks: Vec<_> = (0..2)
+                .map(|_| allocator.allocate().expect("a chain block"))
+                .collect();
+            allocator
+                .cache_full_blocks(&tokens, &blocks, 16, &[], 0)
+                .expect("cache the chain");
+            for block in blocks {
+                allocator.free(block);
+            }
+            mlx_paged_attn::chain_hashes(&tokens, 16, &[], 0)
+        };
+        inner.push_ladder_entry_for_test(32, hashes, tokens, Vec::new(), 0);
+        let mut state = HybridSchedulerState::new(inner).expect("construct MoE scheduler");
+        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
+        adapter.begin_request(9).expect("begin");
+        adapter
+            .allocate_suffix_blocks_for(9, 32)
+            .expect("hold two blocks");
+        assert!(adapter.reserve_rows_for(9, 48).is_err());
+        clear_reclaim_log();
+        assert!(state.reclaim_for_blocked_step(9, false));
+        assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
     }
 
     /// Contention preempts an MTP victim at a long history; alone, it

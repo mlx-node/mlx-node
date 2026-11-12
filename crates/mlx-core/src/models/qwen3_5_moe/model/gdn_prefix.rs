@@ -2,7 +2,11 @@
 //! checkpoints, the cold sidecar, and the paged-session invalidation
 //! lifecycle that guards them.
 
+use std::collections::HashSet;
+
 use super::*;
+use crate::engine::reclaim::{Unit, UnitKey, older_first};
+use crate::models::qwen3_5::dflash2_turn::{Keep, KeptPoints};
 
 impl Qwen35MoeInner {
     /// Frontier agreement for a paged MoE epilogue: the adapter's recorded
@@ -153,7 +157,7 @@ impl Qwen35MoeInner {
     }
 
     fn find_moe_gdn_history_checkpoint(
-        &self,
+        &mut self,
         tokens: &[u32],
         prefix_len: u32,
         expected_image_key: Option<u64>,
@@ -166,12 +170,29 @@ impl Qwen35MoeInner {
         {
             return None;
         }
-        clone_moe_linear_layer_caches(&self.config, &checkpoint.caches)
+        let caches = clone_moe_linear_layer_caches(&self.config, &checkpoint.caches)?;
+        self.gdn_restored_from = Some(UnitKey::History);
+        Some(caches)
     }
 
+    /// Writes the turn's history checkpoint, then ends the active
+    /// sequence's replay-point use, so the point is stamped after the KV
+    /// tail and the history (Splash `Engine::release`).
     pub(super) fn remember_moe_gdn_history_checkpoint(
         &mut self,
     ) -> Result<MoeGdnCheckpointStoreTrace> {
+        let result = self.store_moe_gdn_history_checkpoint();
+        if let Some(seq_id) = self
+            .paged_adapter
+            .as_ref()
+            .and_then(PagedKVCacheAdapter::active_seq_id)
+        {
+            self.end_gdn_use(seq_id);
+        }
+        result
+    }
+
+    fn store_moe_gdn_history_checkpoint(&mut self) -> Result<MoeGdnCheckpointStoreTrace> {
         let trace_enabled = inference_trace_enabled();
         let total_start = trace_enabled.then(std::time::Instant::now);
         let mut trace = MoeGdnCheckpointStoreTrace::default();
@@ -227,6 +248,7 @@ impl Qwen35MoeInner {
             image_key: self.cached_image_key,
             tokens,
             caches,
+            last_used: self.cache_recency.next(),
         });
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
         trace.stored = true;
@@ -256,7 +278,13 @@ impl Qwen35MoeInner {
             &self.config,
             &self.gdn_prefix_checkpoints[checkpoint_idx].caches,
         )?;
-        let checkpoint = self.gdn_prefix_checkpoints.remove(checkpoint_idx)?;
+        let mut checkpoint = self.gdn_prefix_checkpoints.remove(checkpoint_idx)?;
+        checkpoint.last_used = self.cache_recency.next();
+        self.gdn_restored_from = Some(UnitKey::Ladder {
+            owner_id: checkpoint.owner_id.clone(),
+            prefix_len: checkpoint.prefix_len,
+            final_block_hash: checkpoint.final_block_hash,
+        });
         self.gdn_prefix_checkpoints.push_back(checkpoint);
         Some((restored_prefix_len, caches))
     }
@@ -305,6 +333,7 @@ impl Qwen35MoeInner {
                 block_hashes,
                 tokens: prefix_tokens.to_vec(),
                 caches: checkpoint.caches,
+                last_used: self.cache_recency.next(),
             });
         self.prune_moe_gdn_prefix_checkpoints();
         true
@@ -330,6 +359,7 @@ impl Qwen35MoeInner {
             &root_owner_id,
             &active_owner_id,
         );
+        self.sync_gdn_state_marks();
     }
 
     pub(crate) fn publish_moe_gdn_materialized_prefix_checkpoint(
@@ -601,6 +631,28 @@ impl Qwen35MoeInner {
         cache_salt: u64,
         continued_live_prefix: bool,
     ) -> Result<MoeGdnPrefixPreparation> {
+        let seq_id = self.begin_gdn_use();
+        let result = self.prepare_moe_gdn_prefix_state_inner(
+            tokens,
+            cached_prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+            continued_live_prefix,
+        );
+        self.record_gdn_use(seq_id, result.is_ok());
+        result
+    }
+
+    fn prepare_moe_gdn_prefix_state_inner(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        continued_live_prefix: bool,
+    ) -> Result<MoeGdnPrefixPreparation> {
         let image_aware_prefix = extra_keys_per_block.iter().any(|keys| !keys.is_empty());
         let trace_enabled = inference_trace_enabled();
         let inference_info_enabled =
@@ -799,7 +851,33 @@ impl Qwen35MoeInner {
     /// image-keyed paged lineage may be restored; otherwise the caller must
     /// discard the K/V candidate and rerun the full image merge from position
     /// zero with fresh recurrent caches.
+    #[allow(clippy::too_many_arguments)]
     fn prepare_moe_gdn_vlm_prefix_state(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        continued_live_prefix: bool,
+        image_key: u64,
+    ) -> Result<bool> {
+        let seq_id = self.begin_gdn_use();
+        let result = self.prepare_moe_gdn_vlm_prefix_state_inner(
+            tokens,
+            cached_prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+            continued_live_prefix,
+            image_key,
+        );
+        self.record_gdn_use(seq_id, result.is_ok());
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_moe_gdn_vlm_prefix_state_inner(
         &mut self,
         tokens: &[u32],
         cached_prefix_len: u32,
@@ -843,6 +921,7 @@ impl Qwen35MoeInner {
             return Ok(true);
         }
 
+        self.gdn_restored_from = None;
         self.caches = Some(fresh_moe_layer_caches(&self.config));
         Ok(false)
     }
@@ -858,25 +937,36 @@ impl Qwen35MoeInner {
         allow_live_continue: bool,
         image_key: u64,
     ) -> Result<engine::VlmPagedPrefixResolution> {
-        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(self, tokens);
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let candidate_plan_result = match self.paged_adapter.as_mut() {
-            Some(adapter) => adapter
-                .prepare_turn_per_block_with_max_cache_hit_tokens(
-                    0,
-                    tokens,
-                    total_budget,
-                    allow_live_continue,
-                    extra_keys_per_block,
-                    0,
-                    !reuse_cache,
-                    max_cache_hit_tokens,
-                )
-                .map_err(Error::from_reason),
-            None => Err(Error::from_reason(
-                "prepare_moe_vlm_paged_prefix: paged_adapter is None",
-            )),
+        let keep = if reuse_cache {
+            crate::models::qwen3_5::dflash2_turn::Keep {
+                tokens,
+                keys: Some((extra_keys_per_block, 0)),
+            }
+        } else {
+            crate::models::qwen3_5::dflash2_turn::Keep::default()
         };
+        crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_keeping(self, tokens, keep);
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
+        let candidate_plan_result =
+            crate::models::qwen3_5::dflash2_turn::reclaiming(self, keep, |inner| {
+                inner
+                    .paged_adapter
+                    .as_mut()
+                    .ok_or_else(|| {
+                        Error::from_reason("prepare_moe_vlm_paged_prefix: paged_adapter is None")
+                    })?
+                    .prepare_turn_per_block_with_max_cache_hit_tokens(
+                        0,
+                        tokens,
+                        total_budget,
+                        allow_live_continue,
+                        extra_keys_per_block,
+                        0,
+                        !reuse_cache,
+                        max_cache_hit_tokens,
+                    )
+                    .map_err(Error::from_reason)
+            });
         let candidate_plan = match candidate_plan_result {
             Ok(plan) => plan,
             Err(error) => {
@@ -901,22 +991,30 @@ impl Qwen35MoeInner {
             }
         };
 
-        let resolution =
-            engine::resolve_vlm_paged_prefix(candidate_plan, gdn_prefix_already_primed, || {
-                self.paged_adapter
-                    .as_mut()
-                    .ok_or_else(|| {
-                        "prepare_moe_vlm_paged_prefix: paged_adapter dropped before cold restart"
-                            .to_string()
-                    })?
-                    .restart_prepared_turn_cold_per_block(
+        let resolution = engine::resolve_vlm_paged_prefix(
+            candidate_plan,
+            gdn_prefix_already_primed,
+            || {
+                // A cold restart restores no replay point, so it keeps none
+                // (Splash retries a failed admission with skipCache).
+                let keep = crate::models::qwen3_5::dflash2_turn::Keep::default();
+                crate::models::qwen3_5::dflash2_turn::reclaiming(self, keep, |inner| {
+                    inner
+                        .paged_adapter
+                        .as_mut()
+                        .ok_or_else(|| Error::from_reason("prepare_moe_vlm_paged_prefix: paged_adapter dropped before cold restart"))?
+                        .restart_prepared_turn_cold_per_block(
                         0,
                         tokens,
                         total_budget,
                         extra_keys_per_block,
                         0,
-                    )
-            });
+                        )
+                        .map_err(Error::from_reason)
+                })
+                .map_err(|error| error.reason)
+            },
+        );
         match resolution {
             Ok(resolution) => Ok(resolution),
             Err(error) => {
@@ -924,5 +1022,289 @@ impl Qwen35MoeInner {
                 Err(Error::from_reason(error))
             }
         }
+    }
+}
+
+impl Qwen35MoeInner {
+    /// Ends `seq_id`'s earlier use and clears the lookup's hit record; the
+    /// prepare that follows sets it again. `None` without an active request.
+    fn begin_gdn_use(&mut self) -> Option<SeqId> {
+        self.gdn_restored_from = None;
+        let seq_id = self
+            .paged_adapter
+            .as_ref()
+            .and_then(PagedKVCacheAdapter::active_seq_id)?;
+        self.end_gdn_use(seq_id);
+        Some(seq_id)
+    }
+
+    /// The replay point a prepare restored from goes InUse for the turn
+    /// (Splash `StateCache::useState`).
+    fn record_gdn_use(&mut self, seq_id: Option<SeqId>, ok: bool) {
+        let restored = self.gdn_restored_from.take();
+        if ok && let (Some(seq_id), Some(key)) = (seq_id, restored) {
+            self.gdn_in_use.insert(seq_id, key);
+        }
+    }
+
+    /// Ends `seq_id`'s use: the point, if still held, becomes the newest of
+    /// its class (Splash `StateCache::unuse`).
+    pub(crate) fn end_gdn_use(&mut self, seq_id: SeqId) {
+        let Some(key) = self.gdn_in_use.remove(&seq_id) else {
+            return;
+        };
+        let stamp = self.cache_recency.next();
+        match key {
+            UnitKey::Ladder {
+                owner_id,
+                prefix_len,
+                final_block_hash,
+            } => {
+                for entry in self.gdn_prefix_checkpoints.iter_mut().filter(|entry| {
+                    entry.owner_id == owner_id
+                        && entry.prefix_len == prefix_len
+                        && entry.final_block_hash == final_block_hash
+                }) {
+                    entry.last_used = stamp;
+                }
+            }
+            UnitKey::History => {
+                if let Some(entry) = self.gdn_last_history_checkpoint.as_mut() {
+                    entry.last_used = stamp;
+                }
+            }
+            UnitKey::Store(_) | UnitKey::Owner(_) | UnitKey::Table(_) => {}
+        }
+    }
+
+    /// A unit the reclaim may not take: a replay point the prompt can
+    /// restore (Splash `VictimQuery::kept`), or one outside the class asked
+    /// for: in use by a turn, suspended or not, or not (`in_use`).
+    fn gdn_unit_excluded(
+        &self,
+        key: &UnitKey,
+        tokens: &[u32],
+        block_hashes: Option<&[u64]>,
+        kept: &KeptPoints<'_>,
+        in_use: bool,
+    ) -> bool {
+        kept.keeps(tokens, block_hashes)
+            || self.gdn_in_use.values().any(|used| used == key) != in_use
+    }
+
+    fn kept_points<'a>(&self, keep: Keep<'a>) -> KeptPoints<'a> {
+        keep.points(
+            self.paged_adapter
+                .as_ref()
+                .map(PagedKVCacheAdapter::block_size),
+        )
+    }
+
+    fn ladder_key(entry: &MoeGdnPrefixCheckpoint) -> UnitKey {
+        UnitKey::Ladder {
+            owner_id: entry.owner_id.clone(),
+            prefix_len: entry.prefix_len,
+            final_block_hash: entry.final_block_hash,
+        }
+    }
+
+    /// The oldest ladder or history entry a KV need may take. At the block
+    /// cap only rungs on a tip mark (whose chain holds a cache-only block)
+    /// count and the history entry (on no block) does not: an mlx-node
+    /// choice, Splash `Cache::takeOldest` takes the oldest state either way.
+    pub(crate) fn oldest_gdn_state_unit(
+        &self,
+        at_cap: bool,
+        skip: &HashSet<UnitKey>,
+        keep: Keep<'_>,
+        in_use: bool,
+    ) -> Option<Unit> {
+        let kept = self.kept_points(keep);
+        let tips = at_cap.then(|| {
+            self.paged_adapter
+                .as_ref()
+                .map(PagedKVCacheAdapter::tip_marks)
+                .unwrap_or_default()
+        });
+        let ladder = self
+            .gdn_prefix_checkpoints
+            .iter()
+            .filter(|entry| {
+                tips.as_ref()
+                    .is_none_or(|tips| tips.contains(&entry.final_block_hash))
+            })
+            .map(|entry| (entry, Self::ladder_key(entry)))
+            .filter(|(entry, key)| {
+                !self.gdn_unit_excluded(
+                    key,
+                    &entry.tokens,
+                    Some(&entry.block_hashes),
+                    &kept,
+                    in_use,
+                ) && !skip.contains(key)
+            })
+            .map(|(entry, key)| Unit {
+                stamp: entry.last_used,
+                key,
+            })
+            .min_by_key(|unit| unit.stamp);
+        let history = if at_cap {
+            None
+        } else {
+            self.gdn_last_history_checkpoint
+                .as_ref()
+                .filter(|entry| {
+                    !self.gdn_unit_excluded(&UnitKey::History, &entry.tokens, None, &kept, in_use)
+                })
+                .map(|entry| Unit {
+                    stamp: entry.last_used,
+                    key: UnitKey::History,
+                })
+                .filter(|unit| !skip.contains(&unit.key))
+        };
+        older_first(ladder, history)
+    }
+
+    pub(crate) fn drop_gdn_state(&mut self, key: &UnitKey) -> bool {
+        let dropped = match key {
+            UnitKey::Ladder {
+                owner_id,
+                prefix_len,
+                final_block_hash,
+            } => {
+                let before = self.gdn_prefix_checkpoints.len();
+                self.gdn_prefix_checkpoints.retain(|entry| {
+                    !(entry.owner_id == *owner_id
+                        && entry.prefix_len == *prefix_len
+                        && entry.final_block_hash == *final_block_hash)
+                });
+                self.gdn_prefix_checkpoints.len() < before
+            }
+            UnitKey::History => self.gdn_last_history_checkpoint.take().is_some(),
+            UnitKey::Store(_) | UnitKey::Owner(_) | UnitKey::Table(_) => false,
+        };
+        if dropped {
+            self.sync_gdn_state_marks();
+        }
+        dropped
+    }
+
+    /// Each ladder entry marks its final block, so `allocate` never takes
+    /// the chain a state restores through.
+    pub(crate) fn sync_gdn_state_marks(&self) {
+        if let Some(adapter) = self.paged_adapter.as_ref() {
+            adapter.set_state_marks(
+                self.gdn_prefix_checkpoints
+                    .iter()
+                    .map(|entry| entry.final_block_hash),
+            );
+        }
+    }
+
+    /// Marked cache-only blocks the kept prompt hits, its last token
+    /// excluded (the lookup leaves one token to prefill). With keys: the
+    /// prompt's own chain hashes, as the lookup walks them. Without: each
+    /// ladder chain's blocks up to where its tokens leave the prompt.
+    pub(crate) fn marked_hit_blocks(&self, keep: Keep<'_>) -> u32 {
+        let Some(adapter) = self.paged_adapter.as_ref() else {
+            return 0;
+        };
+        let prompt = &keep.tokens[..keep.tokens.len().saturating_sub(1)];
+        if prompt.is_empty() {
+            return 0;
+        }
+        if let Some(chain) = keep.hit_chain(adapter.block_size()) {
+            return adapter.marked_hit(&chain);
+        }
+        let hashes = self.gdn_prefix_checkpoints.iter().flat_map(|entry| {
+            let shared = entry
+                .tokens
+                .iter()
+                .zip(prompt)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let blocks = shared / entry.block_size.max(1) as usize;
+            entry.block_hashes.iter().take(blocks).copied()
+        });
+        adapter.cache_only_count(hashes)
+    }
+
+    /// Bytes of the GDN arrays the entries a reclaim may take hold; with
+    /// `in_use` the entries turns use count too (Splash
+    /// `StateCache::reclaims`).
+    pub(crate) fn gdn_state_bytes(&self, keep: Keep<'_>, in_use: bool) -> u64 {
+        let kept = self.kept_points(keep);
+        let counted = |key: &UnitKey, tokens: &[u32], block_hashes: Option<&[u64]>| {
+            !kept.keeps(tokens, block_hashes)
+                && (in_use || !self.gdn_in_use.values().any(|used| used == key))
+        };
+        let ladder = self
+            .gdn_prefix_checkpoints
+            .iter()
+            .filter(|entry| {
+                counted(
+                    &Self::ladder_key(entry),
+                    &entry.tokens,
+                    Some(&entry.block_hashes),
+                )
+            })
+            .map(|entry| Qwen3_5LayerCache::linear_state_bytes(&entry.caches));
+        let history = self
+            .gdn_last_history_checkpoint
+            .as_ref()
+            .filter(|entry| counted(&UnitKey::History, &entry.tokens, None))
+            .map(|entry| Qwen3_5LayerCache::linear_state_bytes(&entry.caches));
+        ladder
+            .chain(history)
+            .fold(0u64, |sum, bytes| sum.saturating_add(bytes))
+    }
+
+    /// `seq_id` uses the ladder entry on `final_block_hash`, as a prepare
+    /// that restored from it records.
+    #[cfg(test)]
+    pub(crate) fn use_ladder_entry_for_test(&mut self, seq_id: SeqId, final_block_hash: u64) {
+        let key = self
+            .gdn_prefix_checkpoints
+            .iter()
+            .find(|entry| entry.final_block_hash == final_block_hash)
+            .map(Self::ladder_key)
+            .expect("a ladder entry on the hash");
+        self.gdn_in_use.insert(seq_id, key);
+    }
+
+    /// `(prefix_len, final_block_hash, last_used)` of every ladder entry.
+    #[cfg(test)]
+    pub(crate) fn ladder_entries_for_test(&self) -> Vec<(u32, u64, u64)> {
+        self.gdn_prefix_checkpoints
+            .iter()
+            .map(|entry| (entry.prefix_len, entry.final_block_hash, entry.last_used))
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn push_ladder_entry_for_test(
+        &mut self,
+        prefix_len: u32,
+        block_hashes: Vec<u64>,
+        tokens: Vec<u32>,
+        caches: Vec<Qwen3_5LayerCache>,
+        last_used: u64,
+    ) {
+        let block_size = self
+            .paged_adapter
+            .as_ref()
+            .map_or(16, PagedKVCacheAdapter::block_size);
+        self.gdn_prefix_checkpoints
+            .push_back(MoeGdnPrefixCheckpoint {
+                owner_id: self.active_cache_owner_id.clone(),
+                prefix_len,
+                block_size,
+                final_block_hash: block_hashes.last().copied().unwrap_or_default(),
+                block_hashes,
+                tokens,
+                caches,
+                last_used,
+            });
+        self.sync_gdn_state_marks();
     }
 }

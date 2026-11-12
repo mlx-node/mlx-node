@@ -171,6 +171,9 @@ pub(crate) struct Qwen35Inner {
     pub(crate) dflash2_turn_state: Option<crate::models::qwen3_5::dflash2_turn::DFlash2TurnState>,
     pub(crate) dflash2_prefix: PrefixTracker,
     pub(crate) dflash2_states: crate::models::qwen3_5::dflash2_state::flat::FlatStates,
+    /// The one clock the allocator, the DFlash2 store, the GDN ladder and
+    /// history entries and the scheduler's idle owners stamp with.
+    pub(crate) cache_recency: Arc<mlx_paged_attn::CacheRecency>,
     /// DFlash2 window terms fixed at load once the paged pool is
     /// registered; `None` without a draft.
     pub(crate) dflash2_window: Option<crate::models::qwen3_5::dflash2_decode::DFlash2WindowTerms>,
@@ -211,6 +214,16 @@ pub(crate) struct Qwen35Inner {
     gdn_root_cache_owner_is_explicit: bool,
     gdn_prefix_checkpoints: VecDeque<DenseGdnPrefixCheckpoint>,
     gdn_last_history_checkpoint: Option<DenseGdnHistoryCheckpoint>,
+    /// The replay point each running turn restored from (Splash
+    /// `StateCache::useState`): no reclaim unit until its use ends.
+    gdn_in_use: HashMap<SeqId, crate::engine::reclaim::UnitKey>,
+    /// Set by the GDN lookups on a hit; the prepare moves it into
+    /// `gdn_in_use`.
+    gdn_restored_from: Option<crate::engine::reclaim::UnitKey>,
+    /// The finishing paged turn's sequence, read before its request is
+    /// released: the history save ends its replay-point use on every
+    /// terminal path (Splash `Engine::release`).
+    paged_turn_seq: Option<SeqId>,
     /// Set when the infallible [`PagedBackend::finalize_paged_turn`] hook could
     /// not register or release the adapter request. The engine calls
     /// `save_paged_history` immediately afterwards, so that save must consume

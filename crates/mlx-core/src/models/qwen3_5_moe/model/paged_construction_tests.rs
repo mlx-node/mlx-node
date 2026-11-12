@@ -591,6 +591,7 @@ fn test_moe_gdn_root_rotation_retains_new_root() {
                 block_hashes: vec![marker as u64],
                 tokens,
                 caches: Vec::new(),
+                last_used: 0,
             });
         inner.prune_moe_gdn_prefix_checkpoints();
     }
@@ -645,6 +646,7 @@ fn test_moe_gdn_root_rotation_retains_new_root() {
                 block_hashes: vec![marker as u64],
                 tokens,
                 caches: Vec::new(),
+                last_used: 0,
             });
         legacy.prune_moe_gdn_prefix_checkpoints();
     }
@@ -689,6 +691,7 @@ fn moe_gdn_retention_follows_the_installed_cold_sidecar_policy() {
                     block_hashes,
                     tokens: tokens[..prefix_len as usize].to_vec(),
                     caches: Vec::new(),
+                    last_used: 0,
                 });
             inner.prune_moe_gdn_prefix_checkpoints();
         }
@@ -739,6 +742,7 @@ fn test_moe_ladder_survives_sibling_owners_through_the_model_call_site() {
                 block_hashes: (1..=u64::from(blocks)).collect(),
                 tokens: (0..blocks * 16).collect(),
                 caches: Vec::new(),
+                last_used: 0,
             });
         inner.prune_moe_gdn_prefix_checkpoints();
     }
@@ -1918,5 +1922,943 @@ fn scheduled_mtp_owner_replay_matches_independent() {
             inner.park_active_scheduled_recurrent().unwrap();
         }
         crate::models::qwen3_5::scheduled_mtp::tests::owner_replay_matches_independent(&mut inner);
+    }
+}
+
+// ---- the take order on the MoE paged lane ----
+
+type ReclaimProbe = Arc<dyn Fn(u32) -> std::result::Result<u32, String> + Send + Sync>;
+
+/// Swaps the model's pool for one of `initial` blocks that grows to `max`,
+/// its allocator on the model's clock, with `probe` as the grow probe.
+fn install_moe_pool(inner: &mut Qwen35MoeInner, initial: u32, max: u32, probe: ReclaimProbe) {
+    inner.paged_adapter = None;
+    inner.initialize_paged_adapter().expect("paged adapter");
+    let adapter = inner.paged_adapter.take().expect("paged adapter");
+    let block_size = adapter.block_size();
+    let pool = adapter.layer_kv_pool();
+    let (config, dtype) = (pool.config().clone(), pool.cache_dtype());
+    drop(adapter);
+    let pool = mlx_paged_attn::LayerKVPool::new(config, initial, max, dtype).expect("pool");
+    let allocator = Arc::new(std::sync::Mutex::new(
+        mlx_paged_attn::BlockAllocator::with_recency(
+            initial,
+            max,
+            block_size,
+            Arc::clone(&inner.cache_recency),
+        ),
+    ));
+    let mut adapter =
+        PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).expect("adapter");
+    adapter.set_grow_headroom_probe_override(Some(probe));
+    inner.paged_adapter = Some(adapter);
+    inner.sync_gdn_state_marks();
+}
+
+fn moe_reclaim_inner(test_name: &str) -> Option<Qwen35MoeInner> {
+    let mut inner = moe_paged_inner_or_skip(test_name)?;
+    cast_moe_inner_weights_bf16(&mut inner);
+    Some(inner)
+}
+
+fn moe_block_size(inner: &Qwen35MoeInner) -> u32 {
+    inner.paged_adapter.as_ref().expect("adapter").block_size()
+}
+
+fn moe_chain_tokens(seed: u32, blocks: u32, block_size: u32) -> Vec<u32> {
+    (0..blocks * block_size)
+        .map(|i| (seed * 11 + i * 7) % 15 + 1)
+        .collect()
+}
+
+/// Caches `tokens` (whole blocks) as a chain nothing holds.
+fn moe_cache_chain(inner: &Qwen35MoeInner, tokens: &[u32]) -> Vec<u64> {
+    moe_cache_keyed_chain(inner, tokens, &[], 0)
+}
+
+/// [`moe_cache_chain`] under per-block `keys` and `salt`.
+fn moe_cache_keyed_chain(
+    inner: &Qwen35MoeInner,
+    tokens: &[u32],
+    keys: &[Vec<u64>],
+    salt: u64,
+) -> Vec<u64> {
+    let adapter = inner.paged_adapter.as_ref().expect("adapter");
+    let block_size = adapter.block_size();
+    let prefix_keys = if keys.is_empty() {
+        mlx_paged_attn::PrefixKeys::Uniform(&[])
+    } else {
+        mlx_paged_attn::PrefixKeys::PerBlock(keys)
+    };
+    let mut allocator = adapter.allocator().lock().expect("allocator");
+    let blocks: Vec<_> = (0..tokens.len() as u32 / block_size)
+        .map(|_| allocator.allocate().expect("a block for the chain"))
+        .collect();
+    allocator
+        .cache_full_blocks_with_keys(tokens, &blocks, block_size, prefix_keys, salt)
+        .expect("cache the chain");
+    for block in blocks {
+        allocator.free(block);
+    }
+    prefix_keys.chain_hashes(tokens, block_size, salt)
+}
+
+fn moe_push_rung(inner: &mut Qwen35MoeInner, tokens: Vec<u32>, hashes: Vec<u64>, last_used: u64) {
+    inner.push_ladder_entry_for_test(tokens.len() as u32, hashes, tokens, Vec::new(), last_used);
+}
+
+fn moe_ladder(inner: &Qwen35MoeInner) -> Vec<(u32, u64, u64)> {
+    inner
+        .gdn_prefix_checkpoints
+        .iter()
+        .map(|entry| (entry.prefix_len, entry.final_block_hash, entry.last_used))
+        .collect()
+}
+
+fn moe_keys(tokens: &[u32], block_size: u32) -> Vec<Vec<u64>> {
+    vec![Vec::new(); tokens.len() / block_size as usize]
+}
+
+fn grow_log() -> Vec<crate::models::qwen3_5::dflash2_turn::GrowReclaim> {
+    crate::models::qwen3_5::dflash2_turn::grow_reclaim_log()
+}
+
+fn clear_grow_log() {
+    crate::models::qwen3_5::dflash2_turn::clear_grow_reclaim_log();
+}
+
+/// Declines (no room) until the reclaim log on this thread has `taken`
+/// entries.
+fn moe_probe_after(taken: usize) -> ReclaimProbe {
+    Arc::new(move |blocks| Ok(if grow_log().len() >= taken { blocks } else { 0 }))
+}
+
+/// GDN caches the MoE restore accepts: every linear layer's two slots set.
+fn moe_ready_caches(config: &Qwen3_5MoeConfig) -> Vec<Qwen3_5LayerCache> {
+    let mut caches = fresh_moe_layer_caches(config);
+    for cache in &mut caches {
+        if let Qwen3_5LayerCache::Linear(arrays) = cache {
+            for slot in 0..2 {
+                arrays
+                    .set(slot, MxArray::zeros(&[1, 64], None).expect("zeros"))
+                    .expect("set slot");
+            }
+        }
+    }
+    caches
+}
+
+/// The MoE model at the cap: sequence 9 holds a cached 2-block chain, the
+/// live sequence 0 holds it too plus one uncached block, and a 1-block
+/// ladder chain fills the pool. The prompt grow counts the live blocks as
+/// the prompt's, so only the prepare's own refusal can reclaim.
+fn moe_cap_with_a_shared_live_table(inner: &mut Qwen35MoeInner) {
+    moe_cap_with_a_shared_live_table_of(inner, 4);
+}
+
+/// [`moe_cap_with_a_shared_live_table`] on a `total`-block pool.
+fn moe_cap_with_a_shared_live_table_of(inner: &mut Qwen35MoeInner, total: u32) {
+    install_moe_pool(inner, total, total, Arc::new(Ok));
+    let block_size = moe_block_size(inner);
+    let shared = moe_chain_tokens(5, total - 2, block_size);
+    {
+        let adapter = inner.paged_adapter.as_mut().expect("adapter");
+        adapter.begin_request(9).expect("begin");
+        adapter
+            .allocate_suffix_blocks_for(9, shared.len() as u32)
+            .expect("allocate");
+        adapter.record_tokens(&shared).expect("record");
+        adapter
+            .register_full_blocks_for_reuse(&[], 0)
+            .expect("register");
+        let mut live = shared.clone();
+        live.push(1);
+        let plan = adapter
+            .prepare_turn(0, &live, live.len() as u32, true, &[], 0, false)
+            .expect("live prepare");
+        assert_eq!(plan.cached_prefix_len as usize, shared.len());
+    }
+    let rung = moe_chain_tokens(6, 1, block_size);
+    let hashes = moe_cache_chain(inner, &rung);
+    let stamp = inner.cache_recency.next();
+    moe_push_rung(inner, rung, hashes, stamp);
+    let blocks = inner
+        .paged_adapter
+        .as_ref()
+        .expect("adapter")
+        .block_telemetry()
+        .expect("telemetry");
+    assert_eq!((blocks.free_blocks, blocks.evictable_blocks), (0, 0));
+}
+
+/// A MoE model whose sequence 0 restored its prompt's GDN state from rung
+/// E through the text prepare; the hit stamped E, and rung F, pushed after
+/// the prepare, is newer still. Returns E's final hash and F's.
+fn moe_restored_from_rung(test_name: &str) -> Option<(Qwen35MoeInner, u64, u64)> {
+    let mut inner = moe_reclaim_inner(test_name)?;
+    install_moe_pool(&mut inner, 4, 8, moe_probe_after(1));
+    let block_size = moe_block_size(&inner);
+    let rung = moe_chain_tokens(17, 2, block_size);
+    let hashes = mlx_paged_attn::chain_hashes(&rung, block_size, &[], 0);
+    let e_final = hashes[1];
+    let caches = moe_ready_caches(&inner.config);
+    inner.push_ladder_entry_for_test(rung.len() as u32, hashes, rung.clone(), caches, 1);
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .reset_for_new_request(0)
+        .expect("reset");
+    let mut prompt = rung.clone();
+    prompt.extend(moe_chain_tokens(19, 1, block_size));
+    let keys = moe_keys(&prompt, block_size);
+    inner.cached_token_history.clear();
+    let prepared = inner
+        .prepare_moe_gdn_prefix_state(&prompt, rung.len() as u32, block_size, &keys, 0, false)
+        .expect("prepare");
+    assert!(prepared.already_primed || inner.gdn_restored_from.is_none());
+    let f_final = 0xF0F0;
+    let f_stamp = inner.cache_recency.next();
+    let f_caches = moe_ready_caches(&inner.config);
+    inner.push_ladder_entry_for_test(
+        block_size,
+        vec![f_final],
+        moe_chain_tokens(18, 1, block_size),
+        f_caches,
+        f_stamp,
+    );
+    Some((inner, e_final, f_final))
+}
+
+fn moe_rung_key(
+    inner: &Qwen35MoeInner,
+    prefix_len: u32,
+    final_block_hash: u64,
+) -> crate::engine::reclaim::UnitKey {
+    crate::engine::reclaim::UnitKey::Ladder {
+        owner_id: inner.active_cache_owner_id.clone(),
+        prefix_len,
+        final_block_hash,
+    }
+}
+
+/// The rung a MoE turn restored from is InUse: a reclaim passes over it,
+/// though it is older than rung F.
+/// Mutations: ignore `gdn_in_use` in MoE `gdn_unit_excluded` → red (E
+/// goes); drop the insert in MoE `record_gdn_use` → red (E goes).
+#[test]
+fn moe_replay_point_in_use_is_not_a_unit() {
+    let Some((mut inner, e_final, f_final)) =
+        moe_restored_from_rung("moe_replay_point_in_use_is_not_a_unit")
+    else {
+        return;
+    };
+    let e_key = moe_rung_key(&inner, 2 * moe_block_size(&inner), e_final);
+    assert_eq!(inner.gdn_in_use.get(&0), Some(&e_key));
+    clear_grow_log();
+    let mut runs = 0;
+    crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(&mut inner, |inner| {
+        runs += 1;
+        if runs == 1 {
+            inner
+                .paged_adapter
+                .as_ref()
+                .expect("adapter")
+                .refuse_for_test(0, 5);
+            Err(Error::from_reason(
+                "context_length_exceeded: paged decode could not reserve 5 more block(s)",
+            ))
+        } else {
+            Ok(())
+        }
+    })
+    .expect("the retry runs");
+    assert_eq!(runs, 2);
+    assert_eq!(
+        grow_log(),
+        vec![crate::models::qwen3_5::dflash2_turn::GrowReclaim::Ladder]
+    );
+    let left: Vec<u64> = moe_ladder(&inner)
+        .into_iter()
+        .map(|(_, hash, _)| hash)
+        .collect();
+    assert_eq!(left, vec![e_final], "F {f_final:#x} went");
+}
+
+/// A MoE scheduled turn's close ends its replay point's use: rung E leaves
+/// InUse and becomes the newest rung.
+/// Mutation: drop the `end_gdn_use` call in MoE `scheduled_turn_closed` →
+/// red (E stays InUse).
+#[test]
+fn moe_scheduled_turn_close_ends_the_replay_points_use() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    let Some((mut inner, e_final, f_final)) =
+        moe_restored_from_rung("moe_scheduled_turn_close_ends_the_replay_points_use")
+    else {
+        return;
+    };
+    assert!(inner.gdn_in_use.contains_key(&0));
+    HybridSchedulerBackend::scheduled_turn_closed(&mut inner, 0);
+    assert!(inner.gdn_in_use.is_empty());
+    let stamp_of = |hash: u64| {
+        moe_ladder(&inner)
+            .into_iter()
+            .find(|&(_, final_hash, _)| final_hash == hash)
+            .map(|(_, _, stamp)| stamp)
+            .expect("the rung stays")
+    };
+    assert!(stamp_of(e_final) > stamp_of(f_final));
+}
+
+/// The MoE prompt grow charges no block for the marked chain its prompt
+/// hits: with that hit out, the free block covers the need and no grow is
+/// probed.
+/// Mutation: MoE `marked_hit_blocks` returns 0 → red (the grow is probed).
+#[test]
+fn moe_prompt_grow_counts_no_block_for_its_marked_hit() {
+    let Some(mut inner) = moe_reclaim_inner("moe_prompt_grow_counts_no_block_for_its_marked_hit")
+    else {
+        return;
+    };
+    let probes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let calls = Arc::clone(&probes);
+    install_moe_pool(
+        &mut inner,
+        4,
+        8,
+        Arc::new(move |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(4)
+        }),
+    );
+    let block_size = moe_block_size(&inner);
+    let chain = moe_chain_tokens(14, 3, block_size);
+    let hashes = moe_cache_chain(&inner, &chain);
+    let stamp = inner.cache_recency.next();
+    moe_push_rung(&mut inner, chain.clone(), hashes, stamp);
+    let mut prompt = chain;
+    prompt.extend(moe_chain_tokens(15, 1, block_size));
+    let keys = moe_keys(&prompt, block_size);
+    assert_eq!(
+        inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter")
+            .takeable_blocks(),
+        1
+    );
+    crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
+        &mut inner, &prompt, &keys, 0,
+    );
+    assert_eq!(probes.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// The MoE prompt grow on a 4-block pool, max 8, 4-block extents, its 4
+/// blocks a chain a ladder rung marks; an older history entry holds bytes,
+/// so the grow probe passes once it goes. The 5-block prompt's grow clamps
+/// at the max and adds 4: still short, so the take goes on to the rung.
+/// Mutation: count a passing grow as met in `kv_need_met` → red (the take
+/// stops after `History`, the rung stays).
+#[test]
+fn moe_capped_grow_keeps_taking_until_the_ladder_covers() {
+    let Some(mut inner) = moe_reclaim_inner("moe_capped_grow_keeps_taking_until_the_ladder_covers")
+    else {
+        return;
+    };
+    install_moe_pool(&mut inner, 4, 8, moe_probe_after(1));
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .set_extent_growth(4);
+    let block_size = moe_block_size(&inner);
+    inner.gdn_last_history_checkpoint = Some(MoeGdnHistoryCheckpoint {
+        owner_id: inner.active_cache_owner_id.clone(),
+        image_key: None,
+        tokens: vec![5, 6, 7],
+        caches: moe_ready_caches(&inner.config),
+        last_used: inner.cache_recency.next(),
+    });
+    let chain = moe_chain_tokens(20, 4, block_size);
+    let hashes = moe_cache_chain(&inner, &chain);
+    let stamp = inner.cache_recency.next();
+    moe_push_rung(&mut inner, chain, hashes, stamp);
+    assert_eq!(
+        inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter")
+            .takeable_blocks(),
+        0
+    );
+    let prompt = moe_chain_tokens(21, 5, block_size);
+    let keys = moe_keys(&prompt, block_size);
+    clear_grow_log();
+    crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
+        &mut inner, &prompt, &keys, 0,
+    );
+    use crate::models::qwen3_5::dflash2_turn::GrowReclaim;
+    assert_eq!(grow_log(), vec![GrowReclaim::History, GrowReclaim::Ladder]);
+    assert!(moe_ladder(&inner).is_empty());
+    let adapter = inner.paged_adapter.as_ref().expect("adapter");
+    assert_eq!(adapter.layer_kv_pool().num_blocks(), 8);
+    assert!(adapter.takeable_blocks() >= 5);
+}
+
+/// At the cap only the deepest of one owner's nested MoE rungs is a unit.
+/// Mutation: filter on the final block being cache-only instead of
+/// `tip_marks` in MoE `oldest_gdn_state_unit` → red (the older, shallower
+/// rung goes first).
+#[test]
+fn moe_cap_reclaim_takes_the_deepest_rung_only() {
+    let Some(mut inner) = moe_reclaim_inner("moe_cap_reclaim_takes_the_deepest_rung_only") else {
+        return;
+    };
+    install_moe_pool(&mut inner, 4, 4, Arc::new(Ok));
+    let block_size = moe_block_size(&inner);
+    let chain = moe_chain_tokens(16, 4, block_size);
+    let hashes = moe_cache_chain(&inner, &chain);
+    let half = (2 * block_size) as usize;
+    moe_push_rung(&mut inner, chain[..half].to_vec(), hashes[..2].to_vec(), 10);
+    moe_push_rung(&mut inner, chain.clone(), hashes.clone(), 20);
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .begin_request(1)
+        .expect("begin");
+    clear_grow_log();
+    let mut runs = 0;
+    crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(&mut inner, |inner| {
+        runs += 1;
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("adapter")
+            .reserve_rows_for(1, block_size)
+            .map(|_| ())
+            .map_err(Error::from_reason)
+    })
+    .expect("the retry fits");
+    assert_eq!(runs, 2);
+    assert_eq!(
+        grow_log(),
+        vec![crate::models::qwen3_5::dflash2_turn::GrowReclaim::Ladder]
+    );
+    assert_eq!(moe_ladder(&inner), vec![(2 * block_size, hashes[1], 10)]);
+}
+
+/// At the cap a MoE rung on the prompt's tokens but cached under `keys`
+/// and `salt` (another chain) is no replay point of the prompt: the prompt
+/// grow drops it and the prompt's four blocks fit.
+fn moe_cap_prompt_grow_drops_a_rung_on_another_chain(
+    test_name: &str,
+    keys: impl Fn(&[u32], u32) -> Vec<Vec<u64>>,
+    salt: u64,
+) {
+    let Some(mut inner) = moe_reclaim_inner(test_name) else {
+        return;
+    };
+    install_moe_pool(&mut inner, 4, 4, Arc::new(Ok));
+    let block_size = moe_block_size(&inner);
+    let stale = moe_chain_tokens(30, 3, block_size);
+    let stale_keys = keys(&stale, block_size);
+    let hashes = moe_cache_keyed_chain(&inner, &stale, &stale_keys, salt);
+    let stamp = inner.cache_recency.next();
+    moe_push_rung(&mut inner, stale.clone(), hashes, stamp);
+    let mut prompt = stale;
+    prompt.extend(moe_chain_tokens(31, 1, block_size));
+    let prompt_keys = moe_keys(&prompt, block_size);
+    clear_grow_log();
+    crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
+        &mut inner,
+        &prompt,
+        &prompt_keys,
+        0,
+    );
+    assert_eq!(
+        grow_log(),
+        vec![crate::models::qwen3_5::dflash2_turn::GrowReclaim::Ladder]
+    );
+    assert!(moe_ladder(&inner).is_empty());
+    let adapter = inner.paged_adapter.as_mut().expect("adapter");
+    adapter.begin_request(1).expect("begin");
+    adapter
+        .reserve_rows_for(1, prompt.len() as u32)
+        .expect("the prompt fits");
+}
+
+/// A MoE rung on another cache salt.
+/// Mutation: restore the token test for ladder entries in
+/// `KeptPoints::keeps` → red (the rung stays, the grow log is empty).
+#[test]
+fn moe_cap_prompt_grow_drops_a_rung_on_another_salt() {
+    moe_cap_prompt_grow_drops_a_rung_on_another_chain(
+        "moe_cap_prompt_grow_drops_a_rung_on_another_salt",
+        moe_keys,
+        7,
+    );
+}
+
+/// A MoE rung on other image keys.
+/// Mutation: restore the token test for ladder entries in
+/// `KeptPoints::keeps` → red (the rung stays, the grow log is empty).
+#[test]
+fn moe_cap_prompt_grow_drops_a_rung_on_other_image_keys() {
+    moe_cap_prompt_grow_drops_a_rung_on_another_chain(
+        "moe_cap_prompt_grow_drops_a_rung_on_other_image_keys",
+        |tokens, block_size| vec![vec![0x1A6E]; tokens.len() / block_size as usize],
+        0,
+    );
+}
+
+/// At the cap a MoE rung whose tip is a held tail registered under two
+/// released blocks is a unit: dropping it lets those blocks go.
+/// Mutation: keep a mark in `tip_marks` only when the mark itself is
+/// cache-only → red (`Err` "could not reserve", nothing taken).
+#[test]
+fn moe_cap_reclaim_takes_a_rung_over_a_held_tail() {
+    let Some(mut inner) = moe_reclaim_inner("moe_cap_reclaim_takes_a_rung_over_a_held_tail") else {
+        return;
+    };
+    install_moe_pool(&mut inner, 5, 5, Arc::new(Ok));
+    let block_size = moe_block_size(&inner);
+    let chain = moe_chain_tokens(16, 3, block_size);
+    moe_cache_chain(&inner, &chain[..(2 * block_size) as usize]);
+    {
+        let adapter = inner.paged_adapter.as_mut().expect("adapter");
+        adapter.begin_request(9).expect("begin");
+        adapter
+            .allocate_suffix_blocks_for(9, 3 * block_size)
+            .expect("allocate");
+        adapter.record_tokens(&chain).expect("record");
+        adapter
+            .register_full_blocks_for_reuse(&[], 0)
+            .expect("register");
+    }
+    let hashes = mlx_paged_attn::chain_hashes(&chain, block_size, &[], 0);
+    {
+        let adapter = inner.paged_adapter.as_ref().expect("adapter");
+        let allocator = adapter.allocator().lock().expect("allocator");
+        assert_eq!(allocator.cache_only_count(hashes[..2].iter().copied()), 2);
+        assert!(!allocator.is_cache_only(hashes[2]));
+    }
+    moe_push_rung(&mut inner, chain, hashes, 10);
+    let blocks = inner
+        .paged_adapter
+        .as_ref()
+        .expect("adapter")
+        .block_telemetry()
+        .expect("telemetry");
+    assert_eq!((blocks.free_blocks, blocks.evictable_blocks), (0, 0));
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .begin_request(1)
+        .expect("begin");
+    clear_grow_log();
+    let mut runs = 0;
+    crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(&mut inner, |inner| {
+        runs += 1;
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("adapter")
+            .reserve_rows_for(1, block_size)
+            .map(|_| ())
+            .map_err(Error::from_reason)
+    })
+    .expect("the retry fits");
+    assert_eq!(runs, 2);
+    assert_eq!(
+        grow_log(),
+        vec![crate::models::qwen3_5::dflash2_turn::GrowReclaim::Ladder]
+    );
+    assert!(moe_ladder(&inner).is_empty());
+}
+
+/// The MoE prefix prepare at the cap frees a ladder chain its prompt does
+/// not share.
+/// Mutation: drop the `reclaiming` wrapper in MoE `prime_prefix_state` →
+/// red (`Err`).
+#[test]
+fn moe_prefix_prepare_at_the_cap_frees_a_marked_chain() {
+    let Some(mut inner) = moe_reclaim_inner("moe_prefix_prepare_at_the_cap_frees_a_marked_chain")
+    else {
+        return;
+    };
+    moe_cap_with_a_shared_live_table(&mut inner);
+    let block_size = moe_block_size(&inner);
+    let prompt = moe_chain_tokens(7, 2, block_size);
+    clear_grow_log();
+    PagedBackend::prime_prefix_state(&mut inner, &prompt, true, block_size as usize, &[], 0)
+        .expect("the prepare fits after the take");
+    assert_eq!(
+        grow_log(),
+        vec![crate::models::qwen3_5::dflash2_turn::GrowReclaim::Ladder]
+    );
+    assert!(moe_ladder(&inner).is_empty());
+}
+
+/// The MoE VLM prefix prepare at the cap frees a ladder chain its prompt
+/// does not share.
+/// Mutation: drop the `reclaiming` wrapper on the candidate prepare in
+/// `prepare_moe_vlm_paged_prefix` → red (`Err`).
+#[test]
+fn moe_vlm_prefix_prepare_at_the_cap_frees_a_ladder_chain() {
+    let Some(mut inner) =
+        moe_reclaim_inner("moe_vlm_prefix_prepare_at_the_cap_frees_a_ladder_chain")
+    else {
+        return;
+    };
+    moe_cap_with_a_shared_live_table(&mut inner);
+    let block_size = moe_block_size(&inner);
+    let prompt = moe_chain_tokens(11, 2, block_size);
+    let keys = moe_keys(&prompt, block_size);
+    clear_grow_log();
+    inner
+        .prepare_moe_vlm_paged_prefix(
+            &prompt,
+            prompt.len() as u32,
+            block_size,
+            &keys,
+            true,
+            true,
+            77,
+        )
+        .expect("the prepare fits after the take");
+    assert_eq!(
+        grow_log().first(),
+        Some(&crate::models::qwen3_5::dflash2_turn::GrowReclaim::Ladder)
+    );
+    assert!(moe_ladder(&inner).is_empty());
+}
+
+/// The MoE VLM prepare hits a rung's chain whose GDN state cannot
+/// restore, so it restarts cold at the cap: the restart keeps nothing, so
+/// the prompt's own (older) rung goes and the other stays. The candidate
+/// prepare fits in the free block, so the restart's reclaim is the only one
+/// on the path.
+/// Mutation: drop the `reclaiming` wrapper on the cold restart in
+/// `prepare_moe_vlm_paged_prefix` → red (`Err`).
+#[test]
+fn moe_vlm_cold_restart_at_the_cap_frees_a_ladder_chain() {
+    let Some(mut inner) = moe_reclaim_inner("moe_vlm_cold_restart_at_the_cap_frees_a_ladder_chain")
+    else {
+        return;
+    };
+    install_moe_pool(&mut inner, 4, 4, Arc::new(Ok));
+    let block_size = moe_block_size(&inner);
+    let kept = moe_chain_tokens(24, 1, block_size);
+    let kept_hashes = moe_cache_chain(&inner, &kept);
+    let older = inner.cache_recency.next();
+    moe_push_rung(&mut inner, kept.clone(), kept_hashes, older);
+    let other = moe_chain_tokens(25, 2, block_size);
+    let other_hashes = moe_cache_chain(&inner, &other);
+    let newer = inner.cache_recency.next();
+    moe_push_rung(&mut inner, other.clone(), other_hashes, newer);
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .reset_for_new_request(0)
+        .expect("reset");
+    let mut prompt = kept.clone();
+    prompt.extend(moe_chain_tokens(26, 1, block_size));
+    let keys = moe_keys(&prompt, block_size);
+    clear_grow_log();
+    let resolution = inner
+        .prepare_moe_vlm_paged_prefix(
+            &prompt,
+            prompt.len() as u32,
+            block_size,
+            &keys,
+            true,
+            true,
+            77,
+        )
+        .expect("the restart fits after the take");
+    assert_eq!(resolution.candidate_cached_prefix_len as usize, kept.len());
+    assert!(resolution.downgraded_to_cold);
+    assert_eq!(
+        grow_log(),
+        vec![crate::models::qwen3_5::dflash2_turn::GrowReclaim::Ladder]
+    );
+    let left = moe_ladder(&inner);
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].0 as usize, other.len());
+}
+
+/// A pool of 3 blocks holding a cached 2-block chain whose first block
+/// carries the only ladder rung; the prompt is that chain plus one block.
+fn moe_vlm_rung_on_the_prompts_chain(test_name: &str) -> Option<(Qwen35MoeInner, Vec<u32>)> {
+    let mut inner = moe_reclaim_inner(test_name)?;
+    install_moe_pool(&mut inner, 3, 3, Arc::new(Ok));
+    let block_size = moe_block_size(&inner);
+    let chain = moe_chain_tokens(24, 2, block_size);
+    let hashes = moe_cache_chain(&inner, &chain);
+    let stamp = inner.cache_recency.next();
+    moe_push_rung(
+        &mut inner,
+        chain[..block_size as usize].to_vec(),
+        hashes[..1].to_vec(),
+        stamp,
+    );
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .reset_for_new_request(0)
+        .expect("reset");
+    let mut prompt = chain;
+    prompt.extend(moe_chain_tokens(26, 1, block_size));
+    Some((inner, prompt))
+}
+
+/// The MoE cold restart restores no replay point, so it takes the
+/// prompt's own rung: the candidate hits the 2-block chain past the rung,
+/// and the restart needs the whole prompt fresh, which only the rung's
+/// block can complete.
+/// Mutation: pass the candidate's `keep` to the cold-restart `reclaiming`
+/// in `prepare_moe_vlm_paged_prefix` → red (`Err`
+/// context_length_exceeded).
+#[test]
+fn moe_vlm_cold_restart_takes_the_prompts_own_rung() {
+    let Some((mut inner, prompt)) =
+        moe_vlm_rung_on_the_prompts_chain("moe_vlm_cold_restart_takes_the_prompts_own_rung")
+    else {
+        return;
+    };
+    let block_size = moe_block_size(&inner);
+    let keys = moe_keys(&prompt, block_size);
+    clear_grow_log();
+    let resolution = inner
+        .prepare_moe_vlm_paged_prefix(
+            &prompt,
+            prompt.len() as u32,
+            block_size,
+            &keys,
+            true,
+            true,
+            77,
+        )
+        .expect("the restart takes the rung");
+    assert!(resolution.downgraded_to_cold);
+    assert_eq!(resolution.candidate_cached_prefix_len, 2 * block_size);
+    assert_eq!(
+        grow_log(),
+        vec![crate::models::qwen3_5::dflash2_turn::GrowReclaim::Ladder]
+    );
+    assert!(moe_ladder(&inner).is_empty());
+}
+
+/// A MoE VLM prepare that skips the lookup keeps nothing: the pool ensure
+/// and the candidate prepare take the prompt's rung for the whole fresh
+/// prompt.
+/// Mutation: keep the prompt's `Keep` when `!reuse_cache` in
+/// `prepare_moe_vlm_paged_prefix` → red (`Err`
+/// context_length_exceeded).
+#[test]
+fn moe_vlm_prepare_without_reuse_takes_the_prompts_own_rung() {
+    let Some((mut inner, prompt)) = moe_vlm_rung_on_the_prompts_chain(
+        "moe_vlm_prepare_without_reuse_takes_the_prompts_own_rung",
+    ) else {
+        return;
+    };
+    let block_size = moe_block_size(&inner);
+    let keys = moe_keys(&prompt, block_size);
+    clear_grow_log();
+    let resolution = inner
+        .prepare_moe_vlm_paged_prefix(
+            &prompt,
+            prompt.len() as u32,
+            block_size,
+            &keys,
+            false,
+            true,
+            77,
+        )
+        .expect("the fresh prompt takes the rung");
+    assert_eq!(resolution.candidate_cached_prefix_len, 0);
+    assert_eq!(
+        grow_log(),
+        vec![crate::models::qwen3_5::dflash2_turn::GrowReclaim::Ladder]
+    );
+    assert!(moe_ladder(&inner).is_empty());
+}
+
+/// A MoE serial turn that released its request still ends its replay
+/// point's use at the history save, for `reuse_cache=false` and for a
+/// reuse turn whose reconcile failed: rung E leaves InUse, becomes the
+/// newest rung, and is a unit the next turn's reclaim can take.
+/// Mutations: drop the `end_gdn_use` call in the `!reuse_cache` branch of
+/// MoE `save_paged_history` → red on `reuse false`; drop the one after the
+/// history write → red on `reuse true`.
+#[test]
+fn moe_a_released_serial_turn_ends_the_replay_points_use() {
+    use crate::engine::backend::PagedBackend;
+    for reuse in [false, true] {
+        let Some((mut inner, e_final, f_final)) =
+            moe_restored_from_rung("moe_a_released_serial_turn_ends_the_replay_points_use")
+        else {
+            return;
+        };
+        let block_size = moe_block_size(&inner);
+        let e_key = moe_rung_key(&inner, 2 * block_size, e_final);
+        assert_eq!(inner.gdn_in_use.get(&0), Some(&e_key), "reuse {reuse}");
+        let mut prompt = moe_chain_tokens(17, 2, block_size);
+        prompt.extend(moe_chain_tokens(19, 1, block_size));
+        // The MoE save runs no frontier check, so a released reuse turn
+        // saves no history here.
+        let saved: &[u32] = if reuse { &[] } else { &prompt };
+        {
+            // The finalize bumps the global sidecar capture counter.
+            let _serialized = crate::cold_tier::sidecar_counter_test_lock();
+            PagedBackend::finalize_paged_turn(&mut inner, false, 0);
+            PagedBackend::save_paged_history(&mut inner, saved, &[], false, reuse)
+                .expect("the save");
+        }
+        assert!(inner.gdn_in_use.is_empty(), "reuse {reuse}");
+        let stamp_of = |inner: &Qwen35MoeInner, hash: u64| {
+            moe_ladder(inner)
+                .into_iter()
+                .find(|&(_, final_hash, _)| final_hash == hash)
+                .map(|(_, _, stamp)| stamp)
+                .expect("the rung stays")
+        };
+        assert!(
+            stamp_of(&inner, e_final) > stamp_of(&inner, f_final),
+            "reuse {reuse}"
+        );
+        let f_key = moe_rung_key(&inner, block_size, f_final);
+        let skip: std::collections::HashSet<crate::engine::reclaim::UnitKey> =
+            [f_key, crate::engine::reclaim::UnitKey::History].into();
+        let next = inner
+            .oldest_gdn_state_unit(
+                false,
+                &skip,
+                crate::models::qwen3_5::dflash2_turn::Keep::default(),
+                false,
+            )
+            .map(|unit| unit.key);
+        assert_eq!(next, Some(e_key), "reuse {reuse}");
+    }
+}
+
+/// The MoE MTP gate at the cap reclaims a ladder chain before it falls
+/// back to AR decode.
+/// Mutation: drop the `paged_step_reclaiming` wrapper in MoE
+/// `admit_paged_speculative_decode` → red (`Ok(false)`).
+#[test]
+fn moe_mtp_gate_at_the_cap_reclaims_before_falling_back() {
+    let unavailable = crate::test_support::metal_device_absent;
+    let mut cfg = tiny_paged_forward_moe_cfg();
+    cfg.n_mtp_layers = 1;
+    let mut inner = match Qwen35MoeInner::new(cfg) {
+        Ok(inner) => inner,
+        Err(err) if unavailable(&err.reason) => return,
+        Err(err) => panic!("tiny MoE MTP model: {}", err.reason),
+    };
+    if inner.initialize_paged_adapter().is_err() || inner.paged_adapter.is_none() {
+        return;
+    }
+    inner.mtp_weights_loaded = true;
+    assert!(inner.execution_plan().speculative.is_some());
+    install_moe_pool(&mut inner, 2, 2, Arc::new(Ok));
+    let block_size = moe_block_size(&inner);
+    let chain = moe_chain_tokens(27, 2, block_size);
+    let hashes = moe_cache_chain(&inner, &chain);
+    let stamp = inner.cache_recency.next();
+    moe_push_rung(&mut inner, chain, hashes, stamp);
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("adapter")
+        .reset_for_new_request(0)
+        .expect("reset");
+    let mut p = crate::engine::params::extract_chat_params(&crate::engine::types::ChatConfig {
+        enable_mtp: Some(true),
+        ..crate::engine::types::ChatConfig::default()
+    });
+    p.mtp_depth = 1;
+    p.mtp_adaptive_depth = false;
+    assert!(
+        PagedBackend::admit_paged_speculative_decode(&mut inner, &p)
+            .expect("the gate never errors on exhaustion")
+    );
+    assert!(moe_ladder(&inner).is_empty());
+}
+
+struct NullSink;
+impl crate::engine::backend::ChunkSink for NullSink {
+    fn send(&self, _chunk: Result<crate::engine::types::ChatStreamChunk>) {}
+}
+
+/// The MoE serial sync and stream turns at the cap, on a pool whose window
+/// leaves the prompt four blocks past the recurrent rows: their prepare is
+/// refused until the take order drops a ladder rung the prompt does not
+/// share; the prompt grow before it takes nothing.
+/// Mutations: drop the `reclaiming` wrapper on the prepare in MoE
+/// `paged_turn_sync_core` → red on `sync` (`Err`); in MoE
+/// `paged_turn_stream_core` → red on `stream` (`Err`).
+#[test]
+fn moe_serial_prepare_at_the_cap_frees_a_ladder_chain() {
+    use crate::engine::backend::ChatBackend;
+    let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+    for entry in ["sync", "stream"] {
+        let Some(mut inner) =
+            moe_reclaim_inner("moe_serial_prepare_at_the_cap_frees_a_ladder_chain")
+        else {
+            return;
+        };
+        install_moe_pool(&mut inner, 4, 4, Arc::new(Ok));
+        let bytes_per_block = inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter")
+            .bytes_per_block()
+            .expect("bytes per block");
+        let rows = inner
+            .config
+            .recurrent_state_bytes()
+            .div_ceil(bytes_per_block) as u32;
+        moe_cap_with_a_shared_live_table_of(&mut inner, rows + 4);
+        let block_size = moe_block_size(&inner);
+        let mut prompt = moe_chain_tokens(23, 1, block_size);
+        prompt.extend([2, 3, 4, 5]);
+        let config = crate::engine::types::ChatConfig {
+            temperature: Some(0.0),
+            max_new_tokens: Some(2),
+            reasoning_effort: Some("none".to_string()),
+            ..crate::engine::types::ChatConfig::default()
+        };
+        let params = ChatBackend::resolve_params(&inner, &config);
+        let thinking = ChatBackend::thinking_setup(&inner, &config);
+        clear_grow_log();
+        if entry == "sync" {
+            inner
+                .paged_turn_sync_core(prompt, tokenizer.clone(), u32::MAX, params, false, thinking)
+                .expect("the sync turn runs");
+        } else {
+            let sink = NullSink;
+            inner
+                .paged_turn_stream_core(
+                    prompt,
+                    tokenizer.clone(),
+                    u32::MAX,
+                    params,
+                    false,
+                    &super::paged_backend::StreamSender(&sink),
+                    &std::sync::atomic::AtomicBool::new(false),
+                    thinking,
+                )
+                .expect("the stream turn runs");
+        }
+        assert_eq!(
+            grow_log().first(),
+            Some(&crate::models::qwen3_5::dflash2_turn::GrowReclaim::Ladder),
+            "{entry}"
+        );
     }
 }

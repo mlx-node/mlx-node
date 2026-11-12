@@ -66,7 +66,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
     /// out after the step's target rows: free, reclaimable, and not yet
     /// grown up to its max. State lives outside the pool, so target growth
     /// never takes it out of those bytes and the pool never grows for it
-    /// (Splash grows only for KV pages, KvPool.cpp:41-75).
+    /// (Splash grows only for KV pages, `KvPool::acquirePages`).
     pub(super) fn draft_growth_fits(
         &self,
         running: &[TurnState<ScheduledTurn<B::PrefixState>>],
@@ -111,8 +111,16 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         let ungrown = snapshot
             .max_total_blocks
             .saturating_sub(snapshot.blocks.total_blocks);
+        // The snapshot leaves marked chains out of what `allocate` may take;
+        // the draft fit is a byte estimate, not a reservation, so it counts
+        // them as before.
+        let marked = self
+            .inner
+            .paged_adapter()
+            .map_or(0, PagedKVCacheAdapter::marked_blocks);
         let available = u64::from(snapshot.blocks.free_blocks)
             .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
+            .saturating_add(u64::from(marked))
             .saturating_add(u64::from(ungrown))
             .saturating_mul(snapshot.bytes_per_block);
         Ok(need <= available)

@@ -515,6 +515,161 @@ impl BlockAllocator {
         })
     }
 
+    /// Whether `hash` is cached and only the cache holds it.
+    pub fn is_cache_only(&self, hash: u64) -> bool {
+        self.ref_count_of(hash) == Some(1)
+    }
+
+    /// Marks in no other mark's chain whose own chain holds a cache-only
+    /// block: dropping every state on one frees that block unless another
+    /// mark's chain shares it. The mark itself may still be held (a
+    /// verified-duplicate tail registered under a released ancestor).
+    pub fn tip_marks(&self) -> HashSet<u64> {
+        let mut covered = HashSet::new();
+        for &mark in &self.state_marks {
+            let mut hash = mark;
+            while let Some(identity) = self.prefix_cache_identities.get(&hash) {
+                let parent = identity.parent_hash;
+                if parent == 0
+                    || !self.prefix_cache.contains_key(&parent)
+                    || !covered.insert(parent)
+                {
+                    break;
+                }
+                hash = parent;
+            }
+        }
+        self.state_marks
+            .iter()
+            .copied()
+            .filter(|hash| !covered.contains(hash) && self.chain_has_cache_only(*hash))
+            .collect()
+    }
+
+    /// Whether `mark` or a cached ancestor of it is cache-only.
+    fn chain_has_cache_only(&self, mark: u64) -> bool {
+        let mut hash = mark;
+        loop {
+            if self.is_cache_only(hash) {
+                return true;
+            }
+            let Some(identity) = self.prefix_cache_identities.get(&hash) else {
+                return false;
+            };
+            let parent = identity.parent_hash;
+            if parent == 0 || !self.prefix_cache.contains_key(&parent) {
+                return false;
+            }
+            hash = parent;
+        }
+    }
+
+    /// Of `block_ids`, the cached cache-only blocks: (outside every marked
+    /// chain, inside one).
+    pub fn cache_only_among(&self, block_ids: &HashSet<u32>) -> (u32, u32) {
+        if block_ids.is_empty() {
+            return (0, 0);
+        }
+        let closure = self.marked_closure();
+        let mut outside = 0;
+        let mut inside = 0;
+        for (hash, block) in &self.prefix_cache {
+            if block.get_ref_count() != 1 || !block_ids.contains(&block.block_id) {
+                continue;
+            }
+            if closure.contains(hash) {
+                inside += 1;
+            } else {
+                outside += 1;
+            }
+        }
+        (outside, inside)
+    }
+
+    /// How many distinct `hashes` are cached and cache-only.
+    pub fn cache_only_count(&self, hashes: impl IntoIterator<Item = u64>) -> u32 {
+        hashes
+            .into_iter()
+            .collect::<HashSet<u64>>()
+            .into_iter()
+            .filter(|hash| self.is_cache_only(*hash))
+            .count() as u32
+    }
+
+    /// Of the leading cached hashes of `chain` (a lookup's walk), how many are
+    /// cache-only and inside a marked chain.
+    pub fn marked_hit(&self, chain: &[u64]) -> u32 {
+        if self.state_marks.is_empty() {
+            return 0;
+        }
+        let closure = self.marked_closure();
+        chain
+            .iter()
+            .take_while(|hash| self.prefix_cache.contains_key(hash))
+            .filter(|hash| self.is_cache_only(**hash) && closure.contains(hash))
+            .count() as u32
+    }
+
+    /// The cut [`Self::shrink_target`] would reach if the tables holding
+    /// `table_refs` (block id -> refs) were released: a block counts Free
+    /// when no other ref is left, CacheOnly when it is cached and only the
+    /// cache's ref is left.
+    pub fn shrink_target_as_released(
+        &self,
+        floor: u32,
+        extent: u32,
+        extents: u32,
+        table_refs: &HashMap<u32, u32>,
+    ) -> u32 {
+        let mut uses = self.slot_uses();
+        for (&block_id, block) in &self.allocated {
+            let Some(slot) = uses.get_mut(block_id as usize) else {
+                continue;
+            };
+            *slot = self.use_as_released(block_id, block, table_refs);
+        }
+        self.shrink_candidates(&uses, floor, extent, extents)
+            .first()
+            .copied()
+            .unwrap_or(self.num_blocks)
+    }
+
+    /// Of the blocks in `table_refs` (block id -> refs), those releasing
+    /// those refs would leave free or cache-only.
+    pub fn released_blocks(&self, table_refs: &HashMap<u32, u32>) -> HashSet<u32> {
+        table_refs
+            .keys()
+            .copied()
+            .filter(|block_id| {
+                self.allocated.get(block_id).is_some_and(|block| {
+                    self.use_as_released(*block_id, block, table_refs) != SlotUse::Held
+                })
+            })
+            .collect()
+    }
+
+    fn use_as_released(
+        &self,
+        block_id: u32,
+        block: &PhysicalBlock,
+        table_refs: &HashMap<u32, u32>,
+    ) -> SlotUse {
+        let released = table_refs.get(&block_id).copied().unwrap_or(0);
+        let left = block.get_ref_count().saturating_sub(released);
+        let cached = self
+            .block_hashes
+            .get(&block_id)
+            .and_then(|hash| self.prefix_cache.get(hash))
+            .is_some_and(|cached| cached.block_id == block_id);
+        if left == 0 {
+            SlotUse::Free
+        } else if cached && left == 1 {
+            SlotUse::CacheOnly
+        } else {
+            SlotUse::Held
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn block_stamp(&self, hash: u64) -> Option<u64> {
@@ -3595,5 +3750,34 @@ mod tests {
         allocator.free(b_block);
         assert_eq!(allocator.allocate().unwrap().block_id, b);
         assert_eq!(allocator.child_count_rows(), 0);
+    }
+
+    /// A held tail registered under two released blocks marks a chain
+    /// whose ancestors free once its state goes.
+    /// Mutation: keep a mark in `tip_marks` only when the mark itself is
+    /// cache-only -> red (tips empty).
+    #[test]
+    fn a_held_tip_over_cache_only_blocks_is_a_tip() {
+        let mut allocator = BlockAllocator::new(5, 5, 4);
+        let tokens: Vec<u32> = (0..12).collect();
+        let (head, _) = cache_chain(&mut allocator, &tokens[..8]);
+        for block in head {
+            allocator.free(block);
+        }
+        let held: Vec<_> = (0..3).map(|_| allocator.allocate().unwrap()).collect();
+        assert_eq!(
+            allocator
+                .cache_full_blocks(&tokens, &held, 4, &[], 0)
+                .unwrap(),
+            1
+        );
+        let hashes = chain_hashes(&tokens, 4, &[], 0);
+        allocator.set_state_marks([hashes[1], hashes[2]]);
+        assert!(allocator.reserve(1).is_err());
+        assert_eq!(allocator.tip_marks(), [hashes[2]].into_iter().collect());
+        allocator.set_state_marks([hashes[1]]);
+        assert!(allocator.reserve(1).is_err());
+        allocator.set_state_marks([]);
+        assert!(allocator.reserve(1).is_ok());
     }
 }

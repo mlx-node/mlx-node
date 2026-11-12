@@ -511,7 +511,7 @@ fn reserve_evicts_for_the_turn_transients() -> Result<()> {
 /// A paged AR turn whose pool needs no growth keeps every parked DFlash2
 /// state, with room or with no headroom at all, and parks the live one
 /// beside them: Splash reclaims only inside an allocation that was refused
-/// (Engine.cpp:2056-2104), never before a turn.
+/// (`Engine::allocate`), never before a turn.
 /// Mutation: call `evict_parked_dflash2_for_flat_turn` from
 /// `run_paged_turn` (an up-front eviction) → red (pressure keeps only the
 /// live lineage).
