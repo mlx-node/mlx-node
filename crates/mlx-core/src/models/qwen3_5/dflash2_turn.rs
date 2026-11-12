@@ -1151,6 +1151,11 @@ fn wait_and_resume<T: DFlash2Target>(
         turn_wait.sync(wait, now, epoch);
         turn_wait.sleep(wait, now);
         run_control_pass(governor, model, true, target, keep);
+        if cancelled() {
+            return Err(Error::from_reason(
+                crate::engine::session::LANE_VACATED_CANCELLED,
+            ));
+        }
         let (hit, stored) = match lane.decode {
             SerialDecode::DFlash2 => {
                 let (hit, stored) = resolve_dflash2_resume(
@@ -1185,6 +1190,12 @@ fn wait_and_resume<T: DFlash2Target>(
                         if is_gpu_out_of_memory(&error.reason) {
                             governor.note_gpu_oom(model);
                             Error::from_reason(metal_out_of_memory(&error.reason))
+                        } else if cancelled()
+                            || error.reason == crate::models::forward::PREFILL_CANCELLED
+                        {
+                            // Splash `Engine::stop` settles a suspended lane whatever its
+                            // phase: a stop during the replay is the vacated lane's stop.
+                            Error::from_reason(crate::engine::session::LANE_VACATED_CANCELLED)
                         } else {
                             error
                         }
@@ -1338,7 +1349,7 @@ impl<T: DFlash2Target> VictimSource for ModelUnits<'_, T> {
     }
 
     fn take(&mut self, query: &VictimQuery, victim: &Victim) -> LedgerTaken {
-        take_model_unit(self.target, query, victim)
+        take_model_unit(self.target, self.keep, query, victim)
     }
 }
 
@@ -1355,10 +1366,12 @@ pub(crate) fn model_units<T: DFlash2Target>(
     let pages_only = host_refused && query.need.pages > 0;
     let states_only = host_refused && query.need.pages == 0;
     let mut units = Vec::new();
+    let wanted = wanted_chains(target);
     if !host_refused {
-        let bytes = target.paged_adapter_ref().map_or(0, |adapter| {
-            adapter.free_extent_bytes(query.rights.reserves == Reserves::None)
-        });
+        let keep_one = query.rights.reserves == Reserves::None;
+        let bytes = target
+            .paged_adapter_ref()
+            .map_or(0, |adapter| adapter.free_extent_bytes(keep_one));
         if bytes > 0 {
             units.push(Victim {
                 key: UnitKey::Extent,
@@ -1368,17 +1381,30 @@ pub(crate) fn model_units<T: DFlash2Target>(
                 stage: Stage::FreeNow,
             });
         }
+        // Splash `Cache::takeReclaim`: a device need takes the dead leaves
+        // (`Phase::DeadLeaves`, before any ordinary state) and releases the
+        // extent they empty. A need of blocks takes them in place.
+        if query.need.bytes > 0 && query.need.pages == 0 {
+            let lookups = kept_lookups(keep, &wanted, query.rights.certain_reuse);
+            let bytes = target
+                .paged_adapter_ref()
+                .map_or(0, |adapter| adapter.cached_extent_bytes(keep_one, &lookups));
+            if bytes > 0 {
+                units.push(Victim {
+                    key: UnitKey::DeadLeaves,
+                    stamp: 0,
+                    bytes,
+                    pages: 0,
+                    stage: Stage::FreeNow,
+                });
+            }
+        }
     }
     let kept = keep.points(
         target
             .paged_adapter_ref()
             .map(PagedKVCacheAdapter::block_size),
     );
-    let wanted = target
-        .memory_registration()
-        .map_or_else(Arc::default, |guard| {
-            guard.governor().wanted_chains(guard.model_id())
-        });
     let state_bytes = |bytes: u64| if pages_only { 0 } else { bytes };
     let stage = |in_use: bool| if in_use { Stage::InUse } else { Stage::FreeNow };
     // Every state, each with the block it marks and whether the claim's
@@ -1455,6 +1481,30 @@ pub(crate) fn model_units<T: DFlash2Target>(
     units
 }
 
+fn wanted_chains<T: DFlash2Target>(target: &T) -> Arc<WantedChains> {
+    target
+        .memory_registration()
+        .map_or_else(Arc::default, |guard| {
+            guard.governor().wanted_chains(guard.model_id())
+        })
+}
+
+/// The lookups whose chains a reclaim keeps: the claim's prompt, and the
+/// waiting prompts unless the claim takes certain reuse (Splash
+/// `Walk::reused`, `Walk::restored`).
+fn kept_lookups<'a>(
+    keep: Keep<'a>,
+    wanted: &'a WantedChains,
+    reuse: CertainReuse,
+) -> Vec<&'a [u32]> {
+    let mut lookups = vec![&keep.tokens[..keep.tokens.len().saturating_sub(1)]];
+    if reuse != CertainReuse::All {
+        lookups.extend(wanted.lookups());
+    }
+    lookups.retain(|lookup| !lookup.is_empty());
+    lookups
+}
+
 /// A state on the take order, before the claim's rights filter it.
 struct StateUnit {
     unit: Victim,
@@ -1486,6 +1536,7 @@ fn resume_point(states: &[StateUnit]) -> Option<UnitKey> {
 /// block or its arrays hands them to the next one only once it is gone.
 pub(crate) fn take_model_unit<T: DFlash2Target>(
     target: &mut T,
+    keep: Keep<'_>,
     query: &VictimQuery,
     victim: &Victim,
 ) -> LedgerTaken {
@@ -1499,6 +1550,15 @@ pub(crate) fn take_model_unit<T: DFlash2Target>(
             let keep_one = query.rights.reserves == Reserves::None;
             if let Some(adapter) = target.paged_adapter_mut_ref() {
                 pool_bytes = adapter.release_free_extents(victim.bytes, keep_one);
+            }
+            pool_bytes > 0
+        }
+        UnitKey::DeadLeaves => {
+            let keep_one = query.rights.reserves == Reserves::None;
+            let wanted = wanted_chains(&*target);
+            let lookups = kept_lookups(keep, &wanted, query.rights.certain_reuse);
+            if let Some(adapter) = target.paged_adapter_mut_ref() {
+                pool_bytes = adapter.release_cached_extent(keep_one, &lookups);
             }
             pool_bytes > 0
         }
@@ -1570,7 +1630,7 @@ pub(crate) fn take_state_unit<T: DFlash2Target>(target: &mut T, key: &UnitKey) -
             }
             dropped
         }
-        UnitKey::Owner(_) | UnitKey::Extent | UnitKey::Vision(_) => false,
+        UnitKey::Owner(_) | UnitKey::Extent | UnitKey::DeadLeaves | UnitKey::Vision(_) => false,
     }
 }
 

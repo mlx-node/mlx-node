@@ -2005,6 +2005,100 @@ fn idle_thread_gives_back_under_critical() -> Result<()> {
     Ok(())
 }
 
+/// Splash `Cache::takeReclaim`: a device need takes the dead leaves and
+/// releases the extent they empty. A pool grown by an extent whose eight
+/// blocks are two cached chains nothing holds (no free slot, so no empty
+/// extent) gives that extent back to a critical host pass: the oldest chain
+/// goes and the newer one moves down. The chain the claim's prompt walks
+/// stays: the newer one goes instead.
+/// Mutation R3 (a dead-leaves take evicts nothing) → red (eight blocks).
+#[test]
+fn critical_host_pass_evicts_dead_leaves_to_cut_an_extent() -> Result<()> {
+    use crate::engine::governor::governor::Governor;
+    use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+    use crate::engine::governor::host::Pressure;
+    use crate::models::qwen3_5::dflash2_turn::ModelUnits;
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    for keep_old in [false, true] {
+        let mut inner = fixture(0xDFA5_3911);
+        install_pool(&mut inner, 4, 12, passing_probe())?;
+        let block_size = pool_block_size(&inner);
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("adapter")
+            .set_extent_growth(4);
+        let old = chain_tokens(95, 4, block_size);
+        let new = chain_tokens(96, 4, block_size);
+        let old_hashes = cache_chain(&inner, &old);
+        assert!(
+            inner
+                .paged_adapter
+                .as_mut()
+                .expect("adapter")
+                .try_grow_pool(4)
+        );
+        let new_hashes = cache_chain(&inner, &new);
+        assert_eq!(
+            inner
+                .paged_adapter
+                .as_ref()
+                .expect("adapter")
+                .allocator()
+                .lock()
+                .unwrap()
+                .num_blocks(),
+            8
+        );
+        assert_eq!(
+            inner
+                .paged_adapter
+                .as_ref()
+                .expect("adapter")
+                .free_extent_bytes(false),
+            0,
+            "no empty extent"
+        );
+        let io = FakeIo::new(stats(0), host(32 * G, Pressure::Critical));
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+        let registration = governor.register_model(model(16 * G, 0)).expect("register");
+        let model_id = registration.model_id();
+        inner.memory_registration = Some(registration);
+        let mut prompt = old.clone();
+        prompt.push(1);
+        let mut units = ModelUnits {
+            target: &mut inner,
+            keep: Keep {
+                tokens: if keep_old { &prompt } else { &[] },
+                keys: None,
+            },
+        };
+        governor.control_pass(model_id, &mut [&mut units]);
+        let adapter = inner.paged_adapter.as_ref().expect("adapter");
+        assert_eq!(
+            adapter.allocator().lock().unwrap().num_blocks(),
+            4,
+            "keep_old={keep_old}: one extent cut"
+        );
+        let (kept, gone) = if keep_old {
+            (&old_hashes, &new_hashes)
+        } else {
+            (&new_hashes, &old_hashes)
+        };
+        assert!(
+            kept.iter().all(|&hash| adapter.prefix_cached(hash)),
+            "keep_old={keep_old}"
+        );
+        assert!(
+            gone.iter().all(|&hash| !adapter.prefix_cached(hash)),
+            "keep_old={keep_old}"
+        );
+    }
+    Ok(())
+}
+
 /// What a streamed turn sent: its text deltas, its done chunks' raw text.
 #[derive(Default)]
 struct StreamLog {
@@ -2325,6 +2419,71 @@ fn a_stop_in_the_suspend_wait_completes() -> Result<()> {
         let adapter = inner.paged_adapter.as_ref().expect("adapter");
         assert_eq!(adapter.request_count(), 0, "{decoder:?}");
         assert!(inner.caches.is_none(), "{decoder:?}: no live state");
+    }
+    Ok(())
+}
+
+/// Splash `Engine::stop` settles a suspended request whatever its phase,
+/// its replay included. The host recovers at the wait's first sleep and the
+/// stop lands after the wait's own cancel check, so the replay's chunked
+/// prefill is the first to see it (its flag is the backend's turn cancel;
+/// one row per chunk, so the short replay is chunked): the turn
+/// still ends with one done chunk, "cancelled", on the tokens it generated.
+/// Mutation R4 (a cancelled replay's error passes through) → red
+/// (`prefill cancelled`).
+#[test]
+fn a_stop_during_the_replay_completes() -> Result<()> {
+    use crate::engine::governor::governor::CancelScope;
+    use crate::engine::governor::governor::tests::{G, host};
+    use crate::engine::governor::host::Pressure;
+    use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    for decoder in [
+        DecoderPlan::Autoregressive,
+        DecoderPlan::Speculative(crate::engine::plan::SpeculativeKind::DraftModel),
+    ] {
+        let (io, governor) = fake_governor(Pressure::Normal);
+        let (mut inner, prompt) = suspending_lane(0xDFA5_4911, governor)?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let replay_cancel = Arc::new(AtomicBool::new(false));
+        ChatBackend::set_turn_cancel_flag(&mut inner, Some(Arc::clone(&replay_cancel)));
+        let critical = {
+            let io = Arc::clone(&io);
+            Box::new(move || io.with(|state| state.host = host(32 * G, Pressure::Critical)))
+        };
+        let sink = LoggingSink::new(Some(critical));
+        {
+            let stopped = Arc::clone(&sink.stopped);
+            let replay_cancel = Arc::clone(&replay_cancel);
+            io.with(|state| {
+                state.on_sleep = Some(Box::new(move |state| {
+                    state.host = host(32 * G, Pressure::Normal);
+                    stopped.store(true, Ordering::Relaxed);
+                    replay_cancel.store(true, Ordering::Release);
+                    PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(1)));
+                }));
+            });
+        }
+        {
+            let _scope = CancelScope::enter(Arc::clone(&cancelled));
+            let turn = run_streamed_turn(&mut inner, decoder, &prompt, &sink, &cancelled);
+            PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+            turn.unwrap_or_else(|error| panic!("{decoder:?}: {}", error.reason));
+        }
+        assert_eq!(governor.suspensions(7), 1, "{decoder:?}");
+        let log = sink.log.lock().unwrap();
+        assert_eq!(log.done.len(), 1, "{decoder:?}: one done chunk");
+        assert_eq!(log.finish.as_deref(), Some("cancelled"), "{decoder:?}");
+        assert!(
+            (1..SUSPEND_MAX_NEW).contains(&log.tokens),
+            "{decoder:?}: {} tokens",
+            log.tokens
+        );
+        let adapter = inner.paged_adapter.as_ref().expect("adapter");
+        assert_eq!(adapter.request_count(), 0, "{decoder:?}");
     }
     Ok(())
 }

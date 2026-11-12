@@ -206,7 +206,12 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn victim_units(&self, _query: &VictimQuery, _kept: &[u32]) -> Vec<Victim> {
         Vec::new()
     }
-    fn take_victim(&mut self, _query: &VictimQuery, _victim: &Victim) -> LedgerTaken {
+    fn take_victim(
+        &mut self,
+        _query: &VictimQuery,
+        _victim: &Victim,
+        _kept: &[u32],
+    ) -> LedgerTaken {
         LedgerTaken::default()
     }
     /// A GPU command exhausted Metal memory: every cache its writes may
@@ -2035,7 +2040,7 @@ impl<B: HybridSchedulerBackend> VictimSource for SchedUnits<'_, B> {
     /// the blocks it made takeable.
     fn take(&mut self, query: &VictimQuery, victim: &Victim) -> LedgerTaken {
         let LedgerKey::Owner(seq_id) = victim.key else {
-            return self.state.inner.take_victim(query, victim);
+            return self.state.inner.take_victim(query, victim, self.kept);
         };
         let takeable = |state: &HybridSchedulerState<B>| {
             state
@@ -3061,10 +3066,28 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return true;
         };
         let ledger = self.judge_policy() == JudgePolicy::Ledger;
-        for mut turn in completed {
-            if ledger {
+        let mut completed = completed;
+        if ledger {
+            for turn in &mut completed {
                 self.note_gpu_oom(&mut turn.payload.failure);
             }
+            // Splash restarts on `metal_out_of_memory` however the step's
+            // requests ended: MLX may raise one row's failed command in a
+            // peer's, so no row of the step completes.
+            if let Some(detail) = self.gpu_oom.clone() {
+                let error = if detail.starts_with("metal_out_of_memory:") {
+                    detail
+                } else {
+                    crate::engine::governor::metal_out_of_memory(&detail)
+                };
+                for turn in &mut completed {
+                    if turn.payload.failure.is_none() {
+                        turn.payload.failure = Some(Error::from_reason(error.clone()));
+                    }
+                }
+            }
+        }
+        for turn in completed {
             self.finish_completed(turn);
         }
         if ledger {
@@ -5553,6 +5576,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             // would claim a recurrent unit that peers may hold and fail the
             // turn; `abort_paged_turn` would tear down the active peer.
             let _ = self.inner.release_scheduled_cache(turn.seq_id);
+            if let Some(error) = turn.payload.failure.take() {
+                turn.payload.response.send_error(error, cancelled.as_ref());
+                return;
+            }
         } else {
             if let Some(owner_state) = self.owner_states.get(&turn.payload.owner_id) {
                 self.inner.install_owner_state(turn.seq_id, owner_state);
@@ -8906,6 +8933,84 @@ pub(crate) mod tests {
             0,
             "no prefix hit after the reset"
         );
+    }
+
+    /// A step whose every row ends: row 2 with MLX's allocation failure,
+    /// the others as completed turns.
+    #[cfg(target_os = "macos")]
+    struct OneRowOutOfMemory;
+
+    #[cfg(target_os = "macos")]
+    impl<P> StepExecutor<ScheduledTurn<P>> for OneRowOutOfMemory {
+        type Error = Error;
+
+        fn execute(
+            &mut self,
+            plan: &StepPlan,
+            running: &mut [TurnState<ScheduledTurn<P>>],
+        ) -> std::result::Result<StepResult, Self::Error> {
+            for turn in running.iter_mut().filter(|turn| turn.seq_id == 2) {
+                turn.payload.failure = Some(Error::from_reason(
+                    "[malloc] Unable to allocate 1073741824 bytes.",
+                ));
+            }
+            Ok(StepResult {
+                rows: plan
+                    .rows
+                    .iter()
+                    .map(|row| RowStepResult {
+                        seq_id: row.seq_id,
+                        num_computed_tokens: row.num_tokens,
+                        generated_token: None,
+                        speculative: None,
+                        finished: true,
+                        allocation_blocked: false,
+                        prefill_micros: 0,
+                    })
+                    .collect(),
+                executed_decode_batch: 0,
+                executed_greedy_epilogue_batch: 0,
+                rows_alloc_evicted: 0,
+            })
+        }
+    }
+
+    /// Splash restarts on `metal_out_of_memory` however the step's requests
+    /// ended: one row's GPU allocation failure fails the peer the same step
+    /// completed too, and the caches reset.
+    /// Mutation E4 (the step's completed peers finish before the OOM is
+    /// seen) → red (row 1 replies a result).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_rows_oom_fails_the_peer_its_step_completed() {
+        let Some((mut state, governor, mut replies)) = judged_state(&[1, 2]) else {
+            return;
+        };
+        let step = state
+            .step_with(&mut OneRowOutOfMemory)
+            .unwrap_or_else(|_| panic!("the step runs"));
+        let SchedulerAction::Stepped { completed, .. } = &step else {
+            panic!("the step runs");
+        };
+        assert_eq!(completed.len(), 2, "both rows end in the step");
+        state.settle_step(step);
+        state.recover_if_gpu_oom();
+        for (seq, result) in replies.iter_mut().enumerate() {
+            let error = result
+                .try_recv()
+                .expect("the turn replied")
+                .expect_err("the turn fails");
+            assert!(
+                error.reason.starts_with(
+                    "metal_out_of_memory: a GPU command exhausted Metal memory ([malloc]"
+                ),
+                "row {}: {}",
+                seq + 1,
+                error.reason
+            );
+        }
+        assert_eq!(state.scheduler.running_len(), 0);
+        assert_eq!(governor.metal_out_of_memory(7), 1);
     }
 
     /// A step that tells the test it runs, then waits for its release.

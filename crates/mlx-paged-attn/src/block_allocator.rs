@@ -411,10 +411,61 @@ impl BlockAllocator {
 
     /// The oldest cached leaf nothing holds and no mark protects.
     fn oldest_dead_leaf(&self) -> Option<u64> {
-        self.leaves
-            .iter()
-            .map(|&(_, hash)| hash)
-            .find(|hash| !self.state_marks.contains(hash) && self.ref_count_of(*hash) == Some(1))
+        self.oldest_dead_leaf_outside(&HashSet::new())
+    }
+
+    /// [`Self::oldest_dead_leaf`] outside `keep`.
+    fn oldest_dead_leaf_outside(&self, keep: &HashSet<u64>) -> Option<u64> {
+        self.leaves.iter().map(|&(_, hash)| hash).find(|hash| {
+            !self.state_marks.contains(hash)
+                && !keep.contains(hash)
+                && self.ref_count_of(*hash) == Some(1)
+        })
+    }
+
+    /// The cached blocks a prompt's lookup walks: those whose chain's tokens
+    /// from the root prefix one of `prompts` (Splash `Walk::keepsBlock`
+    /// over `RestoredChains`, matched by tokens as the queued chains are).
+    pub fn cached_on_prompts(&self, prompts: &[&[u32]]) -> HashSet<u64> {
+        let mut on = HashSet::new();
+        for prompt in prompts {
+            let mut memo: HashMap<u64, bool> = HashMap::new();
+            for &hash in self.prefix_cache.keys() {
+                let mut path = Vec::new();
+                let mut at = hash;
+                let matched = loop {
+                    if let Some(&known) = memo.get(&at) {
+                        break known;
+                    }
+                    let Some(identity) = self.prefix_cache_identities.get(&at) else {
+                        break false;
+                    };
+                    let start = identity
+                        .block_index
+                        .saturating_mul(self.block_size as usize);
+                    let end = start.saturating_add(identity.token_ids.len());
+                    if prompt.get(start..end) != Some(identity.token_ids.as_slice()) {
+                        break false;
+                    }
+                    path.push(at);
+                    if identity.block_index == 0 {
+                        break identity.parent_hash == 0;
+                    }
+                    if !self.prefix_cache.contains_key(&identity.parent_hash) {
+                        break false;
+                    }
+                    at = identity.parent_hash;
+                };
+                for hash in path {
+                    memo.insert(hash, matched);
+                }
+            }
+            on.extend(
+                memo.into_iter()
+                    .filter_map(|(hash, kept)| kept.then_some(hash)),
+            );
+        }
+        on
     }
 
     /// The deepest cache-only block that still has cached children (all of
@@ -504,7 +555,12 @@ impl BlockAllocator {
 
     /// Evict the oldest dead leaf and put its id back in the free queue.
     pub fn evict_oldest_dead_leaf(&mut self) -> Option<u32> {
-        let hash = self.oldest_dead_leaf()?;
+        self.evict_oldest_dead_leaf_outside(&HashSet::new())
+    }
+
+    /// [`Self::evict_oldest_dead_leaf`], leaving the blocks in `keep`.
+    pub fn evict_oldest_dead_leaf_outside(&mut self, keep: &HashSet<u64>) -> Option<u32> {
+        let hash = self.oldest_dead_leaf_outside(keep)?;
         let block_id = self.take_cached(hash)?;
         self.free_blocks.push_back(block_id);
         Some(block_id)
@@ -1380,7 +1436,26 @@ impl BlockAllocator {
     /// The lowest block count a cut by up to `extents` extents may reach once
     /// enough cache-only blocks are gone: `num_blocks` when none can.
     pub fn shrink_target(&self, floor: u32, extent: u32, extents: u32) -> u32 {
-        let uses = self.slot_uses();
+        self.shrink_target_keeping(floor, extent, extents, &HashSet::new())
+    }
+
+    /// [`Self::shrink_target`] with the cache-only blocks in `keep` staying
+    /// where they are.
+    pub fn shrink_target_keeping(
+        &self,
+        floor: u32,
+        extent: u32,
+        extents: u32,
+        keep: &HashSet<u64>,
+    ) -> u32 {
+        let mut uses = self.slot_uses();
+        for hash in keep {
+            if let Some(block) = self.prefix_cache.get(hash)
+                && let Some(slot) = uses.get_mut(block.block_id as usize)
+            {
+                *slot = SlotUse::Held;
+            }
+        }
         self.shrink_candidates(&uses, floor, extent, extents)
             .first()
             .copied()

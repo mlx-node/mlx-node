@@ -1025,7 +1025,11 @@ impl Qwen35MoeInner {
                     entry.last_used = stamp;
                 }
             }
-            UnitKey::Store(_) | UnitKey::Owner(_) | UnitKey::Extent | UnitKey::Vision(_) => {}
+            UnitKey::Store(_)
+            | UnitKey::Owner(_)
+            | UnitKey::Extent
+            | UnitKey::DeadLeaves
+            | UnitKey::Vision(_) => {}
         }
     }
 
@@ -1099,7 +1103,11 @@ impl Qwen35MoeInner {
                 self.gdn_prefix_checkpoints.len() < before
             }
             UnitKey::History => self.gdn_last_history_checkpoint.take().is_some(),
-            UnitKey::Store(_) | UnitKey::Owner(_) | UnitKey::Extent | UnitKey::Vision(_) => false,
+            UnitKey::Store(_)
+            | UnitKey::Owner(_)
+            | UnitKey::Extent
+            | UnitKey::DeadLeaves
+            | UnitKey::Vision(_) => false,
         };
         if dropped {
             self.sync_gdn_state_marks();

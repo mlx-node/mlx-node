@@ -140,6 +140,8 @@ pub(crate) enum UnitKey {
     History,
     Owner(SeqId),
     Extent,
+    /// The pool's dead leaves, taken until one more extent is cut.
+    DeadLeaves,
     Vision(u64),
 }
 
@@ -212,6 +214,13 @@ pub(crate) struct WantedChains {
 impl WantedChains {
     pub(crate) fn new(prompts: Vec<Vec<u32>>) -> Self {
         Self { prompts }
+    }
+
+    /// Each waiting prompt as its lookup walks it, the last token left out.
+    pub(crate) fn lookups(&self) -> impl Iterator<Item = &[u32]> {
+        self.prompts
+            .iter()
+            .map(|prompt| &prompt[..prompt.len().saturating_sub(1)])
     }
 
     /// Whether a state on `tokens` is a replay point a waiting prompt's
@@ -1094,7 +1103,9 @@ impl Ledger {
             let released = run
                 .took
                 .iter()
-                .filter(|took| took.key == UnitKey::Extent && took.bytes > 0)
+                .filter(|took| {
+                    matches!(took.key, UnitKey::Extent | UnitKey::DeadLeaves) && took.bytes > 0
+                })
                 .count() as u64;
             self.pool_releases = self.pool_releases.saturating_add(released);
         }

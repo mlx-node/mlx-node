@@ -3225,7 +3225,39 @@ impl PagedKVCacheAdapter {
     /// growth lock. The notifier sees the measured new total. Returns the
     /// bytes the pool's buffers shrank by; 0 when nothing was cut.
     pub(crate) fn try_release_pool_extents(&mut self, want_bytes: u64, evict_cached: bool) -> u64 {
-        self.release_pool_extents_above(want_bytes, evict_cached, false)
+        let keep = HashSet::new();
+        self.release_pool_extents_above(want_bytes, evict_cached.then_some(&keep), false)
+    }
+
+    /// The bytes an extent cut gives back beyond [`Self::free_extent_bytes`]
+    /// once the cache-only blocks outside the chains of `kept` prompts go
+    /// (Splash `Cache::takeReclaim`'s victims); it over-counts the blocks a
+    /// state still marks.
+    pub(crate) fn cached_extent_bytes(&self, keep_one: bool, kept: &[&[u32]]) -> u64 {
+        let Some(extent) = self.extent_growth_blocks else {
+            return 0;
+        };
+        let Ok(bytes_per_block) = self.bytes_per_block() else {
+            return 0;
+        };
+        let floor = self.extent_floor(extent, keep_one);
+        let cut = {
+            let guard = self.allocator_guard();
+            let keep = guard.cached_on_prompts(kept);
+            let extents = guard.num_blocks().saturating_sub(floor).div_ceil(extent);
+            let target = guard.shrink_target_keeping(floor, extent, extents, &keep);
+            u64::from(guard.num_blocks().saturating_sub(target)).saturating_mul(bytes_per_block)
+        };
+        cut.saturating_sub(self.free_extent_bytes(keep_one))
+    }
+
+    /// Splash `Cache::takeReclaim` past the empty extents: the oldest dead
+    /// leaves outside the chains of `kept` prompts go one at a time until
+    /// one more extent is cut, keeping one empty extent more with
+    /// `keep_one`. Returns the bytes the pool shrank by.
+    pub(crate) fn release_cached_extent(&mut self, keep_one: bool, kept: &[&[u32]]) -> u64 {
+        let keep = self.allocator_guard().cached_on_prompts(kept);
+        self.release_pool_extents_above(1, Some(&keep), keep_one)
     }
 
     /// The bytes cutting this pool's empty extents gives back without
@@ -3250,7 +3282,7 @@ impl PagedKVCacheAdapter {
     /// [`Self::try_release_pool_extents`] of empty extents only, keeping
     /// one more empty extent with `keep_one`.
     pub(crate) fn release_free_extents(&mut self, want_bytes: u64, keep_one: bool) -> u64 {
-        self.release_pool_extents_above(want_bytes, false, keep_one)
+        self.release_pool_extents_above(want_bytes, None, keep_one)
     }
 
     fn extent_floor(&self, extent: u32, keep_one: bool) -> u32 {
@@ -3261,10 +3293,11 @@ impl PagedKVCacheAdapter {
         }
     }
 
+    /// `evict` keeps its blocks while the oldest other dead leaves go.
     fn release_pool_extents_above(
         &mut self,
         want_bytes: u64,
-        evict_cached: bool,
+        evict: Option<&HashSet<u64>>,
         keep_one: bool,
     ) -> u64 {
         let Some(extent) = self.extent_growth_blocks else {
@@ -3284,8 +3317,8 @@ impl PagedKVCacheAdapter {
         let pending = self.layer_kv_pool.shrink_pending();
         {
             let guard = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
-            let cuttable = if evict_cached {
-                guard.shrink_target(floor, extent, extents) < guard.num_blocks()
+            let cuttable = if let Some(keep) = evict {
+                guard.shrink_target_keeping(floor, extent, extents, keep) < guard.num_blocks()
             } else {
                 guard.shrink_plan(floor, extent, extents).is_some()
             };
@@ -3310,13 +3343,13 @@ impl PagedKVCacheAdapter {
         let mut guard = allocator.lock().unwrap_or_else(|e| e.into_inner());
         let current = guard.num_blocks();
         let mut evicted = 0u32;
-        if evict_cached {
-            let target = guard.shrink_target(floor, extent, extents);
+        if let Some(keep) = evict {
+            let target = guard.shrink_target_keeping(floor, extent, extents, keep);
             while guard
                 .shrink_plan(floor, extent, extents)
                 .map_or(current, |plan| plan.num_blocks)
                 > target
-                && guard.evict_oldest_dead_leaf().is_some()
+                && guard.evict_oldest_dead_leaf_outside(keep).is_some()
             {
                 evicted += 1;
             }

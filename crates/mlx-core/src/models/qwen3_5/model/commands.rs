@@ -271,8 +271,17 @@ impl HybridSchedulerBackend for Qwen35Inner {
         &mut self,
         query: &crate::engine::governor::ledger::VictimQuery,
         victim: &crate::engine::governor::ledger::Victim,
+        kept: &[u32],
     ) -> crate::engine::governor::ledger::Taken {
-        crate::models::qwen3_5::dflash2_turn::take_model_unit(self, query, victim)
+        crate::models::qwen3_5::dflash2_turn::take_model_unit(
+            self,
+            crate::models::qwen3_5::dflash2_turn::Keep {
+                tokens: kept,
+                keys: None,
+            },
+            query,
+            victim,
+        )
     }
 
     fn claim_step_rows(
