@@ -57,7 +57,12 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult, ChatStreamProgress, PerformanceMetrics } from '@mlx-node/core';
-import { isCapacityExhaustedError, isContextCapacityError, selectCommittedStreamText } from '@mlx-node/lm';
+import {
+  isCapacityExhaustedError,
+  isContextCapacityError,
+  retryableErrorCode,
+  selectCommittedStreamText,
+} from '@mlx-node/lm';
 import type { ChatSession, ChatStreamControl, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 import { ToolCallTagBuffer } from '@mlx-node/lm';
 
@@ -67,6 +72,7 @@ import {
   sendAnthropicError,
   sendAnthropicInternalError,
   sendAnthropicNotFound,
+  sendAnthropicOverloaded,
   sendAnthropicRateLimit,
 } from '../errors.js';
 import type { IdleSweeper } from '../idle-sweeper.js';
@@ -983,7 +989,8 @@ async function handleStreamingNativeWithAbort(
     message = 'stream ended without a done event';
   }
   // The streaming `error` event is the Anthropic terminal on the failure path.
-  await flushTerminalSSE(res, 'error', { type: 'error', error: { type: 'api_error', message } }, visibility);
+  const errorType = retryableErrorCode(message) === null ? 'api_error' : 'overloaded_error';
+  await flushTerminalSSE(res, 'error', { type: 'error', error: { type: errorType, message } }, visibility);
   endSSE(res);
   return { ok: false, suppressedToolCalls };
 }
@@ -1898,7 +1905,9 @@ export async function handleCreateMessage(
             sessionReg.drop(MESSAGES_WARM_SLOT_ID);
             const message = err instanceof Error ? err.message : 'Unknown error during inference';
             if (visibility.responseMode === null) {
-              if (isContextCapacityError(err) || isCapacityExhaustedError(err)) {
+              if (retryableErrorCode(err) !== null) {
+                sendAnthropicOverloaded(res, message);
+              } else if (isContextCapacityError(err) || isCapacityExhaustedError(err)) {
                 sendAnthropicBadRequest(res, message);
               } else {
                 sendAnthropicInternalError(res, message);
@@ -1915,7 +1924,7 @@ export async function handleCreateMessage(
               // (a double terminal would confuse the client state machine).
               if (!visibility.terminalEmitted) {
                 writeFallbackErrorSSE(res, 'error', {
-                  error: { type: 'api_error', message },
+                  error: { type: retryableErrorCode(err) === null ? 'api_error' : 'overloaded_error', message },
                 });
               }
               try {

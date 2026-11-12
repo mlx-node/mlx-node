@@ -33,6 +33,7 @@ fn footprint(working_set: u64, active: u64, max_memory: Option<u64>) -> MemoryFo
         staging_bytes: STAGING,
         draft_weights_bytes: 0,
         held_back_bytes: 0,
+        margin: Margin::Unguarded,
     }
 }
 
@@ -75,14 +76,39 @@ fn m3_pro_plan() -> MemoryPlan {
     qwen38_plan(footprint(M3_PRO_WORKING_SET, M3_PRO_ACTIVE, None), None).expect("plan")
 }
 
-/// The margin keeps 85% of the working set less 1 GiB (integer split as
-/// Splash's); Splash's own `max(1 GiB, 2%)` gives 24,696,061,952 here.
-/// Mutation: Splash's margin in `working_set_margin_bytes` → red (margin
-/// 1,073,741,824).
+/// Only a plan the memory governor guards keeps Splash's `max(1 GiB, 2%)`
+/// (2% of the golden working set is below 1 GiB); an unguarded one keeps
+/// 85% of the working set less 1 GiB, and so does the automatic budget.
+/// Mutation M1: swap the two margins in `working_set_margin_bytes` → red
+/// (Unguarded hard 24,696,061,952).
+#[test]
+fn ledger_margin_only_for_the_qwen35_plan() {
+    assert_eq!(
+        working_set_margin_bytes(GOLDEN_WORKING_SET, Margin::Ledger),
+        1_073_741_824
+    );
+    assert_eq!(
+        hard_budget_bytes(GOLDEN_WORKING_SET, None, Margin::Ledger),
+        24_696_061_952
+    );
+    assert_eq!(
+        hard_budget_bytes(GOLDEN_WORKING_SET, None, Margin::Unguarded),
+        20_830_591_385
+    );
+}
+
+/// The unguarded margin keeps 85% of the working set less 1 GiB (integer
+/// split as Splash's).
 #[test]
 fn hard_budget_on_the_splash_golden_working_set() {
-    assert_eq!(working_set_margin_bytes(GOLDEN_WORKING_SET), 4_939_212_391);
-    assert_eq!(hard_budget_bytes(GOLDEN_WORKING_SET, None), 20_830_591_385);
+    assert_eq!(
+        working_set_margin_bytes(GOLDEN_WORKING_SET, Margin::Unguarded),
+        4_939_212_391
+    );
+    assert_eq!(
+        hard_budget_bytes(GOLDEN_WORKING_SET, None, Margin::Unguarded),
+        20_830_591_385
+    );
 }
 
 /// Mutations: take the flag unconditionally in `hard_budget_bytes` → red
@@ -90,21 +116,21 @@ fn hard_budget_on_the_splash_golden_working_set() {
 /// red (a flag equal to the automatic budget reads as this Mac's memory).
 #[test]
 fn max_memory_only_lowers_the_budget() {
-    let automatic = hard_budget_bytes(M3_PRO_WORKING_SET, None);
+    let automatic = hard_budget_bytes(M3_PRO_WORKING_SET, None, Margin::Unguarded);
     assert_eq!(automatic, 23_568_633_036);
-    let lowered = hard_budget_bytes(M3_PRO_WORKING_SET, Some(16 * GIB));
+    let lowered = hard_budget_bytes(M3_PRO_WORKING_SET, Some(16 * GIB), Margin::Unguarded);
     assert_eq!(lowered, 16 * GIB);
     assert_eq!(
         MemoryBound::of(Some(16 * GIB), lowered),
         MemoryBound::MaxMemory
     );
-    let ignored = hard_budget_bytes(M3_PRO_WORKING_SET, Some(64 * GIB));
+    let ignored = hard_budget_bytes(M3_PRO_WORKING_SET, Some(64 * GIB), Margin::Unguarded);
     assert_eq!(ignored, automatic);
     assert_eq!(
         MemoryBound::of(Some(64 * GIB), ignored),
         MemoryBound::DeviceMemory
     );
-    let equal = hard_budget_bytes(M3_PRO_WORKING_SET, Some(automatic));
+    let equal = hard_budget_bytes(M3_PRO_WORKING_SET, Some(automatic), Margin::Unguarded);
     assert_eq!(equal, automatic);
     assert_eq!(
         MemoryBound::of(Some(automatic), equal),
@@ -429,7 +455,7 @@ fn explicit_pool_above_the_plan_is_refused() {
 
 /// Active bytes that leave a dynamic budget of `dynamic` on the M3 Pro.
 fn active_for_dynamic(dynamic: u64) -> u64 {
-    hard_budget_bytes(M3_PRO_WORKING_SET, None) - STAGING - 768 * MIB - dynamic
+    hard_budget_bytes(M3_PRO_WORKING_SET, None, Margin::Unguarded) - STAGING - 768 * MIB - dynamic
 }
 
 /// A draftless load's pool lane needs one cell, Splash's bf16 runway of 64
@@ -621,7 +647,7 @@ fn flash_next_load(
     let tokens = pool.shape.trained.min(RESIDENT_ALLOWANCE_TOKENS);
     let allowance = allowance_dynamic_bytes(&[&ar], tokens);
     let minimum_dynamic = pool.plan_at(0).lane.minimum_bytes;
-    let hard = hard_budget_bytes(working_set, max_memory);
+    let hard = hard_budget_bytes(working_set, max_memory, Margin::Unguarded);
     let store = plan_streamed_store(&StreamedInputs {
         hard,
         bound: MemoryBound::of(max_memory, hard),
@@ -643,6 +669,7 @@ fn flash_next_load(
             staging_bytes: 0,
             draft_weights_bytes: 0,
             held_back_bytes: store.expert_cap_bytes + store.row_cache_bytes,
+            margin: Margin::Unguarded,
         };
         MemoryPlan::evaluate(footprint, Some(pool)).ok()
     });
@@ -672,7 +699,10 @@ fn ar_load(working_set: u64, max_memory: Option<u64>) -> FlashNextLoad {
 #[test]
 fn flash_next_window_for_a_fixed_plan_input() {
     let load = ar_load(STUDIO_WORKING_SET, None);
-    assert_eq!(hard_budget_bytes(STUDIO_WORKING_SET, None), 24_554_329_702);
+    assert_eq!(
+        hard_budget_bytes(STUDIO_WORKING_SET, None, Margin::Unguarded),
+        24_554_329_702
+    );
     assert_eq!(load.allowance, 4_468_093_952);
     let store = load.store.expect("store plan");
     assert_eq!(
@@ -751,7 +781,7 @@ fn flash_next_window_never_shrinks_as_the_budget_grows() {
     let at = ar_load(128 * GIB, Some(THRESHOLD));
     assert!(at.store.expect("store plan").whole);
     assert_eq!(at.ar_window, 65_536);
-    let hard = hard_budget_bytes(128 * GIB, None);
+    let hard = hard_budget_bytes(128 * GIB, None, Margin::Unguarded);
     let (mut previous, mut max_memory) = (0u32, 12 * GIB);
     while max_memory <= hard {
         let load = ar_load(128 * GIB, Some(max_memory));

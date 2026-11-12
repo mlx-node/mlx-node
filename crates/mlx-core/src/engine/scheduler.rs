@@ -4,12 +4,15 @@
 //! behind [`StepExecutor`], so scheduling tests do not load MLX or a model.
 //! Prefill versus decode is derived on every plan from token progress; there
 //! is deliberately no phase queue.
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::transformer::paged_kv_cache_adapter::SeqId;
+use crate::engine::governor::allocate::Denial;
+use crate::engine::governor::ledger::ClaimRank;
+use crate::engine::governor::wait::ResourceWait;
+use crate::transformer::paged_kv_cache_adapter::{BlockRefusal, SeqId};
 use napi_derive::napi;
 
 /// Largest output budget a `prompt_tokens` prompt leaves in a `capacity`
@@ -110,6 +113,14 @@ pub(crate) struct TurnState<P> {
     /// Parked for an SSD restore: it holds the restore's blocks and runs once
     /// they land, so it is another lane to a blocked turn. A victim holds none.
     pub ssd_lane: bool,
+    /// The KV a yielded lane resumes to at once (Splash
+    /// `resumeKvTargetTokens`); 0 when none.
+    pub resume_target: u32,
+    /// Splash `Request::resourceWait`.
+    pub resource_wait: ResourceWait,
+    /// The engine's admission count when this turn was admitted (Splash
+    /// `Request::admission`).
+    pub admission: u64,
     pub payload: P,
     arrival_order: u64,
 }
@@ -231,6 +242,9 @@ impl<P> TurnState<P> {
             scheduled_state_bytes: 0,
             preemptions: 0,
             ssd_lane: false,
+            resume_target: 0,
+            resource_wait: ResourceWait::default(),
+            admission: 0,
             payload,
             arrival_order: 0,
         })
@@ -254,6 +268,30 @@ impl<P> TurnState<P> {
             payload,
         )
         .map_err(|(error, _)| error)
+    }
+
+    /// Splash `Engine::rankOf`: no request priority; a decoding lane
+    /// ranks above a prefilling one, then by the tokens it completed, then
+    /// by arrival.
+    pub fn claim_rank(&self) -> ClaimRank {
+        ClaimRank {
+            priority: 1,
+            decoding: self.num_computed_tokens >= self.prompt_tokens,
+            completed_tokens: u64::from(self.num_computed_tokens),
+            earliness: u64::MAX - self.arrival_order,
+        }
+    }
+
+    /// Its submission order (Splash `Engine::submissionOrder`).
+    pub fn arrival_order(&self) -> u64 {
+        self.arrival_order
+    }
+
+    /// Splash `Engine::yieldsBefore`: compared without earliness.
+    pub fn yields_before(&self, other: &Self) -> bool {
+        let (left, right) = (self.claim_rank(), other.claim_rank());
+        (left.priority, left.decoding, left.completed_tokens)
+            < (right.priority, right.decoding, right.completed_tokens)
     }
 
     fn snapshot_cancel(&mut self) {
@@ -483,6 +521,8 @@ pub(crate) struct SchedulerStats {
     pub preemptions_ssd: u64,
     pub prefill_tokens: u64,
     pub prefill_micros: u64,
+    /// Splash `replans`: steps that ran some rows and refused others.
+    pub replans: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -625,6 +665,27 @@ pub(crate) enum SchedulerError<E> {
     InvalidResult(String),
 }
 
+/// How a step's blocked rows are settled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JudgePolicy {
+    /// The newest running turn is preempted; a lone blocked turn is
+    /// reported in `blocked_alone`.
+    Legacy,
+    /// Rows claimed their memory before the step (Splash
+    /// `Engine::prepare`): blocked rows and their denials are reported and
+    /// no turn moves; the caller judges them.
+    Ledger,
+}
+
+/// A step's claims per plan row: `None` granted, else the row's denial.
+pub(crate) type RowGrant = Option<Denial>;
+
+/// What [`Scheduler::prepare_step`] found to do.
+pub(crate) enum Prepared<P, Exclusive, Barrier> {
+    Action(SchedulerAction<P, Exclusive, Barrier>),
+    Plan(StepPlan),
+}
+
 pub(crate) enum SchedulerAction<P, Exclusive, Barrier> {
     Idle,
     Exclusive(Exclusive),
@@ -633,11 +694,16 @@ pub(crate) enum SchedulerAction<P, Exclusive, Barrier> {
         #[cfg(test)]
         plan: StepPlan,
         completed: Vec<TurnState<P>>,
-        preempted: Option<PreemptedTurn<P>>,
+        preempted: Option<Box<PreemptedTurn<P>>>,
         /// The step's only turn blocked: no other turn holds memory that
         /// could come back, so it stays running, unpreempted, for the model
         /// to reclaim for or fail (Splash `Engine::judge`).
         blocked_alone: Option<SeqId>,
+        /// [`JudgePolicy::Ledger`]: each blocked row and its denial.
+        blocked: Vec<(SeqId, Denial)>,
+        /// Some row of the step ran.
+        progressed: bool,
+        planned: Vec<SeqId>,
     },
 }
 
@@ -768,6 +834,12 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
 
     pub fn has_live_turns(&self) -> bool {
         !self.waiting.is_empty() || !self.running.is_empty()
+    }
+
+    /// Splash `Engine::lanes_` is not empty: a running turn, or a restore
+    /// a turn waits for.
+    pub fn has_resident(&self) -> bool {
+        !self.running.is_empty() || self.waiting.iter().any(|turn| turn.ssd_lane)
     }
 
     pub fn has_preempted(&self) -> bool {
@@ -1003,6 +1075,37 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
     pub fn preempt_running(&mut self, seq_id: SeqId) -> Option<TurnState<P>> {
         let index = self.running.iter().position(|turn| turn.seq_id == seq_id)?;
         Some(self.preempt_running_at(index))
+    }
+
+    /// Every turn the scheduler holds, waiting and running.
+    pub fn turns_mut(&mut self) -> impl Iterator<Item = &mut TurnState<P>> {
+        self.waiting.iter_mut().chain(self.running.iter_mut())
+    }
+
+    /// Every turn the scheduler holds, waiting and running.
+    pub fn turns(&self) -> impl Iterator<Item = &TurnState<P>> {
+        self.waiting.iter().chain(self.running.iter())
+    }
+
+    /// The suspended turn admission tries next (Splash `admitQueued`
+    /// resumes one per pass).
+    pub fn first_preempted(&self) -> Option<SeqId> {
+        self.waiting
+            .iter()
+            .find(|turn| turn.status == TurnStatus::Preempted)
+            .map(|turn| turn.seq_id)
+    }
+
+    pub fn running_turn_mut(&mut self, seq_id: SeqId) -> Option<&mut TurnState<P>> {
+        self.running.iter_mut().find(|turn| turn.seq_id == seq_id)
+    }
+
+    /// Splash `Engine::anotherResident`: a lane other than `seq_id`'s holds
+    /// memory that comes back when it ends, a running turn's or a restore's
+    /// it waits for.
+    pub fn another_resident(&self, seq_id: SeqId) -> bool {
+        self.running.iter().any(|turn| turn.seq_id != seq_id)
+            || self.waiting.iter().any(|turn| turn.ssd_lane)
     }
 
     /// Remove a running turn that ends without completing.
@@ -1247,6 +1350,26 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         }
     }
 
+    /// Splash `Engine::prepare`'s first half: a control command that is
+    /// due, or the admitted turns' plan.
+    pub fn prepare_step(&mut self) -> Result<Prepared<P, Exclusive, Barrier>, String> {
+        if let Some(action) = self.pop_control_if_due() {
+            return Ok(Prepared::Action(action));
+        }
+        self.admit_waiting()?;
+        if self.running.is_empty() {
+            return Ok(Prepared::Action(SchedulerAction::Idle));
+        }
+        let plan = self.build_plan();
+        if plan.rows.is_empty() {
+            return Ok(Prepared::Action(SchedulerAction::Idle));
+        }
+        Ok(Prepared::Plan(plan))
+    }
+
+    /// [`Self::prepare_step`] and [`Self::finish_step`] with every row
+    /// granted.
+    #[cfg(test)]
     pub fn drive_once<E>(
         &mut self,
         executor: &mut E,
@@ -1254,31 +1377,96 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
     where
         E: StepExecutor<P>,
     {
-        if let Some(action) = self.pop_control_if_due() {
-            return Ok(action);
+        match self.prepare_step().map_err(SchedulerError::InvalidResult)? {
+            Prepared::Action(action) => Ok(action),
+            Prepared::Plan(plan) => self.finish_step(plan, &[], executor, JudgePolicy::Legacy),
         }
-        self.admit_waiting()
-            .map_err(SchedulerError::InvalidResult)?;
-        if self.running.is_empty() {
-            return Ok(SchedulerAction::Idle);
+    }
+
+    /// Runs the granted rows of `plan` and applies the result; a denied
+    /// row reports zero progress (Splash: a refused lane leaves the plan).
+    pub fn finish_step<E>(
+        &mut self,
+        plan: StepPlan,
+        grants: &[RowGrant],
+        executor: &mut E,
+        policy: JudgePolicy,
+    ) -> Result<SchedulerAction<P, Exclusive, Barrier>, SchedulerError<E::Error>>
+    where
+        E: StepExecutor<P>,
+    {
+        let denied: HashMap<SeqId, Denial> = plan
+            .rows
+            .iter()
+            .zip(grants)
+            .filter_map(|(row, grant)| grant.map(|denial| (row.seq_id, denial)))
+            .collect();
+        let executed = StepPlan {
+            global_step: plan.global_step,
+            rows: plan
+                .rows
+                .iter()
+                .filter(|row| !denied.contains_key(&row.seq_id))
+                .cloned()
+                .collect(),
+            token_budget: plan.token_budget,
+        };
+        let result = if executed.rows.is_empty() {
+            StepResult {
+                rows: Vec::new(),
+                executed_decode_batch: 0,
+                executed_greedy_epilogue_batch: 0,
+                rows_alloc_evicted: 0,
+            }
+        } else {
+            executor
+                .execute(&executed, &mut self.running)
+                .map_err(SchedulerError::Executor)?
+        };
+        if result.rows.len() != executed.rows.len() {
+            return Err(SchedulerError::InvalidResult(format!(
+                "executor returned {} rows for a {}-row plan",
+                result.rows.len(),
+                executed.rows.len()
+            )));
         }
-        let plan = self.build_plan();
-        if plan.rows.is_empty() {
-            return Ok(SchedulerAction::Idle);
-        }
-        let result = executor
-            .execute(&plan, &mut self.running)
-            .map_err(SchedulerError::Executor)?;
+        let executed_decode_batch = result.executed_decode_batch;
+        let executed_greedy_epilogue_batch = result.executed_greedy_epilogue_batch;
+        let rows_alloc_evicted = result.rows_alloc_evicted;
+        let mut ran = result.rows.into_iter();
+        let rows: Vec<RowStepResult> = plan
+            .rows
+            .iter()
+            .filter_map(|row| {
+                if denied.contains_key(&row.seq_id) {
+                    Some(RowStepResult {
+                        seq_id: row.seq_id,
+                        num_computed_tokens: 0,
+                        generated_token: None,
+                        speculative: None,
+                        finished: false,
+                        allocation_blocked: true,
+                        prefill_micros: 0,
+                    })
+                } else {
+                    ran.next()
+                }
+            })
+            .collect();
+        let result = StepResult {
+            rows,
+            executed_decode_batch,
+            executed_greedy_epilogue_batch,
+            rows_alloc_evicted,
+        };
         let blocked_rows: HashSet<SeqId> = result
             .rows
             .iter()
             .filter(|row| row.allocation_blocked)
             .map(|row| row.seq_id)
             .collect();
-        let executed_decode_batch = result.executed_decode_batch;
-        let executed_greedy_epilogue_batch = result.executed_greedy_epilogue_batch;
-        let rows_alloc_evicted = result.rows_alloc_evicted;
-        let planned_decode_rows = plan
+        let progressed = result.rows.iter().any(|row| !row.allocation_blocked);
+        let planned_decode_rows = executed
             .rows
             .iter()
             .filter(|row| row.kind == StepKind::Decode)
@@ -1317,20 +1505,47 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
 
         let mut preempted = None;
         let mut blocked_alone = None;
-        if !blocked_rows.is_empty()
-            && let Some(index) = self
-                .running
-                .iter()
-                .rposition(|turn| turn.status == TurnStatus::Running)
-        {
-            let another_lane =
-                self.running.len() > 1 || self.waiting.iter().any(|turn| turn.ssd_lane);
-            if !another_lane {
-                blocked_alone = Some(self.running[index].seq_id);
-            } else {
-                let turn = self.preempt_running_at(index);
-                let blocked = blocked_rows.contains(&turn.seq_id);
-                preempted = Some(PreemptedTurn { turn, blocked });
+        let mut blocked = Vec::new();
+        match policy {
+            JudgePolicy::Ledger => {
+                if !denied.is_empty() && progressed {
+                    self.stats.replans = self.stats.replans.saturating_add(1);
+                }
+                // A row the executor blocked after its claim was granted
+                // lacked KV blocks.
+                let executor_kv = Denial {
+                    blocks: Some(BlockRefusal::default()),
+                    ..Denial::default()
+                };
+                blocked = plan
+                    .rows
+                    .iter()
+                    .filter(|row| blocked_rows.contains(&row.seq_id))
+                    .map(|row| {
+                        (
+                            row.seq_id,
+                            denied.get(&row.seq_id).copied().unwrap_or(executor_kv),
+                        )
+                    })
+                    .collect();
+            }
+            JudgePolicy::Legacy => {
+                if !blocked_rows.is_empty()
+                    && let Some(index) = self
+                        .running
+                        .iter()
+                        .rposition(|turn| turn.status == TurnStatus::Running)
+                {
+                    let another_lane =
+                        self.running.len() > 1 || self.waiting.iter().any(|turn| turn.ssd_lane);
+                    if !another_lane {
+                        blocked_alone = Some(self.running[index].seq_id);
+                    } else {
+                        let turn = self.preempt_running_at(index);
+                        let blocked = blocked_rows.contains(&turn.seq_id);
+                        preempted = Some(Box::new(PreemptedTurn { turn, blocked }));
+                    }
+                }
             }
         }
 
@@ -1346,12 +1561,24 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         }
         self.running = retained;
         Ok(SchedulerAction::Stepped {
+            planned: plan.rows.iter().map(|row| row.seq_id).collect(),
             #[cfg(test)]
             plan,
             completed,
             preempted,
             blocked_alone,
+            blocked,
+            progressed,
         })
+    }
+
+    /// Splash `Engine::laneToYield`: the running lane of the lowest rank.
+    pub fn lane_to_yield(&self) -> Option<SeqId> {
+        self.running
+            .iter()
+            .filter(|turn| turn.status == TurnStatus::Running)
+            .min_by_key(|turn| turn.claim_rank())
+            .map(|turn| turn.seq_id)
     }
 
     fn apply_result(&mut self, plan: &StepPlan, result: StepResult) -> Result<(), String> {
@@ -2028,17 +2255,17 @@ mod tests {
             ..MockStep::default()
         };
         let SchedulerAction::Stepped {
-            preempted:
-                Some(PreemptedTurn {
-                    turn: victim,
-                    blocked,
-                }),
+            preempted: Some(preempted),
             blocked_alone: None,
             ..
         } = scheduler.drive_once(&mut step).expect("blocked step")
         else {
             panic!("expected a preempted victim");
         };
+        let PreemptedTurn {
+            turn: victim,
+            blocked,
+        } = *preempted;
         assert_eq!(victim.seq_id, 2);
         assert!(blocked, "the victim blocked its own step");
         assert_eq!(scheduler.stats().preemptions, 1);
@@ -2113,17 +2340,17 @@ mod tests {
         scheduler.park_waiting_for_ssd(2).expect("park SSD turn");
         step.allocation_blocked.insert(1);
         let SchedulerAction::Stepped {
-            preempted:
-                Some(PreemptedTurn {
-                    turn: victim,
-                    blocked,
-                }),
+            preempted: Some(preempted),
             blocked_alone: None,
             ..
         } = scheduler.drive_once(&mut step).expect("blocked step")
         else {
             panic!("a turn beside an SSD lane must yield, not fail alone");
         };
+        let PreemptedTurn {
+            turn: victim,
+            blocked,
+        } = *preempted;
         assert_eq!(victim.seq_id, 1);
         assert!(blocked);
         assert!(!victim.ssd_lane);
@@ -2221,7 +2448,7 @@ mod tests {
         let PreemptedTurn {
             turn: victim,
             blocked,
-        } = preempted.expect("one victim");
+        } = *preempted.expect("one victim");
         assert_eq!(victim.seq_id, 3, "newest running row is the LIFO victim");
         assert!(!blocked, "row 1 blocked, not the victim");
         assert_eq!(victim.status, TurnStatus::Preempted);
@@ -2531,5 +2758,44 @@ mod tests {
             rows(&scheduler.build_plan()),
             [(7, StepKind::Prefill, 6219)]
         );
+    }
+
+    /// Splash `Engine::laneToYield`: the running lane of the lowest rank
+    /// yields; a prefilling lane before a decoding one, then fewer
+    /// completed tokens, then the newest.
+    /// Mutation Y1: the newest running turn (`rposition`) → red (3, the
+    /// newest, decoding with 900 completed, instead of 2).
+    #[test]
+    fn yield_order_follows_rank() {
+        // (seq, prompt, computed, arrival)
+        let lanes = |turns: &[(SeqId, u32, u32, u64)]| {
+            let mut scheduler = Scheduler::<_, (), ()>::new(4, 64).expect("scheduler");
+            for &(seq, prompt, computed, arrival) in turns {
+                let mut turn = TurnState::new(
+                    seq,
+                    vec![1; prompt as usize],
+                    0,
+                    Vec::new(),
+                    None,
+                    "payload",
+                )
+                .expect("turn");
+                turn.num_computed_tokens = computed;
+                turn.num_tokens = computed.max(prompt) + u32::from(computed >= prompt);
+                turn.arrival_order = arrival;
+                turn.status = TurnStatus::Running;
+                scheduler.running.push(turn);
+            }
+            scheduler.lane_to_yield()
+        };
+        assert_eq!(
+            lanes(&[(1, 800, 900, 0), (2, 1000, 300, 1), (3, 1000, 100, 2)]),
+            Some(3)
+        );
+        assert_eq!(
+            lanes(&[(1, 100, 500, 0), (2, 100, 200, 1), (3, 100, 900, 2)]),
+            Some(2)
+        );
+        assert_eq!(lanes(&[(1, 1000, 100, 0), (2, 1000, 100, 1)]), Some(2));
     }
 }

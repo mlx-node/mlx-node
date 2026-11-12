@@ -71,10 +71,12 @@ impl Qwen35Inner {
             dflash2: None,
             dflash2_context: None,
             dflash2_turn_state: None,
+            serial_decode: None,
             dflash2_prefix,
             dflash2_states,
             cache_recency,
             memory_plan: None,
+            memory_registration: None,
             max_memory_bytes: None,
             max_context: None,
             caches: None,
@@ -211,23 +213,44 @@ impl Qwen35Inner {
             max_seq_len: Some(max_seq_len),
             max_batch_size: Some(32),
         };
-        let allocator = Arc::new(std::sync::Mutex::new(
-            mlx_paged_attn::BlockAllocator::with_recency(
-                num_blocks,
-                max_num_blocks,
-                block_size,
-                Arc::clone(&self.cache_recency),
-            ),
-        ));
-        let pool =
-            mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, max_num_blocks, cache_dtype)
-                .map_err(|e| {
-                    Error::from_reason(format!("Failed to construct Qwen3.5 KV pool: {e}"))
-                })?;
-        let mut adapter =
-            PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
-                Error::from_reason(format!("Failed to construct Qwen3.5 paged adapter: {e}"))
-            })?;
+        // A new registration replaces the old one, which unregisters first.
+        self.memory_registration = None;
+        let governor = crate::engine::governor::governor();
+        let recency = Arc::clone(&self.cache_recency);
+        let (registration, mut adapter) = governor
+            .load_pool(
+                crate::engine::governor::governor::ModelRegistration {
+                    model_id: self.model_id,
+                    hard_budget: plan.hard_budget_bytes,
+                    untracked: plan.untracked_reserve_bytes(),
+                    page_bytes: bytes_per_block,
+                },
+                u64::from(num_blocks).saturating_mul(bytes_per_block),
+                || -> std::result::Result<PagedKVCacheAdapter, String> {
+                    let allocator = Arc::new(std::sync::Mutex::new(
+                        mlx_paged_attn::BlockAllocator::with_recency(
+                            num_blocks,
+                            max_num_blocks,
+                            block_size,
+                            Arc::clone(&recency),
+                        ),
+                    ));
+                    let pool = mlx_paged_attn::LayerKVPool::new(
+                        pa_config,
+                        num_blocks,
+                        max_num_blocks,
+                        cache_dtype,
+                    )
+                    .map_err(|e| format!("Failed to construct Qwen3.5 KV pool: {e}"))?;
+                    let adapter = PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size)
+                        .map_err(|e| {
+                        format!("Failed to construct Qwen3.5 paged adapter: {e}")
+                    })?;
+                    Ok(adapter)
+                },
+            )
+            .map_err(Error::from_reason)?;
+        adapter.set_admission(Arc::new(governor));
         if num_blocks < max_num_blocks {
             adapter.set_extent_growth(
                 crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks(bytes_per_block),
@@ -246,6 +269,7 @@ impl Qwen35Inner {
             max_seq_len,
             format.as_str(),
         );
+        self.memory_registration = Some(registration);
         self.memory_plan = Some(plan);
         Ok(())
     }

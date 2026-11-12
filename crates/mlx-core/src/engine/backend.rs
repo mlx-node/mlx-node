@@ -216,11 +216,20 @@ pub(crate) trait ChunkSink {
     fn progress(&self) -> Option<&Arc<TurnProgress>> {
         None
     }
+
+    /// The turn was ended by `ChatStreamHandle::stop`, not by a cancel.
+    fn stop_requested(&self) -> bool {
+        false
+    }
 }
 
 impl ChunkSink for crate::model_thread::StreamTx<ChatStreamChunk> {
     fn progress(&self) -> Option<&Arc<TurnProgress>> {
         crate::model_thread::StreamTx::progress(self)
+    }
+
+    fn stop_requested(&self) -> bool {
+        crate::model_thread::StreamTx::stop_requested(self)
     }
 
     fn send(&self, mut chunk: Result<ChatStreamChunk>) {
@@ -230,7 +239,7 @@ impl ChunkSink for crate::model_thread::StreamTx<ChatStreamChunk> {
             && done.done
             && done.finish_reason.as_deref() == Some("cancelled")
             && done.num_tokens.is_some_and(|tokens| tokens > 0)
-            && self.stop_requested()
+            && crate::model_thread::StreamTx::stop_requested(self)
         {
             done.finish_reason = Some("stop".to_string());
         }

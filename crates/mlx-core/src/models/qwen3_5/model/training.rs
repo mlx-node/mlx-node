@@ -1460,7 +1460,7 @@ impl Qwen35Inner {
     }
 
     fn paged_teacher_forced_prefill(&mut self, ids: &[u32]) -> Result<MxArray> {
-        use crate::models::qwen3_5::dflash2_turn::{Keep, ensure_paged_pool_keeping, reclaiming};
+        use crate::models::qwen3_5::dflash2_turn::{Keep, claimed};
         self.init_caches_sync()?;
         let block_size = self
             .paged_adapter
@@ -1472,8 +1472,7 @@ impl Qwen35Inner {
             tokens: ids,
             keys: None,
         };
-        ensure_paged_pool_keeping(self, ids, keep);
-        reclaiming(self, keep, |inner| {
+        claimed(self, keep, |inner| {
             inner
                 .paged_adapter
                 .as_mut()

@@ -931,6 +931,7 @@ module.exports.getMemorySnapshot = nativeBinding.getMemorySnapshot;
 module.exports.getProfilingData = nativeBinding.getProfilingData;
 module.exports.ggufArchitecture = nativeBinding.ggufArchitecture;
 module.exports.isProfilingEnabled = nativeBinding.isProfilingEnabled;
+module.exports.memoryGovernorStatus = nativeBinding.memoryGovernorStatus;
 module.exports.memoryStats = nativeBinding.memoryStats;
 module.exports.MultimodalContentOrder = nativeBinding.MultimodalContentOrder;
 module.exports.OutputFormat = nativeBinding.OutputFormat;

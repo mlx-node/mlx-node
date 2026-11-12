@@ -204,6 +204,40 @@ export function isCapacityExhaustedError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith('capacity_exhausted:');
 }
 
+/**
+ * The native scheduler gave up waiting for memory within its wait limit
+ * (Splash `ResourceTimeout`): the server answers 503 and the client retries.
+ * Takes an error or a streamed error's message.
+ */
+export function isResourceTimeoutError(error: unknown): boolean {
+  return errorText(error).startsWith('resource_timeout:');
+}
+
+/**
+ * A GPU command exhausted Metal memory; the native model failed its running
+ * requests and reset its caches (Splash `metal_out_of_memory`): the server
+ * answers 503 and the client retries. Takes an error or a streamed error's
+ * message.
+ */
+export function isMetalOutOfMemoryError(error: unknown): boolean {
+  return errorText(error).startsWith('metal_out_of_memory:');
+}
+
+/** The code of a native failure the client retries after a second (503), else null. */
+export function retryableErrorCode(error: unknown): 'resource_timeout' | 'metal_out_of_memory' | null {
+  if (isResourceTimeoutError(error)) {
+    return 'resource_timeout';
+  }
+  if (isMetalOutOfMemoryError(error)) {
+    return 'metal_out_of_memory';
+  }
+  return null;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+}
+
 /** Physical and trained context limits captured by a native model at load. */
 export interface SessionContextLimits {
   trainedWindowTokens: number;

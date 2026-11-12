@@ -18,25 +18,40 @@ use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine;
 use crate::engine::backend::{
-    ChunkSink, PagedBackend, PagedPrefix, StreamEmitter, ThinkingSetup, TurnOutput,
+    ChunkSink, PagedBackend, PagedPrefix, ResetScope, StreamEmitter, ThinkingSetup, TurnOutput,
     TurnTokenObserver,
 };
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
-use crate::engine::model_command::{FamilyCommand, ModelCommand, handle_model_command};
-use crate::engine::reclaim::{
-    DraftReclaim, DraftRefusal, Freed, KvNeed, KvReclaim, MetBefore, Reach, Unit, UnitKey,
-    free_for_draft, free_for_kv,
+use crate::engine::governor::allocate::{
+    Admission, Denial, KvAdmission, Refusal, StateAdmission, UnitSources, Verdict, allocate,
+    capacity_exhausted, judge, page_shortfall,
 };
+use crate::engine::governor::governor::{
+    ClaimHandle, ClaimRef, Failure, Governor, MemoryAccounts, Reservation, ResourceWaitStatus,
+    Scope, next_request_id,
+};
+use crate::engine::governor::ledger::{
+    CertainReuse, ClaimClass, ClaimRank, ClaimSpec, Need, NeedTiming, ReachClass, Stage,
+    Taken as LedgerTaken, UnitKey as LedgerKey, Victim, VictimQuery, VictimSource, WantedChains,
+};
+use crate::engine::governor::metrics::{GapClock, PassWork, Timeline, TtftClock, WholeTurnScope};
+use crate::engine::governor::wait::{
+    LaneWork, ResourceWait, WaitReason, Waiter, defer_resource_retry, note_refusal,
+    resource_timeout, retry_ready, sync_claims, tick,
+};
+use crate::engine::model_command::{FamilyCommand, ModelCommand, handle_model_command};
 use crate::engine::scheduler::{
-    BlockTelemetry, PreemptedTurn, PreemptionMode, PreemptionReplay, RowStepResult, Scheduler,
-    SchedulerAction, SchedulerError, StepExecutor, StepKind, StepPlan, StepResult, TurnState,
-    install_preemption_replay, is_paged_allocation_blocked,
+    BlockTelemetry, JudgePolicy, PreemptedTurn, PreemptionMode, PreemptionReplay, Prepared,
+    RowGrant, RowStepResult, Scheduler, SchedulerAction, SchedulerError, StepExecutor, StepKind,
+    StepPlan, StepResult, TurnState, TurnStatus, install_preemption_replay,
+    is_paged_allocation_blocked,
 };
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::model_thread::{LoopControl, ResponseTx, StreamTx};
 use crate::sampling::{check_repetition_cutoff, sample};
 use crate::stream::{DeviceType, Stream, StreamContext, WiredResidency};
 use crate::tokenizer::Qwen3Tokenizer;
+use crate::transformer::paged_kv_cache_adapter::BlockRefusal;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 
 /// Uninhabited restore ticket used by cache managers whose prefix restore is
@@ -170,45 +185,44 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
 
     fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter>;
     fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter>;
-    /// The family takes a refused KV reservation's units in one stamp order
-    /// (`crate::engine::reclaim`), at the pool's cap too.
+    /// The family's memory is the governor's ledger: its rows claim what
+    /// their steps allocate and its blocked rows are judged as Splash's
+    /// (`JudgePolicy::Ledger`).
     fn reclaims_in_order(&self) -> bool {
         false
     }
-    fn sync_state_marks(&mut self) {}
-    /// Bytes every state unit could free (an upper bound); the states turns
-    /// use count only with `in_use`.
-    fn state_reach_bytes(&self, _in_use: bool) -> u64 {
+    /// The model's id with the memory governor; 0 when not registered.
+    fn memory_model(&self) -> u64 {
         0
     }
-    fn oldest_state_unit(
-        &self,
-        _at_cap: bool,
-        _skip: &HashSet<UnitKey>,
-        _in_use: bool,
-    ) -> Option<Unit> {
+    fn sync_state_marks(&mut self) {}
+    /// The memory governor the model registered with.
+    fn memory_governor(&self) -> Option<&'static Governor> {
         None
     }
-    /// Takes one state unit; false when it freed nothing.
-    fn take_state_unit(&mut self, _key: &UnitKey) -> bool {
-        false
+    /// The model's units on the ledger's order, in its take order (Splash's
+    /// cache walk), none that `kept` restores through; the scheduler adds
+    /// the idle owners.
+    fn victim_units(&self, _query: &VictimQuery, _kept: &[u32]) -> Vec<Victim> {
+        Vec::new()
     }
-    /// Bytes of the rebuilt caches nothing holds (image features).
-    fn rebuilt_bytes(&self) -> u64 {
-        0
+    fn take_victim(&mut self, _query: &VictimQuery, _victim: &Victim) -> LedgerTaken {
+        LedgerTaken::default()
     }
-    /// Drops the least recently used rebuilt-cache unit nothing holds.
-    fn release_one_rebuilt(&mut self) -> bool {
-        false
+    /// A GPU command exhausted Metal memory: every cache its writes may
+    /// have reached goes (Splash restarts the engine).
+    /// The model's accounts on the governor's books.
+    fn memory_accounts(&self) -> Option<MemoryAccounts> {
+        None
     }
-    /// The take order for `need`, keeping `keep`'s own entries.
-    fn reclaim_kv(&mut self, _need: KvNeed, _keep: &[u32]) -> Freed {
-        Freed::Short
+    fn reset_after_gpu_oom(&mut self) -> Result<()> {
+        self.reset_caches(ResetScope::Command)
     }
-    /// Marked cache-only blocks `prompt` hits: its admission is charged no
-    /// block for them.
-    fn marked_hit_blocks(&self, _prompt: &[u32]) -> u32 {
-        0
+    /// Each planned row's claim of what its step allocates (Splash
+    /// `Engine::prepare`); every row is granted unclaimed by default.
+    fn claim_step_rows(state: &mut HybridSchedulerState<Self>, plan: &StepPlan) -> StepClaims {
+        let _ = state;
+        StepClaims::granted(plan)
     }
     fn scheduler_cache_available(&self) -> bool {
         self.paged_adapter().is_some()
@@ -260,7 +274,7 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     /// blocked step reclaims, then preempts, and a lone blocked row fails.
     /// Otherwise the whole turn is booked at admission.
     fn scheduler_books_on_demand(&self) -> bool {
-        !scheduler_reserve_full_isl()
+        false
     }
     /// The window a scheduled turn clamps on when the family's memory plan
     /// sets it. A plan that prices the draft state into its lane answers one
@@ -739,23 +753,6 @@ fn grow_needed_blocks(
     (shortfall_blocks > 0).then_some(shortfall_blocks)
 }
 
-/// Blocks free plus evictable blocks lack for `need_bytes` at the pool's
-/// cap, where only a reclaim adds takeable blocks. `None` below the cap or
-/// when nothing is short.
-fn cap_shortfall_blocks(snapshot: &SchedulerCacheSnapshot, need_bytes: u64) -> Option<u32> {
-    if snapshot.blocks.total_blocks < snapshot.max_total_blocks {
-        return None;
-    }
-    let bytes_per_block = snapshot.bytes_per_block.max(1);
-    let available = u64::from(snapshot.blocks.free_blocks)
-        .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
-        .saturating_mul(bytes_per_block);
-    let short = need_bytes
-        .saturating_sub(available)
-        .div_ceil(bytes_per_block);
-    (short > 0).then(|| short.min(u64::from(u32::MAX)) as u32)
-}
-
 /// Keep-live blocks already allocated for `seq_id` that a continuation
 /// will reuse. Subtracted from `reservation_blocks` at admit so the
 /// full-prompt ISL is not charged on top of KV that is neither free nor
@@ -795,18 +792,6 @@ fn scheduler_watermark_fraction() -> f64 {
             .and_then(|value| value.parse::<f64>().ok())
             .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
             .unwrap_or(0.05)
-    })
-}
-
-fn scheduler_reserve_full_isl() -> bool {
-    static VALUE: OnceLock<bool> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var("MLX_SCHED_RESERVE_FULL_ISL").map_or(true, |value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "no" | "off"
-            )
-        })
     })
 }
 
@@ -957,49 +942,43 @@ fn grow_needed_blocks_for(
     (blocks <= f64::from(room)).then_some(blocks as u32)
 }
 
-/// `grow_needed_blocks_for` for a family whose grow takes in order: a need
-/// past the room grows to the max pool and takes the rest (Splash
-/// `Engine::allocate` frees before the claim waits). That count is sized
-/// for the max pool's watermark, or the take falls short of admission.
-fn grow_or_take_needed_blocks_for(
-    snapshot: &SchedulerCacheSnapshot,
-    decision: &engine::scheduler::MemoryAdmission,
-    watermark_fraction: f64,
-) -> Option<u32> {
-    if snapshot.blocks.total_blocks >= snapshot.max_total_blocks {
-        return None;
+fn is_cancelled<P>(turn: &TurnState<P>) -> bool {
+    turn.cancelled
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+}
+
+fn stop_requested<P>(turn: &TurnState<ScheduledTurn<P>>) -> bool {
+    match &turn.payload.response {
+        ScheduledReply::Stream(stream) => stream.stop_requested(),
+        ScheduledReply::Sync(_) => false,
     }
-    if let Some(blocks) = grow_needed_blocks_for(snapshot, decision, watermark_fraction) {
-        return Some(blocks);
-    }
-    let bytes_per_block = snapshot.bytes_per_block.max(1);
-    let available = u64::from(snapshot.blocks.free_blocks)
-        .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
-        .saturating_mul(bytes_per_block);
-    let watermark = if decision.watermark_bytes > 0 {
-        let capacity =
-            u64::from(snapshot.max_total_blocks).saturating_mul(snapshot.bytes_per_block);
-        ((capacity as f64) * watermark_fraction.clamp(0.0, 1.0)).ceil() as u64
-    } else {
-        0
-    };
-    let short = decision
-        .reserved_block_bytes
-        .saturating_add(decision.reserved_state_bytes)
-        .saturating_add(watermark)
-        .saturating_sub(available)
-        .div_ceil(bytes_per_block);
-    (short > 0).then(|| short.min(u64::from(u32::MAX)) as u32)
+}
+
+/// A stop reached a turn that generated tokens: it ends as a completion
+/// (Splash `Engine::stop` → `settle` → `finish(Stop)`), never as a refusal.
+fn stopped_with_tokens<P>(turn: &TurnState<ScheduledTurn<P>>) -> bool {
+    stop_requested(turn) && !turn.payload.generated_tokens.is_empty()
+}
+
+/// A running turn's stop counts the token its last prefill slice sampled
+/// (Splash `Engine::stop` reads `generatedTokens`): its decode row commits
+/// it and ends `Stop`.
+fn stopped_after_sampling<P>(turn: &TurnState<ScheduledTurn<P>>) -> bool {
+    stop_requested(turn) && turn.token_history.len() > turn.prompt_tokens as usize
+}
+
+/// A failed prefill slice of a stopped turn ends `Stop`, unless the GPU ran
+/// out of memory: that failure must reach the restart (Splash restarts on
+/// `metal_out_of_memory` however the request ended).
+fn failed_slice_vacates<P>(turn: &mut TurnState<ScheduledTurn<P>>, error: &Error) -> bool {
+    !crate::engine::governor::is_gpu_out_of_memory(&error.reason) && stop_vacates(turn)
 }
 
 /// A stopped turn that generated tokens and holds no pages ends as a
 /// completion; marks it and returns true.
 pub(crate) fn stop_vacates<P>(turn: &mut TurnState<ScheduledTurn<P>>) -> bool {
-    let stopped = match &turn.payload.response {
-        ScheduledReply::Stream(stream) => stream.stop_requested(),
-        ScheduledReply::Sync(_) => false,
-    };
-    if !stopped || turn.payload.generated_tokens.is_empty() {
+    if !stopped_with_tokens(turn) {
         return false;
     }
     turn.payload.vacated_stop = true;
@@ -1072,10 +1051,68 @@ pub(crate) struct ScheduledTurn<P> {
     pub(crate) vacated_stop: bool,
     pub(crate) allocation_failed: bool,
     pub(crate) preemption_replay: Option<PreemptionReplay>,
-    /// Token bound the off-pool state reservation was sized for. The block
-    /// reservation may cover fewer tokens (`MLX_SCHED_RESERVE_FULL_ISL=0`),
-    /// so a resume must not derive the bound from it.
+    /// Token bound the off-pool state reservation was sized for. An
+    /// on-demand block reservation covers fewer tokens, so a resume must
+    /// not derive the bound from it.
     pub(crate) requested_tokens: u32,
+    /// The request's memory claim (Splash `Request::claim`), from its
+    /// admission to its end.
+    pub(crate) claim: Option<ClaimHandle<'static>>,
+    /// The GDN cell its admission reserved, held until its first step ran
+    /// (the cell's arrays are allocated lazily).
+    pub(crate) cell: Option<Reservation<'static>>,
+    pub(crate) clock: TurnClock,
+}
+
+/// A scheduled request's clocks: what held it before its first tokens
+/// (Splash `Request::held`) and its token events, for decode gaps.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TurnClock {
+    ttft: TtftClock,
+    gap: GapClock,
+    token_events: u64,
+    seen_events: u64,
+}
+
+impl TurnClock {
+    /// Tokens went out to the client.
+    pub(crate) fn token_event(&mut self) {
+        self.token_events += 1;
+    }
+}
+
+/// When a command reached the model thread (Splash counts a request's TTFT
+/// from its submission) and the claimless timeline then.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Arrival {
+    at: Instant,
+    mark: Timeline,
+}
+
+/// A command off the channel, with its arrival.
+pub(crate) struct Queued<C> {
+    command: ModelCommand<C>,
+    arrival: Arrival,
+}
+
+impl<C> From<ModelCommand<C>> for Queued<C> {
+    fn from(command: ModelCommand<C>) -> Self {
+        Self {
+            command,
+            arrival: Arrival {
+                at: Instant::now(),
+                mark: Timeline::default(),
+            },
+        }
+    }
+}
+
+impl<C> std::ops::Deref for Queued<C> {
+    type Target = ModelCommand<C>;
+
+    fn deref(&self) -> &ModelCommand<C> {
+        &self.command
+    }
 }
 
 struct PreparedTurn {
@@ -1089,6 +1126,12 @@ struct PreparedTurn {
     block_size: u32,
     reservation_state_bytes: u64,
     requested_tokens: u32,
+    /// The request's claim, from its first admission attempt.
+    claim: Option<ClaimHandle<'static>>,
+    /// Splash `Request::resourceWait` before the request has a lane.
+    resource_wait: ResourceWait,
+    enqueued_at: Instant,
+    ttft: TtftClock,
 }
 
 struct PreparedDecodeRow {
@@ -1117,6 +1160,15 @@ pub(crate) struct HybridStepExecutor<'a, B: HybridSchedulerBackend> {
 impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
     pub(crate) fn new(inner: &mut B) -> HybridStepExecutor<'_, B> {
         HybridStepExecutor { inner }
+    }
+
+    /// A row's work is its request's (Splash `Engine::stateClaim`): what it
+    /// publishes claims with its rank and rights.
+    fn request_scope(turn: &TurnState<ScheduledTurn<B::PrefixState>>) -> Option<Scope> {
+        turn.payload
+            .claim
+            .as_ref()
+            .map(|claim| Scope::enter(claim.claim()))
     }
 
     fn blocked(row: &engine::scheduler::StepRow) -> RowStepResult {
@@ -1317,7 +1369,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 // A stop that lands inside a replay slice cancels the slice
                 // from the live flag; the turn still ends `Stop` on what it
                 // generated (Splash `Engine::stop` → `settle`).
-                if stop_vacates(turn) {
+                if failed_slice_vacates(turn, &error) {
                     return Ok(Self::end_row(turn, row));
                 }
                 return Ok(Self::fail(turn, row, error));
@@ -1416,6 +1468,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             progress.first_token();
         }
         if turn.payload.params.max_new_tokens == 0 {
+            turn.payload.clock.token_event();
             if turn.payload.params.report_performance {
                 turn.payload.first_token_instant = Some(Instant::now());
             }
@@ -1458,6 +1511,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         row: &PreparedDecodeRow,
         is_reasoning: bool,
     ) {
+        turn.payload.clock.token_event();
         turn.payload.profiler.mark_first_token();
         turn.payload.last_is_reasoning = is_reasoning;
         if B::CANCEL_PRECEDES_EOS && row.cancelled {
@@ -1838,6 +1892,7 @@ impl<B: HybridSchedulerBackend> StepExecutor<ScheduledTurn<B::PrefixState>>
                         planned.seq_id
                     ))
                 })?;
+            let _request = Self::request_scope(turn);
             rows[index] = Some(
                 self.execute_prefill(planned, turn)
                     .unwrap_or_else(|error| Self::fail(turn, planned, error)),
@@ -1874,171 +1929,250 @@ impl<B: HybridSchedulerBackend> StepExecutor<ScheduledTurn<B::PrefixState>>
     }
 }
 
-/// The scheduler side of the take order for a blocked step: the family's
-/// states beside the idle owners, each by its own stamp.
-struct SchedReclaim<'a, B: HybridSchedulerBackend> {
-    state: &'a mut HybridSchedulerState<B>,
-    victim: SeqId,
+/// A step's claims: each plan row's grant, and the bytes admitted for the
+/// lazy allocations its eval makes, held until the step has run.
+pub(crate) struct StepClaims {
+    pub(crate) grants: Vec<RowGrant>,
+    reservations: Vec<Reservation<'static>>,
 }
 
-impl<B: HybridSchedulerBackend> KvReclaim for SchedReclaim<'_, B> {
-    fn at_cap(&self) -> bool {
-        self.state
+impl StepClaims {
+    pub(crate) fn granted(plan: &StepPlan) -> Self {
+        Self {
+            grants: vec![None; plan.rows.len()],
+            reservations: Vec::new(),
+        }
+    }
+}
+
+/// The scheduler's units (Splash's cache walk): the model's beside the
+/// idle owners' kept tables and parked rows, in one stamp order, a state
+/// first on a tie. The claimant's own owner is no unit.
+pub(crate) struct SchedUnits<'a, B: HybridSchedulerBackend> {
+    pub(crate) state: &'a mut HybridSchedulerState<B>,
+    pub(crate) claimant: SeqId,
+    /// The prompt the claim restores through (Splash `VictimQuery::kept`).
+    pub(crate) kept: &'a [u32],
+}
+
+impl<B: HybridSchedulerBackend> SchedUnits<'_, B> {
+    /// An owner's blocks count for a blocks need, its parked row for a
+    /// bytes need; a need the host refused walks only what meets it in
+    /// place (Splash `Cache::walkFor`). Without certain reuse a claim
+    /// keeps the owners whose chains a waiting request restores.
+    fn owner_units(&self, query: &VictimQuery) -> Vec<Victim> {
+        let state = &*self.state;
+        let host_refused = query.need.host_refused;
+        let pages_only = host_refused && query.need.pages > 0;
+        let adapter = state.inner.paged_adapter();
+        let mut owners = state.idle_owners(self.claimant);
+        if query.rights.certain_reuse != CertainReuse::All {
+            let wanted = state
+                .memory_governor()
+                .wanted_chains(state.inner.memory_model());
+            owners.retain(|&seq_id| {
+                !state
+                    .owner_sequences
+                    .iter()
+                    .find(|(_, owner_seq)| **owner_seq == seq_id)
+                    .and_then(|(owner_id, _)| state.owner_states.get(owner_id))
+                    .is_some_and(|owner| wanted.keeps(B::owner_tokens(owner)))
+            });
+        }
+        let freed = if query.need.pages > 0 {
+            adapter
+                .map(|adapter| adapter.releasable_blocks_of(&owners))
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+        owners
+            .into_iter()
+            .map(|seq_id| {
+                let pages = adapter
+                    .and_then(|adapter| adapter.block_table_for(seq_id))
+                    .map_or(0, |table| {
+                        table
+                            .blocks()
+                            .iter()
+                            .filter(|block| freed.contains(&block.block_id))
+                            .count() as u32
+                    });
+                let bytes = if pages_only || !state.inner.has_scheduled_recurrent(seq_id) {
+                    0
+                } else {
+                    state.inner.recurrent_state_bytes()
+                };
+                let stamp = state.owner_stamp(seq_id);
+                Victim {
+                    key: LedgerKey::Owner(seq_id),
+                    stamp,
+                    bytes,
+                    pages,
+                    stage: Stage::FreeNow,
+                }
+            })
+            .filter(|unit| unit.bytes > 0 || unit.pages > 0)
+            .collect()
+    }
+}
+
+impl<B: HybridSchedulerBackend> VictimSource for SchedUnits<'_, B> {
+    fn units(&self, query: &VictimQuery) -> Vec<Victim> {
+        let mut units: Vec<(Victim, bool)> = self
+            .state
             .inner
-            .paged_adapter()
-            .is_none_or(PagedKVCacheAdapter::at_cap)
+            .victim_units(query, self.kept)
+            .into_iter()
+            .map(|unit| (unit, false))
+            .chain(self.owner_units(query).into_iter().map(|unit| (unit, true)))
+            .collect();
+        units.sort_by_key(|(unit, owner)| (unit.stage, unit.stamp, *owner));
+        units.into_iter().map(|(unit, _)| unit).collect()
     }
 
-    fn takeable(&self) -> u32 {
-        self.state
-            .inner
-            .paged_adapter()
-            .map_or(0, PagedKVCacheAdapter::takeable_blocks)
-    }
-
-    fn ungrown(&self) -> u32 {
-        self.state
-            .inner
-            .paged_adapter()
-            .map_or(0, PagedKVCacheAdapter::ungrown_blocks)
-    }
-
-    fn bytes_per_block(&self) -> u64 {
-        self.state
-            .inner
-            .paged_adapter()
-            .and_then(|adapter| adapter.bytes_per_block().ok())
-            .unwrap_or(0)
-    }
-
-    fn met(&mut self, need: KvNeed) -> bool {
-        self.state
-            .inner
-            .paged_adapter_mut()
-            .is_some_and(|adapter| adapter.kv_need_met(need.blocks, need.over_takeable))
-    }
-
-    fn grow_room(&self) -> u32 {
-        self.state
-            .inner
-            .paged_adapter()
-            .map_or(0, PagedKVCacheAdapter::last_grow_room)
-    }
-
-    fn sync_marks(&mut self) {
-        self.state.inner.sync_state_marks();
-    }
-
-    fn reach(&self, at_cap: bool, in_use: bool) -> Reach {
-        let owners = self.state.idle_owners(self.victim);
-        let adapter = self.state.inner.paged_adapter();
-        let releasable =
-            adapter.map_or(0, |adapter| adapter.releasable_blocks_of(&owners).len()) as u64;
-        let rows = (owners
-            .iter()
-            .filter(|&&seq_id| self.state.inner.has_scheduled_recurrent(seq_id))
-            .count() as u64)
-            .saturating_mul(self.state.inner.recurrent_state_bytes());
-        Reach {
-            blocks: u64::from(adapter.map_or(0, PagedKVCacheAdapter::marked_blocks))
-                .saturating_add(releasable),
-            bytes: if at_cap {
-                0
+    /// An owner's take credits the measured drop in MLX's active bytes and
+    /// the blocks it made takeable.
+    fn take(&mut self, query: &VictimQuery, victim: &Victim) -> LedgerTaken {
+        let LedgerKey::Owner(seq_id) = victim.key else {
+            return self.state.inner.take_victim(query, victim);
+        };
+        let takeable = |state: &HybridSchedulerState<B>| {
+            state
+                .inner
+                .paged_adapter()
+                .map_or(0, PagedKVCacheAdapter::takeable_blocks)
+        };
+        let active = crate::array::memory::active_memory_bytes();
+        let blocks = takeable(self.state);
+        if !self.state.release_owner(seq_id) {
+            return LedgerTaken::default();
+        }
+        let now_bytes = active.saturating_sub(crate::array::memory::active_memory_bytes());
+        let pages = takeable(self.state).saturating_sub(blocks);
+        LedgerTaken {
+            outcome: if now_bytes > 0 || pages > 0 {
+                crate::engine::governor::ledger::FreeOutcome::Met
             } else {
-                self.state
-                    .inner
-                    .state_reach_bytes(in_use)
-                    .saturating_add(rows)
+                crate::engine::governor::ledger::FreeOutcome::Short
             },
+            now_bytes,
+            later_bytes: 0,
+            pages,
+        }
+    }
+}
+
+impl<B: HybridSchedulerBackend> UnitSources for SchedUnits<'_, B> {
+    fn sources(&mut self) -> Vec<&mut dyn VictimSource> {
+        vec![self]
+    }
+}
+
+/// A row's step claim (Splash `growLane`): its KV to the work end, then
+/// its draft state's growth, a bytes claim.
+struct RowAdmission {
+    kv: KvAdmission<u32>,
+    state: Option<StateAdmission<'static>>,
+}
+
+impl Admission for RowAdmission {
+    fn granted(&self) -> bool {
+        self.kv.granted() && self.state.as_ref().is_none_or(Admission::granted)
+    }
+
+    fn failure(&self) -> Option<Failure> {
+        if self.kv.granted() {
+            self.state.as_ref().and_then(Admission::failure)
+        } else {
+            self.kv.failure()
         }
     }
 
-    fn oldest_state(&self, at_cap: bool, skip: &HashSet<UnitKey>, in_use: bool) -> Option<Unit> {
-        self.state.inner.oldest_state_unit(at_cap, skip, in_use)
-    }
-
-    fn oldest_kv(&self, at_cap: bool, skip: &HashSet<UnitKey>) -> Option<Unit> {
-        self.state.oldest_idle_owner(self.victim, !at_cap, skip)
-    }
-
-    fn take(&mut self, key: &UnitKey) -> bool {
-        match key {
-            UnitKey::Owner(seq_id) => self.state.release_owner(*seq_id),
-            _ => self.state.inner.take_state_unit(key),
+    fn in_place(&self, held: u32) -> Need {
+        if self.kv.granted() {
+            Need::default()
+        } else {
+            self.kv.in_place(held)
         }
     }
 
-    fn rebuilt_bytes(&self) -> u64 {
-        self.state.inner.rebuilt_bytes()
+    fn memory_denied(&self) -> bool {
+        if self.kv.granted() {
+            self.state.as_ref().is_some_and(Admission::memory_denied)
+        } else {
+            self.kv.memory_denied()
+        }
     }
 
-    fn rebuild_one(&mut self) -> bool {
-        self.state.inner.release_one_rebuilt()
+    fn blocks(&self) -> Option<BlockRefusal> {
+        if self.kv.granted() {
+            None
+        } else {
+            self.kv.blocks()
+        }
     }
+}
+
+/// Splash `Cache::ensureTokens`: `seq_id`'s KV up to `end` tokens, capped
+/// at the pool's capacity, as an allocation of `claim`.
+fn ensure_tokens(
+    adapter: Option<&mut PagedKVCacheAdapter>,
+    seq_id: SeqId,
+    end: u32,
+    claim: ClaimRef<'_>,
+) -> KvAdmission<u32> {
+    let Some(adapter) = adapter else {
+        return KvAdmission {
+            result: Ok(0),
+            refusal: None,
+            failure: None,
+        };
+    };
+    adapter.clear_refusals();
+    let current = adapter.current_token_count_for(seq_id).unwrap_or(0);
+    let end = end.min(adapter.max_capacity_tokens());
+    let result = adapter
+        .reserve_rows_for(seq_id, end.saturating_sub(current))
+        .map_err(Error::from_reason);
+    let refusal = if result.is_err() {
+        adapter.take_block_refusal()
+    } else {
+        None
+    };
+    KvAdmission {
+        result,
+        refusal,
+        failure: claim.governor.failure(claim.id),
+    }
+}
+
+/// What a request's admission claim decided (Splash `Engine::admit`).
+enum Admitted {
+    /// The GDN cell's reservation, when the request had none live.
+    Granted(Option<Reservation<'static>>),
+    Wait,
+    Fail(Error),
 }
 
 /// A running or preempted scheduled turn.
 type Turn<B> = TurnState<ScheduledTurn<<B as PagedBackend>::PrefixState>>;
 
-/// One step's need in the met list (Splash `Engine::allocate`'s `met`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StepNeed {
-    Blocks(u32),
-    DraftBytes(u64),
-}
-
-/// The draft need's units for a blocked step: the idle owners, by their
-/// own stamps. A row is bytes of the pool budget at any pool size.
-struct DraftUnits<'a, 'p, B: HybridSchedulerBackend> {
-    state: &'a mut HybridSchedulerState<B>,
-    victim: SeqId,
-    refused: &'p [(SeqId, DraftRefusal)],
-    parked: Option<&'p Turn<B>>,
-}
-
-impl<B: HybridSchedulerBackend> DraftReclaim for DraftUnits<'_, '_, B> {
-    fn short(&self) -> u64 {
-        self.state.draft_short_now(self.refused, self.parked)
-    }
-
-    fn reach(&self) -> u64 {
-        let owners = self.state.idle_owners(self.victim);
-        let adapter = self.state.inner.paged_adapter();
-        let bytes_per_block = adapter
-            .and_then(|adapter| adapter.bytes_per_block().ok())
-            .unwrap_or(0);
-        let blocks =
-            adapter.map_or(0, |adapter| adapter.releasable_blocks_of(&owners).len()) as u64;
-        let rows = owners
-            .iter()
-            .filter(|&&seq_id| self.state.inner.has_scheduled_recurrent(seq_id))
-            .count() as u64;
-        blocks
-            .saturating_mul(bytes_per_block)
-            .saturating_add(rows.saturating_mul(self.state.inner.recurrent_state_bytes()))
-    }
-
-    fn oldest(&self, skip: &HashSet<UnitKey>) -> Option<Unit> {
-        self.state.oldest_idle_owner(self.victim, true, skip)
-    }
-
-    fn take(&mut self, key: &UnitKey) -> bool {
-        match key {
-            UnitKey::Owner(seq_id) => self.state.release_owner(*seq_id),
-            _ => false,
-        }
-    }
-}
+type Action<B> = SchedulerAction<
+    ScheduledTurn<<B as PagedBackend>::PrefixState>,
+    Queued<<B as HybridSchedulerBackend>::FamilyCommand>,
+    ModelCommand<<B as HybridSchedulerBackend>::FamilyCommand>,
+>;
 
 pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     pub(crate) inner: B,
     enabled: bool,
     scheduler: Scheduler<
         ScheduledTurn<B::PrefixState>,
-        ModelCommand<B::FamilyCommand>,
+        Queued<B::FamilyCommand>,
         ModelCommand<B::FamilyCommand>,
     >,
-    pending: VecDeque<ModelCommand<B::FamilyCommand>>,
+    pending: VecDeque<Queued<B::FamilyCommand>>,
     prepared_waiting: Option<Box<PreparedTurn>>,
     pending_restores: HashMap<SeqId, B::RestoreTicket>,
     pub(crate) owner_sequences: HashMap<String, SeqId>,
@@ -2046,10 +2180,26 @@ pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     /// Turn-end stamp of each idle owner's kept table, on the model's one
     /// cache clock.
     owner_last_used: HashMap<SeqId, u64>,
-    /// Splash `Engine::allocate`'s met list for the blocked step's retries.
-    met_before: MetBefore<(SeqId, StepNeed)>,
-    /// The prompt an admission grow keeps (Splash `VictimQuery::kept`).
-    reclaim_keep: Vec<u32>,
+    /// The work end each row of the latest step claimed (Splash
+    /// `Denied::workEnd`): a lane that yields resumes to its own.
+    row_work_ends: HashMap<SeqId, u32>,
+    /// Splash `Engine::admissions_`.
+    admissions: u64,
+    /// The lanes the latest step ran (Splash's command in flight), read by
+    /// the next wait tick.
+    worked_lanes: Vec<LaneWork>,
+    /// The requests the published wanted chains were built from.
+    wanted_signature: Vec<(SeqId, usize)>,
+    /// What a step's GPU command that exhausted Metal memory reported.
+    gpu_oom: Option<String>,
+    /// The current drive pass: its start on the governor's clock and what
+    /// it ran.
+    pass_start: f64,
+    pass_work: PassWork,
+    /// What held the requests that have no claim and no row yet.
+    timeline: Timeline,
+    /// When the model's accounts are next published.
+    accounts_due: f64,
     next_seq_id: SeqId,
 }
 
@@ -2102,8 +2252,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             owner_sequences: HashMap::new(),
             owner_states: HashMap::new(),
             owner_last_used: HashMap::new(),
-            met_before: MetBefore::default(),
-            reclaim_keep: Vec::new(),
+            row_work_ends: HashMap::new(),
+            admissions: 0,
+            worked_lanes: Vec::new(),
+            wanted_signature: Vec::new(),
+            gpu_oom: None,
+            pass_start: 0.0,
+            pass_work: PassWork::default(),
+            timeline: Timeline::default(),
+            accounts_due: 0.0,
             next_seq_id: 1,
         })
     }
@@ -2300,7 +2457,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let Some(index) = release_index else {
             return DeferredCleanupProgress::None;
         };
-        let Some(command) = self.pending.remove(index) else {
+        let Some(Queued { command, arrival }) = self.pending.remove(index) else {
             return DeferredCleanupProgress::None;
         };
         match command.into_chat() {
@@ -2309,17 +2466,23 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 DeferredCleanupProgress::OwnerReleaseProcessed
             }
             Ok(chat) => {
-                self.pending.insert(index, ModelCommand::from_chat(chat));
+                self.pending.insert(
+                    index,
+                    Queued {
+                        command: ModelCommand::from_chat(chat),
+                        arrival,
+                    },
+                );
                 DeferredCleanupProgress::None
             }
             Err(command) => {
-                self.pending.insert(index, command);
+                self.pending.insert(index, Queued { command, arrival });
                 DeferredCleanupProgress::None
             }
         }
     }
 
-    fn prepare_chat(&mut self, command: ChatCmd) -> Option<Box<PreparedTurn>> {
+    fn prepare_chat(&mut self, command: ChatCmd, arrival: Arrival) -> Option<Box<PreparedTurn>> {
         let (messages, config, response, cancelled, kind, guard) = match command {
             ChatCmd::SessionStart {
                 messages,
@@ -2577,6 +2740,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             reservation_blocks,
             block_size,
             requested_tokens,
+            claim: None,
+            resource_wait: ResourceWait::default(),
+            enqueued_at: arrival.at,
+            ttft: TtftClock::queued(self.timeline.since(&arrival.mark)),
         }))
     }
 
@@ -2652,17 +2819,33 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     }
 
     /// Idle parked recurrent row that is not the candidate and is not in the
-    /// scheduler's running/waiting set. Unit-cap eviction only.
+    /// scheduler's running/waiting set. Unit-cap eviction only. A family on
+    /// the ledger evicts the oldest by its owner's stamp.
     fn idle_recurrent_victim(&self, seq_id: SeqId) -> Option<SeqId> {
-        self.owner_sequences
-            .values()
+        let idle = self.owner_sequences.values().copied().filter(|&candidate| {
+            candidate != seq_id
+                && self.inner.has_scheduled_recurrent(candidate)
+                && !self.scheduler.contains_seq(candidate)
+        });
+        if self.inner.reclaims_in_order() {
+            idle.min_by_key(|&candidate| (self.owner_stamp(candidate), candidate))
+        } else {
+            idle.min()
+        }
+    }
+
+    /// The turn-end stamp of an idle owner's kept table, on the model's
+    /// cache clock.
+    fn owner_stamp(&self, seq_id: SeqId) -> u64 {
+        self.owner_last_used
+            .get(&seq_id)
             .copied()
-            .filter(|&candidate| {
-                candidate != seq_id
-                    && self.inner.has_scheduled_recurrent(candidate)
-                    && !self.scheduler.contains_seq(candidate)
+            .or_else(|| {
+                self.inner
+                    .paged_adapter()
+                    .and_then(|adapter| adapter.turn_end_stamp(seq_id))
             })
-            .min()
+            .unwrap_or(0)
     }
 
     /// Idle owner that holds a recurrent row or a keep-live/cache table.
@@ -2690,44 +2873,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                         .is_some_and(|adapter| adapter.block_table_for(candidate).is_some()))
         });
         candidates
-    }
-
-    /// The idle owner with the oldest turn-end stamp that frees something: a
-    /// block, or a parked row when `rows_meet`. A block counts when
-    /// releasing every idle owner would free it. An owner the scheduler
-    /// never finished goes by its table's turn-end stamp.
-    fn oldest_idle_owner(
-        &self,
-        victim: SeqId,
-        rows_meet: bool,
-        skip: &HashSet<UnitKey>,
-    ) -> Option<Unit> {
-        let adapter = self.inner.paged_adapter();
-        let owners = self.idle_owners(victim);
-        let freed = adapter
-            .map(|adapter| adapter.releasable_blocks_of(&owners))
-            .unwrap_or_default();
-        owners
-            .into_iter()
-            .filter(|&seq_id| !skip.contains(&UnitKey::Owner(seq_id)))
-            .filter(|&seq_id| {
-                adapter.is_some_and(|adapter| adapter.table_holds_any(seq_id, &freed))
-                    || (rows_meet && self.inner.has_scheduled_recurrent(seq_id))
-            })
-            .map(|seq_id| {
-                let stamp = self
-                    .owner_last_used
-                    .get(&seq_id)
-                    .copied()
-                    .or_else(|| adapter.and_then(|adapter| adapter.turn_end_stamp(seq_id)))
-                    .unwrap_or(0);
-                (stamp, seq_id)
-            })
-            .min()
-            .map(|(stamp, seq_id)| Unit {
-                stamp,
-                key: UnitKey::Owner(seq_id),
-            })
     }
 
     /// Releases an idle owner's row, draft state and table.
@@ -2829,20 +2974,24 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
         }
         self.begin_scheduled_step();
+        let Ok(Ok((plan, claims))) = self.plan_and_claim() else {
+            return false;
+        };
+        let policy = self.judge_policy();
         let mut hooked = Hooked {
             executor: HybridStepExecutor::new(&mut self.inner),
             before_execute,
         };
-        let Ok(SchedulerAction::Stepped {
-            completed,
-            preempted,
-            blocked_alone,
-            ..
-        }) = self.scheduler.drive_once(&mut hooked)
+        let Ok(action) = self
+            .scheduler
+            .finish_step(plan, &claims.grants, &mut hooked, policy)
         else {
             return false;
         };
-        self.settle_step(completed, preempted, blocked_alone);
+        if !matches!(action, SchedulerAction::Stepped { .. }) {
+            return false;
+        }
+        self.settle_step(action);
         true
     }
 
@@ -2864,92 +3013,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return Ok(false);
         }
         Ok(true)
-    }
-
-    /// Frees memory for a blocked step without preempting `victim`. A
-    /// family that reclaims in order sends each need the step recorded
-    /// through its take order (Splash `MemoryLedger::free`): the refused KV
-    /// through states, idle owners and then the rebuilt caches; the refused
-    /// draft fits through the idle owners. Met in place, a count that
-    /// cannot cover the need takes nothing, else units go oldest first
-    /// until it is met; a need met or freed for once already stops, and a
-    /// step that recorded no need takes nothing (Splash `Engine::allocate`).
-    /// `reach_in_use`: the step's turn runs alone, so its KV need goes on to
-    /// the states suspended and running turns use, last (Splash
-    /// `Engine::growthClass`); a turn that yields beside another keeps them.
-    /// `parked` is the turn the step preempted: its state is in the draft
-    /// need. Every other family releases idle owners.
-    fn reclaim_for_blocked_step(
-        &mut self,
-        victim: SeqId,
-        reach_in_use: bool,
-        parked: Option<&Turn<B>>,
-    ) -> bool {
-        if !self.inner.reclaims_in_order() {
-            return self.reclaim_idle_owners(victim);
-        }
-        let (blocks, drafts) = self
-            .inner
-            .paged_adapter()
-            .map_or((None, Vec::new()), |adapter| {
-                (adapter.take_refusal(), adapter.take_draft_refusals())
-            });
-        let mut retry = false;
-        if let Some(blocks) = blocks {
-            let need = (victim, StepNeed::Blocks(blocks));
-            retry |= !self.met_before.seen(&need) && {
-                let freed = free_for_kv(
-                    &mut SchedReclaim {
-                        state: self,
-                        victim,
-                    },
-                    KvNeed {
-                        reach_in_use,
-                        ..KvNeed::in_place(blocks)
-                    },
-                );
-                self.met_before.retry(need, freed)
-            };
-        }
-        if let Some(bytes) = drafts.iter().map(|(_, refusal)| refusal.bytes).max() {
-            let need = (victim, StepNeed::DraftBytes(bytes));
-            retry |= !self.met_before.seen(&need) && {
-                let freed = free_for_draft(&mut DraftUnits {
-                    state: self,
-                    victim,
-                    refused: &drafts,
-                    parked,
-                });
-                self.met_before.retry(need, freed)
-            };
-        }
-        if !retry {
-            self.met_before.clear();
-        }
-        retry
-    }
-
-    /// The most any refused draft fit lacks now, each at its recorded rows,
-    /// over the running turns and the preempted one. An error reads as met:
-    /// the retried step meets it again and fails the turn with it.
-    fn draft_short_now(&self, refused: &[(SeqId, DraftRefusal)], parked: Option<&Turn<B>>) -> u64 {
-        let running = self.scheduler.running();
-        refused
-            .iter()
-            .filter_map(|&(seq_id, refusal)| {
-                let own = running
-                    .iter()
-                    .find(|turn| turn.seq_id == seq_id)
-                    .or(parked.filter(|turn| turn.seq_id == seq_id))?;
-                let others: Vec<&Turn<B>> = running
-                    .iter()
-                    .chain(parked)
-                    .filter(|turn| turn.seq_id != seq_id)
-                    .collect();
-                speculative::draft_shortfall(&self.inner, own, &others, refusal.queries).ok()
-            })
-            .max()
-            .unwrap_or(0)
     }
 
     /// Idle owners, one at a time, until one gives back pool blocks or a
@@ -2982,44 +3045,1217 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         false
     }
 
-    /// Ends the step's completed turns and handles its blocked one. False
-    /// when a turn blocked: no victim resumes in the same round.
-    fn settle_step(
-        &mut self,
-        completed: Vec<TurnState<ScheduledTurn<B::PrefixState>>>,
-        preempted: Option<PreemptedTurn<ScheduledTurn<B::PrefixState>>>,
-        blocked_alone: Option<SeqId>,
-    ) -> bool {
-        for turn in completed {
+    /// Ends the step's completed turns and settles its blocked rows. False
+    /// when a row blocked: no victim resumes in the same round.
+    fn settle_step(&mut self, step: Action<B>) -> bool {
+        let SchedulerAction::Stepped {
+            completed,
+            preempted,
+            blocked_alone,
+            blocked,
+            progressed,
+            planned,
+            ..
+        } = step
+        else {
+            return true;
+        };
+        let ledger = self.judge_policy() == JudgePolicy::Ledger;
+        for mut turn in completed {
+            if ledger {
+                self.note_gpu_oom(&mut turn.payload.failure);
+            }
             self.finish_completed(turn);
+        }
+        if ledger {
+            return self.settle_blocked(blocked, progressed, &planned);
         }
         if let Some(seq_id) = blocked_alone {
             self.handle_blocked_alone(seq_id);
             return false;
         }
         let Some(mut preempted) = preempted else {
-            self.met_before.clear();
             return true;
         };
         if self.inner.scheduler_books_on_demand() {
             // Its caches stay resident until handle_preempted releases them.
             preempted.turn.block_reservation_active = true;
             preempted.turn.recurrent_state_reservation_active = true;
-            if self.reclaim_for_blocked_step(preempted.turn.seq_id, false, Some(&preempted.turn)) {
+            if self.reclaim_idle_owners(preempted.turn.seq_id) {
                 self.scheduler.reinstate_running(preempted.turn);
                 return false;
             }
         }
-        self.handle_preempted(preempted);
+        self.handle_preempted(*preempted);
         false
     }
 
+    /// A family whose rows claim their memory is judged as Splash's;
+    /// every other family keeps the preempt-the-newest policy.
+    fn judge_policy(&self) -> JudgePolicy {
+        if self.inner.reclaims_in_order() {
+            JudgePolicy::Ledger
+        } else {
+            JudgePolicy::Legacy
+        }
+    }
+
+    fn memory_governor(&self) -> &'static Governor {
+        self.inner
+            .memory_governor()
+            .unwrap_or_else(crate::engine::governor::governor)
+    }
+
+    /// The KV a lane holds now, in tokens (Splash `Engine::kvCapacity`).
+    fn kv_capacity(&self, seq_id: SeqId) -> u32 {
+        self.inner
+            .scheduler_materialized_blocks(seq_id)
+            .saturating_mul(
+                self.inner
+                    .paged_adapter()
+                    .map_or(0, |adapter| adapter.block_size()),
+            )
+    }
+
+    fn yields_before(&self, a: SeqId, b: SeqId) -> bool {
+        let running = self.scheduler.running();
+        let turn = |seq_id: SeqId| running.iter().find(|turn| turn.seq_id == seq_id);
+        match (turn(a), turn(b)) {
+            (Some(a), Some(b)) => a.yields_before(b),
+            _ => false,
+        }
+    }
+
+    /// Splash `Engine::prepare` after its claims, and `Engine::refuse`. A
+    /// refusal no transfer returns and that is not KV yields the lane to
+    /// yield first when it holds its memory outside the step and yields
+    /// before the refused row. Otherwise a step that ran some rows replans
+    /// the refused ones at the next step, and a step that ran none waits
+    /// for memory on its way back, or judges the row that yields first.
+    fn settle_blocked(
+        &mut self,
+        blocked: Vec<(SeqId, Denial)>,
+        progressed: bool,
+        planned: &[SeqId],
+    ) -> bool {
+        if blocked.is_empty() {
+            return true;
+        }
+        let yielding = self.scheduler.lane_to_yield();
+        if let Some(yielding) = yielding
+            && !planned.contains(&yielding)
+            && let Some((_, denial)) = blocked.iter().find(|(seq_id, denial)| {
+                denial.blocks.is_none() && !denial.pending && self.yields_before(yielding, *seq_id)
+            })
+        {
+            let failure = denial.failure;
+            let target = self.kv_capacity(yielding);
+            self.yield_lane(yielding, target, failure);
+            return false;
+        }
+        if progressed {
+            return false;
+        }
+        if blocked.iter().any(|(_, denial)| denial.pending) {
+            self.defer_blocked(&blocked);
+            return false;
+        }
+        let Some(&(victim, denial)) = blocked.iter().reduce(|left, right| {
+            if self.yields_before(right.0, left.0) {
+                right
+            } else {
+                left
+            }
+        }) else {
+            return false;
+        };
+        let yielding = yielding.unwrap_or(victim);
+        match judge(&denial, self.scheduler.another_resident(yielding)) {
+            Verdict::Wait => self.defer_blocked(&blocked),
+            Verdict::Yield => {
+                let target = if blocked.iter().any(|(seq_id, _)| *seq_id == yielding) {
+                    self.row_work_ends
+                        .get(&yielding)
+                        .copied()
+                        .unwrap_or_else(|| self.kv_capacity(yielding))
+                } else {
+                    self.kv_capacity(yielding)
+                };
+                self.yield_lane(yielding, target, denial.failure);
+            }
+            Verdict::Fail => {
+                let what = if denial.blocks.is_some() {
+                    "KV target"
+                } else {
+                    "draft state"
+                };
+                let error =
+                    capacity_exhausted(what, denial.failure, &page_shortfall(denial.blocks));
+                self.memory_governor().capacity_exhausted();
+                if let Some(turn) = self.scheduler.take_running(victim) {
+                    self.fail_preempted(turn, error);
+                }
+            }
+        }
+        false
+    }
+
+    /// Splash `refuse`'s wait: every refused lane takes a retry deadline.
+    fn defer_blocked(&mut self, blocked: &[(SeqId, Denial)]) {
+        let governor = self.memory_governor();
+        let model = self.inner.memory_model();
+        let (now, epoch) = (governor.now(), governor.epoch(model));
+        let admissions = self.admissions;
+        for (seq_id, denial) in blocked {
+            if let Some(turn) = self.scheduler.running_turn_mut(*seq_id) {
+                defer_resource_retry(
+                    &mut turn.resource_wait,
+                    now,
+                    denial,
+                    WaitReason::Memory,
+                    true,
+                    admissions,
+                    epoch,
+                );
+            }
+        }
+    }
+
+    /// Splash `Engine::admit`'s KV refusal for a scheduled prepare (the
+    /// chain it restores, the pool grown for it): the scheduler judges what
+    /// the prepare's claim left beside the resident lanes. `None`: the
+    /// prepare failed for anything but memory. `Some(Err)`: the request
+    /// fails `capacity_exhausted`. `Some(Ok)`: it waits, deferred.
+    fn prefix_refused(
+        &mut self,
+        seq_id: SeqId,
+        wait: &mut ResourceWait,
+        has_lane: bool,
+    ) -> Option<std::result::Result<(), Error>> {
+        let denial = crate::engine::governor::governor::take_lane_denial()?;
+        let governor = self.memory_governor();
+        let model = self.inner.memory_model();
+        if judge(&denial, self.scheduler.another_resident(seq_id)) == Verdict::Fail {
+            governor.capacity_exhausted();
+            return Some(Err(Error::from_reason(capacity_exhausted(
+                "KV target",
+                denial.failure,
+                &page_shortfall(denial.blocks),
+            ))));
+        }
+        defer_resource_retry(
+            wait,
+            governor.now(),
+            &denial,
+            WaitReason::Memory,
+            has_lane,
+            self.admissions,
+            governor.epoch(model),
+        );
+        Some(Ok(()))
+    }
+
+    /// Splash `Engine::suspendForGrowth` → `suspendLane`: the lane is
+    /// vacated (its KV released, its history to replay), takes `target`
+    /// tokens of KV at once when it resumes, and waits as a memory
+    /// refusal; the resident lanes drain first.
+    fn yield_lane(&mut self, seq_id: SeqId, target: u32, failure: Option<Failure>) {
+        let Some(mut turn) = self.scheduler.preempt_running(seq_id) else {
+            return;
+        };
+        let governor = self.memory_governor();
+        let model = self.inner.memory_model();
+        let (now, epoch) = (governor.now(), governor.epoch(model));
+        // A lane vacated before its first step drops its admission's cell
+        // bytes: its resume reserves them again.
+        turn.payload.cell = None;
+        turn.resume_target = target;
+        defer_resource_retry(
+            &mut turn.resource_wait,
+            now,
+            &Denial {
+                failure,
+                ..Denial::default()
+            },
+            WaitReason::Memory,
+            true,
+            self.admissions,
+            epoch,
+        );
+        governor.lane_suspended(model, now, failure);
+        let blocked = self.row_work_ends.contains_key(&seq_id);
+        self.handle_preempted(PreemptedTurn { turn, blocked });
+    }
+
+    /// Splash `Engine::growthClass`: the lane that yields first reaches
+    /// only ordinary units while another lane is resident.
+    fn growth_class(&self, seq_id: SeqId) -> ReachClass {
+        if self.scheduler.lane_to_yield() == Some(seq_id) && self.scheduler.another_resident(seq_id)
+        {
+            ReachClass::Ordinary
+        } else {
+            ReachClass::InUse
+        }
+    }
+
+    /// The tokens a planned row's step writes up to (Splash
+    /// `Engine::workEndOf`): a prefill slice's end, or past a decode
+    /// row's pending token and its draft rows.
+    fn work_end(row: &engine::scheduler::StepRow, turn: &Turn<B>) -> u32 {
+        match row.kind {
+            StepKind::Prefill => row.token_start.saturating_add(row.num_tokens),
+            StepKind::Decode => turn
+                .num_tokens
+                .saturating_add(1)
+                .saturating_add(turn.decode_draft_allowance),
+        }
+    }
+
+    /// Splash `Engine::prepare`'s claims: in plan order each row grows its
+    /// lane to its work end under its request's InService claim
+    /// (`growLane`), a speculative decode row's draft-state growth a
+    /// bytes claim under the same one. A granted row's wait ends; a denied
+    /// row notes its refusal. A row refused for anything but memory runs
+    /// and fails in its step.
+    pub(crate) fn claim_rows_in_order(&mut self, plan: &StepPlan) -> StepClaims {
+        self.inner.sync_state_marks();
+        self.row_work_ends.clear();
+        let governor = self.memory_governor();
+        let model = self.inner.memory_model();
+        let mut claims = StepClaims {
+            grants: Vec::with_capacity(plan.rows.len()),
+            reservations: Vec::new(),
+        };
+        for row in &plan.rows {
+            // A cancelled or stopped row ends in its step and grows nothing.
+            if row.cancel_snapshot {
+                claims.grants.push(None);
+                continue;
+            }
+            let reach = self.growth_class(row.seq_id);
+            let Some(turn) = self.scheduler.running_turn_mut(row.seq_id) else {
+                claims.grants.push(None);
+                continue;
+            };
+            let work_end = Self::work_end(row, turn);
+            let hold_ended = turn.resource_wait.hold_ended;
+            let draft_from = turn.num_computed_tokens;
+            let speculative =
+                row.kind == StepKind::Decode && turn.payload.scheduled_speculation.is_some();
+            let mut spec = ClaimSpec {
+                cls: ClaimClass::InService,
+                request_id: 0,
+                rank: turn.claim_rank(),
+                reach,
+                timing: NeedTiming::CanWait,
+            };
+            let claim = match &turn.payload.claim {
+                Some(handle) => handle.claim(),
+                None => {
+                    spec.request_id = crate::engine::governor::governor::next_request_id();
+                    let handle = governor.open(spec, model);
+                    let claim = handle.claim();
+                    turn.payload.claim = Some(handle);
+                    claim
+                }
+            };
+            spec.request_id = governor.spec(claim.id).map_or(0, |open| open.request_id);
+            let draft_bytes = if speculative {
+                self.inner
+                    .scheduled_draft_state_held_bytes(work_end)
+                    .saturating_sub(self.inner.scheduled_draft_state_held_bytes(draft_from))
+            } else {
+                0
+            };
+            let seq_id = row.seq_id;
+            let mut units = SchedUnits {
+                state: &mut *self,
+                claimant: seq_id,
+                kept: &[],
+            };
+            let allocation = allocate(
+                claim,
+                spec,
+                Refusal::Waits,
+                hold_ended,
+                &mut units,
+                |units| {
+                    let kv = ensure_tokens(
+                        units.state.inner.paged_adapter_mut(),
+                        seq_id,
+                        work_end,
+                        claim,
+                    );
+                    let state = (kv.granted() && draft_bytes > 0)
+                        .then(|| StateAdmission(governor.try_reserve(draft_bytes)));
+                    RowAdmission { kv, state }
+                },
+            );
+            let admission = allocation.admission;
+            let denied = !admission.granted() && admission.memory_denied();
+            let (now, epoch) = (governor.now(), governor.epoch(model));
+            let Some(turn) = self.scheduler.running_turn_mut(row.seq_id) else {
+                claims.grants.push(None);
+                continue;
+            };
+            if denied {
+                note_refusal(&mut turn.resource_wait, now, &allocation.denial, epoch);
+                self.row_work_ends.insert(row.seq_id, work_end);
+                claims.grants.push(Some(allocation.denial));
+            } else {
+                turn.resource_wait = Default::default();
+                governor.ledger(|ledger| ledger.set_waiting(claim.id, false));
+                if let Some(Ok(reservation)) = admission.state.map(|state| state.0) {
+                    claims.reservations.push(reservation);
+                }
+                claims.reservations.extend(turn.payload.cell.take());
+                claims.grants.push(None);
+            }
+        }
+        claims
+    }
+
+    /// Splash `Engine::admit`'s claim class: a request starts beside a
+    /// resident lane (`Start`, which reaches no state a turn uses) or alone
+    /// in service.
+    fn admission_spec(&self, seq_id: SeqId, request_id: u64, rank: ClaimRank) -> ClaimSpec {
+        let start = self.scheduler.another_resident(seq_id);
+        ClaimSpec {
+            cls: if start {
+                ClaimClass::Start
+            } else {
+                ClaimClass::InService
+            },
+            request_id,
+            rank,
+            reach: if start {
+                ReachClass::Ordinary
+            } else {
+                ReachClass::InUse
+            },
+            timing: NeedTiming::CanWait,
+        }
+    }
+
+    /// The request's claim, opened at its first admission attempt.
+    fn request_claim(
+        governor: &'static Governor,
+        model: u64,
+        slot: &mut Option<ClaimHandle<'static>>,
+        spec: ClaimSpec,
+    ) -> ClaimRef<'static> {
+        slot.get_or_insert_with(|| governor.open(spec, model))
+            .claim()
+    }
+
+    /// Splash `Engine::admit`'s state claim: the GDN cell `seq_id`
+    /// activates, a bytes reservation (its arrays are allocated lazily).
+    /// `None` when the request's row is live already.
+    fn claim_cell(
+        &mut self,
+        seq_id: SeqId,
+        kept: &[u32],
+        claim: ClaimRef<'static>,
+        spec: ClaimSpec,
+        hold_ended: bool,
+    ) -> Option<crate::engine::governor::allocate::Allocation<StateAdmission<'static>>> {
+        if self.inner.has_scheduled_recurrent(seq_id) {
+            return None;
+        }
+        let bytes = self.inner.recurrent_state_bytes();
+        let governor = claim.governor;
+        let mut units = SchedUnits {
+            state: &mut *self,
+            claimant: seq_id,
+            kept,
+        };
+        Some(allocate(
+            claim,
+            spec,
+            Refusal::Waits,
+            hold_ended,
+            &mut units,
+            |_| StateAdmission(governor.try_reserve(bytes)),
+        ))
+    }
+
+    /// Splash `Engine::admitQueued` + `Engine::admit` for a new request on
+    /// the ledger. Nothing new starts while a lane is suspended or the
+    /// resident lanes drain; the unit cap waits for a lane without a
+    /// deadline. A refusal the judge fails gives up the request's own kept
+    /// table first (`droppedLease`): the prepare looks its chain up again.
+    fn admit_claimed(&mut self, prepared: &mut PreparedTurn) -> Admitted {
+        let governor = self.memory_governor();
+        let model = self.inner.memory_model();
+        let seq_id = prepared.seq_id;
+        let now = governor.now();
+        if self.scheduler.has_preempted()
+            || governor.draining_for_recovery(model, now, self.scheduler.has_resident())
+            || !retry_ready(&prepared.resource_wait, now, governor.epoch(model))
+        {
+            return Admitted::Wait;
+        }
+        if !self.ensure_recurrent_slot(seq_id) {
+            defer_resource_retry(
+                &mut prepared.resource_wait,
+                now,
+                &Denial::default(),
+                WaitReason::Concurrency,
+                false,
+                self.admissions,
+                governor.epoch(model),
+            );
+            return Admitted::Wait;
+        }
+        let request_id = prepared
+            .claim
+            .as_ref()
+            .and_then(|claim| governor.spec(claim.id()))
+            .map_or_else(next_request_id, |spec| spec.request_id);
+        let rank = ClaimRank {
+            priority: 1,
+            decoding: false,
+            completed_tokens: 0,
+            earliness: u64::MAX - request_id,
+        };
+        let spec = self.admission_spec(seq_id, request_id, rank);
+        let claim = Self::request_claim(governor, model, &mut prepared.claim, spec);
+        let hold_ended = prepared.resource_wait.hold_ended;
+        let mut dropped_lease = false;
+        loop {
+            let Some(allocation) =
+                self.claim_cell(seq_id, &prepared.admitted.tokens, claim, spec, hold_ended)
+            else {
+                return Admitted::Granted(None);
+            };
+            if let Ok(reservation) = allocation.admission.0 {
+                prepared.resource_wait = ResourceWait::default();
+                governor.ledger(|ledger| ledger.set_waiting(claim.id, false));
+                return Admitted::Granted(Some(reservation));
+            }
+            let denial = allocation.denial;
+            let verdict = judge(&denial, self.scheduler.another_resident(seq_id));
+            if verdict == Verdict::Fail
+                && !dropped_lease
+                && self.inner.scheduler_materialized_blocks(seq_id) > 0
+            {
+                dropped_lease = true;
+                if self.inner.release_scheduled_cache(seq_id).is_ok() {
+                    continue;
+                }
+            }
+            if verdict == Verdict::Fail {
+                governor.capacity_exhausted();
+                return Admitted::Fail(Error::from_reason(capacity_exhausted(
+                    "request state",
+                    denial.failure,
+                    "",
+                )));
+            }
+            defer_resource_retry(
+                &mut prepared.resource_wait,
+                governor.now(),
+                &denial,
+                WaitReason::Memory,
+                false,
+                self.admissions,
+                governor.epoch(model),
+            );
+            return Admitted::Wait;
+        }
+    }
+
+    /// Splash `Engine::admitQueued` + `Engine::admit` for a suspended
+    /// request on the ledger: retried once its retry time came or the
+    /// epoch moved, never while the resident lanes drain; its state claim
+    /// covers its GDN cell.
+    fn resume_cell(&mut self, turn: &mut Turn<B>) -> Admitted {
+        let governor = self.memory_governor();
+        let model = self.inner.memory_model();
+        let seq_id = turn.seq_id;
+        let (now, epoch) = (governor.now(), governor.epoch(model));
+        if !retry_ready(&turn.resource_wait, now, epoch)
+            || governor.draining_for_recovery(model, now, self.scheduler.has_resident())
+        {
+            return Admitted::Wait;
+        }
+        if !self.ensure_recurrent_slot(seq_id) {
+            defer_resource_retry(
+                &mut turn.resource_wait,
+                now,
+                &Denial::default(),
+                WaitReason::Concurrency,
+                false,
+                self.admissions,
+                epoch,
+            );
+            return Admitted::Wait;
+        }
+        let kept = turn.payload.preemption_replay.as_ref().map_or_else(
+            || turn.payload.prompt_tokens.clone(),
+            |replay| replay.tokens.clone(),
+        );
+        let (claim, spec) = self.resume_claim(turn);
+        let hold_ended = turn.resource_wait.hold_ended;
+        let Some(allocation) = self.claim_cell(seq_id, &kept, claim, spec, hold_ended) else {
+            return Admitted::Granted(None);
+        };
+        if let Ok(reservation) = allocation.admission.0 {
+            turn.resource_wait = ResourceWait::default();
+            governor.ledger(|ledger| ledger.set_waiting(claim.id, false));
+            return Admitted::Granted(Some(reservation));
+        }
+        let denial = allocation.denial;
+        if judge(&denial, self.scheduler.another_resident(seq_id)) == Verdict::Fail {
+            self.memory_governor().capacity_exhausted();
+            return Admitted::Fail(Error::from_reason(capacity_exhausted(
+                "request state",
+                denial.failure,
+                "",
+            )));
+        }
+        defer_resource_retry(
+            &mut turn.resource_wait,
+            governor.now(),
+            &denial,
+            WaitReason::Memory,
+            false,
+            self.admissions,
+            governor.epoch(model),
+        );
+        Admitted::Wait
+    }
+
+    /// A suspended request's claim, Start beside a resident lane.
+    fn resume_claim(&self, turn: &mut Turn<B>) -> (ClaimRef<'static>, ClaimSpec) {
+        let governor = self.memory_governor();
+        let request_id = turn
+            .payload
+            .claim
+            .as_ref()
+            .and_then(|claim| governor.spec(claim.id()))
+            .map_or_else(next_request_id, |spec| spec.request_id);
+        let spec = self.admission_spec(turn.seq_id, request_id, turn.claim_rank());
+        let claim = Self::request_claim(
+            governor,
+            self.inner.memory_model(),
+            &mut turn.payload.claim,
+            spec,
+        );
+        (claim, spec)
+    }
+
+    /// Splash `Engine::admit`: a lane that resumes takes the KV target it
+    /// was suspended with at once, after the chain it restored.
+    fn claim_resume_target(&mut self, turn: &mut Turn<B>, kept: &[u32]) -> Admitted {
+        let target = turn.resume_target;
+        if target == 0 {
+            return Admitted::Granted(None);
+        }
+        let governor = self.memory_governor();
+        let model = self.inner.memory_model();
+        let seq_id = turn.seq_id;
+        let (claim, spec) = self.resume_claim(turn);
+        let hold_ended = turn.resource_wait.hold_ended;
+        let mut units = SchedUnits {
+            state: &mut *self,
+            claimant: seq_id,
+            kept,
+        };
+        let allocation = allocate(
+            claim,
+            spec,
+            Refusal::Waits,
+            hold_ended,
+            &mut units,
+            |units| ensure_tokens(units.state.inner.paged_adapter_mut(), seq_id, target, claim),
+        );
+        if allocation.admission.granted() {
+            turn.resource_wait = ResourceWait::default();
+            governor.ledger(|ledger| ledger.set_waiting(claim.id, false));
+            return Admitted::Granted(None);
+        }
+        let denial = allocation.denial;
+        if !allocation.admission.memory_denied() {
+            return Admitted::Fail(
+                allocation
+                    .admission
+                    .result
+                    .err()
+                    .unwrap_or_else(|| Error::from_reason("resume target refused")),
+            );
+        }
+        if judge(&denial, self.scheduler.another_resident(seq_id)) == Verdict::Fail {
+            self.memory_governor().capacity_exhausted();
+            return Admitted::Fail(Error::from_reason(capacity_exhausted(
+                "KV target",
+                denial.failure,
+                &page_shortfall(denial.blocks),
+            )));
+        }
+        defer_resource_retry(
+            &mut turn.resource_wait,
+            governor.now(),
+            &denial,
+            WaitReason::Memory,
+            false,
+            self.admissions,
+            governor.epoch(model),
+        );
+        Admitted::Wait
+    }
+
+    /// One scheduler step: the plan, its rows' claims, then the granted
+    /// rows run.
+    fn step(&mut self) -> std::result::Result<Action<B>, SchedulerError<Error>> {
+        let (plan, claims) = match self.plan_and_claim()? {
+            Ok(planned) => planned,
+            Err(action) => return Ok(action),
+        };
+        let policy = self.judge_policy();
+        // The step's batched forward is the engine's own (Splash's engine
+        // claim); each row's work is its request's (`HybridStepExecutor`).
+        let model = self.inner.memory_model();
+        let engine = (model != 0).then(|| {
+            self.memory_governor()
+                .open(crate::engine::governor::governor::whole_turn_spec(0), model)
+        });
+        let _engine_scope = engine.as_ref().map(|claim| Scope::enter(claim.claim()));
+        let mut executor = self.inner.step_executor();
+        self.scheduler
+            .finish_step(plan, &claims.grants, &mut executor, policy)
+    }
+
+    /// The step's plan without the rows whose wait has not reached its
+    /// retry (Splash `Engine::prepare` plans no deferred lane), and their
+    /// claims. The granted rows are the lanes this step works.
+    #[allow(clippy::type_complexity)]
+    fn plan_and_claim(
+        &mut self,
+    ) -> std::result::Result<
+        std::result::Result<(StepPlan, StepClaims), Action<B>>,
+        SchedulerError<Error>,
+    > {
+        let mut plan = match self
+            .scheduler
+            .prepare_step()
+            .map_err(SchedulerError::InvalidResult)?
+        {
+            Prepared::Action(action) => return Ok(Err(action)),
+            Prepared::Plan(plan) => plan,
+        };
+        if self.judge_policy() == JudgePolicy::Ledger {
+            let governor = self.memory_governor();
+            let model = self.inner.memory_model();
+            let (now, epoch) = (governor.now(), governor.epoch(model));
+            let scheduler = &mut self.scheduler;
+            plan.rows.retain(|row| {
+                row.cancel_snapshot
+                    || scheduler
+                        .running_turn_mut(row.seq_id)
+                        .is_none_or(|turn| retry_ready(&turn.resource_wait, now, epoch))
+            });
+            if plan.rows.is_empty() {
+                return Ok(Err(SchedulerAction::Idle));
+            }
+        }
+        let claims = B::claim_step_rows(self, &plan);
+        for (row, grant) in plan.rows.iter().zip(&claims.grants) {
+            if grant.is_none() {
+                match row.kind {
+                    StepKind::Prefill => self.pass_work.prefill.push(row.seq_id),
+                    StepKind::Decode => self.pass_work.decode = true,
+                }
+            }
+        }
+        self.worked_lanes = plan
+            .rows
+            .iter()
+            .zip(&claims.grants)
+            .filter(|(_, grant)| grant.is_none())
+            .filter_map(|(row, _)| {
+                self.scheduler
+                    .running()
+                    .iter()
+                    .find(|turn| turn.seq_id == row.seq_id)
+                    .map(|turn| LaneWork {
+                        submitted: turn.arrival_order(),
+                        admission: turn.admission,
+                    })
+            })
+            .collect();
+        Ok(Ok((plan, claims)))
+    }
+
+    /// Splash `Engine::collectLandings` → `Cache::setWantedChains`: the
+    /// prompts of the requests without a lane, the one admission waits on
+    /// and the suspended or queued turns' replays.
+    fn refresh_wanted_chains(&mut self) {
+        if self.judge_policy() != JudgePolicy::Ledger {
+            return;
+        }
+        let tokens = |turn: &Turn<B>| -> Vec<u32> {
+            turn.payload.preemption_replay.as_ref().map_or_else(
+                || turn.payload.prompt_tokens.clone(),
+                |replay| replay.tokens.clone(),
+            )
+        };
+        let signature: Vec<(SeqId, usize)> = self
+            .prepared_waiting
+            .iter()
+            .map(|prepared| (prepared.seq_id, prepared.admitted.tokens.len()))
+            .chain(
+                self.scheduler
+                    .turns()
+                    .filter(|turn| turn.status != TurnStatus::Running)
+                    .map(|turn| (turn.seq_id, tokens(turn).len())),
+            )
+            .collect();
+        if signature == self.wanted_signature {
+            return;
+        }
+        let prompts = self
+            .prepared_waiting
+            .iter()
+            .map(|prepared| prepared.admitted.tokens.clone())
+            .chain(
+                self.scheduler
+                    .turns()
+                    .filter(|turn| turn.status != TurnStatus::Running)
+                    .map(tokens),
+            )
+            .collect();
+        self.wanted_signature = signature;
+        self.memory_governor()
+            .set_wanted_chains(self.inner.memory_model(), WantedChains::new(prompts));
+    }
+
+    /// Splash `Engine::syncClaims` and `Engine::tick`'s waits, once per
+    /// drive pass on the ledger: a claim holds what it waits for only while
+    /// its request is retried; a wait ends `resource_timeout` at its
+    /// deadline, which a lane submitted or admitted before it restarts
+    /// while it works; nothing times out while the resident lanes drain.
+    fn tick_waits(&mut self) {
+        if self.judge_policy() != JudgePolicy::Ledger {
+            return;
+        }
+        let governor = self.memory_governor();
+        let model = self.inner.memory_model();
+        let (now, epoch) = (governor.now(), governor.epoch(model));
+        let draining = governor.draining_for_recovery(model, now, self.scheduler.has_resident());
+        let worked = std::mem::take(&mut self.worked_lanes);
+        let has_preempted = self.scheduler.has_preempted();
+        let first_preempted = self.scheduler.first_preempted();
+        let mut keys: Vec<Option<SeqId>> = Vec::new();
+        let mut waiters: Vec<Waiter<'_>> = Vec::new();
+        if let Some(prepared) = self.prepared_waiting.as_mut() {
+            keys.push(None);
+            waiters.push(Waiter {
+                claim: prepared.claim.as_ref().map(ClaimHandle::id),
+                wait: &mut prepared.resource_wait,
+                // Every turn the scheduler holds was submitted before it.
+                submitted: u64::MAX,
+                finalized: false,
+                retried: !has_preempted && !draining,
+            });
+        }
+        for turn in self.scheduler.turns_mut() {
+            let retried = match turn.status {
+                TurnStatus::Preempted => !draining && first_preempted == Some(turn.seq_id),
+                _ => true,
+            };
+            // A cancel or stop is the turn's end (Splash `Engine::deferEnd`
+            // keeps the first): its wait no longer times out.
+            let finalized = is_cancelled(turn);
+            keys.push(Some(turn.seq_id));
+            waiters.push(Waiter {
+                claim: turn.payload.claim.as_ref().map(ClaimHandle::id),
+                submitted: turn.arrival_order(),
+                wait: &mut turn.resource_wait,
+                finalized,
+                retried,
+            });
+        }
+        sync_claims(governor, &mut waiters, now, epoch);
+        let timed_out: Vec<(Option<SeqId>, Option<Failure>)> =
+            tick(&mut waiters, &worked, now, draining, epoch)
+                .into_iter()
+                .map(|at| (keys[at], waiters[at].wait.failure))
+                .collect();
+        drop(waiters);
+        for (key, failure) in timed_out {
+            let error = resource_timeout(failure);
+            governor.resource_timed_out();
+            match key {
+                None => {
+                    if let Some(prepared) = self.prepared_waiting.take() {
+                        self.cleanup_rejected_prepared(&prepared);
+                        prepared
+                            .response
+                            .send_error(Error::from_reason(error), prepared.cancelled.as_ref());
+                    }
+                }
+                Some(seq_id) => {
+                    let turn = match self.scheduler.take_running(seq_id) {
+                        Some(turn) => Some(turn),
+                        None => {
+                            self.pending_restores.remove(&seq_id);
+                            self.scheduler.take_waiting(seq_id)
+                        }
+                    };
+                    if let Some(turn) = turn {
+                        self.fail_preempted(turn, error);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A command off the channel: the memory monitor's wake is taken here,
+    /// before anything waits behind it.
+    fn receive(&mut self, command: ModelCommand<B::FamilyCommand>) -> bool {
+        match command {
+            ModelCommand::MemoryControl => {
+                crate::engine::governor::monitor::wake_taken(self.inner.memory_model());
+                true
+            }
+            command => {
+                self.pending.push_back(Queued {
+                    command,
+                    arrival: Arrival {
+                        at: Instant::now(),
+                        mark: self.timeline,
+                    },
+                });
+                false
+            }
+        }
+    }
+
+    /// Splash `MemoryControl::run` on the model thread: the governor's
+    /// control pass over the model's units and idle owners, once per
+    /// monitor period, at once on the monitor's wake, and again while the
+    /// pass waits for what lands.
+    fn run_control_pass(&mut self, woke: bool) {
+        if self.judge_policy() != JudgePolicy::Ledger {
+            return;
+        }
+        let model = self.inner.memory_model();
+        let governor = self.memory_governor();
+        if model == 0 || !governor.control_due(model, woke) {
+            return;
+        }
+        let mut units = SchedUnits {
+            state: &mut *self,
+            claimant: SeqId::MAX,
+            kept: &[],
+        };
+        if governor.control_pass(&mut [&mut units]).again() {
+            governor.control_again(model);
+        }
+    }
+
+    /// Runs a command whole on the model thread: a barrier, or a turn the
+    /// exclusive lane holds. `Some` ends the pass.
+    fn run_command(
+        &mut self,
+        command: ModelCommand<B::FamilyCommand>,
+        arrival: Option<Arrival>,
+        wired: Option<&mut crate::stream::WiredUse>,
+    ) -> Option<LoopControl> {
+        let reset = command
+            .as_chat()
+            .is_some_and(|chat| matches!(chat, ChatCmd::ResetCaches { .. }));
+        let command = match command.into_scheduler_stats() {
+            Ok(reply) => {
+                let _ = reply.send(Ok(self.scheduler.stats().to_js()));
+                self.close_pass(&mut []);
+                return Some(LoopControl::Continue);
+            }
+            Err(command) => command,
+        };
+        if let Some(wired) = wired {
+            wired.mark();
+        }
+        let model = self.inner.memory_model();
+        // A whole turn is its request's one claim, alone on the
+        // model, and a wait for memory ends at its cancel.
+        let cancel = command.as_chat().and_then(ChatCmd::cancel_flag);
+        let whole_turn = model != 0 && cancel.is_some();
+        let turn = whole_turn.then(|| {
+            let governor = crate::engine::governor::governor();
+            governor.open(
+                crate::engine::governor::governor::whole_turn_spec(
+                    crate::engine::governor::governor::next_request_id(),
+                ),
+                model,
+            )
+        });
+        let _turn_scope = turn
+            .as_ref()
+            .map(|claim| crate::engine::governor::governor::Scope::enter(claim.claim()));
+        let _cancel_scope = cancel.map(crate::engine::governor::governor::CancelScope::enter);
+        // The turn holds the model as a command does: what waits behind it
+        // is held by its decode. Its own TTFT runs from its arrival.
+        self.pass_work.decode |= whole_turn;
+        let timed = arrival.filter(|_| whole_turn).map(|arrival| {
+            (
+                self.timeline.since(&arrival.mark),
+                Instant::now(),
+                WholeTurnScope::enter(arrival.at),
+            )
+        });
+        self.inner.execute_barrier(
+            command,
+            SchedulerOwnerContext {
+                owner_sequences: &mut self.owner_sequences,
+                owner_states: &mut self.owner_states,
+                next_seq_id: &mut self.next_seq_id,
+            },
+        );
+        if let Some((queued, started, scope)) = timed
+            && let Some((first, claim_wait)) = scope.finish()
+        {
+            let mut clock = crate::engine::governor::metrics::whole_turn_ttft(
+                queued,
+                first.saturating_duration_since(started).as_secs_f64(),
+                claim_wait,
+            );
+            if let Some(parts) = clock.first_tokens() {
+                self.memory_governor().first_tokens(&parts);
+            }
+        }
+        if reset {
+            self.owner_sequences.clear();
+            self.owner_states.clear();
+        }
+        self.close_pass(&mut []);
+        None
+    }
+
+    /// Splash `Engine::holds` at the end of a drive pass, on the ledger: the
+    /// pass's time goes to what held each request without its first tokens
+    /// (`holderOf` over the pass's work); a lane's token events are timed
+    /// for decode gaps (`decodeGap`); the model's waits, replans and
+    /// accounts are published for the governor's status.
+    fn close_pass(&mut self, finished: &mut [Turn<B>]) {
+        if self.judge_policy() != JudgePolicy::Ledger {
+            return;
+        }
+        let governor = self.memory_governor();
+        let model = self.inner.memory_model();
+        let now = governor.now();
+        let seconds = (now - self.pass_start).max(0.0);
+        let work = std::mem::take(&mut self.pass_work);
+        let prefill_seconds = if work.ran_prefill() { seconds } else { 0.0 };
+        let releases = governor.pool_releases();
+        let replans = self.scheduler.stats().replans;
+        let waits = |claim: Option<&ClaimHandle<'static>>| {
+            claim.is_some_and(|claim| {
+                governor.ledger(|ledger| {
+                    ledger
+                        .claim(claim.id())
+                        .is_some_and(|state| state.waiting || state.host_refused_waiting)
+                })
+            })
+        };
+        self.timeline.hold(seconds, work.holder_of(None, false));
+        if let Some(prepared) = self.prepared_waiting.as_mut() {
+            let part = work.holder_of(Some(prepared.seq_id), waits(prepared.claim.as_ref()));
+            prepared.ttft.hold(seconds, part);
+        }
+        for turn in self.scheduler.turns_mut().chain(finished.iter_mut()) {
+            let claim_waits = waits(turn.payload.claim.as_ref());
+            let part = work.holder_of(Some(turn.seq_id), claim_waits);
+            let clock = &mut turn.payload.clock;
+            clock.ttft.hold(seconds, part);
+            clock.gap.worked(prefill_seconds, claim_waits);
+            if clock.token_events > clock.seen_events {
+                clock.seen_events = clock.token_events;
+                if let Some(parts) = clock.ttft.first_tokens() {
+                    governor.first_tokens(&parts);
+                }
+                if let Some(gap) = clock.gap.token(now, releases, replans) {
+                    governor.decode_gap(&gap);
+                }
+            }
+        }
+        if model == 0 {
+            return;
+        }
+        let draining = governor.draining_for_recovery(model, now, self.scheduler.has_resident());
+        let mut status = ResourceWaitStatus {
+            draining,
+            ..ResourceWaitStatus::default()
+        };
+        let mut count = |wait: &ResourceWait, suspended: bool| {
+            let Some(started) = wait.started else {
+                return false;
+            };
+            match wait.reason {
+                WaitReason::Memory => status.memory += 1,
+                WaitReason::Concurrency => status.concurrency += 1,
+                WaitReason::None => return false,
+            }
+            status.suspended += u32::from(suspended);
+            status.oldest_ms = status.oldest_ms.max((now - started).max(0.0) * 1000.0);
+            wait.reason == WaitReason::Memory
+        };
+        let refused = self
+            .prepared_waiting
+            .as_ref()
+            .is_some_and(|prepared| count(&prepared.resource_wait, false));
+        for turn in self.scheduler.turns() {
+            if turn.status == TurnStatus::Preempted {
+                count(&turn.resource_wait, true);
+            }
+        }
+        // The chats behind a start refused memory wait without being tried
+        // (Splash `heldBehindRefusal`).
+        if refused {
+            status.held_behind_refusal = self
+                .pending
+                .iter()
+                .filter(|queued| {
+                    queued
+                        .as_chat()
+                        .is_some_and(|chat| !matches!(chat, ChatCmd::ReleaseCacheOwner { .. }))
+                })
+                .count() as u32;
+        }
+        governor.publish_waits(model, status, replans);
+        if now >= self.accounts_due
+            && let Some(accounts) = self.inner.memory_accounts()
+        {
+            governor.publish_accounts(model, accounts);
+            self.accounts_due = now + crate::engine::governor::monitor::MONITOR_PERIOD_SECONDS;
+        }
+    }
+
+    /// A finished row's failure that a GPU command exhausting Metal memory
+    /// caused becomes `metal_out_of_memory:`, and the model's caches reset
+    /// after the step.
+    fn note_gpu_oom(&mut self, failure: &mut Option<Error>) {
+        let Some(error) = failure.as_mut() else {
+            return;
+        };
+        if error.reason.starts_with("metal_out_of_memory:") {
+            self.gpu_oom.get_or_insert_with(|| error.reason.clone());
+        } else if crate::engine::governor::is_gpu_out_of_memory(&error.reason) {
+            self.gpu_oom = Some(error.reason.clone());
+            *error =
+                Error::from_reason(crate::engine::governor::metal_out_of_memory(&error.reason));
+        }
+    }
+
+    /// The step failed as a whole. On the ledger a GPU command that
+    /// exhausted Metal memory fails the model's requests and resets its
+    /// caches, and the thread lives; any other failure ends the thread.
+    fn executor_failed(&mut self, error: Error) -> LoopControl {
+        if self.judge_policy() == JudgePolicy::Ledger
+            && crate::engine::governor::is_gpu_out_of_memory(&error.reason)
+        {
+            self.gpu_oom = Some(error.reason);
+            self.recover_if_gpu_oom();
+            return LoopControl::Continue;
+        }
+        tracing::error!(
+            "{} scheduler execution failed: {error:?}",
+            B::SCHEDULER_NAME
+        );
+        LoopControl::Break
+    }
+
+    /// Splash's engine restart after `metal_out_of_memory`, the thread
+    /// kept: MLX reports a command's failure at a later command, so what
+    /// any running command wrote may be garbage. Every request with a lane
+    /// or a prepared admission fails, the idle owners and every cache of
+    /// the model go, and the MLX free pool is returned. Commands not yet
+    /// started stay queued.
+    fn recover_if_gpu_oom(&mut self) {
+        let model = self.inner.memory_model();
+        if model == 0 && self.gpu_oom.is_none() {
+            return;
+        }
+        let governor = self.memory_governor();
+        if self.gpu_oom.is_some() {
+            governor.note_gpu_oom(model);
+        }
+        let noted = governor.take_gpu_oom(model);
+        let detail = self.gpu_oom.take();
+        if !noted && detail.is_none() {
+            return;
+        }
+        let detail = detail.unwrap_or_else(|| "a whole turn's command".to_string());
+        let error = if detail.starts_with("metal_out_of_memory:") {
+            detail.clone()
+        } else {
+            crate::engine::governor::metal_out_of_memory(&detail)
+        };
+        tracing::error!(
+            target: "mlx_core::memory",
+            "{} reset after a GPU command exhausted Metal memory: {detail}",
+            B::SCHEDULER_NAME
+        );
+        let seq_ids: Vec<SeqId> = self.scheduler.turns().map(|turn| turn.seq_id).collect();
+        for seq_id in seq_ids {
+            let turn = match self.scheduler.take_running(seq_id) {
+                Some(turn) => Some(turn),
+                None => self.scheduler.take_waiting(seq_id),
+            };
+            if self.pending_restores.remove(&seq_id).is_some() {
+                self.restore_landed();
+            }
+            if let Some(turn) = turn {
+                self.fail_preempted(turn, error.clone());
+            }
+        }
+        if let Some(prepared) = self.prepared_waiting.take() {
+            self.cleanup_rejected_prepared(&prepared);
+            prepared
+                .response
+                .send_error(Error::from_reason(error), prepared.cancelled.as_ref());
+        }
+        for seq_id in self.idle_owners(SeqId::MAX) {
+            self.release_owner(seq_id);
+        }
+        self.owner_sequences.clear();
+        self.owner_states.clear();
+        self.owner_last_used.clear();
+        if let Err(reset) = self.inner.reset_after_gpu_oom() {
+            tracing::warn!(
+                target: "mlx_core::memory",
+                "{} cache reset after a GPU memory failure: {reset}",
+                B::SCHEDULER_NAME
+            );
+        }
+        crate::array::memory::clear_cache();
+    }
+
+    /// [`Self::step`] with a test executor.
+    #[cfg(test)]
+    fn step_with<E>(
+        &mut self,
+        executor: &mut E,
+    ) -> std::result::Result<Action<B>, SchedulerError<Error>>
+    where
+        E: StepExecutor<ScheduledTurn<B::PrefixState>, Error = Error>,
+    {
+        let (plan, claims) = match self.plan_and_claim()? {
+            Ok(planned) => planned,
+            Err(action) => return Ok(action),
+        };
+        let policy = self.judge_policy();
+        self.scheduler
+            .finish_step(plan, &claims.grants, executor, policy)
+    }
+
     /// The step's only running turn blocked. A family that books on demand
-    /// first reclaims idle memory; with none left the turn cannot fit even
+    /// first releases idle owners; with none left the turn cannot fit even
     /// alone, so it fails with `capacity_exhausted` and is released once,
     /// never preempted: a replay would block at the same step (Splash
-    /// `Engine::judge` fails a lone lane). Other
-    /// families book the whole turn and keep the preempt-and-resume path.
+    /// `Engine::judge` fails a lone lane). Other families book the whole
+    /// turn and keep the preempt-and-resume path.
     fn handle_blocked_alone(&mut self, seq_id: SeqId) {
         if !self.inner.scheduler_books_on_demand() {
             if let Some(turn) = self.scheduler.preempt_running(seq_id) {
@@ -3030,7 +4266,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
             return;
         }
-        if self.reclaim_for_blocked_step(seq_id, true, None) {
+        if self.reclaim_idle_owners(seq_id) {
             return;
         }
         let error = self.capacity_exhausted(seq_id);
@@ -3051,16 +4287,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             ),
             _ => format!("it holds {held} paged blocks"),
         };
-        let tried = if self.inner.reclaims_in_order() {
-            "even alone: the parked states and the idle cache owners, plus the unheld image \
-             features below the pool's max, could not free the KV the step lacks, or the idle \
-             cache owners the draft state it lacks (none is taken when their count falls short)"
-        } else {
-            "even alone after every idle cache owner was released"
-        };
         Error::from_reason(format!(
             "capacity_exhausted: could not allocate KV or draft state for this turn's next step \
-             ({pool}); the request does not fit in the memory the page pool may use, {tried}"
+             ({pool}); the request does not fit in the memory the page pool may use, even alone \
+             after every idle cache owner was released"
         ))
     }
 
@@ -3186,7 +4416,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     {
         let mut grown_for_live_turns = false;
         let mut grown_before_reclaim = false;
-        let mut met_before = MetBefore::default();
         loop {
             let decision =
                 self.reserve_memory_decision(&snapshot, reservation_blocks, candidate_state_bytes);
@@ -3248,31 +4477,14 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     if self.inner.scheduler_books_on_demand()
                         && !grown_for_live_turns
                         && state == ScheduledStateFit::Fits
-                        && let Some(needed) = if self.inner.reclaims_in_order() {
-                            grow_or_take_needed_blocks_for(
-                                &snapshot,
-                                &decision,
-                                scheduler_watermark_fraction(),
-                            )
-                            .or_else(|| {
-                                cap_shortfall_blocks(
-                                    &snapshot,
-                                    decision
-                                        .reserved_block_bytes
-                                        .saturating_add(decision.reserved_state_bytes)
-                                        .saturating_add(decision.watermark_bytes),
-                                )
-                            })
-                        } else {
-                            grow_needed_blocks_for(
-                                &snapshot,
-                                &decision,
-                                scheduler_watermark_fraction(),
-                            )
-                        }
+                        && let Some(needed) = grow_needed_blocks_for(
+                            &snapshot,
+                            &decision,
+                            scheduler_watermark_fraction(),
+                        )
                     {
                         grown_for_live_turns = true;
-                        if let Some(grown) = self.try_grow_pool_by(needed, &mut met_before)? {
+                        if let Some(grown) = self.try_grow_pool(needed)? {
                             snapshot = grown;
                             continue;
                         }
@@ -3292,7 +4504,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     &snapshot,
                     reservation_blocks,
                     candidate_state_bytes,
-                    &mut met_before,
                 )? {
                     snapshot = grown;
                     let decision = self.reserve_memory_decision(
@@ -3329,68 +4540,26 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         snapshot: &SchedulerCacheSnapshot,
         reservation_blocks: u32,
         candidate_state_bytes: u64,
-        met_before: &mut MetBefore<u32>,
     ) -> Result<Option<SchedulerCacheSnapshot>> {
-        let existing_state_bytes = self.inner.scheduled_recurrent_bytes();
         let Some(needed) = grow_needed_blocks(
             snapshot,
             reservation_blocks,
             candidate_state_bytes,
-            existing_state_bytes,
-        )
-        .or_else(|| {
-            (self.inner.reclaims_in_order()
-                && !exceeds_max_pool_ceiling(snapshot, reservation_blocks, candidate_state_bytes))
-            .then(|| {
-                cap_shortfall_blocks(
-                    snapshot,
-                    u64::from(reservation_blocks)
-                        .saturating_mul(snapshot.bytes_per_block.max(1))
-                        .saturating_add(candidate_state_bytes)
-                        .saturating_add(existing_state_bytes),
-                )
-            })
-            .flatten()
-        }) else {
+            self.inner.scheduled_recurrent_bytes(),
+        ) else {
             return Ok(None);
         };
-        self.try_grow_pool_by(needed, met_before)
+        self.try_grow_pool(needed)
     }
 
-    /// Grows the pool by `needed` blocks. A family that reclaims in order
-    /// sends the need through the take order (at the cap too, where only a
-    /// take adds blocks), keeping the admitted prompt's entries; a `Short`
-    /// take or a need `met_before` saw is not grown. Returns the fresh
-    /// snapshot, or `None` when the pool did not grow.
-    fn try_grow_pool_by(
-        &mut self,
-        needed: u32,
-        met_before: &mut MetBefore<u32>,
-    ) -> Result<Option<SchedulerCacheSnapshot>> {
-        let Some(adapter) = self.inner.paged_adapter() else {
-            return Ok(None);
-        };
-        let grown = if self.inner.reclaims_in_order() {
-            let blocks = adapter.takeable_blocks().saturating_add(needed);
-            !met_before.seen(&blocks) && {
-                let freed = self.inner.reclaim_kv(
-                    KvNeed {
-                        blocks,
-                        over_takeable: true,
-                        checked: false,
-                        reach_in_use: false,
-                        rebuilt: true,
-                    },
-                    &self.reclaim_keep,
-                );
-                met_before.retry(blocks, freed)
-            }
-        } else {
-            self.inner
-                .paged_adapter_mut()
-                .is_some_and(|adapter| adapter.try_grow_pool(needed))
-        };
-        if grown {
+    /// Grows the pool by `needed` blocks; the fresh snapshot, or `None`
+    /// when it did not grow.
+    fn try_grow_pool(&mut self, needed: u32) -> Result<Option<SchedulerCacheSnapshot>> {
+        if self
+            .inner
+            .paged_adapter_mut()
+            .is_some_and(|adapter| adapter.try_grow_pool(needed))
+        {
             self.inner.scheduler_cache_snapshot()
         } else {
             Ok(None)
@@ -3412,7 +4581,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     }
 
     /// Blocks an admission charges: the reservation less the kept live
-    /// blocks it continues on and the marked chain its prompt hits.
+    /// blocks it continues on.
     fn admission_charge(
         &self,
         reservation_blocks: u32,
@@ -3420,19 +4589,17 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         tokens: &[u32],
         reuse: bool,
     ) -> u32 {
-        reservation_blocks
-            .saturating_sub(reusable_keep_live_blocks(
-                self.inner.paged_adapter(),
-                seq_id,
-                tokens,
-                reuse,
-            ))
-            .saturating_sub(self.inner.marked_hit_blocks(tokens))
+        reservation_blocks.saturating_sub(reusable_keep_live_blocks(
+            self.inner.paged_adapter(),
+            seq_id,
+            tokens,
+            reuse,
+        ))
     }
 
     fn admit_prepared(
         &mut self,
-        prepared: Box<PreparedTurn>,
+        mut prepared: Box<PreparedTurn>,
     ) -> std::result::Result<Option<TurnState<ScheduledTurn<B::PrefixState>>>, Box<PreparedTurn>>
     {
         if prepared.cancelled.load(Ordering::Relaxed) {
@@ -3476,17 +4643,33 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             );
             return Ok(None);
         }
-        // A preempted row resumes before any later turn books memory: a
-        // booking taken now can keep the victim from ever fitting again,
-        // while the victim blocks the later turn from running.
-        if self.inner.scheduler_books_on_demand() && self.scheduler.has_preempted() {
-            return Err(prepared);
-        }
-        if !self.ensure_recurrent_slot(prepared.seq_id) {
-            return Err(prepared);
+        let ledger = self.judge_policy() == JudgePolicy::Ledger;
+        let mut cell = None;
+        if ledger {
+            match self.admit_claimed(&mut prepared) {
+                Admitted::Granted(reservation) => cell = reservation,
+                Admitted::Wait => return Err(prepared),
+                Admitted::Fail(error) => {
+                    self.cleanup_rejected_prepared(&prepared);
+                    prepared
+                        .response
+                        .send_error(error, prepared.cancelled.as_ref());
+                    return Ok(None);
+                }
+            }
+        } else {
+            // A preempted row resumes before any later turn books memory: a
+            // booking taken now can keep the victim from ever fitting again,
+            // while the victim blocks the later turn from running.
+            if self.inner.scheduler_books_on_demand() && self.scheduler.has_preempted() {
+                return Err(prepared);
+            }
+            if !self.ensure_recurrent_slot(prepared.seq_id) {
+                return Err(prepared);
+            }
         }
         let mut scheduled_state_bytes = 0u64;
-        if let Some(snapshot) = cache_snapshot {
+        if !ledger && let Some(snapshot) = cache_snapshot {
             let reuse = prepared.admitted.plan.is_delta || prepared.admitted.params.reuse_cache;
             let charge = self.admission_charge(
                 prepared.reservation_blocks,
@@ -3504,7 +4687,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             );
             scheduled_state_bytes = state_candidate_bytes
                 .saturating_add(self.inner.scheduled_state_held_bytes(prepared.seq_id));
-            self.reclaim_keep.clone_from(&prepared.admitted.tokens);
             let reserved = self.try_reserve_reclaiming_idle(
                 prepared.seq_id,
                 charge,
@@ -3512,7 +4694,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 state_candidate_bytes,
                 snapshot,
             );
-            self.reclaim_keep.clear();
             match reserved {
                 Ok(MemoryReserveOutcome::Admitted) => {}
                 Ok(MemoryReserveOutcome::Defer) => return Err(prepared),
@@ -3534,64 +4715,64 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
         }
 
-        let PreparedTurn {
-            admitted,
-            response,
-            cancelled,
-            owner_id,
-            seq_id,
-            newly_assigned,
-            reservation_blocks,
-            block_size,
-            reservation_state_bytes,
-            requested_tokens,
-        } = *prepared;
-        if cancelled.load(Ordering::Relaxed) {
-            if newly_assigned {
-                self.owner_states.remove(&owner_id);
-                self.owner_sequences.remove(&owner_id);
-                self.inner.release_scheduled_recurrent_for(seq_id);
-                self.inner.release_scheduled_speculation(seq_id);
+        if prepared.cancelled.load(Ordering::Relaxed) {
+            if prepared.newly_assigned {
+                self.owner_states.remove(&prepared.owner_id);
+                self.owner_sequences.remove(&prepared.owner_id);
+                self.inner.release_scheduled_recurrent_for(prepared.seq_id);
+                self.inner.release_scheduled_speculation(prepared.seq_id);
             }
-            response.send_error(
+            prepared.response.send_error(
                 Error::from_reason(engine::session::CHAT_SESSION_CANCELLED),
-                cancelled.as_ref(),
+                prepared.cancelled.as_ref(),
             );
             return Ok(None);
         }
+        let seq_id = prepared.seq_id;
         if let Err(error) = self.inner.activate_scheduled_recurrent(seq_id) {
-            if newly_assigned {
-                self.owner_states.remove(&owner_id);
-                self.owner_sequences.remove(&owner_id);
+            if prepared.newly_assigned {
+                self.owner_states.remove(&prepared.owner_id);
+                self.owner_sequences.remove(&prepared.owner_id);
                 self.inner.release_scheduled_recurrent_for(seq_id);
                 self.inner.release_scheduled_speculation(seq_id);
             }
-            response.send_error(error, cancelled.as_ref());
+            prepared
+                .response
+                .send_error(error, prepared.cancelled.as_ref());
             return Ok(None);
         }
-        let owner_state = self.owner_states.entry(owner_id.clone()).or_default();
+        let owner_state = self
+            .owner_states
+            .entry(prepared.owner_id.clone())
+            .or_default();
         self.inner.install_owner_state(seq_id, owner_state);
         self.inner.set_cache_owner_id(
-            &admitted.params.cache_owner_id,
-            admitted.params.cache_root_owner_id.as_deref(),
+            &prepared.admitted.params.cache_owner_id,
+            prepared.admitted.params.cache_root_owner_id.as_deref(),
         );
         self.inner.scheduled_turn_opened(seq_id);
         self.inner
-            .set_turn_cancel_flag(Some(Arc::clone(&cancelled)));
+            .set_turn_cancel_flag(Some(Arc::clone(&prepared.cancelled)));
         let owner_history = self
             .owner_states
-            .get(&owner_id)
+            .get(&prepared.owner_id)
             .map(B::owner_tokens)
             .unwrap_or_default()
             .to_vec();
-        let prefix_admission = match self.inner.prepare_scheduled_prefix(
+        let scope = prepared
+            .claim
+            .as_ref()
+            .map(|claim| Scope::enter_lane(claim.claim()));
+        let prefix_admission = self.inner.prepare_scheduled_prefix(
             seq_id,
-            &admitted.tokens,
+            &prepared.admitted.tokens,
             &owner_history,
-            admitted.plan.is_delta || admitted.params.reuse_cache,
-            admitted.params.cache_salt,
-            block_size,
-        ) {
+            prepared.admitted.plan.is_delta || prepared.admitted.params.reuse_cache,
+            prepared.admitted.params.cache_salt,
+            prepared.block_size,
+        );
+        drop(scope);
+        let prefix_admission = match prefix_admission {
             Ok(prefix) => prefix,
             Err(error) => {
                 self.inner.abort_paged_turn();
@@ -3599,12 +4780,34 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 self.inner.release_scheduled_speculation(seq_id);
                 self.inner.scheduled_turn_closed(seq_id);
                 self.inner.set_turn_cancel_flag(None);
-                self.owner_states.remove(&owner_id);
-                self.owner_sequences.remove(&owner_id);
-                response.send_error(error, cancelled.as_ref());
+                let error = match self.prefix_refused(seq_id, &mut prepared.resource_wait, false) {
+                    Some(Err(failed)) => failed,
+                    Some(Ok(())) => return Err(prepared),
+                    None => error,
+                };
+                self.owner_states.remove(&prepared.owner_id);
+                self.owner_sequences.remove(&prepared.owner_id);
+                prepared
+                    .response
+                    .send_error(error, prepared.cancelled.as_ref());
                 return Ok(None);
             }
         };
+        let PreparedTurn {
+            admitted,
+            response,
+            cancelled,
+            owner_id,
+            seq_id,
+            reservation_blocks,
+            block_size,
+            reservation_state_bytes,
+            requested_tokens,
+            claim,
+            enqueued_at,
+            ttft,
+            ..
+        } = *prepared;
         let (prefix, restore) = match prefix_admission {
             ScheduledPrefixAdmission::Ready(prefix) => (prefix, None),
             ScheduledPrefixAdmission::Waiting {
@@ -3645,7 +4848,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 .profiler_prefill_tokens(&prefix, admitted.tokens.len() as u32),
         );
         profiler.snapshot_memory_before();
-        let generation_start = admitted.params.report_performance.then(Instant::now);
+        // On the ledger a request's TTFT runs from its arrival (Splash counts
+        // from submission).
+        let generation_start = admitted.params.report_performance.then(|| {
+            if self.judge_policy() == JudgePolicy::Ledger {
+                enqueued_at
+            } else {
+                Instant::now()
+            }
+        });
         let reuse_cache = admitted.plan.is_delta || admitted.params.reuse_cache;
         let payload = ScheduledTurn {
             owner_id,
@@ -3696,6 +4907,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             allocation_failed: false,
             preemption_replay: None,
             requested_tokens,
+            claim,
+            cell,
+            clock: TurnClock {
+                ttft,
+                ..TurnClock::default()
+            },
         };
         let prompt_len = admitted.tokens.len() as u32;
         let cached_prefix = payload.prefix.effective_cached_prefix_len() as u32;
@@ -3737,6 +4954,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         .with_scheduled_state_reservation(scheduled_state_bytes);
         turn.decode_draft_allowance = draft_allowance;
         turn.whole_prompt_prefill = whole_prompt_prefill;
+        if ledger {
+            self.admissions = self.admissions.saturating_add(1);
+            turn.admission = self.admissions;
+        }
         if let Some(restore) = restore {
             self.pending_restores.insert(seq_id, restore);
             if let Err(error) = self.scheduler.try_enqueue_turn(turn) {
@@ -3779,14 +5000,62 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
     }
 
+    /// Cancelled requests end between steps (Splash `Engine::cancel`): the
+    /// waiting ones, and on the ledger the suspended ones (not in flight,
+    /// Splash `Engine::settle` ends them at once) and the running ones too,
+    /// whose refused rows would otherwise keep their memory and their
+    /// claim's takes until they ran again.
     fn reap_cancelled_waiters(&mut self) {
-        for mut turn in self.scheduler.take_cancelled_waiters() {
-            self.pending_restores.remove(&turn.seq_id);
+        let mut reaped = self.scheduler.take_cancelled_waiters();
+        if self.judge_policy() == JudgePolicy::Ledger {
+            let suspended: Vec<SeqId> = self
+                .scheduler
+                .turns()
+                .filter(|turn| turn.status == TurnStatus::Preempted && is_cancelled(turn))
+                .map(|turn| turn.seq_id)
+                .collect();
+            reaped.extend(
+                suspended
+                    .into_iter()
+                    .filter_map(|seq_id| self.scheduler.take_waiting(seq_id)),
+            );
+        }
+        for mut turn in reaped {
+            if self.pending_restores.remove(&turn.seq_id).is_some() {
+                self.restore_landed();
+            }
             if !stop_vacates(&mut turn) {
                 turn.payload.failure =
                     Some(Error::from_reason(engine::session::CHAT_SESSION_CANCELLED));
             }
             self.finish_completed(turn);
+        }
+        if self.judge_policy() != JudgePolicy::Ledger {
+            return;
+        }
+        // A stopped running turn ends in its step: its prefill row vacates,
+        // its decode row commits what it generated.
+        let cancelled: Vec<SeqId> = self
+            .scheduler
+            .running()
+            .iter()
+            .filter(|turn| is_cancelled(turn) && !stopped_after_sampling(turn))
+            .map(|turn| turn.seq_id)
+            .collect();
+        for seq_id in cancelled {
+            if let Some(turn) = self.scheduler.take_running(seq_id) {
+                self.fail_preempted(turn, engine::session::CHAT_SESSION_CANCELLED.to_string());
+            }
+        }
+    }
+
+    /// A cold-tier restore landed or was cancelled (Splash
+    /// `collectLandings` signals progress): what waited for its memory may
+    /// fit now.
+    fn restore_landed(&self) {
+        if self.judge_policy() == JudgePolicy::Ledger {
+            self.memory_governor()
+                .signal_progress(self.inner.memory_model());
         }
     }
 
@@ -3817,6 +5086,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 Ok(None) => {}
                 Ok(Some(restored)) => {
                     self.pending_restores.remove(&seq_id);
+                    self.restore_landed();
                     let Some(turn) = self.scheduler.waiting_turn_mut(seq_id) else {
                         let _ = self.inner.release_scheduled_cache(seq_id);
                         continue;
@@ -3908,7 +5178,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.fail_preempted(turn, error.reason.clone());
             return;
         }
-        if self.inner.scheduler_books_on_demand() {
+        if self.inner.scheduler_books_on_demand() && !self.inner.reclaims_in_order() {
             self.book_resume(
                 &mut turn,
                 replay.tokens.len() as u32,
@@ -3967,7 +5237,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     }
 
     fn try_resume_preempted(&mut self) {
+        let ledger = self.judge_policy() == JudgePolicy::Ledger;
         let Some(mut turn) = self.scheduler.take_preempted() else {
+            if ledger {
+                self.memory_governor().end_drain(self.inner.memory_model());
+            }
             return;
         };
         if turn
@@ -3989,25 +5263,30 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 return;
             }
         };
-        if !self.ensure_recurrent_slot(turn.seq_id) {
+        let mut cell = None;
+        if ledger {
+            match self.resume_cell(&mut turn) {
+                Admitted::Granted(reservation) => cell = reservation,
+                Admitted::Wait => {
+                    self.scheduler.prepend_preempted(turn);
+                    return;
+                }
+                Admitted::Fail(error) => {
+                    self.fail_preempted(turn, error.reason.clone());
+                    return;
+                }
+            }
+        } else if !self.ensure_recurrent_slot(turn.seq_id) {
             self.scheduler.prepend_preempted(turn);
             return;
         }
-        if let Some(snapshot) = cache_snapshot {
-            // The resume looks up the replay tokens, prompt and committed
-            // output (Splash `exactTokens`), so it keeps and charges by them.
-            let replay_tokens = turn
-                .payload
-                .preemption_replay
-                .as_ref()
-                .map_or(&turn.payload.prompt_tokens, |replay| &replay.tokens);
+        if !ledger && let Some(snapshot) = cache_snapshot {
             let materialized = self.inner.scheduler_materialized_blocks(turn.seq_id);
             let charge = if materialized > 0 {
                 turn.block_reservation_total.saturating_sub(materialized)
             } else {
                 turn.block_reservation_total
-            }
-            .saturating_sub(self.inner.marked_hit_blocks(replay_tokens));
+            };
             let state_candidate_bytes = self.inner.scheduled_state_candidate_bytes(
                 turn.seq_id,
                 turn.payload.requested_tokens,
@@ -4018,7 +5297,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             } else {
                 self.scheduler.has_live_turns()
             };
-            self.reclaim_keep.clone_from(replay_tokens);
             let reserved = self.try_reserve_with_policy(
                 turn.seq_id,
                 charge,
@@ -4028,7 +5306,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 may_wait,
                 B::release_scheduled_cache,
             );
-            self.reclaim_keep.clear();
             match reserved {
                 Ok(MemoryReserveOutcome::Admitted) => {
                     turn.scheduled_state_bytes = state_candidate_bytes
@@ -4079,6 +5356,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.fail_preempted(turn, error.reason.clone());
             return;
         }
+        let scope = turn
+            .payload
+            .claim
+            .as_ref()
+            .map(|claim| Scope::enter_lane(claim.claim()));
         let prefix_admission = match self.inner.prepare_scheduled_prefix(
             turn.seq_id,
             &replay_tokens,
@@ -4091,21 +5373,24 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             turn.block_size,
         ) {
             Ok(prefix) => prefix,
-            Err(error) if is_paged_allocation_blocked(&error.reason) => {
-                let _ = self.inner.release_scheduled_cache(turn.seq_id);
-                self.inner.release_scheduled_recurrent_for(turn.seq_id);
-                self.inner.release_scheduled_speculation(turn.seq_id);
-                self.scheduler.prepend_preempted(turn);
-                return;
-            }
             Err(error) => {
+                drop(scope);
                 let _ = self.inner.release_scheduled_cache(turn.seq_id);
                 self.inner.release_scheduled_recurrent_for(turn.seq_id);
                 self.inner.release_scheduled_speculation(turn.seq_id);
-                self.fail_preempted(turn, error.reason.clone());
+                let seq_id = turn.seq_id;
+                match self.prefix_refused(seq_id, &mut turn.resource_wait, true) {
+                    Some(Err(failed)) => self.fail_preempted(turn, failed.reason.clone()),
+                    Some(Ok(())) => self.scheduler.prepend_preempted(turn),
+                    None if is_paged_allocation_blocked(&error.reason) => {
+                        self.scheduler.prepend_preempted(turn);
+                    }
+                    None => self.fail_preempted(turn, error.reason.clone()),
+                }
                 return;
             }
         };
+        drop(scope);
         let (prefix, restore) = match prefix_admission {
             ScheduledPrefixAdmission::Ready(prefix) => (prefix, None),
             ScheduledPrefixAdmission::Waiting {
@@ -4113,6 +5398,29 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 restore,
             } => (provisional, Some(restore)),
         };
+        if ledger {
+            let refused = match self.claim_resume_target(&mut turn, &replay_tokens) {
+                Admitted::Granted(_) => None,
+                Admitted::Wait => Some(None),
+                Admitted::Fail(error) => Some(Some(error)),
+            };
+            if let Some(failure) = refused {
+                let _ = self.inner.release_scheduled_cache(turn.seq_id);
+                self.inner.release_scheduled_recurrent_for(turn.seq_id);
+                self.inner.release_scheduled_speculation(turn.seq_id);
+                match failure {
+                    Some(error) => self.fail_preempted(turn, error.reason.clone()),
+                    None => self.scheduler.prepend_preempted(turn),
+                }
+                return;
+            }
+            let governor = self.memory_governor();
+            governor.lane_resumed(self.inner.memory_model());
+            turn.resume_target = 0;
+            turn.payload.cell = cell;
+            self.admissions = self.admissions.saturating_add(1);
+            turn.admission = self.admissions;
+        }
         let materialized_blocks = self
             .inner
             .scheduler_materialized_blocks(turn.seq_id)
@@ -4154,8 +5462,21 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     }
 
     fn finish_completed(&mut self, mut turn: TurnState<ScheduledTurn<B::PrefixState>>) {
+        // What the turn's end publishes is its request's.
+        let claim = turn.payload.claim.take();
+        let _request = claim.as_ref().map(|claim| Scope::enter(claim.claim()));
         // Every arm below ends the turn, the error returns included.
         self.inner.scheduled_turn_closed(turn.seq_id);
+        // Splash `Engine::release`: a lane, or a suspended request, gives its
+        // memory back and the waits retry; only a lane ends the failure.
+        if self.inner.reclaims_in_order() {
+            let model = self.inner.memory_model();
+            if turn.status == TurnStatus::Preempted {
+                self.memory_governor().signal_progress(model);
+            } else {
+                self.memory_governor().lane_released(model);
+            }
+        }
         let Some(cancelled) = turn.cancelled.take() else {
             let owner_id = turn.payload.owner_id.clone();
             self.inner.abort_paged_turn();
@@ -4295,19 +5616,25 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         &mut self,
         receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ModelCommand<B::FamilyCommand>>,
     ) -> LoopControl {
+        let mut woke = false;
         if !self.scheduler.has_work() && self.pending.is_empty() && self.prepared_waiting.is_none()
         {
             match receiver.blocking_recv() {
-                Some(command) => self.pending.push_back(command),
+                Some(command) => woke |= self.receive(command),
                 None => return LoopControl::Break,
             }
         }
         while let Ok(command) = receiver.try_recv() {
-            self.pending.push_back(command);
+            woke |= self.receive(command);
         }
+        self.pass_work = PassWork::default();
+        self.pass_start = self.memory_governor().now();
         let mut wired = self.inner.wired_residency().map(|r| r.begin());
         self.reap_cancelled_waiters();
         self.poll_restores();
+        self.tick_waits();
+        self.refresh_wanted_chains();
+        self.run_control_pass(woke);
 
         match self.inner.scheduler_cache_snapshot() {
             Ok(Some(snapshot)) => {
@@ -4369,7 +5696,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             {
                 break;
             }
-            let Some(command) = self.pending.pop_front() else {
+            let Some(Queued { command, arrival }) = self.pending.pop_front() else {
                 break;
             };
             if (Self::force_serial() || !self.enabled)
@@ -4377,15 +5704,20 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     .as_chat()
                     .is_some_and(|chat| matches!(chat, ChatCmd::ReleaseCacheOwner { .. }))
             {
-                self.scheduler.enqueue_exclusive(command);
+                self.scheduler
+                    .enqueue_exclusive(Queued { command, arrival });
                 break;
             }
             match command.into_chat() {
                 Ok(ChatCmd::ReleaseCacheOwner { owner_id, reply }) => {
                     if self.cache_owner_release_blocked(&owner_id) {
-                        self.pending.push_front(ModelCommand::from_chat(
-                            ChatCmd::ReleaseCacheOwner { owner_id, reply },
-                        ));
+                        self.pending.push_front(Queued {
+                            command: ModelCommand::from_chat(ChatCmd::ReleaseCacheOwner {
+                                owner_id,
+                                reply,
+                            }),
+                            arrival,
+                        });
                         break;
                     }
                     let _ = reply.send(self.release_cache_owner_now(&owner_id));
@@ -4398,14 +5730,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                             || self.ownerless_speculation_is_scheduled(&chat))
                         || self.chat_requires_barrier(&chat)
                     {
-                        self.scheduler
-                            .enqueue_exclusive(ModelCommand::from_chat(chat));
+                        self.scheduler.enqueue_exclusive(Queued {
+                            command: ModelCommand::from_chat(chat),
+                            arrival,
+                        });
                         exclusive = true;
                     } else if let Some(prepared) = {
                         if let Some(wired) = wired.as_mut() {
                             wired.mark();
                         }
-                        self.prepare_chat(chat)
+                        self.prepare_chat(chat, arrival)
                     } {
                         match self.admit_prepared(prepared) {
                             Ok(Some(turn)) => {
@@ -4430,59 +5764,31 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
 
         self.begin_scheduled_step();
-        let action = {
-            let mut executor = self.inner.step_executor();
-            self.scheduler.drive_once(&mut executor)
-        };
+        let action = self.step();
         let scheduler_idle = matches!(&action, Ok(SchedulerAction::Idle));
         let mut may_resume_preempted = true;
         match action {
-            Ok(SchedulerAction::Idle) => {}
-            Ok(SchedulerAction::Exclusive(command) | SchedulerAction::Barrier(command)) => {
-                let reset = command
-                    .as_chat()
-                    .is_some_and(|chat| matches!(chat, ChatCmd::ResetCaches { .. }));
-                let command = match command.into_scheduler_stats() {
-                    Ok(reply) => {
-                        let _ = reply.send(Ok(self.scheduler.stats().to_js()));
-                        return LoopControl::Continue;
-                    }
-                    Err(command) => command,
-                };
-                if let Some(wired) = wired.as_mut() {
-                    wired.mark();
-                }
-                self.inner.execute_barrier(
-                    command,
-                    SchedulerOwnerContext {
-                        owner_sequences: &mut self.owner_sequences,
-                        owner_states: &mut self.owner_states,
-                        next_seq_id: &mut self.next_seq_id,
-                    },
-                );
-                if reset {
-                    self.owner_sequences.clear();
-                    self.owner_states.clear();
+            Ok(SchedulerAction::Idle) => self.close_pass(&mut []),
+            Ok(SchedulerAction::Exclusive(Queued { command, arrival })) => {
+                if let Some(control) = self.run_command(command, Some(arrival), wired.as_mut()) {
+                    return control;
                 }
             }
-            Ok(SchedulerAction::Stepped {
-                completed,
-                preempted,
-                blocked_alone,
-                ..
-            }) => {
+            Ok(SchedulerAction::Barrier(command)) => {
+                if let Some(control) = self.run_command(command, None, wired.as_mut()) {
+                    return control;
+                }
+            }
+            Ok(mut step @ SchedulerAction::Stepped { .. }) => {
                 if let Some(wired) = wired.as_mut() {
                     wired.used();
                 }
-                may_resume_preempted = self.settle_step(completed, preempted, blocked_alone);
+                if let SchedulerAction::Stepped { completed, .. } = &mut step {
+                    self.close_pass(completed);
+                }
+                may_resume_preempted = self.settle_step(step);
             }
-            Err(SchedulerError::Executor(error)) => {
-                tracing::error!(
-                    "{} scheduler execution failed: {error:?}",
-                    B::SCHEDULER_NAME
-                );
-                return LoopControl::Break;
-            }
+            Err(SchedulerError::Executor(error)) => return self.executor_failed(error),
             Err(SchedulerError::InvalidResult(message)) => {
                 tracing::error!(
                     "{} scheduler returned an invalid result: {message}",
@@ -4491,7 +5797,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 return LoopControl::Break;
             }
         }
+        self.recover_if_gpu_oom();
         if may_resume_preempted {
+            self.refresh_wanted_chains();
             self.try_resume_preempted();
         }
         if scheduler_idle && (self.scheduler.has_work() || self.prepared_waiting.is_some()) {
@@ -5901,9 +7209,7 @@ pub(crate) mod tests {
         let moe = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE model");
         assert!(dense.scheduler_books_on_demand());
         assert!(moe.scheduler_books_on_demand());
-        if std::env::var_os("MLX_SCHED_RESERVE_FULL_ISL").is_none()
-            && let Ok(nemotron) = NemotronHInner::new(tiny_nemotron_paged_config())
-        {
+        if let Ok(nemotron) = NemotronHInner::new(tiny_nemotron_paged_config()) {
             assert!(!nemotron.scheduler_books_on_demand());
         }
     }
@@ -6116,9 +7422,6 @@ pub(crate) mod tests {
         );
         assert!(kept, "the idle owner's cache was reclaimed before a grow");
 
-        if std::env::var_os("MLX_SCHED_RESERVE_FULL_ISL").is_some() {
-            return;
-        }
         let Some((mut state, _)) = growable_scheduler_state() else {
             return;
         };
@@ -6261,276 +7564,6 @@ pub(crate) mod tests {
             .set_grow_headroom_probe_override(Some(probe));
     }
 
-    /// A running turn over a `prompt`-token prompt at `num_tokens`, charged
-    /// `charge`; its prompt blocks go back to the pool so every case reads
-    /// the whole pool as room.
-    #[cfg(target_os = "macos")]
-    pub(in crate::engine::hybrid_scheduler) fn mtp_step_turn_with(
-        state: &mut HybridSchedulerState<Qwen35Inner>,
-        seq: u32,
-        prompt: u32,
-        speculative: bool,
-        num_tokens: u32,
-        charge: u64,
-    ) -> TurnState<ScheduledTurn<<Qwen35Inner as PagedBackend>::PrefixState>> {
-        let mut turn = speculative::tests::request(
-            &mut state.inner,
-            seq,
-            (0..prompt).map(|token| token % 16).collect(),
-            speculative,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .with_block_reservation(0, 0, 16)
-        .with_recurrent_state_reservation(charge);
-        turn.num_tokens = num_tokens;
-        state
-            .inner
-            .release_scheduled_cache(seq)
-            .expect("return the prompt blocks");
-        let snapshot = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("scheduler snapshot")
-            .expect("paged adapter present");
-        assert_eq!(
-            snapshot.blocks.free_blocks + snapshot.blocks.reclaimable_blocks,
-            snapshot.blocks.total_blocks
-        );
-        turn
-    }
-
-    /// A decoding MTP turn over a 40-token prompt at `num_tokens`.
-    #[cfg(target_os = "macos")]
-    fn mtp_step_turn(
-        state: &mut HybridSchedulerState<Qwen35Inner>,
-        seq: u32,
-        num_tokens: u32,
-        admission: u64,
-    ) -> TurnState<ScheduledTurn<<Qwen35Inner as PagedBackend>::PrefixState>> {
-        let mut turn = mtp_step_turn_with(state, seq, 40, true, num_tokens, admission);
-        turn.num_computed_tokens = num_tokens - 1;
-        turn
-    }
-
-    /// Each step prices every running MTP turn at the state it holds, its
-    /// charge included, against the 64-block pool (524,288 B): alone at
-    /// 254 rows 463,104 B fits, at 504 rows 527,104 B does not, and two
-    /// turns at 250 (925,952 B) do not, though their state past the
-    /// charges is only 54,016 B.
-    /// Mutations: `draft_shortfall` returns `Ok(0)` → red (504 rows);
-    /// price turns past their charge (`uncharged_draft_state_bytes`) → red
-    /// (pair); drop the peers → red (pair).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn running_mtp_step_prices_every_turns_held_state() {
-        let Some((mut state, admission)) = mtp_step_state_with(64, 64) else {
-            return;
-        };
-        let short = vec![mtp_step_turn(&mut state, 1, 250, admission)];
-        assert_eq!(
-            step_state_bytes(&state.inner, &short[0], 254, 8_192),
-            463_104
-        );
-        assert!(
-            HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(&short, 0, 4)
-                .expect("short step")
-        );
-        let lone = vec![mtp_step_turn(&mut state, 2, 500, admission)];
-        assert_eq!(
-            step_state_bytes(&state.inner, &lone[0], 504, 8_192),
-            527_104
-        );
-        assert!(
-            !HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(&lone, 0, 4)
-                .expect("lone step")
-        );
-        state.inner.release_scheduled_recurrent_for(1);
-        state.inner.release_scheduled_recurrent_for(2);
-        let pair = vec![
-            mtp_step_turn(&mut state, 3, 250, admission),
-            mtp_step_turn(&mut state, 4, 250, admission),
-        ];
-        assert_eq!(pair[1].decode_draft_allowance, 3);
-        assert_eq!(
-            step_state_bytes(&state.inner, &pair[1], 253, 8_192),
-            462_848
-        );
-        assert_eq!(
-            uncharged_draft_state_bytes(&state.inner, &pair[0], 254)
-                + uncharged_draft_state_bytes(&state.inner, &pair[1], 253),
-            54_016
-        );
-        assert!(
-            !HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(&pair, 0, 4)
-                .expect("pair step")
-        );
-    }
-
-    /// A 16-block pool (131,072 B free) that may grow to 64 blocks has
-    /// 524,288 B left for state. A lone MTP turn at 254 rows holds
-    /// 463,104 B: it fits in the ungrown room and the pool stays at 16
-    /// blocks, since state lives beside the pool. At 504 rows it holds
-    /// 527,104 B and blocks.
-    /// Mutation: grow the pool by the shortfall over the free bytes in
-    /// `draft_shortfall` → red (57 blocks ≠ 16).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn running_mtp_step_counts_the_ungrown_pool_without_growing_it() {
-        let Some((mut state, admission)) = mtp_step_state_with(16, 64) else {
-            return;
-        };
-        set_mtp_step_probe(&mut state, true);
-        let total_blocks = |state: &HybridSchedulerState<Qwen35Inner>| {
-            state
-                .inner
-                .scheduler_cache_snapshot()
-                .expect("scheduler snapshot")
-                .expect("paged adapter present")
-                .blocks
-                .total_blocks
-        };
-        let lone = vec![mtp_step_turn(&mut state, 1, 250, admission)];
-        assert_eq!(
-            step_state_bytes(&state.inner, &lone[0], 254, 8_192),
-            463_104
-        );
-        assert!(
-            HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(&lone, 0, 4)
-                .expect("step in the ungrown room")
-        );
-        assert_eq!(total_blocks(&state), 16);
-        state.inner.release_scheduled_recurrent_for(1);
-        let past = vec![mtp_step_turn(&mut state, 2, 500, admission)];
-        assert_eq!(
-            step_state_bytes(&state.inner, &past[0], 504, 8_192),
-            527_104
-        );
-        assert!(
-            !HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(&past, 0, 4)
-                .expect("step past the max pool")
-        );
-        assert_eq!(total_blocks(&state), 16);
-    }
-
-    /// A lone MTP turn admitted over a 128-token prompt (9 booked blocks)
-    /// passes its step at 159 rows (10 blocks: 438,784 B of state in
-    /// 442,368 B free), priced at what it holds, not at its admission
-    /// charge's prefill hidden rows; at 176 rows (11 blocks) it blocks.
-    /// Mutation: price the own turn at `max(charge, held)` → red (503,552 B).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn lone_mtp_turn_passes_every_step_in_its_window() {
-        let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
-            return;
-        };
-        let charge =
-            state.inner.recurrent_state_bytes() + state.inner.scheduled_draft_state_bytes(144);
-        let mut turn = mtp_step_turn_with(&mut state, 1, 128, true, 155, charge)
-            .with_block_reservation(9, 9, 16);
-        turn.num_computed_tokens = 154;
-        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
-        adapter.reserve_rows_for(1, 159).expect("window KV");
-        assert_eq!(adapter.block_table_for(1).expect("table").num_blocks(), 10);
-        let lone = vec![turn];
-        assert_eq!(
-            step_state_bytes(&state.inner, &lone[0], 159, 8_192),
-            438_784
-        );
-        assert!(
-            HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(&lone, 0, 4)
-                .expect("last window step")
-        );
-        let mut past = lone;
-        past[0].num_tokens = 172;
-        past[0].num_computed_tokens = 171;
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .reserve_rows_for(1, 176)
-            .expect("past-window KV");
-        assert!(
-            !HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(&past, 0, 4)
-                .expect("past-window step")
-        );
-    }
-
-    /// A peer's booked blocks the pool has not handed out yet count: an AR
-    /// peer still prefilling with 8 unbooked blocks (65,536 B) and its
-    /// recurrent charge (29,184 B) beside a lone MTP turn at 254 rows
-    /// (463,104 B) is 557,824 B, over the 64-block pool's 524,288 B.
-    /// Mutation: drop the bookings from `step_state_bytes` → red (29,184 B ≠ 94,720 B).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn running_mtp_step_counts_unmaterialized_bookings() {
-        let Some((mut state, admission)) = mtp_step_state_with(64, 64) else {
-            return;
-        };
-        let recurrent = state.inner.recurrent_state_bytes();
-        let mtp = mtp_step_turn(&mut state, 1, 250, admission);
-        let ar = mtp_step_turn_with(&mut state, 2, 40, false, 40, recurrent)
-            .with_block_reservation(8, 0, 16);
-        let pair = vec![mtp, ar];
-        assert_eq!(
-            step_state_bytes(&state.inner, &pair[1], 40, 8_192),
-            recurrent + 65_536
-        );
-        assert!(
-            !HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(&pair, 0, 4)
-                .expect("step beside a booked peer")
-        );
-        assert!(
-            HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(&pair[..1], 0, 4)
-                .expect("step alone")
-        );
-    }
-
-    /// An idle owner's parked row counts: beside it, the lone MTP turn at
-    /// the last row of its window (438,784 B in 442,368 B free) needs
-    /// 467,968 B and blocks; with the row released it fits.
-    /// Mutations: drop the idle rows from `draft_shortfall` → red (blocks
-    /// beside the row); do not subtract the running turns' own rows → red
-    /// (fits alone).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn mtp_step_counts_idle_parked_rows() {
-        let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
-            return;
-        };
-        let recurrent = state.inner.recurrent_state_bytes();
-        drop(mtp_step_turn_with(&mut state, 2, 40, false, 40, recurrent));
-        let charge = recurrent + state.inner.scheduled_draft_state_bytes(144);
-        let mut turn = mtp_step_turn_with(&mut state, 1, 128, true, 155, charge)
-            .with_block_reservation(9, 9, 16);
-        turn.num_computed_tokens = 154;
-        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
-        adapter.reserve_rows_for(1, 159).expect("window KV");
-        assert_eq!(adapter.block_table_for(1).expect("table").num_blocks(), 10);
-        let lone = vec![turn];
-        assert_eq!(state.inner.scheduled_recurrent_bytes(), 58_368);
-        assert!(
-            !HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(&lone, 0, 4)
-                .expect("step beside an idle row")
-        );
-        state.inner.release_scheduled_recurrent_for(2);
-        assert_eq!(state.inner.scheduled_recurrent_bytes(), 29_184);
-        assert!(
-            HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(&lone, 0, 4)
-                .expect("step with the idle row released")
-        );
-    }
-
     /// Every planned row blocks, as a step whose KV or draft state did not fit.
     #[cfg(target_os = "macos")]
     struct BlockEveryRow;
@@ -6564,16 +7597,707 @@ pub(crate) mod tests {
         turn: TurnState<ScheduledTurn<B::PrefixState>>,
     ) {
         state.scheduler.enqueue_turn(turn).expect("enqueue");
-        let Ok(SchedulerAction::Stepped {
-            completed,
-            preempted,
-            blocked_alone,
+        let step = state.step_with(&mut BlockEveryRow).expect("a step");
+        assert!(matches!(step, SchedulerAction::Stepped { .. }));
+        assert!(!state.settle_step(step));
+    }
+
+    /// Every planned row runs one decode or prefill slice.
+    #[cfg(target_os = "macos")]
+    struct RunEveryRow;
+
+    #[cfg(target_os = "macos")]
+    impl<P> StepExecutor<P> for RunEveryRow {
+        type Error = Error;
+
+        fn execute(
+            &mut self,
+            plan: &StepPlan,
+            _running: &mut [TurnState<P>],
+        ) -> std::result::Result<StepResult, Self::Error> {
+            Ok(StepResult {
+                rows: plan
+                    .rows
+                    .iter()
+                    .map(|row| RowStepResult {
+                        seq_id: row.seq_id,
+                        num_computed_tokens: row.num_tokens,
+                        generated_token: (row.kind == StepKind::Decode).then_some(7),
+                        speculative: None,
+                        finished: false,
+                        allocation_blocked: false,
+                        prefill_micros: 0,
+                    })
+                    .collect(),
+                executed_decode_batch: plan
+                    .rows
+                    .iter()
+                    .filter(|row| row.kind == StepKind::Decode)
+                    .count(),
+                executed_greedy_epilogue_batch: 0,
+                rows_alloc_evicted: 0,
+            })
+        }
+    }
+
+    /// A running turn decoding past its `16`-token prompt of `seq`'s own
+    /// tokens, which holds one block.
+    #[cfg(target_os = "macos")]
+    fn decoding_turn(state: &mut HybridSchedulerState<Qwen35Inner>, seq: u32) -> Turn<Qwen35Inner> {
+        let mut turn = speculative::tests::request(
+            &mut state.inner,
+            seq,
+            (0..16).map(|token| seq * 100 + token).collect(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        turn.num_computed_tokens = 16;
+        turn.token_history.push(3);
+        turn.num_tokens = 17;
+        turn
+    }
+
+    /// Two decode rows (the live GDN unit cap) at the max pool with room for
+    /// one: the row that claims first runs, the other is refused with its
+    /// denial and replans at the next step, and no turn is preempted
+    /// (Splash `Engine::prepare`: a refused lane leaves the plan).
+    /// Mutation P2m: the hook refuses every row when one is refused → red
+    /// (no row runs; replans 0).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn one_refused_row_does_not_stall_the_wave() {
+        let Some((mut state, _)) = growable_qwen35_state() else {
+            return;
+        };
+        state.inner.paged_adapter = Some(tiny_paged_adapter_with(
+            Arc::clone(&state.inner.cache_recency),
+            3,
+            3,
+        ));
+        for seq in 1..=2 {
+            let turn = decoding_turn(&mut state, seq);
+            state.scheduler.reinstate_running(turn);
+        }
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        assert_eq!(
+            snapshot.blocks.free_blocks + snapshot.blocks.reclaimable_blocks,
+            1
+        );
+        let step = state.step_with(&mut RunEveryRow).expect("a step");
+        let SchedulerAction::Stepped {
+            blocked,
+            progressed,
             ..
-        }) = state.scheduler.drive_once(&mut BlockEveryRow)
+        } = &step
         else {
             panic!("expected a step");
         };
-        assert!(!state.settle_step(completed, preempted, blocked_alone));
+        assert!(*progressed);
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].0, 2);
+        assert!(blocked[0].1.blocks.is_some());
+        assert_eq!(state.scheduler.stats().replans, 1);
+        assert!(!state.settle_step(step));
+        assert_eq!(state.scheduler.stats().preemptions, 0);
+        assert_eq!(state.scheduler.running_len(), 2);
+        let computed: Vec<u32> = state
+            .scheduler
+            .running()
+            .iter()
+            .map(|turn| turn.num_computed_tokens)
+            .collect();
+        assert_eq!(computed, vec![17, 16]);
+    }
+
+    /// A Qwen3.5 state registered on a governor of its own, with `lanes`
+    /// running, each with its reply; lane 1 has prefilled 8 tokens, so a
+    /// later lane yields first.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::type_complexity)]
+    fn judged_state(
+        lanes: &[u32],
+    ) -> Option<(
+        HybridSchedulerState<Qwen35Inner>,
+        &'static Governor,
+        Vec<tokio::sync::oneshot::Receiver<Result<ChatResult>>>,
+    )> {
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        let (mut state, _) = growable_qwen35_state()?;
+        let io = FakeIo::new(
+            stats(0),
+            host(32 * G, crate::engine::governor::host::Pressure::Normal),
+        );
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+        state.inner.memory_registration =
+            Some(governor.register_model(model(16 * G, 0)).expect("register"));
+        let mut replies = Vec::new();
+        for &seq in lanes {
+            let mut turn = speculative::tests::request(
+                &mut state.inner,
+                seq,
+                (0..16).map(|token| seq * 100 + token).collect(),
+                false,
+                Arc::new(AtomicBool::new(false)),
+            );
+            if seq == 1 {
+                turn.num_computed_tokens = 8;
+            }
+            let (reply, result) = tokio::sync::oneshot::channel();
+            turn.payload.response = ScheduledReply::Sync(reply);
+            replies.push(result);
+            state.scheduler.reinstate_running(turn);
+        }
+        Some((state, governor, replies))
+    }
+
+    fn kv_denial(failure: Failure) -> Denial {
+        Denial {
+            failure: Some(failure),
+            pending: false,
+            blocks: Some(BlockRefusal {
+                additional: 3,
+                available: 1,
+            }),
+        }
+    }
+
+    /// Splash `Engine::refuse` / `judge` when no row ran: a pending denial
+    /// waits (every refused row deferred, nothing preempted); beside
+    /// another lane the lane to yield first is suspended to the KV it
+    /// holds; a lone lane the host refused is suspended to its own work
+    /// end; a lone lane the limit refused fails `capacity_exhausted`.
+    /// Mutation J1: a lone lane the host refused fails → red (the third
+    /// case's lane fails instead of yielding).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn judge_waits_yields_or_fails() {
+        // Pending → Wait.
+        let Some((mut state, _, _replies)) = judged_state(&[1, 2]) else {
+            return;
+        };
+        let pending = Denial {
+            pending: true,
+            ..Denial::default()
+        };
+        let blocked = vec![(1, pending), (2, kv_denial(Failure::EngineBudget))];
+        assert!(!state.settle_blocked(blocked, false, &[1, 2]));
+        assert_eq!(state.scheduler.stats().preemptions, 0);
+        assert_eq!(state.scheduler.running_len(), 2);
+        for turn in state.scheduler.running() {
+            assert!(
+                turn.resource_wait.retry_at > 0.0,
+                "{} deferred",
+                turn.seq_id
+            );
+        }
+
+        // Another resident → Yield the lane to yield first, to its KV.
+        let Some((mut state, governor, _replies)) = judged_state(&[1, 2]) else {
+            return;
+        };
+        assert_eq!(state.scheduler.lane_to_yield(), Some(2));
+        let blocked = vec![(1, kv_denial(Failure::EngineBudget))];
+        assert!(!state.settle_blocked(blocked, false, &[1, 2]));
+        assert_eq!(state.scheduler.stats().preemptions, 1);
+        assert_eq!(
+            state
+                .scheduler
+                .running()
+                .iter()
+                .map(|turn| turn.seq_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        let yielded = state.scheduler.turn_mut(2).expect("suspended turn");
+        assert_eq!(yielded.resume_target, 16);
+        assert!(yielded.resource_wait.retry_at > 0.0);
+        assert_eq!(governor.suspensions(7), 1);
+        assert!(governor.draining_for_recovery(7, governor.now(), true));
+
+        // Lone + HostPressure → Yield to its own work end.
+        let Some((mut state, governor, _replies)) = judged_state(&[1]) else {
+            return;
+        };
+        state.row_work_ends.insert(1, 33);
+        let blocked = vec![(1, kv_denial(Failure::HostPressure))];
+        assert!(!state.settle_blocked(blocked, false, &[1]));
+        assert_eq!(state.scheduler.stats().preemptions, 1);
+        assert_eq!(state.scheduler.running_len(), 0);
+        assert_eq!(
+            state
+                .scheduler
+                .turn_mut(1)
+                .expect("suspended turn")
+                .resume_target,
+            33
+        );
+        assert_eq!(governor.suspensions(7), 1);
+
+        // Lone + EngineBudget → Fail.
+        let Some((mut state, _, mut replies)) = judged_state(&[1]) else {
+            return;
+        };
+        let blocked = vec![(1, kv_denial(Failure::EngineBudget))];
+        assert!(!state.settle_blocked(blocked, false, &[1]));
+        let error = replies[0]
+            .try_recv()
+            .expect("the turn has ended")
+            .expect_err("the turn fails");
+        assert!(
+            error.reason.starts_with(
+                "capacity_exhausted: could not allocate KV target: engine memory budget exceeded \
+                 (additional_pages=3, free_pages=1)"
+            ),
+            "{}",
+            error.reason
+        );
+        assert_eq!(state.scheduler.stats().preemptions, 0);
+        assert_eq!(state.live_turns(), 0);
+    }
+
+    /// Splash `Engine::prepare`: before a step that ran no row refuses its
+    /// lanes, a refusal that is not KV and that nothing returns yields the
+    /// lane to yield first when that lane is outside the plan and yields
+    /// before the refused row, even beside a pending refusal.
+    /// Mutation F8 (the exception only when a row ran) → red (the pending
+    /// denial defers every row, nothing yields).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_draft_refusal_yields_the_outside_lane_when_no_row_ran() {
+        let Some((mut state, governor, _replies)) = judged_state(&[1, 2]) else {
+            return;
+        };
+        // A third lane past the live GDN unit cap: lane 1's cell goes, as
+        // nothing here runs a forward.
+        state.inner.release_scheduled_recurrent_for(1);
+        let mut third = speculative::tests::request(
+            &mut state.inner,
+            3,
+            (0..16).map(|token| 300 + token).collect(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        third.num_computed_tokens = 4;
+        state.scheduler.reinstate_running(third);
+        assert_eq!(state.scheduler.lane_to_yield(), Some(2));
+        let pending = Denial {
+            pending: true,
+            ..kv_denial(Failure::EngineBudget)
+        };
+        let draft = Denial {
+            failure: Some(Failure::EngineBudget),
+            pending: false,
+            blocks: None,
+        };
+        let blocked = vec![(1, pending), (3, draft)];
+        assert!(!state.settle_blocked(blocked, false, &[1, 3]));
+        assert_eq!(state.scheduler.stats().preemptions, 1);
+        assert_eq!(
+            state
+                .scheduler
+                .running()
+                .iter()
+                .map(|turn| turn.seq_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(governor.suspensions(7), 1);
+    }
+
+    /// A cancelled lane whose rows the ledger refuses ends between steps
+    /// (Splash `Engine::cancel`), its claim and memory with it.
+    /// Mutation RC1 (only waiting turns are reaped) → red (the lane stays
+    /// running, its reply open).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_cancelled_refused_lane_ends_between_steps() {
+        let Some((mut state, _governor, mut replies)) = judged_state(&[1, 2]) else {
+            return;
+        };
+        let turn = state.scheduler.running_turn_mut(2).expect("lane 2");
+        turn.resource_wait.retry_at = f64::MAX;
+        turn.cancelled
+            .as_ref()
+            .expect("cancel flag")
+            .store(true, Ordering::Relaxed);
+        state.reap_cancelled_waiters();
+        assert_eq!(
+            state
+                .scheduler
+                .running()
+                .iter()
+                .map(|turn| turn.seq_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        let error = replies[1]
+            .try_recv()
+            .expect("the turn has ended")
+            .expect_err("cancelled");
+        assert_eq!(error.reason, engine::session::CHAT_SESSION_CANCELLED);
+        assert!(replies[0].try_recv().is_err(), "lane 1 runs on");
+    }
+
+    /// A lane suspended before its first step was granted gives back its
+    /// admission's GDN cell bytes: its resume reserves them again.
+    /// Mutation CL1 (the suspended lane keeps its cell reservation) → red
+    /// (the bytes stay reserved).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_lane_vacated_before_its_first_step_drops_its_cell() {
+        let Some((mut state, governor, _replies)) = judged_state(&[1, 2]) else {
+            return;
+        };
+        let claim = governor.open(crate::engine::governor::governor::whole_turn_spec(9), 7);
+        let cell = {
+            let _scope = Scope::enter(claim.claim());
+            governor.try_reserve(1 << 20).expect("the cell's bytes")
+        };
+        state
+            .scheduler
+            .running_turn_mut(2)
+            .expect("lane 2")
+            .payload
+            .cell = Some(cell);
+        assert_eq!(governor.reserved_bytes(), 1 << 20);
+        let blocked = vec![(1, kv_denial(Failure::EngineBudget))];
+        assert!(!state.settle_blocked(blocked, false, &[1, 2]));
+        assert_eq!(state.scheduler.stats().preemptions, 1);
+        assert_eq!(governor.reserved_bytes(), 0);
+    }
+
+    /// A row's work runs in its request's claim (Splash
+    /// `Engine::stateClaim`), so what it publishes claims with the lane's
+    /// request and rank, not the engine's.
+    /// Mutation RQ1 (no row scope) → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_rows_work_runs_in_its_requests_claim() {
+        let Some((mut state, governor, _replies)) = judged_state(&[1]) else {
+            return;
+        };
+        let claim = governor.open(crate::engine::governor::governor::whole_turn_spec(11), 7);
+        let id = claim.id();
+        let turn = state.scheduler.running_turn_mut(1).expect("lane 1");
+        turn.payload.claim = Some(claim);
+        let _row = HybridStepExecutor::<Qwen35Inner>::request_scope(turn);
+        assert_eq!(governor.scope_claim(), Some(id));
+        assert_eq!(governor.spec(id).map(|spec| spec.request_id), Some(11));
+    }
+
+    /// A Qwen3.5 scheduler registered on a governor of its own whose limit
+    /// is `hard_budget`, its counters reading `pools` bytes of pools.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::type_complexity)]
+    fn ledger_state(
+        hard_budget: u64,
+        pools: u64,
+    ) -> Option<(
+        HybridSchedulerState<Qwen35Inner>,
+        &'static Governor,
+        Arc<crate::engine::governor::governor::tests::FakeIo>,
+    )> {
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        let (mut state, _) = growable_qwen35_state()?;
+        let io = FakeIo::new(
+            stats(0),
+            host(32 * G, crate::engine::governor::host::Pressure::Normal),
+        );
+        io.with(|fake| fake.stats.pools = pools);
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io.clone())));
+        state.inner.memory_registration = Some(
+            governor
+                .register_model(model(hard_budget, 0))
+                .expect("register"),
+        );
+        Some((state, governor, io))
+    }
+
+    /// A plain text turn of `prompt` for owner `seq_id`, prepared for
+    /// admission, and its reply.
+    #[cfg(target_os = "macos")]
+    fn prepared_turn(
+        state: &mut HybridSchedulerState<Qwen35Inner>,
+        seq_id: SeqId,
+        prompt: Vec<u32>,
+    ) -> (
+        Box<PreparedTurn>,
+        tokio::sync::oneshot::Receiver<Result<ChatResult>>,
+    ) {
+        use crate::models::gemma4::dspark_decode::tests::{tiny_qwen_tokenizer, tiny_turn_config};
+        let config = tiny_turn_config(None, 20);
+        let params = state.inner.resolve_params(&config);
+        let thinking = state.inner.thinking_setup(&config);
+        let prompt_tokens = prompt.len() as u32;
+        let owner_id = format!("owner-{seq_id}");
+        state.owner_sequences.insert(owner_id.clone(), seq_id);
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let prepared = PreparedTurn {
+            admitted: engine::session::AdmittedPagedTurn {
+                tokenizer: tiny_qwen_tokenizer(),
+                eos_id: 999,
+                close: engine::backend::ThinkEndResolution {
+                    think_end_id: None,
+                    think_end_str: None,
+                    thinking_end: Arc::from(Vec::new()),
+                    think_end_extra_ids: Vec::new(),
+                },
+                config,
+                params,
+                thinking,
+                template_thinking_enabled: false,
+                tokens: prompt,
+                images: Vec::new(),
+                audio: Vec::new(),
+                plan: engine::plan::TurnPlan {
+                    is_delta: false,
+                    input_media: engine::plan::MediaCapabilities::NONE,
+                    context_media: engine::plan::MediaCapabilities::NONE,
+                    use_paged_attention: true,
+                    decoder: engine::plan::DecoderPlan::Autoregressive,
+                },
+            },
+            response: ScheduledReply::Sync(reply),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            owner_id,
+            seq_id,
+            newly_assigned: false,
+            reservation_blocks: prompt_tokens.div_ceil(16) + 1,
+            block_size: 16,
+            reservation_state_bytes: state.inner.recurrent_state_bytes(),
+            requested_tokens: prompt_tokens + 19,
+            claim: None,
+            resource_wait: ResourceWait::default(),
+            enqueued_at: Instant::now(),
+            ttft: TtftClock::default(),
+        };
+        (Box::new(prepared), result)
+    }
+
+    /// Splash `Engine::admit`: a request alone claims its GDN cell in
+    /// service, one beside a resident lane as a Start. With room below the
+    /// cell and nothing to take, the cell's reservation is refused and the
+    /// lone start fails `capacity_exhausted`.
+    /// Mutation S1: the admission claim is always InService → red (the
+    /// second turn's claim is InService). Mutation S2: the cell is not
+    /// reserved (its arrays are allocated lazily) → red (the lone start is
+    /// admitted).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn admission_is_start_beside_a_lane() {
+        use crate::engine::governor::governor::tests::G;
+        let Some((mut state, governor, _io)) = ledger_state(16 * G, 0) else {
+            return;
+        };
+        let cell = state.inner.recurrent_state_bytes();
+        assert!(cell > 0);
+        let class = |turn: &Turn<Qwen35Inner>| {
+            governor
+                .spec(turn.payload.claim.as_ref().expect("a claim").id())
+                .expect("an open claim")
+                .cls
+        };
+        let (prepared, _alone) = prepared_turn(&mut state, 1, tokens_of(1, 1));
+        let turn = state
+            .admit_prepared(prepared)
+            .ok()
+            .flatten()
+            .expect("admitted alone");
+        assert_eq!(class(&turn), ClaimClass::InService);
+        assert!(turn.payload.cell.is_some(), "the cell is reserved");
+        assert_eq!(turn.admission, 1);
+        state.scheduler.reinstate_running(turn);
+        let (prepared, _beside) = prepared_turn(&mut state, 2, tokens_of(2, 1));
+        let turn = state
+            .admit_prepared(prepared)
+            .ok()
+            .flatten()
+            .expect("admitted beside a lane");
+        assert_eq!(class(&turn), ClaimClass::Start);
+        assert_eq!(turn.admission, 2);
+
+        let Some((mut state, _, _io)) = ledger_state(cell - 1, 0) else {
+            return;
+        };
+        let (prepared, mut result) = prepared_turn(&mut state, 1, tokens_of(1, 1));
+        assert!(matches!(state.admit_prepared(prepared), Ok(None)));
+        let error = result
+            .try_recv()
+            .expect("the turn has ended")
+            .expect_err("the turn fails");
+        assert!(
+            error.reason.starts_with(
+                "capacity_exhausted: could not allocate request state: engine memory budget \
+                 exceeded"
+            ),
+            "{}",
+            error.reason
+        );
+    }
+
+    /// Splash `Engine::suspendLane` → `admit`: a lone lane the host refused
+    /// at its slice end E is suspended to E and, once its retry time came,
+    /// resumes holding E's KV at once. A lane suspended beside another
+    /// keeps the KV it held as its target and waits out the drain while
+    /// the other runs.
+    /// Mutation V1: the resume claims its chain only → red (no block past
+    /// the chain). Mutation V2: a waiting resume is retried every
+    /// iteration → red (resumed before its retry time).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_victim_resumes_to_its_suspended_target() {
+        let Some((mut state, governor, _replies)) = judged_state(&[1]) else {
+            return;
+        };
+        state.row_work_ends.insert(1, 33);
+        let blocked = vec![(1, kv_denial(Failure::HostPressure))];
+        assert!(!state.settle_blocked(blocked, false, &[1]));
+        assert_eq!(
+            state
+                .scheduler
+                .turn_mut(1)
+                .expect("suspended")
+                .resume_target,
+            33
+        );
+        state.resume_preempted();
+        assert!(state.scheduler.has_preempted(), "not before its retry time");
+        governor.sleep(0.2);
+        state.resume_preempted();
+        assert!(!state.scheduler.has_preempted(), "resumed");
+        assert_eq!(state.inner.scheduler_materialized_blocks(1), 3);
+        let resumed = state.scheduler.turn_mut(1).expect("resumed");
+        assert_eq!(resumed.resume_target, 0);
+        assert!(resumed.payload.cell.is_some());
+        assert_eq!(governor.resumptions(7), 1);
+
+        let Some((mut state, governor, _replies)) = judged_state(&[1, 2]) else {
+            return;
+        };
+        let blocked = vec![(1, kv_denial(Failure::EngineBudget))];
+        assert!(!state.settle_blocked(blocked, false, &[1, 2]));
+        assert_eq!(
+            state
+                .scheduler
+                .turn_mut(2)
+                .expect("suspended")
+                .resume_target,
+            16
+        );
+        governor.sleep(0.2);
+        state.resume_preempted();
+        assert!(
+            state.scheduler.has_preempted(),
+            "not while the resident lane drains"
+        );
+        let lane = state.scheduler.take_running(1).expect("lane 1");
+        state.fail_preempted(lane, "done".into());
+        state.resume_preempted();
+        assert!(!state.scheduler.has_preempted(), "resumed");
+        assert_eq!(state.inner.scheduler_materialized_blocks(2), 1);
+        assert_eq!(governor.resumptions(7), 1);
+    }
+
+    /// Splash `Engine::tick`: a start the host refused, with no lane
+    /// working before it, waits out the 30 s limit and then fails
+    /// `resource_timeout`, not before.
+    /// Mutation T1 (no deadline) → red (never times out).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn start_times_out_at_30s_without_competitor_work() {
+        use crate::engine::governor::governor::tests::{G, host};
+        use crate::engine::governor::host::Pressure;
+        let Some((mut state, _, io)) = ledger_state(16 * G, 0) else {
+            return;
+        };
+        io.with(|fake| fake.host = host(32 * G, Pressure::Critical));
+        let (prepared, mut result) = prepared_turn(&mut state, 1, tokens_of(1, 1));
+        let Err(prepared) = state.admit_prepared(prepared) else {
+            panic!("the host refused it: it waits");
+        };
+        assert_eq!(prepared.resource_wait.failure, Some(Failure::HostPressure));
+        state.prepared_waiting = Some(prepared);
+        for at in 1..30 {
+            io.with(|fake| fake.now = f64::from(at));
+            state.tick_waits();
+            assert!(result.try_recv().is_err(), "ended at {at} s");
+            assert!(state.has_prepared_waiting());
+        }
+        io.with(|fake| fake.now = 30.0);
+        state.tick_waits();
+        assert!(!state.has_prepared_waiting());
+        let error = result
+            .try_recv()
+            .expect("the turn has ended")
+            .expect_err("the turn fails");
+        assert_eq!(
+            error.reason,
+            "resource_timeout: memory did not become available within the resource wait limit: \
+             macOS is short of memory; close memory-heavy applications"
+        );
+    }
+
+    /// Splash `Engine::admit`'s `droppedLease`: a lone start whose own kept
+    /// table pins the pool's top extent, with nothing else to take, gives
+    /// the table up, takes the extent its blocks leave, and starts.
+    /// Mutation D2: no dropped-lease retry → red (`capacity_exhausted`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_lone_start_drops_its_own_chain_and_starts() {
+        use crate::engine::governor::governor::tests::G;
+        let Some((mut state, governor, io)) = ledger_state(G, 0) else {
+            return;
+        };
+        let mut adapter = tiny_paged_adapter_with(Arc::clone(&state.inner.cache_recency), 2, 8);
+        adapter.set_grow_headroom_probe_override(Some(passing()));
+        adapter.set_extent_growth(2);
+        assert!(adapter.try_grow_pool(2));
+        adapter.begin_request(9).expect("begin");
+        adapter
+            .allocate_suffix_blocks_for(9, 32)
+            .expect("the runway");
+        let chain = tokens_of(40, 2);
+        adapter.begin_request(1).expect("begin");
+        adapter
+            .allocate_suffix_blocks_for(1, 32)
+            .expect("the extent");
+        adapter.record_tokens(&chain).expect("record");
+        adapter
+            .register_full_blocks_for_reuse_for(1, &[], 0, false)
+            .expect("publish the chain");
+        adapter.release_request_for(9).expect("release");
+        assert_eq!(
+            adapter.free_extent_bytes(false),
+            0,
+            "the kept table pins it"
+        );
+        let pools = adapter.layer_kv_pool().total_bytes();
+        io.with(|fake| fake.stats.pools = pools);
+        let notified = Arc::clone(&io);
+        adapter.set_pool_growth_notifier(Some(Arc::new(move |bytes| {
+            notified.with(|fake| fake.stats.pools = bytes);
+        })));
+        state.inner.paged_adapter = Some(adapter);
+        let cell = state.inner.recurrent_state_bytes();
+        let model = crate::engine::governor::governor::tests::model(pools + cell - 1, 0);
+        state.inner.memory_registration = None;
+        state.inner.memory_registration = Some(governor.register_model(model).expect("register"));
+        let mut prompt = chain.clone();
+        prompt.push(3);
+        let (prepared, mut result) = prepared_turn(&mut state, 1, prompt);
+        let turn = state.admit_prepared(prepared).ok().flatten();
+        assert!(turn.is_some(), "not admitted: {:?}", result.try_recv());
+        assert!(turn.expect("admitted").payload.cell.is_some());
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        assert_eq!(snapshot.blocks.total_blocks, 2, "the extent was cut");
     }
 
     /// The only running turn blocks at the max pool with nothing idle to
@@ -6615,351 +8339,6 @@ pub(crate) mod tests {
         assert_eq!(state.live_turns(), 0);
         assert_eq!(state.inner.scheduler_materialized_blocks(1), 0);
         assert_eq!(state.inner.scheduled_recurrent_bytes(), 0);
-    }
-
-    /// A lone MTP turn at the last row of its window blocks beside an idle
-    /// owner that holds only its parked row (no blocks): the blocked step
-    /// frees that row and the turn's next step fits.
-    /// Mutation: pass `!at_cap` as `rows_meet` in the draft path (the
-    /// fixture is at its cap, 64/64) → red (the turn fails).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn lone_mtp_turn_frees_an_idle_row_only_owner() {
-        let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
-            return;
-        };
-        let recurrent = state.inner.recurrent_state_bytes();
-        drop(mtp_step_turn_with(&mut state, 2, 40, false, 40, recurrent));
-        state.owner_sequences.insert("idle".into(), 2);
-        assert_eq!(state.inner.scheduler_materialized_blocks(2), 0);
-        let charge = recurrent + state.inner.scheduled_draft_state_bytes(144);
-        let mut turn = mtp_step_turn_with(&mut state, 1, 128, true, 155, charge)
-            .with_block_reservation(9, 9, 16);
-        turn.num_computed_tokens = 154;
-        let (reply, mut result) = tokio::sync::oneshot::channel();
-        turn.payload.response = ScheduledReply::Sync(reply);
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .reserve_rows_for(1, 159)
-            .expect("window KV");
-        assert_eq!(state.inner.scheduled_recurrent_bytes(), 2 * recurrent);
-        assert!(
-            !HybridStepExecutor::new(&mut state.inner)
-                .draft_fits_or_refuse(std::slice::from_ref(&turn), 0, 4)
-                .expect("step beside the idle row")
-        );
-        settle_blocked_step(&mut state, turn);
-        assert!(
-            matches!(
-                result.try_recv(),
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-            ),
-            "the turn is still running"
-        );
-        assert_eq!(state.scheduler.running().len(), 1);
-        assert_eq!(state.scheduler.stats().preemptions, 0);
-        assert_eq!(state.inner.scheduled_recurrent_bytes(), recurrent);
-        assert!(
-            HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(state.scheduler.running(), 0, 4)
-                .expect("step after the release")
-        );
-    }
-
-    /// Puts `turns` in the running list and records the first one's draft
-    /// fit at 4 rows; whether it fit.
-    #[cfg(target_os = "macos")]
-    fn run_and_refuse(
-        state: &mut HybridSchedulerState<Qwen35Inner>,
-        turns: Vec<Turn<Qwen35Inner>>,
-    ) -> bool {
-        for turn in turns {
-            state.scheduler.reinstate_running(turn);
-        }
-        HybridStepExecutor::new(&mut state.inner)
-            .draft_fits_or_refuse(state.scheduler.running(), 0, 4)
-            .expect("draft fit")
-    }
-
-    /// What the draft fit of running seq 1 at 4 rows lacks now.
-    #[cfg(target_os = "macos")]
-    fn draft_short_of_seq_1(state: &HybridSchedulerState<Qwen35Inner>) -> u64 {
-        state.draft_short_now(
-            &[(
-                1,
-                DraftRefusal {
-                    bytes: 0,
-                    queries: 4,
-                },
-            )],
-            None,
-        )
-    }
-
-    /// 56 of 64 blocks (the grow declined), none free: a lone MTP turn at
-    /// 250 rows (463,104 B at 4 more) holding `turn_blocks`, idle owner 2
-    /// holding `owner_blocks` and newer than a ladder rung over a cache-only
-    /// chain of the rest. The fit reads 55 blocks (450,560 B): the chain and
-    /// the ungrown 8.
-    #[cfg(target_os = "macos")]
-    fn draft_short_state(
-        turn_blocks: u32,
-        owner_blocks: u32,
-        finished_blocks: u32,
-    ) -> Option<HybridSchedulerState<Qwen35Inner>> {
-        let (mut state, admission) = mtp_step_state_with(56, 64)?;
-        let turn = mtp_step_turn(&mut state, 1, 250, admission);
-        assert_eq!(step_state_bytes(&state.inner, &turn, 254, 8_192), 463_104);
-        hold(&mut state, 1, turn_blocks);
-        hold(&mut state, 2, owner_blocks);
-        if finished_blocks > 0 {
-            hold(&mut state, 3, finished_blocks);
-        }
-        state.owner_sequences.insert("idle".into(), 2);
-        state.owner_last_used.insert(2, u64::MAX);
-        rung(
-            &mut state,
-            7,
-            56 - turn_blocks - owner_blocks - finished_blocks,
-            0,
-        );
-        let snapshot = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("snapshot")
-            .expect("adapter");
-        assert_eq!(snapshot.blocks.free_blocks, 0);
-        assert_eq!(snapshot.blocks.total_blocks, 56);
-        assert!(!run_and_refuse(&mut state, vec![turn]));
-        Some(state)
-    }
-
-    /// A draft denial 12,544 B short (≤ 2 blocks) below the cap: the newer
-    /// idle owner's 2 blocks go; the older rung stays (the fit already
-    /// counts its chain) and the pool does not grow.
-    /// Mutation: send the draft need through `free_for_kv` as ⌈short/bpb⌉
-    /// blocks → red (the older rung goes first).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn draft_denial_frees_only_idle_owners_and_never_grows() {
-        let Some(mut state) = draft_short_state(7, 2, 0) else {
-            return;
-        };
-        let short = draft_short_of_seq_1(&state);
-        assert_eq!(short, 12_544);
-        assert!(short <= 2 * 8_192);
-        assert!(state.reclaim_for_blocked_step(1, false, None));
-        assert!(!table_of(&state, 2), "the idle owner's table is released");
-        assert_eq!(rungs(&state), 1, "the rung stays");
-        assert_eq!(pool_total_blocks(&state), 56);
-        assert_eq!(draft_short_of_seq_1(&state), 0);
-    }
-
-    /// The idle owner's one block (8,192 B) cannot cover a 12,544 B short:
-    /// nothing is taken.
-    /// Mutation: drop the reach check in `free_for_draft` → red (the owner
-    /// is released).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn doomed_draft_denial_keeps_idle_owners() {
-        let Some(mut state) = draft_short_state(8, 1, 0) else {
-            return;
-        };
-        assert_eq!(draft_short_of_seq_1(&state), 12_544);
-        assert!(!state.reclaim_for_blocked_step(1, false, None));
-        assert!(table_of(&state, 2), "the idle owner stays");
-        assert_eq!(rungs(&state), 1);
-    }
-
-    /// A turn that finished after the refusal gave back the bytes the fit
-    /// lacked: the need is met in place and the idle owner stays.
-    /// Mutation: drop the `short == 0 → Met` arm in `free_for_draft` → red
-    /// (the owner is released).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn draft_need_met_by_a_finished_turn_takes_nothing() {
-        let Some(mut state) = draft_short_state(5, 2, 2) else {
-            return;
-        };
-        assert_eq!(draft_short_of_seq_1(&state), 12_544);
-        state
-            .inner
-            .release_scheduled_cache(3)
-            .expect("the finished turn's table");
-        assert_eq!(draft_short_of_seq_1(&state), 0);
-        assert!(state.reclaim_for_blocked_step(1, false, None));
-        assert!(table_of(&state, 2), "the idle owner stays");
-    }
-
-    /// A draft refusal left before the step began reaches no reclaim.
-    /// Mutation: leave the draft map in `clear_refusals` → red (the owner
-    /// is released).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_draft_refusal_lasts_only_its_step() {
-        let Some(mut state) = draft_short_state(7, 2, 0) else {
-            return;
-        };
-        state.begin_scheduled_step();
-        assert!(!state.reclaim_for_blocked_step(1, false, None));
-        assert!(table_of(&state, 2), "the idle owner stays");
-    }
-
-    /// Two MTP turns on a 128-block pool; the later one, booking 2 blocks
-    /// it does not hold yet, is preempted (its reservation flags cleared)
-    /// and the earlier one's draft fit, read with its state and bookings,
-    /// lacks at most one block, which the idle owner holds: the owner goes
-    /// and the victim is reinstated, not preempted.
-    /// Mutations: pass `None` for the preempted turn in `settle_step` → red;
-    /// drop the flag restore in `settle_step` → red; restore only
-    /// `recurrent_state_reservation_active` there → red (the bookings are
-    /// left out). Each reads the short as 0: the owner stays.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_preempted_turn_counts_in_the_draft_need() {
-        let Some((mut state, admission)) = mtp_step_state_with(128, 128) else {
-            return;
-        };
-        let first = mtp_step_turn(&mut state, 1, 250, admission);
-        let later = mtp_step_turn(&mut state, 3, 250, admission).with_block_reservation(2, 0, 16);
-        let need = step_state_bytes(&state.inner, &first, 254, 8_192)
-            + step_state_bytes(
-                &state.inner,
-                &later,
-                250 + later.decode_draft_allowance,
-                8_192,
-            );
-        let blocks = u32::try_from(need.div_ceil(8_192)).expect("blocks");
-        assert!(blocks < 127, "{blocks}");
-        hold(&mut state, 1, 128 - blocks);
-        hold(&mut state, 2, 1);
-        state.owner_sequences.insert("idle".into(), 2);
-        assert!(!run_and_refuse(&mut state, vec![first, later]));
-        let preempted = state.scheduler.preempt_running(3).expect("the later turn");
-        assert!(
-            !preempted.block_reservation_active && !preempted.recurrent_state_reservation_active
-        );
-        assert!(!state.settle_step(
-            Vec::new(),
-            Some(PreemptedTurn {
-                turn: preempted,
-                blocked: false,
-            }),
-            None,
-        ));
-        assert_eq!(state.scheduler.running().len(), 2, "the victim is back");
-        assert!(!table_of(&state, 2), "the idle owner's table is released");
-        assert_eq!(state.scheduler.stats().preemptions, 0);
-    }
-
-    /// The two MTP turns of `a_preempted_turn_counts_in_the_draft_need`, but
-    /// the refused row is the later turn, which the step preempts (its
-    /// reservation flags cleared): its own fit is read from the preempted
-    /// turn, so the idle owner goes and the victim is reinstated.
-    /// Mutations: drop `.or(parked.filter(..))` in `draft_short_now` → red;
-    /// drop the flag restore in `settle_step` → red. Each reads the short
-    /// as 0: the owner stays.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_preempted_refused_row_counts_its_own_draft_need() {
-        let Some((mut state, admission)) = mtp_step_state_with(128, 128) else {
-            return;
-        };
-        let first = mtp_step_turn(&mut state, 1, 250, admission);
-        let later = mtp_step_turn(&mut state, 3, 250, admission);
-        let need = step_state_bytes(&state.inner, &later, 254, 8_192)
-            + step_state_bytes(
-                &state.inner,
-                &first,
-                250 + first.decode_draft_allowance,
-                8_192,
-            );
-        let blocks = u32::try_from(need.div_ceil(8_192)).expect("blocks");
-        assert!(blocks < 127, "{blocks}");
-        hold(&mut state, 1, 128 - blocks);
-        hold(&mut state, 2, 1);
-        state.owner_sequences.insert("idle".into(), 2);
-        state.scheduler.reinstate_running(first);
-        state.scheduler.reinstate_running(later);
-        assert!(
-            !HybridStepExecutor::new(&mut state.inner)
-                .draft_fits_or_refuse(state.scheduler.running(), 1, 4)
-                .expect("draft fit")
-        );
-        let preempted = state.scheduler.preempt_running(3).expect("the later turn");
-        assert!(!preempted.recurrent_state_reservation_active);
-        assert!(!state.settle_step(
-            Vec::new(),
-            Some(PreemptedTurn {
-                turn: preempted,
-                blocked: false,
-            }),
-            None,
-        ));
-        assert_eq!(state.scheduler.running().len(), 2, "the victim is back");
-        assert!(!table_of(&state, 2), "the idle owner's table is released");
-        assert_eq!(state.scheduler.stats().preemptions, 0);
-    }
-
-    /// Two draft refusals in one step after the smaller one was met: the
-    /// step's need is the larger one, which is new, so the idle owner goes.
-    /// Mutation: `.min()` over the draft refusals in
-    /// `reclaim_for_blocked_step` → red (the met need stops the loop, the
-    /// owner stays).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn the_largest_draft_refusal_is_the_steps_need() {
-        let Some(mut state) = draft_short_state(7, 2, 0) else {
-            return;
-        };
-        assert_eq!(draft_short_of_seq_1(&state), 12_544);
-        assert!(
-            state
-                .met_before
-                .retry((1, StepNeed::DraftBytes(100)), Freed::Took)
-        );
-        state
-            .inner
-            .paged_adapter()
-            .expect("paged adapter")
-            .refuse_draft(
-                9,
-                DraftRefusal {
-                    bytes: 100,
-                    queries: 4,
-                },
-            );
-        assert!(state.reclaim_for_blocked_step(1, false, None));
-        assert!(!table_of(&state, 2), "the idle owner's table is released");
-    }
-
-    /// One step left a KV refusal the free blocks cover and a draft
-    /// refusal an idle row covers: both are served, the row is released.
-    /// Mutation: serve the draft refusal only without a KV refusal (`else
-    /// if`) in `reclaim_for_blocked_step` → red (the row stays).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn kv_and_draft_needs_of_one_step_are_both_served() {
-        let Some((mut state, _)) = mtp_step_state_with(64, 64) else {
-            return;
-        };
-        let recurrent = state.inner.recurrent_state_bytes();
-        drop(mtp_step_turn_with(&mut state, 2, 40, false, 40, recurrent));
-        state.owner_sequences.insert("idle".into(), 2);
-        let charge = recurrent + state.inner.scheduled_draft_state_bytes(144);
-        let mut turn = mtp_step_turn_with(&mut state, 1, 128, true, 155, charge)
-            .with_block_reservation(9, 9, 16);
-        turn.num_computed_tokens = 154;
-        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
-        adapter.reserve_rows_for(1, 159).expect("window KV");
-        assert!(adapter.takeable_blocks() >= 1);
-        adapter.refuse_for_test(1, 1);
-        assert!(!run_and_refuse(&mut state, vec![turn]));
-        assert_eq!(state.inner.scheduled_recurrent_bytes(), 2 * recurrent);
-        assert!(state.reclaim_for_blocked_step(1, false, None));
-        assert_eq!(state.inner.scheduled_recurrent_bytes(), recurrent);
     }
 
     /// Every turn takes the pool lane's one window: the plan prices the MTP
@@ -7110,277 +8489,9 @@ pub(crate) mod tests {
         assert_eq!(grow_needed_blocks_for(&near_max, &decision, 0.05), None);
     }
 
-    /// A victim preempted at history 63 resumes into 64 rows (4 blocks), 67
-    /// with three draft rows (5 blocks); alone in a pool that cannot grow
-    /// past 4 blocks, the 5-block resume rejects instead of re-admitting.
-    /// Mutation: `resume_booking_blocks` keeps the booked blocks → red.
-    /// Mutation: drop the draft rows → red (4 ≠ 5).
-    #[test]
-    fn lone_victim_resumes_only_into_its_blocked_step() {
-        assert_eq!(resume_booking_blocks(2, 63, 0, 1_000, 16, false), 4);
-        assert_eq!(resume_booking_blocks(2, 63, 3, 1_000, 16, false), 5);
-        assert_eq!(resume_booking_blocks(9, 63, 3, 1_000, 16, false), 9);
-        let Some((mut state, snapshot)) = growable_qwen35_state() else {
-            return;
-        };
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
-        let outcome = state
-            .try_reserve_with_policy(
-                2,
-                resume_booking_blocks(2, 63, 3, 1_000, 16, false),
-                0,
-                0,
-                snapshot,
-                false,
-                <Qwen35Inner as HybridSchedulerBackend>::release_scheduled_cache,
-            )
-            .expect("reject");
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 4 }),
-            "{outcome:?}"
-        );
-    }
-
-    /// A victim at history 63 with one output token left needs 64 rows: its
-    /// three draft rows run past the whole turn, so it books 4 blocks, not 5,
-    /// and resumes alone in a pool that cannot grow past 4 blocks.
-    /// Mutation: drop the `.min(requested_tokens…)` cap in
-    /// `resume_booking_blocks` → red (5 blocks, Reject).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn lone_victim_with_one_token_left_resumes_in_its_last_block() {
-        let Some((mut state, _)) = growable_qwen35_state() else {
-            return;
-        };
-        let mut turn = speculative::tests::request(
-            &mut state.inner,
-            2,
-            (0..40).map(|token| token % 16).collect(),
-            true,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .with_block_reservation(2, 0, 16);
-        turn.payload.requested_tokens = 64;
-        assert_eq!(turn.decode_draft_allowance, 3);
-        state.book_resume(&mut turn, 63, true, 0, false);
-        state.inner.release_scheduled_recurrent_for(2);
-        state.inner.release_scheduled_speculation(2);
-        state
-            .inner
-            .release_scheduled_cache(2)
-            .expect("release the victim");
-        let snapshot = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("scheduler snapshot")
-            .expect("paged adapter present");
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
-        let outcome = state
-            .try_reserve_with_policy(
-                2,
-                turn.block_reservation_total,
-                0,
-                0,
-                snapshot,
-                false,
-                <Qwen35Inner as HybridSchedulerBackend>::release_scheduled_cache,
-            )
-            .expect("resume decision");
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Admitted),
-            "{outcome:?}"
-        );
-        assert_eq!(resume_booking_blocks(2, 63, 3, 64, 16, false), 4);
-        assert_eq!(resume_booking_blocks(2, 63, 3, 66, 16, false), 5);
-        assert_eq!(resume_booking_blocks(2, 63, 3, 67, 16, false), 5);
-        assert_eq!(resume_booking_blocks(2, 63, 3, 10, 16, false), 4);
-    }
-
-    /// A 64-token prompt with one output token books 4 blocks; preempted
-    /// mid-prefill, it resumes into the same 4, not 5 for a pending row a
-    /// prefill replay does not have, and a lone resume fits a 4-block pool.
-    /// Mutation: drop the `prefill_replay` branch in `resume_booking_blocks`
-    /// → red (5 blocks, Reject).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn prefill_victim_resumes_into_its_admission_blocks() {
-        assert_eq!(scheduled_booking(true, 64, 1, 16), (4, 64));
-        assert_eq!(resume_booking_blocks(4, 64, 3, 64, 16, true), 4);
-        assert_eq!(resume_booking_blocks(4, 64, 0, 64, 16, true), 4);
-        assert_eq!(resume_booking_blocks(4, 64, 0, 65, 16, false), 5);
-        let Some((mut state, _)) = growable_qwen35_state() else {
-            return;
-        };
-        let prompt: Vec<u32> = (0..64).map(|token| token % 16).collect();
-        let mut turn = speculative::tests::request(
-            &mut state.inner,
-            2,
-            prompt.clone(),
-            true,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .with_block_reservation(4, 2, 16);
-        turn.payload.requested_tokens = 64;
-        turn.num_computed_tokens = 32;
-        let replay = install_preemption_replay(&mut turn, &prompt, 32).expect("prefill replay");
-        assert!(!replay.suppress_sample);
-        state.book_resume(
-            &mut turn,
-            replay.tokens.len() as u32,
-            true,
-            0,
-            !replay.suppress_sample,
-        );
-        assert_eq!(turn.block_reservation_total, 4);
-        state.inner.release_scheduled_recurrent_for(2);
-        state.inner.release_scheduled_speculation(2);
-        state
-            .inner
-            .release_scheduled_cache(2)
-            .expect("release the victim");
-        let snapshot = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("scheduler snapshot")
-            .expect("paged adapter present");
-        state
-            .inner
-            .paged_adapter_mut()
-            .expect("paged adapter")
-            .set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
-        let outcome = state
-            .try_reserve_with_policy(
-                2,
-                turn.block_reservation_total,
-                0,
-                0,
-                snapshot,
-                false,
-                <Qwen35Inner as HybridSchedulerBackend>::release_scheduled_cache,
-            )
-            .expect("resume decision");
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Admitted),
-            "{outcome:?}"
-        );
-    }
-
-    /// A victim that did not block resumes to the blocks it held, not to the
-    /// blocked row's step; one that blocked books its own step.
-    /// Mutation: ignore `blocked` in `book_resume` → red (5 ≠ 4).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn unblocked_victim_resumes_to_held_blocks() {
-        let Some((mut state, _)) = growable_qwen35_state() else {
-            return;
-        };
-        let mut turn = speculative::tests::request(
-            &mut state.inner,
-            2,
-            (0..40).map(|token| token % 16).collect(),
-            true,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .with_block_reservation(3, 0, 16);
-        turn.payload.requested_tokens = 1_000;
-        state.book_resume(&mut turn, 63, false, 4, false);
-        assert_eq!(turn.block_reservation_total, 4);
-        state.book_resume(&mut turn, 63, false, 2, false);
-        assert_eq!(turn.block_reservation_total, 4);
-        state.book_resume(&mut turn, 63, true, 4, false);
-        assert_eq!(turn.block_reservation_total, 5);
-    }
-
-    /// A blocked step frees an idle owner's blocks and keeps its victim
-    /// running; with nothing idle left it preempts.
-    /// Mutation: never offer idle owners (`oldest_kv` returns `None` in
-    /// `SchedReclaim`) → red.
-    #[test]
-    fn blocked_step_releases_an_idle_owner_before_preempting() {
-        let Some((mut state, _)) = growable_qwen35_state() else {
-            return;
-        };
-        state.owner_sequences.insert("idle".into(), 1);
-        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
-        adapter.set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(4))));
-        adapter.begin_request(1).expect("begin idle request");
-        adapter
-            .allocate_suffix_blocks_for(1, 32)
-            .expect("idle owner holds two blocks");
-        assert_eq!(state.idle_memory_victim(2), Some(1));
-        let refuse = |state: &HybridSchedulerState<Qwen35Inner>, blocks| {
-            state
-                .inner
-                .paged_adapter()
-                .expect("paged adapter")
-                .refuse_for_test(2, blocks);
-        };
-        refuse(&state, 3);
-        assert!(state.reclaim_for_blocked_step(2, false, None));
-        assert!(
-            state
-                .inner
-                .paged_adapter()
-                .and_then(|adapter| adapter.block_table_for(1))
-                .is_none(),
-            "the idle owner's table is released"
-        );
-        refuse(&state, 5);
-        assert!(!state.reclaim_for_blocked_step(2, false, None));
-    }
-
-    fn bytes_per_block(state: &HybridSchedulerState<Qwen35Inner>) -> u64 {
-        state
-            .inner
-            .paged_adapter()
-            .expect("paged adapter")
-            .bytes_per_block()
-            .expect("bytes per block")
-    }
-
-    fn clear_reclaim_log() {
-        crate::models::qwen3_5::dflash2_turn::clear_grow_reclaim_log();
-    }
-
-    fn reclaim_log() -> Vec<crate::models::qwen3_5::dflash2_turn::GrowReclaim> {
-        crate::models::qwen3_5::dflash2_turn::grow_reclaim_log()
-    }
-
     type Probe = Arc<dyn Fn(u32) -> std::result::Result<u32, String> + Send + Sync>;
 
-    /// Declines with no room (the 4-block pool's own size) until the reclaim
-    /// log on this thread has `taken` entries.
-    fn decline_until_taken(taken: usize) -> Probe {
-        Arc::new(move |blocks| {
-            Ok(if reclaim_log().len() >= taken {
-                blocks
-            } else {
-                4
-            })
-        })
-    }
-
-    fn pool_total_blocks(state: &HybridSchedulerState<Qwen35Inner>) -> u32 {
-        state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("snapshot")
-            .expect("adapter")
-            .blocks
-            .total_blocks
-    }
-
-    // ---- take order (`crate::engine::reclaim`) on the scheduled lane ----
-
-    use crate::models::qwen3_5::dflash2_turn::GrowReclaim;
+    // ---- the ledger's units on the scheduled lane ----
 
     /// Qwen3.5 dense scheduler (no draft) over an `initial`-block pool
     /// growing to `max`, on the model's clock, with `probe`.
@@ -7445,136 +8556,6 @@ pub(crate) mod tests {
         hashes
     }
 
-    fn hold(state: &mut HybridSchedulerState<Qwen35Inner>, seq_id: SeqId, blocks: u32) {
-        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
-        adapter.begin_request(seq_id).expect("begin");
-        adapter
-            .allocate_suffix_blocks_for(seq_id, blocks * 16)
-            .expect("hold blocks");
-    }
-
-    /// `seq_id` already holds `held` blocks and is refused `more`.
-    fn refused(state: &mut HybridSchedulerState<Qwen35Inner>, seq_id: SeqId, held: u32, more: u32) {
-        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
-        if held == 0 {
-            adapter.begin_request(seq_id).expect("begin");
-        }
-        assert!(
-            adapter
-                .reserve_rows_for(seq_id, (held + more) * 16)
-                .is_err(),
-            "the reservation is refused"
-        );
-    }
-
-    fn table_of(state: &HybridSchedulerState<Qwen35Inner>, seq_id: SeqId) -> bool {
-        state
-            .inner
-            .paged_adapter()
-            .is_some_and(|adapter| adapter.block_table_for(seq_id).is_some())
-    }
-
-    fn rungs(state: &HybridSchedulerState<Qwen35Inner>) -> usize {
-        state.inner.ladder_entries_for_test().len()
-    }
-
-    /// An idle owner whose table frees no block (the blocked turn holds its
-    /// chain too) is passed over though it is older.
-    /// Mutation: drop the "frees something" filter in `oldest_idle_owner` →
-    /// red (owner 2's table is released).
-    #[test]
-    fn idle_owners_that_free_nothing_are_skipped() {
-        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
-            return;
-        };
-        let shared = tokens_of(1, 1);
-        {
-            let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
-            adapter.begin_request(3).expect("begin");
-            adapter.allocate_suffix_blocks_for(3, 16).expect("allocate");
-            adapter.record_tokens(&shared).expect("record");
-            adapter
-                .finalize_turn_keep_live(&[], 0)
-                .expect("keep the shared block held");
-            adapter.begin_request(2).expect("owner 2");
-            let mut prompt = shared.clone();
-            prompt.push(1);
-            let hit = adapter
-                .find_cached_prefix(&prompt, &[], 0, false)
-                .expect("owner 2 hits the shared block");
-            assert_eq!(hit.cached_token_count, 16);
-        }
-        hold(&mut state, 1, 1);
-        state.owner_sequences.insert("one".into(), 1);
-        state.owner_sequences.insert("two".into(), 2);
-        state.owner_last_used.insert(1, 20);
-        state.owner_last_used.insert(2, 10);
-        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
-        assert!(
-            adapter.reserve_rows_for(3, 48).is_err(),
-            "the blocked turn is refused 3 blocks"
-        );
-        assert!(state.reclaim_for_blocked_step(3, false, None));
-        assert!(!table_of(&state, 1));
-        assert!(table_of(&state, 2));
-    }
-
-    /// Two idle owners share a cached block: neither frees it alone, both
-    /// together do, so the count covers a need of the free blocks plus both
-    /// tables and the blocked turn runs.
-    /// Mutation: count each owner's blocks of ref at most 2 apart (the old
-    /// per-owner `releasable_blocks_for`) in `SchedReclaim::reach` → red
-    /// (`Short`: the step fails `capacity_exhausted`).
-    #[test]
-    fn idle_owners_sharing_a_block_free_it_together() {
-        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
-            return;
-        };
-        let shared = tokens_of(2, 1);
-        {
-            let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
-            adapter.begin_request(1).expect("owner 1");
-            adapter.allocate_suffix_blocks_for(1, 32).expect("allocate");
-            let mut owned = shared.clone();
-            owned.extend(tokens_of(3, 1));
-            adapter.record_tokens(&owned).expect("record");
-            adapter
-                .finalize_turn_keep_live(&[], 0)
-                .expect("keep owner 1's table");
-            adapter.begin_request(2).expect("owner 2");
-            let mut prompt = shared.clone();
-            prompt.push(1);
-            let hit = adapter
-                .find_cached_prefix(&prompt, &[], 0, false)
-                .expect("owner 2 hits the shared block");
-            assert_eq!(hit.cached_token_count, 16);
-        }
-        state.owner_sequences.insert("one".into(), 1);
-        state.owner_sequences.insert("two".into(), 2);
-        state.owner_last_used.insert(1, 10);
-        state.owner_last_used.insert(2, 20);
-        refused(&mut state, 9, 0, 4);
-        assert_eq!(
-            state
-                .inner
-                .paged_adapter()
-                .expect("paged adapter")
-                .takeable_blocks(),
-            2
-        );
-        assert!(state.reclaim_for_blocked_step(9, false, None));
-        assert!(!table_of(&state, 1));
-        assert!(!table_of(&state, 2));
-        assert_eq!(
-            state
-                .inner
-                .paged_adapter()
-                .expect("paged adapter")
-                .takeable_blocks(),
-            4
-        );
-    }
-
     /// A finished owned turn records its table's turn-end stamp for its
     /// owner, and drops the stamps of owners no longer kept.
     /// Mutations: drop the `owner_last_used` insert in `finish_completed` →
@@ -7617,350 +8598,179 @@ pub(crate) mod tests {
         assert!(!state.owner_last_used.contains_key(&7));
     }
 
-    /// At the cap a ladder rung and an idle owner go by their own stamps:
-    /// the rung's block was cached after the owner's turn ended, but the
-    /// rung itself is older.
-    /// Mutation: stamp ladder units with their final block's stamp → red
-    /// (the owner is released).
-    #[test]
-    fn cap_reclaim_orders_ladder_entries_and_owners_by_their_own_stamps() {
-        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
-            return;
-        };
-        let hashes = rung(&mut state, 2, 1, 0);
-        let block_stamp = state
-            .inner
-            .paged_adapter()
-            .expect("paged adapter")
-            .allocator()
-            .lock()
-            .expect("allocator")
-            .block_stamp(hashes[0])
-            .expect("block stamp");
-        assert!(block_stamp >= 2);
-        state.owner_sequences.insert("idle".into(), 1);
-        hold(&mut state, 1, 1);
-        state.owner_last_used.insert(1, block_stamp - 1);
-        hold(&mut state, 9, 2);
-        refused(&mut state, 9, 2, 1);
-        clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9, false, None));
-        assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
-        assert!(table_of(&state, 1));
-    }
+    /// A step whose GPU command exhausted Metal memory.
+    #[cfg(target_os = "macos")]
+    struct OutOfMemoryStep;
 
-    /// A need no take could cover takes nothing.
-    /// Mutation: drop the count in `free_for_kv` → red (the rung and the
-    /// owner are both taken).
-    #[test]
-    fn cap_reclaim_evicts_nothing_it_cannot_cover() {
-        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
-            return;
-        };
-        rung(&mut state, 3, 1, 0);
-        state.owner_sequences.insert("idle".into(), 1);
-        hold(&mut state, 1, 1);
-        hold(&mut state, 9, 2);
-        state
-            .inner
-            .paged_adapter()
-            .expect("paged adapter")
-            .refuse_for_test(9, 5);
-        assert!(!state.reclaim_for_blocked_step(9, false, None));
-        assert_eq!(rungs(&state), 1);
-        assert!(table_of(&state, 1));
-    }
+    #[cfg(target_os = "macos")]
+    impl<P> StepExecutor<P> for OutOfMemoryStep {
+        type Error = Error;
 
-    /// A decode wave at the cap records each row's own need, so the gate
-    /// sees the wave's sum. Row 2, the one other table, shares its block
-    /// with the blocked row 1, so no idle owner frees a block.
-    /// Mutation: record only the first row's need in `check_wave_fits` →
-    /// red (the record is 1 and the rung is dropped).
-    #[test]
-    fn wave_need_feeds_the_cap_gate() {
-        let Some(mut state) = qwen35_pool_state(3, 3, passing()) else {
-            return;
-        };
-        let shared = tokens_of(7, 1);
-        {
-            let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
-            adapter.begin_request(1).expect("row 1");
-            adapter.allocate_suffix_blocks_for(1, 32).expect("allocate");
-            let mut owned = shared.clone();
-            owned.extend(tokens_of(8, 1));
-            adapter.record_tokens(&owned).expect("record");
-            adapter
-                .finalize_turn_keep_live(&[], 0)
-                .expect("keep row 1's table");
-            adapter.begin_request(2).expect("row 2");
-            let mut prompt = shared.clone();
-            prompt.push(1);
-            adapter
-                .find_cached_prefix(&prompt, &[], 0, false)
-                .expect("row 2 hits the shared block");
+        fn execute(
+            &mut self,
+            _plan: &StepPlan,
+            _running: &mut [TurnState<P>],
+        ) -> std::result::Result<StepResult, Self::Error> {
+            Err(Error::from_reason(
+                "[METAL] Command buffer execution failed: Insufficient Memory \
+                 (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory).",
+            ))
         }
-        rung(&mut state, 9, 1, 0);
-        let wave = |state: &mut HybridSchedulerState<Qwen35Inner>| {
-            crate::transformer::paged_policy::record_decode_wave(
-                state.inner.paged_adapter_mut().expect("paged adapter"),
-                &[(1, 5), (2, 5)],
-                "test",
-            )
-        };
-        assert!(wave(&mut state).is_err());
-        assert_eq!(
-            state
-                .inner
-                .paged_adapter()
-                .expect("paged adapter")
-                .take_refusal(),
-            Some(2)
-        );
-        assert!(wave(&mut state).is_err());
-        assert!(!state.reclaim_for_blocked_step(1, false, None));
-        assert_eq!(rungs(&state), 1);
     }
 
-    /// A lone admission at the cap whose only takeable blocks are a ladder
-    /// chain drops the rung and admits.
-    /// Mutations: fill the snapshot's `reclaimable_blocks` from
-    /// `num_reusable_blocks` → red (admitted with the rung kept); drop
-    /// `cap_shortfall_blocks` from `try_grow_reservation_pool` → red
-    /// (`Reject`).
-    #[test]
-    fn admission_at_the_cap_drops_a_ladder_entry_to_admit() {
-        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
-            return;
-        };
-        rung(&mut state, 11, 4, 0);
-        let snapshot = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("snapshot")
-            .expect("adapter");
-        let outcome = state
-            .try_reserve_reclaiming_idle(2, 2, 0, 0, snapshot)
-            .expect("reserve");
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Admitted),
-            "{outcome:?}"
-        );
-        assert_eq!(rungs(&state), 0);
-    }
-
-    /// A lone admission of 5 blocks on a 4-block pool, max 8, whose 4
-    /// blocks are a ladder chain: the grow clamps at the max and adds 4,
-    /// still short, so the take goes on to the rung and admits.
-    /// Mutation: count a passing grow as met in `kv_need_met` → red
-    /// (`Reject`: the grow came back `Met` with nothing taken).
-    #[test]
-    fn capped_admission_grow_takes_the_ladder() {
-        let Some(mut state) = qwen35_pool_state(4, 8, passing()) else {
-            return;
-        };
-        rung(&mut state, 16, 4, 0);
-        let snapshot = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("snapshot")
-            .expect("adapter");
-        assert_eq!(
-            snapshot.blocks.free_blocks + snapshot.blocks.reclaimable_blocks,
-            0
-        );
-        clear_reclaim_log();
-        let outcome = state
-            .try_reserve_reclaiming_idle(2, 5, 0, 0, snapshot)
-            .expect("reserve");
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Admitted),
-            "{outcome:?}"
-        );
-        assert!(reclaim_log().contains(&GrowReclaim::Ladder));
-        assert_eq!(rungs(&state), 0);
-        assert_eq!(pool_total_blocks(&state), 8);
-    }
-
-    fn reserve_waiting(
-        state: &mut HybridSchedulerState<Qwen35Inner>,
-        blocks: u32,
-    ) -> MemoryReserveOutcome {
-        let snapshot = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("snapshot")
-            .expect("adapter");
-        state
-            .try_reserve_with_policy(2, blocks, 0, 0, snapshot, true, |_, _| Ok(()))
-            .expect("reserve")
-    }
-
-    /// A waiting admission of 5 blocks on a 4-block pool, max 8, whose 4
-    /// blocks are a ladder chain: the grow alone (room 4) cannot cover it,
-    /// so the need grows to the max and takes the rung before it waits.
-    /// Mutations: size the waiting need with the room-clamped
-    /// `grow_needed_blocks_for` → red (`Defer`); drop the `reclaims_in_order`
-    /// branch on the waiting edge → red (`Defer`).
-    #[test]
-    fn waiting_admission_below_the_cap_takes_the_ladder() {
-        let Some(mut state) = qwen35_pool_state(4, 8, passing()) else {
-            return;
-        };
-        rung(&mut state, 16, 4, 0);
-        clear_reclaim_log();
-        let outcome = reserve_waiting(&mut state, 5);
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Admitted),
-            "{outcome:?}"
-        );
-        assert!(reclaim_log().contains(&GrowReclaim::Ladder));
-        assert_eq!(rungs(&state), 0);
-        assert_eq!(pool_total_blocks(&state), 8);
-    }
-
-    /// As above on a 6-block pool, max 10, 2 blocks held: the 9-block need
-    /// is more than the room plus the rung's 4 blocks, so it waits and the
-    /// rung stays.
-    /// Mutation: drop the `most < need` count in `free_for_kv` → red (the
-    /// rung is taken for a need it cannot cover).
-    #[test]
-    fn waiting_admission_below_the_cap_keeps_the_ladder_it_cannot_cover() {
-        let Some(mut state) = qwen35_pool_state(6, 10, passing()) else {
-            return;
-        };
-        hold(&mut state, 9, 2);
-        rung(&mut state, 17, 4, 0);
-        clear_reclaim_log();
-        let outcome = reserve_waiting(&mut state, 9);
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Defer),
-            "{outcome:?}"
-        );
-        assert_eq!(rungs(&state), 1, "the rung stays");
-        assert!(reclaim_log().is_empty());
-    }
-
-    /// A waiting turn holding no block: admission sees live turns, so it
-    /// keeps the watermark, and a later resume may wait on it.
-    #[cfg(target_os = "macos")]
-    fn waiting_peer(state: &mut HybridSchedulerState<Qwen35Inner>, seq: u32) {
-        let turn = speculative::tests::request(
-            &mut state.inner,
-            seq,
-            tokens_of(40 + seq, 1),
-            false,
-            Arc::new(AtomicBool::new(false)),
-        );
-        state.inner.release_scheduled_recurrent_for(seq);
-        state.inner.release_scheduled_speculation(seq);
-        state
-            .inner
-            .release_scheduled_cache(seq)
-            .expect("release the peer");
-        state.scheduler.enqueue_turn(turn).expect("enqueue");
-    }
-
-    /// Beside a waiting peer, a 21-block admission on a 4-block pool, max
-    /// 24, whose 4 blocks are four 1-block rungs. The 5% watermark is 0.2
-    /// of a block at 4 blocks and 1.2 at 24: the grow fills the room (20)
-    /// and the take must cover 21 + 1.2, so 3 rungs go and 1 stays.
-    /// Mutation: size the take for the current pool's watermark → red (22
-    /// blocks: 2 rungs taken, then `Defer`).
+    /// Splash's engine restart after `metal_out_of_memory`, the thread
+    /// kept: a step that fails with MLX's command-buffer OOM fails both
+    /// running turns `metal_out_of_memory:`, empties the ladder and the
+    /// prefix cache, and the loop goes on; a new turn on the rung's prompt
+    /// admits with no prefix hit.
+    /// Mutations K4 (the loop ends) → red; K5 (no cache reset) → red (the
+    /// new turn hits the cached prefix).
     #[cfg(target_os = "macos")]
     #[test]
-    fn waiting_admission_sizes_the_take_for_the_grown_watermark() {
-        let Some(mut state) = qwen35_pool_state(4, 24, passing()) else {
+    fn metal_oom_fails_running_rows_and_resets_caches() {
+        let Some((mut state, governor, mut replies)) = judged_state(&[1, 2]) else {
             return;
         };
-        waiting_peer(&mut state, 1);
-        for seed in 0..4 {
-            rung(&mut state, 50 + seed, 1, u64::from(seed));
+        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
+        let Err(SchedulerError::Executor(error)) = state.step_with(&mut OutOfMemoryStep) else {
+            panic!("the step fails");
+        };
+        assert!(matches!(
+            state.executor_failed(error),
+            LoopControl::Continue
+        ));
+        for result in &mut replies {
+            let error = result
+                .try_recv()
+                .expect("the turn replied")
+                .expect_err("the turn fails");
+            assert!(
+                error.reason.starts_with(
+                    "metal_out_of_memory: a GPU command exhausted Metal memory ([METAL] Command \
+                     buffer execution failed: Insufficient Memory"
+                ),
+                "{}",
+                error.reason
+            );
         }
-        let snapshot = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("snapshot")
-            .expect("adapter");
+        assert_eq!(state.scheduler.running_len(), 0);
+        assert!(!has_rung(&state, r), "the ladder is reset");
+        assert_eq!(state.inner.dflash2_states.store.entries().count(), 0);
+        assert_eq!(governor.metal_out_of_memory(7), 1);
+        let mut prompt = tokens_of(30, 2);
+        prompt.push(3);
+        let (prepared, mut result) = prepared_turn(&mut state, 3, prompt);
+        let turn = state
+            .admit_prepared(prepared)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| panic!("not admitted: {:?}", result.try_recv()));
         assert_eq!(
-            (
-                snapshot.blocks.total_blocks,
-                snapshot.blocks.free_blocks + snapshot.blocks.reclaimable_blocks
-            ),
-            (4, 0)
+            turn.payload.prefix.effective_cached_prefix_len(),
+            0,
+            "no prefix hit after the reset"
         );
-        let decision = state.reserve_memory_decision(&snapshot, 21, 0);
-        assert_eq!(
-            (decision.reserved_block_bytes, decision.reserved_state_bytes),
-            (21 * snapshot.bytes_per_block, 0)
-        );
-        assert!(decision.watermark_bytes > 0);
-        assert_eq!(
-            grow_needed_blocks_for(&snapshot, &decision, scheduler_watermark_fraction()),
-            None
-        );
-        let sized =
-            grow_or_take_needed_blocks_for(&snapshot, &decision, scheduler_watermark_fraction());
-        let outcome = reserve_waiting(&mut state, 21);
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Admitted),
-            "{outcome:?}, {} rungs left",
-            rungs(&state)
-        );
-        assert_eq!(rungs(&state), 1);
-        assert_eq!(pool_total_blocks(&state), 24);
-        assert_eq!(sized, Some(23));
     }
 
-    /// A preempted turn resumes behind an earlier waiter (`resume_may_wait`)
-    /// into 5 blocks on a 4-block pool, max 8, whose 4 blocks are a rung:
-    /// its need grows to the max and takes the rung, and it resumes.
-    /// Mutation: size the waiting need with the room-clamped
-    /// `grow_needed_blocks_for` → red (the resume waits).
+    /// A step that tells the test it runs, then waits for its release.
+    #[cfg(target_os = "macos")]
+    struct HeldStep {
+        entered: std::sync::mpsc::Sender<Option<&'static Governor>>,
+        governor: &'static Governor,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl<P> StepExecutor<P> for HeldStep {
+        type Error = Error;
+
+        fn execute(
+            &mut self,
+            plan: &StepPlan,
+            running: &mut [TurnState<P>],
+        ) -> std::result::Result<StepResult, Self::Error> {
+            let _ = self.entered.send(Some(self.governor));
+            let _ = self.release.recv();
+            RunEveryRow.execute(plan, running)
+        }
+    }
+
+    /// The governor's status is read from the governor alone: it returns
+    /// while a scheduled turn's step runs on the model thread, and its
+    /// accounts (the model's published ones, the MLX free pool and
+    /// "fixed") sum to charged.
+    /// Mutation Z3: the step holds what the status reads (as a status sent
+    /// to the model thread would wait for it) → red (no status before the
+    /// step is released).
     #[cfg(target_os = "macos")]
     #[test]
-    fn waiting_resume_below_the_cap_takes_the_ladder() {
-        let Some(mut state) = qwen35_pool_state(4, 8, passing()) else {
+    fn status_reads_while_a_turn_runs() {
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use std::sync::mpsc;
+        let (entered, step_running) = mpsc::channel();
+        let (release, held) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let Some((mut state, _)) = growable_qwen35_state() else {
+                let _ = entered.send(None);
+                return None;
+            };
+            let io = FakeIo::new(
+                stats(4 * G),
+                host(32 * G, crate::engine::governor::host::Pressure::Normal),
+            );
+            io.with(|fake| fake.stats.cache = G);
+            let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+            state.inner.memory_registration =
+                Some(governor.register_model(model(16 * G, 0)).expect("register"));
+            let accounts = state.inner.memory_accounts().expect("accounts");
+            assert!(accounts.kv > 0, "{accounts:?}");
+            governor.publish_accounts(7, accounts);
+            let mut turn = speculative::tests::request(
+                &mut state.inner,
+                1,
+                (0..16).collect(),
+                false,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let (reply, result) = tokio::sync::oneshot::channel();
+            turn.payload.response = ScheduledReply::Sync(reply);
+            state.scheduler.reinstate_running(turn);
+            let mut step = HeldStep {
+                entered,
+                governor,
+                release: held,
+            };
+            state.step_with(&mut step).expect("the step runs");
+            drop(result);
+            Some(accounts)
+        });
+        let Some(governor) = step_running.recv().expect("the worker reports") else {
             return;
         };
-        waiting_peer(&mut state, 1);
-        let prompt = tokens_of(20, 2);
-        let turn = speculative::tests::request(
-            &mut state.inner,
-            2,
-            prompt.clone(),
-            false,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .with_block_reservation(5, 0, 16);
-        state.inner.release_scheduled_recurrent_for(2);
-        state.inner.release_scheduled_speculation(2);
-        state
-            .inner
-            .release_scheduled_cache(2)
-            .expect("release the victim");
-        state.scheduler.enqueue_turn(turn).expect("enqueue");
-        let mut turn = state.scheduler.take_waiting(2).expect("the victim");
-        rung(&mut state, 16, 4, 0);
-        turn.token_history.push(3);
-        turn.num_computed_tokens = 33;
-        let replay = install_preemption_replay(&mut turn, &prompt, 32).expect("decode replay");
-        turn.payload.preemption_replay = Some(replay);
-        assert!(state.scheduler.resume_may_wait(&turn));
+        let (status_tx, status_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = status_tx.send(crate::engine::governor::status::status(governor));
+        });
+        let status = status_rx.recv_timeout(Duration::from_secs(5));
+        release.send(()).expect("release the step");
+        let accounts = worker.join().expect("the worker ends").expect("accounts");
+        let status = status
+            .expect("the status returns while the step runs")
+            .expect("a model is registered");
+        let rows = &status.snapshot.ledger.accounts;
+        let current = |name: &str| {
+            rows.iter()
+                .find(|row| row.name == name)
+                .map_or(0, |row| row.bytes)
+        };
+        assert_eq!(current("kv"), accounts.kv, "{rows:?}");
+        assert_eq!(current("free_pool"), G, "{rows:?}");
+        assert!(current("fixed") > 0, "{rows:?}");
         assert_eq!(
-            state
-                .inner
-                .paged_adapter()
-                .expect("paged adapter")
-                .takeable_blocks(),
-            0
+            rows.iter().map(|row| row.bytes).sum::<u64>(),
+            status.snapshot.charged,
+            "{rows:?}"
         );
-        state.scheduler.prepend_preempted(turn);
-        clear_reclaim_log();
-        state.try_resume_preempted();
-        assert!(!state.scheduler.has_preempted(), "the turn resumed");
-        assert!(reclaim_log().contains(&GrowReclaim::Ladder));
-        assert_eq!(rungs(&state), 0);
-        assert_eq!(pool_total_blocks(&state), 8);
     }
 
     // ---- the lone blocked turn reaches in-use points (Splash `growthClass`) ----
@@ -7971,6 +8781,21 @@ pub(crate) mod tests {
             .ladder_entries_for_test()
             .iter()
             .any(|&(_, hash, _)| hash == final_hash)
+    }
+
+    /// Puts `turn` (its 40-token prompt recorded) at its 48th token, so its
+    /// next decode row claims a 4th block, then runs and settles one step.
+    #[cfg(target_os = "macos")]
+    fn claim_lone_step<B: HybridSchedulerBackend>(
+        state: &mut HybridSchedulerState<B>,
+        mut turn: TurnState<ScheduledTurn<B::PrefixState>>,
+    ) {
+        turn.token_history.extend([3; 8]);
+        turn.num_computed_tokens = 47;
+        turn.num_tokens = 48;
+        state.scheduler.reinstate_running(turn);
+        let step = state.step_with(&mut RunEveryRow).expect("a step");
+        state.settle_step(step);
     }
 
     /// A running turn over a 40-token prompt (3 blocks) whose reply is
@@ -7996,12 +8821,12 @@ pub(crate) mod tests {
         (turn, result)
     }
 
-    /// The step's only running turn T (3 blocks) blocks for one block at the
-    /// max pool; the rest of the pool is the 2-block cache-only chain of
-    /// rung R, which suspended turn 7 restored from. The lone turn's need
-    /// reaches R, takes it, and runs on.
-    /// Mutation: `handle_blocked_alone` reclaims with `reach_in_use` false
-    /// → red (T fails `capacity_exhausted`).
+    /// The step's only running turn T (3 blocks) claims one more block at
+    /// the max pool; the rest of the pool is the 2-block cache-only chain
+    /// of rung R, which suspended turn 7 restored from. The lone lane's
+    /// claim reaches R (Splash `Engine::growthClass`), takes it, and runs.
+    /// Mutation GC1: `growth_class` is always Ordinary → red (T fails
+    /// `capacity_exhausted`).
     #[cfg(target_os = "macos")]
     #[test]
     fn lone_turn_takes_a_suspended_turns_replay_point_last() {
@@ -8011,11 +8836,15 @@ pub(crate) mod tests {
         let (turn, mut result) = running_turn(&mut state, 1);
         let r = *rung(&mut state, 30, 2, 0).last().expect("R");
         state.inner.use_ladder_entry_for_test(7, r);
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        assert_eq!(snapshot.blocks.total_blocks, snapshot.max_total_blocks);
         let adapter = state.inner.paged_adapter().expect("paged adapter");
-        assert!(adapter.at_cap());
         assert_eq!(adapter.takeable_blocks(), 0);
-        adapter.refuse_for_test(1, 1);
-        settle_blocked_step(&mut state, turn);
+        claim_lone_step(&mut state, turn);
         assert!(
             matches!(
                 result.try_recv(),
@@ -8027,99 +8856,11 @@ pub(crate) mod tests {
         assert!(!has_rung(&state, r), "R was taken");
     }
 
-    /// As above beside an ordinary rung Q (1 block) newer than R: the
-    /// need takes Q and keeps R and its use.
-    /// Mutation: take in-use points in the ordinary loop by stamp in
-    /// `free_for_kv` → red (R, the older, goes first).
-    #[test]
-    fn ordinary_units_go_before_an_in_use_point() {
-        let Some(mut state) = qwen35_pool_state(6, 6, passing()) else {
-            return;
-        };
-        hold(&mut state, 9, 3);
-        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
-        let q = *rung(&mut state, 31, 1, 100).last().expect("Q");
-        state.inner.use_ladder_entry_for_test(7, r);
-        refused(&mut state, 9, 3, 1);
-        assert!(state.reclaim_for_blocked_step(9, true, None));
-        assert!(!has_rung(&state, q), "Q was taken");
-        assert!(has_rung(&state, r), "R stays");
-        assert!(matches!(
-            state.inner.gdn_in_use_for_test(7),
-            Some(UnitKey::Ladder { final_block_hash, .. }) if *final_block_hash == r
-        ));
-    }
-
-    /// Two running turns at the max pool beside rung R, which the later
-    /// one (2) restored from; both block, so the later one yields: its
-    /// reclaim keeps R and it is preempted, still using R.
-    #[cfg(target_os = "macos")]
-    fn yielding_pair() -> Option<(HybridSchedulerState<Qwen35Inner>, u64)> {
-        let mut state = qwen35_pool_state(8, 8, passing())?;
-        let (first, _) = running_turn(&mut state, 1);
-        let (second, _) = running_turn(&mut state, 2);
-        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
-        state.inner.use_ladder_entry_for_test(2, r);
-        let adapter = state.inner.paged_adapter().expect("paged adapter");
-        assert!(adapter.at_cap());
-        assert_eq!(adapter.takeable_blocks(), 0);
-        adapter.refuse_for_test(2, 1);
-        state.scheduler.enqueue_turn(first).expect("enqueue");
-        state.scheduler.enqueue_turn(second).expect("enqueue");
-        let Ok(SchedulerAction::Stepped {
-            completed,
-            preempted,
-            blocked_alone,
-            ..
-        }) = state.scheduler.drive_once(&mut BlockEveryRow)
-        else {
-            panic!("expected a step");
-        };
-        assert!(blocked_alone.is_none());
-        assert_eq!(preempted.as_ref().map(|turn| turn.turn.seq_id), Some(2));
-        assert!(!state.settle_step(completed, preempted, blocked_alone));
-        Some((state, r))
-    }
-
-    /// Mutation: `settle_step` reclaims with `reach_in_use` true → red (R
-    /// taken, no preemption).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn yielding_lane_does_not_take_in_use() {
-        let Some((state, r)) = yielding_pair() else {
-            return;
-        };
-        assert!(has_rung(&state, r), "R stays");
-        assert_eq!(state.scheduler.stats().preemptions, 1);
-        assert_eq!(state.scheduler.running().len(), 1);
-    }
-
-    /// A preempted turn keeps its replay point in use, suspended or not
-    /// (Splash `Engine::Request::replayPoint`), through a resume that waits.
-    /// Mutation: end the use in `handle_preempted`
-    /// (`scheduled_turn_closed`) → red (`None`).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn preemption_keeps_the_use() {
-        let Some((mut state, r)) = yielding_pair() else {
-            return;
-        };
-        let used = |state: &HybridSchedulerState<Qwen35Inner>| {
-            matches!(
-                state.inner.gdn_in_use_for_test(2),
-                Some(UnitKey::Ladder { final_block_hash, .. }) if *final_block_hash == r
-            )
-        };
-        assert!(used(&state));
-        state.try_resume_preempted();
-        assert_eq!(state.scheduler.running().len(), 1, "the resume waits");
-        assert!(used(&state));
-    }
-
-    /// The kept prompt wins over the in-use reach: a prompt that restores
-    /// R keeps it out of the in-use units too.
-    /// Mutation: drop `kept.keeps` from `gdn_unit_excluded` for in-use
-    /// units → red (R offered).
+    /// The kept prompt wins over the in-use reach: R, the replay point
+    /// suspended turn 7 uses, is an `InUse` unit of every claim but the one
+    /// whose prompt restores through it.
+    /// Mutation KP1: drop the `kept.keeps` filter in dense
+    /// `gdn_state_units` → red (R listed for its own prompt).
     #[test]
     fn kept_prompt_beats_in_use_reach() {
         let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
@@ -8129,57 +8870,31 @@ pub(crate) mod tests {
         state.inner.use_ladder_entry_for_test(7, r);
         let mut prompt = tokens_of(30, 2);
         prompt.push(1);
-        let skip = HashSet::new();
-        let offered = |keep: crate::models::qwen3_5::dflash2_turn::Keep<'_>, in_use| {
-            state
-                .inner
-                .oldest_gdn_state_unit(true, &skip, keep, in_use)
-                .map(|unit| unit.key)
+        let query = VictimQuery {
+            rights: crate::engine::governor::ledger::TakeRights {
+                in_use: true,
+                certain_reuse: CertainReuse::All,
+                ..Default::default()
+            },
+            need: Need {
+                pages: 1,
+                kv: true,
+                ..Need::default()
+            },
         };
-        let keep = crate::models::qwen3_5::dflash2_turn::Keep {
-            tokens: &prompt,
-            keys: None,
+        let listed = |kept: &[u32]| {
+            state.inner.victim_units(&query, kept).into_iter().any(|unit| {
+                unit.stage == Stage::InUse
+                    && matches!(unit.key, LedgerKey::Ladder { final_block_hash, .. } if final_block_hash == r)
+            })
         };
-        assert_eq!(offered(keep, true), None);
-        assert_eq!(offered(keep, false), None);
-        assert!(offered(Default::default(), true).is_some());
-        assert_eq!(offered(Default::default(), false), None);
-    }
-
-    /// A taken in-use point keeps its use, as Splash's `StateUse` outlives
-    /// the state: a rung rebuilt on the same chain is in use again until
-    /// the turn ends.
-    /// Mutation: drop the turn's record in `drop_gdn_state` → red (`None`).
-    #[test]
-    fn taken_in_use_point_keeps_its_use() {
-        let Some(mut state) = qwen35_pool_state(5, 5, passing()) else {
-            return;
-        };
-        hold(&mut state, 9, 3);
-        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
-        state.inner.use_ladder_entry_for_test(7, r);
-        refused(&mut state, 9, 3, 1);
-        assert!(state.reclaim_for_blocked_step(9, true, None));
-        assert!(!has_rung(&state, r));
-        assert!(state.inner.gdn_in_use_for_test(7).is_some());
-        let rebuilt = *rung(&mut state, 30, 2, 0).last().expect("R again");
-        assert_eq!(rebuilt, r);
-        let skip = HashSet::new();
-        let offered = |state: &HybridSchedulerState<Qwen35Inner>, in_use| {
-            state
-                .inner
-                .oldest_gdn_state_unit(false, &skip, Default::default(), in_use)
-                .map(|unit| unit.key)
-        };
-        assert_eq!(offered(&state, false), None, "the rebuilt rung is in use");
-        assert!(offered(&state, true).is_some());
-        state.inner.end_gdn_use(7);
-        assert!(offered(&state, false).is_some());
+        assert!(!listed(&prompt));
+        assert!(listed(&[]));
     }
 
     /// MoE twin of `lone_turn_takes_a_suspended_turns_replay_point_last`.
-    /// Mutation: `handle_blocked_alone` reclaims with `reach_in_use` false
-    /// → red (T fails `capacity_exhausted`).
+    /// Mutation GC1: `growth_class` is always Ordinary → red (T fails
+    /// `capacity_exhausted`).
     #[cfg(target_os = "macos")]
     #[test]
     fn moe_lone_turn_takes_a_suspended_turns_replay_point_last() {
@@ -8199,11 +8914,15 @@ pub(crate) mod tests {
             .inner
             .push_ladder_entry_for_test(32, hashes, tokens, Vec::new(), 0);
         state.inner.use_ladder_entry_for_test(7, r);
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("snapshot")
+            .expect("adapter");
+        assert_eq!(snapshot.blocks.total_blocks, snapshot.max_total_blocks);
         let adapter = state.inner.paged_adapter().expect("paged adapter");
-        assert!(adapter.at_cap());
         assert_eq!(adapter.takeable_blocks(), 0);
-        adapter.refuse_for_test(1, 1);
-        settle_blocked_step(&mut state, turn);
+        claim_lone_step(&mut state, turn);
         assert!(
             matches!(
                 result.try_recv(),
@@ -8248,534 +8967,6 @@ pub(crate) mod tests {
             .expect("paged adapter")
             .set_state_marks([]);
         assert_eq!(reclaimable(&state), 2);
-    }
-
-    /// An admission charges no block for the marked chain its prompt hits:
-    /// the free blocks hold the rest, so nothing is taken.
-    /// Mutation: drop `- marked_hit_blocks` from `admission_charge` → red
-    /// (not admitted).
-    #[test]
-    fn admission_charges_no_block_for_its_marked_hit() {
-        let Some(mut state) = qwen35_pool_state(7, 7, passing()) else {
-            return;
-        };
-        rung(&mut state, 13, 2, 0);
-        let own = tokens_of(14, 3);
-        let hashes = cache_dead_chain(&state, &own);
-        let stamp = state.inner.cache_recency.next();
-        state.inner.push_ladder_entry_for_test(
-            own.len() as u32,
-            hashes,
-            own.clone(),
-            Vec::new(),
-            stamp,
-        );
-        let mut prompt = own;
-        prompt.extend(tokens_of(15, 2));
-        let charge = state.admission_charge(5, 2, &prompt, false);
-        assert_eq!(charge, 2);
-        let snapshot = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("snapshot")
-            .expect("adapter");
-        assert_eq!(snapshot.blocks.free_blocks, 2);
-        state.reclaim_keep.clone_from(&prompt);
-        let outcome = state
-            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
-            .expect("reserve");
-        state.reclaim_keep.clear();
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Admitted),
-            "{outcome:?}"
-        );
-        assert_eq!(rungs(&state), 2);
-    }
-
-    /// The MoE admission charges no block for the marked chain its prompt
-    /// hits.
-    /// Mutation: the MoE `HybridSchedulerBackend::marked_hit_blocks` returns
-    /// 0 → red (5 ≠ 2).
-    #[test]
-    fn moe_admission_charges_no_block_for_its_marked_hit() {
-        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
-            return;
-        }
-        let Ok(mut inner) = Qwen35MoeInner::new(tiny_moe_config()) else {
-            return;
-        };
-        let recency = Arc::clone(&inner.cache_recency);
-        inner.paged_adapter = Some(tiny_paged_adapter_with(recency, 7, 7));
-        let own = tokens_of(14, 3);
-        let hashes = {
-            let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
-            let mut allocator = adapter.allocator().lock().expect("allocator");
-            let blocks: Vec<_> = (0..3)
-                .map(|_| allocator.allocate().expect("a chain block"))
-                .collect();
-            allocator
-                .cache_full_blocks(&own, &blocks, 16, &[], 0)
-                .expect("cache the chain");
-            for block in blocks {
-                allocator.free(block);
-            }
-            mlx_paged_attn::chain_hashes(&own, 16, &[], 0)
-        };
-        inner.push_ladder_entry_for_test(own.len() as u32, hashes, own.clone(), Vec::new(), 0);
-        let state = HybridSchedulerState::new(inner).expect("construct MoE scheduler");
-        let mut prompt = own;
-        prompt.extend(tokens_of(15, 2));
-        assert_eq!(state.admission_charge(5, 2, &prompt, false), 2);
-    }
-
-    /// A rung at the admitted prompt's own block-aligned end is no replay
-    /// point of it (the lookup leaves the last token out): at the max pool
-    /// the admission takes it and fits.
-    /// Mutation: pass the whole prompt to the token test in `Keep::points`
-    /// → red (`Reject`).
-    #[test]
-    fn admission_drops_a_rung_at_its_own_block_aligned_end() {
-        let Some(mut state) = qwen35_pool_state(4, 4, passing()) else {
-            return;
-        };
-        rung(&mut state, 16, 4, 0);
-        let prompt = tokens_of(16, 4);
-        let charge = state.admission_charge(4, 2, &prompt, false);
-        assert_eq!(charge, 1);
-        let snapshot = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("snapshot")
-            .expect("adapter");
-        state.reclaim_keep.clone_from(&prompt);
-        let outcome = state
-            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
-            .expect("reserve");
-        state.reclaim_keep.clear();
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Admitted),
-            "{outcome:?}"
-        );
-        assert_eq!(rungs(&state), 0);
-    }
-
-    /// MoE twin of `admission_drops_a_rung_at_its_own_block_aligned_end`.
-    /// Mutation: pass the whole prompt to the token test in `Keep::points`
-    /// → red (`Reject`).
-    #[test]
-    fn moe_admission_drops_a_rung_at_its_own_block_aligned_end() {
-        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
-            return;
-        }
-        let Ok(mut inner) = Qwen35MoeInner::new(tiny_moe_config()) else {
-            return;
-        };
-        let mut adapter = tiny_paged_adapter_with(Arc::clone(&inner.cache_recency), 4, 4);
-        adapter.set_grow_headroom_probe_override(Some(passing()));
-        inner.paged_adapter = Some(adapter);
-        let mut state = HybridSchedulerState::new(inner).expect("construct MoE scheduler");
-        let prompt = tokens_of(16, 4);
-        let hashes = cache_dead_chain(&state, &prompt);
-        state
-            .inner
-            .push_ladder_entry_for_test(64, hashes, prompt.clone(), Vec::new(), 0);
-        let charge = state.admission_charge(4, 2, &prompt, false);
-        assert_eq!(charge, 1);
-        let snapshot = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("snapshot")
-            .expect("adapter");
-        state.reclaim_keep.clone_from(&prompt);
-        let outcome = state
-            .try_reserve_reclaiming_idle(2, charge, 0, 0, snapshot)
-            .expect("reserve");
-        state.reclaim_keep.clear();
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Admitted),
-            "{outcome:?}"
-        );
-        assert!(state.inner.ladder_entries_for_test().is_empty());
-    }
-
-    /// A preempted turn whose 64-token prompt is a rung R's tokens, with one
-    /// output token committed, resumes from its replay tokens, whose lookup
-    /// can restore R: at the max pool its charge leaves R's 4 blocks out and
-    /// fits the free block, and R stays.
-    /// Mutation: the resume charges and keeps by `prompt_tokens` in
-    /// `try_resume_preempted` → red (R taken).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn resume_keeps_a_rung_at_its_prompt_end() {
-        let Some(mut state) = qwen35_pool_state(5, 5, passing()) else {
-            return;
-        };
-        let prompt = tokens_of(16, 4);
-        let mut turn = speculative::tests::request(
-            &mut state.inner,
-            2,
-            prompt.clone(),
-            false,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .with_block_reservation(5, 0, 16);
-        state.inner.release_scheduled_recurrent_for(2);
-        state.inner.release_scheduled_speculation(2);
-        state
-            .inner
-            .release_scheduled_cache(2)
-            .expect("release the victim");
-        let r = *rung(&mut state, 16, 4, 0).last().expect("R");
-        turn.token_history.push(3);
-        turn.num_computed_tokens = 65;
-        let replay = install_preemption_replay(&mut turn, &prompt, 32).expect("decode replay");
-        assert_eq!(replay.tokens.len(), 65);
-        assert_eq!(
-            HybridSchedulerBackend::marked_hit_blocks(&state.inner, &replay.tokens),
-            4
-        );
-        turn.payload.preemption_replay = Some(replay);
-        let adapter = state.inner.paged_adapter().expect("paged adapter");
-        assert!(adapter.at_cap());
-        assert_eq!(adapter.takeable_blocks(), 1, "one free block, R marked");
-        state.scheduler.prepend_preempted(turn);
-        state.try_resume_preempted();
-        assert!(has_rung(&state, r), "R stays");
-        assert!(!state.scheduler.has_preempted(), "the turn resumed");
-    }
-
-    /// A lone MTP turn at the cap fits its draft over a marked chain, as it
-    /// did before marks: the draft fit is a byte estimate.
-    /// Mutation: drop the `marked` term in `draft_shortfall` → red.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn lone_mtp_turn_at_the_cap_fits_its_draft_over_a_marked_chain() {
-        let Some((mut state, admission)) = mtp_step_state_with(64, 64) else {
-            return;
-        };
-        let lone = vec![mtp_step_turn(&mut state, 1, 250, admission)];
-        assert_eq!(
-            step_state_bytes(&state.inner, &lone[0], 254, 8_192),
-            463_104
-        );
-        let chain: Vec<u32> = (0..57 * 16).map(|i| i % 13 + 1).collect();
-        let hashes = cache_dead_chain(&state, &chain);
-        hold(&mut state, 99, 7);
-        let adapter = state.inner.paged_adapter().expect("paged adapter");
-        adapter.set_state_marks([*hashes.last().expect("final")]);
-        let snapshot = state
-            .inner
-            .scheduler_cache_snapshot()
-            .expect("snapshot")
-            .expect("adapter");
-        assert_eq!(
-            (
-                snapshot.blocks.free_blocks,
-                snapshot.blocks.reclaimable_blocks
-            ),
-            (0, 0)
-        );
-        assert!(
-            HybridStepExecutor::new(&mut state.inner)
-                .draft_growth_fits(&lone, 0, 4)
-                .expect("lone step")
-        );
-    }
-
-    /// The MoE family takes a refused step's need in the same order: at the
-    /// cap a ladder rung goes and the step's need is met.
-    /// Mutation: the MoE `reclaims_in_order` returns `false` → red (the
-    /// owner loop finds nothing).
-    #[test]
-    fn moe_cap_reclaim_takes_a_ladder_rung() {
-        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
-            return;
-        }
-        let Ok(mut inner) = Qwen35MoeInner::new(tiny_moe_config()) else {
-            return;
-        };
-        let recency = Arc::clone(&inner.cache_recency);
-        inner.paged_adapter = Some(tiny_paged_adapter_with(recency, 4, 4));
-        let tokens = tokens_of(16, 2);
-        let hashes = {
-            let adapter = inner.paged_adapter.as_ref().expect("paged adapter");
-            let mut allocator = adapter.allocator().lock().expect("allocator");
-            let blocks: Vec<_> = (0..2)
-                .map(|_| allocator.allocate().expect("a chain block"))
-                .collect();
-            allocator
-                .cache_full_blocks(&tokens, &blocks, 16, &[], 0)
-                .expect("cache the chain");
-            for block in blocks {
-                allocator.free(block);
-            }
-            mlx_paged_attn::chain_hashes(&tokens, 16, &[], 0)
-        };
-        inner.push_ladder_entry_for_test(32, hashes, tokens, Vec::new(), 0);
-        let mut state = HybridSchedulerState::new(inner).expect("construct MoE scheduler");
-        let adapter = state.inner.paged_adapter_mut().expect("paged adapter");
-        adapter.begin_request(9).expect("begin");
-        adapter
-            .allocate_suffix_blocks_for(9, 32)
-            .expect("hold two blocks");
-        assert!(adapter.reserve_rows_for(9, 48).is_err());
-        clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(9, false, None));
-        assert_eq!(reclaim_log(), vec![GrowReclaim::Ladder]);
-    }
-
-    /// One image entry nothing holds, `bytes` long, in `cache`.
-    fn insert_unheld_image(cache: &crate::vision::qwen::cache::VisionCache, bytes: u64) {
-        let features = MxArray::from_float32(&[1.0], &[1]).expect("features");
-        features.eval();
-        let mut cache = cache.lock().expect("vision cache");
-        cache.insert_for_test(1, features, usize::try_from(bytes).expect("bytes"));
-        assert_eq!(cache.unheld_bytes() as u64, bytes);
-    }
-
-    /// Below the cap, nothing takeable, no state and no idle owner: the
-    /// blocked step's KV need takes the image entry nothing holds, and the
-    /// grow it counted on then passes.
-    /// Mutation: drop the dense `release_one_rebuilt` override → red
-    /// (`false`: the image stage takes nothing).
-    #[test]
-    fn scheduled_step_takes_an_image_entry_after_owners_and_states() {
-        let Some(mut state) = qwen35_pool_state(4, 16, decline_until_taken(1)) else {
-            return;
-        };
-        hold(&mut state, 2, 4);
-        let bytes = bytes_per_block(&state);
-        insert_unheld_image(&state.inner.vision_cache, bytes);
-        state
-            .inner
-            .paged_adapter()
-            .expect("paged adapter")
-            .refuse_for_test(2, 1);
-        clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(2, false, None));
-        assert_eq!(reclaim_log(), vec![GrowReclaim::Vision]);
-        assert_eq!(
-            crate::vision::qwen::cache::unheld_vision_bytes(&state.inner.vision_cache),
-            0
-        );
-    }
-
-    /// Below the cap, the pool held whole and no state: the admission grow
-    /// takes the image entry nothing holds and grows.
-    /// Mutation: `rebuilt: false` in `try_grow_pool_by` → red (`None`, the
-    /// log is empty).
-    #[test]
-    fn admission_grow_takes_an_image_entry_below_the_cap() {
-        let Some(mut state) = qwen35_pool_state(4, 16, decline_until_taken(1)) else {
-            return;
-        };
-        hold(&mut state, 2, 4);
-        let bytes = bytes_per_block(&state);
-        insert_unheld_image(&state.inner.vision_cache, bytes);
-        clear_reclaim_log();
-        let grown = state
-            .try_grow_pool_by(1, &mut MetBefore::default())
-            .expect("grow");
-        assert!(grown.is_some());
-        assert_eq!(reclaim_log(), vec![GrowReclaim::Vision]);
-        assert_eq!(
-            crate::vision::qwen::cache::unheld_vision_bytes(&state.inner.vision_cache),
-            0
-        );
-    }
-
-    /// The MoE family takes an image entry the same way.
-    /// Mutation: drop the MoE `release_one_rebuilt` override → red
-    /// (`false`).
-    #[test]
-    fn moe_scheduled_step_takes_an_image_entry() {
-        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
-            return;
-        }
-        let Ok(mut inner) = Qwen35MoeInner::new(tiny_moe_config()) else {
-            return;
-        };
-        let recency = Arc::clone(&inner.cache_recency);
-        let mut adapter = tiny_paged_adapter_with(recency, 4, 16);
-        adapter.set_grow_headroom_probe_override(Some(decline_until_taken(1)));
-        let bytes = adapter.bytes_per_block().expect("bytes per block");
-        adapter.begin_request(2).expect("begin");
-        adapter
-            .allocate_suffix_blocks_for(2, 4 * 16)
-            .expect("hold every block");
-        adapter.refuse_for_test(2, 1);
-        inner.paged_adapter = Some(adapter);
-        insert_unheld_image(&inner.vision_cache, bytes);
-        let mut state = HybridSchedulerState::new(inner).expect("construct MoE scheduler");
-        clear_reclaim_log();
-        assert!(state.reclaim_for_blocked_step(2, false, None));
-        assert_eq!(reclaim_log(), vec![GrowReclaim::Vision]);
-    }
-
-    /// Contention preempts an MTP victim at a long history; alone, it
-    /// resumes into a max pool its replayed rows and its admission state
-    /// charge fill exactly, which draft state re-priced on the whole history
-    /// overflows.
-    /// Mutation: re-price `recurrent_state_bytes` with
-    /// `scheduled_draft_state_bytes` of the booked tokens in
-    /// `book_resume` → red (Reject).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn lone_resume_after_contention_fits_the_max_pool() {
-        let Some((mut state, live)) = growable_qwen35_state() else {
-            return;
-        };
-        let prompt: Vec<u32> = (0..40).map(|token| token % 16).collect();
-        let recurrent = state.inner.recurrent_state_bytes();
-        let admission = recurrent + state.inner.scheduled_draft_state_bytes(56);
-        let mut turn = speculative::tests::request(
-            &mut state.inner,
-            2,
-            prompt,
-            true,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .with_block_reservation(4, 0, 16)
-        .with_recurrent_state_reservation(admission);
-        turn.payload.requested_tokens = 78_464;
-        state.book_resume(&mut turn, 1_000, true, 0, false);
-        let blocks = turn.block_reservation_total;
-        let bytes_per_block = live.bytes_per_block;
-        let rows_bytes =
-            u64::from(blocks) * bytes_per_block + state.inner.scheduled_recurrent_bytes();
-        let max_blocks = (rows_bytes + admission).div_ceil(bytes_per_block) as u32;
-        let repriced = recurrent + state.inner.scheduled_draft_state_bytes(blocks * 16);
-        assert!(
-            rows_bytes + repriced > u64::from(max_blocks) * bytes_per_block,
-            "the re-priced charge overflows the max pool"
-        );
-        let snapshot = SchedulerCacheSnapshot {
-            blocks: BlockTelemetry {
-                total_blocks: max_blocks,
-                free_blocks: max_blocks,
-                reclaimable_blocks: 0,
-                allocated_blocks: 0,
-            },
-            max_total_blocks: max_blocks,
-            bytes_per_block,
-        };
-        let outcome = state
-            .try_reserve_with_policy(
-                2,
-                blocks,
-                turn.recurrent_state_bytes,
-                0,
-                snapshot,
-                false,
-                <Qwen35Inner as HybridSchedulerBackend>::release_scheduled_cache,
-            )
-            .expect("resume decision");
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Admitted),
-            "{outcome:?}"
-        );
-    }
-
-    /// A cold replay rebuilds an MTP victim's draft K/V for its whole
-    /// history, so its resume is charged what a running turn holds at the
-    /// booked rows, blocked or not, and a max pool that fits only the
-    /// admission charge beside the rows rejects it.
-    /// Mutation: delete the `scheduled_speculation` re-charge in
-    /// `book_resume` → red (charge 435,968 ≠ 10,642,176).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn resumed_mtp_victim_charges_its_rebuilt_draft_state() {
-        let Some((mut state, live)) = growable_qwen35_state() else {
-            return;
-        };
-        state.inner.config.n_mtp_layers = 1;
-        let prompt: Vec<u32> = (0..40).map(|token| token % 16).collect();
-        let recurrent = state.inner.recurrent_state_bytes();
-        let admission = recurrent + state.inner.scheduled_draft_state_bytes(56);
-        let victim = |state: &mut HybridSchedulerState<Qwen35Inner>, seq: u32| {
-            let mut turn = speculative::tests::request(
-                &mut state.inner,
-                seq,
-                prompt.clone(),
-                true,
-                Arc::new(AtomicBool::new(false)),
-            )
-            .with_block_reservation(4, 0, 16)
-            .with_recurrent_state_reservation(admission);
-            turn.payload.requested_tokens = 78_464;
-            turn
-        };
-        let rebuilt = recurrent + state.inner.scheduled_draft_state_held_bytes(40_016);
-        let mut turn = victim(&mut state, 2);
-        state.book_resume(&mut turn, 40_000, true, 0, false);
-        assert_eq!(turn.block_reservation_total, 2_501);
-        assert_eq!(turn.recurrent_state_bytes, rebuilt);
-        let mut unblocked = victim(&mut state, 3);
-        state.book_resume(&mut unblocked, 40_000, false, 2_501, false);
-        assert_eq!(unblocked.recurrent_state_bytes, rebuilt);
-        let blocks = turn.block_reservation_total;
-        let bytes_per_block = live.bytes_per_block;
-        let rows_bytes =
-            u64::from(blocks) * bytes_per_block + state.inner.scheduled_recurrent_bytes();
-        let max_blocks = (rows_bytes + admission).div_ceil(bytes_per_block) as u32;
-        let snapshot = SchedulerCacheSnapshot {
-            blocks: BlockTelemetry {
-                total_blocks: max_blocks,
-                free_blocks: max_blocks,
-                reclaimable_blocks: 0,
-                allocated_blocks: 0,
-            },
-            max_total_blocks: max_blocks,
-            bytes_per_block,
-        };
-        let outcome = state
-            .try_reserve_with_policy(
-                2,
-                blocks,
-                turn.recurrent_state_bytes,
-                0,
-                snapshot,
-                false,
-                <Qwen35Inner as HybridSchedulerBackend>::release_scheduled_cache,
-            )
-            .expect("resume decision");
-        assert!(
-            matches!(outcome, MemoryReserveOutcome::Reject { .. }),
-            "{outcome:?}"
-        );
-    }
-
-    /// A preempted MTP victim books blocks for its replayed history; its
-    /// state charge is never less than its admission charge and prices no
-    /// hidden rows for the whole history.
-    /// Mutation: re-price `recurrent_state_bytes` with
-    /// `scheduled_draft_state_bytes` of the booked tokens in
-    /// `book_resume` → red.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn resumed_victim_keeps_its_admission_state_charge() {
-        let Some((mut state, _)) = growable_qwen35_state() else {
-            return;
-        };
-        let prompt: Vec<u32> = (0..40).map(|token| token % 16).collect();
-        let admission =
-            state.inner.recurrent_state_bytes() + state.inner.scheduled_draft_state_bytes(56);
-        let mut turn = speculative::tests::request(
-            &mut state.inner,
-            2,
-            prompt,
-            true,
-            Arc::new(AtomicBool::new(false)),
-        )
-        .with_block_reservation(4, 0, 16)
-        .with_recurrent_state_reservation(admission);
-        turn.payload.requested_tokens = 78_464;
-        state.book_resume(&mut turn, 40_000, true, 0, false);
-        assert_eq!(
-            turn.block_reservation_total,
-            resume_booking_blocks(4, 40_000, 3, 78_464, 16, false)
-        );
-        assert_eq!(turn.recurrent_state_bytes, admission);
     }
 
     /// Admission's must-fit hard-reject is measured against the MAX pool the
@@ -9181,21 +9372,23 @@ pub(crate) mod tests {
             .expect("activate completed owner recurrent state");
 
         let (ordinary_reply, _ordinary_result) = tokio::sync::oneshot::channel();
-        state
-            .pending
-            .push_back(Qwen35Cmd::from_chat(ChatCmd::SessionStart {
+        state.pending.push_back(
+            Qwen35Cmd::from_chat(ChatCmd::SessionStart {
                 messages: Vec::new(),
                 config: ChatConfig::default(),
                 reply: ordinary_reply,
                 cancelled: Arc::new(AtomicBool::new(false)),
-            }));
+            })
+            .into(),
+        );
         let (release_reply, mut release_result) = tokio::sync::oneshot::channel();
-        state
-            .pending
-            .push_back(Qwen35Cmd::from_chat(ChatCmd::ReleaseCacheOwner {
+        state.pending.push_back(
+            Qwen35Cmd::from_chat(ChatCmd::ReleaseCacheOwner {
                 owner_id: "completed-owner".into(),
                 reply: release_reply,
-            }));
+            })
+            .into(),
+        );
 
         assert_eq!(
             state.process_deferred_cleanup("blocked-owner"),
@@ -9226,27 +9419,27 @@ pub(crate) mod tests {
             .owner_states
             .insert("completed-owner".into(), vec![7, 8]);
         let (ordinary_reply, _ordinary_result) = tokio::sync::oneshot::channel();
-        state
-            .pending
-            .push_back(Qwen35Cmd::from_chat(ChatCmd::SessionStart {
+        state.pending.push_back(
+            Qwen35Cmd::from_chat(ChatCmd::SessionStart {
                 messages: Vec::new(),
                 config: ChatConfig::default(),
                 reply: ordinary_reply,
                 cancelled: Arc::new(AtomicBool::new(false)),
-            }));
+            })
+            .into(),
+        );
         let (reset_reply, _reset_result) = tokio::sync::oneshot::channel();
         state
             .pending
-            .push_back(Qwen35Cmd::from_chat(ChatCmd::ResetCaches {
-                reply: reset_reply,
-            }));
+            .push_back(Qwen35Cmd::from_chat(ChatCmd::ResetCaches { reply: reset_reply }).into());
         let (release_reply, mut release_result) = tokio::sync::oneshot::channel();
-        state
-            .pending
-            .push_back(Qwen35Cmd::from_chat(ChatCmd::ReleaseCacheOwner {
+        state.pending.push_back(
+            Qwen35Cmd::from_chat(ChatCmd::ReleaseCacheOwner {
                 owner_id: "completed-owner".into(),
                 reply: release_reply,
-            }));
+            })
+            .into(),
+        );
 
         assert_eq!(
             state.process_deferred_cleanup("blocked-owner"),
@@ -9269,9 +9462,8 @@ pub(crate) mod tests {
             .owner_states
             .insert("continued-owner".into(), vec![7, 8]);
         let (turn_reply, _turn_result) = tokio::sync::oneshot::channel();
-        state
-            .pending
-            .push_back(Qwen35Cmd::from_chat(ChatCmd::SessionContinue {
+        state.pending.push_back(
+            Qwen35Cmd::from_chat(ChatCmd::SessionContinue {
                 messages: Vec::new(),
                 config: ChatConfig {
                     cache_owner_id: Some("continued-owner".into()),
@@ -9279,14 +9471,17 @@ pub(crate) mod tests {
                 },
                 reply: turn_reply,
                 cancelled: Arc::new(AtomicBool::new(false)),
-            }));
+            })
+            .into(),
+        );
         let (release_reply, mut release_result) = tokio::sync::oneshot::channel();
-        state
-            .pending
-            .push_back(Qwen35Cmd::from_chat(ChatCmd::ReleaseCacheOwner {
+        state.pending.push_back(
+            Qwen35Cmd::from_chat(ChatCmd::ReleaseCacheOwner {
                 owner_id: "continued-owner".into(),
                 reply: release_reply,
-            }));
+            })
+            .into(),
+        );
 
         assert_eq!(
             state.process_deferred_cleanup("blocked-owner"),
@@ -9375,9 +9570,11 @@ pub(crate) mod tests {
     /// parks its recurrent row; A is preempted (its row dropped, its full
     /// blocks registered) and owner C holds the second recurrent unit. A stop
     /// on A ends it "stop" on the tokens it had, the full blocks through the
-    /// cut stay in the cache, and B and C keep their rows.
+    /// cut stay in the cache, and B and C keep their rows. `in_reap`: the
+    /// pass's reap settles it at once, not its resume.
     fn a_vacated_stop_completes_beside_two_resident_peers<B: HybridSchedulerBackend>(
         mut state: HybridSchedulerState<B>,
+        in_reap: bool,
     ) {
         state.enabled = true;
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -9451,8 +9648,19 @@ pub(crate) mod tests {
             "B and C hold both recurrent units"
         );
 
+        let model = state.inner.memory_model();
+        assert_ne!(model, 0, "the fixture registers its memory");
+        let epoch = state.memory_governor().epoch(model);
         plumbing.handle.stop();
-        state.resume_preempted();
+        if in_reap {
+            state.reap_cancelled_waiters();
+        } else {
+            state.resume_preempted();
+        }
+        assert!(
+            state.memory_governor().epoch(model) > epoch,
+            "the suspended request's end wakes the waits"
+        );
         while let Ok(chunk) = rx.try_recv() {
             chunks.push(chunk);
         }
@@ -9488,33 +9696,264 @@ pub(crate) mod tests {
         assert!(state.inner.has_scheduled_recurrent(seq_c));
     }
 
+    /// A governor of its own with room for the fixtures, and its clock.
+    fn roomy_governor() -> (
+        Arc<crate::engine::governor::governor::tests::FakeIo>,
+        &'static crate::engine::governor::governor::Governor,
+    ) {
+        use crate::engine::governor::governor::Governor;
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, stats};
+        let io = FakeIo::new(
+            stats(0),
+            host(32 * G, crate::engine::governor::host::Pressure::Normal),
+        );
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io.clone())));
+        (io, governor)
+    }
+
     /// Mutation F4: `finish_completed` activates the vacated turn before it
-    /// reads `vacated_stop` → red (the recurrent-unit cap error).
+    /// reads `vacated_stop` → red (the recurrent-unit cap error). SP1 (a
+    /// suspended request's end signals no progress) → red. PS1 (the reap
+    /// leaves a stopped suspended turn to its resume) → red (no wake, no
+    /// done chunk).
     #[cfg(target_os = "macos")]
     #[test]
     fn a_vacated_stop_completes_beside_two_resident_qwen35_peers() {
+        use crate::engine::governor::governor::tests::{G, model};
         if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
             return;
         }
-        let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(0x5730_0002);
-        inner.tokenizer = Some(vacated_stop_tokenizer());
-        a_vacated_stop_completes_beside_two_resident_peers(
-            HybridSchedulerState::new(inner).expect("scheduler"),
-        );
+        for in_reap in [false, true] {
+            let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(0x5730_0002);
+            inner.tokenizer = Some(vacated_stop_tokenizer());
+            inner.memory_registration = Some(
+                roomy_governor()
+                    .1
+                    .register_model(model(16 * G, 0))
+                    .expect("register"),
+            );
+            a_vacated_stop_completes_beside_two_resident_peers(
+                HybridSchedulerState::new(inner).expect("scheduler"),
+                in_reap,
+            );
+        }
     }
 
-    /// Mutation F4: as the dense test → red.
+    /// Mutation F4, SP1, PS1: as the dense test → red.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_vacated_stop_completes_beside_two_resident_qwen35_moe_peers() {
+        use crate::engine::governor::governor::tests::{G, model};
         if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
             return;
         }
-        let mut inner = crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(0x5730_0003);
-        inner.tokenizer = Some(vacated_stop_tokenizer());
-        a_vacated_stop_completes_beside_two_resident_peers(
-            HybridSchedulerState::new(inner).expect("scheduler"),
+        for in_reap in [false, true] {
+            let mut inner =
+                crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(0x5730_0003);
+            inner.tokenizer = Some(vacated_stop_tokenizer());
+            inner.memory_registration = Some(
+                roomy_governor()
+                    .1
+                    .register_model(model(16 * G, 0))
+                    .expect("register"),
+            );
+            a_vacated_stop_completes_beside_two_resident_peers(
+                HybridSchedulerState::new(inner).expect("scheduler"),
+                in_reap,
+            );
+        }
+    }
+
+    /// When a running turn is stopped.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum StopAt {
+        /// Its memory wait has not reached its retry.
+        Waiting,
+        /// Its memory wait is past its limit too.
+        Expired,
+        /// Its last prefill slice sampled a token no decode row took yet.
+        FirstToken,
+    }
+
+    /// Splash `Engine::stop` on a running lane: `settle` ends it at the pass
+    /// boundary as `finish(Stop)`, and a lane whose claim waits is no
+    /// exception. A running turn whose memory wait has not reached its
+    /// retry, or has passed its limit, is stopped: the next pass ends it in
+    /// its step, done "stop" on the tokens it generated (Splash
+    /// `generatedTokens` counts the prefill's sampled token), its owner state
+    /// parked (a completion, not the ordinary cancel's failure, nor
+    /// `resource_timeout`).
+    fn a_stopped_running_turn_ends_in_its_step<B: HybridSchedulerBackend>(
+        mut state: HybridSchedulerState<B>,
+        io: &crate::engine::governor::governor::tests::FakeIo,
+        at: StopAt,
+    ) {
+        state.enabled = true;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (plumbing, mut rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let command = ChatCmd::StreamSessionStart {
+            messages: vacated_stop_message(),
+            config: vacated_stop_config("a"),
+            stream_tx: plumbing.stream_tx.clone(),
+            cancelled: plumbing.cancelled.clone(),
+        };
+        assert!(
+            sender
+                .send(ModelCommand::<B::FamilyCommand>::from_chat(command))
+                .is_ok()
         );
+        let mut chunks = Vec::new();
+        for _ in 0..32 {
+            assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+            while let Ok(chunk) = rx.try_recv() {
+                chunks.push(chunk);
+            }
+            let Some(&seq) = state.owner_sequences.get("a") else {
+                continue;
+            };
+            if state.turn_mut(seq).is_some_and(|turn| match at {
+                StopAt::FirstToken => turn.token_history.len() > turn.prompt_tokens as usize,
+                _ => turn.payload.generated_tokens.len() >= 3,
+            }) {
+                break;
+            }
+        }
+        let seq = state.owner_sequences["a"];
+        let governor = state.memory_governor();
+        let model = state.inner.memory_model();
+        let (now, epoch) = (governor.now(), governor.epoch(model));
+        {
+            let turn = state.turn_mut(seq).expect("A runs");
+            if at == StopAt::FirstToken {
+                assert!(turn.payload.generated_tokens.is_empty());
+                assert_eq!(turn.token_history.len(), turn.prompt_tokens as usize + 1);
+            } else {
+                assert!(turn.payload.generated_tokens.len() >= 3);
+                turn.resource_wait.retry_at = now + 1_000.0;
+                turn.resource_wait.epoch = epoch;
+            }
+            if at == StopAt::Expired {
+                turn.resource_wait.pending = false;
+                turn.resource_wait.deadline = now + 1.0;
+                turn.resource_wait.earlier_lane_work = 0.0;
+            }
+        }
+        if at == StopAt::Expired {
+            io.with(|state| state.now = now + 100.0);
+        }
+        plumbing.handle.stop();
+        for _ in 0..4 {
+            if state.turn_mut(seq).is_none() {
+                break;
+            }
+            assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        }
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        drop(plumbing);
+        let done = chunks
+            .into_iter()
+            .map(|chunk| {
+                chunk.unwrap_or_else(|error| panic!("stopped turn failed: {}", error.reason))
+            })
+            .find(|chunk| chunk.done)
+            .expect("the stopped turn sent no done chunk");
+        assert_eq!(done.finish_reason.as_deref(), Some("stop"), "{at:?}");
+        if at == StopAt::FirstToken {
+            assert_eq!(done.num_tokens, Some(1));
+        } else {
+            assert!(done.num_tokens.is_some_and(|tokens| tokens >= 3), "{at:?}");
+        }
+        assert_eq!(
+            state.owner_sequences.get("a"),
+            Some(&seq),
+            "{at:?}: the stop completes and parks its owner"
+        );
+    }
+
+    /// Mutation RS1 (the ledger's reap fails a stopped running turn as a
+    /// cancel) → red (the cancel error); RS2 (the step plans no stopped row
+    /// whose wait has not reached its retry) → red (no done chunk); FS1 (the
+    /// wait of a stopped turn still times out) → red (`resource_timeout`);
+    /// FT1 (the reap counts only decoded tokens) → red (the cancel error at
+    /// the first token).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stopped_running_turn_ends_in_its_qwen35_step() {
+        use crate::engine::governor::governor::tests::{G, model};
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        for at in [StopAt::Waiting, StopAt::Expired, StopAt::FirstToken] {
+            let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(0x5730_0004);
+            inner.tokenizer = Some(vacated_stop_tokenizer());
+            let (io, governor) = roomy_governor();
+            inner.memory_registration =
+                Some(governor.register_model(model(16 * G, 0)).expect("register"));
+            a_stopped_running_turn_ends_in_its_step(
+                HybridSchedulerState::new(inner).expect("scheduler"),
+                &io,
+                at,
+            );
+        }
+    }
+
+    /// Mutation RS1, RS2, FS1, FT1: as the dense test → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stopped_running_turn_ends_in_its_qwen35_moe_step() {
+        use crate::engine::governor::governor::tests::{G, model};
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        for at in [StopAt::Waiting, StopAt::Expired, StopAt::FirstToken] {
+            let mut inner =
+                crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(0x5730_0005);
+            inner.tokenizer = Some(vacated_stop_tokenizer());
+            let (io, governor) = roomy_governor();
+            inner.memory_registration =
+                Some(governor.register_model(model(16 * G, 0)).expect("register"));
+            a_stopped_running_turn_ends_in_its_step(
+                HybridSchedulerState::new(inner).expect("scheduler"),
+                &io,
+                at,
+            );
+        }
+    }
+
+    /// Splash restarts on `metal_out_of_memory` however the request ended: a
+    /// stopped turn whose prefill slice fails with a GPU OOM keeps the
+    /// failure that `settle_step` reads for the restart; any other slice
+    /// failure of the stopped turn ends it `Stop`.
+    /// Mutation OS1 (the stop vacates an OOM slice) → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_stopped_slice_keeps_its_gpu_oom() {
+        let Some((mut state, _)) = growable_qwen35_state() else {
+            return;
+        };
+        let oom = Error::from_reason(
+            "[METAL] Command buffer execution failed: Insufficient Memory \
+             (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory).",
+        );
+        for (error, vacates) in [
+            (oom, false),
+            (Error::from_reason("prefill cancelled"), true),
+        ] {
+            let (plumbing, _rx) = crate::engine::napi_glue::chat_stream_plumbing();
+            let mut turn = decoding_turn(&mut state, 1);
+            turn.payload.response = ScheduledReply::Stream(plumbing.stream_tx.clone());
+            turn.payload.generated_tokens.push(3);
+            plumbing.handle.stop();
+            assert_eq!(
+                failed_slice_vacates(&mut turn, &error),
+                vacates,
+                "{}",
+                error.reason
+            );
+            assert_eq!(turn.payload.vacated_stop, vacates, "{}", error.reason);
+        }
     }
 }
 

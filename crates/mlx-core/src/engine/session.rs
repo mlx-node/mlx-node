@@ -377,6 +377,12 @@ fn expect_sync_result(out: Result<Option<ChatResult>>) -> Result<ChatResult> {
 /// rejection as "turn cancelled, nothing committed to the client".
 pub(crate) const CHAT_SESSION_CANCELLED: &str = "chat session cancelled";
 
+/// A serial turn's cancel or stop after its lane was vacated (Splash
+/// `Engine::release` → `vacateLane`): its KV is the cache's, its live
+/// state gone. The turn reports [`CHAT_SESSION_CANCELLED`], or completes
+/// on what it generated when it was stopped.
+pub(crate) const LANE_VACATED_CANCELLED: &str = "chat session cancelled after its lane was vacated";
+
 /// Map a sync turn's outcome to the reply contract: once the turn's
 /// cancel flag was flipped, the reply REJECTS with the exact
 /// [`CHAT_SESSION_CANCELLED`] string — regardless of how far the turn

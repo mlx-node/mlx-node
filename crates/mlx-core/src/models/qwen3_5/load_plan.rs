@@ -229,6 +229,7 @@ pub(crate) fn evaluate_qwen35_plan(
         },
         draft_weights_bytes: draft.map_or(0, |draft| draft.weight_bytes),
         held_back_bytes: 0,
+        margin: crate::engine::memory_plan::Margin::Ledger,
     };
     let recurrent_state_bytes = lanes.recurrent_state_bytes;
     let trained = config.served_context_tokens();

@@ -3193,7 +3193,7 @@ fn paged_mtp_lookahead_reservation_covers_verify() {
 
 /// The serial MTP gate at the cap reclaims a ladder chain before it falls
 /// back to AR decode.
-/// Mutation: drop the `paged_step_reclaiming` wrapper in
+/// Mutation: drop the `paged_step_claimed` wrapper in
 /// `reserve_paged_mtp_lookahead` → red (`Ok(false)`).
 #[test]
 fn mtp_gate_at_the_cap_reclaims_before_falling_back() {

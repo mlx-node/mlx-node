@@ -43,6 +43,7 @@ fn snapshot(
         metal_current_allocated_bytes: metal_current,
         metal_current_probe_ok: metal_current > 0,
         allocator_cache_bytes: allocator_cache,
+        ledger: None,
     }
 }
 
@@ -349,48 +350,39 @@ fn memory_budget_saturates_extreme_geometry_without_overflow() {
     assert!(budget.cache_budget_bytes <= VISION_CACHE_MAX_BYTES);
 }
 
-/// Generations 1 (a clone kept), 2 and 3: only the unshared entries count,
-/// and the oldest of them goes.
+/// Generations 1 (a clone kept), 2 and 3: only the unshared entries are
+/// units, and a held one is never released.
 /// Mutation: drop the `strong_count` test in `VisionCacheInner::unheld` →
-/// red (generation 1 counts and goes).
+/// red (generation 1 is a unit and goes).
 #[test]
-fn release_one_unheld_takes_the_oldest_unshared_entry() {
+fn unheld_units_are_the_unshared_entries() {
     let mut cache = VisionCacheInner::new();
     let held = feature(1.0);
     cache.insert_for_test(1, held.clone(), 10);
     cache.insert_for_test(2, feature(2.0), 20);
     cache.insert_for_test(3, feature(3.0), 40);
     assert_eq!(cache.retained_bytes, 70);
-    assert_eq!(cache.unheld_bytes(), 60);
-    assert_eq!(cache.release_one_unheld(), Some(20));
+    let units = cache.unheld_units();
+    assert_eq!(units.iter().map(|&(_, bytes)| bytes).sum::<u64>(), 60);
+    let oldest = units.iter().map(|&(generation, _)| generation).min();
+    assert_eq!(cache.release_unheld(oldest.expect("a unit")), Some(20));
     assert_eq!(cache.retained_bytes, 50);
     assert!(cache.entries.contains_key(&key(1, [1, 1, 1])));
     assert!(!cache.entries.contains_key(&key(2, [1, 1, 1])));
-    assert_eq!(cache.release_one_unheld(), Some(40));
-    assert_eq!(cache.release_one_unheld(), None, "generation 1 is held");
+    let held_generation = cache.entries[&key(1, [1, 1, 1])].lru_generation;
+    assert_eq!(
+        cache.release_unheld(held_generation),
+        None,
+        "generation 1 is held"
+    );
     drop(held);
-    assert_eq!(cache.unheld_bytes(), 10);
-}
-
-/// A locked cache's unheld bytes are unknown: the count reads them as
-/// covering, so a take is still tried.
-/// Mutation: read a locked cache as 0 in `unheld_vision_bytes` → red (0).
-#[test]
-fn a_locked_vision_cache_never_under_counts() {
-    let cache: VisionCache = Arc::new(Mutex::new(VisionCacheInner::new()));
-    cache.lock().unwrap().insert_for_test(1, feature(1.0), 10);
-    assert_eq!(unheld_vision_bytes(&cache), 10);
-    let guard = cache.lock().unwrap();
-    assert_eq!(unheld_vision_bytes(&cache), u64::MAX);
-    assert!(!release_one_unheld_vision(&cache));
-    drop(guard);
-    assert!(release_one_unheld_vision(&cache));
+    assert_eq!(cache.unheld_units().len(), 2);
 }
 
 /// One 2×2-patch image through the tiny encoder: while the caller holds the
 /// returned features the entry is held; dropped, it is unheld.
 /// Mutation: return an empty `held` from `vlm_prepare_vision_features` →
-/// red (`unheld_bytes > 0` at once).
+/// red (an unheld unit at once).
 #[cfg(target_os = "macos")]
 #[test]
 fn prepared_image_features_stay_held_until_dropped() {
@@ -430,9 +422,13 @@ fn prepared_image_features_stay_held_until_dropped() {
     merge.inputs_embeds.eval();
     let retained = cache.lock().unwrap().retained_bytes;
     assert!(retained > 0);
-    assert_eq!(unheld_vision_bytes(&cache), 0);
+    assert!(unheld_vision_units(&cache).is_empty());
     drop(held);
-    assert_eq!(unheld_vision_bytes(&cache), retained as u64);
-    assert!(release_one_unheld_vision(&cache));
+    let units = unheld_vision_units(&cache);
+    assert_eq!(
+        units.iter().map(|&(_, bytes)| bytes).sum::<u64>(),
+        retained as u64
+    );
+    assert!(release_unheld_vision(&cache, units[0].0));
     assert_eq!(cache.lock().unwrap().retained_bytes, 0);
 }

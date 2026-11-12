@@ -396,6 +396,8 @@ impl CacheLimitCoordinator {
             state.pools.len(),
         );
         recompute_locked(&mut state);
+        drop(state);
+        pools_changed();
         Some(PoolCacheLimitGuard { id })
     }
 
@@ -420,6 +422,7 @@ impl CacheLimitCoordinator {
             recompute_locked(&mut state);
             id
         };
+        pools_changed();
         PoolCacheLimitGuard { id }
     }
 
@@ -430,21 +433,24 @@ impl CacheLimitCoordinator {
     /// already dropped) or the byte total is unchanged.
     pub fn update_pool(&self, id: u64, new_bytes: u64) {
         let new_bytes = new_bytes.saturating_add(mlx_paged_attn::RESTORE_STAGING_BYTES);
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(bytes) = state.pools.get_mut(&id) else {
-            return;
-        };
-        if *bytes == new_bytes {
-            return;
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(bytes) = state.pools.get_mut(&id) else {
+                return;
+            };
+            if *bytes == new_bytes {
+                return;
+            }
+            *bytes = new_bytes;
+            info!(
+                "[cache_limit] update paged pool guard={} bytes={:.2} GB (live_pools={})",
+                id,
+                new_bytes as f64 / ONE_GIB,
+                state.pools.len(),
+            );
+            recompute_locked(&mut state);
         }
-        *bytes = new_bytes;
-        info!(
-            "[cache_limit] update paged pool guard={} bytes={:.2} GB (live_pools={})",
-            id,
-            new_bytes as f64 / ONE_GIB,
-            state.pools.len(),
-        );
-        recompute_locked(&mut state);
+        pools_changed();
     }
 
     fn unregister(&self, id: u64) {
@@ -460,8 +466,16 @@ impl CacheLimitCoordinator {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.pools.remove(&id).is_some() {
             recompute_locked(&mut state);
+            drop(state);
+            pools_changed();
         }
     }
+}
+
+/// The memory governor reads the pool total itself, so it runs after the
+/// coordinator's lock is released (lock order: coordinator, then governor).
+fn pools_changed() {
+    crate::engine::governor::governor().pools_changed();
 }
 
 /// RAII token returned from [`CacheLimitCoordinator::register`]. Dropping

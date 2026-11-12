@@ -199,7 +199,11 @@ pub(super) fn plan_store(
     let automatic = pool.shape.trained.min(RESIDENT_ALLOWANCE_TOKENS);
     let allowance = allowance_dynamic_bytes(&[&lane], max_context.unwrap_or(automatic));
     let minimum_dynamic = pool.plan_at(0).lane.minimum_bytes;
-    let hard = hard_budget_bytes(live.working_set_bytes, max_memory);
+    let hard = hard_budget_bytes(
+        live.working_set_bytes,
+        max_memory,
+        crate::engine::memory_plan::Margin::Unguarded,
+    );
     let fixed = live
         .active_bytes
         .saturating_add(live.registered_pool_bytes)
@@ -238,6 +242,7 @@ pub(super) fn plan_engine(
         staging_bytes: 0,
         draft_weights_bytes: 0,
         held_back_bytes: held_back,
+        margin: crate::engine::memory_plan::Margin::Unguarded,
     };
     MemoryPlan::evaluate(footprint, Some(pool_input(c, &transient, &state)))
         .map_err(|error| Error::from_reason(error.message(label)))

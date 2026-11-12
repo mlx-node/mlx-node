@@ -37,6 +37,7 @@ enum VisionMemoryCapSource {
     MlxMemoryLimit,
     MetalWorkingSet,
     ConservativeFallback,
+    MemoryGovernor,
 }
 
 impl VisionMemoryCapSource {
@@ -46,6 +47,7 @@ impl VisionMemoryCapSource {
             Self::MlxMemoryLimit => "mlx_memory_limit",
             Self::MetalWorkingSet => "metal_recommended_working_set",
             Self::ConservativeFallback => "conservative_fallback",
+            Self::MemoryGovernor => "memory_governor_limit",
         }
     }
 }
@@ -65,6 +67,9 @@ struct VisionMemorySnapshot {
     /// immediately before probing, and this value is deliberately not charged
     /// against headroom. Any residue is logged for diagnosis.
     allocator_cache_bytes: u64,
+    /// The memory governor's `(limit, charged)` for a model it registered:
+    /// the cap and the bytes in use instead of MLX's limit and counters.
+    ledger: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -92,6 +97,9 @@ fn percentage_of(value: u64, percent: u64) -> u64 {
 }
 
 fn lower_nonzero_cap(snapshot: VisionMemorySnapshot) -> (u64, VisionMemoryCapSource) {
+    if let Some((limit, _)) = snapshot.ledger {
+        return (limit, VisionMemoryCapSource::MemoryGovernor);
+    }
     let candidates = [
         (
             percentage_of(snapshot.total_system_memory_bytes, 85),
@@ -153,15 +161,18 @@ fn resolve_vision_memory_budget(
     // reclaimable free pool, and external paged-KV buffers. Remove the
     // allocator cache, then take the larger non-reclaimable counter rather
     // than summing and double charging MLX-owned arrays.
-    let usage_probe_available = (snapshot.allocator_active_probe_ok
-        && snapshot.allocator_active_bytes > 0)
+    let usage_probe_available = snapshot.ledger.is_some()
+        || (snapshot.allocator_active_probe_ok && snapshot.allocator_active_bytes > 0)
         || (snapshot.metal_current_probe_ok && snapshot.metal_current_allocated_bytes > 0);
     let metal_nonreclaimable_bytes = snapshot
         .metal_current_allocated_bytes
         .saturating_sub(snapshot.allocator_cache_bytes);
-    let measured_used_memory_bytes = snapshot
-        .allocator_active_bytes
-        .max(metal_nonreclaimable_bytes);
+    let measured_used_memory_bytes = match snapshot.ledger {
+        Some((_, charged)) => charged,
+        None => snapshot
+            .allocator_active_bytes
+            .max(metal_nonreclaimable_bytes),
+    };
     // A loaded vision model cannot genuinely consume zero bytes. If both
     // probes fail/return zero, fail closed by exposing no headroom; the caller
     // can still satisfy an all-hit request but must not start new encoding.
@@ -269,6 +280,7 @@ fn probe_vision_memory() -> VisionMemorySnapshot {
         metal_current_allocated_bytes,
         metal_current_probe_ok,
         allocator_cache_bytes,
+        ledger: crate::engine::governor::governor().scope_budget(),
     }
 }
 
@@ -383,24 +395,22 @@ impl VisionCacheInner {
         Arc::strong_count(&entry.features.handle) == 1
     }
 
-    /// Bytes of the entries nothing outside the cache holds (Splash
-    /// `EmbeddingsPool`: the held entries are its floor).
-    pub(crate) fn unheld_bytes(&self) -> usize {
+    /// `(lru generation, bytes)` of every entry nothing outside the cache
+    /// holds.
+    pub(crate) fn unheld_units(&self) -> Vec<(u64, u64)> {
         self.entries
             .values()
             .filter(|entry| Self::unheld(entry))
-            .map(|entry| entry.bytes)
-            .sum()
+            .map(|entry| (entry.lru_generation, entry.bytes as u64))
+            .collect()
     }
 
-    /// Drops the least recently used entry nothing outside the cache holds;
-    /// its bytes, `None` when every entry is held.
-    pub(crate) fn release_one_unheld(&mut self) -> Option<usize> {
+    /// Drops the unheld entry of `generation`; its bytes.
+    pub(crate) fn release_unheld(&mut self, generation: u64) -> Option<usize> {
         let key = self
             .entries
             .iter()
-            .filter(|(_, entry)| Self::unheld(entry))
-            .min_by_key(|(_, entry)| entry.lru_generation)
+            .find(|(_, entry)| entry.lru_generation == generation && Self::unheld(entry))
             .map(|(key, _)| *key)?;
         let entry = self.entries.remove(&key)?;
         self.retained_bytes = self.retained_bytes.saturating_sub(entry.bytes);
@@ -415,26 +425,23 @@ impl VisionCacheInner {
         };
         self.insert(key, features, bytes, &HashSet::new(), usize::MAX);
     }
-
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
 }
 
 pub(crate) type VisionCache = Arc<Mutex<VisionCacheInner>>;
 
-/// [`VisionCacheInner::unheld_bytes`] of `cache`. While it is locked the
-/// bytes are unknown and read as `u64::MAX`: a count may over-count, never
-/// under-count.
-pub(crate) fn unheld_vision_bytes(cache: &VisionCache) -> u64 {
-    lock_now(cache).map_or(u64::MAX, |cache| cache.unheld_bytes() as u64)
+/// [`VisionCacheInner::unheld_units`] of `cache`; none while it is locked.
+pub(crate) fn unheld_vision_units(cache: &VisionCache) -> Vec<(u64, u64)> {
+    lock_now(cache).map_or_else(Vec::new, |cache| cache.unheld_units())
 }
 
-/// [`VisionCacheInner::release_one_unheld`] of `cache`; false while it is
-/// locked or when nothing is unheld.
-pub(crate) fn release_one_unheld_vision(cache: &VisionCache) -> bool {
-    lock_now(cache).is_some_and(|mut cache| cache.release_one_unheld().is_some())
+/// The bytes `cache` retains; 0 while another thread holds it.
+pub(crate) fn vision_cache_bytes(cache: &VisionCache) -> u64 {
+    lock_now(cache).map_or(0, |cache| cache.retained_bytes as u64)
+}
+
+/// [`VisionCacheInner::release_unheld`] of `cache`.
+pub(crate) fn release_unheld_vision(cache: &VisionCache, generation: u64) -> bool {
+    lock_now(cache).is_some_and(|mut cache| cache.release_unheld(generation).is_some())
 }
 
 fn lock_now(cache: &VisionCache) -> Option<std::sync::MutexGuard<'_, VisionCacheInner>> {

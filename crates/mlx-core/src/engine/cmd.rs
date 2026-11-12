@@ -105,6 +105,21 @@ pub(crate) enum ChatCmd {
     },
 }
 
+impl ChatCmd {
+    /// A turn's cancel flag; `None` for a command that runs no turn.
+    pub(crate) fn cancel_flag(&self) -> Option<Arc<AtomicBool>> {
+        match self {
+            Self::SessionStart { cancelled, .. }
+            | Self::SessionContinue { cancelled, .. }
+            | Self::SessionContinueTool { cancelled, .. }
+            | Self::StreamSessionStart { cancelled, .. }
+            | Self::StreamSessionContinue { cancelled, .. }
+            | Self::StreamSessionContinueTool { cancelled, .. } => Some(Arc::clone(cancelled)),
+            Self::ResetCaches { .. } | Self::ReleaseCacheOwner { .. } => None,
+        }
+    }
+}
+
 /// Training commands dispatched from the GRPO / SFT engines to a
 /// trainable family's dedicated model thread.
 ///

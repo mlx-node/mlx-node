@@ -5375,6 +5375,9 @@ mod tests {
                 prompt.len() as u32,
                 5,
             ),
+            claim: None,
+            cell: None,
+            clock: Default::default(),
         };
         // Splitting the prefill also verifies that non-final slices leave the
         // pending zero-budget close intact until a token can actually be emitted.

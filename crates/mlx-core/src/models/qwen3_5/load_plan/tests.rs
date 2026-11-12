@@ -261,7 +261,7 @@ fn write_27b_fixture(target: &std::path::Path, draft: &std::path::Path) {
 /// with the target's and the draft's weight files as active bytes: on the
 /// M3 Pro working set (27 GiB) with 16,000 MiB of target shards and a
 /// 1,357 MiB draft, the one window equals the load planner's at active
-/// 17,357 MiB (the int8 pool lane with the draft state, 98,297).
+/// 17,357 MiB (the int8 pool lane with the draft state, 221,177).
 /// Mutation: leave the draft file out of the active bytes in
 /// `estimate_qwen35_load` → red.
 #[test]
@@ -359,7 +359,7 @@ fn estimate_matches_the_load_plan() {
     std::fs::remove_dir_all(&draft).unwrap();
 
     let window = plan.pool.expect("pool lane").lane.window;
-    assert_eq!(window.maximum(), 98_297);
+    assert_eq!(window.maximum(), 221_177);
     assert_eq!(
         estimate,
         Qwen35ContextEstimate {
@@ -411,7 +411,7 @@ fn sym8_estimate_plans_the_pool() {
     std::fs::remove_dir_all(&target).unwrap();
     std::fs::remove_dir_all(&draft).unwrap();
     let affine = affine.expect("estimate").expect("readable device");
-    assert_eq!(affine.bound, "memory");
+    assert_eq!(affine.bound, "model");
     assert_eq!(sym8.expect("estimate").expect("readable device"), affine);
 }
 
@@ -454,6 +454,7 @@ fn audit_counts_this_pools_staging_once() {
             staging_bytes: staging,
             draft_weights_bytes: 0,
             held_back_bytes: 0,
+            margin: crate::engine::memory_plan::Margin::Ledger,
         },
         margin_bytes: 0,
         hard_budget_bytes: active
@@ -655,7 +656,11 @@ fn max_context_above_the_plan_is_refused() {
             plan + 1
         )
     );
-    let hard = crate::engine::memory_plan::hard_budget_bytes(working_set, None);
+    let hard = crate::engine::memory_plan::hard_budget_bytes(
+        working_set,
+        None,
+        crate::engine::memory_plan::Margin::Ledger,
+    );
     let error = estimate_27b("refuse-flag", working_set, Some(hard), Some(plan + 1)).unwrap_err();
     assert!(
         error.reason.contains(&format!(
@@ -773,12 +778,12 @@ fn unplanned_estimate_refuses_what_the_load_refuses() {
 /// state (a GDN cell and the draft ring, 201,273,344) sits beside the pool,
 /// the transient is the larger of the tapped prefill chunk and the 8-row
 /// verify cycle with its free pool (491,126,784), the page is 1,064,960 B
-/// in 128-page extents and the runway one extent plus a cell: 6,451 blocks
-/// (3,275 MiB), window 98,297. No flat lane. A bf16 pool on the same
-/// inputs holds 50,041.
+/// in 128-page extents and the runway one extent plus a cell: 14,137 blocks
+/// (7,178 MiB), window 221,177. No flat lane. A bf16 pool on the same
+/// inputs holds 112,473.
 /// Mutations: drop the draft state from the pool lane in
-/// `evaluate_qwen35_plan` → red (6,806 blocks); price the pool transient without
-/// the draft taps → red (6,636 blocks); the pool layout keeps `KvFormat::Bf16` →
+/// `evaluate_qwen35_plan` → red (more blocks); price the pool transient without
+/// the draft taps → red (more blocks); the pool layout keeps `KvFormat::Bf16` →
 /// red.
 #[test]
 fn dflash2_takes_the_one_pool_window() {
@@ -786,20 +791,20 @@ fn dflash2_takes_the_one_pool_window() {
     let int8 = plan_27b_as("int8-window", 27 << 30, None, 262_144, Some(KvFormat::Int8));
     let pool = int8.pool.expect("pool lane");
     assert_eq!(pool.bytes_per_block, 532_480);
-    assert_eq!(pool.max_blocks, 6_451);
-    assert_eq!(pool.max_mib(), 3_275);
+    assert_eq!(pool.max_blocks, 14_137);
+    assert_eq!(pool.max_mib(), 7_178);
     assert_eq!(pool.runway_blocks, 546);
     assert_eq!(pool.lane.transient_bytes, 491_126_784);
     assert_eq!(pool.lane.lane_bytes, cell + 201_273_344);
     assert_eq!(pool.lane.extent_pages, 128);
-    assert_eq!(pool.lane.window.maximum(), 98_297);
+    assert_eq!(pool.lane.window.maximum(), 221_177);
     assert_eq!(pool.lane.window.bound(), "memory");
 
     let bf16 = plan_27b_as("bf16-window", 27 << 30, None, 262_144, Some(KvFormat::Bf16));
     let pool = bf16.pool.expect("pool lane");
     assert_eq!(pool.bytes_per_block, 1 << 20);
     assert_eq!(pool.runway_blocks, 275);
-    assert_eq!(pool.lane.window.maximum(), 50_041);
+    assert_eq!(pool.lane.window.maximum(), 112_473);
 }
 
 /// A draft load without a pool (off Metal) is refused before any read:
@@ -849,10 +854,11 @@ fn draft_without_a_pool_is_refused() {
 /// the pool lane (MTP heads, no draft) charges the MTP state it holds at the
 /// window once, beside the pool (Splash `laneStateBytes`), and inside the
 /// pool too only when the scheduler books it there. M3 Pro inputs, int8
-/// pool: 57,337 (3,902 blocks) for a serial MTP load, 20,473 when the
-/// scheduler books the state in the pool, against 106,489 without the state.
+/// pool: 155,641 (10,165 blocks) for a serial MTP load, 102,908 when the
+/// scheduler books the state in the pool.
 /// `lane_bytes` carries the cell and the state at the window.
-/// Mutation ST: `LaneKv::Pool::budget` ignores the state → red (106,489).
+/// Mutation ST: `LaneKv::Pool::budget` ignores the state → red (a larger
+/// window).
 #[test]
 fn mtp_state_prices_the_one_pool_window() {
     let cell = 153_944_064u64;
@@ -870,12 +876,12 @@ fn mtp_state_prices_the_one_pool_window() {
         Some(false),
     );
     let pool = serial.pool.expect("pool lane");
-    assert_eq!(pool.lane.window.maximum(), 57_337);
-    assert_eq!(pool.max_blocks, 3_902);
+    assert_eq!(pool.lane.window.maximum(), 155_641);
+    assert_eq!(pool.max_blocks, 10_165);
     assert_eq!(
         pool.lane.lane_bytes,
         cell + crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::held_bytes(
-            &config, 57_337
+            &config, 155_641
         )
     );
     let booked = plan_27b_lanes(
@@ -888,7 +894,7 @@ fn mtp_state_prices_the_one_pool_window() {
     );
     assert_eq!(
         booked.pool.expect("pool lane").lane.window.maximum(),
-        20_473
+        102_908
     );
 }
 
@@ -1374,8 +1380,8 @@ fn write_122b_fixture(target: &std::path::Path) {
 /// The 122B's unset default prices the int8 pool: its pages are half the
 /// bf16 ones (bs 16: 199,680 vs 393,216 B; Splash 32-token pages 399,360 vs
 /// 786,432), so on a 96 GiB working set with the lightest weights that leave
-/// a memory-bound int8 window (77,750 MiB), the default equals explicit int8:
-/// 262,137 tokens against bf16's 118,393.
+/// a memory-bound int8 window (91,750 MiB), the default equals explicit int8:
+/// 245,753 tokens against bf16's 128,121.
 /// Mutation D1: `default_for_geometry` keeps a `gqa <= 8` clause → red (the
 /// default prices bf16 pages).
 #[test]
@@ -1417,7 +1423,7 @@ fn estimate_122b_takes_the_int8_pool() {
     };
     // The lightest weights (250 MiB steps from 70,000) whose int8 window is
     // memory-bound.
-    let weight_mib = (0..64)
+    let weight_mib = (0..128)
         .map(|step| 70_000 + 250 * step)
         .find(|&mib| estimate(mib, Some(KvFormat::Int8)).is_some_and(|e| e.bound == "memory"))
         .expect("a memory-bound int8 window");
@@ -1429,14 +1435,14 @@ fn estimate_122b_takes_the_int8_pool() {
         "122B at {weight_mib} MiB of weights, 96 GiB working set: unset {unset:?}, int8 {int8:?}, \
          bf16 {bf16:?}"
     );
-    assert_eq!(weight_mib, 77_750);
+    assert_eq!(weight_mib, 91_750);
     assert_eq!(unset, int8);
     assert_eq!(
         (int8.window_tokens, int8.bound.as_str()),
-        (262_137, "memory")
+        (245_753, "memory")
     );
     assert_eq!(
         (bf16.window_tokens, bf16.bound.as_str()),
-        (135_737, "memory")
+        (128_121, "memory")
     );
 }

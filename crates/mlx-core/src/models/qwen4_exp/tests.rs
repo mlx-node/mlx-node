@@ -743,8 +743,8 @@ fn queued_mtp_owner_keeps_its_draft_reservation_until_its_owner_exists() {
 
 /// A preempted MTP turn drops its row and draft owner and re-admits both on
 /// resume. The resume sizes the draft state from the turn's token bound, not
-/// from its block reservation: with `MLX_SCHED_RESERVE_FULL_ISL=0` the block
-/// reservation covers the prompt plus one growth block, and a turn re-admitted
+/// from its block reservation: an on-demand block reservation covers the
+/// prompt plus one growth block, and a turn re-admitted
 /// at that size would grow its draft frontier beside owners the full bound
 /// defers. The turn is admitted with the full-ISL reservation and shrunk to
 /// the partial shape before the preemption.

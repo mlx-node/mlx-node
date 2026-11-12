@@ -49,6 +49,11 @@ pub(crate) fn compute_performance_metrics(
         (Some(gs), Some(ft)) => (gs, ft),
         _ => return None,
     };
+    // A whole turn of a model on the memory governor: its TTFT runs from
+    // its command's arrival (Splash counts from submission).
+    crate::engine::governor::metrics::whole_turn_first_token(first_tok);
+    let gen_start = crate::engine::governor::metrics::whole_turn_enqueued_at()
+        .map_or(gen_start, |enqueued_at| enqueued_at.min(gen_start));
     let generation_end = std::time::Instant::now();
     let actual_prefill_toks = prefill_tokens_len as f64;
     let gen_toks = generated_tokens_len as f64;

@@ -546,6 +546,24 @@ pub(crate) fn validate_query_input(
     })
 }
 
+/// A refused block reservation (Splash `TokenAdmission`): the blocks it
+/// lacked and the blocks the allocator could hand out then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BlockRefusal {
+    pub additional: u32,
+    pub available: u32,
+}
+
+/// The memory governor's side of a pool: admits a growth's bytes for the
+/// current claim and names the blocks waiting claims hold.
+pub(crate) trait PoolAdmission: Send + Sync {
+    /// Runs `grow` once `bytes` are admitted, holding them until it
+    /// returns; false when refused or when `grow` fails (a refusal of the
+    /// same bytes, Splash `DriverRejected`).
+    fn admit_grow(&self, bytes: u64, grow: &mut dyn FnMut() -> Result<bool, String>) -> bool;
+    fn held_blocks(&self) -> u32;
+}
+
 /// Bytes a pool grow holds beside the new pool: the peak of
 /// `LayerKVPool::grow_to`'s swaps, which allocate each layer's new buffers
 /// while its old ones are alive and skip a layer already at the new size,
@@ -1105,22 +1123,19 @@ pub struct PagedKVCacheAdapter {
     /// frees the table's blocks at this stamp.
     turn_end_stamps: HashMap<SeqId, u64>,
 
-    /// Blocks each sequence's last reservation was refused, per sequence
-    /// (Splash `MemoryLedger::refused`). A `Mutex` so `check_wave_fits`
-    /// stays `&self`; it is locked after the allocator, never before.
-    refusals: Mutex<BTreeMap<SeqId, u32>>,
-
-    /// Each sequence's last refused draft fit (Splash
-    /// `MemoryLedger::refused`). Locked after the allocator, never before.
-    draft_refusals: Mutex<BTreeMap<SeqId, crate::engine::reclaim::DraftRefusal>>,
-
-    /// Blocks the last [`Self::try_grow_pool`] could still have added when
-    /// its probe declined the full grow: the live room.
-    last_grow_room: u32,
+    /// Each sequence's last refused reservation (Splash
+    /// `MemoryLedger::refused`). A `Mutex` so `check_wave_fits` stays
+    /// `&self`; it is locked after the allocator, never before.
+    refusals: Mutex<BTreeMap<SeqId, BlockRefusal>>,
 
     /// The memory plan's ceiling a pool growth is probed against; `None`
     /// probes the automatic hard budget.
     memory_ceiling: Option<u64>,
+
+    /// The memory governor's admission: set, a pool growth is a claim's
+    /// allocation instead of a probe, and blocks held for waiting claims
+    /// stay free.
+    admission: Option<Arc<dyn PoolAdmission>>,
 
     /// Test-only override for the pre-grow headroom probe: receives the
     /// grow-target block count and returns the probe's `selected_blocks`.
@@ -1345,9 +1360,8 @@ impl PagedKVCacheAdapter {
             recency,
             turn_end_stamps: HashMap::new(),
             refusals: Mutex::new(BTreeMap::new()),
-            draft_refusals: Mutex::new(BTreeMap::new()),
-            last_grow_room: 0,
             memory_ceiling: None,
+            admission: None,
             #[cfg(test)]
             grow_headroom_probe_override: None,
         })
@@ -1368,6 +1382,20 @@ impl PagedKVCacheAdapter {
     /// Probe every later growth against the memory plan's ceiling.
     pub(crate) fn set_memory_ceiling(&mut self, ceiling_bytes: u64) {
         self.memory_ceiling = Some(ceiling_bytes);
+    }
+
+    /// Admit every later growth through the memory governor (Splash
+    /// `MemoryGovernor::allocationAdmission`).
+    pub(crate) fn set_admission(&mut self, admission: Arc<dyn PoolAdmission>) {
+        self.admission = Some(admission);
+    }
+
+    /// Blocks held for waiting claims ranked above the current claim; 0
+    /// without the governor's admission.
+    pub(crate) fn held_blocks(&self) -> u32 {
+        self.admission
+            .as_ref()
+            .map_or(0, |admission| admission.held_blocks())
     }
 
     /// The memory plan's ceiling, once the load set it.
@@ -1884,6 +1912,7 @@ impl PagedKVCacheAdapter {
                         pool: &self.layer_kv_pool,
                         allocator: &self.allocator,
                         block_size: self.block_size,
+                        held: self.held_blocks(),
                     };
                     walk.begin_restore_extend(
                         lookup_tokens,
@@ -2481,10 +2510,9 @@ impl PagedKVCacheAdapter {
         // (including the forced-miss `skip_lookup` path below), so exactly the
         // immediately-following request is suppressed.
         let suppress_cold_restore = std::mem::take(&mut self.suppress_cold_restore_once);
-        let block_table = self
-            .block_table
-            .as_mut()
-            .ok_or_else(|| format!("{op} called before reset_for_new_request"))?;
+        if self.block_table.is_none() {
+            return Err(format!("{op} called before reset_for_new_request"));
+        }
 
         // vLLM `skip_reading_prefix_cache` short-circuit. Behaves as a
         // forced 0-block cache miss: same post-conditions as a real
@@ -2496,7 +2524,9 @@ impl PagedKVCacheAdapter {
         if skip_lookup {
             self.cached_token_count = 0;
             self.request_tokens.clear();
-            block_table.set_num_tokens(0);
+            if let Some(block_table) = self.block_table.as_mut() {
+                block_table.set_num_tokens(0);
+            }
             self.prefix_lookup_done = true;
             return Ok(CachedPrefix {
                 blocks: Vec::new(),
@@ -2527,6 +2557,25 @@ impl PagedKVCacheAdapter {
         //
         // Skipped for one lookup after a command reset (`suppress_cold_restore`)
         // so the just-purged prefix is re-prefilled cold rather than restored.
+        // A restore allocates from the pool and cannot grow it: under the
+        // governor the pool grows first for the blocks the lookup may
+        // restore, an allocation of the turn's claim (Splash allocates a
+        // restored chain's pages before its restore starts).
+        if restore_cold
+            && !suppress_cold_restore
+            && self.cold_tier.is_some()
+            && self.admission.is_some()
+        {
+            let restorable =
+                (lookup_len / self.block_size.max(1) as usize).saturating_sub(blocks.len());
+            let restorable = u32::try_from(restorable).unwrap_or(u32::MAX);
+            let held = self.held_blocks();
+            let shortfall =
+                self.grow_shortfall(&self.allocator_guard(), restorable.saturating_add(held));
+            if shortfall > 0 {
+                self.try_grow_pool(shortfall);
+            }
+        }
         if restore_cold
             && !suppress_cold_restore
             && let Some(cold) = self.cold_tier.as_ref()
@@ -2537,6 +2586,7 @@ impl PagedKVCacheAdapter {
                 pool: &self.layer_kv_pool,
                 allocator: &self.allocator,
                 block_size,
+                held: self.held_blocks(),
             };
             let restored = walk.restore_extend(
                 lookup_tokens,
@@ -2558,6 +2608,10 @@ impl PagedKVCacheAdapter {
             self.restored_sidecar = restored.sidecar;
         }
 
+        let block_table = self
+            .block_table
+            .as_mut()
+            .ok_or_else(|| format!("{op} called before reset_for_new_request"))?;
         for block in &blocks {
             block_table.add_block(Arc::clone(block));
         }
@@ -2741,6 +2795,7 @@ impl PagedKVCacheAdapter {
         }
 
         let mut grow_attempted = false;
+        let held = self.held_blocks();
         // Growth BEFORE eviction: if the reservation exceeds everything
         // the allocator could hand out (free + evictable cache-only prefix
         // entries), grow the pool first so `allocate` never evicts a cached
@@ -2755,7 +2810,7 @@ impl PagedKVCacheAdapter {
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            self.grow_shortfall(&guard, needed_blocks)
+            self.grow_shortfall(&guard, needed_blocks.saturating_add(held))
         };
         if shortfall > 0 {
             grow_attempted = true;
@@ -2767,7 +2822,7 @@ impl PagedKVCacheAdapter {
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?
-                .reserve(needed_blocks);
+                .reserve(needed_blocks, held);
             let i = match reserved {
                 Ok(blocks) => break blocks,
                 Err(taken) => taken,
@@ -2781,7 +2836,7 @@ impl PagedKVCacheAdapter {
                     .allocator
                     .lock()
                     .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-                self.grow_shortfall(&guard, needed_blocks)
+                self.grow_shortfall(&guard, needed_blocks.saturating_add(held))
             };
             if grow_attempted || !self.try_grow_pool(retry_shortfall) {
                 if let Some(seq_id) = self.active_seq {
@@ -2858,6 +2913,7 @@ impl PagedKVCacheAdapter {
         let to_allocate = needed_total_blocks - current_blocks;
 
         let mut grow_attempted = false;
+        let held = self.held_blocks();
         // Growth BEFORE eviction: see `allocate_suffix_blocks`. Eviction
         // remains the fallback, and the retry-after-None path stays as a
         // second safety net. The grow is sized by the shortfall over what
@@ -2867,7 +2923,7 @@ impl PagedKVCacheAdapter {
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            self.grow_shortfall(&guard, to_allocate)
+            self.grow_shortfall(&guard, to_allocate.saturating_add(held))
         };
         if shortfall > 0 {
             grow_attempted = true;
@@ -2879,7 +2935,7 @@ impl PagedKVCacheAdapter {
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?
-                .reserve(to_allocate);
+                .reserve(to_allocate, held);
             let i = match reserved {
                 Ok(blocks) => break blocks,
                 Err(taken) => taken,
@@ -2893,7 +2949,7 @@ impl PagedKVCacheAdapter {
                     .allocator
                     .lock()
                     .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-                self.grow_shortfall(&guard, to_allocate)
+                self.grow_shortfall(&guard, to_allocate.saturating_add(held))
             };
             if grow_attempted || !self.try_grow_pool(retry_shortfall) {
                 if let Some(seq_id) = self.active_seq {
@@ -2976,7 +3032,6 @@ impl PagedKVCacheAdapter {
     /// (`HybridSchedulerState::try_grow_reservation_pool`); admission runs
     /// on the model thread, so the same thread/contract holds there.
     pub(crate) fn try_grow_pool(&mut self, needed_additional_blocks: u32) -> bool {
-        self.last_grow_room = 0;
         // Serialize the whole probe → grow → notify sequence process-wide
         // (see crate::cache_limit::pool_growth_lock). Scope-drop releases
         // the guard on every exit path, including the decline/failure
@@ -3020,6 +3075,27 @@ impl PagedKVCacheAdapter {
                 .max(current.saturating_add(needed_additional_blocks)),
         };
         let mut new_num_blocks = self.layer_kv_pool.max_num_blocks().min(target);
+        if let Some(admission) = self.admission.clone() {
+            if new_num_blocks <= current {
+                return false;
+            }
+            let bytes = match self.grow_admission_bytes(new_num_blocks) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "mlx_core::paged_kv",
+                        "paged KV pool grow declined: its bytes are unknown: {e}"
+                    );
+                    return false;
+                }
+            };
+            let mut grew = false;
+            let admitted = admission.admit_grow(bytes, &mut || {
+                grew = self.grow_pool_to(&mut guard, current, new_num_blocks)?;
+                Ok(grew)
+            });
+            return admitted && grew;
+        }
         #[cfg(target_os = "macos")]
         match self.grow_headroom_probe(new_num_blocks) {
             Ok(selected) if selected < new_num_blocks => {
@@ -3039,7 +3115,6 @@ impl PagedKVCacheAdapter {
                     );
                     new_num_blocks = selected;
                 } else {
-                    self.last_grow_room = selected.saturating_sub(current);
                     tracing::warn!(
                         target: "mlx_core::paged_kv",
                         "paged KV pool grow declined: headroom probe caps the pool at {selected} \
@@ -3058,6 +3133,36 @@ impl PagedKVCacheAdapter {
                 return false;
             }
         }
+        match self.grow_pool_to(&mut guard, current, new_num_blocks) {
+            Ok(grew) => grew,
+            Err(e) => {
+                tracing::warn!(target: "mlx_core::paged_kv", "{e}");
+                false
+            }
+        }
+    }
+
+    /// Bytes a grow to `new_num_blocks` asks the governor for: the pool's
+    /// new bytes beyond its own, and the grow's transient beside them.
+    fn grow_admission_bytes(&self, new_num_blocks: u32) -> Result<u64, String> {
+        let layers = self.layer_kv_pool.layer_bytes();
+        let new_layer = self.layer_kv_pool.layer_bytes_for(new_num_blocks)?;
+        let new_total = new_layer.saturating_mul(layers.len() as u64);
+        Ok(new_total
+            .saturating_sub(self.layer_kv_pool.total_bytes())
+            .saturating_add(pool_grow_reserved_bytes(&layers, new_layer)))
+    }
+
+    /// Grows the pool and its allocator (`guard`) from `current` to
+    /// `new_num_blocks`, then notifies the new total. `Ok(false)` when
+    /// nothing allocatable appeared; `Err` when the grow failed, a layer's
+    /// new buffers refused (layers grown before stay larger).
+    fn grow_pool_to(
+        &mut self,
+        guard: &mut std::sync::MutexGuard<'_, BlockAllocator>,
+        current: u32,
+        new_num_blocks: u32,
+    ) -> Result<bool, String> {
         let old_total_bytes = self.layer_kv_pool.total_bytes();
         // This adapter's cached per-layer views retain the pre-grow buffers;
         // dropped after the grow, each old layer would outlive its swap and
@@ -3067,24 +3172,17 @@ impl PagedKVCacheAdapter {
         self.clear_native_graph_state();
         match self.layer_kv_pool.grow_to(new_num_blocks) {
             Ok(true) => {}
-            Ok(false) => {
-                // Already at/above the target or capped at max — nothing
-                // allocatable appeared.
-                return false;
-            }
+            Ok(false) => return Ok(false),
             Err(e) => {
-                // Layers grown before the failure keep their larger buffers.
                 let total_bytes = self.layer_kv_pool.total_bytes();
                 if total_bytes != old_total_bytes
                     && let Some(notifier) = self.pool_growth_notifier.as_ref()
                 {
                     notifier(total_bytes);
                 }
-                tracing::warn!(
-                    target: "mlx_core::paged_kv",
+                return Err(format!(
                     "paged KV pool grow to {new_num_blocks} blocks failed: {e}"
-                );
-                return false;
+                ));
             }
         }
         let added = guard.grow_by(new_num_blocks - current);
@@ -3099,8 +3197,6 @@ impl PagedKVCacheAdapter {
                  block(s) ({current} -> {new_num_blocks}) while the pool grew {pool_added}"
             );
         }
-        drop(guard);
-
         let new_total_bytes = self.layer_kv_pool.total_bytes();
         if let Some(notifier) = self.pool_growth_notifier.as_ref() {
             notifier(new_total_bytes);
@@ -3112,7 +3208,7 @@ impl PagedKVCacheAdapter {
             old_total_bytes as f64 / (1024.0 * 1024.0),
             new_total_bytes as f64 / (1024.0 * 1024.0),
         );
-        true
+        Ok(true)
     }
 
     /// Give an extent-growth pool's memory back to the host: cut its tail by
@@ -3129,6 +3225,48 @@ impl PagedKVCacheAdapter {
     /// growth lock. The notifier sees the measured new total. Returns the
     /// bytes the pool's buffers shrank by; 0 when nothing was cut.
     pub(crate) fn try_release_pool_extents(&mut self, want_bytes: u64, evict_cached: bool) -> u64 {
+        self.release_pool_extents_above(want_bytes, evict_cached, false)
+    }
+
+    /// The bytes cutting this pool's empty extents gives back without
+    /// evicting a block, above the runway or, with `keep_one`, above one
+    /// empty extent more (Splash `Cache::walkFor` `keepRunway`).
+    pub(crate) fn free_extent_bytes(&self, keep_one: bool) -> u64 {
+        let Some(extent) = self.extent_growth_blocks else {
+            return 0;
+        };
+        let Ok(bytes_per_block) = self.bytes_per_block() else {
+            return 0;
+        };
+        let floor = self.extent_floor(extent, keep_one);
+        let guard = self.allocator_guard();
+        let extents = guard.num_blocks().saturating_sub(floor).div_ceil(extent);
+        guard.shrink_plan(floor, extent, extents).map_or(0, |plan| {
+            u64::from(guard.num_blocks().saturating_sub(plan.num_blocks))
+                .saturating_mul(bytes_per_block)
+        })
+    }
+
+    /// [`Self::try_release_pool_extents`] of empty extents only, keeping
+    /// one more empty extent with `keep_one`.
+    pub(crate) fn release_free_extents(&mut self, want_bytes: u64, keep_one: bool) -> u64 {
+        self.release_pool_extents_above(want_bytes, false, keep_one)
+    }
+
+    fn extent_floor(&self, extent: u32, keep_one: bool) -> u32 {
+        if keep_one {
+            self.extent_runway_blocks.saturating_add(extent)
+        } else {
+            self.extent_runway_blocks
+        }
+    }
+
+    fn release_pool_extents_above(
+        &mut self,
+        want_bytes: u64,
+        evict_cached: bool,
+        keep_one: bool,
+    ) -> u64 {
         let Some(extent) = self.extent_growth_blocks else {
             return 0;
         };
@@ -3142,7 +3280,7 @@ impl PagedKVCacheAdapter {
             want_bytes,
             u64::from(extent).saturating_mul(bytes_per_block),
         );
-        let floor = self.extent_runway_blocks;
+        let floor = self.extent_floor(extent, keep_one);
         let pending = self.layer_kv_pool.shrink_pending();
         {
             let guard = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
@@ -3493,11 +3631,12 @@ impl PagedKVCacheAdapter {
 
         self.release_request_for(seq_id)?;
         self.begin_request(seq_id)?;
+        let held = self.held_blocks();
         let reserved = self
             .allocator
             .lock()
             .map_err(|error| format!("BlockAllocator mutex poisoned: {error}"))?
-            .reserve(live_blocks);
+            .reserve(live_blocks, held);
         let allocated = match reserved {
             Ok(blocks) => blocks,
             Err(allocated_count) => {
@@ -3808,8 +3947,9 @@ impl PagedKVCacheAdapter {
         }
         let need = u32::try_from(need).unwrap_or(u32::MAX);
         if need > 0 && !guard.can_allocate(need) {
+            let available = guard.free_or_evictable_blocks();
             for (seq_id, row_need) in row_needs {
-                self.refuse(seq_id, row_need);
+                self.refuse_with(seq_id, row_need, available);
             }
             return Err(format!(
                 "context_length_exceeded: paged decode could not reserve {need} more block(s) \
@@ -7130,6 +7270,7 @@ impl PagedKVCacheAdapter {
                 pool: &self.layer_kv_pool,
                 allocator: &self.allocator,
                 block_size: self.block_size,
+                held: self.held_blocks(),
             }
             .capture_chain(
                 &self.request_tokens,
@@ -7721,12 +7862,25 @@ impl PagedKVCacheAdapter {
         Arc::clone(&self.recency)
     }
 
-    fn refusals(&self) -> std::sync::MutexGuard<'_, BTreeMap<SeqId, u32>> {
+    fn refusals(&self) -> std::sync::MutexGuard<'_, BTreeMap<SeqId, BlockRefusal>> {
         self.refusals.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Records `blocks` refused beside what the allocator could hand out.
+    /// The allocator must not be locked.
     fn refuse(&self, seq_id: SeqId, blocks: u32) {
-        self.refusals().insert(seq_id, blocks);
+        let available = self.allocator_guard().free_or_evictable_blocks();
+        self.refuse_with(seq_id, blocks, available);
+    }
+
+    fn refuse_with(&self, seq_id: SeqId, blocks: u32, available: u32) {
+        self.refusals().insert(
+            seq_id,
+            BlockRefusal {
+                additional: blocks,
+                available,
+            },
+        );
     }
 
     fn clear_refusal(&self, seq_id: SeqId) {
@@ -7734,43 +7888,18 @@ impl PagedKVCacheAdapter {
     }
 
     fn refusal_of(&self, seq_id: SeqId) -> Option<u32> {
-        self.refusals().get(&seq_id).copied()
+        self.refusals()
+            .get(&seq_id)
+            .map(|refusal| refusal.additional)
     }
 
     pub(crate) fn clear_refusals(&self) {
         self.refusals().clear();
-        self.draft_refusals().clear();
-    }
-
-    fn draft_refusals(
-        &self,
-    ) -> std::sync::MutexGuard<'_, BTreeMap<SeqId, crate::engine::reclaim::DraftRefusal>> {
-        self.draft_refusals
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    pub(crate) fn refuse_draft(
-        &self,
-        seq_id: SeqId,
-        refusal: crate::engine::reclaim::DraftRefusal,
-    ) {
-        self.draft_refusals().insert(seq_id, refusal);
-    }
-
-    pub(crate) fn clear_draft_refusal(&self, seq_id: SeqId) {
-        self.draft_refusals().remove(&seq_id);
-    }
-
-    /// Every refused draft fit; the record clears.
-    pub(crate) fn take_draft_refusals(&self) -> Vec<(SeqId, crate::engine::reclaim::DraftRefusal)> {
-        std::mem::take(&mut *self.draft_refusals())
-            .into_iter()
-            .collect()
     }
 
     /// Blocks every refused reservation lacked, summed over sequences; the
     /// record clears. `None` when nothing was refused.
+    #[cfg(test)]
     pub(crate) fn take_refusal(&self) -> Option<u32> {
         let mut refusals = self.refusals();
         if refusals.is_empty() {
@@ -7778,9 +7907,24 @@ impl PagedKVCacheAdapter {
         }
         let blocks = refusals
             .values()
-            .fold(0u32, |sum, &blocks| sum.saturating_add(blocks));
+            .fold(0u32, |sum, refusal| sum.saturating_add(refusal.additional));
         refusals.clear();
         Some(blocks)
+    }
+
+    /// What every refused reservation lacked, summed over sequences, beside
+    /// the blocks the allocator could hand out at the last refusal; the
+    /// record clears.
+    pub(crate) fn take_block_refusal(&self) -> Option<BlockRefusal> {
+        let mut refusals = std::mem::take(&mut *self.refusals());
+        let available = refusals.values().map(|refusal| refusal.available).min()?;
+        let additional = refusals
+            .values_mut()
+            .fold(0u32, |sum, refusal| sum.saturating_add(refusal.additional));
+        Some(BlockRefusal {
+            additional,
+            available,
+        })
     }
 
     #[cfg(test)]
@@ -7788,60 +7932,13 @@ impl PagedKVCacheAdapter {
         self.refuse(seq_id, blocks);
     }
 
-    /// Blocks the last [`Self::try_grow_pool`] could still have added when
-    /// its probe declined.
-    pub(crate) fn last_grow_room(&self) -> u32 {
-        self.last_grow_room
-    }
-
     fn allocator_guard(&self) -> std::sync::MutexGuard<'_, BlockAllocator> {
         self.allocator.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Whether `blocks` are in place now, tried in `allocate_suffix_blocks`'
-    /// order: free blocks, a grow, then the cached blocks `reserve` evicts.
-    /// `over_takeable` grows by what free plus evictable blocks lack, as
-    /// admission sizes its grow. The grow it tries records the probe's room.
-    /// Met means covered, never grew (Splash `KvPool::takeFreePages`): a
-    /// grow clamped at the pool max can add less than the shortfall.
-    pub(crate) fn kv_need_met(&mut self, blocks: u32, over_takeable: bool) -> bool {
-        self.last_grow_room = 0;
-        let (takeable, shortfall, at_cap) = {
-            let guard = self.allocator_guard();
-            let takeable = guard.free_or_evictable_blocks();
-            let shortfall = if over_takeable {
-                blocks.saturating_sub(takeable)
-            } else {
-                self.grow_shortfall(&guard, blocks)
-            };
-            (
-                takeable,
-                shortfall,
-                guard.num_blocks() >= guard.max_num_blocks(),
-            )
-        };
-        if shortfall == 0 {
-            return takeable >= blocks;
-        }
-        if !at_cap && self.try_grow_pool(shortfall) {
-            return self.takeable_blocks() >= blocks;
-        }
-        takeable >= blocks
-    }
-
-    pub(crate) fn at_cap(&self) -> bool {
-        let guard = self.allocator_guard();
-        guard.num_blocks() >= guard.max_num_blocks()
     }
 
     /// Free blocks plus the cached blocks `allocate` may take.
     pub(crate) fn takeable_blocks(&self) -> u32 {
         self.allocator_guard().free_or_evictable_blocks()
-    }
-
-    pub(crate) fn ungrown_blocks(&self) -> u32 {
-        let guard = self.allocator_guard();
-        guard.max_num_blocks().saturating_sub(guard.num_blocks())
     }
 
     /// Cache-only blocks inside a marked chain.
@@ -7852,21 +7949,14 @@ impl PagedKVCacheAdapter {
             .saturating_sub(guard.num_evictable_blocks())
     }
 
-    pub(crate) fn tip_marks(&self) -> HashSet<u64> {
-        self.allocator_guard().tip_marks()
-    }
-
     /// Whether the prefix cache holds a block under `hash`.
     pub(crate) fn prefix_cached(&self, hash: u64) -> bool {
         self.allocator_guard().is_cached(hash)
     }
 
-    pub(crate) fn cache_only_count(&self, hashes: impl IntoIterator<Item = u64>) -> u32 {
-        self.allocator_guard().cache_only_count(hashes)
-    }
-
-    pub(crate) fn marked_hit(&self, chain: &[u64]) -> u32 {
-        self.allocator_guard().marked_hit(chain)
+    /// [`BlockAllocator::freed_by_marks`].
+    pub(crate) fn freed_by_marks(&self, marks: &[u64]) -> Vec<u32> {
+        self.allocator_guard().freed_by_marks(marks)
     }
 
     /// Blocks releasing every table of `seq_ids` together would leave free
@@ -7889,16 +7979,6 @@ impl PagedKVCacheAdapter {
             return HashSet::new();
         }
         self.allocator_guard().released_blocks(&refs)
-    }
-
-    /// Whether `seq_id`'s table holds one of `blocks`.
-    pub(crate) fn table_holds_any(&self, seq_id: SeqId, blocks: &HashSet<u32>) -> bool {
-        self.block_table_for(seq_id).is_some_and(|table| {
-            table
-                .blocks()
-                .iter()
-                .any(|block| blocks.contains(&block.block_id))
-        })
     }
 
     pub(crate) fn set_state_marks(&self, hashes: impl IntoIterator<Item = u64>) {
@@ -12598,109 +12678,6 @@ mod tests {
         );
         adapter.set_memory_ceiling(12_345_678);
         assert_eq!(adapter.grow_probe_budget(), Ok(12_345_678));
-    }
-
-    /// The room a declined grow records is the probe's, and every later
-    /// grow or met check starts from 0.
-    /// Mutation: drop `self.last_grow_room = 0` at the top of
-    /// `try_grow_pool` → red (room 2 after the probe error).
-    #[test]
-    fn grow_room_is_read_from_the_last_grow() {
-        let cfg = mlx_paged_attn::PagedAttentionConfig {
-            block_size: 8,
-            num_kv_heads: 1,
-            head_size: 64,
-            num_layers: 2,
-            gpu_memory_mb: 256,
-            max_seq_len: Some(128),
-            max_batch_size: Some(2),
-        };
-        let pool = match mlx_paged_attn::LayerKVPool::new(
-            cfg,
-            4,
-            16,
-            mlx_paged_attn::metal::MetalDtype::BFloat16,
-        ) {
-            Ok(pool) => Arc::new(pool),
-            Err(error) => {
-                eprintln!("skipping grow_room_is_read_from_the_last_grow: {error}");
-                return;
-            }
-        };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
-        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
-        adapter.set_grow_headroom_probe_override(Some(Arc::new(|_| Ok(6))));
-        assert!(!adapter.try_grow_pool(4));
-        assert_eq!(adapter.last_grow_room(), 2);
-        assert!(adapter.kv_need_met(1, false));
-        assert_eq!(adapter.last_grow_room(), 0);
-        assert!(!adapter.try_grow_pool(4));
-        assert_eq!(adapter.last_grow_room(), 2);
-        adapter.set_grow_headroom_probe_override(Some(Arc::new(|_| Err("no probe".into()))));
-        assert!(!adapter.try_grow_pool(4));
-        assert_eq!(adapter.last_grow_room(), 0);
-    }
-
-    /// A 4-block pool, max 8, 4-block extents, every block held by the live
-    /// request: a 5-block need grows to the max (8) and stays short, since
-    /// 4 blocks are takeable; a 4-block need is met by the same grow.
-    /// Mutations: return the grow's result as met in `kv_need_met` → red
-    /// (5 met); return false after any grow → red (4 not met).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn kv_need_met_recounts_after_a_capped_grow() {
-        let held = || {
-            let cfg = mlx_paged_attn::PagedAttentionConfig {
-                block_size: 8,
-                num_kv_heads: 1,
-                head_size: 64,
-                num_layers: 2,
-                gpu_memory_mb: 256,
-                max_seq_len: Some(128),
-                max_batch_size: Some(2),
-            };
-            let pool = mlx_paged_attn::LayerKVPool::new(
-                cfg,
-                4,
-                8,
-                mlx_paged_attn::metal::MetalDtype::BFloat16,
-            )
-            .map_err(|error| error.to_string())?;
-            let pool = Arc::new(pool);
-            let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8, 8)));
-            let mut adapter = PagedKVCacheAdapter::new(allocator, Arc::clone(&pool), 8)
-                .map_err(|e| e.to_string())?;
-            adapter.set_extent_growth(4);
-            adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
-            adapter
-                .reset_for_new_request(7)
-                .map_err(|e| e.to_string())?;
-            assert_eq!(adapter.allocate_suffix_blocks(32).unwrap(), 4);
-            assert_eq!(adapter.takeable_blocks(), 0);
-            Ok::<_, String>((adapter, pool))
-        };
-        for over_takeable in [false, true] {
-            let (mut adapter, pool) = match held() {
-                Ok(held) => held,
-                Err(error) => {
-                    eprintln!("skipping kv_need_met_recounts_after_a_capped_grow: {error}");
-                    return;
-                }
-            };
-            assert!(
-                !adapter.kv_need_met(5, over_takeable),
-                "a grow clamped at the max covers 4 of 5 (over_takeable {over_takeable})"
-            );
-            assert_eq!(pool.num_blocks(), 8);
-            assert_eq!(adapter.takeable_blocks(), 4);
-
-            let (mut adapter, pool) = held().expect("same setup");
-            assert!(
-                adapter.kv_need_met(4, over_takeable),
-                "the grow covers 4 (over_takeable {over_takeable})"
-            );
-            assert_eq!(pool.num_blocks(), 8);
-        }
     }
 
     #[test]
@@ -19762,6 +19739,72 @@ mod tests {
             v0_val, v1_val,
             "v_scale must be identical across layers (both 1.0)"
         );
+    }
+
+    /// Under the governor a pool growth is an allocation of the scope's
+    /// claim: refused, the pool stays and the claim's refusal holds the
+    /// extent's bytes and the grow's transient; outside any scope it is
+    /// refused too.
+    /// Mutation G1: bypass the governor (the probe decides) → red (grows).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pool_grow_asks_the_governor() {
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, stats};
+        use crate::engine::governor::governor::{Failure, Governor, Scope, whole_turn_spec};
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping pool_grow_asks_the_governor: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+        adapter.set_extent_growth(3);
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let io = FakeIo::new(
+            stats(G),
+            host(32 * G, crate::engine::governor::host::Pressure::Normal),
+        );
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+        let _model = governor
+            .register_model(crate::engine::governor::governor::tests::model(G + 1, 0))
+            .expect("register");
+        adapter.set_admission(Arc::new(governor));
+        let layers = pool.layer_bytes();
+        let new_layer = pool.layer_bytes_for(7).expect("layer bytes");
+        let want = (new_layer * layers.len() as u64 - pool.total_bytes())
+            + pool_grow_reserved_bytes(&layers, new_layer);
+
+        let claim = governor.open(whole_turn_spec(1), 7);
+        {
+            let _scope = Scope::enter(claim.claim());
+            assert!(!adapter.try_grow_pool(3));
+        }
+        assert_eq!(pool.num_blocks(), 4);
+        let refusal = governor
+            .ledger(|ledger| ledger.claim(claim.id()).map(|state| state.refusal))
+            .expect("claim");
+        assert_eq!(refusal.bytes, want);
+        assert_eq!(governor.failure(claim.id()), Some(Failure::EngineBudget));
+
+        assert!(!adapter.try_grow_pool(3), "no scope");
+        assert_eq!(pool.num_blocks(), 4);
     }
 }
 

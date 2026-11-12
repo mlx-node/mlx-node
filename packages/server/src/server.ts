@@ -6,13 +6,19 @@ import type { Server, ServerResponse } from 'node:http';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
+import * as core from '@mlx-node/core';
 import { ResponseStore } from '@mlx-node/core';
 
 import { AudioService, type AudioServiceOptions } from './audio-service.js';
 import type { MemoryReleaseAnswer } from './endpoints/memory-release.js';
 import type { PublicModelEntry } from './handler.js';
 import { createHandler } from './handler.js';
-import { createHealthReporter, type ServerHealth } from './health.js';
+import {
+  createHealthReporter,
+  toMemoryGovernorHealth,
+  type MemoryGovernorHealth,
+  type ServerHealth,
+} from './health.js';
 import {
   createIdleSweeper,
   DEFAULT_IDLE_CLEAR_CACHE_MS,
@@ -26,6 +32,24 @@ import { RerankService, resolveRerankLimits, type RerankServiceOptions } from '.
 import { activeSSEStreamCountForResponses } from './streaming.js';
 import { TurnJournal, type TurnJournalOptions } from './turn-journal.js';
 import { createWeightResidency, trackWeights, type WeightResidency } from './weight-residency.js';
+
+/** How often the memory governor's status is read for `/health` (ms). */
+const MEMORY_GOVERNOR_POLL_MS = 2000;
+
+/**
+ * The memory governor's status, or `null` while no model on it is resident.
+ * A binding without the export reads as none.
+ */
+function readMemoryGovernor(): MemoryGovernorHealth | null {
+  const read = (core as { memoryGovernorStatus?: typeof core.memoryGovernorStatus }).memoryGovernorStatus;
+  if (typeof read !== 'function') return null;
+  try {
+    const status = read();
+    return status ? toMemoryGovernorHealth(status) : null;
+  } catch {
+    return null;
+  }
+}
 
 /** Cleanup interval for expired responses (ms). */
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -498,9 +522,22 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
   }, CLEANUP_INTERVAL_MS);
   cleanupTimer.unref();
 
+  // `/health` never calls into core: it reports what this poller last read.
+  let memoryGovernor = readMemoryGovernor();
+  const memoryGovernorTimer: ReturnType<typeof setInterval> = setInterval(() => {
+    memoryGovernor = readMemoryGovernor();
+  }, MEMORY_GOVERNOR_POLL_MS);
+  memoryGovernorTimer.unref();
+
   // One reporter shared by the HTTP endpoint and `ServerInstance.health()`
   // so both report the same uptime origin.
-  const health = createHealthReporter({ registry, idleSweeper, modelWorkCoordinator, weights });
+  const health = createHealthReporter({
+    registry,
+    idleSweeper,
+    modelWorkCoordinator,
+    weights,
+    memoryGovernor: () => memoryGovernor,
+  });
 
   const audio = new AudioService(
     {
@@ -589,6 +626,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
       void rerankClosed.catch(() => {});
       void audioClosed.catch(() => {});
       clearInterval(cleanupTimer);
+      clearInterval(memoryGovernorTimer);
       idleSweeper.close();
       closing = true;
       weights?.close();

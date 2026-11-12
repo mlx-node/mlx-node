@@ -518,21 +518,27 @@ impl MtpStepper for MoeMtpStepper<'_> {
         self.mtp_caches = Qwen3_5MoeMTPModule::fresh_caches(&self.config);
     }
 
-    // Per-cycle paged twin of the turn-entry lookahead reservation: re-reserve
-    // the lookahead region past the adapter's CURRENT cursor so this cycle's
-    // verify writes land in pre-allocated blocks. The mechanism lives once, in
-    // the stepper's `SpecPagedCache::reserve_lookahead`; this hook only names
-    // the turn's active sequence for it. Exhaustion reports AR fallback with
+    // Per-cycle paged twin of the turn-entry lookahead reservation: the
+    // lookahead past the adapter's CURRENT cursor, booked in the turn's claim
+    // (`dflash2_turn::lookahead_claimed`); a refusal decodes the cycle AR with
     // untouched adapter state.
     fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
-        let seq_id = self.owner.seq_id();
-        crate::engine::spec_paged::SpecPagedCache::reserve_lookahead(self, seq_id, rows).map_err(
-            |e| {
-                Error::from_reason(format!(
-                    "eager paged MoE MTP per-cycle lookahead reservation ({rows} rows): {e}"
-                ))
-            },
-        )
+        let owner = self.owner;
+        let seq_id = owner.seq_id();
+        let lookahead = u32::try_from(rows).unwrap_or(u32::MAX);
+        crate::models::qwen3_5::dflash2_turn::lookahead_claimed(&mut *self.inner, |inner| {
+            owner
+                .accepts(seq_id, MOE_PAGED_MTP)
+                .and_then(|()| owner.resolve(&mut inner.paged_adapter, MOE_PAGED_MTP))
+                .and_then(|adapter| adapter.reserve_rows(lookahead))
+                .map(drop)
+                .map_err(Error::from_reason)
+        })
+        .map_err(|e| {
+            Error::from_reason(format!(
+                "eager paged MoE MTP per-cycle lookahead reservation ({rows} rows): {e}"
+            ))
+        })
     }
 
     // Bound the lazy graph: materialize the token plus the main GDN/full-attn
@@ -641,9 +647,6 @@ impl MtpStepper for MoeMtpStepper<'_> {
 /// PRODUCTION-ROUTED — these are the turn's only path, so conformance and
 /// production cannot drift:
 ///
-/// * `reserve_lookahead` — [`MtpStepper::reserve_cycle_lookahead`] delegates
-///   here for the mechanism ([`PagedKVCacheAdapter::reserve_rows`] plus the
-///   capacity-exhaustion mapping) and only names the active sequence.
 /// * `open_core_write_cycle` + `commit_cycle` — the MoE verify core records
 ///   its `[anchor, drafts..]` slice as part of the forward, so
 ///   [`MtpStepper::verify_step`] opens the cycle AROUND that write and
@@ -659,6 +662,8 @@ impl MtpStepper for MoeMtpStepper<'_> {
 ///
 /// NOT production-routed — conformance surface only:
 ///
+/// * `reserve_lookahead`: the turn books each cycle's lookahead in its
+///   claim ([`crate::models::qwen3_5::dflash2_turn::lookahead_claimed`]).
 /// * `settle_committed` / `settle_captures_durable_state`. Settle is the
 ///   IDENTITY for this family, by construction: the MoE adapter is
 ///   full-attention-only (`sliding_window == 0`, so no per-step prune exists),

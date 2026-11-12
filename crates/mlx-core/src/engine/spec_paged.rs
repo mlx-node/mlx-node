@@ -100,6 +100,18 @@ impl SpecTurnEpilogue {
         finish_paged_turn(backend, args)
     }
 
+    /// A stop that ended the turn after its lane was vacated: nothing is
+    /// published, the result is emitted on what it generated.
+    pub(crate) fn vacated<B: PagedBackend>(
+        mut self,
+        backend: &mut B,
+        args: FinishPagedTurnArgs<'_>,
+    ) -> napi::Result<TurnOutput> {
+        self.discharged = true;
+        backend.abort_paged_turn();
+        crate::engine::paged_turn::emit_paged_turn_result(backend, args)
+    }
+
     /// Error exit: release the live request instead of publishing anything.
     pub(crate) fn abort<B: PagedBackend>(mut self, backend: &mut B) {
         self.discharged = true;

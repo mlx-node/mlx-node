@@ -384,9 +384,14 @@ pub fn maybe_clear_cache_for_privacy_filter_call() {
 /// safest fallback: a degraded-Metal host has no meaningful "active"
 /// number to report.
 pub fn get_active_memory() -> f64 {
+    active_memory_bytes() as f64
+}
+
+/// [`get_active_memory`] in bytes.
+pub(crate) fn active_memory_bytes() -> u64 {
     let mut v: u64 = 0;
     let rc = unsafe { sys::mlx_get_active_memory(&mut v) };
-    if rc != 0 { 0.0 } else { v as f64 }
+    if rc != 0 { 0 } else { v }
 }
 
 /// Active MLX allocations that admission cannot reclaim on demand: total
@@ -400,9 +405,14 @@ pub(crate) fn anonymous_active_memory() -> f64 {
 /// Internal Rust-only function — use memoryCleanupThreshold config for
 /// memory-based cleanup. Returns 0.0 if the shim caught an exception.
 pub fn get_cache_memory() -> f64 {
+    cache_memory_bytes() as f64
+}
+
+/// [`get_cache_memory`] in bytes.
+pub(crate) fn cache_memory_bytes() -> u64 {
     let mut v: u64 = 0;
     let rc = unsafe { sys::mlx_get_cache_memory(&mut v) };
-    if rc != 0 { 0.0 } else { v as f64 }
+    if rc != 0 { 0 } else { v }
 }
 
 /// Get peak memory usage in bytes.
@@ -426,9 +436,14 @@ pub fn reset_peak_memory() {
 /// Returns the previous limit, or 0.0 if the shim caught an exception.
 /// Internal Rust-only function.
 pub fn set_memory_limit(limit: f64) -> f64 {
+    set_memory_limit_bytes(limit as u64) as f64
+}
+
+/// [`set_memory_limit`] in bytes.
+pub(crate) fn set_memory_limit_bytes(limit: u64) -> u64 {
     let mut prev: u64 = 0;
-    let rc = unsafe { sys::mlx_set_memory_limit(limit as u64, &mut prev) };
-    if rc != 0 { 0.0 } else { prev as f64 }
+    let rc = unsafe { sys::mlx_set_memory_limit(limit, &mut prev) };
+    if rc != 0 { 0 } else { prev }
 }
 
 /// Set cache limit (controls memory pool/cache size).
