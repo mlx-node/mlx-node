@@ -1138,6 +1138,13 @@ struct PreparedTurn {
     resource_wait: ResourceWait,
     enqueued_at: Instant,
     ttft: TtftClock,
+    /// Splash `Phase::Queued`: the scheduler did not want it in its last
+    /// admission attempt.
+    held: bool,
+    /// Splash `Request::order`, taken when it is first held.
+    order: Option<u64>,
+    /// Splash `Request::overtaken` while it is held.
+    overtaken: u32,
 }
 
 struct PreparedDecodeRow {
@@ -2191,6 +2198,9 @@ pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     >,
     pending: VecDeque<Queued<B::FamilyCommand>>,
     prepared_waiting: Option<Box<PreparedTurn>>,
+    /// The starts the scheduler holds back (Splash `Engine::admitQueued`'s
+    /// `queue`), in submission order: they hold back nothing.
+    held: VecDeque<Box<PreparedTurn>>,
     pending_restores: HashMap<SeqId, B::RestoreTicket>,
     pub(crate) owner_sequences: HashMap<String, SeqId>,
     pub(crate) owner_states: HashMap<String, B::OwnerState>,
@@ -2286,6 +2296,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             scheduler,
             pending: VecDeque::new(),
             prepared_waiting: None,
+            held: VecDeque::new(),
             pending_restores: HashMap::new(),
             owner_sequences: HashMap::new(),
             owner_states: HashMap::new(),
@@ -2441,8 +2452,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         self.scheduler.contains_seq(seq_id)
             || self
                 .prepared_waiting
-                .as_ref()
-                .is_some_and(|prepared| prepared.owner_id == owner_id)
+                .iter()
+                .chain(&self.held)
+                .any(|prepared| prepared.owner_id == owner_id)
     }
 
     fn release_cache_owner_with<F>(&mut self, owner_id: &str, release: F) -> Result<()>
@@ -2784,6 +2796,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             resource_wait: ResourceWait::default(),
             enqueued_at: arrival.at,
             ttft: TtftClock::queued(self.timeline.since(&arrival.mark)),
+            held: false,
+            order: None,
+            overtaken: 0,
         }))
     }
 
@@ -3907,6 +3922,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let signature: Vec<(SeqId, usize)> = self
             .prepared_waiting
             .iter()
+            .chain(&self.held)
             .map(|prepared| (prepared.seq_id, prepared.admitted.tokens.len()))
             .chain(
                 self.scheduler
@@ -3921,6 +3937,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let prompts = self
             .prepared_waiting
             .iter()
+            .chain(&self.held)
             .map(|prepared| prepared.admitted.tokens.clone())
             .chain(
                 self.scheduler
@@ -4163,7 +4180,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             })
         };
         self.timeline.hold(seconds, work.holder_of(None, false));
-        if let Some(prepared) = self.prepared_waiting.as_mut() {
+        for prepared in self.prepared_waiting.iter_mut().chain(&mut self.held) {
             let part = work.holder_of(Some(prepared.seq_id), waits(prepared.claim.as_ref()));
             prepared.ttft.hold(seconds, part);
         }
@@ -4334,11 +4351,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 self.fail_preempted(turn, error.clone());
             }
         }
-        if let Some(prepared) = self.prepared_waiting.take() {
+        let held = std::mem::take(&mut self.held);
+        for prepared in self.prepared_waiting.take().into_iter().chain(held) {
             self.cleanup_rejected_prepared(&prepared);
-            prepared
-                .response
-                .send_error(Error::from_reason(error), prepared.cancelled.as_ref());
+            prepared.response.send_error(
+                Error::from_reason(error.clone()),
+                prepared.cancelled.as_ref(),
+            );
         }
         for seq_id in self.idle_owners(SeqId::MAX) {
             self.release_owner(seq_id);
@@ -4733,6 +4752,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             prepared.seq_id,
             u32::try_from(cached).unwrap_or(u32::MAX),
             u32::try_from(tokens.len()).unwrap_or(u32::MAX),
+            prepared.order,
+            prepared.overtaken,
         )
     }
 
@@ -4781,8 +4802,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
         // Splash `Scheduler::prefillAdmissionOrder`: it takes no memory
         // until the unit it would join serves it.
-        if self.admission_waits(&prepared) {
+        prepared.held = self.admission_waits(&prepared);
+        if prepared.held {
             self.defer_admission(&mut prepared);
+            if prepared.order.is_none() {
+                prepared.order = Some(self.scheduler.reserve_order());
+            }
             return Err(prepared);
         }
         let cache_snapshot = match self.inner.scheduler_cache_snapshot() {
@@ -4988,6 +5013,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             claim,
             enqueued_at,
             ttft,
+            order,
+            overtaken,
             ..
         } = *prepared;
         let (prefix, restore) = match prefix_admission {
@@ -5136,6 +5163,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         .with_scheduled_state_reservation(scheduled_state_bytes);
         turn.decode_draft_allowance = draft_allowance;
         turn.whole_prompt_prefill = whole_prompt_prefill;
+        turn.submitted_order = order;
+        turn.overtaken = overtaken;
         if ledger {
             self.admissions = self.admissions.saturating_add(1);
             turn.admission = self.admissions;
@@ -5188,6 +5217,17 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// whose refused rows would otherwise keep their memory and their
     /// claim's takes until they ran again.
     fn reap_cancelled_waiters(&mut self) {
+        let (cancelled, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.held)
+            .into_iter()
+            .partition(|prepared| prepared.cancelled.load(Ordering::Relaxed));
+        self.held = held.into();
+        for prepared in cancelled {
+            self.cleanup_rejected_prepared(&prepared);
+            prepared.response.send_error(
+                Error::from_reason(engine::session::CHAT_SESSION_CANCELLED),
+                prepared.cancelled.as_ref(),
+            );
+        }
         let mut reaped = self.scheduler.take_cancelled_waiters();
         if self.judge_policy() == JudgePolicy::Ledger {
             let suspended: Vec<SeqId> = self
@@ -5809,12 +5849,74 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
     }
 
+    /// Splash `Engine::admitQueued` for one start: admitted, held for
+    /// scheduling (`queue`), which holds back nothing, or refused, which
+    /// holds back every start after it. Whether it was refused.
+    fn start_prepared(&mut self, prepared: Box<PreparedTurn>) -> bool {
+        match self.admit_prepared(prepared) {
+            Ok(Some(turn)) => self.enqueue_turn_or_reject(turn),
+            Ok(None) => {}
+            Err(prepared) if prepared.held => self.held.push_back(prepared),
+            Err(prepared) => {
+                self.prepared_waiting = Some(prepared);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A command that must not pass the held starts: a later turn of a held
+    /// owner, and anything that orders the turns after it (a reset, a
+    /// barrier, the exclusive lane), which would otherwise run before them.
+    fn waits_behind_held(&self, command: &Queued<B::FamilyCommand>) -> bool {
+        if self.held.is_empty() {
+            return false;
+        }
+        let Some(chat) = command.as_chat() else {
+            return true;
+        };
+        match chat {
+            ChatCmd::ReleaseCacheOwner { .. } => false,
+            ChatCmd::ResetCaches { .. } => true,
+            _ => {
+                let owner = Self::chat_config(chat)
+                    .and_then(|config| config.cache_owner_id.as_deref())
+                    .unwrap_or_default();
+                Self::force_serial()
+                    || !self.enabled
+                    || !self.inner.scheduler_cache_available()
+                    || !(Self::chat_has_explicit_owner(chat)
+                        || self.ownerless_speculation_is_scheduled(chat))
+                    || self.chat_requires_barrier(chat)
+                    || self.held.iter().any(|prepared| prepared.owner_id == owner)
+            }
+        }
+    }
+
+    /// Splash `Scheduler::complete`: a prefill unit that served a later
+    /// submission overtakes each held start, up to overdue.
+    fn count_held_overtakes(&mut self) {
+        let Some(youngest) = self.scheduler.take_youngest_served() else {
+            return;
+        };
+        for prepared in &mut self.held {
+            if prepared.order.is_some_and(|order| order < youngest)
+                && prepared.overtaken < engine::scheduler::MAX_OVERTAKES
+            {
+                prepared.overtaken += 1;
+            }
+        }
+    }
+
     pub(crate) fn drive(
         &mut self,
         receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ModelCommand<B::FamilyCommand>>,
     ) -> LoopControl {
         let mut woke = false;
-        if !self.scheduler.has_work() && self.pending.is_empty() && self.prepared_waiting.is_none()
+        if !self.scheduler.has_work()
+            && self.pending.is_empty()
+            && self.prepared_waiting.is_none()
+            && self.held.is_empty()
         {
             match receiver.blocking_recv() {
                 Some(command) => woke |= self.receive(command),
@@ -5856,15 +5958,24 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             if let Some(wired) = wired.as_mut() {
                 wired.mark();
             }
-            match self.admit_prepared(prepared) {
-                Ok(Some(turn)) => {
-                    self.enqueue_turn_or_reject(turn);
+            deferred = self.start_prepared(prepared);
+        }
+        // Splash `Engine::admitQueued`'s recovery tries no start of a
+        // suspended lane's priority: a held start's earlier order would
+        // otherwise pass the suspended lane in `admit_waiting`.
+        if !deferred && !self.scheduler.has_pending_control() && !self.scheduler.has_preempted() {
+            for prepared in std::mem::take(&mut self.held) {
+                if deferred
+                    || self.scheduler.waiting_len() + self.scheduler.running_len()
+                        >= self.scheduler.max_num_seqs()
+                {
+                    self.held.push_back(prepared);
+                    continue;
                 }
-                Ok(None) => {}
-                Err(prepared) => {
-                    self.prepared_waiting = Some(prepared);
-                    deferred = true;
+                if let Some(wired) = wired.as_mut() {
+                    wired.mark();
                 }
+                deferred = self.start_prepared(prepared);
             }
         }
         if deferred
@@ -5882,7 +5993,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             let must_wait_for_legacy_owner = command.as_chat().is_some_and(|chat| {
                 Self::chat_requires_legacy_owner_drain(chat) && self.scheduler.has_work()
             });
-            if must_wait_for_legacy_owner {
+            if must_wait_for_legacy_owner || self.waits_behind_held(command) {
                 break;
             }
             if command
@@ -5938,16 +6049,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                         }
                         self.prepare_chat(chat, arrival)
                     } {
-                        match self.admit_prepared(prepared) {
-                            Ok(Some(turn)) => {
-                                self.enqueue_turn_or_reject(turn);
-                            }
-                            Ok(None) => {}
-                            Err(prepared) => {
-                                self.prepared_waiting = Some(prepared);
-                                deferred = true;
-                            }
-                        }
+                        deferred = self.start_prepared(prepared);
                     }
                     if is_reset || exclusive {
                         break;
@@ -5962,6 +6064,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
 
         self.begin_scheduled_step();
         let action = self.step();
+        self.count_held_overtakes();
         let scheduler_idle = matches!(&action, Ok(SchedulerAction::Idle));
         let mut may_resume_preempted = true;
         match action {
@@ -5998,7 +6101,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.try_resume_preempted();
         }
         self.publish_gauges();
-        if scheduler_idle && (self.scheduler.has_work() || self.prepared_waiting.is_some()) {
+        if scheduler_idle
+            && (self.scheduler.has_work()
+                || self.prepared_waiting.is_some()
+                || !self.held.is_empty())
+        {
             std::thread::sleep(Duration::from_millis(1));
         }
         LoopControl::Continue
@@ -6032,6 +6139,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     .is_some_and(|chat| !matches!(chat, ChatCmd::ReleaseCacheOwner { .. }))
             })
             .count() as u64;
+        queued += self.held.len() as u64;
         let mut waiting_resources = 0;
         if let Some(prepared) = self.prepared_waiting.as_ref() {
             if prepared.resource_wait.reason == WaitReason::None {
@@ -8456,6 +8564,9 @@ pub(crate) mod tests {
             resource_wait: ResourceWait::default(),
             enqueued_at: Instant::now(),
             ttft: TtftClock::default(),
+            held: false,
+            order: None,
+            overtaken: 0,
         };
         (Box::new(prepared), result)
     }
@@ -10792,6 +10903,52 @@ pub(crate) mod tests {
             panic!("the start was tried");
         };
         assert!(prepared.claim.is_none());
+    }
+
+    /// Splash `Engine::admitQueued` queues a start the scheduler does not
+    /// want, and it holds back nothing: beside a 40,000 token prefill a held
+    /// 50,000 token start leaves a later short start to be admitted at once.
+    /// Mutation AQ1: a held start is kept as a refused one → red (deferred).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_held_start_holds_back_no_later_start() {
+        let (mut state, _governor) = state_prefilling(40_000);
+        let (long, _long_reply) = prepared_turn(&mut state, 2, vec![1; 50_000]);
+        assert!(!state.start_prepared(long));
+        let (short, _short_reply) = prepared_turn(&mut state, 3, tokens_of(3, 1));
+        assert!(!state.start_prepared(short));
+        assert!(state.prepared_waiting.is_none());
+        assert_eq!(
+            state
+                .held
+                .iter()
+                .map(|held| held.seq_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(state.scheduler.contains_seq(3));
+    }
+
+    /// Splash `Scheduler::complete` overtakes a queued request with each
+    /// prefill unit that serves a later submission; once overdue it leads,
+    /// so a held start is not starved by the short starts that pass it.
+    /// Mutation AQ2: held starts are not overtaken → red (0).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_passed_held_start_turns_overdue() {
+        let (mut state, _governor) = state_prefilling(40_000);
+        let (long, _long_reply) = prepared_turn(&mut state, 2, vec![1; 50_000]);
+        assert!(!state.start_prepared(long));
+        let (short, _short_reply) = prepared_turn(&mut state, 3, tokens_of(3, 1));
+        assert!(!state.start_prepared(short));
+        let step = state.step_with(&mut PrefillWall(1_000)).expect("a step");
+        assert!(matches!(step, SchedulerAction::Stepped { .. }));
+        state.count_held_overtakes();
+        let held = state.held.front().expect("held");
+        assert_eq!(held.overtaken, 1);
+        assert!(state.admission_waits(held));
+        state.held[0].overtaken = engine::scheduler::MAX_OVERTAKES;
+        assert!(!state.admission_waits(&state.held[0]));
     }
 
     /// Splash ranks a candidate by its cached tokens: a live continuation

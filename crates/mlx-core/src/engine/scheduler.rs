@@ -125,6 +125,9 @@ pub(crate) struct TurnState<P> {
     /// Splash `Request::overtaken`: prefill units in a row that served
     /// later arrivals and not it, up to [`MAX_OVERTAKES`].
     pub overtaken: u32,
+    /// The submission order a start the scheduler held before admission
+    /// keeps (Splash `Request::order`).
+    pub submitted_order: Option<u64>,
     pub payload: P,
     arrival_order: u64,
 }
@@ -250,6 +253,7 @@ impl<P> TurnState<P> {
             resource_wait: ResourceWait::default(),
             admission: 0,
             overtaken: 0,
+            submitted_order: None,
             payload,
             arrival_order: 0,
         })
@@ -946,6 +950,9 @@ pub(crate) struct Scheduler<P, Exclusive, Barrier> {
     plan_excluded: Vec<SeqId>,
     counters: Arc<SchedulerCounters>,
     next_order: u64,
+    /// Splash `Scheduler::complete`'s `youngestServed` of the last prefill
+    /// unit, for the starts held outside the scheduler.
+    youngest_served: Option<u64>,
     global_step: u64,
     stats: SchedulerStats,
 }
@@ -968,6 +975,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             plan_excluded: Vec::new(),
             counters: Arc::new(SchedulerCounters::new(max_num_seqs)),
             next_order: 0,
+            youngest_served: None,
             global_step: 0,
             stats: SchedulerStats::default(),
         })
@@ -1013,6 +1021,16 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         order
     }
 
+    /// The submission order of a start held before it has a turn.
+    pub fn reserve_order(&mut self) -> u64 {
+        self.take_order()
+    }
+
+    /// The youngest lane the last measured prefill unit served, once.
+    pub fn take_youngest_served(&mut self) -> Option<u64> {
+        self.youngest_served.take()
+    }
+
     #[cfg(test)]
     pub fn enqueue_turn(&mut self, turn: TurnState<P>) -> Result<(), String> {
         self.try_enqueue_turn(turn)
@@ -1035,7 +1053,10 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             )));
         }
         turn.status = TurnStatus::Waiting;
-        turn.arrival_order = self.take_order();
+        turn.arrival_order = match turn.submitted_order.take() {
+            Some(order) => order,
+            None => self.take_order(),
+        };
         self.waiting.push_back(turn);
         Ok(())
     }
@@ -1776,17 +1797,25 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
     /// leaves it waiting for no other lane's prompt. A start holds its memory from its
     /// first unit to its last, so one that would join and then wait out
     /// another's prompt stays queued until it leads.
-    pub fn serves_candidate(&self, seq_id: SeqId, cached: u32, prompt_tokens: u32) -> bool {
+    /// A held start ranks by its `submitted` order and `overtaken` count.
+    pub fn serves_candidate(
+        &self,
+        seq_id: SeqId,
+        cached: u32,
+        prompt_tokens: u32,
+        submitted: Option<u64>,
+        overtaken: u32,
+    ) -> bool {
         let processed = cached.min(prompt_tokens.saturating_sub(1));
         if !matches!(self.prefill, PrefillUnit::Measured { .. }) || prompt_tokens == 0 {
             return true;
         }
         let candidate = PrefillLane {
             seq_id,
-            arrival_order: self.next_order,
+            arrival_order: submitted.unwrap_or(self.next_order),
             processed,
             remaining: prompt_tokens - processed,
-            overdue: false,
+            overdue: overtaken >= MAX_OVERTAKES,
         };
         let mut ready = self.ready_lanes(&[]);
         ready.push(candidate);
@@ -2143,6 +2172,7 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         else {
             return false;
         };
+        self.youngest_served = Some(youngest);
         let excluded = &self.plan_excluded;
         let waiting = self
             .waiting
@@ -3934,20 +3964,20 @@ mod tests {
     #[test]
     fn admission_waits_for_a_command_that_serves_it() {
         let mut scheduler = measured_scheduler(262_144, DEFAULT_DECODE_SHARE);
-        assert!(scheduler.serves_candidate(9, 0, 50_000));
+        assert!(scheduler.serves_candidate(9, 0, 50_000, None, 0));
         push_prefill(&mut scheduler, 1, 40_000, 0);
-        assert!(!scheduler.serves_candidate(9, 0, 50_000));
-        assert!(scheduler.serves_candidate(9, 0, 300));
+        assert!(!scheduler.serves_candidate(9, 0, 50_000, None, 0));
+        assert!(scheduler.serves_candidate(9, 0, 300, None, 0));
         let mut scheduler = measured_scheduler(262_144, DEFAULT_DECODE_SHARE);
         push_prefill(&mut scheduler, 1, 400, 0);
-        assert!(scheduler.serves_candidate(9, 0, 50_000));
+        assert!(scheduler.serves_candidate(9, 0, 50_000, None, 0));
         let mut fixed = Scheduler::<&'static str, (), ()>::new(10, PREFILL_CHUNK_ROWS).unwrap();
         fixed.running.push({
             let mut turn = TurnState::new(1, vec![1; 40_000], 0, Vec::new(), None, "p").unwrap();
             turn.status = TurnStatus::Running;
             turn
         });
-        assert!(fixed.serves_candidate(9, 0, 50_000));
+        assert!(fixed.serves_candidate(9, 0, 50_000, None, 0));
     }
 
     /// Splash `Engine::tick` commits a unit with the excluded lanes less
