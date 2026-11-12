@@ -5137,7 +5137,6 @@ impl PagedKVCacheAdapter {
                  cache_dtype ({cache_dtype:?}) for non-FP8 caches"
             ));
         }
-        self.refuse_int8_reads("gather_kv_for_decode_graph_batched")?;
 
         let (block_tables, seq_lens, max_context_len) =
             self.decode_attention_inputs_batched(seq_ids)?;
@@ -5238,7 +5237,6 @@ impl PagedKVCacheAdapter {
                  cache_dtype ({cache_dtype:?}) for non-FP8 caches"
             ));
         }
-        self.refuse_int8_reads("gather_kv_for_ragged_graph")?;
         let (block_tables, seq_lens, cu_seqlens_q, max_context_len, total_queries) =
             self.ragged_attention_inputs(rows)?;
         if q_meta.shape[0] != i64::from(total_queries) {
@@ -5387,7 +5385,6 @@ impl PagedKVCacheAdapter {
                  cache_dtype ({cache_dtype:?}) for non-FP8 caches"
             ));
         }
-        self.refuse_int8_reads("gather_kv_for_decode_graph")?;
 
         let (block_table, seq_lens, block_count) = self.decode_attention_inputs()?;
         let grouped_stripes = self.resolve_grouped_d128_stripes(
@@ -5474,7 +5471,20 @@ impl PagedKVCacheAdapter {
             return Err("gather_kv_for_decode called before reset_for_new_request".to_string());
         }
 
-        self.refuse_int8_reads("gather_kv_for_decode")?;
+        // The raw Metal route has no int8 kernel; Splash reads int8 pages
+        // through one path (`splash_attention_page_softmax`).
+        if self.layer_kv_pool.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8 {
+            let output = self.gather_kv_for_decode_graph_with_plan(
+                layer_idx,
+                queries,
+                scale,
+                softcap,
+                route_hint,
+                grouped_stripes,
+            )?;
+            output.eval();
+            return Ok((output, false));
+        }
 
         // Raw Metal gather reads the pool outside MLX's graph scheduler. If a
         // prior native `paged_kv_write` for this layer is still lazy, force it
@@ -5746,7 +5756,6 @@ impl PagedKVCacheAdapter {
                  cache_dtype ({cache_dtype:?}) for non-FP8 caches"
             ));
         }
-        self.refuse_int8_reads("gather_kv_for_prefill_chunk_varlen")?;
         let kv_dtype_raw = self.kv_dtype_raw()?;
 
         let (block_table, seq_lens, cu_seqlens_q, block_count, _) =
@@ -5921,7 +5930,6 @@ impl PagedKVCacheAdapter {
                 self.layer_kv_pool.num_layers()
             ));
         }
-        self.refuse_int8_reads("gather_kv_for_prefill_sdpa")?;
         let cache_dtype = self.layer_kv_pool.cache_dtype();
         if cache_dtype.is_fp8() {
             return Err(
@@ -5930,8 +5938,9 @@ impl PagedKVCacheAdapter {
                     .to_string(),
             );
         }
+        let int8 = cache_dtype == mlx_paged_attn::metal::MetalDtype::Int8;
         let dtype_size = cache_dtype.size();
-        if dtype_size != 2 {
+        if dtype_size != 2 && !int8 {
             return Err(format!(
                 "gather_kv_for_prefill_sdpa: unsupported non-FP8 cache dtype \
                  {cache_dtype:?} with element size {dtype_size}"
@@ -5958,7 +5967,8 @@ impl PagedKVCacheAdapter {
         let PoolLayerArrays {
             key: k_pool,
             value: v_pool,
-            ..
+            k_scale,
+            v_scale,
         } = self.native_pool_arrays_for_layer(layer_idx)?;
 
         // K pool: [B,H,D/x,T,x] -> [H,B,T,D/x,x] -> [1,H,B*T,D].
@@ -6003,7 +6013,30 @@ impl PagedKVCacheAdapter {
             .copy()
             .map_err(|e| format!("gather_kv_for_prefill_sdpa: V contiguous copy failed: {e}"))?;
 
-        Ok((k, v))
+        if !int8 {
+            return Ok((k, v));
+        }
+        // Scale planes: [B,H,T] -> [H,B,T] -> [1,H,B*T], the token order of
+        // the K / V rows above.
+        let scales = |plane: &MxArray, side: &str| -> Result<MxArray, String> {
+            plane
+                .take(&block_ids, 0)
+                .and_then(|taken| taken.transpose(Some(&[1, 0, 2])))
+                .and_then(|planes| planes.reshape(&[1, num_kv_heads as i64, padded_tokens as i64]))
+                .and_then(|planes| {
+                    planes.slice(&[0, 0, local_start], &[1, num_kv_heads as i64, local_end])
+                })
+                .and_then(|planes| planes.copy())
+                .map_err(|e| format!("gather_kv_for_prefill_sdpa: {side} scale gather failed: {e}"))
+        };
+        let dequantize = |rows: &MxArray, plane: &MxArray, side: &str| {
+            crate::array::kv_int8::dequantize_kv_rows(rows, &scales(plane, side)?)
+                .map_err(|e| format!("gather_kv_for_prefill_sdpa: {side} dequantize failed: {e}"))
+        };
+        Ok((
+            dequantize(&k, &k_scale, "K")?,
+            dequantize(&v, &v_scale, "V")?,
+        ))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -6141,7 +6174,6 @@ impl PagedKVCacheAdapter {
                  cache_dtype ({cache_dtype:?}) for non-FP8 caches"
             ));
         }
-        self.refuse_int8_reads("gather_kv_for_prefill_chunk")?;
         let kv_dtype_raw = self.kv_dtype_raw()?;
 
         let (block_table, seq_lens, block_count) =
@@ -6450,14 +6482,12 @@ impl PagedKVCacheAdapter {
         // v_scale dequantization which the adapter does not yet plumb.
         match cache_dtype {
             mlx_paged_attn::metal::MetalDtype::Float16
-            | mlx_paged_attn::metal::MetalDtype::BFloat16 => {}
-            mlx_paged_attn::metal::MetalDtype::Int8 => {
-                self.refuse_int8_reads("read_kv_range")?;
-            }
+            | mlx_paged_attn::metal::MetalDtype::BFloat16
+            | mlx_paged_attn::metal::MetalDtype::Int8 => {}
             other => {
                 return Err(format!(
-                    "read_kv_range: cache_dtype {other:?} is not supported (only Float16 \
-                     and BFloat16; FP8 dequantization is a follow-up)"
+                    "read_kv_range: cache_dtype {other:?} is not supported (only Float16, \
+                     BFloat16 and Int8; FP8 dequantization is a follow-up)"
                 ));
             }
         }
@@ -6515,31 +6545,44 @@ impl PagedKVCacheAdapter {
             ));
         }
 
-        // 6. Layout constants.
-        // Cache dtype is 2 bytes per element here (we rejected FP8 above).
-        let element_size: usize = 2;
-        let x: usize = 8;
+        // 6. Layout constants. Each block's bytes are a blob of data then,
+        //    for an int8 pool, the f32 `[num_kv_heads, block_size]` scale
+        //    slot (`PlaneBytes::blob`).
+        let int8 = cache_dtype == mlx_paged_attn::metal::MetalDtype::Int8;
+        let (element_size, x): (usize, usize) = if int8 { (1, 16) } else { (2, 8) };
         let block_size_us = block_size as usize;
         let num_kv_heads_us = num_kv_heads as usize;
         let head_size_us = head_size as usize;
+        let (key_blob, value_blob) = self.layer_kv_pool.block_blob_bytes()?;
+        let (key_blob, value_blob) = (key_blob as usize, value_blob as usize);
+        let data_bytes = num_kv_heads_us * head_size_us * block_size_us * element_size;
 
-        let key_block_elems = num_kv_heads_us * (head_size_us / x) * block_size_us * x;
-        let value_block_elems = num_kv_heads_us * head_size_us * block_size_us;
-
-        // 7. Allocate output buffers in [num_kv_heads, num_tokens, head_size]
-        //    layout (we'll add the leading batch=1 axis at the MxArray-from-
-        //    bytes step). dtype is u16 representing either FP16 bits or BF16
-        //    bits; we use the matching `MxArray::from_float16` /
-        //    `from_bfloat16` constructor at the end.
+        // 7. Output buffers in [num_kv_heads, num_tokens, head_size] layout
+        //    (the leading batch=1 axis is added at the MxArray step): FP16 /
+        //    BF16 bits, or int8 rows plus their [num_kv_heads, num_tokens]
+        //    scales.
         let num_tokens_us = num_tokens as usize;
         let out_elems = num_kv_heads_us * num_tokens_us * head_size_us;
-        let mut k_out: Vec<u16> = vec![0u16; out_elems];
-        let mut v_out: Vec<u16> = vec![0u16; out_elems];
+        let (wide_elems, narrow_elems, scale_elems) = if int8 {
+            (0, out_elems, num_kv_heads_us * num_tokens_us)
+        } else {
+            (out_elems, 0, 0)
+        };
+        let mut k_out: Vec<u16> = vec![0u16; wide_elems];
+        let mut v_out: Vec<u16> = vec![0u16; wide_elems];
+        let mut k_q: Vec<i8> = vec![0i8; narrow_elems];
+        let mut v_q: Vec<i8> = vec![0i8; narrow_elems];
+        let mut k_s: Vec<f32> = vec![0f32; scale_elems];
+        let mut v_s: Vec<f32> = vec![0f32; scale_elems];
 
-        // Helper: read a u16 from a byte slice at element-index `idx`.
-        let read_u16 = |bytes: &[u8], idx: usize| -> u16 {
-            let off = idx * element_size;
-            u16::from_ne_bytes([bytes[off], bytes[off + 1]])
+        let mut copy_element = |bytes: &[u8], at: usize, out_idx: usize, key: bool| {
+            if int8 {
+                let q = if key { &mut k_q } else { &mut v_q };
+                q[out_idx] = bytes[at] as i8;
+            } else {
+                let out = if key { &mut k_out } else { &mut v_out };
+                out[out_idx] = u16::from_ne_bytes([bytes[at], bytes[at + 1]]);
+            }
         };
 
         // 8. Per-token gather. For token at logical position `pos`:
@@ -6551,49 +6594,55 @@ impl PagedKVCacheAdapter {
             let table_idx = pos / block_size_us;
             let offset_in_block = pos % block_size_us;
             let local = table_idx - first_table_idx;
-            let key_block_base = local * key_block_elems;
-            let value_block_base = local * value_block_elems;
+            let key_block_base = local * key_blob;
+            let value_block_base = local * value_blob;
 
             // K layout per block: [num_kv_heads, head_size/x, block_size, x]
             // K elem at (h, d) = key[h, d/x, offset_in_block, d%x]
-            // strides:
-            // - h-stride = (head_size/x) * block_size * x
-            // - dx-stride = block_size * x
-            // - off-stride = x
-            // - tail = d%x
             for h in 0..num_kv_heads_us {
                 let h_stride = (head_size_us / x) * block_size_us * x;
                 let dx_stride = block_size_us * x;
-                let off_stride = x;
                 for d in 0..head_size_us {
-                    let dx = d / x;
-                    let dt = d % x;
-                    let elem_idx = key_block_base
-                        + h * h_stride
-                        + dx * dx_stride
-                        + offset_in_block * off_stride
-                        + dt;
-                    let bits = read_u16(&key_bytes, elem_idx);
-                    // Output index in [num_kv_heads, num_tokens, head_size]:
+                    let elem_idx = h * h_stride + (d / x) * dx_stride + offset_in_block * x + d % x;
                     let out_idx = h * num_tokens_us * head_size_us + t * head_size_us + d;
-                    k_out[out_idx] = bits;
+                    copy_element(
+                        &key_bytes,
+                        key_block_base + elem_idx * element_size,
+                        out_idx,
+                        true,
+                    );
                 }
             }
 
             // V layout per block: [num_kv_heads, head_size, block_size]
             // V elem at (h, d) = value[h, d, offset_in_block]
-            // strides:
-            // - h-stride = head_size * block_size
-            // - d-stride = block_size
-            // - tail = offset_in_block
             for h in 0..num_kv_heads_us {
-                let h_stride = head_size_us * block_size_us;
-                let d_stride = block_size_us;
                 for d in 0..head_size_us {
-                    let elem_idx = value_block_base + h * h_stride + d * d_stride + offset_in_block;
-                    let bits = read_u16(&value_bytes, elem_idx);
+                    let elem_idx = (h * head_size_us + d) * block_size_us + offset_in_block;
                     let out_idx = h * num_tokens_us * head_size_us + t * head_size_us + d;
-                    v_out[out_idx] = bits;
+                    copy_element(
+                        &value_bytes,
+                        value_block_base + elem_idx * element_size,
+                        out_idx,
+                        false,
+                    );
+                }
+            }
+
+            // Scale slot per block: [num_kv_heads, block_size] f32 after the data.
+            if int8 {
+                for h in 0..num_kv_heads_us {
+                    let slot = data_bytes + (h * block_size_us + offset_in_block) * 4;
+                    let read = |bytes: &[u8], base: usize| {
+                        f32::from_ne_bytes([
+                            bytes[base + slot],
+                            bytes[base + slot + 1],
+                            bytes[base + slot + 2],
+                            bytes[base + slot + 3],
+                        ])
+                    };
+                    k_s[h * num_tokens_us + t] = read(&key_bytes, key_block_base);
+                    v_s[h * num_tokens_us + t] = read(&value_bytes, value_block_base);
                 }
             }
         }
@@ -6601,7 +6650,8 @@ impl PagedKVCacheAdapter {
 
         // 9. Construct MxArrays in [1, num_kv_heads, num_tokens, head_size]
         //    layout. Use the dtype-matching constructor so the bits are
-        //    interpreted correctly (`from_float16` for FP16 cache, etc).
+        //    interpreted correctly (`from_float16` for FP16 cache, etc); int8
+        //    rows dequantize to BF16 through the flat int8 cache's op.
         let array_build_start = trace_enabled.then(Instant::now);
         let shape: [i64; 4] = [1, num_kv_heads as i64, num_tokens as i64, head_size as i64];
         let (k_arr, v_arr) = match cache_dtype {
@@ -6621,6 +6671,18 @@ impl PagedKVCacheAdapter {
                     format!("read_kv_range: failed to build V MxArray (BFloat16): {e}")
                 })?,
             ),
+            mlx_paged_attn::metal::MetalDtype::Int8 => {
+                let scale_shape = [1, num_kv_heads as i64, num_tokens as i64];
+                let dequantize = |q: &[i8], scales: &[f32], side: &str| {
+                    MxArray::from_int8(q, &shape)
+                        .and_then(|rows| {
+                            let scales = MxArray::from_float32(scales, &scale_shape)?;
+                            crate::array::kv_int8::dequantize_kv_rows(&rows, &scales)
+                        })
+                        .map_err(|e| format!("read_kv_range: {side} int8 dequantize failed: {e}"))
+                };
+                (dequantize(&k_q, &k_s, "K")?, dequantize(&v_q, &v_s, "V")?)
+            }
             // unreachable due to the early dtype guard above
             other => {
                 return Err(format!(
@@ -7986,13 +8048,8 @@ impl PagedKVCacheAdapter {
         metal_io_dtype(cache_dtype).ok()
     }
 
-    /// Int8 pages are read only by the scale-aware attention kernels
-    /// (Splash `splash_attention_page_softmax`), which are not built.
-    pub(crate) fn refuse_int8_reads(&self, entry: &str) -> Result<(), String> {
-        if self.layer_kv_pool.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8 {
-            return Err(format!("{entry}: int8 paged reads are not built"));
-        }
-        Ok(())
+    pub(crate) fn cache_dtype(&self) -> mlx_paged_attn::metal::MetalDtype {
+        self.layer_kv_pool.cache_dtype()
     }
 
     pub fn current_token_count(&self) -> u32 {

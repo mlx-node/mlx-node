@@ -41,49 +41,70 @@ fn grouped_qwen35_graph_decode_and_mtp_parity() {
 
 #[test]
 fn grouped_qwen35_graph_route_thresholds_are_pinned() {
-    for (num_q_heads, num_kv_heads, decode_min, verify_min) in
-        [(24, 4, 16_384, 8_192), (16, 2, 32_768, 16_384)]
-    {
-        for (query_rows, selected) in [(1, decode_min), (2, verify_min)] {
-            let below = selected - 1;
-            assert_eq!(
-                unsafe {
-                    mlx_sys::mlx_paged_grouped_qwen35_shape_guard_for_test(
-                        num_q_heads,
-                        num_kv_heads,
-                        query_rows,
-                        below,
-                    )
-                },
-                0,
-                "grouped route selected below its configured threshold"
-            );
-            assert_eq!(
-                unsafe {
-                    mlx_sys::mlx_paged_grouped_qwen35_shape_guard_for_test(
-                        num_q_heads,
-                        num_kv_heads,
-                        query_rows,
-                        selected,
-                    )
-                },
-                1,
-                "grouped route was not selected at its configured threshold"
-            );
-        }
-    }
-    for (num_q_heads, num_kv_heads) in [(16, 4), (24, 2)] {
+    // Bf16 and Int8 pools share the thresholds; FP8 never takes the route.
+    for (num_q_heads, num_kv_heads) in [(24, 4), (16, 2)] {
         assert_eq!(
             unsafe {
                 mlx_sys::mlx_paged_grouped_qwen35_shape_guard_for_test(
                     num_q_heads,
                     num_kv_heads,
                     1,
-                    16_384,
+                    65_536,
+                    2,
                 )
             },
             0,
-            "unsupported nearby head shape selected the grouped route"
+            "an FP8 pool selected the grouped route"
         );
+    }
+    for cache_dtype in [1u8, 3] {
+        for (num_q_heads, num_kv_heads, decode_min, verify_min) in
+            [(24, 4, 16_384, 8_192), (16, 2, 32_768, 16_384)]
+        {
+            for (query_rows, selected) in [(1, decode_min), (2, verify_min)] {
+                let below = selected - 1;
+                assert_eq!(
+                    unsafe {
+                        mlx_sys::mlx_paged_grouped_qwen35_shape_guard_for_test(
+                            num_q_heads,
+                            num_kv_heads,
+                            query_rows,
+                            below,
+                            cache_dtype,
+                        )
+                    },
+                    0,
+                    "grouped route selected below its configured threshold"
+                );
+                assert_eq!(
+                    unsafe {
+                        mlx_sys::mlx_paged_grouped_qwen35_shape_guard_for_test(
+                            num_q_heads,
+                            num_kv_heads,
+                            query_rows,
+                            selected,
+                            cache_dtype,
+                        )
+                    },
+                    1,
+                    "grouped route was not selected at its configured threshold"
+                );
+            }
+        }
+        for (num_q_heads, num_kv_heads) in [(16, 4), (24, 2)] {
+            assert_eq!(
+                unsafe {
+                    mlx_sys::mlx_paged_grouped_qwen35_shape_guard_for_test(
+                        num_q_heads,
+                        num_kv_heads,
+                        1,
+                        16_384,
+                        cache_dtype,
+                    )
+                },
+                0,
+                "unsupported nearby head shape selected the grouped route"
+            );
+        }
     }
 }

@@ -2200,3 +2200,148 @@ fn paged_kv_write_has_four_outputs() {
         unsafe { mlx_sys::mlx_paged_kv_write_is_equivalent(16, 4, 256, 16, 3, 16, 4, 256, 16, 1) };
     assert!(same && !differ);
 }
+
+/// Factory of one paged read (`mlx_paged_attention_forward`, or the varlen
+/// entry with one 2-row sequence) over 3-block pools, H 4, Hq 8; `true`
+/// when it built the lazy output.
+fn read_call(
+    kv_dtype: u8,
+    head_size: i64,
+    block_size: i64,
+    scale_shape: &[i64],
+    varlen: bool,
+) -> bool {
+    let (blocks, heads, q_heads) = (3i64, 4i64, 8i64);
+    let x = if kv_dtype == 3 { 16 } else { 8 };
+    let k_shape = [blocks, heads, head_size / x, block_size, x];
+    let v_shape = [blocks, heads, head_size, block_size];
+    let pool_len = (blocks * heads * head_size * block_size) as usize;
+    let rows = if varlen { 2i64 } else { 1 };
+    let q_shape = [rows, q_heads, head_size];
+    let scale_len: i64 = scale_shape.iter().product();
+    unsafe {
+        let pool = |shape: &[i64]| {
+            if kv_dtype == 3 {
+                mlx_sys::mlx_array_from_int8(
+                    vec![0i8; pool_len].as_ptr(),
+                    shape.as_ptr(),
+                    shape.len(),
+                )
+            } else {
+                mlx_sys::mlx_array_from_bfloat16(
+                    vec![0u16; pool_len].as_ptr(),
+                    shape.as_ptr(),
+                    shape.len(),
+                )
+            }
+        };
+        let scale = || {
+            mlx_sys::mlx_array_from_float32(
+                vec![1.0f32; scale_len as usize].as_ptr(),
+                scale_shape.as_ptr(),
+                scale_shape.len(),
+            )
+        };
+        let q_data = vec![f32_to_bf16_bits(0.5); (rows * q_heads * head_size) as usize];
+        let table = [0i32, 1, 2];
+        let lens = [block_size as i32 * 2];
+        let cu = [0i32, rows as i32];
+        let inputs = [
+            mlx_sys::mlx_array_from_bfloat16(q_data.as_ptr(), q_shape.as_ptr(), 3),
+            pool(&k_shape),
+            pool(&v_shape),
+            mlx_sys::mlx_array_from_int32(table.as_ptr(), [1i64, 3].as_ptr(), 2),
+            mlx_sys::mlx_array_from_int32(lens.as_ptr(), [1i64].as_ptr(), 1),
+            scale(),
+            scale(),
+            mlx_sys::mlx_array_from_int32(cu.as_ptr(), [2i64].as_ptr(), 1),
+        ];
+        let out = if varlen {
+            mlx_sys::mlx_paged_attention_varlen_forward(
+                inputs[0],
+                inputs[1],
+                inputs[2],
+                inputs[3],
+                inputs[4],
+                inputs[7],
+                inputs[5],
+                inputs[6],
+                0.0625,
+                0.0,
+                0,
+                block_size as i32,
+                q_heads as i32,
+                heads as i32,
+                head_size as i32,
+                kv_dtype,
+            )
+        } else {
+            mlx_sys::mlx_paged_attention_forward(
+                inputs[0],
+                inputs[1],
+                inputs[2],
+                inputs[3],
+                inputs[4],
+                inputs[5],
+                inputs[6],
+                0.0625,
+                0.0,
+                0,
+                block_size as i32,
+                q_heads as i32,
+                heads as i32,
+                head_size as i32,
+                kv_dtype,
+            )
+        };
+        let built = !out.is_null();
+        if built {
+            mlx_sys::mlx_array_delete(out);
+        }
+        for input in inputs {
+            mlx_sys::mlx_array_delete(input);
+        }
+        built
+    }
+}
+
+/// Both read validators take an Int8 pool with `[num_blocks, H, bs]` f32
+/// scale planes (Splash `splash_q8_scale_index`), head size 128 / 256 and
+/// block size 16 / 32, and refuse anything else; bf16 keeps `[1]` scales.
+///
+/// Mutation M1 (the read validator accepts `[1]` scales for Int8) goes red.
+#[test]
+fn paged_attention_validates_int8_scale_planes() {
+    if MetalState::get().is_err() {
+        return;
+    }
+    for varlen in [false, true] {
+        for (head_size, block_size) in [(128, 16), (256, 16), (256, 32)] {
+            assert!(
+                read_call(3, head_size, block_size, &[3, 4, block_size], varlen),
+                "varlen {varlen}: Int8 D{head_size} bs{block_size} with scale planes"
+            );
+        }
+        assert!(
+            !read_call(3, 256, 16, &[1], varlen),
+            "varlen {varlen}: Int8 with [1] scales"
+        );
+        assert!(
+            !read_call(3, 256, 16, &[2, 4, 16], varlen),
+            "varlen {varlen}: Int8 with a short scale plane"
+        );
+        assert!(
+            !read_call(3, 64, 16, &[3, 4, 16], varlen),
+            "varlen {varlen}: Int8 with head size 64"
+        );
+        assert!(
+            !read_call(3, 256, 8, &[3, 4, 8], varlen),
+            "varlen {varlen}: Int8 with block size 8"
+        );
+        assert!(read_call(1, 256, 16, &[1], varlen), "varlen {varlen}: bf16");
+        assert!(
+            !read_call(1, 256, 16, &[3, 4, 16], varlen),
+            "varlen {varlen}: bf16 with scale planes"
+        );
+    }
+}

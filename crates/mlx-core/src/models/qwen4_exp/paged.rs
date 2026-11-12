@@ -144,9 +144,11 @@ pub fn gather_selected(
     heads: usize,
     dim: usize,
 ) -> Result<(MxArray, MxArray)> {
-    adapter
-        .refuse_int8_reads("Qwen4 gather_selected")
-        .map_err(Error::from_reason)?;
+    if adapter.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8 {
+        return Err(Error::from_reason(
+            "Qwen4 gather_selected: the qwen4 page gathers read x = 8 bf16 pages; an int8 pool is refused",
+        ));
+    }
     let table = adapter
         .block_table()
         .ok_or_else(|| Error::from_reason("Qwen4 missing page table"))?;
@@ -757,9 +759,11 @@ pub(super) fn gather_window(
     values: &MxArray,
     base: usize,
 ) -> Result<(MxArray, MxArray)> {
-    adapter
-        .refuse_int8_reads("Qwen4 gather_window")
-        .map_err(Error::from_reason)?;
+    if adapter.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8 {
+        return Err(Error::from_reason(
+            "Qwen4 gather_window: the qwen4 page gathers read x = 8 bf16 pages; an int8 pool is refused",
+        ));
+    }
     let table = adapter
         .block_table()
         .ok_or_else(|| Error::from_reason("Qwen4 missing page table"))?;

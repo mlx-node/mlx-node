@@ -61,7 +61,8 @@ pub(crate) fn quantize_kv_rows_reference(x: &MxArray) -> Result<(MxArray, MxArra
     )
 }
 
-/// int8 rows `[B, H, N, 256]` x fp32 scales `[B, H, N]` -> BF16 rows.
+/// int8 rows `[B, H, N, 128 | 256]` x fp32 scales `[B, H, N]` -> BF16 rows
+/// (the paged int8 pool's dense readers use the 128 form).
 pub fn dequantize_kv_rows(q: &MxArray, s: &MxArray) -> Result<MxArray> {
     // SAFETY: both handles are live arrays; the result is an owned handle or
     // null on failure.
@@ -180,4 +181,74 @@ pub(crate) fn segmented_sdpa_int8_with_route(
         )
     };
     MxArray::from_handle(handle, "segmented_sdpa_int8_with_route")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// int8 rows whose head dimension has a stride of 16 (a token slice of a
+    /// `[B, H, D, T]` page seen as `[B, H, T, D]`), lazy or evaluated,
+    /// dequantize bit for bit like the same rows laid out row-major.
+    ///
+    /// Mutation U1: the kernel reads the head dimension at stride 1 → red.
+    #[test]
+    fn dequantize_reads_rows_with_a_strided_head_dimension() {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return;
+        }
+        const HEADS: usize = 2;
+        const PAGE: usize = 16;
+        let (start, end) = (3usize, 12usize);
+        for dim in [128usize, 256] {
+            let page: Vec<i8> = (0..HEADS * dim * PAGE)
+                .map(|i| ((i * 37 + i / 251) % 255) as i16 - 127)
+                .map(|value| value as i8)
+                .collect();
+            let scales: Vec<f32> = (0..HEADS * PAGE)
+                .map(|i| (1 + (i * 7) % 23) as f32 / 64.0)
+                .collect();
+            let mut rows = Vec::with_capacity(HEADS * (end - start) * dim);
+            let mut row_scales = Vec::with_capacity(HEADS * (end - start));
+            for head in 0..HEADS {
+                for token in start..end {
+                    row_scales.push(scales[head * PAGE + token]);
+                    for d in 0..dim {
+                        rows.push(page[(head * dim + d) * PAGE + token]);
+                    }
+                }
+            }
+            let tokens = (end - start) as i64;
+            let want = dequantize_kv_rows(
+                &MxArray::from_int8(&rows, &[1, HEADS as i64, tokens, dim as i64]).unwrap(),
+                &MxArray::from_float32(&row_scales, &[1, HEADS as i64, tokens]).unwrap(),
+            )
+            .unwrap()
+            .to_uint16_native()
+            .unwrap();
+
+            let strided = MxArray::from_int8(&page, &[1, HEADS as i64, dim as i64, PAGE as i64])
+                .and_then(|page| page.transpose(Some(&[0, 1, 3, 2])))
+                .and_then(|rows| rows.slice_axis(2, start as i64, end as i64))
+                .unwrap();
+            let s = MxArray::from_float32(&scales, &[1, HEADS as i64, PAGE as i64])
+                .and_then(|s| s.slice_axis(2, start as i64, end as i64))
+                .unwrap();
+            for evaluated in [false, true] {
+                let q = strided.copy().unwrap();
+                if evaluated {
+                    q.eval();
+                }
+                let got = dequantize_kv_rows(&q, &s)
+                    .unwrap()
+                    .to_uint16_native()
+                    .unwrap();
+                let differing = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+                assert_eq!(
+                    differing, 0,
+                    "D {dim} evaluated {evaluated}: {differing} bf16 values differ"
+                );
+            }
+        }
+    }
 }

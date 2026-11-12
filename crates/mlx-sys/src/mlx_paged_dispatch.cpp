@@ -339,19 +339,29 @@ const std::string& paged_attention_v2_kernel_name(
   });
 }
 
+// An int8 v2 pass writes f32 partials; its reducer is the Splash
+// splash_attention_combine_splits order.
 const std::string& paged_attention_v2_reduce_kernel_name(
     KvDtype io_dtype,
+    KvDtype cache_dtype,
     int head_size) {
   static std::mutex mutex;
-  static std::map<std::tuple<KvDtype, int>, std::string> cache;
+  static std::map<std::tuple<KvDtype, KvDtype, int>, std::string> cache;
   return memoized_kernel_name(
-      cache, mutex, std::make_tuple(io_dtype, head_size), [&] {
+      cache, mutex, std::make_tuple(io_dtype, cache_dtype, head_size), [&] {
     std::ostringstream os;
-    os << "paged_attention_v2_reduce_" << dtype_string(io_dtype) << "_hs"
-       << head_size << "_nt" << kNumThreads << "_nsl" << kNumSimdLanes
-       << "_ps" << kPartitionSize;
+    os << "paged_attention_v2_reduce_"
+       << (cache_dtype == KvDtype::Int8 ? "int8" : dtype_string(io_dtype))
+       << "_hs" << head_size << "_nt" << kNumThreads << "_nsl"
+       << kNumSimdLanes << "_ps" << kPartitionSize;
     return os.str();
   });
+}
+
+// v2 partials: f32 for an int8 pool, the io dtype otherwise.
+mlx::core::Dtype partial_dtype_for(KvDtype io_dtype, KvDtype cache_dtype) {
+  return cache_dtype == KvDtype::Int8 ? mlx::core::float32
+                                      : mlx_dtype_for(io_dtype);
 }
 
 enum class GroupedPagedAttentionKind {
@@ -368,7 +378,16 @@ enum class GroupedD512Mode {
 };
 
 const std::string& paged_attention_grouped_kernel_name(
-    GroupedPagedAttentionKind kind) {
+    GroupedPagedAttentionKind kind,
+    KvDtype cache_dtype) {
+  if (cache_dtype == KvDtype::Int8) {
+    static const std::string qwen35_int8 =
+        "paged_attention_grouped_int8_hs256_bs16_striped";
+    if (kind != GroupedPagedAttentionKind::Qwen35D256) {
+      throw std::logic_error("grouped int8 paged attention is D256 only");
+    }
+    return qwen35_int8;
+  }
   static const std::string qwen35 =
       "paged_attention_grouped_bfloat16_hs256_bs16_striped";
   static const std::string gemma4 =
@@ -389,7 +408,16 @@ const std::string& paged_attention_grouped_kernel_name(
 }
 
 const std::string& paged_attention_grouped_reduce_kernel_name(
-    GroupedPagedAttentionKind kind) {
+    GroupedPagedAttentionKind kind,
+    KvDtype cache_dtype) {
+  if (cache_dtype == KvDtype::Int8) {
+    static const std::string qwen35_int8 =
+        "paged_attention_grouped_int8_hs256_striped_reduce";
+    if (kind != GroupedPagedAttentionKind::Qwen35D256) {
+      throw std::logic_error("grouped int8 paged attention is D256 only");
+    }
+    return qwen35_int8;
+  }
   static const std::string qwen35 =
       "paged_attention_grouped_bfloat16_hs256_striped_reduce";
   static const std::string gemma4 =
@@ -525,7 +553,8 @@ bool grouped_qwen35_shape_matches(
       ? (moe_heads ? 32768 : 16384)
       : (moe_heads ? 16384 : 8192);
   return enabled &&
-      io_dtype == KvDtype::Bf16 && cache_dtype == KvDtype::Bf16 &&
+      io_dtype == KvDtype::Bf16 &&
+      (cache_dtype == KvDtype::Bf16 || cache_dtype == KvDtype::Int8) &&
       num_seqs == 1 && (dense_heads || moe_heads) &&
       head_size == 256 && block_size == 16 &&
       (query_rows == 1 || query_rows == 2) &&
@@ -715,13 +744,15 @@ const std::string& paged_attention_varlen_v2_kernel_name(
 
 const std::string& paged_attention_varlen_v2_reduce_kernel_name(
     KvDtype io_dtype,
+    KvDtype cache_dtype,
     int head_size) {
   static std::mutex mutex;
-  static std::map<std::tuple<KvDtype, int>, std::string> cache;
+  static std::map<std::tuple<KvDtype, KvDtype, int>, std::string> cache;
   return memoized_kernel_name(
-      cache, mutex, std::make_tuple(io_dtype, head_size), [&] {
+      cache, mutex, std::make_tuple(io_dtype, cache_dtype, head_size), [&] {
     std::ostringstream os;
-    os << "paged_attention_varlen_v2_reduce_" << dtype_string(io_dtype)
+    os << "paged_attention_varlen_v2_reduce_"
+       << (cache_dtype == KvDtype::Int8 ? "int8" : dtype_string(io_dtype))
        << "_hs" << head_size << "_nt" << kNumThreads << "_nsl"
        << kNumSimdLanes << "_ps" << kPartitionSize;
     return os.str();
@@ -751,11 +782,13 @@ struct GroupedPipelineLimits {
 
 GroupedPipelineLimits load_grouped_pipeline_limits(
     mlx::core::metal::Device& device,
-    GroupedPagedAttentionKind kind) noexcept {
+    GroupedPagedAttentionKind kind,
+    KvDtype cache_dtype) noexcept {
   try {
-    auto* stage = load_pipeline(device, paged_attention_grouped_kernel_name(kind));
-    auto* reduce =
-        load_pipeline(device, paged_attention_grouped_reduce_kernel_name(kind));
+    auto* stage = load_pipeline(
+        device, paged_attention_grouped_kernel_name(kind, cache_dtype));
+    auto* reduce = load_pipeline(
+        device, paged_attention_grouped_reduce_kernel_name(kind, cache_dtype));
     if (stage == nullptr || reduce == nullptr) {
       std::fprintf(
           stderr,
@@ -786,23 +819,29 @@ GroupedPipelineLimits load_grouped_pipeline_limits(
 bool grouped_pipelines_supported(
     mlx::core::metal::Device& device,
     GroupedPagedAttentionKind kind,
+    KvDtype cache_dtype,
     int num_q_heads,
     int num_kv_heads) {
   // There is one active Metal device. Cache capability independently for the
   // concrete instantiations so an unavailable pipeline cannot disable the
   // supported paths for other head sizes.
   const GroupedPipelineLimits* limits_ptr = nullptr;
-  if (kind == GroupedPagedAttentionKind::Qwen35D256) {
+  if (kind == GroupedPagedAttentionKind::Qwen35D256 &&
+      cache_dtype == KvDtype::Int8) {
+    static const GroupedPipelineLimits qwen35_int8_limits =
+        load_grouped_pipeline_limits(device, kind, KvDtype::Int8);
+    limits_ptr = &qwen35_int8_limits;
+  } else if (kind == GroupedPagedAttentionKind::Qwen35D256) {
     static const GroupedPipelineLimits qwen35_limits =
-        load_grouped_pipeline_limits(device, kind);
+        load_grouped_pipeline_limits(device, kind, KvDtype::Bf16);
     limits_ptr = &qwen35_limits;
   } else if (kind == GroupedPagedAttentionKind::D128Direct) {
     static const GroupedPipelineLimits d128_limits =
-        load_grouped_pipeline_limits(device, kind);
+        load_grouped_pipeline_limits(device, kind, KvDtype::Bf16);
     limits_ptr = &d128_limits;
   } else if (kind == GroupedPagedAttentionKind::D512Direct) {
     static const GroupedPipelineLimits d512_limits =
-        load_grouped_pipeline_limits(device, kind);
+        load_grouped_pipeline_limits(device, kind, KvDtype::Bf16);
     limits_ptr = &d512_limits;
   } else {
     return false;
@@ -907,7 +946,8 @@ extern "C" uint32_t mlx_paged_grouped_d128_max_stripes(
   try {
     auto stream = mlx::core::default_stream(mlx::core::Device::gpu);
     auto& device = mlx::core::metal::device(stream.device);
-    if (!grouped_pipelines_supported(device, GroupedPagedAttentionKind::D128Direct, 32, 2))
+    if (!grouped_pipelines_supported(
+            device, GroupedPagedAttentionKind::D128Direct, KvDtype::Bf16, 32, 2))
       return 0;
     const size_t memory_limit = std::min(
         mlx::core::get_memory_limit(),
@@ -948,6 +988,7 @@ extern "C" int mlx_paged_grouped_d512_capability(
     return grouped_pipelines_supported(
                device,
                GroupedPagedAttentionKind::D512Direct,
+               KvDtype::Bf16,
                num_q_heads,
                num_kv_heads)
         ? 1
@@ -961,11 +1002,15 @@ extern "C" int mlx_paged_grouped_qwen35_shape_guard_for_test(
     int num_q_heads,
     int num_kv_heads,
     int query_rows,
-    int max_context_len) {
+    int max_context_len,
+    uint8_t cache_dtype) {
+  if (cache_dtype > static_cast<uint8_t>(KvDtype::Int8)) {
+    return 0;
+  }
   return grouped_qwen35_shape_matches(
       /*enabled=*/true,
       KvDtype::Bf16,
-      KvDtype::Bf16,
+      static_cast<KvDtype>(cache_dtype),
       /*num_seqs=*/1,
       num_q_heads,
       num_kv_heads,
@@ -1121,6 +1166,42 @@ void dispatch_reshape_and_cache(
 // =============================================================================
 namespace {
 
+// Pool planes are charged by the blocks this read's tables reach, not the
+// whole pool (Splash `EncoderResidency`: memory no command uses costs no
+// command buffer anything). The estimate only schedules commits; binding,
+// hazards and residency are unchanged.
+void bind_pool_plane(
+    mlx::core::metal::CommandEncoder& encoder,
+    const mlx::core::array& plane,
+    int idx,
+    int64_t live_blocks) {
+  const bool per_block = plane.ndim() >= 2 && plane.shape(0) > 0 &&
+      plane.flags().row_contiguous && plane.offset() == 0 &&
+      plane.data_size() == plane.size();
+  if (!per_block) {
+    encoder.set_input_array(plane, idx);
+    return;
+  }
+  const size_t blocks = static_cast<size_t>(plane.shape(0));
+  const size_t touched =
+      std::min(static_cast<size_t>(std::max<int64_t>(live_blocks, 0)), blocks);
+  encoder.set_input_array_with_budget(
+      plane, idx, touched * (plane.data_size() / blocks));
+}
+
+void bind_pool_planes(
+    mlx::core::metal::CommandEncoder& encoder,
+    const mlx::core::array& k_pool,
+    const mlx::core::array& v_pool,
+    const mlx::core::array& k_scale,
+    const mlx::core::array& v_scale,
+    int64_t live_blocks) {
+  bind_pool_plane(encoder, k_pool, 4, live_blocks);
+  bind_pool_plane(encoder, v_pool, 5, live_blocks);
+  bind_pool_plane(encoder, k_scale, 6, live_blocks);
+  bind_pool_plane(encoder, v_scale, 7, live_blocks);
+}
+
 void dispatch_paged_attention_v1_inner(
     mlx::core::metal::CommandEncoder& encoder,
     mlx::core::metal::Device& device,
@@ -1140,6 +1221,7 @@ void dispatch_paged_attention_v1_inner(
     int block_size,
     int max_context_len,
     int max_blocks_per_seq,
+    int64_t live_blocks,
     float scale,
     float softcapping,
     int sliding_window,
@@ -1180,10 +1262,7 @@ void dispatch_paged_attention_v1_inner(
   encoder.set_bytes(dummy_zero, 1);
   encoder.set_output_array(out, 2);
   encoder.set_input_array(q, 3);
-  encoder.set_input_array(k_pool, 4);
-  encoder.set_input_array(v_pool, 5);
-  encoder.set_input_array(k_scale, 6);
-  encoder.set_input_array(v_scale, 7);
+  bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
 
   encoder.set_bytes<int32_t>(num_kv_heads, 8);
   encoder.set_bytes<float>(scale, 9);
@@ -1251,6 +1330,7 @@ void dispatch_paged_attention_v2_inner(
     int block_size,
     int max_context_len,
     int max_blocks_per_seq,
+    int64_t live_blocks,
     float scale,
     float softcapping,
     int sliding_window,
@@ -1277,9 +1357,10 @@ void dispatch_paged_attention_v2_inner(
       (grouped_kind != GroupedPagedAttentionKind::D128Direct || planned_stripes != 0) &&
       grouped_partitions != 0 &&
       grouped_pipelines_supported(
-          device, grouped_kind, num_q_heads, num_kv_heads);
-  // Generic V2 uses contiguous 512-token partitions. The grouped path uses
-  // MLX-style strided stripes and its dedicated second pass.
+          device, grouped_kind, cache_dtype, num_q_heads, num_kv_heads);
+  // Generic V2 uses contiguous 512-token partitions. The bf16 grouped path
+  // uses MLX-style strided stripes, the int8 one contiguous page ranges
+  // (Splash splash_attention_pages_per_split); each has its own second pass.
   const uint32_t max_num_partitions = use_grouped
       ? grouped_partitions
       : (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
@@ -1291,7 +1372,7 @@ void dispatch_paged_attention_v2_inner(
   //   exp_sums:   [num_seqs * num_heads * max_num_partitions] f32
   //   max_logits: same
   //   tmp_out:    [num_seqs * num_heads * max_num_partitions * head_size]
-  //               in io dtype (NOT cache dtype — kernel writes io)
+  //               in io dtype, f32 for an int8 pool
   //
   // We construct them as 1D MLX arrays, allocate via `set_data`, and
   // hand to MLX via `add_temporaries` so their lifetime extends past
@@ -1331,7 +1412,7 @@ void dispatch_paged_attention_v2_inner(
 
   mlx::core::array tmp_out(
       mlx::core::Shape{tmp_out_size},
-      mlx_dtype_for(io_dtype),
+      partial_dtype_for(io_dtype, cache_dtype),
       nullptr,
       {});
   tmp_out.set_data(mlx::core::allocator::malloc(tmp_out.nbytes()));
@@ -1339,7 +1420,7 @@ void dispatch_paged_attention_v2_inner(
   // Stage 1: partitioned attention.
   {
     const std::string& kernel_name = use_grouped
-        ? paged_attention_grouped_kernel_name(grouped_kind)
+        ? paged_attention_grouped_kernel_name(grouped_kind, cache_dtype)
         : paged_attention_v2_kernel_name(
               io_dtype,
               cache_dtype,
@@ -1353,10 +1434,7 @@ void dispatch_paged_attention_v2_inner(
     encoder.set_output_array(max_logits, 1);
     encoder.set_output_array(tmp_out, 2);
     encoder.set_input_array(q, 3);
-    encoder.set_input_array(k_pool, 4);
-    encoder.set_input_array(v_pool, 5);
-    encoder.set_input_array(k_scale, 6);
-    encoder.set_input_array(v_scale, 7);
+    bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
 
     encoder.set_bytes<int32_t>(num_kv_heads, 8);
     encoder.set_bytes<float>(scale, 9);
@@ -1420,8 +1498,9 @@ void dispatch_paged_attention_v2_inner(
   // here, so MLX's dependency tracking fences via `prev_outputs_`.
   {
     const std::string& kernel_name = use_grouped
-        ? paged_attention_grouped_reduce_kernel_name(grouped_kind)
-        : paged_attention_v2_reduce_kernel_name(io_dtype, head_size);
+        ? paged_attention_grouped_reduce_kernel_name(grouped_kind, cache_dtype)
+        : paged_attention_v2_reduce_kernel_name(
+              io_dtype, cache_dtype, head_size);
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);
 
@@ -1484,6 +1563,7 @@ void dispatch_paged_attention_auto(
     int block_size,
     int max_context_len,
     int max_blocks_per_seq,
+    int64_t live_blocks,
     float scale,
     float softcap,
     int sliding_window,
@@ -1538,6 +1618,7 @@ void dispatch_paged_attention_auto(
         block_size,
         max_context_len,
         max_blocks_per_seq,
+        live_blocks,
         scale,
         softcapping,
         sliding_window,
@@ -1563,6 +1644,7 @@ void dispatch_paged_attention_auto(
         block_size,
         max_context_len,
         max_blocks_per_seq,
+        live_blocks,
         scale,
         softcapping,
         sliding_window,
@@ -1599,6 +1681,7 @@ void dispatch_paged_attention_varlen_v1_inner(
     int block_size,
     int max_context_len,
     int max_blocks_per_seq,
+    int64_t live_blocks,
     float scale,
     float softcapping,
     int sliding_window,
@@ -1614,10 +1697,7 @@ void dispatch_paged_attention_varlen_v1_inner(
   encoder.set_bytes(dummy_zero, 1); // max_logits (unused in V1)
   encoder.set_output_array(out, 2);
   encoder.set_input_array(q, 3);
-  encoder.set_input_array(k_pool, 4);
-  encoder.set_input_array(v_pool, 5);
-  encoder.set_input_array(k_scale, 6);
-  encoder.set_input_array(v_scale, 7);
+  bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
 
   encoder.set_bytes<int32_t>(num_kv_heads, 8);
   encoder.set_bytes<float>(scale, 9);
@@ -1680,6 +1760,7 @@ void dispatch_paged_attention_varlen_v2_inner(
     int block_size,
     int max_context_len,
     int max_blocks_per_seq,
+    int64_t live_blocks,
     float scale,
     float softcapping,
     int sliding_window,
@@ -1700,7 +1781,7 @@ void dispatch_paged_attention_varlen_v2_inner(
   const bool use_grouped =
       grouped_kind != GroupedPagedAttentionKind::None &&
       grouped_pipelines_supported(
-          device, grouped_kind, num_q_heads, num_kv_heads);
+          device, grouped_kind, cache_dtype, num_q_heads, num_kv_heads);
   const uint32_t max_num_partitions = use_grouped
       ? grouped_stripe_count(grouped_kind, max_context_len)
       : (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
@@ -1737,7 +1818,7 @@ void dispatch_paged_attention_varlen_v2_inner(
 
   mlx::core::array tmp_out(
       mlx::core::Shape{tmp_out_size},
-      mlx_dtype_for(io_dtype),
+      partial_dtype_for(io_dtype, cache_dtype),
       nullptr,
       {});
   tmp_out.set_data(mlx::core::allocator::malloc(tmp_out.nbytes()));
@@ -1745,7 +1826,7 @@ void dispatch_paged_attention_varlen_v2_inner(
   // Stage 1: partitioned varlen attention.
   {
     const std::string& kernel_name = use_grouped
-        ? paged_attention_grouped_kernel_name(grouped_kind)
+        ? paged_attention_grouped_kernel_name(grouped_kind, cache_dtype)
         : paged_attention_varlen_v2_kernel_name(
               io_dtype,
               cache_dtype,
@@ -1759,10 +1840,7 @@ void dispatch_paged_attention_varlen_v2_inner(
     encoder.set_output_array(max_logits, 1);
     encoder.set_output_array(tmp_out, 2);
     encoder.set_input_array(q, 3);
-    encoder.set_input_array(k_pool, 4);
-    encoder.set_input_array(v_pool, 5);
-    encoder.set_input_array(k_scale, 6);
-    encoder.set_input_array(v_scale, 7);
+    bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
 
     encoder.set_bytes<int32_t>(num_kv_heads, 8);
     encoder.set_bytes<float>(scale, 9);
@@ -1825,8 +1903,9 @@ void dispatch_paged_attention_varlen_v2_inner(
   // Stage 2: reduce partitions.
   {
     const std::string& kernel_name = use_grouped
-        ? paged_attention_grouped_reduce_kernel_name(grouped_kind)
-        : paged_attention_varlen_v2_reduce_kernel_name(io_dtype, head_size);
+        ? paged_attention_grouped_reduce_kernel_name(grouped_kind, cache_dtype)
+        : paged_attention_varlen_v2_reduce_kernel_name(
+              io_dtype, cache_dtype, head_size);
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);
 
@@ -1885,6 +1964,7 @@ void dispatch_paged_attention_varlen_auto(
     int block_size,
     int max_context_len,
     int max_blocks_per_seq,
+    int64_t live_blocks,
     float scale,
     float softcap,
     int sliding_window,
@@ -1932,6 +2012,7 @@ void dispatch_paged_attention_varlen_auto(
         block_size,
         max_context_len,
         max_blocks_per_seq,
+        live_blocks,
         scale,
         softcapping,
         sliding_window,
@@ -1959,6 +2040,7 @@ void dispatch_paged_attention_varlen_auto(
         block_size,
         max_context_len,
         max_blocks_per_seq,
+        live_blocks,
         scale,
         softcapping,
         sliding_window,

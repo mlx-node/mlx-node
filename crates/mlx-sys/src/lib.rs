@@ -1711,6 +1711,23 @@ unsafe extern "C-unwind" {
     /// `kv_dtype_raw` wire value before casting it to the native enum.
     pub fn mlx_paged_attention_varlen_forward_rejects_invalid_kv_dtype() -> i32;
 
+    /// Size commits `dispatches` paged reads cause on a fresh GPU stream
+    /// (`cu_seqlens_q` null = `paged_attention`, else the varlen read).
+    /// `commit_each` ends the command buffer after every read. -1 on error.
+    pub fn mlx_test_paged_attention_commit_count(
+        q: *mut mlx_array,
+        k_pool: *mut mlx_array,
+        v_pool: *mut mlx_array,
+        k_scale: *mut mlx_array,
+        v_scale: *mut mlx_array,
+        block_table: *mut mlx_array,
+        seq_lens: *mut mlx_array,
+        cu_seqlens_q: *mut mlx_array,
+        kv_dtype: u8,
+        dispatches: i32,
+        commit_each: bool,
+    ) -> i64;
+
     /// Returns 1 iff `PagedAttentionVarlen::eval_gpu` rejects a per-sequence
     /// query span larger than the matching `seq_lens` context. Returns -3 when
     /// Metal is unavailable and -1 on test setup errors.
@@ -1747,11 +1764,13 @@ unsafe extern "C-unwind" {
 
     /// Pure shape/threshold guard used to pin the grouped Qwen3.5/3.6 route.
     /// This bypasses the environment escape hatch and GPU capability check.
+    /// `cache_dtype` is the `KvDtype` code (1 Bf16, 3 Int8).
     pub fn mlx_paged_grouped_qwen35_shape_guard_for_test(
         num_q_heads: i32,
         num_kv_heads: i32,
         query_rows: i32,
         max_context_len: i32,
+        cache_dtype: u8,
     ) -> i32;
 
     /// Reset/read the geometry-based grouped D512 route probe.

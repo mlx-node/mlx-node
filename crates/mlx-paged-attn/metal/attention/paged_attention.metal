@@ -558,6 +558,90 @@ template <typename T> inline constexpr bool is_uchar() { return false; }
 // Specialization: T is uchar
 template <> inline constexpr bool is_uchar<uchar>() { return true; }
 
+// ========================================== Int8 (char) vector data types.
+
+struct Char8_ {
+  char4 x;
+  char4 y;
+};
+
+template <> struct Vec<char, 1> {
+  using Type = char;
+};
+template <> struct Vec<char, 2> {
+  using Type = char2;
+};
+template <> struct Vec<char, 4> {
+  using Type = char4;
+};
+template <> struct Vec<char, 8> {
+  using Type = Char8_;
+};
+
+template <typename T> inline constexpr bool is_char() { return false; }
+template <> inline constexpr bool is_char<char>() { return true; }
+
+// |q| <= 127 is exact in bf16; the per-row scales are applied to the score
+// and the probability, never to the element (Splash
+// splash_attention_page_softmax).
+template <typename Vec, typename Quant_vec>
+inline Vec char_to(const thread Quant_vec &);
+
+template <> inline Bfloat4_ char_to<Bfloat4_, char4>(const thread char4 &in) {
+  Bfloat4_ out;
+  out.x.x = bfloat16_t(float(in.x));
+  out.x.y = bfloat16_t(float(in.y));
+  out.y.x = bfloat16_t(float(in.z));
+  out.y.y = bfloat16_t(float(in.w));
+  return out;
+}
+
+template <> inline Bfloat8_ char_to<Bfloat8_, Char8_>(const thread Char8_ &in) {
+  Bfloat8_ out;
+  out.x = char_to<Bfloat4_, char4>(in.x);
+  out.y = char_to<Bfloat4_, char4>(in.y);
+  return out;
+}
+
+// v2 partials of an int8 instance are f32 (Splash splash_paged_attention_tile
+// stores float partials); every other instance writes its io type.
+template <typename T, typename CACHE_T, bool PARTIAL> struct PagedOut {
+  using Type = T;
+};
+template <typename T> struct PagedOut<T, char, true> {
+  using Type = float;
+};
+
+// Splash splash_attention_combine_splits: the maximum over the written
+// partitions, then numerator and denominator accumulated in partition order
+// (a parallel denominator sum changes speculative acceptance), one bf16
+// rounding. `weights` holds `count` floats.
+template <int HEAD_SIZE>
+inline void combine_int8_partitions(device bfloat16_t *out,
+                                    const device float *sums,
+                                    const device float *maxima,
+                                    const device float *partials, int count,
+                                    int thread_idx, int num_threads,
+                                    threadgroup float *weights) {
+  float maximum = -INFINITY;
+  for (int p = 0; p < count; ++p) {
+    maximum = max(maximum, maxima[p]);
+  }
+  for (int p = thread_idx; p < count; p += num_threads) {
+    weights[p] = fast::exp(maxima[p] - maximum);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = thread_idx; i < HEAD_SIZE; i += num_threads) {
+    float numerator = 0.0f;
+    float denominator = 0.0f;
+    for (int p = 0; p < count; ++p) {
+      numerator += weights[p] * partials[p * HEAD_SIZE + i];
+      denominator += weights[p] * sums[p];
+    }
+    out[i] = bfloat16_t(denominator > 0.0f ? numerator / denominator : 0.0f);
+  }
+}
+
 // Generic fallback – will fail to compile if a required specialisation is
 // missing.
 template <typename Vec, typename Quant_vec>
@@ -766,7 +850,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     device float *max_logits
     [[buffer(1)]], // [num_seqs, num_heads, max_num_partitions] - only used when
                    // use_partitioning
-    device T *out
+    device typename PagedOut<T, CACHE_T, (PARTITION_SIZE > 0)>::Type *out
     [[buffer(2)]], // [num_seqs, num_heads, max_num_partitions, head_size]
     device const T *q [[buffer(3)]], // [num_seqs, num_heads, head_size]
     device const CACHE_T *k_cache
@@ -928,6 +1012,10 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
           Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
               k_ptr + offset1 * BLOCK_SIZE * x + offset2);
           k_vecs[j] = fp8_convert<K_vec, Quant_vec>(k_vec_quant, *k_scale);
+        } else if constexpr (is_char<CACHE_T>()) {
+          Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
+              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+          k_vecs[j] = char_to<K_vec, Quant_vec>(k_vec_quant);
         } else {
           // Non-FP8 default
           k_vecs[j] = *reinterpret_cast<const device K_vec *>(
@@ -937,8 +1025,19 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 
       // Compute dot product.
       // This includes a reduction across the threads in the same thread group.
-      float qk = scale * Qk_dot<T, THREAD_GROUP_SIZE>::dot(
-                             q_vecs[thread_group_offset], k_vecs);
+      float qk;
+      if constexpr (is_char<CACHE_T>()) {
+        // Splash splash_attention_page_softmax: the key scale, then Scale.
+        qk = Qk_dot<T, THREAD_GROUP_SIZE>::dot(q_vecs[thread_group_offset],
+                                               k_vecs);
+        qk *= k_scale[(physical_block_number * num_kv_heads + kv_head_idx) *
+                          BLOCK_SIZE +
+                      physical_block_offset];
+        qk *= scale;
+      } else {
+        qk = scale * Qk_dot<T, THREAD_GROUP_SIZE>::dot(
+                         q_vecs[thread_group_offset], k_vecs);
+      }
 
       // Apply softcapping
       if (softcapping != 1.0) {
@@ -1034,9 +1133,13 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
                                                  simd_tid, simd_lid);
 
   // Compute softmax.
-  const float inv_sum = divide(1.f, exp_sum + 1e-6f);
-  for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
-    logits[i] *= inv_sum;
+  // Int8 keeps p unnormalized and divides once at the end (Splash
+  // splash_attention_combine_splits).
+  if constexpr (!is_char<CACHE_T>()) {
+    const float inv_sum = divide(1.f, exp_sum + 1e-6f);
+    for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
+      logits[i] *= inv_sum;
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1086,6 +1189,24 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     L_vec logits_vec;
     Float_L_vec logits_float_vec = *reinterpret_cast<threadgroup Float_L_vec *>(
         logits + token_idx - start_token_idx);
+    if constexpr (is_char<CACHE_T>()) {
+      // Splash splash_attention_page_softmax: P = bf16(p * value scale), and
+      // masked tokens stay exactly zero whatever their stored scale holds.
+      const int limit = int(context_len);
+      const int lower = (sliding_window > 0 && limit > sliding_window)
+                            ? limit - sliding_window
+                            : 0;
+      const device float *value_scales =
+          v_scale +
+          (physical_block_number * num_kv_heads + kv_head_idx) * BLOCK_SIZE +
+          physical_block_offset;
+      thread float *p = reinterpret_cast<thread float *>(&logits_float_vec);
+#pragma unroll
+      for (int j = 0; j < V_VEC_SIZE; j++) {
+        const bool valid = token_idx + j < limit && token_idx + j >= lower;
+        p[j] = valid ? p[j] * value_scales[j] : 0.0f;
+      }
+    }
     from_float(logits_vec, logits_float_vec);
 
     const device CACHE_T *v_ptr = v_cache + physical_block_number * kv_block_stride +
@@ -1106,6 +1227,10 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
           V_quant_vec v_quant_vec =
               *reinterpret_cast<const device V_quant_vec *>(v_ptr + offset);
           v_vec = fp8_convert<V_vec, V_quant_vec>(v_quant_vec, *v_scale);
+        } else if constexpr (is_char<CACHE_T>()) {
+          V_quant_vec v_quant_vec =
+              *reinterpret_cast<const device V_quant_vec *>(v_ptr + offset);
+          v_vec = char_to<V_vec, V_quant_vec>(v_quant_vec);
         } else {
           // Non-FP8 default
           v_vec = *reinterpret_cast<const device V_vec *>(v_ptr + offset);
@@ -1119,7 +1244,12 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
                 token_idx + j < context_len ? v_vec_ptr[j] : zero_value;
           }
         }
-        accs[i] += dot(logits_vec, v_vec);
+        if constexpr (is_char<CACHE_T>()) {
+          // f32 products (Splash multiply_accumulate into a float tile).
+          accs[i] += dot<Float_L_vec>(logits_vec, v_vec);
+        } else {
+          accs[i] += dot(logits_vec, v_vec);
+        }
       }
     }
   }
@@ -1174,14 +1304,20 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 
   // Write the final output.
   if (warp_idx == 0) {
-    device T *out_ptr =
+    using Out_T = typename PagedOut<T, CACHE_T, USE_PARTITIONING>::Type;
+    device Out_T *out_ptr =
         out + seq_idx * num_heads * max_num_partitions * HEAD_SIZE +
         head_idx * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
 #pragma unroll
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
       const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
       if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
-        *(out_ptr + row_idx) = T(accs[i]);
+        if constexpr (is_char<CACHE_T>() && !USE_PARTITIONING) {
+          *(out_ptr + row_idx) =
+              Out_T(exp_sum > 0.0f ? accs[i] / exp_sum : 0.0f);
+        } else {
+          *(out_ptr + row_idx) = Out_T(accs[i]);
+        }
       }
     }
   }
@@ -1813,7 +1949,8 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 [[kernel]] void paged_attention_varlen(
     device float *exp_sums [[buffer(0)]],
     device float *max_logits [[buffer(1)]],
-    device T *out [[buffer(2)]],
+    device typename PagedOut<T, CACHE_T, (PARTITION_SIZE > 0)>::Type *out
+    [[buffer(2)]],
     // Q is now ragged: [total_num_queries, num_heads, head_size].
     device const T *q [[buffer(3)]],
     device const CACHE_T *k_cache [[buffer(4)]],
@@ -1964,14 +2101,29 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
           Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
               k_ptr + offset1 * BLOCK_SIZE * x + offset2);
           k_vecs[j] = fp8_convert<K_vec, Quant_vec>(k_vec_quant, *k_scale);
+        } else if constexpr (is_char<CACHE_T>()) {
+          Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
+              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
+          k_vecs[j] = char_to<K_vec, Quant_vec>(k_vec_quant);
         } else {
           k_vecs[j] = *reinterpret_cast<const device K_vec *>(
               k_ptr + offset1 * BLOCK_SIZE * x + offset2);
         }
       }
 
-      float qk = scale * Qk_dot<T, THREAD_GROUP_SIZE>::dot(
-                             q_vecs[thread_group_offset], k_vecs);
+      float qk;
+      if constexpr (is_char<CACHE_T>()) {
+        // Splash splash_attention_page_softmax: the key scale, then Scale.
+        qk = Qk_dot<T, THREAD_GROUP_SIZE>::dot(q_vecs[thread_group_offset],
+                                               k_vecs);
+        qk *= k_scale[(physical_block_number * num_kv_heads + kv_head_idx) *
+                          BLOCK_SIZE +
+                      physical_block_offset];
+        qk *= scale;
+      } else {
+        qk = scale * Qk_dot<T, THREAD_GROUP_SIZE>::dot(
+                         q_vecs[thread_group_offset], k_vecs);
+      }
 
       if (softcapping != 1.0) {
         qk = precise::tanh(qk / softcapping) * softcapping;
@@ -2047,9 +2199,13 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   exp_sum = block_sum<NUM_WARPS, NUM_SIMD_LANES>(&red_smem[NUM_WARPS], exp_sum,
                                                  simd_tid, simd_lid);
 
-  const float inv_sum = divide(1.f, exp_sum + 1e-6f);
-  for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
-    logits[i] *= inv_sum;
+  // Int8 keeps p unnormalized and divides once at the end (Splash
+  // splash_attention_combine_splits).
+  if constexpr (!is_char<CACHE_T>()) {
+    const float inv_sum = divide(1.f, exp_sum + 1e-6f);
+    for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
+      logits[i] *= inv_sum;
+    }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -2095,6 +2251,24 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     L_vec logits_vec;
     Float_L_vec logits_float_vec = *reinterpret_cast<threadgroup Float_L_vec *>(
         logits + token_idx - start_token_idx);
+    if constexpr (is_char<CACHE_T>()) {
+      // Splash splash_attention_page_softmax: P = bf16(p * value scale), and
+      // masked tokens stay exactly zero whatever their stored scale holds.
+      const int limit = effective_context_len;
+      const int lower = (sliding_window > 0 && limit > sliding_window)
+                            ? limit - sliding_window
+                            : 0;
+      const device float *value_scales =
+          v_scale +
+          (physical_block_number * num_kv_heads + kv_head_idx) * BLOCK_SIZE +
+          physical_block_offset;
+      thread float *p = reinterpret_cast<thread float *>(&logits_float_vec);
+#pragma unroll
+      for (int j = 0; j < V_VEC_SIZE; j++) {
+        const bool valid = token_idx + j < limit && token_idx + j >= lower;
+        p[j] = valid ? p[j] * value_scales[j] : 0.0f;
+      }
+    }
     from_float(logits_vec, logits_float_vec);
 
     const device CACHE_T *v_ptr = v_cache + physical_block_number * kv_block_stride +
@@ -2110,6 +2284,10 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
           V_quant_vec v_quant_vec =
               *reinterpret_cast<const device V_quant_vec *>(v_ptr + offset);
           v_vec = fp8_convert<V_vec, V_quant_vec>(v_quant_vec, *v_scale);
+        } else if constexpr (is_char<CACHE_T>()) {
+          V_quant_vec v_quant_vec =
+              *reinterpret_cast<const device V_quant_vec *>(v_ptr + offset);
+          v_vec = char_to<V_vec, V_quant_vec>(v_quant_vec);
         } else {
           v_vec = *reinterpret_cast<const device V_vec *>(v_ptr + offset);
         }
@@ -2123,7 +2301,12 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
                 token_idx + j < effective_context_len ? v_vec_ptr[j] : zero_value;
           }
         }
-        accs[i] += dot(logits_vec, v_vec);
+        if constexpr (is_char<CACHE_T>()) {
+          // f32 products (Splash multiply_accumulate into a float tile).
+          accs[i] += dot<Float_L_vec>(logits_vec, v_vec);
+        } else {
+          accs[i] += dot(logits_vec, v_vec);
+        }
       }
     }
   }
@@ -2172,14 +2355,20 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 
   // Output indexed by q_token_idx (not seq_idx).
   if (warp_idx == 0) {
-    device T *out_ptr =
+    using Out_T = typename PagedOut<T, CACHE_T, USE_PARTITIONING>::Type;
+    device Out_T *out_ptr =
         out + q_token_idx * num_heads * max_num_partitions * HEAD_SIZE +
         head_idx * max_num_partitions * HEAD_SIZE + partition_idx * HEAD_SIZE;
 #pragma unroll
     for (int i = 0; i < NUM_ROWS_PER_THREAD; i++) {
       const int row_idx = lane / NUM_V_VECS_PER_ROW + i * NUM_ROWS_PER_ITER;
       if (row_idx < HEAD_SIZE && lane % NUM_V_VECS_PER_ROW == 0) {
-        *(out_ptr + row_idx) = T(accs[i]);
+        if constexpr (is_char<CACHE_T>() && !USE_PARTITIONING) {
+          *(out_ptr + row_idx) =
+              Out_T(exp_sum > 0.0f ? accs[i] / exp_sum : 0.0f);
+        } else {
+          *(out_ptr + row_idx) = Out_T(accs[i]);
+        }
       }
     }
   }
@@ -2656,3 +2845,425 @@ instantiate_paged_attention_varlen_v2(half, half, 32);
 instantiate_paged_attention_varlen_v2(float, uchar, 32);
 instantiate_paged_attention_varlen_v2(bfloat16_t, uchar, 32);
 instantiate_paged_attention_varlen_v2(half, uchar, 32);
+
+// ============================================================================
+// Int8 pools: K char [nb, H, D/16, bs, 16], V char [nb, H, D, bs], key and
+// value scales f32 [nb, H, bs] at (block * H + head) * bs + token (Splash
+// splash_q8_scale_index). Generic v1 / v2 / varlen instances read them
+// through the is_char branches above; the reducers and the grouped D256
+// kernel below are int8-only.
+// ============================================================================
+
+template <int HEAD_SIZE, int NUM_THREADS, int PARTITION_SIZE>
+[[kernel]] void paged_attention_v2_reduce_int8(
+    device bfloat16_t *out [[buffer(0)]],
+    const device float *exp_sums [[buffer(1)]],
+    const device float *max_logits [[buffer(2)]],
+    const device float *tmp_out [[buffer(3)]],
+    device uint32_t *context_lens [[buffer(4)]],
+    const constant int &max_num_partitions [[buffer(5)]],
+    threadgroup char *shared_mem [[threadgroup(0)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]]) {
+  const int num_heads = threadgroups_per_grid.x;
+  const int head_idx = threadgroup_position_in_grid.x;
+  const int seq_idx = threadgroup_position_in_grid.y;
+  const int count = DIVIDE_ROUND_UP(int(context_lens[seq_idx]), PARTITION_SIZE);
+  const int row = seq_idx * num_heads + head_idx;
+  combine_int8_partitions<HEAD_SIZE>(
+      out + row * HEAD_SIZE, exp_sums + row * max_num_partitions,
+      max_logits + row * max_num_partitions,
+      tmp_out + row * max_num_partitions * HEAD_SIZE, count,
+      int(thread_position_in_threadgroup.x), NUM_THREADS,
+      reinterpret_cast<threadgroup float *>(shared_mem));
+}
+
+template <int HEAD_SIZE, int NUM_THREADS, int PARTITION_SIZE>
+[[kernel]] void paged_attention_varlen_v2_reduce_int8(
+    device bfloat16_t *out [[buffer(0)]],
+    const device float *exp_sums [[buffer(1)]],
+    const device float *max_logits [[buffer(2)]],
+    const device float *tmp_out [[buffer(3)]],
+    device uint32_t *context_lens [[buffer(4)]],
+    const constant int &max_num_partitions [[buffer(5)]],
+    device const int32_t *cu_seqlens_q [[buffer(6)]],
+    const constant int &num_seqs [[buffer(7)]],
+    threadgroup char *shared_mem [[threadgroup(0)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]]) {
+  const int num_heads = threadgroups_per_grid.x;
+  const int head_idx = threadgroup_position_in_grid.x;
+  const int q_token_idx = threadgroup_position_in_grid.y;
+  const int seq_idx = find_seq_idx_varlen(cu_seqlens_q, q_token_idx, num_seqs);
+  const int q_seq_start = cu_seqlens_q[seq_idx];
+  const int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
+  const int effective_context_len =
+      int(context_lens[seq_idx]) - q_len + (q_token_idx - q_seq_start) + 1;
+  if (effective_context_len <= 0) {
+    return;
+  }
+  const int count = DIVIDE_ROUND_UP(effective_context_len, PARTITION_SIZE);
+  const int row = q_token_idx * num_heads + head_idx;
+  combine_int8_partitions<HEAD_SIZE>(
+      out + row * HEAD_SIZE, exp_sums + row * max_num_partitions,
+      max_logits + row * max_num_partitions,
+      tmp_out + row * max_num_partitions * HEAD_SIZE, count,
+      int(thread_position_in_threadgroup.x), NUM_THREADS,
+      reinterpret_cast<threadgroup float *>(shared_mem));
+}
+
+// The grouped GQA geometry of paged_attention_grouped_bfloat16_bs16_striped
+// over an int8 pool: one SIMD per (query row, query head), two lanes per
+// token, each lane half the head in 16-byte packs. Each stripe walks one
+// contiguous page range (Splash splash_attention_pages_per_split) and
+// writes an f32 numerator with its {max, sum}.
+template <int HEAD_SIZE>
+[[kernel]] void paged_attention_grouped_int8_bs16_striped(
+    device float *exp_sums [[buffer(0)]],
+    device float *max_logits [[buffer(1)]],
+    device float *tmp_out [[buffer(2)]],
+    device const bfloat16_t *q [[buffer(3)]],
+    device const char *k_cache [[buffer(4)]],
+    device const char *v_cache [[buffer(5)]],
+    const device float *__restrict__ k_scale [[buffer(6)]],
+    const device float *__restrict__ v_scale [[buffer(7)]],
+    const constant int &num_kv_heads [[buffer(8)]],
+    const constant float &scale [[buffer(9)]],
+    const constant float &softcapping [[buffer(10)]],
+    device const uint32_t *block_tables [[buffer(11)]],
+    device const uint32_t *context_lens [[buffer(12)]],
+    const constant int &max_num_blocks_per_seq [[buffer(13)]],
+    device const float *alibi_slopes [[buffer(14)]],
+    const constant int &q_stride [[buffer(15)]],
+    const constant int &kv_block_stride [[buffer(16)]],
+    const constant int &kv_head_stride [[buffer(17)]],
+    const constant int &sliding_window [[buffer(18)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint3 threads_per_threadgroup [[threads_per_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+  constexpr int BLOCK_SIZE = 16;
+  constexpr int PACKS_PER_HALF_HEAD = HEAD_SIZE / 16 / 2;
+  constexpr int OUTPUTS_PER_LANE = HEAD_SIZE / 32;
+
+  const int kv_head_idx = int(threadgroup_position_in_grid.x);
+  const int seq_idx = 0;
+  const int stripe_idx = int(threadgroup_position_in_grid.z);
+  const int num_stripes = int(threadgroups_per_grid.z);
+  const int local_q_head = int(thread_position_in_threadgroup.y);
+  const int q_pos_in_seq = int(threadgroup_position_in_grid.y);
+  const int q_len = int(threadgroups_per_grid.y);
+  const int lane = int(thread_position_in_threadgroup.x);
+  const int gqa_factor = int(threads_per_threadgroup.y);
+  const int head_idx = kv_head_idx * gqa_factor + local_q_head;
+  const int num_heads = q_stride / HEAD_SIZE;
+
+  const uint32_t context_len = context_lens[seq_idx];
+  const int effective_context_len =
+      int(context_len) - q_len + q_pos_in_seq + 1;
+  const int sliding_lower =
+      (sliding_window > 0 && effective_context_len > sliding_window)
+          ? (effective_context_len - sliding_window)
+          : 0;
+  const int q_token_idx = q_pos_in_seq;
+  const device bfloat16_t *q_ptr =
+      q + q_token_idx * q_stride + head_idx * HEAD_SIZE;
+
+  float acc[OUTPUTS_PER_LANE];
+#pragma unroll
+  for (int i = 0; i < OUTPUTS_PER_LANE; ++i) {
+    acc[i] = 0.0f;
+  }
+  float running_max = -FLT_MAX;
+  float running_sum = 0.0f;
+  const device uint32_t *block_table =
+      block_tables + seq_idx * max_num_blocks_per_seq;
+
+  const int token_in_block = lane / 2;
+  const int half_head = lane & 1;
+  const int num_context_blocks =
+      DIVIDE_ROUND_UP(int(context_len), BLOCK_SIZE);
+  const int per_stripe = DIVIDE_ROUND_UP(num_context_blocks, num_stripes);
+  const int first_block = stripe_idx * per_stripe;
+  const int end_block = min(first_block + per_stripe, num_context_blocks);
+
+  for (int logical_block = first_block; logical_block < end_block;
+       ++logical_block) {
+    const int block_start_token = logical_block * BLOCK_SIZE;
+    if (block_start_token + BLOCK_SIZE <= sliding_lower) {
+      continue;
+    }
+    const int64_t physical_block =
+        static_cast<int64_t>(block_table[logical_block]);
+    const int64_t scale_base =
+        (physical_block * num_kv_heads + kv_head_idx) * BLOCK_SIZE;
+    const device char *k_block = k_cache +
+        physical_block * int64_t(kv_block_stride) +
+        kv_head_idx * kv_head_stride;
+    float partial = 0.0f;
+#pragma unroll
+    for (int pack = 0; pack < PACKS_PER_HALF_HEAD; ++pack) {
+      const int head_pack = half_head * PACKS_PER_HALF_HEAD + pack;
+      const device bfloat16_t *q_pack = q_ptr + head_pack * 16;
+      const device char *k_pack =
+          k_block + (head_pack * BLOCK_SIZE + token_in_block) * 16;
+      const Char8_ k0 = *reinterpret_cast<const device Char8_ *>(k_pack);
+      const Char8_ k1 = *reinterpret_cast<const device Char8_ *>(k_pack + 8);
+      partial += sum(mul<Float8_, Bfloat8_, Bfloat8_>(
+          *reinterpret_cast<const device Bfloat8_ *>(q_pack),
+          char_to<Bfloat8_, Char8_>(k0)));
+      partial += sum(mul<Float8_, Bfloat8_, Bfloat8_>(
+          *reinterpret_cast<const device Bfloat8_ *>(q_pack + 8),
+          char_to<Bfloat8_, Char8_>(k1)));
+    }
+    // Splash splash_attention_page_softmax: the key scale, then Scale.
+    float score = partial + simd_shuffle_xor(partial, 1);
+    score *= k_scale[scale_base + token_in_block];
+    score *= scale;
+    if (softcapping != 1.0f) {
+      score = precise::tanh(score / softcapping) * softcapping;
+    }
+
+    const int token_idx = block_start_token + token_in_block;
+    const bool valid =
+        token_idx < effective_context_len && token_idx >= sliding_lower;
+    const float owned_score = ((lane & 1) == 0 && valid) ? score : -FLT_MAX;
+    const float block_max = simd_max(owned_score);
+    const float new_max = max(running_max, block_max);
+    const float old_factor =
+        running_sum > 0.0f ? fast::exp(running_max - new_max) : 0.0f;
+    const float owned_weight =
+        ((lane & 1) == 0 && valid) ? fast::exp(score - new_max) : 0.0f;
+    const float block_sum = simd_sum(owned_weight);
+
+    // P = bf16(p * value scale); masked tokens stay exactly zero whatever
+    // their stored scale holds.
+    const device float *value_scales = v_scale + scale_base;
+    float weights[BLOCK_SIZE];
+#pragma unroll
+    for (int token = 0; token < BLOCK_SIZE; ++token) {
+      const float p = simd_shuffle(owned_weight, token * 2);
+      const int t = block_start_token + token;
+      const bool token_valid = t < effective_context_len && t >= sliding_lower;
+      weights[token] = token_valid ? p * value_scales[token] : 0.0f;
+    }
+    Float8_ weights0;
+    weights0.x = float4(weights[0], weights[1], weights[2], weights[3]);
+    weights0.y = float4(weights[4], weights[5], weights[6], weights[7]);
+    Float8_ weights1;
+    weights1.x = float4(weights[8], weights[9], weights[10], weights[11]);
+    weights1.y = float4(weights[12], weights[13], weights[14], weights[15]);
+    Bfloat8_ p0;
+    Bfloat8_ p1;
+    from_float(p0, weights0);
+    from_float(p1, weights1);
+
+    const device char *v_block = v_cache +
+        physical_block * int64_t(kv_block_stride) +
+        kv_head_idx * kv_head_stride;
+#pragma unroll
+    for (int i = 0; i < OUTPUTS_PER_LANE; ++i) {
+      const int dim = lane * OUTPUTS_PER_LANE + i;
+      const device char *v_row = v_block + dim * BLOCK_SIZE;
+      const Char8_ v0 = *reinterpret_cast<const device Char8_ *>(v_row);
+      const Char8_ v1 = *reinterpret_cast<const device Char8_ *>(v_row + 8);
+      const Bfloat8_ values0 = char_to<Bfloat8_, Char8_>(v0);
+      const Bfloat8_ values1 = char_to<Bfloat8_, Char8_>(v1);
+      const float block_acc =
+          sum(mul<Float8_, Bfloat8_, Bfloat8_>(p0, values0)) +
+          sum(mul<Float8_, Bfloat8_, Bfloat8_>(p1, values1));
+      acc[i] = acc[i] * old_factor + block_acc;
+    }
+    running_max = new_max;
+    running_sum = running_sum * old_factor + block_sum;
+  }
+
+  const int row = q_token_idx * num_heads + head_idx;
+  const int stats_offset = row * num_stripes + stripe_idx;
+  if (simd_lid == 0) {
+    exp_sums[stats_offset] = running_sum;
+    max_logits[stats_offset] = running_max;
+  }
+  device float *out_ptr =
+      tmp_out + stats_offset * HEAD_SIZE + lane * OUTPUTS_PER_LANE;
+#pragma unroll
+  for (int i = 0; i < OUTPUTS_PER_LANE; ++i) {
+    out_ptr[i] = acc[i];
+  }
+  (void)alibi_slopes;
+}
+
+template <int HEAD_SIZE>
+[[kernel]] void paged_attention_grouped_int8_striped_reduce(
+    device bfloat16_t *out [[buffer(0)]],
+    const device float *exp_sums [[buffer(1)]],
+    const device float *max_logits [[buffer(2)]],
+    const device float *partials [[buffer(3)]],
+    device const uint32_t *context_lens [[buffer(4)]],
+    const constant int &num_stripes [[buffer(5)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint3 threads_per_threadgroup [[threads_per_threadgroup]]) {
+  // The dispatch caps stripes at 1024.
+  threadgroup float weights[1024];
+  const int head_idx = int(threadgroup_position_in_grid.x);
+  const int q_pos = int(threadgroup_position_in_grid.y);
+  const int num_heads = int(threadgroups_per_grid.x);
+  const int row = q_pos * num_heads + head_idx;
+  combine_int8_partitions<HEAD_SIZE>(
+      out + row * HEAD_SIZE, exp_sums + row * num_stripes,
+      max_logits + row * num_stripes, partials + row * num_stripes * HEAD_SIZE,
+      num_stripes, int(thread_position_in_threadgroup.x),
+      int(threads_per_threadgroup.x), weights);
+  (void)context_lens;
+}
+
+#define instantiate_paged_attention_int8(out_type, head_size, block_size,     \
+                                         partition_size)                      \
+  template [[host_name("paged_attention_bfloat16_t_cache_char_hs" #head_size  \
+                       "_bs" #block_size "_nt256_nsl32_ps" #partition_size)]] \
+  [[kernel]] void paged_attention<bfloat16_t, char, head_size, block_size,    \
+                                  256, 32, partition_size, false>(            \
+      device float *exp_sums [[buffer(0)]],                                   \
+      device float *max_logits [[buffer(1)]],                                 \
+      device out_type *out [[buffer(2)]],                                     \
+      device const bfloat16_t *q [[buffer(3)]],                               \
+      device const char *k_cache [[buffer(4)]],                               \
+      device const char *v_cache [[buffer(5)]],                               \
+      const device float *__restrict__ k_scale [[buffer(6)]],                 \
+      const device float *__restrict__ v_scale [[buffer(7)]],                 \
+      const constant int &num_kv_heads [[buffer(8)]],                         \
+      const constant float &scale [[buffer(9)]],                              \
+      const constant float &softcapping [[buffer(10)]],                       \
+      device const uint32_t *block_tables [[buffer(11)]],                     \
+      device const uint32_t *context_lens [[buffer(12)]],                     \
+      const constant int &max_num_blocks_per_seq [[buffer(13)]],              \
+      device const float *alibi_slopes [[buffer(14)]],                        \
+      const constant int &q_stride [[buffer(15)]],                            \
+      const constant int &kv_block_stride [[buffer(16)]],                     \
+      const constant int &kv_head_stride [[buffer(17)]],                      \
+      const constant int &sliding_window [[buffer(18)]],                      \
+      threadgroup char *shared_mem [[threadgroup(0)]],                        \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],    \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                  \
+      uint3 thread_position_in_threadgroup                                    \
+          [[thread_position_in_threadgroup]],                                 \
+      uint simd_tid [[simdgroup_index_in_threadgroup]],                       \
+      uint simd_lid [[thread_index_in_simdgroup]]);                           \
+  template [[host_name("paged_attention_varlen_bfloat16_t_cache_char_hs"      \
+                       #head_size "_bs" #block_size                           \
+                       "_nt256_nsl32_ps" #partition_size)]]                   \
+  [[kernel]] void paged_attention_varlen<bfloat16_t, char, head_size,         \
+                                         block_size, 256, 32,                 \
+                                         partition_size, false>(              \
+      device float *exp_sums [[buffer(0)]],                                   \
+      device float *max_logits [[buffer(1)]],                                 \
+      device out_type *out [[buffer(2)]],                                     \
+      device const bfloat16_t *q [[buffer(3)]],                               \
+      device const char *k_cache [[buffer(4)]],                               \
+      device const char *v_cache [[buffer(5)]],                               \
+      const device float *__restrict__ k_scale [[buffer(6)]],                 \
+      const device float *__restrict__ v_scale [[buffer(7)]],                 \
+      const constant int &num_kv_heads [[buffer(8)]],                         \
+      const constant float &scale [[buffer(9)]],                              \
+      const constant float &softcapping [[buffer(10)]],                       \
+      device const uint32_t *block_tables [[buffer(11)]],                     \
+      device const uint32_t *context_lens [[buffer(12)]],                     \
+      const constant int &max_num_blocks_per_seq [[buffer(13)]],              \
+      device const float *alibi_slopes [[buffer(14)]],                        \
+      const constant int &q_stride [[buffer(15)]],                            \
+      const constant int &kv_block_stride [[buffer(16)]],                     \
+      const constant int &kv_head_stride [[buffer(17)]],                      \
+      const constant int &sliding_window [[buffer(18)]],                      \
+      device const int32_t *cu_seqlens_q [[buffer(19)]],                      \
+      const constant int &num_seqs [[buffer(20)]],                            \
+      threadgroup char *shared_mem [[threadgroup(0)]],                        \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],    \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                  \
+      uint3 thread_position_in_threadgroup                                    \
+          [[thread_position_in_threadgroup]],                                 \
+      uint simd_tid [[simdgroup_index_in_threadgroup]],                       \
+      uint simd_lid [[thread_index_in_simdgroup]]);
+
+#define instantiate_paged_attention_int8_heads(head_size)                     \
+  instantiate_paged_attention_int8(bfloat16_t, head_size, 16, 0);             \
+  instantiate_paged_attention_int8(float, head_size, 16, 512);                \
+  instantiate_paged_attention_int8(bfloat16_t, head_size, 32, 0);             \
+  instantiate_paged_attention_int8(float, head_size, 32, 512);                \
+  template [[host_name("paged_attention_v2_reduce_int8_hs" #head_size         \
+                       "_nt256_nsl32_ps512")]] [[kernel]] void                \
+  paged_attention_v2_reduce_int8<head_size, 256, 512>(                        \
+      device bfloat16_t *out [[buffer(0)]],                                   \
+      const device float *exp_sums [[buffer(1)]],                             \
+      const device float *max_logits [[buffer(2)]],                           \
+      const device float *tmp_out [[buffer(3)]],                              \
+      device uint32_t *context_lens [[buffer(4)]],                            \
+      const constant int &max_num_partitions [[buffer(5)]],                   \
+      threadgroup char *shared_mem [[threadgroup(0)]],                        \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],    \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                  \
+      uint3 thread_position_in_threadgroup                                    \
+          [[thread_position_in_threadgroup]]);                                \
+  template [[host_name("paged_attention_varlen_v2_reduce_int8_hs" #head_size  \
+                       "_nt256_nsl32_ps512")]] [[kernel]] void                \
+  paged_attention_varlen_v2_reduce_int8<head_size, 256, 512>(                 \
+      device bfloat16_t *out [[buffer(0)]],                                   \
+      const device float *exp_sums [[buffer(1)]],                             \
+      const device float *max_logits [[buffer(2)]],                           \
+      const device float *tmp_out [[buffer(3)]],                              \
+      device uint32_t *context_lens [[buffer(4)]],                            \
+      const constant int &max_num_partitions [[buffer(5)]],                   \
+      device const int32_t *cu_seqlens_q [[buffer(6)]],                       \
+      const constant int &num_seqs [[buffer(7)]],                             \
+      threadgroup char *shared_mem [[threadgroup(0)]],                        \
+      uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],    \
+      uint3 threadgroups_per_grid [[threadgroups_per_grid]],                  \
+      uint3 thread_position_in_threadgroup                                    \
+          [[thread_position_in_threadgroup]]);
+
+instantiate_paged_attention_int8_heads(128);
+instantiate_paged_attention_int8_heads(256);
+
+template [[host_name("paged_attention_grouped_int8_hs256_bs16_striped")]]
+[[kernel]] void paged_attention_grouped_int8_bs16_striped<256>(
+    device float *exp_sums [[buffer(0)]],
+    device float *max_logits [[buffer(1)]],
+    device float *tmp_out [[buffer(2)]],
+    device const bfloat16_t *q [[buffer(3)]],
+    device const char *k_cache [[buffer(4)]],
+    device const char *v_cache [[buffer(5)]],
+    const device float *__restrict__ k_scale [[buffer(6)]],
+    const device float *__restrict__ v_scale [[buffer(7)]],
+    const constant int &num_kv_heads [[buffer(8)]],
+    const constant float &scale [[buffer(9)]],
+    const constant float &softcapping [[buffer(10)]],
+    device const uint32_t *block_tables [[buffer(11)]],
+    device const uint32_t *context_lens [[buffer(12)]],
+    const constant int &max_num_blocks_per_seq [[buffer(13)]],
+    device const float *alibi_slopes [[buffer(14)]],
+    const constant int &q_stride [[buffer(15)]],
+    const constant int &kv_block_stride [[buffer(16)]],
+    const constant int &kv_head_stride [[buffer(17)]],
+    const constant int &sliding_window [[buffer(18)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint3 threads_per_threadgroup [[threads_per_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]);
+
+template [[host_name("paged_attention_grouped_int8_hs256_striped_reduce")]]
+[[kernel]] void paged_attention_grouped_int8_striped_reduce<256>(
+    device bfloat16_t *out [[buffer(0)]],
+    const device float *exp_sums [[buffer(1)]],
+    const device float *max_logits [[buffer(2)]],
+    const device float *partials [[buffer(3)]],
+    device const uint32_t *context_lens [[buffer(4)]],
+    const constant int &num_stripes [[buffer(5)]],
+    uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
+    uint3 threadgroups_per_grid [[threadgroups_per_grid]],
+    uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
+    uint3 threads_per_threadgroup [[threads_per_threadgroup]]);

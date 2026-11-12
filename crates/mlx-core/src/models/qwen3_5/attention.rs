@@ -363,6 +363,19 @@ fn cache_hit_prefill_mode() -> CacheHitPrefillMode {
     })
 }
 
+/// An int8 pool always takes the varlen kernel: Splash reads int8 pages in
+/// place (`prefill_attention_q8_split*`) and has no dequantizing gather route.
+fn cache_hit_prefill_mode_for_pool(
+    configured: CacheHitPrefillMode,
+    int8_pool: bool,
+) -> CacheHitPrefillMode {
+    if int8_pool {
+        CacheHitPrefillMode::ForcePaged
+    } else {
+        configured
+    }
+}
+
 fn should_probe_cache_hit_prefill_memory(
     mode: CacheHitPrefillMode,
     query_tokens: i64,
@@ -1666,7 +1679,10 @@ impl Qwen3_5Attention {
                     dtype_bytes,
                 );
                 let varlen_aux_fits = estimated_varlen_bytes != u64::MAX;
-                let prefill_mode = cache_hit_prefill_mode();
+                let prefill_mode = cache_hit_prefill_mode_for_pool(
+                    cache_hit_prefill_mode(),
+                    adapter.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8,
+                );
                 // Tiny MTP verification prefills are hard-routed to varlen,
                 // and explicit overrides ignore memory heuristics. Avoid all
                 // live probes on those hot paths. The adapter caches the
@@ -4570,6 +4586,24 @@ mod tests {
                 parse_cache_hit_prefill_mode(Some(value)),
                 CacheHitPrefillMode::ForceSdpa,
                 "{value:?} should preserve the prior disabled-paged override"
+            );
+        }
+    }
+
+    #[test]
+    fn int8_pool_cache_hit_prefill_takes_varlen() {
+        for configured in [
+            CacheHitPrefillMode::Auto,
+            CacheHitPrefillMode::ForcePaged,
+            CacheHitPrefillMode::ForceSdpa,
+        ] {
+            let mode = cache_hit_prefill_mode_for_pool(configured, true);
+            assert_eq!(mode, CacheHitPrefillMode::ForcePaged);
+            let plan = select_cache_hit_prefill_plan(mode, 4_096, 1, u64::MAX, Some(u64::MAX));
+            assert_eq!(plan.path, CacheHitPrefillPath::PagedVarlen);
+            assert_eq!(
+                cache_hit_prefill_mode_for_pool(configured, false),
+                configured
             );
         }
     }
