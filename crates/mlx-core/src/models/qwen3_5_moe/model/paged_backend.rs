@@ -1,6 +1,4 @@
-//! `PagedBackend` for `Qwen35MoeInner` plus the paged decode/prefix adapters
-//! and the whole-turn router the engine's multimodal and speculative handlers
-//! dispatch through.
+//! `PagedBackend` for `Qwen35MoeInner` plus the paged decode/prefix adapters.
 
 use super::*;
 use crate::engine::paged_epilogue::FinalTokenPolicy;
@@ -141,8 +139,8 @@ impl Qwen35MoeInner {
         let block_size = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason(
-                    "prime_prefix_state: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
+                    "prime_prefix_state: paged_adapter is None — this load has \
+                     no block-paged pool",
                 )
             })?;
             adapter.block_size()
@@ -506,9 +504,9 @@ impl PagedBackend for Qwen35MoeInner {
 
     fn admit_paged_speculative_decode(&mut self, p: &engine::ChatParams) -> Result<bool> {
         // MTP acceptance gate: a previous turn whose draft head accepted below
-        // break-even decodes THIS turn plain AR. The flat lane applies the same
-        // policy from `moe_whole_turn`; here it runs after prefill, where the
-        // AR fallback below is still a plain loop rather than a failed turn.
+        // break-even decodes THIS turn plain AR. It runs after prefill, where
+        // the AR fallback below is still a plain loop rather than a failed
+        // turn.
         if !p.mtp_adaptive_depth && !self.mtp_gate_allows(p.mtp_depth.max(1) as u32) {
             return Ok(false);
         }
@@ -821,90 +819,22 @@ impl PagedBackend for Qwen35MoeInner {
 }
 
 impl Qwen35MoeInner {
-    /// Whole-turn MoE dispatch behind the engine's multimodal and
-    /// speculative handlers.
-    ///
-    /// Routes the four turn shapes onto the whole-turn cores:
-    /// fresh sync → [`Self::vision_mtp_whole_turn_core`], delta sync →
-    /// [`Self::chat_tokens_delta_sync`], fresh streaming →
-    /// [`Self::vision_mtp_whole_turn_stream_core`], delta streaming →
-    /// [`Self::chat_stream_tokens_delta_sync_inner`]. These cores own
-    /// every MoE-path subtlety the generic flow does not model: VLM
-    /// prefill + M-RoPE deltas, the MTP gate (eager MTP, falling back
-    /// to AR when ineligible), and the paged-always-wins dispatch (including
-    /// requires-paged image routing — unlike dense, MoE has NO
-    /// `mtp_takes_dense_path` exception: its paged early-return runs before
-    /// any MTP consideration on every path).
-    ///
-    /// Delta turns recover the raw delta from the engine-composed
-    /// `args.tokens` (`cached_history + delta` by construction — the
-    /// probes run before any state mutation).
-    pub(super) fn moe_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Fold generation_config.json defaults into the config the VLM/MTP
-        // cores re-extract params from, so they honor the same sampling
-        // defaults as the generic AR path (whose `args.params` already had
-        // them applied via `resolve_params`). No-op when the checkpoint ships
-        // no defaults (`gen_defaults` all-None).
+    /// The tokenizer, params and perf flag an image turn decodes with: the
+    /// request config under the checkpoint's generation defaults, with the
+    /// planned decoder projected in.
+    pub(super) fn vision_turn_params(
+        &self,
+        args: &WholeTurnArgs<'_>,
+    ) -> Result<(Arc<Qwen3Tokenizer>, engine::ChatParams, bool)> {
         let mut config = args.config.clone();
         crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
-        // The request-time plan is authoritative. These legacy whole-turn
-        // cores still re-extract `ChatParams`, so mirror the selected decoder
-        // into their config rather than independently consulting the raw MTP
-        // request flag a second time.
-        let mut planned_mtp = apply_qwen35_moe_planned_decoder(&mut config, args.plan.decoder);
-        // MTP acceptance gate: a previous turn whose draft head accepted
-        // below break-even disables speculation for THIS turn (plain AR).
-        if planned_mtp
-            && !config.mtp_adaptive_depth.unwrap_or(false)
-            && !self.mtp_gate_allows(config.mtp_depth.unwrap_or(1).max(1) as u32)
-        {
-            planned_mtp = false;
-            config.enable_mtp = Some(false);
-        }
-        debug_assert!(!planned_mtp || self.has_mtp_weights());
-        let thinking = args.thinking;
-        match (args.sink, args.cancelled) {
-            (Some(sink), Some(cancelled)) => {
-                let cb = StreamSender(sink);
-                if args.plan.is_delta {
-                    let delta_start = self.cached_token_history.len().min(args.tokens.len());
-                    let delta_tokens = args.tokens[delta_start..].to_vec();
-                    self.chat_stream_tokens_delta_sync_inner(
-                        delta_tokens,
-                        config,
-                        &cb,
-                        cancelled,
-                        thinking,
-                    )?;
-                } else {
-                    self.vision_mtp_whole_turn_stream_core(
-                        args.tokens.to_vec(),
-                        args.media.images,
-                        config,
-                        args.eos_id,
-                        &cb,
-                        cancelled,
-                        thinking,
-                    )?;
-                }
-                Ok(TurnOutput::Streamed)
-            }
-            _ => {
-                let result = if args.plan.is_delta {
-                    let delta_start = self.cached_token_history.len().min(args.tokens.len());
-                    let delta_tokens = args.tokens[delta_start..].to_vec();
-                    self.chat_tokens_delta_sync(delta_tokens, config, thinking)?
-                } else {
-                    self.vision_mtp_whole_turn_core(
-                        args.tokens.to_vec(),
-                        args.media.images,
-                        config,
-                        args.eos_id,
-                        thinking,
-                    )?
-                };
-                Ok(TurnOutput::Complete(Box::new(result)))
-            }
-        }
+        apply_qwen35_moe_planned_decoder(&mut config, args.plan.decoder);
+        let mut p = engine::extract_chat_params(&config);
+        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+        Ok((tokenizer, p, config.report_performance.unwrap_or(false)))
     }
 }

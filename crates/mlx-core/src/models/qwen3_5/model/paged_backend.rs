@@ -145,8 +145,8 @@ impl Qwen35Inner {
         let block_size = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason(
-                    "prime_prefix_state: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
+                    "prime_prefix_state: paged_adapter is None — this load has \
+                     no block-paged pool",
                 )
             })?;
             adapter.block_size()
@@ -737,91 +737,23 @@ impl PagedBackend for Qwen35Inner {
 }
 
 impl Qwen35Inner {
-    /// Whole-turn dense dispatch behind the engine's multimodal and
-    /// speculative handlers.
-    ///
-    /// Routes the four turn shapes onto the whole-turn cores:
-    /// fresh sync → [`Self::vision_mtp_whole_turn_core`], delta sync →
-    /// [`Self::chat_tokens_delta_sync`], fresh streaming →
-    /// [`Self::chat_stream_sync_inner`], delta streaming →
-    /// [`Self::chat_stream_tokens_delta_sync_inner`]. These cores own
-    /// every dense-path subtlety the generic flow does not model: VLM
-    /// prefill + M-RoPE deltas, the MTP gate (eager MTP, falling back to
-    /// AR when ineligible), the legacy defensive paged-to-flat cache rebuild,
-    /// and requires-paged image routing (including the missing-adapter
-    /// diagnostic).
-    ///
-    /// Delta turns recover the raw delta from the engine-composed
-    /// `args.tokens` (`cached_history + delta` by construction — the
-    /// probes run before any state mutation).
-    pub(super) fn dense_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Fold generation_config.json defaults into the config the whole-turn
-        // cores re-extract params from, so VLM/MTP turns honor the same
-        // sampling defaults as the generic AR path (whose `args.params`
-        // already had them applied via `resolve_params`). No-op when the
-        // checkpoint ships no defaults (`gen_defaults` all-None).
+    /// The tokenizer, params and perf flag an image turn decodes with: the
+    /// request config under the checkpoint's generation defaults, with the
+    /// planned decoder projected in.
+    pub(super) fn vision_turn_params(
+        &self,
+        args: &WholeTurnArgs<'_>,
+    ) -> Result<(Arc<Qwen3Tokenizer>, engine::ChatParams, bool)> {
         let mut config = args.config.clone();
         crate::engine::apply_generation_defaults(&mut config, &self.gen_defaults);
-        // The engine resolved MTP admission once, before any cache mutation.
-        // These legacy whole-turn cores still extract their own `ChatParams`,
-        // so project the selected decoder back into their config instead of
-        // letting the raw request independently re-open the MTP gate.
-        let mut planned_mtp = apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
-        // MTP acceptance gate: a previous turn whose draft head accepted
-        // below break-even disables speculation for THIS turn (plain AR),
-        // so the verify cost is not paid for zero speedup.
-        if planned_mtp
-            && !config.mtp_adaptive_depth.unwrap_or(false)
-            && !self.mtp_gate_allows(config.mtp_depth.unwrap_or(1).max(1) as u32)
-        {
-            planned_mtp = false;
-            config.enable_mtp = Some(false);
-        }
-        debug_assert!(!planned_mtp || self.has_mtp_weights());
-        let thinking = args.thinking;
-        match (args.sink, args.cancelled) {
-            (Some(sink), Some(cancelled)) => {
-                let cb = StreamSender(sink);
-                if args.plan.is_delta {
-                    let delta_start = self.cached_token_history.len().min(args.tokens.len());
-                    let delta_tokens = args.tokens[delta_start..].to_vec();
-                    self.chat_stream_tokens_delta_sync_inner(
-                        delta_tokens,
-                        config,
-                        &cb,
-                        cancelled,
-                        thinking,
-                    )?;
-                } else {
-                    self.chat_stream_sync_inner(
-                        args.tokens.to_vec(),
-                        args.media.images,
-                        config,
-                        args.eos_id,
-                        &cb,
-                        cancelled,
-                        thinking,
-                    )?;
-                }
-                Ok(TurnOutput::Streamed)
-            }
-            _ => {
-                let result = if args.plan.is_delta {
-                    let delta_start = self.cached_token_history.len().min(args.tokens.len());
-                    let delta_tokens = args.tokens[delta_start..].to_vec();
-                    self.chat_tokens_delta_sync(delta_tokens, config, thinking)?
-                } else {
-                    self.vision_mtp_whole_turn_core(
-                        args.tokens.to_vec(),
-                        args.media.images,
-                        config,
-                        args.eos_id,
-                        thinking,
-                    )?
-                };
-                Ok(TurnOutput::Complete(Box::new(result)))
-            }
-        }
+        apply_qwen35_dense_planned_decoder(&mut config, args.plan.decoder);
+        let mut p = engine::extract_chat_params(&config);
+        p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| Error::from_reason("Tokenizer not loaded"))?;
+        Ok((tokenizer, p, config.report_performance.unwrap_or(false)))
     }
 
     /// A DFlash2 turn on the pool: the pool window clamps a copy of the
@@ -832,7 +764,6 @@ impl Qwen35Inner {
     ) -> Result<TurnOutput> {
         let mut constrained_params = args.params.clone();
         self.preflight_paged_context(args.tokens.len(), &mut constrained_params)?;
-        self.paged_full_attn_caches_dirty = true;
         let mut constrained_args = WholeTurnArgs {
             tokens: args.tokens,
             tokenizer: args.tokenizer,
@@ -917,12 +848,6 @@ impl Qwen35Inner {
 
         // NON-MTP (sync or stream) → the generic AR+paged engine path.
         //
-        // This paged turn writes full-attention K/V into the paged adapter
-        // pool, NOT the flat `self.caches`, so the flat full-attention slots no
-        // longer reflect the conversation. A later streaming dense-MTP fallback
-        // must rebuild the flat caches before decoding. The MTP paged cores
-        // set this at their core entry; this is the set-site for the
-        // generic path. See `paged_full_attn_caches_dirty`.
         // The specialized MTP/VLM paged cores perform their own hard capacity
         // preflight. The ordinary AR path delegates directly to the generic
         // paged engine, so constrain a copy of the already-resolved params here
@@ -931,14 +856,11 @@ impl Qwen35Inner {
         // `ChatSession` preflight.
         let mut constrained_params = args.params.clone();
         self.preflight_paged_context(args.tokens.len(), &mut constrained_params)?;
-        // Only dirty the flat-attention mirror after deterministic preflight
-        // succeeds. A rejected request has not touched the paged adapter.
-        // The DFlash2 context belongs to that flat mirror, so discard it at
-        // the same ownership boundary. In particular, a future equal-length
-        // prompt must not mistake this stale draft window for the paged prefix.
+        // An AR turn advances the request without DFlash2 taps: a future
+        // equal-length prompt must not mistake the stale draft window for the
+        // paged prefix. A rejected request has not touched the pool.
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
-        self.paged_full_attn_caches_dirty = true;
         self.dflash2_prefix
             .note_drop("paged_whole_turn", DropKind::Dirtied);
         let mut constrained_args = WholeTurnArgs {

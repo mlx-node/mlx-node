@@ -14,7 +14,7 @@ use crate::models::quantized_linear::{MXFP8_BITS, MXFP8_GROUP_SIZE, MXFP8_MODE, 
 use crate::models::qwen3_5::config::Qwen3_5Config;
 use crate::models::qwen3_5::decoder_layer::{self, AttentionType};
 
-fn tiny_cfg(use_block_paged: bool) -> Qwen3_5Config {
+fn tiny_cfg() -> Qwen3_5Config {
     Qwen3_5Config {
         rope_scaling: None,
         qwen35_gguf_gdn_layout: None,
@@ -43,14 +43,13 @@ fn tiny_cfg(use_block_paged: bool) -> Qwen3_5Config {
         rope_theta: 100_000.0,
         paged_cache_memory_mb: Some(64),
         paged_block_size: Some(16),
-        use_block_paged_cache: if use_block_paged { Some(true) } else { None },
         persist_paged_cache: None,
         n_mtp_layers: 0,
     }
 }
 
 pub(super) fn tiny_paged_forward_cfg() -> Qwen3_5Config {
-    let mut cfg = tiny_cfg(true);
+    let mut cfg = tiny_cfg();
     // The paged prefill attention kernel needs a query group of 4, 6, 8 or
     // 16 and head 128 or 256, so the production-forward tests use a
     // separate, larger shape.
@@ -85,7 +84,7 @@ fn expected_scheduler_window(inner: &Qwen35Inner) -> (u32, u32, u32) {
 #[test]
 fn tiny_hybrid_recurrent_bytes_make_usable_window_stricter_than_raw_pool() {
     use crate::engine::hybrid_scheduler::{pool_tokens_after_recurrent, scheduled_turn_context};
-    let inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+    let inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
     let rec = inner.config.recurrent_state_bytes();
     assert!(rec > 0, "tiny hybrid config must have GDN state");
     let trained = 1_048_576;
@@ -119,39 +118,6 @@ fn install_plan(inner: &mut Qwen35Inner, pool_window: Option<u32>, draft: bool) 
     inner.memory_plan = Some(plan);
 }
 
-/// An omitted budget is the rest of the window whenever the plan prices
-/// it: the pool window of a paged load and the flat lane's window of a load
-/// without a pool.
-/// Mutation: set the omitted flag `true` in `from_parts` → red.
-/// Mutation: `pool_context_limit` ignores the plan's flat lane → red
-/// (the trained window, not 900).
-#[test]
-fn flat_load_publishes_no_rest_of_window() {
-    let Some(mut inner) =
-        dense_inner_with_test_adapter_or_skip("flat_load_publishes_no_rest_of_window")
-    else {
-        return;
-    };
-    let limits = inner.context_limits_snapshot();
-    assert!(limits.rest_of_window_output_budget);
-    assert!(limits.omitted_budget_is_rest_of_window);
-
-    inner.paged_adapter = None;
-    let limits = inner.context_limits_snapshot();
-    assert!(
-        limits.rest_of_window_output_budget,
-        "the clamp stays Splash's"
-    );
-    assert!(!limits.omitted_budget_is_rest_of_window);
-
-    inner.memory_plan = Some(crate::engine::memory_plan::MemoryPlan::with_flat_window(
-        900,
-    ));
-    let limits = inner.context_limits_snapshot();
-    assert_eq!(limits.effective_window_tokens, 900);
-    assert!(limits.omitted_budget_is_rest_of_window);
-}
-
 /// Gate: a paged load with a DFlash2 draft publishes one window, the pool
 /// lane's, for every turn; the snapshot has no second window (Splash
 /// `EngineMemoryPlan` sizes one context).
@@ -178,8 +144,8 @@ fn context_limits_publish_one_window() {
 }
 
 /// Gate: the load publishes the K/V format it writes. The block-paged pool
-/// names its own pages (int8 or bf16, whatever the config says); a flat
-/// load names the configured format.
+/// names its own pages (int8 or bf16, whatever the config says); a load
+/// without a pool names the configured format.
 /// Mutation D3: the snapshot keeps `KvFormat::Bf16` for a pool → red.
 #[test]
 fn context_limits_publish_kv_formats() {
@@ -355,7 +321,6 @@ fn every_load_starts_at_the_runway() {
         assert!(runway < pool.max_blocks, "draft={draft}");
         assert_eq!(adapter.memory_ceiling(), Some(plan.ceiling_bytes()));
         assert_eq!(inner.pool_context_limit(), pool.lane.window.maximum());
-        assert!(plan.flat.is_none(), "draft={draft}");
         assert_eq!(
             pool.lane.lane_bytes > inner.config.recurrent_state_bytes(),
             draft,
@@ -503,7 +468,7 @@ fn paged_context_limits_and_preflight_use_scheduler_usable_window() {
 
 #[test]
 fn scheduled_recurrent_cap_counts_the_active_row_and_parked_rows() {
-    let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+    let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
     let bytes = inner.config.recurrent_state_bytes();
 
     inner
@@ -532,7 +497,7 @@ fn scheduled_recurrent_cap_counts_the_active_row_and_parked_rows() {
 
 #[test]
 fn all_full_attention_recurrent_lifecycle_is_a_noop() {
-    let mut config = tiny_cfg(false);
+    let mut config = tiny_cfg();
     config.full_attention_interval = 1;
     let mut inner = Qwen35Inner::new(config).expect("construct all-full dense model");
     assert_eq!(inner.config.recurrent_state_bytes(), 0);
@@ -567,7 +532,7 @@ fn all_full_attention_recurrent_lifecycle_is_a_noop() {
 
 #[test]
 fn save_model_rejects_quantized_dense_projection_before_creating_destination() {
-    let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+    let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
     let weight = MxArray::zeros(&[128, 16], Some(DType::Uint32)).unwrap();
     let scales = MxArray::zeros(&[128, 2], Some(DType::Uint8)).unwrap();
     let quantized = QuantizedLinear::new(
@@ -1037,21 +1002,6 @@ fn assert_close_batch_vocab_logits(left: &MxArray, right: &MxArray, abs_tol: f32
     }
 }
 
-fn assert_finite_hidden(hidden: &MxArray, context: &str) {
-    let f32_arr = hidden.astype(DType::Float32).expect("astype hidden f32");
-    f32_arr.eval();
-    let total = (0..f32_arr.ndim().expect("hidden ndim"))
-        .map(|axis| f32_arr.shape_at(axis).expect("hidden shape") as usize)
-        .product::<usize>();
-    for i in 0..total {
-        let value = f32_arr.item_at_float32(i).expect("hidden item");
-        assert!(
-            value.is_finite(),
-            "{context}: hidden[{i}] is not finite: {value}"
-        );
-    }
-}
-
 fn reset_dense_caches(inner: &mut Qwen35Inner) {
     inner.caches = Some(fresh_dense_layer_caches(&inner.config));
 }
@@ -1127,10 +1077,9 @@ fn run_dense_final_logits_chunked(
     )
 }
 
-/// `use_block_paged_cache` defaults to `None` and round-trips
-/// through serde.
+/// The pool options default to `None` through serde.
 #[test]
-fn test_use_block_paged_cache_serde_default_none() {
+fn pool_options_default_to_none() {
     let json = serde_json::json!({
         "vocab_size": 1024,
         "hidden_size": 64,
@@ -1147,16 +1096,14 @@ fn test_use_block_paged_cache_serde_default_none() {
         "bos_token_id": 0,
     });
     let cfg: Qwen3_5Config = serde_json::from_value(json).unwrap();
-    assert_eq!(
-        cfg.use_block_paged_cache, None,
-        "use_block_paged_cache must default to None on JSON without the key"
-    );
     assert_eq!(cfg.paged_block_size, None);
     assert_eq!(cfg.paged_cache_memory_mb, None);
 }
 
+/// A config mlx-node saved before the pool became the only lane carries
+/// `use_block_paged_cache`; the key is ignored like any other unknown key.
 #[test]
-fn test_use_block_paged_cache_serde_true_round_trip() {
+fn saved_config_with_the_old_lane_key_still_parses() {
     let json = serde_json::json!({
         "vocab_size": 1024,
         "hidden_size": 64,
@@ -1171,19 +1118,18 @@ fn test_use_block_paged_cache_serde_true_round_trip() {
         "pad_token_id": 0,
         "eos_token_id": 0,
         "bos_token_id": 0,
-        "use_block_paged_cache": true,
+        "use_block_paged_cache": false,
         "paged_block_size": 16,
         "paged_cache_memory_mb": 256,
     });
     let cfg: Qwen3_5Config = serde_json::from_value(json).unwrap();
-    assert_eq!(cfg.use_block_paged_cache, Some(true));
     assert_eq!(cfg.paged_block_size, Some(16));
     assert_eq!(cfg.paged_cache_memory_mb, Some(256));
 }
 
 #[test]
 fn test_full_attention_layer_count() {
-    let cfg = tiny_cfg(false);
+    let cfg = tiny_cfg();
     // 8 layers, full_attention_interval=4 → layers 3 and 7 are
     // full-attention (2 layers).
     assert_eq!(cfg.full_attention_layer_count(), 2);
@@ -1214,7 +1160,7 @@ fn test_dense_gdn_root_rotation_and_legacy_retention_policy() {
         inner.prune_dense_gdn_prefix_checkpoints();
     }
 
-    let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+    let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
     push_checkpoint(&mut inner, "root-0", Some("root-0"), 1);
     push_checkpoint(&mut inner, "root-1", Some("root-1"), 2);
     for (index, owner) in ["child-0", "child-1", "child-2", "child-3"]
@@ -1244,7 +1190,7 @@ fn test_dense_gdn_root_rotation_and_legacy_retention_policy() {
     // therefore no cold GDN policy, so the owner cap is the PRE-LADDER one:
     // nothing here could ever read a ladder, and widening the store on that
     // arm changes which checkpoint a later persistence-OFF turn lands on.
-    let mut legacy = Qwen35Inner::new(tiny_cfg(false)).expect("construct legacy dense model");
+    let mut legacy = Qwen35Inner::new(tiny_cfg()).expect("construct legacy dense model");
     assert!(
         !legacy.wants_gdn_checkpoint_ladder(),
         "a model with no paged adapter cannot have a cold GDN sidecar policy"
@@ -1437,9 +1383,8 @@ fn test_qwen35_media_plan_requires_complete_paged_vision_stack() {
                 let available = has_encoder && has_processor && has_paged;
                 assert_eq!(plan.available.images, available);
                 assert!(!plan.available.audio);
-                assert_eq!(plan.backend_validated.images, !available);
-                assert!(!plan.backend_validated.audio);
-                assert!(plan.admitted().images);
+                assert!(plan.backend_validated.is_empty());
+                assert_eq!(plan.admitted().images, available);
             }
         }
     }
@@ -1491,7 +1436,7 @@ fn test_qwen35_session_media_payload_identity() {
 
 #[test]
 fn test_dense_paged_finalize_failure_cannot_republish_image_session() {
-    let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+    let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
     inner.caches = Some(fresh_dense_layer_caches(&inner.config));
     inner.cached_token_history = vec![7, 248_056, 248_056, 8];
     inner.cached_image_key = Some(0xD35E);
@@ -1537,13 +1482,11 @@ fn seed_dense_paged_image_session(inner: &mut Qwen35Inner) {
     inner.cached_image_key = Some(0xD35E);
     inner.cached_paged_image_token_positions = vec![(1, 0xA11C), (2, 0xA11C)];
     inner.cached_rope_deltas = Some(-2);
-    inner.paged_full_attn_caches_dirty = true;
-    inner.flat_mtp_caches_desynced = true;
 }
 
 #[test]
 fn test_dense_manual_paged_finalize_failure_invalidates_session() {
-    let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+    let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
     seed_dense_paged_image_session(&mut inner);
 
     let error = inner
@@ -1555,13 +1498,11 @@ fn test_dense_manual_paged_finalize_failure_invalidates_session() {
     assert!(inner.cached_image_key.is_none());
     assert!(inner.cached_paged_image_token_positions.is_empty());
     assert!(inner.cached_rope_deltas.is_none());
-    assert!(!inner.paged_full_attn_caches_dirty);
-    assert!(!inner.flat_mtp_caches_desynced);
 }
 
 #[test]
 fn test_dense_vlm_prefix_prepare_failure_invalidates_session() {
-    let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+    let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
     seed_dense_paged_image_session(&mut inner);
 
     inner
@@ -1581,7 +1522,6 @@ fn test_dense_vlm_prefix_prepare_failure_invalidates_session() {
     assert!(inner.cached_image_key.is_none());
     assert!(inner.cached_paged_image_token_positions.is_empty());
     assert!(inner.cached_rope_deltas.is_none());
-    assert!(!inner.paged_full_attn_caches_dirty);
     assert!(!crate::engine::backend::ChatBackend::has_live_session(
         &inner
     ));
@@ -1589,7 +1529,7 @@ fn test_dense_vlm_prefix_prepare_failure_invalidates_session() {
 
 #[test]
 fn test_dense_generic_paged_abort_invalidates_session() {
-    let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+    let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
     seed_dense_paged_image_session(&mut inner);
 
     <Qwen35Inner as crate::engine::backend::PagedBackend>::abort_paged_turn(&mut inner);
@@ -1598,8 +1538,6 @@ fn test_dense_generic_paged_abort_invalidates_session() {
     assert!(inner.cached_image_key.is_none());
     assert!(inner.cached_paged_image_token_positions.is_empty());
     assert!(inner.cached_rope_deltas.is_none());
-    assert!(!inner.paged_full_attn_caches_dirty);
-    assert!(!inner.flat_mtp_caches_desynced);
 }
 
 #[test]
@@ -1630,20 +1568,20 @@ fn test_qwen35_planned_decoder_overrides_raw_mtp_flag() {
     assert_eq!(config.enable_mtp, Some(false));
 }
 
-/// When `use_block_paged_cache` is `None`, `paged_adapter` is None.
+/// Construction alone builds no pool; the load builds it.
 #[test]
-fn test_inner_no_paged_adapter_when_flag_is_none() {
-    let cfg = tiny_cfg(false);
+fn test_inner_no_paged_adapter_before_the_load() {
+    let cfg = tiny_cfg();
     let inner = Qwen35Inner::new(cfg).expect("Qwen35Inner::new must succeed without paged adapter");
     assert!(
         inner.paged_adapter.is_none(),
-        "paged_adapter must be None when use_block_paged_cache is None"
+        "paged_adapter must be None before initialize_paged_adapter"
     );
 }
 
 #[test]
 fn test_fresh_dense_layer_caches_are_not_gdn_reuse_ready() {
-    let cfg = tiny_cfg(true);
+    let cfg = tiny_cfg();
     let caches = fresh_dense_layer_caches(&cfg);
     assert_eq!(caches.len(), cfg.num_layers as usize);
     assert!(
@@ -1655,7 +1593,7 @@ fn test_fresh_dense_layer_caches_are_not_gdn_reuse_ready() {
 }
 
 fn run_dense_chunked_prefill_final_logits_only_matches_legacy_chunking() -> Result<()> {
-    let mut inner = Qwen35Inner::new(tiny_cfg(false))?;
+    let mut inner = Qwen35Inner::new(tiny_cfg())?;
     cast_qwen35_inner_weights_bf16(&mut inner);
 
     let prompt_tokens: Vec<u32> = (0u32..33).map(|i| (i * 17 + 5) % 997).collect();
@@ -1693,86 +1631,6 @@ fn test_dense_chunked_prefill_final_logits_only_matches_legacy_chunking() {
             return;
         }
         panic!("unexpected dense chunked prefill failure: {msg}");
-    }
-}
-
-fn run_dense_chunked_prefill_with_hidden_keeps_tail_contract() -> Result<()> {
-    let mut inner = Qwen35Inner::new(tiny_cfg(false))?;
-    cast_qwen35_inner_weights_bf16(&mut inner);
-
-    let prompt_tokens: Vec<u32> = (0u32..35).map(|i| (i * 23 + 3) % 997).collect();
-    let prompt = MxArray::from_uint32(&prompt_tokens, &[1, prompt_tokens.len() as i64])?;
-    let embedding = inner.embedding.clone();
-
-    reset_dense_caches(&mut inner);
-    let (logits, hidden) = chunked_prefill_with_hidden_with_size(
-        &prompt,
-        &embedding,
-        &mut inner.layers,
-        &mut inner.caches,
-        &inner.final_norm,
-        &inner.lm_head,
-        Stream::generation(),
-        Some(5),
-        16,
-        None,
-    )?;
-    assert_finite_batch_vocab_logits(
-        &logits,
-        inner.config.vocab_size,
-        "chunked hidden final logits",
-    );
-    assert_eq!(hidden.ndim()?, 3, "prompt hidden ndim");
-    assert_eq!(hidden.shape_at(0)?, 1, "prompt hidden batch");
-    assert_eq!(hidden.shape_at(1)?, 5, "prompt hidden tail len");
-    assert_eq!(
-        hidden.shape_at(2)?,
-        inner.config.hidden_size as i64,
-        "prompt hidden width"
-    );
-    assert_finite_hidden(&hidden, "chunked hidden tail");
-
-    let logits_without_hidden =
-        run_dense_final_logits_chunked(&mut inner, &prompt, &embedding, 16)?;
-    assert_close_batch_vocab_logits(
-        &logits,
-        &logits_without_hidden,
-        1e-6,
-        "hidden and logits-only chunked final logits",
-    );
-
-    reset_dense_caches(&mut inner);
-    let (_logits, full_tail_hidden) = chunked_prefill_with_hidden_with_size(
-        &prompt,
-        &embedding,
-        &mut inner.layers,
-        &mut inner.caches,
-        &inner.final_norm,
-        &inner.lm_head,
-        Stream::generation(),
-        Some(100),
-        16,
-        None,
-    )?;
-    assert_eq!(
-        full_tail_hidden.shape_at(1)?,
-        prompt_tokens.len() as i64,
-        "oversized keep window keeps the whole prompt"
-    );
-    assert_finite_hidden(&full_tail_hidden, "chunked full prompt hidden");
-
-    Ok(())
-}
-
-#[test]
-fn test_dense_chunked_prefill_with_hidden_keeps_tail_contract() {
-    if let Err(err) = run_dense_chunked_prefill_with_hidden_keeps_tail_contract() {
-        let msg = err.reason.to_string();
-        if msg.contains("Metal") || msg.contains("device") {
-            eprintln!("skipping test_dense_chunked_prefill_with_hidden_keeps_tail_contract: {msg}");
-            return;
-        }
-        panic!("unexpected dense chunked prefill hidden failure: {msg}");
     }
 }
 
@@ -1831,16 +1689,15 @@ fn test_inner_constructs_paged_adapter_when_flag_is_true() {
     if std::env::var_os("MLX_TEST_PAGED").is_none() {
         return;
     }
-    let cfg = tiny_cfg(true);
-    let mut inner = Qwen35Inner::new(cfg).expect(
-        "Qwen35Inner::new with use_block_paged_cache=true must succeed on Metal-capable host",
-    );
+    let cfg = tiny_cfg();
+    let mut inner =
+        Qwen35Inner::new(cfg).expect("Qwen35Inner::new must succeed on a Metal-capable host");
     inner
         .initialize_paged_adapter()
         .expect("post-load paged adapter initialization must succeed");
     assert!(
         inner.paged_adapter.is_some(),
-        "paged_adapter must be Some when use_block_paged_cache = Some(true)"
+        "paged_adapter must be Some after the load on Metal"
     );
 }
 
@@ -1856,7 +1713,7 @@ fn test_vlm_loads_when_paged_enabled() {
     use crate::vision::qwen::encoder::QwenVisionConfig;
     use crate::vision::qwen::encoder::QwenVisionEncoder;
 
-    let cfg = tiny_cfg(true);
+    let cfg = tiny_cfg();
     let mut inner = Qwen35Inner::new(cfg).unwrap();
     inner
         .initialize_paged_adapter()
@@ -1884,7 +1741,8 @@ fn test_vlm_loads_when_paged_enabled() {
     );
     let incomplete = inner.execution_plan().media;
     assert_eq!(incomplete.available, MediaCapabilities::NONE);
-    assert_eq!(incomplete.backend_validated, MediaCapabilities::IMAGES);
+    assert_eq!(incomplete.backend_validated, MediaCapabilities::NONE);
+    assert_eq!(incomplete.admitted(), MediaCapabilities::NONE);
 
     inner.set_image_processor(QwenImageProcessor::new(None));
     let complete = inner.execution_plan().media;
@@ -2395,7 +2253,7 @@ fn dense_inner_with_test_pool_or_skip(
     )));
     let adapter = PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE)
         .expect("test paged adapter must construct");
-    let mut inner = Qwen35Inner::new(tiny_cfg(true)).expect("construct tiny dense model");
+    let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
     inner.paged_adapter = Some(adapter);
     Some(inner)
 }
@@ -3698,7 +3556,7 @@ fn scheduled_mtp_owner_replay_matches_independent() {
 #[test]
 fn scheduler_and_preflight_follow_the_cap() {
     use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
-    let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+    let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
     inner.max_context = Some(100);
     let limits = inner.context_limits_snapshot();
     assert_eq!(limits.effective_window_tokens, 100);
@@ -3726,12 +3584,12 @@ fn scheduler_and_preflight_follow_the_cap() {
     );
 }
 
-/// Gate: with no pool the chat turn core holds the flat lane's capped
-/// window (Splash `Engine::submit`). Mutation: the dense `context_window`
+/// Gate: off Metal (no pool) the chat turn core holds the flat lane's
+/// capped window (Splash `Engine::submit`). Mutation: the dense `context_window`
 /// returns `None` → red.
 #[test]
 fn flat_context_window_is_the_capped_lane() {
-    let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+    let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
     assert!(inner.paged_adapter.is_none());
     assert_eq!(
         crate::engine::backend::ChatBackend::context_window(&inner),
@@ -3750,8 +3608,8 @@ fn flat_context_window_is_the_capped_lane() {
 #[test]
 fn yarn_reaches_the_cold_tier_key_not_the_saved_config() {
     use crate::nn::rope_scaling::RopeScaling;
-    let plain = tiny_cfg(false);
-    let mut scaled = tiny_cfg(false);
+    let plain = tiny_cfg();
+    let mut scaled = tiny_cfg();
     scaled.rope_scaling = Some(RopeScaling {
         factor: 1.5625,
         original_context_tokens: 262_144,
@@ -3855,4 +3713,351 @@ fn eval_reads_the_pool() {
         .fold(0f32, f32::max);
     assert!(paged.iter().all(|v| v.is_finite()));
     assert!(worst < 0.25, "paged vs flat eval hidden differ by {worst}");
+}
+
+/// Gate: on Metal a kernel-geometry load builds the pool and every text
+/// turn, MTP requested or not, fresh or delta, streaming or not, resolves to
+/// the paged path; an image turn resolves to the multimodal one. The flat
+/// autoregressive hooks refuse the load. Mutation N1: `qwen35_pool_backend`
+/// returns false (the old switch reopened) → red (no pool). Mutation N2: the
+/// flat hooks skip their check → red (`prefill` runs).
+#[test]
+fn metal_load_has_no_flat_lane() {
+    use crate::engine::backend::ChatBackend;
+    use crate::engine::plan::{MediaCapabilities, TurnPath, TurnPlan, TurnRequest};
+    let mut cfg = tiny_paged_forward_cfg();
+    cfg.n_mtp_layers = 1;
+    let Some(loaded) = planned_load(cfg, false) else {
+        return;
+    };
+    let mut inner = loaded.expect("a kernel geometry loads on the pool");
+    assert!(inner.paged_adapter.is_some(), "no pool");
+    assert!(
+        inner
+            .memory_plan
+            .as_ref()
+            .is_some_and(|plan| plan.pool.is_some())
+    );
+    inner.mtp_weights_loaded = true;
+    let plan = inner.execution_plan();
+    assert!(plan.paged_attention.is_some());
+    assert!(plan.speculative.is_some());
+    for is_delta in [false, true] {
+        for speculative_requested in [false, true] {
+            for streaming in [false, true] {
+                let turn = TurnPlan::resolve(
+                    plan,
+                    TurnRequest {
+                        is_delta,
+                        input_media: MediaCapabilities::NONE,
+                        context_media: MediaCapabilities::NONE,
+                        speculative_requested,
+                        streaming,
+                    },
+                );
+                assert!(
+                    matches!(turn.path(), TurnPath::Paged),
+                    "delta {is_delta} mtp {speculative_requested} stream {streaming}"
+                );
+            }
+        }
+    }
+    let image = TurnPlan::resolve(
+        plan,
+        TurnRequest {
+            is_delta: false,
+            input_media: MediaCapabilities::IMAGES,
+            context_media: MediaCapabilities::NONE,
+            speculative_requested: true,
+            streaming: false,
+        },
+    );
+    assert!(matches!(image.path(), TurnPath::Multimodal));
+    let refused = ChatBackend::prefill(&mut inner, &[1, 2, 3], Stream::generation())
+        .err()
+        .expect("the flat lane refuses a Metal load");
+    assert!(
+        refused.reason.contains("flat KV lane"),
+        "{}",
+        refused.reason
+    );
+}
+
+/// Gate: a Metal load whose attention geometry has no paged-attention
+/// kernel fails, with Splash's words, and leaves neither a pool nor a plan.
+/// Mutation N4: a geometry error falls back to a load without a pool (the
+/// old escape) → red (`Ok`).
+#[test]
+fn geometry_without_a_kernel_fails_the_load() {
+    let Some(loaded) = planned_load(tiny_cfg(), false) else {
+        return;
+    };
+    let error = match loaded {
+        Ok(_) => panic!("a 4 / 2-head head-16 layout has no pool kernel"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .reason
+            .contains("no paged-attention kernel for layout: 4/2 heads, head_dim 16"),
+        "{}",
+        error.reason
+    );
+}
+
+/// A load off Metal (the CUDA preview) builds no pool and serves bf16
+/// autoregressive turns on its own caches: an unset format stays bf16 at
+/// head 256, MTP requests fall back to AR, an explicit int8 is refused.
+/// Mutation N5: the MTP plan is published without a pool → red. Mutation
+/// N6: the int8 refusal is dropped → red (`Ok`).
+#[test]
+fn off_metal_load_serves_bf16_autoregressive_turns() {
+    use crate::engine::backend::ChatBackend;
+    use crate::engine::plan::{MediaCapabilities, TurnPath, TurnPlan, TurnRequest};
+    if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+        return;
+    }
+    crate::models::qwen3_5::load_plan::NO_METAL_POOL.with(|off| off.set(true));
+    let _live = LiveMemory::set(16 * GIB, 0);
+    let mut cfg = tiny_paged_forward_cfg();
+    cfg.head_dim = 256;
+    cfg.n_mtp_layers = 1;
+    let mut inner = Qwen35Inner::new(cfg.clone()).expect("construct tiny model");
+    cast_qwen35_inner_weights_bf16(&mut inner);
+    let pinned = inner.config.pin_kv_format(None, DType::BFloat16);
+    assert_eq!(pinned, crate::transformer::KvFormat::Bf16);
+    inner
+        .initialize_paged_adapter()
+        .expect("a load off Metal has no pool");
+    assert!(inner.paged_adapter.is_none());
+    assert_eq!(inner.context_limits_snapshot().kv_format, "bf16");
+    inner.mtp_weights_loaded = true;
+    let plan = inner.execution_plan();
+    assert!(plan.speculative.is_none(), "MTP verifies on the pool");
+    let turn = TurnPlan::resolve(
+        plan,
+        TurnRequest {
+            is_delta: false,
+            input_media: MediaCapabilities::NONE,
+            context_media: MediaCapabilities::NONE,
+            speculative_requested: true,
+            streaming: false,
+        },
+    );
+    assert!(matches!(turn.path(), TurnPath::Generic));
+    inner.init_caches_sync().expect("caches");
+    let logits = ChatBackend::prefill(&mut inner, &[1, 2, 3], Stream::generation())
+        .expect("the flat lane serves off Metal");
+    logits.eval();
+
+    cfg.kv_format = Some("int8".to_string());
+    let mut int8 = Qwen35Inner::new(cfg).expect("construct tiny model");
+    let refused = int8.initialize_paged_adapter();
+    crate::models::qwen3_5::load_plan::NO_METAL_POOL.with(|off| off.set(false));
+    let refused = refused.expect_err("int8 K/V lives in the pool");
+    assert!(
+        refused
+            .reason
+            .contains("int8 K/V lives in the block-paged pool"),
+        "{}",
+        refused.reason
+    );
+}
+
+/// An f32 checkpoint chats on the pool: its Q / K / V reach every pool
+/// write cast to the pool's io dtype (Splash casts its inputs to the pool's
+/// element type), so a two-token AR turn stores its prefill and decode rows
+/// and completes. Mutation D1: `paged_attention_operands` passes a uniform
+/// operand dtype through uncast → red (the bf16 pool refuses f32 rows).
+#[test]
+fn f32_checkpoint_chats_on_the_pool() {
+    use crate::engine::backend::{ChatBackend, TurnOutput, WholeTurnArgs};
+    use crate::engine::plan::{DecoderPlan, MediaCapabilities, MediaInputs, TurnPlan};
+    use crate::engine::types::ChatConfig;
+    let Some(loaded) = planned_load(tiny_paged_forward_cfg(), false) else {
+        return;
+    };
+    let mut inner = loaded.expect("an f32 load builds the pool");
+    assert_eq!(
+        inner.embedding.get_weight().dtype().unwrap(),
+        DType::Float32
+    );
+    assert_eq!(
+        inner.paged_adapter.as_ref().expect("pool").cache_dtype(),
+        mlx_paged_attn::metal::MetalDtype::BFloat16
+    );
+    let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
+    let config = ChatConfig {
+        temperature: Some(0.0),
+        max_new_tokens: Some(2),
+        reasoning_effort: Some("none".to_string()),
+        ..ChatConfig::default()
+    };
+    let params = ChatBackend::resolve_params(&inner, &config);
+    let thinking = ChatBackend::thinking_setup(&inner, &config);
+    let tokens: Vec<u32> = (0..40).map(|i| (i * 7) % 15 + 1).collect();
+    let mut args = WholeTurnArgs {
+        tokens: &tokens,
+        tokenizer: &tokenizer,
+        eos_id: u32::MAX,
+        config: &config,
+        params: &params,
+        thinking,
+        plan: TurnPlan {
+            is_delta: false,
+            input_media: MediaCapabilities::NONE,
+            context_media: MediaCapabilities::NONE,
+            use_paged_attention: true,
+            decoder: DecoderPlan::Autoregressive,
+        },
+        sink: None,
+        cancelled: None,
+        media: MediaInputs {
+            images: &[],
+            audio: &[],
+        },
+    };
+    let TurnOutput::Complete(result) = ChatBackend::run_paged_turn(&mut inner, &mut args)
+        .unwrap_or_else(|error| panic!("an f32 turn on the pool: {}", error.reason))
+    else {
+        panic!("a sync turn completes");
+    };
+    assert_eq!(result.num_tokens, 2);
+}
+
+fn calibration_tokenizer() -> Arc<Qwen3Tokenizer> {
+    let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": { "type": "Whitespace" },
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": { "a": 0, "b": 1, "c": 2, "<unk>": 3, "<|im_end|>": 4 },
+                "unk_token": "<unk>"
+            }
+        }"#;
+    let tokenizer = tokenizers::Tokenizer::from_bytes(json)
+        .unwrap_or_else(|error| panic!("fixture tokenizer: {error}"));
+    Arc::new(Qwen3Tokenizer::from_tokenizer(tokenizer, None).expect("tokenizer"))
+}
+
+/// `mlx calibrate` prefills each row as one fresh sequence on the pool (the
+/// route a served turn reads), records the mxfp8 sites' activation amax
+/// there, and leaves no live request or history behind.
+/// Mutation N9: the pool arm prefills through the flat chat hook → red (the
+/// hook refuses a Metal load). Mutation E1: the pool arm prefills disarmed
+/// → red (no amax under the site's key).
+#[test]
+fn calibration_reads_the_pool() {
+    use crate::calibration::activation_amax::{ActivationAmaxCollector, CALIB_TEST_LOCK};
+    let Some(loaded) = planned_head256_load("bf16", true) else {
+        return;
+    };
+    let mut inner = loaded.expect("a kernel geometry loads on the pool");
+    inner.tokenizer = Some(calibration_tokenizer());
+    let key = "layers.3.self_attn.q_proj";
+    match &mut inner.layers[3].attn {
+        AttentionType::Full(attn) => {
+            let shape = attn.get_q_proj_weight().shape().unwrap();
+            let (rows, cols) = (shape[0], shape[1]);
+            let quantized = QuantizedLinear::new(
+                MxArray::zeros(
+                    &[rows, cols * i64::from(MXFP8_BITS) / 32],
+                    Some(DType::Uint32),
+                )
+                .unwrap(),
+                MxArray::zeros(
+                    &[rows, cols / i64::from(MXFP8_GROUP_SIZE)],
+                    Some(DType::Uint8),
+                )
+                .unwrap(),
+                None,
+                None,
+                MXFP8_GROUP_SIZE,
+                MXFP8_BITS,
+                MXFP8_MODE.to_string(),
+            )
+            .with_amax_key(Some(key.to_string()));
+            attn.set_quantized_q_proj(quantized);
+        }
+        AttentionType::Linear(_) => panic!("layer 3 must be full attention"),
+    }
+    let _guard = CALIB_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = ActivationAmaxCollector::take();
+    let rows = inner
+        .calibrate_prefill_raw_sync(vec!["a b c a b".into(), "c b a".into()], 64)
+        .expect("calibration on the pool");
+    let amax = ActivationAmaxCollector::take();
+    assert_eq!(rows, 2);
+    let site = amax.get(key).copied();
+    assert!(
+        site.is_some_and(|value| value.is_finite() && value > 0.0),
+        "{site:?} in {amax:?}"
+    );
+    assert!(inner.cached_token_history.is_empty());
+    assert!(
+        !inner
+            .paged_adapter
+            .as_ref()
+            .expect("pool")
+            .is_live_for_continue()
+    );
+}
+
+/// An f32 checkpoint calibrates on the pool: a row shorter than one block
+/// takes the single-shot prefill, whose kept hidden stays in the load's
+/// compute dtype (Splash casts only the pool inputs; the residual keeps its
+/// dtype). Mutation CA2: the last-token projection asserts a BFloat16 hidden
+/// → red (the f32 hidden panics the debug assertion).
+#[test]
+fn f32_checkpoint_calibrates_a_short_row_on_the_pool() {
+    use crate::calibration::activation_amax::{ActivationAmaxCollector, CALIB_TEST_LOCK};
+    let Some(loaded) = planned_load(tiny_paged_forward_cfg(), false) else {
+        return;
+    };
+    let mut inner = loaded.expect("an f32 load builds the pool");
+    assert_eq!(
+        inner.embedding.get_weight().dtype().unwrap(),
+        DType::Float32
+    );
+    let block_size = inner.paged_adapter.as_ref().expect("pool").block_size();
+    inner.tokenizer = Some(calibration_tokenizer());
+    let _guard = CALIB_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = ActivationAmaxCollector::take();
+    let row = "a b c";
+    assert!(row.split(' ').count() < block_size as usize);
+    let rows = inner
+        .calibrate_prefill_raw_sync(vec![row.into()], 64)
+        .unwrap_or_else(|error| panic!("f32 calibration on the pool: {}", error.reason));
+    let _ = ActivationAmaxCollector::take();
+    assert_eq!(rows, 1);
+    let hidden = inner
+        .prefill_hidden_once(&[0, 1, 2])
+        .expect("short f32 row");
+    assert_eq!(hidden.dtype().unwrap(), DType::Float32);
+    assert_eq!(hidden.shape().unwrap().as_ref(), [1, 3, 128]);
+}
+
+/// An image turn is admitted only where it runs: a load without a pool
+/// publishes no image capability, so the engine refuses the image before it
+/// renders (Splash `Engine::submit`). Mutation N11: the plan admits images
+/// for the family handler to refuse later → red.
+#[test]
+fn image_turn_without_a_pool_is_refused_at_admission() {
+    use crate::engine::backend::ChatBackend;
+    let plan = qwen35_dense_media_plan(true, true, false);
+    assert!(!plan.admitted().images);
+    assert!(qwen35_dense_media_plan(true, true, true).admitted().images);
+    assert!(!qwen35_dense_media_plan(false, true, true).admitted().images);
+    let inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny model");
+    assert!(!inner.execution_plan().media.admitted().images);
 }

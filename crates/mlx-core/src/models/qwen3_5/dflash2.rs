@@ -4348,7 +4348,6 @@ mod tests {
             rope_theta: 10_000.0,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            use_block_paged_cache: Some(false),
             persist_paged_cache: None,
             n_mtp_layers: 0,
         };

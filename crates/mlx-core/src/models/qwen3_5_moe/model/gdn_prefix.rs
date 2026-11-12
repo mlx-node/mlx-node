@@ -518,63 +518,6 @@ impl Qwen35MoeInner {
             .is_some_and(crate::models::qwen3_5::paged_forward::gdn_cold_sidecar_ladder_wanted)
     }
 
-    /// Prefill for the hand-written MoE paged cores (sync + stream, text).
-    ///
-    /// The engine's `PagedBackend::paged_prefill` serves only AR turns; a
-    /// planned-MTP turn returns from `paged_whole_turn` before the engine runs
-    /// and prefills here instead. Both cores share this one body so the chunk
-    /// size — and with it the whole checkpoint ladder a cold sidecar is anchored
-    /// on — cannot be right in one core and wrong in the other.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn run_moe_core_paged_prefill(
-        &mut self,
-        tokens: &[u32],
-        suffix: &[u32],
-        cached_prefix_len: u32,
-        gdn_prefix_already_primed: bool,
-        layer_kinds: &[crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind],
-        context: &'static str,
-    ) -> Result<(
-        MxArray,
-        Vec<crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint>,
-    )> {
-        let embed = self.embedding.clone();
-        // Cross-turn M-RoPE delta (0 unless this text turn warm-continues an
-        // image prefill); feeds the scalar-offset RoPE for the suffix.
-        let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
-        let chunk_size = self.cold_gdn_prefill_chunk_size();
-        // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
-        // can borrow `self.layers`/`self.caches` mutably at the same time.
-        // Both family paged cores fail closed on Err via
-        // `invalidate_moe_paged_session`.
-        let turn_cancel = self.turn_cancel.clone();
-        let caches_ref = self
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason(format!("{context}: caches not initialized")))?;
-        let adapter = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason(format!("{context}: paged_adapter dropped")))?;
-        crate::models::qwen3_5_moe::paged_forward::run_paged_prefill_chunk_with_size_and_checkpoint(
-            tokens,
-            suffix,
-            cached_prefix_len,
-            gdn_prefix_already_primed,
-            &embed,
-            &mut self.layers,
-            caches_ref,
-            &self.final_norm,
-            &self.lm_head,
-            layer_kinds,
-            adapter,
-            chunk_size,
-            rope_deltas,
-            turn_cancel.as_deref(),
-            None,
-        )
-    }
-
     /// Cold-tier GDN sidecar capture
     /// ([`crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar`]).
     pub(super) fn capture_moe_gdn_cold_sidecar(
@@ -664,6 +607,7 @@ impl Qwen35MoeInner {
                 );
             }
             let preparation = MoeGdnPrefixPreparation {
+                #[cfg(test)]
                 state,
                 already_primed: cached_prefix_len > 0,
                 restored_prefix_tokens,

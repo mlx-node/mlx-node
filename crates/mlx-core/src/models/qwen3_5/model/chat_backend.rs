@@ -72,8 +72,8 @@ impl ChatBackend for Qwen35Inner {
         self.gen_defaults.eos_token_ids.clone()
     }
 
-    /// The flat lane has no executor that bounds it; the paged lane keeps
-    /// `preflight_paged_context`, DFlash2 included.
+    /// The flat lane of a load off Metal has no executor that bounds it;
+    /// the paged lane keeps `preflight_paged_context`, DFlash2 included.
     fn context_window(&self) -> Option<u32> {
         self.paged_adapter
             .is_none()
@@ -158,14 +158,6 @@ impl ChatBackend for Qwen35Inner {
         )
     }
 
-    fn flat_caches_desynced(&self) -> bool {
-        self.flat_mtp_caches_desynced
-    }
-
-    fn clear_flat_caches_desynced(&mut self) {
-        self.flat_mtp_caches_desynced = false;
-    }
-
     fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
         // Delta continuations preserve `cached_image_key` — the KV cache
         // still holds the prior prefill's image attention state even
@@ -218,6 +210,7 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
+        crate::models::qwen3_5::load_plan::qwen35_flat_lane_check("Qwen3.5")?;
         // Text-only prefill block (the engine's reset-or-delta split already
         // ran; `self.caches` holds either fresh caches or the live session
         // state).
@@ -240,39 +233,24 @@ impl ChatBackend for Qwen35Inner {
         Self: 'a;
 
     fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+        crate::models::qwen3_5::load_plan::qwen35_flat_lane_check("Qwen3.5")?;
         let p = turn.params;
 
         let is_streaming = self.turn_is_streaming.get();
 
-        // Decode-entry trace (sync paths only — the streaming cores never
-        // logged it). `enable_mtp && has_mtp_weights` turns route through
-        // `mtp_turn`, so the MTP branch string is unreachable here.
+        // Decode-entry trace (sync paths only).
         if !is_streaming {
             let prefill_len = turn.total_seq_len as i32;
             let max_kv_len_estimate =
                 engine::kv_capacity_round_up_saturating(prefill_len, p.max_new_tokens);
-            let has_mtp = self.has_mtp_weights();
-            let branch = if !p.enable_mtp {
-                "AR (enable_mtp=false)"
-            } else if !has_mtp {
-                "AR (no MTP weights on model)"
-            } else {
-                "AR"
-            };
             info!(
-                "Qwen3.5 chat_decode entry: prompt_len={} max_new_tokens={} enable_mtp={} \
-                 mtp_depth={} prefill_seq_len={} max_kv_len={} has_mtp_weights={} \
-                 is_delta={} has_images={} branch=\"{}\"",
+                "Qwen3.5 chat_decode entry: prompt_len={} max_new_tokens={} \
+                 prefill_seq_len={} max_kv_len={} is_delta={} branch=\"AR\"",
                 turn.total_seq_len,
                 p.max_new_tokens,
-                p.enable_mtp,
-                p.mtp_depth,
                 prefill_len,
                 max_kv_len_estimate,
-                has_mtp,
                 turn.is_delta,
-                turn.has_images,
-                branch,
             );
         }
 
@@ -292,7 +270,11 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn execution_plan(&self) -> ExecutionPlan {
-        let speculative = if self.dflash2.is_some() {
+        // Speculative turns verify on the pool; a load without one serves
+        // autoregressive turns only.
+        let speculative = if self.paged_adapter.is_none() {
+            None
+        } else if self.dflash2.is_some() {
             Some(SpeculativePlan {
                 kind: SpeculativeKind::DraftModel,
                 supported_input_media: MediaCapabilities::NONE,
@@ -390,22 +372,41 @@ impl ChatBackend for Qwen35Inner {
         self.paged_whole_turn(args)
     }
 
-    fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // The execution plan has already established request opt-in, loaded
-        // MTP weights, flat-cache admission, and text-only input. The dense
-        // core retains the algorithm-specific MTP gate and AR fallback.
-        debug_assert!(args.media.is_empty());
-        match args.plan.decoder {
-            DecoderPlan::Speculative(SpeculativeKind::NativeMtp) => self.dense_whole_turn(args),
-            _ => Err(Error::from_reason(
-                "Qwen3.5 speculative turn received a non-speculative decoder plan",
-            )),
-        }
-    }
-
+    /// An image turn prefills its merged vision embeddings on the pool and
+    /// decodes autoregressively (Splash serves images from the same pages).
+    /// The media plan admits images only on a pool load with an encoder and
+    /// a processor.
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // The dense cores own the full image pipeline (VLM prefill, M-RoPE
-        // deltas, paged-backend validation, missing-encoder error).
-        self.dense_whole_turn(args)
+        let (tokenizer, p, report_perf) = self.vision_turn_params(args)?;
+        let tokens = args.tokens.to_vec();
+        match (args.sink, args.cancelled) {
+            (Some(sink), Some(cancelled)) => {
+                let cb = StreamSender(sink);
+                self.vision_paged_turn_stream_core(
+                    tokens,
+                    args.media.images,
+                    tokenizer,
+                    args.eos_id,
+                    p,
+                    report_perf,
+                    &cb,
+                    cancelled,
+                    args.thinking,
+                )?;
+                Ok(TurnOutput::Streamed)
+            }
+            _ => {
+                let result = self.vision_paged_turn_sync_core(
+                    tokens,
+                    args.media.images,
+                    tokenizer,
+                    args.eos_id,
+                    p,
+                    report_perf,
+                    args.thinking,
+                )?;
+                Ok(TurnOutput::Complete(Box::new(result)))
+            }
+        }
     }
 }

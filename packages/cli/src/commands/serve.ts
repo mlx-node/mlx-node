@@ -52,7 +52,7 @@ Options:
   --kv-format <fmt>   Target K/V cache format: int8 or bf16 (default: int8
                       where the int8 kernels serve the model, else bf16).
                       Sets the block-paged pool (qwen3_5, qwen3_5_moe,
-                      qwen4_exp) and the flat cache DFlash2 turns use.
+                      qwen4_exp).
                       bf16 uses more memory.
   --max-memory <size> Metal memory budget, e.g. 28G; it can only lower the
                       automatic budget (default: auto). Qwen3.5 dense and

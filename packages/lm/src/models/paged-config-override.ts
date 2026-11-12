@@ -18,10 +18,7 @@ import { ggufArchitecture, prepareMuseGlimmerGguf, releaseNativeGgufLease } from
 
 import { CHAT_FAMILY_IDS } from '../family-data.js';
 
-/** Families historically forced paged by `mlx launch claude`. */
-export const QWEN35_PAGED_MODEL_TYPES = ['qwen3_5', 'qwen3_5_moe'] as const;
-
-const QWEN35_MODEL_TYPES = new Set<string>(QWEN35_PAGED_MODEL_TYPES);
+const QWEN35_MODEL_TYPES = new Set<string>(['qwen3_5', 'qwen3_5_moe']);
 const QWEN35_MTP_DRAFTER_DIR = 'mtp-drafter';
 const QWEN35_DENSE_NESTED_MTP_SIDECAR = 'mtp/weights.safetensors';
 

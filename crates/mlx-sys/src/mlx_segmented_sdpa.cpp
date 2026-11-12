@@ -1467,10 +1467,9 @@ mlx_array *segmented_sdpa_int8_forward_impl(
 
 } // namespace
 
-// INT8 K/V (per-row fp32 scales) production entry. The int8 primitive never
-// qualifies the dequantizing concat fallback silently: a compiled verify
-// trace over it would bake the prefix length, so an unsupported launch is an
-// error (null, message on stderr) and the Rust caller stays eager.
+// INT8 K/V (per-row fp32 scales) entry, the reference the paged int8 read
+// is checked against. It never qualifies the dequantizing concat fallback:
+// an unsupported launch is an error (null, message on stderr).
 extern "C" mlx_array *mlx_segmented_sdpa_int8_forward(
     mlx_array *q, mlx_array *prefix_k, mlx_array *prefix_v,
     mlx_array *prefix_ks, mlx_array *prefix_vs, mlx_array *new_k,
@@ -1480,25 +1479,6 @@ extern "C" mlx_array *mlx_segmented_sdpa_int8_forward(
       q, prefix_k, prefix_v, prefix_ks, prefix_vs, new_k, new_v, new_ks,
       new_vs, scale, causal, true,
       mlx::core::segmented_sdpa::SegmentedTileMode::automatic);
-}
-
-// Test-only int8 entry with a forced route: `mode` is SegmentedTileMode
-// (-1 automatic, 0 vector, 1 tile, 2 nax); null (message on stderr) when the
-// route cannot serve the block.
-extern "C" mlx_array *mlx_segmented_sdpa_int8_test_forward(
-    mlx_array *q, mlx_array *prefix_k, mlx_array *prefix_v,
-    mlx_array *prefix_ks, mlx_array *prefix_vs, mlx_array *new_k,
-    mlx_array *new_v, mlx_array *new_ks, mlx_array *new_vs, float scale,
-    bool causal, int mode) {
-  using mlx::core::segmented_sdpa::SegmentedTileMode;
-  if (mode < -1 || mode > 2) {
-    std::fprintf(stderr, "mlx_segmented_sdpa_int8_test_forward: bad mode %d\n",
-                 mode);
-    return nullptr;
-  }
-  return segmented_sdpa_int8_forward_impl(
-      q, prefix_k, prefix_v, prefix_ks, prefix_vs, new_k, new_v, new_ks,
-      new_vs, scale, causal, true, static_cast<SegmentedTileMode>(mode));
 }
 
 // Test-only contract: never silently qualify the concatenated fallback, and

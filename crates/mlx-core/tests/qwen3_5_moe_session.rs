@@ -3,9 +3,8 @@
 //! Mirrors `qwen3_5_delta_chat.rs` but exercises the MoE surface. The MoE
 //! implementation reuses the shared `crate::engine` helpers (ChatML delta
 //! construction, cache prefix verification, decode loop) and threads the
-//! MoE-specific compiled forward path through the decode loop, so both
-//! legacy-compatible `vision_mtp_whole_turn_core` (ex-`chat_sync_core`) AND the new session API must stay
-//! byte-for-byte consistent.
+//! MoE-specific forward path through the decode loop, so the session API
+//! must stay byte-for-byte consistent across turns.
 //!
 //! The test is gated because it needs a real Qwen3.5 MoE checkpoint on
 //! disk. Run it manually with:

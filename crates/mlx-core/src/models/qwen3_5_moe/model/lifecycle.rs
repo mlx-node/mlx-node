@@ -102,7 +102,6 @@ impl Qwen35MoeInner {
             cached_paged_image_token_positions: Vec::new(),
             cached_rope_deltas: None,
             model_id,
-            flat_mtp_caches_desynced: false,
             active_cache_owner_id: String::new(),
             gdn_root_cache_owner_id: None,
             gdn_root_cache_owner_is_explicit: false,
@@ -135,8 +134,8 @@ impl Qwen35MoeInner {
     /// Plan this load's memory once its weights are materialized (Splash
     /// `RuntimeResources::create`), then build the paged pool: it starts at
     /// the runway and grows by extents toward the plan's ceiling. A load
-    /// without a pool plans its DFlash2 lane, or its flat lane without a
-    /// draft. Runs inside the process-wide pool-growth lock.
+    /// without a pool (a load off Metal) plans its
+    /// footprint only. Runs inside the process-wide pool-growth lock.
     pub(crate) fn initialize_paged_adapter(&mut self) -> Result<()> {
         if self.paged_adapter.is_some() {
             return Ok(());
@@ -145,9 +144,11 @@ impl Qwen35MoeInner {
         // the old one.
         self.dflash2_states.clear();
         let recurrent = self.config.recurrent_state_bytes();
-        if !self.config.use_block_paged_cache.unwrap_or(true)
-            || !crate::engine::persistence::compiled_forward_backend_available()
-        {
+        if !crate::models::qwen3_5::load_plan::qwen35_pool_backend() {
+            crate::models::qwen3_5::load_plan::qwen35_no_pool_format(
+                "Qwen3.5 MoE",
+                self.config.kv_format(),
+            )?;
             self.memory_plan = crate::models::qwen3_5::load_plan::plan_qwen35_load(
                 "Qwen3.5 MoE",
                 &*self,
@@ -682,18 +683,18 @@ impl Qwen35MoeInner {
     pub(crate) fn require_dflash2_pool(&self) -> Result<()> {
         if self.dflash2.is_some() && self.paged_adapter.is_none() {
             return Err(Error::from_reason(
-                "Qwen3.5 MoE DFlash2 runs on the block-paged KV pool and this load has none; \
-                 load without the companion (autoLoadDraft: false) or with the paged cache",
+                "Qwen3.5 MoE DFlash2 runs on the block-paged KV pool, which this load has \
+                 none of (it needs Metal); load without the companion (autoLoadDraft: \
+                 false)",
             ));
         }
         Ok(())
     }
 
-    /// Tokens one paged, vision, MTP or flat autoregressive turn may hold:
-    /// the plan's pool lane, or its flat lane on a load with neither pool
-    /// nor draft. Without a plan (a pool installed by a test), the pool's
-    /// blocks after one recurrent cell; without a pool, the served window.
-    /// All at most the context cap.
+    /// Tokens one turn may hold: the plan's pool lane. Without a plan (a
+    /// pool installed by a test), the pool's blocks after one recurrent cell;
+    /// without a pool (off Metal), the served window. All at most the
+    /// context cap.
     pub(crate) fn pool_context_limit(&self) -> u32 {
         self.pool_lane_limit().min(self.context_cap())
     }
@@ -711,13 +712,12 @@ impl Qwen35MoeInner {
 
     fn pool_lane_limit(&self) -> u32 {
         let trained = self.served_context();
-        if let Some(plan) = self.memory_plan.as_ref() {
-            if let Some(pool) = plan.pool.as_ref() {
-                return pool.lane.window.maximum();
-            }
-            if let Some(flat) = plan.flat.as_ref() {
-                return flat.window.maximum();
-            }
+        if let Some(pool) = self
+            .memory_plan
+            .as_ref()
+            .and_then(|plan| plan.pool.as_ref())
+        {
+            return pool.lane.window.maximum();
         }
         self.paged_adapter.as_ref().map_or(trained, |adapter| {
             crate::engine::hybrid_scheduler::pool_tokens_after_recurrent(
@@ -756,11 +756,7 @@ impl Qwen35MoeInner {
         };
         crate::models::qwen3_5::model::Qwen3_5ContextLimits::from_parts(
             self.paged_context_limits(),
-            self.paged_adapter.is_some()
-                || self
-                    .memory_plan
-                    .as_ref()
-                    .is_some_and(|plan| plan.flat.is_some()),
+            self.paged_adapter.is_some(),
             kv_format,
         )
     }
@@ -810,18 +806,9 @@ impl Qwen35MoeInner {
 
     /// Initialize KV caches.
     pub(crate) fn init_caches_sync(&mut self) -> Result<()> {
-        let caches = (0..self.config.num_layers as usize)
-            .map(|i| {
-                if self.config.is_linear_layer(i) {
-                    Qwen3_5LayerCache::new_linear()
-                } else {
-                    Qwen3_5LayerCache::new_full_attention_with(
-                        self.config.to_dense_config().kv_format(),
-                    )
-                }
-            })
-            .collect();
-        self.caches = Some(caches);
+        self.caches = Some(Qwen3_5LayerCache::fresh_layer_caches(
+            &self.config.to_dense_config(),
+        ));
         self.clear_reuse_state();
         Ok(())
     }
@@ -899,19 +886,12 @@ impl Qwen35MoeInner {
                 continue;
             }
 
-            // Fresh turn-0 caches per row (prefill asserts `self.caches` is set,
-            // and a stale cache would append rows into one growing context).
-            self.init_caches_sync()?;
-            let generation_stream = Stream::generation();
-            // PREFILL ONLY — trips every mxfp8 attn/GDN tap once. No generated
-            // token: a decode step would fold a synthetic argmax token's
-            // activations into the amax.
-            let logits = self.prefill(&tokens, generation_stream)?;
-            // Force the row's forward to complete (the taps already `.item()`
-            // each projection input, but eval bounds the lazy graph and makes
-            // per-row memory reclamation deterministic).
-            logits.eval();
-            self.reset_caches_sync()?;
+            // PREFILL ONLY, one fresh sequence per row — trips every mxfp8
+            // attn/GDN tap once. No generated token: a decode step would fold
+            // a synthetic argmax token's activations into the amax. The eval
+            // bounds the lazy graph and makes per-row memory reclamation
+            // deterministic.
+            self.prefill_hidden_once(&tokens)?.eval();
             rows_prefilled += 1;
 
             // Bound resident scratch across many rows (large models × 1024 rows).
@@ -998,7 +978,6 @@ impl Qwen35MoeInner {
         self.caches = None;
         self.dflash2_states.drop_unregistered();
         self.clear_reuse_state();
-        self.flat_mtp_caches_desynced = false;
     }
 }
 
@@ -1061,156 +1040,5 @@ mod source_mixer_profile_tests {
                 .validate_mixer_profile(&bad)
                 .unwrap();
         }
-    }
-}
-
-#[cfg(test)]
-mod source_mixer_mtp_target_tests {
-    use super::*;
-    use crate::array::DType;
-    use crate::models::qwen3_5::layer_cache::{replay_mtp_snapshot_to, snapshot_all_mtp};
-    use crate::models::qwen3_5_moe::source_math_policy::SourceMoePolicy;
-
-    fn values(a: &MxArray) -> Vec<u32> {
-        a.astype(DType::Float32)
-            .unwrap()
-            .to_float32()
-            .unwrap()
-            .iter()
-            .map(|x| x.to_bits())
-            .collect()
-    }
-    fn cache_values(caches: &[Qwen3_5LayerCache]) -> Vec<(i32, Vec<Vec<u32>>)> {
-        caches
-            .iter()
-            .map(|cache| {
-                let arrays = match cache {
-                    Qwen3_5LayerCache::Linear(c) => [c.get(0), c.get(1)]
-                        .into_iter()
-                        .flatten()
-                        .map(values)
-                        .collect(),
-                    Qwen3_5LayerCache::FullAttention(c) => [c.keys_ref(), c.values_ref()]
-                        .into_iter()
-                        .flatten()
-                        .map(|a| values(&a.slice_axis(2, 0, c.get_offset() as i64).unwrap()))
-                        .collect(),
-                };
-                (cache.offset(), arrays)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn source_mixer_eager_mtp_target_fallback_preserves_tape_and_partial_accept() -> Result<()> {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            return Ok(());
-        }
-        // Test the exact eager-MTP main-stack entry point with H2048/T8 so
-        // the mixer request is selected. Tiny standard projections force
-        // the native fallback; this is not source-kernel arithmetic proof.
-        let mut cfg = super::super::paged_construction_tests::tiny_paged_forward_moe_cfg();
-        cfg.hidden_size = 2048;
-        cfg.vocab_size = 32;
-        cfg.num_layers = 2;
-        cfg.full_attention_interval = 2;
-        cfg.intermediate_size = 16;
-        cfg.moe_intermediate_size = Some(16);
-        cfg.shared_expert_intermediate_size = Some(16);
-        cfg.num_experts = 2;
-        cfg.num_experts_per_tok = 1;
-        cfg.use_block_paged_cache = Some(false);
-        cfg.n_mtp_layers = 0;
-        let mut inner = Qwen35MoeInner::new(cfg.clone())?;
-        super::super::paged_construction_tests::cast_moe_inner_weights_bf16(&mut inner);
-        let on = SourceMoePolicy::default().with_mixer_value(Some(std::ffi::OsStr::new("1")));
-        let mut native = Some(fresh_moe_layer_caches(&cfg));
-        let mut selected = Some(fresh_moe_layer_caches(&cfg));
-        let prime = MxArray::from_uint32(&[2, 3, 5], &[1, 3])?;
-        for (policy, caches) in [
-            (SourceMoePolicy::default(), &mut native),
-            (on, &mut selected),
-        ] {
-            inner.configure_source_moe_policy(policy);
-            let y = forward::forward_pre_norm_inner(
-                &prime,
-                &inner.embedding,
-                &mut inner.layers,
-                caches,
-                inner.fa_idx,
-            )?;
-            y.eval();
-        }
-        assert_eq!(
-            cache_values(native.as_ref().unwrap()),
-            cache_values(selected.as_ref().unwrap())
-        );
-        for (cycle, keep) in [1usize, 3, 8].into_iter().enumerate() {
-            let tokens = (0..8)
-                .map(|i| ((i + cycle * 3 + 7) % 32) as u32)
-                .collect::<Vec<_>>();
-            let ids = MxArray::from_uint32(&tokens, &[1, 8])?;
-            let mut reference = None;
-            for (policy, caches) in [
-                (SourceMoePolicy::default(), &mut native),
-                (on, &mut selected),
-            ] {
-                inner.configure_source_moe_policy(policy);
-                let snapshot = snapshot_all_mtp(caches.as_ref().unwrap(), false)?;
-                let mut tape = Vec::new();
-                let output = forward::eager_verify_step(
-                    &mut inner.layers,
-                    caches,
-                    &inner.final_norm,
-                    &inner.lm_head,
-                    inner.fa_idx,
-                    &ids,
-                    &inner.embedding,
-                    Some(&mut tape),
-                )?;
-                let layer_tape = tape[0].as_ref().expect("linear target tape");
-                assert!(tape[1].is_none(), "full attention has no GDN tape");
-                let observed = (
-                    values(&output.logits),
-                    values(&output.hiddens),
-                    values(&layer_tape.qkv),
-                    values(&layer_tape.kernel.q),
-                    values(&layer_tape.kernel.k),
-                    values(&layer_tape.kernel.v),
-                    values(&layer_tape.kernel.g),
-                    values(&layer_tape.kernel.beta),
-                );
-                if let Some(want) = &reference {
-                    assert_eq!(&observed, want);
-                } else {
-                    reference = Some(observed);
-                }
-                replay_mtp_snapshot_to(
-                    caches.as_mut().unwrap(),
-                    &snapshot,
-                    &tape,
-                    keep,
-                    false,
-                    "source mixer MTP target test",
-                )?;
-            }
-            assert_eq!(
-                cache_values(native.as_ref().unwrap()),
-                cache_values(selected.as_ref().unwrap())
-            );
-            assert_eq!(
-                selected.as_ref().unwrap()[inner.fa_idx].offset(),
-                3 + [1, 3, 8][..=cycle].iter().sum::<i32>()
-            );
-        }
-        // Session recovery resets cache state but retains the immutable
-        // per-loaded-model arithmetic request and its target-layer flags.
-        inner.configure_source_moe_policy(on);
-        inner.caches = selected;
-        inner.reset_caches_sync()?;
-        assert_eq!(inner.source_moe_policy, on);
-        inner.discard_moe_paged_session();
-        assert_eq!(inner.source_moe_policy, on);
-        Ok(())
     }
 }

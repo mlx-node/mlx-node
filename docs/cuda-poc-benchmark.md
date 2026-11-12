@@ -5,8 +5,8 @@ question this answers is "does mlx-node run on NVIDIA, and how fast vs Apple",
 not "is the CUDA path tuned".
 
 - **GB10**: NVIDIA GB10 (Grace-Blackwell, sm_121), 128 GB LPDDR5X (~273 GB/s),
-  forced eager + flat KV (`MLX_QWEN35_FORCE_EAGER=1 MLX_QWEN35_PAGED_OVERRIDE=0`)
-  because paged attention needs Metal kernels.
+  eager forward on flat bf16 KV (automatic off Metal: a Qwen3.5 load has no
+  pool) because paged attention needs Metal kernels.
 - **M3 Max**: Apple M3 Max 128 GB (~400 GB/s), numbers from the HF model cards
   (same `examples/lm.ts` harness → apples-to-apples for decode).
 - **Harness** (`examples/lm.ts`): 4-turn capitals chat, `temp 0.6`,

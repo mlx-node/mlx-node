@@ -7,11 +7,6 @@ use super::*;
 pub(crate) type Qwen35MoeCmd = crate::engine::model_command::ModelCommand<Qwen35MoeFamilyCommand>;
 
 pub(crate) enum Qwen35MoeFamilyCommand {
-    Generate {
-        prompt_tokens: MxArray,
-        config: Qwen3_5MoeGenerationConfig,
-        reply: ResponseTx<Qwen3_5MoeGenerationResult>,
-    },
     /// Static FP8 activation-amax calibration prefill — see
     /// [`Qwen35MoeInner::calibrate_prefill_raw_sync`] for the contract.
     CalibratePrefillRaw {
@@ -128,13 +123,6 @@ impl TrainBackend for Qwen35MoeInner {
 impl crate::engine::model_command::FamilyCommand<Qwen35MoeInner> for Qwen35MoeFamilyCommand {
     fn execute(self, inner: &mut Qwen35MoeInner) {
         match self {
-            Qwen35MoeFamilyCommand::Generate {
-                prompt_tokens,
-                config,
-                reply,
-            } => {
-                let _ = reply.send(inner.generate_sync(prompt_tokens, config));
-            }
             Qwen35MoeFamilyCommand::CalibratePrefillRaw {
                 texts,
                 calib_seq,

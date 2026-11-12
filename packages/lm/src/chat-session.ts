@@ -555,10 +555,8 @@ export interface SessionCapableModel {
    *
    * `true` iff the adapter was successfully constructed at load time
    * (driven by the per-model `use_block_paged_cache` config flag, which
-   * defaults to ON for Qwen3, LFM2, Gemma4, and Qwen3.5 dense/MoE after
-   * parity validation). Qwen3.5 VLM instances expose the loaded paged
-   * text lane while media/MTP requests retain their model-specific ordered
-   * execution path.
+   * defaults to ON for Qwen3, LFM2 and Gemma4; Qwen3.5 dense/MoE ignore the
+   * flag and have the adapter on every Metal load and never off Metal).
    *
    * When `true`, the native cache reuses SYS blocks across requests via
    * content-addressing in the `BlockAllocator`'s prefix-hash table —

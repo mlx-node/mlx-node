@@ -1,5 +1,5 @@
 use crate::array::MxArray;
-use crate::transformer::{KVCache, KvFormat};
+use crate::transformer::KVCache;
 use napi::bindgen_prelude::*;
 
 use super::arrays_cache::ArraysCache;
@@ -37,19 +37,14 @@ impl Qwen3_5LayerCache {
         Self::FullAttention(KVCache::new())
     }
 
-    /// Create a cache for a full attention layer holding rows in `format`.
-    pub fn new_full_attention_with(format: KvFormat) -> Self {
-        Self::FullAttention(KVCache::with_format(format))
-    }
-
     /// The per-layer cache slot for decoder layer `index` of `config`: a
-    /// GDN state cache for linear layers, a full-attention K/V cache in the
-    /// config's KV format otherwise.
+    /// GDN state cache for linear layers, a bf16 full-attention K/V cache
+    /// otherwise (a pool load's full-attention K/V lives in the pool).
     pub fn for_layer(config: &Qwen3_5Config, index: usize) -> Self {
         if config.is_linear_layer(index) {
             Self::new_linear()
         } else {
-            Self::new_full_attention_with(config.kv_format())
+            Self::new_full_attention()
         }
     }
 
@@ -84,9 +79,7 @@ impl Qwen3_5LayerCache {
         }
     }
 
-    /// Get the cache offset (for mask generation).
-    /// For linear layers, returns 0 (not position-based).
-    /// For full attention layers, returns the KVCache offset.
+    #[cfg(test)]
     pub fn offset(&self) -> i32 {
         match self {
             Self::Linear(_) => 0,
@@ -115,22 +108,13 @@ impl Qwen3_5LayerCache {
                 if let Some(v) = c.values_ref() {
                     out.push(v);
                 }
-                if let Some(ks) = c.key_scales_ref() {
-                    out.push(ks);
-                }
-                if let Some(vs) = c.value_scales_ref() {
-                    out.push(vs);
-                }
             }
         }
     }
 
     /// Capture a restore point for speculative decoding.
     ///
-    /// * **FullAttention**: snapshots only the logical `offset` — the pre-allocated
-    ///   K/V buffer is reused in place. After [`Self::restore`], the slots beyond
-    ///   the snapshotted offset become "free for reuse" and the next
-    ///   `update_and_fetch` overwrites them. No tensor data is copied.
+    /// * **FullAttention**: a placeholder; its K/V lives in the pool.
     /// * **Linear / GDN**: retains immutable aliases of `conv_state` and
     ///   `recurrent_state`. Each decode step replaces those cache slots with
     ///   new arrays, so the saved handles keep the pre-verify values alive
@@ -150,36 +134,9 @@ impl Qwen3_5LayerCache {
     /// allocating a new one), this API MUST first create independent copies
     /// and evaluate them before the mutation. Evaluating an alias alone does
     /// not detach its storage or protect the snapshot against mutation.
-    ///
-    /// # Paged-KV caveat
-    ///
-    /// This API targets the **flat (non-paged) cache path only**. When
-    /// `Qwen3_5Config::use_block_paged_cache = true`, the FullAttention
-    /// state lives in a `PagedKVCacheAdapter` and the `KVCache` slot held
-    /// inside `Qwen3_5LayerCache::FullAttention` is a vestigial shell with
-    /// `offset == 0` and empty K/V buffers. Snapshotting in that
-    /// configuration would silently capture `offset = 0` and the
-    /// corresponding [`Self::restore`] would no-op — yielding an invalid
-    /// rollback that pretends to succeed.
-    ///
-    /// **Callers must guard with the paged adapter being `None` before
-    /// snapshotting.** A `debug_assert!` below provides a louder failure in
-    /// dev builds when a FullAttention slot is snapshotted with empty
-    /// underlying buffers (the most reliable in-process signal that the
-    /// paged path is active).
     pub(crate) fn snapshot(&self) -> Result<Qwen3_5LayerSnapshot> {
         match self {
-            Self::FullAttention(c) => {
-                debug_assert!(
-                    c.keys_ref().is_some() || c.get_offset() > 0,
-                    "Qwen3_5LayerCache::snapshot: FullAttention cache has empty K/V buffer \
-                     and offset=0 — likely the paged-KV path is active and this snapshot \
-                     would silently capture nothing. See the Paged-KV caveat in the doc."
-                );
-                Ok(Qwen3_5LayerSnapshot::FullAttention {
-                    offset: c.get_offset(),
-                })
-            }
+            Self::FullAttention(_) => Ok(Qwen3_5LayerSnapshot::FullAttention),
             Self::Linear(c) => {
                 // Lazy aliases suffice: every GDN state update is functional
                 // (`ArraysCache::set` swaps in a new MxArray; `get` yields only
@@ -200,36 +157,16 @@ impl Qwen3_5LayerCache {
 
     /// Roll the cache back to a previously captured [`Qwen3_5LayerSnapshot`].
     ///
-    /// * **FullAttention**: rewinds the logical offset via [`KVCache::trim`].
-    ///   The underlying K/V buffer is unchanged; subsequent writes will
-    ///   overwrite the stale tail in place.
+    /// * **FullAttention**: nothing (its K/V lives in the pool).
     /// * **Linear**: swaps `conv_state` / `recurrent_state` back to the
     ///   snapshotted copies.
     ///
     /// Returns an error if the snapshot variant does not match the cache
     /// variant — speculative decoding code must keep the two in lock-step.
-    ///
-    /// Also returns an error if the snapshot's FullAttention offset exceeds
-    /// the current cache offset. [`KVCache::trim`] silently no-ops when
-    /// `new_len >= offset`, which would otherwise hide bugs such as
-    /// restoring a stale snapshot from a longer-running cache onto a
-    /// shorter one.
     #[cfg(test)]
     pub(crate) fn restore(&mut self, snap: &Qwen3_5LayerSnapshot) -> Result<()> {
         match (self, snap) {
-            (Self::FullAttention(c), Qwen3_5LayerSnapshot::FullAttention { offset }) => {
-                let snap_offset = *offset;
-                let cur_offset = c.get_offset();
-                if snap_offset > cur_offset {
-                    return Err(Error::from_reason(format!(
-                        "Qwen3_5LayerCache::restore: snapshot offset {snap_offset} \
-                         exceeds current cache offset {cur_offset}; KVCache::trim cannot \
-                         grow the cache via restore (would silently no-op)",
-                    )));
-                }
-                c.trim(snap_offset);
-                Ok(())
-            }
+            (Self::FullAttention(_), Qwen3_5LayerSnapshot::FullAttention) => Ok(()),
             (
                 Self::Linear(c),
                 Qwen3_5LayerSnapshot::Linear {
@@ -251,11 +188,9 @@ impl Qwen3_5LayerCache {
                     "Qwen3_5LayerCache::restore: snapshot is Linear but cache slot is FullAttention",
                 ))
             }
-            (Self::Linear(_), Qwen3_5LayerSnapshot::FullAttention { .. }) => {
-                Err(Error::from_reason(
-                    "Qwen3_5LayerCache::restore: snapshot is FullAttention but cache slot is Linear",
-                ))
-            }
+            (Self::Linear(_), Qwen3_5LayerSnapshot::FullAttention) => Err(Error::from_reason(
+                "Qwen3_5LayerCache::restore: snapshot is FullAttention but cache slot is Linear",
+            )),
         }
     }
 }
@@ -265,10 +200,9 @@ impl Qwen3_5LayerCache {
 /// Used by speculative decode: snapshot before drafting,
 /// restore (`rollback_after_verify` equivalent) if the verifier rejects.
 pub(crate) enum Qwen3_5LayerSnapshot {
-    /// Logical token offset of the full-attention KV cache. The underlying
-    /// pre-allocated buffer is shared with the live cache and is rewound by
-    /// trimming the offset on restore — zero tensor copy.
-    FullAttention { offset: i32 },
+    /// A full-attention layer: its K/V lives in the pool, which the adapter
+    /// rewinds, so there is nothing to keep here.
+    FullAttention,
     /// Deep-cloned conv + recurrent state for a GatedDeltaNet layer.
     Linear {
         conv_state: Option<MxArray>,
@@ -281,17 +215,15 @@ pub(crate) enum Qwen3_5LayerSnapshot {
 /// from their `rollback` and paged `rollback_unemitted` hooks.
 ///
 /// Pure over `(snap, tape, steps)`: `steps == 0` degenerates to a bare
-/// snapshot restore. On the FLAT path a full-attention layer (no tape) rewinds
-/// its K/V offset to `snapshot_offset + steps`; on the PAGED path that K/V
-/// lives in the pool and is rewound through the adapter, so the vestigial flat
-/// shell is skipped. `context` prefixes every error so the caller's family and
-/// hook stay identifiable.
+/// snapshot restore. A full-attention layer (no tape) keeps its K/V in the
+/// pool, which the adapter rewinds, so its vestigial shell here is skipped.
+/// `context` prefixes every error so the caller's family and hook stay
+/// identifiable.
 pub(crate) fn replay_mtp_snapshot_to(
     caches: &mut [Qwen3_5LayerCache],
     snap: &[Qwen3_5LayerSnapshot],
     tape: &[Option<super::gated_delta_net::GdnLayerTape>],
     steps: usize,
-    paged: bool,
     context: &str,
 ) -> Result<()> {
     if caches.len() != snap.len() || caches.len() != tape.len() {
@@ -304,33 +236,22 @@ pub(crate) fn replay_mtp_snapshot_to(
     }
     for (idx, cache) in caches.iter_mut().enumerate() {
         let Some(layer_tape) = tape[idx].as_ref() else {
-            if paged
-                && matches!(cache, Qwen3_5LayerCache::FullAttention(_))
-                && matches!(snap[idx], Qwen3_5LayerSnapshot::FullAttention { .. })
-            {
-                // Full-attention layer on the paged path: K/V lives in the
-                // paged pool and is rewound through the adapter. The
-                // `FullAttention` slot is unused there, so skip it.
-                continue;
-            }
-            match &snap[idx] {
-                Qwen3_5LayerSnapshot::FullAttention { offset } => {
-                    let kv = cache.as_kv_cache_mut().ok_or_else(|| {
-                        Error::from_reason(format!(
-                            "{context}: layer {idx} has a FullAttention snapshot but its \
-                             cache slot is not FullAttention",
-                        ))
-                    })?;
-                    let target = *offset + steps as i32;
-                    kv.trim(target);
+            match (&*cache, &snap[idx]) {
+                (Qwen3_5LayerCache::FullAttention(_), Qwen3_5LayerSnapshot::FullAttention) => {
+                    continue;
                 }
-                Qwen3_5LayerSnapshot::Linear { .. } => {
+                (_, Qwen3_5LayerSnapshot::FullAttention) => {
+                    return Err(Error::from_reason(format!(
+                        "{context}: layer {idx} has a FullAttention snapshot but its cache \
+                         slot is not FullAttention",
+                    )));
+                }
+                (_, Qwen3_5LayerSnapshot::Linear { .. }) => {
                     return Err(Error::from_reason(format!(
                         "{context}: layer {idx} has no GDN tape but a Linear snapshot",
                     )));
                 }
             }
-            continue;
         };
         let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
             Error::from_reason(format!(
@@ -342,7 +263,7 @@ pub(crate) fn replay_mtp_snapshot_to(
                 conv_state,
                 recurrent_state,
             } => (conv_state.as_ref(), recurrent_state.as_ref()),
-            Qwen3_5LayerSnapshot::FullAttention { .. } => {
+            Qwen3_5LayerSnapshot::FullAttention => {
                 return Err(Error::from_reason(format!(
                     "{context}: layer {idx} GDN tape but FullAttention snapshot",
                 )));
@@ -360,39 +281,11 @@ pub(crate) fn replay_mtp_snapshot_to(
     Ok(())
 }
 
-/// Snapshot every layer's cache in one shot. Production snapshots go through
-/// [`snapshot_all_mtp`], which is paged-aware; this stays as the round-trip
-/// oracle `restore_all` is paired with.
-#[cfg(test)]
-pub(crate) fn snapshot_all(caches: &[Qwen3_5LayerCache]) -> Result<Vec<Qwen3_5LayerSnapshot>> {
+/// Snapshot every layer for the eager-MTP rollback: the GDN state of each
+/// Linear slot, and a placeholder for each FullAttention slot (its K/V
+/// lives in the pool, rewound through `adapter.rollback_last_tokens`).
+pub(crate) fn snapshot_all_mtp(caches: &[Qwen3_5LayerCache]) -> Result<Vec<Qwen3_5LayerSnapshot>> {
     caches.iter().map(|c| c.snapshot()).collect()
-}
-
-/// Snapshot every layer for the eager-MTP rollback, paged-backend aware.
-///
-/// Identical to [`snapshot_all`] on the flat path. On the **paged** path the
-/// FullAttention K/V lives in the `PagedKVCacheAdapter` pool rather than in
-/// `caches`, so each `Qwen3_5LayerCache::FullAttention` slot is a vestigial
-/// shell (empty K/V buffer, offset 0). The paged MTP rollback rewinds those
-/// slots via `adapter.rollback_last_tokens` and never reads their snapshot
-/// (see `DenseMtpStepper::rollback`), so this emits a benign
-/// `FullAttention { offset: 0 }` placeholder for them instead of calling
-/// [`Qwen3_5LayerCache::snapshot`] — which would trip that method's flat-only
-/// empty-buffer `debug_assert!`. Linear (GDN) slots, whose recurrent state
-/// lives in `caches` on both paths, are snapshotted normally.
-pub(crate) fn snapshot_all_mtp(
-    caches: &[Qwen3_5LayerCache],
-    paged: bool,
-) -> Result<Vec<Qwen3_5LayerSnapshot>> {
-    caches
-        .iter()
-        .map(|c| match c {
-            Qwen3_5LayerCache::FullAttention(_) if paged => {
-                Ok(Qwen3_5LayerSnapshot::FullAttention { offset: 0 })
-            }
-            _ => c.snapshot(),
-        })
-        .collect()
 }
 
 /// Restore every layer's cache from a matching slice of snapshots.
@@ -405,12 +298,7 @@ pub(crate) fn snapshot_all_mtp(
 ///
 /// All variant pairs are pre-validated **before** any cache is mutated.
 /// If any pair mismatches, the function returns `Err` and every cache is
-/// left in its original state. After validation, the per-layer
-/// [`Qwen3_5LayerCache::restore`] can still fail on the inner
-/// `KVCache::trim` offset check; in that case the caches up to (but not
-/// including) the failing index will have been rolled back. The variant
-/// pre-validation removes the most common source of partial-rollback
-/// inconsistency observed during speculative decoding.
+/// left in its original state.
 #[cfg(test)]
 pub(crate) fn restore_all(
     caches: &mut [Qwen3_5LayerCache],
@@ -431,7 +319,7 @@ pub(crate) fn restore_all(
             (cache, snap),
             (
                 Qwen3_5LayerCache::FullAttention(_),
-                Qwen3_5LayerSnapshot::FullAttention { .. },
+                Qwen3_5LayerSnapshot::FullAttention,
             ) | (
                 Qwen3_5LayerCache::Linear(_),
                 Qwen3_5LayerSnapshot::Linear { .. },
@@ -443,7 +331,7 @@ pub(crate) fn restore_all(
                 Qwen3_5LayerCache::Linear(_) => "Linear",
             };
             let snap_kind = match snap {
-                Qwen3_5LayerSnapshot::FullAttention { .. } => "FullAttention",
+                Qwen3_5LayerSnapshot::FullAttention => "FullAttention",
                 Qwen3_5LayerSnapshot::Linear { .. } => "Linear",
             };
             return Err(Error::from_reason(format!(
@@ -484,60 +372,6 @@ mod tests {
     fn vec_of(arr: &MxArray) -> Vec<f32> {
         arr.eval();
         arr.to_float32().expect("to_float32").to_vec()
-    }
-
-    #[test]
-    fn snapshot_full_attention_byte_equality() {
-        let mut cache = Qwen3_5LayerCache::new_full_attention();
-        let Qwen3_5LayerCache::FullAttention(kv) = &mut cache else {
-            unreachable!()
-        };
-
-        // Prime to offset N=4 with recognizable data. `from_float32` only
-        // validates shape; if it errors here it's a real bug worth panicking
-        // on. Metal-skip is handled in `try_eval_or_skip` below.
-        let keys1 = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]).unwrap();
-        let values1 = MxArray::from_float32(&[10.0, 20.0, 30.0, 40.0], &[1, 1, 4, 1]).unwrap();
-        let (rk1, _) = kv.update_and_fetch(&keys1, &values1).unwrap();
-        if !try_eval_or_skip(&rk1, "snapshot_full_attention_byte_equality::prime") {
-            return;
-        }
-        assert_eq!(kv.get_offset(), 4);
-
-        // Snapshot at offset=4, then write 3 more entries.
-        let snap = cache.snapshot().expect("snapshot");
-        match &snap {
-            Qwen3_5LayerSnapshot::FullAttention { offset } => assert_eq!(*offset, 4),
-            _ => panic!("expected FullAttention snapshot"),
-        }
-
-        let Qwen3_5LayerCache::FullAttention(kv) = &mut cache else {
-            unreachable!()
-        };
-        let keys2 = MxArray::from_float32(&[5.0, 6.0, 7.0], &[1, 1, 3, 1]).unwrap();
-        let values2 = MxArray::from_float32(&[50.0, 60.0, 70.0], &[1, 1, 3, 1]).unwrap();
-        kv.update_and_fetch(&keys2, &values2).unwrap();
-        assert_eq!(kv.get_offset(), 7);
-
-        // Restore: offset must rewind to 4; the trailing 3 slots stay in the
-        // pre-allocated buffer but are no longer logically valid.
-        cache.restore(&snap).expect("restore");
-        let Qwen3_5LayerCache::FullAttention(kv) = &cache else {
-            unreachable!()
-        };
-        assert_eq!(kv.get_offset(), 4);
-
-        // Subsequent writes must resume from offset=4 and overwrite the stale
-        // tail in place — i.e. the buffer's logical tail equals the new data.
-        let Qwen3_5LayerCache::FullAttention(kv) = &mut cache else {
-            unreachable!()
-        };
-        let keys3 = MxArray::from_float32(&[100.0, 200.0], &[1, 1, 2, 1]).unwrap();
-        let values3 = MxArray::from_float32(&[1000.0, 2000.0], &[1, 1, 2, 1]).unwrap();
-        let (rk, rv) = kv.update_and_fetch(&keys3, &values3).unwrap();
-        assert_eq!(kv.get_offset(), 6);
-        assert_eq!(vec_of(&rk), vec![1.0, 2.0, 3.0, 4.0, 100.0, 200.0]);
-        assert_eq!(vec_of(&rv), vec![10.0, 20.0, 30.0, 40.0, 1000.0, 2000.0]);
     }
 
     #[test]
@@ -628,10 +462,7 @@ mod tests {
 
     #[test]
     fn restore_variant_mismatch_errors() {
-        // Construct snapshots directly (rather than via `snapshot()`) so we
-        // don't trip the Paged-KV `debug_assert!` on empty FullAttention
-        // caches — the assertion is irrelevant to variant-mismatch testing.
-        let full_snap = Qwen3_5LayerSnapshot::FullAttention { offset: 0 };
+        let full_snap = Qwen3_5LayerSnapshot::FullAttention;
         let mut linear = Qwen3_5LayerCache::new_linear();
         let err = linear
             .restore(&full_snap)
@@ -663,31 +494,16 @@ mod tests {
             Qwen3_5LayerCache::new_linear(),
         ];
 
-        // Prime the full-attention cache.
-        if let Qwen3_5LayerCache::FullAttention(kv) = &mut caches[0] {
-            let k = MxArray::from_float32(&[1.0, 2.0], &[1, 1, 2, 1]).unwrap();
-            let v = MxArray::from_float32(&[10.0, 20.0], &[1, 1, 2, 1]).unwrap();
-            let (rk, _) = kv.update_and_fetch(&k, &v).unwrap();
-            if !try_eval_or_skip(&rk, "snapshot_all_restore_all_round_trip::prime") {
-                return;
-            }
-        }
         // Prime the linear cache.
         if let Some(arrays) = caches[1].as_arrays_cache_mut() {
             let c0 = MxArray::from_float32(&[7.0, 8.0], &[1, 2]).unwrap();
             arrays.set(0, c0).unwrap();
         }
 
-        let snaps = snapshot_all(&caches).expect("snapshot_all");
+        let snaps = snapshot_all_mtp(&caches).expect("snapshot_all_mtp");
         assert_eq!(snaps.len(), 2);
 
-        // Advance both caches past the snapshot.
-        if let Qwen3_5LayerCache::FullAttention(kv) = &mut caches[0] {
-            let k = MxArray::from_float32(&[99.0], &[1, 1, 1, 1]).unwrap();
-            let v = MxArray::from_float32(&[99.0], &[1, 1, 1, 1]).unwrap();
-            kv.update_and_fetch(&k, &v).unwrap();
-            assert_eq!(kv.get_offset(), 3);
-        }
+        // Advance the linear cache past the snapshot.
         if let Some(arrays) = caches[1].as_arrays_cache_mut() {
             arrays
                 .set(0, MxArray::from_float32(&[-1.0, -2.0], &[1, 2]).unwrap())
@@ -696,11 +512,6 @@ mod tests {
 
         restore_all(&mut caches, &snaps).expect("restore_all");
 
-        if let Qwen3_5LayerCache::FullAttention(kv) = &caches[0] {
-            assert_eq!(kv.get_offset(), 2);
-        } else {
-            panic!("layer 0 must remain FullAttention");
-        }
         if let Some(arrays) = caches[1].as_arrays_cache_mut() {
             assert_eq!(
                 vec_of(arrays.get(0).expect("conv_state restored")),
@@ -710,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_all_mtp_skips_empty_fullattention_shell_on_paged() {
+    fn snapshot_all_mtp_keeps_a_fullattention_placeholder() {
         // Mirror the paged-MTP layout: a FullAttention slot is a vestigial
         // shell (empty K/V, offset 0) because its real K/V lives in the paged
         // adapter pool, alongside a Linear (GDN) slot whose recurrent state
@@ -725,14 +536,11 @@ mod tests {
                 .unwrap();
         }
 
-        // The paged-aware snapshot must NOT call `snapshot()` on the empty
-        // shell (that trips its flat-only debug-assert in dev builds); it
-        // emits a placeholder instead and snapshots the Linear slot normally.
-        let snaps = snapshot_all_mtp(&caches, true).expect("paged snapshot must not panic");
+        let snaps = snapshot_all_mtp(&caches).expect("snapshot");
         assert_eq!(snaps.len(), 2);
         assert!(
-            matches!(snaps[0], Qwen3_5LayerSnapshot::FullAttention { offset: 0 }),
-            "paged FullAttention shell must snapshot as an offset-0 placeholder",
+            matches!(snaps[0], Qwen3_5LayerSnapshot::FullAttention),
+            "the FullAttention shell snapshots as a placeholder",
         );
         assert!(
             matches!(snaps[1], Qwen3_5LayerSnapshot::Linear { .. }),
@@ -811,53 +619,10 @@ mod tests {
         }
     }
 
+    /// A tape-less (full-attention) layer keeps its K/V in the adapter pool,
+    /// so the replay leaves the vestigial shell alone.
     #[test]
-    fn restore_full_attention_rejects_grow_attempt() {
-        // Prime cache to offset=4, then try to restore with a snapshot
-        // whose offset is 10 — that would be a "grow via restore", which
-        // KVCache::trim silently no-ops. The new defensive check must
-        // surface an error naming both offsets.
-        let mut cache = Qwen3_5LayerCache::new_full_attention();
-        let Qwen3_5LayerCache::FullAttention(kv) = &mut cache else {
-            unreachable!()
-        };
-        let k = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]).unwrap();
-        let v = MxArray::from_float32(&[10.0, 20.0, 30.0, 40.0], &[1, 1, 4, 1]).unwrap();
-        let (rk, _) = kv.update_and_fetch(&k, &v).unwrap();
-        if !try_eval_or_skip(&rk, "restore_full_attention_rejects_grow_attempt::prime") {
-            return;
-        }
-        assert_eq!(kv.get_offset(), 4);
-
-        let bogus_snap = Qwen3_5LayerSnapshot::FullAttention { offset: 10 };
-        let err = cache
-            .restore(&bogus_snap)
-            .expect_err("must reject snapshot offset > current offset");
-        let msg = err.reason.to_string();
-        assert!(
-            msg.contains("10") && msg.contains("4"),
-            "error message must include both offsets (got: {msg})",
-        );
-
-        // Offset must be unchanged after the rejected restore.
-        if let Qwen3_5LayerCache::FullAttention(kv) = &cache {
-            assert_eq!(kv.get_offset(), 4);
-        } else {
-            unreachable!();
-        }
-    }
-    /// The extracted eager-MTP GDN rewind is BACKEND-AWARE at exactly one
-    /// place: a tape-less (full-attention) layer. On the FLAT lane its K/V
-    /// lives here and is trimmed to `snapshot_offset + steps`; on the PAGED
-    /// lane it lives in the adapter pool and the vestigial shell must be left
-    /// alone — trimming a shell whose offset is 0 to `0 + steps` would invent
-    /// a frontier for rows this cache never held.
-    ///
-    /// Catches, verified by mutation: dropping the `if paged { continue }` arm
-    /// in `replay_mtp_snapshot_to`. The paged leg then errors on the shell's
-    /// mismatched snapshot instead of skipping it.
-    #[test]
-    fn replay_skips_the_full_attention_shell_on_paged_and_trims_it_on_flat() {
+    fn replay_skips_the_full_attention_shell() {
         let mut caches = vec![Qwen3_5LayerCache::new_full_attention()];
         let k = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]).unwrap();
         let v = MxArray::from_float32(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 4, 1]).unwrap();
@@ -869,26 +634,14 @@ mod tests {
             kv.update_and_fetch(&k, &v).unwrap();
             assert_eq!(kv.get_offset(), 4);
         }
-        // A snapshot taken two tokens back, i.e. a cycle that wrote 2 rows.
-        let snap = vec![Qwen3_5LayerSnapshot::FullAttention { offset: 2 }];
+        let snap = vec![Qwen3_5LayerSnapshot::FullAttention];
         let tape: Vec<Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>> = vec![None];
-
-        // PAGED: the pool owns the K/V, so this cache is untouched.
-        replay_mtp_snapshot_to(&mut caches, &snap, &tape, 1, true, "paged replay")
-            .expect("the paged replay must skip the shell, not fail on it");
+        replay_mtp_snapshot_to(&mut caches, &snap, &tape, 1, "replay")
+            .expect("the replay must skip the shell, not fail on it");
         assert_eq!(
             caches[0].offset(),
             4,
-            "a paged replay must not move the vestigial full-attention shell"
-        );
-
-        // FLAT: the same call rewinds to snapshot_offset + steps.
-        replay_mtp_snapshot_to(&mut caches, &snap, &tape, 1, false, "flat replay")
-            .expect("flat replay");
-        assert_eq!(
-            caches[0].offset(),
-            3,
-            "a flat replay rewinds full-attention K/V to snapshot_offset + steps"
+            "a replay must not move the vestigial full-attention shell"
         );
     }
 
@@ -903,32 +656,23 @@ mod tests {
             recurrent_state: None,
         }];
         let tape: Vec<Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>> = Vec::new();
-        let err = replay_mtp_snapshot_to(&mut caches, &snap, &tape, 0, false, "ctx")
+        let err = replay_mtp_snapshot_to(&mut caches, &snap, &tape, 0, "ctx")
             .expect_err("a short tape must be refused");
         assert!(err.reason.contains("length mismatch"), "{}", err.reason);
         assert!(err.reason.contains("ctx"), "{}", err.reason);
     }
 
     #[test]
-    fn replay_rejects_a_missing_linear_tape_on_both_cache_backends() {
-        for paged in [false, true] {
-            let mut caches = vec![Qwen3_5LayerCache::new_linear()];
-            let snap = vec![Qwen3_5LayerSnapshot::Linear {
-                conv_state: None,
-                recurrent_state: None,
-            }];
-            for steps in [0, 1] {
-                let err = replay_mtp_snapshot_to(
-                    &mut caches,
-                    &snap,
-                    &[None],
-                    steps,
-                    paged,
-                    "missing tape",
-                )
+    fn replay_rejects_a_missing_linear_tape() {
+        let mut caches = vec![Qwen3_5LayerCache::new_linear()];
+        let snap = vec![Qwen3_5LayerSnapshot::Linear {
+            conv_state: None,
+            recurrent_state: None,
+        }];
+        for steps in [0, 1] {
+            let err = replay_mtp_snapshot_to(&mut caches, &snap, &[None], steps, "missing tape")
                 .expect_err("paged K/V ownership does not excuse a missing recurrent tape");
-                assert!(err.reason.contains("no GDN tape"), "{}", err.reason);
-            }
+            assert!(err.reason.contains("no GDN tape"), "{}", err.reason);
         }
     }
 }

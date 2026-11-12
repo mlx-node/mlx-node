@@ -846,7 +846,7 @@ fn apply_weights_moe_inner_with_residency(
         ensure_kquant_storage_resolves_kquant(params, "embedding", plq.mode, "qwen3_5_moe")?;
         ensure_row_major_kquant_layout(plq, "embedding", "qwen3_5_moe")?;
         ensure_affine_biases_present(params, "embedding", plq.mode, "qwen3_5_moe")?;
-        // Dense/MoE flat, paged, MTP, and VLM consumers now carry `Embedding`
+        // Dense/MoE paged, MTP, and VLM consumers now carry `Embedding`
         // itself and dispatch lookup/projection through its packed-aware APIs.
         // Keep measured sub-byte affine embeddings packed independent of the
         // configured backend, declared MTP depth, or vision presence. Runtime
@@ -1655,34 +1655,6 @@ fn load_vision_encoder_moe(
     Ok(vision_params)
 }
 
-/// Pin a sym8 checkpoint to the flat (eager int8) KV path, mirroring the
-/// dense loader's sym8 pin (`qwen3_5/persistence.rs`).
-///
-/// A sym8 MoE checkpoint on the block-paged path fails its FIRST paged KV
-/// write: sym8 convert stores norm weights as f32 (the affine twin stores
-/// bf16), and `fast::rms_norm` promotes its output to
-/// `result_type(x, weight)`, so K leaves `k_norm` as f32 while V — which has
-/// no norm and comes straight out of the bf16-emitting int8 kernels — stays
-/// bf16. The paged pool's `update_keys_values` hard-rejects mixed K/V dtypes
-/// (its kernel templates on a single 2-byte KV element type), aborting the
-/// generation with "keys/values dtype mismatch (Float32 vs BFloat16)". The
-/// flat `KVCache` has no such gate, so the flat path is the validated one.
-fn pin_sym8_to_flat_kv_cache(
-    config: &mut Qwen3_5MoeConfig,
-    top_level_mode: Option<PerLayerMode>,
-    per_layer_quant: &HashMap<String, PerLayerQuant>,
-) {
-    if has_sym8_mode(top_level_mode, per_layer_quant) && config.use_block_paged_cache == Some(true)
-    {
-        warn!(
-            "Qwen3.5-MoE: sym8 checkpoint requested block-paged KV cache; \
-             sym8 is validated on the flat (eager int8) path only — \
-             forcing use_block_paged_cache=false."
-        );
-        config.use_block_paged_cache = Some(false);
-    }
-}
-
 /// The float dtype the checkpoint's residual stream runs in.
 ///
 /// `dtype` is the current Transformers spelling and `torch_dtype` the legacy
@@ -1791,7 +1763,7 @@ fn align_affine_embedding_dtype(
 }
 
 /// Aligns the affine embedding sidecars with the checkpoint's residual stream,
-/// then pins the flat K/V format the resulting compute dtype allows
+/// then pins the K/V format the resulting compute dtype allows
 /// (`requested` and config.json `kv_format` win). The format must follow the
 /// alignment: the embedding's dtype after it is the model's compute dtype.
 fn settle_compute_dtype(
@@ -2120,12 +2092,6 @@ pub(crate) async fn load_with_source(
                     mtp_linear_suffixes,
                     &mut per_layer_quant,
                 )?;
-
-                // sym8 emits mixed-dtype K/V (f32 K after the f32-weight
-                // k_norm, bf16 V) which the block-paged pool hard-rejects;
-                // force the flat path before `Qwen35MoeInner::new` builds
-                // the paged adapter. See `pin_sym8_to_flat_kv_cache`.
-                pin_sym8_to_flat_kv_cache(&mut config, top_level_mode, &per_layer_quant);
 
                 if quant_cfg.is_some() {
                     info!(
@@ -2571,18 +2537,6 @@ pub(crate) fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
             }),
         paged_cache_memory_mb: paged.paged_cache_memory_mb,
         paged_block_size: paged.paged_block_size,
-        use_block_paged_cache: {
-            let explicit = paged.use_block_paged_cache;
-            let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
-            let resolved = crate::models::qwen3_5::config::resolve_qwen35_paged_default(
-                explicit,
-                env_override.as_deref(),
-            );
-            // Match dense Qwen3.5: paged is the default for compatible text
-            // and vision checkpoints. Explicit false remains a diagnostic
-            // escape hatch; sym8 is forced flat after quant metadata is known.
-            resolved
-        },
         // Persist the out-of-pool GDN recurrent state to the SSD cold tier. Off
         // unless explicitly present as a bool (the agent overlay / a config
         // override). `MLX_PERSIST_PAGED_CACHE` supplies the env default at load
@@ -2804,7 +2758,7 @@ mod tests {
     /// `to_dense_config` → red (dense `kv_format` is `Some("bf16")`; on Metal
     /// the default is Bf16, not Int8).
     #[test]
-    fn moe_flat_cache_precision_follows_the_geometry_default_and_explicit_format() {
+    fn moe_kv_format_follows_the_geometry_default_and_explicit_format() {
         use crate::transformer::KvFormat;
         let mut raw = json!({
             "hidden_size": 2048,
@@ -2916,14 +2870,6 @@ mod tests {
         assert_eq!(config.paged_cache_memory_mb, Some(64));
         assert_eq!(config.paged_block_size, None);
         assert_eq!(config.persist_paged_cache, Some(false));
-        let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
-        assert_eq!(
-            config.use_block_paged_cache,
-            crate::models::qwen3_5::config::resolve_qwen35_paged_default(
-                Some(false),
-                env_override.as_deref()
-            )
-        );
     }
 
     /// The MoE body strip (`sanitize_weights`) delegates to the shared
@@ -2944,8 +2890,8 @@ mod tests {
         AttentionType, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DType, MLPType, MxArray,
         PerLayerMode, PerLayerQuant, Qwen3_5MoeConfig, Qwen35MoeInner,
         align_affine_embedding_dtype, apply_weights_moe_inner, declared_residual_dtype,
-        default_per_layer_quant, load_vision_encoder_moe, parse_config, pin_sym8_to_flat_kv_cache,
-        residual_stream_dtype, sanitize_weights,
+        default_per_layer_quant, load_vision_encoder_moe, parse_config, residual_stream_dtype,
+        sanitize_weights,
     };
     use std::collections::HashMap;
 
@@ -3123,7 +3069,7 @@ mod tests {
         );
     }
 
-    /// Gate: the load pins the flat K/V format for the checkpoint's compute
+    /// Gate: the load pins the K/V format for the checkpoint's compute
     /// dtype. An `mlx convert --dtype float16` MoE at 16 x 2 x 256 (f16 norms,
     /// fp32 affine embedding sidecars, a stale `torch_dtype: bfloat16`) gets
     /// BF16 K/V — the int8 verify needs BF16 queries — while the same
@@ -3320,7 +3266,6 @@ mod tests {
             mlp_only_layers: None,
             paged_cache_memory_mb: Some(256),
             paged_block_size: Some(16),
-            use_block_paged_cache: Some(true),
             persist_paged_cache: None,
             n_mtp_layers: 0,
             qwen35_gguf_gdn_layout: None,
@@ -3332,7 +3277,6 @@ mod tests {
     fn mixed_q4k_dense_split_gdn_projections_install_through_moe_loader() {
         let label = "mixed_q4k_dense_split_gdn_projections_install_through_moe_loader";
         let mut config = moe_paged_tiny_cfg();
-        config.use_block_paged_cache = Some(false);
         config.paged_cache_memory_mb = None;
         let mut inner = match Qwen35MoeInner::new(config.clone()) {
             Ok(inner) => inner,
@@ -3435,7 +3379,6 @@ mod tests {
     fn tied_quantized_embedding_loads_via_packed_path_moe() {
         let label = "tied_quantized_embedding_loads_via_packed_path_moe";
         let mut cfg = moe_paged_tiny_cfg();
-        cfg.use_block_paged_cache = Some(false);
         cfg.paged_cache_memory_mb = None;
         cfg.n_mtp_layers = 1;
 
@@ -3595,7 +3538,6 @@ mod tests {
             mlp_only_layers: None,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            use_block_paged_cache: None,
             persist_paged_cache: None,
             n_mtp_layers: 0,
             qwen35_gguf_gdn_layout: None,
@@ -4706,76 +4648,6 @@ mod tests {
             inner.image_processor.is_none(),
             "sym8 checkpoint must NOT install the image processor"
         );
-    }
-
-    /// A sym8 checkpoint that requests the block-paged KV cache must be
-    /// pinned to the flat path (see `pin_sym8_to_flat_kv_cache`): sym8's f32
-    /// norm weights promote K to f32 after `k_norm` while V stays bf16, and
-    /// the paged pool's `update_keys_values` hard-rejects mixed K/V dtypes —
-    /// the first paged generation would abort. Asserts the EFFECTIVE cache
-    /// mode (`paged_adapter` presence), not just the config bit, for both the
-    /// pinned sym8 config and an affine control.
-    #[test]
-    fn sym8_checkpoint_pins_flat_kv_cache() {
-        // Top-level sym8 mode: the pin fires and the built model is flat.
-        let mut cfg = moe_paged_tiny_cfg();
-        assert_eq!(cfg.use_block_paged_cache, Some(true));
-        pin_sym8_to_flat_kv_cache(&mut cfg, Some(PerLayerMode::Sym8), &HashMap::new());
-        assert_eq!(
-            cfg.use_block_paged_cache,
-            Some(false),
-            "sym8 top-level mode must force use_block_paged_cache=false"
-        );
-        let inner = Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed");
-        assert!(
-            inner.paged_adapter.is_none(),
-            "pinned sym8 model must run the flat KV path (no paged adapter)"
-        );
-
-        // Per-layer-only sym8 (no top-level mode) must pin too — has_sym8_mode
-        // covers both shapes.
-        let mut cfg = moe_paged_tiny_cfg();
-        let mut per_layer_quant = HashMap::new();
-        per_layer_quant.insert(
-            "layers.0.self_attn.q_proj".to_string(),
-            default_per_layer_quant(8, -1, PerLayerMode::Sym8),
-        );
-        pin_sym8_to_flat_kv_cache(&mut cfg, None, &per_layer_quant);
-        assert_eq!(
-            cfg.use_block_paged_cache,
-            Some(false),
-            "a per-layer sym8 override must force use_block_paged_cache=false"
-        );
-
-        // Affine control: the paged request survives and the adapter builds
-        // (on hosts with the paged backend available).
-        let mut cfg = moe_paged_tiny_cfg();
-        pin_sym8_to_flat_kv_cache(&mut cfg, Some(PerLayerMode::Affine), &HashMap::new());
-        assert_eq!(
-            cfg.use_block_paged_cache,
-            Some(true),
-            "affine checkpoints must keep their block-paged request"
-        );
-        if crate::engine::persistence::compiled_forward_backend_available() {
-            let mut inner = Qwen35MoeInner::new(cfg).expect("Qwen35MoeInner::new must succeed");
-            inner
-                .initialize_paged_adapter()
-                .expect("post-load paged adapter initialization must succeed");
-            assert!(
-                inner.paged_adapter.is_some(),
-                "affine paged config must build the paged adapter"
-            );
-            let pool_bytes = inner
-                .paged_adapter
-                .as_ref()
-                .expect("paged adapter")
-                .pool_allocated_bytes()
-                .expect("paged pool byte accounting");
-            assert!(
-                pool_bytes > 0,
-                "paged pool must report its private Metal bytes"
-            );
-        }
     }
 
     /// A packed (non-float) member of a PARTIAL quant group must fail loud

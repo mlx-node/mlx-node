@@ -3,10 +3,9 @@
 //!
 //! It builds a TINY random-init MoE checkpoint that ships a real MTP head,
 //! reloads it, and decodes the same prompt with MTP off (plain AR reference)
-//! and on. The fixture pins `use_block_paged_cache: false`, so this is the
-//! always-on route through `MoeMtpStepper`'s FLAT mode — the PAGED mode needs
-//! real PagedAttention head geometry and is gated on a real checkpoint by
-//! `qwen3_5_moe_paged_mtp_parity.rs`.
+//! and on, on the block-paged pool (8 / 2 heads of 128: a kernel geometry).
+//! This is the always-on route through `MoeMtpStepper`; the real-weights
+//! parity lives in `qwen3_5_moe_paged_mtp_parity.rs`.
 //!
 //! What the test asserts — all four are deterministic on random weights:
 //! 1. `has_mtp_weights()` is true after reload (gates the random-save
@@ -45,10 +44,9 @@ use mlx_core::tokenizer::ChatMessage;
 /// the single decoder layer (and the MTP layer pinned at
 /// `fa_idx = interval - 1 = 0`) full-attention, so no GDN state is involved;
 /// `decoder_sparse_step: 1` makes layer 0 MoE-flavored, which is the flavor
-/// the MTP loader gate expects for this config. `use_block_paged_cache` is
-/// explicitly disabled because this MTP-only fixture deliberately uses a
-/// tiny 16-wide attention head, which is not valid PagedAttention geometry,
-/// and the eager MTP arm must remain reachable.
+/// the MTP loader gate expects for this config. The attention geometry (a
+/// query group of 4, head 128) has a paged-attention kernel, so the load
+/// builds the pool every Qwen3.5 turn runs on.
 ///
 /// `vocab_size` MUST cover every id the real Qwen tokenizer can emit
 /// (chat-template special tokens reach id ~248076 on the Qwen3.5 tokenizer):
@@ -62,11 +60,11 @@ fn tiny_mtp_config() -> Qwen3_5MoeConfig {
         vocab_size: 250_000,
         hidden_size: 64,
         num_layers: 1,
-        num_heads: 4,
+        num_heads: 8,
         num_kv_heads: 2,
         intermediate_size: 128,
         rms_norm_eps: 1e-6,
-        head_dim: 16,
+        head_dim: 128,
         tie_word_embeddings: true,
         attention_bias: false,
         max_position_embeddings: 512,
@@ -90,12 +88,40 @@ fn tiny_mtp_config() -> Qwen3_5MoeConfig {
         mlp_only_layers: None,
         paged_cache_memory_mb: None,
         paged_block_size: None,
-        use_block_paged_cache: Some(false),
         persist_paged_cache: None,
         n_mtp_layers: 1,
         qwen35_gguf_gdn_layout: None,
         kv_format: None,
         rope_scaling: None,
+    }
+}
+
+/// Rewrite the random-init (f32) checkpoint in BF16, the element type the
+/// pool's operands take (Splash io is bf16); `A_log` stays f32 as in a
+/// converted checkpoint.
+fn store_bf16(dir: &Path) {
+    use mlx_core::array::DType;
+    use mlx_core::utils::safetensors::{load_safetensors_lazy, save_safetensors};
+    for entry in std::fs::read_dir(dir).expect("read checkpoint dir") {
+        let path = entry.expect("checkpoint dir entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("safetensors") {
+            continue;
+        }
+        let mut tensors = load_safetensors_lazy(&path).expect("load random checkpoint");
+        for (name, tensor) in tensors.iter_mut() {
+            if !name.ends_with("A_log") && tensor.dtype().expect("dtype") == DType::Float32 {
+                *tensor = tensor.astype(DType::BFloat16).expect("cast to bf16");
+            }
+            tensor.eval();
+        }
+        let staged = path.with_extension("bf16");
+        save_safetensors(
+            &staged,
+            &mut tensors,
+            Some(serde_json::json!({ "format": "mlx" })),
+        )
+        .expect("save bf16 checkpoint");
+        std::fs::rename(&staged, &path).expect("replace the f32 shard");
     }
 }
 
@@ -213,6 +239,7 @@ pub async fn run_synthetic_mtp_gate(mode_label: &str) {
 
     create_random_qwen35_moe_checkpoint_sync(tiny_mtp_config(), &ckpt_path)
         .expect("failed to create random MoE+MTP checkpoint");
+    store_bf16(&ckpt_dir);
     // The chat template lives in tokenizer_config.json next to
     // tokenizer.json; copy both (plus a standalone template if the source
     // checkpoint ships one).

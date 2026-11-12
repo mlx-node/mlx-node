@@ -236,6 +236,7 @@ impl KvLayout {
     }
 
     /// K/V and index bytes of one token row across every layer.
+    #[cfg(test)]
     pub(crate) fn row_bytes(&self) -> u64 {
         self.page_bytes() / KV_PAGE_TOKENS
     }
@@ -411,13 +412,6 @@ impl PoolInput<'_> {
     }
 }
 
-/// The flat KV lane of a load without a pool: KV grows by a copy of one of
-/// `copy_layers` layers (`None`: no copy).
-pub(crate) struct FlatInput<'a> {
-    pub shape: LaneShape<'a>,
-    pub copy_layers: Option<u64>,
-}
-
 /// Splash `ContextBounds` without spilling: the trained window and the
 /// longest one resident KV holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -468,7 +462,6 @@ pub(crate) struct LanePlan {
     /// KV of the window and its scratch rows, in whole extents.
     pub kv_bytes: u64,
     pub transient_bytes: u64,
-    pub copy_bytes: u64,
     /// Splash `minimumDynamicBytes`: the lane, the KV runway and the
     /// transient of a turn as long as the runway.
     pub minimum_bytes: u64,
@@ -505,8 +498,6 @@ pub(crate) struct MemoryPlan {
     pub fixed_bytes: u64,
     pub dynamic_budget_bytes: u64,
     pub pool: Option<PoolPlan>,
-    /// The flat autoregressive lane of a load without a pool.
-    pub flat: Option<LanePlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -671,9 +662,10 @@ enum LaneKv<'a> {
         state: &'a dyn Fn(u32) -> u64,
         state_in_pool: bool,
     },
-    Flat {
-        copy_layers: Option<u64>,
-    },
+    /// Splash `KvExtent` arithmetic with no grow copy and no state: the
+    /// dynamic budget less the lane and the transient.
+    #[cfg(test)]
+    Extents,
 }
 
 impl LaneKv<'_> {
@@ -681,22 +673,8 @@ impl LaneKv<'_> {
     fn state_bytes(&self, window: u32) -> u64 {
         match *self {
             Self::Pool { state, .. } => state(window),
-            Self::Flat { .. } => 0,
-        }
-    }
-
-    fn copy_bytes(&self, shape: &LaneShape<'_>, window: u32) -> u64 {
-        match *self {
-            Self::Pool { .. }
-            | Self::Flat {
-                copy_layers: None, ..
-            } => 0,
-            Self::Flat {
-                copy_layers: Some(layers),
-                ..
-            } => (u64::from(window) + shape.scratch_rows)
-                .saturating_mul(shape.layout.row_bytes())
-                .div_ceil(layers.max(1)),
+            #[cfg(test)]
+            Self::Extents => 0,
         }
     }
 
@@ -731,18 +709,18 @@ impl LaneKv<'_> {
                     .saturating_sub(in_pool);
                 (blocks, kv)
             }
-            Self::Flat { .. } => {
-                let kv = dynamic
+            #[cfg(test)]
+            Self::Extents => (
+                0,
+                dynamic
                     .saturating_sub(shape.lane_bytes)
-                    .saturating_sub(transient)
-                    .saturating_sub(self.copy_bytes(shape, window));
-                (0, kv)
-            }
+                    .saturating_sub(transient),
+            ),
         }
     }
 }
 
-/// One lane's plan and the pool blocks at its window (0 for a flat lane).
+/// One lane's plan and the pool blocks at its window.
 fn plan_lane(dynamic: u64, shape: &LaneShape<'_>, kv: LaneKv<'_>) -> (LanePlan, u64) {
     let fits = |window: u32| {
         let (_, bytes) = kv.budget(dynamic, shape, window);
@@ -777,20 +755,18 @@ fn plan_lane(dynamic: u64, shape: &LaneShape<'_>, kv: LaneKv<'_>) -> (LanePlan, 
         capacity_pages,
         kv_bytes,
         transient_bytes: (shape.transient)(window),
-        copy_bytes: kv.copy_bytes(shape, window),
         minimum_bytes,
     };
     (plan, blocks)
 }
 
 impl MemoryPlan {
-    /// Splash `evaluateEngineMemoryPlan` over the lanes this load serves:
-    /// the paged pool lane (every turn's, a DFlash2 turn's included), or the
-    /// flat autoregressive lane of a load without a pool.
+    /// Splash `evaluateEngineMemoryPlan` over the paged pool lane (every
+    /// turn's, a DFlash2 turn's included); a load without a pool plans its
+    /// footprint only.
     pub(crate) fn evaluate(
         footprint: MemoryFootprint,
         pool: Option<PoolInput<'_>>,
-        flat: Option<FlatInput<'_>>,
     ) -> Result<Self, PlanError> {
         let working_set = footprint.working_set_bytes;
         let margin_bytes = working_set_margin_bytes(working_set);
@@ -812,22 +788,10 @@ impl MemoryPlan {
         let dynamic = hard_budget_bytes.saturating_sub(fixed_bytes);
 
         let pool_plan = pool.as_ref().map(|input| input.plan_at(dynamic));
-        let flat_plan = flat.as_ref().map(|input| {
-            plan_lane(
-                dynamic,
-                &input.shape,
-                LaneKv::Flat {
-                    copy_layers: input.copy_layers,
-                },
-            )
-            .0
-        });
-
-        let lanes = pool_plan.iter().map(|pool| pool.lane).chain(flat_plan);
-        let minimum = lanes.clone().map(|lane| lane.minimum_bytes).max();
-        if let Some(minimum) = minimum
-            && (dynamic < minimum || lanes.clone().any(|lane| lane.extent_pages == 0))
+        if let Some(lane) = pool_plan.map(|pool| pool.lane)
+            && (dynamic < lane.minimum_bytes || lane.extent_pages == 0)
         {
+            let minimum = lane.minimum_bytes;
             return Err(PlanError::KvPoolDoesNotFit {
                 required: fixed_bytes.saturating_add(minimum),
                 budget: hard_budget_bytes,
@@ -847,7 +811,6 @@ impl MemoryPlan {
             fixed_bytes,
             dynamic_budget_bytes: dynamic,
             pool: pool_plan,
-            flat: flat_plan,
         })
     }
 
@@ -929,7 +892,6 @@ impl MemoryPlan {
             fixed_bytes: 0,
             dynamic_budget_bytes: 0,
             pool: None,
-            flat: None,
         }
     }
 
@@ -945,7 +907,6 @@ impl MemoryPlan {
             capacity_pages: 0,
             kv_bytes: 0,
             transient_bytes: 0,
-            copy_bytes: 0,
             minimum_bytes: 0,
         }
     }
@@ -957,16 +918,6 @@ impl MemoryPlan {
         Self {
             hard_budget_bytes: u64::MAX,
             dynamic_budget_bytes: dynamic,
-            ..Self::bare()
-        }
-    }
-
-    /// A plan whose flat lane holds `resident` tokens and nothing else.
-    #[cfg(test)]
-    pub(crate) fn with_flat_window(resident: u32) -> Self {
-        Self {
-            hard_budget_bytes: u64::MAX,
-            flat: Some(Self::bare_lane(resident, 0, 1)),
             ..Self::bare()
         }
     }
@@ -1083,15 +1034,14 @@ impl MemoryPlan {
             let _ = write!(
                 out,
                 "\n{name}: context {} tokens ({}; window {}, resident {}); lane state {}, \
-                 transient {}, growth copy {}, KV {} in extents of {} pages ({} pages of \
-                 capacity), minimum dynamic {}",
+                 transient {}, KV {} in extents of {} pages ({} pages of capacity), minimum \
+                 dynamic {}",
                 lane.window.maximum(),
                 lane.window.bound(),
                 lane.window.window,
                 lane.window.resident,
                 bytes_and_mib(lane.lane_bytes),
                 bytes_and_mib(lane.transient_bytes),
-                bytes_and_mib(lane.copy_bytes),
                 bytes_and_mib(lane.kv_bytes),
                 lane.extent_pages,
                 lane.capacity_pages,
@@ -1107,9 +1057,6 @@ impl MemoryPlan {
                 pool.runway_blocks
             );
             lane(&mut out, "pool lane", &pool.lane);
-        }
-        if let Some(flat) = &self.flat {
-            lane(&mut out, "flat lane", flat);
         }
         out
     }

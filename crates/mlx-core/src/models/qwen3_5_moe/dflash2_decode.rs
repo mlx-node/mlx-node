@@ -118,12 +118,10 @@ impl Qwen35MoeDFlash2Stepper<'_> {
                 .map(|_| ())
                 .map_err(Error::from_reason)
         })?;
-        let snapshot = snapshot_all_mtp(
-            self.inner.caches.as_ref().ok_or_else(|| {
+        let snapshot =
+            snapshot_all_mtp(self.inner.caches.as_ref().ok_or_else(|| {
                 Error::from_reason("Qwen3.5 MoE DFlash2 target caches are absent")
-            })?,
-            true,
-        )?;
+            })?)?;
         let ticket =
             crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq, full.len())
                 .map_err(Error::from_reason)?;
@@ -435,7 +433,6 @@ impl DsparkStepper for Qwen35MoeDFlash2Stepper<'_> {
                     &snapshot,
                     &tape,
                     keep,
-                    true,
                     "Qwen3.5 MoE DFlash2 commit",
                 )?;
             }
@@ -887,7 +884,6 @@ mod tests {
         adjust: impl FnOnce(&mut super::super::config::Qwen3_5MoeConfig),
     ) -> Qwen35MoeInner {
         let mut inner = super::super::model::scheduled_mtp::seeded_inner_with_config(seed, adjust);
-        inner.paged_adapter = None;
         let mut head = Linear::new(
             inner.config.hidden_size as u32,
             inner.config.vocab_size as u32,

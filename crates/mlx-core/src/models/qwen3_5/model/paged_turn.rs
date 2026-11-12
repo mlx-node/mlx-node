@@ -3,12 +3,9 @@
 use super::*;
 
 impl Qwen35Inner {
-    /// Block-paged variant of [`Self::vision_mtp_whole_turn_core`].
-    ///
-    /// Mirrors the flat path's control flow (penalty stack, decode
-    /// loop, EOS / repetition cutoff, performance timing, output
-    /// post-processing) but routes full-attention layers through
-    /// `forward_paged_or_flat` against the paged KV adapter. GDN
+    /// The block-paged whole-turn core: penalty stack, decode loop, EOS /
+    /// repetition cutoff, performance timing and output post-processing,
+    /// with full-attention layers on the paged KV adapter. GDN
     /// (linear-attention) layers continue to use their existing
     /// `Qwen3_5LayerCache::Linear(ArraysCache)` storage and are
     /// reset+re-prefilled every turn (no cross-request prefix reuse —
@@ -49,14 +46,8 @@ impl Qwen35Inner {
         }
         self.preflight_paged_context(tokens.len(), &mut p)?;
 
-        // This paged turn writes full-attention K/V into the paged adapter
-        // pool, NOT the flat `self.caches`, so the flat full-attention slots no
-        // longer reflect the conversation. A later streaming dense-MTP fallback
-        // must rebuild the flat caches before decoding. See
-        // `paged_full_attn_caches_dirty`.
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
-        self.paged_full_attn_caches_dirty = true;
         self.dflash2_prefix
             .note_drop("paged_turn_sync_core", DropKind::Dirtied);
 
@@ -82,11 +73,7 @@ impl Qwen35Inner {
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
-        // Per-block extra_keys for prefix-cache lookup. Text-only dispatch
-        // (image-bearing turns route to the flat path) yields all-empty
-        // per-block vecs; the resulting hashes are bit-equal to passing `&[]`
-        // to the uniform API. VLM-paged forward integration would swap in real
-        // image-position pairs here to enable image-aware cache isolation.
+        // Text-only turns: all-empty per-block extra_keys, bit-equal to `&[]`.
         let block_size = {
             let adapter = self
                 .paged_adapter
@@ -126,8 +113,8 @@ impl Qwen35Inner {
         {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason(
-                    "paged_turn_sync_core: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
+                    "paged_turn_sync_core: paged_adapter is None — this load has \
+                     no block-paged pool",
                 )
             })?;
             live_ready = adapter.is_live_for_continue();
@@ -156,8 +143,8 @@ impl Qwen35Inner {
                     .as_mut()
                     .ok_or_else(|| {
                         Error::from_reason(
-                            "paged_turn_sync_core: paged_adapter is None — caller must check \
-                             use_block_paged_cache before dispatch",
+                            "paged_turn_sync_core: paged_adapter is None — this load has \
+                             no block-paged pool",
                         )
                     })?
                     .prepare_turn_per_block_with_max_cache_hit_tokens(
@@ -284,10 +271,8 @@ impl Qwen35Inner {
             }
         };
 
-        // Persist the full token history so subsequent
-        // `chat_session_continue` /
-        // `chat_tokens_delta_sync` calls find an initialized session
-        // to extend. The paged decode loop never feeds the LAST
+        // Persist the full token history so a subsequent
+        // `chat_session_continue` finds an initialized session to extend. The paged decode loop never feeds the LAST
         // sampled token through the model, so drop it from the
         // saved history (mirrors LFM2 / Qwen3 paged path).
         let last_token_in_cache = false;
@@ -658,12 +643,8 @@ impl Qwen35Inner {
                 }
             };
 
-        // This paged turn writes full-attention K/V into the paged adapter pool,
-        // leaving the flat `self.caches` full-attention slots stale. A later
-        // dense-MTP fallback must rebuild them first.
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
-        self.paged_full_attn_caches_dirty = true;
         self.dflash2_prefix
             .note_drop("vision_paged_turn_sync_core", DropKind::Dirtied);
 
@@ -1051,7 +1032,6 @@ impl Qwen35Inner {
 
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
-        self.paged_full_attn_caches_dirty = true;
         self.dflash2_prefix
             .note_drop("vision_paged_turn_stream_core", DropKind::Dirtied);
 
@@ -1462,7 +1442,7 @@ impl Qwen35Inner {
         Ok(())
     }
 
-    /// Block-paged streaming variant of [`Self::chat_stream_sync_inner`].
+    /// The block-paged streaming whole-turn core.
     ///
     /// Mirrors `paged_turn_sync_core`'s adapter lifecycle and
     /// per-layer dispatch but emits each generated token through the
@@ -1506,13 +1486,8 @@ impl Qwen35Inner {
         }
         self.preflight_paged_context(tokens.len(), &mut p)?;
 
-        // This paged turn writes full-attention K/V into the paged adapter
-        // pool, NOT the flat `self.caches`, so a later streaming dense-MTP
-        // fallback must rebuild the flat caches before decoding. See
-        // `paged_full_attn_caches_dirty`.
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
-        self.paged_full_attn_caches_dirty = true;
         self.dflash2_prefix
             .note_drop("paged_turn_stream_core", DropKind::Dirtied);
 
@@ -1584,8 +1559,8 @@ impl Qwen35Inner {
         {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason(
-                    "paged_turn_stream_core: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
+                    "paged_turn_stream_core: paged_adapter is None — this load has \
+                     no block-paged pool",
                 )
             })?;
             live_ready = adapter.is_live_for_continue();
@@ -1614,8 +1589,8 @@ impl Qwen35Inner {
                     .as_mut()
                     .ok_or_else(|| {
                         Error::from_reason(
-                            "paged_turn_stream_core: paged_adapter is None — caller must check \
-                             use_block_paged_cache before dispatch",
+                            "paged_turn_stream_core: paged_adapter is None — this load has \
+                             no block-paged pool",
                         )
                     })?
                     .prepare_turn_per_block_with_max_cache_hit_tokens(
@@ -2312,5 +2287,65 @@ impl Qwen35Inner {
         }
 
         Ok((generated_tokens, finish_reason, None))
+    }
+}
+
+impl Qwen35Inner {
+    /// Turn-admission speculative reservation for the paged MTP arm: reserve
+    /// the lookahead rows past the (post-prefill) prompt cursor, sized by
+    /// `engine::mtp_turn::turn_lookahead_rows` off the model's
+    /// [`SpeculativePlan`] (I1 — the plan property is the single source).
+    /// This guarantees the FIRST cycle; the engine loop re-reserves the same
+    /// margin before every later cycle through
+    /// [`MtpStepper::reserve_cycle_lookahead`], where exhaustion degrades
+    /// that cycle to a Step-A AR token instead of gating the whole turn.
+    ///
+    /// `Ok(false)` means the pool cannot hold even one verify cycle: the
+    /// caller must run the turn autoregressively instead of erroring it
+    /// (vLLM schedules such a request without its spec tokens rather than
+    /// failing it). AR decode grows one row at a time against the same
+    /// lazily-allocated tail, so it can still make progress where a
+    /// `depth + 1`-row verify write could not. Non-capacity errors (missing
+    /// adapter, poisoned allocator) still fail the turn.
+    pub(super) fn reserve_paged_mtp_lookahead(
+        &mut self,
+        p: &engine::ChatParams,
+        site: &str,
+    ) -> Result<bool> {
+        let Some(plan) = self.execution_plan().speculative else {
+            // The MTP arms gate on `has_mtp_weights()`, which is exactly what
+            // publishes the speculative plan — unreachable, but proceeding
+            // without a reservation only restores lazy allocation.
+            debug_assert!(
+                false,
+                "{site}: paged MTP admission without a speculative plan"
+            );
+            return Ok(true);
+        };
+        let rows = u32::try_from(crate::engine::mtp_turn::turn_lookahead_rows(plan, p))
+            .unwrap_or(u32::MAX);
+        let reserved = crate::models::qwen3_5::dflash2_turn::paged_step_reclaiming(self, |inner| {
+            inner
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| Error::from_reason(format!("{site}: paged_adapter is None")))?
+                .reserve_rows(rows)
+                .map_err(Error::from_reason)
+        });
+        match reserved.map_err(|error| error.reason) {
+            Ok(_) => Ok(true),
+            Err(e) if e.starts_with("context_length_exceeded:") => {
+                tracing::warn!(
+                    target: "mlx_core::qwen3_5::paged",
+                    lookahead_rows = rows,
+                    "{site}: speculative lookahead reservation exhausted the \
+                     paged pool; falling back to autoregressive decode: {e}"
+                );
+                Ok(false)
+            }
+            Err(e) => Err(Error::from_reason(format!(
+                "{site}: speculative lookahead reservation: {e}"
+            ))),
+        }
     }
 }

@@ -408,10 +408,9 @@ larger of the tapped prefill chunk and the 8-row verify cycle with the free
 pool MLX keeps of it (twice the cycle; MLX collects that pool only at 95% of
 the working set). On the M3 Pro inputs (27 GiB working set, the 27B and its
 draft, int8 pool) that is 98,297 tokens for every turn. DFlash2 runs only on
-the block-paged pool: a load with a draft and no pool fails. A load with no
-pool (`use_block_paged_cache: false`, a sym8 checkpoint, no compiled backend)
-is planned on its flat lane, so `maxMemoryBytes` bounds it and can refuse it
-like a paged load. The load
+the block-paged pool: a load with a draft and no pool fails. On Metal every
+Qwen3.5 load serves its turns from the pool (a sym8 checkpoint included);
+only a load off Metal has none, and it plans its weights only. The load
 log prints the plan and which bound wins (`memory` or `model`). A
 `paged_cache_memory_mb` above the plan's pool fails the load with the MiB the
 plan allows, and so does an unreadable Metal working set on a paged load.

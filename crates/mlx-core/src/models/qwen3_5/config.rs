@@ -1,23 +1,5 @@
 use napi_derive::napi;
 
-use crate::models::paged_config::PagedCacheConfig;
-
-/// Resolve the shared dense/MoE Qwen3.5 paged-cache policy.
-///
-/// The environment override is intentionally an input rather than read here:
-/// both loaders use this pure function, and unit tests can pin precedence
-/// without mutating process-global environment state.
-pub(crate) fn resolve_qwen35_paged_default(
-    explicit: Option<bool>,
-    env_override: Option<&str>,
-) -> Option<bool> {
-    match env_override {
-        Some("1") | Some("true") | Some("TRUE") => Some(true),
-        Some("0") | Some("false") | Some("FALSE") => Some(false),
-        _ => PagedCacheConfig::resolve_use_paged_default(explicit, true),
-    }
-}
-
 /// Qwen3.5 model configuration (dense variant).
 ///
 /// For MoE models, use `Qwen3_5MoeConfig` from `qwen3_5_moe`.
@@ -59,56 +41,18 @@ pub struct Qwen3_5Config {
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
 
-    // Paged attention options (default-on, mirror Qwen3/Gemma4/LFM2 knobs).
+    // Block-paged pool options.
     /// Ceiling of the paged KV pool in MiB, at most the memory plan's.
-    /// Only used when `use_block_paged_cache` is true.
     /// Default: the memory plan's.
     #[serde(default)]
     #[napi(ts_type = "number | undefined")]
     pub paged_cache_memory_mb: Option<u32>,
 
     /// Block size for paged attention (tokens per block).
-    /// Only used when `use_block_paged_cache` is true.
     /// Default: 16.
     #[serde(default)]
     #[napi(ts_type = "number | undefined")]
     pub paged_block_size: Option<u32>,
-
-    /// Use the block-paged KV cache adapter (`PagedKVCacheAdapter`) for
-    /// full-attention layers.
-    ///
-    /// When enabled (the default), `Qwen35Inner`
-    /// allocates a `BlockAllocator` + `LayerKVPool` pair sized for the
-    /// model's full-attention layer count and constructs a
-    /// `PagedKVCacheAdapter`. The chat-session forward dispatch routes
-    /// full-attention layers through this adapter while linear-attention
-    /// (GatedDeltaNet / GDN) layers continue to use the existing
-    /// `Qwen3_5LayerCache::Linear(ArraysCache)` path with no
-    /// cross-request prefix reuse — vLLM's `MambaManager`-style "no
-    /// prefix reuse for recurrent layers" stance.
-    ///
-    /// **Paged vs flat eager**: this flag selects the eager paged decode
-    /// over the eager flat decode. When enabled, full-attention
-    /// layers run through the paged adapter (cross-request prefix reuse);
-    /// an explicit false runs eager flat decode. Either way the forward is
-    /// pure-Rust eager.
-    ///
-    /// **VLM under paged**: VLM checkpoints also default this flag ON, so
-    /// dense image turns ONLY run on the paged-vision core. A fresh single-turn
-    /// image-bearing prompt prefills through the paged adapter (M-RoPE positions
-    /// feed the rotary; the merged vision embeddings feed the forward) and
-    /// decodes plain AR — MTP weights are ignored on image turns. Warm
-    /// image-bearing session continues / cache-hit reuse are still rejected at
-    /// runtime (the GDN two-pass warm prefix is not byte-exact). A vision turn
-    /// that reaches a None adapter (explicit `Some(false)`, non-Metal build, or
-    /// a sym8 checkpoint) errors at dispatch.
-    ///
-    /// Load default: `Some(true)` for compatible text and VLM checkpoints.
-    /// Explicit false remains available for flat-path diagnostics; sym8 is
-    /// forced flat by persistence after its storage mode is known.
-    #[serde(default)]
-    #[napi(ts_type = "boolean | undefined")]
-    pub use_block_paged_cache: Option<bool>,
 
     /// Persist the out-of-pool GDN recurrent state (and the paged KV blocks it
     /// gates) to the SSD cold tier so warm prefixes survive process restarts.
@@ -133,12 +77,12 @@ pub struct Qwen3_5Config {
     #[napi(ts_type = "string | undefined")]
     pub qwen35_gguf_gdn_layout: Option<String>,
 
-    /// Element format of the full-attention K/V, the block-paged pool's and
-    /// the flat cache's: `"int8"` (per-(token, head) symmetric int8 rows
-    /// with one fp32 scale each — half the K/V memory and read bandwidth;
-    /// see `crate::array::kv_int8`) or `"bf16"`. Unset: int8 where the int8
-    /// kernels serve the model (Metal, head 256, BF16 compute, a 16- or
-    /// 32-token paged block), else BF16 — see `kv_format_for()`.
+    /// Element format of the block-paged pool's full-attention K/V:
+    /// `"int8"` (per-(token, head) symmetric int8 rows with one fp32 scale
+    /// each — half the K/V memory and read bandwidth; see
+    /// `crate::array::kv_int8`) or `"bf16"`. Unset: int8 where the int8
+    /// kernels serve the model (a pool, head 256, BF16 compute, a 16- or
+    /// 32-token block), else BF16 — see `kv_format_for()`.
     /// Set from the `kvFormat` load option; never saved (a runtime option,
     /// like Splash `--kv-format`).
     #[serde(default, skip_serializing)]
@@ -229,13 +173,13 @@ impl Qwen3_5Config {
         !(layer_idx + 1).is_multiple_of(self.full_attention_interval as usize)
     }
 
-    /// Element format of the full-attention K/V (pool and flat cache) of a
-    /// model that computes in `compute`. An explicit `kv_format` wins (an
-    /// unparseable value is BF16 — persistence rejects it at load);
-    /// otherwise int8, Splash's default, wherever the int8 kernels serve the
-    /// model (`KvFormat::default_for_geometry`: BF16 compute, head 256, whole
-    /// GQA groups; and a 16- or 32-token block when the load is paged), and
-    /// BF16 elsewhere, so only an explicit int8 can fail a load.
+    /// Element format of the full-attention K/V of a model that computes in
+    /// `compute`. An explicit `kv_format` wins (an unparseable value is BF16 —
+    /// persistence rejects it at load); otherwise int8, Splash's default,
+    /// wherever the pool's int8 kernels serve the model
+    /// (`KvFormat::default_for_geometry`: BF16 compute, head 256, whole GQA
+    /// groups; a pool with 16- or 32-token blocks), and BF16 elsewhere, so
+    /// only an explicit int8 can fail a load.
     pub fn kv_format_for(&self, compute: crate::array::DType) -> crate::transformer::KvFormat {
         use crate::transformer::KvFormat;
         match self.kv_format.as_deref() {
@@ -243,8 +187,8 @@ impl Qwen3_5Config {
                 KvFormat::parse(Some(value)).unwrap_or_default()
             }
             _ => {
-                let pool_block_fits = self.use_block_paged_cache == Some(false)
-                    || matches!(self.paged_block_size(), 16 | 32);
+                let pool_block_fits = crate::models::qwen3_5::load_plan::qwen35_pool_backend()
+                    && matches!(self.paged_block_size(), 16 | 32);
                 match KvFormat::default_for_geometry(
                     i64::from(self.head_dim),
                     i64::from(self.num_heads),
@@ -271,7 +215,7 @@ impl Qwen3_5Config {
         format
     }
 
-    /// The format of the flat caches a model built from this config uses. A
+    /// The K/V format of a model built from this config. A
     /// load pins it (`pin_kv_format`); an unpinned config builds a random-init
     /// model, whose weights are f32.
     pub fn kv_format(&self) -> crate::transformer::KvFormat {
@@ -310,7 +254,7 @@ impl Qwen3_5Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Qwen3_5Config, resolve_qwen35_paged_default};
+    use super::Qwen3_5Config;
 
     #[test]
     fn gdn_state_bytes_follow_the_real_conv_and_recurrent_shapes() {
@@ -342,7 +286,6 @@ mod tests {
             rope_theta: 10_000.0,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            use_block_paged_cache: Some(true),
             persist_paged_cache: None,
             n_mtp_layers: 0,
         };
@@ -350,24 +293,6 @@ mod tests {
         assert_eq!(
             config.recurrent_state_bytes(),
             2 * (3 * 14 * 2 + 2 * 3 * 4 * 4)
-        );
-    }
-
-    #[test]
-    fn paged_default_and_override_precedence_match_dense_and_moe() {
-        assert_eq!(resolve_qwen35_paged_default(None, None), Some(true));
-        assert_eq!(resolve_qwen35_paged_default(Some(false), None), Some(false));
-        assert_eq!(
-            resolve_qwen35_paged_default(Some(false), Some("1")),
-            Some(true)
-        );
-        assert_eq!(
-            resolve_qwen35_paged_default(Some(true), Some("0")),
-            Some(false)
-        );
-        assert_eq!(
-            resolve_qwen35_paged_default(None, Some("unexpected")),
-            Some(true)
         );
     }
 }

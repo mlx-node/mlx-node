@@ -1324,9 +1324,6 @@ fn chat_turn_core<B: ChatBackend>(
             let turn_setup = TurnSetup {
                 params: &p,
                 is_delta,
-                // The generic flow is text-only; image turns routed through
-                // the multimodal executor above.
-                has_images: false,
                 total_seq_len: tokens.len(),
             };
             let mut step = backend.begin_decode(&turn_setup)?;

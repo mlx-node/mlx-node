@@ -26,7 +26,6 @@ use crate::engine::plan::{
     SpeculativePlan,
 };
 use crate::engine::recurrent_state::{HYBRID_LIVE_STATE_UNITS, RecurrentStateTable};
-use crate::engine::scheduler::context_output_budget;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHandle};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
@@ -58,7 +57,7 @@ use crate::engine;
 use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup, SpecFrontier};
 use crate::engine::spec_owner::SpecOwner;
 use crate::engine::{
-    apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
+    apply_all_penalties, compute_performance_metrics, finalize_chat_result,
     save_cache_state_direct, verify_cache_prefix_direct,
 };
 use crate::models::quantized_linear::LinearProj;
@@ -78,13 +77,11 @@ use crate::transformer::paged_policy::record_decode_wave;
 
 mod chat_backend;
 mod commands;
-mod flat_turn;
 mod forward;
 mod gdn_prefix;
 mod lifecycle;
 mod mtp;
 mod paged_backend;
-mod paged_turn;
 pub(crate) mod scheduled_mtp;
 mod state;
 mod training;
@@ -95,8 +92,7 @@ use self::chat_backend::qwen35_moe_speculative_plan;
 pub(crate) use self::commands::{Qwen35MoeCmd, Qwen35MoeFamilyCommand};
 pub(crate) use self::forward::PREFILL_STEP_SIZE;
 use self::forward::{
-    chunked_prefill, eager_verify_step, forward_inner, forward_pre_norm_inner,
-    project_logits_from_hidden,
+    chunked_prefill, forward_inner, forward_pre_norm_inner, project_logits_from_hidden,
 };
 pub(crate) use self::mtp::Qwen35MoeDecode;
 use self::paged_backend::{Qwen35MoePrefixState, StreamSender};
@@ -169,12 +165,6 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) cached_paged_image_token_positions: Vec<(u32, u64)>,
     pub(crate) cached_rope_deltas: Option<i32>,
     pub(crate) model_id: u64,
-    /// Set when a flat eager-MTP turn stopped mid-cycle leaving `self.caches`
-    /// advanced past the emitted token history (GDN state cannot be rewound).
-    /// Forces the next turn to discard `self.caches` and re-prefill the full
-    /// history into fresh caches. Pure-flat sessions only; the paged path
-    /// rolls back its adapter directly.
-    pub(crate) flat_mtp_caches_desynced: bool,
     active_cache_owner_id: String,
     gdn_root_cache_owner_id: Option<String>,
     gdn_root_cache_owner_is_explicit: bool,
@@ -300,31 +290,6 @@ pub struct MoeMtpPagedGdnStateForTest {
     pub has_history_checkpoint: bool,
 }
 
-/// Generation configuration for Qwen3.5 MoE
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct Qwen3_5MoeGenerationConfig {
-    pub max_new_tokens: i32,
-    #[napi(ts_type = "number | undefined")]
-    pub temperature: Option<f64>,
-    #[napi(ts_type = "number | undefined")]
-    pub top_k: Option<i32>,
-    #[napi(ts_type = "number | undefined")]
-    pub top_p: Option<f64>,
-    #[napi(ts_type = "number | undefined")]
-    pub min_p: Option<f64>,
-}
-
-/// Generation result
-#[napi(object)]
-#[derive(Debug, Clone)]
-pub struct Qwen3_5MoeGenerationResult {
-    pub tokens: Vec<u32>,
-    pub text: String,
-    pub num_tokens: u32,
-    pub finish_reason: String,
-}
-
 /// Qwen3.5 MoE Model -- hybrid linear/full attention with Mixture-of-Experts.
 ///
 /// All inference and training state lives on a dedicated OS thread. NAPI methods
@@ -337,11 +302,8 @@ pub struct Qwen3_5MoeModel {
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5MoeConfig,
     /// Snapshot of `Qwen35MoeInner::paged_adapter.is_some()` captured at
-    /// construction time. Compatible Qwen3.5 MoE checkpoints default the
-    /// adapter ON; explicit false and sym8 retain the flat path. VLM
-    /// checkpoints can load with the adapter on for text-only inference;
-    /// image-bearing chat turns are rejected at runtime by the chat-entry sites.
-    /// Surfaced through the `hasBlockPagedCache()` NAPI method.
+    /// construction time: every load on Metal has the adapter; a load off
+    /// Metal has none. Surfaced through the `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
     /// Snapshot of `Qwen35MoeInner::has_mtp_weights()` captured at
     /// construction time, mirroring `paged_active`. Surfaced through the
@@ -404,11 +366,9 @@ impl Qwen3_5MoeModel {
     /// instance.
     ///
     /// `true` iff `Qwen35MoeInner::paged_adapter` was successfully
-    /// constructed at load time (driven by
-    /// `Qwen3_5MoeConfig::use_block_paged_cache`, default-ON for compatible
-    /// checkpoints). On VLM checkpoints the adapter can still be active for text-only
-    /// inference; image-bearing chat turns are rejected at runtime by
-    /// the chat-entry sites. Surfaced through this NAPI method so
+    /// constructed at load time (every load on Metal). On
+    /// VLM checkpoints image turns run on the paged-vision core; a load with
+    /// no adapter admits no image turn. Surfaced through this NAPI method so
     /// server endpoints can branch on it without round-tripping through
     /// the model thread.
     #[napi]
@@ -540,40 +500,6 @@ impl Qwen3_5MoeModel {
             source.release_lease();
         }
         loaded
-    }
-
-    /// Generate text from a prompt token sequence.
-    #[napi]
-    pub async fn generate(
-        &self,
-        prompt_tokens: &MxArray,
-        mut config: Qwen3_5MoeGenerationConfig,
-    ) -> Result<Qwen3_5MoeGenerationResult> {
-        if config.max_new_tokens <= 0 {
-            return Err(Error::from_reason(format!(
-                "max_new_tokens must be > 0, got {}",
-                config.max_new_tokens
-            )));
-        }
-        let batch_size = prompt_tokens.shape_at(0)?;
-        if batch_size != 1 {
-            return Err(Error::from_reason(format!(
-                "generate() only supports batch_size=1, got batch_size={}",
-                batch_size
-            )));
-        }
-        let prompt_len = prompt_tokens.shape_at(1)? as usize;
-        let max_output =
-            context_output_budget(prompt_len, self.context_limits.effective_window_tokens)?;
-        config.max_new_tokens = config.max_new_tokens.min(max_output as i32);
-        crate::model_thread::send_and_await(&self.thread, |reply| {
-            Qwen35MoeFamilyCommand::Generate {
-                prompt_tokens: prompt_tokens.clone(),
-                config,
-                reply,
-            }
-        })
-        .await
     }
 
     // Test-only streaming entry points that bypass ThreadsafeFunction and hand
@@ -740,6 +666,3 @@ mod eval_teacher_forced_tests;
 
 #[cfg(test)]
 mod paged_speculative_routing_tests;
-
-#[cfg(test)]
-mod stream_progress_tests;

@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, readlink, rm, stat, writeFile } from 'node:fs
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { CHAT_FAMILY_IDS, PagedConfigOverrideManager, QWEN35_PAGED_MODEL_TYPES } from '@mlx-node/lm';
+import { CHAT_FAMILY_IDS, PagedConfigOverrideManager } from '@mlx-node/lm';
 import { describe, expect, it } from 'vite-plus/test';
 
 async function makeFixture(modelType: string, extraConfig: Record<string, unknown> = {}): Promise<string> {
@@ -21,7 +21,7 @@ async function makeFixture(modelType: string, extraConfig: Record<string, unknow
 
 function launchClaudeManager(): PagedConfigOverrideManager {
   return new PagedConfigOverrideManager({
-    modelTypes: QWEN35_PAGED_MODEL_TYPES,
+    modelTypes: ['qwen3_5', 'qwen3_5_moe'],
   });
 }
 

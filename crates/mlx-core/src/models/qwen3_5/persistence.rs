@@ -2698,7 +2698,6 @@ async fn load_with_thread_impl(
                 }
                 // Decision inference never allocates a chat KV pool or speculative head.
                 if clef {
-                    config.use_block_paged_cache = Some(false);
                     config.persist_paged_cache = Some(false);
                     config.n_mtp_layers = 0;
                     config.kv_format = Some("bf16".into());
@@ -2984,24 +2983,6 @@ async fn load_with_thread_impl(
 
                 augment_mtplx_mtp_quantization(&raw, config.n_mtp_layers, &mut per_layer_quant)?;
 
-                // sym8 v1 scope: sym8 is only validated on the dense FLAT
-                // (eager int8) decode path. Dense paged decode is pure-Rust
-                // eager too, but sym8 under it is simply UNVALIDATED — the pin
-                // is retained conservatively, forcing the flat path so a
-                // paged-by-default config (or MLX_QWEN35_PAGED_OVERRIDE=1) cannot
-                // route sym8 through it. (MoE and gemma4 already ship sym8
-                // under paged decode, so lifting this pin is a plausible
-                // follow-up — a behavior decision, not made here.)
-                if has_sym8_mode(top_level_mode, &per_layer_quant)
-                    && config.use_block_paged_cache == Some(true)
-                {
-                    warn!(
-                        "Qwen3.5: sym8 checkpoint requested block-paged KV cache; \
-                         sym8 is validated on the flat (eager int8) path only — \
-                         forcing use_block_paged_cache=false."
-                    );
-                    config.use_block_paged_cache = Some(false);
-                }
                 let runtime_default_mode =
                     resolve_default_mode(top_level_mode, is_mxfp8_checkpoint(&params));
                 let runtime_default_plq =
@@ -3506,23 +3487,6 @@ pub(crate) fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         // remain available by setting `paged_cache_memory_mb` explicitly.
         paged_cache_memory_mb: paged.paged_cache_memory_mb,
         paged_block_size: paged.paged_block_size,
-        // Block-paged attention is the production default for Qwen3.5. The
-        // explicit config bit and MLX_QWEN35_PAGED_OVERRIDE remain useful for
-        // deliberate flat-path diagnostics; sym8 is forced flat later because
-        // that storage format is not structurally compatible with the paged
-        // compiled core.
-        use_block_paged_cache: {
-            let explicit = paged.use_block_paged_cache;
-            let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
-            let resolved = crate::models::qwen3_5::config::resolve_qwen35_paged_default(
-                explicit,
-                env_override.as_deref(),
-            );
-            // An explicit value (or MLX_QWEN35_PAGED_OVERRIDE, including `=0`)
-            // is honored as-is. A sym8 checkpoint that lands on `Some(true)`
-            // here is flipped back to `Some(false)` by the sym8 force above.
-            resolved
-        },
         // Persist the out-of-pool GDN recurrent state to the SSD cold tier. Off
         // unless explicitly present as a bool (the agent overlay / a config
         // override). `MLX_PERSIST_PAGED_CACHE` supplies the env default at load
@@ -3836,14 +3800,6 @@ mod tests {
         assert_eq!(config.paged_cache_memory_mb, Some(64));
         assert_eq!(config.paged_block_size, None);
         assert_eq!(config.persist_paged_cache, Some(false));
-        let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
-        assert_eq!(
-            config.use_block_paged_cache,
-            crate::models::qwen3_5::config::resolve_qwen35_paged_default(
-                Some(false),
-                env_override.as_deref()
-            )
-        );
     }
 
     fn packed_projection(rows: i64, weight_cols: i64) -> (MxArray, MxArray, MxArray) {
@@ -4973,7 +4929,6 @@ mod tests {
             rope_theta: 100_000.0,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            use_block_paged_cache: None,
             persist_paged_cache: None,
             n_mtp_layers: 0,
         }
@@ -5065,11 +5020,10 @@ mod tests {
     #[test]
     fn tied_quantized_embedding_loads_via_packed_path() {
         let label = "tied_quantized_embedding_loads_via_packed_path";
-        // Exercise all three former exclusions at once: flat backend, declared
+        // Exercise the former exclusions at once: declared
         // MTP module, and VLM checkpoint. The fixture deliberately omits MTP
         // weights, so runtime dispatch must remain gated by `has_mtp_weights()`.
         let mut cfg = no_mtp_layer_cfg(); // tie_word_embeddings: true, vocab 1024
-        cfg.use_block_paged_cache = Some(false);
         cfg.n_mtp_layers = 1;
 
         let mut inner = match Qwen35Inner::new(cfg.clone()) {

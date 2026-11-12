@@ -1,11 +1,10 @@
 //! Per-row symmetric int8 KV rows (Splash's target KV format): one int8 row
-//! of `head_dim = 256` per (batch, head, token) with one fp32 scale,
+//! of `head_dim` per (batch, head, token) with one fp32 scale,
 //! `scale = max|x| / 127`, `q = clamp(rint(x * 127 / max), -127, 127)`.
 //!
-//! The flat Qwen3.5-family `KVCache` stores its full-attention rows this way
-//! when loaded with `kvFormat: 'int8'`; the segmented SDPA kernels read the
-//! int8 rows and their scales directly, and prefill chunks after the first
-//! dequantize the cached prefix back to BF16 for MLX's fused causal SDPA.
+//! The block-paged pool stores its int8 pages this way; its dense readers
+//! dequantize through [`dequantize_kv_rows`]. The row quantizer is the
+//! reference the pool's store is checked against.
 
 use super::MxArray;
 use mlx_sys as sys;
@@ -13,14 +12,16 @@ use napi::bindgen_prelude::*;
 
 /// Quantized rows: `keys` / `values` int8 `[B, H, N, 256]`, `key_scales` /
 /// `value_scales` float32 `[B, H, N]`.
+#[cfg(test)]
 #[derive(Clone)]
-pub struct Int8KvRows {
+pub(crate) struct Int8KvRows {
     pub keys: MxArray,
     pub values: MxArray,
     pub key_scales: MxArray,
     pub value_scales: MxArray,
 }
 
+#[cfg(test)]
 fn quantize_with(
     x: &MxArray,
     entry: unsafe extern "C-unwind" fn(
@@ -47,7 +48,8 @@ fn quantize_with(
 }
 
 /// BF16 rows `[B, H, N, 256]` -> `(int8 rows, fp32 scales [B, H, N])`.
-pub fn quantize_kv_rows(x: &MxArray) -> Result<(MxArray, MxArray)> {
+#[cfg(test)]
+pub(crate) fn quantize_kv_rows(x: &MxArray) -> Result<(MxArray, MxArray)> {
     quantize_with(x, sys::mlx_kv_int8_quantize_rows, "quantize_kv_rows")
 }
 
@@ -70,6 +72,7 @@ pub fn dequantize_kv_rows(q: &MxArray, s: &MxArray) -> Result<MxArray> {
     MxArray::from_handle(handle, "dequantize_kv_rows")
 }
 
+#[cfg(test)]
 impl Int8KvRows {
     /// Quantize a BF16 `(keys, values)` pair.
     pub fn quantize(keys: &MxArray, values: &MxArray) -> Result<Self> {
@@ -100,112 +103,6 @@ impl Int8KvRows {
             value_scales: self.value_scales.slice_axis(2, start, end)?,
         })
     }
-
-    /// Token rows held.
-    pub fn len(&self) -> Result<i64> {
-        self.keys.shape_at(2)
-    }
-
-    pub fn is_empty(&self) -> Result<bool> {
-        Ok(self.len()? == 0)
-    }
-
-    /// The four arrays in the order the segmented int8 primitive and the
-    /// compiled verify tape use: keys, values, key scales, value scales.
-    pub fn arrays(&self) -> [&MxArray; 4] {
-        [
-            &self.keys,
-            &self.values,
-            &self.key_scales,
-            &self.value_scales,
-        ]
-    }
-}
-
-/// Segmented BF16-query attention over an int8 prefix followed by int8 new
-/// rows (the verify block or the single decode row). Never falls back to the
-/// dequantizing concat: an unsupported launch is an error.
-pub fn segmented_sdpa_int8(
-    queries: &MxArray,
-    prefix: &Int8KvRows,
-    new: &Int8KvRows,
-    scale: f32,
-    causal: bool,
-) -> Result<MxArray> {
-    // SAFETY: every handle is a live array; the result is an owned handle or
-    // null (message on stderr).
-    let handle = unsafe {
-        sys::mlx_segmented_sdpa_int8_forward(
-            queries.as_raw_ptr(),
-            prefix.keys.as_raw_ptr(),
-            prefix.values.as_raw_ptr(),
-            prefix.key_scales.as_raw_ptr(),
-            prefix.value_scales.as_raw_ptr(),
-            new.keys.as_raw_ptr(),
-            new.values.as_raw_ptr(),
-            new.key_scales.as_raw_ptr(),
-            new.value_scales.as_raw_ptr(),
-            scale,
-            causal,
-        )
-    };
-    MxArray::from_handle(handle, "segmented_sdpa_int8")
-}
-
-/// Whether [`segmented_sdpa_int8`] launches a causal block of `rows` (1..=8)
-/// queries at `gqa`: one chunk of at most the device's widest query chunk,
-/// or two (`segmented_verify_head_rows` in the C++ planner), so `rows <= 2 x
-/// max`. At gqa 16 the widest chunk is 2 rows and a 5..8-row block is an
-/// error there. Call only on the Metal device.
-pub(crate) fn segmented_int8_covers(rows: i64, gqa: i64) -> bool {
-    use std::sync::atomic::{AtomicI32, Ordering};
-    const UNREAD: i32 = i32::MIN;
-    static MAX_QUERY: [AtomicI32; 33] = [const { AtomicI32::new(UNREAD) }; 33];
-    let Ok(index) = usize::try_from(gqa) else {
-        return false;
-    };
-    let Some(slot) = MAX_QUERY.get(index) else {
-        return false;
-    };
-    let mut max_query = slot.load(Ordering::Relaxed);
-    if max_query == UNREAD {
-        // SAFETY: a pure query of the loaded metallib's pipeline limits.
-        max_query = unsafe { sys::mlx_segmented_sdpa_max_query_length(gqa as i32) };
-        slot.store(max_query, Ordering::Relaxed);
-    }
-    // 0 (no launch) or -1 (missing kernels): the kernel call reports it.
-    max_query < 1 || rows <= 2 * i64::from(max_query)
-}
-
-/// Forced-route form of [`segmented_sdpa_int8`] (tests): `mode` -1
-/// automatic, 0 vector, 1 tile, 2 nax.
-#[cfg(test)]
-pub(crate) fn segmented_sdpa_int8_with_route(
-    queries: &MxArray,
-    prefix: &Int8KvRows,
-    new: &Int8KvRows,
-    scale: f32,
-    causal: bool,
-    mode: i32,
-) -> Result<MxArray> {
-    // SAFETY: as `segmented_sdpa_int8`.
-    let handle = unsafe {
-        sys::mlx_segmented_sdpa_int8_test_forward(
-            queries.as_raw_ptr(),
-            prefix.keys.as_raw_ptr(),
-            prefix.values.as_raw_ptr(),
-            prefix.key_scales.as_raw_ptr(),
-            prefix.value_scales.as_raw_ptr(),
-            new.keys.as_raw_ptr(),
-            new.values.as_raw_ptr(),
-            new.key_scales.as_raw_ptr(),
-            new.value_scales.as_raw_ptr(),
-            scale,
-            causal,
-            mode,
-        )
-    };
-    MxArray::from_handle(handle, "segmented_sdpa_int8_with_route")
 }
 
 #[cfg(test)]

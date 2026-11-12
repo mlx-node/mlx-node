@@ -465,7 +465,7 @@ impl<T: ScheduledMtpTarget> ScheduledDraftVerify for MtpVerify<'_, T> {
                             .iter()
                             .map(|cache| match cache {
                                 Qwen3_5LayerCache::FullAttention(_) => {
-                                    Qwen3_5LayerSnapshot::FullAttention { offset: 0 }
+                                    Qwen3_5LayerSnapshot::FullAttention
                                 }
                                 // GDN replaces cache handles; it never mutates input arrays.
                                 // Verify uses separate stacked caches. Retain graph references
@@ -482,7 +482,7 @@ impl<T: ScheduledMtpTarget> ScheduledDraftVerify for MtpVerify<'_, T> {
             let mut scratch = Vec::new();
             for (layer, snapshot) in snapshots[0].iter().enumerate() {
                 match snapshot {
-                    Qwen3_5LayerSnapshot::FullAttention { .. } => {
+                    Qwen3_5LayerSnapshot::FullAttention => {
                         scratch.push(Qwen3_5LayerCache::new_full_attention())
                     }
                     Qwen3_5LayerSnapshot::Linear { .. } => {
@@ -582,7 +582,6 @@ impl<T: ScheduledMtpTarget> ScheduledDraftVerify for MtpVerify<'_, T> {
             &pending.snapshot,
             &pending.tape,
             keep,
-            true,
             "scheduled MTP commit",
         )?;
         self.0.replace_mtp_target_caches(seq, caches)?;
@@ -653,9 +652,7 @@ pub(crate) mod tests {
         snapshot
             .iter()
             .map(|state| match state {
-                Qwen3_5LayerSnapshot::FullAttention { .. } => {
-                    Qwen3_5LayerCache::new_full_attention()
-                }
+                Qwen3_5LayerSnapshot::FullAttention => Qwen3_5LayerCache::new_full_attention(),
                 Qwen3_5LayerSnapshot::Linear {
                     conv_state,
                     recurrent_state,
@@ -713,11 +710,8 @@ pub(crate) mod tests {
         let snapshots = seqs
             .iter()
             .map(|&seq| {
-                super::super::layer_cache::snapshot_all_mtp(
-                    target.mtp_target_caches(seq).unwrap(),
-                    true,
-                )
-                .unwrap()
+                super::super::layer_cache::snapshot_all_mtp(target.mtp_target_caches(seq).unwrap())
+                    .unwrap()
             })
             .collect::<Vec<_>>();
         let initial = snapshots
@@ -843,7 +837,6 @@ pub(crate) mod tests {
                         &snapshots[index],
                         &tape,
                         keeps[index],
-                        true,
                         "independent MTP test",
                     )
                     .unwrap();

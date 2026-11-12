@@ -64,8 +64,9 @@ fn pool_needs_a_prefill_kernel_geometry() {
         for (heads, bs) in [((4, 2, 32), 16), ((24, 4, 256), 8), ((40, 4, 256), 16)] {
             let error = dtype(format, heads, bs, DType::BFloat16).unwrap_err();
             assert!(
-                error.reason.contains("no paged prefill attention kernel")
-                    && error.reason.contains("useBlockPagedCache false"),
+                error
+                    .reason
+                    .contains("no paged-attention kernel for layout"),
                 "{format:?} {heads:?} bs {bs}: {}",
                 error.reason
             );
@@ -85,7 +86,7 @@ fn pool_needs_a_prefill_kernel_geometry() {
 
 /// The unset default is int8 only where the pool would get int8 pages, so a
 /// default load never fails: a paged 8-token block keeps bf16, a 16-token
-/// block or a flat load takes int8 (Metal, head 256, BF16), at the 27B's GQA 6
+/// block takes int8 (a pool, head 256, BF16), at the 27B's GQA 6
 /// and at the 122B's 32 / 2 (GQA 16). An explicit int8 stays int8.
 /// Mutation B1: the default ignores the block size → red.
 /// Mutation D1: `default_for_geometry` keeps a `gqa <= 8` clause → red at
@@ -100,7 +101,6 @@ fn unset_kv_format_defaults_to_int8_only_where_the_pool_has_kernels() {
         config.num_heads = q_heads;
         config.num_kv_heads = kv_heads;
         config.kv_format = None;
-        config.use_block_paged_cache = None;
         config.paged_block_size = Some(16);
         let label = format!("{q_heads} / {kv_heads}");
         assert_eq!(
@@ -114,13 +114,14 @@ fn unset_kv_format_defaults_to_int8_only_where_the_pool_has_kernels() {
             KvFormat::Bf16,
             "{label}"
         );
-        config.use_block_paged_cache = Some(false);
+        config.paged_block_size = Some(16);
+        super::NO_METAL_POOL.with(|off| off.set(true));
         assert_eq!(
             config.kv_format_for(DType::BFloat16),
-            KvFormat::Int8,
-            "{label}"
+            KvFormat::Bf16,
+            "{label} off Metal"
         );
-        config.use_block_paged_cache = None;
+        super::NO_METAL_POOL.with(|off| off.set(false));
         config.kv_format = Some("int8".to_string());
         assert_eq!(
             config.kv_format_for(DType::BFloat16),
@@ -341,8 +342,6 @@ fn estimate_matches_the_load_plan() {
             },
         ),
         draft: Some(DraftTerms::of(&draft_config, 1_357 * MIB)),
-        format,
-        dtype: DType::BFloat16,
         mtp: false,
         mtp_state_in_pool: false,
     };
@@ -370,21 +369,15 @@ fn estimate_matches_the_load_plan() {
     );
 }
 
-/// A sym8 checkpoint asking for paged KV loads flat (the loaders' sym8 pin),
-/// so the estimate is the flat lane's window with no pool: 16,000 MiB of
-/// weights on the 27 GiB working set leave 126,976 int8 rows. Mutation: drop
-/// the sym8 pin from `estimate_qwen35_load` → red (the pool window).
+/// A sym8 checkpoint plans the pool like any other (its mixed-dtype operands
+/// are cast to the pool's io dtype): its estimate equals the affine one.
+/// Mutation N8: the estimate re-pins sym8 to no pool → red (the no-pool
+/// estimate refuses the int8 default).
 #[test]
-fn estimate_follows_the_sym8_flat_pin() {
+fn sym8_estimate_plans_the_pool() {
     let target = estimate_fixture_dir("sym8");
     let draft = estimate_fixture_dir("sym8-draft");
     write_27b_fixture(&target, &draft);
-    let mut config: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
-            .unwrap();
-    config["use_block_paged_cache"] = serde_json::json!(true);
-    config["quantization"] = serde_json::json!({"mode": "sym8", "bits": 8, "group_size": null});
-    std::fs::write(target.join("config.json"), config.to_string()).unwrap();
     crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| {
         cell.set(Some(LiveMemory {
             working_set_bytes: 27 << 30,
@@ -392,158 +385,34 @@ fn estimate_follows_the_sym8_flat_pin() {
             registered_pool_bytes: 0,
         }))
     });
-    let estimate = estimate_qwen35_load(
-        "Qwen3.5",
-        &EstimateInput {
-            asset_dir: &target,
-            moe: false,
-            weight_bytes: 16_000 << 20,
-            header: bf16_header(),
-            draft_dir: None,
-            kv_format: None,
-            max_memory_bytes: None,
-            max_context: None,
-        },
-    );
-    crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
-    std::fs::remove_dir_all(&target).unwrap();
-    std::fs::remove_dir_all(&draft).unwrap();
-    assert_eq!(
-        estimate.expect("estimate").expect("readable device"),
-        Qwen35ContextEstimate {
-            window_tokens: 126_976,
-            bound: "memory".to_string(),
-        }
-    );
-}
-
-/// A load with neither pool nor draft is planned on its flat lane (Splash
-/// plans every start), so `--max-memory` bounds it: 1,024 bytes cannot
-/// hold 1 GiB of weights and the load is refused with the flag's advice
-/// (the weights, the 768 MiB reserves, one GDN cell, Splash's int8 runway
-/// of 128 pages and a 4,096-token turn's transient); 4 GiB bounds the flat
-/// window by memory at 45,056 (11 extents of 4,096 rows). Mutation: build
-/// no flat lane in `evaluate_qwen35_plan` → red (`Ok` 262,144, bound
-/// "model").
-#[test]
-fn flat_load_is_planned_under_max_memory() {
-    let target = estimate_fixture_dir("flat");
-    let draft = estimate_fixture_dir("flat-draft");
-    write_27b_fixture(&target, &draft);
-    let mut config: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
-            .unwrap();
-    config["use_block_paged_cache"] = serde_json::json!(false);
-    std::fs::write(target.join("config.json"), config.to_string()).unwrap();
-    crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| {
-        cell.set(Some(LiveMemory {
-            working_set_bytes: 27 << 30,
-            active_bytes: 0,
-            registered_pool_bytes: 0,
-        }))
-    });
-    let estimate = |max_memory_bytes| {
+    let estimate = || {
         estimate_qwen35_load(
             "Qwen3.5",
             &EstimateInput {
                 asset_dir: &target,
                 moe: false,
-                weight_bytes: 1 << 30,
+                weight_bytes: 16_000 << 20,
                 header: bf16_header(),
                 draft_dir: None,
                 kv_format: None,
-                max_memory_bytes,
+                max_memory_bytes: None,
                 max_context: None,
             },
         )
     };
-    let refused = estimate(Some(1_024));
-    let bounded = estimate(Some(4 << 30));
-    crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
-    std::fs::remove_dir_all(&target).unwrap();
-    std::fs::remove_dir_all(&draft).unwrap();
-    let err = refused.expect_err("1,024 bytes hold no flat lane");
-    assert!(
-        err.reason.contains("need 2488074240 bytes"),
-        "{}",
-        err.reason
-    );
-    assert!(
-        err.reason.contains("the memory limit is 1024 bytes"),
-        "{}",
-        err.reason
-    );
-    assert!(err.reason.contains("raise --max-memory"), "{}", err.reason);
-    assert_eq!(
-        bounded.expect("estimate").expect("readable device"),
-        Qwen35ContextEstimate {
-            window_tokens: 45_056,
-            bound: "memory".to_string(),
-        }
-    );
-}
-
-/// `--max-context` covers the flat lane like every other lane: on a load
-/// with neither pool nor draft the flat lane is the default turn's, so on
-/// the 4 GiB plan of 45,056 rows a 40,000 cap publishes 40,000 and 45,057
-/// fails with Splash's `ServingRuntime::start` text. Mutation: leave the
-/// flat lane out of `turn_window` → red (45,057 is clamped to 45,056).
-#[test]
-fn max_context_caps_the_flat_lane() {
-    let target = estimate_fixture_dir("flat-cap");
-    let draft = estimate_fixture_dir("flat-cap-draft");
-    write_27b_fixture(&target, &draft);
+    let affine = estimate();
     let mut config: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
             .unwrap();
-    config["use_block_paged_cache"] = serde_json::json!(false);
+    config["quantization"] = serde_json::json!({"mode": "sym8", "bits": 8, "group_size": null});
     std::fs::write(target.join("config.json"), config.to_string()).unwrap();
-    crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| {
-        cell.set(Some(LiveMemory {
-            working_set_bytes: 27 << 30,
-            active_bytes: 0,
-            registered_pool_bytes: 0,
-        }))
-    });
-    let estimate = |max_context| {
-        estimate_qwen35_load(
-            "Qwen3.5",
-            &EstimateInput {
-                asset_dir: &target,
-                moe: false,
-                weight_bytes: 1 << 30,
-                header: bf16_header(),
-                draft_dir: None,
-                kv_format: None,
-                max_memory_bytes: Some(4 << 30),
-                max_context,
-            },
-        )
-    };
-    let capped = estimate(Some(40_000));
-    let at = estimate(Some(45_056));
-    let above = estimate(Some(45_057));
+    let sym8 = estimate();
     crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
     std::fs::remove_dir_all(&target).unwrap();
     std::fs::remove_dir_all(&draft).unwrap();
-    assert_eq!(
-        capped.expect("estimate").expect("readable device"),
-        Qwen35ContextEstimate {
-            window_tokens: 40_000,
-            bound: "memory".to_string(),
-        }
-    );
-    assert_eq!(
-        at.expect("estimate")
-            .expect("readable device")
-            .window_tokens,
-        45_056
-    );
-    assert_eq!(
-        above.expect_err("above the flat lane").reason,
-        "Qwen3.5: --max-context 45057 exceeds the 45056 tokens the model and --max-memory \
-         allow; omit it or pass at most 45056"
-    );
+    let affine = affine.expect("estimate").expect("readable device");
+    assert_eq!(affine.bound, "memory");
+    assert_eq!(sym8.expect("estimate").expect("readable device"), affine);
 }
 
 /// An unknown family is refused before any file is read. Mutation: map
@@ -597,7 +466,6 @@ fn audit_counts_this_pools_staging_once() {
         fixed_bytes: 0,
         dynamic_budget_bytes: 0,
         pool: None,
-        flat: None,
     };
     let live = LiveMemory {
         working_set_bytes: 28_991_029_248,
@@ -752,8 +620,6 @@ fn plan_27b_lanes(
         draft: mtp
             .is_none()
             .then(|| DraftTerms::of(&draft_config, 1_357 * MIB)),
-        format,
-        dtype: DType::BFloat16,
         mtp: mtp.is_some(),
         mtp_state_in_pool: mtp.unwrap_or(false),
     };
@@ -918,7 +784,6 @@ fn unplanned_estimate_refuses_what_the_load_refuses() {
 fn dflash2_takes_the_one_pool_window() {
     let cell = 153_944_064u64;
     let int8 = plan_27b_as("int8-window", 27 << 30, None, 262_144, Some(KvFormat::Int8));
-    assert!(int8.flat.is_none());
     let pool = int8.pool.expect("pool lane");
     assert_eq!(pool.bytes_per_block, 532_480);
     assert_eq!(pool.max_blocks, 6_451);
@@ -937,8 +802,8 @@ fn dflash2_takes_the_one_pool_window() {
     assert_eq!(pool.lane.window.maximum(), 50_041);
 }
 
-/// A draft load without a pool is refused before any read: DFlash2 runs
-/// only on the pool. Mutation: drop the check in `estimate_qwen35_load` →
+/// A draft load without a pool (off Metal) is refused before any read:
+/// DFlash2 runs only on the pool. Mutation: drop the check in `estimate_qwen35_load` →
 /// red (`Ok`).
 #[test]
 fn draft_without_a_pool_is_refused() {
@@ -946,11 +811,7 @@ fn draft_without_a_pool_is_refused() {
     let draft = estimate_fixture_dir("draft-flat-draft");
     write_27b_fixture(&target, &draft);
     sparse_file(&draft.join("model.safetensors"), 1_357 * MIB);
-    let mut config: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
-            .unwrap();
-    config["use_block_paged_cache"] = serde_json::json!(false);
-    std::fs::write(target.join("config.json"), config.to_string()).unwrap();
+    super::NO_METAL_POOL.with(|off| off.set(true));
     crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| {
         cell.set(Some(LiveMemory {
             working_set_bytes: 27 << 30,
@@ -972,6 +833,7 @@ fn draft_without_a_pool_is_refused() {
         },
     );
     crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
+    super::NO_METAL_POOL.with(|off| off.set(false));
     std::fs::remove_dir_all(&target).unwrap();
     std::fs::remove_dir_all(&draft).unwrap();
     let err = estimate.expect_err("no pool for the draft");
@@ -1016,7 +878,6 @@ fn mtp_state_prices_the_one_pool_window() {
             &config, 57_337
         )
     );
-    assert!(serial.flat.is_none());
     let booked = plan_27b_lanes(
         "mtp-booked",
         27 << 30,
@@ -1106,8 +967,6 @@ fn load_window(
         recurrent_state_bytes: config.recurrent_state_bytes(),
         pool,
         draft: None,
-        format,
-        dtype: compute,
         mtp,
         mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
     };
@@ -1124,7 +983,6 @@ fn load_window(
     Ok(plan
         .pool
         .map(|pool| pool.lane)
-        .or(plan.flat)
         .expect("a lane")
         .window
         .maximum())

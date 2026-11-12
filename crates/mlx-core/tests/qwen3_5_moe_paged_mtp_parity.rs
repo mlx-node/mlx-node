@@ -7,11 +7,8 @@
 //!
 //! Oracle: at T=0 speculative decoding is output-invariant, because every
 //! emitted token is re-derived from the MAIN model's own verify forward. So
-//! the paged MTP transcript must byte-match BOTH the paged AR transcript on
-//! the same checkpoint AND the flat MTP transcript on a `use_block_paged_cache:
-//! false` clone of it. Three-way equality separates the two failure classes a
-//! two-way comparison confuses: a paged-only bug (paged MTP != paged AR) and a
-//! backend-wide one (both paged legs agree with each other but not with flat).
+//! the paged MTP transcript must byte-match the paged AR transcript on the
+//! same checkpoint (every Qwen3.5 turn runs on the pool).
 //!
 //! A second leg checks the state the transcript cannot see: the GDN recurrent
 //! state a paged MTP turn persists is bit-compared against a FRESH recompute
@@ -30,8 +27,7 @@
 //!
 //! Without the env var every test skips cleanly.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use mlx_core::engine::types::{ChatConfig, ChatResult};
 use mlx_core::models::qwen3_5_moe::model::Qwen3_5MoeModel;
@@ -46,7 +42,7 @@ use mlx_core::tokenizer::ChatMessage;
 /// weekend hiking trip") diverges on this checkpoint at the SAME character on
 /// the FLAT lane — where MTP is pre-existing code — and even flips between
 /// paged AR and flat AR with no speculation involved at all. Every prompt below
-/// was screened as paged-MTP == paged-AR AND flat-MTP == flat-AR at depth 1 and
+/// was screened as paged-MTP == paged-AR at depth 1 and
 /// depth 4 before being admitted.
 ///
 /// Each also produces a long, fully determined continuation (many cycles: 41,
@@ -162,75 +158,9 @@ pub fn model_path() -> Option<String> {
     Some(path)
 }
 
-/// Clone `src` into the workspace target dir with every weight file SYMLINKED
-/// and `config.json` patched to force the FLAT backend. `use_block_paged_cache`
-/// is written at BOTH the top level and inside `text_config`, because a VLM
-/// export nests the language-model config and the loader reads the merged view.
-pub fn flat_clone_model_dir(src: &Path, suffix: &str) -> Result<PathBuf, String> {
-    let workspace_target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let manifest = std::env::var("CARGO_MANIFEST_DIR")
-                .expect("CARGO_MANIFEST_DIR must be set when running cargo test");
-            let mut p = PathBuf::from(manifest);
-            p.pop();
-            p.pop();
-            p.join("target")
-        });
-    let dst = workspace_target.join(format!("moe-mtp-flat-{}-{suffix}", std::process::id()));
-    if dst.exists() {
-        let _ = fs::remove_dir_all(&dst);
-    }
-    fs::create_dir_all(&dst).map_err(|e| format!("create_dir_all({}): {e}", dst.display()))?;
-
-    for entry in fs::read_dir(src).map_err(|e| format!("read_dir({}): {e}", src.display()))? {
-        let entry = entry.map_err(|e| format!("dir entry: {e}"))?;
-        let from = entry.path();
-        if !from.is_file() {
-            continue;
-        }
-        let to = dst.join(entry.file_name());
-        if entry.file_name() == "config.json" {
-            fs::copy(&from, &to)
-                .map_err(|e| format!("copy({} -> {}): {e}", from.display(), to.display()))?;
-        } else {
-            std::os::unix::fs::symlink(&from, &to)
-                .map_err(|e| format!("symlink({} -> {}): {e}", from.display(), to.display()))?;
-        }
-    }
-
-    let cfg_path = dst.join("config.json");
-    let raw = fs::read_to_string(&cfg_path).map_err(|e| format!("read config.json: {e}"))?;
-    let mut cfg: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("parse config.json: {e}"))?;
-    cfg["use_block_paged_cache"] = serde_json::Value::Bool(false);
-    cfg["kv_format"] = serde_json::Value::String("bf16".to_string());
-    if let Some(text) = cfg.get_mut("text_config") {
-        text["use_block_paged_cache"] = serde_json::Value::Bool(false);
-    }
-    let pretty =
-        serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize config.json: {e}"))?;
-    fs::write(&cfg_path, pretty).map_err(|e| format!("write config.json: {e}"))?;
-    Ok(dst)
-}
-
-/// Best-effort removal of a cloned checkpoint dir, including on panic.
-pub struct DirCleanup(pub PathBuf);
-
-impl Drop for DirCleanup {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// Three-way T=0 transcript equality: paged MTP == paged AR == flat MTP, over
-/// every screened fixture at depth 4.
-///
-/// The two paged legs share a backend and differ only in the decoder, so their
-/// equality isolates the speculative bookkeeping. The flat leg shares the
-/// decoder and differs only in the KV backend, so adding it catches a bug that
-/// moved BOTH paged legs together (a paged prefill or RoPE-offset regression
-/// would do exactly that, and paged-MTP == paged-AR would stay green).
+/// T=0 transcript equality: paged MTP == paged AR over every screened
+/// fixture at depth 4. The two legs share the pool and differ only in the
+/// decoder, so their equality isolates the speculative bookkeeping.
 ///
 /// The MTP legs are also asserted to have actually SPECULATED — an
 /// `mtp_cycles > 1` anti-vacuity probe. Without it this test passes trivially
@@ -238,7 +168,7 @@ impl Drop for DirCleanup {
 /// AR reference byte-for-byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_MOE_MTP_MODEL_PATH pointing to a real Qwen3.5-MoE MTP checkpoint"]
-async fn paged_mtp_matches_paged_ar_and_flat_mtp() {
+async fn paged_mtp_matches_paged_ar() {
     let Some(model_path) = model_path() else {
         return;
     };
@@ -311,44 +241,6 @@ async fn paged_mtp_matches_paged_ar_and_flat_mtp() {
         paged_mtp_texts.push(mtp.text);
     }
     drop(paged_model);
-
-    // Flat leg: the SAME weights behind a `use_block_paged_cache: false`
-    // config, so only the KV backend differs.
-    let flat_dir = flat_clone_model_dir(Path::new(&model_path), "parity")
-        .expect("flat clone of the checkpoint failed");
-    let _cleanup = DirCleanup(flat_dir.clone());
-    let flat_model = Qwen3_5MoeModel::load(flat_dir.to_string_lossy().into_owned(), None)
-        .await
-        .expect("failed to load MoE model (flat MTP)");
-    assert!(
-        !flat_model.has_block_paged_cache(),
-        "the flat clone still loaded the paged backend — use_block_paged_cache: false did \
-         not take, so this leg would silently repeat the paged run"
-    );
-    for (idx, prompt) in SCREENED_PROMPTS.iter().enumerate() {
-        let flat_mtp = flat_model
-            .chat_session_start(
-                vec![user_message(prompt)],
-                Some(turn_cfg(&format!("fm{idx}"), MAX_NEW_TOKENS, true)),
-            )
-            .await
-            .expect("flat MTP chat_session_start failed");
-        let flat_cycles = flat_mtp
-            .performance
-            .as_ref()
-            .and_then(|p| p.mtp_cycles)
-            .unwrap_or(0);
-        assert!(
-            flat_cycles > 1,
-            "ANTI-VACUITY [{prompt}]: the flat leg ran {flat_cycles} MTP cycles"
-        );
-        assert_eq!(
-            paged_mtp_texts[idx], flat_mtp.text,
-            "[{prompt}] the paged and flat MTP lanes disagree at T=0 — both paged legs \
-             may have moved together (a paged prefill / RoPE-offset regression), which \
-             paged-MTP == paged-AR alone cannot see"
-        );
-    }
 }
 
 /// Carried-state parity: the cache + GDN state a paged MTP turn leaves behind
