@@ -1,0 +1,1259 @@
+import {
+  Copy,
+  FolderOpen,
+  Globe,
+  MessageCircle,
+  Pencil,
+  ScanSearch,
+  Shield,
+  ShieldCheck,
+  ShieldOff,
+  Square,
+  SquareTerminal,
+  Trash2,
+} from 'lucide-react';
+import {
+  createElement,
+  type ReactElement,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+
+import { ChatFrame, JumpButton, useChatDocked } from '../components/arc-x/chat-frame/chat-frame';
+import { Composer, type ComposerNotice, type ComposerPhase } from '../components/arc-x/composer/composer';
+import { ConfirmDialog } from '../components/arc-x/confirm-dialog/confirm-dialog';
+import type { ConversationItem } from '../components/arc-x/conversation-list/conversation-list';
+import { InteractionPresence } from '../components/arc-x/interaction-card/interaction-card';
+import { ModelPicker } from '../components/arc-x/model-picker/model-picker';
+import { Placeholder } from '../components/arc-x/placeholder/placeholder';
+import { SwapCell } from '../components/arc-x/swap-cell/swap-cell';
+import { Button } from '../components/arc/button/button';
+import { ChatThread, ConversationNotices, type TurnAction } from '../components/chat-thread';
+import { UnloadButton } from '../components/unload-button';
+import { DashboardApiError, mutate } from '../lib/api';
+import { isSlashText } from '../lib/chat-input';
+import type { ConversationState } from '../lib/chat-store';
+import { CHAT, fill } from '../lib/chat-strings';
+import { answerMarkdown, chatTitle, conversationMarkdown, splitTurns } from '../lib/chat-turns';
+import type {
+  ChatHostState,
+  ChatMode,
+  ConversationInfo,
+  ConversationRow,
+  Interaction,
+  PermissionMode,
+  TurnState,
+} from '../lib/chat-types';
+import { getTransportUp, subscribeConnection } from '../lib/connection';
+import { formatBytes } from '../lib/format';
+import { folderName } from '../lib/permission-text';
+import { pickFolder } from '../lib/pick-folder';
+import { useStickToBottom } from '../lib/stick-to-bottom';
+import { toast } from '../lib/toast';
+import type { ModelsResponse, TranscriptEntry } from '../lib/types';
+import { useJson } from '../lib/use-api';
+import { type AppCommand, useCommands } from '../shell/commands';
+import { useCrumbs } from '../shell/crumbs';
+import { type Hotkey, useHotkeys, usePageSearch } from '../shell/hotkeys';
+import { useScrollRoot } from '../shell/scroll-root';
+import { type BlockAction, copyDetails, infoNotice, modeBlocker, sendFailure, type StripNotice } from './chat/blockers';
+import { modelOptions, modelSizeOf, startModel, WebChip } from './chat/composer-tools';
+import { conversationPath, deleteContent, RenameDialog, type RenameTarget } from './chat/conversation-actions';
+import {
+  chooseFolder,
+  chosenFolder,
+  folderTooLong,
+  forgetPlace,
+  isChatMode,
+  lastPlaceOf,
+  NEW_PLACE,
+  readDraft,
+  recentFolders,
+  rememberPlace,
+  storedMode,
+  storedModel,
+  storeMode,
+  storeModel,
+  writeDraft,
+} from './chat/drafts';
+import { ListPane } from './chat/list-pane';
+import { NewScreen } from './chat/new-screen';
+import { ModeSwitch, NewButton, ThreadBar } from './chat/thread-bar';
+import { useChatHost } from './chat/use-chat-host';
+import { forgetConversation, useConversation } from './chat/use-conversation';
+import { useUnload } from './chat/use-unload';
+import { NewFolderChip, OpenFolderChip } from './chat/work/folder-chip';
+import { asksSentence, type InteractionAnswer, PermissionCard, PlanCard } from './chat/work/permission';
+import {
+  PermissionModeChip,
+  PermissionModeDialog,
+  permissionModeBlocked,
+  permissionModeName,
+  permissionModeShown,
+  usePermissionMode,
+} from './chat/work/permission-mode';
+
+interface ListResponse {
+  conversations: ConversationRow[];
+}
+
+interface CreateReply {
+  conversation: ConversationInfo;
+  turnId: string;
+}
+
+/** A message on its way: shown as the user's bubble until the stream carries it. */
+interface Sending {
+  /** The conversation it goes to; null while the create call is in flight. */
+  conversationId: string | null;
+  mode: ChatMode;
+  text: string;
+  /** Entries of the conversation when it was sent: the stream has it once there are more. */
+  base: number;
+  lastEnd: ConversationState['lastEnd'];
+  ts: number;
+}
+
+const NO_RAISED: ChatHostState['permissionRaised'] = [];
+const STARTING: TurnState = { turnId: '', phase: 'starting', startedAt: 0, wait: null };
+let newVisits = 0;
+const glyph = (icon: typeof Copy): ReactNode => createElement(icon, { size: 16, strokeWidth: 1.75 });
+
+function chatUrl(id: string): string {
+  return `/chat?c=${encodeURIComponent(id)}`;
+}
+
+function newUrl(mode: ChatMode): string {
+  return `/chat?mode=${mode}`;
+}
+
+function writeClipboard(text: string): Promise<void> {
+  return navigator.clipboard?.writeText(text) ?? Promise.reject(new Error('no clipboard'));
+}
+
+function dialogOpen(): boolean {
+  return document.querySelector('[role="dialog"], [role="alertdialog"], [data-radix-popper-content-wrapper]') !== null;
+}
+
+function withShown(
+  rows: readonly ConversationRow[] | undefined,
+  shown: ConversationInfo | null,
+  mode: ChatMode,
+): readonly ConversationRow[] | undefined {
+  if (rows === undefined || shown === null || shown.mode !== mode || rows.some((row) => row.id === shown.id))
+    return rows;
+  return [{ ...shown, turns: 0 }, ...rows];
+}
+
+export default function Chat(): ReactElement {
+  const [params] = useSearchParams();
+  const navigate = useNavigate();
+  const rawId = params.get('c');
+  const conversationId = rawId !== null && rawId !== '' ? rawId : null;
+  const modeParam = params.get('mode');
+  const connected = useSyncExternalStore(subscribeConnection, getTransportUp, getTransportUp);
+  const hostSnapshot = useChatHost();
+  const host = hostSnapshot.state;
+  const view = useConversation(conversationId);
+  const conv = view.state;
+  const gone = conversationId !== null ? view.gone : null;
+  const local = useJson<ModelsResponse>('/models');
+
+  const chatList = useJson<ListResponse>('/chat/conversations?mode=chat');
+  const workList = useJson<ListResponse>('/chat/conversations?mode=work');
+  const reloadChat = chatList.reload;
+  const reloadWork = workList.reload;
+  const reloadLists = useCallback(() => {
+    reloadChat();
+    reloadWork();
+  }, [reloadChat, reloadWork]);
+  const listsVersion = useRef(hostSnapshot.conversationsVersion);
+  useEffect(() => {
+    if (listsVersion.current === hostSnapshot.conversationsVersion) return;
+    listsVersion.current = hostSnapshot.conversationsVersion;
+    reloadLists();
+  }, [hostSnapshot.conversationsVersion, reloadLists]);
+
+  // The open conversation is listed while its first answer waits: the stored list hides a session with no message yet.
+  const shownInfo = gone === null ? (conv?.conversation ?? null) : null;
+  const chatRows = useMemo(
+    () => withShown(chatList.data?.conversations, shownInfo, 'chat'),
+    [chatList.data, shownInfo],
+  );
+  const workRows = useMemo(
+    () => withShown(workList.data?.conversations, shownInfo, 'work'),
+    [workList.data, shownInfo],
+  );
+  const rows = useMemo(() => [...(chatRows ?? []), ...(workRows ?? [])], [chatRows, workRows]);
+  const rowOf = (id: string | null): ConversationRow | undefined =>
+    id === null ? undefined : rows.find((row) => row.id === id);
+  const recent = useMemo(() => recentFolders(workList.data?.conversations ?? []), [workList.data]);
+  const [folderChoice, setFolderChoice] = useState<string | null>(() => chosenFolder());
+  // The last Work folder is preselected; the user's own choice in this window wins.
+  const newFolder = folderChoice ?? recent[0] ?? null;
+
+  const [sending, setSending] = useState<Sending | null>(null);
+  const isNew = conversationId === null || gone !== null;
+  const place = conversationId ?? NEW_PLACE;
+  const newMode: ChatMode = isChatMode(modeParam) ? modeParam : storedMode();
+  const mode: ChatMode = isNew
+    ? sending?.conversationId === null
+      ? sending.mode
+      : newMode
+    : (conv?.conversation.mode ?? rowOf(conversationId)?.mode ?? sending?.mode ?? storedMode());
+
+  useEffect(() => {
+    if (conversationId === null && isChatMode(modeParam)) storeMode(modeParam);
+  }, [conversationId, modeParam]);
+
+  const openId = conv?.conversation.id ?? null;
+  const openMode = conv?.conversation.mode ?? null;
+  const openFolder = isNew || mode !== 'work' ? null : (conv?.conversation.cwd ?? rowOf(conversationId)?.cwd ?? null);
+  const cwdProblem = isNew || mode !== 'work' ? undefined : conv?.conversation.cwdProblem;
+  useEffect(() => {
+    if (openId === null || openMode === null) return;
+    rememberPlace(openMode, openId);
+    storeMode(openMode);
+  }, [openId, openMode]);
+
+  useEffect(() => {
+    if (gone !== null && conversationId !== null) forgetPlace(conversationId);
+  }, [gone, conversationId]);
+
+  // The draft of the place on screen; a place keeps its own while the page shows another.
+  const [draft, setDraftState] = useState(() => readDraft(place));
+  const [shownPlace, setShownPlace] = useState(place);
+  const [createdId, setCreatedId] = useState<string | null>(null);
+  const [threadKey, setThreadKey] = useState(place);
+  const [stripError, setStripError] = useState<StripNotice | null>(null);
+  const [failedText, setFailedText] = useState<{ place: string; text: string } | null>(null);
+  if (shownPlace !== place) {
+    setShownPlace(place);
+    setDraftState(readDraft(place));
+    setStripError(null);
+    setFailedText(null);
+    // The created conversation keeps the New screen's thread cell: the bubble stays where it was drawn.
+    if (shownPlace !== NEW_PLACE || createdId !== place) {
+      newVisits += 1;
+      setThreadKey(place === NEW_PLACE ? `${NEW_PLACE}:${newVisits}` : place);
+      if (createdId !== null) setCreatedId(null);
+    }
+  }
+  const placeRef = useRef(place);
+  useLayoutEffect(() => {
+    placeRef.current = place;
+  });
+  const setDraft = useCallback(
+    (text: string) => {
+      setDraftState(text);
+      writeDraft(place, text);
+    },
+    [place],
+  );
+
+  const [status, setStatus] = useState({ n: 0, text: '' });
+  const announce = useCallback((text: string) => setStatus((current) => ({ n: current.n + 1, text })), []);
+
+  const [dismissedEnd, setDismissedEnd] = useState<ConversationState['lastEnd']>(null);
+
+  // The bubble leaves once the stream carries the message, or the turn ended without it. A turn that failed before
+  // it ran never carried the message: its text comes back for Retry.
+  useEffect(() => {
+    if (sending === null || sending.conversationId === null || sending.conversationId !== conversationId) return;
+    if (gone !== null) {
+      setSending(null);
+      return;
+    }
+    if (conv === null) return;
+    if (conv.entries.length > sending.base || conv.lastEnd !== sending.lastEnd) {
+      setSending(null);
+      const end = conv.lastEnd;
+      if (conv.entries.length <= sending.base && end?.failure !== undefined && end.outcome === undefined) {
+        setFailedText({ place: sending.conversationId, text: sending.text });
+        if (readDraft(sending.conversationId) === '') {
+          writeDraft(sending.conversationId, sending.text);
+          setDraftState(sending.text);
+        }
+      }
+    }
+  }, [sending, conv, conversationId, gone]);
+
+  const sendingHere =
+    sending !== null && (sending.conversationId === null ? isNew : sending.conversationId === conversationId);
+  const turn = conv?.turn ?? null;
+  const running = turn !== null;
+  const phase: ComposerPhase = turn !== null ? turn.phase : sendingHere ? 'creating' : 'idle';
+  const busy = phase !== 'idle';
+
+  // Models.
+  const unload = useUnload(host);
+  const unloadControl = unload.control;
+  const resident = useMemo(() => new Set(unload.resident.map((entry) => entry.modelId)), [unload.resident]);
+  const options = useMemo(
+    () => (host === null ? [] : modelOptions(host, resident, local.data?.models, mode)),
+    [host, resident, local.data, mode],
+  );
+  const [newModel, setNewModel] = useState<string | null>(null);
+  const [modelWorking, setModelWorking] = useState(false);
+  const pickerRef = useRef<HTMLSpanElement>(null);
+  const chosenNew =
+    newModel !== null && host?.models.some((model) => model.id === newModel) === true
+      ? newModel
+      : startModel(host, storedModel(mode));
+  const modelValue = isNew ? chosenNew : (conv?.conversation.modelId ?? null);
+  const residentId = host?.models.find((model) => resident.has(model.id))?.id ?? null;
+  const localModels = local.data?.models;
+  const modelSize = useCallback(
+    (id: string): number | null =>
+      modelSizeOf(localModels, id) ?? host?.resident.find((entry) => entry.modelId === id)?.sizeBytes ?? null,
+    [localModels, host],
+  );
+  const otherRunning = host?.active.some((entry) => entry.busy && entry.conversationId !== conversationId) === true;
+  const residentSize = residentId === null ? null : modelSize(residentId);
+  const memory =
+    residentId === null
+      ? undefined
+      : {
+          text:
+            residentSize === null
+              ? fill(CHAT.engine.residentNoSize, { model: residentId })
+              : fill(CHAT.engine.resident, { model: residentId, size: formatBytes(residentSize) }),
+          action: <UnloadButton control={unload.control(residentId)} />,
+        };
+  const threadModel = conv?.conversation.modelId ?? modelValue;
+  const threadUnload = useMemo(
+    () => (threadModel === null ? undefined : unloadControl(threadModel)),
+    [threadModel, unloadControl],
+  );
+
+  const changeModel = async (id: string): Promise<void> => {
+    storeModel(mode, id);
+    if (isNew) {
+      setNewModel(id);
+      return;
+    }
+    if (conversationId === null) return;
+    setModelWorking(true);
+    try {
+      await mutate<ConversationInfo>('PATCH', conversationPath(conversationId), { modelId: id });
+    } catch (err) {
+      const reason = err instanceof DashboardApiError ? err.reason : undefined;
+      if (reason === 'conversation-busy') toast.error(CHAT.sendErrors['conversation-busy'][0]);
+      else toast.error(CHAT.modelUnavailable);
+    } finally {
+      setModelWorking(false);
+    }
+  };
+
+  // Why Send is off.
+  const blocker = modeBlocker(connected, host, mode);
+  let blocked = blocker?.reason;
+  if (blocked === undefined && isNew && mode === 'work' && newFolder === null) blocked = CHAT.folderNeeded;
+  if (blocked === undefined && isNew && mode === 'work' && newFolder !== null && folderTooLong(newFolder))
+    blocked = CHAT.folderTooLong;
+  if (blocked === undefined && cwdProblem !== undefined) blocked = CHAT.cwdProblems[cwdProblem];
+  if (blocked === undefined && isSlashText(draft)) blocked = CHAT.slashText;
+  const panelShown = isNew && blocker?.panel !== undefined;
+
+  const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const focusComposer = useCallback(() => {
+    requestAnimationFrame(() => composerRef.current?.focus({ preventScroll: true }));
+  }, []);
+
+  const root = useScrollRoot();
+  const stick = useStickToBottom(root, threadKey);
+
+  const send = async (text: string): Promise<void> => {
+    if (text.trim() === '' || isSlashText(text) || phase !== 'idle') return;
+    if (modeBlocker(connected, host, mode) !== null) return;
+    if (isNew && mode === 'work' && (newFolder === null || folderTooLong(newFolder))) return;
+    if (!isNew && cwdProblem !== undefined) return;
+    setStripError(null);
+    setFailedText(null);
+    setDismissedEnd(conv?.lastEnd ?? null);
+    const fromNew = isNew;
+    const target = fromNew ? null : conversationId;
+    const origin = place;
+    const base = fromNew ? 0 : (conv?.entries.length ?? 0);
+    const next: Sending = {
+      conversationId: target,
+      mode,
+      text,
+      base,
+      lastEnd: fromNew ? null : (conv?.lastEnd ?? null),
+      ts: Date.now(),
+    };
+    setSending(next);
+    // A Retry of a failed message leaves text typed since then in the composer.
+    if (readDraft(origin) === text) setDraft('');
+    stick.pin();
+    announce(CHAT.status.sent);
+    // The reply belongs to the place it was sent from; the user may be elsewhere by the time it arrives.
+    const stillShown = (): boolean => placeRef.current === origin;
+    const drop = (): void => setSending((current) => (current === next ? null : current));
+    try {
+      if (fromNew) {
+        const body: { mode: ChatMode; text: string; modelId?: string; cwd?: string } = { mode, text };
+        if (chosenNew !== null) body.modelId = chosenNew;
+        if (mode === 'work' && newFolder !== null) body.cwd = newFolder;
+        const reply = await mutate<CreateReply>('POST', '/chat/conversations', body);
+        const id = reply.conversation.id;
+        rememberPlace(mode, id);
+        reloadLists();
+        if (stillShown()) {
+          setCreatedId(id);
+          setSending((current) => (current === next ? { ...next, conversationId: id, lastEnd: null } : current));
+          void navigate(chatUrl(id));
+        } else {
+          drop();
+        }
+      } else if (target !== null) {
+        await mutate('POST', `${conversationPath(target)}/prompt`, { text });
+      }
+    } catch (err) {
+      drop();
+      // Text typed while the send was pending stays; Retry still sends the failed text.
+      const restore = readDraft(origin) === '';
+      if (restore) writeDraft(origin, text);
+      const reason = err instanceof DashboardApiError ? err.reason : undefined;
+      const code = err instanceof DashboardApiError ? err.code : undefined;
+      const outcome = sendFailure(reason, code, mode, err instanceof Error ? err.message : undefined);
+      if ('toast' in outcome) toast.error(outcome.toast);
+      else if (stillShown()) {
+        if (restore) setDraftState(text);
+        setStripError(outcome.strip);
+        setFailedText({ place: origin, text });
+      } else {
+        toast.error(outcome.strip.text);
+      }
+    }
+  };
+
+  const picking = useRef(false);
+  const pickAndChoose = useCallback(async () => {
+    if (picking.current) return;
+    picking.current = true;
+    try {
+      const path = await pickFolder();
+      if (path !== null) {
+        chooseFolder(path);
+        setFolderChoice(path);
+        setStripError(null);
+      }
+    } finally {
+      picking.current = false;
+    }
+    focusComposer();
+  }, [focusComposer]);
+  const chooseRecent = useCallback(
+    (path: string) => {
+      chooseFolder(path);
+      setFolderChoice(path);
+      setStripError(null);
+      focusComposer();
+    },
+    [focusComposer],
+  );
+
+  const stop = useCallback(() => {
+    if (conversationId === null || turn === null || turn.phase === 'cancelling') return;
+    mutate('POST', `${conversationPath(conversationId)}/cancel`).catch(() => {
+      toast.error(CHAT.sendErrors.other[0]);
+    });
+  }, [conversationId, turn]);
+
+  const runAction = (action: BlockAction): void => {
+    setStripError(null);
+    switch (action.kind) {
+      case 'install':
+        mutate('POST', '/chat/agent', { action: 'install' }).catch(() => undefined);
+        return;
+      case 'restart':
+        mutate('POST', '/chat/agent', { action: 'restart', mode }).catch(() => undefined);
+        return;
+      case 'open-engine':
+        void navigate('/engine');
+        return;
+      case 'open-models':
+        void navigate('/models');
+        return;
+      case 'open-providers':
+        void navigate('/providers');
+        return;
+      case 'copy-details':
+        if (host !== null)
+          writeClipboard(copyDetails(host, mode)).then(
+            () => toast.success(CHAT.detailsCopied),
+            () => undefined,
+          );
+        return;
+      case 'retry':
+        if (turnStrip !== null && conv !== null) setDismissedEnd(conv.lastEnd);
+        if (retryText !== null) void send(retryText);
+        return;
+      case 'pick-model':
+        pickerRef.current?.querySelector('button')?.click();
+        return;
+      case 'choose-folder':
+        void pickAndChoose();
+        return;
+    }
+  };
+
+  const toNotice = (strip: StripNotice): ComposerNotice => ({
+    tone: strip.tone,
+    text: strip.text,
+    working: strip.working,
+    action:
+      strip.action === undefined ? undefined : { label: strip.action.label, onSelect: () => runAction(strip.action!) },
+    secondary:
+      strip.secondary === undefined
+        ? undefined
+        : { label: strip.secondary.label, onSelect: () => runAction(strip.secondary!) },
+  });
+
+  const retryText = failedText !== null && failedText.place === place ? failedText.text : null;
+  const endFailure = conv?.lastEnd?.failure;
+  const turnStrip =
+    conv !== null && endFailure !== undefined && conv.lastEnd?.outcome === undefined && dismissedEnd !== conv.lastEnd
+      ? (() => {
+          const outcome = sendFailure(endFailure.code, undefined, mode, undefined, conv.conversation.modelId);
+          if (!('strip' in outcome)) return null;
+          // Retry needs the text of the message that never ran; without it the strip has no button.
+          const strip = outcome.strip;
+          return strip.action?.kind === 'retry' && retryText === null ? { ...strip, action: undefined } : strip;
+        })()
+      : null;
+  const modeStrip = panelShown ? undefined : blocker?.notice;
+  const folderStrip: StripNotice | null =
+    cwdProblem !== undefined ? { tone: 'danger', text: CHAT.cwdProblems[cwdProblem] } : null;
+  const strip: StripNotice | null = modeStrip ?? stripError ?? folderStrip ?? turnStrip ?? infoNotice(host, mode);
+
+  const onDraftChange = (text: string): void => {
+    setDraft(text);
+    if (stripError !== null) setStripError(null);
+    if (turnStrip !== null && conv !== null) setDismissedEnd(conv.lastEnd);
+  };
+
+  // Navigation.
+  const switchMode = useCallback(
+    (next: ChatMode) => {
+      if (next === mode) return;
+      storeMode(next);
+      announce(next === 'work' ? CHAT.status.toWork : CHAT.status.toChat);
+      if (isNew) {
+        void navigate(newUrl(next), { replace: true });
+        return;
+      }
+      const placeOf = lastPlaceOf(next);
+      void navigate(placeOf !== null ? chatUrl(placeOf) : newUrl(next));
+    },
+    [mode, isNew, navigate, announce],
+  );
+
+  const pageRef = useRef<HTMLDivElement | null>(null);
+  const docked = useChatDocked(pageRef);
+  const [listOpen, setListOpen] = useState(false);
+  const [searchWanted, setSearchWanted] = useState(false);
+  const searchRef = useRef<HTMLInputElement | null>(null);
+  usePageSearch(searchRef);
+  useEffect(() => {
+    if (!searchWanted) return;
+    const timer = setTimeout(() => {
+      searchRef.current?.focus();
+      setSearchWanted(false);
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [searchWanted, listOpen]);
+  const [query, setQuery] = useState('');
+
+  const pickedFromDrawer = useRef(false);
+  const openConversation = useCallback(
+    (id: string) => {
+      const fromDrawer = !docked && listOpen;
+      pickedFromDrawer.current = fromDrawer;
+      setListOpen(false);
+      if (id !== conversationId) void navigate(chatUrl(id));
+      else if (!fromDrawer) focusComposer();
+    },
+    [conversationId, navigate, focusComposer, docked, listOpen],
+  );
+  const listCloseFocus = useCallback((opener: Element | null): HTMLElement | null => {
+    if (pickedFromDrawer.current) {
+      pickedFromDrawer.current = false;
+      return composerRef.current;
+    }
+    if (opener instanceof HTMLElement && opener.isConnected && opener !== document.body) return opener;
+    return composerRef.current;
+  }, []);
+
+  const onDeleted = useCallback(
+    (id: string) => {
+      forgetConversation(id);
+      forgetPlace(id);
+      reloadLists();
+      if (id === conversationId) void navigate(newUrl(mode), { replace: true });
+    },
+    [conversationId, mode, navigate, reloadLists],
+  );
+
+  const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const busyOf = (id: string): boolean =>
+    host?.active.some((entry) => entry.conversationId === id && (entry.busy || entry.waiting)) === true ||
+    (id === conversationId && busy);
+  const focusBefore = useRef<Element | null>(null);
+  const noteFocus = (): void => {
+    focusBefore.current = document.activeElement;
+  };
+  const returnFocus = (): HTMLElement | null => {
+    const before = focusBefore.current;
+    if (before instanceof HTMLElement && before.isConnected && before !== document.body) return before;
+    return composerRef.current;
+  };
+  const renameItem = (item: Pick<ConversationItem, 'id' | 'title'>): void => {
+    noteFocus();
+    setRenameTarget({ id: item.id, title: item.title, busy: busyOf(item.id) });
+  };
+
+  const title = isNew
+    ? gone !== null
+      ? gone === 'deleted'
+        ? CHAT.goneDeleted
+        : CHAT.goneUnknown
+      : mode === 'work'
+        ? CHAT.newWork
+        : CHAT.newChat
+    : chatTitle(conv?.conversation.title ?? rowOf(conversationId)?.title ?? '', mode);
+  useCrumbs([{ label: CHAT.nav, to: '/chat' }, { label: title }]);
+  useEffect(() => {
+    document.title = `${title} — mlx-node`;
+  }, [title]);
+
+  const openedAnnounced = useRef<string | null>(null);
+  useEffect(() => {
+    if (openId === null || conv === null || openedAnnounced.current === openId) return;
+    openedAnnounced.current = openId;
+    if (createdId !== openId)
+      announce(fill(CHAT.status.opened, { title: chatTitle(conv.conversation.title, conv.conversation.mode) }));
+  }, [openId, conv, announce, createdId]);
+
+  const landing = isNew ? `${NEW_PLACE}:${mode}` : place;
+  // Focus: the composer whenever the page lands on a place (after the shell's own focus move), or the panel's action.
+  // The mode switch keeps focus while it is used; a pick from the drawer focuses once the drawer has closed.
+  useEffect(() => {
+    if (pickedFromDrawer.current && !docked) return;
+    pickedFromDrawer.current = false;
+    const timer = setTimeout(() => {
+      if (document.activeElement?.closest(`[aria-label="${CHAT.mode}"]`) != null) return;
+      const action =
+        document.querySelector<HTMLElement>('[data-interaction-card] button:not(:disabled)') ??
+        document.querySelector<HTMLElement>('[data-hero-action]');
+      (action ?? composerRef.current)?.focus({ preventScroll: true });
+    }, 0);
+    return () => clearTimeout(timer);
+  }, [landing]);
+
+  const copyLastAnswer = useCallback(() => {
+    if (conv === null) return;
+    const turns = splitTurns(conv.entries, conv.turns);
+    const lastFinished =
+      conv.turn !== null && turns[turns.length - 1]?.end === null ? turns.length - 2 : turns.length - 1;
+    for (let i = lastFinished; i >= 0; i -= 1) {
+      const text = answerMarkdown(turns[i]!.entries);
+      if (text !== '') {
+        writeClipboard(text).then(
+          () => toast.success(CHAT.copiedAnswer),
+          () => undefined,
+        );
+        return;
+      }
+    }
+  }, [conv]);
+
+  const hotkeys: readonly Hotkey[] = [
+    {
+      key: 'm',
+      meta: true,
+      shift: true,
+      allowInInput: true,
+      run: () => {
+        switchMode(mode === 'chat' ? 'work' : 'chat');
+        focusComposer();
+      },
+    },
+    {
+      key: '/',
+      run: () => {
+        if (docked) return;
+        setListOpen(true);
+        setSearchWanted(true);
+      },
+    },
+    { key: 'h', meta: true, shift: true, allowInInput: true, run: () => (docked ? undefined : setListOpen((o) => !o)) },
+    { key: 'c', meta: true, shift: true, allowInInput: true, run: copyLastAnswer },
+    {
+      key: 'F2',
+      allowInInput: true,
+      run: (event) => {
+        const target = event.target instanceof Element ? event.target : null;
+        if (target?.closest(`nav[aria-label="${CHAT.conversations}"]`) != null || dialogOpen()) return;
+        if (isNew || conversationId === null || busy) return;
+        renameItem({ id: conversationId, title });
+      },
+    },
+  ];
+  useHotkeys(hotkeys);
+
+  // Palette commands of this page.
+  const commands = useMemo<AppCommand[]>(() => {
+    const group = CHAT.commands.group;
+    const list: AppCommand[] = [
+      {
+        id: 'chat:switch',
+        label: mode === 'chat' ? CHAT.commands.switchToWork : CHAT.commands.switchToChat,
+        group,
+        shortcut: '⌘ ⇧ M',
+        icon: glyph(mode === 'chat' ? SquareTerminal : MessageCircle),
+        run: () => switchMode(mode === 'chat' ? 'work' : 'chat'),
+      },
+    ];
+    if (running) list.push({ id: 'chat:stop', label: CHAT.commands.stop, group, icon: glyph(Square), run: stop });
+    if (!isNew && conversationId !== null) {
+      const id = conversationId;
+      if (!busy) {
+        list.push({
+          id: 'chat:rename',
+          label: CHAT.commands.rename,
+          group,
+          icon: glyph(Pencil),
+          run: () => {
+            focusBefore.current = document.activeElement;
+            setRenameTarget({ id, title, busy: false });
+          },
+        });
+        list.push({
+          id: 'chat:delete',
+          label: CHAT.commands.remove,
+          group,
+          icon: glyph(Trash2),
+          run: () => {
+            focusBefore.current = document.activeElement;
+            setDeleteOpen(true);
+          },
+        });
+      }
+      list.push({
+        id: 'chat:inspect',
+        label: CHAT.commands.inspect,
+        group,
+        icon: glyph(ScanSearch),
+        run: () => void navigate(`/sessions/${encodeURIComponent(id)}?tab=activity`),
+      });
+      if (conv !== null && conv.entries.length > 0) {
+        const entries = conv.entries;
+        list.push({
+          id: 'chat:copy-all',
+          label: CHAT.commands.copyAll,
+          group,
+          icon: glyph(Copy),
+          run: () => {
+            writeClipboard(conversationMarkdown(entries)).then(
+              () => void toast.success(CHAT.copiedAll),
+              () => undefined,
+            );
+          },
+        });
+      }
+    }
+    if (mode === 'work' && isNew)
+      list.push({
+        id: 'chat:choose-folder',
+        label: CHAT.commands.chooseFolder,
+        group,
+        icon: glyph(FolderOpen),
+        run: () => void pickAndChoose(),
+      });
+    list.push({
+      id: 'chat:web',
+      label: CHAT.commands.webSettings,
+      group,
+      icon: glyph(Globe),
+      run: () => void navigate('/providers'),
+    });
+    return list;
+  }, [mode, running, stop, isNew, conversationId, busy, title, conv, navigate, switchMode, pickAndChoose]);
+  useCommands(commands);
+
+  // Requests of the agent (Work): one card at a time, in arrival order.
+  const [closedCards, setClosedCards] = useState<ReadonlySet<string>>(() => new Set());
+  const openCards: Interaction[] =
+    mode === 'work' && conv !== null ? conv.interactions.filter((item) => !closedCards.has(item.id)) : [];
+  const card = openCards[0];
+  const cardId = card?.id ?? null;
+  const cardRef = useRef(card);
+  useLayoutEffect(() => {
+    cardRef.current = card;
+  });
+  const shownCard = useRef<string | null>(null);
+  useEffect(() => {
+    const before = shownCard.current;
+    shownCard.current = cardId;
+    const focused = document.activeElement?.closest('[data-interaction-card]') != null;
+    if (cardId !== null && cardId !== before && cardRef.current !== undefined && !focused)
+      announce(asksSentence(cardRef.current));
+    if (before !== null && cardId === null) {
+      const active = document.activeElement;
+      if (active === null || active === document.body || active.closest('[data-interaction-card]') !== null)
+        focusComposer();
+    }
+  }, [cardId, announce, focusComposer]);
+  const answerCard = useCallback(
+    async (iid: string, answer: InteractionAnswer): Promise<void> => {
+      if (conversationId === null) return;
+      try {
+        await mutate('POST', `${conversationPath(conversationId)}/interactions/${encodeURIComponent(iid)}`, answer);
+      } catch (err) {
+        const code = err instanceof DashboardApiError ? err.code : undefined;
+        if (code === 'E_NOT_FOUND') {
+          setClosedCards((current) => new Set(current).add(iid));
+          toast.error(CHAT.permClosed);
+          return;
+        }
+        toast.error(code === 'E_BAD_REQUEST' && err instanceof Error ? err.message : CHAT.sendErrors.other[0]);
+        throw err;
+      }
+    },
+    [conversationId],
+  );
+  // The permission mode of the open Work conversation: the stream decides what is shown, never this page.
+  const workInfo = !isNew && conv !== null && conv.conversation.mode === 'work' ? conv.conversation : null;
+  const workId = workInfo?.id ?? null;
+  const permissionMode = permissionModeShown(host?.permissionRaised ?? null, workInfo);
+  const permissionSwitch = usePermissionMode(workId);
+  const permissionBlock = permissionModeBlocked({
+    connected,
+    isNew: isNew || workInfo === null,
+    cardOpen: openCards.length > 0,
+    blocker: modeBlocker(connected, host, 'work')?.reason,
+    cwdProblem,
+  });
+  const openAllowOnce = openCards.filter(
+    (item) =>
+      item.kind === 'permission' &&
+      item.options.some((option) => option.optionId === 'allow-once' && option.kind === 'allow_once'),
+  ).length;
+  const permissionFacts = {
+    folder: openFolder ?? newFolder,
+    userHooks: workInfo?.userHooks === true,
+    openAllowOnce,
+  };
+  const [permissionAsked, setPermissionAsked] = useState<{ id: string; target: 'auto' | 'bypass' } | null>(null);
+  // Only in its own conversation: a dialog keyed by the next one would mount open and never finish its exit.
+  const permissionDialog = permissionAsked !== null && permissionAsked.id === workId ? permissionAsked.target : null;
+  const permissionSeen = useRef<{ id: string | null; mode: PermissionMode; marks: number }>({
+    id: null,
+    mode: 'ask',
+    marks: 0,
+  });
+  const permissionMarks = workInfo === null ? undefined : conv?.permissionMarks;
+  const permissionFolder = permissionFacts.folder;
+  useEffect(() => {
+    const seen = permissionSeen.current;
+    const count = permissionMarks?.length ?? 0;
+    if (workId !== null && seen.id === workId) {
+      if (seen.mode !== permissionMode) announce(permissionModeName(permissionMode, permissionFolder));
+      if (
+        permissionMarks !== undefined &&
+        count > seen.marks &&
+        permissionMarks.slice(seen.marks).some((m) => m.kind === 'settings')
+      )
+        toast.warning(CHAT.permission.settingsLabel, { description: CHAT.permission.settingsText });
+    }
+    permissionSeen.current = { id: workId, mode: permissionMode, marks: count };
+  }, [workId, permissionMode, permissionMarks, permissionFolder, announce]);
+  const setPermissionMode = permissionSwitch.set;
+  // A confirm whose facts went stale closes and does not open again by itself.
+  const dialogBlocked = permissionDialog !== null && permissionBlock[permissionDialog] !== null;
+  useEffect(() => {
+    if (dialogBlocked) setPermissionAsked(null);
+  }, [dialogBlocked]);
+  useEffect(() => {
+    setPermissionAsked(null);
+  }, [workId, permissionMode]);
+  const permissionCommands = useMemo<AppCommand[]>(() => {
+    if (workId === null) return [];
+    const group = CHAT.commands.group;
+    const p = CHAT.permission;
+    const label = (target: PermissionMode): string => fill(p.command, { mode: p.modes[target] });
+    const list: AppCommand[] = [];
+    const free = (target: 'auto' | 'bypass'): boolean => permissionBlock[target] === null;
+    if (permissionBlock.chip !== null) return list;
+    if (permissionMode !== 'ask')
+      list.push({
+        id: 'chat:permission-ask',
+        label: label('ask'),
+        group,
+        icon: glyph(Shield),
+        run: () => void setPermissionMode('ask', false),
+      });
+    if (permissionMode === 'bypass')
+      list.push({
+        id: 'chat:permission-auto',
+        label: label('auto'),
+        group,
+        icon: glyph(ShieldCheck),
+        run: () => void setPermissionMode('auto', false),
+      });
+    if (permissionMode === 'ask' && free('auto'))
+      list.push({
+        id: 'chat:permission-auto',
+        label: `${label('auto')}…`,
+        group,
+        icon: glyph(ShieldCheck),
+        run: () => setPermissionAsked({ id: workId, target: 'auto' }),
+      });
+    if (permissionMode !== 'bypass' && free('bypass'))
+      list.push({
+        id: 'chat:permission-bypass',
+        label: `${label('bypass')}…`,
+        group,
+        icon: glyph(ShieldOff),
+        run: () => setPermissionAsked({ id: workId, target: 'bypass' }),
+      });
+    return list;
+  }, [workId, permissionMode, permissionBlock.chip, permissionBlock.auto, permissionBlock.bypass, setPermissionMode]);
+  useCommands(permissionCommands);
+
+  const position = { index: 1, count: openCards.length };
+  const cardNode =
+    mode === 'work' ? (
+      <InteractionPresence>
+        {card === undefined ? null : card.kind === 'permission' ? (
+          <PermissionCard
+            key={card.id}
+            interaction={card}
+            permissionMode={permissionMode}
+            folder={openFolder}
+            position={position}
+            composerRef={composerRef}
+            onAnswer={(answer) => answerCard(card.id, answer)}
+          />
+        ) : (
+          <PlanCard
+            key={card.id}
+            interaction={card}
+            folder={openFolder}
+            position={position}
+            composerRef={composerRef}
+            onAnswer={(answer) => answerCard(card.id, answer)}
+          />
+        )}
+      </InteractionPresence>
+    ) : null;
+
+  // The other workspace waits for an answer: said once per conversation that starts waiting.
+  const otherMode: ChatMode = mode === 'chat' ? 'work' : 'chat';
+  const waitingOther = (host?.active ?? [])
+    .filter((entry) => entry.mode === otherMode && entry.waiting)
+    .map((entry) => entry.conversationId)
+    .sort()
+    .join('\n');
+  const waitingSeen = useRef<string>('');
+  useEffect(() => {
+    const before = new Set(waitingSeen.current === '' ? [] : waitingSeen.current.split('\n'));
+    waitingSeen.current = waitingOther;
+    if (waitingOther === '') return;
+    if (waitingOther.split('\n').some((id) => !before.has(id)))
+      announce(fill(CHAT.status.otherWaits, { mode: otherMode === 'work' ? CHAT.modeWork : CHAT.modeChat }));
+  }, [waitingOther, otherMode, announce]);
+
+  // The thread.
+  let entries: readonly TranscriptEntry[] = conv?.entries ?? [];
+  let threadTurn: TurnState | null = turn;
+  let lastEnd: ConversationState['lastEnd'] = conv?.lastEnd ?? null;
+  if (sendingHere && sending !== null) {
+    if (entries.length <= sending.base) {
+      entries = [...entries, { kind: 'user', ts: sending.ts, text: sending.text, promptIndex: null }];
+    }
+    threadTurn = turn ?? STARTING;
+    if (turn === null) lastEnd = null;
+  }
+  const engineReason =
+    host?.inference === 'stopped' ? CHAT.blockers['inference-stopped'][1] : (blocker?.reason ?? undefined);
+
+  const sendRef = useRef(send);
+  useLayoutEffect(() => {
+    sendRef.current = send;
+  });
+  const onTurnAction = useCallback((action: TurnAction) => {
+    if (action.kind === 'update-agent') {
+      mutate('POST', '/chat/agent', { action: 'install' }).catch(() => undefined);
+      return;
+    }
+    void sendRef.current(action.text);
+  }, []);
+
+  let body: ReactNode;
+  if (gone !== null && !sendingHere) {
+    body = (
+      <div className="grid h-full content-center justify-items-center gap-3 py-6 text-center">
+        <p className="m-0 text-body text-foreground">{gone === 'deleted' ? CHAT.goneDeleted : CHAT.goneUnknown}</p>
+        <Button
+          type="button"
+          variant="secondary"
+          size="sm"
+          onClick={() => void navigate(newUrl(mode), { replace: true })}
+        >
+          {mode === 'work' ? CHAT.newWork : CHAT.newChat}
+        </Button>
+      </div>
+    );
+  } else if (isNew && !sendingHere) {
+    body = (
+      <NewScreen
+        mode={mode}
+        model={chosenNew}
+        providers={host?.providers ?? null}
+        blocker={blocker}
+        folder={newFolder}
+        onChooseFolder={() => void pickAndChoose()}
+        onStarter={(text) => {
+          setDraft(text);
+          focusComposer();
+        }}
+        onAction={runAction}
+      />
+    );
+  } else if (conv === null && !sendingHere) {
+    body = (
+      <div className="grid gap-3" aria-busy="true">
+        <span className="flex justify-end">
+          <Placeholder width="40%" height={36} radius="panel" />
+        </span>
+        <Placeholder width="90%" />
+        <Placeholder width="70%" />
+      </div>
+    );
+  } else {
+    body = (
+      <ChatThread
+        conversationId={conversationId}
+        mode={mode}
+        entries={entries}
+        turns={conv?.turns ?? []}
+        turn={threadTurn}
+        lastEnd={lastEnd}
+        creating={sendingHere && turn === null}
+        host={
+          host === null
+            ? null
+            : { inference: host.inference, loading: host.loading, resident: unload.resident, answers: host.answers }
+        }
+        modelSize={modelSize}
+        unload={threadUnload}
+        asOfMs={view.asOfMs}
+        model={threadModel}
+        transcriptError={conv?.transcriptError ?? null}
+        inspectHref={
+          conversationId === null ? undefined : `/sessions/${encodeURIComponent(conversationId)}?tab=activity`
+        }
+        onTurnAction={onTurnAction}
+        actionDisabledReason={engineReason}
+        onStatus={announce}
+        contentRef={stick.contentRef}
+        folder={openFolder}
+        card={cardNode}
+        marks={permissionMarks}
+      />
+    );
+  }
+
+  const removeContent =
+    !isNew && conversationId !== null
+      ? deleteContent({ id: conversationId, title, mode, folder: conv?.conversation.cwd ?? null }, onDeleted)
+      : null;
+
+  const placeholder = !isNew
+    ? permissionMode === 'bypass'
+      ? CHAT.permission.bypass.placeholder
+      : CHAT.placeholderReply
+    : mode === 'work'
+      ? newFolder === null
+        ? CHAT.placeholderWorkNoFolder
+        : fill(CHAT.placeholderWork, { folder: folderName(newFolder) })
+      : CHAT.placeholderChat;
+
+  const tools = (
+    <>
+      <span ref={pickerRef} className="inline-flex">
+        <ModelPicker
+          value={modelValue}
+          options={options}
+          onValueChange={(id) => void changeModel(id)}
+          disabled={!isNew && busy}
+          disabledReason={!isNew && busy ? CHAT.modelBusy : undefined}
+          working={modelWorking}
+          footer={residentId !== null ? fill(CHAT.modelFooter, { resident: residentId }) : undefined}
+          swapWarning={residentId !== null && otherRunning ? fill(CHAT.modelSwap, { resident: residentId }) : undefined}
+          memory={memory}
+        />
+      </span>
+      {mode !== 'work' ? null : isNew ? (
+        <NewFolderChip folder={newFolder} recent={recent} onChoose={chooseRecent} onPick={() => void pickAndChoose()} />
+      ) : openFolder !== null ? (
+        <OpenFolderChip folder={openFolder} />
+      ) : null}
+      {host !== null ? <WebChip providers={host.providers} mode={mode} /> : null}
+      {mode === 'work' ? (
+        <PermissionModeChip
+          key={workId ?? ''}
+          place="composer"
+          mode={permissionMode}
+          block={permissionBlock}
+          facts={permissionFacts}
+          providers={host?.providers ?? null}
+          pending={permissionSwitch.pending}
+          onSet={setPermissionMode}
+        />
+      ) : null}
+    </>
+  );
+
+  const newButton = <NewButton mode={mode} onNew={() => void navigate(newUrl(mode))} />;
+
+  return (
+    <div ref={pageRef} className="min-w-0">
+      <ChatFrame
+        barStart={
+          <>
+            <ModeSwitch mode={mode} active={host?.active ?? []} onChange={switchMode} />
+            {docked ? newButton : null}
+          </>
+        }
+        barEnd={
+          <ThreadBar
+            title={title}
+            open={
+              removeContent !== null && conversationId !== null
+                ? { id: conversationId, running: busy, remove: removeContent }
+                : null
+            }
+            onRename={() => {
+              if (conversationId !== null) renameItem({ id: conversationId, title });
+            }}
+            trailing={docked ? null : newButton}
+            folder={openFolder !== null ? <OpenFolderChip folder={openFolder} /> : null}
+            permission={
+              permissionMode !== 'ask' ? (
+                <PermissionModeChip
+                  key={workId ?? ''}
+                  place="header"
+                  mode={permissionMode}
+                  block={permissionBlock}
+                  facts={permissionFacts}
+                  providers={host?.providers ?? null}
+                  pending={permissionSwitch.pending}
+                  onSet={setPermissionMode}
+                />
+              ) : null
+            }
+          />
+        }
+        list={
+          <ListPane
+            mode={mode}
+            chat={{
+              rows: chatRows,
+              error: chatList.error !== undefined && chatList.data === undefined,
+            }}
+            work={{
+              rows: workRows,
+              error: workList.error !== undefined && workList.data === undefined,
+            }}
+            active={host?.active ?? []}
+            raised={host?.permissionRaised ?? NO_RAISED}
+            currentId={conversationId}
+            query={query}
+            onQueryChange={setQuery}
+            searchRef={searchRef}
+            onOpen={openConversation}
+            onRename={renameItem}
+            onDeleted={onDeleted}
+            onRetry={reloadLists}
+          />
+        }
+        listLabel={CHAT.conversations}
+        listOpen={listOpen}
+        onListOpenChange={setListOpen}
+        listCloseFocus={listCloseFocus}
+        jump={
+          stick.showJump ? (
+            <JumpButton
+              onJump={(button) => {
+                const focused = document.activeElement === button;
+                stick.jump();
+                if (focused) focusComposer();
+              }}
+              fresh={stick.fresh}
+            />
+          ) : null
+        }
+        dock={
+          <div className="grid gap-2">
+            {conv !== null ? <ConversationNotices notices={conv.notices} /> : null}
+            <Composer
+              value={draft}
+              onValueChange={onDraftChange}
+              placeholder={placeholder}
+              phase={phase}
+              onSend={() => void send(draft)}
+              onStop={stop}
+              blocked={blocked}
+              notice={strip === null ? undefined : toNotice(strip)}
+              tools={tools}
+              hint={running ? CHAT.hintStop : CHAT.hintSend}
+              hintOnFocus={running}
+              textareaRef={composerRef}
+            />
+          </div>
+        }
+      >
+        <SwapCell active={threadKey} items={{ [threadKey]: body }} className="h-full" />
+      </ChatFrame>
+      <div role="status" aria-live="polite" className="sr-only">
+        <span key={status.n}>{status.text}</span>
+      </div>
+      <RenameDialog
+        target={renameTarget}
+        onOpenChange={(open) => {
+          if (!open) setRenameTarget(null);
+        }}
+        onRenamed={() => reloadLists()}
+        returnFocus={returnFocus}
+      />
+      {workId !== null ? (
+        <PermissionModeDialog
+          key={workId}
+          target={permissionDialog}
+          mode={permissionMode}
+          onClose={() => setPermissionAsked(null)}
+          facts={permissionFacts}
+          providers={host?.providers ?? null}
+          pending={permissionSwitch.pending}
+          onSet={setPermissionMode}
+        />
+      ) : null}
+      {removeContent !== null ? (
+        <ConfirmDialog {...removeContent} open={deleteOpen} onOpenChange={setDeleteOpen} returnFocus={returnFocus} />
+      ) : null}
+    </div>
+  );
+}

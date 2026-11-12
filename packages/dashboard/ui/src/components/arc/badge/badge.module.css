@@ -1,0 +1,104 @@
+/*
+ * One formula tints every tone and colour from the shared --tone-* family, so they read as one set in both themes:
+ *   background  the tone mixed into the surface (10% light, a barely tinted 12% dark)
+ *   text        the tone, deepened toward the foreground in light (AA on the tint) and the bright pastel itself in dark
+ *   mark        the icon or dot, closer to the pure tone
+ *   ring        transparent by default; `outline` draws a hairline of the tone
+ * All mixes run in oklab: oklch tints turn pink after the production build.
+ */
+.badge {
+  --badge-tone: var(--text-secondary);
+  --badge-tint: 10%;
+  --badge-ink: 84%;
+  --badge-background: color-mix(in oklab, var(--badge-tone) var(--badge-tint), var(--surface));
+  --badge-foreground: color-mix(in oklab, var(--badge-tone) var(--badge-ink), var(--foreground));
+  --badge-color: color-mix(in oklab, var(--badge-tone) 88%, var(--foreground));
+  --badge-border: transparent;
+  --badge-radius: 6px;
+  --badge-height: 24px;
+  --badge-pad: 10px;
+  --badge-gap: 5px;
+  --badge-icon: 14px;
+  --badge-dot: 6px;
+  box-sizing: border-box;
+  display: inline-flex;
+  min-height: var(--badge-height);
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  border: 1px solid var(--badge-border);
+  border-radius: var(--badge-radius);
+  padding: 0 var(--badge-pad);
+  color: var(--badge-foreground);
+  background: var(--badge-background);
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -.005em;
+  line-height: 1;
+  white-space: nowrap;
+  /* Clip keeps the corners clean while the badge morphs around swapped text. */
+  overflow: clip;
+  transition: border-color var(--duration-standard) var(--ease-standard), background-color var(--duration-standard) var(--ease-standard), color var(--duration-standard) var(--ease-standard);
+}
+
+:global(:root[data-theme="dark"]) .badge { --badge-tint: 12%; --badge-ink: 94%; }
+.outline { --badge-border: color-mix(in oklab, var(--badge-tone) 14%, var(--border)); }
+:global(:root[data-theme="dark"]) .outline { --badge-border: color-mix(in oklab, var(--badge-tone) 22%, var(--border)); }
+
+/* Sizes on the four point grid. The leading edge tightens beside a mark so the visual padding matches the trailing edge. */
+.sm { --badge-height: 20px; --badge-radius: 5px; --badge-pad: 8px; --badge-gap: 4px; --badge-icon: 12px; --badge-dot: 5px; font-size: 11px; }
+.md { --badge-height: 24px; --badge-radius: 6px; --badge-pad: 10px; --badge-gap: 5px; --badge-icon: 14px; --badge-dot: 6px; }
+.lg { --badge-height: 28px; --badge-radius: 7px; --badge-pad: 12px; --badge-gap: 6px; --badge-icon: 16px; --badge-dot: 7px; font-size: var(--text-sm); }
+/* Full round ends, the original look. Declared after the sizes so it wins over their radius. */
+.pill { --badge-radius: var(--radius-pill); }
+.withIcon { padding-inline-start: calc(var(--badge-pad) - 2px); }
+.withDot { padding-inline-start: calc(var(--badge-pad) - 1px); }
+
+/* Flex all the way down: an inline box here would sit on a text baseline and push the label off centre. */
+.body { display: flex; align-items: center; }
+.content { position: relative; display: flex; width: max-content; align-items: center; gap: var(--badge-gap); }
+.label, .glyph { position: relative; display: inline-flex; align-items: center; }
+/* Trim the line box to cap height and baseline, so flex centring puts the letters on the badge's optical centre at every size. */
+.text { display: block; text-box: trim-both cap alphabetic; }
+
+.icon {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  color: var(--badge-color);
+  line-height: 0;
+}
+.glyph > svg { display: block; width: var(--badge-icon); height: var(--badge-icon); }
+
+.dot {
+  display: block;
+  width: var(--badge-dot);
+  height: var(--badge-dot);
+  flex: none;
+  border-radius: 50%;
+  background: var(--badge-color);
+}
+
+.neutral { --badge-tone: var(--text-secondary); }
+.info { --badge-tone: var(--info, var(--tone-sky)); }
+.success { --badge-tone: var(--success); }
+.warning { --badge-tone: var(--warning); }
+.danger { --badge-tone: var(--danger); }
+/* Categorical colours (method tags, labels) override the tone. */
+.teal { --badge-tone: var(--tone-teal); }
+.sky { --badge-tone: var(--tone-sky); }
+.orchid { --badge-tone: var(--tone-orchid); }
+.violet { --badge-tone: var(--tone-violet); }
+.rose { --badge-tone: var(--tone-rose); }
+.amber { --badge-tone: var(--tone-amber); }
+/* Amber is the lightest hue, so light mode deepens its text a little further. */
+.warning, .amber { --badge-ink: 76%; }
+
+@media (prefers-reduced-motion: reduce) {
+  .badge { transition-duration: var(--duration-instant); }
+}

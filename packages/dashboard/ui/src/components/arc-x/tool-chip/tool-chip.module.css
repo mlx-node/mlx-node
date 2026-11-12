@@ -1,0 +1,110 @@
+.root {
+  box-sizing: border-box;
+  display: inline-flex;
+  height: var(--control-height-sm);
+  min-width: 0;
+  max-width: 100%;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 0 var(--space-2-5);
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+
+.root[data-chip='off'] {
+  border: 1px dashed var(--border-strong);
+  color: var(--text-secondary);
+}
+
+.root[data-compact] {
+  width: var(--control-height-sm);
+  justify-content: center;
+  padding: 0;
+}
+
+.root:hover {
+  background: var(--row-hover);
+}
+
+.root:active,
+.root[aria-expanded='true'] {
+  background: var(--row-active);
+}
+
+.root:disabled,
+.root[aria-disabled='true'] {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.root[aria-disabled='true']:hover,
+.root[aria-disabled='true']:active {
+  background: transparent;
+}
+
+.root[data-chip-tone='active'] {
+  border-color: var(--border-strong);
+  background: var(--accent-subtle);
+}
+
+.root[data-chip-tone='danger'] {
+  border-color: var(--danger);
+  background: color-mix(in oklab, var(--danger) 10%, var(--surface));
+  color: color-mix(in oklab, var(--danger) 84%, var(--foreground));
+}
+
+.root[data-chip-tone='danger']:hover,
+.root[data-chip-tone='danger'][aria-expanded='true'] {
+  background: color-mix(in oklab, var(--danger) 16%, var(--surface));
+}
+
+.root[data-chip-tone='active']:hover,
+.root[data-chip-tone='active'][aria-expanded='true'] {
+  background: color-mix(in oklab, var(--foreground) 5%, var(--accent-subtle));
+}
+
+.icon {
+  display: inline-flex;
+  flex: none;
+}
+
+.icon > svg {
+  width: 14px;
+  height: 14px;
+}
+
+.label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: var(--radius-pill);
+}
+
+.dot[data-tone='warning'] {
+  background: var(--warning);
+}
+
+.dot[data-tone='danger'] {
+  background: var(--danger);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .root {
+    transition: none;
+  }
+}

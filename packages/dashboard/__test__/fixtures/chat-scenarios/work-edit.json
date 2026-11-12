@@ -1,0 +1,112 @@
+{
+  "persist": true,
+  "initialize": {
+    "protocolVersion": 1,
+    "loadSession": true,
+    "pluginDirs": true,
+    "agentVersion": "1.0.45",
+    "models": [
+      {
+        "modelId": "qwen3.5-4b",
+        "totalContextTokens": 32768
+      },
+      {
+        "modelId": "qwen3.5-9b",
+        "totalContextTokens": 65536
+      }
+    ]
+  },
+  "session": {
+    "agentName": "grok-build-plan",
+    "toolDefinitionsCount": 20,
+    "skills": 1,
+    "mcpServers": 0,
+    "apiBackend": "Messages",
+    "mcpReadyAfterMs": 70,
+    "modelChangedOnNewAndLoad": true,
+    "replayOnLoad": true
+  },
+  "prompts": [
+    {
+      "match": "",
+      "steps": [
+        {
+          "permission": {
+            "toolName": "write",
+            "kind": "edit",
+            "title": "Write notes.md",
+            "rawInput": {
+              "variant": "Write",
+              "file_path": "notes.md",
+              "content": "hello\n"
+            },
+            "options": [
+              {
+                "optionId": "allow-edits-session",
+                "name": "Yes, allow all edits this session",
+                "kind": "allow_always"
+              },
+              {
+                "optionId": "allow-once",
+                "name": "Yes",
+                "kind": "allow_once"
+              },
+              {
+                "optionId": "reject-once",
+                "name": "No",
+                "kind": "reject_once"
+              }
+            ],
+            "output": "wrote notes.md"
+          }
+        },
+        {
+          "permission": {
+            "toolName": "write",
+            "kind": "edit",
+            "title": "Write more.md",
+            "rawInput": {
+              "variant": "Write",
+              "file_path": "more.md",
+              "content": "more\n"
+            },
+            "options": [
+              {
+                "optionId": "allow-edits-session",
+                "name": "Yes, allow all edits this session",
+                "kind": "allow_always"
+              },
+              {
+                "optionId": "allow-once",
+                "name": "Yes",
+                "kind": "allow_once"
+              },
+              {
+                "optionId": "reject-once",
+                "name": "No",
+                "kind": "reject_once"
+              }
+            ],
+            "output": "wrote more.md"
+          }
+        },
+        {
+          "text": "Wrote two files.",
+          "chunk": 7
+        },
+        {
+          "turnCompleted": {
+            "inputTokens": 400,
+            "outputTokens": 30
+          }
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    }
+  ],
+  "faults": {}
+}

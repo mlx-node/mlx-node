@@ -13,6 +13,11 @@ export interface LocalModel {
   contextWindow: number | null;
   sizeBytes: number;
   fileCount: number;
+  /**
+   * Names this checkpoint is served and traced under (a GGUF folder serves one per variant). Match with
+   * `servedIds.includes(key) || (servedIds.length === 0 && name === key)`.
+   */
+  servedIds: string[];
 }
 
 export interface ModelsResponse {
@@ -22,6 +27,7 @@ export interface ModelsResponse {
   warnings: string[];
   /** Absolute path of the models directory these checkpoints were discovered in. */
   dir: string;
+  host: { totalMemBytes: number; diskFreeBytes: number | null };
 }
 
 export interface CatalogItem {
@@ -48,6 +54,8 @@ export interface CatalogItem {
    * names the blockage rather than offering a button that always errors.
    */
   blockedByForeignDir: boolean;
+  /** What occupies the slug; non-null exactly when `blockedByForeignDir` is true. */
+  blocker: CatalogBlocker | null;
   /**
    * Commit sha the local bytes were pinned to, or `null` when no completion
    * marker exists to read (hand copy, pre-marker CLI install, renamed dir).
@@ -71,12 +79,33 @@ export interface CatalogItem {
   assetsRepo?: string;
   /** Separate optional draft weights, never a standalone chat-model entry. */
   draft?: CatalogDraftItem;
+  globs?: string[];
 }
 
 export type CatalogDraftItem = Pick<
   CatalogItem,
-  'label' | 'hfRepo' | 'sizeGb' | 'slug' | 'installed' | 'present' | 'blockedByForeignDir' | 'localRevision'
+  'label' | 'hfRepo' | 'sizeGb' | 'slug' | 'installed' | 'present' | 'blockedByForeignDir' | 'blocker' | 'localRevision'
 >;
+
+/** An entry at a catalog slug that the app did not create, measured without following a link or opening a file. */
+export interface CatalogBlocker {
+  kind: 'directory' | 'symlink' | 'file';
+  /** directory: files below it. file: 1. symlink: 0. */
+  fileCount: number;
+  sizeBytes: number;
+  /** The walk stopped early: both numbers are lower bounds. */
+  truncated: boolean;
+  /** Relative paths, only for 3 files or fewer. */
+  names: string[];
+  /** Local models lists this entry. */
+  listed: boolean;
+  /** A `config.json` is at its root. */
+  modelLike: boolean;
+  /** `mlx serve` can list a model in it (a checkpoint or a target GGUF), so Reinstall refuses it. */
+  holdsModel: boolean;
+  linkTarget: string | null;
+  dangling: boolean;
+}
 
 export interface CatalogResponse {
   items: CatalogItem[];
@@ -121,74 +150,6 @@ export interface DeleteModelResponse {
   name: string;
 }
 
-/** One day's token totals from `GET /api/metrics/overview` `tokensByDay` (UTC day). */
-export interface TokensByDayRow {
-  /** `YYYY-MM-DD` (UTC). */
-  day: string;
-  input: number;
-  output: number;
-  cached: number;
-  reasoning: number;
-}
-
-/** Per-model throughput averages (not a time series) — averages are null when no sample carried the column. */
-export interface ThroughputByModelRow {
-  model: string;
-  avgDecodeTps: number | null;
-  avgPrefillTps: number | null;
-  avgTtftMs: number | null;
-  samples: number;
-}
-
-/**
- * One (model, UTC-day) throughput bucket from `GET /api/metrics/overview`
- * `throughputTrend` — the time-bucketed series backing the temporal charts.
- * Shared contract with the server overview query; the values are per-day
- * averages over `samples` traces for that model.
- */
-export interface ThroughputTrendPoint {
-  model: string;
-  /** `YYYY-MM-DD` (UTC). */
-  day: string;
-  /** Averages are null when no trace in the bucket carried the column. */
-  decodeTps: number | null;
-  prefillTps: number | null;
-  ttftMs: number | null;
-  samples: number;
-}
-
-/** Per-model speculative-decoding (MTP) acceptance averages; only models with a recorded mean appear. */
-export interface MtpByModelRow {
-  model: string;
-  meanAccepted: number | null;
-  avgCycles: number | null;
-  samples: number;
-}
-
-/** Per-model usage totals for the share chart. */
-export interface ModelShareRow {
-  model: string;
-  turns: number;
-  outputTokens: number;
-}
-
-export interface MetricsOverviewResponse {
-  range: { from: number | null; to: number | null };
-  tokensByDay: TokensByDayRow[];
-  throughputByModel: ThroughputByModelRow[];
-  throughputTrend: ThroughputTrendPoint[];
-  mtpByModel: MtpByModelRow[];
-  modelShare: ModelShareRow[];
-  totals: {
-    turns: number;
-    traces: number;
-    inputTokens: number;
-    outputTokens: number;
-    cachedTokens: number;
-    reasoningTokens: number;
-  };
-}
-
 export interface ColdCacheDiskInfo {
   root: string;
   exists: boolean;
@@ -205,7 +166,8 @@ export interface ColdCacheDiskInfo {
 }
 
 export interface CacheTrendRow {
-  day: string;
+  /** Local day start, epoch ms. */
+  t: number;
   hits: number;
   misses: number;
   bytesWritten: number;
@@ -336,8 +298,13 @@ export interface SessionTokens {
   cached: number;
 }
 
+/** Who started a session: a terminal `mlx agent`, or the app in Chat or Work mode. */
+export type SessionOrigin = 'agent' | 'chat' | 'work';
+
 export interface SessionRow {
   id: string;
+  origin: SessionOrigin;
+  /** The agent's title, else the title of the first typed prompt; '' only for a session with no prompt. */
   title: string;
   cwd: string;
   model: string | null;
@@ -377,10 +344,26 @@ export interface SessionDetail extends SessionRow {
   subagents: SubagentRef[];
 }
 
+/** What woke the agent for a turn the user did not type, read from the prompt id the agent recorded. */
+export type WakeCause = 'workflow' | 'subagent' | 'task' | 'notifications' | 'goal' | 'unknown';
+
 export type TranscriptEntry =
   | { kind: 'user'; ts: number; text: string; promptIndex: number | null; interjection?: boolean }
-  | { kind: 'assistant'; ts: number; text: string }
-  | { kind: 'thinking'; ts: number; text: string }
+  /** A hidden prompt the agent wrote to itself when a background event woke it. Never a message of the user. */
+  | {
+      kind: 'wake';
+      ts: number;
+      cause: WakeCause;
+      /** cause 'workflow': the run's name and status when it woke the agent. */
+      workflow?: { name: string; status: string };
+      /** cause 'subagent': the child whose finish woke the agent. */
+      subagent?: { childId: string; description: string };
+      /** Cut at 16 KB. */
+      text: string;
+      truncated?: true;
+    }
+  | { kind: 'assistant'; ts: number; text: string; endTs?: number }
+  | { kind: 'thinking'; ts: number; text: string; endTs?: number }
   | {
       kind: 'tool';
       ts: number;
@@ -391,6 +374,12 @@ export type TranscriptEntry =
       input?: string;
       output?: string;
       truncated?: boolean;
+      endTs?: number;
+      /** A shell command's non-zero exit code. */
+      exitCode?: number;
+      /** A shell command stopped by the agent or the system (`timeout`, `oom`, …). */
+      signal?: string;
+      timedOut?: true;
     }
   | { kind: 'plan'; ts: number; entries: { content: string; status: string; priority: string }[] }
   | {
@@ -405,6 +394,10 @@ export type TranscriptEntry =
       error?: string;
       /** Set by the detail route; only `true` may be linked. */
       exists?: boolean;
+      /** Time of the `subagent_finished` line. */
+      endTs?: number;
+      /** Made by a finish line with no spawn line: `ts` is the finish time. */
+      noSpawn?: true;
     }
   | { kind: 'model'; ts: number; modelId: string }
   | { kind: 'turn-end'; ts: number; stopReason: string; elapsedMs?: number; error?: string };
@@ -417,10 +410,15 @@ export interface TurnMetric {
   cachedTokens: number;
   reasoningTokens: number;
   elapsedMs: number | null;
+  /** Time to first token of the turn's first model call. */
   ttftMs: number | null;
+  /** Summed measured prefill windows; set with `prefillTokens`, never alone. */
   prefillMs: number | null;
-  prefillTps: number | null;
-  prefillInputTokens: number | null;
+  prefillTokens: number | null;
+  /** Model calls in the prefill sums. */
+  prefillCalls: number | null;
+  /** Model calls of the turn. */
+  modelCalls: number | null;
   decodeTps: number | null;
   model: string | null;
 }
@@ -436,7 +434,8 @@ export interface SessionDetailResponse {
   transcript: TranscriptEntry[];
   turns: TurnMetric[];
   transcriptError?: string;
-  resumeCommand: string;
+  /** Null for a Chat conversation: a terminal cannot open the Chat agent's home. */
+  resumeCommand: string | null;
 }
 
 /** `PATCH /api/sessions/:id` body `{title}`; `title` is the sanitized title as stored. */
@@ -448,4 +447,553 @@ export interface SessionRenameResponse {
 /** `DELETE /api/sessions/:id`: the session first, then its subagent children. */
 export interface SessionDeleteResponse {
   deleted: string[];
+}
+
+export type TimelineLaneStatus = 'completed' | 'failed' | 'cancelled' | 'running' | 'unknown';
+export type TimelineNoSteps =
+  | 'missing'
+  | 'empty'
+  | 'too-large'
+  | 'unreadable'
+  /** The file has events, none inside this run. */
+  | 'out-of-range'
+  /** A finish line with no spawn line. */
+  | 'no-spawn'
+  | 'folded';
+
+export interface TimelineLane {
+  /** 'main', the child session id, or 'folded'. */
+  id: string;
+  role: 'main' | 'subagent' | 'folded';
+  name: string;
+  /** Subagent type; null on the main lane of a top-level session and on the folded lane. */
+  type: string | null;
+  model: string | null;
+  /** 0..7 for a subagent lane; null = neutral. */
+  slot: number | null;
+  /** The lane's own session when its folder exists; only then the UI links it. */
+  sessionId: string | null;
+  status: TimelineLaneStatus;
+  /** The lane's first run was spawned before this window. */
+  carriedIn: boolean;
+  /** The window is finished and the lane's last run returns after it. */
+  carriedOut: boolean;
+  /** Set when the lane has one `run` span instead of steps. */
+  noSteps: TimelineNoSteps | null;
+  /** Size of the file that was refused, for 'too-large'. */
+  fileBytes: number | null;
+  /** A step crossed a handoff time and was cut there. Events are never moved. */
+  clamped: boolean;
+  /** Subagents this lane spawned itself (not drawn). On the folded lane: how many subagents it stands for. */
+  subagents: number;
+  /** Usage reports inside the window, ascending. */
+  tokenReports: Array<{ atMs: number; tokens: number }>;
+}
+
+interface TimelineSpanBase {
+  /** `${lane}:${index}`, stable while the files do not change. */
+  id: string;
+  lane: string;
+  /** ms from range.startMs. */
+  startMs: number;
+  /** null only with status 'running'. */
+  endMs: number | null;
+  status: 'ok' | 'failed' | 'running' | 'unfinished';
+  inferredStart: boolean;
+  inferredEnd: boolean;
+  /** The turn's window cut the span on this side: it began before the window or went on after it. */
+  cutStart: boolean;
+  cutEnd: boolean;
+  /** A model request retry at or right before this span. Only on `wait` / `model` and `generate` spans. */
+  retry: { attempt: number; max: number } | null;
+}
+
+export type TimelineSpan =
+  | (TimelineSpanBase & { kind: 'generate'; phase: 'reasoning' | 'answer' })
+  | (TimelineSpanBase & { kind: 'tool'; tools: string[]; calls: number; failedCalls: number })
+  /** until: what ended the wait. 'open' = still waiting (running) or cut by the lane's end. */
+  | (TimelineSpanBase & { kind: 'wait'; reason: 'model'; until: 'text' | 'tool' | 'open' })
+  /** calls: spawn tool calls merged into it; 0 = built from spawn lines alone. */
+  | (TimelineSpanBase & { kind: 'wait'; reason: 'subagent'; tools: string[]; calls: number; failedCalls: number })
+  | (TimelineSpanBase & { kind: 'run'; noSteps: TimelineNoSteps })
+  /** The main lane before a woken turn: no turn was open. At most one, the main lane's first span. */
+  | (TimelineSpanBase & { kind: 'idle' });
+
+export interface TimelineHandoff {
+  /** `${lane}:${kind}:${run index}`. */
+  id: string;
+  /** The child lane. The other end is always 'main'. */
+  lane: string;
+  kind: 'spawn' | 'return';
+  atMs: number;
+  failed: boolean;
+}
+
+/** `GET /api/sessions/:id/timeline?turn=<n>`: one turn as lanes of spans. Metadata only, never text. */
+export interface SessionTimelineResponse {
+  turn: number;
+  /** Finished turns in the transcript; an open turn is `turns + 1`. */
+  turns: number;
+  open: boolean;
+  /** The session's live verdict when this body was built (the rule of SessionRow.live). */
+  live: boolean;
+  stopReason: string | null;
+  /** Worker clock when this body was built, epoch ms. */
+  asOfMs: number;
+  /**
+   * Epoch ms. null = the turn has no usable time; lanes, spans and handoffs are then empty.
+   * endMs >= turnStartMs >= startMs always. leadMs: how far the prompt lies before the start the agent measured (0 = not
+   * at all).
+   */
+  range: {
+    /** Axis origin. Earlier than turnStartMs only when a background event started the turn and subagents ran before it. */
+    startMs: number;
+    /** Where the turn itself starts: the prompt or the start the agent measured, whichever is earlier. */
+    turnStartMs: number;
+    endMs: number | null;
+    lastEventMs: number;
+    /** Refers to turnStartMs. */
+    startExact: boolean;
+    leadMs: number;
+  } | null;
+  lanes: TimelineLane[];
+  /** Ordered by lane order, then start. */
+  spans: TimelineSpan[];
+  handoffs: TimelineHandoff[];
+  notes: { untimedEvents: number; foldedSubagents: number; droppedSpans: number; unplacedRetries: number };
+  /** Same text as SessionDetailResponse.transcriptError; range is then null. */
+  transcriptError?: string;
+}
+
+export type MetricsBucket = '5m' | 'hour' | 'day';
+export type TurnOutcome = 'ok' | 'error' | 'cancelled';
+
+/** A median below this many samples is drawn as low-confidence. */
+export const LOW_SAMPLE_N = 5;
+/** A p05 / p95 below this many samples is drawn as low-confidence. */
+export const LOW_SAMPLE_TAIL_N = 20;
+
+export interface Quantiles {
+  n: number;
+  p05: number | null;
+  p50: number | null;
+  p95: number | null;
+}
+
+export interface MetricsRange {
+  from: number | null;
+  to: number | null;
+}
+
+// GET /api/metrics/models  — no params. Whole retention window.
+// Order: firstTs ascending, then model. A model's index here is its color index on every page.
+export interface MetricsModels {
+  models: Array<{
+    model: string;
+    modelType: string | null;
+    firstTs: number;
+    lastTs: number;
+    turns: number;
+  }>;
+}
+
+export interface MetricsTotals {
+  turns: number;
+  ok: number;
+  error: number;
+  cancelled: number;
+  /** Ok turns that carry a measured prefill window. */
+  prefillMeasured: number;
+  /** Net of cache. */
+  inputTokens: number;
+  cachedTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  /** Wall-time sums in ms, for the time-breakdown bar. */
+  queueWallMs: number;
+  loadWaitWallMs: number;
+  resolveWallMs: number;
+  /** Time to first token of turns without a prefill window: setup and prefill together. */
+  firstTokenWallMs: number;
+  /** Time to first token outside the prefill window, measured turns only. */
+  setupWallMs: number;
+  /** Sum of measured prefill windows, each capped at its time to first token. */
+  prefillWallMs: number;
+  decodeWallMs: number;
+  /** total − queue − loadWait − resolve − firstToken − setup − prefill − decode, clamped at 0. */
+  otherWallMs: number;
+  totalWallMs: number;
+}
+
+export interface MetricsLatency {
+  ttftMs: Quantiles;
+  /** Time to first token outside the prefill window, measured turns only. */
+  setupMs: Quantiles;
+  decodeTps: Quantiles;
+  prefillTps: Quantiles;
+  /** preDispatch + duration. */
+  totalMs: Quantiles;
+  queueMs: Quantiles;
+  /** Percent of the context window in use at turn end. */
+  ctxFillPct: Quantiles;
+}
+
+// GET /api/metrics/summary?from&to&model
+export interface MetricsSummary {
+  range: MetricsRange;
+  model: string | null;
+  totals: MetricsTotals;
+  latency: MetricsLatency;
+  /** The window of equal length just before `from`; null unless both bounds were given. */
+  previous: { totals: MetricsTotals; latency: MetricsLatency } | null;
+  byModel: Array<{
+    model: string;
+    modelType: string | null;
+    ctxWindow: number | null;
+    totals: MetricsTotals;
+    latency: MetricsLatency;
+    mtpTurns: number;
+    lastTs: number;
+  }>;
+  finishReasons: Array<{ reason: string; turns: number }>;
+  failures: Array<{
+    outcome: 'error' | 'cancelled';
+    errorKind: 'finish_error' | 'exception' | null;
+    failPhase: 'queued' | 'prefill' | 'decode' | null;
+    turns: number;
+  }>;
+  endpoints: Array<{ endpoint: string; stream: boolean; turns: number }>;
+  dispatches: Array<{ dispatch: string; turns: number; promptTokens: number; cachedTokens: number }>;
+}
+
+// GET /api/metrics/timeseries?from&to&bucket&model&groupBy
+export interface MetricsTimeseries {
+  range: MetricsRange;
+  bucket: MetricsBucket;
+  groupBy: 'model' | 'none';
+  points: Array<{
+    /** Bucket start, epoch ms. */
+    t: number;
+    model: string;
+    totals: MetricsTotals;
+    ttftMs: Quantiles;
+    decodeTps: Quantiles;
+    prefillTps: Quantiles;
+    totalMs: Quantiles;
+    /** Cycle-weighted committed tokens per cycle; null when no MTP turn. */
+    mtpMeanAccepted: number | null;
+    mtpTurns: number;
+    coldHits: number;
+    coldMisses: number;
+    concurrencyPeak: number | null;
+  }>;
+}
+
+export interface Histogram {
+  /** Samples counted. */
+  n: number;
+  /** One count per bin; `counts.length === edges.length`. */
+  counts: number[];
+}
+
+// GET /api/metrics/distributions?from&to&model&groupBy
+export interface MetricsDistributions {
+  range: MetricsRange;
+  groupBy: 'model' | 'none';
+  /** Lower bounds. Bin i is [edges[i], edges[i+1]); the last bin is open-ended. */
+  edges: {
+    ttftMs: number[];
+    decodeTps: number[];
+    prefillTps: number[];
+    totalMs: number[];
+    ctxFillPct: number[];
+    promptTokens: number[];
+    outputTokens: number[];
+  };
+  series: Array<{
+    model: string;
+    ttftMs: Histogram;
+    decodeTps: Histogram;
+    prefillTps: Histogram;
+    totalMs: Histogram;
+    ctxFillPct: Histogram;
+    promptTokens: Histogram;
+    outputTokens: Histogram;
+  }>;
+}
+
+// GET /api/metrics/speculative?from&to&model&bucket
+export interface MetricsSpeculative {
+  range: MetricsRange;
+  models: Array<{
+    model: string;
+    turns: number;
+    mtpTurns: number;
+    cycles: number;
+    /** Cycle-weighted. */
+    meanAccepted: number | null;
+    meanDrafts: number | null;
+    meanDepth: number | null;
+    /** `pos` is 0-based: pos 0 = the first draft position. */
+    acceptByPos: Array<{ pos: number; rate: number; cycles: number }>;
+    decodeTpsWithMtp: Quantiles;
+    decodeTpsWithoutMtp: Quantiles;
+  }>;
+  trend: Array<{ t: number; model: string; meanAccepted: number | null; mtpTurns: number }>;
+}
+
+export interface TurnRow {
+  traceId: string;
+  /** End of turn, epoch ms. */
+  ts: number;
+  model: string;
+  /** Alias the client used, when different from `model`. */
+  alias: string | null;
+  modelType: string | null;
+  outcome: TurnOutcome;
+  errorKind: string | null;
+  failPhase: string | null;
+  finishReason: string | null;
+  endpoint: string | null;
+  stream: boolean | null;
+  dispatch: string | null;
+  promptTokens: number | null;
+  cachedTokens: number | null;
+  outputTokens: number | null;
+  reasoningTokens: number | null;
+  ctxWindow: number | null;
+  ctxFillPct: number | null;
+  /** Span segments in ms; `t0 = ts − durationMs − (preDispatchMs ?? 0)`. */
+  preDispatchMs: number | null;
+  queueMs: number | null;
+  loadWaitMs: number | null;
+  resolveMs: number | null;
+  ttftMs: number | null;
+  /** Measured prefill window; null when the turn has none. */
+  prefillMs: number | null;
+  prefillTokens: number | null;
+  /** `ttftMs − prefillMs`, measured turns only. */
+  setupMs: number | null;
+  decodeMs: number | null;
+  durationMs: number | null;
+  /** Rated turns only: measured, at least `PREFILL_MIN_TOKENS`. */
+  prefillTps: number | null;
+  decodeTps: number | null;
+  mtpCycles: number | null;
+  mtpMeanAccepted: number | null;
+  coldHits: number | null;
+  coldMisses: number | null;
+  toolCount: number | null;
+  toolCallCount: number | null;
+  imageCount: number | null;
+  concurrency: number | null;
+  concurrencyPeak: number | null;
+  memActiveBytes: number | null;
+  pid: number | null;
+}
+
+// GET /api/metrics/turns?from&to&model&outcome&limit&beforeTs&beforeTraceId
+// Newest first. limit default 200, max 2000.
+// Cursor: WHERE (ts, trace_id) < (beforeTs, beforeTraceId).
+// traceId=<id>: exact match on trace_id; every other param is ignored; `rows` holds 0 or 1 row, `next` is null,
+// `total` is rows.length. Used by the turn drawer to open a turn that is not on the loaded page.
+export interface MetricsTurns {
+  range: MetricsRange;
+  rows: TurnRow[];
+  next: { beforeTs: number; beforeTraceId: string } | null;
+  /** Rows matching the filter, ignoring the cursor and limit. */
+  total: number;
+}
+
+export type HostKind = 'serve' | 'launch' | 'desktop' | 'embedded';
+export type EngineStatus =
+  | 'running'
+  | 'loading'
+  | 'starting'
+  | 'restarting'
+  | 'failed'
+  | 'untrusted'
+  | 'unresponsive'
+  | 'stopped';
+
+export interface RuntimeProcessLive {
+  status: 'running' | 'unresponsive' | 'dead';
+  /** now − ts. */
+  ageMs: number;
+  pid: number;
+  startedAt: number;
+  ts: number;
+  host: HostKind;
+  version: string;
+  port: number;
+  health: 'ok' | 'loading' | 'degraded' | 'error';
+  mem: { active: number; peak: number; cache: number; wiredLimit: number; rss: number };
+  decodeTps: number | null;
+  loading: { model: string; startedAt: number } | null;
+  counters: { ok: number; error: number; cancelled: number; outputTokens: number; loads: number; rejected: number };
+  models: Array<{
+    name: string;
+    modelType: string;
+    ctxWindow: number;
+    paged: boolean;
+    maxConcurrent: number;
+    loadedAt: number | null;
+    loadMs: number | null;
+    inFlight: number;
+    queued: number;
+    queueLimit: number | null;
+    pool: {
+      at: number;
+      blockCapacity: number;
+      allocatedBlocks: number;
+      freeBlocks: number;
+      reclaimableBlocks: number;
+    } | null;
+  }>;
+  turns: Array<{
+    traceId: string;
+    /** Alias the client used. Display and color use `modelId ?? model`. */
+    model: string;
+    modelId: string | null;
+    ctxWindow: number | null;
+    startedAt: number;
+    stream: boolean;
+    dispatch: 'start' | 'continue' | 'continue_tool';
+    phase: 'queued' | 'prefill' | 'decode' | null;
+    promptTokens: number | null;
+    cachedTokens: number | null;
+    prefillTotal: number | null;
+    prefillDone: number | null;
+    generatedTokens: number | null;
+  }>;
+}
+
+export interface SupervisorLive {
+  state: 'stopped' | 'starting' | 'running' | 'restarting' | 'failed' | 'lying';
+  pid: number | null;
+  generation: number;
+  consecutiveCrashes: number;
+  lastExit: { verdict: 'clean' | 'crash'; code: number | null; signal: string | null; atMs: number } | null;
+  healthStatus: 'ok' | 'loading' | 'degraded' | 'error' | null;
+  nativeErrorCount: number;
+  /** The count is at the supervisor's cap of 20; print "20+". */
+  nativeErrorsCapped: boolean;
+  lastNativeErrorContext: string | null;
+  lastNativeErrorAt: number | null;
+  writtenAt: number;
+}
+
+// GET /api/runtime/live  — no params. Also the payload of the `runtime` live event.
+export interface RuntimeLive {
+  now: number;
+  status: EngineStatus;
+  /** Desktop-managed sidecar; null when not run by the desktop app. */
+  supervisor: SupervisorLive | null;
+  /** Running first, then unresponsive, then dead; newest `startedAt` first within each. */
+  processes: RuntimeProcessLive[];
+}
+
+export interface SchedSnapshot {
+  ts: number;
+  blockCapacity: number;
+  allocatedBlocks: number;
+  freeBlocks: number;
+  reclaimableBlocks: number;
+  watermarkBlocks: number;
+  reservedBlocks: number;
+  memoryCapacityBytes: number;
+  /** Largest decode batch since the model was loaded. A high-water mark, not a counter. */
+  maxBatchOccupancy: number;
+  /** Turns sent to the model since its load, all lanes; null when the engine did not write the count. */
+  turns: number | null;
+}
+
+// GET /api/runtime/series?from&to&bucketMs
+// bucketMs ∈ {5000, 15000, 60000, 300000, 900000, 3600000}; (to − from) / bucketMs ≤ 2000. Both bounds required.
+export interface RuntimeSeries {
+  range: { from: number; to: number };
+  bucketMs: number;
+  points: Array<{
+    t: number;
+    samples: number;
+    memActiveAvg: number | null;
+    memActiveMax: number | null;
+    memPeakMax: number | null;
+    memCacheAvg: number | null;
+    rssMax: number | null;
+    inFlightAvg: number | null;
+    inFlightMax: number | null;
+    queuedMax: number | null;
+    /** Sum of the samples' measured `busyMs`. */
+    busyMs: number;
+    okTurns: number;
+    errorTurns: number;
+    cancelledTurns: number;
+    outTokens: number;
+    rejected: number;
+  }>;
+  procs: Array<{
+    procKey: string;
+    pid: number;
+    startedAt: number;
+    host: string | null;
+    version: string | null;
+    port: number | null;
+    chip: string | null;
+    wiredLimitBytes: number | null;
+    totalMemBytes: number | null;
+    firstTs: number;
+    lastTs: number;
+    exitTs: number | null;
+  }>;
+  loads: Array<{
+    ts: number;
+    procKey: string;
+    model: string;
+    modelType: string | null;
+    capability: string | null;
+    ms: number | null;
+    ok: boolean;
+  }>;
+  /** One entry per (process, model) with at least one snapshot in or before the range. */
+  sched: Array<{
+    procKey: string;
+    model: string;
+    latest: SchedSnapshot;
+    /** Pool at rest over time, snapshots inside the range. */
+    snapshots: SchedSnapshot[];
+    /** Growth of monotonic counters inside the range. */
+    delta: {
+      globalSteps: number;
+      admitted: number;
+      completed: number;
+      preemptions: number;
+      preemptionsRecompute: number;
+      preemptionsSsd: number;
+      admissionDeferredBlocks: number;
+      admissionDeferredState: number;
+      rowsAllocEvicted: number;
+      ssdRestoreBytes: number;
+      ssdRestoreWaitMs: number;
+      /** Turns sent to the model, all lanes. 0 when the engine did not write the count. */
+      turns: number;
+      /** Decode steps per batch size. */
+      occupancy: Array<{ occupancy: number; steps: number }>;
+    };
+  }>;
+}
+
+// Push events
+export type LiveEvent =
+  | { type: 'runtime'; snapshot: RuntimeLive }
+  | { type: 'data'; version: number; traces: boolean; runtime: boolean };
+
+/** `/api/health`: the directories this Control Panel reads. */
+export interface HealthResponse {
+  status: string;
+  modelsDir: string;
+  tracesDir: string;
+  runtimeDir: string;
+  /** The user's home folder: paths under it are shown as `~/…`. */
+  homeDir: string;
 }

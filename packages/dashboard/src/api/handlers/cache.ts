@@ -5,6 +5,7 @@ import { TRACE_RETENTION_DAYS } from '../../ingest/traces.js';
 import type { ApiPaths, ApiRequest, WorkerApiContext } from '../context.js';
 import { requireBody, toInt } from '../context.js';
 import { ApiError } from '../errors.js';
+import { bucketSql } from '../sql.js';
 
 /**
  * Cold-tier view for ONE cache root: the on-disk scan, the trace-derived trend
@@ -91,17 +92,18 @@ export function handleCacheGet(ctx: WorkerApiContext): unknown {
   // their own environments, and on macOS `/tmp` → `/private/tmp` alone makes
   // two identical-looking spellings unequal.
   const scopeRoot = canonicalCacheRoot(requestedRoot);
+  // Local-day buckets on the same epoch-ms axis every other page uses.
   const trend = ctx.dash.sqlite
     .prepare(
-      `SELECT date(ts / 1000, 'unixepoch') AS day,
+      `SELECT ${bucketSql('day')} AS t,
               COALESCE(SUM(cold_hits), 0) AS hits, COALESCE(SUM(cold_misses), 0) AS misses,
               COALESCE(SUM(cold_bytes_written), 0) AS bytesWritten,
               COALESCE(SUM(cold_bytes_restored), 0) AS bytesRestored
-       FROM traces WHERE ts > 0 AND cold_root = ? GROUP BY day ORDER BY day`,
+       FROM traces WHERE ts > 0 AND cold_root = ? GROUP BY t ORDER BY t`,
     )
     .all(scopeRoot)
     .map((row) => ({
-      day: String(row.day),
+      t: toInt(row.t),
       hits: toInt(row.hits),
       misses: toInt(row.misses),
       bytesWritten: toInt(row.bytesWritten),
@@ -109,7 +111,8 @@ export function handleCacheGet(ctx: WorkerApiContext): unknown {
     }));
 
   // `CASE WHEN` rather than `FILTER` — portable across whatever SQLite the
-  // bundled `node:sqlite` links.
+  // bundled `node:sqlite` links. Failed turns carry no cold fields at all, so
+  // without the outcome guard every one of them would count as a legacy turn.
   const excluded = ctx.dash.sqlite
     .prepare(
       `SELECT
@@ -128,7 +131,7 @@ export function handleCacheGet(ctx: WorkerApiContext): unknown {
          COUNT(CASE WHEN cold_enabled = 0 THEN 1 END) AS disabledTurns,
          COALESCE(SUM(CASE WHEN cold_root IS NULL THEN cold_sidecar_capture_reached END), 0)
            AS unrootedSidecarCaptures
-       FROM traces WHERE ts > 0`,
+       FROM traces WHERE ts > 0 AND outcome = 'ok'`,
     )
     .get(scopeRoot, scopeRoot, scopeRoot);
 

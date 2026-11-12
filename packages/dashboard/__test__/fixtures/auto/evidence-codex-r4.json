@@ -1,0 +1,6111 @@
+{
+ "source": "codex review round 4 (scratchpad/impl/codex-r4-review.txt) and its three verifiers: every input of C1-C5 and of the class audit asks; the plain uses listed run. C6 (host order) and C7 (disk errors) are schedules and injected errors, tested in chat-auto-host-gen.test.ts and chat-auto-disk-errors.test.ts.",
+ "rows": [
+  {
+   "input": "printf '%n' 'x[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%d' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%i' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%u' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%o' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%x' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%X' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%e' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%E' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%f' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%g' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%G' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%5d' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%.3f' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%#x' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%+d' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '% d' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%-3d' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%03d' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%hd' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%ld' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%1$d' 'HOME[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%d' 'path[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%d' 'PWD[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%d' 'argv[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%i' 'path[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%i' 'PWD[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%i' 'argv[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%x' 'path[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%x' 'PWD[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%x' 'argv[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%*s' 'HOME[1$(touch marker)]' y",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%.*s' 'HOME[1$(touch marker)]' y",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%d' 'x[1$(touch marker)]=1'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%n' path; cat a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%d' 'path=0'; cat a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%s%n' y 'x[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%d' 'x[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1"
+  },
+  {
+   "input": "printf '%c' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf '%b' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf '%q' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf '%F' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf '%a' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf '%A' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf '%lld' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf '%jd' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf '%zd' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf '%(%Y)T' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf '%5s' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf '%-10s' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf '%.2s' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf '%' x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: only %s %% and \\n \\t \\\\ pass"
+  },
+  {
+   "input": "printf 'a\\x41'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: escapes other than \\n \\t \\\\"
+  },
+  {
+   "input": "printf 'a\\0101'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: escapes other than \\n \\t \\\\"
+  },
+  {
+   "input": "printf 'a\\c'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1 stricter: escapes other than \\n \\t \\\\"
+  },
+  {
+   "input": "printf -v x '%s' y",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C1: an option"
+  },
+  {
+   "input": "printf '%s\\n' hi",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C1 plain"
+  },
+  {
+   "input": "printf 'done\\n'",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C1 plain"
+  },
+  {
+   "input": "printf '%s\\t%s\\n' a b",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C1 plain"
+  },
+  {
+   "input": "printf '100%%\\n'",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C1 plain"
+  },
+  {
+   "input": "printf x",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C1 plain"
+  },
+  {
+   "input": "printf '%s' 'x[1$(touch marker)]'",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C1 plain"
+  },
+  {
+   "input": "printf 'a\\\\b\\n'",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C1 plain"
+  },
+  {
+   "input": "mv d e/d/k/f e",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C2"
+  },
+  {
+   "input": "mv node_modules e/node_modules/foo/package.json e",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C2"
+  },
+  {
+   "input": "mv d e/./d/k/f e",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C2"
+  },
+  {
+   "input": "mv d E/D/k/f e",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C2"
+  },
+  {
+   "input": "mv d lnkE/d/k/f lnkE",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C2"
+  },
+  {
+   "input": "git mv d e/d/k/f e",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C2"
+  },
+  {
+   "input": "mv -f d e/d/k/f e",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C2"
+  },
+  {
+   "input": "mv a.txt b.txt e",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C2"
+  },
+  {
+   "input": "mv a.txt c.txt",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C2 plain"
+  },
+  {
+   "input": "mv a.txt e",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C2 plain"
+  },
+  {
+   "input": "cp a.txt b.txt e",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C2 plain"
+  },
+  {
+   "input": "cp a.txt e/",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C2 plain"
+  },
+  {
+   "input": "git mv a.txt c.txt",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C2 plain"
+  },
+  {
+   "input": "cat src/é*",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "cat src/é*",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "cat src/한*",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "cat src/한*",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "cat src/が*",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "cat src/が*",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "cat src/Å*",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "cat src/Å*",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "cat src/e*",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "cat src/?́x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "ls src/*x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "wc -l src/a*",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "grep -r x src/*x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "cat é/*.ts",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "cat nfd/é*",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "cat nfd/é*",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 glob"
+  },
+  {
+   "input": "mv d nß && touch 'nẞ/k/f'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 fold"
+  },
+  {
+   "input": "mv d nss && touch 'nẞ/k/f'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 fold"
+  },
+  {
+   "input": "mv d 'nẞ' && touch nß/k/f",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 fold"
+  },
+  {
+   "input": "mv d nss && touch nß/k/f",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 fold"
+  },
+  {
+   "input": "mv d 'Nẞ' && touch nss/k/f",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C3 fold"
+  },
+  {
+   "input": "cat src/*.ts",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C3 plain"
+  },
+  {
+   "input": "cat nfd/*.ts",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C3 plain"
+  },
+  {
+   "input": "ls nfd",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C3 plain"
+  },
+  {
+   "input": "wc -l src/a.*",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C3 plain"
+  },
+  {
+   "input": "cat nfd/é.ts",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C3 plain"
+  },
+  {
+   "input": "pytest test_link.py::test_x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "pytest 'test_link.py::test_x[1]'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "python3 -m pytest test_link.py::test_x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "python3 -m unittest k.test_case",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "python3 -m unittest test_link",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "python3 -m unittest k.test_case.py",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "python3 -m unittest discover",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "python3 -m unittest DISCOVER",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "python3 -m unittest tests.test_a",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "vitest run a.test.ts:3",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "vp test a.test.ts:3",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "vp test a.test",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "bun test a.test",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "jest a.test",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "jest Button",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "prettier --check 'k*'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "oxlint 'k*'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "vp check 'x*'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "eslint 'src/*.ts'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "pytest 'tests/test_a.py::T'",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "pytest test_link.py",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "vitest run a.test.ts",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "pytest k",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "eslint node_modules/foo",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "tsc --noEmit -p k/tsconfig.json",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "pytest tests/far",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "vitest run nothing-here",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "go test ./k/...",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "go build ./k",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "pytest tests/test_a.py::test_x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C4"
+  },
+  {
+   "input": "pytest",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "pytest tests",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "pytest tests/test_a.py",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "python3 -m pytest tests",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "python3 -m pytest",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "python3 -m unittest",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "vitest run",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "vitest run src/a.ts",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "eslint src",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "eslint .",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "tsc --noEmit -p tsconfig.json",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "go test ./...",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "go build ./src/...",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "prettier --check src",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "jest",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "bun test",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "vp test --run",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C4 plain"
+  },
+  {
+   "input": "echo '--filter=x' > .ugrep",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 tool config in the folder (ugrep reads .ugrep)"
+  },
+  {
+   "input": "cat .ugrep",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 tool config in the folder (ugrep reads .ugrep)"
+  },
+  {
+   "input": "cp a.txt .UGREP",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 tool config in the folder (ugrep reads .ugrep)"
+  },
+  {
+   "input": "grep -r x .ugrep",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 tool config in the folder (ugrep reads .ugrep)"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain (allowed config)"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree",
+   "setup": "worktree"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 fsmonitor",
+   "setup": "fsmonitor"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 diff-external",
+   "setup": "diff-external"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 gpg-sign",
+   "setup": "gpg-sign"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 show-signature",
+   "setup": "show-signature"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 uploadpack",
+   "setup": "uploadpack"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 credential",
+   "setup": "credential"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ssh-command",
+   "setup": "ssh-command"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 worktree-config",
+   "setup": "worktree-config"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 textconv",
+   "setup": "textconv"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 filter",
+   "setup": "filter"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 hooks-path",
+   "setup": "hooks-path"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include",
+   "setup": "include"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 include-if",
+   "setup": "include-if"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 quoted",
+   "setup": "quoted"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 continuation",
+   "setup": "continuation"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 comment-after",
+   "setup": "comment-after"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dotted-section",
+   "setup": "dotted-section"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 bare",
+   "setup": "bare"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 format-2",
+   "setup": "format-2"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 partial-clone",
+   "setup": "partial-clone"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 url-insteadof",
+   "setup": "url-insteadof"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 core-editor",
+   "setup": "core-editor"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-proxy",
+   "setup": "remote-proxy"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 remote-vcs",
+   "setup": "remote-vcs"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 submodule",
+   "setup": "submodule"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-file",
+   "setup": "git-file"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 git-link",
+   "setup": "git-link"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 commondir",
+   "setup": "commondir"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 modules",
+   "setup": "modules"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-link",
+   "setup": "config-link"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git show",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git blame a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git grep -e x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git ls-files",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git ls-files -m",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git rev-parse --show-toplevel",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git diff",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git checkout main2",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git stash pop",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git add a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git tag v1",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 config-missing",
+   "setup": "config-missing"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 local-url",
+   "setup": "local-url"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 local-url",
+   "setup": "local-url"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 local-url",
+   "setup": "local-url"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 local-url",
+   "setup": "local-url"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 local-url",
+   "setup": "local-url"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 local-url",
+   "setup": "local-url"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "local-url"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "local-url"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "local-url"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 file-url",
+   "setup": "file-url"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 file-url",
+   "setup": "file-url"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 file-url",
+   "setup": "file-url"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 file-url",
+   "setup": "file-url"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 file-url",
+   "setup": "file-url"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 file-url",
+   "setup": "file-url"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "file-url"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "file-url"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "file-url"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ext-url",
+   "setup": "ext-url"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ext-url",
+   "setup": "ext-url"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ext-url",
+   "setup": "ext-url"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ext-url",
+   "setup": "ext-url"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ext-url",
+   "setup": "ext-url"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 ext-url",
+   "setup": "ext-url"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "ext-url"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "ext-url"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "ext-url"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 helper-url",
+   "setup": "helper-url"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 helper-url",
+   "setup": "helper-url"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 helper-url",
+   "setup": "helper-url"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 helper-url",
+   "setup": "helper-url"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 helper-url",
+   "setup": "helper-url"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 helper-url",
+   "setup": "helper-url"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "helper-url"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "helper-url"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "helper-url"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dash-host",
+   "setup": "dash-host"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dash-host",
+   "setup": "dash-host"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dash-host",
+   "setup": "dash-host"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dash-host",
+   "setup": "dash-host"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dash-host",
+   "setup": "dash-host"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 dash-host",
+   "setup": "dash-host"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "dash-host"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "dash-host"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "dash-host"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 local-pushurl",
+   "setup": "local-pushurl"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 local-pushurl",
+   "setup": "local-pushurl"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 local-pushurl",
+   "setup": "local-pushurl"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 local-pushurl",
+   "setup": "local-pushurl"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 local-pushurl",
+   "setup": "local-pushurl"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 local-pushurl",
+   "setup": "local-pushurl"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "local-pushurl"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "local-pushurl"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "local-pushurl"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 branch-local-remote",
+   "setup": "branch-local-remote"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 branch-local-remote",
+   "setup": "branch-local-remote"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 branch-local-remote",
+   "setup": "branch-local-remote"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "branch-local-remote"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "branch-local-remote"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "branch-local-remote"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 branch-unknown-remote",
+   "setup": "branch-unknown-remote"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 branch-unknown-remote",
+   "setup": "branch-unknown-remote"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 branch-unknown-remote",
+   "setup": "branch-unknown-remote"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "branch-unknown-remote"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "branch-unknown-remote"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "branch-unknown-remote"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 abs-url",
+   "setup": "abs-url"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 abs-url",
+   "setup": "abs-url"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 abs-url",
+   "setup": "abs-url"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 abs-url",
+   "setup": "abs-url"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 abs-url",
+   "setup": "abs-url"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 abs-url",
+   "setup": "abs-url"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "abs-url"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "abs-url"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "abs-url"
+  },
+  {
+   "input": "git push origin main",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 scp-slash",
+   "setup": "scp-slash"
+  },
+  {
+   "input": "git fetch origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 scp-slash",
+   "setup": "scp-slash"
+  },
+  {
+   "input": "git pull origin",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 scp-slash",
+   "setup": "scp-slash"
+  },
+  {
+   "input": "git push",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 scp-slash",
+   "setup": "scp-slash"
+  },
+  {
+   "input": "git pull",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 scp-slash",
+   "setup": "scp-slash"
+  },
+  {
+   "input": "git fetch",
+   "kind": "bash",
+   "expect": "ask",
+   "class": "C5 scp-slash",
+   "setup": "scp-slash"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "scp-slash"
+  },
+  {
+   "input": "git log",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "scp-slash"
+  },
+  {
+   "input": "git commit -m x",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "C5 plain: a remote setting changes only fetch, pull and push",
+   "setup": "scp-slash"
+  }
+ ]
+}

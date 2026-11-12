@@ -16,8 +16,10 @@
 import type { DownloadEvent } from '../../../src/download.js';
 import { createRpcClient, type RpcClient, type RpcClientOptions } from '../../../src/rpc/client.js';
 import type { RpcPort } from '../../../src/rpc/port.js';
-import { bumpConnectionGeneration } from './connection';
-import { clearCache } from './json-cache';
+import type { ChatHostEvent, ConversationEvent } from './chat-types';
+import { bumpConnectionGeneration, markTransportDown } from './connection';
+import { cacheEpoch, clearCache } from './json-cache';
+import type { LiveEvent } from './types';
 
 /**
  * Error thrown for any failed API call.
@@ -29,12 +31,15 @@ import { clearCache } from './json-cache';
 export class DashboardApiError extends Error {
   readonly status: number;
   readonly code: string;
+  /** A finer cause the Chat routes send (a `ChatFailureCode`, `slash-text`, …). */
+  readonly reason: string | undefined;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, reason?: string) {
     super(message);
     this.name = 'DashboardApiError';
     this.status = status;
     this.code = code;
+    this.reason = reason;
   }
 }
 
@@ -80,6 +85,12 @@ export function connectDashboardApi(port: RpcPort, opts: RpcClientOptions): void
       // this generation, so its close drain still retains recovery coverage.
       if (generation === rpcGeneration) opts.onUnresponsive(reason);
     },
+    onDown(reason): void {
+      if (generation === rpcGeneration) {
+        markTransportDown();
+        opts.onDown?.(reason);
+      }
+    },
   });
 }
 
@@ -91,6 +102,7 @@ export function disconnectDashboardApi(): void {
   client?.close();
   clearCache();
   client = null;
+  markTransportDown();
 }
 
 function requireClient(): RpcClient {
@@ -106,13 +118,65 @@ async function callApi<T>(method: string, path: string, body?: unknown): Promise
     path: apiPath(path),
     ...(body === undefined ? {} : { body }),
   });
-  if (!response.ok) throw new DashboardApiError(response.status, response.code, response.message);
+  if (!response.ok) throw new DashboardApiError(response.status, response.code, response.message, response.reason);
   return response.body as T;
 }
 
-/** GET a JSON resource, typed as `T`. */
-export function getJson<T>(path: string): Promise<T> {
-  return callApi<T>('GET', path);
+/** One GET in flight, which later identical GETs on the same connection share. */
+interface SharedGet {
+  /** Order of start, from {@link getMark}. */
+  seq: number;
+  /** The client that sent it: a reconnect never joins a request of the old connection. */
+  owner: RpcClient;
+  /** The {@link cacheEpoch} at its start: a GET started after a clear never joins one from before it. */
+  epoch: number;
+  body: Promise<unknown>;
+}
+
+/**
+ * Identical GETs in flight, by `/api` path. The runtime interleaves its handlers, so N copies of one slow listing each
+ * take N times as long, and enough of them cross the unresponsive deadline and restart the runtime.
+ */
+const inFlight = new Map<string, SharedGet>();
+let lastGetSeq = 0;
+
+/** The order mark of the latest GET started. A GET asked for with `after: mark` joins only one started later. */
+export function getMark(): number {
+  return lastGetSeq;
+}
+
+/** Stop sharing every GET now in flight: a GET that starts after this sends its own request. */
+export function endSharedGets(): void {
+  inFlight.clear();
+}
+
+export interface GetOptions {
+  /** Join only a request started after this {@link getMark}. Default 0: any request in flight. */
+  after?: number;
+}
+
+/**
+ * GET a JSON resource, typed as `T`. A request for the same path already in flight on this connection, started after
+ * the last mutation and after `options.after`, is shared: every sharer gets its body or its error. A finished
+ * request is never reused.
+ */
+export function getJson<T>(path: string, options: GetOptions = {}): Promise<T> {
+  const owner = client;
+  if (owner === null) return callApi<T>('GET', path);
+  const key = apiPath(path);
+  const epoch = cacheEpoch();
+  const shared = inFlight.get(key);
+  if (shared !== undefined && shared.owner === owner && shared.epoch === epoch && shared.seq > (options.after ?? 0)) {
+    return shared.body as Promise<T>;
+  }
+  const body = callApi<T>('GET', path);
+  const entry: SharedGet = { seq: ++lastGetSeq, owner, epoch, body };
+  inFlight.set(key, entry);
+  const release = (): void => {
+    if (inFlight.get(key) === entry) inFlight.delete(key);
+  };
+  body.then(release, release);
+  return body;
 }
 
 /**
@@ -122,9 +186,10 @@ export function getJson<T>(path: string): Promise<T> {
  * Drops every cached GET body, on failure as well as success: a write that
  * reports an error may still have acted (a delete that removed the files and
  * then failed to verify), and serving a body that a partly-applied write
- * invalidated is worse than one extra round-trip.
+ * invalidated is worse than one extra round-trip. GETs in flight stop being shared when it starts and when it ends.
  */
 export async function mutate<T>(method: HttpMutation, path: string, body?: unknown): Promise<T> {
+  endSharedGets();
   try {
     return await callApi<T>(method, path, body);
   } finally {
@@ -146,5 +211,31 @@ export interface Subscription {
  */
 export function subscribeDownload(id: string, onEvent: (event: DownloadEvent) => void): Subscription {
   const unsubscribe = requireClient().subscribe(id, onEvent);
+  return { close: unsubscribe };
+}
+
+/**
+ * Watch the runtime's live channel: engine snapshots and "new data was ingested" events.
+ * One call opens one watch on the current connection; a reconnect does not carry it over.
+ */
+export function subscribeLive(onEvent: (event: LiveEvent) => void): Subscription {
+  const unsubscribe = requireClient().watchLive(onEvent);
+  return { close: unsubscribe };
+}
+
+/**
+ * Watch the Chat host state. One call opens one stream on the current connection; a reconnect does not carry it
+ * over (the stores in `chat-store.ts` re-attach).
+ */
+export function subscribeChatHost(onEvent: (event: ChatHostEvent) => void): Subscription {
+  const unsubscribe = requireClient().watchChat({ scope: 'host' }, (event) => onEvent(event as ChatHostEvent));
+  return { close: unsubscribe };
+}
+
+/** Watch one conversation: a `sync` first, then numbered events. Same lifetime rule as {@link subscribeChatHost}. */
+export function subscribeConversation(id: string, onEvent: (event: ConversationEvent) => void): Subscription {
+  const unsubscribe = requireClient().watchChat({ scope: 'conversation', conversationId: id }, (event) =>
+    onEvent(event as ConversationEvent),
+  );
   return { close: unsubscribe };
 }

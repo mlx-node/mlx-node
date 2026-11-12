@@ -1,0 +1,70 @@
+.root {
+  display: grid;
+  grid-template-rows: 1fr;
+  animation: proof-open var(--duration-standard) var(--ease-enter) both;
+}
+
+.clip {
+  min-height: 0;
+  overflow: hidden;
+}
+
+.line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1-5) var(--space-2);
+  margin: 0;
+  padding-top: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-body);
+}
+
+.icon {
+  flex: none;
+}
+
+.root[data-kind='installed'] .icon {
+  color: var(--success);
+}
+
+.chip {
+  display: inline-flex;
+  animation: proof-chip var(--duration-standard) var(--ease-enter) both;
+  animation-delay: calc(var(--stagger-item) * var(--step, 0));
+}
+
+.code {
+  font-family: var(--font-code);
+  font-size: var(--text-xs);
+}
+
+@keyframes proof-open {
+  from {
+    grid-template-rows: 0fr;
+    opacity: 0;
+  }
+  to {
+    grid-template-rows: 1fr;
+    opacity: 1;
+  }
+}
+
+@keyframes proof-chip {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .root,
+  .chip {
+    animation: none;
+  }
+}

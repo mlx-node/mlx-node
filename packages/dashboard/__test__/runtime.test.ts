@@ -4,7 +4,7 @@
  */
 
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MessageChannel } from 'node:worker_threads';
 
@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 import type { MainApiContext, WorkerApiContext } from '../src/api/context.js';
 import { dispatchMain, dispatchWorker, routeThreadFor } from '../src/api/dispatch.js';
 import { ROUTES } from '../src/api/routes.js';
+import type { LiveEvent } from '../src/live.js';
 import { createRpcClient } from '../src/rpc/client.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
@@ -123,12 +124,12 @@ describe('dashboard runtime — call', () => {
   it('answers an API call with the route body, no socket involved', async () => {
     const res = await runtime.call({ method: 'GET', path: '/api/health' });
     expect(res.status).toBe(200);
-    expect(res.ok ? res.body : null).toMatchObject({ status: 'ok', tracesDir, modelsDir });
+    expect(res.ok ? res.body : null).toMatchObject({ status: 'ok', tracesDir, modelsDir, homeDir: homedir() });
   });
 
   it('parses the query string off the path', async () => {
     await runtime.ingestNow();
-    const res = await runtime.call({ method: 'GET', path: '/api/metrics/overview?from=0&to=10' });
+    const res = await runtime.call({ method: 'GET', path: '/api/metrics/summary?from=0&to=10' });
     expect(res.ok).toBe(true);
     const body = res.ok ? (res.body as { range: { from: number | null; to: number | null } }) : null;
     expect(body?.range).toEqual({ from: 0, to: 10 });
@@ -153,6 +154,32 @@ describe('dashboard runtime — call', () => {
 // events. Asserting SETTLE ORDER rather than a duration keeps it deterministic —
 // a transport-thread route is answered in microtasks, so it cannot lose to a
 // cross-thread round trip, let alone one queued behind a 120-file ingest.
+describe('dashboard runtime — coding agents sandbox', () => {
+  it('looks up instruction files under the home it was given, never the real one', async () => {
+    const home = join(base, 'home');
+    const sandboxed = createDashboardRuntime({
+      dbPath: ':memory:',
+      tracesDir,
+      modelsDir,
+      codingAgents: { home, env: {} },
+    });
+    try {
+      const response = await sandboxed.call({
+        method: 'POST',
+        path: '/api/coding-agents',
+        body: { action: 'refresh' },
+      });
+      expect(response.ok).toBe(true);
+      const agents = (response as { body: { agents: { id: string; path: string }[] } }).body.agents;
+      expect(agents.map((agent) => agent.id)).toEqual(['claude', 'codex', 'grok']);
+      for (const agent of agents) expect(agent.path.startsWith(`${home}/`)).toBe(true);
+      expect(agents.find((agent) => agent.id === 'claude')?.path).toBe(join(home, '.claude', 'CLAUDE.md'));
+    } finally {
+      await sandboxed.close();
+    }
+  });
+});
+
 describe('dashboard runtime — thread split', () => {
   it('answers a transport-thread route while the worker is busy ingesting', async () => {
     const settled: string[] = [];
@@ -203,6 +230,22 @@ describe('dashboard runtime — route ownership', () => {
       'POST /api/downloads',
       'DELETE /api/downloads/:id',
       'GET /api/downloads/:id/events',
+      'GET /api/runtime/live',
+      'GET /api/chat/state',
+      'POST /api/chat/conversations',
+      'POST /api/chat/conversations/:id/prompt',
+      'POST /api/chat/conversations/:id/cancel',
+      'POST /api/chat/conversations/:id/interactions/:iid',
+      'POST /api/chat/conversations/:id/permission-mode',
+      'PATCH /api/chat/conversations/:id',
+      'DELETE /api/chat/conversations/:id',
+      'POST /api/chat/agent',
+      'POST /api/chat/engine/unload',
+      'GET /api/providers',
+      'PUT /api/providers/selection',
+      'PUT /api/providers/:id/key',
+      'DELETE /api/providers/:id/key',
+      'POST /api/providers/:id/validate',
     ]);
   });
 
@@ -228,6 +271,39 @@ describe('dashboard runtime — route ownership', () => {
     const downloadOnWorker = await dispatchWorker(workerCtx, { method: 'GET', pathname: '/api/downloads', query });
     expect(downloadOnWorker.status).toBe(500);
     expect(downloadOnWorker.ok ? '' : downloadOnWorker.message).toContain('owned by the main thread');
+  });
+});
+
+describe('dashboard runtime — live', () => {
+  it('the periodic ingest emits a data event when it wrote records', async () => {
+    const liveBase = join(base, 'live');
+    const liveTraces = join(liveBase, 'traces');
+    mkdirSync(liveTraces, { recursive: true });
+    const periodic = createDashboardRuntime({
+      dbPath: ':memory:',
+      tracesDir: liveTraces,
+      modelsDir,
+      supervisorPath: join(liveBase, 'supervisor.json'),
+      ingestIntervalMs: 50,
+    });
+    try {
+      await periodic.ingestNow();
+      const events: LiveEvent[] = [];
+      const stop = periodic.watchLive((event) => events.push(event));
+      writeFileSync(
+        join(liveTraces, '2026-11-10-1.jsonl'),
+        `${JSON.stringify({ v: 2, traceId: 'live-1', ts: 1, model: 'm', outcome: 'ok' })}\n`,
+      );
+      const deadline = Date.now() + 5000;
+      while (!events.some((e) => e.type === 'data') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      stop();
+      const data = events.find((e) => e.type === 'data');
+      expect(data).toMatchObject({ type: 'data', traces: true, runtime: false });
+    } finally {
+      await periodic.close();
+    }
   });
 });
 
@@ -271,10 +347,10 @@ describe('dashboard runtime — shutdown', () => {
     for (let i = 0; i < 5; i++) void runtime.ingestNow();
     // Awaiting one more ingestNow drains every segment queued before it.
     await runtime.ingestNow();
-    const res = await runtime.call({ method: 'GET', path: '/api/metrics/overview' });
+    const res = await runtime.call({ method: 'GET', path: '/api/metrics/summary' });
     expect(res.ok).toBe(true);
-    const body = res.ok ? (res.body as { totals: { traces: number } }) : null;
-    expect(body?.totals.traces).toBe(TRACE_FILE_COUNT);
+    const body = res.ok ? (res.body as { totals: { turns: number } }) : null;
+    expect(body?.totals.turns).toBe(TRACE_FILE_COUNT);
   });
 
   // Downloads must drain BEFORE anything else tears down: a shutdown that killed
@@ -403,8 +479,11 @@ describe('dashboard runtime — worker death', () => {
       dbPath: ':memory:',
       modelsDir,
       tracesDir,
+      runtimeDir: join(base, 'runtime'),
       cacheRoot: undefined,
       agentHome: join(base, 'agent'),
+      chatAgentHome: join(base, 'chat', 'chat-agent'),
+      chatIndexPath: join(base, 'chat', 'conversations.json'),
     });
 
     try {
@@ -458,8 +537,11 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       dbPath: ':memory:',
       modelsDir,
       tracesDir,
+      runtimeDir: join(base, 'runtime'),
       cacheRoot: undefined,
       agentHome: join(base, 'agent'),
+      chatAgentHome: join(base, 'chat', 'chat-agent'),
+      chatIndexPath: join(base, 'chat', 'conversations.json'),
     });
   }
 
@@ -546,8 +628,11 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       dbPath: ':memory:',
       modelsDir,
       tracesDir,
+      runtimeDir: join(base, 'runtime'),
       cacheRoot: undefined,
       agentHome: join(base, 'agent'),
+      chatAgentHome: join(base, 'chat', 'chat-agent'),
+      chatIndexPath: join(base, 'chat', 'conversations.json'),
     });
 
     try {

@@ -1,0 +1,39 @@
+.bar {
+  min-width: 0;
+}
+
+.bar [role='progressbar'] > :not(:last-child) {
+  display: none;
+}
+
+.bar [role='progressbar'] > :last-child {
+  position: relative;
+  overflow: hidden;
+}
+
+.bar[data-shine] [role='progressbar'] > :last-child::after {
+  position: absolute;
+  inset: 0;
+  clip-path: inset(0 calc(100% - var(--pct)) 0 0);
+  background: linear-gradient(90deg, transparent, var(--shine), transparent) no-repeat;
+  background-size: 28px 100%;
+  content: '';
+  animation: download-shine var(--duration-shine) var(--ease-in-out) infinite;
+}
+
+@keyframes download-shine {
+  0% {
+    background-position: -28px 0;
+  }
+  70%,
+  100% {
+    background-position: calc(100% + 28px) 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bar[data-shine] [role='progressbar'] > :last-child::after {
+    animation: none;
+    display: none;
+  }
+}

@@ -67,3 +67,96 @@ export function evictPreview(buckets: readonly AgeBucketLike[], days: number): {
   }
   return { count, bytes };
 }
+
+/** The sidecar counters of the health card, read once so the tiles and their alarms agree. */
+export interface SidecarReading {
+  captures: number;
+  installed: number;
+  persisted: number;
+  written: number;
+  noAnchor: number;
+  unrooted: number;
+  /** State was on disk and prefixes restored, yet nothing was installed. */
+  replayed: boolean;
+  /** Captures ran and never wrote nor found a sidecar. */
+  stranded: boolean;
+}
+
+/** Shape of the health counters this reading uses (a structural subset of the API type). */
+interface SidecarHealthLike {
+  sidecarCaptureReached: number;
+  sidecarInstalled: number;
+  sidecarAlreadyPersisted: number;
+  sidecarEnqueued: number;
+  sidecarChainEmpty: number;
+  sidecarBoundarySkips: number;
+}
+
+/**
+ * `replayed`: the regression `installed` exists to expose — prefixes were restored (real hits) and the family's state
+ * was on disk, yet nothing was installed, so every restored turn replayed its whole prefix and still produced correct
+ * state. `stranded`: the capture ran and never once wrote a sidecar nor found one already there; `persisted` is what
+ * separates it from the healthy steady state where the first turn already wrote the chain.
+ */
+export function sidecarReading(
+  health: SidecarHealthLike | undefined,
+  scope: { unrootedSidecarCaptures: number } | undefined,
+  trendHits: number,
+): SidecarReading {
+  const captures = health?.sidecarCaptureReached ?? 0;
+  const installed = health?.sidecarInstalled ?? 0;
+  const persisted = health?.sidecarAlreadyPersisted ?? 0;
+  const written = health?.sidecarEnqueued ?? 0;
+  return {
+    captures,
+    installed,
+    persisted,
+    written,
+    noAnchor: (health?.sidecarChainEmpty ?? 0) + (health?.sidecarBoundarySkips ?? 0),
+    unrooted: scope?.unrootedSidecarCaptures ?? 0,
+    replayed: installed === 0 && persisted > 0 && trendHits > 0,
+    stranded: captures > 0 && written === 0 && persisted === 0,
+  };
+}
+
+/** Shape of one trend day (a structural subset of the API type). */
+interface TrendDayLike {
+  t: number;
+  hits: number;
+  misses: number;
+}
+
+/** Lookups and bytes of the trend days that start in `starts`: the Cache page and the Overview count the same window. */
+export function coldWindowTotals(
+  trend: ReadonlyArray<TrendDayLike & { bytesWritten: number; bytesRestored: number }>,
+  starts: readonly number[],
+): { hits: number; misses: number; bytesWritten: number; bytesRestored: number } {
+  const days = new Set(starts);
+  const acc = { hits: 0, misses: 0, bytesWritten: 0, bytesRestored: 0 };
+  for (const row of trend) {
+    if (!days.has(row.t)) continue;
+    acc.hits += row.hits;
+    acc.misses += row.misses;
+    acc.bytesWritten += row.bytesWritten;
+    acc.bytesRestored += row.bytesRestored;
+  }
+  return acc;
+}
+
+/** Hit rate in percent per day start; null on a day with no lookup (never a 0 % that was not measured). */
+export function hitRateSeries(
+  trend: readonly TrendDayLike[],
+  starts: readonly number[],
+): Array<{ t: number; rate: number | null; lookups: number; hits: number }> {
+  const byDay = new Map<number, { hits: number; misses: number }>();
+  for (const day of trend) {
+    const seen = byDay.get(day.t);
+    byDay.set(day.t, { hits: (seen?.hits ?? 0) + day.hits, misses: (seen?.misses ?? 0) + day.misses });
+  }
+  return starts.map((t) => {
+    const day = byDay.get(t);
+    const hits = day?.hits ?? 0;
+    const lookups = hits + (day?.misses ?? 0);
+    return { t, rate: lookups > 0 ? (100 * hits) / lookups : null, lookups, hits };
+  });
+}

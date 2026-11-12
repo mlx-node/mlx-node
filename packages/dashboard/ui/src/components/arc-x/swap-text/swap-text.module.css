@@ -1,0 +1,111 @@
+.root {
+  display: inline-flex;
+  max-width: 100%;
+  white-space: pre;
+}
+
+.root[data-granularity='char'] {
+  /* `safe`: text wider than its box clips at the end, never at the start. */
+  justify-content: safe flex-end;
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+}
+
+.cell {
+  display: inline-grid;
+  min-width: 0;
+}
+
+.root[data-granularity='char'] > .cell {
+  flex: none;
+}
+
+.root[data-granularity='text'] > .cell {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.now,
+.cell::before {
+  grid-area: 1 / 1;
+}
+
+.now {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cell[data-prev]::before {
+  content: attr(data-prev);
+  pointer-events: none;
+  user-select: none;
+}
+
+.root[data-granularity='text'] > .cell[data-prev]::before {
+  animation: swap-fade-out var(--duration-instant) var(--ease-standard) both;
+}
+
+.root[data-granularity='text'] > .cell[data-prev] > .now {
+  animation: swap-rise-in var(--duration-fast) var(--ease-enter) both;
+}
+
+.root[data-granularity='char'] > .cell[data-prev]::before {
+  animation: swap-char-out var(--duration-instant) var(--ease-standard) calc(var(--rank) * var(--stagger-char)) both;
+}
+
+.root[data-granularity='char'] > .cell[data-prev] > .now {
+  animation: swap-char-in var(--duration-fast) var(--ease-enter) calc(var(--rank) * var(--stagger-char)) both;
+}
+
+@keyframes swap-fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes swap-rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes swap-char-out {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+
+@keyframes swap-char-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Same specificity as the animated rules above, so these win by order. */
+@media (prefers-reduced-motion: reduce) {
+  .root[data-granularity] > .cell[data-prev]::before {
+    display: none;
+  }
+  .root[data-granularity] > .cell[data-prev] > .now {
+    animation: none;
+  }
+}

@@ -1,0 +1,32 @@
+*,
+::before,
+::after {
+  border-color: var(--border);
+}
+
+* {
+  scrollbar-width: thin;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+a.link {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+code,
+kbd,
+pre,
+samp {
+  font-family: var(--font-code);
+}

@@ -1,0 +1,295 @@
+{
+ "source": "scratchpad/impl/tmp/r3/codex/scan-results.jsonl (third reviewer): 58 rows, every one must ask",
+ "rows": [
+  {
+   "input": "cat <<EOF\n$(sh -c \"arbitrary code\")\nEOF",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "cat <<<$(sh -c \"arbitrary code\")",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "cat <$(sh -c \"arbitrary code\")",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "cat < ~/.ssh/id_rsa",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "cat <<< \"$XAI_API_KEY\"",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "echo x >& /private/tmp/outside-file",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "cat $'.\\x73sh/id_rsa'",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "touch a$'\\x2f..\\x2f..\\x2foutside'",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "cp a.txt dest/",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "cp -R dest .",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "chmod -R 777 dest",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "mkdir -p a/../dest; touch a.txt",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "mv dest/a.txt a.txt; echo x > a.txt",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "cp dest/a.txt a.txt; echo x > a.txt",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "rg --hostname-bin=./evil x",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "rg --hostname-bin ./evil x",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "git diff --no-index a.txt /etc/passwd",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "git diff --src-prefix=x --dst-prefix=y",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "git diff --textconv",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "git commit --template=/etc/passwd",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "git add --chmod=+x ../outside/file",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "git mv ../outside/file a.txt",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "git mv a.txt ../outside/file",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "git --exec-path=/tmp status",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "sort --compress-prog=./evil a.txt",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "env -u FOO ls",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "env -u $(sh -c \"arbitrary code\") ls",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "ls\rsh -c code",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "ls\u000bsh -c code",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "ls\fsh -c code",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "echo ${x:-$(sh -c code)}",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "echo $((1+$(sh -c code)))",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "printf -v PATH /tmp",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "printf -v PATH /tmp; ls",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "printf -v PATH .; ls",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "printf -v IFS x; ls",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "chmod +x ls; printf -v PATH .; ls",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "printf -v DEBUG XAI_%s API_KEY; printf \"%s\" \"${!DEBUG}\"",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "printf -v 'x[$(sh -c code)]' x",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "bun -e'console.log(1)'",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "bun -p'process.env'",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "make --eva='$(shell id)'",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "make -E'$(shell id)'",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "chmod -R 777 .",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "cp -P dest/a.txt new-link; echo x > new-link",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "cp -P dest/a.txt new-link; touch new-link",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "cat ~/.s?h/id_rsa",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "cat ~/[.]ssh/id_rsa",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "cat a.txt <<EOF\n$(rm -rf /private/tmp/outside-file)\nEOF",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "ls\r",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "touch\\r a.txt",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "while true; do ls; done",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "npm test -- --output-file=/private/tmp/outside-file",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "bun --eval=code",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "npm --script-shell=/bin/sh test",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "npm --script-shel=/bin/sh test",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "npm --scripT-shell=/bin/sh test",
+   "kind": "bash",
+   "expect": "ask"
+  },
+  {
+   "input": "n\\\node a.js",
+   "kind": "bash",
+   "expect": "ask"
+  }
+ ]
+}

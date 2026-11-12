@@ -15,10 +15,12 @@
 import { parentPort, receiveMessageOnPort, workerData, type MessagePort } from 'node:worker_threads';
 
 import { AgentSessionsReader } from '../agent-sessions/reader.js';
-import type { IngestSummary, WorkerApiContext } from '../api/context.js';
+import type { IngestPassResult, IngestSummary, WorkerApiContext } from '../api/context.js';
 import { dispatchWorker } from '../api/dispatch.js';
 import { failure, toFailure, type ApiResponse } from '../api/errors.js';
+import { readWorkIndexSync } from '../chat/index-file.js';
 import { openDashboardDb } from '../db/open.js';
+import { ingestRuntime } from '../ingest/runtime.js';
 import { ingestTraces } from '../ingest/traces.js';
 import type { DbWorkerBoot, MainToWorker, WorkerToMain } from './protocol.js';
 
@@ -31,7 +33,8 @@ function requireParentPort(): MessagePort {
 }
 const port = requireParentPort();
 
-const { dbPath, modelsDir, tracesDir, cacheRoot, agentHome, withdrawPort } = workerData as DbWorkerBoot;
+const { dbPath, modelsDir, tracesDir, runtimeDir, cacheRoot, agentHome, chatAgentHome, chatIndexPath, withdrawPort } =
+  workerData as DbWorkerBoot;
 
 /**
  * Requests the transport thread stopped waiting for before this thread reached
@@ -78,17 +81,23 @@ const dash = openDashboardDb(dbPath);
 // the chain for later callers (a rejected promise would skip every queued
 // `.then`).
 const doIngest = async (): Promise<IngestSummary> => {
+  let traces: IngestPassResult;
+  let runtime: IngestPassResult;
   try {
-    const tracesResult = await ingestTraces(dash, tracesDir, { retentionDays: RETENTION_DAYS });
-    return { traces: tracesResult };
+    traces = await ingestTraces(dash, tracesDir, { retentionDays: RETENTION_DAYS });
   } catch (err) {
-    return {
-      traces: { files: 0, records: 0, pruned: 0, warnings: [String(err)] },
-    };
+    traces = { files: 0, records: 0, pruned: 0, warnings: [String(err)] };
   }
+  try {
+    runtime = await ingestRuntime(dash, runtimeDir);
+  } catch (err) {
+    runtime = { files: 0, records: 0, pruned: 0, warnings: [String(err)] };
+  }
+  return { traces, runtime };
 };
 let ingestChain: Promise<IngestSummary> = Promise.resolve({
   traces: { files: 0, records: 0, pruned: 0, warnings: [] },
+  runtime: { files: 0, records: 0, pruned: 0, warnings: [] },
 });
 const runIngest = (): Promise<IngestSummary> => {
   ingestChain = ingestChain.then(doIngest);
@@ -101,7 +110,7 @@ const runIngest = (): Promise<IngestSummary> => {
  * in-flight one only ever looked harmless because `doIngest`'s catch swallowed
  * the resulting "database is not open".
  *
- * `ingestTraces` has a fully synchronous body today, so the
+ * `ingestTraces` and `ingestRuntime` have fully synchronous bodies today, so the
  * chain advances on microtasks and no `close` message can be DELIVERED while it
  * runs — which makes this await invisible in a test right now. It is what keeps
  * the invariant true the day one of them awaits real I/O.
@@ -118,10 +127,13 @@ const ctx: WorkerApiContext = {
   dash,
   modelsDir,
   tracesDir,
+  runtimeDir,
   cacheRoot,
   agentHome,
   runIngest,
   agentSessions: new AgentSessionsReader({ agentHome }),
+  chatSessions: new AgentSessionsReader({ agentHome: chatAgentHome, origin: 'chat' }),
+  chatIndex: () => readWorkIndexSync(chatIndexPath),
 };
 
 /**

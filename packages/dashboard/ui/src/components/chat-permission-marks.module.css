@@ -1,0 +1,30 @@
+.warnings {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  gap: var(--space-1);
+  list-style: none;
+}
+
+.warning {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: var(--space-1-5);
+  color: var(--warning);
+  font-size: var(--text-sm);
+}
+
+.warningIcon {
+  display: inline-flex;
+  flex: none;
+  padding-top: 2px;
+}
+
+.line {
+  min-width: 0;
+}
+
+.danger {
+  color: color-mix(in oklab, var(--danger) 84%, var(--foreground));
+}

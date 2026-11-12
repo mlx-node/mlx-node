@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Own components gallery</title>
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+
+      .gallery {
+        display: grid;
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 24px 16px 96px;
+        gap: 20px;
+      }
+
+      .gallery-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .gallery-head h1 {
+        margin: 0;
+        font-size: var(--text-xl);
+        font-weight: 600;
+      }
+
+      .gallery-section {
+        display: grid;
+        gap: 12px;
+        padding: 16px;
+        border: 1px solid var(--border);
+        border-radius: var(--radius-panel);
+        background: var(--surface);
+      }
+
+      .gallery-section h2 {
+        margin: 0;
+        font-size: var(--text-sm);
+        font-weight: 600;
+      }
+
+      .gallery-body {
+        display: grid;
+        gap: 12px;
+      }
+
+      .gallery-note {
+        margin: 0;
+        color: var(--text-secondary);
+        font-size: var(--text-xs);
+      }
+
+      .gallery-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 16px;
+      }
+
+      .gallery-cell {
+        display: grid;
+        min-width: 120px;
+        gap: 4px;
+      }
+
+      .gallery-cell > span:first-child {
+        color: var(--text-muted);
+        font-size: var(--text-xs);
+      }
+
+      .gallery-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+        gap: 16px;
+      }
+
+      .gallery-stage {
+        display: grid;
+        gap: 16px;
+      }
+
+      .gallery-value {
+        font-size: var(--text-2xl);
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./gallery.tsx"></script>
+  </body>
+</html>
