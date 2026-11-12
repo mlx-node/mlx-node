@@ -868,6 +868,78 @@ fn a_stop_on_a_preempted_turn_finishes_stop() {
     assert!(!state.owner_sequences.contains_key("owner"));
 }
 
+/// Splash `Engine::stop` settles a lane with generated tokens as `Stop` in
+/// any phase: a stop that lands after the step's cancel snapshot, while the
+/// preempted turn replays its prefill, cancels the replay slice from the live
+/// flag and still ends the turn "stop".
+///
+/// Mutation F1: the failed replay slice ignores the stop; the turn fails with
+/// "prefill cancelled".
+#[test]
+fn a_stop_inside_a_replay_prefill_slice_finishes_stop() {
+    use crate::engine::cmd::ChatCmd;
+    use crate::engine::hybrid_scheduler::HybridSchedulerState;
+    use crate::engine::model_command::ModelCommand;
+    use crate::model_thread::LoopControl;
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let (plumbing, mut rx) = crate::engine::napi_glue::chat_stream_plumbing();
+    let message: crate::tokenizer::ChatMessage =
+        serde_json::from_value(serde_json::json!({"role": "user", "content": "a"})).unwrap();
+    let config = crate::engine::types::ChatConfig {
+        max_new_tokens: Some(40),
+        temperature: Some(0.0),
+        enable_mtp: Some(false),
+        max_consecutive_tokens: Some(0),
+        max_ngram_repeats: Some(0),
+        cache_owner_id: Some("owner".to_string()),
+        ..Default::default()
+    };
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let command = ChatCmd::StreamSessionStart {
+        messages: vec![message],
+        config,
+        stream_tx: plumbing.stream_tx.clone(),
+        cancelled: plumbing.cancelled.clone(),
+    };
+    assert!(sender.send(ModelCommand::from_chat(command)).is_ok());
+    let mut seq = None;
+    for _ in 0..64 {
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        seq = state.owner_sequences.get("owner").copied();
+        if let Some(seq) = seq
+            && state
+                .turn_mut(seq)
+                .is_some_and(|turn| turn.payload.generated_tokens.len() >= 2)
+        {
+            break;
+        }
+    }
+    let seq = seq.unwrap();
+    assert!(state.turn_mut(seq).unwrap().payload.generated_tokens.len() >= 2);
+    assert!(state.preempt_running(seq));
+    state.resume_preempted();
+    assert!(
+        state
+            .turn_mut(seq)
+            .is_some_and(|turn| turn.payload.preemption_replay.is_some()),
+        "the resumed turn does not replay"
+    );
+    let handle = &plumbing.handle;
+    assert!(state.step_after_snapshot(|| handle.stop()));
+    drop(plumbing);
+    let mut done = None;
+    while let Ok(chunk) = rx.try_recv() {
+        let chunk = chunk.unwrap_or_else(|error| panic!("stopped turn failed: {}", error.reason));
+        if chunk.done {
+            done = Some(chunk);
+        }
+    }
+    let done = done.expect("the stopped turn sent no done chunk");
+    assert_eq!(done.finish_reason.as_deref(), Some("stop"));
+    assert!(done.num_tokens.is_some_and(|tokens| tokens >= 2));
+    assert!(!state.owner_sequences.contains_key("owner"));
+}
+
 /// Drives one turn without a `cacheOwnerId` through the scheduler and returns
 /// its text and MTP cycle count.
 fn drive_ownerless_turn(

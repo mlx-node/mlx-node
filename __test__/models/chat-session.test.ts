@@ -3310,6 +3310,82 @@ describe('ChatSession', () => {
       expect(fake.chatSessionStart).toHaveBeenCalledTimes(1);
       expect(fake.chatSessionContinue).not.toHaveBeenCalled();
     });
+
+    // Splash `RuntimeCall._request_end`: a stop the native stream cannot take
+    // yet returns false and changes nothing.
+    // Mutation F2: the cut is latched before the stop is accepted.
+    it('a stop before the native stream starts changes nothing', async () => {
+      const mock = makeMockModel();
+      const session = new ChatSession(mock.model);
+      session.primeHistory([{ role: 'user', content: 'hi' }]);
+      const stream = session.startFromHistoryStream();
+      const first = stream.next();
+      expect(session.stop('cut')).toBe(false);
+      const events: ChatStreamEvent[] = [];
+      for (let next = await first; next.done !== true; next = await stream.next()) {
+        events.push(next.value);
+      }
+      expect(events[events.length - 1]).toMatchObject({ done: true, text: 'start-reply' });
+      const history = (session as unknown as { history: ChatMessage[] }).history;
+      expect(history[history.length - 1]).toMatchObject({ role: 'assistant', content: 'start-reply' });
+      await session.send('next');
+      expect(mock.chatSessionContinue).toHaveBeenCalledTimes(1);
+    });
+
+    // LFM2's template reads reasoning only from the raw content.
+    // Mutation F3: the cut commit drops the raw reasoning block.
+    it('a stopped raw-replay turn keeps its reasoning block in the content', async () => {
+      const mock = makeMockModel();
+      let stopped = false;
+      const chatStreamSessionStart = vi.fn(async function* (
+        _messages: ChatMessage[],
+        _config?: ChatConfig | null,
+        _signal?: AbortSignal,
+        control?: ChatStreamControl,
+      ): AsyncGenerator<ChatStreamEvent> {
+        if (control != null) {
+          control.stop = () => {
+            stopped = true;
+            return true;
+          };
+        }
+        let raw = '';
+        for (const text of ['<think>', 'R', '</think>']) {
+          raw += text;
+          yield { text, done: false, isReasoning: true };
+        }
+        for (const text of [' a', ' HALT', ' over']) {
+          raw += text;
+          yield { text, done: false, isReasoning: false };
+          if (stopped) break;
+        }
+        yield {
+          ...finalChunk(raw.slice('<think>R</think> '.length)),
+          finishReason: 'cancelled',
+          thinking: 'R',
+          rawText: raw,
+        };
+      });
+      const model: SessionCapableModel = {
+        ...mock.model,
+        chatStreamSessionStart,
+        replaysAssistantRawText: () => true,
+      };
+      const session = new ChatSession(model);
+      session.primeHistory([{ role: 'user', content: 'go' }]);
+      let visible = '';
+      for await (const event of session.startFromHistoryStream()) {
+        if (event.done || event.isReasoning === true) continue;
+        if (event.text === ' HALT') expect(session.stop(visible)).toBe(true);
+        visible += event.text;
+      }
+      const history = (session as unknown as { history: ChatMessage[] }).history;
+      expect(history[history.length - 1]).toEqual({
+        role: 'assistant',
+        content: '<think>R</think> a',
+        thinkingEnabled: true,
+      });
+    });
   });
 
   // -------------------------------------------------------------------

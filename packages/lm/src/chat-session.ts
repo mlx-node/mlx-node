@@ -348,6 +348,17 @@ function buildAssistantMessage(
 }
 
 /**
+ * The raw assistant bytes of a reply cut at a stop match, for families whose
+ * template replays raw content: the raw text before the visible stream (the
+ * reasoning block) followed by the cut. `null` when the raw text does not end
+ * with the visible stream, so the reasoning bytes cannot be told apart.
+ */
+function cutRawText(rawText: string | null, visibleStream: string, cut: string): string | null {
+  if (rawText === null || !rawText.endsWith(visibleStream)) return null;
+  return rawText.slice(0, rawText.length - visibleStream.length) + cut;
+}
+
+/**
  * Count the `ok`-status tool calls in a `ChatResult.toolCalls` /
  * terminal stream chunk. Used to detect the unsupported multi-call
  * fan-out pattern — the chat-session API only serves one tool call
@@ -950,13 +961,16 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * with `finishReason: 'stop'`, and the next `send` replays the full
    * history (native history holds the tokens decoded past the cut).
    * Returns whether the native stop was sent: `false` when no stoppable
-   * turn is in flight, it was already stopped, or a cancel ended it first.
+   * turn is in flight, its native stream has not started yet, it was already
+   * stopped, or a cancel ended it first. A `false` changes nothing (Splash
+   * `RuntimeCall._request_end`), so the caller may retry.
    */
   stop(committedText: string): boolean {
     const active = this.activeStop;
     if (active === null || active.cut !== null) return false;
+    if (active.control.stop?.() !== true) return false;
     active.cut = committedText;
-    return active.control.stop?.() ?? false;
+    return true;
   }
 
   /** Whether the session currently has images bound to its cache. */
@@ -1823,8 +1837,12 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // mutated on a successful commit — on any non-success exit,
         // the primed state is left intact so the caller can retry.
         if (sawFinal && active.cut !== null) {
+          const rawCut =
+            this.model.replaysAssistantRawText?.() === true
+              ? cutRawText(finalReplayRaw, accumulatedVisible, active.cut)
+              : null;
           this.history.push(
-            buildAssistantMessage(active.cut, undefined, finalThinking, finalThinkingEnabled, null, false),
+            buildAssistantMessage(active.cut, undefined, finalThinking, finalThinkingEnabled, rawCut, rawCut !== null),
           );
           this.turnCount++;
           this.needsFullReplay = true;

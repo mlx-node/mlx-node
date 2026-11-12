@@ -107,7 +107,7 @@ const result = await pipeline.analyze(imageBuffer);
 - `sendToolResult(...)` / `sendToolResultStream(...)` — feed back a structured tool result through the same template path
 - `reset()` — clear conversation
 - `primeHistory(history)` / `startFromHistory(history)` / `startFromHistoryStream(history)` — server-side cold-start replay
-- `stop(committedText)` — end the in-flight `startFromHistoryStream` turn at the native step it is running, as a completion (Splash `RuntimeCall.stop`). The turn commits `committedText` with no tool calls, its done event carries that text with `finishReason: 'stop'`, and the next `send` replays the full history. The messages server calls it on a stop-sequence match
+- `stop(committedText)` — end the in-flight `startFromHistoryStream` turn at the native step it is running, as a completion (Splash `RuntimeCall.stop`). The turn commits `committedText` with no tool calls, its done event carries that text with `finishReason: 'stop'`, and the next `send` replays the full history. A raw-replay family (LFM2) commits its raw reasoning block followed by `committedText`. It returns `false` and changes nothing until the native stream has started, so the caller can retry. The messages server calls it on a stop-sequence match
 - `applyChatTemplate(history)` — apply tokenizer chat template (e.g. for token counting)
 - `hasBlockPagedCache?()` — paged-cache routing hint
 

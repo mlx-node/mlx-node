@@ -1314,6 +1314,12 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             }
             Err(error) => {
                 turn.payload.profiler.end_prefill();
+                // A stop that lands inside a replay slice cancels the slice
+                // from the live flag; the turn still ends `Stop` on what it
+                // generated (Splash `Engine::stop` → `settle`).
+                if stop_vacates(turn) {
+                    return Ok(Self::end_row(turn, row));
+                }
                 return Ok(Self::fail(turn, row, error));
             }
         };
@@ -2798,6 +2804,46 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     #[cfg(test)]
     pub(crate) fn resume_preempted(&mut self) {
         self.try_resume_preempted();
+    }
+
+    /// Runs one scheduler step whose rows execute after `before_execute`,
+    /// i.e. after the step's cancel snapshot, and settles it.
+    #[cfg(test)]
+    pub(crate) fn step_after_snapshot(&mut self, before_execute: impl FnMut()) -> bool {
+        struct Hooked<'a, B: HybridSchedulerBackend, F> {
+            executor: HybridStepExecutor<'a, B>,
+            before_execute: F,
+        }
+        impl<B: HybridSchedulerBackend, F: FnMut()> StepExecutor<ScheduledTurn<B::PrefixState>>
+            for Hooked<'_, B, F>
+        {
+            type Error = Error;
+
+            fn execute(
+                &mut self,
+                plan: &StepPlan,
+                running: &mut [TurnState<ScheduledTurn<B::PrefixState>>],
+            ) -> std::result::Result<StepResult, Self::Error> {
+                (self.before_execute)();
+                self.executor.execute(plan, running)
+            }
+        }
+        self.begin_scheduled_step();
+        let mut hooked = Hooked {
+            executor: HybridStepExecutor::new(&mut self.inner),
+            before_execute,
+        };
+        let Ok(SchedulerAction::Stepped {
+            completed,
+            preempted,
+            blocked_alone,
+            ..
+        }) = self.scheduler.drive_once(&mut hooked)
+        else {
+            return false;
+        };
+        self.settle_step(completed, preempted, blocked_alone);
+        true
     }
 
     fn reclaim_one_idle_scheduled_with<F>(
