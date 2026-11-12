@@ -2697,6 +2697,82 @@ mod paged_dflash2_tests {
         Ok(())
     }
 
+    /// The chunk ending at checkpoint 16 grows the pool (its one block is
+    /// held by another request), and the ledger has room for the grow or
+    /// for the checkpoint's buffers, not both, with nothing to reclaim. The
+    /// chunk's KV is booked before the capture is claimed (Splash
+    /// `Engine::prepare`: `growLane`, then `reserveCaptures`), so the
+    /// prefill completes and every state is published.
+    /// Mutation KV1 (the capture is claimed before the chunk's KV) → red
+    /// (the held capture leaves the grow no room: capacity_exhausted).
+    #[test]
+    fn chunk_kv_is_booked_before_its_capture() -> Result<()> {
+        use crate::engine::governor::governor::Governor;
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use crate::models::qwen3_5::model::dflash2_park_tests::{install_pool, passing_probe};
+        use crate::transformer::paged_kv_cache_adapter::pool_grow_reserved_bytes;
+        let _ctx = StreamContext::new(Stream::generation());
+        let prompt = prompt(100);
+        let mut inner = tiny_paged_int8_dflash_inner(0x5_8142);
+        install_pool(&mut inner, 1, 16, passing_probe())?;
+        let grow = {
+            let adapter = inner.paged_adapter.as_mut().expect("pool");
+            let block_size = adapter.block_size();
+            assert_eq!(block_size, 16, "the chunk ending at 16 takes one block");
+            adapter.set_extent_growth(15);
+            adapter.begin_request(9).map_err(Error::from_reason)?;
+            adapter
+                .allocate_suffix_blocks_for(9, block_size)
+                .map_err(Error::from_reason)?;
+            let pool = adapter.layer_kv_pool();
+            let layers = pool.layer_bytes();
+            let new_layer = pool.layer_bytes_for(16).map_err(Error::from_reason)?;
+            new_layer * layers.len() as u64 - pool.total_bytes()
+                + pool_grow_reserved_bytes(&layers, new_layer)
+        };
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(16)));
+        let result = (|| -> Result<()> {
+            let prefix = inner.prime_dspark_prefix_state(&prompt, true, 0)?;
+            let anchor = inner
+                .dflash2_states
+                .turn
+                .as_ref()
+                .expect("the turn's plan")
+                .anchor_bytes;
+            let limit = grow.max(anchor) + grow.min(anchor) / 2;
+            let io = FakeIo::new(
+                stats(0),
+                host(32 * G, crate::engine::governor::host::Pressure::Normal),
+            );
+            let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+            inner.memory_registration =
+                Some(governor.register_model(model(limit, 0)).expect("register"));
+            inner
+                .paged_adapter
+                .as_mut()
+                .expect("pool")
+                .set_admission(std::sync::Arc::new(governor));
+            inner
+                .paged_prefill_with_draft_state(&prompt, &prefix, Stream::generation())?
+                .eval();
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result?;
+        let counters = inner.dflash2_states.counters;
+        assert_eq!(counters.checkpoint_publications, 5);
+        assert_eq!(counters.replay_state_publications, 1);
+        assert_eq!(counters.checkpoint_publication_failures, 0);
+        let telemetry = inner
+            .paged_adapter
+            .as_ref()
+            .expect("pool")
+            .block_telemetry()
+            .expect("telemetry");
+        assert_eq!(telemetry.total_blocks, 16, "the chunk grew the pool");
+        Ok(())
+    }
+
     /// A (200 tokens) keeps 176 (checkpoint) and 192 (its replay point) and
     /// registers its whole chain. B shares A's first 150 tokens: it resumes
     /// at 0, its KV hit is 144 with a state below it (Splash `Cache::lookup`

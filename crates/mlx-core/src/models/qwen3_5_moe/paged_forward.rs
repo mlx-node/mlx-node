@@ -16,9 +16,9 @@ use crate::inference_trace::{
 };
 use crate::models::qwen3_5::paged_forward::{
     CaptureGrant, MaterializedGdnPrefixCheckpoint, PrefillParts, PrefillTapSink, PrefillTarget,
-    capture_chunk_linear, capture_rows_of, check_prefill_chunk_rows, checkpoint_suffix_offsets,
-    gdn_checkpoint_target, materialize_linear_layer_caches, media_prefill_ranges,
-    paged_prefill_ranges, prefill_breaks, prefill_ladder, prepare_chunk_capture, reach_chunk,
+    book_chunk, capture_chunk_linear, capture_rows_of, check_prefill_chunk_rows,
+    checkpoint_suffix_offsets, gdn_checkpoint_target, materialize_linear_layer_caches,
+    media_prefill_ranges, paged_prefill_ranges, prefill_breaks, prefill_ladder, reach_chunk,
     snapshot_materialized_linear_layer_caches,
 };
 use crate::nn::{Embedding, RMSNorm};
@@ -424,19 +424,18 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
         let chunk = &suffix_tokens[range];
         let is_last_chunk = chunk_idx + 1 == total_chunks;
         let chunk_trace_start = trace_enabled.then(Instant::now);
-        let grant = prepare_chunk_capture(
+        // 1. Advance cursor + grow blocks for this chunk, then claim its
+        //    capture. Must happen BEFORE calling the per-chunk helper so
+        //    `update_keys_values` inside the layer loop aligns at
+        //    `[chunk_start_position, chunk_start_position+chunk.len())`.
+        let grant = book_chunk(
             target,
             taps.as_deref_mut(),
             &capture_rows,
+            chunk,
             chunk_start_position + chunk.len() as u32,
             is_last_chunk,
         )?;
-
-        // 1. Advance cursor + grow blocks for this chunk. Must happen
-        //    BEFORE calling the per-chunk helper so `update_keys_values`
-        //    inside the layer loop aligns at
-        //    `[chunk_start_position, chunk_start_position+chunk.len())`.
-        target.record(chunk)?;
         let parts = target.parts()?;
 
         // 2. Run the per-chunk forward (embed → layer loop). For chunk N

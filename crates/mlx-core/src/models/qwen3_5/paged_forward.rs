@@ -169,15 +169,19 @@ pub(crate) fn capture_rows_of(taps: Option<&dyn PrefillTapSink>) -> Vec<u32> {
     })
 }
 
-/// The claim of the capture at `row` when the chunk ends there; the sink
-/// snapshots only a granted one.
-pub(crate) fn prepare_chunk_capture<L>(
+/// Books `chunk`'s rows, then claims the capture at `row` when the chunk
+/// ends there; the sink snapshots only a granted one. The KV comes first
+/// (Splash `Engine::prepare` runs `growLane` before `reserveCaptures`): an
+/// optional state is refused rather than taking the room the chunk needs.
+pub(crate) fn book_chunk<L>(
     target: &mut dyn PrefillTarget<L>,
     taps: Option<&mut (dyn PrefillTapSink + '_)>,
     capture_rows: &[u32],
+    chunk: &[u32],
     row: u32,
     is_last_chunk: bool,
 ) -> Result<Option<CaptureGrant>> {
+    target.record(chunk)?;
     let Some(sink) = taps else {
         return Ok(None);
     };
@@ -271,9 +275,9 @@ pub(crate) trait PrefillTarget<L> {
     fn parts(&mut self) -> Result<PrefillParts<'_, L>>;
     /// Books `chunk`'s rows and advances the cursor over them.
     fn record(&mut self, chunk: &[u32]) -> Result<()>;
-    /// Claims the state the chunk ending at `row` captures, before the
-    /// chunk's rows are booked (Splash `Engine::reserveCaptures` runs before
-    /// the command).
+    /// Claims the state the chunk ending at `row` captures, after the
+    /// chunk's rows are booked and before the chunk runs (Splash
+    /// `Engine::prepare`: `growLane`, then `reserveCaptures`).
     fn prepare_capture(&mut self, _row: u32) -> Result<CaptureGrant> {
         Ok(CaptureGrant::Reserved(None, false))
     }
@@ -931,15 +935,14 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         let is_last_chunk = chunk_idx + 1 == total_chunks;
         let chunk_trace_start = trace_enabled.then(Instant::now);
         let chunk_info_start = inference_info_enabled.then(Instant::now);
-        let grant = prepare_chunk_capture(
+        let grant = book_chunk(
             target,
             taps.as_deref_mut(),
             &capture_rows,
+            chunk,
             chunk_start_position + chunk.len() as u32,
             is_last_chunk,
         )?;
-
-        target.record(chunk)?;
         let parts = target.parts()?;
         #[cfg(test)]
         note_prefill_chunk_blocks(parts.adapter);
