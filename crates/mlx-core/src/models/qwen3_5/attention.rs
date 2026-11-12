@@ -779,9 +779,18 @@ impl Qwen3_5Attention {
     ///
     /// Readers by block shape:
     ///   * `T == 1` (AR decode, MTP draft step) and `2..=8` without a mask
-    ///     (eager MTP / DFlash2 verify): the segmented int8 kernels read the
-    ///     int8 rows directly — prefix `[0, P)` and the block's own rows as
-    ///     the "new" segment, causal for a block.
+    ///     (eager MTP verify) that the segmented int8 kernels launch
+    ///     (`segmented_int8_covers`): they read the int8 rows directly —
+    ///     prefix `[0, P)` and the block's own rows as the "new" segment,
+    ///     causal for a block.
+    ///   * any other unmasked block of `1..=8` rows over a prefix (a 5..8-row
+    ///     block at gqa above 8, which the segmented kernels cannot split, or
+    ///     a dtype, head size or device they do not take): the cache's own
+    ///     rows `[0, P + T)`
+    ///     are dequantized and MLX's fused SDPA runs over them, so the block
+    ///     reads its own rows int8-rounded like a 1-row decode (Splash
+    ///     `PagedAttention::addVerify` stores the chunk, then attends over the
+    ///     pages).
     ///   * anything else (prefill chunks, explicit masks): the cached prefix
     ///     is dequantized to a BF16 temporary (one pass per layer per chunk)
     ///     and MLX's fused SDPA runs over `concat(prefix, fresh block)`; the
@@ -808,13 +817,17 @@ impl Qwen3_5Attention {
             && self.head_dim == 256
             && queries.dtype()? == DType::BFloat16
             && unsafe { mlx_sys::mlx_metal_is_available() }
-            && unsafe { mlx_sys::mlx_default_device() } == 1;
+            && unsafe { mlx_sys::mlx_default_device() } == 1
+            && crate::array::kv_int8::segmented_int8_covers(seq_len, gqa);
         if segmented {
             let prefix = all.slice_tokens(0, prefix_len)?;
             let new = all.slice_tokens(prefix_len, prefix_len + seq_len)?;
             return segmented_sdpa_int8(queries, &prefix, &new, self.scale, seq_len > 1);
         }
-        let (k, v) = if prefix_len > 0 {
+        let verify_shaped = mask.is_none() && prefix_len > 0 && (1..=8).contains(&seq_len);
+        let (k, v) = if verify_shaped {
+            all.dequantize()?
+        } else if prefix_len > 0 {
             let (pk, pv) = all.slice_tokens(0, prefix_len)?.dequantize()?;
             (
                 MxArray::concatenate(&pk, keys, 2)?,

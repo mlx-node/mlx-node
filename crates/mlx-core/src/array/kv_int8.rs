@@ -152,6 +152,31 @@ pub fn segmented_sdpa_int8(
     MxArray::from_handle(handle, "segmented_sdpa_int8")
 }
 
+/// Whether [`segmented_sdpa_int8`] launches a causal block of `rows` (1..=8)
+/// queries at `gqa`: one chunk of at most the device's widest query chunk,
+/// or two (`segmented_verify_head_rows` in the C++ planner), so `rows <= 2 x
+/// max`. At gqa 16 the widest chunk is 2 rows and a 5..8-row block is an
+/// error there. Call only on the Metal device.
+pub(crate) fn segmented_int8_covers(rows: i64, gqa: i64) -> bool {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    const UNREAD: i32 = i32::MIN;
+    static MAX_QUERY: [AtomicI32; 33] = [const { AtomicI32::new(UNREAD) }; 33];
+    let Ok(index) = usize::try_from(gqa) else {
+        return false;
+    };
+    let Some(slot) = MAX_QUERY.get(index) else {
+        return false;
+    };
+    let mut max_query = slot.load(Ordering::Relaxed);
+    if max_query == UNREAD {
+        // SAFETY: a pure query of the loaded metallib's pipeline limits.
+        max_query = unsafe { sys::mlx_segmented_sdpa_max_query_length(gqa as i32) };
+        slot.store(max_query, Ordering::Relaxed);
+    }
+    // 0 (no launch) or -1 (missing kernels): the kernel call reports it.
+    max_query < 1 || rows <= 2 * i64::from(max_query)
+}
+
 /// Forced-route form of [`segmented_sdpa_int8`] (tests): `mode` -1
 /// automatic, 0 vector, 1 tile, 2 nax.
 #[cfg(test)]

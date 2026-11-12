@@ -800,3 +800,82 @@ fn int8_varlen_prefill_reads_past_the_aux_cap() {
     varlen_rows_match_single_rows(&mut adapter, 9_000, 512, &[0, 112, 113, 511]);
     varlen_rows_match_single_rows(&mut adapter, 90_000, 2048, &[0, 1000, 2047]);
 }
+
+/// One sequence of `tokens` seeded rows in a one-layer pool of `dtype` with
+/// the 122B's attention geometry (2 KV heads, D 256, bs 16).
+fn gqa16_adapter(tokens: u32, dtype: MetalDtype) -> Option<PagedKVCacheAdapter> {
+    let config = PagedAttentionConfig {
+        num_layers: 1,
+        num_kv_heads: 2,
+        max_seq_len: Some(tokens + 64),
+        ..pool_config_d256()
+    };
+    let blocks = tokens.div_ceil(BS as u32) + 1;
+    let (mut adapter, _) = adapter_for(config, blocks, blocks, dtype)?;
+    adapter.begin_request(1).unwrap();
+    adapter.allocate_suffix_blocks(tokens).unwrap();
+    adapter
+        .record_tokens(&(0..tokens).map(|t| t % 1000).collect::<Vec<u32>>())
+        .unwrap();
+    let (keys, _) = shaped_rows(tokens as usize, 2, D256_DIM, 300, None);
+    let (values, _) = shaped_rows(tokens as usize, 2, D256_DIM, 400, None);
+    adapter
+        .update_keys_values_native(0, &keys, &values, 0)
+        .unwrap();
+    adapter.eval_pending_pool_writes().unwrap();
+    Some(adapter)
+}
+
+/// The adapter's read entries at the 122B's 32 query / 2 KV heads (gqa 16,
+/// D 256) over 600 tokens: the decode graph (1 row) and the varlen read of
+/// the last 8 (verify) and 64 (prefill) rows track a bf16 pool holding the
+/// same rows within the int8 noise.
+///
+/// Mutation G16: query heads >= 8 of a group read the next KV head in the
+/// generic int8 kernels → red.
+#[test]
+fn int8_adapter_reads_serve_gqa_16() {
+    const QUERY_HEADS_G16: usize = 32;
+    const TOKENS: u32 = 600;
+    let Some(mut int8) = gqa16_adapter(TOKENS, MetalDtype::Int8) else {
+        return;
+    };
+    let Some(mut bf16) = gqa16_adapter(TOKENS, MetalDtype::BFloat16) else {
+        return;
+    };
+    let scale = 1.0 / (D256_DIM as f32).sqrt();
+    let queries = |rows: usize| {
+        bf16_array(
+            &wide_queries(rows, QUERY_HEADS_G16, D256_DIM, 50 + rows as u32),
+            &[rows as i64, QUERY_HEADS_G16 as i64, D256_DIM as i64],
+        )
+    };
+    let read = |adapter: &mut PagedKVCacheAdapter, rows: usize| {
+        if rows == 1 {
+            adapter
+                .gather_kv_for_decode_graph(0, &queries(1), scale, 1.0)
+                .unwrap()
+        } else {
+            adapter
+                .gather_kv_for_prefill_chunk_varlen(0, &queries(rows), TOKENS - rows as u32, scale)
+                .unwrap()
+        }
+    };
+    for rows in [1, 8, 64] {
+        let got = host(&read(&mut int8, rows));
+        let want = host(&read(&mut bf16, rows));
+        assert_eq!(got.len(), rows * QUERY_HEADS_G16 * D256_DIM, "rows {rows}");
+        assert!(got.iter().all(|value| value.is_finite()), "rows {rows}");
+        let magnitude = want.iter().fold(0.0f32, |max, value| max.max(value.abs()));
+        let max = got
+            .iter()
+            .zip(&want)
+            .fold(0.0f32, |max, (a, b)| max.max((a - b).abs()));
+        eprintln!("gqa 16 rows {rows}: magnitude {magnitude} max |int8 - bf16| {max}");
+        assert!(magnitude > 0.0, "rows {rows}: zero output");
+        assert!(
+            max <= magnitude / 32.0,
+            "rows {rows}: max |d| {max} > magnitude {magnitude} / 32"
+        );
+    }
+}

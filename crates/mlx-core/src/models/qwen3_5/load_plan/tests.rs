@@ -75,26 +75,49 @@ fn int8_pool_without_a_kernel_fails_the_load() {
 
 /// The unset default is int8 only where the pool would get int8 pages, so a
 /// default load never fails: a paged 8-token block keeps bf16, a 16-token
-/// block or a flat load takes int8 (Metal, head 256, GQA 6, BF16). An
-/// explicit int8 stays int8.
+/// block or a flat load takes int8 (Metal, head 256, BF16), at the 27B's GQA 6
+/// and at the 122B's 32 / 2 (GQA 16). An explicit int8 stays int8.
 /// Mutation B1: the default ignores the block size → red.
+/// Mutation D1: `default_for_geometry` keeps a `gqa <= 8` clause → red at
+/// 32 / 2.
 #[test]
 fn unset_kv_format_defaults_to_int8_only_where_the_pool_has_kernels() {
     if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
         return;
     }
-    let mut config = crate::models::qwen3_5::dflash2_decode::tests::qwen38_27b_cfg();
-    config.kv_format = None;
-    config.use_block_paged_cache = None;
-    config.paged_block_size = Some(16);
-    assert_eq!(config.kv_format_for(DType::BFloat16), KvFormat::Int8);
-    config.paged_block_size = Some(8);
-    assert_eq!(config.kv_format_for(DType::BFloat16), KvFormat::Bf16);
-    config.use_block_paged_cache = Some(false);
-    assert_eq!(config.kv_format_for(DType::BFloat16), KvFormat::Int8);
-    config.use_block_paged_cache = None;
-    config.kv_format = Some("int8".to_string());
-    assert_eq!(config.kv_format_for(DType::BFloat16), KvFormat::Int8);
+    for (q_heads, kv_heads) in [(24, 4), (32, 2)] {
+        let mut config = crate::models::qwen3_5::dflash2_decode::tests::qwen38_27b_cfg();
+        config.num_heads = q_heads;
+        config.num_kv_heads = kv_heads;
+        config.kv_format = None;
+        config.use_block_paged_cache = None;
+        config.paged_block_size = Some(16);
+        let label = format!("{q_heads} / {kv_heads}");
+        assert_eq!(
+            config.kv_format_for(DType::BFloat16),
+            KvFormat::Int8,
+            "{label}"
+        );
+        config.paged_block_size = Some(8);
+        assert_eq!(
+            config.kv_format_for(DType::BFloat16),
+            KvFormat::Bf16,
+            "{label}"
+        );
+        config.use_block_paged_cache = Some(false);
+        assert_eq!(
+            config.kv_format_for(DType::BFloat16),
+            KvFormat::Int8,
+            "{label}"
+        );
+        config.use_block_paged_cache = None;
+        config.kv_format = Some("int8".to_string());
+        assert_eq!(
+            config.kv_format_for(DType::BFloat16),
+            KvFormat::Int8,
+            "{label}"
+        );
+    }
 }
 
 /// A saved config never carries the load's pinned `kv_format` (Splash
@@ -1426,4 +1449,106 @@ fn moe_header_names_mtp_experts_like_the_sanitizer() {
             "{tag}: the fixture is a complete head"
         );
     }
+}
+
+/// Splash `kQwen3_5_122BLayout` (Qwen3.5-122B-A10B) as a config file only:
+/// 48 layers, every fourth full attention (12), 32 query / 2 KV heads at
+/// D 256, GDN 16 / 64 heads x 128, 256 experts, 8 per token.
+fn write_122b_fixture(target: &std::path::Path) {
+    std::fs::write(
+        target.join("config.json"),
+        serde_json::json!({
+            "model_type": "qwen3_5_moe",
+            "hidden_size": 3072,
+            "num_hidden_layers": 48,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "intermediate_size": 1024,
+            "moe_intermediate_size": 1024,
+            "shared_expert_intermediate_size": 1024,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "vocab_size": 248320,
+            "max_position_embeddings": 262144,
+            "full_attention_interval": 4,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 64,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// The 122B's unset default prices the int8 pool: its pages are half the
+/// bf16 ones (bs 16: 199,680 vs 393,216 B; Splash 32-token pages 399,360 vs
+/// 786,432), so on a 96 GiB working set with the lightest weights that leave
+/// a memory-bound int8 window (77,750 MiB), the default equals explicit int8:
+/// 262,137 tokens against bf16's 118,393.
+/// Mutation D1: `default_for_geometry` keeps a `gqa <= 8` clause → red (the
+/// default prices bf16 pages).
+#[test]
+fn estimate_122b_takes_the_int8_pool() {
+    use mlx_paged_attn::metal::MetalDtype;
+    const MIB: u64 = 1 << 20;
+    let page = |dtype, bs| mlx_paged_attn::profile::bytes_per_block(12, 2, 256, bs, dtype).unwrap();
+    assert_eq!(page(MetalDtype::Int8, 16), 199_680);
+    assert_eq!(page(MetalDtype::BFloat16, 16), 393_216);
+    assert_eq!(page(MetalDtype::Int8, 32), 399_360);
+    assert_eq!(page(MetalDtype::BFloat16, 32), 786_432);
+    if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+        return;
+    }
+    let target = estimate_fixture_dir("122b");
+    write_122b_fixture(&target);
+    let live = LiveMemory {
+        working_set_bytes: 96 << 30,
+        active_bytes: 0,
+        registered_pool_bytes: 0,
+    };
+    let estimate = |weight_mib: u64, kv_format| {
+        crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(Some(live)));
+        let estimate = estimate_qwen35_load(
+            "Qwen3.5 MoE",
+            &EstimateInput {
+                asset_dir: &target,
+                moe: true,
+                weight_bytes: weight_mib * MIB,
+                header: bf16_header(),
+                draft_dir: None,
+                kv_format,
+                max_memory_bytes: None,
+                max_context: None,
+            },
+        );
+        crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
+        estimate.ok().flatten()
+    };
+    // The lightest weights (250 MiB steps from 70,000) whose int8 window is
+    // memory-bound.
+    let weight_mib = (0..64)
+        .map(|step| 70_000 + 250 * step)
+        .find(|&mib| estimate(mib, Some(KvFormat::Int8)).is_some_and(|e| e.bound == "memory"))
+        .expect("a memory-bound int8 window");
+    let unset = estimate(weight_mib, None).expect("unset");
+    let int8 = estimate(weight_mib, Some(KvFormat::Int8)).expect("int8");
+    let bf16 = estimate(weight_mib, Some(KvFormat::Bf16)).expect("bf16");
+    std::fs::remove_dir_all(&target).unwrap();
+    eprintln!(
+        "122B at {weight_mib} MiB of weights, 96 GiB working set: unset {unset:?}, int8 {int8:?}, \
+         bf16 {bf16:?}"
+    );
+    assert_eq!(weight_mib, 77_750);
+    assert_eq!(unset, int8);
+    assert_eq!(
+        (int8.window_tokens, int8.bound.as_str()),
+        (262_137, "memory")
+    );
+    assert_eq!(
+        (bf16.window_tokens, bf16.bound.as_str()),
+        (118_393, "memory")
+    );
 }

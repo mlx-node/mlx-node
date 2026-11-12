@@ -522,28 +522,40 @@ fn int8_routes_are_counted() -> Result<()> {
     Ok(())
 }
 
-/// A production-geometry attention layer (24 x 4 and 16 x 2 heads, D = 256)
-/// over an int8 cache against the same layer over a BF16 cache: a prefill
-/// chunk, a second chunk (dequantized prefix + fresh rows), decode rows (the
-/// int8 decode kernel) and verify blocks (the int8 block kernels). The
-/// outputs stay within the quantization noise of each other, the decode and
-/// verify rows reach the int8 kernels, and the int8 cache holds exactly the
-/// quantized rows.
+/// A production-geometry attention layer (24 x 4, 16 x 2 and the 122B's
+/// 32 x 2 heads, D = 256) over an int8 cache against the same layer over a
+/// BF16 cache: a prefill chunk, a second chunk (dequantized prefix + fresh
+/// rows), decode rows (the int8 decode kernel) and verify blocks of 8 and 5
+/// rows. The outputs stay within the quantization noise of each other, and
+/// the int8 cache holds exactly the quantized rows. Through gqa 8 the decode
+/// and verify rows reach the int8 kernels; at gqa 16 only the decode rows
+/// do: the 8- and 5-row blocks, which the segmented kernels cannot split
+/// there, read the dequantized cache rows through MLX's SDPA.
 /// Mutation: narrow the gqa bound in `forward_int8_cached` to `1..=6` → red
 /// (16 x 2 dequantizes, int8 kernel count 0; the tolerance alone stays green).
+/// Mutation: `forward_int8_cached` ignores `segmented_int8_covers` → red
+/// (32 x 2 "verify 8": "unsupported segmented SDPA verify block").
 #[test]
 #[cfg(target_os = "macos")]
 fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache() -> Result<()> {
     if !metal() {
         return Ok(());
     }
-    for (h, kv) in [(24_i64, 4_i64), (16, 2)] {
-        eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(h, kv)?;
+    for (h, kv, int8_reads) in [
+        (24_i64, 4_i64, 6..u64::MAX),
+        (16, 2, 6..u64::MAX),
+        (32, 2, 3..4),
+    ] {
+        eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(h, kv, int8_reads)?;
     }
     Ok(())
 }
 
-fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(h: i64, kv: i64) -> Result<()> {
+fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(
+    h: i64,
+    kv: i64,
+    expected_int8_reads: std::ops::Range<u64>,
+) -> Result<()> {
     seed_rng(0x1A7_0005);
     let cfg = Qwen3_5Config {
         hidden_size: 64,
@@ -656,8 +668,9 @@ fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(h: i64, kv: i64) ->
     unsafe { mlx_sys::mlx_test_kquant_counting(false) };
     reads?;
     assert!(
-        int8_reads >= 6,
-        "{h}x{kv}: {int8_reads} int8 kernel reads for 3 decode rows and 3 verify blocks"
+        expected_int8_reads.contains(&int8_reads),
+        "{h}x{kv}: {int8_reads} int8 kernel reads for 3 decode rows and 3 verify blocks, \
+         expected {expected_int8_reads:?}"
     );
     assert_eq!(int8.format(), KvFormat::Int8);
     let view = int8.int8_view().expect("int8 cache allocated");
@@ -667,30 +680,135 @@ fn eager_forward_over_an_int8_cache_tracks_the_bf16_cache_at(h: i64, kv: i64) ->
     Ok(())
 }
 
-/// Gate: the static GQA bound of `KvFormat::default_for_geometry` (int8 only
-/// at gqa <= 8) matches this device's int8 verify: an 8-row block splits into
-/// chunks of at most 4 rows at gqa 8, and cannot at gqa 16.
-/// Mutation: widen the bound in `default_for_geometry` to `1..=16` → red
-/// (gqa 16 defaults to int8), as is `kv_format_default_needs_an_int8_verify_kernel`.
+/// A gqa-16 flat int8 verify block (32 x 2 heads, D 256) of 4..=8 rows
+/// against the same rows fed one at a time through the 1-row int8 decode
+/// kernel over an equal cache: every row reads the same int8 rows, its own
+/// and the earlier block rows included (4 rows take the segmented kernel,
+/// 5..=8 the dequantizing reader). Random rows agree within reduction noise;
+/// zero queries over one zero prefix row and fresh V rows `[127, 0.5, 0..]`
+/// (the int8 store rounds 0.5 away) agree to the BF16 ulp, where a reader of
+/// the BF16 fresh rows outputs at least 0.25 in the second component.
+/// Mutation: `forward_int8_cached` concatenates the BF16 fresh rows onto the
+/// dequantized prefix for a 5..=8-row block → red.
 #[test]
 #[cfg(target_os = "macos")]
-fn int8_verify_chunks_bound_the_default_gqa() -> Result<()> {
+fn flat_int8_verify_at_gqa_16_reads_like_sequential_int8_decode() -> Result<()> {
+    if !metal() {
+        return Ok(());
+    }
+    seed_rng(0x1A7_0016);
+    let (h, kv, d) = (32_i64, 2_i64, D as i64);
+    let cfg = Qwen3_5Config {
+        hidden_size: 64,
+        num_heads: h as i32,
+        num_kv_heads: kv as i32,
+        head_dim: 256,
+        partial_rotary_factor: 0.25,
+        ..super::tests::tiny_cfg()
+    };
+    let attn = Qwen3_5Attention::new(&cfg)?;
+
+    // Per-row arrays so the decode inputs are contiguous, not slices.
+    let run = |prefix: (&MxArray, &MxArray),
+               q: &[MxArray],
+               k: &[MxArray],
+               v: &[MxArray]|
+     -> Result<(Vec<f32>, Vec<f32>)> {
+        let rows = q.len() as i64;
+        let mut block = KVCache::with_format(KvFormat::Int8);
+        let mut sequential = KVCache::with_format(KvFormat::Int8);
+        block.update_and_fetch_int8(prefix.0, prefix.1)?;
+        sequential.update_and_fetch_int8(prefix.0, prefix.1)?;
+        let cat = |rows: &[MxArray]| MxArray::concatenate_many(rows.iter().collect(), Some(2));
+        let verify =
+            attn.forward_int8_cached(&cat(q)?, &cat(k)?, &cat(v)?, None, &mut block, rows)?;
+        let mut decoded = Vec::new();
+        for r in 0..q.len() {
+            decoded.push(attn.forward_int8_cached(
+                &q[r],
+                &k[r],
+                &v[r],
+                None,
+                &mut sequential,
+                1,
+            )?);
+        }
+        let decoded = MxArray::concatenate_many(decoded.iter().collect(), Some(2))?;
+        Ok((f32s(&verify), f32s(&decoded)))
+    };
+
+    for rows in 4..=8_usize {
+        let zero_row_k = normal(&[1, kv, 1, d], 0.0, 1.0);
+        let zero_row_v = MxArray::zeros(&[1, kv, 1, d], Some(DType::BFloat16))?;
+        let mut fresh = vec![0f32; D];
+        fresh[0] = 127.0;
+        fresh[1] = 0.5;
+        let fresh: Vec<f32> = fresh.repeat(kv as usize);
+        let fresh_v = MxArray::from_float32(&fresh, &[1, kv, 1, d])?.astype(DType::BFloat16)?;
+        let q: Vec<_> = (0..rows)
+            .map(|_| MxArray::zeros(&[1, h, 1, d], Some(DType::BFloat16)))
+            .collect::<Result<_>>()?;
+        let k: Vec<_> = (0..rows)
+            .map(|_| normal(&[1, kv, 1, d], 0.0, 1.0))
+            .collect();
+        let v: Vec<_> = (0..rows).map(|_| fresh_v.clone()).collect();
+        let (verify, decoded) = run((&zero_row_k, &zero_row_v), &q, &k, &v)?;
+        for (i, (a, b)) in verify.iter().zip(&decoded).enumerate() {
+            assert!(
+                (a - b).abs() <= bf16_ulp(a.abs().max(b.abs())),
+                "32x2 verify {rows}, row {}, component {}: verify {a} vs decode {b}",
+                (i / D) % rows,
+                i % D
+            );
+        }
+
+        let prefix_k = normal(&[1, kv, 64, d], 0.0, 1.0);
+        let prefix_v = normal(&[1, kv, 64, d], 0.0, 1.0);
+        let q: Vec<_> = (0..rows).map(|_| normal(&[1, h, 1, d], 0.0, 1.0)).collect();
+        let k: Vec<_> = (0..rows)
+            .map(|_| normal(&[1, kv, 1, d], 0.0, 1.0))
+            .collect();
+        let v: Vec<_> = (0..rows)
+            .map(|_| normal(&[1, kv, 1, d], 0.0, 1.0))
+            .collect();
+        let (verify, decoded) = run((&prefix_k, &prefix_v), &q, &k, &v)?;
+        let (max, mean) = error_ulps(&verify, &decoded);
+        eprintln!(
+            "32x2 verify {rows} vs sequential decode: max {max} / mean {mean:.4} BF16 ulps of output magnitude"
+        );
+        assert!(max <= 4.0, "32x2 verify {rows}: max {max} BF16 ulps");
+    }
+    Ok(())
+}
+
+/// Gate: the segmented int8 route splits every block of up to 8 rows through
+/// gqa 8 (the widest query chunk is at least 4 rows, so `segmented_int8_covers`
+/// keeps every flat read there on the segmented kernels), and cannot at gqa
+/// 16 (widest chunk 2 rows): there the C ABI refuses an 8-row block, which
+/// `forward_int8_cached` routes to the dequantizing reader instead.
+#[test]
+#[cfg(target_os = "macos")]
+fn flat_int8_split_covers_every_block_through_gqa_8() -> Result<()> {
     if !metal() {
         return Ok(());
     }
     // SAFETY: a pure query of the loaded metallib's pipeline limits.
     let max_q = |gqa| unsafe { mlx_sys::mlx_segmented_sdpa_max_query_length(gqa) };
-    assert!(max_q(8) >= 4);
-    assert!(max_q(16) < 4);
-    assert_eq!(
-        KvFormat::default_for_geometry(256, 16, 2, DType::BFloat16),
-        KvFormat::Int8,
-        "gqa 8"
-    );
-    assert_eq!(
-        KvFormat::default_for_geometry(256, 32, 2, DType::BFloat16),
-        KvFormat::Bf16,
-        "gqa 16"
+    for gqa in 1..=8 {
+        assert!(max_q(gqa) >= 4, "gqa {gqa}: widest chunk {}", max_q(gqa));
+        for rows in 1..=8 {
+            assert!(crate::array::kv_int8::segmented_int8_covers(
+                rows, gqa as i64
+            ));
+        }
+    }
+    assert!(max_q(16) < 4, "gqa 16: widest chunk {}", max_q(16));
+    assert!(crate::array::kv_int8::segmented_int8_covers(4, 16));
+    assert!(!crate::array::kv_int8::segmented_int8_covers(5, 16));
+    let wide = make_case(32, 2, 8, 64, 1.0, 1.0);
+    assert!(
+        segmented_sdpa_int8(&wide.q, &wide.prefix, &wide.new, SCALE, true).is_err(),
+        "32 x 2: an 8-row block must be refused by the segmented kernels"
     );
     Ok(())
 }

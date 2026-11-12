@@ -376,9 +376,9 @@ teacher at 8 x 8,192 tokens (tail = positions past the first 2,048-token
 chunk, the ones that read int8): Qwen3.6-35B-A3B tail KL 0.0062, top-1
 0.9699 (raw 0.0047 / 0.9775); Qwen3.8-27B not measured (details in
 [docs/research/splash-qwen35-moe.md](research/splash-qwen35-moe.md#int8-kv-default)).
-DFlash2 acceptance on 35B is not measured. Geometries the int8 kernels do not
-serve default to `bf16`: Qwen3.6-122B (32 x 2 heads) defaults to bf16 because
-the int8 verify cannot split an 8-row block at gqa 16. An f16-compute checkpoint
+DFlash2 acceptance on 35B is not measured. Qwen3.6-122B (32 x 2 heads) defaults
+to int8 pages like the 27B and 35B (its teacher-forced numbers are not measured
+yet). Geometries the int8 kernels do not serve default to `bf16`: an f16-compute checkpoint
 (`mlx convert --dtype float16`) also defaults to bf16 K/V: the int8 kernels take
 BF16 queries. The option sets the block-paged pool (and the flat cache of a
 load without one); an explicit `int8` the kernels cannot serve fails the load.

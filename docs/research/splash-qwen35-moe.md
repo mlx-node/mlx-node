@@ -96,8 +96,8 @@
 ## Int8 K/V default
 
 The flat full-attention K/V of `qwen3_5_moe` now takes the same geometry
-default as dense `qwen3_5`: int8 on Metal at head 256 when the GQA factor is at
-most 8 and compute is BF16, BF16 elsewhere. The old MoE-only BF16 override in
+default as dense `qwen3_5`: int8 on Metal at head 256 when compute is BF16,
+BF16 elsewhere. The old MoE-only BF16 override in
 `Qwen3_5MoeConfig::to_dense_config` is gone. `kvFormat: 'bf16'` (load option,
 `--kv-format bf16`, or a top-level `kv_format` key in `config.json`) opts out.
 MTP and DFlash2 draft K/V stay BF16, and the block-paged pool stays BF16.
@@ -118,29 +118,28 @@ Which models change:
 | --------------------- | ------------------ | --- | ------------------- |
 | Qwen3.8-27B (dense)   | 24 / 4, 256        | 6   | int8 (unchanged)    |
 | Qwen3.6-35B-A3B (MoE) | 16 / 2, 256        | 8   | **int8 (was BF16)** |
-| Qwen3.6-122B (MoE)    | 32 / 2, 256        | 16  | BF16 (gap below)    |
+| Qwen3.6-122B (MoE)    | 32 / 2, 256        | 16  | **int8 (was BF16)** |
 
-### Gap: no gqa-16 int8 verify (122B stays BF16)
+### 122B: int8 pages
 
-Splash serves 32/2/256 with its own `_kv2_g16` kernel. mlx-node's int8
-segmented SDPA has none that serves a wide verify block at gqa 16:
+Splash serves 32/2/256 with its own `_kv2_g16` split kernel (two tile parts of
+4 rows x 16 heads, `SPLASH_ATTENTION_TILE_PARTS`). mlx-node's paged int8 reads
+(decode, varlen verify / prefill) run one threadgroup per query head and map
+query head h to KV head h / gqa at any gqa, so they serve 32/2 as they are.
+
+The flat int8 segmented route still cannot split a 5..8-row block at gqa 16:
 
 ```
 two-pass stage 1 = 32 x gqa x rows threads <= 1024
 gqa 8  -> widest chunk 4 rows -> 8-row verify = 4 + 4   ok
 gqa 16 -> widest chunk 2 rows -> 3-4 rows split ok,
                                  5-8 rows: segmented_verify_head_rows = -1
-          bf16 verify: falls back (segmented_verify_head_len is None)
-          int8 verify: calls segmented_sdpa_int8 with no fallback
-                       -> "unsupported segmented SDPA verify block"
 ```
 
-So at gqa 16 every flat int8 verify block of 5 to 8 rows (MTP depth >= 4,
-DFlash2's 8 rows) would be an error. `KvFormat::default_for_geometry` adds the
-GQA bound (1..=8), and 122B stays BF16 by default. Lift: a gqa-16 int8 verify
-kernel (Splash `_kv2_g16`). The bound is the two-pass pipeline's
-`max_threads_per_threadgroup`; the unit test
-`int8_verify_chunks_bound_the_default_gqa` pins it on the test device only.
+`forward_int8_cached` takes the segmented route only for a block it covers
+(`rows <= 2 x max_q`); a wider flat block (no-pool MTP depth >= 4, a chunked
+prefill tail) reads the int8 prefix through dequantize + fused SDPA, as every
+prefill chunk does. Splash has no flat lane.
 
 ### BF16 compute only (an f16 checkpoint stays BF16)
 
@@ -232,7 +231,7 @@ Gaps:
 - `mlx eval cache` has no format flag and uses the load default, so on
   head-256 Qwen a teacher past 2,048 tokens is int8 K/V unless the checkpoint
   config says `bf16`.
-- 122B stays BF16 (above).
+- 122B defaults to int8 (above).
 
 ## Correctness and current validation
 

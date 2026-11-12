@@ -109,7 +109,7 @@ rather than accepting an arbitrary client-selected namespace.
 On qwen3_5 / qwen3_5_moe the pool's K/V format follows `kvFormat` (Splash
 `--kv-format`): `int8` pages hold int8 rows with one f32 scale per token, head
 and side, `bf16` pages hold bf16 rows. Unset is int8 where the int8 kernels
-serve the model (head 256, GQA up to 8, BF16 compute, 16- or 32-token blocks),
+serve the model (head 256, BF16 compute, 16- or 32-token blocks),
 else bf16; an explicit `int8` the kernels cannot serve (head not 128 / 256,
 another block size, f16 compute) fails the load. The cold tier stores an int8
 block with its scales (`K | K scales | V | V scales` per layer, Splash slot

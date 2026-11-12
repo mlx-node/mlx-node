@@ -5256,8 +5256,8 @@ export interface Qwen35Config {
    * the flat cache's: `"int8"` (per-(token, head) symmetric int8 rows
    * with one fp32 scale each — half the K/V memory and read bandwidth;
    * see `crate::array::kv_int8`) or `"bf16"`. Unset: int8 where the int8
-   * kernels serve the model (Metal, head 256, GQA up to 8, BF16 compute,
-   * a 16- or 32-token paged block), else BF16 — see `kv_format_for()`.
+   * kernels serve the model (Metal, head 256, BF16 compute, a 16- or
+   * 32-token paged block), else BF16 — see `kv_format_for()`.
    * Set from the `kvFormat` load option; never saved (a runtime option,
    * like Splash `--kv-format`).
    */
@@ -5332,7 +5332,7 @@ export interface Qwen35LoadOptions {
    * fp32 scale each — half the K/V memory and read bandwidth) or
    * `'bf16'`. When neither this option nor checkpoint config specifies a
    * format, dense and MoE Qwen default to int8 on Metal with 256-wide
-   * heads, GQA up to 8, BF16 compute and a 16- or 32-token paged block,
+   * heads, BF16 compute and a 16- or 32-token paged block,
    * BF16 elsewhere (an f16 checkpoint keeps BF16 K/V). An int8 pool needs
    * head 128 or 256, a 16- or 32-token block and BF16 compute, else the
    * load fails.
@@ -5447,9 +5447,9 @@ export interface Qwen35MoeConfig {
   /**
    * Full-attention K/V format of the block-paged pool and the flat
    * cache, `int8` or `bf16`. Unset: the default of
-   * `Qwen3_5Config::kv_format_for` (int8 on Metal at head 256 when the
-   * GQA factor is at most 8, compute is BF16 and a paged block is 16 or
-   * 32 tokens, else BF16). Never saved (a runtime option, like Splash
+   * `Qwen3_5Config::kv_format_for` (int8 on Metal at head 256 when
+   * compute is BF16 and a paged block is 16 or 32 tokens, else BF16).
+   * Never saved (a runtime option, like Splash
    * `--kv-format`).
    */
   kvFormat?: string | undefined;
