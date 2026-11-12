@@ -27,8 +27,8 @@ use crate::models::quant_dispatch::{
     normalize_per_layer_key, parse_quant_settings, resolve_default_mode, select_quantization_block,
 };
 use crate::models::qwen3_5::persistence::{
-    MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes,
-    embedding_compute_dtype,
+    MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes, compute_dtype_of,
+    embedding_compute_dtype, params_dtype,
 };
 use crate::nn::Linear;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -55,7 +55,7 @@ use crate::models::quantized_linear::{
 };
 
 /// Sanitize weights from HuggingFace format.
-fn sanitize_weights(
+pub(crate) fn sanitize_weights(
     mut params: HashMap<String, MxArray>,
     config: &Qwen3_5MoeConfig,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
@@ -438,6 +438,42 @@ fn normalize_moe_weight_map(
     }
 
     Ok(result)
+}
+
+/// The keys [`normalize_moe_weight_map`] gives the renamed `mtp.*` key `name`,
+/// from the name alone: per-expert tensors stack into `switch_mlp`, a fused
+/// `experts.gate_up_proj` splits into gate and up, `experts.down_proj` moves
+/// to `switch_mlp`. `has_individual_experts` is `sanitize_weights`' flag.
+pub(crate) fn mtp_expert_keys(name: &str, has_individual_experts: bool) -> Vec<String> {
+    let Some((prefix, rest)) = name
+        .split_once(".mlp.experts.")
+        .filter(|_| name.starts_with("mtp."))
+    else {
+        return vec![name.to_string()];
+    };
+    let tensor = |base: &str| {
+        let suffix = if name.ends_with(".scales") {
+            "scales"
+        } else if name.ends_with(".biases") {
+            "biases"
+        } else {
+            "weight"
+        };
+        format!("{prefix}.mlp.switch_mlp.{base}.{suffix}")
+    };
+    let mut parts = rest.split('.');
+    if has_individual_experts
+        && let (Some(_), Some(proj), Some(_)) = (parts.next(), parts.next(), parts.next())
+    {
+        return vec![tensor(proj)];
+    }
+    if rest.starts_with("gate_up_proj") {
+        return vec![tensor("gate_proj"), tensor("up_proj")];
+    }
+    if rest.starts_with("down_proj") {
+        return vec![tensor("down_proj")];
+    }
+    vec![name.to_string()]
 }
 
 pub(crate) fn try_build_quantized_switch_linear(
@@ -1686,10 +1722,42 @@ fn declared_residual_dtype(raw: &Value) -> Option<DType> {
 /// The declared dtype is only the fallback for a config that declares
 /// nothing — the GGUF-synthesized standalone config.
 fn residual_stream_dtype(raw: &Value, params: &HashMap<String, MxArray>) -> Option<DType> {
+    residual_dtype_of(raw, &params_dtype(params))
+}
+
+/// [`residual_stream_dtype`] over `dtype_of`, a sanitized key's dtype.
+fn residual_dtype_of(raw: &Value, dtype_of: &dyn Fn(&str) -> Option<DType>) -> Option<DType> {
     ["layers.0.input_layernorm.weight", "final_norm.weight"]
         .iter()
-        .find_map(|key| params.get(*key).and_then(|w| w.dtype().ok()))
+        .find_map(|key| dtype_of(key))
         .or_else(|| declared_residual_dtype(raw))
+}
+
+/// The dtype [`align_affine_embedding_dtype`] casts the embedding sidecars
+/// to, `None` when it leaves them alone.
+fn affine_embedding_cast(
+    dtype_of: &dyn Fn(&str) -> Option<DType>,
+    target: Option<DType>,
+) -> Option<DType> {
+    let target = target.filter(|t| matches!(t, DType::BFloat16 | DType::Float16))?;
+    for suffix in ["scales", "biases"] {
+        if dtype_of(&format!("embedding.{suffix}"))
+            .is_some_and(|dtype| !matches!(dtype, DType::Float16 | DType::Float32))
+        {
+            return None;
+        }
+    }
+    (dtype_of("embedding.scales")? != target).then_some(target)
+}
+
+/// The compute dtype `settle_compute_dtype` leaves the load with, over
+/// `dtype_of`, a sanitized key's dtype before the alignment.
+pub(crate) fn settled_compute_dtype(
+    raw: &Value,
+    dtype_of: &dyn Fn(&str) -> Option<DType>,
+) -> DType {
+    affine_embedding_cast(dtype_of, residual_dtype_of(raw, dtype_of))
+        .unwrap_or_else(|| compute_dtype_of(dtype_of))
 }
 
 /// Normalize an imported affine embedding group to the checkpoint's dtype.
@@ -1710,25 +1778,9 @@ fn align_affine_embedding_dtype(
     params: &mut HashMap<String, MxArray>,
     target: Option<DType>,
 ) -> Result<bool> {
-    let Some(target) = target.filter(|t| matches!(t, DType::BFloat16 | DType::Float16)) else {
+    let Some(target) = affine_embedding_cast(&params_dtype(params), target) else {
         return Ok(false);
     };
-    for suffix in ["scales", "biases"] {
-        let key = format!("embedding.{suffix}");
-        let Some(sidecar) = params.get(&key).cloned() else {
-            continue;
-        };
-        if !matches!(sidecar.dtype()?, DType::Float16 | DType::Float32) {
-            return Ok(false);
-        }
-    }
-    let Some(scales) = params.get("embedding.scales").cloned() else {
-        return Ok(false);
-    };
-    if scales.dtype()? == target {
-        return Ok(false);
-    }
-
     for suffix in ["scales", "biases"] {
         let key = format!("embedding.{suffix}");
         if let Some(sidecar) = params.get(&key).cloned() {
@@ -2779,9 +2831,10 @@ mod tests {
             assert_eq!(explicit.kv_format(), format);
             assert_eq!(explicit.kv_format_for(DType::Float16), format);
             assert_eq!(explicit.to_dense_config().kv_format(), format);
+            // A runtime option, never saved (Splash `--kv-format`).
             let restored: Qwen3_5MoeConfig =
                 serde_json::from_value(serde_json::to_value(&explicit).unwrap()).unwrap();
-            assert_eq!(restored.kv_format(), format);
+            assert_eq!(restored.kv_format, None);
         }
     }
 

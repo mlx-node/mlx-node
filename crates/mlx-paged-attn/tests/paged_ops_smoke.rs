@@ -12,11 +12,7 @@
 //!    the inner trace function runs ONCE across two same-shape calls
 //!    (i.e., the second call hits the compile cache). Implemented via
 //!    a C++ FFI helper that exposes a static atomic trace counter.
-//! 3. **FP8 scale plumbing** — runs a real FP8 kernel dispatch with
-//!    non-default `k_scale`/`v_scale` and reads the resulting FP8
-//!    bytes back to confirm scales propagated to the kernel (instead
-//!    of being silently dropped). Also keeps the kernel-name
-//!    selection sanity test as supplementary coverage.
+//! 3. **Retired kv_dtype code** — code 2 (paged FP8) is refused.
 //! 4. **`is_equivalent` correctness** — instantiate two
 //!    `PagedKVWrite` primitives via the C++ FFI helper and assert
 //!    `is_equivalent` correctly distinguishes equal vs. differing
@@ -227,8 +223,6 @@ fn round_trip_k_v_through_shim() {
             block_size,
             x as i32,
             0, // KvDtypeC::Fp16
-            1.0,
-            1.0,
         )
     };
     assert_eq!(rc, 0, "shim dispatch must succeed (rc=0)");
@@ -309,342 +303,29 @@ fn round_trip_k_v_through_shim() {
 }
 
 // =============================================================================
-// Test 3: FP8 scale plumbing
+// Test 3: retired kv_dtype code
 //
-// We can't easily round-trip FP8 (E4M3 dequant requires the kernel
-// scale machinery and reading host-side FP8 bytes is value-dependent).
-// Instead, this test asserts:
-//   a) The shim REJECTS an x_pack disagreement for FP8 (`x_pack=8`
-//      with `KvDtypeC::Fp8` should error since Fp8 expects x=16).
-//   b) The shim ACCEPTS the correct (FP8, x_pack=16) combo and would
-//      route to the FP8 kernel name. We don't actually fire the
-//      kernel because that requires real quantization-aware K/V; the
-//      kernel-name routing is verified in `state.rs`'s own tests
-//      (`reshape_and_cache_kernel_name` returns the `_fp8` variant
-//      for `(*, UChar)`).
-//
-// This is a "plumbing" test, not an end-to-end FP8 dispatch — we only
-// need the param to flow through correctly.
+// Code 2 was paged FP8. Splash `kv::Format` has Int8 and BFloat16 only, so
+// the C ABI refuses 2 like any unknown code instead of misrouting it.
 // =============================================================================
 
 #[test]
-fn fp8_scale_plumbing_rejects_wrong_x_pack() {
-    // Use dummy non-null pointers; the shim's validation should
-    // reject before it dereferences them.
+fn retired_kv_dtype_code_is_refused() {
+    let threw = unsafe { mlx_sys::mlx_paged_kv_dtype_refuses_retired_code() };
+    assert_eq!(threw, 1, "kv_dtype code 2 must be refused (got {threw})");
     let dummy: *mut c_void = std::ptr::dangling_mut::<c_void>();
-
-    // FP8 with x_pack = 8 is a contradiction (FP8 requires x=16).
     let rc = unsafe {
         mlx_paged_attn_reshape_and_cache_dispatch(
-            dummy, dummy, dummy, 0, dummy, 0, dummy, 0, 1, 4, 64, 16, /*x_pack=*/ 8,
-            /*kv_dtype=Fp8*/ 2, 0.5, 0.25,
-        )
-    };
-    assert_eq!(rc, -1, "FP8 with x_pack=8 must be rejected");
-
-    // Bf16 with x_pack = 16 is the inverse contradiction.
-    let rc2 = unsafe {
-        mlx_paged_attn_reshape_and_cache_dispatch(
             dummy, dummy, dummy, 0, dummy, 0, dummy, 0, 1, 4, 64, 16, /*x_pack=*/ 16,
-            /*kv_dtype=Bf16*/ 1, 1.0, 1.0,
+            /*kv_dtype=*/ 2,
         )
     };
-    assert_eq!(rc2, -1, "Bf16 with x_pack=16 must be rejected");
-}
-
-/// Verifies the FP8 kernel-name selection logic that `MetalState`
-/// drives — combined with the shim's strict `(kv_dtype, x_pack)`
-/// pairing check, this proves the FP8 dispatch path is wired through
-/// to the correct Metal kernel instantiation.
-///
-/// Supplementary to `fp8_dispatch_uses_runtime_scales` below — this
-/// kernel-name test catches a regression where the kernel suffix is
-/// wired wrong, while the dispatch test catches a regression where
-/// the suffix is right but the scales drop on the floor.
-#[test]
-fn fp8_kernel_name_selected_for_fp8_dtype() {
-    use mlx_paged_attn::metal::MetalDtype;
-
-    // Non-FP8 → name has no `_fp8` suffix.
-    let bf16 = MetalState::reshape_and_cache_kernel_name(
-        MetalDtype::BFloat16,
-        MetalDtype::BFloat16,
-        false,
-    );
-    assert!(!bf16.contains("_fp8"));
-    assert!(bf16.contains("bfloat16_t"));
-
-    // FP8 cache → name has `_fp8` suffix.
-    let fp8 =
-        MetalState::reshape_and_cache_kernel_name(MetalDtype::BFloat16, MetalDtype::UChar, true);
-    assert!(fp8.ends_with("_fp8"));
-    assert!(fp8.contains("uchar"));
-}
-
-/// Convert a positive single-precision float to its FP8 E4M3 byte
-/// representation. Mirrors `metal/float8.metal::float_to_fp8_e4m3`
-/// closely enough for the values used in this test (round to nearest
-/// even, no NaN/Inf paths needed).
-fn f32_to_fp8_e4m3_byte(f: f32) -> u8 {
-    if f == 0.0 {
-        return 0;
-    }
-    let bits = f.to_bits();
-    let sign = (bits >> 31) & 1;
-    let abs = bits & 0x7fff_ffff;
-    if abs >= 0x7f80_0000 {
-        // Inf / NaN — mirror metal saturate behavior.
-        let mant = if abs != 0x7f80_0000 { 1 } else { 0 };
-        return ((sign << 7) | (0xf << 3) | mant) as u8;
-    }
-    let e = (((abs >> 23) & 0xff) as i32) - 127;
-    let m = abs & 0x7f_ffff;
-    const EXP_BITS: i32 = 4;
-    const MAN_BITS: i32 = 3;
-    const BIAS: i32 = 7;
-    const EXP_MAX: i32 = (1 << EXP_BITS) - 2; // 14
-    let e_fp8 = e + BIAS;
-    if (1..=EXP_MAX).contains(&e_fp8) {
-        let shift = 23 - MAN_BITS; // 20
-        let mut mant = m >> shift;
-        let lsb = mant & 1;
-        let round = (m >> (shift - 1)) & 1;
-        let sticky = u32::from((m & ((1u32 << (shift - 1)) - 1)) != 0);
-        mant += round & (sticky | lsb);
-        if mant >> MAN_BITS != 0 {
-            // mantissa overflow
-            let e2 = e_fp8 + 1;
-            if e2 > EXP_MAX {
-                return ((sign << 7) | (((1u32 << EXP_BITS) - 1) << MAN_BITS)) as u8;
-            }
-            return ((sign << 7) | ((e2 as u32) << MAN_BITS)) as u8;
-        }
-        return ((sign << 7) | ((e_fp8 as u32) << MAN_BITS) | (mant & ((1u32 << MAN_BITS) - 1)))
-            as u8;
-    }
-    if e_fp8 < 1 - MAN_BITS {
-        return (sign << 7) as u8;
-    }
-    // sub-normal
-    let rshift = (1 - e_fp8) + (23 - MAN_BITS);
-    let mant_full = 0x80_0000 | m;
-    let rounded = (mant_full + (1 << (rshift - 1))) >> rshift;
-    if rounded == 0 {
-        return (sign << 7) as u8;
-    }
-    ((sign << 7) | (rounded & ((1u32 << MAN_BITS) - 1))) as u8
+    assert_eq!(rc, -1, "the Rust shim must refuse kv_dtype code 2");
 }
 
 /// Convert f32 to bf16 (truncation — drops 16 LSBs).
 fn f32_to_bf16_bits(x: f32) -> u16 {
     (x.to_bits() >> 16) as u16
-}
-
-/// Real FP8 kernel dispatch with non-default scales.
-///
-/// Writes K=0.5 BF16, V=0.25 BF16 with `k_scale=0.5`, `v_scale=0.25`.
-/// The kernel computes `to_fp8(K / k_scale) = to_fp8(1.0) = 0x38`
-/// (E4M3, exp=7, mant=0). If the shim silently dropped the scales
-/// (i.e., used 1.0), the cache would hold `to_fp8(0.5)` (= 0x30) for
-/// K and `to_fp8(0.25)` (= 0x28) for V — distinct bytes. Reading the
-/// cache bytes back distinguishes the two cases.
-///
-/// This is the canonical "did the scale plumbing actually work?"
-/// observability test.
-#[test]
-fn fp8_dispatch_uses_runtime_scales() {
-    let state = match MetalState::get() {
-        Ok(s) => s,
-        Err(e) if e.contains("No Metal device found") => {
-            eprintln!("skipping fp8_dispatch_uses_runtime_scales: {e}");
-            return;
-        }
-        Err(e) => panic!("unexpected MetalState::get failure: {e}"),
-    };
-
-    // Pool config: 4 blocks, 4 KV heads, head_size 64, block_size 16,
-    // FP8 → x = 16. element_size = 1 byte (FP8 is `uchar` on cache).
-    let num_blocks: u32 = 4;
-    let num_kv_heads: u32 = 4;
-    let head_size: u32 = 64;
-    let block_size: u32 = 16;
-    let x: u32 = 16;
-    let cache_element_size: u64 = 1; // FP8 is 1 byte
-
-    let key_cache_size = (num_blocks as u64)
-        * (num_kv_heads as u64)
-        * (head_size as u64 / x as u64)
-        * (block_size as u64)
-        * (x as u64)
-        * cache_element_size;
-    let value_cache_size = (num_blocks as u64)
-        * (num_kv_heads as u64)
-        * (head_size as u64)
-        * (block_size as u64)
-        * cache_element_size;
-
-    let key_pool = state
-        .device
-        .try_new_buffer(key_cache_size, MTLResourceOptions::StorageModeShared)
-        .expect("test buffer allocation must succeed");
-    let value_pool = state
-        .device
-        .try_new_buffer(value_cache_size, MTLResourceOptions::StorageModeShared)
-        .expect("test buffer allocation must succeed");
-
-    // Mark every cache byte with a sentinel (0xff) so we can tell
-    // which slots actually got written.
-    unsafe {
-        std::ptr::write_bytes(
-            key_pool.contents() as *mut u8,
-            0xff,
-            key_cache_size as usize,
-        );
-        std::ptr::write_bytes(
-            value_pool.contents() as *mut u8,
-            0xff,
-            value_cache_size as usize,
-        );
-    }
-
-    // 2 tokens of synthetic data — uniform K=0.5, V=0.25.
-    let num_tokens: u32 = 2;
-    let tokens_size_elements =
-        (num_tokens as usize) * (num_kv_heads as usize) * (head_size as usize);
-    let k_value_f32: f32 = 0.5;
-    let v_value_f32: f32 = 0.25;
-    let k_bf16 = f32_to_bf16_bits(k_value_f32);
-    let v_bf16 = f32_to_bf16_bits(v_value_f32);
-    let new_k_host: Vec<u16> = vec![k_bf16; tokens_size_elements];
-    let new_v_host: Vec<u16> = vec![v_bf16; tokens_size_elements];
-
-    let new_k = state
-        .device
-        .try_new_buffer_with_slice(new_k_host.as_slice(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let new_v = state
-        .device
-        .try_new_buffer_with_slice(new_v_host.as_slice(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-
-    // Slot mapping: token 0 → slot 0, token 1 → slot 1 (block 0,
-    // positions 0/1).
-    let slot_mapping_host: Vec<i64> = vec![0, 1];
-    let slot_mapping = state
-        .device
-        .try_new_buffer_with_slice(
-            slot_mapping_host.as_ref(),
-            MTLResourceOptions::StorageModeShared,
-        )
-        .expect("test buffer-with-slice allocation must succeed");
-
-    // Non-default scales chosen so K/k_scale = V/v_scale = 1.0.
-    let k_scale: f32 = 0.5;
-    let v_scale: f32 = 0.25;
-
-    // Dispatch with FP8 + x=16 + non-default scales.
-    let rc = unsafe {
-        mlx_paged_attn_reshape_and_cache_dispatch(
-            key_pool.as_ptr() as *mut c_void,
-            value_pool.as_ptr() as *mut c_void,
-            new_k.as_ptr() as *mut c_void,
-            0,
-            new_v.as_ptr() as *mut c_void,
-            0,
-            slot_mapping.as_ptr() as *mut c_void,
-            0,
-            num_tokens,
-            num_kv_heads,
-            head_size,
-            block_size,
-            x as i32,
-            2, // KvDtypeC::Fp8
-            k_scale,
-            v_scale,
-        )
-    };
-    assert_eq!(rc, 0, "FP8 dispatch must succeed (rc={rc})");
-
-    // Read the FP8 bytes back. Expected:
-    //   to_fp8_e4m3(K / k_scale) = to_fp8_e4m3(0.5/0.5) = to_fp8_e4m3(1.0)
-    //   to_fp8_e4m3(V / v_scale) = to_fp8_e4m3(0.25/0.25) = to_fp8_e4m3(1.0)
-    // If the scales were dropped (treated as 1.0):
-    //   K_bytes would equal to_fp8_e4m3(0.5) = 0x30 (NOT 0x38).
-    //   V_bytes would equal to_fp8_e4m3(0.25) = 0x28 (NOT 0x38).
-    let expected_k_byte = f32_to_fp8_e4m3_byte(1.0);
-    let expected_v_byte = f32_to_fp8_e4m3_byte(1.0);
-    let bad_if_scale_dropped_k = f32_to_fp8_e4m3_byte(0.5);
-    let bad_if_scale_dropped_v = f32_to_fp8_e4m3_byte(0.25);
-    // Sanity: the two must differ — otherwise the test wouldn't
-    // distinguish the two cases.
-    assert_ne!(
-        expected_k_byte, bad_if_scale_dropped_k,
-        "FP8 bytes for 1.0 vs 0.5 must differ to distinguish scale-applied vs scale-dropped"
-    );
-    assert_ne!(expected_v_byte, bad_if_scale_dropped_v);
-
-    let key_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(key_pool.contents() as *const u8, key_cache_size as usize)
-    };
-    let value_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            value_pool.contents() as *const u8,
-            value_cache_size as usize,
-        )
-    };
-
-    // K layout for FP8 (still vLLM):
-    // key_cache[block_idx, head_idx, j/x, block_offset, j%x]
-    let head_per_block_k = (head_size / x) * block_size * x;
-    let stride_block_k = num_kv_heads * head_per_block_k;
-    let stride_head_k = head_per_block_k;
-    let stride_xidx_k = block_size * x;
-    let stride_blockoff_k = x;
-
-    let head_per_block_v = head_size * block_size;
-    let stride_block_v = num_kv_heads * head_per_block_v;
-    let stride_head_v = head_per_block_v;
-    let stride_j_v = block_size;
-
-    // Spot-check the (token=0, head=0, j=0) slot for both K and V
-    // — and a deeper position to confirm the kernel wrote across
-    // all heads/positions, not just head 0.
-    for t in 0..num_tokens {
-        let slot_idx = slot_mapping_host[t as usize];
-        let block_idx = (slot_idx / block_size as i64) as u32;
-        let block_offset = (slot_idx % block_size as i64) as u32;
-        for h in [0u32, 3u32] {
-            for j in [0u32, 32u32, 63u32] {
-                let x_idx = j / x;
-                let x_offset = j % x;
-                let k_idx = (block_idx * stride_block_k
-                    + h * stride_head_k
-                    + x_idx * stride_xidx_k
-                    + block_offset * stride_blockoff_k
-                    + x_offset) as usize;
-                let v_idx = (block_idx * stride_block_v
-                    + h * stride_head_v
-                    + j * stride_j_v
-                    + block_offset) as usize;
-                let actual_k = key_bytes[k_idx];
-                let actual_v = value_bytes[v_idx];
-                assert_eq!(
-                    actual_k, expected_k_byte,
-                    "K FP8 byte at token={t} head={h} j={j}: \
-                     expected 0x{expected_k_byte:02x} (= to_fp8(1.0), proves scale was applied) \
-                     but got 0x{actual_k:02x}. \
-                     If got 0x{bad_if_scale_dropped_k:02x} the kernel ignored k_scale."
-                );
-                assert_eq!(
-                    actual_v, expected_v_byte,
-                    "V FP8 byte at token={t} head={h} j={j}: \
-                     expected 0x{expected_v_byte:02x} (= to_fp8(1.0), proves scale was applied) \
-                     but got 0x{actual_v:02x}. \
-                     If got 0x{bad_if_scale_dropped_v:02x} the kernel ignored v_scale."
-                );
-            }
-        }
-    }
 }
 
 /// Negative test — the C++ layer's `paged_attention` shim must reject
@@ -660,7 +341,7 @@ fn paged_attention_shim_rejects_zero_context() {
             /*num_q_heads=*/ 8, /*num_kv_heads=*/ 4, /*head_size=*/ 64,
             /*block_size=*/ 16, /*max_context_len=*/ 0, /*max_blocks_per_seq=*/ 4,
             /*scale=*/ 0.125, /*softcap=*/ 0.0, /*sliding_window=*/ 0,
-            /*kv_dtype=Bf16*/ 1, /*k_scale=*/ 1.0, /*v_scale=*/ 1.0,
+            /*kv_dtype=Bf16*/ 1,
         )
     };
     assert_eq!(rc, -1, "max_context_len=0 must be rejected");
@@ -909,7 +590,7 @@ fn paged_attention_shim_rejects_sliding_window() {
             /*num_q_heads=*/ 8, /*num_kv_heads=*/ 4, /*head_size=*/ 64,
             /*block_size=*/ 16, /*max_context_len=*/ 32, /*max_blocks_per_seq=*/ 4,
             /*scale=*/ 0.125, /*softcap=*/ 0.0, /*sliding_window=*/ -1,
-            /*kv_dtype=Bf16*/ 1, /*k_scale=*/ 1.0, /*v_scale=*/ 1.0,
+            /*kv_dtype=Bf16*/ 1,
         )
     };
     assert_eq!(rc, -1, "shim must reject sliding_window < 0");
@@ -1230,26 +911,6 @@ fn paged_kv_write_factory_rejects_new_v_dtype_bf16() {
 }
 
 #[test]
-fn paged_kv_write_factory_rejects_k_pool_dtype_fp8() {
-    let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_k_pool_dtype_fp8() };
-    assert_eq!(
-        threw, 1,
-        "paged_kv_write(...) must reject k_pool dtype != uint8 for kv_dtype=Fp8 \
-         (got {threw}); FP8 cache is stored opaquely as bytes"
-    );
-}
-
-#[test]
-fn paged_kv_write_factory_rejects_new_k_dtype_fp8() {
-    let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_new_k_dtype_fp8() };
-    assert_eq!(
-        threw, 1,
-        "paged_kv_write(...) must reject new_k dtype != bfloat16 for kv_dtype=Fp8 \
-         (got {threw}); Phase 1 contract: FP8 io dtype is bfloat16"
-    );
-}
-
-#[test]
 fn paged_attention_factory_rejects_q_dtype_bf16() {
     let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_q_dtype_bf16() };
     assert_eq!(
@@ -1259,30 +920,11 @@ fn paged_attention_factory_rejects_q_dtype_bf16() {
 }
 
 #[test]
-fn paged_attention_factory_rejects_q_dtype_fp8() {
-    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_q_dtype_fp8() };
-    assert_eq!(
-        threw, 1,
-        "paged_attention(...) must reject q dtype != bfloat16 for kv_dtype=Fp8 \
-         (got {threw}); Phase 1 contract: FP8 io dtype is bfloat16"
-    );
-}
-
-#[test]
 fn paged_attention_factory_rejects_k_pool_dtype_bf16() {
     let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_k_pool_dtype_bf16() };
     assert_eq!(
         threw, 1,
         "paged_attention(...) must reject k_pool dtype != bfloat16 for kv_dtype=Bf16 (got {threw})"
-    );
-}
-
-#[test]
-fn paged_attention_factory_rejects_k_pool_dtype_fp8() {
-    let threw = unsafe { mlx_sys::mlx_paged_attention_factory_rejects_k_pool_dtype_fp8() };
-    assert_eq!(
-        threw, 1,
-        "paged_attention(...) must reject k_pool dtype != uint8 for kv_dtype=Fp8 (got {threw})"
     );
 }
 

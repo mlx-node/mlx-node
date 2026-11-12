@@ -365,7 +365,7 @@ impl HybridSchedulerBackend for Qwen35Inner {
             total_tokens,
         )
     }
-    fn planned_turn_window(&self, speculative: bool) -> Option<u32> {
+    fn planned_turn_window(&self, _speculative: bool) -> Option<u32> {
         let Some(pool) = self
             .memory_plan
             .as_ref()
@@ -373,11 +373,7 @@ impl HybridSchedulerBackend for Qwen35Inner {
         else {
             return Some(self.pool_context_limit());
         };
-        Some(if speculative {
-            pool.window_with(&|window| self.scheduled_draft_state_held_bytes(window))
-        } else {
-            pool.lane.window.maximum()
-        })
+        Some(pool.lane.window.maximum())
     }
     fn scheduled_draft_state_held_bytes(&self, total_tokens: u32) -> u64 {
         crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::held_bytes(

@@ -316,7 +316,6 @@ impl Gemma4Inner {
                             )
                         },
                     )?,
-                    use_fp8_cache: Some(false),
                     max_seq_len: Some(max_seq_len),
                     max_batch_size: Some(max_concurrent_sequences),
                 };

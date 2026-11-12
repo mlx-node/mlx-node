@@ -74,7 +74,7 @@ export interface GrokAgentLaunchOptions {
   needsServer?: boolean;
   /** Discovered model the spawned `mlx serve` starts loading at boot (`--preload`). */
   preloadModel?: string;
-  /** Flat K/V cache format the spawned `mlx serve` loads with (`--kv-format`). */
+  /** K/V cache format the spawned `mlx serve` loads with (`--kv-format`). */
   kvFormat?: 'int8' | 'bf16';
   /** Metal memory budget in bytes the spawned `mlx serve` plans with (`--max-memory`). */
   maxMemoryBytes?: number;

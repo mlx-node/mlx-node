@@ -1,7 +1,6 @@
 // Updated from MLX commit has f70764a
 
 #include "../utils.metal"
-#include "../float8.metal"
 #include <metal_simdgroup>
 #include <metal_stdlib>
 
@@ -530,34 +529,6 @@ inline void from_float(thread Half8_ &dst, Float8_ src) {
   dst.y = y;
 }
 
-// ========================================== FP8 (uchar) vector data types.
-
-// 8‑lane uchar vector – Metal only provides up to uchar4, so build our own.
-struct Uchar8_ {
-  uchar4 x;
-  uchar4 y;
-};
-
-// Vec specialisations so Vec<uchar, N>::Type resolves correctly.
-template <> struct Vec<uchar, 1> {
-  using Type = uchar;
-};
-template <> struct Vec<uchar, 2> {
-  using Type = uchar2;
-};
-template <> struct Vec<uchar, 4> {
-  using Type = uchar4;
-};
-template <> struct Vec<uchar, 8> {
-  using Type = Uchar8_;
-};
-
-// General case: not uchar
-template <typename T> inline constexpr bool is_uchar() { return false; }
-
-// Specialization: T is uchar
-template <> inline constexpr bool is_uchar<uchar>() { return true; }
-
 // ========================================== Int8 (char) vector data types.
 
 struct Char8_ {
@@ -642,126 +613,6 @@ inline void combine_int8_partitions(device bfloat16_t *out,
   }
 }
 
-// Generic fallback – will fail to compile if a required specialisation is
-// missing.
-template <typename Vec, typename Quant_vec>
-inline Vec fp8_convert(const thread Quant_vec &, float scale) {
-  static_assert(sizeof(Vec) == 0, "Missing fp8_convert specialisation");
-}
-
-// ========================================== FP8 → float/half/bfloat
-inline float __dequant_single(uchar v, float scale) {
-  return fp8_e4m3_to_float(v) * scale;
-}
-
-// ---- 1‑lane ----
-template <>
-inline float fp8_convert<float, uchar>(const thread uchar &in, float scale) {
-  return __dequant_single(in, scale);
-}
-template <>
-inline half fp8_convert<half, uchar>(const thread uchar &in, float scale) {
-  return half(__dequant_single(in, scale));
-}
-template <>
-inline bfloat16_t fp8_convert<bfloat16_t, uchar>(const thread uchar &in,
-                                                 float scale) {
-  return bfloat16_t(__dequant_single(in, scale));
-}
-
-// ---- 2‑lane ----
-template <>
-inline float2 fp8_convert<float2, uchar2>(const thread uchar2 &in,
-                                          float scale) {
-  return float2(__dequant_single(in.x, scale), __dequant_single(in.y, scale));
-}
-template <>
-inline half2 fp8_convert<half2, uchar2>(const thread uchar2 &in, float scale) {
-  half2 out;
-  out.x = half(__dequant_single(in.x, scale));
-  out.y = half(__dequant_single(in.y, scale));
-  return out;
-}
-template <>
-inline Bfloat2_ fp8_convert<Bfloat2_, uchar2>(const thread uchar2 &in,
-                                              float scale) {
-  Bfloat2_ out;
-  out.x = bfloat16_t(__dequant_single(in.x, scale));
-  out.y = bfloat16_t(__dequant_single(in.y, scale));
-  return out;
-}
-
-// ---- 4‑lane ----
-template <>
-inline float4 fp8_convert<float4, uchar4>(const thread uchar4 &in,
-                                          float scale) {
-  return float4(__dequant_single(in.x, scale), __dequant_single(in.y, scale),
-                __dequant_single(in.z, scale), __dequant_single(in.w, scale));
-}
-template <>
-inline half4 fp8_convert<half4, uchar4>(const thread uchar4 &in, float scale) {
-  half4 out;
-  out.x = half(__dequant_single(in.x, scale));
-  out.y = half(__dequant_single(in.y, scale));
-  out.z = half(__dequant_single(in.z, scale));
-  out.w = half(__dequant_single(in.w, scale));
-  return out;
-}
-template <>
-inline Bfloat4_ fp8_convert<Bfloat4_, uchar4>(const thread uchar4 &in,
-                                              float scale) {
-  Bfloat4_ out;
-  out.x.x = bfloat16_t(__dequant_single(in.x, scale));
-  out.x.y = bfloat16_t(__dequant_single(in.y, scale));
-  out.y.x = bfloat16_t(__dequant_single(in.z, scale));
-  out.y.y = bfloat16_t(__dequant_single(in.w, scale));
-  return out;
-}
-
-// ---- 8‑lane ----
-template <>
-inline Float8_ fp8_convert<Float8_, Uchar8_>(const thread Uchar8_ &in,
-                                             float scale) {
-  Float8_ out;
-  out.x =
-      float4(__dequant_single(in.x.x, scale), __dequant_single(in.x.y, scale),
-             __dequant_single(in.x.z, scale), __dequant_single(in.x.w, scale));
-  out.y =
-      float4(__dequant_single(in.y.x, scale), __dequant_single(in.y.y, scale),
-             __dequant_single(in.y.z, scale), __dequant_single(in.y.w, scale));
-  return out;
-}
-template <>
-inline Half8_ fp8_convert<Half8_, Uchar8_>(const thread Uchar8_ &in,
-                                           float scale) {
-  Half8_ out;
-  out.x = half4(half(__dequant_single(in.x.x, scale)),
-                half(__dequant_single(in.x.y, scale)),
-                half(__dequant_single(in.x.z, scale)),
-                half(__dequant_single(in.x.w, scale)));
-  out.y = half4(half(__dequant_single(in.y.x, scale)),
-                half(__dequant_single(in.y.y, scale)),
-                half(__dequant_single(in.y.z, scale)),
-                half(__dequant_single(in.y.w, scale)));
-  return out;
-}
-template <>
-inline Bfloat8_ fp8_convert<Bfloat8_, Uchar8_>(const thread Uchar8_ &in,
-                                               float scale) {
-  Bfloat8_ out;
-  // first 4
-  out.x.x.x = bfloat16_t(__dequant_single(in.x.x, scale));
-  out.x.x.y = bfloat16_t(__dequant_single(in.x.y, scale));
-  out.x.y.x = bfloat16_t(__dequant_single(in.x.z, scale));
-  out.x.y.y = bfloat16_t(__dequant_single(in.x.w, scale));
-  // second 4
-  out.y.x.x = bfloat16_t(__dequant_single(in.y.x, scale));
-  out.y.x.y = bfloat16_t(__dequant_single(in.y.y, scale));
-  out.y.y.x = bfloat16_t(__dequant_single(in.y.z, scale));
-  out.y.y.y = bfloat16_t(__dequant_single(in.y.w, scale));
-  return out;
-}
-
 // ========================================== Dot product utilities
 
 // TODO(EricLBuehler): optimize with vectorization
@@ -837,9 +688,7 @@ inline float block_sum(threadgroup float *red_smem, float sum, uint simd_tid,
 // Original:
 //   constant bool use_partitioning [[function_constant(10)]];
 //   constant bool use_alibi [[function_constant(20)]];
-//   constant bool use_fp8_scales [[function_constant(30)]];
 // Note: use_partitioning is now derived from PARTITION_SIZE > 0
-// Note: use_fp8_scales is handled by is_uchar<CACHE_T>() for FP8 cache types
 
 template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_THREADS,
           int NUM_SIMD_LANES, int PARTITION_SIZE = 0, bool USE_ALIBI = false>
@@ -858,9 +707,9 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     device const CACHE_T *v_cache
     [[buffer(5)]], // [num_blocks, num_kv_heads, head_size, block_size]
     const device float *__restrict__ k_scale
-    [[buffer(6)]], // [1] - only used when use_fp8_scales
+    [[buffer(6)]], // int8: per-row key scales
     const device float *__restrict__ v_scale
-    [[buffer(7)]], // [1] - only used when use_fp8_scales
+    [[buffer(7)]], // int8: per-row value scales
     const constant int &num_kv_heads [[buffer(8)]], // [num_heads]
     const constant float &scale [[buffer(9)]],
     const constant float &softcapping [[buffer(10)]],
@@ -1007,17 +856,11 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
         const int offset1 = (vec_idx * VEC_SIZE) / x;
         const int offset2 = (vec_idx * VEC_SIZE) % x;
 
-        if constexpr (is_uchar<CACHE_T>()) {
-          // FP8 support
-          Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
-              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
-          k_vecs[j] = fp8_convert<K_vec, Quant_vec>(k_vec_quant, *k_scale);
-        } else if constexpr (is_char<CACHE_T>()) {
+        if constexpr (is_char<CACHE_T>()) {
           Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
               k_ptr + offset1 * BLOCK_SIZE * x + offset2);
           k_vecs[j] = char_to<K_vec, Quant_vec>(k_vec_quant);
         } else {
-          // Non-FP8 default
           k_vecs[j] = *reinterpret_cast<const device K_vec *>(
               k_ptr + offset1 * BLOCK_SIZE * x + offset2);
         }
@@ -1222,17 +1065,11 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
         // https://github.com/vllm-project/vllm/issues/641#issuecomment-1682544472
         V_vec v_vec;
 
-        if constexpr (is_uchar<CACHE_T>()) {
-          // FP8 support
-          V_quant_vec v_quant_vec =
-              *reinterpret_cast<const device V_quant_vec *>(v_ptr + offset);
-          v_vec = fp8_convert<V_vec, V_quant_vec>(v_quant_vec, *v_scale);
-        } else if constexpr (is_char<CACHE_T>()) {
+        if constexpr (is_char<CACHE_T>()) {
           V_quant_vec v_quant_vec =
               *reinterpret_cast<const device V_quant_vec *>(v_ptr + offset);
           v_vec = char_to<V_vec, V_quant_vec>(v_quant_vec);
         } else {
-          // Non-FP8 default
           v_vec = *reinterpret_cast<const device V_vec *>(v_ptr + offset);
         }
 
@@ -2097,11 +1934,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
         const int offset1 = (vec_idx * VEC_SIZE) / x;
         const int offset2 = (vec_idx * VEC_SIZE) % x;
 
-        if constexpr (is_uchar<CACHE_T>()) {
-          Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
-              k_ptr + offset1 * BLOCK_SIZE * x + offset2);
-          k_vecs[j] = fp8_convert<K_vec, Quant_vec>(k_vec_quant, *k_scale);
-        } else if constexpr (is_char<CACHE_T>()) {
+        if constexpr (is_char<CACHE_T>()) {
           Quant_vec k_vec_quant = *reinterpret_cast<const device Quant_vec *>(
               k_ptr + offset1 * BLOCK_SIZE * x + offset2);
           k_vecs[j] = char_to<K_vec, Quant_vec>(k_vec_quant);
@@ -2280,11 +2113,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
         const int offset = row_idx * BLOCK_SIZE + physical_block_offset;
         V_vec v_vec;
 
-        if constexpr (is_uchar<CACHE_T>()) {
-          V_quant_vec v_quant_vec =
-              *reinterpret_cast<const device V_quant_vec *>(v_ptr + offset);
-          v_vec = fp8_convert<V_vec, V_quant_vec>(v_quant_vec, *v_scale);
-        } else if constexpr (is_char<CACHE_T>()) {
+        if constexpr (is_char<CACHE_T>()) {
           V_quant_vec v_quant_vec =
               *reinterpret_cast<const device V_quant_vec *>(v_ptr + offset);
           v_vec = char_to<V_vec, V_quant_vec>(v_quant_vec);
@@ -2651,9 +2480,6 @@ instantiate_paged_attention_v1(float, float, 32);
 instantiate_paged_attention_v1(bfloat16_t, bfloat16_t, 32);
 instantiate_paged_attention_v1(half, half, 32);
 
-instantiate_paged_attention_v1(float, uchar, 32);
-instantiate_paged_attention_v1(bfloat16_t, uchar, 32);
-instantiate_paged_attention_v1(half, uchar, 32);
 
 instantiate_paged_attention_v2_reduce(float, 32);
 instantiate_paged_attention_v2_reduce(bfloat16_t, 32);
@@ -2663,9 +2489,6 @@ instantiate_paged_attention_v2(float, float, 32);
 instantiate_paged_attention_v2(bfloat16_t, bfloat16_t, 32);
 instantiate_paged_attention_v2(half, half, 32);
 
-instantiate_paged_attention_v2(float, uchar, 32);
-instantiate_paged_attention_v2(bfloat16_t, uchar, 32);
-instantiate_paged_attention_v2(half, uchar, 32);
 
 // ============================================================================
 // Varlen kernel instantiations (Phase 4a).
@@ -2830,9 +2653,6 @@ instantiate_paged_attention_varlen_v1(float, float, 32);
 instantiate_paged_attention_varlen_v1(bfloat16_t, bfloat16_t, 32);
 instantiate_paged_attention_varlen_v1(half, half, 32);
 
-instantiate_paged_attention_varlen_v1(float, uchar, 32);
-instantiate_paged_attention_varlen_v1(bfloat16_t, uchar, 32);
-instantiate_paged_attention_varlen_v1(half, uchar, 32);
 
 instantiate_paged_attention_varlen_v2_reduce(float, 32);
 instantiate_paged_attention_varlen_v2_reduce(bfloat16_t, 32);
@@ -2842,9 +2662,6 @@ instantiate_paged_attention_varlen_v2(float, float, 32);
 instantiate_paged_attention_varlen_v2(bfloat16_t, bfloat16_t, 32);
 instantiate_paged_attention_varlen_v2(half, half, 32);
 
-instantiate_paged_attention_varlen_v2(float, uchar, 32);
-instantiate_paged_attention_varlen_v2(bfloat16_t, uchar, 32);
-instantiate_paged_attention_varlen_v2(half, uchar, 32);
 
 // ============================================================================
 // Int8 pools: K char [nb, H, D/16, bs, 16], V char [nb, H, D, bs], key and

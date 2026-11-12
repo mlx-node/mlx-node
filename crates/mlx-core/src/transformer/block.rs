@@ -275,7 +275,7 @@ impl TransformerBlock {
     ///   per-decode-token blocking `mlx_metal_synchronize()` +
     ///   command-buffer host wait that the synchronous path forces.
     /// - **Decode output dtype.** The decode gather returns the query/pool
-    ///   dtype (BF16 for Qwen3's non-FP8 cache). We `astype` it back to
+    ///   dtype (BF16 for Qwen3's bf16 cache). We `astype` it back to
     ///   `x`'s dtype defensively before output projection / residual so the
     ///   rest of the block stays homogeneous.
     #[allow(clippy::too_many_arguments)]

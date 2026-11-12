@@ -67,11 +67,9 @@ pub struct LoadTimePoolSizing {
 /// `MetalDtype::size`.
 pub fn dtype_size_for(dtype: MetalDtype) -> u32 {
     match dtype {
-        // Non-FP8 caches are 2 bytes/element regardless of input
-        // (kernels only instantiate (half, half) and (bfloat16_t, bfloat16_t)).
         MetalDtype::Float16 | MetalDtype::BFloat16 => 2,
-        // FP8 E4M3 and int8 caches: 1 byte/element.
-        MetalDtype::UChar | MetalDtype::Int8 => 1,
+        // Int8 rows; the scale planes are counted by `bytes_per_block`.
+        MetalDtype::Int8 => 1,
         // Float32 caches are not supported (no kernel instantiation). The
         // profile-run path treats them as 4 bytes for consistency, but
         // `LayerKVPool::new` rejects them at construction so we never
@@ -193,7 +191,6 @@ mod tests {
     fn dtype_size_table() {
         assert_eq!(dtype_size_for(MetalDtype::Float16), 2);
         assert_eq!(dtype_size_for(MetalDtype::BFloat16), 2);
-        assert_eq!(dtype_size_for(MetalDtype::UChar), 1);
         assert_eq!(dtype_size_for(MetalDtype::Float32), 4);
     }
 
@@ -223,10 +220,6 @@ mod tests {
         assert_eq!(
             bytes_per_block(16, 4, 256, 16, MetalDtype::BFloat16).unwrap(),
             1_048_576
-        );
-        assert_eq!(
-            bytes_per_block(16, 4, 256, 16, MetalDtype::UChar).unwrap(),
-            524_288
         );
     }
 

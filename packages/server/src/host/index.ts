@@ -175,8 +175,8 @@ export interface InferenceHostOptions {
    */
   enginePolicy?: EnginePolicy;
   /**
-   * Flat (DFlash2) K/V cache format for qwen3_5 / qwen3_5_moe loads; other
-   * families never see it. The block-paged pool ignores it and stays bf16.
+   * K/V format of the block-paged pool and the flat (DFlash2) cache for
+   * qwen3_5 / qwen3_5_moe loads; other families never see it.
    * Omitted ⇒ the load default.
    */
   kvFormat?: 'int8' | 'bf16';

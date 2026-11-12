@@ -41,7 +41,8 @@ fn grouped_qwen35_graph_decode_and_mtp_parity() {
 
 #[test]
 fn grouped_qwen35_graph_route_thresholds_are_pinned() {
-    // Bf16 and Int8 pools share the thresholds; FP8 never takes the route.
+    // Bf16 and Int8 pools share the thresholds; the retired code 2 never
+    // takes the route.
     for (num_q_heads, num_kv_heads) in [(24, 4), (16, 2)] {
         assert_eq!(
             unsafe {
@@ -54,7 +55,7 @@ fn grouped_qwen35_graph_route_thresholds_are_pinned() {
                 )
             },
             0,
-            "an FP8 pool selected the grouped route"
+            "the retired kv_dtype code 2 selected the grouped route"
         );
     }
     for cache_dtype in [1u8, 3] {

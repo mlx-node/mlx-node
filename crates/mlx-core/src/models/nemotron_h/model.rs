@@ -276,7 +276,6 @@ fn configured_paged_pool_plan(config: &NemotronHConfig) -> Result<Option<Configu
         head_size: config.head_dim as u32,
         num_kv_heads: config.num_key_value_heads as u32,
         num_layers: attn_layer_count,
-        use_fp8_cache: Some(false),
         max_seq_len: Some(config.max_position_embeddings as u32),
         max_batch_size: Some(32),
     };
@@ -758,7 +757,6 @@ impl NemotronHInner {
             head_size,
             num_kv_heads,
             num_layers: attn_layer_count,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(max_seq_len),
             max_batch_size: Some(32),
         };
@@ -3558,7 +3556,6 @@ mod scheduler_tests {
             head_size: config.head_dim as u32,
             num_kv_heads: config.num_key_value_heads as u32,
             num_layers: config.attention_layer_idxs().len() as u32,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(config.max_position_embeddings as u32),
             max_batch_size: Some(32),
         };

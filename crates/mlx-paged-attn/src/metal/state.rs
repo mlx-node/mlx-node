@@ -7,7 +7,7 @@
 //! which MLX's metal_kernel() API doesn't support.
 //!
 //! Kernel naming convention:
-//! - reshape_and_cache: reshape_and_cache_kv_{type}_cache_{cache_type}[_fp8]
+//! - reshape_and_cache: reshape_and_cache_kv_{type}_cache_{cache_type}
 //! - paged_attention V1: paged_attention_{type}_cache_{cache_type}_hs{head}_bs{block}_nt256_nsl32_ps0[_alibi]
 //! - paged_attention V2: paged_attention_{type}_cache_{cache_type}_hs{head}_bs{block}_nt256_nsl32_ps512[_alibi]
 //! - paged_attention V2 reduce: paged_attention_v2_reduce_{type}_hs{head}_nt256_nsl32_ps512
@@ -80,7 +80,7 @@ impl MetalState {
     ///
     /// FORKED: Kernels are now template-specialized, so we just load by name
     /// without needing to set function constants. The kernel name encodes
-    /// all the options (e.g., _fp8, _alibi suffixes).
+    /// all the options (e.g. the _alibi suffix).
     ///
     /// Pipelines are cached for performance - subsequent calls with the same
     /// kernel name return the cached pipeline.
@@ -124,37 +124,17 @@ impl MetalState {
         Ok(pipeline)
     }
 
-    /// Get the `reshape_and_cache` kernel name for an `(input, cache)` dtype pair.
-    ///
-    /// The metal source instantiates these combinations (see
-    /// `crates/mlx-paged-attn/metal/cache/reshape_and_cache.metal`):
-    /// - Non-FP8: `(float, float)`, `(half, half)`, `(bfloat16_t, bfloat16_t)`
-    /// - FP8 (cache = `uchar`): `(float, uchar)`, `(half, uchar)`, `(bfloat16_t, uchar)`
-    ///
-    /// Hard-coding the input dtype as `half` (the previous behavior) silently
-    /// dispatched the wrong kernel when callers passed BF16 or F32 K/V — and
-    /// for FP8 with BF16 input, even routed BF16 bytes through a kernel
-    /// expecting `half`, corrupting the cache. Splitting the two dtypes
-    /// explicitly forces every caller to identify the input dtype, and the
-    /// Metal source's kernel-name lookup will fail loudly if the requested
-    /// pair was never instantiated.
-    ///
-    /// # Arguments
-    /// * `input_dtype` - Data type of the K/V input arrays handed to the kernel
-    /// * `cache_dtype` - Data type for cache storage (UChar for FP8, otherwise
-    ///   the same as `input_dtype`)
-    /// * `use_fp8` - Whether to use the `_fp8` (scale-divided) variant
+    /// Get the `reshape_and_cache` kernel name for an `(input, cache)` dtype
+    /// pair. The metal source instantiates `(float, float)`, `(half, half)`
+    /// and `(bfloat16_t, bfloat16_t)`; any other pair fails the lookup.
     pub fn reshape_and_cache_kernel_name(
         input_dtype: MetalDtype,
         cache_dtype: MetalDtype,
-        use_fp8: bool,
     ) -> String {
-        let input_type = input_dtype.type_string();
-        let cache_type = cache_dtype.type_string();
-        let suffix = if use_fp8 { "_fp8" } else { "" };
         format!(
-            "reshape_and_cache_kv_{}_cache_{}{}",
-            input_type, cache_type, suffix
+            "reshape_and_cache_kv_{}_cache_{}",
+            input_dtype.type_string(),
+            cache_dtype.type_string()
         )
     }
 
@@ -162,25 +142,13 @@ impl MetalState {
     ///
     /// The metal source instantiates these `(io_type, cache_type)` pairs (see
     /// `crates/mlx-paged-attn/metal/attention/paged_attention.metal`):
-    /// - Non-FP8: `(float, float)`, `(half, half)`, `(bfloat16_t, bfloat16_t)`
-    /// - FP8 (`cache_type = uchar`): `(float, uchar)`, `(half, uchar)`,
-    ///   `(bfloat16_t, uchar)`
-    ///
-    /// Hard-coding the io dtype as `half` (the previous behavior) silently
-    /// dispatched the wrong kernel when the cache dtype was BFloat16 — and
-    /// for non-FP8 caches there is no `(half, bfloat16_t)` instantiation, so
-    /// the kernel-name lookup would fall back to corrupt routing through
-    /// `(half, half)` (or fail loudly, depending on the cache_dtype value).
-    /// Splitting `io_dtype` from `cache_dtype` forces every caller to
-    /// identify the io dtype, and the metallib lookup now fails loudly if
-    /// the requested pair was never instantiated.
+    /// `(float, float)`, `(half, half)`, `(bfloat16_t, bfloat16_t)` and the
+    /// int8 `(bfloat16_t, char)`; the metallib lookup fails loudly on any
+    /// pair it never instantiated.
     ///
     /// # Arguments
-    /// * `io_dtype` - Data type for queries + output (must equal `cache_dtype`
-    ///   for non-FP8; for FP8 cache the io dtype can independently be Float16,
-    ///   BFloat16, or Float32)
-    /// * `cache_dtype` - Data type for cache storage (UChar for FP8,
-    ///   otherwise Float16 / BFloat16 / Float32 to match the cache buffers)
+    /// * `io_dtype` - Data type for queries + output (`cache_dtype.io_dtype()`)
+    /// * `cache_dtype` - Data type for cache storage
     /// * `head_size` - Head dimension (32, 64, 80, 96, 112, 120, 128, 192, 256)
     /// * `block_size` - Block size (8, 16, 32)
     /// * `use_alibi` - Whether to use ALiBi positional encoding
@@ -328,8 +296,6 @@ pub enum MetalDtype {
     Float32,
     Float16,
     BFloat16,
-    /// FP8 E4M3 format (1 byte per element)
-    UChar,
     /// Splash `kv::Format::Int8`: symmetric int8 with one f32 scale per
     /// token, head and side (`splash_store_kv_row`).
     Int8,
@@ -342,7 +308,6 @@ impl MetalDtype {
             MetalDtype::Float32 => "float",
             MetalDtype::Float16 => "half",
             MetalDtype::BFloat16 => "bfloat16_t",
-            MetalDtype::UChar => "uchar",
             MetalDtype::Int8 => "char",
         }
     }
@@ -352,13 +317,8 @@ impl MetalDtype {
         match self {
             MetalDtype::Float32 => 4,
             MetalDtype::Float16 | MetalDtype::BFloat16 => 2,
-            MetalDtype::UChar | MetalDtype::Int8 => 1,
+            MetalDtype::Int8 => 1,
         }
-    }
-
-    /// Check if this is an FP8 type
-    pub fn is_fp8(&self) -> bool {
-        matches!(self, MetalDtype::UChar)
     }
 
     /// Dtype of the rows written into and read out of a cache of this
@@ -397,48 +357,17 @@ mod tests {
 
     #[test]
     fn test_kernel_names() {
-        // Non-FP8: every (input, cache) pair instantiated by the metal source.
         assert_eq!(
-            MetalState::reshape_and_cache_kernel_name(
-                MetalDtype::Float16,
-                MetalDtype::Float16,
-                false,
-            ),
+            MetalState::reshape_and_cache_kernel_name(MetalDtype::Float16, MetalDtype::Float16),
             "reshape_and_cache_kv_half_cache_half"
         );
         assert_eq!(
-            MetalState::reshape_and_cache_kernel_name(
-                MetalDtype::BFloat16,
-                MetalDtype::BFloat16,
-                false,
-            ),
+            MetalState::reshape_and_cache_kernel_name(MetalDtype::BFloat16, MetalDtype::BFloat16),
             "reshape_and_cache_kv_bfloat16_t_cache_bfloat16_t"
         );
         assert_eq!(
-            MetalState::reshape_and_cache_kernel_name(
-                MetalDtype::Float32,
-                MetalDtype::Float32,
-                false,
-            ),
+            MetalState::reshape_and_cache_kernel_name(MetalDtype::Float32, MetalDtype::Float32),
             "reshape_and_cache_kv_float_cache_float"
-        );
-
-        // FP8: every (input, uchar) pair instantiated with the `_fp8` suffix.
-        assert_eq!(
-            MetalState::reshape_and_cache_kernel_name(MetalDtype::Float16, MetalDtype::UChar, true,),
-            "reshape_and_cache_kv_half_cache_uchar_fp8"
-        );
-        assert_eq!(
-            MetalState::reshape_and_cache_kernel_name(
-                MetalDtype::BFloat16,
-                MetalDtype::UChar,
-                true,
-            ),
-            "reshape_and_cache_kv_bfloat16_t_cache_uchar_fp8"
-        );
-        assert_eq!(
-            MetalState::reshape_and_cache_kernel_name(MetalDtype::Float32, MetalDtype::UChar, true,),
-            "reshape_and_cache_kv_float_cache_uchar_fp8"
         );
 
         // Paged attention V1/V2 — io_dtype split from cache_dtype.
@@ -506,27 +435,6 @@ mod tests {
             ),
             "paged_attention_bfloat16_t_cache_bfloat16_t_hs128_bs16_nt256_nsl32_ps512"
         );
-        // (half, uchar) — FP8 cache, half io.
-        assert_eq!(
-            MetalState::paged_attention_v1_kernel_name(
-                MetalDtype::Float16,
-                MetalDtype::UChar,
-                128,
-                16,
-                false,
-            ),
-            "paged_attention_half_cache_uchar_hs128_bs16_nt256_nsl32_ps0"
-        );
-        assert_eq!(
-            MetalState::paged_attention_v2_kernel_name(
-                MetalDtype::Float16,
-                MetalDtype::UChar,
-                128,
-                16,
-                false,
-            ),
-            "paged_attention_half_cache_uchar_hs128_bs16_nt256_nsl32_ps512"
-        );
         // Reduce kernel uses io_dtype only (the partition outputs are the
         // io type; cache_dtype is irrelevant for the reduce phase).
         assert_eq!(
@@ -552,11 +460,8 @@ mod tests {
             }
             Err(e) => panic!("unexpected MetalState::get failure: {e}"),
         };
-        let kernel_name = MetalState::reshape_and_cache_kernel_name(
-            MetalDtype::Float16,
-            MetalDtype::Float16,
-            false,
-        );
+        let kernel_name =
+            MetalState::reshape_and_cache_kernel_name(MetalDtype::Float16, MetalDtype::Float16);
         let pipeline = state.get_pipeline(&kernel_name);
         assert!(
             pipeline.is_ok(),

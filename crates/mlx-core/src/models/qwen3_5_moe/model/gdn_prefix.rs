@@ -429,19 +429,26 @@ impl Qwen35MoeInner {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<bool> {
-        let (restored, cache_dtype) = {
+        let (restored, activation_dtype) = {
             let Some(adapter) = self.paged_adapter.as_mut() else {
                 return Ok(false);
             };
             (
                 adapter.take_restored_sidecar(),
-                format!("{:?}", adapter.layer_kv_pool().cache_dtype()),
+                adapter
+                    .cold_tier()
+                    .and_then(|cold| cold.sidecar_policy.as_ref())
+                    .and_then(|policy| {
+                        crate::models::qwen3_5::gdn_sidecar::dtype_from_label(
+                            &policy.layout().dtype,
+                        )
+                    }),
             )
         };
         let dense_config = self.config.to_dense_config();
-        let Some(geometry) =
-            crate::models::qwen3_5::gdn_sidecar::geometry(&dense_config, &cache_dtype)
-        else {
+        let Some(geometry) = activation_dtype.and_then(|activation| {
+            crate::models::qwen3_5::gdn_sidecar::geometry(&dense_config, activation)
+        }) else {
             return Ok(false);
         };
         let expected_layout =

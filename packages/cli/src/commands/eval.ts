@@ -128,10 +128,11 @@ Cache Arguments:
 Score Arguments:
   --model <path>        Candidate checkpoint to score
   --cache <dir>         Teacher cache directory
-  --kv-format <fmt>     Candidate flat K/V cache format: int8 or bf16 (qwen3_5
-                        and qwen3_5_moe; default: the load default, int8 on
-                        Metal at head 256, GQA up to 8 and BF16 compute,
-                        else bf16)
+  --kv-format <fmt>     Candidate K/V format (pool and flat cache): int8 or
+                        bf16 (qwen3_5 and qwen3_5_moe; default: the load
+                        default, int8 on Metal at head 256, GQA up to 8 and
+                        BF16 compute, else bf16). A paged load scores
+                        through the pool.
   --json                Emit the report as one JSON object
 
 Shared Arguments:

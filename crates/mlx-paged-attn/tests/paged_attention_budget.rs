@@ -69,7 +69,6 @@ fn pool(cache_dtype: MetalDtype) -> Option<Pool> {
         head_size: D as u32,
         num_kv_heads: H as u32,
         num_layers: 1,
-        use_fp8_cache: Some(false),
         max_seq_len: Some(BLOCKS * BS as u32),
         max_batch_size: Some(1),
     };

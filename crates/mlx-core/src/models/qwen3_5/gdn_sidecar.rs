@@ -49,10 +49,12 @@
 //!
 //! No f32 round trip: 16-bit state goes out via `to_uint16_native` and back via
 //! `from_bfloat16` / `from_float16`; f32 state via `to_float32` / `from_float32`.
-//! The conv history's element type is fixed at load from the paged pool's cache
-//! dtype (`build_cold_tier_context`), which equals the GDN activation dtype on
-//! every checkpoint; the recurrent state is ALWAYS f32 ([`RECURRENT_DTYPE`],
-//! the carried precision of the GDN kernels). Capture re-checks each array's
+//! The conv history's element type is the GDN activation dtype (the
+//! embedding's output dtype), fixed at load (`build_cold_tier_context`); the
+//! pool's K/V format never labels it (Splash
+//! `GdnStateLayout::convolutionLayerBytes` never follows the KV format). The
+//! recurrent state is ALWAYS f32 ([`RECURRENT_DTYPE`], the carried precision
+//! of the GDN kernels). Capture re-checks each array's
 //! actual dtype and SKIPS (fail closed) on any mismatch rather than mislabel.
 
 use std::collections::VecDeque;
@@ -91,11 +93,22 @@ pub(crate) fn gdn_layers(config: &Qwen3_5Config) -> Vec<usize> {
 /// Map a dtype label (`"BFloat16"` / `"Float16"` / `"Float32"`) to the concrete
 /// [`DType`]; `None` for anything the sidecar codec cannot round-trip
 /// bit-exactly.
-fn dtype_from_label(label: &str) -> Option<DType> {
+pub(crate) fn dtype_from_label(label: &str) -> Option<DType> {
     match label {
         "BFloat16" => Some(DType::BFloat16),
         "Float16" => Some(DType::Float16),
         "Float32" => Some(DType::Float32),
+        _ => None,
+    }
+}
+
+/// The label [`dtype_from_label`] reads back for `dtype`; `None` for a dtype
+/// the codec cannot round-trip bit-exactly.
+pub(crate) fn sidecar_dtype_label(dtype: DType) -> Option<&'static str> {
+    match dtype {
+        DType::BFloat16 => Some("BFloat16"),
+        DType::Float16 => Some("Float16"),
+        DType::Float32 => Some("Float32"),
         _ => None,
     }
 }
@@ -109,7 +122,7 @@ fn element_size(dtype: DType) -> usize {
 }
 
 /// Geometry of qwen3_5's out-of-pool GDN state, derived once from the config +
-/// the pool's cache dtype. Every field is boundary-invariant, which is what
+/// the activation dtype. Every field is boundary-invariant, which is what
 /// lets it back a [`ColdSidecarPolicy`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GdnSidecarGeometry {
@@ -125,8 +138,8 @@ pub(crate) struct GdnSidecarGeometry {
     pub v_head_dim: u32,
     /// `linear_key_head_dim` — recurrent state `Dk` axis.
     pub k_head_dim: u32,
-    /// Conv-history element dtype label, fixed at load from the pool cache
-    /// dtype. The recurrent state is always [`RECURRENT_DTYPE`].
+    /// Conv-history element dtype label: the GDN activation dtype, fixed at
+    /// load. The recurrent state is always [`RECURRENT_DTYPE`].
     pub dtype: String,
 }
 
@@ -220,13 +233,12 @@ impl GdnSidecarGeometry {
 /// nonsensical head geometry) or a dtype the codec cannot round-trip. `None`
 /// means "install no policy": the restore walk then reconciles nothing and the
 /// GDN state is recomputed.
-pub(crate) fn geometry(config: &Qwen3_5Config, cache_dtype: &str) -> Option<GdnSidecarGeometry> {
+pub(crate) fn geometry(config: &Qwen3_5Config, activation: DType) -> Option<GdnSidecarGeometry> {
     let gdn_layers = u32::try_from(gdn_layers(config).len()).ok()?;
     if gdn_layers == 0 {
         return None;
     }
-    // Codec must be able to round-trip this dtype bit-exactly.
-    dtype_from_label(cache_dtype)?;
+    let label = sidecar_dtype_label(activation)?;
     // `[1, K-1, conv_dim]`: a kernel of 1 leaves K-1 = 0, which is not a
     // representable (positive) dim.
     let conv_rows = u32::try_from(config.linear_conv_kernel_dim - 1).ok()?;
@@ -244,7 +256,7 @@ pub(crate) fn geometry(config: &Qwen3_5Config, cache_dtype: &str) -> Option<GdnS
         num_v_heads,
         v_head_dim,
         k_head_dim,
-        dtype: cache_dtype.to_string(),
+        dtype: label.to_string(),
     };
     // A geometry whose payload cannot be sized is not persistable at all.
     geo.bytes_per_tensor()?;
@@ -267,10 +279,10 @@ pub(crate) fn layout_at(geo: &GdnSidecarGeometry, boundary_tokens: u32) -> ColdS
     }
 }
 
-/// Build the reconcile-down policy for this config + pool dtype, or `None` when
-/// there is no GDN state to back (see [`geometry`]).
-pub(crate) fn policy(config: &Qwen3_5Config, cache_dtype: &str) -> Option<ColdSidecarPolicy> {
-    let geo = geometry(config, cache_dtype)?;
+/// Build the reconcile-down policy for this config + activation dtype, or
+/// `None` when there is no GDN state to back (see [`geometry`]).
+pub(crate) fn policy(config: &Qwen3_5Config, activation: DType) -> Option<ColdSidecarPolicy> {
+    let geo = geometry(config, activation)?;
     ColdSidecarPolicy::new(layout_at(&geo, 0)).ok()
 }
 
@@ -483,8 +495,9 @@ pub(crate) fn capture_gdn_cold_sidecar<T: GdnCheckpointLineage>(
     if !image_token_positions.is_empty() {
         return;
     }
-    let cache_dtype = format!("{:?}", adapter.layer_kv_pool().cache_dtype());
-    let Some(geometry) = geometry(geometry_config, &cache_dtype) else {
+    let Some(geometry) =
+        dtype_from_label(&policy.layout().dtype).and_then(|dtype| geometry(geometry_config, dtype))
+    else {
         return;
     };
     let block_size = adapter.block_size();
@@ -789,7 +802,7 @@ mod tests {
     }
 
     fn geo_of(cfg: &Qwen3_5Config) -> GdnSidecarGeometry {
-        geometry(cfg, "BFloat16").expect("geometry")
+        geometry(cfg, DType::BFloat16).expect("geometry")
     }
 
     #[test]
@@ -804,9 +817,9 @@ mod tests {
         // conv kernel of 1 leaves K-1 = 0: not representable.
         let mut cfg = config();
         cfg.linear_conv_kernel_dim = 1;
-        assert!(geometry(&cfg, "BFloat16").is_none());
+        assert!(geometry(&cfg, DType::BFloat16).is_none());
         // Unsupported dtype: codec cannot round-trip.
-        assert!(geometry(&config(), "Int8").is_none());
+        assert!(geometry(&config(), DType::Int8).is_none());
     }
 
     #[test]
@@ -826,7 +839,7 @@ mod tests {
         // conv 3*14 bf16 (2 B) + recurrent 2*4*3 f32 (4 B) = 84 + 96 = 180.
         assert_eq!(a.bytes_per_tensor, 3 * 14 * 2 + 2 * 4 * 3 * 4);
 
-        let policy = policy(&cfg, "BFloat16").expect("policy");
+        let policy = policy(&cfg, DType::BFloat16).expect("policy");
         assert_eq!(policy.group(), ColdGroup::GdnState);
         assert_eq!(policy.expected_at(32), a);
         assert_eq!(policy.expected_at(64), b);
@@ -995,7 +1008,9 @@ mod tests {
         assert_ne!(geo_of(&wider).fingerprint_component(), base);
 
         assert_ne!(
-            geometry(&cfg, "Float32").unwrap().fingerprint_component(),
+            geometry(&cfg, DType::Float32)
+                .unwrap()
+                .fingerprint_component(),
             base
         );
     }
@@ -1022,7 +1037,7 @@ mod tests {
     /// here rather than quoted from a comment.
     #[test]
     fn one_gdn_checkpoint_of_the_27b_costs_a_known_number_of_bytes() {
-        let geo = geometry(&qwen3_6_27b_config(), "BFloat16").expect("geometry");
+        let geo = geometry(&qwen3_6_27b_config(), DType::BFloat16).expect("geometry");
         assert_eq!(geo.gdn_layers, 48);
         // conv `[1, 3, 10240]` bf16 + recurrent `[1, 48, 128, 128]` f32.
         assert_eq!(geo.conv_elements(), Some(30_720));
@@ -1042,7 +1057,7 @@ mod tests {
     fn a_27b_gdn_checkpoint_allocates_the_bytes_its_layout_claims() {
         use crate::array::{DType, MxArray, get_active_memory};
 
-        let geo = geometry(&qwen3_6_27b_config(), "BFloat16").expect("geometry");
+        let geo = geometry(&qwen3_6_27b_config(), DType::BFloat16).expect("geometry");
         let layout = layout_at(&geo, 4096);
         let claimed = layout.bytes_per_tensor * layout.num_layers as usize;
 

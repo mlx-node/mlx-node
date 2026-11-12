@@ -2613,7 +2613,7 @@ fn test_ple_oov_masking() {
 }
 
 /// Tiny Gemma4 config compatible with `LayerKVPool`'s validate
-/// constraints (head_size in {32, 64, 96, 128, 256}, FP8 off, etc.).
+/// constraints (head_size in {32, 64, 96, 128, 256}, etc.).
 /// `head_dim = 32`, num_kv_heads = 2, no PLE/MoE/vision/sharing.
 #[cfg(test)]
 fn paged_tiny_config(use_block_paged: Option<bool>) -> super::Gemma4Config {
@@ -2737,7 +2737,6 @@ fn test_default_paged_cache_memory_covers_gemma4_full_context() {
         head_size: 512,
         num_kv_heads: 2,
         num_layers: 5,
-        use_fp8_cache: Some(false),
         max_seq_len: Some(131_072),
         max_batch_size: Some(32),
     };

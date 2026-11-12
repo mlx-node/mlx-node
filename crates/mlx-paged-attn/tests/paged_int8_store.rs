@@ -24,23 +24,21 @@ impl Drop for Owned {
     }
 }
 
-fn config(head_size: usize, num_blocks: usize, fp8: bool) -> PagedAttentionConfig {
+fn config(head_size: usize, num_blocks: usize) -> PagedAttentionConfig {
     PagedAttentionConfig {
         block_size: BS as u32,
         gpu_memory_mb: 256,
         head_size: head_size as u32,
         num_kv_heads: H as u32,
         num_layers: 1,
-        use_fp8_cache: Some(fp8),
         max_seq_len: Some((num_blocks * BS) as u32),
         max_batch_size: Some(1),
     }
 }
 
 fn pool(head_size: usize, num_blocks: usize, dtype: MetalDtype) -> Option<LayerKVPool> {
-    let fp8 = dtype == MetalDtype::UChar;
     match LayerKVPool::new(
-        config(head_size, num_blocks, fp8),
+        config(head_size, num_blocks),
         num_blocks as u32,
         num_blocks as u32,
         dtype,
@@ -369,8 +367,8 @@ fn paged_int8_store_matches_the_flat_quantizer() {
     );
 }
 
-/// `[T, H, D]` integer-valued bf16 rows in -15..=15 (exact in bf16 and in
-/// FP8 E4M3), with the row (token 2, head 1) all zero.
+/// `[T, H, D]` integer-valued bf16 rows in -15..=15 (exact in bf16), with
+/// the row (token 2, head 1) all zero.
 fn layout_rows(tokens: usize, head_size: usize, side: usize) -> Vec<u16> {
     let mut out = vec![0u16; tokens * H * head_size];
     for t in 0..tokens {
@@ -387,18 +385,6 @@ fn layout_rows(tokens: usize, head_size: usize, side: usize) -> Vec<u16> {
     out
 }
 
-/// FP8 E4M3 byte of an integer in -15..=15 (exact: at most 3 mantissa bits).
-fn fp8_byte(v: f32) -> u8 {
-    if v == 0.0 {
-        return 0;
-    }
-    let sign = u8::from(v < 0.0) << 7;
-    let a = v.abs() as u32;
-    let exponent = 31 - a.leading_zeros();
-    let mantissa = ((a << 3) >> exponent) & 7;
-    sign | (((exponent + 7) as u8) << 3) | mantissa as u8
-}
-
 fn fill(pool: &LayerKVPool, blocks: usize, byte: u8) -> (Vec<u8>, Vec<u8>) {
     let (k, v) = pool.block_blob_bytes().unwrap();
     let (k, v) = (vec![byte; k as usize], vec![byte; v as usize]);
@@ -411,8 +397,7 @@ fn fill(pool: &LayerKVPool, blocks: usize, byte: u8) -> (Vec<u8>, Vec<u8>) {
 /// Layout gate, kernel half: every byte of K, V and both scale planes of
 /// every block equals the f32 reference at the index formulas; untouched
 /// slots (including the token with slot -1) keep the host-IO sentinel; the
-/// MLX output views read the same bytes; the FP8 store puts each (token,
-/// head, dimension) at the same K and V offsets.
+/// MLX output views read the same bytes.
 ///
 /// Mutation K3 (the kernel writes V token-major) goes red.
 #[test]
@@ -423,7 +408,6 @@ fn paged_int8_store_layout_matches_the_formulas() {
         let Some(int8) = pool(head_size, BLOCKS, MetalDtype::Int8) else {
             return;
         };
-        let fp8 = pool(head_size, BLOCKS, MetalDtype::UChar).unwrap();
         let tokens = 40;
         // Blocks 5, 0, 2 in turn; token 7 is skipped (slot -1).
         let slots: Vec<i64> = (0..tokens)
@@ -503,34 +487,6 @@ fn paged_int8_store_layout_matches_the_formulas() {
                 &views[3][block * scales..(block + 1) * scales],
                 &want.1[data..]
             );
-        }
-
-        fill(&fp8, BLOCKS, 0);
-        let fp8_written = write(&fp8, &keys, &values, &slots, head_size, 2).unwrap();
-        let fp8_key = bytes(&fp8_written.key, false);
-        let fp8_value = bytes(&fp8_written.value, false);
-        for (t, &slot) in slots.iter().enumerate() {
-            if slot < 0 {
-                continue;
-            }
-            let (block, token) = (slot as usize / BS, slot as usize % BS);
-            for h in 0..H {
-                for d in 0..head_size {
-                    let at = (t * H + h) * head_size + d;
-                    let k = key_index(block, h, token, d, head_size);
-                    let v = value_index(block, h, token, d, head_size);
-                    assert_eq!(
-                        fp8_key[k],
-                        fp8_byte(f32_of(keys[at])),
-                        "FP8 K t{t} h{h} d{d}"
-                    );
-                    assert_eq!(
-                        fp8_value[v],
-                        fp8_byte(f32_of(values[at])),
-                        "FP8 V t{t} h{h} d{d}"
-                    );
-                }
-            }
         }
     }
 }

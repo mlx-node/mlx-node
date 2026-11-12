@@ -374,41 +374,51 @@ fn validate_drafter_text_config_variant(
 /// reports `has_mtp_weights() == true`, silently corrupting speculative decode.
 /// Returns the list of missing canonical `mtp.*` keys (empty ⇒ complete).
 ///
-/// Shared by the drafter-merge gate ([`load_drafter_tensors`]) and the MoE
-/// loader's post-sanitize completeness gate, so the dense and MoE backbones use
-/// one source of truth for "what a complete MTP head looks like".
+/// Shared by the drafter-merge gate ([`load_drafter_tensors`]) and both
+/// loaders' post-sanitize completeness gates, so the dense and MoE backbones
+/// use one source of truth for "what a complete MTP head looks like".
 ///
 /// DTYPE-AWARE for quantized companions: for every required `.weight` key, if
 /// the present array's dtype is `Uint32` (an affine/MXFP/NVFP packed weight),
-/// the sibling `.scales` key is ALSO required — mirroring the dense loader's
-/// `require_mtp_linear` (`qwen3_5/persistence.rs`). A packed `Uint32` `.weight`
+/// the sibling `.scales` key is ALSO required. A packed `Uint32` `.weight`
 /// without its `.scales` would otherwise load as silent garbage (MoE
 /// `SwitchLinear::set_weight` performs no shape/dtype check). For bf16/f16
 /// `.weight`s no `.scales` is required, so plain dense checkpoints are
 /// unaffected. If a `.weight`'s dtype cannot be read, it is treated
-/// conservatively as non-quantized (no extra `.scales` requirement) rather than
-/// erroring — matching the dense loader's handling.
+/// conservatively as non-quantized (no extra `.scales` requirement).
 pub(crate) fn missing_required_mtp_keys(
     params: &HashMap<String, MxArray>,
     body: DrafterBodyVariant,
     n_mtp_layers: i32,
 ) -> Vec<String> {
+    missing_mtp_keys(
+        &|key| {
+            params
+                .get(key)
+                .map(|weight| matches!(weight.dtype(), Ok(DType::Uint32)))
+        },
+        body,
+        n_mtp_layers,
+    )
+}
+
+/// [`missing_required_mtp_keys`] over `packed`: `None` for an absent key,
+/// else whether it is a packed `Uint32` weight. The load-free estimate reads
+/// the same keys from the checkpoint headers.
+pub(crate) fn missing_mtp_keys(
+    packed: &dyn Fn(&str) -> Option<bool>,
+    body: DrafterBodyVariant,
+    n_mtp_layers: i32,
+) -> Vec<String> {
     let mut missing = Vec::new();
-    // For a required `<base>.weight` key: flag the `.weight` if absent;
-    // otherwise, if the present array is a packed `Uint32` quantized weight,
-    // ALSO require its sibling `<base>.scales` (mirrors the dense loader's
-    // `require_mtp_linear`). A dtype that cannot be read is treated as
-    // non-quantized (conservative, no extra requirement).
     let mut require_weight = |key: String| {
-        let Some(weight) = params.get(&key) else {
+        let Some(is_packed) = packed(&key) else {
             missing.push(key);
             return;
         };
-        if matches!(weight.dtype(), Ok(DType::Uint32))
-            && let Some(base) = key.strip_suffix(".weight")
-        {
+        if is_packed && let Some(base) = key.strip_suffix(".weight") {
             let scales_key = format!("{base}.scales");
-            if !params.contains_key(&scales_key) {
+            if packed(&scales_key).is_none() {
                 missing.push(scales_key);
             }
         }
@@ -920,8 +930,7 @@ mod tests {
     }
 
     /// A packed `Uint32` required `.weight` with NO sibling `.scales` must be
-    /// flagged (the missing `.scales`), mirroring the dense
-    /// loader's `require_mtp_linear`. The MoE `SwitchLinear::set_weight` performs
+    /// flagged (the missing `.scales`). The MoE `SwitchLinear::set_weight` performs
     /// no shape/dtype check, so a quantized `.weight` without scales would load
     /// as silent garbage. Needs Metal to allocate the Uint32 array — skip when
     /// MLX/Metal is unavailable (same pattern as the other allocating tests).

@@ -332,6 +332,40 @@ pub(crate) fn estimate_paged_pool_sdpa_bytes_with_portable(
     gathered.saturating_add(scores).saturating_add(fp32_output)
 }
 
+/// Row-partitions an int8 varlen prefill's f32 partials hold whatever the
+/// history: the dispatch tiles the query rows to this (Splash
+/// `PagedAttention::prefillWorkspace`, the row-splits of a 2,048-row chunk).
+pub(crate) const INT8_VARLEN_WORKSPACE_ROWS: u64 = 2048;
+
+/// Peak bytes of an int8 varlen prefill of `query_tokens` rows over
+/// `total_context`: the bf16 output, and above one 512-token partition the
+/// f32 partials and softmax state of at most
+/// [`INT8_VARLEN_WORKSPACE_ROWS`] row-partitions.
+pub(crate) fn estimate_int8_varlen_prefill_bytes(
+    query_tokens: u64,
+    total_context: u64,
+    num_query_heads: u64,
+    head_dim: u64,
+) -> u64 {
+    let output = query_tokens
+        .saturating_mul(num_query_heads)
+        .saturating_mul(head_dim)
+        .saturating_mul(2);
+    if total_context <= 512 {
+        return output.saturating_add(PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES);
+    }
+    let partitions = total_context.div_ceil(512);
+    let row_partitions = query_tokens
+        .saturating_mul(partitions)
+        .min(INT8_VARLEN_WORKSPACE_ROWS.max(partitions));
+    let workspace = row_partitions
+        .saturating_mul(num_query_heads)
+        .saturating_mul(head_dim.saturating_mul(4).saturating_add(8));
+    output
+        .saturating_add(workspace)
+        .saturating_add(PREFILL_ESTIMATE_FIXED_OVERHEAD_BYTES)
+}
+
 /// Peak auxiliary storage used by the varlen paged kernel. Above one 512-token
 /// partition, V2 keeps per-query/head/partition softmax state and a partial
 /// head-sized output. For long multi-token chunks this can be larger than the

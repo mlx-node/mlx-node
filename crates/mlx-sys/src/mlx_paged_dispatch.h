@@ -49,15 +49,13 @@
 namespace mlx::core::fast::paged {
 
 /// On-cache element type. Matches the Rust `MetalDtype` enum used in
-/// kernel names: Fp16 → "half", Bf16 → "bfloat16_t", Fp8 → "uchar",
-/// Int8 → "char".
+/// kernel names: Fp16 → "half", Bf16 → "bfloat16_t", Int8 → "char".
 /// (The C++ `KvDtype` enum in `mlx_paged_ops.h` is the public-facing
 /// version; this internal enum is equivalent but lives in its own
 /// namespace so we don't crowd the public header.)
 enum class KvDtype : uint8_t {
   Fp16 = 0,
   Bf16 = 1,
-  Fp8 = 2,
   Int8 = 3,
 };
 
@@ -90,9 +88,9 @@ enum class PagedAttentionRouteHint : uint8_t {
 /// scheduling subsequent commands.
 ///
 /// `k_scale` / `v_scale` are the primitive's scale outputs (sharing the
-/// scale inputs' buffers). FP8 reads them as `[1]` fp32 scalars; Int8
-/// writes one fp32 scale per stored row into `[num_blocks, num_kv_heads,
-/// block_size]` (Splash `splash_q8_scale_index`); Fp16/Bf16 ignore them.
+/// scale inputs' buffers). Int8 writes one fp32 scale per stored row into
+/// `[num_blocks, num_kv_heads, block_size]` (Splash
+/// `splash_q8_scale_index`); Fp16/Bf16 ignore them.
 ///
 /// Int8 runs `reshape_and_cache_int8_kv_bfloat16_t_hd{128,256}`: one
 /// threadgroup of `head_size` threads per K or V row, `2 * num_tokens *

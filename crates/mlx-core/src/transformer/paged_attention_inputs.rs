@@ -18,9 +18,8 @@
 //!    re-tracing on shape changes (per-request data variation) is
 //!    impossible because shapes are FIXED at compile time and only the
 //!    contents change.
-//! 2. Refactoring the metadata flow (e.g. adding FP8 scales as a 7th
-//!    field, or splitting decode vs. prefill into separate bundles) only
-//!    touches one definition.
+//! 2. Refactoring the metadata flow (e.g. adding a 7th field, or splitting
+//!    decode vs. prefill into separate bundles) only touches one definition.
 //! 3. Test coverage is shared — every model wrapper that accepts
 //!    `PagedAttentionInputs` benefits from the same struct-level
 //!    invariants.

@@ -378,9 +378,9 @@ DFlash2 acceptance on 35B is not measured. Geometries the int8 kernels do not
 serve default to `bf16`: Qwen3.6-122B (32 x 2 heads) defaults to bf16 because
 the int8 verify cannot split an 8-row block at gqa 16. An f16-compute checkpoint
 (`mlx convert --dtype float16`) also defaults to bf16 K/V: the int8 kernels take
-BF16 queries. The block-paged
-pool ignores the option and stays bf16, so on a paged load only DFlash2 turns
-write int8. `contextLimits().kvFormat` names the format of the pool lane
+BF16 queries. The option sets both the block-paged pool and the flat
+(DFlash2) cache; an explicit `int8` the kernels cannot serve fails the load.
+`contextLimits().kvFormat` names the format of the pool lane
 (`effectiveWindowTokens`) and `.speculativeKvFormat` the DFlash2 lane's
 (`speculativeWindowTokens`). `mlx serve --kv-format` and `mlx agent
 --kv-format` set it for served qwen3_5 / qwen3_5_moe loads. `mlx eval score

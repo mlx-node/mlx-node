@@ -512,7 +512,7 @@ fn read_passthrough_bytes(src: &PassthroughSource) -> Result<Vec<u8>> {
 /// the sorted `model-*-of-*.safetensors` shards. Stray or auxiliary
 /// `.safetensors` files in the directory are deliberately ignored so a sharded
 /// lookup resolves against the same files that produced the sanitized params.
-fn checkpoint_safetensors_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+pub(crate) fn checkpoint_safetensors_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     for single in ["weights.safetensors", "model.safetensors"] {
         let p = dir.join(single);
         if p.exists() {

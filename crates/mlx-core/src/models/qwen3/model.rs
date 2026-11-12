@@ -1127,8 +1127,7 @@ impl Qwen3Inner {
         //
         // Cache dtype: BFloat16 (Qwen3's production dtype). FP16 is also
         // supported by `LayerKVPool` for non-Qwen3 callers, but Qwen3 weights
-        // ship as BF16 so we hard-code that here. FP8 mode is intentionally
-        // not plumbed through this path.
+        // ship as BF16 so we hard-code that here.
         // Default to ON: paged-vs-flat parity verified via
         // `qwen3_paged_vs_flat_parity` integration test (greedy byte-equal +
         // prefix-reuse byte-equal at BF16 against real Qwen3-0.6B weights).
@@ -1149,8 +1148,6 @@ impl Qwen3Inner {
                 head_size: config.head_dim as u32,
                 num_kv_heads: config.num_kv_heads as u32,
                 num_layers: config.num_layers as u32,
-                // FP8 mode is not plumbed through this path; always false here.
-                use_fp8_cache: Some(false),
                 max_seq_len: Some(config.max_position_embeddings as u32),
                 max_batch_size: Some(scheduler_max_num_seqs_for(32) as u32),
             };
@@ -1277,7 +1274,6 @@ impl Qwen3Inner {
             head_size: self.config.head_dim as u32,
             num_kv_heads: self.config.num_kv_heads as u32,
             num_layers: self.config.num_layers as u32,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(per_seq_context),
             max_batch_size: Some(scheduler_max_num_seqs_for(32) as u32),
         };
@@ -5158,7 +5154,7 @@ mod tests {
 
     /// Tiny config compatible with the block-paged adapter's
     /// `PagedAttentionConfig::validate` constraints (head_size in the
-    /// allowed set, FP8 off, etc.). Mirrors the `tiny_config` helpers in
+    /// allowed set, etc.). Mirrors the `tiny_config` helpers in
     /// `utils/functional.rs` but with `head_dim = 32` so the LayerKVPool
     /// constructor accepts it.
     ///

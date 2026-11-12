@@ -24,10 +24,6 @@ pub struct ReshapeAndCacheParams {
     pub value_stride: i32,
     /// X factor for key cache layout (typically 16 / sizeof(dtype))
     pub x: i32,
-    /// K scale for FP8 quantization (1.0 for non-FP8)
-    pub k_scale: f32,
-    /// V scale for FP8 quantization (1.0 for non-FP8)
-    pub v_scale: f32,
 }
 
 impl Default for ReshapeAndCacheParams {
@@ -40,8 +36,6 @@ impl Default for ReshapeAndCacheParams {
             key_stride: 0,
             value_stride: 0,
             x: 8,
-            k_scale: 1.0,
-            v_scale: 1.0,
         }
     }
 }
@@ -62,9 +56,8 @@ pub struct RawBufferInfo {
 /// This variant is used when integrating with MLX arrays, where we extract
 /// raw Metal buffer pointers instead of having owned `Buffer` references.
 ///
-/// `input_dtype` is the dtype of the K/V buffers, `cache_dtype` is the
-/// on-cache element type (`UChar` for FP8). See [`dispatch_reshape_and_cache`]
-/// for the full discussion of why these are split.
+/// `input_dtype` is the dtype of the K/V buffers, `cache_dtype` the
+/// on-cache element type; the metallib has only equal pairs.
 ///
 /// # Safety
 ///
@@ -87,11 +80,7 @@ pub unsafe fn dispatch_reshape_and_cache_raw(
 ) -> Result<(), String> {
     let state = MetalState::get()?;
 
-    // Determine if using FP8 based on cache dtype.
-    let use_fp8 = cache_dtype.is_fp8();
-
-    // Get pipeline for this (input, cache) pair.
-    let kernel_name = MetalState::reshape_and_cache_kernel_name(input_dtype, cache_dtype, use_fp8);
+    let kernel_name = MetalState::reshape_and_cache_kernel_name(input_dtype, cache_dtype);
     let pipeline = state.get_pipeline(&kernel_name)?;
 
     // Create command buffer and encoder
@@ -119,24 +108,6 @@ pub unsafe fn dispatch_reshape_and_cache_raw(
     encoder.set_buffer(3, Some(value_cache), 0);
     encoder.set_buffer(4, Some(slot_buffer_ref), slot_mapping.offset as u64);
 
-    // k_scale and v_scale - use params values for FP8
-    let k_scale_buffer = state
-        .device
-        .try_new_buffer_with_value(
-            &params.k_scale,
-            metal::MTLResourceOptions::StorageModeShared,
-        )
-        .ok_or_else(|| "Metal device failed to allocate k_scale buffer".to_string())?;
-    let v_scale_buffer = state
-        .device
-        .try_new_buffer_with_value(
-            &params.v_scale,
-            metal::MTLResourceOptions::StorageModeShared,
-        )
-        .ok_or_else(|| "Metal device failed to allocate v_scale buffer".to_string())?;
-    encoder.set_buffer(5, Some(&k_scale_buffer), 0);
-    encoder.set_buffer(6, Some(&v_scale_buffer), 0);
-
     // Set dimension constants as buffers
     let key_stride = params.key_stride;
     let value_stride = params.value_stride;
@@ -159,12 +130,12 @@ pub unsafe fn dispatch_reshape_and_cache_raw(
     let block_size_buf = create_const_buffer(block_size)?;
     let x_buf = create_const_buffer(x)?;
 
-    encoder.set_buffer(7, Some(&key_stride_buf), 0);
-    encoder.set_buffer(8, Some(&value_stride_buf), 0);
-    encoder.set_buffer(9, Some(&num_heads_buf), 0);
-    encoder.set_buffer(10, Some(&head_size_buf), 0);
-    encoder.set_buffer(11, Some(&block_size_buf), 0);
-    encoder.set_buffer(12, Some(&x_buf), 0);
+    encoder.set_buffer(5, Some(&key_stride_buf), 0);
+    encoder.set_buffer(6, Some(&value_stride_buf), 0);
+    encoder.set_buffer(7, Some(&num_heads_buf), 0);
+    encoder.set_buffer(8, Some(&head_size_buf), 0);
+    encoder.set_buffer(9, Some(&block_size_buf), 0);
+    encoder.set_buffer(10, Some(&x_buf), 0);
 
     // Dispatch: 1 threadgroup per token, 256 threads per threadgroup
     let threads_per_threadgroup = MTLSize::new(256, 1, 1);

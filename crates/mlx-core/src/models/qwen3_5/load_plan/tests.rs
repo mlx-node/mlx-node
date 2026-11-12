@@ -1,12 +1,115 @@
 use super::*;
 
-/// The 27B runway: 2,048 tokens of 16-token blocks and its 153,944,064-byte
-/// GDN cell in 1 MiB blocks (147). Mutation: drop the recurrent cell from
-/// `qwen35_runway_blocks` → red (128).
+/// The runway follows the layout's `kvRunwayPages` and adds one GDN cell of
+/// blocks: bf16 27B 64 pages (2,048 tokens) + 147 = 275; int8 27B one
+/// 128-page extent (4,096 tokens) + 290 = 546; int8 35B (2 heads) one
+/// 256-page extent (8,192 tokens) + its cell. Mutation W2: tokens fixed at
+/// 2,048 → int8 27B 418 → red.
 #[test]
-fn qwen38_27b_runway_is_275_blocks() {
-    assert_eq!(qwen35_runway_blocks(16, 1 << 20, 153_944_064), 128 + 147);
-    assert_eq!(qwen35_runway_blocks(16, 1 << 20, 0), 128);
+fn qwen35_runway_follows_kv_runway_pages() {
+    let layout = |layers, heads, format| KvLayout::of(layers, heads, 256, DType::BFloat16, format);
+    let bf16 = layout(16, 4, KvFormat::Bf16);
+    let int8 = layout(16, 4, KvFormat::Int8);
+    assert_eq!(
+        qwen35_runway_blocks(16, 1 << 20, 153_944_064, &bf16),
+        128 + 147
+    );
+    assert_eq!(qwen35_runway_blocks(16, 1 << 20, 0, &bf16), 128);
+    assert_eq!(
+        qwen35_runway_blocks(16, 532_480, 153_944_064, &int8),
+        256 + 290
+    );
+    let moe = layout(10, 2, KvFormat::Int8);
+    assert_eq!(moe.runway_pages(), 256);
+    let bpb = mlx_paged_attn::profile::bytes_per_block(
+        10,
+        2,
+        256,
+        16,
+        mlx_paged_attn::metal::MetalDtype::Int8,
+    )
+    .unwrap();
+    assert_eq!(bpb, 166_400);
+    assert_eq!(
+        qwen35_runway_blocks(16, bpb, 64_389_120, &moe),
+        512 + 64_389_120u64.div_ceil(166_400) as u32
+    );
+}
+
+/// The pool's element type: bf16 for any geometry; int8 only where the int8
+/// store and paged attention kernels exist (head 128 / 256, 16- / 32-token
+/// blocks, BF16 rows), else the load fails with the kernel named.
+/// Mutation D2: the helper returns Int8 without the kernel check → red.
+#[test]
+fn int8_pool_without_a_kernel_fails_the_load() {
+    use mlx_paged_attn::metal::MetalDtype;
+    let dtype = |format, head, bs, compute| qwen35_pool_cache_dtype("t", format, head, bs, compute);
+    assert_eq!(
+        dtype(KvFormat::Int8, 256, 16, DType::BFloat16).unwrap(),
+        MetalDtype::Int8
+    );
+    assert_eq!(
+        dtype(KvFormat::Int8, 128, 32, DType::BFloat16).unwrap(),
+        MetalDtype::Int8
+    );
+    for (head, bs, compute) in [(256, 16, DType::Float16), (64, 16, DType::BFloat16)] {
+        assert_eq!(
+            dtype(KvFormat::Bf16, head, bs, compute).unwrap(),
+            MetalDtype::BFloat16
+        );
+    }
+    for (head, bs, compute) in [
+        (64, 16, DType::BFloat16),
+        (256, 8, DType::BFloat16),
+        (256, 16, DType::Float16),
+    ] {
+        let error = dtype(KvFormat::Int8, head, bs, compute).unwrap_err();
+        assert!(
+            error.reason.contains("no int8 paged attention kernel")
+                && error.reason.contains("kvFormat 'bf16'"),
+            "{}",
+            error.reason
+        );
+    }
+}
+
+/// The unset default is int8 only where the pool would get int8 pages, so a
+/// default load never fails: a paged 8-token block keeps bf16, a 16-token
+/// block or a flat load takes int8 (Metal, head 256, GQA 6, BF16). An
+/// explicit int8 stays int8.
+/// Mutation B1: the default ignores the block size → red.
+#[test]
+fn unset_kv_format_defaults_to_int8_only_where_the_pool_has_kernels() {
+    if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+        return;
+    }
+    let mut config = crate::models::qwen3_5::dflash2_decode::tests::qwen38_27b_cfg();
+    config.kv_format = None;
+    config.use_block_paged_cache = None;
+    config.paged_block_size = Some(16);
+    assert_eq!(config.kv_format_for(DType::BFloat16), KvFormat::Int8);
+    config.paged_block_size = Some(8);
+    assert_eq!(config.kv_format_for(DType::BFloat16), KvFormat::Bf16);
+    config.use_block_paged_cache = Some(false);
+    assert_eq!(config.kv_format_for(DType::BFloat16), KvFormat::Int8);
+    config.use_block_paged_cache = None;
+    config.kv_format = Some("int8".to_string());
+    assert_eq!(config.kv_format_for(DType::BFloat16), KvFormat::Int8);
+}
+
+/// A saved config never carries the load's pinned `kv_format` (Splash
+/// `--kv-format` is a runtime option), while a source config.json's value is
+/// still read. Mutation: drop `skip_serializing` → red.
+#[test]
+fn pinned_kv_format_is_never_saved() {
+    let mut config = crate::models::qwen3_5::dflash2_decode::tests::qwen38_27b_cfg();
+    config.pin_kv_format(Some(KvFormat::Int8), DType::BFloat16);
+    let saved = serde_json::to_value(&config).unwrap();
+    assert!(saved.get("kv_format").is_none(), "{saved}");
+    let mut source = saved;
+    source["kv_format"] = serde_json::json!("bf16");
+    let read: super::super::config::Qwen3_5Config = serde_json::from_value(source).unwrap();
+    assert_eq!(read.kv_format.as_deref(), Some("bf16"));
 }
 
 /// `maxMemoryBytes` reaches the plan as given and is refused unless
@@ -24,6 +127,14 @@ fn max_memory_load_option_reaches_the_plan() {
             err.reason,
             "Qwen3.5 load: maxMemoryBytes must be a positive byte count"
         );
+    }
+}
+
+/// A BF16 checkpoint with no `mtp.*` weights.
+fn bf16_header() -> CheckpointHeader {
+    CheckpointHeader {
+        compute: DType::BFloat16,
+        mtp: HashMap::new(),
     }
 }
 
@@ -152,6 +263,7 @@ fn estimate_matches_the_load_plan() {
             asset_dir: &target,
             moe: false,
             weight_bytes,
+            header: bf16_header(),
             draft_dir: Some(&draft),
             kv_format: None,
             max_memory_bytes: None,
@@ -173,7 +285,7 @@ fn estimate_matches_the_load_plan() {
         4,
         256,
         block_size,
-        mlx_paged_attn::metal::MetalDtype::BFloat16,
+        qwen35_pool_cache_dtype("t", format, 256, block_size, DType::BFloat16).unwrap(),
     )
     .unwrap();
     let lanes = LoadLanes {
@@ -181,6 +293,7 @@ fn estimate_matches_the_load_plan() {
         recurrent_state_bytes: config.recurrent_state_bytes(),
         pool: crate::engine::persistence::compiled_forward_backend_available().then_some(
             PoolGeometry {
+                format,
                 bytes_per_block,
                 block_size,
                 layers: 16,
@@ -190,6 +303,8 @@ fn estimate_matches_the_load_plan() {
         draft: Some(DraftTerms::of(&draft_config, 1_357 * MIB)),
         format,
         dtype: DType::BFloat16,
+        mtp: false,
+        mtp_state_in_pool: false,
     };
     let plan = evaluate_qwen35_plan(
         "Qwen3.5",
@@ -244,6 +359,7 @@ fn estimate_follows_the_sym8_flat_pin() {
             asset_dir: &target,
             moe: false,
             weight_bytes: 16_000 << 20,
+            header: bf16_header(),
             draft_dir: None,
             kv_format: None,
             max_memory_bytes: None,
@@ -295,6 +411,7 @@ fn flat_load_is_planned_under_max_memory() {
                 asset_dir: &target,
                 moe: false,
                 weight_bytes: 1 << 30,
+                header: bf16_header(),
                 draft_dir: None,
                 kv_format: None,
                 max_memory_bytes,
@@ -359,6 +476,7 @@ fn max_context_caps_the_flat_lane() {
                 asset_dir: &target,
                 moe: false,
                 weight_bytes: 1 << 30,
+                header: bf16_header(),
                 draft_dir: None,
                 kv_format: None,
                 max_memory_bytes: Some(4 << 30),
@@ -493,6 +611,7 @@ fn estimate_27b(
             asset_dir: &target,
             moe: false,
             weight_bytes: 16_000 * MIB,
+            header: bf16_header(),
             draft_dir: Some(&draft),
             kv_format: None,
             max_memory_bytes,
@@ -517,6 +636,38 @@ fn plan_27b_with_draft(
     max_context: Option<u32>,
     draft_trained: u32,
 ) -> MemoryPlan {
+    plan_27b_as(tag, working_set, max_context, draft_trained, None)
+}
+
+/// [`plan_27b_with_draft`] with the load's `kvFormat`.
+fn plan_27b_as(
+    tag: &str,
+    working_set: u64,
+    max_context: Option<u32>,
+    draft_trained: u32,
+    kv_format: Option<KvFormat>,
+) -> MemoryPlan {
+    plan_27b_lanes(
+        tag,
+        working_set,
+        max_context,
+        draft_trained,
+        kv_format,
+        None,
+    )
+}
+
+/// [`plan_27b_as`]; with `mtp` set, the target has one MTP layer and no
+/// draft, and `mtp` says whether the scheduler books the MTP state in the
+/// pool.
+fn plan_27b_lanes(
+    tag: &str,
+    working_set: u64,
+    max_context: Option<u32>,
+    draft_trained: u32,
+    kv_format: Option<KvFormat>,
+    mtp: Option<bool>,
+) -> MemoryPlan {
     let target = estimate_fixture_dir(tag);
     let draft = estimate_fixture_dir(&format!("{tag}-draft"));
     write_27b_fixture(&target, &draft);
@@ -531,7 +682,10 @@ fn plan_27b_with_draft(
     let mut config = crate::models::qwen3_5::persistence::parse_config(&raw).unwrap();
     config.rope_scaling =
         Some(RopeScaling::served_for("Qwen3.5", 262_144, config.scaling(), max_context).unwrap());
-    let format = config.pin_kv_format(None, DType::BFloat16);
+    if mtp.is_some() {
+        config.n_mtp_layers = 1;
+    }
+    let format = config.pin_kv_format(kv_format, DType::BFloat16);
     let draft_config = crate::models::qwen3_5::dflash2::read_dflash2_config(&draft).unwrap();
     std::fs::remove_dir_all(&target).unwrap();
     std::fs::remove_dir_all(&draft).unwrap();
@@ -541,21 +695,26 @@ fn plan_27b_with_draft(
         4,
         256,
         block_size,
-        mlx_paged_attn::metal::MetalDtype::BFloat16,
+        qwen35_pool_cache_dtype("t", format, 256, block_size, DType::BFloat16).unwrap(),
     )
     .unwrap();
     let lanes = LoadLanes {
         config: &config,
         recurrent_state_bytes: config.recurrent_state_bytes(),
         pool: Some(PoolGeometry {
+            format,
             bytes_per_block,
             block_size,
             layers: 16,
             explicit_mib: None,
         }),
-        draft: Some(DraftTerms::of(&draft_config, 1_357 * MIB)),
+        draft: mtp
+            .is_none()
+            .then(|| DraftTerms::of(&draft_config, 1_357 * MIB)),
         format,
         dtype: DType::BFloat16,
+        mtp: mtp.is_some(),
+        mtp_state_in_pool: mtp.unwrap_or(false),
     };
     evaluate_qwen35_plan(
         "Qwen3.5",
@@ -684,6 +843,7 @@ fn unplanned_estimate_refuses_what_the_load_refuses() {
                 asset_dir: &target,
                 moe: false,
                 weight_bytes: 16_000 << 20,
+                header: bf16_header(),
                 draft_dir: None,
                 kv_format: None,
                 max_memory_bytes: None,
@@ -703,4 +863,536 @@ fn unplanned_estimate_refuses_what_the_load_refuses() {
         "Qwen3.5: --max-context 300000 is past the native window of 262144, and this load has \
          no memory plan to hold it"
     );
+}
+
+/// The int8 pool window from the plan on the M3 Pro inputs (27 GiB working
+/// set, 17,357 MiB active, the 27B with its DFlash2 draft): the pool lane is
+/// priced in int8 pages (1,064,960 B a 32-token page, 128-page extents), its
+/// runway is one extent plus a GDN cell, and its transient is the bounded
+/// int8 varlen workspace. A bf16 pool on the same inputs holds less than
+/// half the window.
+/// Mutation W1: the pool lane's layout keeps `KvFormat::Bf16` → window
+/// 53,849 → red.
+#[test]
+fn int8_pool_window_from_the_plan() {
+    let int8 = plan_27b_as("int8-window", 27 << 30, None, 262_144, Some(KvFormat::Int8));
+    let pool = int8.pool.expect("pool lane");
+    assert_eq!(pool.bytes_per_block, 532_480);
+    assert_eq!(pool.max_blocks, 6_932);
+    assert_eq!(pool.max_mib(), 3_520);
+    assert_eq!(pool.runway_blocks, 546);
+    assert_eq!(pool.lane.transient_bytes, 419_823_616);
+    assert_eq!(pool.lane.extent_pages, 128);
+    assert_eq!(pool.lane.window.maximum(), 102_393);
+    assert_eq!(pool.lane.window.bound(), "memory");
+    let speculative = int8.speculative.expect("draft lane");
+    assert_eq!(speculative.held_bytes, 546 * 532_480);
+    eprintln!(
+        "int8 pool: DFlash2 lane window {}",
+        speculative.window.maximum()
+    );
+
+    let bf16 = plan_27b_as("bf16-window", 27 << 30, None, 262_144, Some(KvFormat::Bf16));
+    let pool = bf16.pool.expect("pool lane");
+    assert_eq!(pool.bytes_per_block, 1 << 20);
+    assert_eq!(pool.runway_blocks, 275);
+    eprintln!(
+        "bf16 pool: window {} max_blocks {} transient {}",
+        pool.lane.window.maximum(),
+        pool.max_blocks,
+        pool.lane.transient_bytes
+    );
+    assert!(2 * pool.lane.window.maximum() < 102_393);
+}
+
+/// One window for every non-DFlash2 turn: a load that can run MTP turns on
+/// the pool lane (MTP heads, no draft) charges the MTP state it holds at the
+/// window once, beside the pool (Splash `laneStateBytes`), and inside the
+/// pool too only when the scheduler books it there. M3 Pro inputs, int8
+/// pool: 55,207 (3,874 blocks) for a serial MTP load, 20,473 when the
+/// scheduler books the state in the pool, against 102,393 without MTP
+/// heads. `lane_bytes` carries the cell and the state at the window.
+/// Mutation O1: `LaneKv::Pool::budget` ignores the state → red (102,393).
+#[test]
+fn mtp_state_prices_the_one_pool_window() {
+    let cell = 153_944_064u64;
+    let config = {
+        let mut config = crate::models::qwen3_5::dflash2_decode::tests::qwen38_27b_cfg();
+        config.n_mtp_layers = 1;
+        config
+    };
+    let serial = plan_27b_lanes(
+        "mtp-serial",
+        27 << 30,
+        None,
+        262_144,
+        Some(KvFormat::Int8),
+        Some(false),
+    );
+    let pool = serial.pool.expect("pool lane");
+    assert_eq!(pool.lane.window.maximum(), 55_207);
+    assert_eq!(pool.max_blocks, 3_874);
+    assert_eq!(
+        pool.lane.lane_bytes,
+        cell + crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::held_bytes(
+            &config, 55_207
+        )
+    );
+    assert!(serial.speculative.is_none());
+    let booked = plan_27b_lanes(
+        "mtp-booked",
+        27 << 30,
+        None,
+        262_144,
+        Some(KvFormat::Int8),
+        Some(true),
+    );
+    assert_eq!(
+        booked.pool.expect("pool lane").lane.window.maximum(),
+        20_473
+    );
+}
+
+/// A safetensors file of zero-filled `tensors` (name, dtype, shape).
+fn write_safetensors(path: &std::path::Path, tensors: &[(&str, &str, &[usize])]) {
+    let mut header = serde_json::Map::new();
+    let mut end = 0usize;
+    for (name, dtype, shape) in tensors {
+        let width = match *dtype {
+            "F32" | "U32" => 4,
+            "F16" | "BF16" => 2,
+            _ => 1,
+        };
+        let bytes = width * shape.iter().product::<usize>();
+        header.insert(
+            name.to_string(),
+            serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [end, end + bytes]}),
+        );
+        end += bytes;
+    }
+    let mut json = serde_json::Value::Object(header).to_string();
+    while !json.len().is_multiple_of(8) {
+        json.push(' ');
+    }
+    let mut file = (json.len() as u64).to_le_bytes().to_vec();
+    file.extend_from_slice(json.as_bytes());
+    file.resize(file.len() + end, 0);
+    std::fs::write(path, file).unwrap();
+}
+
+/// The window, or the refusal, a load of the 27B fixture whose embedding
+/// computes in `compute` plans with 16,000 MiB of weights and no draft on
+/// the M3 Pro working set: the load's own format pin, pool dtype and lane
+/// dtype for that compute dtype. `mtp` is the load's `has_mtp_weights`.
+fn load_window(
+    target: &std::path::Path,
+    compute: DType,
+    kv_format: Option<KvFormat>,
+    mtp: bool,
+) -> Result<u32> {
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
+            .unwrap();
+    let mut config = crate::models::qwen3_5::persistence::parse_config(&raw).unwrap();
+    config.rope_scaling =
+        Some(RopeScaling::served_for("Qwen3.5", 262_144, config.scaling(), None).unwrap());
+    let format = config.pin_kv_format(kv_format, compute);
+    let pool = if crate::engine::persistence::compiled_forward_backend_available() {
+        let block_size = config.paged_block_size();
+        let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
+            16,
+            4,
+            256,
+            block_size,
+            qwen35_pool_cache_dtype("Qwen3.5", format, 256, block_size, compute)?,
+        )
+        .unwrap();
+        Some(PoolGeometry {
+            format,
+            bytes_per_block,
+            block_size,
+            layers: 16,
+            explicit_mib: None,
+        })
+    } else {
+        None
+    };
+    let lanes = LoadLanes {
+        config: &config,
+        recurrent_state_bytes: config.recurrent_state_bytes(),
+        pool,
+        draft: None,
+        format,
+        dtype: compute,
+        mtp,
+        mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
+    };
+    let plan = evaluate_qwen35_plan(
+        "Qwen3.5",
+        &lanes,
+        LiveMemory {
+            working_set_bytes: 27 << 30,
+            active_bytes: 16_000 * MIB,
+            registered_pool_bytes: 0,
+        },
+        None,
+    )?;
+    Ok(plan
+        .pool
+        .map(|pool| pool.lane)
+        .or(plan.flat)
+        .expect("a lane")
+        .window
+        .maximum())
+}
+
+/// The estimate resolves the compute dtype from the weights' headers by the
+/// loaders' rule, so it pins the format and sizes the pool as the load
+/// does: an f16 embedding gets the bf16 pool the load builds and an
+/// explicit int8 fails with the load's refusal; a bf16 one gets int8 on
+/// Metal. The header dtype equals what the loaded arrays give the rule.
+/// Mutation CD1: the estimate pins BF16 again → red (f16 sized as int8).
+#[test]
+fn estimate_resolves_the_compute_dtype_like_the_load() {
+    for (tag, dtype, compute) in [
+        ("f16", "F16", DType::Float16),
+        ("bf16", "BF16", DType::BFloat16),
+    ] {
+        let target = estimate_fixture_dir(&format!("compute-{tag}"));
+        let draft = estimate_fixture_dir(&format!("compute-{tag}-draft"));
+        write_27b_fixture(&target, &draft);
+        write_safetensors(
+            &target.join("model.safetensors"),
+            &[
+                ("model.language_model.embed_tokens.weight", dtype, &[8, 4]),
+                ("model.language_model.norm.weight", dtype, &[4]),
+            ],
+        );
+        let resolved = checkpoint_header(&CheckpointSource::Dir(target.clone()), false)
+            .expect("header compute dtype")
+            .compute;
+        assert_eq!(resolved, compute, "{tag}");
+        let loaded: std::collections::HashMap<String, crate::array::MxArray> =
+            crate::engine::persistence::load_all_safetensors(&target, false)
+                .unwrap()
+                .into_iter()
+                .filter_map(|(key, array)| {
+                    Some((
+                        crate::models::qwen3_5::persistence::qwen35_text_key(&key)?,
+                        array,
+                    ))
+                })
+                .collect();
+        assert_eq!(
+            crate::models::qwen3_5::persistence::embedding_compute_dtype(&loaded),
+            resolved,
+            "{tag}: the load's rule on the loaded arrays"
+        );
+        for kv_format in [None, Some(KvFormat::Int8)] {
+            crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| {
+                cell.set(Some(LiveMemory {
+                    working_set_bytes: 27 << 30,
+                    active_bytes: 0,
+                    registered_pool_bytes: 0,
+                }))
+            });
+            let estimate = estimate_qwen35_load(
+                "Qwen3.5",
+                &EstimateInput {
+                    asset_dir: &target,
+                    moe: false,
+                    weight_bytes: 16_000 * MIB,
+                    header: CheckpointHeader {
+                        compute: resolved,
+                        mtp: HashMap::new(),
+                    },
+                    draft_dir: None,
+                    kv_format,
+                    max_memory_bytes: None,
+                    max_context: None,
+                },
+            );
+            crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
+            match (estimate, load_window(&target, compute, kv_format, false)) {
+                (Ok(estimate), Ok(window)) => assert_eq!(
+                    estimate.expect("readable device").window_tokens,
+                    window,
+                    "{tag} {kv_format:?}"
+                ),
+                (Err(estimate), Err(load)) => {
+                    assert_eq!(estimate.reason, load.reason, "{tag} {kv_format:?}")
+                }
+                (estimate, load) => panic!(
+                    "{tag} {kv_format:?}: estimate {:?} but load {:?}",
+                    estimate.map(|e| e.map(|e| e.window_tokens)),
+                    load
+                ),
+            }
+        }
+        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::remove_dir_all(&draft).unwrap();
+    }
+}
+
+/// The MoE estimate takes the MoE loader's rule: f16 affine embedding
+/// scales beside bf16 norms are aligned to bf16 (`settle_compute_dtype`),
+/// while the dense loader keeps f16 compute for the same tensors.
+/// Mutation CD2: the MoE estimate takes the dense rule → red (F16).
+#[test]
+fn moe_estimate_aligns_the_affine_embedding() {
+    let target = estimate_fixture_dir("compute-moe");
+    let draft = estimate_fixture_dir("compute-moe-draft");
+    write_27b_fixture(&target, &draft);
+    write_safetensors(
+        &target.join("model.safetensors"),
+        &[
+            ("model.language_model.embed_tokens.weight", "U32", &[8, 1]),
+            ("model.language_model.embed_tokens.scales", "F16", &[8, 1]),
+            ("model.language_model.embed_tokens.biases", "F16", &[8, 1]),
+            (
+                "model.language_model.layers.0.input_layernorm.weight",
+                "BF16",
+                &[4],
+            ),
+            ("model.language_model.norm.weight", "BF16", &[4]),
+        ],
+    );
+    let source = CheckpointSource::Dir(target.clone());
+    let moe = checkpoint_header(&source, true)
+        .expect("MoE compute dtype")
+        .compute;
+    let dense = checkpoint_header(&source, false)
+        .expect("dense compute dtype")
+        .compute;
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_dir_all(&draft).unwrap();
+    assert_eq!(moe, DType::BFloat16);
+    assert_eq!(dense, DType::Float16);
+}
+
+/// The MTP head's tensors in the raw checkpoint naming, every one present
+/// for one dense MTP layer.
+const DENSE_MTP_HEAD: [&str; 15] = [
+    "mtp.fc.weight",
+    "mtp.norm.weight",
+    "mtp.pre_fc_norm_embedding.weight",
+    "mtp.pre_fc_norm_hidden.weight",
+    "mtp.layers.0.input_layernorm.weight",
+    "mtp.layers.0.post_attention_layernorm.weight",
+    "mtp.layers.0.self_attn.q_norm.weight",
+    "mtp.layers.0.self_attn.k_norm.weight",
+    "mtp.layers.0.self_attn.q_proj.weight",
+    "mtp.layers.0.self_attn.k_proj.weight",
+    "mtp.layers.0.self_attn.v_proj.weight",
+    "mtp.layers.0.self_attn.o_proj.weight",
+    "mtp.layers.0.mlp.gate_proj.weight",
+    "mtp.layers.0.mlp.up_proj.weight",
+    "mtp.layers.0.mlp.down_proj.weight",
+];
+
+/// Adds `fields` to the fixture's `config.json`.
+fn extend_config(target: &std::path::Path, fields: serde_json::Value) {
+    let path = target.join("config.json");
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for (key, value) in fields.as_object().unwrap() {
+        raw[key] = value.clone();
+    }
+    std::fs::write(&path, raw.to_string()).unwrap();
+}
+
+/// The checkpoint's tensors as the load reads them, under the sanitized
+/// (renamed) keys.
+fn loaded_text_params(
+    target: &std::path::Path,
+) -> std::collections::HashMap<String, crate::array::MxArray> {
+    crate::engine::persistence::load_all_safetensors(target, false)
+        .unwrap()
+        .into_iter()
+        .filter_map(|(key, array)| {
+            Some((
+                crate::models::qwen3_5::persistence::qwen35_text_key(&key)?,
+                array,
+            ))
+        })
+        .collect()
+}
+
+/// The estimate charges the MTP state only when the load turns the head on:
+/// the loaders' completeness gate (`missing_required_mtp_keys`) over the
+/// header's `mtp.*` keys. A 27B fixture that declares one MTP layer: with
+/// every head weight the estimate takes the load's MTP window; with
+/// `o_proj` missing the load runs without MTP and so does the estimate.
+/// Mutation M1: the estimate prices MTP from `n_mtp_layers` alone → red
+/// (the partial head charged).
+#[test]
+fn estimate_prices_mtp_only_when_the_load_enables_it() {
+    let mut windows = Vec::new();
+    for missing in [None, Some("mtp.layers.0.self_attn.o_proj.weight")] {
+        let tag = if missing.is_some() {
+            "partial"
+        } else {
+            "complete"
+        };
+        let target = estimate_fixture_dir(&format!("mtp-{tag}"));
+        let draft = estimate_fixture_dir(&format!("mtp-{tag}-draft"));
+        write_27b_fixture(&target, &draft);
+        extend_config(&target, serde_json::json!({"mtp_num_hidden_layers": 1}));
+        let mut tensors: Vec<(&str, &str, &[usize])> = vec![
+            ("model.language_model.embed_tokens.weight", "BF16", &[8, 4]),
+            ("model.language_model.norm.weight", "BF16", &[4]),
+        ];
+        for name in DENSE_MTP_HEAD {
+            if Some(name) != missing {
+                tensors.push((name, "BF16", &[4, 4]));
+            }
+        }
+        write_safetensors(&target.join("model.safetensors"), &tensors);
+        let header = checkpoint_header(&CheckpointSource::Dir(target.clone()), false)
+            .expect("checkpoint header");
+        let loads = crate::models::mtp_drafter::missing_required_mtp_keys(
+            &loaded_text_params(&target),
+            crate::models::mtp_drafter::DrafterBodyVariant::Dense,
+            1,
+        )
+        .is_empty();
+        assert_eq!(loads, missing.is_none(), "{tag}: the load's gate");
+        crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| {
+            cell.set(Some(LiveMemory {
+                working_set_bytes: 27 << 30,
+                active_bytes: 0,
+                registered_pool_bytes: 0,
+            }))
+        });
+        let estimate = estimate_qwen35_load(
+            "Qwen3.5",
+            &EstimateInput {
+                asset_dir: &target,
+                moe: false,
+                weight_bytes: 16_000 * MIB,
+                header,
+                draft_dir: None,
+                kv_format: None,
+                max_memory_bytes: None,
+                max_context: None,
+            },
+        );
+        crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
+        let window = load_window(&target, DType::BFloat16, None, loads).expect("load plan");
+        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::remove_dir_all(&draft).unwrap();
+        assert_eq!(
+            estimate
+                .expect("estimate")
+                .expect("readable device")
+                .window_tokens,
+            window,
+            "{tag}"
+        );
+        windows.push(window);
+    }
+    if crate::engine::persistence::compiled_forward_backend_available() {
+        assert!(
+            windows[0] < windows[1],
+            "the complete head is charged its MTP state: {windows:?}"
+        );
+    }
+}
+
+/// The MoE header names the inline MTP experts as `sanitize_weights` does:
+/// per-expert tensors, and a fused `experts.gate_up_proj` with
+/// `experts.down_proj`, both land on `switch_mlp`, so the loaders' gate
+/// reads the same `mtp.*` keys (and dtypes) from the header as from the
+/// sanitized arrays, and finds the head complete.
+/// Mutation M2: `mtp_expert_keys` keeps the raw name → red.
+#[test]
+fn moe_header_names_mtp_experts_like_the_sanitizer() {
+    let common = [
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.mlp.gate.weight",
+        "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+        "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+        "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+        "mtp.layers.0.mlp.shared_expert_gate.weight",
+    ];
+    let per_expert: Vec<String> = (0..2)
+        .flat_map(|expert| {
+            ["gate_proj", "up_proj", "down_proj"]
+                .map(|proj| format!("mtp.layers.0.mlp.experts.{expert}.{proj}.weight"))
+        })
+        .collect();
+    let fused = [
+        "mtp.layers.0.mlp.experts.gate_up_proj".to_string(),
+        "mtp.layers.0.mlp.experts.down_proj".to_string(),
+    ];
+    for (tag, experts) in [
+        ("per-expert", per_expert.as_slice()),
+        ("fused", fused.as_slice()),
+    ] {
+        let target = estimate_fixture_dir(&format!("moe-mtp-{tag}"));
+        let draft = estimate_fixture_dir(&format!("moe-mtp-{tag}-draft"));
+        write_27b_fixture(&target, &draft);
+        extend_config(
+            &target,
+            serde_json::json!({
+                "model_type": "qwen3_5_moe",
+                "num_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 4,
+                "mtp_num_hidden_layers": 1,
+            }),
+        );
+        let mut tensors: Vec<(&str, &str, &[usize])> = vec![
+            ("model.language_model.embed_tokens.weight", "BF16", &[8, 4]),
+            ("model.language_model.norm.weight", "BF16", &[4]),
+        ];
+        for name in common {
+            tensors.push((name, "BF16", &[4]));
+        }
+        for name in experts {
+            tensors.push((name.as_str(), "BF16", &[2, 4, 4]));
+        }
+        write_safetensors(&target.join("model.safetensors"), &tensors);
+        let header = checkpoint_header(&CheckpointSource::Dir(target.clone()), true)
+            .expect("checkpoint header");
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
+                .unwrap();
+        let config = crate::models::qwen3_5_moe::persistence::parse_config(&raw).unwrap();
+        let raw_params = crate::engine::persistence::load_all_safetensors(&target, false).unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
+        std::fs::remove_dir_all(&draft).unwrap();
+        let sanitized = crate::models::qwen3_5_moe::persistence::sanitize_weights(
+            raw_params,
+            &config,
+            &HashMap::new(),
+        )
+        .expect("sanitize");
+        let loaded: HashMap<String, DType> = sanitized
+            .iter()
+            .filter(|(key, _)| key.starts_with("mtp."))
+            .map(|(key, array)| (key.clone(), array.dtype().unwrap()))
+            .collect();
+        assert_eq!(header.mtp, loaded, "{tag}");
+        assert!(
+            crate::models::mtp_drafter::missing_required_mtp_keys(
+                &sanitized,
+                crate::models::mtp_drafter::DrafterBodyVariant::Moe,
+                1,
+            )
+            .is_empty(),
+            "{tag}: the fixture is a complete head"
+        );
+    }
 }

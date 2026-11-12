@@ -15,8 +15,6 @@ pub enum MetalDtype {
     Float32,
     Float16,
     BFloat16,
-    /// FP8 E4M3 format (1 byte per element)
-    UChar,
     /// Splash `kv::Format::Int8`: symmetric int8 with one f32 scale per
     /// token, head and side (`splash_store_kv_row`).
     Int8,
@@ -29,7 +27,6 @@ impl MetalDtype {
             MetalDtype::Float32 => "float",
             MetalDtype::Float16 => "half",
             MetalDtype::BFloat16 => "bfloat16_t",
-            MetalDtype::UChar => "uchar",
             MetalDtype::Int8 => "char",
         }
     }
@@ -39,13 +36,8 @@ impl MetalDtype {
         match self {
             MetalDtype::Float32 => 4,
             MetalDtype::Float16 | MetalDtype::BFloat16 => 2,
-            MetalDtype::UChar | MetalDtype::Int8 => 1,
+            MetalDtype::Int8 => 1,
         }
-    }
-
-    /// Check if this is an FP8 type
-    pub fn is_fp8(&self) -> bool {
-        matches!(self, MetalDtype::UChar)
     }
 
     /// Dtype of the rows written into and read out of a cache of this

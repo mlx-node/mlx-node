@@ -530,7 +530,7 @@ fn sanitize_weights(
     Ok(result)
 }
 
-fn normalize_mtp_weight_key(name: &str) -> Option<String> {
+pub(crate) fn normalize_mtp_weight_key(name: &str) -> Option<String> {
     // Shared longest-first chain (incl. `model.language_model.model.`) so raw
     // VLM-wrapped triple-prefix `mtp.*` keys survive — see
     // `mtp_drafter::strip_wrapper_prefix`.
@@ -554,7 +554,7 @@ fn push_sidecar_candidate(candidates: &mut Vec<PathBuf>, model_dir: &Path, rel: 
     }
 }
 
-fn mtp_sidecar_candidates(model_dir: &Path, raw: &Value) -> Vec<PathBuf> {
+pub(crate) fn mtp_sidecar_candidates(model_dir: &Path, raw: &Value) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(rel) = raw
         .get("mlx_lm_extra_tensors")
@@ -1240,66 +1240,6 @@ fn install_runtime_draft_lm_head(
     Ok(())
 }
 
-fn require_mtp_linear(params: &HashMap<String, MxArray>, prefix: &str, missing: &mut Vec<String>) {
-    let weight_key = format!("{prefix}.weight");
-    let Some(weight) = params.get(&weight_key) else {
-        missing.push(weight_key);
-        return;
-    };
-
-    if matches!(weight.dtype(), Ok(DType::Uint32)) {
-        let scales_key = format!("{prefix}.scales");
-        if !params.contains_key(&scales_key) {
-            missing.push(scales_key);
-        }
-    }
-}
-
-fn missing_mtp_required_weights(
-    params: &HashMap<String, MxArray>,
-    config: &Qwen3_5Config,
-) -> Vec<String> {
-    let mut missing = Vec::new();
-    // Norms are never quantized (`convert.rs::mtp_quant_decision` returns
-    // `Skip` for them), so a presence check is sufficient.
-    for key in [
-        "mtp.norm.weight",
-        "mtp.pre_fc_norm_hidden.weight",
-        "mtp.pre_fc_norm_embedding.weight",
-    ] {
-        if !params.contains_key(key) {
-            missing.push(key.to_string());
-        }
-    }
-
-    // `mtp.fc` is a linear that `--q-mtp all` affine-quantizes to a packed
-    // `Uint32` weight, so it needs the same dtype-aware check as the
-    // per-layer linears: a `Uint32` `mtp.fc.weight` without `mtp.fc.scales`
-    // would otherwise pass the gate and hit the dense `set_weight` branch in
-    // `Qwen3_5MTPModule::apply_weights` (garbage), instead of cleanly
-    // disabling MTP.
-    require_mtp_linear(params, "mtp.fc", &mut missing);
-
-    for layer_idx in 0..config.n_mtp_layers.max(0) {
-        let prefix = format!("mtp.layers.{layer_idx}");
-        for key in [
-            format!("{prefix}.input_layernorm.weight"),
-            format!("{prefix}.post_attention_layernorm.weight"),
-            format!("{prefix}.self_attn.q_norm.weight"),
-            format!("{prefix}.self_attn.k_norm.weight"),
-        ] {
-            if !params.contains_key(&key) {
-                missing.push(key);
-            }
-        }
-        for suffix in MTP_LAYER_LINEAR_SUFFIXES {
-            require_mtp_linear(params, &format!("{prefix}.{suffix}"), &mut missing);
-        }
-    }
-
-    missing
-}
-
 /// How the CLEF loader stores the quantized BACKBONE projections. A decide is
 /// one prefill forward — every weight is read exactly once at M = prompt
 /// length — so this is a GEMM-route choice. The embedding and lm_head are
@@ -1740,15 +1680,40 @@ fn apply_weights_inner(
 /// (whose `.scales` hold integer sub-block codes — the fp16 super-scale lives
 /// in `.biases`). Dense tables emit their own dtype.
 pub(crate) fn embedding_compute_dtype(params: &HashMap<String, MxArray>) -> DType {
-    params
-        .get("embedding.scales")
-        .and_then(|w| w.dtype().ok())
+    compute_dtype_of(&params_dtype(params))
+}
+
+/// [`embedding_compute_dtype`] over `dtype_of`, a sanitized key's dtype; the
+/// load-free estimate reads the same keys from the checkpoint headers.
+pub(crate) fn compute_dtype_of(dtype_of: &dyn Fn(&str) -> Option<DType>) -> DType {
+    dtype_of("embedding.scales")
         .map(|d| match d {
             DType::Float16 | DType::BFloat16 | DType::Float32 => d,
             _ => DType::BFloat16,
         })
-        .or_else(|| params.get("embedding.weight").and_then(|w| w.dtype().ok()))
+        .or_else(|| dtype_of("embedding.weight"))
         .unwrap_or(DType::BFloat16)
+}
+
+/// A sanitized key's dtype in `params`.
+pub(crate) fn params_dtype(
+    params: &HashMap<String, MxArray>,
+) -> impl Fn(&str) -> Option<DType> + '_ {
+    |key| params.get(key).and_then(|array| array.dtype().ok())
+}
+
+/// The key the dense and MoE sanitizers give a raw checkpoint key, `None`
+/// for a tensor they drop.
+pub(crate) fn qwen35_text_key(raw: &str) -> Option<String> {
+    crate::engine::persistence::rename_key(
+        raw,
+        &RenameSpec {
+            raw_rules: QWEN35_RAW_DROPS,
+            strip_prefixes: WRAPPER_STRIP_PREFIXES,
+            rules: QWEN35_KEY_RENAMES,
+            ..Default::default()
+        },
+    )
 }
 
 /// Pins the load's flat full-attention K/V format for the checkpoint's
@@ -2473,7 +2438,11 @@ fn apply_weights_inner_with_residency(
                 config.n_mtp_layers
             );
         } else {
-            let missing_mtp = missing_mtp_required_weights(params, config);
+            let missing_mtp = crate::models::mtp_drafter::missing_required_mtp_keys(
+                params,
+                crate::models::mtp_drafter::DrafterBodyVariant::Dense,
+                config.n_mtp_layers,
+            );
             if missing_mtp.is_empty() {
                 mtp.apply_weights(params, default_plq, &per_layer_quant, compute_dtype)?;
                 inner.mtp_weights_loaded = true;
@@ -4971,7 +4940,7 @@ mod tests {
         assert_eq!(overrides.len(), 8);
     }
 
-    /// Config with `n_mtp_layers = 0` so `missing_mtp_required_weights`
+    /// Config with `n_mtp_layers = 0` so the MTP completeness gate
     /// only exercises the top-level norms + the `mtp.fc` guard (the
     /// per-layer linear loop is empty), keeping the fixture tiny.
     fn no_mtp_layer_cfg() -> Qwen3_5Config {
@@ -6041,7 +6010,11 @@ mod tests {
 
         // Uint32 fc weight with no scales must be flagged (would otherwise
         // hit the dense `set_weight` branch and corrupt the model).
-        let missing = missing_mtp_required_weights(&params, &cfg);
+        let missing = crate::models::mtp_drafter::missing_required_mtp_keys(
+            &params,
+            crate::models::mtp_drafter::DrafterBodyVariant::Dense,
+            cfg.n_mtp_layers,
+        );
         assert!(
             missing.iter().any(|k| k == "mtp.fc.scales"),
             "expected mtp.fc.scales to be flagged, got: {missing:?}"
@@ -6060,7 +6033,11 @@ mod tests {
             }
         };
         params.insert("mtp.fc.scales".to_string(), scales);
-        let missing = missing_mtp_required_weights(&params, &cfg);
+        let missing = crate::models::mtp_drafter::missing_required_mtp_keys(
+            &params,
+            crate::models::mtp_drafter::DrafterBodyVariant::Dense,
+            cfg.n_mtp_layers,
+        );
         assert!(
             !missing.iter().any(|k| k == "mtp.fc.scales"),
             "mtp.fc.scales should not be flagged once present, got: {missing:?}"
@@ -6090,7 +6067,11 @@ mod tests {
         };
         params.insert("mtp.fc.weight".to_string(), fc_weight);
 
-        let missing = missing_mtp_required_weights(&params, &cfg);
+        let missing = crate::models::mtp_drafter::missing_required_mtp_keys(
+            &params,
+            crate::models::mtp_drafter::DrafterBodyVariant::Dense,
+            cfg.n_mtp_layers,
+        );
         assert!(
             missing.is_empty(),
             "bf16 fc (no scales) must not be flagged, got: {missing:?}"

@@ -40,6 +40,9 @@ namespace {
 // Partition size for V2 kernel (mirrors `PARTITION_SIZE` constant in
 // `crates/mlx-paged-attn/src/metal/paged_attention.rs`).
 constexpr uint32_t kPartitionSize = 512;
+// Row-partitions an int8 varlen prefill's partials hold (Splash
+// PagedAttention::prefillWorkspace of a 2,048-row chunk).
+constexpr int64_t kVarlenWorkspaceRows = 2048;
 
 // `NUM_THREADS` and `NUM_WARPS` baked into the forked kernels. These
 // must agree with the `_nt256_nsl32` suffix in the kernel-name format
@@ -171,8 +174,6 @@ const char* dtype_string(KvDtype d) {
       return "half";
     case KvDtype::Bf16:
       return "bfloat16_t";
-    case KvDtype::Fp8:
-      return "uchar";
     case KvDtype::Int8:
       return "char";
   }
@@ -180,11 +181,9 @@ const char* dtype_string(KvDtype d) {
   return "half";
 }
 
-// Map io dtype paired with cache dtype: io == cache for non-FP8,
-// io = bfloat16 for FP8.
+// io == cache for Fp16/Bf16, bfloat16 for Int8.
 KvDtype io_dtype_for(KvDtype cache) {
-  return cache == KvDtype::Fp8 || cache == KvDtype::Int8 ? KvDtype::Bf16
-                                                         : cache;
+  return cache == KvDtype::Int8 ? KvDtype::Bf16 : cache;
 }
 
 mlx::core::Dtype mlx_dtype_for(KvDtype d) {
@@ -193,11 +192,6 @@ mlx::core::Dtype mlx_dtype_for(KvDtype d) {
       return mlx::core::float16;
     case KvDtype::Bf16:
       return mlx::core::bfloat16;
-    case KvDtype::Fp8:
-      // FP8 is stored opaquely as bytes; the cache buffer is uint8 in
-      // MLX. The kernel reinterprets via `to_cache<KV_T, uchar>`. For
-      // io we never see Fp8 (io is bf16).
-      return mlx::core::uint8;
     case KvDtype::Int8:
       return mlx::core::int8;
   }
@@ -209,7 +203,6 @@ size_t dtype_byte_size(KvDtype d) {
     case KvDtype::Fp16:
     case KvDtype::Bf16:
       return 2;
-    case KvDtype::Fp8:
     case KvDtype::Int8:
       return 1;
   }
@@ -260,18 +253,14 @@ const std::string& memoized_kernel_name(
 
 const std::string& reshape_and_cache_kernel_name(
     KvDtype input_dtype,
-    KvDtype cache_dtype,
-    bool use_fp8) {
+    KvDtype cache_dtype) {
   static std::mutex mutex;
-  static std::map<std::tuple<KvDtype, KvDtype, bool>, std::string> cache;
+  static std::map<std::tuple<KvDtype, KvDtype>, std::string> cache;
   return memoized_kernel_name(
-      cache, mutex, std::make_tuple(input_dtype, cache_dtype, use_fp8), [&] {
+      cache, mutex, std::make_tuple(input_dtype, cache_dtype), [&] {
     std::ostringstream os;
     os << "reshape_and_cache_kv_" << dtype_string(input_dtype) << "_cache_"
        << dtype_string(cache_dtype);
-    if (use_fp8) {
-      os << "_fp8";
-    }
     return os.str();
   });
 }
@@ -1004,7 +993,7 @@ extern "C" int mlx_paged_grouped_qwen35_shape_guard_for_test(
     int query_rows,
     int max_context_len,
     uint8_t cache_dtype) {
-  if (cache_dtype > static_cast<uint8_t>(KvDtype::Int8)) {
+  if (cache_dtype == 2 || cache_dtype > static_cast<uint8_t>(KvDtype::Int8)) {
     return 0;
   }
   return grouped_qwen35_shape_matches(
@@ -1111,15 +1100,11 @@ void dispatch_reshape_and_cache(
     return;
   }
 
-  // io dtype == cache dtype for non-FP8, BF16 for FP8. The Rust
-  // dispatcher derives this; we mirror so the kernel name matches what
-  // the metallib instantiated.
   const KvDtype cache_dtype = kv_dtype;
   const KvDtype input_dtype = io_dtype_for(cache_dtype);
-  const bool use_fp8 = cache_dtype == KvDtype::Fp8;
 
   const std::string& kernel_name =
-      reshape_and_cache_kernel_name(input_dtype, cache_dtype, use_fp8);
+      reshape_and_cache_kernel_name(input_dtype, cache_dtype);
   MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
   encoder.set_compute_pipeline_state(pipeline);
 
@@ -1133,26 +1118,22 @@ void dispatch_reshape_and_cache(
   //   buffer(2): k_pool        (read-write, in-place)
   //   buffer(3): v_pool        (read-write, in-place)
   //   buffer(4): slot_mapping  (read-only)
-  //   buffer(5): k_scale       (read-only, used for FP8)
-  //   buffer(6): v_scale       (read-only, used for FP8)
   encoder.set_input_array(new_k, 0);
   encoder.set_input_array(new_v, 1);
   encoder.set_output_array(k_pool, 2);
   encoder.set_output_array(v_pool, 3);
   encoder.set_input_array(slot_mapping, 4);
-  encoder.set_input_array(k_scale, 5);
-  encoder.set_input_array(v_scale, 6);
 
   // Constants — kernel takes them as `device const int &` which
   // Metal's `setBytes` can satisfy directly without an extra device
   // buffer. (Rust path allocates a separate small device buffer per
   // constant; we save those allocations by inlining.)
-  encoder.set_bytes(key_stride, 7);
-  encoder.set_bytes(value_stride, 8);
-  encoder.set_bytes<int32_t>(num_kv_heads, 9);
-  encoder.set_bytes<int32_t>(head_size, 10);
-  encoder.set_bytes<int32_t>(block_size, 11);
-  encoder.set_bytes<int32_t>(x_pack, 12);
+  encoder.set_bytes(key_stride, 5);
+  encoder.set_bytes(value_stride, 6);
+  encoder.set_bytes<int32_t>(num_kv_heads, 7);
+  encoder.set_bytes<int32_t>(head_size, 8);
+  encoder.set_bytes<int32_t>(block_size, 9);
+  encoder.set_bytes<int32_t>(x_pack, 10);
 
   // Dispatch: 1 threadgroup per token, kNumThreads threads per
   // threadgroup. Mirrors Rust path.
@@ -1590,7 +1571,6 @@ void dispatch_paged_attention_auto(
     throw std::runtime_error(msg.str());
   }
 
-  // io = bf16 for FP8, else io = cache dtype.
   const KvDtype io_dtype = io_dtype_for(kv_dtype);
   const KvDtype cache_dtype = kv_dtype;
 
@@ -1787,9 +1767,24 @@ void dispatch_paged_attention_varlen_v2_inner(
       : (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
           kPartitionSize;
 
-  // Aux buffers indexed by q_token_idx (not seq_idx) — size by total_queries.
+  // An int8 prefill of one sequence runs its query rows in tiles of at most
+  // kVarlenWorkspaceRows row-partitions (Splash
+  // PagedAttention::prefillWorkspace: the partials are bounded at allocation
+  // for every history). A row's partitions and reduce read only that row, so
+  // the tiles give the same bits as one launch.
+  const bool tiled = !use_grouped && cache_dtype == KvDtype::Int8 &&
+      num_seqs == 1;
+  const int tile_rows = tiled
+      ? static_cast<int>(std::clamp<int64_t>(
+            kVarlenWorkspaceRows / static_cast<int64_t>(max_num_partitions),
+            1,
+            total_queries))
+      : total_queries;
+  const int num_tiles = (total_queries + tile_rows - 1) / tile_rows;
+
+  // Aux buffers indexed by the tile's q_token_idx: size by tile_rows.
   const int64_t exp_sums_size_i64 =
-      static_cast<int64_t>(total_queries) *
+      static_cast<int64_t>(tile_rows) *
       static_cast<int64_t>(num_q_heads) *
       static_cast<int64_t>(max_num_partitions);
   const int64_t tmp_out_size_i64 =
@@ -1823,117 +1818,162 @@ void dispatch_paged_attention_varlen_v2_inner(
       {});
   tmp_out.set_data(mlx::core::allocator::malloc(tmp_out.nbytes()));
 
-  // Stage 1: partitioned varlen attention.
-  {
-    const std::string& kernel_name = use_grouped
-        ? paged_attention_grouped_kernel_name(grouped_kind, cache_dtype)
-        : paged_attention_varlen_v2_kernel_name(
-              io_dtype,
-              cache_dtype,
-              head_size,
-              block_size,
-              /*use_alibi=*/false);
-    MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
-    encoder.set_compute_pipeline_state(pipeline);
-
-    encoder.set_output_array(exp_sums, 0);
-    encoder.set_output_array(max_logits, 1);
-    encoder.set_output_array(tmp_out, 2);
-    encoder.set_input_array(q, 3);
-    bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
-
-    encoder.set_bytes<int32_t>(num_kv_heads, 8);
-    encoder.set_bytes<float>(scale, 9);
-    encoder.set_bytes<float>(softcapping, 10);
-    encoder.set_input_array(block_table, 11);
-    encoder.set_input_array(seq_lens, 12);
-    encoder.set_bytes<int32_t>(max_blocks_per_seq, 13);
-    const float dummy_zero = 0.0f;
-    encoder.set_bytes(dummy_zero, 14); // alibi_slopes
-
-    const int32_t q_stride = num_q_heads * head_size;
-    const int32_t kv_block_stride = num_kv_heads * head_size * block_size;
-    const int32_t kv_head_stride = head_size * block_size;
-    encoder.set_bytes<int32_t>(q_stride, 15);
-    encoder.set_bytes<int32_t>(kv_block_stride, 16);
-    encoder.set_bytes<int32_t>(kv_head_stride, 17);
-    encoder.set_bytes<int32_t>(sliding_window, 18);
-
-    encoder.set_input_array(cu_seqlens_q, 19);
-    encoder.set_bytes<int32_t>(num_seqs, 20);
-
-    // Keep one GQA-sized threadgroup per query row (192 threads for GQA6 or
-    // 256 for GQA8). Combining both q_len=2 rows would cut occupancy sharply
-    // on Apple GPUs; adjacent y groups still traverse identical pages and
-    // retain cache locality.
-    const int gqa_factor = num_q_heads / num_kv_heads;
-    MTL::Size group = use_grouped
-        ? MTL::Size::Make(
-              32,
-              static_cast<size_t>(gqa_factor),
-              1)
-        : MTL::Size::Make(kNumThreads, 1, 1);
-    MTL::Size grid = use_grouped
-        ? MTL::Size::Make(
-              static_cast<size_t>(num_kv_heads),
-              static_cast<size_t>(total_queries),
-              static_cast<size_t>(max_num_partitions))
-        : MTL::Size::Make(
-              static_cast<size_t>(num_q_heads),
-              static_cast<size_t>(total_queries),
-              static_cast<size_t>(max_num_partitions));
-    if (!use_grouped) {
-      const size_t logits_bytes =
-          static_cast<size_t>(kPartitionSize) * sizeof(float);
-      const size_t v_reduce_bytes =
-          static_cast<size_t>(kNumWarps / 2) *
-          static_cast<size_t>(head_size) * sizeof(float);
-      const size_t red_smem_bytes =
-          2 * static_cast<size_t>(kNumWarps) * sizeof(float);
-      const size_t threadgroup_mem =
-          std::max(logits_bytes, v_reduce_bytes) + red_smem_bytes;
-      encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+  // Per tile {seq_len, 0, rows}: the tile is the last `rows` queries of a
+  // sequence that ends at its last row, so each row keeps its causal bound.
+  mlx::core::array tile_meta(
+      mlx::core::Shape{3 * num_tiles}, mlx::core::int32, nullptr, {});
+  if (tiled) {
+    tile_meta.set_data(mlx::core::allocator::malloc(tile_meta.nbytes()));
+    int32_t* meta = tile_meta.data<int32_t>();
+    for (int t = 0; t < num_tiles; ++t) {
+      const int end = std::min(total_queries, (t + 1) * tile_rows);
+      meta[3 * t] = max_context_len - (total_queries - end);
+      meta[3 * t + 1] = 0;
+      meta[3 * t + 2] = end - t * tile_rows;
     }
-    if (use_grouped) {
-      record_grouped_route_for_test(grouped_kind);
-    }
-    encoder.dispatch_threadgroups(grid, group);
   }
 
-  // Stage 2: reduce partitions.
-  {
-    const std::string& kernel_name = use_grouped
-        ? paged_attention_grouped_reduce_kernel_name(grouped_kind, cache_dtype)
-        : paged_attention_varlen_v2_reduce_kernel_name(
-              io_dtype, cache_dtype, head_size);
-    MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
-    encoder.set_compute_pipeline_state(pipeline);
-
-    encoder.set_output_array(out, 0);
-    encoder.set_input_array(exp_sums, 1);
-    encoder.set_input_array(max_logits, 2);
-    encoder.set_input_array(tmp_out, 3);
-    encoder.set_input_array(seq_lens, 4);
-    encoder.set_bytes<int32_t>(static_cast<int32_t>(max_num_partitions), 5);
-
-    encoder.set_input_array(cu_seqlens_q, 6);
-    encoder.set_bytes<int32_t>(num_seqs, 7);
-
-    if (!use_grouped) {
-      const size_t threadgroup_mem =
-          2 * static_cast<size_t>(max_num_partitions) * sizeof(float);
-      encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+  const int32_t q_stride = num_q_heads * head_size;
+  for (int t = 0; t < num_tiles; ++t) {
+    const int first = t * tile_rows;
+    const int rows = std::min(tile_rows, total_queries - first);
+    const int64_t q_offset =
+        static_cast<int64_t>(first) * q_stride * q.itemsize();
+    const int64_t out_offset =
+        static_cast<int64_t>(first) * q_stride * out.itemsize();
+    const auto bind_seq_lens = [&](int idx) {
+      if (tiled) {
+        encoder.set_input_array(tile_meta, idx, int64_t{12} * t);
+      } else {
+        encoder.set_input_array(seq_lens, idx);
+      }
+    };
+    const auto bind_cu_seqlens = [&](int idx) {
+      if (tiled) {
+        encoder.set_input_array(tile_meta, idx, int64_t{12} * t + 4);
+      } else {
+        encoder.set_input_array(cu_seqlens_q, idx);
+      }
+    };
+    if (t > 0) {
+      // The next stage 1 rewrites the partials the last reduce read.
+      encoder.barrier();
     }
 
-    MTL::Size group =
-        MTL::Size::Make(use_grouped ? 1024 : kNumThreads, 1, 1);
-    MTL::Size grid = MTL::Size::Make(
-        static_cast<size_t>(num_q_heads),
-        static_cast<size_t>(total_queries),
-        1);
-    encoder.dispatch_threadgroups(grid, group);
+    // Stage 1: partitioned varlen attention.
+    {
+      const std::string& kernel_name = use_grouped
+          ? paged_attention_grouped_kernel_name(grouped_kind, cache_dtype)
+          : paged_attention_varlen_v2_kernel_name(
+                io_dtype,
+                cache_dtype,
+                head_size,
+                block_size,
+                /*use_alibi=*/false);
+      MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
+      encoder.set_compute_pipeline_state(pipeline);
+
+      encoder.set_output_array(exp_sums, 0);
+      encoder.set_output_array(max_logits, 1);
+      encoder.set_output_array(tmp_out, 2);
+      encoder.set_input_array(q, 3, q_offset);
+      bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
+
+      encoder.set_bytes<int32_t>(num_kv_heads, 8);
+      encoder.set_bytes<float>(scale, 9);
+      encoder.set_bytes<float>(softcapping, 10);
+      encoder.set_input_array(block_table, 11);
+      bind_seq_lens(12);
+      encoder.set_bytes<int32_t>(max_blocks_per_seq, 13);
+      const float dummy_zero = 0.0f;
+      encoder.set_bytes(dummy_zero, 14); // alibi_slopes
+
+      const int32_t kv_block_stride = num_kv_heads * head_size * block_size;
+      const int32_t kv_head_stride = head_size * block_size;
+      encoder.set_bytes<int32_t>(q_stride, 15);
+      encoder.set_bytes<int32_t>(kv_block_stride, 16);
+      encoder.set_bytes<int32_t>(kv_head_stride, 17);
+      encoder.set_bytes<int32_t>(sliding_window, 18);
+
+      bind_cu_seqlens(19);
+      encoder.set_bytes<int32_t>(num_seqs, 20);
+
+      // Keep one GQA-sized threadgroup per query row (192 threads for GQA6
+      // or 256 for GQA8). Combining both q_len=2 rows would cut occupancy
+      // sharply on Apple GPUs; adjacent y groups still traverse identical
+      // pages and retain cache locality.
+      const int gqa_factor = num_q_heads / num_kv_heads;
+      MTL::Size group = use_grouped
+          ? MTL::Size::Make(
+                32,
+                static_cast<size_t>(gqa_factor),
+                1)
+          : MTL::Size::Make(kNumThreads, 1, 1);
+      MTL::Size grid = use_grouped
+          ? MTL::Size::Make(
+                static_cast<size_t>(num_kv_heads),
+                static_cast<size_t>(rows),
+                static_cast<size_t>(max_num_partitions))
+          : MTL::Size::Make(
+                static_cast<size_t>(num_q_heads),
+                static_cast<size_t>(rows),
+                static_cast<size_t>(max_num_partitions));
+      if (!use_grouped) {
+        const size_t logits_bytes =
+            static_cast<size_t>(kPartitionSize) * sizeof(float);
+        const size_t v_reduce_bytes =
+            static_cast<size_t>(kNumWarps / 2) *
+            static_cast<size_t>(head_size) * sizeof(float);
+        const size_t red_smem_bytes =
+            2 * static_cast<size_t>(kNumWarps) * sizeof(float);
+        const size_t threadgroup_mem =
+            std::max(logits_bytes, v_reduce_bytes) + red_smem_bytes;
+        encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+      }
+      if (use_grouped) {
+        record_grouped_route_for_test(grouped_kind);
+      }
+      encoder.dispatch_threadgroups(grid, group);
+    }
+
+    // Stage 2: reduce partitions.
+    {
+      const std::string& kernel_name = use_grouped
+          ? paged_attention_grouped_reduce_kernel_name(grouped_kind, cache_dtype)
+          : paged_attention_varlen_v2_reduce_kernel_name(
+                io_dtype, cache_dtype, head_size);
+      MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
+      encoder.set_compute_pipeline_state(pipeline);
+
+      encoder.set_output_array(out, 0, out_offset);
+      encoder.set_input_array(exp_sums, 1);
+      encoder.set_input_array(max_logits, 2);
+      encoder.set_input_array(tmp_out, 3);
+      bind_seq_lens(4);
+      encoder.set_bytes<int32_t>(static_cast<int32_t>(max_num_partitions), 5);
+
+      bind_cu_seqlens(6);
+      encoder.set_bytes<int32_t>(num_seqs, 7);
+
+      if (!use_grouped) {
+        const size_t threadgroup_mem =
+            2 * static_cast<size_t>(max_num_partitions) * sizeof(float);
+        encoder.set_threadgroup_memory_length(threadgroup_mem, 0);
+      }
+
+      MTL::Size group =
+          MTL::Size::Make(use_grouped ? 1024 : kNumThreads, 1, 1);
+      MTL::Size grid = MTL::Size::Make(
+          static_cast<size_t>(num_q_heads),
+          static_cast<size_t>(rows),
+          1);
+      encoder.dispatch_threadgroups(grid, group);
+    }
   }
 
+  if (tiled) {
+    encoder.add_temporary(std::move(tile_meta));
+  }
   encoder.add_temporary(std::move(exp_sums));
   encoder.add_temporary(std::move(max_logits));
   encoder.add_temporary(std::move(tmp_out));

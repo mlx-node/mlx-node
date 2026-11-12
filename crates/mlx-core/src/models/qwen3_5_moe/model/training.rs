@@ -1696,6 +1696,84 @@ impl Qwen35MoeInner {
     }
 }
 
+impl Qwen35MoeInner {
+    /// `mlx eval`'s teacher-forced prefill on the paged pool, the route a
+    /// served turn reads (Splash has no flat path): one fresh sequence, no
+    /// prefix lookup or publish, its blocks freed at the end. Returns the
+    /// post-norm hidden of every row of `ids`.
+    fn paged_teacher_forced_hidden(&mut self, ids: &[u32]) -> Result<MxArray> {
+        self.discard_moe_paged_session();
+        let result = self.paged_teacher_forced_prefill(ids);
+        self.discard_moe_paged_session();
+        result
+    }
+
+    fn paged_teacher_forced_prefill(&mut self, ids: &[u32]) -> Result<MxArray> {
+        use crate::models::qwen3_5::dflash2_turn::{Keep, ensure_paged_pool_keeping, reclaiming};
+        self.init_caches_sync()?;
+        let block_size = self
+            .paged_adapter
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("mlx eval: paged adapter dropped"))?
+            .block_size();
+        let keys = crate::engine::build_paged_extra_keys(ids.len(), block_size, &[]);
+        let keep = Keep {
+            tokens: ids,
+            keys: None,
+        };
+        ensure_paged_pool_keeping(self, ids, keep);
+        reclaiming(self, keep, |inner| {
+            inner
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("mlx eval: paged adapter dropped"))?
+                .prepare_turn_per_block_with_max_cache_hit_tokens(
+                    0,
+                    ids,
+                    ids.len() as u32,
+                    false,
+                    &keys,
+                    0,
+                    true,
+                    0,
+                )
+                .map_err(Error::from_reason)
+        })?;
+        let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
+            self.config.num_layers as usize,
+            |i| self.config.is_linear_layer(i),
+        );
+        let embed = self.embedding.clone();
+        let caches = self
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("mlx eval: caches not initialized"))?;
+        let adapter = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("mlx eval: paged adapter dropped"))?;
+        let mut hidden = None;
+        crate::models::qwen3_5_moe::paged_forward::run_paged_prefill_chunk_with_size_and_checkpoint(
+            ids,
+            ids,
+            0,
+            false,
+            &embed,
+            &mut self.layers,
+            caches,
+            &self.final_norm,
+            &self.lm_head,
+            &layer_kinds,
+            adapter,
+            PREFILL_STEP_SIZE as i32,
+            0,
+            None,
+            Some(&mut hidden),
+        )?;
+        hidden.ok_or_else(|| Error::from_reason("mlx eval: the paged prefill kept no hidden"))
+    }
+}
+
 /// `mlx eval` adapter. The capture and score loops, the position chunking and
 /// the teacher cache live in [`crate::quality::runner`]; this supplies only what
 /// is family-specific. Mirrors the dense
@@ -1703,7 +1781,13 @@ impl Qwen35MoeInner {
 /// through its forward.
 impl crate::quality::runner::EvalBackend for Qwen35MoeInner {
     fn kv_format(&self) -> crate::transformer::KvFormat {
-        self.config.kv_format()
+        match self.paged_adapter.as_ref() {
+            Some(adapter) => match adapter.layer_kv_pool().cache_dtype() {
+                mlx_paged_attn::metal::MetalDtype::Int8 => crate::transformer::KvFormat::Int8,
+                _ => crate::transformer::KvFormat::Bf16,
+            },
+            None => self.config.kv_format(),
+        }
     }
 
     fn vocab_size(&self) -> i32 {
@@ -1718,6 +1802,9 @@ impl crate::quality::runner::EvalBackend for Qwen35MoeInner {
     }
 
     fn teacher_forced_hidden(&mut self, tokens: &[u32]) -> Result<MxArray> {
+        if self.paged_adapter.is_some() {
+            return self.paged_teacher_forced_hidden(&tokens[..tokens.len() - 1]);
+        }
         self.init_caches_sync()?;
         let generation_stream = Stream::generation();
         let fa_idx = self.fa_idx;

@@ -1261,6 +1261,47 @@ fn dtype_target_for(
     Some(target)
 }
 
+/// The checkpoint key and dtype of each dense table and quantized
+/// `.weight` / `.scales` the import makes from `header`, from the header
+/// alone. A tensor the import leaves out or refuses has none.
+pub(crate) fn imported_dtypes(
+    header: &GgufFile,
+    plan: &ImportPlan,
+    opts: &ImportOptions,
+) -> Vec<(String, DType)> {
+    let mut out = Vec::new();
+    for t in &header.tensors {
+        let Some(key) = gguf_name_to_hf_for_metadata(&t.name, &header.metadata) else {
+            continue;
+        };
+        let ty = t.tensor_type;
+        let scales = if let Some(format) = ty.k_quant_format() {
+            if !plan.import_k_quants {
+                continue;
+            }
+            if format.scales_are_signed() {
+                DType::Int8
+            } else {
+                DType::Uint8
+            }
+        } else if ty.is_mlx_affine_quantized() {
+            DType::Float16
+        } else if ty.is_mlx_mxfp4_quantized() {
+            DType::Uint8
+        } else {
+            if let Some(source) = dense_dtype(ty) {
+                let dtype = dtype_target_for(&key, source, plan, opts).unwrap_or(source);
+                out.push((key, dtype));
+            }
+            continue;
+        };
+        let prefix = key.strip_suffix(".weight").unwrap_or(&key);
+        out.push((format!("{prefix}.scales"), scales));
+        out.push((key, DType::Uint32));
+    }
+    out
+}
+
 /// `(gguf name, rows per shard)` for the one dense 2-D tensor whose
 /// checkpoint key satisfies `is_target`, when it imports as `dtype` and its
 /// imported bytes exceed `budget`; rows per shard = max(1, budget / imported
@@ -2734,6 +2775,38 @@ mod tests {
                 1 + usize::from(fx.companion.is_some()),
                 "{name}: identity files"
             );
+        }
+        fs::remove_dir_all(&work).ok();
+    }
+
+    /// The header-only dtypes the context estimate reads equal the
+    /// preload's for every key both make: the dense Q8_0 table's f16 scales,
+    /// the MoE Q6_K table's integer sub-scales, the norms after the bf16
+    /// dtype pass. Mutation CD3: affine scales reported BF16 → red.
+    #[test]
+    fn imported_dtypes_match_the_preload() {
+        let work = import_work_dir("imported-dtypes");
+        for name in [
+            "qwen35-dense-untied",
+            "qwen35-dense-tied",
+            "qwen35moe-3d-experts",
+        ] {
+            let fx = write_import_fixture(name, &work.join(name));
+            let input = fixture_input(&fx, false);
+            let preload = GgufPreload::load(&input).unwrap();
+            let mut compared = Vec::new();
+            for (key, dtype) in imported_dtypes(&input.main.1, &input.main.3, &input.opts) {
+                if let Some(array) = preload.main.get(&key) {
+                    assert_eq!(array.dtype().unwrap(), dtype, "{name}: {key}");
+                    compared.push(key);
+                }
+            }
+            for suffix in ["embed_tokens.scales", "model.norm.weight"] {
+                assert!(
+                    compared.iter().any(|key| key.ends_with(suffix)),
+                    "{name}: {suffix} not compared in {compared:?}"
+                );
+            }
         }
         fs::remove_dir_all(&work).ok();
     }

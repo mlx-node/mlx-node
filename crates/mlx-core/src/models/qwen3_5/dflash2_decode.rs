@@ -364,11 +364,13 @@ fn prefill_chunk_scratch_bytes(config: &super::config::Qwen3_5Config, window: u6
 }
 
 /// Bytes a paged pool turn of `window` tokens allocates besides KV at its
-/// peak: the last prefill chunk's scratch with the cheaper of the two
-/// attention routes the paged prefill picks from, or one decode step.
+/// peak: the last prefill chunk's scratch with its attention route, or one
+/// decode step. A bf16 pool takes the cheaper of the two routes the paged
+/// prefill picks from; an int8 pool always reads through the varlen kernel
+/// with its bounded workspace.
 pub(crate) fn pool_lane_transient(
     config: &super::config::Qwen3_5Config,
-    dtype: DType,
+    format: KvFormat,
     kernels: PrefillSdpaKernels,
     window: u32,
 ) -> u64 {
@@ -380,26 +382,34 @@ pub(crate) fn pool_lane_transient(
         dim(config.num_kv_heads),
         dim(config.head_dim),
     );
-    let dtype_bytes = dtype.byte_size() as u64;
-    let gathered = estimate_paged_pool_sdpa_bytes_with_portable(
-        chunk,
-        window,
-        heads,
-        kv_heads,
-        head_dim,
-        dtype_bytes,
-        kernels.d256_full,
-        kernels.portable_d256,
-    );
-    let varlen = estimate_varlen_paged_attention_bytes(
-        chunk,
-        window,
-        heads,
-        kv_heads,
-        head_dim,
-        dtype_bytes,
-    );
-    let prefill = prefill_chunk_scratch_bytes(config, window).saturating_add(gathered.min(varlen));
+    let attention = match format {
+        KvFormat::Int8 => crate::transformer::paged_policy::estimate_int8_varlen_prefill_bytes(
+            chunk, window, heads, head_dim,
+        ),
+        KvFormat::Bf16 => {
+            let dtype_bytes = DType::BFloat16.byte_size() as u64;
+            let gathered = estimate_paged_pool_sdpa_bytes_with_portable(
+                chunk,
+                window,
+                heads,
+                kv_heads,
+                head_dim,
+                dtype_bytes,
+                kernels.d256_full,
+                kernels.portable_d256,
+            );
+            let varlen = estimate_varlen_paged_attention_bytes(
+                chunk,
+                window,
+                heads,
+                kv_heads,
+                head_dim,
+                dtype_bytes,
+            );
+            gathered.min(varlen)
+        }
+    };
+    let prefill = prefill_chunk_scratch_bytes(config, window).saturating_add(attention);
     prefill.max(dflash2_cycle_transient(config, 0, window).total())
 }
 

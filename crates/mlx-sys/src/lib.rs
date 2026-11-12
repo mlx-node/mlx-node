@@ -1396,25 +1396,14 @@ unsafe extern "C-unwind" {
     /// new_v dtype != bfloat16 must be rejected for kv_dtype=Bf16.
     pub fn mlx_paged_kv_write_factory_rejects_new_v_dtype_bf16() -> i32;
 
-    /// k_pool dtype != uint8 must be rejected for kv_dtype=Fp8.
-    pub fn mlx_paged_kv_write_factory_rejects_k_pool_dtype_fp8() -> i32;
-
-    /// new_k dtype != bfloat16 must be rejected for kv_dtype=Fp8
-    /// (FP8 io dtype is bfloat16).
-    pub fn mlx_paged_kv_write_factory_rejects_new_k_dtype_fp8() -> i32;
+    /// The retired kv_dtype code 2 must be refused.
+    pub fn mlx_paged_kv_dtype_refuses_retired_code() -> i32;
 
     /// q dtype != bfloat16 must be rejected for kv_dtype=Bf16.
     pub fn mlx_paged_attention_factory_rejects_q_dtype_bf16() -> i32;
 
-    /// q dtype != bfloat16 must be rejected for kv_dtype=Fp8 (FP8 io
-    /// dtype is bfloat16).
-    pub fn mlx_paged_attention_factory_rejects_q_dtype_fp8() -> i32;
-
     /// k_pool dtype != bfloat16 must be rejected for kv_dtype=Bf16.
     pub fn mlx_paged_attention_factory_rejects_k_pool_dtype_bf16() -> i32;
-
-    /// k_pool dtype != uint8 must be rejected for kv_dtype=Fp8.
-    pub fn mlx_paged_attention_factory_rejects_k_pool_dtype_fp8() -> i32;
 
     // =============================================================================
     // GQA head-group divisibility.

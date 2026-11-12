@@ -12,8 +12,18 @@ use mlx_paged_attn::metal::MetalDtype;
 use mlx_paged_attn::{LayerKVPool, PagedAttentionConfig};
 use mlx_sys::mlx_array;
 
-const H: usize = 4;
-const HQ: usize = 24;
+thread_local! {
+    /// (K/V heads, query heads) of the case running on this thread.
+    static HEADS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((4, 24)) };
+}
+
+fn kv_heads() -> usize {
+    HEADS.with(|heads| heads.get().0)
+}
+
+fn q_heads() -> usize {
+    HEADS.with(|heads| heads.get().1)
+}
 
 struct Owned(*mut mlx_array);
 
@@ -74,9 +84,9 @@ impl Rng {
 /// every row has its own scale: `magnitude(t, h) * U[-1, 1)`.
 fn rows(tokens: usize, d: usize, seed: u64, magnitude: impl Fn(usize, usize) -> f32) -> Vec<u16> {
     let mut rng = Rng(seed);
-    let mut out = Vec::with_capacity(tokens * H * d);
+    let mut out = Vec::with_capacity(tokens * kv_heads() * d);
     for t in 0..tokens {
-        for h in 0..H {
+        for h in 0..kv_heads() {
             let m = magnitude(t, h);
             for _ in 0..d {
                 out.push(bf16(rng.next() * m));
@@ -90,8 +100,8 @@ fn rows(tokens: usize, d: usize, seed: u64, magnitude: impl Fn(usize, usize) -> 
 fn head_major(rows: &[u16], tokens: usize, d: usize) -> Vec<u16> {
     let mut out = vec![0u16; rows.len()];
     for t in 0..tokens {
-        for h in 0..H {
-            let src = (t * H + h) * d;
+        for h in 0..kv_heads() {
+            let src = (t * kv_heads() + h) * d;
             let dst = (h * tokens + t) * d;
             out[dst..dst + d].copy_from_slice(&rows[src..src + d]);
         }
@@ -104,7 +114,7 @@ fn head_major(rows: &[u16], tokens: usize, d: usize) -> Vec<u16> {
 fn quantize(rows: &[u16], tokens: usize, d: usize) -> (Owned, Owned) {
     let x = from_bf16(
         &head_major(rows, tokens, d),
-        &[1, H as i64, tokens as i64, d as i64],
+        &[1, kv_heads() as i64, tokens as i64, d as i64],
     );
     let mut q = std::ptr::null_mut();
     let mut s = std::ptr::null_mut();
@@ -163,14 +173,14 @@ fn reference(
     d: usize,
     scale: f64,
 ) -> Vec<f32> {
-    let gqa = HQ / H;
-    let mut out = vec![0f32; rows * HQ * d];
+    let gqa = q_heads() / kv_heads();
+    let mut out = vec![0f32; rows * q_heads() * d];
     let mut scores = vec![0f64; c];
     for r in 0..rows {
         let visible = c - rows + r + 1;
-        for qh in 0..HQ {
+        for qh in 0..q_heads() {
             let h = qh / gqa;
-            let qrow = &q[(r * HQ + qh) * d..(r * HQ + qh + 1) * d];
+            let qrow = &q[(r * q_heads() + qh) * d..(r * q_heads() + qh + 1) * d];
             let mut max = f64::NEG_INFINITY;
             for (i, score) in scores[..visible].iter_mut().enumerate() {
                 let k = &keys[(h * c + i) * d..(h * c + i + 1) * d];
@@ -186,7 +196,7 @@ fn reference(
                 *score = (*score - max).exp();
                 sum += *score;
             }
-            let o = &mut out[(r * HQ + qh) * d..(r * HQ + qh + 1) * d];
+            let o = &mut out[(r * q_heads() + qh) * d..(r * q_heads() + qh + 1) * d];
             let mut acc = vec![0f64; d];
             for (i, &p) in scores[..visible].iter().enumerate() {
                 let v = &values[(h * c + i) * d..(h * c + i + 1) * d];
@@ -259,9 +269,8 @@ fn filled(c: usize, d: usize, bs: usize, seed: u64) -> Option<Filled> {
         block_size: bs as u32,
         gpu_memory_mb: 512,
         head_size: d as u32,
-        num_kv_heads: H as u32,
+        num_kv_heads: kv_heads() as u32,
         num_layers: 1,
-        use_fp8_cache: Some(false),
         max_seq_len: Some((blocks * bs) as u32),
         max_batch_size: Some(1),
     };
@@ -272,7 +281,7 @@ fn filled(c: usize, d: usize, bs: usize, seed: u64) -> Option<Filled> {
     };
     let (key_blob, value_blob) = pool.block_blob_bytes().unwrap();
     let nan_blob = |len: u64| -> Vec<u8> {
-        let data = H * d * bs;
+        let data = kv_heads() * d * bs;
         let mut blob = vec![0u8; len as usize];
         for chunk in blob[data..].as_chunks_mut::<4>().0 {
             *chunk = f32::NAN.to_ne_bytes();
@@ -294,7 +303,7 @@ fn filled(c: usize, d: usize, bs: usize, seed: u64) -> Option<Filled> {
     let slots: Vec<i64> = (0..c)
         .map(|t| i64::from(table[t / bs]) * bs as i64 + (t % bs) as i64)
         .collect();
-    let shape = [c as i64, H as i64, d as i64];
+    let shape = [c as i64, kv_heads() as i64, d as i64];
     let new_k = from_bf16(&keys, &shape);
     let new_v = from_bf16(&values, &shape);
     let slots = from_i64(&slots);
@@ -314,7 +323,7 @@ fn filled(c: usize, d: usize, bs: usize, seed: u64) -> Option<Filled> {
             key_scale.0,
             value_scale.0,
             bs as i32,
-            H as i32,
+            kv_heads() as i32,
             d as i32,
             3,
             k_out,
@@ -351,7 +360,7 @@ fn paged(
     bs: usize,
     scale: f32,
 ) -> Vec<f32> {
-    let q = from_bf16(q, &[rows as i64, HQ as i64, d as i64]);
+    let q = from_bf16(q, &[rows as i64, q_heads() as i64, d as i64]);
     let table = from_i32(&f.table, &[1, f.table.len() as i64]);
     let lens = from_i32(&[c as i32], &[1]);
     let out = if rows == 1 {
@@ -368,8 +377,8 @@ fn paged(
                 0.0,
                 0,
                 bs as i32,
-                HQ as i32,
-                H as i32,
+                q_heads() as i32,
+                kv_heads() as i32,
                 d as i32,
                 3,
             )
@@ -390,8 +399,8 @@ fn paged(
                 0.0,
                 0,
                 bs as i32,
-                HQ as i32,
-                H as i32,
+                q_heads() as i32,
+                kv_heads() as i32,
                 d as i32,
                 3,
             )
@@ -408,7 +417,7 @@ fn paged(
 /// `c - rows`, new = the last `rows`, causal. Out `[rows][HQ][D]`.
 fn flat(f: &Filled, q: &[u16], rows: usize, c: usize, scale: f32) -> Vec<f32> {
     const D: usize = 256;
-    let split = (c - rows) * H * D;
+    let split = (c - rows) * kv_heads() * D;
     let (pk, pks) = quantize(&f.keys[..split], c - rows, D);
     let (pv, pvs) = quantize(&f.values[..split], c - rows, D);
     let (nk, nks) = quantize(&f.keys[split..], rows, D);
@@ -416,12 +425,12 @@ fn flat(f: &Filled, q: &[u16], rows: usize, c: usize, scale: f32) -> Vec<f32> {
     // [rows, HQ, D] -> [1, HQ, rows, D]
     let mut q_hm = vec![0u16; q.len()];
     for r in 0..rows {
-        for qh in 0..HQ {
+        for qh in 0..q_heads() {
             q_hm[(qh * rows + r) * D..(qh * rows + r + 1) * D]
-                .copy_from_slice(&q[(r * HQ + qh) * D..(r * HQ + qh + 1) * D]);
+                .copy_from_slice(&q[(r * q_heads() + qh) * D..(r * q_heads() + qh + 1) * D]);
         }
     }
-    let q = from_bf16(&q_hm, &[1, HQ as i64, rows as i64, D as i64]);
+    let q = from_bf16(&q_hm, &[1, q_heads() as i64, rows as i64, D as i64]);
     let out = unsafe {
         mlx_sys::mlx_segmented_sdpa_int8_forward(
             q.0, pk.0, pv.0, pks.0, pvs.0, nk.0, nv.0, nks.0, nvs.0, scale, true,
@@ -431,8 +440,8 @@ fn flat(f: &Filled, q: &[u16], rows: usize, c: usize, scale: f32) -> Vec<f32> {
     let out = floats(&Owned(out));
     let mut token_major = vec![0f32; out.len()];
     for r in 0..rows {
-        for qh in 0..HQ {
-            token_major[(r * HQ + qh) * D..(r * HQ + qh + 1) * D]
+        for qh in 0..q_heads() {
+            token_major[(r * q_heads() + qh) * D..(r * q_heads() + qh + 1) * D]
                 .copy_from_slice(&out[(qh * rows + r) * D..(qh * rows + r + 1) * D]);
         }
     }
@@ -440,6 +449,8 @@ fn flat(f: &Filled, q: &[u16], rows: usize, c: usize, scale: f32) -> Vec<f32> {
 }
 
 struct Case {
+    /// (H, HQ).
+    heads: (usize, usize),
     d: usize,
     bs: usize,
     c: usize,
@@ -450,7 +461,9 @@ struct Case {
 
 /// Every case runs; the failures come back as text.
 fn check(case: &Case, seed: u64, failures: &mut Vec<String>) {
+    HEADS.with(|heads| heads.set(case.heads));
     let (d, bs, c) = (case.d, case.bs, case.c);
+    let (h, hq) = case.heads;
     let scale = 1.0 / (d as f32).sqrt();
     let Some(f) = filled(c, d, bs, seed) else {
         return;
@@ -461,7 +474,9 @@ fn check(case: &Case, seed: u64, failures: &mut Vec<String>) {
     let values_bf16 = as_f64_head_major(&f.values, c, d);
     let mut rng = Rng(seed ^ 0x9);
     for (&rows, &grouped) in case.rows.iter().zip(case.grouped) {
-        let q: Vec<u16> = (0..rows * HQ * d).map(|_| bf16(rng.next() * 1.7)).collect();
+        let q: Vec<u16> = (0..rows * q_heads() * d)
+            .map(|_| bf16(rng.next() * 1.7))
+            .collect();
         let q_f32: Vec<f32> = q.iter().map(|&b| f32_of(b)).collect();
         unsafe { mlx_sys::mlx_paged_grouped_qwen35_test_probe_reset() };
         let got = paged(&f, &q, rows, c, d, bs, scale);
@@ -469,17 +484,17 @@ fn check(case: &Case, seed: u64, failures: &mut Vec<String>) {
         let expected = reference(&q_f32, rows, &keys_q, &values_q, c, d, f64::from(scale));
         let (max, mean) = error_ulps(&got, &expected);
         eprintln!(
-            "D{d} bs{bs} C{c} rows {rows}: grouped launches {launches}; paged vs f64 \
+            "{h}/{hq} D{d} bs{bs} C{c} rows {rows}: grouped launches {launches}; paged vs f64 \
              dequantized reference max {max} / mean {mean:.4} bf16 ulps"
         );
         if (launches > 0) != grouped {
             failures.push(format!(
-                "D{d} bs{bs} C{c} rows {rows}: grouped launches {launches}"
+                "{h}/{hq} D{d} bs{bs} C{c} rows {rows}: grouped launches {launches}"
             ));
         }
         if !(max <= 3.0 && mean <= 0.35) {
             failures.push(format!(
-                "D{d} bs{bs} C{c} rows {rows}: paged int8 vs f64 reference max {max} / mean \
+                "{h}/{hq} D{d} bs{bs} C{c} rows {rows}: paged int8 vs f64 reference max {max} / mean \
                  {mean:.4} bf16 ulps"
             ));
         }
@@ -506,7 +521,7 @@ fn check(case: &Case, seed: u64, failures: &mut Vec<String>) {
             );
             if !(paged_vs_flat.0 <= noise.0 + 4.0 * ulp && paged_vs_flat.1 <= noise.1 * 1.5 + ulp) {
                 failures.push(format!(
-                    "D{d} C{c} rows {rows}: paged vs flat {paged_vs_flat:?} exceeds the \
+                    "{h}/{hq} D{d} C{c} rows {rows}: paged vs flat {paged_vs_flat:?} exceeds the \
                      quantization noise {noise:?} + kernel tolerance"
                 ));
             }
@@ -527,6 +542,7 @@ fn paged_int8_attention_tracks_the_flat_int8_kernel() {
     unsafe { std::env::set_var("MLX_PAGED_GROUPED_QWEN35_TEST_PROBE", "1") };
     let cases = [
         Case {
+            heads: (4, 24),
             d: 256,
             bs: 16,
             c: 512,
@@ -534,6 +550,7 @@ fn paged_int8_attention_tracks_the_flat_int8_kernel() {
             grouped: &[false, false, false],
         },
         Case {
+            heads: (4, 24),
             d: 256,
             bs: 16,
             c: 9_000,
@@ -541,6 +558,7 @@ fn paged_int8_attention_tracks_the_flat_int8_kernel() {
             grouped: &[false, true, false],
         },
         Case {
+            heads: (4, 24),
             d: 256,
             bs: 16,
             c: 17_000,
@@ -562,6 +580,7 @@ fn paged_int8_attention_head_and_page_sizes() {
     unsafe { std::env::set_var("MLX_PAGED_GROUPED_QWEN35_TEST_PROBE", "1") };
     let cases = [
         Case {
+            heads: (4, 24),
             d: 128,
             bs: 16,
             c: 300,
@@ -569,6 +588,7 @@ fn paged_int8_attention_head_and_page_sizes() {
             grouped: &[false, false],
         },
         Case {
+            heads: (4, 24),
             d: 128,
             bs: 16,
             c: 600,
@@ -576,6 +596,7 @@ fn paged_int8_attention_head_and_page_sizes() {
             grouped: &[false, false, false],
         },
         Case {
+            heads: (4, 24),
             d: 256,
             bs: 32,
             c: 600,
@@ -586,6 +607,64 @@ fn paged_int8_attention_head_and_page_sizes() {
     let mut failures = Vec::new();
     for (i, case) in cases.iter().enumerate() {
         check(case, 0x52_0000 + i as u64, &mut failures);
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The head layouts an int8 default reaches besides the 27B's 4 / 24: the
+/// 35B's 2 / 16 (the grouped route at 2 rows from 16,384 and 1 row from
+/// 32,768 tokens), the 0.8B's 2 / 8 and the 4B / 9B's 4 / 16.
+///
+/// Mutation G1: the varlen dispatch passes `num_kv_heads` as
+/// `num_q_heads / 6` (a GQA-6 assumption) → every non-6 case red.
+#[test]
+fn paged_int8_attention_gqa_shapes() {
+    unsafe { std::env::set_var("MLX_PAGED_GROUPED_QWEN35_TEST_PROBE", "1") };
+    let cases = [
+        Case {
+            heads: (2, 16),
+            d: 256,
+            bs: 16,
+            c: 600,
+            rows: &[1, 2, 8],
+            grouped: &[false, false, false],
+        },
+        Case {
+            heads: (2, 16),
+            d: 256,
+            bs: 16,
+            c: 17_000,
+            rows: &[1, 2, 8],
+            grouped: &[false, true, false],
+        },
+        Case {
+            heads: (2, 16),
+            d: 256,
+            bs: 16,
+            c: 33_000,
+            rows: &[1],
+            grouped: &[true],
+        },
+        Case {
+            heads: (2, 8),
+            d: 256,
+            bs: 16,
+            c: 9_000,
+            rows: &[1, 2, 8],
+            grouped: &[false, false, false],
+        },
+        Case {
+            heads: (4, 16),
+            d: 256,
+            bs: 16,
+            c: 9_000,
+            rows: &[1, 2, 8],
+            grouped: &[false, false, false],
+        },
+    ];
+    let mut failures = Vec::new();
+    for (i, case) in cases.iter().enumerate() {
+        check(case, 0x53_0000 + i as u64, &mut failures);
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }

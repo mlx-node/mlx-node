@@ -27,11 +27,6 @@ pub struct PagedAttentionConfig {
     /// Number of transformer layers
     pub num_layers: u32,
 
-    /// Whether to use FP8 quantization for cache
-    /// Reduces memory by ~50% with minimal quality loss
-    /// Default: false
-    pub use_fp8_cache: Option<bool>,
-
     /// Maximum sequence length supported
     /// Default: 8192
     pub max_seq_len: Option<u32>,
@@ -77,13 +72,6 @@ impl PagedAttentionConfig {
         // Validate KV heads
         if self.num_kv_heads == 0 {
             return Err("num_kv_heads must be > 0".to_string());
-        }
-
-        // FP8 cache requires block_size 16 or 32 for optimal memory alignment
-        if self.use_fp8_cache.unwrap_or(false) && self.block_size == 8 {
-            return Err(
-                "FP8 cache requires block_size 16 or 32 for optimal alignment.".to_string(),
-            );
         }
 
         Ok(())
@@ -141,11 +129,6 @@ impl PagedAttentionConfig {
         u64::from(self.calculate_num_blocks(cache_dtype)) * u64::from(self.block_size)
     }
 
-    /// Get the use_fp8_cache setting with default
-    pub fn use_fp8(&self) -> bool {
-        self.use_fp8_cache.unwrap_or(false)
-    }
-
     /// Get the max_seq_len setting with default
     pub fn max_seq_len(&self) -> u32 {
         self.max_seq_len.unwrap_or(8192)
@@ -165,7 +148,6 @@ impl Default for PagedAttentionConfig {
             head_size: 128, // Qwen3 default
             num_kv_heads: 4,
             num_layers: 28,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(8192),
             max_batch_size: Some(256),
         }
@@ -203,7 +185,6 @@ mod tests {
             head_size: 128,
             num_kv_heads: 4,
             num_layers: 28,
-            use_fp8_cache: Some(false),
             ..Default::default()
         };
 
@@ -215,59 +196,6 @@ mod tests {
             "Got {} blocks",
             num_blocks
         );
-    }
-
-    #[test]
-    fn test_fp8_doubles_capacity() {
-        let config_fp16 = PagedAttentionConfig {
-            block_size: 32,
-            gpu_memory_mb: 1024,
-            head_size: 128,
-            num_kv_heads: 4,
-            num_layers: 28,
-            use_fp8_cache: Some(false),
-            ..Default::default()
-        };
-
-        let config_fp8 = PagedAttentionConfig {
-            use_fp8_cache: Some(true),
-            ..config_fp16.clone()
-        };
-
-        let blocks_fp16 = config_fp16.calculate_num_blocks(MetalDtype::Float16);
-        let blocks_fp8 = config_fp8.calculate_num_blocks(MetalDtype::UChar);
-
-        // FP8 should give ~2x the blocks (calculation still works, just validation rejects)
-        assert!(blocks_fp8 >= blocks_fp16 * 2 - 1 && blocks_fp8 <= blocks_fp16 * 2 + 1);
-    }
-
-    #[test]
-    fn test_fp8_validation() {
-        // FP8 with block_size 32 should work
-        let config = PagedAttentionConfig {
-            use_fp8_cache: Some(true),
-            block_size: 32,
-            ..Default::default()
-        };
-        assert!(config.validate().is_ok());
-
-        // FP8 with block_size 16 should work
-        let config = PagedAttentionConfig {
-            use_fp8_cache: Some(true),
-            block_size: 16,
-            ..Default::default()
-        };
-        assert!(config.validate().is_ok());
-
-        // FP8 with block_size 8 should fail (alignment)
-        let config = PagedAttentionConfig {
-            use_fp8_cache: Some(true),
-            block_size: 8,
-            ..Default::default()
-        };
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("block_size 16 or 32"));
     }
 
     #[test]
@@ -288,7 +216,6 @@ mod tests {
             head_size: 128,
             num_kv_heads: 2,
             num_layers: 6,
-            use_fp8_cache: Some(false),
             max_seq_len: Some(1_048_576),
             max_batch_size: Some(32),
         };
@@ -319,7 +246,6 @@ mod tests {
             head_size: 256,
             num_kv_heads: 4,
             num_layers: 16,
-            use_fp8_cache: Some(false),
             ..Default::default()
         };
         assert_eq!(config.calculate_num_blocks(MetalDtype::Int8), 9_946);

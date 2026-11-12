@@ -1,6 +1,7 @@
 //! The memory plan a dense or MoE Qwen3.5 load serves its lanes from.
 
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -12,13 +13,18 @@ use crate::engine::memory_plan::{
     MemoryPlan, PlanError, PoolInput, SPECULATIVE_SCRATCH_TOKENS, check_max_context, live_memory,
     speculative_lane_bytes,
 };
+use crate::models::mtp_drafter::{
+    DrafterBodyVariant, detect_drafter_safetensors, missing_mtp_keys, reprefix_drafter_key,
+};
 use crate::models::quant_dispatch::{
-    has_sym8_mode, parse_quant_settings, select_quantization_block,
+    has_kquant_mode, has_sym8_mode, parse_quant_settings, select_quantization_block,
 };
 use crate::models::quantized_linear::{DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE};
 use crate::nn::rope_scaling::RopeScaling;
 use crate::transformer::KvFormat;
 use crate::utils::gguf::NativeGgufFamily;
+use crate::utils::gguf_import::imported_dtypes;
+use crate::utils::safetensors::{SafeTensorDType, SafeTensorsFile, checkpoint_safetensors_files};
 
 use super::config::Qwen3_5Config;
 use super::dflash2::DFlash2Config;
@@ -26,27 +32,62 @@ use super::dflash2_decode::{
     PrefillSdpaKernels, dflash2_lane_transient, flat_lane_transient, pool_lane_transient,
 };
 use super::dflash2_turn::{DFlash2Target, dflash2_target_kv_dtype, dflash2_target_kv_format};
+use super::persistence::{
+    compute_dtype_of, mtp_sidecar_candidates, normalize_mtp_weight_key, qwen35_text_key,
+};
+use crate::models::qwen3_5_moe::persistence::{mtp_expert_keys, settled_compute_dtype};
 
-/// Tokens of the pool every load starts with (Splash `warmupKvPages`).
-const RUNWAY_TOKENS: u32 = 2048;
+/// The pool's element type for `format`. BF16 pages hold any compute dtype
+/// cast to bf16. Int8 pages exist only where mlx-node has the int8 store and
+/// paged attention kernels: head 128 or 256, 16- or 32-token blocks, BF16
+/// rows; any other geometry fails the load, as Splash's start fails when
+/// `compiledAttention` has "no paged-attention kernel for layout" (Splash's
+/// bf16 kernels are geometry-bound the same way).
+pub(crate) fn qwen35_pool_cache_dtype(
+    label: &str,
+    format: KvFormat,
+    head_dim: u32,
+    block_size: u32,
+    compute: DType,
+) -> Result<mlx_paged_attn::metal::MetalDtype> {
+    use mlx_paged_attn::metal::MetalDtype;
+    match format {
+        KvFormat::Bf16 => Ok(MetalDtype::BFloat16),
+        KvFormat::Int8
+            if matches!(head_dim, 128 | 256)
+                && matches!(block_size, 16 | 32)
+                && compute == DType::BFloat16 =>
+        {
+            Ok(MetalDtype::Int8)
+        }
+        KvFormat::Int8 => Err(Error::from_reason(format!(
+            "{label}: no int8 paged attention kernel for head_dim {head_dim}, block size \
+             {block_size}, {compute:?} compute; load with kvFormat 'bf16'"
+        ))),
+    }
+}
 
-/// The blocks a pool starts with: the runway's tokens and one request's
-/// recurrent state.
+/// The blocks a pool starts with: `layout`'s runway pages (Splash
+/// `kvRunwayPages(minimumExtentPages)`) and one request's recurrent state,
+/// which the scheduler charges inside the pool.
 pub(crate) fn qwen35_runway_blocks(
     block_size: u32,
     bytes_per_block: u64,
     recurrent_state_bytes: u64,
+    layout: &KvLayout,
 ) -> u32 {
-    RUNWAY_TOKENS.div_ceil(block_size.max(1)).saturating_add(
-        recurrent_state_bytes
-            .div_ceil(bytes_per_block.max(1))
-            .min(u64::from(u32::MAX)) as u32,
-    )
+    let tokens = layout.runway_pages() * crate::engine::memory_plan::KV_PAGE_TOKENS;
+    tokens
+        .div_ceil(u64::from(block_size.max(1)))
+        .saturating_add(recurrent_state_bytes.div_ceil(bytes_per_block.max(1)))
+        .min(u64::from(u32::MAX)) as u32
 }
 
-/// The paged pool a load builds: BF16 blocks over the full-attention layers.
+/// The paged pool a load builds: blocks of `format` over the full-attention
+/// layers.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PoolGeometry {
+    pub format: KvFormat,
     pub bytes_per_block: u64,
     pub block_size: u32,
     pub layers: u32,
@@ -84,6 +125,17 @@ pub(crate) struct LoadLanes<'a> {
     /// lane's without a pool and a draft).
     pub format: KvFormat,
     pub dtype: DType,
+    /// The load can run an MTP turn on the pool lane (MTP heads, no
+    /// DFlash2 draft): the lane holds its draft state at the window.
+    pub mtp: bool,
+    /// The scheduler books that state inside the pool as well.
+    pub mtp_state_in_pool: bool,
+}
+
+/// Whether the hybrid scheduler serves this process's Qwen3.5 turns: it
+/// books lane state inside the pool.
+pub(crate) fn qwen35_scheduler_books_state_in_pool() -> bool {
+    super::model::Qwen35SchedulerState::continuous_batching_enabled()
 }
 
 /// Splash `evaluateEngineMemoryPlan` over `lanes` on the device `live`.
@@ -114,30 +166,47 @@ pub(crate) fn evaluate_qwen35_plan(
     let trained = config.served_context_tokens();
     let fa_layers = config.full_attention_layer_count();
     let kernels = PrefillSdpaKernels::probe(config.head_dim);
-    let pool_transient = |window| pool_lane_transient(config, DType::BFloat16, kernels, window);
-    let pool_input = lanes.pool.map(|geometry| PoolInput {
-        shape: LaneShape {
-            trained,
-            lane_bytes: recurrent_state_bytes,
-            layout: KvLayout::of(
-                fa_layers,
-                config.num_kv_heads,
-                config.head_dim,
-                DType::BFloat16,
-                KvFormat::Bf16,
+    let pool_format = lanes
+        .pool
+        .map_or(KvFormat::Bf16, |geometry| geometry.format);
+    let pool_transient = |window| pool_lane_transient(config, pool_format, kernels, window);
+    let mtp = lanes.mtp;
+    let mtp_state = |window: u32| {
+        if mtp {
+            super::scheduled_mtp::ScheduledMtpState::held_bytes(config, window)
+        } else {
+            0
+        }
+    };
+    let pool_input = lanes.pool.map(|geometry| {
+        let layout = KvLayout::of(
+            fa_layers,
+            config.num_kv_heads,
+            config.head_dim,
+            DType::BFloat16,
+            geometry.format,
+        );
+        PoolInput {
+            shape: LaneShape {
+                trained,
+                lane_bytes: recurrent_state_bytes,
+                layout,
+                scratch_rows: SPECULATIVE_SCRATCH_TOKENS,
+                transient: &pool_transient,
+            },
+            bytes_per_block: geometry.bytes_per_block,
+            layers: u64::from(geometry.layers),
+            runway_blocks: qwen35_runway_blocks(
+                geometry.block_size,
+                geometry.bytes_per_block,
+                recurrent_state_bytes,
+                &layout,
             ),
-            scratch_rows: SPECULATIVE_SCRATCH_TOKENS,
-            transient: &pool_transient,
-        },
-        bytes_per_block: geometry.bytes_per_block,
-        layers: u64::from(geometry.layers),
-        runway_blocks: qwen35_runway_blocks(
-            geometry.block_size,
-            geometry.bytes_per_block,
-            recurrent_state_bytes,
-        ),
-        explicit_mib: geometry.explicit_mib,
-        lane_in_pool: true,
+            explicit_mib: geometry.explicit_mib,
+            lane_in_pool: true,
+            state: &mtp_state,
+            state_in_pool: mtp && lanes.mtp_state_in_pool,
+        }
     });
     let (block_size, tap_layers) =
         draft.map_or((0, 0), |draft| (draft.block_size, draft.tap_layers));
@@ -227,6 +296,7 @@ pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
     label: &str,
     target: &T,
     recurrent_state_bytes: u64,
+    mtp_weights: bool,
     pool: Option<PoolGeometry>,
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
@@ -244,6 +314,8 @@ pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
         draft: draft.map(|draft| DraftTerms::of(&draft.config, draft.weight_bytes)),
         format: dflash2_target_kv_format(target),
         dtype: dflash2_target_kv_dtype(target)?,
+        mtp: mtp_weights && draft.is_none(),
+        mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
     };
     let plan = evaluate_qwen35_plan(label, &lanes, live, max_memory_bytes)?;
     check_qwen35_max_context(label, &plan, max_context)?;
@@ -298,9 +370,9 @@ pub(crate) fn max_memory_option(label: &str, value: Option<i64>) -> Result<Optio
 #[napi(object)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Qwen35ContextEstimate {
-    /// Tokens a non-DFlash2 turn may hold: the pool lane's, the flat lane's
-    /// without a pool and a draft, the trained window with a draft and no
-    /// pool.
+    /// Tokens a non-DFlash2 turn (AR, vision, MTP) may hold: the pool
+    /// lane's, the flat lane's without a pool and a draft, the trained
+    /// window with a draft and no pool.
     pub window_tokens: u32,
     /// Tokens a DFlash2 turn may hold; set only with a draft.
     pub speculative_window_tokens: Option<u32>,
@@ -347,6 +419,7 @@ pub async fn estimate_qwen35_context_window(
                 asset_dir: source.asset_dir(),
                 moe,
                 weight_bytes,
+                header: checkpoint_header(&source, moe)?,
                 draft_dir: options.draft_model_path.as_deref().map(Path::new),
                 kv_format,
                 max_memory_bytes,
@@ -400,26 +473,124 @@ pub(crate) fn checkpoint_weight_bytes(source: &CheckpointSource) -> Result<u64> 
     }
 }
 
-pub(crate) struct EstimateInput<'a> {
-    /// The directory holding the checkpoint's `config.json`.
-    pub asset_dir: &'a Path,
-    pub moe: bool,
-    pub weight_bytes: u64,
-    pub draft_dir: Option<&'a Path>,
-    pub kv_format: Option<KvFormat>,
-    pub max_memory_bytes: Option<u64>,
-    pub max_context: Option<u32>,
+/// What a load of a checkpoint reads from its weights, taken from the
+/// headers alone.
+pub(crate) struct CheckpointHeader {
+    /// The compute dtype the load settles on.
+    pub compute: DType,
+    /// The sanitized `mtp.*` keys the load's MTP gate sees, with their dtypes.
+    pub mtp: HashMap<String, DType>,
 }
 
-/// The plan a load of `input` would make on the device now, with the
-/// target's and the draft's weight files counted as active bytes. The
-/// compute dtype is taken as BF16: the weights that decide it are not read.
-pub(crate) fn estimate_qwen35_load(
-    label: &str,
-    input: &EstimateInput<'_>,
-) -> Result<Option<Qwen35ContextEstimate>> {
-    let config_path = input.asset_dir.join("config.json");
-    let raw: serde_json::Value = std::fs::read_to_string(&config_path)
+/// Each tensor's dtype in the safetensors files `paths`, an fp8 weight with
+/// a `_scale_inv` as the BF16 `dequant_fp8_weights` makes of it.
+fn safetensors_dtypes(paths: &[PathBuf]) -> Result<Vec<(String, DType)>> {
+    let mut dtypes = Vec::new();
+    let mut fp8_scaled = HashSet::new();
+    for path in paths {
+        for (name, info) in SafeTensorsFile::load(path)?.tensors {
+            if let Some(weight) = name.strip_suffix("_scale_inv") {
+                fp8_scaled.insert(weight.to_string());
+            }
+            let dtype = match info.dtype {
+                SafeTensorDType::F32 => DType::Float32,
+                SafeTensorDType::F16 => DType::Float16,
+                SafeTensorDType::BF16 => DType::BFloat16,
+                SafeTensorDType::I32 => DType::Int32,
+                SafeTensorDType::U32 => DType::Uint32,
+                SafeTensorDType::I8 => DType::Int8,
+                SafeTensorDType::U8 | SafeTensorDType::F8_E4M3 => DType::Uint8,
+                SafeTensorDType::I64 | SafeTensorDType::F64 | SafeTensorDType::BOOL => continue,
+            };
+            dtypes.push((name, dtype));
+        }
+    }
+    for (name, dtype) in &mut dtypes {
+        if fp8_scaled.contains(name.as_str()) {
+            *dtype = DType::BFloat16;
+        }
+    }
+    Ok(dtypes)
+}
+
+/// The loaders' rule over the dtypes the weights' headers give the
+/// sanitized keys (the GGUF ones are the import's): the compute dtype, and
+/// the `mtp.*` keys from the body, else (no inline MTP) the dense loader's
+/// sidecar, else the split drafter.
+pub(crate) fn checkpoint_header(source: &CheckpointSource, moe: bool) -> Result<CheckpointHeader> {
+    let mut raw_dtypes = match source {
+        CheckpointSource::Dir(dir) => safetensors_dtypes(&checkpoint_safetensors_files(dir))?,
+        CheckpointSource::Gguf(checkpoint) => {
+            imported_dtypes(&checkpoint.main.1, &checkpoint.plans.0, &checkpoint.opts)
+        }
+    };
+    let asset_dir = source.asset_dir();
+    let raw = read_config_json(asset_dir)?;
+    let inline_mtp = raw_dtypes.iter().any(|(name, _)| {
+        if moe {
+            name.contains("mtp.")
+        } else {
+            normalize_mtp_weight_key(name).is_some()
+        }
+    });
+    if !inline_mtp {
+        let mut sidecar = Vec::new();
+        if !moe {
+            for candidate in mtp_sidecar_candidates(asset_dir, &raw) {
+                if !candidate.exists() {
+                    continue;
+                }
+                sidecar = safetensors_dtypes(&[candidate])?
+                    .into_iter()
+                    .filter_map(|(name, dtype)| Some((normalize_mtp_weight_key(&name)?, dtype)))
+                    .collect();
+                if !sidecar.is_empty() {
+                    break;
+                }
+            }
+        }
+        if sidecar.is_empty()
+            && let Some(drafter) = detect_drafter_safetensors(asset_dir)
+        {
+            sidecar = safetensors_dtypes(&[drafter])?
+                .into_iter()
+                .map(|(name, dtype)| (reprefix_drafter_key(&name), dtype))
+                .collect();
+        }
+        raw_dtypes.extend(sidecar);
+    }
+    let has_individual_experts = raw_dtypes
+        .iter()
+        .any(|(name, _)| name.contains(".mlp.experts.0.up_proj.weight"));
+    let dtypes: HashMap<String, DType> = raw_dtypes
+        .into_iter()
+        .filter_map(|(name, dtype)| Some((qwen35_text_key(&name)?, dtype)))
+        .collect();
+    let mut mtp = HashMap::new();
+    for (name, dtype) in &dtypes {
+        if !name.starts_with("mtp.") {
+            continue;
+        }
+        if moe {
+            for key in mtp_expert_keys(name, has_individual_experts) {
+                mtp.insert(key, *dtype);
+            }
+        } else {
+            mtp.insert(name.clone(), *dtype);
+        }
+    }
+    let dtype_of = |key: &str| dtypes.get(key).copied();
+    let compute = if moe {
+        settled_compute_dtype(&raw, &dtype_of)
+    } else {
+        compute_dtype_of(&dtype_of)
+    };
+    Ok(CheckpointHeader { compute, mtp })
+}
+
+fn read_config_json(dir: &Path) -> Result<serde_json::Value> {
+    let config_path = dir.join("config.json");
+    std::fs::read_to_string(&config_path)
         .map_err(|error| {
             Error::from_reason(format!("Failed to read {}: {error}", config_path.display()))
         })
@@ -430,11 +601,37 @@ pub(crate) fn estimate_qwen35_load(
                     config_path.display()
                 ))
             })
-        })?;
-    let mut config = if input.moe {
-        crate::models::qwen3_5_moe::persistence::parse_config(&raw)?.to_dense_config()
+        })
+}
+
+pub(crate) struct EstimateInput<'a> {
+    /// The directory holding the checkpoint's `config.json`.
+    pub asset_dir: &'a Path,
+    pub moe: bool,
+    pub weight_bytes: u64,
+    pub header: CheckpointHeader,
+    pub draft_dir: Option<&'a Path>,
+    pub kv_format: Option<KvFormat>,
+    pub max_memory_bytes: Option<u64>,
+    pub max_context: Option<u32>,
+}
+
+/// The plan a load of `input` would make on the device now, with the
+/// target's and the draft's weight files counted as active bytes.
+pub(crate) fn estimate_qwen35_load(
+    label: &str,
+    input: &EstimateInput<'_>,
+) -> Result<Option<Qwen35ContextEstimate>> {
+    let raw = read_config_json(input.asset_dir)?;
+    let (mut config, mtp_body) = if input.moe {
+        let moe = crate::models::qwen3_5_moe::persistence::parse_config(&raw)?;
+        let body = crate::models::qwen3_5_moe::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&moe);
+        (moe.to_dense_config(), body)
     } else {
-        crate::models::qwen3_5::persistence::parse_config(&raw)?
+        (
+            crate::models::qwen3_5::persistence::parse_config(&raw)?,
+            DrafterBodyVariant::Dense,
+        )
     };
     config.rope_scaling = Some(RopeScaling::served_for(
         label,
@@ -447,14 +644,32 @@ pub(crate) fn estimate_qwen35_load(
         DEFAULT_QUANT_BITS,
         DEFAULT_QUANT_GROUP_SIZE,
     )?;
+    let sym8 = has_sym8_mode(top_level_mode, &per_layer_quant);
     // Both loaders pin a sym8 checkpoint to flat KV after reading its quant block.
-    if has_sym8_mode(top_level_mode, &per_layer_quant) && config.use_block_paged_cache == Some(true)
-    {
+    if sym8 && config.use_block_paged_cache == Some(true) {
         config.use_block_paged_cache = Some(false);
     }
+    // The loaders turn the MTP head off for sym8 (both) and K-quant (MoE)
+    // checkpoints, and for an incomplete `mtp.*` set.
+    let mtp_head = config.n_mtp_layers > 0
+        && !sym8
+        && !(input.moe && has_kquant_mode(top_level_mode, &per_layer_quant))
+        && missing_mtp_keys(
+            &|key| {
+                input
+                    .header
+                    .mtp
+                    .get(key)
+                    .map(|dtype| *dtype == DType::Uint32)
+            },
+            mtp_body,
+            config.n_mtp_layers,
+        )
+        .is_empty();
     KvFormat::parse(config.kv_format.as_deref())
         .map_err(|message| Error::from_reason(format!("config.json: {message}")))?;
-    let format = config.pin_kv_format(input.kv_format, DType::BFloat16);
+    let compute = input.header.compute;
+    let format = config.pin_kv_format(input.kv_format, compute);
     let draft = input
         .draft_dir
         .map(|dir| {
@@ -470,15 +685,18 @@ pub(crate) fn estimate_qwen35_load(
     {
         let layers = config.full_attention_layer_count() as u32;
         let block_size = config.paged_block_size();
+        let cache_dtype =
+            qwen35_pool_cache_dtype(label, format, config.head_dim as u32, block_size, compute)?;
         let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
             layers,
             config.num_kv_heads as u32,
             config.head_dim as u32,
             block_size,
-            mlx_paged_attn::metal::MetalDtype::BFloat16,
+            cache_dtype,
         )
         .map_err(|error| Error::from_reason(format!("{label} block-paged adapter: {error}")))?;
         Some(PoolGeometry {
+            format,
             bytes_per_block,
             block_size,
             layers,
@@ -503,7 +721,9 @@ pub(crate) fn estimate_qwen35_load(
         pool,
         draft,
         format,
-        dtype: DType::BFloat16,
+        dtype: compute,
+        mtp: mtp_head && draft.is_none(),
+        mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
     };
     let plan = evaluate_qwen35_plan(label, &lanes, live, input.max_memory_bytes)?;
     check_qwen35_max_context(label, &plan, input.max_context)?;
