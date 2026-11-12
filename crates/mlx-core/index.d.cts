@@ -62,6 +62,13 @@ export declare class ChatSessionCall {
  */
 export declare class ChatStreamHandle {
   cancel(): void;
+  /**
+   * Splash `RuntimeCall.stop` / `Engine::stop`: the turn ends at the step
+   * it is running, like a cancel, and finishes as a completion (`"stop"`)
+   * when it generated tokens. The stop bit is stored before the cancel
+   * flag the decode loops read.
+   */
+  stop(): void;
   /** Snapshot of the turn's prefill/decode progress. */
   progress(): ChatStreamProgress;
 }

@@ -101,11 +101,16 @@ export interface ChatStreamFinal {
 export type ChatStreamEvent = ChatStreamDelta | ChatStreamFinal;
 
 /**
- * Reader for the live native stream's progress. `read` is set once the
- * native handle exists and reset to `null` when the stream ends.
+ * Control of the live native stream. `read` returns its progress once the
+ * native handle exists. `stop` ends the native turn at the step it is running
+ * as a completion (Splash `RuntimeCall.stop`); it shares cancel's latch, so
+ * the first of the two wins and the other returns `false`. The stream still
+ * reads on to the done chunk after a stop. Both reset to `null` when the
+ * stream ends.
  */
-export interface ChatStreamProgressRef {
+export interface ChatStreamControl {
   read: (() => ChatStreamProgress | null) | null;
+  stop: (() => boolean) | null;
 }
 
 const modelPathsForTokenizers = new WeakMap<object, string>();
@@ -202,7 +207,7 @@ async function applyChatTemplateFromModelPath(
  *      path (client disconnect before first token) never happens.
  *   3. The generator sees the marker, breaks out of its loop, and the
  *      finally block runs `cancelOnce()` — which is a no-op because
- *      `triggerAbort` already flipped the `cancelled` flag. Some
+ *      `triggerAbort` already set the end latch. Some
  *      backends throw on double-cancel, so routing every cancel site
  *      through `cancelOnce` keeps abort behavior deterministic.
  *
@@ -219,7 +224,7 @@ async function applyChatTemplateFromModelPath(
 export async function* _runChatStream(
   startCall: (callback: (err: Error | null, chunk: ChatStreamChunk) => void) => Promise<ChatStreamHandle>,
   signal?: AbortSignal,
-  progressRef?: ChatStreamProgressRef,
+  control?: ChatStreamControl,
 ): AsyncGenerator<ChatStreamEvent> {
   // The native ThreadsafeFunction uses the same fixed ceiling. This JS-side
   // guard also protects handwritten/test adapters that bypass the Rust glue.
@@ -231,17 +236,16 @@ export async function* _runChatStream(
   }> = [];
   let resolve: (() => void) | null = null;
   let handle: ChatStreamHandle | null = null;
-  let cancelRequested = false;
-  let cancelled = false;
+  // Splash `RuntimeCall._request_end`: one latch for cancel and stop.
+  let endKind: 'cancel' | 'stop' | null = null;
   let overflowed = false;
 
-  const cancelOnce = (): void => {
-    if (cancelled) return;
-    if (handle === null) {
-      cancelRequested = true;
+  const sendEnd = (): void => {
+    if (handle === null || endKind === null) return;
+    if (endKind === 'stop') {
+      handle.stop();
       return;
     }
-    cancelled = true;
     try {
       handle.cancel();
     } catch {
@@ -249,6 +253,19 @@ export async function* _runChatStream(
       // remains authoritative for the consumer even if a backend throws.
     }
   };
+
+  const requestEnd = (kind: 'cancel' | 'stop'): boolean => {
+    if (endKind !== null) return false;
+    endKind = kind;
+    sendEnd();
+    return true;
+  };
+
+  const cancelOnce = (): void => {
+    requestEnd('cancel');
+  };
+
+  if (control != null) control.stop = () => requestEnd('stop');
 
   const waitForItem = () =>
     queue.length > 0
@@ -283,7 +300,7 @@ export async function* _runChatStream(
   };
 
   handle = await startCall(callback);
-  if (cancelRequested) cancelOnce();
+  sendEnd();
 
   // Guard against double-cancel. Some native backends throw on a
   // second `cancel()`; we route every cancel site through this
@@ -322,9 +339,9 @@ export async function* _runChatStream(
     }
   }
 
-  if (progressRef != null) {
+  if (control != null) {
     const started = handle;
-    progressRef.read = () => started.progress();
+    control.read = () => started.progress();
   }
 
   try {
@@ -403,7 +420,10 @@ export async function* _runChatStream(
         // a misbehaving signal must not leak out of the finally.
       }
     }
-    if (progressRef != null) progressRef.read = null;
+    if (control != null) {
+      control.read = null;
+      control.stop = null;
+    }
     cancelOnce();
   }
 }
@@ -723,12 +743,12 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
       messages: ChatMessage[],
       config?: ChatConfig | null,
       signal?: AbortSignal,
-      progressRef?: ChatStreamProgressRef,
+      control?: ChatStreamControl,
     ): AsyncGenerator<ChatStreamEvent> {
       yield* _runChatStream(
         (callback) => nativeStart.call(this, messages as never, (config ?? null) as never, callback as never),
         signal,
-        progressRef,
+        control,
       );
     }
 
@@ -736,12 +756,12 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
       messages: ChatMessage[],
       config?: ChatConfig | null,
       signal?: AbortSignal,
-      progressRef?: ChatStreamProgressRef,
+      control?: ChatStreamControl,
     ): AsyncGenerator<ChatStreamEvent> {
       yield* _runChatStream(
         (callback) => nativeContinue.call(this, messages as never, (config ?? null) as never, callback as never),
         signal,
-        progressRef,
+        control,
       );
     }
 
@@ -749,12 +769,12 @@ export function makeStreamingModel<C extends NativeStreamingCtor, const O extend
       messages: ChatMessage[],
       config?: ChatConfig | null,
       signal?: AbortSignal,
-      progressRef?: ChatStreamProgressRef,
+      control?: ChatStreamControl,
     ): AsyncGenerator<ChatStreamEvent> {
       yield* _runChatStream(
         (callback) => nativeContinueTool.call(this, messages as never, (config ?? null) as never, callback as never),
         signal,
-        progressRef,
+        control,
       );
     }
   }

@@ -812,6 +812,7 @@ pub(super) mod tests {
             streamed_text_len: 0,
             last_is_reasoning: false,
             failure: None,
+            vacated_stop: false,
             allocation_failed: false,
             preemption_replay: None,
             requested_tokens,

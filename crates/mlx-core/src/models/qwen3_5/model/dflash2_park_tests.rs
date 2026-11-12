@@ -71,6 +71,109 @@ fn run_paged_ar_turn(
     Ok(())
 }
 
+/// Forwards to the request's stream and calls `ChatStreamHandle::stop` on its
+/// 20th delta, as the server's stop match does.
+struct StopAt20<'a> {
+    plumbing: &'a crate::engine::napi_glue::ChatStreamPlumbing,
+    deltas: std::sync::Mutex<usize>,
+}
+
+impl crate::engine::backend::ChunkSink for StopAt20<'_> {
+    fn send(&self, chunk: Result<crate::engine::types::ChatStreamChunk>) {
+        if let Ok(delta) = &chunk
+            && !delta.done
+        {
+            let mut deltas = self.deltas.lock().unwrap();
+            *deltas += 1;
+            if *deltas == 20 {
+                self.plumbing.handle.stop();
+            }
+        }
+        crate::engine::backend::ChunkSink::send(&self.plumbing.stream_tx, chunk);
+    }
+}
+
+/// A turn stopped at its 20th token ends through the commit epilogue (Splash
+/// `release` → `vacateLane`): the full blocks of the prompt and the reply up
+/// to the stop are registered, so a new request's prefix hits through them.
+///
+/// Mutation: `finish_paged_turn` aborts a "cancelled" turn's pages in
+/// place of registering them; the hit stops inside the prompt.
+#[test]
+fn a_stopped_turn_commits_through_the_match() -> Result<()> {
+    if !metal_is_default_device() {
+        return Ok(());
+    }
+    let mut inner = fixture(0x5730_0001);
+    install_pool(&mut inner, 16, 16, passing_probe())?;
+    let tokenizer = tokenizer();
+    let prompt = first_prompt(3);
+    let config = ChatConfig {
+        max_new_tokens: Some(40),
+        max_consecutive_tokens: Some(0),
+        max_ngram_repeats: Some(0),
+        ..ar_config()
+    };
+    let params = ChatBackend::resolve_params(&inner, &config);
+    let thinking = ChatBackend::thinking_setup(&inner, &config);
+    let (plumbing, mut rx) = crate::engine::napi_glue::chat_stream_plumbing();
+    let sink = StopAt20 {
+        plumbing: &plumbing,
+        deltas: std::sync::Mutex::new(0),
+    };
+    ChatBackend::set_cache_owner_id(&mut inner, "stopped", None);
+    let mut args = WholeTurnArgs {
+        tokens: &prompt,
+        tokenizer: &tokenizer,
+        eos_id: u32::MAX,
+        config: &config,
+        params: &params,
+        thinking,
+        plan: TurnPlan {
+            is_delta: false,
+            input_media: MediaCapabilities::NONE,
+            context_media: MediaCapabilities::NONE,
+            use_paged_attention: true,
+            decoder: DecoderPlan::Autoregressive,
+        },
+        sink: Some(&sink),
+        cancelled: Some(&plumbing.cancelled),
+        media: MediaInputs {
+            images: &[],
+            audio: &[],
+        },
+    };
+    ChatBackend::run_paged_turn(&mut inner, &mut args)?;
+    let mut done = None;
+    while let Ok(chunk) = rx.try_recv() {
+        let chunk = chunk?;
+        if chunk.done {
+            done = Some(chunk);
+        }
+    }
+    let done = done.expect("the stopped turn sent no done chunk");
+    assert_eq!(done.finish_reason.as_deref(), Some("stop"));
+    let generated = done.num_tokens.unwrap() as usize;
+    assert!((20..=21).contains(&generated), "{generated} tokens");
+    let history = inner.cached_token_history.clone();
+    assert_eq!(history.len(), prompt.len() + generated - 1);
+    inner.discard_dense_paged_session();
+    let adapter = inner.paged_adapter.as_ref().expect("adapter");
+    let block_size = adapter.block_size() as usize;
+    assert_eq!(block_size, 16);
+    let mut next = history.clone();
+    next.extend([1, 2, 3, 4, 5]);
+    let (_, hit) = adapter.allocator().lock().unwrap().find_longest_cache_hit(
+        &next,
+        block_size as u32,
+        &[],
+        params.cache_salt,
+    );
+    assert_eq!(hit, history.len() / block_size * block_size);
+    assert!(hit > prompt.len() / block_size * block_size);
+    Ok(())
+}
+
 /// A pool starts at the runway and grows by Splash extents. Mutation: drop the `set_extent_growth` call in dense
 /// `initialize_paged_adapter` → red (`None`).
 #[test]

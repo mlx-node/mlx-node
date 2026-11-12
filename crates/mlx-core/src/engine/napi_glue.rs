@@ -16,7 +16,7 @@
 //!         callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
 //!     }
 //! });
-//! Ok(ChatStreamHandle { cancelled, progress })
+//! Ok(ChatStreamHandle { cancelled, stop, progress })
 //! ```
 
 use std::sync::Arc;
@@ -94,15 +94,18 @@ pub(crate) fn chat_stream_plumbing() -> (
     tokio::sync::mpsc::Receiver<napi::Result<ChatStreamChunk>>,
 ) {
     let cancelled = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
     let progress = Arc::new(TurnProgress::new());
-    let (stream_tx, stream_rx) =
+    let (mut stream_tx, stream_rx) =
         stream_channel_with_progress(CHAT_STREAM_NATIVE_QUEUE_LIMIT, Arc::clone(&progress));
+    stream_tx.watch_stop(Arc::clone(&cancelled), Arc::clone(&stop));
     (
         ChatStreamPlumbing {
             cancelled: cancelled.clone(),
             stream_tx,
             handle: ChatStreamHandle {
                 cancelled,
+                stop,
                 progress,
             },
         },
@@ -278,5 +281,47 @@ mod tests {
             .block_on(send_chat_and_await(&thread, Some(schemas()), Turn))
             .unwrap();
         assert_eq!(result.tool_calls[0].arguments, json!({"n": 4}));
+    }
+
+    fn done_chunk(finish_reason: &str, num_tokens: u32) -> ChatStreamChunk {
+        ChatStreamChunk {
+            text: String::new(),
+            done: true,
+            finish_reason: Some(finish_reason.to_string()),
+            tool_calls: None,
+            thinking: None,
+            thinking_enabled: Some(false),
+            num_tokens: Some(num_tokens),
+            prompt_tokens: None,
+            reasoning_tokens: None,
+            raw_text: None,
+            public_raw_text: None,
+            text_authoritative: None,
+            cached_tokens: None,
+            performance: None,
+            is_reasoning: None,
+        }
+    }
+
+    /// Splash `Engine::stop`: a stopped turn with tokens finishes "stop"; one
+    /// with none, or one a cancel ended, stays "cancelled"; a finish the turn
+    /// reached on its own is kept.
+    ///
+    /// Mutation: the sink skips the rename; (a) reads "cancelled".
+    #[test]
+    fn a_stopped_stream_finishes_stop() {
+        use crate::engine::backend::ChunkSink;
+        let finish = |end: &dyn Fn(&ChatStreamHandle), reason: &str, tokens: u32| {
+            let (plumbing, mut rx) = chat_stream_plumbing();
+            end(&plumbing.handle);
+            ChunkSink::send(&plumbing.stream_tx, Ok(done_chunk(reason, tokens)));
+            rx.try_recv().unwrap().unwrap().finish_reason.unwrap()
+        };
+        let stop = |handle: &ChatStreamHandle| handle.stop();
+        let cancel = |handle: &ChatStreamHandle| handle.cancel();
+        assert_eq!(finish(&stop, "cancelled", 20), "stop");
+        assert_eq!(finish(&stop, "cancelled", 0), "cancelled");
+        assert_eq!(finish(&cancel, "cancelled", 20), "cancelled");
+        assert_eq!(finish(&stop, "tool_calls", 20), "tool_calls");
     }
 }

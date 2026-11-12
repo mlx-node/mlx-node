@@ -83,7 +83,7 @@ export type { ClefRequest, ClefQuestion, ClefResult, ClefAnswer, DecisionModel }
 export type { ChatConfig, ChatResult, ChatMessage, ToolCallResult, PerformanceMetrics } from '@mlx-node/core';
 
 // Streaming chat API
-export type { ChatStreamDelta, ChatStreamFinal, ChatStreamEvent, ChatStreamProgressRef } from './stream.js';
+export type { ChatStreamDelta, ChatStreamFinal, ChatStreamEvent, ChatStreamControl } from './stream.js';
 // Internal: exported for testing the callback-to-AsyncGenerator bridge
 // Not part of the public API — may change without notice.
 // `_runChatStream` is the generic adapter used by every model wrapper
@@ -108,6 +108,7 @@ export {
   isContextCapacityError,
   mtpAutoDefaultAllowed,
   mtpOnByDefault,
+  selectCommittedStreamText,
 } from './chat-session.js';
 export { ToolCallTagBuffer, longestSuffixPrefixOverlap } from './tool-call-buffer.js';
 export type {

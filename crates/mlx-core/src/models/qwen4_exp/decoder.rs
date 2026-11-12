@@ -212,6 +212,10 @@ pub struct Decoder {
     pub rope_delta: i64,
     pub media_digests: Vec<crate::engine::cache::ImageCacheDigest>,
     pub cancelled: Option<Arc<AtomicBool>>,
+    /// Splash `Engine::stop` ends a lane at its pass boundary: inside a
+    /// decode pass the cancel flag is left to the step-boundary snapshot,
+    /// so a stop never fails the pass (or a batched pass's peer rows).
+    pub(super) decode_pass: bool,
     pub paged: Option<crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter>,
     paged_chunk_start: usize,
     scope: String,
@@ -319,6 +323,7 @@ impl Decoder {
             rope_delta: 0,
             media_digests: Vec::new(),
             cancelled: None,
+            decode_pass: false,
             paged: None,
             paged_chunk_start: 0,
             scope: String::new(),
@@ -545,6 +550,9 @@ impl Decoder {
         )
     }
     pub fn check_cancelled(&self) -> Result<()> {
+        if self.decode_pass {
+            return Ok(());
+        }
         if self
             .cancelled
             .as_ref()
@@ -2181,10 +2189,12 @@ impl Decoder {
     pub fn step(&mut self, token: u32) -> Result<MxArray> {
         self.rotary_tables.get_mut().clear();
         let started = std::time::Instant::now();
+        let pass = std::mem::replace(&mut self.decode_pass, true);
         let result = self.forward_with_device_routes(token, true);
+        self.decode_pass = pass;
         self.rotary_tables.get_mut().clear();
-        // A read failure or cancellation can happen after earlier layers have
-        // advanced. Discard the entire prefix instead of reusing partial state.
+        // A read failure can happen after earlier layers have advanced.
+        // Discard the entire prefix instead of reusing partial state.
         if result.is_err() {
             self.reset();
         } else {
@@ -2308,6 +2318,7 @@ impl Decoder {
         if self.verify_routes_on_device() {
             self.device_routes = Some(Vec::with_capacity(self.config.num_hidden_layers));
         }
+        let pass = std::mem::replace(&mut self.decode_pass, true);
         let result = (|| {
             if cfg!(target_os = "macos") {
                 self.weights.check_forward_headroom()?;
@@ -2361,6 +2372,7 @@ impl Decoder {
             }
             Ok((logits, states))
         })();
+        self.decode_pass = pass;
         self.rotary_tables.get_mut().clear();
         match result {
             Ok(verified) => {

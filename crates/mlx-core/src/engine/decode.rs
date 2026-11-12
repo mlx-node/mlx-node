@@ -2392,4 +2392,132 @@ mod run_decode_loop_tests {
         assert_eq!(step.ledger, vec!["lazy_forward"]);
         assert!(step.records.is_empty());
     }
+
+    /// Cycles `t1 c3 c4` forever: the turn ends only by its token cap or a stop.
+    struct CyclingStep {
+        forward_calls: usize,
+    }
+
+    impl DecodeStep for CyclingStep {
+        fn forward(&mut self, _input_ids: &MxArray) -> Result<(MxArray, bool)> {
+            let target = [3usize, 4, 1][self.forward_calls % 3];
+            self.forward_calls += 1;
+            let mut v = vec![0.0f32; 7];
+            v[target] = 10.0;
+            Ok((MxArray::from_float32(&v, &[1, 7])?, false))
+        }
+    }
+
+    /// Calls `ChatStreamHandle::stop` on its 20th delta, as the server's stop
+    /// match does.
+    struct StopAtSink<'a> {
+        handle: &'a crate::engine::types::ChatStreamHandle,
+        deltas: Mutex<usize>,
+    }
+
+    impl ChunkSink for StopAtSink<'_> {
+        fn send(&self, chunk: Result<ChatStreamChunk>) {
+            let Ok(chunk) = chunk else { return };
+            if chunk.done {
+                return;
+            }
+            let mut deltas = self.deltas.lock().unwrap();
+            *deltas += 1;
+            if *deltas == 20 {
+                self.handle.stop();
+            }
+        }
+    }
+
+    /// A stop match at token 20 with a 32,000-token cap ends decode within
+    /// one step, and the done chunk reads "stop".
+    ///
+    /// Mutation: `stop()` sets only the stop bit, not the cancel flag
+    /// (decode keeps consuming); the loop runs to the cap.
+    #[test]
+    fn stop_at_token_20_ends_decode_within_one_step() {
+        let (plumbing, mut rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let params = greedy_params(|cfg| {
+            cfg.max_consecutive_tokens = Some(0);
+            cfg.max_ngram_repeats = Some(0);
+        });
+        let mut tracker = ReasoningTracker::new(false, None, &[]);
+        let mut step = CyclingStep { forward_calls: 0 };
+        let tokenizer = tiny_tokenizer();
+        let mut decode_stream = tokenizer.decode_stream(true);
+        let sink = StopAtSink {
+            handle: &plumbing.handle,
+            deltas: Mutex::new(0),
+        };
+        let mut streamed_text_len = 0usize;
+        let mut last_is_reasoning = false;
+        let mut emitter = DefaultStreamEmitter;
+        let y = MxArray::from_int32(&[1], &[1]).unwrap_or_else(|e| panic!("{}", e.reason));
+        let mut profiler = DecodeProfiler::new("test", "mock");
+        let mut generated_tokens: Vec<u32> = Vec::new();
+        let mut token_history: Vec<u32> = Vec::new();
+        let mut finish_reason = String::from("length");
+        let mut first_token_instant: Option<std::time::Instant> = None;
+        let cancelled: &AtomicBool = &plumbing.cancelled;
+        run_decode_loop(
+            &mut step,
+            DecodeLoopArgs {
+                y,
+                params: &params,
+                reasoning_tracker: &mut tracker,
+                profiler: &mut profiler,
+                max_new_tokens: 32_000,
+                eos_id: 5,
+                extra_eos_ids: &[],
+                eos_before_emit: false,
+                generated_tokens: &mut generated_tokens,
+                token_history: &mut token_history,
+                finish_reason: &mut finish_reason,
+                first_token_instant: &mut first_token_instant,
+                report_perf: false,
+                generation_stream: Stream::generation(),
+                cancel_flag: Some(cancelled),
+                turn_token_observer: None,
+            },
+            Some(StreamingCtx {
+                callback: &sink,
+                cancelled,
+                decode_stream: &mut decode_stream,
+                tokenizer: &tokenizer,
+                streamed_text_len: &mut streamed_text_len,
+                last_is_reasoning: &mut last_is_reasoning,
+                emitter: &mut emitter,
+            }),
+        )
+        .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+        assert_eq!(*sink.deltas.lock().unwrap(), 20);
+        assert!(
+            generated_tokens.len() <= 21,
+            "decoded {} tokens past a stop at 20",
+            generated_tokens.len()
+        );
+        assert_eq!(finish_reason, "cancelled");
+        ChunkSink::send(
+            &plumbing.stream_tx,
+            Ok(ChatStreamChunk {
+                text: String::new(),
+                done: true,
+                finish_reason: Some(finish_reason),
+                tool_calls: None,
+                thinking: None,
+                thinking_enabled: Some(false),
+                num_tokens: Some(generated_tokens.len() as u32),
+                prompt_tokens: None,
+                reasoning_tokens: None,
+                raw_text: None,
+                public_raw_text: None,
+                text_authoritative: None,
+                cached_tokens: None,
+                performance: None,
+                is_reasoning: None,
+            }),
+        );
+        let done = rx.try_recv().unwrap().unwrap();
+        assert_eq!(done.finish_reason.as_deref(), Some("stop"));
+    }
 }

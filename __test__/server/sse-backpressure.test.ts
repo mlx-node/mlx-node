@@ -4,7 +4,7 @@ import type { AddressInfo } from 'node:net';
 import { Writable } from 'node:stream';
 
 import type { ChatMessage, ChatResult, ChatStreamProgress } from '@mlx-node/core';
-import type { ChatStreamProgressRef, SessionCapableModel } from '@mlx-node/lm';
+import type { ChatStreamControl, SessionCapableModel } from '@mlx-node/lm';
 import { createServer, type ServerInstance } from '@mlx-node/server';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
@@ -540,7 +540,7 @@ describe('progress pings under backpressure', () => {
       const snapshot: ChatStreamProgress = { phase: 'decode', generatedTokens: 1, decodeElapsedMs: 100 };
       const nextEvent = deferred<Record<string, unknown>>();
       let started = false;
-      async function* stream(ref?: ChatStreamProgressRef): AsyncGenerator<Record<string, unknown>> {
+      async function* stream(ref?: ChatStreamControl): AsyncGenerator<Record<string, unknown>> {
         started = true;
         if (ref !== undefined) ref.read = () => snapshot;
         try {
@@ -551,7 +551,7 @@ describe('progress pings under backpressure', () => {
         }
       }
       const start = vi.fn(
-        (_messages: ChatMessage[], _config: unknown, _signal?: AbortSignal, ref?: ChatStreamProgressRef) => stream(ref),
+        (_messages: ChatMessage[], _config: unknown, _signal?: AbortSignal, ref?: ChatStreamControl) => stream(ref),
       );
       const model = {
         chatSessionStart: vi.fn(async () => quickResult()),

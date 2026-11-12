@@ -53,7 +53,7 @@ pub(crate) struct FinishPagedTurnArgs<'a> {
 
 pub(crate) fn finish_paged_turn<B: PagedBackend>(
     backend: &mut B,
-    mut args: FinishPagedTurnArgs<'_>,
+    args: FinishPagedTurnArgs<'_>,
 ) -> Result<TurnOutput> {
     let keep_all = args.finish_reason == "length" && args.retain_final_length_token;
     let reconcile_ok = if args.reuse_cache {
@@ -78,7 +78,15 @@ pub(crate) fn finish_paged_turn<B: PagedBackend>(
         backend.abort_paged_turn();
         return Err(error);
     }
+    emit_paged_turn_result(backend, args)
+}
 
+/// The result half of [`finish_paged_turn`], for a turn whose pages were
+/// already handed back to the cache (Splash `vacateLane` at preemption).
+pub(crate) fn emit_paged_turn_result<B: PagedBackend>(
+    backend: &mut B,
+    mut args: FinishPagedTurnArgs<'_>,
+) -> Result<TurnOutput> {
     let perf_prefill_tokens =
         backend.paged_perf_prefill_tokens(args.prompt_tokens.len(), args.suffix_len);
     let performance = if args.params.report_performance {

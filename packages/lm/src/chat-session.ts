@@ -89,7 +89,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import type { ChatConfig, ChatMessage, ChatResult, ToolCall, ToolCallResult, ToolDefinition } from '@mlx-node/core';
 
-import type { ChatStreamEvent, ChatStreamProgressRef } from './stream.js';
+import type { ChatStreamControl, ChatStreamEvent } from './stream.js';
 
 /**
  * Typed prefix native media guards use when a history cannot be continued
@@ -348,6 +348,17 @@ function buildAssistantMessage(
 }
 
 /**
+ * The raw assistant bytes of a reply cut at a stop match, for families whose
+ * template replays raw content: the raw text before the visible stream (the
+ * reasoning block) followed by the cut. `null` when the raw text does not end
+ * with the visible stream, so the reasoning bytes cannot be told apart.
+ */
+function cutRawText(rawText: string | null, visibleStream: string, cut: string): string | null {
+  if (rawText === null || !rawText.endsWith(visibleStream)) return null;
+  return rawText.slice(0, rawText.length - visibleStream.length) + cut;
+}
+
+/**
  * Count the `ok`-status tool calls in a `ChatResult.toolCalls` /
  * terminal stream chunk. Used to detect the unsupported multi-call
  * fan-out pattern — the chat-session API only serves one tool call
@@ -375,7 +386,7 @@ function countOkToolCalls(toolCalls: readonly ToolCallResult[] | undefined): num
  * text as deltas and an empty terminal value for ordinary no-tool replies, so
  * retain the accumulated visible text in that distinct shape.
  */
-function selectCommittedStreamText(
+export function selectCommittedStreamText(
   finalText: string | null,
   accumulatedVisible: string,
   terminalTextAuthoritative: boolean | undefined,
@@ -508,26 +519,27 @@ export interface SessionCapableModel {
    * cancellation (e.g. HTTP endpoints flipping an AbortController on
    * socket close) can attach one here and the native decode unwinds
    * at the next safepoint via `ChatStreamHandle.cancel()`. Non-signal
-   * callers (the common direct-use path) just omit it. `progressRef`
-   * receives a reader for the native turn's progress while it runs.
+   * callers (the common direct-use path) just omit it. `control`
+   * receives the native turn's progress reader and its `stop` while it
+   * runs.
    */
   chatStreamSessionStart(
     messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
-    progressRef?: ChatStreamProgressRef,
+    control?: ChatStreamControl,
   ): AsyncGenerator<ChatStreamEvent>;
   chatStreamSessionContinue(
     messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
-    progressRef?: ChatStreamProgressRef,
+    control?: ChatStreamControl,
   ): AsyncGenerator<ChatStreamEvent>;
   chatStreamSessionContinueTool(
     messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
-    progressRef?: ChatStreamProgressRef,
+    control?: ChatStreamControl,
   ): AsyncGenerator<ChatStreamEvent>;
   /**
    * Wipe the native KV caches and cached token history.
@@ -901,6 +913,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   private inFlight = false;
   /** A failed/abandoned native turn must be followed by a full replay. */
   private needsFullReplay = false;
+  /** The in-flight `startFromHistoryStream` turn's stop, and its cut once stopped. */
+  private activeStop: { control: ChatStreamControl; cut: string | null } | null = null;
 
   /**
    * Count of `ok` tool calls emitted by the prior assistant turn, or
@@ -937,6 +951,26 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    */
   get turns(): number {
     return this.turnCount;
+  }
+
+  /**
+   * Ends the in-flight {@link startFromHistoryStream} turn at the native
+   * step it is running, as a completion (Splash `RuntimeCall.stop`, sent on
+   * a stop-sequence match). The turn commits `committedText` as the
+   * assistant reply with no tool calls, its done event carries that text
+   * with `finishReason: 'stop'`, and the next `send` replays the full
+   * history (native history holds the tokens decoded past the cut).
+   * Returns whether the native stop was sent: `false` when no stoppable
+   * turn is in flight, its native stream has not started yet, it was already
+   * stopped, or a cancel ended it first. A `false` changes nothing (Splash
+   * `RuntimeCall._request_end`), so the caller may retry.
+   */
+  stop(committedText: string): boolean {
+    const active = this.activeStop;
+    if (active === null || active.cut !== null) return false;
+    if (active.control.stop?.() !== true) return false;
+    active.cut = committedText;
+    return true;
   }
 
   /** Whether the session currently has images bound to its cache. */
@@ -1736,7 +1770,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   async *startFromHistoryStream(
     config?: ChatConfig,
     signal?: AbortSignal,
-    progressRef?: ChatStreamProgressRef,
+    control: ChatStreamControl = { read: null, stop: null },
   ): AsyncGenerator<ChatStreamEvent> {
     if (this.inFlight) {
       throw new Error('ChatSession: cannot startFromHistoryStream() while a send() is in flight');
@@ -1748,6 +1782,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       throw new Error('ChatSession: startFromHistoryStream() requires a primed history');
     }
     this.inFlight = true;
+    const active = { control, cut: null as string | null };
+    this.activeStop = active;
     try {
       const mergedConfig = this.mergeConfig(config);
       const historySnapshot = this.history.slice();
@@ -1766,7 +1802,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           historySnapshot,
           withReplayReasoning(constrainedConfig, this.model),
           signal,
-          progressRef,
+          control,
         )) {
           if (event.done) {
             if (event.finishReason !== 'error') {
@@ -1785,7 +1821,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
             }
           }
           const publicEvent = publicStreamEvent(event, constrainedConfig);
-          if (publicEvent !== null) yield publicEvent;
+          if (publicEvent === null) continue;
+          // Splash `NativeBackend._finalize`: a stopped turn reports reason
+          // "stop", its text ends at the match, and no call counts as made.
+          if (publicEvent.done && active.cut !== null) {
+            yield { ...publicEvent, text: active.cut, toolCalls: [], finishReason: 'stop' };
+          } else {
+            yield publicEvent;
+          }
         }
       } finally {
         // finally runs on normal completion, mid-stream throw, caller
@@ -1793,7 +1836,21 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // error-finish chunks alike. The primed history is only
         // mutated on a successful commit — on any non-success exit,
         // the primed state is left intact so the caller can retry.
-        if (sawFinal) {
+        if (sawFinal && active.cut !== null) {
+          const rawCut =
+            this.model.replaysAssistantRawText?.() === true
+              ? cutRawText(finalReplayRaw, accumulatedVisible, active.cut)
+              : null;
+          this.history.push(
+            buildAssistantMessage(active.cut, undefined, finalThinking, finalThinkingEnabled, rawCut, rawCut !== null),
+          );
+          this.turnCount++;
+          this.needsFullReplay = true;
+          this.lastImagesKey = this.computeTrailingImagesKey();
+          this.lastAudioKey = this.computeTrailingAudioKey();
+          this.commitActiveTools(constrainedConfig);
+          this.recordToolCallFanout(undefined);
+        } else if (sawFinal) {
           this.history.push(
             buildAssistantMessage(
               selectCommittedStreamText(finalRaw, accumulatedVisible, finalTextAuthoritative),
@@ -1813,6 +1870,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         }
       }
     } finally {
+      this.activeStop = null;
       this.inFlight = false;
     }
   }

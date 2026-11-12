@@ -992,6 +992,21 @@ fn grow_or_take_needed_blocks_for(
     (short > 0).then(|| short.min(u64::from(u32::MAX)) as u32)
 }
 
+/// A stopped turn that generated tokens and holds no pages ends as a
+/// completion; marks it and returns true.
+pub(crate) fn stop_vacates<P>(turn: &mut TurnState<ScheduledTurn<P>>) -> bool {
+    let stopped = match &turn.payload.response {
+        ScheduledReply::Stream(stream) => stream.stop_requested(),
+        ScheduledReply::Sync(_) => false,
+    };
+    if !stopped || turn.payload.generated_tokens.is_empty() {
+        return false;
+    }
+    turn.payload.vacated_stop = true;
+    turn.payload.finish_reason = "cancelled".to_string();
+    true
+}
+
 pub(crate) enum ScheduledReply {
     Sync(ResponseTx<ChatResult>),
     Stream(StreamTx<ChatStreamChunk>),
@@ -1051,6 +1066,10 @@ pub(crate) struct ScheduledTurn<P> {
     pub(crate) streamed_text_len: usize,
     pub(crate) last_is_reasoning: bool,
     pub(crate) failure: Option<Error>,
+    /// A stop reached the turn while it held no pages (preempted, waiting, or
+    /// replaying after preemption): it ends as a completion on what it
+    /// generated (Splash `Engine::stop` → `settle` → `finish(Stop)`).
+    pub(crate) vacated_stop: bool,
     pub(crate) allocation_failed: bool,
     pub(crate) preemption_replay: Option<PreemptionReplay>,
     /// Token bound the off-pool state reservation was sized for. The block
@@ -1128,6 +1147,13 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
     ) -> RowStepResult {
         turn.payload.allocation_failed |= is_paged_allocation_blocked(&error.reason);
         turn.payload.failure = Some(error);
+        Self::end_row(turn, row)
+    }
+
+    fn end_row(
+        turn: &mut TurnState<ScheduledTurn<B::PrefixState>>,
+        row: &engine::scheduler::StepRow,
+    ) -> RowStepResult {
         turn.payload.profiler.snapshot_memory_after();
         turn.payload.profiler.report();
         RowStepResult {
@@ -1198,6 +1224,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         turn: &mut TurnState<ScheduledTurn<B::PrefixState>>,
     ) -> Result<RowStepResult> {
         if row.cancel_snapshot {
+            if stop_vacates(turn) {
+                return Ok(Self::end_row(turn, row));
+            }
             return Ok(Self::fail(
                 turn,
                 row,
@@ -1285,6 +1314,12 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             }
             Err(error) => {
                 turn.payload.profiler.end_prefill();
+                // A stop that lands inside a replay slice cancels the slice
+                // from the live flag; the turn still ends `Stop` on what it
+                // generated (Splash `Engine::stop` → `settle`).
+                if stop_vacates(turn) {
+                    return Ok(Self::end_row(turn, row));
+                }
                 return Ok(Self::fail(turn, row, error));
             }
         };
@@ -2771,6 +2806,46 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         self.try_resume_preempted();
     }
 
+    /// Runs one scheduler step whose rows execute after `before_execute`,
+    /// i.e. after the step's cancel snapshot, and settles it.
+    #[cfg(test)]
+    pub(crate) fn step_after_snapshot(&mut self, before_execute: impl FnMut()) -> bool {
+        struct Hooked<'a, B: HybridSchedulerBackend, F> {
+            executor: HybridStepExecutor<'a, B>,
+            before_execute: F,
+        }
+        impl<B: HybridSchedulerBackend, F: FnMut()> StepExecutor<ScheduledTurn<B::PrefixState>>
+            for Hooked<'_, B, F>
+        {
+            type Error = Error;
+
+            fn execute(
+                &mut self,
+                plan: &StepPlan,
+                running: &mut [TurnState<ScheduledTurn<B::PrefixState>>],
+            ) -> std::result::Result<StepResult, Self::Error> {
+                (self.before_execute)();
+                self.executor.execute(plan, running)
+            }
+        }
+        self.begin_scheduled_step();
+        let mut hooked = Hooked {
+            executor: HybridStepExecutor::new(&mut self.inner),
+            before_execute,
+        };
+        let Ok(SchedulerAction::Stepped {
+            completed,
+            preempted,
+            blocked_alone,
+            ..
+        }) = self.scheduler.drive_once(&mut hooked)
+        else {
+            return false;
+        };
+        self.settle_step(completed, preempted, blocked_alone);
+        true
+    }
+
     fn reclaim_one_idle_scheduled_with<F>(
         &mut self,
         seq_id: SeqId,
@@ -3617,6 +3692,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             streamed_text_len: 0,
             last_is_reasoning: admitted.thinking.enabled,
             failure: None,
+            vacated_stop: false,
             allocation_failed: false,
             preemption_replay: None,
             requested_tokens,
@@ -3706,8 +3782,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     fn reap_cancelled_waiters(&mut self) {
         for mut turn in self.scheduler.take_cancelled_waiters() {
             self.pending_restores.remove(&turn.seq_id);
-            turn.payload.failure =
-                Some(Error::from_reason(engine::session::CHAT_SESSION_CANCELLED));
+            if !stop_vacates(&mut turn) {
+                turn.payload.failure =
+                    Some(Error::from_reason(engine::session::CHAT_SESSION_CANCELLED));
+            }
             self.finish_completed(turn);
         }
     }
@@ -3897,7 +3975,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .as_ref()
             .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
         {
-            self.fail_preempted(turn, engine::session::CHAT_SESSION_CANCELLED.to_string());
+            if stop_vacates(&mut turn) {
+                self.finish_completed(turn);
+            } else {
+                self.fail_preempted(turn, engine::session::CHAT_SESSION_CANCELLED.to_string());
+            }
             return;
         }
         let cache_snapshot = match self.inner.scheduler_cache_snapshot() {
@@ -4091,29 +4173,43 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             );
             return;
         };
-        if let Some(owner_state) = self.owner_states.get(&turn.payload.owner_id) {
-            self.inner.install_owner_state(turn.seq_id, owner_state);
-        }
-        if let Err(error) = self.inner.activate_paged_seq(turn.seq_id) {
-            self.inner.release_scheduled_recurrent_for(turn.seq_id);
-            self.inner.release_scheduled_speculation(turn.seq_id);
-            self.owner_states.remove(&turn.payload.owner_id);
-            self.owner_sequences.remove(&turn.payload.owner_id);
-            turn.payload.response.send_error(error, cancelled.as_ref());
-            return;
-        }
-        if let Some(error) = turn.payload.failure.take() {
-            self.inner.abort_paged_turn();
-            self.inner.release_scheduled_recurrent_for(turn.seq_id);
-            self.inner.release_scheduled_speculation(turn.seq_id);
-            self.inner.set_turn_cancel_flag(None);
-            self.owner_states.remove(&turn.payload.owner_id);
-            self.owner_sequences.remove(&turn.payload.owner_id);
-            turn.payload.response.send_error(error, cancelled.as_ref());
-            return;
+        let vacated = turn.payload.vacated_stop;
+        if vacated {
+            // Splash `vacateLane` → `finish(Stop)`: the stop completes on what
+            // the turn generated and takes no lane back. Activating here
+            // would claim a recurrent unit that peers may hold and fail the
+            // turn; `abort_paged_turn` would tear down the active peer.
+            let _ = self.inner.release_scheduled_cache(turn.seq_id);
+        } else {
+            if let Some(owner_state) = self.owner_states.get(&turn.payload.owner_id) {
+                self.inner.install_owner_state(turn.seq_id, owner_state);
+            }
+            if let Err(error) = self.inner.activate_paged_seq(turn.seq_id) {
+                self.inner.release_scheduled_recurrent_for(turn.seq_id);
+                self.inner.release_scheduled_speculation(turn.seq_id);
+                self.owner_states.remove(&turn.payload.owner_id);
+                self.owner_sequences.remove(&turn.payload.owner_id);
+                turn.payload.response.send_error(error, cancelled.as_ref());
+                return;
+            }
+            if let Some(error) = turn.payload.failure.take() {
+                self.inner.abort_paged_turn();
+                self.inner.release_scheduled_recurrent_for(turn.seq_id);
+                self.inner.release_scheduled_speculation(turn.seq_id);
+                self.inner.set_turn_cancel_flag(None);
+                self.owner_states.remove(&turn.payload.owner_id);
+                self.owner_sequences.remove(&turn.payload.owner_id);
+                turn.payload.response.send_error(error, cancelled.as_ref());
+                return;
+            }
         }
         let sink = turn.payload.response.sink();
-        let outcome = engine::paged_turn::finish_paged_turn(
+        let finish = if vacated {
+            engine::paged_turn::emit_paged_turn_result::<B>
+        } else {
+            engine::paged_turn::finish_paged_turn::<B>
+        };
+        let outcome = finish(
             &mut self.inner,
             engine::paged_turn::FinishPagedTurnArgs {
                 tokenizer: &turn.payload.tokenizer,
@@ -4140,7 +4236,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             },
         );
         self.inner.release_scheduled_speculation(turn.seq_id);
-        let parked = if outcome.is_ok() && turn.payload.reuse_cache {
+        let parked = if outcome.is_ok() && turn.payload.reuse_cache && !vacated {
             self.owner_states.insert(
                 turn.payload.owner_id.clone(),
                 self.inner.capture_owner_state(turn.seq_id),
@@ -4152,7 +4248,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             Ok(())
         };
         self.inner.set_turn_cancel_flag(None);
-        if outcome.is_err() || parked.is_err() {
+        if outcome.is_err() || parked.is_err() || vacated {
             self.owner_states.remove(&turn.payload.owner_id);
             self.owner_sequences.remove(&turn.payload.owner_id);
         }
@@ -9205,6 +9301,219 @@ pub(crate) mod tests {
         assert_eq!(
             state.owner_states.get("continued-owner").map(Vec::as_slice),
             Some(&[7, 8][..])
+        );
+    }
+
+    /// Word-level `t0`..`t15` plus `<|im_end|>` (16, outside the 16-token
+    /// head) and a fixed 8-token chat template.
+    fn vacated_stop_tokenizer() -> Arc<Qwen3Tokenizer> {
+        let vocab = (0..16)
+            .map(|i| format!("\"t{i}\": {i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let json = format!(
+            r#"{{
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": {{ "type": "Whitespace" }},
+                "post_processor": null,
+                "decoder": null,
+                "model": {{
+                    "type": "WordLevel",
+                    "vocab": {{ {vocab}, "<|im_end|>": 16 }},
+                    "unk_token": "t0"
+                }}
+            }}"#
+        );
+        let tokenizer = tokenizers::Tokenizer::from_bytes(json.as_bytes())
+            .unwrap_or_else(|error| panic!("fixture tokenizer: {error}"));
+        Arc::new(
+            Qwen3Tokenizer::from_tokenizer(tokenizer, Some("t1 t2 t3 t4 t5 t6 t7 t8".to_string()))
+                .expect("tokenizer"),
+        )
+    }
+
+    fn vacated_stop_config(owner: &str) -> ChatConfig {
+        ChatConfig {
+            max_new_tokens: Some(40),
+            temperature: Some(0.0),
+            enable_mtp: Some(false),
+            max_consecutive_tokens: Some(0),
+            max_ngram_repeats: Some(0),
+            reasoning_effort: Some("none".to_string()),
+            cache_owner_id: Some(owner.to_string()),
+            ..ChatConfig::default()
+        }
+    }
+
+    fn vacated_stop_message() -> Vec<crate::tokenizer::ChatMessage> {
+        vec![
+            serde_json::from_value(serde_json::json!({"role": "user", "content": "t1"}))
+                .expect("message"),
+        ]
+    }
+
+    fn sync_peer(owner: &str) -> (ChatCmd, tokio::sync::oneshot::Receiver<Result<ChatResult>>) {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let command = ChatCmd::SessionStart {
+            messages: vacated_stop_message(),
+            config: ChatConfig {
+                max_new_tokens: Some(2),
+                ..vacated_stop_config(owner)
+            },
+            reply,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        (command, result)
+    }
+
+    /// Splash `Engine::stop` on a suspended request: `settle` → `finish(Stop)`
+    /// takes no lane back. Turn A generates beside owner B, which finishes and
+    /// parks its recurrent row; A is preempted (its row dropped, its full
+    /// blocks registered) and owner C holds the second recurrent unit. A stop
+    /// on A ends it "stop" on the tokens it had, the full blocks through the
+    /// cut stay in the cache, and B and C keep their rows.
+    fn a_vacated_stop_completes_beside_two_resident_peers<B: HybridSchedulerBackend>(
+        mut state: HybridSchedulerState<B>,
+    ) {
+        state.enabled = true;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (plumbing, mut rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let mut chunks = Vec::new();
+        let command = ChatCmd::StreamSessionStart {
+            messages: vacated_stop_message(),
+            config: vacated_stop_config("a"),
+            stream_tx: plumbing.stream_tx.clone(),
+            cancelled: plumbing.cancelled.clone(),
+        };
+        assert!(
+            sender
+                .send(ModelCommand::<B::FamilyCommand>::from_chat(command))
+                .is_ok()
+        );
+        let (command, mut b_result) = sync_peer("b");
+        assert!(sender.send(ModelCommand::from_chat(command)).is_ok());
+        let mut b_done = None;
+        for _ in 0..64 {
+            assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+            while let Ok(chunk) = rx.try_recv() {
+                chunks.push(chunk);
+            }
+            if b_done.is_none() {
+                b_done = b_result.try_recv().ok();
+            }
+            let seq = state.owner_sequences["a"];
+            if b_done.is_some()
+                && state
+                    .turn_mut(seq)
+                    .is_some_and(|turn| turn.payload.generated_tokens.len() >= 20)
+            {
+                break;
+            }
+        }
+        let b = b_done
+            .expect("B did not finish")
+            .unwrap_or_else(|error| panic!("B failed: {}", error.reason));
+        assert_eq!(b.num_tokens, 2);
+        let seq = state.owner_sequences["a"];
+        let seq_b = state.owner_sequences["b"];
+        let (prompt, cut, salt) = {
+            let turn = state.turn_mut(seq).expect("A still runs");
+            (
+                turn.payload.prompt_tokens.clone(),
+                turn.payload.generated_tokens.clone(),
+                turn.payload.params.cache_salt,
+            )
+        };
+        assert!(cut.len() >= 20, "{} tokens", cut.len());
+        assert!(state.preempt_running(seq));
+        assert!(!state.inner.has_scheduled_recurrent(seq));
+
+        // Admission waits behind a preempted turn (on-demand booking), so the
+        // second resident row is pinned for owner C directly.
+        let seq_c = state.next_seq_id;
+        state.next_seq_id += 1;
+        state.owner_sequences.insert("c".to_string(), seq_c);
+        state
+            .inner
+            .activate_scheduled_recurrent(seq_c)
+            .expect("C takes the second unit");
+        state
+            .inner
+            .park_active_scheduled_recurrent()
+            .expect("C parks");
+        assert!(state.inner.has_scheduled_recurrent(seq_b), "B stays parked");
+        assert!(
+            !state.inner.can_activate_scheduled_recurrent(seq),
+            "B and C hold both recurrent units"
+        );
+
+        plumbing.handle.stop();
+        state.resume_preempted();
+        while let Ok(chunk) = rx.try_recv() {
+            chunks.push(chunk);
+        }
+        drop(plumbing);
+        let done = chunks
+            .into_iter()
+            .map(|chunk| {
+                chunk.unwrap_or_else(|error| panic!("stopped turn failed: {}", error.reason))
+            })
+            .find(|chunk| chunk.done)
+            .expect("the stopped turn sent no done chunk");
+        assert_eq!(done.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(done.num_tokens, Some(cut.len() as u32));
+        assert!(!state.owner_sequences.contains_key("a"));
+
+        let mut history = prompt;
+        history.extend_from_slice(&cut[..cut.len() - 1]);
+        let adapter = state.inner.paged_adapter().expect("adapter");
+        let block_size = adapter.block_size();
+        let (_, hit) = adapter.allocator().lock().unwrap().find_longest_cache_hit(
+            &history,
+            block_size,
+            &[],
+            salt,
+        );
+        assert_eq!(
+            hit,
+            history.len() / block_size as usize * block_size as usize
+        );
+        assert!(hit >= block_size as usize);
+
+        assert!(state.inner.has_scheduled_recurrent(seq_b));
+        assert!(state.inner.has_scheduled_recurrent(seq_c));
+    }
+
+    /// Mutation F4: `finish_completed` activates the vacated turn before it
+    /// reads `vacated_stop` → red (the recurrent-unit cap error).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_vacated_stop_completes_beside_two_resident_qwen35_peers() {
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(0x5730_0002);
+        inner.tokenizer = Some(vacated_stop_tokenizer());
+        a_vacated_stop_completes_beside_two_resident_peers(
+            HybridSchedulerState::new(inner).expect("scheduler"),
+        );
+    }
+
+    /// Mutation F4: as the dense test → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_vacated_stop_completes_beside_two_resident_qwen35_moe_peers() {
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        let mut inner = crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(0x5730_0003);
+        inner.tokenizer = Some(vacated_stop_tokenizer());
+        a_vacated_stop_completes_beside_two_resident_peers(
+            HybridSchedulerState::new(inner).expect("scheduler"),
         );
     }
 }

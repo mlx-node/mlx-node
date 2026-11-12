@@ -1,7 +1,7 @@
 import type { ServerResponse } from 'node:http';
 
 import type { ChatMessage, ChatResult, ChatStreamProgress, ToolCallResult } from '@mlx-node/core';
-import { ChatSession, type ChatStreamProgressRef, type SessionCapableModel } from '@mlx-node/lm';
+import { ChatSession, type ChatStreamControl, type SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
@@ -2341,6 +2341,188 @@ describe('handleCreateMessage', () => {
   // -----------------------------------------------------------------------
 
   describe('stop sequences', () => {
+    /**
+     * A native stream of " w1" .. " w19", " HALT" at token 20, then words up
+     * to `cap` or until its control's `stop` lands; after a stop one more
+     * word (the step in flight) and a done with the native full text.
+     */
+    function createStoppableModel(
+      opts: { cap?: number; words?: number; finalText?: string; textAuthoritative?: boolean } = {},
+    ) {
+      const cap = opts.cap ?? 32_000;
+      let stops = 0;
+      let deltas = 0;
+      async function* stream(
+        _messages: ChatMessage[],
+        _config: unknown,
+        _signal?: AbortSignal,
+        control?: ChatStreamControl,
+      ): AsyncGenerator<Record<string, unknown>> {
+        if (control != null) {
+          control.stop = () => {
+            stops += 1;
+            return true;
+          };
+        }
+        let text = '';
+        let finishReason = 'length';
+        for (let i = 1; i <= (opts.words ?? cap); i += 1) {
+          const word = i === 20 ? ' HALT' : ` w${i}`;
+          text += word;
+          deltas += 1;
+          yield { text: word, done: false, isReasoning: false };
+          if (stops > 0) {
+            text += ' over';
+            deltas += 1;
+            yield { text: ' over', done: false, isReasoning: false };
+            finishReason = 'stop';
+            break;
+          }
+        }
+        if (opts.words !== undefined) finishReason = 'stop';
+        yield {
+          done: true,
+          text: opts.finalText ?? text,
+          finishReason,
+          toolCalls: [],
+          thinking: null,
+          thinkingEnabled: false,
+          numTokens: deltas,
+          promptTokens: 4,
+          reasoningTokens: 0,
+          rawText: opts.finalText ?? text,
+          ...(opts.textAuthoritative === undefined ? {} : { textAuthoritative: opts.textAuthoritative }),
+        };
+      }
+      const chatSessionStart = vi.fn().mockRejectedValue(new Error('requests with stops stream'));
+      const chatStreamSessionStart = vi.fn(stream);
+      const model = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: chatSessionContinue not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: chatSessionContinueTool not expected')),
+        chatStreamSessionStart,
+        chatStreamSessionContinue: vi.fn(stream),
+        chatStreamSessionContinueTool: vi.fn(stream),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SessionCapableModel;
+      return { model, chatSessionStart, chatStreamSessionStart, stops: () => stops, deltas: () => deltas };
+    }
+
+    const beforeHalt = Array.from({ length: 19 }, (_, i) => ` w${i + 1}`).join('');
+
+    // Splash `stop_matched` → `RuntimeCall.stop`.
+    // Mutation: the streaming handler never calls stop; decode runs to the cap.
+    it('streaming: a stop match ends decode within one step', async () => {
+      const registry = new ModelRegistry();
+      const fake = createStoppableModel();
+      registry.register('test-model', fake.model);
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'count' }],
+          max_tokens: 32_000,
+          stream: true,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      expect(fake.stops()).toBe(1);
+      expect(fake.deltas()).toBeLessThanOrEqual(21);
+      const events = parseSSE(getBody());
+      const text = events
+        .filter((e) => e.event === 'content_block_delta' && (e.data['delta'] as any).type === 'text_delta')
+        .map((d) => (d.data['delta'] as any).text as string)
+        .join('');
+      expect(text).toBe(beforeHalt + ' ');
+      const delta = events.find((e) => e.event === 'message_delta');
+      expect((delta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
+      expect((delta!.data['delta'] as any).stop_sequence).toBe('HALT');
+      expect(events.some((e) => e.event === 'message_stop')).toBe(true);
+      expect(events.some((e) => e.event === 'error')).toBe(false);
+    });
+
+    // Mutation: the collector never calls stop; decode runs to the cap.
+    it('non-streaming: a stop match ends decode within one step', async () => {
+      const registry = new ModelRegistry();
+      const fake = createStoppableModel();
+      registry.register('test-model', fake.model);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'count' }],
+          max_tokens: 32_000,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      expect(fake.chatSessionStart).not.toHaveBeenCalled();
+      expect(fake.chatStreamSessionStart).toHaveBeenCalledTimes(1);
+      expect(fake.stops()).toBe(1);
+      expect(fake.deltas()).toBeLessThanOrEqual(21);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.stop_reason).toBe('stop_sequence');
+      expect(parsed.stop_sequence).toBe('HALT');
+      expect(parsed.content[0].text).toBe(beforeHalt + ' ');
+    });
+
+    // Gemma4 / Muse-Glimmer send visible text only as deltas.
+    // Mutation: the collector takes `done.text`; the reply is empty.
+    it('non-streaming with stops keeps delta-only text', async () => {
+      const registry = new ModelRegistry();
+      const fake = createStoppableModel({ words: 5, finalText: '', textAuthoritative: false });
+      registry.register('test-model', fake.model);
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'count' }],
+          max_tokens: 100,
+          stop_sequences: ['NEVER'],
+        },
+        registry,
+      );
+
+      const parsed = JSON.parse(getBody());
+      expect(parsed.stop_reason).toBe('end_turn');
+      expect(parsed.content[0].text).toBe(' w1 w2 w3 w4 w5');
+    });
+
+    // Splash: one `CallbackStreamer` decides text and sequence.
+    // Mutation: the response rescans the done text; no match, end_turn.
+    it('non-streaming takes the stop from the decode deltas', async () => {
+      const registry = new ModelRegistry();
+      const fake = createStoppableModel({ finalText: 'cleaned' });
+      registry.register('test-model', fake.model);
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'count' }],
+          max_tokens: 32_000,
+          stop_sequences: ['HALT'],
+        },
+        registry,
+      );
+
+      const parsed = JSON.parse(getBody());
+      expect(parsed.stop_reason).toBe('stop_sequence');
+      expect(parsed.stop_sequence).toBe('HALT');
+      expect(parsed.content[0].text).toBe(beforeHalt + ' ');
+    });
+
     it('non-streaming: truncates text at the stop sequence and reports stop_sequence', async () => {
       const registry = new ModelRegistry();
       const mockModel = createMockModel(
@@ -6771,11 +6953,11 @@ function createSteppedStreamModel(): {
   model: SessionCapableModel;
   snapshot: { current: ChatStreamProgress | null };
   push: (step: ProgressStep) => void;
-  refs: Array<ChatStreamProgressRef | undefined>;
+  refs: Array<ChatStreamControl | undefined>;
 } {
   const snapshot: { current: ChatStreamProgress | null } = { current: { phase: 'queued' } };
   const pending: ProgressStep[] = [];
-  const refs: Array<ChatStreamProgressRef | undefined> = [];
+  const refs: Array<ChatStreamControl | undefined> = [];
   let wake: (() => void) | null = null;
   const push = (step: ProgressStep): void => {
     pending.push(step);
@@ -6783,7 +6965,7 @@ function createSteppedStreamModel(): {
     wake = null;
     w?.();
   };
-  async function* stream(ref: ChatStreamProgressRef | undefined): AsyncGenerator<Record<string, unknown>> {
+  async function* stream(ref: ChatStreamControl | undefined): AsyncGenerator<Record<string, unknown>> {
     refs.push(ref);
     if (ref !== undefined) ref.read = () => snapshot.current;
     try {
@@ -6802,8 +6984,8 @@ function createSteppedStreamModel(): {
       if (ref !== undefined) ref.read = null;
     }
   }
-  const start = vi.fn(
-    (_messages: ChatMessage[], _config: unknown, _signal?: AbortSignal, ref?: ChatStreamProgressRef) => stream(ref),
+  const start = vi.fn((_messages: ChatMessage[], _config: unknown, _signal?: AbortSignal, ref?: ChatStreamControl) =>
+    stream(ref),
   );
   const model = {
     chatSessionStart: vi.fn().mockRejectedValue(new Error('Should use chatStreamSessionStart')),

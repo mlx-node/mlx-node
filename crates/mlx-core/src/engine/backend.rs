@@ -223,7 +223,17 @@ impl ChunkSink for crate::model_thread::StreamTx<ChatStreamChunk> {
         crate::model_thread::StreamTx::progress(self)
     }
 
-    fn send(&self, chunk: Result<ChatStreamChunk>) {
+    fn send(&self, mut chunk: Result<ChatStreamChunk>) {
+        // Splash `Engine::stop`: a stopped request that generated tokens is a
+        // completion; one that generated none stays cancelled.
+        if let Ok(done) = &mut chunk
+            && done.done
+            && done.finish_reason.as_deref() == Some("cancelled")
+            && done.num_tokens.is_some_and(|tokens| tokens > 0)
+            && self.stop_requested()
+        {
+            done.finish_reason = Some("stop".to_string());
+        }
         if let Some(progress) = crate::model_thread::StreamTx::progress(self) {
             match &chunk {
                 Err(_) | Ok(ChatStreamChunk { done: true, .. }) => progress.finish(),

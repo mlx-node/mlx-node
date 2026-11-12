@@ -495,20 +495,22 @@ impl HybridSchedulerBackend for Inner {
         rng: &mut dyn rand::Rng,
         confidence: bool,
     ) -> Result<crate::engine::backend::DsparkProposal> {
-        self.activate_paged_seq(seq)?;
-        self.propose_mtp(seq, anchor, cap, params, rng, confidence)
+        self.in_decode_pass(|inner| {
+            inner.activate_paged_seq(seq)?;
+            inner.propose_mtp(seq, anchor, cap, params, rng, confidence)
+        })
     }
     fn run_scheduled_verify(
         &mut self,
         rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyRow],
     ) -> Result<MxArray> {
-        self.verify_mtp(rows)
+        self.in_decode_pass(|inner| inner.verify_mtp(rows))
     }
     fn commit_scheduled_verify(
         &mut self,
         rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyCommit],
     ) -> Result<Vec<Result<()>>> {
-        self.commit_mtp(rows)
+        self.in_decode_pass(|inner| inner.commit_mtp(rows))
     }
     fn release_scheduled_speculation(&mut self, seq: SeqId) {
         self.mtp.finish(
@@ -633,30 +635,7 @@ impl HybridSchedulerBackend for Inner {
         }
     }
     fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
-        let mut seen = std::collections::HashSet::new();
-        if rows.is_empty() || rows.iter().any(|(seq, _)| !seen.insert(*seq)) {
-            return Err(Error::from_reason(
-                "Qwen4 decode requires a nonempty batch of distinct sequences",
-            ));
-        }
-        if rows.len() > self.scheduler_capacity() {
-            return Err(Error::from_reason(
-                "Qwen4 scheduled batch exceeds owner capacity",
-            ));
-        }
-        if rows.len() > 1 {
-            return self.decode_shared_layers(rows);
-        }
-        let mut logits = Vec::with_capacity(rows.len());
-        for &(seq, token) in rows {
-            self.activate_paged_seq(seq)?;
-            // The shared scheduler slices [batch, 1, vocabulary] before
-            // sampling each row; retain the singleton token dimension.
-            logits.push(self.decoder.step(token)?);
-            let hidden = self.decoder.last_chunk_hidden.clone();
-            self.observe_mtp(seq, &[token], &hidden)?;
-        }
-        MxArray::concatenate_many(logits.iter().collect(), Some(0))
+        self.in_decode_pass(|inner| inner.decode_step_rows(rows))
     }
     fn replace_cached_token_history(&mut self, history: Vec<u32>) {
         self.saved_history = history;
@@ -808,6 +787,40 @@ pub(super) fn gather_window(
 }
 
 impl Inner {
+    /// Splash `Engine::stop` ends a lane at its pass boundary; see
+    /// `Decoder::decode_pass`.
+    fn in_decode_pass<R>(&mut self, pass: impl FnOnce(&mut Self) -> R) -> R {
+        let prior = std::mem::replace(&mut self.decoder.decode_pass, true);
+        let result = pass(self);
+        self.decoder.decode_pass = prior;
+        result
+    }
+    fn decode_step_rows(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        let mut seen = std::collections::HashSet::new();
+        if rows.is_empty() || rows.iter().any(|(seq, _)| !seen.insert(*seq)) {
+            return Err(Error::from_reason(
+                "Qwen4 decode requires a nonempty batch of distinct sequences",
+            ));
+        }
+        if rows.len() > self.scheduler_capacity() {
+            return Err(Error::from_reason(
+                "Qwen4 scheduled batch exceeds owner capacity",
+            ));
+        }
+        if rows.len() > 1 {
+            return self.decode_shared_layers(rows);
+        }
+        let mut logits = Vec::with_capacity(rows.len());
+        for &(seq, token) in rows {
+            self.activate_paged_seq(seq)?;
+            // The shared scheduler slices [batch, 1, vocabulary] before
+            // sampling each row; retain the singleton token dimension.
+            logits.push(self.decoder.step(token)?);
+            let hidden = self.decoder.last_chunk_hidden.clone();
+            self.observe_mtp(seq, &[token], &hidden)?;
+        }
+        MxArray::concatenate_many(logits.iter().collect(), Some(0))
+    }
     fn decode_shared_layers(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
         let started = std::time::Instant::now();
         let result = (|| {

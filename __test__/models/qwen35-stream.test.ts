@@ -1,5 +1,5 @@
 import type { ChatMessage, ChatStreamChunk, ChatStreamHandle, ChatStreamProgress } from '@mlx-node/core';
-import type { ChatStreamEvent, ChatStreamProgressRef } from '@mlx-node/lm';
+import type { ChatStreamEvent, ChatStreamControl } from '@mlx-node/lm';
 import { _runChatStream } from '@mlx-node/lm';
 import { describe, it, expect, vi } from 'vite-plus/test';
 
@@ -362,7 +362,7 @@ describe('_runChatStream bridge', () => {
     const progress = vi.fn(() => snapshot);
     let callback!: (err: Error | null, chunk: ChatStreamChunk) => void;
     let resolveHandle!: (handle: ChatStreamHandle) => void;
-    const ref: ChatStreamProgressRef = { read: null };
+    const ref: ChatStreamControl = { read: null, stop: null };
     const gen = _runChatStream(
       (cb) => {
         callback = cb;
@@ -404,7 +404,7 @@ describe('_runChatStream bridge', () => {
   it('clears the progress ref when the consumer stops early or the stream throws', async () => {
     const handle = { cancel: vi.fn(), progress: vi.fn(() => ({ phase: 'decode' })) } as unknown as ChatStreamHandle;
 
-    const brokenRef: ChatStreamProgressRef = { read: null };
+    const brokenRef: ChatStreamControl = { read: null, stop: null };
     let brokenCallback!: (err: Error | null, chunk: ChatStreamChunk) => void;
     const broken = _runChatStream(
       (cb) => {
@@ -420,12 +420,94 @@ describe('_runChatStream bridge', () => {
     await expect(pending).rejects.toThrow('native failure');
     expect(brokenRef.read).toBeNull();
 
-    const earlyRef: ChatStreamProgressRef = { read: null };
+    const earlyRef: ChatStreamControl = { read: null, stop: null };
     const native = fakeNativeMethod(3);
     const early = _runChatStream((cb) => native([], null, cb), undefined, earlyRef);
     expect((await early.next()).value).toEqual({ text: 'token0', done: false });
     expect(earlyRef.read).not.toBeNull();
     await early.return(undefined);
     expect(earlyRef.read).toBeNull();
+  });
+
+  // Splash `RuntimeCall._request_end`: one latch for cancel and stop; a stop
+  // reads on to the native done chunk.
+  // Mutation: a stop pushes the abort marker; (a) yields no done event.
+  it('stop shares the cancel latch and reads on to the done chunk', async () => {
+    const doneChunk = {
+      text: 'a',
+      done: true,
+      finishReason: 'stop',
+      toolCalls: [],
+      thinkingEnabled: false,
+      numTokens: 1,
+      rawText: 'a',
+    } as unknown as ChatStreamChunk;
+    const fakeHandle = () => {
+      const cancel = vi.fn();
+      const stop = vi.fn();
+      return { cancel, stop, handle: { cancel, stop, progress: vi.fn() } as unknown as ChatStreamHandle };
+    };
+
+    const a = fakeHandle();
+    const control: ChatStreamControl = { read: null, stop: null };
+    let callback!: (err: Error | null, chunk: ChatStreamChunk) => void;
+    const gen = _runChatStream(
+      (cb) => {
+        callback = cb;
+        return Promise.resolve(a.handle);
+      },
+      undefined,
+      control,
+    );
+    const first = gen.next();
+    await vi.waitFor(() => expect(control.read).not.toBeNull());
+    expect(control.stop!()).toBe(true);
+    expect(control.stop!()).toBe(false);
+    callback(null, doneChunk);
+    const done = await first;
+    expect(done.done).toBe(false);
+    expect((done.value as ChatStreamEvent).done).toBe(true);
+    expect((await gen.next()).done).toBe(true);
+    expect(a.stop).toHaveBeenCalledTimes(1);
+    expect(a.cancel).not.toHaveBeenCalled();
+    expect(control.stop).toBeNull();
+
+    const b = fakeHandle();
+    const early: ChatStreamControl = { read: null, stop: null };
+    let resolveHandle!: (handle: ChatStreamHandle) => void;
+    let earlyCallback!: (err: Error | null, chunk: ChatStreamChunk) => void;
+    const pending = _runChatStream(
+      (cb) => {
+        earlyCallback = cb;
+        return new Promise<ChatStreamHandle>((resolve) => {
+          resolveHandle = resolve;
+        });
+      },
+      undefined,
+      early,
+    );
+    const next = pending.next();
+    await Promise.resolve();
+    expect(early.stop!()).toBe(true);
+    expect(b.stop).not.toHaveBeenCalled();
+    resolveHandle(b.handle);
+    await vi.waitFor(() => expect(b.stop).toHaveBeenCalledTimes(1));
+    earlyCallback(null, doneChunk);
+    expect(((await next).value as ChatStreamEvent).done).toBe(true);
+    expect((await pending.next()).done).toBe(true);
+    expect(b.stop).toHaveBeenCalledTimes(1);
+    expect(b.cancel).not.toHaveBeenCalled();
+
+    const c = fakeHandle();
+    const aborted: ChatStreamControl = { read: null, stop: null };
+    const controller = new AbortController();
+    const cancelled = _runChatStream(() => Promise.resolve(c.handle), controller.signal, aborted);
+    const last = cancelled.next();
+    await vi.waitFor(() => expect(aborted.read).not.toBeNull());
+    controller.abort();
+    expect(aborted.stop!()).toBe(false);
+    expect((await last).done).toBe(true);
+    expect(c.cancel).toHaveBeenCalledTimes(1);
+    expect(c.stop).not.toHaveBeenCalled();
   });
 });
