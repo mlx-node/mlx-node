@@ -183,6 +183,23 @@ describe('restart timing (Splash RestartPolicy.after, real numbers)', () => {
     expect(sup.snapshot().state).toBe('failed');
   });
 
+  // Splash `served_seconds` runs from Ready to the failure; a load pauses it, never erases it.
+  it('keeps the service earned before a model load that crashes', async () => {
+    const { supervisor: sup, children } = harness();
+    sup.start().catch(() => {});
+
+    const gaps = await shortFailures(sup, children, 7, async (child) => {
+      healthStatus = 'ok';
+      await becomeReady(sup, child);
+      await vi.advanceTimersByTimeAsync(70_000);
+      healthStatus = 'loading';
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+
+    expect(gaps).toEqual([0, 0, 0, 0, 0, 0, 0]);
+    expect(sup.snapshot()).toMatchObject({ state: 'starting', shortLivedFailures: 0 });
+  });
+
   it('a user start or restart starts the count anew', async () => {
     const { supervisor: sup, children } = harness();
     sup.start().catch(() => {});

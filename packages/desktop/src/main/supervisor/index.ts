@@ -210,6 +210,8 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
    * while `/health` says `loading`, so a lazy model load is never probation.
    */
   let servingSinceMs: number | null = null;
+  /** Service from stretches a load ended; a crash during a later load keeps it (Splash `served_seconds`). */
+  let servedBeforeMs = 0;
   /** The intent before a transport fault on a live child turned it into `abort`. */
   let faultIntent: ChildIntent | null = null;
   /** `opts.entry` was missing at spawn: Splash's `EngineLaunchFailed`. */
@@ -403,8 +405,10 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
         if (generation !== gen || child === null) return;
         const changed = probe?.status !== health?.status;
         health = probe;
-        if (probe?.status === 'loading') servingSinceMs = null;
-        else if (probe !== null && isServingStatus(probe.status) && servingSinceMs === null)
+        if (probe?.status === 'loading') {
+          if (servingSinceMs !== null) servedBeforeMs += Date.now() - servingSinceMs;
+          servingSinceMs = null;
+        } else if (probe !== null && isServingStatus(probe.status) && servingSinceMs === null)
           servingSinceMs = Date.now();
         // A `/health` that stops answering while the process is alive is a
         // hang, not a crash, and restarting on it would kill a legitimately
@@ -610,7 +614,7 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
     emit({ type: 'crashed', exit: lastExit });
     const permanent = isPermanentExit(exit, entryMissing);
     const failure = {
-      servedMs: servingSinceMs === null ? 0 : Date.now() - servingSinceMs,
+      servedMs: servedBeforeMs + (servingSinceMs === null ? 0 : Date.now() - servingSinceMs),
       permanent,
     };
     const after = restartAfter(policy, restartState, failure);
@@ -673,6 +677,7 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
     abortReason = null;
     becameReady = false;
     servingSinceMs = null;
+    servedBeforeMs = 0;
     faultIntent = null;
     entryMissing = false;
     journalDir = null;
