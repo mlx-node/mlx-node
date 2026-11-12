@@ -26,6 +26,7 @@ import {
   SIDECAR_HOST_OPTIONS,
   SIDECAR_HOST_CLOSE_TIMEOUT_MS,
   sidecarHostOptions,
+  turnJournalFromEnv,
   type ParentChannel,
   type SidecarHost,
 } from '../src/inference/sidecar.js';
@@ -475,3 +476,31 @@ describe('resolveParentChannel', () => {
 });
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe('the turn journal env', () => {
+  const a = 'a'.repeat(64);
+  const b = '0123456789abcdef'.repeat(4);
+
+  it('the sidecar reads its journal dir and quarantined list from its env', () => {
+    expect(turnJournalFromEnv({})).toBeNull();
+    expect(turnJournalFromEnv({ MLX_TURN_JOURNAL: '', MLX_QUARANTINED: a })).toBeNull();
+    expect(turnJournalFromEnv({ MLX_TURN_JOURNAL: '/j', MLX_QUARANTINED: `${a},${b}` })).toEqual({
+      dir: '/j',
+      quarantined: new Set([a, b]),
+    });
+    expect(turnJournalFromEnv({ MLX_TURN_JOURNAL: '/j', MLX_QUARANTINED: '' })?.quarantined).toEqual(new Set());
+    expect(turnJournalFromEnv({ MLX_TURN_JOURNAL: '/j' })?.quarantined).toEqual(new Set());
+    const malformed = [a.slice(1), `${a}0`, a.toUpperCase(), `g${a.slice(1)}`, ''].join(',');
+    expect(turnJournalFromEnv({ MLX_TURN_JOURNAL: '/j', MLX_QUARANTINED: `${malformed},${b}` })?.quarantined).toEqual(
+      new Set([b]),
+    );
+  });
+
+  it('hands the host its journal only when MAIN forced one', () => {
+    expect('turnJournal' in sidecarHostOptions({})).toBe(false);
+    expect(sidecarHostOptions({ MLX_TURN_JOURNAL: '/j', MLX_QUARANTINED: a }).turnJournal).toEqual({
+      dir: '/j',
+      quarantined: new Set([a]),
+    });
+  });
+});

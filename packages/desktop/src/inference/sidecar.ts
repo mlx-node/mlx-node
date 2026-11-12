@@ -18,6 +18,7 @@
 import { randomBytes } from 'node:crypto';
 
 import { EXIT_STARTUP_FAILED } from './exit-codes.js';
+import { parseFingerprintList, QUARANTINED_ENV, TURN_JOURNAL_ENV } from './turn-journal.js';
 
 // Re-exported so existing importers keep working; the definition and the rule
 // about who else may read it live in exit-codes.ts.
@@ -81,8 +82,36 @@ export function newSidecarAuthToken(): string {
  * enter renderer RPC, public snapshots, the `info` reply, or supervisor traces.
  * The supervisor polls unauthenticated `/health`.
  */
-export function sidecarHostOptions(): { port: number; host: string; authToken: string } {
-  return { ...SIDECAR_HOST_OPTIONS, authToken: newSidecarAuthToken() };
+export function sidecarHostOptions(env: NodeJS.ProcessEnv = process.env): SidecarHostOptions {
+  const turnJournal = turnJournalFromEnv(env);
+  return {
+    ...SIDECAR_HOST_OPTIONS,
+    authToken: newSidecarAuthToken(),
+    ...(turnJournal !== null ? { turnJournal } : {}),
+  };
+}
+
+/** `InferenceHostOptions.turnJournal`, restated for the reason {@link SidecarHost} gives. */
+export interface SidecarTurnJournal {
+  dir: string;
+  quarantined: ReadonlySet<string>;
+}
+
+export interface SidecarHostOptions {
+  port: number;
+  host: string;
+  authToken: string;
+  turnJournal?: SidecarTurnJournal;
+}
+
+/**
+ * The journal MAIN forced into this child's env at fork time. Absent when the
+ * entry is run by hand: no journal, no refusal.
+ */
+export function turnJournalFromEnv(env: NodeJS.ProcessEnv): SidecarTurnJournal | null {
+  const dir = env[TURN_JOURNAL_ENV];
+  if (dir === undefined || dir === '') return null;
+  return { dir, quarantined: parseFingerprintList(env[QUARANTINED_ENV] ?? '') };
 }
 
 /**

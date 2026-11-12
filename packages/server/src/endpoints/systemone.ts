@@ -18,6 +18,8 @@ export async function handleSystemOne(
   idleSweeper?: IdleSweeper | null,
   resolveModel?: (name: string) => Promise<void>,
   coordinator?: ModelWorkCoordinator,
+  /** Journals the turn once it holds the decision lane; returns its end. */
+  beginTurn?: () => () => void,
 ): Promise<void> {
   // Bind BEFORE admission so a registerDecision inside resolveModel
   // synchronously transfers every outstanding cold permit, matching the
@@ -68,10 +70,15 @@ export async function handleSystemOne(
     const run = () =>
       dispatch.run(async () => {
         if (!dispatch.current()) throw new Error('Model binding changed while waiting; retry the request');
-        const result = await dispatch.model.decideRaw(raw, { signal: abort.signal });
-        abort.signal.throwIfAborted();
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(stringifyStrictJson({ model: dispatch.canonicalName, ...result }));
+        const endTurn = beginTurn?.();
+        try {
+          const result = await dispatch.model.decideRaw(raw, { signal: abort.signal });
+          abort.signal.throwIfAborted();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(stringifyStrictJson({ model: dispatch.canonicalName, ...result }));
+        } finally {
+          endTurn?.();
+        }
       }, abort.signal);
     if (coordinator) await coordinator.withInference(run, abort.signal);
     else await run();

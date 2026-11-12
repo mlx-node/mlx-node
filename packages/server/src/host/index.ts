@@ -65,6 +65,7 @@ import type { AudioServiceOptions } from '../audio-service.js';
 import type { ServerHealth } from '../health.js';
 import { resolveRerankLimits, type RerankServiceOptions } from '../rerank-service.js';
 import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance } from '../server.js';
+import type { TurnJournalOptions } from '../turn-journal.js';
 import { discoverAudioModels, loadAudioModel, audioCapabilities, type DiscoveredAudioModel } from './audio-models.js';
 import { chatCapability, withCapabilityModels } from './capability-models.js';
 import { discoverModels, type DiscoveredModel } from './discover.js';
@@ -192,6 +193,8 @@ export interface InferenceHostOptions {
   maxContextTokens?: number;
   /** See `ServerConfig.thinkingTokenBudget`. */
   thinkingTokenBudget?: number;
+  /** See `ServerConfig.turnJournal`. */
+  turnJournal?: TurnJournalOptions;
   /**
    * Seconds without a request before the residency is unwired and the chat
    * weights are freed (`--idle-release`); the next request loads them again.
@@ -401,6 +404,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     ...(opts.disableStore !== undefined ? { disableStore: opts.disableStore } : {}),
     ...(opts.maxQueueDepthPerModel !== undefined ? { maxQueueDepthPerModel: opts.maxQueueDepthPerModel } : {}),
     ...(opts.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: opts.thinkingTokenBudget } : {}),
+    ...(opts.turnJournal !== undefined ? { turnJournal: opts.turnJournal } : {}),
   };
   const server = await createServer(serverConfig);
 

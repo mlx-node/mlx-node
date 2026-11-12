@@ -6,8 +6,12 @@
  * driven directly from a test instead of inferred from behaviour.
  */
 
+import { constants } from 'node:os';
+
 import { EXIT_STARTUP_FAILED } from '../../inference/exit-codes.js';
 import type { ChildExit, Lifecycle, SupervisorState } from './types.js';
+
+const osSignals: Readonly<Record<string, number | undefined>> = constants.signals;
 
 /**
  * Why the supervisor believes the current child should be running, or not.
@@ -78,63 +82,135 @@ function describeExit(exit: ChildExit): string {
   return exit.code === null ? 'no status' : `code ${exit.code}`;
 }
 
+/**
+ * Splash `RestartPolicy` (server/supervision.py), with its two inputs:
+ * `BACKOFF_BASE_SECONDS` and `kProbation` (runtime/Supervision.hpp), which is
+ * both `Thresholds.short_lived` and `Thresholds.backoff_cap`.
+ */
 export interface RestartPolicy {
-  /**
-   * Consecutive crashes tolerated. The Nth crash with `N >= this` gives up, so
-   * a value of 5 yields 4 restarts and then a resting `failed` state.
-   */
-  maxConsecutiveCrashes: number;
-  baseDelayMs: number;
-  maxDelayMs: number;
-  /**
-   * A child that stayed READY at least this long has proved it can run, and
-   * earns a fresh crash budget. Measured from `ready` to `exit`, not from
-   * spawn: a 9B model off a cold USB mmap can take a minute to load, and
-   * counting that as uptime would hand a crash-looping sidecar an infinite
-   * budget as long as each attempt loaded slowly enough.
-   */
-  healthyForMs: number;
+  backoffBaseMs: number;
+  probationMs: number;
 }
 
 export const DEFAULT_RESTART_POLICY: RestartPolicy = Object.freeze({
-  maxConsecutiveCrashes: 5,
-  baseDelayMs: 1_000,
-  maxDelayMs: 30_000,
-  healthyForMs: 60_000,
+  backoffBaseMs: 5_000,
+  probationMs: 60_000,
 });
 
-export type RestartDecision =
-  | { action: 'restart'; delayMs: number; attempt: number }
-  | { action: 'give-up'; attempt: number };
+/** Splash `BACKOFF_DOUBLINGS`. */
+export function backoffDoublings(policy: RestartPolicy): number {
+  if (!(policy.backoffBaseMs > 0) || !(policy.probationMs >= policy.backoffBaseMs)) {
+    throw new RangeError(
+      `restart policy needs 0 < backoffBaseMs <= probationMs (got ${policy.backoffBaseMs}, ${policy.probationMs})`,
+    );
+  }
+  return Math.ceil(Math.log2(policy.probationMs / policy.backoffBaseMs));
+}
 
-/**
- * What to do after the `consecutiveCrashes`-th consecutive crash.
- *
- * Exponential from `baseDelayMs`, clamped at `maxDelayMs`, with no jitter: a
- * single local child has nothing to stampede against, and jitter would make the
- * give-up boundary untestable for the sake of a property nothing here needs.
- *
- * One exit is NEVER restarted, whatever the budget: `EXIT_STARTUP_FAILED` is
- * the sidecar reporting that `createHost` rejected — a deterministic
- * environment problem, classically `NoModelsDiscoveredError` on a machine
- * with no downloaded models. The next fork inherits the same environment, so
- * five attempts differ from one only in how long the user stares at a crash
- * loop. `start()` resets the crash count, so a manual Start after the user
- * fixes the cause (downloaded a model) always gets a fresh attempt.
- */
-export function planRestart(policy: RestartPolicy, consecutiveCrashes: number, exit: ChildExit): RestartDecision {
-  if (exit.code === EXIT_STARTUP_FAILED) return { action: 'give-up', attempt: consecutiveCrashes };
-  if (consecutiveCrashes >= policy.maxConsecutiveCrashes) return { action: 'give-up', attempt: consecutiveCrashes };
-  const raw = policy.baseDelayMs * 2 ** (consecutiveCrashes - 1);
-  return { action: 'restart', delayMs: Math.min(raw, policy.maxDelayMs), attempt: consecutiveCrashes };
+/** Splash `CRASH_LOOP_FAILURES`: the short-lived failure in a row that stops the relaunches. */
+export function crashLoopFailures(policy: RestartPolicy): number {
+  return 2 + backoffDoublings(policy);
+}
+
+/** Splash `RestartPolicy.streak` and `.short_lived_failures`. */
+export interface RestartState {
+  streak: number;
+  shortLivedFailures: number;
+}
+
+export const FRESH_RESTART_STATE: RestartState = Object.freeze({ streak: 0, shortLivedFailures: 0 });
+
+/** Splash `EngineFailure.served_seconds` and `permanent()`. */
+export interface EngineFailure {
+  /** Time served with nothing loading, 0 for a child that never became ready. */
+  servedMs: number;
+  permanent: boolean;
+}
+
+export type RestartDecision = { action: 'restart'; delayMs: number } | { action: 'give-up'; permanent: boolean };
+
+/** Splash `RestartPolicy.after`. */
+export function restartAfter(
+  policy: RestartPolicy,
+  state: RestartState,
+  failure: EngineFailure,
+): { decision: RestartDecision; state: RestartState } {
+  const doublings = backoffDoublings(policy);
+  if (failure.permanent) return { decision: { action: 'give-up', permanent: true }, state };
+  let { streak, shortLivedFailures } = state;
+  if (failure.servedMs >= policy.probationMs) {
+    streak = 0;
+    shortLivedFailures = 0;
+  } else {
+    shortLivedFailures += 1;
+    if (shortLivedFailures === 2 + doublings) {
+      return { decision: { action: 'give-up', permanent: false }, state: { streak, shortLivedFailures } };
+    }
+  }
+  streak += 1;
+  const delayMs =
+    streak === 1 ? 0 : Math.min(policy.probationMs, policy.backoffBaseMs * 2 ** Math.min(streak - 2, doublings));
+  return { decision: { action: 'restart', delayMs }, state: { streak, shortLivedFailures } };
+}
+
+/** The cause in Splash's `_stop_message`, for a failure `restartAfter` gave up on. */
+export function stopCause(policy: RestartPolicy, permanent: boolean, reason: string): string {
+  if (permanent) return reason;
+  return `it failed ${crashLoopFailures(policy)} times in a row, each within ${policy.probationMs / 1000} s of starting (${reason})`;
 }
 
 /**
- * The crash count to carry forward. A child that was ready long enough resets
- * the run to 1 rather than to 0 — the crash that just happened still counts.
+ * Whether a child exit is permanent (Splash `permanent()`): `createHost`
+ * refused its environment (`EXIT_STARTUP_FAILED`), or the entry module is
+ * missing, the one launch failure Splash's `EngineLaunchFailed` names.
  */
-export function nextCrashCount(policy: RestartPolicy, previous: number, readyForMs: number): number {
-  return readyForMs >= policy.healthyForMs ? 1 : previous + 1;
+export function isPermanentExit(exit: ChildExit, entryMissing: boolean): boolean {
+  return entryMissing || exit.code === EXIT_STARTUP_FAILED;
+}
+
+/** Splash `Quarantine`. Sets are replaced, never changed in place. */
+export interface QuarantineState {
+  suspects: ReadonlySet<string>;
+  refused: ReadonlySet<string>;
+}
+
+export const EMPTY_QUARANTINE: QuarantineState = Object.freeze({
+  suspects: new Set<string>(),
+  refused: new Set<string>(),
+});
+
+/** Splash `Quarantine.after`: count a failure a request may have caused. */
+export function quarantineAfter(
+  quarantine: QuarantineState,
+  started: ReadonlySet<string>,
+): { state: QuarantineState; refused: ReadonlySet<string> } {
+  const refused = new Set<string>();
+  for (const fingerprint of quarantine.suspects) {
+    if (started.has(fingerprint) && !quarantine.refused.has(fingerprint)) refused.add(fingerprint);
+  }
+  return {
+    state: {
+      suspects: new Set(started),
+      refused: new Set([...quarantine.refused, ...refused]),
+    },
+    refused,
+  };
+}
+
+const FAULT_SIGNAL_NAMES = ['SIGSEGV', 'SIGBUS', 'SIGILL', 'SIGABRT', 'SIGFPE', 'SIGTRAP'] as const;
+
+/** Splash `FAULT_SIGNALS`, as this platform's signal numbers. */
+const FAULT_SIGNAL_CODES: ReadonlySet<number> = new Set(
+  FAULT_SIGNAL_NAMES.map((name) => osSignals[name]).filter((code): code is number => typeof code === 'number'),
+);
+
+/**
+ * Splash `request_caused`: a fault-signal death of a child that became ready
+ * and that we did not stop or kill. Both transports report a signal death as
+ * its number in `code`.
+ */
+export function requestCaused(input: { intent: ChildIntent; becameReady: boolean; code: number | null }): boolean {
+  return input.intent === 'run' && input.becameReady && input.code !== null && FAULT_SIGNAL_CODES.has(input.code);
 }
 
 /**

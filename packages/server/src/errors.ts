@@ -43,6 +43,11 @@ export function sendCapacityExhausted(res: ServerResponse, message: string): voi
   sendError(res, 400, 'invalid_request_error', message, null, 'capacity_exhausted');
 }
 
+/** 400 `request_quarantined` (Splash `_admit`): a retry fails the same way. */
+export function sendRequestQuarantined(res: ServerResponse, message: string): void {
+  sendError(res, 400, 'invalid_request_error', message, null, 'request_quarantined');
+}
+
 export function sendNotFound(res: ServerResponse, message: string): void {
   sendError(res, 404, 'not_found_error', message);
 }

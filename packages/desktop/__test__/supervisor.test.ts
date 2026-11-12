@@ -10,8 +10,8 @@
  * `utilityProcess` delivers them.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { constants, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
@@ -65,7 +65,8 @@ function makeSupervisor(opts: HarnessOptions = {}): { supervisor: Supervisor; ev
       ...(health !== undefined ? { MLX_TEST_HEALTH: health } : {}),
       ...rest.env,
     },
-    restart: { maxConsecutiveCrashes: 3, baseDelayMs: 20, maxDelayMs: 40, healthyForMs: 10_000, ...rest.restart },
+    // Splash CRASH_LOOP_FAILURES = 2 + ceil(log2(40 / 20)) = 3: at once, 20 ms, stop.
+    restart: { backoffBaseMs: 20, probationMs: 40, ...rest.restart },
     timings: {
       readyTimeoutMs: 5_000,
       healthPollMs: 20,
@@ -175,11 +176,11 @@ describe('start-up', () => {
   // which aborts Rust — leaves nothing but a stderr line. Proven here with the
   // cheapest reproducible stderr-only death there is.
   it('keeps the stderr that explains a crash', async () => {
-    const { supervisor } = makeSupervisor({ entry: join(SIDECAR, '..', 'does-not-exist.mjs') });
+    const { supervisor } = makeSupervisor({ mode: 'crash-now' });
     void supervisor.start().catch(() => {});
 
     const snapshot = await waitFor(supervisor, (s) => s.state === 'failed', 'give-up');
-    expect(snapshot.lastExit?.stderrTail.join('\n')).toContain('MODULE_NOT_FOUND');
+    expect(snapshot.lastExit?.stderrTail.join('\n')).toContain('fixture: dying on purpose');
   });
 });
 
@@ -213,7 +214,7 @@ describe('intent', () => {
     expect(events.some((event) => event.type === 'crashed')).toBe(true);
 
     const restarted = await waitFor(supervisor, (s) => s.state === 'running' && s.generation === 2, 'the respawn');
-    expect(restarted.consecutiveCrashes).toBe(1);
+    expect(restarted.streak).toBe(1);
   });
 
   it('treats a REQUESTED stop as clean and does not restart', async () => {
@@ -335,20 +336,27 @@ describe('intent', () => {
     await supervisor.start();
     await supervisor.restart();
 
-    expect(supervisor.snapshot()).toMatchObject({ state: 'running', generation: 2, consecutiveCrashes: 0 });
+    expect(supervisor.snapshot()).toMatchObject({ state: 'running', generation: 2, streak: 0, shortLivedFailures: 0 });
     expect(events.some((event) => event.type === 'crashed')).toBe(false);
   });
 });
 
 describe('restart budget', () => {
   // A sidecar that dies instantly in a loop must not spin forever.
-  it('gives up after the configured number of consecutive crashes', async () => {
+  it('gives up at the short failure whose backoff would reach the cap', async () => {
     const { supervisor, events } = makeSupervisor({ mode: 'crash-now' });
     await expect(supervisor.start()).rejects.toThrow(/gave up/);
 
     const snapshot = supervisor.snapshot();
     expect(snapshot.state).toBe('failed');
-    expect(snapshot.consecutiveCrashes).toBe(3);
+    expect(snapshot).toMatchObject({ streak: 2, shortLivedFailures: 3 });
+    expect(events.filter((event) => event.type === 'gave-up')).toEqual([
+      {
+        type: 'gave-up',
+        message:
+          'stopped restarting inference: it failed 3 times in a row, each within 0.04 s of starting (exited 7 before it ever became ready). Start inference again after fixing the cause.',
+      },
+    ]);
     expect(snapshot.generation).toBe(3);
     expect(events.filter((event) => event.type === 'crashed')).toHaveLength(3);
     expect(events.some((event) => event.type === 'gave-up')).toBe(true);
@@ -362,15 +370,15 @@ describe('restart budget', () => {
   // Quitting the app during the backoff must not leave a fork armed to fire
   // after everything else has been torn down.
   it('cancels a pending restart when asked to stop mid-backoff', async () => {
-    const { supervisor } = makeSupervisor({ mode: 'crash-now', restart: { baseDelayMs: 500 } });
+    const { supervisor } = makeSupervisor({ mode: 'crash-now', restart: { backoffBaseMs: 500, probationMs: 1_000 } });
     void supervisor.start().catch(() => {});
 
-    await waitFor(supervisor, (s) => s.state === 'restarting', 'the backoff');
+    await waitFor(supervisor, (s) => s.state === 'restarting' && s.generation === 2, 'the backoff');
     await supervisor.stop();
 
     expect(supervisor.snapshot().state).toBe('stopped');
     await sleep(700);
-    expect(supervisor.snapshot()).toMatchObject({ state: 'stopped', generation: 1 });
+    expect(supervisor.snapshot()).toMatchObject({ state: 'stopped', generation: 2 });
   });
 
   /**
@@ -383,13 +391,13 @@ describe('restart budget', () => {
    * backoff was the one place that broke it.
    */
   it('rejects a start that was still pending when stop() landed mid-backoff', async () => {
-    const { supervisor } = makeSupervisor({ mode: 'crash-now', restart: { baseDelayMs: 500 } });
+    const { supervisor } = makeSupervisor({ mode: 'crash-now', restart: { backoffBaseMs: 500, probationMs: 1_000 } });
     const starting = supervisor.start();
     // Nothing may observe it before the assertion; an unhandled rejection would
     // fail the run on its own terms rather than on this test's.
     starting.catch(() => {});
 
-    await waitFor(supervisor, (s) => s.state === 'restarting', 'the backoff');
+    await waitFor(supervisor, (s) => s.state === 'restarting' && s.generation === 2, 'the backoff');
     await supervisor.stop();
 
     // `settleWithin` races on resolution, so a rejecting promise has to be
@@ -411,11 +419,11 @@ describe('restart budget', () => {
    * different child than the one it asked for.
    */
   it('does not resolve a stopped start when a later generation becomes ready', async () => {
-    const { supervisor } = makeSupervisor({ mode: 'crash-now', restart: { baseDelayMs: 500 } });
+    const { supervisor } = makeSupervisor({ mode: 'crash-now', restart: { backoffBaseMs: 500, probationMs: 1_000 } });
     const cancelled = supervisor.start();
     cancelled.catch(() => {});
 
-    await waitFor(supervisor, (s) => s.state === 'restarting', 'the backoff');
+    await waitFor(supervisor, (s) => s.state === 'restarting' && s.generation === 2, 'the backoff');
     await supervisor.stop();
     await expect(cancelled).rejects.toThrow();
 
@@ -550,7 +558,6 @@ describe('spawn failure', () => {
     };
     const { supervisor } = makeSupervisor({
       transport,
-      restart: { maxConsecutiveCrashes: 1 },
       timings: { readyTimeoutMs: 300 },
     });
 
@@ -577,7 +584,7 @@ describe('spawn failure', () => {
     };
     const { supervisor } = makeSupervisor({
       transport,
-      restart: { maxConsecutiveCrashes: 3, baseDelayMs: 1, maxDelayMs: 1 },
+      restart: { backoffBaseMs: 1, probationMs: 2 },
       timings: { readyTimeoutMs: 5_000, stdioFlushMs: 20 },
     });
 
@@ -600,7 +607,7 @@ describe('spawn failure', () => {
     expect(replacement).toMatchObject({
       state: 'starting',
       pid: spawns[1].pid,
-      consecutiveCrashes: 1,
+      streak: 1,
     });
 
     // Electron documents that the real exit does follow error. Deliver that
@@ -612,7 +619,7 @@ describe('spawn failure', () => {
       state: 'starting',
       generation: 2,
       pid: spawns[1].pid,
-      consecutiveCrashes: 1,
+      streak: 1,
     });
     expect(supervisor.snapshot().lastExit).toMatchObject({
       code: null,
@@ -779,5 +786,92 @@ describe('fork-time environment', () => {
     await supervisor.start();
     await supervisor.request({ op: 'echo', value: 1 });
     expect(JSON.stringify(process.env)).toBe(before);
+  });
+});
+
+describe('a missing entry (Splash EngineLaunchFailed)', () => {
+  // A missing entry stays missing; any other spawn error may not.
+  it('stops at once with the reason instead of relaunching', async () => {
+    const { supervisor, events } = makeSupervisor({ entry: '/nonexistent/mlx-inference/index.js' });
+    await expect(supervisor.start()).rejects.toThrow(/gave up/);
+
+    expect(supervisor.snapshot()).toMatchObject({ state: 'failed', generation: 1 });
+    const gaveUp = events.filter((event) => event.type === 'gave-up');
+    expect(gaveUp).toHaveLength(1);
+    expect(gaveUp[0]).toMatchObject({
+      message: expect.stringContaining(
+        'stopped restarting inference: failed to spawn: the inference entry /nonexistent/mlx-inference/index.js is missing',
+      ),
+    });
+  });
+});
+
+describe('quarantine (Splash Quarantine)', () => {
+  const SIGSEGV: number = (constants.signals as Readonly<Record<string, number | undefined>>).SIGSEGV ?? -1;
+  const [A, B, C, X] = ['a', 'b', 'c', 'd'].map((c) => c.repeat(64));
+  const JOURNAL_ENV = ['MLX_QUARANTINED', 'MLX_TURN_JOURNAL'];
+
+  async function crashWithTurns(supervisor: Supervisor, generation: number, fingerprints: readonly string[]) {
+    await waitFor(supervisor, (s) => s.state === 'running' && s.generation === generation, `generation ${generation}`);
+    for (const fp of fingerprints) await supervisor.request({ op: 'journal', fp });
+    await expect(supervisor.request({ op: 'segv' })).rejects.toBeInstanceOf(SidecarRequestError);
+  }
+
+  it('the child_process transport reports a signal death as its number', async () => {
+    const { supervisor } = makeSupervisor();
+    await supervisor.start();
+    await expect(supervisor.request({ op: 'segv' })).rejects.toBeInstanceOf(SidecarRequestError);
+    const crashed = await waitFor(supervisor, (s) => s.lastExit !== null, 'the crash');
+    expect(crashed.lastExit).toMatchObject({ verdict: 'crash', code: SIGSEGV, signal: 'SIGSEGV' });
+    expect(crashed.lastExit?.reason).toBe('killed by SIGSEGV');
+  });
+
+  it('a turn in flight at two crashes in a row is refused by the next child', async () => {
+    const { supervisor, events, dir } = makeSupervisor({ restart: { backoffBaseMs: 20, probationMs: 10_000 } });
+    await supervisor.start();
+    await crashWithTurns(supervisor, 1, [A, B]);
+    await crashWithTurns(supervisor, 2, [A, C]);
+
+    await waitFor(supervisor, (s) => s.state === 'running' && s.generation === 3, 'generation 3');
+    expect(events.filter((event) => event.type === 'quarantined')).toEqual([
+      { type: 'quarantined', refused: 1, total: 1 },
+    ]);
+    const third = await supervisor.request<Record<string, string | null>>({ op: 'env', names: JOURNAL_ENV });
+    expect(third.MLX_QUARANTINED).toBe(A);
+    expect(third.MLX_TURN_JOURNAL).toBe(join(dir, 'trace', 'inference-3.turns'));
+    expect(readdirSync(third.MLX_TURN_JOURNAL ?? '')).toEqual([]);
+
+    // Exit 1 is no request's doing: neither adds nor clears.
+    await supervisor.request({ op: 'journal', fp: A });
+    await expect(supervisor.request({ op: 'die', code: 1 })).rejects.toBeInstanceOf(SidecarRequestError);
+    await waitFor(supervisor, (s) => s.state === 'running' && s.generation === 4, 'generation 4');
+    const fourth = await supervisor.request<Record<string, string | null>>({ op: 'env', names: JOURNAL_ENV });
+    expect(fourth.MLX_QUARANTINED).toBe(A);
+
+    // A user restart is Splash's server restart.
+    await supervisor.restart();
+    const fifth = await supervisor.request<Record<string, string | null>>({ op: 'env', names: JOURNAL_ENV });
+    expect(supervisor.snapshot().generation).toBe(5);
+    expect(fifth.MLX_QUARANTINED).toBe('');
+    for (const generation of [1, 2, 3, 4]) {
+      expect(existsSync(join(dir, 'trace', `inference-${generation}.turns`))).toBe(false);
+    }
+  });
+
+  it('a journal left by an earlier app run is never read', async () => {
+    const { supervisor, events, dir } = makeSupervisor({ restart: { backoffBaseMs: 20, probationMs: 10_000 } });
+    for (const generation of [1, 2]) {
+      const stale = join(dir, 'trace', `inference-${generation}.turns`);
+      mkdirSync(stale, { recursive: true });
+      writeFileSync(join(stale, '1'), X);
+    }
+    await supervisor.start();
+    await crashWithTurns(supervisor, 1, []);
+    await crashWithTurns(supervisor, 2, []);
+    await waitFor(supervisor, (s) => s.state === 'running' && s.generation === 3, 'generation 3');
+
+    expect(events.some((event) => event.type === 'quarantined')).toBe(false);
+    const third = await supervisor.request<Record<string, string | null>>({ op: 'env', names: JOURNAL_ENV });
+    expect(third.MLX_QUARANTINED).toBe('');
   });
 });

@@ -18,8 +18,9 @@
  * Behaviour selected by MLX_TEST_SIDECAR.
  */
 
-import { appendFileSync, writeSync } from 'node:fs';
+import { appendFileSync, writeFileSync, writeSync } from 'node:fs';
 import { createServer } from 'node:http';
+import { join } from 'node:path';
 
 const MODE = process.env.MLX_TEST_SIDECAR ?? 'ok';
 
@@ -91,6 +92,7 @@ if (MODE === 'no-ready') {
     });
   }
 
+  let journaled = 0;
   process.on('message', (message) => {
     if (message?.kind !== 'mlx:request') return;
     const { id, payload } = message;
@@ -127,6 +129,16 @@ if (MODE === 'no-ready') {
       case 'stderr':
         for (const line of payload.lines) errSync(line);
         reply(true);
+        break;
+      case 'journal':
+        // Impersonates the server's `TurnJournal.begin`: one file per turn in flight.
+        journaled += 1;
+        writeFileSync(join(process.env.MLX_TURN_JOURNAL, String(journaled)), payload.fp);
+        reply(true);
+        break;
+      case 'segv':
+        // No reply: a fault-signal death with turns in flight.
+        process.kill(process.pid, 'SIGSEGV');
         break;
       case 'die':
         // No reply, on purpose: the pending request must be settled by the

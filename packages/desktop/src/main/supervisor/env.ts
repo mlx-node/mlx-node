@@ -12,9 +12,12 @@
  * The fork-time-only set, as of this writing: `MLX_PAGED_PREFILL_CHUNK_SIZE`,
  * `MLX_PAGED_PREFILL_EVAL_INTERVAL`, `MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL`,
  * `MLX_PAGED_GROUPED_{QWEN35,GEMMA4}`, `MLX_GEMMA4_PAGED_{DECODE,PREFILL}_ROUTE`,
- * `MLX_PAGED_{NATIVE_KV_WRITE,GRAPH_DECODE_GATHER}`, `MLX_INFERENCE_TRACE[_FILE]`, and roughly
- * twenty MTP/sampling knobs. They are fork parameters, not settings.
+ * `MLX_PAGED_{NATIVE_KV_WRITE,GRAPH_DECODE_GATHER}`, `MLX_INFERENCE_TRACE[_FILE]`,
+ * `MLX_TURN_JOURNAL`, `MLX_QUARANTINED`, and roughly twenty MTP/sampling knobs.
+ * They are fork parameters, not settings.
  */
+
+import { QUARANTINED_ENV, TURN_JOURNAL_ENV } from '../../inference/turn-journal.js';
 
 /**
  * `MLX_INFERENCE_TRACE` and `MLX_INFERENCE_TRACE_FILE` together are the ONLY
@@ -50,6 +53,10 @@ export interface ChildEnvInput {
   overrides?: Readonly<Record<string, string>>;
   /** Absolute path this generation's child must write its trace to. */
   traceFile: string;
+  /** This generation's turn journal directory. */
+  turnJournal: string;
+  /** Fingerprints the child must refuse (Splash `Quarantine.refuses`). */
+  quarantined: ReadonlySet<string>;
 }
 
 /**
@@ -59,7 +66,9 @@ export interface ChildEnvInput {
  *      semantics where a value the user already set in their shell wins;
  *   2. the inherited environment — the user's shell overrides the policy;
  *   3. supervisor overrides — chosen in the UI, so they beat the shell;
- *   4. the trace variables — FORCED, above everything.
+ *   4. the trace variables and the turn journal pair — FORCED, above
+ *      everything: a shell value would hide the journal from MAIN or lift a
+ *      quarantine.
  *
  * The trace layer is last and unconditional because it is not a preference. A
  * user with `MLX_INFERENCE_TRACE_FILE` already exported would otherwise point
@@ -75,5 +84,7 @@ export function buildChildEnv(input: ChildEnvInput): Record<string, string> {
   Object.assign(env, input.overrides ?? {});
   env[TRACE_FLAG] = '1';
   env[TRACE_FILE] = input.traceFile;
+  env[TURN_JOURNAL_ENV] = input.turnJournal;
+  env[QUARANTINED_ENV] = [...input.quarantined].join(',');
   return env;
 }

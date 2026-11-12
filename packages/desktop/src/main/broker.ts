@@ -23,7 +23,9 @@
  * per-generation trace file for class-(b) errors, and an RPC map. CONTROL PANEL has none
  * of those and needs one thing that supervisor's `ChildHandle` deliberately
  * cannot do — transfer a port. The restart arithmetic is shared instead, from
- * `supervisor/state.ts`, so the two agree on what a crash loop is.
+ * `supervisor/state.ts` (Splash `RestartPolicy.after`), so the two agree on
+ * what a crash loop is. Service is counted from the fork: CONTROL PANEL has
+ * no Ready.
  *
  * Electron-free by construction: `MessageChannelMain`, `utilityProcess` and
  * `WebContents` all arrive through {@link BrokerDeps}, so every rule below is
@@ -32,7 +34,16 @@
  */
 
 import { CONTROL_PANEL_BROKER_KILL_GRACE_MS } from '../control-panel/shutdown-timings.js';
-import { DEFAULT_RESTART_POLICY, nextCrashCount, planRestart, type RestartPolicy } from './supervisor/state.js';
+import { EXIT_STARTUP_FAILED } from '../inference/exit-codes.js';
+import {
+  backoffDoublings,
+  DEFAULT_RESTART_POLICY,
+  FRESH_RESTART_STATE,
+  restartAfter,
+  stopCause,
+  type RestartPolicy,
+  type RestartState,
+} from './supervisor/state.js';
 
 /** One end of a `MessageChannelMain`, as much of it as the broker touches. */
 export interface BrokerPort {
@@ -58,9 +69,9 @@ export type BrokerEvent =
   | { type: 'brokered'; generation: number }
   /** The handshake could not be completed. The renderer is left with no port. */
   | { type: 'broker-failed'; generation: number; reason: string }
-  | { type: 'control-panel-exited'; code: number | null; consecutiveCrashes: number }
+  | { type: 'control-panel-exited'; code: number | null; streak: number }
   /** Out of restart budget. The Control Panel window stays empty until the app restarts. */
-  | { type: 'control-panel-gave-up'; consecutiveCrashes: number };
+  | { type: 'control-panel-gave-up'; message: string };
 
 /**
  * Everything that touches Electron. `Target` is the renderer handle — a
@@ -128,15 +139,19 @@ export function createControlPanelBroker<Target>(
   options: BrokerOptions = {},
 ): ControlPanelBroker<Target> {
   const policy: RestartPolicy = { ...DEFAULT_RESTART_POLICY, ...options.restart };
+  backoffDoublings(policy);
   const killGraceMs = options.killGraceMs ?? CONTROL_PANEL_BROKER_KILL_GRACE_MS;
 
   let child: ControlPanelChild | null = null;
   let generation = 0;
   let disposed = false;
-  let gaveUp = false;
-  let consecutiveCrashes = 0;
-  /** When the current child was forked, for the crash-budget reset. */
+  /** Splash's stop message once restarting stopped. */
+  let gaveUp: string | null = null;
+  let restartState: RestartState = FRESH_RESTART_STATE;
+  /** When the current child was forked: its service, for the restart policy. */
   let spawnedAtMs = 0;
+  /** The last fork threw ENOENT: a missing entry stays missing (Splash `EngineLaunchFailed`). */
+  let forkMissing = false;
   let cancelRestart: (() => void) | null = null;
   let recovery: { target: ControlPanelChild; cancelEscalation: () => void } | null = null;
   /**
@@ -161,9 +176,10 @@ export function createControlPanelBroker<Target>(
 
   function ensureChild(): ControlPanelChild | null {
     if (child !== null) return child;
-    if (disposed || gaveUp) return null;
+    if (disposed || gaveUp !== null) return null;
     spawnedAtMs = deps.now();
     spawnFailure = null;
+    forkMissing = false;
     try {
       child = deps.spawn({ onExit: (code) => onExit(code) });
     } catch (error) {
@@ -173,6 +189,7 @@ export function createControlPanelBroker<Target>(
       // nothing to report. Synthesise the exit, exactly as the INFERENCE
       // supervisor does for a transport that reports `error` and no `exit`.
       spawnFailure = `control panel failed to fork: ${describe(error)}`;
+      forkMissing = isMissingFile(error);
       onExit(null);
       return null;
     }
@@ -195,13 +212,16 @@ export function createControlPanelBroker<Target>(
     // includes a watchdog recovery: repeatedly wedging is a crash loop even
     // though MAIN delivered the terminating signal. An exit code of 0 still
     // does not make it healthy.
-    consecutiveCrashes = nextCrashCount(policy, consecutiveCrashes, deps.now() - spawnedAtMs);
-    deps.report({ type: 'control-panel-exited', code, consecutiveCrashes });
+    const permanent = forkMissing || code === EXIT_STARTUP_FAILED;
+    const after = restartAfter(policy, restartState, { servedMs: deps.now() - spawnedAtMs, permanent });
+    restartState = after.state;
+    const decision = after.decision;
+    deps.report({ type: 'control-panel-exited', code, streak: restartState.streak });
 
-    const decision = planRestart(policy, consecutiveCrashes, { code, signal: null });
     if (decision.action === 'give-up') {
-      gaveUp = true;
-      deps.report({ type: 'control-panel-gave-up', consecutiveCrashes });
+      const cause = stopCause(policy, decision.permanent, spawnFailure ?? `exited ${code ?? 'with no status'}`);
+      gaveUp = `stopped restarting the control panel: ${cause}. Quit and reopen the app after fixing the cause.`;
+      deps.report({ type: 'control-panel-gave-up', message: gaveUp });
       return;
     }
     cancelRestart = deps.delay(() => {
@@ -223,8 +243,7 @@ export function createControlPanelBroker<Target>(
       deps.report({
         type: 'broker-failed',
         generation,
-        reason:
-          spawnFailure ?? (gaveUp ? `control panel gave up after ${consecutiveCrashes} crashes` : 'broker disposed'),
+        reason: spawnFailure ?? gaveUp ?? 'broker disposed',
       });
       return;
     }
@@ -344,6 +363,10 @@ export function createControlPanelBroker<Target>(
       cancelCap();
     },
   };
+}
+
+function isMissingFile(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ENOENT';
 }
 
 function describe(error: unknown): string {

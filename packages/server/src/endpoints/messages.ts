@@ -64,6 +64,7 @@ import { ToolCallTagBuffer } from '@mlx-node/lm';
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
 import {
   sendAnthropicBadRequest,
+  sendAnthropicError,
   sendAnthropicInternalError,
   sendAnthropicNotFound,
   sendAnthropicRateLimit,
@@ -114,6 +115,7 @@ import {
   type TransportVisibility,
   writeFallbackErrorSSE,
 } from '../transport-visibility.js';
+import { QUARANTINE_MESSAGE, requestFingerprint, type TurnJournal } from '../turn-journal.js';
 import type { TracedChatConfig } from '../turn-trace.js';
 import type { AnthropicMessagesRequest } from '../types-anthropic.js';
 
@@ -1200,6 +1202,7 @@ export async function handleCreateMessage(
   resolveModel?: (name: string) => Promise<void>,
   modelWorkCoordinator?: ModelWorkCoordinator,
   defaultThinkingTokenBudget?: number,
+  turnJournal?: TurnJournal,
 ): Promise<void> {
   if (modelWorkCoordinator) {
     registry.setModelLoadAdmissionCoordinator(modelWorkCoordinator);
@@ -1270,6 +1273,15 @@ export async function handleCreateMessage(
     } = mapAnthropicRequest(body));
   } catch (err) {
     sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
+    return;
+  }
+  mappedConfig = applyClaudeCodeTitleFastPath(mappedConfig, body);
+  mappedConfig = applyDefaultThinkingTokenBudget(mappedConfig, defaultThinkingTokenBudget);
+  const turnFingerprint =
+    turnJournal === undefined ? null : requestFingerprint(body.model, mappedMessages, mappedConfig);
+  // Splash `_admit`: refused before admission and before any model load or swap.
+  if (turnFingerprint !== null && turnJournal?.refuses(turnFingerprint) === true) {
+    sendAnthropicError(res, 400, 'invalid_request_error', QUARANTINE_MESSAGE);
     return;
   }
 
@@ -1458,8 +1470,6 @@ export async function handleCreateMessage(
   try {
     const sessionReg: SessionRegistry = lease.registry;
     mappedConfig = applyOutputTokenLimit(mappedConfig, sessionReg.outputTokenLimit);
-    mappedConfig = applyClaudeCodeTitleFastPath(mappedConfig, body);
-    mappedConfig = applyDefaultThinkingTokenBudget(mappedConfig, defaultThinkingTokenBudget);
     // Snapshot the monotonic instance id so the in-mutex re-read can detect a
     // hot-swap that lands between lease acquisition and mutex entry. Unlike
     // `/v1/responses`, the Anthropic handler has no stored-identity check
@@ -1715,6 +1725,8 @@ export async function handleCreateMessage(
           // flips in `writeHead` before the body lands) so a crash after
           // `writeHead(application/json)` cannot leak SSE frames into a JSON body.
           const visibility = createVisibility();
+          // Splash `RuntimeCall.started`: journaled from dispatch to its end.
+          const endTurn = turnFingerprint === null ? null : (turnJournal?.begin(turnFingerprint) ?? null);
 
           try {
             if (body.stream === true) {
@@ -1913,6 +1925,7 @@ export async function handleCreateMessage(
               }
             }
           } finally {
+            endTurn?.();
             // Every session that was not retained in the warm registry owns
             // request-local native state and must be released before leaving
             // the admission lane. Cleanup failure must not replace a terminal

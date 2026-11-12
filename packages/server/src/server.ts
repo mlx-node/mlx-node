@@ -24,6 +24,7 @@ import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import { ModelRegistry } from './registry.js';
 import { RerankService, resolveRerankLimits, type RerankServiceOptions } from './rerank-service.js';
 import { activeSSEStreamCountForResponses } from './streaming.js';
+import { TurnJournal, type TurnJournalOptions } from './turn-journal.js';
 import { createWeightResidency, trackWeights, type WeightResidency } from './weight-residency.js';
 
 /** Cleanup interval for expired responses (ms). */
@@ -172,6 +173,11 @@ export interface ServerConfig {
    * which its thinking closes (Splash `--thinking-token-budget`). Default: no cap.
    */
   thinkingTokenBudget?: number;
+  /**
+   * The desktop supervisor's turn journal and quarantine (Splash
+   * `Quarantine`). Omitted: no journal and no refusal.
+   */
+  turnJournal?: TurnJournalOptions;
   /** Port to listen on (default: 8080). */
   port?: number;
   /** Hostname to bind to (default: '127.0.0.1'). */
@@ -535,6 +541,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
         }
       : {}),
     ...(config?.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: config.thinkingTokenBudget } : {}),
+    ...(config?.turnJournal !== undefined ? { turnJournal: new TurnJournal(config.turnJournal) } : {}),
   });
   /**
    * Responses owned by THIS HTTP server. The SSE registry is deliberately

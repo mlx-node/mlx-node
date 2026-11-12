@@ -26,20 +26,29 @@
  *             to report health.
  */
 
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { buildChildEnv } from './env.js';
+import { readStartedFingerprints } from './journal.js';
 import {
   assessExit,
+  backoffDoublings,
   DEFAULT_RESTART_POLICY,
+  EMPTY_QUARANTINE,
+  FRESH_RESTART_STATE,
   isLoopbackHttpUrl,
+  isPermanentExit,
   isServingStatus,
-  nextCrashCount,
-  planRestart,
   projectState,
+  quarantineAfter,
+  requestCaused,
+  restartAfter,
+  stopCause,
   type ChildIntent,
+  type QuarantineState,
   type RestartPolicy,
+  type RestartState,
 } from './state.js';
 import { watchTraceFile, parseSwallowedStderrLine, type SwallowedError, type TraceWatcher } from './trace.js';
 import {
@@ -115,7 +124,10 @@ export interface SupervisorOptions {
   entry: string;
   args?: readonly string[];
   cwd?: string;
-  /** Where per-generation trace files are written. Created if missing. */
+  /**
+   * Where per-generation trace files and turn journals
+   * (`inference-<gen>.turns`) are written. Created if missing.
+   */
   traceDir: string;
   /**
    * Required, with no default. The `utilityProcess` transport is production and
@@ -177,6 +189,7 @@ const MAX_NATIVE_ERRORS = 20;
 export function createSupervisor(opts: SupervisorOptions): Supervisor {
   const timings: SupervisorTimings = { ...DEFAULT_TIMINGS, ...opts.timings };
   const policy: RestartPolicy = { ...DEFAULT_RESTART_POLICY, ...opts.restart };
+  backoffDoublings(policy);
   const baseEnv = opts.baseEnv ?? process.env;
   const stderrTailLines = opts.stderrTailLines ?? 50;
 
@@ -191,7 +204,19 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
   let intent: ChildIntent = 'run';
   let abortReason: string | null = null;
   let becameReady = false;
-  let readyAtMs = 0;
+  /**
+   * Start of the current stretch of service with nothing loading (Splash
+   * `_ready_at`, which follows the weights' load): `null` before Ready and
+   * while `/health` says `loading`, so a lazy model load is never probation.
+   */
+  let servingSinceMs: number | null = null;
+  /** Service from stretches a load ended; a crash during a later load keeps it (Splash `served_seconds`). */
+  let servedBeforeMs = 0;
+  /** The intent before a transport fault on a live child turned it into `abort`. */
+  let faultIntent: ChildIntent | null = null;
+  /** `opts.entry` was missing at spawn: Splash's `EngineLaunchFailed`. */
+  let entryMissing = false;
+  let journalDir: string | null = null;
   let url: string | null = null;
   /**
    * The current child's bearer token, in memory only.
@@ -218,7 +243,8 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
   const genTimers = new Set<NodeJS.Timeout>();
 
   // Across generations.
-  let consecutiveCrashes = 0;
+  let restartState: RestartState = FRESH_RESTART_STATE;
+  let quarantine: QuarantineState = EMPTY_QUARANTINE;
   let lastExit: ExitRecord | null = null;
   let restartTimer: NodeJS.Timeout | null = null;
   let nextRequestId = 0;
@@ -246,7 +272,8 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
       pid: child?.pid,
       url,
       generation,
-      consecutiveCrashes,
+      streak: restartState.streak,
+      shortLivedFailures: restartState.shortLivedFailures,
       lastExit,
       health,
       nativeErrors: [...nativeErrors],
@@ -360,7 +387,7 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
 
   function markReady(): void {
     becameReady = true;
-    readyAtMs = Date.now();
+    servingSinceMs = Date.now();
     clearGenTimers();
     setLifecycle('running');
     if (url !== null) emit({ type: 'ready', url });
@@ -378,6 +405,11 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
         if (generation !== gen || child === null) return;
         const changed = probe?.status !== health?.status;
         health = probe;
+        if (probe?.status === 'loading') {
+          if (servingSinceMs !== null) servedBeforeMs += Date.now() - servingSinceMs;
+          servingSinceMs = null;
+        } else if (probe !== null && isServingStatus(probe.status) && servingSinceMs === null)
+          servingSinceMs = Date.now();
         // A `/health` that stops answering while the process is alive is a
         // hang, not a crash, and restarting on it would kill a legitimately
         // slow model load — `deriveHealthStatus` reports `loading` precisely so
@@ -481,6 +513,9 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
       onExit({ code: null, signal: null });
       return;
     }
+    // Electron's `error` is a non-continuable V8 fault and its exit follows:
+    // judged as the death it is, not as our own abort.
+    faultIntent ??= intent;
     intent = 'abort';
     genTimer(() => {
       if (!exitHandled) onExit({ code: null, signal: null });
@@ -570,23 +605,41 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
     resolveStopWaiters();
 
     if (assessment.verdict === 'clean') {
+      removeJournal();
       setLifecycle('stopped');
       rejectStartWaiters(new Error(`inference sidecar ${assessment.reason}`));
       return;
     }
 
     emit({ type: 'crashed', exit: lastExit });
-    const readyForMs = becameReady ? Date.now() - readyAtMs : 0;
-    consecutiveCrashes = nextCrashCount(policy, consecutiveCrashes, readyForMs);
-    const decision = planRestart(policy, consecutiveCrashes, exit);
+    const permanent = isPermanentExit(exit, entryMissing);
+    const failure = {
+      servedMs: servedBeforeMs + (servingSinceMs === null ? 0 : Date.now() - servingSinceMs),
+      permanent,
+    };
+    const after = restartAfter(policy, restartState, failure);
+    restartState = after.state;
+    const decision = after.decision;
     if (decision.action === 'give-up') {
+      removeJournal();
+      const message = `stopped restarting inference: ${stopCause(policy, decision.permanent, assessment.reason)}. Start inference again after fixing the cause.`;
       setLifecycle('failed');
-      emit({ type: 'gave-up', consecutiveCrashes });
-      rejectStartWaiters(
-        new Error(`inference sidecar gave up after ${consecutiveCrashes} crashes: ${assessment.reason}`),
-      );
+      emit({ type: 'gave-up', message });
+      rejectStartWaiters(new Error(`inference sidecar gave up: ${message}`));
       return;
     }
+
+    // Splash `_count_failure`: counted before the relaunch, and only for a
+    // failure a turn may have caused.
+    if (requestCaused({ intent: faultIntent ?? intent, becameReady, code: exit.code })) {
+      const started = journalDir === null ? new Set<string>() : readStartedFingerprints(journalDir);
+      const counted = quarantineAfter(quarantine, started);
+      quarantine = counted.state;
+      if (counted.refused.size > 0) {
+        emit({ type: 'quarantined', refused: counted.refused.size, total: counted.state.refused.size });
+      }
+    }
+    removeJournal();
 
     setLifecycle('restarting');
     restartTimer = setTimeout(() => {
@@ -594,6 +647,15 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
       if (disposed || lifecycle !== 'restarting') return;
       spawn();
     }, decision.delayMs);
+  }
+
+  function removeJournal(): void {
+    if (journalDir === null) return;
+    try {
+      rmSync(journalDir, { recursive: true, force: true });
+    } catch {
+      // The next generation's spawn wipes its own directory before use.
+    }
   }
 
   function resolveStopWaiters(): void {
@@ -614,7 +676,11 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
     intent = 'run';
     abortReason = null;
     becameReady = false;
-    readyAtMs = 0;
+    servingSinceMs = null;
+    servedBeforeMs = 0;
+    faultIntent = null;
+    entryMissing = false;
+    journalDir = null;
     url = null;
     // A token belongs to one child. Clearing it here means a copied connect
     // command cannot silently keep pointing at a generation that is gone.
@@ -643,12 +709,26 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
       // and a restart is not judged by the previous child's corruption.
       mkdirSync(opts.traceDir, { recursive: true });
       traceFile = join(opts.traceDir, `inference-${generation}.trace.log`);
+      // Generation numbers restart at 1 every app launch: an earlier run's
+      // directory would read as this child's turns.
+      journalDir = join(opts.traceDir, `inference-${generation}.turns`);
+      rmSync(journalDir, { recursive: true, force: true });
+      mkdirSync(journalDir, { recursive: true });
       watcher = watchTraceFile(traceFile, {
         intervalMs: timings.tracePollMs,
         onError: recordSwallowed,
       });
 
       setLifecycle('starting');
+
+      // Splash `EngineLaunchFailed`: a missing entry stays missing; any other
+      // spawn error may not.
+      if (!existsSync(opts.entry)) {
+        entryMissing = true;
+        throw new Error(
+          `the inference entry ${opts.entry} is missing; the installation may have been upgraded or removed`,
+        );
+      }
 
       child = opts.transport(
         {
@@ -659,6 +739,8 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
             enginePolicyEnv: opts.enginePolicyEnv ?? {},
             ...(opts.env !== undefined ? { overrides: opts.env } : {}),
             traceFile,
+            turnJournal: journalDir,
+            quarantined: quarantine.refused,
           }),
           ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
         },
@@ -714,7 +796,9 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
       startWaiters.push({ resolve, reject });
     });
     if (lifecycle === 'stopped' || lifecycle === 'failed') {
-      consecutiveCrashes = 0;
+      // Splash's server restart: a fresh policy and quarantine.
+      restartState = FRESH_RESTART_STATE;
+      quarantine = EMPTY_QUARANTINE;
       spawn();
     }
     return waiter;
@@ -770,8 +854,8 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
     stop,
     async restart(): Promise<void> {
       await stop();
-      // A restart the user asked for is not evidence the sidecar is unstable.
-      consecutiveCrashes = 0;
+      // A restart the user asked for is not evidence the sidecar is unstable:
+      // `start()` from `stopped` begins a fresh policy and quarantine.
       await start();
     },
     request<T = unknown>(payload: unknown, requestOpts?: RequestOptions): Promise<T> {

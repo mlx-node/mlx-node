@@ -145,7 +145,7 @@ function describe(snapshot: SupervisorSnapshot): Described {
       return {
         indicator: 'busy',
         title: '',
-        statusLabel: `Inference: restarting (crash ${snapshot.consecutiveCrashes})`,
+        statusLabel: `Inference: restarting (failure ${snapshot.streak})`,
         detail: snapshot.lastExit === null ? null : snapshot.lastExit.reason,
       };
 
@@ -153,7 +153,7 @@ function describe(snapshot: SupervisorSnapshot): Described {
       return {
         indicator: 'error',
         title: '✕',
-        statusLabel: `Inference: failed after ${snapshot.consecutiveCrashes} ${snapshot.consecutiveCrashes === 1 ? 'crash' : 'crashes'}`,
+        statusLabel: 'Inference: stopped restarting',
         detail: snapshot.lastExit === null ? null : snapshot.lastExit.reason,
       };
 

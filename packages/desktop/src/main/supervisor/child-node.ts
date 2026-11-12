@@ -15,8 +15,11 @@
  */
 
 import { fork } from 'node:child_process';
+import { constants } from 'node:os';
 
 import type { ChildEvents, ChildHandle, ChildSpec, ChildTransport } from './types.js';
+
+const osSignals: Readonly<Record<string, number | undefined>> = constants.signals;
 
 export const nodeChildTransport: ChildTransport = (spec: ChildSpec, events: ChildEvents): ChildHandle => {
   const child = fork(spec.modulePath, [...spec.args], {
@@ -46,7 +49,7 @@ export const nodeChildTransport: ChildTransport = (spec: ChildSpec, events: Chil
     events.onError(error);
   });
   child.on('exit', (code, signal) => {
-    events.onExit({ code, signal });
+    events.onExit({ code: code ?? (signal === null ? null : (osSignals[signal] ?? null)), signal });
   });
 
   return {
