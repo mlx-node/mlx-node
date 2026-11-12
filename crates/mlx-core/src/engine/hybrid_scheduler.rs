@@ -992,6 +992,21 @@ fn grow_or_take_needed_blocks_for(
     (short > 0).then(|| short.min(u64::from(u32::MAX)) as u32)
 }
 
+/// A stopped turn that generated tokens and holds no pages ends as a
+/// completion; marks it and returns true.
+pub(crate) fn stop_vacates<P>(turn: &mut TurnState<ScheduledTurn<P>>) -> bool {
+    let stopped = match &turn.payload.response {
+        ScheduledReply::Stream(stream) => stream.stop_requested(),
+        ScheduledReply::Sync(_) => false,
+    };
+    if !stopped || turn.payload.generated_tokens.is_empty() {
+        return false;
+    }
+    turn.payload.vacated_stop = true;
+    turn.payload.finish_reason = "cancelled".to_string();
+    true
+}
+
 pub(crate) enum ScheduledReply {
     Sync(ResponseTx<ChatResult>),
     Stream(StreamTx<ChatStreamChunk>),
@@ -1051,6 +1066,10 @@ pub(crate) struct ScheduledTurn<P> {
     pub(crate) streamed_text_len: usize,
     pub(crate) last_is_reasoning: bool,
     pub(crate) failure: Option<Error>,
+    /// A stop reached the turn while it held no pages (preempted, waiting, or
+    /// replaying after preemption): it ends as a completion on what it
+    /// generated (Splash `Engine::stop` → `settle` → `finish(Stop)`).
+    pub(crate) vacated_stop: bool,
     pub(crate) allocation_failed: bool,
     pub(crate) preemption_replay: Option<PreemptionReplay>,
     /// Token bound the off-pool state reservation was sized for. The block
@@ -1128,6 +1147,13 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
     ) -> RowStepResult {
         turn.payload.allocation_failed |= is_paged_allocation_blocked(&error.reason);
         turn.payload.failure = Some(error);
+        Self::end_row(turn, row)
+    }
+
+    fn end_row(
+        turn: &mut TurnState<ScheduledTurn<B::PrefixState>>,
+        row: &engine::scheduler::StepRow,
+    ) -> RowStepResult {
         turn.payload.profiler.snapshot_memory_after();
         turn.payload.profiler.report();
         RowStepResult {
@@ -1198,6 +1224,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         turn: &mut TurnState<ScheduledTurn<B::PrefixState>>,
     ) -> Result<RowStepResult> {
         if row.cancel_snapshot {
+            if stop_vacates(turn) {
+                return Ok(Self::end_row(turn, row));
+            }
             return Ok(Self::fail(
                 turn,
                 row,
@@ -3617,6 +3646,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             streamed_text_len: 0,
             last_is_reasoning: admitted.thinking.enabled,
             failure: None,
+            vacated_stop: false,
             allocation_failed: false,
             preemption_replay: None,
             requested_tokens,
@@ -3706,8 +3736,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     fn reap_cancelled_waiters(&mut self) {
         for mut turn in self.scheduler.take_cancelled_waiters() {
             self.pending_restores.remove(&turn.seq_id);
-            turn.payload.failure =
-                Some(Error::from_reason(engine::session::CHAT_SESSION_CANCELLED));
+            if !stop_vacates(&mut turn) {
+                turn.payload.failure =
+                    Some(Error::from_reason(engine::session::CHAT_SESSION_CANCELLED));
+            }
             self.finish_completed(turn);
         }
     }
@@ -3897,7 +3929,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .as_ref()
             .is_some_and(|cancelled| cancelled.load(Ordering::Relaxed))
         {
-            self.fail_preempted(turn, engine::session::CHAT_SESSION_CANCELLED.to_string());
+            if stop_vacates(&mut turn) {
+                self.finish_completed(turn);
+            } else {
+                self.fail_preempted(turn, engine::session::CHAT_SESSION_CANCELLED.to_string());
+            }
             return;
         }
         let cache_snapshot = match self.inner.scheduler_cache_snapshot() {
@@ -4112,8 +4148,17 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             turn.payload.response.send_error(error, cancelled.as_ref());
             return;
         }
+        let vacated = turn.payload.vacated_stop;
+        if vacated {
+            self.inner.abort_paged_turn();
+        }
         let sink = turn.payload.response.sink();
-        let outcome = engine::paged_turn::finish_paged_turn(
+        let finish = if vacated {
+            engine::paged_turn::emit_paged_turn_result::<B>
+        } else {
+            engine::paged_turn::finish_paged_turn::<B>
+        };
+        let outcome = finish(
             &mut self.inner,
             engine::paged_turn::FinishPagedTurnArgs {
                 tokenizer: &turn.payload.tokenizer,
@@ -4140,7 +4185,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             },
         );
         self.inner.release_scheduled_speculation(turn.seq_id);
-        let parked = if outcome.is_ok() && turn.payload.reuse_cache {
+        let parked = if outcome.is_ok() && turn.payload.reuse_cache && !vacated {
             self.owner_states.insert(
                 turn.payload.owner_id.clone(),
                 self.inner.capture_owner_state(turn.seq_id),
@@ -4152,7 +4197,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             Ok(())
         };
         self.inner.set_turn_cancel_flag(None);
-        if outcome.is_err() || parked.is_err() {
+        if outcome.is_err() || parked.is_err() || vacated {
             self.owner_states.remove(&turn.payload.owner_id);
             self.owner_sequences.remove(&turn.payload.owner_id);
         }

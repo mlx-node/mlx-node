@@ -804,6 +804,70 @@ fn resumed_mtp_turn_keeps_the_draft_reservation_of_its_token_bound() {
     assert_eq!(text, control);
 }
 
+/// Splash `Engine::stop` on a lane that is not in flight: a stop that reaches
+/// a preempted turn which generated tokens ends it as a completion ("stop"),
+/// not as the cancelled error.
+///
+/// Mutation: `stop_vacates` returns false; the resume fails the turn with
+/// the cancelled error.
+#[test]
+fn a_stop_on_a_preempted_turn_finishes_stop() {
+    use crate::engine::cmd::ChatCmd;
+    use crate::engine::hybrid_scheduler::HybridSchedulerState;
+    use crate::engine::model_command::ModelCommand;
+    use crate::model_thread::LoopControl;
+    let mut state = HybridSchedulerState::new(tiny_inner()).unwrap();
+    let (plumbing, mut rx) = crate::engine::napi_glue::chat_stream_plumbing();
+    let message: crate::tokenizer::ChatMessage =
+        serde_json::from_value(serde_json::json!({"role": "user", "content": "a"})).unwrap();
+    let config = crate::engine::types::ChatConfig {
+        max_new_tokens: Some(40),
+        temperature: Some(0.0),
+        enable_mtp: Some(false),
+        max_consecutive_tokens: Some(0),
+        max_ngram_repeats: Some(0),
+        cache_owner_id: Some("owner".to_string()),
+        ..Default::default()
+    };
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let command = ChatCmd::StreamSessionStart {
+        messages: vec![message],
+        config,
+        stream_tx: plumbing.stream_tx.clone(),
+        cancelled: plumbing.cancelled.clone(),
+    };
+    assert!(sender.send(ModelCommand::from_chat(command)).is_ok());
+    let mut seq = None;
+    for _ in 0..64 {
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        seq = state.owner_sequences.get("owner").copied();
+        if let Some(seq) = seq
+            && state
+                .turn_mut(seq)
+                .is_some_and(|turn| turn.payload.generated_tokens.len() >= 2)
+        {
+            break;
+        }
+    }
+    let seq = seq.unwrap();
+    assert!(state.turn_mut(seq).unwrap().payload.generated_tokens.len() >= 2);
+    assert!(state.preempt_running(seq));
+    plumbing.handle.stop();
+    state.resume_preempted();
+    drop(plumbing);
+    let mut done = None;
+    while let Ok(chunk) = rx.try_recv() {
+        let chunk = chunk.unwrap_or_else(|error| panic!("stopped turn failed: {}", error.reason));
+        if chunk.done {
+            done = Some(chunk);
+        }
+    }
+    let done = done.expect("the stopped turn sent no done chunk");
+    assert_eq!(done.finish_reason.as_deref(), Some("stop"));
+    assert!(done.num_tokens.is_some_and(|tokens| tokens >= 2));
+    assert!(!state.owner_sequences.contains_key("owner"));
+}
+
 /// Drives one turn without a `cacheOwnerId` through the scheduler and returns
 /// its text and MTP cycle count.
 fn drive_ownerless_turn(
@@ -1205,9 +1269,10 @@ fn interrupted_token_discards_partial_layer_state_and_can_restart() {
     let restarted = model.step(3).unwrap().to_float32().unwrap();
     assert_eq!(&*expected, &*restarted);
 
+    // A cancel interrupts a prefill pass; a decode pass ends at its boundary.
     let flag = Arc::new(AtomicBool::new(true));
     model.cancelled = Some(flag.clone());
-    assert!(model.step(9).is_err());
+    assert!(model.prefill_chunk(&[9], None, false).is_err());
     assert!(model.history.is_empty());
     flag.store(false, std::sync::atomic::Ordering::Relaxed);
     assert_eq!(&*model.step(3).unwrap().to_float32().unwrap(), &*expected);
@@ -2592,6 +2657,26 @@ fn completed_paged_turn_keeps_auxiliary_state_and_partial_page_for_continuation(
             .num_blocks(),
         1
     );
+}
+
+/// Splash `Engine::stop` ends a lane at its pass boundary: a cancel flag set
+/// before a decode pass leaves that pass to finish (the step snapshot ends
+/// the turn), while prefill still stops on it.
+///
+/// Mutation: `check_cancelled` ignores `decode_pass`; the step fails.
+#[test]
+fn a_cancel_during_decode_ends_at_the_pass_boundary() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    let mut inner = tiny_inner();
+    inner.activate_paged_seq(1).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    inner.set_turn_cancel_flag(Some(cancel.clone()));
+    inner.decoder.prefill_chunk(&[3, 9], None, false).unwrap();
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    inner.run_paged_decode_step_batched(&[(1, 7)]).unwrap();
+    inner.decoder.step(4).unwrap();
+    assert_eq!(inner.decoder.history, [3, 9, 7, 4]);
+    assert!(inner.decoder.prefill_chunk(&[8], None, false).is_err());
 }
 
 #[test]

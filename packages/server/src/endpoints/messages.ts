@@ -57,8 +57,8 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult, ChatStreamProgress, PerformanceMetrics } from '@mlx-node/core';
-import { isCapacityExhaustedError, isContextCapacityError } from '@mlx-node/lm';
-import type { ChatSession, ChatStreamEvent, ChatStreamProgressRef, SessionCapableModel } from '@mlx-node/lm';
+import { isCapacityExhaustedError, isContextCapacityError, selectCommittedStreamText } from '@mlx-node/lm';
+import type { ChatSession, ChatStreamControl, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 import { ToolCallTagBuffer } from '@mlx-node/lm';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
@@ -226,6 +226,7 @@ async function handleNonStreaming(
   stopSequences: string[],
   outputClampedToContext: boolean,
   serverTiming?: ServerTimingForUsage,
+  deltaStop: DeltaStop | null = null,
 ): Promise<void> {
   const messageId = genId('msg_');
 
@@ -249,7 +250,12 @@ async function handleNonStreaming(
 
   let matchedStopSequence: string | null = null;
   let responseResult = result;
-  if (stopSequences.length > 0) {
+  if (deltaStop !== null) {
+    // The scan that stopped decode decides text and sequence (Splash: one
+    // `CallbackStreamer` per request).
+    matchedStopSequence = deltaStop.matched;
+    responseResult = { ...result, text: deltaStop.cut };
+  } else if (stopSequences.length > 0) {
     const stopBuffer = new StopSequenceBuffer(stopSequences);
     const pushed = stopBuffer.push(visibleText);
     const flushed = stopBuffer.flush();
@@ -310,7 +316,8 @@ async function handleStreamingNative(
   stopSequences: string[],
   outputClampedToContext: boolean,
   serverTiming?: ServerTimingForUsage,
-  progressRef?: ChatStreamProgressRef,
+  control?: ChatStreamControl,
+  stop?: (committedText: string) => boolean,
 ): Promise<MessagesStreamingHandlerResult> {
   const abort = trackSSEClientAbort(res, httpReq);
   try {
@@ -325,7 +332,8 @@ async function handleStreamingNative(
       stopSequences,
       outputClampedToContext,
       serverTiming,
-      progressRef,
+      control,
+      stop,
     );
   } finally {
     abort.dispose();
@@ -343,7 +351,8 @@ async function handleStreamingNativeWithAbort(
   stopSequences: string[],
   outputClampedToContext: boolean,
   serverTiming?: ServerTimingForUsage,
-  progressRef?: ChatStreamProgressRef,
+  control?: ChatStreamControl,
+  stop?: (committedText: string) => boolean,
 ): Promise<MessagesStreamingHandlerResult> {
   const streamStartMs = Date.now();
   const messageId = genId('msg_');
@@ -415,6 +424,7 @@ async function handleStreamingNativeWithAbort(
   // boundary is caught with buffer continuity.
   const stopBuffer = new StopSequenceBuffer(stopSequences);
   let matchedStopSequence: string | null = null;
+  let stopSent = false;
 
   // Terminal emission is deferred until after the loop drains so `wasCommitted()`
   // reads an authoritative `session.turns`. On a committed done chunk we emit
@@ -458,13 +468,13 @@ async function handleStreamingNativeWithAbort(
   // `pendingDrain`; a tick never writes while one is pending.
   let lastProgress: ChatStreamProgress | null = null;
   const progressTimer =
-    progressRef === undefined
+    control === undefined
       ? null
       : setInterval(() => {
           if (abort.aborted || pendingDrain !== null || res.writableEnded || res.destroyed) return;
           let snapshot: ChatStreamProgress | null;
           try {
-            snapshot = progressRef.read?.() ?? null;
+            snapshot = control.read?.() ?? null;
           } catch {
             // A throw here would be uncaught in the timer callback.
             return;
@@ -822,8 +832,8 @@ async function handleStreamingNativeWithAbort(
           // holds back a trailing suffix that could be the start of a stop
           // string (released on a later push or at flush), and once a full
           // stop string matches it returns empty `safeText` for the rest of
-          // the stream. We record the match and keep consuming so the native
-          // `done` chunk still fires the commit gate and history commit.
+          // the stream. On a match the turn is stopped (below); the native
+          // `done` chunk still arrives and drives the commit gate.
           const stopResult = stopBuffer.push(safeText);
           if (stopResult.matched !== null) {
             matchedStopSequence = stopResult.matched;
@@ -882,6 +892,12 @@ async function handleStreamingNativeWithAbort(
             }
           }
         }
+      }
+      // Splash `stop_matched` → `RuntimeCall.stop`: end decode at the running
+      // step and commit the visible text the response holds.
+      if (matchedStopSequence !== null && !stopSent) {
+        stopSent = true;
+        stop?.(emittedText + pendingLeadingWhitespace);
       }
     }
   } catch (err: unknown) {
@@ -982,6 +998,8 @@ async function handleStreamingNativeWithAbort(
  */
 interface MessagesNonStreamingOutcome {
   result: ChatResult;
+  /** The stop sequence the decode deltas matched, and the text before it. */
+  deltaStop: DeltaStop | null;
   committed: boolean;
   /** The context window, not the request's limit, set the output budget. */
   outputClampedToContext: boolean;
@@ -996,6 +1014,61 @@ function clampedToContext(requested: ChatConfig, constrained: ChatConfig): boole
   );
 }
 
+interface DeltaStop {
+  matched: string;
+  cut: string;
+}
+
+/**
+ * Splash streams every request through one `CallbackStreamer`: a request with
+ * stop sequences runs the stream so a match ends decode (`stop_matched` →
+ * `RuntimeCall.stop`). The visible deltas run through the same
+ * `ToolCallTagBuffer` → `StopSequenceBuffer` order as the streaming handler.
+ * A stream that ends without a done event (an abort) rejects like the sync
+ * path.
+ */
+async function collectStoppedTurn(
+  stream: AsyncGenerator<ChatStreamEvent>,
+  stopSequences: string[],
+  stop: (committedText: string) => boolean,
+): Promise<{ result: ChatResult; deltaStop: DeltaStop | null }> {
+  const tagBuffer = new ToolCallTagBuffer();
+  const stopBuffer = new StopSequenceBuffer(stopSequences);
+  let released = '';
+  let accumulatedVisible = '';
+  let deltaStop: DeltaStop | null = null;
+  for await (const event of stream) {
+    if (event.done) {
+      const text = selectCommittedStreamText(event.text, accumulatedVisible, event.textAuthoritative);
+      const result: ChatResult = {
+        text,
+        toolCalls: event.toolCalls.slice(),
+        thinking: event.thinking ?? undefined,
+        thinkingEnabled: event.thinkingEnabled,
+        numTokens: event.numTokens,
+        promptTokens: event.promptTokens,
+        reasoningTokens: event.reasoningTokens,
+        finishReason: event.finishReason,
+        rawText: event.rawText !== '' ? event.rawText : text,
+        cachedTokens: event.cachedTokens ?? 0,
+        performance: event.performance,
+      };
+      return { result, deltaStop };
+    }
+    if (event.isReasoning === true) continue;
+    accumulatedVisible += event.text;
+    if (deltaStop !== null) continue;
+    const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
+    const pushed = stopBuffer.push(tagFound ? cleanPrefix : safeText);
+    released += pushed.safeText;
+    if (pushed.matched !== null) {
+      deltaStop = { matched: pushed.matched, cut: released };
+      stop(released);
+    }
+  }
+  throw new Error('chat session cancelled');
+}
+
 /** Prime a session with the full history and run a single turn. */
 async function runSessionNonStreaming(
   session: ChatSession<SessionCapableModel>,
@@ -1003,6 +1076,7 @@ async function runSessionNonStreaming(
   config: ChatConfig,
   resetNativeCache: boolean,
   signal?: AbortSignal,
+  stopSequences: string[] = [],
 ): Promise<MessagesNonStreamingOutcome> {
   // Dual-branch reset gated by the caller's native-cache policy:
   //
@@ -1039,7 +1113,17 @@ async function runSessionNonStreaming(
   }
   session.primeHistory(messages);
   const initialTurns = session.turns;
-  const result = await session.startFromHistory(constrainedConfig, { signal });
+  let result: ChatResult;
+  let deltaStop: DeltaStop | null = null;
+  if (stopSequences.length === 0) {
+    result = await session.startFromHistory(constrainedConfig, { signal });
+  } else {
+    ({ result, deltaStop } = await collectStoppedTurn(
+      session.startFromHistoryStream(constrainedConfig, signal),
+      stopSequences,
+      (cut) => session.stop(cut),
+    ));
+  }
   // Mirror the streaming-side dual-gate (`streamResult.ok &&
   // outcome.wasCommitted()`) and the sibling `/v1/responses` adopt
   // gate. `ChatSession.startFromHistory` advances `turnCount`
@@ -1050,7 +1134,7 @@ async function runSessionNonStreaming(
   // `chat_session_start_sync` with `Ok(finish_reason="error")` cannot
   // silently poison the warm slot.
   const committed = session.turns > initialTurns && result.finishReason !== 'error';
-  return { result, committed, outputClampedToContext: clampedToContext(config, constrainedConfig) };
+  return { result, deltaStop, committed, outputClampedToContext: clampedToContext(config, constrainedConfig) };
 }
 
 /**
@@ -1063,7 +1147,9 @@ interface MessagesStreamingOutcome {
   stream: AsyncGenerator<ChatStreamEvent>;
   wasCommitted: () => boolean;
   /** Filled while the native stream runs; read by the progress ping. */
-  progress: ChatStreamProgressRef;
+  control: ChatStreamControl;
+  /** Ends the turn at the running step and commits `committedText`. */
+  stop: (committedText: string) => boolean;
   /** The context window, not the request's limit, set the output budget. */
   outputClampedToContext: boolean;
 }
@@ -1093,11 +1179,12 @@ async function runSessionStreaming(
   }
   session.primeHistory(messages);
   const initialTurns = session.turns;
-  const progress: ChatStreamProgressRef = { read: null };
+  const control: ChatStreamControl = { read: null, stop: null };
   return {
-    stream: session.startFromHistoryStream(constrainedConfig, signal, progress),
+    stream: session.startFromHistoryStream(constrainedConfig, signal, control),
     wasCommitted: () => session.turns > initialTurns,
-    progress,
+    control,
+    stop: (committedText) => session.stop(committedText),
     outputClampedToContext: clampedToContext(config, constrainedConfig),
   };
 }
@@ -1652,7 +1739,8 @@ export async function handleCreateMessage(
                 stopSequences,
                 outcome.outputClampedToContext,
                 serverTiming,
-                outcome.progress,
+                outcome.control,
+                outcome.stop,
               );
               // Warm-slot adopt/drop only applies to the non-paged
               // path. On the paged path the JS-side warm slot plays no
@@ -1707,7 +1795,14 @@ export async function handleCreateMessage(
               // disconnect-aware skip inside `handleNonStreaming` /
               // `endJson` remains the last line of defense for a
               // disconnect racing the final flush.
-              const outcome = await runSessionNonStreaming(session, messages, config, resetNativeCache, streamSignal);
+              const outcome = await runSessionNonStreaming(
+                session,
+                messages,
+                config,
+                resetNativeCache,
+                streamSignal,
+                stopSequences,
+              );
               const result = outcome.result;
               // Re-classify the `X-Session-Cache` header.
               //
@@ -1746,6 +1841,7 @@ export async function handleCreateMessage(
                 stopSequences,
                 outcome.outputClampedToContext,
                 serverTiming,
+                outcome.deltaStop,
               );
               // Non-paged success: adopt the warm slot only when the
               // dispatch actually committed. Mirrors the streaming-side

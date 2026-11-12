@@ -21,7 +21,7 @@
  */
 import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
 import { ChatSession, ContextCapacityError, contextLane, type SessionCapableModel } from '@mlx-node/lm';
-import type { ChatStreamEvent, ChatStreamFinal } from '@mlx-node/lm';
+import type { ChatStreamControl, ChatStreamEvent, ChatStreamFinal } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../../packages/server/src/chat-session-warm-reuse.js';
@@ -3230,6 +3230,85 @@ describe('ChatSession', () => {
       session.primeHistory([{ role: 'user', content: 'describe', images: [img] }]);
       for await (const _e of session.startFromHistoryStream()) void _e;
       expect(session.hasImages).toBe(true);
+    });
+
+    /**
+     * A fake native stream: " w1" .. " w19", " HALT" at token 20, then words
+     * until its control's `stop` lands, one more word (the step in flight),
+     * and a done with the full text and a finished tool call.
+     */
+    function makeStoppableModel() {
+      const mock = makeMockModel();
+      let stops = 0;
+      const chatStreamSessionStart = vi.fn(async function* (
+        _messages: ChatMessage[],
+        _config?: ChatConfig | null,
+        _signal?: AbortSignal,
+        control?: ChatStreamControl,
+      ): AsyncGenerator<ChatStreamEvent> {
+        if (control != null) {
+          control.stop = () => {
+            stops += 1;
+            return true;
+          };
+        }
+        let text = '';
+        for (let i = 1; i <= 32_000; i += 1) {
+          const word = i === 20 ? ' HALT' : ` w${i}`;
+          text += word;
+          yield { text: word, done: false };
+          if (stops > 0) {
+            text += ' over';
+            yield { text: ' over', done: false };
+            break;
+          }
+        }
+        yield { ...finalChunkWithSingleToolCall(text, 'call_1'), numTokens: text.split(' ').length - 1 };
+      });
+      const model: SessionCapableModel = { ...mock.model, chatStreamSessionStart };
+      return { ...mock, model, chatStreamSessionStart, stops: () => stops };
+    }
+
+    async function stoppedTurn() {
+      const fake = makeStoppableModel();
+      const session = new ChatSession(fake.model);
+      session.primeHistory([{ role: 'user', content: 'count' }]);
+      let visible = '';
+      let cut: string | null = null;
+      const events: ChatStreamEvent[] = [];
+      for await (const event of session.startFromHistoryStream()) {
+        events.push(event);
+        if (event.done) continue;
+        if (cut === null && event.text === ' HALT') {
+          cut = visible;
+          expect(session.stop(cut)).toBe(true);
+        }
+        visible += event.text;
+      }
+      return { fake, session, cut: cut!, events };
+    }
+
+    // Splash `stop_matched` → `RuntimeCall.stop`; the reply ends at the match.
+    // Mutation: the stopped turn commits the native full text.
+    it('a stopped turn commits the text up to the match', async () => {
+      const { fake, session, cut, events } = await stoppedTurn();
+      expect(fake.stops()).toBe(1);
+      expect(events.filter((e) => !e.done).length).toBe(21);
+      const done = events[events.length - 1] as ChatStreamFinal;
+      expect(done).toMatchObject({ done: true, text: cut, finishReason: 'stop', toolCalls: [] });
+      const history = (session as unknown as { history: ChatMessage[] }).history;
+      expect(history[history.length - 1]).toEqual({ role: 'assistant', content: cut, thinkingEnabled: true });
+      expect(session.turns).toBe(1);
+      expect(session.stop('again')).toBe(false);
+    });
+
+    // Native history holds the tokens decoded past the cut.
+    // Mutation: `needsFullReplay` stays false; the next send continues.
+    it('a stopped turn replays the full history on the next send', async () => {
+      const { fake, session } = await stoppedTurn();
+      await session.send('next');
+      expect(fake.chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(fake.chatSessionContinue).not.toHaveBeenCalled();
     });
   });
 

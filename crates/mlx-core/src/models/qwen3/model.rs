@@ -326,6 +326,13 @@ impl QwenStepExecutor<'_> {
             || error.reason.contains("failed to record sequence")
             || error.reason.contains("paged cache capacity");
         turn.payload.failure = Some(error);
+        Self::end_row(turn, row)
+    }
+
+    fn end_row(
+        turn: &mut TurnState<QwenScheduledTurn>,
+        row: &engine::scheduler::StepRow,
+    ) -> RowStepResult {
         turn.payload.profiler.snapshot_memory_after();
         turn.payload.profiler.report();
         RowStepResult {
@@ -503,11 +510,16 @@ impl QwenStepExecutor<'_> {
             match row.kind {
                 StepKind::Prefill => {
                     if row.cancel_snapshot {
-                        results[plan_index] = Some(Self::fail(
-                            turn,
-                            row,
-                            Error::from_reason(engine::session::CHAT_SESSION_CANCELLED),
-                        ));
+                        results[plan_index] =
+                            Some(if engine::hybrid_scheduler::stop_vacates(turn) {
+                                Self::end_row(turn, row)
+                            } else {
+                                Self::fail(
+                                    turn,
+                                    row,
+                                    Error::from_reason(engine::session::CHAT_SESSION_CANCELLED),
+                                )
+                            });
                         continue;
                     }
                     let start = row.token_start as usize;
@@ -5356,6 +5368,7 @@ mod tests {
             streamed_text_len: 0,
             last_is_reasoning: enabled,
             failure: None,
+            vacated_stop: false,
             allocation_failed: false,
             preemption_replay: None,
             requested_tokens: engine::scheduler::scheduled_materialized_tokens(
@@ -5471,6 +5484,59 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn ragged_scheduled_thinking_budgets_apply_before_prefill_and_decode_tokens() {
         assert_scheduled_thinking_budgets(true);
+    }
+
+    /// Splash `Engine::stop` on a lane that is not decoding: a stop that
+    /// reaches a ragged prefill row of a turn that already generated tokens
+    /// (a replay after preemption) ends it as a completion, not as the
+    /// cancelled error.
+    ///
+    /// Mutation: the ragged prefill row ignores the stop; the turn fails.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_stop_on_a_ragged_prefill_row_ends_as_a_completion() {
+        use crate::engine::scheduler::{Scheduler, SchedulerAction};
+
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            assert!(!crate::test_support::metal_required());
+            return;
+        }
+        let mut inner = match super::Qwen3Inner::new(paged_tiny_config(Some(true))) {
+            Ok(inner) => inner,
+            Err(error) if crate::test_support::metal_device_absent(&error.reason) => return,
+            Err(error) => panic!("construct scheduled stop fixture: {error}"),
+        };
+        cast_paged_inner_to_bf16(&mut inner);
+        let (plumbing, _rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let mut turn = scheduled_thinking_budget_turn(&mut inner, 10, None, false);
+        turn.payload.response =
+            engine::hybrid_scheduler::ScheduledReply::Stream(plumbing.stream_tx.clone());
+        turn.payload.generated_tokens = vec![0, 0];
+        turn.cancelled = Some(plumbing.cancelled.clone());
+        let mut scheduler = Scheduler::<_, (), ()>::new(1, 12).unwrap();
+        scheduler.enqueue_turn(turn).unwrap();
+        let mut executor = QwenStepExecutor {
+            inner: &mut inner,
+            ragged_step: true,
+        };
+        let first = scheduler.drive_once(&mut executor).unwrap();
+        assert!(matches!(
+            first,
+            SchedulerAction::Stepped { ref completed, .. } if completed.is_empty()
+        ));
+        plumbing.handle.stop();
+        let SchedulerAction::Stepped { completed, .. } =
+            scheduler.drive_once(&mut executor).unwrap()
+        else {
+            panic!("the stopped prefill row did not step");
+        };
+        let turn = completed
+            .into_iter()
+            .next()
+            .expect("the stopped turn did not end");
+        assert!(turn.payload.failure.is_none(), "{:?}", turn.payload.failure);
+        assert!(turn.payload.vacated_stop);
+        assert_eq!(turn.payload.finish_reason, "cancelled");
     }
 
     /// Explicit opt-out (`Some(false)`) must NOT allocate the block-paged

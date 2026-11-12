@@ -265,6 +265,7 @@ pub struct ChatStreamChunk {
 #[napi]
 pub struct ChatStreamHandle {
     pub(crate) cancelled: Arc<AtomicBool>,
+    pub(crate) stop: Arc<AtomicBool>,
     pub(crate) progress: Arc<crate::engine::progress::TurnProgress>,
 }
 
@@ -272,7 +273,17 @@ pub struct ChatStreamHandle {
 impl ChatStreamHandle {
     #[napi]
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Relaxed);
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Splash `RuntimeCall.stop` / `Engine::stop`: the turn ends at the step
+    /// it is running, like a cancel, and finishes as a completion (`"stop"`)
+    /// when it generated tokens. The stop bit is stored before the cancel
+    /// flag the decode loops read.
+    #[napi]
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.cancelled.store(true, Ordering::Release);
     }
 
     /// Snapshot of the turn's prefill/decode progress.

@@ -36,6 +36,15 @@ fn send_init_result<T>(
 pub struct StreamTx<T> {
     inner: tokio::sync::mpsc::Sender<napi::Result<T>>,
     progress: Option<std::sync::Arc<crate::engine::progress::TurnProgress>>,
+    stop: Option<StopWatch>,
+}
+
+/// The request's cancel flag and the stop bit `ChatStreamHandle::stop` sets
+/// before it.
+#[derive(Debug, Clone)]
+struct StopWatch {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<T> Clone for StreamTx<T> {
@@ -43,6 +52,7 @@ impl<T> Clone for StreamTx<T> {
         Self {
             inner: self.inner.clone(),
             progress: self.progress.clone(),
+            stop: self.stop.clone(),
         }
     }
 }
@@ -52,6 +62,22 @@ impl<T> StreamTx<T> {
         &self,
     ) -> Option<&std::sync::Arc<crate::engine::progress::TurnProgress>> {
         self.progress.as_ref()
+    }
+
+    pub(crate) fn watch_stop(
+        &mut self,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        self.stop = Some(StopWatch { cancelled, stop });
+    }
+
+    /// The turn was ended by `ChatStreamHandle::stop`, not by a cancel.
+    pub(crate) fn stop_requested(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.stop.as_ref().is_some_and(|watch| {
+            watch.cancelled.load(Ordering::Acquire) && watch.stop.load(Ordering::Relaxed)
+        })
     }
 
     pub fn send(
@@ -80,6 +106,7 @@ pub fn stream_channel<T>(
         StreamTx {
             inner: tx,
             progress: None,
+            stop: None,
         },
         rx,
     )
