@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { ggufArchitecture } from '@mlx-node/core';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { readGgufArchitecture, readGgufHeader } from '../src/gguf-metadata.js';
+import { readGgufArchitecture, readGgufHeader, readGgufSourceArchitecture } from '../src/gguf-metadata.js';
 import { detectModelType } from '../src/model-detection.js';
 
 function u32(value: number): Buffer {
@@ -105,6 +105,22 @@ describe('native-free GGUF metadata', () => {
   ])('rejects %s without allocation or unbounded reads', async (_name, data) => {
     writeFileSync(path, data);
     await expect(readGgufArchitecture(path)).rejects.toThrow();
+  });
+
+  it('reads a skipped array in discovery without holding it', async () => {
+    const ignored = 32 * 1024 * 1024;
+    const bytes = header([
+      entry('ignored', 9, Buffer.concat([u32(0), u64(ignored), Buffer.alloc(ignored)])),
+      architecture(),
+      entry('trailing-metadata', 8, str('more')),
+    ]);
+    let requested = 0;
+    const read = async (position: number, length: number) => {
+      requested += length;
+      return bytes.subarray(position, position + length);
+    };
+    await expect(readGgufSourceArchitecture(read, bytes.length)).resolves.toBe('qwen35');
+    expect(requested).toBeLessThan(1024 * 1024);
   });
 
   it.skipIf(process.platform === 'win32')('refuses FIFO metadata files without blocking discovery', async () => {

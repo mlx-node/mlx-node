@@ -27,23 +27,19 @@ const HUB_READ_BYTES = 8 * 1024 * 1024;
 /** `length` bytes of the source from `position` (fewer only at its end). */
 export type GgufByteSource = (position: number, length: number) => Promise<Uint8Array>;
 
-/**
- * Sequential header cursor over a byte source. Every byte from 0 to the
- * furthest one read is kept, so the header can be returned as read; skipping
- * an array advances the cursor without reading it until a later read needs
- * the bytes after it.
- */
-class HeaderReader {
-  private readonly chunks: Uint8Array[] = [];
-  private fetched = 0;
+/** Sequential header cursor over a byte source; `load` decides what is kept. */
+abstract class HeaderCursor {
   position = 0;
 
   constructor(
-    private readonly read: GgufByteSource,
-    private readonly size: number,
-    private readonly chunk: number,
+    protected readonly read: GgufByteSource,
+    protected readonly size: number,
+    protected readonly chunk: number,
     private readonly limit = Number.POSITIVE_INFINITY,
   ) {}
+
+  /** Bytes `[position, position + length)`, already bounds-checked by `skip`. */
+  protected abstract load(position: number, length: number): Promise<Uint8Array>;
 
   skip(length: number): void {
     if (!Number.isSafeInteger(length) || length < 0 || length > this.size - this.position) {
@@ -53,37 +49,11 @@ class HeaderReader {
     if (this.position > this.limit) throw new Error(`GGUF header exceeds ${this.limit} bytes`);
   }
 
-  /** Reads until every byte before `end` is held. */
-  async fill(end: number): Promise<void> {
-    while (this.fetched < end) {
-      const length = Math.min(Math.max(this.chunk, end - this.fetched), this.size - this.fetched);
-      const bytes = await this.read(this.fetched, length);
-      if (bytes.length === 0) throw new Error('Truncated GGUF metadata');
-      this.chunks.push(bytes);
-      this.fetched += bytes.length;
-    }
-  }
-
-  /** Bytes `[start, end)` of what was read. */
-  slice(start: number, end: number): Uint8Array {
-    const result = new Uint8Array(end - start);
-    let at = 0;
-    for (const bytes of this.chunks) {
-      const from = Math.max(start - at, 0);
-      const to = Math.min(end - at, bytes.length);
-      if (from < to) result.set(bytes.subarray(from, to), at + from - start);
-      at += bytes.length;
-      if (at >= end) break;
-    }
-    return result;
-  }
-
   async bytes(length: number): Promise<Buffer> {
     const position = this.position;
     this.skip(length);
     if (length > MAX_GGUF_LENGTH) throw new Error('GGUF string exceeds maximum length');
-    await this.fill(position + length);
-    return Buffer.from(this.slice(position, position + length));
+    return Buffer.from(await this.load(position, length));
   }
 
   async u32(): Promise<number> {
@@ -114,6 +84,67 @@ class HeaderReader {
     if (elementSize !== undefined) return this.skip(count * elementSize);
     if (element !== 8 && element !== 9) throw new Error('Unsupported GGUF array element type');
     for (let index = 0; index < count; index++) await this.skipValue(element, depth + 1);
+  }
+}
+
+/** Holds one window of `chunk` bytes: a skipped array is never read or kept. */
+class WindowReader extends HeaderCursor {
+  private window: Uint8Array = new Uint8Array(0);
+  private start = 0;
+
+  protected async load(position: number, length: number): Promise<Uint8Array> {
+    const end = position + length;
+    if (position < this.start || end > this.start + this.window.length) {
+      const stop = Math.min(position + Math.max(this.chunk, length), this.size);
+      const parts: Uint8Array[] = [];
+      let at = position;
+      while (at < stop) {
+        const bytes = await this.read(at, stop - at);
+        if (bytes.length === 0) break;
+        parts.push(bytes);
+        at += bytes.length;
+      }
+      if (at < end) throw new Error('Truncated GGUF metadata');
+      this.window = parts.length === 1 ? parts[0] : Buffer.concat(parts);
+      this.start = position;
+    }
+    return this.window.subarray(position - this.start, end - this.start);
+  }
+}
+
+/** Keeps every byte from 0 to the furthest one read, so the header can be returned as read. */
+class HeaderReader extends HeaderCursor {
+  private readonly chunks: Uint8Array[] = [];
+  private fetched = 0;
+
+  /** Reads until every byte before `end` is held. */
+  async fill(end: number): Promise<void> {
+    while (this.fetched < end) {
+      const length = Math.min(Math.max(this.chunk, end - this.fetched), this.size - this.fetched);
+      const bytes = await this.read(this.fetched, length);
+      if (bytes.length === 0) throw new Error('Truncated GGUF metadata');
+      this.chunks.push(bytes);
+      this.fetched += bytes.length;
+    }
+  }
+
+  /** Bytes `[start, end)` of what was read. */
+  slice(start: number, end: number): Uint8Array {
+    const result = new Uint8Array(end - start);
+    let at = 0;
+    for (const bytes of this.chunks) {
+      const from = Math.max(start - at, 0);
+      const to = Math.min(end - at, bytes.length);
+      if (from < to) result.set(bytes.subarray(from, to), at + from - start);
+      at += bytes.length;
+      if (at >= end) break;
+    }
+    return result;
+  }
+
+  protected async load(position: number, length: number): Promise<Uint8Array> {
+    await this.fill(position + length);
+    return this.slice(position, position + length);
   }
 }
 
@@ -161,28 +192,37 @@ export async function readGgufArchitecture(path: string): Promise<string> {
   try {
     const info = await file.stat();
     if (!info.isFile()) throw new Error('GGUF path must be a regular file');
-    const reader = new HeaderReader(fileSource(file), info.size, 64 * 1024);
-    if ((await reader.bytes(4)).toString() !== 'GGUF') throw new Error('Not a GGUF file');
-    if ((await reader.u32()) < 3) throw new Error('Unsupported GGUF version (only v3+ supported)');
-    await reader.u64(); // Tensor count: discovery only needs the metadata section.
-    const count = await reader.u64();
-    let architecture: string | undefined;
-    const keys = new Set<string>();
-    for (let index = 0; index < count; index++) {
-      const key = await reader.string();
-      if (keys.has(key)) throw new Error(`duplicate GGUF metadata key: ${key}`);
-      keys.add(key);
-      const type = await reader.u32();
-      if (key === 'general.architecture') {
-        architecture = type === 8 ? await reader.string() : undefined;
-        if (type !== 8) await reader.skipValue(type);
-      } else {
-        await reader.skipValue(type);
-      }
-    }
-    if (!architecture) throw new Error('GGUF does not declare a non-empty general.architecture');
-    return architecture;
+    return await readGgufSourceArchitecture(fileSource(file), info.size);
   } finally {
     await file.close();
   }
+}
+
+/** `general.architecture` of a GGUF source, read through one `chunk`-byte window. */
+export async function readGgufSourceArchitecture(
+  read: GgufByteSource,
+  size: number,
+  chunk = 64 * 1024,
+): Promise<string> {
+  const reader = new WindowReader(read, size, chunk);
+  if ((await reader.bytes(4)).toString() !== 'GGUF') throw new Error('Not a GGUF file');
+  if ((await reader.u32()) < 3) throw new Error('Unsupported GGUF version (only v3+ supported)');
+  await reader.u64(); // Tensor count: discovery only needs the metadata section.
+  const count = await reader.u64();
+  let architecture: string | undefined;
+  const keys = new Set<string>();
+  for (let index = 0; index < count; index++) {
+    const key = await reader.string();
+    if (keys.has(key)) throw new Error(`duplicate GGUF metadata key: ${key}`);
+    keys.add(key);
+    const type = await reader.u32();
+    if (key === 'general.architecture') {
+      architecture = type === 8 ? await reader.string() : undefined;
+      if (type !== 8) await reader.skipValue(type);
+    } else {
+      await reader.skipValue(type);
+    }
+  }
+  if (!architecture) throw new Error('GGUF does not declare a non-empty general.architecture');
+  return architecture;
 }
