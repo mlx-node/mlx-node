@@ -1192,7 +1192,9 @@ fn sparse_moe_functional(
 
     // Top-k selection via argpartition
     let top_indices_full = router_weights.argpartition(-k, Some(-1))?;
-    let top_indices = top_indices_full.slice_axis(1, num_exp - k as i64, num_exp)?;
+    let top_indices = top_indices_full
+        .slice_axis(1, num_exp - k as i64, num_exp)?
+        .stop_gradient()?;
     let scores = router_weights.take_along_axis(&top_indices, -1)?;
 
     // Normalize top-k weights
@@ -1215,9 +1217,6 @@ fn sparse_moe_functional(
 
     // Expand x for gather_mm: [ne, D] -> [ne, 1, 1, D]
     let x_expanded = x_flat.reshape(&[ne, 1, 1, hidden_size])?;
-
-    // stop_gradient on indices (training: don't differentiate through discrete index selection)
-    let top_indices = top_indices.stop_gradient()?;
 
     // Sort optimization (same threshold as stateful SwitchGLU in switch_glu.rs)
     let do_sort = top_indices.size()? >= 64;
@@ -1984,5 +1983,136 @@ mod chunked_lm_head_tests {
             // Log probs should be <= 0
             assert!(v <= 0.0, "Log prob at {} should be <= 0, got {}", i, v);
         }
+    }
+}
+
+#[cfg(test)]
+mod sparse_moe_autograd_tests {
+    use super::*;
+    use crate::array::DType;
+
+    const HIDDEN: i64 = 16;
+    const EXPERTS: i64 = 4;
+    const TOP_K: i32 = 2;
+    const MOE_INTER: i64 = 8;
+    const SHARED_INTER: i64 = 8;
+
+    fn tiny_moe_config() -> Qwen3_5MoeConfig {
+        Qwen3_5MoeConfig {
+            vocab_size: 32,
+            hidden_size: HIDDEN as i32,
+            num_layers: 1,
+            num_heads: 2,
+            num_kv_heads: 1,
+            intermediate_size: MOE_INTER as i32,
+            rms_norm_eps: 1e-6,
+            head_dim: 8,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 64,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 2,
+            linear_num_key_heads: 1,
+            linear_key_head_dim: 8,
+            linear_value_head_dim: 8,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000.0,
+            num_experts: EXPERTS as i32,
+            num_experts_per_tok: TOP_K,
+            decoder_sparse_step: 1,
+            shared_expert_intermediate_size: Some(SHARED_INTER as i32),
+            moe_intermediate_size: Some(MOE_INTER as i32),
+            norm_topk_prob: true,
+            mlp_only_layers: None,
+            paged_cache_memory_mb: None,
+            paged_cache_initial_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: Some(false),
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+            qwen35_gguf_gdn_layout: None,
+            kv_format: None,
+        }
+    }
+
+    fn param_shapes() -> Vec<(&'static str, Vec<i64>)> {
+        vec![
+            ("gate.weight", vec![EXPERTS, HIDDEN]),
+            (
+                "switch_mlp.gate_proj.weight",
+                vec![EXPERTS, MOE_INTER, HIDDEN],
+            ),
+            (
+                "switch_mlp.up_proj.weight",
+                vec![EXPERTS, MOE_INTER, HIDDEN],
+            ),
+            (
+                "switch_mlp.down_proj.weight",
+                vec![EXPERTS, HIDDEN, MOE_INTER],
+            ),
+            ("shared_expert.gate_proj.weight", vec![SHARED_INTER, HIDDEN]),
+            ("shared_expert.up_proj.weight", vec![SHARED_INTER, HIDDEN]),
+            ("shared_expert.down_proj.weight", vec![HIDDEN, SHARED_INTER]),
+            ("shared_expert_gate.weight", vec![1, HIDDEN]),
+        ]
+    }
+
+    fn max_abs(a: &MxArray) -> f32 {
+        let m = a.abs().unwrap().max(None, None).unwrap();
+        m.eval();
+        m.to_float32().unwrap()[0]
+    }
+
+    /// Runs `value_and_grad` over every sparse-MoE parameter for `seq_len`
+    /// tokens. `seq_len * TOP_K < 64` takes the unsorted `gather_mm` branch,
+    /// `>= 64` the sorted one; both must differentiate.
+    fn assert_moe_grads(seq_len: i64) {
+        unsafe { mlx_sys::mlx_seed(0x5EED_0E00u64) };
+        let names: Vec<String> = param_shapes()
+            .iter()
+            .map(|(n, _)| format!("mlp.{n}"))
+            .collect();
+        let values: Vec<MxArray> = param_shapes()
+            .iter()
+            .map(|(_, s)| MxArray::random_normal(s, 0.0, 0.5, Some(DType::Float32)).unwrap())
+            .collect();
+        let x =
+            MxArray::random_normal(&[1, seq_len, HIDDEN], 0.0, 1.0, Some(DType::Float32)).unwrap();
+        let config = tiny_moe_config();
+
+        let loss_names = names.clone();
+        let (loss, grads) = autograd::value_and_grad(values.iter().collect(), move |p| {
+            let params: HashMap<String, MxArray> =
+                loss_names.iter().cloned().zip(p.iter().cloned()).collect();
+            let y = sparse_moe_functional(&params, &x, "mlp", &config)?;
+            y.square()?.sum(None, None)
+        })
+        .unwrap_or_else(|e| panic!("seq_len={seq_len}: MoE value_and_grad failed: {e}"));
+
+        loss.eval();
+        assert!(loss.to_float32().unwrap()[0].is_finite());
+        assert_eq!(grads.len(), names.len());
+        for (name, g) in names.iter().zip(grads.iter()) {
+            let m = max_abs(g);
+            assert!(m.is_finite(), "seq_len={seq_len}: {name} grad not finite");
+            assert!(m > 0.0, "seq_len={seq_len}: {name} grad is all zero");
+        }
+    }
+
+    /// Mutation: move `top_indices.stop_gradient()` back after the
+    /// `take_along_axis` gather -> MLX throws "[gather_axis] Cannot calculate
+    /// VJP with respect to indices" and value_and_grad returns 0 (red).
+    #[test]
+    fn sparse_moe_value_and_grad_unsorted_branch() {
+        assert_moe_grads(4);
+    }
+
+    #[test]
+    fn sparse_moe_value_and_grad_sorted_branch() {
+        assert_moe_grads(40);
     }
 }

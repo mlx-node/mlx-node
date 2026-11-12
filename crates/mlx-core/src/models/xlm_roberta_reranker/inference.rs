@@ -150,6 +150,11 @@ fn batch_end(pairs: &[Pair], start: usize, policy: &Policy) -> usize {
 }
 impl Model {
     pub fn load(path: &Path, options: Options) -> Result<Self> {
+        // The calling thread runs every forward of this model. NAX GPUs run
+        // f32 GEMMs with more than one row in TF32 under MLX's default, but a
+        // one-row GEMM stays true f32, so an f32 score would depend on the
+        // batch it lands in.
+        array::set_thread_tf32(Some(false));
         let raw: Value = serde_json::from_str(
             &std::fs::read_to_string(path.join("config.json")).map_err(invalid)?,
         )
