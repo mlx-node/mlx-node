@@ -861,6 +861,7 @@ mod tests {
         // 3 a full-attention layer; n_mtp_layers=1. num_experts=4 keeps
         // SparseMoeBlock construction cheap.
         Qwen3_5MoeConfig {
+            rope_scaling: None,
             vocab_size: 1024,
             hidden_size: 64,
             num_layers: 4,

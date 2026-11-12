@@ -432,7 +432,7 @@ impl HybridSchedulerBackend for Qwen35Inner {
     }
 
     fn max_position_embeddings(&self) -> i32 {
-        self.config.max_position_embeddings
+        self.context_cap() as i32
     }
 
     fn recurrent_state_bytes(&self) -> u64 {

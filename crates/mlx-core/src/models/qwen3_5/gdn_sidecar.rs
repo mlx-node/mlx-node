@@ -755,6 +755,7 @@ mod tests {
     /// attention at 3,7. Small GDN dims so a mis-ordered round trip is visible.
     fn config() -> Qwen3_5Config {
         Qwen3_5Config {
+            rope_scaling: None,
             qwen35_gguf_gdn_layout: None,
             kv_format: None,
             vocab_size: 32,

@@ -816,6 +816,12 @@ fn qwen3_5_attention_functional(
     prefix: &str,
     config: &Qwen3_5Config,
 ) -> Result<MxArray> {
+    if config.scaling().yarn() {
+        return Err(Error::from_reason(
+            "Qwen3.5 training: the model was loaded with YaRN (maxContextTokens past the native \
+             window); load it without maxContextTokens to train",
+        ));
+    }
     let batch = x.shape_at(0)?;
     let seq_len = x.shape_at(1)?;
     let num_heads = config.num_heads;

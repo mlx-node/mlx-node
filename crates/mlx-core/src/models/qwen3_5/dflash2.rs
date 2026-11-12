@@ -308,10 +308,6 @@ impl DraftExecutionPolicy {
 }
 
 impl DFlash2Config {
-    pub(crate) fn max_position_embeddings(&self) -> usize {
-        self.max_position_embeddings
-    }
-
     /// Bytes of every layer's BF16 K and V draft window buffers at their
     /// largest capacity (`DraftKvWindow::append`'s cap: window + reserve +
     /// one growth step).
@@ -1949,10 +1945,6 @@ impl DFlash2Model {
         self.compiled.prepared.store(false, Ordering::Relaxed);
     }
 
-    pub(crate) fn max_position_embeddings(&self) -> usize {
-        self.config.max_position_embeddings
-    }
-
     pub(crate) fn validate_target(&self, target: &super::config::Qwen3_5Config) -> Result<()> {
         let invalid_tap = self
             .config
@@ -2397,15 +2389,6 @@ impl DFlash2Model {
         confidence: Option<&mut Option<MxArray>>,
         rng: &mut R,
     ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
-        let query_end = context
-            .logical_len
-            .saturating_add(max_len.saturating_add(1) as i32);
-        if query_end as usize > self.config.max_position_embeddings {
-            return Err(Error::from_reason(format!(
-                "DFlash2 query end {query_end} exceeds trained context {}",
-                self.config.max_position_embeddings
-            )));
-        }
         let ids = parallel_query_ids(anchor, self.config.mask_token_id, max_len);
         let phase_time = std::env::var("MLX_DFLASH2_PHASE_TIME").is_ok();
         let t0 = std::time::Instant::now();
@@ -4293,6 +4276,7 @@ mod tests {
 
     fn three_layer_tiny_draft() -> super::DFlash2Model {
         let target = super::super::config::Qwen3_5Config {
+            rope_scaling: None,
             qwen35_gguf_gdn_layout: None,
             kv_format: None,
             vocab_size: 32,
@@ -5449,6 +5433,48 @@ mod tests {
         fresh.append(&model, &rows(10), 0, &[1; 10]).unwrap();
         let chunk = fresh.project(&model, &rows(9), 10).unwrap();
         assert!(fresh.snapshot_window_at(12, &chunk, &[3; 9]).is_ok());
+    }
+
+    /// Splash bounds the draft by its sliding window only: a proposal past
+    /// the draft's trained context (256 here) runs. Mutation: the
+    /// query-end check back in `propose` → red.
+    #[test]
+    fn draft_proposes_past_its_trained_context() {
+        let mut model = three_layer_tiny_draft();
+        model.config.sliding_window = 8;
+        for layer in &mut model.layers {
+            layer.attention.sliding_window = 8;
+        }
+        assert_eq!(model.config.max_position_embeddings, 256);
+        let embedding = Embedding::from_weight(
+            &MxArray::random_normal(&[32, 64], 0.0, 0.5, Some(DType::BFloat16)).unwrap(),
+        )
+        .unwrap();
+        let mut context = super::DFlash2ContextCache::new(&model.config);
+        context.logical_len = 300;
+        for layer in &mut context.layers {
+            layer.keys = Some(
+                MxArray::random_normal(&[1, 2, 16, 16], 0.0, 0.5, Some(DType::BFloat16)).unwrap(),
+            );
+            layer.values = Some(
+                MxArray::random_normal(&[1, 2, 16, 16], 0.0, 0.5, Some(DType::BFloat16)).unwrap(),
+            );
+            layer.start = 0;
+            layer.end = 7;
+        }
+        model
+            .propose(
+                &embedding,
+                None,
+                &mut context,
+                7,
+                2,
+                0.0,
+                true,
+                None,
+                &mut rand::rng(),
+            )
+            .expect("a proposal past the draft's trained context");
     }
 
     #[test]

@@ -139,6 +139,17 @@ describe('parseServeArgs', () => {
     );
   });
 
+  it('maps --max-context to tokens and rejects a bad count', () => {
+    expect(parseServeArgs(['--max-context', '100K']).maxContextTokens).toBe(102_400);
+    expect(parseServeArgs(['--max-context=1M']).maxContextTokens).toBe(1_000_000);
+    expect(parseServeArgs(['--max-context', 'auto']).maxContextTokens).toBeUndefined();
+    expect('maxContextTokens' in parseServeArgs(['--max-context', 'auto'])).toBe(false);
+    expect('maxContextTokens' in parseServeArgs([])).toBe(false);
+    expect(() => parseServeArgs(['--max-context', '2M'])).toThrow(
+      "--max-context must be 'auto' or a token count up to 1010000, such as 100K or 1M (K = 1024 tokens, M = 1000000 tokens)",
+    );
+  });
+
   it('treats --log-dir as implying --verbose', () => {
     expect(parseServeArgs(['--log-dir', '/tmp/mlx-serve-logs']).logDir).toBe('/tmp/mlx-serve-logs');
   });
@@ -274,6 +285,41 @@ describe('mlx serve — end to end', () => {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
         expect(loads).toEqual([{ maxMemoryBytes: 30_064_771_072 }]);
+        const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
+        added[0]!('SIGINT');
+        for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      },
+    });
+    expect(exitCodes).toEqual([0]);
+  });
+
+  // Mutation: drop `maxContextTokens` from the `createInferenceHost` call → red.
+  it('hands --max-context to the qwen model loader', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const loads: unknown[] = [];
+    const exitCodes: number[] = [];
+    const sigintBefore = new Set(listenersOf('SIGINT'));
+
+    await run(['--port', '0', '--models-dir', modelsDir, '--preload', 'alpha', '--max-context', '100K'], {
+      hostOverrides: {
+        disableStore: true,
+        sweepOrphanTempRoots: false,
+        pagedModelTypes: [],
+        estimateContextWindow: async () => null,
+        loadModel: async (_path: string, options?: unknown) => {
+          loads.push(options);
+          return {} as unknown as LoadableModel;
+        },
+      },
+      exit: (code) => exitCodes.push(code),
+      onReady: async () => {
+        for (let i = 0; i < 200 && loads.length === 0; i++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect(loads).toEqual([{ maxContextTokens: 102_400 }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {

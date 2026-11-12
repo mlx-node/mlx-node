@@ -97,15 +97,15 @@ mod free_released_wiring_tests {
             );
             let outcome = match family {
                 NativeGgufFamily::Qwen35 => {
-                    super::qwen3_5::persistence::load_with_source(&source, None, None, None)
+                    super::qwen3_5::persistence::load_with_source(&source, None, None, None, None)
                         .await
                         .map(drop)
                 }
-                NativeGgufFamily::Qwen35Moe => {
-                    super::qwen3_5_moe::persistence::load_with_source(&source, None, None, None)
-                        .await
-                        .map(drop)
-                }
+                NativeGgufFamily::Qwen35Moe => super::qwen3_5_moe::persistence::load_with_source(
+                    &source, None, None, None, None,
+                )
+                .await
+                .map(drop),
                 NativeGgufFamily::Gemma4 => {
                     super::gemma4::Gemma4Model::load_with_source(&source, None)
                         .await

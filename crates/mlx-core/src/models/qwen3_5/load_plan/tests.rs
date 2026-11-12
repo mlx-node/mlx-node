@@ -155,6 +155,7 @@ fn estimate_matches_the_load_plan() {
             draft_dir: Some(&draft),
             kv_format: None,
             max_memory_bytes: None,
+            max_context: None,
         },
     );
     crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
@@ -246,6 +247,7 @@ fn estimate_follows_the_sym8_flat_pin() {
             draft_dir: None,
             kv_format: None,
             max_memory_bytes: None,
+            max_context: None,
         },
     );
     crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
@@ -296,6 +298,7 @@ fn flat_load_is_planned_under_max_memory() {
                 draft_dir: None,
                 kv_format: None,
                 max_memory_bytes,
+                max_context: None,
             },
         )
     };
@@ -323,6 +326,70 @@ fn flat_load_is_planned_under_max_memory() {
             speculative_window_tokens: None,
             bound: "memory".to_string(),
         }
+    );
+}
+
+/// `--max-context` covers the flat lane like every other lane: on a load
+/// with neither pool nor draft the flat lane is the default turn's, so on
+/// the 4 GiB plan of 45,056 rows a 40,000 cap publishes 40,000 and 45,057
+/// fails with Splash's `ServingRuntime::start` text. Mutation: leave the
+/// flat lane out of `default_turn_window` → red (45,057 is clamped to
+/// 45,056).
+#[test]
+fn max_context_caps_the_flat_lane() {
+    let target = estimate_fixture_dir("flat-cap");
+    let draft = estimate_fixture_dir("flat-cap-draft");
+    write_27b_fixture(&target, &draft);
+    let mut config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
+            .unwrap();
+    config["use_block_paged_cache"] = serde_json::json!(false);
+    std::fs::write(target.join("config.json"), config.to_string()).unwrap();
+    crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| {
+        cell.set(Some(LiveMemory {
+            working_set_bytes: 27 << 30,
+            active_bytes: 0,
+            registered_pool_bytes: 0,
+        }))
+    });
+    let estimate = |max_context| {
+        estimate_qwen35_load(
+            "Qwen3.5",
+            &EstimateInput {
+                asset_dir: &target,
+                moe: false,
+                weight_bytes: 1 << 30,
+                draft_dir: None,
+                kv_format: None,
+                max_memory_bytes: Some(4 << 30),
+                max_context,
+            },
+        )
+    };
+    let capped = estimate(Some(40_000));
+    let at = estimate(Some(45_056));
+    let above = estimate(Some(45_057));
+    crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_dir_all(&draft).unwrap();
+    assert_eq!(
+        capped.expect("estimate").expect("readable device"),
+        Qwen35ContextEstimate {
+            window_tokens: 40_000,
+            speculative_window_tokens: None,
+            bound: "memory".to_string(),
+        }
+    );
+    assert_eq!(
+        at.expect("estimate")
+            .expect("readable device")
+            .window_tokens,
+        45_056
+    );
+    assert_eq!(
+        above.expect_err("above the flat lane").reason,
+        "Qwen3.5: --max-context 45057 exceeds the 45056 tokens the model and --max-memory \
+         allow; omit it or pass at most 45056"
     );
 }
 
@@ -397,4 +464,243 @@ fn audit_counts_this_pools_staging_once() {
         0,
     );
     assert_eq!(flat.other_pool_bytes, others);
+}
+
+const MIB: u64 = 1 << 20;
+
+/// The 27B fixture's estimate at a working set of `working_set` bytes, with
+/// 16,000 MiB of target shards and a 1,357 MiB draft.
+fn estimate_27b(
+    tag: &str,
+    working_set: u64,
+    max_memory_bytes: Option<u64>,
+    max_context: Option<u32>,
+) -> Result<Option<Qwen35ContextEstimate>> {
+    let target = estimate_fixture_dir(tag);
+    let draft = estimate_fixture_dir(&format!("{tag}-draft"));
+    write_27b_fixture(&target, &draft);
+    sparse_file(&draft.join("model.safetensors"), 1_357 * MIB);
+    crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| {
+        cell.set(Some(LiveMemory {
+            working_set_bytes: working_set,
+            active_bytes: 0,
+            registered_pool_bytes: 0,
+        }))
+    });
+    let estimate = estimate_qwen35_load(
+        "Qwen3.5",
+        &EstimateInput {
+            asset_dir: &target,
+            moe: false,
+            weight_bytes: 16_000 * MIB,
+            draft_dir: Some(&draft),
+            kv_format: None,
+            max_memory_bytes,
+            max_context,
+        },
+    );
+    crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_dir_all(&draft).unwrap();
+    estimate
+}
+
+/// The 27B plan at `working_set` with the target served for `max_context`.
+fn plan_27b(tag: &str, working_set: u64, max_context: Option<u32>) -> MemoryPlan {
+    plan_27b_with_draft(tag, working_set, max_context, 262_144)
+}
+
+/// [`plan_27b`] with a draft whose config says `draft_trained` tokens.
+fn plan_27b_with_draft(
+    tag: &str,
+    working_set: u64,
+    max_context: Option<u32>,
+    draft_trained: u32,
+) -> MemoryPlan {
+    let target = estimate_fixture_dir(tag);
+    let draft = estimate_fixture_dir(&format!("{tag}-draft"));
+    write_27b_fixture(&target, &draft);
+    let draft_json = draft.join("config.json");
+    let mut raw_draft: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&draft_json).unwrap()).unwrap();
+    raw_draft["max_position_embeddings"] = serde_json::json!(draft_trained);
+    std::fs::write(&draft_json, raw_draft.to_string()).unwrap();
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
+            .unwrap();
+    let mut config = crate::models::qwen3_5::persistence::parse_config(&raw).unwrap();
+    config.rope_scaling =
+        Some(RopeScaling::served_for("Qwen3.5", 262_144, config.scaling(), max_context).unwrap());
+    let format = config.pin_kv_format(None, DType::BFloat16);
+    let draft_config = crate::models::qwen3_5::dflash2::read_dflash2_config(&draft).unwrap();
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_dir_all(&draft).unwrap();
+    let block_size = config.paged_block_size();
+    let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
+        16,
+        4,
+        256,
+        block_size,
+        mlx_paged_attn::metal::MetalDtype::BFloat16,
+    )
+    .unwrap();
+    let lanes = LoadLanes {
+        config: &config,
+        recurrent_state_bytes: config.recurrent_state_bytes(),
+        pool: Some(PoolGeometry {
+            bytes_per_block,
+            block_size,
+            layers: 16,
+            explicit_mib: None,
+        }),
+        draft: Some(DraftTerms::of(&draft_config, 1_357 * MIB)),
+        format,
+        dtype: DType::BFloat16,
+    };
+    evaluate_qwen35_plan(
+        "Qwen3.5",
+        &lanes,
+        LiveMemory {
+            working_set_bytes: working_set,
+            active_bytes: 17_357 * MIB,
+            registered_pool_bytes: 0,
+        },
+        None,
+    )
+    .expect("load plan")
+}
+
+/// Splash `ServingRuntime::start`: an explicit `--max-context` above the
+/// default turn's lane fails the load with Splash's text, naming what bound
+/// it. Mutation: clamp instead of refuse in `check_max_context` → red.
+#[test]
+fn max_context_above_the_plan_is_refused() {
+    let working_set = 27u64 << 30;
+    let unset = estimate_27b("refuse-unset", working_set, None, None)
+        .unwrap()
+        .unwrap();
+    let plan = unset.speculative_window_tokens.expect("draft lane");
+    let error = estimate_27b("refuse-device", working_set, None, Some(plan + 1)).unwrap_err();
+    assert_eq!(
+        error.reason,
+        format!(
+            "Qwen3.5: --max-context {} exceeds the {plan} tokens the model and this Mac's \
+             memory allow; omit it or pass at most {plan}",
+            plan + 1
+        )
+    );
+    let hard = crate::engine::memory_plan::hard_budget_bytes(working_set, None);
+    let error = estimate_27b("refuse-flag", working_set, Some(hard), Some(plan + 1)).unwrap_err();
+    assert!(
+        error.reason.contains(&format!(
+            "the {plan} tokens the model and --max-memory allow"
+        )),
+        "{}",
+        error.reason
+    );
+    let at = estimate_27b("refuse-at", working_set, None, Some(plan))
+        .unwrap()
+        .unwrap();
+    assert_eq!(at.speculative_window_tokens, Some(plan));
+    assert_eq!(at.window_tokens, unset.window_tokens.min(plan));
+}
+
+/// Gate: a 100K cap publishes 102,400 on both lanes while the plan still
+/// prices the native window. Mutation: publish the lane maximum without
+/// the cap in `estimate_qwen35_load` → red (262,144).
+#[test]
+fn a_100k_cap_gives_window_100k() {
+    let estimate = estimate_27b("cap-100k", 128 << 30, None, Some(102_400))
+        .unwrap()
+        .unwrap();
+    assert_eq!(estimate.window_tokens, 102_400);
+    assert_eq!(estimate.speculative_window_tokens, Some(102_400));
+    let plan = plan_27b("cap-100k-plan", 128 << 30, Some(102_400));
+    assert_eq!(plan.pool.unwrap().lane.window.window, 262_144);
+    assert_eq!(plan.speculative.unwrap().window.window, 262_144);
+}
+
+/// 400K plans the YaRN-served window on both lanes. Mutation: price the
+/// native window in `evaluate_qwen35_plan` → red (262,144, then refused).
+#[test]
+fn four_hundred_k_plans_the_served_window() {
+    let plan = plan_27b("yarn-400k", 128 << 30, Some(409_600));
+    assert_eq!(plan.pool.unwrap().lane.window.window, 409_600);
+    assert_eq!(plan.speculative.unwrap().window.window, 409_600);
+    let estimate = estimate_27b("yarn-400k-estimate", 128 << 30, None, Some(409_600))
+        .unwrap()
+        .unwrap();
+    assert_eq!(estimate.window_tokens, 409_600);
+    assert_eq!(estimate.speculative_window_tokens, Some(409_600));
+    let unset = plan_27b("yarn-unset", 128 << 30, None);
+    assert_eq!(unset.pool.unwrap().lane.window.window, 262_144);
+}
+
+/// The draft's trained context no longer bounds the speculative lane
+/// (Splash `readDraftLayout` never reads it): a draft whose config says
+/// 131,072 tokens leaves the lane at the target's 262,144. Mutation: the
+/// draft's 131,072 back as `trained.min(..)` in `evaluate_qwen35_plan` → red.
+#[test]
+fn speculative_lane_takes_the_target_window() {
+    let plan = plan_27b_with_draft("draft-cap", 128 << 30, None, 131_072);
+    assert_eq!(plan.speculative.unwrap().window.window, 262_144);
+}
+
+/// A load whose device memory is unreadable has no plan, so it serves at
+/// most its native window.
+/// Mutation: accept any context in `check_unplanned_max_context` → red.
+#[test]
+fn unplanned_context_past_native_is_refused() {
+    let target = estimate_fixture_dir("unplanned");
+    let draft = estimate_fixture_dir("unplanned-draft");
+    write_27b_fixture(&target, &draft);
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
+            .unwrap();
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_dir_all(&draft).unwrap();
+    let config = crate::models::qwen3_5::persistence::parse_config(&raw).unwrap();
+    assert!(check_unplanned_max_context("Qwen3.5", &config, Some(262_144)).is_ok());
+    let error = check_unplanned_max_context("Qwen3.5", &config, Some(300_000)).unwrap_err();
+    assert_eq!(
+        error.reason,
+        "Qwen3.5: --max-context 300000 is past the native window of 262144, and this load has \
+         no memory plan to hold it"
+    );
+}
+
+/// With the device unreadable the estimate refuses what the load refuses,
+/// so `/v1/models` never lists a window the load then fails.
+/// Mutation: the estimate returns no estimate without the check → red.
+#[test]
+fn unplanned_estimate_refuses_what_the_load_refuses() {
+    let target = estimate_fixture_dir("unplanned-estimate");
+    let draft = estimate_fixture_dir("unplanned-estimate-draft");
+    write_27b_fixture(&target, &draft);
+    let estimate = |max_context| {
+        estimate_qwen35_load(
+            "Qwen3.5",
+            &EstimateInput {
+                asset_dir: &target,
+                moe: false,
+                weight_bytes: 16_000 << 20,
+                draft_dir: None,
+                kv_format: None,
+                max_memory_bytes: None,
+                max_context,
+            },
+        )
+    };
+    crate::engine::memory_plan::LIVE_MEMORY_UNREADABLE.with(|cell| cell.set(true));
+    let within = estimate(Some(100_000));
+    let past = estimate(Some(300_000));
+    crate::engine::memory_plan::LIVE_MEMORY_UNREADABLE.with(|cell| cell.set(false));
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_dir_all(&draft).unwrap();
+    assert_eq!(within.expect("within native"), None);
+    assert_eq!(
+        past.expect_err("past native without a plan").reason,
+        "Qwen3.5: --max-context 300000 is past the native window of 262144, and this load has \
+         no memory plan to hold it"
+    );
 }

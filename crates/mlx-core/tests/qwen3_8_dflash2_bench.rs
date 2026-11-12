@@ -128,6 +128,7 @@ async fn qwen38_dflash2_perf() {
             draft_model_path: Some(draft),
             kv_format: None,
             max_memory_bytes: None,
+            max_context_tokens: None,
         }),
     )
     .await
@@ -801,6 +802,7 @@ async fn run_restore_case(case: RestoreCase) {
             draft_model_path: Some(draft),
             kv_format: None,
             max_memory_bytes: None,
+            max_context_tokens: None,
         }),
     )
     .await

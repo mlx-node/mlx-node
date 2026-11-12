@@ -121,10 +121,17 @@ pub fn config(store: &Store) -> Result<Config> {
     if head_dim == 0 {
         return Err(Error::from_reason("Invalid GGUF attention head dimension"));
     }
-    text.insert(
-        "rope_parameters".into(),
-        json!({"rope_theta":theta,"partial_rotary_factor":dims as f64/head_dim as f64}),
-    );
+    let mut rope = json!({"rope_theta":theta,"partial_rotary_factor":dims as f64/head_dim as f64});
+    // Splash `GgufImage`: a set `rope.scaling.type` other than `none` is an
+    // already scaled target, which `Config::validate` refuses.
+    if let Some(scaling) = m
+        .get("qwen4exp.rope.scaling.type")
+        .and_then(GgufMetaValue::as_str)
+        .filter(|scaling| *scaling != "none")
+    {
+        rope["rope_type"] = json!(scaling);
+    }
+    text.insert("rope_parameters".into(), rope);
     text.insert(
         "ple_layer_ids".into(),
         json!(

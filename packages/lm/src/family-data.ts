@@ -251,6 +251,12 @@ interface ModelFamilyDataBase {
    */
   readonly acceptsMaxMemory?: true;
   /**
+   * Native `load` accepts `LoadModelOptions.maxContextTokens` (`--max-context`):
+   * every turn holds at most that many tokens, and past the native window the
+   * target's RoPE takes YaRN (Splash `yarnContextTokens`).
+   */
+  readonly acceptsMaxContext?: true;
+  /**
    * Native `load` accepts a matching auxiliary HF checkpoint directory — the
    * original checkpoint supplying qwen4_exp's MTP and vision weights that a
    * GGUF omits. Gates `LoadModelOptions.auxiliaryModelPath` in
@@ -434,6 +440,7 @@ export const MODEL_FAMILY_DATA = [
     acceptsDraftModel: true,
     acceptsKvFormat: true,
     acceptsMaxMemory: true,
+    acceptsMaxContext: true,
     coldRestoreEligible: true,
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen35'],
@@ -454,6 +461,7 @@ export const MODEL_FAMILY_DATA = [
     acceptsDraftModel: true,
     acceptsKvFormat: true,
     acceptsMaxMemory: true,
+    acceptsMaxContext: true,
     coldRestoreEligible: true,
     streamOpts: { recordModelPath: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
@@ -469,6 +477,7 @@ export const MODEL_FAMILY_DATA = [
     match: { rawModelTypes: ['qwen4_exp', 'qwen4_exp_text'] },
     acceptsAuxiliaryModel: true,
     acceptsMaxMemory: true,
+    acceptsMaxContext: true,
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen4exp'],
     ggufDiscovery: { variants: 'all', split: true },

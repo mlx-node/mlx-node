@@ -11,7 +11,8 @@ use crate::array::DType;
 use crate::engine::memory_plan::{
     KvLayout, LaneShape, LiveMemory, MemoryBound, MemoryFootprint, MemoryPlan, PoolInput,
     RESIDENT_ALLOWANCE_TOKENS, SPECULATIVE_SCRATCH_TOKENS, StorePlan, StreamedInputs, StreamedPart,
-    allowance_dynamic_bytes, hard_budget_bytes, plan_streamed_store, table_share_bytes,
+    allowance_dynamic_bytes, check_max_context, hard_budget_bytes, plan_streamed_store,
+    table_share_bytes,
 };
 use crate::transformer::KvFormat;
 
@@ -53,13 +54,44 @@ pub(super) fn transient(c: &Config, window: u32) -> u64 {
     prefill_scratch(c, super::MAX_PREFILL_CHUNK, window as usize)
 }
 
+/// Splash `servedFor` on `c`: YaRN past the native window, with the
+/// startup line.
+pub(super) fn serve_context(label: &str, c: &mut Config, max_context: Option<u32>) -> Result<()> {
+    c.rope_scaling = crate::nn::rope_scaling::RopeScaling::served_for(
+        label,
+        c.max_position_embeddings.min(u32::MAX as usize) as u32,
+        c.rope_scaling,
+        max_context,
+    )?;
+    if c.rope_scaling.yarn() {
+        tracing::info!(
+            "{label} {}",
+            c.rope_scaling.startup_line(c.served_context_tokens())
+        );
+    }
+    Ok(())
+}
+
+/// Splash `ServingRuntime::start` on the AR lane, the default turn.
+pub(super) fn check_context(
+    label: &str,
+    plan: &MemoryPlan,
+    max_context: Option<u32>,
+) -> Result<()> {
+    match plan.pool.as_ref() {
+        Some(pool) => check_max_context(pool.lane.window, plan.bound, max_context)
+            .map_err(|error| Error::from_reason(error.message(label))),
+        None => Ok(()),
+    }
+}
+
 /// The pool lane: one cell held beside the pool, priced pages from the
-/// runway, the trained window.
+/// runway, the served window.
 pub(super) fn pool_input<'a>(c: &Config, transient: &'a dyn Fn(u32) -> u64) -> PoolInput<'a> {
     let layout = flash_next_layout(c);
     PoolInput {
         shape: LaneShape {
-            trained: c.max_position_embeddings.min(u32::MAX as usize) as u32,
+            trained: c.served_context_tokens(),
             lane_bytes: row_state_bytes(c),
             layout,
             scratch_rows: SPECULATIVE_SCRATCH_TOKENS,
@@ -112,15 +144,16 @@ pub(super) struct StoreDecision {
 }
 
 /// Splash `planStreamedMemory` for a target that cannot spill: the KV
-/// allowance of `min(trained, kResidentAllowanceTokens)` on every lane the
-/// load serves (the AR lane, and the MTP lane with MTP weights) comes before
-/// the experts.
+/// allowance of the requested context, else `min(trained,
+/// kResidentAllowanceTokens)`, on every lane the load serves (the AR lane,
+/// and the MTP lane with MTP weights) comes before the experts.
 pub(super) fn plan_store(
     label: &str,
     c: &Config,
     inventory: &LoadInventory,
     live: LiveMemory,
     max_memory: Option<u64>,
+    max_context: Option<u32>,
     has_mtp: bool,
 ) -> Result<StoreDecision> {
     let transient = |window: u32| transient(c, window);
@@ -129,8 +162,8 @@ pub(super) fn plan_store(
     let ar = |dynamic: u64| pool.plan_at(dynamic).lane.window.maximum();
     let mtp = |dynamic: u64| pool.plan_at(dynamic).window_with(&draft);
     let lanes: Vec<&dyn Fn(u64) -> u32> = if has_mtp { vec![&ar, &mtp] } else { vec![&ar] };
-    let allowance =
-        allowance_dynamic_bytes(&lanes, pool.shape.trained.min(RESIDENT_ALLOWANCE_TOKENS));
+    let automatic = pool.shape.trained.min(RESIDENT_ALLOWANCE_TOKENS);
+    let allowance = allowance_dynamic_bytes(&lanes, max_context.unwrap_or(automatic));
     let runway_tokens = (pool.shape.layout.runway_pages()
         * crate::engine::memory_plan::KV_PAGE_TOKENS)
         .min(u64::from(u32::MAX)) as u32;
@@ -260,9 +293,10 @@ pub(super) fn estimate(
     inventory: &LoadInventory,
     live: LiveMemory,
     max_memory: Option<u64>,
+    max_context: Option<u32>,
     has_mtp: bool,
 ) -> Result<Qwen4ExpContextEstimate> {
-    let decision = plan_store(label, c, inventory, live, max_memory, has_mtp)?;
+    let decision = plan_store(label, c, inventory, live, max_memory, max_context, has_mtp)?;
     let loaded = LiveMemory {
         active_bytes: live
             .active_bytes
@@ -275,12 +309,18 @@ pub(super) fn estimate(
         .saturating_add(decision.store.row_cache_bytes)
         .saturating_add(inventory.vision_bytes);
     let plan = plan_engine(label, c, loaded, held_back, max_memory)?;
-    let pool = plan.pool.ok_or_else(|| {
+    check_context(label, &plan, max_context)?;
+    let pool = plan.pool.as_ref().ok_or_else(|| {
         Error::from_reason(format!("{label} memory plan: the load planned no pool"))
     })?;
+    let cap = max_context.unwrap_or_else(|| c.served_context_tokens());
     Ok(Qwen4ExpContextEstimate {
-        window_tokens: pool.lane.window.maximum(),
-        speculative_window_tokens: if has_mtp { mtp_window(c, &plan) } else { None },
+        window_tokens: pool.lane.window.maximum().min(cap),
+        speculative_window_tokens: if has_mtp {
+            mtp_window(c, &plan).map(|window| window.min(cap))
+        } else {
+            None
+        },
         bound: pool.lane.window.bound().to_string(),
     })
 }
@@ -298,6 +338,8 @@ pub async fn estimate_qwen4_exp_context_window(
     let options = options.unwrap_or_default();
     let max_memory =
         crate::models::qwen3_5::load_plan::max_memory_option(LABEL, options.max_memory_bytes)?;
+    let max_context =
+        crate::nn::rope_scaling::max_context_option(LABEL, options.max_context_tokens)?;
     napi::bindgen_prelude::spawn_blocking(move || {
         let Some(live) = crate::engine::memory_plan::live_memory() else {
             return Ok(None);
@@ -311,10 +353,20 @@ pub async fn estimate_qwen4_exp_context_window(
             path,
             options.auxiliary_model_path.as_deref(),
         )?;
+        serve_context(LABEL, &mut config, max_context)?;
         let has_mtp = super::auxiliary::validate_mtp(&weights, &config)?;
         let vision = super::media::Vision::metadata(&raw, &weights, &config)?.available();
         let inventory = weights.load_inventory(&config, vision)?;
-        estimate(LABEL, &config, &inventory, live, max_memory, has_mtp).map(Some)
+        estimate(
+            LABEL,
+            &config,
+            &inventory,
+            live,
+            max_memory,
+            max_context,
+            has_mtp,
+        )
+        .map(Some)
     })
     .await
     .map_err(|error| Error::from_reason(format!("{LABEL} estimate: {error}")))?

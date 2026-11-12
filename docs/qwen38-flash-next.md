@@ -56,7 +56,8 @@ less 15% and 1 GiB, lowered by `maxMemoryBytes` (`--max-memory`). In order:
    the smallest lane) must fit, or the load is refused before it reads a byte.
 2. The KV allowance comes first: the dynamic bytes at which every lane the
    load serves (the AR lane, and the MTP lane with MTP weights) holds
-   `min(trained, 65,536)` tokens.
+   `min(trained, 65,536)` tokens, or `maxContextTokens` (`--max-context`)
+   tokens when it is set (Splash `allowance` for a target that cannot spill).
 3. The experts load whole only where they leave the allowance and the row
    share; otherwise they stream with a cap of what the allowance and the share
    leave. The row cache takes what the allowance leaves of its share.
@@ -209,7 +210,10 @@ turn's state is admitted against what the pool's blocks and the transient
 leave, and a turn is refused only when that budget cannot hold its state. The
 effective window is the plan's AR window (65,536 tokens on a 36 GB Mac, the
 trained 262,144 when the experts load whole with room to spare); an MTP turn
-takes the MTP lane's window. The output budget is the rest of the window, and
+takes the MTP lane's window. `maxContextTokens` (`--max-context`) caps both
+windows; past the native 262,144 the target's RoPE, the indexer's pooled keys
+included, takes static YaRN up to 1,010,000 tokens (Splash `Qwen4Exp`
+`yarnContextTokens`), and a load whose AR window holds fewer tokens fails. The output budget is the rest of the window, and
 an omitted one fills it. Inspect `contextLimits()` for the windows and
 `/v1/models` for the load-free estimate before a load. Multi-owner decode keeps stateful attention per owner and batches stateless
 MLP projections across ready rows. Warm continuation reuses that

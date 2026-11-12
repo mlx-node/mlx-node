@@ -1969,6 +1969,18 @@ describe('launchGrokAgent server gating', () => {
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--max-memory');
   });
 
+  // Mutation: drop the `--max-context` pair from the serve argv → red.
+  it('hands --max-context to the spawned serve as tokens', async () => {
+    await launchGrokAgent({ argv: ['-c'], maxContextTokens: 102_400, spawnServe, spawnAgent });
+    const serveArgv: string[] = spawnServe.mock.calls[0]![0];
+    expect(serveArgv.slice(-2)).toEqual(['--max-context', '102400']);
+    expect(parseServeArgs(serveArgv.slice(2)).maxContextTokens).toBe(102_400);
+
+    spawnServe.mockClear();
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+    expect(spawnServe.mock.calls[0]![0]).not.toContain('--max-context');
+  });
+
   it('turns off the xAI media tools a served launch cannot answer, keeping a user override', async () => {
     const mediaEnv = ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN'] as const;
     const saved = mediaEnv.map((name) => process.env[name]);

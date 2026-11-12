@@ -37,7 +37,7 @@ fn live(active: u64) -> LiveMemory {
 /// store at its cap.
 fn load(has_mtp: bool) -> (StoreDecision, MemoryPlan) {
     let c = flash_next_config();
-    let decision = plan_store("Qwen4Exp", &c, &inventory(), live(0), None, has_mtp).unwrap();
+    let decision = plan_store("Qwen4Exp", &c, &inventory(), live(0), None, None, has_mtp).unwrap();
     let held_back = decision.store.expert_cap_bytes + decision.store.row_cache_bytes;
     let plan = plan_engine("Qwen4Exp", &c, live(FLASH_NEXT_LOADED), held_back, None).unwrap();
     (decision, plan)
@@ -183,7 +183,7 @@ fn pool_starts_at_the_runway_and_grows_to_the_plan() {
 fn context_limits_publish_the_plan() {
     let c = flash_next_config();
     let (_, ar) = load(false);
-    let limits = super::super::Qwen4ExpContextLimits::from_plan(&c, &ar, false).unwrap();
+    let limits = super::super::Qwen4ExpContextLimits::from_plan(&c, &ar, false, 262_144).unwrap();
     assert_eq!(
         limits,
         super::super::Qwen4ExpContextLimits {
@@ -198,7 +198,7 @@ fn context_limits_publish_the_plan() {
         }
     );
     let (_, mtp) = load(true);
-    let limits = super::super::Qwen4ExpContextLimits::from_plan(&c, &mtp, true).unwrap();
+    let limits = super::super::Qwen4ExpContextLimits::from_plan(&c, &mtp, true, 262_144).unwrap();
     assert_eq!(limits.effective_window_tokens, 95_225);
     assert_eq!(limits.speculative_window_tokens, Some(65_655));
     assert!(limits.speculative_omitted_budget_is_rest_of_window);
@@ -212,7 +212,7 @@ fn context_limits_publish_the_plan() {
 #[test]
 fn estimate_is_the_load_plan() {
     let c = flash_next_config();
-    let ar = estimate("Qwen4Exp", &c, &inventory(), live(0), None, false).unwrap();
+    let ar = estimate("Qwen4Exp", &c, &inventory(), live(0), None, None, false).unwrap();
     assert_eq!(
         ar,
         Qwen4ExpContextEstimate {
@@ -222,12 +222,21 @@ fn estimate_is_the_load_plan() {
         }
     );
     assert_eq!(ar.window_tokens, 65_536);
-    let mtp = estimate("Qwen4Exp", &c, &inventory(), live(0), None, true).unwrap();
+    let mtp = estimate("Qwen4Exp", &c, &inventory(), live(0), None, None, true).unwrap();
     assert_eq!(
         (mtp.window_tokens, mtp.speculative_window_tokens),
         (95_225, Some(65_655))
     );
-    let lower = estimate("Qwen4Exp", &c, &inventory(), live(0), Some(16 << 30), false).unwrap();
+    let lower = estimate(
+        "Qwen4Exp",
+        &c,
+        &inventory(),
+        live(0),
+        Some(16 << 30),
+        None,
+        false,
+    )
+    .unwrap();
     assert!(lower.window_tokens <= ar.window_tokens);
 }
 
@@ -269,8 +278,115 @@ fn hf_experts_stream_from_the_plan() {
     assert_eq!(inventory.experts.all, 241_591_910_400);
     assert_eq!(inventory.experts.minimum, 4_816_896_000);
     assert_eq!(inventory.store_fixed_bytes, fixed_bytes);
-    let decision = plan_store("Qwen4Exp", &c, &inventory, live(0), None, false)
+    let decision = plan_store("Qwen4Exp", &c, &inventory, live(0), None, None, false)
         .unwrap_or_else(|error| panic!("the HF store must stream: {error}"));
     assert!(!decision.store.whole);
     assert!(decision.store.expert_cap_bytes < inventory.experts.all);
+}
+
+/// The KV allowance follows the requested context (Splash `allowance`'s
+/// non-spill branch), so a 100K cap on the 36 GB input serves 102,400.
+/// Mutation: keep `min(trained, 64K)` whatever the request → red
+/// (refused, the plan holds 65,536).
+#[test]
+fn flash_next_allowance_is_the_requested_context() {
+    let c = flash_next_config();
+    let transient = |window: u32| transient(&c, window);
+    let pool = pool_input(&c, &transient);
+    let ar = |dynamic: u64| pool.plan_at(dynamic).lane.window.maximum();
+    let decision = plan_store(
+        "Qwen4Exp",
+        &c,
+        &inventory(),
+        live(0),
+        None,
+        Some(102_400),
+        false,
+    )
+    .unwrap();
+    assert_eq!(decision.allowance, allowance_dynamic_bytes(&[&ar], 102_400));
+    let estimate = estimate(
+        "Qwen4Exp",
+        &c,
+        &inventory(),
+        live(0),
+        None,
+        Some(102_400),
+        false,
+    )
+    .unwrap();
+    assert_eq!(estimate.window_tokens, 102_400);
+    let unset = plan_store("Qwen4Exp", &c, &inventory(), live(0), None, None, false).unwrap();
+    assert_eq!(unset.allowance, allowance_dynamic_bytes(&[&ar], 65_536));
+}
+
+/// A context the plan cannot hold under `--max-memory` fails with Splash's
+/// text. Mutation: skip `check_context` → red (Ok).
+#[test]
+fn flash_next_context_above_the_plan_is_refused() {
+    let c = flash_next_config();
+    let error = estimate(
+        "Qwen4Exp",
+        &c,
+        &inventory(),
+        live(0),
+        Some(8 << 30),
+        Some(131_072),
+        false,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .reason
+            .starts_with("Qwen4Exp: --max-context 131072 exceeds the "),
+        "{}",
+        error.reason
+    );
+    assert!(
+        error
+            .reason
+            .contains("tokens the model and --max-memory allow; omit it or pass at most "),
+        "{}",
+        error.reason
+    );
+}
+
+/// 400K serves the YaRN window: the pool lane prices 409,600 and a 128 GiB
+/// working set holds it. Mutation: price the native window in
+/// `pool_input` → red (refused).
+#[test]
+fn flash_next_400k_serves_the_yarn_window() {
+    let mut c = flash_next_config();
+    serve_context("Qwen4Exp", &mut c, Some(409_600)).unwrap();
+    assert!(c.rope_scaling.yarn());
+    let transient = |window: u32| transient(&c, window);
+    assert_eq!(pool_input(&c, &transient).shape.trained, 409_600);
+    let large = LiveMemory {
+        working_set_bytes: 128 << 30,
+        active_bytes: 0,
+        registered_pool_bytes: 0,
+    };
+    let estimate = estimate(
+        "Qwen4Exp",
+        &c,
+        &inventory(),
+        large,
+        None,
+        Some(409_600),
+        false,
+    )
+    .unwrap();
+    assert_eq!(estimate.window_tokens, 409_600);
+}
+
+/// The published windows are at most the cap, the trained one stays
+/// native. Mutation: no cap in `from_plan` → red (95,225).
+#[test]
+fn flash_next_limits_publish_the_cap() {
+    let c = flash_next_config();
+    let (_, mtp) = load(true);
+    let limits = super::super::Qwen4ExpContextLimits::from_plan(&c, &mtp, true, 50_000).unwrap();
+    assert_eq!(limits.effective_window_tokens, 50_000);
+    assert_eq!(limits.speculative_window_tokens, Some(50_000));
+    assert_eq!(limits.trained_window_tokens, 262_144);
 }

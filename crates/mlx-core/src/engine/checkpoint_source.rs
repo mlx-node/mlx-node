@@ -101,6 +101,32 @@ impl CheckpointSource {
     }
 }
 
+/// Splash `GgufImage`: a Qwen target GGUF whose `rope.scaling.type` is set
+/// and not `none` is already scaled. Checked from the header on every load,
+/// so a cached asset directory cannot hide it.
+pub(crate) fn refuse_scaled_gguf_rope(
+    metadata: &std::collections::HashMap<String, crate::utils::gguf::GgufMetaValue>,
+    path: &Path,
+) -> Result<()> {
+    let Some(arch) = metadata
+        .get("general.architecture")
+        .and_then(|value| value.as_str())
+        .filter(|arch| matches!(*arch, "qwen35" | "qwen35moe" | "clef"))
+    else {
+        return Ok(());
+    };
+    match metadata
+        .get(&format!("{arch}.rope.scaling.type"))
+        .and_then(|value| value.as_str())
+    {
+        Some(scaling) if scaling != "none" => Err(Error::from_reason(format!(
+            "'{}': rope.scaling.type {scaling} (expected none); the target's RoPE is already scaled",
+            path.display()
+        ))),
+        _ => Ok(()),
+    }
+}
+
 impl GgufCheckpoint {
     pub(crate) fn preload_input(&self, load_companion: bool) -> PreloadInput {
         let file = |(path, header, identity): &GgufSourceFile, plan: &ImportPlan| {
@@ -120,6 +146,7 @@ impl GgufCheckpoint {
     /// The asset `config.json` must mark exactly the prefixes the plan tiles,
     /// or the builder would read t64 bytes as row-major (or the reverse).
     pub(crate) fn check_asset_config(&self) -> Result<()> {
+        refuse_scaled_gguf_rope(&self.main.1.metadata, &self.main.0)?;
         let path = self.asset_dir.join("config.json");
         let config: Value =
             serde_json::from_slice(&fs::read(&path).map_err(|e| {

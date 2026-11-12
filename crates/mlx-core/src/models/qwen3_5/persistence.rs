@@ -2586,6 +2586,7 @@ pub async fn load_with_thread(
         draft_model_path,
         kv_format,
         None,
+        None,
     )
     .await
 }
@@ -2596,8 +2597,17 @@ pub(crate) async fn load_with_source(
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
     max_memory_bytes: Option<u64>,
+    max_context: Option<u32>,
 ) -> Result<Qwen3_5Model> {
-    load_with_thread_impl(source, draft_model_path, kv_format, max_memory_bytes, false).await
+    load_with_thread_impl(
+        source,
+        draft_model_path,
+        kv_format,
+        max_memory_bytes,
+        max_context,
+        false,
+    )
+    .await
 }
 
 /// The caller releases `source`'s lease when this fails.
@@ -2607,6 +2617,7 @@ pub(crate) async fn load_clef_with_source(source: &CheckpointSource) -> Result<Q
         source,
         None,
         Some(crate::transformer::KvFormat::Bf16),
+        None,
         None,
         true,
     )
@@ -2660,6 +2671,7 @@ async fn load_with_thread_impl(
     draft_model_path: Option<String>,
     kv_format: Option<crate::transformer::KvFormat>,
     max_memory_bytes: Option<u64>,
+    max_context: Option<u32>,
     clef: bool,
 ) -> Result<Qwen3_5Model> {
     let model_assets_path = source.asset_dir().to_string_lossy().into_owned();
@@ -2701,6 +2713,20 @@ async fn load_with_thread_impl(
                     .map_err(|e| Error::from_reason(format!("Failed to parse config: {}", e)))?;
 
                 let mut config = parse_config(&raw)?;
+                config.rope_scaling = Some(crate::nn::rope_scaling::RopeScaling::served_for(
+                    "Qwen3.5",
+                    config.max_position_embeddings.max(0) as u32,
+                    config.scaling(),
+                    max_context,
+                )?);
+                if config.scaling().yarn() {
+                    info!(
+                        "Qwen3.5 {}",
+                        config
+                            .scaling()
+                            .startup_line(config.served_context_tokens())
+                    );
+                }
                 // Decision inference never allocates a chat KV pool or speculative head.
                 if clef {
                     config.use_block_paged_cache = Some(false);
@@ -3065,6 +3091,7 @@ async fn load_with_thread_impl(
                 // Create inner model
                 let mut inner = Qwen35Inner::new(config.clone())?;
                 inner.max_memory_bytes = max_memory_bytes;
+                inner.max_context = max_context;
                 inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(path));
 
                 // Deterministic weight-byte total of the text checkpoint for
@@ -3410,6 +3437,7 @@ pub(crate) fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
     let rope_obj = text_cfg
         .and_then(|tc| tc.get("rope_parameters"))
         .or_else(|| raw.get("rope_parameters"));
+    crate::nn::rope_scaling::refuse_scaled_rope("Qwen3.5", rope_obj)?;
 
     let partial_rotary_factor = rope_obj
         .and_then(|rp| rp["partial_rotary_factor"].as_f64())
@@ -3463,6 +3491,7 @@ pub(crate) fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
     }
 
     Ok(Qwen3_5Config {
+        rope_scaling: None,
         vocab_size,
         hidden_size,
         num_layers,
@@ -3576,6 +3605,72 @@ pub fn create_random_qwen35_checkpoint<'env>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Splash `validateTextConfig`: `rope_type` when present, else `type`,
+    /// must be `default`; an already scaled checkpoint is refused before
+    /// any weight. A scaled GGUF header is refused on every load (Splash
+    /// `GgufImage`). Mutation: skip the rope-type check in
+    /// `parse_config` → red.
+    #[test]
+    fn scaled_checkpoints_are_refused() {
+        let config = |rope: serde_json::Value| {
+            json!({
+                "model_type": "qwen3_5",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 2,
+                "intermediate_size": 128,
+                "rope_parameters": rope,
+            })
+        };
+        let error = parse_config(&config(json!({"rope_type": "yarn", "factor": 4.0}))).unwrap_err();
+        assert_eq!(
+            error.reason,
+            "Qwen3.5 config: rope_parameters.rope_type \"yarn\": the target's RoPE is already scaled"
+        );
+        let error = parse_config(&config(json!({"type": "yarn"}))).unwrap_err();
+        assert!(
+            error.reason.contains("rope_parameters.type"),
+            "{}",
+            error.reason
+        );
+        for loads in [
+            json!({"rope_type": "default"}),
+            json!({"rope_type": "default", "type": "yarn"}),
+            json!({"rope_theta": 10_000_000}),
+        ] {
+            assert!(parse_config(&config(loads.clone())).is_ok(), "{loads}");
+        }
+        assert!(parse_config(&config(serde_json::Value::Null)).is_ok());
+
+        use crate::utils::gguf::GgufMetaValue;
+        let header = |scaling: Option<&str>| {
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                "general.architecture".to_string(),
+                GgufMetaValue::String("qwen35".to_string()),
+            );
+            if let Some(scaling) = scaling {
+                metadata.insert(
+                    "qwen35.rope.scaling.type".to_string(),
+                    GgufMetaValue::String(scaling.to_string()),
+                );
+            }
+            metadata
+        };
+        let path = Path::new("/m.gguf");
+        let refuse = crate::engine::checkpoint_source::refuse_scaled_gguf_rope;
+        let error = refuse(&header(Some("yarn")), path).unwrap_err();
+        assert!(
+            error
+                .reason
+                .contains("rope.scaling.type yarn (expected none)"),
+            "{}",
+            error.reason
+        );
+        assert!(refuse(&header(Some("none")), path).is_ok());
+        assert!(refuse(&header(None), path).is_ok());
+    }
 
     fn clef_fixture() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../__test__/fixtures/clef")
@@ -4868,6 +4963,7 @@ mod tests {
     /// per-layer linear loop is empty), keeping the fixture tiny.
     fn no_mtp_layer_cfg() -> Qwen3_5Config {
         Qwen3_5Config {
+            rope_scaling: None,
             qwen35_gguf_gdn_layout: None,
             kv_format: None,
             vocab_size: 1024,

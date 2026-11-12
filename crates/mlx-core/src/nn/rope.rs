@@ -1,6 +1,10 @@
-use crate::array::MxArray;
+use std::sync::Arc;
+
+use crate::array::{DType, MxArray};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
+
+use super::rope_scaling::{RopeScaling, rotary_inverse_frequencies};
 
 // ============================================
 // Positional Encoding (Internal)
@@ -15,6 +19,12 @@ pub struct RoPE {
     pub(crate) traditional: bool,
     pub(crate) base: f32,
     pub(crate) scale: f32,
+    /// YaRN only: `[dims / 2]` f32 periods (MLX `freqs`, `1 / inverse
+    /// frequency`) of Splash `rotaryInverseFrequencies`.
+    periods: Option<Arc<MxArray>>,
+    /// YaRN only: `[head_dim]` f32, Splash `attentionFactor` on the rotated
+    /// dims and 1 on the rest.
+    rotated_scale: Option<Arc<MxArray>>,
 }
 
 impl RoPE {
@@ -30,12 +40,67 @@ impl RoPE {
             traditional: traditional.unwrap_or(false),
             base: base.unwrap_or(10000.0) as f32,
             scale: scale.unwrap_or(1.0) as f32,
+            periods: None,
+            rotated_scale: None,
         }
+    }
+
+    /// A target RoPE of `dims` rotated dims over `head_dim` scaled by
+    /// `scaling` (Splash `RopeTableParams::target_scale` on cos and sin);
+    /// without YaRN, [`Self::new`].
+    pub(crate) fn yarn(dims: i32, head_dim: i32, base: f64, scaling: &RopeScaling) -> Result<Self> {
+        let mut rope = Self::new(dims, Some(false), Some(base), None);
+        if !scaling.yarn() {
+            return Ok(rope);
+        }
+        let inverse = rotary_inverse_frequencies(base as f32, (dims / 2) as u32, scaling)?;
+        let periods: Vec<f32> = inverse.iter().map(|value| 1.0 / value).collect();
+        let factor = scaling.attention_factor();
+        let rotated: Vec<f32> = (0..head_dim)
+            .map(|dim| if dim < dims { factor } else { 1.0 })
+            .collect();
+        rope.periods = Some(Arc::new(MxArray::from_float32(
+            &periods,
+            &[i64::from(dims / 2)],
+        )?));
+        rope.rotated_scale = Some(Arc::new(MxArray::from_float32(
+            &rotated,
+            &[i64::from(head_dim)],
+        )?));
+        Ok(rope)
+    }
+
+    pub(crate) fn is_scaled(&self) -> bool {
+        self.periods.is_some()
+    }
+
+    /// `x` in f32 times the rotated-dim scale, the periods, and the cast back.
+    fn scaled_rope(&self, x: &MxArray, offsets: &MxArray) -> Result<MxArray> {
+        let (Some(periods), Some(rotated_scale)) = (&self.periods, &self.rotated_scale) else {
+            return Err(Error::from_reason("RoPE has no YaRN table"));
+        };
+        let dtype = x.dtype()?;
+        let scaled = x.astype(DType::Float32)?.mul(rotated_scale)?;
+        let handle = unsafe {
+            sys::mlx_fast_rope_with_freqs(
+                scaled.handle.0,
+                self.dims,
+                self.traditional,
+                0.0,
+                self.scale,
+                offsets.handle.0,
+                periods.handle.0,
+            )
+        };
+        MxArray::from_handle(handle, "yarn_rope")?.astype(dtype)
     }
 
     /// Apply RoPE to input tensor
     pub fn forward(&self, x: &MxArray, offset: Option<i32>) -> Result<MxArray> {
         let offset = offset.unwrap_or(0);
+        if self.is_scaled() {
+            return self.scaled_rope(x, &MxArray::from_int32(&[offset], &[1])?);
+        }
         let handle = unsafe {
             sys::mlx_fast_rope(
                 x.handle.0,
@@ -75,6 +140,9 @@ impl RoPE {
                 offsets.dtype()?
             )));
         }
+        if self.is_scaled() {
+            return self.scaled_rope(x, offsets);
+        }
         let handle = unsafe {
             sys::mlx_fast_rope_with_freqs(
                 x.handle.0,
@@ -97,6 +165,8 @@ impl Clone for RoPE {
             traditional: self.traditional,
             base: self.base,
             scale: self.scale,
+            periods: self.periods.clone(),
+            rotated_scale: self.rotated_scale.clone(),
         }
     }
 }
@@ -191,5 +261,156 @@ mod tests {
         let batched = batched.to_float32().unwrap();
         let scalar = scalar.to_float32().unwrap();
         assert_eq!(batched.as_ref(), scalar.as_ref());
+    }
+
+    fn sample(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|index| ((index * 37 % 101) as f32 / 50.0) - 1.0)
+            .collect()
+    }
+
+    fn yarn_rope() -> (RoPE, Vec<f32>, f32) {
+        let scaling = RopeScaling {
+            factor: 1.5625,
+            original_context_tokens: 262_144,
+        };
+        let rope = RoPE::yarn(64, 256, 1e7, &scaling).unwrap();
+        let inverse = rotary_inverse_frequencies(1e7, 32, &scaling).unwrap();
+        (rope, inverse, scaling.attention_factor())
+    }
+
+    /// Rotated dims of `[1, heads, seq, 256]` against the kernel's own f32
+    /// angle `f32(position) * (1 / period)` with cos/sin in f64.
+    fn assert_yarn_rotation(input: &[f32], output: &[f32], offset: i32, tolerance: f64) {
+        let (_, inverse, factor) = yarn_rope();
+        let (heads, seq) = (2usize, 5usize);
+        for head in 0..heads {
+            for t in 0..seq {
+                let row = (head * seq + t) * 256;
+                let position = (offset + t as i32) as f32;
+                for pair in 0..32 {
+                    let period = 1.0f32 / inverse[pair];
+                    let angle = f64::from(position * (1.0f32 / period));
+                    let (x1, x2) = (
+                        f64::from(input[row + pair]),
+                        f64::from(input[row + pair + 32]),
+                    );
+                    let af = f64::from(factor);
+                    let first = (x1 * angle.cos() - x2 * angle.sin()) * af;
+                    let second = (x1 * angle.sin() + x2 * angle.cos()) * af;
+                    for (got, want) in [
+                        (output[row + pair], first),
+                        (output[row + pair + 32], second),
+                    ] {
+                        assert!(
+                            (f64::from(got) - want).abs() <= tolerance,
+                            "offset {offset} head {head} t {t} pair {pair}: {got} vs {want}"
+                        );
+                    }
+                }
+                for dim in 64..256 {
+                    assert_eq!(output[row + dim].to_bits(), input[row + dim].to_bits());
+                }
+            }
+        }
+    }
+
+    /// The rotated dims of a YaRN RoPE take Splash's table and attention
+    /// factor, the tail dims pass through. Mutations: skip the
+    /// `rotated_scale` multiply → red; null periods in the scaled
+    /// `forward_with_offsets` → red.
+    #[test]
+    fn yarn_rope_scales_the_rotated_dims() {
+        let (rope, _, _) = yarn_rope();
+        assert!(rope.is_scaled());
+        let input = sample(2 * 5 * 256);
+        let x = MxArray::from_float32(&input, &[1, 2, 5, 256]).unwrap();
+        for (offset, tolerance) in [(0, 1e-5), (7, 1e-5), (4093, 1e-3)] {
+            let scalar = rope.forward(&x, Some(offset)).unwrap();
+            let offsets = MxArray::from_int32(&[offset], &[1]).unwrap();
+            let batched = rope.forward_with_offsets(&x, &offsets).unwrap();
+            assert_eq!(scalar.dtype().unwrap(), DType::Float32);
+            let scalar = scalar.to_float32().unwrap();
+            let batched = batched.to_float32().unwrap();
+            assert_eq!(scalar.as_ref(), batched.as_ref());
+            assert_yarn_rotation(&input, scalar.as_ref(), offset, tolerance);
+        }
+        let bf16 = x.astype(DType::BFloat16).unwrap();
+        let rounded = bf16.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let out = rope.forward(&bf16, Some(7)).unwrap();
+        assert_eq!(out.dtype().unwrap(), DType::BFloat16);
+        let out = out.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let f32_out = rope
+            .forward(
+                &MxArray::from_float32(rounded.as_ref(), &[1, 2, 5, 256]).unwrap(),
+                Some(7),
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        assert_eq!(out.as_ref(), f32_out.as_ref());
+        for row in 0..10 {
+            for dim in 64..256 {
+                assert_eq!(
+                    out[row * 256 + dim].to_bits(),
+                    rounded[row * 256 + dim].to_bits()
+                );
+            }
+        }
+    }
+
+    /// Without YaRN `RoPE::yarn` is the plain kernel bit for bit. Mutation:
+    /// the unscaled `forward` through a periods table → red.
+    #[test]
+    fn unscaled_rope_is_the_plain_kernel() {
+        let rope = RoPE::yarn(64, 256, 1e7, &RopeScaling::default()).unwrap();
+        assert!(!rope.is_scaled());
+        let input = sample(2 * 5 * 256);
+        for dtype in [DType::Float32, DType::BFloat16] {
+            let x = MxArray::from_float32(&input, &[1, 2, 5, 256])
+                .unwrap()
+                .astype(dtype)
+                .unwrap();
+            let direct = MxArray::from_handle(
+                unsafe { sys::mlx_fast_rope(x.handle.0, 64, false, 1e7, 1.0, 4093) },
+                "rope",
+            )
+            .unwrap();
+            let offsets = MxArray::from_int32(&[4093], &[1]).unwrap();
+            let direct_offsets = MxArray::from_handle(
+                unsafe {
+                    sys::mlx_fast_rope_with_freqs(
+                        x.handle.0,
+                        64,
+                        false,
+                        1e7,
+                        1.0,
+                        offsets.handle.0,
+                        std::ptr::null_mut(),
+                    )
+                },
+                "rope",
+            )
+            .unwrap();
+            let read = |array: MxArray| {
+                array
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(read(rope.forward(&x, Some(4093)).unwrap()), read(direct));
+            assert_eq!(
+                read(rope.forward_with_offsets(&x, &offsets).unwrap()),
+                read(direct_offsets)
+            );
+        }
     }
 }

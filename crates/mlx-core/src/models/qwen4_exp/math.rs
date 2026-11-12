@@ -611,9 +611,56 @@ pub fn norm(x: &MxArray, w: &MxArray, group: usize, eps: f64, centered: bool) ->
     y.mul(&w)?.astype(x.dtype()?)
 }
 
+/// YaRN of a target past its native window: Splash
+/// `rotaryInverseFrequencies` and the `attentionFactor` cos and sin take.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Yarn {
+    inverse: std::sync::Arc<[f32]>,
+    factor: f32,
+}
+
+impl Yarn {
+    /// `None` without YaRN.
+    pub fn of(config: &super::config::Config) -> Result<Option<Self>> {
+        let scaling = &config.rope_scaling;
+        if !scaling.yarn() {
+            return Ok(None);
+        }
+        let inverse = crate::nn::rope_scaling::rotary_inverse_frequencies(
+            config.rope_theta() as f32,
+            (config.rope_dims() / 2) as u32,
+            scaling,
+        )?;
+        Ok(Some(Self {
+            inverse: inverse.into(),
+            factor: scaling.attention_factor(),
+        }))
+    }
+}
+
+/// `cos(angles)` and `sin(angles)` in f32, each times the YaRN attention
+/// factor (Splash `target_rope_pair`), cast to `dtype`.
+fn cos_sin(angles: &MxArray, yarn: Option<&Yarn>, dtype: DType) -> Result<(MxArray, MxArray)> {
+    let (cos, sin) = (angles.cos()?, angles.sin()?);
+    let (cos, sin) = match yarn {
+        Some(yarn) => (
+            cos.mul_scalar(f64::from(yarn.factor))?,
+            sin.mul_scalar(f64::from(yarn.factor))?,
+        ),
+        None => (cos, sin),
+    };
+    Ok((cos.astype(dtype)?, sin.astype(dtype)?))
+}
+
 /// Split-half partial RoPE. Text positions coincide on the three MRoPE axes.
-pub fn rope(x: &MxArray, position: usize, dims: usize, theta: f64) -> Result<MxArray> {
-    mrope(x, [position as i64; 3], dims, theta, [0; 3], true)
+pub fn rope(
+    x: &MxArray,
+    position: usize,
+    dims: usize,
+    theta: f64,
+    yarn: Option<&Yarn>,
+) -> Result<MxArray> {
+    mrope(x, [position as i64; 3], dims, theta, [0; 3], true, yarn)
 }
 
 pub fn mrope(
@@ -623,6 +670,7 @@ pub fn mrope(
     theta: f64,
     sections: [usize; 3],
     interleaved: bool,
+    yarn: Option<&Yarn>,
 ) -> Result<MxArray> {
     let shape = x.shape()?;
     let (&width, axes) = shape
@@ -630,10 +678,9 @@ pub fn mrope(
         .ok_or_else(|| Error::from_reason("Qwen4 rotary input must have a feature dimension"))?;
     let axis = axes.len();
     let half = dims as i64 / 2;
-    let angles = rotary_angles(positions, dims, theta, sections, interleaved);
+    let angles = rotary_angles(positions, dims, theta, sections, interleaved, yarn);
     let angles = MxArray::from_float32(&angles, &[half])?;
-    let cos = angles.cos()?.astype(x.dtype()?)?;
-    let sin = angles.sin()?.astype(x.dtype()?)?;
+    let (cos, sin) = cos_sin(&angles, yarn, x.dtype()?)?;
     let a = x.slice_axis(axis, 0, half)?;
     let b = x.slice_axis(axis, half, dims as i64)?;
     let left = a.mul(&cos)?.sub(&b.mul(&sin)?)?;
@@ -648,6 +695,7 @@ fn rotary_angles(
     theta: f64,
     sections: [usize; 3],
     interleaved: bool,
+    yarn: Option<&Yarn>,
 ) -> Vec<f32> {
     let half = dims as i64 / 2;
     let angles: Vec<f32> = (0..half)
@@ -668,7 +716,10 @@ fn rotary_angles(
             } else {
                 2
             };
-            (positions[axis] as f64 / theta.powf((2 * i) as f64 / dims as f64)) as f32
+            match yarn {
+                Some(yarn) => (positions[axis] as f64 * f64::from(yarn.inverse[j])) as f32,
+                None => (positions[axis] as f64 / theta.powf((2 * i) as f64 / dims as f64)) as f32,
+            }
         })
         .collect();
     angles
@@ -721,6 +772,7 @@ impl RotaryWindowCache {
         theta: f64,
         sections: [usize; 3],
         interleaved: bool,
+        yarn: Option<&Yarn>,
     ) -> Result<MxArray> {
         let key = RotaryKey {
             positions,
@@ -730,11 +782,12 @@ impl RotaryWindowCache {
             interleaved,
             dtype: x.dtype()?,
         };
-        let (cos, sin) = self.tables(key)?;
+        let (cos, sin) = self.tables(key, yarn)?;
         apply_rotary_window(x, dims, &cos, &sin)
     }
 
-    fn tables(&mut self, key: RotaryKey) -> Result<(MxArray, MxArray)> {
+    /// The YaRN of a decoder is fixed for its life, so it is not in the key.
+    fn tables(&mut self, key: RotaryKey, yarn: Option<&Yarn>) -> Result<(MxArray, MxArray)> {
         if let Some((_, cos, sin)) = self.tables.iter().find(|(old, _, _)| *old == key) {
             return Ok((cos.clone(), sin.clone()));
         }
@@ -745,6 +798,7 @@ impl RotaryWindowCache {
             key.sections,
             key.interleaved,
             key.dtype,
+            yarn,
         )?;
         if self.tables.len() >= self.capacity {
             self.tables.remove(0);
@@ -761,14 +815,15 @@ fn rotary_tables(
     sections: [usize; 3],
     interleaved: bool,
     dtype: DType,
+    yarn: Option<&Yarn>,
 ) -> Result<(MxArray, MxArray)> {
     let half = dims as i64 / 2;
     let angles: Vec<f32> = positions
         .iter()
-        .flat_map(|&p| rotary_angles(p, dims, theta, sections, interleaved))
+        .flat_map(|&p| rotary_angles(p, dims, theta, sections, interleaved, yarn))
         .collect();
     let angles = MxArray::from_float32(&angles, &[1, 1, positions.len() as i64, half])?;
-    Ok((angles.cos()?.astype(dtype)?, angles.sin()?.astype(dtype)?))
+    cos_sin(&angles, yarn, dtype)
 }
 
 fn apply_rotary_window(x: &MxArray, dims: usize, cos: &MxArray, sin: &MxArray) -> Result<MxArray> {
@@ -807,7 +862,7 @@ mod input_validation_tests {
     #[test]
     fn scalar_inputs_return_shape_errors_without_changing_convolution_history() {
         let scalar = MxArray::from_float32(&[1.], &[]).unwrap();
-        let rotary_error = mrope(&scalar, [0; 3], 2, 10_000., [0; 3], true)
+        let rotary_error = mrope(&scalar, [0; 3], 2, 10_000., [0; 3], true, None)
             .err()
             .expect("scalar rotary input must be rejected");
         assert_eq!(
@@ -1009,6 +1064,70 @@ mod compact_recurrence_tests {
 mod rotary_window_tests {
     use super::*;
 
+    /// The Flash Next tables take Splash's YaRN inverse frequencies and its
+    /// attention factor on cos and sin; without YaRN they are today's
+    /// angles bit for bit. Mutation: the attention factor left out of
+    /// `cos_sin` → red (4.5% off).
+    #[test]
+    fn flash_next_rotary_takes_the_yarn_table() {
+        let mut config = crate::models::qwen4_exp::memory::flash_next_config();
+        let (dims, theta) = (config.rope_dims(), config.rope_theta());
+        let positions = vec![[0i64; 3], [3; 3], [409_000; 3]];
+        let (plain_cos, plain_sin) =
+            rotary_tables(&positions, dims, theta, [0; 3], true, DType::Float32, None).unwrap();
+        let old: Vec<f32> = positions
+            .iter()
+            .flat_map(|p| {
+                (0..dims / 2)
+                    .map(|i| (p[0] as f64 / theta.powf((2 * i) as f64 / dims as f64)) as f32)
+            })
+            .collect();
+        let old = MxArray::from_float32(&old, &[1, 1, 3, dims as i64 / 2]).unwrap();
+        let bits = |a: &MxArray| {
+            a.to_float32()
+                .unwrap()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&plain_cos), bits(&old.cos().unwrap()));
+        assert_eq!(bits(&plain_sin), bits(&old.sin().unwrap()));
+
+        crate::models::qwen4_exp::load_plan::serve_context("Qwen4Exp", &mut config, Some(409_600))
+            .unwrap();
+        let yarn = Yarn::of(&config)
+            .unwrap()
+            .expect("YaRN past the native window");
+        let inverse = crate::nn::rope_scaling::rotary_inverse_frequencies(
+            theta as f32,
+            (dims / 2) as u32,
+            &config.rope_scaling,
+        )
+        .unwrap();
+        let factor = f64::from(config.rope_scaling.attention_factor());
+        assert_eq!(factor as f32, f32::from_bits(0x3f85b665));
+        let (cos, sin) = rotary_tables(
+            &positions,
+            dims,
+            theta,
+            [0; 3],
+            true,
+            DType::Float32,
+            Some(&yarn),
+        )
+        .unwrap();
+        let (cos, sin) = (cos.to_float32().unwrap(), sin.to_float32().unwrap());
+        for (row, position) in positions.iter().enumerate() {
+            for (pair, &inverse) in inverse.iter().enumerate() {
+                let angle = f64::from((position[0] as f64 * f64::from(inverse)) as f32);
+                let index = row * dims / 2 + pair;
+                let tolerance = if position[0] > 1000 { 2e-3 } else { 1e-5 };
+                assert!((f64::from(cos[index]) - angle.cos() * factor).abs() <= tolerance);
+                assert!((f64::from(sin[index]) - angle.sin() * factor).abs() <= tolerance);
+            }
+        }
+    }
+
     #[test]
     fn shared_tables_preserve_scalar_rounding_and_media_axes() {
         let mut cache = RotaryWindowCache::default();
@@ -1038,6 +1157,7 @@ mod rotary_window_tests {
                                 10_000_000.,
                                 [16, 8, 8],
                                 interleaved,
+                                None,
                             )
                             .unwrap();
                         let rows: Vec<_> = positions
@@ -1051,6 +1171,7 @@ mod rotary_window_tests {
                                     10_000_000.,
                                     [16, 8, 8],
                                     interleaved,
+                                    None,
                                 )
                                 .unwrap()
                             })

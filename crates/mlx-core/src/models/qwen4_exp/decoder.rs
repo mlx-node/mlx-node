@@ -213,6 +213,8 @@ pub struct Decoder {
     scope: String,
     position_override: Option<usize>,
     rotary_tables: std::cell::RefCell<math::RotaryWindowCache>,
+    /// The target's YaRN; `None` within the native window.
+    pub(super) yarn: Option<math::Yarn>,
     verification: Option<Vec<DecoderState>>,
     device_routes: Option<Vec<(usize, MxArray)>>,
     device_route_cooldown: usize,
@@ -294,7 +296,8 @@ impl Decoder {
 
     pub fn new(config: Config, weights: Store) -> Result<Self> {
         // Validate the checkpoint topology before the first tensor payload read.
-        let context_window = config.max_position_embeddings;
+        let context_window = config.served_context_tokens() as usize;
+        let yarn = math::Yarn::of(&config)?;
         let prefill_chunk_size =
             super::memory::prefill_window(&config, &weights.plan, context_window);
         let d = Self {
@@ -317,6 +320,7 @@ impl Decoder {
             scope: String::new(),
             position_override: None,
             rotary_tables: Default::default(),
+            yarn,
             verification: None,
             device_routes: None,
             device_route_cooldown: 0,
@@ -396,7 +400,13 @@ impl Decoder {
     }
     fn rope(&self, x: &MxArray, pos: usize) -> Result<MxArray> {
         if !self.scope.is_empty() || self.positions.is_empty() {
-            return math::rope(x, pos, self.config.rope_dims(), self.config.rope_theta());
+            return math::rope(
+                x,
+                pos,
+                self.config.rope_dims(),
+                self.config.rope_theta(),
+                self.yarn.as_ref(),
+            );
         }
         let v = &self.config.rope_parameters;
         let p = self
@@ -414,6 +424,7 @@ impl Decoder {
             self.config.rope_theta(),
             sections,
             interleaved,
+            self.yarn.as_ref(),
         )
     }
     #[cfg(test)]

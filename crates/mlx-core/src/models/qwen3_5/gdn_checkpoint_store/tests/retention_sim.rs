@@ -755,6 +755,7 @@ fn dense_0_8b() -> Qwen3_5Config {
 /// Fields `gdn_sidecar::geometry` never reads, filled with anything valid.
 fn small_config_shell() -> Qwen3_5Config {
     Qwen3_5Config {
+        rope_scaling: None,
         qwen35_gguf_gdn_layout: None,
         kv_format: None,
         vocab_size: 32,

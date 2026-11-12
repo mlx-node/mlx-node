@@ -95,6 +95,7 @@ fn tiny_mtp_config() -> Qwen3_5MoeConfig {
         n_mtp_layers: 1,
         qwen35_gguf_gdn_layout: None,
         kv_format: None,
+        rope_scaling: None,
     }
 }
 

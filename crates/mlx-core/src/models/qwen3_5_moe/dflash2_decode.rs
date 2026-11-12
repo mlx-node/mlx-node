@@ -746,8 +746,8 @@ impl DFlash2Target for Qwen35MoeInner {
         self.config.head_dim
     }
 
-    fn max_position_embeddings(&self) -> i32 {
-        self.config.max_position_embeddings
+    fn context_tokens(&self) -> u32 {
+        self.context_cap()
     }
 
     fn dflash2_window(&self) -> Option<u32> {

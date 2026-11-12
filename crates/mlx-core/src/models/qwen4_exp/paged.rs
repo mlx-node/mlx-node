@@ -87,7 +87,7 @@ fn pool_config(
         num_kv_heads: config.num_key_value_heads as u32,
         num_layers: super::load_plan::full_attention_layers(config) as u32,
         use_fp8_cache: Some(false),
-        max_seq_len: Some(config.max_position_embeddings.min(u32::MAX as usize) as u32),
+        max_seq_len: Some(config.served_context_tokens()),
         max_batch_size: Some(4),
     };
     cfg.validate().map_err(Error::from_reason)?;
@@ -451,7 +451,8 @@ impl HybridSchedulerBackend for Inner {
     fn reserve_scheduled_speculation(&mut self, seq: SeqId, queries: usize) -> Result<bool> {
         self.activate_paged_seq(seq)?;
         let window = super::load_plan::mtp_window(&self.decoder.config, &self.memory_plan)
-            .map_or(self.decoder.context_window, |window| window as usize);
+            .map_or(self.decoder.context_window, |window| window as usize)
+            .min(self.context_cap() as usize);
         if self.decoder.history.len() + queries > window {
             return Ok(false);
         }
@@ -519,11 +520,14 @@ impl HybridSchedulerBackend for Inner {
     }
     fn planned_turn_window(&self, speculative: bool) -> Option<u32> {
         let pool = self.memory_plan.pool.as_ref()?;
-        Some(if speculative {
-            super::load_plan::mtp_window(&self.decoder.config, &self.memory_plan)?
-        } else {
-            pool.lane.window.maximum()
-        })
+        Some(
+            if speculative {
+                super::load_plan::mtp_window(&self.decoder.config, &self.memory_plan)?
+            } else {
+                pool.lane.window.maximum()
+            }
+            .min(self.context_cap()),
+        )
     }
     fn scheduler_whole_prompt_prefill(&self, prompt_tokens: u32, cached_prefix: u32) -> bool {
         self.media_prefill.is_none()
@@ -532,10 +536,7 @@ impl HybridSchedulerBackend for Inner {
                 .group_mode(prompt_tokens.saturating_sub(cached_prefix) as usize)
     }
     fn max_position_embeddings(&self) -> i32 {
-        self.decoder
-            .config
-            .max_position_embeddings
-            .min(i32::MAX as usize) as i32
+        self.context_cap() as i32
     }
     fn scheduled_state_capacity(&self) -> Option<ScheduledStateCapacity> {
         let c = &self.decoder.config;

@@ -72,16 +72,16 @@ pub(crate) fn reusable_dflash2_prefix(
     }
 }
 
+/// Splash bounds a DFlash2 turn by the target's served context only; the
+/// draft's sliding window is its own bound.
 pub(crate) fn constrain_dflash2_context_params(
     prompt_tokens: usize,
-    target_capacity: i32,
-    draft_capacity: usize,
+    target_capacity: u32,
     published_window: Option<u32>,
     params: &mut crate::engine::params::ChatParams,
 ) -> Result<usize> {
-    let target_capacity = usize::try_from(target_capacity.max(0)).unwrap_or(usize::MAX);
     let window = published_window.map_or(usize::MAX, |window| window as usize);
-    let capacity = target_capacity.min(draft_capacity).min(window);
+    let capacity = (target_capacity as usize).min(window);
     super::model::constrain_paged_context_params(
         "Qwen3.8 DFlash2",
         prompt_tokens,
@@ -942,8 +942,8 @@ impl DFlash2Target for Qwen35Inner {
         self.config.head_dim
     }
 
-    fn max_position_embeddings(&self) -> i32 {
-        self.config.max_position_embeddings
+    fn context_tokens(&self) -> u32 {
+        self.context_cap()
     }
 
     fn dflash2_window(&self) -> Option<u32> {
@@ -2331,6 +2331,7 @@ pub(crate) mod tests {
     /// 48 value heads × 128, vocab 248 320.
     pub(crate) fn qwen38_27b_cfg() -> super::super::config::Qwen3_5Config {
         super::super::config::Qwen3_5Config {
+            rope_scaling: None,
             qwen35_gguf_gdn_layout: None,
             kv_format: None,
             vocab_size: 248_320,
@@ -2696,25 +2697,28 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// The draft's trained context no longer bounds a DFlash2 turn (Splash
+    /// `servedFor` caps by the target's served context only). Mutation:
+    /// a 12-token draft cap back in `constrain_dflash2_context_params` → red.
     #[test]
-    fn context_budget_uses_the_smaller_target_or_draft_window() {
+    fn context_budget_uses_the_target_window_only() {
         let mut params = extract_chat_params(&ChatConfig {
             max_new_tokens: Some(64),
             ..ChatConfig::default()
         });
-        let capacity = constrain_dflash2_context_params(10, 16, 12, None, &mut params)
+        let capacity = constrain_dflash2_context_params(10, 16, None, &mut params)
             .expect("valid prompt is clamped");
-        assert_eq!(capacity, 12);
-        assert_eq!(params.max_new_tokens, 2);
+        assert_eq!(capacity, 16);
+        assert_eq!(params.max_new_tokens, 6);
 
         let mut too_long = extract_chat_params(&ChatConfig::default());
-        let error = constrain_dflash2_context_params(13, 16, 12, None, &mut too_long)
-            .expect_err("prompt beyond draft context must fail before prefill");
-        assert!(error.reason.contains("effective active context is 12"));
+        let error = constrain_dflash2_context_params(17, 16, None, &mut too_long)
+            .expect_err("prompt beyond the target context must fail before prefill");
+        assert!(error.reason.contains("effective active context is 16"));
 
-        assert!(dflash2_final_token_fits_context(11, capacity));
+        assert!(dflash2_final_token_fits_context(15, capacity));
         assert!(
-            !dflash2_final_token_fits_context(12, capacity),
+            !dflash2_final_token_fits_context(16, capacity),
             "the final sampled token may be returned at capacity but must not be forwarded"
         );
     }
@@ -2730,20 +2734,15 @@ pub(crate) mod tests {
             ..ChatConfig::default()
         });
         let capacity =
-            constrain_dflash2_context_params(140_000, 262_144, 262_144, Some(148_464), &mut params)
+            constrain_dflash2_context_params(140_000, 262_144, Some(148_464), &mut params)
                 .expect("prompt inside the window");
         assert_eq!(capacity, 148_464);
         assert_eq!(params.max_new_tokens, 148_464 - 140_000);
 
         let mut at_window = extract_chat_params(&ChatConfig::default());
-        let error = constrain_dflash2_context_params(
-            148_464,
-            262_144,
-            262_144,
-            Some(148_464),
-            &mut at_window,
-        )
-        .expect_err("a prompt filling the window leaves no room to generate");
+        let error =
+            constrain_dflash2_context_params(148_464, 262_144, Some(148_464), &mut at_window)
+                .expect_err("a prompt filling the window leaves no room to generate");
         assert!(
             error
                 .reason

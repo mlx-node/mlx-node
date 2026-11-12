@@ -11,6 +11,7 @@ pub mod linear;
 pub mod losses;
 pub mod normalization;
 pub mod rope;
+pub mod rope_scaling;
 
 #[cfg(test)]
 mod layers_test;

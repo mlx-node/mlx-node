@@ -696,6 +696,7 @@ mod tests {
         // (head_dim divisible by 2 for RoPE). full_attention_interval=4
         // makes layer 3 a full-attention layer; n_mtp_layers=1.
         Qwen3_5Config {
+            rope_scaling: None,
             qwen35_gguf_gdn_layout: None,
             kv_format: None,
             vocab_size: 1024,

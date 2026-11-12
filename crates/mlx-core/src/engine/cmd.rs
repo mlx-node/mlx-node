@@ -608,6 +608,12 @@ mod mock_backend_tests {
         /// Whether a whole-turn progress was installed on this thread when
         /// each `prefill` ran.
         progress_installed_in_prefill: Vec<bool>,
+        /// Returned from `context_window`.
+        context_window_knob: Option<u32>,
+        /// `params.max_new_tokens` seen by each `begin_decode`.
+        decode_max_new_tokens: Vec<i32>,
+        /// `config.max_new_tokens` seen by each speculative whole turn.
+        speculative_max_new_tokens: Vec<Option<i32>>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -652,6 +658,9 @@ mod mock_backend_tests {
                 turn_cancel_events: Vec::new(),
                 flip_cancel_in_prefill_knob: None,
                 progress_installed_in_prefill: Vec::new(),
+                context_window_knob: None,
+                decode_max_new_tokens: Vec::new(),
+                speculative_max_new_tokens: Vec::new(),
             }
         }
     }
@@ -811,6 +820,10 @@ mod mock_backend_tests {
             self.flat_caches_desynced_knob
         }
 
+        fn context_window(&self) -> Option<u32> {
+            self.context_window_knob
+        }
+
         fn clear_flat_caches_desynced(&mut self) {
             self.flat_caches_desynced_knob = false;
         }
@@ -846,7 +859,9 @@ mod mock_backend_tests {
             ))
         }
 
-        fn run_speculative_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+            self.speculative_max_new_tokens
+                .push(args.config.max_new_tokens);
             Ok(TurnOutput::Complete(Box::new(ChatResult {
                 text: "SPECULATIVE_COMPLETE".to_string(),
                 tool_calls: Vec::new(),
@@ -967,6 +982,7 @@ mod mock_backend_tests {
             Self: 'a;
 
         fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+            self.decode_max_new_tokens.push(turn.params.max_new_tokens);
             self.begin_decode_turns.push(TurnSnapshot {
                 is_delta: turn.is_delta,
                 total_seq_len: turn.total_seq_len,
@@ -2733,5 +2749,105 @@ mod mock_backend_tests {
         );
         assert_eq!(backend.render_prompt_calls.load(Ordering::Relaxed), 0);
         assert!(backend.prefill_calls.is_empty());
+    }
+
+    /// Gate: the window refuses a full context that leaves no room for one
+    /// new token before any cache change, on a start and on a continuation
+    /// whose delta alone fits. Mutation: skip the `context_window` check in
+    /// `chat_turn_core` → red.
+    #[test]
+    fn context_window_refuses_before_any_cache_change() {
+        let mut backend =
+            MockBackend::new(vec![vec![TOK_HELLO, TOK_THINK_END, TOK_WORLD, TOK_IM_END]]);
+        let r1 = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
+            messages: user_messages("hello world"),
+            config: greedy_config(),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("start failed: {}", e.reason));
+        let prompt = backend.prefill_calls[0].len();
+        let history = backend.history.clone();
+        let assert_untouched = |backend: &MockBackend, error: Error| {
+            assert!(
+                error.reason.starts_with("context_length_exceeded"),
+                "{}",
+                error.reason
+            );
+            assert_eq!(backend.reset_calls, vec![ResetScope::PrefixMiss]);
+            assert_eq!(backend.prefill_calls.len(), 1);
+            assert_eq!(backend.save_calls.len(), 1);
+            assert_eq!(backend.history, history);
+        };
+
+        backend.context_window_knob = Some(prompt as u32);
+        let error = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
+            messages: user_messages("hello world"),
+            config: greedy_config(),
+            reply,
+        })
+        .expect_err("a prompt of the whole window is refused");
+        assert_untouched(&backend, error);
+
+        backend.context_window_knob = Some(history.len() as u32 + 1);
+        let mut messages = user_messages("hello world");
+        messages.push(assistant_message(&r1));
+        messages.extend(user_messages("again"));
+        let error = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
+            cancelled: test_cancel_flag(),
+            messages,
+            config: greedy_config(),
+            reply,
+        })
+        .expect_err("history plus the delta overflows the window");
+        assert_untouched(&backend, error);
+    }
+
+    /// Gate: under the window both the generic decode and a whole turn get
+    /// `window - prompt` new tokens. Mutation: leave the clamp out of the
+    /// config the whole-turn cores re-extract → red (1000).
+    #[test]
+    fn context_window_clamps_the_whole_turn_budget() {
+        let mut backend =
+            MockBackend::new(vec![vec![TOK_HELLO, TOK_THINK_END, TOK_WORLD, TOK_IM_END]]);
+        backend.speculative_complete_knob = true;
+        let prompt = backend
+            .tokenizer
+            .apply_chat_template_sync(
+                &user_messages("hello"),
+                Some(true),
+                None,
+                None,
+                crate::engine::session::SESSION_PRESERVE_THINKING,
+            )
+            .unwrap_or_else(|e| panic!("probe render failed: {}", e.reason))
+            .len();
+        backend.context_window_knob = Some(prompt as u32 + 5);
+        let config = |enable_mtp| ChatConfig {
+            max_new_tokens: Some(1000),
+            enable_mtp: Some(enable_mtp),
+            ..greedy_config()
+        };
+
+        run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
+            messages: user_messages("hello"),
+            config: config(false),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("generic turn failed: {}", e.reason));
+        assert_eq!(backend.prefill_calls[0].len(), prompt);
+        assert_eq!(backend.decode_max_new_tokens, vec![5]);
+
+        let result = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
+            messages: user_messages("hello"),
+            config: config(true),
+            reply,
+        })
+        .unwrap_or_else(|e| panic!("speculative turn failed: {}", e.reason));
+        assert_eq!(result.text, "SPECULATIVE_COMPLETE");
+        assert_eq!(backend.speculative_max_new_tokens, vec![Some(5)]);
     }
 }

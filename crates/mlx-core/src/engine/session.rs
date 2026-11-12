@@ -1146,11 +1146,19 @@ fn chat_turn_core<B: ChatBackend>(
     let think_end_id = admitted.think_end_id;
     let think_end_str = admitted.think_end_str;
     let think_end_extra_ids = admitted.think_end_extra_ids;
-    let config = admitted.config;
-    let p = admitted.params;
+    let mut config = admitted.config;
+    let mut p = admitted.params;
+    let tokens = admitted.tokens;
+    if let Some(window) = backend.context_window() {
+        let max_output = crate::engine::scheduler::context_output_budget(tokens.len(), window)?;
+        p.max_new_tokens = p
+            .max_new_tokens
+            .min(i32::try_from(max_output).unwrap_or(i32::MAX));
+        // The whole-turn cores re-extract their params from the config.
+        config.max_new_tokens = Some(p.max_new_tokens);
+    }
     let thinking = admitted.thinking;
     let template_thinking_enabled = admitted.template_thinking_enabled;
-    let tokens = admitted.tokens;
     let images = admitted.images;
     let audio = admitted.audio;
     let turn_plan = admitted.plan;

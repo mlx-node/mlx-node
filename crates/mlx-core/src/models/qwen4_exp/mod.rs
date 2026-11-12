@@ -65,6 +65,8 @@ struct Inner {
     /// The memory plan the load settled on: the pool, the window and the
     /// dynamic budget the scheduled state shares with the pool.
     memory_plan: crate::engine::memory_plan::MemoryPlan,
+    /// `--max-context`: the context every turn may hold.
+    max_context: Option<u32>,
     /// Scheduled turns admitted and not yet finished; the first to open
     /// after the set emptied starts a live window, every open adds its
     /// turn to the one in progress.
@@ -75,6 +77,12 @@ struct Inner {
 }
 
 impl Inner {
+    /// The context every turn may hold: `--max-context`, else the served
+    /// window.
+    fn context_cap(&self) -> u32 {
+        self.max_context
+            .unwrap_or_else(|| self.decoder.config.served_context_tokens())
+    }
     /// The first turn after an idle gap activates reclaimable banks and
     /// resumes their direct fill. Admissions beside an open turn share it.
     fn open_turn(&mut self, first: bool) {
@@ -347,6 +355,11 @@ pub struct Qwen4ExpLoadOptions {
     /// The Metal memory budget (`--max-memory`) the memory plan sizes the
     /// stores, the pool and the windows within.
     pub max_memory_bytes: Option<i64>,
+    /// Context token limit (`--max-context`), 1 to 1,010,000: the KV
+    /// allowance the stores leave room for and the most any turn holds; the
+    /// load fails when its plan holds fewer. Past the native window the
+    /// target's RoPE takes YaRN.
+    pub max_context_tokens: Option<i64>,
 }
 
 /// Load-time residency decision (the budget is admitted before payload
@@ -426,18 +439,19 @@ impl Qwen4ExpContextLimits {
         config: &config::Config,
         plan: &crate::engine::memory_plan::MemoryPlan,
         has_mtp: bool,
+        cap: u32,
     ) -> Result<Self> {
         let pool = plan
             .pool
             .as_ref()
             .ok_or_else(|| Error::from_reason("Qwen4Exp memory plan: the load planned no pool"))?;
         let speculative = if has_mtp {
-            load_plan::mtp_window(config, plan)
+            load_plan::mtp_window(config, plan).map(|window| window.min(cap))
         } else {
             None
         };
         Ok(Self {
-            effective_window_tokens: pool.lane.window.maximum(),
+            effective_window_tokens: pool.lane.window.maximum().min(cap),
             paged_block_capacity: pool.max_blocks,
             paged_block_size: crate::engine::memory_plan::KV_PAGE_TOKENS as u32,
             trained_window_tokens: config.max_position_embeddings.min(u32::MAX as usize) as u32,
@@ -471,6 +485,8 @@ impl Qwen4ExpModel {
         let options = options.unwrap_or_default();
         let max_memory =
             crate::models::qwen3_5::load_plan::max_memory_option(LABEL, options.max_memory_bytes)?;
+        let max_context =
+            crate::nn::rope_scaling::max_context_option(LABEL, options.max_context_tokens)?;
         // `gguf::assets` leases the returned sidecar for the model's
         // lifetime; when init fails, the caller must release that reference
         // or the dir is pinned against the cache cap forever.
@@ -496,6 +512,7 @@ impl Qwen4ExpModel {
                     &path,
                     options.auxiliary_model_path.as_deref(),
                 )?;
+                load_plan::serve_context(LABEL, &mut config, max_context)?;
                 let has_mtp = auxiliary::validate_mtp(&weights, &config)?;
                 let vision = media::Vision::metadata(&raw, &weights, &config)?;
                 let supports_images = vision.available();
@@ -513,8 +530,15 @@ impl Qwen4ExpModel {
                     ))
                 })?;
                 let inventory = weights.load_inventory(&config, supports_images)?;
-                let decision =
-                    load_plan::plan_store(LABEL, &config, &inventory, live, max_memory, has_mtp)?;
+                let decision = load_plan::plan_store(
+                    LABEL,
+                    &config,
+                    &inventory,
+                    live,
+                    max_memory,
+                    max_context,
+                    has_mtp,
+                )?;
                 weights.set_store_plan(decision.store, inventory.store_fixed_bytes);
                 let mut decoder = decoder::Decoder::new(config.clone(), weights)?;
                 decoder.register_cache_limit();
@@ -550,6 +574,7 @@ impl Qwen4ExpModel {
                         load_plan::settle(&engine, held_back, decision.allowance, &mut |bytes| {
                             weights.lower_store_cap(bytes)
                         })?;
+                    load_plan::check_context(LABEL, &plan, max_context)?;
                     let pool_plan = plan.pool.ok_or_else(|| {
                         Error::from_reason(format!("{LABEL} memory plan: the load planned no pool"))
                     })?;
@@ -571,8 +596,12 @@ impl Qwen4ExpModel {
                     &memory_plan,
                     pool_bytes,
                 )?;
-                let context_limits =
-                    Qwen4ExpContextLimits::from_plan(&config, &memory_plan, has_mtp)?;
+                let context_limits = Qwen4ExpContextLimits::from_plan(
+                    &config,
+                    &memory_plan,
+                    has_mtp,
+                    max_context.unwrap_or_else(|| config.served_context_tokens()),
+                )?;
                 decoder.context_window = context_limits.effective_window_tokens as usize;
                 decoder
                     .weights
@@ -599,6 +628,7 @@ impl Qwen4ExpModel {
                     media_prefill: None,
                     _pool_guard: pool_guard,
                     memory_plan,
+                    max_context,
                     open_turns: std::collections::HashSet::new(),
                     exclusive_turn: false,
                 };
