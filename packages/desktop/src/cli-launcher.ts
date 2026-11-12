@@ -10,6 +10,16 @@ import { CliVerificationCache } from './cli-verification-cache.js';
 
 const execute = promisify(execFile);
 const HEADER = '#!/bin/sh\n# Managed by mlx-node.\n';
+const AGENT_UPDATE_MS = 600_000;
+
+/** `mlx agent update` through the prepared launcher. Its output is not kept: it is not ours to log. */
+export async function runAgentUpdate(command: string): Promise<void> {
+  try {
+    await execute(command, ['agent', 'update'], { timeout: AGENT_UPDATE_MS, maxBuffer: 1024 * 1024 });
+  } catch {
+    throw new Error('mlx agent update failed');
+  }
+}
 
 export interface DesktopCliConfig {
   executable: string;

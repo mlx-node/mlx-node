@@ -60,6 +60,11 @@ import {
   type Rect,
   type WindowBounds,
 } from './settings.js';
+import {
+  createSupervisorStateWriter,
+  projectSupervisorState,
+  supervisorStateFilePath,
+} from './supervisor-state-file.js';
 import { utilityChildTransport } from './supervisor/child-utility.js';
 import { createSupervisor, type Supervisor } from './supervisor/index.js';
 import { prepareExtraCaBundle, securityText } from './system-ca.js';
@@ -79,6 +84,7 @@ let saveDirty = false;
 let saveInFlight: Promise<void> = Promise.resolve();
 
 let supervisor: Supervisor | null = null;
+let supervisorStateWriter: ReturnType<typeof createSupervisorStateWriter> | null = null;
 let tray: TrayController | null = null;
 let controlPanel: ControlPanelWindowManager | null = null;
 let broker: ControlPanelBroker<WebContents> | null = null;
@@ -312,9 +318,12 @@ async function bootstrap(): Promise<void> {
     env: sidecarEnvOverrides({ nativeAddon: paths.nativeAddon, modelsDir: settings.modelsDir }),
   });
 
+  const stateWriter = createSupervisorStateWriter(supervisorStateFilePath());
+  supervisorStateWriter = stateWriter;
   supervisor.on((event) => {
     if (event.type === 'state') {
       tray?.update(event.snapshot);
+      stateWriter.write(projectSupervisorState(event.snapshot, process.pid, Date.now()));
       return;
     }
     if (event.type === 'crashed') {
@@ -648,4 +657,5 @@ async function shutdown(): Promise<void> {
   // its temp root. Serialising them would spend two kill-grace periods against
   // one whole-app quit deadline.
   await Promise.all([broker?.dispose(), supervisor?.dispose()]);
+  await supervisorStateWriter?.dispose();
 }

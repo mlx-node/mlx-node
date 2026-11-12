@@ -81,8 +81,8 @@ export function newSidecarAuthToken(): string {
  * enter renderer RPC, public snapshots, the `info` reply, or supervisor traces.
  * The supervisor polls unauthenticated `/health`.
  */
-export function sidecarHostOptions(): { port: number; host: string; authToken: string } {
-  return { ...SIDECAR_HOST_OPTIONS, authToken: newSidecarAuthToken() };
+export function sidecarHostOptions(): { port: number; host: string; authToken: string; hostKind: 'desktop' } {
+  return { ...SIDECAR_HOST_OPTIONS, authToken: newSidecarAuthToken(), hostKind: 'desktop' };
 }
 
 /**

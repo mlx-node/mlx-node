@@ -177,6 +177,10 @@ describe('the readiness handshake', () => {
     expect(tokens.size).toBe(8);
   });
 
+  it('names the desktop as the host kind of the runtime series', () => {
+    expect(sidecarHostOptions().hostKind).toBe('desktop');
+  });
+
   it('keeps the bind that the token protects', () => {
     const options = sidecarHostOptions();
     expect(options.port).toBe(SIDECAR_HOST_OPTIONS.port);
