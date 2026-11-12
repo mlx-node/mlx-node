@@ -2197,6 +2197,10 @@ pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     wanted_signature: Vec<(SeqId, usize)>,
     /// What a step's GPU command that exhausted Metal memory reported.
     gpu_oom: Option<String>,
+    /// The next lane admission or resume's prefix preparation fails with
+    /// this text.
+    #[cfg(test)]
+    prefix_failure: Option<&'static str>,
     /// The current drive pass: its start on the governor's clock and what
     /// it ran.
     pass_start: f64,
@@ -2262,6 +2266,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             worked_lanes: Vec::new(),
             wanted_signature: Vec::new(),
             gpu_oom: None,
+            #[cfg(test)]
+            prefix_failure: None,
             pass_start: 0.0,
             pass_work: PassWork::default(),
             timeline: Timeline::default(),
@@ -4223,6 +4229,25 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
     }
 
+    /// Splash `NativeRuntime::executionFailed` around `Engine::tick`'s
+    /// admission: a lane's prefix preparation that a GPU command exhausting
+    /// Metal memory failed restarts the model like a failed step. The
+    /// request's error, or `None` for any other failure.
+    fn prefix_gpu_oom(&mut self, error: &Error) -> Option<String> {
+        if self.judge_policy() != JudgePolicy::Ledger
+            || !crate::engine::governor::is_gpu_out_of_memory(&error.reason)
+        {
+            return None;
+        }
+        let _ = crate::engine::governor::governor::take_lane_denial();
+        self.gpu_oom = Some(error.reason.clone());
+        Some(if error.reason.starts_with("metal_out_of_memory:") {
+            error.reason.clone()
+        } else {
+            crate::engine::governor::metal_out_of_memory(&error.reason)
+        })
+    }
+
     /// The step failed as a whole. On the ledger a GPU command that
     /// exhausted Metal memory fails the model's requests and resets its
     /// caches, and the thread lives; any other failure ends the thread.
@@ -4847,6 +4872,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             prepared.block_size,
         );
         drop(scope);
+        #[cfg(test)]
+        let prefix_admission = match self.prefix_failure.take() {
+            Some(reason) => Err(Error::from_reason(reason)),
+            None => prefix_admission,
+        };
         let prefix_admission = match prefix_admission {
             Ok(prefix) => prefix,
             Err(error) => {
@@ -4855,16 +4885,23 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 self.inner.release_scheduled_speculation(seq_id);
                 self.inner.scheduled_turn_closed(seq_id);
                 self.inner.set_turn_cancel_flag(None);
-                let error = match self.prefix_refused(seq_id, &mut prepared.resource_wait, false) {
-                    Some(Err(failed)) => failed,
-                    Some(Ok(())) => return Err(prepared),
-                    None => error,
+                let oom = self.prefix_gpu_oom(&error);
+                let error = match oom.clone() {
+                    Some(reason) => Error::from_reason(reason),
+                    None => match self.prefix_refused(seq_id, &mut prepared.resource_wait, false) {
+                        Some(Err(failed)) => failed,
+                        Some(Ok(())) => return Err(prepared),
+                        None => error,
+                    },
                 };
                 self.owner_states.remove(&prepared.owner_id);
                 self.owner_sequences.remove(&prepared.owner_id);
                 prepared
                     .response
                     .send_error(error, prepared.cancelled.as_ref());
+                if oom.is_some() {
+                    self.recover_if_gpu_oom();
+                }
                 return Ok(None);
             }
         };
@@ -5436,7 +5473,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .claim
             .as_ref()
             .map(|claim| Scope::enter_lane(claim.claim()));
-        let prefix_admission = match self.inner.prepare_scheduled_prefix(
+        let prefix_admission = self.inner.prepare_scheduled_prefix(
             turn.seq_id,
             &replay_tokens,
             self.owner_states
@@ -5446,13 +5483,24 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             true,
             turn.payload.params.cache_salt,
             turn.block_size,
-        ) {
+        );
+        #[cfg(test)]
+        let prefix_admission = match self.prefix_failure.take() {
+            Some(reason) => Err(Error::from_reason(reason)),
+            None => prefix_admission,
+        };
+        let prefix_admission = match prefix_admission {
             Ok(prefix) => prefix,
             Err(error) => {
                 drop(scope);
                 let _ = self.inner.release_scheduled_cache(turn.seq_id);
                 self.inner.release_scheduled_recurrent_for(turn.seq_id);
                 self.inner.release_scheduled_speculation(turn.seq_id);
+                if let Some(oom) = self.prefix_gpu_oom(&error) {
+                    self.fail_preempted(turn, oom);
+                    self.recover_if_gpu_oom();
+                    return;
+                }
                 let seq_id = turn.seq_id;
                 match self.prefix_refused(seq_id, &mut turn.resource_wait, true) {
                     Some(Err(failed)) => self.fail_preempted(turn, failed.reason.clone()),
@@ -9010,6 +9058,72 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(state.scheduler.running_len(), 0);
+        assert_eq!(governor.metal_out_of_memory(7), 1);
+    }
+
+    /// The reply of a request a GPU memory restart ended.
+    #[cfg(target_os = "macos")]
+    fn assert_metal_oom(
+        result: &mut tokio::sync::oneshot::Receiver<Result<ChatResult>>,
+        who: &str,
+    ) {
+        let error = result
+            .try_recv()
+            .unwrap_or_else(|_| panic!("{who} replied"))
+            .expect_err("the request fails");
+        assert!(
+            error.reason.starts_with(
+                "metal_out_of_memory: a GPU command exhausted Metal memory ([METAL] Command \
+                 buffer execution failed: Insufficient Memory"
+            ),
+            "{who}: {}",
+            error.reason
+        );
+    }
+
+    /// Splash `NativeRuntime::executionFailed` around `Engine::tick`'s
+    /// admission: a new turn whose prefix preparation MLX failed for Metal
+    /// memory, and a suspended lane whose resume did, fail
+    /// `metal_out_of_memory:` and restart the model at once: the resident
+    /// lanes fail and the ladder resets.
+    /// Mutation E7 (a prefix preparation's error is not classified) → red
+    /// (the new turn gets MLX's text); E7b (the resume's is not) → red (the
+    /// resumed lane gets MLX's text).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_prefix_preparation_oom_restarts_the_model() {
+        const OOM: &str = "[METAL] Command buffer execution failed: Insufficient Memory \
+                           (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory).";
+        let Some((mut state, governor, mut replies)) = judged_state(&[1]) else {
+            return;
+        };
+        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
+        state.prefix_failure = Some(OOM);
+        let mut prompt = tokens_of(40, 2);
+        prompt.push(3);
+        let (prepared, mut result) = prepared_turn(&mut state, 3, prompt);
+        assert!(matches!(state.admit_prepared(prepared), Ok(None)));
+        assert!(state.prefix_failure.is_none(), "the prefix was prepared");
+        assert_metal_oom(&mut result, "the new turn");
+        assert_metal_oom(&mut replies[0], "the resident lane");
+        assert_eq!(state.scheduler.running_len(), 0);
+        assert!(!has_rung(&state, r), "the ladder is reset");
+        assert_eq!(governor.metal_out_of_memory(7), 1);
+
+        let Some((mut state, governor, mut replies)) = judged_state(&[1]) else {
+            return;
+        };
+        state.row_work_ends.insert(1, 33);
+        let blocked = vec![(1, kv_denial(Failure::HostPressure))];
+        assert!(!state.settle_blocked(blocked, false, &[1]));
+        let r = *rung(&mut state, 30, 2, 0).last().expect("R");
+        governor.sleep(0.2);
+        state.prefix_failure = Some(OOM);
+        state.resume_preempted();
+        assert!(state.prefix_failure.is_none(), "the resume was prepared");
+        assert!(!state.scheduler.has_preempted());
+        assert_metal_oom(&mut replies[0], "the resumed lane");
+        assert!(!has_rung(&state, r), "the ladder is reset");
         assert_eq!(governor.metal_out_of_memory(7), 1);
     }
 
