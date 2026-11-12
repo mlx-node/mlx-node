@@ -24,6 +24,9 @@ fn source_operand_fixture_with_inline_mtp(root: &Path, inline_mtp: bool) -> Path
             .unwrap()
             .1 = GgufMetaValue::Uint32(value);
     }
+    if inline_mtp {
+        metadata.push(("qwen35moe.nextn_predict_layers", GgufMetaValue::Uint32(1)));
+    }
     let mut owned = source_math::expected_tensors()
         .into_iter()
         .enumerate()

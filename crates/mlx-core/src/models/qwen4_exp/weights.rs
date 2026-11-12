@@ -1988,6 +1988,70 @@ pub(super) fn routed_expert_tensor(name: &str) -> Option<(usize, usize)> {
 mod cache_tests {
     use super::*;
 
+    /// Splash `storedRowBytes`: a BF16 / F16 PLE table row is `columns * 2`
+    /// bytes at any width, 160 included (not a multiple of 256).
+    #[test]
+    fn ple_table_rows_bf16_and_f16_at_width_160() {
+        use crate::utils::gguf_test_fixtures::build_minimal_gguf;
+        const WIDTH: usize = 160;
+        const ROWS: usize = 7;
+        let value = |r: usize, c: usize| ((r * ROWS + c) % 128) as f32 - 64.0;
+        let dir = std::env::temp_dir().join(format!("qwen4-ple-rows-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        for ty in [GgufTensorType::BF16, GgufTensorType::F16] {
+            let payload: Vec<u8> = (0..ROWS)
+                .flat_map(|r| (0..WIDTH).map(move |c| (r, c)))
+                .flat_map(|(r, c)| match ty {
+                    GgufTensorType::BF16 => half::bf16::from_f32(value(r, c)).to_le_bytes(),
+                    _ => half::f16::from_f32(value(r, c)).to_le_bytes(),
+                })
+                .collect();
+            let path = dir.join(format!("ple-{ty:?}.gguf"));
+            fs::write(
+                &path,
+                build_minimal_gguf(
+                    &[(
+                        "general.architecture",
+                        GgufMetaValue::String("qwen4exp".into()),
+                    )],
+                    &[(
+                        "per_layer_token_embd.weight",
+                        &[WIDTH as u64, ROWS as u64],
+                        ty,
+                        &payload,
+                    )],
+                ),
+            )
+            .unwrap();
+            let store = Store::open_descriptors(&path).unwrap();
+            let d = store.descriptor("per_layer_token_embd.weight").unwrap();
+            assert_eq!(d.rows().unwrap(), ROWS, "{ty:?}");
+            assert_eq!(d.width().unwrap(), WIDTH, "{ty:?}");
+            let check = |start: usize, rows: usize| {
+                let weight = d
+                    .import_rows(start, rows)
+                    .unwrap_or_else(|e| panic!("{ty:?} rows {start}+{rows}: {}", e.reason));
+                let got = weight.values.astype(DType::Float32).unwrap();
+                let got = got.to_float32().unwrap();
+                let want: Vec<f32> = (start..start + rows)
+                    .flat_map(|r| (0..WIDTH).map(move |c| value(r, c)))
+                    .collect();
+                assert_eq!(&*got, want.as_slice(), "{ty:?} rows {start}+{rows}");
+            };
+            for r in 0..ROWS {
+                check(r, 1);
+            }
+            check(2, 3);
+        }
+    }
+
     #[test]
     fn pq2_gguf_is_rejected_during_store_indexing() {
         let dir = std::env::temp_dir().join(format!("qwen4-pq2-reject-{}", uuid::Uuid::new_v4()));

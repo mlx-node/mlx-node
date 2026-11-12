@@ -79,13 +79,13 @@ describe('ggufNextSteps', () => {
   });
 
   it('tells a family without split support to merge first, never to convert each shard', async () => {
-    const set = shards('Qwen3.6-27B-UD-Q4_K_XL', 2);
-    writeGguf(join(dir, set[0]), 'qwen35');
+    const set = shards('gemma-4-31b-it-UD-Q4_K_XL', 2);
+    writeGguf(join(dir, set[0]), 'gemma4');
     writeGguf(join(dir, set[1]));
     expect(await ggufNextSteps(dir, set)).toEqual([
       'Split GGUF with no split-aware loader: merge the shards, then convert:',
-      `  llama-gguf-split --merge ${join(dir, set[0])} ${join(dir, 'Qwen3.6-27B-UD-Q4_K_XL.gguf')}`,
-      `  mlx convert -i ${join(dir, 'Qwen3.6-27B-UD-Q4_K_XL.gguf')} -o ${dir}-mlx`,
+      `  llama-gguf-split --merge ${join(dir, set[0])} ${join(dir, 'gemma-4-31b-it-UD-Q4_K_XL.gguf')}`,
+      `  mlx convert -i ${join(dir, 'gemma-4-31b-it-UD-Q4_K_XL.gguf')} -o ${dir}-mlx`,
     ]);
   });
 

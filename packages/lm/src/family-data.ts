@@ -444,7 +444,7 @@ export const MODEL_FAMILY_DATA = [
     coldRestoreEligible: true,
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen35'],
-    ggufDiscovery: { variants: 'qwen35-xl' },
+    ggufDiscovery: { variants: 'qwen35-xl', split: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
     launchPreset: {
       sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
@@ -456,7 +456,7 @@ export const MODEL_FAMILY_DATA = [
     visionConfigKeys: ['vision_config'],
     kind: 'trainable',
     ggufArchitectures: ['qwen35moe'],
-    ggufDiscovery: { variants: 'qwen35-xl' },
+    ggufDiscovery: { variants: 'qwen35-xl', split: true },
     match: { rawModelTypes: ['qwen3_5_moe'] },
     acceptsDraftModel: true,
     acceptsKvFormat: true,

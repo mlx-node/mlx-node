@@ -487,7 +487,11 @@ pub(crate) fn checkpoint_weight_bytes(source: &CheckpointSource) -> Result<u64> 
                 .companion
                 .as_ref()
                 .map_or(Ok(0), |(path, _, _)| stat(path))?;
-            Ok(stat(&checkpoint.main.0)?.saturating_add(companion))
+            let mut total = companion;
+            for (path, _, _) in &checkpoint.main.parts {
+                total = total.saturating_add(stat(path)?);
+            }
+            Ok(total)
         }
     }
 }
@@ -539,9 +543,11 @@ fn safetensors_dtypes(paths: &[PathBuf]) -> Result<Vec<(String, DType)>> {
 pub(crate) fn checkpoint_header(source: &CheckpointSource, moe: bool) -> Result<CheckpointHeader> {
     let mut raw_dtypes = match source {
         CheckpointSource::Dir(dir) => safetensors_dtypes(&checkpoint_safetensors_files(dir))?,
-        CheckpointSource::Gguf(checkpoint) => {
-            imported_dtypes(&checkpoint.main.1, &checkpoint.plans.0, &checkpoint.opts)
-        }
+        CheckpointSource::Gguf(checkpoint) => imported_dtypes(
+            &checkpoint.main.header,
+            &checkpoint.plans.0,
+            &checkpoint.opts,
+        ),
     };
     let asset_dir = source.asset_dir();
     let raw = read_config_json(asset_dir)?;

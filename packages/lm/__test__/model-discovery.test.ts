@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vite-plus/test';
 
-import { discoverLocalChatModels } from '../src/model-discovery.js';
+import { discoverLocalChatModels, ggufSplitPart } from '../src/model-discovery.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'mlx-discovery-'));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -294,6 +294,35 @@ describe('discoverLocalChatModels', () => {
     writeFileSync(gguf, minimalGguf('qwen35'));
     const models = await discoverLocalChatModels(dir);
     expect(models).toEqual([expect.objectContaining({ path: gguf, modelType: 'qwen3_5' })]);
+  });
+
+  it('finds part 1 of a split Qwen3.5 MoE XL GGUF and never its later parts', async () => {
+    const dir = join(tmp, 'qwen35moe-split');
+    mkdirSync(dir);
+    const parts = [1, 2, 3].map((k) => join(dir, `Qwen3.5-122B-A10B-UD-Q4_K_XL-0000${k}-of-00003.gguf`));
+    for (const part of parts) writeFileSync(part, minimalGguf('qwen35moe'));
+    writeFileSync(join(dir, 'Model-Q4_0-00001-of-00002.gguf'), minimalGguf('qwen35moe'));
+    writeFileSync(join(dir, 'Model-Q4_0-00002-of-00002.gguf'), minimalGguf('qwen35moe'));
+    const models = await discoverLocalChatModels(dir);
+    expect(models).toEqual([expect.objectContaining({ path: parts[0], modelType: 'qwen3_5_moe' })]);
+
+    const single = join(tmp, 'qwen35moe-single');
+    mkdirSync(single);
+    const whole = join(single, 'Qwen3.5-122B-A10B-UD-Q4_K_XL.gguf');
+    writeFileSync(whole, minimalGguf('qwen35moe'));
+    expect(await discoverLocalChatModels(single)).toEqual([
+      expect.objectContaining({ path: whole, modelType: 'qwen3_5_moe' }),
+    ]);
+  });
+
+  it('parses split GGUF part names without a pattern', () => {
+    expect(ggufSplitPart('M-UD-Q4_K_XL-00002-of-00003.GGUF')).toEqual({ stem: 'M-UD-Q4_K_XL', part: 2, total: 3 });
+    expect(ggufSplitPart('M-00004-of-00003.gguf')).toBeNull();
+    expect(ggufSplitPart('M-00000-of-00003.gguf')).toBeNull();
+    expect(ggufSplitPart('M-0001-of-00003.gguf')).toBeNull();
+    expect(ggufSplitPart('M-00001-of-01025.gguf')).toBeNull();
+    expect(ggufSplitPart('M.gguf')).toBeNull();
+    expect(ggufSplitPart('M-00001-of-00002.safetensors')).toBeNull();
   });
 
   it.skipIf(!canChmod)('reports an entry it could not evaluate via onEntryFailure', async () => {

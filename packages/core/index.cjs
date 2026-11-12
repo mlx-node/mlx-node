@@ -906,6 +906,7 @@ module.exports.BuiltinRewardType = nativeBinding.BuiltinRewardType;
 module.exports.calibrateActivationAmaxRaw = nativeBinding.calibrateActivationAmaxRaw;
 module.exports.captureTeacherLogits = nativeBinding.captureTeacherLogits;
 module.exports.ChatRole = nativeBinding.ChatRole;
+module.exports.checkGgufHeaders = nativeBinding.checkGgufHeaders;
 module.exports.coldCacheDrain = nativeBinding.coldCacheDrain;
 module.exports.coldCacheStats = nativeBinding.coldCacheStats;
 module.exports.coldRestoreFamilies = nativeBinding.coldRestoreFamilies;

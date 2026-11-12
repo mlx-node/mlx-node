@@ -2348,7 +2348,7 @@ mod tests {
         std::fs::write(asset.join("config.json"), b"{}").unwrap();
         let main = dir.join("main.gguf");
         write_gguf_file(&main, "qwen35", 1);
-        let identity = GgufIdentity::new(&gguf_file_identity(&main), None);
+        let identity = GgufIdentity::new(&[gguf_file_identity(&main)], None);
 
         assert!(
             build(&asset).is_none(),
@@ -2371,12 +2371,12 @@ mod tests {
         write_gguf_file(&main, "qwen35", 1);
         write_gguf_file(&companion, "clip", 2);
         let first = build_gguf(&GgufIdentity::new(
-            &gguf_file_identity(&main),
+            &[gguf_file_identity(&main)],
             Some(&gguf_file_identity(&companion)),
         ))
         .expect("first load");
         let second = build_gguf(&GgufIdentity::new(
-            &gguf_file_identity(&main),
+            &[gguf_file_identity(&main)],
             Some(&gguf_file_identity(&companion)),
         ))
         .expect("second load");
@@ -2392,7 +2392,7 @@ mod tests {
         let dir = gguf_dir("gguf-fp-touch");
         let main = dir.join("main.gguf");
         write_gguf_file(&main, "qwen35", 1);
-        let identity = GgufIdentity::new(&gguf_file_identity(&main), None);
+        let identity = GgufIdentity::new(&[gguf_file_identity(&main)], None);
         let before = build_gguf(&identity).expect("before");
         let mtime = std::fs::metadata(&main).unwrap().modified().unwrap();
         set_shard_mtime(&main, mtime - std::time::Duration::from_secs(10));
@@ -2406,7 +2406,7 @@ mod tests {
         let dir = gguf_dir("gguf-fp-len");
         let main = dir.join("main.gguf");
         write_gguf_file(&main, "qwen35", 1);
-        let identity = GgufIdentity::new(&gguf_file_identity(&main), None);
+        let identity = GgufIdentity::new(&[gguf_file_identity(&main)], None);
         let before = build_gguf(&identity).expect("before");
         let mtime = std::fs::metadata(&main).unwrap().modified().unwrap();
         {
@@ -2434,16 +2434,20 @@ mod tests {
         write_gguf_file(&second, "clip", 3);
         let main_identity = gguf_file_identity(&main);
         let with_first = build_gguf(&GgufIdentity::new(
-            &main_identity,
+            std::slice::from_ref(&main_identity),
             Some(&gguf_file_identity(&first)),
         ))
         .expect("first companion");
         let with_second = build_gguf(&GgufIdentity::new(
-            &main_identity,
+            std::slice::from_ref(&main_identity),
             Some(&gguf_file_identity(&second)),
         ))
         .expect("second companion");
-        let without = build_gguf(&GgufIdentity::new(&main_identity, None)).expect("no companion");
+        let without = build_gguf(&GgufIdentity::new(
+            std::slice::from_ref(&main_identity),
+            None,
+        ))
+        .expect("no companion");
         assert_ne!(
             with_first, with_second,
             "another companion must change the fingerprint"
@@ -2460,7 +2464,7 @@ mod tests {
         let dir = gguf_dir("gguf-fp-header");
         let main = dir.join("main.gguf");
         write_gguf_file(&main, "qwen35", 1);
-        let identity = GgufIdentity::new(&gguf_file_identity(&main), None);
+        let identity = GgufIdentity::new(&[gguf_file_identity(&main)], None);
         write_gguf_file(&main, "qwen36", 1);
         let rewritten = gguf_file_identity(&main);
         assert_ne!(
@@ -2485,7 +2489,7 @@ mod tests {
         write_gguf_file(&main, "qwen35", 1);
         write_gguf_file(&companion, "clip", 2);
         let identity = GgufIdentity::new(
-            &gguf_file_identity(&main),
+            &[gguf_file_identity(&main)],
             Some(&gguf_file_identity(&companion)),
         );
         let files = CheckpointFiles::Gguf(&identity);

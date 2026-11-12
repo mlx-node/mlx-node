@@ -305,6 +305,30 @@ pub(crate) fn build_minimal_gguf(
                     buf.extend_from_slice(&v.to_le_bytes());
                 }
             }
+            GgufMetaValue::Uint64(v) => {
+                buf.extend_from_slice(&(GgufValueType::Uint64 as u32).to_le_bytes());
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            GgufMetaValue::Int64(v) => {
+                buf.extend_from_slice(&(GgufValueType::Int64 as u32).to_le_bytes());
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            GgufMetaValue::Uint8(v) => {
+                buf.extend_from_slice(&(GgufValueType::Uint8 as u32).to_le_bytes());
+                buf.push(*v);
+            }
+            GgufMetaValue::Float64(v) => {
+                buf.extend_from_slice(&(GgufValueType::Float64 as u32).to_le_bytes());
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+            GgufMetaValue::ArrayF32(values) => {
+                buf.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+                buf.extend_from_slice(&(GgufValueType::Float32 as u32).to_le_bytes());
+                buf.extend_from_slice(&(values.len() as u64).to_le_bytes());
+                for v in values {
+                    buf.extend_from_slice(&v.to_le_bytes());
+                }
+            }
             _ => panic!("Unsupported metadata type in test helper"),
         }
     }
@@ -361,6 +385,122 @@ pub(crate) fn build_minimal_gguf(
     }
 
     buf
+}
+
+/// A GGUF read back whole: metadata sorted by key, tensors in file order with
+/// their payload bytes.
+pub(crate) struct GgufParts {
+    pub metadata: Vec<(String, GgufMetaValue)>,
+    pub tensors: Vec<(String, Vec<u64>, GgufTensorType, Vec<u8>)>,
+}
+
+impl GgufParts {
+    pub(crate) fn read(path: &Path) -> Self {
+        let header = super::gguf::parse_gguf(path).unwrap();
+        let bytes = fs::read(path).unwrap();
+        let mut metadata: Vec<(String, GgufMetaValue)> = header
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        metadata.sort_by(|a, b| a.0.cmp(&b.0));
+        let tensors = header
+            .tensors
+            .iter()
+            .map(|t| {
+                let start = (header.data_offset + t.offset) as usize;
+                let end = start + t.data_size().unwrap() as usize;
+                (
+                    t.name.clone(),
+                    t.dims.clone(),
+                    t.tensor_type,
+                    bytes[start..end].to_vec(),
+                )
+            })
+            .collect();
+        Self { metadata, tensors }
+    }
+
+    pub(crate) fn set(&mut self, key: &str, value: GgufMetaValue) {
+        self.metadata.retain(|(k, _)| k != key);
+        self.metadata.push((key.to_string(), value));
+        self.metadata.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+
+    /// Adds a tensor of zero bytes.
+    pub(crate) fn add_tensor(&mut self, name: &str, dims: &[u64], ty: GgufTensorType) {
+        let info = super::gguf::GgufTensorInfo {
+            name: name.to_string(),
+            n_dims: dims.len() as u32,
+            dims: dims.to_vec(),
+            tensor_type: ty,
+            offset: 0,
+        };
+        let len = info.data_size().unwrap() as usize;
+        self.tensors
+            .push((name.to_string(), dims.to_vec(), ty, vec![0; len]));
+    }
+
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        let metadata: Vec<(&str, GgufMetaValue)> = self
+            .metadata
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
+        let tensors: Vec<(&str, &[u64], GgufTensorType, &[u8])> = self
+            .tensors
+            .iter()
+            .map(|(n, d, t, b)| (n.as_str(), d.as_slice(), *t, b.as_slice()))
+            .collect();
+        build_minimal_gguf(&metadata, &tensors)
+    }
+
+    pub(crate) fn write(&self, path: &Path) {
+        fs::write(path, self.bytes()).unwrap();
+    }
+}
+
+/// `src` re-split as llama-gguf-split writes it into `{prefix}-0000K-of-0000N.gguf`
+/// under `dir`: the tensors in file order cut into `parts` runs, part 1 keeps
+/// the metadata, every part `split.no` / `split.count` u16 and
+/// `split.tensors.count` i32.
+pub(crate) fn split_import_fixture(
+    src: &Path,
+    dir: &Path,
+    prefix: &str,
+    parts: usize,
+) -> Vec<PathBuf> {
+    let whole = GgufParts::read(src);
+    let total = whole.tensors.len();
+    assert!(
+        parts >= 2 && parts <= total,
+        "{parts} parts of {total} tensors"
+    );
+    fs::create_dir_all(dir).unwrap();
+    let per = total.div_ceil(parts);
+    (0..parts)
+        .map(|part| {
+            let mut metadata = if part == 0 {
+                whole.metadata.clone()
+            } else {
+                Vec::new()
+            };
+            metadata.push(("split.no".into(), GgufMetaValue::Uint16(part as u16)));
+            metadata.push(("split.count".into(), GgufMetaValue::Uint16(parts as u16)));
+            metadata.push((
+                "split.tensors.count".into(),
+                GgufMetaValue::Int32(total as i32),
+            ));
+            let end = ((part + 1) * per).min(total);
+            let piece = GgufParts {
+                metadata,
+                tensors: whole.tensors[(part * per).min(end)..end].to_vec(),
+            };
+            let path = dir.join(format!("{prefix}-{:05}-of-{parts:05}.gguf", part + 1));
+            piece.write(&path);
+            path
+        })
+        .collect()
 }
 
 fn split_tensor_payloads(tensors: &[(&str, &[u64])]) -> Vec<Vec<u8>> {

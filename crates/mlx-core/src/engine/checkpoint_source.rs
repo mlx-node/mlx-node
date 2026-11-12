@@ -16,16 +16,35 @@ use crate::utils::gguf::{
     prepare_gguf_assets_in, resolve_gemma4_gguf_source, resolve_muse_glimmer_gguf_source,
     source_file_identity_digest,
 };
-use crate::utils::gguf_import::PreloadInput;
+use crate::utils::gguf_import::{PreloadInput, PreloadMain};
 use crate::utils::gguf_plan::{
     ImportOptions, ImportPlan, OutputRole, annotate_gguf_header, plan_gguf_import,
 };
-use crate::utils::gguf_source::{GgufFileIdentity, file_identity};
+use crate::utils::gguf_source::{GgufFileIdentity, file_identity, merge_split_headers};
 
 pub(crate) const GGUF_SOURCE_FILE: &str = "gguf-source.json";
 
 /// Canonical path, the header parsed once, and the identity it was parsed under.
 pub(crate) type GgufSourceFile = (PathBuf, Arc<GgufFile>, GgufFileIdentity);
+
+/// The main GGUF: every part (each with its own header) and the one header
+/// the plan reads (Splash `GgufFile` over all parts).
+#[derive(Clone)]
+pub(crate) struct GgufMain {
+    pub parts: Vec<GgufSourceFile>,
+    pub header: Arc<GgufFile>,
+}
+
+impl GgufMain {
+    /// Part 1's canonical path.
+    pub(crate) fn path(&self) -> &Path {
+        &self.parts[0].0
+    }
+
+    pub(crate) fn identities(&self) -> Vec<GgufFileIdentity> {
+        self.parts.iter().map(|(_, _, id)| id.clone()).collect()
+    }
+}
 
 pub(crate) enum CheckpointSource {
     Dir(PathBuf),
@@ -36,7 +55,7 @@ pub(crate) struct GgufCheckpoint {
     /// Prepared asset entry, or the directory holding `gguf-source.json`
     /// the caller passed (a host config overlay).
     pub asset_dir: PathBuf,
-    pub main: GgufSourceFile,
+    pub main: GgufMain,
     pub companion: Option<GgufSourceFile>,
     pub plans: (ImportPlan, Option<ImportPlan>),
     pub opts: ImportOptions,
@@ -129,15 +148,17 @@ pub(crate) fn refuse_scaled_gguf_rope(
 
 impl GgufCheckpoint {
     pub(crate) fn preload_input(&self, load_companion: bool) -> PreloadInput {
-        let file = |(path, header, identity): &GgufSourceFile, plan: &ImportPlan| {
-            (path.clone(), header.clone(), identity.clone(), plan.clone())
-        };
         PreloadInput::new(
-            file(&self.main, &self.plans.0),
-            self.companion
-                .as_ref()
-                .zip(self.plans.1.as_ref())
-                .map(|(companion, plan)| file(companion, plan)),
+            PreloadMain {
+                parts: self.main.parts.clone(),
+                header: self.main.header.clone(),
+                plan: self.plans.0.clone(),
+            },
+            self.companion.as_ref().zip(self.plans.1.as_ref()).map(
+                |((path, header, identity), plan)| {
+                    (path.clone(), header.clone(), identity.clone(), plan.clone())
+                },
+            ),
             load_companion,
             self.opts.clone(),
         )
@@ -146,7 +167,7 @@ impl GgufCheckpoint {
     /// The asset `config.json` must mark exactly the prefixes the plan tiles,
     /// or the builder would read t64 bytes as row-major (or the reverse).
     pub(crate) fn check_asset_config(&self) -> Result<()> {
-        refuse_scaled_gguf_rope(&self.main.1.metadata, &self.main.0)?;
+        refuse_scaled_gguf_rope(&self.main.header.metadata, self.main.path())?;
         let path = self.asset_dir.join("config.json");
         let config: Value =
             serde_json::from_slice(&fs::read(&path).map_err(|e| {
@@ -161,7 +182,7 @@ impl GgufCheckpoint {
                 path.display(),
                 marked.len(),
                 self.plans.0.tiled_prefixes.len(),
-                self.main.0.display()
+                self.main.path().display()
             )));
         }
         Ok(())
@@ -171,12 +192,12 @@ impl GgufCheckpoint {
     /// refuse if either changed since prepare.
     fn from_asset_dir(dir: &Path, family: NativeGgufFamily) -> Result<Self> {
         let record = read_gguf_source_json(dir)?;
-        let main = open_recorded(&record.main)?;
-        family.check_main_header(&main.1, &main.0)?;
+        let main = open_gguf_main_with(&record.main, open_recorded)?;
+        family.check_main_header(&main.header, main.path())?;
         let companion = record.companion.as_ref().map(open_recorded).transpose()?;
         let (opts, main_plan, companion_plan) = native_import_plans(
             family,
-            (&main.0, &main.1),
+            (main.path(), &main.header),
             companion
                 .as_ref()
                 .map(|(path, header, _)| (path.as_path(), &**header)),
@@ -245,16 +266,49 @@ pub(crate) fn native_import_plans(
     Ok((main_opts, main_plan, companion_plan))
 }
 
+/// Every part of the main GGUF opened, merged into the plan header and
+/// annotated once (the inline MTP block can sit in the last part).
+pub(crate) fn open_gguf_main(paths: &[PathBuf]) -> Result<GgufMain> {
+    open_gguf_main_with(paths, |path| open_gguf_part(path))
+}
+
+fn open_gguf_main_with<T>(
+    parts: &[T],
+    open: impl Fn(&T) -> Result<GgufSourceFile>,
+) -> Result<GgufMain> {
+    let parts = parts.iter().map(open).collect::<Result<Vec<_>>>()?;
+    let mut header = merge_split_headers(
+        &parts
+            .iter()
+            .map(|(path, header, _)| (path.as_path(), &**header))
+            .collect::<Vec<_>>(),
+    )?;
+    annotate_gguf_header(&mut header);
+    Ok(GgufMain {
+        parts,
+        header: Arc::new(header),
+    })
+}
+
+/// [`open_gguf_part`] annotated for the plan: a companion GGUF.
+pub(crate) fn open_gguf_source(path: &Path) -> Result<GgufSourceFile> {
+    let (path, header, identity) = open_gguf_part(path)?;
+    let mut header = Arc::try_unwrap(header)
+        .map_err(|_| Error::from_reason("GGUF header is shared before annotation"))?;
+    annotate_gguf_header(&mut header);
+    Ok((path, Arc::new(header), identity))
+}
+
 /// Parse a GGUF header once, bracketed by two stats so the header, its digest
 /// and the identity all describe one file version.
-pub(crate) fn open_gguf_source(path: &Path) -> Result<GgufSourceFile> {
+fn open_gguf_part(path: &Path) -> Result<GgufSourceFile> {
     let stat = |path: &Path| {
         fs::metadata(path).map_err(|e| {
             Error::from_reason(format!("Failed to stat GGUF '{}': {e}", path.display()))
         })
     };
     let before = stat(path)?;
-    let mut header = parse_gguf(path)?;
+    let header = parse_gguf(path)?;
     let identity = file_identity(path, &header, &before)?;
     if source_file_identity_digest(&identity.path, &stat(&identity.path)?)
         != identity.source_identity
@@ -264,12 +318,11 @@ pub(crate) fn open_gguf_source(path: &Path) -> Result<GgufSourceFile> {
             identity.path.display()
         )));
     }
-    annotate_gguf_header(&mut header);
     Ok((identity.path.clone(), Arc::new(header), identity))
 }
 
 fn open_recorded(recorded: &GgufFileIdentity) -> Result<GgufSourceFile> {
-    let opened = open_gguf_source(&recorded.path)?;
+    let opened = open_gguf_part(&recorded.path)?;
     if opened.2 != *recorded {
         return Err(Error::from_reason(format!(
             "GGUF '{}' changed since prepare; retry the load",
@@ -280,7 +333,8 @@ fn open_recorded(recorded: &GgufFileIdentity) -> Result<GgufSourceFile> {
 }
 
 pub(crate) struct GgufSourceRecord {
-    pub main: GgufFileIdentity,
+    /// Every part of the main GGUF, in part order.
+    pub main: Vec<GgufFileIdentity>,
     pub companion: Option<GgufFileIdentity>,
 }
 
@@ -314,13 +368,13 @@ fn identity_json(identity: &GgufFileIdentity) -> Value {
 
 pub(crate) fn write_gguf_source_json(
     dir: &Path,
-    main: &GgufFileIdentity,
+    main: &[GgufFileIdentity],
     companion: Option<&GgufFileIdentity>,
 ) -> Result<()> {
     let record = json!({
-        "main": path_text(&main.path)?,
+        "main": main.iter().map(|m| path_text(&m.path)).collect::<Result<Vec<_>>>()?,
         "companion": companion.map(|c| path_text(&c.path)).transpose()?,
-        "main_identity": identity_json(main),
+        "main_identity": main.iter().map(identity_json).collect::<Vec<_>>(),
         "companion_identity": companion.map(identity_json),
     });
     let text = serde_json::to_string_pretty(&record)
@@ -338,42 +392,60 @@ pub(crate) fn read_gguf_source_json(dir: &Path) -> Result<GgufSourceRecord> {
             .map_err(|e| Error::from_reason(format!("Failed to read {}: {e}", path.display())))?,
     )
     .map_err(|e| corrupt(&e.to_string()))?;
-    let identity = |path_key: &str, identity_key: &str| -> Result<Option<GgufFileIdentity>> {
-        let file = match record.get(path_key) {
-            None => return Err(corrupt(&format!("no '{path_key}'"))),
-            Some(Value::Null) => return Ok(None),
-            Some(value) => value
-                .as_str()
-                .ok_or_else(|| corrupt(&format!("'{path_key}' is not a string")))?,
-        };
+    let parse = |what: &str, file: &Value, fields: &Value| -> Result<GgufFileIdentity> {
+        let file = file
+            .as_str()
+            .ok_or_else(|| corrupt(&format!("'{what}' path is not a string")))?;
         let file = PathBuf::from(file);
         if !file.is_absolute() {
-            return Err(corrupt(&format!("'{path_key}' is not an absolute path")));
+            return Err(corrupt(&format!("'{what}' is not an absolute path")));
         }
-        let fields = record
-            .get(identity_key)
-            .filter(|value| value.is_object())
-            .ok_or_else(|| corrupt(&format!("no '{identity_key}'")))?;
+        if !fields.is_object() {
+            return Err(corrupt(&format!("'{what}' identity is not an object")));
+        }
         let source_identity = fields
             .get("source_identity")
             .and_then(Value::as_str)
-            .ok_or_else(|| corrupt(&format!("'{identity_key}.source_identity'")))?
+            .ok_or_else(|| corrupt(&format!("'{what}' source_identity")))?
             .to_string();
         let header_digest = fields
             .get("header_digest")
             .and_then(Value::as_str)
             .and_then(unhex32)
-            .ok_or_else(|| corrupt(&format!("'{identity_key}.header_digest'")))?;
-        Ok(Some(GgufFileIdentity {
+            .ok_or_else(|| corrupt(&format!("'{what}' header_digest")))?;
+        Ok(GgufFileIdentity {
             path: file,
             source_identity,
             header_digest,
-        }))
+        })
     };
-    Ok(GgufSourceRecord {
-        main: identity("main", "main_identity")?.ok_or_else(|| corrupt("'main' is null"))?,
-        companion: identity("companion", "companion_identity")?,
-    })
+    let (Some(Value::Array(main)), Some(Value::Array(main_identity))) =
+        (record.get("main"), record.get("main_identity"))
+    else {
+        return Err(corrupt("'main' and 'main_identity' must be arrays"));
+    };
+    if main.is_empty() || main.len() != main_identity.len() {
+        return Err(corrupt(
+            "'main' and 'main_identity' must list the same parts",
+        ));
+    }
+    let main = main
+        .iter()
+        .zip(main_identity)
+        .map(|(file, fields)| parse("main", file, fields))
+        .collect::<Result<Vec<_>>>()?;
+    let companion = match record.get("companion") {
+        None => return Err(corrupt("no 'companion'")),
+        Some(Value::Null) => None,
+        Some(file) => Some(parse(
+            "companion",
+            file,
+            record
+                .get("companion_identity")
+                .ok_or_else(|| corrupt("no 'companion_identity'"))?,
+        )?),
+    };
+    Ok(GgufSourceRecord { main, companion })
 }
 
 /// Prefixes a `config.json` marks `"layout": "t64"`.
@@ -451,9 +523,9 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{name}: {}", e.reason));
             let dir = ckpt.asset_dir.clone();
             let entry = dir.file_name().unwrap().to_string_lossy().into_owned();
-            assert!(entry.contains("-v8-"), "{name}: entry key {entry}");
+            assert!(entry.contains("-v9-"), "{name}: entry key {entry}");
             let marker = fs::read_to_string(dir.join(".complete")).unwrap();
-            assert!(marker.starts_with("format=8\n"), "{name}: marker\n{marker}");
+            assert!(marker.starts_with("format=9\n"), "{name}: marker\n{marker}");
 
             let files = names(&dir);
             let weights: Vec<&String> = files
@@ -519,13 +591,17 @@ mod tests {
             };
             let main = expect(&fx.main);
             assert!(main.path.is_absolute(), "{name}: main path");
-            assert_eq!(record.main, main, "{name}: main identity");
+            assert_eq!(record.main, vec![main.clone()], "{name}: main identity");
             assert_eq!(
-                raw["main"].as_str(),
+                raw["main"][0].as_str(),
                 main.path.to_str(),
                 "{name}: main path"
             );
-            assert_eq!(ckpt.main.2, main, "{name}: checkpoint main identity");
+            assert_eq!(
+                ckpt.main.identities(),
+                vec![main.clone()],
+                "{name}: checkpoint main identity"
+            );
             match &fx.companion {
                 Some(companion) => {
                     let companion = expect(companion);
@@ -611,7 +687,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     #[tokio::test]
-    async fn sweep_removes_v7_and_keeps_v8_after_cutover() {
+    async fn sweep_removes_v8_and_keeps_v9_after_cutover() {
         let _env_guard = crate::utils::gguf::sweep_env_lock().lock().unwrap();
         let work = work_dir("formats");
         let fx = write_import_fixture("qwen35-dense-untied", &work.join("src"));
@@ -620,7 +696,7 @@ mod tests {
             .await
             .unwrap();
         let marker = fs::read_to_string(ckpt.asset_dir.join(".complete")).unwrap();
-        assert!(marker.starts_with("format=8\n"), "{marker}");
+        assert!(marker.starts_with("format=9\n"), "{marker}");
         let entry = |format: u32| {
             let dir = cache.join(format!(
                 "aged-1-1-v{format}-{}-{}",
@@ -632,17 +708,17 @@ mod tests {
             let path = dir.join(".complete");
             fs::write(
                 &path,
-                marker.replacen("format=8\n", &format!("format={format}\n"), 1),
+                marker.replacen("format=9\n", &format!("format={format}\n"), 1),
             )
             .unwrap();
             set_mtime(&path, TWO_DAYS);
             dir
         };
-        let (v6, v7, v8) = (entry(6), entry(7), entry(8));
-        sweep_until_removed(&cache, "unrelated-key", &[&v6, &v7]);
-        assert!(!v6.exists(), "an aged v6 entry must be swept (control)");
-        assert!(!v7.exists(), "an aged v7 weight entry must be swept");
-        assert!(v8.is_dir(), "a healthy aged v8 asset entry must survive");
+        let (v7, v8, v9) = (entry(7), entry(8), entry(9));
+        sweep_until_removed(&cache, "unrelated-key", &[&v7, &v8]);
+        assert!(!v7.exists(), "an aged v7 entry must be swept (control)");
+        assert!(!v8.exists(), "an aged v8 one-file entry must be swept");
+        assert!(v9.is_dir(), "a healthy aged v9 asset entry must survive");
         native_gguf_unlease_in_use(&ckpt.asset_dir);
         fs::remove_dir_all(&work).ok();
     }
@@ -830,10 +906,10 @@ mod tests {
         };
         let main = identity(&fx.main);
         let companion = identity(fx.companion.as_ref().unwrap());
-        assert_eq!(ckpt.main.2, main);
+        assert_eq!(ckpt.main.identities(), vec![main.clone()]);
         assert_eq!(ckpt.companion.as_ref().map(|c| &c.2), Some(&companion));
         let input = ckpt.preload_input(true);
-        assert_eq!(input.main.2, main, "preload main identity");
+        assert_eq!(input.main.parts[0].2, main, "preload main identity");
         assert_eq!(
             input.companion.as_ref().map(|c| &c.2),
             Some(&companion),
@@ -843,8 +919,76 @@ mod tests {
         set_mtime(&fx.main, 3600);
         assert_ne!(identity(&fx.main), main, "mtime change kept the identity");
         let input = ckpt.preload_input(true);
-        assert_eq!(input.main.2, main, "preload_input re-read the source");
+        assert_eq!(
+            input.main.parts[0].2, main,
+            "preload_input re-read the source"
+        );
         native_gguf_unlease_in_use(&ckpt.asset_dir);
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[tokio::test]
+    async fn split_gguf_loads_like_one_file() {
+        use crate::models::qwen3_5::load_plan::checkpoint_weight_bytes;
+        use crate::utils::gguf_import::{GgufPreload, gate::manifest};
+        use crate::utils::gguf_test_fixtures::split_import_fixture;
+        let work = work_dir("split-load");
+        for (name, family) in [
+            ("qwen35-dense-untied", NativeGgufFamily::Qwen35),
+            ("qwen35moe-3d-experts", NativeGgufFamily::Qwen35Moe),
+        ] {
+            let one = write_import_fixture(name, &work.join(name).join("one"));
+            let split_dir = work.join(name).join("split");
+            let parts = split_import_fixture(&one.main, &split_dir, "model", 3);
+
+            let load = |source: &CheckpointSource| {
+                let CheckpointSource::Gguf(ckpt) = source else {
+                    panic!("{name}: not a GGUF checkpoint");
+                };
+                let input = ckpt.preload_input(false);
+                let preload = GgufPreload::load(&input)
+                    .unwrap_or_else(|e| panic!("{name}: preload: {}", e.reason));
+                (manifest(&preload.main), input.identity().files.len())
+            };
+            let single =
+                CheckpointSource::resolve_in(&one.main, family, Some(&work.join(name).join("c1")))
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: one file: {}", e.reason));
+            let split =
+                CheckpointSource::resolve_in(&parts[0], family, Some(&work.join(name).join("c2")))
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: split: {}", e.reason));
+            let (want, one_files) = load(&single);
+            let (got, files) = load(&split);
+            assert_eq!(one_files, 1, "{name}");
+            assert_eq!(files, 3, "{name}: identity covers every part");
+            assert_eq!(
+                got, want,
+                "{name}: split load differs from the one-file load"
+            );
+            assert_eq!(
+                checkpoint_weight_bytes(&split).unwrap(),
+                parts
+                    .iter()
+                    .map(|p| fs::metadata(p).unwrap().len())
+                    .sum::<u64>(),
+                "{name}: checkpoint bytes"
+            );
+
+            let record = read_gguf_source_json(split.asset_dir()).unwrap();
+            assert_eq!(record.main.len(), 3, "{name}: gguf-source.json parts");
+            for (recorded, part) in record.main.iter().zip(&parts) {
+                assert_eq!(recorded.path, part.canonicalize().unwrap(), "{name}");
+            }
+            let again = CheckpointSource::resolve_in(split.asset_dir(), family, None)
+                .await
+                .unwrap_or_else(|e| panic!("{name}: from_asset_dir: {}", e.reason));
+            let (again, files) = load(&again);
+            assert_eq!(files, 3, "{name}: from_asset_dir parts");
+            assert_eq!(again, want, "{name}: from_asset_dir load");
+            single.release_lease();
+            split.release_lease();
+        }
         fs::remove_dir_all(&work).ok();
     }
 }

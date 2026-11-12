@@ -110,7 +110,14 @@ silently breaks. The flag fetches the base model's `tokenizer.json`,
 configs (whichever the repo carries) beside the weights after the download; a
 file the GGUF repo itself shipped wins over the base repo's copy. It is
 idempotent, so re-running a command with it re-verifies the sidecars without
-re-downloading them:
+re-downloading them.
+
+Before any weight byte is fetched, `mlx download model` range-reads the header
+of every selected target GGUF (a few 8 MiB reads per part) and runs the same
+header check a load runs (Splash `gguf_target` + `model-check`): the file and
+split rules, and for qwen35 / qwen35moe (Qwen3.5 / 3.6 / 3.8) the import plan. A refusal names the
+target and downloads nothing. A split GGUF is one target, so a selection must
+hold every part of it. With `--assets-repo`:
 
 ```bash
 mlx download model -m unsloth/Qwen3.8-27B-GGUF -g "*UD-Q4_K_XL*" \
@@ -418,7 +425,15 @@ loads Google's QAT checkpoint without a separate conversion command.
 Every load reads the GGUF directly and repacks its supported quantized tensors
 into MLX layouts in memory, including the media companion when media is enabled.
 A small asset directory holds only config/tokenizer/template files and
-`gguf-source.json`; it does not hold a packed-weight copy of the model.
+`gguf-source.json` (every part of the main GGUF, then the companion); it does
+not hold a packed-weight copy of the model. A split qwen35 / qwen35moe GGUF
+(`NAME-0000K-of-0000N.gguf`) loads from its first part: every part is found by
+name beside it and read as one GGUF (Splash `GgufFile`); a later part or an
+incomplete set is refused. Every tensor in a qwen35 / qwen35moe GGUF header must
+be one the loader reads, or the load is refused before a weight byte is read
+(for example `attn_q.bias`, `rope_freqs.weight`, a fused `ffn_gate_up_exps`).
+A header `tokenizer.ggml.eog_token_ids` list and the vocabulary's
+`<|endoftext|>` join the stop ids in the asset `generation_config.json`.
 Supported source types are F32/F16/BF16, the affine blocks Q4_0, Q4_1, Q5_0,
 Q5_1 and Q8_0, MXFP4, the K/IQ formats Q2_K, Q3_K, Q4_K, Q5_K, Q6_K,
 IQ4_NL and IQ4_XS, and the grid formats IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS,
@@ -985,8 +1000,8 @@ Direct GGUF loads for Qwen3.5/3.6/3.8 dense and MoE, CLEF, Gemma 4, and
 Muse-Glimmer keep small per-checkpoint asset entries under
 `~/Library/Caches/mlx-node/native-gguf` on macOS (`~/.cache/mlx-node/native-gguf`
 elsewhere). These entries contain config/tokenizer/template files and
-`gguf-source.json`, not packed weights: the original GGUF and any companion are
-read and repacked in memory on every load. Leases protect assets that can still
+`gguf-source.json`, not packed weights: every part of the original GGUF and any
+companion are read and repacked in memory on every load. Leases protect assets that can still
 be read lazily, while stale/debris cleanup runs under per-key locks.
 
 Qwen3.8 Flash Next reads and repacks routed experts directly from GGUF into
