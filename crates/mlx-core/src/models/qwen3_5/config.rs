@@ -304,9 +304,10 @@ pub struct Qwen3_5Config {
     /// Element format of the flat full-attention K/V cache: `"int8"`
     /// (per-(token, head) symmetric int8 rows with one fp32 scale each —
     /// half the K/V memory and read bandwidth; see `crate::array::kv_int8`)
-    /// or `"bf16"`. Unset: int8 where the int8 kernels serve the geometry
-    /// (Metal, head 256), else BF16 — see `kv_format()`. Set from the
-    /// `kvFormat` load option; the paged cache ignores it.
+    /// or `"bf16"`. Unset: int8 where the int8 kernels serve the model
+    /// (Metal, head 256, GQA up to 8, BF16 compute), else BF16 — see
+    /// `kv_format_for()`. Set from the `kvFormat` load option; the paged
+    /// cache ignores it.
     #[serde(default)]
     #[napi(ts_type = "string | undefined")]
     pub kv_format: Option<String>,
@@ -377,19 +378,46 @@ impl Qwen3_5Config {
         !(layer_idx + 1).is_multiple_of(self.full_attention_interval as usize)
     }
 
-    /// Element format of the flat full-attention K/V cache. An explicit
-    /// `kv_format` wins (an unparseable value is BF16 — persistence rejects
-    /// it at load); otherwise int8, Splash's default, wherever the int8
-    /// segmented kernels serve the geometry (Metal, `head_dim` 256), and
-    /// BF16 elsewhere so no geometry falls onto the dequantizing fallback.
-    pub fn kv_format(&self) -> crate::transformer::KvFormat {
+    /// Element format of the flat full-attention K/V cache of a model that
+    /// computes in `compute`. An explicit `kv_format` wins (an unparseable
+    /// value is BF16 — persistence rejects it at load); otherwise int8,
+    /// Splash's default, wherever the int8 segmented kernels serve the model
+    /// (`KvFormat::default_for_geometry`: BF16 compute, head 256, GQA up to
+    /// 8), and BF16 elsewhere so no model falls onto the dequantizing
+    /// fallback.
+    pub fn kv_format_for(&self, compute: crate::array::DType) -> crate::transformer::KvFormat {
         use crate::transformer::KvFormat;
         match self.kv_format.as_deref() {
             Some(value) if !value.trim().is_empty() => {
                 KvFormat::parse(Some(value)).unwrap_or_default()
             }
-            _ => KvFormat::default_for_geometry(i64::from(self.head_dim)),
+            _ => KvFormat::default_for_geometry(
+                i64::from(self.head_dim),
+                i64::from(self.num_heads),
+                i64::from(self.num_kv_heads),
+                compute,
+            ),
         }
+    }
+
+    /// Resolves the load's format (`requested` wins over the config) for the
+    /// checkpoint's `compute` dtype and pins it into `kv_format`, so every
+    /// cache and every window price after the load reads the same format.
+    pub(crate) fn pin_kv_format(
+        &mut self,
+        requested: Option<crate::transformer::KvFormat>,
+        compute: crate::array::DType,
+    ) -> crate::transformer::KvFormat {
+        let format = requested.unwrap_or_else(|| self.kv_format_for(compute));
+        self.kv_format = Some(format.as_str().to_string());
+        format
+    }
+
+    /// The format of the flat caches a model built from this config uses. A
+    /// load pins it (`pin_kv_format`); an unpinned config builds a random-init
+    /// model, whose weights are f32.
+    pub fn kv_format(&self) -> crate::transformer::KvFormat {
+        self.kv_format_for(crate::array::DType::Float32)
     }
 
     /// Number of full-attention layers (i.e. layers that use

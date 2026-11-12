@@ -398,8 +398,9 @@ pub struct Qwen35LoadOptions {
     /// Element format of the flat full-attention K/V cache: `'int8'`
     /// (per-token symmetric int8 rows with one fp32 scale each — half the
     /// K/V memory and read bandwidth) or `'bf16'`. When neither this option
-    /// nor checkpoint config specifies a format, dense Qwen defaults to int8
-    /// on Metal with 256-wide heads and BF16 elsewhere; MoE defaults to BF16.
+    /// nor checkpoint config specifies a format, dense and MoE Qwen default
+    /// to int8 on Metal with 256-wide heads, GQA up to 8 and BF16 compute,
+    /// BF16 elsewhere (an f16 checkpoint keeps BF16 K/V).
     /// The block-paged cache ignores it.
     #[napi(ts_type = "'int8' | 'bf16' | undefined")]
     pub kv_format: Option<String>,

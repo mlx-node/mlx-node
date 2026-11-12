@@ -28,6 +28,7 @@ use crate::models::quant_dispatch::{
 };
 use crate::models::qwen3_5::persistence::{
     MTP_LAYER_LINEAR_SUFFIXES, augment_mtplx_mtp_quantization_with_suffixes,
+    embedding_compute_dtype,
 };
 use crate::nn::Linear;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -577,23 +578,10 @@ fn apply_weights_moe_inner_with_residency(
     let checkpoint_keys: std::collections::HashSet<String> = params.keys().cloned().collect();
     let (default_plq, default_gate_plq) =
         compute_moe_defaults(params, top_level_mode, quant_bits, quant_group_size);
-    // The model's actual compute dtype is whatever the embedding emits —
-    // affine-quantized tables emit their `.scales` dtype, but K-quant/IQ/mxfp
-    // `.scales` are integer sub-block codes and MLX `dequantize` emits bf16
-    // for them; dense tables emit their own dtype. Sidecar casts must target
-    // this, not a hardcoded family default (f32/f16 checkpoints must keep
-    // f32/f16 sidecars).
-    let compute_dtype = params
-        .get("embedding.scales")
-        .and_then(|w| w.dtype().ok())
-        .map(|d| match d {
-            crate::array::DType::Float16
-            | crate::array::DType::BFloat16
-            | crate::array::DType::Float32 => d,
-            _ => crate::array::DType::BFloat16,
-        })
-        .or_else(|| params.get("embedding.weight").and_then(|w| w.dtype().ok()))
-        .unwrap_or(crate::array::DType::BFloat16);
+    // Sidecar casts must target the embedding's compute dtype, not a
+    // hardcoded family default (f32/f16 checkpoints must keep f32/f16
+    // sidecars).
+    let compute_dtype = embedding_compute_dtype(params);
     let plain_fp8_residency = std::cell::RefCell::new(PlainFp8Residency::default());
     // Prefixes whose Tiled64 repack made the map's row-major arrays redundant;
     // drained into `release_tiled_kquant_sources` once their owner is installed.
@@ -1750,6 +1738,26 @@ fn align_affine_embedding_dtype(
     Ok(true)
 }
 
+/// Aligns the affine embedding sidecars with the checkpoint's residual stream,
+/// then pins the flat K/V format the resulting compute dtype allows
+/// (`requested` and config.json `kv_format` win). The format must follow the
+/// alignment: the embedding's dtype after it is the model's compute dtype.
+fn settle_compute_dtype(
+    raw: &Value,
+    params: &mut HashMap<String, MxArray>,
+    config: &mut Qwen3_5MoeConfig,
+    requested: Option<crate::transformer::KvFormat>,
+) -> Result<crate::transformer::KvFormat> {
+    let residual_dtype = residual_stream_dtype(raw, params);
+    if align_affine_embedding_dtype(params, residual_dtype)? {
+        info!(
+            "Aligned the quantized embedding's affine sidecars with the \
+             checkpoint's {residual_dtype:?} residual stream"
+        );
+    }
+    Ok(config.pin_kv_format(requested, embedding_compute_dtype(params)))
+}
+
 /// Load a pretrained Qwen3.5 MoE model into a dedicated model thread.
 ///
 /// All model state lives on the spawned thread. Returns a thin NAPI shell
@@ -1857,8 +1865,6 @@ pub(crate) async fn load_with_source(
 
                 crate::transformer::KvFormat::parse(config.kv_format.as_deref())
                     .map_err(|message| Error::from_reason(format!("config.json: {message}")))?;
-                let kv_format = kv_format.unwrap_or_else(|| config.kv_format());
-                config.kv_format = Some(kv_format.as_str().to_string());
 
                 info!(
                     "Qwen3.5 MoE config: {} layers, hidden={}, experts={}x{}",
@@ -1997,13 +2003,7 @@ pub(crate) async fn load_with_source(
                 // declared `dtype`/`torch_dtype` (convert casts the weights
                 // but copies the config verbatim, so the declaration can be
                 // stale — the loaded dtype is the ground truth).
-                let residual_dtype = residual_stream_dtype(&raw, &params);
-                if align_affine_embedding_dtype(&mut params, residual_dtype)? {
-                    info!(
-                        "Aligned the quantized embedding's affine sidecars with the \
-                         checkpoint's {residual_dtype:?} residual stream"
-                    );
-                }
+                settle_compute_dtype(&raw, &mut params, &mut config, kv_format)?;
                 // Original BF16 norms already selected the residual/embedding
                 // dtype above. Replace only sanitized final-value norm keys.
                 let source_norm_identity = source_norm_request
@@ -2675,8 +2675,14 @@ mod tests {
         std::fs::remove_dir_all(&work).ok();
     }
 
+    /// Gate: an unset MoE format is the geometry default (int8 on Metal at
+    /// 16 x 2 x 256 with BF16 compute), and an explicit value wins both ways.
+    /// Mutation: restore `.or_else(|| Some("bf16".to_string()))` in
+    /// `to_dense_config` → red (dense `kv_format` is `Some("bf16")`; on Metal
+    /// the default is Bf16, not Int8).
     #[test]
-    fn moe_flat_cache_precision_preserves_default_and_explicit_format() {
+    fn moe_flat_cache_precision_follows_the_geometry_default_and_explicit_format() {
+        use crate::transformer::KvFormat;
         let mut raw = json!({
             "hidden_size": 2048,
             "num_hidden_layers": 40,
@@ -2687,14 +2693,96 @@ mod tests {
             "num_experts": 256
         });
         let default = parse_config(&raw).unwrap();
-        assert_eq!(default.kv_format(), crate::transformer::KvFormat::Bf16);
-        raw["kv_format"] = json!("int8");
-        let explicit = parse_config(&raw).unwrap();
-        assert_eq!(explicit.kv_format(), crate::transformer::KvFormat::Int8);
-        assert_eq!(explicit.to_dense_config().kv_format(), explicit.kv_format());
-        let restored: Qwen3_5MoeConfig =
-            serde_json::from_value(serde_json::to_value(&explicit).unwrap()).unwrap();
-        assert_eq!(restored.kv_format(), explicit.kv_format());
+        assert_eq!(default.to_dense_config().kv_format, None);
+        assert_eq!(
+            default.kv_format_for(DType::BFloat16),
+            KvFormat::default_for_geometry(256, 16, 2, DType::BFloat16)
+        );
+        let metal = unsafe { mlx_sys::mlx_metal_is_available() }
+            && unsafe { mlx_sys::mlx_default_device() } == 1;
+        if metal {
+            assert_eq!(default.kv_format_for(DType::BFloat16), KvFormat::Int8);
+        }
+        for (value, format) in [("bf16", KvFormat::Bf16), ("int8", KvFormat::Int8)] {
+            raw["kv_format"] = json!(value);
+            let explicit = parse_config(&raw).unwrap();
+            assert_eq!(explicit.kv_format(), format);
+            assert_eq!(explicit.kv_format_for(DType::Float16), format);
+            assert_eq!(explicit.to_dense_config().kv_format(), format);
+            let restored: Qwen3_5MoeConfig =
+                serde_json::from_value(serde_json::to_value(&explicit).unwrap()).unwrap();
+            assert_eq!(restored.kv_format(), format);
+        }
+    }
+
+    /// Gate: the 35B-A3B DFlash2 window on the M3 Pro pool budget (5,051 MiB
+    /// = 16,163 BF16 blocks of 327,680 B, 325-block runway allocated, the
+    /// 6 x 8 x 128 draft, 7 scratch rows) prices the default int8 rows:
+    /// 10,400 B/token, pool term 475,129, window = trained 262,144. BF16:
+    /// 20,480 B/token, 244,217.
+    /// Mutations: restore `.or_else(|| Some("bf16".to_string()))` in
+    /// `to_dense_config` → red (20,480 / 244,217); price `KvFormat::Bf16` in
+    /// `dflash2_window_terms` → red.
+    #[test]
+    fn moe_dflash2_window_prices_the_default_format() {
+        use crate::array::DType;
+        use crate::models::qwen3_5::dflash2_decode::{
+            DFlash2PoolBudget, dflash2_pool_budget_bytes, dflash2_window_terms,
+        };
+        use crate::transformer::KvFormat;
+        let metal = unsafe { mlx_sys::mlx_metal_is_available() }
+            && unsafe { mlx_sys::mlx_default_device() } == 1;
+        if !metal {
+            return;
+        }
+        let raw = json!({
+            "hidden_size": 2048,
+            "num_hidden_layers": 40,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "moe_intermediate_size": 512,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "full_attention_interval": 4,
+            "linear_conv_kernel_dim": 4,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "max_position_embeddings": 262144
+        });
+        let cfg = parse_config(&raw).unwrap();
+        assert_eq!(cfg.recurrent_state_bytes(), 64_389_120);
+        let pool = DFlash2PoolBudget {
+            bytes: dflash2_pool_budget_bytes(16_163, 325, 327_680),
+            floor_tokens: 231_936,
+        };
+        let terms = |format| {
+            dflash2_window_terms(
+                &cfg.to_dense_config(),
+                format,
+                DType::BFloat16,
+                262_144,
+                56_795_136,
+                7,
+                Some(pool),
+                None,
+            )
+            .unwrap()
+        };
+        // The published 35B-A3B checkpoint computes in BF16, the activation
+        // dtype the terms price.
+        let int8 = terms(cfg.kv_format_for(DType::BFloat16));
+        assert_eq!(
+            (int8.row_bytes, int8.pool, int8.window()),
+            (10_400, Some(475_129), 262_144)
+        );
+        let bf16 = terms(KvFormat::Bf16);
+        assert_eq!(
+            (bf16.row_bytes, bf16.pool, bf16.window()),
+            (20_480, Some(244_217), 244_217)
+        );
     }
 
     #[test]
@@ -2932,6 +3020,91 @@ mod tests {
         assert_eq!(
             residual_stream_dtype(&serde_json::json!({"dtype": "bfloat16"}), &declared_only),
             Some(DType::BFloat16)
+        );
+    }
+
+    /// Gate: the load pins the flat K/V format for the checkpoint's compute
+    /// dtype. An `mlx convert --dtype float16` MoE at 16 x 2 x 256 (f16 norms,
+    /// fp32 affine embedding sidecars, a stale `torch_dtype: bfloat16`) gets
+    /// BF16 K/V — the int8 verify needs BF16 queries — while the same
+    /// checkpoint with BF16 norms gets int8 on Metal. An explicit int8 (load
+    /// option or config.json) still wins over f16 compute.
+    /// Mutations: pass `DType::BFloat16` to `pin_kv_format` in
+    /// `settle_compute_dtype` → red (f16 gives Int8); pin before
+    /// `align_affine_embedding_dtype` → red (the BF16-norm checkpoint reads
+    /// its fp32 sidecars and gives Bf16); apply the compute check to an
+    /// explicit format → red (explicit int8 gives Bf16).
+    #[test]
+    fn moe_load_pins_the_kv_format_for_the_compute_dtype() {
+        use super::settle_compute_dtype;
+        use crate::transformer::KvFormat;
+        let metal = unsafe { mlx_sys::mlx_metal_is_available() }
+            && unsafe { mlx_sys::mlx_default_device() } == 1;
+        let mut raw = serde_json::json!({
+            "hidden_size": 64,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "moe_intermediate_size": 16,
+            "num_experts": 2,
+            "torch_dtype": "bfloat16"
+        });
+        let checkpoint = |norm: DType| {
+            let mut params: HashMap<String, MxArray> = HashMap::new();
+            params.insert(
+                "layers.0.input_layernorm.weight".to_string(),
+                MxArray::from_float32(&[1.0f32; 64], &[64])
+                    .unwrap()
+                    .astype(norm)
+                    .unwrap(),
+            );
+            params.insert(
+                "embedding.weight".to_string(),
+                MxArray::from_uint32(&[0u32; 16], &[8, 2]).unwrap(),
+            );
+            params.insert(
+                "embedding.scales".to_string(),
+                MxArray::from_float32(&[1.0f32; 16], &[8, 2]).unwrap(),
+            );
+            params.insert(
+                "embedding.biases".to_string(),
+                MxArray::from_float32(&[0.0f32; 16], &[8, 2]).unwrap(),
+            );
+            params
+        };
+        let settle = |raw: &serde_json::Value, norm: DType, requested: Option<KvFormat>| {
+            let mut config = parse_config(raw).unwrap();
+            let mut params = checkpoint(norm);
+            let format = settle_compute_dtype(raw, &mut params, &mut config, requested).unwrap();
+            assert_eq!(config.kv_format.as_deref(), Some(format.as_str()));
+            assert_eq!(config.kv_format(), format);
+            assert_eq!(config.to_dense_config().kv_format(), format);
+            format
+        };
+
+        assert_eq!(settle(&raw, DType::Float16, None), KvFormat::Bf16, "f16");
+        let bf16_default = if metal {
+            KvFormat::Int8
+        } else {
+            KvFormat::Bf16
+        };
+        assert_eq!(settle(&raw, DType::BFloat16, None), bf16_default, "bf16");
+        assert_eq!(
+            settle(&raw, DType::Float16, Some(KvFormat::Int8)),
+            KvFormat::Int8,
+            "load option int8 at f16"
+        );
+        raw["kv_format"] = serde_json::json!("int8");
+        assert_eq!(
+            settle(&raw, DType::Float16, None),
+            KvFormat::Int8,
+            "config.json int8 at f16"
+        );
+        assert_eq!(
+            settle(&raw, DType::BFloat16, Some(KvFormat::Bf16)),
+            KvFormat::Bf16,
+            "load option over config.json"
         );
     }
 

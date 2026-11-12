@@ -47,7 +47,8 @@ Options:
                       the server keeps running.
   --model-residency <mode>  capability (default) or single
   --kv-format <fmt>   Target K/V cache format: int8 or bf16 (default: int8
-                      for dense qwen3_5 on Metal at head 256, else bf16).
+                      on Metal at head 256, GQA up to 8 and BF16 compute,
+                      else bf16).
                       Sets the flat cache DFlash2 turns use; the
                       block-paged pool ignores it and stays bf16. bf16
                       uses more memory.

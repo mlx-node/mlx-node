@@ -69,6 +69,7 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
                 .remove("use_block_paged_cache");
         } else {
             cfg["use_block_paged_cache"] = serde_json::Value::Bool(false);
+            cfg["kv_format"] = serde_json::Value::String("bf16".to_string());
         }
         cfg["paged_cache_memory_mb"] = serde_json::Value::from(1024u32);
         cfg["paged_block_size"] = serde_json::Value::from(16u32);
