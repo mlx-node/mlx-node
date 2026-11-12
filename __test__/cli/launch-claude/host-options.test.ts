@@ -154,7 +154,6 @@ describe('loadServedWindow', () => {
           effectiveWindowTokens: 73696,
           pagedBlockCapacity: 0,
           pagedBlockSize: 16,
-          speculativeWindowTokens: 139257,
         }),
         hasMtpWeights: () => true,
       };
@@ -175,7 +174,7 @@ describe('loadServedWindow', () => {
       });
       try {
         expect(host.server.registry.servedContext(host.boundModel)).toBeUndefined();
-        await expect(loadServedWindow(host)).resolves.toBe(139257);
+        await expect(loadServedWindow(host)).resolves.toBe(73696);
 
         host.server.registry.unregister(host.boundModel);
         fail = true;

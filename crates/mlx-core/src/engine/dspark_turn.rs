@@ -1277,6 +1277,17 @@ pub(crate) trait PagedDsparkBackend: PagedBackend + DsparkBackend {
     /// The paged sequence this turn owns. Diagnostic only: it names the
     /// sequence in the abandoned-epilogue report.
     fn paged_spec_seq_id(&self) -> u32;
+
+    /// The turn's prime: [`PagedBackend::prime_prefix_state`] unless the
+    /// family reuses a prefix only together with its draft state.
+    fn prime_dspark_prefix_state(
+        &mut self,
+        tokens: &[u32],
+        reuse_cache: bool,
+        cache_salt: u64,
+    ) -> Result<Self::PrefixState> {
+        self.prime_prefix_state(tokens, reuse_cache, 0, &[], cache_salt)
+    }
 }
 
 /// Drive one PAGED DSpark speculative whole turn.
@@ -1302,12 +1313,11 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
     let is_streaming = args.sink.is_some();
     let think_end_id = tokenizer.think_end_id();
 
-    // Owned params: re-resolved from the request config (deterministic —
-    // identical to what the session core handed us in `args.params`), then
-    // populated with the stop-set `run_dspark_turn` reads from
+    // The session core's params (a family's context preflight may have
+    // clamped them), plus the stop-set `run_dspark_turn` reads from
     // `ChatParams::extra_eos_ids` (the autoregressive loops thread it as a
     // separate argument instead).
-    let mut p = backend.resolve_params(args.config);
+    let mut p = args.params.clone();
     p.extra_eos_ids = backend.extra_eos_ids();
     let report_perf = p.report_performance;
     let max_new_tokens = p.max_new_tokens;
@@ -1321,7 +1331,7 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
     // token is the only handle to it.
     let epilogue = SpecTurnEpilogue::begin(backend.paged_spec_seq_id());
 
-    let prefix = match backend.prime_prefix_state(args.tokens, reuse_cache, 0, &[], p.cache_salt) {
+    let prefix = match backend.prime_dspark_prefix_state(args.tokens, reuse_cache, p.cache_salt) {
         Ok(prefix) => prefix,
         Err(error) => {
             epilogue.abort(backend);

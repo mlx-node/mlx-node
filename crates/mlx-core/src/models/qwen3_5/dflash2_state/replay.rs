@@ -10,11 +10,10 @@ use serde::{Deserialize, Serialize};
 use super::trace::{
     self, Hit, HitKind, LedgerTurn, LiveView, StateDesign, StoreView, TurnLedger, TurnObservation,
 };
-use crate::engine::cache::verify_cache_prefix_direct;
 use crate::engine::gen_prompt::replay_point;
 use crate::engine::session::SESSION_PRESERVE_THINKING;
 use crate::engine::types::ChatConfig;
-use crate::models::qwen3_5::dflash2_decode::reusable_dflash2_prefix;
+use crate::models::qwen3_5::dflash2_decode::live_window_prefix;
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 
 /// Token ids of unrecorded requests start here, above every real vocabulary,
@@ -185,25 +184,7 @@ pub fn replay(
             gen_suffix_len,
             replay_point,
         } = &rendered[index];
-        let verified = verify_cache_prefix_direct(
-            true,
-            false,
-            prompt,
-            prompt,
-            0,
-            live,
-            &None,
-            !live.is_empty(),
-        );
-        let cached = reusable_dflash2_prefix(
-            false,
-            prompt,
-            0,
-            verified,
-            Some(live),
-            Some(live.len()),
-            true,
-        );
+        let cached = live_window_prefix(prompt, live);
         let used = if cached > 0 {
             Hit {
                 kind: HitKind::Live,

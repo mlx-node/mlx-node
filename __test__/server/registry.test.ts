@@ -500,23 +500,20 @@ describe('ModelRegistry.servedContext', () => {
       effectiveWindowTokens: 73696.5,
       pagedBlockCapacity: 0,
       pagedBlockSize: 16,
-      speculativeWindowTokens: 139257,
       kvFormat: 'bf16' as const,
-      speculativeKvFormat: 'int8' as const,
     }));
     const model = Object.assign(createMockSessionModel(), { contextLimits, hasMtpWeights: () => hasMtpWeights });
     return { model, contextLimits };
   }
 
-  // Mutation: ignore `defaultSamplingConfig.enableMtp` → red (the AR default).
   // Mutation: read `contextLimits()` on every call → red (spy count).
-  it('servedContext follows the default text lane', () => {
+  it('servedContext is the one window for every model', () => {
     const registry = new ModelRegistry();
     const draft = modelWithLimits(true);
     registry.register('draft', draft.model);
     registry.register('alias', draft.model);
-    expect(registry.servedContext('draft')).toEqual({ windowTokens: 139257, kvFormat: 'int8' });
-    expect(registry.servedContext('alias')).toEqual({ windowTokens: 139257, kvFormat: 'int8' });
+    expect(registry.servedContext('draft')).toEqual({ windowTokens: 73696, kvFormat: 'bf16' });
+    expect(registry.servedContext('alias')).toEqual({ windowTokens: 73696, kvFormat: 'bf16' });
 
     const plain = modelWithLimits(false);
     registry.register('plain', plain.model);
@@ -528,7 +525,7 @@ describe('ModelRegistry.servedContext', () => {
 
     registry.unregister('draft');
     expect(registry.servedContext('draft')).toBeUndefined();
-    expect(registry.servedContext('alias')).toEqual({ windowTokens: 139257, kvFormat: 'int8' });
+    expect(registry.servedContext('alias')).toEqual({ windowTokens: 73696, kvFormat: 'bf16' });
     registry.unregister('alias');
     expect(registry.servedContext('alias')).toBeUndefined();
     expect(registry.servedContext('missing')).toBeUndefined();

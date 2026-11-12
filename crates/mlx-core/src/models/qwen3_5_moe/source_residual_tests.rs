@@ -10,69 +10,6 @@ fn bits(x: &MxArray) -> Vec<u16> {
     x.to_uint16_native().unwrap()
 }
 
-#[test]
-fn source_residual_hidden_and_pending_preserve_raw_taps_and_one_norm() {
-    let norm = RMSNorm::from_weight(&bf(&[1.125; 64], &[64]), Some(1e-6)).unwrap();
-    let h = bf(
-        &(0..512)
-            .map(|i| ((i % 29) as f32 - 14.0) * 0.125)
-            .collect::<Vec<_>>(),
-        &[1, 8, 64],
-    );
-    let delta = bf(&[0.03125; 512], &[1, 8, 64]);
-    let want = h.add(&delta).unwrap();
-    for output in [
-        VerifyLayerOutput::Hidden(want.clone()),
-        VerifyLayerOutput::Pending {
-            h: h.clone(),
-            delta: delta.clone(),
-        },
-    ] {
-        let (tap, normalized) = output.normalize(&norm).unwrap();
-        assert_eq!(bits(&tap), bits(&want));
-        assert_eq!(bits(&normalized), bits(&norm.forward(&want).unwrap()));
-        match output.as_input() {
-            VerifyResidual::Hidden(x) => assert_eq!(bits(x), bits(&want)),
-            VerifyResidual::Pending { h, delta } => {
-                assert_eq!(bits(&h.add(delta).unwrap()), bits(&want))
-            }
-        }
-    }
-}
-
-#[test]
-fn source_residual_hidden_tap_and_final_norm_replay_changing_inputs() {
-    if !unsafe { mlx_sys::mlx_metal_is_available() } {
-        return;
-    }
-    let norm = RMSNorm::from_weight(&bf(&[0.875; 64], &[64]), Some(1e-6)).unwrap();
-    norm.get_weight().eval();
-    let key = 0x5150_5352_4553_0001;
-    crate::compiled_graph::erase_compiled_graphs_matching(u64::MAX, key);
-    let mut traces = 0;
-    for (rows, seed) in [(8, 3), (7, 11), (33, 23), (1, 41), (8, 59)] {
-        let input = bf(
-            &(0..rows * 64)
-                .map(|i| ((i * 7 + seed) % 61) as f32 * 0.125 - 3.0)
-                .collect::<Vec<_>>(),
-            &[1, rows as i64, 64],
-        );
-        let mut build = |inputs: &[MxArray]| -> Result<Vec<MxArray>> {
-            traces += 1;
-            let output = VerifyLayerOutput::Hidden(inputs[0].clone());
-            let (tap, normalized) = output.normalize(&norm)?;
-            Ok(vec![tap, normalized])
-        };
-        let got = crate::compiled_graph::invoke_compiled_graph(key, &[&input], 2, true, &mut build)
-            .unwrap()
-            .unwrap();
-        assert_eq!(bits(&got[0]), bits(&input));
-        assert_eq!(bits(&got[1]), bits(&norm.forward(&input).unwrap()));
-    }
-    assert_eq!(traces, 1);
-    crate::compiled_graph::erase_compiled_graphs_matching(u64::MAX, key);
-}
-
 fn combine_fixture(rows: usize, live: usize, seed: usize) -> Vec<MxArray> {
     let mut values = vec![0.0; rows * 9 * 2048];
     for row in 0..rows {

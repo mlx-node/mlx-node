@@ -93,16 +93,11 @@ mod vision_turn;
 #[cfg(test)]
 use self::chat_backend::qwen35_moe_speculative_plan;
 pub(crate) use self::commands::{Qwen35MoeCmd, Qwen35MoeFamilyCommand};
-pub(crate) use self::forward::{
-    DFlash2LogitsSpan, PREFILL_STEP_SIZE, forward_dflash2_deferred, forward_dflash2_with_budget,
-    forward_dflash2_with_taps,
-};
+pub(crate) use self::forward::PREFILL_STEP_SIZE;
 use self::forward::{
     chunked_prefill, eager_verify_step, forward_inner, forward_pre_norm_inner,
     project_logits_from_hidden,
 };
-#[cfg(test)]
-pub(crate) use self::forward::{inject_dflash2_store_failure, take_dflash2_compiled_test_counts};
 pub(crate) use self::mtp::Qwen35MoeDecode;
 use self::paged_backend::{Qwen35MoePrefixState, StreamSender};
 pub(crate) use self::state::qwen35_moe_vision_active;
@@ -161,9 +156,6 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) max_memory_bytes: Option<u64>,
     /// `--max-context`: the context every turn may hold, at most the plan's.
     pub(crate) max_context: Option<u32>,
-    /// Set only by a tapped flat prefill; every other cache lane invalidates it.
-    pub(crate) dflash2_flat_lane_authoritative: bool,
-    pub(crate) dflash2_compiled_verify_disabled: bool,
     pub(crate) dflash2_verify_budget: super::verify_budget::VerifyBudget,
     pub(crate) vision_encoder: Option<Arc<QwenVisionEncoder>>,
     pub(crate) image_processor: Option<Arc<QwenImageProcessor>>,
@@ -234,7 +226,7 @@ pub(crate) struct Qwen35MoeInner {
     /// the independent recurrent arrays for one cache owner.
     scheduled_recurrent: RecurrentStateTable<Vec<Qwen3_5LayerCache>>,
     scheduled_mtp: crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState,
-    active_scheduled_seq: Option<SeqId>,
+    pub(crate) active_scheduled_seq: Option<SeqId>,
     /// Multi-Token Prediction head — `Some` when `config.n_mtp_layers > 0`
     /// (the checkpoint shipped MTP weights), `None` otherwise. Owned by
     /// the model thread; the speculative-decode loop reads it directly.

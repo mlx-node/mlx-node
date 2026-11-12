@@ -48,7 +48,6 @@ pub(crate) enum UnitKey {
     },
     History,
     Owner(SeqId),
-    Table(SeqId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,7 +114,6 @@ pub(crate) trait KvReclaim {
     fn bytes_per_block(&self) -> u64;
     fn met(&mut self, need: KvNeed) -> bool;
     fn grow_room(&self) -> u32;
-    fn before_count(&mut self, _at_cap: bool) {}
     fn sync_marks(&mut self) {}
     /// What the units of the need's classes free; may over-count.
     fn reach(&self, at_cap: bool, in_use: bool) -> Reach;
@@ -160,7 +158,6 @@ pub(crate) fn free_for_kv<U: KvReclaim>(units: &mut U, need: KvNeed) -> Freed {
         return Freed::Met;
     }
     let mut at_cap = units.at_cap();
-    units.before_count(at_cap);
     let reach = units.reach(at_cap, need.reach_in_use);
     // A page need is met by pages only: a rebuilt cache gives bytes.
     let reach_bytes = if need.rebuilt && !at_cap {

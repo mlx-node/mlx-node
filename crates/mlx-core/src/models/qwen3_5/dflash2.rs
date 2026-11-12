@@ -24,6 +24,13 @@ use crate::nn::{Activations, Embedding, Linear, RMSNorm, RoPE};
 use crate::sampling::{SparseDistribution, is_greedy_temperature};
 use crate::utils::safetensors::load_safetensors_lazy;
 
+/// Proposals one DFlash2 cycle drafts (Splash `SPLASH_DRAFT_PROPOSAL_TOKENS`).
+pub(crate) const DFLASH2_DRAFT_PROPOSALS: usize = 7;
+
+/// Rows of the one verify graph: the anchor and the proposals (Splash
+/// `SPLASH_TARGET_VERIFY_ROWS`).
+pub(crate) const DFLASH2_VERIFY_ROWS: usize = DFLASH2_DRAFT_PROPOSALS + 1;
+
 #[derive(Clone, Debug, Deserialize)]
 struct RawDFlashConfig {
     block_size: usize,
@@ -120,7 +127,6 @@ impl DFlash2Config {
                 .iter()
                 .all(|kind| kind == "sliding_attention")
             && !raw.is_causal
-            && draft.block_size > 1
             && draft.conv_kernel_size == 2
             && draft.conv_group_size > 0
             && raw.hidden_size.is_multiple_of(draft.conv_group_size)
@@ -142,10 +148,16 @@ impl DFlash2Config {
                 "unsupported DFlash2 configuration (requires non-causal sliding attention, two-tap grouped convolution, and a non-empty selector)",
             ));
         }
+        // Splash `ModelDescriptor` draft check: the trained block holds the
+        // verify rows or more, and a cycle drafts the first of them.
+        if draft.block_size < DFLASH2_VERIFY_ROWS {
+            return Err(Error::from_reason(format!(
+                "draft config dflash_config block_size {} is less than the {DFLASH2_VERIFY_ROWS} rows a cycle drafts",
+                draft.block_size
+            )));
+        }
         Ok(Self {
-            // z-lab names the total verify width (anchor + proposals)
-            // `block_size`. The engine's DSpark width counts proposals only.
-            block_size: draft.block_size - 1,
+            block_size: DFLASH2_DRAFT_PROPOSALS,
             mask_token_id: draft.mask_token_id,
             target_layers: draft.target_layer_ids,
             target_num_layers: raw.num_target_layers,
@@ -1644,6 +1656,7 @@ impl DFlash2ContextCache {
     /// length `c` and provenance `[.., c)`. Evaluated here because a later
     /// append that overruns the window stores its rows in place over the
     /// rows this reads.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) fn snapshot_window_at(
         &self,
         c: i32,
@@ -1821,36 +1834,6 @@ impl DFlash2ContextCache {
         } else {
             MxArray::eval_arrays(&arrays)
         }
-    }
-
-    /// An evaluated copy with the same buffer layout that shares no buffer
-    /// with `self`: the windows store rows in place, so a snapshot installed
-    /// as a live context must not alias the one kept for later resumes.
-    pub(crate) fn deep_copy(&self) -> Result<DFlash2ContextCache> {
-        let copy = |buffer: &Option<MxArray>| buffer.as_ref().map(MxArray::deep_copy).transpose();
-        let layers = self
-            .layers
-            .iter()
-            .map(|window| {
-                Ok(DraftKvWindow {
-                    keys: copy(&window.keys)?,
-                    values: copy(&window.values)?,
-                    start: window.start,
-                    end: window.end,
-                    window: window.window,
-                    reserve: window.reserve,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let copied = DFlash2ContextCache {
-            layers,
-            mask_memo: None,
-            logical_len: self.logical_len,
-            kv_end: self.kv_end,
-            token_history: self.token_history.clone(),
-        };
-        copied.eval()?;
-        Ok(copied)
     }
 }
 
@@ -2471,11 +2454,19 @@ impl DFlash2Model {
 pub(crate) fn tiny_dflash2_model_for_stepper_test(
     target: &super::config::Qwen3_5Config,
 ) -> Result<DFlash2Model> {
+    tiny_dflash2_model_with_block(target, 2)
+}
+
+#[cfg(test)]
+pub(crate) fn tiny_dflash2_model_with_block(
+    target: &super::config::Qwen3_5Config,
+    block_size: usize,
+) -> Result<DFlash2Model> {
     let execution_policy = DraftExecutionPolicy::capture();
     let hidden = target.hidden_size as usize;
     let head_dim = target.head_dim as usize;
     let config = DFlash2Config {
-        block_size: 2,
+        block_size,
         mask_token_id: 0,
         target_layers: vec![1, 3],
         target_num_layers: target.num_layers as usize,

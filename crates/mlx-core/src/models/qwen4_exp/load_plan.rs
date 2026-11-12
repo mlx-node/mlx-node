@@ -239,13 +239,8 @@ pub(super) fn plan_engine(
         draft_weights_bytes: 0,
         held_back_bytes: held_back,
     };
-    MemoryPlan::evaluate(
-        footprint,
-        Some(pool_input(c, &transient, &state)),
-        None,
-        None,
-    )
-    .map_err(|error| Error::from_reason(error.message(label)))
+    MemoryPlan::evaluate(footprint, Some(pool_input(c, &transient, &state)), None)
+        .map_err(|error| Error::from_reason(error.message(label)))
 }
 
 /// Splash plans the stores again with their loaded sizes (`storesPlan`): an

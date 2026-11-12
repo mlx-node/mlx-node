@@ -3004,22 +3004,6 @@ impl Qwen3Tokenizer {
         self.generation_suffix_for(&RenderInputs::from_config(config, false))
     }
 
-    /// Makes `generation_suffix(config)` answer `suffix` without a render.
-    #[cfg(test)]
-    pub(crate) fn seed_generation_suffix(
-        &self,
-        config: &crate::engine::types::ChatConfig,
-        suffix: &[u32],
-    ) {
-        self.generation_suffixes
-            .lock()
-            .expect("generation suffix cache")
-            .insert(
-                RenderInputs::from_config(config, false),
-                Some(Arc::from(suffix)),
-            );
-    }
-
     pub(crate) fn generation_suffix_for(
         &self,
         inputs: &RenderInputs,

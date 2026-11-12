@@ -5267,16 +5267,13 @@ export interface Qwen35Config {
 /** What a load of a Qwen3.5 checkpoint would serve, priced before it loads. */
 export interface Qwen35ContextEstimate {
   /**
-   * Tokens a non-DFlash2 turn (AR, vision, MTP) may hold: the pool
-   * lane's, the flat lane's without a pool and a draft, the trained
-   * window with a draft and no pool.
+   * Tokens every turn may hold: the pool lane's (with a DFlash2 draft's
+   * state priced), the flat lane's without a pool.
    */
   windowTokens: number;
-  /** Tokens a DFlash2 turn may hold; set only with a draft. */
-  speculativeWindowTokens?: number;
   /**
-   * `'memory'` when the plan binds the window a default turn takes,
-   * `'model'` when the trained window does.
+   * `'memory'` when the plan binds the window, `'model'` when the trained
+   * window does.
    */
   bound: string;
 }
@@ -5287,15 +5284,13 @@ export interface Qwen35ContextEstimate {
  * derives from the pool's MAX capacity (grow-on-demand pools are preflighted
  * against the ceiling they grow toward), while `paged_block_capacity` is the
  * physical pool size actually allocated at load and may lag after a grow.
- * `speculative_window_tokens` is set only with a DFlash2 draft: it bounds
- * text turns that speculate, and `effective_window_tokens` bounds the rest.
+ * `effective_window_tokens` bounds every turn, a DFlash2 one included.
  */
 export interface Qwen35ContextLimits {
   trainedWindowTokens: number;
   effectiveWindowTokens: number;
   pagedBlockCapacity: number;
   pagedBlockSize: number;
-  speculativeWindowTokens?: number;
   /**
    * The output budget fills the window: a prompt leaves room for one new
    * token and the budget is clamped to `window - prompt`.
@@ -5304,20 +5299,11 @@ export interface Qwen35ContextLimits {
   /**
    * An omitted budget on `effective_window_tokens` is the rest of that
    * window. Set when the plan prices that window: the paged pool, or the
-   * flat lane of a load with neither pool nor draft. A flat load with a
-   * draft publishes the trained length there and keeps the native
-   * default.
+   * flat lane of a load without a pool.
    */
   omittedBudgetIsRestOfWindow: boolean;
-  /**
-   * The same for `speculative_window_tokens`: set when that window has a
-   * memory term (the pool or the live reservation).
-   */
-  speculativeOmittedBudgetIsRestOfWindow: boolean;
   /** Format of the K/V a turn on `effective_window_tokens` writes. */
   kvFormat: 'int8' | 'bf16';
-  /** Format of the K/V a turn on `speculative_window_tokens` writes. */
-  speculativeKvFormat?: 'int8' | 'bf16' | undefined;
 }
 
 /** Generation configuration for Qwen3.5 */

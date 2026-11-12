@@ -40,7 +40,7 @@
 import type { ChatConfig } from '@mlx-node/core';
 import type { DecisionModel, SessionContextLimits } from '@mlx-node/lm';
 import type { SessionCapableModel } from '@mlx-node/lm';
-import { contextLane, mtpOnByDefault } from '@mlx-node/lm';
+import { contextLane } from '@mlx-node/lm';
 
 import { AudioRegistry } from './audio-registry.js';
 import { DecisionRegistry } from './decision-registry.js';
@@ -118,7 +118,7 @@ interface SessionRegistryBinding {
   /** `unregister(name, { dispose: true })`: the teardown also frees the model's weights. */
   disposeOnTeardown: boolean;
   /** The model's load-time context snapshot, read once with the binding. */
-  context?: { limits: SessionContextLimits; mtpByDefault: boolean };
+  context?: { limits: SessionContextLimits };
 }
 
 /**
@@ -352,7 +352,7 @@ export class ModelRegistry {
         disposeOnTeardown: false,
       };
       const limits = typeof model.contextLimits === 'function' ? model.contextLimits() : undefined;
-      if (limits !== undefined) binding.context = { limits, mtpByDefault: mtpOnByDefault(model) };
+      if (limits !== undefined) binding.context = { limits };
       this.sessionRegistriesByModel.set(model, binding);
     } else {
       if (binding.pendingTeardown) {
@@ -762,16 +762,15 @@ export class ModelRegistry {
   }
 
   /**
-   * The window and K/V format of the lane a default text turn on `name`
-   * takes (the same lane the ChatSession clamp picks); `undefined` when
+   * The window and K/V format every turn on `name` takes (the window the
+   * ChatSession clamp reads); `undefined` when
    * `name` is not a loaded chat model or publishes no load-time context.
    */
   servedContext(name: string): ServedContext | undefined {
     const entry = this.models.get(name);
     const context = entry && this.sessionRegistriesByModel.get(entry.model)?.context;
     if (!entry || !context) return undefined;
-    const enableMtp = entry.sessionRegistry.defaultSamplingConfig?.enableMtp ?? context.mtpByDefault;
-    const lane = contextLane(context.limits, enableMtp, false);
+    const lane = contextLane(context.limits);
     const windowTokens = Math.floor(lane.windowTokens);
     if (!Number.isSafeInteger(windowTokens) || windowTokens <= 0) return undefined;
     return { windowTokens, ...(lane.kvFormat !== undefined ? { kvFormat: lane.kvFormat } : {}) };

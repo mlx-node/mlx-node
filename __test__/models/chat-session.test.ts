@@ -3802,11 +3802,10 @@ describe('ChatSession', () => {
       expect(mock.chatStreamSessionStart).not.toHaveBeenCalled();
     });
 
-    describe('per-lane window', () => {
-      // Pool window 64, speculative window 96 (or 48 when the draft binds).
-      function withWindows(
+    describe('one window', () => {
+      // The pool window 64 for every turn, speculative or not.
+      function withWindow(
         model: SessionCapableModel,
-        speculative: number,
         promptTokens: number,
         extra: Partial<SessionCapableModel> = {},
       ): SessionCapableModel {
@@ -3817,55 +3816,53 @@ describe('ChatSession', () => {
             effectiveWindowTokens: 64,
             pagedBlockCapacity: 4,
             pagedBlockSize: 16,
-            speculativeWindowTokens: speculative,
             restOfWindowOutputBudget: true,
             omittedBudgetIsRestOfWindow: true,
-            speculativeOmittedBudgetIsRestOfWindow: true,
+            kvFormat: 'int8' as const,
           }),
           applyChatTemplate: vi.fn(() => new Uint32Array(promptTokens)),
+          expandedPromptTokenCount: vi.fn(() => promptTokens),
           ...extra,
         };
       }
 
-      // Mutation: always use `speculativeWindowTokens` → red (resolves with 16 tokens).
-      it('bounds an autoregressive turn by the pool window', async () => {
+      it('bounds every turn by the one window', async () => {
         const mock = makeMockModel();
-        const session = new ChatSession(withWindows(mock.model, 96, 80));
-        const messages: ChatMessage[] = [{ role: 'user', content: 'ar' }];
-
-        await expect(
-          session.preflightContextCapacity(messages, { enableMtp: false, maxNewTokens: 64 }),
-        ).rejects.toMatchObject({ code: 'context_length_exceeded', effectiveWindowTokens: 64 });
-        await expect(session.preflightContextCapacity(messages, { maxNewTokens: 64 })).rejects.toBeInstanceOf(
-          ContextCapacityError,
-        );
+        const session = new ChatSession(withWindow(mock.model, 80));
+        for (const enableMtp of [true, false]) {
+          for (const hasImages of [true, false]) {
+            const messages: ChatMessage[] = [
+              { role: 'user', content: 'turn', ...(hasImages ? { images: [new Uint8Array([1])] } : {}) },
+            ];
+            await expect(
+              session.preflightContextCapacity(messages, { enableMtp, maxNewTokens: 64 }),
+            ).rejects.toMatchObject({ code: 'context_length_exceeded', effectiveWindowTokens: 64 });
+          }
+        }
+        expect(mock.chatSessionStart).not.toHaveBeenCalled();
       });
 
-      // Mutation: always use `effectiveWindowTokens` → red (rejects at 64).
-      it('bounds a speculative text turn by the speculative window', async () => {
+      it('contextLane equals the clamp window', async () => {
         const mock = makeMockModel();
-        const session = new ChatSession(withWindows(mock.model, 96, 80));
-        const messages: ChatMessage[] = [{ role: 'user', content: 'mtp' }];
-
-        const explicit = await session.preflightContextCapacity(messages, { enableMtp: true, maxNewTokens: 64 });
-        expect(explicit.maxNewTokens).toBe(16);
-
-        const auto = new ChatSession(
-          withWindows(mock.model, 96, 80, { hasMtpWeights: () => true, mtpAutoEnabled: () => true }),
-        );
-        const omitted = await auto.preflightContextCapacity(messages);
-        expect(omitted.enableMtp).toBe(true);
-        expect(omitted.maxNewTokens).toBe(16);
+        const model = withWindow(mock.model, 20);
+        const session = new ChatSession(model);
+        const lane = contextLane(model.contextLimits!());
+        expect(lane).toEqual({ windowTokens: 64, kvFormat: 'int8', omittedBudgetIsRestOfWindow: true });
+        for (const enableMtp of [true, false]) {
+          for (const hasImages of [true, false]) {
+            const messages: ChatMessage[] = [
+              { role: 'user', content: 'lane', ...(hasImages ? { images: [new Uint8Array([1])] } : {}) },
+            ];
+            const clamped = await session.preflightContextCapacity(messages, { enableMtp });
+            expect(clamped.maxNewTokens).toBe(lane.windowTokens - 20);
+          }
+        }
       });
 
-      // A flat load: the pool-less window is the trained length, the DFlash2
-      // window has a memory term.
-      // Mutation: read `omittedBudgetIsRestOfWindow` for both lanes → red
-      // (undefined ≠ 8112). Mutation: read the speculative flag for both → red
-      // (4016 ≠ undefined).
-      it('fills an omitted budget only on the window memory sizes', async () => {
+      // Mutation: ignore `omittedBudgetIsRestOfWindow` in the clamp → red.
+      it('fills an omitted budget only when the window is sized by memory', async () => {
         const mock = makeMockModel();
-        const flat = (limits: Partial<ReturnType<NonNullable<SessionCapableModel['contextLimits']>>>) =>
+        const flat = (omittedBudgetIsRestOfWindow: boolean) =>
           new ChatSession({
             ...mock.model,
             contextLimits: () => ({
@@ -3873,77 +3870,14 @@ describe('ChatSession', () => {
               effectiveWindowTokens: 4096,
               pagedBlockCapacity: 0,
               pagedBlockSize: 0,
-              speculativeWindowTokens: 8192,
               restOfWindowOutputBudget: true,
-              omittedBudgetIsRestOfWindow: false,
-              speculativeOmittedBudgetIsRestOfWindow: true,
-              ...limits,
+              omittedBudgetIsRestOfWindow,
             }),
             applyChatTemplate: vi.fn(() => new Uint32Array(80)),
           });
         const messages: ChatMessage[] = [{ role: 'user', content: 'flat' }];
-
-        const speculative = await flat({}).preflightContextCapacity(messages, { enableMtp: true });
-        expect(speculative.maxNewTokens).toBe(8112);
-        const ar = await flat({}).preflightContextCapacity(messages, { enableMtp: false });
-        expect(ar.maxNewTokens).toBeUndefined();
-      });
-
-      // Mutation: always use `effectiveWindowTokens` → red (resolves with 8 tokens).
-      it('rejects a speculative text turn above a draft window smaller than the pool', async () => {
-        const mock = makeMockModel();
-        const session = new ChatSession(withWindows(mock.model, 48, 56));
-        const messages: ChatMessage[] = [{ role: 'user', content: 'mtp' }];
-
-        await expect(
-          session.preflightContextCapacity(messages, { enableMtp: true, maxNewTokens: 64 }),
-        ).rejects.toMatchObject({ code: 'context_length_exceeded', effectiveWindowTokens: 48 });
-        const ar = await session.preflightContextCapacity(messages, { enableMtp: false, maxNewTokens: 64 });
-        expect(ar.maxNewTokens).toBe(8);
-      });
-
-      // Mutation: drop `!hasImages` from the window choice → red (resolves with 16 tokens).
-      it('bounds an image turn by the pool window even with enableMtp on', async () => {
-        const mock = makeMockModel();
-        const session = new ChatSession(withWindows(mock.model, 96, 8, { expandedPromptTokenCount: vi.fn(() => 80) }));
-        const current: ChatMessage[] = [{ role: 'user', content: 'describe', images: [new Uint8Array([1])] }];
-        const history: ChatMessage[] = [
-          { role: 'user', content: 'first', images: [new Uint8Array([2])] },
-          { role: 'assistant', content: 'seen' },
-          { role: 'user', content: 'follow up' },
-        ];
-
-        for (const messages of [current, history]) {
-          await expect(
-            session.preflightContextCapacity(messages, { enableMtp: true, maxNewTokens: 64 }),
-          ).rejects.toMatchObject({ code: 'context_length_exceeded', effectiveWindowTokens: 64 });
-        }
-        expect(mock.chatSessionStart).not.toHaveBeenCalled();
-      });
-      // Mutation: `contextLane` ignores `hasImages` → red (image + MTP lane 96 ≠ clamp 64).
-      it('contextLane equals the clamp window', async () => {
-        const mock = makeMockModel();
-        const model = withWindows(mock.model, 96, 20, { expandedPromptTokenCount: vi.fn(() => 20) });
-        const limits = {
-          ...model.contextLimits!(),
-          kvFormat: 'bf16' as const,
-          speculativeKvFormat: 'int8' as const,
-        };
-        const session = new ChatSession(model);
-        const seen: number[] = [];
-        for (const enableMtp of [true, false]) {
-          for (const hasImages of [true, false]) {
-            const messages: ChatMessage[] = [
-              { role: 'user', content: 'lane', ...(hasImages ? { images: [new Uint8Array([1])] } : {}) },
-            ];
-            const clamped = await session.preflightContextCapacity(messages, { enableMtp });
-            const lane = contextLane(limits, enableMtp, hasImages);
-            expect(clamped.maxNewTokens).toBe(lane.windowTokens - 20);
-            expect(lane.kvFormat).toBe(lane.windowTokens === 96 ? 'int8' : 'bf16');
-            seen.push(lane.windowTokens);
-          }
-        }
-        expect(seen).toEqual([64, 96, 64, 64]);
+        expect((await flat(false).preflightContextCapacity(messages)).maxNewTokens).toBeUndefined();
+        expect((await flat(true).preflightContextCapacity(messages)).maxNewTokens).toBe(4016);
       });
     });
 

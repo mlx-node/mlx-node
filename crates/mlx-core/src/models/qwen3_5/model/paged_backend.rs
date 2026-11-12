@@ -3,6 +3,7 @@
 use super::*;
 use crate::engine::paged_epilogue::FinalTokenPolicy;
 use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
+use crate::models::qwen3_5::paged_forward::PrefillTapSink;
 
 /// Adapter giving the engine's [`ChunkSink`] the `.call()` shape the
 /// `decode_loop!` macro and the engine's `run_mtp_turn` loop (and the
@@ -121,23 +122,16 @@ impl PagedPrefix for Qwen35PrefixState {
     }
 }
 
-impl PagedBackend for Qwen35Inner {
-    type PagedDecode<'a>
-        = PagedStepper<Qwen35PagedDecode<'a>>
-    where
-        Self: 'a;
-    type PrefixState = Qwen35PrefixState;
-
-    fn prime_prefix_state(
+impl Qwen35Inner {
+    /// The `prepare_turn_…` + `prepare_dense_gdn_prefix_state` block that
+    /// opens a dense paged turn. `dflash2_hit` is a DFlash2 turn's reusable
+    /// prefix: the prepare then books nothing past it.
+    pub(crate) fn prime_dense_prefix(
         &mut self,
         plan: &[u32],
-        _reuse_cache: bool,
-        _block_size: usize,
-        _extra_keys: &[u64],
         cache_salt: u64,
-    ) -> Result<Self::PrefixState> {
-        // The `prepare_turn_…` + `prepare_dense_gdn_prefix_state` block that
-        // opens a dense paged turn.
+        dflash2_hit: Option<u32>,
+    ) -> Result<Qwen35PrefixState> {
         self.paged_finalize_failed = false;
         let trace_enabled = inference_trace_enabled();
         let total_budget = plan.len() as u32;
@@ -194,25 +188,26 @@ impl PagedBackend for Qwen35Inner {
                 live_mismatch = token_prefix_mismatch_trace(plan, live_tokens);
             }
         }
-        if self.active_scheduled_seq.is_none() {
-            crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_for_prompt(
-                self,
-                plan,
-                &lookup_extra_keys,
-                cache_salt,
-            );
-        }
-        let turn_plan = crate::models::qwen3_5::dflash2_turn::reclaiming(
-            self,
-            crate::models::qwen3_5::dflash2_turn::Keep {
+        // A DFlash2 turn reuses only the live table, which no reclaim takes,
+        // so it keeps nothing (Splash keeps a restored chain only for a
+        // request that does not skip the cache).
+        let keep = match dflash2_hit {
+            None => crate::models::qwen3_5::dflash2_turn::Keep {
                 tokens: plan,
                 keys: Some((lookup_extra_keys.as_slice(), cache_salt)),
             },
-            |inner| {
-                inner
-                    .paged_adapter
-                    .as_mut()
-                    .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?
+            Some(_) => crate::models::qwen3_5::dflash2_turn::Keep::default(),
+        };
+        if self.active_scheduled_seq.is_none() {
+            crate::models::qwen3_5::dflash2_turn::ensure_paged_pool_keeping(self, plan, keep);
+        }
+        let turn_plan = crate::models::qwen3_5::dflash2_turn::reclaiming(self, keep, |inner| {
+            let adapter = inner
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?;
+            let Some(candidate) = dflash2_hit else {
+                return adapter
                     .prepare_turn_per_block_with_max_cache_hit_tokens(
                         seq_id,
                         plan,
@@ -223,9 +218,39 @@ impl PagedBackend for Qwen35Inner {
                         false,
                         max_cache_hit_tokens,
                     )
-                    .map_err(Error::from_reason)
-            },
-        )?;
+                    .map_err(Error::from_reason);
+            };
+            // A DFlash2 turn resumes only where its draft window ends
+            // (Splash resumes a state at its exact boundary); any other
+            // hit restarts cold.
+            let prepared = adapter
+                .prepare_turn_per_block_booking_hit_only(
+                    seq_id,
+                    plan,
+                    total_budget,
+                    &lookup_extra_keys,
+                    cache_salt,
+                    candidate == 0,
+                    candidate,
+                )
+                .map_err(Error::from_reason)?;
+            if prepared.cached_prefix_len == 0
+                || (prepared.continued_live_prefix && prepared.cached_prefix_len == candidate)
+            {
+                return Ok(prepared);
+            }
+            adapter
+                .prepare_turn_per_block_booking_hit_only(
+                    seq_id,
+                    plan,
+                    total_budget,
+                    &lookup_extra_keys,
+                    cache_salt,
+                    true,
+                    0,
+                )
+                .map_err(Error::from_reason)
+        })?;
         let cached_prefix_len = turn_plan.cached_prefix_len;
         let continued_live_prefix = turn_plan.continued_live_prefix;
         if trace_enabled {
@@ -307,13 +332,20 @@ impl PagedBackend for Qwen35Inner {
             gdn_prefix_already_primed,
         })
     }
+}
 
-    fn paged_prefill(
+impl Qwen35Inner {
+    /// The paged prefill; with `draft`, the draft context advanced over the
+    /// prompt from the same forward's taps.
+    pub(crate) fn dense_paged_prefill(
         &mut self,
         suffix_tokens: &[u32],
-        prefix: &Self::PrefixState,
-        _stream: Stream,
-    ) -> Result<MxArray> {
+        prefix: &Qwen35PrefixState,
+        draft: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
+    ) -> Result<(
+        MxArray,
+        Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
+    )> {
         // Scheduled MTP also retains the final normalized prompt row as the
         // request-owned draft seed. The ordinary path only produces logits.
         let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
@@ -325,14 +357,58 @@ impl PagedBackend for Qwen35Inner {
         // continues an image prefill); aligns the suffix keys with the
         // compressed-position image keys.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
-        let chunk_size = self.cold_gdn_prefill_chunk_size();
+        let chunk_size = crate::models::qwen3_5::paged_forward::prefill_chunk_rows(
+            self.cold_gdn_prefill_chunk_size(),
+        );
         // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
         // can borrow `self.layers`/`self.caches` mutably at the same time.
         let turn_cancel = self.turn_cancel.clone();
         let mtp_seq = self
             .active_scheduled_seq
             .filter(|seq| self.scheduled_mtp.owners.contains_key(seq));
+        if draft.is_some() && mtp_seq.is_some() {
+            return Err(Error::from_reason(
+                "a DFlash2 prefill never runs on a scheduled MTP sequence",
+            ));
+        }
         let mut mtp_hidden = None;
+        if let Some(context) = draft {
+            // The draft leaves the model for the prefill so each chunk can book
+            // through the take order on the whole model.
+            let model = self
+                .dflash2
+                .take()
+                .ok_or_else(|| Error::from_reason("Qwen3.8 has no loaded DFlash2 companion"))?;
+            let mut sink = crate::models::qwen3_5::dflash2_turn::DraftTapSink::new(
+                &model,
+                context,
+                &prefix.full_tokens,
+                prefix.effective_cached_prefix_len,
+            );
+            let prefilled =
+                crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
+                    &prefix.full_tokens,
+                    suffix_tokens,
+                    prefix.effective_cached_prefix_len as u32,
+                    prefix.gdn_prefix_already_primed,
+                    &embed,
+                    self,
+                    &layer_kinds,
+                    chunk_size,
+                    rope_deltas,
+                    turn_cancel.as_deref(),
+                    Some(&mut sink as &mut dyn PrefillTapSink),
+                );
+            let context = sink.into_context();
+            self.dflash2 = Some(model);
+            let (logits, checkpoint) = prefilled?;
+            self.publish_dense_gdn_materialized_prefix_checkpoint(
+                &prefix.full_tokens,
+                prefix.cache_salt,
+                checkpoint,
+            );
+            return Ok((logits, Some(context)));
+        }
         let (logits, checkpoint) = {
             let caches_ref = self
                 .caches
@@ -369,15 +445,18 @@ impl PagedBackend for Qwen35Inner {
                     prefix.effective_cached_prefix_len as u32,
                     prefix.gdn_prefix_already_primed,
                     &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
+                    &mut crate::models::qwen3_5::paged_forward::PrefillParts {
+                        layers: &mut self.layers,
+                        caches: caches_ref,
+                        final_norm: &self.final_norm,
+                        lm_head: &self.lm_head,
+                        adapter,
+                    },
                     &layer_kinds,
-                    adapter,
                     chunk_size,
                     rope_deltas,
                     turn_cancel.as_deref(),
+                    None,
                 )?
             }
         };
@@ -395,7 +474,60 @@ impl PagedBackend for Qwen35Inner {
             prefix.cache_salt,
             checkpoint,
         );
-        Ok(logits)
+        Ok((logits, None))
+    }
+}
+
+impl crate::models::qwen3_5::paged_forward::PrefillTarget<DecoderLayer> for Qwen35Inner {
+    fn parts(
+        &mut self,
+    ) -> Result<crate::models::qwen3_5::paged_forward::PrefillParts<'_, DecoderLayer>> {
+        Ok(crate::models::qwen3_5::paged_forward::PrefillParts {
+            layers: &mut self.layers,
+            caches: self
+                .caches
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("paged_prefill: caches not initialized"))?,
+            final_norm: &self.final_norm,
+            lm_head: &self.lm_head,
+            adapter: self
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?,
+        })
+    }
+
+    fn record(&mut self, chunk: &[u32]) -> Result<()> {
+        crate::models::qwen3_5::dflash2_turn::record_chunk_reclaiming(self, chunk)
+    }
+}
+
+impl PagedBackend for Qwen35Inner {
+    type PagedDecode<'a>
+        = PagedStepper<Qwen35PagedDecode<'a>>
+    where
+        Self: 'a;
+    type PrefixState = Qwen35PrefixState;
+
+    fn prime_prefix_state(
+        &mut self,
+        plan: &[u32],
+        _reuse_cache: bool,
+        _block_size: usize,
+        _extra_keys: &[u64],
+        cache_salt: u64,
+    ) -> Result<Self::PrefixState> {
+        self.prime_dense_prefix(plan, cache_salt, None)
+    }
+
+    fn paged_prefill(
+        &mut self,
+        suffix_tokens: &[u32],
+        prefix: &Self::PrefixState,
+        _stream: Stream,
+    ) -> Result<MxArray> {
+        self.dense_paged_prefill(suffix_tokens, prefix, None)
+            .map(|(logits, _)| logits)
     }
 
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
@@ -703,6 +835,30 @@ impl Qwen35Inner {
         }
     }
 
+    /// A DFlash2 turn on the pool: the pool window clamps a copy of the
+    /// params, then the paged DSpark driver runs it.
+    pub(super) fn paged_dflash2_turn(
+        &mut self,
+        args: &mut WholeTurnArgs<'_>,
+    ) -> Result<TurnOutput> {
+        let mut constrained_params = args.params.clone();
+        self.preflight_paged_context(args.tokens.len(), &mut constrained_params)?;
+        self.paged_full_attn_caches_dirty = true;
+        let mut constrained_args = WholeTurnArgs {
+            tokens: args.tokens,
+            tokenizer: args.tokenizer,
+            eos_id: args.eos_id,
+            config: args.config,
+            params: &constrained_params,
+            thinking: args.thinking,
+            plan: args.plan,
+            sink: args.sink,
+            cancelled: args.cancelled,
+            media: args.media,
+        };
+        crate::engine::dspark_turn::run_paged_dspark_turn(self, &mut constrained_args)
+    }
+
     /// Whole-turn block-paged dispatch behind [`ChatBackend::run_paged_turn`].
     ///
     /// Conditional router (dense differs from MoE here — `run_decode_loop` has
@@ -790,10 +946,7 @@ impl Qwen35Inner {
         // succeeds. A rejected request has not touched the paged adapter.
         // The DFlash2 context belongs to that flat mirror, so discard it at
         // the same ownership boundary. In particular, a future equal-length
-        // prompt must not mistake this stale draft K/V for the paged prefix.
-        // An exact DFlash2 state parks instead, taking the history with it so
-        // the paged GDN `last_history` arm cannot adopt the caches left here.
-        crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self);
+        // prompt must not mistake this stale draft window for the paged prefix.
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
         self.paged_full_attn_caches_dirty = true;

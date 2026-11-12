@@ -54,7 +54,7 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     /// The flat lane has no executor that bounds it; the paged lane keeps
-    /// `preflight_paged_context`, DFlash2 `constrain_dflash2_context_params`.
+    /// `preflight_paged_context`, DFlash2 included.
     fn context_window(&self) -> Option<u32> {
         self.paged_adapter
             .is_none()
@@ -66,13 +66,6 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
-        if scope == ResetScope::PrefixMiss {
-            // The park takes the history with the state; this scope keeps it.
-            let history = self.cached_token_history.clone();
-            if crate::models::qwen3_5::dflash2_turn::park_live_dflash2_state(self) {
-                self.cached_token_history = history;
-            }
-        }
         self.invalidate_dflash2_context(reset_drop_site(scope));
         match scope {
             // Prefix-miss reset: reset each live layer cache, then install a
@@ -318,10 +311,6 @@ impl ChatBackend for Qwen35MoeInner {
         // Sharing one driver is what keeps the two paged decoders on one epilogue.
         debug_assert!(args.plan.use_paged_attention);
         debug_assert!(self.paged_adapter.is_some());
-        debug_assert!(matches!(
-            args.plan.decoder,
-            DecoderPlan::Autoregressive | DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
-        ));
         let mut constrained_params = args.params.clone();
         self.preflight_paged_context(args.tokens.len(), &mut constrained_params)?;
         let mut constrained_args = WholeTurnArgs {
@@ -336,17 +325,20 @@ impl ChatBackend for Qwen35MoeInner {
             cancelled: args.cancelled,
             media: args.media,
         };
+        if matches!(
+            args.plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel)
+        ) {
+            return crate::engine::dspark_turn::run_paged_dspark_turn(self, &mut constrained_args);
+        }
         crate::engine::paged_turn::run_paged_turn(self, &mut constrained_args)
     }
 
     fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         debug_assert!(args.media.is_empty());
         match args.plan.decoder {
-            DecoderPlan::Speculative(SpeculativeKind::DraftModel) => {
-                crate::models::qwen3_5::dflash2_turn::dflash2_chat_turn(self, args)
-            }
             DecoderPlan::Speculative(SpeculativeKind::NativeMtp) => {
-                self.park_or_invalidate_dflash2_context("native_mtp_turn", args.plan.is_delta);
+                self.invalidate_dflash2_context("native_mtp_turn");
                 self.moe_whole_turn(args)
             }
             _ => Err(Error::from_reason(
@@ -356,13 +348,7 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        if self.paged_adapter.is_none() {
-            crate::models::qwen3_5::dflash2_turn::evict_parked_dflash2_for_flat_turn(
-                self,
-                args.tokens.len(),
-            );
-        }
-        self.park_or_invalidate_dflash2_context("run_multimodal_turn", args.plan.is_delta);
+        self.invalidate_dflash2_context("run_multimodal_turn");
         self.moe_whole_turn(args)
     }
 }
@@ -388,14 +374,13 @@ pub(super) fn qwen35_moe_speculative_plan() -> SpeculativePlan {
     }
 }
 
-/// External DFlash2 keeps one authoritative flat target/draft cache lane.
-/// Paged or media turns invalidate its retained taps before advancing state.
+/// External DFlash2 verifies on the paged pool (Splash has no flat lane).
 fn qwen35_moe_dflash2_plan() -> SpeculativePlan {
     SpeculativePlan {
         kind: SpeculativeKind::DraftModel,
         supported_input_media: MediaCapabilities::NONE,
         supported_context_media: MediaCapabilities::NONE,
-        supports_paged_attention: false,
+        supports_paged_attention: true,
         supports_streaming: true,
     }
 }

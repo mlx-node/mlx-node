@@ -534,15 +534,18 @@ impl Qwen35Inner {
                     cached_prefix_len,
                     gdn_prefix_already_primed,
                     &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
+                    &mut crate::models::qwen3_5::paged_forward::PrefillParts {
+                        layers: &mut self.layers,
+                        caches: caches_ref,
+                        final_norm: &self.final_norm,
+                        lm_head: &self.lm_head,
+                        adapter,
+                    },
                     layer_kinds,
-                    adapter,
                     chunk_size,
                     rope_deltas,
                     turn_cancel.as_deref(),
+                    None,
                 )?;
             Ok((logits, None, checkpoints))
         }
@@ -1063,7 +1066,7 @@ impl Qwen35Inner {
                     entry.last_used = stamp;
                 }
             }
-            UnitKey::Store(_) | UnitKey::Owner(_) | UnitKey::Table(_) => {}
+            UnitKey::Store(_) | UnitKey::Owner(_) => {}
         }
     }
 
@@ -1176,7 +1179,7 @@ impl Qwen35Inner {
                 self.gdn_prefix_checkpoints.len() < before
             }
             UnitKey::History => self.gdn_last_history_checkpoint.take().is_some(),
-            UnitKey::Store(_) | UnitKey::Owner(_) | UnitKey::Table(_) => false,
+            UnitKey::Store(_) | UnitKey::Owner(_) => false,
         };
         if dropped {
             self.sync_gdn_state_marks();

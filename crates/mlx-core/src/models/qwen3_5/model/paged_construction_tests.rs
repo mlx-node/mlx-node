@@ -100,16 +100,14 @@ fn tiny_hybrid_recurrent_bytes_make_usable_window_stricter_than_raw_pool() {
 }
 
 /// Installs a memory plan whose pool lane holds `pool_window` tokens and,
-/// with `speculative`, a tiny DFlash2 draft and a lane of that window.
-fn install_plan(inner: &mut Qwen35Inner, pool_window: Option<u32>, speculative: Option<u32>) {
+/// with `draft`, a tiny DFlash2 draft.
+fn install_plan(inner: &mut Qwen35Inner, pool_window: Option<u32>, draft: bool) {
     use crate::engine::memory_plan::MemoryPlan;
     let mut plan = MemoryPlan::with_pool_window(0, 1, 0, pool_window.unwrap_or(0));
     if pool_window.is_none() {
         plan.pool = None;
     }
-    plan.speculative =
-        speculative.and_then(|window| MemoryPlan::with_speculative_window(window, 8).speculative);
-    if speculative.is_some() && inner.dflash2.is_none() {
+    if draft && inner.dflash2.is_none() {
         inner.dflash2 = Some(
             crate::models::qwen3_5::dflash2::tiny_dflash2_model_for_stepper_test(&inner.config)
                 .expect("tiny DFlash2 companion"),
@@ -118,64 +116,10 @@ fn install_plan(inner: &mut Qwen35Inner, pool_window: Option<u32>, speculative: 
     inner.memory_plan = Some(plan);
 }
 
-/// Gate: a DFlash2 window above the pool leaves paged preflight on the
-/// plan's pool window. Mutation: preflight on `speculative_window()` → red.
-#[test]
-fn preflight_keeps_the_pool_window_when_a_dflash2_window_is_published() {
-    let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
-        "preflight_keeps_the_pool_window_when_a_dflash2_window_is_published",
-    ) else {
-        return;
-    };
-    let trained = inner.config.max_position_embeddings as u32;
-    install_plan(&mut inner, Some(100), Some(trained));
-    let pool_window = inner.pool_context_limit();
-    assert_eq!(pool_window, 100);
-    let speculative = inner.speculative_window().expect("a DFlash2 window");
-    assert!(speculative > pool_window, "{speculative} vs {pool_window}");
-
-    let mut params = crate::engine::extract_chat_params(&crate::engine::types::ChatConfig {
-        max_new_tokens: Some(32),
-        ..crate::engine::types::ChatConfig::default()
-    });
-    inner
-        .preflight_paged_context(pool_window as usize - 1, &mut params)
-        .expect("a prompt inside the pool window passes");
-    assert_eq!(params.max_new_tokens, 1);
-    let err = inner
-        .preflight_paged_context(pool_window as usize, &mut params)
-        .expect_err("the pool window, not the DFlash2 one, bounds paged turns");
-    assert!(
-        err.reason
-            .contains(&format!("effective active context is {pool_window} tokens")),
-        "{}",
-        err.reason
-    );
-}
-
-/// Gate: the native DFlash2 clamp reads the plan's speculative window.
-/// Mutation: ignore the plan in `speculative_window` → red (the trained
-/// windows, not 700).
-#[test]
-fn dflash2_clamp_window_is_the_speculative_window() {
-    use crate::models::qwen3_5::dflash2_turn::DFlash2Target;
-    let Some(mut inner) =
-        dense_inner_with_test_adapter_or_skip("dflash2_clamp_window_is_the_speculative_window")
-    else {
-        return;
-    };
-    install_plan(&mut inner, Some(100), Some(700));
-    assert_eq!(inner.speculative_window(), Some(700));
-    assert_eq!(DFlash2Target::dflash2_window(&inner), Some(700));
-}
-
-/// An omitted budget is the rest of a window whenever the plan prices it:
-/// the pool window of a paged load, the DFlash2 window whenever the plan
-/// has its lane, whatever bounds it, and the flat lane's window of a load
-/// with neither pool nor draft. A flat load with a draft keeps the trained
-/// length.
-/// Mutation: set both omitted flags `true` in `from_parts` → red.
-/// Mutation: read the speculative flag from `memory_window` → red.
+/// An omitted budget is the rest of the window whenever the plan prices
+/// it: the pool window of a paged load and the flat lane's window of a load
+/// without a pool.
+/// Mutation: set the omitted flag `true` in `from_parts` → red.
 /// Mutation: `pool_context_limit` ignores the plan's flat lane → red
 /// (the trained window, not 900).
 #[test]
@@ -188,7 +132,6 @@ fn flat_load_publishes_no_rest_of_window() {
     let limits = inner.context_limits_snapshot();
     assert!(limits.rest_of_window_output_budget);
     assert!(limits.omitted_budget_is_rest_of_window);
-    assert!(!limits.speculative_omitted_budget_is_rest_of_window);
 
     inner.paged_adapter = None;
     let limits = inner.context_limits_snapshot();
@@ -197,59 +140,43 @@ fn flat_load_publishes_no_rest_of_window() {
         "the clamp stays Splash's"
     );
     assert!(!limits.omitted_budget_is_rest_of_window);
-    let trained = inner.config.max_position_embeddings as u32;
-    for (speculative, memory_bound) in [(Some(1_000), true), (Some(trained), true)] {
-        install_plan(&mut inner, None, speculative);
-        let limits = inner.context_limits_snapshot();
-        assert!(!limits.omitted_budget_is_rest_of_window);
-        assert_eq!(
-            limits.speculative_omitted_budget_is_rest_of_window, memory_bound,
-            "{speculative:?}"
-        );
-    }
-    inner.memory_plan = None;
-    let limits = inner.context_limits_snapshot();
-    assert!(!limits.speculative_omitted_budget_is_rest_of_window);
 
-    inner.dflash2 = None;
     inner.memory_plan = Some(crate::engine::memory_plan::MemoryPlan::with_flat_window(
         900,
     ));
     let limits = inner.context_limits_snapshot();
     assert_eq!(limits.effective_window_tokens, 900);
     assert!(limits.omitted_budget_is_rest_of_window);
-    assert_eq!(limits.speculative_window_tokens, None);
 }
 
-/// Gate: the load snapshot publishes the pool window as the effective
-/// window and the DFlash2 window beside it.
-/// Mutation: build `effective_window_tokens` from `speculative_window()`
-/// → red.
+/// Gate: a paged load with a DFlash2 draft publishes one window, the pool
+/// lane's, for every turn; the snapshot has no second window (Splash
+/// `EngineMemoryPlan` sizes one context).
 #[test]
-fn context_limits_publish_both_windows() {
-    let Some(mut inner) =
-        dense_inner_with_test_adapter_or_skip("context_limits_publish_both_windows")
-    else {
+fn context_limits_publish_one_window() {
+    let Some(mut inner) = dense_inner_with_test_pool_or_skip(
+        "context_limits_publish_one_window",
+        mlx_paged_attn::metal::MetalDtype::Int8,
+        128,
+    ) else {
         return;
     };
     let trained = inner.config.max_position_embeddings as u32;
-    install_plan(&mut inner, Some(100), None);
-    let limits = inner.context_limits_snapshot();
-    assert_eq!(limits.effective_window_tokens, 100);
-    assert_eq!(limits.speculative_window_tokens, None);
-    for draft_window in [101, (100 + trained) / 2] {
-        install_plan(&mut inner, Some(100), Some(draft_window));
+    for draft in [false, true] {
+        install_plan(&mut inner, Some(100), draft);
         let limits = inner.context_limits_snapshot();
         assert_eq!(limits.trained_window_tokens, trained);
         assert_eq!(limits.effective_window_tokens, 100);
-        assert_eq!(limits.speculative_window_tokens, Some(draft_window));
+        assert_eq!(limits.effective_window_tokens, inner.pool_context_limit());
+        assert!(limits.omitted_budget_is_rest_of_window);
+        assert_eq!(limits.kv_format, "int8");
     }
+    assert!(inner.dflash2.is_some());
 }
 
-/// Gate: each lane publishes the K/V format it writes. The block-paged pool
-/// names its own pages (int8 or bf16, whatever the config says); the
-/// DFlash2 lane names the format its window was priced at; a flat load
-/// names the configured format.
+/// Gate: the load publishes the K/V format it writes. The block-paged pool
+/// names its own pages (int8 or bf16, whatever the config says); a flat
+/// load names the configured format.
 /// Mutation D3: the snapshot keeps `KvFormat::Bf16` for a pool → red.
 #[test]
 fn context_limits_publish_kv_formats() {
@@ -269,19 +196,7 @@ fn context_limits_publish_kv_formats() {
     };
     inner.config.kv_format = Some("int8".to_string());
     inner.caches = None;
-    let limits = inner.context_limits_snapshot();
-    assert_eq!(limits.kv_format, "bf16");
-    assert_eq!(limits.speculative_kv_format, None);
-
-    install_plan(&mut inner, Some(100), Some(1_000));
-    let priced = crate::models::qwen3_5::dflash2_turn::dflash2_target_kv_format(&inner);
-    assert_eq!(priced, crate::transformer::KvFormat::Int8);
-    let limits = inner.context_limits_snapshot();
-    assert_eq!(limits.kv_format, "bf16");
-    assert_eq!(
-        limits.speculative_kv_format.as_deref(),
-        Some(priced.as_str())
-    );
+    assert_eq!(inner.context_limits_snapshot().kv_format, "bf16");
 
     inner.paged_adapter = None;
     assert_eq!(inner.context_limits_snapshot().kv_format, "int8");
@@ -435,10 +350,14 @@ fn every_load_starts_at_the_runway() {
         let pool = plan.pool.as_ref().expect("pool plan");
         assert_eq!(adapter.layer_kv_pool().max_num_blocks(), pool.max_blocks);
         assert!(runway < pool.max_blocks, "draft={draft}");
-        assert!(adapter.grows_by_extent(), "draft={draft}");
         assert_eq!(adapter.memory_ceiling(), Some(plan.ceiling_bytes()));
         assert_eq!(inner.pool_context_limit(), pool.lane.window.maximum());
-        assert_eq!(plan.speculative.is_some(), draft);
+        assert!(plan.flat.is_none(), "draft={draft}");
+        assert_eq!(
+            pool.lane.lane_bytes > inner.config.recurrent_state_bytes(),
+            draft,
+            "the draft state rides the pool lane"
+        );
     }
 }
 
@@ -995,14 +914,17 @@ fn run_dense_paged_prefill_with_size_and_checkpoint(
         cached_prefix_len,
         false,
         &embed,
-        &mut inner.layers,
-        caches,
-        &inner.final_norm,
-        &inner.lm_head,
+        &mut crate::models::qwen3_5::paged_forward::PrefillParts {
+            layers: &mut inner.layers,
+            caches,
+            final_norm: &inner.final_norm,
+            lm_head: &inner.lm_head,
+            adapter,
+        },
         &layer_kinds,
-        adapter,
         chunk_size,
         /* cached_rope_deltas */ 0,
+        None,
         None,
     )
 }
