@@ -362,6 +362,19 @@ export class ModelWorkCoordinator {
     }
   }
 
+  /**
+   * Run `fn` in the exclusive writer slot without a load record: a release of
+   * the weights is no load, and `/health` reports it under `weights`.
+   */
+  async withWeightRelease<T>(fn: () => Promise<T> | T): Promise<T> {
+    await this.acquireWrite();
+    try {
+      return await fn();
+    } finally {
+      this.releaseWrite();
+    }
+  }
+
   async withInference<T>(fn: () => Promise<T> | T, signal?: AbortSignal): Promise<T> {
     await this.acquireRead(signal);
     try {
@@ -377,9 +390,13 @@ export class ModelWorkCoordinator {
       this.activeReaders += 1;
       return Promise.resolve();
     }
-    return this.parkWaiter(this.readerWaiters, () => {
-      this.activeReaders += 1;
-    }, signal);
+    return this.parkWaiter(
+      this.readerWaiters,
+      () => {
+        this.activeReaders += 1;
+      },
+      signal,
+    );
   }
 
   private acquireWrite(signal?: AbortSignal): Promise<void> {

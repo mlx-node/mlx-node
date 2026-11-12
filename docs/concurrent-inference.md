@@ -207,7 +207,10 @@ restored, or replayed the prompt (see
 | H4  | SSE ignores backpressure — **fixed with bounded cancellation** | Endpoints stop pulling when `res.write()` returns false and wait close-safely for drain. A 30s default drain deadline converts a connected stalled peer into a sticky abort and destroys the transport, so an admission slot cannot be held forever. The chat model-thread mailbox, native TSFN delivery, and JS callback queue each have a 64-event ceiling. A full mailbox backpressures the model instance's one producer OS thread, shared by every row in its active batch; close or callback overflow drops the receiver, wakes that producer, and cancels the turn. A slow-but-continuously-draining row can therefore throttle its peers until that turn ends because it never trips an overflow or the stalled-peer deadline. Per-row output parking remains a performance follow-up. Qwen3-ASR's real-time capture stream is outside this chat-output claim. |
 
 Cross-model residual coupling is perf-class, not correctness: the process-wide
-Metal wired limit is set/restored per turn (`crates/mlx-core/src/stream.rs:142-262`),
+Metal wired limit is a model-life lease for qwen3_5 / qwen3_5_moe / qwen4_exp
+(`WiredResidency` in `crates/mlx-core/src/stream.rs`, lapsing after the
+`--idle-release` time without a command) and is set/restored per turn for the
+other families; the process limit is the largest live lease,
 and the flat decode path calls `clear_cache` every 256 steps, draining the
 process-wide Metal free pool (`ChatBackend::maintain_cache`; noted as
 multi-model-hostile on `handle_chat_cmd` in `engine/cmd.rs`).

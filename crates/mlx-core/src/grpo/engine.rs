@@ -448,8 +448,7 @@ impl GRPOTrainingEngine {
         let sender = model
             .thread
             .cmd_sender()
-            .ok_or_else(|| Error::from_reason("Model thread not running"))?
-            .clone();
+            .ok_or_else(|| Error::from_reason("Model thread not running"))?;
 
         // Send InitTraining to set up optimizer + state on model thread
         let dispatch = TrainingDispatch::Qwen3(sender);
@@ -486,8 +485,7 @@ impl GRPOTrainingEngine {
         let sender = model
             .thread
             .cmd_sender()
-            .ok_or_else(|| Error::from_reason("Model thread not running"))?
-            .clone();
+            .ok_or_else(|| Error::from_reason("Model thread not running"))?;
 
         let dispatch = TrainingDispatch::Qwen35Dense(sender);
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -523,8 +521,7 @@ impl GRPOTrainingEngine {
         let sender = model
             .thread
             .cmd_sender()
-            .ok_or_else(|| Error::from_reason("Model thread not running"))?
-            .clone();
+            .ok_or_else(|| Error::from_reason("Model thread not running"))?;
 
         let dispatch = TrainingDispatch::Qwen35Moe(sender);
         let (tx, rx) = tokio::sync::oneshot::channel();

@@ -59,6 +59,7 @@ impl Qwen35Inner {
         );
         Ok(Self {
             config,
+            wired: None,
             turn_cancel: None,
             layer_kinds,
             embedding,

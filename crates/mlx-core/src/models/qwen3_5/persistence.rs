@@ -3358,6 +3358,17 @@ async fn load_with_thread_impl(
                 inner.image_processor.is_some(),
                 paged_active,
             );
+            if !clef {
+                if let Some(adapter) = inner.paged_adapter.as_ref() {
+                    adapter
+                        .layer_kv_pool()
+                        .hold_resident()
+                        .map_err(Error::from_reason)?;
+                }
+                inner.wired = Some(crate::stream::WiredResidency::new(
+                    crate::stream::WiredResidency::working_set_minus_pools,
+                ));
+            }
             let context_limits = inner.finish_load_limits()?;
 
             Ok((
@@ -3406,8 +3417,10 @@ async fn load_with_thread_impl(
         spatial_merge_size,
         context_limits,
         model_assets_path,
-        _cache_limit_guard: cache_limit_guard,
-        pool_cache_limit_guard,
+        cache_limit_guards: std::sync::Mutex::new(Some((
+            cache_limit_guard,
+            pool_cache_limit_guard,
+        ))),
     })
 }
 /// Parse Qwen3.5 dense config from JSON.

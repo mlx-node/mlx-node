@@ -25,6 +25,7 @@
 import type { IdleSweeper } from './idle-sweeper.js';
 import type { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
+import type { WeightResidency, WeightsSnapshot } from './weight-residency.js';
 
 /**
  * Coarse readiness classification. Ordered by precedence in
@@ -90,6 +91,8 @@ export interface ServerHealth {
     inFlight: number;
     /** True while the idle sweeper has a `clearCache()` drain armed. */
     drainPending: boolean;
+    /** True while the weights' idle release is armed. */
+    releasePending: boolean;
     writerActive: boolean;
     waitingWriters: number;
   };
@@ -106,6 +109,12 @@ export interface ServerHealth {
    * turn gets and the format of the K/V it writes (Splash `/status`).
    */
   kv: Record<string, ResidentKvStatus>;
+  /**
+   * The weights' idle release (Splash `/status` `weights`), when the server
+   * can release them. Released weights with nothing resident still read `ok`:
+   * the next request loads them.
+   */
+  weights?: WeightsSnapshot;
 }
 
 /** Splash's `/status` KV fields for one resident model. */
@@ -163,6 +172,8 @@ export interface HealthReporterDeps {
   idleSweeper?: IdleSweeper | null;
   /** Optional: supplies writer state + `lastLoad`. Absent ⇒ no load has ever run. */
   modelWorkCoordinator?: ModelWorkCoordinator | null;
+  /** Optional: the weights' idle release behind `weights` / `releasePending`. */
+  weights?: WeightResidency | null;
   /** Defaults to `Date.now()` at construction. */
   startedAt?: number;
   /** Injectable clock for tests. */
@@ -240,10 +251,11 @@ export function createHealthReporter(deps: HealthReporterDeps): () => ServerHeal
       uptimeMs: Math.max(0, now() - startedAt),
       pid: process.pid,
       models: { resident, count: resident.length },
-      work: { inFlight, drainPending, writerActive, waitingWriters },
+      work: { inFlight, drainPending, releasePending: deps.weights?.isPending ?? false, writerActive, waitingWriters },
       queue: { depth, limit, saturated },
       lastLoad,
       kv,
+      ...(deps.weights ? { weights: deps.weights.snapshot() } : {}),
     };
   };
 }

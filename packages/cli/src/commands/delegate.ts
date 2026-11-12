@@ -32,6 +32,7 @@ const DELEGATE_VALUE_FLAGS = new Set([
   '--kv-format',
   '--max-memory',
   '--max-context',
+  '--idle-release',
   '--repo',
   '--pr',
 ]);

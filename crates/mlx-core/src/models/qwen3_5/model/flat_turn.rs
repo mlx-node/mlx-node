@@ -479,9 +479,6 @@ impl Qwen35Inner {
         let eos_id = eos_token_id;
 
         let generation_stream = Stream::generation();
-        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
         let mut profiler = crate::decode_profiler::DecodeProfiler::new("chat", "qwen3_5");
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);
@@ -700,9 +697,6 @@ impl Qwen35Inner {
 
         let embedding = self.embedding.clone();
         let generation_stream = Stream::generation();
-        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
         let mut profiler = crate::decode_profiler::DecodeProfiler::new("chat_delta", "qwen3_5");
         profiler.set_prompt_tokens(delta_tokens.len() as u32);
@@ -815,8 +809,6 @@ impl Qwen35Inner {
     /// loop's running history), and the decode loop mutates it in place.
     ///
     /// The caller is responsible for:
-    /// - Creating a `WiredLimitContext` tied to `inputs.generation_stream` for
-    ///   the lifetime of this call.
     /// - Running prefill and populating the resulting `last_logits` and
     ///   `seq_len` fields of `ChatDecodeInputs`.
     /// - Pre-starting the profiler (`set_prompt_tokens`, `snapshot_memory_before`,
@@ -1099,8 +1091,7 @@ impl Qwen35Inner {
     /// detokenization plus the default
     /// [`crate::engine::backend::DefaultStreamEmitter`]) so accepted
     /// tokens stream out the `cb` sink incrementally, sharing ONE loop with the
-    /// sync site. Caller owns prefill, sampling of the first `y`, the
-    /// `WiredLimitContext`, and the post-loop save-cache / final-chunk tail.
+    /// sync site. Caller owns prefill, sampling of the first `y` and the post-loop save-cache / final-chunk tail.
     ///
     /// Preconditions (enforced by the callers' gate): `enable_mtp`,
     /// `has_mtp_weights()`, `paged_adapter.is_none()`, text-only. The body is
@@ -1318,9 +1309,6 @@ impl Qwen35Inner {
 
         let embedding = self.embedding.clone();
         let generation_stream = Stream::generation();
-        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
         let mut profiler =
             crate::decode_profiler::DecodeProfiler::new("chat_stream_delta", "qwen3_5");
@@ -1865,9 +1853,6 @@ impl Qwen35Inner {
         );
 
         let generation_stream = Stream::generation();
-        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
         let mut profiler = crate::decode_profiler::DecodeProfiler::new("chat_stream", "qwen3_5");
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);

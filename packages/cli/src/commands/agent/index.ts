@@ -26,6 +26,7 @@ import { dirname, join, resolve } from 'node:path';
 // the family list must have exactly ONE definition (the drift guard's).
 import { CHAT_FAMILY_IDS, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { readAgentDefaultModel } from '@mlx-node/agent/paths';
+import { IDLE_RELEASE_ERROR, parseIdleRelease } from '@mlx-node/server/host/idle-release';
 import { MAX_CONTEXT_ERROR, parseMaxContext } from '@mlx-node/server/host/max-context';
 import { MAX_MEMORY_ERROR, parseMaxMemory } from '@mlx-node/server/host/max-memory';
 
@@ -71,6 +72,10 @@ export interface AgentArgScan {
   maxContextTokens?: number;
   /** `--max-context` had a missing or unparseable value (the raw value, `''` when missing) — usage error. */
   maxContextInvalid?: string;
+  /** Seconds of `--idle-release` (lifted out of the argv, forwarded to `mlx serve`); `Infinity` for `off`. */
+  idleReleaseSeconds?: number;
+  /** `--idle-release` had a missing or unparseable value (the raw value, `''` when missing) — usage error. */
+  idleReleaseInvalid?: string;
   /**
    * `-h`/`--help` seen and this is NOT a binary-managed subcommand
    * (`models`/`export`/`doctor`/… print their own help inside the binary, so
@@ -254,6 +259,16 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       maxContextInvalid = value;
     }
   };
+  let idleReleaseSeconds: number | undefined;
+  let idleReleaseInvalid: string | undefined;
+  const takeIdleRelease = (value: string): void => {
+    try {
+      idleReleaseSeconds = parseIdleRelease(value);
+      idleReleaseInvalid = undefined;
+    } catch {
+      idleReleaseInvalid = value;
+    }
+  };
   let helpSeen = false;
   let versionSeen = false;
 
@@ -351,6 +366,20 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       takeMaxContext(arg.slice('--max-context='.length));
       continue;
     }
+    if (arg === '--idle-release') {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        idleReleaseInvalid = '';
+      } else {
+        takeIdleRelease(next);
+        i++;
+      }
+      continue;
+    }
+    if (arg.startsWith('--idle-release=')) {
+      takeIdleRelease(arg.slice('--idle-release='.length));
+      continue;
+    }
     if (arg === '--trace-dir') {
       trace = true;
       const next = argv[i + 1];
@@ -402,6 +431,8 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     ...(maxMemoryInvalid !== undefined ? { maxMemoryInvalid } : {}),
     ...(maxContextTokens !== undefined ? { maxContextTokens } : {}),
     ...(maxContextInvalid !== undefined ? { maxContextInvalid } : {}),
+    ...(idleReleaseSeconds !== undefined ? { idleReleaseSeconds } : {}),
+    ...(idleReleaseInvalid !== undefined ? { idleReleaseInvalid } : {}),
     help: helpSeen && !isSubcommand,
     update: leadingCommand === 'update',
     grokOneShot: versionSeen || (isSubcommand && (leadingCommand !== 'agent' || helpSeen)),
@@ -611,6 +642,11 @@ mlx options (handled before the agent binary sees the args):
                             every length, so pass more than the native window
                             only when a request needs it (default: auto, the
                             native window when memory holds it).
+  --idle-release <duration> Time without a request before the engine unwires its
+                            memory and frees the weights: seconds, or with an s,
+                            m or h suffix, e.g. 30m (default: 10m); off keeps
+                            both, though POST /v1/memory/release still frees
+                            the weights.
   --no-persist-cache        Disable the on-by-default SSD cold tier for persisted
                             paged prefix blocks. One switch for ALL restore-eligible
                             families (${coldTierRestoreFamilyList().join(', ')});
@@ -784,6 +820,12 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     return;
   }
 
+  if (scan.idleReleaseInvalid !== undefined) {
+    console.error(IDLE_RELEASE_ERROR);
+    process.exitCode = 1;
+    return;
+  }
+
   // Must run before the spawned `mlx serve` starts so its native tracing
   // subscriber picks up the env we export here.
   configureAgentTracing(scan);
@@ -849,5 +891,6 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     ...(scan.kvFormat !== undefined ? { kvFormat: scan.kvFormat } : {}),
     ...(scan.maxMemoryBytes !== undefined ? { maxMemoryBytes: scan.maxMemoryBytes } : {}),
     ...(scan.maxContextTokens !== undefined ? { maxContextTokens: scan.maxContextTokens } : {}),
+    ...(scan.idleReleaseSeconds !== undefined ? { idleReleaseSeconds: scan.idleReleaseSeconds } : {}),
   });
 }

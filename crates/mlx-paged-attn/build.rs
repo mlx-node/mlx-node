@@ -84,6 +84,7 @@ fn compile_metal_shaders() {
     let metal_files = [
         "attention/paged_attention.metal",
         "cache/reshape_and_cache.metal",
+        "shared/residency.metal",
     ];
 
     let mut air_files = Vec::new();

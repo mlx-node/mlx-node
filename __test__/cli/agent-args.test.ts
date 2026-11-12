@@ -224,6 +224,34 @@ describe('scanAgentArgs', () => {
     });
   });
 
+  // Mutation: stop lifting `--idle-release` (forward it to grok) → red.
+  describe('--idle-release extraction', () => {
+    it('lifts both forms out of passthrough as seconds', () => {
+      const spaced = scanAgentArgs(['--idle-release', '30m', '-p', 'hi']);
+      expect(spaced.idleReleaseSeconds).toBe(1800);
+      expect(spaced.idleReleaseInvalid).toBeUndefined();
+      expect(spaced.passthrough).toEqual(['-p', 'hi']);
+      const inline = scanAgentArgs(['--idle-release=off', '-c']);
+      expect(inline.idleReleaseSeconds).toBe(Infinity);
+      expect(inline.passthrough).toEqual(['-c']);
+      expect('idleReleaseSeconds' in scanAgentArgs([])).toBe(false);
+    });
+
+    it('keeps an --idle-release sitting in a grok value slot', () => {
+      const scan = scanAgentArgs(['--system-prompt-override', '--idle-release', '30m']);
+      expect(scan.idleReleaseSeconds).toBeUndefined();
+      expect(scan.passthrough).toEqual(['--system-prompt-override', '--idle-release', '30m']);
+    });
+
+    it('reports a missing or bad value without swallowing the next option', () => {
+      expect(scanAgentArgs(['--idle-release', 'never']).idleReleaseInvalid).toBe('never');
+      expect(scanAgentArgs(['--idle-release=']).idleReleaseInvalid).toBe('');
+      const missing = scanAgentArgs(['--idle-release', '--help']);
+      expect(missing.idleReleaseInvalid).toBe('');
+      expect(missing.passthrough).toEqual(['--help']);
+    });
+  });
+
   describe('update intercept', () => {
     it('detects a leading update positional', () => {
       expect(scanAgentArgs(['update']).update).toBe(true);
@@ -845,6 +873,32 @@ describe('run() argv routing', () => {
     expect(calls.launch).toHaveLength(1);
     expect(calls.launch[0]!.maxContextTokens).toBe(102_400);
     expect(calls.launch[0]!.argv).not.toContain('--max-context');
+  });
+
+  // Mutation: drop the `idleReleaseInvalid` usage check in `run` → red (a bad
+  // duration launches). Mutation: drop the launcher pass-through → red.
+  it('exits 1 on a bad --idle-release and hands a good one to the launcher', async () => {
+    for (const argv of [['--idle-release', '0'], ['--idle-release'], ['--idle-release=inf']]) {
+      const { deps, calls } = makeDeps();
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const prevExitCode = process.exitCode;
+      try {
+        await run(argv, deps);
+        expect(process.exitCode).toBe(1);
+        expect(errorSpy.mock.calls.flat().join('\n')).toContain(
+          '--idle-release must be off or a positive duration such as 30m, 2h or 600',
+        );
+      } finally {
+        process.exitCode = prevExitCode;
+        errorSpy.mockRestore();
+      }
+      expect(calls.launch).toHaveLength(0);
+    }
+    const { deps, calls } = makeDeps();
+    await run(['--idle-release', '30m'], deps);
+    expect(calls.launch).toHaveLength(1);
+    expect(calls.launch[0]!.idleReleaseSeconds).toBe(1800);
+    expect(calls.launch[0]!.argv).not.toContain('--idle-release');
   });
 
   it('documents the mlx flags and the grok environment in the help preamble', async () => {

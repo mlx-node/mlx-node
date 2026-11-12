@@ -208,8 +208,7 @@ impl SftTrainingEngine {
         let sender = model
             .thread
             .cmd_sender()
-            .ok_or_else(|| Error::from_reason("Model thread not running"))?
-            .clone();
+            .ok_or_else(|| Error::from_reason("Model thread not running"))?;
 
         // Send InitTraining to set up optimizer + state on model thread
         let grpo_config = Self::sft_config_to_grpo_config(&config);
@@ -245,8 +244,7 @@ impl SftTrainingEngine {
         let sender = model
             .thread
             .cmd_sender()
-            .ok_or_else(|| Error::from_reason("Model thread not running"))?
-            .clone();
+            .ok_or_else(|| Error::from_reason("Model thread not running"))?;
 
         let grpo_config = Self::sft_config_to_grpo_config(&config);
         let dispatch = TrainingDispatch::Qwen35Dense(sender);
@@ -281,8 +279,7 @@ impl SftTrainingEngine {
         let sender = model
             .thread
             .cmd_sender()
-            .ok_or_else(|| Error::from_reason("Model thread not running"))?
-            .clone();
+            .ok_or_else(|| Error::from_reason("Model thread not running"))?;
 
         let grpo_config = Self::sft_config_to_grpo_config(&config);
         let dispatch = TrainingDispatch::Qwen35Moe(sender);

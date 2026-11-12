@@ -459,6 +459,31 @@ describe('createInferenceHost — lazy load on the first request', () => {
     expect(host.server.registry.get('gpt-5-codex')).toBeDefined();
   });
 
+  // Mutation M12: `releaseAll` skips `dispose` → red (dispose stays 0).
+  it('POST /v1/memory/release frees the weights and the next request loads them again', async () => {
+    const disposed: string[] = [];
+    const { loads, start: startHost } = countingHost();
+    const host = await startHost({
+      loadModel: async (path: string) => {
+        loads.push(path);
+        return { dispose: async () => void disposed.push(path) } as unknown as LoadableModel;
+      },
+    });
+    expect((await post(host, '/v1/messages', 'beta')).status).not.toBe(404);
+    expect(loads).toHaveLength(1);
+
+    const release = await fetch(`${host.url}/v1/memory/release`, { method: 'POST' });
+    expect(release.status).toBe(200);
+    expect(await release.json()).toMatchObject({ released: true, weights: { released: true, restores: 0 } });
+    expect(disposed).toEqual(loads);
+    expect(host.server.registry.list()).toHaveLength(0);
+    expect(host.health()).toMatchObject({ status: 'ok', weights: { idleReleaseSeconds: 600, released: true } });
+
+    expect((await post(host, '/v1/messages', 'beta')).status).not.toBe(404);
+    expect(loads).toHaveLength(2);
+    expect(host.health().weights).toMatchObject({ released: false, restores: 1 });
+  });
+
   // The control: the Anthropic path already behaved. If this ever regresses the
   // comparison above stops meaning anything.
   it('still resolves for POST /v1/messages', async () => {

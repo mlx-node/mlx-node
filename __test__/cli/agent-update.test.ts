@@ -1981,6 +1981,22 @@ describe('launchGrokAgent server gating', () => {
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--max-context');
   });
 
+  // Mutation: drop the `--idle-release` pair from the serve argv → red.
+  it('hands --idle-release to the spawned serve as Splash spells it', async () => {
+    await launchGrokAgent({ argv: ['-c'], idleReleaseSeconds: 1800, spawnServe, spawnAgent });
+    const serveArgv: string[] = spawnServe.mock.calls[0]![0];
+    expect(serveArgv.slice(-2)).toEqual(['--idle-release', '1800']);
+    expect(parseServeArgs(serveArgv.slice(2)).idleReleaseSeconds).toBe(1800);
+
+    spawnServe.mockClear();
+    await launchGrokAgent({ argv: ['-c'], idleReleaseSeconds: Infinity, spawnServe, spawnAgent });
+    expect(spawnServe.mock.calls[0]![0].slice(-2)).toEqual(['--idle-release', 'off']);
+
+    spawnServe.mockClear();
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+    expect(spawnServe.mock.calls[0]![0]).not.toContain('--idle-release');
+  });
+
   it('turns off the xAI media tools a served launch cannot answer, keeping a user override', async () => {
     const mediaEnv = ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN'] as const;
     const saved = mediaEnv.map((name) => process.env[name]);

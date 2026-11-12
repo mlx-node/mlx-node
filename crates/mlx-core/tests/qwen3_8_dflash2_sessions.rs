@@ -1193,7 +1193,7 @@ async fn qwen38_dflash2_sessions_g1() {
         }),
     );
     model
-        .shutdown_for_test()
+        .shutdown()
         .expect("Qwen3.8 model thread must shut down cleanly");
     assert!(
         errors.is_empty(),

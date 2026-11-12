@@ -9,15 +9,22 @@ import { join } from 'node:path';
 import { ResponseStore } from '@mlx-node/core';
 
 import { AudioService, type AudioServiceOptions } from './audio-service.js';
+import type { MemoryReleaseAnswer } from './endpoints/memory-release.js';
 import type { PublicModelEntry } from './handler.js';
 import { createHandler } from './handler.js';
 import { createHealthReporter, type ServerHealth } from './health.js';
-import { createIdleSweeper, DEFAULT_IDLE_CLEAR_CACHE_MS, parseIdleClearCacheEnv } from './idle-sweeper.js';
+import {
+  createIdleSweeper,
+  DEFAULT_IDLE_CLEAR_CACHE_MS,
+  parseIdleClearCacheEnv,
+  resolveClearCache,
+} from './idle-sweeper.js';
 import { runGuardedModelLoad, type LoadModelOptions } from './load-model.js';
 import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import { ModelRegistry } from './registry.js';
 import { RerankService, resolveRerankLimits, type RerankServiceOptions } from './rerank-service.js';
 import { activeSSEStreamCountForResponses } from './streaming.js';
+import { createWeightResidency, trackWeights, type WeightResidency } from './weight-residency.js';
 
 /** Cleanup interval for expired responses (ms). */
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -232,6 +239,19 @@ export interface ServerConfig {
    */
   idleClearCacheMs?: number;
   /**
+   * Milliseconds without a request before {@link ServerConfig.releaseWeights}
+   * unloads the chat weights (Splash `--idle-release`); the next request
+   * loads them again. Default 600_000 (10 minutes); `Infinity` keeps them,
+   * though `POST /v1/memory/release` still frees them.
+   */
+  idleReleaseMs?: number;
+  /**
+   * Unloads every resident chat model and frees its weights. Supplied by a
+   * host whose {@link ServerConfig.resolveModel} loads them again; without it
+   * nothing is released and `POST /v1/memory/release` is not served.
+   */
+  releaseWeights?: () => Promise<void>;
+  /**
    * Optional async callback invoked before the endpoint layer looks
    * the model up in the registry. Intended for lazy-load schemes:
    * the callback should register the model into `registry` if it can;
@@ -369,6 +389,8 @@ export interface ServerInstance {
    * missing `__internal__.clearCache`): returns a no-op disposer.
    */
   suspendDrains(): () => void;
+  /** The weights' idle release, when {@link ServerConfig.releaseWeights} is set. */
+  readonly weights: WeightResidency | null;
 }
 
 /**
@@ -425,6 +447,31 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
   // module doc (section "Drain is post-request only") for rationale.
   const registry = new ModelRegistry({ maxQueueDepth: maxQueueDepthPerModel });
   const modelWorkCoordinator = new ModelWorkCoordinator(maxQueueDepthPerModel);
+  const idleReleaseMs = config?.idleReleaseMs ?? 600_000;
+  if (!(idleReleaseMs > 0)) {
+    throw new Error(`idleReleaseMs must be positive or Infinity; received ${String(idleReleaseMs)}`);
+  }
+  const releaseWeights = config?.releaseWeights;
+  const weights =
+    releaseWeights === undefined
+      ? null
+      : createWeightResidency({
+          idleReleaseMs,
+          release: releaseWeights,
+          drain: resolveClearCache(),
+          exclusive: (fn) => modelWorkCoordinator.withWeightRelease(fn),
+          busy: () =>
+            modelWorkCoordinator.writerActive ||
+            modelWorkCoordinator.waitingWriters > 0 ||
+            modelWorkCoordinator.requestLoadAdmissionCount > 0 ||
+            registry.dispatchLeaseCount > 0 ||
+            registry.persistRetainCount > 0,
+          resident: () => registry.listSessionRegistries().length > 0,
+        });
+  // Chat requests and their loads also move the weights' clock; audio and
+  // rerank keep the plain sweeper.
+  const chatSweeper = weights === null ? idleSweeper : trackWeights(idleSweeper, weights);
+  let closing = false;
 
   let store: ResponseStore | null = null;
   if (!disableStore) {
@@ -447,7 +494,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
 
   // One reporter shared by the HTTP endpoint and `ServerInstance.health()`
   // so both report the same uptime origin.
-  const health = createHealthReporter({ registry, idleSweeper, modelWorkCoordinator });
+  const health = createHealthReporter({ registry, idleSweeper, modelWorkCoordinator, weights });
 
   const audio = new AudioService(
     {
@@ -475,12 +522,18 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     cors,
     store,
     responseRetentionSec,
-    idleSweeper,
+    idleSweeper: chatSweeper,
     resolveModel: config?.resolveModel,
     modelWorkCoordinator,
     listModels: config?.listModels,
     authToken,
     health,
+    ...(weights !== null
+      ? {
+          releaseMemory: async (): Promise<MemoryReleaseAnswer> =>
+            closing ? { kind: 'closing' } : { kind: 'answered', weights: await weights.release('request') },
+        }
+      : {}),
     ...(config?.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: config.thinkingTokenBudget } : {}),
   });
   /**
@@ -530,6 +583,8 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
       void audioClosed.catch(() => {});
       clearInterval(cleanupTimer);
       idleSweeper.close();
+      closing = true;
+      weights?.close();
 
       let forced = false;
       let streamsAborted = 0;
@@ -584,11 +639,12 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     modelWork: modelWorkCoordinator,
     health,
     close,
+    weights,
     loadModel(opts: LoadModelOptions): Promise<void> {
-      return runGuardedModelLoad({ idleSweeper, modelWorkCoordinator, registry }, opts);
+      return runGuardedModelLoad({ idleSweeper: chatSweeper, modelWorkCoordinator, registry }, opts);
     },
     withSuspendedDrains<T>(fn: () => T | Promise<T>): T | Promise<T> {
-      return idleSweeper.withSuspendedDrains(fn as () => Promise<T>);
+      return chatSweeper.withSuspendedDrains(fn as () => Promise<T>);
     },
     suspendDrains(): () => void {
       return idleSweeper.suspendDrains();

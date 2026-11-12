@@ -409,21 +409,27 @@ impl Inner {
         Ok(())
     }
 }
+impl Inner {
+    /// The model's wired lease: the store's budget and the plan's dynamic
+    /// budget, which holds the pool, the rows' state and the transient.
+    pub(super) fn wired_bytes(&self) -> usize {
+        self.decoder
+            .weights
+            .cache_budget()
+            .checked_add(self.memory_plan.dynamic_budget_bytes)
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .unwrap_or(usize::MAX)
+    }
+}
+
 impl HybridSchedulerBackend for Inner {
     type FamilyCommand = std::convert::Infallible;
     type RestoreTicket = NoRestoreTicket;
     type OwnerState = Vec<u32>;
     type StepExecutor<'a> = HybridStepExecutor<'a, Self>;
     const SCHEDULER_NAME: &'static str = "qwen4_exp";
-    /// The store's budget and the plan's dynamic budget, which holds the
-    /// pool, the rows' state and the transient.
-    fn scheduler_wired_bytes(&self) -> Option<usize> {
-        let bytes = self
-            .decoder
-            .weights
-            .cache_budget()
-            .checked_add(self.memory_plan.dynamic_budget_bytes)?;
-        usize::try_from(bytes).ok()
+    fn wired_residency(&self) -> Option<Arc<crate::stream::WiredResidency>> {
+        self.wired.clone()
     }
     fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter> {
         self.decoder.paged.as_ref()
@@ -505,7 +511,6 @@ impl HybridSchedulerBackend for Inner {
     }
     fn scheduled_turn_closed(&mut self, seq: SeqId) {
         self.open_turns.remove(&seq);
-        self.close_turn_if_idle();
     }
     fn scheduler_prefill_slice_tokens(&self) -> u32 {
         self.decoder.prefill_slice_size() as u32

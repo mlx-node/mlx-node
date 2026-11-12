@@ -63,6 +63,19 @@ writes no pool size: it only forces `use_block_paged_cache`, and a source
 `paged_cache_memory_mb` passes through to the plan's check. Other families size their pools on the same hard budget
 (`automatic_hard_budget`) through `load_time_pool_sizing`.
 
+**Residency.** A qwen3_5 / qwen3_5_moe / qwen4_exp pool keeps its K/V layer
+buffers in a Metal residency set of its own (`LayerKVPool::hold_resident`,
+`crates/mlx-paged-attn/src/residency.rs`; Splash `metal::Residency`). The set
+is never attached to a command queue or a command buffer: a command makes
+resident only what its encoders bind. Its members are the pool's live layer
+buffers; a grow or a shrink adds the new pair and removes the old one in one
+commit, so the set's bytes always equal the pool's. Adding or removing never
+requests residency; one beat thread (`mlx-residency`) requests it every 500 ms
+while the process-wide clock is within the keep-alive (`--idle-release`, default
+10 minutes, since the last command), then ends it and dispatches one
+`residency_kick` so Metal applies the end. A device without residency sets
+leaves the pool unwired; other families' pools hold no set.
+
 **Transient memory during grow.** `LayerKVPool::grow_to` grows one layer at
 a time: it allocates the layer's larger pair, copies the old bytes, waits,
 swaps the pair in and drops the old one before the next layer, so the peak is

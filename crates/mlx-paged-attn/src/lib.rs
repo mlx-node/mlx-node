@@ -30,6 +30,7 @@ mod layer_kv_pool;
 mod prefix_registry;
 pub mod profile;
 mod recency;
+pub mod residency;
 
 #[cfg(target_os = "macos")]
 pub mod metal;

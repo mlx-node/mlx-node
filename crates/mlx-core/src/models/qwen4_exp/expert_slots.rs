@@ -3,7 +3,7 @@
 //! supplies bounded misses and releases imported chunks after the slot copy.
 use super::*;
 use crate::array::alloc::{OutLayout, SendPtr};
-use crate::array::purgeable::{PurgeableBank, PurgeableState};
+use crate::array::purgeable::PurgeableBank;
 use crate::utils::gguf_gpu::{
     GpuRepackKind, RepackDst, band_offset_rule, gpu_kind_for, gpu_repack_available, gpu_repack_band,
 };
@@ -13,7 +13,7 @@ use crate::utils::gguf_read::{
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const DIRECT_READ_BYTES: usize = 8 << 20;
 const DIRECT_STAGING_SLOTS: usize = 4;
@@ -24,10 +24,6 @@ fn slot_bank_budget_for(cap: u64, routed: u64, largest_layer: u64) -> u64 {
     (u128::from(cap) * u128::from(routed) / u128::from(routed.saturating_add(largest_layer)).max(1))
         as u64
 }
-
-pub(in super::super) const DIRECT_STAGING_BYTES: u64 =
-    (DIRECT_READ_BYTES * DIRECT_STAGING_SLOTS) as u64;
-const SLOT_RECLAIM_FALLBACK: Duration = Duration::from_secs(30);
 
 /// The fused expert kernels' bank contract (K-quant gate/up, affine down).
 fn fused_bank_modes(banks: &[Arc<Weight>; 3]) -> bool {
@@ -40,27 +36,9 @@ fn fused_bank_modes(banks: &[Arc<Weight>; 3]) -> bool {
             .all(|w| w.group == 32 && w.scales.is_some() && w.biases.is_some())
 }
 
-struct SlotBank {
-    template: Weight,
-    storage: Vec<PurgeableBank>,
-}
-
-impl SlotBank {
-    fn set_purgeable(&self, state: PurgeableState) -> Result<bool> {
-        let mut empty = false;
-        for bank in &self.storage {
-            empty |= bank.set_purgeable(state)? == PurgeableState::Empty;
-        }
-        Ok(empty)
-    }
-}
-
 pub(super) struct ExpertSlots {
     banks: [Arc<Weight>; 3],
-    storage: Option<[SlotBank; 3]>,
     direct: bool,
-    suspended: bool,
-    purge_requested: bool,
     names: [String; 3],
     rows: [usize; 3],
     occupants: Vec<Option<u32>>,
@@ -87,23 +65,20 @@ impl Weight {
         })
     }
     #[cfg(target_os = "macos")]
-    fn purgeable_slots(&self, capacity: usize) -> Result<(Self, SlotBank)> {
-        let mut storage = Vec::with_capacity(3);
-        let mut allocate = |a: &MxArray| -> Result<MxArray> {
+    /// The array owns its no-copy bank; nothing makes it volatile.
+    fn purgeable_slots(&self, capacity: usize) -> Result<Self> {
+        let allocate = |a: &MxArray| -> Result<MxArray> {
             let shape = a.shape()?;
             let bank = PurgeableBank::new(&[shape[0] * capacity as i64, shape[1]], a.dtype()?)?;
-            let array = bank.array().clone();
-            storage.push(bank);
-            Ok(array)
+            Ok(bank.array().clone())
         };
-        let template = Self {
+        Ok(Self {
             values: allocate(&self.values)?,
             dense_bf16: None,
-            scales: self.scales.as_ref().map(&mut allocate).transpose()?,
-            biases: self.biases.as_ref().map(&mut allocate).transpose()?,
+            scales: self.scales.as_ref().map(allocate).transpose()?,
+            biases: self.biases.as_ref().map(allocate).transpose()?,
             ..self.clone()
-        };
-        Ok((template.clone(), SlotBank { template, storage }))
+        })
     }
 }
 
@@ -155,59 +130,6 @@ impl Tensor {
 }
 
 impl ExpertSlots {
-    fn suspended_bank_bytes(&self) -> Result<u64> {
-        if !self.suspended {
-            return Ok(0);
-        }
-        let Some(storage) = &self.storage else {
-            return Ok(0);
-        };
-        storage.iter().try_fold(0u64, |total, slot| {
-            slot.storage.iter().try_fold(total, |total, bank| {
-                total
-                    .checked_add(bank.nbytes() as u64)
-                    .ok_or_else(|| err("Qwen4 suspended bank size overflow"))
-            })
-        })
-    }
-
-    fn activate(&mut self) -> Result<()> {
-        if !self.suspended {
-            return Ok(());
-        }
-        let mut empty = std::mem::take(&mut self.purge_requested);
-        if let Some(storage) = &self.storage {
-            for bank in storage {
-                empty |= bank.set_purgeable(PurgeableState::NonVolatile)?;
-            }
-        }
-        if empty {
-            if let Some(storage) = &self.storage {
-                self.banks = storage
-                    .each_ref()
-                    .map(|bank| Arc::new(bank.template.clone()));
-            }
-            self.invalidate_all();
-        }
-        self.suspended = false;
-        Ok(())
-    }
-
-    fn suspend(&mut self, force_empty: bool) -> Result<()> {
-        let Some(storage) = &self.storage else {
-            return Ok(());
-        };
-        for bank in storage {
-            bank.set_purgeable(PurgeableState::Volatile)?;
-            if force_empty {
-                bank.set_purgeable(PurgeableState::Empty)?;
-            }
-        }
-        self.purge_requested |= force_empty;
-        self.suspended = true;
-        Ok(())
-    }
-
     fn invalidate_all(&mut self) {
         self.occupants.fill(None);
         self.mapping.fill(None);
@@ -224,7 +146,6 @@ impl ExpertSlots {
 
     fn identity_ready(&self) -> bool {
         self.direct
-            && !self.suspended
             && self.occupants.len() == self.mapping.len()
             && self
                 .occupants
@@ -249,14 +170,11 @@ impl ExpertSlots {
     }
 
     /// The fill worker mutates lazy output handles, never the store's slot
-    /// bookkeeping or purge state. All handles share the same bank storage.
+    /// bookkeeping. All handles share the same bank storage.
     fn fill_clone(&self) -> Self {
         Self {
             banks: self.banks.clone(),
-            storage: None,
             direct: self.direct,
-            suspended: false,
-            purge_requested: false,
             names: self.names.clone(),
             rows: self.rows,
             occupants: self.occupants.clone(),
@@ -417,7 +335,6 @@ impl DirectRun<'_, '_> {
 struct DirectFillStats {
     source_bytes: u64,
     bank_bytes: u64,
-    slow_source: bool,
     #[cfg(test)]
     windows: Vec<(u64, usize)>,
 }
@@ -500,9 +417,6 @@ impl DirectFill {
                         }
                     }
                     let file_refs: Vec<&File> = files.iter().collect();
-                    let started = Instant::now();
-                    let mut filled_source = 0u64;
-                    let mut slow = false;
                     for mut job in jobs {
                         if worker_stop.load(Ordering::Acquire) {
                             return;
@@ -525,24 +439,11 @@ impl DirectFill {
                         match result {
                             Ok(filled) => {
                                 stats = filled;
-                                filled_source = filled_source.saturating_add(stats.source_bytes);
-                                if !slow && filled_source >= (1 << 30) {
-                                    let elapsed = started.elapsed().as_secs_f64().max(0.000_001);
-                                    let rate = filled_source as f64 / elapsed;
-                                    if rate < 5_000_000_000.0 {
-                                        slow = true;
-                                        tracing::warn!(
-                                            "qwen4 direct GGUF: slow source ({:.2} GB/s first GiB), estimated full fill {:.1} s; banks stay resident at idle",
-                                            rate / 1_000_000_000.0,
-                                            total_source as f64 / rate,
-                                        );
-                                    }
-                                }
-                                stats.slow_source = slow;
-                                worker_live.direct_filled_layers.fetch_add(1, Ordering::AcqRel);
+                                worker_live
+                                    .direct_filled_layers
+                                    .fetch_add(1, Ordering::AcqRel);
                             }
                             Err(failure) => {
-                                stats.slow_source = slow;
                                 if worker_stop.load(Ordering::Acquire) {
                                     return;
                                 }
@@ -725,7 +626,6 @@ impl Store {
             .extend(stats.windows.iter().copied());
         self.bytes_read += stats.source_bytes;
         self.slot_upload_bytes += stats.bank_bytes;
-        self.direct_slow_source |= stats.slow_source;
     }
 
     fn fill_direct_chunk(
@@ -952,7 +852,6 @@ impl Store {
             self.slot_bank_budget = original_slot_bank_budget;
             return Err(error);
         }
-        self.direct_slow_source = false;
         self.direct_error = None;
         self.direct_fill_pass = false;
         self.live.direct_filled_layers.store(0, Ordering::Release);
@@ -1181,17 +1080,7 @@ impl Store {
         Ok(())
     }
 
-    fn check_activation_refusal(&self) -> Result<()> {
-        if let Some(error) = &self.activation_error {
-            return Err(err(format!(
-                "Qwen4 expert bank activation refused: {error}"
-            )));
-        }
-        Ok(())
-    }
-
     fn wait_direct_layer(&mut self, layer: usize) -> Result<()> {
-        self.check_activation_refusal()?;
         if self
             .slots
             .get(&layer)
@@ -1277,138 +1166,14 @@ impl Store {
         self.start_direct_fill()
     }
 
-    pub(in super::super) fn activate_expert_slots(&mut self) -> Result<()> {
-        self.activate_expert_slots_with(&mut super::super::memory::admit_direct)
-    }
-
-    pub(in super::super) fn activate_expert_slots_with(
-        &mut self,
-        admit: &mut impl FnMut(u64) -> Result<()>,
-    ) -> Result<()> {
-        self.activate_expert_slots_with_reclaim(
-            admit,
-            &mut || crate::array::memory::get_cache_memory(),
-            &mut || crate::array::memory::clear_cache(),
-        )
-    }
-
-    fn activate_expert_slots_with_reclaim(
-        &mut self,
-        admit: &mut impl FnMut(u64) -> Result<()>,
-        cache_size: &mut impl FnMut() -> f64,
-        reclaim: &mut impl FnMut(),
-    ) -> Result<()> {
-        if self
-            .slot_reclaim_since
-            .is_some_and(|since| since.elapsed() >= SLOT_RECLAIM_FALLBACK)
-        {
-            self.purge_expert_slots()?;
-        }
-        let retrying_activation_refusal = self.activation_error.is_some();
-        // Suspended banks are still reclaimable in the live host sample;
-        // active banks are already counted there and must not be admitted again.
-        let suspended_bytes = self.slots.values().try_fold(0u64, |total, slots| {
-            total
-                .checked_add(slots.suspended_bank_bytes()?)
-                .ok_or_else(|| err("Qwen4 suspended bank total overflows u64"))
-        })?;
-        if suspended_bytes > 0 {
-            let bytes = suspended_bytes
-                .checked_add(DIRECT_STAGING_BYTES)
-                .ok_or_else(|| err("Qwen4 activation admission overflows u64"))?;
-            let mut admitted = admit(bytes);
-            if admitted.is_err() && cache_size() > 0.0 {
-                reclaim();
-                admitted = admit(bytes);
-            }
-            if let Err(error) = admitted {
-                self.activation_error = Some(error.reason.clone());
-                return Err(error);
-            }
-            self.activation_error = None;
-        }
-        for slots in self.slots.values_mut() {
-            slots.activate()?;
-        }
-        self.slot_reclaim_since = None;
-        // An activation retry must not erase an unrelated asynchronous worker error.
-        if !retrying_activation_refusal || self.direct_error.is_none() {
-            self.start_direct_fill()?;
-        }
+    /// Resumes any unpublished direct layers before a turn. The banks stay
+    /// allocated and non-volatile until the model is released (Splash
+    /// `ExpertStore` has no purgeable state and no timed purge).
+    pub(in super::super) fn begin_turn(&mut self) -> Result<()> {
+        self.start_direct_fill()?;
         self.direct_fill_pass =
             self.plan.direct && self.slots.values().any(|slots| !slots.identity_ready());
         Ok(())
-    }
-
-    /// Between turns, complete every bank reader before making slot storage
-    /// reclaimable. Explicit Empty is the fallback when automatic reclaim is
-    /// unavailable or a probe needs a guaranteed refill.
-    pub(in super::super) fn reclaim_expert_slots(&mut self) -> Result<()> {
-        self.suspend_expert_slots(false)
-    }
-
-    pub(in super::super) fn purge_expert_slots(&mut self) -> Result<()> {
-        self.suspend_expert_slots(true)
-    }
-
-    fn suspend_expert_slots(&mut self, force_empty: bool) -> Result<()> {
-        if self.plan.direct && self.direct_slow_source {
-            return Ok(());
-        }
-        if self.plan.direct && self.slots.values().any(|slots| !slots.identity_ready()) {
-            // The fill worker still writes unpublished banks. Keep the whole
-            // set non-volatile until a later idle boundary can drain it.
-            return Ok(());
-        }
-        self.direct_fill_pass = false;
-        self.complete_device_readers()?;
-        crate::array::memory::synchronize();
-        for slots in self.slots.values_mut() {
-            slots.suspend(force_empty)?;
-        }
-        self.slot_reclaim_since = if force_empty {
-            None
-        } else if self.slots.values().any(|slots| slots.storage.is_some()) {
-            Some(Instant::now())
-        } else {
-            None
-        };
-        Ok(())
-    }
-
-    /// Activate reclaimable banks and resume any unpublished direct layers
-    /// before the first turn of an idle model.
-    pub(in super::super) fn begin_turn(&mut self) -> Result<()> {
-        self.activate_expert_slots()
-    }
-
-    #[cfg(test)]
-    pub(in super::super) fn begin_turn_with(
-        &mut self,
-        admit: &mut impl FnMut(u64) -> Result<()>,
-    ) -> Result<()> {
-        self.activate_expert_slots_with_reclaim(admit, &mut || 0.0, &mut || {})
-    }
-
-    #[cfg(test)]
-    pub(in super::super) fn begin_turn_with_reclaim(
-        &mut self,
-        admit: &mut impl FnMut(u64) -> Result<()>,
-        cache_size: &mut impl FnMut() -> f64,
-        reclaim: &mut impl FnMut(),
-    ) -> Result<()> {
-        self.activate_expert_slots_with_reclaim(admit, cache_size, reclaim)
-    }
-
-    #[cfg(test)]
-    pub(in super::super) fn slot_suspend_states_for_test(&self) -> Vec<(usize, bool, bool)> {
-        let mut states: Vec<_> = self
-            .slots
-            .iter()
-            .map(|(&layer, slots)| (layer, slots.suspended, slots.purge_requested))
-            .collect();
-        states.sort_unstable_by_key(|&(layer, ..)| layer);
-        states
     }
 
     pub(in super::super) fn expert_slot_capacity(
@@ -1634,40 +1399,28 @@ impl Store {
         super::super::memory::maintain_freelist(self.plan.physical_bytes);
         admit(bytes + MAX_READ_BYTES * 3)?;
         #[cfg(target_os = "macos")]
-        let (banks, storage) = {
+        let banks = {
             let mut banks = Vec::with_capacity(3);
-            let mut storage = Vec::with_capacity(3);
             for prototype in &prototypes {
-                let (bank, owner) = prototype.purgeable_slots(capacity)?;
-                banks.push(Arc::new(bank));
-                storage.push(owner);
+                banks.push(Arc::new(prototype.purgeable_slots(capacity)?));
             }
             let banks: [Arc<Weight>; 3] = banks
                 .try_into()
                 .map_err(|_| err("Qwen4 slot bank count mismatch"))?;
-            let storage: [SlotBank; 3] = storage
-                .try_into()
-                .map_err(|_| err("Qwen4 slot storage count mismatch"))?;
-            (banks, Some(storage))
+            banks
         };
         #[cfg(not(target_os = "macos"))]
-        let (banks, storage) = {
-            let banks = [
-                Arc::new(prototypes[0].empty_slots(capacity)?),
-                Arc::new(prototypes[1].empty_slots(capacity)?),
-                Arc::new(prototypes[2].empty_slots(capacity)?),
-            ];
-            (banks, None)
-        };
+        let banks = [
+            Arc::new(prototypes[0].empty_slots(capacity)?),
+            Arc::new(prototypes[1].empty_slots(capacity)?),
+            Arc::new(prototypes[2].empty_slots(capacity)?),
+        ];
         self.slot_bytes += bytes;
         self.cache_bytes += bytes;
         self.peak_cache_bytes = self.peak_cache_bytes.max(self.cache_bytes);
         Ok(Some(ExpertSlots {
             banks,
-            storage,
             direct,
-            suspended: false,
-            purge_requested: false,
             names,
             rows,
             occupants: vec![None; capacity],
@@ -1686,9 +1439,6 @@ impl Store {
         top: usize,
         ids: &[u32],
     ) -> Result<Option<([Arc<Weight>; 3], Vec<u32>, usize)>> {
-        if !self.plan.direct {
-            self.check_activation_refusal()?;
-        }
         let capacity = self.expert_slot_capacity(experts, top)?;
         let wanted: HashSet<u32> = ids.iter().copied().collect();
         if capacity == 0 || wanted.len() > capacity {
@@ -1723,7 +1473,6 @@ impl Store {
                 None => return Ok(None),
             }
         };
-        slots.activate()?;
         let result = (|| -> Result<_> {
             let mut missing: Vec<u32> = wanted
                 .iter()
@@ -1821,9 +1570,9 @@ impl Store {
             });
         }
         (0..layers).all(|layer| {
-            self.slots.get(&layer).is_some_and(|slots| {
-                !slots.suspended && slots.occupants.first().is_some_and(Option::is_some)
-            })
+            self.slots
+                .get(&layer)
+                .is_some_and(|slots| slots.occupants.first().is_some_and(Option::is_some))
         })
     }
 
@@ -1837,15 +1586,14 @@ impl Store {
     pub(in super::super) fn prefill_device_slots_ready(&self, layers: usize) -> bool {
         if self.plan.direct {
             return (0..layers).all(|layer| {
-                self.slots.get(&layer).is_some_and(|slots| {
-                    !slots.suspended && slots.direct && fused_bank_modes(&slots.banks)
-                })
+                self.slots
+                    .get(&layer)
+                    .is_some_and(|slots| slots.direct && fused_bank_modes(&slots.banks))
             });
         }
         (0..layers).all(|layer| {
             self.slots.get(&layer).is_some_and(|slots| {
-                !slots.suspended
-                    && slots.occupants.first().is_some_and(Option::is_some)
+                slots.occupants.first().is_some_and(Option::is_some)
                     && self.wide_routes.get(&layer).is_some_and(|ids| {
                         !ids.is_empty()
                             && ids.iter().all(|&id| {
@@ -1919,7 +1667,7 @@ impl Store {
             let local = ids.reshape(&[-1])?.astype(DType::Uint32)?;
             return Ok(Some((slots.banks.clone(), local)));
         }
-        let Some(slots) = self.slots.get_mut(&layer).filter(|s| !s.suspended) else {
+        let Some(slots) = self.slots.get_mut(&layer) else {
             return Ok(None);
         };
         if slots.device_mapping.is_none() {
@@ -1982,7 +1730,7 @@ impl Store {
             return Ok(true);
         }
         for &(layer, selected) in entries {
-            let Some(slots) = self.slots.get(&layer).filter(|s| !s.suspended) else {
+            let Some(slots) = self.slots.get(&layer) else {
                 return Ok(false);
             };
             if selected.iter().any(|&e| {
@@ -2143,10 +1891,7 @@ mod tests {
                 layer,
                 ExpertSlots {
                     banks: [weight.clone(), weight.clone(), weight.clone()],
-                    storage: None,
                     direct: false,
-                    suspended: false,
-                    purge_requested: false,
                     names: ["gate".into(), "up".into(), "down".into()],
                     rows: [1; 3],
                     occupants: vec![Some(layer as u32)],
@@ -2185,10 +1930,7 @@ mod tests {
             0,
             ExpertSlots {
                 banks: [bank.clone(), bank.clone(), bank],
-                storage: None,
                 direct: false,
-                suspended: false,
-                purge_requested: false,
                 names: Default::default(),
                 rows: [1; 3],
                 occupants: vec![Some(0)],
@@ -2233,10 +1975,7 @@ mod tests {
             1,
             ExpertSlots {
                 banks: previous,
-                storage: None,
                 direct: false,
-                suspended: false,
-                purge_requested: false,
                 names: Default::default(),
                 rows: [1; 3],
                 occupants: vec![Some(0)],

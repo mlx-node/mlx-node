@@ -206,9 +206,6 @@ impl Qwen35MoeInner {
         );
 
         let generation_stream = Stream::generation();
-        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
         let fa_idx = self.fa_idx;
 
@@ -566,9 +563,6 @@ impl Qwen35MoeInner {
 
         let embedding = self.embedding.clone();
         let generation_stream = Stream::generation();
-        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
         // StreamContext created ONCE for entire prefill+decode
         let _stream_ctx = StreamContext::new(generation_stream);
@@ -858,9 +852,6 @@ impl Qwen35MoeInner {
 
         let embedding = self.embedding.clone();
         let generation_stream = Stream::generation();
-        let model_size_bytes = self.config.estimate_memory_bytes() as usize;
-        let _wired_ctx =
-            crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
         let fa_idx = self.fa_idx;
 

@@ -26,6 +26,17 @@ All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendSt
 
 `Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Qwen3.8-Flash-Next, Gemma4, Muse-Glimmer, LFM2.5, Nemotron 3.5 Lightning, and DeepSeek V4.1 Flash are inference-only.
 
+**Freeing a model.** `Qwen35Model`, `Qwen35MoeModel` and `Qwen4ExpModel` have
+`dispose()`: the model thread drops the weights, caches and state and exits,
+and every later call fails. Other wrappers free at GC. These three families
+hold one wired residency for the model's life (Splash `metal::Residency`): the
+MLX wired limit stays leased between turns and the paged pool keeps its own
+residency set, both requested every 500 ms until `setResidencyKeepAlive(seconds)`
+(default 600, `Infinity` = for the model's life) passes without a command. The
+server's idle release (`--idle-release`, `POST /v1/memory/release`) unloads the
+resident chat model through `dispose()` and loads it again on the next request;
+see [cli.md](cli.md).
+
 See [Qwen3.8-Flash-Next](qwen38-flash-next.md) for SSD loading, memory budgets,
 the first-split GGUF path, auxiliary MTP/vision weights, and supported media.
 

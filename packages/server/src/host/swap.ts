@@ -18,6 +18,12 @@ export interface SwapController {
   resolveModel: (name: string) => Promise<void>;
   listModels: () => PublicModelEntry[];
   disposeAll?: () => Promise<void>;
+  /**
+   * {@link disposeAll}, and each unloaded model's `dispose()` frees its
+   * weights once its sessions flush; resolves when they are freed. The
+   * selection stays, so the next request loads the same model again.
+   */
+  releaseAll?: () => Promise<void>;
 }
 
 /**
@@ -218,13 +224,19 @@ export function makeSwapController(
     });
   }
 
-  async function disposeAll(): Promise<void> {
+  async function unloadAll(dispose: boolean): Promise<void> {
     await currentOp;
     const sessions = registry.listSessionRegistries();
-    for (const entry of registry.list()) if (registry.getAny(entry.id)) registry.unregister(entry.id);
+    for (const entry of registry.list()) if (registry.getAny(entry.id)) registry.unregister(entry.id, { dispose });
     resident = null;
     aliases.clear();
     await Promise.all(sessions.map((session) => session.flushPendingDisposals()));
+    if (dispose) await registry.settleModelDisposals();
   }
-  return { resolveModel, listModels, disposeAll };
+  return {
+    resolveModel,
+    listModels,
+    disposeAll: () => unloadAll(false),
+    releaseAll: () => unloadAll(true),
+  };
 }

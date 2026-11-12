@@ -101,8 +101,14 @@ pub(crate) fn stream_channel_with_progress<T>(
 /// `engine::model_command::ModelCommand` envelope with typed family extensions;
 /// non-chat services may use their own command enums.
 pub struct ModelThread<Cmd: Send + 'static> {
+    /// `send` and `take_for_join` both run through `&self` (napi futures
+    /// keep sending while `dispose` takes the thread).
+    parts: std::sync::Mutex<ThreadParts<Cmd>>,
+}
+
+struct ThreadParts<Cmd> {
     cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<Cmd>>,
-    _handle: Option<std::thread::JoinHandle<()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Result of one scheduler-owned model-thread loop iteration.
@@ -112,6 +118,22 @@ pub(crate) enum LoopControl {
 }
 
 impl<Cmd: Send + 'static> ModelThread<Cmd> {
+    fn from_parts(
+        cmd_tx: tokio::sync::mpsc::UnboundedSender<Cmd>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    ) -> Self {
+        Self {
+            parts: std::sync::Mutex::new(ThreadParts {
+                cmd_tx: Some(cmd_tx),
+                handle,
+            }),
+        }
+    }
+
+    fn parts(&self) -> std::sync::MutexGuard<'_, ThreadParts<Cmd>> {
+        self.parts.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Spawn a model thread whose loop owns the command receiver.
     ///
     /// Unlike [`Self::spawn_with_init`], this variant does not consume one
@@ -164,13 +186,7 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
             }
         };
 
-        (
-            Self {
-                cmd_tx: Some(cmd_tx),
-                _handle: handle,
-            },
-            init_rx,
-        )
+        (Self::from_parts(cmd_tx, handle), init_rx)
     }
 
     /// Spawn a dedicated model thread with an initialization phase.
@@ -228,40 +244,34 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
             }
         };
 
-        let thread = Self {
-            cmd_tx: Some(cmd_tx),
-            _handle: handle,
-        };
-        (thread, init_rx)
+        (Self::from_parts(cmd_tx, handle), init_rx)
     }
 
-    /// Get a reference to the command sender.
-    /// Training engines use this to send training commands directly.
-    pub fn cmd_sender(&self) -> Option<&tokio::sync::mpsc::UnboundedSender<Cmd>> {
-        self.cmd_tx.as_ref()
+    /// A clone of the command sender. Training engines use this to send
+    /// training commands directly.
+    pub fn cmd_sender(&self) -> Option<tokio::sync::mpsc::UnboundedSender<Cmd>> {
+        self.parts().cmd_tx.clone()
     }
 
     /// Send a command to the model thread.
     ///
     /// Returns an error if the channel is closed (thread has exited).
     pub fn send(&self, cmd: impl Into<Cmd>) -> napi::Result<()> {
-        self.cmd_tx
+        self.parts()
+            .cmd_tx
             .as_ref()
             .ok_or_else(|| napi::Error::from_reason("Model thread is not running"))?
             .send(cmd.into())
             .map_err(|_| napi::Error::from_reason("Model thread has exited"))
     }
 
-    /// Close the command channel and wait for the model thread to release its
-    /// state.
-    ///
-    /// Normal NAPI teardown deliberately detaches in [`Drop`] so JavaScript GC
-    /// never blocks on multi-gigabyte Metal cleanup. Real-weight tests sometimes
-    /// need deterministic teardown before loading a second oracle model on a
-    /// memory-constrained runner; this explicit path provides that stronger
-    /// lifecycle guarantee without changing production drop behavior.
-    pub(crate) fn shutdown_and_join(&mut self) -> Result<(), String> {
-        if let Some(cmd_tx) = self.cmd_tx.as_ref() {
+    /// Closes the command channel and hands back the thread to join; the
+    /// thread drops its state once its current command ends. Later sends
+    /// fail. Requires exclusive command-sender ownership: a live clone would
+    /// keep the thread waiting for commands.
+    pub(crate) fn take_for_join(&self) -> Result<Option<std::thread::JoinHandle<()>>, String> {
+        let mut parts = self.parts();
+        if let Some(cmd_tx) = parts.cmd_tx.as_ref() {
             let sender_count = cmd_tx.strong_count();
             if sender_count != 1 {
                 return Err(format!(
@@ -269,13 +279,33 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
                 ));
             }
         }
-        self.cmd_tx.take();
-        match self._handle.take() {
+        parts.cmd_tx.take();
+        Ok(parts.handle.take())
+    }
+
+    /// [`Self::take_for_join`], then wait for the thread to drop its state.
+    /// Normal NAPI teardown detaches in [`Drop`] so JavaScript GC never
+    /// blocks on multi-gigabyte Metal cleanup.
+    pub(crate) fn shutdown_and_join(&self) -> Result<(), String> {
+        match self.take_for_join()? {
             Some(handle) => handle
                 .join()
                 .map_err(|_| "model thread panicked during shutdown".to_string()),
             None => Ok(()),
         }
+    }
+
+    /// [`Self::shutdown_and_join`] off the JS thread; a second call resolves
+    /// at once.
+    pub(crate) async fn dispose(&self) -> napi::Result<()> {
+        let handle = self.take_for_join().map_err(napi::Error::from_reason)?;
+        if let Some(handle) = handle {
+            tokio::task::spawn_blocking(move || handle.join())
+                .await
+                .map_err(|error| napi::Error::from_reason(error.to_string()))?
+                .map_err(|_| napi::Error::from_reason("model thread panicked during shutdown"))?;
+        }
+        Ok(())
     }
 }
 
@@ -288,7 +318,7 @@ impl<Cmd: Send + 'static> Drop for ModelThread<Cmd> {
         // and exit on its own.  Joining can block for seconds while MLX
         // tears down GPU allocations, which causes vitest fork workers
         // to time out and get killed.
-        self.cmd_tx.take();
+        self.parts().cmd_tx.take();
     }
 }
 
@@ -399,7 +429,7 @@ mod tests {
     fn explicit_shutdown_requires_exclusive_sender_and_joins_state_drop() {
         let dropped = Arc::new(AtomicBool::new(false));
         let dropped_for_thread = dropped.clone();
-        let (mut model_thread, init_rx) = ModelThread::<()>::spawn_with_init(
+        let (model_thread, init_rx) = ModelThread::<()>::spawn_with_init(
             move || Ok((DropState(dropped_for_thread), ())),
             |_, _| {},
         );
@@ -408,10 +438,7 @@ mod tests {
             .expect("model init channel closed")
             .expect("model init failed");
 
-        let extra_sender = model_thread
-            .cmd_sender()
-            .expect("model sender missing")
-            .clone();
+        let extra_sender = model_thread.cmd_sender().expect("model sender missing");
         let err = model_thread
             .shutdown_and_join()
             .expect_err("an outstanding sender must prevent a blocking join");
@@ -425,13 +452,49 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
     }
 
+    /// `dispose` takes the thread through `&self`: the channel closes, the
+    /// thread drops its state, and a later send fails.
+    ///
+    /// Mutation M10: `take_for_join` keeps the sender, so the thread never
+    /// exits.
+    #[test]
+    fn take_for_join_drops_the_state() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_for_thread = dropped.clone();
+        let (model_thread, init_rx) = ModelThread::<()>::spawn_with_init(
+            move || Ok((DropState(dropped_for_thread), ())),
+            |_, _| {},
+        );
+        init_rx
+            .blocking_recv()
+            .expect("model init channel closed")
+            .expect("model init failed");
+        let handle = model_thread
+            .take_for_join()
+            .expect("exclusive sender")
+            .expect("thread handle");
+        let (joined_tx, joined_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = joined_tx.send(handle.join().is_ok());
+        });
+        assert_eq!(
+            joined_rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Ok(true),
+            "the model thread did not exit"
+        );
+        assert!(dropped.load(Ordering::SeqCst));
+        let error = model_thread.send(()).expect_err("send after dispose");
+        assert_eq!(error.reason, "Model thread is not running");
+        assert!(model_thread.take_for_join().expect("second take").is_none());
+    }
+
     #[test]
     fn scheduler_spawn_hands_receiver_ownership_to_the_loop() {
         enum Cmd {
             Add(i32, ResponseTx<i32>),
             Stop,
         }
-        let (mut model_thread, init_rx) = ModelThread::<Cmd>::spawn_with_scheduler(
+        let (model_thread, init_rx) = ModelThread::<Cmd>::spawn_with_scheduler(
             || Ok((40, ())),
             |state, receiver| match receiver.blocking_recv() {
                 Some(Cmd::Add(value, reply)) => {

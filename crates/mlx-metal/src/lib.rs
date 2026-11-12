@@ -22,7 +22,7 @@ use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLFunction,
-    MTLLibrary, MTLResource,
+    MTLLibrary, MTLResidencySet, MTLResidencySetDescriptor, MTLResource,
 };
 
 pub use objc2_metal::{MTLResourceOptions, MTLStorageMode};
@@ -291,6 +291,69 @@ impl Device {
     #[inline]
     pub fn current_allocated_size(&self) -> u64 {
         self.0.currentAllocatedSize() as u64
+    }
+
+    /// Errs when the device or OS has no residency sets.
+    pub fn try_new_residency_set(&self) -> Result<ResidencySet, String> {
+        let descriptor = MTLResidencySetDescriptor::new();
+        self.0
+            .newResidencySetWithDescriptor_error(&descriptor)
+            .map(ResidencySet)
+            .map_err(error_string)
+    }
+}
+
+/// An `MTLResidencySet`. There is deliberately no way to attach it to a
+/// command queue or command buffer.
+pub struct ResidencySet(Retained<ProtocolObject<dyn MTLResidencySet>>);
+
+// SAFETY: residency sets are thread-safe Metal objects; callers serialize
+// membership changes with request/end calls under their own lock.
+unsafe impl Send for ResidencySet {}
+unsafe impl Sync for ResidencySet {}
+
+impl ResidencySet {
+    #[inline]
+    pub fn add(&self, buffer: &BufferRef) {
+        self.0
+            .addAllocation(ProtocolObject::from_ref(buffer.inner()));
+    }
+
+    #[inline]
+    pub fn remove(&self, buffer: &BufferRef) {
+        self.0
+            .removeAllocation(ProtocolObject::from_ref(buffer.inner()));
+    }
+
+    #[inline]
+    pub fn contains(&self, buffer: &BufferRef) -> bool {
+        self.0
+            .containsAllocation(ProtocolObject::from_ref(buffer.inner()))
+    }
+
+    #[inline]
+    pub fn commit(&self) {
+        self.0.commit();
+    }
+
+    #[inline]
+    pub fn request_residency(&self) {
+        self.0.requestResidency();
+    }
+
+    #[inline]
+    pub fn end_residency(&self) {
+        self.0.endResidency();
+    }
+
+    #[inline]
+    pub fn allocation_count(&self) -> u64 {
+        self.0.allocationCount() as u64
+    }
+
+    #[inline]
+    pub fn allocated_size(&self) -> u64 {
+        self.0.allocatedSize()
     }
 }
 

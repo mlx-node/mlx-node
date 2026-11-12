@@ -240,7 +240,7 @@ async fn qwen38_dflash2_perf() {
         );
     }
 
-    model.shutdown_for_test().expect("shutdown");
+    model.shutdown().expect("shutdown");
 }
 
 // ---------------------------------------------------------------------------
@@ -874,7 +874,7 @@ async fn run_restore_case(case: RestoreCase) {
         serde_json::to_string_pretty(&record.to_json()).expect("restore result JSON"),
     )
     .unwrap_or_else(|error| panic!("write {}: {error}", part.display()));
-    model.shutdown_for_test().expect("shutdown");
+    model.shutdown().expect("shutdown");
     assert_eq!(
         record.hit_kind,
         case.resume.hit_kind(),

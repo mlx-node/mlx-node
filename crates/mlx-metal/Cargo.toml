@@ -26,6 +26,7 @@ objc2-metal = { version = "0.3.2", default-features = false, features = [
   "MTLComputePipeline",
   "MTLDevice",
   "MTLLibrary",
+  "MTLResidencySet",
   "MTLResource",
   "MTLTypes",
 ] }

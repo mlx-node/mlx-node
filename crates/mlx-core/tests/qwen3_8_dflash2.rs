@@ -162,6 +162,6 @@ async fn qwen38_dflash2_loads_and_runs_a_verified_cycle() {
     );
 
     model
-        .shutdown_for_test()
+        .shutdown()
         .expect("Qwen3.8 model thread must shut down cleanly");
 }

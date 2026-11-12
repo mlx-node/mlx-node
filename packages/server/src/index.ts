@@ -23,6 +23,11 @@ export type {
   ServerHealthStatus,
 } from './health.js';
 
+/** The weights' idle release (Splash `--idle-release`) and `POST /v1/memory/release`. */
+export { createWeightResidency, WEIGHT_RELEASE_RETRY_MS } from './weight-residency.js';
+export type { WeightResidency, WeightResidencyOptions, WeightsSnapshot } from './weight-residency.js';
+export type { MemoryReleaseAnswer } from './endpoints/memory-release.js';
+
 export { ModelWorkCoordinator } from './model-work-coordinator.js';
 export type { ModelLoadOutcome } from './model-work-coordinator.js';
 export type { GuardedLoadDeps, LoadModelOptions } from './load-model.js';

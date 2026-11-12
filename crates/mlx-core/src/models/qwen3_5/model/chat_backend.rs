@@ -333,13 +333,9 @@ impl ChatBackend for Qwen35Inner {
         }
     }
 
+    /// The model's `WiredResidency` holds the lease for its life.
     fn wired_limit_bytes(&self) -> Option<usize> {
-        // Per-turn wired-memory limit = the model's estimated footprint.
-        let draft = self
-            .dflash2
-            .as_ref()
-            .map_or(0usize, |draft| draft.weight_bytes as usize);
-        Some((self.config.estimate_memory_bytes() as usize).saturating_add(draft))
+        None
     }
 
     fn profiler_label(&self, is_delta: bool, is_streaming: bool) -> &'static str {

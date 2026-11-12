@@ -337,8 +337,6 @@ pub(super) fn apply_qwen35_dense_planned_decoder(
 /// [`Qwen35Inner::chat_tokens_delta_sync`].
 ///
 /// The caller is responsible for:
-///   - constructing a `WiredLimitContext` tied to `generation_stream` for
-///     the lifetime of the call,
 ///   - running prefill and packaging the resulting `last_logits` and
 ///     `seq_len`.
 pub(crate) struct ChatDecodeInputs {

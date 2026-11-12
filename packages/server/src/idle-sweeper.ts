@@ -305,7 +305,7 @@ let __warnedMissingClearCache = false;
  * namespace / missing function / wrong-type function all route to a
  * one-time `console.warn` + no-op fallback so the server stays up.
  */
-function resolveClearCache(): () => void {
+export function resolveClearCache(): () => void {
   // Read through the module namespace — `core.__internal__` returns
   // `undefined` when the loaded binding predates the namespace, WITHOUT
   // throwing. Using an optional chain on the function keeps the probe
