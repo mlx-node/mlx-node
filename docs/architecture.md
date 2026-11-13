@@ -11,7 +11,7 @@ speculative-decoding plan, see [inference-architecture.md](inference-architectur
 │  plus examples and the core/npm/darwin-arm64 distribution │
 ├────────────────────────────────────────────────────────────┤
 │  Rust compute layer — 6 workspace crates                  │
-│  mlx-core, mlx-sys, mlx-paged-attn, mlx-db, mlx-tui,       │
+│  mlx-core, mlx-sys, mlx-paged-attn, mlx-db, mlx-tts,      │
 │  mlx-metal (narrow objc2-metal adapter)                    │
 ├────────────────────────────────────────────────────────────┤
 │  C++ bridge → MLX FFI and compiled decode via mlx::compile │
@@ -113,7 +113,7 @@ core ── native addon boundary
 └── desktop ─────────── dashboard + lm + server (process-isolated native)
 ```
 
-`internal-tools` is development tooling, not part of the runtime chain. The dashboard dependency remains a native-free catalog boundary; dependency edges are not permission to import native code into UI processes. `mlx-tui` is the standalone Ratatui workspace binary and is built separately with `cargo build -p mlx-tui`.
+`internal-tools` is development tooling, not part of the runtime chain. The dashboard dependency remains a native-free catalog boundary; dependency edges are not permission to import native code into UI processes.
 
 ## Repository layout
 
@@ -130,7 +130,7 @@ mlx-node/
 │   ├── mlx-core/               All NAPI exports: models, training, ops, vision
 │   ├── mlx-paged-attn/         PagedAttention + Metal shaders — see paged-cache.md
 │   ├── mlx-db/                 SQLite training persistence
-│   ├── mlx-tui/                mlx-train Ratatui binary (standalone)
+│   ├── mlx-tts/                Tempo text-to-speech model
 │   └── mlx-metal/              narrow objc2-metal adapter
 │
 ├── packages/
@@ -172,13 +172,12 @@ mlx-node/
 
 ## Build flow
 
-| Command                            | Output                                                                                                                                                            |
-| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `vp run build`                     | `vp run build:native && vp run build:ts`                                                                                                                          |
-| `vp run build:native`              | macOS: `packages/core/index.cjs`, `mlx-core.darwin-arm64.node`, `mlx.metallib`, `paged_attn.metallib`. Linux/CUDA: `mlx-core.linux-arm64-gnu.node` (no metallibs) |
-| `vp run build:ts`                  | `packages/*/dist/` via `tsc -b` (project references)                                                                                                              |
-| `vp run typecheck`                 | TypeScript type-check only                                                                                                                                        |
-| `cargo build --release -p mlx-tui` | `mlx-train` TUI binary                                                                                                                                            |
+| Command               | Output                                                                                                                                                            |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `vp run build`        | `vp run build:native && vp run build:ts`                                                                                                                          |
+| `vp run build:native` | macOS: `packages/core/index.cjs`, `mlx-core.darwin-arm64.node`, `mlx.metallib`, `paged_attn.metallib`. Linux/CUDA: `mlx-core.linux-arm64-gnu.node` (no metallibs) |
+| `vp run build:ts`     | `packages/*/dist/` via `tsc -b` (project references)                                                                                                              |
+| `vp run typecheck`    | TypeScript type-check only                                                                                                                                        |
 
 `vp run build:native` is the **canonical native build** — runs the napi-rs pipeline through `packages/core/build.ts` (executed via `oxnode`). Running `cargo build` directly does **not** produce the `.node` addon.
 

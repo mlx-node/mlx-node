@@ -5,11 +5,7 @@ Train Qwen3 models to use GitHub's Octokit API via Group Relative Policy Optimiz
 ## Quick Start
 
 ```bash
-# Basic training run
 yarn oxnode examples/grpo/train-github-tool.ts
-
-# With TUI visualization
-./target/release/mlx-train --script examples/grpo/train-github-tool.ts
 ```
 
 ## CLI Options

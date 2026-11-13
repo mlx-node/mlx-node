@@ -36,7 +36,6 @@ export interface SFTTrainerConfig {
   saveSteps: number;
   maxCheckpoints: number;
   logJsonl: boolean;
-  tuiMode: boolean;
 
   // Memory optimization
   gradientCheckpointing: boolean;
@@ -67,7 +66,6 @@ const DEFAULT_SFT_CONFIG: SFTTrainerConfig = Object.freeze({
   saveSteps: 100,
   maxCheckpoints: 3,
   logJsonl: true,
-  tuiMode: false,
 
   gradientCheckpointing: true,
 
@@ -95,7 +93,6 @@ const SFT_CONFIG_VALUE_TYPES: Record<SFTConfigKey, 'number' | 'boolean' | 'strin
   saveSteps: 'number',
   maxCheckpoints: 'number',
   logJsonl: 'boolean',
-  tuiMode: 'boolean',
   seed: 'number',
   gradientCheckpointing: 'boolean',
   resumeFromCheckpoint: 'string',

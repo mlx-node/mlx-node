@@ -53,7 +53,6 @@ import {
   statSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
-import * as readline from 'node:readline';
 
 import {
   GrpoTrainingEngine,
@@ -169,10 +168,6 @@ export interface GRPOTrainerConfig<T = unknown> {
   /** Resume training from a checkpoint directory, or 'latest' to auto-find */
   // eslint-disable-next-line @typescript-eslint/no-redundant-type-constituents
   resumeFromCheckpoint?: 'latest' | string;
-
-  // TUI mode
-  /** Enable TUI mode - outputs structured JSONL to stdout and listens for commands on stdin */
-  tuiMode?: boolean;
 
   // Reward callback timeout
   /**
@@ -452,12 +447,8 @@ export class GRPOTrainer<T = unknown> {
   /** Original model path (for tokenizer files when saving checkpoints) */
   private originalModelPath?: string;
 
-  // TUI state
-  private paused: boolean = false;
   private stopRequested: boolean = false;
-  private stdinInterface?: import('readline').Interface;
   private logger: TrainingLogger;
-  private sampleDisplayMode: 'all' | 'best_worst' | 'random' = 'all';
 
   // Output recording
   private outputStore?: OutputStore;
@@ -484,21 +475,10 @@ export class GRPOTrainer<T = unknown> {
    * @param config - Training configuration
    */
   constructor(model: TrainableModel, config: Partial<GRPOTrainerConfig<T>> = {}, logger?: TrainingLogger) {
-    // Auto-detect TUI mode from environment variable (set by mlx-train TUI)
-    const tuiModeFromEnv = process.env.MLX_TUI_MODE === '1';
-    if (tuiModeFromEnv && config.tuiMode === undefined) {
-      config.tuiMode = true;
-    }
-
-    // Auto-enable database persistence in TUI mode (enables Database tab)
-    if (tuiModeFromEnv && config.outputStore === undefined) {
-      config.outputStore = { enabled: true };
-    }
-
     this.config = { ...DEFAULT_GRPO_CONFIG, ...config };
     this.model = model;
 
-    // Create or use provided logger (TUI mode auto-detected from MLX_TUI_MODE env var)
+    // Create or use provided logger
     this.logger =
       logger ??
       createTrainingLogger({
@@ -559,31 +539,8 @@ export class GRPOTrainer<T = unknown> {
       throw new Error(`Unsupported model type: ${(model as object).constructor?.name ?? typeof model}`);
     }
 
-    // Setup stdin handler if TUI mode
-    if (this.config.tuiMode) {
-      this.setupStdinHandler();
-    }
-
     // Always setup signal handlers for crash recovery
     this.setupSignalHandlers();
-  }
-
-  /**
-   * Setup stdin handler for TUI control commands
-   */
-  private setupStdinHandler(): void {
-    if (!this.config.tuiMode) return;
-
-    this.stdinInterface = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      terminal: false,
-    });
-
-    this.stdinInterface.on('line', (line: string) => {
-      const cmd = line.trim();
-      this.handleStdinCommand(cmd);
-    });
   }
 
   /**
@@ -622,11 +579,6 @@ export class GRPOTrainer<T = unknown> {
         console.error('Emergency save failed:', e);
       }
 
-      // Cleanup stdin interface
-      if (this.stdinInterface) {
-        this.stdinInterface.close();
-      }
-
       process.exit(0);
     };
 
@@ -652,18 +604,12 @@ export class GRPOTrainer<T = unknown> {
   /**
    * Initialize the output store for recording training outputs
    */
-  private async initOutputStore(stepsPerEpoch?: number): Promise<void> {
+  private async initOutputStore(): Promise<void> {
     // Guard against re-initialization (e.g., train() called after trainStepAuto())
     if (this.outputStore) return;
 
     const cfg = this.config.outputStore;
-    if (!cfg?.enabled) {
-      // Even without outputStore, send UI resume state if resuming from checkpoint
-      if (this.config.resumeFromCheckpoint && this.currentStep > 0 && stepsPerEpoch) {
-        this.sendResumeStateUiOnly(stepsPerEpoch);
-      }
-      return;
-    }
+    if (!cfg?.enabled) return;
 
     const localPath = cfg.localPath ?? join(this.config.outputDir ?? '.', 'outputs.db');
     this.outputStorePath = localPath;
@@ -698,10 +644,6 @@ export class GRPOTrainer<T = unknown> {
           }
         }
 
-        this.logger.databasePath(localPath, this.outputStoreRunId, this.config.runName ?? undefined);
-
-        // Send resume state to TUI for sparkline and aggregate restoration
-        await this.sendResumeState(existingRun.id, stepsPerEpoch);
         return;
       } else {
         // Run name specified but not found - warn and create new
@@ -728,113 +670,6 @@ export class GRPOTrainer<T = unknown> {
     } else {
       this.outputStoreRunId = await this.outputStore.startRun(modelName, modelPath, JSON.stringify(sanitizedConfig));
     }
-
-    // Emit database path to TUI for the Database tab
-    this.logger.databasePath(localPath, this.outputStoreRunId, this.config.runName ?? undefined);
-
-    // If resuming from checkpoint but didn't find existing DB run, still send UI state
-    // This ensures TUI displays correct batch progress even without historical data
-    if (this.config.resumeFromCheckpoint && this.currentStep > 0 && stepsPerEpoch) {
-      this.sendResumeStateUiOnly(stepsPerEpoch);
-    }
-  }
-
-  /**
-   * Send minimal resume state to TUI for UI display only (no historical data)
-   *
-   * Used when resuming from checkpoint without a matching database run.
-   * Ensures TUI shows correct epoch/batch progress.
-   */
-  private sendResumeStateUiOnly(stepsPerEpoch: number): void {
-    if (!this.logger.isTuiMode) return;
-
-    const totalEpochs = this.config.numEpochs ?? 1;
-    const stepInEpoch = this.currentStep > 0 ? ((this.currentStep - 1) % stepsPerEpoch) + 1 : 0;
-
-    this.logger.resumeState({
-      step: this.currentStep,
-      epoch: this.currentEpoch + 1, // 1-indexed
-      totalEpochs,
-      stepInEpoch,
-      totalStepsInEpoch: stepsPerEpoch,
-      metricsHistory: [], // No historical data
-      aggregates: {
-        bestReward: 0,
-        avgReward: 0,
-        rewardCount: 0,
-        bestLoss: Infinity,
-        avgLoss: 0,
-        lossCount: 0,
-        totalTokens: 0,
-        avgGenerationTimeMs: 0,
-        avgTrainingTimeMs: 0,
-      },
-    });
-
-    this.logger.info(`Sent UI resume state to TUI (step ${this.currentStep}, no historical data)`);
-  }
-
-  /**
-   * Send resume state to TUI for restoring sparklines and aggregates
-   *
-   * Queries the database for historical metrics and aggregates, then sends
-   * to TUI via the resumeState message.
-   *
-   * @param runId - Database run ID
-   * @param actualStepsPerEpoch - Actual steps per epoch from dataset (if known)
-   */
-  private async sendResumeState(runId: string, actualStepsPerEpoch?: number): Promise<void> {
-    if (!this.outputStore || !this.logger.isTuiMode) return;
-
-    try {
-      // Query historical metrics (last 60 for sparklines)
-      const metricsHistory = await this.outputStore.getRecentStepMetrics(runId, 60);
-
-      // Query aggregate statistics
-      const aggregates = await this.outputStore.getRunAggregates(runId);
-
-      // Use actual steps per epoch if provided, otherwise use a reasonable default
-      const totalEpochs = this.config.numEpochs ?? 1;
-      const stepsPerEpoch = actualStepsPerEpoch ?? 50;
-
-      // Calculate step within current epoch
-      const stepInEpoch = this.currentStep > 0 ? ((this.currentStep - 1) % stepsPerEpoch) + 1 : 0;
-
-      // Send resume state to TUI
-      // Note: epoch is 1-indexed to match epochStart() convention
-      this.logger.resumeState({
-        step: this.currentStep,
-        epoch: this.currentEpoch + 1,
-        totalEpochs,
-        stepInEpoch,
-        totalStepsInEpoch: stepsPerEpoch,
-        metricsHistory: metricsHistory.map((m) => ({
-          step: Number(m.step),
-          loss: m.loss,
-          meanReward: m.meanReward,
-          stdAdvantage: m.stdAdvantage,
-          perplexity: m.perplexity ?? undefined,
-          tokenAccuracy: m.tokenAccuracy ?? undefined,
-          generationTimeMs: m.generationTimeMs ?? undefined,
-          trainingTimeMs: m.trainingTimeMs ?? undefined,
-        })),
-        aggregates: {
-          bestReward: aggregates.bestReward,
-          avgReward: aggregates.avgReward,
-          rewardCount: Number(aggregates.rewardCount),
-          bestLoss: aggregates.bestLoss,
-          avgLoss: aggregates.avgLoss,
-          lossCount: Number(aggregates.lossCount),
-          totalTokens: Number(aggregates.totalTokens),
-          avgGenerationTimeMs: aggregates.avgGenerationTimeMs,
-          avgTrainingTimeMs: aggregates.avgTrainingTimeMs,
-        },
-      });
-
-      this.logger.info(`Sent ${metricsHistory.length} historical metrics to TUI`);
-    } catch (err) {
-      this.logger.warn(`Failed to send resume state to TUI: ${err as Error}`);
-    }
   }
 
   /**
@@ -842,7 +677,7 @@ export class GRPOTrainer<T = unknown> {
    * Uses promise mutex to prevent race conditions from concurrent calls.
    *
    * Call this method from custom training loops before starting training
-   * to enable database recording and TUI database tab.
+   * to enable database recording.
    */
   async ensureOutputStoreInitialized(): Promise<void> {
     if (this.outputStore) return; // Already initialized
@@ -869,54 +704,6 @@ export class GRPOTrainer<T = unknown> {
    */
   getOutputStore(): OutputStore | undefined {
     return this.outputStore;
-  }
-
-  /**
-   * Handle a command received from stdin
-   */
-  private handleStdinCommand(cmd: string): void {
-    switch (cmd) {
-      case 'PAUSE':
-        this.paused = true;
-        this.logger.paused(this.currentStep);
-        break;
-      case 'RESUME':
-        this.paused = false;
-        this.logger.resumed(this.currentStep);
-        break;
-      case 'SAVE_CHECKPOINT':
-        // Will be handled in the training loop
-        this.saveCheckpoint().catch(() => {});
-        break;
-      case 'STOP':
-        this.stopRequested = true;
-        break;
-      default:
-        // Handle SET commands (e.g., SET sample_display=best_worst)
-        if (cmd.startsWith('SET ')) {
-          const keyValue = cmd.slice(4); // Remove 'SET ' prefix
-          const eqIdx = keyValue.indexOf('=');
-          if (eqIdx > 0) {
-            const key = keyValue.slice(0, eqIdx);
-            const value = keyValue.slice(eqIdx + 1);
-            if (key === 'sample_display') {
-              if (value === 'all' || value === 'best_worst' || value === 'random') {
-                this.sampleDisplayMode = value;
-              }
-            }
-          }
-        }
-        break;
-    }
-  }
-
-  /**
-   * Wait for resume if paused, with polling
-   */
-  private async waitForResume(): Promise<void> {
-    while (this.paused && !this.stopRequested) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
   }
 
   /**
@@ -962,7 +749,6 @@ export class GRPOTrainer<T = unknown> {
     }
 
     // Create logger early (before model loading)
-    // TUI mode is auto-detected from MLX_TUI_MODE env var (set by mlx-tui)
     const logger = createTrainingLogger({
       logConsole: config.logConsole,
       logJsonl: config.logJsonl,
@@ -1577,7 +1363,6 @@ export class GRPOTrainer<T = unknown> {
    * - Generation and reward computation
    * - Logging (if configured)
    * - Checkpoint saving and resumption
-   * - TUI mode support (pause/resume, sample reporting)
    *
    * @param dataset - Array of DatasetExample items
    */
@@ -1595,7 +1380,7 @@ export class GRPOTrainer<T = unknown> {
       mkdirSync(this.config.outputDir, { recursive: true });
     }
 
-    // Calculate total steps per epoch BEFORE initOutputStore (needed for accurate resume state)
+    // Calculate steps per epoch
     const stepsPerEpoch = Math.ceil(dataset.length / batchSize);
 
     // Compute current dataset metadata
@@ -1634,8 +1419,8 @@ export class GRPOTrainer<T = unknown> {
     // Store current dataset metadata for future checkpoints
     this.datasetMetadata = currentDatasetMetadata;
 
-    // Initialize output store if enabled (pass stepsPerEpoch for accurate batch display on resume)
-    await this.initOutputStore(stepsPerEpoch);
+    // Initialize output store if enabled
+    await this.initOutputStore();
 
     // Determine starting point based on resumed state
     const startEpoch = this.currentEpoch;
@@ -1683,12 +1468,6 @@ export class GRPOTrainer<T = unknown> {
         // Check for stop request
         if (this.stopRequested) break;
 
-        // Wait if paused
-        if (this.paused) {
-          await this.waitForResume();
-          if (this.stopRequested) break;
-        }
-
         // Calculate batch index (0-indexed within epoch)
         const batchIdx = Math.floor(i / batchSize);
 
@@ -1711,74 +1490,18 @@ export class GRPOTrainer<T = unknown> {
 
         // Run training step with auto reward computation
         const stepStartTime = Date.now();
-        const { metrics, completions, rewards, completionLengths } = await this.trainStepAuto(prompts);
+        const { metrics } = await this.trainStepAuto(prompts);
         const stepDuration = Date.now() - stepStartTime;
         this.logger.info(
           `Batch ${batchNum}/${stepsPerEpoch} done in ${(stepDuration / 1000).toFixed(1)}s ` +
             `(gen=${metrics.generationTimeMs?.toFixed(0) ?? '?'}ms, train=${metrics.trainingTimeMs?.toFixed(0) ?? '?'}ms, loss=${metrics.loss.toFixed(4)})`,
         );
 
-        // Log step metrics (logger handles TUI/console mode internally)
+        // Log step metrics
         this.logger.step(metrics, batchIdx, stepsPerEpoch);
 
         // Track processed batch for resume
         this.processedBatchIndices.add(batchIdx);
-
-        // Report generation samples to TUI based on display mode
-        // In console mode, logger.generation() is a no-op
-        const groupSize = this.config.groupSize ?? 4;
-
-        // Determine which sample indices to report based on display mode
-        let indicesToReport: number[];
-        if (this.sampleDisplayMode === 'all') {
-          // Report all samples
-          indicesToReport = Array.from({ length: completions.length }, (_, i) => i);
-        } else if (this.sampleDisplayMode === 'best_worst') {
-          // Find indices of best (max reward) and worst (min reward) samples
-          let bestIdx = 0;
-          let worstIdx = 0;
-          let bestReward = rewards[0];
-          let worstReward = rewards[0];
-          for (let j = 1; j < rewards.length; j++) {
-            if (rewards[j] > bestReward) {
-              bestReward = rewards[j];
-              bestIdx = j;
-            }
-            if (rewards[j] < worstReward) {
-              worstReward = rewards[j];
-              worstIdx = j;
-            }
-          }
-          // Avoid duplicates if best and worst are the same
-          indicesToReport = bestIdx === worstIdx ? [bestIdx] : [bestIdx, worstIdx];
-        } else {
-          // random: pick 2 random samples (or fewer if completions.length < 2)
-          const numSamples = Math.min(2, completions.length);
-          const shuffled = Array.from({ length: completions.length }, (_, i) => i);
-          // Fisher-Yates partial shuffle for first numSamples
-          for (let k = 0; k < numSamples; k++) {
-            const randIdx = k + Math.floor(Math.random() * (shuffled.length - k));
-            [shuffled[k], shuffled[randIdx]] = [shuffled[randIdx], shuffled[k]];
-          }
-          indicesToReport = shuffled.slice(0, numSamples);
-        }
-
-        for (const j of indicesToReport) {
-          // Get the prompt for this completion (each prompt has groupSize completions)
-          const promptIdx = Math.floor(j / groupSize);
-          const promptMessages = prompts[promptIdx] ?? [];
-          // Format prompt as text (last user message is most relevant)
-          const lastUserMsg = promptMessages.filter((m) => m.role === 'user').pop();
-          const promptText = lastUserMsg?.content ?? '';
-
-          this.logger.generation({
-            index: j,
-            prompt: promptText,
-            completion: completions[j],
-            reward: rewards[j],
-            tokens: completionLengths[j] ?? this.config.maxCompletionLength ?? 256,
-          });
-        }
 
         // Save checkpoint periodically
         if (this.config.outputDir && this.currentStep > 0 && this.currentStep % saveInterval === 0) {
@@ -1874,11 +1597,6 @@ export class GRPOTrainer<T = unknown> {
       const status = this.stopRequested ? 'stopped' : 'completed';
       await this.outputStore.endRun(status);
       await this.outputStore.flush();
-    }
-
-    // Cleanup stdin interface
-    if (this.stdinInterface) {
-      this.stdinInterface.close();
     }
   }
 

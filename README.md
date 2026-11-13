@@ -133,19 +133,7 @@ await trainer.train(dataset);
 
 Available GRPO loss types are `grpo`, `dapo`, `dr_grpo`, and `bnpo`. Training supports custom and built-in rewards, gradient accumulation, checkpoint resume, and the AdamW optimizer (or plain SGD updates when no optimizer is configured).
 
-The repository also contains a Ratatui frontend for watching and controlling a training run:
-
-```bash
-cargo run -p mlx-tui -- \
-  --import '@oxc-node/core/register' \
-  --script ./examples/grpo/train-github-tool.ts
-```
-
-<div align="center">
-<img src="images/demo.png" alt="MLX-Node training TUI" width="800">
-</div>
-
-See [docs/training.md](docs/training.md) for GRPO, SFT, datasets, checkpointing, and the TUI protocol.
+See [docs/training.md](docs/training.md) for GRPO, SFT, datasets, and checkpointing.
 
 ## Platform support
 

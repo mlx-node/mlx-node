@@ -18,7 +18,7 @@ There are already some wild used inference implementations for your reference:
 - [docs/adding-a-model.md](docs/adding-a-model.md) — Per-stage checklist for onboarding a model family: required registration sites, failure modes, conditional/trainable fan-out, CI conventions
 - [docs/models.md](docs/models.md) — Model implementations, ChatSession API, streaming, VLM, document pipelines
 - [docs/privacy-filter.md](docs/privacy-filter.md) — PII detection & redaction (openai/privacy-filter port)
-- [docs/training.md](docs/training.md) — GRPO, SFT, autograd, optimizers, `mlx-train` TUI, persistence
+- [docs/training.md](docs/training.md) — GRPO, SFT, autograd, optimizers, persistence
 - [docs/vllm-speculative-alignment.md](docs/vllm-speculative-alignment.md) — Speculative × paged KV vs vLLM: adopted laws, permanent divergences (with reopen triggers), and the remaining alignment ladder
 - [docs/paged-cache.md](docs/paged-cache.md) — Block-paged KV cache support matrix and parity gates
 - [docs/ffi-cpp.md](docs/ffi-cpp.md) — C++ FFI bridge, compiled Qwen3.5 forward paths, Metal shaders
@@ -36,7 +36,6 @@ yarn build                                       # native + TS
 yarn build:native                                # Rust/NAPI native addon (~70s incremental)
 yarn build:ts                                    # tsc -b across packages
 yarn typecheck                                   # TS type-check only
-cargo build --release -p mlx-tui                 # mlx-train TUI binary
 
 # Test
 yarn vite run test                               # all TS tests

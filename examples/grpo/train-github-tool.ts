@@ -189,50 +189,6 @@ async function selectScenarios(): Promise<string[]> {
   return selected;
 }
 
-/**
- * Build choices for TUI prompt (simpler format than @inquirer/prompts).
- */
-function buildTuiChoices(): Array<{ value: string; label: string; description?: string }> {
-  const scenarios = getAllScenarioInfo();
-  const choices: Array<{ value: string; label: string; description?: string }> = [];
-
-  // "All scenarios" option with empty string value
-  choices.push({
-    value: '',
-    label: 'All Scenarios',
-    description: 'Train on all 10 APIs (harder)',
-  });
-
-  // Read operations
-  for (const s of scenarios.filter((s) => s.category === 'read')) {
-    choices.push({
-      value: s.id,
-      label: `[Read] ${s.id}`,
-      description: `${s.apiMethod} (${s.numPromptVariations} variations)`,
-    });
-  }
-
-  // Write operations
-  for (const s of scenarios.filter((s) => s.category === 'write')) {
-    choices.push({
-      value: s.id,
-      label: `[Write] ${s.id}`,
-      description: `${s.apiMethod} (${s.numPromptVariations} variations)`,
-    });
-  }
-
-  // Workflow operations
-  for (const s of scenarios.filter((s) => s.category === 'workflow')) {
-    choices.push({
-      value: s.id,
-      label: `[Workflow] ${s.id}`,
-      description: `${s.apiMethod} (${s.numPromptVariations} variations)`,
-    });
-  }
-
-  return choices;
-}
-
 // ============================================================================
 // Dataset Generation
 // ============================================================================
@@ -326,10 +282,6 @@ async function main() {
   const dryRun = values['dry-run'] || false;
   const resume = values['resume'] || false;
 
-  // Check for TUI mode and create preliminary logger for prompt
-  const isTuiMode = process.env.MLX_TUI_MODE === '1';
-  const prelimLogger = createTrainingLogger({});
-
   // Get targets from CLI (could be array or single value)
   const cliTargets = values['target'] ? (Array.isArray(values['target']) ? values['target'] : [values['target']]) : [];
 
@@ -337,16 +289,7 @@ async function main() {
 
   if (cliTargets.length > 0) {
     targetScenarios = cliTargets;
-  } else if (isTuiMode) {
-    // TUI mode: use multi-select prompt
-    const selected = await prelimLogger.promptMulti(
-      'training-targets',
-      'Select training scenarios (Space to toggle, Enter to confirm):',
-      buildTuiChoices(),
-    );
-    targetScenarios = selected?.filter((v) => v !== '') ?? [];
   } else {
-    // CLI mode: use @inquirer/prompts checkbox
     targetScenarios = await selectScenarios();
   }
 
@@ -356,7 +299,7 @@ async function main() {
     : resolve(process.cwd(), 'outputs', 'grpo-github-tool');
   const runName = values['run-name'] || 'github-tool-use';
 
-  // Create logger (auto-detects TUI mode from environment)
+  // Create console/JSONL logger
   const logger = createTrainingLogger({ outputDir });
 
   // Decorative banner
@@ -494,8 +437,8 @@ async function main() {
     saveInterval: 8,
     evalInterval: 50,
     outputDir,
-    logConsole: process.env.MLX_TUI_MODE !== '1',
-    logJsonl: process.env.MLX_TUI_MODE !== '1',
+    logConsole: true,
+    logJsonl: true,
     runName,
     device: 'metal',
 
@@ -541,7 +484,7 @@ async function main() {
     let totalLspCalls = 0;
     let totalCompletions = 0;
 
-    // Calculate steps per epoch for TUI display
+    // Calculate steps per epoch
     const stepsPerEpoch = Math.ceil(examples.length / batchSize);
 
     // Get starting position from trainer (handles checkpoint resumption)
@@ -561,7 +504,7 @@ async function main() {
       }
     }
 
-    // Send TUI init message (required for TUI to show Running state and config)
+    // Log training initialization
     const modelName = modelPath.split('/').pop() ?? 'Unknown';
     logger.init(
       modelName,
@@ -575,7 +518,7 @@ async function main() {
       examples.length,
     );
 
-    // Initialize output store for database recording (sends databasePath to TUI)
+    // Initialize output store for database recording
     await trainer.ensureOutputStoreInitialized();
 
     if (startStep > 0) {
@@ -588,7 +531,7 @@ async function main() {
       trainer.startEpoch();
       const epochStart = Date.now();
 
-      // Send TUI epoch_start message
+      // Log epoch start
       logger.epochStart(epoch, numEpochs, stepsPerEpoch);
 
       // Calculate starting batch for this epoch (only applies to resumed epoch)
@@ -759,7 +702,7 @@ async function main() {
         // Calculate step number within epoch
         const batchIdx = Math.floor(i / batchSize);
 
-        // Send TUI step message for real-time metrics display
+        // Log step metrics
         logger.step(
           {
             step: stepMetrics.step,
@@ -777,19 +720,6 @@ async function main() {
           stepsPerEpoch,
         );
 
-        // Send TUI generation samples for the Samples tab
-        for (let j = 0; j < finalCompletionTexts.length; j++) {
-          const promptIdx = Math.floor(j / groupSize);
-          const promptText = promptTexts[promptIdx] ?? '';
-          logger.generation({
-            index: j,
-            prompt: promptText, // Truncate for display
-            completion: finalCompletionTexts[j],
-            reward: rewards[j],
-            tokens: tokenCounts[j] ?? 0,
-          });
-        }
-
         // Save checkpoint periodically (using trainer's step counter for consistency)
         if (currentStep > 0 && currentStep % saveInterval === 0) {
           await trainer.saveCheckpoint();
@@ -799,7 +729,7 @@ async function main() {
       const epochTime = (Date.now() - epochStart) / 1000;
       const epochMetrics = trainer.endEpoch(epochTime);
 
-      // Send TUI epoch_end message
+      // Log epoch summary
       logger.epochEnd(epoch, numEpochs, epochTime);
 
       logger.info(
@@ -811,7 +741,7 @@ async function main() {
     // Save final checkpoint
     await trainer.saveCheckpoint('final');
 
-    // Send TUI complete message with final step count
+    // Log training completion
     const finalStep = numEpochs * stepsPerEpoch;
     logger.complete(finalStep);
 

@@ -1,7 +1,7 @@
 //! Data types for the output store
 //!
 //! Plain Rust types for database records (no NAPI decorators).
-//! These types are shared between mlx-core (NAPI) and mlx-tui (native).
+//! These types are used by mlx-core's NAPI bindings.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -331,7 +331,7 @@ pub struct LogRecord {
     pub run_id: Option<String>,
     /// Log level: DEBUG, INFO, WARN, ERROR
     pub level: String,
-    /// Module/target path (e.g., mlx_tui::app)
+    /// Module/target path (e.g., mlx_core::output_store)
     pub target: String,
     /// Log message content
     pub message: String,
