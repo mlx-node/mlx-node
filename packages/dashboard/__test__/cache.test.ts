@@ -20,7 +20,7 @@ function hexName(index: number): string {
 }
 
 /** Canonical sidecar filename: same key, `ColdGroup` label as an infix. */
-function sidecarName(index: number, group: 'gdn_state' | 'sliding_window'): string {
+function sidecarName(index: number, group: 'conv_state' | 'sliding_window' | 'dflash2_state'): string {
   return `${index.toString(16).padStart(64, '0')}.${group}.safetensors`;
 }
 
@@ -100,13 +100,17 @@ describe('scanColdCache', () => {
   it('accounts sidecars separately but inside the quota total', () => {
     const now = Date.now();
     stage(now);
-    // Two sidecars, aged into distinct buckets, plus near-miss names that must
-    // be ignored: an unknown group label and the `kv` label (a KV object is
-    // only ever the bare 64-hex form).
-    const gdn = join(root, sidecarName(5, 'gdn_state'));
-    writeFileSync(gdn, Buffer.alloc(7));
-    const gdnWhen = new Date(now - 0.5 * DAY_MS);
-    utimesSync(gdn, gdnWhen, gdnWhen);
+    // Three sidecars, aged into distinct buckets, plus near-miss names that
+    // must be ignored: an unknown group label, the retired `gdn_state` label,
+    // and the `kv` label (a KV object is only ever the bare 64-hex form).
+    const conv = join(root, sidecarName(5, 'conv_state'));
+    writeFileSync(conv, Buffer.alloc(4));
+    const convWhen = new Date(now - 0.5 * DAY_MS);
+    utimesSync(conv, convWhen, convWhen);
+
+    const dflash2 = join(root, sidecarName(7, 'dflash2_state'));
+    writeFileSync(dflash2, Buffer.alloc(3));
+    utimesSync(dflash2, convWhen, convWhen);
 
     const win = join(root, sidecarName(6, 'sliding_window'));
     writeFileSync(win, Buffer.alloc(3));
@@ -114,16 +118,17 @@ describe('scanColdCache', () => {
     utimesSync(win, winWhen, winWhen);
 
     writeFileSync(join(root, `${'0'.repeat(63)}7.mamba_state.safetensors`), 'unknown-group');
+    writeFileSync(join(root, `${'0'.repeat(63)}9.gdn_state.safetensors`), 'retired-group');
     writeFileSync(join(root, `${'0'.repeat(63)}8.kv.safetensors`), 'kv-is-never-an-infix');
 
     const info = scanColdCache(root);
     expect(info.entryCount).toBe(4); // blocks only
-    expect(info.sidecarCount).toBe(2);
+    expect(info.sidecarCount).toBe(3);
     expect(info.sidecarBytes).toBe(10);
     expect(info.totalBytes).toBe(110); // 100 block bytes + 10 sidecar bytes
     // Sidecars are evictable by mtime, so the preview histogram counts them.
     expect(info.ageHistogram).toEqual([
-      { label: '<1d', count: 2, bytes: 17 },
+      { label: '<1d', count: 3, bytes: 17 },
       { label: '1-7d', count: 1, bytes: 20 },
       { label: '7-30d', count: 2, bytes: 33 },
       { label: '>30d', count: 1, bytes: 40 },
@@ -133,7 +138,7 @@ describe('scanColdCache', () => {
   it('clear and evict remove sidecars too, so none can outlive the quota view', () => {
     const now = Date.now();
     stage(now);
-    const fresh = join(root, sidecarName(5, 'gdn_state'));
+    const fresh = join(root, sidecarName(5, 'dflash2_state'));
     writeFileSync(fresh, Buffer.alloc(7));
     const freshWhen = new Date(now - 0.5 * DAY_MS);
     utimesSync(fresh, freshWhen, freshWhen);
@@ -335,7 +340,7 @@ describe('cold-tier object counting (Cache page ↔ scan)', () => {
     stage(now);
     // Two sidecars beside the four blocks — the 138-vs-136 shape, in miniature.
     for (const [index, group, ageDays] of [
-      [5, 'gdn_state', 0.5],
+      [5, 'conv_state', 0.5],
       [6, 'sliding_window', 10],
     ] as const) {
       const path = join(root, sidecarName(index, group));
@@ -430,7 +435,7 @@ describe('cold-tier object counting (Cache page ↔ scan)', () => {
     // Reachable state: blocks evicted, sidecars left behind. Gating the
     // destructive controls on `entryCount` showed occupied quota the UI refused
     // to clear, and the age chart claimed "no blocks persisted yet".
-    const solo = join(root, sidecarName(9, 'gdn_state'));
+    const solo = join(root, sidecarName(9, 'dflash2_state'));
     writeFileSync(solo, Buffer.alloc(64));
 
     const info = scanColdCache(root);

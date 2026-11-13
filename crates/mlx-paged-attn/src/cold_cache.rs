@@ -122,7 +122,8 @@ pub enum ColdGroup {
 impl ColdGroup {
     /// Every non-KV group, in a stable order. Used by name parsing and by the
     /// dashboard-facing filename contract.
-    pub const SIDECAR_GROUPS: [Self; 2] = [Self::ConvState, Self::SlidingWindow];
+    pub const SIDECAR_GROUPS: [Self; 3] =
+        [Self::ConvState, Self::SlidingWindow, Self::DFlash2State];
 
     /// Domain-separation tag hashed as the first component of every key.
     ///
@@ -4100,7 +4101,7 @@ fn rebuild_index(root: &RootDir) -> Result<CacheIndex, String> {
     let mut index = CacheIndex::default();
     for name in root.entry_names()? {
         let Some((key, group)) = parse_object_name(&name) else {
-            if is_cold_cache_temp_file(&name) {
+            if is_cold_cache_temp_file(&name) || is_retired_gdn_sidecar(&name) {
                 let _ = root.unlink(&name);
             }
             continue;
@@ -4140,6 +4141,13 @@ fn is_cold_cache_temp_file(name: &str) -> bool {
     };
     let is_digits = |value: &str| !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
     hex_decode_32(key).is_some() && is_digits(pid) && is_digits(tick)
+}
+
+/// Exact `<64-hex>.gdn_state.safetensors` only, so foreign files survive.
+fn is_retired_gdn_sidecar(name: &str) -> bool {
+    name.strip_suffix(".gdn_state.safetensors")
+        .and_then(hex_decode_32)
+        .is_some()
 }
 
 fn now_tick() -> u128 {
@@ -8200,6 +8208,33 @@ mod tests {
         );
         assert!(foreign_tmp.exists(), "unrelated *.tmp files must survive");
         assert!(foreign_data.exists());
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_cleanup_removes_retired_gdn_sidecars() {
+        let root = temp_root("gdn-sidecar-cleanup");
+        fs::create_dir_all(&root).unwrap();
+        let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
+        let retired = root.join(format!("{}.gdn_state.safetensors", key.to_hex()));
+        let foreign_sidecar = root.join("foo.gdn_state.safetensors");
+        let foreign_data = root.join("data.txt");
+        fs::write(&retired, b"retired gdn sidecar").unwrap();
+        fs::write(&foreign_sidecar, b"foreign").unwrap();
+        fs::write(&foreign_data, b"data").unwrap();
+
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 1).unwrap();
+        assert!(
+            !retired.exists(),
+            "a retired GDN sidecar must be deleted at startup"
+        );
+        assert!(
+            foreign_sidecar.exists(),
+            "a non-hex *.gdn_state.safetensors must survive"
+        );
+        assert!(foreign_data.exists());
+        assert_eq!(manager.total_bytes(), 0);
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }
