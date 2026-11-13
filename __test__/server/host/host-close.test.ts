@@ -42,6 +42,7 @@ describe('host close', () => {
     const events: string[] = [];
     const deadlines: Array<{ model: string; left: number }> = [];
     const drains: number[] = [];
+    const lines: string[] = [];
     let sweeps = 0;
     const host = await createInferenceHost({
       port: 0,
@@ -59,6 +60,7 @@ describe('host close', () => {
         return true;
       },
       now: () => clock,
+      log: (line) => lines.push(line),
     });
     hosts.push(host);
     expect(sweeps).toBe(1);
@@ -91,6 +93,72 @@ describe('host close', () => {
       { model: 'b', left: FLUSH_MS - 4000 },
     ]);
     expect(drains).toEqual([FLUSH_MS - 4500]);
+    expect(lines).toEqual(['[mlx] SSD cache close: 2 of 2 flushed']);
+  });
+
+  // Mutation HL1: the close line counts a cache that missed its deadline as
+  // flushed → red.
+  it('logs how many caches flushed, missed the deadline or failed', async () => {
+    let clock = 1_000_000;
+    const lines: string[] = [];
+    const host = await createInferenceHost({
+      port: 0,
+      disableStore: true,
+      modelsDir: await modelsDir(),
+      sweepOrphanTempRoots: false,
+      estimateContextWindow: async () => null,
+      loadModel: async () => ({}) as unknown as LoadableModel,
+      coldCacheDrain: () => true,
+      now: () => clock,
+      log: (line) => lines.push(line),
+    });
+    hosts.push(host);
+    const model = (closeCache: () => Promise<boolean>): ServableModel => ({ closeCache }) as unknown as ServableModel;
+    host.server.registry.register(
+      'flushed',
+      model(async () => {
+        clock += FLUSH_MS;
+        return true;
+      }),
+    );
+    host.server.registry.register(
+      'late',
+      model(async () => false),
+    );
+    host.server.registry.register(
+      'failed',
+      model(async () => {
+        throw new Error('tier gone');
+      }),
+    );
+    host.server.registry.register(
+      'hung',
+      model(() => new Promise<boolean>(() => undefined)),
+    );
+
+    await host.close({ timeoutMs: 250 });
+
+    expect(lines).toEqual(['[mlx] SSD cache close: 1 of 4 flushed, 2 not flushed in time, 1 failed']);
+  });
+
+  it('logs nothing when no loaded model has an SSD cache', async () => {
+    const lines: string[] = [];
+    const host = await createInferenceHost({
+      port: 0,
+      disableStore: true,
+      modelsDir: await modelsDir(),
+      sweepOrphanTempRoots: false,
+      estimateContextWindow: async () => null,
+      loadModel: async () => ({}) as unknown as LoadableModel,
+      coldCacheDrain: () => true,
+      log: (line) => lines.push(line),
+    });
+    hosts.push(host);
+    host.server.registry.register('plain', {} as unknown as ServableModel);
+
+    await host.close({ timeoutMs: 250 });
+
+    expect(lines).toEqual([]);
   });
 
   it('skips the start sweep when the host is told to leave leftovers alone', async () => {

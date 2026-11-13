@@ -273,6 +273,8 @@ export interface InferenceHostOptions {
   coldCacheDrain?: (timeoutMs: number) => boolean;
   /** Test seam: the clock of the shared flush deadline (`Date.now()`'s). */
   now?: () => number;
+  /** Test seam: receives the SSD cache close line (`console.log`'s). */
+  log?: (line: string) => void;
 }
 
 /** A loaded model with an SSD cache to close at a clean stop (qwen3_5 / qwen3_5_moe). */
@@ -606,22 +608,34 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       const model = server.registry.get(id);
       if (hasCacheToClose(model)) models.add(model);
     }
+    let flushed = 0;
+    let late = 0;
+    let failed = 0;
     for (const model of models) {
       const remaining = Math.max(0, deadline - now());
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
-        await Promise.race([
+        const done = await Promise.race([
           model.closeCache(deadline),
-          new Promise<void>((resolveTimer) => {
-            timer = setTimeout(resolveTimer, remaining);
+          new Promise<false>((resolveTimer) => {
+            timer = setTimeout(() => resolveTimer(false), remaining);
             timer.unref?.();
           }),
         ]);
+        if (done) flushed += 1;
+        else late += 1;
       } catch {
         /* a cache that fails to close loses its waiting points, as a crash would */
+        failed += 1;
       } finally {
         clearTimeout(timer);
       }
+    }
+    if (models.size > 0) {
+      const parts = [`${flushed} of ${models.size} flushed`];
+      if (late > 0) parts.push(`${late} not flushed in time`);
+      if (failed > 0) parts.push(`${failed} failed`);
+      (opts.log ?? console.log)(`[mlx] SSD cache close: ${parts.join(', ')}`);
     }
     try {
       (opts.coldCacheDrain ?? coldCacheDrainNative)(Math.max(0, deadline - now()));
