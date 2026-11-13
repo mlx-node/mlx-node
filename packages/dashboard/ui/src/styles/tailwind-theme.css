@@ -1,0 +1,44 @@
+@theme inline reference {
+  --spacing: 0.25rem;
+
+  --breakpoint-md: 55rem;
+  --breakpoint-xl: 87.5rem;
+
+  --container-sm: 40rem;
+  --container-md: 52rem;
+  --container-lg: 60rem;
+  --container-xl: 72rem;
+
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-surface-muted: var(--surface-muted);
+  --color-foreground: var(--foreground);
+  --color-secondary: var(--text-secondary);
+  --color-muted: var(--text-muted);
+  --color-border: var(--border);
+  --color-border-subtle: var(--border-subtle);
+  --color-border-strong: var(--border-strong);
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+
+  --text-caption: var(--text-xs);
+  --text-body: var(--text-sm);
+  --text-strong: var(--text-base);
+  --text-heading: var(--text-lg);
+  --text-title: var(--text-xl);
+  --text-figure: var(--text-2xl);
+  --text-hero: var(--text-3xl);
+
+  --font-sans: var(--font-body);
+  --font-heading: var(--font-display);
+  --font-mono: var(--font-code);
+
+  --font-weight-normal: 400;
+  --font-weight-medium: 500;
+  --leading-tight: 1.1;
+  --leading-normal: 1.4;
+}

@@ -1,0 +1,29 @@
+.root {
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
+  flex: none;
+  place-items: center;
+  color: var(--foreground);
+}
+
+.root[data-size='20'] {
+  width: 20px;
+  height: 20px;
+}
+
+.root > svg {
+  width: 100%;
+  height: 100%;
+}
+
+.boxed {
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-chip);
+}
+
+.terminal {
+  width: 60%;
+  height: 60%;
+}

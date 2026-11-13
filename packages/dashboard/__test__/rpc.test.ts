@@ -11,7 +11,9 @@ import { MessageChannel, type MessagePort } from 'node:worker_threads';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { failure, type ApiResponse } from '../src/api/errors.js';
+import type { ChatHostEvent, ConversationEvent } from '../src/chat/types.js';
 import type { DownloadEvent } from '../src/download.js';
+import type { LiveEvent } from '../src/live.js';
 import { createRpcClient, type RpcClient } from '../src/rpc/client.js';
 import { serveRuntimeOverPort, type RpcRuntime } from '../src/rpc/host.js';
 import {
@@ -21,7 +23,7 @@ import {
   type EventTargetPort,
   type RpcPortEvents,
 } from '../src/rpc/port.js';
-import type { RpcRequest } from '../src/rpc/protocol.js';
+import { isRpcReply, isRpcRequest, type RpcRequest } from '../src/rpc/protocol.js';
 import type { ApiCall } from '../src/runtime.js';
 
 const cleanups: Array<() => void> = [];
@@ -66,12 +68,17 @@ interface Stub {
   emit(jobId: string, event: DownloadEvent): void;
   /** How many `runtime.subscribe` registrations are still live. */
   liveSubscriptions(): number;
+  /** Fire a live event at every watcher. */
+  emitLive(event: LiveEvent): void;
+  /** How many `runtime.watchLive` registrations are still live. */
+  liveWatchers(): number;
   calls: ApiCall[];
   signals: Array<AbortSignal | undefined>;
 }
 
 function stubRuntime(answer?: (call: ApiCall, signal?: AbortSignal) => ApiResponse | Promise<ApiResponse>): Stub {
   const subscribers = new Map<number, { jobId: string; listener: (event: DownloadEvent) => void }>();
+  const watchers = new Map<number, (event: LiveEvent) => void>();
   let nextKey = 1;
   const calls: ApiCall[] = [];
   const signals: Array<AbortSignal | undefined> = [];
@@ -91,12 +98,25 @@ function stubRuntime(answer?: (call: ApiCall, signal?: AbortSignal) => ApiRespon
           subscribers.delete(key);
         };
       },
+      watchLive(listener: (event: LiveEvent) => void): () => void {
+        const key = nextKey++;
+        watchers.set(key, listener);
+        return () => {
+          watchers.delete(key);
+        };
+      },
     },
     emit(jobId: string, event: DownloadEvent): void {
       for (const s of subscribers.values()) if (s.jobId === jobId) s.listener(event);
     },
     liveSubscriptions(): number {
       return subscribers.size;
+    },
+    emitLive(event: LiveEvent): void {
+      for (const listener of watchers.values()) listener(event);
+    },
+    liveWatchers(): number {
+      return watchers.size;
     },
   };
 }
@@ -392,8 +412,8 @@ describe('rpc never hangs a caller', () => {
       events!.onClose();
       const result = await response;
       expect(result).toMatchObject({ ok: false, code: 'E_UNAVAILABLE', status: 503 });
-      expect((result as { message: string }).message).toMatch(/outcome is unknown/i);
-      expect((result as { message: string }).message).not.toMatch(/cancellation acknowledged/i);
+      expect((result as { message: string }).message).toContain('outcome is unknown');
+      expect((result as { message: string }).message.toLowerCase()).not.toContain('cancellation acknowledged');
       // Recovery is requested before the peer-death witness exposes the unknown
       // outcome, and the suspect port is then retired.
       expect(order).toEqual(['call', 'cancel', 'recover', 'detached', 'closed', 'settled']);
@@ -448,7 +468,7 @@ describe('rpc never hangs a caller', () => {
       events!.onClose();
       const result = await pending;
       expect(result).toMatchObject({ ok: false, code: 'E_UNAVAILABLE' });
-      expect((result as { message: string }).message).toMatch(/outcome is unknown/i);
+      expect((result as { message: string }).message).toContain('outcome is unknown');
       expect(closes).toBe(1);
     } finally {
       vi.useRealTimers();
@@ -551,7 +571,7 @@ describe('rpc never hangs a caller', () => {
     expect(settled).not.toBe('HUNG');
     for (const res of settled as ApiResponse[]) {
       expect(res).toMatchObject({ ok: false, code: 'E_UNAVAILABLE', status: 503 });
-      expect((res as { message: string }).message).toMatch(/call outcome is unknown/i);
+      expect((res as { message: string }).message).toContain('call outcome is unknown');
     }
   });
 
@@ -661,7 +681,7 @@ describe('rpc never hangs a caller', () => {
     // synchronously and the request never leaves this side.
     const res = await within(client.call({ method: 'POST', path: '/api/ingest', body: () => 'nope' }), 1000);
     expect(res).toMatchObject({ ok: false, code: 'E_BAD_REQUEST', status: 400 });
-    expect((res as { message: string }).message).toMatch(/cannot cross the message port/i);
+    expect((res as { message: string }).message).toContain('cannot cross the message port');
     // Nothing was delivered, so the runtime never saw it.
     expect(stub.calls).toHaveLength(0);
   });
@@ -672,7 +692,7 @@ describe('rpc never hangs a caller', () => {
 
     const res = await within(client.call({ method: 'GET', path: '/api/models' }), 1000);
     expect(res).toMatchObject({ ok: false, code: 'E_INTERNAL', status: 500 });
-    expect((res as { message: string }).message).toMatch(/cannot cross the message port/i);
+    expect((res as { message: string }).message).toContain('cannot cross the message port');
   });
 });
 
@@ -772,5 +792,154 @@ describe('rpc subscriptions', () => {
     await flush();
 
     expect(seen).toEqual([]);
+  });
+});
+
+describe('rpc live watch', () => {
+  const DATA: LiveEvent = { type: 'data', version: 3, traces: true, runtime: false };
+
+  it('watch delivers live events and unsubscribe stops them', async () => {
+    const stub = stubRuntime();
+    const { client } = connected(stub);
+
+    const seen: LiveEvent[] = [];
+    const download: DownloadEvent[] = [];
+    const off = client.watchLive((e) => seen.push(e));
+    client.subscribe('job', (e) => download.push(e));
+    await flush();
+    expect(stub.liveWatchers()).toBe(1);
+
+    stub.emitLive(DATA);
+    stub.emit('job', PROGRESS);
+    await flush();
+    expect(seen).toEqual([DATA]);
+    expect(download).toEqual([PROGRESS]);
+
+    off();
+    stub.emitLive({ ...DATA, version: 4 });
+    await flush();
+    expect(seen).toEqual([DATA]);
+    expect(stub.liveWatchers()).toBe(0);
+    expect(stub.liveSubscriptions()).toBe(1);
+  });
+
+  it('rejects a watch with an unknown topic', async () => {
+    const stub = stubRuntime();
+    const { client, clientPort } = connected(stub);
+
+    const leaked: unknown[] = [];
+    clientPort.on('message', (m: unknown) => leaked.push(m));
+    clientPort.postMessage({ kind: 'watch', id: 95, topic: 'everything' });
+    clientPort.postMessage({ kind: 'watch', id: 96 });
+    await flush();
+    expect(stub.liveWatchers()).toBe(0);
+
+    stub.emitLive(DATA);
+    await flush();
+    expect(leaked).toEqual([]);
+    expect(await within(client.call({ method: 'GET', path: '/api/models' }))).not.toBe('HUNG');
+  });
+
+  it('releases every live watcher when the peer closes', async () => {
+    const stub = stubRuntime();
+    const { client, clientPort } = connected(stub);
+
+    client.watchLive(() => {});
+    await flush();
+    expect(stub.liveWatchers()).toBe(1);
+
+    clientPort.close();
+    await flush();
+    expect(stub.liveWatchers()).toBe(0);
+  });
+});
+
+describe('rpc chat streams', () => {
+  /** The stub runtime plus a `watchChat` that records each open scope and can push to it. */
+  function withChat(stub: Stub): {
+    scopes: string[];
+    open(): number;
+    push(event: ChatHostEvent | ConversationEvent): void;
+  } {
+    const sinks = new Map<number, (event: ChatHostEvent | ConversationEvent) => void>();
+    const scopes: string[] = [];
+    let key = 0;
+    stub.runtime.watchChat = (scope, send) => {
+      scopes.push(scope.scope === 'host' ? 'host' : scope.conversationId);
+      const k = key++;
+      sinks.set(k, send);
+      return () => {
+        sinks.delete(k);
+      };
+    };
+    return {
+      scopes,
+      open: () => sinks.size,
+      push: (event) => {
+        for (const send of sinks.values()) send(event);
+      },
+    };
+  }
+
+  const CHANGED: ChatHostEvent = { type: 'conversations-changed' };
+
+  it('opens a host and a conversation stream, delivers each its events, and closes on unsubscribe', async () => {
+    const stub = stubRuntime();
+    const chat = withChat(stub);
+    const { client } = connected(stub);
+    const host: unknown[] = [];
+    const conv: unknown[] = [];
+    const offHost = client.watchChat({ scope: 'host' }, (e) => host.push(e));
+    const offConv = client.watchChat({ scope: 'conversation', conversationId: 'c1' }, (e) => conv.push(e));
+    await flush();
+    expect(chat.scopes).toEqual(['host', 'c1']);
+    chat.push(CHANGED);
+    await flush();
+    expect(host).toEqual([CHANGED]);
+    expect(conv).toEqual([CHANGED]);
+    offConv();
+    await flush();
+    expect(chat.open()).toBe(1);
+    offHost();
+    await flush();
+    expect(chat.open()).toBe(0);
+  });
+
+  it('refuses a chat request with no scope or an empty conversation id', async () => {
+    const stub = stubRuntime();
+    const chat = withChat(stub);
+    const { clientPort } = connected(stub);
+    clientPort.postMessage({ kind: 'chat', id: 90 });
+    clientPort.postMessage({ kind: 'chat', id: 91, scope: 'conversation', conversationId: '' });
+    clientPort.postMessage({ kind: 'chat', id: 92, scope: 'conversation', conversationId: 7 });
+    clientPort.postMessage({ kind: 'chat', id: 93, scope: 'everything' });
+    await flush();
+    expect(chat.scopes).toEqual([]);
+    expect(isRpcRequest({ kind: 'chat', id: 1, scope: 'host' })).toBe(true);
+    expect(isRpcReply({ kind: 'chat', id: 1, event: CHANGED })).toBe(true);
+    expect(isRpcReply({ kind: 'chat', id: 1, event: null })).toBe(false);
+  });
+
+  it('releases every chat stream when the peer closes', async () => {
+    const stub = stubRuntime();
+    const chat = withChat(stub);
+    const { client, clientPort } = connected(stub);
+    client.watchChat({ scope: 'host' }, () => {});
+    client.watchChat({ scope: 'conversation', conversationId: 'c1' }, () => {});
+    await flush();
+    expect(chat.open()).toBe(2);
+    clientPort.close();
+    await flush();
+    expect(chat.open()).toBe(0);
+  });
+
+  it('opens nothing on a runtime without chat streams', async () => {
+    const stub = stubRuntime();
+    const { client } = connected(stub);
+    const seen: unknown[] = [];
+    client.watchChat({ scope: 'host' }, (e) => seen.push(e));
+    await flush();
+    expect(seen).toEqual([]);
+    expect(await within(client.call({ method: 'GET', path: '/api/models' }))).not.toBe('HUNG');
   });
 });

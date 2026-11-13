@@ -23,12 +23,24 @@ import { MessageChannel } from 'node:worker_threads';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
+import { parseUpdates } from '../src/agent-sessions/transcript.js';
 import { containedSessionDir, SessionWriteError, validateRenameTitle } from '../src/agent-sessions/writes.js';
+import { routeThreadFor } from '../src/api/dispatch.js';
+import { MemorySecretStore } from '../src/chat/providers/secrets.js';
 import { createRpcClient } from '../src/rpc/client.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
 import { createDashboardRuntime, type DashboardRuntime } from '../src/runtime.js';
+import { answerLine, modelLine, turnLine, userLine, writeSession } from './helpers/agent-session-files.js';
 import { createTestClient, type TestClient } from './helpers/api-client.js';
+import {
+  HIDDEN_TEXT,
+  WOKEN_CHILDREN,
+  WOKEN_PARENT,
+  WOKEN_PROSE,
+  wokenChildLines,
+  wokenParentLines,
+} from './helpers/woken-turn.js';
 
 const FIXTURE_HOME = fileURLToPath(new URL('./fixtures/grok-sessions/home', import.meta.url));
 const DAY = 24 * 60 * 60 * 1000;
@@ -101,6 +113,7 @@ beforeEach(() => {
     tracesDir: join(base, 'traces'),
     modelsDir: join(base, 'models'),
     agentHome: home,
+    chat: { tempRoots: [], root: join(base, 'chat'), readEndpoint: async () => null, secrets: new MemorySecretStore() },
   });
   api = createTestClient(runtime);
 });
@@ -120,6 +133,47 @@ describe('GET /api/sessions', () => {
     expect(body.sessions.every((s) => !s.live)).toBe(true);
     expect(body.total).toBe(3);
     expect(body.cwds).toEqual(['/Users/dev/other', '/Users/dev/proj']);
+  });
+
+  it('lists the Chat home beside the agent home, and tags the rows the Work index names', async () => {
+    const chatId = '01c30000-0000-7000-8000-000000000001';
+    const T0 = 1_800_000_000_000;
+    writeSession(join(base, 'chat', 'chat-agent'), {
+      id: chatId,
+      cwd: join(base, 'chat', 'chat-workspace'),
+      lines: [userLine(T0, 'Hi'), answerLine(T0 + 10, 'Hello')],
+    });
+    writeFileSync(
+      join(base, 'chat', 'conversations.json'),
+      JSON.stringify({ version: 1, work: [{ id: P, createdAt: T0 }] }),
+    );
+    const { body } = await json<{ sessions: { id: string; origin: string }[]; total: number }>('/api/sessions');
+    expect(body.total).toBe(4);
+    expect(Object.fromEntries(body.sessions.map((s) => [s.id, s.origin]))).toEqual({
+      [M]: 'agent',
+      [P]: 'work',
+      [F]: 'agent',
+      [chatId]: 'chat',
+    });
+    const chatDetail = await json<{ session: { id: string; origin: string }; resumeCommand: string | null }>(
+      `/api/sessions/${chatId}`,
+    );
+    expect(chatDetail.status).toBe(200);
+    expect(chatDetail.body.session).toMatchObject({ id: chatId, origin: 'chat' });
+    expect(chatDetail.body.resumeCommand).toBeNull();
+    const chatTimeline = await json<{ turn: number }>(`/api/sessions/${chatId}/timeline?turn=1`);
+    expect(chatTimeline.status).toBe(200);
+    const workDetail = await json<{ session: { origin: string }; resumeCommand: string | null }>(`/api/sessions/${P}`);
+    expect(workDetail.body.session.origin).toBe('work');
+    expect(workDetail.body.resumeCommand).toBe(`cd '/Users/dev/proj' && GROK_HOME='${home}' mlx agent --resume ${P}`);
+    const rows = await runtime.call({ method: 'GET', path: '/api/chat/conversations?mode=chat' });
+    expect(rows.ok && (rows.body as { conversations: { id: string }[] }).conversations.map((c) => c.id)).toEqual([
+      chatId,
+    ]);
+    const work = await runtime.call({ method: 'GET', path: '/api/chat/conversations?mode=work' });
+    expect(work.ok && (work.body as { conversations: { id: string; mode: string }[] }).conversations).toMatchObject([
+      { id: P, mode: 'work' },
+    ]);
   });
 
   it('filters by q and exact cwd, and pages with limit/offset', async () => {
@@ -172,6 +226,12 @@ describe('GET /api/sessions/:id', () => {
       tracesDir: join(base, 'traces'),
       modelsDir: join(base, 'models'),
       agentHome: rel,
+      chat: {
+        tempRoots: [],
+        root: join(base, 'chat'),
+        readEndpoint: async () => null,
+        secrets: new MemorySecretStore(),
+      },
     });
     try {
       expect(relRuntime.agentHome).toBe(home);
@@ -202,6 +262,163 @@ describe('GET /api/sessions/:id', () => {
       expect((await api.fetch(path)).status).toBe(404);
     }
     expect((await api.fetch('/api/sessions/%zz')).status).toBe(400);
+  });
+});
+
+describe('GET /api/sessions/:id/timeline', () => {
+  type Timeline = {
+    turn: number;
+    turns: number;
+    range: { startMs: number; leadMs: number } | null;
+    lanes: { id: string; noSteps: string | null }[];
+    spans: { lane: string; kind: string }[];
+    handoffs: { lane: string; kind: string; atMs: number }[];
+    transcriptError?: string;
+    error?: string;
+  };
+  const timeline = (sid: string, query: string) =>
+    json<Timeline>(`/api/sessions/${encodeURIComponent(sid)}/timeline${query}`);
+
+  it('serves one turn of the fixture as lanes, spans and handoffs', async () => {
+    const one = await timeline(P, '?turn=1');
+    expect(one.status).toBe(200);
+    expect(one.body.lanes.map((l) => [l.id, l.noSteps])).toEqual([
+      ['main', null],
+      [C1, 'out-of-range'],
+      [C2, 'empty'],
+    ]);
+    expect(one.body.spans.filter((s) => s.lane === 'main')).toHaveLength(10);
+    expect(one.body.handoffs.map((h) => [h.lane, h.kind, h.atMs])).toEqual([
+      [C1, 'spawn', 48],
+      [C1, 'return', 50],
+      [C2, 'spawn', 49],
+    ]);
+    const two = await timeline(P, '?turn=2');
+    expect(two.status).toBe(200);
+    expect(two.body.range?.leadMs).toBe(1004);
+  });
+
+  it('serves metadata only: no prompt, text, tool title, tool input or output, or error text', async () => {
+    const parsed = parseUpdates(readFileSync(join(sessionDir(PROJ, P), 'updates.jsonl'), 'utf8'));
+    const secrets = new Set<string>();
+    for (const e of parsed.transcript) {
+      if (e.kind === 'user' || e.kind === 'assistant' || e.kind === 'thinking') secrets.add(e.text);
+      if (e.kind === 'tool') for (const text of [e.title, e.input, e.output]) if (text !== undefined) secrets.add(text);
+      if (e.kind === 'turn-end' && e.error !== undefined) secrets.add(e.error);
+      if (e.kind === 'subagent' && e.error !== undefined) secrets.add(e.error);
+    }
+    // A tool whose title is its own name: the name is metadata and is served.
+    for (const e of parsed.transcript) if (e.kind === 'tool') secrets.delete(e.name);
+    secrets.delete('');
+    expect(secrets.size).toBeGreaterThan(5);
+    const strings: string[] = [];
+    const walk = (value: unknown): void => {
+      if (typeof value === 'string') strings.push(value);
+      else if (Array.isArray(value)) for (const item of value) walk(item);
+      else if (typeof value === 'object' && value !== null) for (const item of Object.values(value)) walk(item);
+    };
+    for (const turn of [1, 2]) {
+      const { body } = await timeline(P, `?turn=${String(turn)}`);
+      walk(body);
+    }
+    expect(strings.length).toBeGreaterThan(0);
+    for (const value of strings) expect(secrets.has(value), value).toBe(false);
+  });
+
+  it('a woken turn: the detail body holds the wake entry, the timeline body never its text', async () => {
+    writeSession(home, { id: WOKEN_PARENT, lines: wokenParentLines() });
+    for (const child of WOKEN_CHILDREN) {
+      writeSession(home, {
+        id: child.id,
+        lines: wokenChildLines(child),
+        parent: { id: WOKEN_PARENT, status: 'completed', description: child.description },
+      });
+    }
+    const detail = await json<{ transcript: Array<{ kind: string; cause?: string; text?: string }> }>(
+      `/api/sessions/${WOKEN_PARENT}`,
+    );
+    expect(detail.body.transcript.filter((e) => e.kind === 'wake')).toEqual([
+      expect.objectContaining({
+        cause: 'workflow',
+        workflow: { name: 'deep-research', status: 'complete' },
+        text: HIDDEN_TEXT,
+      }),
+    ]);
+    const detailText = JSON.stringify(detail.body);
+    for (const prose of WOKEN_PROSE) expect(detailText).toContain(prose);
+    const { status, body } = await timeline(WOKEN_PARENT, '?turn=2');
+    expect(status).toBe(200);
+    expect(body.lanes).toHaveLength(8);
+    expect(body.spans.filter((s) => s.lane === 'main')[0]?.kind).toBe('idle');
+    const strings: string[] = [];
+    const walk = (value: unknown): void => {
+      if (typeof value === 'string') strings.push(value);
+      else if (Array.isArray(value)) for (const item of value) walk(item);
+      else if (typeof value === 'object' && value !== null) for (const item of Object.values(value)) walk(item);
+    };
+    walk(body);
+    expect(strings.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(body);
+    for (const prose of WOKEN_PROSE) expect(serialized).not.toContain(prose);
+    for (const value of strings) {
+      expect(value).not.toBe('workflow');
+      expect(value).not.toBe('deep-research');
+    }
+  });
+
+  it('400s a bad turn before anything else, then 404s an unknown session or turn', async () => {
+    for (const query of ['', '?turn=', '?turn=0', '?turn=-1', '?turn=abc', '?turn=1.5']) {
+      const res = await timeline(id(0x99), query);
+      expect(res.status, query).toBe(400);
+      expect(res.body.error).toBe('turn must be a positive integer');
+    }
+    const unknown = await timeline(id(0x99), '?turn=1');
+    expect(unknown.status).toBe(404);
+    expect(unknown.body.error).toBe(`Session ${id(0x99)} not found`);
+    expect((await timeline(D, '?turn=1')).status).toBe(404);
+    const past = await timeline(P, '?turn=99');
+    expect(past.status).toBe(404);
+    expect(past.body.error).toBe(`Turn 99 not found in session ${P}`);
+  });
+
+  it('404s the trailing entries after the last turn when they hold no work', async () => {
+    const sid = '01c20000-0000-7000-8000-000000000001';
+    const T0 = 1_800_000_000_000;
+    writeSession(home, {
+      id: sid,
+      lines: [userLine(T0, 'Go'), answerLine(T0 + 10, 'Done'), turnLine(T0 + 20, 20), modelLine(T0 + 30, 'other')],
+    });
+    expect((await timeline(sid, '?turn=1')).status).toBe(200);
+    const trailing = await timeline(sid, '?turn=2');
+    expect(trailing.status).toBe(404);
+    expect(trailing.body.error).toBe(`Turn 2 not found in session ${sid}`);
+  });
+
+  it('answers 200 with the transcript error for any turn when the transcript cannot be read', async () => {
+    const updates = join(sessionDir(PROJ, P), 'updates.jsonl');
+    rmSync(updates);
+    mkdirSync(updates);
+    for (const turn of [1, 99]) {
+      const { status, body } = await timeline(P, `?turn=${String(turn)}`);
+      expect(status).toBe(200);
+      expect(body).toMatchObject({ turn, turns: 0, range: null, lanes: [], spans: [], handoffs: [] });
+      expect(body.transcriptError).toBe('updates.jsonl is not a regular file');
+    }
+  });
+
+  it('is answered by the worker, also over the RPC port', async () => {
+    expect(routeThreadFor('GET', `/api/sessions/${P}/timeline`)).toBe('worker');
+    const { port1, port2 } = new MessageChannel();
+    const dispose = serveRuntimeOverPort(runtime, bindEventTargetPort(port2));
+    const client = createRpcClient(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+    try {
+      const res = await createTestClient(client).fetch(`/api/sessions/${P}/timeline?turn=1`);
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as Timeline).lanes).toHaveLength(3);
+    } finally {
+      client.close();
+      dispose();
+    }
   });
 });
 
@@ -255,7 +472,7 @@ describe('PATCH /api/sessions/:id', () => {
     const original = readFileSync(join(sessionDir(PROJ, P), 'summary.json'), 'utf8');
     const res = await rename(P, 'Nope');
     expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/open in a running mlx agent/);
+    expect(res.body.error).toContain('open in a running mlx agent');
     expect(readFileSync(join(sessionDir(PROJ, P), 'summary.json'), 'utf8')).toBe(original);
     const child = await rename(C1, 'Nope');
     expect(child.status).toBe(409);
@@ -271,7 +488,7 @@ describe('PATCH /api/sessions/:id', () => {
     touchNow(join(sessionDir(PROJ, P), 'updates.jsonl'));
     const res = await rename(P, 'Nope');
     expect(res.status).toBe(409);
-    expect(res.body.error).toMatch(/last 30 s/);
+    expect(res.body.error).toContain('last 30 s');
     expect(readSummary(sessionDir(PROJ, P)).generated_title).toBe('Research the project layout');
   });
 
@@ -414,7 +631,7 @@ describe('Sessions API over the RPC port', () => {
       register(P);
       const refused = await rpc.fetch(`/api/sessions/${P}`, { method: 'DELETE' });
       expect(refused.status).toBe(409);
-      expect(((await refused.json()) as { error: string }).error).toMatch(/running mlx agent/);
+      expect(((await refused.json()) as { error: string }).error).toContain('running mlx agent');
     } finally {
       client.close();
       dispose();
@@ -430,7 +647,7 @@ describe('write guards', () => {
       SessionWriteError,
     );
     expect(() => containedSessionDir(sessionsRoot, { id: P, dir: `${sessionsRoot}/${PROJ}/../${PROJ}/${P}` })).toThrow(
-      /direct <cwd>\/<id>/,
+      'direct <cwd>/<id>',
     );
     expect(() => containedSessionDir(join(sessionsRoot, PROJ), { id: P, dir: sessionDir(PROJ, P) })).toThrow(
       SessionWriteError,
@@ -442,6 +659,6 @@ describe('write guards', () => {
     expect(validateRenameTitle(' A\u0085 b‏　')).toBe('A b');
     // U+FEFF is not Rust whitespace, so it stays.
     expect(validateRenameTitle('﻿x')).toBe('﻿x');
-    expect(() => validateRenameTitle('\uD800x')).toThrow(/Unicode/);
+    expect(() => validateRenameTitle('\uD800x')).toThrow('Unicode');
   });
 });

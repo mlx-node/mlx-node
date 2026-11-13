@@ -1,0 +1,27 @@
+.warnings {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  gap: var(--space-1);
+  list-style: none;
+}
+
+.warning {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: var(--space-1-5);
+  color: var(--warning);
+  font-size: var(--text-sm);
+}
+
+.warningIcon {
+  display: inline-flex;
+  flex: none;
+  padding-top: 2px;
+}
+
+/* A path and the punctuation after it break as one word. */
+.path {
+  white-space: nowrap;
+}

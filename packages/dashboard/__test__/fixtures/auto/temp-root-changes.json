@@ -1,0 +1,381 @@
+{
+ "list": [],
+ "root": [
+  {
+   "file": "evidence-findings.json",
+   "row": 9,
+   "input": "cp a.txt d",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-findings.json",
+   "row": 10,
+   "input": "cp a.txt d/",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-findings.json",
+   "row": 12,
+   "input": "cp a.txt d/a.txt",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 4,
+   "input": "touch q/M/f",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 13,
+   "input": "cp a.txt d",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 14,
+   "input": "cp a.txt d/",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 16,
+   "input": "cp a.txt d/a.txt",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 26,
+   "input": "n b.txt",
+   "from": "risky",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 27,
+   "input": "echo x > d/a.txt",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 28,
+   "input": "echo x > k/f",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 29,
+   "input": "mkdir -p k/n/m",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 30,
+   "input": "echo x >> chain1",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 31,
+   "input": "echo x > dang",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 33,
+   "input": "touch ../x",
+   "from": "risky",
+   "to": "unknown-target",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (unknown-target)"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 34,
+   "input": "mkdir -p n/../../x",
+   "from": "risky",
+   "to": "unknown-target",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (unknown-target)"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 35,
+   "input": "touch L/../../../x",
+   "from": "risky",
+   "to": "unknown-target",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (unknown-target)"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 36,
+   "input": "touch /{OUT}/x",
+   "from": "risky",
+   "to": "allow",
+   "reason": "the path names a plain folder of yours in the temp root by text (in this pass the root holds the home and the outside folder)"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 38,
+   "input": "touch k/",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 41,
+   "input": "cd .. && touch f",
+   "from": "risky",
+   "to": "not-known",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (not-known)"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 43,
+   "input": "cd && touch f",
+   "from": "risky",
+   "to": "not-known",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (not-known)"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 47,
+   "input": "pushd && touch f",
+   "from": "risky",
+   "to": "not-known",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (not-known)"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 68,
+   "input": "echo x > /dev/fd/../..{OUT}/x",
+   "from": "risky",
+   "to": "unknown-target",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (unknown-target)"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 69,
+   "input": "d/a.txt",
+   "from": "risky",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 70,
+   "input": "k/new.txt",
+   "from": "risky",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 75,
+   "input": "dang",
+   "from": "risky",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 76,
+   "input": "chain1",
+   "from": "risky",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 77,
+   "input": "../x.txt",
+   "from": "risky",
+   "to": "temp",
+   "reason": "an edit path with a .. part whose landing is in a temp root asks (temp, place)"
+  },
+  {
+   "file": "evidence-disk-host.json",
+   "row": 78,
+   "input": "~/x.txt",
+   "from": "risky",
+   "to": "allow",
+   "reason": "the path names a plain folder of yours in the temp root by text (in this pass the root holds the home and the outside folder)"
+  },
+  {
+   "file": "evidence-codex.json",
+   "row": 8,
+   "input": "cp a.txt dest/",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 48,
+   "input": "echo x > ../x",
+   "from": "risky",
+   "to": "unknown-target",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (unknown-target)"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 50,
+   "input": "echo x | tee ../x",
+   "from": "risky",
+   "to": "unknown-target",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (unknown-target)"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 51,
+   "input": "echo x | tee k/x",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 59,
+   "input": "cp a.txt ../x",
+   "from": "risky",
+   "to": "unknown-target",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (unknown-target)"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 69,
+   "input": "cp a.txt k",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 72,
+   "input": "mv a.txt ../x",
+   "from": "risky",
+   "to": "unknown-target",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (unknown-target)"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 73,
+   "input": "mv -t ../x a.txt",
+   "from": "risky",
+   "to": "not-known",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (not-known)"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 77,
+   "input": "mkdir -p d/../../x",
+   "from": "risky",
+   "to": "unknown-target",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (unknown-target)"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 78,
+   "input": "mkdir -p new/../../../x",
+   "from": "risky",
+   "to": "unknown-target",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (unknown-target)"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 79,
+   "input": "mkdir k/x",
+   "from": "unknown-target",
+   "to": "allow",
+   "reason": "a write or edit through a link of the Work folder lands in a plain folder of yours in the temp root: your file, one link, real folders"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 83,
+   "input": "touch -r ~/.ssh/id_rsa a.txt",
+   "from": "risky",
+   "to": "protected",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks: it names .ssh"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 88,
+   "input": "chmod 777 k",
+   "from": "unknown-target",
+   "to": "temp",
+   "reason": "a mode change through a link of the Work folder that lands in the temp root asks there (cause mode): it can open a place of yours to other users"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 113,
+   "input": "cd s/../..; touch x",
+   "from": "risky",
+   "to": "not-known",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (not-known)"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 114,
+   "input": "cd s/../.. && echo x > y",
+   "from": "risky",
+   "to": "not-known",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (not-known)"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 115,
+   "input": "cd node_modules/react/../../../../..; touch x",
+   "from": "risky",
+   "to": "not-known",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (not-known)"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 116,
+   "input": "pushd s/../.. && touch x",
+   "from": "risky",
+   "to": "not-known",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (not-known)"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 120,
+   "input": "cd .. && touch x",
+   "from": "risky",
+   "to": "not-known",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (not-known)"
+  },
+  {
+   "file": "evidence-heads.json",
+   "row": 206,
+   "input": "cp -- -t ../x",
+   "from": "risky",
+   "to": "not-known",
+   "reason": "the outside-folder flag is judged by the roots, so the target no longer flags; the row still asks for its .. or cd form (not-known)"
+  }
+ ]
+}

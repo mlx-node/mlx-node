@@ -1,0 +1,147 @@
+.root {
+  min-width: 0;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+  font-size: var(--text-sm);
+}
+
+.header {
+  --focus-outline-offset: -2px;
+  box-sizing: border-box;
+  display: grid;
+  width: 100%;
+  min-height: var(--control-height-md);
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: var(--space-2);
+  border: 0;
+  border-radius: var(--radius-panel);
+  padding: 0 var(--space-2-5);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+
+.root[data-state='open'] > .header {
+  border-radius: var(--radius-panel) var(--radius-panel) 0 0;
+}
+
+.chevron {
+  color: var(--text-muted);
+  transition:
+    transform var(--duration-standard) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard);
+}
+
+.root[data-state='open'] > .header > .chevron {
+  transform: rotate(90deg);
+}
+
+.label {
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.meta {
+  display: inline-flex;
+  align-items: baseline;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: pre;
+}
+
+.tailClip,
+.bodyClip {
+  overflow: clip;
+}
+
+.tail {
+  display: flex;
+  height: 40px;
+  flex-direction: column;
+  justify-content: flex-end;
+  overflow: hidden;
+  padding: 0 var(--space-3) 0 calc(var(--space-2-5) + 14px + var(--space-2));
+  color: var(--text-muted);
+  mask-image: linear-gradient(to bottom, transparent, var(--foreground) 16px);
+}
+
+.tailText {
+  line-height: var(--leading-prose);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  transition: transform var(--duration-standard) var(--ease-standard);
+}
+
+.body {
+  padding: var(--space-1) var(--space-3) var(--space-3);
+  color: var(--text-secondary);
+  line-height: var(--leading-prose);
+  text-wrap: pretty;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.body[data-enter] {
+  animation: reasoning-fade var(--duration-fast) var(--ease-enter) both;
+}
+
+.fresh {
+  animation: reasoning-chunk var(--duration-fast) var(--ease-standard) both;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .header:hover {
+    background: var(--row-hover);
+  }
+  .header:hover > .chevron {
+    color: var(--text-secondary);
+  }
+}
+
+.header:active {
+  background: var(--row-active);
+}
+
+@keyframes reasoning-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes reasoning-chunk {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .header,
+  .chevron,
+  .tailText {
+    transition-duration: var(--duration-instant);
+  }
+  .chevron {
+    transition-property: color;
+  }
+  .tailText {
+    transition: none;
+  }
+  .body[data-enter],
+  .fresh {
+    animation: none;
+  }
+}

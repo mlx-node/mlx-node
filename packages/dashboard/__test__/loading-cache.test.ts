@@ -18,12 +18,15 @@
  */
 
 import { mutate } from '@/lib/api';
-import { useJson } from '@/lib/use-api';
+import { useRuntimeLive } from '@/lib/live';
+import { splitWhitespace } from '@/lib/text-scan';
+import type { LiveEvent, RuntimeLive } from '@/lib/types';
+import { useJson, type JsonOptions } from '@/lib/use-api';
 import { act, createElement, type ReactElement } from 'react';
 import { createRoot } from 'react-dom/client';
-import { afterEach, describe, expect, it } from 'vite-plus/test';
+import { afterEach, beforeAll, describe, expect, it } from 'vite-plus/test';
 
-import { renderPage, sequence, stubApi } from './render.js';
+import { renderPage, sequence, stubApi, waitFor, type RenderedPage, type StubbedApi } from './render.js';
 
 interface Counter {
   n: number;
@@ -62,7 +65,7 @@ function mountOnce(element: ReactElement): Mounted {
     root.render(element);
   });
   return {
-    text: () => (container.textContent ?? '').replace(/\s+/g, ' ').trim(),
+    text: () => splitWhitespace(container.textContent ?? '').join(' '),
     rerender: (next: ReactElement) => {
       act(() => {
         root.render(next);
@@ -185,5 +188,185 @@ describe('useJson stale-while-revalidate', () => {
     mounted = mountOnce(createElement(Probe, { path: '/counter' }));
 
     expect(mounted.text()).toContain('LOADING');
+  });
+});
+
+function LiveProbe(): ReactElement {
+  const live = useRuntimeLive();
+  return createElement('div', null, `status=${live?.status ?? '-'}`);
+}
+
+/** A counting query: the text is how many answers it has seen. */
+function CountingProbe({ live }: { live: JsonOptions['live'] }): ReactElement {
+  const state = useJson<Counter>('/counter', { live });
+  return createElement('div', null, `n=${state.data?.n ?? '-'}`);
+}
+
+function runtimeEvent(status: RuntimeLive['status']): LiveEvent {
+  return { type: 'runtime', snapshot: { now: 1, status, supervisor: null, processes: [] } };
+}
+
+const DATA_EVENT: LiveEvent = { type: 'data', version: 1, traces: true, runtime: false };
+
+function sleep(ms: number): Promise<void> {
+  return act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  });
+}
+
+describe('live channel', () => {
+  let api: StubbedApi | null = null;
+  let page: RenderedPage | null = null;
+  let visibility: DocumentVisibilityState = 'visible';
+
+  beforeAll(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility });
+  });
+
+  afterEach(() => {
+    page?.unmount();
+    page = null;
+    api?.();
+    api = null;
+    visibility = 'visible';
+  });
+
+  it('shows the pushed engine snapshot, only while the window is visible, and drops it on a reconnect', async () => {
+    api = stubApi({});
+    page = await renderPage(createElement(LiveProbe), (text) => text === 'status=-');
+    await waitFor(() => {
+      api?.emitLive(runtimeEvent('running'));
+      return page?.text() === 'status=running';
+    });
+
+    visibility = 'hidden';
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    api.emitLive(runtimeEvent('stopped'));
+    await sleep(20);
+    expect(page.text()).toBe('status=running');
+
+    visibility = 'visible';
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await waitFor(() => {
+      api?.emitLive(runtimeEvent('loading'));
+      return page?.text() === 'status=loading';
+    });
+
+    act(() => {
+      api?.();
+      api = stubApi({});
+    });
+    await waitFor(() => page?.text() === 'status=-');
+    await waitFor(() => {
+      api?.emitLive(runtimeEvent('failed'));
+      return page?.text() === 'status=failed';
+    });
+  });
+
+  it('refetches a live query on a data event at most once per interval, with one trailing refetch', async () => {
+    let served = 0;
+    api = stubApi(
+      { '/counter': { n: 0 } },
+      {
+        onCall: () => {
+          served += 1;
+        },
+      },
+    );
+    page = await renderPage(createElement(CountingProbe, { live: { minIntervalMs: 150 } }), (text) => text === 'n=0');
+    expect(served).toBe(1);
+
+    await sleep(180);
+    api.emitLive(DATA_EVENT);
+    await waitFor(() => served === 2);
+
+    api.emitLive(DATA_EVENT);
+    api.emitLive(DATA_EVENT);
+    await sleep(60);
+    expect(served).toBe(2);
+    await waitFor(() => served === 3, 600);
+    await sleep(250);
+    expect(served).toBe(3);
+  });
+
+  it('refetches a live query once when the window shows again after it was hidden', async () => {
+    let served = 0;
+    api = stubApi(
+      { '/counter': { n: 0 } },
+      {
+        onCall: () => {
+          served += 1;
+        },
+      },
+    );
+    page = await renderPage(createElement(CountingProbe, { live: { minIntervalMs: 50 } }), (text) => text === 'n=0');
+    expect(served).toBe(1);
+
+    visibility = 'hidden';
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    api.emitLive(DATA_EVENT);
+    await sleep(80);
+    expect(served).toBe(1);
+
+    visibility = 'visible';
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await waitFor(() => served === 2, 600);
+    await sleep(120);
+    expect(served).toBe(2);
+  });
+
+  it('refetches a live query once on show when it first mounted while the window was hidden', async () => {
+    let served = 0;
+    visibility = 'hidden';
+    api = stubApi(
+      { '/counter': sequence({ n: 0 }, { n: 1 }) },
+      {
+        onCall: () => {
+          served += 1;
+        },
+      },
+    );
+    page = await renderPage(createElement(CountingProbe, { live: { minIntervalMs: 50 } }), (text) => text === 'n=0');
+    expect(served).toBe(1);
+    await sleep(80);
+
+    visibility = 'visible';
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await waitFor(() => page?.text() === 'n=1', 600);
+    await sleep(120);
+    expect(served).toBe(2);
+  });
+
+  it('ignores data events in a query that is not live', async () => {
+    let served = 0;
+    api = stubApi(
+      { '/counter': { n: 0 } },
+      {
+        onCall: () => {
+          served += 1;
+        },
+      },
+    );
+    page = await renderPage(
+      createElement('div', null, createElement(CountingProbe, { live: false }), createElement(LiveProbe)),
+      (text) => text.includes('n=0'),
+    );
+    await waitFor(() => {
+      api?.emitLive(runtimeEvent('running'));
+      return page?.text().includes('status=running') === true;
+    });
+    api.emitLive(DATA_EVENT);
+    await sleep(60);
+    expect(served).toBe(1);
   });
 });

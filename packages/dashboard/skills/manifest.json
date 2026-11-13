@@ -1,0 +1,164 @@
+{
+  "version": 1,
+  "bundles": {
+    "chat-web": {
+      "root": "own/chat-web",
+      "upstream": null,
+      "skills": [
+        "web-tools"
+      ],
+      "files": [
+        {
+          "path": "skills/web-tools/SKILL.md",
+          "sha256": "3dc6e8e874c68c974659ed8b1fb1e6c79ade030eb118b6771f51125b8a7a0e33",
+          "bytes": 1712
+        }
+      ]
+    },
+    "exa": {
+      "root": "vendor/exa",
+      "upstream": {
+        "repo": "exa-labs/agent-skills",
+        "commit": "a0c2df864db555d470455f932f9c150a97be113b",
+        "license": "MIT"
+      },
+      "skills": [
+        "exa-search",
+        "exa-contents"
+      ],
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "fa90b2501d7d481cf31ab7d4c26e867cb184f28f71a1da5800f97abdb803952a",
+          "bytes": 1071
+        },
+        {
+          "path": "PROVENANCE.md",
+          "sha256": "d658b6b76559226b8b31654e227cb0a6cf819c0c18b0a436d7cab5e22c634663",
+          "bytes": 549
+        },
+        {
+          "path": "skills/exa-contents/SKILL.md",
+          "sha256": "2d76bb362eb6fba0b3f04241265ac81a4384d87f9ec6e26dbdd7da1d631ff828",
+          "bytes": 8778
+        },
+        {
+          "path": "skills/exa-search/SKILL.md",
+          "sha256": "3d43480ea73a5743a1dd8b1d2ec4676bf66afb5d05a36fe03e80b51ac5378760",
+          "bytes": 13761
+        }
+      ]
+    },
+    "deepseek": {
+      "root": "own/deepseek",
+      "upstream": null,
+      "skills": [
+        "deepseek-search"
+      ],
+      "files": [
+        {
+          "path": "skills/deepseek-search/SKILL.md",
+          "sha256": "1351ddea9bb4c04d2b780770b99a672c4eb8cfd2c65b15fa102a5d0d75076947",
+          "bytes": 2766
+        }
+      ]
+    },
+    "brave": {
+      "root": "vendor/brave",
+      "upstream": {
+        "repo": "brave/brave-search-skills",
+        "commit": "62793e0c49ed2fc7c8f0c99a8ab8898abdf32a1d",
+        "license": "MIT"
+      },
+      "skills": [
+        "web-search",
+        "llm-context",
+        "news-search"
+      ],
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "104c4be5d96b7fa1ec09409ad8165b5e987c469aeb529153298a082a7012707e",
+          "bytes": 1071
+        },
+        {
+          "path": "PROVENANCE.md",
+          "sha256": "e7a80af6f4d8aa673930b29e569f331bef2a4b4901e35892e200f32b0b6ce565",
+          "bytes": 624
+        },
+        {
+          "path": "skills/llm-context/SKILL.md",
+          "sha256": "729c39285a9648bed69c61d81d06e5113bf57c99bfeb234353757cdc9d5cf6aa",
+          "bytes": 13081
+        },
+        {
+          "path": "skills/news-search/SKILL.md",
+          "sha256": "6cb80b66ac55fa0a3b5d6fee78f81c286c99e781d765d2ca5f76a1f9647b4073",
+          "bytes": 8127
+        },
+        {
+          "path": "skills/web-search/SKILL.md",
+          "sha256": "71b36b64b6ab05c3372dbbc8a7e42f11c099de6f381e9000cda95552f5232cbe",
+          "bytes": 14857
+        }
+      ]
+    },
+    "firecrawl": {
+      "root": "vendor/firecrawl",
+      "upstream": {
+        "repo": "firecrawl/skills",
+        "commit": "667d3f7fe804f3f95d375fb0da24802f83a115ab",
+        "license": "ISC"
+      },
+      "skills": [
+        "firecrawl",
+        "firecrawl-search",
+        "firecrawl-scrape",
+        "firecrawl-crawl",
+        "firecrawl-map"
+      ],
+      "files": [
+        {
+          "path": "LICENSE",
+          "sha256": "8db975b9d59274cd37f19d3f7fec9ce0f2d96daf71e0c69d48dc5358f55dd691",
+          "bytes": 735
+        },
+        {
+          "path": "PROVENANCE.md",
+          "sha256": "33d1fa8b2f341ddc3fb261dab7ac6bd44b1d830a7d3050ca827426ef6def2d94",
+          "bytes": 3884
+        },
+        {
+          "path": "skills/firecrawl-crawl/SKILL.md",
+          "sha256": "60bf3fa590a393c82cf3e1c869138074794a84beb9defb6271836520f00bfa6c",
+          "bytes": 1809
+        },
+        {
+          "path": "skills/firecrawl-map/SKILL.md",
+          "sha256": "a95471eddb6836b35055e07bfeab9ec32d947c5b11e4771bf875ba4c379091b4",
+          "bytes": 1594
+        },
+        {
+          "path": "skills/firecrawl-scrape/SKILL.md",
+          "sha256": "365b0e3b73cb37e3eee36d8d89e92680ae7cdc0ce24b20162117127818c67143",
+          "bytes": 9018
+        },
+        {
+          "path": "skills/firecrawl-scrape/references/large-results.md",
+          "sha256": "718c1d3a3ab187be6ecabf53fdbd8c685c4bbe65814d549031761e6c84ad26a7",
+          "bytes": 3645
+        },
+        {
+          "path": "skills/firecrawl-search/SKILL.md",
+          "sha256": "efd6c132076fd0d3e9a689564144a1f8c582d94bbae52f656d48d9f9039b3cc3",
+          "bytes": 13976
+        },
+        {
+          "path": "skills/firecrawl/SKILL.md",
+          "sha256": "80d39592ad1a07d6082027c21b1814eed1f68f44f1d98b5939ba4ed16b89fbda",
+          "bytes": 11731
+        }
+      ]
+    }
+  }
+}

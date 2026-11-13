@@ -1,0 +1,94 @@
+.palette {
+  width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+  box-shadow: var(--shadow-floating);
+  transform-origin: top center;
+}
+
+.searchRow {
+  position: relative;
+  display: flex;
+  min-height: 54px;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--border-subtle);
+  transition: background var(--duration-fast) var(--ease-standard);
+}
+
+.searchRow:focus-within { background: var(--surface-muted); }
+.searchIcon, .itemIcon { display: grid; flex: none; place-items: center; color: var(--text-muted); }
+.searchIcon { width: 22px; height: 22px; }
+.searchRow input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: var(--foreground); font: inherit; font-size: var(--text-sm); }
+.searchRow input::placeholder { color: var(--text-muted); }
+.searchRow input:focus-visible { outline: none; }
+
+.commandKey {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.commandKey { min-width: 38px; height: 24px; padding: 0 6px; gap: 2px; }
+.clearButton { display: grid; width: 24px; height: 24px; flex: none; place-items: center; border: 0; border-radius: 7px; background: transparent; color: var(--text-muted); cursor: pointer; transition: color var(--duration-fast) var(--ease-standard), background-color var(--duration-fast) var(--ease-standard); }
+@media (hover: hover) and (pointer: fine) { .clearButton:hover, .closeButton:hover { background: var(--surface); color: var(--foreground); } }
+.clearButton:active, .closeButton:active { background: var(--surface); color: var(--foreground); }
+.closeButton { display: grid; min-width: 27px; height: 24px; flex: none; place-items: center; border: 1px solid var(--border-subtle); border-radius: 7px; background: transparent; color: var(--text-muted); padding: 0 6px; font: inherit; font-size: var(--text-xs); font-weight: 500; line-height: 1; cursor: pointer; transition: color var(--duration-fast) var(--ease-standard), background-color var(--duration-fast) var(--ease-standard); }
+
+/* The frame animates to the list height; the list keeps its own scroll. */
+.resultsFrame { overflow: hidden; }
+.results { position: relative; max-height: 342px; overflow: auto; padding: 6px 8px; }
+.highlight { position: absolute; top: 0; right: 8px; left: 8px; border-radius: 8px; background: var(--surface-muted); opacity: 0; pointer-events: none; }
+/* Groups are positioned so a row that pops out of the flow is placed against the same box it was measured in, even mid-glide. */
+.group { position: relative; }
+.group + .group { margin-top: 6px; }
+.groupHeading { display: block; padding: 8px 10px 4px; color: var(--text-muted); font-size: var(--text-xs); font-weight: 500; line-height: var(--leading-body); }
+
+/* One line per result: icon, the title, then its description, with any shortcut keys at the right edge. Every row is the same height. */
+.result { position: relative; display: flex; width: 100%; height: 38px; align-items: center; gap: 10px; border: 0; border-radius: 8px; padding: 0 10px; background: transparent; color: var(--foreground); font: inherit; text-align: left; cursor: pointer; }
+/* The active row is drawn by the shared highlight; the row itself only brings its icon up to full contrast. */
+.itemIcon { display: grid; width: 16px; height: 16px; flex: none; place-items: center; color: var(--text-muted); transition: color var(--duration-fast) var(--ease-standard); }
+.itemIcon svg { width: 16px; height: 16px; }
+.activeResult .itemIcon { color: var(--foreground); }
+.resultCopy { display: flex; min-width: 0; flex: 1; align-items: baseline; gap: 8px; }
+.resultLabel, .resultDescription { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.resultLabel { flex: none; max-width: 100%; color: var(--foreground); font-size: var(--text-sm); font-weight: 400; }
+/* The letters that matched the query carry the weight; the rest of the label stays regular. */
+.match { background: none; color: inherit; font-weight: 500; }
+.resultDescription { min-width: 0; color: var(--text-secondary); font-size: var(--text-xs); }
+.shortcut { display: flex; flex: none; gap: 3px; margin-left: auto; }
+.shortcut kbd { display: inline-grid; min-width: 20px; height: 20px; place-items: center; padding: 0 5px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--text-muted); font-family: inherit; font-size: 11px; font-weight: 500; line-height: 1; }
+.empty { display: grid; justify-items: center; gap: 4px; padding: 26px 12px 28px; text-align: center; }
+.empty > span { display: grid; width: 32px; height: 32px; place-items: center; margin-bottom: 5px; color: var(--text-muted); }
+.empty strong { max-width: 100%; overflow: hidden; font-size: var(--text-sm); font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
+.empty small { color: var(--text-secondary); font-size: var(--text-xs); }
+.visuallyHidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+@media (max-width: 480px) {
+  .searchRow { gap: 8px; padding: 8px 11px; }
+  .results { padding: 6px; }
+  .highlight { right: 6px; left: 6px; }
+  .result { gap: 8px; }
+  .shortcut, .commandKey { display: none; }
+  }
+
+@media (max-width: 340px) {
+    .result { padding-inline: 6px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .searchRow, .itemIcon, .clearButton, .closeButton { transition: none; }
+}

@@ -15,19 +15,41 @@
  */
 
 import type { AgentSessionsReader } from '../agent-sessions/reader.js';
+import type { WorkIndex } from '../chat/index-file.js';
+import type { ProvidersService } from '../chat/providers/service.js';
+import type { ChatService } from '../chat/service.js';
 import type { CodingAgentsService } from '../coding-agents.js';
 import type { DashboardDb } from '../db/open.js';
 import type { DownloadManager } from '../download.js';
+import type { LiveWatcher } from '../live.js';
 import { ApiError } from './errors.js';
 
+export interface IngestPassResult {
+  files: number;
+  records: number;
+  pruned: number;
+  warnings: string[];
+}
+
 export interface IngestSummary {
-  traces: { files: number; records: number; pruned: number; warnings: string[] };
+  traces: IngestPassResult;
+  runtime: IngestPassResult;
+}
+
+/** The summary of a pass that could not run. */
+export function failedIngestSummary(reason: string): IngestSummary {
+  return {
+    traces: { files: 0, records: 0, pruned: 0, warnings: [reason] },
+    runtime: { files: 0, records: 0, pruned: 0, warnings: [reason] },
+  };
 }
 
 /** Resolved locations, readable from either thread (both are handed the same values). */
 export interface ApiPaths {
   modelsDir: string;
   tracesDir: string;
+  /** Inference runtime series and live heartbeats. */
+  runtimeDir: string;
   /** Cold-tier root; `undefined` lets `cache.ts` resolve the running-tier default. */
   cacheRoot: string | undefined;
 }
@@ -35,18 +57,27 @@ export interface ApiPaths {
 /** The database worker's context: it alone holds the SQLite handle and the ingest chain. */
 export interface WorkerApiContext extends ApiPaths {
   dash: DashboardDb;
-  /** Serialized incremental rescan (traces). */
+  /** Serialized incremental rescan (traces and runtime series). */
   runIngest: () => Promise<IngestSummary>;
   /** grok-build (`mlx agent`) config home; sessions live under `<agentHome>/sessions`. */
   agentHome: string;
   /** Long-lived so its parse caches survive between calls. */
   agentSessions: AgentSessionsReader;
+  /** The Chat agent home's sessions (`~/.mlx-node/chat/chat-agent`); every row is a Chat conversation. */
+  chatSessions: AgentSessionsReader;
+  /** A read-only view of `conversations.json`: the Work sessions the app created. The main thread writes it. */
+  chatIndex: () => WorkIndex;
 }
 
-/** The transport thread's context: it alone holds the download manager. */
+/** The transport thread's context: it alone holds the download manager and the live watcher. */
 export interface MainApiContext extends ApiPaths {
   downloads: DownloadManager;
+  live: LiveWatcher;
   codingAgents?: CodingAgentsService;
+  /** Chat and Work conversations and their agent processes. */
+  chat?: ChatService;
+  /** Web search providers: selection, keys, skill folders. */
+  providers?: ProvidersService;
 }
 
 /**

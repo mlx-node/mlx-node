@@ -1,0 +1,1048 @@
+{
+ "source": "review round 4, second gate review: the inputs of the grammar, tables and disk-host findings (scratchpad impl/NOTES-review-r4.md, GATE REVIEW 2); allow rows are uses that must stay",
+ "rows": [
+  {
+   "input": "grep -rv /*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R1 pattern glob"
+  },
+  {
+   "input": "grep -r /* src",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R1 pattern glob"
+  },
+  {
+   "input": "grep -rl ~/*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R1 pattern glob"
+  },
+  {
+   "input": "grep -rv ../*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R1 pattern glob"
+  },
+  {
+   "input": "grep -rv .*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R1 pattern glob"
+  },
+  {
+   "input": "grep -r -- /* src",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R1 pattern glob"
+  },
+  {
+   "input": "grep -rv -- ~/*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R1 pattern glob"
+  },
+  {
+   "input": "rg -v /*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R1 pattern glob"
+  },
+  {
+   "input": "rg -uuv /*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R1 pattern glob"
+  },
+  {
+   "input": "rg -v ~/*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R1 pattern glob"
+  },
+  {
+   "input": "rg -uuv .*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R1 pattern glob"
+  },
+  {
+   "input": "grep -rv /U*/*/.s*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R1 pattern glob"
+  },
+  {
+   "input": "rg -uuv /U*/*/.s*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R1 pattern glob"
+  },
+  {
+   "input": "cat src/*/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R2 glob landing"
+  },
+  {
+   "input": "cat src/k*/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R2 glob landing"
+  },
+  {
+   "input": "cat s*/keys/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R2 glob landing"
+  },
+  {
+   "input": "cat src/***/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R2 glob landing"
+  },
+  {
+   "input": "head -n 5 src/k?ys/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R2 glob landing"
+  },
+  {
+   "input": "wc -c src/*/*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R2 glob landing"
+  },
+  {
+   "input": "grep -rh SECRET src/k*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R2 glob landing"
+  },
+  {
+   "input": "cat src/k*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R2 glob landing"
+  },
+  {
+   "input": "ls src/*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R2 glob landing"
+  },
+  {
+   "input": "cat src/**",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R2 glob landing"
+  },
+  {
+   "input": "ls; >/dev/null",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R3 part with no head"
+  },
+  {
+   "input": "ls; 2>&1",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R3 part with no head"
+  },
+  {
+   "input": "ls; 2>/dev/null",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R3 part with no head"
+  },
+  {
+   "input": ">/dev/null\nls",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R3 part with no head"
+  },
+  {
+   "input": "2>&1\nls",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R3 part with no head"
+  },
+  {
+   "input": "2>/dev/null\nls",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R3 part with no head"
+  },
+  {
+   "input": "ls\n2>&1",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R3 part with no head"
+  },
+  {
+   "input": "ls\n>/dev/null",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R3 part with no head"
+  },
+  {
+   "input": "diff -rN src dest",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R5 recursive readers that follow links"
+  },
+  {
+   "input": "diff -r src dest",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R5 recursive readers that follow links"
+  },
+  {
+   "input": "rg -L SECRET src",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R5 recursive readers that follow links"
+  },
+  {
+   "input": "rg -uuL SECRET src",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R5 recursive readers that follow links"
+  },
+  {
+   "input": "grep -R SECRET src",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R5 recursive readers that follow links"
+  },
+  {
+   "input": "grep -R KEY .",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R5 recursive readers that follow links"
+  },
+  {
+   "input": "grep -R KEY d",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R5 recursive readers that follow links"
+  },
+  {
+   "input": "rg -L KEY",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R5 recursive readers that follow links"
+  },
+  {
+   "input": "rg -L KEY d",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R5 recursive readers that follow links"
+  },
+  {
+   "input": "diff -rN d e2",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R5 recursive readers that follow links"
+  },
+  {
+   "input": "diff -r d e2",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R5 recursive readers that follow links"
+  },
+  {
+   "input": "echo x''",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R6 empty quote next to a word"
+  },
+  {
+   "input": "echo ''x",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R6 empty quote next to a word"
+  },
+  {
+   "input": "echo a''b",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R6 empty quote next to a word"
+  },
+  {
+   "input": "echo x\"\"",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R6 empty quote next to a word"
+  },
+  {
+   "input": "echo \"\"x",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R6 empty quote next to a word"
+  },
+  {
+   "input": "echo 'a\ud83d\ude00b'",
+   "kind": "bash",
+   "expect": "allow",
+   "finding": "R7 a character above U+FFFF in quotes"
+  },
+  {
+   "input": "echo \"a\ud83d\ude00b\"",
+   "kind": "bash",
+   "expect": "allow",
+   "finding": "R7 a character above U+FFFF in quotes"
+  },
+  {
+   "input": "git commit -m 'fix \ud83d\udc1b'",
+   "kind": "bash",
+   "expect": "allow",
+   "finding": "R7 a character above U+FFFF in quotes"
+  },
+  {
+   "input": "echo 'a\ud800b'",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R7 a lone surrogate in quotes"
+  },
+  {
+   "input": "timeout 1 timeout 1 timeout 1 timeout 1 ls",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R9 more than three wrappers"
+  },
+  {
+   "input": "nice -n 1 nice -n 1 nice -n 1 nice -n 1 ls",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R9 more than three wrappers"
+  },
+  {
+   "input": "env CI=1 env CI=1 env CI=1 env CI=1 ls",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "R9 more than three wrappers"
+  },
+  {
+   "input": "timeout 1 nice -n 1 env CI=1 ls",
+   "kind": "bash",
+   "expect": "allow",
+   "finding": "R9 three wrappers"
+  },
+  {
+   "input": "rg *",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T1 pattern glob"
+  },
+  {
+   "input": "rg -n *",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T1 pattern glob"
+  },
+  {
+   "input": "rg -l *",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T1 pattern glob"
+  },
+  {
+   "input": "rg ?*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T1 pattern glob"
+  },
+  {
+   "input": "grep -rn *",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T1 pattern glob"
+  },
+  {
+   "input": "grep * src",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T1 pattern glob"
+  },
+  {
+   "input": "git push sub main",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T2 remote is a configured name"
+  },
+  {
+   "input": "git push -u sub main",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T2 remote is a configured name"
+  },
+  {
+   "input": "git push sub",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T2 remote is a configured name"
+  },
+  {
+   "input": "git fetch sub",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T2 remote is a configured name"
+  },
+  {
+   "input": "git pull sub main",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T2 remote is a configured name"
+  },
+  {
+   "input": "git fetch a",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T2 remote is a configured name"
+  },
+  {
+   "input": "git fetch upstream",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T2 remote is a configured name"
+  },
+  {
+   "input": "git push upstream main",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T2 remote is a configured name"
+  },
+  {
+   "input": "pytest @a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T3 @file"
+  },
+  {
+   "input": "python3 -m pytest @a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T3 @file"
+  },
+  {
+   "input": "pytest -q @a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T3 @file"
+  },
+  {
+   "input": "pytest -k @a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T3 @file"
+  },
+  {
+   "input": "eslint @a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T3 @file"
+  },
+  {
+   "input": "tsc --noEmit false",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T4 tsc boolean value and @file"
+  },
+  {
+   "input": "tsc --noEmit false x.ts",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T4 tsc boolean value and @file"
+  },
+  {
+   "input": "tsc --noEmit -p . false",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T4 tsc boolean value and @file"
+  },
+  {
+   "input": "tsc --noEmit @o.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T4 tsc boolean value and @file"
+  },
+  {
+   "input": "tsc --noEmit true",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T4 tsc boolean value and @file"
+  },
+  {
+   "input": "tsc --noEmit -p @o.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T4 tsc boolean value and @file"
+  },
+  {
+   "input": "jest --ci false",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T4 tsc boolean value and @file"
+  },
+  {
+   "input": "git stash pop && echo x > newd/f",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T5 stash sets the barrier"
+  },
+  {
+   "input": "git stash apply && echo x > newd/f",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T5 stash sets the barrier"
+  },
+  {
+   "input": "git stash && echo x > newd/f",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T5 stash sets the barrier"
+  },
+  {
+   "input": "git stash pop && node script.js",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T5 stash sets the barrier"
+  },
+  {
+   "input": "git stash pop && cd sub",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T5 stash sets the barrier"
+  },
+  {
+   "input": "git stash pop && touch newd",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T5 stash sets the barrier"
+  },
+  {
+   "input": "bun run whoami",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T6 run takes a package script"
+  },
+  {
+   "input": "bun run sh",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T6 run takes a package script"
+  },
+  {
+   "input": "bun run l.ts",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T6 run takes a package script"
+  },
+  {
+   "input": "npm run whoami",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T6 run takes a package script"
+  },
+  {
+   "input": "pnpm run sh",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T6 run takes a package script"
+  },
+  {
+   "input": "yarn run sh",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T6 run takes a package script"
+  },
+  {
+   "input": "deno run https://x/y.ts",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T7 deno specifiers"
+  },
+  {
+   "input": "deno run npm:pkg@1.0.0/x.js",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T7 deno specifiers"
+  },
+  {
+   "input": "deno run jsr:@std/x/mod.ts",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T7 deno specifiers"
+  },
+  {
+   "input": "deno run data:text/javascript,console.log%28%27x%27%29//x.js",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T7 deno specifiers"
+  },
+  {
+   "input": "node a//b.js",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T7 deno specifiers"
+  },
+  {
+   "input": "pytest k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "python3 -m pytest k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "python3 -m pytest ./k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "python3 -m unittest k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "go test ./k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "go build ./k/...",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "vite build k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "vp build k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "eslint k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "bun test k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "tsc --noEmit -p k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "oxlint k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "prettier --check k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "vitest run k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "jest k",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T8 tool path lands inside"
+  },
+  {
+   "input": "git log --pretty /etc/hosts",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T10 joined values"
+  },
+  {
+   "input": "git log --format ../x",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T10 joined values"
+  },
+  {
+   "input": "git log --pretty",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T10 joined values"
+  },
+  {
+   "input": "git log --pretty=oneline",
+   "kind": "bash",
+   "expect": "allow",
+   "finding": "T10 joined values"
+  },
+  {
+   "input": "git log --format=%h -n 5",
+   "kind": "bash",
+   "expect": "allow",
+   "finding": "T10 joined values"
+  },
+  {
+   "input": "git add ':(top)a.txt'",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T11 pathspec magic"
+  },
+  {
+   "input": "git log -- ':(exclude)a.txt'",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T11 pathspec magic"
+  },
+  {
+   "input": "git diff ':(icase)A.TXT'",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T11 pathspec magic"
+  },
+  {
+   "input": "git add ':!a.txt'",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T11 pathspec magic"
+  },
+  {
+   "input": "git add ':/'",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T11 pathspec magic"
+  },
+  {
+   "input": "vp test watch",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T12 vp test commands"
+  },
+  {
+   "input": "vp test dev",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T12 vp test commands"
+  },
+  {
+   "input": "vp test related",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T12 vp test commands"
+  },
+  {
+   "input": "vp test bench",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T12 vp test commands"
+  },
+  {
+   "input": "vp test list",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "T12 vp test commands"
+  },
+  {
+   "input": "mv d e && cat e/s/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D3 read after mv or a git changer"
+  },
+  {
+   "input": "mv d e; cat e/s/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D3 read after mv or a git changer"
+  },
+  {
+   "input": "mv d e\ncat e/s/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D3 read after mv or a git changer"
+  },
+  {
+   "input": "mv d e || cat e/s/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D3 read after mv or a git changer"
+  },
+  {
+   "input": "cp f.txt g.txt && mv d e && head -n 1 e/s/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D3 read after mv or a git changer"
+  },
+  {
+   "input": "git checkout feature && cat l/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D3 read after mv or a git changer"
+  },
+  {
+   "input": "git stash pop && cat l/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D3 read after mv or a git changer"
+  },
+  {
+   "input": "git pull origin main && cat l/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D3 read after mv or a git changer"
+  },
+  {
+   "input": "git switch feature && head -n 3 l/id_rsa",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D3 read after mv or a git changer"
+  },
+  {
+   "input": "git checkout feature && cat l/*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D3 read after mv or a git changer"
+  },
+  {
+   "input": "mv d e && cat e/*",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D3 read after mv or a git changer"
+  },
+  {
+   "input": "mv d e && echo x > E/l/f",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D4 moved rule folded"
+  },
+  {
+   "input": "mv d e; echo x >> E/l/f",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D4 moved rule folded"
+  },
+  {
+   "input": "mv d e && touch E/l/f",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D4 moved rule folded"
+  },
+  {
+   "input": "mv d e && mkdir -p E/l/z",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D4 moved rule folded"
+  },
+  {
+   "input": "mv d e && cp f.txt E/l",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D4 moved rule folded"
+  },
+  {
+   "input": "mv d e && tee E/l/f",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D4 moved rule folded"
+  },
+  {
+   "input": "mv d e && chmod 644 E/l/h",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D4 moved rule folded"
+  },
+  {
+   "input": "mv d \u00e9 && echo x > e\u0301/l/f",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D4 moved rule folded"
+  },
+  {
+   "input": "mv d e\u0301 && echo x > \u00e9/l/f",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D4 moved rule folded"
+  },
+  {
+   "input": "mv d e && echo x > ./E//l/f",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D4 moved rule folded"
+  },
+  {
+   "input": "mv d nn && echo x > NN/l/f",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D4 moved rule folded"
+  },
+  {
+   "input": "mv d nn && cd NN/l",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D4 moved rule folded"
+  },
+  {
+   "input": "mv d nn && node NN/l/x.js",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D4 moved rule folded"
+  },
+  {
+   "input": "/dev/stdout",
+   "kind": "edit",
+   "expect": "ask",
+   "finding": "D5 edit landing in /dev",
+   "tool": "write"
+  },
+  {
+   "input": "/dev/stderr",
+   "kind": "edit",
+   "expect": "ask",
+   "finding": "D5 edit landing in /dev",
+   "tool": "write"
+  },
+  {
+   "input": "/dev/tty",
+   "kind": "edit",
+   "expect": "ask",
+   "finding": "D5 edit landing in /dev",
+   "tool": "write"
+  },
+  {
+   "input": "/dev/fd/1",
+   "kind": "edit",
+   "expect": "ask",
+   "finding": "D5 edit landing in /dev",
+   "tool": "write"
+  },
+  {
+   "input": "/dev/fd/2",
+   "kind": "edit",
+   "expect": "ask",
+   "finding": "D5 edit landing in /dev",
+   "tool": "write"
+  },
+  {
+   "input": "/dev/null",
+   "kind": "edit",
+   "expect": "ask",
+   "finding": "D5 edit landing in /dev",
+   "tool": "write"
+  },
+  {
+   "input": "so",
+   "kind": "edit",
+   "expect": "ask",
+   "finding": "D5 edit landing in /dev",
+   "tool": "write"
+  },
+  {
+   "input": "so",
+   "kind": "edit",
+   "expect": "ask",
+   "finding": "D5 edit landing in /dev",
+   "tool": "search_replace"
+  },
+  {
+   "input": "echo x > /dev/fd/14",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D6 /dev/fd write target"
+  },
+  {
+   "input": "cp a.txt /dev/fd/14",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D6 /dev/fd write target"
+  },
+  {
+   "input": "echo x >> /dev/null",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D6 /dev/fd write target"
+  },
+  {
+   "input": "tee /dev/null",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D6 /dev/fd write target"
+  },
+  {
+   "input": "echo x > /dev/stdout",
+   "kind": "bash",
+   "expect": "ask",
+   "finding": "D6 /dev/fd write target"
+  },
+  {
+   "input": "fifo",
+   "kind": "edit",
+   "expect": "ask",
+   "finding": "D7 edit landing not a file",
+   "tool": "write"
+  },
+  {
+   "input": "src",
+   "kind": "edit",
+   "expect": "ask",
+   "finding": "D7 edit landing not a file",
+   "tool": "write"
+  },
+  {
+   "input": "fifo",
+   "kind": "edit",
+   "expect": "ask",
+   "finding": "D7 edit landing not a file",
+   "tool": "search_replace"
+  },
+  {
+   "input": "cat src/*.ts",
+   "kind": "bash",
+   "expect": "allow",
+   "finding": "globs that stay"
+  },
+  {
+   "input": "wc -l a*.txt",
+   "kind": "bash",
+   "expect": "allow",
+   "finding": "globs that stay"
+  },
+  {
+   "input": "ls tests/*",
+   "kind": "bash",
+   "expect": "allow",
+   "finding": "globs that stay"
+  },
+  {
+   "input": "head -n 3 src/*.ts a?txt",
+   "kind": "bash",
+   "expect": "allow",
+   "finding": "globs that stay"
+  }
+ ]
+}

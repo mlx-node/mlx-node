@@ -1,751 +1,778 @@
-import { StatTile } from '@/components/stat-tile';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Skeleton } from '@/components/ui/skeleton';
-import { mutate } from '@/lib/api';
-import { AXIS_TICK, ChartBody, ChartCard, ChartEmpty, TOOLTIP_CONTENT_STYLE } from '@/lib/chart';
-import { coldObjectCounts, evictPreview } from '@/lib/cold-tier';
+import { RefreshCw } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from 'react';
+
+import { ChartCard, type ChartState } from '../components/arc-x/chart-card/chart-card';
+import type { ChartPoint, ChartSeries } from '../components/arc-x/chart/types';
+import { ConfirmDialog } from '../components/arc-x/confirm-dialog/confirm-dialog';
+import { ConfirmPopover, type ConfirmContent } from '../components/arc-x/confirm-popover/confirm-popover';
+import { Disclosure } from '../components/arc-x/disclosure/disclosure';
+import { IconButton } from '../components/arc-x/icon-button/icon-button';
+import { Panel } from '../components/arc-x/panel/panel';
+import { PathText } from '../components/arc-x/path-text/path-text';
+import { Placeholder } from '../components/arc-x/placeholder/placeholder';
+import { Rule } from '../components/arc-x/rule/rule';
+import { Meter, SplitBar } from '../components/arc-x/split-bar/split-bar';
+import { StackedBarChart } from '../components/arc-x/stacked-bar-chart/stacked-bar-chart';
+import { StatGroup, StatTile } from '../components/arc-x/stat-tile/stat-tile';
+import { SwapText } from '../components/arc-x/swap-text/swap-text';
+import { TrendChart } from '../components/arc-x/trend-chart/trend-chart';
+import { Alert } from '../components/arc/alert/alert';
+import { Badge } from '../components/arc/badge/badge';
+import { Button } from '../components/arc/button/button';
+import { CopyButton } from '../components/arc/copy-button/copy-button';
+import SegmentedControl, { type Segment } from '../components/arc/segmented-control/segmented-control';
+import { mutate } from '../lib/api';
+import { coldObjectCounts, coldWindowTotals, evictPreview, hitRateSeries, sidecarReading } from '../lib/cold-tier';
 import {
   formatBytes,
+  formatBytesParts,
+  formatClock,
   formatCount,
+  formatCountNoun,
   formatNumber,
   formatPercent,
+  formatPercentValue,
   formatRate,
   formatRelativeTime,
-  percentInt,
-} from '@/lib/format';
-import type { CacheMutationResult, CacheResponse } from '@/lib/types';
-import { useJson } from '@/lib/use-api';
-import { cn } from '@/lib/utils';
-import type { LucideIcon } from 'lucide-react';
-import {
-  AlertCircle,
-  Clock,
-  Database,
-  HardDrive,
-  Layers,
-  Loader2,
-  Percent,
-  ShieldAlert,
-  ShieldCheck,
-  Trash2,
-} from 'lucide-react';
-import { useMemo, useState } from 'react';
-import { Bar, BarChart, CartesianGrid, Legend, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import { toast } from 'sonner';
+} from '../lib/format';
+import { useHeld } from '../lib/held';
+import { useDataVersion } from '../lib/live';
+import { axisNumber, byteAxis } from '../lib/metrics-view';
+import { alignedRange } from '../lib/range';
+import { LOOKUP_SERIES, SERIES_A, SERIES_B } from '../lib/series';
+import { bucketPoint } from '../lib/timeseries';
+import { toast } from '../lib/toast';
+import type { CacheMutationResult, CacheResponse } from '../lib/types';
+import { LIVE_REFETCH_FAST_MS, reloadMountedQueries, useJson } from '../lib/use-api';
+import { useCommands, type AppCommand } from '../shell/commands';
+import { Page, PageGrid, PageHeader } from '../shell/page';
+import { DiskCacheLine } from './cache/disk-cache-line';
 
-const EVICT_OPTIONS: Array<{ value: string; label: string; days: number }> = [
-  { value: '1', label: 'Older than 1 day', days: 1 },
-  { value: '7', label: 'Older than 7 days', days: 7 },
-  { value: '30', label: 'Older than 30 days', days: 30 },
+type EvictDays = 1 | 7 | 30;
+type Pending = { kind: 'clear' } | { kind: 'evict'; days: EvictDays } | null;
+
+const EVICT_OPTIONS: Segment[] = [
+  { value: '1', label: '1 day' },
+  { value: '7', label: '7 days' },
+  { value: '30', label: '30 days' },
+];
+const MEASURE_OPTIONS: Segment[] = [
+  { value: 'objects', label: 'Objects' },
+  { value: 'bytes', label: 'Bytes' },
+];
+const VIEW_OPTIONS: Segment[] = [
+  { value: 'lookups', label: 'Lookups' },
+  { value: 'rate', label: 'Hit rate' },
 ];
 
-/** UTC-day string (`YYYY-MM-DD`) → short label (`Jul 20`). */
-function formatDay(day: string): string {
-  const parsed = new Date(`${day}T00:00:00Z`);
-  if (Number.isNaN(parsed.getTime())) return day;
-  return parsed.toLocaleDateString(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' });
+const KEPT_SERIES: ChartSeries[] = [
+  { key: 'kept', label: 'Kept', color: SERIES_A },
+  { key: 'evict', label: 'Would be evicted', color: SERIES_A, pattern: 'alt' },
+];
+const BYTES_SERIES: ChartSeries[] = [
+  { key: 'written', label: 'Written', color: SERIES_A },
+  { key: 'restored', label: 'Restored', color: SERIES_B },
+];
+
+const HEALTH_HELP =
+  'Counters are per turn and belong to this cache root. A corruption always costs a miss, so never add the two. ' +
+  'A decline is neither a hit nor a miss: a refused restore looks nothing up. Sidecars hold family state kept outside ' +
+  'the paged pool; the sidecar figures on the queue tile are a share of the object counts beside them. Writes, ' +
+  'evictions and write errors advance on a background thread, so those totals are approximate.';
+
+function plural(n: number, one: string, many: string): string {
+  return n === 1 ? one : many;
 }
 
-function errMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+function evictDaysOf(value: string): EvictDays | null {
+  return value === '1' ? 1 : value === '7' ? 7 : value === '30' ? 30 : null;
 }
 
-type PendingAction = { kind: 'clear' } | { kind: 'evict'; days: number } | null;
+/** The start index of the age histogram an eviction of `days` removes from. */
+function evictStart(days: EvictDays): number {
+  return days >= 30 ? 3 : days >= 7 ? 2 : 1;
+}
 
-export default function Cache() {
-  const cache = useJson<CacheResponse>('/cache');
-  const disk = cache.data?.disk;
-  const trend = useMemo(() => cache.data?.trend ?? [], [cache.data]);
+function Strong({ children }: { children: ReactNode }): ReactElement {
+  return <span className="font-medium text-foreground">{children}</span>;
+}
 
-  const [evictKey, setEvictKey] = useState('7');
-  const [pending, setPending] = useState<PendingAction>(null);
-  const [busy, setBusy] = useState(false);
+/** A value split into the tile's value and unit; '—' becomes null. */
+function bytesTile(bytes: number | null | undefined): { value: string | null; unit?: string } {
+  const parts = formatBytesParts(bytes);
+  return parts.value === '—' ? { value: null } : { value: parts.value, unit: parts.unit };
+}
 
-  const evictDays = EVICT_OPTIONS.find((o) => o.value === evictKey)?.days ?? 7;
+/** A tile hint on one line: cut with an ellipsis, the full text in its title. */
+function Alarm({ on, children }: { on: boolean; children: string }): ReactElement {
+  return (
+    <span className="flex min-w-0 items-center gap-1.5" title={children}>
+      {on ? (
+        <Badge size="sm" tone="danger" className="shrink-0">
+          Check
+        </Badge>
+      ) : null}
+      <span className="min-w-0 truncate">{children}</span>
+    </span>
+  );
+}
+
+export default function Cache(): ReactElement {
+  const cache = useJson<CacheResponse>('/cache', { live: { minIntervalMs: LIVE_REFETCH_FAST_MS } });
+  const held = useHeld(cache);
+  const data = held.data;
+  const disk = data?.disk;
+  const scope = data?.scope;
+  const health = data?.health;
+  const loading = data === undefined;
+
+  const [evictDays, setEvictDays] = useState<EvictDays>(7);
+  const [announced, setAnnounced] = useState('');
+  const [measure, setMeasure] = useState<'objects' | 'bytes'>('objects');
+  const [view, setView] = useState<'lookups' | 'rate'>('lookups');
+  const [pending, setPending] = useState<Pending>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [receivedAt, setReceivedAt] = useState<number | null>(null);
+  const result = useRef<CacheMutationResult | null>(null);
+
+  useEffect(() => {
+    if (cache.data !== undefined) setReceivedAt(Date.now());
+  }, [cache.data]);
 
   const totalBytes = disk?.totalBytes ?? 0;
   const quotaBytes = disk?.quotaBytes ?? 0;
   const sidecarBytes = disk?.sidecarBytes ?? 0;
   const blockBytes = Math.max(0, totalBytes - sidecarBytes);
-  // `blocks` is the KV-block count; `objects` is blocks + sidecars, which is
-  // what the age histogram charts, what the quota measures, and what clear/evict
-  // actually unlink. Using `blocks` for any of those is the F2 miscount.
   const { blocks, sidecars, objects } = coldObjectCounts(disk);
   const quotaFraction = quotaBytes > 0 ? Math.min(1, totalBytes / quotaBytes) : 0;
-  const scope = cache.data?.scope;
-  const health = cache.data?.health;
-  const restoreFamilies = cache.data?.restoreFamilies ?? [];
 
-  const trendTotals = useMemo(
-    () =>
-      trend.reduce(
-        (acc, row) => ({
-          hits: acc.hits + row.hits,
-          misses: acc.misses + row.misses,
-          bytesWritten: acc.bytesWritten + row.bytesWritten,
-          bytesRestored: acc.bytesRestored + row.bytesRestored,
-        }),
-        { hits: 0, misses: 0, bytesWritten: 0, bytesRestored: 0 },
-      ),
-    [trend],
-  );
-  const lookups = trendTotals.hits + trendTotals.misses;
+  const dataVersion = useDataVersion();
+  const range = useMemo(() => alignedRange('30d'), [dataVersion]);
+  const now = range.to - 1;
 
-  const trendData = useMemo(
-    () => trend.map((row) => ({ day: formatDay(row.day), hits: row.hits, misses: row.misses })),
-    [trend],
-  );
-  const hasTrend = lookups > 0;
-  // Gates the destructive controls and the age chart. Must count OBJECTS: a
-  // root holding only sidecars still occupies quota, and gating on blocks alone
-  // left those bytes visible in the Usage tile but impossible to clear.
-  const hasObjects = objects > 0;
-
-  const evictP = disk !== undefined ? evictPreview(disk.ageHistogram, evictDays) : { count: 0, bytes: 0 };
+  const trend = useMemo(() => data?.trend ?? [], [data]);
+  const totals = useMemo(() => coldWindowTotals(trend, range.starts), [trend, range]);
+  const lookups = totals.hits + totals.misses;
+  const declines = health?.restoreDeclines ?? 0;
+  const sidecar = sidecarReading(health, scope, totals.hits);
   const excludedLookups =
-    scope !== undefined
-      ? scope.legacy.hits +
+    scope === undefined
+      ? 0
+      : scope.legacy.hits +
         scope.legacy.misses +
         scope.otherRoots.hits +
         scope.otherRoots.misses +
         scope.unattributed.hits +
-        scope.unattributed.misses
-      : 0;
-  const corruptionsSeen = (health?.corruptionsTotal ?? 0) > 0 || (health?.corruptions ?? 0) > 0;
-  const writeErrorsSeen = (health?.writeErrorsTotal ?? 0) > 0 || (health?.writeErrors ?? 0) > 0;
-  const refusals = health?.restoreDeclines ?? 0;
+        scope.unattributed.misses;
 
-  const sidecarCaptures = health?.sidecarCaptureReached ?? 0;
-  const sidecarInstalled = health?.sidecarInstalled ?? 0;
-  const sidecarPersisted = health?.sidecarAlreadyPersisted ?? 0;
-  const sidecarWritten = health?.sidecarEnqueued ?? 0;
-  // Chain-empty and boundary-skip are ONE number here on purpose: both end with
-  // the capture holding no rung to anchor state under, and the operator's next
-  // move is the same either way. Which of the two it was goes to the
-  // `[MLX_TRACE] paged` line, and both stay separate over the wire.
-  const sidecarNoAnchor = (health?.sidecarChainEmpty ?? 0) + (health?.sidecarBoundarySkips ?? 0);
-  // The regression `installed` exists to expose. Prefixes WERE restored (real
-  // hits) and the family's state WAS on disk (the capture re-found the same
-  // chain), yet nothing was installed — so every restored turn silently
-  // replayed the whole prefix. The replay produces CORRECT state, which is why
-  // every other number on this page reads exactly like a healthy run.
-  const sidecarReplayed = sidecarInstalled === 0 && sidecarPersisted > 0 && trendTotals.hits > 0;
-  // The write-side dead end: the capture ran and never once wrote a sidecar nor
-  // found one already there, so no prefix will ever restore state.
-  // `alreadyPersisted` is the discriminator — without it the healthy steady
-  // state (nothing enqueued because the FIRST turn wrote the chain every later
-  // turn re-selects) carries the identical signature.
-  const sidecarStranded = sidecarCaptures > 0 && sidecarWritten === 0 && sidecarPersisted === 0;
-  // Captures that ran against NO cache root. The recorder sits above the
-  // capture's `adapter.cold_tier()` guard, so a hybrid turn with persistence
-  // off — or one whose tier failed to open — counts one and then carries no
-  // root for the scope to match. Reading that zero as "dense family" names the
-  // wrong cause for the one state these counters exist to catch, so it takes
-  // the hint over.
-  const sidecarUnrooted = scope?.unrootedSidecarCaptures ?? 0;
+  const previewOf = (days: EvictDays): string => {
+    const preview = disk === undefined ? { count: 0, bytes: 0 } : evictPreview(disk.ageHistogram, days);
+    return preview.count === 0
+      ? 'Nothing is that old.'
+      : `${formatNumber(preview.count)} ${plural(preview.count, 'object', 'objects')} · ${formatBytes(preview.bytes)} would be removed`;
+  };
+  const evictP = disk === undefined ? { count: 0, bytes: 0 } : evictPreview(disk.ageHistogram, evictDays);
+  const previewText = previewOf(evictDays);
+  const evictDisabled = cache.loading || evictP.count === 0;
+  const clearDisabled = cache.loading || objects === 0;
 
-  const runDelete = async (action: Exclude<PendingAction, null>): Promise<void> => {
-    setBusy(true);
-    try {
-      const body = action.kind === 'evict' ? { olderThanDays: action.days } : { all: true };
-      const result = await mutate<CacheMutationResult>('DELETE', '/cache', body);
-      // The server unlinks blocks AND sidecars, so `removed` is an OBJECT count
-      // — say "objects", not "blocks", or the toast disagrees with the dialog.
-      toast.success(
-        action.kind === 'evict'
-          ? `Evicted cold-tier objects older than ${action.days} day${action.days === 1 ? '' : 's'}`
-          : 'Cleared cold cache',
-        {
-          description: `${formatNumber(result.removed)} object${result.removed === 1 ? '' : 's'} removed · ${formatBytes(result.freedBytes)} freed`,
-        },
-      );
-      setPending(null);
+  const ageChart = useMemo(() => {
+    const buckets = disk?.ageHistogram ?? [];
+    const start = evictStart(evictDays);
+    const axis = byteAxis(Math.max(0, ...buckets.map((bucket) => bucket.bytes)));
+    const data: ChartPoint[] = buckets.map((bucket, index) => {
+      const value = measure === 'objects' ? bucket.count : bucket.bytes / axis.div;
+      const evicted = index >= start;
+      return {
+        key: bucket.label,
+        label: `${bucket.label} · ${formatNumber(bucket.count)} ${plural(bucket.count, 'object', 'objects')} · ${formatBytes(bucket.bytes)}`,
+        axisLabel: bucket.label,
+        values: { kept: evicted ? 0 : value, evict: evicted ? value : 0 },
+      };
+    });
+    return { data, unit: measure === 'objects' ? 'objects' : axis.unit };
+  }, [disk, evictDays, measure]);
+
+  const lookupChart = useMemo(() => {
+    const days = hitRateSeries(trend, range.starts);
+    const lookupData: ChartPoint[] = days.map((day) => {
+      const point = bucketPoint(day.t, 'day', now);
+      const rate = formatRate(day.hits, day.lookups);
+      return {
+        ...point,
+        label: day.lookups > 0 ? `${point.label} · hit rate ${rate}` : point.label,
+        values: { hits: day.hits, misses: day.lookups - day.hits },
+      };
+    });
+    const rateData: ChartPoint[] = days.map((day) => ({
+      ...bucketPoint(day.t, 'day', now),
+      values: { rate: day.rate },
+      samples: { rate: day.lookups },
+    }));
+    const inWindow = days.reduce((sum, day) => sum + day.lookups, 0);
+    return { lookupData, rateData, inWindow };
+  }, [trend, range, now]);
+
+  const bytesChart = useMemo(() => {
+    const byDay = new Map<number, { written: number; restored: number }>();
+    for (const row of trend) {
+      const seen = byDay.get(row.t);
+      byDay.set(row.t, {
+        written: (seen?.written ?? 0) + row.bytesWritten,
+        restored: (seen?.restored ?? 0) + row.bytesRestored,
+      });
+    }
+    let max = 0;
+    let written = 0;
+    let restored = 0;
+    for (const t of range.starts) {
+      const day = byDay.get(t);
+      max = Math.max(max, day?.written ?? 0, day?.restored ?? 0);
+      written += day?.written ?? 0;
+      restored += day?.restored ?? 0;
+    }
+    const axis = byteAxis(max);
+    const data: ChartPoint[] = range.starts.map((t) => {
+      const day = byDay.get(t);
+      return {
+        ...bucketPoint(t, 'day', now),
+        values: { written: (day?.written ?? 0) / axis.div, restored: (day?.restored ?? 0) / axis.div },
+      };
+    });
+    return { data, unit: axis.unit, written, restored };
+  }, [trend, range, now]);
+
+  const chartState = (empty: boolean): ChartState =>
+    loading ? 'loading' : empty ? 'empty' : held.held ? 'held' : 'ready';
+
+  const toastResult = (title: string): void => {
+    const done = result.current;
+    toast.success(title, {
+      description:
+        done === null
+          ? undefined
+          : `${formatNumber(done.removed)} ${plural(done.removed, 'object', 'objects')} removed · ${formatBytes(done.freedBytes)} freed`,
+    });
+  };
+
+  const evictContent = (days: EvictDays): ConfirmContent => {
+    const preview = disk === undefined ? { count: 0, bytes: 0 } : evictPreview(disk.ageHistogram, days);
+    const daysText = `${String(days)} ${plural(days, 'day', 'days')}`;
+    return {
+      title: 'Evict old cache objects?',
+      description: (
+        <>
+          Removes cold-tier objects (blocks and state sidecars) older than <Strong>{daysText}</Strong>. This frees an
+          estimated{' '}
+          <Strong>
+            {`${formatNumber(preview.count)} ${plural(preview.count, 'object', 'objects')} · ${formatBytes(preview.bytes)}`}
+          </Strong>
+          . Newer objects are kept.
+        </>
+      ),
+      confirmLabel: 'Evict',
+      workingLabel: 'Evicting…',
+      successLabel: 'Evicted',
+      tone: 'neutral',
+      errorTitle: 'Failed to update cache',
+      onConfirm: async () => {
+        result.current = await mutate<CacheMutationResult>('DELETE', '/cache', { olderThanDays: days });
+      },
+      onDone: () => {
+        cache.reload();
+        toastResult(`Evicted cold-tier objects older than ${daysText}`);
+      },
+    };
+  };
+
+  const clearContent: ConfirmContent = {
+    title: 'Clear the cold cache?',
+    description: (
+      <>
+        Removes all <Strong>{`${formatNumber(objects)} ${plural(objects, 'object', 'objects')}`}</Strong> —{' '}
+        {`${formatNumber(blocks)} prefix ${plural(blocks, 'block', 'blocks')} and ${formatNumber(sidecars)} state ${plural(sidecars, 'sidecar', 'sidecars')}, ${formatBytes(totalBytes)} in total`}{' '}
+        — from the cold tier. This cannot be undone.
+      </>
+    ),
+    confirmLabel: 'Clear all',
+    workingLabel: 'Clearing…',
+    successLabel: 'Cleared',
+    tone: 'danger',
+    errorTitle: 'Failed to update cache',
+    onConfirm: async () => {
+      result.current = await mutate<CacheMutationResult>('DELETE', '/cache', { all: true });
+    },
+    onDone: () => {
       cache.reload();
-    } catch (err) {
-      toast.error('Failed to update cache', { description: errMessage(err) });
+      toastResult('Cleared cold cache');
+    },
+  };
+
+  const commands = useMemo((): AppCommand[] => {
+    const list: AppCommand[] = [];
+    if (!evictDisabled) {
+      list.push({
+        id: 'cache-evict',
+        label: 'Evict old cache objects…',
+        group: 'Cache',
+        run: () => setPending({ kind: 'evict', days: evictDays }),
+      });
+    }
+    if (!clearDisabled) {
+      list.push({
+        id: 'cache-clear',
+        label: 'Clear cold cache…',
+        group: 'Cache',
+        run: () => setPending({ kind: 'clear' }),
+      });
+    }
+    return list;
+  }, [evictDisabled, clearDisabled, evictDays]);
+  useCommands(commands);
+
+  const refresh = async (): Promise<void> => {
+    setRefreshing(true);
+    try {
+      await mutate('POST', '/ingest');
+    } catch {
+      // A failed ingest still leaves the last index to read.
     } finally {
-      setBusy(false);
+      reloadMountedQueries();
+      setRefreshing(false);
     }
   };
 
-  return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Cache</h1>
-        <p className="text-muted-foreground text-sm">PagedAttention cold-tier usage and management.</p>
-        {disk !== undefined && (
-          <p className="text-muted-foreground mt-1 font-mono text-xs break-all" title={scope?.root ?? disk.root}>
-            {disk.root}
-            {!disk.exists && ' · not created yet'}
-          </p>
-        )}
-        {/*
-          Every number on this page is scoped to the root above. Rows the scope
-          left out are named here rather than silently folded in (which was the
-          bug) or silently dropped (which would make real history vanish).
-        */}
-        {scope !== undefined &&
-          (scope.legacy.turns > 0 || scope.otherRoots.turns > 0 || scope.unattributed.turns > 0) && (
-            <p className="text-muted-foreground mt-1 text-xs">
-              {scope.legacy.turns > 0 && (
-                <span>
-                  {formatNumber(scope.legacy.turns)} turn{scope.legacy.turns === 1 ? '' : 's'} recorded before cache
-                  attribution existed ({formatNumber(scope.legacy.hits)} hits · {formatNumber(scope.legacy.misses)}{' '}
-                  misses) are excluded; they age out within {scope.trendWindowDays} days.
-                </span>
-              )}
-              {scope.otherRoots.turns > 0 && (
-                <span>
-                  {scope.legacy.turns > 0 && ' '}
-                  {formatNumber(scope.otherRoots.turns)} turn{scope.otherRoots.turns === 1 ? '' : 's'} ran against a
-                  different cache directory ({formatNumber(scope.otherRoots.hits)} hits ·{' '}
-                  {formatNumber(scope.otherRoots.misses)} misses) and are excluded too.
-                </span>
-              )}
-              {/*
-              The partition's catch-all arm: tier on, root unrecorded. The
-              writer can no longer produce one, so this line should never
-              appear — which is exactly why it must exist rather than let those
-              lookups fall through every bucket and disappear.
-            */}
-              {scope.unattributed.turns > 0 && (
-                <span>
-                  {(scope.legacy.turns > 0 || scope.otherRoots.turns > 0) && ' '}
-                  {formatNumber(scope.unattributed.turns)} turn{scope.unattributed.turns === 1 ? '' : 's'} ran with the
-                  cold tier on but recorded no cache directory ({formatNumber(scope.unattributed.hits)} hits ·{' '}
-                  {formatNumber(scope.unattributed.misses)} misses) and cannot be attributed.
-                </span>
-              )}
-            </p>
-          )}
-      </div>
-
-      {cache.error ? (
-        <Card>
-          <CardContent className="text-destructive flex items-center gap-2 py-6 text-sm">
-            <AlertCircle className="size-4 shrink-0" aria-hidden />
-            {cache.error.message}
-          </CardContent>
-        </Card>
-      ) : (
+  const header = (
+    <PageHeader
+      title="Cache"
+      description={
         <>
-          {/*
-            Every bar in this grid is `h-[1lh]` — one line box of the font its own
-            wrapper carries. StatTile renders `value` inside `text-3xl leading-none`
-            and `sub` inside `text-sm`, so the bars measure 30px and 20px without
-            any call site restating those numbers, and they stay right if the type
-            scale moves. The fixed heights they replace did not match the text
-            (`h-8` is 2px over the value, `h-4` 4px under the sub-line), so all four
-            tiles grew as the request landed and took the charts below with them.
-            The meter is the exception and needs no `1lh`: UsageMeter is itself
-            `h-2`, so the bar already stands in its exact box.
-          */}
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            <StatTile
-              label="Usage"
-              icon={HardDrive}
-              value={cache.loading ? <Skeleton className="h-[1lh] w-24" /> : formatBytes(totalBytes)}
-              sub={
-                cache.loading ? (
-                  <Skeleton className="h-[1lh] w-32" />
-                ) : (
-                  // Over half the tier's bytes can be sidecars, so the split is
-                  // spelled out rather than folded into one opaque total.
-                  <span>
-                    {quotaBytes > 0
-                      ? `${formatPercent(quotaFraction)} of ${formatBytes(quotaBytes)} quota`
-                      : 'no quota available'}
-                    {` · ${formatBytes(blockBytes)} blocks + ${formatBytes(sidecarBytes)} sidecars`}
-                  </span>
-                )
-              }
-              footer={
-                cache.loading ? (
-                  <Skeleton className="h-2 w-full rounded-full" />
-                ) : quotaBytes > 0 ? (
-                  <UsageMeter fraction={quotaFraction} totalBytes={totalBytes} quotaBytes={quotaBytes} />
-                ) : undefined
-              }
-            />
-            <StatTile
-              label="Objects"
-              icon={Database}
-              value={cache.loading ? <Skeleton className="h-[1lh] w-16" /> : formatCount(objects)}
-              sub={
-                cache.loading ? (
-                  <Skeleton className="h-[1lh] w-40" />
-                ) : (
-                  `${formatCount(blocks)} prefix block${blocks === 1 ? '' : 's'} · ${formatCount(sidecars)} state sidecar${sidecars === 1 ? '' : 's'}`
-                )
-              }
-            />
-            <StatTile
-              label="Hit rate"
-              icon={Percent}
-              value={cache.loading ? <Skeleton className="h-[1lh] w-16" /> : formatRate(trendTotals.hits, lookups)}
-              sub={
-                cache.loading ? (
-                  <Skeleton className="h-[1lh] w-32" />
-                ) : hasTrend ? (
-                  `${formatCount(trendTotals.hits)} hits · ${formatCount(trendTotals.misses)} misses · this cache only`
-                ) : refusals > 0 ? (
-                  // A refused restore performs no lookup, so it lands as 0/0
-                  // and used to render as the empty state below — telling an
-                  // operator "nothing ran" when what happened was "reuse was
-                  // refused". Those are opposite diagnoses.
-                  `${formatCount(refusals)} restore${refusals === 1 ? '' : 's'} refused · no lookup was performed`
-                ) : (
-                  'no lookups recorded for this cache'
-                )
-              }
-            />
-            <StatTile
-              label="Oldest object"
-              icon={Clock}
-              value={
-                cache.loading ? (
-                  <Skeleton className="h-[1lh] w-20" />
-                ) : disk?.oldestMtime != null ? (
-                  formatRelativeTime(disk.oldestMtime)
-                ) : (
-                  '—'
-                )
-              }
-              sub={
-                cache.loading ? (
-                  <Skeleton className="h-[1lh] w-28" />
-                ) : disk?.newestMtime != null ? (
-                  `newest ${formatRelativeTime(disk.newestMtime)}`
-                ) : (
-                  'empty tier'
-                )
-              }
-            />
-          </div>
-
-          <div className="grid gap-4 lg:grid-cols-2">
-            <ChartCard title="Objects by age" subtitle="Prefix blocks AND state sidecars — everything evict removes">
-              <ChartBody
-                loading={cache.loading}
-                error={cache.error}
-                isEmpty={!hasObjects}
-                empty={
-                  <ChartEmpty
-                    icon={Layers}
-                    message="No cold-tier objects persisted yet."
-                    hint={
-                      restoreFamilies.length > 0
-                        ? `Objects appear when a persistent paged cache is used by a restore-eligible family: ${restoreFamilies.join(', ')}.`
-                        : 'Objects appear when a persistent paged cache is used by a restore-eligible model family.'
-                    }
-                  />
-                }
-              >
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={disk?.ageHistogram ?? []} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
-                    <XAxis dataKey="label" tick={AXIS_TICK} tickLine={false} axisLine={false} />
-                    <YAxis
-                      tick={AXIS_TICK}
-                      tickLine={false}
-                      axisLine={false}
-                      width={40}
-                      allowDecimals={false}
-                      tickFormatter={(v) => formatCount(Number(v))}
-                    />
-                    <Tooltip
-                      cursor={{ fill: 'var(--color-muted)', opacity: 0.35 }}
-                      contentStyle={TOOLTIP_CONTENT_STYLE}
-                      formatter={(value, _name, item) => {
-                        const bytes = Number((item as { payload?: { bytes?: number } }).payload?.bytes ?? 0);
-                        return [`${formatNumber(Number(value))} objects · ${formatBytes(bytes)}`, 'Objects'];
-                      }}
-                    />
-                    <Bar
-                      dataKey="count"
-                      name="Objects"
-                      fill="var(--viz-input)"
-                      radius={[4, 4, 0, 0]}
-                      isAnimationActive={false}
-                    />
-                  </BarChart>
-                </ResponsiveContainer>
-              </ChartBody>
-            </ChartCard>
-
-            <ChartCard
-              title="Cache hit / miss trend"
-              subtitle={
-                scope !== undefined
-                  ? `Lookups against THIS cache root, by day · last ${scope.trendWindowDays} days`
-                  : 'Cold-tier lookups against this cache root, by day'
-              }
-            >
-              <ChartBody
-                loading={cache.loading}
-                error={cache.error}
-                isEmpty={!hasTrend}
-                empty={
-                  <ChartEmpty
-                    icon={Percent}
-                    message="No hits or misses recorded for this cache."
-                    hint={
-                      excludedLookups > 0
-                        ? `${formatNumber(excludedLookups)} lookups were recorded against a different (or unattributed) cache root — see the scope note above.`
-                        : 'Cold-cache lookups are recorded per turn when you run mlx agent with a persistent paged cache.'
-                    }
-                  />
-                }
-              >
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={trendData} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
-                    <XAxis dataKey="day" tick={AXIS_TICK} tickLine={false} axisLine={false} minTickGap={16} />
-                    <YAxis
-                      tick={AXIS_TICK}
-                      tickLine={false}
-                      axisLine={false}
-                      width={40}
-                      allowDecimals={false}
-                      tickFormatter={(v) => formatCount(Number(v))}
-                    />
-                    <Tooltip
-                      cursor={{ fill: 'var(--color-muted)', opacity: 0.35 }}
-                      contentStyle={TOOLTIP_CONTENT_STYLE}
-                      formatter={(value) => formatNumber(Number(value))}
-                    />
-                    <Legend
-                      wrapperStyle={{ fontSize: 12 }}
-                      formatter={(value) => <span className="text-foreground">{value}</span>}
-                    />
-                    <Bar
-                      dataKey="hits"
-                      name="Hits"
-                      fill="var(--viz-output)"
-                      stroke="var(--color-card)"
-                      strokeWidth={1}
-                      radius={[4, 4, 0, 0]}
-                      isAnimationActive={false}
-                    />
-                    <Bar
-                      dataKey="misses"
-                      name="Misses"
-                      fill="var(--viz-cached)"
-                      stroke="var(--color-card)"
-                      strokeWidth={1}
-                      radius={[4, 4, 0, 0]}
-                      isAnimationActive={false}
-                    />
-                  </BarChart>
-                </ResponsiveContainer>
-              </ChartBody>
-            </ChartCard>
-          </div>
-
-          {/*
-            Cold-tier counters the native `coldCacheStats()` has always exposed
-            and nothing shipped ever read. `corruptions == 0` is the stated
-            acceptance bar for admitting a family to the restore allowlist, and
-            until now it could not be checked from anything the user runs.
-          */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Cold-tier health</CardTitle>
-              <CardDescription>
-                Per-turn counters recorded against this cache root. Corruptions are a SUBSET of misses (a failed
-                validation always costs a miss), so never add the two. Declines are NEITHER — a refused restore performs
-                no lookup, so it moves neither hits nor misses. Sidecars are the family state kept outside the paged
-                pool; the sidecar figures on the queue tile are a SHARE of the object counts beside them, since one
-                admission bumps both. Writes, evictions and write errors advance on a background writer thread, making
-                those totals approximate.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-              <HealthStat
-                label="Corruptions"
-                value={formatNumber(health?.corruptions ?? 0)}
-                hint={
-                  corruptionsSeen
-                    ? `cumulative max ${formatNumber(health?.corruptionsTotal ?? 0)} — investigate`
-                    : 'none seen (acceptance bar: 0)'
-                }
-                icon={corruptionsSeen ? ShieldAlert : ShieldCheck}
-                alarm={corruptionsSeen}
-                loading={cache.loading}
-              />
-              <HealthStat
-                label="Queue drops"
-                value={formatNumber(health?.queueDrops ?? 0)}
-                // The value and `enqueued` are object-scoped — blocks and family
-                // state sidecars share this queue, so "objects" is what they
-                // count. The two sidecar figures are the sidecar SHARE of those
-                // same numbers, phrased "among them" / "of the drops" so nobody
-                // reads them as a second population to add.
-                hint={`cumulative max ${formatNumber(health?.queueDropsTotal ?? 0)} · ${formatNumber(health?.enqueued ?? 0)} objects enqueued · ${formatNumber(sidecarWritten)} sidecar${sidecarWritten === 1 ? '' : 's'} among them, ${formatNumber(health?.sidecarQueueDrops ?? 0)} of the drops`}
-                alarm={(health?.queueDropsTotal ?? 0) > 0}
-                loading={cache.loading}
-              />
-              <HealthStat
-                label="Write errors"
-                value={formatNumber(health?.writeErrors ?? 0)}
-                hint={
-                  writeErrorsSeen
-                    ? `cumulative max ${formatNumber(health?.writeErrorsTotal ?? 0)} — the cache root is refusing writes`
-                    : 'none seen (writes are landing)'
-                }
-                icon={writeErrorsSeen ? ShieldAlert : ShieldCheck}
-                alarm={writeErrorsSeen}
-                loading={cache.loading}
-              />
-              {/*
-                The write side of the family state that lives OUTSIDE the paged
-                pool. Only the hybrid families enter this capture, so a zero
-                beside real block traffic is the normal dense-model reading and
-                deliberately wears no alarm — but only once the rootless
-                captures are known to be zero too, since a hybrid that never got
-                a tier produces the same zero here for the opposite reason.
-              */}
-              <HealthStat
-                label="Sidecar captures"
-                value={formatNumber(sidecarCaptures)}
-                hint={
-                  sidecarCaptures === 0
-                    ? sidecarUnrooted > 0
-                      ? `${formatNumber(sidecarUnrooted)} ran with no cache attached — persistence off, or the tier never opened`
-                      : 'not reached — dense families keep no state outside the pool'
-                    : sidecarStranded
-                      ? 'nothing written and nothing on disk — no prefix can restore state'
-                      : `${formatNumber(sidecarWritten)} written · ${formatNumber(sidecarPersisted)} already on disk · ${formatNumber(sidecarNoAnchor)} found no anchor`
-                }
-                icon={sidecarStranded ? ShieldAlert : undefined}
-                alarm={sidecarStranded}
-                loading={cache.loading}
-              />
-              <HealthStat
-                label="Restore declines"
-                value={formatNumber(health?.restoreDeclines ?? 0)}
-                hint="refused before lookup · not counted as a lookup"
-                loading={cache.loading}
-              />
-              {/*
-                The one cold-tier counter nothing else on this page can stand in
-                for. Every `install_*_cold_sidecar` early-return falls through to
-                a full O(prefix) replay that produces CORRECT state, so a
-                regression from "restored and INSTALLED" to "restored and
-                silently re-derived" leaves the hit rate, the trend, the bytes
-                and the corruption count all exactly where they were.
-              */}
-              <HealthStat
-                label="Sidecar installs"
-                value={formatNumber(sidecarInstalled)}
-                hint={
-                  sidecarReplayed
-                    ? 'state was on disk and prefixes restored — every one re-derived by a full replay'
-                    : sidecarInstalled > 0
-                      ? 'restored prefixes that reused family state instead of replaying it'
-                      : 'no restored prefix carried family state in this window'
-                }
-                icon={sidecarReplayed ? ShieldAlert : undefined}
-                alarm={sidecarReplayed}
-                loading={cache.loading}
-              />
-              <HealthStat
-                label="Evictions"
-                value={formatNumber(health?.evictions ?? 0)}
-                hint="objects removed by quota pressure"
-                loading={cache.loading}
-              />
-              <HealthStat
-                label="Bytes restored"
-                value={formatBytes(trendTotals.bytesRestored)}
-                hint={`${formatBytes(trendTotals.bytesWritten)} landed`}
-                loading={cache.loading}
-              />
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle className="text-base">Manage cold cache</CardTitle>
-              <CardDescription>
-                Removes persisted paged blocks AND their state sidecars from disk — both occupy the quota, so both go.
-                This is safe (they are re-created on demand) but a cleared cache means the next matching prefix pays
-                full prefill again.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
-              <div className="flex flex-wrap items-end gap-2">
-                <div className="space-y-1.5">
-                  <label className="text-muted-foreground text-xs font-medium" htmlFor="evict-threshold">
-                    Evict objects
-                  </label>
-                  <Select value={evictKey} onValueChange={setEvictKey}>
-                    <SelectTrigger id="evict-threshold" className="w-48" aria-label="Eviction age threshold">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {EVICT_OPTIONS.map((o) => (
-                        <SelectItem key={o.value} value={o.value}>
-                          {o.label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-                <Button
-                  variant="outline"
-                  disabled={cache.loading || evictP.count === 0}
-                  onClick={() => setPending({ kind: 'evict', days: evictDays })}
-                >
-                  Evict older
-                </Button>
-              </div>
-              <Button
-                variant="destructive"
-                disabled={cache.loading || !hasObjects}
-                onClick={() => setPending({ kind: 'clear' })}
-              >
-                <Trash2 className="size-4" />
-                Clear all
-              </Button>
-            </CardContent>
-          </Card>
+          <span className="block">Paged cold tier on disk: use, reuse and health.</span>
+          {disk === undefined ? null : (
+            <span className="mt-1 flex min-w-0 items-center gap-1">
+              <span className="min-w-0 truncate text-caption text-secondary">
+                <PathText path={disk.root} title={scope?.root ?? disk.root} />
+                {disk.exists ? '' : ' · not created yet'}
+              </span>
+              <CopyButton value={disk.root} iconOnly variant="plain" label="Copy cache path" />
+            </span>
+          )}
         </>
-      )}
+      }
+      actions={
+        <IconButton
+          label="Refresh data"
+          variant="secondary"
+          icon={<RefreshCw size={16} aria-hidden="true" />}
+          loading={refreshing}
+          onClick={() => void refresh()}
+        />
+      }
+    />
+  );
 
-      <Dialog open={pending !== null} onOpenChange={(open) => !open && !busy && setPending(null)}>
-        <DialogContent>
-          <DialogHeader>
-            {/* "objects", not "blocks": the number under this title is
-                `evictP.count`, an object count, and the body says so too. */}
-            <DialogTitle>
-              {pending?.kind === 'evict' ? 'Evict old cache objects?' : 'Clear the cold cache?'}
-            </DialogTitle>
-            <DialogDescription>
-              {pending?.kind === 'evict' ? (
-                <>
-                  Removes cold-tier objects (blocks and state sidecars) older than{' '}
-                  <span className="text-foreground font-medium">
-                    {pending.days} day{pending.days === 1 ? '' : 's'}
-                  </span>
-                  . This frees an estimated{' '}
-                  <span className="text-foreground font-medium">
-                    {formatNumber(evictP.count)} object{evictP.count === 1 ? '' : 's'} · {formatBytes(evictP.bytes)}
-                  </span>
-                  . Newer objects are kept.
-                </>
-              ) : (
-                <>
-                  Removes all{' '}
-                  <span className="text-foreground font-medium">
-                    {formatNumber(objects)} object{objects === 1 ? '' : 's'}
-                  </span>{' '}
-                  — {formatNumber(blocks)} prefix block{blocks === 1 ? '' : 's'} and {formatNumber(sidecars)} state
-                  sidecar{sidecars === 1 ? '' : 's'}, {formatBytes(totalBytes)} in total — from the cold tier. This
-                  cannot be undone.
-                </>
-              )}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <DialogClose asChild>
-              <Button variant="outline" disabled={busy}>
-                Cancel
-              </Button>
-            </DialogClose>
-            <Button variant="destructive" disabled={busy} onClick={() => pending !== null && void runDelete(pending)}>
-              {busy && <Loader2 className="size-4 animate-spin" />}
-              {pending?.kind === 'evict' ? 'Evict' : 'Clear all'}
+  if (cache.error !== undefined && data === undefined) {
+    return (
+      <Page>
+        {header}
+        <Alert tone="danger" title="Could not load the cache">
+          <span className="grid justify-items-start gap-2">
+            <span>{cache.error.message}</span>
+            <Button variant="secondary" size="sm" onClick={cache.reload}>
+              Try again
             </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </div>
-  );
-}
+          </span>
+        </Alert>
+      </Page>
+    );
+  }
 
-/**
- * One cold-tier health counter. Deliberately plain: these are diagnostics, and
- * an `alarm` counter is tinted destructive so a non-zero corruption count reads
- * as a finding rather than as another number.
- */
-function HealthStat({
-  label,
-  value,
-  hint,
-  icon: Icon,
-  alarm = false,
-  loading,
-}: {
-  label: string;
-  value: string;
-  hint: string;
-  icon?: LucideIcon;
-  alarm?: boolean;
-  loading: boolean;
-}) {
+  const scopeSentences: string[] = [];
+  if (scope !== undefined) {
+    if (scope.legacy.turns > 0) {
+      scopeSentences.push(
+        `${formatNumber(scope.legacy.turns)} ${plural(scope.legacy.turns, 'turn', 'turns')} recorded before cache attribution existed (${formatCountNoun(scope.legacy.hits, 'hit', 'hits')} · ${formatCountNoun(scope.legacy.misses, 'miss', 'misses')}) ${plural(scope.legacy.turns, 'is', 'are')} excluded; they age out within ${String(scope.trendWindowDays)} days.`,
+      );
+    }
+    if (scope.otherRoots.turns > 0) {
+      scopeSentences.push(
+        `${formatNumber(scope.otherRoots.turns)} ${plural(scope.otherRoots.turns, 'turn', 'turns')} ran against a different cache directory (${formatCountNoun(scope.otherRoots.hits, 'hit', 'hits')} · ${formatCountNoun(scope.otherRoots.misses, 'miss', 'misses')}) and ${plural(scope.otherRoots.turns, 'is', 'are')} excluded too.`,
+      );
+    }
+    if (scope.unattributed.turns > 0) {
+      scopeSentences.push(
+        `${formatNumber(scope.unattributed.turns)} ${plural(scope.unattributed.turns, 'turn', 'turns')} ran with the cold tier on but recorded no cache directory (${formatCountNoun(scope.unattributed.hits, 'hit', 'hits')} · ${formatCountNoun(scope.unattributed.misses, 'miss', 'misses')}) and cannot be attributed.`,
+      );
+    }
+  }
+
+  const hitHint =
+    lookups > 0
+      ? `${formatCountNoun(totals.hits, 'hit', 'hits', formatCount)} · ${formatCountNoun(totals.misses, 'miss', 'misses', formatCount)} · this cache only`
+      : declines > 0
+        ? `${formatCount(declines)} ${plural(declines, 'restore', 'restores')} refused · no lookup was performed`
+        : 'no lookups recorded for this cache';
+
+  const restoreFamilies = data?.restoreFamilies ?? [];
+  const ageEmptyHint =
+    restoreFamilies.length > 0
+      ? `Objects appear when a persistent paged cache is used by a restore-eligible family: ${restoreFamilies.join(', ')}.`
+      : 'Objects appear when a persistent paged cache is used by a restore-eligible model family.';
+  const trendEmptyHint =
+    excludedLookups > 0
+      ? `${formatCountNoun(excludedLookups, 'lookup was', 'lookups were')} recorded against a different (or unattributed) cache root — see the note above.`
+      : (scope?.disabledTurns ?? 0) > 0
+        ? `${formatNumber(scope?.disabledTurns ?? 0)} ${plural(scope?.disabledTurns ?? 0, 'turn', 'turns')} ran with the cold tier off, so nothing was looked up.`
+        : 'Lookups are recorded per turn when a model runs with a persistent paged cache.';
+
+  const corruptionsSeen = (health?.corruptions ?? 0) > 0 || (health?.corruptionsTotal ?? 0) > 0;
+  const writeErrorsSeen = (health?.writeErrors ?? 0) > 0 || (health?.writeErrorsTotal ?? 0) > 0;
+  const capturesHint =
+    sidecar.captures === 0
+      ? sidecar.unrooted > 0
+        ? `${formatNumber(sidecar.unrooted)} ran with no cache attached — persistence off, or the tier never opened`
+        : 'not reached — dense families keep no state outside the pool'
+      : sidecar.stranded
+        ? 'nothing written and nothing on disk — no prefix can restore state'
+        : `${formatNumber(sidecar.written)} written · ${formatNumber(sidecar.persisted)} already on disk · ${formatNumber(sidecar.noAnchor)} found no anchor`;
+  const installsHint = sidecar.replayed
+    ? 'state was on disk and prefixes restored — every one re-derived by a full replay'
+    : sidecar.installed > 0
+      ? 'restored prefixes that reused family state instead of replaying it'
+      : 'no restored prefix carried family state in this window';
+
+  const usage = bytesTile(disk?.totalBytes);
+  const restored = bytesTile(loading ? undefined : totals.bytesRestored);
+  const hitRate = formatRate(totals.hits, lookups);
+  const oldest = disk?.oldestMtime ?? null;
+
   return (
-    <div className="space-y-1">
-      <p className="text-muted-foreground flex items-center gap-1.5 text-xs font-medium">
-        {Icon !== undefined && <Icon className={cn('size-3.5', alarm && 'text-destructive')} aria-hidden />}
-        {label}
-      </p>
-      {/*
-        The value keeps its own wrapper while loading rather than being replaced
-        by a bare bar, so the placeholder stands in the box the number will occupy
-        instead of one that merely looks similar: `1lh` resolves against this
-        element's own line-height, which is what `text-xl leading-none` sets. The
-        `h-6` bar it replaces was 4px taller than that line, and this card renders
-        eight of these in a two-row grid, so both rows and everything under them
-        stepped down when the request landed.
+    <Page busy={cache.loading || cache.refreshing}>
+      {header}
+      <DiskCacheLine scope={scope} />
+      {cache.error !== undefined ? (
+        <Alert tone="warning" title="Could not refresh">
+          <span className="grid justify-items-start gap-2">
+            <span>{`Showing data from ${formatClock(receivedAt)}.`}</span>
+            <Button variant="secondary" size="sm" onClick={cache.reload}>
+              Try again
+            </Button>
+          </span>
+        </Alert>
+      ) : null}
+      {scopeSentences.length > 0 ? (
+        <Alert tone="info" title="Some turns are not counted here">
+          {scopeSentences.join(' ')}
+        </Alert>
+      ) : null}
 
-        A `div` rather than the `<p>` it was, for the same reason StatTile's value
-        is one: a paragraph may not contain the bar's `div`, and under preflight
-        the two elements produce the identical box anyway.
-      */}
-      <div className={cn('text-xl leading-none font-semibold', alarm && 'text-destructive')}>
-        {loading ? <Skeleton className="h-[1lh] w-16" /> : value}
-      </div>
-      <p className="text-muted-foreground text-xs">{hint}</p>
-    </div>
-  );
-}
+      <StatGroup label="Cold cache">
+        <StatTile
+          label="Usage"
+          value={usage.value}
+          unit={usage.unit}
+          loading={loading}
+          held={held.held}
+          hint={`${quotaBytes > 0 ? `${formatPercent(quotaFraction)} of ${formatBytes(quotaBytes)} quota` : 'no quota available'} · ${formatBytes(blockBytes)} blocks + ${formatBytes(sidecarBytes)} sidecars`}
+          footer={
+            loading ? (
+              <Placeholder height={6} radius="pill" />
+            ) : quotaBytes > 0 ? (
+              <Meter
+                size="thin"
+                label={`Cold cache using ${formatBytes(totalBytes)} of ${formatBytes(quotaBytes)} quota`}
+                value={totalBytes}
+                max={quotaBytes}
+              />
+            ) : undefined
+          }
+        />
+        <StatTile
+          label="Objects"
+          value={loading ? null : formatCount(objects)}
+          loading={loading}
+          held={held.held}
+          hint={`${formatCount(blocks)} prefix ${plural(blocks, 'block', 'blocks')} · ${formatCount(sidecars)} state ${plural(sidecars, 'sidecar', 'sidecars')}`}
+        />
+        <StatTile
+          label="Hit rate"
+          value={hitRate === '—' ? null : hitRate}
+          loading={loading}
+          held={held.held}
+          hint={hitHint}
+        />
+        <StatTile
+          label="Bytes restored"
+          value={restored.value}
+          unit={restored.unit}
+          loading={loading}
+          held={held.held}
+          hint={`${formatBytes(totals.bytesWritten)} landed`}
+        />
+        <StatTile
+          label="Oldest object"
+          value={oldest === null ? null : formatRelativeTime(oldest)}
+          loading={loading}
+          held={held.held}
+          hint={disk?.newestMtime != null ? `newest ${formatRelativeTime(disk.newestMtime)}` : 'empty tier'}
+        />
+      </StatGroup>
 
-/** Usage-vs-quota bar with an accessible progressbar role. */
-function UsageMeter({
-  fraction,
-  totalBytes,
-  quotaBytes,
-}: {
-  fraction: number;
-  totalBytes: number;
-  quotaBytes: number;
-}) {
-  // Saturated exactly like the visible label, so the announced value can never
-  // say 100 while the tile reads `>99%`.
-  const pct = percentInt(fraction);
-  return (
-    <div
-      className="bg-secondary h-2 w-full overflow-hidden rounded-full"
-      role="progressbar"
-      aria-valuenow={pct}
-      aria-valuetext={formatPercent(fraction)}
-      aria-valuemin={0}
-      aria-valuemax={100}
-      aria-label={`Cold cache using ${formatBytes(totalBytes)} of ${formatBytes(quotaBytes)} quota`}
-    >
-      <div className="bg-primary h-full rounded-full" style={{ width: `${pct}%` }} />
-    </div>
+      <PageGrid>
+        <ChartCard
+          className="col-span-12 @md:col-span-7"
+          title="Objects by age"
+          height={200}
+          subtitle={`Prefix blocks and state sidecars · ${ageChart.unit}`}
+          state={chartState(objects === 0)}
+          empty={{ title: 'No cold-tier objects persisted yet.', hint: ageEmptyHint }}
+          actions={
+            <SegmentedControl
+              label="Measure"
+              options={MEASURE_OPTIONS}
+              value={measure}
+              onValueChange={(value) => {
+                if (value === 'objects' || value === 'bytes') setMeasure(value);
+              }}
+            />
+          }
+          footnote={`${formatCountNoun(objects, 'object', 'objects')} · ${formatBytes(totalBytes)}`}
+        >
+          <StackedBarChart
+            label="Objects by age"
+            unit={ageChart.unit}
+            data={ageChart.data}
+            series={KEPT_SERIES}
+            formatValue={measure === 'objects' ? formatNumber : undefined}
+            formatTick={measure === 'objects' ? formatCount : undefined}
+          />
+        </ChartCard>
+
+        <Panel
+          className="col-span-12 @md:col-span-5"
+          title="Manage cold cache"
+          description="Removes blocks and their state sidecars from disk. They are made again on demand; the next matching prompt pays full prefill once."
+        >
+          <div className="grid gap-3">
+            <div className="grid justify-items-start gap-1.5">
+              <span className="text-body text-secondary">Evict objects older than</span>
+              <SegmentedControl
+                label="Eviction age threshold"
+                options={EVICT_OPTIONS}
+                value={String(evictDays)}
+                onValueChange={(value) => {
+                  const days = evictDaysOf(value);
+                  if (days === null) return;
+                  setEvictDays(days);
+                  if (!loading) setAnnounced(previewOf(days));
+                }}
+              />
+            </div>
+            <p className="text-body tabular-nums">
+              <SwapText text={loading ? '' : previewText} granularity="char" />
+            </p>
+            <p className="sr-only" aria-live="polite">
+              {announced}
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <ConfirmPopover
+                trigger={{ kind: 'button', label: 'Evict older', variant: 'secondary' }}
+                align="start"
+                disabled={evictDisabled}
+                disabledReason={previewText}
+                {...evictContent(evictDays)}
+              />
+            </div>
+            <Rule />
+            <div className="flex flex-wrap items-center gap-2">
+              <ConfirmPopover
+                trigger={{ kind: 'button', label: 'Clear all', variant: 'danger' }}
+                align="start"
+                disabled={clearDisabled}
+                disabledReason={objects === 0 ? 'The tier is empty.' : undefined}
+                {...clearContent}
+              />
+              {!loading && objects === 0 ? <span className="text-body text-secondary">The tier is empty.</span> : null}
+            </div>
+          </div>
+        </Panel>
+
+        <ChartCard
+          className="col-span-12 @md:col-span-7"
+          title="Cache hit / miss trend"
+          height={200}
+          subtitle={
+            view === 'lookups'
+              ? `Lookups against this cache root, per day · last ${String(scope?.trendWindowDays ?? 30)} days`
+              : 'Hits ÷ lookups per day · % · axis does not start at 0'
+          }
+          state={chartState(lookupChart.inWindow === 0)}
+          empty={{ title: 'No hits or misses recorded for this cache.', hint: trendEmptyHint }}
+          actions={
+            <SegmentedControl
+              label="View"
+              options={VIEW_OPTIONS}
+              value={view}
+              onValueChange={(value) => {
+                if (value === 'lookups' || value === 'rate') setView(value);
+              }}
+            />
+          }
+          footnote={`${formatCountNoun(totals.hits, 'hit', 'hits', formatCount)} · ${formatCountNoun(totals.misses, 'miss', 'misses', formatCount)} · this cache only`}
+        >
+          {view === 'lookups' ? (
+            <StackedBarChart
+              label="Cache hit / miss trend"
+              unit="lookups"
+              data={lookupChart.lookupData}
+              series={LOOKUP_SERIES}
+              formatValue={formatNumber}
+              formatTick={formatCount}
+            />
+          ) : (
+            <TrendChart
+              label="Cache hit rate per day"
+              unit="%"
+              yMin="auto"
+              lowSampleBelow={5}
+              data={lookupChart.rateData}
+              series={[{ key: 'rate', label: 'Hit rate', color: 'var(--series-1)' }]}
+              formatValue={(value) => formatPercentValue(value / 100)}
+              formatTick={axisNumber}
+            />
+          )}
+        </ChartCard>
+
+        <ChartCard
+          className="col-span-12 @md:col-span-5"
+          title="Bytes written and restored"
+          height={200}
+          subtitle={`Per day · ${bytesChart.unit}`}
+          state={chartState(bytesChart.written + bytesChart.restored === 0)}
+          empty={{
+            title: 'Nothing written or restored yet',
+            hint: 'Bytes move when a prompt prefix is saved to disk or read back.',
+          }}
+          footnote={`${formatBytes(bytesChart.written)} written · ${formatBytes(bytesChart.restored)} restored`}
+        >
+          <StackedBarChart
+            label="Bytes written and restored"
+            unit={bytesChart.unit}
+            mode="grouped"
+            data={bytesChart.data}
+            series={BYTES_SERIES}
+          />
+        </ChartCard>
+
+        <Panel className="col-span-12" title="Cold-tier health">
+          <div className="grid gap-3">
+            <Disclosure title="How to read these counters">
+              <p className="max-w-[72ch] text-body text-secondary">{HEALTH_HELP}</p>
+            </Disclosure>
+            <StatGroup label="Cold-tier health">
+              <StatTile
+                label="Corruptions"
+                value={loading ? null : formatNumber(health?.corruptions ?? 0)}
+                loading={loading}
+                held={held.held}
+                hint={
+                  <Alarm on={corruptionsSeen}>
+                    {corruptionsSeen
+                      ? `cumulative max ${formatNumber(health?.corruptionsTotal ?? 0)} — investigate`
+                      : 'none seen (acceptance bar: 0)'}
+                  </Alarm>
+                }
+              />
+              <StatTile
+                label="Queue drops"
+                value={loading ? null : formatNumber(health?.queueDrops ?? 0)}
+                loading={loading}
+                held={held.held}
+                hint={
+                  <Alarm on={(health?.queueDropsTotal ?? 0) > 0}>
+                    {`cumulative max ${formatNumber(health?.queueDropsTotal ?? 0)} · ${formatNumber(health?.enqueued ?? 0)} objects enqueued · ${formatNumber(sidecar.written)} ${plural(sidecar.written, 'sidecar', 'sidecars')} among them, ${formatNumber(health?.sidecarQueueDrops ?? 0)} of the drops`}
+                  </Alarm>
+                }
+              />
+              <StatTile
+                label="Write errors"
+                value={loading ? null : formatNumber(health?.writeErrors ?? 0)}
+                loading={loading}
+                held={held.held}
+                hint={
+                  <Alarm on={writeErrorsSeen}>
+                    {writeErrorsSeen
+                      ? `cumulative max ${formatNumber(health?.writeErrorsTotal ?? 0)} — the cache root is refusing writes`
+                      : 'none seen (writes are landing)'}
+                  </Alarm>
+                }
+              />
+              <StatTile
+                label="Restore declines"
+                value={loading ? null : formatNumber(declines)}
+                loading={loading}
+                held={held.held}
+                hint="refused before lookup · not counted as a lookup"
+              />
+              <StatTile
+                label="Sidecar captures"
+                value={loading ? null : formatNumber(sidecar.captures)}
+                loading={loading}
+                held={held.held}
+                hint={<Alarm on={sidecar.stranded}>{capturesHint}</Alarm>}
+                footer={
+                  loading ? (
+                    <Placeholder height={6} radius="pill" />
+                  ) : sidecar.captures > 0 && !sidecar.stranded ? (
+                    <SplitBar
+                      size="dense"
+                      legend={false}
+                      label="Capture outcomes"
+                      total={sidecar.captures}
+                      segments={[
+                        { key: 'written', label: 'Written', value: sidecar.written, color: SERIES_A },
+                        { key: 'persisted', label: 'Already on disk', value: sidecar.persisted, color: SERIES_B },
+                        { key: 'noAnchor', label: 'No anchor', value: sidecar.noAnchor, color: 'var(--model-other)' },
+                      ]}
+                    />
+                  ) : undefined
+                }
+              />
+              <StatTile
+                label="Sidecar installs"
+                value={loading ? null : formatNumber(sidecar.installed)}
+                loading={loading}
+                held={held.held}
+                hint={<Alarm on={sidecar.replayed}>{installsHint}</Alarm>}
+              />
+              <StatTile
+                label="Evictions"
+                value={loading ? null : formatNumber(health?.evictions ?? 0)}
+                loading={loading}
+                held={held.held}
+                hint="objects removed by quota pressure"
+              />
+              <StatTile
+                label="Turns with the tier off"
+                value={loading ? null : formatNumber(scope?.disabledTurns ?? 0)}
+                loading={loading}
+                held={held.held}
+                hint="ran without a persistent cache"
+              />
+            </StatGroup>
+          </div>
+        </Panel>
+      </PageGrid>
+
+      {pending === null ? null : (
+        <ConfirmDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setPending(null);
+          }}
+          {...(pending.kind === 'evict' ? evictContent(pending.days) : clearContent)}
+        />
+      )}
+    </Page>
   );
 }
