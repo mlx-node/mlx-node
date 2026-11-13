@@ -284,8 +284,23 @@ async fn lfm2_paged_vs_flat_greedy_token_parity() {
                 "TEXT MISMATCH on prompt #{idx} ({prompt:?}). \
                  first_diff_byte={first_diff:?}\n\
                  FLAT  ({} tokens) text={:?}\n\
-                 PAGED ({} tokens) text={:?}",
-                r_flat.num_tokens, r_flat.text, r_paged.num_tokens, r_paged.text,
+                 PAGED ({} tokens) text={:?}\n\
+                 FLAT  reasoning_tokens={} prompt_tokens={} cached={} thinking={:?} raw_text={:?}\n\
+                 PAGED reasoning_tokens={} prompt_tokens={} cached={} thinking={:?} raw_text={:?}",
+                r_flat.num_tokens,
+                r_flat.text,
+                r_paged.num_tokens,
+                r_paged.text,
+                r_flat.reasoning_tokens,
+                r_flat.prompt_tokens,
+                r_flat.cached_tokens,
+                r_flat.thinking,
+                r_flat.raw_text,
+                r_paged.reasoning_tokens,
+                r_paged.prompt_tokens,
+                r_paged.cached_tokens,
+                r_paged.thinking,
+                r_paged.raw_text,
             );
         }
         assert_eq!(
