@@ -9,7 +9,18 @@ import { useArrivals } from '../chart/use-arrivals';
 import { useEntrance, useRichMotion } from '../motion/use-entrance';
 import styles from './span-timeline.module.css';
 
-export type SpanKind = 'queue' | 'first' | 'setup' | 'prefill' | 'decode' | 'wait' | 'load' | 'other';
+export type SpanKind =
+  | 'queue'
+  | 'busy'
+  | 'slot'
+  | 'prepare'
+  | 'first'
+  | 'setup'
+  | 'prefill'
+  | 'decode'
+  | 'wait'
+  | 'load'
+  | 'other';
 
 export interface TimelineRow {
   id: string;
@@ -68,6 +79,9 @@ const MAX_ROW_STEP = 4;
 
 const KIND_NAME: Record<SpanKind, string> = {
   queue: 'Queue',
+  busy: 'Model busy',
+  slot: 'Waiting for a slot',
+  prepare: 'Preparing',
   load: 'Loading the model',
   wait: 'Waiting for a model load',
   first: 'To first token',
@@ -76,7 +90,19 @@ const KIND_NAME: Record<SpanKind, string> = {
   decode: 'Decode',
   other: 'Other',
 };
-const KIND_ORDER: readonly SpanKind[] = ['queue', 'load', 'wait', 'first', 'setup', 'prefill', 'decode', 'other'];
+const KIND_ORDER: readonly SpanKind[] = [
+  'queue',
+  'load',
+  'wait',
+  'busy',
+  'slot',
+  'prepare',
+  'first',
+  'setup',
+  'prefill',
+  'decode',
+  'other',
+];
 
 interface Placed {
   span: TimelineSpan;

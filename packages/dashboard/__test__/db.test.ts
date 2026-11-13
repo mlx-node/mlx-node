@@ -185,7 +185,7 @@ describe('dashboard db', () => {
   // version ahead) is as unusable as an older one — an exact-match check must
   // reject it and rebuild, not open it blind.
   it('stores the measured prefill window and rebuilds an index stamped 9', () => {
-    expect(SCHEMA_VERSION).toBe(11);
+    expect(SCHEMA_VERSION).toBe(12);
     const d = mkdtempSync(join(tmpdir(), 'dash-prefill-'));
     const file = join(d, 'index.db');
     const seed = openDashboardDb(file);
@@ -571,7 +571,7 @@ describe('dashboard db', () => {
     // live schema via `fixtureTable`, so a new column lands in all of them at
     // once and each keeps exactly the one gap `expectFixtureGaps` pins.
     const uv = first.sqlite.prepare('PRAGMA user_version').get() as { user_version: number };
-    expect(uv.user_version).toBe(11);
+    expect(uv.user_version).toBe(12);
     first.close();
 
     // Reopening the rebuilt file validates in place: no second quarantine.

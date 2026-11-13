@@ -48,6 +48,8 @@
   --phase-decode: var(--model-3);
   --phase-tool: var(--model-4);
   --phase-wait: var(--model-5);
+  --phase-slot: var(--model-7);
+  --phase-prepare: var(--model-4);
   --hit: var(--model-6);
   --miss: var(--model-5);
   --chart-grid: var(--border-subtle);

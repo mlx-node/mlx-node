@@ -9,6 +9,7 @@ import {
   formatElapsed,
   liveOutcome,
   fullLimit,
+  loadFor,
   loadVariant,
   pendingRow,
   splitTurns,
@@ -166,6 +167,22 @@ describe('outcomes', () => {
     expect(fullLimit(at(250), 'qwen-a', 200)).toBeNull();
     expect(fullLimit(at(null), 'qwen-a', 200)).toBeNull();
     expect(fullLimit(at(100), 'qwen-a', null)).toBeNull();
+  });
+
+  it("a conversation shows its own model's load, else the oldest one", () => {
+    const load = (modelId: string, startedAt: number) => ({
+      modelId,
+      startedAt,
+      phase: 'kernels' as const,
+      stepsDone: 1,
+      steps: 2,
+    });
+    const loading = [load('a', 1), load('b', 2)];
+    expect(loadFor(loading, 'b')?.modelId).toBe('b');
+    expect(loadFor(loading, 'a')?.modelId).toBe('a');
+    expect(loadFor(loading, 'c')?.modelId).toBe('a');
+    expect(loadFor(loading, null)?.modelId).toBe('a');
+    expect(loadFor([], 'a')).toBeNull();
   });
 
   it('load card variant, clock text and the engine note under the end line', () => {

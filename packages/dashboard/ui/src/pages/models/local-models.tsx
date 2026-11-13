@@ -53,7 +53,7 @@ export function liveStateOf(model: Pick<LocalModel, 'name' | 'servedIds'>, live:
     for (const entry of process.models) {
       if (resident === undefined && matchesModel(model, entry.name)) resident = entry;
     }
-    if (process.loading !== null && matchesModel(model, process.loading.model)) loading = true;
+    if (process.loading.some((load) => matchesModel(model, load.model))) loading = true;
   }
   return { resident, loading };
 }

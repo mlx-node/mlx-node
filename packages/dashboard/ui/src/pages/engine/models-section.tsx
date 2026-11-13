@@ -40,8 +40,8 @@ export function ModelsSection({
   modelUrl: (name: string) => string;
 }): ReactElement {
   const rows: Row[] = process.models.map((model) => ({ kind: 'model', model }));
-  if (process.loading !== null)
-    rows.unshift({ kind: 'loading', name: process.loading.model, startedAt: process.loading.startedAt });
+  for (const load of [...process.loading].reverse())
+    rows.unshift({ kind: 'loading', name: load.model, startedAt: load.startedAt });
   const live = process.status === 'running';
 
   const columns: DataColumn<Row>[] = [

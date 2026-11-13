@@ -972,6 +972,7 @@ export function LiveTurnSection(): ReactElement {
         prefillTotal={31_000}
         generatedTokens={decoding ? (tick - 12) * 34 : null}
         promptTokens={31_000}
+        cachedTokens={0}
         ctxWindow={131_072}
       />
       <LiveTurnRow
@@ -984,6 +985,7 @@ export function LiveTurnSection(): ReactElement {
         prefillTotal={null}
         generatedTokens={1204 + tick * 41}
         promptTokens={3_900}
+        cachedTokens={0}
         ctxWindow={32_768}
       />
       {tick % 8 < 5 ? (
@@ -991,12 +993,13 @@ export function LiveTurnSection(): ReactElement {
           key="c"
           model="lfm2.5-8b"
           dispatchLabel="start"
-          phase="queued"
+          phase={tick % 8 < 2 ? 'queued' : tick % 8 < 3 ? 'slot' : 'prepare'}
           elapsedMs={1_000 + (tick % 8) * 1000}
           prefillDone={null}
           prefillTotal={null}
           generatedTokens={null}
           promptTokens={null}
+          cachedTokens={tick % 8 < 4 ? null : 19_456}
           ctxWindow={null}
         />
       ) : null}
@@ -1008,6 +1011,7 @@ export function LiveTurnSection(): ReactElement {
         prefillDone={null}
         prefillTotal={null}
         generatedTokens={null}
+        cachedTokens={null}
         promptTokens={2_000}
         ctxWindow={40_960}
         density="compact"

@@ -116,9 +116,15 @@ export interface TurnPhases {
   resolveMs: number;
   loadWaitMs: number;
   queueMs: number;
-  /** Time to first token of a turn without a prefill window; 0 when measured. */
+  /** The model was busy with other requests: before the time to first token. */
+  waitMs: number;
+  /** No lane or memory to start: inside the time to first token, or before the end of a turn that never had one. */
+  slotMs: number;
+  /** Prompt preparation before the prefill: placed as `slotMs`. */
+  prepareMs: number;
+  /** Time to first token of a turn without a prefill window, net of slot and prepare; 0 when measured. */
   firstTokenMs: number;
-  /** Time to first token outside the prefill window; 0 when not measured. */
+  /** Time to first token outside the prefill window, slot and prepare; 0 when not measured. */
   setupMs: number;
   /** The measured prefill window, capped at time to first token; 0 when not measured. */
   prefillMs: number;
@@ -142,15 +148,25 @@ export function turnPhases(row: TurnRow): TurnPhases {
   const ttft = nonNegative(row.ttftMs);
   const lead = Math.min(ttft > 0 ? ttft : measured ? nonNegative(row.prefillMs) : 0, dur);
   const prefillMs = measured ? Math.min(nonNegative(row.prefillMs), lead) : 0;
-  const setupMs = measured ? lead - prefillMs : 0;
-  const firstTokenMs = measured ? 0 : lead;
-  const decodeMs = Math.min(nonNegative(row.decodeMs), dur - lead);
-  const tailMs = dur - lead - decodeMs;
+  const waitMs = Math.min(nonNegative(row.waitMs), dur - lead);
+  const decodeMs = Math.min(nonNegative(row.decodeMs), dur - lead - waitMs);
+  // A turn with no first token has no lead: its slot and prepare time sits in the rest of the duration.
+  const inLead = lead > 0;
+  const room = inLead ? lead - prefillMs : dur - waitMs - decodeMs;
+  const slotMs = Math.min(nonNegative(row.slotMs), room);
+  const prepareMs = Math.min(nonNegative(row.prepareMs), room - slotMs);
+  const beforePrefill = inLead ? slotMs + prepareMs : 0;
+  const setupMs = measured ? lead - prefillMs - beforePrefill : 0;
+  const firstTokenMs = measured ? 0 : lead - beforePrefill;
+  const tailMs = dur - lead - waitMs - decodeMs - (inLead ? 0 : slotMs + prepareMs);
   return {
     handlingMs,
     resolveMs,
     loadWaitMs,
     queueMs,
+    waitMs,
+    slotMs,
+    prepareMs,
     firstTokenMs,
     setupMs,
     prefillMs,
@@ -165,6 +181,9 @@ export const PHASES: ReadonlyArray<{ key: string; label: string; color: string; 
   { key: 'queue', label: 'Queue', color: 'var(--phase-queue)', pattern: 'hatch' },
   { key: 'loadWait', label: 'Waiting for a model load', color: 'var(--phase-wait)', pattern: 'hatch' },
   { key: 'resolve', label: 'Loading the model', color: 'var(--phase-wait)', pattern: 'solid' },
+  { key: 'wait', label: 'Model busy', color: 'var(--phase-queue)', pattern: 'solid' },
+  { key: 'slot', label: 'Waiting for a slot', color: 'var(--phase-slot)', pattern: 'hatch' },
+  { key: 'prepare', label: 'Preparing', color: 'var(--phase-prepare)', pattern: 'solid' },
   { key: 'first', label: 'To first token', color: 'var(--phase-prefill)', pattern: 'hatch' },
   { key: 'setup', label: 'Setup', color: 'var(--phase-setup)', pattern: 'solid' },
   { key: 'prefill', label: 'Prefill', color: 'var(--phase-prefill)', pattern: 'solid' },
@@ -184,10 +203,13 @@ function isTotals(value: TurnPhases | MetricsTotals): value is MetricsTotals {
   return 'totalWallMs' in value;
 }
 
+/** Phases a record may lack: left out of a bar at 0, so a record from an older engine shows no empty part. */
+const OPTIONAL_PHASES: ReadonlySet<string> = new Set(['first', 'wait', 'slot', 'prepare']);
+
 /**
- * Segments for a SplitBar: handling and tail are merged into `other`. `first`
- * is left out at 0; `setup` and `prefill` are left out when both are 0 and
- * `first` is not.
+ * Segments for a SplitBar: handling and tail are merged into `other`. `first`,
+ * `wait`, `slot` and `prepare` are left out at 0; `setup` and `prefill` are
+ * left out when both are 0 and `first` is not.
  */
 export function phaseSegments(phases: TurnPhases | MetricsTotals): BarSegment[] {
   const values: Record<string, number> = isTotals(phases)
@@ -195,6 +217,9 @@ export function phaseSegments(phases: TurnPhases | MetricsTotals): BarSegment[] 
         queue: phases.queueWallMs,
         loadWait: phases.loadWaitWallMs,
         resolve: phases.resolveWallMs,
+        wait: phases.waitWallMs,
+        slot: phases.slotWallMs,
+        prepare: phases.prepareWallMs,
         first: phases.firstTokenWallMs,
         setup: phases.setupWallMs,
         prefill: phases.prefillWallMs,
@@ -205,6 +230,9 @@ export function phaseSegments(phases: TurnPhases | MetricsTotals): BarSegment[] 
         queue: phases.queueMs,
         loadWait: phases.loadWaitMs,
         resolve: phases.resolveMs,
+        wait: phases.waitMs,
+        slot: phases.slotMs,
+        prepare: phases.prepareMs,
         first: phases.firstTokenMs,
         setup: phases.setupMs,
         prefill: phases.prefillMs,
@@ -214,7 +242,7 @@ export function phaseSegments(phases: TurnPhases | MetricsTotals): BarSegment[] 
   const value = (key: string): number => nonNegative(values[key]);
   const unsplitOnly = value('first') > 0 && value('setup') === 0 && value('prefill') === 0;
   return PHASES.filter((phase) => {
-    if (phase.key === 'first') return value('first') > 0;
+    if (OPTIONAL_PHASES.has(phase.key)) return value(phase.key) > 0;
     if (phase.key === 'setup' || phase.key === 'prefill') return !unsplitOnly;
     return true;
   }).map((phase) => ({
@@ -237,6 +265,9 @@ export function phaseMeans(points: readonly TsPoint[], range: AlignedRange): Cha
       queue: mean((t) => t.queueWallMs),
       loadWait: mean((t) => t.loadWaitWallMs),
       resolve: mean((t) => t.resolveWallMs),
+      wait: mean((t) => t.waitWallMs),
+      slot: mean((t) => t.slotWallMs),
+      prepare: mean((t) => t.prepareWallMs),
       first: mean((t) => t.firstTokenWallMs),
       setup: mean((t) => t.setupWallMs),
       prefill: mean((t) => t.prefillWallMs),
@@ -255,7 +286,9 @@ export function phaseMeans(points: readonly TsPoint[], range: AlignedRange): Cha
 }
 
 const FAIL_PHASE_TEXT: Record<string, string> = {
-  queued: 'while queued',
+  queued: 'while waiting',
+  slot: 'while waiting for a slot',
+  prepare: 'while preparing',
   prefill: 'during prefill',
   decode: 'during decode',
 };
@@ -295,6 +328,9 @@ const SPAN_LABEL = {
   resolve: 'Loading the model',
   loadWait: 'Waiting for a model load',
   queue: 'Queue',
+  wait: 'Model busy',
+  slot: 'Waiting for a slot',
+  prepare: 'Preparing',
   first: 'To first token',
   setup: 'Setup',
   prefill: 'Prefill',
@@ -314,6 +350,7 @@ export function turnTimeline(row: TurnRow): {
   const rowId = 'turn';
   const rows: TimelineRow[] = [{ id: rowId, label: 'Turn' }];
   const stop = row.outcome === 'ok' ? null : row.failPhase;
+  const beforePrefill = stop === 'queued' || stop === 'slot' || stop === 'prepare';
   const spans: TimelineSpan[] = [];
   let at = 0;
   const push = (
@@ -341,10 +378,22 @@ export function turnTimeline(row: TurnRow): {
   push('resolve', 'load', phases.resolveMs, true);
   push('loadWait', 'wait', phases.loadWaitMs, true);
   push('queue', 'queue', phases.queueMs, true);
-  if (stop !== 'queued') {
+  push('wait', 'busy', phases.waitMs, false, [{ label: 'Waiting for', value: 'other requests on this model' }]);
+  push('slot', 'slot', phases.slotMs, false, [{ label: 'Waiting for', value: 'a free lane or memory' }]);
+  push('prepare', 'prepare', phases.prepareMs, false, [
+    { label: 'Cached tokens', value: formatNumber(row.cachedTokens) },
+    { label: 'Work', value: 'prompt, prefix match, cache restore' },
+  ]);
+  if (!beforePrefill) {
     if (row.prefillMs !== null) {
       push('setup', 'setup', phases.setupMs, true, [
-        { label: 'Before prefill', value: 'prefix lookup, cache restore, allocation' },
+        {
+          label: 'Before prefill',
+          value:
+            row.prepareMs !== null && row.prepareMs > 0
+              ? 'other requests on this model'
+              : 'prefix lookup, cache restore, allocation',
+        },
         { label: 'After prefill', value: 'first decode step' },
       ]);
       push('prefill', 'prefill', phases.prefillMs, false, [
@@ -375,12 +424,19 @@ export function turnTimeline(row: TurnRow): {
     spans[spans.length - 1] = { ...last, status: row.outcome };
   }
   const markers: TimelineMarker[] =
-    row.ttftMs !== null && stop !== 'queued'
+    row.ttftMs !== null && !beforePrefill
       ? [
           {
             id: 'first-token',
             rowId,
-            atMs: pre + phases.setupMs + phases.prefillMs + phases.firstTokenMs,
+            atMs:
+              pre +
+              phases.waitMs +
+              phases.slotMs +
+              phases.prepareMs +
+              phases.setupMs +
+              phases.prefillMs +
+              phases.firstTokenMs,
             label: 'First token',
           },
         ]

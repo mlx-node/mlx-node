@@ -60,6 +60,7 @@ export function TurnRowFor({
       prefillTotal={turn.prefillTotal}
       generatedTokens={turn.generatedTokens}
       promptTokens={turn.promptTokens}
+      cachedTokens={turn.cachedTokens}
       ctxWindow={turn.ctxWindow}
       dispatchLabel={dispatchWord(turn.dispatch)}
       density={density}
@@ -78,6 +79,7 @@ export function FlightSection({ process, now }: { process: RuntimeProcessLive; n
     prefillTotal: turn.prefillTotal,
     generatedTokens: turn.generatedTokens,
     promptTokens: turn.promptTokens,
+    cachedTokens: turn.cachedTokens,
     ctxWindow: turn.ctxWindow,
     live,
   });
@@ -106,7 +108,7 @@ export function FlightSection({ process, now }: { process: RuntimeProcessLive; n
         );
       },
     },
-    { id: 'phase', header: 'Phase', width: 100, cell: (turn) => <PhaseBadge phase={turn.phase} live={live} /> },
+    { id: 'phase', header: 'Phase', width: 116, cell: (turn) => <PhaseBadge phase={turn.phase} live={live} /> },
     {
       id: 'progress',
       header: 'Progress',

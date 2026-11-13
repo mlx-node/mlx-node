@@ -96,7 +96,7 @@ export function hostModel(id: string, contextTokens: number | null): ChatHostSta
 
 export const READY_CHAT_HOST: ChatHostState = {
   inference: 'ready',
-  loading: null,
+  loading: [],
   resident: [],
   answers: [],
   models: [hostModel('qwen3.5-4b', 32768)],

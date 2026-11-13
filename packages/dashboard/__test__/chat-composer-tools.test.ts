@@ -13,7 +13,7 @@ import { hostModel, READY_CHAT_HOST } from './render.js';
 const MODELS = ['alpha', 'bravo', 'charlie', 'delta'].map((id) => hostModel(id, 32768));
 
 function host(over: Partial<ChatHostState>): ChatHostState {
-  return { ...READY_CHAT_HOST, models: MODELS, resident: [], loading: null, defaultModelId: 'alpha', ...over };
+  return { ...READY_CHAT_HOST, models: MODELS, resident: [], loading: [], defaultModelId: 'alpha', ...over };
 }
 
 describe('startModel', () => {
@@ -24,7 +24,12 @@ describe('startModel', () => {
   });
 
   it('with no model in memory: the model in load, then the stored choice, then the default, then the first', () => {
-    expect(startModel(host({ loading: { modelId: 'delta', startedAt: 1 } }), 'bravo')).toBe('delta');
+    expect(
+      startModel(
+        host({ loading: [{ modelId: 'delta', startedAt: 1, phase: 'weights', stepsDone: 0, steps: 0 }] }),
+        'bravo',
+      ),
+    ).toBe('delta');
     expect(startModel(host({}), 'bravo')).toBe('bravo');
     expect(startModel(host({ defaultModelId: 'charlie' }), 'gone')).toBe('charlie');
     expect(startModel(host({ defaultModelId: null }), null)).toBe('alpha');
@@ -88,7 +93,9 @@ describe('modelBases', () => {
   });
 
   it('in memory first, then in load, then the rest, in both lists; a base takes its best state', () => {
-    const rows = bases({ loading: { modelId: FLASH.id, startedAt: 1 } }, [BF16.id]);
+    const rows = bases({ loading: [{ modelId: FLASH.id, startedAt: 1, phase: 'weights', stepsDone: 0, steps: 0 }] }, [
+      BF16.id,
+    ]);
     expect(rows.map((row) => [row.base, row.state])).toEqual([
       ['Qwen3.8-27B', 'loaded'],
       ['Qwen3.8-Flash-Next', 'loading'],
@@ -103,7 +110,9 @@ describe('modelBases', () => {
   });
 
   it('a base with a loaded and a loading variant says loading and names the one in load', () => {
-    const rows = bases({ loading: { modelId: M.id, startedAt: 1 } }, [XL.id]);
+    const rows = bases({ loading: [{ modelId: M.id, startedAt: 1, phase: 'weights', stepsDone: 0, steps: 0 }] }, [
+      XL.id,
+    ]);
     const qwen = rows[0]!;
     expect(qwen.base).toBe('Qwen3.8-27B');
     expect(qwen.state).toBe('loading');
@@ -155,7 +164,9 @@ describe('modelBases', () => {
 
   it('preselect: the conversation model, then in memory, then in load, then the last picked, then the smallest', () => {
     const qwen = (rows: ReturnType<typeof bases>) => rows.find((row) => row.base === 'Qwen3.8-27B')!.preselect;
-    const loading = { loading: { modelId: BF16.id, startedAt: 1 } };
+    const loading = {
+      loading: [{ modelId: BF16.id, startedAt: 1, phase: 'weights' as const, stepsDone: 0, steps: 0 }],
+    };
     const picked = { 'qwen3.8-27b': XL.id };
     expect(qwen(bases(loading, [M.id], BF16.id, picked))).toBe(BF16.id);
     expect(qwen(bases(loading, [M.id], AGENTS.id, picked))).toBe(M.id);

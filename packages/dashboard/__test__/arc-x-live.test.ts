@@ -194,6 +194,7 @@ const BASE: LiveTurnRowProps = {
   prefillTotal: null,
   generatedTokens: 1204,
   promptTokens: 3000,
+  cachedTokens: null,
   ctxWindow: 32_000,
 };
 
@@ -212,7 +213,12 @@ describe('LiveTurnRow', () => {
       ],
       [{ phase: 'decode' }, 'Decode', '1,204 tokens out'],
       [{ phase: 'decode', generatedTokens: 1 }, 'Decode', '1 token out'],
-      [{ phase: 'queued' }, 'Queued', 'waiting for a slot'],
+      [{ phase: 'queued' }, 'Waiting', 'model busy'],
+      [{ phase: 'slot' }, 'Queued', 'waiting for a slot'],
+      [{ phase: 'prepare', cachedTokens: 19_456 }, 'Preparing', 'restoring 19,456 cached tokens'],
+      [{ phase: 'prepare', cachedTokens: 1 }, 'Preparing', 'restoring 1 cached token'],
+      [{ phase: 'prepare', cachedTokens: 0 }, 'Preparing', 'reading the prompt'],
+      [{ phase: 'prepare' }, 'Preparing', 'reading the prompt'],
       [{ phase: null }, 'Running', 'no progress for non-streamed turns'],
     ];
     for (const [patch, word, progress] of cases) {
@@ -228,6 +234,29 @@ describe('LiveTurnRow', () => {
       expect(row.getAttribute('aria-label')).toContain(`${word.toLowerCase()}, ${progress}`);
       document.body.innerHTML = '';
     }
+  });
+
+  it('says "waiting for a slot" only for a turn the scheduler could not start', () => {
+    const phases: LiveTurnRowProps['phase'][] = ['queued', 'slot', 'prepare', 'prefill', 'decode', null];
+    const slotted = phases.filter((phase) => {
+      const { container } = mount(
+        createElement(LiveTurnList, {
+          label: 'In flight',
+          children: createElement(LiveTurnRow, { ...BASE, phase, cachedTokens: 900, prefillDone: 1, prefillTotal: 2 }),
+        }),
+      );
+      const text = rowOf(container).textContent ?? '';
+      document.body.innerHTML = '';
+      return text.includes('waiting for a slot');
+    });
+    expect(slotted).toEqual(['slot']);
+  });
+
+  it('each waiting phase has its own key color', () => {
+    const rules = cssRules('components/arc-x/live-turn-row/live-turn-row.module.css');
+    expect(cssValue(rules, '.key', 'background')).toBe('var(--phase-queue)');
+    expect(cssValue(rules, ".key[data-phase='slot']", 'background')).toBe('var(--phase-slot)');
+    expect(cssValue(rules, ".key[data-phase='prepare']", 'background')).toBe('var(--phase-prepare)');
   });
 
   it('shows — for the context when the window is unknown', () => {

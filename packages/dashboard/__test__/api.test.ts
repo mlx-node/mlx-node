@@ -575,12 +575,47 @@ describe('dashboard api — metrics', () => {
         outputTokens: 101,
         decodeTps: 100,
       },
+      {
+        traceId: 'busy',
+        ts: at + 5,
+        durationMs: 79_700,
+        ttftMs: 2_600,
+        prefillMs: 500,
+        prefillTokens: 1000,
+        waitMs: 75_070,
+        slotMs: 300,
+        prepareMs: 1_200,
+        outputTokens: 101,
+        decodeTps: 50,
+      },
+      {
+        traceId: 'cut-in-prepare',
+        ts: at + 6,
+        outcome: 'cancelled',
+        failPhase: 'prepare',
+        durationMs: 5_000,
+        waitMs: 1_000,
+        slotMs: 3_000,
+        prepareMs: 9_000,
+      },
+      {
+        traceId: 'busy-long-decode',
+        ts: at + 7,
+        durationMs: 10_000,
+        ttftMs: 1_000,
+        waitMs: 5_000,
+        outputTokens: 1001,
+        decodeTps: 100,
+      },
     ]);
     await ingest();
     const phaseSum = (t: MetricsTotals): number =>
       t.queueWallMs +
       t.loadWaitWallMs +
       t.resolveWallMs +
+      t.waitWallMs +
+      t.slotWallMs +
+      t.prepareWallMs +
       t.firstTokenWallMs +
       t.setupWallMs +
       t.prefillWallMs +
@@ -595,13 +630,16 @@ describe('dashboard api — metrics', () => {
     }
 
     const turns = await get<{ rows: TurnRow[] }>('/api/metrics/turns');
-    expect(turns.rows).toHaveLength(5);
+    expect(turns.rows).toHaveLength(8);
     const rowSum = (pick: (p: ReturnType<typeof turnPhases>) => number): number =>
       turns.rows.reduce((sum, row) => sum + pick(turnPhases(row)), 0);
     expect(summary.totals).toMatchObject({
       queueWallMs: rowSum((p) => p.queueMs),
       loadWaitWallMs: rowSum((p) => p.loadWaitMs),
       resolveWallMs: rowSum((p) => p.resolveMs),
+      waitWallMs: rowSum((p) => p.waitMs),
+      slotWallMs: rowSum((p) => p.slotMs),
+      prepareWallMs: rowSum((p) => p.prepareMs),
       firstTokenWallMs: rowSum((p) => p.firstTokenMs),
       setupWallMs: rowSum((p) => p.setupMs),
       prefillWallMs: rowSum((p) => p.prefillMs),
@@ -612,6 +650,14 @@ describe('dashboard api — metrics', () => {
       rowSum((p) => p.decodeMs),
       6,
     );
+    const byId = new Map(turns.rows.map((row) => [row.traceId, turnPhases(row)]));
+    expect(byId.get('busy')).toMatchObject({ waitMs: 75_070, slotMs: 300, prepareMs: 1_200, setupMs: 600 });
+    expect(byId.get('cut-in-prepare')).toMatchObject({ waitMs: 1_000, slotMs: 3_000, prepareMs: 1_000, tailMs: 0 });
+    expect(byId.get('busy-long-decode')).toMatchObject({ waitMs: 5_000, decodeMs: 4_000, tailMs: 0 });
+    expect(turns.rows.find((row) => row.traceId === 'busy')?.setupMs).toBe(600);
+    for (const row of turns.rows) {
+      if (row.setupMs !== null) expect(row.setupMs).toBeCloseTo(turnPhases(row).setupMs, 6);
+    }
 
     writeTurns('2026-07-10-8.jsonl', [
       {

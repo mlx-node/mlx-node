@@ -60,8 +60,6 @@ const MEASURED = 'prefill_ms > 0 AND prefill_tokens > 0';
 export const PREFILL_MEASURED_SQL = MEASURED;
 /** Prefill tokens ÷ prefill window, rated rows only. */
 export const PREFILL_TPS_SQL = `CASE WHEN prefill_ms > 0 AND prefill_tokens >= ${String(PREFILL_MIN_TOKENS)} THEN prefill_tokens * 1000.0 / prefill_ms END`;
-/** Time to first token outside the window. */
-export const SETUP_MS_SQL = `CASE WHEN ${MEASURED} AND ttft_ms IS NOT NULL THEN MAX(ttft_ms - prefill_ms, 0) END`;
 
 const nonNegative = (sql: string): string => `MAX(COALESCE(${sql}, 0), 0)`;
 const PRE = nonNegative('pre_dispatch_ms');
@@ -72,6 +70,16 @@ const RESOLVE = `MIN(${nonNegative('resolve_ms')}, ${PRE} - ${QUEUE} - ${LOAD_WA
 const TTFT = nonNegative('ttft_ms');
 const LEAD = `MIN(CASE WHEN ${TTFT} > 0 THEN ${TTFT} WHEN ${MEASURED} THEN ${nonNegative('prefill_ms')} ELSE 0 END, ${DUR})`;
 const PREFILL = `CASE WHEN ${MEASURED} THEN MIN(${nonNegative('prefill_ms')}, ${LEAD}) ELSE 0 END`;
+const WAIT = `MIN(${nonNegative('wait_ms')}, ${DUR} - ${LEAD})`;
+const DECODE = `MIN(${nonNegative(DECODE_WALL_SQL)}, ${DUR} - ${LEAD} - ${WAIT})`;
+/** Slot and prepare sit in the time to first token; a turn that never had one keeps them in the rest of its duration. */
+const ROOM = `CASE WHEN ${LEAD} > 0 THEN ${LEAD} - ${PREFILL} ELSE ${DUR} - ${WAIT} - ${DECODE} END`;
+const SLOT = `MIN(${nonNegative('slot_ms')}, ${ROOM})`;
+const PREPARE = `MIN(${nonNegative('prepare_ms')}, ${ROOM} - ${SLOT})`;
+const BEFORE_PREFILL = `CASE WHEN ${LEAD} > 0 THEN ${SLOT} + ${PREPARE} ELSE 0 END`;
+
+/** Time to first token outside the window, slot and prepare: the `setup` phase of a row that has a first token. */
+export const SETUP_MS_SQL = `CASE WHEN ${MEASURED} AND ttft_ms IS NOT NULL THEN ${LEAD} - ${PREFILL} - ${BEFORE_PREFILL} END`;
 
 /**
  * One row's phases bounded as `turnPhases` bounds them: admission phases within the pre-dispatch time, the rest
@@ -81,10 +89,13 @@ export const PHASE_SQL = {
   queue: QUEUE,
   loadWait: LOAD_WAIT,
   resolve: RESOLVE,
-  firstToken: `CASE WHEN ${MEASURED} THEN 0 ELSE ${LEAD} END`,
-  setup: `CASE WHEN ${MEASURED} THEN ${LEAD} - ${PREFILL} ELSE 0 END`,
+  wait: WAIT,
+  slot: SLOT,
+  prepare: PREPARE,
+  firstToken: `CASE WHEN ${MEASURED} THEN 0 ELSE ${LEAD} - ${BEFORE_PREFILL} END`,
+  setup: `CASE WHEN ${MEASURED} THEN ${LEAD} - ${PREFILL} - ${BEFORE_PREFILL} ELSE 0 END`,
   prefill: PREFILL,
-  decode: `MIN(${nonNegative(DECODE_WALL_SQL)}, ${DUR} - ${LEAD})`,
+  decode: DECODE,
 } as const;
 /** Pre-dispatch time plus duration, each read as 0 when missing or negative. */
 export const PHASE_TOTAL_SQL = `${PRE} + ${DUR}`;

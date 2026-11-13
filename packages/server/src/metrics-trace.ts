@@ -83,13 +83,14 @@ export type ColdDeltaField = (typeof COLD_DELTA_FIELDS)[number];
 
 export type TurnOutcome = 'ok' | 'error' | 'cancelled';
 export type TurnErrorKind = 'finish_error' | 'exception';
-export type TurnFailPhase = 'queued' | 'prefill' | 'decode';
+export type TurnFailPhase = 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode';
 export type TurnEndpoint = 'messages' | 'responses' | 'other';
 export type TurnDispatch = 'start' | 'continue' | 'continue_tool';
 
 export const TURN_OUTCOMES: readonly TurnOutcome[] = ['ok', 'error', 'cancelled'];
 export const TURN_ERROR_KINDS: readonly TurnErrorKind[] = ['finish_error', 'exception'];
-export const TURN_FAIL_PHASES: readonly TurnFailPhase[] = ['queued', 'prefill', 'decode'];
+/** The phases of a running native turn, in order; `done` is left out. */
+export const TURN_FAIL_PHASES: readonly TurnFailPhase[] = ['queued', 'slot', 'prepare', 'prefill', 'decode'];
 export const TURN_ENDPOINTS: readonly TurnEndpoint[] = ['messages', 'responses', 'other'];
 export const TURN_DISPATCHES: readonly TurnDispatch[] = ['start', 'continue', 'continue_tool'];
 
@@ -137,6 +138,12 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
   resolveMs?: number;
   /** Handler start → dispatch. Includes `queueMs`, `loadWaitMs` and `resolveMs`. */
   preDispatchMs?: number;
+  /** Native: creation → the model thread picked the turn up. Outside `ttftMs`. Streamed turns of a native that reports it. */
+  waitMs?: number;
+  /** Native: time the scheduler could not start the turn (lanes or memory). Inside `ttftMs`. */
+  slotMs?: number;
+  /** Native: render, prefix match, cache restore and GDN replay before the prefill. Inside `ttftMs`. */
+  prepareMs?: number;
 
   /** Always present when outcome is `ok`. Best effort otherwise. */
   promptTokens?: number;
@@ -178,6 +185,14 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
   memActiveBytes?: number;
   /** MLX process high-water mark at turn end. Not a per-turn peak. */
   memPeakBytes?: number;
+
+  /**
+   * GPU pipelines the process created while serving, between this turn's begin and end. Process-wide, so
+   * overlapping turns share them. Absent when the native counter is off.
+   */
+  pipelinesCreated?: number;
+  /** Time spent creating those pipelines. Written with `pipelinesCreated`. */
+  pipelineCreateMs?: number;
 
   /** Cold-tier restore hits accrued this turn (synchronous counter — exact). */
   coldHits?: number;
@@ -467,7 +482,16 @@ export class MetricsTrace {
         const failPhase = enumOf(rec.failPhase, TURN_FAIL_PHASES);
         if (failPhase !== undefined) out.failPhase = failPhase;
       }
-      for (const key of ['queueMs', 'loadWaitMs', 'resolveMs', 'preDispatchMs', 'ttftMs'] as const) {
+      for (const key of [
+        'queueMs',
+        'loadWaitMs',
+        'resolveMs',
+        'preDispatchMs',
+        'ttftMs',
+        'waitMs',
+        'slotMs',
+        'prepareMs',
+      ] as const) {
         const value = nonNeg(rec[key]);
         if (value !== undefined) out[key] = value;
       }
@@ -501,6 +525,12 @@ export class MetricsTrace {
       ] as const) {
         const value = nonNeg(rec[key]);
         if (value !== undefined) out[key] = value;
+      }
+      const pipelinesCreated = nonNegInt(rec.pipelinesCreated);
+      const pipelineCreateMs = nonNeg(rec.pipelineCreateMs);
+      if (pipelinesCreated !== undefined && pipelineCreateMs !== undefined) {
+        out.pipelinesCreated = pipelinesCreated;
+        out.pipelineCreateMs = pipelineCreateMs;
       }
       const mtpAcceptByPos = rateList(rec.mtpAcceptByPos);
       if (mtpAcceptByPos !== undefined) out.mtpAcceptByPos = mtpAcceptByPos;

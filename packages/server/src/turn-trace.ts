@@ -62,6 +62,7 @@ import {
   type TurnErrorKind,
   type TurnFailPhase,
 } from './metrics-trace.js';
+import { readPipelineStats, type PipelineStats, type TurnProgressSnapshot } from './native-progress.js';
 import type { MeasuredPrefill } from './timing.js';
 
 /** Read the process-wide cold-tier snapshot; the native addon may be absent (unit tests). */
@@ -162,24 +163,29 @@ export interface LiveTurn {
   startedAt: number;
   stream: boolean;
   dispatch: TurnDispatch;
-  progress: ChatStreamProgress | null;
+  progress: TurnProgressSnapshot | null;
 }
 
 /**
  * Where a failed stream stopped. Native sets the phase to `done` BEFORE it
  * sends an error or the terminal chunk, so on `done` the surviving timers say
- * how far the turn got.
+ * how far the turn got. Before a prefill, time in `slot` wins over time in
+ * `prepare`: only a lane or memory wait puts a turn in `slot`, and the
+ * scheduler's own refusal comes from there, while every scheduled turn spends
+ * some time in `prepare`.
  */
-export function failPhaseOf(snap: ChatStreamProgress | null): TurnFailPhase | undefined {
+export function failPhaseOf(snap: TurnProgressSnapshot | null): TurnFailPhase | undefined {
   if (snap === null) return undefined;
-  if (snap.phase === 'queued' || snap.phase === 'prefill' || snap.phase === 'decode') return snap.phase;
+  if (snap.phase !== 'done') return snap.phase;
   if (snap.decodeElapsedMs !== undefined) return 'decode';
   if (snap.prefillElapsedMs !== undefined) return 'prefill';
+  if (snap.slotMs !== undefined && snap.slotMs > 0) return 'slot';
+  if (snap.prepareMs !== undefined && snap.prepareMs > 0) return 'prepare';
   return 'queued';
 }
 
 /** The frozen prefill window of a finished stream, or undefined when native did not measure one. */
-export function measuredPrefillOf(snap: ChatStreamProgress | null | undefined): MeasuredPrefill | undefined {
+export function measuredPrefillOf(snap: TurnProgressSnapshot | null | undefined): MeasuredPrefill | undefined {
   if (snap === null || snap === undefined) return undefined;
   const tokens = snap.prefillTotal;
   const ms = snap.prefillElapsedMs;
@@ -280,6 +286,8 @@ export interface TurnTraceDeps {
   ctxWindow?: number;
   /** Memory reader for the turn-end snapshot; defaults to the native addon. */
   memory?: () => { activeBytes: number; peakBytes: number } | undefined;
+  /** Process-wide pipeline counter; defaults to the native addon. Null while the counter is off. */
+  pipelineStats?: () => PipelineStats | null;
 }
 
 /**
@@ -338,6 +346,8 @@ interface TurnContext {
   progress: TraceControl | null;
   /** Generated tokens already added to the process counter. */
   creditedTokens: number;
+  /** The pipeline counter at dispatch; null while it is off. */
+  pipelines: PipelineStats | null;
 }
 
 /**
@@ -488,7 +498,7 @@ export class TurnTraceModel implements SessionCapableModel {
   liveTurns(): LiveTurn[] {
     const out: LiveTurn[] = [];
     for (const ctx of this.liveCtx) {
-      let progress: ChatStreamProgress | null = null;
+      let progress: TurnProgressSnapshot | null = null;
       try {
         progress = ctx.progress?.read?.() ?? null;
       } catch {
@@ -582,6 +592,7 @@ export class TurnTraceModel implements SessionCapableModel {
       signal,
       progress: stream ? new TraceControl(outerControl) : null,
       creditedTokens: 0,
+      pipelines: this.pipelineStats(),
     };
     (marks.live ??= new Set()).add(ctx);
     this.liveCtx.add(ctx);
@@ -596,8 +607,16 @@ export class TurnTraceModel implements SessionCapableModel {
     return ctx;
   }
 
-  /** The fields every outcome shares: identity, timing, counts, overlap, memory. */
-  private baseRecord(ctx: TurnContext): MetricsTraceInput {
+  private pipelineStats(): PipelineStats | null {
+    try {
+      return (this.deps.pipelineStats ?? readPipelineStats)();
+    } catch {
+      return null;
+    }
+  }
+
+  /** The fields every outcome shares: identity, timing, counts, overlap, memory, phase timers, pipelines. */
+  private baseRecord(ctx: TurnContext, snap: TurnProgressSnapshot | null): MetricsTraceInput {
     const now = this.now();
     const identity = this.deps.identity;
     const meta = ctx.meta;
@@ -634,6 +653,17 @@ export class TurnTraceModel implements SessionCapableModel {
       rec.memActiveBytes = memory.activeBytes;
       rec.memPeakBytes = memory.peakBytes;
     }
+    if (snap !== null) {
+      rec.waitMs = snap.waitMs;
+      rec.slotMs = snap.slotMs;
+      rec.prepareMs = snap.prepareMs;
+    }
+    const begin = ctx.pipelines;
+    const end = begin === null ? null : this.pipelineStats();
+    if (begin !== null && end !== null && end.createdServing >= begin.createdServing) {
+      rec.pipelinesCreated = end.createdServing - begin.createdServing;
+      rec.pipelineCreateMs = Math.max(0, end.servingMs - begin.servingMs);
+    }
     return rec;
   }
 
@@ -667,7 +697,8 @@ export class TurnTraceModel implements SessionCapableModel {
     try {
       const coldStats = this.deps.coldStats ?? safeColdStats;
       const sidecarStats = this.deps.sidecarStats ?? safeSidecarStats;
-      const rec = this.baseRecord(ctx);
+      const snap = this.readProgress(ctx);
+      const rec = this.baseRecord(ctx, snap);
       rec.outcome = 'ok';
       rec.finishReason = final.finishReason;
       rec.promptTokens = final.promptTokens;
@@ -687,7 +718,7 @@ export class TurnTraceModel implements SessionCapableModel {
         rec.mtpMeanDepth = perf.mtpMeanDepth;
         rec.mtpAcceptByPos = perf.mtpAcceptanceByPosition;
       }
-      const measured = measuredPrefillOf(this.readProgress(ctx));
+      const measured = measuredPrefillOf(snap);
       if (measured !== undefined) {
         rec.prefillMs = measured.prefillMs;
         rec.prefillTokens = measured.prefillTokens;
@@ -786,7 +817,7 @@ export class TurnTraceModel implements SessionCapableModel {
     this.settle(ctx, total);
     COUNTERS[outcome] += 1;
     try {
-      const rec = this.baseRecord(ctx);
+      const rec = this.baseRecord(ctx, snap);
       rec.outcome = outcome;
       rec.finishReason = outcome === 'cancelled' ? 'cancelled' : 'error';
       if (outcome === 'error') rec.errorKind = errorKind;
@@ -812,7 +843,7 @@ export class TurnTraceModel implements SessionCapableModel {
     notifyEdge();
   }
 
-  private readProgress(ctx: TurnContext): ChatStreamProgress | null {
+  private readProgress(ctx: TurnContext): TurnProgressSnapshot | null {
     try {
       return ctx.progress?.read?.() ?? ctx.progress?.last ?? null;
     } catch {

@@ -35,6 +35,12 @@ export const traces = sqliteTable('traces', {
   loadWaitMs: real('load_wait_ms'),
   resolveMs: real('resolve_ms'),
   preDispatchMs: real('pre_dispatch_ms'),
+  /** Native creation → pickup; outside `ttft_ms`. NULL from a record that predates it. */
+  waitMs: real('wait_ms'),
+  /** Native time with no lane or memory to start; inside `ttft_ms`. */
+  slotMs: real('slot_ms'),
+  /** Native time preparing the prompt before its prefill; inside `ttft_ms`. */
+  prepareMs: real('prepare_ms'),
   finishReason: text('finish_reason'),
   promptTokens: integer('prompt_tokens'),
   cachedTokens: integer('cached_tokens'),
@@ -49,6 +55,9 @@ export const traces = sqliteTable('traces', {
   concurrencyPeak: integer('concurrency_peak'),
   memActiveBytes: integer('mem_active_bytes'),
   memPeakBytes: integer('mem_peak_bytes'),
+  /** GPU pipelines created while the turn ran (process-wide); NULL while the counter is off. */
+  pipelinesCreated: integer('pipelines_created'),
+  pipelineCreateMs: real('pipeline_create_ms'),
   coldHits: integer('cold_hits'),
   coldMisses: integer('cold_misses'),
   coldBytesWritten: integer('cold_bytes_written'),

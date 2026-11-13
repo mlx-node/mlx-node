@@ -18,7 +18,14 @@ import { memoryStats, type SchedulerStats } from '@mlx-node/core';
 
 import pkgJson from '../../package.json' with { type: 'json' };
 import type { ServerHealthStatus } from '../health.js';
-import { metricsEnvDisabled } from '../metrics-trace.js';
+import { metricsEnvDisabled, TURN_FAIL_PHASES } from '../metrics-trace.js';
+import {
+  readLoadProgress,
+  readPipelineStats,
+  type LoadProgress,
+  type PipelineStats,
+  type WarmupReport,
+} from '../native-progress.js';
 import { queueRejections } from '../queue-rejections.js';
 import type { ResidentModel } from '../registry.js';
 import {
@@ -28,7 +35,9 @@ import {
   type HostKind,
   type RuntimeCapability,
   type RuntimeLiveFile,
+  type RuntimeLiveLoad,
   type RuntimeLiveModel,
+  type RuntimeLoadRecord,
   type RuntimeLiveTurn,
   type RuntimeSampleRecord,
   type RuntimeSchedRecord,
@@ -62,14 +71,26 @@ export interface RuntimeSamplerDeps {
   dir?: string;
   /** Liveness probe for the start-up sweep. */
   isAlive?: (pid: number) => boolean;
+  /** Native progress of the load of `path`; defaults to the native addon. */
+  loadProgress?: (path: string) => LoadProgress | null;
+  /** Process-wide pipeline counter; defaults to the native addon. Null while the counter is off. */
+  pipelineStats?: () => PipelineStats | null;
+}
+
+/** What {@link RuntimeSampler.timedLoad} records about one load. */
+export interface TimedLoadInfo<T> {
+  model: string;
+  modelType: string;
+  capability: RuntimeCapability;
+  /** The exact path the native load receives: the key of its load progress. */
+  path: string;
+  /** The warm-up report of a loaded model; null when the load ran none. */
+  warmupOf?: (result: T) => WarmupReport | null;
 }
 
 export interface RuntimeSampler {
-  /** Wrap a real load. Records one `load` record and the live `loading` field. */
-  timedLoad<T>(
-    info: { model: string; modelType: string; capability: RuntimeCapability },
-    load: () => Promise<T>,
-  ): Promise<T>;
+  /** Wrap a real load. Records one `load` record and an entry of the live `loading` list. */
+  timedLoad<T>(info: TimedLoadInfo<T>, load: () => Promise<T>): Promise<T>;
   /** Final sample + `exit` record, flush, remove the live file. Idempotent. */
   stop(): Promise<void>;
 }
@@ -118,6 +139,27 @@ function safeWiredLimit(): number {
 
 function finiteOr0(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function roundedOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : null;
+}
+
+function livePhase(value: unknown): RuntimeLiveTurn['phase'] {
+  for (const phase of TURN_FAIL_PHASES) if (phase === value) return phase;
+  return null;
+}
+
+function warmupFields(report: WarmupReport): Partial<RuntimeLoadRecord> {
+  return {
+    warmupMs: report.ms,
+    warmupSteps: report.steps,
+    warmupSkipped: report.skipped,
+    warmupReset: report.reset,
+    warmupPipelines: report.pipelines,
+    warmupCompileMs: report.compileMs,
+    warmupPeakBytes: report.peakBytes,
+  };
 }
 
 function liveColdCapture(budget: ColdCaptureBudget | null): RuntimeLiveFile['coldCapture'] {
@@ -230,8 +272,8 @@ class Sampler implements RuntimeSampler {
   private prevCounters: TurnCounters;
   private prevRejected: number;
 
-  private loadsActive = 0;
-  private loading: { model: string; startedAt: number } | null = null;
+  /** One entry per load in flight; two loads of one model or one path keep their own entries. */
+  private readonly loading = new Set<{ model: string; startedAt: number; path: string }>();
   private loads = 0;
   private readonly loaded = new Map<string, { loadedAt: number; loadMs: number }>();
 
@@ -296,7 +338,7 @@ class Sampler implements RuntimeSampler {
    * after the settle edge with no edge of its own, so counting it stretches every burst to the next tick.
    */
   private busyNow(): boolean {
-    if (this.loadsActive > 0) return true;
+    if (this.loading.size > 0) return true;
     for (const entry of this.deps.registry.listResidentModels()) {
       const sessions = entry.sessions;
       if (sessions.turnStats().live > 0 || sessions.queueDepth > 0) return true;
@@ -339,7 +381,7 @@ class Sampler implements RuntimeSampler {
   }
 
   private computeBusy(views: BindingView[]): boolean {
-    if (this.loadsActive > 0) return true;
+    if (this.loading.size > 0) return true;
     for (const view of views) {
       if (view.stats.live > 0 || view.queued > 0) return true;
     }
@@ -461,6 +503,8 @@ class Sampler implements RuntimeSampler {
     };
     const dropped = this.trace.takeDropped();
     if (dropped > 0) rec.dropped = dropped;
+    const pipelines = this.pipelineStats();
+    if (pipelines !== null) rec.pipelinesCreatedWhileServing = pipelines.createdServing;
     this.prevCounters = counters;
     this.prevRejected = rejected;
     this.lastSampleAt = now;
@@ -590,7 +634,7 @@ class Sampler implements RuntimeSampler {
     all.sort((a, b) => a.startedAt - b.startedAt);
     return all.slice(0, LIVE_TURNS_MAX).map((turn) => {
       const p = turn.progress;
-      const phase = p?.phase === 'queued' || p?.phase === 'prefill' || p?.phase === 'decode' ? p.phase : null;
+      const phase = livePhase(p?.phase);
       const cached = p?.cachedTokens ?? null;
       const prefillTotal = p?.prefillTotal ?? null;
       return {
@@ -602,6 +646,9 @@ class Sampler implements RuntimeSampler {
         stream: turn.stream,
         dispatch: turn.dispatch,
         phase,
+        waitMs: roundedOrNull(p?.waitMs),
+        slotMs: roundedOrNull(p?.slotMs),
+        prepareMs: roundedOrNull(p?.prepareMs),
         promptTokens: cached !== null && prefillTotal !== null ? cached + prefillTotal : null,
         cachedTokens: cached,
         prefillTotal,
@@ -624,7 +671,7 @@ class Sampler implements RuntimeSampler {
     this.lastLiveAt = now;
     this.lastLiveTokens = counters.streamedTokens;
     return {
-      v: 1,
+      v: 2,
       pid: process.pid,
       startedAt: this.startedAt,
       ts: now,
@@ -643,7 +690,7 @@ class Sampler implements RuntimeSampler {
         rss: process.memoryUsage.rss(),
       },
       decodeTps,
-      loading: this.loading,
+      loading: this.liveLoads(),
       counters: {
         ok: counters.ok,
         error: counters.error,
@@ -655,6 +702,35 @@ class Sampler implements RuntimeSampler {
       models: views.map((view) => this.liveModel(view)),
       turns: this.liveTurns(views),
     };
+  }
+
+  private pipelineStats(): PipelineStats | null {
+    try {
+      return (this.deps.pipelineStats ?? readPipelineStats)();
+    } catch {
+      return null;
+    }
+  }
+
+  private liveLoads(): RuntimeLiveLoad[] {
+    const read = this.deps.loadProgress ?? readLoadProgress;
+    return [...this.loading]
+      .sort((a, b) => a.startedAt - b.startedAt)
+      .map((load) => {
+        let progress: LoadProgress | null = null;
+        try {
+          progress = read(load.path);
+        } catch {
+          progress = null;
+        }
+        return {
+          model: load.model,
+          startedAt: load.startedAt,
+          phase: progress?.phase ?? 'weights',
+          stepsDone: progress?.stepsDone ?? null,
+          steps: progress?.steps ?? null,
+        };
+      });
   }
 
   private writeLive(now: number, views: BindingView[], busy: boolean): void {
@@ -678,26 +754,28 @@ class Sampler implements RuntimeSampler {
     })();
   }
 
-  async timedLoad<T>(
-    info: { model: string; modelType: string; capability: RuntimeCapability },
-    load: () => Promise<T>,
-  ): Promise<T> {
+  async timedLoad<T>(info: TimedLoadInfo<T>, load: () => Promise<T>): Promise<T> {
     if (this.stopped) return load();
     const startedAt = this.now();
-    this.loadsActive += 1;
-    this.loading = { model: info.model, startedAt };
+    const entry = { model: info.model, startedAt, path: info.path };
+    this.loading.add(entry);
     this.noteBusy(startedAt, true);
     this.pullIn();
     let ok = false;
+    let warmup: WarmupReport | null = null;
     try {
       const result = await load();
       ok = true;
+      try {
+        warmup = info.warmupOf?.(result) ?? null;
+      } catch {
+        warmup = null;
+      }
       return result;
     } finally {
       const end = this.now();
       const ms = Math.max(0, end - startedAt);
-      this.loadsActive -= 1;
-      if (this.loadsActive === 0) this.loading = null;
+      this.loading.delete(entry);
       this.loads += 1;
       if (ok) this.loaded.set(info.model, { loadedAt: end, loadMs: ms });
       if (!this.stopped) {
@@ -712,6 +790,7 @@ class Sampler implements RuntimeSampler {
           capability: info.capability,
           ms,
           ok,
+          ...(warmup === null ? {} : warmupFields(warmup)),
         });
         this.noteBusy(end, this.busyNow());
         this.pullIn();

@@ -126,6 +126,9 @@ export const CHAT = {
   pendingThinking: 'Thinking…',
   load: {
     title: 'Loading the model',
+    titleKernels: 'Preparing GPU kernels',
+    kernelSteps: '{done} of {steps}',
+    kernelNote: 'The first load after an update prepares the GPU. It can take a couple of minutes.',
     titleQueued: 'Waiting for the engine',
     size: '{size} on disk',
     wait: 'Your message waits until the model is in memory. Then the answer starts.',

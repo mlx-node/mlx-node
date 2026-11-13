@@ -24,7 +24,12 @@ import { pathToFileURL } from 'node:url';
 
 import type { SupervisorStateFile } from '../../desktop/src/main/supervisor-state-file.js';
 import type { MetricsTraceRecord } from '../../server/src/metrics-trace.js';
-import type { RuntimeLiveFile, RuntimeTraceRecord } from '../../server/src/runtime-trace.js';
+import type {
+  RuntimeLiveFile,
+  RuntimeLiveLoad,
+  RuntimeLiveTurn,
+  RuntimeTraceRecord,
+} from '../../server/src/runtime-trace.js';
 import { managedBlock } from '../src/coding-agents.js';
 
 export const DEFAULT_SEED = 0x4d4c58;
@@ -490,11 +495,45 @@ function writeTraces(home: string, random: Random, now: number): number {
   return index;
 }
 
+/** Three turns before their prefill, one per waiting phase. */
+function phaseTurns(model: string, now: number): RuntimeLiveTurn[] {
+  const turn = (traceId: string, startedAgo: number, patch: Partial<RuntimeLiveTurn>): RuntimeLiveTurn => ({
+    traceId,
+    model,
+    modelId: model,
+    ctxWindow: 131072,
+    startedAt: now - startedAgo,
+    stream: true,
+    dispatch: 'continue',
+    phase: 'queued',
+    waitMs: null,
+    slotMs: null,
+    prepareMs: null,
+    promptTokens: null,
+    cachedTokens: null,
+    prefillTotal: null,
+    prefillDone: null,
+    generatedTokens: null,
+    ...patch,
+  });
+  return [
+    turn('fx-live-busy', 1200, { phase: 'queued', waitMs: 1200 }),
+    turn('fx-live-slot', 9000, { phase: 'slot', waitMs: 3, slotMs: 8900, prepareMs: 0 }),
+    turn('fx-live-prepare', 4100, {
+      phase: 'prepare',
+      waitMs: 2,
+      slotMs: 0,
+      prepareMs: 4000,
+      cachedTokens: 19_456,
+    }),
+  ];
+}
+
 export interface LiveProcess {
   pid: number;
   startedAt: number;
-  /** The load the harness engine runs now. */
-  loading?: { model: string; startedAt: number } | null;
+  /** The loads the harness engine runs now. */
+  loading?: RuntimeLiveLoad[];
   /** Chat models the harness engine holds, after the two fixture models. */
   chatModels?: readonly string[];
   /**
@@ -508,8 +547,9 @@ export interface LiveProcess {
   /**
    * The turns in flight. 'two-models' (default): one turn on each fixture model, the big one asked through an alias.
    * 'one-model': two turns on the big model, one of them asked through the alias `mlx-local`.
+   * 'phases': three more turns on the big model before their prefill: model busy, waiting for a slot, preparing.
    */
-  flight?: 'two-models' | 'one-model';
+  flight?: 'two-models' | 'one-model' | 'phases';
   /**
    * The disk cache the heartbeat reports. 'whole-prompt' (default): on, the whole prompt per turn. 'native': on, the
    * native 128 blocks. 'off': off. 'older': neither field, as an engine from before them writes.
@@ -825,7 +865,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         ? { blocks: 128, ms: 250 }
         : null;
   const file: RuntimeLiveFile = {
-    v: 1,
+    v: 2,
     pid: live.pid,
     startedAt: live.startedAt,
     ts: now,
@@ -844,7 +884,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
       rss: Math.round(1.4 * GIB),
     },
     decodeTps: live.ticker?.decodeTps ?? round(37.5 + 6 * Math.sin(now / DECODE_WAVE_MS), 1),
-    loading: live.loading ?? null,
+    loading: live.loading ?? [],
     counters: { ok: 412, error: 6, cancelled: 3, outputTokens: 389_120, loads: 3, rejected: 5 },
     models: [
       {
@@ -904,6 +944,9 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         stream: true,
         dispatch: 'continue_tool',
         phase: 'decode',
+        waitMs: 4,
+        slotMs: 0,
+        prepareMs: 310,
         promptTokens: 18_432,
         cachedTokens: 16_896,
         prefillTotal: 1536,
@@ -919,12 +962,16 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         stream: true,
         dispatch: 'start',
         phase: 'prefill',
+        waitMs: 2,
+        slotMs: 0,
+        prepareMs: 40,
         promptTokens: 9_216,
         cachedTokens: 2_048,
         prefillTotal: PREFILL_TOTAL,
         prefillDone: Math.floor((PREFILL_TOTAL * ((Math.floor(now / 1000) % 10) + 1)) / 12),
         generatedTokens: null,
       },
+      ...(live.flight === 'phases' ? phaseTurns(big, now) : []),
     ],
   };
   if (diskCache === 'older') {

@@ -85,6 +85,8 @@ export interface RuntimeSampleRecord extends RuntimeBase {
   dRejected: number;
   /** Records the sink dropped since the previous sample. Omitted when 0. */
   dropped?: number;
+  /** GPU pipelines created while serving since the process started (cumulative); absent while the counter is off. */
+  pipelinesCreatedWhileServing?: number;
 }
 
 /** One idle snapshot of a model's scheduler. Counters are cumulative for the model's lifetime. */
@@ -128,6 +130,14 @@ export interface RuntimeLoadRecord extends RuntimeBase {
   capability: RuntimeCapability;
   ms: number;
   ok: boolean;
+  /** The load-time warm-up, when the load ran one. */
+  warmupMs?: number;
+  warmupSteps?: number;
+  warmupSkipped?: number;
+  warmupReset?: number;
+  warmupPipelines?: number;
+  warmupCompileMs?: number;
+  warmupPeakBytes?: number;
 }
 
 /** Clean shutdown only. A killed process leaves none. */
@@ -172,7 +182,13 @@ export interface RuntimeLiveTurn {
   startedAt: number;
   stream: boolean;
   dispatch: 'start' | 'continue' | 'continue_tool';
-  phase: 'queued' | 'prefill' | 'decode' | null;
+  phase: 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode' | null;
+  /** Creation → pickup by the model thread, rounded to ms; null when native does not report it. */
+  waitMs: number | null;
+  /** Time the scheduler could not start the turn, rounded to ms; null before pickup or when not reported. */
+  slotMs: number | null;
+  /** Time spent preparing the prompt before its prefill, rounded to ms; null before pickup or when not reported. */
+  prepareMs: number | null;
   promptTokens: number | null;
   cachedTokens: number | null;
   prefillTotal: number | null;
@@ -180,9 +196,18 @@ export interface RuntimeLiveTurn {
   generatedTokens: number | null;
 }
 
+/** One model load in flight. `stepsDone` / `steps` are null when native reports no progress for it. */
+export interface RuntimeLiveLoad {
+  model: string;
+  startedAt: number;
+  phase: 'weights' | 'kernels';
+  stepsDone: number | null;
+  steps: number | null;
+}
+
 /** `live-<pid>.json`: replaced atomically (tmp + rename). */
 export interface RuntimeLiveFile {
-  v: 1;
+  v: 2;
   pid: number;
   startedAt: number;
   ts: number;
@@ -199,7 +224,8 @@ export interface RuntimeLiveFile {
   mem: { active: number; peak: number; cache: number; wiredLimit: number; rss: number };
   /** Output tokens per second across all in-flight turns since the previous write; null when idle. */
   decodeTps: number | null;
-  loading: { model: string; startedAt: number } | null;
+  /** Loads in flight, oldest first; empty when idle. */
+  loading: RuntimeLiveLoad[];
   counters: { ok: number; error: number; cancelled: number; outputTokens: number; loads: number; rejected: number };
   models: RuntimeLiveModel[];
   /** At most 32, oldest first. */

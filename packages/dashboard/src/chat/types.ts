@@ -276,8 +276,17 @@ export interface AgentModeState {
 }
 export interface ChatHostState {
   inference: 'ready' | 'starting' | 'loading' | 'stopped';
-  /** Set while the engine loads or swaps a model. `startedAt` is the engine's own clock (epoch ms). */
-  loading: { modelId: string; startedAt: number } | null;
+  /**
+   * The loads the engine runs now, oldest first; empty when none. `startedAt` is the engine's own clock (epoch ms).
+   * `phase: 'kernels'` with `steps` known: the load prepares GPU kernels, `stepsDone` of `steps`.
+   */
+  loading: Array<{
+    modelId: string;
+    startedAt: number;
+    phase: 'weights' | 'kernels';
+    stepsDone: number | null;
+    steps: number | null;
+  }>;
   /** The chat models the engine holds in memory now; `sizeBytes` is the size on disk, null when unknown. */
   resident: Array<{ modelId: string; sizeBytes: number | null }>;
   /**

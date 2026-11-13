@@ -537,7 +537,7 @@ describe('progress pings under backpressure', () => {
     process.env.MLX_SSE_PROGRESS_INTERVAL_MS = '1000';
     vi.useFakeTimers();
     try {
-      const snapshot: ChatStreamProgress = { phase: 'decode', generatedTokens: 1, decodeElapsedMs: 100 };
+      const snapshot = { phase: 'decode', generatedTokens: 1, decodeElapsedMs: 100 } as ChatStreamProgress;
       const nextEvent = deferred<Record<string, unknown>>();
       let started = false;
       async function* stream(ref?: ChatStreamControl): AsyncGenerator<Record<string, unknown>> {

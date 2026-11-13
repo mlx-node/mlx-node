@@ -500,18 +500,24 @@ describe('Chat service — titles', () => {
 });
 
 describe('Chat service — engine facts and unload', () => {
-  function liveWith(
-    loading: { model: string; startedAt: number } | null,
-    names: string[],
-    ts = Date.now(),
-  ): RuntimeLive {
+  type Load = RuntimeLive['processes'][number]['loading'][number];
+  const load = (model: string, startedAt: number, patch: Partial<Load> = {}): Load => ({
+    model,
+    startedAt,
+    phase: 'weights',
+    stepsDone: 0,
+    steps: 0,
+    ...patch,
+  });
+
+  function liveWith(loading: Load[], names: string[], ts = Date.now()): RuntimeLive {
     return live({
       processes: [
         liveProcess({ pid: process.pid, ts, loading, models: names.map((n) => liveModel(n)) }),
         liveProcess({
           pid: process.pid + 1,
           host: 'launch',
-          loading: { model: 'qwen3.5-4b', startedAt: 99 },
+          loading: [load('qwen3.5-4b', 99)],
           models: [liveModel('qwen3.5-4b')],
         }),
       ],
@@ -523,7 +529,10 @@ describe('Chat service — engine facts and unload', () => {
     mkdirSync(join(dir, 'b'));
     writeFileSync(join(dir, 'b', 'model.safetensors'), 'x'.repeat(200));
     writeFileSync(join(dir, 'b', 'config.json'), 'x'.repeat(100));
-    let snapshot = liveWith({ model: 'qwen3.5-9b', startedAt: 1234 }, ['qwen3.5-9b', 'mlx-local']);
+    let snapshot = liveWith(
+      [load('qwen3.5-9b', 1234, { phase: 'kernels', stepsDone: 3, steps: 50 }), load('gemma-4', 1000)],
+      ['qwen3.5-9b', 'mlx-local'],
+    );
     const fake = fakeService('chat-basic', {
       mutate: scripted,
       endpointModels: [endpointModel('qwen3.5-4b', join(dir, 'a')), endpointModel('qwen3.5-9b', join(dir, 'b'))],
@@ -533,14 +542,17 @@ describe('Chat service — engine facts and unload', () => {
       let state = await fake.service.state();
       expect(state).toMatchObject({
         inference: 'loading',
-        loading: { modelId: 'qwen3.5-9b', startedAt: 1234 },
+        loading: [
+          { modelId: 'gemma-4', startedAt: 1000, phase: 'weights', stepsDone: 0, steps: 0 },
+          { modelId: 'qwen3.5-9b', startedAt: 1234, phase: 'kernels', stepsDone: 3, steps: 50 },
+        ],
         resident: [{ modelId: 'qwen3.5-9b', sizeBytes: 300 }],
         defaultModelId: 'qwen3.5-9b',
       });
-      snapshot = liveWith(null, []);
+      snapshot = liveWith([], []);
       state = await fake.service.state();
-      expect(state).toMatchObject({ inference: 'ready', loading: null, resident: [], defaultModelId: 'qwen3.5-4b' });
-      snapshot = liveWith(null, ['qwen3.5-4b']);
+      expect(state).toMatchObject({ inference: 'ready', loading: [], resident: [], defaultModelId: 'qwen3.5-4b' });
+      snapshot = liveWith([], ['qwen3.5-4b']);
       expect((await fake.service.state()).resident).toEqual([{ modelId: 'qwen3.5-4b', sizeBytes: null }]);
       expect((await fake.service.state()).answers).toEqual([
         { modelId: 'qwen3.5-4b', inFlight: 0, maxConcurrent: 4, queued: 0, lastStart: null },
@@ -549,7 +561,7 @@ describe('Chat service — engine facts and unload', () => {
         processes: [
           liveProcess({
             pid: process.pid,
-            loading: null,
+            loading: [],
             models: [liveModel('qwen3.5-4b', { maxConcurrent: 1, inFlight: 1, queued: 1 }), liveModel('mlx-local')],
             turns: [
               liveTurn('t-old', { model: 'qwen3.5-4b', startedAt: 5_000 }),
@@ -562,7 +574,7 @@ describe('Chat service — engine facts and unload', () => {
       expect((await fake.service.state()).answers).toEqual([
         { modelId: 'qwen3.5-4b', inFlight: 1, maxConcurrent: 1, queued: 1, lastStart: 7_000 },
       ]);
-      snapshot = liveWith(null, ['qwen3.5-9b']);
+      snapshot = liveWith([], ['qwen3.5-9b']);
       const { conversation } = await fake.service.create({ mode: 'chat', text: 'hi' });
       expect(conversation.modelId).toBe('qwen3.5-9b');
     } finally {
@@ -676,7 +688,7 @@ describe('Chat service — engine facts and unload', () => {
   });
 
   it('unload: refused while a turn runs or the app engine loads, with no engine request; else the engine names the model', async () => {
-    let snapshot = liveWith(null, ['qwen3.5-4b']);
+    let snapshot = liveWith([], ['qwen3.5-4b']);
     const fake = fakeService('chat-basic', {
       mutate: scripted,
       live: { subscribe: () => () => {}, readNow: async () => snapshot },
@@ -691,10 +703,10 @@ describe('Chat service — engine facts and unload', () => {
       await fake.service.cancel(created.conversation.id);
       await until(() => page.ends().length === 1, 5_000);
       page.detach();
-      snapshot = liveWith({ model: 'qwen3.5-9b', startedAt: 1 }, []);
+      snapshot = liveWith([load('qwen3.5-9b', 1)], []);
       expect((await apiError(fake.service.unloadModels())).reason).toBe('engine-busy');
       expect(unloads()).toBe(0);
-      snapshot = liveWith(null, ['qwen3.5-4b']);
+      snapshot = liveWith([], ['qwen3.5-4b']);
       expect(await fake.service.unloadModels()).toEqual({ unloaded: ['qwen3.5-4b'] });
       expect(unloads()).toBe(1);
       engine.script(() => ({ status: 409, json: {} }));
@@ -709,7 +721,7 @@ describe('Chat service — engine facts and unload', () => {
 
   it('after an unload, a heartbeat written before it does not list the unloaded model; a later one does', async () => {
     const before = Date.now() - 1_000;
-    let snapshot = liveWith(null, ['qwen3.5-4b'], before);
+    let snapshot = liveWith([], ['qwen3.5-4b'], before);
     const fake = fakeService('chat-basic', {
       mutate: scripted,
       live: { subscribe: () => () => {}, readNow: async () => snapshot },
@@ -721,10 +733,10 @@ describe('Chat service — engine facts and unload', () => {
       let state = await fake.service.state();
       expect(state.resident).toEqual([]);
       expect(state.defaultModelId).toBe('qwen3.5-4b');
-      snapshot = liveWith(null, ['qwen3.5-4b'], Date.now() + 1_000);
+      snapshot = liveWith([], ['qwen3.5-4b'], Date.now() + 1_000);
       state = await fake.service.state();
       expect(state.resident.map((r) => r.modelId)).toEqual(['qwen3.5-4b']);
-      snapshot = liveWith(null, ['qwen3.5-4b'], before);
+      snapshot = liveWith([], ['qwen3.5-4b'], before);
       expect((await fake.service.state()).resident.map((r) => r.modelId)).toEqual(['qwen3.5-4b']);
     } finally {
       await fake.close();

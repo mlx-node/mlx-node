@@ -47,7 +47,7 @@ export function modelBases(
   picked: Readonly<Record<string, string>>,
 ): ModelBaseOption[] {
   const stateOf = (id: string): State =>
-    host.loading?.modelId === id ? 'loading' : resident.has(id) ? 'loaded' : 'idle';
+    host.loading.some((load) => load.modelId === id) ? 'loading' : resident.has(id) ? 'loaded' : 'idle';
   const small = (model: HostModel): boolean =>
     mode === 'work' && model.contextTokens !== null && model.contextTokens < WORK_CONTEXT;
   const groups = new Map<string, HostModel[]>();
@@ -109,7 +109,7 @@ export function startModel(host: ChatHostState | null, stored: string | null): s
   if (host === null || host.models.length === 0) return null;
   const served = (id: string | null): id is string => id !== null && host.models.some((model) => model.id === id);
   const inMemory = host.resident.find((entry) => served(entry.modelId))?.modelId ?? null;
-  for (const id of [inMemory, host.loading?.modelId ?? null, stored, host.defaultModelId]) if (served(id)) return id;
+  for (const id of [inMemory, host.loading[0]?.modelId ?? null, stored, host.defaultModelId]) if (served(id)) return id;
   return host.models[0]!.id;
 }
 

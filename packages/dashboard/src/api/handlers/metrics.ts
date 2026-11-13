@@ -63,6 +63,12 @@ export interface MetricsTotals {
   queueWallMs: number;
   loadWaitWallMs: number;
   resolveWallMs: number;
+  /** Native wait for the model thread (busy with other requests), before the time to first token. */
+  waitWallMs: number;
+  /** Native wait for a lane or memory, inside the time to first token. */
+  slotWallMs: number;
+  /** Native prompt preparation (render, prefix match, cache restore), inside the time to first token. */
+  prepareWallMs: number;
   /** Time to first token of turns without a prefill window: setup and prefill together. */
   firstTokenWallMs: number;
   /** Time to first token outside the prefill window, measured turns only. */
@@ -70,7 +76,7 @@ export interface MetricsTotals {
   /** Sum of measured prefill windows, each capped at its time to first token. */
   prefillWallMs: number;
   decodeWallMs: number;
-  /** total − queue − loadWait − resolve − firstToken − setup − prefill − decode, clamped at 0. */
+  /** total − every phase above, clamped at 0. */
   otherWallMs: number;
   totalWallMs: number;
 }
@@ -104,7 +110,7 @@ export interface MetricsSummary {
   failures: Array<{
     outcome: 'error' | 'cancelled';
     errorKind: 'finish_error' | 'exception' | null;
-    failPhase: 'queued' | 'prefill' | 'decode' | null;
+    failPhase: 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode' | null;
     turns: number;
   }>;
   endpoints: Array<{ endpoint: string; stream: boolean; turns: number }>;
@@ -187,6 +193,10 @@ export interface TurnRow {
   queueMs: number | null;
   loadWaitMs: number | null;
   resolveMs: number | null;
+  /** Native creation → pickup; null from a record that predates it. */
+  waitMs: number | null;
+  slotMs: number | null;
+  prepareMs: number | null;
   ttftMs: number | null;
   /** Measured prefill window; null when the turn has none. */
   prefillMs: number | null;
@@ -207,6 +217,9 @@ export interface TurnRow {
   concurrency: number | null;
   concurrencyPeak: number | null;
   memActiveBytes: number | null;
+  /** GPU pipelines created while the turn ran; null while the counter is off. */
+  pipelinesCreated: number | null;
+  pipelineCreateMs: number | null;
   pid: number | null;
 }
 
@@ -227,6 +240,8 @@ export const HISTOGRAM_EDGES: Record<DistributionMetric, number[]> = {
   promptTokens: [0, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072],
   outputTokens: [0, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192],
 };
+
+const FAIL_PHASES = ['queued', 'slot', 'prepare', 'prefill', 'decode'] as const;
 
 const TURNS_LIMIT_DEFAULT = 200;
 const TURNS_LIMIT_MAX = 2000;
@@ -252,6 +267,7 @@ const TOTALS_SELECT = `
   SUM(COALESCE(output_tokens, 0)) AS outputTokens, SUM(COALESCE(reasoning_tokens, 0)) AS reasoningTokens,
   SUM(${PHASE_SQL.queue}) AS queueWallMs, SUM(${PHASE_SQL.loadWait}) AS loadWaitWallMs,
   SUM(${PHASE_SQL.resolve}) AS resolveWallMs,
+  SUM(${PHASE_SQL.wait}) AS waitWallMs, SUM(${PHASE_SQL.slot}) AS slotWallMs, SUM(${PHASE_SQL.prepare}) AS prepareWallMs,
   SUM(${PHASE_SQL.firstToken}) AS firstTokenWallMs, SUM(${PHASE_SQL.setup}) AS setupWallMs,
   SUM(${PHASE_SQL.prefill}) AS prefillWallMs, SUM(${PHASE_SQL.decode}) AS decodeWallMs,
   SUM(${PHASE_TOTAL_SQL}) AS totalWallMs`;
@@ -270,6 +286,9 @@ function emptyTotals(): MetricsTotals {
     queueWallMs: 0,
     loadWaitWallMs: 0,
     resolveWallMs: 0,
+    waitWallMs: 0,
+    slotWallMs: 0,
+    prepareWallMs: 0,
     firstTokenWallMs: 0,
     setupWallMs: 0,
     prefillWallMs: 0,
@@ -284,6 +303,9 @@ function withOther(t: MetricsTotals): MetricsTotals {
     t.queueWallMs +
     t.loadWaitWallMs +
     t.resolveWallMs +
+    t.waitWallMs +
+    t.slotWallMs +
+    t.prepareWallMs +
     t.firstTokenWallMs +
     t.setupWallMs +
     t.prefillWallMs +
@@ -306,6 +328,9 @@ function totalsOf(row: Row): MetricsTotals {
     queueWallMs: ms(row.queueWallMs),
     loadWaitWallMs: ms(row.loadWaitWallMs),
     resolveWallMs: ms(row.resolveWallMs),
+    waitWallMs: ms(row.waitWallMs),
+    slotWallMs: ms(row.slotWallMs),
+    prepareWallMs: ms(row.prepareWallMs),
     firstTokenWallMs: ms(row.firstTokenWallMs),
     setupWallMs: ms(row.setupWallMs),
     prefillWallMs: ms(row.prefillWallMs),
@@ -451,8 +476,7 @@ export function handleMetricsSummary(ctx: WorkerApiContext, req: ApiRequest): Me
     ).map((row) => ({
       outcome: row.outcome === 'cancelled' ? 'cancelled' : 'error',
       errorKind: row.errorKind === 'finish_error' || row.errorKind === 'exception' ? row.errorKind : null,
-      failPhase:
-        row.failPhase === 'queued' || row.failPhase === 'prefill' || row.failPhase === 'decode' ? row.failPhase : null,
+      failPhase: FAIL_PHASES.find((phase) => phase === row.failPhase) ?? null,
       turns: toInt(row.turns),
     })),
     endpoints: run(
@@ -679,12 +703,13 @@ const TURN_COLUMNS = `trace_id AS traceId, ts, model_key AS modelKey, model, mod
   prompt_tokens AS promptTokens, cached_tokens AS cachedTokens, output_tokens AS outputTokens,
   reasoning_tokens AS reasoningTokens, ctx_window AS ctxWindow, ${CTX_FILL_SQL} AS ctxFillPct,
   pre_dispatch_ms AS preDispatchMs, queue_ms AS queueMs, load_wait_ms AS loadWaitMs, resolve_ms AS resolveMs,
-  ttft_ms AS ttftMs, CASE WHEN ${PREFILL_MEASURED_SQL} THEN prefill_ms END AS prefillMs,
+  wait_ms AS waitMs, slot_ms AS slotMs, prepare_ms AS prepareMs, ttft_ms AS ttftMs, CASE WHEN ${PREFILL_MEASURED_SQL} THEN prefill_ms END AS prefillMs,
   CASE WHEN ${PREFILL_MEASURED_SQL} THEN prefill_tokens END AS prefillTokens, ${SETUP_MS_SQL} AS setupMs,
   ${DECODE_WALL_SQL} AS decodeMs, duration_ms AS durationMs, ${PREFILL_TPS_SQL} AS prefillTps,
   decode_tps AS decodeTps, mtp_cycles AS mtpCycles, mtp_mean_accepted AS mtpMeanAccepted, cold_hits AS coldHits,
   cold_misses AS coldMisses, tool_count AS toolCount, tool_call_count AS toolCallCount, image_count AS imageCount,
-  concurrency, concurrency_peak AS concurrencyPeak, mem_active_bytes AS memActiveBytes, pid`;
+  concurrency, concurrency_peak AS concurrencyPeak, mem_active_bytes AS memActiveBytes,
+  pipelines_created AS pipelinesCreated, pipeline_create_ms AS pipelineCreateMs, pid`;
 
 function turnRow(row: Row): TurnRow {
   const key = String(row.modelKey);
@@ -713,6 +738,9 @@ function turnRow(row: Row): TurnRow {
     queueMs: toNum(row.queueMs),
     loadWaitMs: toNum(row.loadWaitMs),
     resolveMs: toNum(row.resolveMs),
+    waitMs: toNum(row.waitMs),
+    slotMs: toNum(row.slotMs),
+    prepareMs: toNum(row.prepareMs),
     ttftMs: toNum(row.ttftMs),
     prefillMs: toNum(row.prefillMs),
     prefillTokens: toNum(row.prefillTokens),
@@ -731,6 +759,8 @@ function turnRow(row: Row): TurnRow {
     concurrency: toNum(row.concurrency),
     concurrencyPeak: toNum(row.concurrencyPeak),
     memActiveBytes: toNum(row.memActiveBytes),
+    pipelinesCreated: toNum(row.pipelinesCreated),
+    pipelineCreateMs: toNum(row.pipelineCreateMs),
     pid: toNum(row.pid),
   };
 }

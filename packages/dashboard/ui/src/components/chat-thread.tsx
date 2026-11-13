@@ -8,6 +8,7 @@ import {
   answerMarkdown,
   engineNote,
   fullLimit,
+  loadFor,
   loadVariant,
   pendingRow,
   splitTurns,
@@ -818,7 +819,7 @@ function PendingRow(props: {
     const timer = setTimeout(() => setQuiet(true), QUIET_MS);
     return () => clearTimeout(timer);
   }, [phase, props.asOfMs]);
-  const loading = props.host?.loading ?? null;
+  const loading = loadFor(props.host?.loading ?? [], props.model);
   const row = pendingRow({
     creating: props.creating,
     phase,
@@ -851,6 +852,7 @@ function PendingRow(props: {
         other={loading?.modelId ?? null}
         since={since}
         sizeBytes={props.modelSize?.(row.modelId) ?? null}
+        progress={variant === 'loading' ? loading : null}
       />
     </Message>
   );
@@ -973,7 +975,7 @@ export function ChatThread(props: ChatThreadProps): ReactElement {
     endLine === null || liveLast || props.lastEnd == null
       ? null
       : engineNote({
-          loading: props.host?.loading ?? null,
+          loading: loadFor(props.host?.loading ?? [], props.model ?? null),
           unsent: props.lastEnd.unsent === true,
           model: props.model ?? null,
           resident: props.host?.resident ?? [],
