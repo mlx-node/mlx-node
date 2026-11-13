@@ -10,8 +10,6 @@
  * Electron-free so both tables are testable; MAIN reads them and passes them on.
  */
 
-import { DESKTOP_ENGINE_POLICY, engineEnvFor } from '@mlx-node/server/host/env-policy';
-
 /**
  * `packages/core/index.cjs`'s `requireNative()` checks this FIRST and passes it
  * straight to `require()`.
@@ -77,14 +75,4 @@ function modelsDirEnv(modelsDir: string | null): Record<string, string> {
   // treat a zero-length value as unset, but an empty string in a child env is
   // indistinguishable from a bug at every point in between.
   return modelsDir === null ? {} : { [MODELS_DIR]: modelsDir };
-}
-
-/**
- * The `enginePolicyEnv` layer of `buildChildEnv` for the sidecar: the lowest
- * layer, so a value in the user's shell wins. It carries
- * `MLX_CONTINUOUS_BATCHING=1`; without it a Qwen3.5 model runs one whole turn
- * at a time and a helper request stalls the main step of a Work turn.
- */
-export function sidecarEnginePolicyEnv(): Record<string, string> {
-  return engineEnvFor(DESKTOP_ENGINE_POLICY);
 }

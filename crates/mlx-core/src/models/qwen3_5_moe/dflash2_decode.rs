@@ -796,6 +796,10 @@ impl DFlash2Target for Qwen35MoeInner {
         std::borrow::Cow::Owned(self.config.to_dense_config())
     }
 
+    fn decode_row_expert_bytes(&self) -> u64 {
+        self.config.decode_row_expert_bytes()
+    }
+
     fn embedding_dtype(&self) -> Result<DType> {
         self.embedding
             .forward(&MxArray::from_int32(&[0], &[1, 1])?)?
@@ -1084,6 +1088,12 @@ mod paged_dflash2_tests {
     /// launch).
     #[test]
     fn verify_takes_the_verify_split_rule() -> Result<()> {
+        // The launch probe counts every paged prefill in the process.
+        if !crate::test_support::in_own_process(
+            "models::qwen3_5_moe::dflash2_decode::paged_dflash2_tests::verify_takes_the_verify_split_rule",
+        ) {
+            return Ok(());
+        }
         if crate::test_support::paged_prefill_unsupported("verify_takes_the_verify_split_rule") {
             return Ok(());
         }

@@ -20,6 +20,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
+import { engineEnvFor, LAUNCHER_ENGINE_POLICY } from '@mlx-node/server/host/env-policy';
 import { resolveModelsDirAsync } from '@mlx-node/server/host/paths';
 import {
   app,
@@ -44,7 +45,7 @@ import {
 } from './agent-updates.js';
 import { decideAutoStart } from './auto-start.js';
 import { createControlPanelBroker, type ControlPanelBroker } from './broker.js';
-import { controlPanelEnvOverrides, sidecarEnginePolicyEnv, sidecarEnvOverrides } from './child-env.js';
+import { controlPanelEnvOverrides, sidecarEnvOverrides } from './child-env.js';
 import { electronBrokerDeps } from './control-panel-child.js';
 import { createLaunchVisibility } from './launch-visibility.js';
 import { viewMenuTemplate } from './menu-policy.js';
@@ -308,7 +309,7 @@ async function bootstrap(): Promise<void> {
     // the addon-free leaf of that package; its `/host` entry statically imports
     // `@mlx-node/lm` and maps the 233 MB native addon into whatever process
     // evaluates it, which is the one thing MAIN must never do.
-    enginePolicyEnv: sidecarEnginePolicyEnv(),
+    enginePolicyEnv: engineEnvFor(LAUNCHER_ENGINE_POLICY),
     // `NAPI_RS_NATIVE_LIBRARY_PATH` is in here, and fork time is the only moment
     // it can be set: `packages/core/index.cjs` reads it inside `requireNative()`,
     // which runs while `@mlx-node/lm` is being imported at the sidecar entry's

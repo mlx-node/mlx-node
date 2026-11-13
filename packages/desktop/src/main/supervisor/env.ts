@@ -39,7 +39,7 @@ export interface ChildEnvInput {
    */
   baseEnv: NodeJS.ProcessEnv;
   /**
-   * Engine policy for this fork — normally `sidecarEnginePolicyEnv()`
+   * Engine policy for this fork — normally `engineEnvFor(LAUNCHER_ENGINE_POLICY)`
    * from `@mlx-node/server/host`.
    *
    * Passed in rather than imported: `@mlx-node/server/host` statically imports

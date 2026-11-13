@@ -1,9 +1,8 @@
 //! Real-checkpoint Qwen3.5 MoE continuous-batching parity gate.
 //!
-//! Every request is text-only plain autoregressive decode. MTP-capable and
-//! vision-capable checkpoints are therefore valid fixtures, but the test
-//! explicitly disables MTP so those ordered-barrier paths cannot mask the
-//! scheduled lane.
+//! Text-only requests. Vision-capable checkpoints are valid fixtures. The
+//! first gate runs plain autoregressive decode only; the wave gate adds
+//! fixed-depth MTP when the checkpoint has MTP heads.
 //!
 //! `QWEN35_MOE_STAGE2_MODEL_PATH=/abs/qwen3.5-moe cargo test -p mlx-core \
 //!   --test qwen3_5_moe_concurrent_batched_parity -- --ignored --nocapture`
@@ -14,6 +13,10 @@ use futures::future::join_all;
 use mlx_core::engine::types::{ChatConfig, ChatResult};
 use mlx_core::models::qwen3_5_moe::persistence::load_with_thread;
 use mlx_core::tokenizer::ChatMessage;
+
+/// Both gates flip the process env `MLX_SERVE_FORCE_SERIAL`; they must not
+/// run at once.
+static ENV_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn model_path() -> Option<PathBuf> {
     let path = std::env::var_os("QWEN35_MOE_STAGE2_MODEL_PATH")?;
@@ -37,6 +40,10 @@ fn user_message(content: &str) -> ChatMessage {
 }
 
 fn config(owner: &str, max_new_tokens: i32) -> ChatConfig {
+    config_with(owner, max_new_tokens, false)
+}
+
+fn config_with(owner: &str, max_new_tokens: i32, mtp: bool) -> ChatConfig {
     ChatConfig {
         cache_salt: None,
         cache_owner_id: Some(owner.to_string()),
@@ -49,9 +56,10 @@ fn config(owner: &str, max_new_tokens: i32) -> ChatConfig {
         max_consecutive_tokens: Some(0),
         max_ngram_repeats: Some(0),
         ngram_size: Some(0),
-        enable_mtp: Some(false),
+        enable_mtp: Some(mtp),
+        mtp_adaptive_depth: Some(false),
         include_reasoning: Some(true),
-        report_performance: Some(false),
+        report_performance: Some(mtp),
         reuse_cache: Some(true),
         ..ChatConfig::default()
     }
@@ -74,11 +82,8 @@ async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
         eprintln!("skipping: QWEN35_MOE_STAGE2_MODEL_PATH unset");
         return;
     };
+    let _env = ENV_GATE.lock().await;
 
-    // This ignored gate is the only test in its binary, so setting these
-    // process-local controls before model-thread creation is deterministic.
-    unsafe { std::env::set_var("MLX_CONTINUOUS_BATCHING", "1") };
-    unsafe { std::env::set_var("MLX_SERVE_FORCE_SERIAL", "1") };
     let model = load_with_thread(&path.to_string_lossy(), None, None)
         .await
         .expect("load Qwen3.5 MoE");
@@ -86,6 +91,9 @@ async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
         model.has_block_paged_cache(),
         "gate requires block-paged Qwen3.5 MoE"
     );
+    // The switch is read per command, so the load keeps the scheduled plan
+    // and only the oracle turns run whole-turn.
+    unsafe { std::env::set_var("MLX_SERVE_FORCE_SERIAL", "1") };
 
     let cases = [
         ("Explain briefly why the sky appears blue.", 7),
@@ -109,7 +117,7 @@ async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
     unsafe { std::env::remove_var("MLX_SERVE_FORCE_SERIAL") };
     assert!(
         model.max_concurrent_sequences() >= 2,
-        "opted-in checkpoint must advertise the scheduled lane"
+        "a paged checkpoint advertises the scheduled lane by default"
     );
     let scheduled_solo = model
         .chat_session_start(
@@ -178,4 +186,158 @@ async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
         "expected a genuine N=2 sparse-MoE decode, got {}",
         stats.max_batch_occupancy
     );
+}
+
+const WAVE_PROMPTS: [(&str, i32); 8] = [
+    ("Explain briefly why the sky appears blue.", 24),
+    ("Explain briefly why ice floats on water.", 17),
+    ("Name three common primary colors.", 21),
+    ("Give one sentence about the moon.", 13),
+    ("What is two plus three? Answer in words.", 19),
+    ("Write a short greeting for a new colleague.", 23),
+    ("List two uses of copper.", 15),
+    ("Say something kind about rain.", 20),
+];
+
+/// MTP cycles and accepted drafts a turn reports.
+fn mtp_counts(result: &ChatResult) -> (u32, f64) {
+    let performance = result.performance.as_ref().expect("performance");
+    let cycles = performance.mtp_cycles.unwrap_or(0);
+    let accepted = performance.mtp_mean_accepted_tokens.unwrap_or(0.0) * f64::from(cycles);
+    (cycles, accepted.round())
+}
+
+/// N = 1, 2, 4 and 8 concurrent text turns against the serial path at
+/// temperature 0. Plain AR gives the serial path's tokens at every N. With
+/// fixed-depth MTP (when the checkpoint has MTP heads) a scheduled verify
+/// packs 2+ lanes' rows into one expert batch whose shape changes the bf16
+/// rounding of the sparse-MoE projections, so a near-tie may resolve the
+/// other way and tokens are not asserted against the serial path; what
+/// holds by design is that every scheduled MTP turn finishes without error
+/// within its budget, runs draft cycles, that at every width the scheduled
+/// wave accepts drafts exactly when the serial oracle does on the same
+/// prompts, and that the oracle accepts at least one draft. The first
+/// character that differs is printed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "needs QWEN35_MOE_STAGE2_MODEL_PATH pointing to a Qwen3.5 MoE checkpoint"]
+async fn waves_of_one_two_four_and_eight_match_serial() {
+    let Some(path) = model_path() else {
+        eprintln!("skipping: QWEN35_MOE_STAGE2_MODEL_PATH unset");
+        return;
+    };
+    let _env = ENV_GATE.lock().await;
+    let model = load_with_thread(&path.to_string_lossy(), None, None)
+        .await
+        .expect("load Qwen3.5 MoE");
+    assert!(
+        model.has_block_paged_cache(),
+        "gate requires block-paged Qwen3.5 MoE"
+    );
+    let lanes = model.max_concurrent_sequences();
+    eprintln!("planned lanes: {lanes}");
+    assert!((1..=8).contains(&lanes));
+    let modes: &[bool] = if model.has_mtp_weights() {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for &mtp in modes {
+        // The switch is read per command, so the load keeps its plan and
+        // only the oracle turns run whole-turn.
+        unsafe { std::env::set_var("MLX_SERVE_FORCE_SERIAL", "1") };
+        let mut serial = Vec::new();
+        for (index, (prompt, max_tokens)) in WAVE_PROMPTS.iter().enumerate() {
+            serial.push(
+                model
+                    .chat_session_start(
+                        vec![user_message(prompt)],
+                        Some(config_with(
+                            &format!("serial-{mtp}-{index}"),
+                            *max_tokens,
+                            mtp,
+                        )),
+                    )
+                    .await
+                    .expect("serial oracle"),
+            );
+            model.reset_caches().await.expect("reset serial oracle");
+        }
+        unsafe { std::env::remove_var("MLX_SERVE_FORCE_SERIAL") };
+        let mut serial_accepted = vec![0.0; serial.len()];
+        if mtp {
+            for (index, result) in serial.iter().enumerate() {
+                serial_accepted[index] = mtp_counts(result).1;
+            }
+            assert!(
+                serial_accepted.iter().sum::<f64>() > 0.0,
+                "the serial oracle accepted at least one draft"
+            );
+        }
+        for width in [1usize, 2, 4, 8] {
+            let mut scheduled_accepted = 0.0;
+            let wave = join_all(WAVE_PROMPTS[..width].iter().enumerate().map(
+                |(index, (prompt, max_tokens))| {
+                    model.chat_session_start(
+                        vec![user_message(prompt)],
+                        Some(config_with(
+                            &format!("wave-{mtp}-{width}-{index}"),
+                            *max_tokens,
+                            mtp,
+                        )),
+                    )
+                },
+            ))
+            .await;
+            for ((expected, actual), (prompt, max_tokens)) in
+                serial.iter().zip(wave).zip(&WAVE_PROMPTS[..width])
+            {
+                let actual = actual.expect("batched turn");
+                let label = format!("mtp={mtp} N={width}: {prompt}");
+                if mtp {
+                    let (cycles, accepted) = mtp_counts(&actual);
+                    let differs = actual
+                        .raw_text
+                        .chars()
+                        .zip(expected.raw_text.chars())
+                        .position(|(left, right)| left != right);
+                    eprintln!(
+                        "{label}: {cycles} cycles, {accepted} accepted; first differing \
+                         character {differs:?}"
+                    );
+                    assert!(cycles > 0, "no draft cycle for {label}");
+                    assert!(actual.num_tokens <= *max_tokens as u32, "{label}");
+                    scheduled_accepted += accepted;
+                } else {
+                    assert_same(expected, &actual, &label);
+                }
+            }
+            if mtp {
+                let serial_wave: f64 = serial_accepted[..width].iter().sum();
+                eprintln!(
+                    "mtp=true N={width}: accepted drafts: scheduled {scheduled_accepted}, \
+                     serial {serial_wave}"
+                );
+                assert_eq!(
+                    scheduled_accepted > 0.0,
+                    serial_wave > 0.0,
+                    "N={width}: the scheduled wave accepts drafts exactly when the serial \
+                     oracle does"
+                );
+            }
+            model.reset_caches().await.expect("reset after wave");
+        }
+        let stats = model.scheduler_stats().await.expect("scheduler stats");
+        eprintln!(
+            "mtp={mtp}: max_batch_occupancy {}",
+            stats.max_batch_occupancy
+        );
+        if !mtp {
+            // The occupancy is a running maximum, so only the first pass
+            // can prove it.
+            assert!(
+                stats.max_batch_occupancy >= lanes.min(8),
+                "every granted lane decodes in one step"
+            );
+        }
+    }
 }
