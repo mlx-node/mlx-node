@@ -309,28 +309,37 @@ fn tier_limit(cache_disk: CacheDisk, volume: Option<&Volume>, held: u64) -> u64 
 /// Splash `persistentCacheNamespace`'s inputs.
 pub(crate) struct CacheNamespace<'a> {
     pub target: ColdCacheFingerprint,
-    pub draft: ColdCacheFingerprint,
+    /// The draft of a DFlash2 load; `None` for a load without one, whose
+    /// states are the GDN cell alone.
+    pub draft: Option<DraftNamespace>,
     /// Block size, layers, KV heads, head size and the cache dtype.
     pub kv: (u32, u32, u32, u32, &'a str),
     /// GDN layers, conv history, conv channels, value heads, value and key
     /// head dims; the recurrent state is fp32.
     pub gdn: [u32; 6],
+}
+
+/// A draft's part of a persistent namespace.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DraftNamespace {
+    pub fingerprint: ColdCacheFingerprint,
     /// Draft layers, KV heads, head size and sliding window.
-    pub draft_geometry: (u32, u32, u32, u32),
+    pub geometry: (u32, u32, u32, u32),
     pub context_width: u32,
 }
 
 /// The `gdn`, `draft` and `context` lines: a state object's geometry.
-pub(crate) fn state_geometry(
-    gdn: [u32; 6],
-    draft: (u32, u32, u32, u32),
-    context_width: u32,
-) -> String {
+/// `draft` is the draft's geometry and context width, `None` without one.
+pub(crate) fn state_geometry(gdn: [u32; 6], draft: Option<((u32, u32, u32, u32), u32)>) -> String {
     let [layers, history, channels, groups, rows, cols] = gdn;
-    let (draft_layers, heads, head, window) = draft;
     let mut text = format!("gdn {layers} {history} {channels} {groups} {rows} {cols}\n");
-    text.push_str(&format!("draft {draft_layers} {heads} {head} {window}\n"));
-    text.push_str(&format!("context {context_width} q4 64\n"));
+    match draft {
+        Some(((draft_layers, heads, head, window), context_width)) => {
+            text.push_str(&format!("draft {draft_layers} {heads} {head} {window}\n"));
+            text.push_str(&format!("context {context_width} q4 64\n"));
+        }
+        None => text.push_str("draft none\ncontext none\n"),
+    }
     text
 }
 
@@ -340,10 +349,16 @@ pub(crate) fn cache_namespace_text(ns: &CacheNamespace<'_>) -> String {
     let mut text = String::from("mlx-node-persistent-cache-v1\n");
     text.push_str(&ns.target.to_hex());
     text.push('\n');
-    text.push_str(&ns.draft.to_hex());
+    match ns.draft {
+        Some(draft) => text.push_str(&draft.fingerprint.to_hex()),
+        None => text.push_str("none"),
+    }
     text.push('\n');
     text.push_str(&format!("kv {block} {layers} {heads} {head} {dtype}\n"));
-    text.push_str(&state_geometry(ns.gdn, ns.draft_geometry, ns.context_width));
+    text.push_str(&state_geometry(
+        ns.gdn,
+        ns.draft.map(|draft| (draft.geometry, draft.context_width)),
+    ));
     text
 }
 

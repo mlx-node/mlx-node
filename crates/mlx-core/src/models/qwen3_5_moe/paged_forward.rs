@@ -428,13 +428,14 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
         //    capture. Must happen BEFORE calling the per-chunk helper so
         //    `update_keys_values` inside the layer loop aligns at
         //    `[chunk_start_position, chunk_start_position+chunk.len())`.
+        let chunk_end = chunk_start_position + chunk.len() as u32;
         let grant = book_chunk(
             target,
             taps.as_deref_mut(),
             &capture_rows,
             chunk,
-            chunk_start_position + chunk.len() as u32,
-            is_last_chunk,
+            chunk_end,
+            chunk_end as usize >= full_tokens.len(),
         )?;
         let parts = target.parts()?;
 
@@ -490,6 +491,14 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
                         caches,
                     });
                 }
+            }
+            if grant.is_some() {
+                if grant.as_ref().is_some_and(CaptureGrant::armed)
+                    && let Some(sink) = taps.as_deref_mut()
+                {
+                    capture_chunk_linear(parts.caches, sink, context_after, capture_checkpoint)?;
+                }
+                reach_chunk(target, taps.as_deref_mut(), context_after, grant)?;
             }
             if let Some(start) = chunk_trace_start {
                 let chunk_elapsed_ms = elapsed_ms(start);

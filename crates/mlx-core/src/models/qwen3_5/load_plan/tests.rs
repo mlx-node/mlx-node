@@ -670,10 +670,12 @@ fn plan_27b_disk(
 
 /// Splash `stateStagingBytes`: a draft load with the SSD tier sets one
 /// state (GDN cell + draft window, 159,842,304 B on 27B) aside as fixed
-/// bytes, and the window gives up what those bytes held. No draft, or a
-/// quota below one state, sets nothing aside; an automatic tier that would
-/// cost a `--max-context` the plan holds without it turns off.
-/// Mutation SG1: staging left out of fixed bytes → red.
+/// bytes, and the window gives up what those bytes held; a pool load
+/// without a draft sets its GDN cell aside (153,944,064 B). A quota below
+/// one state sets nothing aside; an automatic tier that would cost a
+/// `--max-context` the plan holds without it turns off.
+/// Mutations SG1 (staging left out of fixed bytes) and AL1 (a load without
+/// a draft stages nothing) → red.
 #[test]
 fn staging_moves_the_plan_once() {
     const STATE: u64 = 159_842_304;
@@ -695,10 +697,16 @@ fn staging_moves_the_plan_once() {
     );
     assert_eq!((off_window, auto_window), (221_177, 212_985));
 
+    // A load without a draft stages its GDN cell alone (Splash
+    // `QwenStateStorage::stagingBytes` with no window span).
+    const CELL: u64 = 153_944_064;
     let mtp_off = plan("staging-mtp-off", None, Some(false), Some(CacheDisk::Off)).unwrap();
     let mtp_auto = plan("staging-mtp-auto", None, Some(false), Some(CacheDisk::Auto)).unwrap();
-    assert_eq!(mtp_auto.footprint.state_staging_bytes, 0);
-    assert_eq!(mtp_auto, mtp_off);
+    assert_eq!(mtp_off.footprint.state_staging_bytes, 0);
+    assert_eq!(mtp_auto.footprint.state_staging_bytes, CELL);
+    assert_eq!(mtp_auto.fixed_bytes, mtp_off.fixed_bytes + CELL);
+    let (plain_off, plain_auto) = (window(&mtp_off).maximum(), window(&mtp_auto).maximum());
+    assert_eq!((plain_off, plain_auto), (155_641, 151_545));
 
     let small = plan(
         "staging-small",

@@ -48,6 +48,7 @@ pub(crate) mod vision;
 // `crate::engine::<item>` path.
 pub(crate) use cache::*;
 pub(crate) use finalize::*;
+pub use governor::status::{MemoryGovernorStatus, memory_governor_status};
 pub(crate) use params::*;
 pub(crate) use penalties::*;
 pub use scheduler::{DecodeBatchOccupancyBucketJs, SchedulerStatsJs};

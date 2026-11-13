@@ -83,8 +83,9 @@ pub(crate) trait PrefillTapSink {
     }
     /// The lane's context window as it is now, which ends at `row`: a
     /// state the ledger refused before its chunk, taken from the lane after
-    /// it (Splash `fromLane`).
-    fn snapshot_lane_window(&mut self, row: usize) -> Result<DraftContextWindow> {
+    /// it (Splash `fromLane`); `None` for a lane that keeps no window (a
+    /// load without a draft).
+    fn snapshot_lane_window(&mut self, row: usize) -> Result<Option<DraftContextWindow>> {
         Err(Error::from_reason(format!(
             "this prefill keeps no lane window at row {row}"
         )))
@@ -178,19 +179,22 @@ pub(crate) fn capture_rows_of(taps: Option<&dyn PrefillTapSink>) -> Vec<u32> {
 /// ends there; the sink snapshots only a granted one. The KV comes first
 /// (Splash `Engine::prepare` runs `growLane` before `reserveCaptures`): an
 /// optional state is refused rather than taking the room the chunk needs.
+/// A chunk that ends the prompt captures nothing; one that ends a prefill
+/// command short of it (a scheduler slice) does (Splash publishes a
+/// boundary at a command's end).
 pub(crate) fn book_chunk<L>(
     target: &mut dyn PrefillTarget<L>,
     taps: Option<&mut (dyn PrefillTapSink + '_)>,
     capture_rows: &[u32],
     chunk: &[u32],
     row: u32,
-    is_last_chunk: bool,
+    prompt_end: bool,
 ) -> Result<Option<CaptureGrant>> {
     target.record(chunk)?;
     let Some(sink) = taps else {
         return Ok(None);
     };
-    if is_last_chunk || !capture_rows.contains(&row) {
+    if prompt_end || !capture_rows.contains(&row) {
         return Ok(None);
     }
     let grant = target.prepare_capture(row)?;
@@ -226,7 +230,7 @@ pub(crate) fn capture_chunk_linear(
     Ok(())
 }
 
-/// Hands what a non-last chunk of a tapped prefill reached to the target.
+/// Hands what a chunk of a tapped prefill reached to the target.
 pub(crate) fn reach_chunk<L>(
     target: &mut dyn PrefillTarget<L>,
     taps: Option<&mut (dyn PrefillTapSink + '_)>,
@@ -822,13 +826,14 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         let is_last_chunk = chunk_idx + 1 == total_chunks;
         let chunk_trace_start = trace_enabled.then(Instant::now);
         let chunk_info_start = inference_info_enabled.then(Instant::now);
+        let chunk_end = chunk_start_position + chunk.len() as u32;
         let grant = book_chunk(
             target,
             taps.as_deref_mut(),
             &capture_rows,
             chunk,
-            chunk_start_position + chunk.len() as u32,
-            is_last_chunk,
+            chunk_end,
+            chunk_end as usize >= full_tokens.len(),
         )?;
         let parts = target.parts()?;
         #[cfg(test)]
@@ -869,6 +874,14 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                         caches,
                     });
                 }
+            }
+            if grant.is_some() {
+                if grant.as_ref().is_some_and(CaptureGrant::armed)
+                    && let Some(sink) = taps.as_deref_mut()
+                {
+                    capture_chunk_linear(parts.caches, sink, context_after, capture_checkpoint)?;
+                }
+                reach_chunk(target, taps.as_deref_mut(), context_after, grant)?;
             }
             if let Some(start) = chunk_trace_start {
                 let chunk_elapsed_ms = elapsed_ms(start);

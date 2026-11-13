@@ -171,14 +171,17 @@ fn auto_quota_follows_the_volume() {
 fn namespace_names_the_draft_and_the_window() {
     let target = ColdCacheFingerprint::from_components([b"target".as_slice()]);
     let draft = ColdCacheFingerprint::from_components([b"draft".as_slice()]);
-    let ns = CacheNamespace {
+    let with_draft = |fingerprint, geometry, context_width| CacheNamespace {
         target,
-        draft,
+        draft: Some(DraftNamespace {
+            fingerprint,
+            geometry,
+            context_width,
+        }),
         kv: (16, 16, 4, 256, "Int8"),
         gdn: [48, 3, 10240, 48, 128, 128],
-        draft_geometry: (5, 8, 128, 2048),
-        context_width: 5120,
     };
+    let ns = with_draft(draft, (5, 8, 128, 2048), 5120);
     assert_eq!(
         cache_namespace_text(&ns),
         format!(
@@ -192,23 +195,57 @@ fn namespace_names_the_draft_and_the_window() {
     assert_eq!(name.len(), 32);
     assert!(namespace_name(&name));
 
-    let other_draft = CacheNamespace {
-        draft: target,
-        ..ns
-    };
+    let other_draft = with_draft(target, (5, 8, 128, 2048), 5120);
     assert_ne!(cache_namespace(&other_draft).0, name);
-    let other_window = CacheNamespace {
-        draft_geometry: (5, 8, 128, 4096),
-        ..ns
-    };
+    let other_window = with_draft(draft, (5, 8, 128, 4096), 5120);
     assert_ne!(cache_namespace(&other_window).0, name);
-    let other_width = CacheNamespace {
-        context_width: 4096,
-        ..ns
-    };
+    let other_width = with_draft(draft, (5, 8, 128, 2048), 4096);
     let (width_name, width_state) = cache_namespace(&other_width);
     assert_ne!(width_name, name);
     assert_ne!(width_state, state);
+}
+
+/// A load without a draft names no draft: its state is the GDN cell alone,
+/// so its namespace differs from every draft load's, and the draft text is
+/// unchanged by the draftless form.
+/// Mutation AN1 (`state_geometry` writes draft lines for `None`) → red.
+#[test]
+fn draftless_namespace_differs_and_draft_text_is_unchanged() {
+    let target = ColdCacheFingerprint::from_components([b"target".as_slice()]);
+    let draft = ColdCacheFingerprint::from_components([b"draft".as_slice()]);
+    let gdn = [48, 3, 10240, 48, 128, 128];
+    assert_eq!(
+        state_geometry(gdn, Some(((5, 8, 128, 2048), 5120))),
+        "gdn 48 3 10240 48 128 128\ndraft 5 8 128 2048\ncontext 5120 q4 64\n"
+    );
+    assert_eq!(
+        state_geometry(gdn, None),
+        "gdn 48 3 10240 48 128 128\ndraft none\ncontext none\n"
+    );
+    let plain = CacheNamespace {
+        target,
+        draft: None,
+        kv: (16, 16, 4, 256, "Int8"),
+        gdn,
+    };
+    assert_eq!(
+        cache_namespace_text(&plain),
+        format!(
+            "mlx-node-persistent-cache-v1\n{}\nnone\nkv 16 16 4 256 Int8\ngdn 48 3 10240 48 128 \
+             128\ndraft none\ncontext none\n",
+            target.to_hex()
+        )
+    );
+    let drafted = CacheNamespace {
+        draft: Some(DraftNamespace {
+            fingerprint: draft,
+            geometry: (5, 8, 128, 2048),
+            context_width: 5120,
+        }),
+        ..plain
+    };
+    assert_ne!(cache_namespace(&plain).0, cache_namespace(&drafted).0);
+    assert_ne!(cache_namespace(&plain).1, cache_namespace(&drafted).1);
 }
 
 /// A temporary tier is a locked, published directory; its close removes it

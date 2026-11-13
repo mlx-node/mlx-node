@@ -99,7 +99,8 @@ fn tier_at(root: &std::path::Path, tag: &str, limit: u64, persistent: bool) -> A
     tier
 }
 
-/// The model's states on `tier`, their window `window` bytes.
+/// The model's states on `tier`, their window `window` bytes (0: a load
+/// without a draft, whose state is the GDN cell alone).
 pub(crate) fn attach_tier(
     states: &mut DFlash2States,
     config: &Qwen3_5Config,
@@ -114,7 +115,7 @@ pub(crate) fn attach_tier(
         StateDisk::new(
             Arc::clone(&tier.tier),
             gdn,
-            window,
+            (window > 0).then_some(window),
             slots,
             "test geometry".to_string(),
             block_bytes,
@@ -135,7 +136,10 @@ pub(crate) fn writable_anchor(config: &Qwen3_5Config, window: DraftContextWindow
         cache.collect_arrays(&mut arrays);
     }
     crate::array::MxArray::eval_arrays(&arrays).expect("eval");
-    PagedAnchor { linear, window }
+    PagedAnchor {
+        linear,
+        window: Some(window),
+    }
 }
 
 fn fixture(seed: u64, tag: &str) -> Option<(Qwen35Inner, TestTier)> {
@@ -1163,8 +1167,10 @@ fn a_draft_changed_during_load_keeps_the_tier_temporary() {
             config_json: b"{}".to_vec(),
             dense: &inner.config,
             activation: DType::BFloat16,
-            draft: inner.dflash2.as_ref().expect("a draft"),
-            draft_files: &draft_files,
+            draft: Some(DraftTier {
+                model: inner.dflash2.as_ref().expect("a draft"),
+                files: &draft_files,
+            }),
             adapter: inner.paged_adapter.as_ref().expect("pool"),
             files,
             weights: &weights,

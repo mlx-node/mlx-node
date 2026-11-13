@@ -1287,10 +1287,6 @@ pub(crate) trait PagedDsparkBackend: PagedBackend + DsparkBackend {
     ) -> Result<Self::PrefixState> {
         self.prime_prefix_state(tokens, reuse_cache, 0, &[], cache_salt)
     }
-
-    /// The generation prompt this turn's render appends, which places the
-    /// prompt's replay point (Splash `Engine::promptReplayBoundary`).
-    fn set_generation_suffix(&mut self, _suffix: Option<std::sync::Arc<[u32]>>) {}
 }
 
 /// Drive one PAGED DSpark speculative whole turn.

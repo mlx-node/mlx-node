@@ -103,6 +103,9 @@ impl KeptPoints<'_> {
 /// A Qwen3.5-family target model that runs DFlash2 turns on its paged pool.
 pub(crate) trait DFlash2Target: ChatBackend {
     fn dflash2(&self) -> Option<&DFlash2Model>;
+    /// The sequence the lane running now holds: a scheduled lane's own,
+    /// else the serial lane's 0 (Splash `Request` per lane).
+    fn lane_seq(&self) -> u32;
     fn dflash2_states(&self) -> &DFlash2States;
     fn dflash2_states_mut(&mut self) -> &mut DFlash2States;
     /// Dense-shaped config the load plan prices.
@@ -423,7 +426,11 @@ pub(crate) fn install_parked_state<T: DFlash2Target>(
             .ok_or_else(|| Error::from_reason(format!("DFlash2 state {id} holds no RAM copy")))?;
         super::dflash2_state::paged::install_linear(&mut caches, &anchor.linear)?;
         if let Some(lane) = lane.as_mut() {
-            lane.copy_from(&anchor.window)?;
+            let window = anchor
+                .window
+                .as_ref()
+                .ok_or_else(|| Error::from_reason(format!("DFlash2 state {id} holds no window")))?;
+            lane.copy_from(window)?;
         }
     }
     let draft = target
@@ -455,10 +462,20 @@ pub(crate) fn install_parked_state<T: DFlash2Target>(
         .map_err(|_| Error::from_reason("DFlash2 parked state depth overflow"))
 }
 
+/// The window a turn plans its states with: the draft's sliding window, or
+/// Splash's `draftContextTokens` on a load without a draft.
+fn state_window<T: DFlash2Target>(target: &T) -> Result<u32> {
+    match target.dflash2() {
+        Some(draft) => u32::try_from(draft.config.sliding_window)
+            .map_err(|_| Error::from_reason("DFlash2 draft window exceeds u32 rows")),
+        None => Ok(super::dflash2_state::plan::state_window_tokens()),
+    }
+}
+
 /// Splash `Engine::configureDraftStatePlan` for a turn of `tokens` that
 /// resumes at `resume` with a junction at `junction` (0 for none), with the
-/// draft's window; `None` without a draft or a pool. Shared-prefill points
-/// are not planned.
+/// state window; `None` without a pool. Shared-prefill points are not
+/// planned.
 fn state_plan<T: DFlash2Target>(
     target: &T,
     tokens: &[u32],
@@ -466,14 +483,13 @@ fn state_plan<T: DFlash2Target>(
     resume: u32,
     junction: u32,
 ) -> Result<Option<(StatePlan, u32)>> {
-    let (Some(draft), Some(adapter)) = (target.dflash2(), target.paged_adapter_ref()) else {
+    let Some(adapter) = target.paged_adapter_ref() else {
         return Ok(None);
     };
     let block = adapter.block_size();
     let len = u32::try_from(tokens.len())
         .map_err(|_| Error::from_reason("DFlash2 prompt exceeds u32 tokens"))?;
-    let window = u32::try_from(draft.config.sliding_window)
-        .map_err(|_| Error::from_reason("DFlash2 draft window exceeds u32 rows"))?;
+    let window = state_window(target)?;
     let prompt_replay = u32::try_from(crate::engine::gen_prompt::prompt_replay_boundary(
         &tokens[..(prompt as usize).min(tokens.len())],
         target.dflash2_states().generation_suffix.as_deref(),
@@ -543,17 +559,21 @@ fn open_turn<T: DFlash2Target>(
         StatePlan::default()
     };
     let anchor_bytes = turn_anchor_bytes(&*target, &plan);
-    target.dflash2_states_mut().turn = Some(TurnStates {
-        plan: plan.clone(),
-        cursor: 0,
-        passed: Vec::new(),
-        anchor_bytes,
-        latest_checkpoint: None,
-        cache_salt,
-        junction,
-        prompt_tokens: prompt,
-        reuse,
-    });
+    let seq = target.lane_seq();
+    target.dflash2_states_mut().turns.insert(
+        seq,
+        TurnStates {
+            plan: plan.clone(),
+            cursor: 0,
+            passed: Vec::new(),
+            anchor_bytes,
+            latest_checkpoint: None,
+            cache_salt,
+            junction,
+            prompt_tokens: prompt,
+            reuse,
+        },
+    );
     Ok(plan)
 }
 
@@ -561,8 +581,8 @@ fn open_turn<T: DFlash2Target>(
 fn reopen_cold<T: DFlash2Target>(target: &mut T, tokens: &[u32], prompt: u32) -> Result<()> {
     if let Some((salt, junction, reuse)) = target
         .dflash2_states()
-        .turn
-        .as_ref()
+        .turns
+        .get(&target.lane_seq())
         .map(|turn| (turn.cache_salt, turn.junction, turn.reuse))
     {
         open_turn(target, tokens, prompt, 0, junction, salt, reuse)?;
@@ -576,23 +596,25 @@ fn turn_prompt<T: DFlash2Target>(target: &T, tokens: &[u32]) -> u32 {
     let len = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
     target
         .dflash2_states()
-        .turn
-        .as_ref()
+        .turns
+        .get(&target.lane_seq())
         .map_or(len, |turn| turn.prompt_tokens.min(len))
 }
 
-/// What one capture of the turn holds: a GDN cell, the window and the
-/// deepest point's lineage vectors. Read while the draft is on the model.
+/// What one capture of the turn holds: a GDN cell, the window (none
+/// without a draft) and the deepest point's lineage vectors. Read while
+/// the draft is on the model.
 fn turn_anchor_bytes<T: DFlash2Target>(target: &T, plan: &StatePlan) -> u64 {
     let block = target
         .paged_adapter_ref()
         .map_or(1, PagedKVCacheAdapter::block_size)
         .max(1);
     let deepest = plan.boundaries.last().map_or(0, |point| point.tokens) as usize;
-    target.dflash2().map_or(0, |draft| {
-        anchor_bytes(&target.dense_config(), &draft.config)
-            .saturating_add(lineage_bytes(deepest, deepest / block as usize))
-    })
+    anchor_bytes(
+        &target.dense_config(),
+        target.dflash2().map(|draft| &draft.config),
+    )
+    .saturating_add(lineage_bytes(deepest, deepest / block as usize))
 }
 
 /// The parked state a DFlash2 lane of `tokens` resumes from (Splash
@@ -748,13 +770,16 @@ fn settle_disk_read<T: DFlash2Target>(target: &mut T, tokens: &[u32], resumed: O
         let keep = Keep { tokens, keys: None };
         let snapshot = |target: &mut T| -> Result<PagedAnchor> {
             let window = match read.window.as_ref() {
-                Some(window) => window.snapshot()?,
-                None => target
-                    .dflash2_states()
-                    .lane_window
-                    .as_ref()
-                    .ok_or_else(|| Error::from_reason("a disk restore left no lane window"))?
-                    .snapshot()?,
+                Some(window) => Some(window.snapshot()?),
+                None if target.dflash2().is_none() => None,
+                None => Some(
+                    target
+                        .dflash2_states()
+                        .lane_window
+                        .as_ref()
+                        .ok_or_else(|| Error::from_reason("a disk restore left no lane window"))?
+                        .snapshot()?,
+                ),
             };
             Ok(PagedAnchor {
                 linear: target.snapshot_live_linear()?,
@@ -823,6 +848,7 @@ pub(crate) fn admit_resumed<T: DFlash2Target>(
     let Some(id) = resumed else {
         return reopen_cold(target, tokens, prompt);
     };
+    let seq = target.lane_seq();
     let states = target.dflash2_states_mut();
     let replay = crate::engine::gen_prompt::prompt_replay_boundary(
         &tokens[..prompt as usize],
@@ -835,11 +861,11 @@ pub(crate) fn admit_resumed<T: DFlash2Target>(
         states.counters.deduplicated_state_publications += 1;
         latest = None;
     }
-    if let Some(turn) = states.turn.as_mut() {
+    if let Some(turn) = states.turns.get_mut(&seq) {
         turn.latest_checkpoint = latest;
     }
     if cached == replay {
-        states.use_replay_point(id);
+        states.use_replay_point(seq, id);
     }
     Ok(())
 }
@@ -869,8 +895,13 @@ pub(crate) fn prime_dflash2_turn<T: DFlash2Target, P: crate::engine::backend::Pa
         target.clear_draft_context();
     }
     admit_resumed(target, tokens, stored, cached)?;
+    let seq = target.lane_seq();
     let states = target.dflash2_states_mut();
-    if states.turn.as_ref().is_some_and(|turn| turn.junction != 0) {
+    if states
+        .turns
+        .get(&seq)
+        .is_some_and(|turn| turn.junction != 0)
+    {
         states.counters.lazy_junctions += 1;
     }
     Ok(prefix)
@@ -892,10 +923,11 @@ pub(crate) fn turn_plan<T: DFlash2Target>(
         .map_err(|_| Error::from_reason("DFlash2 prefix exceeds u32 tokens"))?;
     let len = u32::try_from(tokens.len())
         .map_err(|_| Error::from_reason("DFlash2 prompt exceeds u32 tokens"))?;
+    let seq = target.lane_seq();
     let (junction, latest, reuse) = target
         .dflash2_states()
-        .turn
-        .as_ref()
+        .turns
+        .get(&seq)
         .map_or((0, None, true), |turn| {
             (turn.junction, turn.latest_checkpoint, turn.reuse)
         });
@@ -905,7 +937,7 @@ pub(crate) fn turn_plan<T: DFlash2Target>(
         plan.boundaries.clear();
     }
     let breaks = command_breaks(resume, len, u32::try_from(chunk_rows).unwrap_or(0), &plan);
-    if let Some(turn) = target.dflash2_states_mut().turn.as_mut() {
+    if let Some(turn) = target.dflash2_states_mut().turns.get_mut(&seq) {
         turn.plan = plan.clone();
         turn.passed = breaks.passed;
         turn.latest_checkpoint = latest;
@@ -1144,7 +1176,7 @@ fn checkpoint_reclaimable(states: &DFlash2States, turn: &TurnStates) -> bool {
 /// (`fromLane`); refused otherwise, no state is taken.
 pub(crate) fn reserve_capture<T: DFlash2Target>(target: &mut T, row: u32) -> Result<CaptureGrant> {
     let states = target.dflash2_states();
-    let Some((class, bytes, from_lane)) = states.turn.as_ref().and_then(|turn| {
+    let Some((class, bytes, from_lane)) = states.turns.get(&target.lane_seq()).and_then(|turn| {
         capture_class(&turn.plan, row).map(|class| {
             (
                 class,
@@ -1310,8 +1342,8 @@ pub(crate) fn reached<T: DFlash2Target>(
     super::dflash2_state::disk::tick(target, super::dflash2_state::disk::Tick::Poll);
     let Some(salt) = target
         .dflash2_states()
-        .turn
-        .as_ref()
+        .turns
+        .get(&target.lane_seq())
         .map(|turn| turn.cache_salt)
     else {
         return Ok(());
@@ -1347,15 +1379,17 @@ fn publish_reached_state<T: DFlash2Target>(
         .and_then(|adapter| adapter.request_tokens().get(..row as usize))
         .map(<[u32]>::to_vec)
         .ok_or_else(|| Error::from_reason(format!("DFlash2 prefill has no row {row}")))?;
-    let Some(mut turn) = target.dflash2_states_mut().turn.take() else {
+    let seq = target.lane_seq();
+    let Some(mut turn) = target.dflash2_states_mut().turns.remove(&seq) else {
         return Ok(());
     };
     let published = publish_point(target, &mut turn, &lineage, outcome);
-    target.dflash2_states_mut().turn = Some(turn);
+    target.dflash2_states_mut().turns.insert(seq, turn);
     published
 }
 
-/// The live GDN cell and the sink's lane window, both at `row`.
+/// The live GDN cell and the sink's lane window (none without a draft),
+/// both at `row`.
 fn lane_state<T: DFlash2Target>(
     target: &mut T,
     sink: &mut (dyn super::paged_forward::PrefillTapSink + '_),
@@ -1429,7 +1463,8 @@ fn publish_point<T: DFlash2Target>(
         return Ok(());
     }
     if replay {
-        target.dflash2_states_mut().use_replay_block(block);
+        let seq = target.lane_seq();
+        target.dflash2_states_mut().use_replay_block(seq, block);
     }
     let reused = stored.filter(|&id| target.dflash2_states_mut().store.reuse(id, checkpoint));
     let depth = u32::try_from(lineage.len()).unwrap_or(u32::MAX);
@@ -1667,10 +1702,11 @@ fn run_control_pass<T: DFlash2Target>(
 /// `Engine::release`): its replay point is no longer in use and its points
 /// go; what it published stays.
 pub(crate) fn end_turn_states<T: DFlash2Target>(target: &mut T) {
-    if target.dflash2_states().turn.is_some() {
+    let seq = target.lane_seq();
+    if target.dflash2_states().turns.contains_key(&seq) {
         log_turn_end("end_use");
     }
-    target.dflash2_states_mut().end_turn();
+    target.dflash2_states_mut().end_turn(seq);
 }
 
 #[cfg(test)]
@@ -1899,7 +1935,7 @@ impl crate::models::qwen3_5::paged_forward::PrefillTapSink for DraftTapSink<'_> 
         }
     }
 
-    fn snapshot_lane_window(&mut self, row: usize) -> Result<DraftContextWindow> {
+    fn snapshot_lane_window(&mut self, row: usize) -> Result<Option<DraftContextWindow>> {
         let lane = self
             .lane
             .as_ref()
@@ -1910,17 +1946,221 @@ impl crate::models::qwen3_5::paged_forward::PrefillTapSink for DraftTapSink<'_> 
                 ))
             })?;
         note_lane_snapshot();
-        lane.snapshot()
+        lane.snapshot().map(Some)
     }
 
     fn take_captured(&mut self, row: usize) -> Option<PagedAnchor> {
         self.armed = None;
         match (self.window.take(), self.linear.take()) {
             (Some((at, window)), Some((linear_at, linear))) if at == row && linear_at == row => {
-                Some(PagedAnchor { linear, window })
+                Some(PagedAnchor {
+                    linear,
+                    window: Some(window),
+                })
             }
             _ => None,
         }
+    }
+}
+
+/// The state sink of a prefill on a load without a draft (Splash
+/// `publishReachedStateBoundaries` with a state that is the GDN cell
+/// alone): it taps no layer, and at an armed point the GDN cell is that
+/// point's state.
+pub(crate) struct LaneStateSink {
+    captures: Vec<usize>,
+    armed: Option<usize>,
+    linear: Option<(usize, Vec<super::layer_cache::Qwen3_5LayerCache>)>,
+}
+
+impl LaneStateSink {
+    /// `captures` are the rows a chunk ends at to capture.
+    pub(crate) fn new(captures: &[u32]) -> Self {
+        Self {
+            captures: captures.iter().map(|&row| row as usize).collect(),
+            armed: None,
+            linear: None,
+        }
+    }
+}
+
+impl crate::models::qwen3_5::paged_forward::PrefillTapSink for LaneStateSink {
+    fn tap_layers(&self) -> &[usize] {
+        &[]
+    }
+
+    fn chunk(&mut self, _first_row: usize, _chunk: &[u32], _taps: &[MxArray]) -> Result<()> {
+        Ok(())
+    }
+
+    fn eval(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn capture_rows(&self) -> &[usize] {
+        &self.captures
+    }
+
+    fn arm(&mut self, row: usize, armed: bool) {
+        self.armed = armed.then_some(row);
+        self.linear = None;
+    }
+
+    fn capture_linear(&mut self, row: usize, linear: Vec<super::layer_cache::Qwen3_5LayerCache>) {
+        self.linear = Some((row, linear));
+    }
+
+    /// No window: the object's window span is empty and begins at `row`.
+    fn write_lane_window(&mut self, row: usize, _out: &mut [u8]) -> Result<Option<u32>> {
+        Ok(u32::try_from(row).ok())
+    }
+
+    fn snapshot_lane_window(&mut self, _row: usize) -> Result<Option<DraftContextWindow>> {
+        Ok(None)
+    }
+
+    fn take_captured(&mut self, row: usize) -> Option<PagedAnchor> {
+        let armed = self.armed.take();
+        match self.linear.take() {
+            Some((at, linear)) if at == row && armed == Some(row) => Some(PagedAnchor {
+                linear,
+                window: None,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Splash `Engine::admit` → `configureDraftStatePlan` and
+/// `completeAdmission` for a turn of `tokens` on a load without a draft,
+/// once its prime put the lane at `cached`: the turn's points open from
+/// `cached` (no junction: the prime's GDN replay already reached the KV
+/// hit). A prime that restored stored state `restored` at `cached` makes a
+/// disk copy resident under an optional claim (Splash `promotedCopy`), a
+/// checkpoint the lane's rolling one, and the prompt's replay point the
+/// turn's own, in use until the turn ends. A lane whose GDN state is not
+/// exact on a text chain plans no point.
+pub(crate) fn open_lane_turn<T: DFlash2Target>(
+    target: &mut T,
+    tokens: &[u32],
+    cached: usize,
+    cache_salt: u64,
+    reuse: bool,
+    restored: Option<EntryId>,
+) -> Result<()> {
+    if target.paged_adapter_ref().is_none() {
+        return Ok(());
+    }
+    let seq = target.lane_seq();
+    let resume = u32::try_from(cached)
+        .map_err(|_| Error::from_reason("a prime's prefix exceeds u32 tokens"))?;
+    let prompt = u32::try_from(tokens.len())
+        .map_err(|_| Error::from_reason("a prompt exceeds u32 tokens"))?;
+    let plan = open_turn(target, tokens, prompt, resume, 0, cache_salt, reuse)?;
+    if !target.replay_state_exact()
+        && let Some(turn) = target.dflash2_states_mut().turns.get_mut(&seq)
+    {
+        turn.plan.boundaries.clear();
+    }
+    let resumed = restored.filter(|&id| {
+        cached > 0
+            && target
+                .dflash2_states()
+                .store
+                .get(id)
+                .is_some_and(|entry| entry.depth() == cached)
+    });
+    if let Some(id) = resumed
+        && target
+            .dflash2_states()
+            .store
+            .get(id)
+            .is_some_and(|entry| entry.ram().is_none())
+    {
+        target.dflash2_states_mut().disk_read =
+            Some(super::dflash2_state::paged::DiskRead { id, window: None });
+    }
+    settle_disk_read(target, tokens, resumed);
+    let Some(id) = resumed else {
+        return Ok(());
+    };
+    let states = target.dflash2_states_mut();
+    let mut latest = states.store.checkpoint_state(id);
+    let replay = resume == plan.prompt_replay;
+    if replay && latest.is_some() {
+        states.store.reuse(id, false);
+        states.counters.deduplicated_state_publications += 1;
+        latest = None;
+    }
+    if let Some(turn) = states.turns.get_mut(&seq) {
+        turn.latest_checkpoint = latest;
+    }
+    if replay {
+        states.use_replay_point(seq, id);
+    }
+    Ok(())
+}
+
+/// Splash `reserveCaptures` over one prefill command of the lane's turn,
+/// rows `[start, end)` in chunks of `chunk` rows: the rows a chunk ends at
+/// to capture, a point at `end` among them when the prompt runs on past it
+/// (Splash publishes a boundary at a command's end from the lane). The
+/// checkpoints the command carries past are noted on the turn.
+pub(crate) fn lane_command_breaks<T: DFlash2Target>(
+    target: &mut T,
+    start: usize,
+    end: usize,
+    chunk: i32,
+) -> Vec<u32> {
+    let seq = target.lane_seq();
+    let (Ok(start), Ok(end)) = (u32::try_from(start), u32::try_from(end)) else {
+        return Vec::new();
+    };
+    let Some(turn) = target.dflash2_states_mut().turns.get_mut(&seq) else {
+        return Vec::new();
+    };
+    let stop = if end < turn.prompt_tokens {
+        end.saturating_add(1)
+    } else {
+        end
+    };
+    let breaks = command_breaks(start, stop, u32::try_from(chunk).unwrap_or(0), &turn.plan);
+    turn.passed
+        .extend(breaks.passed.into_iter().filter(|&row| row <= end));
+    breaks
+        .breaks
+        .into_iter()
+        .filter(|&row| row <= end)
+        .collect()
+}
+
+/// A prefill on a load without a draft as its turn's target: the parts and
+/// the plain booking of the model, the state claims and publications of
+/// the turn (Splash `Engine::prepare` and `apply` for any request).
+pub(crate) struct LanePrefill<'a, T>(pub(crate) &'a mut T);
+
+impl<L, T> crate::models::qwen3_5::paged_forward::PrefillTarget<L> for LanePrefill<'_, T>
+where
+    T: DFlash2Target + crate::models::qwen3_5::paged_forward::PrefillTarget<L>,
+{
+    fn parts(&mut self) -> Result<crate::models::qwen3_5::paged_forward::PrefillParts<'_, L>> {
+        self.0.parts()
+    }
+
+    fn record(&mut self, chunk: &[u32]) -> Result<()> {
+        self.0
+            .paged_adapter_mut_ref()
+            .ok_or_else(|| Error::from_reason("a paged prefill lost its paged adapter"))?
+            .record_tokens(chunk)
+            .map_err(Error::from_reason)
+    }
+
+    fn prepare_capture(&mut self, row: u32) -> Result<CaptureGrant> {
+        reserve_capture(self.0, row)
+    }
+
+    fn reached(&mut self, row: u32, outcome: Reached<'_>) -> Result<()> {
+        reached(self.0, row, outcome)
     }
 }
 
@@ -2531,11 +2771,11 @@ fn vacate_serial_lane<T: DFlash2Target>(target: &mut T) -> Result<Vacated> {
         .release_request_for(SERIAL_SEQ)
         .map_err(Error::from_reason)?;
     // A prefill vacated part way still replays its whole prompt.
-    let (prompt, reuse) = target.dflash2_states().turn.as_ref().map_or(
+    let (prompt, reuse) = target.dflash2_states().turns.get(&SERIAL_SEQ).map_or(
         (u32::try_from(tokens.len()).unwrap_or(u32::MAX), true),
         |turn| (turn.prompt_tokens, turn.reuse),
     );
-    target.dflash2_states_mut().turn = None;
+    target.dflash2_states_mut().turns.remove(&SERIAL_SEQ);
     target.sync_gdn_state_marks();
     #[cfg(test)]
     SUSPEND_LOG.with(|log| {
@@ -2547,8 +2787,11 @@ fn vacate_serial_lane<T: DFlash2Target>(target: &mut T) -> Result<Vacated> {
                 .entries()
                 .map(|entry| (entry.depth(), entry.checkpoint()))
                 .collect(),
-            turn: target.dflash2_states().turn.is_some(),
-            replay_point: target.dflash2_states().replay_point.is_some(),
+            turn: target.dflash2_states().turns.contains_key(&SERIAL_SEQ),
+            replay_point: target
+                .dflash2_states()
+                .replay_points
+                .contains_key(&SERIAL_SEQ),
         });
     });
     Ok(Vacated {
@@ -2702,8 +2945,8 @@ fn wait_and_resume<T: DFlash2Target>(
                         hit,
                         points: target
                             .dflash2_states()
-                            .turn
-                            .as_ref()
+                            .turns
+                            .get(&SERIAL_SEQ)
                             .map(|turn| {
                                 turn.plan
                                     .boundaries

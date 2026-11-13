@@ -1068,15 +1068,15 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35Inner {
             |inner, hit| inner.prime_dense_prefix(tokens, cache_salt, Some(hit)),
         )
     }
-
-    fn set_generation_suffix(&mut self, suffix: Option<std::sync::Arc<[u32]>>) {
-        self.dflash2_states.generation_suffix = suffix;
-    }
 }
 
 impl DFlash2Target for Qwen35Inner {
     fn dflash2(&self) -> Option<&super::dflash2::DFlash2Model> {
         self.dflash2.as_ref()
+    }
+
+    fn lane_seq(&self) -> u32 {
+        self.active_scheduled_seq.unwrap_or(0)
     }
 
     fn dflash2_states(&self) -> &crate::models::qwen3_5::dflash2_state::paged::DFlash2States {
@@ -2451,7 +2451,9 @@ mod paged_dflash2_tests {
             .expect("R")
             .ram()
             .expect("a RAM copy")
-            .window;
+            .window
+            .as_ref()
+            .expect("a window");
         let begin = window
             .begin()
             .max(48 - (draft.config.sliding_window as u32 - 1));
@@ -2538,7 +2540,7 @@ mod paged_dflash2_tests {
                 .ok_or_else(|| Error::from_reason("no parked state"))?;
             assert_eq!(entry.tokens(), &full[..192]);
             let anchor = entry.ram().expect("a RAM copy");
-            assert_eq!(anchor.window.end(), 192);
+            assert_eq!(anchor.window.as_ref().expect("a window").end(), 192);
             let mut arrays = Vec::new();
             anchor.collect_arrays(&mut arrays);
             arrays.into_iter().map(bits).collect()
@@ -2746,7 +2748,7 @@ mod paged_dflash2_tests {
         script_claims(&[ScriptedClaim::Wait, ScriptedClaim::Grant { freed: false }]);
         let prefix = inner.prime_dspark_prefix_state(&prompt, true, 0)?;
         let draft = inner.dflash2.as_ref().expect("draft");
-        let bytes = anchor_bytes(&inner.config, &draft.config) + draft.config.kv_ring_bytes();
+        let bytes = anchor_bytes(&inner.config, Some(&draft.config)) + draft.config.kv_ring_bytes();
         assert_eq!(
             restore_log(take_claim_log()),
             vec![(ClaimClass::InService, Refusal::Waits, bytes); 2]
@@ -2862,8 +2864,8 @@ mod paged_dflash2_tests {
             let prefix = inner.prime_dspark_prefix_state(&prompt, true, 0)?;
             let anchor = inner
                 .dflash2_states
-                .turn
-                .as_ref()
+                .turns
+                .get(&0)
                 .expect("the turn's plan")
                 .anchor_bytes;
             let limit = grow.max(anchor) + grow.min(anchor) / 2;
@@ -3659,8 +3661,8 @@ mod paged_dflash2_tests {
             assert_eq!(inner.dflash2_states.counters.lazy_junctions, 2);
             let points: Vec<u32> = inner
                 .dflash2_states
-                .turn
-                .as_ref()
+                .turns
+                .get(&0)
                 .expect("D's turn")
                 .plan
                 .boundaries
@@ -3923,7 +3925,7 @@ mod paged_dflash2_tests {
         })();
         PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
         result?;
-        let turn = inner.dflash2_states.turn.as_ref().expect("the turn state");
+        let turn = inner.dflash2_states.turns.get(&0).expect("the turn state");
         assert!(
             turn.plan.boundaries.is_empty(),
             "{:?}",

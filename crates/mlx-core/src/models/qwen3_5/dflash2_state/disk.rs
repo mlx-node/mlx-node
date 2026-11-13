@@ -18,11 +18,11 @@ use crate::array::DType;
 use crate::array::memory::WeightsResident;
 use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, ShardIdentity};
 use crate::disk_tier::{
-    CacheNamespace, DiskTier, DiskTierOptions, PersistentIdentity, cache_namespace, open_disk_tier,
-    state_geometry,
+    CacheNamespace, DiskTier, DiskTierOptions, DraftNamespace, PersistentIdentity, cache_namespace,
+    open_disk_tier, state_geometry,
 };
 use crate::models::qwen3_5::config::Qwen3_5Config;
-use crate::models::qwen3_5::dflash2::DFlash2Model;
+use crate::models::qwen3_5::dflash2::{DFlash2Config, DFlash2Model};
 use crate::models::qwen3_5::dflash2_turn::DFlash2Target;
 use crate::models::qwen3_5::draft_context::DraftContextWindow;
 use crate::models::qwen3_5::gdn_sidecar::{self, GdnSidecarGeometry};
@@ -38,7 +38,8 @@ use super::write_behind::WriteBehind;
 /// The model's state tier: one per model, so one state write in flight.
 pub(crate) struct StateDisk {
     pub(crate) tier: Arc<DiskTier>,
-    /// Splash `stateSpans`: the GDN cell, then the draft context window.
+    /// Splash `stateSpans`: the GDN cell, then the draft context window; the
+    /// cell alone on a load without a draft.
     pub(crate) spans: Vec<u64>,
     /// The `gdn`, `draft` and `context` lines every object carries.
     pub(crate) geometry: String,
@@ -101,12 +102,13 @@ impl StateDisk {
     pub(crate) fn new(
         tier: Arc<DiskTier>,
         gdn: GdnSidecarGeometry,
-        window_bytes: u64,
+        window_bytes: Option<u64>,
         window_slots: u32,
         geometry: String,
         block_bytes: u64,
     ) -> Option<Self> {
-        let spans = vec![gdn.cell_bytes()?, window_bytes];
+        let mut spans = vec![gdn.cell_bytes()?];
+        spans.extend(window_bytes);
         let bytes = usize::try_from(spans.iter().sum::<u64>()).ok()?;
         let (landed_tx, landed_rx) = std::sync::mpsc::channel();
         let write_behind = WriteBehind::new(tier.persistent);
@@ -375,7 +377,10 @@ pub(crate) fn stage<T: DFlash2Target>(
     let (cell_span, window_span) = staging.split_at_mut(cell);
     let encoded = gdn_sidecar::encode_into(&config, &disk.gdn, &anchor.linear, cell_span)
         .unwrap_or(false)
-        && anchor.window.write_bytes(window_span).unwrap_or(false);
+        && match anchor.window.as_ref() {
+            Some(window) => window.write_bytes(window_span).unwrap_or(false),
+            None => window_span.is_empty(),
+        };
     if !encoded {
         disk.staging = Some(staging);
         return Staged::Refused;
@@ -385,7 +390,10 @@ pub(crate) fn stage<T: DFlash2Target>(
         key,
         bytes: state_object_bytes(&layout, &label),
         landed: false,
-        window_begin: anchor.window.begin(),
+        window_begin: anchor.window.as_ref().map_or_else(
+            || u32::try_from(entry.depth()).unwrap_or(u32::MAX),
+            DraftContextWindow::begin,
+        ),
         chain_owed: !disk.chain_on_disk(entry),
     };
     let object = ColdStateObject {
@@ -1097,7 +1105,10 @@ pub(crate) fn encode_anchor(
     let mut bytes = vec![0; usize::try_from(disk.spans.iter().sum::<u64>()).ok()?];
     let (cell, window) = bytes.split_at_mut(disk.spans[0] as usize);
     (gdn_sidecar::encode_into(config, &disk.gdn, &anchor.linear, cell).ok()?
-        && anchor.window.write_bytes(window).ok()?)
+        && match anchor.window.as_ref() {
+            Some(lane) => lane.write_bytes(window).ok()?,
+            None => window.is_empty(),
+        })
     .then_some(bytes)
 }
 
@@ -1432,12 +1443,18 @@ pub(crate) struct TierLoad<'a> {
     /// The dense-shaped config the GDN geometry reads.
     pub dense: &'a Qwen3_5Config,
     pub activation: DType,
-    pub draft: &'a DFlash2Model,
-    pub draft_files: &'a DraftLoadGuard<'a>,
+    /// The DFlash2 draft and its files; `None` for a load without one.
+    pub draft: Option<DraftTier<'a>>,
     pub adapter: &'a PagedKVCacheAdapter,
     pub files: CheckpointFiles<'a>,
     pub weights: &'a WeightsResident,
     pub guard: &'a CheckpointLoadGuard<'a>,
+}
+
+/// A draft load's draft, as its tier names it.
+pub(crate) struct DraftTier<'a> {
+    pub model: &'a DFlash2Model,
+    pub files: &'a DraftLoadGuard<'a>,
 }
 
 /// The draft's files as Splash `assembly.verify` holds every source of the
@@ -1471,9 +1488,10 @@ fn draft_identities(dir: &Path) -> Option<HashMap<String, ShardIdentity>> {
     Some(files)
 }
 
-/// Splash `openDiskTier` for a DFlash2 load: the adapter's state-backed cold
+/// Splash `openDiskTier` for a paged load: the adapter's state-backed cold
 /// context and the model's state tier, whose landings wake `model`'s
-/// thread, or `None` when the tier stays off.
+/// thread, or `None` when the tier stays off. A state is the GDN cell and
+/// the draft window, the cell alone without a draft.
 pub(crate) fn open_state_disk(
     load: &TierLoad<'_>,
     options: &DiskTierOptions,
@@ -1481,14 +1499,11 @@ pub(crate) fn open_state_disk(
 ) -> Option<(ColdTierContext, StateDisk)> {
     let geometry = gdn_sidecar::geometry(load.dense, load.activation)?;
     let cell = geometry.cell_bytes()?;
-    let draft = &load.draft.config;
-    let window = draft.context_window_bytes();
-    let state_bytes = cell.saturating_add(window);
-    let geometry_text = state_geometry(
-        geometry.namespace_gdn(),
-        draft.namespace_geometry(),
-        draft.context_width(),
-    );
+    let draft = load.draft.as_ref().map(|draft| &draft.model.config);
+    let window = draft.map(DFlash2Config::context_window_bytes);
+    let state_bytes = cell.saturating_add(window.unwrap_or(0));
+    let draft_geometry = draft.map(|draft| (draft.namespace_geometry(), draft.context_width()));
+    let geometry_text = state_geometry(geometry.namespace_gdn(), draft_geometry);
     let pool = load.adapter.layer_kv_pool();
     let cache_dtype = format!("{:?}", pool.cache_dtype());
     let identity = || {
@@ -1505,15 +1520,24 @@ pub(crate) fn open_state_disk(
             },
             load.weights,
         )?;
-        let mut components = vec![b"dflash2-draft\0".to_vec()];
-        crate::cold_tier::push_dir_identity(load.draft_files.dir, &mut components)?;
-        components.push(std::fs::read(load.draft_files.dir.join("config.json")).ok()?);
+        let draft_fingerprint = match load.draft.as_ref() {
+            Some(draft) => {
+                let mut components = vec![b"dflash2-draft\0".to_vec()];
+                crate::cold_tier::push_dir_identity(draft.files.dir, &mut components)?;
+                components.push(std::fs::read(draft.files.dir.join("config.json")).ok()?);
+                Some(mlx_paged_attn::ColdCacheFingerprint::from_components(
+                    components.iter().map(Vec::as_slice),
+                ))
+            }
+            None => None,
+        };
         let changed = if !load.guard.stable_after_fingerprint() {
-            Some(load.files.label())
-        } else if !load.draft_files.stable_after_fingerprint() {
-            Some(load.draft_files.dir.display())
+            Some(load.files.label().to_string())
         } else {
-            None
+            load.draft
+                .as_ref()
+                .filter(|draft| !draft.files.stable_after_fingerprint())
+                .map(|draft| draft.files.dir.display().to_string())
         };
         if let Some(changed) = changed {
             tracing::warn!(
@@ -1522,12 +1546,15 @@ pub(crate) fn open_state_disk(
             );
             return None;
         }
-        let draft_fingerprint = mlx_paged_attn::ColdCacheFingerprint::from_components(
-            components.iter().map(Vec::as_slice),
-        );
         let (namespace, state) = cache_namespace(&CacheNamespace {
             target,
-            draft: draft_fingerprint,
+            draft: draft_fingerprint
+                .zip(draft)
+                .map(|(fingerprint, draft)| DraftNamespace {
+                    fingerprint,
+                    geometry: draft.namespace_geometry(),
+                    context_width: draft.context_width(),
+                }),
             kv: (
                 pool.block_size(),
                 pool.num_layers() as u32,
@@ -1536,8 +1563,6 @@ pub(crate) fn open_state_disk(
                 &cache_dtype,
             ),
             gdn: geometry.namespace_gdn(),
-            draft_geometry: draft.namespace_geometry(),
-            context_width: draft.context_width(),
         });
         Some(PersistentIdentity {
             namespace,
@@ -1548,11 +1573,15 @@ pub(crate) fn open_state_disk(
     let tier = open_disk_tier(options, identity, state_bytes)?;
     let block_bytes = mlx_paged_attn::block_object_bytes(pool);
     let context = state_context(&tier);
+    let window_slots = match draft {
+        Some(draft) => u32::try_from(draft.sliding_window).ok()?,
+        None => 0,
+    };
     let disk = StateDisk::new(
         tier,
         geometry,
         window,
-        u32::try_from(draft.sliding_window).ok()?,
+        window_slots,
         geometry_text,
         block_bytes,
     )?;

@@ -326,6 +326,7 @@ impl Qwen35Inner {
             .ok_or_else(|| Error::from_reason("a replay's prefix passed its tokens"))?;
         let logits = match decode {
             crate::models::qwen3_5::dflash2_turn::SerialDecode::Autoregressive => {
+                self.open_dense_lane_turn(tokens, cached, cache_salt, true)?;
                 self.dense_paged_prefill(suffix, &prefix, None)?.0
             }
             crate::models::qwen3_5::dflash2_turn::SerialDecode::DFlash2 => {
@@ -431,8 +432,31 @@ impl Qwen35Inner {
 }
 
 impl Qwen35Inner {
+    /// Opens the lane's state points once the prime put it at `cached`, on
+    /// a load without a draft (a draft load's turns open their own).
+    pub(crate) fn open_dense_lane_turn(
+        &mut self,
+        tokens: &[u32],
+        cached: usize,
+        cache_salt: u64,
+        reuse: bool,
+    ) -> Result<()> {
+        if self.dflash2.is_some() || self.paged_adapter.is_none() {
+            return Ok(());
+        }
+        let seq = crate::models::qwen3_5::dflash2_turn::DFlash2Target::lane_seq(self);
+        let restored = match self.gdn_in_use.get(&seq) {
+            Some(crate::engine::governor::ledger::UnitKey::Store(id)) => Some(*id),
+            _ => None,
+        };
+        crate::models::qwen3_5::dflash2_turn::open_lane_turn(
+            self, tokens, cached, cache_salt, reuse, restored,
+        )
+    }
+
     /// The paged prefill; with `draft`, the draft context advanced over the
-    /// prompt from the same forward's taps.
+    /// prompt from the same forward's taps. Without one, on a load without
+    /// a draft, the turn's state points publish as the chunks reach them.
     pub(crate) fn dense_paged_prefill(
         &mut self,
         suffix_tokens: &[u32],
@@ -568,6 +592,33 @@ impl Qwen35Inner {
             )?;
                 mtp_hidden = Some(hidden);
                 (logits, checkpoint)
+            } else if self.dflash2.is_none()
+                && self
+                    .dflash2_states
+                    .turns
+                    .contains_key(&self.active_scheduled_seq.unwrap_or(0))
+            {
+                let cached = prefix.effective_cached_prefix_len;
+                let captures = crate::models::qwen3_5::dflash2_turn::lane_command_breaks(
+                    self,
+                    cached,
+                    cached + suffix_tokens.len(),
+                    chunk_size,
+                );
+                let mut sink = crate::models::qwen3_5::dflash2_turn::LaneStateSink::new(&captures);
+                crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
+                    &prefix.full_tokens,
+                    suffix_tokens,
+                    cached as u32,
+                    prefix.gdn_prefix_already_primed,
+                    &embed,
+                    &mut crate::models::qwen3_5::dflash2_turn::LanePrefill(self),
+                    &layer_kinds,
+                    chunk_size,
+                    rope_deltas,
+                    turn_cancel.as_deref(),
+                    Some(&mut sink as &mut dyn PrefillTapSink),
+                )?
             } else {
                 crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
                     &prefix.full_tokens,
@@ -654,15 +705,26 @@ impl PagedBackend for Qwen35Inner {
         Self: 'a;
     type PrefixState = Qwen35PrefixState;
 
+    fn set_generation_suffix(&mut self, suffix: Option<std::sync::Arc<[u32]>>) {
+        self.dflash2_states.generation_suffix = suffix;
+    }
+
     fn prime_prefix_state(
         &mut self,
         plan: &[u32],
-        _reuse_cache: bool,
+        reuse_cache: bool,
         _block_size: usize,
         _extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<Self::PrefixState> {
-        self.prime_dense_prefix(plan, cache_salt, None)
+        let prefix = self.prime_dense_prefix(plan, cache_salt, None)?;
+        self.open_dense_lane_turn(
+            plan,
+            prefix.effective_cached_prefix_len,
+            cache_salt,
+            reuse_cache,
+        )?;
+        Ok(prefix)
     }
 
     fn paged_prefill(
@@ -701,7 +763,11 @@ impl PagedBackend for Qwen35Inner {
             .and_then(PagedKVCacheAdapter::active_seq_id);
         // A DFlash2 turn's lane is released at its end (Splash
         // `Engine::release`): its states are the published ones.
-        let dflash2 = self.dflash2_states.turn.is_some();
+        let dflash2 = self.dflash2.is_some()
+            && self
+                .dflash2_states
+                .turns
+                .contains_key(&self.active_scheduled_seq.unwrap_or(0));
         let mut release_pending = false;
         let mut finalize_error = match self.paged_adapter.as_mut() {
             Some(adapter) if reuse_cache && !dflash2 => {

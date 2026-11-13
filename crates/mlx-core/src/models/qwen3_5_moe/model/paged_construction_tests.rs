@@ -2347,3 +2347,181 @@ fn moe_metal_load_has_no_flat_lane() {
         refused.reason
     );
 }
+
+/// The tiny MoE model with no draft on a production-shaped pool, its states
+/// on `tier`: the GDN cell alone. A 32-row state window and 16-row chunks
+/// on this thread plan a checkpoint at 64 and the replay point at 128 for a
+/// 140-token prompt.
+fn plain_moe_on(
+    tier: &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
+    test: &str,
+) -> Option<Qwen35MoeInner> {
+    if crate::test_support::paged_prefill_unsupported(test) {
+        return None;
+    }
+    let mut inner = moe_paged_inner_or_skip(test)?;
+    cast_moe_inner_weights_bf16(&mut inner);
+    assert!(inner.dflash2.is_none());
+    let dense = inner.config.to_dense_config();
+    crate::models::qwen3_5::dflash2_state::disk::tests::attach_tier(
+        &mut inner.dflash2_states,
+        &dense,
+        inner.paged_adapter.as_ref().expect("pool"),
+        tier,
+        0,
+        0,
+    );
+    inner.paged_adapter.as_mut().expect("pool").set_cold_tier(
+        crate::models::qwen3_5::dflash2_state::disk::state_context(&tier.tier),
+    );
+    Some(inner)
+}
+
+fn moe_small_plan(on: bool) {
+    crate::models::qwen3_5::dflash2_state::plan::STATE_WINDOW_OVERRIDE
+        .with(|window| window.set(on.then_some(32)));
+    crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE
+        .with(|rows| rows.set(on.then_some(16)));
+}
+
+/// The encoded GDN cell of the RAM copy of the state `depth` deep.
+fn moe_cell_at(inner: &Qwen35MoeInner, depth: usize) -> Vec<u8> {
+    let anchor = inner
+        .dflash2_states
+        .store
+        .entries()
+        .find(|entry| entry.depth() == depth)
+        .and_then(|entry| entry.ram())
+        .unwrap_or_else(|| panic!("a RAM state at {depth}"));
+    crate::models::qwen3_5::dflash2_state::disk::encode_anchor(
+        &inner.dflash2_states,
+        &inner.config.to_dense_config(),
+        anchor,
+    )
+    .expect("an encoded cell")
+}
+
+/// Splash `openDiskTier` for a MoE load without a draft: a pool load whose
+/// plan set a state's staging aside opens the tier with one span, the GDN
+/// cell.
+/// Mutation AT1m (the MoE tier opens only with a draft) → red.
+#[test]
+fn moe_plain_paged_load_opens_the_state_tier() {
+    let Some(mut inner) = moe_paged_inner_or_skip("moe_plain_paged_load_opens_the_state_tier")
+    else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!(
+        "mlx-s13-moe-plain-tier-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let target = root.join("target");
+    std::fs::create_dir_all(&target).expect("target dir");
+    std::fs::create_dir_all(root.join("tmp")).expect("temp root");
+    std::fs::write(target.join("model.safetensors"), b"target").expect("target shard");
+    inner.disk_options = crate::disk_tier::DiskTierOptions {
+        cache_disk: crate::disk_tier::CacheDisk::Bytes(1 << 30),
+        persistent: false,
+        cache_dir: Some(root.join("cache")),
+        temp_root: Some(root.join("tmp")),
+    };
+    let dense = inner.config.to_dense_config();
+    let activation =
+        crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&inner).unwrap();
+    let cell = crate::models::qwen3_5::gdn_sidecar::geometry(&dense, activation)
+        .and_then(|geometry| geometry.cell_bytes())
+        .expect("a GDN cell");
+    install_plan(&mut inner, Some(512), false);
+    if let Some(plan) = inner.memory_plan.as_mut() {
+        plan.footprint.state_staging_bytes = dense.recurrent_state_bytes();
+    }
+    let weights = crate::array::memory::WeightsResident::for_test(1, 4096);
+    let files = crate::cold_tier::CheckpointFiles::Dir(&target);
+    let mut guard = crate::cold_tier::CheckpointLoadGuard::before_read(files, true);
+    guard.record_read();
+    inner.build_disk_tier_context(files, None, &weights, &guard);
+    let disk = inner
+        .dflash2_states
+        .disk
+        .as_ref()
+        .expect("a plain MoE paged load opens the state tier");
+    assert_eq!(disk.spans, vec![cell]);
+    assert!(disk.geometry.ends_with("draft none\ncontext none\n"));
+    disk.tier.close(std::time::Instant::now());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Splash `publishReachedStateBoundaries`, `WriteBehind`, `Cache::adopt`
+/// and `promotedCopy` on a MoE load without a draft: its plain turn
+/// publishes the checkpoint and the replay point, the replay point waits
+/// behind and a clean close writes it, and after a restart the next load's
+/// prime resumes at it from disk with the stored cell, the read turned
+/// resident.
+/// Mutation AP1m (the MoE prime opens no lane turn) → red.
+#[test]
+fn moe_plain_restart_restores_the_disk_state() -> Result<()> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::persistent_test_tier;
+    const TEST: &str = "moe_plain_restart_restores_the_disk_state";
+    let tier = persistent_test_tier("s13-moe-ar-restart", 1 << 30);
+    let Some(mut first) = plain_moe_on(&tier, TEST) else {
+        return Ok(());
+    };
+    moe_small_plan(true);
+    let result = (|| -> Result<()> {
+        let tokens: Vec<u32> = (0..140).map(|i| (i * 7 + 3) % 13 + 1).collect();
+        let stream = Stream::default(crate::stream::DeviceType::Gpu);
+        let prefix = first.prime_prefix_state(&tokens, true, 16, &[], 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len, 0);
+        first.paged_prefill(&tokens, &prefix, stream)?.eval();
+        first.finalize_paged_turn(true, 0);
+        let counters = first.dflash2_states.counters;
+        assert_eq!(
+            (
+                counters.checkpoint_publications,
+                counters.replay_state_publications
+            ),
+            (1, 1)
+        );
+        let waiting = |inner: &Qwen35MoeInner| {
+            inner
+                .dflash2_states
+                .disk
+                .as_ref()
+                .expect("tier")
+                .write_behind
+                .snapshot()
+        };
+        assert_eq!(waiting(&first).waiting, 1);
+        let stored = moe_cell_at(&first, 128);
+        assert!(crate::models::qwen3_5::dflash2_state::disk::close_cache(
+            &mut first,
+            std::time::Instant::now() + std::time::Duration::from_secs(30)
+        ));
+        assert_eq!(waiting(&first).durable, 1);
+        drop(first);
+
+        let tier = tier.reopen("s13-moe-ar-restart", 1 << 30);
+        let Some(mut second) = plain_moe_on(&tier, TEST) else {
+            return Ok(());
+        };
+        assert_eq!(
+            crate::models::qwen3_5::dflash2_state::disk::adopt_all(&mut second),
+            1
+        );
+        let prefix = second.prime_prefix_state(&tokens, true, 16, &[], 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len, 128);
+        let disk = second.dflash2_states.disk.as_ref().expect("tier");
+        assert_eq!(
+            disk.counters.promotions + disk.counters.promotions_skipped,
+            1
+        );
+        assert_eq!(moe_cell_at(&second, 128), stored);
+        Ok(())
+    })();
+    moe_small_plan(false);
+    result
+}

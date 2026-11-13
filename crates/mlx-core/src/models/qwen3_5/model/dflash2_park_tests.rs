@@ -1507,7 +1507,10 @@ fn anchor(inner: &Qwen35Inner) -> crate::models::qwen3_5::dflash2_state::paged::
             .unwrap();
         }
     }
-    PagedAnchor { linear, window }
+    PagedAnchor {
+        linear,
+        window: Some(window),
+    }
 }
 
 /// A parked DFlash2 state on `tokens` (whole blocks) of this model's
@@ -1965,23 +1968,26 @@ fn warning_holds_back_publications_not_the_lane() -> Result<()> {
     );
 
     let row = block_size;
-    inner.dflash2_states.turn = Some(TurnStates {
-        plan: StatePlan {
-            boundaries: vec![StateBoundary {
-                tokens: row,
-                disposable: false,
-            }],
-            prompt_replay: row,
+    inner.dflash2_states.turns.insert(
+        0,
+        TurnStates {
+            plan: StatePlan {
+                boundaries: vec![StateBoundary {
+                    tokens: row,
+                    disposable: false,
+                }],
+                prompt_replay: row,
+            },
+            cursor: 0,
+            passed: Vec::new(),
+            anchor_bytes: anchor(&inner).state_bytes(),
+            latest_checkpoint: None,
+            cache_salt: 0,
+            junction: 0,
+            prompt_tokens: row + 1,
+            reuse: true,
         },
-        cursor: 0,
-        passed: Vec::new(),
-        anchor_bytes: anchor(&inner).state_bytes(),
-        latest_checkpoint: None,
-        cache_salt: 0,
-        junction: 0,
-        prompt_tokens: row + 1,
-        reuse: true,
-    });
+    );
     assert!(
         matches!(
             reserve_capture(&mut inner, row)?,
@@ -1989,7 +1995,7 @@ fn warning_holds_back_publications_not_the_lane() -> Result<()> {
         ),
         "the replay point's capture is granted"
     );
-    inner.dflash2_states.turn = None;
+    inner.dflash2_states.turns.remove(&0);
     assert_eq!(governor.publications_refused(7), 1);
 
     let mut lane = fixture(0xDFA5_3802);
@@ -2193,7 +2199,7 @@ fn dead_leaves_go_after_checkpoints_before_ordinary_states() -> Result<()> {
     cache_chain(&inner, &chain_tokens(96, 4, block_size));
     let anchor = || PagedAnchor {
         linear: Vec::new(),
-        window: DraftContextWindow::new(64, 8).expect("window"),
+        window: Some(DraftContextWindow::new(64, 8).expect("window")),
     };
     let (ordinary, checkpoint) = (
         chain_tokens(97, 1, block_size),

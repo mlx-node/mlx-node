@@ -767,15 +767,15 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35MoeInner {
             |inner, hit| inner.prime_moe_prefix(tokens, cache_salt, Some(hit)),
         )
     }
-
-    fn set_generation_suffix(&mut self, suffix: Option<std::sync::Arc<[u32]>>) {
-        self.dflash2_states.generation_suffix = suffix;
-    }
 }
 
 impl DFlash2Target for Qwen35MoeInner {
     fn dflash2(&self) -> Option<&crate::models::qwen3_5::dflash2::DFlash2Model> {
         self.dflash2.as_ref()
+    }
+
+    fn lane_seq(&self) -> u32 {
+        self.active_scheduled_seq.unwrap_or(0)
     }
 
     fn dflash2_states(&self) -> &crate::models::qwen3_5::dflash2_state::paged::DFlash2States {

@@ -5042,6 +5042,14 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .claim
             .as_ref()
             .map(|claim| Scope::enter_lane(claim.claim()));
+        self.inner.set_generation_suffix(
+            prepared
+                .admitted
+                .tokenizer
+                .generation_suffix(&prepared.admitted.config)
+                .ok()
+                .flatten(),
+        );
         let prefix_admission = self.inner.prepare_scheduled_prefix(
             seq_id,
             &prepared.admitted.tokens,
@@ -5667,6 +5675,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .claim
             .as_ref()
             .map(|claim| Scope::enter_lane(claim.claim()));
+        self.inner.set_generation_suffix(
+            turn.payload
+                .tokenizer
+                .generation_suffix(&turn.payload.config)
+                .ok()
+                .flatten(),
+        );
         let prefix_admission = self.inner.prepare_scheduled_prefix(
             turn.seq_id,
             &replay_tokens,
@@ -9797,7 +9812,7 @@ pub(crate) mod tests {
         state.owner_last_used.insert(2, 0);
         let anchor = || PagedAnchor {
             linear: Vec::new(),
-            window: DraftContextWindow::new(64, 8).expect("window"),
+            window: Some(DraftContextWindow::new(64, 8).expect("window")),
         };
         let (ordinary, checkpoint) = (tokens_of(41, 1), tokens_of(42, 1));
         let store = &mut state.inner.dflash2_states.store;

@@ -282,8 +282,9 @@ impl Qwen35Inner {
         Ok(())
     }
 
-    /// Opens the load's SSD tier for its DFlash2 states (Splash
-    /// `openDiskTier`) when the memory plan set its state staging aside, and
+    /// Opens the load's SSD tier for its states (Splash `openDiskTier`), with
+    /// or without a draft, when the memory plan set its state staging aside,
+    /// and
     /// gives the adapter its state-backed cold context. A persistent tier's
     /// identity is read only after `materialize_weights` (the `weights`
     /// witness) and only while `guard` and `draft_files` show the files
@@ -299,13 +300,15 @@ impl Qwen35Inner {
             .memory_plan
             .as_ref()
             .is_some_and(|plan| plan.footprint.state_staging_bytes > 0);
-        let (Some(draft_files), Some(draft), Some(adapter), true) = (
-            draft_files,
-            self.dflash2.as_ref(),
-            self.paged_adapter.as_ref(),
-            staged,
-        ) else {
+        let (Some(adapter), true) = (self.paged_adapter.as_ref(), staged) else {
             return;
+        };
+        let draft = match (self.dflash2.as_ref(), draft_files) {
+            (Some(model), Some(files)) => {
+                Some(crate::models::qwen3_5::dflash2_state::disk::DraftTier { model, files })
+            }
+            (None, _) => None,
+            (Some(_), None) => return,
         };
         let Ok(activation) =
             crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&*self)
@@ -330,7 +333,6 @@ impl Qwen35Inner {
             dense: &dense,
             activation,
             draft,
-            draft_files,
             adapter,
             files,
             weights,
@@ -617,6 +619,7 @@ impl Qwen35Inner {
 
     pub(super) fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
         self.scheduled_mtp.release(seq_id);
+        self.dflash2_states.end_turn(seq_id);
         if self.active_scheduled_seq == Some(seq_id) {
             self.active_scheduled_seq = None;
             self.caches = Some(fresh_dense_layer_caches(&self.config));
@@ -922,7 +925,8 @@ impl Qwen35Inner {
         }
         self.caches = None;
         self.idle_dflash2_lane();
-        self.dflash2_states.end_turn();
+        let seq = self.active_scheduled_seq.unwrap_or(0);
+        self.dflash2_states.end_turn(seq);
         self.clear_reuse_state();
     }
 

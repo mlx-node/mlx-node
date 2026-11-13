@@ -288,14 +288,15 @@ pub(crate) fn evaluate_qwen35_plan(
         .map_err(|error| Error::from_reason(error.message(label)))
 }
 
-/// Bytes of one stored DFlash2 state of `lanes`' load (Splash
-/// `CompositeStateLayout::cachedBytes`: the GDN cell and the window); 0
-/// without a draft on the pool.
+/// Bytes of one stored state of `lanes`' load (Splash
+/// `CompositeStateLayout::cachedBytes`: the GDN cell and the draft window,
+/// the cell alone without a draft); 0 without a pool.
 fn lanes_state_bytes(lanes: &LoadLanes<'_>) -> u64 {
     match (lanes.draft, lanes.pool) {
         (Some(draft), Some(_)) => lanes
             .recurrent_state_bytes
             .saturating_add(draft.window_bytes),
+        (None, Some(_)) => lanes.recurrent_state_bytes,
         _ => 0,
     }
 }

@@ -670,21 +670,11 @@ impl Qwen3_5MoeModel {
     ///
     /// Dispatches to model thread.
     #[napi]
-    pub fn close_cache<'env>(
-        &self,
-        env: &'env Env,
-        deadline_ms: f64,
-    ) -> Result<PromiseRaw<'env, bool>> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.thread.send(Qwen35MoeFamilyCommand::CloseCache {
-            deadline_ms,
-            reply: tx,
-        })?;
-        let promise = env.spawn_future(async move {
-            rx.await
-                .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
-        })?;
-        Ok(promise)
+    pub async fn close_cache(&self, deadline_ms: f64) -> Result<bool> {
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35MoeFamilyCommand::CloseCache { deadline_ms, reply }
+        })
+        .await
     }
 }
 

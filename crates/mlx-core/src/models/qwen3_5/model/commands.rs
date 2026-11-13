@@ -223,6 +223,7 @@ impl HybridSchedulerBackend for Qwen35Inner {
     /// The turn's replay point leaves InUse when it closes.
     fn scheduled_turn_closed(&mut self, seq_id: SeqId) {
         self.end_gdn_use(seq_id);
+        self.dflash2_states.end_turn(seq_id);
     }
 
     fn reclaims_in_order(&self) -> bool {
