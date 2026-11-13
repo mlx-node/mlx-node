@@ -135,7 +135,7 @@ export interface SupervisorOptions {
    * wrong one ship by omission.
    */
   transport: ChildTransport;
-  /** Normally `engineEnvFor(LAUNCHER_ENGINE_POLICY)`. See `env.ts` for why it is passed in. */
+  /** Normally `sidecarEnginePolicyEnv()`. See `env.ts` for why it is passed in. */
   enginePolicyEnv?: Readonly<Record<string, string>>;
   /** Supervisor-chosen env that must beat the user's shell. */
   env?: Readonly<Record<string, string>>;
@@ -184,7 +184,7 @@ export interface Supervisor {
 }
 
 /** Class-(b) errors kept per generation. See {@link recordSwallowed}. */
-const MAX_NATIVE_ERRORS = 20;
+export const MAX_NATIVE_ERRORS = 20;
 
 export function createSupervisor(opts: SupervisorOptions): Supervisor {
   const timings: SupervisorTimings = { ...DEFAULT_TIMINGS, ...opts.timings };

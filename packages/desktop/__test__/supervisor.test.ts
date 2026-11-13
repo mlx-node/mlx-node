@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
+import { COLD_CACHE_DRAIN_TIMEOUT_MS } from '@mlx-node/server/host/persist-cache';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import { DESKTOP_QUIT_DEADLINE_MS } from '../src/control-panel/shutdown-timings.js';
@@ -191,6 +192,12 @@ describe('shutdown timing', () => {
     // temp root. Keep a material margin within MAIN's whole-app quit deadline.
     expect(DEFAULT_TIMINGS.killGraceMs - SIDECAR_HOST_CLOSE_TIMEOUT_MS).toBeGreaterThanOrEqual(2_000);
     expect(DEFAULT_TIMINGS.killGraceMs).toBeLessThan(DESKTOP_QUIT_DEADLINE_MS);
+  });
+
+  it('leaves the host time to drain the disk cache writes after its HTTP close budget', () => {
+    expect(
+      DEFAULT_TIMINGS.killGraceMs - SIDECAR_HOST_CLOSE_TIMEOUT_MS - COLD_CACHE_DRAIN_TIMEOUT_MS,
+    ).toBeGreaterThanOrEqual(1_000);
   });
 });
 
