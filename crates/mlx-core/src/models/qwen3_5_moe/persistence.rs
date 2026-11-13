@@ -2195,6 +2195,12 @@ pub(crate) async fn load_with_source(
                     crate::array::memory::materialize_weights(&arrays)?
                 };
 
+                let draft_load = draft_model_path.as_deref().map(|draft_path| {
+                    crate::models::qwen3_5::dflash2_state::disk::DraftLoadGuard::before_read(
+                        Path::new(draft_path),
+                        reads_identity,
+                    )
+                });
                 let dflash2_weight_bytes = if let Some(draft_path) = draft_model_path.as_deref() {
                     let (mut draft, bytes) =
                         crate::models::qwen3_5::dflash2::load_dflash2(Path::new(draft_path))?;
@@ -2293,7 +2299,7 @@ pub(crate) async fn load_with_source(
 
                 inner.build_disk_tier_context(
                     checkpoint_files,
-                    draft_model_path.as_deref().map(Path::new),
+                    draft_load.as_ref(),
                     &weights_resident,
                     &checkpoint_load,
                 );

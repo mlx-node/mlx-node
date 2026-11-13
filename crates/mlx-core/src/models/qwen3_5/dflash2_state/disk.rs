@@ -3,7 +3,7 @@
 //! buffer every state write and read goes through (Splash
 //! `QwenStateStorage::staging_`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -16,7 +16,7 @@ use mlx_paged_attn::{
 
 use crate::array::DType;
 use crate::array::memory::WeightsResident;
-use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard};
+use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, ShardIdentity};
 use crate::disk_tier::{
     CacheNamespace, DiskTier, DiskTierOptions, PersistentIdentity, cache_namespace, open_disk_tier,
     state_geometry,
@@ -1433,11 +1433,42 @@ pub(crate) struct TierLoad<'a> {
     pub dense: &'a Qwen3_5Config,
     pub activation: DType,
     pub draft: &'a DFlash2Model,
-    pub draft_dir: &'a Path,
+    pub draft_files: &'a DraftLoadGuard<'a>,
     pub adapter: &'a PagedKVCacheAdapter,
     pub files: CheckpointFiles<'a>,
     pub weights: &'a WeightsResident,
     pub guard: &'a CheckpointLoadGuard<'a>,
+}
+
+/// The draft's files as Splash `assembly.verify` holds every source of the
+/// namespace, the draft's with the target's: taken before the draft loads,
+/// compared once its identity is read.
+pub(crate) struct DraftLoadGuard<'a> {
+    dir: &'a Path,
+    before_read: Option<HashMap<String, ShardIdentity>>,
+}
+
+impl<'a> DraftLoadGuard<'a> {
+    pub(crate) fn before_read(dir: &'a Path, enabled: bool) -> Self {
+        Self {
+            dir,
+            before_read: enabled.then(|| draft_identities(dir)).flatten(),
+        }
+    }
+
+    fn stable_after_fingerprint(&self) -> bool {
+        self.before_read.is_some() && self.before_read == draft_identities(self.dir)
+    }
+}
+
+fn draft_identities(dir: &Path) -> Option<HashMap<String, ShardIdentity>> {
+    let mut files = crate::cold_tier::snapshot_shard_identities(dir)?;
+    let config = std::fs::metadata(dir.join("config.json")).ok()?;
+    files.insert(
+        "config.json".to_string(),
+        ShardIdentity::from_metadata(&config),
+    );
+    Some(files)
 }
 
 /// Splash `openDiskTier` for a DFlash2 load: the adapter's state-backed cold
@@ -1475,13 +1506,19 @@ pub(crate) fn open_state_disk(
             load.weights,
         )?;
         let mut components = vec![b"dflash2-draft\0".to_vec()];
-        crate::cold_tier::push_dir_identity(load.draft_dir, &mut components)?;
-        components.push(std::fs::read(load.draft_dir.join("config.json")).ok()?);
-        if !load.guard.stable_after_fingerprint() {
+        crate::cold_tier::push_dir_identity(load.draft_files.dir, &mut components)?;
+        components.push(std::fs::read(load.draft_files.dir.join("config.json")).ok()?);
+        let changed = if !load.guard.stable_after_fingerprint() {
+            Some(load.files.label())
+        } else if !load.draft_files.stable_after_fingerprint() {
+            Some(load.draft_files.dir.display())
+        } else {
+            None
+        };
+        if let Some(changed) = changed {
             tracing::warn!(
-                "{}: the model directory changed during load; the SSD cache keeps temporary \
-                 files",
-                load.files.label()
+                "{changed}: the model directory changed during load; the SSD cache keeps \
+                 temporary files"
             );
             return None;
         }

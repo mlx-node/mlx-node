@@ -286,11 +286,12 @@ impl Qwen35Inner {
     /// `openDiskTier`) when the memory plan set its state staging aside, and
     /// gives the adapter its state-backed cold context. A persistent tier's
     /// identity is read only after `materialize_weights` (the `weights`
-    /// witness) and only while `guard` shows the shards unchanged.
+    /// witness) and only while `guard` and `draft_files` show the files
+    /// unchanged.
     pub(crate) fn build_disk_tier_context(
         &mut self,
         files: crate::cold_tier::CheckpointFiles<'_>,
-        draft_dir: Option<&std::path::Path>,
+        draft_files: Option<&crate::models::qwen3_5::dflash2_state::disk::DraftLoadGuard<'_>>,
         weights: &crate::array::memory::WeightsResident,
         guard: &crate::cold_tier::CheckpointLoadGuard<'_>,
     ) {
@@ -298,8 +299,8 @@ impl Qwen35Inner {
             .memory_plan
             .as_ref()
             .is_some_and(|plan| plan.footprint.state_staging_bytes > 0);
-        let (Some(draft_dir), Some(draft), Some(adapter), true) = (
-            draft_dir,
+        let (Some(draft_files), Some(draft), Some(adapter), true) = (
+            draft_files,
             self.dflash2.as_ref(),
             self.paged_adapter.as_ref(),
             staged,
@@ -329,7 +330,7 @@ impl Qwen35Inner {
             dense: &dense,
             activation,
             draft,
-            draft_dir,
+            draft_files,
             adapter,
             files,
             weights,

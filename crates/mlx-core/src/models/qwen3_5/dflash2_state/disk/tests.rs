@@ -1113,3 +1113,72 @@ fn a_full_tick_measures_the_cache_root() {
     tick(&mut inner, Tick::Full { command_pages: 0 });
     assert!(!sibling.exists(), "the tier grew: the idle sibling went");
 }
+
+/// Codex disk.rs:1480: a draft replaced between its load and the identity
+/// read keys nothing by the replacement.
+#[test]
+fn a_draft_changed_during_load_keeps_the_tier_temporary() {
+    if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+        return;
+    }
+    let mut inner = crate::models::qwen3_5::dflash2_decode::tests::tiny_dflash_inner_with_config(
+        0x5713_1480,
+        |_| {},
+    );
+    install_pool(&mut inner, 8, 8, passing_probe()).expect("pool");
+    let root = std::env::temp_dir().join(format!(
+        "mlx-s13-draft-guard-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let target = root.join("target");
+    let draft = root.join("draft");
+    std::fs::create_dir_all(&target).expect("target dir");
+    std::fs::create_dir_all(&draft).expect("draft dir");
+    std::fs::create_dir_all(root.join("tmp")).expect("temp root");
+    std::fs::write(target.join("model.safetensors"), b"target").expect("target shard");
+    std::fs::write(draft.join("model.safetensors"), b"draft").expect("draft shard");
+    std::fs::write(draft.join("config.json"), b"{}").expect("draft config");
+    let options = DiskTierOptions {
+        cache_disk: CacheDisk::Bytes(1 << 30),
+        persistent: true,
+        cache_dir: Some(root.join("cache")),
+        temp_root: Some(root.join("tmp")),
+    };
+    let weights = WeightsResident::for_test(1, 4096);
+    let files = CheckpointFiles::Dir(&target);
+    let open = |replace_draft: bool| {
+        let mut guard = CheckpointLoadGuard::before_read(files, true);
+        guard.record_read();
+        let draft_files = DraftLoadGuard::before_read(&draft, true);
+        if replace_draft {
+            std::fs::write(draft.join("model.safetensors"), b"replacement draft")
+                .expect("replacement");
+        }
+        let load = TierLoad {
+            family: "qwen3_5",
+            config_json: b"{}".to_vec(),
+            dense: &inner.config,
+            activation: DType::BFloat16,
+            draft: inner.dflash2.as_ref().expect("a draft"),
+            draft_files: &draft_files,
+            adapter: inner.paged_adapter.as_ref().expect("pool"),
+            files,
+            weights: &weights,
+            guard: &guard,
+        };
+        let (_, disk) = open_state_disk(&load, &options, inner.model_id).expect("a tier");
+        let persistent = disk.tier.persistent;
+        disk.tier.close(Instant::now());
+        persistent
+    };
+    assert!(open(false), "an unchanged draft keys a persistent tier");
+    assert!(
+        !open(true),
+        "a draft replaced during load keeps the tier temporary"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -3120,6 +3120,12 @@ async fn load_with_thread_impl(
                     crate::array::memory::materialize_weights(&arrays)?
                 };
 
+                let draft_load = draft_model_path.as_deref().map(|draft_path| {
+                    super::dflash2_state::disk::DraftLoadGuard::before_read(
+                        Path::new(draft_path),
+                        disk.reads_identity(),
+                    )
+                });
                 let dflash2_weight_bytes = if let Some(draft_path) = draft_model_path.as_deref() {
                     let (draft, bytes) = super::dflash2::load_dflash2(Path::new(draft_path))?;
                     draft.validate_target(&config)?;
@@ -3257,7 +3263,7 @@ async fn load_with_thread_impl(
 
                 inner.build_disk_tier_context(
                     checkpoint_files,
-                    draft_model_path.as_deref().map(Path::new),
+                    draft_load.as_ref(),
                     &weights_resident,
                     &checkpoint_load,
                 );
