@@ -24,8 +24,13 @@ never loaded as one dense model.
 For [Unsloth UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-Q4_K_XL),
 place all four splits together and pass the first `.gguf` file. The loader
 validates the split descriptors before inference. It extracts embedded tokenizer
-assets into a small `.mlx-qwen4-assets-v2-*` directory in the writable native
-GGUF asset root. `MLX_NATIVE_GGUF_CACHE_DIR` overrides that asset root;
+assets into a small `.mlx-qwen4-assets-v3-*` directory in the writable native
+GGUF asset root. As in Splash and llama.cpp, the GGUF's CONTROL rows
+(`<|im_end|>`) are special tokens and its USER_DEFINED rows (`<think>`,
+`</think>`, `<tool_call>`, `</tool_call>`) are not, so decoded output keeps the
+tags the reasoning split and the tool-call parser read. The load refuses a
+tokenizer that splits one of these tags, or the `<|im_end|>` stop text, or whose
+skip-special decode drops a tag. Sidecars of an older version are never reused. `MLX_NATIVE_GGUF_CACHE_DIR` overrides that asset root;
 otherwise the loader uses the XDG/OS user cache, with a temporary-directory
 fallback. The source checkpoint directory only needs read access.
 Quantized weight codes and scale/minimum values are preserved during import;
@@ -116,7 +121,7 @@ reclaims the allocator freelist and re-polls before erroring.
 
 Flash Next does not build or open a derived weight pack. A load creates no
 files or directories under the retired `qwen4-packed` cache root. The small
-`.mlx-qwen4-assets-v2-*` config/tokenizer sidecar described above is separate
+`.mlx-qwen4-assets-v3-*` config/tokenizer sidecar described above is separate
 and remains in use.
 
 For one release, opening a GGUF checkpoint also performs best-effort cleanup of
@@ -168,7 +173,19 @@ and `directBytes`, and layered fill progress (`directLayers`,
 `directFilledLayers`, `directFillInProgress`). The bank allowance and live
 memory of the residency decision are `bankBudgetBytes` and
 `liveNonReclaimableBytes`; `fallbackReason` is present when that gate selected
-partial slots. The prefill window and live decoded-row counters are
+partial slots. `prefillChunkTokens` is the prefill window: the 1,024 rows
+whose scratch the memory plan prices as the lane transient at the served
+window, on a whole and a partial store alike; free memory at load or at a
+turn never cuts it. When the load gate chose partial slots, the host holds
+them beside the scratch of one 1,024-row chunk at the 65,536-token allowance
+(or `--max-context`), so a prefill pass past that length halves its rows until
+its scratch fits that reservation. The expert counters since load are `slotHits` and
+`slotMisses` (routed experts served without a read, and read by a slot fill),
+`checkpointBytesRead` (bytes read from the checkpoint files by expert fills
+and row imports; the page cache may serve part of them) and `routeReplays`
+(decode tokens and prefill windows replayed after a tentative device route
+missed the slots). A request keeps its own replay cooldown when the scheduler
+switches rows. The live decoded-row counters are
 `decodedRowLookups`, `decodedRowMisses`, `decodedRowHitRate`,
 `decodedRowEvictions`, `decodedRowEvictedBytes`, plus `prefetchedRows` /
 `lateRows` (imports the reader threads had ready versus rows the model thread
@@ -242,6 +259,42 @@ an omitted one fills it. Inspect `contextLimits()` for the windows and
 MLP projections across ready rows. Warm continuation reuses that
 owner's full state; standalone KV-only prefix restores are disabled because
 recurrent, PLE, and indexer state are also required.
+
+**Warm prefix reuse.** A turn stores the cell outside the pool (GDN conv
+history, GDN recurrent matrices, PLE history: 115,642,368 B on the released
+geometry, plus 4 B per token and 8 B per block of its lineage) at lines of the
+prefill pass grid: the replay point, the last 1,024-row line at or before the
+generation prompt's `<|im_start|>`, and rolling checkpoints every 4,096 rows,
+each retiring the turn's previous one (Splash `StateCache`). Its KV blocks
+below each state are registered in the prefix cache. A later turn of the same
+loaded model whose prompt starts with a stored lineage, every block of it still
+cached, restores that cell and prefills only the rest; `cachedTokens` (and the
+usage's cached input tokens) reports that row. A pass reads its own rows' K/V
+at BF16 and earlier rows from the pool, so states sit only where every cold
+prefill cuts: a restored turn runs the cold turn's passes after it, and the
+output at temperature 0 equals a cold prefill's. Reuse comes in whole 1,024-row
+lines: a shared prefix under 1,024 tokens reports 0. The live continuation of
+the row's own history (prompt + generated tokens) still applies first and
+publishes nothing. A KV block's prefix-cache key also holds the tokens of its
+whole 1,024-row pass: a row's bits may depend on the later rows of its pass, so
+two runs share a block only when both ran that pass over the same tokens. Two
+conversations that part inside a pass (a shared system prompt that is not a
+multiple of 1,024 tokens) each keep their own blocks for that pass and each
+store their own states. A new conversation does not resume at the end of a
+shared system prompt: no state sits there unless that row is a checkpoint or a
+replay point of an earlier turn. A state is not published after a pass off the
+cold grid (a scheduler budget cut of the slice), for an image prompt or with
+`reuseCache: false`. A publication the memory checks refuse drops no other
+state. A restored turn has no MTP draft owner (the draft cache of the restored
+rows is not stored with the cell), so an `enableMtp` turn that restores runs
+plain AR; before this reuse such a follow-up prefilled cold and drafted. Stored
+states use the room the
+dynamic budget leaves after the pool at its largest, one pass's transient, the
+rows and the MTP state (about 12 states on a busy 128 GB host, from plan
+numbers); a row's admission takes stored states back first, checkpoints before
+replay points, never one a running turn uses. `resetCaches` and a GPU reset drop
+them and purge the prefix cache. States live only in the engine process: a
+restart starts cold.
 
 Native MTP is **opt-in** (`enableMtp: true`); it drafts two tokens per cycle
 unless `mtpDepth` says otherwise, capped at three. It runs

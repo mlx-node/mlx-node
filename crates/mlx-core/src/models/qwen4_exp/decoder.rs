@@ -184,6 +184,9 @@ pub struct DecoderState {
     media_digests: Vec<crate::engine::cache::ImageCacheDigest>,
     last_chunk_hidden: Vec<MxArray>,
     cancelled: Option<Arc<AtomicBool>>,
+    /// Decode tokens this request still runs on the ordinary path after a
+    /// tentative device route missed the slots.
+    device_route_cooldown: usize,
 }
 impl DecoderState {
     pub(super) fn arrays(&self) -> impl Iterator<Item = &MxArray> {
@@ -198,6 +201,9 @@ pub struct Decoder {
     /// The tokens one sequence may hold: the memory plan's window once the
     /// load planned it, the trained window before.
     pub context_window: usize,
+    /// The prefill scratch a host gate that refused the whole bank set
+    /// reserved beside the partial slots; `None` on every other store.
+    pub(super) host_prefill_scratch: Option<u64>,
     /// A test that sizes admission through the prefill window keeps its
     /// window across the turn opens that re-derive it from the plan.
     #[cfg(test)]
@@ -225,7 +231,7 @@ pub struct Decoder {
     pub(super) yarn: Option<math::Yarn>,
     verification: Option<Vec<DecoderState>>,
     device_routes: Option<Vec<(usize, MxArray)>>,
-    device_route_cooldown: usize,
+    pub(super) device_route_cooldown: usize,
     /// Layers whose routes a pass read back to the host one at a time.
     #[cfg(test)]
     pub(super) route_readbacks: u64,
@@ -265,10 +271,9 @@ impl Decoder {
             Some(crate::cache_limit::coordinator().register(self.weights.cache_budget()));
     }
 
-    /// The prefill window follows the residency plan in force.
+    /// The prefill window is the chunk the memory plan prices.
     pub fn refresh_prefill_window(&mut self) {
-        let window =
-            super::memory::prefill_window(&self.config, &self.weights.plan, self.context_window);
+        let window = super::MAX_PREFILL_CHUNK;
         #[cfg(test)]
         let window = self.prefill_window_pin.unwrap_or(window);
         self.prefill_chunk_size = window;
@@ -276,6 +281,30 @@ impl Decoder {
             .live
             .prefill_chunk_tokens
             .store(self.prefill_chunk_size as u64, Ordering::Release);
+    }
+
+    /// The load's memory plan is in force: a sequence holds up to `window`
+    /// tokens. A store the host gate refused keeps the prefill scratch that
+    /// gate priced at `allowance_tokens`.
+    pub(super) fn adopt_plan(&mut self, window: usize, allowance_tokens: u32) {
+        self.context_window = window;
+        self.host_prefill_scratch = matches!(
+            self.weights.live.fallback(),
+            Some(super::live::Fallback::LoadGate { .. })
+        )
+        .then(|| super::load_plan::transient(&self.config, allowance_tokens));
+        self.residency_changed();
+    }
+
+    /// The rows of the next prefill pass after `history`: the admitted
+    /// window, halved where it would outgrow a refused gate's reservation.
+    pub fn prefill_pass_window(&self) -> usize {
+        let window = self.prefill_slice_size();
+        window.min(super::memory::prefill_window(
+            &self.config,
+            self.host_prefill_scratch,
+            self.history.len() + window,
+        ))
     }
 
     /// The store changed its residency: the budget it registers and the
@@ -306,11 +335,10 @@ impl Decoder {
         // Validate the checkpoint topology before the first tensor payload read.
         let context_window = config.served_context_tokens() as usize;
         let yarn = math::Yarn::of(&config)?;
-        let prefill_chunk_size =
-            super::memory::prefill_window(&config, &weights.plan, context_window);
         let d = Self {
-            prefill_chunk_size,
+            prefill_chunk_size: super::MAX_PREFILL_CHUNK,
             context_window,
+            host_prefill_scratch: None,
             #[cfg(test)]
             prefill_window_pin: None,
             caches: (0..config.num_hidden_layers)
@@ -363,6 +391,7 @@ impl Decoder {
             media_digests: self.media_digests.clone(),
             last_chunk_hidden: self.last_chunk_hidden.clone(),
             cancelled: self.cancelled.clone(),
+            device_route_cooldown: self.device_route_cooldown,
         }
     }
     #[cfg(test)]
@@ -421,6 +450,7 @@ impl Decoder {
             media_digests: self.media_digests.clone(),
             last_chunk_hidden: std::mem::take(&mut self.last_chunk_hidden),
             cancelled: self.cancelled.take(),
+            device_route_cooldown: self.device_route_cooldown,
         };
         self.reset();
         state
@@ -434,7 +464,72 @@ impl Decoder {
         self.media_digests = state.media_digests;
         self.last_chunk_hidden = state.last_chunk_hidden;
         self.cancelled = state.cancelled;
+        self.device_route_cooldown = state.device_route_cooldown;
     }
+    /// The cell outside the pool at this row, in storage of its own; `None`
+    /// where an indexer key still waits for a block or a cache holds rows
+    /// the pool does not (no pages, image positions, draft history).
+    pub(super) fn cell(&self, grid: usize) -> Result<Option<super::prefix_state::Cell>> {
+        if self.paged.is_none() || !self.positions.is_empty() {
+            return Ok(None);
+        }
+        let copy = |array: &Option<MxArray>| array.as_ref().map(MxArray::deep_copy).transpose();
+        let mut layers = Vec::with_capacity(self.caches.len());
+        for cache in &self.caches {
+            if !cache.index_tail.is_empty()
+                || cache.index_keys.is_some()
+                || cache.draft_rows.is_some()
+                || cache.keys.is_some()
+                || cache.values.is_some()
+            {
+                return Ok(None);
+            }
+            layers.push(super::prefix_state::LayerCell {
+                conv: copy(&cache.conv)?,
+                recurrent: copy(&cache.recurrent)?,
+                ple_conv: copy(&cache.ple_conv)?,
+                index_blocks: cache.index_blocks,
+            });
+        }
+        let cell = super::prefix_state::Cell { grid, layers };
+        let arrays: Vec<&MxArray> = cell.arrays().collect();
+        if !arrays.is_empty() {
+            MxArray::eval_arrays(&arrays)?;
+        }
+        Ok(Some(cell))
+    }
+
+    /// Resume at the row `cell` was taken at: copies of its arrays become the
+    /// caches and `history` the tokens before that row. The cancel flag of
+    /// the running turn stays.
+    pub(super) fn restore_cell(
+        &mut self,
+        cell: &super::prefix_state::Cell,
+        history: &[u32],
+    ) -> Result<()> {
+        if cell.layers.len() != self.config.num_hidden_layers {
+            return Err(Error::from_reason(format!(
+                "Qwen4 stored state holds {} layers for {}",
+                cell.layers.len(),
+                self.config.num_hidden_layers
+            )));
+        }
+        self.reset();
+        let copy = |array: &Option<MxArray>| array.as_ref().map(MxArray::deep_copy).transpose();
+        for (cache, layer) in self.caches.iter_mut().zip(&cell.layers) {
+            cache.conv = copy(&layer.conv)?;
+            cache.recurrent = copy(&layer.recurrent)?;
+            cache.ple_conv = copy(&layer.ple_conv)?;
+            cache.index_blocks = layer.index_blocks;
+        }
+        self.history = history.to_vec();
+        let arrays: Vec<&MxArray> = self.caches.iter().flat_map(LayerCache::arrays).collect();
+        if !arrays.is_empty() {
+            MxArray::eval_arrays(&arrays)?;
+        }
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         self.rotary_tables.get_mut().clear();
         self.verification = None;
@@ -2466,7 +2561,7 @@ impl Decoder {
         let mut logits = None;
         let mut start = 0;
         while start < tokens.len() {
-            let window = self.prefill_slice_size();
+            let window = self.prefill_pass_window();
             let end = (start + window).min(tokens.len());
             let next_end = (end + window).min(tokens.len());
             logits = Some(self.prefill_chunk_ahead(
@@ -2777,6 +2872,7 @@ impl Decoder {
                         media_digests: self.media_digests.clone(),
                         last_chunk_hidden: Vec::new(),
                         cancelled: self.cancelled.clone(),
+                        device_route_cooldown: self.device_route_cooldown,
                     })
                     .collect(),
             );
