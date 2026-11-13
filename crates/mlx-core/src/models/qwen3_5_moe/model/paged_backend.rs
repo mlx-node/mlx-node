@@ -256,7 +256,8 @@ impl Qwen35MoeInner {
                 cache_salt,
                 hit,
             )
-        })?;
+        })
+        .inspect_err(|_| self.dflash2_states.state_read = None)?;
         let cached_prefix_len = turn_plan.cached_prefix_len;
         let continued_live_prefix = turn_plan.continued_live_prefix;
         if trace_enabled {
@@ -342,19 +343,18 @@ impl Qwen35MoeInner {
         carries_image_lineage: bool,
         turn_plan: &crate::transformer::paged_kv_cache_adapter::PagedTurnPlan,
     ) -> Result<Qwen35MoePrefixState> {
-        let cached_prefix_len = turn_plan.cached_prefix_len;
-        let continued_live_prefix = turn_plan.continued_live_prefix;
         let total_budget = plan.len() as u32;
         // GDN recurrent-state prime (live / checkpoint / replay). No qwen3/lfm2
         // analog — moe carries GDN recurrent state across turns.
         let gdn_prefix_preparation = self.prepare_moe_gdn_prefix_state(
             plan,
-            cached_prefix_len,
+            turn_plan.cached_prefix_len,
             block_size,
             lookup_extra_keys,
             cache_salt,
-            continued_live_prefix,
+            turn_plan.continued_live_prefix,
         )?;
+        let cached_prefix_len = gdn_prefix_preparation.cached_prefix_len;
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         // GDN recurrent state now covers exactly the cached prefix (installed
         // live, restored from a cold sidecar, or replayed just above). Discharge

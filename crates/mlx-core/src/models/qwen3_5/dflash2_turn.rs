@@ -283,8 +283,11 @@ pub(crate) fn parked_state_hit<T: DFlash2Target>(
 
 /// The deepest state on disk alone an autoregressive prime of `tokens`
 /// resumes on, at most `cap` deep: its chain comes back from the tier with
-/// the KV lookup. One whose chain cannot come back whole is discarded and
-/// the next deepest taken (Splash `pollRestores` → `discardState`).
+/// the KV lookup. Its object is read and checked before the chain is armed,
+/// and the read waits in `state_read` for the GDN prime. One that does not
+/// read back, or whose chain cannot come back whole, is discarded and the
+/// next deepest taken (Splash `pollRestores` → `discardState`, then a fresh
+/// lookup): no KV is restored without its state.
 pub(crate) fn disk_state_depth<T: DFlash2Target>(
     target: &mut T,
     tokens: &[u32],
@@ -292,6 +295,7 @@ pub(crate) fn disk_state_depth<T: DFlash2Target>(
     cache_salt: u64,
     cap: u32,
 ) -> Option<u32> {
+    target.dflash2_states_mut().state_read = None;
     for _ in 0..=target.dflash2_states().store.bytes().entries {
         let store = &target.dflash2_states().store;
         let hit = store.lookup_within(
@@ -303,12 +307,75 @@ pub(crate) fn disk_state_depth<T: DFlash2Target>(
             cap as usize,
         )?;
         store.get(hit.id).filter(|entry| entry.ram().is_none())?;
-        if disk::restorable(&*target, hit.id) {
-            return u32::try_from(hit.depth).ok();
+        let depth = u32::try_from(hit.depth).ok()?;
+        if disk::restorable(&*target, hit.id)
+            && let Some(linear) = disk::read_state(target, hit.id, None)
+        {
+            target.dflash2_states_mut().state_read =
+                Some(super::dflash2_state::paged::StateRead { id: hit.id, linear });
+            return Some(depth);
         }
         disk::discard_state(target, hit.id);
     }
     None
+}
+
+/// The turn's KV prefix came back with a disk state but no GDN state at its
+/// end does: the restored KV goes and the turn prefills its whole prompt
+/// from nothing (Splash `pollRestores` vacates the lane after a failed state
+/// read). The lookup is skipped, so the restored chain is not hit again
+/// without its state. A whole turn books its prompt; a scheduled lane books
+/// nothing past its empty hit.
+pub(crate) fn restart_turn_cold<T: DFlash2Target>(
+    target: &mut T,
+    tokens: &[u32],
+    extra_keys: &[Vec<u64>],
+    cache_salt: u64,
+) -> Result<()> {
+    let seq = target
+        .paged_adapter_ref()
+        .and_then(PagedKVCacheAdapter::active_seq_id)
+        .ok_or_else(|| Error::from_reason("a cold restart without an active request"))?;
+    let budget = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+    claimed(target, Keep::default(), |target| {
+        let adapter = target
+            .paged_adapter_mut_ref()
+            .ok_or_else(|| Error::from_reason("a cold restart lost its paged adapter"))?;
+        let prepared = if seq == 0 {
+            adapter
+                .restart_prepared_turn_cold_per_block(seq, tokens, budget, extra_keys, cache_salt)
+        } else {
+            adapter.prepare_turn_per_block_booking_hit_only(
+                seq, tokens, budget, extra_keys, cache_salt, true, 0,
+            )
+        };
+        prepared.map(drop).map_err(Error::from_reason)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static STATE_READ_LOST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// While it lives, the state read a prime armed with is lost before the
+/// GDN prime takes it, and the state does not read back again.
+#[cfg(test)]
+pub(crate) struct StateReadLost;
+
+#[cfg(test)]
+impl StateReadLost {
+    pub(crate) fn new() -> Self {
+        STATE_READ_LOST.with(|lost| lost.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for StateReadLost {
+    fn drop(&mut self) {
+        STATE_READ_LOST.with(|lost| lost.set(false));
+    }
 }
 
 /// The deepest stored state an autoregressive prime of `tokens` restores
@@ -316,9 +383,9 @@ pub(crate) fn disk_state_depth<T: DFlash2Target>(
 /// (the best ladder rung). Returns its id, depth and a deep copy of its GDN
 /// slots (Splash `QwenStateStorage::restore` with `restoreDraftState`
 /// false: a composite state serves a request that needs no draft).
-/// A state on disk alone gives its cell from its object (the window is
-/// read and dropped); one that does not read back is discarded and the
-/// next deepest taken.
+/// A state on disk alone gives its cell from the read its prime armed with,
+/// else from its object (the window is read and dropped); one that does
+/// not read back is discarded and the next deepest taken.
 pub(crate) fn stored_gdn_prefix<T: DFlash2Target>(
     target: &mut T,
     tokens: &[u32],
@@ -346,7 +413,17 @@ pub(crate) fn stored_gdn_prefix<T: DFlash2Target>(
             super::dflash2_state::paged::install_linear(&mut caches, &anchor.linear).ok()?;
             return Some((hit.id, depth, caches));
         }
-        match disk::read_state(target, hit.id, None) {
+        let read = match target
+            .dflash2_states_mut()
+            .state_read
+            .take_if(|read| read.id == hit.id)
+        {
+            Some(read) => Some(read.linear),
+            None => disk::read_state(target, hit.id, None),
+        };
+        #[cfg(test)]
+        let read = read.filter(|_| !STATE_READ_LOST.with(std::cell::Cell::get));
+        match read {
             Some(linear) => {
                 super::dflash2_state::paged::adopt_linear(&mut caches, linear).ok()?;
                 return Some((hit.id, depth, caches));

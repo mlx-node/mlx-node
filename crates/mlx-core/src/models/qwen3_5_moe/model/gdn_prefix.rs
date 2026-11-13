@@ -447,7 +447,7 @@ impl Qwen35MoeInner {
         continued_live_prefix: bool,
     ) -> Result<MoeGdnPrefixPreparation> {
         let seq_id = self.begin_gdn_use();
-        let result = self.prepare_moe_gdn_prefix_state_inner(
+        let mut result = self.prepare_moe_gdn_prefix_state_inner(
             tokens,
             cached_prefix_len,
             block_size,
@@ -455,6 +455,31 @@ impl Qwen35MoeInner {
             cache_salt,
             continued_live_prefix,
         );
+        if matches!(result, Ok(None)) {
+            self.gdn_restored_from = None;
+            result = crate::models::qwen3_5::dflash2_turn::restart_turn_cold(
+                self,
+                tokens,
+                extra_keys_per_block,
+                cache_salt,
+            )
+            .and_then(|()| {
+                self.prepare_moe_gdn_prefix_state_inner(
+                    tokens,
+                    0,
+                    block_size,
+                    extra_keys_per_block,
+                    cache_salt,
+                    false,
+                )
+            });
+        }
+        self.dflash2_states.state_read = None;
+        let result = result.and_then(|preparation| {
+            preparation.ok_or_else(|| {
+                Error::from_reason("a cold restart left a disk state's KV without its GDN state")
+            })
+        });
         self.record_gdn_use(seq_id, result.is_ok());
         result
     }
@@ -467,7 +492,7 @@ impl Qwen35MoeInner {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
         continued_live_prefix: bool,
-    ) -> Result<MoeGdnPrefixPreparation> {
+    ) -> Result<Option<MoeGdnPrefixPreparation>> {
         let image_aware_prefix = extra_keys_per_block.iter().any(|keys| !keys.is_empty());
         let trace_enabled = inference_trace_enabled();
         let inference_info_enabled =
@@ -497,6 +522,7 @@ impl Qwen35MoeInner {
             let preparation = MoeGdnPrefixPreparation {
                 #[cfg(test)]
                 state,
+                cached_prefix_len,
                 already_primed: cached_prefix_len > 0,
                 restored_prefix_tokens,
                 replayed_prefix_tokens,
@@ -517,14 +543,14 @@ impl Qwen35MoeInner {
         let gdn_caches_ready =
             !gdn_state_dirty && moe_paged_linear_caches_ready(&self.config, self.caches.as_deref());
         if gdn_caches_ready && continued_live_prefix {
-            return Ok(finish("live", cached_prefix_len, 0));
+            return Ok(Some(finish("live", cached_prefix_len, 0)));
         }
 
         let gdn_prefix_from_history = cached_prefix_len > 0
             && self.cached_token_history.len() == cached_prefix_len as usize
             && tokens.starts_with(&self.cached_token_history);
         if gdn_caches_ready && gdn_prefix_from_history {
-            return Ok(finish("last_history", cached_prefix_len, 0));
+            return Ok(Some(finish("last_history", cached_prefix_len, 0)));
         }
         if cached_prefix_len > 0 {
             let history_lookup_start = trace_enabled.then(std::time::Instant::now);
@@ -533,7 +559,11 @@ impl Qwen35MoeInner {
             let history_lookup_ms = history_lookup_start.map(elapsed_ms);
             if let Some(checkpoint) = history_checkpoint {
                 self.caches = Some(checkpoint);
-                return Ok(finish("last_history_checkpoint", cached_prefix_len, 0));
+                return Ok(Some(finish(
+                    "last_history_checkpoint",
+                    cached_prefix_len,
+                    0,
+                )));
             } else if trace_enabled {
                 let history_checkpoint_len = self
                     .gdn_last_history_checkpoint
@@ -573,7 +603,7 @@ impl Qwen35MoeInner {
                 })?;
             if replayed_prefix_len == 0 {
                 self.caches = Some(checkpoint);
-                return Ok(finish("checkpoint", restored_prefix_len, 0));
+                return Ok(Some(finish("checkpoint", restored_prefix_len, 0)));
             }
             if image_aware_prefix {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
@@ -583,6 +613,9 @@ impl Qwen35MoeInner {
                 return Err(Error::from_reason(
                     "image-conditioned GDN prefix requires an exact checkpoint or the original image embeddings",
                 ));
+            }
+            if self.state_restored_prefix() {
+                return Ok(None);
             }
 
             let replay_suffix = tokens
@@ -604,17 +637,17 @@ impl Qwen35MoeInner {
                     turn_cancel.as_deref(),
                 )
             })?;
-            return Ok(finish(
+            return Ok(Some(finish(
                 "checkpoint_replay_materialized",
                 restored_prefix_len,
                 replayed_prefix_len,
-            ));
+            )));
         }
 
         let fresh_caches = fresh_moe_layer_caches(&self.config);
         if cached_prefix_len == 0 {
             self.caches = Some(fresh_caches);
-            return Ok(finish("cold", 0, 0));
+            return Ok(Some(finish("cold", 0, 0)));
         }
         if image_aware_prefix {
             if let Some(adapter) = self.paged_adapter.as_mut() {
@@ -624,6 +657,9 @@ impl Qwen35MoeInner {
             return Err(Error::from_reason(
                 "image-conditioned GDN prefix cannot be reconstructed from placeholder token ids",
             ));
+        }
+        if self.state_restored_prefix() {
+            return Ok(None);
         }
 
         let cached_prefix_len_usize = cached_prefix_len as usize;
@@ -642,7 +678,16 @@ impl Qwen35MoeInner {
                 turn_cancel.as_deref(),
             )
         })?;
-        Ok(finish("replay_materialized", 0, cached_prefix_len))
+        Ok(Some(finish("replay_materialized", 0, cached_prefix_len)))
+    }
+
+    /// The prepare's KV prefix came back with a disk state's chain, so only
+    /// an exact GDN state at its end backs it: a replay would decode on a
+    /// state the KV never had.
+    fn state_restored_prefix(&self) -> bool {
+        self.paged_adapter
+            .as_ref()
+            .is_some_and(PagedKVCacheAdapter::state_restored)
     }
 
     /// Image-aware GDN prefix preparation. Only exact sidecars on the same
@@ -670,6 +715,7 @@ impl Qwen35MoeInner {
             continued_live_prefix,
             image_key,
         );
+        self.dflash2_states.state_read = None;
         self.record_gdn_use(seq_id, result.is_ok());
         result
     }
@@ -782,6 +828,7 @@ impl Qwen35MoeInner {
         let candidate_plan = match candidate_plan_result {
             Ok(plan) => plan,
             Err(error) => {
+                self.dflash2_states.state_read = None;
                 self.invalidate_moe_paged_session("VLM paged-prefix preparation failure");
                 return Err(error);
             }

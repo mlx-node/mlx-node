@@ -270,7 +270,8 @@ impl Qwen35Inner {
                 cache_salt,
                 hit,
             )
-        })?;
+        })
+        .inspect_err(|_| self.dflash2_states.state_read = None)?;
         let cached_prefix_len = turn_plan.cached_prefix_len;
         let continued_live_prefix = turn_plan.continued_live_prefix;
         if trace_enabled {
@@ -366,19 +367,18 @@ impl Qwen35Inner {
         carries_image_lineage: bool,
         turn_plan: &crate::transformer::paged_kv_cache_adapter::PagedTurnPlan,
     ) -> Result<Qwen35PrefixState> {
-        let cached_prefix_len = turn_plan.cached_prefix_len;
-        let continued_live_prefix = turn_plan.continued_live_prefix;
         let total_budget = plan.len() as u32;
         // GDN recurrent-state prime (live / checkpoint / replay). No qwen3/lfm2
         // analog — dense carries GDN recurrent state across turns.
         let gdn_prefix_preparation = self.prepare_dense_gdn_prefix_state(
             plan,
-            cached_prefix_len,
+            turn_plan.cached_prefix_len,
             block_size,
             lookup_extra_keys,
             cache_salt,
-            continued_live_prefix,
+            turn_plan.continued_live_prefix,
         )?;
+        let cached_prefix_len = gdn_prefix_preparation.cached_prefix_len;
         let reconciled_prefix = crate::engine::recurrent_state::reconcile_hybrid_prefix(&[
             cached_prefix_len,
             gdn_prefix_preparation

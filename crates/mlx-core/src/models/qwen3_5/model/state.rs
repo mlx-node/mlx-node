@@ -107,6 +107,9 @@ pub(super) struct DenseGdnHistoryCheckpoint {
 
 pub(super) struct DenseGdnPrefixPreparation {
     pub(super) state: &'static str,
+    /// The KV prefix the turn resumes from: the prepare's, or 0 once a
+    /// disk state's KV without its GDN state restarted the turn cold.
+    pub(super) cached_prefix_len: u32,
     pub(super) already_primed: bool,
     pub(super) restored_prefix_tokens: u32,
     pub(super) replayed_prefix_tokens: u32,

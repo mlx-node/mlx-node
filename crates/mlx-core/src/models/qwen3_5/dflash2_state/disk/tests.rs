@@ -571,6 +571,32 @@ pub(crate) fn kv_key(
     chain_keys(ColdGroup::Kv, tier.tier.kv_fingerprint, entry)[index]
 }
 
+/// The tier key of the landed disk copy of the state `depth` deep.
+pub(crate) fn state_key_at(states: &DFlash2States, depth: usize) -> ColdCacheKey {
+    let copy = states
+        .store
+        .entries()
+        .find(|entry| entry.depth() == depth)
+        .and_then(|entry| entry.disk().copied())
+        .unwrap_or_else(|| panic!("a disk copy at {depth}"));
+    assert!(copy.landed, "the copy at {depth} landed");
+    copy.key
+}
+
+/// Flips the last payload byte of `key`'s state object: its size and its
+/// header stay sound, its checksum does not.
+pub(crate) fn corrupt_state_object(tier: &TestTier, key: ColdCacheKey) {
+    let path = tier.tier.manager.root().join(format!(
+        "{}.{}.safetensors",
+        key.to_hex(),
+        ColdGroup::DFlash2State.label()
+    ));
+    let mut bytes = std::fs::read(&path).expect("the state object");
+    let last = bytes.last_mut().expect("a payload byte");
+    *last ^= 0xff;
+    std::fs::write(&path, &bytes).expect("the corrupted state object");
+}
+
 pub(crate) fn drained(tier: &TestTier) {
     assert!(tier.tier.manager.drain(std::time::Duration::from_secs(10)));
 }

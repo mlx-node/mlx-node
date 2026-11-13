@@ -2526,6 +2526,236 @@ fn moe_plain_restart_restores_the_disk_state() -> Result<()> {
     result
 }
 
+/// The small plan on this thread until the guard drops.
+struct MoeSmallPlan;
+
+impl MoeSmallPlan {
+    fn new() -> Self {
+        moe_small_plan(true);
+        Self
+    }
+}
+
+impl Drop for MoeSmallPlan {
+    fn drop(&mut self) {
+        moe_small_plan(false);
+    }
+}
+
+/// One MoE text turn: prime, prefill of the rest, finalize. Returns the
+/// prefix it resumed from and its last logits.
+fn moe_turn(inner: &mut Qwen35MoeInner, tokens: &[u32]) -> Result<(usize, MxArray)> {
+    let prefix = inner.prime_prefix_state(tokens, true, 16, &[], 0)?;
+    let cached = prefix.effective_cached_prefix_len;
+    let logits = inner.paged_prefill(
+        &tokens[cached..],
+        &prefix,
+        Stream::default(crate::stream::DeviceType::Gpu),
+    )?;
+    logits.eval();
+    inner.finalize_paged_turn(true, 0);
+    Ok((cached, logits))
+}
+
+/// The tiny MoE load on `tier`, its weights drawn from one seed so every
+/// load of a test holds the same model.
+fn seeded_moe_on(
+    tier: &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
+    test: &str,
+) -> Option<Qwen35MoeInner> {
+    unsafe { mlx_sys::mlx_seed(0x5A13_0021) };
+    plain_moe_on(tier, test)
+}
+
+/// A first MoE process runs `turns`, then [`moe_reopen_after`]. Returns
+/// the reopened tier, the new load and the first process's last logits.
+fn moe_restart_after(
+    tag: &str,
+    test: &str,
+    turns: &[Vec<u32>],
+    damage: impl FnOnce(&Qwen35MoeInner, &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier),
+    adopted: u64,
+) -> Result<
+    Option<(
+        crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
+        Qwen35MoeInner,
+        MxArray,
+    )>,
+> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::persistent_test_tier;
+    let tier = persistent_test_tier(tag, 1 << 30);
+    let Some(mut first) = seeded_moe_on(&tier, test) else {
+        return Ok(None);
+    };
+    let mut last = None;
+    for tokens in turns {
+        last = Some(moe_turn(&mut first, tokens)?.1);
+    }
+    let logits = last.expect("a turn");
+    Ok(moe_reopen_after(first, tier, tag, test, damage, adopted)?
+        .map(|(tier, second)| (tier, second, logits)))
+}
+
+/// `first` closes the tier cleanly; the next MoE load on it, after
+/// `damage`, adopts what is left.
+fn moe_reopen_after(
+    mut first: Qwen35MoeInner,
+    tier: crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
+    tag: &str,
+    test: &str,
+    damage: impl FnOnce(&Qwen35MoeInner, &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier),
+    adopted: u64,
+) -> Result<
+    Option<(
+        crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
+        Qwen35MoeInner,
+    )>,
+> {
+    assert!(crate::models::qwen3_5::dflash2_state::disk::close_cache(
+        &mut first,
+        std::time::Instant::now() + std::time::Duration::from_secs(30)
+    ));
+    damage(&first, &tier);
+    drop(first);
+    let tier = tier.reopen(tag, 1 << 30);
+    let Some(mut second) = seeded_moe_on(&tier, test) else {
+        return Ok(None);
+    };
+    assert_eq!(
+        crate::models::qwen3_5::dflash2_state::disk::adopt_all(&mut second),
+        adopted
+    );
+    Ok(Some((tier, second)))
+}
+
+/// The MoE twin of the dense case: the only disk state's object is damaged
+/// after a clean close, so the prime reads it before it arms the chain,
+/// discards it and restores no KV; the turn prefills cold, bit-equal to the
+/// first process's cold turn.
+/// Mutation M1 (the prime arms a state it did not read) → red.
+#[test]
+fn moe_a_state_that_fails_its_read_restores_no_kv() -> Result<()> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::{corrupt_state_object, state_key_at};
+    const TEST: &str = "moe_a_state_that_fails_its_read_restores_no_kv";
+    let _plan = MoeSmallPlan::new();
+    let tokens: Vec<u32> = (0..140).map(|i| (i * 7 + 3) % 13 + 1).collect();
+    let Some((tier, mut second, cold)) = moe_restart_after(
+        "state-tier-moe-corrupt",
+        TEST,
+        std::slice::from_ref(&tokens),
+        |first, tier| corrupt_state_object(tier, state_key_at(&first.dflash2_states, 128)),
+        1,
+    )?
+    else {
+        return Ok(());
+    };
+    let hits = tier.tier.manager.stats().hits;
+    let (cached, logits) = moe_turn(&mut second, &tokens)?;
+    assert_eq!(cached, 0);
+    assert_eq!(
+        tier.tier.manager.stats().hits,
+        hits,
+        "no KV block came back"
+    );
+    assert!(crate::models::qwen3_5::model::arrays_bits_equal_for_test(
+        &logits, &cold
+    )?);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
+    Ok(())
+}
+
+/// A damaged MoE state above a sound one on the same lineage: the prime
+/// discards the deeper one at its read and resumes at the one below, its
+/// KV chain and its GDN cell at the same depth. The sound state reaches the
+/// disk in an earlier process.
+/// Mutation M1 (the prime arms a state it did not read) → red.
+#[test]
+fn moe_a_damaged_state_resumes_at_the_sound_state_below() -> Result<()> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::{corrupt_state_object, state_key_at};
+    const TEST: &str = "moe_a_damaged_state_resumes_at_the_sound_state_below";
+    const TAG: &str = "state-tier-moe-corrupt-deeper";
+    let _plan = MoeSmallPlan::new();
+    let tokens: Vec<u32> = (0..140).map(|i| (i * 7 + 3) % 13 + 1).collect();
+    let Some((tier, mut middle, _)) =
+        moe_restart_after(TAG, TEST, &[tokens[..100].to_vec()], |_, _| {}, 1)?
+    else {
+        return Ok(());
+    };
+    assert_eq!(moe_turn(&mut middle, &tokens)?.0, 96);
+    let Some((tier, mut second)) = moe_reopen_after(
+        middle,
+        tier,
+        TAG,
+        TEST,
+        |first, tier| {
+            let mut on_disk: Vec<usize> = first
+                .dflash2_states
+                .store
+                .entries()
+                .filter(|entry| entry.disk().is_some())
+                .map(|entry| entry.depth())
+                .collect();
+            on_disk.sort_unstable();
+            assert_eq!(on_disk, vec![96, 128]);
+            corrupt_state_object(tier, state_key_at(&first.dflash2_states, 128));
+        },
+        2,
+    )?
+    else {
+        return Ok(());
+    };
+    let hits = tier.tier.manager.stats().hits;
+    let prefix = second.prime_prefix_state(&tokens, true, 16, &[], 0)?;
+    assert_eq!(prefix.effective_cached_prefix_len, 96);
+    assert_eq!(
+        tier.tier.manager.stats().hits - hits,
+        6,
+        "the chain below 96 came back"
+    );
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
+    Ok(())
+}
+
+/// The MoE read a prime armed with is gone before the GDN prime takes it,
+/// and the state does not read back: the turn restarts cold instead of
+/// replaying GDN alone over the restored KV, bit-equal to a cold turn.
+/// Mutation M2 (the prime keeps the KV and replays) → red.
+#[test]
+fn moe_a_state_lost_after_its_chain_came_back_restarts_cold() -> Result<()> {
+    const TEST: &str = "moe_a_state_lost_after_its_chain_came_back_restarts_cold";
+    let _plan = MoeSmallPlan::new();
+    let tokens: Vec<u32> = (0..140).map(|i| (i * 7 + 3) % 13 + 1).collect();
+    let Some((tier, mut second, cold)) = moe_restart_after(
+        "state-tier-moe-lost-read",
+        TEST,
+        std::slice::from_ref(&tokens),
+        |_, _| {},
+        1,
+    )?
+    else {
+        return Ok(());
+    };
+    let hits = tier.tier.manager.stats().hits;
+    let (cached, logits) = {
+        let _lost = crate::models::qwen3_5::dflash2_turn::StateReadLost::new();
+        moe_turn(&mut second, &tokens)?
+    };
+    assert_eq!(
+        tier.tier.manager.stats().hits - hits,
+        8,
+        "the state's chain came back"
+    );
+    assert_eq!(cached, 0);
+    assert!(crate::models::qwen3_5::model::arrays_bits_equal_for_test(
+        &logits, &cold
+    )?);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
+    Ok(())
+}
+
 /// Splash `publishReachedStateBoundaries` for a scheduled MTP sequence on a
 /// MoE load without a draft: the prefill reaches the lane's checkpoint (64)
 /// and replay point (128) and publishes them while the same forward seeds

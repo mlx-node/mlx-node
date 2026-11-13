@@ -1039,8 +1039,12 @@ pub struct PagedKVCacheAdapter {
     suppress_cold_restore_once: bool,
     /// The depth of the disk state the next prefix lookup resumes at: on a
     /// state-backed tier the only cold walk, restoring the state's chain
-    /// below it whole or not at all. Taken by that lookup.
+    /// below it whole or not at all. Taken by that lookup; the turn's
+    /// prepare drops one no lookup took.
     state_restore: Option<usize>,
+    /// The last prepare's prefix ends in KV blocks a disk state's restore
+    /// brought back: only that state's GDN cell backs it.
+    state_restored: bool,
 
     /// Auxiliary state the last prefix lookup restored, for the caller to
     /// install before it resumes from the cached prefix. Always `None` unless
@@ -1403,6 +1407,7 @@ impl PagedKVCacheAdapter {
             cold_tier: None,
             suppress_cold_restore_once: false,
             state_restore: None,
+            state_restored: false,
             restored_sidecar: None,
             aux_prefix_unbacked: false,
             cold_capture: ColdCaptureOutcome::default(),
@@ -1540,6 +1545,11 @@ impl PagedKVCacheAdapter {
     /// restores a disk state's chain with the state).
     pub(crate) fn arm_state_restore(&mut self, depth: u32) {
         self.state_restore = Some(depth as usize);
+    }
+
+    /// The last prepare's prefix came back with an armed disk state's chain.
+    pub(crate) fn state_restored(&self) -> bool {
+        self.state_restored
     }
 
     pub fn take_restored_sidecar(&mut self) -> Option<mlx_paged_attn::ColdSidecar> {
@@ -2265,7 +2275,11 @@ impl PagedKVCacheAdapter {
         // Select only this request. Other live rows are parked in the request
         // table and must survive a prefix miss, failed continuation, or suffix
         // allocation failure on this row.
-        self.activate_request(seq_id)?;
+        self.state_restored = false;
+        if let Err(error) = self.activate_request(seq_id) {
+            self.state_restore = None;
+            return Err(error);
+        }
         let result = self.prepare_turn_inner_mutating(
             seq_id,
             prompt_tokens,
@@ -2277,6 +2291,7 @@ impl PagedKVCacheAdapter {
             max_cache_hit_tokens,
             booking,
         );
+        self.state_restore = None;
         if result.is_err() {
             // Prefix lookup attaches cache-owned block references before suffix
             // allocation. A later allocation failure must not leave those
@@ -2582,6 +2597,7 @@ impl PagedKVCacheAdapter {
         // immediately-following request is suppressed.
         let suppress_cold_restore = std::mem::take(&mut self.suppress_cold_restore_once);
         let state_restore = self.state_restore.take();
+        self.state_restored = false;
         if self.block_table.is_none() {
             return Err(format!("{op} called before reset_for_new_request"));
         }
@@ -2663,7 +2679,8 @@ impl PagedKVCacheAdapter {
             && !suppress_cold_restore
             && let Some(cold) = self.cold_tier.as_ref()
         {
-            let backing = match state_restore.filter(|_| state_only) {
+            let state_depth = state_restore.filter(|_| state_only);
+            let backing = match state_depth {
                 Some(depth) => cold_tier::ColdBacking::State { depth },
                 None => cold_tier::ColdBacking::Sidecar(cold.sidecar_policy()),
             };
@@ -2690,6 +2707,7 @@ impl PagedKVCacheAdapter {
                 },
             );
             cold_restored_blocks = restored.blocks.len();
+            self.state_restored = state_depth.is_some() && cold_restored_blocks > 0;
             cached_tokens += restored.blocks.len() * block_size as usize;
             blocks.extend(restored.blocks);
             // Backs exactly `cached_tokens` — the walk reduced the prefix and

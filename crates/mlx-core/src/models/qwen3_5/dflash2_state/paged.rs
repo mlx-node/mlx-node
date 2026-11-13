@@ -162,6 +162,15 @@ pub(crate) struct DFlash2States {
     /// The disk state the turn's lane read, until the admission promotes
     /// or discards it (Splash `Engine::pollRestores`).
     pub(crate) disk_read: Option<DiskRead>,
+    /// The disk state an autoregressive prime read and checked before it
+    /// armed the state's chain, until the GDN prime takes it.
+    pub(crate) state_read: Option<StateRead>,
+}
+
+/// A disk state's GDN cell, read before its chain is restored.
+pub(crate) struct StateRead {
+    pub(crate) id: EntryId,
+    pub(crate) linear: Vec<Qwen3_5LayerCache>,
 }
 
 /// A disk state a lane read (Splash `StateRestore`): the window the read
@@ -238,6 +247,7 @@ impl DFlash2States {
             prefill_yield: None,
             disk: None,
             disk_read: None,
+            state_read: None,
         }
     }
 
@@ -249,6 +259,7 @@ impl DFlash2States {
         self.lane_window = None;
         self.seq_windows.clear();
         self.disk_read = None;
+        self.state_read = None;
         self.restore_uses.clear();
         self.idle_lane = IdleLane::default();
     }
@@ -309,6 +320,7 @@ impl DFlash2States {
     pub(crate) fn end_turn(&mut self, seq: u32) {
         self.end_replay_point(seq);
         self.turns.remove(&seq);
+        self.state_read = None;
         let window = self.seq_windows.remove(&seq);
         self.idle_lane.give_window(window);
     }

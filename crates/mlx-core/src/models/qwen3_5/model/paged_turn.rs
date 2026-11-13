@@ -171,6 +171,7 @@ impl Qwen35Inner {
                 return Err(error);
             }
         };
+        let cached_prefix_len = gdn_prefix_preparation.cached_prefix_len;
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         // Discharge the adapter's auxiliary (GDN) prefix obligation before the
         // turn's first `record_tokens`. See `prime_prefix_state` for the full
@@ -1577,6 +1578,7 @@ impl Qwen35Inner {
                 return Err(error);
             }
         };
+        let cached_prefix_len = gdn_prefix_preparation.cached_prefix_len;
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         // Discharge the adapter's auxiliary (GDN) prefix obligation before the
         // turn's first `record_tokens`. See `prime_prefix_state` for the full
@@ -2331,6 +2333,7 @@ impl Qwen35Inner {
                     .map_err(Error::from_reason)
             },
         )
+        .inspect_err(|_| self.dflash2_states.state_read = None)
     }
 
     /// Turn-admission speculative reservation for the paged MTP arm: reserve

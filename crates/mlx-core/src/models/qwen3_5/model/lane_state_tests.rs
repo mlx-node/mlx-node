@@ -17,7 +17,7 @@ use crate::models::qwen3_5::dflash2_decode::tests::{
     metal_is_default_device, tiny_dflash_inner_with_config,
 };
 use crate::models::qwen3_5::dflash2_state::disk::tests::{
-    TestTier, attach_tier, persistent_test_tier, test_tier,
+    TestTier, attach_tier, corrupt_state_object, persistent_test_tier, state_key_at, test_tier,
 };
 use crate::models::qwen3_5::dflash2_state::disk::{
     close_cache, encode_anchor, poll_offload, read_object,
@@ -452,6 +452,190 @@ fn ar_restart_restores_the_disk_state() -> Result<()> {
     );
     assert_eq!(disk.counters.invalidations, 0);
     assert_eq!(cell_bytes(&second, state_at(&second, 112)), stored);
+    Ok(())
+}
+
+/// A first process runs `turns` of the tier's prompts, then
+/// [`reopen_after`]. Returns the reopened tier, the new load and the
+/// greedy tokens of the first process's last turn (a cold turn when it is
+/// the only one).
+fn restart_after(
+    tag: &str,
+    seed: u64,
+    test: &str,
+    turns: &[Vec<u32>],
+    damage: impl FnOnce(&Qwen35Inner, &TestTier),
+    adopted: u64,
+) -> Result<Option<(TestTier, Qwen35Inner, Vec<u32>)>> {
+    let Some(mut first) = plain(seed, test) else {
+        return Ok(None);
+    };
+    let tier = persistent_test_tier(tag, 1 << 30);
+    attach(&mut first, &tier);
+    for tokens in turns {
+        ar_turn(&mut first, tokens)?;
+    }
+    let tokens = generated();
+    Ok(reopen_after(first, tier, tag, seed, test, damage, adopted)?
+        .map(|(tier, second)| (tier, second, tokens)))
+}
+
+/// `first` closes the tier cleanly; the next load on it, after `damage`,
+/// adopts what is left.
+fn reopen_after(
+    mut first: Qwen35Inner,
+    tier: TestTier,
+    tag: &str,
+    seed: u64,
+    test: &str,
+    damage: impl FnOnce(&Qwen35Inner, &TestTier),
+    adopted: u64,
+) -> Result<Option<(TestTier, Qwen35Inner)>> {
+    assert!(close_cache(
+        &mut first,
+        std::time::Instant::now() + std::time::Duration::from_secs(30)
+    ));
+    damage(&first, &tier);
+    drop(first);
+    let tier = tier.reopen(tag, 1 << 30);
+    let Some(mut second) = plain(seed, test) else {
+        return Ok(None);
+    };
+    attach(&mut second, &tier);
+    assert_eq!(
+        crate::models::qwen3_5::dflash2_state::disk::adopt_all(&mut second),
+        adopted
+    );
+    Ok(Some((tier, second)))
+}
+
+/// Splash `pollRestores` → `discardState` and a fresh lookup: after a
+/// restart the only disk state's object is damaged (its header sound), so
+/// the prime reads it before it arms the chain, discards it and restores no
+/// KV; the turn prefills cold and decodes what the first process did.
+/// Mutation M1 (the prime arms a state it did not read) → red.
+#[test]
+fn a_state_that_fails_its_read_restores_no_kv() -> Result<()> {
+    const TEST: &str = "a_state_that_fails_its_read_restores_no_kv";
+    let _plan = SmallPlan::new();
+    let tokens = prompt(11, 127);
+    let Some((tier, mut second, cold)) = restart_after(
+        "state-tier-ar-corrupt",
+        0x5A13_0011,
+        TEST,
+        std::slice::from_ref(&tokens),
+        |first, tier| corrupt_state_object(tier, state_key_at(&first.dflash2_states, 112)),
+        1,
+    )?
+    else {
+        return Ok(());
+    };
+    let hits = tier.tier.manager.stats().hits;
+    let result = ar_turn(&mut second, &tokens)?;
+    assert_eq!(result.cached_tokens, 0);
+    assert_eq!(
+        tier.tier.manager.stats().hits,
+        hits,
+        "no KV block came back"
+    );
+    assert_eq!(second.last_gdn_prefix_prepare_state, "cold");
+    assert_eq!(generated(), cold);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
+    Ok(())
+}
+
+/// A damaged state above a sound one on the same lineage: the prime
+/// discards the deeper one at its read and resumes at the one below, its KV
+/// chain and its GDN cell at the same depth (no replay over the gap). The
+/// sound state reaches the disk in an earlier process: a point its
+/// conversation went on from is never copied behind.
+/// Mutation M1 (the prime arms a state it did not read) → red.
+#[test]
+fn a_damaged_state_resumes_at_the_sound_state_below() -> Result<()> {
+    const TEST: &str = "a_damaged_state_resumes_at_the_sound_state_below";
+    const TAG: &str = "state-tier-ar-corrupt-deeper";
+    const SEED: u64 = 0x5A13_0012;
+    let _plan = SmallPlan::new();
+    let tokens = prompt(11, 127);
+    let Some((tier, mut middle, _)) =
+        restart_after(TAG, SEED, TEST, &[prompt(11, 95)], |_, _| {}, 1)?
+    else {
+        return Ok(());
+    };
+    assert_eq!(ar_turn(&mut middle, &tokens)?.cached_tokens, 80);
+    let Some((tier, mut second)) = reopen_after(
+        middle,
+        tier,
+        TAG,
+        SEED,
+        TEST,
+        |first, tier| {
+            assert_eq!(
+                states(first)
+                    .into_iter()
+                    .filter(|state| state.3)
+                    .map(|state| state.0)
+                    .collect::<Vec<_>>(),
+                vec![80, 112]
+            );
+            corrupt_state_object(tier, state_key_at(&first.dflash2_states, 112));
+        },
+        2,
+    )?
+    else {
+        return Ok(());
+    };
+    let hits = tier.tier.manager.stats().hits;
+    let result = ar_turn(&mut second, &tokens)?;
+    assert_eq!(result.cached_tokens, 80);
+    assert_eq!(second.last_gdn_prefix_prepare_state, "checkpoint");
+    assert_eq!(
+        tier.tier.manager.stats().hits - hits,
+        5,
+        "the chain below 80 came back"
+    );
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
+    Ok(())
+}
+
+/// The read a prime armed with is gone before the GDN prime takes it, and
+/// the state does not read back: the KV the state's chain brought back has
+/// no GDN state at its end, so the turn restarts cold instead of replaying
+/// GDN alone over it, and decodes what a cold turn does.
+/// Mutation M2 (the prime keeps the KV and replays) → red.
+#[test]
+fn a_state_lost_after_its_chain_came_back_restarts_cold() -> Result<()> {
+    const TEST: &str = "a_state_lost_after_its_chain_came_back_restarts_cold";
+    let _plan = SmallPlan::new();
+    let tokens = prompt(11, 127);
+    let Some((tier, mut second, cold)) = restart_after(
+        "state-tier-ar-lost-read",
+        0x5A13_0013,
+        TEST,
+        std::slice::from_ref(&tokens),
+        |_, _| {},
+        1,
+    )?
+    else {
+        return Ok(());
+    };
+    let hits = tier.tier.manager.stats().hits;
+    let result = {
+        let _lost = crate::models::qwen3_5::dflash2_turn::StateReadLost::new();
+        ar_turn(&mut second, &tokens)?
+    };
+    assert_eq!(
+        tier.tier.manager.stats().hits - hits,
+        7,
+        "the state's chain came back"
+    );
+    assert_eq!(result.cached_tokens, 0);
+    assert_eq!(second.last_gdn_prefix_prepare_state, "cold");
+    assert_eq!(generated(), cold);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
     Ok(())
 }
 
