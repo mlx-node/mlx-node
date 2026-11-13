@@ -114,7 +114,7 @@ pub(crate) mod recipe {
 
     use super::{
         Sym8ScalesCastAction, dequant_fp8, normalize_mtp_prefix, remap_qwen35_body_key,
-        sym8_scales_cast_action,
+        shift_raw_mtp_norms, sym8_scales_cast_action,
     };
     use crate::array::{DType, MxArray};
 
@@ -1247,41 +1247,6 @@ pub(crate) mod recipe {
                 ".k_norm.weight",
             ];
 
-            // MTP-head norms are classified INDEPENDENTLY of the LM body. The
-            // `already_sanitized` probe above samples a non-MTP norm, but a
-            // checkpoint can mix conventions — e.g. an older convert revision
-            // shifted the body but skipped every `mtp.*` key, leaving raw MTP
-            // norms behind a shifted body. Probe an MTP norm directly and shift
-            // only the seven MTP norm tensors (`mtp.norm` + the two pre-fc norms
-            // match none of the suffixes above). Mean is the discriminator: a
-            // raw MTP norm sits near 0, a shifted one near 1.
-            let mtp_norm_suffixes = [
-                ".input_layernorm.weight",
-                ".post_attention_layernorm.weight",
-                ".q_norm.weight",
-                ".k_norm.weight",
-                ".pre_fc_norm_hidden.weight",
-                ".pre_fc_norm_embedding.weight",
-            ];
-            let is_mtp_norm = |k: &str| {
-                k.starts_with("mtp.")
-                    && (k == "mtp.norm.weight" || mtp_norm_suffixes.iter().any(|s| k.ends_with(s)))
-            };
-            let mtp_norms_need_shift = match new_weights
-                .iter()
-                .find(|(k, _)| k.ends_with("mtp.layers.0.input_layernorm.weight"))
-            {
-                Some((_, v)) => {
-                    let f32_v = v.astype(DType::Float32)?;
-                    let m = f32_v.mean(None, None)?;
-                    m.eval();
-                    let mean = m.item_at_float32(0).unwrap_or(1.0);
-                    let need = mean < 0.5;
-                    info!("  MTP-norm probe: mean={mean:.4} (raw≈0 shifted≈1) → shift={need}");
-                    need
-                }
-                None => false,
-            };
             let keys: Vec<String> = if already_sanitized {
                 Vec::new() // skip all sanitization transforms
             } else {
@@ -1333,8 +1298,8 @@ pub(crate) mod recipe {
                     // Raw-HF LM-body norm weights are stored unshifted (~0); MLX
                     // `fast::rms_norm` is direct-convention and expects weight+1.
                     // MTP-head norms are excluded here (the body suffixes also
-                    // match `mtp.*` keys) and shifted separately below under the
-                    // independent `mtp_norms_need_shift` probe.
+                    // match `mtp.*` keys) and shifted separately below by
+                    // `shift_raw_mtp_norms`.
                     let v = new_weights.get(&k).ok_or_else(|| {
                         Error::from_reason(format!("weight key '{k}' vanished from weights"))
                     })?;
@@ -1345,27 +1310,9 @@ pub(crate) mod recipe {
                 }
             }
 
-            // MTP-head norm shift — independent of `already_sanitized` and the
-            // main loop's `keys` gate, so MTP norms are corrected even when the
-            // LM body is already sanitized. A previous revision skipped `mtp.*`
-            // entirely on the false assumption that MTP norms ship in final form;
-            // that left raw MTP norms behind and produced zero MTP acceptance.
-            if mtp_norms_need_shift {
-                let mtp_keys: Vec<String> = new_weights
-                    .keys()
-                    .filter(|k| is_mtp_norm(k.as_str()))
-                    .cloned()
-                    .collect();
-                for k in mtp_keys {
-                    let v = new_weights.get(&k).ok_or_else(|| {
-                        Error::from_reason(format!("weight key '{k}' vanished from weights"))
-                    })?;
-                    if v.ndim()? == 1 {
-                        let shifted = v.add_scalar(1.0)?;
-                        new_weights.insert(k, shifted);
-                    }
-                }
-            }
+            // MTP-head norms are decided apart from the LM body: a checkpoint can
+            // ship raw MTP norms behind a shifted body.
+            shift_raw_mtp_norms(&mut new_weights)?;
 
             info!("  After sanitization: {} tensors", new_weights.len());
 
@@ -5290,37 +5237,57 @@ fn mtp_sidecar_weight_count(weights: &HashMap<String, MxArray>) -> usize {
         .count()
 }
 
-/// Tripwire for `--q-mtp split`: confirm `mtp.layers.0.input_layernorm.weight`
-/// already carries the +1.0 RMSNorm shift (mean ≈ 1.0). The drafter is written
-/// with `format:mlx` metadata, so mlx-vlm's loader SKIPS its own sanitize and
-/// trusts the on-disk values verbatim — they MUST already be shifted. Operating
-/// on the post-sanitization `converted_tensors` guarantees this; assert it so a
-/// future regression that drops the shift fails loud here, not at inference.
-/// Probes via `Result`/`if let` (no `.unwrap()`); a missing probe key is a
+/// Tripwire for `--q-mtp split`: the loader's rule
+/// ([`crate::models::qwen3_5::persistence::mtp_norms_need_shift`]) must read
+/// the MTP norms as shifted. The drafter is written with `format:mlx`
+/// metadata, so mlx-vlm's loader SKIPS its own sanitize and trusts the
+/// on-disk values verbatim — they MUST already be shifted. No MTP norm is a
 /// no-op (the absence of mtp.* is caught by the caller's earlier guard).
 fn assert_mtp_norm_shifted(weights: &HashMap<String, MxArray>) -> Result<()> {
-    let probe = weights
-        .iter()
-        .find(|(k, _)| k.ends_with("mtp.layers.0.input_layernorm.weight"));
-    if let Some((key, v)) = probe {
-        let f32_v = v.astype(DType::Float32)?;
-        let m = f32_v.mean(None, None)?;
-        m.eval();
-        // `item_at_float32` can fail on an empty array; treat that as "unknown"
-        // and fall through rather than panic.
-        if let Ok(mean) = m.item_at_float32(0) {
-            info!("  MTP-drafter shift tripwire: mean({key})={mean:.4} (expect ≈1.0)");
-            if mean < 0.5 {
-                return Err(Error::from_reason(format!(
-                    "--q-mtp split: MTP norm '{key}' mean={mean:.4} looks UNSHIFTED (raw HF ≈0). \
-                     The drafter is emitted as format:mlx so mlx-vlm trusts these values verbatim; \
-                     they must already carry the +1.0 RMSNorm shift. This indicates a convert-time \
-                     sanitization regression."
-                )));
-            }
-        }
+    if crate::models::qwen3_5::persistence::mtp_norms_need_shift(weights, "--q-mtp split")? {
+        return Err(Error::from_reason(
+            "--q-mtp split: the MTP norms look UNSHIFTED (raw HF ≈0). The drafter is emitted \
+             as format:mlx so mlx-vlm trusts these values verbatim; they must already carry \
+             the +1.0 RMSNorm shift. This indicates a convert-time sanitization regression.",
+        ));
     }
     Ok(())
+}
+
+/// Shifts every MTP-head norm by +1.0 when the loader's rule
+/// ([`crate::models::qwen3_5::persistence::mtp_norms_need_shift`]) reads them
+/// as raw, so the written checkpoint loads with no second shift. Keys are the
+/// bare `mtp.*` ones. True when it shifted.
+fn shift_raw_mtp_norms(weights: &mut HashMap<String, MxArray>) -> Result<bool> {
+    if !crate::models::qwen3_5::persistence::mtp_norms_need_shift(weights, "convert")? {
+        return Ok(false);
+    }
+    let suffixes = [
+        ".input_layernorm.weight",
+        ".post_attention_layernorm.weight",
+        ".q_norm.weight",
+        ".k_norm.weight",
+        ".pre_fc_norm_hidden.weight",
+        ".pre_fc_norm_embedding.weight",
+    ];
+    let keys: Vec<String> = weights
+        .keys()
+        .filter(|k| {
+            k.starts_with("mtp.")
+                && (k.as_str() == "mtp.norm.weight" || suffixes.iter().any(|s| k.ends_with(s)))
+        })
+        .cloned()
+        .collect();
+    for k in keys {
+        let v = weights
+            .get(&k)
+            .ok_or_else(|| Error::from_reason(format!("weight key '{k}' vanished from weights")))?;
+        if v.ndim()? == 1 {
+            let shifted = v.add_scalar(1.0)?;
+            weights.insert(k, shifted);
+        }
+    }
+    Ok(true)
 }
 
 /// Extract the post-sanitization `mtp.*` tensors into a BARE-keyed map for the
@@ -18914,7 +18881,7 @@ mod tests {
             "mtp.norm.weight".to_string(),
             MxArray::from_float32(&[1.03, 0.97], &[2]).unwrap(),
         );
-        // Probe key the tripwire reads — shifted (mean ≈ 1.0).
+        // Shifted (mean ≈ 1.0).
         w.insert(
             "mtp.layers.0.input_layernorm.weight".to_string(),
             MxArray::from_float32(&[1.04, 1.06], &[2]).unwrap(),
@@ -19146,13 +19113,110 @@ mod tests {
     #[test]
     fn split_tripwire_rejects_unshifted_mtp_norm() {
         let mut weights = synthetic_split_weights();
-        // Force the probe key to look raw/unshifted (mean ≈ 0).
-        weights.insert(
-            "mtp.layers.0.input_layernorm.weight".to_string(),
-            MxArray::from_float32(&[0.01, -0.01], &[2]).unwrap(),
-        );
+        assert!(assert_mtp_norm_shifted(&weights).is_ok());
+        // The hidden-width MTP norms the loader's rule reads look raw (≈ 0).
+        for key in [
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.layers.0.post_attention_layernorm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+        ] {
+            weights.insert(
+                key.to_string(),
+                MxArray::from_float32(&[0.01, -0.01], &[2]).unwrap(),
+            );
+        }
         let err = assert_mtp_norm_shifted(&weights);
-        assert!(err.is_err(), "tripwire must reject an unshifted MTP norm");
+        assert!(err.is_err(), "tripwire must reject unshifted MTP norms");
+    }
+
+    /// Bare `mtp.*` norms with the given per-tensor means, in the order
+    /// [input, post-attention, q, k, mtp.norm, pre-fc embedding, pre-fc
+    /// hidden], each a spread around its mean, beside a body norm at 0.
+    fn mtp_norm_weights(means: [f32; 7]) -> HashMap<String, MxArray> {
+        let names = [
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.layers.0.post_attention_layernorm.weight",
+            "mtp.layers.0.self_attn.q_norm.weight",
+            "mtp.layers.0.self_attn.k_norm.weight",
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+        ];
+        let mut weights = HashMap::new();
+        for (name, mean) in names.into_iter().zip(means) {
+            let values = [mean - 0.3, mean + 0.3, mean - 0.1, mean + 0.1];
+            weights.insert(
+                name.to_string(),
+                MxArray::from_float32(&values, &[4]).unwrap(),
+            );
+        }
+        weights.insert(
+            "language_model.model.layers.0.input_layernorm.weight".to_string(),
+            MxArray::from_float32(&[0.0; 4], &[4]).unwrap(),
+        );
+        weights
+    }
+
+    /// Convert decides the MTP-norm shift by the loader's rule: raw norms
+    /// are shifted once (+1.0 on all seven, the body untouched), shifted
+    /// ones are left alone, and the loader then reads every written
+    /// checkpoint as shifted, so it never shifts again; a second convert
+    /// of the output shifts nothing. The 0.8B checkpoint's input norm
+    /// mean is 0.5052, above the old single-tensor cut, but the rule's
+    /// mean (0.0388 on the real tensors) shifts it. Mutation: decide from
+    /// `mtp.layers.0.input_layernorm` alone (`< 0.5`) → the 0.8B case red.
+    #[test]
+    fn convert_shifts_raw_mtp_norms_once_by_the_loader_rule() {
+        let cases: [(&str, [f32; 7], bool); 4] = [
+            (
+                "Qwen3.5-0.8B: raw, input norm just above 0.5",
+                [0.5052, 0.4270, 0.8228, 0.7820, 3.4390, -0.4334, -0.3436],
+                true,
+            ),
+            (
+                "raw, every norm near 0",
+                [0.0, 0.03, 0.02, 0.01, 0.05, -0.02, 0.01],
+                true,
+            ),
+            (
+                "Qwen3.6-35B-A3B converted: shifted, pre-fc norms below 0.5",
+                [0.9049, 1.8685, 1.7670, 1.7418, 2.9253, 0.2734, 0.4937],
+                false,
+            ),
+            (
+                "shifted, every norm near 1",
+                [1.0, 1.03, 1.02, 1.01, 1.05, 0.98, 1.01],
+                false,
+            ),
+        ];
+        let loader = crate::models::qwen3_5::persistence::mtp_norms_need_shift;
+        for (label, means, raw) in cases {
+            let source = mtp_norm_weights(means);
+            let mut converted = mtp_norm_weights(means);
+            assert_eq!(
+                loader(&source, "test").unwrap(),
+                raw,
+                "{label}: the loader's rule"
+            );
+            assert_eq!(shift_raw_mtp_norms(&mut converted).unwrap(), raw, "{label}");
+            let offset = if raw { 1.0 } else { 0.0 };
+            for (key, before) in &source {
+                let shift = if key.starts_with("mtp.") { offset } else { 0.0 };
+                let after = f32_vec(&converted[key]);
+                for (got, want) in after.iter().zip(f32_vec(before)) {
+                    assert!((got - (want + shift)).abs() < 1e-6, "{label}: {key}");
+                }
+            }
+            assert!(
+                !loader(&converted, "test").unwrap(),
+                "{label}: the loader shifts nothing"
+            );
+            assert!(
+                !shift_raw_mtp_norms(&mut converted).unwrap(),
+                "{label}: a second convert shifts nothing"
+            );
+        }
     }
 
     #[test]

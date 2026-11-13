@@ -207,17 +207,17 @@ fn mtp_counts(result: &ChatResult) -> (u32, f64) {
     (cycles, accepted.round())
 }
 
-/// N = 1, 2, 4 and 8 concurrent text turns against the serial path at
-/// temperature 0. Plain AR gives the serial path's tokens at every N. With
-/// fixed-depth MTP (when the checkpoint has MTP heads) a scheduled verify
-/// packs 2+ lanes' rows into one expert batch whose shape changes the bf16
-/// rounding of the sparse-MoE projections, so a near-tie may resolve the
-/// other way and tokens are not asserted against the serial path; what
-/// holds by design is that every scheduled MTP turn finishes without error
-/// within its budget, runs draft cycles, that at every width the scheduled
-/// wave accepts drafts exactly when the serial oracle does on the same
-/// prompts, and that the oracle accepts at least one draft. The first
-/// character that differs is printed.
+/// N = 1, 2, 4 and 8 concurrent text turns at temperature 0. With MTP off
+/// every turn gives the serial path's tokens. When the checkpoint has MTP
+/// heads, fixed-depth MTP turns give the tokens of the same prompt's
+/// scheduled turn run alone: the lanes share a step, never a matmul. The
+/// serial MTP path is not that reference: its first cycle follows one AR
+/// step and its drafter rebuilds history every cycle, so it verifies other
+/// windows, and on a MoE checkpoint a one-ulp change in a router input can
+/// pick other experts; its first differing character is printed. Every
+/// scheduled MTP turn runs draft cycles, at every width the scheduled wave
+/// accepts drafts exactly when the serial oracle does on the same prompts,
+/// and the oracle accepts at least one draft.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "needs QWEN35_MOE_STAGE2_MODEL_PATH pointing to a Qwen3.5 MoE checkpoint"]
 async fn waves_of_one_two_four_and_eight_match_serial() {
@@ -241,6 +241,8 @@ async fn waves_of_one_two_four_and_eight_match_serial() {
     } else {
         &[false]
     };
+    // Every wave runs before the verdict, so one load shows each width.
+    let mut differing = Vec::new();
     for &mtp in modes {
         // The switch is read per command, so the load keeps its plan and
         // only the oracle turns run whole-turn.
@@ -263,6 +265,25 @@ async fn waves_of_one_two_four_and_eight_match_serial() {
             model.reset_caches().await.expect("reset serial oracle");
         }
         unsafe { std::env::remove_var("MLX_SERVE_FORCE_SERIAL") };
+        let mut alone = Vec::new();
+        if mtp {
+            for (index, (prompt, max_tokens)) in WAVE_PROMPTS.iter().enumerate() {
+                alone.push(
+                    model
+                        .chat_session_start(
+                            vec![user_message(prompt)],
+                            Some(config_with(&format!("alone-{index}"), *max_tokens, mtp)),
+                        )
+                        .await
+                        .expect("scheduled turn alone"),
+                );
+                model
+                    .reset_caches()
+                    .await
+                    .expect("reset after the lone turn");
+            }
+        }
+        let reference = if mtp { &alone } else { &serial };
         let mut serial_accepted = vec![0.0; serial.len()];
         if mtp {
             for (index, result) in serial.iter().enumerate() {
@@ -288,27 +309,43 @@ async fn waves_of_one_two_four_and_eight_match_serial() {
                 },
             ))
             .await;
-            for ((expected, actual), (prompt, max_tokens)) in
-                serial.iter().zip(wave).zip(&WAVE_PROMPTS[..width])
+            for (((expected, oracle), actual), (prompt, _)) in reference
+                .iter()
+                .zip(&serial)
+                .zip(wave)
+                .zip(&WAVE_PROMPTS[..width])
             {
                 let actual = actual.expect("batched turn");
                 let label = format!("mtp={mtp} N={width}: {prompt}");
-                if mtp {
-                    let (cycles, accepted) = mtp_counts(&actual);
-                    let differs = actual
+                let first_difference = |reference: &ChatResult| {
+                    actual
                         .raw_text
                         .chars()
-                        .zip(expected.raw_text.chars())
-                        .position(|(left, right)| left != right);
+                        .zip(reference.raw_text.chars())
+                        .position(|(left, right)| left != right)
+                };
+                eprintln!(
+                    "{label}: first character differing from the reference {:?}, from the \
+                     serial path {:?}",
+                    first_difference(expected),
+                    first_difference(oracle)
+                );
+                if actual.text != expected.text
+                    || actual.raw_text != expected.raw_text
+                    || actual.finish_reason != expected.finish_reason
+                    || actual.num_tokens != expected.num_tokens
+                {
+                    differing.push(label.clone());
+                }
+                if mtp {
+                    let (cycles, accepted) = mtp_counts(&actual);
+                    let (serial_cycles, serial_drafts) = mtp_counts(oracle);
                     eprintln!(
-                        "{label}: {cycles} cycles, {accepted} accepted; first differing \
-                         character {differs:?}"
+                        "{label}: scheduled {cycles} cycles, {accepted} accepted; serial \
+                         {serial_cycles} cycles, {serial_drafts} accepted"
                     );
                     assert!(cycles > 0, "no draft cycle for {label}");
-                    assert!(actual.num_tokens <= *max_tokens as u32, "{label}");
                     scheduled_accepted += accepted;
-                } else {
-                    assert_same(expected, &actual, &label);
                 }
             }
             if mtp {
@@ -340,4 +377,8 @@ async fn waves_of_one_two_four_and_eight_match_serial() {
             );
         }
     }
+    assert!(
+        differing.is_empty(),
+        "turns whose tokens differ from their reference: {differing:?}"
+    );
 }
