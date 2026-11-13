@@ -23,6 +23,19 @@
   color: var(--text-secondary);
 }
 
+/* The orb (20 px, about 2 px of empty canvas at its edge) and the 8 px dot share one leading column: the title and the name start at one x, the orb's ink at the text edge. */
+.head > [data-wait-orb] {
+  margin-inline-start: -2px;
+}
+
+.name > [data-model] {
+  gap: var(--space-2);
+}
+
+.name > [data-model] > :first-child {
+  margin-inline: 4px 6px;
+}
+
 .title {
   min-width: 0;
   flex: 1;
