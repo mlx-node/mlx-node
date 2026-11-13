@@ -734,7 +734,7 @@ impl PagedBackend for Qwen35Inner {
                 cache_salt,
             );
         }
-        self.gdn_unclaimed_rungs.clear();
+        self.gdn_unclaimed_rung = None;
         // Always attempt the release for the non-reuse path, even when
         // registration failed.
         if release_pending && let Some(adapter) = self.paged_adapter.as_mut() {

@@ -274,6 +274,32 @@ pub(crate) trait GdnCheckpointLineage {
     fn block_hashes(&self) -> &[u64];
 }
 
+impl<T: GdnCheckpointLineage> GdnCheckpointLineage for &T {
+    fn owner_id(&self) -> &str {
+        (**self).owner_id()
+    }
+
+    fn prefix_len(&self) -> u32 {
+        (**self).prefix_len()
+    }
+
+    fn block_size(&self) -> u32 {
+        (**self).block_size()
+    }
+
+    fn final_block_hash(&self) -> u64 {
+        (**self).final_block_hash()
+    }
+
+    fn tokens(&self) -> &[u32] {
+        (**self).tokens()
+    }
+
+    fn block_hashes(&self) -> &[u64] {
+        (**self).block_hashes()
+    }
+}
+
 /// Replay into a staged GDN cache and publish it only after the replay succeeds.
 ///
 /// Materialized replay is fallible after it has already mutated recurrent

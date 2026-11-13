@@ -2362,10 +2362,12 @@ fn dense_manual_paged_finalize_reaches_the_gdn_sidecar_capture() {
 /// A host short of spare memory refuses a ladder rung its RAM claim
 /// (`HostRule::admits` keeps the margin from Optional claims), so the rung
 /// goes to the cold tier through the turn's sidecar capture instead (Splash
-/// `publishStateToDisk`) and never into RAM.
+/// `publishStateToDisk`) and never into RAM. Only the deepest refused rung is
+/// held until the capture: rungs 16 and 32, then 16 again, leave 32.
 ///
-/// Mutation: drop the refused rung → the capture finds no checkpoint
-/// (`boundary_skips` +1, `enqueued` +0) → red.
+/// Mutations: drop the refused rung → the capture finds no checkpoint
+/// (`boundary_skips` +1, `enqueued` +0) → red; F1 (the newest refused rung
+/// replaces a deeper one) → the held rung is 16 → red.
 #[test]
 fn a_rung_refused_ram_still_reaches_the_cold_tier() {
     use crate::engine::governor::governor::Governor;
@@ -2387,45 +2389,51 @@ fn a_rung_refused_ram_still_reaches_the_cold_tier() {
     let activation = crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&inner)
         .expect("activation dtype");
     let config = inner.config.clone();
-    let mut caches = fresh_dense_layer_caches(&config);
-    for cache in &mut caches {
-        if let Qwen3_5LayerCache::Linear(arrays) = cache {
-            let conv = MxArray::zeros(
-                &[
-                    1,
-                    i64::from(config.linear_conv_kernel_dim - 1),
-                    i64::from(config.linear_conv_dim()),
-                ],
-                Some(activation),
-            )
-            .expect("conv state");
-            let recurrent = MxArray::zeros(
-                &[
-                    1,
-                    i64::from(config.linear_num_value_heads),
-                    i64::from(config.linear_value_head_dim),
-                    i64::from(config.linear_key_head_dim),
-                ],
-                Some(DType::Float32),
-            )
-            .expect("recurrent state");
-            arrays.set(0, conv).expect("set conv");
-            arrays.set(1, recurrent).expect("set recurrent");
+    let rung = |prefix_len: u32| {
+        let mut caches = fresh_dense_layer_caches(&config);
+        for cache in &mut caches {
+            if let Qwen3_5LayerCache::Linear(arrays) = cache {
+                let conv = MxArray::zeros(
+                    &[
+                        1,
+                        i64::from(config.linear_conv_kernel_dim - 1),
+                        i64::from(config.linear_conv_dim()),
+                    ],
+                    Some(activation),
+                )
+                .expect("conv state");
+                let recurrent = MxArray::zeros(
+                    &[
+                        1,
+                        i64::from(config.linear_num_value_heads),
+                        i64::from(config.linear_value_head_dim),
+                        i64::from(config.linear_key_head_dim),
+                    ],
+                    Some(DType::Float32),
+                )
+                .expect("recurrent state");
+                arrays.set(0, conv).expect("set conv");
+                arrays.set(1, recurrent).expect("set recurrent");
+            }
         }
-    }
-    inner.publish_dense_gdn_materialized_prefix_checkpoint(
-        &prompt,
-        0,
-        vec![
-            crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint {
-                prefix_len: 16,
-                caches,
-            },
-        ],
-    );
+        crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint {
+            prefix_len,
+            caches,
+        }
+    };
+    inner.publish_dense_gdn_materialized_prefix_checkpoint(&prompt, 0, vec![rung(16), rung(32)]);
+    inner.publish_dense_gdn_materialized_prefix_checkpoint(&prompt, 0, vec![rung(16)]);
     assert!(
         inner.gdn_prefix_checkpoints.is_empty(),
-        "the host refused the rung its RAM"
+        "the host refused the rungs their RAM"
+    );
+    assert_eq!(
+        inner
+            .gdn_unclaimed_rung
+            .as_ref()
+            .map(|kept| kept.prefix_len),
+        Some(32),
+        "only the deepest refused rung is held"
     );
 
     let _serialized = crate::cold_tier::sidecar_counter_test_lock();
@@ -2444,7 +2452,7 @@ fn a_rung_refused_ram_still_reaches_the_cold_tier() {
         "the refused rung must reach the cold tier"
     );
     assert!(
-        inner.gdn_unclaimed_rungs.is_empty(),
+        inner.gdn_unclaimed_rung.is_none(),
         "the turn's end drops the refused rung"
     );
 
