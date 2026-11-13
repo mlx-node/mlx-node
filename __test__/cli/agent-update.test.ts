@@ -50,6 +50,7 @@ import {
 } from '../../packages/cli/src/commands/agent/grok-build.js';
 import { run } from '../../packages/cli/src/commands/agent/index.js';
 import { parseServeArgs } from '../../packages/cli/src/commands/serve.js';
+import { AGENT_HOST_THINKING } from '../../packages/server/src/host/agent-thinking.js';
 
 const MANAGED = { source: 'managed', path: '/m/mlx-agent' } satisfies Partial<AgentInstallProbe>;
 
@@ -2042,6 +2043,16 @@ describe('launchGrokAgent server gating', () => {
     spawnServe.mockClear();
     await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent, persistPagedCache });
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--max-context');
+  });
+
+  // The server `mlx agent` starts runs agents. Mutation: drop the budget pair from the serve argv → red.
+  it('hands the agent hosts thinking budget, cycle guard and end text to the spawned serve', async () => {
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent, persistPagedCache });
+    const serveArgv: string[] = spawnServe.mock.calls[0]![0];
+    const args = parseServeArgs(serveArgv.slice(2));
+    expect(args.thinkingTokenBudget).toBe(AGENT_HOST_THINKING.tokenBudget);
+    expect(args.thinkingCycleGuard).toBe(true);
+    expect(args.thinkingEndText).toBe(AGENT_HOST_THINKING.endText);
   });
 
   // Mutation: drop the `--idle-release` pair from the serve argv → red.

@@ -137,6 +137,10 @@ export interface HandlerOptions {
   health?: () => ServerHealth;
   /** See `ServerConfig.thinkingTokenBudget`. */
   thinkingTokenBudget?: number;
+  /** See `ServerConfig.thinkingCycleGuard`. */
+  thinkingCycleGuard?: boolean;
+  /** See `ServerConfig.thinkingEndText`. */
+  thinkingEndText?: string;
   /** See `ServerConfig.turnJournal`. */
   turnJournal?: TurnJournal;
   /** Serves `POST /v1/memory/release`; supplied by `createServer` when it can release the weights. */
@@ -238,6 +242,8 @@ export function createHandler(
           rerank,
           unloadModels,
           thinkingTokenBudget: options?.thinkingTokenBudget,
+          thinkingCycleGuard: options?.thinkingCycleGuard,
+          thinkingEndText: options?.thinkingEndText,
           ...(options?.turnJournal !== undefined ? { turnJournal: options.turnJournal } : {}),
           ...(options?.releaseMemory !== undefined ? { releaseMemory: options.releaseMemory } : {}),
         },

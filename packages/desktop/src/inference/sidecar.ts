@@ -17,6 +17,8 @@
 
 import { randomBytes } from 'node:crypto';
 
+import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
+
 import { EXIT_STARTUP_FAILED } from './exit-codes.js';
 import { parseFingerprintList, QUARANTINED_ENV, TURN_JOURNAL_ENV } from './turn-journal.js';
 
@@ -89,6 +91,9 @@ export function sidecarHostOptions(env: NodeJS.ProcessEnv = process.env): Sideca
     authToken: newSidecarAuthToken(),
     hostKind: 'desktop',
     persistPagedCache: { byDefault: true, wholePrompt: true },
+    thinkingTokenBudget: AGENT_HOST_THINKING.tokenBudget,
+    thinkingCycleGuard: AGENT_HOST_THINKING.cycleGuard,
+    thinkingEndText: AGENT_HOST_THINKING.endText,
     ...(turnJournal !== null ? { turnJournal } : {}),
   };
 }
@@ -111,6 +116,13 @@ export interface SidecarHostOptions {
    * {@link SidecarHost} gives.
    */
   persistPagedCache: { flag?: boolean; byDefault: boolean; wholePrompt: boolean };
+  /**
+   * The engine runs the app's agents: Messages thinking gets the agent hosts'
+   * budget, cycle guard and end text (`AGENT_HOST_THINKING`).
+   */
+  thinkingTokenBudget: number;
+  thinkingCycleGuard: boolean;
+  thinkingEndText: string;
   turnJournal?: SidecarTurnJournal;
 }
 

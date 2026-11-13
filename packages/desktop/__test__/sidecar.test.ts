@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { AddressInfo } from 'node:net';
 
+import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import {
@@ -183,6 +184,14 @@ describe('the readiness handshake', () => {
 
   it('names the desktop as the host kind of the runtime series', () => {
     expect(sidecarHostOptions().hostKind).toBe('desktop');
+  });
+
+  // The engine runs the app's agents. Mutation: drop the budget from the options → red.
+  it('the desktop engine passes the agent hosts thinking budget, cycle guard and end text', () => {
+    const options = sidecarHostOptions();
+    expect(options.thinkingTokenBudget).toBe(AGENT_HOST_THINKING.tokenBudget);
+    expect(options.thinkingCycleGuard).toBe(true);
+    expect(options.thinkingEndText).toBe(AGENT_HOST_THINKING.endText);
   });
 
   it('the desktop engine keeps the disk cache on by default, with no flag over the env', () => {

@@ -1,5 +1,7 @@
 /** Every fixed word of the Chat page. Tests import this object, never a literal. `{x}` is filled by `fill`. */
 
+import { CONTINUE_PROMPT } from './chat-types';
+
 export const CHAT = {
   nav: 'Chat',
   mode: 'Mode',
@@ -124,6 +126,7 @@ export const CHAT = {
   pendingQueuedOne: 'Waiting for a running answer. {model} runs one answer at a time.',
   pendingQueuedMany: 'Waiting for running answers. {model} runs {n} answers at a time.',
   pendingThinking: 'Thinking…',
+  pendingContinuing: 'Continuing after the length limit…',
   load: {
     title: 'Loading the model',
     titleKernels: 'Preparing GPU kernels',
@@ -153,6 +156,7 @@ export const CHAT = {
   writing: 'Writing',
   thinking: 'Thinking',
   thought: 'Thought',
+  continued: 'Continued',
   imageLink: 'Image: {alt}',
   imageLinkBare: 'Image',
 
@@ -395,6 +399,7 @@ export const CHAT = {
     'cancelled-unsent': 'You stopped. The message was not sent.',
     'stopped-stored': 'This answer stopped before the end.',
     'output-limit': 'The answer hit the length limit.',
+    'output-limit-twice': 'The answer hit the length limit twice in a row. Continuing did not help.',
     'tool-loop': 'Stopped: too many tool calls.',
     'tool-refused': 'Stopped: the model asked for a tool that Chat does not have.',
     'address-refused': 'Stopped: the model tried to read an address that is not from you or from a search result.',
@@ -412,7 +417,7 @@ export const CHAT = {
   },
   sendAgain: 'Send again',
   continueAnswer: 'Continue',
-  continuePrompt: 'continue',
+  continuePrompt: CONTINUE_PROMPT,
   updateAgent: 'Update the agent',
 
   blockers: {

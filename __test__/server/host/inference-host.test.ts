@@ -18,6 +18,7 @@ import {
   InferenceHostClosedError,
   InsecureBindError,
   LAUNCHER_ENGINE_POLICY,
+  AGENT_HOST_THINKING,
   ModelNotFoundError,
   NoModelsDiscoveredError,
   nativeContextEstimate,
@@ -508,6 +509,94 @@ describe('createInferenceHost — lazy load on the first request', () => {
 
     expect(res.status).not.toBe(404);
     expect(loads).toHaveLength(1);
+  });
+});
+
+describe('createInferenceHost — the agent hosts thinking options', () => {
+  /** A model that records the config of every native dispatch and answers with an empty stop. */
+  function recordingModel(configs: Array<Record<string, unknown>>): LoadableModel {
+    const result = {
+      text: 'ok',
+      toolCalls: [],
+      thinkingEnabled: true,
+      numTokens: 1,
+      promptTokens: 1,
+      reasoningTokens: 0,
+      finishReason: 'stop',
+      rawText: 'ok',
+      cachedTokens: 0,
+    };
+    async function* stream(): AsyncGenerator<Record<string, unknown>> {
+      yield { ...result, done: true, thinking: null };
+    }
+    const record = (config: unknown): void => {
+      configs.push({ ...(config as Record<string, unknown>) });
+    };
+    return {
+      chatSessionStart: async (_messages: unknown, config: unknown) => (record(config), result),
+      chatSessionContinue: async (_messages: unknown, config: unknown) => (record(config), result),
+      chatSessionContinueTool: async (_messages: unknown, config: unknown) => (record(config), result),
+      chatStreamSessionStart: (_messages: unknown, config: unknown) => (record(config), stream()),
+      chatStreamSessionContinue: (_messages: unknown, config: unknown) => (record(config), stream()),
+      chatStreamSessionContinueTool: (_messages: unknown, config: unknown) => (record(config), stream()),
+      resetCaches: async () => undefined,
+    } as unknown as LoadableModel;
+  }
+
+  async function served(over: Partial<InferenceHostOptions>, path: string, body: Record<string, unknown>) {
+    const configs: Array<Record<string, unknown>> = [];
+    const host = await start({
+      modelsDir: await makeModelsDir(['alpha']),
+      model: 'alpha',
+      loadModel: async () => recordingModel(configs),
+      ...over,
+    });
+    const res = await fetch(`${host.url}${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'alpha', ...body }),
+    });
+    await res.text();
+    expect(res.status).toBe(200);
+    const config = configs[0] ?? {};
+    return {
+      budget: config.thinkingTokenBudget,
+      guard: config.thinkingCycleGuard,
+      endText: config.thinkingEndText,
+    };
+  }
+
+  const messages = { messages: [{ role: 'user', content: 'hi' }], max_tokens: 8 };
+  const desktop = (): Partial<InferenceHostOptions> => {
+    const options = sidecarHostOptions({});
+    return {
+      thinkingTokenBudget: options.thinkingTokenBudget,
+      thinkingCycleGuard: options.thinkingCycleGuard,
+      thinkingEndText: options.thinkingEndText,
+    };
+  };
+
+  // Mutation: drop `thinkingCycleGuard` from the host's server config → red.
+  it("the desktop engine's three values reach a Messages request; Responses gets none of them", async () => {
+    expect(await served(desktop(), '/v1/messages', messages)).toEqual({
+      budget: AGENT_HOST_THINKING.tokenBudget,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+    });
+    expect(await served(desktop(), '/v1/responses', { input: 'hi', max_output_tokens: 8 })).toEqual({
+      budget: undefined,
+      guard: undefined,
+      endText: undefined,
+    });
+  });
+
+  // `mlx serve` by hand: "default: no cap".
+  it('a host started with none of them sends none', async () => {
+    expect(await served({}, '/v1/messages', messages)).toEqual({
+      budget: undefined,
+      guard: undefined,
+      endText: undefined,
+    });
   });
 });
 

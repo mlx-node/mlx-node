@@ -4,6 +4,8 @@
  * in a terminal, minus the app's internal variables and every provider key that is not selected.
  */
 
+import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
+
 import type { ChatPaths } from '../paths.js';
 
 export interface InferenceAccess {
@@ -30,8 +32,12 @@ export const WORK_ENV_REMOVED = [
   'NODE_OPTIONS',
 ];
 
-export const CHAT_MAX_COMPLETION_TOKENS = 8192;
-export const WORK_MAX_COMPLETION_TOKENS = 16384;
+/** Room for the answer after the thought. */
+export const CHAT_ANSWER_TOKENS = 8192;
+export const WORK_ANSWER_TOKENS = 16384;
+/** Each cap is the answer room plus the engine's thinking budget, so the budget fires before the cap. */
+export const CHAT_MAX_COMPLETION_TOKENS = CHAT_ANSWER_TOKENS + AGENT_HOST_THINKING.tokenBudget;
+export const WORK_MAX_COMPLETION_TOKENS = WORK_ANSWER_TOKENS + AGENT_HOST_THINKING.tokenBudget;
 
 function baseUrls(endpoint: InferenceAccess): Record<string, string> {
   const v1 = `${endpoint.url}/v1`;

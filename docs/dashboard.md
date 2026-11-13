@@ -76,7 +76,16 @@ fails does not ask: the guard then fails open. A `[permission]` ask rule cannot 
 this: `GROK_CONFIG` drops that table, and every file that holds one lives in `~/.mlx-agent`. The hook "ask" also
 outranks the user's own allow rules and saved bash grants; a deny rule still denies. File reads, listings and searches
 do not ask. `GROK_CONFIG` of Work is the user's own overlay object (when there is one) with the output cap set in
-`models`.
+`models`. Each mode's cap is its answer room plus the engine's thinking budget (`AGENT_HOST_THINKING`, 12,000): Work
+16,384 + 12,000 = 28,384, Chat 8,192 + 12,000 = 20,192 (`src/chat/agent/env.ts`). A lower cap of the user's own still
+holds.
+
+The desktop engine runs these agents, so its server sets the three thinking options of
+`@mlx-node/server/host/agent-thinking` on every Messages request that is not reasoning effort `none`: a budget of
+12,000 thinking tokens (only when the request sets none), the cycle guard (an exact repeat inside a thought closes it)
+and the end text written before the close when a cut ends a thought. The cut thought ends on that sentence in the
+Thought card. Responses on the same server gets none of them. An engine whose addon predates the
+guard ignores it and the end text; the budget alone still bounds the thought.
 
 ## Using it as a library
 
@@ -272,9 +281,29 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
 - Turns: the Stop button, the palette's "Stop answer" and `Esc` in the composer cancel the running turn. `Esc` stops
   nothing on a key repeat, while an input method composes, or with the focus anywhere else. A Chat turn stops after 10
   minutes (`turn-timeout`). A Work turn has no time limit: it runs until the agent ends it or you press Stop, and the
-  app ends it only when the engine or the agent is gone. The end of a turn says why it stopped; `output-limit` offers
+  app ends it only when the engine or the agent is gone, or after two length stops in a row (below). The end of a turn says why it stopped; `output-limit` offers
   Continue, `tool-refused`, `address-refused`, `arguments-unreadable` and `tool-loop`
   offer Send again.
+- Length stop in Work: when the model's reply hits the output cap, the app sends the Continue button's own message
+  (`continue`) once, inside the same turn: after the agent's own end line of the reply (no timer) and a fresh read of
+  the engine's endpoint. The thread shows a "Continued" divider where the prompt bubble would be, in every permission
+  mode; the pending row reads "Continuing after the length limit…" until the answer comes. A tool call since the
+  prompt was written resets the count. Two length stops in a row with no tool call between end the turn:
+  "The answer hit the length limit twice in a row. Continuing did not help." and Continue. Stop, a
+  lost endpoint, the agent's exit or a stale host between the two prompts end the turn `output-limit` and nothing is
+  sent to the agent. Chat never continues by itself. The turn's result carries `lengthStops`, `continues`,
+  `noContinue` (`second-length`, `stop`, `endpoint`, `agent-exit`, `host-stale`) and `late` for the stop record.
+
+  | What ends a Work turn                               | Who               |
+  | --------------------------------------------------- | ----------------- |
+  | The agent ends it                                   | the agent         |
+  | Stop                                                | you               |
+  | The engine or the agent is gone                     | the app           |
+  | Two length stops in a row with no tool call between | the app, by count |
+
+- Thought time: a thought made from live lines shows the time from its first to its last chunk. A thought read from
+  disk shows "Thought" alone: the agent stores one merged record with its last stamp, so no real time is known. When a
+  conversation goes cold and is read again, its earlier thoughts lose their time.
 - Titles, one rule on the server (`src/chat/titles.ts`) for Chat and Sessions: the agent's title, else the first typed
   prompt (first non-empty line, at most 60 characters with the `…`, cut at a word), else no title. A page prints its
   own word for no title: "New chat", "New Work conversation", or "Session" and the first 8 characters of the id.
@@ -545,6 +574,7 @@ lands in the same stream.
 | Request         | `outcome`, `errorKind`, `failPhase`, `endpoint`, `stream`, `dispatch`, `finishReason`                                                                                                                        |
 | Timing          | `durationMs`, `queueMs`, `loadWaitMs`, `resolveMs`, `preDispatchMs`, `waitMs`, `slotMs`, `prepareMs`, `ttftMs`, `prefillMs`, `decodeTps`                                                                     |
 | Tokens          | `promptTokens`, `cachedTokens`, `outputTokens`, `reasoningTokens`, `prefillDoneTokens`, `prefillTokens`, `ctxWindow`                                                                                         |
+| Thinking        | `thinkingBudget`, `thinkingBudgetFrom`, `thinkingGuard`, `outputCap` (what the server sent); native `reasoningClose`, `reasoningCutAt`, `reasoningCyclePeriod`, `reasoningStrayCloses`                       |
 | Speculation     | `mtpCycles`, `mtpMeanAccepted`, `mtpMeanDrafts`, `mtpMeanDepth`, `mtpAcceptByPos` (at most 16 positions)                                                                                                     |
 | Counts, overlap | `toolCount`, `toolCallCount`, `imageCount`, `concurrency`, `concurrencyPeak`                                                                                                                                 |
 | Memory          | `memActiveBytes`, `memPeakBytes`                                                                                                                                                                             |
@@ -552,6 +582,12 @@ lands in the same stream.
 | Cold tier       | `cold*` deltas and totals of the turn (hits, misses, bytes, queue drops, evictions, corruptions, write errors, sidecar counts)                                                                               |
 
 A rate or time that was not measured is absent, never 0. A media-restart error is not recorded as a failure.
+`thinkingBudget` and `outputCap` are the budget and `maxNewTokens` of the native config, after the window scaled them;
+`thinkingBudgetFrom` is `request` or `server` (Messages only); `thinkingGuard` is `true` when the cycle guard was sent. The native four
+are written for every finish reason: `reasoningClose` is `model`, `budget`, `cycle` or `open` (absent when the turn
+did not start in thinking), `reasoningCutAt` the thinking tokens when a cut began, `reasoningCyclePeriod` the period of
+the cycle the guard saw, `reasoningStrayCloses` the close tokens after the thought ended. An addon that predates them
+sends none, and the record carries none.
 `failPhase` is one of `queued`, `slot`, `prepare`, `prefill`, `decode`; a line from an older engine wrote `queued` for
 any stop before the prefill. Native reports `done` before it sends an error, so the server reads where the turn
 stopped from its timers: decode, else prefill, else `slot` when `slotMs` > 0, else `prepare` when `prepareMs` > 0,

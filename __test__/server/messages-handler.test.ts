@@ -4,7 +4,8 @@ import type { ChatMessage, ChatResult, ChatStreamProgress, ToolCallResult } from
 import { ChatSession, isContextCapacityError, type ChatStreamControl, type SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
-import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
+import { handleCreateMessage, type ServerThinking } from '../../packages/server/src/endpoints/messages.js';
+import { AGENT_HOST_THINKING } from '../../packages/server/src/host/agent-thinking.js';
 import { ModelWorkCoordinator } from '../../packages/server/src/model-work-coordinator.js';
 import type { TurnProgressSnapshot } from '../../packages/server/src/native-progress.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';
@@ -7484,7 +7485,7 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
         undefined,
         undefined,
         undefined,
-        4096,
+        { tokenBudget: 4096 },
       );
       return (model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]?.thinkingTokenBudget;
     };
@@ -7492,6 +7493,68 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
     expect(await budgetFor({ thinking: { type: 'adaptive' } })).toBe(4096);
     expect(await budgetFor({ thinking: { type: 'enabled', budget_tokens: 2048 } })).toBe(2048);
     expect(await budgetFor({ extra_body: { reasoning_effort: 'none' } })).toBeUndefined();
+  });
+
+  // The agent hosts' three server options. Mutation: apply them for effort `none` → red.
+  it('sends the server budget, cycle guard and end text to native, never for effort none', async () => {
+    const thinkingOf = async (
+      extra: Record<string, unknown>,
+      server: ServerThinking | undefined,
+    ): Promise<Record<string, unknown>> => {
+      const registry = new ModelRegistry();
+      const model = createMockModel();
+      registry.register('test-model', model);
+      const { res } = createMockRes();
+      await handleCreateMessage(
+        res,
+        { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: 16, ...extra },
+        registry,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        server,
+      );
+      const config = ((model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] ?? {}) as Record<
+        string,
+        unknown
+      >;
+      return {
+        budget: config.thinkingTokenBudget,
+        guard: config.thinkingCycleGuard,
+        endText: config.thinkingEndText,
+        from: (config.turnMeta as { thinkingBudgetFrom?: string } | undefined)?.thinkingBudgetFrom,
+      };
+    };
+    const host = {
+      tokenBudget: AGENT_HOST_THINKING.tokenBudget,
+      cycleGuard: AGENT_HOST_THINKING.cycleGuard,
+      endText: AGENT_HOST_THINKING.endText,
+    };
+    expect(await thinkingOf({}, host)).toEqual({
+      budget: 12_000,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+      from: 'server',
+    });
+    expect(await thinkingOf({ thinking: { type: 'enabled', budget_tokens: 2048 } }, host)).toEqual({
+      budget: 2048,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+      from: 'request',
+    });
+    expect(await thinkingOf({ extra_body: { reasoning_effort: 'none' } }, host)).toEqual({
+      budget: undefined,
+      guard: undefined,
+      endText: undefined,
+      from: undefined,
+    });
+    expect(await thinkingOf({}, undefined)).toEqual({
+      budget: undefined,
+      guard: undefined,
+      endText: undefined,
+      from: undefined,
+    });
   });
 
   // Splash `StreamingToolCallProjector._begin_call`: an opening that names no function

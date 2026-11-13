@@ -40,19 +40,20 @@ import {
 import type { ProviderSource } from '../providers/source.js';
 import type { ProviderId } from '../providers/types.js';
 import { needleList } from '../redact.js';
-import type {
-  AgentModeState,
-  AutoAsk,
-  PermissionMark,
-  PermissionMode,
-  ChatFailure,
-  ChatFailureCode,
-  ChatMode,
-  ConversationNotice,
-  Interaction,
-  PermissionInteraction,
-  TurnOutcome,
-  TurnState,
+import {
+  CONTINUE_PROMPT,
+  type AgentModeState,
+  type AutoAsk,
+  type PermissionMark,
+  type PermissionMode,
+  type ChatFailure,
+  type ChatFailureCode,
+  type ChatMode,
+  type ConversationNotice,
+  type Interaction,
+  type PermissionInteraction,
+  type TurnOutcome,
+  type TurnState,
 } from '../types.js';
 import { parseWebResultText, type WebResult } from '../web/result-text.js';
 import { editLanding, type WorkFolderCheck } from '../work-folder.js';
@@ -239,7 +240,22 @@ export interface TurnResult {
   failure?: ChatFailure;
   /** The turn ended before `session/prompt` was written to the agent. */
   unsent?: true;
+  /** Work, an `output-limit` end: length stops in a row with no tool call between. */
+  lengthStops?: number;
+  /** Automatic continues sent in this turn; set when one was sent. */
+  continues?: number;
+  /** Work, an `output-limit` end: why no automatic continue was sent. */
+  noContinue?: NoContinue;
+  /** What the host recorded after the model's length reply. */
+  late?: TurnEndCause;
 }
+
+/**
+ * Why a Work turn that ended `output-limit` was not continued: a second length stop with no tool call between, the
+ * user's Stop, the engine's endpoint file gone, the agent gone, or the host stale (the engine's address or token
+ * changed).
+ */
+export type NoContinue = 'second-length' | 'stop' | 'endpoint' | 'agent-exit' | 'host-stale';
 
 export interface AgentHostListener {
   onState?(state: AgentModeState): void;
@@ -250,6 +266,8 @@ export interface AgentHostListener {
   onModel?(sessionId: string, modelId: string): void;
   onTurn?(sessionId: string, turn: TurnState | null): void;
   onTurnEnd?(sessionId: string, result: TurnResult): void;
+  /** Work: the automatic `continue` after a length stop was written to the agent; `n` counts them in the turn. */
+  onAutoContinue?(sessionId: string, n: number): void;
   onInteraction?(sessionId: string, interaction: Interaction): void;
   onInteractionClosed?(sessionId: string, id: string, reason: 'answered' | 'cancelled' | 'expired'): void;
   /** These sessions are no longer loaded in a running process. */
@@ -349,6 +367,18 @@ interface TurnRecord {
   graceTimer: ReturnType<typeof setTimeout> | null;
   /** Ends the turn before the prompt was sent (cancel during start). */
   abort: ((result: TurnResult) => void) | null;
+  /** Work: a length reply came and no prompt is in flight; the host decides whether to continue. */
+  between: boolean;
+  /** Wakes the wait for the agent's end line between two prompts. */
+  gap: (() => void) | null;
+  /** A live tool call of the session since the last prompt was written. */
+  toolSeen: boolean;
+  /** The agent's `turn_completed` of the last prompt arrived. */
+  endSeen: boolean;
+  /** Length stops in a row with no tool call between. */
+  lengthStops: number;
+  /** Automatic continues sent. */
+  continues: number;
 }
 
 interface HostSession {
@@ -517,7 +547,7 @@ export class AgentHost {
 
   turnState(sessionId: string): TurnState | null {
     const t = this.sessions.get(sessionId)?.turn;
-    return t == null ? null : { turnId: t.turnId, phase: t.phase, startedAt: t.startedAt, wait: t.wait };
+    return t == null ? null : turnStateOf(t);
   }
 
   openInteractions(sessionId: string): Interaction[] {
@@ -550,6 +580,7 @@ export class AgentHost {
   markStale(): void {
     if (this.running === null && this.starting === null) return;
     this.stale = true;
+    for (const s of this.sessions.values()) s.turn?.gap?.();
     this.emitState();
     this.restartIfIdle();
   }
@@ -640,6 +671,12 @@ export class AgentHost {
       capTimer: null,
       graceTimer: null,
       abort: null,
+      between: false,
+      gap: null,
+      toolSeen: false,
+      endSeen: false,
+      lengthStops: 0,
+      continues: 0,
     };
     session.turn = turn;
     this.clearIdle();
@@ -1324,10 +1361,45 @@ export class AgentHost {
     let exited = false;
     const onExit: ExitWaiter = () => {
       exited = true;
+      turn.gap?.();
     };
     this.exitWaiters.add(onExit);
     try {
-      const result = await running.process.client.request('session/prompt', promptParams(session.id, text), null);
+      let prompt = text;
+      for (;;) {
+        turn.between = false;
+        turn.toolSeen = false;
+        turn.endSeen = false;
+        const sent = running.process.client.request('session/prompt', promptParams(session.id, prompt), null);
+        if (turn.continues > 0) this.opts.listener?.onAutoContinue?.(session.id, turn.continues);
+        const end = await this.promptEnd(sent, turn, running, () => exited);
+        if (end.outcome !== 'output-limit' || this.mode !== 'work') return this.withContinues(turn, end);
+        turn.between = true;
+        const recordedAtReply = turn.recorded;
+        turn.lengthStops = turn.toolSeen ? 1 : turn.lengthStops + 1;
+        if (turn.lengthStops >= 2) return this.lengthEnd(turn, end, 'second-length', recordedAtReply);
+        const block = await this.continueGate(turn, running, () => exited);
+        if (block !== null) return this.lengthEnd(turn, end, block, recordedAtReply);
+        turn.continues += 1;
+        this.emitTurn(session);
+        prompt = CONTINUE_PROMPT;
+      }
+    } finally {
+      turn.between = false;
+      turn.gap = null;
+      this.exitWaiters.delete(onExit);
+    }
+  }
+
+  /** The end of one `session/prompt`: the reply, or the error it got. */
+  private async promptEnd(
+    sent: Promise<unknown>,
+    turn: TurnRecord,
+    running: Running,
+    exited: () => boolean,
+  ): Promise<TurnResult> {
+    try {
+      const result = await sent;
       return {
         turnId: turn.turnId,
         outcome: turnOutcome({ mode: this.mode, result: readPromptResult(result), recorded: turn.recorded }),
@@ -1343,13 +1415,59 @@ export class AgentHost {
           }),
         };
       }
-      if (exited || !running.process.running || running.process.brokeProtocol) {
+      if (exited() || !running.process.running || running.process.brokeProtocol) {
         return { turnId: turn.turnId, outcome: 'agent-crashed', failure: chatFailure('agent-crashed') };
       }
       return { turnId: turn.turnId, outcome: 'model-error' };
-    } finally {
-      this.exitWaiters.delete(onExit);
     }
+  }
+
+  private withContinues(turn: TurnRecord, end: TurnResult): TurnResult {
+    return turn.continues > 0 ? { ...end, continues: turn.continues } : end;
+  }
+
+  /** A Work turn that ends on its length reply: the count, and why no continue went out. */
+  private lengthEnd(
+    turn: TurnRecord,
+    end: TurnResult,
+    noContinue: NoContinue,
+    recordedAtReply: TurnEndCause | null,
+  ): TurnResult {
+    return {
+      ...this.withContinues(turn, end),
+      lengthStops: turn.lengthStops,
+      noContinue,
+      ...(recordedAtReply === null && turn.recorded !== null ? { late: turn.recorded } : {}),
+    };
+  }
+
+  /**
+   * Work, after a length reply: null when the automatic continue may go out. It waits for the agent's own end line of
+   * the reply (no timer), then re-reads the endpoint. Woken by that line, the agent's exit, Stop and a stale host.
+   */
+  private async continueGate(turn: TurnRecord, running: Running, exited: () => boolean): Promise<NoContinue | null> {
+    const check = (): NoContinue | null => {
+      if (turn.recorded !== null) return turn.recorded === 'inference-lost' ? 'endpoint' : 'stop';
+      if (exited() || !running.process.running || running.process.brokeProtocol) return 'agent-exit';
+      if (this.stale || this.running !== running) return 'host-stale';
+      return null;
+    };
+    let block = check();
+    if (block !== null) return block;
+    if (!turn.endSeen) {
+      await new Promise<void>((resolve) => {
+        turn.gap = resolve;
+      });
+      turn.gap = null;
+      block = check();
+      if (block !== null) return block;
+    }
+    try {
+      await this.checkEndpoint();
+    } catch {
+      return 'endpoint';
+    }
+    return check();
   }
 
   private finishTurn(session: HostSession, turn: TurnRecord, result: TurnResult): void {
@@ -1369,6 +1487,11 @@ export class AgentHost {
     if (turn === null) return;
     if (turn.recorded === null) turn.recorded = cause;
     this.closeInteractions(session, 'cancelled');
+    // No prompt is in flight: nothing goes to the agent, and the turn ends on its length reply.
+    if (turn.between) {
+      turn.gap?.();
+      return;
+    }
     if (turn.abort !== null) {
       turn.select?.abort();
       turn.abort({ turnId: turn.turnId, outcome: causeOutcome(turn.recorded), unsent: true });
@@ -1478,11 +1601,24 @@ export class AgentHost {
     const line: UpdateLine = { xai: message.xai, update: message.update, meta: message.meta };
     const turnRunning = session.turn !== null && session.turn.phase !== 'starting';
     if (liveFilter(line, { turnRunning, modelId: session.modelId }) === 'drop') return;
+    const turn = session.turn;
+    if (
+      turn !== null &&
+      !line.xai &&
+      line.update.sessionUpdate === 'tool_call' &&
+      typeof line.update.toolCallId === 'string'
+    ) {
+      turn.toolSeen = true;
+    }
     if (line.xai && line.update.sessionUpdate === 'model_changed' && typeof line.update.model_id === 'string') {
       session.modelId = line.update.model_id;
       this.opts.listener?.onModel?.(session.id, session.modelId);
     }
     this.opts.listener?.onUpdate?.(session.id, line);
+    if (turn !== null && line.xai && line.update.sessionUpdate === 'turn_completed') {
+      turn.endSeen = true;
+      turn.gap?.();
+    }
     if (this.mode === 'work') this.checkPrinted(session, line.update);
     if (this.mode === 'chat') {
       const result = readWebToolResult(line.update);
@@ -1991,15 +2127,22 @@ export class AgentHost {
 
   private emitTurn(session: HostSession): void {
     const t = session.turn;
-    this.opts.listener?.onTurn?.(
-      session.id,
-      t === null ? null : { turnId: t.turnId, phase: t.phase, startedAt: t.startedAt, wait: t.wait },
-    );
+    this.opts.listener?.onTurn?.(session.id, t === null ? null : turnStateOf(t));
   }
 
   private emitState(): void {
     this.opts.listener?.onState?.(this.modeState());
   }
+}
+
+function turnStateOf(t: TurnRecord): TurnState {
+  return {
+    turnId: t.turnId,
+    phase: t.phase,
+    startedAt: t.startedAt,
+    wait: t.wait,
+    ...(t.continues > 0 ? { continues: t.continues } : {}),
+  };
 }
 
 /** The request offers `allow-once` or `reject-once`, each with its own kind. */

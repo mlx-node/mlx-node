@@ -6,11 +6,12 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { describe, expect, it } from 'vite-plus/test';
+import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { AgentHostError, launchFromProbe } from '../src/chat/agent/agent-host.js';
-import { CHAT_CONFIG_TOML, CHAT_REQUIREMENTS_TOML } from '../src/chat/agent/profiles.js';
+import { CHAT_CONFIG_TOML, CHAT_REQUIREMENTS_TOML, promptParams } from '../src/chat/agent/profiles.js';
 import { REDACTED } from '../src/chat/redact.js';
+import { CONTINUE_PROMPT } from '../src/chat/types.js';
 import {
   endpointModel,
   fakeHost,
@@ -882,6 +883,274 @@ describe('Work host', () => {
         });
       },
       work,
+    );
+  });
+});
+
+describe('Work host: the length stop', () => {
+  const work = { mode: 'work' as const, providers: noProviders() };
+  const prompts = (fake: FakeHost): Json[] => fake.sent().filter((m) => m.method === 'session/prompt');
+  const steps = (s: Json): Json[] => ((s.prompts as Json[])[1]!.steps as Json[])!;
+  const setLength = (s: Json, length: Json): void => {
+    steps(s)[1] = { lengthError: length };
+  };
+  const thought = (fake: FakeHost): boolean =>
+    fake.events.updates.some((u) => u.line.update.sessionUpdate === 'agent_thought_chunk');
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function start(fake: FakeHost) {
+    const created = await fake.host.createSession({ modelId: MODEL, cwd: fake.project });
+    const started = fake.host.startTurn(created.sessionId, 'fix it', { modelId: MODEL, cwd: fake.project });
+    return { id: created.sessionId, done: started.done };
+  }
+
+  // Mutation: send the continue without waiting for the agent's end line → red (the order).
+  it('continues once after the end line, with the button message, inside one running turn', async () => {
+    await withFake(
+      'work-length',
+      async (fake) => {
+        const { id, done } = await start(fake);
+        expect(await done).toEqual({
+          turnId: expect.any(String),
+          outcome: 'completed',
+          continues: 1,
+        });
+        const sent = prompts(fake);
+        expect(sent).toHaveLength(2);
+        expect(sent[1]!.params).toEqual(promptParams(id, CONTINUE_PROMPT));
+        expect(CONTINUE_PROMPT).toBe('continue');
+        expect(fake.events.continues).toEqual([{ sessionId: id, n: 1 }]);
+        const order = fake.events.timeline.filter((k) => k === 'turn_completed' || k.startsWith('continue'));
+        expect(order).toEqual(['turn_completed', 'continue 1', 'turn_completed']);
+        const states = fake.events.turns.filter((t) => t.sessionId === id).map((t) => t.turn);
+        const from = states.findIndex((t) => t?.phase === 'running');
+        expect(states.slice(from, -1).every((t) => t?.phase === 'running')).toBe(true);
+        expect(states.at(-1)).toBeNull();
+        expect(states.at(-2)).toMatchObject({ phase: 'running', continues: 1 });
+      },
+      { ...work, mutate: (s) => setLength(s, { endAfterMs: 200 }) },
+    );
+  });
+
+  // Mutation: count tool calls in `trackCall` → red (the read call of an ungranted session is missed).
+  it('a second length stop with no tool call ends the turn; a read call between gives one more continue', async () => {
+    await withFake(
+      'work-length',
+      async (fake) => {
+        const { done } = await start(fake);
+        expect(await done).toEqual({
+          turnId: expect.any(String),
+          outcome: 'output-limit',
+          lengthStops: 2,
+          continues: 1,
+          noContinue: 'second-length',
+        });
+        expect(prompts(fake)).toHaveLength(2);
+      },
+      {
+        ...work,
+        mutate: (s) => {
+          (s.prompts as Json[])[0] = { match: 'continue', steps: [{ thought: 'Again.' }, { lengthError: {} }] };
+        },
+      },
+    );
+    await withFake(
+      'work-length',
+      async (fake) => {
+        const { done } = await start(fake);
+        expect(await done).toEqual({ turnId: expect.any(String), outcome: 'completed', continues: 2 });
+        expect(prompts(fake)).toHaveLength(3);
+      },
+      {
+        ...work,
+        mutate: (s) => {
+          const after = (s.prompts as Json[])[0]!;
+          (s.prompts as Json[]).unshift({
+            match: 'continue',
+            once: true,
+            steps: [
+              { tool: { toolName: 'read_file', kind: 'read', title: 'Read b.txt', output: 'y' } },
+              { lengthError: {} },
+            ],
+          });
+          expect(after.match).toBe('continue');
+        },
+      },
+    );
+  });
+
+  // Mutation: remove the `between` branch of `cancelTurn` → red (a `session/cancel` goes out).
+  it('Stop between the two prompts ends output-limit, sends nothing and arms no kill timer', async () => {
+    await withFake(
+      'work-length',
+      async (fake) => {
+        const { id, done } = await start(fake);
+        await until(() => thought(fake));
+        await sleep(150);
+        expect(fake.host.cancel(id)).toBe(true);
+        expect(await done).toEqual({
+          turnId: expect.any(String),
+          outcome: 'output-limit',
+          lengthStops: 1,
+          noContinue: 'stop',
+          late: 'cancelled',
+        });
+        await sleep(150);
+        expect(fake.sent().some((m) => m.method === 'session/cancel')).toBe(false);
+        expect(prompts(fake)).toHaveLength(1);
+        expect(fake.host.modeState().state).toBe('ready');
+        expect(fake.records().filter((r) => r.kind === 'start')).toHaveLength(1);
+      },
+      { ...work, timings: { cancelReplyMs: 50 }, mutate: (s) => setLength(s, { noEnd: true }) },
+    );
+    let blocked: (() => void) | null = null;
+    let block = false;
+    await withFake(
+      'work-length',
+      async (fake) => {
+        const { id, done } = await start(fake);
+        await until(() => thought(fake));
+        block = true;
+        await until(() => blocked !== null);
+        fake.host.cancel(id);
+        blocked!();
+        expect(await done).toMatchObject({ outcome: 'output-limit', noContinue: 'stop', late: 'cancelled' });
+        expect(fake.sent().some((m) => m.method === 'session/cancel')).toBe(false);
+        expect(prompts(fake)).toHaveLength(1);
+      },
+      {
+        ...work,
+        mutate: (s) => setLength(s, { endAfterMs: 200 }),
+        readEndpoint: async (endpoint) => {
+          if (block) await new Promise<void>((resolve) => (blocked = resolve));
+          return endpoint.current;
+        },
+      },
+    );
+  });
+
+  // Mutation: skip `checkEndpoint` before the continue → red (the continue goes to the old address).
+  it('no continue when the agent exits or the endpoint changed in the gap', async () => {
+    await withFake(
+      'work-length',
+      async (fake) => {
+        const { done } = await start(fake);
+        expect(await done).toMatchObject({ outcome: 'output-limit', noContinue: 'agent-exit' });
+        expect(prompts(fake)).toHaveLength(1);
+      },
+      { ...work, mutate: (s) => setLength(s, { noEnd: true, exitAfterMs: 100 }) },
+    );
+    await withFake(
+      'work-length',
+      async (fake) => {
+        const { done } = await start(fake);
+        await until(() => thought(fake));
+        fake.endpoint.current = { ...fake.endpoint.current!, token: 'tok-OTHER-0123456789abcdef' };
+        expect(await done).toMatchObject({ outcome: 'output-limit', noContinue: 'host-stale' });
+        expect(prompts(fake)).toHaveLength(1);
+      },
+      { ...work, mutate: (s) => setLength(s, { endAfterMs: 200 }) },
+    );
+  });
+
+  // Mutation: the gate's wait also ends on a timer → red (the continue goes out after the clock moves).
+  it('no timer ends the wait for the end line', async () => {
+    const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+    const spin = async (ms: number, check: () => boolean = () => false): Promise<void> => {
+      const end = Date.now() + ms;
+      while (!check() && Date.now() < end) await tick();
+    };
+    await withFake(
+      'work-length',
+      async (fake) => {
+        const { id, done } = await start(fake);
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+        try {
+          await spin(3_000, () => thought(fake));
+          expect(thought(fake)).toBe(true);
+          await spin(150);
+          for (let hour = 0; hour < 3; hour += 1) {
+            vi.advanceTimersByTime(3_600_000);
+            await spin(100);
+          }
+          expect(fake.host.isBusy(id)).toBe(true);
+          expect(prompts(fake)).toHaveLength(1);
+        } finally {
+          vi.useRealTimers();
+        }
+        fake.host.cancel(id);
+        expect(await done).toMatchObject({ outcome: 'output-limit', noContinue: 'stop' });
+      },
+      { ...work, mutate: (s) => setLength(s, { noEnd: true }) },
+    );
+  });
+
+  // Mutation: `markStale` does not wake the gate → red (the turn waits for Stop).
+  it('a config change while the end line never comes ends the turn host-stale', async () => {
+    await withFake(
+      'work-length',
+      async (fake) => {
+        const { done } = await start(fake);
+        let result: Json | null = null;
+        void done.then((r) => (result = r as unknown as Json));
+        await until(() => thought(fake));
+        await sleep(150);
+        fake.host.markStale();
+        await until(() => result !== null, 2_000);
+        expect(result).toMatchObject({ outcome: 'output-limit', noContinue: 'host-stale' });
+        expect(prompts(fake)).toHaveLength(1);
+      },
+      { ...work, mutate: (s) => setLength(s, { noEnd: true }) },
+    );
+  });
+
+  // Mutation: keep `toolSeen` across the continue → red (a third prompt goes out).
+  it('a tool call before the first length stop does not count for the continue that calls none', async () => {
+    await withFake(
+      'work-length',
+      async (fake) => {
+        const { done } = await start(fake);
+        expect(await done).toEqual({
+          turnId: expect.any(String),
+          outcome: 'output-limit',
+          lengthStops: 2,
+          continues: 1,
+          noContinue: 'second-length',
+        });
+        expect(prompts(fake)).toHaveLength(2);
+      },
+      {
+        ...work,
+        mutate: (s) => {
+          const list = s.prompts as Json[];
+          const first = list[1]!;
+          first.steps = [
+            { tool: { toolName: 'read_file', kind: 'read', title: 'Read a.txt', output: 'x' } },
+            { lengthError: {} },
+          ];
+          list.unshift({ match: 'continue', once: true, steps: [{ thought: 'Again.' }, { lengthError: {} }] });
+        },
+      },
+    );
+  });
+
+  // Mutation: drop the mode check of the loop → red (Chat sends a second prompt).
+  it('Chat never continues by itself', async () => {
+    await withFake(
+      'max-tokens',
+      async (fake) => {
+        const { result } = await turn(fake, 'long');
+        expect(result).toEqual({ turnId: expect.any(String), outcome: 'output-limit' });
+        await sleep(100);
+        expect(prompts(fake)).toHaveLength(1);
+        expect(fake.events.continues).toEqual([]);
+      },
+      {
+        mutate: (s) => {
+          const list = ((s.prompts as Json[])[0]!.steps as Json[])!;
+          list[1] = { lengthError: {} };
+        },
+      },
     );
   });
 });

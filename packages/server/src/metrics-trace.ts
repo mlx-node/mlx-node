@@ -86,6 +86,10 @@ export type TurnErrorKind = 'finish_error' | 'exception';
 export type TurnFailPhase = 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode';
 export type TurnEndpoint = 'messages' | 'responses' | 'other';
 export type TurnDispatch = 'start' | 'continue' | 'continue_tool';
+/** Where a turn's thinking budget came from: the request, or the server's option. */
+export type TurnBudgetFrom = 'request' | 'server';
+/** How a thought ended (native `reasoningClose`). */
+export type TurnReasoningClose = 'model' | 'budget' | 'cycle' | 'open';
 
 export const TURN_OUTCOMES: readonly TurnOutcome[] = ['ok', 'error', 'cancelled'];
 export const TURN_ERROR_KINDS: readonly TurnErrorKind[] = ['finish_error', 'exception'];
@@ -93,6 +97,8 @@ export const TURN_ERROR_KINDS: readonly TurnErrorKind[] = ['finish_error', 'exce
 export const TURN_FAIL_PHASES: readonly TurnFailPhase[] = ['queued', 'slot', 'prepare', 'prefill', 'decode'];
 export const TURN_ENDPOINTS: readonly TurnEndpoint[] = ['messages', 'responses', 'other'];
 export const TURN_DISPATCHES: readonly TurnDispatch[] = ['start', 'continue', 'continue_tool'];
+export const TURN_BUDGET_FROM: readonly TurnBudgetFrom[] = ['request', 'server'];
+export const TURN_REASONING_CLOSES: readonly TurnReasoningClose[] = ['model', 'budget', 'cycle', 'open'];
 
 /** Most MTP draft positions a record carries. */
 export const MTP_ACCEPT_BY_POS_MAX = 16;
@@ -150,6 +156,21 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
   cachedTokens?: number;
   outputTokens?: number;
   reasoningTokens?: number;
+  /** Native: how the thought ended; absent when the turn did not start in thinking or the addon does not report it. */
+  reasoningClose?: TurnReasoningClose;
+  /** Native: thinking tokens when a cut began. */
+  reasoningCutAt?: number;
+  /** Native: period in tokens of the cycle the check saw. */
+  reasoningCyclePeriod?: number;
+  /** Native: close tokens after the thought ended. */
+  reasoningStrayCloses?: number;
+  /** The thinking budget sent to native, after the window scaled it. */
+  thinkingBudget?: number;
+  thinkingBudgetFrom?: TurnBudgetFrom;
+  /** `true` when the cycle guard was sent; else absent. */
+  thinkingGuard?: true;
+  /** `maxNewTokens` sent to native. */
+  outputCap?: number;
   /** Non-ok streams: prefill tokens materialized before the turn ended. */
   prefillDoneTokens?: number;
   /** Usable context of the loaded model, in tokens. */
@@ -500,6 +521,10 @@ export class MetricsTrace {
         'cachedTokens',
         'outputTokens',
         'reasoningTokens',
+        'reasoningCutAt',
+        'reasoningStrayCloses',
+        'thinkingBudget',
+        'outputCap',
         'prefillDoneTokens',
         'ctxWindow',
         'mtpCycles',
@@ -508,6 +533,13 @@ export class MetricsTrace {
         const value = nonNegInt(rec[key]);
         if (value !== undefined) out[key] = value;
       }
+      const reasoningClose = enumOf(rec.reasoningClose, TURN_REASONING_CLOSES);
+      if (reasoningClose !== undefined) out.reasoningClose = reasoningClose;
+      const cyclePeriod = nonNegInt(rec.reasoningCyclePeriod);
+      if (cyclePeriod !== undefined && cyclePeriod > 0) out.reasoningCyclePeriod = cyclePeriod;
+      const budgetFrom = enumOf(rec.thinkingBudgetFrom, TURN_BUDGET_FROM);
+      if (budgetFrom !== undefined) out.thinkingBudgetFrom = budgetFrom;
+      if (rec.thinkingGuard === true) out.thinkingGuard = true;
       const prefillMs = positive(rec.prefillMs);
       const prefillTokens = nonNegInt(rec.prefillTokens);
       if (outcome === 'ok' && prefillMs !== undefined && prefillTokens !== undefined && prefillTokens > 0) {

@@ -18,6 +18,7 @@ import {
   type ChatThreadProps,
 } from '../ui/src/components/chat-thread.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
+import type { TranscriptEntry } from '../ui/src/lib/types.js';
 import {
   CITED_ANSWER,
   FETCH_USER_URL,
@@ -32,6 +33,9 @@ import {
   answer,
   directFetch,
   end,
+  metric,
+  T0,
+  thinking,
   liveOutcomeSample,
   longThread,
   outcomeSample,
@@ -404,6 +408,57 @@ describe('ChatThread: web call rows', () => {
     expect(text).toContain('No prompt typed');
     expect(text).toContain('hologram');
     expect(text).toContain('Fixed.');
+  });
+});
+
+describe('ChatThread: the automatic continue and the thought time', () => {
+  const lengthEnd: TranscriptEntry = {
+    kind: 'turn-end',
+    ts: T0 + 2_000,
+    stopReason: 'error',
+    error: 'response truncated by max_tokens',
+    lengthLimit: true,
+  };
+  const continued: TranscriptEntry = {
+    kind: 'user',
+    ts: T0 + 3_000,
+    text: CHAT.continuePrompt,
+    promptIndex: 1,
+    continued: true,
+  };
+
+  // Mutation: draw the continued entry as a bubble → red.
+  it('a continued entry draws a divider, not a bubble; a stored thought shows no time', () => {
+    const sample: ThreadSample = {
+      mode: 'work',
+      entries: [
+        user('fix it'),
+        thinking('Let me look.'),
+        lengthEnd,
+        continued,
+        answer('Done.', T0 + 4_000),
+        end('end_turn', T0 + 5_000),
+      ],
+      turns: [metric(), metric()],
+      turn: null,
+      lastEnd: null,
+    };
+    const container = mount(threadOf(sample));
+    const text = container.textContent ?? '';
+    expect(text).toContain(CHAT.continued);
+    expect(container.querySelectorAll('[data-role="user"]')).toHaveLength(1);
+    expect(text).toContain(CHAT.outcomes['output-limit']);
+    expect(text).not.toContain('response truncated');
+    expect(text).toContain(CHAT.thought);
+    expect(text).not.toContain(`${CHAT.thought} for`);
+  });
+
+  it('a thought timed live shows its time', () => {
+    const timed: TranscriptEntry = { kind: 'thinking', ts: T0 + 100, endTs: T0 + 5_100, text: 'Hm.', timed: true };
+    const container = mount(
+      threadOf({ ...outcomeSample('end_turn'), entries: [user('hi'), timed, answer('ok'), end()] }),
+    );
+    expect(container.textContent).toContain(`${CHAT.thought} for 5`);
   });
 });
 

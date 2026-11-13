@@ -801,6 +801,87 @@ describe('TurnTraceModel', () => {
     });
   });
 
+  // Mutation: drop the outcome copy from `finishTurn` → red.
+  it('records the thinking config and the native thought outcome, plain and streamed, stop and length', async () => {
+    const outcome = {
+      reasoningClose: 'cycle',
+      reasoningCutAt: 764,
+      reasoningCyclePeriod: 300,
+      reasoningStrayCloses: 1,
+    };
+    const config = (): TracedChatConfig =>
+      ({
+        maxNewTokens: 28_384,
+        thinkingTokenBudget: 12_000,
+        thinkingCycleGuard: true,
+        thinkingEndText: 'the end text never reaches the record',
+        turnMeta: { endpoint: 'messages', thinkingBudgetFrom: 'server' },
+      }) as TracedChatConfig;
+    const want = {
+      ...outcome,
+      thinkingBudget: 12_000,
+      thinkingBudgetFrom: 'server',
+      thinkingGuard: true,
+      outputCap: 28_384,
+    };
+    for (const finishReason of ['stop', 'length']) {
+      const plain = new TurnTraceModel(
+        makeInner({ chatSessionStart: vi.fn(async () => makeResult({ finishReason, ...outcome } as never)) }),
+        deps(),
+      );
+      await plain.chatSessionStart([], config());
+      const streamed = new TurnTraceModel(
+        makeInner({
+          chatStreamSessionStart: vi.fn(async function* () {
+            yield makeFinalEvent({ finishReason, ...outcome });
+          }),
+        }),
+        deps(),
+      );
+      for await (const _event of streamed.chatStreamSessionStart([], config())) {
+        // drain
+      }
+    }
+    const lines = readTraceLines(dir);
+    expect(lines).toHaveLength(4);
+    for (const line of lines) expect(line).toMatchObject(want);
+    expect(lines.map((line) => line.finishReason)).toEqual(['stop', 'stop', 'length', 'length']);
+    expect(JSON.stringify(lines)).not.toContain('the end text');
+  });
+
+  it('drops an outcome value outside its list, and writes none of the fields an older addon does not send', async () => {
+    const odd = new TurnTraceModel(
+      makeInner({
+        chatSessionStart: vi.fn(async () =>
+          makeResult({
+            reasoningClose: 'gave-up',
+            reasoningCutAt: -1,
+            reasoningCyclePeriod: 0,
+            reasoningStrayCloses: 1.5,
+          } as never),
+        ),
+      }),
+      deps(),
+    );
+    await odd.chatSessionStart([], { turnMeta: { endpoint: 'messages', thinkingBudgetFrom: 'elsewhere' } } as never);
+    const old = new TurnTraceModel(makeInner(), deps());
+    await old.chatSessionStart([], { maxNewTokens: 64 });
+    const [first, second] = readTraceLines(dir);
+    for (const key of [
+      'reasoningClose',
+      'reasoningCutAt',
+      'reasoningCyclePeriod',
+      'reasoningStrayCloses',
+      'thinkingBudget',
+      'thinkingBudgetFrom',
+      'thinkingGuard',
+    ]) {
+      expect([key, key in first!]).toEqual([key, false]);
+      expect([key, key in second!]).toEqual([key, false]);
+    }
+    expect(second!.outputCap).toBe(64);
+  });
+
   it('records a turn with no turnMeta as endpoint other', async () => {
     const model = new TurnTraceModel(makeInner(), deps());
     await model.chatSessionStart([]);

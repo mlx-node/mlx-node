@@ -279,7 +279,7 @@ describe('seed', () => {
     expect(ops).toEqual([
       { op: 'push', entry: { kind: 'user', ts: 9, text: 'new', promptIndex: null } },
       { op: 'push', entry: { kind: 'assistant', ts: 9, text: 'a', endTs: 9 } },
-      { op: 'text', index: 3, append: 'b' },
+      { op: 'text', index: 3, append: 'b', endTs: 9 },
     ]);
     expect(r.snapshot().entries.map((e) => e.kind)).toEqual(['user', 'assistant', 'user', 'assistant']);
   });

@@ -215,6 +215,10 @@ export interface InferenceHostOptions {
   decodeShare?: number;
   /** See `ServerConfig.thinkingTokenBudget`. */
   thinkingTokenBudget?: number;
+  /** See `ServerConfig.thinkingCycleGuard`. */
+  thinkingCycleGuard?: boolean;
+  /** See `ServerConfig.thinkingEndText`. */
+  thinkingEndText?: string;
   /** See `ServerConfig.turnJournal`. */
   turnJournal?: TurnJournalOptions;
   /**
@@ -456,6 +460,8 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     ...(opts.disableStore !== undefined ? { disableStore: opts.disableStore } : {}),
     ...(opts.maxQueueDepthPerModel !== undefined ? { maxQueueDepthPerModel: opts.maxQueueDepthPerModel } : {}),
     ...(opts.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: opts.thinkingTokenBudget } : {}),
+    ...(opts.thinkingCycleGuard !== undefined ? { thinkingCycleGuard: opts.thinkingCycleGuard } : {}),
+    ...(opts.thinkingEndText !== undefined ? { thinkingEndText: opts.thinkingEndText } : {}),
     ...(opts.turnJournal !== undefined ? { turnJournal: opts.turnJournal } : {}),
   };
   const server = await createServer(serverConfig);
@@ -811,6 +817,7 @@ export { discoverModels, type DiscoveredModel } from './discover.js';
 export { DECODE_SHARE_ERROR, DEFAULT_DECODE_SHARE, parseDecodeShare } from './decode-share.js';
 export { DEFAULT_IDLE_RELEASE_SECONDS, IDLE_RELEASE_ERROR, idleReleaseText, parseIdleRelease } from './idle-release.js';
 export { MAX_CONTEXT_ERROR, MAX_YARN_CONTEXT_TOKENS, parseMaxContext } from './max-context.js';
+export { AGENT_HOST_THINKING, parseThinkingEndText, THINKING_END_TEXT_MAX } from './agent-thinking.js';
 export { MAX_MEMORY_ERROR, parseMaxMemory } from './max-memory.js';
 export {
   COLD_CACHE_DRAIN_TIMEOUT_MS,

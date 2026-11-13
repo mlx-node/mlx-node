@@ -96,6 +96,10 @@ export interface RouteExtras {
   rerank?: RerankService;
   /** Thinking budget of a Messages thinking request that sets none. */
   thinkingTokenBudget?: number;
+  /** The cycle guard of a Messages request. */
+  thinkingCycleGuard?: boolean;
+  /** The end text of a Messages request's cut thought. */
+  thinkingEndText?: string;
   /** The desktop supervisor's turn journal and quarantine. */
   turnJournal?: TurnJournal;
   /** `POST /v1/memory/release`; omitted ⇒ the route is not served. */
@@ -300,7 +304,11 @@ export async function routeRequest(
       idleSweeper,
       resolveModel,
       modelWorkCoordinator,
-      extras?.thinkingTokenBudget,
+      {
+        tokenBudget: extras?.thinkingTokenBudget,
+        cycleGuard: extras?.thinkingCycleGuard,
+        endText: extras?.thinkingEndText,
+      },
       extras?.turnJournal,
     );
     return;

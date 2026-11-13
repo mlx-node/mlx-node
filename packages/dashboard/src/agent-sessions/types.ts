@@ -56,7 +56,15 @@ export interface SessionDetail extends SessionRow {
 export type WakeCause = 'workflow' | 'subagent' | 'task' | 'notifications' | 'goal' | 'unknown';
 
 export type TranscriptEntry =
-  | { kind: 'user'; ts: number; text: string; promptIndex: number | null; interjection?: boolean }
+  | {
+      kind: 'user';
+      ts: number;
+      text: string;
+      promptIndex: number | null;
+      interjection?: boolean;
+      /** The `continue` prompt right after a length end: drawn as a divider, not a message. */
+      continued?: true;
+    }
   /** A hidden prompt the agent wrote to itself when a background event woke it. Never a message of the user. */
   | {
       kind: 'wake';
@@ -71,7 +79,14 @@ export type TranscriptEntry =
       truncated?: true;
     }
   | { kind: 'assistant'; ts: number; text: string; endTs?: number }
-  | { kind: 'thinking'; ts: number; text: string; endTs?: number }
+  | {
+      kind: 'thinking';
+      ts: number;
+      text: string;
+      endTs?: number;
+      /** Made from live lines: `ts` and `endTs` are its first and last chunk. A thought read from disk has no time. */
+      timed?: true;
+    }
   | {
       kind: 'tool';
       ts: number;
@@ -108,7 +123,15 @@ export type TranscriptEntry =
       noSpawn?: true;
     }
   | { kind: 'model'; ts: number; modelId: string }
-  | { kind: 'turn-end'; ts: number; stopReason: string; elapsedMs?: number; error?: string };
+  | {
+      kind: 'turn-end';
+      ts: number;
+      stopReason: string;
+      elapsedMs?: number;
+      error?: string;
+      /** The turn ended on the model's length limit (the agent stores it as an error). */
+      lengthLimit?: true;
+    };
 
 export interface TurnMetric {
   promptId: string;

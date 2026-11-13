@@ -789,3 +789,95 @@ describe('parseUpdates: wake prompts', () => {
     expect(parsed.transcript[0]).toMatchObject({ kind: 'user', text: 'typed' });
   });
 });
+
+describe('the length stop and the automatic continue', () => {
+  const thoughtLine = (text: string, n: number) =>
+    acp({ sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } }, n);
+  const lengthEnd = (n: number) =>
+    xai(
+      {
+        sessionUpdate: 'turn_completed',
+        prompt_id: 'p1',
+        stop_reason: 'error',
+        agent_result: 'response truncated by max_tokens',
+        error_kind: 'max_tokens_truncation',
+      },
+      n,
+    );
+  const normalEnd = (n: number) =>
+    xai({ sessionUpdate: 'turn_completed', prompt_id: 'p2', stop_reason: 'end_turn' }, n);
+  const lines = [
+    user('fix it', 0),
+    thoughtLine('Let me ', 2),
+    thoughtLine('think.', 3),
+    lengthEnd(4),
+    user('continue', 1),
+    thoughtLine('Again.', 6),
+    agent('Done.'),
+    normalEnd(8),
+  ];
+
+  /** The lines as the app sees them live: its own prompts pushed, every other line applied. */
+  function live(input: string[]): { entries: TranscriptEntry[]; ops: unknown[] } {
+    const reducer = new TranscriptReducer();
+    const ops: unknown[] = [];
+    for (const text of input) {
+      const params = (
+        JSON.parse(text) as {
+          method: string;
+          params: { update: Record<string, unknown>; _meta: Record<string, unknown> };
+        }
+      ).params;
+      const content = params.update.content as { text?: string } | undefined;
+      if (params.update.sessionUpdate === 'user_message_chunk') {
+        ops.push(...reducer.userPrompt(content?.text ?? '', params._meta.agentTimestampMs as number));
+      } else {
+        const isXai = (JSON.parse(text) as { method: string }).method === '_x.ai/session/update';
+        ops.push(...reducer.apply({ xai: isXai, update: params.update, meta: params._meta }));
+      }
+    }
+    return { entries: reducer.snapshot().entries, ops };
+  }
+
+  /** What may differ live and from disk: the thought's time, and the prompt index the agent stores. */
+  function comparable(entries: readonly TranscriptEntry[]): unknown[] {
+    return entries.map((entry) => {
+      if (entry.kind === 'thinking') return { kind: entry.kind, text: entry.text };
+      if (entry.kind === 'user') return { ...entry, promptIndex: null };
+      return entry;
+    });
+  }
+
+  // Mutation: mark `continued` by the text alone → red (a continue after a normal end).
+  it('live and from disk give the same entries, with continued and lengthLimit', () => {
+    const disk = parseUpdates(`${lines.join('\n')}\n`).transcript;
+    const hot = live(lines).entries;
+    expect(comparable(hot)).toEqual(comparable(disk));
+    const users = disk.filter((e) => e.kind === 'user');
+    expect(users.map((e) => e.kind === 'user' && e.continued === true)).toEqual([false, true]);
+    const ends = disk.filter((e) => e.kind === 'turn-end');
+    expect(ends.map((e) => e.kind === 'turn-end' && e.lengthLimit === true)).toEqual([true, false]);
+
+    const after = parseUpdates(`${[user('hi', 0), agent('ok'), normalEnd(3), user('continue', 1)].join('\n')}\n`);
+    const last = after.transcript.at(-1)!;
+    expect(last).toMatchObject({ kind: 'user', text: 'continue' });
+    expect(last).not.toHaveProperty('continued');
+  });
+
+  // Mutation: stamp `timed` on a thought read from disk → red.
+  it('only a thought made from live lines is timed; the text op carries the end stamp', () => {
+    const disk = parseUpdates(`${lines.join('\n')}\n`).transcript.filter((e) => e.kind === 'thinking');
+    expect(disk.every((e) => !('timed' in e))).toBe(true);
+    const { entries, ops } = live(lines);
+    const thoughts = entries.filter((e) => e.kind === 'thinking');
+    expect(thoughts.map((e) => e.kind === 'thinking' && e.timed === true)).toEqual([true, true]);
+    expect(ops).toContainEqual({ op: 'text', index: 1, append: 'think.', endTs: 1791643279003 });
+
+    const split = parseUpdates(
+      `${[user('go', 0), thoughtLine('a', 2), acp({ sessionUpdate: 'available_commands_update', availableCommands: [] }, 3), thoughtLine('b', 4)].join('\n')}\n`,
+    ).transcript.filter((e) => e.kind === 'thinking');
+    expect(split).toHaveLength(1);
+    expect(split[0]).toMatchObject({ kind: 'thinking', text: 'ab' });
+    expect(split[0]).not.toHaveProperty('timed');
+  });
+});

@@ -32,7 +32,7 @@ export function metric(partial: Partial<TurnMetric> = {}): TurnMetric {
   };
 }
 
-const T0 = 1_794_411_000_000;
+export const T0 = 1_794_411_000_000;
 
 export function user(text: string, ts = T0): TranscriptEntry {
   return { kind: 'user', ts, text, promptIndex: null };

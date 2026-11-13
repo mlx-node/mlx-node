@@ -200,7 +200,9 @@ describe('Transcript', () => {
       (node.textContent ?? '').includes('Thinking'),
     );
     expect(thinking).toBeUndefined();
-    expect(container.textContent).toContain('Thinking for 80 ms');
+    // Read from disk: the agent stores a thought as one record with its last stamp, so it has no time.
+    expect(container.textContent).toContain('Thinking');
+    expect(container.textContent).not.toContain('Thinking for');
     expect(container.querySelector('[data-status="running"][data-live]')).not.toBeNull();
     expect(container.querySelector('article[data-role="assistant"][data-live]')?.textContent).toContain('Writing');
     expect(container.textContent).toContain('Using 2 tools');

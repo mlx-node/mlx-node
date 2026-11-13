@@ -7,7 +7,7 @@
  * raw lines first, exactly like grok's `filter_rewind_lines`.
  */
 
-import type { TranscriptOp } from '../chat/types.js';
+import { CONTINUE_PROMPT, type TranscriptOp } from '../chat/types.js';
 import { mcpOutputText } from './mcp-output.js';
 import type { TranscriptEntry, TurnMetric, WakeCause } from './types.js';
 
@@ -292,6 +292,11 @@ interface Notification {
   xai: boolean;
   update: Json;
   ts: number;
+}
+
+/** A stored end on the model's length limit. */
+function isLengthEnd(entry: TranscriptEntry | undefined): boolean {
+  return entry?.kind === 'turn-end' && (entry.stopReason === 'max_tokens' || entry.lengthLimit === true);
 }
 
 /** One line → its notification, or `null` for a line grok's reader would skip. */
@@ -612,6 +617,7 @@ export class TranscriptReducer {
               text: body,
               promptIndex,
               ...(interjection ? { interjection: true } : {}),
+              ...(!interjection && body === CONTINUE_PROMPT && isLengthEnd(prev) ? { continued: true as const } : {}),
             };
             this.add(entry);
             if (this.turnPrompt === null && !interjection) this.turnPrompt = { entry, atWake: null };
@@ -630,9 +636,14 @@ export class TranscriptReducer {
             const text = prev as Timed<'assistant' | 'thinking'>;
             text.text += body;
             text.endTs = ts;
-            if (this.ops !== null) this.ops.push({ op: 'text', index: this.transcript.length - 1, append: body });
+            if (this.ops !== null) {
+              this.ops.push({ op: 'text', index: this.transcript.length - 1, append: body, endTs: ts });
+            }
           } else {
             const entry: Timed<'assistant' | 'thinking'> = { kind, ts, text: body, endTs: ts };
+            // Only a thought made from live lines has a real time: the agent stores one merged chunk with its last stamp.
+            if (kind === 'thinking' && this.ops !== null)
+              (entry as Extract<TranscriptEntry, { kind: 'thinking' }>).timed = true;
             this.add(entry);
           }
           break;
@@ -680,13 +691,15 @@ export class TranscriptReducer {
         const elapsedMs = num(update.elapsed_ms);
         const stopReason = str(update.stop_reason) ?? 'unknown';
         const errorText = str(update.agent_result);
-        const isError = stopReason === 'error' || str(update.error_kind) !== null;
+        const errorKind = str(update.error_kind);
+        const isError = stopReason === 'error' || errorKind !== null;
         this.add({
           kind: 'turn-end',
           ts,
           stopReason,
           ...(elapsedMs !== null ? { elapsedMs } : {}),
           ...(isError && errorText !== null && errorText !== '' ? { error: errorText } : {}),
+          ...(errorKind === 'max_tokens_truncation' ? { lengthLimit: true as const } : {}),
         });
         const metric: TurnMetric = {
           promptId: promptId ?? '',

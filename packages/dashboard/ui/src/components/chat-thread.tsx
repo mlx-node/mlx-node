@@ -1,4 +1,4 @@
-import { BellRing, Cpu, FilePen, FileText, Folder, GitBranch, Search, SquareTerminal } from 'lucide-react';
+import { BellRing, Cpu, FilePen, FileText, Folder, GitBranch, RotateCw, Search, SquareTerminal } from 'lucide-react';
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 
@@ -6,12 +6,14 @@ import type { ConversationState } from '../lib/chat-store';
 import { CHAT, fill } from '../lib/chat-strings';
 import {
   answerMarkdown,
+  continuingTurn,
   engineNote,
   fullLimit,
   loadFor,
   loadVariant,
   pendingRow,
   splitTurns,
+  thoughtDuration,
   turnOutcome,
   turnPrompt,
   turnStats,
@@ -616,6 +618,15 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement {
     i += 1;
     switch (entry.kind) {
       case 'user':
+        if (entry.continued === true) {
+          items.push(
+            <RuleLabel key={at}>
+              <RotateCw size={12} strokeWidth={1.75} aria-hidden="true" />
+              {CHAT.continued}
+            </RuleLabel>,
+          );
+          break;
+        }
         items.push(
           <Message
             key={at}
@@ -657,7 +668,7 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement {
             key={at}
             text={entry.text}
             label={live ? CHAT.thinking : CHAT.thought}
-            durationMs={live ? null : durationOf(entry)}
+            durationMs={live ? null : thoughtDuration(entry)}
             live={live}
             startTs={live ? entry.ts : undefined}
             asOfMs={live ? props.asOfMs : undefined}
@@ -804,6 +815,7 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement {
 
 function PendingRow(props: {
   creating: boolean;
+  continuing: boolean;
   turn: TurnState | null;
   host: ChatThreadProps['host'];
   asOfMs: number | undefined;
@@ -829,6 +841,7 @@ function PendingRow(props: {
     inference: props.host?.inference ?? null,
     quiet,
     full: fullLimit(props.host?.answers ?? [], props.model, props.turn?.startedAt ?? null),
+    continuing: props.continuing,
   });
   const loadModel = row.kind === 'load' ? row.modelId : null;
   const variant = loadVariant(loadModel ?? '', loading, props.host?.resident ?? []);
@@ -1089,6 +1102,7 @@ export function ChatThread(props: ChatThreadProps): ReactElement {
       {pending ? (
         <PendingRow
           creating={props.creating === true}
+          continuing={running && continuingTurn(last, props.turn?.continues)}
           turn={props.turn}
           host={props.host}
           asOfMs={props.asOfMs}

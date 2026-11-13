@@ -74,6 +74,20 @@ describe('parseServeArgs', () => {
     }
   });
 
+  it('parses --thinking-cycle-guard and --thinking-end-text; none of them is set by default', () => {
+    const args = parseServeArgs(['--thinking-cycle-guard', '--thinking-end-text=\n\nAnswer now.']);
+    expect(args.thinkingCycleGuard).toBe(true);
+    expect(args.thinkingEndText).toBe('\n\nAnswer now.');
+    const none = parseServeArgs([]);
+    expect('thinkingCycleGuard' in none).toBe(false);
+    expect('thinkingEndText' in none).toBe(false);
+    expect('thinkingTokenBudget' in none).toBe(false);
+    for (const bad of ['', 'x'.repeat(513)]) {
+      expect(() => parseServeArgs([`--thinking-end-text=${bad}`])).toThrow('--thinking-end-text');
+    }
+    expect(parseServeArgs([`--thinking-end-text=${'x'.repeat(512)}`]).thinkingEndText).toHaveLength(512);
+  });
+
   it('validates the global residency policy', () => {
     expect(parseServeArgs(['--model-residency', 'single']).modelResidency).toBe('single');
     expect(parseServeArgs(['--model-residency', 'capability']).modelResidency).toBe('capability');
@@ -459,6 +473,77 @@ describe('mlx serve — end to end', () => {
       },
     });
     expect(exitCodes).toEqual([0]);
+  });
+
+  // Mutation: drop `thinkingCycleGuard` from the `createInferenceHost` call → red.
+  it('hands the three thinking flags to a Messages request, and without them sends none', async () => {
+    const configsFor = async (argv: string[]): Promise<Array<Record<string, unknown>>> => {
+      const modelsDir = await makeModelsDir(['alpha']);
+      vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      const configs: Array<Record<string, unknown>> = [];
+      const result = {
+        text: 'ok',
+        toolCalls: [],
+        thinkingEnabled: true,
+        numTokens: 1,
+        promptTokens: 1,
+        reasoningTokens: 0,
+        finishReason: 'stop',
+        rawText: 'ok',
+        cachedTokens: 0,
+      };
+      const model = {
+        chatSessionStart: async (_messages: unknown, config: Record<string, unknown>) => {
+          configs.push({ ...config });
+          return result;
+        },
+        resetCaches: async () => undefined,
+      };
+      const exitCodes: number[] = [];
+      const sigintBefore = new Set(listenersOf('SIGINT'));
+      await run(['--port', '0', '--models-dir', modelsDir, '--model', 'alpha', ...argv], {
+        hostOverrides: {
+          disableStore: true,
+          sweepOrphanTempRoots: false,
+          pagedModelTypes: [],
+          estimateContextWindow: async () => null,
+          loadModel: async () => model as unknown as LoadableModel,
+        },
+        exit: (code) => exitCodes.push(code),
+        onReady: async (host) => {
+          const res = await fetch(`${host.url}/v1/messages`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ model: 'alpha', messages: [{ role: 'user', content: 'hi' }], max_tokens: 8 }),
+          });
+          await res.text();
+          const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
+          added[0]!('SIGINT');
+          for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        },
+      });
+      expect(exitCodes).toEqual([0]);
+      return configs;
+    };
+    const flagged = await configsFor([
+      '--thinking-token-budget',
+      '12000',
+      '--thinking-cycle-guard',
+      '--thinking-end-text=\n\nAnswer now.',
+    ]);
+    expect(flagged).toHaveLength(1);
+    expect(flagged[0]).toMatchObject({
+      thinkingTokenBudget: 12000,
+      thinkingCycleGuard: true,
+      thinkingEndText: '\n\nAnswer now.',
+    });
+    const plain = await configsFor([]);
+    expect(plain).toHaveLength(1);
+    expect(plain[0]!.thinkingTokenBudget).toBeUndefined();
+    expect(plain[0]!.thinkingCycleGuard).toBeUndefined();
+    expect(plain[0]!.thinkingEndText).toBeUndefined();
   });
 
   // Mutation: drop `idleReleaseSeconds` from the `createInferenceHost` call → red.

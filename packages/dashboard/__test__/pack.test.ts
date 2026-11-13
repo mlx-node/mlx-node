@@ -18,7 +18,7 @@ const assetsDir = join(webDir, 'assets');
  * Size caps in bytes, set about 1 % above the measured build. A cap that fails means the bundle grew: find what
  * grew before raising it.
  */
-const JS_CAP_BYTES = 1_512_192;
+const JS_CAP_BYTES = 1_516_288;
 const CSS_CAP_BYTES = 278_528;
 const FONTS_CAP_BYTES = 230_000;
 

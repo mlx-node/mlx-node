@@ -117,9 +117,25 @@ export function liveOutcome(outcome: TurnOutcome, mode: ChatMode, unsent = false
   }
 }
 
+/** A stored end on the model's length limit: `max_tokens`, or the agent's length error. */
+function isLengthEnd(end: TurnEnd): boolean {
+  return end.stopReason === 'max_tokens' || end.lengthLimit === true;
+}
+
+/** The turn is a `continue` after a length end, and the model called no tool in it. */
+function continuedWithoutTool(turn: ThreadTurn): boolean {
+  const prompt = turn.entries.find(startsTurn);
+  return prompt?.kind === 'user' && prompt.continued === true && !turn.entries.some((entry) => entry.kind === 'tool');
+}
+
+function twice(line: OutcomeLine | null): OutcomeLine | null {
+  return line === null ? null : { ...line, text: CHAT.outcomes['output-limit-twice'] };
+}
+
 /** The outcome of a stored turn, from its `turn-end`. */
 export function storedOutcome(end: TurnEnd): OutcomeLine | null {
   const o = CHAT.outcomes;
+  if (end.lengthLimit === true) return { tone: 'warning', glyph: 'alert', text: o['output-limit'], action: 'continue' };
   const detail = end.error !== undefined && end.error !== '' ? end.error : undefined;
   let line: OutcomeLine | null;
   if (end.stopReason === 'end_turn') line = null;
@@ -148,9 +164,14 @@ export interface TurnEndState {
  */
 export function turnOutcome(turn: ThreadTurn, state: TurnEndState): OutcomeLine | null {
   if (state.last && state.running) return null;
-  if (state.last && state.live !== null && state.live.outcome !== undefined)
-    return liveOutcome(state.live.outcome, state.mode, state.live.unsent === true);
-  if (turn.end !== null) return storedOutcome(turn.end);
+  if (state.last && state.live !== null && state.live.outcome !== undefined) {
+    const line = liveOutcome(state.live.outcome, state.mode, state.live.unsent === true);
+    return state.live.outcome === 'output-limit' && continuedWithoutTool(turn) ? twice(line) : line;
+  }
+  if (turn.end !== null) {
+    const line = storedOutcome(turn.end);
+    return isLengthEnd(turn.end) && continuedWithoutTool(turn) ? twice(line) : line;
+  }
   if (turn.entries.some(startsTurn))
     return {
       tone: 'neutral',
@@ -273,6 +294,8 @@ export interface PendingInput {
   quiet: boolean;
   /** The conversation's model is full: see {@link fullLimit}. */
   full: number | null;
+  /** The app sent the automatic `continue` and nothing of its answer came yet. */
+  continuing?: boolean;
 }
 
 export type PendingRow = { kind: 'label'; text: string; orb: 'hold' | 'think' } | { kind: 'load'; modelId: string };
@@ -292,8 +315,27 @@ export function pendingRow(input: PendingInput): PendingRow {
         ? fill(CHAT.pendingQueuedOne, { model: input.model })
         : fill(CHAT.pendingQueuedMany, { model: input.model, n: String(input.full) }),
     );
+  if (input.phase === 'running' && input.continuing === true) return label(CHAT.pendingContinuing, 'think');
   if (input.quiet) return label(CHAT.pendingWaiting);
   return label(CHAT.pendingThinking, 'think');
+}
+
+/** The time of a thought, from its first to its last live chunk; null for a thought read from disk. */
+export function thoughtDuration(entry: { ts: number; endTs?: number; timed?: true }): number | null {
+  return entry.timed === true && entry.ts > 0 && entry.endTs !== undefined && entry.endTs > entry.ts
+    ? entry.endTs - entry.ts
+    : null;
+}
+
+/** The last turn holds only the automatic `continue` so far. */
+export function continuingTurn(turn: ThreadTurn | undefined, continues: number | undefined): boolean {
+  return (
+    (continues ?? 0) > 0 &&
+    turn !== undefined &&
+    turn.end === null &&
+    turn.entries.some((entry) => entry.kind === 'user' && entry.continued === true) &&
+    turn.entries.every((entry) => entry.kind === 'model' || (entry.kind === 'user' && entry.continued === true))
+  );
 }
 
 /**

@@ -413,6 +413,88 @@
     },
     "prompts": [
       {
+        "match": "lengthtool",
+        "steps": [
+          {
+            "thought": "The parser fails on the nested case. Let me look at the tokenizer first, then the grammar rules, and check where the recursion depth is counted before I change anything.",
+            "chunk": 12,
+            "delayMs": 250
+          },
+          {
+            "lengthError": {
+              "endAfterMs": 400,
+              "outputTokens": 28384
+            }
+          }
+        ],
+        "followUp": {
+          "match": "continue",
+          "steps": [
+            {
+              "thought": "I was cut off. The fix is in the grammar rules; reading them now.",
+              "chunk": 10,
+              "delayMs": 200
+            },
+            {
+              "tool": {
+                "toolName": "read_file",
+                "kind": "read",
+                "title": "Read src/grammar.rs",
+                "output": "fn rule() {}"
+              }
+            },
+            {
+              "text": "The nested case now parses: the recursion depth is counted once per rule.",
+              "chunk": 6,
+              "delayMs": 60
+            },
+            {
+              "turnCompleted": {
+                "inputTokens": 4200,
+                "outputTokens": 180
+              }
+            },
+            {
+              "end": {
+                "stopReason": "end_turn"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "match": "lengthtwice",
+        "steps": [
+          {
+            "thought": "The parser fails on the nested case. Let me look at the tokenizer first, then the grammar rules, and check where the recursion depth is counted before I change anything.",
+            "chunk": 12,
+            "delayMs": 120
+          },
+          {
+            "lengthError": {
+              "endAfterMs": 400,
+              "outputTokens": 28384
+            }
+          }
+        ],
+        "followUp": {
+          "match": "continue",
+          "steps": [
+            {
+              "thought": "Still the same question about the tokenizer and the grammar rules.",
+              "chunk": 10,
+              "delayMs": 120
+            },
+            {
+              "lengthError": {
+                "endAfterMs": 400,
+                "outputTokens": 28384
+              }
+            }
+          ]
+        }
+      },
+      {
         "match": "run",
         "steps": [
           {
