@@ -131,7 +131,7 @@ async fn qwen38_dflash2_perf() {
             max_context_tokens: None,
             decode_share: None,
             cache_disk: None,
-            persistent_cache: None,
+            persist_paged_cache: None,
             cache_dir: None,
         }),
     )
@@ -809,7 +809,7 @@ async fn run_restore_case(case: RestoreCase) {
             max_context_tokens: None,
             decode_share: None,
             cache_disk: None,
-            persistent_cache: None,
+            persist_paged_cache: None,
             cache_dir: None,
         }),
     )

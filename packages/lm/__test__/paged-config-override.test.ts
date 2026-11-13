@@ -1,8 +1,12 @@
 /// <reference types="node" />
 
 /**
- * `PagedConfigOverrideManager`: the paged config overlay the host loads from,
- * pinned without loading any weights.
+ * `PagedConfigOverrideManager` persist-paged-cache injection.
+ *
+ * The agent enables each allowlisted family's cold tier by asking the config overlay to
+ * write `persist_paged_cache: true` into the cloned `config.json` the native
+ * loader reads — never mutating the downloaded checkpoint. These tests pin that
+ * injection (and its absence) without loading any weights.
  */
 
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -21,7 +25,7 @@ afterEach(async () => {
 });
 
 async function makeModelDir(config: Record<string, unknown>): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'mlx-override-src-'));
+  const root = await mkdtemp(join(tmpdir(), 'mlx-persist-src-'));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const dir = join(root, 'model');
   await mkdir(dir, { recursive: true });
@@ -34,9 +38,9 @@ async function readOverrideConfig(overridePath: string): Promise<Record<string, 
   return JSON.parse(await readFile(join(overridePath, 'config.json'), 'utf-8')) as Record<string, unknown>;
 }
 
-describe('PagedConfigOverrideManager overlay', () => {
-  it('muse overlay keeps gguf-source.json and has_dflash', async () => {
-    const sourceConfig = { model_type: 'muse_glimmer', use_block_paged_cache: false };
+describe('PagedConfigOverrideManager persist-paged-cache', () => {
+  it.each([true, false])('muse overlay keeps gguf-source.json and has_dflash with persistence=%s', async (persist) => {
+    const sourceConfig = { model_type: 'muse_glimmer', use_block_paged_cache: false, persist_paged_cache: !persist };
     const prepared = await makeModelDir(sourceConfig);
     const input = join(prepared, 'Muse-Glimmer-Q4_K_M.gguf');
     const ggufSource = {
@@ -51,14 +55,17 @@ describe('PagedConfigOverrideManager overlay', () => {
     const manager = new PagedConfigOverrideManager();
     cleanups.push(() => manager.cleanup());
 
-    const resolved = await manager.resolve(input, 'muse_glimmer');
+    const resolved = await manager.resolve(input, 'muse_glimmer', persist);
     expect(prepare).toHaveBeenCalledWith(input);
     expect(resolved).not.toBe(prepared);
-    expect(await readOverrideConfig(resolved)).toMatchObject({ use_block_paged_cache: true });
+    expect(await readOverrideConfig(resolved)).toMatchObject({
+      use_block_paged_cache: true,
+      persist_paged_cache: persist,
+    });
     expect(JSON.parse(await readFile(join(resolved, 'gguf-source.json'), 'utf8'))).toEqual(ggufSource);
     expect(await readFile(join(resolved, 'draft.safetensors'), 'utf8')).toBe('draft weights');
     expect(await readOverrideConfig(prepared)).toEqual(sourceConfig);
-    expect(await manager.resolve(input, 'muse_glimmer')).toBe(resolved);
+    expect(await manager.resolve(input, 'muse_glimmer', persist)).toBe(resolved);
   });
 
   // Each resolve of a muse_glimmer .gguf acquires one prepared-asset lease
@@ -110,8 +117,117 @@ describe('PagedConfigOverrideManager overlay', () => {
     const prepare = vi.spyOn(core, 'prepareMuseGlimmerGguf');
     const manager = new PagedConfigOverrideManager({ modelTypes: ['qwen3_5'] });
     cleanups.push(() => manager.cleanup());
-    expect(await manager.resolve('/models/muse.gguf', 'muse_glimmer')).toBe('/models/muse.gguf');
+    expect(await manager.resolve('/models/muse.gguf', 'muse_glimmer', true)).toBe('/models/muse.gguf');
     expect(prepare).not.toHaveBeenCalled();
+  });
+
+  it('injects persist_paged_cache into a qwen3 overlay when requested', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const resolved = await manager.resolve(source, 'qwen3', true);
+    expect(resolved).not.toBe(source);
+
+    const config = await readOverrideConfig(resolved);
+    expect(config.persist_paged_cache).toBe(true);
+    expect(config.use_block_paged_cache).toBe(true);
+  });
+
+  it('does not write persist_paged_cache when persistence is not requested', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const resolved = await manager.resolve(source, 'qwen3');
+    const config = await readOverrideConfig(resolved);
+    expect(config.use_block_paged_cache).toBe(true);
+    expect('persist_paged_cache' in config).toBe(false);
+  });
+
+  it('still injects persistence for an already-paged qwen3 checkpoint (fast-path override)', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3', use_block_paged_cache: true });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const resolved = await manager.resolve(source, 'qwen3', true);
+    // Without the persist request this config would pass through unchanged; the
+    // request must force a clone so the flag actually reaches the loader.
+    expect(resolved).not.toBe(source);
+    const config = await readOverrideConfig(resolved);
+    expect(config.persist_paged_cache).toBe(true);
+  });
+
+  // Finding 9: an explicit `false` directive is AUTHORITATIVE — it must override
+  // a checkpoint whose config.json hard-codes persistence on, so
+  // `mlx agent --no-persist-cache` truly wins.
+  it('writes an authoritative persist_paged_cache: false over a persist-enabled checkpoint', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3', persist_paged_cache: true });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const resolved = await manager.resolve(source, 'qwen3', false);
+    // A clone is forced so the false actually reaches the loader.
+    expect(resolved).not.toBe(source);
+    const config = await readOverrideConfig(resolved);
+    expect(config.persist_paged_cache).toBe(false);
+  });
+
+  it('reconciles a stray camelCase persistPagedCache alias to the authoritative value', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3', persistPagedCache: true });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const resolved = await manager.resolve(source, 'qwen3', false);
+    expect(resolved).not.toBe(source);
+    const config = await readOverrideConfig(resolved);
+    // Both spellings agree on the authoritative false the loader will read.
+    expect(config.persist_paged_cache).toBe(false);
+    expect(config.persistPagedCache).toBe(false);
+  });
+
+  // Finding 12: snake-first precedence. A config with persist_paged_cache:false
+  // AND persistPagedCache:true reads as the authoritative snake=false (native
+  // reads snake first), so a requested `true` DISAGREES and must force a clone
+  // that writes snake=true. The old OR misread this as already-true and passed
+  // an already-paged checkpoint straight through, silently dropping persistence.
+  it('forces a clone writing persist_paged_cache:true when snake=false conflicts with camel=true', async () => {
+    const source = await makeModelDir({
+      model_type: 'qwen3',
+      use_block_paged_cache: true, // already paged: only the persist override can force a clone
+      persist_paged_cache: false,
+      persistPagedCache: true,
+    });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const resolved = await manager.resolve(source, 'qwen3', true);
+    expect(resolved).not.toBe(source);
+    const config = await readOverrideConfig(resolved);
+    expect(config.persist_paged_cache).toBe(true);
+    expect(config.persistPagedCache).toBe(true);
+  });
+
+  // Finding D: the memo key folds in the persist tri-state, so resolving the SAME
+  // source with persist=true then persist=false yields two DISTINCT overrides —
+  // the second must not return the first (persist=true) clone cached under the
+  // bare path. Same directive still memoizes.
+  it('resolves distinct overrides for the same source under different persist directives', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const enabled = await manager.resolve(source, 'qwen3', true);
+    const disabled = await manager.resolve(source, 'qwen3', false);
+    expect(disabled).not.toBe(enabled);
+
+    const enabledConfig = await readOverrideConfig(enabled);
+    const disabledConfig = await readOverrideConfig(disabled);
+    expect(enabledConfig.persist_paged_cache).toBe(true);
+    expect(disabledConfig.persist_paged_cache).toBe(false);
+
+    // Re-resolving with the same directive returns the memoized override.
+    expect(await manager.resolve(source, 'qwen3', true)).toBe(enabled);
   });
 
   // A family missing from CHAT_FAMILY_IDS is not "unpaged by policy" —
@@ -129,6 +245,17 @@ describe('PagedConfigOverrideManager overlay', () => {
     const resolved = await manager.resolve(source, 'nemotron_h');
     expect(resolved).not.toBe(source);
     expect((await readOverrideConfig(resolved)).use_block_paged_cache).toBe(true);
+  });
+
+  it('leaves persist untouched for an undirected (undefined) resolve', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const resolved = await manager.resolve(source, 'qwen3');
+    const config = await readOverrideConfig(resolved);
+    expect('persist_paged_cache' in config).toBe(false);
+    expect('persistPagedCache' in config).toBe(false);
   });
 
   // Pins the derived default paged policy set: every chat family, and nothing

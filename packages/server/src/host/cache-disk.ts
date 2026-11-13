@@ -1,5 +1,5 @@
 /**
- * `--max-cache-disk SIZE`, `--[no-]persistent-cache` and `--cache-dir DIRECTORY`:
+ * `--max-cache-disk SIZE` and `--cache-dir DIRECTORY` of the Qwen3.5 SSD state tier:
  * Splash `parse_max_cache_disk`, `parse_cache_dir` and the cache checks of
  * `check_serve_arguments`.
  */
@@ -36,48 +36,40 @@ export function parseCacheDir(value: string): string {
   return resolve(value);
 }
 
-/** The SSD cache flags of one `mlx serve` as given; `persistentCache` unset when neither form was passed. */
+/** The SSD cache flags of one `mlx serve` as given, with the resolved paged KV disk cache switch. */
 export interface CacheDiskArgs {
   cacheDisk: string;
-  persistentCache?: boolean;
+  /** The resolved `persistPagedCache` (`persist-cache.ts`). */
+  persistPagedCache: boolean;
+  /** Whether `--no-persist-cache` (rather than `MLX_PERSIST_PAGED_CACHE`) turned it off. */
+  offByFlag?: boolean;
   cacheDir?: string;
 }
 
-/** The SSD cache options a load receives. */
+/** The SSD cache options a qwen3_5 / qwen3_5_moe load receives. */
 export interface ResolvedCacheDisk {
   cacheDisk: string;
-  persistentCache: boolean;
   cacheDir?: string;
 }
 
 /**
- * The cache kept across restarts unless `--no-persistent-cache` or
- * `--max-cache-disk 0` turns it off. Splash defaults to a temporary cache;
- * mlx-node keeps it because restart persistence is the point of the tier.
+ * Splash `check_serve_arguments` over the shared switch: `--cache-dir` needs a
+ * persistent tier. A persistent switch with `--max-cache-disk 0` is no error:
+ * the switch also serves the other families, and the Qwen3.5 tier stays off.
  */
-export function defaultPersistentCache(cacheDisk: string | undefined): boolean {
-  return cacheDisk !== '0';
-}
-
-/** Splash `check_serve_arguments` over the persistent default. */
 export function resolveCacheDisk(args: CacheDiskArgs): ResolvedCacheDisk {
-  if (args.persistentCache === true && args.cacheDisk === '0') {
-    throw new Error('--persistent-cache needs the SSD cache --max-cache-disk 0 turns off');
+  if (args.cacheDir !== undefined && args.cacheDisk === '0') {
+    throw new Error('--cache-dir needs the SSD cache --max-cache-disk 0 turns off');
   }
-  const persistentCache = args.persistentCache ?? defaultPersistentCache(args.cacheDisk);
-  if (args.cacheDir !== undefined && !persistentCache) {
+  if (args.cacheDir !== undefined && !args.persistPagedCache) {
     throw new Error(
-      args.persistentCache === false
-        ? '--cache-dir needs the persistent cache --no-persistent-cache turns off'
-        : '--cache-dir needs the SSD cache --max-cache-disk 0 turns off',
+      args.offByFlag === true
+        ? '--cache-dir needs the persistent cache --no-persist-cache turns off'
+        : '--cache-dir needs the persistent cache MLX_PERSIST_PAGED_CACHE turns off',
     );
   }
   return {
     cacheDisk: args.cacheDisk,
-    persistentCache,
     ...(args.cacheDir !== undefined ? { cacheDir: args.cacheDir } : {}),
   };
 }
-
-/** Both `--persistent-cache` and `--no-persistent-cache` given. */
-export const PERSISTENT_CACHE_CONFLICT_ERROR = '--persistent-cache and --no-persistent-cache cannot be used together';

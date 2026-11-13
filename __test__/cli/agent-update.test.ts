@@ -1957,43 +1957,53 @@ describe('launchGrokAgent server gating', () => {
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--kv-format');
   });
 
-  // Mutation TSF1: drop `--persistent-cache` from the serve argv → red.
-  it('hands the SSD cache flags to the spawned serve', async () => {
-    await launchGrokAgent({
-      argv: ['-c'],
-      cacheDisk: '0',
-      spawnServe,
-      spawnAgent,
-    });
+  it('hands the SSD state tier flags to the spawned serve', async () => {
+    await launchGrokAgent({ argv: ['-c'], cacheDisk: '0', spawnServe, spawnAgent });
     const offArgv: string[] = spawnServe.mock.calls[0]![0];
     expect(offArgv.slice(-2)).toEqual(['--max-cache-disk', '0']);
-    expect(parseServeArgs(offArgv.slice(2))).toMatchObject({ cacheDisk: '0', persistentCache: false });
+    expect(parseServeArgs(offArgv.slice(2), {}).cacheDisk).toBe('0');
 
     spawnServe.mockClear();
-    await launchGrokAgent({ argv: ['-c'], persistentCache: true, cacheDir: '/c', spawnServe, spawnAgent });
-    const persistentArgv: string[] = spawnServe.mock.calls[0]![0];
-    expect(persistentArgv.slice(-2)).toEqual(['--persistent-cache', '--cache-dir=/c']);
-    expect(parseServeArgs(persistentArgv.slice(2))).toMatchObject({
-      cacheDisk: 'auto',
-      persistentCache: true,
-      cacheDir: '/c',
-    });
+    await launchGrokAgent({ argv: ['-c'], cacheDir: '/c', spawnServe, spawnAgent });
+    const dirArgv: string[] = spawnServe.mock.calls[0]![0];
+    expect(dirArgv.slice(-1)).toEqual(['--cache-dir=/c']);
+    expect(parseServeArgs(dirArgv.slice(2), {})).toMatchObject({ cacheDisk: 'auto', cacheDir: '/c' });
 
     spawnServe.mockClear();
     await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
     const plainArgv: string[] = spawnServe.mock.calls[0]![0];
-    expect(plainArgv).not.toContain('--persistent-cache');
-    expect(plainArgv).not.toContain('--no-persistent-cache');
     expect(plainArgv).not.toContain('--max-cache-disk');
-    expect(parseServeArgs(plainArgv.slice(2)).persistentCache).toBe(true);
+    expect(plainArgv.some((arg) => arg.startsWith('--cache-dir'))).toBe(false);
   });
 
-  // Mutation TSD3: grok-build drops `--no-persistent-cache` → red.
-  it('hands --no-persistent-cache to the spawned serve only when asked', async () => {
-    await launchGrokAgent({ argv: ['-c'], persistentCache: false, spawnServe, spawnAgent });
-    const offArgv: string[] = spawnServe.mock.calls[0]![0];
-    expect(offArgv.slice(-1)).toEqual(['--no-persistent-cache']);
-    expect(parseServeArgs(offArgv.slice(2))).toMatchObject({ cacheDisk: 'auto', persistentCache: false });
+  // Mutation TPG1: grok-build passes no persist flag to the spawned serve → red.
+  it('hands the resolved paged KV disk cache switch to the spawned serve, on by default', async () => {
+    const flagOf = (argv: string[]): boolean | undefined => parseServeArgs(argv.slice(2), {}).persistPagedCache;
+    const previous = process.env.MLX_PERSIST_PAGED_CACHE;
+    try {
+      delete process.env.MLX_PERSIST_PAGED_CACHE;
+      await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+      expect(spawnServe.mock.calls[0]![0]).toContain('--persist-cache');
+      expect(flagOf(spawnServe.mock.calls[0]![0])).toBe(true);
+
+      spawnServe.mockClear();
+      await launchGrokAgent({
+        argv: ['-c'],
+        persistPagedCache: { flag: false, byDefault: true },
+        spawnServe,
+        spawnAgent,
+      });
+      expect(spawnServe.mock.calls[0]![0]).toContain('--no-persist-cache');
+      expect(flagOf(spawnServe.mock.calls[0]![0])).toBe(false);
+
+      spawnServe.mockClear();
+      process.env.MLX_PERSIST_PAGED_CACHE = '0';
+      await launchGrokAgent({ argv: ['-c'], persistPagedCache: { byDefault: true }, spawnServe, spawnAgent });
+      expect(flagOf(spawnServe.mock.calls[0]![0])).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.MLX_PERSIST_PAGED_CACHE;
+      else process.env.MLX_PERSIST_PAGED_CACHE = previous;
+    }
   });
 
   // Mutation: drop the `--max-memory` pair from the serve argv → red.

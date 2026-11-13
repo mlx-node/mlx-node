@@ -72,7 +72,7 @@ import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance 
 import { FLUSH_MS } from '../supervision.js';
 import type { TurnJournalOptions } from '../turn-journal.js';
 import { discoverAudioModels, loadAudioModel, audioCapabilities, type DiscoveredAudioModel } from './audio-models.js';
-import { defaultPersistentCache } from './cache-disk.js';
+import { resolveCacheDisk } from './cache-disk.js';
 import { chatCapability, withCapabilityModels } from './capability-models.js';
 import { discoverModels, type DiscoveredModel } from './discover.js';
 import { applyEnginePolicy, type EnginePolicy } from './env-policy.js';
@@ -80,6 +80,12 @@ import { DEFAULT_IDLE_RELEASE_SECONDS } from './idle-release.js';
 import { attachLogger as defaultAttachLogger, type Logger } from './logger.js';
 import { hostUrl, isLoopbackBindHost, normalizeLoopbackBindHost, pickFreePort } from './net.js';
 import { resolveModelsDir } from './paths.js';
+import {
+  PERSIST_PAGED_CACHE_DEFAULT,
+  PERSIST_PAGED_CACHE_ENV,
+  resolvePersistPagedCache,
+  type PersistPagedCache,
+} from './persist-cache.js';
 import { loadRerankModel, rerankCapability } from './rerank-models.js';
 import { makeSwapController } from './swap.js';
 import { hostTempDirPrefix, sweepOrphanHostTempRoots } from './temp-root.js';
@@ -205,14 +211,18 @@ export interface InferenceHostOptions {
    */
   cacheDisk?: string;
   /**
-   * Keep the SSD cache across restarts (`--[no-]persistent-cache`) for
-   * qwen3_5 / qwen3_5_moe loads. Omitted ⇒ persistent unless `cacheDisk` is
-   * `'0'`; `false` ⇒ a temporary cache that goes at `close()`.
+   * The paged KV disk cache switch for every family: the cold tier of
+   * `COLD_TIER_RESTORE_FAMILIES`, and for qwen3_5 / qwen3_5_moe a persistent
+   * SSD state tier (off ⇒ a temporary one that goes at `close()`). Resolved
+   * `flag` > `MLX_PERSIST_PAGED_CACHE` > `byDefault` and written to
+   * `MLX_PERSIST_PAGED_CACHE` before any load. Omitted ⇒
+   * {@link PERSIST_PAGED_CACHE_DEFAULT} (on).
    */
-  persistentCache?: boolean;
+  persistPagedCache?: PersistPagedCache;
   /**
-   * The persistent cache's root (`--cache-dir`); needs `persistentCache`.
-   * Omitted ⇒ `~/.mlx-node/cache/prefix-cache`.
+   * The persistent SSD state tier's root (`--cache-dir`) for qwen3_5 /
+   * qwen3_5_moe loads; needs the switch on. Omitted ⇒
+   * `~/.mlx-node/cache/prefix-cache`.
    */
   cacheDir?: string;
   /**
@@ -303,6 +313,8 @@ export interface InferenceHost {
   boundModel: string;
   /** Verbose log directory, or `null` when logging is off. */
   logDir: string | null;
+  /** The resolved paged KV disk cache switch every load of this process reads. */
+  persistPagedCache: boolean;
   /** Escape hatch for callers that need the registry, store, or raw `http.Server`. */
   server: ServerInstance;
   /** Current readiness snapshot — the same body `GET /health` returns. */
@@ -371,11 +383,20 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   if (!(idleReleaseSeconds > 0)) {
     throw new Error(`idleReleaseSeconds must be positive or Infinity; received ${String(idleReleaseSeconds)}`);
   }
+  const persistOption = opts.persistPagedCache ?? PERSIST_PAGED_CACHE_DEFAULT;
+  const persistPagedCache = resolvePersistPagedCache(persistOption);
+  resolveCacheDisk({
+    cacheDisk: opts.cacheDisk ?? 'auto',
+    persistPagedCache,
+    offByFlag: persistOption.flag === false,
+    ...(opts.cacheDir !== undefined ? { cacheDir: opts.cacheDir } : {}),
+  });
 
   // FIRST, before anything can touch the engine: the native side latches
   // these via `OnceLock` on first read, so a policy applied after a load has
   // silently done nothing.
   if (opts.enginePolicy !== undefined) applyEnginePolicy(opts.enginePolicy);
+  process.env[PERSIST_PAGED_CACHE_ENV] = persistPagedCache ? '1' : '0';
   // Splash keeps one value for both: the residency lapses and the weights go
   // after the same time without a request.
   (opts.setResidencyKeepAlive ?? setResidencyKeepAliveNative)(idleReleaseSeconds);
@@ -499,7 +520,6 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       ...(familyDataFor(entry.modelType)?.acceptsCacheDisk === true
         ? {
             ...(opts.cacheDisk !== undefined ? { cacheDisk: opts.cacheDisk } : {}),
-            persistentCache: opts.persistentCache ?? defaultPersistentCache(opts.cacheDisk),
             ...(opts.cacheDir !== undefined ? { cacheDir: opts.cacheDir } : {}),
           }
         : {}),
@@ -654,6 +674,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     rerankModels,
     boundModel: boundEntry.name,
     logDir: logger?.logDir ?? null,
+    persistPagedCache,
     server,
     health: () => server.health(),
 
@@ -831,15 +852,22 @@ export { MAX_CONTEXT_ERROR, MAX_YARN_CONTEXT_TOKENS, parseMaxContext } from './m
 export { MAX_MEMORY_ERROR, parseMaxMemory } from './max-memory.js';
 export {
   CACHE_DIR_ERROR,
-  defaultPersistentCache,
   MAX_CACHE_DISK_ERROR,
   parseCacheDir,
   parseMaxCacheDisk,
-  PERSISTENT_CACHE_CONFLICT_ERROR,
   resolveCacheDisk,
   type CacheDiskArgs,
   type ResolvedCacheDisk,
 } from './cache-disk.js';
+export {
+  parsePersistEnv,
+  PERSIST_CACHE_CONFLICT_ERROR,
+  PERSIST_PAGED_CACHE_DEFAULT,
+  PERSIST_PAGED_CACHE_ENV,
+  persistPagedCacheFlag,
+  resolvePersistPagedCache,
+  type PersistPagedCache,
+} from './persist-cache.js';
 export {
   applyEnginePolicy,
   engineEnvFor,

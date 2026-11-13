@@ -24,18 +24,18 @@ import { dirname, join, resolve } from 'node:path';
 
 // Native-free subpaths: the help path must print without loading the addon, and
 // the family list must have exactly ONE definition (the drift guard's).
-import { CHAT_FAMILY_IDS } from '@mlx-node/agent/catalog';
+import { CHAT_FAMILY_IDS, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { readAgentDefaultModel } from '@mlx-node/agent/paths';
-import {
-  parseCacheDir,
-  parseMaxCacheDisk,
-  PERSISTENT_CACHE_CONFLICT_ERROR,
-  resolveCacheDisk,
-} from '@mlx-node/server/host/cache-disk';
+import { parseCacheDir, parseMaxCacheDisk, resolveCacheDisk } from '@mlx-node/server/host/cache-disk';
 import { DECODE_SHARE_ERROR, parseDecodeShare } from '@mlx-node/server/host/decode-share';
 import { IDLE_RELEASE_ERROR, parseIdleRelease } from '@mlx-node/server/host/idle-release';
 import { MAX_CONTEXT_ERROR, parseMaxContext } from '@mlx-node/server/host/max-context';
 import { MAX_MEMORY_ERROR, parseMaxMemory } from '@mlx-node/server/host/max-memory';
+import {
+  PERSIST_PAGED_CACHE_DEFAULT,
+  resolvePersistPagedCache,
+  type PersistPagedCache,
+} from '@mlx-node/server/host/persist-cache';
 
 import {
   agentUpdateStatus,
@@ -62,10 +62,12 @@ export interface AgentArgScan {
   /** Native text of `--max-cache-disk` (lifted out of the argv, forwarded to `mlx serve`). */
   cacheDisk?: string;
   /**
-   * `true` for `--persistent-cache`, `false` for `--no-persistent-cache`, unset
-   * for neither (lifted out of the argv; `mlx serve` keeps the cache by default).
+   * The paged KV disk cache for the spawned `mlx serve`: on by default,
+   * `--no-persist-cache` sets the flag off. A SINGLE process-wide switch for
+   * every family in `COLD_TIER_RESTORE_FAMILIES` and the qwen3_5 state tier.
+   * Lifted out of the argv, never forwarded to the agent binary.
    */
-  persistentCache?: boolean;
+  persistPagedCache: PersistPagedCache;
   /** Absolute `--cache-dir` (lifted out of the argv, forwarded to `mlx serve`). */
   cacheDir?: string;
   /** A cache flag had a missing or bad value, or the cache flags conflict: the usage error. */
@@ -234,8 +236,12 @@ function i_next(index: number, argv: readonly string[]): number {
  * forwarded verbatim, never hijacked as mlx's flag. Routing (help/update/
  * subcommand) reads the value-aware passthrough head, so a stripped
  * `--models-dir` pair cannot mask what the binary will see at argv[0].
+ * `env` is read only to check `--cache-dir` against the resolved switch.
  */
-export function scanAgentArgs(argv: string[]): AgentArgScan {
+export function scanAgentArgs(
+  argv: string[],
+  env: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>> = process.env,
+): AgentArgScan {
   const passthrough: string[] = [];
   let modelsDir: string | undefined;
   let modelsDirMissingValue = false;
@@ -243,8 +249,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   let traceDir: string | undefined;
   let traceDirMissingValue = false;
   let cacheDisk: string | undefined;
-  let persistentCache: boolean | undefined;
-  let persistentCacheConflict = false;
+  let persistCacheOff = false;
   let cacheDir: string | undefined;
   let cacheDiskError: string | undefined;
   const takeCacheValue = (parse: (value: string) => string, value: string, assign: (parsed: string) => void) => {
@@ -358,10 +363,8 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       trace = true;
       continue;
     }
-    if (arg === '--persistent-cache' || arg === '--no-persistent-cache') {
-      const value = arg === '--persistent-cache';
-      if (persistentCache !== undefined && persistentCache !== value) persistentCacheConflict = true;
-      persistentCache = value;
+    if (arg === '--no-persist-cache') {
+      persistCacheOff = true;
       continue;
     }
     if (arg === '--max-cache-disk' || arg === '--cache-dir') {
@@ -485,12 +488,15 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     passthrough.push(arg);
   }
 
-  if (cacheDiskError === undefined && persistentCacheConflict) cacheDiskError = PERSISTENT_CACHE_CONFLICT_ERROR;
+  const persistPagedCache: PersistPagedCache = persistCacheOff
+    ? { flag: false, byDefault: PERSIST_PAGED_CACHE_DEFAULT.byDefault }
+    : PERSIST_PAGED_CACHE_DEFAULT;
   if (cacheDiskError === undefined) {
     try {
       resolveCacheDisk({
         cacheDisk: cacheDisk ?? 'auto',
-        ...(persistentCache !== undefined ? { persistentCache } : {}),
+        persistPagedCache: resolvePersistPagedCache(persistPagedCache, env),
+        offByFlag: persistCacheOff,
         ...(cacheDir !== undefined ? { cacheDir } : {}),
       });
     } catch (error) {
@@ -509,8 +515,8 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     trace,
     traceDir,
     traceDirMissingValue,
+    persistPagedCache,
     ...(cacheDisk !== undefined ? { cacheDisk } : {}),
-    ...(persistentCache !== undefined ? { persistentCache } : {}),
     ...(cacheDir !== undefined ? { cacheDir } : {}),
     ...(cacheDiskError !== undefined ? { cacheDiskError } : {}),
     ...(kvFormat !== undefined ? { kvFormat } : {}),
@@ -701,7 +707,8 @@ export function chooseDefaultModel(
 
 /**
  * mlx-side help text; the binary's own flag list prints via a forwarded
- * `--help` (it exits before serving). Exported for its tests.
+ * `--help` (it exits before serving). Exported so tests can assert the
+ * `--no-persist-cache` copy matches the allowlist it applies to.
  */
 export function agentPreambleText(): string {
   return `
@@ -740,16 +747,21 @@ mlx options (handled before the agent binary sees the args):
                             m or h suffix, e.g. 30m (default: 10m); off keeps
                             both, though POST /v1/memory/release still frees
                             the weights.
-  --max-cache-disk <size>   SSD quota for the DFlash2 states of Qwen3.5 dense and
-                            MoE loads: auto (default; a quarter of the volume's
+  --no-persist-cache        Turn off the paged KV disk cache, which is on by
+                            default (a conversation resumes after an engine
+                            restart without prefilling again).
+                            MLX_PERSIST_PAGED_CACHE=0 also turns it off when this
+                            flag is absent. One switch for ALL restore-eligible
+                            families (${coldTierRestoreFamilyList().join(', ')})
+                            and the Qwen3.5 dense and MoE state tier, whose files
+                            are then temporary; every other family never
+                            persists, flag or not.
+  --max-cache-disk <size>   SSD quota for the states of Qwen3.5 dense and MoE
+                            loads: auto (default; a quarter of the volume's
                             free space beyond its floor, at most 32G), a size
                             such as 16G, or 0 to disable.
-  --persistent-cache        Keep the SSD cache across restarts (default: on
-                            unless --max-cache-disk is 0).
-  --no-persistent-cache     Keep the SSD cache for this run only; its
-                            temporary files go when the agent stops.
-  --cache-dir <dir>         Where the persistent cache keeps its files
-                            (default: ~/.mlx-node/cache/prefix-cache).
+  --cache-dir <dir>         Where the persistent Qwen3.5 state tier keeps its
+                            files (default: ~/.mlx-node/cache/prefix-cache).
 
 First run: when no local model exists, an interactive wizard offers a curated
 download. Agent config home: ~/.mlx-agent (override: GROK_HOME).
@@ -1004,8 +1016,8 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     ...(scan.maxContextTokens !== undefined ? { maxContextTokens: scan.maxContextTokens } : {}),
     ...(scan.decodeShare !== undefined ? { decodeShare: scan.decodeShare } : {}),
     ...(scan.idleReleaseSeconds !== undefined ? { idleReleaseSeconds: scan.idleReleaseSeconds } : {}),
+    persistPagedCache: scan.persistPagedCache,
     ...(scan.cacheDisk !== undefined ? { cacheDisk: scan.cacheDisk } : {}),
-    ...(scan.persistentCache !== undefined ? { persistentCache: scan.persistentCache } : {}),
     ...(scan.cacheDir !== undefined ? { cacheDir: scan.cacheDir } : {}),
   });
 }

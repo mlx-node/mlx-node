@@ -123,20 +123,17 @@ describe('scanAgentArgs', () => {
     });
   });
 
-  describe('--persistent-cache extraction', () => {
+  describe('--no-persist-cache extraction', () => {
     it('lifts the mlx-owned flag out of passthrough', () => {
-      const scan = scanAgentArgs(['--persistent-cache', '-p', 'hi']);
-      expect(scan.persistentCache).toBe(true);
+      const scan = scanAgentArgs(['--no-persist-cache', '-p', 'hi']);
+      expect(scan.persistPagedCache).toEqual({ flag: false, byDefault: true });
       expect(scan.passthrough).toEqual(['-p', 'hi']);
-      const off = scanAgentArgs(['--no-persistent-cache', '-p', 'hi']);
-      expect(off.persistentCache).toBe(false);
-      expect(off.passthrough).toEqual(['-p', 'hi']);
     });
 
     it('does not hijack the flag when it sits in a value-consumer slot', () => {
-      const scan = scanAgentArgs(['--system-prompt-override', '--persistent-cache']);
-      expect(scan.persistentCache).toBeUndefined();
-      expect(scan.passthrough).toEqual(['--system-prompt-override', '--persistent-cache']);
+      const scan = scanAgentArgs(['--system-prompt-override', '--no-persist-cache']);
+      expect(scan.persistPagedCache).toEqual({ byDefault: true });
+      expect(scan.passthrough).toEqual(['--system-prompt-override', '--no-persist-cache']);
     });
   });
 
@@ -779,7 +776,7 @@ describe('run() argv routing', () => {
     for (const argv of [
       ['models', '--models-dir', '--local'],
       ['--models-dir', '--help'],
-      ['--models-dir', '--persistent-cache', '-p', 'hi'],
+      ['--models-dir', '--no-persist-cache', '-p', 'hi'],
       ['--models-dir'],
       ['--models-dir', ''],
     ]) {
@@ -842,13 +839,12 @@ describe('run() argv routing', () => {
     expect(calls.launch[0]!.argv).not.toContain('--kv-format');
   });
 
-  // Mutation TSF1: drop `persistentCache` from the launcher pass-through → red.
+  // Mutation TPA2: drop `persistPagedCache` from the launcher pass-through → red.
   it('exits 1 on bad SSD cache flags and hands good ones to the launcher', async () => {
     for (const argv of [
       ['--max-cache-disk', 'lots'],
-      ['--no-persistent-cache', '--cache-dir', '/c'],
-      ['--persistent-cache', '--max-cache-disk=0'],
-      ['--persistent-cache', '--no-persistent-cache'],
+      ['--no-persist-cache', '--cache-dir', '/c'],
+      ['--max-cache-disk=0', '--cache-dir', '/c'],
     ]) {
       const { deps, calls } = makeDeps();
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -864,20 +860,23 @@ describe('run() argv routing', () => {
       expect(calls.launch).toHaveLength(0);
     }
     const { deps, calls } = makeDeps();
-    await run(['--max-cache-disk', '64G', '--persistent-cache', '--cache-dir', '/c'], deps);
+    await run(['--max-cache-disk', '64G', '--cache-dir', '/c'], deps);
     expect(calls.launch).toHaveLength(1);
-    expect(calls.launch[0]).toMatchObject({ cacheDisk: String(64 * 1024 ** 3), persistentCache: true, cacheDir: '/c' });
-    expect(calls.launch[0]!.argv).not.toContain('--persistent-cache');
+    expect(calls.launch[0]).toMatchObject({
+      cacheDisk: String(64 * 1024 ** 3),
+      persistPagedCache: { byDefault: true },
+      cacheDir: '/c',
+    });
 
     const plain = makeDeps();
     await run([], plain.deps);
-    expect(plain.calls.launch[0]!.persistentCache).toBeUndefined();
+    expect(plain.calls.launch[0]!.persistPagedCache).toEqual({ byDefault: true });
     expect(plain.calls.launch[0]!.cacheDisk).toBeUndefined();
 
     const off = makeDeps();
-    await run(['--no-persistent-cache'], off.deps);
-    expect(off.calls.launch[0]!.persistentCache).toBe(false);
-    expect(off.calls.launch[0]!.argv).not.toContain('--no-persistent-cache');
+    await run(['--no-persist-cache'], off.deps);
+    expect(off.calls.launch[0]!.persistPagedCache).toEqual({ flag: false, byDefault: true });
+    expect(off.calls.launch[0]!.argv).not.toContain('--no-persist-cache');
   });
 
   // Mutation: drop the `maxMemoryInvalid` usage check in `run` → red (a bad
@@ -967,8 +966,8 @@ describe('run() argv routing', () => {
       const output = logSpy.mock.calls.flat().join('\n');
       expect(output).toContain('--trace');
       expect(output).toContain('--trace-dir <dir>');
+      expect(output).toContain('--no-persist-cache');
       expect(output).toContain('--max-cache-disk <size>');
-      expect(output).toContain('--persistent-cache');
       expect(output).toContain('--cache-dir <dir>');
       expect(output).toContain('MLX_NODE_LOG');
       expect(output).toContain('MLX_NODE_LOG_FILE');

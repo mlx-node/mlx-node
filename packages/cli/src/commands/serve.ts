@@ -20,12 +20,15 @@ import {
   parseMaxCacheDisk,
   parseMaxContext,
   parseMaxMemory,
-  PERSISTENT_CACHE_CONFLICT_ERROR,
+  PERSIST_CACHE_CONFLICT_ERROR,
+  PERSIST_PAGED_CACHE_DEFAULT,
   resolveCacheDisk,
+  resolvePersistPagedCache,
   resolveLogDir,
   resolveMlxNodeHome,
   type InferenceHost,
   type InferenceHostOptions,
+  type PersistPagedCache,
 } from '@mlx-node/server/host';
 import { SERVER_CLOSE_MS } from '@mlx-node/server/supervision';
 
@@ -79,18 +82,22 @@ Options:
                       s, m or h suffix, e.g. 30m (default: 10m); off keeps
                       both, though POST /v1/memory/release still frees the
                       weights. The next request loads the weights again.
-  --max-cache-disk <size>  SSD quota for the DFlash2 states of Qwen3.5 dense
-                      and MoE loads: auto follows the volume, a quarter of
-                      its free space beyond a floor of 10G (5% of a volume
-                      under 200G), at most 32G; a size such as 16G is held
-                      as given while the volume keeps that floor; 0
-                      disables (default: auto).
-  --persistent-cache  Keep the SSD cache across restarts (default: on unless
-                      --max-cache-disk is 0).
-  --no-persistent-cache  Keep the SSD cache for this run only; its temporary
-                      files go when serve stops.
-  --cache-dir <dir>   Where the persistent cache keeps its files (default:
-                      ~/.mlx-node/cache/prefix-cache).
+  --persist-cache     Keep the paged KV disk cache across restarts, for every
+                      family that has one (default: on, unless
+                      MLX_PERSIST_PAGED_CACHE turns it off): the cold tier of
+                      Qwen3, Gemma4, Muse-Glimmer and LFM2, and the SSD state
+                      tier of Qwen3.5 dense and MoE.
+  --no-persist-cache  Turn it off, whatever MLX_PERSIST_PAGED_CACHE says; the
+                      Qwen3.5 state tier then keeps temporary files that go
+                      when serve stops.
+  --max-cache-disk <size>  SSD quota for the states of Qwen3.5 dense and MoE
+                      loads: auto follows the volume, a quarter of its free
+                      space beyond a floor of 10G (5% of a volume under
+                      200G), at most 32G; a size such as 16G is held as
+                      given while the volume keeps that floor; 0 disables
+                      (default: auto).
+  --cache-dir <dir>   Where the persistent Qwen3.5 state tier keeps its files
+                      (default: ~/.mlx-node/cache/prefix-cache).
   --thinking-token-budget <n>  Thinking tokens of a thinking request that
                       sets no budget, after which its thinking closes
                       (default: no cap).
@@ -131,7 +138,8 @@ export interface ServeArgs {
   idleReleaseSeconds?: number;
   /** `--max-cache-disk` as the native load option's text: `'auto'`, `'0'` or a byte count. */
   cacheDisk: string;
-  persistentCache: boolean;
+  /** `--persist-cache` (true) or `--no-persist-cache` (false); unset when neither was given. */
+  persistPagedCache?: boolean;
   cacheDir?: string;
   thinkingTokenBudget?: number;
   rerankConfig?: string;
@@ -146,8 +154,13 @@ export interface ServeArgs {
  * `--port 0` is legal here (unlike `mlx launch claude`, which rejects it):
  * an operator asking for an ephemeral port gets one, and the real port is
  * printed. `undefined` still means "pick one for me".
+ *
+ * `env` is read only to check `--cache-dir` against the resolved switch.
  */
-export function parseServeArgs(argv: string[]): ServeArgs {
+export function parseServeArgs(
+  argv: string[],
+  env: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>> = process.env,
+): ServeArgs {
   const parsed = parseArgs({
     args: argv,
     options: {
@@ -163,8 +176,8 @@ export function parseServeArgs(argv: string[]): ServeArgs {
       'decode-share': { type: 'string' },
       'idle-release': { type: 'string' },
       'max-cache-disk': { type: 'string' },
-      'persistent-cache': { type: 'boolean' },
-      'no-persistent-cache': { type: 'boolean' },
+      'persist-cache': { type: 'boolean' },
+      'no-persist-cache': { type: 'boolean' },
       'cache-dir': { type: 'string' },
       'thinking-token-budget': { type: 'string' },
       'rerank-config': { type: 'string' },
@@ -202,16 +215,17 @@ export function parseServeArgs(argv: string[]): ServeArgs {
   const idleReleaseSeconds = idleReleaseText === undefined ? undefined : parseIdleRelease(idleReleaseText);
   const cacheDiskText = values['max-cache-disk'];
   const cacheDisk = cacheDiskText === undefined ? 'auto' : parseMaxCacheDisk(cacheDiskText);
-  if (values['persistent-cache'] === true && values['no-persistent-cache'] === true) {
-    throw new Error(PERSISTENT_CACHE_CONFLICT_ERROR);
+  if (values['persist-cache'] === true && values['no-persist-cache'] === true) {
+    throw new Error(PERSIST_CACHE_CONFLICT_ERROR);
   }
-  const persistentFlag =
-    values['persistent-cache'] === true ? true : values['no-persistent-cache'] === true ? false : undefined;
+  const persistPagedCache =
+    values['persist-cache'] === true ? true : values['no-persist-cache'] === true ? false : undefined;
   const cacheDirText = values['cache-dir'];
   const cacheDirArg = cacheDirText === undefined ? undefined : parseCacheDir(cacheDirText);
-  const { persistentCache, cacheDir } = resolveCacheDisk({
+  const { cacheDir } = resolveCacheDisk({
     cacheDisk,
-    ...(persistentFlag !== undefined ? { persistentCache: persistentFlag } : {}),
+    persistPagedCache: resolvePersistPagedCache(persistOption(persistPagedCache), env),
+    offByFlag: persistPagedCache === false,
     ...(cacheDirArg !== undefined ? { cacheDir: cacheDirArg } : {}),
   });
   const budgetText = values['thinking-token-budget'];
@@ -232,13 +246,18 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     ...(decodeShare !== undefined ? { decodeShare } : {}),
     ...(idleReleaseSeconds !== undefined ? { idleReleaseSeconds } : {}),
     cacheDisk,
-    persistentCache,
+    ...(persistPagedCache !== undefined ? { persistPagedCache } : {}),
     ...(cacheDir !== undefined ? { cacheDir } : {}),
     ...(thinkingTokenBudget !== undefined ? { thinkingTokenBudget } : {}),
     ...(values['rerank-config'] !== undefined ? { rerankConfig: values['rerank-config'] } : {}),
     authToken: values['auth-token'],
     logDir: verbose ? resolveLogDir(values['log-dir'], resolveMlxNodeHome()) : undefined,
   };
+}
+
+/** The host's switch: the flag over `MLX_PERSIST_PAGED_CACHE` over on. */
+function persistOption(flag: boolean | undefined): PersistPagedCache {
+  return flag === undefined ? PERSIST_PAGED_CACHE_DEFAULT : { flag, byDefault: PERSIST_PAGED_CACHE_DEFAULT.byDefault };
 }
 
 /** A nonnegative decimal integer that fits the native i32 budget. */
@@ -301,7 +320,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       ...(args.decodeShare !== undefined ? { decodeShare: args.decodeShare } : {}),
       ...(args.idleReleaseSeconds !== undefined ? { idleReleaseSeconds: args.idleReleaseSeconds } : {}),
       cacheDisk: args.cacheDisk,
-      persistentCache: args.persistentCache,
+      persistPagedCache: persistOption(args.persistPagedCache),
       ...(args.cacheDir !== undefined ? { cacheDir: args.cacheDir } : {}),
       ...(args.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: args.thinkingTokenBudget } : {}),
       ...(await readRerankConfig(args.rerankConfig)),
@@ -330,6 +349,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
   console.log(
     `[mlx] models dir: ${host.modelsDir} | listening on ${host.url} | discovered ${host.models.length + (host.audioModels?.length ?? 0) + (host.rerankModels?.length ?? 0)} model(s) | default: ${host.boundModel}`,
   );
+  console.log(`[mlx] paged KV disk cache: ${host.persistPagedCache ? 'on' : 'off'}`);
   if (host.logDir !== null) console.log(`[mlx] verbose logging → ${host.logDir}`);
   console.log('Press Ctrl+C to stop.');
 

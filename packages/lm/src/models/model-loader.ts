@@ -102,15 +102,14 @@ export interface LoadModelOptions {
    */
   decodeShare?: number;
   /**
-   * SSD cache of the DFlash2 states of `qwen3_5` and `qwen3_5_moe` targets
+   * SSD state tier of `qwen3_5` and `qwen3_5_moe` targets
    * (`--max-cache-disk`): `'auto'` (the default), a decimal byte count, or
-   * `'0'` (off). The cache opens only with a DFlash2 draft. Other model
-   * families reject it, as they do `persistentCache` and `cacheDir`.
+   * `'0'` (off). Whether it survives a restart is the paged KV disk cache
+   * switch every family reads, `MLX_PERSIST_PAGED_CACHE`. Other model
+   * families reject it, as they do `cacheDir`.
    */
   cacheDisk?: string;
-  /** Keep that SSD cache across restarts (`--persistent-cache`). */
-  persistentCache?: boolean;
-  /** The persistent cache's root (`--cache-dir`); needs `persistentCache`. */
+  /** The persistent tier's root (`--cache-dir`); needs the switch on. */
   cacheDir?: string;
 }
 
@@ -123,7 +122,6 @@ function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOpt
     options?.maxContextTokens === undefined &&
     options?.decodeShare === undefined &&
     options?.cacheDisk === undefined &&
-    options?.persistentCache === undefined &&
     options?.cacheDir === undefined
   )
     return null;
@@ -134,7 +132,6 @@ function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOpt
     maxContextTokens: options.maxContextTokens,
     decodeShare: options.decodeShare,
     cacheDisk: options.cacheDisk,
-    persistentCache: options.persistentCache,
     cacheDir: options.cacheDir,
   };
 }
@@ -317,11 +314,11 @@ function dispatchLoad(
     );
   }
   if (
-    (options?.cacheDisk !== undefined || options?.persistentCache !== undefined || options?.cacheDir !== undefined) &&
+    (options?.cacheDisk !== undefined || options?.cacheDir !== undefined) &&
     requireFamilyData(modelType).acceptsCacheDisk !== true
   ) {
     throw new Error(
-      `cacheDisk, persistentCache and cacheDir (the SSD cache) are only supported by qwen3_5 and qwen3_5_moe models; ` +
+      `cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5 and qwen3_5_moe models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }

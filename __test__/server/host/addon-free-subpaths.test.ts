@@ -33,6 +33,7 @@ const ADDON_FREE_SUBPATHS = [
   'host/max-context.ts',
   'host/max-memory.ts',
   'host/paths.ts',
+  'host/persist-cache.ts',
   'supervision.ts',
 ];
 

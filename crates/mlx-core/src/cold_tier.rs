@@ -654,6 +654,9 @@ impl<'a> CheckpointLoadGuard<'a> {
     }
 }
 
+/// The env default of the paged KV disk cache switch (`persistPagedCache`).
+pub(crate) const PERSIST_PAGED_CACHE_ENV: &str = "MLX_PERSIST_PAGED_CACHE";
+
 /// Lenient boolean parse for the `MLX_PERSIST_PAGED_CACHE` override.
 /// `1/true/on/yes` → `Some(true)`, `0/false/off/no` → `Some(false)`
 /// (case-insensitive, surrounding whitespace ignored); anything else →
@@ -1506,6 +1509,18 @@ mod tests {
                 "lfm2_moe".to_string()
             ]
         );
+    }
+
+    /// A default `mlx serve` / `mlx agent` / desktop host writes
+    /// `MLX_PERSIST_PAGED_CACHE=1` and `--no-persist-cache` writes `0`; a
+    /// load with no config of its own follows it for every family here.
+    #[test]
+    fn host_switch_reaches_every_cold_family() {
+        for family in cold_restore_families() {
+            assert!(resolve_persist_cold(&family, Some("1"), None), "{family}");
+            assert!(!resolve_persist_cold(&family, Some("0"), None), "{family}");
+            assert!(!resolve_persist_cold(&family, None, None), "{family}");
+        }
     }
 
     #[test]

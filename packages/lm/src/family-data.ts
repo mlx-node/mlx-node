@@ -263,9 +263,10 @@ interface ModelFamilyDataBase {
    */
   readonly acceptsDecodeShare?: true;
   /**
-   * Native `load` accepts `LoadModelOptions.cacheDisk`, `persistentCache` and
-   * `cacheDir` (`--max-cache-disk`, `--persistent-cache`, `--cache-dir`): its
-   * DFlash2 states get an SSD tier (Splash `openDiskTier`).
+   * Native `load` accepts `LoadModelOptions.cacheDisk` and `cacheDir`
+   * (`--max-cache-disk`, `--cache-dir`): its DFlash2 states get an SSD tier
+   * (Splash `openDiskTier`), persistent under the paged KV disk cache switch
+   * (`MLX_PERSIST_PAGED_CACHE`).
    */
   readonly acceptsCacheDisk?: true;
   /**

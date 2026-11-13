@@ -37,14 +37,15 @@ describe('cold-tier restore allowlist', () => {
 
   // Identity, not equality: a re-export that ever became a second `new Set([…])`
   // would satisfy a deep compare on the day it was written and drift the day
-  // after. The catalog subpath is what the dashboard reads — it must BE the
-  // leaf.
+  // after. The catalog subpath is what the dashboard and the CLI help text
+  // read — it must BE the leaf.
   it('is the same object everywhere it is consumed', () => {
     expect(viaCatalog).toBe(COLD_TIER_RESTORE_FAMILIES);
   });
 
-  // The display list feeds the /api/cache payload the SPA renders, so it must
-  // be derived from the set rather than being a fifth hand-maintained copy.
+  // The display list feeds the `--no-persist-cache` help text and the /api/cache
+  // payload the SPA renders, so it must be derived from the set rather than
+  // being a fifth hand-maintained copy.
   it('derives its display list from the set', () => {
     expect(coldTierRestoreFamilyList()).toEqual([...COLD_TIER_RESTORE_FAMILIES].sort());
     expect(coldTierRestoreFamilyList()).toEqual([...coldRestoreFamilies()].sort());

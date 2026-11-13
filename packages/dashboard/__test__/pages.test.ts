@@ -417,7 +417,7 @@ describe('Cache page', () => {
    * The same zero, a different cause, and the one the dense-family reading
    * hides. `record_capture_reached()` runs above the `adapter.cold_tier()`
    * guard in every family's capture, so a hybrid turn under
-   * persistence off — or one whose tier failed to open — counts the
+   * `--no-persist-cache` — or one whose tier failed to open — counts the
    * capture and then carries no root for the scope to match. Those captures
    * arrive as `scope.unrootedSidecarCaptures`, and reading "dense families keep
    * no state outside the pool" off them names the wrong cause for the exact

@@ -58,8 +58,16 @@ import { MODEL_FAMILY_DATA } from './family-data.js';
  * authorized by exactly one thing: the family's native restart-parity gate
  * passing on real weights with `hits > 0` and `corruptions == 0`.
  *
- * Families off the allowlist never persist: `cold_tier::resolve_persist_cold`
- * refuses them under ANY setting.
+ * The `mlx agent --no-persist-cache` flag applies to EVERY family in this
+ * set, not to one of them: it is a SINGLE process-wide boolean, written to
+ * `MLX_PERSIST_PAGED_CACHE` before any load (`@mlx-node/server/host/persist-cache`).
+ * The same switch makes the `qwen3_5` / `qwen3_5_moe` SSD state tier
+ * persistent. Families off the allowlist never persist — not because the
+ * flag spares them, but because `cold_tier::resolve_persist_cold` refuses
+ * them under ANY setting. The help text says so in exactly one place, built
+ * from {@link coldTierRestoreFamilyList} in
+ * `packages/cli/src/commands/agent/index.ts` and asserted by
+ * `packages/cli/__test__/agent-cmd.test.ts`.
  */
 export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType>(
   MODEL_FAMILY_DATA.filter((row) => 'coldRestoreEligible' in row).map((row) => row.id),

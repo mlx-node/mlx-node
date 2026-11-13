@@ -391,7 +391,7 @@ fn held_namespace_falls_back_to_temp() {
 }
 
 /// Splash `serve_options.py`: the default is the automatic temporary tier;
-/// `--cache-dir` needs `--persistent-cache`, which needs the tier on.
+/// `--cache-dir` needs a persistent tier, which needs the tier on.
 /// Mutation DF1 (`persistent` defaults to true) → red.
 #[test]
 fn default_options_open_a_temp_tier() {
@@ -399,16 +399,16 @@ fn default_options_open_a_temp_tier() {
     assert_eq!(default.cache_disk, CacheDisk::Auto);
     assert!(!default.persistent);
     assert_eq!(
-        DiskTierOptions::from_load(None, None, None).unwrap(),
+        DiskTierOptions::from_load(None, false, None).unwrap(),
         default
     );
     assert_eq!(
-        DiskTierOptions::from_load(None, None, Some("/x".to_string())).unwrap_err(),
-        "--cache-dir needs --persistent-cache"
+        DiskTierOptions::from_load(None, false, Some("/x".to_string())).unwrap_err(),
+        "--cache-dir needs the persistent cache --no-persist-cache turns off"
     );
     assert_eq!(
-        DiskTierOptions::from_load(Some("0"), Some(true), None).unwrap_err(),
-        "--persistent-cache needs the SSD cache --max-cache-disk 0 turns off"
+        DiskTierOptions::from_load(Some("0"), true, Some("/x".to_string())).unwrap_err(),
+        "--cache-dir needs the SSD cache --max-cache-disk 0 turns off"
     );
     assert_eq!(CacheDisk::parse("0"), Ok(CacheDisk::Off));
     assert_eq!(
@@ -427,11 +427,39 @@ fn default_options_open_a_temp_tier() {
     set_volume(&root.0, Some(volume(1024, 200)));
     let options = DiskTierOptions {
         temp_root: Some(root.join("tmp")),
-        ..DiskTierOptions::from_load(None, None, None).unwrap()
+        ..DiskTierOptions::from_load(None, false, None).unwrap()
     };
     let tier = open_disk_tier(&options, || identity(NS), 160).expect("temporary tier");
     assert!(!tier.persistent);
     assert_eq!(tier.limit, 32 * GIB);
+}
+
+/// `persistPagedCache` is the switch every family shares: the load's option,
+/// else `MLX_PERSIST_PAGED_CACHE`, else off. Persistent maps to the tier's
+/// persistent mode; a tier `--max-cache-disk 0` turns off stays off instead
+/// of failing the load.
+/// Mutation PS1 (`resolve_persist` ignores the env) → red.
+#[test]
+fn persist_switch_picks_the_tier_mode() {
+    assert!(!resolve_persist(None, None));
+    assert!(resolve_persist(None, Some("1")));
+    assert!(resolve_persist(None, Some(" on ")));
+    assert!(!resolve_persist(None, Some("0")));
+    assert!(!resolve_persist(None, Some("maybe")));
+    assert!(!resolve_persist(Some(false), Some("1")));
+    assert!(resolve_persist(Some(true), Some("0")));
+
+    let persistent = DiskTierOptions::from_load(None, true, Some("/c".to_string())).unwrap();
+    assert!(persistent.persistent);
+    assert!(persistent.reads_identity());
+    assert_eq!(persistent.cache_dir, Some(PathBuf::from("/c")));
+    let temp = DiskTierOptions::from_load(Some("68719476736"), false, None).unwrap();
+    assert!(!temp.persistent);
+    assert_eq!(temp.cache_disk, CacheDisk::Bytes(64 * GIB));
+    let off = DiskTierOptions::from_load(Some("0"), true, None).unwrap();
+    assert_eq!(off.cache_disk, CacheDisk::Off);
+    assert!(!off.persistent);
+    assert!(!off.reads_identity());
 }
 
 /// A temporary tier hashes no weights: its identity is random, the load

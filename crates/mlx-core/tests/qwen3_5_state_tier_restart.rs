@@ -304,7 +304,7 @@ async fn conversation_resumes_after_a_restart(decode: Decode) {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("cache root");
     let persistent = || Qwen35LoadOptions {
-        persistent_cache: Some(true),
+        persist_paged_cache: Some(true),
         cache_dir: Some(root.to_string_lossy().to_string()),
         ..Qwen35LoadOptions::default()
     };
@@ -466,7 +466,7 @@ async fn image_conversation_resumes_after_a_restart() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("cache root");
     let persistent = || Qwen35LoadOptions {
-        persistent_cache: Some(true),
+        persist_paged_cache: Some(true),
         cache_dir: Some(root.to_string_lossy().to_string()),
         ..Qwen35LoadOptions::default()
     };

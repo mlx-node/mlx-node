@@ -178,6 +178,11 @@ describe('the readiness handshake', () => {
     expect(tokens.size).toBe(8);
   });
 
+  // Mutation TPD1 (the desktop engine passes `byDefault: false`) → red.
+  it('keeps the paged KV disk cache on, so a conversation resumes after a restart', () => {
+    expect(sidecarHostOptions().persistPagedCache).toEqual({ byDefault: true });
+  });
+
   it('keeps the bind that the token protects', () => {
     const options = sidecarHostOptions();
     expect(options.port).toBe(SIDECAR_HOST_OPTIONS.port);

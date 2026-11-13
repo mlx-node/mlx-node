@@ -88,6 +88,7 @@ export function sidecarHostOptions(env: NodeJS.ProcessEnv = process.env): Sideca
   return {
     ...SIDECAR_HOST_OPTIONS,
     authToken: newSidecarAuthToken(),
+    persistPagedCache: { byDefault: true },
     ...(turnJournal !== null ? { turnJournal } : {}),
   };
 }
@@ -102,6 +103,12 @@ export interface SidecarHostOptions {
   port: number;
   host: string;
   authToken: string;
+  /**
+   * The paged KV disk cache: on unless `MLX_PERSIST_PAGED_CACHE` in this
+   * process's env says otherwise. `InferenceHostOptions.persistPagedCache`,
+   * restated for the reason {@link SidecarHost} gives.
+   */
+  persistPagedCache: { flag?: boolean; byDefault: boolean };
   turnJournal?: SidecarTurnJournal;
 }
 

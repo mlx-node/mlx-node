@@ -39,8 +39,8 @@ import { ApiError } from '../errors.js';
  *    on the CANONICAL root, the same emptiness test `canonicalCacheRoot`
  *    applies), so the bucket should stay empty; it exists so that if one ever
  *    appears the lookups are shown rather than dropped on the floor.
- *  - `disabledTurns` — the tier was off (persistence not asked for, or a
- *    family off the restore allowlist). Their deltas are all zero, so they are counted but
+ *  - `disabledTurns` — the tier was off (`--no-persist-cache`, or a family off
+ *    the restore allowlist). Their deltas are all zero, so they are counted but
  *    carry no lookups. Overlaps the buckets above by design: it is a TURN
  *    count, not a lookup bucket.
  *  - `unrootedSidecarCaptures` — the one delta a rootless turn can still carry,

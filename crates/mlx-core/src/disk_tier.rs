@@ -3,8 +3,9 @@
 //!
 //! Temporary by default: a locked directory under the temp root that the
 //! model's `closeCache` removes at a clean stop and the next start sweeps
-//! after a crash. `--persistent-cache` keeps it in a namespace directory of
-//! the cache root across restarts.
+//! after a crash. The paged KV disk cache switch every family shares
+//! (`persistPagedCache`, `--no-persist-cache`, `MLX_PERSIST_PAGED_CACHE`)
+//! keeps it in a namespace directory of the cache root across restarts.
 
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
@@ -86,7 +87,7 @@ impl CacheDisk {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DiskTierOptions {
     pub cache_disk: CacheDisk,
-    /// `--persistent-cache`: keep the cache across restarts.
+    /// Keep the cache across restarts: the resolved `persistPagedCache`.
     pub persistent: bool,
     /// `--cache-dir`, only with `persistent`.
     pub cache_dir: Option<PathBuf>,
@@ -94,27 +95,36 @@ pub(crate) struct DiskTierOptions {
     pub temp_root: Option<PathBuf>,
 }
 
+/// The `persistPagedCache` switch of a load: the load's own option, else
+/// `MLX_PERSIST_PAGED_CACHE` (`cold_tier::parse_bool_env`), else off, the
+/// precedence `cold_tier::resolve_persist_cold` gives the other families.
+pub(crate) fn resolve_persist(option: Option<bool>, env_value: Option<&str>) -> bool {
+    option
+        .or_else(|| env_value.and_then(crate::cold_tier::parse_bool_env))
+        .unwrap_or(false)
+}
+
 impl DiskTierOptions {
     /// The load options, refused as Splash `check_serve_arguments` refuses
-    /// the flags.
+    /// the flags. `persist` is the resolved switch; a tier
+    /// `--max-cache-disk 0` turns off keeps nothing, so it is not persistent.
     pub(crate) fn from_load(
         cache_disk: Option<&str>,
-        persistent: Option<bool>,
+        persist: bool,
         cache_dir: Option<String>,
     ) -> Result<Self, String> {
         let cache_disk = cache_disk.map_or(Ok(CacheDisk::Auto), CacheDisk::parse)?;
-        let persistent = persistent.unwrap_or(false);
-        if cache_dir.is_some() && !persistent {
-            return Err("--cache-dir needs --persistent-cache".to_string());
+        if cache_dir.is_some() && cache_disk == CacheDisk::Off {
+            return Err("--cache-dir needs the SSD cache --max-cache-disk 0 turns off".to_string());
         }
-        if persistent && cache_disk == CacheDisk::Off {
+        if cache_dir.is_some() && !persist {
             return Err(
-                "--persistent-cache needs the SSD cache --max-cache-disk 0 turns off".to_string(),
+                "--cache-dir needs the persistent cache --no-persist-cache turns off".to_string(),
             );
         }
         Ok(Self {
             cache_disk,
-            persistent,
+            persistent: persist && cache_disk != CacheDisk::Off,
             cache_dir: cache_dir.map(PathBuf::from),
             temp_root: None,
         })
@@ -384,7 +394,7 @@ fn temporary_fingerprint() -> ColdCacheFingerprint {
     ColdCacheFingerprint::from_components([b"mlx-node-temp-tier".as_slice(), random.as_bytes()])
 }
 
-/// A persistent tier's identity, built only when `--persistent-cache` asks
+/// A persistent tier's identity, built only when `persistPagedCache` asks
 /// for one.
 pub(crate) struct PersistentIdentity {
     pub namespace: String,

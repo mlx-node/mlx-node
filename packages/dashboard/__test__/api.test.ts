@@ -635,8 +635,8 @@ describe('dashboard api — cache trend scoping', () => {
       // every BLOCK counter. The sidecar capture is the exception and the
       // reason this row carries one: `record_capture_reached()` is the first
       // statement of `capture_gemma4_sliding_cold_sidecar`, above its
-      // `adapter.cold_tier()` guard, so a hybrid turn with persistence off
-      // reaches the capture, counts it, and returns with
+      // `adapter.cold_tier()` guard, so a hybrid turn under
+      // `--no-persist-cache` reaches the capture, counts it, and returns with
       // no tier to name a root from.
       {
         traceId: 'disabled-1',
@@ -834,7 +834,7 @@ describe('dashboard api — cache trend scoping', () => {
    * capture — `crates/mlx-core/src/models/gemma4/model.rs:2839` sits above the
    * `adapter.cold_tier()` guard at `:2843`, and qwen3_5 (`:2118` vs `:2122`)
    * and qwen3_5_moe (`:1497` vs `:1501`) are identical — so a hybrid turn run
-   * with persistence off, or one whose tier failed to open, counts the
+   * under `--no-persist-cache`, or one whose tier failed to open, counts the
    * capture and then returns with no tier to name a root from. The writer only
    * emits `coldRoot` for a tier that was open
    * (`packages/agent/src/provider/index.ts:182`), so those turns land with a

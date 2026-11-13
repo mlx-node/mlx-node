@@ -148,18 +148,22 @@ from Node would stall the agent. From mlx-agent v0.3.0 every resident session
 is detected. With an older binary, an idle ACP/headless holder with no recent
 writes cannot be detected.
 
-## Persist paged cache (`persist_paged_cache`)
+## Persist paged cache (`persistPagedCache`)
 
 The `ColdCacheManager` SSD cold tier of the restore-allowlisted families: when
 enabled, full paged prefix blocks are captured to the cold tier on publish and
 restored on a hot-cache miss before falling back to a normal prefill. Qwen3.5
 dense and MoE are not among them: their SSD tier holds DFlash2 states
-(`mlx serve --max-cache-disk`, `--[no-]persistent-cache`, kept across restarts by default; see
+(`mlx serve --max-cache-disk`, persistent under the same switch; see
 [paged-cache.md](paged-cache.md#dflash2-states-on-ssd-qwen3_5--qwen3_5_moe)), and
 this view does not list it.
 
-- Default is **off**: the model's `config.json` `persist_paged_cache`, else
-  `MLX_PERSIST_PAGED_CACHE`, turns it on.
+- One switch for every family: `mlx serve`, `mlx agent`, `mlx launch claude`
+  and the desktop engine turn it **on** by default (`--no-persist-cache`, or
+  `MLX_PERSIST_PAGED_CACHE=0` without a flag, turns it off) and write the
+  resolved value to `MLX_PERSIST_PAGED_CACHE` before any load. A load with no
+  host reads the model's `config.json` `persist_paged_cache`, else
+  `MLX_PERSIST_PAGED_CACHE`, else off.
 - **Restore is gated to an allowlist: `qwen3`, `gemma4`, `muse_glimmer`, `lfm2`, and `lfm2_moe`.**
   Dense qwen3 sizes its pool over every layer, so paged blocks fully determine its
   layer state. The others are hybrid — their pools cover the full-attention

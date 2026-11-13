@@ -398,20 +398,31 @@ pub struct Qwen35LoadOptions {
     /// (the default: up to 32 GiB, a quarter of the volume's room), a byte
     /// count, or `'0'` (off).
     pub cache_disk: Option<String>,
-    /// Keep the SSD cache across restarts (`--persistent-cache`) in a
-    /// directory of the model's own under `cacheDir`.
-    pub persistent_cache: Option<bool>,
+    /// The paged KV disk cache switch every family shares (`--no-persist-cache`):
+    /// keep the SSD cache across restarts in a directory of the model's own
+    /// under `cacheDir`; off, the cache is temporary and goes at close.
+    /// Unset ⇒ `MLX_PERSIST_PAGED_CACHE`, else off.
+    pub persist_paged_cache: Option<bool>,
     /// The persistent cache's root (`--cache-dir`), default
-    /// `~/.mlx-node/cache/prefix-cache`; needs `persistentCache`.
+    /// `~/.mlx-node/cache/prefix-cache`; needs `persistPagedCache`.
     pub cache_dir: Option<String>,
 }
 
 impl Qwen35LoadOptions {
     /// The SSD tier these options ask for.
     pub(crate) fn disk_tier(&self, label: &str) -> Result<crate::disk_tier::DiskTierOptions> {
+        let env = std::env::var(crate::cold_tier::PERSIST_PAGED_CACHE_ENV).ok();
+        self.disk_tier_with_env(label, env.as_deref())
+    }
+
+    pub(crate) fn disk_tier_with_env(
+        &self,
+        label: &str,
+        env_value: Option<&str>,
+    ) -> Result<crate::disk_tier::DiskTierOptions> {
         crate::disk_tier::DiskTierOptions::from_load(
             self.cache_disk.as_deref(),
-            self.persistent_cache,
+            crate::disk_tier::resolve_persist(self.persist_paged_cache, env_value),
             self.cache_dir.clone(),
         )
         .map_err(|message| Error::from_reason(format!("{label} load: {message}")))

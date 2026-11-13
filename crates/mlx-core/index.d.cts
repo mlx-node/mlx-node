@@ -5535,13 +5535,15 @@ export interface Qwen35LoadOptions {
    */
   cacheDisk?: string;
   /**
-   * Keep the SSD cache across restarts (`--persistent-cache`) in a
-   * directory of the model's own under `cacheDir`.
+   * The paged KV disk cache switch every family shares (`--no-persist-cache`):
+   * keep the SSD cache across restarts in a directory of the model's own
+   * under `cacheDir`; off, the cache is temporary and goes at close.
+   * Unset ⇒ `MLX_PERSIST_PAGED_CACHE`, else off.
    */
-  persistentCache?: boolean;
+  persistPagedCache?: boolean;
   /**
    * The persistent cache's root (`--cache-dir`), default
-   * `~/.mlx-node/cache/prefix-cache`; needs `persistentCache`.
+   * `~/.mlx-node/cache/prefix-cache`; needs `persistPagedCache`.
    */
   cacheDir?: string;
 }

@@ -41,6 +41,12 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 import { idleReleaseText } from '@mlx-node/server/host/idle-release';
+import {
+  PERSIST_PAGED_CACHE_DEFAULT,
+  persistPagedCacheFlag,
+  resolvePersistPagedCache,
+  type PersistPagedCache,
+} from '@mlx-node/server/host/persist-cache';
 import { STOP_MS } from '@mlx-node/server/supervision';
 import semver from 'semver';
 
@@ -85,14 +91,15 @@ export interface GrokAgentLaunchOptions {
   decodeShare?: number;
   /** Seconds without a request before the spawned `mlx serve` frees the weights (`--idle-release`); `Infinity` = off. */
   idleReleaseSeconds?: number;
-  /** SSD cache quota the spawned `mlx serve` loads with (`--max-cache-disk`, its native text). */
-  cacheDisk?: string;
   /**
-   * `--persistent-cache` / `--no-persistent-cache` for the spawned `mlx serve`;
-   * unset leaves serve's default (persistent).
+   * The paged KV disk cache for the spawned `mlx serve`, resolved here against
+   * this process's env and passed as an explicit `--persist-cache` /
+   * `--no-persist-cache`. Omitted ⇒ {@link PERSIST_PAGED_CACHE_DEFAULT} (on).
    */
-  persistentCache?: boolean;
-  /** The persistent cache's root (`--cache-dir`). */
+  persistPagedCache?: PersistPagedCache;
+  /** SSD state tier quota the spawned `mlx serve` loads with (`--max-cache-disk`, its native text). */
+  cacheDisk?: string;
+  /** The persistent state tier's root (`--cache-dir`). */
   cacheDir?: string;
   /** Test seam: custom spawn for the agent binary. */
   spawnAgent?: (bin: string, argv: string[], opts: SpawnOptions) => ChildProcess;
@@ -1722,6 +1729,7 @@ function spawnInferenceServer(opts: GrokAgentLaunchOptions): { child: ChildProce
     '0',
     // `=` form: a base64url token can start with `-`, which parseArgs reads as a flag.
     `--auth-token=${token}`,
+    persistPagedCacheFlag(resolvePersistPagedCache(opts.persistPagedCache ?? PERSIST_PAGED_CACHE_DEFAULT)),
     ...(opts.modelsDir ? ['--models-dir', opts.modelsDir] : []),
     ...(opts.preloadModel !== undefined ? ['--preload', opts.preloadModel] : []),
     ...(opts.kvFormat !== undefined ? ['--kv-format', opts.kvFormat] : []),
@@ -1730,8 +1738,6 @@ function spawnInferenceServer(opts: GrokAgentLaunchOptions): { child: ChildProce
     ...(opts.decodeShare !== undefined ? ['--decode-share', String(opts.decodeShare)] : []),
     ...(opts.idleReleaseSeconds !== undefined ? ['--idle-release', idleReleaseText(opts.idleReleaseSeconds)] : []),
     ...(opts.cacheDisk !== undefined ? ['--max-cache-disk', opts.cacheDisk] : []),
-    ...(opts.persistentCache === true ? ['--persistent-cache'] : []),
-    ...(opts.persistentCache === false ? ['--no-persistent-cache'] : []),
     ...(opts.cacheDir !== undefined ? [`--cache-dir=${opts.cacheDir}`] : []),
   ];
   const child = (opts.spawnServe ?? ((argv, so) => spawn(process.execPath, argv, so)))(serveArgv, {
