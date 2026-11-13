@@ -178,12 +178,15 @@ pub(crate) struct Qwen35MoeInner {
     gdn_root_cache_owner_id: Option<String>,
     gdn_root_cache_owner_is_explicit: bool,
     gdn_prefix_checkpoints: VecDeque<MoeGdnPrefixCheckpoint>,
-    /// The deepest ladder rung the governor refused RAM for this turn. It
-    /// goes to the cold tier only (Splash `publishStateToDisk`): this turn's
-    /// sidecar capture reads it, and the turn's end drops it. One rung, the
-    /// one the capture's deepest-boundary pick can use, so a refused host
-    /// holds at most one extra state.
-    gdn_unclaimed_rung: Option<MoeGdnPrefixCheckpoint>,
+    /// Per scheduled sequence (`None` = the serial lane), the deepest ladder
+    /// rung the governor refused RAM for this turn. It goes to the cold tier
+    /// only (Splash `publishStateToDisk`): the sequence's sidecar capture
+    /// reads it, and its turn's end drops it, so a refused host holds at most
+    /// one extra state per live sequence. Keyed by sequence, not
+    /// `active_cache_owner_id`: the scheduler sets that only at admission, so
+    /// under overlap it names the last admitted owner, while each prefill
+    /// slice and turn end activates its own sequence (one per owner).
+    gdn_unclaimed_rungs: HashMap<Option<SeqId>, MoeGdnPrefixCheckpoint>,
     gdn_last_history_checkpoint: Option<MoeGdnHistoryCheckpoint>,
     /// The replay point each running turn restored from (Splash
     /// `StateCache::useState`): no reclaim unit until its use ends.

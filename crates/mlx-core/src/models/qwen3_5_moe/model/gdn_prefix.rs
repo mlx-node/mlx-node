@@ -130,11 +130,10 @@ impl Qwen35MoeInner {
         match finalize_result {
             Ok(_) => {
                 self.capture_moe_gdn_cold_sidecar(image_token_positions, cache_salt);
-                self.gdn_unclaimed_rung = None;
+                self.gdn_unclaimed_rungs.remove(&self.active_scheduled_seq);
                 Ok(())
             }
             Err(error) => {
-                self.gdn_unclaimed_rung = None;
                 self.invalidate_moe_paged_session("manual finalization failure");
                 Err(Error::from_reason(format!(
                     "MoE paged finalization failed: {error}"
@@ -366,11 +365,12 @@ impl Qwen35MoeInner {
         };
         if !claimed {
             let keep_older = self
-                .gdn_unclaimed_rung
-                .as_ref()
+                .gdn_unclaimed_rungs
+                .get(&self.active_scheduled_seq)
                 .is_some_and(|kept| kept.prefix_len > prefix_len);
             if !keep_older {
-                self.gdn_unclaimed_rung = Some(rung);
+                self.gdn_unclaimed_rungs
+                    .insert(self.active_scheduled_seq, rung);
             }
             return false;
         }
@@ -576,7 +576,7 @@ impl Qwen35MoeInner {
         let checkpoints: VecDeque<&MoeGdnPrefixCheckpoint> = self
             .gdn_prefix_checkpoints
             .iter()
-            .chain(&self.gdn_unclaimed_rung)
+            .chain(self.gdn_unclaimed_rungs.get(&self.active_scheduled_seq))
             .collect();
         crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar(
             "qwen3_5_moe",

@@ -812,7 +812,7 @@ impl PagedBackend for Qwen35MoeInner {
         if finalize_error.is_none() {
             self.capture_moe_gdn_cold_sidecar(&self.cached_paged_image_token_positions, cache_salt);
         }
-        self.gdn_unclaimed_rung = None;
+        self.gdn_unclaimed_rungs.remove(&self.active_scheduled_seq);
         // Always attempt the release for the non-reuse path, even when
         // registration failed (mirrors the prior `register_error.or(release)`).
         if release_pending && let Some(adapter) = self.paged_adapter.as_mut() {
