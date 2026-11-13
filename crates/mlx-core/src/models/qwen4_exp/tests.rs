@@ -1,5 +1,7 @@
 use super::*;
 use std::sync::atomic::Ordering;
+#[path = "prefix_reuse_tests.rs"]
+mod prefix_reuse;
 fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp")
 }
@@ -56,6 +58,12 @@ pub(super) fn go_live(decoder: &mut decoder::Decoder, anonymous_need: u64) {
 /// experts and a minimal embedded tokenizer. The returned config matches the
 /// widened routed geometry used by the GGUF metadata.
 pub(super) fn write_direct_gguf_fixture(path: &Path) -> config::Config {
+    write_direct_gguf_fixture_typed(path, [1, 3, 4, 4, 4, 4])
+}
+
+/// [`write_direct_gguf_fixture`] with `token_types` for its vocabulary
+/// `old`, `<|im_end|>`, `<tool_call>`, `</tool_call>`, `<think>`, `</think>`.
+fn write_direct_gguf_fixture_typed(path: &Path, token_types: [i32; 6]) -> config::Config {
     use crate::utils::gguf::{GgufMetaValue, GgufTensorType, parse_gguf};
     use crate::utils::gguf_test_fixtures::build_minimal_gguf;
 
@@ -117,11 +125,22 @@ pub(super) fn write_direct_gguf_fixture(path: &Path) -> config::Config {
         ("tokenizer.ggml.model", GgufMetaValue::String("gpt2".into())),
         (
             "tokenizer.ggml.tokens",
-            GgufMetaValue::ArrayString(vec!["old".into()]),
+            GgufMetaValue::ArrayString(
+                [
+                    "old",
+                    "<|im_end|>",
+                    "<tool_call>",
+                    "</tool_call>",
+                    "<think>",
+                    "</think>",
+                ]
+                .map(String::from)
+                .to_vec(),
+            ),
         ),
         (
             "tokenizer.ggml.token_type",
-            GgufMetaValue::ArrayI32(vec![1]),
+            GgufMetaValue::ArrayI32(token_types.to_vec()),
         ),
         (
             "tokenizer.ggml.merges",
@@ -1503,6 +1522,62 @@ fn flash_next_load_writes_no_derived_weight_pack() {
     eprintln!("fresh Flash Next load wrote non-weight assets only: {observed:?}");
 }
 
+/// Production load of a checkpoint whose `<tool_call>` row is CONTROL: the
+/// load fails at the tag check, naming the tag, before it plans memory.
+/// MUTATION: the load skips `check_tokenizer_tags` → red.
+#[test]
+fn load_refuses_a_checkpoint_whose_tool_call_tag_is_control() {
+    const CHILD: &str = "MLX_QWEN4_TAG_CHILD";
+    const MODEL: &str = "MLX_QWEN4_TAG_MODEL";
+    const REFUSED: &str = "qwen4 tag check refused the load: ";
+    if std::env::var_os(CHILD).is_some() {
+        let model_path = std::env::var(MODEL).unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                match Qwen4ExpModel::load(model_path, None).await {
+                    Ok(model) => {
+                        model.thread.shutdown_and_join().unwrap();
+                        panic!("a CONTROL <tool_call> row loaded");
+                    }
+                    Err(error) => println!("{REFUSED}{}", error.reason),
+                }
+            });
+        return;
+    }
+    let temp = Temp::new();
+    let model = temp.0.join("control-tag.gguf");
+    write_direct_gguf_fixture_typed(&model, [1, 3, 3, 4, 4, 4]);
+    let home = temp.0.join("fresh-research-home");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "models::qwen4_exp::tests::load_refuses_a_checkpoint_whose_tool_call_tag_is_control",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env(MODEL, &model)
+        .env(memory::FIXTURE_HOST_ENV, "1")
+        .env("HOME", &home)
+        .env("MLX_NATIVE_GGUF_CACHE_DIR", home.join("native-gguf"))
+        .env_remove("MLX_QWEN4_RESIDENCY")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let reason = stdout
+        .lines()
+        .find_map(|line| line.split_once(REFUSED).map(|(_, reason)| reason))
+        .unwrap_or_else(|| {
+            panic!(
+                "the load was not refused:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    assert!(reason.contains("\"<tool_call>\""), "{reason}");
+}
+
 fn gguf_string(bytes: &mut Vec<u8>, s: &str) {
     bytes.extend_from_slice(&(s.len() as u64).to_le_bytes());
     bytes.extend_from_slice(s.as_bytes());
@@ -2516,7 +2591,7 @@ fn tiny_inner() -> Inner {
 }
 
 /// The paged fixture with the MTP head, before the load's last step.
-fn tiny_decoder() -> (decoder::Decoder, media::Vision) {
+pub(super) fn tiny_decoder() -> (decoder::Decoder, media::Vision) {
     let path = fixture().join("bf16/paged");
     let raw = serde_json::from_slice(&std::fs::read(path.join("config.json")).unwrap()).unwrap();
     let c = config::Config::parse(&raw).unwrap();
@@ -2560,6 +2635,7 @@ fn inner_over(mut decoder: decoder::Decoder, vision: media::Vision, has_mtp: boo
         open_turns: Default::default(),
         exclusive_turn: false,
         wired: None,
+        prefix_states: prefix_state::States::new(None),
     }
 }
 
@@ -2828,48 +2904,89 @@ fn scheduled_turns_open_at_admission_and_close_when_they_finish() {
     assert!(!state.inner.exclusive_turn);
 }
 
-/// The prefill window follows the plan in force: a host that leaves less
-/// beside the store than the load saw halves it, and the next turn to open
-/// prefills with the window that host admits, not the load's.
-///
-/// MUTATION: `open_turn` keeps `decoder.prefill_chunk_size`;
-/// the window stays at the load's value.
+/// A route miss on request A sets A's cooldown; B starts with none while A
+/// is parked, and A resumes with its own and counts it down on its next
+/// token. Every replay, of a decode token or a prefill window, counts once in
+/// the live counters.
+/// MUTATION: `take_state` parks a row with a zero cooldown → red (A resumes
+/// at 0).
 #[test]
-fn a_turn_opens_with_the_prefill_window_of_the_plan_in_force() {
+fn a_route_miss_keeps_its_cooldown_across_row_switches() {
     use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
-    use std::sync::atomic::Ordering;
     let mut inner = tiny_inner();
-    let config = Arc::clone(&inner.decoder.config);
-    let admitted = inner.decoder.prefill_chunk_size;
-    let context = inner.decoder.context_window;
-    assert_eq!(
-        admitted,
-        memory::prefill_window(&config, &inner.decoder.weights.plan, context)
-    );
-    assert!(admitted >= 4);
-    let mut plan = inner.decoder.weights.plan.clone();
-    plan.partial_direct_gate = false;
-    plan.physical_bytes = Some(16 << 30);
-    plan.available_bytes = Some(
-        plan.budget.saturating_sub(plan.direct_bytes)
-            + (4 << 30)
-            + memory::prefill_scratch(&config, admitted / 4, context),
-    );
-    let narrow = memory::prefill_window(&config, &plan, context);
-    assert_eq!(narrow, admitted / 4);
-    inner.decoder.weights.plan = plan;
-    inner.scheduled_turn_opened(1);
-    assert_eq!(inner.decoder.prefill_chunk_size, narrow);
-    assert_eq!(
+    let replays = |inner: &Inner| {
         inner
             .decoder
             .weights
             .live
-            .prefill_chunk_tokens
-            .load(Ordering::Acquire),
-        narrow as u64
+            .route_replays
+            .load(Ordering::Relaxed)
+    };
+    inner.activate_paged_seq(1).unwrap();
+    for token in [3, 4, 5] {
+        inner.decoder.step(token).unwrap();
+    }
+    let base = inner.decoder.snapshot();
+    inner.decoder.step(11).unwrap();
+    inner.decoder.replay_device_token(base, 7, true).unwrap();
+    let cooldown = inner.decoder.device_route_cooldown;
+    assert!(cooldown > 0, "a miss sets the cooldown");
+    assert_eq!(replays(&inner), 1);
+    inner.activate_paged_seq(2).unwrap();
+    assert_eq!(inner.decoder.device_route_cooldown, 0, "B starts with none");
+    inner.decoder.step(6).unwrap();
+    inner.activate_paged_seq(1).unwrap();
+    assert_eq!(
+        inner.decoder.device_route_cooldown, cooldown,
+        "A resumes with its own cooldown"
     );
-    inner.scheduled_turn_closed(1);
+    inner.decoder.step(8).unwrap();
+    assert_eq!(inner.decoder.device_route_cooldown, cooldown - 1);
+    let base = inner.decoder.snapshot();
+    inner.decoder.prefill_chunk(&[11; 5], None, true).unwrap();
+    inner
+        .decoder
+        .replay_device_prefill(base, &[3, 4, 5, 6, 7], None, true)
+        .unwrap();
+    assert_eq!(replays(&inner), 2);
+    assert_eq!(inner.decoder.device_route_cooldown, cooldown - 1);
+}
+
+/// A store the host gate refused prefills each pass at the rows whose
+/// scratch fits the gate's reservation at that pass's length: the first
+/// passes keep the admitted window and the later, longer ones halve, in the
+/// exclusive and the paged loops alike. Every other store keeps the window.
+///
+/// MUTATION: the paged loop reads `prefill_slice_size` instead of
+/// `prefill_pass_window` → red (every pass keeps 32 rows).
+#[test]
+fn a_refused_gate_halves_only_the_passes_past_its_reservation() {
+    let prompt: Vec<u32> = (0..96).map(|i| 3 + (i % 10) as u32).collect();
+    for paged in [false, true] {
+        let mut inner = tiny_inner();
+        let rows = prefill_pass_rows(&mut inner, paged, &prompt, 32, 32);
+        assert_eq!(rows, [32; 3]);
+
+        let mut inner = tiny_inner();
+        let config = Arc::clone(&inner.decoder.config);
+        let reserved = memory::prefill_scratch(&config, 32, 64);
+        inner.decoder.host_prefill_scratch = Some(reserved);
+        let mut expected = Vec::new();
+        let mut base = 0;
+        while base < prompt.len() {
+            let window = 32.min(memory::prefill_window(&config, Some(reserved), base + 32));
+            let rows = window.min(prompt.len() - base);
+            expected.push(rows);
+            base += rows;
+        }
+        assert_eq!(&expected[..2], [32, 32]);
+        assert!(expected[2] < 32, "{expected:?}");
+        assert_eq!(
+            prefill_pass_rows(&mut inner, paged, &prompt, 32, 32),
+            expected,
+            "paged {paged}"
+        );
+    }
 }
 
 /// Rows of every prefill pass over `prompt` when the admitted window is cut
@@ -4398,19 +4515,21 @@ fn hyper_up_preserves_native_sigmoid_halfway_rounding() {
     assert_eq!(&*actual, &*expected);
 }
 
+/// The window is sized from checkpoint dimensions against the reserved
+/// scratch alone: wider dimensions and a dominant PLE stage narrow it under
+/// the same reservation, and a smaller reservation narrows it.
 #[test]
-fn prefill_bootstrap_uses_dimensions_and_live_headroom() {
+fn prefill_window_uses_dimensions_against_the_reserved_scratch() {
     let raw =
         serde_json::from_slice(&std::fs::read(fixture().join("config.json")).unwrap()).unwrap();
     let mut config = config::Config::parse(&raw).unwrap();
-    let mut plan = weights::Store::open_metadata(&fixture(), None)
-        .unwrap()
-        .plan;
-    plan.budget = 32 << 30;
-    plan.available_bytes = Some(52 << 30);
-    plan.physical_bytes = Some(128 << 30);
     let context = config.max_position_embeddings;
-    let small = memory::prefill_window(&config, &plan, context);
+    let transient = Some(memory::prefill_scratch(
+        &memory::flash_next_config(),
+        MAX_PREFILL_CHUNK,
+        context,
+    ));
+    let small = memory::prefill_window(&config, transient, context);
     config.hidden_size = 8192;
     config.hc_count = 4;
     config.moe_intermediate_size = 4096;
@@ -4418,17 +4537,17 @@ fn prefill_bootstrap_uses_dimensions_and_live_headroom() {
     config.head_dim = 256;
     config.num_experts_per_tok = 10;
     config.indexer_budget = 2048;
-    let large = memory::prefill_window(&config, &plan, context);
+    let large = memory::prefill_window(&config, transient, context);
     assert!(large < small);
     let old_ple = config.ple_conv_kernel_size;
     config.ple_conv_kernel_size = 64;
     assert!(
-        memory::prefill_window(&config, &plan, context) < large,
+        memory::prefill_window(&config, transient, context) < large,
         "A dominant PLE stage must reduce the admitted window"
     );
     config.ple_conv_kernel_size = old_ple;
-    plan.available_bytes = Some((51 << 30) + (128 << 20));
-    assert!(memory::prefill_window(&config, &plan, context) < large);
+    let smaller = transient.map(|bytes| bytes / 2);
+    assert!(memory::prefill_window(&config, smaller, context) < large);
 }
 
 /// The MTP hidden norm is one RMS per hyper-connection stream: stretching a
@@ -9748,4 +9867,35 @@ fn token_major_page_gathers_read_the_stored_rows() {
             }
         }
     }
+}
+
+fn tag_tokenizer(overrides: &[(&str, i32)]) -> Qwen3Tokenizer {
+    let metadata = crate::utils::gguf_test_fixtures::qwen_tag_tokenizer_metadata(overrides);
+    let json = crate::utils::gguf::embedded_gpt2_tokenizer_json(&metadata)
+        .unwrap()
+        .unwrap();
+    let tokenizer = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&json).unwrap()).unwrap();
+    Qwen3Tokenizer::from_tokenizer(tokenizer, None).unwrap()
+}
+
+/// The load refuses a tokenizer whose reasoning or tool-call tag a
+/// skip-special decode drops, or that splits a tag or the turn end.
+#[test]
+fn load_refuses_tokenizers_that_lose_the_tags() {
+    check_tokenizer_tags(&tag_tokenizer(&[])).unwrap();
+    for (tag, kind) in [
+        ("<tool_call>", 3),
+        ("</think>", 3),
+        ("</tool_call>", 5),
+        ("<think>", 3),
+    ] {
+        let error = check_tokenizer_tags(&tag_tokenizer(&[(tag, kind)])).unwrap_err();
+        assert!(
+            error.reason.contains(&format!("{tag:?}")),
+            "{tag} type {kind}: {}",
+            error.reason
+        );
+    }
+    let error = check_tokenizer_tags(&tag_tokenizer(&[("<|im_end|>", 5)])).unwrap_err();
+    assert!(error.reason.contains("<|im_end|>"), "{}", error.reason);
 }

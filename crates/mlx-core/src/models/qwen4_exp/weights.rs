@@ -771,6 +771,13 @@ struct SafeDescriptor {
 }
 
 impl Store {
+    /// Count `bytes` read from the checkpoint files, here and in the live
+    /// counters `residencyInfo` reads.
+    pub(super) fn count_bytes_read(&mut self, bytes: u64) {
+        self.bytes_read += bytes;
+        self.live.bytes_read.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     pub(super) fn check_forward_headroom(&self) -> Result<()> {
         self.check_forward_headroom_with(|| {
             super::memory::check_growth_headroom(self.plan.use_direct_turn_floor())
@@ -1567,7 +1574,7 @@ impl Store {
         if !lookup {
             MxArray::eval_arrays_with_context(&arrays, "qwen4::weights::loaded")?;
         }
-        self.bytes_read += bytes;
+        self.count_bytes_read(bytes);
         self.retain_read(name, key, weight, lookup, rows)
     }
 
@@ -3795,6 +3802,22 @@ mod direct_tests {
             assert!(decoder.weights.slot_bytes <= bank_budget);
             assert!(decoder.weights.cache_bytes <= decoder.weights.cache_limit);
             assert!(decoder.weights.peak_cache_bytes <= decoder.weights.cache_limit);
+            // MUTATION: a slot miss left out of the live counters → red.
+            let live = &decoder.weights.live;
+            assert!(decoder.weights.slot_misses > 0 && decoder.weights.bytes_read > 0);
+            assert_eq!(
+                [
+                    live.slot_hits.load(Ordering::Relaxed),
+                    live.slot_misses.load(Ordering::Relaxed),
+                    live.bytes_read.load(Ordering::Relaxed),
+                ],
+                [
+                    decoder.weights.slot_hits,
+                    decoder.weights.slot_misses,
+                    decoder.weights.bytes_read,
+                ],
+                "residencyInfo reads the store's own counters"
+            );
             eprintln!(
                 "synthetic pressure row (not a real-model benchmark): live={live_gib} GiB, capacity={capacity}, prefill unique misses={unique}, slot bytes={}, text={actual:?}",
                 decoder.weights.slot_bytes,
@@ -3873,6 +3896,11 @@ mod direct_tests {
         assert_eq!(store.slot_bytes, allocated);
         assert_eq!(store.cache_bytes, allocated);
         assert_eq!(store.slot_misses, 0);
+        assert_eq!(
+            store.live.slot_hits.load(Ordering::Relaxed),
+            store.slot_hits,
+            "device-route hits reach the live counters"
+        );
     }
 
     #[test]

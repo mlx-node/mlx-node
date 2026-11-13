@@ -5898,6 +5898,20 @@ export interface Qwen4ExpResidencyInfo {
    */
   decodedRowEvictions: number;
   decodedRowEvictedBytes: number;
+  /** Routed experts the slots or banks served without a read since load. */
+  slotHits: number;
+  /** Routed experts a slot fill read from the checkpoint since load. */
+  slotMisses: number;
+  /**
+   * Bytes read from the checkpoint files since load (expert fills and row
+   * imports); the page cache may serve part of them.
+   */
+  checkpointBytesRead: number;
+  /**
+   * Decode tokens and prefill windows replayed after a tentative device
+   * route missed the slots.
+   */
+  routeReplays: number;
 }
 
 /** Result of text recognition. */

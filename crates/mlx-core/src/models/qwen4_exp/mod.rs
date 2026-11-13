@@ -13,6 +13,7 @@ mod memory;
 mod mtp;
 mod packed_cache;
 mod paged;
+mod prefix_state;
 mod route_plan;
 #[cfg(test)]
 mod route_replay;
@@ -50,6 +51,33 @@ use napi_derive::napi;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 
+/// Splash server/constraints.py `validate_tokenizer` (d8af1054): refuse a
+/// tokenizer that does not encode the reasoning and tool-call tags as one
+/// token each, or the turn end as one token. The finalize reads these tags in
+/// decoded text, so each must also survive a skip-special decode.
+fn check_tokenizer_tags(tokenizer: &Qwen3Tokenizer) -> Result<()> {
+    for tag in ["<think>", "</think>", "<tool_call>", "</tool_call>"] {
+        let ids = tokenizer.encode_sync(tag, Some(false))?;
+        let kept = match ids.as_slice() {
+            [id] => tokenizer.decode_sync(&[*id], true)? == tag,
+            _ => false,
+        };
+        if !kept {
+            return Err(Error::from_reason(format!(
+                "Qwen4Exp tokenizer: {tag:?} must be one token that a skip-special decode keeps \
+                 (it encodes to {ids:?}); without it the reasoning split and tool calls are lost"
+            )));
+        }
+    }
+    let ids = tokenizer.encode_sync("<|im_end|>", Some(false))?;
+    if ids.len() != 1 {
+        return Err(Error::from_reason(format!(
+            "Qwen4Exp tokenizer: the stop text \"<|im_end|>\" must be one token (it encodes to {ids:?})"
+        )));
+    }
+    Ok(())
+}
+
 struct Inner {
     decoder: decoder::Decoder,
     tokenizer: Arc<Qwen3Tokenizer>,
@@ -75,6 +103,8 @@ struct Inner {
     /// installed); it is one window of its own.
     exclusive_turn: bool,
     wired: Option<Arc<crate::stream::WiredResidency>>,
+    /// Stored states for warm prefix reuse and the running turns' points.
+    prefix_states: prefix_state::States,
 }
 
 impl Inner {
@@ -272,6 +302,12 @@ impl ChatBackend for Inner {
             self.rows.clear();
             self.active_seq = None;
             self.mtp = mtp::State::default();
+            self.prefix_states.clear();
+            if let Some(adapter) = &mut self.decoder.paged {
+                adapter
+                    .release_request_and_purge_prefix_cache()
+                    .map_err(Error::from_reason)?;
+            }
         }
         self.decoder.reset();
         self.saved_history.clear();
@@ -408,6 +444,16 @@ pub struct Qwen4ExpResidencyInfo {
     /// evictions released (a window's shared buffer goes with its last row).
     pub decoded_row_evictions: f64,
     pub decoded_row_evicted_bytes: f64,
+    /// Routed experts the slots or banks served without a read since load.
+    pub slot_hits: f64,
+    /// Routed experts a slot fill read from the checkpoint since load.
+    pub slot_misses: f64,
+    /// Bytes read from the checkpoint files since load (expert fills and row
+    /// imports); the page cache may serve part of them.
+    pub checkpoint_bytes_read: f64,
+    /// Decode tokens and prefill windows replayed after a tentative device
+    /// route missed the slots.
+    pub route_replays: f64,
 }
 
 #[napi(object)]
@@ -519,6 +565,11 @@ impl Qwen4ExpModel {
                         .to_str()
                         .ok_or_else(|| Error::from_reason("Non-UTF8 model path"))?,
                 )?);
+                check_tokenizer_tags(&tokenizer)?;
+                let turn_open = match tokenizer.encode_sync("<|im_start|>", Some(false))?[..] {
+                    [id] => Some(id),
+                    _ => None,
+                };
                 let defaults =
                     crate::engine::persistence::parse_generation_defaults(Path::new(&assets));
                 let live = memory::live_memory().ok_or_else(|| {
@@ -604,14 +655,16 @@ impl Qwen4ExpModel {
                     &memory_plan,
                     max_context.unwrap_or_else(|| config.served_context_tokens()),
                 )?;
-                decoder.context_window = context_limits.effective_window_tokens as usize;
                 decoder
                     .weights
                     .set_active_ceiling(memory_plan.ceiling_bytes());
                 decoder.weights.publish_live();
                 // Register the final budget and the prefill window of the
                 // planned context.
-                decoder.residency_changed();
+                decoder.adopt_plan(
+                    context_limits.effective_window_tokens as usize,
+                    decision.allowance_tokens,
+                );
                 let pool_guard = Some(pool_guard);
                 let residency = decoder.weights.plan.clone();
                 let live = Arc::clone(&decoder.weights.live);
@@ -634,6 +687,7 @@ impl Qwen4ExpModel {
                     open_turns: std::collections::HashSet::new(),
                     exclusive_turn: false,
                     wired: None,
+                    prefix_states: prefix_state::States::new(turn_open),
                 };
                 if let Some(adapter) = inner.decoder.paged.as_ref() {
                     adapter
@@ -761,6 +815,10 @@ impl Qwen4ExpModel {
             late_rows: self.lookup.late() as f64,
             decoded_row_evictions: self.lookup.evicted_rows() as f64,
             decoded_row_evicted_bytes: self.lookup.evicted_row_bytes() as f64,
+            slot_hits: live.slot_hits.load(Ordering::Relaxed) as f64,
+            slot_misses: live.slot_misses.load(Ordering::Relaxed) as f64,
+            checkpoint_bytes_read: live.bytes_read.load(Ordering::Relaxed) as f64,
+            route_replays: live.route_replays.load(Ordering::Relaxed) as f64,
         }
     }
     #[napi]
