@@ -124,7 +124,6 @@ pub(super) fn pool_input<'a>(
         explicit_mib: None,
         lane_in_pool: false,
         state,
-        state_in_pool: false,
     }
 }
 

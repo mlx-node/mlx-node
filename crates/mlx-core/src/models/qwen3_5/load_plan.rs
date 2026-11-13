@@ -28,7 +28,7 @@ use crate::utils::safetensors::{SafeTensorDType, SafeTensorsFile, checkpoint_saf
 
 use super::config::Qwen3_5Config;
 use super::dflash2::DFlash2Config;
-use super::dflash2_decode::pool_lane_transient;
+use super::dflash2_decode::{pool_decode_step_bytes, pool_lane_transient};
 use super::dflash2_turn::DFlash2Target;
 use super::persistence::{
     compute_dtype_of, mtp_sidecar_candidates, normalize_mtp_weight_key, qwen35_text_key,
@@ -196,26 +196,96 @@ pub(crate) struct LoadLanes<'a> {
     /// The load can run an MTP turn on the pool lane (MTP heads, no
     /// DFlash2 draft): the lane holds its draft state at the window.
     pub mtp: bool,
-    /// The scheduler books that state inside the pool as well.
-    pub mtp_state_in_pool: bool,
+    /// The most decode lanes the scheduler runs on this load
+    /// ([`qwen35_scheduler_lanes`]); the plan grants at most this many.
+    pub lanes: u32,
+    /// Bytes each decode row's MoE layers allocate past the dense view
+    /// (`Qwen3_5MoeConfig::decode_row_expert_bytes`); 0 for a dense model.
+    pub expert_row_bytes: u64,
 }
 
-/// Whether the hybrid scheduler serves this process's Qwen3.5 turns: it
-/// books lane state inside the pool.
-pub(crate) fn qwen35_scheduler_books_state_in_pool() -> bool {
-    super::model::Qwen35SchedulerState::continuous_batching_enabled()
+/// Physical memory from which a Qwen3.5 load may run the full hybrid
+/// live-state cap. A 256 GB Mac reports 256 GiB and a 192 GB Mac 192 GiB;
+/// 256 * 10^9 bytes lies between them.
+const ALL_LANES_PHYSICAL_BYTES: u64 = 256_000_000_000;
+
+/// Lane ceiling of every smaller machine, or of one whose memory is
+/// unreadable.
+const SMALL_MACHINE_LANES: usize = 4;
+
+/// The most decode lanes a Qwen3.5 load runs on a machine of
+/// `physical_bytes`: the hybrid live-state cap from 256 GB, 4 below.
+pub(crate) fn qwen35_lane_ceiling(physical_bytes: Option<u64>) -> usize {
+    let all = crate::engine::recurrent_state::HYBRID_LIVE_STATE_UNITS;
+    match physical_bytes {
+        Some(bytes) if bytes >= ALL_LANES_PHYSICAL_BYTES => all,
+        _ => SMALL_MACHINE_LANES.min(all),
+    }
+}
+
+/// The decode lanes the scheduler can run on a Qwen3.5 load: this machine's
+/// lane ceiling (`MLX_SCHED_MAX_NUM_SEQS` only lowers it), or one when every
+/// turn runs whole-turn.
+pub(crate) fn qwen35_scheduler_lanes() -> u32 {
+    if super::model::Qwen35SchedulerState::force_serial() {
+        1
+    } else {
+        crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for(qwen35_lane_ceiling(
+            crate::utils::host::physical_memory(),
+        )) as u32
+    }
+}
+
+/// Target rows of one decode step over `lanes` lanes, each at its widest
+/// step: one AR row, or the widest MTP verify the scheduler reserves
+/// (`MAX_DRAFTS` drafts and the anchor). A one-lane plan keeps the
+/// transient [`pool_lane_transient`] prices.
+fn decode_step_rows(lanes: u32, mtp: bool) -> u64 {
+    let per_lane = if mtp {
+        super::scheduled_mtp::MAX_DRAFTS as u64 + 1
+    } else {
+        1
+    };
+    u64::from(lanes.max(1)) * per_lane
 }
 
 /// Splash `evaluateEngineMemoryPlan` over `lanes` on the device `live`.
-/// A pool load prices one lane, whose state carries a DFlash2 draft's
-/// (Splash's one window for every turn); a load without a pool prices its
-/// footprint only.
+/// A pool load prices the first lane's state, which carries a DFlash2
+/// draft's (Splash's one window for every turn); the plan then grants the
+/// most decode lanes, up to `lanes.lanes`, whose states and joint decode
+/// step keep the one-lane window. Lanes give way first: the window never
+/// shrinks for a lane, and a load the one-lane plan admits always loads. A
+/// load without a pool prices its footprint only.
 pub(crate) fn evaluate_qwen35_plan(
     label: &str,
     lanes: &LoadLanes<'_>,
     live: LiveMemory,
     max_memory_bytes: Option<u64>,
 ) -> Result<MemoryPlan> {
+    let single = evaluate_qwen35_lanes(lanes, live, max_memory_bytes, 1)
+        .map_err(|error| Error::from_reason(error.message(label)))?;
+    let Some(window) = single.pool.map(|pool| pool.lane.window.maximum()) else {
+        return Ok(single);
+    };
+    for count in (2..=lanes.lanes).rev() {
+        if let Ok(plan) = evaluate_qwen35_lanes(lanes, live, max_memory_bytes, count)
+            && plan
+                .pool
+                .is_some_and(|pool| pool.lane.window.maximum() >= window)
+        {
+            return Ok(plan);
+        }
+    }
+    Ok(single)
+}
+
+/// The plan of `lanes` with the decode step of `count` lanes.
+fn evaluate_qwen35_lanes(
+    lanes: &LoadLanes<'_>,
+    live: LiveMemory,
+    max_memory_bytes: Option<u64>,
+    count: u32,
+) -> std::result::Result<MemoryPlan, PlanError> {
     let config = lanes.config;
     let draft = lanes.draft;
     let footprint = MemoryFootprint {
@@ -236,16 +306,34 @@ pub(crate) fn evaluate_qwen35_plan(
     let trained = config.served_context_tokens();
     let fa_layers = config.full_attention_layer_count();
     let draft_taps = draft.map(|draft| draft.tap_layers);
-    let pool_transient = |window| pool_lane_transient(config, draft_taps, window);
     let mtp = lanes.mtp;
-    // A DFlash2 turn runs alone on the Barrier lane, so its state is never
-    // booked in the pool.
+    let step_rows = decode_step_rows(count, mtp);
+    let pool_transient = |window| {
+        let one_lane = pool_lane_transient(config, draft_taps, window);
+        if count > 1 {
+            one_lane.max(
+                pool_decode_step_bytes(config, step_rows, window)
+                    .saturating_add(step_rows.saturating_mul(lanes.expert_row_bytes)),
+            )
+        } else {
+            one_lane
+        }
+    };
     let draft_state =
         draft.map(|draft| dflash2_lane_state_bytes(recurrent_state_bytes, draft.lane_bytes));
-    let lane_state = |window: u32| match draft_state {
-        Some(bytes) => bytes,
-        None if mtp => super::scheduled_mtp::ScheduledMtpState::held_bytes(config, window),
-        None => 0,
+    let mtp_state = |window: u32| {
+        if mtp {
+            super::scheduled_mtp::ScheduledMtpState::held_bytes(config, window)
+        } else {
+            0
+        }
+    };
+    // Each lane past the first holds its own GDN state and, on an MTP load,
+    // its own draft state at the full window.
+    let lane_state = |window: u32| {
+        let first = draft_state.unwrap_or_else(|| mtp_state(window));
+        let other = recurrent_state_bytes.saturating_add(mtp_state(window));
+        first.saturating_add(other.saturating_mul(u64::from(count.max(1) - 1)))
     };
     let pool_input = lanes.pool.map(|geometry| {
         let layout = KvLayout::of(
@@ -274,11 +362,13 @@ pub(crate) fn evaluate_qwen35_plan(
             explicit_mib: geometry.explicit_mib,
             lane_in_pool: true,
             state: &lane_state,
-            state_in_pool: mtp && lanes.mtp_state_in_pool,
         }
     });
-    MemoryPlan::evaluate(footprint, pool_input)
-        .map_err(|error| Error::from_reason(error.message(label)))
+    let mut plan = MemoryPlan::evaluate(footprint, pool_input)?;
+    if let Some(pool) = plan.pool.as_mut() {
+        pool.lanes = count;
+    }
+    Ok(plan)
 }
 
 /// Every turn's window: the pool lane's.
@@ -339,7 +429,8 @@ pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
         pool,
         draft: draft.map(|draft| DraftTerms::of(&draft.config, draft.weight_bytes)),
         mtp: mtp_weights && draft.is_none(),
-        mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
+        lanes: qwen35_scheduler_lanes(),
+        expert_row_bytes: target.decode_row_expert_bytes(),
     };
     let plan = evaluate_qwen35_plan(label, &lanes, live, max_memory_bytes)?;
     check_qwen35_max_context(label, &plan, max_context)?;
@@ -662,14 +753,15 @@ pub(crate) fn estimate_qwen35_load(
     input: &EstimateInput<'_>,
 ) -> Result<Option<Qwen35ContextEstimate>> {
     let raw = read_config_json(input.asset_dir)?;
-    let (mut config, mtp_body) = if input.moe {
+    let (mut config, mtp_body, expert_row_bytes) = if input.moe {
         let moe = crate::models::qwen3_5_moe::persistence::parse_config(&raw)?;
         let body = crate::models::qwen3_5_moe::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&moe);
-        (moe.to_dense_config(), body)
+        (moe.to_dense_config(), body, moe.decode_row_expert_bytes())
     } else {
         (
             crate::models::qwen3_5::persistence::parse_config(&raw)?,
             DrafterBodyVariant::Dense,
+            0,
         )
     };
     config.rope_scaling = Some(RopeScaling::served_for(
@@ -761,7 +853,8 @@ pub(crate) fn estimate_qwen35_load(
         pool,
         draft,
         mtp: mtp_head && draft.is_none(),
-        mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
+        lanes: qwen35_scheduler_lanes(),
+        expert_row_bytes,
     };
     let plan = evaluate_qwen35_plan(label, &lanes, live, input.max_memory_bytes)?;
     check_qwen35_max_context(label, &plan, input.max_context)?;

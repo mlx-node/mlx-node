@@ -9,15 +9,12 @@
  * are tested as data rather than observed as behaviour.
  */
 
-import { readFileSync } from 'node:fs';
 import { extname } from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vite-plus/test';
 
-import { controlPanelEnvOverrides, sidecarEnginePolicyEnv, sidecarEnvOverrides } from '../src/main/child-env.js';
+import { controlPanelEnvOverrides, sidecarEnvOverrides } from '../src/main/child-env.js';
 import { resolveAppPaths } from '../src/main/paths.js';
-import { buildChildEnv } from '../src/main/supervisor/env.js';
 
 const ADDON = '/Applications/mlx-node.app/Contents/Resources/native/mlx-core.darwin-arm64.node';
 
@@ -86,30 +83,5 @@ describe('the addon path the app will actually use', () => {
       const env = sidecarEnvOverrides({ nativeAddon: paths.nativeAddon, modelsDir: null });
       expect(extname(env.NAPI_RS_NATIVE_LIBRARY_PATH), `packaged=${packaged}`).toBe('.node');
     }
-  });
-});
-
-describe('sidecarEnginePolicyEnv', () => {
-  const fork = (baseEnv: NodeJS.ProcessEnv) =>
-    buildChildEnv({
-      baseEnv,
-      enginePolicyEnv: sidecarEnginePolicyEnv(),
-      traceFile: '/trace/native.log',
-      turnJournal: '/trace/journal',
-      quarantined: new Set(),
-    });
-
-  it('turns concurrent turns on for every scheduled family', () => {
-    expect(sidecarEnginePolicyEnv()).toEqual({ MLX_PAGED_PREFILL_CHUNK_SIZE: '2048', MLX_CONTINUOUS_BATCHING: '1' });
-    expect(fork({}).MLX_CONTINUOUS_BATCHING).toBe('1');
-  });
-
-  it('lets the user shell turn it off', () => {
-    expect(fork({ MLX_CONTINUOUS_BATCHING: '0' }).MLX_CONTINUOUS_BATCHING).toBe('0');
-  });
-
-  it('is the policy MAIN hands to the supervisor', () => {
-    const main = readFileSync(fileURLToPath(new URL('../src/main/index.ts', import.meta.url)), 'utf8');
-    expect(main).toContain('enginePolicyEnv: sidecarEnginePolicyEnv(),');
   });
 });

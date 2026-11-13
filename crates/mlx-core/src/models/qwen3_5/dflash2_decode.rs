@@ -347,6 +347,19 @@ pub(crate) fn pool_lane_transient(
     }
 }
 
+/// One decode step of `rows` target rows over `window` keys, the rows of
+/// every lane in the step together: logits, GDN tapes, one layer's scratch
+/// and the attention partials. One row is the single-lane AR step
+/// [`pool_lane_transient`] prices.
+pub(crate) fn pool_decode_step_bytes(
+    config: &super::config::Qwen3_5Config,
+    rows: u64,
+    window: u32,
+) -> u64 {
+    let block = usize::try_from(rows.max(1) - 1).unwrap_or(usize::MAX);
+    dflash2_cycle_transient(config, block, u64::from(window)).total()
+}
+
 /// The pending GDN tape a DFlash2 lane holds between cycles: per linear
 /// layer, 8 rows of raw conv inputs, k and v (bf16), decay (f32) and beta
 /// (bf16) (Splash `gdn_tape_layer_bytes`). The verify's own tape is in the
@@ -1852,6 +1865,12 @@ mod paged_dflash2_tests {
     /// launch).
     #[test]
     fn verify_takes_the_verify_split_rule() -> Result<()> {
+        // The launch probe counts every paged prefill in the process.
+        if !crate::test_support::in_own_process(
+            "models::qwen3_5::dflash2_decode::paged_dflash2_tests::verify_takes_the_verify_split_rule",
+        ) {
+            return Ok(());
+        }
         if crate::test_support::paged_prefill_unsupported("verify_takes_the_verify_split_rule") {
             return Ok(());
         }

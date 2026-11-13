@@ -234,8 +234,9 @@ fn every_load_starts_at_the_runway() {
         assert!(runway < pool.max_blocks, "draft={draft}");
         assert_eq!(adapter.memory_ceiling(), Some(plan.ceiling_bytes()));
         assert_eq!(inner.pool_context_limit(), pool.lane.window.maximum());
+        // Without a draft the lane holds one GDN state per granted lane.
         assert_eq!(
-            pool.lane.lane_bytes > inner.config.recurrent_state_bytes(),
+            pool.lane.lane_bytes > inner.config.recurrent_state_bytes() * u64::from(pool.lanes),
             draft,
             "the draft state rides the pool lane"
         );
@@ -289,6 +290,13 @@ fn explicit_pool_size_above_the_plan_fails_load() {
 /// ("gpu_memory_mb too small").
 #[test]
 fn pool_below_the_config_floor_loads() {
+    // Its 1,200 MiB budget lowers the process-wide governor limit for every
+    // load beside it.
+    if !crate::test_support::in_own_process(
+        "models::qwen3_5_moe::model::paged_construction_tests::pool_below_the_config_floor_loads",
+    ) {
+        return;
+    }
     for (explicit_mib, max_memory) in [(None, Some(1_200 << 20)), (Some(128), None)] {
         let mut cfg = tiny_paged_forward_moe_cfg();
         cfg.paged_cache_memory_mb = explicit_mib;

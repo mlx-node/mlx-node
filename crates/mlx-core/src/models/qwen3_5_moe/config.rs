@@ -170,6 +170,31 @@ impl Qwen3_5MoeConfig {
         self.to_dense_config().recurrent_state_bytes()
     }
 
+    /// Bytes one decode row's MoE layer allocates that the dense view does
+    /// not price: the top-k gathered inputs, the gate / up / SwiGLU and down
+    /// outputs with their unsort and weighting copies, the shared expert's
+    /// gate / up / SwiGLU (all bf16), and the router's bf16 logits and f32
+    /// probabilities.
+    pub(crate) fn decode_row_expert_bytes(&self) -> u64 {
+        let dim = |v: i32| v.max(0) as u64;
+        let top_k = dim(self.num_experts_per_tok);
+        let hidden = dim(self.hidden_size);
+        let expert = dim(self.moe_intermediate_size.unwrap_or(self.intermediate_size));
+        let shared = dim(self
+            .shared_expert_intermediate_size
+            .unwrap_or(self.intermediate_size));
+        let elements = top_k
+            .saturating_mul(
+                hidden
+                    .saturating_mul(4)
+                    .saturating_add(expert.saturating_mul(3)),
+            )
+            .saturating_add(shared.saturating_mul(3));
+        elements
+            .saturating_mul(2)
+            .saturating_add(dim(self.num_experts).saturating_mul(6))
+    }
+
     /// Convert to a dense Qwen3_5Config for shared types (attention, GatedDeltaNet)
     /// that expect the dense config struct.
     pub fn to_dense_config(&self) -> crate::models::qwen3_5::Qwen3_5Config {

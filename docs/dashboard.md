@@ -551,7 +551,7 @@ and also holds other turns' decode steps.
 `schedulerStats()` is a scheduler barrier, so the sampler never calls it on a model with work: it goes through
 `SessionRegistry.tryIdleProbe`, which holds any dispatch that arrives until the reply settles. Scheduler counters are
 cumulative, so the difference of two idle snapshots is exact for the burst between them. A turn in the one-turn-at-a-time
-lane moves no scheduler counter (Qwen3.5 dense and MoE without `MLX_CONTINUOUS_BATCHING=1`, DFlash2 and other barrier
+lane moves no scheduler counter (any family under `MLX_SERVE_FORCE_SERIAL=1`, DFlash2 and other barrier
 turns), so `turns` against `admitted` tells such a model from an idle scheduler; a record without `turns` reads as
 unknown. Live concurrency comes from TS-side state. At 16 MiB a series file takes only `load` and `exit` records (each still led by this process's
 `proc` header when the file has none from it yet); `sample`, `sched` and `proc` records are dropped until the next

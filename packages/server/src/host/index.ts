@@ -821,7 +821,6 @@ export {
 } from './persist-cache.js';
 export {
   applyEnginePolicy,
-  DESKTOP_ENGINE_POLICY,
   engineEnvFor,
   ENGINE_POLICY_ENV_VARS,
   LAUNCHER_ENGINE_POLICY,

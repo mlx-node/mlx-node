@@ -296,8 +296,8 @@ describe('MAIN never links the native addon', () => {
     // native-free leaves (ADDON_FREE_SUBPATHS), walked into, never offenders.
     expect(graph.packages).toEqual([
       '@mlx-node/lm/model-discovery',
-      '@mlx-node/server/host/paths',
       '@mlx-node/server/host/env-policy',
+      '@mlx-node/server/host/paths',
       '@mlx-node/rerank/families',
     ]);
   });

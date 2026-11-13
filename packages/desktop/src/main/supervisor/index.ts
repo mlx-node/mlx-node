@@ -135,7 +135,7 @@ export interface SupervisorOptions {
    * wrong one ship by omission.
    */
   transport: ChildTransport;
-  /** Normally `sidecarEnginePolicyEnv()`. See `env.ts` for why it is passed in. */
+  /** Normally `engineEnvFor(LAUNCHER_ENGINE_POLICY)`. See `env.ts` for why it is passed in. */
   enginePolicyEnv?: Readonly<Record<string, string>>;
   /** Supervisor-chosen env that must beat the user's shell. */
   env?: Readonly<Record<string, string>>;

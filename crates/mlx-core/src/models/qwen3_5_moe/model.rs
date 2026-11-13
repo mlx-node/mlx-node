@@ -314,6 +314,8 @@ pub struct Qwen3_5MoeModel {
     /// construction time: every load on Metal has the adapter; a load off
     /// Metal has none. Surfaced through the `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
+    /// The decode lanes the load's memory plan granted.
+    pub(crate) scheduled_lanes: u32,
     /// Snapshot of `Qwen35MoeInner::has_mtp_weights()` captured at
     /// construction time, mirroring `paged_active`. Surfaced through the
     /// `hasMtpWeights()` NAPI method so the TS ChatSession can auto-default
@@ -390,14 +392,10 @@ impl Qwen3_5MoeModel {
     /// admission policy instead of using this plain autoregressive width.
     #[napi]
     pub fn max_concurrent_sequences(&self) -> u32 {
-        if self.paged_active
-            && Qwen35MoeSchedulerState::continuous_batching_enabled()
-            && !Qwen35MoeSchedulerState::force_serial()
-        {
-            crate::engine::hybrid_scheduler::scheduler_max_num_seqs() as u32
-        } else {
-            1
-        }
+        crate::models::qwen3_5::model::qwen35_max_concurrent_sequences(
+            self.paged_active,
+            self.scheduled_lanes,
+        )
     }
 
     /// Test-only: snapshot the paged-MTP GDN bookkeeping between turns.
