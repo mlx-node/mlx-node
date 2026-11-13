@@ -1242,8 +1242,9 @@ fn moe_manual_paged_finalize_reaches_the_gdn_sidecar_capture() {
 /// MoE mirror of the dense case: a host short of spare memory refuses a
 /// ladder rung its RAM claim (`HostRule::admits`), so the rung goes to the
 /// cold tier through the turn's sidecar capture instead (Splash
-/// `publishStateToDisk`) and never into RAM. Only the deepest refused rung
-/// is held until the capture: rungs 16 and 32, then 16 again, leave 32.
+/// `publishStateToDisk`) and never into RAM. With the capture walk reaching
+/// the whole prompt only the deepest refused rung is held until the capture:
+/// rungs 16 and 32, then 16 again, leave 32.
 ///
 /// Mutation F4: drop the refused rung → no rung is held and the capture
 /// finds no checkpoint → red.
@@ -1293,6 +1294,70 @@ fn moe_rung_refused_ram_still_reaches_the_cold_tier() {
     assert!(
         inner.gdn_unclaimed_rungs.is_empty(),
         "the turn's end drops the refused rung"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// MoE mirror: with a one-block capture budget the refused rungs 16, 32 and
+/// 48 leave 48 (the deepest) and 16 (the deepest the walk reaches), and the
+/// capture anchors at 16.
+///
+/// Mutation: hold only the deepest refused rung → the held set is
+/// `[(None, 48)]` and the capture finds no checkpoint within the one-block
+/// chain → red.
+#[test]
+fn moe_refused_rung_within_the_capture_reach_reaches_the_cold_tier() {
+    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
+        "moe_refused_rung_within_the_capture_reach_reaches_the_cold_tier",
+    ) else {
+        return;
+    };
+    let root = moe_temp_cold_root("moe-refused-rung-within-reach");
+    install_moe_gdn_cold_tier(&mut inner, &root);
+    moe_refuse_optional_claims(&mut inner);
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("paged_adapter")
+        .set_cold_capture_budget(crate::transformer::cold_tier::ColdCaptureBudget {
+            max_blocks: 1,
+            max_walk: std::time::Duration::from_secs(60),
+        });
+    let prompt: Vec<u32> = (0u32..48).collect();
+    record_whole_moe_paged_request(&mut inner, &prompt);
+
+    let extra_keys = engine::build_paged_extra_keys(prompt.len(), 16, &[]);
+    let rungs = vec![
+        moe_zero_gdn_rung(&inner, 16),
+        moe_zero_gdn_rung(&inner, 32),
+        moe_zero_gdn_rung(&inner, 48),
+    ];
+    inner.publish_moe_gdn_materialized_prefix_checkpoint(&prompt, &extra_keys, 0, rungs);
+    assert_eq!(
+        moe_held_rungs(&inner),
+        vec![(None, 16), (None, 48)],
+        "the deepest refused rung and the deepest within the capture reach are held"
+    );
+
+    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
+    let before = crate::cold_tier::cold_sidecar_telemetry();
+    inner
+        .finalize_moe_manual_paged_turn(&[], 0)
+        .expect("manual paged finalization must succeed");
+    let after = crate::cold_tier::cold_sidecar_telemetry();
+    assert_eq!(
+        after.boundary_skips, before.boundary_skips,
+        "the rung within the capture reach must anchor the sidecar"
+    );
+    assert_eq!(
+        after.enqueued,
+        before.enqueued + 1,
+        "the rung within the capture reach must reach the cold tier"
+    );
+    assert!(
+        inner.gdn_unclaimed_rungs.is_empty(),
+        "the turn's end drops the refused rungs"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -1396,7 +1461,7 @@ fn moe_held_rungs(inner: &Qwen35MoeInner) -> Vec<(Option<SeqId>, u32)> {
     let mut held: Vec<_> = inner
         .gdn_unclaimed_rungs
         .iter()
-        .map(|(seq_id, rung)| (*seq_id, rung.prefix_len))
+        .flat_map(|(seq_id, rungs)| rungs.iter().map(|rung| (*seq_id, rung.prefix_len)))
         .collect();
     held.sort_unstable();
     held

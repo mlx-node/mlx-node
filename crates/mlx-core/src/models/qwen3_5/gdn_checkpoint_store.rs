@@ -300,6 +300,39 @@ impl<T: GdnCheckpointLineage> GdnCheckpointLineage for &T {
     }
 }
 
+/// Add `rung`, a ladder rung the governor refused RAM for, to the ones a
+/// sequence holds until its turn-end sidecar capture, and keep at most two:
+/// the deepest, and the deepest at or below `reach_tokens`, the reach
+/// predicted for this turn's K/V capture walk. The capture anchors only at or
+/// below the walk's reach, so a deepest rung past it alone persists nothing.
+/// On equal depth the newer rung wins.
+pub(crate) fn hold_refused_rung<T: GdnCheckpointLineage>(
+    held: &mut Vec<T>,
+    rung: T,
+    reach_tokens: Option<u32>,
+) {
+    held.push(rung);
+    let deepest = held.iter().map(|kept| kept.prefix_len()).max();
+    let reachable = reach_tokens.and_then(|reach| {
+        held.iter()
+            .map(|kept| kept.prefix_len())
+            .filter(|&prefix_len| prefix_len <= reach)
+            .max()
+    });
+    let mut kept: Vec<T> = Vec::with_capacity(2);
+    for candidate in held.drain(..).rev() {
+        let prefix_len = Some(candidate.prefix_len());
+        if (prefix_len == deepest || prefix_len == reachable)
+            && !kept
+                .iter()
+                .any(|other| Some(other.prefix_len()) == prefix_len)
+        {
+            kept.push(candidate);
+        }
+    }
+    *held = kept;
+}
+
 /// Replay into a staged GDN cache and publish it only after the replay succeeds.
 ///
 /// Materialized replay is fallible after it has already mutated recurrent

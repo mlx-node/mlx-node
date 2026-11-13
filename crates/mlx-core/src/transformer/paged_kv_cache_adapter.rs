@@ -1523,6 +1523,35 @@ impl PagedKVCacheAdapter {
         self.cold_tier.as_ref()
     }
 
+    /// Tokens of `tokens` the turn-end capture walk reaches at least, under
+    /// this adapter's per-turn budget ([`ColdTierWalk::capture_reach`]).
+    /// `None` without a cold tier.
+    pub(crate) fn cold_capture_reach_tokens(
+        &self,
+        tokens: &[u32],
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> Option<u32> {
+        let cold = self.cold_tier.as_ref()?;
+        let blocks = ColdTierWalk {
+            cold,
+            pool: &self.layer_kv_pool,
+            allocator: &self.allocator,
+            block_size: self.block_size,
+            held: self.held_blocks(),
+        }
+        .capture_reach(
+            tokens,
+            cache_salt,
+            self.cold_capture_budget.max_blocks,
+            |i| extra_keys_per_block.get(i).map(Vec::as_slice),
+        );
+        Some(
+            u32::try_from((blocks as u64).saturating_mul(u64::from(self.block_size)))
+                .unwrap_or(u32::MAX),
+        )
+    }
+
     /// Take the auxiliary state the last prefix lookup restored, if any.
     ///
     /// `Some` only for a family whose [`ColdTierContext::sidecar_policy`] is

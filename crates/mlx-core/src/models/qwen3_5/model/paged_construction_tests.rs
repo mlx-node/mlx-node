@@ -2362,8 +2362,9 @@ fn dense_manual_paged_finalize_reaches_the_gdn_sidecar_capture() {
 /// A host short of spare memory refuses a ladder rung its RAM claim
 /// (`HostRule::admits` keeps the margin from Optional claims), so the rung
 /// goes to the cold tier through the turn's sidecar capture instead (Splash
-/// `publishStateToDisk`) and never into RAM. Only the deepest refused rung is
-/// held until the capture: rungs 16 and 32, then 16 again, leave 32.
+/// `publishStateToDisk`) and never into RAM. With the capture walk reaching
+/// the whole prompt only the deepest refused rung is held until the capture:
+/// rungs 16 and 32, then 16 again, leave 32.
 ///
 /// Mutations: drop the refused rung → the capture finds no checkpoint
 /// (`boundary_skips` +1, `enqueued` +0) → red; F1 (the newest refused rung
@@ -2413,6 +2414,70 @@ fn a_rung_refused_ram_still_reaches_the_cold_tier() {
     assert!(
         inner.gdn_unclaimed_rungs.is_empty(),
         "the turn's end drops the refused rung"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The turn's K/V capture walk persists at most its per-turn block budget,
+/// and the sidecar anchors only at or below the chain it reaches. With a
+/// one-block budget the refused rungs 16, 32 and 48 leave 48 (the deepest)
+/// and 16 (the deepest the walk reaches), and the capture anchors at 16.
+///
+/// Mutation: hold only the deepest refused rung → the held set is
+/// `[(None, 48)]` and the capture finds no checkpoint within the one-block
+/// chain → red.
+#[test]
+fn a_refused_rung_within_the_capture_reach_reaches_the_cold_tier() {
+    let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
+        "a_refused_rung_within_the_capture_reach_reaches_the_cold_tier",
+    ) else {
+        return;
+    };
+    let root = temp_cold_root("dense-refused-rung-within-reach");
+    install_gdn_cold_tier(&mut inner, &root);
+    refuse_optional_claims(&mut inner);
+    inner
+        .paged_adapter
+        .as_mut()
+        .expect("paged_adapter")
+        .set_cold_capture_budget(crate::transformer::cold_tier::ColdCaptureBudget {
+            max_blocks: 1,
+            max_walk: std::time::Duration::from_secs(60),
+        });
+    let prompt: Vec<u32> = (0u32..48).collect();
+    record_whole_paged_request(&mut inner, &prompt);
+
+    let rungs = vec![
+        zero_gdn_rung(&inner, 16),
+        zero_gdn_rung(&inner, 32),
+        zero_gdn_rung(&inner, 48),
+    ];
+    inner.publish_dense_gdn_materialized_prefix_checkpoint(&prompt, 0, rungs);
+    assert_eq!(
+        held_rungs(&inner),
+        vec![(None, 16), (None, 48)],
+        "the deepest refused rung and the deepest within the capture reach are held"
+    );
+
+    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
+    let before = crate::cold_tier::cold_sidecar_telemetry();
+    inner
+        .finalize_dense_manual_paged_turn(&[], 0, prompt.len())
+        .expect("manual paged finalization must succeed");
+    let after = crate::cold_tier::cold_sidecar_telemetry();
+    assert_eq!(
+        after.boundary_skips, before.boundary_skips,
+        "the rung within the capture reach must anchor the sidecar"
+    );
+    assert_eq!(
+        after.enqueued,
+        before.enqueued + 1,
+        "the rung within the capture reach must reach the cold tier"
+    );
+    assert!(
+        inner.gdn_unclaimed_rungs.is_empty(),
+        "the turn's end drops the refused rungs"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -2519,7 +2584,7 @@ fn held_rungs(inner: &Qwen35Inner) -> Vec<(Option<SeqId>, u32)> {
     let mut held: Vec<_> = inner
         .gdn_unclaimed_rungs
         .iter()
-        .map(|(seq_id, rung)| (*seq_id, rung.prefix_len))
+        .flat_map(|(seq_id, rungs)| rungs.iter().map(|rung| (*seq_id, rung.prefix_len)))
         .collect();
     held.sort_unstable();
     held
