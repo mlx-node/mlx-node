@@ -262,39 +262,66 @@ recurrent, PLE, and indexer state are also required.
 
 **Warm prefix reuse.** A turn stores the cell outside the pool (GDN conv
 history, GDN recurrent matrices, PLE history: 115,642,368 B on the released
-geometry, plus 4 B per token and 8 B per block of its lineage) at lines of the
-prefill pass grid: the replay point, the last 1,024-row line at or before the
-generation prompt's `<|im_start|>`, and rolling checkpoints every 4,096 rows,
-each retiring the turn's previous one (Splash `StateCache`). Its KV blocks
-below each state are registered in the prefix cache. A later turn of the same
-loaded model whose prompt starts with a stored lineage, every block of it still
-cached, restores that cell and prefills only the rest; `cachedTokens` (and the
-usage's cached input tokens) reports that row. A pass reads its own rows' K/V
-at BF16 and earlier rows from the pool, so states sit only where every cold
-prefill cuts: a restored turn runs the cold turn's passes after it, and the
-output at temperature 0 equals a cold prefill's. Reuse comes in whole 1,024-row
-lines: a shared prefix under 1,024 tokens reports 0. The live continuation of
-the row's own history (prompt + generated tokens) still applies first and
-publishes nothing. A KV block's prefix-cache key also holds the tokens of its
-whole 1,024-row pass: a row's bits may depend on the later rows of its pass, so
-two runs share a block only when both ran that pass over the same tokens. Two
-conversations that part inside a pass (a shared system prompt that is not a
-multiple of 1,024 tokens) each keep their own blocks for that pass and each
-store their own states. A new conversation does not resume at the end of a
-shared system prompt: no state sits there unless that row is a checkpoint or a
-replay point of an earlier turn. A state is not published after a pass off the
-cold grid (a scheduler budget cut of the slice), for an image prompt or with
-`reuseCache: false`. A publication the memory checks refuse drops no other
-state. A restored turn has no MTP draft owner (the draft cache of the restored
-rows is not stored with the cell), so an `enableMtp` turn that restores runs
-plain AR; before this reuse such a follow-up prefilled cold and drafted. Stored
-states use the room the
-dynamic budget leaves after the pool at its largest, one pass's transient, the
-rows and the MTP state (about 12 states on a busy 128 GB host, from plan
-numbers); a row's admission takes stored states back first, checkpoints before
-replay points, never one a running turn uses. `resetCaches` and a GPU reset drop
-them and purge the prefix cache. States live only in the engine process: a
-restart starts cold.
+geometry, plus 4 B per token and 8 B per block of its lineage) at rows where
+every cold prefill of its conversation cuts a pass. Every pass end is a pure
+function of the prompt: from each end, the next is the first of the 1,024-row
+window, the block row (a multiple of 32) before the next assistant opening
+(`<|im_start|>assistant`), and the prompt's end. The replay point is the block
+row before the last assistant opening (the generation prompt, Splash
+`Engine::promptReplayBoundary`); rolling checkpoints sit every 4,096 rows, each
+moved to the first block-aligned end at or after it and retiring the turn's
+previous one (Splash `StateCache`). Its KV blocks below each state are
+registered in the prefix cache. A later turn of the same loaded model whose
+prompt starts with a stored lineage, every block of it still cached, restores
+that cell and prefills only the rest; `cachedTokens` (and the usage's cached
+input tokens) reports that row: the previous turn's generation prompt rounded
+down to 32 tokens. A pass reads its own rows' K/V at BF16 and earlier rows from
+the pool, so a turn's bits depend on where its passes are cut; since every
+earlier generation prompt is also an assistant opening of every later prompt
+of the conversation, a cold prefill of the later prompt cuts at the earlier
+replay rows, a restored turn runs the cold turn's passes after it, and the
+output at temperature 0 equals a cold prefill's (Splash does not keep this
+law; this engine does). A KV block's prefix-cache key also holds the tokens and
+ends of the passes over it (the prompt's last pass, which a longer prompt does
+not cut at, has no key): two runs share a block only when both ran those passes
+over the same tokens, and a key match below a state proves its row is a pass
+end of the new prompt. A prompt that leaves the conversation inside the block
+of an assistant opening resumes at an earlier state. The cost: a cold prompt
+runs up to one more pass per assistant message (60K tokens with 100 assistant
+messages: up to 159 passes instead of 59), and a warm tool-loop turn one more
+small pass. The live continuation of the row's own history (prompt +
+generated tokens) still applies first and publishes nothing. A state is not
+published after a pass a cold prefill does not run (a scheduler budget cut of
+the slice), for an image prompt or with `reuseCache: false`; the scheduled
+lane slices a text prompt at its pass ends. A publication the memory checks
+refuse drops no other state.
+
+With the MTP head loaded, every published state also carries the draft
+history a cold prefill has at its row (Splash keeps a lane's draft window on
+every prefill): the draft K/V and indexer keys of its whole 1,024-row draft
+passes, shared between the states of one conversation, and the target hidden
+rows still waiting for the next draft pass (at most 20 MiB). Every text
+prefill keeps a draft owner for that, an autoregressive one only until its
+prefill ends, and the memory plan books it on the lane (the window's draft
+indexer keys and a full window of waiting rows beside the MTP turn's draft
+state). Admission charges every turn on such a load for the draft history it
+may keep, an autoregressive turn too. A restored turn gets the state's draft history, so an `enableMtp` turn
+that restores begins speculation at the restored row and drafts as a cold turn
+does; a point whose owner does not hold the cold prefill's draft passes there
+is not published. A state at 60K tokens is about 375 MiB with the head instead
+of 110 MiB.
+
+Stored states use the room the dynamic budget leaves after the pool at its
+largest, one pass's transient, the rows and the MTP state (about 12 states
+without the head on a busy 128 GB host, from plan numbers); a row's admission
+takes stored states back first, checkpoints before replay points, never one a
+running turn uses. `resetCaches` and a GPU reset drop them and purge the
+prefix cache. With the paged cache's disk tier on (`mlx agent` and the
+desktop engine by default, GGUF loads only) a turn's replay state, its KV
+blocks and its draft segments also go to disk behind the turn, and a
+restarted engine restores the deepest state of a prompt whose chain is
+whole (see paged-cache.md, "SSD cold tier"); otherwise a restart starts
+cold.
 
 Native MTP is **opt-in** (`enableMtp: true`); it drafts two tokens per cycle
 unless `mtpDepth` says otherwise, capped at three. It runs

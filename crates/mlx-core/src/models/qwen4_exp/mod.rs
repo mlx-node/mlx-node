@@ -13,6 +13,7 @@ mod memory;
 mod mtp;
 mod packed_cache;
 mod paged;
+mod prefix_disk;
 mod prefix_state;
 mod route_plan;
 #[cfg(test)]
@@ -21,6 +22,8 @@ mod row_fetch;
 mod weights;
 
 const MAX_PREFILL_CHUNK: usize = 1024;
+/// Sequences the continuous-batching scheduler runs at once.
+const LANES: usize = 4;
 
 pub use load_plan::{Qwen4ExpContextEstimate, estimate_qwen4_exp_context_window};
 
@@ -105,9 +108,87 @@ struct Inner {
     wired: Option<Arc<crate::stream::WiredResidency>>,
     /// Stored states for warm prefix reuse and the running turns' points.
     prefix_states: prefix_state::States,
+    /// The stored states' disk tier; `None` when it is off.
+    disk: Option<prefix_disk::Disk>,
+    telemetry: Arc<prefix_disk::Telemetry>,
+}
+
+const PERSIST_ENV: &str = "MLX_PERSIST_PAGED_CACHE";
+
+/// Whether a load keeps its stored states on disk: the paged cache's
+/// persistence switch (`MLX_PERSIST_PAGED_CACHE`, which the host writes from
+/// `--persist-cache` before any load) for this family, on a GGUF store whose
+/// identity the stored objects are bound to.
+fn disk_tier_on(weights: &weights::Store) -> bool {
+    let env = std::env::var(PERSIST_ENV).ok();
+    disk_switch(env.as_deref(), weights.checkpoint_identity())
+}
+
+/// [`disk_tier_on`] for the switch's value `env` and the store's identity.
+fn disk_switch(env: Option<&str>, identity: Option<&str>) -> bool {
+    if !crate::cold_tier::resolve_persist_cold("qwen4_exp", env, None) {
+        return false;
+    }
+    if identity.is_none() {
+        tracing::info!(
+            "qwen4_exp: stored states stay in memory: the disk tier needs a GGUF checkpoint"
+        );
+        return false;
+    }
+    true
 }
 
 impl Inner {
+    /// Opens the disk tier of the stored states when the persistence
+    /// switch `env` turns it on for a checkpoint of `identity`, over
+    /// `manager` (the process's cold store), and hands the store to the
+    /// adapter for the states' KV blocks. Fails open: the states stay in
+    /// memory.
+    fn open_prefix_disk(
+        &mut self,
+        env: Option<&str>,
+        identity: Option<&str>,
+        auxiliary: Option<&Path>,
+        manager: impl FnOnce() -> Option<Arc<mlx_paged_attn::ColdCacheManager>>,
+    ) {
+        if !disk_switch(env, identity) {
+            return;
+        }
+        let window = self.decoder.prefill_slice_size();
+        let scratch = self.decoder.host_prefill_scratch;
+        let fingerprint = match (identity, self.decoder.paged.as_ref()) {
+            (Some(identity), Some(adapter)) => prefix_disk::fingerprint(
+                identity,
+                auxiliary,
+                &self.decoder.config,
+                adapter.layer_kv_pool(),
+                window,
+                &self.prefix_states.open,
+                scratch,
+                self.has_mtp,
+            ),
+            _ => None,
+        };
+        let Some(fingerprint) = fingerprint else {
+            tracing::warn!("qwen4_exp: stored states stay in memory: no checkpoint identity");
+            return;
+        };
+        let Some(manager) = manager() else {
+            tracing::warn!("qwen4_exp: stored states stay in memory: the cold store did not open");
+            return;
+        };
+        match prefix_disk::Disk::open(manager, fingerprint, Arc::clone(&self.telemetry)) {
+            Ok(disk) => {
+                if let Some(adapter) = self.decoder.paged.as_mut() {
+                    disk.attach(adapter);
+                    self.disk = Some(disk);
+                }
+            }
+            Err(error) => {
+                tracing::warn!("qwen4_exp: stored states stay in memory: {error}");
+            }
+        }
+    }
     /// The context every turn may hold: `--max-context`, else the served
     /// window.
     fn context_cap(&self) -> u32 {
@@ -160,6 +241,7 @@ impl PagedStepModel for Step<'_> {
         if (step + 1) % 256 == 0 {
             crate::array::clear_cache();
         }
+        self.0.top_up_disk();
     }
 }
 impl ChatBackend for Inner {
@@ -303,6 +385,10 @@ impl ChatBackend for Inner {
             self.active_seq = None;
             self.mtp = mtp::State::default();
             self.prefix_states.clear();
+            if let Some(disk) = &mut self.disk {
+                disk.reset();
+            }
+            self.telemetry.sync(&self.prefix_states);
             if let Some(adapter) = &mut self.decoder.paged {
                 adapter
                     .release_request_and_purge_prefix_cache()
@@ -454,6 +540,31 @@ pub struct Qwen4ExpResidencyInfo {
     /// Decode tokens and prefill windows replayed after a tentative device
     /// route missed the slots.
     pub route_replays: f64,
+    /// Stored prefix states in memory and their bytes.
+    pub prefix_states: f64,
+    pub prefix_state_bytes: f64,
+    /// States published since load, and turns that resumed from one.
+    pub prefix_published: f64,
+    pub prefix_restored: f64,
+    /// The stored states' disk tier is on.
+    pub prefix_disk_enabled: bool,
+    /// States parked for the disk and not handed to the writer yet.
+    pub prefix_disk_waiting: f64,
+    /// States handed to the writer and found on disk.
+    pub prefix_disk_durable: f64,
+    /// Parked states a newer state of their conversation replaced.
+    pub prefix_disk_unneeded: f64,
+    /// States not written: chain incomplete, budget, queue full.
+    pub prefix_disk_refused: f64,
+    /// States read back from disk into memory.
+    pub prefix_disk_restored: f64,
+    /// States removed from disk: a block or draft segment of their chain
+    /// was not there, or they did not read back.
+    pub prefix_disk_dropped_chain: f64,
+    /// Block and draft-segment copies waiting for the writer.
+    pub prefix_disk_owed_blocks: f64,
+    /// Bytes of states written.
+    pub prefix_disk_state_bytes_written: f64,
 }
 
 #[napi(object)]
@@ -510,6 +621,7 @@ pub struct Qwen4ExpModel {
     live: Arc<live::Live>,
     lookup: Arc<weights::LookupStats>,
     supports_images: bool,
+    prefix: Arc<prefix_disk::Telemetry>,
 }
 #[napi]
 impl Qwen4ExpModel {
@@ -557,6 +669,8 @@ impl Qwen4ExpModel {
                 config.kv_format =
                     load_plan::resolve_kv_format(LABEL, options.kv_format.as_deref(), &config)?;
                 let has_mtp = auxiliary::validate_mtp(&weights, &config)?;
+                let persist = std::env::var(PERSIST_ENV).ok();
+                let disk = disk_switch(persist.as_deref(), weights.checkpoint_identity());
                 let vision = media::Vision::metadata(&raw, &weights, &config)?;
                 let supports_images = vision.available();
                 let tokenizer = Arc::new(Qwen3Tokenizer::load_from_file_sync(
@@ -566,9 +680,14 @@ impl Qwen4ExpModel {
                         .ok_or_else(|| Error::from_reason("Non-UTF8 model path"))?,
                 )?);
                 check_tokenizer_tags(&tokenizer)?;
-                let turn_open = match tokenizer.encode_sync("<|im_start|>", Some(false))?[..] {
-                    [id] => Some(id),
-                    _ => None,
+                let open = match tokenizer.encode_sync("<|im_start|>", Some(false))?[..] {
+                    [id] => {
+                        match tokenizer.encode_sync("<|im_start|>assistant", Some(false))?[..] {
+                            [first, role] if first == id => vec![id, role],
+                            _ => vec![id],
+                        }
+                    }
+                    _ => Vec::new(),
                 };
                 let defaults =
                     crate::engine::persistence::parse_generation_defaults(Path::new(&assets));
@@ -586,6 +705,7 @@ impl Qwen4ExpModel {
                     max_memory,
                     max_context,
                     has_mtp,
+                    disk,
                 )?;
                 weights.set_store_plan(decision.store, inventory.store_fixed_bytes);
                 let mut decoder = decoder::Decoder::new(config.clone(), weights)?;
@@ -615,6 +735,7 @@ impl Qwen4ExpModel {
                             held_back.saturating_add(inventory.vision_bytes),
                             max_memory,
                             has_mtp,
+                            disk,
                         )
                     };
                     let held_back = decoder.weights.held_back_bytes();
@@ -670,6 +791,7 @@ impl Qwen4ExpModel {
                 let live = Arc::clone(&decoder.weights.live);
                 let lookup = Arc::clone(&decoder.weights.lookup);
                 let assets = assets.to_string_lossy().into_owned();
+                let telemetry = Arc::new(prefix_disk::Telemetry::default());
                 let mut inner = Inner {
                     decoder,
                     tokenizer,
@@ -687,8 +809,23 @@ impl Qwen4ExpModel {
                     open_turns: std::collections::HashSet::new(),
                     exclusive_turn: false,
                     wired: None,
-                    prefix_states: prefix_state::States::new(turn_open),
+                    prefix_states: prefix_state::States::new(open),
+                    disk: None,
+                    telemetry: Arc::clone(&telemetry),
                 };
+                if disk {
+                    let identity = inner
+                        .decoder
+                        .weights
+                        .checkpoint_identity()
+                        .map(str::to_owned);
+                    inner.open_prefix_disk(
+                        persist.as_deref(),
+                        identity.as_deref(),
+                        options.auxiliary_model_path.as_deref().map(Path::new),
+                        crate::cold_tier::global_cold_cache,
+                    );
+                }
                 if let Some(adapter) = inner.decoder.paged.as_ref() {
                     adapter
                         .layer_kv_pool()
@@ -708,6 +845,7 @@ impl Qwen4ExpModel {
                         live,
                         lookup,
                         supports_images,
+                        telemetry,
                     ),
                 ))
             },
@@ -722,6 +860,7 @@ impl Qwen4ExpModel {
             live,
             lookup,
             supports_images,
+            prefix,
         ) = match ready.await {
             Ok(Ok(init)) => init,
             Ok(Err(error)) => {
@@ -755,6 +894,7 @@ impl Qwen4ExpModel {
             live,
             lookup,
             supports_images,
+            prefix,
         })
     }
     /// Whether the validated checkpoint has a supported image tower.
@@ -819,6 +959,20 @@ impl Qwen4ExpModel {
             slot_misses: live.slot_misses.load(Ordering::Relaxed) as f64,
             checkpoint_bytes_read: live.bytes_read.load(Ordering::Relaxed) as f64,
             route_replays: live.route_replays.load(Ordering::Relaxed) as f64,
+            prefix_states: self.prefix.states.load(Ordering::Relaxed) as f64,
+            prefix_state_bytes: self.prefix.state_bytes.load(Ordering::Relaxed) as f64,
+            prefix_published: self.prefix.published.load(Ordering::Relaxed) as f64,
+            prefix_restored: self.prefix.restored.load(Ordering::Relaxed) as f64,
+            prefix_disk_enabled: self.prefix.disk_enabled.load(Ordering::Relaxed) != 0,
+            prefix_disk_waiting: self.prefix.waiting.load(Ordering::Relaxed) as f64,
+            prefix_disk_durable: self.prefix.durable.load(Ordering::Relaxed) as f64,
+            prefix_disk_unneeded: self.prefix.unneeded.load(Ordering::Relaxed) as f64,
+            prefix_disk_refused: self.prefix.refused.load(Ordering::Relaxed) as f64,
+            prefix_disk_restored: self.prefix.disk_restored.load(Ordering::Relaxed) as f64,
+            prefix_disk_dropped_chain: self.prefix.dropped_chain.load(Ordering::Relaxed) as f64,
+            prefix_disk_owed_blocks: self.prefix.owed.load(Ordering::Relaxed) as f64,
+            prefix_disk_state_bytes_written: self.prefix.state_bytes_written.load(Ordering::Relaxed)
+                as f64,
         }
     }
     #[napi]

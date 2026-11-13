@@ -952,6 +952,12 @@ impl BlockAllocator {
         true
     }
 
+    /// The block the prefix cache holds under `hash`, without a reference:
+    /// valid until the allocator next evicts or frees.
+    pub fn cached_block(&self, hash: u64) -> Option<Arc<PhysicalBlock>> {
+        self.prefix_cache.get(&hash).map(Arc::clone)
+    }
+
     /// Look up a block in the prefix cache
     ///
     /// Returns the cached block if found, incrementing its ref count. It

@@ -289,6 +289,18 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn scheduler_prefill_slice_tokens(&self) -> u32 {
         scheduler_long_prefill_tokens()
     }
+    /// Every prefill slice end of `seq`'s prompt (`prompt_tokens`,
+    /// `cached_prefix` of them cached) when the family fixes them itself:
+    /// ascending, past `cached_prefix`, the last at `prompt_tokens`. They
+    /// replace the slice grid walked from the cached prefix.
+    fn scheduler_prefill_ends(
+        &self,
+        _seq_id: SeqId,
+        _prompt_tokens: u32,
+        _cached_prefix: u32,
+    ) -> Option<Vec<u32>> {
+        None
+    }
     /// The turn books its prompt plus one block and grows KV per step; a
     /// blocked step reclaims, then preempts, and a lone blocked row fails.
     /// Otherwise the whole turn is booked at admission.
@@ -2299,11 +2311,20 @@ fn row_work_end<P>(row: &engine::scheduler::StepRow, turn: &TurnState<P>) -> u32
 /// one whole-prompt step (then the grid is the one end `prompt`).
 fn prefill_breaks<B: HybridSchedulerBackend>(
     inner: &B,
+    seq_id: SeqId,
     cached_prefix: u32,
     prompt_tokens: u32,
     extra_breaks: Vec<u32>,
 ) -> (Vec<u32>, bool) {
     let whole = inner.scheduler_whole_prompt_prefill(prompt_tokens, cached_prefix);
+    if !whole
+        && let Some(ends) = inner.scheduler_prefill_ends(seq_id, prompt_tokens, cached_prefix)
+        && ends.last() == Some(&prompt_tokens)
+        && ends.first().is_some_and(|&end| end > cached_prefix)
+        && ends.windows(2).all(|pair| pair[0] < pair[1])
+    {
+        return (ends, false);
+    }
     let slice = if whole {
         u32::MAX
     } else {
@@ -5204,7 +5225,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let cached_prefix = payload.prefix.effective_cached_prefix_len() as u32;
         let extra_breaks = self.inner.extra_prefill_breaks(prompt_len, cached_prefix);
         let (breaks, whole_prompt_prefill) =
-            prefill_breaks(&self.inner, cached_prefix, prompt_len, extra_breaks);
+            prefill_breaks(&self.inner, seq_id, cached_prefix, prompt_len, extra_breaks);
         let turn_cancelled = Arc::clone(&cancelled);
         let draft_allowance = if payload.scheduled_speculation.is_some() {
             payload.params.mtp_depth as u32
@@ -5401,6 +5422,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                         .set_prompt_tokens(restored.profiler_prefill_tokens);
                     (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) = prefill_breaks(
                         &self.inner,
+                        seq_id,
                         turn.num_computed_tokens,
                         turn.prompt_tokens,
                         restored.extra_prefill_breaks,
@@ -5445,7 +5467,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         ) {
             Ok(replay) => {
                 (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) =
-                    prefill_breaks(&self.inner, 0, turn.prompt_tokens, Vec::new());
+                    prefill_breaks(&self.inner, turn.seq_id, 0, turn.prompt_tokens, Vec::new());
                 replay
             }
             Err(error) => {
@@ -5743,8 +5765,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let extra_breaks = self
             .inner
             .extra_prefill_breaks(target, turn.num_computed_tokens);
-        (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) =
-            prefill_breaks(&self.inner, turn.num_computed_tokens, target, extra_breaks);
+        (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) = prefill_breaks(
+            &self.inner,
+            turn.seq_id,
+            turn.num_computed_tokens,
+            target,
+            extra_breaks,
+        );
         let Some(replay) = turn.payload.preemption_replay.as_mut() else {
             self.fail_preempted(
                 turn,

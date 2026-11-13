@@ -1,5 +1,7 @@
 use super::*;
 use std::sync::atomic::Ordering;
+#[path = "prefix_disk_tests.rs"]
+mod prefix_disk_tests;
 #[path = "prefix_reuse_tests.rs"]
 mod prefix_reuse;
 fn fixture() -> PathBuf {
@@ -539,7 +541,9 @@ fn mtp_start_after_a_long_ar_turn_takes_back_the_pool_growth() {
     );
     inner.memory_plan = crate::engine::memory_plan::MemoryPlan::with_dynamic(dynamic);
     let mut state = HybridSchedulerState::new(inner).unwrap();
-    drive_turn(&mut state, TurnKind::Start, false, 120, Some("ar")).unwrap();
+    // On a load with the MTP head the AR prefill is charged its draft
+    // history too: its turn stays within the runway's budget.
+    drive_turn(&mut state, TurnKind::Start, false, 60, Some("ar")).unwrap();
     // The fixture stops long before its window; the rest of a long turn's
     // growth is taken directly.
     let pool = state.inner.decoder.paged.as_mut().unwrap();
@@ -575,16 +579,27 @@ fn scheduled_state_accounting_counts_rows_and_tracked_drafts() {
     let kv = memory::draft_kv_bytes_per_token(&c);
     assert!(row > 0 && kv > 0);
     let held = |inner: &Inner| inner.scheduled_state_capacity().unwrap().held;
+    let window = inner.decoder.prefill_slice_size() as u64;
+    let waiting = 100.min(window + 1);
+    let ar = memory::draft_owner_bytes(&c, 100 - waiting, waiting, false)
+        .max(memory::draft_owner_bytes(&c, 100, 0, false));
     assert_eq!(held(&inner), 0);
-    assert_eq!(inner.scheduled_state_candidate_bytes(1, 100, false), row);
+    assert_eq!(
+        inner.scheduled_state_candidate_bytes(1, 100, false),
+        row + ar
+    );
+    let index = memory::draft_index_bytes_per_token(&c);
     assert_eq!(
         inner.scheduled_state_candidate_bytes(1, 100, true),
-        row + memory::draft_state_bytes(&c, 100)
+        row + memory::draft_state_bytes(&c, 100) + 100 * index
     );
     inner.activate_paged_seq(1).unwrap();
     assert_eq!(held(&inner), row);
-    assert_eq!(inner.scheduled_state_candidate_bytes(1, 100, false), 0);
-    assert_eq!(inner.scheduled_state_candidate_bytes(2, 100, false), row);
+    assert_eq!(inner.scheduled_state_candidate_bytes(1, 100, false), ar);
+    assert_eq!(
+        inner.scheduled_state_candidate_bytes(2, 100, false),
+        row + ar
+    );
     inner.begin_mtp(1, 0).unwrap();
     let prompt = [3, 9, 5, 2, 7, 11, 12, 8];
     let prefix = inner
@@ -605,7 +620,7 @@ fn scheduled_state_accounting_counts_rows_and_tracked_drafts() {
     assert_eq!(held(&inner), row + tracked);
     assert_eq!(
         inner.scheduled_state_candidate_bytes(1, 100, true),
-        memory::draft_state_bytes(&c, 100 - frontier)
+        memory::draft_state_bytes(&c, 100 - frontier) + (100 - frontier) * index
     );
     inner.release_scheduled_speculation(1);
     assert_eq!(held(&inner), row + parked);
@@ -791,8 +806,9 @@ fn resumed_mtp_turn_keeps_the_draft_reservation_of_its_token_bound() {
         prompt_tokens,
         max_new_tokens as u32,
     );
-    let reserved =
-        memory::row_state_bytes(&c) + memory::draft_state_bytes(&c, u64::from(requested));
+    let reserved = memory::row_state_bytes(&c)
+        + memory::draft_state_bytes(&c, u64::from(requested))
+        + u64::from(requested) * memory::draft_index_bytes_per_token(&c);
     assert_eq!(turn.scheduled_state_bytes, reserved);
     turn.block_reservation_total = prompt_tokens.div_ceil(turn.block_size) + 1;
     let partial = turn.block_reservation_total * turn.block_size;
@@ -2635,7 +2651,9 @@ fn inner_over(mut decoder: decoder::Decoder, vision: media::Vision, has_mtp: boo
         open_turns: Default::default(),
         exclusive_turn: false,
         wired: None,
-        prefix_states: prefix_state::States::new(None),
+        prefix_states: prefix_state::States::new(Vec::new()),
+        disk: None,
+        telemetry: Arc::new(prefix_disk::Telemetry::default()),
     }
 }
 
@@ -9391,9 +9409,10 @@ fn cancel_between_two_sweeps_resets_the_decoder() {
 }
 
 /// The `paged_prefill` dispatch. With group mode pinned on, the paged
-/// lane runs the prompt as a group and observes the MTP owner per window and
-/// then for the tail; the owner's draft cache, waiting rows and frontier are
-/// those of the window-at-a-time lane (pinned off), and so are the logits.
+/// lane runs the prompt's whole windows as a group and its tail as a pass of
+/// its own, observing the MTP owner per window; the owner's draft cache,
+/// waiting rows and frontier are those of the window-at-a-time lane (pinned
+/// off), and so are the logits.
 #[test]
 fn observe_mtp_after_a_group_gives_the_same_draft_cache() {
     use crate::engine::backend::PagedBackend;
@@ -9428,8 +9447,14 @@ fn observe_mtp_after_a_group_gives_the_same_draft_cache() {
     };
     let grouped = run(true);
     let windowed = run(false);
-    assert!(grouped.3.iter().any(|e| e == "qwen4::group::end"));
-    assert!(grouped.3.iter().any(|e| e == "qwen4::tail::start"));
+    assert_eq!(
+        grouped
+            .3
+            .iter()
+            .filter(|e| *e == "qwen4::group::end")
+            .count(),
+        1
+    );
     assert!(!windowed.3.iter().any(|e| e == "qwen4::group::end"));
     assert!(
         !grouped.0.is_empty(),
@@ -9625,8 +9650,16 @@ fn tiny_planned_inner() -> Inner {
         active_bytes: 0,
         registered_pool_bytes: 0,
     };
-    inner.memory_plan =
-        load_plan::plan_engine("Qwen4Exp", &inner.decoder.config, live, 0, None, false).unwrap();
+    inner.memory_plan = load_plan::plan_engine(
+        "Qwen4Exp",
+        &inner.decoder.config,
+        live,
+        0,
+        None,
+        false,
+        false,
+    )
+    .unwrap();
     inner
 }
 

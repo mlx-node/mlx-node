@@ -50,7 +50,17 @@ pub(in crate::models::qwen4_exp) fn load_with(
         working_set_bytes: working_set,
         ..live(active)
     };
-    let decision = plan_store("Qwen4Exp", c, &inventory(), at(0), None, None, has_mtp).unwrap();
+    let decision = plan_store(
+        "Qwen4Exp",
+        c,
+        &inventory(),
+        at(0),
+        None,
+        None,
+        has_mtp,
+        false,
+    )
+    .unwrap();
     let held_back = decision.store.expert_cap_bytes + decision.store.row_cache_bytes;
     let plan = plan_engine(
         "Qwen4Exp",
@@ -59,6 +69,7 @@ pub(in crate::models::qwen4_exp) fn load_with(
         held_back,
         None,
         has_mtp,
+        false,
     )
     .unwrap();
     (decision, plan)
@@ -165,6 +176,7 @@ fn replan_after_load_keeps_the_allowance() {
             held,
             None,
             false,
+            false,
         )
     };
     let unsettled = engine(held_back).unwrap();
@@ -236,7 +248,17 @@ fn context_limits_publish_the_plan() {
 #[test]
 fn estimate_is_the_load_plan() {
     let c = flash_next_config();
-    let ar = estimate("Qwen4Exp", &c, &inventory(), live(0), None, None, false).unwrap();
+    let ar = estimate(
+        "Qwen4Exp",
+        &c,
+        &inventory(),
+        live(0),
+        None,
+        None,
+        false,
+        false,
+    )
+    .unwrap();
     assert_eq!(
         ar,
         Qwen4ExpContextEstimate {
@@ -245,7 +267,17 @@ fn estimate_is_the_load_plan() {
         }
     );
     assert_eq!(ar.window_tokens, 65_536);
-    let mtp = estimate("Qwen4Exp", &c, &inventory(), live(0), None, None, true).unwrap();
+    let mtp = estimate(
+        "Qwen4Exp",
+        &c,
+        &inventory(),
+        live(0),
+        None,
+        None,
+        true,
+        false,
+    )
+    .unwrap();
     assert_eq!(mtp.window_tokens, 65_536);
     let int8 = estimate(
         "Qwen4Exp",
@@ -254,6 +286,7 @@ fn estimate_is_the_load_plan() {
         live(0),
         None,
         None,
+        false,
         false,
     )
     .unwrap();
@@ -265,6 +298,7 @@ fn estimate_is_the_load_plan() {
         live(0),
         Some(16 << 30),
         None,
+        false,
         false,
     )
     .unwrap();
@@ -309,8 +343,17 @@ fn hf_experts_stream_from_the_plan() {
     assert_eq!(inventory.experts.all, 241_591_910_400);
     assert_eq!(inventory.experts.minimum, 4_816_896_000);
     assert_eq!(inventory.store_fixed_bytes, fixed_bytes);
-    let decision = plan_store("Qwen4Exp", &c, &inventory, live(0), None, None, false)
-        .unwrap_or_else(|error| panic!("the HF store must stream: {error}"));
+    let decision = plan_store(
+        "Qwen4Exp",
+        &c,
+        &inventory,
+        live(0),
+        None,
+        None,
+        false,
+        false,
+    )
+    .unwrap_or_else(|error| panic!("the HF store must stream: {error}"));
     assert!(!decision.store.whole);
     assert!(decision.store.expert_cap_bytes < inventory.experts.all);
 }
@@ -333,6 +376,7 @@ fn flash_next_allowance_is_the_requested_context() {
         None,
         Some(102_400),
         false,
+        false,
     )
     .unwrap();
     assert_eq!(decision.allowance, allowance_dynamic_bytes(&[&ar], 102_400));
@@ -344,10 +388,21 @@ fn flash_next_allowance_is_the_requested_context() {
         None,
         Some(102_400),
         false,
+        false,
     )
     .unwrap();
     assert_eq!(estimate.window_tokens, 102_400);
-    let unset = plan_store("Qwen4Exp", &c, &inventory(), live(0), None, None, false).unwrap();
+    let unset = plan_store(
+        "Qwen4Exp",
+        &c,
+        &inventory(),
+        live(0),
+        None,
+        None,
+        false,
+        false,
+    )
+    .unwrap();
     assert_eq!(unset.allowance, allowance_dynamic_bytes(&[&ar], 65_536));
 }
 
@@ -363,6 +418,7 @@ fn flash_next_context_above_the_plan_is_refused() {
         live(0),
         Some(8 << 30),
         Some(131_072),
+        false,
         false,
     )
     .unwrap_err();
@@ -404,6 +460,7 @@ fn flash_next_400k_serves_the_yarn_window() {
         large,
         None,
         Some(409_600),
+        false,
         false,
     )
     .unwrap();
@@ -525,28 +582,28 @@ fn int8_pool_window_from_the_plan() {
 }
 
 /// The MTP draft state is the one lane's, charged once: at a fixed dynamic
-/// budget the int8 window is 67,407 (90,964 without MTP), and a load with
+/// budget the int8 window is 66,175 (90,964 without MTP), and a load with
 /// MTP weights keeps 64K in both formats. Mutation O1: `LaneKv::Pool`
 /// also takes the state from the pool's KV (the state charged twice) → red
-/// (49,145).
+/// (a smaller window).
 #[test]
 fn mtp_state_prices_the_one_pool_window() {
     const DYNAMIC: u64 = 4_468_093_952;
     let c = int8_config();
     let transient = |window: u32| transient(&c, window);
-    let state = mtp_state(&c, true);
+    let state = lane_state(&c, true, false);
     let mtp = pool_input(&c, &transient, &state).plan_at(DYNAMIC);
-    assert_eq!(mtp.lane.window.maximum(), 67_407);
+    assert_eq!(mtp.lane.window.maximum(), 66_175);
     assert_eq!(mtp.max_blocks, 2_304);
     assert_eq!(
         mtp.lane.lane_bytes,
-        row_state_bytes(&c) + draft_state_bytes(&c, 67_407)
+        row_state_bytes(&c) + lane_state(&c, true, false)(66_175)
     );
     let ar = pool_input(&c, &transient, &|_| 0).plan_at(DYNAMIC);
     assert_eq!((ar.lane.window.maximum(), ar.max_blocks), (90_964, 3_072));
     for (config, allowance, cap, max_blocks) in [
-        (int8_config(), 4_429_808_640, 14_497_648_470, 2_304),
-        (flash_next_config(), 5_199_135_744, 13_728_321_366, 2_080),
+        (int8_config(), 4_454_974_464, 14_472_482_646, 2_304),
+        (flash_next_config(), 5_224_301_568, 13_703_155_542, 2_080),
     ] {
         let (decision, plan) = load_with(&config, true, STUDIO_WORKING_SET);
         assert_eq!(decision.allowance, allowance);
@@ -555,4 +612,84 @@ fn mtp_state_prices_the_one_pool_window() {
         assert_eq!(pool.lane.window.maximum(), 65_536);
         assert_eq!(pool.max_blocks, max_blocks);
     }
+}
+
+/// With the MTP head every prefill keeps its draft history: the lane's state
+/// at a window is the MTP turn's draft state, the draft indexer keys of every
+/// row (64 B at the Flash Next geometry) and a full prefill window of BF16
+/// hidden rows waiting for the next draft pass (1,024 x 20,480 B). Without
+/// the head the lane holds none.
+/// Mutation: the waiting rows are left out of `lane_state` → red.
+#[test]
+fn the_load_plan_prices_the_lane_draft() {
+    let c = flash_next_config();
+    assert_eq!(memory::draft_index_bytes_per_token(&c), 64);
+    assert_eq!(memory::draft_hidden_row_bytes(&c), 20_480);
+    for window in [65_536u32, 262_144] {
+        assert_eq!(
+            lane_state(&c, true, false)(window),
+            draft_state_bytes(&c, u64::from(window)) + u64::from(window) * 64 + 20_971_520
+        );
+        assert_eq!(lane_state(&c, false, false)(window), 0);
+    }
+}
+
+/// With the disk tier on, the lane books its staging whatever the window:
+/// an encoded state (cell and, with the head, a window of waiting rows and
+/// the seed) for every parcel and one more for the writer's copy, the copy
+/// queue and the writer's queue of pages or draft segments behind it; off,
+/// nothing.
+/// Mutation: two states are booked, as before the parcels went per lane →
+/// red.
+#[test]
+fn the_load_plan_books_the_state_staging() {
+    use crate::models::qwen4_exp::prefix_disk::{PARCELS, QUEUE_BYTES};
+    let c = flash_next_config();
+    let cell = memory::state_cell_bytes(&c);
+    let page = super::flash_next_layout(&c).page_bytes();
+    let writer = (mlx_paged_attn::DEFAULT_QUEUE_DEPTH as u64 + 3) * page;
+    let states = (PARCELS as u64 + 1) * memory::encoded_state_bytes(&c, false);
+    assert!(memory::encoded_state_bytes(&c, false) > cell);
+    assert!(memory::encoded_state_bytes(&c, true) > cell + 1025 * 20_480);
+    for window in [65_536u32, 262_144] {
+        let off = lane_state(&c, false, true)(window);
+        assert!(off > states + QUEUE_BYTES + writer, "{off}");
+        assert_eq!(off, memory::disk_staging_bytes(&c, false));
+        assert_eq!(
+            lane_state(&c, true, true)(window),
+            lane_state(&c, true, false)(window) + memory::disk_staging_bytes(&c, true)
+        );
+        assert!(memory::disk_staging_bytes(&c, true) > off);
+        assert_eq!(lane_state(&c, false, false)(window), 0);
+    }
+    let (_, off) = load_with(&c, false, STUDIO_WORKING_SET);
+    let decision = plan_store(
+        "Qwen4Exp",
+        &c,
+        &inventory(),
+        live(0),
+        None,
+        None,
+        false,
+        true,
+    )
+    .unwrap();
+    let held_back = decision.store.expert_cap_bytes + decision.store.row_cache_bytes;
+    let on = plan_engine(
+        "Qwen4Exp",
+        &c,
+        LiveMemory {
+            working_set_bytes: STUDIO_WORKING_SET,
+            ..live(FLASH_NEXT_LOADED)
+        },
+        held_back,
+        None,
+        false,
+        true,
+    )
+    .unwrap();
+    assert!(
+        on.pool.unwrap().lane.lane_bytes > off.pool.unwrap().lane.lane_bytes,
+        "the lane holds the staging"
+    );
 }

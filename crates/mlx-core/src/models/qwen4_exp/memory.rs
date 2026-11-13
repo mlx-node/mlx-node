@@ -677,17 +677,56 @@ pub(super) fn draft_hidden_row_bytes(c: &super::config::Config) -> u64 {
     (c.hc_count * c.hidden_size * 2) as u64
 }
 
-/// What an MTP owner holds now: draft K/V for the rows in its cache, the
-/// hidden rows still waiting (trusted rows and the seed), and the verify
-/// snapshots while it is inside an MTP turn. A waiting row has no K/V yet.
+/// The draft layer's pooled BF16 indexer keys per token.
+pub(super) fn draft_index_bytes_per_token(c: &super::config::Config) -> u64 {
+    (c.indexer_head_dim * 2 / c.indexer_compress_ratio.max(1)) as u64
+}
+
+/// The rows a cold prefill of `rows` tokens has in its draft cache: draft
+/// passes drain whole `chunk`-row windows of the trusted rows, which end one
+/// row before the frontier.
+pub(super) fn cached_draft_rows(rows: u64, chunk: u64) -> u64 {
+    let trusted = rows.saturating_sub(1);
+    trusted - trusted % chunk.max(1)
+}
+
+/// The draft part of a state at `row`: the draft K/V and indexer keys of its
+/// cached rows and the hidden rows waiting beside them (the seed included).
+pub(super) fn draft_cell_bytes(c: &super::config::Config, row: u64, chunk: u64) -> u64 {
+    let cached = cached_draft_rows(row, chunk);
+    cached * (draft_kv_bytes_per_token(c) + draft_index_bytes_per_token(c))
+        + (row - cached) * draft_hidden_row_bytes(c)
+}
+
+/// One stored state at `row` of a load whose prefill window is `chunk`, its
+/// draft part with the MTP head.
+pub(super) fn state_bytes(c: &super::config::Config, row: u64, chunk: u64, has_mtp: bool) -> u64 {
+    state_cell_bytes(c)
+        + if has_mtp {
+            draft_cell_bytes(c, row, chunk)
+        } else {
+            0
+        }
+}
+
+/// What an MTP owner holds now: draft K/V and indexer keys for the rows in
+/// its cache, the hidden rows still waiting (trusted rows and the seed), and
+/// the verify snapshots while it is inside an MTP turn. A waiting row has no
+/// K/V yet.
 pub(super) fn draft_owner_bytes(
     c: &super::config::Config,
     cached_rows: u64,
     hidden_rows: u64,
-    tracking: bool,
+    speculative: bool,
 ) -> u64 {
-    let snapshots = if tracking { 4 * row_state_bytes(c) } else { 0 };
-    snapshots + cached_rows * draft_kv_bytes_per_token(c) + hidden_rows * draft_hidden_row_bytes(c)
+    let snapshots = if speculative {
+        4 * row_state_bytes(c)
+    } else {
+        0
+    };
+    snapshots
+        + cached_rows * (draft_kv_bytes_per_token(c) + draft_index_bytes_per_token(c))
+        + hidden_rows * draft_hidden_row_bytes(c)
 }
 
 /// The pool's share of the dynamic budget the scheduled state competes
@@ -728,6 +767,43 @@ pub(super) fn scheduled_state_budget(dynamic: u64, transient: u64, pool: &PoolCh
 pub(super) fn state_cell_bytes(c: &super::config::Config) -> u64 {
     let [conv, recurrent, ple, _] = row_state_parts(c);
     conv + recurrent + ple
+}
+
+/// An encoded state's header (shapes, dtypes, index blocks) at most.
+const STATE_HEADER_BYTES: u64 = 1 << 16;
+
+/// One state as the disk tier encodes it: the cell, the draft's waiting rows
+/// and seed with the MTP head (its segments are objects of their own).
+pub(super) fn encoded_state_bytes(c: &super::config::Config, has_mtp: bool) -> u64 {
+    let waiting = if has_mtp {
+        (super::MAX_PREFILL_CHUNK as u64 + 1) * draft_hidden_row_bytes(c)
+    } else {
+        0
+    };
+    state_cell_bytes(c) + waiting + STATE_HEADER_BYTES
+}
+
+/// Host bytes the disk tier holds on a load with it on: every parked state
+/// and the copy the writer encodes of the one it writes; one array's host
+/// copy while the model thread encodes a state; the parker's queue of block
+/// and segment copies (one copy past its bound), the writer's queue behind
+/// it and the copy the writer encodes.
+pub(super) fn disk_staging_bytes(c: &super::config::Config, has_mtp: bool) -> u64 {
+    let window = super::MAX_PREFILL_CHUNK as u64;
+    let linear = (0..c.num_hidden_layers).filter(|&i| c.linear(i)).count() as u64;
+    let [conv, recurrent, ple, _] = row_state_parts(c);
+    let mut largest = (conv / linear.max(1))
+        .max(recurrent / linear.max(1))
+        .max(ple);
+    let mut item = super::load_plan::flash_next_layout(c).page_bytes();
+    if has_mtp {
+        largest = largest.max(window * draft_hidden_row_bytes(c));
+        item = item.max(window * (draft_kv_bytes_per_token(c) + draft_index_bytes_per_token(c)));
+    }
+    (super::prefix_disk::PARCELS as u64 + 1) * encoded_state_bytes(c, has_mtp)
+        + largest
+        + super::prefix_disk::QUEUE_BYTES
+        + (mlx_paged_attn::DEFAULT_QUEUE_DEPTH as u64 + 3) * item
 }
 
 /// What stored states may hold: the dynamic budget less one pass's transient
@@ -889,7 +965,7 @@ fn flash_next_parked_owners_charge_their_waiting_hidden_rows() {
     assert!(parked > kv_figure);
     assert_eq!(
         draft_owner_bytes(&c, 7, 1, true),
-        4 * row + 7 * 4096 + 20_480,
+        4 * row + 7 * (4096 + 64) + 20_480,
         "cached rows pay K/V, the seed pays its hidden row, a tracked owner its snapshots"
     );
     let candidate = row + draft_state_bytes(&c, 256);

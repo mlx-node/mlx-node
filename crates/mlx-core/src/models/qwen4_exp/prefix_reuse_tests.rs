@@ -1,21 +1,26 @@
-//! Warm prefix reuse on the paged fixture: 32-row passes (one KV block),
-//! checkpoints every 32 rows, a 128-token window.
+//! Warm prefix reuse on the paged fixture (with the MTP head): 32-row
+//! passes (one KV block), checkpoints every 32 rows, a 128-token window;
+//! the prompt-cut tests run 64-row passes.
 use super::*;
 use crate::engine::backend::{PagedBackend, PagedPrefix};
 use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
 
-const GRID: usize = 32;
+pub(super) const GRID: usize = 32;
 
-fn gpu() -> Stream {
+/// The assistant opening of the fixture's tests (`prompt` never makes 62
+/// or 63).
+const OPEN: [u32; 2] = [62, 63];
+
+pub(super) fn gpu() -> Stream {
     Stream::default(crate::stream::DeviceType::Gpu)
 }
 
 /// The paged fixture with 32-row passes and a checkpoint every 32 rows.
-fn reuse_inner() -> Inner {
+pub(super) fn reuse_inner() -> Inner {
     reuse_over(tiny_inner())
 }
 
-fn reuse_over(mut inner: Inner) -> Inner {
+pub(super) fn reuse_over(mut inner: Inner) -> Inner {
     inner.decoder.prefill_window_pin = Some(GRID);
     inner.decoder.refresh_prefill_window();
     inner.prefix_states.interval = GRID;
@@ -23,21 +28,21 @@ fn reuse_over(mut inner: Inner) -> Inner {
 }
 
 /// `len` fixture token ids in `3..62`, distinct per `seed`.
-fn prompt(len: usize, seed: u32) -> Vec<u32> {
+pub(super) fn prompt(len: usize, seed: u32) -> Vec<u32> {
     (0..len as u32)
         .map(|i| 3 + (i * 7 + seed * 13) % 59)
         .collect()
 }
 
 /// `base[..at]` then `len - at` tokens of another conversation.
-fn fork(base: &[u32], at: usize, len: usize, seed: u32) -> Vec<u32> {
+pub(super) fn fork(base: &[u32], at: usize, len: usize, seed: u32) -> Vec<u32> {
     let mut tokens = base[..at].to_vec();
     tokens.extend(prompt(len - at, seed));
     tokens
 }
 
 /// Primes and prefills `tokens` on `seq`; the cached prefix and the logits.
-fn turn(inner: &mut Inner, seq: u32, tokens: &[u32]) -> (usize, Vec<f32>) {
+pub(super) fn turn(inner: &mut Inner, seq: u32, tokens: &[u32]) -> (usize, Vec<f32>) {
     inner.activate_paged_seq(seq).unwrap();
     let prefix = inner.prime_prefix_state(tokens, true, 32, &[], 0).unwrap();
     let cached = prefix.effective_cached_prefix_len();
@@ -48,13 +53,13 @@ fn turn(inner: &mut Inner, seq: u32, tokens: &[u32]) -> (usize, Vec<f32>) {
 }
 
 /// Ends the active turn as the epilogue does: the row stays live.
-fn finish(inner: &mut Inner) {
+pub(super) fn finish(inner: &mut Inner) {
     inner.finalize_paged_turn(true, 0);
     inner.save_paged_history(&[], &[], false, true).unwrap();
 }
 
 /// `count` greedy steps after `logits`, each step's logits.
-fn greedy(inner: &mut Inner, logits: &[f32], count: usize) -> Vec<Vec<f32>> {
+pub(super) fn greedy(inner: &mut Inner, logits: &[f32], count: usize) -> Vec<Vec<f32>> {
     let mut out = Vec::new();
     let mut last = logits.to_vec();
     for _ in 0..count {
@@ -75,7 +80,7 @@ fn cold(tokens: &[u32]) -> (Vec<f32>, Vec<Vec<f32>>) {
     cold_on(reuse_inner(), tokens)
 }
 
-fn cold_on(mut inner: Inner, tokens: &[u32]) -> (Vec<f32>, Vec<Vec<f32>>) {
+pub(super) fn cold_on(mut inner: Inner, tokens: &[u32]) -> (Vec<f32>, Vec<Vec<f32>>) {
     let (cached, logits) = turn(&mut inner, 1, tokens);
     assert_eq!(cached, 0);
     let steps = greedy(&mut inner, &logits, 8);
@@ -169,8 +174,10 @@ fn a_prompt_that_differs_inside_the_prefix_resumes_at_the_last_state_before_it()
     assert_eq!(turn(&mut inner, 3, &c).0, 0);
 }
 
-/// A cancel after the pass ending at 64 fails the prefill: the state at 64
-/// stays, none sits above it, and a retry resumes there and equals cold.
+/// A cancel that lands after the pass ending at 96 fails the prefill in
+/// that pass's draft history, before the point there is published: the
+/// state at 64 stays, none sits above it, and a retry resumes there and
+/// equals cold.
 /// Mutation: `abort_paged_turn` clears the store → red (the retry is cold).
 #[test]
 fn a_cancel_in_prefill_keeps_the_states_behind_it_and_nothing_past_it() {
@@ -183,7 +190,7 @@ fn a_cancel_in_prefill_keeps_the_states_behind_it_and_nothing_past_it() {
     let mut passes = 0;
     inner.decoder.after_pass = Some(Box::new(move |_| {
         passes += 1;
-        if passes == 2 {
+        if passes == 3 {
             trip.store(true, Ordering::Release);
         }
     }));
@@ -379,13 +386,14 @@ fn the_state_store_stays_inside_its_room_and_gives_way_to_rows() {
     use crate::models::qwen3_5::dflash2_state::store::lineage_bytes;
     let _host = memory::scoped_fixture_host();
     let mut inner = reuse_inner();
-    let cell = memory::state_cell_bytes(&inner.decoder.config);
-    let room = cell + lineage_bytes(96, 3) + cell / 2;
+    let state = |row: usize| memory::state_bytes(&inner.decoder.config, row as u64, 32, true);
+    let room = state(96) + lineage_bytes(96, 3) + state(32) / 2;
     inner.prefix_states.room_override = Some(room);
     turn(&mut inner, 1, &prompt(100, 1));
     assert_eq!(depths(&inner), [(96, false)]);
     assert!(inner.prefix_states.bytes() <= room);
-    assert_eq!(inner.prefix_states.counters.dropped_memory, 2);
+    assert_eq!(inner.prefix_states.counters.dropped_memory, 1);
+    assert_eq!(inner.prefix_states.counters.retired, 1);
     let c = inner.decoder.config.clone();
     assert_eq!(
         inner.scheduled_state_capacity().unwrap().held,
@@ -489,8 +497,8 @@ fn a_refused_publication_drops_no_stored_state() {
     use crate::models::qwen3_5::dflash2_state::store::lineage_bytes;
     let _host = memory::scoped_fixture_host();
     let mut inner = reuse_inner();
-    let cell = memory::state_cell_bytes(&inner.decoder.config);
-    inner.prefix_states.room_override = Some(cell + lineage_bytes(96, 3) + cell / 2);
+    let state = |row: usize| memory::state_bytes(&inner.decoder.config, row as u64, 32, true);
+    inner.prefix_states.room_override = Some(state(96) + lineage_bytes(96, 3) + state(32) / 2);
     let a = prompt(100, 1);
     turn(&mut inner, 1, &a);
     finish(&mut inner);
@@ -612,11 +620,13 @@ fn a_preempted_turn_publishes_no_block_past_its_states() {
         .preempt_scheduled_cache(1, 0, PreemptionMode::Recompute)
         .unwrap();
     inner.release_scheduled_recurrent_for(1);
+    // Keys of the prompt's passes below 64, and of the decode rows 64..96 as
+    // if a pass had run over them.
     let chain = crate::models::qwen3_5::gdn_checkpoint_store::compute_paged_prefix_block_hashes(
         &history,
         96,
         32,
-        &prefix_state::pass_keys(&history, GRID),
+        &prefix_state::pass_keys(&history, &[32, 64, 96, 97], GRID),
         0,
     )
     .unwrap();
@@ -625,11 +635,12 @@ fn a_preempted_turn_publishes_no_block_past_its_states() {
     assert!(!adapter.prefix_cached(chain[2]), "a block of decode rows");
 }
 
-/// A restored turn's sequence drops the draft owner an earlier turn left at
-/// the same row: speculation cannot begin from another history.
-/// Mutation: the restore keeps the owner → red.
+/// A restored turn's sequence replaces the draft owner an earlier turn left
+/// at the same row with the state's draft history: speculation begins there
+/// from the history a cold prefill of the lineage leaves.
+/// Mutation: the restore keeps the old owner → red.
 #[test]
-fn a_restored_turn_drops_a_stale_draft_owner() {
+fn a_restored_turn_replaces_a_stale_draft_owner() {
     let _host = memory::scoped_fixture_host();
     let mut inner = reuse_inner();
     inner.activate_paged_seq(1).unwrap();
@@ -649,8 +660,15 @@ fn a_restored_turn_drops_a_stale_draft_owner() {
         .prime_prefix_state(&fork(&a, 80, 110, 3), true, 32, &[], 0)
         .unwrap();
     assert_eq!(prefix.effective_cached_prefix_len(), 64);
-    assert!(!inner.begin_scheduled_speculation(1, 64).unwrap());
+    assert!(inner.begin_scheduled_speculation(1, 64).unwrap());
+    let restored = inner.mtp.draft_bits(1).unwrap();
     inner.abort_paged_turn();
+    let mut cold = reuse_inner();
+    cold.activate_paged_seq(1).unwrap();
+    let prefix = cold.prime_prefix_state(&a[..64], true, 32, &[], 0).unwrap();
+    assert!(cold.begin_scheduled_speculation(1, 0).unwrap());
+    cold.paged_prefill(&a[..64], &prefix, gpu()).unwrap();
+    assert_eq!(restored, cold.mtp.draft_bits(1).unwrap());
 }
 
 /// The turn result reports the reused rows as `cachedTokens`, from the
@@ -755,6 +773,502 @@ fn every_turn_end_gives_back_the_states_it_used() {
         );
         end(&mut inner);
         assert_eq!(in_use(&inner), 0, "{name}");
-        assert!(!inner.prefix_states.turns.contains_key(&1), "{name}");
+        assert!(
+            inner
+                .prefix_states
+                .turns
+                .get(&1)
+                .is_none_or(|turn| turn.uses.is_empty() && turn.prompt_len == 20),
+            "{name}: only the next prompt's turn may be open"
+        );
     }
+}
+
+/// `inner` on a 64-row prefill window (checkpoints every 64 rows) whose
+/// prompts open assistant messages with [`OPEN`].
+fn cut_over(mut inner: Inner) -> Inner {
+    inner.decoder.prefill_window_pin = Some(2 * GRID);
+    inner.decoder.refresh_prefill_window();
+    inner.prefix_states.interval = 2 * GRID;
+    inner.prefix_states.open = OPEN.to_vec();
+    inner
+}
+
+fn cut_inner() -> Inner {
+    cut_over(tiny_inner())
+}
+
+/// The parts in order.
+fn join(parts: &[&[u32]]) -> Vec<u32> {
+    parts.concat()
+}
+
+/// A: an assistant opening at row 45, a user opening (`62, 5`) at row 67.
+/// B: A up to the opening, another reply and B's own generation prompt at
+/// row 87.
+fn conversation() -> (Vec<u32>, Vec<u32>) {
+    let a = join(&[
+        &prompt(45, 1),
+        &OPEN,
+        &prompt(20, 3),
+        &[62, 5],
+        &prompt(3, 4),
+    ]);
+    let b = join(&[&a[..47], &prompt(40, 2), &OPEN, &prompt(3, 5)]);
+    (a, b)
+}
+
+/// The rows of every pass the decoder ran since the last call.
+fn passes(inner: &mut Inner) -> Vec<usize> {
+    std::mem::take(&mut inner.decoder.pass_samples)
+        .into_iter()
+        .map(|(rows, _)| rows)
+        .collect()
+}
+
+/// A follow-up resumes at the block before its conversation's last
+/// generation prompt (row 32 for an opening at row 45, where the 64-row
+/// grid would give 0), and gives a cold model's logits and greedy steps bit
+/// for bit, on a bf16 pool, an int8 pool (head 128), and with the passes a
+/// refused gate halves.
+/// Mutation: `boundaries` ignores the opening's role token → red (the user
+/// opening at row 67 moves the replay point to 64, past B's lineage).
+#[test]
+fn a_follow_up_resumes_at_the_block_before_the_generation_prompt() {
+    use crate::transformer::KvFormat;
+    let _host = memory::scoped_fixture_host();
+    let dir = Temp::new();
+    write_wide_head_fixture(&dir.0);
+    let halved = || {
+        let mut inner = cut_inner();
+        let config = Arc::clone(&inner.decoder.config);
+        inner.decoder.host_prefill_scratch = Some(memory::prefill_scratch(&config, 32, 64));
+        inner
+    };
+    let cases: [(&str, &dyn Fn() -> Inner); 3] = [
+        ("bf16", &cut_inner),
+        ("int8", &|| {
+            cut_over(wide_head_inner(&dir.0, KvFormat::Int8))
+        }),
+        ("halved", &halved),
+    ];
+    let (a, b) = conversation();
+    for (name, make) in cases {
+        let mut inner = make();
+        assert_eq!(turn(&mut inner, 1, &a).0, 0, "{name}");
+        finish(&mut inner);
+        assert_eq!(depths(&inner), [(32, false)], "{name}");
+        let (cached, logits) = turn(&mut inner, 1, &b);
+        assert_eq!(cached, 32, "{name}");
+        if name == "halved" {
+            assert!(
+                inner
+                    .decoder
+                    .pass_samples
+                    .iter()
+                    .any(|(rows, _)| *rows < 2 * GRID),
+                "{name}: the window halves past the scratch"
+            );
+        }
+        let steps = greedy(&mut inner, &logits, 8);
+        let (want_logits, want_steps) = cold_on(make(), &b);
+        assert_eq!(logits, want_logits, "{name}: first logits");
+        assert_eq!(steps, want_steps, "{name}: greedy steps");
+    }
+}
+
+/// A cold prefill of the follow-up runs the passes the first turn ran below
+/// the point the follow-up resumes at, then the follow-up's own.
+/// Mutation: a cold turn walks the plain grid (no cut at its openings) →
+/// red.
+#[test]
+fn a_cold_run_cuts_where_an_earlier_turn_resumed() {
+    let _host = memory::scoped_fixture_host();
+    let (a, b) = conversation();
+    let mut inner = cut_inner();
+    inner.decoder.pass_samples.clear();
+    turn(&mut inner, 1, &a);
+    let first = passes(&mut inner);
+    assert_eq!(first, [32, 40]);
+    finish(&mut inner);
+    let (cached, _) = turn(&mut inner, 1, &b);
+    assert_eq!(cached, 32);
+    let warm = passes(&mut inner);
+    assert_eq!(warm, [32, 28]);
+    let mut cold = cut_inner();
+    cold.decoder.pass_samples.clear();
+    assert_eq!(turn(&mut cold, 1, &b).0, 0);
+    assert_eq!(passes(&mut cold), [&first[..1], &warm[..]].concat());
+}
+
+/// A prompt that shares a state's lineage but leaves the conversation inside
+/// the block of the opening the state was cut for does not cut there, so it
+/// takes the deepest earlier state of its own passes, and equals cold.
+/// Mutation: the lookup ignores the pass keys → red (the state at 64 is
+/// tried, its blocks miss, the turn runs cold).
+#[test]
+fn a_prompt_that_leaves_inside_the_open_block_does_not_take_that_state() {
+    let _host = memory::scoped_fixture_host();
+    let mut inner = cut_inner();
+    let first = join(&[&prompt(45, 1), &OPEN, &prompt(3, 3)]);
+    turn(&mut inner, 1, &first);
+    finish(&mut inner);
+    let a = join(&[&first[..47], &prompt(18, 3), &OPEN, &prompt(3, 4)]);
+    assert_eq!(turn(&mut inner, 2, &a).0, 32);
+    finish(&mut inner);
+    assert_eq!(depths(&inner), [(32, false), (64, false)]);
+    let q = join(&[&a[..65], &prompt(40, 6), &OPEN, &prompt(3, 7)]);
+    let (cached, logits) = turn(&mut inner, 3, &q);
+    assert_eq!(cached, 32);
+    let steps = greedy(&mut inner, &logits, 8);
+    let (want_logits, want_steps) = cold_on(cut_inner(), &q);
+    assert_eq!(logits, want_logits);
+    assert_eq!(steps, want_steps);
+}
+
+/// The scheduler slices a text prompt at its pass ends, not on a grid
+/// walked from the cached prefix: slices run through the scheduled lane
+/// publish the replay point a cold prefill publishes.
+/// Mutation: `scheduler_prefill_ends` answers `None` → red (the walked grid
+/// cuts at 64, off the passes, and nothing is published).
+#[test]
+fn scheduled_slices_follow_the_prompt_ends() {
+    use crate::engine::hybrid_scheduler::{ScheduledPrefixAdmission, prefill_slice_ends};
+    let _host = memory::scoped_fixture_host();
+    let mut inner = cut_inner();
+    let a = join(&[&prompt(45, 1), &OPEN, &prompt(58, 3), &OPEN, &prompt(3, 4)]);
+    let Ok(ScheduledPrefixAdmission::Ready(prefix)) =
+        inner.prepare_scheduled_prefix(1, &a, &[], true, 0, 32)
+    else {
+        panic!("a text prompt is admitted at once");
+    };
+    let len = a.len() as u32;
+    let ends = inner.scheduler_prefill_ends(1, len, 0);
+    assert_eq!(ends.as_deref(), Some(&[32, 96, 110][..]));
+    assert_eq!(
+        ends.as_ref()
+            .unwrap()
+            .iter()
+            .map(|&e| e as usize)
+            .collect::<Vec<_>>(),
+        inner.prefix_states.turns[&1].ends
+    );
+    let slices = ends
+        .unwrap_or_else(|| prefill_slice_ends(0, len, inner.scheduler_prefill_slice_tokens(), []));
+    let mut start = 0;
+    for end in slices {
+        inner.activate_paged_seq(1).unwrap();
+        inner
+            .run_scheduled_prefill_slice(1, &a, &prefix, start, end as usize, gpu(), start == 0)
+            .unwrap();
+        start = end as usize;
+    }
+    finish(&mut inner);
+    assert_eq!(depths(&inner), [(96, false)]);
+}
+
+/// A layer-major group holds only whole windows of the turn's passes: with
+/// the window halved past 64 rows, the short passes run one at a time, and
+/// the states equal the window-at-a-time ones bit for bit.
+/// Mutation: a run takes passes of any length → red (a run of short
+/// passes).
+#[test]
+fn a_group_holds_only_whole_windows() {
+    let _host = memory::scoped_fixture_host();
+    let run = |pin: bool| {
+        let mut inner = reuse_inner();
+        let config = Arc::clone(&inner.decoder.config);
+        inner.decoder.host_prefill_scratch = Some(memory::prefill_scratch(&config, 32, 64));
+        inner.decoder.group_pin = Some(pin);
+        let (_, logits) = turn(&mut inner, 1, &prompt(100, 1));
+        let turn = &inner.prefix_states.turns[&1];
+        assert!(
+            turn.ends.windows(2).any(|pair| pair[1] - pair[0] < GRID),
+            "the window halves past 64 rows: {:?}",
+            turn.ends
+        );
+        for run in turn.runs(0, 100, GRID) {
+            assert!(
+                run.len() == 1 || run.iter().all(|&(start, end)| end - start == GRID),
+                "a run of several passes holds whole windows only: {run:?}"
+            );
+        }
+        let log = inner.decoder.submit_log.borrow().clone();
+        let mut cells: Vec<_> = inner
+            .prefix_states
+            .store
+            .entries()
+            .map(|entry| {
+                (
+                    entry.depth(),
+                    entry.state().arrays().map(f32s).collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        cells.sort_by_key(|(depth, _)| *depth);
+        let passes = inner.prefix_states.counters;
+        (cells, log, logits, passes)
+    };
+    let (grouped, log, grouped_logits, counters) = run(true);
+    let (windowed, _, windowed_logits, _) = run(false);
+    assert_eq!(
+        log.iter().filter(|e| *e == "qwen4::group::end").count(),
+        1,
+        "only the two whole windows below the checkpoint form a group"
+    );
+    assert_eq!(counters.refused_off_grid, 0);
+    assert_eq!(
+        grouped.iter().map(|(d, _)| *d).collect::<Vec<_>>(),
+        [64, 96]
+    );
+    assert_eq!(grouped, windowed);
+    assert_eq!(grouped_logits, windowed_logits);
+}
+
+/// `count` greedy speculative cycles from `logits`: propose two drafts,
+/// verify them with the anchor, keep the matching prefix. Each cycle's
+/// draft ids, kept rows and verify logits.
+pub(super) fn cycles(
+    inner: &mut Inner,
+    logits: &[f32],
+    count: usize,
+) -> Vec<(Vec<i32>, usize, Vec<f32>)> {
+    use crate::engine::hybrid_scheduler::{ScheduledVerifyCommit, ScheduledVerifyRow};
+    use rand::SeedableRng;
+    let params = inner.resolve_params(&crate::engine::types::ChatConfig {
+        temperature: Some(0.0),
+        enable_mtp: Some(true),
+        ..Default::default()
+    });
+    let argmax = |row: &[f32]| {
+        row.iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .unwrap()
+    };
+    let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+    let mut last = logits.to_vec();
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let anchor = argmax(&last);
+        let proposal = inner
+            .propose_mtp(1, anchor, 2, &params, &mut rng, false)
+            .unwrap();
+        let mut tokens = vec![anchor];
+        tokens.extend(proposal.draft_ids.iter().map(|&t| t as u32));
+        let verified = f32s(
+            &inner
+                .verify_mtp(&[ScheduledVerifyRow {
+                    seq_id: 1,
+                    first_position: inner.decoder.history.len() as u32,
+                    tokens: tokens.clone(),
+                    speculative: true,
+                }])
+                .unwrap(),
+        );
+        let rows: Vec<&[f32]> = verified.chunks(verified.len() / tokens.len()).collect();
+        let mut keep = 1;
+        while keep < tokens.len() && argmax(rows[keep - 1]) == tokens[keep] {
+            keep += 1;
+        }
+        inner
+            .commit_mtp(&[ScheduledVerifyCommit { seq_id: 1, keep }])
+            .unwrap()
+            .remove(0)
+            .unwrap();
+        last = rows[keep - 1].to_vec();
+        out.push((proposal.draft_ids, keep, verified));
+    }
+    out
+}
+
+/// Primes `tokens` on sequence 1, begins speculation at the prefix it
+/// resumes at as the scheduler does, and prefills: the cached prefix, the
+/// begin answer and the logits.
+pub(super) fn speculative_turn(inner: &mut Inner, tokens: &[u32]) -> (usize, bool, Vec<f32>) {
+    inner.activate_paged_seq(1).unwrap();
+    let prefix = inner.prime_prefix_state(tokens, true, 32, &[], 0).unwrap();
+    let cached = prefix.effective_cached_prefix_len();
+    let begun = inner.begin_scheduled_speculation(1, cached as u32).unwrap();
+    let logits = inner
+        .paged_prefill(&tokens[cached..], &prefix, gpu())
+        .unwrap();
+    (cached, begun, f32s(&logits))
+}
+
+/// A turn restored from a state drafts as a cold turn of its prompt does:
+/// speculation begins at the restored row, the draft history after the
+/// prefill is the cold one's bit for bit, and six greedy cycles give the
+/// same drafts, kept rows and verify logits.
+/// Mutation: `mtp.restore` drops the waiting rows → red.
+#[test]
+fn a_restored_turn_drafts_as_a_cold_turn_does() {
+    let _host = memory::scoped_fixture_host();
+    let mut inner = reuse_inner();
+    let a = prompt(100, 1);
+    let (_, begun, _) = speculative_turn(&mut inner, &a);
+    assert!(begun);
+    finish(&mut inner);
+    inner.release_scheduled_speculation(1);
+    let b = fork(&a, 98, 104, 2);
+    let (cached, begun, logits) = speculative_turn(&mut inner, &b);
+    assert_eq!((cached, begun), (96, true));
+    let warm = inner.mtp.draft_bits(1).unwrap();
+    let mut cold = reuse_inner();
+    let (cached, begun, cold_logits) = speculative_turn(&mut cold, &b);
+    assert_eq!((cached, begun), (0, true));
+    assert_eq!(logits, cold_logits);
+    assert_eq!(warm, cold.mtp.draft_bits(1).unwrap());
+    assert_eq!(warm.rows, 96);
+    assert_eq!(
+        cycles(&mut inner, &logits, 6),
+        cycles(&mut cold, &cold_logits, 6)
+    );
+}
+
+/// On a load with the MTP head an autoregressive turn still publishes its
+/// states with the draft history and drops its owner after its prefill; a
+/// follow-up that speculates resumes there and drafts as a cold one.
+/// Mutation: the prime starts no owner for a turn that has not begun
+/// speculation → red (no state is published).
+#[test]
+fn an_autoregressive_turn_on_a_draft_load_publishes_draft_states() {
+    let _host = memory::scoped_fixture_host();
+    let mut inner = reuse_inner();
+    let a = prompt(100, 1);
+    turn(&mut inner, 1, &a);
+    assert_eq!(inner.mtp.owner_frontier(1), None);
+    finish(&mut inner);
+    assert_eq!(depths(&inner), [(64, true), (96, false)]);
+    assert!(
+        inner
+            .prefix_states
+            .store
+            .entries()
+            .all(|entry| entry.state().draft.is_some())
+    );
+    let b = fork(&a, 98, 104, 2);
+    let (cached, begun, logits) = speculative_turn(&mut inner, &b);
+    assert_eq!((cached, begun), (96, true));
+    let mut cold = reuse_inner();
+    let (_, _, cold_logits) = speculative_turn(&mut cold, &b);
+    assert_eq!(logits, cold_logits);
+    assert_eq!(
+        inner.mtp.draft_bits(1).unwrap(),
+        cold.mtp.draft_bits(1).unwrap()
+    );
+}
+
+/// A point whose owner no longer holds the cold prefill's draft passes is
+/// refused, never published without its draft history.
+/// Mutation: the publication ignores a refused capture → red (a state at 96).
+#[test]
+fn a_state_without_its_draft_is_not_published() {
+    use crate::engine::hybrid_scheduler::ScheduledPrefixAdmission;
+    let _host = memory::scoped_fixture_host();
+    let mut inner = reuse_inner();
+    let a = prompt(100, 1);
+    let Ok(ScheduledPrefixAdmission::Ready(prefix)) =
+        inner.prepare_scheduled_prefix(1, &a, &[], true, 0, 32)
+    else {
+        panic!("a text prompt is admitted at once");
+    };
+    for (start, end) in [(0, 32), (32, 64), (64, 96), (96, 100)] {
+        inner.activate_paged_seq(1).unwrap();
+        inner
+            .run_scheduled_prefill_slice(1, &a, &prefix, start, end, gpu(), start == 0)
+            .unwrap();
+        if end == 64 {
+            inner.mtp.misalign(1);
+        }
+    }
+    finish(&mut inner);
+    assert_eq!(inner.prefix_states.counters.refused_draft, 1);
+    assert_eq!(depths(&inner), [(64, true)]);
+}
+
+/// The states of one conversation share the draft passes they have in
+/// common: the shallow state's segments are the deep state's first ones.
+/// Mutation: `capture` copies the draft cache for every state → red.
+#[test]
+fn states_of_one_lineage_share_their_draft_segments() {
+    let _host = memory::scoped_fixture_host();
+    let mut inner = reuse_inner();
+    turn(&mut inner, 1, &prompt(100, 1));
+    finish(&mut inner);
+    let segments = |depth: usize| {
+        let entry = inner
+            .prefix_states
+            .store
+            .entries()
+            .find(|entry| entry.depth() == depth)
+            .unwrap();
+        entry
+            .state()
+            .draft
+            .as_ref()
+            .unwrap()
+            .segments
+            .iter()
+            .map(|segment| segment.keys.as_raw_ptr())
+            .collect::<Vec<_>>()
+    };
+    let (shallow, deep) = (segments(64), segments(96));
+    assert_eq!((shallow.len(), deep.len()), (1, 2));
+    assert_eq!(shallow[..], deep[..1]);
+}
+
+/// On a load with the MTP head an autoregressive text prefill is charged at
+/// admission for the draft history it keeps (draft K/V and indexer keys of
+/// its rows, at most a window of hidden rows waiting); without the head it
+/// is charged its row only. An owner's held bytes count the segments cut
+/// out of its cache.
+/// Mutation: only a speculative turn is charged its draft → red.
+#[test]
+fn an_autoregressive_prefill_on_a_head_load_is_charged_its_draft() {
+    let _host = memory::scoped_fixture_host();
+    let mut inner = reuse_inner();
+    let c = inner.decoder.config.clone();
+    let row = memory::row_state_bytes(&c);
+    let window = inner.decoder.prefill_slice_size() as u64;
+    let waiting = 100.min(window + 1);
+    let ar = memory::draft_owner_bytes(&c, 100 - waiting, waiting, false)
+        .max(memory::draft_owner_bytes(&c, 100, 0, false));
+    assert_eq!(
+        inner.scheduled_state_candidate_bytes(1, 100, false),
+        row + ar
+    );
+    let a = prompt(100, 1);
+    let (_, begun, _) = speculative_turn(&mut inner, &a);
+    assert!(begun);
+    let (_, waiting) = inner.mtp.draft_rows(1).unwrap();
+    let frontier = inner.mtp.owner_frontier(1).unwrap() as u64;
+    let hidden = waiting as u64 + 1;
+    // The replay state at row 96 shares the segments cut out of the owner.
+    let replay = inner
+        .prefix_states
+        .store
+        .entries()
+        .find(|entry| entry.depth() == 96)
+        .unwrap();
+    let segments: u64 = replay
+        .state()
+        .draft
+        .as_ref()
+        .unwrap()
+        .segments
+        .iter()
+        .map(|segment| {
+            (segment.keys.nbytes() + segment.values.nbytes() + segment.index.nbytes()) as u64
+        })
+        .sum();
+    assert!(segments > 0);
+    assert_eq!(
+        inner.mtp.owner_held_bytes(&c, 1),
+        memory::draft_owner_bytes(&c, frontier - hidden, hidden, true) + segments
+    );
+    let mut without = reuse_inner();
+    without.has_mtp = false;
+    assert_eq!(without.scheduled_state_candidate_bytes(1, 100, false), row);
 }

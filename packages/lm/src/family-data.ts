@@ -501,6 +501,7 @@ export const MODEL_FAMILY_DATA = [
     acceptsKvFormat: true,
     acceptsMaxMemory: true,
     acceptsMaxContext: true,
+    coldRestoreEligible: true,
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen4exp'],
     ggufDiscovery: { variants: 'all', split: true },

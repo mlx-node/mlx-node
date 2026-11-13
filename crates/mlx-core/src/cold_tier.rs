@@ -432,6 +432,10 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 ///    attention pool. `ColdGroup::ConvState` serializes that state at the same
 ///    exact boundary as the K/V chain, so missing or malformed auxiliary state
 ///    reconciles to a smaller backed boundary or zero.
+///  * `qwen4_exp` stores its prefix states (GDN, PLE and draft history) as
+///    `ColdGroup::HybridCell` / `HybridDraft` objects, each written only after
+///    every K/V block of its chain is on disk; a restart restores a state
+///    only when its whole chain is (`models::qwen4_exp::prefix_disk`).
 ///
 /// Widening this list is a correctness decision, never a perf one, and it is
 /// authorized by exactly one thing: the family's restart-parity gate
@@ -445,6 +449,7 @@ const COLD_RESTORE_FAMILIES: &[&str] = &[
     "muse_glimmer",
     "lfm2",
     "lfm2_moe",
+    "qwen4_exp",
 ];
 
 /// Whether the cold tier may restore persisted paged blocks for `model_type`
@@ -1207,11 +1212,49 @@ pub fn cold_sidecar_stats() -> ColdSidecarStatsJs {
 /// survives process death and kernel panic, but a sudden power loss can leave
 /// it torn. Torn objects fail the payload checksum on the next read and are
 /// pruned as a miss, so the cost is a recomputed prefix, never wrong state.
+///
+/// The registered drain hooks run first, inside the same deadline: they hand
+/// the writes a family still holds (a state waiting for its delay) to the
+/// writer, which this drain then flushes.
 #[napi]
 pub fn cold_cache_drain(timeout_ms: u32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+    let hooks: Vec<DrainHook> = DRAIN_HOOKS
+        .lock()
+        .map(|hooks| hooks.iter().map(|(_, hook)| Arc::clone(hook)).collect())
+        .unwrap_or_default();
+    for hook in hooks {
+        hook(deadline);
+    }
     match GLOBAL.get().and_then(|slot| slot.clone()) {
-        Some(manager) => manager.drain(std::time::Duration::from_millis(timeout_ms as u64)),
+        Some(manager) => {
+            manager.drain(deadline.saturating_duration_since(std::time::Instant::now()))
+        }
         None => true,
+    }
+}
+
+/// A flush [`cold_cache_drain`] runs before the writer's own drain, given
+/// the drain's deadline. It must not touch MLX or a pool: it runs on the
+/// caller's thread. It returns as soon as nothing it holds can land any
+/// more, so the writer's drain keeps the rest of the deadline.
+pub(crate) type DrainHook = Arc<dyn Fn(std::time::Instant) + Send + Sync>;
+
+static DRAIN_HOOKS: std::sync::Mutex<Vec<(u64, DrainHook)>> = std::sync::Mutex::new(Vec::new());
+static NEXT_DRAIN_HOOK: AtomicU64 = AtomicU64::new(1);
+
+/// Registers `hook` for [`cold_cache_drain`]; the id unregisters it.
+pub(crate) fn register_drain_hook(hook: DrainHook) -> u64 {
+    let id = NEXT_DRAIN_HOOK.fetch_add(1, Ordering::Relaxed);
+    if let Ok(mut hooks) = DRAIN_HOOKS.lock() {
+        hooks.push((id, hook));
+    }
+    id
+}
+
+pub(crate) fn unregister_drain_hook(id: u64) {
+    if let Ok(mut hooks) = DRAIN_HOOKS.lock() {
+        hooks.retain(|(hook, _)| *hook != id);
     }
 }
 
@@ -1489,6 +1532,12 @@ mod tests {
         // LFM2 dense and MoE share the same exact-boundary ShortConv codec.
         assert!(cold_restore_supported("lfm2"));
         assert!(cold_restore_supported("lfm2_moe"));
+        // Flash Next: on wherever the host's switch (the env every entry
+        // writes) says so, off when it says off, off for a library caller
+        // that sets nothing.
+        assert!(resolve_persist_cold("qwen4_exp", Some("1"), None));
+        assert!(!resolve_persist_cold("qwen4_exp", Some("0"), None));
+        assert!(!resolve_persist_cold("qwen4_exp", None, None));
         // Unknown spellings still fail closed.
         for family in [
             // Fails closed on anything unrecognized, including near-misses.
@@ -1519,7 +1568,8 @@ mod tests {
                 "gemma4".to_string(),
                 "muse_glimmer".to_string(),
                 "lfm2".to_string(),
-                "lfm2_moe".to_string()
+                "lfm2_moe".to_string(),
+                "qwen4_exp".to_string()
             ]
         );
     }
@@ -2686,5 +2736,23 @@ mod cold_tier_shard_identity_tests {
             "an unreadable after-fingerprint snapshot must fail safe"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A drain runs every registered hook with its deadline before the
+    /// writer's own drain, and an unregistered hook no more.
+    /// Mutation: `cold_cache_drain` skips the hooks → red.
+    #[test]
+    fn a_drain_runs_the_registered_hooks_first() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&calls);
+        let id = register_drain_hook(Arc::new(move |deadline: std::time::Instant| {
+            assert!(deadline > std::time::Instant::now());
+            seen.fetch_add(1, Ordering::Relaxed);
+        }));
+        cold_cache_drain(500);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        unregister_drain_hook(id);
+        cold_cache_drain(500);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }
