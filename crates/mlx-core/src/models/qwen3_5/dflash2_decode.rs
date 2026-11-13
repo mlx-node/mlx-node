@@ -1498,9 +1498,9 @@ mod paged_dflash2_tests {
 
     /// Greedy paged AR: `n` tokens and the cursor after them.
     fn paged_ar(inner: &mut Qwen35Inner, prompt: &[u32], n: usize) -> Result<(Vec<u32>, u32)> {
-        let prefix = inner.prime_prefix_state(prompt, true, 0, &[], 0)?;
+        let prefix = inner.prime_dense_prefix(prompt, 0, None)?;
         let suffix = &prompt[prefix.effective_cached_prefix_len()..];
-        let logits = inner.paged_prefill(suffix, &prefix, Stream::generation())?;
+        let logits = inner.dense_paged_prefill(suffix, &prefix, None)?.0;
         let mut tokens = argmax_rows(&logits)?;
         while tokens.len() < n {
             let last = *tokens.last().expect("one token");
@@ -1916,8 +1916,8 @@ mod paged_dflash2_tests {
         let _ctx = StreamContext::new(stream);
         let mut inner = tiny_paged_int8_dflash_inner(0x5_8005);
         let prompt = prompt(44);
-        let prefix = inner.prime_prefix_state(&prompt, true, 0, &[], 0)?;
-        inner.paged_prefill(&prompt, &prefix, stream)?.eval();
+        let prefix = inner.prime_dense_prefix(&prompt, 0, None)?;
+        inner.dense_paged_prefill(&prompt, &prefix, None)?.0.eval();
         assert_eq!(cursor(&inner), 44);
         let taps = inner
             .dflash2
@@ -2045,8 +2045,8 @@ mod paged_dflash2_tests {
         PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(128)));
         let result = (|| -> Result<(Vec<u32>, Vec<u32>)> {
             let mut plain = tiny_paged_int8_dflash_inner(0x5_8007);
-            let prefix = plain.prime_prefix_state(&prompt, true, 0, &[], 0)?;
-            let plain_logits = plain.paged_prefill(&prompt, &prefix, stream)?;
+            let prefix = plain.prime_dense_prefix(&prompt, 0, None)?;
+            let plain_logits = plain.dense_paged_prefill(&prompt, &prefix, None)?.0;
             let mut tapped = tiny_paged_int8_dflash_inner(0x5_8007);
             let prefix = tapped.prime_dspark_prefix_state(&prompt, true, 0)?;
             let tapped_logits = tapped.paged_prefill_with_draft_state(&prompt, &prefix, stream)?;
@@ -2173,6 +2173,16 @@ mod paged_dflash2_tests {
         tokens: &[u32],
         decoder: crate::engine::plan::DecoderPlan,
     ) -> Result<Vec<u32>> {
+        whole_turn_with(inner, tokens, decoder, None).map(|(history, _)| history)
+    }
+
+    /// [`whole_turn`] with the request's `reuse_cache`; also the raw text.
+    fn whole_turn_with(
+        inner: &mut Qwen35Inner,
+        tokens: &[u32],
+        decoder: crate::engine::plan::DecoderPlan,
+        reuse_cache: Option<bool>,
+    ) -> Result<(Vec<u32>, String)> {
         use crate::engine::backend::{ChatBackend, TurnOutput, WholeTurnArgs};
         use crate::engine::plan::{MediaCapabilities, MediaInputs, TurnPlan};
         let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
@@ -2180,6 +2190,7 @@ mod paged_dflash2_tests {
             temperature: Some(0.0),
             max_new_tokens: Some(20),
             reasoning_effort: Some("none".to_string()),
+            reuse_cache,
             ..Default::default()
         };
         let params = ChatBackend::resolve_params(inner, &config);
@@ -2209,7 +2220,7 @@ mod paged_dflash2_tests {
             panic!("a sync turn completes");
         };
         assert_eq!(result.num_tokens, 20);
-        Ok(inner.cached_token_history.clone())
+        Ok((inner.cached_token_history.clone(), result.raw_text))
     }
 
     fn block_ids(inner: &Qwen35Inner) -> Vec<u32> {
@@ -2488,6 +2499,59 @@ mod paged_dflash2_tests {
         assert_eq!(
             whole_turn(&mut spec, &far, dflash2)?,
             whole_turn(&mut ar, &far, DecoderPlan::Autoregressive)?
+        );
+        Ok(())
+    }
+
+    /// An autoregressive turn on a draft load publishes the points a DFlash2
+    /// turn of its prompt does, each with its draft window (Splash
+    /// `configureDraftStatePlan` runs for every request), and decodes the
+    /// tokens of a twin that keeps no state; its conversation's next
+    /// autoregressive turn resumes at its replay point.
+    /// Mutation MDL1 (`draft_lane_turn` false) → red (nothing parked).
+    #[test]
+    fn ar_turn_on_a_draft_load_publishes_draft_states() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "ar_turn_on_a_draft_load_publishes_draft_states",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::backend::ChatBackend;
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let first = prompt(100);
+        let mut spec = tiny_paged_int8_dflash_inner(0x5_8140);
+        whole_turn(
+            &mut spec,
+            &first,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+        )?;
+        let mut ar = tiny_paged_int8_dflash_inner(0x5_8140);
+        let (history, text) =
+            whole_turn_with(&mut ar, &first, DecoderPlan::Autoregressive, Some(true))?;
+        let depths = parked_depths(&ar);
+        assert!(!depths.is_empty(), "the AR turn published nothing");
+        assert_eq!(depths, parked_depths(&spec));
+        assert!(
+            ar.dflash2_states
+                .store
+                .entries()
+                .all(|entry| entry.ram().is_some_and(|state| state.window.is_some())),
+            "every state carries the draft window"
+        );
+        let mut cold = tiny_paged_int8_dflash_inner(0x5_8140);
+        let (_, cold_text) =
+            whole_turn_with(&mut cold, &first, DecoderPlan::Autoregressive, Some(false))?;
+        assert!(parked_depths(&cold).is_empty());
+        assert_eq!(text, cold_text, "publishing changed the tokens");
+        let mut next = history.clone();
+        next.extend((0..12u32).map(|i| (i * 7 + 3) % VOCAB));
+        let salt = ChatBackend::resolve_params(&ar, &Default::default()).cache_salt;
+        let prefix = PagedBackend::prime_prefix_state(&mut ar, &next, true, 0, &[], salt)?;
+        assert_eq!(
+            prefix.effective_cached_prefix_len(),
+            *depths.iter().max().expect("a depth")
         );
         Ok(())
     }
@@ -3709,14 +3773,14 @@ mod paged_dflash2_tests {
         TURN_END_LOG.with(|log| log.borrow_mut().clear());
         let history = whole_turn(&mut spec, &first, dflash2)?;
         assert_eq!(
+            TURN_END_LOG.with(|log| std::mem::take(&mut *log.borrow_mut())),
+            vec!["register", "release", "end_use"]
+        );
+        assert_eq!(
             history,
             whole_turn(&mut ar, &first, DecoderPlan::Autoregressive)?
         );
         assert_eq!(history.len(), first.len() + 19);
-        assert_eq!(
-            TURN_END_LOG.with(|log| std::mem::take(&mut *log.borrow_mut())),
-            vec!["register", "release", "end_use"]
-        );
         assert!(
             !spec
                 .paged_adapter

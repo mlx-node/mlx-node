@@ -412,7 +412,7 @@ fn cap_with_a_shared_live_table_of(seed: u64, total: u32) -> Result<Qwen35Inner>
 
 /// A prefix prepare at the cap whose only takeable chain is a ladder rung
 /// the prompt does not share frees it and prepares.
-/// Mutations: drop the `claimed` wrapper in dense `prime_prefix_state`
+/// Mutations: drop the `claimed` wrapper in dense `prime_dense_prefix`
 /// → red (`Err` "paged cache could not reserve"); drop the record after
 /// the release in `prepare_turn_inner` → red (`Err`, no refusal).
 #[test]
@@ -424,7 +424,7 @@ fn prefix_prepare_at_the_cap_frees_a_marked_chain() -> Result<()> {
     let block_size = pool_block_size(&inner);
     let prompt = chain_tokens(7, 2, block_size);
     clear_grow_reclaim_log();
-    PagedBackend::prime_prefix_state(&mut inner, &prompt, true, block_size as usize, &[], 0)?;
+    inner.prime_dense_prefix(&prompt, 0, None)?;
     assert_eq!(grow_reclaim_log(), vec![GrowReclaim::Ladder]);
     assert!(inner.ladder_entries_for_test().is_empty());
     Ok(())
@@ -635,14 +635,13 @@ fn a_take_that_frees_nothing_measurable_lists_again() -> Result<()> {
     Ok(())
 }
 
-/// GDN caches a ladder rung can restore: the live state of a finished
-/// DFlash2 turn.
+/// GDN caches a ladder rung can restore: the lane the last turn on the
+/// draft load released.
 fn restorable_caches(inner: &Qwen35Inner) -> Vec<Qwen3_5LayerCache> {
-    super::state::clone_dense_linear_layer_caches(
-        &inner.config,
-        inner.caches.as_ref().expect("live caches"),
-    )
-    .expect("ready linear caches")
+    let lane = crate::models::qwen3_5::dflash2_turn::RELEASED_LANE
+        .with(|lane| lane.borrow_mut().take())
+        .expect("the turn released its lane");
+    restorable_caches_from(inner, &lane)
 }
 
 /// A fixture whose sequence 0 restored its prompt's GDN state from rung E

@@ -1143,9 +1143,9 @@ mod paged_dflash2_tests {
 
     /// Greedy paged AR: `n` tokens and the cursor after them.
     fn paged_ar(inner: &mut Qwen35MoeInner, prompt: &[u32], n: usize) -> Result<(Vec<u32>, u32)> {
-        let prefix = inner.prime_prefix_state(prompt, true, 0, &[], 0)?;
+        let prefix = inner.prime_moe_prefix(prompt, 0, None)?;
         let suffix = &prompt[prefix.effective_cached_prefix_len()..];
-        let logits = inner.paged_prefill(suffix, &prefix, Stream::generation())?;
+        let logits = inner.moe_paged_prefill(suffix, &prefix, None)?.0;
         let mut tokens = argmax_rows(&logits)?;
         while tokens.len() < n {
             let last = *tokens.last().expect("one token");
@@ -1378,6 +1378,53 @@ mod paged_dflash2_tests {
         logits.eval();
         Ok(())
     }
+    /// An autoregressive MoE turn on a draft load primes and prefills as a
+    /// DFlash2 turn (Splash `configureDraftStatePlan` runs for every
+    /// request): it parks its replay point with the draft window, its first
+    /// token is plain paged AR's, and the next autoregressive turn of the
+    /// prefix resumes there.
+    /// Mutation MDL1m (`draft_lane_turn` false) → red (nothing parked).
+    #[test]
+    fn moe_ar_turn_on_a_draft_load_publishes_draft_states() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "moe_ar_turn_on_a_draft_load_publishes_draft_states",
+        ) {
+            return Ok(());
+        }
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let a1 = prompt(40);
+        let mut plain = tiny_paged_int8_moe_dflash_inner(0x5_8105);
+        let (reference, _) = paged_ar(&mut plain, &a1, 1)?;
+        let mut inner = tiny_paged_int8_moe_dflash_inner(0x5_8105);
+        let prefix = PagedBackend::prime_prefix_state(&mut inner, &a1, true, 0, &[], 0)?;
+        let logits = PagedBackend::paged_prefill(
+            &mut inner,
+            &a1[prefix.effective_cached_prefix_len()..],
+            &prefix,
+            stream,
+        )?;
+        assert_eq!(argmax_rows(&logits)?[..1], reference[..1]);
+        inner.finalize_paged_turn(true, 0);
+        let parked: Vec<(usize, bool)> = inner
+            .dflash2_states
+            .store
+            .entries()
+            .map(|entry| {
+                (
+                    entry.depth(),
+                    entry.ram().is_some_and(|state| state.window.is_some()),
+                )
+            })
+            .collect();
+        assert_eq!(parked, vec![(32, true)]);
+        let mut a2 = a1[..32].to_vec();
+        a2.extend((0..20u32).map(|i| (i * 5 + 2) % VOCAB));
+        let prefix = PagedBackend::prime_prefix_state(&mut inner, &a2, true, 0, &[], 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len(), 32);
+        Ok(())
+    }
+
     /// Splash `Runtime::suspend` → `QwenStateStorage::releaseLane` on the
     /// MoE serial lane: a verify the host refuses (critical) suspends the
     /// lane; its two GDN cells and pending rows are gone before the wait,

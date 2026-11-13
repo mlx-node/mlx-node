@@ -17,6 +17,8 @@
 
 import { randomBytes } from 'node:crypto';
 
+import { SERVER_CLOSE_MS } from '@mlx-node/server/supervision';
+
 import { EXIT_STARTUP_FAILED } from './exit-codes.js';
 import { parseFingerprintList, QUARANTINED_ENV, TURN_JOURNAL_ENV } from './turn-journal.js';
 
@@ -48,11 +50,10 @@ export const SIDECAR_HOST_OPTIONS = Object.freeze({ port: 0, host: '127.0.0.1' }
  * How long the inference host may drain HTTP requests before aborting them.
  *
  * Kept explicit at the process seam rather than relying on the server package's
- * default: MAIN's supervisor must allow this whole interval PLUS time for
- * `InferenceHost.close()` to flush its logger and remove the paged-config temp
- * root before escalating SIGTERM to SIGKILL.
+ * default: MAIN's supervisor must allow this whole interval PLUS the SSD cache
+ * flush `InferenceHost.close()` runs after it (`INFERENCE_KILL_GRACE_MS`).
  */
-export const SIDECAR_HOST_CLOSE_TIMEOUT_MS = 5_000;
+export const SIDECAR_HOST_CLOSE_TIMEOUT_MS = SERVER_CLOSE_MS;
 
 /**
  * A fresh secret for one sidecar process.

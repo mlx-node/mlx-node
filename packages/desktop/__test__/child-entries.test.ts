@@ -298,6 +298,7 @@ describe('MAIN never links the native addon', () => {
       '@mlx-node/lm/model-discovery',
       '@mlx-node/server/host/env-policy',
       '@mlx-node/server/host/paths',
+      '@mlx-node/server/supervision',
       '@mlx-node/rerank/families',
     ]);
   });

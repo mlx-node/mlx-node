@@ -5,6 +5,7 @@ import {
   CONTROL_PANEL_PROCESS_EXIT_CAP_MS,
   CONTROL_PANEL_WORKER_SHUTDOWN_STEP_MS,
   DESKTOP_QUIT_DEADLINE_MS,
+  INFERENCE_KILL_GRACE_MS,
 } from '../src/control-panel/shutdown-timings.js';
 
 describe('CONTROL PANEL shutdown budget nesting', () => {
@@ -17,5 +18,6 @@ describe('CONTROL PANEL shutdown budget nesting', () => {
   it('leaves cleanup margin between every enclosing deadline', () => {
     expect(CONTROL_PANEL_BROKER_KILL_GRACE_MS - CONTROL_PANEL_PROCESS_EXIT_CAP_MS).toBeGreaterThanOrEqual(2_000);
     expect(DESKTOP_QUIT_DEADLINE_MS - CONTROL_PANEL_BROKER_KILL_GRACE_MS).toBeGreaterThanOrEqual(2_000);
+    expect(DESKTOP_QUIT_DEADLINE_MS - INFERENCE_KILL_GRACE_MS).toBeGreaterThanOrEqual(2_000);
   });
 });

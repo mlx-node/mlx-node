@@ -2881,48 +2881,49 @@ fn wait_and_resume<T: DFlash2Target>(
         // Splash `admit`: the lane's buffers, then the KV target; the
         // restore runs only once both are held.
         let mut restore = None;
-        let hit = match lane.decode {
-            SerialDecode::DFlash2 => {
-                let resume = plan_resume(
-                    target,
-                    lane.tokens,
-                    lane.prompt,
-                    lane.reuse,
-                    lane.cache_salt,
-                )?;
-                match resume.hit {
-                    None => Some(DFlash2Hit::Cold),
-                    Some(hit) => {
-                        let bytes = restore_bytes(&*target, hit.id, resume.restore_draft);
-                        match restore_attempt(target, claim, spec, bytes, keep, wait.hold_ended) {
-                            RestoreAttempt::Granted(reservation) => {
-                                let depth = u32::try_from(hit.depth).map_err(|_| {
-                                    Error::from_reason("DFlash2 parked state depth overflow")
-                                })?;
-                                restore = Some((hit.id, depth, resume.restore_draft, reservation));
-                                Some(DFlash2Hit::Stored(depth))
-                            }
-                            RestoreAttempt::Fail => {
-                                reopen_cold(target, lane.tokens, lane.prompt)?;
-                                Some(DFlash2Hit::Cold)
-                            }
-                            RestoreAttempt::Wait(denial) => {
-                                defer_resource_retry(
-                                    wait,
-                                    governor.now(),
-                                    &denial,
-                                    WaitReason::Memory,
-                                    false,
-                                    0,
-                                    governor.epoch(model),
-                                );
-                                continue;
-                            }
+        // On a draft load every lane's states carry the draft window, whatever
+        // it decodes with (Splash keeps one composite state per request).
+        let hit = if target.dflash2().is_some() {
+            let resume = plan_resume(
+                target,
+                lane.tokens,
+                lane.prompt,
+                lane.reuse,
+                lane.cache_salt,
+            )?;
+            match resume.hit {
+                None => Some(DFlash2Hit::Cold),
+                Some(hit) => {
+                    let bytes = restore_bytes(&*target, hit.id, resume.restore_draft);
+                    match restore_attempt(target, claim, spec, bytes, keep, wait.hold_ended) {
+                        RestoreAttempt::Granted(reservation) => {
+                            let depth = u32::try_from(hit.depth).map_err(|_| {
+                                Error::from_reason("DFlash2 parked state depth overflow")
+                            })?;
+                            restore = Some((hit.id, depth, resume.restore_draft, reservation));
+                            Some(DFlash2Hit::Stored(depth))
+                        }
+                        RestoreAttempt::Fail => {
+                            reopen_cold(target, lane.tokens, lane.prompt)?;
+                            Some(DFlash2Hit::Cold)
+                        }
+                        RestoreAttempt::Wait(denial) => {
+                            defer_resource_retry(
+                                wait,
+                                governor.now(),
+                                &denial,
+                                WaitReason::Memory,
+                                false,
+                                0,
+                                governor.epoch(model),
+                            );
+                            continue;
                         }
                     }
                 }
             }
-            SerialDecode::Autoregressive => None,
+        } else {
+            None
         };
         let mut stored = None;
         let allocation = allocate(

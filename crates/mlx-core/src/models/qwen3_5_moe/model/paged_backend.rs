@@ -311,11 +311,13 @@ impl Qwen35MoeInner {
             .get(cached..)
             .ok_or_else(|| Error::from_reason("a replay's prefix passed its tokens"))?;
         let logits = match decode {
-            crate::models::qwen3_5::dflash2_turn::SerialDecode::Autoregressive => {
+            crate::models::qwen3_5::dflash2_turn::SerialDecode::Autoregressive
+                if self.dflash2.is_none() =>
+            {
                 self.open_moe_lane_turn(tokens, cached, cache_salt, true)?;
                 self.moe_paged_prefill(suffix, &prefix, None)?.0
             }
-            crate::models::qwen3_5::dflash2_turn::SerialDecode::DFlash2 => {
+            _ => {
                 if cached == 0 {
                     self.dflash2_context = None;
                 }
@@ -395,6 +397,13 @@ impl Qwen35MoeInner {
             checkpoint_extra_keys: lookup_extra_keys.to_vec(),
             checkpoint_cache_salt: cache_salt,
         })
+    }
+
+    /// An autoregressive whole turn on a draft load primes and prefills as a
+    /// DFlash2 turn (Splash `configureDraftStatePlan` for every request): its
+    /// states carry the draft window, and its lane is released at its end.
+    pub(crate) fn draft_lane_turn(&self) -> bool {
+        self.dflash2.is_some() && self.active_scheduled_seq.is_none()
     }
 
     /// Opens the lane's state points once the prime put it at `cached`, on
@@ -676,6 +685,14 @@ impl PagedBackend for Qwen35MoeInner {
         _extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<Self::PrefixState> {
+        if self.draft_lane_turn() {
+            return crate::engine::dspark_turn::PagedDsparkBackend::prime_dspark_prefix_state(
+                self,
+                plan,
+                reuse_cache,
+                cache_salt,
+            );
+        }
         self.invalidate_dflash2_context("prime_prefix_state");
         let prefix = self.prime_moe_prefix(plan, cache_salt, None)?;
         self.open_moe_lane_turn(
@@ -691,8 +708,16 @@ impl PagedBackend for Qwen35MoeInner {
         &mut self,
         suffix_tokens: &[u32],
         prefix: &Self::PrefixState,
-        _stream: Stream,
+        stream: Stream,
     ) -> Result<MxArray> {
+        if self.draft_lane_turn() {
+            return crate::engine::dspark_turn::PagedDsparkBackend::paged_prefill_with_draft_state(
+                self,
+                suffix_tokens,
+                prefix,
+                stream,
+            );
+        }
         self.moe_paged_prefill(suffix_tokens, prefix, None)
             .map(|(logits, _)| logits)
     }

@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 
+import { FLUSH_MS } from '@mlx-node/server/supervision';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import { DESKTOP_QUIT_DEADLINE_MS } from '../src/control-panel/shutdown-timings.js';
@@ -185,12 +186,12 @@ describe('start-up', () => {
 });
 
 describe('shutdown timing', () => {
-  it('reserves cleanup time after the child host exhausts its HTTP drain budget', () => {
-    // At equality both timers race: the parent may SIGKILL before the child's
-    // forced socket teardown can flush request logs and remove the paged-config
-    // temp root. Keep a material margin within MAIN's whole-app quit deadline.
-    expect(DEFAULT_TIMINGS.killGraceMs - SIDECAR_HOST_CLOSE_TIMEOUT_MS).toBeGreaterThanOrEqual(2_000);
-    expect(DEFAULT_TIMINGS.killGraceMs).toBeLessThan(DESKTOP_QUIT_DEADLINE_MS);
+  it('reserves the SSD cache flush and cleanup after the child host exhausts its HTTP drain budget', () => {
+    // host.close() drains HTTP, then flushes the persistent SSD cache for up to
+    // FLUSH_MS; a SIGKILL inside that window loses the points a restart resumes
+    // from. Keep a margin past both within MAIN's whole-app quit deadline.
+    expect(DEFAULT_TIMINGS.killGraceMs - (SIDECAR_HOST_CLOSE_TIMEOUT_MS + FLUSH_MS)).toBeGreaterThanOrEqual(2_000);
+    expect(DESKTOP_QUIT_DEADLINE_MS - DEFAULT_TIMINGS.killGraceMs).toBeGreaterThanOrEqual(2_000);
   });
 });
 

@@ -325,11 +325,13 @@ impl Qwen35Inner {
             .get(cached..)
             .ok_or_else(|| Error::from_reason("a replay's prefix passed its tokens"))?;
         let logits = match decode {
-            crate::models::qwen3_5::dflash2_turn::SerialDecode::Autoregressive => {
+            crate::models::qwen3_5::dflash2_turn::SerialDecode::Autoregressive
+                if self.dflash2.is_none() =>
+            {
                 self.open_dense_lane_turn(tokens, cached, cache_salt, true)?;
                 self.dense_paged_prefill(suffix, &prefix, None)?.0
             }
-            crate::models::qwen3_5::dflash2_turn::SerialDecode::DFlash2 => {
+            _ => {
                 if cached == 0 {
                     self.dflash2_context = None;
                 }
@@ -432,6 +434,13 @@ impl Qwen35Inner {
 }
 
 impl Qwen35Inner {
+    /// An autoregressive whole turn on a draft load primes and prefills as a
+    /// DFlash2 turn (Splash `configureDraftStatePlan` for every request): its
+    /// states carry the draft window, and its lane is released at its end.
+    pub(crate) fn draft_lane_turn(&self) -> bool {
+        self.dflash2.is_some() && self.active_scheduled_seq.is_none()
+    }
+
     /// Opens the lane's state points once the prime put it at `cached`, on
     /// a load without a draft (a draft load's turns open their own).
     pub(crate) fn open_dense_lane_turn(
@@ -712,6 +721,14 @@ impl PagedBackend for Qwen35Inner {
         _extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<Self::PrefixState> {
+        if self.draft_lane_turn() {
+            return crate::engine::dspark_turn::PagedDsparkBackend::prime_dspark_prefix_state(
+                self,
+                plan,
+                reuse_cache,
+                cache_salt,
+            );
+        }
         let prefix = self.prime_dense_prefix(plan, cache_salt, None)?;
         self.open_dense_lane_turn(
             plan,
@@ -726,8 +743,16 @@ impl PagedBackend for Qwen35Inner {
         &mut self,
         suffix_tokens: &[u32],
         prefix: &Self::PrefixState,
-        _stream: Stream,
+        stream: Stream,
     ) -> Result<MxArray> {
+        if self.draft_lane_turn() {
+            return crate::engine::dspark_turn::PagedDsparkBackend::paged_prefill_with_draft_state(
+                self,
+                suffix_tokens,
+                prefix,
+                stream,
+            );
+        }
         self.dense_paged_prefill(suffix_tokens, prefix, None)
             .map(|(logits, _)| logits)
     }
@@ -1085,13 +1110,12 @@ impl Qwen35Inner {
         // `ChatSession` preflight.
         let mut constrained_params = args.params.clone();
         self.preflight_paged_context(args.tokens.len(), &mut constrained_params)?;
-        // An AR turn advances the request without DFlash2 taps: a future
-        // equal-length prompt must not mistake the stale draft window for the
-        // paged prefix. A rejected request has not touched the pool.
-        self.dflash2_context = None;
-        self.dflash2_turn_state = None;
-        self.dflash2_prefix
-            .note_drop("paged_whole_turn", DropKind::Dirtied);
+        if !self.draft_lane_turn() {
+            self.dflash2_context = None;
+            self.dflash2_turn_state = None;
+            self.dflash2_prefix
+                .note_drop("paged_whole_turn", DropKind::Dirtied);
+        }
         let mut constrained_args = WholeTurnArgs {
             tokens: args.tokens,
             tokenizer: args.tokenizer,
