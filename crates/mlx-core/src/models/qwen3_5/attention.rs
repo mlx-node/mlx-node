@@ -3909,9 +3909,9 @@ mod tests {
     /// A bf16 verify block of 8 rows at 131,072 tokens runs as 7 + 1 rows on
     /// the portable path. The 1-row piece is a view 14,336 bytes into a
     /// 16 KiB query buffer, which `contiguous` aliases rather than copies,
-    /// and the varlen primitive refuses a nonzero offset. Every row must
-    /// match one launch of the block bit for bit. Mutation F3 (no copy per
-    /// piece) → the second piece is refused → red.
+    /// so the varlen primitive gets q at a nonzero offset. Every row must
+    /// match one launch of the block bit for bit. A primitive that refuses a
+    /// q offset → the second piece is refused → red.
     #[cfg(target_os = "macos")]
     #[test]
     fn portable_verify_pieces_at_long_context_attend() {

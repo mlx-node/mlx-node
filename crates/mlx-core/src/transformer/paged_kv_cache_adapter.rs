@@ -6183,16 +6183,9 @@ impl PagedKVCacheAdapter {
         let last = pieces.len() - 1;
         let mut outputs = Vec::new();
         for (index, (start, end)) in pieces.into_iter().enumerate() {
-            let mut part = queries
+            let part = queries
                 .slice_axis(0, i64::from(start), i64::from(end))
                 .map_err(|e| format!("paged_prefill_attention: query rows: {e}"))?;
-            // The varlen primitive refuses a query view at a nonzero offset,
-            // and `contiguous` keeps the view when the parent buffer is small.
-            if last > 0 {
-                part = part
-                    .deep_copy()
-                    .map_err(|e| format!("paged_prefill_attention: query rows: {e}"))?;
-            }
             #[cfg(test)]
             self.portable_prefill_launches
                 .push((end - start, committed + end));
