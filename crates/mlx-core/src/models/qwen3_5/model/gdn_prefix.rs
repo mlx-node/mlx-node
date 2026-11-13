@@ -375,9 +375,16 @@ impl Qwen35Inner {
             last_used: self.cache_recency.next(),
         };
         if !claimed {
-            self.gdn_unclaimed_rungs
-                .retain(|existing| !same_rung(existing));
-            self.gdn_unclaimed_rungs.push_back(rung);
+            let reach_tokens = self.paged_adapter.as_ref().and_then(|adapter| {
+                adapter.cold_capture_reach_tokens(tokens, extra_keys_per_block, cache_salt)
+            });
+            crate::models::qwen3_5::gdn_checkpoint_store::hold_refused_rung(
+                self.gdn_unclaimed_rungs
+                    .entry(self.active_scheduled_seq)
+                    .or_default(),
+                rung,
+                reach_tokens,
+            );
             return false;
         }
         self.gdn_prefix_checkpoints
@@ -605,7 +612,12 @@ impl Qwen35Inner {
         let checkpoints: VecDeque<&DenseGdnPrefixCheckpoint> = self
             .gdn_prefix_checkpoints
             .iter()
-            .chain(&self.gdn_unclaimed_rungs)
+            .chain(
+                self.gdn_unclaimed_rungs
+                    .get(&self.active_scheduled_seq)
+                    .into_iter()
+                    .flatten(),
+            )
             .collect();
         crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar(
             "qwen3_5",

@@ -98,7 +98,7 @@ impl Qwen35Inner {
             gdn_root_cache_owner_id: None,
             gdn_root_cache_owner_is_explicit: false,
             gdn_prefix_checkpoints: VecDeque::new(),
-            gdn_unclaimed_rungs: VecDeque::new(),
+            gdn_unclaimed_rungs: HashMap::new(),
             gdn_last_history_checkpoint: None,
             gdn_in_use: HashMap::new(),
             gdn_restored_from: None,
@@ -641,6 +641,7 @@ impl Qwen35Inner {
 
     pub(super) fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
         self.scheduled_mtp.release(seq_id);
+        self.gdn_unclaimed_rungs.remove(&Some(seq_id));
         if self.active_scheduled_seq == Some(seq_id) {
             self.active_scheduled_seq = None;
             self.caches = Some(fresh_dense_layer_caches(&self.config));
@@ -1034,11 +1035,10 @@ impl Qwen35Inner {
                 if !self.paged_gdn_state_dirty {
                     self.capture_dense_gdn_cold_sidecar(image_token_positions, cache_salt);
                 }
-                self.gdn_unclaimed_rungs.clear();
+                self.gdn_unclaimed_rungs.remove(&self.active_scheduled_seq);
                 Ok(())
             }
             Err(error) => {
-                self.gdn_unclaimed_rungs.clear();
                 self.invalidate_dense_paged_session("manual finalization failure");
                 Err(Error::from_reason(format!(
                     "dense paged finalization failed: {error}"

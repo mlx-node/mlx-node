@@ -231,8 +231,10 @@ void validate_kv_scales(
 
 // Kernels use dense row-major indexing, so strided inputs need compaction.
 // CommandEncoder::set_input_array binds the array's byte offset. Read-only
-// new K/V may therefore be contiguous offset views. Keep the stricter
-// zero-offset contract for mutable pools and CPU-inspected metadata.
+// activations (q, new K/V) may therefore be contiguous offset views; q's
+// offset must be whole heads, the only q alignment the kernels address.
+// Keep the stricter zero-offset contract for mutable pools and
+// CPU-inspected metadata.
 //
 // The stricter zero-offset check passes on:
 //   - tracer arrays from `mlx::core::compile()` (default flags
@@ -257,6 +259,29 @@ void require_row_contiguous(
         << " must be row-contiguous; got non-row-contiguous view "
         << "(probably from a transpose / non-trivial slice). "
         << "Materialize a contiguous copy first via "
+        << "`mlx::core::contiguous(arr)` before passing to the primitive.";
+    throw std::invalid_argument(msg.str());
+  }
+}
+
+void require_row_contiguous_head_offset(
+    const array& arr,
+    const char* op_name,
+    const char* input_name) {
+  require_row_contiguous(arr, op_name, input_name);
+  if (arr.offset() == 0) {
+    return;
+  }
+  const int64_t head_bytes = arr.ndim() == 0
+      ? 0
+      : static_cast<int64_t>(arr.shape(-1)) *
+          static_cast<int64_t>(arr.itemsize());
+  if (head_bytes == 0 || arr.offset() % head_bytes != 0) {
+    std::ostringstream msg;
+    msg << "[validator] [" << op_name << "] " << input_name
+        << " offset must be a multiple of one head (" << head_bytes
+        << " bytes); got offset " << arr.offset()
+        << ". Materialize a contiguous copy first via "
         << "`mlx::core::contiguous(arr)` before passing to the primitive.";
     throw std::invalid_argument(msg.str());
   }
@@ -593,8 +618,8 @@ void validate_paged_attention_inputs(
     int sliding_window,
     KvDtype kv_dtype,
     const char* op_name) {
-  // 1. Contiguity + zero offset.
-  require_row_contiguous_zero_offset(q, op_name, "q");
+  // 1. Contiguity + offset rules.
+  require_row_contiguous_head_offset(q, op_name, "q");
   require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
   require_row_contiguous_zero_offset(v_pool, op_name, "v_pool");
   require_row_contiguous_zero_offset(block_table, op_name, "block_table");
@@ -1480,7 +1505,7 @@ void validate_paged_attention_varlen_inputs(
     int sliding_window,
     KvDtype kv_dtype,
     const char* op_name) {
-  require_row_contiguous_zero_offset(q, op_name, "q");
+  require_row_contiguous_head_offset(q, op_name, "q");
   require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
   require_row_contiguous_zero_offset(v_pool, op_name, "v_pool");
   require_row_contiguous_zero_offset(block_table, op_name, "block_table");
@@ -1993,7 +2018,7 @@ void validate_paged_prefill_inputs(
     KvDtype kv_dtype,
     const char* op_name) {
   namespace paged = mlx::core::fast::paged;
-  require_row_contiguous_zero_offset(q_staged, op_name, "q_staged");
+  require_row_contiguous_head_offset(q_staged, op_name, "q_staged");
   require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
   require_row_contiguous_zero_offset(v_pool, op_name, "v_pool");
   require_row_contiguous_zero_offset(k_scale, op_name, "k_scale");

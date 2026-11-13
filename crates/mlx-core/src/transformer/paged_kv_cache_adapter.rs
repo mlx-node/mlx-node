@@ -1523,6 +1523,35 @@ impl PagedKVCacheAdapter {
         self.cold_tier.as_ref()
     }
 
+    /// Tokens of `tokens` the turn-end capture walk reaches at least, under
+    /// this adapter's per-turn budget ([`ColdTierWalk::capture_reach`]).
+    /// `None` without a cold tier.
+    pub(crate) fn cold_capture_reach_tokens(
+        &self,
+        tokens: &[u32],
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> Option<u32> {
+        let cold = self.cold_tier.as_ref()?;
+        let blocks = ColdTierWalk {
+            cold,
+            pool: &self.layer_kv_pool,
+            allocator: &self.allocator,
+            block_size: self.block_size,
+            held: self.held_blocks(),
+        }
+        .capture_reach(
+            tokens,
+            cache_salt,
+            self.cold_capture_budget.max_blocks,
+            |i| extra_keys_per_block.get(i).map(Vec::as_slice),
+        );
+        Some(
+            u32::try_from((blocks as u64).saturating_mul(u64::from(self.block_size)))
+                .unwrap_or(u32::MAX),
+        )
+    }
+
     /// Take the auxiliary state the last prefix lookup restored, if any.
     ///
     /// `Some` only for a family whose [`ColdTierContext::sidecar_policy`] is
@@ -6179,20 +6208,30 @@ impl PagedKVCacheAdapter {
         {
             return self.gather_kv_for_prefill_chunk_varlen(layer_idx, queries, committed, scale);
         }
+        let pieces = portable_prefill_pieces(committed, rows);
+        let last = pieces.len() - 1;
         let mut outputs = Vec::new();
-        for (start, end) in portable_prefill_pieces(committed, rows) {
+        for (index, (start, end)) in pieces.into_iter().enumerate() {
             let part = queries
                 .slice_axis(0, i64::from(start), i64::from(end))
                 .map_err(|e| format!("paged_prefill_attention: query rows: {e}"))?;
             #[cfg(test)]
             self.portable_prefill_launches
                 .push((end - start, committed + end));
-            outputs.push(self.gather_kv_for_prefill_chunk_varlen(
+            let output = self.gather_kv_for_prefill_chunk_varlen(
                 layer_idx,
                 &part,
                 committed + start,
                 scale,
-            )?);
+            )?;
+            // Each launch allocates its own partials and frees them when its
+            // command buffer completes; evaluating a piece before the next is
+            // built keeps one piece's partials live, the priced workspace.
+            if index < last {
+                MxArray::eval_arrays(&[&output])
+                    .map_err(|e| format!("paged_prefill_attention: piece: {e}"))?;
+            }
+            outputs.push(output);
         }
         if outputs.len() == 1 {
             return Ok(outputs.remove(0));

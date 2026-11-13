@@ -110,6 +110,7 @@ impl Qwen35MoeInner {
             gdn_root_cache_owner_id: None,
             gdn_root_cache_owner_is_explicit: false,
             gdn_prefix_checkpoints: VecDeque::new(),
+            gdn_unclaimed_rungs: HashMap::new(),
             gdn_last_history_checkpoint: None,
             gdn_in_use: HashMap::new(),
             gdn_restored_from: None,
@@ -368,6 +369,7 @@ impl Qwen35MoeInner {
 
     pub(super) fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
         self.scheduled_mtp.release(seq_id);
+        self.gdn_unclaimed_rungs.remove(&Some(seq_id));
         if self.active_scheduled_seq == Some(seq_id) {
             self.active_scheduled_seq = None;
             self.caches = Some(fresh_moe_layer_caches(&self.config));
@@ -1003,6 +1005,7 @@ impl Qwen35MoeInner {
         self.cached_paged_image_token_positions.clear();
         self.cached_rope_deltas = None;
         self.gdn_prefix_checkpoints.clear();
+        self.gdn_unclaimed_rungs.clear();
         self.gdn_last_history_checkpoint = None;
         self.gdn_in_use.clear();
         self.dflash2_states.end_all_restored();

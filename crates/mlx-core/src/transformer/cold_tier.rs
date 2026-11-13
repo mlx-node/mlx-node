@@ -818,6 +818,52 @@ impl ColdTierWalk<'_> {
         outcome.elapsed = started.elapsed();
         outcome
     }
+
+    /// The leading blocks of `request_tokens` that [`Self::capture_chain`]
+    /// would cover if it ran now under `max_blocks` and every enqueue landed:
+    /// the blocks already on disk, which it re-walks for free, and up to
+    /// `max_blocks` absent ones. Blocks persisted before the capture only
+    /// deepen the real walk, so this is a lower bound on its reach.
+    pub(crate) fn capture_reach<'k>(
+        &self,
+        request_tokens: &[u32],
+        cache_salt: u64,
+        max_blocks: usize,
+        extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
+    ) -> usize {
+        let bs = self.block_size as usize;
+        if bs == 0 {
+            return 0;
+        }
+        let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
+        let mut absent = 0usize;
+        let mut reach = 0usize;
+        for i in 0..request_tokens.len() / bs {
+            let (Some(extra_keys), Some(toks)) =
+                (extra_keys_for(i), request_tokens.get(i * bs..(i + 1) * bs))
+            else {
+                break;
+            };
+            let key = mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::Kv,
+                self.cold.fingerprint,
+                parent,
+                toks,
+                extra_keys,
+                cache_salt,
+                i,
+            );
+            if !self.cold.manager.contains(&key) {
+                if absent >= max_blocks {
+                    break;
+                }
+                absent += 1;
+            }
+            parent = Some(key);
+            reach = i + 1;
+        }
+        reach
+    }
 }
 
 /// How much of the prompt one turn's cold-tier capture walk may persist.
