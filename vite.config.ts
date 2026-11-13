@@ -134,6 +134,8 @@ export default defineConfig({
     env: { MLX_AGENT_METRICS: '0' },
     watch: false,
     testTimeout: 120000, // 2 minutes
+    // A `beforeAll` that loads a checkpoint needs the same budget as a test: the 10 s default is too short on a slow CI runner.
+    hookTimeout: 120000,
     // Two lanes that never overlap: `sequence.groupOrder` makes Vitest finish
     // every pure-TS file (parallel) before the first addon file (serial).
     projects: [
