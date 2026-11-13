@@ -79,77 +79,181 @@ describe('ingestTraces', () => {
     expect(a.coldBytesRestored).toBe(2048);
   });
 
-  // Finding 11b: a subagent turn's root session id must survive ingest so a
-  // root view can include its delegated children.
-  it('stores root_session_id from a subagent trace record', async () => {
-    cpSync(FIXTURE_TRACES, dir, { recursive: true });
+  it('maps every v2 field', async () => {
+    mkdirSync(dir, { recursive: true });
+    const v2 = {
+      v: 2,
+      traceId: 'trace-v2',
+      ts: 1782036402000,
+      pid: 4242,
+      sessionId: 'sess-1',
+      model: 'claude-haiku-4-5',
+      modelId: 'Qwen3.6-35B-A3B-4bit',
+      modelType: 'qwen3_5_moe',
+      outcome: 'error',
+      errorKind: 'finish_error',
+      failPhase: 'decode',
+      endpoint: 'messages',
+      stream: true,
+      dispatch: 'continue_tool',
+      finishReason: 'error',
+      durationMs: 900.5,
+      queueMs: 12.25,
+      loadWaitMs: 30.5,
+      resolveMs: 4000.75,
+      preDispatchMs: 4100.5,
+      promptTokens: 2000,
+      cachedTokens: 1500,
+      outputTokens: 64,
+      reasoningTokens: 8,
+      prefillDoneTokens: 500,
+      ctxWindow: 262144,
+      ttftMs: 210.5,
+      prefillMs: 160.25,
+      prefillTokens: 500,
+      decodeTps: 71.5,
+      mtpCycles: 30,
+      mtpMeanAccepted: 2.1,
+      mtpMeanDrafts: 1.1,
+      mtpMeanDepth: 3,
+      mtpAcceptByPos: [0.9, 0.55, 0.2],
+      toolCount: 12,
+      toolCallCount: 2,
+      imageCount: 1,
+      concurrency: 2,
+      concurrencyPeak: 3,
+      memActiveBytes: 20_000_000_000,
+      memPeakBytes: 24_000_000_000,
+    };
+    writeFileSync(join(dir, '2026-07-20-4242.jsonl'), `${JSON.stringify(v2)}\n`);
+    await ingestTraces(dash, dir);
+    const row = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-v2')).all()[0];
+    expect(row).toMatchObject({
+      sessionId: 'sess-1',
+      ts: 1782036402000,
+      pid: 4242,
+      model: 'claude-haiku-4-5',
+      modelId: 'Qwen3.6-35B-A3B-4bit',
+      modelType: 'qwen3_5_moe',
+      modelKey: 'Qwen3.6-35B-A3B-4bit',
+      outcome: 'error',
+      errorKind: 'finish_error',
+      failPhase: 'decode',
+      endpoint: 'messages',
+      stream: 1,
+      dispatch: 'continue_tool',
+      finishReason: 'error',
+      durationMs: 900.5,
+      queueMs: 12.25,
+      loadWaitMs: 30.5,
+      resolveMs: 4000.75,
+      preDispatchMs: 4100.5,
+      promptTokens: 2000,
+      cachedTokens: 1500,
+      outputTokens: 64,
+      reasoningTokens: 8,
+      prefillDoneTokens: 500,
+      ctxWindow: 262144,
+      ttftMs: 210.5,
+      prefillMs: 160.25,
+      prefillTokens: 500,
+      decodeTps: 71.5,
+      mtpCycles: 30,
+      mtpMeanAccepted: 2.1,
+      mtpMeanDrafts: 1.1,
+      mtpMeanDepth: 3,
+      mtpAcceptByPos: '[0.9,0.55,0.2]',
+      toolCount: 12,
+      toolCallCount: 2,
+      imageCount: 1,
+      concurrency: 2,
+      concurrencyPeak: 3,
+      memActiveBytes: 20_000_000_000,
+      memPeakBytes: 24_000_000_000,
+      sourceFile: '2026-07-20-4242.jsonl',
+    });
+  });
+
+  it('fills the prefill window only from a valid measured pair', async () => {
+    mkdirSync(dir, { recursive: true });
+    const line = (traceId: string, extra: Record<string, unknown>) =>
+      JSON.stringify({ v: 2, traceId, ts: 1782036402000, model: 'm', outcome: 'ok', ttftMs: 500, ...extra });
     writeFileSync(
-      join(dir, '2026-07-02-child.jsonl'),
+      join(dir, '2026-07-20-2.jsonl'),
+      [
+        line('measured', { prefillMs: 250, prefillTokens: 400 }),
+        line('legacy', { prefillTps: 900 }),
+        line('no-tokens', { prefillMs: 250 }),
+        line('no-ms', { prefillTokens: 400 }),
+        line('zero-ms', { prefillMs: 0, prefillTokens: 400 }),
+        line('zero-tokens', { prefillMs: 250, prefillTokens: 0 }),
+      ].join('\n') + '\n',
+    );
+    await ingestTraces(dash, dir);
+    const pairs = new Map(
+      dash.db
+        .select()
+        .from(traces)
+        .all()
+        .map((r) => [r.traceId, [r.prefillMs, r.prefillTokens]]),
+    );
+    expect(pairs.get('measured')).toEqual([250, 400]);
+    for (const id of ['legacy', 'no-tokens', 'no-ms', 'zero-ms', 'zero-tokens']) {
+      expect(pairs.get(id)).toEqual([null, null]);
+    }
+  });
+
+  it('drops unknown enum values and an oversized mtpAcceptByPos', async () => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, '2026-07-20-1.jsonl'),
       `${JSON.stringify({
-        v: 1,
-        traceId: 'trace-child',
-        ts: 1782036302000,
-        sessionId: 'child-x',
-        rootSessionId: 'root-r',
-        model: 'qwen3_5',
-        durationMs: 10,
-        finishReason: 'stop',
-        promptTokens: 1,
-        cachedTokens: 0,
-        outputTokens: 1,
-        reasoningTokens: 0,
+        v: 2,
+        traceId: 'trace-odd',
+        ts: 1782036402000,
+        model: 'm',
+        outcome: 'ok',
+        endpoint: 'chat',
+        dispatch: 'resume',
+        failPhase: 'later',
+        mtpAcceptByPos: Array.from({ length: 17 }, () => 0.5),
       })}\n`,
     );
     await ingestTraces(dash, dir);
-    const row = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-child')).all()[0];
-    expect(row.sessionId).toBe('child-x');
-    expect(row.rootSessionId).toBe('root-r');
+    const row = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-odd')).all()[0];
+    expect(row.endpoint).toBeNull();
+    expect(row.dispatch).toBeNull();
+    expect(row.failPhase).toBeNull();
+    expect(row.mtpAcceptByPos).toBeNull();
   });
 
-  // Finding #7: queue_ms + resident telemetry must land in their own columns;
-  // the boolean `resident` is encoded 0/1.
-  it('stores queueMs and resident (boolean → 0/1) from a trace record', async () => {
+  it('treats a line without outcome as ok', async () => {
+    cpSync(FIXTURE_TRACES, dir, { recursive: true });
+    await ingestTraces(dash, dir);
+    const outcomes = dash.db.select({ outcome: traces.outcome }).from(traces).all();
+    expect(outcomes.map((r) => r.outcome)).toEqual(['ok', 'ok', 'ok']);
+  });
+
+  it('stores model_key from modelId, then model', async () => {
     mkdirSync(dir, { recursive: true });
+    const base = { v: 2, ts: 1782036402000, outcome: 'ok', endpoint: 'other', dispatch: 'start' };
     writeFileSync(
-      join(dir, '2026-07-20-metrics.jsonl'),
-      `${JSON.stringify({
-        v: 1,
-        traceId: 'trace-warm',
-        ts: 1782036402000,
-        model: 'qwen3_5',
-        durationMs: 500,
-        queueMs: 42,
-        resident: true,
-        finishReason: 'stop',
-        promptTokens: 1,
-        cachedTokens: 0,
-        outputTokens: 1,
-        reasoningTokens: 0,
-      })}\n${JSON.stringify({
-        v: 1,
-        traceId: 'trace-cold',
-        ts: 1782036403000,
-        model: 'qwen3_5',
-        durationMs: 900,
-        queueMs: 3100,
-        resident: false,
-        finishReason: 'stop',
-        promptTokens: 1,
-        cachedTokens: 0,
-        outputTokens: 1,
-        reasoningTokens: 0,
-      })}\n`,
+      join(dir, '2026-07-20-2.jsonl'),
+      [
+        { ...base, traceId: 'with-id', model: 'alias', modelId: 'Checkpoint-A' },
+        { ...base, traceId: 'empty-id', model: 'alias', modelId: '' },
+        { ...base, traceId: 'model-only', model: 'plain' },
+        { ...base, traceId: 'nothing' },
+      ]
+        .map((rec) => `${JSON.stringify(rec)}\n`)
+        .join(''),
     );
-    const res = await ingestTraces(dash, dir);
-    expect(res.records).toBe(2);
-
-    const warm = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-warm')).all()[0];
-    expect(warm.queueMs).toBe(42);
-    expect(warm.resident).toBe(1);
-
-    const cold = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-cold')).all()[0];
-    expect(cold.queueMs).toBe(3100);
-    expect(cold.resident).toBe(0);
+    await ingestTraces(dash, dir);
+    const keyOf = (id: string): string => dash.db.select().from(traces).where(eq(traces.traceId, id)).all()[0].modelKey;
+    expect(keyOf('with-id')).toBe('Checkpoint-A');
+    expect(keyOf('empty-id')).toBe('alias');
+    expect(keyOf('model-only')).toBe('plain');
+    expect(keyOf('nothing')).toBe('unknown');
   });
 
   /**
@@ -218,13 +322,15 @@ describe('ingestTraces', () => {
     expect(row.coldSidecarInstalled).toBeNull();
   });
 
-  // Finding #7: older JSONL without the new fields ingests them as NULL, not 0.
-  it('leaves queueMs/resident NULL when a trace record omits them', async () => {
+  // Older JSONL without the newer fields ingests them as NULL, not 0.
+  it('leaves queueMs and the v2 fields NULL when a trace record omits them', async () => {
     cpSync(FIXTURE_TRACES, dir, { recursive: true });
     await ingestTraces(dash, dir);
     const row = dash.db.select().from(traces).where(eq(traces.traceId, 'trace-bbb')).all()[0];
     expect(row.queueMs).toBeNull();
-    expect(row.resident).toBeNull();
+    expect(row.ctxWindow).toBeNull();
+    expect(row.endpoint).toBeNull();
+    expect(row.stream).toBeNull();
   });
 
   it('is idempotent on duplicate traceId', async () => {
@@ -262,9 +368,7 @@ describe('ingestTraces', () => {
     expect(dash.db.select().from(traces).all()).toHaveLength(3);
   });
 
-  // F2: a file that grew since its watermark (a new appended record) is re-read;
-  // the new record lands while the existing rows dedupe via onConflict.
-  it('re-ingests a file that was appended to after its watermark', async () => {
+  it('appends only the new tail when a file grows', async () => {
     cpSync(FIXTURE_TRACES, dir, { recursive: true });
     await ingestTraces(dash, dir);
     expect(dash.db.select().from(traces).all()).toHaveLength(3);
@@ -276,11 +380,56 @@ describe('ingestTraces', () => {
     utimesSync(file, later, later);
 
     const res = await ingestTraces(dash, dir);
-    // The changed file is read again (files === 1); the 3 originals re-process
-    // idempotently and the appended record is added → 4 rows total.
     expect(res.files).toBe(1);
+    expect(res.records).toBe(1);
     expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-appended')).all()).toHaveLength(1);
     expect(dash.db.select().from(traces).all()).toHaveLength(4);
+    const mark = dash.db.select().from(traceFiles).all()[0];
+    expect(mark.consumed).toBe(mark.lastIngestedSize);
+  });
+
+  it('falls back to replace when the bytes before the offset changed', async () => {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-07-05-rewritten.jsonl');
+    writeFileSync(file, `${traceLine('trace-A')}${traceLine('trace-B')}`);
+    await ingestTraces(dash, dir);
+
+    // Grown, but the bytes just before the old offset differ (the id is the last
+    // key): an append from the old offset would keep A and B.
+    const idLast = (traceId: string): string =>
+      `${JSON.stringify({ v: 1, ts: 1782036002000, model: 'qwen3_5', durationMs: 100, finishReason: 'stop', promptTokens: 100, outputTokens: 20, traceId })}\n`;
+    const rewritten = `${idLast('trace-X')}${idLast('trace-Y')}${idLast('trace-Z')}`;
+    expect(Buffer.byteLength(rewritten)).toBeGreaterThan(Buffer.byteLength(traceLine('trace-A')) * 2);
+    writeFileSync(file, rewritten);
+    const later = Date.now() / 1000 + 5;
+    utimesSync(file, later, later);
+    const res = await ingestTraces(dash, dir);
+    expect(res.records).toBe(3);
+    const ids = dash.db
+      .select({ id: traces.traceId })
+      .from(traces)
+      .all()
+      .map((r) => r.id)
+      .sort();
+    expect(ids).toEqual(['trace-X', 'trace-Y', 'trace-Z']);
+  });
+
+  it('leaves a partial last line for the next pass', async () => {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-07-05-torn.jsonl');
+    const whole = traceLine('trace-torn');
+    writeFileSync(file, `${traceLine('trace-first')}${whole.slice(0, 20)}`);
+    const first = await ingestTraces(dash, dir);
+    expect(first.records).toBe(1);
+    expect(dash.db.select().from(traceFiles).all()[0].consumed).toBe(Buffer.byteLength(traceLine('trace-first')));
+
+    appendFileSync(file, whole.slice(20));
+    const later = Date.now() / 1000 + 5;
+    utimesSync(file, later, later);
+    const second = await ingestTraces(dash, dir);
+    expect(second.records).toBe(1);
+    expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-torn')).all()).toHaveLength(1);
+    expect(dash.db.select().from(traces).all()).toHaveLength(2);
   });
 
   it('prunes files older than retentionDays', async () => {
@@ -405,6 +554,45 @@ describe('ingestTraces', () => {
 
     await ingestTraces(dash, dir);
     expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-fix')).all()[0].durationMs).toBe(777);
+  });
+
+  it('replaces a two-record file rewritten at the same size that keeps its last record', async () => {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-07-05-samesize.jsonl');
+    const first = (durationMs: number): string =>
+      `${JSON.stringify({ v: 1, traceId: 'trace-first', ts: 1782036002000, model: 'qwen3_5', durationMs })}\n`;
+    writeFileSync(file, `${first(100)}${traceLine('trace-last')}`);
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-first')).all()[0].durationMs).toBe(100);
+
+    writeFileSync(file, `${first(777)}${traceLine('trace-last')}`);
+    const later = Date.now() / 1000 + 5;
+    utimesSync(file, later, later);
+
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).where(eq(traces.traceId, 'trace-first')).all()[0].durationMs).toBe(777);
+    expect(dash.db.select().from(traces).all()).toHaveLength(2);
+  });
+
+  it('replaces a file that shrank into its torn last line', async () => {
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, '2026-07-05-shrunk.jsonl');
+    const torn = traceLine('trace-torn');
+    writeFileSync(file, `${traceLine('trace-A')}${torn.slice(0, 40)}`);
+    await ingestTraces(dash, dir);
+    expect(dash.db.select().from(traces).all()).toHaveLength(1);
+
+    writeFileSync(file, `${traceLine('trace-B')}${torn.slice(0, 20)}`);
+    const later = Date.now() / 1000 + 5;
+    utimesSync(file, later, later);
+
+    await ingestTraces(dash, dir);
+    const ids = dash.db
+      .select({ id: traces.traceId })
+      .from(traces)
+      .all()
+      .map((r) => r.id);
+    expect(ids).toEqual(['trace-B']);
   });
 
   // G3: an APPEND ([A] → [A,B]) still ends with both records after the

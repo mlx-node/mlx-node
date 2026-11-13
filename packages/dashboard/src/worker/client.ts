@@ -11,7 +11,7 @@
 
 import { MessageChannel, Worker } from 'node:worker_threads';
 
-import type { IngestSummary } from '../api/context.js';
+import { failedIngestSummary, type IngestSummary } from '../api/context.js';
 import { failure, type ApiResponse } from '../api/errors.js';
 import type { DbWorkerBoot, DbWorkerBootstrap, MainToWorker, WorkerToMain } from './protocol.js';
 
@@ -87,9 +87,7 @@ export interface DbWorkerClient {
 
 /** Mirrors `doIngest`'s never-throw contract: a failed rescan is a warning, not an error. */
 function unavailableSummary(reason: string): IngestSummary {
-  return {
-    traces: { files: 0, records: 0, pruned: 0, warnings: [reason] },
-  };
+  return failedIngestSummary(reason);
 }
 
 export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
@@ -118,8 +116,11 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
       dbPath: opts.dbPath,
       modelsDir: opts.modelsDir,
       tracesDir: opts.tracesDir,
+      runtimeDir: opts.runtimeDir,
       cacheRoot: opts.cacheRoot,
       agentHome: opts.agentHome,
+      chatAgentHome: opts.chatAgentHome,
+      chatIndexPath: opts.chatIndexPath,
       withdrawPort: withdrawals.port2,
     } satisfies DbWorkerBoot,
     transferList: [withdrawals.port2],

@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 import { MODEL_CATALOG } from '../../agent/src/catalog.js';
 import type { DownloadEvent } from '../src/download.js';
 import type { ApiCall } from '../src/runtime.js';
+import { splitWhitespace } from '../ui/src/lib/text-scan.js';
 import { deferred, renderPage, type RenderedPage, sequence, STUB_FAILURE, stubApi } from './render.js';
 
 const items: CatalogItem[] = MODEL_CATALOG.map((item) => ({
@@ -20,6 +21,7 @@ const items: CatalogItem[] = MODEL_CATALOG.map((item) => ({
   installed: false,
   present: false,
   blockedByForeignDir: false,
+  blocker: null,
   localRevision: null,
   localAssetsRepo: null,
   localAssetsRevision: null,
@@ -44,7 +46,13 @@ afterEach(() => {
 
 function routes(dir = '/test/onboarding') {
   return {
-    '/models': { models: [], companions: [], warnings: [], dir },
+    '/models': {
+      models: [],
+      companions: [],
+      warnings: [],
+      dir,
+      host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
+    },
     '/catalog': { items },
     '/catalog/updates': { items: [] },
     '/downloads': { jobs: [] },
@@ -55,6 +63,10 @@ async function mount() {
   page = await renderPage(createElement(MemoryRouter, null, createElement(Models, { onboarding: true })), (text) =>
     text.includes('Download model'),
   );
+}
+
+function hasButton(label: string): boolean {
+  return [...page!.container.querySelectorAll('button')].some((el) => el.textContent?.trim() === label);
 }
 
 function button(label: string): HTMLButtonElement {
@@ -128,7 +140,7 @@ describe('first model onboarding', () => {
           ? { '/downloads': { jobs: [{ id: 'ongoing', repo: visible[0].hfRepo, state: 'running' }] } }
           : {}),
       });
-      page = await renderPage(createElement(App), (text) => text.includes('YOUR LOCAL AI STARTS HERE'));
+      page = await renderPage(createElement(App), (text) => text.includes('Choose your first model'));
       const control = () =>
         action === 'mlx-node home'
           ? page!.container.querySelector<HTMLButtonElement>('[aria-label="mlx-node home"]')!
@@ -156,6 +168,7 @@ describe('first model onboarding', () => {
     dispose = stubApi({ ...routes(dir), '/models': sequence(STUB_FAILURE, library.body) });
     page = await renderPage(createElement(App), (text) => text.includes('Try again'));
     const home = page.container.querySelector<HTMLButtonElement>('[aria-label="mlx-node home"]')!;
+    expect(splitWhitespace(home.className)).toEqual(expect.arrayContaining(['font-heading', 'text-strong']));
     expect(button('Set up later').disabled).toBe(true);
     expect(home.disabled).toBe(true);
     await act(async () => {
@@ -190,7 +203,7 @@ describe('first model onboarding', () => {
       ...routes(dir),
       '/catalog': { items: items.map((item) => ({ ...item, present: item.isDefault })) },
     });
-    page = await renderPage(createElement(App), (text) => text.includes('Set up coding agents'));
+    page = await renderPage(createElement(App), (text) => text.includes('Model ready'));
     await act(async () => button('Set up coding agents').click());
     await waitFor(() => expect(window.location.pathname).toBe('/coding-agents'));
     expect(localStorage.getItem(`mlx-node:onboarding:v1:${dir}`)).toBe('done');
@@ -228,10 +241,11 @@ describe('first model onboarding', () => {
     expect(calls.find((call) => call.method === 'POST')?.body).toEqual({ repo: chosen.hfRepo });
     await act(async () => listener!({ type: 'done', id: 'chosen-job', outputDir: `/models/${chosen.slug}` }));
     await waitFor(() => expect(page!.text()).toContain('Checking download…'));
-    expect(page!.text()).not.toContain('Set up coding agents');
+    expect(page!.text()).not.toContain('Model ready');
+    expect(hasButton('Set up coding agents')).toBe(false);
     await act(async () => refreshed.release());
-    await waitFor(() => expect(page!.text()).toContain('Set up coding agents'));
-    expect(page!.text()).toContain('YOUR MODEL IS READY');
+    await waitFor(() => expect(hasButton('Set up coding agents')).toBe(true));
+    expect(page!.text()).toContain('Model ready');
     expect(page!.container.querySelector<HTMLInputElement>('input:checked')?.value).toBe(chosen.hfRepo);
   });
 
@@ -256,7 +270,7 @@ describe('first model onboarding', () => {
       },
     );
     page = await renderPage(createElement(MemoryRouter, null, createElement(Models, { onboarding: true })), (text) =>
-      text.includes('MAKING IT LOCAL'),
+      text.includes('Downloading'),
     );
     await waitFor(() => expect(listener).toBeDefined());
     expect(page.container.querySelector<HTMLInputElement>('input:checked')?.value).toBe(chosen.hfRepo);
@@ -285,7 +299,7 @@ describe('first model onboarding', () => {
       },
     );
     page = await renderPage(createElement(MemoryRouter, null, createElement(Models, { onboarding: true })), (text) =>
-      text.includes('MAKING IT LOCAL'),
+      text.includes('Downloading'),
     );
     await waitFor(() => expect(listener).toBeDefined());
     await act(async () => listener!({ type: 'error', id: 'failed-job', message: 'Connection lost' }));

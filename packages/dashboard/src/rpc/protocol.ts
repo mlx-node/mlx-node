@@ -14,8 +14,15 @@
  */
 
 import type { ApiResponse } from '../api/errors.js';
+import type { ChatHostEvent, ConversationEvent } from '../chat/types.js';
 import type { DownloadEvent } from '../download.js';
+import type { LiveEvent, LiveTopic } from '../live.js';
 import type { ApiCall } from '../runtime.js';
+
+export type { LiveEvent, LiveTopic } from '../live.js';
+
+/** What a `chat` stream watches: the host state, or one conversation. */
+export type ChatScope = { scope: 'host' } | { scope: 'conversation'; conversationId: string };
 
 /**
  * The `window.postMessage` tag the preload uses to hand the SPA its port.
@@ -45,12 +52,18 @@ export type RpcRequest =
   | { kind: 'cancel'; id: number }
   /** Open a download-progress subscription; `id` tags every event that follows. */
   | { kind: 'subscribe'; id: number; jobId: string }
-  /** Close the subscription opened under `id`. Never answered. */
+  /** Open a live engine-state subscription; `id` tags every `live` reply that follows. */
+  | { kind: 'watch'; id: number; topic: LiveTopic }
+  /** Open a Chat stream; `id` tags every `chat` reply that follows. Closed by `unsubscribe`. */
+  | ({ kind: 'chat'; id: number } & ChatScope)
+  /** Close the subscription (any kind) opened under `id`. Never answered. */
   | { kind: 'unsubscribe'; id: number };
 
 export type RpcReply =
   | { kind: 'response'; id: number; response: ApiResponse }
-  | { kind: 'event'; id: number; event: DownloadEvent };
+  | { kind: 'event'; id: number; event: DownloadEvent }
+  | { kind: 'live'; id: number; event: LiveEvent }
+  | { kind: 'chat'; id: number; event: ChatHostEvent | ConversationEvent };
 
 /**
  * Whether an inbound payload is a well-formed request. A port is only as trusted
@@ -59,7 +72,15 @@ export type RpcReply =
  */
 export function isRpcRequest(value: unknown): value is RpcRequest {
   if (typeof value !== 'object' || value === null) return false;
-  const msg = value as { kind?: unknown; id?: unknown; call?: unknown; jobId?: unknown };
+  const msg = value as {
+    kind?: unknown;
+    id?: unknown;
+    call?: unknown;
+    jobId?: unknown;
+    topic?: unknown;
+    scope?: unknown;
+    conversationId?: unknown;
+  };
   if (typeof msg.id !== 'number') return false;
   switch (msg.kind) {
     case 'call':
@@ -68,6 +89,13 @@ export function isRpcRequest(value: unknown): value is RpcRequest {
       return true;
     case 'subscribe':
       return typeof msg.jobId === 'string';
+    case 'watch':
+      return msg.topic === 'live';
+    case 'chat':
+      return (
+        msg.scope === 'host' ||
+        (msg.scope === 'conversation' && typeof msg.conversationId === 'string' && msg.conversationId !== '')
+      );
     case 'unsubscribe':
       return true;
     default:
@@ -84,6 +112,8 @@ export function isRpcReply(value: unknown): value is RpcReply {
     case 'response':
       return typeof msg.response === 'object' && msg.response !== null;
     case 'event':
+    case 'live':
+    case 'chat':
       return typeof msg.event === 'object' && msg.event !== null;
     default:
       return false;

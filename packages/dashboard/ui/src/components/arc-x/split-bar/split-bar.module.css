@@ -1,0 +1,341 @@
+.root {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1-5);
+}
+
+.readout {
+  display: flex;
+  height: 20px;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-bottom: var(--space-0-5);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.readoutKey {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  align-self: center;
+  border-radius: var(--radius-mark);
+  background: var(--c);
+}
+
+.readoutName {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  text-align: right;
+}
+
+.readoutShare {
+  font-size: var(--text-base);
+  font-weight: 500;
+}
+
+.readoutValue {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.barWrap {
+  position: relative;
+}
+
+.bar {
+  display: flex;
+  overflow: hidden;
+  gap: 2px;
+  border-radius: var(--radius-pill);
+  background: var(--surface-muted);
+}
+
+.root[data-size='dense'] .bar {
+  height: 4px;
+}
+
+.root[data-size='thin'] .bar {
+  height: 8px;
+}
+
+.root[data-size='tall'] .bar {
+  height: 28px;
+  border-radius: var(--radius-inset);
+}
+
+.segment,
+.rest {
+  min-width: 0;
+  flex-basis: 0;
+  transition:
+    flex-grow var(--duration-considered) var(--ease-standard),
+    opacity var(--duration-fast) var(--ease-standard),
+    background-color var(--duration-fast) var(--ease-standard);
+}
+
+.segment {
+  background: var(--c);
+}
+
+.segment[data-pattern='hatch'] {
+  background:
+    repeating-linear-gradient(45deg, color-mix(in oklab, var(--c) 30%, transparent) 0 1px, transparent 1px 5px),
+    color-mix(in oklab, var(--c) 5%, var(--surface));
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--c) 24%, transparent);
+}
+
+.rest {
+  background: transparent;
+}
+
+.root[data-size='tall'] .segment {
+  border-radius: var(--radius-bar);
+  background: color-mix(in oklab, var(--c) 42%, var(--surface));
+  box-shadow: inset -3px 0 0 var(--c);
+}
+
+.root[data-size='tall'] .segment[data-on] {
+  background: color-mix(in oklab, var(--c) 62%, var(--surface));
+}
+
+.root[data-size='tall'] .segment:first-child {
+  border-top-left-radius: var(--radius-inset);
+  border-bottom-left-radius: var(--radius-inset);
+}
+
+.root[data-size='tall'] .segment:last-child {
+  border-top-right-radius: var(--radius-inset);
+  border-bottom-right-radius: var(--radius-inset);
+}
+
+.root[data-active] .segment:not([data-on]) {
+  opacity: var(--dim-opacity);
+}
+
+.root[data-size='tall'] .segment {
+  transition:
+    flex-grow var(--duration-considered) var(--ease-standard),
+    opacity var(--duration-standard) var(--ease-standard),
+    background-color var(--duration-fast) var(--ease-standard);
+}
+
+.threshold {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 0;
+  border-left: 1.5px dashed var(--text-secondary);
+}
+
+.caption {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.thresholdKey {
+  width: 12px;
+  height: 0;
+  border-top: 1.5px dashed var(--text-secondary);
+}
+
+.legend {
+  display: grid;
+  gap: 2px;
+  margin: 0 calc(-1 * var(--space-2)) 0;
+  padding: 0;
+  list-style: none;
+}
+
+.legendRow {
+  display: grid;
+  min-height: var(--row-height-dense);
+  box-sizing: border-box;
+  grid-template-columns: 10px minmax(0, 1fr) auto 3.4em;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-chip);
+  font-size: var(--text-sm);
+  outline-offset: -2px;
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+
+.legendRow[data-on] {
+  background: var(--row-hover);
+}
+
+.key {
+  width: 10px;
+  height: 10px;
+  border-radius: var(--radius-mark);
+  background: var(--c);
+}
+
+.key[data-pattern='hatch'] {
+  background:
+    repeating-linear-gradient(45deg, color-mix(in oklab, var(--c) 30%, transparent) 0 1px, transparent 1px 4px),
+    color-mix(in oklab, var(--c) 5%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--c) 24%, transparent);
+}
+
+.legendName {
+  overflow: hidden;
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.legendValue,
+.legendShare {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.legendShare {
+  color: var(--text-secondary);
+}
+
+.meterRoot {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.meter {
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+  background: color-mix(in oklab, var(--tone) 16%, transparent);
+  --tone: var(--accent);
+}
+
+.meter[data-tone='warning'] {
+  --tone: var(--warning);
+}
+
+.meter[data-tone='danger'] {
+  --tone: var(--danger);
+}
+
+.meter[data-unknown] {
+  background: var(--surface-muted);
+}
+
+.meter[data-size='dense'] {
+  height: 4px;
+}
+
+.meter[data-size='thin'] {
+  height: 8px;
+}
+
+.fill {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+  background: var(--tone);
+  clip-path: inset(0 var(--rest) 0 0 round var(--radius-pill));
+  transition:
+    clip-path var(--duration-considered) var(--ease-standard),
+    background-color var(--duration-standard) var(--ease-standard);
+}
+
+.fill[data-busy]::after {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, var(--shine), transparent) no-repeat;
+  background-size: 28px 100%;
+  content: '';
+  animation: meter-shine var(--duration-shine) var(--ease-in-out) infinite;
+}
+
+.root[data-entrance='pending'] .bar {
+  clip-path: inset(0 100% 0 0);
+}
+
+.root[data-entrance='pending'] .legendRow {
+  opacity: 0;
+}
+
+.root[data-entrance='run'] .bar {
+  animation: split-draw var(--duration-considered) var(--ease-standard) both;
+}
+
+.root[data-entrance='run'] .legendRow {
+  animation: split-reveal var(--duration-standard) var(--ease-enter) calc(var(--step) * var(--stagger-item)) both;
+}
+
+.meterRoot[data-entrance='pending'] .fill {
+  clip-path: inset(0 100% 0 0 round var(--radius-pill));
+}
+
+.meterRoot[data-entrance='run'] .fill {
+  animation: meter-grow var(--duration-considered) var(--ease-standard) both;
+}
+
+@keyframes split-draw {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+
+@keyframes split-reveal {
+  from {
+    opacity: 0;
+    translate: 0 4px;
+  }
+  to {
+    opacity: 1;
+    translate: 0 0;
+  }
+}
+
+@keyframes meter-grow {
+  from {
+    clip-path: inset(0 100% 0 0 round var(--radius-pill));
+  }
+  to {
+    clip-path: inset(0 var(--rest) 0 0 round var(--radius-pill));
+  }
+}
+
+@keyframes meter-shine {
+  0% {
+    background-position: -28px 0;
+  }
+  70%,
+  100% {
+    background-position: calc(100% + 28px) 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .segment,
+  .rest,
+  .root[data-size='tall'] .segment,
+  .legendRow {
+    transition-duration: var(--duration-instant);
+    transition-property: opacity, background-color;
+  }
+  .fill {
+    transition: none;
+  }
+  .fill[data-busy]::after {
+    animation: none;
+  }
+  .root[data-entrance='run'] .bar,
+  .root[data-entrance='run'] .legendRow,
+  .meterRoot[data-entrance='run'] .fill {
+    animation: none;
+  }
+}

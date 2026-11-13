@@ -1,0 +1,12 @@
+.root {
+  flex: none;
+  align-self: stretch;
+  height: 1px;
+  margin: 0;
+  border: 0;
+  background: var(--border-subtle);
+}
+
+.root[data-tone='strong'] {
+  background: var(--border);
+}

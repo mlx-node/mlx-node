@@ -320,9 +320,10 @@ scheduler barrier, so simultaneous DFlash turns are serialized; set
 `enableMtp: false` for request pools where batched concurrency is preferred.
 
 Paged AR prefixes can also survive hot-cache eviction and process restart via
-the SSD cold tier. Enable it with `persist_paged_cache: true` in the model
-config or `MLX_PERSIST_PAGED_CACHE=1`; `mlx agent` enables persistence by
-default for supported families. Muse persists the 13 full-attention layers as
+the SSD cold tier. `mlx agent` and the desktop app engine turn it on by default
+(`mlx agent --no-persist-cache` or `MLX_PERSIST_PAGED_CACHE=0` turns it off);
+`mlx serve` takes `--persist-cache`. A library caller enables it with
+`persist_paged_cache: true` in the model config or `MLX_PERSIST_PAGED_CACHE=1`. Muse persists the 13 full-attention layers as
 the authoritative block chain and all 39 sliding layers as a companion sidecar
 at the same token boundary. A missing, corrupt, or mismatched sidecar discards
 the full-group hit and recomputes from the start. DFlash's flat caches are not

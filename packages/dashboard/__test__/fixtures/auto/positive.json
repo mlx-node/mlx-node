@@ -1,0 +1,245 @@
+{
+ "source": "the brief: these run with no card in Auto (cmd written as ls / pwd)",
+ "rows": [
+  {
+   "input": "ls",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "ls -la",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "ls src",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "cat file",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "head -n 20 file",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "tail -n 5 file",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "wc -l file",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "grep -rn word src",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "rg word",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "rg -n word src -g '*.ts'",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "find . -name '*.ts' -type f",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "sort file",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "diff a.txt b.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "pwd",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "echo text",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "mkdir -p a/b",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "touch a/b/c.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "cp a b",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "mv a b",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "echo text > out.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "cat a b >> out.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "ls 2>&1",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "ls > /dev/null",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "ls | head -n 5",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "ls && pwd",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "cd sub && npm test",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "git status",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "git --no-pager diff",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "git log --oneline -n 5",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "git add file",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "git commit -m 'text'",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "npm test",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "npm run build",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "pnpm test",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "yarn test",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "node script.js",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "python3 script.py",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "python3 -m pytest",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "make",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "make test",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "cargo build",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "cargo test",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "cargo check",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "go build ./...",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "go test ./...",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "tsc --noEmit",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "vitest run",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "input": "eslint src",
+   "kind": "bash",
+   "expect": "allow"
+  }
+ ]
+}

@@ -1,0 +1,12 @@
+.counter { position: relative; display: inline-flex; flex-direction: column; color: var(--foreground); font-family: var(--font-display); font-size: var(--text-3xl); font-weight: 500; letter-spacing: var(--tracking-display); line-height: 1; font-variant-numeric: tabular-nums; }
+.label { margin-bottom: var(--space-2); color: var(--text-muted); font-family: var(--font-body); font-size: var(--text-xs); font-weight: 400; letter-spacing: var(--tracking-body); line-height: var(--leading-body); }
+/* Each digit is a clipped wheel; separators clip sideways only so a comma keeps its tail. */
+.value { display: inline-flex; align-items: flex-start; white-space: nowrap; user-select: none; }
+/* The wheel's window reaches a little past the line box and feathers out, so a turning digit fades at the edge instead of being cut. */
+.column { --feather: .16em; position: relative; display: inline-block; overflow: hidden; margin-block: calc(var(--feather) * -1); padding-block: var(--feather); mask-image: linear-gradient(to bottom, transparent, #000 calc(var(--feather) * 1.5), #000 calc(100% - var(--feather) * 1.5), transparent); }
+.sizer { visibility: hidden; }
+.glyph { position: absolute; inset: var(--feather) 0; text-align: center; }
+.labelText { display: inline-block; }
+.labelSwap { position: relative; display: block; }
+.symbol { display: inline-block; overflow-x: clip; }
+.srOnly { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }

@@ -10,4 +10,8 @@ describe('Control Panel boot screen', () => {
     expect(html).toContain('role="status"');
     expect(html).toContain('Starting mlx-node…');
   });
+
+  it('paints the boot screen in the window background of either OS scheme', () => {
+    expect(html).toContain('light-dark(#ffffff, #141414)');
+  });
 });

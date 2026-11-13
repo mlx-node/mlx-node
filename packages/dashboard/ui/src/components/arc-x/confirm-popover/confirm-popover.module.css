@@ -1,0 +1,369 @@
+.anchor {
+  display: inline-flex;
+  flex: none;
+  vertical-align: middle;
+}
+
+.anchor[data-covered] {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.content {
+  position: relative;
+  z-index: 60;
+  width: 300px;
+  outline: none;
+}
+
+.surface {
+  position: absolute;
+  box-sizing: border-box;
+  overflow: clip;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface);
+  color: var(--foreground);
+  transition:
+    background-color var(--duration-standard) var(--ease-standard),
+    border-color var(--duration-standard) var(--ease-standard),
+    color var(--duration-standard) var(--ease-standard),
+    border-radius var(--duration-considered) var(--ease-standard),
+    box-shadow var(--duration-considered) var(--ease-standard);
+}
+
+.surface[data-look='trigger'][data-trigger='ghost'] {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.surface[data-look='trigger'][data-trigger='danger'] {
+  color: var(--danger);
+}
+
+.surface[data-look='panel'] {
+  border-radius: var(--radius-panel);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-floating);
+}
+
+.surface[data-look='success'] {
+  border-color: color-mix(in oklab, var(--success) 30%, transparent);
+  background: color-mix(in oklab, var(--success) 12%, var(--surface-raised));
+  color: var(--success);
+}
+
+.content[data-side='bottom'] > .surface {
+  top: 0;
+}
+
+.content[data-side='top'] > .surface {
+  bottom: 0;
+}
+
+.content[data-align='end'] > .surface {
+  right: 0;
+}
+
+.content[data-align='start'] > .surface {
+  left: 0;
+}
+
+.content[data-side='bottom'] .triggerFace,
+.content[data-side='bottom'] .panel,
+.content[data-side='bottom'] .successFace {
+  top: -1px;
+}
+
+.content[data-side='top'] .triggerFace,
+.content[data-side='top'] .panel,
+.content[data-side='top'] .successFace {
+  bottom: -1px;
+}
+
+.content[data-align='end'] .triggerFace,
+.content[data-align='end'] .panel,
+.content[data-align='end'] .successFace {
+  right: -1px;
+}
+
+.content[data-align='start'] .triggerFace,
+.content[data-align='start'] .panel,
+.content[data-align='start'] .successFace {
+  left: -1px;
+}
+
+.triggerFace,
+.panel,
+.successFace {
+  position: absolute;
+  box-sizing: border-box;
+}
+
+.triggerFace {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.faceLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.faceLabel svg,
+.faceIcon svg {
+  flex: none;
+}
+
+.faceIcon {
+  display: inline-flex;
+}
+
+.panel {
+  display: grid;
+  width: 300px;
+  gap: var(--space-2-5);
+  padding: var(--space-3-5);
+}
+
+.title {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: 500;
+  line-height: var(--leading-body);
+}
+
+.description {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+  text-wrap: pretty;
+  overflow-wrap: anywhere;
+}
+
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+  overflow-wrap: anywhere;
+}
+
+.noticeIcon {
+  flex: none;
+  margin-top: var(--space-0-5);
+  color: var(--warning);
+}
+
+.error {
+  border-radius: var(--radius-inset);
+  padding: var(--space-2) var(--space-2-5);
+  background: color-mix(in oklab, var(--danger) 9%, transparent);
+  animation: confirm-reveal var(--duration-standard) var(--ease-enter) both;
+}
+
+.errorTitle {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+.errorMessage {
+  margin: 0;
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.confirm[data-working] {
+  overflow: hidden;
+  cursor: progress;
+}
+
+.confirm[data-working]::after {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in oklab, var(--sweep-tone, var(--danger)) 22%, transparent),
+    transparent
+  );
+  content: '';
+  pointer-events: none;
+  animation: confirm-sweep var(--duration-sweep) var(--ease-in-out) infinite;
+}
+
+.surface[data-tone='neutral'] .confirm {
+  --sweep-tone: var(--foreground);
+}
+
+.confirm[data-working][data-static]::after {
+  background: color-mix(in oklab, var(--sweep-tone, var(--danger)) 10%, transparent);
+  animation: none;
+}
+
+.successFace {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  padding: 0 var(--space-2-5);
+  color: var(--success);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.surface[data-shape='trigger'] .triggerFace {
+  animation: confirm-face-in var(--duration-fast) var(--ease-enter) both;
+}
+
+.surface:not([data-shape='trigger']) .triggerFace {
+  animation: confirm-face-out var(--duration-instant) var(--ease-standard) both;
+}
+
+.surface[data-shape='panel'] .panel {
+  animation: confirm-panel-in var(--duration-fast) var(--ease-enter) both;
+}
+
+.surface:not([data-shape='panel']) .panel {
+  visibility: hidden;
+  animation: confirm-panel-out var(--duration-instant) var(--ease-standard) both;
+}
+
+.surface[data-shape='success'] .successFace {
+  animation: confirm-face-in var(--duration-fast) var(--ease-enter) both;
+}
+
+.surface:not([data-shape='success']) .successFace {
+  opacity: 0;
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@keyframes confirm-sweep {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes confirm-face-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes confirm-face-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes confirm-panel-in {
+  from {
+    opacity: 0;
+    filter: blur(var(--blur-subtle));
+  }
+  to {
+    opacity: 1;
+    filter: none;
+  }
+}
+
+@keyframes confirm-panel-out {
+  from {
+    visibility: visible;
+    opacity: 1;
+    filter: none;
+  }
+  to {
+    visibility: hidden;
+    opacity: 0;
+    filter: blur(var(--blur-subtle));
+  }
+}
+
+@keyframes confirm-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Same specificity as the shape rules above, so these win by order. */
+@media (prefers-reduced-motion: reduce) {
+  .surface {
+    transition-duration: var(--duration-instant);
+  }
+  .surface[data-shape] .triggerFace,
+  .surface[data-shape] .panel,
+  .surface[data-shape] .successFace,
+  .error {
+    animation-duration: var(--duration-instant);
+  }
+  .surface[data-shape] .panel,
+  .error {
+    animation-name: none;
+  }
+  .confirm[data-working]::after {
+    background: color-mix(in oklab, var(--sweep-tone, var(--danger)) 10%, transparent);
+    animation: none;
+  }
+}
+
+/* aria-disabled, not disabled: the trigger keeps its tooltip, so it must look off by hand, like Arc's :disabled. */
+.trigger[aria-disabled='true'] {
+  cursor: not-allowed;
+  color: var(--text-muted);
+}
+
+.trigger[aria-disabled='true'][data-trigger='ghost'],
+.trigger[aria-disabled='true'][data-trigger='ghost']:hover,
+.trigger[aria-disabled='true'][data-trigger='ghost']:active {
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.trigger[aria-disabled='true'][data-trigger='solid'],
+.trigger[aria-disabled='true'][data-trigger='solid']:hover,
+.trigger[aria-disabled='true'][data-trigger='solid']:active {
+  border-color: var(--border);
+  background: var(--surface-muted);
+  box-shadow: none;
+  color: var(--text-muted);
+}

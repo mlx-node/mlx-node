@@ -1,0 +1,59 @@
+{
+  "persist": true,
+  "initialize": {
+    "protocolVersion": 1,
+    "loadSession": true,
+    "pluginDirs": true,
+    "agentVersion": "1.0.45",
+    "models": [
+      {
+        "modelId": "qwen3.5-4b",
+        "totalContextTokens": 32768
+      },
+      {
+        "modelId": "qwen3.5-9b",
+        "totalContextTokens": 65536
+      }
+    ]
+  },
+  "session": {
+    "agentName": "mlx-chat",
+    "toolDefinitionsCount": 2,
+    "skills": 1,
+    "mcpServers": 1,
+    "apiBackend": "Messages",
+    "mcpReadyAfterMs": 70,
+    "modelChangedOnNewAndLoad": true,
+    "replayOnLoad": true
+  },
+  "prompts": [
+    {
+      "match": "",
+      "steps": [
+        {
+          "permission": {
+            "toolName": "run_terminal_command",
+            "kind": "execute",
+            "title": "Execute `cat /etc/hosts`",
+            "rawInput": {
+              "variant": "Bash",
+              "command": "cat /etc/hosts",
+              "description": "read",
+              "is_background": false
+            }
+          }
+        },
+        {
+          "text": "never sent",
+          "chunk": 7
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    }
+  ],
+  "faults": {}
+}

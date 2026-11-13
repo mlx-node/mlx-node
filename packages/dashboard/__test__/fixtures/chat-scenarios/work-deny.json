@@ -1,0 +1,60 @@
+{
+  "persist": true,
+  "initialize": {
+    "protocolVersion": 1,
+    "loadSession": true,
+    "pluginDirs": true,
+    "agentVersion": "1.0.45",
+    "models": [
+      {
+        "modelId": "qwen3.5-4b",
+        "totalContextTokens": 32768
+      },
+      {
+        "modelId": "qwen3.5-9b",
+        "totalContextTokens": 65536
+      }
+    ]
+  },
+  "session": {
+    "agentName": "grok-build-plan",
+    "toolDefinitionsCount": 20,
+    "skills": 1,
+    "mcpServers": 0,
+    "apiBackend": "Messages",
+    "mcpReadyAfterMs": 70,
+    "modelChangedOnNewAndLoad": true,
+    "replayOnLoad": true
+  },
+  "prompts": [
+    {
+      "match": "",
+      "steps": [
+        {
+          "permission": {
+            "toolName": "run_terminal_command",
+            "kind": "execute",
+            "title": "Execute `rm -rf build`",
+            "rawInput": {
+              "variant": "Bash",
+              "command": "rm -rf build",
+              "description": "clean",
+              "is_background": false
+            },
+            "offerEnableAlwaysApprove": true
+          }
+        },
+        {
+          "text": "never sent",
+          "chunk": 7
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    }
+  ],
+  "faults": {}
+}

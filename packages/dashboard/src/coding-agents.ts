@@ -18,6 +18,8 @@ export interface CodingAgentRow {
 }
 export interface CodingAgentsState {
   command: string | null;
+  /** Exactly what Install writes into an instruction file; null without a command. */
+  block: string | null;
   model: string | null;
   available: boolean;
   unavailableReason: string | null;
@@ -198,6 +200,7 @@ export class CodingAgentsService {
     return {
       model: this.model,
       command: this.command,
+      block: this.command !== null ? managedBlock(this.command) : null,
       available: this.model !== null && this.command !== null,
       unavailableReason: this.unavailableReason,
       agents: [...this.rows.values()].map((row) => ({ ...row })),

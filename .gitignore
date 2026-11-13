@@ -206,6 +206,9 @@ __test__/**/*.js
 
 # Dashboard UI build output (built by the package build script; not source)
 packages/dashboard/web/
+# Dashboard dev harness: generated fixture home and screenshots
+packages/dashboard/.dev-home/
+packages/dashboard/.dev-shots/
 
 # Python virtual environments
 .venv

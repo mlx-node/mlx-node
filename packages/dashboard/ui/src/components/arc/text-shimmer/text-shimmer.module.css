@@ -1,0 +1,9 @@
+/* The band is the current text color; the resting base leans toward muted text. Override with --text-shimmer-highlight and --text-shimmer-base. */
+.shimmer { --ts-highlight: var(--text-shimmer-highlight, currentColor); --ts-base: var(--text-shimmer-base, color-mix(in oklab, currentColor 12%, var(--text-muted))); }
+.stage { position: relative; display: inline-block; max-width: 100%; }
+.label { display: inline-block; max-width: 100%; background-repeat: no-repeat; -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+/* While the line springs to a new width the label keeps its own line, so it never rewraps mid morph. */
+.stage[data-sizing] .label { max-width: none; white-space: nowrap; }
+.label::selection { -webkit-text-fill-color: currentColor; }
+@supports not (color: color-mix(in oklab, red, blue)) { .label { background: none !important; -webkit-text-fill-color: currentColor; } }
+@media (forced-colors: active) { .label { background: none !important; -webkit-text-fill-color: currentColor; } }

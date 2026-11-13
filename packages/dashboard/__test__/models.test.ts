@@ -1,21 +1,34 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  truncateSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir, totalmem } from 'node:os';
+import { dirname, join } from 'node:path';
 
 import { catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
-import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
+import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished } from 'vite-plus/test';
 
+import { handleModels } from '../src/api/handlers/models.js';
 import { type CatalogItem, catalogSlug, catalogWithState } from '../src/catalog.js';
 import {
   DOWNLOAD_COMPLETE_MARKER,
   defaultModelsDir,
   deleteLocalModel,
   discoverLocalModels,
+  holdsModelFiles,
   isDownloaderOwned,
   isModelInstalled,
   isModelPresent,
   readCompletion,
+  summarizeForeignEntry,
 } from '../src/models.js';
 
 let modelsDir: string;
@@ -50,6 +63,53 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(modelsDir, { recursive: true, force: true });
+});
+
+function ggufHeader(architecture: string): Buffer {
+  const string = (text: string): Buffer => {
+    const bytes = Buffer.from(text);
+    const length = Buffer.alloc(8);
+    length.writeBigUInt64LE(BigInt(bytes.length));
+    return Buffer.concat([length, bytes]);
+  };
+  const header = Buffer.alloc(24);
+  header.write('GGUF');
+  header.writeUInt32LE(3, 4);
+  header.writeBigUInt64LE(1n, 16);
+  const stringType = Buffer.alloc(4);
+  stringType.writeUInt32LE(8);
+  return Buffer.concat([header, string('general.architecture'), stringType, string(architecture)]);
+}
+
+describe('GET /api/models', () => {
+  const paths = (dir: string) => ({ modelsDir: dir, tracesDir: '', runtimeDir: '', cacheRoot: undefined });
+
+  it('servedIds lists the served names of a GGUF directory', async () => {
+    const repo = join(modelsDir, 'gguf-repo');
+    mkdirSync(repo, { recursive: true });
+    writeFileSync(join(repo, 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
+    writeFileSync(join(repo, 'tokenizer.json'), '{}');
+    writeModel(modelsDir, 'unserved', JSON.stringify({ model_type: 'not_a_chat_family' }), 16);
+    for (const name of ['gemma4-Q6_K_XL', 'gemma4-Q4_K_XL', 'gemma4-mmproj-Q4_K_XL', 'gemma4-draft-Q4_K_XL']) {
+      writeFileSync(join(repo, `${name}.gguf`), ggufHeader('gemma4'));
+    }
+
+    const body = await handleModels(paths(modelsDir));
+    const served = Object.fromEntries(body.models.map((m) => [m.name, m.servedIds]));
+    expect(served['gguf-repo']).toEqual(['gemma4-Q4_K_XL', 'gemma4-Q6_K_XL']);
+    expect(served['model-a']).toEqual(['model-a']);
+    // Not a chat family: listed as a checkpoint, served by nothing.
+    expect(served.unserved).toEqual([]);
+  });
+
+  it('host reports memory and free disk', async () => {
+    const body = await handleModels(paths(modelsDir));
+    expect(body.host.totalMemBytes).toBe(totalmem());
+    expect(body.host.diskFreeBytes).toBeGreaterThan(0);
+    const missing = await handleModels(paths(join(modelsDir, 'does-not-exist')));
+    expect(missing.models).toEqual([]);
+    expect(missing.host.diskFreeBytes).toBeNull();
+  });
 });
 
 describe('discoverLocalModels', () => {
@@ -223,7 +283,7 @@ describe('deleteLocalModel', () => {
     mkdirSync(staging, { recursive: true });
     writeFileSync(join(staging, 'in-flight.txt'), 'active publish');
 
-    expect(() => deleteLocalModel(modelsDir, '.staging')).toThrow(/reserved/i);
+    expect(() => deleteLocalModel(modelsDir, '.staging')).toThrow('reserved');
     expect(existsSync(staging)).toBe(true);
     expect(existsSync(join(staging, 'in-flight.txt'))).toBe(true);
   });
@@ -255,7 +315,7 @@ describe('deleteLocalModel', () => {
     writeFileSync(join(outside, 'victim.txt'), 'important');
     symlinkSync(outside, join(modelsDir, 'link'));
 
-    expect(() => deleteLocalModel(modelsDir, 'link')).toThrow(/not a model checkpoint/i);
+    expect(() => deleteLocalModel(modelsDir, 'link')).toThrow('not a model checkpoint');
     // The link itself survives — it was refused, not unlinked.
     expect(lstatSync(join(modelsDir, 'link')).isSymbolicLink()).toBe(true);
     expect(existsSync(join(outside, 'victim.txt'))).toBe(true);
@@ -267,9 +327,9 @@ describe('deleteLocalModel', () => {
     // `junk/` (a dir without config.json) and `README.md` (a regular file) both
     // sit directly under modelsDir with safe names, but neither is a checkpoint
     // discovery would list — a typo/hand-crafted DELETE must not rmSync them.
-    expect(() => deleteLocalModel(modelsDir, 'junk')).toThrow(/not a model checkpoint/i);
+    expect(() => deleteLocalModel(modelsDir, 'junk')).toThrow('not a model checkpoint');
     expect(existsSync(join(modelsDir, 'junk'))).toBe(true);
-    expect(() => deleteLocalModel(modelsDir, 'README.md')).toThrow(/not a model checkpoint/i);
+    expect(() => deleteLocalModel(modelsDir, 'README.md')).toThrow('not a model checkpoint');
     expect(existsSync(join(modelsDir, 'README.md'))).toBe(true);
   });
 });
@@ -972,5 +1032,266 @@ describe('isWeightFile — companion GGUFs (projector, calibration, draft, MTP) 
     expect(isWeightFile('Qwen3.8-27B-UD-Q4_K_XL.gguf')).toBe(true);
     expect(isWeightFile('model.safetensors')).toBe(true);
     expect(isWeightFile('model.pdiparams')).toBe(true);
+  });
+});
+
+describe('catalog blocker: what is in the way, measured without following or opening', () => {
+  const QWEN = MODEL_CATALOG.find((entry) => entry.label === 'Qwen3.8-27B')!;
+  const slugDir = (): string => join(modelsDir, catalogSlug(QWEN));
+  const draftDir = (): string => join(modelsDir, QWEN.draft!.hfRepo.split('/')[1]!.toLowerCase());
+
+  it.each<[string, () => void, boolean]>([
+    ['absent', () => {}, false],
+    ['a foreign directory', () => mkdirSync(slugDir()), true],
+    [
+      'an owned partial directory',
+      () => writeCompletion(catalogSlug(QWEN), catalogRepo(QWEN), ['config.json', 'model.safetensors']),
+      false,
+    ],
+    ['a present CLI install', () => writeModel(modelsDir, catalogSlug(QWEN), CONFIG_A, 8), false],
+    ['a dangling link', () => symlinkSync(join(modelsDir, 'nowhere'), slugDir()), true],
+    ['a file', () => writeFileSync(slugDir(), 'x'), true],
+    [
+      'a foreign draft directory',
+      () => {
+        mkdirSync(draftDir());
+        writeFileSync(join(draftDir(), 'config.json'), JSON.stringify({ architectures: ['DFlash2DraftModel'] }));
+      },
+      false,
+    ],
+  ])('blocker is set exactly when blockedByForeignDir is (%s)', (name, plant, blocked) => {
+    plant();
+    const items = catalogWithState(modelsDir);
+    expect(items.find((item) => item.label === QWEN.label)!.blockedByForeignDir).toBe(blocked);
+    for (const item of items) {
+      expect(item.blocker !== null, item.slug).toBe(item.blockedByForeignDir);
+      if (item.draft !== undefined)
+        expect(item.draft.blocker !== null, item.draft.slug).toBe(item.draft.blockedByForeignDir);
+    }
+    expect(items.some((item) => item.draft?.blockedByForeignDir === true)).toBe(name === 'a foreign draft directory');
+  });
+
+  it('describes a one-file leftover directory', () => {
+    mkdirSync(slugDir());
+    writeFileSync(join(slugDir(), 'imatrix_unsloth.gguf_file'), Buffer.alloc(183));
+    expect(catalogItem('Qwen3.8-27B').blocker).toEqual({
+      kind: 'directory',
+      fileCount: 1,
+      sizeBytes: 183,
+      truncated: false,
+      names: ['imatrix_unsloth.gguf_file'],
+      listed: false,
+      modelLike: false,
+      holdsModel: false,
+      linkTarget: null,
+      dangling: false,
+    });
+  });
+
+  it('names up to three files, sorted, with their relative paths; none for four', () => {
+    const dir = join(modelsDir, 'three');
+    mkdirSync(join(dir, 'sub'), { recursive: true });
+    writeFileSync(join(dir, 'b.bin'), 'bb');
+    writeFileSync(join(dir, 'a.bin'), 'a');
+    writeFileSync(join(dir, 'sub', 'c.bin'), 'ccc');
+    expect(summarizeForeignEntry(dir)).toMatchObject({
+      fileCount: 3,
+      sizeBytes: 6,
+      names: ['a.bin', 'b.bin', 'sub/c.bin'],
+    });
+    writeFileSync(join(dir, 'd.bin'), 'd');
+    expect(summarizeForeignEntry(dir)).toMatchObject({ fileCount: 4, sizeBytes: 7, names: [] });
+  });
+
+  it('counts no files in an empty directory or one with only empty subdirectories', () => {
+    const dir = join(modelsDir, 'empty');
+    mkdirSync(dir);
+    expect(summarizeForeignEntry(dir)).toMatchObject({
+      kind: 'directory',
+      fileCount: 0,
+      sizeBytes: 0,
+      truncated: false,
+    });
+    mkdirSync(join(dir, 'a', 'b'), { recursive: true });
+    expect(summarizeForeignEntry(dir)).toMatchObject({ fileCount: 0, sizeBytes: 0, names: [] });
+  });
+
+  it('marks a config.json directory listed only when the config is a JSON object', () => {
+    const dir = join(modelsDir, 'half');
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'config.json'), CONFIG_A);
+    expect(summarizeForeignEntry(dir)).toMatchObject({ listed: true, modelLike: true });
+    writeFileSync(join(dir, 'config.json'), '[1, 2]');
+    expect(summarizeForeignEntry(dir)).toMatchObject({ listed: false, modelLike: true });
+  });
+
+  const SHARD_1 = 'model-00001-of-00002.safetensors';
+  const SHARD_2 = 'model-00002-of-00002.safetensors';
+  const INDEX = 'model.safetensors.index.json';
+  const GGUF = 'Qwen3.8-27B-UD-Q4_K_XL.gguf';
+  const indexOf = (shards: string[]): string =>
+    JSON.stringify({ weight_map: Object.fromEntries(shards.map((shard, i) => [`w${i}`, shard])) });
+  type Layout = Record<string, string | Buffer>;
+
+  function plantLayout(dir: string, layout: Layout): void {
+    mkdirSync(dir, { recursive: true });
+    for (const [file, body] of Object.entries(layout)) {
+      mkdirSync(dirname(join(dir, file)), { recursive: true });
+      writeFileSync(join(dir, file), body);
+    }
+  }
+
+  it.each<[string, Layout]>([
+    ['shards with no index', { 'config.json': CONFIG_A, [SHARD_1]: 'w', [SHARD_2]: 'w' }],
+    [
+      'shards named model.safetensors-N-of-M with no index',
+      {
+        'config.json': CONFIG_A,
+        'model.safetensors-00001-of-00002.safetensors': 'w',
+        'model.safetensors-00002-of-00002.safetensors': 'w',
+      },
+    ],
+    ['complete shards with an index that does not parse', { 'config.json': CONFIG_A, [INDEX]: '{', [SHARD_1]: 'w' }],
+    ['complete shards with an empty weight_map', { 'config.json': CONFIG_A, [INDEX]: indexOf([]), [SHARD_1]: 'w' }],
+    [
+      'an index naming a missing shard',
+      { 'config.json': CONFIG_A, [INDEX]: indexOf([SHARD_1, SHARD_2]), [SHARD_1]: 'w' },
+    ],
+    ['model.safetensors', { 'config.json': CONFIG_A, 'model.safetensors': 'w' }],
+    ['weights.safetensors', { 'config.json': CONFIG_A, 'weights.safetensors': 'w' }],
+    ['consolidated.safetensors', { 'config.json': CONFIG_A, 'consolidated.safetensors': 'w' }],
+    ['weights-N-of-M shards', { 'config.json': CONFIG_A, 'weights-00001-of-00002.safetensors': 'w' }],
+    ['only a config.json', { 'config.json': CONFIG_A }],
+    ['weights in a folder under a root config', { 'config.json': CONFIG_A, 'sub/model.safetensors': 'w' }],
+    ['a GGUF at the root and no config.json', { [GGUF]: ggufHeader('qwen35') }],
+    [
+      'a config.json and a GGUF in a variant folder',
+      { 'config.json': JSON.stringify({ model_type: 'qwen3_5' }), [`UD-Q4_K_XL/${GGUF}`]: ggufHeader('qwen35') },
+    ],
+  ])('holds model files for a layout mlx serve lists: %s', async (_name, layout) => {
+    const home = mkdtempSync(join(tmpdir(), 'dash-serve-'));
+    onTestFinished(() => rmSync(home, { recursive: true, force: true }));
+    const entry = join(home, 'entry');
+    plantLayout(entry, layout);
+    const served = (await discoverLocalChatModels(home)).map((model) => model.path);
+    expect(served.length).toBeGreaterThan(0);
+    expect(served.every((path) => path.startsWith(entry))).toBe(true);
+    expect(holdsModelFiles(entry)).toBe(true);
+    expect(summarizeForeignEntry(entry)).toMatchObject({ kind: 'directory', holdsModel: true });
+  });
+
+  it.each<[string, Layout]>([
+    [
+      'a config.json and model.safetensors only in a variant folder',
+      { 'v/config.json': CONFIG_A, 'v/model.safetensors': 'w' },
+    ],
+    ['shards with no index only in a variant folder', { [`v/${SHARD_1}`]: 'w', [`v/${SHARD_2}`]: 'w' }],
+    ['only companion GGUFs', { 'imatrix_unsloth.gguf': 'x', 'mmproj-F16.gguf': 'x', 'UD-Q4_K_XL/m-mtp.gguf': 'x' }],
+    ['a GGUF with an upper-case extension', { 'm-Q8_0.GGUF': 'x' }],
+    ['a GGUF in a dot-folder', { '.cache/m-UD-Q4_K_XL.gguf': 'x' }],
+    ['a GGUF two folders down', { 'a/b/m-UD-Q4_K_XL.gguf': 'x' }],
+    ['PyTorch weights', { 'pytorch_model.bin': 'x' }],
+    ['Paddle weights', { 'inference.pdiparams': 'x' }],
+    ['MLX arrays', { 'weights.npz': 'x' }],
+  ])('holds model files for weights mlx serve does not list: %s', async (_name, layout) => {
+    const home = mkdtempSync(join(tmpdir(), 'dash-serve-'));
+    onTestFinished(() => rmSync(home, { recursive: true, force: true }));
+    const entry = join(home, 'entry');
+    plantLayout(entry, layout);
+    expect(await discoverLocalChatModels(home)).toEqual([]);
+    expect(holdsModelFiles(entry)).toBe(true);
+  });
+
+  it.each<[string, Layout]>([
+    ['a calibration file that is not a GGUF', { 'imatrix_unsloth.gguf_file': 'x' }],
+    ['a README', { 'README.md': '# x' }],
+    ['an empty directory', {}],
+    ['a marker the app did not write', { [DOWNLOAD_COMPLETE_MARKER]: '{"files":[]}' }],
+    [
+      'Hugging Face download metadata and a tokenizer',
+      { '.cache/huggingface/download/model.safetensors.metadata': 'x', 'tokenizer.json': '{}' },
+    ],
+  ])('holds no model files for a leftover: %s', (_name, layout) => {
+    const entry = join(modelsDir, 'leftover');
+    plantLayout(entry, layout);
+    expect(holdsModelFiles(entry)).toBe(false);
+    expect(summarizeForeignEntry(entry)).toMatchObject({ kind: 'directory', holdsModel: false });
+  });
+
+  it('follows a link to a folder inside the entry, and stops at a link cycle', () => {
+    const external = mkdtempSync(join(tmpdir(), 'dash-holds-'));
+    onTestFinished(() => rmSync(external, { recursive: true, force: true }));
+    const entry = join(modelsDir, 'linked');
+    mkdirSync(entry);
+    symlinkSync(entry, join(entry, 'self'));
+    expect(holdsModelFiles(entry)).toBe(false);
+    symlinkSync(external, join(entry, 'UD-Q4_K_XL'));
+    writeFileSync(join(external, GGUF), 'x');
+    expect(holdsModelFiles(entry)).toBe(true);
+  });
+
+  it('marks a model through a link at the root, and never for a file', () => {
+    const external = mkdtempSync(join(tmpdir(), 'dash-holds-'));
+    onTestFinished(() => rmSync(external, { recursive: true, force: true }));
+    mkdirSync(join(external, 'UD-Q4_K_XL'));
+    writeFileSync(join(external, 'UD-Q4_K_XL', 'm-UD-Q4_K_XL.gguf'), 'x');
+    symlinkSync(external, slugDir());
+    expect(summarizeForeignEntry(slugDir())).toMatchObject({ kind: 'symlink', fileCount: 0, holdsModel: true });
+    rmSync(slugDir());
+    writeFileSync(slugDir(), 'x');
+    expect(summarizeForeignEntry(slugDir())).toMatchObject({ kind: 'file', holdsModel: false });
+  });
+
+  it('holds model files for a config whose name differs only in case, which a case-insensitive volume opens', () => {
+    const entry = join(modelsDir, 'cased');
+    plantLayout(entry, { 'Config.json': CONFIG_A });
+    expect(holdsModelFiles(entry)).toBe(true);
+  });
+
+  it('counts a complete checkpoint as a model too', () => {
+    writeModel(modelsDir, 'checkpoint', CONFIG_A, 8);
+    expect(holdsModelFiles(join(modelsDir, 'checkpoint'))).toBe(true);
+  });
+
+  it('describes a file at the slug path by its own size', () => {
+    writeFileSync(slugDir(), Buffer.alloc(40));
+    expect(catalogItem('Qwen3.8-27B').blocker).toMatchObject({ kind: 'file', fileCount: 1, sizeBytes: 40, names: [] });
+  });
+
+  it('never follows a link: dangling or live, its counts are 0', () => {
+    const target = join(modelsDir, 'nowhere');
+    symlinkSync(target, slugDir());
+    expect(catalogItem('Qwen3.8-27B').blocker).toMatchObject({
+      kind: 'symlink',
+      dangling: true,
+      linkTarget: target,
+      fileCount: 0,
+      sizeBytes: 0,
+    });
+    rmSync(slugDir());
+    const external = mkdtempSync(join(tmpdir(), 'dash-ext-'));
+    onTestFinished(() => rmSync(external, { recursive: true, force: true }));
+    writeFileSync(join(external, 'big.bin'), Buffer.alloc(1024 * 1024));
+    symlinkSync(external, slugDir());
+    expect(catalogItem('Qwen3.8-27B').blocker).toMatchObject({
+      kind: 'symlink',
+      dangling: false,
+      fileCount: 0,
+      sizeBytes: 0,
+    });
+  });
+
+  it('counts a link and a FIFO inside as files of no size, without opening them', () => {
+    const dir = join(modelsDir, 'odd');
+    mkdirSync(dir);
+    const external = mkdtempSync(join(tmpdir(), 'dash-ext-'));
+    onTestFinished(() => rmSync(external, { recursive: true, force: true }));
+    const big = join(external, 'big.bin');
+    writeFileSync(big, '');
+    truncateSync(big, 64 * 1024 * 1024);
+    symlinkSync(big, join(dir, 'link.bin'));
+    execFileSync('mkfifo', [join(dir, 'pipe')]);
+    writeFileSync(join(dir, 'real.bin'), 'abc');
+    expect(summarizeForeignEntry(dir)).toMatchObject({ fileCount: 3, sizeBytes: 3, truncated: false });
   });
 });

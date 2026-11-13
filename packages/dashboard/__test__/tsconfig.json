@@ -10,5 +10,5 @@
     "jsx": "react-jsx",
     "paths": { "@/*": ["../ui/src/*"] }
   },
-  "include": ["./**/*.ts"]
+  "include": ["./**/*.ts", "../ui/src/vite-env.d.ts"]
 }
