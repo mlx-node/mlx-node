@@ -7,17 +7,23 @@
 //! (`persistPagedCache`, `--no-persist-cache`, `MLX_PERSIST_PAGED_CACHE`)
 //! keeps it in a namespace directory of the cache root across restarts.
 
-use std::collections::VecDeque;
-use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Instant;
 
-use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheManager, DEFAULT_QUEUE_DEPTH};
+use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheManager};
 use sha2::{Digest, Sha256};
+
+#[cfg(unix)]
+use {
+    mlx_paged_attn::DEFAULT_QUEUE_DEPTH,
+    std::collections::VecDeque,
+    std::fs::{self, File, OpenOptions},
+    std::os::fd::AsRawFd,
+    std::os::unix::fs::{MetadataExt, OpenOptionsExt},
+    std::sync::Mutex,
+    std::time::{Duration, SystemTime},
+};
 
 const GIB: u64 = 1 << 30;
 
@@ -26,17 +32,22 @@ pub(crate) const AUTOMATIC_CACHE_DISK_BYTES: u64 = 32 * GIB;
 
 /// Splash `kStaleCache`: a namespace nobody used for this long goes at the
 /// next start.
+#[cfg(unix)]
 const STALE_CACHE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 /// Splash `CacheDirectory::kNamespaceDigits`.
 const NAMESPACE_DIGITS: usize = 32;
 
+#[cfg(unix)]
 const LOCK_FILE: &str = "lock";
+#[cfg(unix)]
 const TEMP_PREFIX: &str = "mlx-node-cache-";
+#[cfg(unix)]
 const TEMP_CREATING_PREFIX: &str = ".mlx-node-cache-new-";
 
 /// Splash `kCacheLockWait`: a restarting server's new load can race the end
 /// of the old one.
+#[cfg(unix)]
 fn cache_lock_wait() -> Duration {
     if cfg!(test) {
         Duration::ZERO
@@ -152,27 +163,32 @@ impl DiskTierOptions {
 }
 
 /// Splash `diskFloorBytes`.
+#[cfg(unix)]
 pub(crate) fn disk_floor_bytes(volume: u64) -> u64 {
     (10 * GIB).min(volume / 20)
 }
 
 /// Splash `diskRoomBytes`.
+#[cfg(unix)]
 pub(crate) fn disk_room_bytes(available: u64, held: u64, floor: u64) -> u64 {
     available.saturating_add(held).saturating_sub(floor)
 }
 
 /// Splash `diskLimitBytes`: an automatic tier keeps a quarter of the room.
+#[cfg(unix)]
 pub(crate) fn disk_limit_bytes(quota: u64, available: u64, held: u64, floor: u64) -> u64 {
     let room = disk_room_bytes(available, held, floor);
     quota.min(room / 4)
 }
 
 /// Splash `diskActiveLimitBytes`: a size may take all of the room.
+#[cfg(unix)]
 pub(crate) fn disk_active_limit_bytes(quota: u64, available: u64, held: u64, floor: u64) -> u64 {
     quota.min(disk_room_bytes(available, held, floor))
 }
 
 /// Splash `DiskVolume`.
+#[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Volume {
     pub available: u64,
@@ -183,6 +199,7 @@ pub(crate) struct Volume {
 
 /// Splash `volumeOf`: the volume of `path`, or of its nearest existing
 /// ancestor.
+#[cfg(unix)]
 pub(crate) fn volume_of(path: &Path) -> Option<Volume> {
     #[cfg(test)]
     if let Some(volume) = VOLUMES.with(|volumes| {
@@ -205,7 +222,7 @@ pub(crate) fn volume_of(path: &Path) -> Option<Volume> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     /// Volumes the tests give paths under these roots.
     pub(crate) static VOLUMES: std::cell::RefCell<Vec<(PathBuf, Option<Volume>)>> =
@@ -220,6 +237,7 @@ thread_local! {
 
 /// The writer's queue depth and its free-space reserve over a volume whose
 /// floor is `floor`.
+#[cfg(unix)]
 fn writer_shape(floor: u64) -> (usize, u64) {
     #[cfg(test)]
     if let Some(shape) = TEST_WRITER.with(std::cell::Cell::get) {
@@ -252,7 +270,7 @@ fn measure_volume(directory: &Path) -> Option<Volume> {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn measure_volume(directory: &Path) -> Option<Volume> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(directory.as_os_str().as_bytes()).ok()?;
@@ -272,12 +290,14 @@ fn measure_volume(directory: &Path) -> Option<Volume> {
     })
 }
 
+#[cfg(unix)]
 fn gibibytes(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / GIB as f64)
 }
 
 /// Splash `automaticDiskRefusal`: why an automatic tier stays off on
 /// `volume`, whose caches nobody holds come to `held` bytes.
+#[cfg(unix)]
 pub(crate) fn automatic_disk_refusal(
     volume: Option<&Volume>,
     held: u64,
@@ -304,6 +324,7 @@ pub(crate) fn automatic_disk_refusal(
 /// The limit a tier of `cache_disk` keeps on `volume` (Splash `DiskSpace`):
 /// an automatic one a quarter of the room, a size all of it; a volume the
 /// tier does not follow leaves the size as it is.
+#[cfg(unix)]
 fn tier_limit(cache_disk: CacheDisk, volume: Option<&Volume>, held: u64) -> u64 {
     let quota = cache_disk.nominal_bytes();
     match volume.filter(|volume| volume.local) {
@@ -391,6 +412,7 @@ pub(crate) fn cache_namespace(ns: &CacheNamespace<'_>) -> (String, ColdCacheFing
 
 /// A temporary tier dies with its process, so it is keyed by random bytes
 /// and hashes no weights.
+#[cfg(unix)]
 fn temporary_fingerprint() -> ColdCacheFingerprint {
     let random = uuid::Uuid::new_v4();
     ColdCacheFingerprint::from_components([b"mlx-node-temp-tier".as_slice(), random.as_bytes()])
@@ -404,6 +426,7 @@ pub(crate) struct PersistentIdentity {
     pub kv: ColdCacheFingerprint,
 }
 
+#[cfg(unix)]
 enum TierHold {
     Temp { dir: PathBuf, _lock: File },
     Persistent { _lock: File },
@@ -421,12 +444,15 @@ pub(crate) struct DiskTier {
     pub held: u64,
     pub state_fingerprint: ColdCacheFingerprint,
     pub kv_fingerprint: ColdCacheFingerprint,
+    #[cfg(unix)]
     hold: Mutex<Option<TierHold>>,
     /// The root's other caches nobody held at open, oldest first; none for a
     /// temporary tier.
+    #[cfg(unix)]
     others: Mutex<VecDeque<Idle>>,
 }
 
+#[cfg(unix)]
 impl DiskTier {
     /// Until [`Self::close`], and while no write failed for anything but
     /// room: the writer takes jobs.
@@ -552,6 +578,7 @@ impl TierHandle {
     }
 }
 
+#[cfg(unix)]
 impl Drop for DiskTier {
     fn drop(&mut self) {
         self.close(Instant::now());
@@ -561,6 +588,7 @@ impl Drop for DiskTier {
 /// Removes a closed temporary tier's directory. The stopped writer may still
 /// be finishing one write in it, so a removal that finds the directory
 /// refilled tries again until `deadline`.
+#[cfg(unix)]
 fn remove_temp_dir(dir: &Path, deadline: Instant) {
     let mut result = fs::remove_dir_all(dir);
     while let Err(error) = &result {
@@ -580,12 +608,14 @@ fn remove_temp_dir(dir: &Path, deadline: Instant) {
     }
 }
 
+#[cfg(unix)]
 fn owned_by_me(meta: &fs::Metadata) -> bool {
     // SAFETY: geteuid has no preconditions and cannot fail.
     meta.uid() == unsafe { libc::geteuid() }
 }
 
 /// Takes `file`'s lock without waiting.
+#[cfg(unix)]
 fn try_lock(file: &File) -> bool {
     // SAFETY: the descriptor is open for the call's duration.
     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
@@ -593,6 +623,7 @@ fn try_lock(file: &File) -> bool {
 
 /// The `lock` of the cache directory `dir` taken, when nobody holds it.
 /// A directory whose lock is missing is nobody's.
+#[cfg(unix)]
 enum Taken {
     Lock(File),
     NoLock,
@@ -603,6 +634,7 @@ enum Taken {
 /// directory's path still names it. A removal of the namespace as a cache
 /// nobody holds takes the lock away, so a process that held, or waited for,
 /// the same lock may hold one that names nothing.
+#[cfg(unix)]
 pub(crate) fn named(dir: &Path, lock: &File) -> bool {
     let (Ok(held), Ok(current)) = (lock.metadata(), fs::symlink_metadata(dir.join(LOCK_FILE)))
     else {
@@ -611,6 +643,7 @@ pub(crate) fn named(dir: &Path, lock: &File) -> bool {
     held.dev() == current.dev() && held.ino() == current.ino()
 }
 
+#[cfg(unix)]
 fn take_lock(dir: &Path) -> Taken {
     match OpenOptions::new()
         .read(true)
@@ -628,6 +661,7 @@ fn take_lock(dir: &Path) -> Taken {
 /// Removes every published temporary cache under `temp_root` whose lock
 /// nobody holds (a crashed process's). A directory still being made has a
 /// dot name and is never touched.
+#[cfg(unix)]
 pub(crate) fn sweep_temp_leftovers(temp_root: &Path) -> usize {
     let Ok(entries) = fs::read_dir(temp_root) else {
         return 0;
@@ -660,6 +694,7 @@ pub(crate) fn sweep_temp_leftovers(temp_root: &Path) -> usize {
 
 /// Makes a temporary cache: created under a dot name, its lock taken, then
 /// published under the name a sweep matches.
+#[cfg(unix)]
 fn make_temp_dir(temp_root: &Path) -> Result<(PathBuf, File), String> {
     use std::os::unix::ffi::OsStrExt;
     let template = temp_root.join(format!("{TEMP_CREATING_PREFIX}XXXXXX"));
@@ -704,12 +739,14 @@ fn make_temp_dir(temp_root: &Path) -> Result<(PathBuf, File), String> {
 
 /// A namespace directory of the cache root that nobody holds (Splash
 /// `CacheDirectory::Idle`), with its lock taken while it is looked at.
+#[cfg(unix)]
 struct Idle {
     path: PathBuf,
     bytes: u64,
     last_use: SystemTime,
 }
 
+#[cfg(unix)]
 fn namespace_name(name: &str) -> bool {
     name.len() == NAMESPACE_DIGITS
         && name
@@ -718,6 +755,7 @@ fn namespace_name(name: &str) -> bool {
 }
 
 /// Bytes and the newest modification time of the files in `dir`.
+#[cfg(unix)]
 fn usage(dir: &Path) -> (u64, SystemTime) {
     let mut bytes = 0u64;
     let mut last_use = SystemTime::UNIX_EPOCH;
@@ -741,6 +779,7 @@ fn usage(dir: &Path) -> (u64, SystemTime) {
 }
 
 /// Splash `CacheDirectory::idle`: the root's namespaces whose lock is free.
+#[cfg(unix)]
 fn idle_caches(root: &Path) -> Vec<Idle> {
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
@@ -771,6 +810,7 @@ fn idle_caches(root: &Path) -> Vec<Idle> {
 }
 
 /// Removes `cache` when its lock is still free.
+#[cfg(unix)]
 fn remove_idle(cache: &Idle) -> bool {
     let held = match take_lock(&cache.path) {
         Taken::Lock(lock) => Some(lock),
@@ -782,6 +822,7 @@ fn remove_idle(cache: &Idle) -> bool {
     removed
 }
 
+#[cfg(unix)]
 enum PersistentOpen {
     Open { dir: PathBuf, lock: File },
     Held(PathBuf),
@@ -790,6 +831,7 @@ enum PersistentOpen {
 
 /// Splash `CacheDirectory::open`: the namespace's directory with its lock,
 /// waiting up to [`cache_lock_wait`] for another process to let go.
+#[cfg(unix)]
 fn open_persistent_dir(root: &Path, namespace: &str) -> PersistentOpen {
     if let Err(error) = fs::create_dir_all(root) {
         return PersistentOpen::Failed(format!("make {}: {error}", root.display()));
@@ -856,6 +898,7 @@ fn open_persistent_dir(root: &Path, namespace: &str) -> PersistentOpen {
 /// Splash `openDiskTier`: the tier of a load whose state is `state_bytes`,
 /// or `None` (logged) when it stays off. `identity` runs only when the
 /// options read one ([`DiskTierOptions::reads_identity`]).
+#[cfg(unix)]
 pub(crate) fn open_disk_tier(
     options: &DiskTierOptions,
     identity: impl FnOnce() -> Option<PersistentIdentity>,
@@ -886,6 +929,7 @@ pub(crate) fn open_disk_tier(
 
 /// Splash `CacheDirectory::removeStale`: each cache unused for
 /// [`STALE_CACHE`] goes while nobody holds it; the others are kept.
+#[cfg(unix)]
 fn remove_stale(caches: Vec<Idle>) -> Vec<Idle> {
     let now = SystemTime::now();
     caches
@@ -905,6 +949,7 @@ fn remove_stale(caches: Vec<Idle>) -> Vec<Idle> {
         .collect()
 }
 
+#[cfg(unix)]
 fn open_tier(
     options: &DiskTierOptions,
     identity: impl FnOnce() -> Option<PersistentIdentity>,
@@ -972,6 +1017,7 @@ fn open_tier(
     }
 }
 
+#[cfg(unix)]
 fn open_temporary(
     options: &DiskTierOptions,
     temp_root: &Path,
@@ -1006,6 +1052,7 @@ fn open_temporary(
     }))
 }
 
+#[cfg(unix)]
 fn open_persistent(
     options: &DiskTierOptions,
     root: &Path,
@@ -1052,5 +1099,35 @@ fn open_persistent(
     }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(windows)]
+impl DiskTier {
+    pub(crate) fn is_open(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn close(&self, _deadline: Instant) -> bool {
+        true
+    }
+
+    pub(crate) fn measure(&self) {}
+}
+
+#[cfg(windows)]
+pub(crate) fn open_disk_tier(
+    options: &DiskTierOptions,
+    _identity: impl FnOnce() -> Option<PersistentIdentity>,
+    _state_bytes: u64,
+) -> Option<Arc<DiskTier>> {
+    if options.cache_disk != CacheDisk::Off {
+        tracing::debug!("DFlash2 SSD cache is unavailable on Windows");
+    }
+    None
+}
+
+#[cfg(windows)]
+pub(crate) fn sweep_temp_leftovers(_temp_root: &Path) -> usize {
+    0
+}

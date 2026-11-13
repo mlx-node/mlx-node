@@ -197,6 +197,8 @@ async function bootstrap(): Promise<void> {
     resourcesPath: process.resourcesPath,
     packaged: app.isPackaged,
     userData,
+    platform: process.platform,
+    arch: process.arch,
   });
 
   // Synchronously, before the first await: a window created by anything that

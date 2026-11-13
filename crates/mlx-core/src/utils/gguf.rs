@@ -19,8 +19,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -6553,7 +6551,6 @@ struct Qwen35NativeCacheLock {
 }
 
 impl Qwen35NativeCacheLock {
-    #[cfg(unix)]
     fn acquire(path: &Path) -> std::io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
@@ -6561,32 +6558,8 @@ impl Qwen35NativeCacheLock {
             .read(true)
             .write(true)
             .open(path)?;
-        // SAFETY: `file` owns this live descriptor for at least the lifetime of
-        // the returned guard. `flock` changes only the kernel lock state for
-        // that descriptor, and Drop releases it before the file is closed.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
+        file.lock()?;
         Ok(Self { _file: file })
-    }
-
-    #[cfg(not(unix))]
-    fn acquire(_path: &Path) -> std::io::Result<Self> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "native Qwen GGUF cache locking requires Unix flock",
-        ))
-    }
-}
-
-#[cfg(unix)]
-impl Drop for Qwen35NativeCacheLock {
-    fn drop(&mut self) {
-        // SAFETY: `_file` still owns a live descriptor here. Unlock failure is
-        // not actionable during Drop; closing the file releases the lock too.
-        unsafe {
-            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
-        }
     }
 }
 
@@ -6660,7 +6633,11 @@ fn native_gguf_mtime_older(
 /// not a writer pid — regardless of how it parses.
 fn native_gguf_valid_pid(pid_text: &str) -> Option<u32> {
     let pid = pid_text.parse::<u32>().ok()?;
-    if pid == 0 || pid > libc::pid_t::MAX as u32 || pid.to_string() != pid_text {
+    #[cfg(unix)]
+    if pid > libc::pid_t::MAX as u32 {
+        return None;
+    }
+    if pid == 0 || pid.to_string() != pid_text {
         return None;
     }
     Some(pid)
@@ -6869,7 +6846,6 @@ fn native_gguf_is_entry_name(name: &str) -> bool {
 /// a live writer or an open/flock failure: keep the entry. The lock file
 /// itself is never deleted — unlinking it would break flock mutual exclusion
 /// across processes.
-#[cfg(unix)]
 fn native_gguf_try_entry_lock(cache_root: &Path, key: &str) -> Option<Option<fs::File>> {
     let file = match OpenOptions::new()
         .create(true)
@@ -6882,17 +6858,8 @@ fn native_gguf_try_entry_lock(cache_root: &Path, key: &str) -> Option<Option<fs:
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(None),
         Err(_) => return None,
     };
-    // SAFETY: `file` owns the descriptor for the flock call, and the returned
-    // guard keeps it — and the lock — alive until the caller drops it.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return None;
-    }
+    file.try_lock().ok()?;
     Some(Some(file))
-}
-
-#[cfg(not(unix))]
-fn native_gguf_try_entry_lock(_cache_root: &Path, _key: &str) -> Option<Option<fs::File>> {
-    None
 }
 
 // ── In-use sidecar leases ──────────────────────────────────────────────────
@@ -7133,34 +7100,25 @@ pub(crate) fn native_gguf_lease_in_use(root: &Path, dir: &Path, key: Option<&str
         *count += 1;
         return true;
     }
-    let mut file: Option<fs::File> = None;
-    #[cfg(unix)]
-    {
-        if let Some(key) = key {
-            let lease_path = root.join(native_gguf_lease_name(key));
-            // Fail closed for a KEYED lease: an unopenable or unflockable
-            // sentinel means no cross-process leg, and a registry-only entry
-            // would silently report a protection the model does not have.
-            // `false` routes the caller to the exclusive path, which
-            // rechecks under the writer lock.
-            let Ok(opened) = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&lease_path)
-            else {
-                return false;
-            };
-            if unsafe { libc::flock(opened.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
-                // A deleter holds the lease sentinel exclusively.
-                return false;
-            }
-            file = Some(opened);
+    let file = if let Some(key) = key {
+        // A keyed lease requires cross-process protection. Failure routes the
+        // caller to the exclusive path, which rechecks under the writer lock.
+        let Ok(opened) = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(root.join(native_gguf_lease_name(key)))
+        else {
+            return false;
+        };
+        if opened.try_lock_shared().is_err() {
+            return false;
         }
-    }
-    #[cfg(not(unix))]
-    let _ = (root, key);
+        Some(opened)
+    } else {
+        None
+    };
     registry.insert(registry_key, (1, file));
     true
 }
@@ -7198,28 +7156,16 @@ pub(crate) fn native_gguf_output_delete_guard(
     Option<fs::File>,
 )> {
     let registry = native_gguf_in_use_delete_guard(output_dir)?;
-    #[cfg(unix)]
-    {
-        let key = output_dir.file_name()?.to_str()?;
-        let lease_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(cache_root.join(native_gguf_lease_name(key)))
-            .ok()?;
-        // SAFETY: `lease_file` owns the descriptor across this try-flock;
-        // losing it means a loaded model holds the lease — keep the dir.
-        if unsafe { libc::flock(lease_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return None;
-        }
-        Some((registry, Some(lease_file)))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = cache_root;
-        Some((registry, None))
-    }
+    let key = output_dir.file_name()?.to_str()?;
+    let lease_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(cache_root.join(native_gguf_lease_name(key)))
+        .ok()?;
+    lease_file.try_lock().ok()?;
+    Some((registry, Some(lease_file)))
 }
 
 /// Best-effort recursive size. `symlink_metadata` classifies each entry by
@@ -7450,9 +7396,7 @@ fn native_gguf_locked_remove(
         Ok(file) => file,
         Err(_) => return 0,
     };
-    // SAFETY: `lease_file` owns the descriptor across this try-flock; a
-    // failure keeps the entry.
-    if unsafe { libc::flock(lease_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if lease_file.try_lock().is_err() {
         debug!(
             "native GGUF cache sweep keeps '{}' (lease held by a loaded model)",
             path.display()

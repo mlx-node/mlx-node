@@ -224,6 +224,35 @@ impl ReadAt for std::fs::File {
     }
 }
 
+#[cfg(windows)]
+impl ReadAt for std::fs::File {
+    fn read_exact_at(&self, mut buf: &mut [u8], mut off: u64) -> std::io::Result<()> {
+        while !buf.is_empty() {
+            match read_at(self, buf, off) {
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => {
+                    buf = &mut buf[n..];
+                    off += n as u64;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn read_at(file: &std::fs::File, buf: &mut [u8], off: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buf, off)
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::FileExt::seek_read(file, buf, off)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct GgufReadError {
     pub path: PathBuf,

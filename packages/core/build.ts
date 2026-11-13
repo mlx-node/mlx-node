@@ -1,4 +1,4 @@
-import { readFile, writeFile, copyFile, stat, mkdir, rm } from 'node:fs/promises';
+import { readFile, writeFile, copyFile, stat, mkdir, rm, readdir, cp } from 'node:fs/promises';
 import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -37,10 +37,10 @@ async function assertDeclarationCopiesMatch(phase: string): Promise<void> {
   }
 }
 
-// Linux NAPI output omits target-gated macOS exports. Preserve the committed
+// Non-macOS NAPI output omits target-gated macOS exports. Preserve the committed
 // cross-platform binding surface instead of replacing it with that subset.
-const preservedLinuxBindings =
-  process.platform === 'linux'
+const preservedBindings =
+  process.platform === 'linux' || process.platform === 'win32'
     ? await Promise.all(
         [packageDeclarationsPath, packageJsBindingPath].map(
           async (path) => [path, await readFile(path, 'utf8')] as const,
@@ -81,8 +81,8 @@ for (const output of outputs) {
   }
 }
 
-if (preservedLinuxBindings) {
-  await Promise.all(preservedLinuxBindings.map(([path, contents]) => writeFile(path, contents)));
+if (preservedBindings) {
+  await Promise.all(preservedBindings.map(([path, contents]) => writeFile(path, contents)));
 }
 await assertDeclarationCopiesMatch('after native generation');
 
@@ -94,6 +94,9 @@ if (metalBuild) {
   }
 }
 await copyNativeAddon(outputs);
+if (process.platform === 'win32' && process.arch === 'arm64') {
+  await copyWindowsCudaRuntime();
+}
 // Copy mlx.metallib for colocated Metal shader loading
 // MLX looks for metallib next to the binary, so we copy it here.
 // Also copy paged_attn.metallib, which mlx_paged_dispatch.cpp loads via a
@@ -184,6 +187,67 @@ async function copyNativeAddon(outputs: Awaited<typeof task>) {
   const dst = join(npmPlatformDir, expectedName);
   await copyFile(nodeOutput.path, dst);
   console.log(`Copied ${expectedName} -> ${dst}`);
+}
+
+async function copyWindowsCudaRuntime() {
+  const targetRoot = resolveTargetRoot({
+    targetDir: buildOptions.targetDir,
+    env: process.env,
+    defaultRoot: join(__dirname, '../../target'),
+  });
+  const buildRoot = join(targetRoot, 'aarch64-pc-windows-msvc', profileDirName(buildOptions), 'build');
+  const entries = await readdir(buildRoot);
+  const scriptDirs = entries.filter((name) => name.startsWith('mlx-sys-')).map((name) => join(buildRoot, name));
+  if (entries.includes('mlx-sys')) {
+    const packageDir = join(buildRoot, 'mlx-sys');
+    scriptDirs.push(...(await readdir(packageDir)).map((name) => join(packageDir, name)));
+  }
+  const installs = await Promise.all(
+    scriptDirs.map(async (dir) => {
+      const install = join(dir, 'out', 'mlx-cmake');
+      const blas = await stat(join(install, 'openblas.dll')).catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw error;
+      });
+      return { install, mtime: blas?.mtimeMs ?? 0 };
+    }),
+  );
+  const source = installs.filter(({ mtime }) => mtime > 0).sort((a, b) => b.mtime - a.mtime)[0]?.install;
+  if (!source) throw new Error(`Cannot find the Windows MLX install in ${buildRoot}`);
+
+  const cudaRoot = process.env.CUDA_PATH || process.env.CUDA_HOME;
+  const cudnnRoot = process.env.CUDNN_PATH;
+  if (!cudaRoot || !cudnnRoot) throw new Error('Set CUDA_PATH and CUDNN_PATH to the Windows ARM64 toolkits.');
+  const cudaBin = join(cudaRoot, 'bin', 'arm64');
+  const cudnnBin = join(cudnnRoot, 'bin', 'arm64');
+  const cudaDlls = [
+    'cudart64_13.dll',
+    'cublas64_13.dll',
+    'cublasLt64_13.dll',
+    'cufft64_12.dll',
+    'cusolver64_12.dll',
+    'cusparse64_12.dll',
+    'nvJitLink_130_0.dll',
+    'nvrtc64_130_0.dll',
+  ];
+  const nvrtcBuiltins = (await readdir(cudaBin)).filter((name) => /^nvrtc-builtins64_.*\.dll$/i.test(name));
+  const cudnnDlls = (await readdir(cudnnBin)).filter((name) => /^cudnn.*\.dll$/i.test(name));
+  if (nvrtcBuiltins.length === 0 || !cudnnDlls.includes('cudnn64_9.dll')) {
+    throw new Error('CUDA_PATH must contain NVRTC builtins and CUDNN_PATH must contain cuDNN 9.');
+  }
+  const destinations = [__dirname, join(__dirname, 'npm', 'win32-arm64-msvc')];
+  for (const dest of destinations) {
+    await copyFile(join(source, 'openblas.dll'), join(dest, 'openblas.dll'));
+    for (const name of [...cudaDlls, ...nvrtcBuiltins]) {
+      await copyFile(join(cudaBin, name), join(dest, name));
+    }
+    for (const name of cudnnDlls) {
+      await copyFile(join(cudnnBin, name), join(dest, name));
+    }
+    for (const include of ['cccl', 'cute', 'cutlass']) {
+      await cp(join(source, 'include', include), join(dest, 'include', include), { recursive: true });
+    }
+  }
 }
 
 // Publish/release fail-closed switch (set as `MLX_METALLIB_STRICT=1` in the

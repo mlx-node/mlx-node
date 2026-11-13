@@ -1643,6 +1643,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-width",
  "uuid",
+ "windows-sys",
  "zip",
 ]
 

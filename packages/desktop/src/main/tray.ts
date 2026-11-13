@@ -65,12 +65,12 @@ export function createTray(options: TrayOptions): TrayController {
   // garbage-collected and vanishes from the menubar — the single most common way
   // an Electron menubar app "randomly" loses its icon.
   const tray = new Tray(icon);
-  tray.setIgnoreDoubleClickEvents(true);
+  if (process.platform === 'darwin') tray.setIgnoreDoubleClickEvents(true);
 
   let rendered: string | null = null;
 
   function render(presentation: TrayPresentation): void {
-    tray.setTitle(presentation.title);
+    if (process.platform === 'darwin') tray.setTitle(presentation.title);
     tray.setToolTip(presentation.tooltip);
 
     // Every `click` is wrapped rather than passed by reference: a method handed

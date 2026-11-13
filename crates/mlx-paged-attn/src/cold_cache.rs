@@ -2870,8 +2870,9 @@ impl PersistError {
     }
 
     fn write(error: std::io::Error) -> Self {
-        let space = error.kind() == std::io::ErrorKind::StorageFull
-            || error.raw_os_error() == Some(rustix::io::Errno::DQUOT.raw_os_error());
+        let space = error.kind() == std::io::ErrorKind::StorageFull;
+        #[cfg(unix)]
+        let space = space || error.raw_os_error() == Some(rustix::io::Errno::DQUOT.raw_os_error());
         Self {
             space,
             message: format!("write cold-cache file: {error}"),

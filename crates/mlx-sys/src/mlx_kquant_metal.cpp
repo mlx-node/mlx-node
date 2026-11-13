@@ -1627,6 +1627,7 @@ int tiled_projection_splits(int, int) { return 1; }
 bool tiled_projection_spread(const Stream&) { return false; }
 bool tiled_tensor_op_tier(int, int, int, int, bool) { return false; }
 
+#ifndef MLX_NODE_CUDA_ENABLED
 void KQuantMatmul::eval_gpu(const std::vector<array> &, array &) {
   throw std::runtime_error(
       "[quantized_matmul] K-quant modes are not implemented on this GPU "
@@ -1642,6 +1643,7 @@ void KQuantDequantize::eval_gpu(const std::vector<array> &, array &) {
   throw std::runtime_error(
       "[dequantize] K-quant modes are not implemented on this GPU backend.");
 }
+#endif
 
 } // namespace mlx::core::kquant
 

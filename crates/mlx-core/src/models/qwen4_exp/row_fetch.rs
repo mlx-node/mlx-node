@@ -6,10 +6,11 @@
 //! when still queued, or awaited when a reader holds it.
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
+
+use crate::utils::gguf_read::ReadAt;
 
 /// `(tensor name, row)`.
 pub(super) type Key = (String, usize);

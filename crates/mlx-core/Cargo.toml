@@ -22,7 +22,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11"
 tokio = { workspace = true }
-tokenizers = { workspace = true }
 minijinja = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
@@ -64,6 +63,14 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = [
   "NSUUID",
   "NSValue",
 ] }
+
+[target.'cfg(not(windows))'.dependencies]
+tokenizers = { workspace = true, features = ["esaxx_fast"] }
+
+[target.'cfg(windows)'.dependencies]
+# esaxx_fast forces the static MSVC CRT. The pure Rust trainer works with Node's DLL CRT.
+tokenizers = { workspace = true }
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
 
 [[bench]]
 name = "attention_vjp_bench"
