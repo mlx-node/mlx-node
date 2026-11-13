@@ -639,6 +639,236 @@ fn a_state_lost_after_its_chain_came_back_restarts_cold() -> Result<()> {
     Ok(())
 }
 
+/// A RAM state below the disk state the prime armed: the lost read leaves
+/// that lower state as the GDN prime's best, so the prime would replay GDN
+/// from it over the KV the disk state's chain brought back. The turn
+/// restarts cold instead and decodes what a cold turn does.
+/// Mutation M3 (the checkpoint-replay arm keeps the restored KV) → red.
+#[test]
+fn a_state_lost_above_a_ram_state_restarts_cold() -> Result<()> {
+    const TEST: &str = "a_state_lost_above_a_ram_state_restarts_cold";
+    let _plan = SmallPlan::new();
+    let tokens = prompt(11, 127);
+    let Some((tier, mut second, cold)) = restart_after(
+        "state-tier-ar-lost-above-ram",
+        0x5A13_0014,
+        TEST,
+        std::slice::from_ref(&tokens),
+        |_, _| {},
+        1,
+    )?
+    else {
+        return Ok(());
+    };
+    assert_eq!(ar_turn(&mut second, &prompt(11, 95))?.cached_tokens, 0);
+    assert_eq!(
+        states(&second),
+        vec![
+            (64, true, true, false),
+            (80, false, true, false),
+            (112, false, false, true)
+        ]
+    );
+    let hits = tier.tier.manager.stats().hits;
+    let result = {
+        let _lost = crate::models::qwen3_5::dflash2_turn::StateReadLost::new();
+        ar_turn(&mut second, &tokens)?
+    };
+    assert_eq!(
+        tier.tier.manager.stats().hits - hits,
+        2,
+        "the state's chain above the hot hit came back"
+    );
+    assert_eq!(result.cached_tokens, 0);
+    assert_eq!(second.last_gdn_prefix_prepare_state, "cold");
+    assert_eq!(generated(), cold);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
+    Ok(())
+}
+
+/// The scheduled lane's prime of a lost state: the restored KV goes, the
+/// lane books nothing past its empty hit (its prefill slices book their
+/// own ends), and its prefill ends on the logits a cold lane computes.
+/// Mutation M4 (a scheduled lane's cold restart books its whole prompt) →
+/// red.
+#[test]
+fn a_scheduled_lane_whose_state_is_lost_restarts_cold() -> Result<()> {
+    const TEST: &str = "a_scheduled_lane_whose_state_is_lost_restarts_cold";
+    const SEED: u64 = 0x5A13_0015;
+    let _plan = SmallPlan::new();
+    let tokens = prompt(11, 127);
+    let lane = |inner: &mut Qwen35Inner, check: &dyn Fn(&Qwen35Inner)| -> Result<MxArray> {
+        inner.activate_scheduled_recurrent(1)?;
+        let base = PagedBackend::prime_prefix_state(inner, &tokens, true, 16, &[], 0)?;
+        assert_eq!(base.effective_cached_prefix_len, 0);
+        check(inner);
+        let mut last = None;
+        for (start, end) in [(0usize, 64usize), (64, tokens.len())] {
+            let prefix = HybridSchedulerBackend::build_scheduled_prefix(
+                inner,
+                &base,
+                start,
+                end - start,
+                tokens.clone(),
+                start == 0,
+            );
+            let logits = PagedBackend::paged_prefill(
+                inner,
+                &tokens[start..end],
+                &prefix,
+                crate::stream::Stream::default(crate::stream::DeviceType::Gpu),
+            )?;
+            logits.eval();
+            last = Some(logits);
+        }
+        Ok(last.expect("a slice"))
+    };
+    let Some(mut reference) = plain(SEED, TEST) else {
+        return Ok(());
+    };
+    let cold = lane(&mut reference, &|_| {})?;
+    drop(reference);
+    let Some((tier, mut second, _)) = restart_after(
+        "state-tier-lane-lost-read",
+        SEED,
+        TEST,
+        std::slice::from_ref(&tokens),
+        |_, _| {},
+        1,
+    )?
+    else {
+        return Ok(());
+    };
+    let hits = tier.tier.manager.stats().hits;
+    let logits = {
+        let _lost = crate::models::qwen3_5::dflash2_turn::StateReadLost::new();
+        lane(&mut second, &|inner| {
+            assert_eq!(inner.last_gdn_prefix_prepare_state, "cold");
+            let booked = inner
+                .paged_adapter
+                .as_ref()
+                .and_then(PagedKVCacheAdapter::block_table)
+                .map_or(0, |table| table.blocks().len());
+            assert_eq!(booked, 0, "the lane books nothing past its empty hit");
+        })?
+    };
+    assert_eq!(
+        tier.tier.manager.stats().hits - hits,
+        7,
+        "the state's chain came back"
+    );
+    assert!(crate::models::qwen3_5::model::arrays_bits_equal_for_test(
+        &logits, &cold
+    )?);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
+    Ok(())
+}
+
+/// A planned-MTP turn, sync or streamed, whose disk state is lost after
+/// its chain came back: its core restarts cold, resumes at nothing and
+/// decodes what the first process's cold MTP turn did.
+/// Mutation M5 (the MTP core resumes at its prepare's KV prefix) → red.
+fn mtp_turn_whose_state_is_lost_restarts_cold(
+    test: &str,
+    tag: &str,
+    seed: u64,
+    streamed: bool,
+) -> Result<()> {
+    let _plan = SmallPlan::new();
+    let tokens = prompt(17, 127);
+    let Some(mut first) = plain(seed, test) else {
+        return Ok(());
+    };
+    let tier = persistent_test_tier(tag, 1 << 30);
+    attach(&mut first, &tier);
+    assert_eq!(mtp_turn(&mut first, &tokens, true)?.cached_tokens, 0);
+    let cold = generated();
+    let Some((tier, mut second)) = reopen_after(first, tier, tag, seed, test, |_, _| {}, 1)? else {
+        return Ok(());
+    };
+    let hits = tier.tier.manager.stats().hits;
+    {
+        let _lost = crate::models::qwen3_5::dflash2_turn::StateReadLost::new();
+        if streamed {
+            second.mtp_weights_loaded = true;
+            let sink = crate::models::qwen3_5::model::dflash2_park_tests::LoggingSink::new(None);
+            let cancelled = std::sync::atomic::AtomicBool::new(false);
+            let config = ChatConfig {
+                max_new_tokens: Some(8),
+                enable_mtp: Some(true),
+                reuse_cache: Some(true),
+                ..config()
+            };
+            let tokenizer = tokenizer();
+            let params = ChatBackend::resolve_params(&second, &config);
+            let thinking = ChatBackend::thinking_setup(&second, &config);
+            let mut args = WholeTurnArgs {
+                tokens: &tokens,
+                tokenizer: &tokenizer,
+                eos_id: u32::MAX,
+                config: &config,
+                params: &params,
+                thinking,
+                plan: TurnPlan {
+                    is_delta: false,
+                    input_media: MediaCapabilities::NONE,
+                    context_media: MediaCapabilities::NONE,
+                    use_paged_attention: true,
+                    decoder: DecoderPlan::Speculative(
+                        crate::engine::plan::SpeculativeKind::NativeMtp,
+                    ),
+                },
+                sink: Some(&sink),
+                cancelled: Some(&cancelled),
+                media: MediaInputs {
+                    images: &[],
+                    audio: &[],
+                },
+            };
+            assert!(matches!(
+                ChatBackend::run_paged_turn(&mut second, &mut args)?,
+                TurnOutput::Streamed
+            ));
+            let log = sink.log.lock().unwrap();
+            assert_eq!(log.done.len(), 1, "the streamed turn finished");
+        } else {
+            assert_eq!(mtp_turn(&mut second, &tokens, true)?.cached_tokens, 0);
+        }
+    }
+    assert_eq!(
+        tier.tier.manager.stats().hits - hits,
+        7,
+        "the state's chain came back"
+    );
+    assert_eq!(second.last_gdn_prefix_prepare_state, "cold");
+    assert_eq!(generated(), cold);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
+    Ok(())
+}
+
+#[test]
+fn a_sync_mtp_turn_whose_state_is_lost_restarts_cold() -> Result<()> {
+    mtp_turn_whose_state_is_lost_restarts_cold(
+        "a_sync_mtp_turn_whose_state_is_lost_restarts_cold",
+        "state-tier-mtp-sync-lost-read",
+        0x5A13_0016,
+        false,
+    )
+}
+
+#[test]
+fn a_streamed_mtp_turn_whose_state_is_lost_restarts_cold() -> Result<()> {
+    mtp_turn_whose_state_is_lost_restarts_cold(
+        "a_streamed_mtp_turn_whose_state_is_lost_restarts_cold",
+        "state-tier-mtp-stream-lost-read",
+        0x5A13_0017,
+        true,
+    )
+}
+
 /// Splash `Request` per lane: two scheduled sequences whose prefill slices
 /// interleave keep their own points, cursors and checkpoints; a slice that
 /// ends at a point publishes it from the lane at the command's end (Splash

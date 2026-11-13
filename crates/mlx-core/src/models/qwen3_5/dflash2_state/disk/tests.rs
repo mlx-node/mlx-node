@@ -94,9 +94,18 @@ fn tier_at(root: &std::path::Path, tag: &str, limit: u64, persistent: bool) -> A
             kv: fingerprint,
         })
     };
-    let tier = open_disk_tier(&options, identity, 1 << 20).expect("a tier");
-    assert_eq!(tier.persistent, persistent);
-    tier
+    // The last open's writer lets go of the namespace's lock only when its
+    // thread exits, after its close returned.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let tier = open_disk_tier(&options, identity, 1 << 20).expect("a tier");
+        if tier.persistent == persistent || std::time::Instant::now() >= deadline {
+            assert_eq!(tier.persistent, persistent);
+            return tier;
+        }
+        drop(tier);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// The model's states on `tier`, their window `window` bytes (0: a load

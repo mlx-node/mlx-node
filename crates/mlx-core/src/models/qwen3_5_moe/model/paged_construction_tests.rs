@@ -2756,6 +2756,56 @@ fn moe_a_state_lost_after_its_chain_came_back_restarts_cold() -> Result<()> {
     Ok(())
 }
 
+/// The MoE twin with a RAM state below the armed disk state: the lost read
+/// leaves that lower state as the GDN prime's best, so the prime would
+/// replay GDN from it over the KV the disk state's chain brought back. The
+/// turn restarts cold instead, bit-equal to a cold turn.
+/// Mutation M3 (the checkpoint-replay arm keeps the restored KV) → red.
+#[test]
+fn moe_a_state_lost_above_a_ram_state_restarts_cold() -> Result<()> {
+    const TEST: &str = "moe_a_state_lost_above_a_ram_state_restarts_cold";
+    let _plan = MoeSmallPlan::new();
+    let tokens: Vec<u32> = (0..140).map(|i| (i * 7 + 3) % 13 + 1).collect();
+    let Some((tier, mut second, cold)) = moe_restart_after(
+        "state-tier-moe-lost-above-ram",
+        TEST,
+        std::slice::from_ref(&tokens),
+        |_, _| {},
+        1,
+    )?
+    else {
+        return Ok(());
+    };
+    let mut short = tokens[..100].to_vec();
+    short[99] = 14;
+    assert_eq!(moe_turn(&mut second, &short)?.0, 0);
+    let mut held: Vec<(usize, bool)> = second
+        .dflash2_states
+        .store
+        .entries()
+        .map(|entry| (entry.depth(), entry.ram().is_some()))
+        .collect();
+    held.sort_unstable();
+    assert_eq!(held, vec![(64, true), (96, true), (128, false)]);
+    let hits = tier.tier.manager.stats().hits;
+    let (cached, logits) = {
+        let _lost = crate::models::qwen3_5::dflash2_turn::StateReadLost::new();
+        moe_turn(&mut second, &tokens)?
+    };
+    assert_eq!(
+        tier.tier.manager.stats().hits - hits,
+        2,
+        "the state's chain above the hot hit came back"
+    );
+    assert_eq!(cached, 0);
+    assert!(crate::models::qwen3_5::model::arrays_bits_equal_for_test(
+        &logits, &cold
+    )?);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
+    Ok(())
+}
+
 /// Splash `publishReachedStateBoundaries` for a scheduled MTP sequence on a
 /// MoE load without a draft: the prefill reaches the lane's checkpoint (64)
 /// and replay point (128) and publishes them while the same forward seeds
