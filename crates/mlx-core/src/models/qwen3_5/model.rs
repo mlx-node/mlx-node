@@ -237,6 +237,13 @@ pub(crate) struct Qwen35Inner {
     /// while each prefill slice and turn end activates its own sequence (one
     /// per owner).
     gdn_unclaimed_rungs: HashMap<Option<SeqId>, Vec<DenseGdnPrefixCheckpoint>>,
+    /// False while a scheduled prefill slice runs for a sequence whose
+    /// admission reserved no room for its refused rungs: a rung its claim
+    /// refuses is then dropped, not held.
+    refused_rungs_booked: bool,
+    /// The load persists its paged cache to the cold tier
+    /// (`resolve_persist_cold`): its memory plan prices the refused rungs.
+    pub(crate) persist_cold: bool,
     gdn_last_history_checkpoint: Option<DenseGdnHistoryCheckpoint>,
     /// The replay point each running turn restored from (Splash
     /// `StateCache::useState`): no reclaim unit until its use ends.

@@ -1454,6 +1454,43 @@ fn moe_overlapped_sequences_each_send_their_refused_rung_to_the_cold_tier() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// With the cold tier on, a MoE sequence's admission reserves two GDN
+/// states for the rungs its claims may refuse; a sequence the scheduler
+/// marks as holding no such reservation keeps no refused rung, one that
+/// holds it keeps the deepest. Mutation M1: the MoE backend reports no
+/// unclaimed prefill state → red.
+#[test]
+fn moe_keeps_refused_rungs_only_when_booked() {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    let Some(mut inner) =
+        moe_inner_with_test_adapter_or_skip("moe_keeps_refused_rungs_only_when_booked")
+    else {
+        return;
+    };
+    assert_eq!(inner.scheduled_unclaimed_prefill_bytes(), 0, "no cold tier");
+    let root = moe_temp_cold_root("moe-booked-rungs");
+    install_moe_gdn_cold_tier(&mut inner, &root);
+    assert_eq!(
+        inner.scheduled_unclaimed_prefill_bytes(),
+        2 * inner.config.recurrent_state_bytes()
+    );
+    moe_refuse_optional_claims(&mut inner);
+    let prompt: Vec<u32> = (0u32..32).collect();
+    record_whole_moe_paged_request(&mut inner, &prompt);
+    let extra_keys = engine::build_paged_extra_keys(prompt.len(), 16, &[]);
+
+    inner.book_unclaimed_prefill_state(false);
+    let rungs = vec![moe_zero_gdn_rung(&inner, 32)];
+    inner.publish_moe_gdn_materialized_prefix_checkpoint(&prompt, &extra_keys, 0, rungs);
+    assert!(moe_held_rungs(&inner).is_empty(), "unbooked: no rung held");
+
+    inner.book_unclaimed_prefill_state(true);
+    let rungs = vec![moe_zero_gdn_rung(&inner, 32)];
+    inner.publish_moe_gdn_materialized_prefix_checkpoint(&prompt, &extra_keys, 0, rungs);
+    assert_eq!(moe_held_rungs(&inner), vec![(None, 32)], "booked: held");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A host that keeps its spare-memory margin from every Optional claim
 /// (`HostRule::admits`), so each ladder rung is refused its RAM.
 fn moe_refuse_optional_claims(inner: &mut Qwen35MoeInner) {

@@ -202,6 +202,23 @@ pub(crate) struct LoadLanes<'a> {
     /// Bytes each decode row's MoE layers allocate past the dense view
     /// (`Qwen3_5MoeConfig::decode_row_expert_bytes`); 0 for a dense model.
     pub expert_row_bytes: u64,
+    /// The load keeps GDN ladder rungs a claim refused until the turn's
+    /// cold-tier capture ([`qwen35_keeps_refused_rungs`]).
+    pub refused_rungs: bool,
+}
+
+/// Whether a load keeps refused GDN ladder rungs: its paged cache persists
+/// to the cold tier (`persist_cold`, [`crate::cold_tier::resolve_persist_cold`])
+/// with a GDN sidecar, the case
+/// [`super::paged_forward::gdn_cold_sidecar_ladder_wanted`] reads at run time.
+pub(crate) fn qwen35_keeps_refused_rungs(
+    config: &Qwen3_5Config,
+    activation: DType,
+    persist_cold: bool,
+) -> bool {
+    persist_cold
+        && super::gdn_sidecar::policy(config, activation)
+            .is_some_and(|policy| policy.group() == mlx_paged_attn::ColdGroup::GdnState)
 }
 
 /// Physical memory from which a Qwen3.5 load may run the full hybrid
@@ -329,10 +346,21 @@ fn evaluate_qwen35_lanes(
         }
     };
     // Each lane past the first holds its own GDN state and, on an MTP load,
-    // its own draft state at the full window.
+    // its own draft state at the full window. On a load that keeps refused
+    // GDN ladder rungs, every lane may hold them beside its state until its
+    // turn ends.
+    let rungs = if lanes.refused_rungs {
+        super::gdn_checkpoint_store::refused_rung_bytes(recurrent_state_bytes)
+    } else {
+        0
+    };
     let lane_state = |window: u32| {
-        let first = draft_state.unwrap_or_else(|| mtp_state(window));
-        let other = recurrent_state_bytes.saturating_add(mtp_state(window));
+        let first = draft_state
+            .unwrap_or_else(|| mtp_state(window))
+            .saturating_add(rungs);
+        let other = recurrent_state_bytes
+            .saturating_add(mtp_state(window))
+            .saturating_add(rungs);
         first.saturating_add(other.saturating_mul(u64::from(count.max(1) - 1)))
     };
     let pool_input = lanes.pool.map(|geometry| {
@@ -414,11 +442,14 @@ pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
     recurrent_state_bytes: u64,
     mtp_weights: bool,
     pool: Option<PoolGeometry>,
+    persist_cold: bool,
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
 ) -> Result<Option<MemoryPlan>> {
     let draft = target.dflash2();
     let config = target.dense_config();
+    let refused_rungs = pool.is_some()
+        && qwen35_keeps_refused_rungs(&config, target.embedding_dtype()?, persist_cold);
     let Some(live) = live_memory() else {
         check_unplanned_max_context(label, &config, max_context)?;
         return Ok(None);
@@ -431,6 +462,7 @@ pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
         mtp: mtp_weights && draft.is_none(),
         lanes: qwen35_scheduler_lanes(),
         expert_row_bytes: target.decode_row_expert_bytes(),
+        refused_rungs,
     };
     let plan = evaluate_qwen35_plan(label, &lanes, live, max_memory_bytes)?;
     check_qwen35_max_context(label, &plan, max_context)?;
@@ -734,6 +766,13 @@ fn read_config_json(dir: &Path) -> Result<serde_json::Value> {
         })
 }
 
+/// The loader's cold-tier decision from `config.json` and the environment
+/// (a host's config overlay is not on disk).
+fn estimate_persist_cold(model_type: &str, config_flag: Option<bool>) -> bool {
+    let env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
+    crate::cold_tier::resolve_persist_cold(model_type, env.as_deref(), config_flag)
+}
+
 pub(crate) struct EstimateInput<'a> {
     /// The directory holding the checkpoint's `config.json`.
     pub asset_dir: &'a Path,
@@ -753,16 +792,20 @@ pub(crate) fn estimate_qwen35_load(
     input: &EstimateInput<'_>,
 ) -> Result<Option<Qwen35ContextEstimate>> {
     let raw = read_config_json(input.asset_dir)?;
-    let (mut config, mtp_body, expert_row_bytes) = if input.moe {
+    let (mut config, mtp_body, expert_row_bytes, persist_cold) = if input.moe {
         let moe = crate::models::qwen3_5_moe::persistence::parse_config(&raw)?;
         let body = crate::models::qwen3_5_moe::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&moe);
-        (moe.to_dense_config(), body, moe.decode_row_expert_bytes())
-    } else {
+        let persist_cold = estimate_persist_cold("qwen3_5_moe", moe.persist_paged_cache);
         (
-            crate::models::qwen3_5::persistence::parse_config(&raw)?,
-            DrafterBodyVariant::Dense,
-            0,
+            moe.to_dense_config(),
+            body,
+            moe.decode_row_expert_bytes(),
+            persist_cold,
         )
+    } else {
+        let config = crate::models::qwen3_5::persistence::parse_config(&raw)?;
+        let persist_cold = estimate_persist_cold("qwen3_5", config.persist_paged_cache);
+        (config, DrafterBodyVariant::Dense, 0, persist_cold)
     };
     config.rope_scaling = Some(RopeScaling::served_for(
         label,
@@ -855,6 +898,7 @@ pub(crate) fn estimate_qwen35_load(
         mtp: mtp_head && draft.is_none(),
         lanes: qwen35_scheduler_lanes(),
         expert_row_bytes,
+        refused_rungs: pool.is_some() && qwen35_keeps_refused_rungs(&config, compute, persist_cold),
     };
     let plan = evaluate_qwen35_plan(label, &lanes, live, input.max_memory_bytes)?;
     check_qwen35_max_context(label, &plan, input.max_context)?;

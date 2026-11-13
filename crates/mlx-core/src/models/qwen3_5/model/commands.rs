@@ -403,6 +403,20 @@ impl HybridSchedulerBackend for Qwen35Inner {
         self.config.recurrent_state_bytes()
     }
 
+    fn scheduled_unclaimed_prefill_bytes(&self) -> u64 {
+        if self.wants_gdn_checkpoint_ladder() {
+            crate::models::qwen3_5::gdn_checkpoint_store::refused_rung_bytes(
+                self.config.recurrent_state_bytes(),
+            )
+        } else {
+            0
+        }
+    }
+
+    fn book_unclaimed_prefill_state(&mut self, booked: bool) {
+        self.refused_rungs_booked = booked;
+    }
+
     fn scheduled_recurrent_bytes(&self) -> u64 {
         self.scheduled_recurrent_bytes()
     }

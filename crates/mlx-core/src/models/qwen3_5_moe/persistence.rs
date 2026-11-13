@@ -2244,6 +2244,7 @@ pub(crate) async fn load_with_source(
                 // registration, so a concurrent grow (or another model's load) never
                 // reads sibling pool totals that miss this reservation; the start's
                 // retry waits outside it. See `cache_limit::pool_growth_lock`.
+                inner.persist_cold = persist_cold;
                 let pool_cache_limit_guard =
                     crate::engine::governor::governor::start_under_growth_lock(
                         crate::engine::governor::governor(),

@@ -99,6 +99,8 @@ impl Qwen35Inner {
             gdn_root_cache_owner_is_explicit: false,
             gdn_prefix_checkpoints: VecDeque::new(),
             gdn_unclaimed_rungs: HashMap::new(),
+            refused_rungs_booked: true,
+            persist_cold: false,
             gdn_last_history_checkpoint: None,
             gdn_in_use: HashMap::new(),
             gdn_restored_from: None,
@@ -149,6 +151,7 @@ impl Qwen35Inner {
                 recurrent,
                 self.has_mtp_weights(),
                 None,
+                self.persist_cold,
                 self.max_memory_bytes,
                 self.max_context,
             )?;
@@ -194,6 +197,7 @@ impl Qwen35Inner {
                 layers: attn_layer_count,
                 explicit_mib: self.config.paged_cache_memory_mb,
             }),
+            self.persist_cold,
             self.max_memory_bytes,
             self.max_context,
         )?

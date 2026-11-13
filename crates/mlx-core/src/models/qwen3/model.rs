@@ -5379,6 +5379,7 @@ mod tests {
             ),
             claim: None,
             cell: None,
+            prefill_state: None,
             clock: Default::default(),
         };
         // Splitting the prefill also verifies that non-final slices leave the

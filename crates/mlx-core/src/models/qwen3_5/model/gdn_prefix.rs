@@ -353,7 +353,7 @@ impl Qwen35Inner {
             |_| (),
         )
         .is_some();
-        if !claimed && !self.wants_gdn_checkpoint_ladder() {
+        if !claimed && !(self.refused_rungs_booked && self.wants_gdn_checkpoint_ladder()) {
             return false;
         }
         let owner_id = self.active_cache_owner_id.clone();
@@ -501,6 +501,12 @@ impl Qwen35Inner {
     /// call in the argument list does not borrow-check.
     pub(super) fn cold_gdn_prefill_chunk_size(&self) -> i32 {
         crate::models::forward::paged_prefill_chunk_rows() as i32
+    }
+
+    /// Refused rungs `seq` holds for its turn-end capture.
+    #[cfg(test)]
+    pub(crate) fn held_refused_rungs(&self, seq: Option<SeqId>) -> usize {
+        self.gdn_unclaimed_rungs.get(&seq).map_or(0, Vec::len)
     }
 
     /// Whether this turn's prefill should publish the whole checkpoint ladder.

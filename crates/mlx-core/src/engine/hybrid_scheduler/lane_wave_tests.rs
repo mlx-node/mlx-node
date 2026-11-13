@@ -195,3 +195,48 @@ fn a_scheduled_mtp_turn_reports_its_accepted_drafts() {
         crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(8107)
     });
 }
+
+/// Scheduled MoE MTP lanes give each lane's own tokens at every lane count
+/// and draft depth. Packed into one [N * W] projection, 16 or more verify rows
+/// take another bf16 matmul kernel than one lane's [W] rows; the first
+/// changed value is in the GDN input projection of layer 1, and the routed
+/// experts turn it into other tokens. Mutation: the MoE target bucket packs
+/// its projections again (`row_exact_decode_projections`, false on this
+/// unquantized load, in place of `true`) -> red.
+#[test]
+fn moe_mtp_lanes_match_each_lane_alone_at_every_depth() {
+    if crate::test_support::paged_prefill_unsupported(
+        "moe_mtp_lanes_match_each_lane_alone_at_every_depth",
+    ) {
+        return;
+    }
+    for drafts in [1u32, 3, 7] {
+        let alone = (0..8)
+            .map(|lane| {
+                run_wave(moe_with_random_head(), &[lane], drafts)
+                    .0
+                    .remove(0)
+                    .tokens
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            alone
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 1,
+            "the head must follow the lane"
+        );
+        for width in [2usize, 4, 8] {
+            let lanes = (0..width).collect::<Vec<_>>();
+            let (wave, occupancy) = run_wave(moe_with_random_head(), &lanes, drafts);
+            assert_eq!(occupancy, width, "{width} MTP rows share a step");
+            for (lane, owner) in wave.iter().enumerate() {
+                assert_eq!(
+                    owner.tokens, alone[lane],
+                    "{drafts} drafts: lane {lane} of {width} equals the lane alone"
+                );
+            }
+        }
+    }
+}

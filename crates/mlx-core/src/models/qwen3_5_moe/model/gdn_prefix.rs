@@ -350,7 +350,7 @@ impl Qwen35MoeInner {
             |_| (),
         )
         .is_some();
-        if !claimed && !self.wants_gdn_checkpoint_ladder() {
+        if !claimed && !(self.refused_rungs_booked && self.wants_gdn_checkpoint_ladder()) {
             return false;
         }
         let rung = MoeGdnPrefixCheckpoint {

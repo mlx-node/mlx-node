@@ -345,6 +345,7 @@ fn estimate_matches_the_load_plan() {
         mtp: false,
         lanes: crate::models::qwen3_5::load_plan::qwen35_scheduler_lanes(),
         expert_row_bytes: 0,
+        refused_rungs: false,
     };
     let plan = evaluate_qwen35_plan(
         "Qwen3.5",
@@ -647,6 +648,7 @@ fn plan_27b_decode(
         mtp,
         lanes,
         expert_row_bytes: 0,
+        refused_rungs: false,
     };
     evaluate_qwen35_plan(
         "Qwen3.5",
@@ -987,6 +989,7 @@ fn load_window(
         mtp,
         lanes: 8,
         expert_row_bytes: 0,
+        refused_rungs: false,
     };
     let plan = evaluate_qwen35_plan(
         "Qwen3.5",
@@ -1568,6 +1571,27 @@ fn shaped_moe_plan(
     lanes: u32,
     expert_row_bytes: u64,
 ) -> Result<MemoryPlan> {
+    shaped_rungs_plan(
+        config,
+        weights,
+        working_set,
+        mtp,
+        lanes,
+        expert_row_bytes,
+        false,
+    )
+}
+
+/// [`shaped_moe_plan`] on a load that keeps refused GDN rungs or not.
+fn shaped_rungs_plan(
+    config: &Qwen3_5Config,
+    weights: u64,
+    working_set: u64,
+    mtp: bool,
+    lanes: u32,
+    expert_row_bytes: u64,
+    refused_rungs: bool,
+) -> Result<MemoryPlan> {
     let format = config.kv_format_for(DType::BFloat16);
     let block_size = config.paged_block_size();
     let layers = config.full_attention_layer_count() as u32;
@@ -1601,6 +1625,7 @@ fn shaped_moe_plan(
             mtp,
             lanes,
             expert_row_bytes,
+            refused_rungs,
         },
         LiveMemory {
             working_set_bytes: working_set,
@@ -1647,11 +1672,65 @@ type TableModel = (&'static str, u64, fn(bool) -> (Qwen3_5Config, u64));
 /// weights, 1,666 MiB), a 9B shape (8-bit, 9,500 MiB), the 27B fixture
 /// (16,000 MiB), the 35B-A3B (4-bit, 35e9 x 4.5 / 8 B = 18,780 MiB) and the
 /// 122B-A10B (4-bit, 65,440 MiB). The reported width is the granted lane
-/// count. Mutations: price no decode step or state past one lane → every
-/// fitting row grants its ceiling → red; the ceiling always 8 → the 64,
-/// 128 and 192 GB rows grant 8 → red.
+/// count. A load that keeps refused GDN rungs (the cold tier on) prices
+/// two more GDN states a lane: only the 16, 24 and 36 GB rows of the 9B
+/// and the 27B move. Mutations: price no decode step or state past one
+/// lane → every fitting row grants its ceiling → red; the ceiling always 8
+/// → the 64, 128 and 192 GB rows grant 8 → red.
 #[test]
 fn lanes_follow_the_device() {
+    let (rows, table) = lane_table(false);
+    println!("{table}");
+    const FULL: u32 = 262_144;
+    #[rustfmt::skip]
+    let expected: Vec<LaneRow> = vec![
+        // 0.8B, MTP off: 16, 24, 36, 64, 128, 192, 256, 512 GB
+        Some((4, FULL)), Some((4, FULL)), Some((4, FULL)), Some((4, FULL)),
+        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
+        // 0.8B, MTP on
+        Some((4, FULL)), Some((4, FULL)), Some((4, FULL)), Some((4, FULL)),
+        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
+        // 9B, MTP off
+        Some((2, 28_665)), Some((4, FULL)), Some((4, FULL)), Some((4, FULL)),
+        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
+        // 9B, MTP on
+        Some((1, 4_089)), Some((1, 244_389)), Some((3, FULL)), Some((4, FULL)),
+        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
+        // 27B, MTP off
+        None, None, Some((1, FULL)), Some((4, FULL)),
+        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
+        // 27B, MTP on
+        None, None, Some((1, 188_409)), Some((4, FULL)),
+        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
+        // 35B-A3B, MTP off
+        None, None, Some((4, FULL)), Some((4, FULL)),
+        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
+        // 35B-A3B, MTP on
+        None, None, Some((1, FULL)), Some((4, FULL)),
+        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
+        // 122B-A10B, MTP off
+        None, None, None, None,
+        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
+        // 122B-A10B, MTP on
+        None, None, None, None,
+        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
+    ];
+    assert_eq!(rows, expected, "{table}");
+
+    let (rows, table) = lane_table(true);
+    println!("{table}");
+    let mut cold = expected;
+    // 9B MTP off 16 GB; 9B MTP on 16 and 24 GB; 27B MTP off and on 36 GB.
+    cold[16] = Some((1, 24_569));
+    cold[24] = Some((1, 1_760));
+    cold[25] = Some((1, 241_173));
+    cold[34] = Some((1, 258_041));
+    cold[42] = Some((1, 180_217));
+    assert_eq!(rows, cold, "{table}");
+}
+
+/// The rows of [`lanes_follow_the_device`] and their printed table.
+fn lane_table(refused_rungs: bool) -> (Vec<LaneRow>, String) {
     let models: [TableModel; 5] = [
         ("0.8B", 1_666 * MIB, |mtp| {
             (shaped_config(1024, 24, 8, 2, 3584, 16, 16, mtp), 0)
@@ -1681,7 +1760,15 @@ fn lanes_follow_the_device() {
                 let working_set = physical / 4 * 3;
                 let ceiling = qwen35_lane_ceiling(Some(physical)) as u32;
                 let plan = |lanes| {
-                    shaped_moe_plan(&config, weights, working_set, mtp, lanes, expert_row_bytes)
+                    shaped_rungs_plan(
+                        &config,
+                        weights,
+                        working_set,
+                        mtp,
+                        lanes,
+                        expert_row_bytes,
+                        refused_rungs,
+                    )
                 };
                 let row = match (plan(1), plan(8), plan(ceiling)) {
                     (Ok(single), Ok(offered), Ok(planned)) => {
@@ -1749,42 +1836,7 @@ fn lanes_follow_the_device() {
             }
         }
     }
-    println!("{table}");
-    const FULL: u32 = 262_144;
-    #[rustfmt::skip]
-    let expected: Vec<LaneRow> = vec![
-        // 0.8B, MTP off: 16, 24, 36, 64, 128, 192, 256, 512 GB
-        Some((4, FULL)), Some((4, FULL)), Some((4, FULL)), Some((4, FULL)),
-        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
-        // 0.8B, MTP on
-        Some((4, FULL)), Some((4, FULL)), Some((4, FULL)), Some((4, FULL)),
-        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
-        // 9B, MTP off
-        Some((2, 28_665)), Some((4, FULL)), Some((4, FULL)), Some((4, FULL)),
-        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
-        // 9B, MTP on
-        Some((1, 4_089)), Some((1, 244_389)), Some((3, FULL)), Some((4, FULL)),
-        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
-        // 27B, MTP off
-        None, None, Some((1, FULL)), Some((4, FULL)),
-        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
-        // 27B, MTP on
-        None, None, Some((1, 188_409)), Some((4, FULL)),
-        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
-        // 35B-A3B, MTP off
-        None, None, Some((4, FULL)), Some((4, FULL)),
-        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
-        // 35B-A3B, MTP on
-        None, None, Some((1, FULL)), Some((4, FULL)),
-        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
-        // 122B-A10B, MTP off
-        None, None, None, None,
-        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
-        // 122B-A10B, MTP on
-        None, None, None, None,
-        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
-    ];
-    assert_eq!(rows, expected, "{table}");
+    (rows, table)
 }
 
 /// Decode rows a step prices: one AR row or the widest MTP verify the
@@ -1839,6 +1891,75 @@ fn eight_lanes_price_eight_decode_steps_and_states() {
         let describe = eight.describe();
         assert!(describe.contains("; 8 decode lanes"), "{describe}");
     }
+}
+
+/// On a load that keeps refused GDN rungs every lane prices the two GDN
+/// states its sequence may hold past a refused claim, the first lane
+/// included, beside its GDN state and its MTP state: lane bytes are lanes x
+/// (3 GDN states + MTP state); a load without them prices lanes x (1 GDN
+/// state + MTP state). Dense and MoE, MTP off and on. Mutation P1: the plan
+/// leaves the rungs out → red. Mutation P2: the plan prices them on every
+/// load → red.
+#[test]
+fn every_lane_prices_its_refused_rungs_on_a_cold_tier_load() {
+    let models: [(&str, u64, fn(bool) -> (Qwen3_5Config, u64)); 2] = [
+        ("27B", 16_000 * MIB, |mtp| {
+            (shaped_config(5120, 64, 24, 4, 17408, 16, 48, mtp), 0)
+        }),
+        ("35B-A3B", 18_780 * MIB, |mtp| {
+            moe_shape(&qwen35_35b_a3b_raw(), mtp)
+        }),
+    ];
+    for (name, weights, shape) in models {
+        for mtp in [false, true] {
+            let (config, expert_row_bytes) = shape(mtp);
+            let state = config.recurrent_state_bytes();
+            assert_eq!(
+                crate::models::qwen3_5::gdn_checkpoint_store::refused_rung_bytes(state),
+                2 * state
+            );
+            for (refused_rungs, states) in [(false, 1), (true, 3)] {
+                for lanes in [1u32, 8] {
+                    let plan = shaped_rungs_plan(
+                        &config,
+                        weights,
+                        384 << 30,
+                        mtp,
+                        lanes,
+                        expert_row_bytes,
+                        refused_rungs,
+                    )
+                    .unwrap();
+                    let pool = plan.pool.unwrap();
+                    let label = format!("{name} mtp={mtp} rungs={refused_rungs} {lanes} lanes");
+                    assert_eq!(pool.lanes, lanes, "{label}");
+                    let held = if mtp {
+                        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::held_bytes(
+                            &config,
+                            pool.lane.window.maximum(),
+                        )
+                    } else {
+                        0
+                    };
+                    assert_eq!(
+                        pool.lane.lane_bytes,
+                        u64::from(lanes) * (states * state + held),
+                        "{label}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The rungs are priced only where they are held: a pool load that
+/// persists its cache with a GDN sidecar, as the run-time ladder rule reads
+/// it.
+#[test]
+fn refused_rungs_follow_the_cold_tier_decision() {
+    let config = shaped_config(5120, 64, 24, 4, 17408, 16, 48, false);
+    assert!(qwen35_keeps_refused_rungs(&config, DType::BFloat16, true));
+    assert!(!qwen35_keeps_refused_rungs(&config, DType::BFloat16, false));
 }
 
 /// A MoE decode row allocates its top-k expert work past the dense view:
