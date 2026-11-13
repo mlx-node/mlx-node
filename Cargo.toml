@@ -44,7 +44,6 @@ napi-build = "2.4"
 
 # Workspace packages
 mlx-sys = { path = "crates/mlx-sys" }
-mlx-core = { path = "crates/mlx-core" }
 mlx-paged-attn = { path = "crates/mlx-paged-attn" }
 mlx-db = { path = "crates/mlx-db" }
 mlx-tts = { path = "crates/mlx-tts" }

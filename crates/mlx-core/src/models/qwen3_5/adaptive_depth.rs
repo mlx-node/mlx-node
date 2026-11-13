@@ -328,8 +328,8 @@ impl ExpectedValueDepthPolicy {
         }
 
         let mut prefix_probability = 1.0;
-        for idx in 0..drafted_depth {
-            prefix_probability *= self.accept_ewma[idx].clamp(0.0, 1.0);
+        for accept in self.accept_ewma.iter().take(drafted_depth) {
+            prefix_probability *= accept.clamp(0.0, 1.0);
         }
         let next_probability = self.accept_ewma[next_depth as usize - 1].clamp(0.0, 1.0);
         let confidence_factor = self.confidence_factor(metrics);

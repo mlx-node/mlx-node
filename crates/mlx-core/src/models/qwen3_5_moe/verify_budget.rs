@@ -606,8 +606,8 @@ mod tests {
                 labels: i % 7 != 0,
                 confidence: [0.0; POSITIONS],
             };
-            for j in 0..POSITIONS {
-                observation.confidence[j] = ((i * 17 + j * 13) % 99 + 1) as f32 / 100.0;
+            for (j, confidence) in observation.confidence.iter_mut().enumerate() {
+                *confidence = ((i * 17 + j * 13) % 99 + 1) as f32 / 100.0;
             }
             let ms = if i == 55 {
                 1.0e9

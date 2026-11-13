@@ -467,9 +467,13 @@ fn apply_loaded_parameters(
         inner.lm_head.set_weight(array)?;
     }
 
-    for layer_idx in 0..config.num_layers as usize {
+    for (layer_idx, layer) in inner
+        .layers
+        .iter_mut()
+        .enumerate()
+        .take(config.num_layers as usize)
+    {
         let prefix = format!("layers.{layer_idx}");
-        let layer = &mut inner.layers[layer_idx];
         if let Some(weight) = mapped_params.get(&format!("{prefix}.self_attn.q_proj.weight")) {
             layer.self_attn.set_q_proj_weight(weight)?;
         }

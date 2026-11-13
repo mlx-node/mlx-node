@@ -205,7 +205,7 @@ pub(crate) fn accept_dspark_proposal(
             // prefix. Construct deterministic target distributions together
             // without drawing acceptance coins or residual samples early.
             let mut targets = Vec::with_capacity(draft_len);
-            for i in 0..draft_len {
+            for (i, &draft_id) in proposal.draft_ids.iter().enumerate().take(draft_len) {
                 let v_slice = logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
                 let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
                 let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
@@ -213,7 +213,7 @@ pub(crate) fn accept_dspark_proposal(
                     sampling::sampling_distribution(&penalized, p.sampling_config)?
                         .astype(DType::Float32)?,
                 );
-                hist_extended.push(proposal.draft_ids[i] as u32);
+                hist_extended.push(draft_id as u32);
             }
             let roots = targets
                 .iter()
