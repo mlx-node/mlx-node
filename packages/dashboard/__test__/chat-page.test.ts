@@ -751,7 +751,10 @@ describe('Chat page: a message that waits for its model', () => {
     await open('/chat?c=p-unsent', (text) => text.includes('Hi there'), {
       routes: { '/chat/conversations/p-unsent/prompt': {}, '/chat/conversations/p-unsent/cancel': {} },
       conversations: { 'p-unsent': sync('p-unsent') },
-      host: host({ inference: 'loading', loading: { modelId: 'qwen3.5-4b', startedAt: NOW - 3_000 } }),
+      host: host({
+        inference: 'loading',
+        loading: [{ modelId: 'qwen3.5-4b', startedAt: NOW - 3_000, phase: 'weights', stepsDone: 0, steps: 0 }],
+      }),
     });
     type('Wait for the model');
     click(sendFace());

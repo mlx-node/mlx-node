@@ -127,8 +127,17 @@
   transition: opacity var(--duration-fast) var(--ease-standard);
 }
 
-.span[data-kind='queue'] {
+.span[data-kind='queue'],
+.span[data-kind='busy'] {
   --c: var(--phase-queue);
+}
+
+.span[data-kind='slot'] {
+  --c: var(--phase-slot);
+}
+
+.span[data-kind='prepare'] {
+  --c: var(--phase-prepare);
 }
 
 .span[data-kind='first'],
@@ -163,6 +172,7 @@
 }
 
 .span[data-kind='queue'] .fill,
+.span[data-kind='slot'] .fill,
 .span[data-kind='wait'] .fill,
 .span[data-kind='first'] .fill {
   background:
@@ -262,8 +272,17 @@
   background: var(--c);
 }
 
-.legendKey[data-kind='queue'] {
+.legendKey[data-kind='queue'],
+.legendKey[data-kind='busy'] {
   --c: var(--phase-queue);
+}
+
+.legendKey[data-kind='slot'] {
+  --c: var(--phase-slot);
+}
+
+.legendKey[data-kind='prepare'] {
+  --c: var(--phase-prepare);
 }
 
 .legendKey[data-kind='first'],
@@ -285,6 +304,7 @@
 }
 
 .legendKey[data-kind='queue'],
+.legendKey[data-kind='slot'],
 .legendKey[data-kind='wait'],
 .legendKey[data-kind='first'] {
   background:

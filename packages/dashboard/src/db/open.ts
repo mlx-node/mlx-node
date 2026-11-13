@@ -18,7 +18,7 @@ export interface DashboardDb {
  * rather than migrated in place. The index is disposable and repopulated from
  * JSONL on boot, so a rebuild never loses source-of-truth data.
  */
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS traces (
@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS traces (
   load_wait_ms REAL,
   resolve_ms REAL,
   pre_dispatch_ms REAL,
+  wait_ms REAL,
+  slot_ms REAL,
+  prepare_ms REAL,
   finish_reason TEXT,
   prompt_tokens INTEGER,
   cached_tokens INTEGER,
@@ -65,6 +68,8 @@ CREATE TABLE IF NOT EXISTS traces (
   concurrency_peak INTEGER,
   mem_active_bytes INTEGER,
   mem_peak_bytes INTEGER,
+  pipelines_created INTEGER,
+  pipeline_create_ms REAL,
   cold_hits INTEGER,
   cold_misses INTEGER,
   cold_bytes_written INTEGER,

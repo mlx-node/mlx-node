@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
 import { ModelWorkCoordinator } from '../../packages/server/src/model-work-coordinator.js';
+import type { TurnProgressSnapshot } from '../../packages/server/src/native-progress.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';
 
 // ---------------------------------------------------------------------------
@@ -7102,11 +7103,11 @@ const PROGRESS_DONE_EVENT = {
  */
 function createSteppedStreamModel(): {
   model: SessionCapableModel;
-  snapshot: { current: ChatStreamProgress | null };
+  snapshot: { current: TurnProgressSnapshot | null };
   push: (step: ProgressStep) => void;
   refs: Array<ChatStreamControl | undefined>;
 } {
-  const snapshot: { current: ChatStreamProgress | null } = { current: { phase: 'queued' } };
+  const snapshot: { current: TurnProgressSnapshot | null } = { current: { phase: 'queued' } };
   const pending: ProgressStep[] = [];
   const refs: Array<ChatStreamControl | undefined> = [];
   let wake: (() => void) | null = null;
@@ -7118,7 +7119,7 @@ function createSteppedStreamModel(): {
   };
   async function* stream(ref: ChatStreamControl | undefined): AsyncGenerator<Record<string, unknown>> {
     refs.push(ref);
-    if (ref !== undefined) ref.read = () => snapshot.current;
+    if (ref !== undefined) ref.read = () => snapshot.current as ChatStreamProgress | null;
     try {
       while (true) {
         while (pending.length === 0) {

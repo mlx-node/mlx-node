@@ -1615,6 +1615,51 @@ describe('createInferenceHost — runtime sampler', () => {
     }
   });
 
+  it("a chat load's record carries the warm-up report the loaded model holds", async () => {
+    const savedHome = process.env.HOME;
+    const savedMetrics = process.env.MLX_AGENT_METRICS;
+    const home = await mkdtemp(join(tmpdir(), 'mlx-host-home-'));
+    scratchDirs.push(home);
+    process.env.HOME = home;
+    delete process.env.MLX_AGENT_METRICS;
+    class WarmedModel {
+      get warmup(): unknown {
+        return { ms: 3_400, steps: 50, skipped: 1, reset: 0, pipelines: 212, compileMs: 74_900, peakBytes: 4096 };
+      }
+    }
+    try {
+      const host = await start({
+        modelsDir: await makeModelsDir(['alpha']),
+        hostKind: 'serve',
+        loadModel: async () => new WarmedModel() as unknown as LoadableModel,
+      });
+      await host.loadModel('alpha');
+      await host.close({ timeoutMs: 250 });
+      const runtimeDir = join(home, '.mlx-node', 'metrics', 'runtime');
+      const series = (await readdir(runtimeDir)).filter((name) => name.endsWith('.jsonl'));
+      const records = (await readFile(join(runtimeDir, series[0]!), 'utf8'))
+        .split('\n')
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as { k: string });
+      expect(records.find((r) => r.k === 'load')).toMatchObject({
+        model: 'alpha',
+        ok: true,
+        warmupMs: 3_400,
+        warmupSteps: 50,
+        warmupSkipped: 1,
+        warmupReset: 0,
+        warmupPipelines: 212,
+        warmupCompileMs: 74_900,
+        warmupPeakBytes: 4096,
+      });
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedMetrics === undefined) delete process.env.MLX_AGENT_METRICS;
+      else process.env.MLX_AGENT_METRICS = savedMetrics;
+    }
+  });
+
   it('the live file reports the disk cache switch the host resolved', async () => {
     const savedHome = process.env.HOME;
     const savedMetrics = process.env.MLX_AGENT_METRICS;

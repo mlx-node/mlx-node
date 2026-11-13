@@ -17,6 +17,7 @@ import { ChatSession, type ChatStreamControl, type ChatStreamEvent, type Session
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { MetricsTrace, type MetricsTraceRecord } from '../../packages/server/src/metrics-trace.js';
+import type { PipelineStats, TurnProgressSnapshot } from '../../packages/server/src/native-progress.js';
 import { SessionRegistry } from '../../packages/server/src/session-registry.js';
 import {
   measuredPrefillOf,
@@ -81,6 +82,11 @@ function makeResult(overrides: Partial<ChatResult> = {}): ChatResult {
     },
     ...overrides,
   };
+}
+
+/** A snapshot as the addon hands it, the native timers left out as an older addon leaves them out. */
+function asNative(snap: TurnProgressSnapshot): ChatStreamProgress {
+  return snap as ChatStreamProgress;
 }
 
 function makeFinalEvent(overrides: Record<string, unknown> = {}): ChatStreamEvent {
@@ -336,12 +342,20 @@ describe('TurnTraceModel', () => {
       sidecarStats: () => sidecarStats(),
       watermarks: { cold: {}, sidecar: {} },
       memory: () => ({ activeBytes: 1000, peakBytes: 2000 }),
+      pipelineStats: () => null,
       ...overrides,
     };
   }
 
-  function progress(overrides: Partial<ChatStreamProgress> = {}): ChatStreamProgress {
-    return { phase: 'decode', prefillTotal: 40, prefillDone: 40, cachedTokens: 60, generatedTokens: 5, ...overrides };
+  function progress(overrides: Partial<TurnProgressSnapshot> = {}): ChatStreamProgress {
+    return asNative({
+      phase: 'decode',
+      prefillTotal: 40,
+      prefillDone: 40,
+      cachedTokens: 60,
+      generatedTokens: 5,
+      ...overrides,
+    });
   }
 
   it('records an error turn when the dispatch throws', async () => {
@@ -630,9 +644,9 @@ describe('TurnTraceModel', () => {
 
   /** A streamed turn whose reader returns `snap` through the terminal event, then `after` until cleared. */
   function streamWith(
-    snap: () => ChatStreamProgress,
+    snap: () => TurnProgressSnapshot,
     final: ChatStreamEvent = makeFinalEvent(),
-    after?: ChatStreamProgress,
+    after?: TurnProgressSnapshot,
   ) {
     return makeInner({
       chatStreamSessionStart: vi.fn(async function* (
@@ -642,7 +656,7 @@ describe('TurnTraceModel', () => {
         ref?: ChatStreamControl,
       ) {
         let read = snap;
-        if (ref) ref.read = () => read();
+        if (ref) ref.read = () => asNative(read());
         try {
           yield { text: 'a', done: false as const };
           yield final;
@@ -1175,6 +1189,118 @@ describe('TurnTraceModel', () => {
       expect(config?.enableMtp).toBe(enableMtp);
     },
   );
+
+  /** A stream whose native reader returns `snap`; it ends on `final`, or is abandoned when `final` is null. */
+  function phasedStream(snap: TurnProgressSnapshot, final: ChatStreamEvent | null) {
+    return makeInner({
+      chatStreamSessionStart: vi.fn(async function* (
+        _messages: unknown,
+        _config: unknown,
+        _signal: unknown,
+        ref?: ChatStreamControl,
+      ) {
+        if (ref) ref.read = () => snap as unknown as ChatStreamProgress;
+        try {
+          yield { text: 'a', done: false as const };
+          if (final !== null) yield final;
+        } finally {
+          if (ref) ref.read = null;
+        }
+      }),
+    });
+  }
+
+  it('ok and cancelled records carry the three native timers', async () => {
+    const done: TurnProgressSnapshot = {
+      phase: 'done',
+      prefillTotal: 400,
+      prefillElapsedMs: 250,
+      decodeElapsedMs: 900,
+      waitMs: 75_070.25,
+      slotMs: 0,
+      prepareMs: 4_210.5,
+    };
+    await drainStart(new TurnTraceModel(phasedStream(done, makeFinalEvent()), deps()));
+    const slot: TurnProgressSnapshot = { phase: 'slot', waitMs: 3, slotMs: 1_500, prepareMs: 0 };
+    for await (const _ of new TurnTraceModel(phasedStream(slot, null), deps()).chatStreamSessionStart([])) break;
+
+    const [ok, cancelled] = readTraceLines(dir);
+    expect(ok).toMatchObject({ outcome: 'ok', waitMs: 75_070.25, slotMs: 0, prepareMs: 4_210.5, prefillMs: 250 });
+    expect(cancelled).toMatchObject({
+      outcome: 'cancelled',
+      failPhase: 'slot',
+      waitMs: 3,
+      slotMs: 1_500,
+      prepareMs: 0,
+    });
+  });
+
+  it('a stream cancelled while preparing records failPhase prepare', async () => {
+    const snap: TurnProgressSnapshot = { phase: 'prepare', waitMs: 1, slotMs: 0, prepareMs: 800, cachedTokens: 19_000 };
+    for await (const _ of new TurnTraceModel(phasedStream(snap, null), deps()).chatStreamSessionStart([])) break;
+    expect(readTraceLines(dir)[0]).toMatchObject({ outcome: 'cancelled', failPhase: 'prepare', prepareMs: 800 });
+  });
+
+  it.each([
+    { name: 'is refused after a slot wait', snap: { waitMs: 2, slotMs: 30_000, prepareMs: 40 }, phase: 'slot' },
+    { name: 'fails restoring its prefix', snap: { waitMs: 2, slotMs: 0, prepareMs: 900 }, phase: 'prepare' },
+    { name: 'fails before pickup', snap: { waitMs: 5 }, phase: 'queued' },
+    { name: 'fails before its prefill on an older native', snap: {}, phase: 'queued' },
+  ] as const)('a stream that $name records failPhase $phase', async ({ snap, phase }) => {
+    const done: TurnProgressSnapshot = { phase: 'done', ...snap };
+    const model = new TurnTraceModel(
+      makeInner({
+        chatStreamSessionStart: vi.fn(async function* (
+          _messages: unknown,
+          _config: unknown,
+          _signal: unknown,
+          ref?: ChatStreamControl,
+        ) {
+          if (ref) ref.read = () => asNative(done);
+          try {
+            yield { text: '', done: false as const };
+            throw new Error('scheduler refused the turn');
+          } finally {
+            if (ref) ref.read = null;
+          }
+        }),
+      }),
+      deps(),
+    );
+    await expect(async () => {
+      for await (const _ of model.chatStreamSessionStart([])) {
+        // drains until the throw
+      }
+    }).rejects.toThrow('scheduler refused the turn');
+    expect(readTraceLines(dir)[0]).toMatchObject({ outcome: 'error', failPhase: phase });
+  });
+
+  it('an older native reports no timers, and the record carries none', async () => {
+    await drainStart(new TurnTraceModel(phasedStream({ ...FINISHED }, makeFinalEvent()), deps()));
+    const [line] = readTraceLines(dir);
+    for (const key of ['waitMs', 'slotMs', 'prepareMs', 'pipelinesCreated', 'pipelineCreateMs']) {
+      expect(key in line!).toBe(false);
+    }
+  });
+
+  it('records the pipelines created between turn begin and end, and none while the counter is off', async () => {
+    let stats: PipelineStats | null = { createdLoading: 200, createdServing: 5, loadingMs: 70_000, servingMs: 100 };
+    const inner = makeInner({
+      chatSessionStart: vi.fn(async () => {
+        stats = { createdLoading: 200, createdServing: 8, loadingMs: 70_000, servingMs: 400.5 };
+        return makeResult();
+      }),
+    });
+    const model = new TurnTraceModel(inner, deps({ pipelineStats: () => stats }));
+    await model.chatSessionStart([]);
+    stats = null;
+    await model.chatSessionStart([]);
+
+    const [counted, off] = readTraceLines(dir);
+    expect(counted).toMatchObject({ pipelinesCreated: 3, pipelineCreateMs: 300.5 });
+    expect('pipelinesCreated' in off!).toBe(false);
+    expect('pipelineCreateMs' in off!).toBe(false);
+  });
 });
 
 describe('SessionRegistry trace hook', () => {

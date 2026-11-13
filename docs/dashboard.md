@@ -123,6 +123,19 @@ header that counts turns per served model ("2 turns on 1 model"). A row names th
 "asked for `mlx-local`" under the model name, so two requests on one model never read as two models. "Started" is
 the time since the turn began, on the snapshot clock.
 
+The Phase badge and the Progress text follow the native phase of the turn (`arc-x/live-turn-row`):
+
+| Native phase | Badge     | Progress                                                                | When                                                                     |
+| ------------ | --------- | ----------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `queued`     | Waiting   | model busy                                                              | the model thread works on other requests (also before it picks this one) |
+| `slot`       | Queued    | waiting for a slot                                                      | the scheduler cannot start it: lanes full, memory refused, a held start  |
+| `prepare`    | Preparing | restoring N cached tokens (`cachedTokens` > 0), else reading the prompt | render, prefix match, cache restore, GDN replay before its prefill       |
+| `prefill`    | Prefill   | done of total tokens, with a bar                                        | as before                                                                |
+| `decode`     | Decode    | tokens out                                                              | as before                                                                |
+| none         | Running   | no progress for non-streamed turns                                      | a turn without a progress handle                                         |
+
+"waiting for a slot" is printed for `slot` only. From `prefill` on the native phase never moves back.
+
 The Cache page opens with one disk cache line: the switch the running engine's host resolved (`persistPagedCache`
 of its heartbeat: On, Off, or Unknown for an engine started before the field), the most one turn's capture walk may
 write (`coldCapture`: up to N prefix blocks, or "the whole prompt" from 63,125 blocks, and the walk's time cap; a
@@ -224,7 +237,12 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
 - Model: before each message goes to the agent, the app selects the conversation's model on the engine
   (`POST /v1/messages/count_tokens` over `node:http` to 127.0.0.1 only, the token in the `x-api-key` header, a 30 min
   ceiling; `src/chat/agent/select-model.ts`). Only that model loads. While the engine loads it, the thread shows the
-  load card; Stop then ends the turn with "The message was not sent." and the engine continues the load. A model change
+  load card; Stop then ends the turn with "The message was not sent." and the engine continues the load. While the
+  engine prepares GPU kernels for that model (load progress `phase: 'kernels'` with `steps` known), the card's title
+  is "Preparing GPU kernels", its head counts "n of m" steps, a bar fills by steps and the note says "The first load
+  after an update prepares the GPU. It can take a couple of minutes."; the weight read, or an engine that reports no
+  steps, keeps the plain card. Loads can overlap: the card shows the load of the conversation's own model, else the
+  oldest one (`loadFor`, `ChatHostState.loading` is a list, oldest first). A model change
   in an open conversation loads nothing until the next message. A model in memory is selected at once, also while
   answers run on it (the engine skips its load gate for a resident name). If the select still waits, the card says the
   model is in memory and does not say it loads. When the turn has no output yet and the live file shows that the
@@ -521,18 +539,46 @@ output, error text, stderr and URLs are never written by the app; the agents wri
 or `cancelled` — written by the turn wrapper in `turn-trace.ts`, so every client of `/v1/responses` and `/v1/messages`
 lands in the same stream.
 
-| Group           | Fields                                                                                                                         |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| Identity        | `traceId`, `ts`, `pid`, `sessionId`, `model`, `modelId`, `modelType`                                                           |
-| Request         | `outcome`, `errorKind`, `failPhase`, `endpoint`, `stream`, `dispatch`, `finishReason`                                          |
-| Timing          | `durationMs`, `queueMs`, `loadWaitMs`, `resolveMs`, `preDispatchMs`, `ttftMs`, `prefillMs`, `decodeTps`                        |
-| Tokens          | `promptTokens`, `cachedTokens`, `outputTokens`, `reasoningTokens`, `prefillDoneTokens`, `prefillTokens`, `ctxWindow`           |
-| Speculation     | `mtpCycles`, `mtpMeanAccepted`, `mtpMeanDrafts`, `mtpMeanDepth`, `mtpAcceptByPos` (at most 16 positions)                       |
-| Counts, overlap | `toolCount`, `toolCallCount`, `imageCount`, `concurrency`, `concurrencyPeak`                                                   |
-| Memory          | `memActiveBytes`, `memPeakBytes`                                                                                               |
-| Cold tier       | `cold*` deltas and totals of the turn (hits, misses, bytes, queue drops, evictions, corruptions, write errors, sidecar counts) |
+| Group           | Fields                                                                                                                                                                                                       |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Identity        | `traceId`, `ts`, `pid`, `sessionId`, `model`, `modelId`, `modelType`                                                                                                                                         |
+| Request         | `outcome`, `errorKind`, `failPhase`, `endpoint`, `stream`, `dispatch`, `finishReason`                                                                                                                        |
+| Timing          | `durationMs`, `queueMs`, `loadWaitMs`, `resolveMs`, `preDispatchMs`, `waitMs`, `slotMs`, `prepareMs`, `ttftMs`, `prefillMs`, `decodeTps`                                                                     |
+| Tokens          | `promptTokens`, `cachedTokens`, `outputTokens`, `reasoningTokens`, `prefillDoneTokens`, `prefillTokens`, `ctxWindow`                                                                                         |
+| Speculation     | `mtpCycles`, `mtpMeanAccepted`, `mtpMeanDrafts`, `mtpMeanDepth`, `mtpAcceptByPos` (at most 16 positions)                                                                                                     |
+| Counts, overlap | `toolCount`, `toolCallCount`, `imageCount`, `concurrency`, `concurrencyPeak`                                                                                                                                 |
+| Memory          | `memActiveBytes`, `memPeakBytes`                                                                                                                                                                             |
+| GPU kernels     | `pipelinesCreated`, `pipelineCreateMs`: pipelines the process created while serving between the turn's begin and end (process-wide, so overlapping turns share them); absent while the native counter is off |
+| Cold tier       | `cold*` deltas and totals of the turn (hits, misses, bytes, queue drops, evictions, corruptions, write errors, sidecar counts)                                                                               |
 
 A rate or time that was not measured is absent, never 0. A media-restart error is not recorded as a failure.
+`failPhase` is one of `queued`, `slot`, `prepare`, `prefill`, `decode`; a line from an older engine wrote `queued` for
+any stop before the prefill. Native reports `done` before it sends an error, so the server reads where the turn
+stopped from its timers: decode, else prefill, else `slot` when `slotMs` > 0, else `prepare` when `prepareMs` > 0,
+else `queued` (`turn-trace.ts` `failPhaseOf`).
+
+#### Native waits before the first token
+
+Streamed turns of an engine that reports them carry three timers from the native progress handle (on `ok`,
+`error` and `cancelled` lines alike; an older engine writes none):
+
+| Name        | Meaning                                                                                                          |
+| ----------- | ---------------------------------------------------------------------------------------------------------------- |
+| `waitMs`    | Native request created → the model thread picked it up: the model was busy. Outside `ttftMs`                     |
+| `slotMs`    | Sum of the spans the scheduler could not start the turn (lanes or memory). Inside `ttftMs`                       |
+| `prepareMs` | Sum of the spans spent on render, prefix match, cache restore and GDN replay before the prefill. Inside `ttftMs` |
+
+```
+created ──waitMs──► pickup ──[ queued | slot | prepare ]*──► begin_prefill ──prefillMs──► first token
+                    └──────────────────────────── ttftMs ────────────────────────────────────┘
+```
+
+The phase bars and the turn drawer place them as `wait` (bounded by duration − time to first token), then `slot` and
+`prepare` inside the time to first token before the prefill; Setup is what is left of it. A turn that never had a
+first token keeps its slot and prepare time in the rest of its duration. The parts never pass the turn's total
+(`api/sql.ts` `PHASE_SQL` and `turnPhases` agree row by row). The drawer lists Model busy, Waiting for a slot and
+Preparing under Speed when the record has them and they are above 0, and "GPU kernels created: n (time)" under the
+details when the turn created any.
 
 #### Time to first token, setup and prefill
 
@@ -545,17 +591,17 @@ A rate or time that was not measured is absent, never 0. A media-restart error i
     │              │ memory wiring     │ sample            │ emitted       │                          │
                    ├───────────────────────── ttftMs ───────────────────────┤
                                        ├──── prefillMs ────┤
-                         setupMs = ttftMs − prefillMs = part a + part b
+             setupMs = ttftMs − prefillMs − slotMs − prepareMs = part a + part b
 ```
 
-| Name            | Meaning                                                                                                                   |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `ttftMs`        | `generation_start` to the first token emitted. Shown as First token                                                       |
-| `prefillTokens` | Tokens the prefill window processed (native `ChatStreamProgress.prefillTotal`, the cached prefix excluded)                |
-| `prefillMs`     | `begin_prefill()` to the first token sampled (native `prefillElapsedMs`, frozen at the first token)                       |
-| Setup           | `max(ttftMs − prefillMs, 0)`: prefix lookup, cache restore, allocation before the prefill; the first decode step after it |
-| Prefill speed   | `prefillTokens × 1000 / prefillMs`, only from `PREFILL_MIN_TOKENS` = 256 tokens up (`src/prefill-rule.ts`)                |
-| To first token  | `ttftMs` of a turn without a prefill window: setup and prefill cannot be told apart                                       |
+| Name            | Meaning                                                                                                                                                                                                                                |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ttftMs`        | `generation_start` to the first token emitted. Shown as First token                                                                                                                                                                    |
+| `prefillTokens` | Tokens the prefill window processed (native `ChatStreamProgress.prefillTotal`, the cached prefix excluded)                                                                                                                             |
+| `prefillMs`     | `begin_prefill()` to the first token sampled (native `prefillElapsedMs`, frozen at the first token)                                                                                                                                    |
+| Setup           | `ttftMs − prefillMs − slotMs − prepareMs`, bounded as above (`SETUP_MS_SQL`): prefix lookup, cache restore, allocation before the prefill, or only the wait behind other requests once `prepareMs` > 0; the first decode step after it |
+| Prefill speed   | `prefillTokens × 1000 / prefillMs`, only from `PREFILL_MIN_TOKENS` = 256 tokens up (`src/prefill-rule.ts`)                                                                                                                             |
+| To first token  | `ttftMs` of a turn without a prefill window: setup and prefill cannot be told apart                                                                                                                                                    |
 
 The server reads the window from the stream handle's progress snapshot at the terminal event and writes both fields
 for an `ok` streamed turn only. Non-streamed turns (no progress handle), paths that never call `begin_prefill`, failed
@@ -568,13 +614,13 @@ and also holds other turns' decode steps.
 
 `packages/server/src/host/runtime-sampler.ts`, started by the server host; one per process.
 
-| Output                               | Content                                                                                                                                                                                                                      | Cadence                                                                                                  |
-| ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `live-<pid>.json`                    | status, health, memory, loaded models with their KV pool, turns in flight with their phase, counters, decode rate; about 0.6 KB plus about 330 B per turn in flight (at most 32 listed) plus each resident model, not capped | 1 s while busy, 5 s while idle (tmp + rename), plus a write 250 ms after each turn or load start and end |
-| `<date>-<pid>.jsonl` `proc`          | host kind, version, port, wired limit, total memory, chip                                                                                                                                                                    | first line of each file                                                                                  |
-| `<date>-<pid>.jsonl` `sample`        | busy time, memory, in flight, queued, resident models, turn and token deltas                                                                                                                                                 | 5 s while busy, 60 s while idle, plus one on each busy flip or resident-set change                       |
-| `<date>-<pid>.jsonl` `sched`         | `schedulerStats()` snapshot of one model, plus `turns`: the turns sent to that model since its load, all lanes, counted when the call was sent                                                                               | once after each load, then once after each busy burst, only when that model is idle (see below)          |
-| `<date>-<pid>.jsonl` `load` / `exit` | one model load; process exit                                                                                                                                                                                                 | on the event                                                                                             |
+| Output                               | Content                                                                                                                                                                                                                                                                                                                                                                                                                  | Cadence                                                                                                  |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |
+| `live-<pid>.json` (`v: 2`)           | status, health, memory, loaded models with their KV pool, turns in flight with their phase and `waitMs` / `slotMs` / `prepareMs`, the loads in flight (`loading`: model, start, `phase` `weights` or `kernels`, `stepsDone` of `steps`, read per load path from native `loadProgress`), counters, decode rate; about 0.6 KB plus about 380 B per turn in flight (at most 32 listed) plus each resident model, not capped | 1 s while busy, 5 s while idle (tmp + rename), plus a write 250 ms after each turn or load start and end |
+| `<date>-<pid>.jsonl` `proc`          | host kind, version, port, wired limit, total memory, chip                                                                                                                                                                                                                                                                                                                                                                | first line of each file                                                                                  |
+| `<date>-<pid>.jsonl` `sample`        | busy time, memory, in flight, queued, resident models, turn and token deltas, `pipelinesCreatedWhileServing` (cumulative; absent while the native counter is off)                                                                                                                                                                                                                                                        | 5 s while busy, 60 s while idle, plus one on each busy flip or resident-set change                       |
+| `<date>-<pid>.jsonl` `sched`         | `schedulerStats()` snapshot of one model, plus `turns`: the turns sent to that model since its load, all lanes, counted when the call was sent                                                                                                                                                                                                                                                                           | once after each load, then once after each busy burst, only when that model is idle (see below)          |
+| `<date>-<pid>.jsonl` `load` / `exit` | one model load (with `warmupMs`, `warmupSteps`, `warmupSkipped`, `warmupReset`, `warmupPipelines`, `warmupCompileMs`, `warmupPeakBytes` when the load ran a warm-up; not indexed); process exit                                                                                                                                                                                                                          | on the event                                                                                             |
 
 `schedulerStats()` is a scheduler barrier, so the sampler never calls it on a model with work: it goes through
 `SessionRegistry.tryIdleProbe`, which holds any dispatch that arrives until the reply settles. Scheduler counters are
@@ -596,10 +642,11 @@ reader ignores the file when MAIN's pid is dead.
 ### The index
 
 `~/.mlx-node/dashboard.db` is **disposable**: deleting it loses nothing; it is rebuilt from the JSONL on next start.
-`SCHEMA_VERSION` is 11 (`src/db/open.ts`): `traces`, `trace_files`, and five runtime tables (`runtime_files`,
+`SCHEMA_VERSION` is 12 (`src/db/open.ts`): `traces`, `trace_files`, and five runtime tables (`runtime_files`,
 `runtime_procs`, `runtime_samples`, `runtime_sched`, `runtime_loads`). Any DDL change bumps the version; a file with
 another version, or a damaged one, is moved aside and rebuilt. Version 10 replaced `traces.prefill_tps` with
-`prefill_ms` and `prefill_tokens`; version 11 added `runtime_sched.turns`.
+`prefill_ms` and `prefill_tokens`; version 11 added `runtime_sched.turns`; version 12 added `traces.wait_ms`,
+`slot_ms`, `prepare_ms`, `pipelines_created` and `pipeline_create_ms`.
 
 Ingest runs on boot, then every 30 s, after a finished turn (see the live channel) and on `POST /api/ingest`. It reads
 only the tail appended since the last read of each file. Files past retention are pruned after ingest.
@@ -608,7 +655,8 @@ only the tail appended since the last read of each file. Files past retention ar
 
 Live state is pushed over the same port; no page polls for it. The one timer that reads data is the Coding Agents
 page, which re-reads `GET /api/coding-agents` every 30 s while the window is visible (and on window focus). The Chat
-load card has a 1 s clock while it is shown; it changes only its elapsed-time text.
+load card has a 1 s clock while it is shown; it changes only its elapsed-time text (the kernel step count comes with
+the live snapshot).
 
 ```
  SPA  ── { kind: 'watch', id, topic: 'live' } ──▶  service
@@ -695,6 +743,8 @@ yarn workspace @mlx-node/dashboard dev:shots         # PNGs, light/dark x 1180x8
 - `MLX_DEV_FLIGHT=one-model` puts both turns in flight on one model, one asked through the alias `mlx-local` (the
   default is one turn on each of two models). `MLX_DEV_DISK_CACHE=native|off|older` sets the disk cache the heartbeat
   reports: on with the native 128-block limit, off, or no field at all (default: on, the whole prompt).
+  `MLX_DEV_FLIGHT=phases` adds three turns before their prefill: model busy, waiting for a slot, preparing.
+  `MLX_DEV_LOAD_KERNELS=3/50` reports the harness engine's load as "Preparing GPU kernels", 3 of 50.
 - Chat and Work run only on the scripted fake agent (`__test__/helpers/fake-agent.mjs`, script
   `__test__/fixtures/chat-scenarios/chat-harness.json`, picked by a word of the prompt), with keys in memory and the
   providers on loopback. The folder dialog answers a throwaway folder in the fixture home.

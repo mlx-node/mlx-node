@@ -65,8 +65,9 @@ import type { RerankerFamilyOptions, RerankerModel } from '@mlx-node/rerank/type
 import type { AudioModel } from '../audio-registry.js';
 import type { AudioServiceOptions } from '../audio-service.js';
 import type { ServerHealth } from '../health.js';
+import { readWarmupReport } from '../native-progress.js';
 import { resolveRerankLimits, type RerankServiceOptions } from '../rerank-service.js';
-import type { HostKind, RuntimeCapability } from '../runtime-trace.js';
+import type { HostKind } from '../runtime-trace.js';
 import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance } from '../server.js';
 import type { TurnJournalOptions } from '../turn-journal.js';
 import { discoverAudioModels, loadAudioModel, audioCapabilities, type DiscoveredAudioModel } from './audio-models.js';
@@ -87,7 +88,7 @@ import {
   type PersistPagedCache,
 } from './persist-cache.js';
 import { loadRerankModel, rerankCapability } from './rerank-models.js';
-import { startRuntimeSampler, type RuntimeSampler } from './runtime-sampler.js';
+import { startRuntimeSampler, type RuntimeSampler, type TimedLoadInfo } from './runtime-sampler.js';
 import { makeSwapController } from './swap.js';
 import { hostTempDirPrefix, sweepOrphanHostTempRoots } from './temp-root.js';
 
@@ -420,10 +421,8 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   const chatRef: { current: ReturnType<typeof makeSwapController> | null } = { current: null };
   // Started once the port is known; loads before that are not timed.
   const samplerRef: { current: RuntimeSampler | null } = { current: null };
-  const timedLoad = <T>(
-    info: { model: string; modelType: string; capability: RuntimeCapability },
-    load: () => Promise<T>,
-  ): Promise<T> => (samplerRef.current === null ? load() : samplerRef.current.timedLoad(info, load));
+  const timedLoad = <T>(info: TimedLoadInfo<T>, load: () => Promise<T>): Promise<T> =>
+    samplerRef.current === null ? load() : samplerRef.current.timedLoad(info, load);
   let acceptingHttpModelLoads = true;
   const activeHttpModelLoads = new Set<Promise<void>>();
 
@@ -500,8 +499,15 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
         : {}),
     };
     try {
-      return await timedLoad({ model: entry.name, modelType: String(entry.modelType), capability: 'chat' }, () =>
-        Object.keys(options).length === 0 ? loadModelFn(resolvedPath) : loadModelFn(resolvedPath, options),
+      return await timedLoad(
+        {
+          model: entry.name,
+          modelType: String(entry.modelType),
+          capability: 'chat',
+          path: resolvedPath,
+          warmupOf: readWarmupReport,
+        },
+        () => (Object.keys(options).length === 0 ? loadModelFn(resolvedPath) : loadModelFn(resolvedPath, options)),
       );
     } catch (error) {
       if (leasedDir !== undefined) releaseNativeGgufLease(leasedDir);
@@ -531,11 +537,14 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     [
       chatCapability(chatController, server.registry),
       ...audioCapabilities(audioModels, server.registry, (entry) =>
-        timedLoad({ model: entry.name, modelType: entry.modelType, capability: 'audio' }, () => audioLoader(entry)),
+        timedLoad({ model: entry.name, modelType: entry.modelType, capability: 'audio', path: entry.path }, () =>
+          audioLoader(entry),
+        ),
       ),
       rerankCapability(rerankModels, server.registry, (entry) =>
-        timedLoad({ model: entry.name, modelType: String(entry.modelType), capability: 'rerank' }, () =>
-          rerankLoader(entry),
+        timedLoad(
+          { model: entry.name, modelType: String(entry.modelType), capability: 'rerank', path: entry.path },
+          () => rerankLoader(entry),
         ),
       ),
     ],

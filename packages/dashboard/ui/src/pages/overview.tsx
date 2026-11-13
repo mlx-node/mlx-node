@@ -228,8 +228,8 @@ function EnginePanel({
     <Panel title="Engine" actions={open} className="col-span-12 @md:col-span-8">
       <div className="grid gap-3">
         {statusRow}
-        {live.status === 'loading' && process?.loading != null ? (
-          <p className="text-body text-secondary">{`Loading ${process.loading.model}…`}</p>
+        {live.status === 'loading' && process != null && process.loading.length > 0 ? (
+          <p className="text-body text-secondary">{`Loading ${process.loading.map((load) => load.model).join(', ')}…`}</p>
         ) : null}
         {body}
       </div>

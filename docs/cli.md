@@ -827,7 +827,7 @@ Like `mlx launch claude`, it applies the launcher engine policy (`MLX_PAGED_PREF
 
 ### Progress pings on `/v1/messages`
 
-While a streaming `/v1/messages` turn runs, the server writes a standard Anthropic `ping` event every 10 s (`MLX_SSE_PROGRESS_INTERVAL_MS` overrides) carrying an `mlx_progress` extension, so a client can show prefill and decode progress on long prompts. The first ping is 10 s after the stream starts. No ping follows `message_delta`, `message_stop` or `error`, and a tick is skipped while the socket is backpressured or the client has gone. Every field is omitted while unknown. `phase` is `queued` until the model thread starts this request, then `prefill`, then `decode`. Rates cover the window since the previous ping (the first prefill ping counts from prefill start, the first decode ping from the first token) and are omitted when the window shows no progress. `elapsed_ms` is measured from the start of the response stream. There is no ETA field: clients derive it from `prefill_total - prefill_done` and the rate. Non-streaming requests and `/v1/responses` do not send it.
+While a streaming `/v1/messages` turn runs, the server writes a standard Anthropic `ping` event every 10 s (`MLX_SSE_PROGRESS_INTERVAL_MS` overrides) carrying an `mlx_progress` extension, so a client can show prefill and decode progress on long prompts. The first ping is 10 s after the stream starts. No ping follows `message_delta`, `message_stop` or `error`, and a tick is skipped while the socket is backpressured or the client has gone. Every field is omitted while unknown. `phase` is `queued` while the model thread works on other requests, `slot` while the scheduler cannot start this one (lanes or memory), `prepare` while the thread prepares its prompt and cache, then `prefill`, then `decode`; `wait_ms`, `slot_ms` and `prepare_ms` are the native timers of those waits (integer ms; an older engine sends none). Rates cover the window since the previous ping (the first prefill ping counts from prefill start, the first decode ping from the first token) and are omitted when the window shows no progress. `elapsed_ms` is measured from the start of the response stream. There is no ETA field: clients derive it from `prefill_total - prefill_done` and the rate. Non-streaming requests and `/v1/responses` do not send it.
 
 ```
 event: ping
@@ -836,8 +836,11 @@ data: {"type":"ping","mlx_progress":{"phase":"prefill","elapsed_ms":20000,"prefi
 
 | Field                       | Meaning                                                |
 | --------------------------- | ------------------------------------------------------ |
-| `phase`                     | `queued`, `prefill` or `decode`                        |
+| `phase`                     | `queued`, `slot`, `prepare`, `prefill` or `decode`     |
 | `elapsed_ms`                | Integer ms since the response stream started           |
+| `wait_ms`                   | Native request created → picked up by the model thread |
+| `slot_ms`                   | Time the scheduler could not start the request         |
+| `prepare_ms`                | Time spent preparing the request before its prefill    |
 | `prefill_total`             | Tokens this turn prefills, excluding the cached prefix |
 | `prefill_done`              | Tokens of `prefill_total` done so far                  |
 | `cached_tokens`             | Prefix tokens reused from the cache                    |

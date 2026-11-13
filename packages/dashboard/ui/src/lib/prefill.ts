@@ -14,6 +14,11 @@ export const PREFILL_UNDER_TEXT = `under ${String(PREFILL_MIN_TOKENS)} tokens`;
 
 export const SETUP_HOLDS_TEXT = 'prefix lookup, cache restore, allocation, first decode step';
 
+/** What a turn's setup time holds; once native timed the prepare, only the wait behind other requests is left in it. */
+export function setupHoldsText(prepareMs: number | null): string {
+  return prepareMs !== null && prepareMs > 0 ? 'other requests on this model, first decode step' : SETUP_HOLDS_TEXT;
+}
+
 export const PREFILL_SMALL_HINT = 'Smaller prefills are mostly fixed cost, so they get no rate.';
 
 export const PREFILL_NONE_TITLE = 'No measured prefill in this range';

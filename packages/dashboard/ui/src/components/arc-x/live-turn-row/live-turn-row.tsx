@@ -12,7 +12,7 @@ import { Meter } from '../split-bar/split-bar';
 import { SwapText } from '../swap-text/swap-text';
 import styles from './live-turn-row.module.css';
 
-export type LivePhase = 'queued' | 'prefill' | 'decode' | null;
+export type LivePhase = 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode' | null;
 
 export interface LiveTurnRowProps {
   /** Callers pass `turn.modelId ?? turn.model`: the checkpoint, else the alias the client used. */
@@ -25,6 +25,8 @@ export interface LiveTurnRowProps {
   prefillTotal: number | null;
   generatedTokens: number | null;
   promptTokens: number | null;
+  /** Prefix tokens reused from the cache: the `prepare` phase restores them. */
+  cachedTokens: number | null;
   /** Callers pass `turn.ctxWindow`. It is never looked up by model name: an alias matches no `models[].name`. */
   ctxWindow: number | null;
   /** The name the client asked for, when it differs from `model`: 11 px muted text after the badge. */
@@ -39,8 +41,10 @@ export interface LiveTurnRowProps {
 
 const RICH_ROWS = 8;
 
-const PHASE_WORD: Record<'queued' | 'prefill' | 'decode' | 'running', string> = {
-  queued: 'Queued',
+const PHASE_WORD: Record<NonNullable<LivePhase> | 'running', string> = {
+  queued: 'Waiting',
+  slot: 'Queued',
+  prepare: 'Preparing',
   prefill: 'Prefill',
   decode: 'Decode',
   running: 'Running',
@@ -68,7 +72,7 @@ function spokenElapsed(ms: number): string {
 
 /** The middle cell's words, also used in the row's accessible name. */
 export function progressText(
-  props: Pick<LiveTurnRowProps, 'phase' | 'prefillDone' | 'prefillTotal' | 'generatedTokens'>,
+  props: Pick<LiveTurnRowProps, 'phase' | 'prefillDone' | 'prefillTotal' | 'generatedTokens' | 'cachedTokens'>,
 ): string {
   switch (props.phase) {
     case 'prefill':
@@ -78,7 +82,13 @@ export function progressText(
     case 'decode':
       return `${formatCountNoun(props.generatedTokens, 'token', 'tokens')} out`;
     case 'queued':
+      return 'model busy';
+    case 'slot':
       return 'waiting for a slot';
+    case 'prepare':
+      return props.cachedTokens !== null && props.cachedTokens > 0
+        ? `restoring ${formatCountNoun(props.cachedTokens, 'cached token', 'cached tokens')}`
+        : 'reading the prompt';
     default:
       return 'no progress for non-streamed turns';
   }
@@ -91,15 +101,24 @@ function contextShare(props: Pick<LiveTurnRowProps, 'promptTokens' | 'generatedT
 
 type ProgressProps = Pick<
   LiveTurnRowProps,
-  'model' | 'phase' | 'prefillDone' | 'prefillTotal' | 'generatedTokens' | 'promptTokens' | 'ctxWindow' | 'live'
+  | 'model'
+  | 'phase'
+  | 'prefillDone'
+  | 'prefillTotal'
+  | 'generatedTokens'
+  | 'promptTokens'
+  | 'cachedTokens'
+  | 'ctxWindow'
+  | 'live'
 >;
 
 /** The phase word in a badge, with its phase-colored key; the word shimmers while the turn works. */
 export function PhaseBadge({ phase, live }: { phase: LivePhase; live?: boolean }): ReactElement {
   const phaseKey = phase ?? 'running';
-  const working = live !== false && (phase === 'prefill' || phase === 'decode');
+  const busy = phase === 'prepare' || phase === 'prefill' || phase === 'decode';
+  const working = live !== false && busy;
   return (
-    <Badge tone={phase === 'prefill' || phase === 'decode' ? 'info' : 'neutral'} outline={phase === 'queued'} size="sm">
+    <Badge tone={busy ? 'info' : 'neutral'} outline={phase === 'queued' || phase === 'slot'} size="sm">
       <span className={styles.key} data-phase={phaseKey} aria-hidden="true" />
       <LiveLabel active={working}>{PHASE_WORD[phaseKey]}</LiveLabel>
     </Badge>

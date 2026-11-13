@@ -15,7 +15,7 @@ import {
   formatTps,
 } from '../lib/format';
 import { outcomeText, stopSentence, turnPhases, turnTimeline } from '../lib/metrics-view';
-import { PREFILL_UNDER_TEXT, prefillSizeText, SETUP_HOLDS_TEXT } from '../lib/prefill';
+import { PREFILL_UNDER_TEXT, prefillSizeText, setupHoldsText } from '../lib/prefill';
 import type { MetricsTurns, TurnRow } from '../lib/types';
 import { KeyValue, type KeyValueItem } from './arc-x/key-value/key-value';
 import { ModelBadge } from './arc-x/model-badge/model-badge';
@@ -84,6 +84,25 @@ function tokenItems(row: TurnRow): KeyValueItem[] {
   ];
 }
 
+/** The native waits before the first token; a record without one, or with none spent, leaves its row out. */
+export function waitItems(row: TurnRow): KeyValueItem[] {
+  const rows: Array<[string, string, number | null, string]> = [
+    ['wait', 'Model busy', row.waitMs, 'before the model started this turn'],
+    ['slot', 'Waiting for a slot', row.slotMs, 'no free lane or memory'],
+    ['prepare', 'Preparing', row.prepareMs, 'prompt, prefix match, cache restore'],
+  ];
+  return rows
+    .filter(([, , value]) => value !== null && value > 0)
+    .map(([key, label, value, hint]) => ({ key, label, value: formatDuration(value), hint, numeric: true }));
+}
+
+/** "GPU kernels created" for a turn that created any; nothing otherwise, also while the counter is off. */
+export function kernelItems(row: TurnRow): KeyValueItem[] {
+  if (row.pipelinesCreated === null || row.pipelinesCreated <= 0) return [];
+  const ms = row.pipelineCreateMs === null ? '' : ` (${formatDuration(row.pipelineCreateMs)})`;
+  return [{ key: 'kernels', label: 'GPU kernels created', value: `${formatNumber(row.pipelinesCreated)}${ms}` }];
+}
+
 function speedItems(row: TurnRow | null): KeyValueItem[] {
   const measured = row !== null && row.prefillMs !== null && row.prefillTokens !== null;
   const size = measured ? prefillSizeText(row.prefillTokens ?? 0, row.prefillMs ?? 0) : null;
@@ -95,11 +114,12 @@ function speedItems(row: TurnRow | null): KeyValueItem[] {
   }
   return [
     { key: 'first', label: 'First token', value: row === null ? null : formatDuration(row.ttftMs), numeric: true },
+    ...(row === null ? [] : waitItems(row)),
     {
       key: 'setup',
       label: 'Setup',
       value: measured ? formatDuration(row.setupMs) : null,
-      hint: measured ? SETUP_HOLDS_TEXT : undefined,
+      hint: measured ? setupHoldsText(row.prepareMs) : undefined,
       wrapHint: true,
       numeric: true,
     },
@@ -125,6 +145,7 @@ function detailItems(row: TurnRow): KeyValueItem[] {
       value: `${formatCountNoun(row.mtpCycles, 'cycle', 'cycles')} · ${accepted} tokens per cycle`,
     });
   }
+  items.push(...kernelItems(row));
   if (row.coldHits !== null || row.coldMisses !== null) {
     items.push({
       key: 'cold',
@@ -253,6 +274,9 @@ const EMPTY_ROW: TurnRow = {
   queueMs: null,
   loadWaitMs: null,
   resolveMs: null,
+  waitMs: null,
+  slotMs: null,
+  prepareMs: null,
   ttftMs: null,
   prefillMs: null,
   prefillTokens: null,
@@ -271,6 +295,8 @@ const EMPTY_ROW: TurnRow = {
   concurrency: null,
   concurrencyPeak: null,
   memActiveBytes: null,
+  pipelinesCreated: null,
+  pipelineCreateMs: null,
   pid: null,
 };
 

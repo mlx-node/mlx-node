@@ -19,7 +19,7 @@ const assetsDir = join(webDir, 'assets');
  * grew before raising it.
  */
 const JS_CAP_BYTES = 1_512_192;
-const CSS_CAP_BYTES = 277_700;
+const CSS_CAP_BYTES = 278_528;
 const FONTS_CAP_BYTES = 230_000;
 
 /** Strings only the dev harness carries. None may reach `web/`. */

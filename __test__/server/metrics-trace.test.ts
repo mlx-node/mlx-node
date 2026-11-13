@@ -268,6 +268,56 @@ describe('MetricsTrace', () => {
     });
   });
 
+  it('writes the three native timers and the pipeline pair, and drops invalid values', () => {
+    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
+    trace.record(
+      baseRecord({
+        traceId: 'timed',
+        waitMs: 75_070.25,
+        slotMs: 0,
+        prepareMs: 4_210.5,
+        pipelinesCreated: 3,
+        pipelineCreateMs: 812.5,
+      }),
+    );
+    trace.record(
+      baseRecord({
+        traceId: 'cancelled-in-prepare',
+        outcome: 'cancelled',
+        failPhase: 'prepare',
+        waitMs: 1,
+        slotMs: 0,
+        prepareMs: 800,
+      }),
+    );
+    trace.record(baseRecord({ traceId: 'cancelled-in-slot', outcome: 'cancelled', failPhase: 'slot' }));
+    trace.record(
+      baseRecord({
+        traceId: 'invalid',
+        waitMs: -1,
+        slotMs: Number.NaN,
+        prepareMs: Number.POSITIVE_INFINITY,
+        pipelinesCreated: 1.5,
+        pipelineCreateMs: 10,
+      }),
+    );
+    trace.record(baseRecord({ traceId: 'count-only', pipelinesCreated: 2 }));
+    const [timed, prepare, slot, invalid, countOnly] = readLines(trace.currentFile()) as Record<string, unknown>[];
+    expect(timed).toMatchObject({
+      waitMs: 75_070.25,
+      slotMs: 0,
+      prepareMs: 4_210.5,
+      pipelinesCreated: 3,
+      pipelineCreateMs: 812.5,
+    });
+    expect(prepare).toMatchObject({ failPhase: 'prepare', waitMs: 1, slotMs: 0, prepareMs: 800 });
+    expect(slot).toMatchObject({ failPhase: 'slot' });
+    for (const key of ['waitMs', 'slotMs', 'prepareMs', 'pipelinesCreated', 'pipelineCreateMs']) {
+      expect(key in invalid!).toBe(false);
+    }
+    expect('pipelinesCreated' in countOnly!).toBe(false);
+  });
+
   it('writes the prefill window only as a valid pair on an ok turn', () => {
     const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
     const cases: Array<[string, Partial<RecordInput>]> = [

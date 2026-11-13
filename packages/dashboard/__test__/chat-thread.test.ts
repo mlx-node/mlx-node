@@ -634,7 +634,7 @@ describe('ChatThread: a message that waits for its model', () => {
           model: LONG,
           host: {
             inference: 'loading',
-            loading: { modelId: LONG, startedAt: NOW - 134_000 },
+            loading: [{ modelId: LONG, startedAt: NOW - 134_000, phase: 'weights', stepsDone: 0, steps: 0 }],
             resident: [],
             answers: [],
           },
@@ -667,7 +667,7 @@ describe('ChatThread: a message that waits for its model', () => {
     try {
       const host = (loading: { modelId: string; startedAt: number } | null) => ({
         inference: loading === null ? ('ready' as const) : ('loading' as const),
-        loading,
+        loading: loading === null ? [] : [{ ...loading, phase: 'weights' as const, stepsDone: 0, steps: 0 }],
         resident: [],
         answers: [],
       });
@@ -695,11 +695,93 @@ describe('ChatThread: a message that waits for its model', () => {
     }
   });
 
+  it('while the engine prepares GPU kernels the card says so, counts the steps and fills a bar', () => {
+    vi.useFakeTimers({ now: NOW, toFake: ['Date', 'setInterval', 'clearInterval'] });
+    try {
+      const container = mount(
+        threadOf(waiting(NOW - 9_000), {
+          model: 'qwen-a',
+          host: {
+            inference: 'loading',
+            loading: [{ modelId: 'qwen-a', startedAt: NOW - 40_000, phase: 'kernels', stepsDone: 12, steps: 45 }],
+            resident: [],
+            answers: [],
+          },
+        }),
+      );
+      const card = cardOf(container);
+      expect(card.getAttribute('data-phase')).toBe('kernels');
+      expect(card.textContent).toContain(CHAT.load.titleKernels);
+      expect(card.textContent).not.toContain(CHAT.load.title);
+      expect(card.textContent).toContain('12 of 45');
+      expect(card.textContent).toContain(CHAT.load.kernelNote);
+      expect(card.textContent).toContain(CHAT.load.stopNote);
+      const bar = byRole(container, 'meter', CHAT.load.titleKernels);
+      expect(bar?.getAttribute('aria-valuenow')).toBe('27');
+      expect(bar?.getAttribute('aria-valuetext')).toBe('27%, 12 of 45');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the weight read, or a load with no steps, keeps the plain card', () => {
+    vi.useFakeTimers({ now: NOW, toFake: ['Date', 'setInterval', 'clearInterval'] });
+    try {
+      const hostOf = (phase: 'weights' | 'kernels', stepsDone: number | null, steps: number | null) => ({
+        inference: 'loading' as const,
+        loading: [{ modelId: 'qwen-a', startedAt: NOW - 1_000, phase, stepsDone, steps }],
+        resident: [],
+        answers: [],
+      });
+      const container = mount(threadOf(waiting(NOW - 1_000), { model: 'qwen-a', host: hostOf('weights', 0, 0) }));
+      for (const host of [hostOf('weights', 0, 0), hostOf('kernels', null, null), hostOf('kernels', 0, 0)]) {
+        rerender(threadOf(waiting(NOW - 1_000), { model: 'qwen-a', host }));
+        const card = cardOf(container);
+        expect(card.textContent).toContain(CHAT.load.title);
+        expect(card.textContent).toContain(CHAT.load.wait);
+        expect(card.textContent).not.toContain(CHAT.load.titleKernels);
+        expect(card.textContent).not.toContain(' of ');
+        expect(container.querySelector('[role="meter"]')).toBeNull();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('two loads at once: each conversation shows its own model and count', () => {
+    vi.useFakeTimers({ now: NOW, toFake: ['Date', 'setInterval', 'clearInterval'] });
+    try {
+      const host = {
+        inference: 'loading' as const,
+        loading: [
+          { modelId: 'qwen-a', startedAt: NOW - 60_000, phase: 'kernels' as const, stepsDone: 30, steps: 50 },
+          { modelId: 'qwen-b', startedAt: NOW - 5_000, phase: 'kernels' as const, stepsDone: 3, steps: 45 },
+        ],
+        resident: [],
+        answers: [],
+      };
+      const container = mount(threadOf(waiting(NOW - 1_000), { model: 'qwen-a', host }));
+      expect(cardOf(container).textContent).toContain('30 of 50');
+      expect(cardOf(container).textContent).toContain('1:00');
+      rerender(threadOf(waiting(NOW - 1_000), { model: 'qwen-b', host }));
+      expect(cardOf(container).getAttribute('data-variant')).toBe('loading');
+      expect(cardOf(container).textContent).toContain('3 of 45');
+      expect(cardOf(container).textContent).toContain('0:05');
+      expect(cardOf(container).textContent).not.toContain('30 of 50');
+      rerender(threadOf(waiting(NOW - 1_000), { model: 'qwen-c', host }));
+      expect(cardOf(container).getAttribute('data-variant')).toBe('other-first');
+      expect(cardOf(container).textContent).toContain(fill(CHAT.load.otherFirst, { other: 'qwen-a' }));
+      expect(cardOf(container).textContent).not.toContain(' of 5');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('a model in memory: the card waits for the engine and never says the model loads', () => {
     const onStatus = vi.fn();
     const host = {
       inference: 'ready' as const,
-      loading: null,
+      loading: [],
       resident: [{ modelId: 'qwen-a', sizeBytes: null }],
       answers: [],
     };
@@ -722,7 +804,7 @@ describe('ChatThread: a message that waits for its model', () => {
     };
     const host = (inFlight: number, maxConcurrent: number, queued: number, lastStart = 400) => ({
       inference: 'ready' as const,
-      loading: null,
+      loading: [],
       resident: [{ modelId: 'qwen-a', sizeBytes: null }],
       answers: [{ modelId: 'qwen-a', inFlight, maxConcurrent, queued, lastStart }],
     });
@@ -746,7 +828,7 @@ describe('ChatThread: a message that waits for its model', () => {
 
   it('the load is announced once, and a resident model shows no card', () => {
     const onStatus = vi.fn();
-    const host = { inference: 'ready' as const, loading: null, resident: [], answers: [] };
+    const host = { inference: 'ready' as const, loading: [], resident: [], answers: [] };
     const container = mount(threadOf(waiting(Date.now()), { model: 'qwen-a', host, onStatus }));
     rerender(threadOf(waiting(Date.now()), { model: 'qwen-a', host, onStatus }));
     expect(onStatus.mock.calls.filter(([text]) => text === fill(CHAT.load.status, { model: 'qwen-a' }))).toHaveLength(
@@ -772,7 +854,12 @@ describe('ChatThread: a message that waits for its model', () => {
     const container = mount(
       threadOf(sample, {
         model: 'qwen-a',
-        host: { inference: 'loading', loading: { modelId: 'qwen-a', startedAt: 0 }, resident: [], answers: [] },
+        host: {
+          inference: 'loading',
+          loading: [{ modelId: 'qwen-a', startedAt: 0, phase: 'weights', stepsDone: 0, steps: 0 }],
+          resident: [],
+          answers: [],
+        },
       }),
     );
     expect(container.textContent).toContain(CHAT.outcomes['cancelled-unsent']);
@@ -786,7 +873,7 @@ describe('ChatThread: a message that waits for its model', () => {
         model: 'qwen-a',
         host: {
           inference: 'ready',
-          loading: null,
+          loading: [],
           resident: [{ modelId: 'qwen-a', sizeBytes: 2 * 1024 ** 3 }],
           answers: [],
         },
@@ -796,7 +883,7 @@ describe('ChatThread: a message that waits for its model', () => {
     expect(container.textContent).toContain(fill(CHAT.engine.resident, { model: 'qwen-a', size: '2.0 GB' }));
     expect(anchors(container)).not.toContain('/engine');
     rerender(
-      threadOf(sample, { model: 'qwen-a', host: { inference: 'ready', loading: null, resident: [], answers: [] } }),
+      threadOf(sample, { model: 'qwen-a', host: { inference: 'ready', loading: [], resident: [], answers: [] } }),
     );
     expect(container.textContent).not.toContain('is in memory');
     expect(container.textContent).toContain(CHAT.outcomes['cancelled-unsent']);
@@ -812,7 +899,7 @@ describe('ChatThread: a message that waits for its model', () => {
     };
     const host = {
       inference: 'ready' as const,
-      loading: null,
+      loading: [],
       resident: [{ modelId: 'qwen-a', sizeBytes: null }],
       answers: [],
     };

@@ -429,10 +429,19 @@ export interface AnthropicMessageStopEvent {
  * Every field is omitted while unknown.
  */
 export interface MlxProgress {
-  /** `queued` until the model thread starts this request's prefill. */
-  phase?: 'queued' | 'prefill' | 'decode';
+  /**
+   * `queued`: the model thread works on other requests. `slot`: the scheduler cannot start this one yet (lanes or
+   * memory). `prepare`: the thread prepares this one's prompt and cache before its prefill.
+   */
+  phase?: 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode';
   /** Milliseconds since the server started this response stream. */
   elapsed_ms?: number;
+  /** Milliseconds from the native request to its pickup by the model thread. */
+  wait_ms?: number;
+  /** Milliseconds the scheduler could not start this request. */
+  slot_ms?: number;
+  /** Milliseconds spent preparing this request before its prefill. */
+  prepare_ms?: number;
   /** Tokens this turn prefills, excluding the cached prefix. */
   prefill_total?: number;
   /** Tokens of `prefill_total` done so far. */

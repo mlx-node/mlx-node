@@ -24,7 +24,7 @@ const T = Date.UTC(2026, 10, 10, 12);
 /** Typed against the writer's own type, so a field renamed on either side fails the typecheck. */
 function liveFile(pid: number, extra: Partial<WriterLiveFile> = {}): WriterLiveFile {
   return {
-    v: 1,
+    v: 2,
     pid,
     startedAt: T - 60_000,
     ts: T,
@@ -37,7 +37,7 @@ function liveFile(pid: number, extra: Partial<WriterLiveFile> = {}): WriterLiveF
     health: 'ok',
     mem: { active: 1, peak: 2, cache: 3, wiredLimit: 4, rss: 5 },
     decodeTps: 42.5,
-    loading: null,
+    loading: [],
     counters: { ok: 1, error: 0, cancelled: 0, outputTokens: 100, loads: 1, rejected: 0 },
     models: [
       {
@@ -64,6 +64,9 @@ function liveFile(pid: number, extra: Partial<WriterLiveFile> = {}): WriterLiveF
         stream: true,
         dispatch: 'start',
         phase: 'decode',
+        waitMs: 4,
+        slotMs: 0,
+        prepareMs: 210,
         promptTokens: 1200,
         cachedTokens: 1000,
         prefillTotal: 200,
@@ -234,6 +237,69 @@ describe('live: watcher', () => {
     expect(snapshot.processes).toHaveLength(1);
     const { v: _v, ...fields } = liveFile(31);
     expect(snapshot.processes[0]).toEqual({ ...fields, status: 'running', ageMs: 500 });
+  });
+
+  it('a heartbeat of an older engine (v1) lists no process and breaks nothing', async () => {
+    writeLive(31, liveFile(31));
+    writeLive(32, { ...liveFile(32), v: 1, loading: null });
+    watcher = createLiveWatcher({
+      runtimeDir,
+      supervisorPath,
+      ingest: async () => summary(0, 0),
+      now: () => T + 500,
+      isAlive: () => true,
+    });
+    const snapshot = await watcher.readNow();
+    expect(snapshot.processes.map((p) => p.pid)).toEqual([31]);
+    expect(existsSync(join(runtimeDir, 'live-32.json'))).toBe(true);
+  });
+
+  it('reads the three waiting phases and their timers', () => {
+    const turn = liveFile(31).turns[0]!;
+    const turns = [
+      { ...turn, traceId: 'busy', phase: 'queued' as const, waitMs: 75_070, slotMs: null, prepareMs: null },
+      { ...turn, traceId: 'slot', phase: 'slot' as const, waitMs: 3, slotMs: 1_500, prepareMs: 0 },
+      { ...turn, traceId: 'prep', phase: 'prepare' as const, waitMs: 2, slotMs: 0, prepareMs: 4_000 },
+    ];
+    const parsed = parseLiveFile(liveFile(31, { turns }));
+    expect(parsed?.turns.map((t) => [t.traceId, t.phase, t.waitMs, t.slotMs, t.prepareMs])).toEqual([
+      ['busy', 'queued', 75_070, null, null],
+      ['slot', 'slot', 3, 1_500, 0],
+      ['prep', 'prepare', 2, 0, 4_000],
+    ]);
+  });
+
+  it('rejects an unknown phase, a turn without the timers, and a v1 heartbeat', () => {
+    const turn = liveFile(31).turns[0]!;
+    expect(parseLiveFile({ ...liveFile(31), turns: [{ ...turn, phase: 'warming' }] })).toBeNull();
+    const { waitMs: _wait, ...untimed } = turn;
+    expect(parseLiveFile({ ...liveFile(31), turns: [untimed] })).toBeNull();
+    const v1 = {
+      ...liveFile(31),
+      v: 1,
+      loading: { model: 'm', startedAt: T },
+      turns: [{ ...untimed, slotMs: undefined, prepareMs: undefined }],
+    };
+    expect(parseLiveFile(v1)).toBeNull();
+    expect(parseLiveFile({ ...liveFile(31), v: 1 })).toBeNull();
+  });
+
+  it('reads every load in flight, oldest first, with its phase and steps', () => {
+    const parsed = parseLiveFile(
+      liveFile(31, {
+        loading: [
+          { model: 'Qwen3.5-4B', startedAt: T - 1000, phase: 'weights', stepsDone: null, steps: null },
+          { model: 'Ornith-35B', startedAt: T - 5000, phase: 'kernels', stepsDone: 3, steps: 50 },
+        ],
+      }),
+    );
+    expect(parsed?.loading).toEqual([
+      { model: 'Ornith-35B', startedAt: T - 5000, phase: 'kernels', stepsDone: 3, steps: 50 },
+      { model: 'Qwen3.5-4B', startedAt: T - 1000, phase: 'weights', stepsDone: null, steps: null },
+    ]);
+    expect(parseLiveFile({ ...liveFile(31), loading: null })).toBeNull();
+    const badPhase = { model: 'm', startedAt: T, phase: 'compile', stepsDone: 0, steps: 0 };
+    expect(parseLiveFile({ ...liveFile(31), loading: [badPhase] })).toBeNull();
   });
 
   it('reports whether the engine has the disk cache on, and null when the engine does not say', () => {

@@ -43,6 +43,9 @@ describe('turnPhases', () => {
       resolveMs: 10,
       loadWaitMs: 20,
       queueMs: 30,
+      waitMs: 0,
+      slotMs: 0,
+      prepareMs: 0,
       firstTokenMs: 0,
       setupMs: 50,
       prefillMs: 150,
@@ -159,7 +162,146 @@ describe('turnPhases', () => {
   });
 });
 
+describe('turnPhases with the native timers', () => {
+  const sum = (p: ReturnType<typeof turnPhases>): number =>
+    p.handlingMs +
+    p.resolveMs +
+    p.loadWaitMs +
+    p.queueMs +
+    p.waitMs +
+    p.slotMs +
+    p.prepareMs +
+    p.firstTokenMs +
+    p.setupMs +
+    p.prefillMs +
+    p.decodeMs +
+    p.tailMs;
+
+  it('a turn that waited 75 s for the model has a wait part, and the parts sum to the total', () => {
+    const row = turnRow('b', {
+      preDispatchMs: 0,
+      queueMs: 0,
+      waitMs: 75_070,
+      slotMs: 0,
+      prepareMs: 1_200,
+      ttftMs: 2_600,
+      prefillMs: 500,
+      decodeMs: 2_000,
+      durationMs: 79_700,
+    });
+    const phases = turnPhases(row);
+    expect(phases).toMatchObject({ waitMs: 75_070, slotMs: 0, prepareMs: 1_200, setupMs: 900, decodeMs: 2_000 });
+    expect(sum(phases)).toBe(phases.totalMs);
+    expect(phaseSegments(phases).find((segment) => segment.key === 'wait')).toMatchObject({
+      label: 'Model busy',
+      value: 75_070,
+    });
+  });
+
+  it('clamps timers that overrun their window and never passes the total', () => {
+    const phases = turnPhases(
+      turnRow('o', {
+        preDispatchMs: 0,
+        waitMs: 90_000,
+        slotMs: 5_000,
+        prepareMs: 5_000,
+        ttftMs: 2_600,
+        prefillMs: 500,
+        decodeMs: 9_000,
+        durationMs: 10_000,
+      }),
+    );
+    expect(phases).toMatchObject({ waitMs: 7_400, decodeMs: 0, slotMs: 2_100, prepareMs: 0, setupMs: 0 });
+    expect(sum(phases)).toBe(phases.totalMs);
+  });
+
+  it('a turn cut before its first token keeps its slot and prepare time', () => {
+    const phases = turnPhases(
+      turnRow('c', {
+        outcome: 'cancelled',
+        failPhase: 'prepare',
+        preDispatchMs: 0,
+        waitMs: 1_000,
+        slotMs: 3_000,
+        prepareMs: 9_000,
+        ttftMs: null,
+        prefillMs: null,
+        decodeMs: null,
+        durationMs: 5_000,
+      }),
+    );
+    expect(phases).toMatchObject({ waitMs: 1_000, slotMs: 3_000, prepareMs: 1_000, firstTokenMs: 0, tailMs: 0 });
+    expect(sum(phases)).toBe(phases.totalMs);
+  });
+
+  it('a record without the timers shows no empty part', () => {
+    const keys = phaseSegments(turnPhases(turnRow('old'))).map((segment) => segment.key);
+    expect(keys).not.toContain('wait');
+    expect(keys).not.toContain('slot');
+    expect(keys).not.toContain('prepare');
+  });
+});
+
 describe('turnTimeline', () => {
+  it('draws model busy, slot and prepare before the setup, the first-token marker after them', () => {
+    const timeline = turnTimeline(
+      turnRow('t', {
+        preDispatchMs: 0,
+        queueMs: 0,
+        waitMs: 75_070,
+        slotMs: 300,
+        prepareMs: 1_200,
+        ttftMs: 2_600,
+        prefillMs: 500,
+        decodeMs: 2_000,
+        durationMs: 79_700,
+      }),
+    );
+    expect(timeline.spans.map((span) => [span.kind, span.label, span.startMs, span.endMs])).toEqual([
+      ['busy', 'Model busy', 0, 75_070],
+      ['slot', 'Waiting for a slot', 75_070, 75_370],
+      ['prepare', 'Preparing', 75_370, 76_570],
+      ['setup', 'Setup', 76_570, 77_170],
+      ['prefill', 'Prefill', 77_170, 77_670],
+      ['decode', 'Decode', 77_670, 79_670],
+      ['other', 'Other', 79_670, 79_700],
+    ]);
+    expect(timeline.markers[0]?.atMs).toBe(77_670);
+  });
+
+  it('names the prefix work in the setup of a turn whose prepare was not timed', () => {
+    const before = (prepareMs: number | null): string | undefined =>
+      turnTimeline(turnRow('p', { prepareMs })).spans.find((span) => span.kind === 'setup')?.detail?.[0]?.value;
+    expect(before(null)).toBe('prefix lookup, cache restore, allocation');
+    expect(before(0)).toBe('prefix lookup, cache restore, allocation');
+    expect(before(20)).toBe('other requests on this model');
+  });
+
+  it('a turn stopped while waiting or preparing ends at that phase', () => {
+    for (const failPhase of ['queued', 'slot', 'prepare'] as const) {
+      const timeline = turnTimeline(
+        turnRow('s', {
+          outcome: 'cancelled',
+          failPhase,
+          preDispatchMs: 0,
+          waitMs: 1_000,
+          slotMs: 3_000,
+          prepareMs: 500,
+          ttftMs: null,
+          prefillMs: null,
+          decodeMs: null,
+          durationMs: 5_000,
+        }),
+      );
+      expect(timeline.spans.map((span) => span.id)).toEqual(['wait', 'slot', 'prepare']);
+      expect(timeline.spans.at(-1)?.status).toBe('cancelled');
+      expect(timeline.markers).toEqual([]);
+    }
+    expect(stopSentence({ outcome: 'cancelled', failPhase: 'prepare' })).toBe('Stopped while preparing.');
+    expect(stopSentence({ outcome: 'error', failPhase: 'slot' })).toBe('Stopped while waiting for a slot.');
+    expect(stopSentence({ outcome: 'cancelled', failPhase: 'queued' })).toBe('Stopped while waiting.');
+  });
+
   it('marks derived spans estimated and measured ones not', () => {
     const timeline = turnTimeline(turnRow('d', { preDispatchMs: 100, queueMs: 40 }));
     const byId = new Map(timeline.spans.map((span) => [span.id, span]));

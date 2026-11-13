@@ -9,6 +9,8 @@
  * every unload with 409. `MLX_DEV_ENGINE_STATES=1`: five more loaded models, one per state of the Engine pool section.
  * `MLX_DEV_TICKER_TPS` / `MLX_DEV_TICKER_MEM_GB`: fixed Output rate and MLX memory values in the heartbeat.
  * `MLX_DEV_FLIGHT=one-model`: both turns in flight on one model, one asked through the alias `mlx-local`.
+ * `MLX_DEV_FLIGHT=phases`: three more turns before their prefill: model busy, waiting for a slot, preparing.
+ * `MLX_DEV_LOAD_KERNELS=<done>/<steps>`: the heartbeat reports a load as "Preparing GPU kernels", done of steps.
  * `MLX_DEV_DISK_CACHE=native|off|older`: the disk cache the heartbeat reports (default: on, whole prompt).
  */
 
@@ -56,6 +58,18 @@ function tickerValues(): LiveProcess['ticker'] {
   return { decodeTps: tps, memActive: Math.round(mem * 1024 ** 3) };
 }
 
+function flightValue(value: string | undefined): LiveProcess['flight'] {
+  return value === 'one-model' || value === 'phases' ? value : 'two-models';
+}
+
+/** `<done>/<steps>` of `MLX_DEV_LOAD_KERNELS`, or null. */
+function kernelSteps(value: string | undefined): { stepsDone: number; steps: number } | null {
+  if (value === undefined) return null;
+  const [done, steps] = value.split('/').map((part) => Number.parseInt(part, 10));
+  if (done === undefined || steps === undefined || !Number.isFinite(done) || !Number.isFinite(steps)) return null;
+  return { stepsDone: done, steps };
+}
+
 function diskCacheValue(value: string | undefined): LiveProcess['diskCache'] {
   return value === 'native' || value === 'off' || value === 'older' ? value : 'whole-prompt';
 }
@@ -71,7 +85,7 @@ async function main(): Promise<void> {
     startedAt,
     engineStates,
     ticker: tickerValues(),
-    flight: process.env.MLX_DEV_FLIGHT === 'one-model' ? 'one-model' : 'two-models',
+    flight: flightValue(process.env.MLX_DEV_FLIGHT),
     diskCache: diskCacheValue(process.env.MLX_DEV_DISK_CACHE),
   };
   if (fixtureExists(home)) {
@@ -87,11 +101,19 @@ async function main(): Promise<void> {
   const providers = await startHarnessProviders();
   const loadMs = Number.parseInt(process.env.MLX_DEV_LOAD_MS ?? '', 10);
   const hidden = process.env.MLX_DEV_LOAD_HIDDEN === '1';
+  const kernels = kernelSteps(process.env.MLX_DEV_LOAD_KERNELS);
   const engine = await startHarnessEngine({
     loadMs: Number.isFinite(loadMs) && loadMs >= 0 ? loadMs : HARNESS_LOAD_MS,
     unloadBusy: process.env.MLX_DEV_UNLOAD_BUSY === '1',
     onState: (state) => {
-      live.loading = hidden ? null : state.loading;
+      live.loading =
+        hidden || state.loading === null
+          ? []
+          : [
+              kernels === null
+                ? { ...state.loading, phase: 'weights', stepsDone: 0, steps: 0 }
+                : { ...state.loading, phase: 'kernels', ...kernels },
+            ];
       live.chatModels = state.resident === null ? [] : [state.resident];
       writeLiveFile(home, live);
     },

@@ -57,6 +57,76 @@ afterEach(() => {
 });
 
 describe('ingestTraces', () => {
+  it('an index from the previous version is rebuilt; old rows and rows with the native timers both load', async () => {
+    mkdirSync(dir, { recursive: true });
+    const row = (traceId: string, extra: Record<string, unknown>) =>
+      JSON.stringify({
+        v: 2,
+        traceId,
+        ts: Date.now() - 60_000,
+        pid: 7,
+        model: 'Ornith-35B',
+        outcome: 'ok',
+        endpoint: 'messages',
+        stream: true,
+        dispatch: 'start',
+        finishReason: 'stop',
+        durationMs: 77_700,
+        toolCount: 0,
+        imageCount: 0,
+        concurrency: 1,
+        concurrencyPeak: 1,
+        ...extra,
+      });
+    writeFileSync(
+      join(dir, '2026-11-13-55843.jsonl'),
+      [
+        row('old', { ttftMs: 2_600 }),
+        row('new', { ttftMs: 2_600, waitMs: 75_070, slotMs: 0, prepareMs: 2_100, pipelinesCreated: 0 }),
+        row('cut', {
+          outcome: 'cancelled',
+          finishReason: 'cancelled',
+          failPhase: 'prepare',
+          waitMs: 1,
+          slotMs: 0,
+          prepareMs: 800,
+          pipelinesCreated: 4,
+          pipelineCreateMs: 9_000.5,
+        }),
+        row('bad', { outcome: 'cancelled', finishReason: 'cancelled', failPhase: 'warming' }),
+      ].join('\n') + '\n',
+    );
+    const file = join(base, 'index.db');
+    const first = openDashboardDb(file);
+    await ingestTraces(first, dir);
+    first.sqlite.exec('PRAGMA user_version = 11;');
+    first.close();
+
+    const rebuilt = openDashboardDb(file);
+    try {
+      expect(rebuilt.db.select().from(traces).all()).toHaveLength(0);
+      await ingestTraces(rebuilt, dir);
+      const rows = new Map(
+        rebuilt.db
+          .select()
+          .from(traces)
+          .all()
+          .map((r) => [r.traceId, r]),
+      );
+      expect(rows.get('old')).toMatchObject({ waitMs: null, slotMs: null, prepareMs: null, pipelinesCreated: null });
+      expect(rows.get('new')).toMatchObject({ waitMs: 75_070, slotMs: 0, prepareMs: 2_100, pipelinesCreated: 0 });
+      expect(rows.get('cut')).toMatchObject({
+        failPhase: 'prepare',
+        prepareMs: 800,
+        pipelinesCreated: 4,
+        pipelineCreateMs: 9_000.5,
+      });
+      expect(rows.get('bad')?.failPhase).toBeNull();
+    } finally {
+      rebuilt.close();
+    }
+  });
+
   it('indexes trace records with numeric fields', async () => {
     cpSync(FIXTURE_TRACES, dir, { recursive: true });
     const res = await ingestTraces(dash, dir);

@@ -9,14 +9,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 import {
   EDGE_COALESCE_MS,
   LIVE_DEAD_AFTER_MS,
+  SAMPLE_IDLE_MS,
   shouldSnapshotScheduler,
   startRuntimeSampler,
   type RuntimeSampler,
   type RuntimeSamplerDeps,
 } from '../../../packages/server/src/host/runtime-sampler.js';
+import type { LoadProgress, PipelineStats, WarmupReport } from '../../../packages/server/src/native-progress.js';
 import type { ResidentModel } from '../../../packages/server/src/registry.js';
 import type {
   RuntimeLiveFile,
+  RuntimeLoadRecord,
   RuntimeSampleRecord,
   RuntimeSchedRecord,
   RuntimeTrace,
@@ -207,6 +210,7 @@ describe('runtime sampler', () => {
   /** When the sampler last built a live body: only that build reads `host.persistPagedCache`. */
   let liveBuiltAt: number | null = null;
   const landed = () => liveLanded(join(dir, `live-${process.pid}.json`), liveBuiltAt);
+  const readLive = () => JSON.parse(readFileSync(join(dir, `live-${process.pid}.json`), 'utf8')) as RuntimeLiveFile;
 
   function start(entries: ResidentModel[], overrides: Partial<RuntimeSamplerDeps> = {}) {
     const { records, trace } = captureTrace();
@@ -229,6 +233,8 @@ describe('runtime sampler', () => {
       memory: () => ({ activeBytes: 100, peakBytes: 200, cacheBytes: 50 }),
       wiredLimit: () => 1000,
       isAlive: () => true,
+      loadProgress: () => null,
+      pipelineStats: () => null,
       ...overrides,
     });
     return records;
@@ -407,7 +413,7 @@ describe('runtime sampler', () => {
     const liveFile = join(dir, `live-${process.pid}.json`);
     const live = JSON.parse(readFileSync(liveFile, 'utf8')) as RuntimeLiveFile;
     expect(live).toMatchObject({
-      v: 1,
+      v: 2,
       pid: process.pid,
       host: 'serve',
       port: 8080,
@@ -417,7 +423,7 @@ describe('runtime sampler', () => {
       health: 'ok',
       mem: { active: 100, peak: 200, cache: 50, wiredLimit: 1000 },
       decodeTps: null,
-      loading: null,
+      loading: [],
     });
     expect(live.models).toEqual([
       {
@@ -444,6 +450,9 @@ describe('runtime sampler', () => {
         stream: true,
         dispatch: 'start',
         phase: 'decode',
+        waitMs: null,
+        slotMs: null,
+        prepareMs: null,
         promptTokens: 100,
         cachedTokens: 60,
         prefillTotal: 40,
@@ -555,8 +564,6 @@ describe('runtime sampler', () => {
     } as unknown as ResidentModel;
     start([entry]);
     await landed();
-    const liveFile = join(dir, `live-${process.pid}.json`);
-    const readLive = () => JSON.parse(readFileSync(liveFile, 'utf8')) as RuntimeLiveFile;
 
     const stream = traced.chatStreamSessionStart([])[Symbol.asyncIterator]();
     await stream.next();
@@ -588,13 +595,14 @@ describe('runtime sampler', () => {
 
   it('timedLoad records duration and ok for success and failure', async () => {
     const records = start([]);
-    const loaded = await sampler!.timedLoad({ model: 'a', modelType: 'qwen3_5', capability: 'chat' }, async () => {
+    const info = { model: 'a', modelType: 'qwen3_5', capability: 'chat', path: '/m/a' } as const;
+    const loaded = await sampler!.timedLoad(info, async () => {
       vi.setSystemTime(Date.now() + 1234);
       return 'model';
     });
     expect(loaded).toBe('model');
     await expect(
-      sampler!.timedLoad({ model: 'tts', modelType: 'qwen3_tts', capability: 'audio' }, async () => {
+      sampler!.timedLoad({ model: 'tts', modelType: 'qwen3_tts', capability: 'audio', path: '/m/tts' }, async () => {
         vi.setSystemTime(Date.now() + 10);
         throw new Error('load failed: /secret/path');
       }),
@@ -606,6 +614,126 @@ describe('runtime sampler', () => {
       expect.objectContaining({ model: 'tts', modelType: 'qwen3_tts', capability: 'audio', ms: 10, ok: false }),
     ]);
     expect(JSON.stringify(records)).not.toContain('secret');
+    expect(loads[0]).not.toHaveProperty('warmupMs');
+  });
+
+  it('two overlapping loads keep their own model and counts in the live file', async () => {
+    const progress = new Map<string, LoadProgress | null>([
+      ['/m/big', { phase: 'kernels', steps: 50, stepsDone: 3 }],
+      ['/m/small', { phase: 'weights', steps: 0, stepsDone: 0 }],
+    ]);
+    start([], { loadProgress: (path) => progress.get(path) ?? null });
+    await landed();
+    const gates: Array<() => void> = [];
+    const loadOf = (model: string, path: string) =>
+      sampler!.timedLoad(
+        { model, modelType: 'qwen3_5_moe', capability: 'chat', path },
+        () => new Promise<string>((resolve) => gates.push(() => resolve(model))),
+      );
+    const big = loadOf('Ornith-35B', '/m/big');
+    await vi.advanceTimersByTimeAsync(10);
+    const small = loadOf('Qwen3.5-4B', '/m/small');
+    const other = loadOf('Gemma-4', '/m/other');
+    await vi.advanceTimersByTimeAsync(1_000);
+    await landed();
+    expect(readLive().loading).toEqual([
+      { model: 'Ornith-35B', startedAt: T0, phase: 'kernels', stepsDone: 3, steps: 50 },
+      { model: 'Qwen3.5-4B', startedAt: T0 + 10, phase: 'weights', stepsDone: 0, steps: 0 },
+      { model: 'Gemma-4', startedAt: T0 + 10, phase: 'weights', stepsDone: null, steps: null },
+    ]);
+
+    progress.set('/m/big', { phase: 'kernels', steps: 50, stepsDone: 4 });
+    gates[1]!();
+    await small;
+    await vi.advanceTimersByTimeAsync(1_000);
+    await landed();
+    expect(readLive().loading).toEqual([
+      { model: 'Ornith-35B', startedAt: T0, phase: 'kernels', stepsDone: 4, steps: 50 },
+      { model: 'Gemma-4', startedAt: T0 + 10, phase: 'weights', stepsDone: null, steps: null },
+    ]);
+    gates[0]!();
+    gates[2]!();
+    await Promise.all([big, other]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await landed();
+    expect(readLive().loading).toEqual([]);
+  });
+
+  it('a load record carries the warm-up report, and none without one', async () => {
+    const records = start([]);
+    const report: WarmupReport = {
+      ms: 3_400,
+      steps: 50,
+      skipped: 1,
+      reset: 0,
+      pipelines: 212,
+      compileMs: 2_900.5,
+      peakBytes: 4_096,
+    };
+    await sampler!.timedLoad(
+      { model: 'warm', modelType: 'qwen3_5_moe', capability: 'chat', path: '/m/warm', warmupOf: () => report },
+      async () => ({ warmup: report }),
+    );
+    await sampler!.timedLoad(
+      { model: 'flat', modelType: 'qwen3_5', capability: 'chat', path: '/m/flat', warmupOf: () => null },
+      async () => ({}),
+    );
+    const loads = records.filter((r): r is RuntimeLoadRecord => r.k === 'load');
+    expect(loads[0]).toMatchObject({
+      model: 'warm',
+      ok: true,
+      warmupMs: 3_400,
+      warmupSteps: 50,
+      warmupSkipped: 1,
+      warmupReset: 0,
+      warmupPipelines: 212,
+      warmupCompileMs: 2_900.5,
+      warmupPeakBytes: 4_096,
+    });
+    expect(Object.keys(loads[1]!).filter((key) => key.startsWith('warmup'))).toEqual([]);
+  });
+
+  it('a sample carries the serving pipeline count only while the counter is alive', async () => {
+    let stats: PipelineStats | null = null;
+    const records = start([], { pipelineStats: () => stats });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(samples(records)[0]).not.toHaveProperty('pipelinesCreatedWhileServing');
+    stats = { createdLoading: 200, createdServing: 7, loadingMs: 70_000, servingMs: 900 };
+    await vi.advanceTimersByTimeAsync(SAMPLE_IDLE_MS);
+    expect(samples(records).at(-1)!.pipelinesCreatedWhileServing).toBe(7);
+  });
+
+  it('a live turn carries the phase and the three timers, rounded', async () => {
+    const binding = fakeBinding();
+    binding.state.live = 1;
+    binding.state.turns = [
+      {
+        traceId: 't-prep',
+        model: 'm',
+        modelId: 'Qwen3.6-27B',
+        ctxWindow: 65536,
+        startedAt: T0,
+        stream: true,
+        dispatch: 'continue',
+        progress: { phase: 'prepare', waitMs: 75_070.4, slotMs: 0, prepareMs: 300.6, cachedTokens: 19_000 },
+      },
+      {
+        traceId: 't-slot',
+        model: 'm',
+        modelId: 'Qwen3.6-27B',
+        ctxWindow: 65536,
+        startedAt: T0 + 1,
+        stream: true,
+        dispatch: 'start',
+        progress: { phase: 'slot', waitMs: 2, slotMs: 1_500 },
+      },
+    ];
+    start([binding.entry]);
+    await landed();
+    expect(readLive().turns.map((t) => [t.phase, t.waitMs, t.slotMs, t.prepareMs, t.cachedTokens])).toEqual([
+      ['prepare', 75_070, 0, 301, 19_000],
+      ['slot', 2, 1_500, null, null],
+    ]);
   });
 
   it('sweeps live files of dead pids, and files older than the hard limit, at start', async () => {

@@ -167,7 +167,7 @@ function process(overrides: Partial<RuntimeProcessLive> = {}): RuntimeProcessLiv
     health: 'ok',
     mem: { active: 1, peak: 1, cache: 0, wiredLimit: 1, rss: 1 },
     decodeTps: null,
-    loading: null,
+    loading: [],
     counters: { ok: 0, error: 0, cancelled: 0, outputTokens: 0, loads: 1, rejected: 0 },
     models: [model('qwen3.5-9b', 1), model('gemma-4-e4b', 0)],
     turns: [],

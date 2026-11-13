@@ -4,7 +4,7 @@
  */
 
 import { CHAT, fill } from './chat-strings';
-import type { ChatFailure, ChatMode, TurnOutcome } from './chat-types';
+import type { ChatFailure, ChatHostState, ChatMode, TurnOutcome } from './chat-types';
 import { formatCountNoun, formatDuration, formatNumber, formatTps } from './format';
 import type { TranscriptEntry, TurnMetric } from './types';
 import { oneLine, parseWebCall } from './web-tools';
@@ -252,13 +252,21 @@ export function conversationMarkdown(entries: readonly TranscriptEntry[]): strin
   return parts.join('\n\n');
 }
 
+/** One load of `ChatHostState.loading`. */
+export type EngineLoad = ChatHostState['loading'][number];
+
+/** The load a conversation on `model` shows: that model's own load, else the oldest one. */
+export function loadFor(loading: readonly EngineLoad[], model: string | null): EngineLoad | null {
+  return loading.find((load) => load.modelId === model) ?? loading[0] ?? null;
+}
+
 export interface PendingInput {
   creating: boolean;
   phase: 'starting' | 'running' | 'cancelling' | null;
   wait: 'model' | null;
   /** The conversation's model. */
   model: string | null;
-  /** The model the engine loads now (`ChatHostState.loading`). */
+  /** The load this conversation shows ({@link loadFor}). */
   loading: { modelId: string; startedAt: number } | null;
   inference: 'ready' | 'starting' | 'loading' | 'stopped' | null;
   /** No stream event for 3 s while running. */

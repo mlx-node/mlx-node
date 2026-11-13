@@ -82,6 +82,61 @@ describe('TurnDrawer', () => {
     expect(text).not.toContain('Stopped');
   });
 
+  it('shows the three native waits and the GPU kernels a turn created', async () => {
+    await mountDrawer('/?turn=t3', [
+      turnRow('t3', {
+        waitMs: 75_070,
+        slotMs: 300,
+        prepareMs: 1_200,
+        ttftMs: 2_600,
+        durationMs: 79_700,
+        pipelinesCreated: 212,
+        pipelineCreateMs: 74_900,
+      }),
+    ]);
+    const text = drawerText();
+    expect(text).toContain('Model busy');
+    expect(text).toContain('Waiting for a slot');
+    expect(text).toContain('Preparing');
+    expect(text).toContain('GPU kernels created');
+    expect(text).toContain('212 (');
+  });
+
+  it('a record without the waits or a kernel count shows neither', async () => {
+    await mountDrawer('/?turn=t4', [turnRow('t4', { pipelinesCreated: 0, pipelineCreateMs: 0 })]);
+    const text = drawerText();
+    expect(text).not.toContain('Model busy');
+    expect(text).not.toContain('Waiting for a slot');
+    expect(text).not.toContain('GPU kernels created');
+  });
+
+  it('a turn that spent no time waiting shows no wait rows, and its setup holds only the wait behind others', async () => {
+    await mountDrawer('/?turn=t6', [
+      turnRow('t6', {
+        waitMs: 0,
+        slotMs: 0,
+        prepareMs: 1_200,
+        ttftMs: 2_300,
+        setupMs: 600,
+        prefillMs: 500,
+        prefillTokens: 1_000,
+      }),
+    ]);
+    const text = drawerText();
+    expect(text).not.toContain('Model busy');
+    expect(text).not.toContain('Waiting for a slot');
+    expect(text).toContain('Preparing');
+    expect(text).toContain('other requests on this model, first decode step');
+    expect(text).not.toContain('prefix lookup');
+  });
+
+  it('a turn cancelled while preparing says so', async () => {
+    await mountDrawer('/?turn=t5', [
+      turnRow('t5', { outcome: 'cancelled', failPhase: 'prepare', prepareMs: 800, ttftMs: null, prefillMs: null }),
+    ]);
+    expect(drawerText()).toContain('Stopped while preparing.');
+  });
+
   it('says where a failed turn stopped and that its error text is not kept', async () => {
     await mountDrawer('/?turn=t2', [turnRow('t2', { outcome: 'error', errorKind: 'exception', failPhase: 'prefill' })]);
     const text = drawerText();

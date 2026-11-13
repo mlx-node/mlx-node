@@ -27,7 +27,7 @@ type ParsedTrace = Record<string, unknown>;
 
 const OUTCOMES = ['ok', 'error', 'cancelled'];
 const ERROR_KINDS = ['finish_error', 'exception'];
-const FAIL_PHASES = ['queued', 'prefill', 'decode'];
+const FAIL_PHASES = ['queued', 'slot', 'prepare', 'prefill', 'decode'];
 const ENDPOINTS = ['messages', 'responses', 'other'];
 const DISPATCHES = ['start', 'continue', 'continue_tool'];
 const MTP_ACCEPT_BY_POS_MAX = 16;
@@ -114,6 +114,9 @@ function traceRow(trace: ParsedTrace, sourceFile: string): typeof traces.$inferI
     loadWaitMs: numOrNull(trace.loadWaitMs),
     resolveMs: numOrNull(trace.resolveMs),
     preDispatchMs: numOrNull(trace.preDispatchMs),
+    waitMs: numOrNull(trace.waitMs),
+    slotMs: numOrNull(trace.slotMs),
+    prepareMs: numOrNull(trace.prepareMs),
     finishReason: strOrNull(trace.finishReason),
     promptTokens: numOrNull(trace.promptTokens),
     cachedTokens: numOrNull(trace.cachedTokens),
@@ -128,6 +131,8 @@ function traceRow(trace: ParsedTrace, sourceFile: string): typeof traces.$inferI
     concurrencyPeak: numOrNull(trace.concurrencyPeak),
     memActiveBytes: numOrNull(trace.memActiveBytes),
     memPeakBytes: numOrNull(trace.memPeakBytes),
+    pipelinesCreated: numOrNull(trace.pipelinesCreated),
+    pipelineCreateMs: numOrNull(trace.pipelineCreateMs),
     coldHits: numOrNull(trace.coldHits),
     coldMisses: numOrNull(trace.coldMisses),
     coldBytesWritten: numOrNull(trace.coldBytesWritten),

@@ -925,7 +925,7 @@ export class ChatService {
     if (endpoint === null) throw chatRouteError('inference-stopped');
     const loading = await this.engineLoading(endpoint.pid);
     const turns = this.hosts.chat.modeState().turnsInFlight + this.hosts.work.modeState().turnsInFlight;
-    if (loading !== null || turns > 0) throw chatRouteError('engine-busy');
+    if (loading.length > 0 || turns > 0) throw chatRouteError('engine-busy');
     const answer = await unloadModels(endpoint, { maxMs: this.opts.unloadMaxMs ?? UNLOAD_MAX_MS });
     if (answer === 'busy') throw chatRouteError('engine-busy');
     if (typeof answer === 'string') throw chatRouteError('inference-failed');
@@ -1382,10 +1382,10 @@ export class ChatService {
     }
   }
 
-  /** The load the app's engine runs now, from its heartbeat. */
+  /** The loads the app's engine runs now, from its heartbeat. */
   private async engineLoading(pid: number): Promise<RuntimeLive['processes'][number]['loading']> {
     const live = await this.readLive();
-    return live?.processes.find((p) => p.status === 'running' && p.pid === pid && p.loading !== null)?.loading ?? null;
+    return live?.processes.find((p) => p.status === 'running' && p.pid === pid)?.loading ?? [];
   }
 
   private async computeState(): Promise<ChatHostState> {
@@ -1393,11 +1393,11 @@ export class ChatService {
     const live = await this.readLive();
     // Only the endpoint file's engine: the app never selects on a terminal `mlx serve` or `mlx launch` engine.
     const running = live?.processes.filter((p) => p.status === 'running' && p.pid === endpoint?.pid) ?? [];
-    const loading = running.find((p) => p.loading !== null)?.loading ?? null;
+    const loading = running.flatMap((p) => p.loading).sort((a, b) => a.startedAt - b.startedAt);
     const supervisor = live?.supervisor?.state;
     const inference: ChatHostState['inference'] =
       endpoint !== null
-        ? loading !== null
+        ? loading.length > 0
           ? 'loading'
           : 'ready'
         : supervisor === 'starting' || supervisor === 'restarting'
@@ -1453,7 +1453,13 @@ export class ChatService {
     }
     return {
       inference,
-      loading: loading === null ? null : { modelId: loading.model, startedAt: loading.startedAt },
+      loading: loading.map((load) => ({
+        modelId: load.model,
+        startedAt: load.startedAt,
+        phase: load.phase,
+        stepsDone: load.stepsDone,
+        steps: load.steps,
+      })),
       resident,
       answers,
       models,

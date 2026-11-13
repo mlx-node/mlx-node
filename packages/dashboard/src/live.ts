@@ -30,7 +30,9 @@ export type EngineStatus =
 export type ProcessStatus = 'running' | 'unresponsive' | 'dead';
 export type RuntimeHealth = 'ok' | 'loading' | 'degraded' | 'error';
 export type SupervisorState = 'stopped' | 'starting' | 'running' | 'restarting' | 'failed' | 'lying';
-export type LiveTurnPhase = 'queued' | 'prefill' | 'decode';
+/** `queued`: the model thread works on other requests. `slot`: the scheduler cannot start it yet. `prepare`: its prompt and cache are prepared before the prefill. */
+export type LiveTurnPhase = 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode';
+export type LiveLoadPhase = 'weights' | 'kernels';
 export type LiveDispatch = 'start' | 'continue' | 'continue_tool';
 
 export interface RuntimeLiveModel {
@@ -63,11 +65,26 @@ export interface RuntimeLiveTurn {
   stream: boolean;
   dispatch: LiveDispatch;
   phase: LiveTurnPhase | null;
+  /** Creation → pickup by the model thread. */
+  waitMs: number | null;
+  /** Time the scheduler could not start the turn. */
+  slotMs: number | null;
+  /** Time spent preparing the prompt before its prefill. */
+  prepareMs: number | null;
   promptTokens: number | null;
   cachedTokens: number | null;
   prefillTotal: number | null;
   prefillDone: number | null;
   generatedTokens: number | null;
+}
+
+/** One model load in flight; the step counts are null when native reports no progress for it. */
+export interface RuntimeLiveLoad {
+  model: string;
+  startedAt: number;
+  phase: LiveLoadPhase;
+  stepsDone: number | null;
+  steps: number | null;
 }
 
 /** The validated content of one `live-<pid>.json`. */
@@ -86,7 +103,8 @@ export interface RuntimeLiveFile {
   health: RuntimeHealth;
   mem: { active: number; peak: number; cache: number; wiredLimit: number; rss: number };
   decodeTps: number | null;
-  loading: { model: string; startedAt: number } | null;
+  /** Loads in flight, oldest first; empty when idle. */
+  loading: RuntimeLiveLoad[];
   counters: { ok: number; error: number; cancelled: number; outputTokens: number; loads: number; rejected: number };
   models: RuntimeLiveModel[];
   turns: RuntimeLiveTurn[];
@@ -140,6 +158,7 @@ export const LIVE_POLL_MS = 1000;
 export const INGEST_COALESCE_MS = 2000;
 const LIVE_TURNS_MAX = 32;
 const LIVE_MODELS_MAX = 64;
+const LIVE_LOADS_MAX = 16;
 
 // ---------------------------------------------------------------- parsing
 
@@ -172,7 +191,8 @@ function oneOf<T extends string>(value: unknown, allowed: readonly T[]): T | nul
 const HOSTS: readonly HostKind[] = ['serve', 'launch', 'desktop', 'embedded'];
 const HEALTH: readonly RuntimeHealth[] = ['ok', 'loading', 'degraded', 'error'];
 const STATES: readonly SupervisorState[] = ['stopped', 'starting', 'running', 'restarting', 'failed', 'lying'];
-const PHASES: readonly LiveTurnPhase[] = ['queued', 'prefill', 'decode'];
+const PHASES: readonly LiveTurnPhase[] = ['queued', 'slot', 'prepare', 'prefill', 'decode'];
+const LOAD_PHASES: readonly LiveLoadPhase[] = ['weights', 'kernels'];
 const DISPATCHES: readonly LiveDispatch[] = ['start', 'continue', 'continue_tool'];
 
 /** pid of a `live-<pid>.json` file name, or null. */
@@ -251,9 +271,13 @@ function parseTurn(value: unknown): RuntimeLiveTurn | null {
     value.prefillTotal,
     value.prefillDone,
     value.generatedTokens,
+    value.waitMs,
+    value.slotMs,
+    value.prepareMs,
   ].map(finOrNull);
   if (counts.some((c) => c === undefined)) return null;
-  const [promptTokens, cachedTokens, prefillTotal, prefillDone, generatedTokens] = counts as Array<number | null>;
+  const [promptTokens, cachedTokens, prefillTotal, prefillDone, generatedTokens, waitMs, slotMs, prepareMs] =
+    counts as Array<number | null>;
   return {
     traceId: value.traceId,
     model: value.model,
@@ -263,6 +287,9 @@ function parseTurn(value: unknown): RuntimeLiveTurn | null {
     stream: value.stream,
     dispatch,
     phase,
+    waitMs,
+    slotMs,
+    prepareMs,
     promptTokens,
     cachedTokens,
     prefillTotal,
@@ -271,9 +298,19 @@ function parseTurn(value: unknown): RuntimeLiveTurn | null {
   };
 }
 
+function parseLoad(value: unknown): RuntimeLiveLoad | null {
+  if (!isObj(value) || typeof value.model !== 'string') return null;
+  const startedAt = fin(value.startedAt);
+  const phase = oneOf(value.phase, LOAD_PHASES);
+  const stepsDone = finOrNull(value.stepsDone);
+  const steps = finOrNull(value.steps);
+  if (startedAt === null || phase === null || stepsDone === undefined || steps === undefined) return null;
+  return { model: value.model, startedAt, phase, stepsDone, steps };
+}
+
 /** Field-by-field validation of a heartbeat; null for anything malformed. */
 export function parseLiveFile(value: unknown): RuntimeLiveFile | null {
-  if (!isObj(value) || value.v !== 1) return null;
+  if (!isObj(value) || value.v !== 2) return null;
   const pid = fin(value.pid);
   const startedAt = fin(value.startedAt);
   const ts = fin(value.ts);
@@ -300,14 +337,14 @@ export function parseLiveFile(value: unknown): RuntimeLiveFile | null {
     if (n === null) return null;
     counters[key] = n;
   }
-  let loading: RuntimeLiveFile['loading'] = null;
-  if (value.loading !== null) {
-    if (!isObj(value.loading) || typeof value.loading.model !== 'string') return null;
-    const since = fin(value.loading.startedAt);
-    if (since === null) return null;
-    loading = { model: value.loading.model, startedAt: since };
+  if (!Array.isArray(value.loading) || !Array.isArray(value.models) || !Array.isArray(value.turns)) return null;
+  const loading: RuntimeLiveLoad[] = [];
+  for (const raw of value.loading.slice(0, LIVE_LOADS_MAX)) {
+    const load = parseLoad(raw);
+    if (load === null) return null;
+    loading.push(load);
   }
-  if (!Array.isArray(value.models) || !Array.isArray(value.turns)) return null;
+  loading.sort((a, b) => a.startedAt - b.startedAt);
   const models: RuntimeLiveModel[] = [];
   for (const raw of value.models.slice(0, LIVE_MODELS_MAX)) {
     const model = parseModel(raw);

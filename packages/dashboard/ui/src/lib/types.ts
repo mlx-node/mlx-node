@@ -615,6 +615,12 @@ export interface MetricsTotals {
   queueWallMs: number;
   loadWaitWallMs: number;
   resolveWallMs: number;
+  /** The model was busy with other requests, before the time to first token. */
+  waitWallMs: number;
+  /** No lane or memory to start, inside the time to first token. */
+  slotWallMs: number;
+  /** Prompt preparation (render, prefix match, cache restore), inside the time to first token. */
+  prepareWallMs: number;
   /** Time to first token of turns without a prefill window: setup and prefill together. */
   firstTokenWallMs: number;
   /** Time to first token outside the prefill window, measured turns only. */
@@ -622,7 +628,7 @@ export interface MetricsTotals {
   /** Sum of measured prefill windows, each capped at its time to first token. */
   prefillWallMs: number;
   decodeWallMs: number;
-  /** total − queue − loadWait − resolve − firstToken − setup − prefill − decode, clamped at 0. */
+  /** total − every phase above, clamped at 0. */
   otherWallMs: number;
   totalWallMs: number;
 }
@@ -661,7 +667,7 @@ export interface MetricsSummary {
   failures: Array<{
     outcome: 'error' | 'cancelled';
     errorKind: 'finish_error' | 'exception' | null;
-    failPhase: 'queued' | 'prefill' | 'decode' | null;
+    failPhase: 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode' | null;
     turns: number;
   }>;
   endpoints: Array<{ endpoint: string; stream: boolean; turns: number }>;
@@ -770,6 +776,12 @@ export interface TurnRow {
   queueMs: number | null;
   loadWaitMs: number | null;
   resolveMs: number | null;
+  /** The model was busy with other requests (native creation → pickup); null from a record that predates it. */
+  waitMs: number | null;
+  /** No lane or memory to start the turn. */
+  slotMs: number | null;
+  /** Prompt preparation before the prefill. */
+  prepareMs: number | null;
   ttftMs: number | null;
   /** Measured prefill window; null when the turn has none. */
   prefillMs: number | null;
@@ -791,6 +803,9 @@ export interface TurnRow {
   concurrency: number | null;
   concurrencyPeak: number | null;
   memActiveBytes: number | null;
+  /** GPU pipelines created while the turn ran; null while the counter is off. */
+  pipelinesCreated: number | null;
+  pipelineCreateMs: number | null;
   pid: number | null;
 }
 
@@ -835,7 +850,14 @@ export interface RuntimeProcessLive {
   health: 'ok' | 'loading' | 'degraded' | 'error';
   mem: { active: number; peak: number; cache: number; wiredLimit: number; rss: number };
   decodeTps: number | null;
-  loading: { model: string; startedAt: number } | null;
+  /** Loads in flight, oldest first; empty when idle. The step counts are null when native reports none. */
+  loading: Array<{
+    model: string;
+    startedAt: number;
+    phase: 'weights' | 'kernels';
+    stepsDone: number | null;
+    steps: number | null;
+  }>;
   counters: { ok: number; error: number; cancelled: number; outputTokens: number; loads: number; rejected: number };
   models: Array<{
     name: string;
@@ -865,7 +887,11 @@ export interface RuntimeProcessLive {
     startedAt: number;
     stream: boolean;
     dispatch: 'start' | 'continue' | 'continue_tool';
-    phase: 'queued' | 'prefill' | 'decode' | null;
+    /** `queued`: the model is busy with other requests. `slot`: no lane or memory yet. `prepare`: before its prefill. */
+    phase: 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode' | null;
+    waitMs: number | null;
+    slotMs: number | null;
+    prepareMs: number | null;
     promptTokens: number | null;
     cachedTokens: number | null;
     prefillTotal: number | null;
