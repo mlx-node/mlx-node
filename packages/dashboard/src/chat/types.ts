@@ -326,6 +326,8 @@ export interface ChatHostState {
   active: Array<{ conversationId: string; mode: ChatMode; busy: boolean; waiting: boolean }>;
   /** The Work conversations not in Ask, with their mode (the list has no other source). */
   permissionRaised: Array<{ id: string; mode: 'auto' | 'bypass' }>;
+  /** The mode picked on the New Work screen for the draft `draft`, before its conversation exists. */
+  permissionDraft: { draft: string; mode: 'auto' | 'bypass' } | null;
   /** The temp root Auto covers, as people type it (`/tmp`); null when Auto covers the Work folder only. */
   tempRoot: string | null;
   /** The real top of that temp root: a Work folder that holds or equals it gets no temp root. */

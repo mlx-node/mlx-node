@@ -116,6 +116,7 @@ export const READY_CHAT_HOST: ChatHostState = {
   providers: { search: null, searchCheck: null, firecrawl: false, fetch: null, applyPending: false },
   active: [],
   permissionRaised: [],
+  permissionDraft: null,
   tempRoot: null,
   tempTop: null,
 };

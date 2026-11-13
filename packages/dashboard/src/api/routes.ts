@@ -21,12 +21,14 @@ import {
   handleChatConversations,
   handleChatCreate,
   handleChatDelete,
+  handleChatDraftPermissionMode,
   handleChatEngineUnload,
   handleChatInteraction,
   handleChatPatch,
   handleChatPermissionMode,
   handleChatPrompt,
   handleChatState,
+  handleChatWorkHooks,
 } from './handlers/chat.js';
 import { handleCodingAgents, handleCodingAgentAction } from './handlers/coding-agents.js';
 import {
@@ -171,6 +173,8 @@ export const ROUTES: Route[] = [
   mainRoute('POST', '/api/chat/conversations/:id/cancel', handleChatCancel),
   mainRoute('POST', '/api/chat/conversations/:id/interactions/:iid', handleChatInteraction),
   mainRoute('POST', '/api/chat/conversations/:id/permission-mode', handleChatPermissionMode),
+  mainRoute('POST', '/api/chat/drafts/:draft/permission-mode', handleChatDraftPermissionMode),
+  mainRoute('GET', '/api/chat/work/hooks', handleChatWorkHooks),
   mainRoute('PATCH', '/api/chat/conversations/:id', handleChatPatch),
   mainRoute('DELETE', '/api/chat/conversations/:id', handleChatDelete),
   mainRoute('POST', '/api/chat/agent', handleChatAgent),

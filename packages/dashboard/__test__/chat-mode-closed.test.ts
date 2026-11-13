@@ -296,6 +296,43 @@ describe('nothing else moves the mode up', () => {
     host.off();
   }, 60_000);
 
+  it('(a) a create names a draft, never a mode: an id the Control Panel never saw gives Ask; Chat takes none', async () => {
+    scenario([LS]);
+    boot();
+    const host = watchHost();
+    const folder = project();
+    const picked = await call('POST', '/api/chat/drafts/d-seen/permission-mode', {
+      mode: 'bypass',
+      up: true,
+      cwd: folder,
+    });
+    expect(picked.ok && picked.body).toEqual({ mode: 'bypass' });
+    expect((await state()).permissionDraft).toEqual({ draft: 'd-seen', mode: 'bypass' });
+    const made = await call('POST', '/api/chat/conversations', {
+      mode: 'work',
+      text: 'ls',
+      cwd: folder,
+      draft: 'd-new',
+    });
+    if (!made.ok) throw new Error(made.message);
+    const id = (made.body as { conversation: ConversationInfo }).conversation.id;
+    expect((made.body as { conversation: ConversationInfo }).conversation.permissionMode).toBe('ask');
+    const w = watch(id);
+    await until(() => cards(w).length === 1, 5_000);
+    expect([(cards(w)[0] as PermissionInteraction).autoAsk, modeOf(w)]).toEqual([undefined, 'ask']);
+    await call('POST', `/api/chat/conversations/${id}/interactions/${cards(w)[0]!.id}`, { optionId: 'reject-once' });
+    await until(() => ends(w) === 1, 5_000);
+    for (const body of [
+      { mode: 'chat', text: 'hi', draft: 'd-seen' },
+      { mode: 'work', text: 'ls', cwd: folder, draft: 'bad id' },
+      { mode: 'work', text: 'ls', cwd: folder, draft: 7 },
+    ]) {
+      expect([body, code(await call('POST', '/api/chat/conversations', body))]).toEqual([body, 'E_BAD_REQUEST']);
+    }
+    w.off();
+    host.off();
+  }, 30_000);
+
   it('(b) prompt text: slash words are refused, and words about the mode are only text', async () => {
     scenario([LS]);
     boot();
@@ -455,6 +492,51 @@ describe('the source', () => {
     walk(SRC);
     expect(callers).toEqual(['api/handlers/chat.ts']);
     expect(setters).toEqual(['chat/service.ts async raise', 'chat/service.ts lower']);
+  });
+
+  it('(f) the draft mode: one route caller, one claim in create, and raise only from the two moves up', () => {
+    /** The function or class member a line belongs to: the nearest line above that opens one. */
+    const owner = (lines: string[], from: number): string => {
+      for (let i = from; i >= 0; i -= 1) {
+        const line = lines[i]!;
+        const top = line.startsWith('export function ') || line.startsWith('function ');
+        const words = line.slice(0, line.indexOf('(')).trim().split(' ');
+        const statement = ['return', 'const', 'let', 'if', 'for', 'await', 'throw', 'void'].includes(words[0]!);
+        const member = line.startsWith('  ') && isLetter(line[2] ?? '') && line.includes('(') && !statement;
+        if (!top && !member) continue;
+        return words[words.length - 1]!;
+      }
+      return '';
+    };
+    const uses = (needle: string): string[] => {
+      const out: string[] = [];
+      const walk = (dir: string): void => {
+        for (const name of readdirSync(dir)) {
+          const path = join(dir, name);
+          if (statSync(path).isDirectory()) walk(path);
+          else if (name.endsWith('.ts')) {
+            const lines = readFileSync(path, 'utf8').split('\n');
+            lines.forEach((line, index) => {
+              const at = line.indexOf(needle);
+              if (at === -1) return;
+              const own = owner(lines, index);
+              // The declaration itself is not a call.
+              if (owner([line], 0) === needle.slice(needle.lastIndexOf('.') + 1, -1)) return;
+              out.push(`${relative(SRC, path)} ${own}`);
+            });
+          }
+        }
+      };
+      walk(SRC);
+      return out;
+    };
+    expect(uses('.setDraftPermissionMode(')).toEqual(['api/handlers/chat.ts handleChatDraftPermissionMode']);
+    expect(uses('.claim(')).toEqual(['chat/service.ts create']);
+    expect(uses('this.raise(').filter((use) => use.startsWith('chat/service.ts'))).toEqual([
+      'chat/service.ts applyDraft',
+      'chat/service.ts setPermissionMode',
+    ]);
+    expect(uses('this.applyDraft(')).toEqual(['chat/service.ts create']);
   });
 });
 

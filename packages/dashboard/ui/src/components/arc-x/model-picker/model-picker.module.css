@@ -248,11 +248,20 @@
   color: var(--warning);
 }
 
-/* Work at 720 px: the longest base and quantization beside the folder, web and mode chips push Send off its place. */
-@container composer (max-width: 639px) {
-  .trigger[data-crowded] .variant {
-    display: none;
-  }
+/* Work: a badge with no room beside the name wraps to a clipped second line, so it goes before the name shortens. */
+.trigger[data-crowded] .name {
+  align-self: stretch;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  row-gap: var(--space-2);
+  overflow: clip;
+}
+
+.trigger[data-crowded] .name::before {
+  width: 0;
+  height: var(--control-height-sm);
+  margin-inline-end: calc(var(--space-1-5) * -1);
+  content: '';
 }
 
 @keyframes picker-swap {

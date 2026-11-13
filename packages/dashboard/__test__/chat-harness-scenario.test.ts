@@ -1,7 +1,11 @@
+import { mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'vite-plus/test';
 
 import type { Interaction } from '../src/chat/types.js';
-import { fakeHost, until, type FakeHost, type Json } from './helpers/chat-fake.js';
+import { applyConversationEvent, type ConversationState } from '../ui/src/lib/chat-store.js';
+import { fakeHost, fakeService, until, type FakeHost, type Json } from './helpers/chat-fake.js';
 
 const MODEL = 'qwen3.5-4b';
 
@@ -139,4 +143,42 @@ describe('chat-harness scenario', () => {
       await fake.close();
     }
   });
+
+  it('"everything" with Bypass picked on the New screen: four allowed marks and no card', async () => {
+    const fake = fakeService('chat-harness');
+    const window = fake.service.watchHost(() => {});
+    try {
+      const project = join(fake.root, 'home', 'code', 'app');
+      mkdirSync(project, { recursive: true });
+      await fake.service.setDraftPermissionMode('d1', 'bypass', true, project, null);
+      const { conversation } = await fake.service.create({
+        mode: 'work',
+        text: 'everything',
+        cwd: project,
+        draft: 'd1',
+      });
+      expect(conversation.permissionMode).toBe('bypass');
+      let state: ConversationState | null = null;
+      let cards = 0;
+      const off = fake.service.watchConversation(conversation.id, (event) => {
+        if (event.type === 'interaction') cards += 1;
+        const next = applyConversationEvent(state, event);
+        if (next !== 'resync') state = next;
+      });
+      const done = (): boolean => state !== null && state.turn === null && state.entries.length > 1;
+      await until(done, 10_000);
+      const marks = (state as ConversationState | null)?.permissionMarks ?? [];
+      expect(marks.filter((m) => m.kind === 'allowed').map((m) => m.kind === 'allowed' && m.mode)).toEqual([
+        'bypass',
+        'bypass',
+        'bypass',
+        'bypass',
+      ]);
+      expect([cards, (state as ConversationState | null)?.interactions.length]).toEqual([0, 0]);
+      off();
+    } finally {
+      window();
+      await fake.close();
+    }
+  }, 30_000);
 });

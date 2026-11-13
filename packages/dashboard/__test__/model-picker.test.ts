@@ -2,9 +2,6 @@
  * @vitest-environment happy-dom
  */
 
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-
 import { act, createElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
@@ -217,18 +214,21 @@ describe('ModelPicker: the pill', () => {
     expect(badge.textContent!.endsWith('-mlx)')).toBe(true);
   });
 
-  it('crowded (Work): the badge hides under a 640 px composer; elsewhere only under 520 px', () => {
+  it('crowded (Work): the badge is whole on the pill line or not drawn, never cut; elsewhere it hides only under 520 px', () => {
     const rules = cssRules('components/arc-x/model-picker/model-picker.module.css');
-    const crowded = rules.find((rule) => rule.selectors.includes('.trigger[data-crowded] .variant'));
-    expect(crowded?.conditional).toBe(true);
-    expect(crowded?.decls.get('display')).toBe('none');
-    const css = readFileSync(
-      join(import.meta.dirname, '../ui/src/components/arc-x/model-picker/model-picker.module.css'),
-      'utf8',
-    );
-    expect(css).toContain('@container composer (max-width: 639px)');
-    expect(trigger(mount(picker({ crowded: true }))).hasAttribute('data-crowded')).toBe(true);
-    expect(trigger(mount(picker())).hasAttribute('data-crowded')).toBe(false);
+    expect(rules.some((rule) => rule.selectors.includes('.trigger[data-crowded] .variant'))).toBe(false);
+    expect(
+      ['flex-wrap', 'overflow', 'align-self'].map((property) =>
+        cssValue(rules, '.trigger[data-crowded] .name', property),
+      ),
+    ).toEqual(['wrap', 'clip', 'stretch']);
+    expect(cssValue(rules, '.trigger[data-crowded] .name::before', 'height')).toBe('var(--control-height-sm)');
+    const crowded = trigger(mount(picker({ crowded: true })));
+    expect(crowded.hasAttribute('data-crowded')).toBe(true);
+    expect(crowded.querySelector('[data-chip-label]')?.hasAttribute('data-fit-whole')).toBe(true);
+    const chat = trigger(mount(picker()));
+    expect(chat.hasAttribute('data-crowded')).toBe(false);
+    expect(chat.querySelector('[data-chip-label]')?.hasAttribute('data-fit-whole')).toBe(false);
   });
 
   it('a model that is not served: the stored id, no badge, no state', () => {

@@ -36,6 +36,7 @@ import { ALLOW_ONCE_OPTION_ID, chatPrompt, REJECT_ONCE_OPTION_ID } from './agent
 import { tempRoots, type AllowedRoot } from './agent/roots.js';
 import { UNLOAD_MAX_MS, unloadModels } from './agent/select-model.js';
 import { Conversation, type ConversationSink } from './conversation.js';
+import { PermissionDraft } from './draft-mode.js';
 import { readWorkIndexSync, writeWorkIndex, type WorkIndex } from './index-file.js';
 import { removeChatPromptHistory, type ChatPaths } from './paths.js';
 import {
@@ -198,6 +199,8 @@ export class ChatService {
   private readonly permissionLog: PermissionLog;
   /** Moves up, and the record of every move, one at a time. */
   private permissionChain: Promise<unknown> = Promise.resolve();
+  /** The mode picked on the New Work screen, before its conversation exists. */
+  private readonly draft = new PermissionDraft();
   private readonly home: string;
   private readonly workHome: string;
 
@@ -373,9 +376,96 @@ export class ChatService {
     conversation.marksLoaded = true;
     conversation.seed([], [], null);
     this.conversations.set(conversation.info.id, conversation);
-    const { turnId } = this.startTurn(conversation, input.text);
+    const grant = mode === 'work' && cwd !== undefined ? this.draft.claim(input.draft, cwd, session.sessionId) : null;
+    if (input.draft !== undefined) this.scheduleState();
+    if (grant !== null) await this.applyDraft(conversation, grant);
+    let turnId: string;
+    try {
+      turnId = this.startTurn(conversation, input.text).turnId;
+    } catch (error) {
+      if (this.modeOf(session.sessionId) !== 'ask') this.lower(conversation, 'ask', 'user');
+      throw error;
+    }
     this.emitHost({ type: 'conversations-changed' });
     return { conversation: conversation.publicInfo(), turnId };
+  }
+
+  /**
+   * The mode picked on the New screen, for the conversation just made from it: the same move up as the conversation's
+   * own route, before its first turn. A failure leaves the conversation in Ask; a mode line it wrote is closed.
+   */
+  private async applyDraft(conversation: Conversation, grant: 'auto' | 'bypass'): Promise<void> {
+    const id = conversation.info.id;
+    const epoch = this.epochOf(id);
+    const temp = grant === 'auto' ? this.tempOf(conversation) : null;
+    const run = (): Promise<{ mode: PermissionMode }> => this.raise(id, grant, epoch, temp);
+    const next = this.permissionChain.then(run, run);
+    this.permissionChain = next.catch(() => {});
+    try {
+      await next;
+    } catch {
+      const open = this.conversations.get(id) === conversation;
+      if (open && this.modeOf(id) === 'ask' && (this.logged.get(id) ?? 'ask') !== 'ask') {
+        this.lower(conversation, 'ask', 'user');
+      }
+    }
+  }
+
+  /**
+   * The mode picked on the New Work screen, kept for `draft` and its folder until the first message makes the
+   * conversation (`create` applies it there). The same laws as a conversation's mode: only a confirm's `up` moves up,
+   * a move down is applied in this tick and calls back a move up that waits. Once the draft made its conversation, a
+   * move down goes to that conversation and a move up is refused.
+   */
+  async setDraftPermissionMode(
+    draft: string,
+    target: PermissionMode,
+    up: boolean,
+    cwd: string | null,
+    temp: string | null,
+  ): Promise<{ mode: PermissionMode }> {
+    this.assertOpen();
+    const spent = this.draft.spent(draft);
+    if (spent !== null) {
+      if (up) throw modeChanged();
+      this.permissionEpoch.set(spent, this.epochOf(spent) + 1);
+      const conversation = this.conversations.get(spent);
+      if (conversation !== undefined && MODE_RANK[target] < MODE_RANK[this.modeOf(spent)]) {
+        this.lower(conversation, target, 'user');
+      }
+      return { mode: this.modeOf(spent) };
+    }
+    this.draft.epoch += 1;
+    const epoch = this.draft.epoch;
+    const mode = this.draft.modeOf(draft);
+    if (MODE_RANK[target] < MODE_RANK[mode]) {
+      this.draft.lower(draft, target === 'auto' ? 'auto' : 'ask');
+      this.scheduleState();
+      return { mode: target };
+    }
+    if (target === mode) return { mode };
+    if (!up) throw modeChanged();
+    const folder = await checkWorkFolder(cwd ?? '', this.folderRules);
+    if (!folder.ok) throw cwdError(folder.problem);
+    this.assertOpen();
+    if (this.draft.epoch !== epoch) throw modeChanged();
+    if (target === 'auto') {
+      const covered = typedTop(tempRoots({ cwd: folder.path, home: this.home, temp: this.tempRoots })[0]);
+      if (covered !== null && temp !== covered) {
+        throw new ApiError('E_CONFLICT', 'The Auto text did not name the temp folder.', 'temp-unnamed');
+      }
+    }
+    this.draft.set(draft, target === 'auto' ? 'auto' : 'bypass', folder.path);
+    this.scheduleState();
+    return { mode: target };
+  }
+
+  /** Whether the user has tool hooks for a Work folder; a read error says yes. */
+  async workHooks(cwd: string): Promise<{ userHooks: boolean }> {
+    const folder = await checkWorkFolder(cwd, this.folderRules);
+    if (!folder.ok) throw cwdError(folder.problem);
+    const place: SettingsPlace = { home: this.home, agentHome: this.workHome, cwd: folder.path };
+    return { userHooks: await findUserHooks(place).catch(() => true) };
   }
 
   async prompt(id: string, text: string): Promise<{ turnId: string }> {
@@ -880,6 +970,7 @@ export class ChatService {
       });
       this.permissionModes.delete(id);
       this.permissionEpoch.delete(id);
+      this.draft.forget(id);
       this.logged.delete(id);
       this.settingsBase.delete(id);
       await this.permissionLog.remove(id).catch(() => {});
@@ -919,6 +1010,8 @@ export class ChatService {
     return () => {
       live = false;
       this.hostSinks.delete(sink);
+      // A pick on the New screen lives in a window: with no window left it goes.
+      if (this.hostSinks.size === 0) this.draft.clear();
       this.watchPage();
       this.updateLive();
     };
@@ -974,6 +1067,7 @@ export class ChatService {
     this.pageGoneTimer = null;
     this.liveOff?.();
     this.liveOff = null;
+    this.draft.clear();
     await Promise.all([this.hosts.chat.close(), this.hosts.work.close()]);
     for (const conversation of this.conversations.values()) conversation.flush();
     this.hostSinks.clear();
@@ -1369,6 +1463,7 @@ export class ChatService {
       providers: this.providers.summary(),
       active,
       permissionRaised: [...this.permissionModes].map(([id, mode]) => ({ id, mode })),
+      permissionDraft: this.draft.shown(),
       tempRoot: typedTop(this.tempRoots[0]),
       tempTop: this.tempRoots[0]?.top ?? null,
     };

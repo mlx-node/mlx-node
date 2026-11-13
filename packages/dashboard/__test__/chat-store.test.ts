@@ -283,6 +283,21 @@ describe('permission modes in the stores', () => {
     await until(() => store.getSnapshot().state?.permissionRaised.length === 0);
     off();
   });
+
+  it('the mode picked on the New Work screen follows each state event', async () => {
+    const api = stub();
+    const store = createChatHostStore();
+    const off = store.subscribe(() => {});
+    await until(() => store.getSnapshot().state !== null);
+    expect(store.getSnapshot().state?.permissionDraft).toBeNull();
+    const draft = { draft: 'd1', mode: 'bypass' as const };
+    api.emitChatHost({ type: 'state', state: { ...READY_CHAT_HOST, permissionDraft: draft } });
+    await until(() => store.getSnapshot().state?.permissionDraft !== null);
+    expect(store.getSnapshot().state?.permissionDraft).toEqual(draft);
+    api.emitChatHost({ type: 'state', state: READY_CHAT_HOST });
+    await until(() => store.getSnapshot().state?.permissionDraft === null);
+    off();
+  });
 });
 
 describe('Chat route failures', () => {

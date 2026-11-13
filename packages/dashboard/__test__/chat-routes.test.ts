@@ -157,12 +157,60 @@ describe('Chat routes — threads', () => {
       'main POST /api/chat/conversations/:id/cancel',
       'main POST /api/chat/conversations/:id/interactions/:iid',
       'main POST /api/chat/conversations/:id/permission-mode',
+      'main POST /api/chat/drafts/:draft/permission-mode',
+      'main GET /api/chat/work/hooks',
       'main PATCH /api/chat/conversations/:id',
       'main DELETE /api/chat/conversations/:id',
       'main POST /api/chat/agent',
       'main POST /api/chat/engine/unload',
     ]);
     expect(routeThreadFor('POST', '/api/chat/conversations/abc/prompt')).toBe('main');
+  });
+});
+
+describe('Chat routes — the New Work screen', () => {
+  it('the draft mode route takes exactly {mode, up, cwd?, temp?}; a move up names its folder, a move down none', async () => {
+    start('chat-basic');
+    const folder = join(base, 'home', 'code', 'app');
+    mkdirSync(folder, { recursive: true });
+    const path = '/api/chat/drafts/d1/permission-mode';
+    for (const body of [
+      {},
+      { mode: 'bypass', up: true },
+      { mode: 'bypass', up: true, cwd: '' },
+      { mode: 'bypass', up: true, cwd: 'x'.repeat(4_097) },
+      { mode: 'ask', up: false, cwd: folder },
+      { mode: 'ask', up: false, temp: '/tmp' },
+      { mode: 'bypass', up: true, cwd: folder, draft: 'd2' },
+      { mode: 'Bypass', up: true, cwd: folder },
+      { mode: 'bypass', up: 'true', cwd: folder },
+      { mode: 'bypass', cwd: folder },
+      null,
+    ]) {
+      expect([body, failureOf(await call('POST', path, body)).code]).toEqual([body, 'E_BAD_REQUEST']);
+    }
+    expect(
+      failureOf(await call('POST', '/api/chat/drafts/bad%20id/permission-mode', { mode: 'ask', up: false })).code,
+    ).toBe('E_NOT_FOUND');
+    const home = await call('POST', path, { mode: 'bypass', up: true, cwd: join(base, 'home') });
+    expect([failureOf(home).code, failureOf(home).reason]).toEqual(['E_BAD_REQUEST', 'cwd-invalid']);
+    const up = await call('POST', path, { mode: 'bypass', up: true, cwd: folder });
+    expect(up.ok && up.body).toEqual({ mode: 'bypass' });
+    const down = await call('POST', path, { mode: 'ask', up: false });
+    expect(down.ok && down.body).toEqual({ mode: 'ask' });
+  });
+
+  it('the hooks route reads the folder rule first, then the hooks', async () => {
+    start('chat-basic');
+    const folder = join(base, 'home', 'code', 'app');
+    mkdirSync(folder, { recursive: true });
+    const ok = await call('GET', `/api/chat/work/hooks?cwd=${encodeURIComponent(folder)}`);
+    expect(ok.ok && ok.body).toEqual({ userHooks: false });
+    for (const cwd of [join(base, 'home'), join(base, 'home', 'missing')]) {
+      const refused = await call('GET', `/api/chat/work/hooks?cwd=${encodeURIComponent(cwd)}`);
+      expect([cwd, failureOf(refused).reason]).toEqual([cwd, 'cwd-invalid']);
+    }
+    expect(failureOf(await call('GET', '/api/chat/work/hooks')).reason).toBe('cwd-invalid');
   });
 });
 

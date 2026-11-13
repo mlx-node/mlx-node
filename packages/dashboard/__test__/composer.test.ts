@@ -11,6 +11,7 @@ import {
   sendFace,
   type ComposerProps,
 } from '../ui/src/components/arc-x/composer/composer.js';
+import { CHAT } from '../ui/src/lib/chat-strings.js';
 import { cssRules, cssValue } from './helpers/css-rules.js';
 import { mount, rerender, unmountAll } from './helpers/mount.js';
 import { byRole } from './render.js';
@@ -26,7 +27,7 @@ function props(extra: Partial<ComposerProps> = {}): ComposerProps {
     onSend: () => undefined,
     onStop: () => undefined,
     tools: createElement('span', null, 'TOOLS'),
-    hint: 'Enter to send',
+    hint: CHAT.hintSend,
     ...extra,
   };
 }
@@ -105,19 +106,37 @@ describe('Composer', () => {
 
   it('a focus-only hint shows only while the text field has the focus', () => {
     const container = mount(
-      createElement(Composer, props({ value: '', phase: 'running', hint: 'Esc to stop', hintOnFocus: true })),
+      createElement(Composer, props({ value: '', phase: 'running', hint: CHAT.hintStop, hintOnFocus: true })),
     );
+    const stop = `${CHAT.keyNames.esc} ${CHAT.hintStop[0].label}`;
     const area = byRole(container, 'textbox', 'Message') as HTMLTextAreaElement;
-    expect(container.textContent).not.toContain('Esc to stop');
+    expect(container.textContent).not.toContain(stop);
     act(() => area.focus());
-    expect(container.textContent).toContain('Esc to stop');
+    expect(container.textContent).toContain(stop);
     act(() => area.blur());
-    expect(container.textContent).not.toContain('Esc to stop');
+    expect(container.textContent).not.toContain(stop);
+  });
+
+  it('the legend: one part per key hint, Send first; each key an icon with its hidden name; no key glyph as text', () => {
+    const container = mount(createElement(Composer, props()));
+    const parts = [...container.querySelectorAll('form > div:last-child > div > span')].filter(
+      (part) => part.querySelector('kbd') !== null,
+    );
+    expect(parts.map((part) => part.textContent)).toEqual([
+      `${CHAT.keyNames.enter} ${CHAT.hintSend[0].label}`,
+      `${CHAT.keyNames.shift} ${CHAT.keyNames.enter} ${CHAT.hintSend[1].label}`,
+    ]);
+    for (const part of parts) {
+      const keys = part.querySelector('kbd')!;
+      expect(keys.querySelectorAll('svg[aria-hidden="true"]').length).toBe(keys.querySelectorAll('span').length);
+    }
+    expect(container.textContent).not.toContain('↵');
+    expect(container.textContent).not.toContain('⇧');
   });
 
   it('the side text: the reason when there is text, the counter near the limit, else the hint', () => {
     const container = mount(createElement(Composer, props({ value: '', blocked: 'Engine stopped' })));
-    expect(container.textContent).toContain('Enter to send');
+    expect(container.textContent).toContain(CHAT.hintSend[0].label);
     rerender(createElement(Composer, props({ value: 'x', blocked: 'Engine stopped' })));
     expect(container.textContent).toContain('Engine stopped');
     rerender(createElement(Composer, props({ value: 'x'.repeat(95), maxLength: 100 })));
@@ -164,10 +183,73 @@ describe('Composer', () => {
 });
 
 describe('Composer tools row', () => {
-  it('a long reason wraps beside the chips and never hides one', () => {
-    const rules = cssRules('components/arc-x/composer/composer.module.css');
-    expect(cssValue(rules, '.toolsStart', 'flex')).toBe('0 1 auto');
-    expect(cssValue(rules, '.toolsEnd', 'flex')).toBe('1 1 0');
-    expect(cssValue(rules, ".side[data-kind='reason']", 'white-space')).toBe('normal');
+  const rules = cssRules('components/arc-x/composer/composer.module.css');
+  const value = (selector: string, property: string): string | undefined => cssValue(rules, selector, property);
+
+  it('Send has its own column at the right edge, outside the box that shrinks', () => {
+    expect(value('.tools', 'display')).toBe('grid');
+    expect(value('.tools', 'grid-template-columns')).toBe('minmax(0, 1fr) auto');
+    const container = mount(createElement(Composer, props()));
+    const send = byRole(container, 'button', 'Send')!;
+    const fit = container.querySelector('[data-side]')!;
+    expect(fit.contains(send)).toBe(false);
+    expect(fit.parentElement!.contains(send)).toBe(true);
+  });
+
+  it('a legend part is never cut: no ellipsis, one line, whole or wrapped out of the clipped box', () => {
+    expect([value('.hint', 'flex'), value('.hint', 'white-space')]).toEqual(['none', 'nowrap']);
+    for (const property of ['overflow', 'text-overflow']) expect(value('.hint', property)).toBeUndefined();
+    expect([value('.fit', 'flex-wrap'), value('.fit', 'height'), value('.fit', 'overflow')]).toEqual([
+      'wrap',
+      'var(--control-height-sm)',
+      'clip',
+    ]);
+    expect(value(".fit[data-side='reason']", 'flex-wrap')).toBe('nowrap');
+  });
+
+  it('the chips give way in order: folder, then web, then the model, each down to its floor', () => {
+    const shrink = (give: number): number =>
+      Number(value(`.toolsStart > [data-give='${String(give)}']`, 'flex-shrink'));
+    expect(shrink(1)).toBeGreaterThan(shrink(2) * 1000);
+    expect(shrink(2)).toBeGreaterThan(shrink(3) * 1000);
+    expect([1, 2, 3].map((give) => value(`.toolsStart > [data-give='${String(give)}']`, 'min-width'))).toEqual([
+      '4.75rem',
+      '4.75rem',
+      '4.25rem',
+    ]);
+  });
+
+  it('a part marked data-fit-whole is drawn on the row line or not at all, so its room goes back to the chips', () => {
+    expect(value('.toolsStart [data-fit-whole][data-dropped]', 'display')).toBe('none');
+    let partTop = 36;
+    const box = (top: number, height: number): DOMRect =>
+      ({ top, height, bottom: top + height, left: 0, right: 0, width: 0, x: 0, y: top }) as DOMRect;
+    const spy = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function rect(this: Element) {
+      return this.hasAttribute('data-fit-whole') ? box(partTop, 20) : box(0, 28);
+    });
+    try {
+      const tools = createElement('span', { 'data-fit-whole': '' }, 'Q4_K_M');
+      const container = mount(createElement(Composer, props({ tools })));
+      const part = container.querySelector('[data-fit-whole]')!;
+      expect(part.hasAttribute('data-dropped')).toBe(true);
+      partTop = 4;
+      rerender(createElement(Composer, props({ tools })));
+      expect(part.hasAttribute('data-dropped')).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('the key icon and its word share one centre line', () => {
+    expect([value('.hint', 'display'), value('.hint', 'align-items'), value('.hint', 'line-height')]).toEqual([
+      'inline-flex',
+      'center',
+      '1',
+    ]);
+    expect([value('.keys', 'align-items'), value('.keys > svg', 'display'), value('.keys > svg', 'width')]).toEqual([
+      'center',
+      'block',
+      '12px',
+    ]);
   });
 });
