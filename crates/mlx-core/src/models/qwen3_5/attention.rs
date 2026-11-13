@@ -3770,6 +3770,142 @@ mod tests {
         );
     }
 
+    /// On a bf16 pool the portable prefill runs its rows in chunks of at
+    /// most 2,048 row-partitions, the bound the varlen kernel tiles an int8
+    /// pool to: 1,400 rows at 100 over 3 partitions run as 682 + 682 + 36,
+    /// every row bit-equal to one unchunked launch. Mutations PT1 (a later
+    /// piece attends at `committed + start - 1`) and PT2 (one launch) → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn portable_prefill_chunks_a_bf16_pool_to_the_tile_bound() {
+        use crate::transformer::paged_int8_tests::adapter_for;
+        use mlx_paged_attn::metal::MetalDtype;
+        const HQ: usize = 16;
+        const HKV: usize = 2;
+        const D: usize = 256;
+        let config = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: 256,
+            head_size: D as u32,
+            num_kv_heads: HKV as u32,
+            num_layers: 1,
+            max_seq_len: Some(2048),
+            max_batch_size: Some(4),
+        };
+        let scale = 1.0 / (D as f32).sqrt();
+        let Some((mut adapter, _pool)) = adapter_for(config, 112, 112, MetalDtype::BFloat16) else {
+            return;
+        };
+        adapter.force_portable_prefill();
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.allocate_suffix_blocks(1500).unwrap();
+        for (seed, (committed, rows)) in [(0usize, 100usize), (100, 1400)].into_iter().enumerate() {
+            adapter.portable_prefill_launches.clear();
+            let (q, got) = store_attend_chunk(
+                &mut adapter,
+                (committed, rows),
+                PagedPass::Prefill,
+                (HQ, HKV, D),
+                seed as u32 * 10,
+            );
+            for &(launch_rows, context) in &adapter.portable_prefill_launches {
+                assert!(
+                    u64::from(launch_rows) * u64::from(context).div_ceil(512) <= 2048,
+                    "P {committed} T {rows}: a launch of {launch_rows} rows over {context} \
+                     tokens holds more than 2,048 row-partitions"
+                );
+            }
+            if rows == 1400 {
+                assert_eq!(
+                    adapter.portable_prefill_launches,
+                    [(682, 782), (682, 1464), (36, 1500)],
+                    "the 1,400-row chunk's launches"
+                );
+            }
+            let queries = bf16_array(&q, &[rows as i64, HQ as i64, D as i64]);
+            let whole = adapter
+                .gather_kv_for_prefill_chunk_varlen(0, &queries, committed as u32, scale)
+                .unwrap();
+            let whole = f32_values(&whole);
+            let differing = got
+                .iter()
+                .zip(&whole)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "P {committed} T {rows}: chunked values differ from one launch"
+            );
+        }
+    }
+
+    /// Every piece a bf16 portable prefill launches passes the varlen
+    /// preflight and holds at most the tile kernel's priced workspace with a
+    /// second copy of the chunk's output (the concatenate): 2,048-row chunks
+    /// at histories up to 1,048,576 tokens (2,048 partitions), at 24 / 4 and
+    /// 16 / 2 heads, D256. One launch of the chunk fails the preflight from
+    /// 87,041 (24 heads) and 130,561 (16 heads) tokens. Mutation PT2 (one
+    /// launch) → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn portable_prefill_pieces_fit_the_priced_workspace() {
+        use crate::transformer::paged_kv_cache_adapter::{
+            PagedAttentionV2Layout, paged_attention_v2_aux_fits,
+            paged_attention_v2_partition_upper_bound, portable_prefill_pieces,
+        };
+        use mlx_paged_attn::prefill_plan::{Pass, attention_bytes, workspace_bound_floats};
+        const D: u32 = 256;
+        const ROWS: u32 = 2048;
+        const MOST: u32 = 1_048_576;
+        let fits = |rows, hq, hkv, context| {
+            paged_attention_v2_aux_fits(PagedAttentionV2Layout::Varlen, rows, hq, hkv, context, D)
+        };
+        for (hq, hkv, first_refused) in [(24u32, 4u32, 87_041u32), (16, 2, 130_561)] {
+            assert!(fits(ROWS, hq, hkv, first_refused - 1));
+            assert!(!fits(ROWS, hq, hkv, first_refused));
+            let workspace = workspace_bound_floats(Pass::Prefill, hq, D) * 4;
+            let priced = attention_bytes(ROWS, hq, hkv, D, Pass::Prefill);
+            let duplicate_output = u64::from(ROWS) * u64::from(hq) * u64::from(D) * 2;
+            let mut largest = 0u64;
+            let edges = [ROWS, first_refused, 262_144, MOST];
+            for total in (ROWS..=MOST).step_by(1021).chain(edges) {
+                let committed = total - ROWS;
+                let pieces = portable_prefill_pieces(committed, ROWS);
+                assert_eq!(pieces.first().map(|p| p.0), Some(0));
+                assert_eq!(pieces.last().map(|p| p.1), Some(ROWS));
+                assert!(pieces.windows(2).all(|w| w[0].1 == w[1].0));
+                for &(start, end) in &pieces {
+                    let (rows, context) = (end - start, committed + end);
+                    assert!(
+                        fits(rows, hq, hkv, context),
+                        "{hq}/{hkv} at {total}: piece {start}..{end} fails the preflight"
+                    );
+                    let partitions = paged_attention_v2_partition_upper_bound(
+                        PagedAttentionV2Layout::Varlen,
+                        rows,
+                        hq,
+                        hkv,
+                        context,
+                        D,
+                    );
+                    // bf16 partials, f32 exp sums and max logits.
+                    let aux = u64::from(rows) * u64::from(hq) * partitions * (2 * u64::from(D) + 8);
+                    largest = largest.max(aux);
+                    assert!(
+                        aux + duplicate_output <= workspace,
+                        "{hq}/{hkv} at {total}: piece {start}..{end} holds {aux} B of partials"
+                    );
+                }
+            }
+            eprintln!(
+                "{hq}/{hkv} D{D}: largest piece partials {largest} B, with the output copy {} B, \
+                 workspace bound {workspace} B, attention_bytes {priced} B",
+                largest + duplicate_output
+            );
+            assert!(largest + duplicate_output <= priced);
+        }
+    }
+
     /// The device answer is made once per process, and a GPU that builds
     /// the tensor-op pipelines (every Apple GPU family) launches them for
     /// every prefill chunk. Mutations PF1 (the fallback always taken) and

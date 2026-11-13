@@ -128,6 +128,34 @@ impl SuffixBooking {
 
 const PAGED_ATTENTION_V2_PARTITION_SIZE: u64 = 512;
 const PAGED_ATTENTION_V2_AUX_ELEM_LIMIT: u128 = i32::MAX as u128;
+/// Row-partitions the varlen dispatch tiles an int8 prefill's partials to
+/// (`kVarlenWorkspaceRows` in `mlx_paged_dispatch.cpp`).
+#[cfg(target_os = "macos")]
+const PAGED_ATTENTION_VARLEN_WORKSPACE_ROWS: u64 = 2048;
+
+/// The `[start, end)` row pieces a bf16 portable prefill of `rows` rows at
+/// `committed` launches: each holds at most
+/// `PAGED_ATTENTION_VARLEN_WORKSPACE_ROWS` row-partitions. A piece is never
+/// 2 rows unless `rows` is: a 2-row varlen launch takes the grouped kernel,
+/// whose partitions differ from one launch of the chunk.
+#[cfg(target_os = "macos")]
+pub(crate) fn portable_prefill_pieces(committed: u32, rows: u32) -> Vec<(u32, u32)> {
+    let partitions =
+        (u64::from(committed) + u64::from(rows)).div_ceil(PAGED_ATTENTION_V2_PARTITION_SIZE);
+    let chunk = (PAGED_ATTENTION_VARLEN_WORKSPACE_ROWS / partitions.max(1))
+        .clamp(1, u64::from(rows.max(1))) as u32;
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    while start < rows {
+        let mut end = rows.min(start + chunk);
+        if end - start == 2 && rows != 2 {
+            end = start + 1;
+        }
+        pieces.push((start, end));
+        start = end;
+    }
+    pieces
+}
 
 /// The two paged-attention V2 entry points assign query rows differently.
 /// The fixed-row path treats each row as a sequence, while varlen keeps one
@@ -1166,6 +1194,9 @@ pub struct PagedKVCacheAdapter {
     /// builds the tensor-op pipelines.
     #[cfg(all(test, target_os = "macos"))]
     portable_prefill_forced: bool,
+    /// Test-only: (rows, context) of every bf16 portable prefill launch.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) portable_prefill_launches: Vec<(u32, u32)>,
 }
 
 /// One layer's pool arrays as a native write consumes and returns them.
@@ -1391,6 +1422,8 @@ impl PagedKVCacheAdapter {
             grow_headroom_probe_override: None,
             #[cfg(all(test, target_os = "macos"))]
             portable_prefill_forced: false,
+            #[cfg(all(test, target_os = "macos"))]
+            portable_prefill_launches: Vec::new(),
         })
     }
 
@@ -6126,6 +6159,48 @@ impl PagedKVCacheAdapter {
         !device_prefill_mpp_builds()
     }
 
+    /// The varlen dispatch tiles only an int8 pool's rows; a bf16 pool's rows
+    /// run in pieces of the same bound, or their partials outgrow the
+    /// workspace the memory plan prices.
+    #[cfg(target_os = "macos")]
+    fn portable_prefill_attention(
+        &mut self,
+        layer_idx: u32,
+        queries: &MxArray,
+        committed: u32,
+        scale: f32,
+    ) -> Result<MxArray, String> {
+        let rows = queries
+            .shape_at(0)
+            .map_err(|e| format!("paged_prefill_attention: {e}"))?;
+        let rows = u32::try_from(rows)
+            .map_err(|_| format!("paged_prefill_attention: invalid rows {rows}"))?;
+        if rows == 0 || self.layer_kv_pool.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8
+        {
+            return self.gather_kv_for_prefill_chunk_varlen(layer_idx, queries, committed, scale);
+        }
+        let mut outputs = Vec::new();
+        for (start, end) in portable_prefill_pieces(committed, rows) {
+            let part = queries
+                .slice_axis(0, i64::from(start), i64::from(end))
+                .map_err(|e| format!("paged_prefill_attention: query rows: {e}"))?;
+            #[cfg(test)]
+            self.portable_prefill_launches
+                .push((end - start, committed + end));
+            outputs.push(self.gather_kv_for_prefill_chunk_varlen(
+                layer_idx,
+                &part,
+                committed + start,
+                scale,
+            )?);
+        }
+        if outputs.len() == 1 {
+            return Ok(outputs.remove(0));
+        }
+        MxArray::concatenate_many(outputs.iter().collect(), Some(0))
+            .map_err(|e| format!("paged_prefill_attention: concatenate: {e}"))
+    }
+
     /// In-place attention of the active sequence's chunk over this layer's
     /// pool pages, its rows already stored (Splash `PagedAttention::addPrefill`
     /// and `addVerify`): `queries` `[rows, Hq, D]` at positions
@@ -6159,7 +6234,7 @@ impl PagedKVCacheAdapter {
         // paged_attention_tile.h). A GPU that cannot build these pipelines
         // (a hosted VM GPU) attends through the plain-Metal varlen kernel.
         if self.portable_prefill() {
-            return self.gather_kv_for_prefill_chunk_varlen(layer_idx, queries, committed, scale);
+            return self.portable_prefill_attention(layer_idx, queries, committed, scale);
         }
         let q_meta = KvTensorMeta::from_array(queries, "prefill_queries")?;
         if q_meta.ndim != 3 || q_meta.shape.len() < 3 {
