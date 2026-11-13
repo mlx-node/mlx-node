@@ -417,6 +417,53 @@ fn select(device: Device) -> bool {
     true
 }
 
+fn select_metal_gpu() -> bool {
+    // SAFETY: This predicate reports availability without changing device state.
+    (unsafe { mlx_sys::mlx_metal_is_available() }) && select(Device::Gpu)
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[test]
+fn cuda_matches_cpu_for_catalog_kquant_operations() {
+    if !select(Device::Gpu) {
+        eprintln!("skipping CUDA K-quant parity: no GPU device");
+        return;
+    }
+    for kq in KQUANTS
+        .iter()
+        .filter(|kq| matches!(kq.mode, "q3k" | "q4k" | "q5k" | "q6k" | "iq4nl" | "iq4xs"))
+    {
+        let mode = kq.mode;
+        let w = filled_kquant_weights(kq, &[N], 2 * K);
+        compare_devices(&format!("CUDA dequantize {mode}"), 0.0, || {
+            dequantize_handle(&w.0, &w.1, Some(&w.2), kq.group_size, kq.bits, mode)
+        });
+        let x = activation(&[3, 2 * K], 17, DType::Float32);
+        compare_devices(&format!("CUDA matmul {mode}"), F32_TOL, || {
+            qmm_of(kq, &x, &w, true)
+        });
+        let experts = filled_kquant_weights(kq, &[4, N], 2 * K);
+        let x = activation(&[3, 2, 2 * K], 31, DType::Float32);
+        let lhs = indices(&[2, 0, 2]);
+        let rhs = indices(&[1, 3, 2]);
+        compare_devices(&format!("CUDA gather {mode}"), F32_TOL, || {
+            gather_qmm_handle(
+                &x,
+                &experts.0,
+                &experts.1,
+                Some(&experts.2),
+                Some(&lhs),
+                &rhs,
+                true,
+                false,
+                kq.group_size,
+                kq.bits,
+                mode,
+            )
+        });
+    }
+}
+
 /// Whether this host has the NAX tensor-op kernels at all.
 ///
 /// `metal::is_nax_available()` folds the GPU generation (>= 17, or >= 18 when
@@ -1197,7 +1244,7 @@ fn cpu_runs_dequantize_matmul_and_gather_for_every_kquant_mode() {
 /// and the tolerance is the ordinary tile-rounding one.
 #[test]
 fn gpu_matches_cpu_on_every_quantized_matmul_kernel() {
-    if !select(Device::Gpu) {
+    if !select_metal_gpu() {
         eprintln!("skipping gpu_matches_cpu_on_every_quantized_matmul_kernel: no GPU device");
         return;
     }
@@ -1510,7 +1557,7 @@ fn gpu_matches_cpu_on_every_quantized_matmul_kernel() {
 /// other mode packs N in 256s and is always a multiple of 64.
 #[test]
 fn qvm_split_k_writes_every_iq4nl_output_column() {
-    if !select(Device::Gpu) {
+    if !select_metal_gpu() {
         eprintln!("skipping qvm_split_k_writes_every_iq4nl_output_column: no GPU device");
         return;
     }
@@ -1559,7 +1606,7 @@ fn qvm_split_k_writes_every_iq4nl_output_column() {
 /// the two `gather_qmm_rhs` cases pass a null left index and let MLX derive it.
 #[test]
 fn gpu_matches_cpu_on_every_gather_kernel() {
-    if !select(Device::Gpu) {
+    if !select_metal_gpu() {
         eprintln!("skipping gpu_matches_cpu_on_every_gather_kernel: no GPU device");
         return;
     }
@@ -1638,7 +1685,7 @@ fn gpu_matches_cpu_on_every_gather_kernel() {
 /// simdgroup `gather_qmm_rhs_nt`; the family counter says which.
 #[test]
 fn gather_qmm_rhs_nax_matches_cpu() {
-    if !select(Device::Gpu) {
+    if !select_metal_gpu() {
         eprintln!("skipping gather_qmm_rhs_nax_matches_cpu: no GPU device");
         return;
     }
@@ -1740,7 +1787,7 @@ fn gather_qmm_rhs_nax_matches_cpu() {
 /// `vector_limit`.
 #[test]
 fn gpu_matches_cpu_for_every_activation_dtype() {
-    if !select(Device::Gpu) {
+    if !select_metal_gpu() {
         eprintln!("skipping gpu_matches_cpu_for_every_activation_dtype: no GPU device");
         return;
     }
@@ -1833,7 +1880,7 @@ fn gpu_matches_cpu_for_every_activation_dtype() {
 /// hosts as well; the ordinary dtype sweep above retains unsupported paths.
 #[test]
 fn portable_prefill_tiles_match_cpu() {
-    if !select(Device::Gpu) {
+    if !select_metal_gpu() {
         return;
     }
     for kq in KQUANTS
@@ -1887,7 +1934,7 @@ fn portable_prefill_tiles_match_cpu() {
 /// `*_STORE_TOL` constants want re-measuring rather than keeping.
 #[test]
 fn affine_shows_the_same_bfloat16_vector_gap() {
-    if !select(Device::Gpu) {
+    if !select_metal_gpu() {
         eprintln!("skipping affine_shows_the_same_bfloat16_vector_gap: no GPU device");
         return;
     }

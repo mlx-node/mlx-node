@@ -692,8 +692,8 @@ fn portable_cmake_defines(
         if let Some(deployment_target) = deployment_target {
             define("CMAKE_OSX_DEPLOYMENT_TARGET", deployment_target);
         }
-    } else if target_os == "linux" {
-        // Linux/CUDA build. The MLX submodule's CMake auto-detects the GPU
+    } else if matches!(target_os, "linux" | "windows") {
+        // The MLX submodule's CMake auto-detects the GPU
         // architecture, but on a GPU-less / headless configure host the
         // detection query is empty and FATALs. Pass the arch explicitly for
         // determinism (`121a` is what MLX auto-detected on the GB10 host;
@@ -712,6 +712,13 @@ fn portable_cmake_defines(
         define("MLX_BUILD_CPU", "ON");
         define("MLX_CUDA_ARCHITECTURES", &cuda_archs);
         define("CMAKE_BUILD_TYPE", "Release");
+        if target_os == "windows" {
+            define("CMAKE_CUDA_RUNTIME_LIBRARY", "Shared");
+            define("CMAKE_CUDA_ARCHITECTURES", &cuda_archs);
+            // CUTLASS 4.4 fails to parse with MSVC's strict mode in C++20.
+            // https://github.com/NVIDIA/cutlass/issues/3065
+            define("CMAKE_CUDA_FLAGS", "-Xcompiler=/permissive,/EHsc");
+        }
     }
     defines
 }
@@ -1286,11 +1293,14 @@ fn main() -> io::Result<()> {
 
     // Read the target OS/arch up front: they decide whether we build the
     // Metal backend at all. On macOS we build Metal (unless explicitly
-    // disabled); on Linux we build the CUDA backend and there is no Metal
-    // toolchain to look for.
+    // disabled). On Linux and Windows we build the CUDA backend.
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH is not set");
     let target_os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS is not set");
     let is_macos = target_os == "macos";
+    let build_cuda = matches!(target_os.as_str(), "linux" | "windows");
+    if build_cuda {
+        println!("cargo:rerun-if-env-changed=MLX_CUDA_ARCHITECTURES");
+    }
 
     let metal_disabled = env::var_os("MLX_DISABLE_METAL").is_some();
     // Metal is built only on macOS and only when not explicitly disabled.
@@ -1564,6 +1574,40 @@ fn main() -> io::Result<()> {
         for l in ["stdc++", "dl", "pthread"] {
             println!("cargo:rustc-link-lib=dylib={l}");
         }
+    } else if target_os == "windows" {
+        let (cuda, cudnn) = windows_cuda_roots();
+        let arch = if target_arch == "aarch64" {
+            "arm64"
+        } else {
+            "x64"
+        };
+        for dir in [
+            cuda.join("lib").join(arch),
+            windows_cudnn_lib_dir(&cudnn, arch),
+        ] {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+        let blas = if target_arch == "aarch64" {
+            "openblas"
+        } else {
+            "libopenblas"
+        };
+        for lib in [
+            blas,
+            "cudart",
+            "cublasLt",
+            "cufft",
+            "cusolver",
+            "nvrtc",
+            "cuda",
+            "cudnn",
+            "cudnn_graph",
+            "cudnn_engines_runtime_compiled",
+            "dxgi",
+            "Psapi",
+        ] {
+            println!("cargo:rustc-link-lib=dylib={lib}");
+        }
     }
 
     let include_source = mlx_dir.join("mlx");
@@ -1574,11 +1618,36 @@ fn main() -> io::Result<()> {
         .cpp(true)
         .warnings(false)
         .define("MLX_STATIC", None)
-        .include(&include_source)
         .include(&mlx_dir);
+    if target_os != "windows" {
+        bridge.include(&include_source);
+    }
 
-    if build_metal || target_os == "linux" {
+    if build_metal || build_cuda {
         bridge.define("MLX_NODE_GPU_ENABLED", None);
+    }
+    if build_cuda {
+        let cuda = if target_os == "windows" {
+            windows_cuda_roots().0
+        } else {
+            env_non_empty("CUDA_PATH")
+                .or_else(|| env_non_empty("CUDA_HOME"))
+                .map_or_else(|| PathBuf::from("/usr/local/cuda"), PathBuf::from)
+        };
+        bridge
+            .define("MLX_NODE_CUDA_ENABLED", None)
+            .include(cuda.join("include"))
+            .include(cuda.join("include/cccl"))
+            .include(mlx_root.join("build/_deps/fmt-src/include"));
+    }
+    if target_os == "windows" {
+        bridge
+            .define("NOMINMAX", None)
+            .define("WIN32_LEAN_AND_MEAN", None)
+            .flag("/bigobj")
+            .flag("/utf-8")
+            .flag("/EHsc")
+            .flag("/Zc:__cplusplus");
     }
 
     // `__APPLE__` alone does not mean this build contains MLX's Metal backend:
@@ -1793,6 +1862,17 @@ fn build_mlx_from_source(
 
     // Defines are applied together: `define` above only records them, so
     // the same list can be written into an exported artifact's manifest.
+    if target_os == "windows" {
+        let (cuda, cudnn) = windows_cuda_roots();
+        let arch = if target_arch == "aarch64" {
+            "arm64"
+        } else {
+            "x64"
+        };
+        cfg.define("CUDAToolkit_ROOT", &cuda)
+            .define("CUDNN_INCLUDE_PATH", cudnn.join("include"))
+            .define("CUDNN_LIBRARY_PATH", windows_cudnn_lib_dir(&cudnn, arch));
+    }
     for (key, value) in &defines {
         cfg.define(key, value);
     }
@@ -1803,6 +1883,24 @@ fn build_mlx_from_source(
     }
     let dst = cfg.build();
     (dst, defines, sentinel)
+}
+
+fn windows_cuda_roots() -> (PathBuf, PathBuf) {
+    for key in ["CUDA_PATH", "CUDA_HOME", "CUDNN_PATH"] {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+    let cuda = env_non_empty("CUDA_PATH")
+        .or_else(|| env_non_empty("CUDA_HOME"))
+        .expect("set CUDA_PATH to the native Windows CUDA Toolkit directory");
+    let cudnn =
+        env_non_empty("CUDNN_PATH").expect("set CUDNN_PATH to the native Windows cuDNN directory");
+    (cuda.into(), cudnn.into())
+}
+
+fn windows_cudnn_lib_dir(cudnn: &Path, arch: &str) -> PathBuf {
+    let lib = cudnn.join("lib");
+    let arch_lib = lib.join(arch);
+    if arch_lib.is_dir() { arch_lib } else { lib }
 }
 
 /// MLX kernel headers as source text for the JIT-built bridge kernels.

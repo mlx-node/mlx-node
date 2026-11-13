@@ -9,7 +9,6 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -23,6 +22,7 @@ use super::repack::SlotRepack;
 use crate::array::alloc::SendPtr;
 use crate::cold_tier::ShardIdentity;
 use crate::utils::gguf::GgufTensorInfo;
+use crate::utils::gguf_read::read_at;
 
 /// Reader threads of the product pool (8-16 read within 1 % of each other).
 pub const DEFAULT_THREADS: usize = 12;
@@ -214,7 +214,7 @@ impl ShardSet {
         let file = &self.shards[shard].file;
         let mut done = 0;
         while done < buf.len() {
-            match file.read_at(&mut buf[done..], offset + done as u64) {
+            match read_at(file, &mut buf[done..], offset + done as u64) {
                 Ok(0) => break,
                 Ok(n) => done += n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}

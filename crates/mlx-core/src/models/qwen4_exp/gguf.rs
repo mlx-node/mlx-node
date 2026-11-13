@@ -165,14 +165,11 @@ pub fn assets(first: &Path, store: &Store, c: &Config) -> Result<PathBuf> {
     assets_in(first, store, c, &native_gguf_cache_root()?)
 }
 
-/// Per-sidecar flock shared with the native-GGUF sweep: a held lock makes the
+/// Per-sidecar lock shared with the native-GGUF sweep: a held lock makes the
 /// sweep skip the directory, so the hit check and the publish below cannot
-/// race a mid-flight eviction. `Some(_)` keeps the fd as a guard (inner None
-/// on non-Unix, where no sweep runs); `None` means contention — the caller
-/// retries briefly rather than publishing into a possible mid-delete.
-#[cfg(unix)]
-fn assets_sidecar_lock(root: &Path, dir_name: &str) -> Option<Option<std::fs::File>> {
-    use std::os::fd::AsRawFd;
+/// race a mid-flight eviction. The caller keeps the file open as a guard
+/// and retries briefly if acquiring it fails.
+fn assets_sidecar_lock(root: &Path, dir_name: &str) -> Option<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -180,17 +177,8 @@ fn assets_sidecar_lock(root: &Path, dir_name: &str) -> Option<Option<std::fs::Fi
         .write(true)
         .open(root.join(format!("{dir_name}.lock")))
         .ok()?;
-    // SAFETY: `file` owns the descriptor for the flock call, and the returned
-    // guard keeps it — and the lock — alive until the caller drops it.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return None;
-    }
-    Some(Some(file))
-}
-
-#[cfg(not(unix))]
-fn assets_sidecar_lock(_root: &Path, _dir_name: &str) -> Option<Option<std::fs::File>> {
-    Some(None)
+    file.try_lock().ok()?;
+    Some(file)
 }
 
 fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<PathBuf> {

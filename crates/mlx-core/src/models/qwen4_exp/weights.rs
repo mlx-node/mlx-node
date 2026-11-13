@@ -5,7 +5,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::os::unix::fs::{FileExt, MetadataExt};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -22,6 +23,7 @@ use crate::utils::gguf::{
     GgufFile, GgufLoadOptions, GgufMetaValue, GgufTensorInfo, GgufTensorType, load_gguf_tensor,
     parse_gguf, source_file_identity_digest, symmetric_zero_point,
 };
+use crate::utils::gguf_read::ReadAt;
 
 #[path = "expert_slots.rs"]
 mod expert_slots;
@@ -305,6 +307,7 @@ impl DirectGgufSource {
                     expected.path.display()
                 ))
             })?;
+            #[cfg(unix)]
             if live.len() < expected.len && live.dev() == held.dev() && live.ino() == held.ino() {
                 return Err(err(format!(
                     "GGUF '{}' is truncated: expected {} bytes, found {}",
@@ -403,21 +406,18 @@ impl crate::utils::gguf_read::ReadAt for DirectGgufReader<'_> {
             }
             let in_shard = offset - shard.base;
             let n = (shard.len - in_shard).min(remaining.len() as u64) as usize;
-            std::os::unix::fs::FileExt::read_exact_at(
-                self.files[index],
-                &mut remaining[..n],
-                in_shard,
-            )
-            .map_err(|error| {
-                if self.source.shards.len() == 1 {
-                    error
-                } else {
-                    std::io::Error::new(
-                        error.kind(),
-                        format!("GGUF shard '{}': {error}", shard.path.display()),
-                    )
-                }
-            })?;
+            self.files[index]
+                .read_exact_at(&mut remaining[..n], in_shard)
+                .map_err(|error| {
+                    if self.source.shards.len() == 1 {
+                        error
+                    } else {
+                        std::io::Error::new(
+                            error.kind(),
+                            format!("GGUF shard '{}': {error}", shard.path.display()),
+                        )
+                    }
+                })?;
             offset += n as u64;
             remaining = &mut remaining[n..];
         }
@@ -835,11 +835,12 @@ impl Store {
 
     /// Auxiliary source checkpoints contribute only descriptors, so their
     /// unrelated target tensors must not participate in residency admission.
-    pub(super) fn open_metadata(path: &Path, root: Option<&Path>) -> Result<Self> {
+    pub(super) fn open_metadata(path: &Path, _root: Option<&Path>) -> Result<Self> {
         let s = Self::open_descriptors(path)?;
+        #[cfg(unix)]
         if s.gguf {
             let root =
-                root.map_or_else(|| super::packed_cache::cache_root(path), Path::to_path_buf);
+                _root.map_or_else(|| super::packed_cache::cache_root(path), Path::to_path_buf);
             super::packed_cache::sweep_old_packs(&root);
         }
         Ok(s)

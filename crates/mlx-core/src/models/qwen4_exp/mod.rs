@@ -11,6 +11,7 @@ mod math;
 mod media;
 mod memory;
 mod mtp;
+#[cfg(unix)]
 mod packed_cache;
 mod paged;
 mod route_plan;

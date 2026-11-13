@@ -24,10 +24,24 @@ pub use banded_attention::banded_attention;
 pub(crate) use handle::{MxHandle, check_handle};
 pub use padding::{PaddedSequences, pad_float_sequences, pad_sequences};
 
+#[cfg(unix)]
 pub fn page_size() -> usize {
     // SAFETY: sysconf has no preconditions.
     let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     usize::try_from(size).unwrap_or(16384)
+}
+
+#[cfg(windows)]
+pub fn page_size() -> usize {
+    use std::mem::MaybeUninit;
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+
+    let mut info = MaybeUninit::<SYSTEM_INFO>::uninit();
+    // SAFETY: GetSystemInfo initializes the writable SYSTEM_INFO.
+    unsafe {
+        GetSystemInfo(info.as_mut_ptr());
+        info.assume_init().dwPageSize as usize
+    }
 }
 
 // Re-exports from memory submodule (used across the crate)

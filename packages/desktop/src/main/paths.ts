@@ -36,6 +36,8 @@ export interface AppLayout {
   packaged: boolean;
   /** `app.getPath('userData')` — `~/Library/Application Support/<productName>`. */
   userData: string;
+  platform?: NodeJS.Platform;
+  arch?: NodeJS.Architecture;
 }
 
 export interface AppPaths {
@@ -92,6 +94,8 @@ export interface AppPaths {
 
 export function resolveAppPaths(layout: AppLayout): AppPaths {
   const { appPath, resourcesPath, packaged, userData } = layout;
+  const windowsArm64 = layout.platform === 'win32' && layout.arch === 'arm64';
+  const addon = windowsArm64 ? 'mlx-core.win32-arm64-msvc.node' : ADDON_FILE;
   return {
     cliEntry: packaged
       ? join(appPath, 'node_modules', '@mlx-node', 'cli', 'dist', 'cli.js')
@@ -110,7 +114,7 @@ export function resolveAppPaths(layout: AppLayout): AppPaths {
     // which is also where napi's own fallback would have found it: the variable
     // is set in both modes anyway so that dev and the bundle take the same code
     // path through `requireNative()`.
-    nativeAddon: packaged ? join(resourcesPath, 'native', ADDON_FILE) : join(appPath, '..', 'core', ADDON_FILE),
+    nativeAddon: packaged ? join(resourcesPath, 'native', addon) : join(appPath, '..', 'core', addon),
     traceDir: join(userData, 'traces'),
     settingsFile: join(userData, 'settings.json'),
     trayIcon: join(appPath, 'build', 'iconTemplate.png'),

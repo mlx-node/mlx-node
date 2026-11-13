@@ -72,7 +72,12 @@
 #include <stdint.h>
 #define KQ_THREAD
 #define KQ_DEVICE
+#ifdef _MSC_VER
+#include <bit>
+#define KQ_POPCOUNT(x) std::popcount(x)
+#else
 #define KQ_POPCOUNT(x) __builtin_popcount(x)
+#endif
 #endif
 
 // uint32 words of `.weight` per unit (the mode's `bits`).

@@ -85,12 +85,14 @@ import {
 
 ## Platform Support
 
-| Platform | Architecture          | Status      |
-| -------- | --------------------- | ----------- |
-| macOS    | Apple Silicon (arm64) | Supported   |
-| macOS    | Intel (x86_64)        | Unsupported |
-| Linux    | CUDA                  | Coming soon |
-| Windows  | CUDA                  | Coming soon |
+| Platform | Architecture          | Status                    |
+| -------- | --------------------- | ------------------------- |
+| macOS    | Apple Silicon (arm64) | Supported                 |
+| macOS    | Intel (x86_64)        | Unsupported               |
+| Linux    | ARM64 CUDA            | Experimental source build |
+| Windows  | ARM64 CUDA            | Experimental source build |
+
+See the [Windows ARM64 CUDA build instructions](../../README.md#windows-arm64-cuda).
 
 ## Related Packages
 
