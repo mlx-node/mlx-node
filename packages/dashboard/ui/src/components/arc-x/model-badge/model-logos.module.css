@@ -1,0 +1,10 @@
+.monogram {
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-mark);
+  background: color-mix(in oklab, var(--foreground) 10%, transparent);
+  color: var(--foreground);
+  font-size: calc(var(--text-xs) * 0.75);
+  font-weight: 700;
+  line-height: 1;
+}

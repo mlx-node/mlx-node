@@ -1,0 +1,107 @@
+.bone {
+  display: block;
+  box-sizing: border-box;
+  max-width: 100%;
+  border-radius: var(--radius-chip);
+  background: var(--surface-muted);
+  opacity: 0;
+  animation:
+    placeholder-appear var(--duration-standard) var(--ease-enter) var(--duration-hold) both,
+    placeholder-pulse var(--duration-pulse) var(--ease-in-out) calc(var(--duration-hold) + var(--duration-standard))
+      infinite;
+}
+
+span.bone {
+  display: inline-block;
+  vertical-align: middle;
+}
+
+.bone[data-radius='text'] {
+  position: relative;
+  border-radius: 0;
+  background: transparent;
+}
+
+.bone[data-radius='text']::before {
+  position: absolute;
+  inset-inline: 0;
+  top: 50%;
+  height: min(12px, calc(1lh - 6px));
+  border-radius: var(--radius-chip);
+  background: var(--surface-muted);
+  content: '';
+  transform: translateY(-50%);
+}
+
+.bone[data-radius='control'] {
+  border-radius: var(--radius-inset);
+}
+
+.bone[data-radius='panel'] {
+  border-radius: var(--radius-panel);
+}
+
+.bone[data-radius='pill'] {
+  border-radius: var(--radius-pill);
+}
+
+.slot {
+  position: relative;
+  isolation: isolate;
+}
+
+span.slot {
+  display: inline-block;
+}
+
+.bone[data-settling] {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  max-width: none;
+  opacity: 1;
+  transform-origin: 0 0;
+  animation: placeholder-settle var(--duration-standard) var(--ease-standard)
+    calc((var(--step) + 1) * var(--stagger-item)) both;
+}
+
+@keyframes placeholder-appear {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes placeholder-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes placeholder-settle {
+  from {
+    opacity: 1;
+    transform: scale(var(--from-x, 1), var(--from-y, 1));
+  }
+  to {
+    opacity: 0;
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bone {
+    opacity: 1;
+    animation: none;
+  }
+  .bone[data-settling] {
+    opacity: 0;
+    animation: none;
+  }
+}

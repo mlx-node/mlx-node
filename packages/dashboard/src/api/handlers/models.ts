@@ -1,15 +1,70 @@
+import { statfsSync } from 'node:fs';
+import { totalmem } from 'node:os';
+import { isAbsolute, relative, sep } from 'node:path';
+
 import { discoverMlxModels } from '@mlx-node/agent/models';
 
 import { catalogWithState } from '../../catalog.js';
-import { discoverLocalModels, deleteLocalModel, isModelPresent, isRegularFile } from '../../models.js';
+import {
+  discoverLocalModels,
+  deleteLocalModel,
+  isModelPresent,
+  isRegularFile,
+  type ModelsResponse,
+} from '../../models.js';
 import type { ApiPaths, ApiRequest, MainApiContext } from '../context.js';
 import { ApiError } from '../errors.js';
 
-export function handleModels(ctx: ApiPaths): unknown {
+/** The first path segment of `path` under `root`, or null when it is not inside it. */
+function firstSegmentUnder(root: string, path: string): string | null {
+  const rel = relative(root, path);
+  if (rel === '' || isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) return null;
+  const cut = rel.indexOf(sep);
+  return cut === -1 ? rel : rel.slice(0, cut);
+}
+
+/** Served names per top-level entry of the models directory; empty when discovery fails. */
+async function servedIdsByEntry(modelsDir: string): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>();
+  let discovered;
+  try {
+    discovered = await discoverMlxModels(modelsDir);
+  } catch {
+    return out;
+  }
+  for (const { discovered: model } of discovered) {
+    const entry = firstSegmentUnder(modelsDir, model.path);
+    if (entry === null) continue;
+    const list = out.get(entry);
+    if (list === undefined) out.set(entry, [model.name]);
+    else list.push(model.name);
+  }
+  for (const list of out.values()) list.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return out;
+}
+
+function diskFreeBytes(dir: string): number | null {
+  try {
+    const fs = statfsSync(dir);
+    return Number(fs.bavail) * Number(fs.bsize);
+  } catch {
+    return null;
+  }
+}
+
+export async function handleModels(ctx: ApiPaths): Promise<ModelsResponse> {
   const { models, companions, warnings } = discoverLocalModels(ctx.modelsDir);
+  const served = await servedIdsByEntry(ctx.modelsDir);
+  for (const model of models) model.servedIds = served.get(model.name) ?? [];
   // `dir` lets the UI show WHERE these checkpoints live — the directory is
   // configurable (`--models-dir`), so the count alone is ambiguous.
-  return { models, companions, warnings, dir: ctx.modelsDir };
+  return {
+    models,
+    companions,
+    warnings,
+    dir: ctx.modelsDir,
+    host: { totalMemBytes: totalmem(), diskFreeBytes: diskFreeBytes(ctx.modelsDir) },
+  };
 }
 
 export async function handleCodingAgentModels(ctx: ApiPaths): Promise<unknown> {

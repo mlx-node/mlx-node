@@ -37,11 +37,14 @@ export function statusForCode(code: ApiErrorCode): number {
  */
 export class ApiError extends Error {
   readonly code: ApiErrorCode;
+  /** A finer machine-readable cause the page branches on (the Chat routes' typed failures). */
+  readonly reason: string | undefined;
 
-  constructor(code: ApiErrorCode, message: string) {
+  constructor(code: ApiErrorCode, message: string, reason?: string) {
     super(message);
     this.name = 'ApiError';
     this.code = code;
+    this.reason = reason;
   }
 
   /** Derived, never stored: the HTTP status for {@link code}. */
@@ -97,13 +100,16 @@ export interface ApiFailure {
   message: string;
   /** Always `statusForCode(code)`; carried so transports need not re-derive it. */
   status: number;
+  reason?: string;
 }
 
 export type ApiResponse = ApiSuccess | ApiFailure;
 
 /** Build a failure envelope, deriving its status from the code. */
-export function failure(code: ApiErrorCode, message: string): ApiFailure {
-  return { ok: false, code, message, status: statusForCode(code) };
+export function failure(code: ApiErrorCode, message: string, reason?: string): ApiFailure {
+  return reason === undefined
+    ? { ok: false, code, message, status: statusForCode(code) }
+    : { ok: false, code, message, status: statusForCode(code), reason };
 }
 
 /**
@@ -113,6 +119,6 @@ export function failure(code: ApiErrorCode, message: string): ApiFailure {
  * likewise surfaced `err.message` when present).
  */
 export function toFailure(err: unknown): ApiFailure {
-  if (err instanceof ApiError) return failure(err.code, err.message);
+  if (err instanceof ApiError) return failure(err.code, err.message, err.reason);
   return failure('E_INTERNAL', err instanceof Error ? err.message : 'Internal server error');
 }

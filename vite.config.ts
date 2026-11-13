@@ -111,9 +111,12 @@ export default defineConfig({
       // Generated converter outputs; parity tests compare their raw bytes.
       '/crates/mlx-core/src/utils/testdata/gguf_import_golden',
       '**/*.metal.inc',
+      // Vendored Arc files stay byte-comparable with upstream (PROVENANCE.md lists every local change).
+      'packages/dashboard/ui/src/components/arc/**',
     ],
   },
   lint: {
+    ignorePatterns: ['packages/dashboard/ui/src/components/arc/**'],
     options: {
       typeAware: true,
       typeCheck: true,

@@ -1,0 +1,77 @@
+.root {
+  --dot-size: 8px;
+  --dot-tone: var(--text-muted);
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-1-5);
+  vertical-align: middle;
+}
+
+.root[data-size='6'] {
+  --dot-size: 6px;
+}
+
+.root[data-tone='success'] {
+  --dot-tone: var(--success);
+}
+
+.root[data-tone='warning'] {
+  --dot-tone: var(--warning);
+}
+
+.root[data-tone='danger'] {
+  --dot-tone: var(--danger);
+}
+
+.root[data-tone='accent'] {
+  --dot-tone: var(--accent-strong);
+}
+
+.dot {
+  position: relative;
+  flex: none;
+  width: var(--dot-size);
+  height: var(--dot-size);
+  border-radius: var(--radius-pill);
+  background: var(--dot-tone);
+  transition: background-color var(--duration-standard) var(--ease-standard);
+}
+
+.dot[data-pulse]::after {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--dot-tone);
+  content: '';
+  opacity: 0;
+  animation: live-dot-ping var(--duration-ping) var(--ease-standard) infinite;
+}
+
+.label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes live-dot-ping {
+  from {
+    opacity: 0.4;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(2.4);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dot {
+    transition-duration: var(--duration-instant);
+  }
+  .dot[data-pulse]::after {
+    display: none;
+    animation: none;
+  }
+}

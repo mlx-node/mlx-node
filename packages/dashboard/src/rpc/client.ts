@@ -1,5 +1,5 @@
 /**
- * The caller's end of the dashboard RPC: `call` / `subscribe` over one
+ * The caller's end of the dashboard RPC: `call` / `subscribe` / `watchLive` / `watchChat` over one
  * {@link RpcPort}, shaped so no caller can hang.
  *
  * `call` mirrors `runtime.call` exactly — same argument, same
@@ -21,10 +21,12 @@
  */
 
 import { failure, type ApiResponse } from '../api/errors.js';
+import type { ChatHostEvent, ConversationEvent } from '../chat/types.js';
 import type { DownloadEvent } from '../download.js';
+import type { LiveEvent } from '../live.js';
 import type { ApiCall } from '../runtime.js';
 import type { RpcPort } from './port.js';
-import { isRpcReply, type RpcRequest } from './protocol.js';
+import { isRpcReply, type ChatScope, type RpcRequest } from './protocol.js';
 
 /**
  * Per-request cancellation deadline. It is generous: its job is to detect a
@@ -52,6 +54,12 @@ export interface RpcClientOptions {
    * closing this port is not a substitute for proving queued work is dead.
    */
   onUnresponsive(reason: string): void;
+  /**
+   * Called once when the transport stops carrying calls on its own: the peer
+   * closed the port, or recovery started for a wedged peer. Never called after
+   * `close()`.
+   */
+  onDown?(reason: string): void;
 }
 
 export interface RpcClient {
@@ -59,6 +67,10 @@ export interface RpcClient {
   call(call: ApiCall): Promise<ApiResponse>;
   /** Subscribe to a download job's progress events; returns the unsubscribe. */
   subscribe(jobId: string, listener: (event: DownloadEvent) => void): () => void;
+  /** Subscribe to live engine state and data-change events; returns the unsubscribe. */
+  watchLive(listener: (event: LiveEvent) => void): () => void;
+  /** Open a Chat stream (host state, or one conversation); returns the unsubscribe. */
+  watchChat(scope: ChatScope, listener: (event: ChatHostEvent | ConversationEvent) => void): () => void;
   /**
    * Stop new work and subscriptions, then drain in-flight calls to an
    * acknowledged cancellation or real result before closing the port.
@@ -80,6 +92,8 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
     }
   >();
   const listeners = new Map<number, (event: DownloadEvent) => void>();
+  const liveListeners = new Map<number, (event: LiveEvent) => void>();
+  const chatListeners = new Map<number, (event: ChatHostEvent | ConversationEvent) => void>();
   let nextId = 1;
   /** Set once no further reply can arrive; every later call fails fast instead of waiting out its deadline. */
   let down: string | null = null;
@@ -87,7 +101,18 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
   let closed = false;
   let portFinished = false;
   let recoveryStarted = false;
+  let downReported = false;
   let detach = (): void => {};
+
+  const reportDown = (reason: string): void => {
+    if (downReported) return;
+    downReported = true;
+    try {
+      opts.onDown?.(reason);
+    } catch {
+      // Runs from the port's own event dispatch or a timer; nothing could catch it.
+    }
+  };
 
   const finishClose = (): void => {
     if (!closed || portFinished || pending.size > 0) return;
@@ -107,6 +132,8 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
     const waiting = [...pending.values()];
     pending.clear();
     listeners.clear();
+    liveListeners.clear();
+    chatListeners.clear();
     for (const entry of waiting) {
       clearTimeout(entry.timer);
       entry.settle(failure('E_UNAVAILABLE', `Dashboard runtime is unavailable: ${down}`));
@@ -124,6 +151,14 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
         listeners.get(data.id)?.(data.event);
         return;
       }
+      if (data.kind === 'live') {
+        liveListeners.get(data.id)?.(data.event);
+        return;
+      }
+      if (data.kind === 'chat') {
+        chatListeners.get(data.id)?.(data.event);
+        return;
+      }
       const entry = pending.get(data.id);
       // No entry means the request already settled or the client went down.
       // Dropping the late reply is what keeps a caller from being settled twice.
@@ -136,6 +171,7 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
     onClose(): void {
       closed = true;
       goDown('the message port was closed; call outcome is unknown');
+      reportDown('the message port was closed');
     },
   });
 
@@ -149,7 +185,10 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
     closed = true;
     down = `${reason}; runtime recovery is in progress`;
     listeners.clear();
+    liveListeners.clear();
+    chatListeners.clear();
     for (const entry of pending.values()) clearTimeout(entry.timer);
+    reportDown(reason);
     // Do NOT settle or locally close the port here. Posting the recovery signal
     // is not proof that queued work is dead. The old process's port-close event
     // is the teardown witness; until then only an authoritative original
@@ -188,6 +227,40 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
     }, cancellationGraceMs);
   };
 
+  /** Register `listener` under a fresh id and post the opening request; returns the unsubscribe. */
+  const open = <E>(
+    registry: Map<number, (event: E) => void>,
+    listener: (event: E) => void,
+    request: (id: number) => RpcRequest,
+  ): (() => void) => {
+    // A dead port can deliver nothing; hand back an inert unsubscribe rather
+    // than register a listener that would leak until `close()`.
+    if (down !== null) return () => {};
+    const id = nextId++;
+    registry.set(id, listener);
+    try {
+      post(request(id));
+    } catch {
+      registry.delete(id);
+      return () => {};
+    }
+    let live = true;
+    return () => {
+      if (!live) return;
+      live = false;
+      // Local first: an event the host posted before the unsubscribe reached it
+      // is already in flight, and dropping the listener here is the only thing
+      // that stops it being delivered after the caller asked it to stop.
+      registry.delete(id);
+      if (down !== null) return;
+      try {
+        post({ kind: 'unsubscribe', id });
+      } catch {
+        // The peer is gone; its subscription died with it.
+      }
+    };
+  };
+
   return {
     call(apiCall: ApiCall): Promise<ApiResponse> {
       if (down !== null) {
@@ -219,43 +292,27 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
     },
 
     subscribe(jobId: string, listener: (event: DownloadEvent) => void): () => void {
-      // A dead port can deliver nothing; hand back an inert unsubscribe rather
-      // than register a listener that would leak until `close()`.
-      if (down !== null) return () => {};
-      const id = nextId++;
-      listeners.set(id, listener);
-      try {
-        post({ kind: 'subscribe', id, jobId });
-      } catch {
-        listeners.delete(id);
-        return () => {};
-      }
-      let live = true;
-      return () => {
-        if (!live) return;
-        live = false;
-        // Local first: an event the host posted before the unsubscribe reached it
-        // is already in flight, and dropping the listener here is the only thing
-        // that stops it being delivered after the caller asked it to stop.
-        listeners.delete(id);
-        if (down !== null) return;
-        try {
-          post({ kind: 'unsubscribe', id });
-        } catch {
-          // The peer is gone; its subscription died with it.
-        }
-      };
+      return open(listeners, listener, (id) => ({ kind: 'subscribe', id, jobId }));
+    },
+
+    watchLive(listener: (event: LiveEvent) => void): () => void {
+      return open(liveListeners, listener, (id) => ({ kind: 'watch', id, topic: 'live' }));
+    },
+
+    watchChat(scope: ChatScope, listener: (event: ChatHostEvent | ConversationEvent) => void): () => void {
+      return open(chatListeners, listener, (id) => ({ kind: 'chat', id, ...scope }));
     },
 
     close(): void {
       if (closed) return;
       closed = true;
+      downReported = true;
       down = 'the client was closed';
 
       // Subscriptions have no terminal acknowledgement to wait for. Drop local
       // delivery immediately and ask the host to release each registration
       // while the old port remains alive for pending calls.
-      for (const id of listeners.keys()) {
+      for (const id of [...listeners.keys(), ...liveListeners.keys(), ...chatListeners.keys()]) {
         try {
           post({ kind: 'unsubscribe', id });
         } catch {
@@ -263,6 +320,8 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
         }
       }
       listeners.clear();
+      liveListeners.clear();
+      chatListeners.clear();
 
       // A graceful reconnect is not permission to guess the outcome of old
       // mutations. Stop their timers, request cancellation, and retain both the

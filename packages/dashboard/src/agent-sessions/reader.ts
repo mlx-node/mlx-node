@@ -10,6 +10,7 @@ import { type Dirent, lstatSync, readdirSync, readFileSync, type Stats } from 'n
 import { homedir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 
+import { resolveTitle } from '../chat/titles.js';
 import {
   type ActiveRegistry,
   isPidAlive,
@@ -30,13 +31,24 @@ import {
   parseSummary,
   type SubagentMeta,
 } from './summary.js';
+import {
+  buildTimeline,
+  type ChildEvents,
+  digestUpdates,
+  type LaneSource,
+  type TimelineChildInfo,
+  timelineChildReads,
+  type TimelineInput,
+} from './timeline.js';
 import { type ParsedUpdates, parseUpdates } from './transcript.js';
 import type {
   SessionDetail,
   SessionDetailResponse,
   SessionListQuery,
   SessionListResponse,
+  SessionOrigin,
   SessionRow,
+  SessionTimelineResponse,
   SessionTokens,
   SubagentRef,
 } from './types.js';
@@ -46,6 +58,9 @@ export const MAX_UPDATES_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_LIST_LIMIT = 100;
 export const MAX_LIST_LIMIT = 500;
 const TRANSCRIPT_CACHE_ENTRIES = 4;
+/** Larger subagent event files are not read for a timeline; the lane says so. */
+export const MAX_TIMELINE_CHILD_BYTES = 8 * 1024 * 1024;
+const DIGEST_CACHE_ENTRIES = 32;
 
 export interface SessionRef {
   id: string;
@@ -89,11 +104,23 @@ interface UpdateStats {
   tokens: SessionTokens | null;
   /** `null` when `updates.jsonl` could not be parsed (too large, unreadable). */
   openTurn: boolean | null;
+  /** The first typed prompt (not an interjection), at most {@link FIRST_PROMPT_CHARS} characters. */
+  firstPrompt: string | null;
 }
+
+const FIRST_PROMPT_CHARS = 400;
 
 type UpdatesResult = { ok: true; parsed: ParsedUpdates } | { ok: false; error: string };
 
-const EMPTY_PARSED: ParsedUpdates = { transcript: [], turns: [], turnsWithUsage: 0, openTurn: false };
+const EMPTY_PARSED: ParsedUpdates = {
+  transcript: [],
+  turns: [],
+  turnsWithUsage: 0,
+  openTurn: false,
+  retries: [],
+  lastTs: 0,
+  toolNames: new Map(),
+};
 
 function fresh(entry: Stamp | undefined, st: Stats): boolean {
   return entry !== undefined && entry.mtimeMs === st.mtimeMs && entry.size === st.size;
@@ -155,6 +182,10 @@ export interface AgentSessionsReaderOptions {
   now?: () => number;
   /** Test seam for the registry pid probe. */
   isPidAlive?: (pid: number) => boolean;
+  /** Test seam; defaults to {@link MAX_TIMELINE_CHILD_BYTES}. */
+  maxTimelineChildBytes?: number;
+  /** The origin of every row: `chat` for the Chat agent home. Work rows are tagged by the caller from the Work index. */
+  origin?: Exclude<SessionOrigin, 'work'>;
 }
 
 export class AgentSessionsReader {
@@ -167,7 +198,11 @@ export class AgentSessionsReader {
   private readonly metas = new Map<string, Cached<SubagentMeta | null>>();
   private readonly stats = new Map<string, Cached<UpdateStats>>();
   private readonly transcripts = new Map<string, Cached<ParsedUpdates>>();
+  /** Child event digests for timelines; text-free, so child files never enter `transcripts`. */
+  private readonly digests = new Map<string, Cached<LaneSource>>();
   private readonly ownWrites = new Map<string, number>();
+  private readonly maxTimelineChildBytes: number;
+  private readonly origin: SessionOrigin;
 
   constructor(options: AgentSessionsReaderOptions) {
     this.agentHome = options.agentHome;
@@ -175,6 +210,8 @@ export class AgentSessionsReader {
     this.defaultAgentHome = options.defaultAgentHome;
     this.now = options.now ?? Date.now;
     this.alive = options.isPidAlive ?? isPidAlive;
+    this.maxTimelineChildBytes = options.maxTimelineChildBytes ?? MAX_TIMELINE_CHILD_BYTES;
+    this.origin = options.origin ?? 'agent';
   }
 
   /** Walk `<sessionsRoot>/<encodedCwd>/<id>/summary.json` like grok's `RelocationView`. */
@@ -253,6 +290,7 @@ export class AgentSessionsReader {
     const liveUpdates = new Set([...sessions.values()].map((r) => join(r.dir, 'updates.jsonl')));
     for (const key of this.stats.keys()) if (!liveUpdates.has(key)) this.stats.delete(key);
     for (const key of this.transcripts.keys()) if (!liveUpdates.has(key)) this.transcripts.delete(key);
+    for (const key of this.digests.keys()) if (!liveUpdates.has(key)) this.digests.delete(key);
 
     return { sessions, ambiguous, parentOf, childrenOf, spawnedBy, unreadable };
   }
@@ -267,7 +305,9 @@ export class AgentSessionsReader {
     const filtered = top.filter((r) => {
       if (query.cwd !== undefined && query.cwd !== '' && r.summary.cwd !== query.cwd) return false;
       if (needle === '') return true;
-      return displayTitle(r.summary).toLowerCase().includes(needle) || r.summary.cwd.toLowerCase().includes(needle);
+      const named = displayTitle(r.summary);
+      const shown = named.trim() !== '' ? named : this.title(r);
+      return shown.toLowerCase().includes(needle) || r.summary.cwd.toLowerCase().includes(needle);
     });
     filtered.sort((a, b) => {
       const d = instantKey(lastActive(b.summary)) - instantKey(lastActive(a.summary));
@@ -304,7 +344,7 @@ export class AgentSessionsReader {
       })
       .map((link) => {
         const child = index.sessions.get(link.childId);
-        const childTitle = child === undefined ? '' : displayTitle(child.summary).trim();
+        const childTitle = child === undefined ? '' : this.title(child);
         return {
           id: link.childId,
           title: childTitle !== '' ? childTitle : link.meta.description,
@@ -326,7 +366,7 @@ export class AgentSessionsReader {
       parent:
         row.parentId === null
           ? null
-          : { id: row.parentId, title: parentRef === undefined ? null : displayTitle(parentRef.summary).trim() },
+          : { id: row.parentId, title: parentRef === undefined ? null : this.title(parentRef) },
       subagents,
     };
     const updates = this.updates(ref, true);
@@ -341,8 +381,110 @@ export class AgentSessionsReader {
       transcript,
       turns: updates.ok ? updates.parsed.turns : [],
       ...(updates.ok ? {} : { transcriptError: updates.error }),
-      resumeCommand: resumeCommand(s.cwd, id, this.agentHome, this.defaultAgentHome),
+      resumeCommand: this.origin === 'chat' ? null : resumeCommand(s.cwd, id, this.agentHome, this.defaultAgentHome),
     };
+  }
+
+  /**
+   * One turn of a session as lanes: `null` = unknown or ambiguous session; `'no-turn'` = the
+   * transcript was read and has no such turn. Reads at most `MAX_TIMELINE_LANES` child event files.
+   */
+  timeline(id: string, turn: number): SessionTimelineResponse | 'no-turn' | null {
+    const index = this.scan();
+    const ref = index.sessions.get(id);
+    if (ref === undefined) return null;
+    const now = this.now();
+    const live = this.livenessIn(index, id, readActiveRegistry(this.agentHome, this.alive), now, false).live;
+    const updates = this.updates(ref, true);
+    if (!updates.ok) {
+      return {
+        turn,
+        turns: 0,
+        open: false,
+        live,
+        stopReason: null,
+        asOfMs: now,
+        range: null,
+        lanes: [],
+        spans: [],
+        handoffs: [],
+        notes: { untimedEvents: 0, foldedSubagents: 0, droppedSpans: 0, unplacedRetries: 0 },
+        transcriptError: updates.error,
+      };
+    }
+    const parent = digestUpdates(updates.parsed);
+    const children = new Map<string, TimelineChildInfo>();
+    for (const e of parent.entries) {
+      if (e.kind !== 'subagent' || children.has(e.childId)) continue;
+      const link = index.parentOf.get(e.childId);
+      const meta = link !== undefined && link.parentId === id ? link.meta : null;
+      const child = index.sessions.get(e.childId);
+      children.set(e.childId, {
+        status: meta?.status ?? null,
+        type: meta?.subagentType ?? '',
+        description: meta?.description ?? '',
+        model: meta?.effectiveModelId ?? child?.summary.currentModelId ?? null,
+        exists: child !== undefined,
+        subagents: index.childrenOf.get(e.childId)?.length ?? 0,
+      });
+    }
+    const ownLink = index.parentOf.get(id);
+    const ownType = ownLink === undefined || ownLink.meta.subagentType === '' ? null : ownLink.meta.subagentType;
+    const input: TimelineInput = {
+      turn,
+      parent,
+      live,
+      asOfMs: now,
+      main: {
+        name: ownLink === undefined ? 'Main agent' : (ownType ?? 'Subagent'),
+        type: ownType,
+        model: ref.summary.currentModelId,
+        sessionId: id,
+      },
+      children,
+    };
+    const reads = timelineChildReads(input);
+    if (reads === 'no-turn') return reads;
+    const events = new Map<string, ChildEvents>();
+    for (const childId of reads) {
+      const child = index.sessions.get(childId);
+      events.set(
+        childId,
+        child === undefined ? { ok: false, noSteps: 'missing', fileBytes: null } : this.childEvents(child),
+      );
+    }
+    return buildTimeline(input, events);
+  }
+
+  /** A child's event digest for a timeline lane, cached by stamp; a file over the size cap is not read. */
+  private childEvents(ref: SessionRef): ChildEvents {
+    const path = join(ref.dir, 'updates.jsonl');
+    let st: Stats;
+    try {
+      st = lstatSync(path);
+    } catch (err) {
+      const missing = (err as NodeJS.ErrnoException).code === 'ENOENT';
+      return { ok: false, noSteps: missing ? 'empty' : 'unreadable', fileBytes: null };
+    }
+    if (!st.isFile()) return { ok: false, noSteps: 'unreadable', fileBytes: null };
+    if (st.size > this.maxTimelineChildBytes) return { ok: false, noSteps: 'too-large', fileBytes: st.size };
+    if (st.size === 0) return { ok: false, noSteps: 'empty', fileBytes: null };
+    const hit = this.digests.get(path);
+    if (fresh(hit, st)) {
+      this.digests.delete(path);
+      this.digests.set(path, hit!);
+      return { ok: true, source: hit!.value };
+    }
+    let text: string;
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch {
+      return { ok: false, noSteps: 'unreadable', fileBytes: null };
+    }
+    const source = digestUpdates(parseUpdates(text));
+    this.digests.set(path, { mtimeMs: st.mtimeMs, size: st.size, value: source });
+    while (this.digests.size > DIGEST_CACHE_ENTRIES) this.digests.delete(this.digests.keys().next().value!);
+    return { ok: true, source };
   }
 
   /**
@@ -405,7 +547,7 @@ export class AgentSessionsReader {
   /** Drop every cached parse and own-write mark under a session dir after we changed it. */
   invalidate(dir: string): void {
     const prefix = dir.endsWith(sep) ? dir : dir + sep;
-    for (const cache of [this.summaries, this.metas, this.stats, this.transcripts, this.ownWrites] as Map<
+    for (const cache of [this.summaries, this.metas, this.stats, this.transcripts, this.digests, this.ownWrites] as Map<
       string,
       unknown
     >[]) {
@@ -413,11 +555,18 @@ export class AgentSessionsReader {
     }
   }
 
+  /** The agent's title, else the first prompt's title (`resolveTitle`), else ''. */
+  private title(ref: SessionRef): string {
+    return resolveTitle(displayTitle(ref.summary), this.updateStats(ref).firstPrompt);
+  }
+
   private row(ref: SessionRef, index: SessionIndex, registry: ActiveRegistry, now: number): SessionRow {
     const s = ref.summary;
+    const stats = this.updateStats(ref);
     return {
       id: ref.id,
-      title: displayTitle(s).trim(),
+      origin: this.origin,
+      title: resolveTitle(displayTitle(s), stats.firstPrompt),
       cwd: s.cwd,
       model: s.currentModelId,
       branch: s.headBranch,
@@ -428,7 +577,7 @@ export class AgentSessionsReader {
       kind: s.sessionKind,
       parentId: parentIdOf(ref, index),
       subagentCount: subagentDescendants(index, ref.id).length,
-      tokens: this.updateStats(ref).tokens,
+      tokens: stats.tokens,
     };
   }
 
@@ -458,7 +607,7 @@ export class AgentSessionsReader {
       if (fresh(hit, st)) return hit!.value;
     }
     const result = this.updates(ref, false);
-    return result.ok ? statsOf(result.parsed) : { tokens: null, openTurn: null };
+    return result.ok ? statsOf(result.parsed) : { tokens: null, openTurn: null, firstPrompt: null };
   }
 
   /** Parse `updates.jsonl`, refreshing the stats cache; `keep` also retains the transcript. */
@@ -532,14 +681,16 @@ function statUpdates(path: string): Stats | Error | null {
 }
 
 function statsOf(parsed: ParsedUpdates): UpdateStats {
-  if (parsed.turnsWithUsage === 0) return { tokens: null, openTurn: parsed.openTurn };
+  const prompt = parsed.transcript.find((e) => e.kind === 'user' && e.interjection !== true);
+  const firstPrompt = prompt?.kind === 'user' ? prompt.text.slice(0, FIRST_PROMPT_CHARS) : null;
+  if (parsed.turnsWithUsage === 0) return { tokens: null, openTurn: parsed.openTurn, firstPrompt };
   const tokens: SessionTokens = { input: 0, output: 0, cached: 0 };
   for (const t of parsed.turns) {
     tokens.input += t.inputTokens;
     tokens.output += t.outputTokens;
     tokens.cached += t.cachedTokens;
   }
-  return { tokens, openTurn: parsed.openTurn };
+  return { tokens, openTurn: parsed.openTurn, firstPrompt };
 }
 
 /**

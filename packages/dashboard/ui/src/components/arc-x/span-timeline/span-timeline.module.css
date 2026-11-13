@@ -1,0 +1,348 @@
+.root {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2);
+  color: var(--foreground);
+}
+
+.grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: var(--label-w) minmax(0, 1fr);
+}
+
+.root[data-compact] .grid {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.root[data-compact] .axisLabel {
+  display: none;
+}
+
+.row {
+  display: contents;
+}
+
+.axisLabel {
+  height: 24px;
+}
+
+.axis {
+  position: relative;
+  height: 24px;
+  box-shadow: inset 0 -1px 0 var(--border);
+}
+
+.tick {
+  position: absolute;
+  top: var(--space-1);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+  white-space: nowrap;
+  transform: translateX(-50%);
+}
+
+.tick:first-child {
+  transform: none;
+}
+
+.label {
+  display: flex;
+  min-width: 0;
+  height: var(--row-h);
+  align-items: center;
+  gap: var(--space-2);
+  padding-right: var(--space-3);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--c);
+}
+
+.names {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: var(--space-1-5);
+  line-height: 1.2;
+}
+
+.name {
+  flex: 0 1 auto;
+  overflow: hidden;
+  color: inherit;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sublabel {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plot {
+  position: relative;
+  min-width: 0;
+  height: var(--row-h);
+}
+
+.rule {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--chart-grid);
+}
+
+.spans {
+  position: absolute;
+  inset: 0;
+}
+
+.span {
+  --c: var(--border-strong);
+  position: absolute;
+  top: calc((var(--row-h) - 14px) / 2);
+  height: 14px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-bar);
+  background: transparent;
+  cursor: pointer;
+  transition: opacity var(--duration-fast) var(--ease-standard);
+}
+
+.span[data-kind='queue'] {
+  --c: var(--phase-queue);
+}
+
+.span[data-kind='first'],
+.span[data-kind='prefill'] {
+  --c: var(--phase-prefill);
+}
+
+.span[data-kind='setup'] {
+  --c: var(--phase-setup);
+}
+
+.span[data-kind='decode'] {
+  --c: var(--phase-decode);
+}
+
+.span[data-kind='wait'],
+.span[data-kind='load'] {
+  --c: var(--phase-wait);
+}
+
+.span:focus-visible {
+  outline: var(--focus-outline-width, 2px) solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.fill {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  border-radius: inherit;
+  background: var(--c);
+}
+
+.span[data-kind='queue'] .fill,
+.span[data-kind='wait'] .fill,
+.span[data-kind='first'] .fill {
+  background:
+    repeating-linear-gradient(45deg, color-mix(in oklab, var(--c) 30%, transparent) 0 1px, transparent 1px 5px),
+    color-mix(in oklab, var(--c) 5%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--c) 24%, transparent);
+}
+
+.span[data-estimated] .fill {
+  outline: 1px dashed color-mix(in oklab, var(--foreground) 45%, transparent);
+  outline-offset: -1px;
+}
+
+.span[data-status='error'] .fill {
+  outline: 2px solid var(--danger);
+  outline-offset: 0;
+}
+
+.span[data-status='cancelled'] {
+  opacity: 0.5;
+}
+
+.root[data-selecting] .span:not([aria-pressed='true']) {
+  opacity: var(--dim-opacity);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .span:hover .fill {
+    filter: brightness(1.06);
+  }
+}
+
+.errorGlyph {
+  position: absolute;
+  top: 50%;
+  color: var(--danger);
+  font-size: var(--text-xs);
+  line-height: 1;
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.marker {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: color-mix(in oklab, var(--foreground) 50%, transparent);
+  pointer-events: none;
+}
+
+.marker[data-knob]::before {
+  position: absolute;
+  top: 1px;
+  left: -2.5px;
+  width: 6px;
+  height: 6px;
+  box-sizing: border-box;
+  border-radius: 50%;
+  background: var(--foreground);
+  box-shadow: 0 0 0 2px var(--surface);
+  content: '';
+}
+
+.tip {
+  position: absolute;
+  z-index: 3;
+  bottom: calc(100% - 4px);
+  pointer-events: none;
+}
+
+.more {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.legendItem {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.legendKey {
+  --c: var(--border-strong);
+  width: 14px;
+  height: 8px;
+  border-radius: var(--radius-mark);
+  background: var(--c);
+}
+
+.legendKey[data-kind='queue'] {
+  --c: var(--phase-queue);
+}
+
+.legendKey[data-kind='first'],
+.legendKey[data-kind='prefill'] {
+  --c: var(--phase-prefill);
+}
+
+.legendKey[data-kind='setup'] {
+  --c: var(--phase-setup);
+}
+
+.legendKey[data-kind='decode'] {
+  --c: var(--phase-decode);
+}
+
+.legendKey[data-kind='wait'],
+.legendKey[data-kind='load'] {
+  --c: var(--phase-wait);
+}
+
+.legendKey[data-kind='queue'],
+.legendKey[data-kind='wait'],
+.legendKey[data-kind='first'] {
+  background:
+    repeating-linear-gradient(45deg, color-mix(in oklab, var(--c) 30%, transparent) 0 1px, transparent 1px 4px),
+    color-mix(in oklab, var(--c) 5%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--c) 24%, transparent);
+}
+
+.span[data-arrive] {
+  animation: timeline-draw var(--duration-considered) var(--ease-standard) both;
+}
+
+.root[data-entrance='pending'] .spans {
+  clip-path: inset(0 100% 0 0);
+}
+
+.root[data-entrance='pending'] .marker {
+  opacity: 0;
+}
+
+.root[data-entrance='run'] .spans {
+  animation: timeline-draw var(--duration-considered) var(--ease-standard) calc(var(--step) * var(--stagger-item)) both;
+}
+
+.root[data-entrance='run'] .marker {
+  animation: timeline-pop var(--duration-fast) var(--ease-enter)
+    calc(var(--step) * var(--stagger-item) + var(--duration-considered)) both;
+}
+
+@keyframes timeline-draw {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+
+@keyframes timeline-pop {
+  from {
+    opacity: 0;
+    scale: 1 0.5;
+  }
+  to {
+    opacity: 1;
+    scale: 1 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .span {
+    transition-duration: var(--duration-instant);
+  }
+  .span[data-arrive] {
+    animation: none;
+  }
+  .root[data-entrance='run'] .spans,
+  .root[data-entrance='run'] .marker {
+    animation: none;
+  }
+}

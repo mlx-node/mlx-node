@@ -1,0 +1,26 @@
+.root {
+  box-sizing: border-box;
+  display: inline-grid;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-mark);
+  background: var(--surface-muted);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1;
+}
+
+.root[data-size='20'] {
+  width: 20px;
+  height: 20px;
+  font-size: var(--text-xs);
+}
+
+.globe {
+  width: 10px;
+  height: 10px;
+}

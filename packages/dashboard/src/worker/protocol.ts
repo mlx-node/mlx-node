@@ -23,8 +23,13 @@ export interface DbWorkerBootstrap {
   dbPath: string;
   modelsDir: string;
   tracesDir: string;
+  runtimeDir: string;
   cacheRoot: string | undefined;
   agentHome: string;
+  /** `GROK_HOME` of the Chat agent: its sessions are the Chat conversations. */
+  chatAgentHome: string;
+  /** `conversations.json`, the Work index. Read only here. */
+  chatIndexPath: string;
 }
 
 /**

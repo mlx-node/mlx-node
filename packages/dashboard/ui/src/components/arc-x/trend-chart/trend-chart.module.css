@@ -1,0 +1,187 @@
+.root {
+  min-width: 0;
+}
+
+.under,
+.lines,
+.markers {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.line {
+  fill: none;
+  stroke: var(--c);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
+.series[data-pattern='alt'] .line {
+  stroke-dasharray: 6 4;
+}
+
+.lone {
+  fill: var(--c);
+}
+
+.area {
+  fill: color-mix(in oklab, var(--c) 10%, transparent);
+}
+
+.band {
+  fill: color-mix(in oklab, var(--c) 14%, transparent);
+}
+
+.ghost {
+  fill: none;
+  stroke: var(--text-muted);
+  stroke-dasharray: 4 4;
+  stroke-linecap: round;
+  stroke-width: 1.5;
+  animation: trend-fade var(--duration-considered) var(--ease-standard) both;
+}
+
+.ghostDot {
+  fill: var(--text-muted);
+}
+
+.hollow {
+  fill: var(--surface);
+  stroke: var(--c);
+  stroke-width: 2;
+}
+
+.end,
+.hover {
+  fill: var(--c);
+  stroke: var(--surface);
+  stroke-width: 2;
+}
+
+.end {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.selected {
+  fill: none;
+  stroke: var(--c);
+  stroke-width: 1.5;
+}
+
+.direct {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.directLabel {
+  position: absolute;
+  display: flex;
+  max-width: 62px;
+  align-items: center;
+  gap: var(--space-1);
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transform: translateY(-50%);
+}
+
+.directText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.directLabel::before {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--c);
+  content: '';
+}
+
+.series[data-arrive] {
+  animation: trend-fade var(--duration-fast) var(--ease-standard) both;
+}
+
+[data-entrance='pending'] .lines {
+  clip-path: inset(0 100% 0 0);
+}
+
+[data-entrance='pending'] .area,
+[data-entrance='pending'] .end,
+[data-entrance='pending'] .hollow,
+[data-entrance='pending'] .selected,
+[data-entrance='pending'] .direct {
+  opacity: 0;
+}
+
+[data-entrance='run'] .lines {
+  animation: trend-trace var(--duration-trace) var(--ease-in-out) both;
+}
+
+[data-entrance='run'] .area {
+  animation: trend-fade var(--duration-considered) var(--ease-standard) calc(var(--duration-trace) / 2) both;
+}
+
+[data-entrance='run'] .end {
+  animation:
+    trend-fade var(--duration-fast) var(--ease-enter) var(--duration-trace) both,
+    trend-pop var(--duration-spring) var(--ease-spring) var(--duration-trace) both;
+}
+
+[data-entrance='run'] .hollow,
+[data-entrance='run'] .selected,
+[data-entrance='run'] .direct {
+  animation: trend-fade var(--duration-fast) var(--ease-enter) var(--duration-trace) both;
+}
+
+@keyframes trend-trace {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    clip-path: inset(0 -1% 0 0);
+  }
+}
+
+@keyframes trend-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes trend-pop {
+  from {
+    transform: scale(0.5);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ghost,
+  .series[data-arrive] {
+    animation: none;
+  }
+  [data-entrance='run'] .lines,
+  [data-entrance='run'] .area,
+  [data-entrance='run'] .end,
+  [data-entrance='run'] .hollow,
+  [data-entrance='run'] .selected,
+  [data-entrance='run'] .direct {
+    animation: none;
+  }
+}

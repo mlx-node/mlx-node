@@ -1,0 +1,115 @@
+.root {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.label {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.writing {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.time {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.body {
+  min-width: 0;
+  max-width: 72ch;
+  font-size: var(--text-sm);
+  line-height: var(--leading-prose);
+  overflow-wrap: anywhere;
+}
+
+.root[data-role='user'] > .body {
+  justify-self: start;
+  border-radius: var(--radius-panel);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-muted);
+}
+
+.root[data-variant='chat'] {
+  gap: var(--space-1);
+}
+
+.root[data-variant='chat'] > .body {
+  max-width: none;
+}
+
+.root[data-variant='chat'][data-role='user'] {
+  justify-items: end;
+}
+
+.root[data-variant='chat'][data-role='user'] > .body {
+  justify-self: end;
+  max-width: var(--chat-bubble-max);
+  color: var(--foreground);
+  white-space: pre-wrap;
+}
+
+.root[data-variant='chat'][data-role='user'] > .body > * {
+  color: inherit;
+}
+
+.root[data-enter] {
+  animation: message-reveal var(--duration-standard) var(--ease-enter) both;
+}
+
+@keyframes message-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.footer {
+  display: flex;
+  min-height: var(--control-height-sm);
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-1);
+  opacity: 0;
+  transition: opacity var(--duration-fast) var(--ease-standard);
+}
+
+.root:hover > .footer,
+.root:focus-within > .footer {
+  opacity: 1;
+}
+
+@media (forced-colors: active) {
+  .root[data-role='user'] > .body {
+    border: 1px solid CanvasText;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .footer {
+    transition: none;
+  }
+
+  .root[data-enter] {
+    animation: none;
+  }
+}

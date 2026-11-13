@@ -15,3 +15,13 @@ export function metricsTraceDir(): string {
 export function dashboardDbPath(): string {
   return join(mlxNodeHome(), 'dashboard.db');
 }
+
+/** Directory holding the inference runtime series `<date>-<pid>.jsonl` and the `live-<pid>.json` heartbeats. */
+export function metricsRuntimeDir(): string {
+  return join(mlxNodeHome(), 'metrics', 'runtime');
+}
+
+/** The desktop supervisor state file written by the Electron main process. */
+export function desktopSupervisorStatePath(): string {
+  return join(mlxNodeHome(), 'desktop', 'supervisor.json');
+}

@@ -1,0 +1,230 @@
+.block {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+  animation: sources-reveal var(--duration-standard) var(--ease-enter) both;
+}
+
+.head {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.label {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 500;
+}
+
+.chip {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 14rem;
+  color: var(--foreground);
+  text-decoration: none;
+}
+
+.chipInner {
+  box-sizing: border-box;
+  display: inline-flex;
+  height: 24px;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-chip);
+  padding: 0 var(--space-1-5) 0 var(--space-1);
+  background: var(--surface-muted);
+  animation: sources-reveal var(--duration-standard) var(--ease-enter) both;
+  animation-delay: calc(var(--stagger-item) * var(--step, 0));
+  transition: border-color var(--duration-fast) var(--ease-standard);
+}
+
+.chip:hover .chipInner {
+  border-color: var(--border-strong);
+}
+
+.chipHost {
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.more {
+  box-sizing: border-box;
+  display: inline-flex;
+  height: 24px;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-chip);
+  padding: 0 var(--space-1-5);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+
+.more:hover {
+  background: var(--row-hover);
+}
+
+.moreChevron {
+  transition: transform var(--duration-fast) var(--ease-standard);
+}
+
+.block[data-state='open'] .moreChevron {
+  transform: rotate(180deg);
+}
+
+.openClip {
+  overflow: clip;
+}
+
+.list {
+  display: grid;
+  min-width: 0;
+}
+
+.rows {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.row {
+  display: grid;
+  min-width: 0;
+  min-height: var(--row-height);
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.rowTitle {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+a.rowTitle {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.rowFacts {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.also {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-1) 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 500;
+}
+
+.rule {
+  width: var(--space-4);
+  height: 1px;
+  background: var(--border);
+}
+
+.cite {
+  --focus-outline-offset: 1px;
+  box-sizing: border-box;
+  display: inline-flex;
+  min-width: 16px;
+  height: 16px;
+  justify-content: center;
+  align-items: center;
+  margin: 0 1px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-chip);
+  padding: 0 3px;
+  background: var(--surface-muted);
+  background-clip: padding-box;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  vertical-align: 1px;
+  cursor: pointer;
+  position: relative;
+}
+
+.cite::before {
+  position: absolute;
+  inset: -4px -2px;
+  content: '';
+}
+
+.cite:hover {
+  border-color: var(--border-strong);
+  color: var(--foreground);
+}
+
+.citePanel.citePanel {
+  display: grid;
+  max-width: 18rem;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-2-5);
+  pointer-events: none;
+}
+
+.citeTitle {
+  color: var(--foreground);
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+.citeHost {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1-5);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+@keyframes sources-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .block,
+  .chipInner {
+    animation: none;
+  }
+
+  .chipInner,
+  .more,
+  .moreChevron {
+    transition: none;
+  }
+}

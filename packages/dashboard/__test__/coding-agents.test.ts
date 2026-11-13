@@ -163,6 +163,15 @@ describe('managed instruction block', () => {
     expect((await row()).status).toBe('not-installed');
   });
 
+  it('the state carries the managed block when a command exists', async () => {
+    const { service, block } = await setup();
+    expect((await service.state()).block).toBe(block);
+    const none = await setup([]);
+    const state = await none.service.state();
+    expect(state.command).toBeNull();
+    expect(state.block).toBeNull();
+  });
+
   it('reports the exact block as installed', async () => {
     const { write, row, block } = await setup();
     await write(`Before.\n${block}\nAfter.\n`);

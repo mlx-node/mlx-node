@@ -10,5 +10,5 @@ import { defineConfig } from 'vite-plus';
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   resolve: { alias: { '@': resolve(import.meta.dirname, 'src') } },
-  build: { outDir: '../web', emptyOutDir: true },
+  build: { outDir: '../web', emptyOutDir: true, target: 'chrome140', cssTarget: 'chrome140' },
 });

@@ -1,0 +1,84 @@
+{
+  "persist": true,
+  "initialize": {
+    "protocolVersion": 1,
+    "loadSession": true,
+    "pluginDirs": true,
+    "agentVersion": "1.0.45",
+    "models": [
+      {
+        "modelId": "qwen3.5-4b",
+        "totalContextTokens": 32768
+      },
+      {
+        "modelId": "qwen3.5-9b",
+        "totalContextTokens": 65536
+      }
+    ]
+  },
+  "session": {
+    "agentName": "mlx-chat",
+    "toolDefinitionsCount": 2,
+    "skills": 1,
+    "mcpServers": 1,
+    "apiBackend": "Messages",
+    "mcpReadyAfterMs": 70,
+    "modelChangedOnNewAndLoad": true,
+    "replayOnLoad": true
+  },
+  "prompts": [
+    {
+      "match": "",
+      "steps": [
+        {
+          "webCall": {
+            "shape": "direct",
+            "id": "toolu_d1",
+            "tool_name": "mlx_web__web_search",
+            "tool_input": {
+              "query": "mlx-node"
+            }
+          },
+          "onAllow": {
+            "fail": "Transport closed"
+          }
+        },
+        {
+          "serverStatus": {
+            "status": "unavailable",
+            "reason": "transport_closed"
+          }
+        },
+        {
+          "webCall": {
+            "shape": "direct",
+            "id": "toolu_d2",
+            "tool_name": "mlx_web__web_search",
+            "tool_input": {
+              "query": "mlx-node"
+            }
+          },
+          "onAllow": {
+            "fail": "MCP server 'mlx_web' not found"
+          }
+        },
+        {
+          "text": "I could not reach the web search.",
+          "chunk": 8
+        },
+        {
+          "turnCompleted": {
+            "inputTokens": 400,
+            "outputTokens": 30
+          }
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    }
+  ],
+  "faults": {}
+}

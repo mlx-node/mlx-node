@@ -32,13 +32,17 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import type { ApiContext } from '../src/api/context.js';
 import { dispatch, isApiPath } from '../src/api/dispatch.js';
+import { quantilesOf } from '../src/api/quantiles.js';
 import { CodingAgentsService } from '../src/coding-agents.js';
+import { openDashboardDb } from '../src/db/open.js';
 import { DownloadsClosedError } from '../src/download.js';
-import { TRACE_RETENTION_DAYS } from '../src/ingest/traces.js';
+import { ingestTraces, TRACE_RETENTION_DAYS } from '../src/ingest/traces.js';
 import { createRpcClient } from '../src/rpc/client.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
 import { createDashboardRuntime, type DashboardRuntime } from '../src/runtime.js';
+import { turnPhases } from '../ui/src/lib/metrics-view.js';
+import type { MetricsTotals, TurnRow } from '../ui/src/lib/types.js';
 import { createTestClient, type TestClient } from './helpers/api-client.js';
 
 const FIXTURE_TRACES = fileURLToPath(new URL('./fixtures/traces', import.meta.url));
@@ -61,6 +65,12 @@ function ggufHeader(architecture: string): Buffer {
   return Buffer.concat([header, string('general.architecture'), stringType, string(architecture)]);
 }
 
+/** Start of the local calendar day holding `ms`. */
+function localDayStart(ms: number): number {
+  const d = new Date(ms);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
 /** 64-char lowercase-hex cold-cache block filename. */
 function hexBlock(index: number): string {
   return `${index.toString(16).padStart(64, '0')}.safetensors`;
@@ -79,6 +89,13 @@ async function ingest(): Promise<void> {
   expect(res.status).toBe(200);
 }
 
+/** GET a route that must answer 200, as its JSON body. */
+async function get<T>(path: string): Promise<T> {
+  const res = await api.fetch(path);
+  expect(res.status).toBe(200);
+  return (await res.json()) as T;
+}
+
 beforeEach(() => {
   base = mkdtempSync(join(tmpdir(), 'dash-api-'));
   tracesDir = join(base, 'traces');
@@ -95,6 +112,7 @@ beforeEach(() => {
   writeFileSync(join(cacheRoot, hexBlock(2)), Buffer.alloc(200));
 
   runtime = createDashboardRuntime({
+    chat: { tempRoots: [] },
     dbPath: ':memory:',
     tracesDir,
     modelsDir,
@@ -245,12 +263,12 @@ describe('dashboard api — models & catalog', () => {
 
     const unknown = await api.fetch('/api/models/ghost-model', { method: 'DELETE' });
     expect(unknown.status).toBe(404);
-    expect(((await unknown.json()) as { error: string }).error).toMatch(/not found/i);
+    expect(((await unknown.json()) as { error: string }).error).toContain('not found');
 
     // Present on disk but not a checkpoint → a refusal, not a 404.
     const refused = await api.fetch('/api/models/not-a-checkpoint', { method: 'DELETE' });
     expect(refused.status).toBe(400);
-    expect(((await refused.json()) as { error: string }).error).toMatch(/not a model checkpoint/i);
+    expect(((await refused.json()) as { error: string }).error).toContain('not a model checkpoint');
     expect(existsSync(join(modelsDir, 'not-a-checkpoint'))).toBe(true);
   });
 
@@ -284,116 +302,768 @@ describe('dashboard api — ingest fault isolation', () => {
       expect(body.traces.warnings.some((w) => w.includes('scan skipped'))).toBe(true);
 
       // An unreadable root is unknown, not empty: the indexed traces survive it.
-      const overview = (await (await api.fetch('/api/metrics/overview')).json()) as {
-        totals: { traces: number };
+      const summary = (await (await api.fetch('/api/metrics/summary')).json()) as {
+        totals: { turns: number };
       };
-      expect(overview.totals.traces).toBe(3);
+      expect(summary.totals.turns).toBe(3);
     } finally {
       chmodSync(tracesDir, 0o755); // restore so afterEach cleanup can remove it
     }
   });
 });
 
-describe('dashboard api — metrics overview', () => {
-  it('returns aggregate arrays', async () => {
-    await ingest();
-    const res = await api.fetch('/api/metrics/overview');
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      tokensByDay: unknown[];
-      throughputByModel: unknown[];
-      modelShare: unknown[];
-      totals: { turns: number; outputTokens: number };
+describe('dashboard api — metrics', () => {
+  /** One v2 trace line with the fields every record carries. */
+  function turn(rec: Record<string, unknown>): Record<string, unknown> {
+    return {
+      v: 2,
+      ts: Date.UTC(2026, 6, 10, 12),
+      pid: 1,
+      model: 'm',
+      outcome: 'ok',
+      endpoint: 'messages',
+      stream: true,
+      dispatch: 'start',
+      finishReason: 'stop',
+      durationMs: 100,
+      toolCount: 0,
+      imageCount: 0,
+      concurrency: 1,
+      concurrencyPeak: 1,
+      ...rec,
     };
-    expect(Array.isArray(body.tokensByDay)).toBe(true);
-    expect(body.tokensByDay.length).toBeGreaterThan(0);
-    expect(Array.isArray(body.throughputByModel)).toBe(true);
-    expect(Array.isArray(body.modelShare)).toBe(true);
-    expect(body.totals.turns).toBeGreaterThan(0);
-    expect(body.totals.outputTokens).toBeGreaterThan(0);
+  }
+
+  function writeTurns(name: string, records: Array<Record<string, unknown>>): void {
+    writeFileSync(join(tracesDir, name), records.map((r) => `${JSON.stringify(turn(r))}\n`).join(''));
+  }
+
+  interface Q {
+    n: number;
+    p05: number | null;
+    p50: number | null;
+    p95: number | null;
+  }
+
+  beforeEach(() => {
+    for (const n of readdirSync(tracesDir)) if (n.endsWith('.jsonl')) unlinkSync(join(tracesDir, n));
   });
 
-  // Finding 9-query: the overview must expose a day-bucketed throughput/TTFT trend
-  // per model — one row per (model, day) with that day's averages — not just the
-  // single range-wide average per model in `throughputByModel`.
-  it('returns a per-model, per-day throughput trend, not one range-wide average', async () => {
-    const day1 = Date.parse('2026-07-01T12:00:00.000Z');
-    const day2 = Date.parse('2026-07-02T12:00:00.000Z');
-    writeFileSync(
-      join(tracesDir, '2026-07-02-trend.jsonl'),
-      `${JSON.stringify({ v: 1, traceId: 'trend-d1', ts: day1, model: 'trend-model', decodeTps: 100, prefillTps: 500, ttftMs: 20 })}\n${JSON.stringify({ v: 1, traceId: 'trend-d2', ts: day2, model: 'trend-model', decodeTps: 200, prefillTps: 700, ttftMs: 40 })}\n`,
-    );
+  it('summary: nearest-rank p05/p50/p95 for n = 1, 2, 3, 20, 21', async () => {
+    const sizes = [1, 2, 3, 20, 21];
+    const records: Array<Record<string, unknown>> = [];
+    for (const n of sizes) {
+      // Written in descending order so a missing sort shows up.
+      for (let v = n; v >= 1; v--) records.push({ traceId: `q${n}-${v}`, model: `n${n}`, ttftMs: v });
+    }
+    writeTurns('2026-07-10-1.jsonl', records);
     await ingest();
-
-    const body = (await (await api.fetch('/api/metrics/overview')).json()) as {
-      throughputTrend: Array<{
-        model: string;
-        day: string;
-        decodeTps: number;
-        prefillTps: number;
-        ttftMs: number;
-        samples: number;
-      }>;
+    const expected: Record<number, [number, number, number]> = {
+      1: [1, 1, 1],
+      2: [1, 1, 2],
+      3: [1, 2, 3],
+      20: [1, 10, 19],
+      21: [2, 11, 20],
     };
-    const rows = body.throughputTrend.filter((r) => r.model === 'trend-model');
-    // One row per day (not a single averaged 150), ordered by day.
-    expect(rows).toHaveLength(2);
-    expect(rows[0].day).toBe('2026-07-01');
-    expect(rows[1].day).toBe('2026-07-02');
-    const d1 = rows.find((r) => r.day === '2026-07-01');
-    const d2 = rows.find((r) => r.day === '2026-07-02');
-    expect(d1?.decodeTps).toBe(100);
-    expect(d1?.prefillTps).toBe(500);
-    expect(d1?.ttftMs).toBe(20);
-    expect(d1?.samples).toBe(1);
-    expect(d2?.decodeTps).toBe(200);
-    expect(d2?.samples).toBe(1);
+    for (const n of sizes) {
+      const body = await get<{ latency: { ttftMs: Q } }>(`/api/metrics/summary?model=n${n}`);
+      const [p05, p50, p95] = expected[n];
+      expect(body.latency.ttftMs).toEqual({ n, p05, p50, p95 });
+    }
   });
 
-  // Finding F4: the trace perf columns (ttft_ms/prefill_tps/decode_tps) are
-  // nullable and legitimately null for a valid trace recorded without timing.
-  // A bucket whose traces carry no perf → AVG over an all-NULL group is NULL and
-  // MUST surface as `null`, not a fabricated `0` (which would plot a fake
-  // `0 tok/s` point and defeat the UI's `Number.isFinite` empty-state guard). A
-  // sibling bucket that DOES carry perf must be unchanged (finite values).
-  it('reports null (not 0) throughput for a bucket whose traces carry no perf', async () => {
-    const day = Date.parse('2026-07-02T12:00:00.000Z');
-    writeFileSync(
-      join(tracesDir, '2026-07-02-nullperf.jsonl'),
-      `${JSON.stringify({ v: 1, traceId: 'np-perf', ts: day, model: 'perf-model', decodeTps: 150, prefillTps: 600, ttftMs: 30 })}\n${JSON.stringify({ v: 1, traceId: 'np-null', ts: day, model: 'nullperf-model' })}\n`,
-    );
+  it('summary: quantiles equal the reference window-function SQL', async () => {
+    const values: Record<string, number[]> = {
+      a: [5, 3, 9, 1, 7, 2, 8, 4, 6, 10, 11, 12, 13],
+      b: [100, 50],
+      c: [42],
+    };
+    const records: Array<Record<string, unknown>> = [];
+    for (const [model, list] of Object.entries(values)) {
+      list.forEach((v, i) => records.push({ traceId: `ref-${model}-${i}`, model, ttftMs: v }));
+    }
+    writeTurns('2026-07-10-2.jsonl', records);
     await ingest();
 
-    const body = (await (await api.fetch('/api/metrics/overview')).json()) as {
-      throughputTrend: Array<{
-        model: string;
-        day: string;
-        decodeTps: number | null;
+    const ref = openDashboardDb(':memory:');
+    try {
+      await ingestTraces(ref, tracesDir);
+      const rows = ref.sqlite
+        .prepare(
+          `WITH base AS (
+             SELECT model_key AS g, ttft_ms AS v FROM traces WHERE outcome = 'ok' AND ttft_ms IS NOT NULL
+           ),
+           ranked AS (
+             SELECT g, v, ROW_NUMBER() OVER (PARTITION BY g ORDER BY v) AS rn, COUNT(*) OVER (PARTITION BY g) AS n
+             FROM base
+           )
+           SELECT g, n,
+                  MAX(CASE WHEN rn = (n *  5 + 99) / 100 THEN v END) AS p05,
+                  MAX(CASE WHEN rn = (n * 50 + 99) / 100 THEN v END) AS p50,
+                  MAX(CASE WHEN rn = (n * 95 + 99) / 100 THEN v END) AS p95
+           FROM ranked GROUP BY g ORDER BY g`,
+        )
+        .all() as Array<{ g: string; n: number; p05: number; p50: number; p95: number }>;
+      expect(rows).toHaveLength(3);
+      for (const row of rows) {
+        expect(quantilesOf(values[row.g])).toEqual({ n: row.n, p05: row.p05, p50: row.p50, p95: row.p95 });
+        const body = await get<{ latency: { ttftMs: Q } }>(`/api/metrics/summary?model=${row.g}`);
+        expect(body.latency.ttftMs).toEqual({ n: row.n, p05: row.p05, p50: row.p50, p95: row.p95 });
+      }
+    } finally {
+      ref.close();
+    }
+  });
+
+  it('summary: percentiles ignore non-ok turns, counts include them', async () => {
+    writeTurns('2026-07-10-3.jsonl', [
+      { traceId: 'ok-1', ttftMs: 10, outputTokens: 5 },
+      { traceId: 'ok-2', ttftMs: 20, outputTokens: 5 },
+      {
+        traceId: 'err-1',
+        outcome: 'error',
+        errorKind: 'exception',
+        ttftMs: 9000,
+        outputTokens: 3,
+        finishReason: 'error',
+      },
+      {
+        traceId: 'can-1',
+        outcome: 'cancelled',
+        failPhase: 'decode',
+        ttftMs: 9000,
+        outputTokens: 2,
+        finishReason: 'cancelled',
+      },
+    ]);
+    await ingest();
+    const body = await get<{
+      totals: { turns: number; ok: number; error: number; cancelled: number; outputTokens: number };
+      latency: { ttftMs: Q };
+      failures: Array<{ outcome: string; errorKind: string | null; failPhase: string | null; turns: number }>;
+      finishReasons: Array<{ reason: string; turns: number }>;
+    }>('/api/metrics/summary');
+    expect(body.totals).toMatchObject({ turns: 4, ok: 2, error: 1, cancelled: 1, outputTokens: 15 });
+    expect(body.latency.ttftMs).toEqual({ n: 2, p05: 10, p50: 10, p95: 20 });
+    expect(body.failures).toEqual(
+      expect.arrayContaining([
+        { outcome: 'error', errorKind: 'exception', failPhase: null, turns: 1 },
+        { outcome: 'cancelled', errorKind: null, failPhase: 'decode', turns: 1 },
+      ]),
+    );
+    expect(body.finishReasons[0]).toEqual({ reason: 'stop', turns: 2 });
+  });
+
+  it('summary: previous window is null without both bounds', async () => {
+    const t = Date.UTC(2026, 6, 10, 12);
+    writeTurns('2026-07-10-4.jsonl', [
+      { traceId: 'prev', ts: t - 1500, ttftMs: 1 },
+      { traceId: 'cur', ts: t - 500, ttftMs: 2 },
+    ]);
+    await ingest();
+    expect((await get<{ previous: unknown }>(`/api/metrics/summary?from=${t - 1000}`)).previous).toBeNull();
+    expect((await get<{ previous: unknown }>(`/api/metrics/summary?to=${t}`)).previous).toBeNull();
+    const both = await get<{ totals: { turns: number }; previous: { totals: { turns: number } } }>(
+      `/api/metrics/summary?from=${t - 1000}&to=${t}`,
+    );
+    expect(both.totals.turns).toBe(1);
+    expect(both.previous.totals.turns).toBe(1);
+    expect((await api.fetch(`/api/metrics/summary?from=${t}&to=${t - 1}`)).status).toBe(400);
+  });
+
+  it('summary: a one-token turn with decode_tps 0 is in neither the decode quantiles nor the histogram', async () => {
+    writeFileSync(
+      join(tracesDir, '2026-07-10-5.jsonl'),
+      [
+        { v: 1, traceId: 'title', ts: Date.UTC(2026, 6, 10), model: 'm', outputTokens: 1, decodeTps: 0 },
+        { v: 1, traceId: 'real', ts: Date.UTC(2026, 6, 10), model: 'm', outputTokens: 50, decodeTps: 42 },
+      ]
+        .map((r) => `${JSON.stringify(r)}\n`)
+        .join(''),
+    );
+    await ingest();
+    const summary = await get<{ latency: { decodeTps: Q } }>('/api/metrics/summary');
+    expect(summary.latency.decodeTps).toEqual({ n: 1, p05: 42, p50: 42, p95: 42 });
+    const dist = await get<{ series: Array<{ decodeTps: { n: number; counts: number[] } }> }>(
+      '/api/metrics/distributions',
+    );
+    expect(dist.series[0].decodeTps.n).toBe(1);
+    expect(dist.series[0].decodeTps.counts[0]).toBe(0);
+  });
+
+  it('prefill speed reads rated rows only and the first-token time splits into setup and prefill', async () => {
+    const at = Date.UTC(2026, 6, 10, 12);
+    writeTurns('2026-07-10-7.jsonl', [
+      { traceId: 'A', ts: at, ttftMs: 500, prefillTps: 900, promptTokens: 2000, durationMs: 5000 },
+      { traceId: 'B', ts: at + 1, ttftMs: 1200, prefillMs: 1000, prefillTokens: 2000, durationMs: 5000 },
+      { traceId: 'C', ts: at + 2, ttftMs: 400, prefillMs: 50, prefillTokens: 100, durationMs: 5000 },
+      { traceId: 'D', ts: at + 3, ttftMs: 300, stream: false, durationMs: 5000 },
+      { traceId: 'E', ts: at + 4, ttftMs: 700, prefillMs: 800, prefillTokens: 1000, durationMs: 5000 },
+    ]);
+    await ingest();
+    const summary = await get<{
+      totals: { prefillMeasured: number; firstTokenWallMs: number; setupWallMs: number; prefillWallMs: number };
+      latency: { prefillTps: Q; setupMs: Q };
+    }>('/api/metrics/summary');
+    expect(summary.latency.prefillTps).toEqual({ n: 2, p05: 1250, p50: 1250, p95: 2000 });
+    expect(summary.totals).toMatchObject({
+      prefillMeasured: 3,
+      firstTokenWallMs: 800,
+      setupWallMs: 550,
+      prefillWallMs: 1750,
+    });
+    expect(summary.latency.setupMs).toEqual({ n: 3, p05: 0, p50: 200, p95: 350 });
+
+    const turns = await get<{
+      rows: Array<{
+        traceId: string;
+        prefillMs: number | null;
+        prefillTokens: number | null;
+        setupMs: number | null;
         prefillTps: number | null;
-        ttftMs: number | null;
-        samples: number;
       }>;
+    }>('/api/metrics/turns');
+    const byId = new Map(turns.rows.map((r) => [r.traceId, r]));
+    for (const id of ['A', 'D']) {
+      expect(byId.get(id)).toMatchObject({ prefillMs: null, prefillTokens: null, setupMs: null, prefillTps: null });
+    }
+    expect(byId.get('B')).toMatchObject({ prefillMs: 1000, prefillTokens: 2000, setupMs: 200, prefillTps: 2000 });
+    expect(byId.get('C')).toMatchObject({ prefillMs: 50, prefillTokens: 100, setupMs: 350, prefillTps: null });
+
+    const dist = await get<{ series: Array<{ prefillTps: { n: number } }> }>('/api/metrics/distributions');
+    expect(dist.series[0].prefillTps.n).toBe(2);
+    const series = await get<{ points: Array<{ prefillTps: Q }> }>(
+      `/api/metrics/timeseries?bucket=hour&from=${at - 3_600_000}&to=${at + 3_600_000}`,
+    );
+    expect(series.points).toHaveLength(1);
+    expect(series.points[0].prefillTps.n).toBe(2);
+  });
+
+  it('summed phases stay within the wall time when the times of a row disagree', async () => {
+    const at = Date.UTC(2026, 6, 10, 12);
+    writeTurns('2026-07-10-8.jsonl', [
+      {
+        traceId: 'over',
+        ts: at,
+        durationMs: 100,
+        ttftMs: 200,
+        prefillMs: 150,
+        prefillTokens: 1000,
+        outputTokens: 11,
+        decodeTps: 100,
+      },
+      { traceId: 'decode', ts: at + 1, durationMs: 1000, ttftMs: 400, outputTokens: 101, decodeTps: 100 },
+      { traceId: 'unsplit', ts: at + 2, durationMs: 100, ttftMs: 900 },
+      {
+        traceId: 'admission',
+        ts: at + 3,
+        durationMs: 100,
+        preDispatchMs: 10,
+        queueMs: 500,
+        loadWaitMs: 500,
+        resolveMs: 500,
+      },
+      {
+        traceId: 'sane',
+        ts: at + 4,
+        durationMs: 2000,
+        preDispatchMs: 50,
+        queueMs: 20,
+        ttftMs: 600,
+        prefillMs: 500,
+        prefillTokens: 1000,
+        outputTokens: 101,
+        decodeTps: 100,
+      },
+    ]);
+    await ingest();
+    const phaseSum = (t: MetricsTotals): number =>
+      t.queueWallMs +
+      t.loadWaitWallMs +
+      t.resolveWallMs +
+      t.firstTokenWallMs +
+      t.setupWallMs +
+      t.prefillWallMs +
+      t.decodeWallMs +
+      t.otherWallMs;
+    const summary = await get<{ totals: MetricsTotals }>('/api/metrics/summary');
+    const series = await get<{ points: Array<{ totals: MetricsTotals }> }>('/api/metrics/timeseries?bucket=day');
+    expect(series.points).toHaveLength(1);
+    for (const totals of [summary.totals, series.points[0]!.totals]) {
+      expect(phaseSum(totals)).toBeCloseTo(totals.totalWallMs, 6);
+      for (const value of Object.values(totals)) expect(value).toBeGreaterThanOrEqual(0);
+    }
+
+    const turns = await get<{ rows: TurnRow[] }>('/api/metrics/turns');
+    expect(turns.rows).toHaveLength(5);
+    const rowSum = (pick: (p: ReturnType<typeof turnPhases>) => number): number =>
+      turns.rows.reduce((sum, row) => sum + pick(turnPhases(row)), 0);
+    expect(summary.totals).toMatchObject({
+      queueWallMs: rowSum((p) => p.queueMs),
+      loadWaitWallMs: rowSum((p) => p.loadWaitMs),
+      resolveWallMs: rowSum((p) => p.resolveMs),
+      firstTokenWallMs: rowSum((p) => p.firstTokenMs),
+      setupWallMs: rowSum((p) => p.setupMs),
+      prefillWallMs: rowSum((p) => p.prefillMs),
+      totalWallMs: rowSum((p) => p.totalMs),
+      otherWallMs: rowSum((p) => p.handlingMs + p.tailMs),
+    });
+    expect(summary.totals.decodeWallMs).toBeCloseTo(
+      rowSum((p) => p.decodeMs),
+      6,
+    );
+
+    writeTurns('2026-07-10-8.jsonl', [
+      {
+        traceId: 'over',
+        ts: at,
+        durationMs: 100,
+        ttftMs: 200,
+        prefillMs: 150,
+        prefillTokens: 1000,
+        outputTokens: 11,
+        decodeTps: 100,
+      },
+    ]);
+    await ingest();
+    const one = await get<{ totals: MetricsTotals }>('/api/metrics/summary');
+    expect(one.totals).toMatchObject({
+      setupWallMs: 0,
+      prefillWallMs: 100,
+      decodeWallMs: 0,
+      otherWallMs: 0,
+      totalWallMs: 100,
+    });
+  });
+
+  it('timeseries: hour and day buckets follow local time', async () => {
+    const savedTz = process.env.TZ;
+    process.env.TZ = 'Asia/Kolkata';
+    try {
+      // 10:10 UTC is 15:40 in UTC+05:30.
+      const at = Date.UTC(2026, 6, 10, 10, 10);
+      writeTurns('2026-07-10-6.jsonl', [{ traceId: 'tz', ts: at }]);
+      await ingest();
+      const hour = await get<{ points: Array<{ t: number }> }>(
+        `/api/metrics/timeseries?bucket=hour&from=${at - 3_600_000}&to=${at}`,
+      );
+      expect(hour.points.map((p) => p.t)).toEqual([Date.UTC(2026, 6, 10, 9, 30)]);
+      const day = await get<{ points: Array<{ t: number }> }>('/api/metrics/timeseries?bucket=day');
+      expect(day.points.map((p) => p.t)).toEqual([Date.UTC(2026, 6, 9, 18, 30)]);
+    } finally {
+      if (savedTz === undefined) delete process.env.TZ;
+      else process.env.TZ = savedTz;
+    }
+  });
+
+  it('timeseries: groupBy none merges models', async () => {
+    const at = Date.UTC(2026, 6, 10, 12);
+    writeTurns('2026-07-10-7.jsonl', [
+      { traceId: 'g1', model: 'x', ts: at, outputTokens: 10, ttftMs: 1 },
+      { traceId: 'g2', model: 'y', ts: at + 1, outputTokens: 20, ttftMs: 3 },
+    ]);
+    await ingest();
+    const byModel = await get<{ points: Array<{ model: string }> }>('/api/metrics/timeseries?bucket=day');
+    expect(byModel.points.map((p) => p.model)).toEqual(['x', 'y']);
+    const merged = await get<{
+      groupBy: string;
+      points: Array<{ model: string; totals: { turns: number; outputTokens: number }; ttftMs: Q }>;
+    }>('/api/metrics/timeseries?bucket=day&groupBy=none');
+    expect(merged.groupBy).toBe('none');
+    expect(merged.points).toHaveLength(1);
+    expect(merged.points[0].model).toBe('*');
+    expect(merged.points[0].totals).toMatchObject({ turns: 2, outputTokens: 30 });
+    expect(merged.points[0].ttftMs).toEqual({ n: 2, p05: 1, p50: 1, p95: 3 });
+    expect((await api.fetch('/api/metrics/timeseries')).status).toBe(400);
+    expect((await api.fetch('/api/metrics/timeseries?bucket=5m')).status).toBe(400);
+    expect((await api.fetch('/api/metrics/timeseries?bucket=5m&from=0&to=1000000000')).status).toBe(400);
+    expect((await api.fetch('/api/metrics/timeseries?bucket=day&groupBy=family')).status).toBe(400);
+  });
+
+  it('null perf stays null', async () => {
+    writeFileSync(
+      join(tracesDir, '2026-07-10-8.jsonl'),
+      `${JSON.stringify({ v: 1, traceId: 'np-null', ts: Date.UTC(2026, 6, 10), model: 'nullperf-model' })}\n`,
+    );
+    await ingest();
+    const body = await get<{
+      points: Array<{ totals: { turns: number }; ttftMs: Q; decodeTps: Q; mtpMeanAccepted: number | null }>;
+    }>('/api/metrics/timeseries?bucket=day');
+    expect(body.points).toHaveLength(1);
+    expect(body.points[0].totals.turns).toBe(1);
+    expect(body.points[0].ttftMs).toEqual({ n: 0, p05: null, p50: null, p95: null });
+    expect(body.points[0].decodeTps).toEqual({ n: 0, p05: null, p50: null, p95: null });
+    expect(body.points[0].mtpMeanAccepted).toBeNull();
+  });
+
+  it('distributions: counts land in the documented bins and the last bin is open-ended', async () => {
+    writeTurns('2026-07-10-9.jsonl', [
+      { traceId: 'd1', ttftMs: 0 },
+      { traceId: 'd2', ttftMs: 99.9 },
+      { traceId: 'd3', ttftMs: 100 },
+      { traceId: 'd4', ttftMs: 60000 },
+      { traceId: 'd5', ttftMs: 999_999 },
+    ]);
+    await ingest();
+    const body = await get<{
+      edges: { ttftMs: number[] };
+      series: Array<{ model: string; ttftMs: { n: number; counts: number[] } }>;
+    }>('/api/metrics/distributions');
+    expect(body.edges.ttftMs).toEqual([
+      0, 100, 200, 350, 500, 750, 1000, 1500, 2000, 3000, 5000, 8000, 12000, 20000, 30000, 60000,
+    ]);
+    const h = body.series[0].ttftMs;
+    expect(h.n).toBe(5);
+    expect(h.counts).toHaveLength(body.edges.ttftMs.length);
+    expect(h.counts[0]).toBe(2);
+    expect(h.counts[1]).toBe(1);
+    expect(h.counts[h.counts.length - 1]).toBe(2);
+  });
+
+  it('speculative: acceptance by position is weighted by cycles', async () => {
+    writeTurns('2026-07-10-10.jsonl', [
+      { traceId: 's1', mtpCycles: 10, mtpMeanAccepted: 2, mtpAcceptByPos: [1, 0.5], decodeTps: 80, outputTokens: 30 },
+      { traceId: 's2', mtpCycles: 30, mtpMeanAccepted: 3, mtpAcceptByPos: [0.5], decodeTps: 90, outputTokens: 30 },
+      { traceId: 's3', decodeTps: 40, outputTokens: 30 },
+    ]);
+    await ingest();
+    const body = await get<{
+      models: Array<{
+        turns: number;
+        mtpTurns: number;
+        cycles: number;
+        meanAccepted: number;
+        acceptByPos: Array<{ pos: number; rate: number; cycles: number }>;
+        decodeTpsWithMtp: Q;
+        decodeTpsWithoutMtp: Q;
+      }>;
+      trend: Array<{ meanAccepted: number; mtpTurns: number }>;
+    }>('/api/metrics/speculative?bucket=day');
+    const m = body.models[0];
+    expect(m).toMatchObject({ turns: 3, mtpTurns: 2, cycles: 40 });
+    expect(m.meanAccepted).toBeCloseTo((2 * 10 + 3 * 30) / 40, 10);
+    expect(m.acceptByPos).toEqual([
+      { pos: 0, rate: (1 * 10 + 0.5 * 30) / 40, cycles: 40 },
+      { pos: 1, rate: 0.5, cycles: 10 },
+    ]);
+    expect(m.decodeTpsWithMtp.n).toBe(2);
+    expect(m.decodeTpsWithoutMtp).toEqual({ n: 1, p05: 40, p50: 40, p95: 40 });
+    expect(body.trend[0].mtpTurns).toBe(2);
+    expect(body.trend[0].meanAccepted).toBeCloseTo(110 / 40, 10);
+  });
+
+  it('turns: cursor pages without gaps or repeats across equal timestamps', async () => {
+    const at = Date.UTC(2026, 6, 10, 12);
+    const records: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < 7; i++) records.push({ traceId: `t-${i}`, ts: i < 5 ? at : at - 1000 * i });
+    writeTurns('2026-07-10-11.jsonl', records);
+    await ingest();
+    const seen: string[] = [];
+    let path = '/api/metrics/turns?limit=2';
+    for (let page = 0; page < 10; page++) {
+      const body = await get<{
+        rows: Array<{ traceId: string; ts: number }>;
+        next: { beforeTs: number; beforeTraceId: string } | null;
+        total: number;
+      }>(path);
+      expect(body.total).toBe(7);
+      seen.push(...body.rows.map((r) => r.traceId));
+      if (body.next === null) break;
+      path = `/api/metrics/turns?limit=2&beforeTs=${body.next.beforeTs}&beforeTraceId=${body.next.beforeTraceId}`;
+    }
+    expect(seen).toEqual(['t-4', 't-3', 't-2', 't-1', 't-0', 't-5', 't-6']);
+  });
+
+  it('turns: a non-numeric limit or beforeTs is a bad request', async () => {
+    const badLimit = await api.fetch('/api/metrics/turns?limit=abc');
+    expect(badLimit.status).toBe(400);
+    expect(((await badLimit.json()) as { error: string }).error).toBe('limit must be a number');
+    const badCursor = await api.fetch('/api/metrics/turns?beforeTs=abc&beforeTraceId=x');
+    expect(badCursor.status).toBe(400);
+    expect(((await badCursor.json()) as { error: string }).error).toBe('beforeTs must be a number');
+  });
+
+  it('turns: traceId returns that one row', async () => {
+    writeTurns('2026-07-10-12.jsonl', [
+      {
+        traceId: 'wanted',
+        model: 'alias',
+        modelId: 'Checkpoint',
+        ctxWindow: 1000,
+        promptTokens: 200,
+        outputTokens: 51,
+        decodeTps: 50,
+        preDispatchMs: 10,
+      },
+      { traceId: 'other' },
+    ]);
+    await ingest();
+    const body = await get<{ rows: Array<Record<string, unknown>>; next: unknown; total: number }>(
+      '/api/metrics/turns?traceId=wanted&limit=1&outcome=error',
+    );
+    expect(body.total).toBe(1);
+    expect(body.next).toBeNull();
+    expect(body.rows[0]).toMatchObject({
+      traceId: 'wanted',
+      model: 'Checkpoint',
+      alias: 'alias',
+      stream: true,
+      ctxFillPct: 25.1,
+      decodeMs: 1000,
+      preDispatchMs: 10,
+    });
+    expect((await get<{ rows: unknown[] }>('/api/metrics/turns?traceId=missing')).rows).toEqual([]);
+  });
+
+  it('models: keys in first-seen order', async () => {
+    const at = Date.UTC(2026, 6, 10, 12);
+    writeTurns('2026-07-10-13.jsonl', [
+      { traceId: 'm1', model: 'late', ts: at + 10 },
+      { traceId: 'm2', model: 'alias', modelId: 'early', modelType: 'qwen3', ts: at },
+      { traceId: 'm3', model: 'late', ts: at + 20 },
+    ]);
+    await ingest();
+    const body = await get<{ models: Array<{ model: string; modelType: string | null; turns: number }> }>(
+      '/api/metrics/models',
+    );
+    expect(body.models).toEqual([
+      { model: 'early', modelType: 'qwen3', firstTs: at, lastTs: at, turns: 1 },
+      { model: 'late', modelType: null, firstTs: at + 10, lastTs: at + 20, turns: 2 },
+    ]);
+  });
+});
+
+describe('dashboard api — runtime series', () => {
+  const T = Date.UTC(2026, 10, 10, 12, 0, 0);
+  let runtimeDir: string;
+
+  function base1(pid: number, startedAt: number, ts: number): Record<string, unknown> {
+    return { v: 1, ts, pid, startedAt };
+  }
+
+  function sample(pid: number, ts: number, extra: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      ...base1(pid, T - 60_000, ts),
+      k: 'sample',
+      dtMs: 1000,
+      busy: true,
+      busyMs: 0,
+      health: 'ok',
+      memActive: 0,
+      memPeak: 0,
+      memCache: 0,
+      rss: 0,
+      inFlight: 0,
+      queued: 0,
+      resident: 1,
+      dOk: 0,
+      dError: 0,
+      dCancelled: 0,
+      dOutTokens: 0,
+      dRejected: 0,
+      ...extra,
     };
+  }
 
-    // The bucket WITH perf keeps its finite averages, unchanged.
-    const perf = body.throughputTrend.find((r) => r.model === 'perf-model');
-    expect(perf?.decodeTps).toBe(150);
-    expect(perf?.prefillTps).toBe(600);
-    expect(perf?.ttftMs).toBe(30);
-    expect(perf?.samples).toBe(1);
+  function sched(ts: number, extra: Record<string, unknown>): Record<string, unknown> {
+    return {
+      ...base1(7, T - 60_000, ts),
+      k: 'sched',
+      model: 'M',
+      blockCapacity: 100,
+      allocatedBlocks: 1,
+      freeBlocks: 99,
+      reclaimableBlocks: 0,
+      watermarkBlocks: 1,
+      reservedBlocks: 0,
+      memoryCapacityBytes: 1000,
+      memoryWatermarkBytes: 10,
+      reservedBlockBytes: 0,
+      reservedStateBytes: 0,
+      globalSteps: 0,
+      admitted: 0,
+      completed: 0,
+      maxBatchOccupancy: 1,
+      fusedGreedyEpilogueSteps: 0,
+      admissionDeferredBlocks: 0,
+      admissionDeferredState: 0,
+      rowsAllocEvicted: 0,
+      preemptions: 0,
+      preemptionsRecompute: 0,
+      preemptionsSsd: 0,
+      ssdRestoreWaiting: 0,
+      ssdRestoreBytes: 0,
+      ssdRestoreWaitMs: 0,
+      occHist: [],
+      ...extra,
+    };
+  }
 
-    // The bucket with only null-perf traces: COUNT(*) still counts the row (the
-    // bucket exists), but every AVG is NULL → surfaced as `null`, never `0`.
-    const nullPerf = body.throughputTrend.find((r) => r.model === 'nullperf-model');
-    expect(nullPerf).toBeDefined();
-    expect(nullPerf?.samples).toBe(1);
-    expect(nullPerf?.decodeTps).toBeNull();
-    expect(nullPerf?.prefillTps).toBeNull();
-    expect(nullPerf?.ttftMs).toBeNull();
-    // Guard against the old `?? 0` regression re-appearing.
-    expect(nullPerf?.decodeTps).not.toBe(0);
-    expect(nullPerf?.prefillTps).not.toBe(0);
-    expect(nullPerf?.ttftMs).not.toBe(0);
+  function writeSeries(name: string, records: Array<Record<string, unknown>>): void {
+    mkdirSync(runtimeDir, { recursive: true });
+    writeFileSync(join(runtimeDir, name), records.map((r) => `${JSON.stringify(r)}\n`).join(''));
+  }
+
+  interface Series {
+    points: Array<{
+      t: number;
+      samples: number;
+      memActiveAvg: number | null;
+      memActiveMax: number | null;
+      busyMs: number;
+      okTurns: number;
+      outTokens: number;
+    }>;
+    sched: Array<{
+      model: string;
+      latest: { maxBatchOccupancy: number; ts: number; turns: number | null };
+      snapshots: unknown[];
+      delta: Record<string, unknown> & { occupancy: Array<{ occupancy: number; steps: number }> };
+    }>;
+    procs: Array<{ procKey: string }>;
+  }
+
+  beforeEach(() => {
+    runtimeDir = join(base, 'runtime');
+  });
+
+  it('runtime series: two samples 1 s apart in one 5 s bucket give one point with samples 2', async () => {
+    writeSeries('2026-11-10-7.jsonl', [sample(7, T + 1000), sample(7, T + 2000)]);
+    await ingest();
+    const body = await get<Series>(`/api/runtime/series?from=${T}&to=${T + 4999}&bucketMs=5000`);
+    expect(body.points).toHaveLength(1);
+    expect(body.points[0]).toMatchObject({ t: T, samples: 2 });
+  });
+
+  it('runtime series: sums processes after averaging within each', async () => {
+    writeSeries('2026-11-10-7.jsonl', [
+      sample(7, T + 1000, { memActive: 100 }),
+      sample(7, T + 2000, { memActive: 300 }),
+    ]);
+    writeSeries('2026-11-10-8.jsonl', [sample(8, T + 1500, { memActive: 1000 })]);
+    await ingest();
+    const body = await get<Series>(`/api/runtime/series?from=${T}&to=${T + 4999}&bucketMs=5000`);
+    expect(body.points[0]).toMatchObject({ samples: 3, memActiveAvg: 1200, memActiveMax: 1300 });
+    expect(body.procs).toHaveLength(2);
+  });
+
+  it("runtime series: busyMs is the sum of the samples' busyMs", async () => {
+    writeSeries('2026-11-10-7.jsonl', [
+      sample(7, T + 1000, { busyMs: 700, dOk: 2, dOutTokens: 50 }),
+      sample(7, T + 61_000, { busy: false, busyMs: 2000, dOk: 1, dOutTokens: 10 }),
+    ]);
+    await ingest();
+    const body = await get<Series>(`/api/runtime/series?from=${T}&to=${T + 3_599_999}&bucketMs=3600000`);
+    expect(body.points).toHaveLength(1);
+    expect(body.points[0]).toMatchObject({ busyMs: 2700, okTurns: 3, outTokens: 60 });
+    expect((await api.fetch(`/api/runtime/series?from=${T}&to=${T + 1000}&bucketMs=1234`)).status).toBe(400);
+    expect((await api.fetch(`/api/runtime/series?from=${T}&bucketMs=5000`)).status).toBe(400);
+    expect((await api.fetch(`/api/runtime/series?from=0&to=${T}&bucketMs=5000`)).status).toBe(400);
+  });
+
+  it("runtime series: maxBatchOccupancy is the latest snapshot's value and is not in delta", async () => {
+    writeSeries('2026-11-10-7.jsonl', [
+      sched(T - 5000, { maxBatchOccupancy: 2, globalSteps: 10 }),
+      sched(T + 1000, { maxBatchOccupancy: 4, globalSteps: 30 }),
+      sched(T + 2000, { maxBatchOccupancy: 4, globalSteps: 35 }),
+    ]);
+    await ingest();
+    const body = await get<Series>(`/api/runtime/series?from=${T}&to=${T + 60_000}&bucketMs=5000`);
+    expect(body.sched).toHaveLength(1);
+    expect(body.sched[0].latest).toMatchObject({ maxBatchOccupancy: 4, ts: T + 2000 });
+    expect(body.sched[0].snapshots).toHaveLength(2);
+    expect(body.sched[0].delta.globalSteps).toBe(25);
+    expect('maxBatchOccupancy' in body.sched[0].delta).toBe(false);
+  });
+
+  it('runtime series: the first snapshot of a process and model counts from zero', async () => {
+    writeSeries('2026-11-10-7.jsonl', [
+      sched(T + 1000, {
+        globalSteps: 500,
+        admitted: 40,
+        completed: 40,
+        occHist: [
+          [1, 300],
+          [2, 200],
+        ],
+      }),
+    ]);
+    await ingest();
+    const body = await get<Series>(`/api/runtime/series?from=${T}&to=${T + 60_000}&bucketMs=5000`);
+    expect(body.sched).toHaveLength(1);
+    expect(body.sched[0].delta).toMatchObject({ globalSteps: 500, admitted: 40, completed: 40, preemptions: 0 });
+    expect(body.sched[0].delta.occupancy).toEqual([
+      { occupancy: 1, steps: 300 },
+      { occupancy: 2, steps: 200 },
+    ]);
+  });
+
+  it('runtime series: scheduler deltas survive a counter reset', async () => {
+    writeSeries('2026-11-10-7.jsonl', [
+      sched(T - 5000, { admitted: 50, occHist: [[1, 100]] }),
+      sched(T + 1000, {
+        admitted: 60,
+        occHist: [
+          [1, 120],
+          [2, 5],
+        ],
+      }),
+      // The model was reloaded: counters restart below the previous value.
+      sched(T + 2000, { admitted: 4, occHist: [[1, 3]] }),
+    ]);
+    await ingest();
+    const body = await get<Series>(`/api/runtime/series?from=${T}&to=${T + 60_000}&bucketMs=5000`);
+    expect(body.sched[0].delta.admitted).toBe(14);
+    expect(body.sched[0].delta.occupancy).toEqual([
+      { occupancy: 1, steps: 23 },
+      { occupancy: 2, steps: 5 },
+    ]);
+  });
+
+  it('runtime series: turns grow in the range, restart at a reload, and read as unknown when not written', async () => {
+    writeSeries('2026-11-10-7.jsonl', [
+      sched(T - 5000, { turns: 3 }),
+      sched(T + 1000, { turns: 7 }),
+      loadRec(T + 2000, true),
+      sched(T + 3000, { turns: 2 }),
+    ]);
+    writeSeries('2026-11-10-8.jsonl', [{ ...sched(T + 1000, {}), pid: 8, model: 'Old' }]);
+    await ingest();
+    const body = await get<Series>(`/api/runtime/series?from=${T}&to=${T + 60_000}&bucketMs=5000`);
+    const byModel = new Map(body.sched.map((entry) => [entry.model, entry]));
+    expect(byModel.get('M')?.latest.turns).toBe(2);
+    expect(byModel.get('M')?.delta.turns).toBe(6);
+    expect(byModel.get('Old')?.latest.turns).toBeNull();
+    expect(byModel.get('Old')?.delta.turns).toBe(0);
+  });
+
+  function loadRec(ts: number, ok: boolean): Record<string, unknown> {
+    return { ...base1(7, T - 60_000, ts), k: 'load', model: 'M', modelType: 'qwen3_5', capability: 'chat', ms: 10, ok };
+  }
+
+  it('runtime series: a successful reload between snapshots restarts the counters', async () => {
+    writeSeries('2026-11-10-7.jsonl', [
+      sched(T + 1000, { admitted: 10, occHist: [[1, 100]] }),
+      loadRec(T + 3000, true),
+      sched(T + 4000, { admitted: 15, occHist: [[1, 150]] }),
+    ]);
+    await ingest();
+    const body = await get<Series>(`/api/runtime/series?from=${T}&to=${T + 60_000}&bucketMs=5000`);
+    expect(body.sched[0].delta.admitted).toBe(25);
+    expect(body.sched[0].delta.occupancy).toEqual([{ occupancy: 1, steps: 250 }]);
+  });
+
+  it('runtime series: a reload before the range resets and a failed load does not', async () => {
+    writeSeries('2026-11-10-7.jsonl', [
+      sched(T - 5000, { admitted: 7 }),
+      loadRec(T - 1000, true),
+      sched(T + 1000, { admitted: 10 }),
+      loadRec(T + 2000, false),
+      sched(T + 3000, { admitted: 12 }),
+    ]);
+    await ingest();
+    const body = await get<Series>(`/api/runtime/series?from=${T}&to=${T + 60_000}&bucketMs=5000`);
+    expect(body.sched[0].delta.admitted).toBe(12);
   });
 });
 
@@ -490,7 +1160,7 @@ describe('dashboard api — cache trend scoping', () => {
 
   interface CacheBody {
     disk: { root: string; entryCount: number };
-    trend: Array<{ day: string; hits: number; misses: number; bytesWritten: number; bytesRestored: number }>;
+    trend: Array<{ t: number; hits: number; misses: number; bytesWritten: number; bytesRestored: number }>;
     scope: {
       root: string;
       trendWindowDays: number;
@@ -498,6 +1168,7 @@ describe('dashboard api — cache trend scoping', () => {
       otherRoots: { turns: number; hits: number; misses: number };
       unattributed: { turns: number; hits: number; misses: number };
       disabledTurns: number;
+      enabledTurns: number;
       unrootedSidecarCaptures: number;
     };
     health: {
@@ -667,8 +1338,11 @@ describe('dashboard api — cache trend scoping', () => {
     // ONLY this root's rows. 15010 would mean the filter is gone.
     expect(totals(body)).toEqual({ hits: 11, misses: 3 });
     expect(body.scope.root).toBe(canonicalCacheRootPath);
-    // Two days, two rows — neither the other root's day nor the legacy day.
-    expect(body.trend.map((r) => r.day)).toEqual(['2026-07-20', '2026-07-21']);
+    // Two local days, two rows — neither the other root's day nor the legacy day.
+    expect(body.trend.map((r) => r.t)).toEqual([
+      localDayStart(Date.UTC(2026, 6, 20, 10)),
+      localDayStart(Date.UTC(2026, 6, 21, 10)),
+    ]);
     expect(body.trend.reduce((a, r) => a + r.bytesRestored, 0)).toBe(1100);
     expect(body.trend.reduce((a, r) => a + r.bytesWritten, 0)).toBe(150);
   });
@@ -686,6 +1360,8 @@ describe('dashboard api — cache trend scoping', () => {
     // A turn that ran with the tier OFF is a different story from an
     // unattributable one, and must not be folded into `legacy`.
     expect(body.scope.disabledTurns).toBe(1);
+    // Tier on, whatever the root: two here, one elsewhere, one with no root. Legacy rows count in neither.
+    expect(body.scope.enabledTurns).toBe(4);
   });
 
   /**
@@ -698,6 +1374,22 @@ describe('dashboard api — cache trend scoping', () => {
    * Asserted as a CONSERVATION law against the table's own total rather than by
    * enumerating the arms, so any future fifth shape has to be accounted for too.
    */
+  it('cache: failed turns are not counted as legacy turns', async () => {
+    writeFileSync(
+      join(tracesDir, '2026-07-22-failed.jsonl'),
+      ['error', 'cancelled']
+        .map(
+          (outcome, i) =>
+            `${JSON.stringify({ v: 2, traceId: `failed-${i}`, ts: Date.UTC(2026, 6, 22), model: 'm', outcome, endpoint: 'messages', dispatch: 'start', stream: true })}\n`,
+        )
+        .join(''),
+    );
+    await ingest();
+    const body = (await (await api.fetch('/api/cache')).json()) as CacheBody;
+    expect(body.scope.legacy).toEqual({ turns: 1, hits: 5000, misses: 11 });
+    expect(body.scope.disabledTurns).toBe(1);
+  });
+
   it('accounts for every trace row: the buckets partition the table, they do not just avoid overlap', async () => {
     const body = (await (await api.fetch('/api/cache')).json()) as CacheBody;
     expect(body.scope.unattributed).toEqual({ turns: 1, hits: 777, misses: 5 });
@@ -723,6 +1415,7 @@ describe('dashboard api — cache trend scoping', () => {
     const linkRoot = join(base, 'cache-link');
     symlinkSync(cacheRoot, linkRoot);
     const linked = createDashboardRuntime({
+      chat: { tempRoots: [] },
       dbPath: ':memory:',
       tracesDir,
       modelsDir,
@@ -952,6 +1645,7 @@ describe('dashboard api — production cache root (no explicit cacheRoot)', () =
     );
 
     defaulted = createDashboardRuntime({
+      chat: { tempRoots: [] },
       dbPath: ':memory:',
       tracesDir,
       modelsDir,
@@ -1036,7 +1730,7 @@ describe('dashboard api — downloads', () => {
   it('answers the streaming route 503, not a misleading 404, for a caller that cannot stream', async () => {
     const res = await api.fetch('/api/downloads/some-job/events');
     expect(res.status).toBe(503);
-    expect(((await res.json()) as { error: string }).error).toMatch(/not available over this transport/i);
+    expect(((await res.json()) as { error: string }).error).toContain('not available over this transport');
   });
 });
 
@@ -1145,7 +1839,7 @@ describe('dashboard api — start download route', () => {
     expect(res.status).toBe(503);
     expect(res.ok).toBe(false);
     expect(res.ok ? '' : res.code).toBe('E_UNAVAILABLE');
-    expect(res.ok ? '' : res.message).toMatch(/shutting down/i);
+    expect(res.ok ? '' : res.message).toContain('shutting down');
   });
 
   it('still answers 400 for a repo the catalog does not carry', async () => {

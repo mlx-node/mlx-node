@@ -1,0 +1,1167 @@
+{
+ "source": "Auto with a temp root beside the Work folder: request texts with stand-ins; {T} is the alias spelling of a throwaway temp root, {TR} its real path, {TUP} {T} in capitals, {W} the Work folder, {UID} the test uid",
+ "rows": [
+  {
+   "n": 1,
+   "input": "cd {T}/scan/sub && cat note.txt | head -40",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 2,
+   "input": "cd {T}/scan/sub && grep -n word note.txt | head -40",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 3,
+   "input": "cd {T}/scan/sub && wc -l note.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 4,
+   "input": "cat {T}/scan/sub/note.txt | head -40",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 5,
+   "input": "ls {T}/scan 2>/dev/null | head",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 6,
+   "input": "ls -la {TR}/scan",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 7,
+   "input": "cd {T}/repo 2>/dev/null && git status --short | head -10",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 8,
+   "input": "echo x > {T}/scan/new.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 9,
+   "input": "mkdir -p {T}/scan2/sub",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 10,
+   "input": "touch {T}/scan/marker",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 11,
+   "input": "cp a.txt {T}/scan/",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 12,
+   "input": "cp {T}/scan/a.txt copy.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 13,
+   "input": "echo x > {T}/out.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 14,
+   "input": "echo x > {T}/new-out.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 15,
+   "input": "find {T}/scan -name '*.txt' -type f | head -40",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 16,
+   "input": "wc -l {T}/scan/sub/*.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 17,
+   "input": "diff {T}/scan/a.txt a.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 18,
+   "input": "test -f {T}/scan/a.txt && echo x",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 19,
+   "input": "ls {T}/scan/",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 19,
+   "input": "ls {T}//scan",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 19,
+   "input": "ls /{T}/scan",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 20,
+   "input": "mv {T}/scan/a.txt {T}/scan/c.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 21,
+   "input": "cd {T}/web && npm test",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "tool"
+  },
+  {
+   "n": 21,
+   "input": "cd {T}/web && make",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "tool"
+  },
+  {
+   "n": 22,
+   "input": "node {T}/web/a.js",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "tool"
+  },
+  {
+   "n": 22,
+   "input": "tsc --noEmit -p {T}/web/tsconfig.json",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "tool"
+  },
+  {
+   "n": 23,
+   "input": "pushd {T}/scan && cat a.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 24,
+   "input": "cat {T}/scan/lnk-in/note.txt",
+   "kind": "bash",
+   "expect": "allow",
+   "touched": false
+  },
+  {
+   "n": 25,
+   "input": "cat tmp/a.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 26,
+   "input": "ps aux | grep -E \"node|cargo\" | grep -v grep | head -10",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 27,
+   "input": "ps -p 1,2 -o pid,command",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 28,
+   "input": "echo \"---\"; echo x",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 29,
+   "input": "{T}/scan/new.txt",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "allow",
+   "touched": true
+  },
+  {
+   "n": 29,
+   "input": "{T}/scan/b.txt",
+   "kind": "edit",
+   "tool": "search_replace",
+   "expect": "allow",
+   "touched": true
+  },
+  {
+   "n": 30,
+   "input": "ls /var/tmp/x",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 31,
+   "input": "cat /var/folders/zz/abc/T/x.txt",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 32,
+   "input": "cat $TMPDIR/x.txt",
+   "kind": "bash",
+   "expect": "unread"
+  },
+  {
+   "n": 32,
+   "input": "cat \"${TMPDIR}/x.txt\"",
+   "kind": "bash",
+   "expect": "unread"
+  },
+  {
+   "n": 33,
+   "input": "X={T}/scan; cat $X/a.txt",
+   "kind": "bash",
+   "expect": "unread"
+  },
+  {
+   "n": 34,
+   "input": "ls {T}",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "top"
+  },
+  {
+   "n": 34,
+   "input": "ls {T}/",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "top"
+  },
+  {
+   "n": 34,
+   "input": "ls {TR}",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "top"
+  },
+  {
+   "n": 35,
+   "input": "cd {T} && cat x",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "top"
+  },
+  {
+   "n": 36,
+   "input": "cat {T}/*",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "top"
+  },
+  {
+   "n": 37,
+   "input": "find {T} -name x",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "top"
+  },
+  {
+   "n": 38,
+   "input": "cd {T}/scan/..",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 39,
+   "input": "cat {T}/scan/../repo/src/x.ts",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 40,
+   "input": "cd {T}/scan && cd ..",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 41,
+   "input": "cat ~/../../t/scan/a.txt",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 42,
+   "input": "ls {TUP}/scan",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 43,
+   "input": "ls {T}x/scan",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 43,
+   "input": "ls {T}.bak/x",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 44,
+   "input": "ls {T}／scan",
+   "kind": "bash",
+   "expect": "unread"
+  },
+  {
+   "n": 44,
+   "input": "ls {T}​/scan",
+   "kind": "bash",
+   "expect": "unread"
+  },
+  {
+   "n": 45,
+   "input": "cat {T}/scan/lnk/x",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "cause": "place"
+  },
+  {
+   "n": 46,
+   "input": "echo x > {T}/scan/lnk/x",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "cause": "place"
+  },
+  {
+   "n": 47,
+   "input": "echo x > {T}/lnk-out/x",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "cause": "place"
+  },
+  {
+   "n": 48,
+   "input": "echo x > {T}/scan/dang",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "cause": "place"
+  },
+  {
+   "n": 49,
+   "input": "cd {T}/scan/lnk && touch marker",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 50,
+   "input": "mkdir -p {T}/scan/lnk/new/deep",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "cause": "place"
+  },
+  {
+   "n": 51,
+   "input": "echo x >> {T}/scan/hard",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 52,
+   "input": "{T}/scan/hard",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "unknown-landing"
+  },
+  {
+   "n": 53,
+   "input": "cat {T}/mnt/a.txt",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "volume"
+  },
+  {
+   "n": 54,
+   "input": "wc -l {T}/scan/l*",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 54,
+   "input": "cat {T}/scan/f*",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 55,
+   "input": "cd {T}/scan; cat lnk2/x",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 56,
+   "input": "cat {T}/tool-{UID}/notes.txt",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "private"
+  },
+  {
+   "n": 57,
+   "input": "echo x > {T}/tool-{UID}/notes.txt",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "private"
+  },
+  {
+   "n": 58,
+   "input": "mkdir {T}/pytest-of-owner/x",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "private"
+  },
+  {
+   "n": 59,
+   "input": "ls {T}/.hidden",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "private"
+  },
+  {
+   "n": 59,
+   "input": "ls {T}/com.apple.launchd.x",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "private"
+  },
+  {
+   "n": 60,
+   "input": "cat {T}/scan/fifo",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "special"
+  },
+  {
+   "n": 60,
+   "input": "echo x > {T}/scan/fifo",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "special"
+  },
+  {
+   "n": 61,
+   "input": "cat {T}/scan/a.txt",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "owner",
+   "suite": "S2"
+  },
+  {
+   "n": 62,
+   "input": "echo x > {T}/open/a.txt",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "shared"
+  },
+  {
+   "n": 62,
+   "input": "cat {T}/open/a.txt",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "shared"
+  },
+  {
+   "n": 63,
+   "input": "cat {T}/chat-root/conversations.json",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "app"
+  },
+  {
+   "n": 64,
+   "input": "cat {T}/keep/.git/config",
+   "kind": "bash",
+   "expect": "protected"
+  },
+  {
+   "n": 64,
+   "input": "echo x > {T}/keep/.claude/settings.json",
+   "kind": "bash",
+   "expect": "protected"
+  },
+  {
+   "n": 64,
+   "input": "echo x > {T}/keep/.zshrc",
+   "kind": "bash",
+   "expect": "protected"
+  },
+  {
+   "n": 64,
+   "input": "cat {T}/keep/cfg/config",
+   "kind": "bash",
+   "expect": "protected"
+  },
+  {
+   "n": 65,
+   "input": "rm {T}/scan/marker",
+   "kind": "bash",
+   "expect": "risky"
+  },
+  {
+   "n": 65,
+   "input": "rm -r {T}/scan2",
+   "kind": "bash",
+   "expect": "risky"
+  },
+  {
+   "n": 65,
+   "input": "find {T}/scan -delete",
+   "kind": "bash",
+   "expect": "risky"
+  },
+  {
+   "n": 66,
+   "input": "cd {T}/scan && printf '%d\\n' 5",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 67,
+   "input": "git -C {T}/repo status",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 68,
+   "input": "cd {T}/wt && git status",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "cause": "git"
+  },
+  {
+   "n": 69,
+   "input": "cd {T}/scan && git status",
+   "kind": "bash",
+   "expect": "not-known",
+   "cause": "git"
+  },
+  {
+   "n": 70,
+   "input": "sort -o {T}/scan/out.txt a.txt",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 70,
+   "input": "tsc --noEmit --outDir {T}/scan",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 71,
+   "input": "echo x >> /dev/null",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 71,
+   "input": "echo x > /dev/stdout",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 71,
+   "input": "echo x > /dev/tty",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 71,
+   "input": "cp a.txt /dev/null",
+   "kind": "bash",
+   "expect": "unknown-target"
+  },
+  {
+   "n": 72,
+   "input": "ps auxe",
+   "kind": "bash",
+   "expect": "risky"
+  },
+  {
+   "n": 72,
+   "input": "ps e",
+   "kind": "bash",
+   "expect": "risky"
+  },
+  {
+   "n": 72,
+   "input": "ps -E",
+   "kind": "bash",
+   "expect": "risky"
+  },
+  {
+   "n": 73,
+   "input": "ps -ef",
+   "kind": "bash",
+   "expect": "not-known",
+   "part": "ps"
+  },
+  {
+   "n": 73,
+   "input": "ps -u root",
+   "kind": "bash",
+   "expect": "not-known",
+   "part": "ps"
+  },
+  {
+   "n": 73,
+   "input": "ps \"aux\"",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 73,
+   "input": "ps auxz",
+   "kind": "bash",
+   "expect": "not-known",
+   "part": "ps"
+  },
+  {
+   "n": 74,
+   "input": "echo -e x",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 74,
+   "input": "echo -E x",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 75,
+   "input": "{T}/scan/run.sh",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 75,
+   "input": "sh {T}/scan/run.sh",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 76,
+   "input": "cd {T}/scan | cat",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 77,
+   "input": "{T}/tool-{UID}/x",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "temp",
+   "cause": "private"
+  },
+  {
+   "n": 77,
+   "input": "{T}/scan/lnk/x",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "risky"
+  },
+  {
+   "n": 77,
+   "input": "{T}",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "temp",
+   "cause": "top"
+  },
+  {
+   "n": 77,
+   "input": "{T}/scan/sub/../new.txt",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "temp",
+   "cause": "place"
+  },
+  {
+   "n": 79,
+   "input": "cd {T}/scan/sub && cat note.txt | head -40",
+   "kind": "bash",
+   "expect": "not-known",
+   "suite": "OFF"
+  },
+  {
+   "n": 79,
+   "input": "cat {T}/scan/sub/note.txt | head -40",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "suite": "OFF"
+  },
+  {
+   "n": 79,
+   "input": "echo x > {T}/scan/new.txt",
+   "kind": "bash",
+   "expect": "risky",
+   "suite": "OFF"
+  },
+  {
+   "n": 80,
+   "input": "cd {W}/sub && ls",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 80,
+   "input": "cat {W}/*.txt",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 81,
+   "input": "echo x > {T}/open/x",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "shared"
+  },
+  {
+   "n": 82,
+   "input": "cat {T}/scan/lnk-in/note.txt",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "owner",
+   "suite": "S2"
+  },
+  {
+   "n": 83,
+   "input": "tsc --noEmit -p {T}/tool-{UID}/tsconfig.json",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "private"
+  },
+  {
+   "n": 84,
+   "input": "cat {T}/locked/a.txt",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "unreadable",
+   "part": "{T}/locked/a.txt"
+  },
+  {
+   "n": 85,
+   "input": "cd {T}/repo/barelike && git status",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "cause": "git"
+  },
+  {
+   "n": 86,
+   "input": "cd {T}/repo/nohead && git status",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "cause": "git"
+  },
+  {
+   "n": 86,
+   "input": "cd {T}/repo/junkhead && git status",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "cause": "git"
+  },
+  {
+   "n": 87,
+   "input": "cd {T}/repo && git status",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "cause": "git",
+   "setup": "config-0666"
+  },
+  {
+   "n": 87,
+   "input": "cd {T}/repo && git status",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "cause": "git",
+   "setup": "hooks-0777"
+  },
+  {
+   "n": 88,
+   "input": "cat {T}/proj/a.txt",
+   "kind": "bash",
+   "expect": "allow",
+   "suite": "S3",
+   "touched": false
+  },
+  {
+   "n": 89,
+   "input": "cd {T}/proj/sub && ls",
+   "kind": "bash",
+   "expect": "not-known",
+   "suite": "S3"
+  },
+  {
+   "n": 90,
+   "input": "ls {TR}/scan",
+   "kind": "bash",
+   "expect": "allow",
+   "suite": "S5"
+  },
+  {
+   "n": 90,
+   "input": "ls {T}/scan",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "suite": "S5"
+  },
+  {
+   "n": 90,
+   "input": "cd {TR}/scan && ls",
+   "kind": "bash",
+   "expect": "not-known",
+   "suite": "S5"
+  },
+  {
+   "n": 91,
+   "input": "cd {T}/repo 2>/dev/null && git status --short | head -10",
+   "kind": "bash",
+   "expect": "allow",
+   "suite": "S4"
+  },
+  {
+   "n": 92,
+   "input": "cd {T}/repo; git status --short",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "cause": "git",
+   "suite": "S4",
+   "part": "app"
+  },
+  {
+   "n": 93,
+   "input": "true || cd {T}/repo && git status --short",
+   "kind": "bash",
+   "expect": "unknown-target",
+   "cause": "git",
+   "suite": "S4",
+   "part": "app"
+  },
+  {
+   "n": 94,
+   "input": "cd {T}/scan && cat lnk2/x",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 95,
+   "input": "cd {T}/scan/sub && sed -n '1,40p' note.txt | head -40",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 95,
+   "input": "sed -n '$p' {T}/scan/a.txt",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 95,
+   "input": "cat a.txt | sed -n 3p",
+   "kind": "bash",
+   "expect": "allow"
+  },
+  {
+   "n": 96,
+   "input": "sed -i s/a/b/ a.txt",
+   "kind": "bash",
+   "expect": "not-known",
+   "part": "sed"
+  },
+  {
+   "n": 96,
+   "input": "sed 1,40p a.txt",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 96,
+   "input": "sed -n -e 1p a.txt",
+   "kind": "bash",
+   "expect": "not-known",
+   "part": "sed"
+  },
+  {
+   "n": 96,
+   "input": "sed -n '1p;w out' a.txt",
+   "kind": "bash",
+   "expect": "not-known",
+   "part": "sed"
+  },
+  {
+   "n": 96,
+   "input": "sed -n '1e true' a.txt",
+   "kind": "bash",
+   "expect": "not-known"
+  },
+  {
+   "n": 96,
+   "input": "sed -n 1p {T}/tool-{UID}/notes.txt",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "private"
+  },
+  {
+   "n": 97,
+   "input": "true 2>{T}/scan/err.log",
+   "kind": "bash",
+   "expect": "unread",
+   "cause": "redirect",
+   "part": "2>"
+  },
+  {
+   "n": 97,
+   "input": "true 2>err.log",
+   "kind": "bash",
+   "expect": "unread",
+   "cause": "redirect",
+   "part": "2>"
+  },
+  {
+   "n": 100,
+   "input": "ps aux | grep -E \"cargo|rustc|lldb\" | grep -v grep | head -10; echo \"---\"; ls {T}/napi-rs-a6ih 2>/dev/null | head; echo \"---\"; cd {T}/napi-rs-a6ih 2>/dev/null && git status --short | head -10",
+   "kind": "bash",
+   "expect": "allow",
+   "touched": true,
+   "class": "owner"
+  },
+  {
+   "n": 100,
+   "input": "ps aux | grep -E \"cargo|rustc|lldb\" | grep -v grep | head -10; echo \"---\"; ls {T}/napi-rs-a6ih 2>/dev/null | head; echo \"---\"; cd {T}/napi-rs-a6ih 2>/dev/null && git status --short | head -10",
+   "kind": "bash",
+   "expect": "allow",
+   "suite": "S4",
+   "touched": true,
+   "class": "owner"
+  },
+  {
+   "n": 101,
+   "input": "echo x > {T}/.zz",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "private",
+   "class": "U2 on a new first-level name"
+  },
+  {
+   "n": 101,
+   "input": "mkdir {T}/new-{UID}",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "private",
+   "class": "U2 on a new first-level name"
+  },
+  {
+   "n": 101,
+   "input": "touch {T}/com.apple.zz",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "private",
+   "class": "U2 on a new first-level name"
+  },
+  {
+   "n": 101,
+   "input": "mkdir -p {T}/.zdir/sub",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "private",
+   "class": "U2 on a new first-level name"
+  },
+  {
+   "n": 101,
+   "input": "{T}/.newdot",
+   "kind": "edit",
+   "expect": "temp",
+   "cause": "private",
+   "class": "U2 on a new first-level name"
+  },
+  {
+   "n": 101,
+   "input": "{T}/new-{UID}/x",
+   "kind": "edit",
+   "expect": "temp",
+   "cause": "private",
+   "class": "U2 on a new first-level name"
+  },
+  {
+   "n": 102,
+   "input": "chmod 755 {T}/scan",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "mode",
+   "part": "{T}/scan",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "chmod g+w {T}/scan/sub",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "mode",
+   "part": "{T}/scan/sub",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "chmod o+w {TR}/scan/sub",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "mode",
+   "part": "{T}/scan/sub",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "chmod 644 {T}/scan/a.txt",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "mode",
+   "part": "{T}/scan/a.txt",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "chmod -v u+x {T}/scan/new.sh",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "mode",
+   "part": "{T}/scan/new.sh",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "cd {T}/scan && chmod 700 sub",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "mode",
+   "part": "{T}/scan/sub",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "chmod 600 a.txt {T}/scan/b.txt",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "mode",
+   "part": "{T}/scan/b.txt",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "chmod 700 {T}/scan/lnk-in",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "mode",
+   "part": "{T}/scan/lnk-in",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "chmod 755 {T}",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "top",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "chmod 777 {T}/open/a.txt",
+   "kind": "bash",
+   "expect": "temp",
+   "cause": "shared",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "chown {UID} {T}/scan/a.txt",
+   "kind": "bash",
+   "expect": "not-known",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "chgrp staff {T}/scan/a.txt",
+   "kind": "bash",
+   "expect": "not-known",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "install -m 777 a.txt {T}/scan/x",
+   "kind": "bash",
+   "expect": "not-known",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "mkdir -m 777 {T}/scan/d2",
+   "kind": "bash",
+   "expect": "not-known",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "chmod 755 {T}/scan",
+   "kind": "bash",
+   "expect": "risky",
+   "suite": "OFF",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged"
+  },
+  {
+   "n": 102,
+   "input": "chmod 644 a.txt",
+   "kind": "bash",
+   "expect": "allow",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged",
+   "touched": false
+  },
+  {
+   "n": 102,
+   "input": "chmod 644 a.txt",
+   "kind": "bash",
+   "expect": "allow",
+   "suite": "S3",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged",
+   "touched": false
+  },
+  {
+   "n": 102,
+   "input": "chmod 644 {T}/proj/a.txt",
+   "kind": "bash",
+   "expect": "allow",
+   "suite": "S3",
+   "class": "a mode change in a temp root asks; the Work folder is unchanged",
+   "touched": false
+  }
+ ]
+}

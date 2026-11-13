@@ -23,12 +23,30 @@
  */
 
 let generation = 0;
+let transportUp = false;
 const listeners = new Set<() => void>();
+
+function notify(): void {
+  for (const listener of listeners) listener();
+}
 
 /** Called by `connectDashboardApi` — one place decides what a reconnect means. */
 export function bumpConnectionGeneration(): void {
   generation += 1;
-  for (const listener of listeners) listener();
+  transportUp = true;
+  notify();
+}
+
+/** The current port died or was dropped; the generation stays until a replacement port arrives. */
+export function markTransportDown(): void {
+  if (!transportUp) return;
+  transportUp = false;
+  notify();
+}
+
+/** Whether the current port can carry calls: the shell's `connected`. */
+export function getTransportUp(): boolean {
+  return transportUp;
 }
 
 export function subscribeConnection(listener: () => void): () => void {

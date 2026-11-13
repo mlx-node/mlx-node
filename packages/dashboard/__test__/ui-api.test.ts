@@ -13,6 +13,7 @@ import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { failure, type ApiResponse } from '../src/api/errors.js';
 import type { DownloadEvent } from '../src/download.js';
+import type { LiveEvent } from '../src/live.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort, type RpcPort, type RpcPortEvents } from '../src/rpc/port.js';
 import type { ApiCall } from '../src/runtime.js';
@@ -23,6 +24,7 @@ import {
   getJson,
   mutate,
   subscribeDownload,
+  subscribeLive,
 } from '../ui/src/lib/api.js';
 
 let teardown: (() => void) | null = null;
@@ -41,6 +43,8 @@ interface Harness {
   calls: ApiCall[];
   emit(jobId: string, event: DownloadEvent): void;
   liveSubscriptions(): number;
+  emitLive(event: LiveEvent): void;
+  watchers(): number;
 }
 
 /** Connect the SPA client to a stub runtime over a real MessageChannel. */
@@ -48,6 +52,7 @@ function connect(answer?: (call: ApiCall) => ApiResponse): Harness {
   const calls: ApiCall[] = [];
   const subscribers = new Map<number, { jobId: string; listener: (event: DownloadEvent) => void }>();
   let nextKey = 1;
+  const watchers = new Set<(event: LiveEvent) => void>();
 
   const { port1, port2 } = new MessageChannel();
   port1.unref();
@@ -65,6 +70,12 @@ function connect(answer?: (call: ApiCall) => ApiResponse): Harness {
           subscribers.delete(key);
         };
       },
+      watchLive: (listener: (event: LiveEvent) => void) => {
+        watchers.add(listener);
+        return () => {
+          watchers.delete(listener);
+        };
+      },
     },
     bindEventTargetPort(port2),
   );
@@ -77,6 +88,10 @@ function connect(answer?: (call: ApiCall) => ApiResponse): Harness {
       for (const s of subscribers.values()) if (s.jobId === jobId) s.listener(event);
     },
     liveSubscriptions: () => subscribers.size,
+    emitLive(event) {
+      for (const listener of watchers) listener(event);
+    },
+    watchers: () => watchers.size,
   };
 }
 
@@ -154,6 +169,37 @@ describe('SPA api client', () => {
     h.emit('job-1', { type: 'error', id: 'job-1', message: 'late' });
     await flush();
     expect(seen).toHaveLength(1);
+  });
+
+  it('delivers live-channel events and stops on close', async () => {
+    const h = connect();
+    const seen: unknown[] = [];
+    const sub = subscribeLive((event) => seen.push(event));
+    await flush();
+    expect(h.watchers()).toBe(1);
+
+    h.emitLive({ type: 'data', version: 3, traces: true, runtime: false });
+    await flush();
+    expect(seen).toEqual([{ type: 'data', version: 3, traces: true, runtime: false }]);
+
+    sub.close();
+    await flush();
+    expect(h.watchers()).toBe(0);
+    h.emitLive({ type: 'data', version: 4, traces: true, runtime: true });
+    await flush();
+    expect(seen).toHaveLength(1);
+  });
+
+  it('refuses a live watch with E_UNAVAILABLE when no port has been connected', () => {
+    disconnectDashboardApi();
+    let err: unknown = null;
+    try {
+      subscribeLive(() => {});
+    } catch (caught) {
+      err = caught;
+    }
+    expect(err).toBeInstanceOf(DashboardApiError);
+    expect((err as DashboardApiError).code).toBe('E_UNAVAILABLE');
   });
 
   it('closes the previous connection when a new port is connected', async () => {

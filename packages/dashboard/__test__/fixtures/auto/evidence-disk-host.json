@@ -1,0 +1,507 @@
+{
+ "source": "scratchpad/impl/tmp/r3/sec/disk-host/probe-results.jsonl (review r3, lens disk-host); separate-name rows left out (the disk keeps those names apart)",
+ "rows": [
+  {
+   "input": "cd L/../q && echo x >> h",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D1"
+  },
+  {
+   "input": "cd L/../q; touch M/f",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D1"
+  },
+  {
+   "input": "pushd L/../q && cp a.txt h",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D1"
+  },
+  {
+   "input": "echo x >> q/h",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D1-control"
+  },
+  {
+   "input": "touch q/M/f",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D1-control"
+  },
+  {
+   "input": "echo {} > .mcp.jſon",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D2"
+  },
+  {
+   "input": "cp a.txt .claude.jſon",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D2"
+  },
+  {
+   "input": "touch .mcp.jſon",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D2"
+  },
+  {
+   "input": ".mcp.jſon",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "ask",
+   "group": "D2"
+  },
+  {
+   "input": "sub/.baſhrc",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "ask",
+   "group": "D2"
+  },
+  {
+   "input": "echo {} > .MCP.JSON",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D2-control"
+  },
+  {
+   "input": "echo {} > .mcp.json",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D2-control"
+  },
+  {
+   "input": "echo x > .groK/config.toml",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D2-control"
+  },
+  {
+   "input": "cp a.txt d",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D3"
+  },
+  {
+   "input": "cp a.txt d/",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D3"
+  },
+  {
+   "input": "cp -R d e",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D3"
+  },
+  {
+   "input": "cp a.txt d/a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D3-control"
+  },
+  {
+   "input": "chmod -R u+w e",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D4"
+  },
+  {
+   "input": "chmod -R 644 .",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D4"
+  },
+  {
+   "input": "chmod u+w e/h",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D4-control"
+  },
+  {
+   "input": "cp -R k d2 && echo x > d2/f",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D5"
+  },
+  {
+   "input": "cp -R k d2; mkdir d2/x",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D5"
+  },
+  {
+   "input": "cp -R k d3 && cp a.txt d3/z",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D5"
+  },
+  {
+   "input": "printf -v CDPATH %s /outside/out; cd sub && touch x",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D6"
+  },
+  {
+   "input": "printf -v CDPATH ~; cd sub && echo x > y",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "D6"
+  },
+  {
+   "input": "n b.txt",
+   "kind": "edit",
+   "tool": "search_replace",
+   "expect": "ask",
+   "group": "D7"
+  },
+  {
+   "input": "n b.txt",
+   "kind": "edit",
+   "tool": "search_replace",
+   "expect": "ask",
+   "group": "D7-control"
+  },
+  {
+   "input": "echo x > d/a.txt",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "echo x > k/f",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "mkdir -p k/n/m",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "echo x >> chain1",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "echo x > dang",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "echo x > loop",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "touch ../x",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "mkdir -p n/../../x",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "touch L/../../../x",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "touch /{OUT}/x",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "echo x >> ./q/./h",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "touch k/",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "echo x > ''",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "cd k && touch f",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "cd .. && touch f",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "cd sub; cd - ; touch f",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "cd && touch f",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "cd ~ && touch f",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "cd nosuch; echo x >> q/h",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "cd a; cd b; cd ../..; cd sub; cd ..; cd q; cd ..; cd d; cd ..; cd e; touch z",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "pushd && touch f",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "pushd +1 && touch f",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "touch ~root/x",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "touch ~+/x",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "touch $HOME/x",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "touch ${HOME}/../x",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "touch $PWD/x",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "echo x > q/h",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "echo x | tee q/h",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "cp a.txt q/h",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "mv a.txt q/h",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "touch q/h",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "chmod 600 q/h",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "mv k k2 && echo x > k2/f",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "echo x > .GIT/hooks/pre-commit",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "touch .Git/",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "touch sub/.git/x",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "echo x > hooks/pre-commit",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "ln -s ~ k3",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "popd",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "echo x > /dev/disk0",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "echo x > /dev/fd/../..{OUT}/x",
+   "kind": "bash",
+   "expect": "ask",
+   "group": "held"
+  },
+  {
+   "input": "d/a.txt",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "ask",
+   "group": "held-edit"
+  },
+  {
+   "input": "k/new.txt",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "ask",
+   "group": "held-edit"
+  },
+  {
+   "input": "q/h",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "ask",
+   "group": "held-edit"
+  },
+  {
+   "input": ".git/hooks/pre-commit",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "ask",
+   "group": "held-edit"
+  },
+  {
+   "input": ".GIT/hooks/pre-commit",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "ask",
+   "group": "held-edit"
+  },
+  {
+   "input": "hooks/pre-commit",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "ask",
+   "group": "held-edit"
+  },
+  {
+   "input": "dang",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "ask",
+   "group": "held-edit"
+  },
+  {
+   "input": "chain1",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "ask",
+   "group": "held-edit"
+  },
+  {
+   "input": "../x.txt",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "ask",
+   "group": "held-edit"
+  },
+  {
+   "input": "~/x.txt",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "ask",
+   "group": "held-edit"
+  },
+  {
+   "input": ".groK/config.toml",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "ask",
+   "group": "held-edit"
+  },
+  {
+   "input": "new/dir/x.txt",
+   "kind": "edit",
+   "tool": "write",
+   "expect": "allow",
+   "group": "ok-edit"
+  }
+ ]
+}

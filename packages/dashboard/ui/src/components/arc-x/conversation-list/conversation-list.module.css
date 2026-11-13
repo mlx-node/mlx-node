@@ -1,0 +1,238 @@
+.root {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  padding: 0 0 var(--space-3);
+  animation: list-swap var(--duration-fast) var(--ease-enter) both;
+}
+
+.loading {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-1);
+}
+
+.empty {
+  padding: var(--space-4) var(--space-3);
+}
+
+.group {
+  display: grid;
+  min-width: 0;
+}
+
+.groupLabel {
+  margin: 0;
+  padding: var(--space-3) var(--space-3) var(--space-1);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.list {
+  display: grid;
+  margin: 0;
+  padding: 0 var(--space-1);
+  list-style: none;
+}
+
+.row {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: var(--row-height);
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  border-radius: var(--radius-control);
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+
+.row[data-two-line] {
+  min-height: 44px;
+}
+
+.row[data-enter] {
+  animation: row-enter var(--duration-standard) var(--ease-enter) both;
+}
+
+.row:hover {
+  background: var(--row-hover);
+}
+
+.row[data-current] {
+  background: var(--row-active);
+}
+
+.row[data-current]::before {
+  position: absolute;
+  top: var(--space-2);
+  bottom: var(--space-2);
+  inset-inline-start: 0;
+  width: 2px;
+  border-radius: var(--radius-mark);
+  background: var(--foreground);
+  content: '';
+}
+
+.link {
+  --focus-outline-offset: -2px;
+  display: grid;
+  min-width: 0;
+  min-height: inherit;
+  grid-column: 1 / -1;
+  grid-row: 1;
+  grid-template-columns: 14px minmax(0, 1fr);
+  align-items: center;
+  border-radius: inherit;
+  padding: 0 var(--space-2) 0 var(--space-3);
+  color: var(--foreground);
+  text-decoration: none;
+}
+
+.dot {
+  display: inline-flex;
+  width: 14px;
+}
+
+.text {
+  display: grid;
+  min-width: 0;
+  padding-inline-end: 4.5rem;
+}
+
+.titleLine {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.title {
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mode {
+  flex: none;
+}
+
+.permission {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-secondary);
+}
+
+.permission[data-permission-mode='bypass'] {
+  color: var(--danger);
+}
+
+.folder[data-loud] {
+  display: flex;
+  min-width: 0;
+}
+
+.permissionWord {
+  flex: none;
+  white-space: pre;
+  color: color-mix(in oklab, var(--danger) 84%, var(--foreground));
+}
+
+.folder {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.time,
+.actions {
+  z-index: 1;
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: end;
+  padding-inline-end: var(--space-2);
+}
+
+.time {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  transition: opacity var(--duration-fast) var(--ease-standard);
+}
+
+.actions {
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--duration-fast) var(--ease-standard);
+}
+
+.row:hover > .actions,
+.row:focus-within > .actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.row:hover > .time,
+.row:focus-within > .time {
+  opacity: 0;
+}
+
+.actions button {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+@keyframes row-enter {
+  from {
+    max-height: 0;
+    min-height: 0;
+    opacity: 0;
+  }
+  to {
+    max-height: 44px;
+    opacity: 1;
+  }
+}
+
+@keyframes list-swap {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .root,
+  .row[data-enter] {
+    animation: none;
+  }
+
+  .row,
+  .time,
+  .actions {
+    transition: none;
+  }
+}

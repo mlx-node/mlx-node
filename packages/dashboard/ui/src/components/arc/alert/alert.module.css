@@ -1,0 +1,15 @@
+.presence { min-width: 0; }
+.alert { display: flex; align-items: start; gap: var(--space-3); border: 1px solid var(--border); border-radius: var(--radius-control); padding: var(--space-4); background: var(--surface); box-shadow: var(--shadow-resting); }
+.icon, .glyph { position: relative; display: grid; flex: 0 0 auto; place-items: center; }
+.icon { width: 18px; height: 18px; margin-top: 1px; }
+.icon svg { display: block; }
+.copy { flex: 1; min-width: 0; }
+.content { position: relative; }
+.title { position: relative; display: block; font-size: var(--text-sm); font-weight: 500; }
+.line { display: block; }
+.description { position: relative; margin: var(--space-1) 0 0; color: var(--text-secondary); font-size: var(--text-xs); }
+.info .icon { color: var(--info, var(--accent)); } .success .icon { color: var(--success); } .warning .icon { color: var(--warning); } .danger .icon { color: var(--danger); }
+.dismiss { display: grid; width: 28px; height: 28px; flex: 0 0 auto; place-items: center; margin: -5px -6px -5px 0; border: 0; border-radius: var(--radius-pill); background: transparent; color: var(--text-muted); cursor: pointer; transition: transform var(--duration-spring) var(--ease-spring), background-color var(--duration-fast) var(--ease-standard), color var(--duration-fast) var(--ease-standard); }
+.dismiss:active { transform: scale(.96); transition-duration: var(--duration-instant); transition-timing-function: var(--ease-standard); }
+@media (hover: hover) and (pointer: fine) { .dismiss:hover { background: var(--surface-muted); color: var(--foreground); } }
+@media (prefers-reduced-motion: reduce) { .dismiss { transition: none; } .dismiss:active { transform: none; } }

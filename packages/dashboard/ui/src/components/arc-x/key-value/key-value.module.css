@@ -1,0 +1,146 @@
+.root {
+  display: grid;
+  margin: 0;
+}
+
+.root[data-layout='grid'] {
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: var(--space-3) var(--space-4);
+}
+
+.row {
+  min-width: 0;
+}
+
+.root[data-layout='grid'] > .row {
+  display: grid;
+  align-content: start;
+  gap: var(--space-0-5);
+}
+
+.root[data-layout='rows'] {
+  grid-template-columns: fit-content(50%) minmax(0, 1fr);
+  column-gap: var(--space-3);
+}
+
+/* One label column for the whole list, so every value starts at the same x. */
+.root[data-layout='rows'] > .row {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  min-height: var(--row-height-dense);
+  align-items: center;
+  box-shadow: inset 0 -1px 0 var(--border-subtle);
+}
+
+.root[data-layout='rows'] > .row:last-child {
+  box-shadow: none;
+}
+
+.label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.root[data-layout='grid'] .label {
+  font-size: var(--text-xs);
+}
+
+.root[data-layout='rows'] .label {
+  flex: none;
+  font-size: var(--text-sm);
+}
+
+.value {
+  min-width: 0;
+  margin: 0;
+  color: var(--foreground);
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+}
+
+.root[data-layout='rows'] .value {
+  flex: 1;
+}
+
+.slot {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-1-5);
+}
+
+.root[data-layout='rows'] .value .slot {
+  justify-content: flex-end;
+}
+
+.root[data-layout='rows'] .value:not([data-numeric]) .slot {
+  justify-content: flex-start;
+}
+
+.value[data-numeric] {
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+}
+
+.value[data-mono] .text {
+  font-family: var(--font-code);
+  font-size: var(--text-code);
+  letter-spacing: 0;
+}
+
+.text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hint {
+  flex: none;
+  color: var(--text-muted);
+}
+
+.root[data-layout='rows'] .value[data-numeric] .text {
+  flex: none;
+}
+
+.root[data-layout='rows'] .hint {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.root[data-layout='grid'] .slot {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+
+.root[data-layout='grid'] .hint {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.root .hint[data-wrap] {
+  overflow: visible;
+  white-space: normal;
+}
+
+/* A copyable value keeps its button on the text's line; the text gives way with an ellipsis. */
+.root[data-layout='grid'] .value[data-copy] .slot {
+  flex-wrap: nowrap;
+}
+
+.copy {
+  display: inline-flex;
+  flex: none;
+}

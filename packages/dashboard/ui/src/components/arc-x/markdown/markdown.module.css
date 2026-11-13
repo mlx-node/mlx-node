@@ -1,0 +1,106 @@
+.root {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2-5);
+  color: var(--foreground);
+  font-size: var(--text-sm);
+  line-height: var(--leading-prose);
+  overflow-wrap: anywhere;
+}
+
+.root > [data-fresh] {
+  animation: markdown-chunk var(--duration-fast) var(--ease-standard) both;
+}
+
+.p,
+.list,
+.quote,
+.rule,
+.table {
+  margin: 0;
+}
+
+.h1,
+.h2,
+.h3 {
+  margin: var(--space-1) 0 0;
+  font-weight: 500;
+  line-height: var(--leading-body);
+}
+
+.h1 {
+  font-size: var(--text-lg);
+}
+
+.h2,
+.h3 {
+  font-size: var(--text-base);
+}
+
+.list {
+  display: grid;
+  gap: var(--space-1);
+  padding-inline-start: var(--space-5);
+}
+
+.quote {
+  border-inline-start: 2px solid var(--border-strong);
+  padding-inline-start: var(--space-3);
+  color: var(--text-secondary);
+}
+
+.rule {
+  height: 1px;
+  border: 0;
+  background: var(--border-subtle);
+}
+
+.table {
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.table :is(th, td) {
+  padding: var(--space-1) var(--space-2-5);
+  box-shadow: inset 0 -1px 0 var(--border-subtle);
+  text-align: start;
+}
+
+.table th {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.link {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.inlineCode {
+  border-radius: var(--radius-mark);
+  padding: 0 var(--space-1);
+  background: var(--surface-muted);
+  font-family: var(--font-code);
+  font-size: var(--text-code);
+  letter-spacing: 0;
+}
+
+.block {
+  min-width: 0;
+}
+
+@keyframes markdown-chunk {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .root > [data-fresh] {
+    animation: none;
+  }
+}

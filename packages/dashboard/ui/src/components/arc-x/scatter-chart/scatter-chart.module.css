@@ -1,0 +1,104 @@
+.points {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.point {
+  fill: color-mix(in oklab, var(--c) 70%, transparent);
+  transform-box: view-box;
+}
+
+.point[data-hollow] {
+  fill: var(--surface);
+  stroke: var(--c);
+  stroke-width: 1.5;
+}
+
+.ring {
+  fill: none;
+  stroke: var(--c);
+  stroke-width: 1.5;
+  animation: scatter-fade var(--duration-fast) var(--ease-standard) both;
+}
+
+.point[data-arrive] {
+  animation:
+    scatter-fade var(--duration-fast) var(--ease-enter) both,
+    scatter-pop var(--duration-spring) var(--ease-spring) both;
+}
+
+[data-entrance='pending'] .point {
+  opacity: 0;
+}
+
+[data-entrance='pending'] .points:not([data-wave]) {
+  opacity: 0;
+}
+
+[data-entrance='run'] .points[data-wave] .point {
+  animation:
+    scatter-fade var(--duration-standard) var(--ease-standard)
+      calc(var(--i) * min(var(--stagger-cell), calc(var(--stagger-budget) / var(--n)))) both,
+    scatter-grow var(--duration-standard) var(--ease-standard)
+      calc(var(--i) * min(var(--stagger-cell), calc(var(--stagger-budget) / var(--n)))) both;
+}
+
+[data-entrance='run'] .points:not([data-wave]) {
+  animation: scatter-reveal var(--duration-standard) var(--ease-enter) both;
+}
+
+[data-entrance='run'] .points:not([data-wave]) .point {
+  opacity: 1;
+}
+
+@keyframes scatter-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes scatter-grow {
+  from {
+    scale: 0.5;
+  }
+  to {
+    scale: 1;
+  }
+}
+
+@keyframes scatter-pop {
+  from {
+    scale: 0.5;
+  }
+  to {
+    scale: 1;
+  }
+}
+
+@keyframes scatter-reveal {
+  from {
+    opacity: 0;
+    translate: 0 4px;
+  }
+  to {
+    opacity: 1;
+    translate: 0 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ring,
+  .point[data-arrive] {
+    animation: none;
+  }
+  [data-entrance='run'] .points[data-wave] .point,
+  [data-entrance='run'] .points:not([data-wave]) {
+    animation: none;
+  }
+}

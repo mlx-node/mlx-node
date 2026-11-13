@@ -1,0 +1,237 @@
+.clip {
+  overflow: clip;
+  min-width: 0;
+}
+
+/* "Proposed" is dashed: the agent asks, nothing has run yet. */
+.root {
+  box-sizing: border-box;
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2);
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-panel);
+  padding: var(--space-3);
+  background: var(--surface);
+  color: var(--foreground);
+}
+
+.top {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.head {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.icon {
+  display: inline-flex;
+  flex: none;
+  align-self: center;
+  color: var(--text-secondary);
+}
+
+.title {
+  min-width: 0;
+  margin: 0;
+  flex: 1;
+  font-size: var(--text-base);
+  font-weight: 500;
+  line-height: var(--leading-body);
+}
+
+.meta {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 50%;
+  flex: none;
+  align-items: baseline;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.subtitle {
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The exact command or path: wrapped, never cut; a long one scrolls inside the well. */
+.exact {
+  box-sizing: border-box;
+  max-height: 15rem;
+  min-width: 0;
+  margin: 0;
+  overflow-y: auto;
+  border-radius: var(--radius-inset);
+  padding: var(--space-2) var(--space-2-5);
+  background: var(--surface-muted);
+  color: var(--foreground);
+  font-family: var(--font-code);
+  font-size: var(--text-code);
+  letter-spacing: 0;
+  line-height: var(--leading-code);
+  overscroll-behavior: contain;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* A well that does not fit fades at its end until it was scrolled there. */
+.exactWrap {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.exactWrap[data-overflow]:not([data-end])::after {
+  position: absolute;
+  inset-inline: 0;
+  bottom: calc(var(--text-xs) * 1.5 + var(--space-1));
+  height: 2.5rem;
+  border-radius: 0 0 var(--radius-inset) var(--radius-inset);
+  background: linear-gradient(to bottom, transparent, var(--surface-muted));
+  content: '';
+  pointer-events: none;
+}
+
+.exactNote {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+/* Padding shown as a count: set apart from the command text so it cannot be read as part of it. */
+.gap {
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-inset);
+  padding: 0 var(--space-1);
+  color: var(--text-secondary);
+  font-family: var(--font-body);
+  font-size: var(--text-xs);
+  font-style: italic;
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.fieldBox {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.count {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 400;
+}
+
+.well {
+  box-sizing: border-box;
+  max-height: 15rem;
+  min-width: 0;
+  overflow-y: auto;
+  border-radius: var(--radius-inset);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-muted);
+  overscroll-behavior: contain;
+}
+
+.warnings {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  gap: var(--space-1);
+  list-style: none;
+}
+
+.warning {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: var(--space-1-5);
+  color: var(--warning);
+  font-size: var(--text-sm);
+}
+
+.warning[data-tone='neutral'] {
+  color: var(--text-secondary);
+}
+
+.warningIcon {
+  display: inline-flex;
+  flex: none;
+  padding-top: 2px;
+}
+
+.foot {
+  display: grid;
+  min-width: 0;
+  margin-top: var(--space-1);
+  gap: var(--space-1-5);
+}
+
+.notes {
+  display: grid;
+  gap: var(--space-0-5);
+}
+
+.actions {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.note {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.fieldLabel {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+  color: var(--foreground);
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+.field {
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: 4.5rem;
+  resize: vertical;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-inset);
+  padding: var(--space-1-5) var(--space-2);
+  background: var(--surface);
+  color: var(--foreground);
+  font: inherit;
+  font-weight: 400;
+}
+
+.field:focus {
+  border-color: var(--foreground);
+  outline: none;
+}

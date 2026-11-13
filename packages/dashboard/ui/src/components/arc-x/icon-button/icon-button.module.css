@@ -1,0 +1,16 @@
+.icon.icon {
+  flex: none;
+  padding: 0;
+}
+
+.icon.sm {
+  width: var(--control-height-sm);
+}
+
+.icon.md {
+  width: var(--control-height-md);
+}
+
+.icon.lg {
+  width: var(--control-height-lg);
+}

@@ -1,0 +1,65 @@
+.root {
+  position: relative;
+  min-width: 0;
+  margin: 0;
+  border-radius: var(--radius-inset);
+  padding: var(--space-2) var(--space-2-5);
+  background: var(--surface-muted);
+  color: var(--text-secondary);
+}
+
+.clip {
+  overflow: clip;
+}
+
+.clip[data-collapsed] {
+  max-height: calc(var(--text-code) * var(--leading-code) * var(--lines));
+}
+
+.code {
+  margin: 0;
+  padding-inline-end: var(--control-height-sm);
+  overflow-x: auto;
+  font-family: var(--font-code);
+  font-size: var(--text-code);
+  letter-spacing: 0;
+  line-height: var(--leading-code);
+  white-space: pre;
+}
+
+.code[data-wrap] {
+  overflow-x: visible;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.copy {
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-1);
+}
+
+.more {
+  margin-top: var(--space-1);
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  cursor: pointer;
+  transition: color var(--duration-fast) var(--ease-standard);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .more:hover {
+    color: var(--foreground);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .more {
+    transition-duration: var(--duration-instant);
+  }
+}
