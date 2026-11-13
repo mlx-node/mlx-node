@@ -47,6 +47,7 @@ import { DecisionRegistry } from './decision-registry.js';
 import type { ModelAdmissionLane } from './model-work-coordinator.js';
 import { RerankRegistry } from './rerank-registry.js';
 import { SessionRegistry } from './session-registry.js';
+import type { ModelIdentity } from './turn-trace.js';
 
 interface ModelLoadAdmissionCoordinator {
   bindRequestLoadAdmissions(modelId: string, registry: ModelAdmissionLane): void;
@@ -69,6 +70,12 @@ export interface ServedContext {
   kvFormat?: 'int8' | 'bf16';
   /** The model's `model_id` in the memory governor's `scheduler` status. */
   governorModelId?: number;
+}
+
+/** The whole-token window of the lane the default text turn takes; `undefined` when unusable. */
+function servedWindowOf(limits: SessionContextLimits): number | undefined {
+  const windowTokens = Math.floor(contextLane(limits).windowTokens);
+  return Number.isSafeInteger(windowTokens) && windowTokens > 0 ? windowTokens : undefined;
 }
 
 /** Model entry stored in the registry. */
@@ -165,6 +172,19 @@ export interface RegisterOptions {
    * clamp pathological values before dispatch.
    */
   maxOutputTokens?: number;
+  /**
+   * Identity stamped on the traces of the binding this call creates. An
+   * existing binding keeps the identity it was created with: aliases
+   * register against the same model object, so the first registration wins.
+   */
+  identity?: ModelIdentity;
+}
+
+/** One resident model binding, for the runtime sampler. */
+export interface ResidentModel {
+  names: string[];
+  model: ServableModel;
+  sessions: SessionRegistry;
 }
 
 export class ModelRegistry {
@@ -235,6 +255,7 @@ export class ModelRegistry {
   private readonly retiredInstanceIds = new WeakMap<ServableModel, { instanceId: number; outstandingCount: number }>();
   private modelLoadAdmissionCoordinator: ModelLoadAdmissionCoordinator | undefined;
   private readonly modelDisposals = new Set<Promise<void>>();
+  private bindingReleaseListener: (() => void) | undefined;
 
   constructor(opts?: ModelRegistryOptions) {
     this.maxQueueDepth = opts?.maxQueueDepth;
@@ -274,6 +295,16 @@ export class ModelRegistry {
         coordinator.bindRequestLoadAdmissions(name, entry.sessionRegistry);
       }
     }
+  }
+
+  /**
+   * Called once per model binding that no name, dispatch lease or persist
+   * retention holds any more, after its cached sessions are released and,
+   * when the teardown disposes the model, after that dispose settles. From
+   * then on the registry holds no reference to that model object.
+   */
+  setBindingReleaseListener(listener: (() => void) | undefined): void {
+    this.bindingReleaseListener = listener;
   }
 
   /**
@@ -336,6 +367,7 @@ export class ModelRegistry {
     // in-flight one.
     let binding = this.sessionRegistriesByModel.get(model);
     if (!binding) {
+      const limits = typeof model.contextLimits === 'function' ? model.contextLimits() : undefined;
       binding = {
         registry: new SessionRegistry({
           model,
@@ -346,6 +378,8 @@ export class ModelRegistry {
           // Resolve the trace name per turn — requests stamp their own alias,
           // and the binding outlives `name` whenever aliases rebind it.
           modelName: () => this.bindingDisplayName(model) ?? name,
+          identity: opts?.identity,
+          servedWindowTokens: limits !== undefined ? servedWindowOf(limits) : undefined,
         }),
         refCount: 0,
         inFlight: 0,
@@ -353,7 +387,6 @@ export class ModelRegistry {
         pendingTeardown: false,
         disposeOnTeardown: false,
       };
-      const limits = typeof model.contextLimits === 'function' ? model.contextLimits() : undefined;
       if (limits !== undefined) binding.context = { limits };
       this.sessionRegistriesByModel.set(model, binding);
     } else {
@@ -512,6 +545,7 @@ export class ModelRegistry {
     const flushed = binding.registry.flushPendingDisposals().catch((error: unknown) => {
       console.error('[server] failed to flush final chat-session owner disposals:', error);
     });
+    let settled: Promise<void> = flushed;
     if (binding.disposeOnTeardown && typeof model.dispose === 'function') {
       // The sessions' owner releases run on the model thread, so they land
       // before the thread is joined.
@@ -525,7 +559,9 @@ export class ModelRegistry {
         )
         .finally(() => this.modelDisposals.delete(disposal));
       this.modelDisposals.add(disposal);
+      settled = disposal;
     }
+    void settled.then(() => this.bindingReleaseListener?.());
     this.sessionRegistriesByModel.delete(model);
     this.instanceIds.delete(model);
   }
@@ -763,6 +799,19 @@ export class ModelRegistry {
     return out;
   }
 
+  /** One entry per binding, with every registered name that resolves to it. */
+  listResidentModels(): ResidentModel[] {
+    const out: ResidentModel[] = [];
+    for (const [model, binding] of this.sessionRegistriesByModel) {
+      const names: string[] = [];
+      for (const [name, entry] of this.models) {
+        if (entry.model === model) names.push(name);
+      }
+      out.push({ names, model, sessions: binding.registry });
+    }
+    return out;
+  }
+
   /**
    * The window and K/V format every turn on `name` takes (the window the
    * ChatSession clamp reads); `undefined` when
@@ -773,8 +822,8 @@ export class ModelRegistry {
     const context = entry && this.sessionRegistriesByModel.get(entry.model)?.context;
     if (!entry || !context) return undefined;
     const lane = contextLane(context.limits);
-    const windowTokens = Math.floor(lane.windowTokens);
-    if (!Number.isSafeInteger(windowTokens) || windowTokens <= 0) return undefined;
+    const windowTokens = servedWindowOf(context.limits);
+    if (windowTokens === undefined) return undefined;
     const { governorModelId } = context.limits;
     return {
       windowTokens,

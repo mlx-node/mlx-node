@@ -29,7 +29,8 @@
  *   2. the SSD caches of the loaded models (their `closeCache`, then the
  *      process tier's drain),
  *   3. the verbose request logger (when `logDir` is set),
- *   4. the `PagedConfigOverrideManager`'s temp root.
+ *   4. the `PagedConfigOverrideManager`'s temp root,
+ *   5. the runtime sampler (series + `live-<pid>.json` heartbeat).
  *
  * The server goes first because the logger records a request from that
  * request's own `finish`/`close` handler. Ending the log streams while a
@@ -68,6 +69,7 @@ import type { AudioModel } from '../audio-registry.js';
 import type { AudioServiceOptions } from '../audio-service.js';
 import type { ServerHealth } from '../health.js';
 import { resolveRerankLimits, type RerankServiceOptions } from '../rerank-service.js';
+import type { HostKind, RuntimeCapability } from '../runtime-trace.js';
 import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance } from '../server.js';
 import { FLUSH_MS } from '../supervision.js';
 import type { TurnJournalOptions } from '../turn-journal.js';
@@ -78,15 +80,19 @@ import { discoverModels, type DiscoveredModel } from './discover.js';
 import { applyEnginePolicy, type EnginePolicy } from './env-policy.js';
 import { DEFAULT_IDLE_RELEASE_SECONDS } from './idle-release.js';
 import { attachLogger as defaultAttachLogger, type Logger } from './logger.js';
+import { createModelReleaser, type Collector } from './model-release.js';
 import { hostUrl, isLoopbackBindHost, normalizeLoopbackBindHost, pickFreePort } from './net.js';
 import { resolveModelsDir } from './paths.js';
 import {
   PERSIST_PAGED_CACHE_DEFAULT,
   PERSIST_PAGED_CACHE_ENV,
+  resolveColdCapture,
   resolvePersistPagedCache,
+  type ColdCaptureBudget,
   type PersistPagedCache,
 } from './persist-cache.js';
 import { loadRerankModel, rerankCapability } from './rerank-models.js';
+import { startRuntimeSampler, type RuntimeSampler } from './runtime-sampler.js';
 import { makeSwapController } from './swap.js';
 import { hostTempDirPrefix, sweepOrphanHostTempRoots } from './temp-root.js';
 
@@ -140,6 +146,8 @@ export class InferenceHostClosedError extends Error {
 }
 
 export interface InferenceHostOptions {
+  /** Who runs this host; stamped on the runtime series. Default `'embedded'`. */
+  hostKind?: HostKind;
   modelResidency?: 'capability' | 'single';
   audio?: AudioServiceOptions;
   rerank?: RerankServiceOptions;
@@ -236,6 +244,13 @@ export interface InferenceHostOptions {
   /** See `ServerConfig.turnJournal`. */
   turnJournal?: TurnJournalOptions;
   /**
+   * Write the whole-prompt capture limits (`MLX_COLD_CAPTURE_*`) the env does
+   * not set, for the cold tier's per-turn capture walk of the families in
+   * `COLD_TIER_RESTORE_FAMILIES`; only when the disk cache is on. Not the
+   * qwen3_5 / qwen3_5_moe state tier. Omitted ⇒ the native limits.
+   */
+  persistWholePrompt?: boolean;
+  /**
    * Seconds without a request before the residency is unwired and the chat
    * weights are freed (`--idle-release`); the next request loads them again.
    * Omitted ⇒ {@link DEFAULT_IDLE_RELEASE_SECONDS} (10 minutes); `Infinity`
@@ -285,6 +300,8 @@ export interface InferenceHostOptions {
   now?: () => number;
   /** Test seam: receives the SSD cache close line (`console.log`'s). */
   log?: (line: string) => void;
+  /** Test seam: replaces the V8 collector that releases a dropped chat model; `null` = none. */
+  collectGarbage?: Collector | null;
 }
 
 /** A loaded model with an SSD cache to close at a clean stop (qwen3_5 / qwen3_5_moe). */
@@ -315,6 +332,8 @@ export interface InferenceHost {
   logDir: string | null;
   /** The resolved paged KV disk cache switch every load of this process reads. */
   persistPagedCache: boolean;
+  /** The per-turn capture limits model loads read; `null` when the disk cache is off. */
+  coldCapture: ColdCaptureBudget | null;
   /** Escape hatch for callers that need the registry, store, or raw `http.Server`. */
   server: ServerInstance;
   /** Current readiness snapshot — the same body `GET /health` returns. */
@@ -397,6 +416,8 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   // silently done nothing.
   if (opts.enginePolicy !== undefined) applyEnginePolicy(opts.enginePolicy);
   process.env[PERSIST_PAGED_CACHE_ENV] = persistPagedCache ? '1' : '0';
+  const coldCapture = resolveColdCapture(opts.persistWholePrompt === true, persistPagedCache);
+  Object.assign(process.env, coldCapture.writes);
   // Splash keeps one value for both: the residency lapses and the weights go
   // after the same time without a request.
   (opts.setResidencyKeepAlive ?? setResidencyKeepAliveNative)(idleReleaseSeconds);
@@ -451,6 +472,12 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   // late-bound holder: the callbacks capture `ctrlRef.current` by closure.
   const ctrlRef: { current: ReturnType<typeof makeSwapController> | null } = { current: null };
   const chatRef: { current: ReturnType<typeof makeSwapController> | null } = { current: null };
+  // Started once the port is known; loads before that are not timed.
+  const samplerRef: { current: RuntimeSampler | null } = { current: null };
+  const timedLoad = <T>(
+    info: { model: string; modelType: string; capability: RuntimeCapability },
+    load: () => Promise<T>,
+  ): Promise<T> => (samplerRef.current === null ? load() : samplerRef.current.timedLoad(info, load));
   let acceptingHttpModelLoads = true;
   const activeHttpModelLoads = new Set<Promise<void>>();
 
@@ -474,6 +501,11 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     listModels: () => ctrlRef.current!.listModels(),
     idleReleaseMs: idleReleaseSeconds * 1000,
     releaseWeights: () => chatRef.current!.releaseAll!(),
+    unloadModels: async (): Promise<string[]> => {
+      const names = models.filter((m) => server.registry.getAny(m.name) !== undefined).map((m) => m.name);
+      await chatRef.current!.releaseAll!();
+      return names;
+    },
     ...(opts.authToken !== undefined ? { authToken: opts.authToken } : {}),
     ...(opts.storePath !== undefined ? { storePath: opts.storePath } : {}),
     ...(opts.disableStore !== undefined ? { disableStore: opts.disableStore } : {}),
@@ -482,6 +514,9 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     ...(opts.turnJournal !== undefined ? { turnJournal: opts.turnJournal } : {}),
   };
   const server = await createServer(serverConfig);
+  const collectGarbage = opts.collectGarbage;
+  const releaser = createModelReleaser(collectGarbage === undefined ? {} : { resolve: () => collectGarbage });
+  server.registry.setBindingReleaseListener(() => releaser.released());
 
   // Wrap the loader so `pagedModelTypes` families get `use_block_paged_cache:
   // true` injected via a temp-dir clone with a patched config.json. The temp
@@ -525,9 +560,9 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
         : {}),
     };
     try {
-      return Object.keys(options).length === 0
-        ? await loadModelFn(resolvedPath)
-        : await loadModelFn(resolvedPath, options);
+      return await timedLoad({ model: entry.name, modelType: String(entry.modelType), capability: 'chat' }, () =>
+        Object.keys(options).length === 0 ? loadModelFn(resolvedPath) : loadModelFn(resolvedPath, options),
+      );
     } catch (error) {
       if (leasedDir !== undefined) releaseNativeGgufLease(leasedDir);
       throw error;
@@ -549,14 +584,20 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     estimates.get(name),
   );
   chatRef.current = chatController;
+  const audioLoader = opts.loadAudioModel ?? loadAudioModel;
+  const rerankLoader =
+    opts.loadRerankModel ??
+    ((entry: DiscoveredReranker) => loadRerankModel(entry, familyLoadOptions(opts.reranker, entry.modelType)));
   const controller = withCapabilityModels(
     [
       chatCapability(chatController, server.registry),
-      ...audioCapabilities(audioModels, server.registry, opts.loadAudioModel ?? loadAudioModel),
-      rerankCapability(
-        rerankModels,
-        server.registry,
-        opts.loadRerankModel ?? ((entry) => loadRerankModel(entry, familyLoadOptions(opts.reranker, entry.modelType))),
+      ...audioCapabilities(audioModels, server.registry, (entry) =>
+        timedLoad({ model: entry.name, modelType: entry.modelType, capability: 'audio' }, () => audioLoader(entry)),
+      ),
+      rerankCapability(rerankModels, server.registry, (entry) =>
+        timedLoad({ model: entry.name, modelType: String(entry.modelType), capability: 'rerank' }, () =>
+          rerankLoader(entry),
+        ),
       ),
     ],
     opts.modelResidency ?? 'capability',
@@ -664,6 +705,14 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     }
   };
 
+  const sampler = startRuntimeSampler({
+    registry: server.registry,
+    health: () => server.health(),
+    models: models.map((m) => ({ name: m.name, modelType: String(m.modelType), contextWindow: m.contextWindow })),
+    host: { kind: opts.hostKind ?? 'embedded', port: boundPort, persistPagedCache, coldCapture: coldCapture.budget },
+  });
+  samplerRef.current = sampler;
+
   return {
     url: hostUrl(host, boundPort),
     port: boundPort,
@@ -675,6 +724,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     boundModel: boundEntry.name,
     logDir: logger?.logDir ?? null,
     persistPagedCache,
+    coldCapture: coldCapture.budget,
     server,
     health: () => server.health(),
 
@@ -753,6 +803,11 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
           } catch (error) {
             disposalError ??= error;
           }
+        }
+        try {
+          await sampler.stop();
+        } catch {
+          /* telemetry is best effort; never block shutdown */
         }
         // Only once nothing is still serving. The logger writes a request's
         // record from that request's `finish` handler, so ending the streams
@@ -860,16 +915,25 @@ export {
   type ResolvedCacheDisk,
 } from './cache-disk.js';
 export {
+  COLD_CAPTURE_BLOCKS_ENV,
+  COLD_CAPTURE_BUDGET_MS_ENV,
+  parseCaptureEnv,
   parsePersistEnv,
   PERSIST_CACHE_CONFLICT_ERROR,
   PERSIST_PAGED_CACHE_DEFAULT,
   PERSIST_PAGED_CACHE_ENV,
+  PERSIST_WHOLE_PROMPT_FLAG,
   persistPagedCacheFlag,
+  resolveColdCapture,
   resolvePersistPagedCache,
+  WHOLE_PROMPT_CAPTURE_BLOCKS,
+  WHOLE_PROMPT_CAPTURE_BUDGET_MS,
+  type ColdCaptureBudget,
   type PersistPagedCache,
 } from './persist-cache.js';
 export {
   applyEnginePolicy,
+  DESKTOP_ENGINE_POLICY,
   engineEnvFor,
   ENGINE_POLICY_ENV_VARS,
   LAUNCHER_ENGINE_POLICY,

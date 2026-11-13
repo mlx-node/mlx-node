@@ -115,6 +115,8 @@ export interface HandlerOptions {
    * returns this list instead of `registry.list()`.
    */
   listModels?: () => PublicModelEntry[];
+  /** Backs `POST /v1/models/unload`: unloads the resident chat models and returns their names. */
+  unloadModels?: () => Promise<string[]>;
   /**
    * Shared secret required on every route except `/health` and `/v1/health`.
    *
@@ -154,6 +156,7 @@ export function createHandler(
   const resolveModel = options?.resolveModel;
   const modelWorkCoordinator = options?.modelWorkCoordinator ?? new ModelWorkCoordinator(registry.queueDepthLimit);
   const listModels = options?.listModels;
+  const unloadModels = options?.unloadModels;
   const health =
     options?.health ?? createHealthReporter({ registry, idleSweeper, modelWorkCoordinator: modelWorkCoordinator });
 
@@ -233,6 +236,7 @@ export function createHandler(
           authenticated,
           audio,
           rerank,
+          unloadModels,
           thinkingTokenBudget: options?.thinkingTokenBudget,
           ...(options?.turnJournal !== undefined ? { turnJournal: options.turnJournal } : {}),
           ...(options?.releaseMemory !== undefined ? { releaseMemory: options.releaseMemory } : {}),

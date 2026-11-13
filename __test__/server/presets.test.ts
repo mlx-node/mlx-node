@@ -89,6 +89,20 @@ describe('QWEN launch-preset repetition cutoff is default-off', () => {
   });
 });
 
+describe('Qwen3.8-Flash-Next launch preset', () => {
+  // The GGUF's `general.sampling.*` and Splash's QWEN_SAMPLING: 1.0 / 0.95 / 20.
+  it('samples at temperature 1.0, top_p 0.95, top_k 20 with no penalties', () => {
+    expect(launchPresetFor('qwen4_exp')!.sampling).toEqual({
+      temperature: 1.0,
+      topP: 0.95,
+      topK: 20,
+      minP: 0,
+      presencePenalty: 0,
+      repetitionPenalty: 1,
+    });
+  });
+});
+
 describe('scope lock: non-Qwen presets unchanged', () => {
   it('does not set the cutoff on the Gemma4 preset', () => {
     expect(GEMMA4_SAMPLING_DEFAULTS.maxConsecutiveTokens).toBeUndefined();

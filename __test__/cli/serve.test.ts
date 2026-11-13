@@ -18,6 +18,12 @@ import { parseServeArgs, run } from '../../packages/cli/src/commands/serve.js';
 
 const CHUNK_ENV = 'MLX_PAGED_PREFILL_CHUNK_SIZE';
 const originalChunkEnv = process.env[CHUNK_ENV];
+const PERSIST_ENV = 'MLX_PERSIST_PAGED_CACHE';
+const originalPersistEnv = process.env[PERSIST_ENV];
+const BLOCKS_ENV = 'MLX_COLD_CAPTURE_BLOCKS_PER_TURN';
+const BUDGET_ENV = 'MLX_COLD_CAPTURE_BUDGET_MS';
+const originalBlocksEnv = process.env[BLOCKS_ENV];
+const originalBudgetEnv = process.env[BUDGET_ENV];
 
 let scratchDirs: string[] = [];
 let installedSignalHandlers: { signal: NodeJS.Signals; handler: NodeJS.SignalsListener }[] = [];
@@ -32,6 +38,12 @@ afterEach(async () => {
 
   if (originalChunkEnv === undefined) delete process.env[CHUNK_ENV];
   else process.env[CHUNK_ENV] = originalChunkEnv;
+  if (originalPersistEnv === undefined) delete process.env[PERSIST_ENV];
+  else process.env[PERSIST_ENV] = originalPersistEnv;
+  if (originalBlocksEnv === undefined) delete process.env[BLOCKS_ENV];
+  else process.env[BLOCKS_ENV] = originalBlocksEnv;
+  if (originalBudgetEnv === undefined) delete process.env[BUDGET_ENV];
+  else process.env[BUDGET_ENV] = originalBudgetEnv;
 
   vi.restoreAllMocks();
 });
@@ -181,6 +193,103 @@ describe('parseServeArgs', () => {
 
   it('leaves logDir unset without --verbose', () => {
     expect(parseServeArgs([]).logDir).toBeUndefined();
+  });
+
+  it('maps --persist-whole-prompt', () => {
+    expect(parseServeArgs(['--persist-whole-prompt']).persistWholePrompt).toBe(true);
+    expect('persistWholePrompt' in parseServeArgs([])).toBe(false);
+  });
+});
+
+interface ServeLoadSaw {
+  env: string | undefined;
+  host: boolean;
+  line: string | undefined;
+  capture: { blocks: string | undefined; ms: string | undefined; line: string | undefined };
+}
+
+/** Run `mlx serve` with `argv`, preload `alpha`, and return the disk-cache env its load saw and the startup lines. */
+async function serveLoadSaw(argv: string[]): Promise<ServeLoadSaw> {
+  const modelsDir = await makeModelsDir(['alpha']);
+  const logged: string[] = [];
+  vi.spyOn(console, 'log').mockImplementation((line: unknown) => {
+    logged.push(String(line));
+  });
+  const seen: (string | undefined)[] = [];
+  const captureSeen: { blocks: string | undefined; ms: string | undefined }[] = [];
+  let hostSays = false;
+  const exitCodes: number[] = [];
+  const sigintBefore = new Set(listenersOf('SIGINT'));
+  await run(['--port', '0', '--models-dir', modelsDir, '--preload', 'alpha', ...argv], {
+    hostOverrides: {
+      disableStore: true,
+      sweepOrphanTempRoots: false,
+      estimateContextWindow: async () => null,
+      loadModel: async () => {
+        seen.push(process.env[PERSIST_ENV]);
+        captureSeen.push({ blocks: process.env[BLOCKS_ENV], ms: process.env[BUDGET_ENV] });
+        return {} as unknown as LoadableModel;
+      },
+    },
+    exit: (code) => exitCodes.push(code),
+    onReady: async (host: InferenceHost) => {
+      hostSays = host.persistPagedCache;
+      for (let i = 0; i < 200 && seen.length === 0; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
+      added[0]!('SIGINT');
+      for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    },
+  });
+  expect(exitCodes).toEqual([0]);
+  expect(seen).toHaveLength(1);
+  delete process.env[BLOCKS_ENV];
+  delete process.env[BUDGET_ENV];
+  return {
+    env: seen[0],
+    host: hostSays,
+    line: logged.find((l) => l.startsWith('[mlx] paged KV disk cache:')),
+    capture: { ...captureSeen[0]!, line: logged.find((l) => l.startsWith('[mlx] paged KV disk capture')) },
+  };
+}
+
+/** {@link serveLoadSaw}, the capture limits only. */
+async function captureEnvAtLoad(argv: string[]): Promise<ServeLoadSaw['capture']> {
+  return (await serveLoadSaw(argv)).capture;
+}
+
+describe('mlx serve — per-turn disk capture', () => {
+  const WHOLE = '[mlx] paged KV disk capture per turn: 63125 blocks, 10000 ms';
+  const NATIVE = '[mlx] paged KV disk capture per turn: 128 blocks, 250 ms';
+
+  it('keeps the native defaults without --persist-whole-prompt', async () => {
+    delete process.env[BLOCKS_ENV];
+    delete process.env[BUDGET_ENV];
+    expect(await captureEnvAtLoad(['--persist-cache'])).toEqual({ blocks: undefined, ms: undefined, line: NATIVE });
+  });
+
+  it('--persist-whole-prompt writes the whole-prompt limits the env does not set, only with the cache on', async () => {
+    delete process.env[BLOCKS_ENV];
+    delete process.env[BUDGET_ENV];
+    expect(await captureEnvAtLoad(['--persist-cache', '--persist-whole-prompt'])).toEqual({
+      blocks: '63125',
+      ms: '10000',
+      line: WHOLE,
+    });
+    process.env[BUDGET_ENV] = '3000';
+    expect(await captureEnvAtLoad(['--persist-cache', '--persist-whole-prompt'])).toEqual({
+      blocks: '63125',
+      ms: '3000',
+      line: '[mlx] paged KV disk capture per turn: 63125 blocks, 3000 ms',
+    });
+    expect(await captureEnvAtLoad(['--no-persist-cache', '--persist-whole-prompt'])).toEqual({
+      blocks: undefined,
+      ms: undefined,
+      line: undefined,
+    });
   });
 });
 

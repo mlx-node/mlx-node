@@ -12,6 +12,7 @@ import type { LoadableModel, SessionCapableModel, DecisionModel } from '@mlx-nod
 
 import type { PublicModelEntry } from '../handler.js';
 import type { ModelRegistry } from '../registry.js';
+import type { ModelIdentity } from '../turn-trace.js';
 import type { DiscoveredModel } from './discover.js';
 
 export interface SwapController {
@@ -24,6 +25,10 @@ export interface SwapController {
    * selection stays, so the next request loads the same model again.
    */
   releaseAll?: () => Promise<void>;
+}
+
+function identityOf(entry: DiscoveredModel): ModelIdentity {
+  return { modelId: entry.name, modelType: String(entry.modelType), contextWindow: entry.contextWindow };
 }
 
 /**
@@ -156,6 +161,7 @@ export function makeSwapController(
               registry.registerAny(oldResident.name, oldInstance, {
                 samplingDefaults: oldEntry?.preset.sampling,
                 maxOutputTokens: oldEntry?.preset.maxOutputTokens,
+                identity: oldEntry ? identityOf(oldEntry) : undefined,
               });
               resident = oldResident;
             }
@@ -166,6 +172,7 @@ export function makeSwapController(
         registry.registerAny(targetEntry.name, instance, {
           samplingDefaults: targetEntry.preset.sampling,
           maxOutputTokens: targetEntry.preset.maxOutputTokens,
+          identity: identityOf(targetEntry),
         });
         resident = { name: targetEntry.name };
       } else if (!resident) {

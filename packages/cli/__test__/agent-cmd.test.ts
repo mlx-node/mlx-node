@@ -10,6 +10,10 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
+import {
+  WHOLE_PROMPT_CAPTURE_BLOCKS,
+  WHOLE_PROMPT_CAPTURE_BUDGET_MS,
+} from '@mlx-node/server/host/persist-cache';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { agentPreambleText, scanAgentArgs } from '../src/commands/agent/index.js';
@@ -87,5 +91,11 @@ describe('mlx agent help — --no-persist-cache', () => {
     expect(help).toContain('MLX_PERSIST_PAGED_CACHE=0');
     expect(help).toContain('--max-cache-disk <size>');
     expect(help).toContain('--cache-dir <dir>');
+  });
+
+  it('says a turn of the restore-eligible families writes the whole prompt', () => {
+    expect(agentPreambleText()).toContain(
+      `(up to ${WHOLE_PROMPT_CAPTURE_BLOCKS} blocks within\n                            ${WHOLE_PROMPT_CAPTURE_BUDGET_MS} ms) before it ends.`,
+    );
   });
 });

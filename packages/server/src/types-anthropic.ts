@@ -234,8 +234,9 @@ export type AnthropicResponseContent =
  *
  * `prefill_input_tokens` and `cached_prefix_tokens` provide the
  * denominator/context for `prefill_tokens_per_second`: on cached-prefix
- * turns the prefill rate is for the uncached suffix, not the full
- * logical prompt.
+ * turns that rate is for the uncached suffix, not the full logical
+ * prompt. It divides by time to first token, so it includes setup;
+ * `prefill_tokens` / `prefill_ms` is the measured prefill window.
  */
 export interface AnthropicUsage {
   input_tokens: number;
@@ -244,7 +245,7 @@ export interface AnthropicUsage {
   cache_creation_input_tokens?: number;
   /** Server-extension: time-to-first-token in milliseconds. */
   time_to_first_token_ms?: number;
-  /** Server-extension: prompt-token throughput during prefill. */
+  /** Server-extension: prompt tokens ÷ time to first token; includes setup. Not a prefill speed: use `prefill_tokens` / `prefill_ms`. */
   prefill_tokens_per_second?: number;
   /** Server-extension: generated-token throughput during decode. */
   decode_tokens_per_second?: number;
@@ -254,7 +255,7 @@ export interface AnthropicUsage {
   server_time_to_first_token_ms?: number;
   /** Server-extension: handler-start to first native token, including model resolve/load and queue wait. */
   server_total_time_to_first_token_ms?: number;
-  /** Server-extension alias for native prefill throughput. */
+  /** Server-extension alias: prompt tokens ÷ time to first token; includes setup. Not a prefill speed: use `prefill_tokens` / `prefill_ms`. */
   server_prefill_tokens_per_second?: number;
   /** Server-extension alias for native decode throughput. */
   server_decode_tokens_per_second?: number;
@@ -262,6 +263,10 @@ export interface AnthropicUsage {
   prefill_input_tokens?: number;
   /** Server-extension: prompt tokens skipped because a cached prefix was reused. */
   cached_prefix_tokens?: number;
+  /** Server-extension: the prefill window of this call in ms, `begin_prefill` to the first token sampled. Streamed calls only. */
+  prefill_ms?: number;
+  /** Server-extension: tokens that prefill window processed; present with `prefill_ms`, never alone. */
+  prefill_tokens?: number;
   /** Server-extension: time spent resolving/loading/aliasing the requested model before registry lookup. */
   server_model_resolve_ms?: number;
   /** Server-extension: wall-clock time blocked on the process-wide model-load writer lock. */
@@ -374,7 +379,7 @@ export interface AnthropicMessageDeltaEvent {
     cache_creation_input_tokens?: number;
     /** Server-extension: time-to-first-token in milliseconds. */
     time_to_first_token_ms?: number;
-    /** Server-extension: prompt-token throughput during prefill. */
+    /** Server-extension: prompt tokens ÷ time to first token; includes setup. Not a prefill speed: use `prefill_tokens` / `prefill_ms`. */
     prefill_tokens_per_second?: number;
     /** Server-extension: generated-token throughput during decode. */
     decode_tokens_per_second?: number;
@@ -384,7 +389,7 @@ export interface AnthropicMessageDeltaEvent {
     server_time_to_first_token_ms?: number;
     /** Server-extension: handler-start to first native token, including model resolve/load and queue wait. */
     server_total_time_to_first_token_ms?: number;
-    /** Server-extension alias for native prefill throughput. */
+    /** Server-extension alias: prompt tokens ÷ time to first token; includes setup. Not a prefill speed: use `prefill_tokens` / `prefill_ms`. */
     server_prefill_tokens_per_second?: number;
     /** Server-extension alias for native decode throughput. */
     server_decode_tokens_per_second?: number;
@@ -392,6 +397,10 @@ export interface AnthropicMessageDeltaEvent {
     prefill_input_tokens?: number;
     /** Server-extension: prompt tokens skipped because a cached prefix was reused. */
     cached_prefix_tokens?: number;
+    /** Server-extension: the prefill window of this call in ms, `begin_prefill` to the first token sampled. Streamed calls only. */
+    prefill_ms?: number;
+    /** Server-extension: tokens that prefill window processed; present with `prefill_ms`, never alone. */
+    prefill_tokens?: number;
     /** Server-extension: time spent resolving/loading/aliasing the requested model before registry lookup. */
     server_model_resolve_ms?: number;
     /** Server-extension: wall-clock time blocked on the process-wide model-load writer lock. */

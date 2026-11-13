@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 
@@ -10,7 +10,7 @@ import { MetricsTrace, type MetricsTraceRecord } from '../../packages/server/src
 const FIXED_NOW = Date.UTC(2026, 6, 21, 12, 34, 56); // 2026-07-21
 const FIXED_DATE = '2026-07-21';
 
-type RecordInput = Omit<MetricsTraceRecord, 'v'>;
+type RecordInput = Omit<MetricsTraceRecord, 'v' | 'pid'>;
 
 function baseRecord(overrides: Partial<RecordInput> = {}): RecordInput {
   return {
@@ -18,12 +18,20 @@ function baseRecord(overrides: Partial<RecordInput> = {}): RecordInput {
     ts: FIXED_NOW,
     sessionId: 'sess-a',
     model: 'qwen-small',
+    outcome: 'ok',
+    endpoint: 'messages',
+    stream: true,
+    dispatch: 'start',
     durationMs: 42,
     finishReason: 'stop',
     promptTokens: 100,
     cachedTokens: 60,
     outputTokens: 7,
     reasoningTokens: 0,
+    toolCount: 0,
+    imageCount: 0,
+    concurrency: 1,
+    concurrencyPeak: 1,
     ...overrides,
   };
 }
@@ -66,7 +74,7 @@ describe('MetricsTrace', () => {
     expect(lines).toHaveLength(2);
     expect(lines.map((l) => l.traceId)).toEqual(['a', 'b']);
     expect(lines[0]).toMatchObject({
-      v: 1,
+      v: 2,
       traceId: 'a',
       model: 'qwen-small',
       finishReason: 'stop',
@@ -79,13 +87,154 @@ describe('MetricsTrace', () => {
     });
   });
 
-  it('stamps the root session id/file supplied WITH the record (per-turn snapshot)', () => {
+  it('writes a v2 record with every allowlisted field', () => {
     const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
-    trace.record(baseRecord({ rootSessionId: 'root-7', rootSessionFile: '/sessions/root-7.jsonl' }));
+    trace.record(
+      baseRecord({
+        modelId: 'Qwen3.6-35B-A3B',
+        modelType: 'qwen3_5_moe',
+        outcome: 'error',
+        errorKind: 'exception',
+        failPhase: 'decode',
+        endpoint: 'responses',
+        stream: false,
+        dispatch: 'continue_tool',
+        finishReason: 'error',
+        queueMs: 3,
+        loadWaitMs: 4,
+        resolveMs: 5,
+        preDispatchMs: 12,
+        prefillDoneTokens: 40,
+        ctxWindow: 262144,
+        ttftMs: 125,
+        prefillMs: 90,
+        prefillTokens: 40,
+        decodeTps: 47.25,
+        mtpCycles: 3,
+        mtpMeanAccepted: 1.6,
+        mtpMeanDrafts: 0.6,
+        mtpMeanDepth: 2,
+        mtpAcceptByPos: [0.5, 0.25],
+        toolCount: 4,
+        toolCallCount: 2,
+        imageCount: 1,
+        concurrency: 2,
+        concurrencyPeak: 3,
+        memActiveBytes: 1000,
+        memPeakBytes: 2000,
+      }),
+    );
+    const [line] = readLines(trace.currentFile()) as Record<string, unknown>[];
+    expect(line).toEqual({
+      v: 2,
+      traceId: 'trace-1',
+      ts: FIXED_NOW,
+      pid: process.pid,
+      sessionId: 'sess-a',
+      model: 'qwen-small',
+      modelId: 'Qwen3.6-35B-A3B',
+      modelType: 'qwen3_5_moe',
+      outcome: 'error',
+      errorKind: 'exception',
+      failPhase: 'decode',
+      endpoint: 'responses',
+      stream: false,
+      dispatch: 'continue_tool',
+      finishReason: 'error',
+      durationMs: 42,
+      queueMs: 3,
+      loadWaitMs: 4,
+      resolveMs: 5,
+      preDispatchMs: 12,
+      promptTokens: 100,
+      cachedTokens: 60,
+      outputTokens: 7,
+      reasoningTokens: 0,
+      prefillDoneTokens: 40,
+      ctxWindow: 262144,
+      ttftMs: 125,
+      decodeTps: 47.25,
+      mtpCycles: 3,
+      mtpMeanAccepted: 1.6,
+      mtpMeanDrafts: 0.6,
+      mtpMeanDepth: 2,
+      mtpAcceptByPos: [0.5, 0.25],
+      toolCount: 4,
+      toolCallCount: 2,
+      imageCount: 1,
+      concurrency: 2,
+      concurrencyPeak: 3,
+      memActiveBytes: 1000,
+      memPeakBytes: 2000,
+    });
+  });
 
+  it('drops unknown enum values and unsafe finish reasons', () => {
+    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
+    trace.record(baseRecord({ traceId: 'bad-outcome', outcome: 'maybe' as never }));
+    trace.record(baseRecord({ traceId: 'bad-endpoint', endpoint: 'chat' as never }));
+    trace.record(baseRecord({ traceId: 'bad-dispatch', dispatch: 'resume' as never }));
+    trace.record(baseRecord({ traceId: 'unsafe', finishReason: 'Stop: user said "secret"' }));
+    trace.record(baseRecord({ traceId: 'long', finishReason: 'a'.repeat(33) }));
+    trace.record(
+      baseRecord({ traceId: 'ok-kind', errorKind: 'exception', failPhase: 'decode', finishReason: 'tool_calls' }),
+    );
+    trace.record(
+      baseRecord({ traceId: 'bad-kind', outcome: 'error', errorKind: 'oom' as never, failPhase: 'x' as never }),
+    );
+
+    const lines = readLines(trace.currentFile()) as MetricsTraceRecord[];
+    expect(lines.map((l) => l.traceId)).toEqual(['unsafe', 'long', 'ok-kind', 'bad-kind']);
+    expect(lines[0]!.finishReason).toBe('other');
+    expect(lines[1]!.finishReason).toBe('other');
+    // errorKind and failPhase belong to failed turns only.
+    expect(lines[2]!.finishReason).toBe('tool_calls');
+    expect('errorKind' in lines[2]!).toBe(false);
+    expect('failPhase' in lines[2]!).toBe(false);
+    expect('errorKind' in lines[3]!).toBe(false);
+    expect('failPhase' in lines[3]!).toBe(false);
+  });
+
+  it('caps mtpAcceptByPos at 16 rounded rates', () => {
+    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
+    const rates = [0.123456, -0.5, 1.5, Number.NaN, ...Array.from({ length: 20 }, () => 0.5)];
+    trace.record(baseRecord({ mtpAcceptByPos: rates }));
     const [line] = readLines(trace.currentFile()) as MetricsTraceRecord[];
-    expect(line.rootSessionId).toBe('root-7');
-    expect(line.rootSessionFile).toBe('/sessions/root-7.jsonl');
+    expect(line!.mtpAcceptByPos).toHaveLength(16);
+    expect(line!.mtpAcceptByPos!.slice(0, 4)).toEqual([0.1235, 0, 1, 0.5]);
+  });
+
+  it('never writes rootSessionId, rootSessionFile or resident', () => {
+    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
+    trace.record({
+      ...baseRecord(),
+      rootSessionId: 'root-7',
+      rootSessionFile: '/sessions/root-7.jsonl',
+      resident: true,
+    } as unknown as RecordInput);
+    const [line] = readLines(trace.currentFile()) as Record<string, unknown>[];
+    expect('rootSessionId' in line).toBe(false);
+    expect('rootSessionFile' in line).toBe(false);
+    expect('resident' in line).toBe(false);
+  });
+
+  it('re-creates the directory and retries once when the append fails', () => {
+    const traceDir = join(dir, 'traces');
+    const trace = new MetricsTrace({ dir: traceDir, now: () => FIXED_NOW });
+    trace.record(baseRecord({ traceId: 'first' }));
+    rmSync(traceDir, { recursive: true, force: true });
+    expect(existsSync(traceDir)).toBe(false);
+    trace.record(baseRecord({ traceId: 'second' }));
+    const lines = readLines(trace.currentFile()) as MetricsTraceRecord[];
+    expect(lines.map((l) => l.traceId)).toEqual(['second']);
+  });
+
+  it('does not write a zero decodeTps', () => {
+    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
+    trace.record(baseRecord({ decodeTps: 0, ttftMs: 0 }));
+    const [line] = readLines(trace.currentFile()) as Record<string, unknown>[];
+    expect('decodeTps' in line).toBe(false);
+    expect(line.ttftMs).toBe(0);
   });
 
   it('records optional throughput / mtp / cold-tier fields when present', () => {
@@ -93,7 +242,8 @@ describe('MetricsTrace', () => {
     trace.record(
       baseRecord({
         ttftMs: 125,
-        prefillTps: 812.5,
+        prefillMs: 90.5,
+        prefillTokens: 40,
         decodeTps: 47.25,
         mtpCycles: 3,
         mtpMeanAccepted: 1.6,
@@ -106,7 +256,8 @@ describe('MetricsTrace', () => {
     const [line] = readLines(trace.currentFile()) as MetricsTraceRecord[];
     expect(line).toMatchObject({
       ttftMs: 125,
-      prefillTps: 812.5,
+      prefillMs: 90.5,
+      prefillTokens: 40,
       decodeTps: 47.25,
       mtpCycles: 3,
       mtpMeanAccepted: 1.6,
@@ -115,6 +266,33 @@ describe('MetricsTrace', () => {
       coldBytesWritten: 4096,
       coldBytesRestored: 8192,
     });
+  });
+
+  it('writes the prefill window only as a valid pair on an ok turn', () => {
+    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
+    const cases: Array<[string, Partial<RecordInput>]> = [
+      ['valid', { prefillMs: 250, prefillTokens: 400 }],
+      ['zero-ms', { prefillMs: 0, prefillTokens: 400 }],
+      ['zero-tokens', { prefillMs: 250, prefillTokens: 0 }],
+      ['negative', { prefillMs: -1, prefillTokens: 400 }],
+      ['nan', { prefillMs: Number.NaN, prefillTokens: 400 }],
+      ['infinite', { prefillMs: Number.POSITIVE_INFINITY, prefillTokens: 400 }],
+      ['fractional', { prefillMs: 250, prefillTokens: 1.5 }],
+      ['no-tokens', { prefillMs: 250 }],
+      ['no-ms', { prefillTokens: 400 }],
+      ['error', { outcome: 'error', errorKind: 'exception', prefillMs: 250, prefillTokens: 400 }],
+      ['cancelled', { outcome: 'cancelled', prefillMs: 250, prefillTokens: 400 }],
+    ];
+    for (const [traceId, fields] of cases) trace.record(baseRecord({ traceId, ...fields }));
+    trace.record({ ...baseRecord({ traceId: 'legacy' }), prefillTps: 900 } as unknown as RecordInput);
+    const lines = readLines(trace.currentFile()) as Record<string, unknown>[];
+    expect(lines.map((l) => l.traceId)).toEqual([...cases.map(([id]) => id), 'legacy']);
+    expect(lines[0]).toMatchObject({ prefillMs: 250, prefillTokens: 400 });
+    for (const line of lines.slice(1)) {
+      expect('prefillMs' in line).toBe(false);
+      expect('prefillTokens' in line).toBe(false);
+    }
+    for (const line of lines) expect('prefillTps' in line).toBe(false);
   });
 
   /**
@@ -178,7 +356,6 @@ describe('MetricsTrace', () => {
     expect('ttftMs' in line).toBe(false);
     expect('coldHits' in line).toBe(false);
     expect('sessionId' in line).toBe(false);
-    expect('rootSessionId' in line).toBe(false);
   });
 
   it('only writes allowlisted fields — free text passed by a caller never reaches disk', () => {

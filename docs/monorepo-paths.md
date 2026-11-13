@@ -128,6 +128,11 @@ The `resolveId`-with-`enforce: 'pre'` shape is also the direction Vite itself po
   specifiers the SPA's own `vite.config.ts` resolves. `@mlx-node/core` has no alias either: its
   `exports` already point `import` and `require` at the same `packages/core/index.cjs`, so an alias
   was resolving to exactly the file the package boundary resolves to.
+- **A process the dashboard starts from source maps its own imports.** The plugin does not reach a
+  child process, and Node does not map `./x.js` to `x.ts`. The database worker
+  (`src/worker/ts-bootstrap.ts`) and the Chat agent's `mlx_web` server
+  (`src/chat/web/server-ts-bootstrap.ts`) each start through a `registerHooks` resolve hook that does
+  only that; a built `dist` never takes this path.
 
 ## Published surface
 

@@ -63,6 +63,37 @@ export function parseGgufFileName(path: string): GgufFileName | undefined {
   return { stem: base.slice(0, dash), ordinal, shards };
 }
 
+const MAX_SPLIT_SHARDS = 1024;
+
+function splitDigits(value: number): string {
+  return String(value).padStart(SPLIT_DIGITS, '0');
+}
+
+/**
+ * The files the native loader opens for the GGUF file `name` (`resolve_gguf_shards`), found among the names in its
+ * own folder `siblings` (the folder of the path as given, links not resolved): `name` alone when it is not split, or
+ * for `PREFIX-00001-of-NNNNN.gguf` (`-of-` in small letters) exactly one `PREFIX-0000K-of-NNNNN` with a `.gguf` of
+ * any case for every K from 2 to N, in part order. N comes from the name; the loader takes it from the header's
+ * `split.count` and refuses a first part whose name says another count. Undefined when the loader cannot open it.
+ */
+export function ggufSplitPartNames(name: string, siblings: readonly string[]): string[] | undefined {
+  const base = withoutGgufExtension(name);
+  const parsed = parseGgufFileName(name);
+  if (base === undefined || parsed === undefined) return undefined;
+  if (parsed.stem.length === base.length) return [name];
+  const { stem: prefix, ordinal, shards } = parsed;
+  const suffix = `${SPLIT_OF}${splitDigits(shards)}`;
+  if (ordinal !== 1 || shards < 1 || shards > MAX_SPLIT_SHARDS || !base.endsWith(suffix)) return undefined;
+  const parts = [name];
+  for (let part = 2; part <= shards; part++) {
+    const want = `${prefix}-${splitDigits(part)}${suffix}`;
+    const found = siblings.filter((sibling) => withoutGgufExtension(sibling) === want);
+    if (found.length !== 1) return undefined;
+    parts.push(found[0]!);
+  }
+  return parts;
+}
+
 /**
  * `mtp` is on the list because the catalog ships MTP weights BESIDE a target
  * (Qwen3.8's `MTP/mtp-*.gguf`, Gemma's `mtp-*.gguf`) and nothing in the runtime

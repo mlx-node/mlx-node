@@ -54,10 +54,28 @@ function discovered(names: string[]): DiscoveredModel[] {
     },
     contextWindow: 262144,
     supportsImages: false,
+    base: n,
+    variant: 'MLX',
+    format: 'mlx' as const,
   }));
 }
 
 describe('makeSwapController', () => {
+  it('registers the target binding with its identity', async () => {
+    const reg = fakeRegistry();
+    const loader = vi.fn(async (path: string) => ({ marker: path }) as unknown as LoadableModel);
+    const ctrl = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, loader, 'a');
+    await ctrl.resolveModel('b');
+    await ctrl.resolveModel('claude-haiku-4-5');
+
+    const calls = reg.registerAny.mock.calls as Array<[string, unknown, { identity?: unknown }]>;
+    const target = calls.find(([name]) => name === 'b');
+    expect(target?.[2].identity).toEqual({ modelId: 'b', modelType: 'qwen3_5', contextWindow: 262144 });
+    const alias = calls.find(([name]) => name === 'claude-haiku-4-5');
+    expect(alias).toBeDefined();
+    expect(alias?.[2].identity).toBeUndefined();
+  });
+
   it.each(['asr', 'rerank'] as const)('preserves the selected chat target after %s evicts it', async (kind) => {
     const reg = fakeRegistry();
     const loader = vi.fn(async (path: string) => ({ marker: path }) as unknown as LoadableModel);
@@ -397,5 +415,21 @@ describe('makeSwapController', () => {
       expect(entry.owned_by).toBe('mlx-node');
       expect(typeof entry.created).toBe('number');
     }
+  });
+
+  it('disposeAll empties the registry and the aliases but keeps the selection for the next unknown name', async () => {
+    const reg = fakeRegistry();
+    const loader = vi.fn(async (path: string) => ({ marker: path }) as unknown as LoadableModel);
+    const ctrl = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, loader, 'a');
+    await ctrl.resolveModel('b');
+    await ctrl.resolveModel('mlx-local');
+    expect(reg.list().map((e) => e.id)).toEqual(['b', 'mlx-local']);
+
+    await ctrl.disposeAll!();
+    expect(reg.list()).toEqual([]);
+
+    await ctrl.resolveModel('mlx-local');
+    expect(loader.mock.calls.map(([path]) => path)).toEqual(['/fake/b', '/fake/b']);
+    expect(reg.list().map((e) => e.id)).toEqual(['b', 'mlx-local']);
   });
 });

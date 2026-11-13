@@ -28,6 +28,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const ADDON_FREE_SUBPATHS = [
   'host/cache-disk.ts',
   'host/decode-share.ts',
+  'host/desktop-endpoint.ts',
   'host/env-policy.ts',
   'host/idle-release.ts',
   'host/max-context.ts',

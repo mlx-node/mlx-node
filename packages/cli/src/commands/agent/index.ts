@@ -34,6 +34,8 @@ import { MAX_MEMORY_ERROR, parseMaxMemory } from '@mlx-node/server/host/max-memo
 import {
   PERSIST_PAGED_CACHE_DEFAULT,
   resolvePersistPagedCache,
+  WHOLE_PROMPT_CAPTURE_BLOCKS,
+  WHOLE_PROMPT_CAPTURE_BUDGET_MS,
   type PersistPagedCache,
 } from '@mlx-node/server/host/persist-cache';
 
@@ -755,7 +757,10 @@ mlx options (handled before the agent binary sees the args):
                             families (${coldTierRestoreFamilyList().join(', ')})
                             and the Qwen3.5 dense and MoE state tier, whose files
                             are then temporary; every other family never
-                            persists, flag or not.
+                            persists, flag or not. A turn of those
+                            restore-eligible families writes the whole prompt
+                            (up to ${WHOLE_PROMPT_CAPTURE_BLOCKS} blocks within
+                            ${WHOLE_PROMPT_CAPTURE_BUDGET_MS} ms) before it ends.
   --max-cache-disk <size>   SSD quota for the states of Qwen3.5 dense and MoE
                             loads: auto (default; a quarter of the volume's
                             free space beyond its floor, at most 32G), a size
@@ -774,6 +779,10 @@ Environment:
                             downloads resolve (default: newest published).
   MLX_CLI_ENTRY             Path to this CLI's entry point, used to spawn the
                             inference host (default: the running 'mlx' bin).
+  MLX_COLD_CAPTURE_BLOCKS_PER_TURN, MLX_COLD_CAPTURE_BUDGET_MS
+                            Cap one turn's disk cache write of the
+                            restore-eligible families (blocks, ms); a set
+                            value beats the whole-prompt default.
   MLX_NODE_LOG              Override the Rust tracing target filter used by --trace.
   MLX_NODE_LOG_FILE         Override the Rust tracing log file used by --trace.
 

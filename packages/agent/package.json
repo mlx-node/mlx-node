@@ -39,6 +39,11 @@
       "types": "./dist/paths.d.ts",
       "default": "./dist/paths.js"
     },
+    "./binary": {
+      "@mlx-node/source": "./src/binary.ts",
+      "types": "./dist/binary.d.ts",
+      "default": "./dist/binary.js"
+    },
     "./models": {
       "@mlx-node/source": "./src/models.ts",
       "types": "./dist/models.d.ts",

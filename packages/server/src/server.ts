@@ -296,6 +296,8 @@ export interface ServerConfig {
    * on disk while only the currently-resident one is registered).
    */
   listModels?: () => PublicModelEntry[];
+  /** Backs `POST /v1/models/unload`. See `HandlerOptions.unloadModels`. */
+  unloadModels?: () => Promise<string[]>;
 }
 
 /** Options for {@link ServerInstance.close}. */
@@ -569,6 +571,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     resolveModel: config?.resolveModel,
     modelWorkCoordinator,
     listModels: config?.listModels,
+    unloadModels: config?.unloadModels,
     authToken,
     health,
     ...(weights !== null

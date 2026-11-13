@@ -1,6 +1,7 @@
 /**
  * `TurnTraceModel` — the `SessionCapableModel` wrapper that produces one
- * {@link MetricsTraceRecord} per completed inference turn.
+ * {@link MetricsTraceRecord} per dispatched inference turn: `ok`, `error` or
+ * `cancelled`.
  *
  * Installed once per `SessionRegistry` — the single allocation point of every
  * `ChatSession` the serve process hands out — so it sits on ALL of the
@@ -10,13 +11,14 @@
  * warm hit or cold replay. There is deliberately no endpoint-level hook:
  * the endpoints hand work to the session and only learn the wire shape
  * afterwards; the model call is the one place the final `ChatResult` /
- * terminal `ChatStreamEvent` exists before the turn is committed.
+ * terminal `ChatStreamEvent` exists before the turn is committed. The
+ * endpoints stamp request timing on the config (`turnMeta`).
  *
  * Turn boundaries: the cold-tier counters are process-wide and cumulative, so
  * the baseline is snapshotted INSIDE the wrapped call (the actual dispatch
  * moment) and diffed when the turn completes successfully. A turn that
- * throws, aborts, or ends on `finishReason: 'error'` never records — but it
- * still ADVANCES the shared watermarks ({@link TurnTraceModel.discardTurn}),
+ * throws, aborts, or ends on `finishReason: 'error'` records no cold fields —
+ * but it still ADVANCES the shared watermarks ({@link TurnTraceModel.discardTurn}),
  * so its counter increments are consumed rather than inherited by the next
  * successful turn's delta. That advance is floored at the oldest LIVE turn's
  * baseline: a failure finishing mid-overlap consumes only up to what a
@@ -26,9 +28,7 @@
  * each turn then reports the counter advance since the PREVIOUS record's
  * high-water mark ({@link TurnWatermarks}), so attribution between
  * overlapping turns is approximate while the deltas still sum to the
- * counter's real advance — the dashboard SUMs these columns. `durationMs`
- * therefore measures the wrapped dispatch call itself; admission-lane queue
- * waits happen upstream and are not included.
+ * counter's real advance — the dashboard SUMs these columns.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -36,14 +36,17 @@ import { randomUUID } from 'node:crypto';
 import {
   coldCacheStats,
   coldSidecarStats,
+  getMemorySnapshot,
   type ChatConfig,
   type ChatMessage,
   type ChatResult,
+  type ChatStreamProgress,
   type ColdCacheStats,
   type ColdSidecarStats,
   type PerformanceMetrics,
 } from '@mlx-node/core';
 import {
+  isMediaHeldRestartError,
   mtpAutoDefaultAllowed,
   type ChatStreamEvent,
   type ChatStreamControl,
@@ -51,7 +54,15 @@ import {
 } from '@mlx-node/lm';
 import { canonicalCacheRoot } from '@mlx-node/lm/cold-tier';
 
-import { MetricsTrace, type MetricsTraceInput } from './metrics-trace.js';
+import {
+  MetricsTrace,
+  type MetricsTraceInput,
+  type TurnDispatch,
+  type TurnEndpoint,
+  type TurnErrorKind,
+  type TurnFailPhase,
+} from './metrics-trace.js';
+import type { MeasuredPrefill } from './timing.js';
 
 /** Read the process-wide cold-tier snapshot; the native addon may be absent (unit tests). */
 function safeColdStats(): ColdCacheStats | undefined {
@@ -77,9 +88,158 @@ function safeSidecarStats(): ColdSidecarStats | undefined {
   }
 }
 
+/** Process-wide memory reader; the native addon may be absent (unit tests). */
+function safeMemory(): { activeBytes: number; peakBytes: number } | undefined {
+  try {
+    const snapshot = getMemorySnapshot();
+    return { activeBytes: snapshot.activeBytes, peakBytes: snapshot.peakBytes };
+  } catch {
+    return undefined;
+  }
+}
+
+/** Request timing the serve endpoints stamp on the dispatched config. */
+export interface TurnRequestMeta {
+  endpoint: TurnEndpoint;
+  queueMs?: number;
+  loadWaitMs?: number;
+  resolveMs?: number;
+  preDispatchMs?: number;
+}
+
+/** Identity of the model a binding was created for. */
+export interface ModelIdentity {
+  modelId: string;
+  modelType: string;
+  contextWindow: number;
+}
+
+/** Process-wide, monotonic. Read by the runtime sampler. */
+export interface TurnCounters {
+  ok: number;
+  error: number;
+  cancelled: number;
+  outputTokens: number;
+  /**
+   * Tokens of streaming turns only. A non-stream turn credits all its tokens at
+   * settle, so a live rate must read this counter, never `outputTokens`.
+   */
+  streamedTokens: number;
+}
+
+const COUNTERS: TurnCounters = { ok: 0, error: 0, cancelled: 0, outputTokens: 0, streamedTokens: 0 };
+
+export function turnCounters(): Readonly<TurnCounters> {
+  return { ...COUNTERS };
+}
+
+let edgeListener: (() => void) | null = null;
+
+/** One listener (the sampler). Called on every turn begin and settle. */
+export function setTurnEdgeListener(listener: (() => void) | null): void {
+  edgeListener = listener;
+}
+
+function notifyEdge(): void {
+  const listener = edgeListener;
+  if (listener === null) return;
+  try {
+    listener();
+  } catch {
+    // A broken listener must never break inference.
+  }
+}
+
+/** One turn of this model in native flight. */
+export interface LiveTurn {
+  traceId: string;
+  /** Alias the client asked for. */
+  model: string;
+  /** Checkpoint name from the binding's identity; null without one. */
+  modelId: string | null;
+  /** The wrapper's resolved window; null when unknown. */
+  ctxWindow: number | null;
+  startedAt: number;
+  stream: boolean;
+  dispatch: TurnDispatch;
+  progress: ChatStreamProgress | null;
+}
+
 /**
- * `ChatConfig` plus the trace-only field the serve endpoints stamp per
- * request: the registry name the request resolved through. The napi object
+ * Where a failed stream stopped. Native sets the phase to `done` BEFORE it
+ * sends an error or the terminal chunk, so on `done` the surviving timers say
+ * how far the turn got.
+ */
+export function failPhaseOf(snap: ChatStreamProgress | null): TurnFailPhase | undefined {
+  if (snap === null) return undefined;
+  if (snap.phase === 'queued' || snap.phase === 'prefill' || snap.phase === 'decode') return snap.phase;
+  if (snap.decodeElapsedMs !== undefined) return 'decode';
+  if (snap.prefillElapsedMs !== undefined) return 'prefill';
+  return 'queued';
+}
+
+/** The frozen prefill window of a finished stream, or undefined when native did not measure one. */
+export function measuredPrefillOf(snap: ChatStreamProgress | null | undefined): MeasuredPrefill | undefined {
+  if (snap === null || snap === undefined) return undefined;
+  const tokens = snap.prefillTotal;
+  const ms = snap.prefillElapsedMs;
+  // Without `prefillTotal` the clock counts from `begin_turn`, and without
+  // `decodeElapsedMs` the window is still running: neither is a prefill window.
+  if (tokens === undefined || ms === undefined || snap.decodeElapsedMs === undefined) return undefined;
+  if (!Number.isInteger(tokens) || tokens <= 0 || !Number.isFinite(ms) || ms <= 0) return undefined;
+  return { prefillMs: ms, prefillTokens: tokens };
+}
+
+/**
+ * Keeps the last native progress snapshot readable after the stream bridge
+ * clears its reader (`packages/lm/src/stream.ts` sets `read = null` in its
+ * `finally`, while the native handle is still alive), and forwards every
+ * reader and stop to the caller's control: `ChatSession.stop` calls the
+ * caller's `stop`, so a stop that is not forwarded never reaches native.
+ * `stopped` is set when native accepts one: `ChatSession` then reports the
+ * turn with no tool calls, whatever native decoded.
+ */
+class TraceControl implements ChatStreamControl {
+  private reader: (() => ChatStreamProgress | null) | null = null;
+  private stopper: (() => boolean) | null = null;
+  last: ChatStreamProgress | null = null;
+  stopped = false;
+  constructor(private readonly outer: ChatStreamControl | undefined) {}
+  get read(): (() => ChatStreamProgress | null) | null {
+    return this.reader;
+  }
+  set read(next: (() => ChatStreamProgress | null) | null) {
+    if (next === null && this.reader !== null) {
+      try {
+        this.last = this.reader();
+      } catch {
+        // The handle may already be gone; keep the previous capture.
+      }
+    }
+    this.reader = next;
+    if (this.outer !== undefined) this.outer.read = next;
+  }
+  get stop(): (() => boolean) | null {
+    return this.stopper;
+  }
+  set stop(next: (() => boolean) | null) {
+    this.stopper = next;
+    if (this.outer === undefined) return;
+    this.outer.stop =
+      next === null
+        ? null
+        : (): boolean => {
+            const sent = next();
+            if (sent) this.stopped = true;
+            return sent;
+          };
+  }
+}
+
+/**
+ * `ChatConfig` plus the trace-only fields the serve endpoints stamp per
+ * request: the registry name the request resolved through, and the request
+ * timing (`turnMeta`). The napi object
  * boundary drops unknown props, so carrying it on the config costs nothing
  * — and it is the only per-request handle a shared model wrapper has:
  * aliased registrations reuse one `SessionRegistry`, so the registration
@@ -88,6 +248,7 @@ function safeSidecarStats(): ColdSidecarStats | undefined {
  */
 export interface TracedChatConfig extends ChatConfig {
   modelAlias?: string;
+  turnMeta?: TurnRequestMeta;
 }
 
 /** Injectable seams for {@link TurnTraceModel} (unit tests). */
@@ -113,6 +274,12 @@ export interface TurnTraceDeps {
    * Tests inject a fresh one so records stay deterministic.
    */
   watermarks?: TurnWatermarks;
+  /** Identity of the model this binding was created for. */
+  identity?: ModelIdentity;
+  /** The served window, read once by the model registry; the identity's trained window when absent. */
+  ctxWindow?: number;
+  /** Memory reader for the turn-end snapshot; defaults to the native addon. */
+  memory?: () => { activeBytes: number; peakBytes: number } | undefined;
 }
 
 /**
@@ -160,6 +327,17 @@ interface TurnContext {
   cold: ColdCacheStats | undefined;
   sidecar: ColdSidecarStats | undefined;
   done: boolean;
+  stream: boolean;
+  dispatch: TurnDispatch;
+  meta: TurnRequestMeta | undefined;
+  toolCount: number;
+  imageCount: number;
+  concurrency: number;
+  concurrencyPeak: number;
+  signal: AbortSignal | undefined;
+  progress: TraceControl | null;
+  /** Generated tokens already added to the process counter. */
+  creditedTokens: number;
 }
 
 /**
@@ -225,12 +403,41 @@ interface TurnFinal {
   reasoningTokens: number;
   cachedTokens?: number;
   performance?: PerformanceMetrics;
+  /** Only the length is read. */
+  toolCalls?: readonly unknown[];
+}
+
+type DispatchKind = 'chatSessionStart' | 'chatSessionContinue' | 'chatSessionContinueTool';
+type StreamDispatchKind = 'chatStreamSessionStart' | 'chatStreamSessionContinue' | 'chatStreamSessionContinueTool';
+
+function dispatchOf(kind: DispatchKind | StreamDispatchKind): TurnDispatch {
+  switch (kind) {
+    case 'chatSessionStart':
+    case 'chatStreamSessionStart':
+      return 'start';
+    case 'chatSessionContinue':
+    case 'chatStreamSessionContinue':
+      return 'continue';
+    default:
+      return 'continue_tool';
+  }
+}
+
+function imageCountOf(messages: readonly ChatMessage[] | null | undefined): number {
+  if (!Array.isArray(messages)) return 0;
+  let count = 0;
+  for (const message of messages) count += message?.images?.length ?? 0;
+  return count;
 }
 
 export class TurnTraceModel implements SessionCapableModel {
   private readonly inner: SessionCapableModel;
   private readonly deps: TurnTraceDeps;
   private readonly trace: Pick<MetricsTrace, 'record'>;
+  private readonly liveCtx = new Set<TurnContext>();
+  private begun = 0;
+  private lastSettleAt = 0;
+  private readonly ctxWindow: number | undefined;
 
   // Optional members installed verbatim on this instance in the constructor
   // when — and only when — the inner model defines them. `declare` so the
@@ -267,6 +474,55 @@ export class TurnTraceModel implements SessionCapableModel {
     if (typeof inner.mtpAutoEnabled !== 'function') {
       Object.defineProperty(this, 'mtpAutoEnabled', { value: () => mtpAutoDefaultAllowed(inner) });
     }
+    const served = deps.ctxWindow;
+    const identityWindow = deps.identity?.contextWindow;
+    this.ctxWindow =
+      typeof served === 'number' && served > 0
+        ? served
+        : typeof identityWindow === 'number' && identityWindow > 0
+          ? identityWindow
+          : undefined;
+  }
+
+  /** Live turns of this model. Also credits streamed tokens to the process counter. */
+  liveTurns(): LiveTurn[] {
+    const out: LiveTurn[] = [];
+    for (const ctx of this.liveCtx) {
+      let progress: ChatStreamProgress | null = null;
+      try {
+        progress = ctx.progress?.read?.() ?? null;
+      } catch {
+        progress = null;
+      }
+      const generated = progress?.generatedTokens;
+      if (typeof generated === 'number' && generated > ctx.creditedTokens) {
+        COUNTERS.outputTokens += generated - ctx.creditedTokens;
+        COUNTERS.streamedTokens += generated - ctx.creditedTokens;
+        ctx.creditedTokens = generated;
+      }
+      out.push({
+        traceId: ctx.traceId,
+        model: this.modelNameOf(ctx),
+        modelId: this.deps.identity?.modelId ?? null,
+        ctxWindow: this.ctxWindow ?? null,
+        startedAt: ctx.startMs,
+        stream: ctx.stream,
+        dispatch: ctx.dispatch,
+        progress,
+      });
+    }
+    return out;
+  }
+
+  /** `begun` rises by one per dispatch; the sampler uses it to detect a burst between ticks. */
+  turnStats(): { live: number; begun: number; lastSettleAt: number } {
+    return { live: this.liveCtx.size, begun: this.begun, lastSettleAt: this.lastSettleAt };
+  }
+
+  private modelNameOf(ctx: TurnContext): string {
+    const dep = this.deps.modelName;
+    const fallback = typeof dep === 'function' ? dep() : dep;
+    return ctx.modelAlias ?? fallback ?? 'unknown';
   }
 
   private get now(): () => number {
@@ -280,7 +536,14 @@ export class TurnTraceModel implements SessionCapableModel {
    * is measured still gets its own delta, after which marks chain
    * intervals so recorded deltas always sum to the counter's real advance.
    */
-  private beginTurn(config: ChatConfig | null | undefined): TurnContext | null {
+  private beginTurn(
+    config: ChatConfig | null | undefined,
+    messages: readonly ChatMessage[] | null | undefined,
+    kind: DispatchKind | StreamDispatchKind,
+    stream: boolean,
+    signal: AbortSignal | undefined,
+    outerControl: ChatStreamControl | undefined,
+  ): TurnContext | null {
     const trace = this.trace;
     if (trace instanceof MetricsTrace && !trace.enabled) return null;
     const marks = this.deps.watermarks ?? SHARED_WATERMARKS;
@@ -298,19 +561,91 @@ export class TurnTraceModel implements SessionCapableModel {
         if (typeof value === 'number') marks.sidecar[key] ??= value;
       }
     }
+    const traced = config as TracedChatConfig | null | undefined;
     const ctx: TurnContext = {
       traceId: randomUUID(),
       sessionId: typeof config?.cacheOwnerId === 'string' ? config.cacheOwnerId : undefined,
       // The requesting alias outranks the binding name: one SessionRegistry
       // (and one wrapper) serves every alias of a model.
-      modelAlias: (config as TracedChatConfig | null | undefined)?.modelAlias,
+      modelAlias: traced?.modelAlias,
       startMs: this.now(),
       cold,
       sidecar,
       done: false,
+      stream,
+      dispatch: dispatchOf(kind),
+      meta: traced?.turnMeta,
+      toolCount: config?.tools?.length ?? 0,
+      imageCount: imageCountOf(messages),
+      concurrency: 0,
+      concurrencyPeak: 0,
+      signal,
+      progress: stream ? new TraceControl(outerControl) : null,
+      creditedTokens: 0,
     };
     (marks.live ??= new Set()).add(ctx);
+    this.liveCtx.add(ctx);
+    const live = this.liveCtx.size;
+    ctx.concurrency = live;
+    ctx.concurrencyPeak = live;
+    for (const other of this.liveCtx) {
+      if (other.concurrencyPeak < live) other.concurrencyPeak = live;
+    }
+    this.begun += 1;
+    notifyEdge();
     return ctx;
+  }
+
+  /** The fields every outcome shares: identity, timing, counts, overlap, memory. */
+  private baseRecord(ctx: TurnContext): MetricsTraceInput {
+    const now = this.now();
+    const identity = this.deps.identity;
+    const meta = ctx.meta;
+    const rec: MetricsTraceInput = {
+      traceId: ctx.traceId,
+      ts: now,
+      sessionId: ctx.sessionId,
+      model: this.modelNameOf(ctx),
+      modelId: identity?.modelId,
+      modelType: identity?.modelType,
+      outcome: 'ok',
+      endpoint: meta?.endpoint ?? 'other',
+      stream: ctx.stream,
+      dispatch: ctx.dispatch,
+      finishReason: 'other',
+      durationMs: Math.max(0, now - ctx.startMs),
+      queueMs: meta?.queueMs,
+      loadWaitMs: meta?.loadWaitMs,
+      resolveMs: meta?.resolveMs,
+      preDispatchMs: meta?.preDispatchMs,
+      ctxWindow: this.ctxWindow,
+      toolCount: ctx.toolCount,
+      imageCount: ctx.imageCount,
+      concurrency: ctx.concurrency,
+      concurrencyPeak: ctx.concurrencyPeak,
+    };
+    let memory: { activeBytes: number; peakBytes: number } | undefined;
+    try {
+      memory = (this.deps.memory ?? safeMemory)();
+    } catch {
+      memory = undefined;
+    }
+    if (memory) {
+      rec.memActiveBytes = memory.activeBytes;
+      rec.memPeakBytes = memory.peakBytes;
+    }
+    return rec;
+  }
+
+  /** Remove a turn from the live set and credit its last tokens. */
+  private settle(ctx: TurnContext, totalTokens: number | undefined): void {
+    this.liveCtx.delete(ctx);
+    if (typeof totalTokens === 'number' && totalTokens > ctx.creditedTokens) {
+      COUNTERS.outputTokens += totalTokens - ctx.creditedTokens;
+      if (ctx.stream) COUNTERS.streamedTokens += totalTokens - ctx.creditedTokens;
+      ctx.creditedTokens = totalTokens;
+    }
+    this.lastSettleAt = this.now();
   }
 
   /**
@@ -327,31 +662,35 @@ export class TurnTraceModel implements SessionCapableModel {
     if (ctx.done) return;
     ctx.done = true;
     (this.deps.watermarks ?? SHARED_WATERMARKS).live?.delete(ctx);
+    this.settle(ctx, final.numTokens);
+    COUNTERS.ok += 1;
     try {
       const coldStats = this.deps.coldStats ?? safeColdStats;
       const sidecarStats = this.deps.sidecarStats ?? safeSidecarStats;
-      const dep = this.deps.modelName;
-      const fallback = typeof dep === 'function' ? dep() : dep;
-      const rec: MetricsTraceInput = {
-        traceId: ctx.traceId,
-        ts: this.now(),
-        sessionId: ctx.sessionId,
-        model: ctx.modelAlias ?? fallback ?? 'unknown',
-        durationMs: Math.max(0, this.now() - ctx.startMs),
-        finishReason: final.finishReason,
-        promptTokens: final.promptTokens,
-        cachedTokens: final.cachedTokens ?? 0,
-        outputTokens: final.numTokens,
-        reasoningTokens: final.reasoningTokens,
-      };
+      const rec = this.baseRecord(ctx);
+      rec.outcome = 'ok';
+      rec.finishReason = final.finishReason;
+      rec.promptTokens = final.promptTokens;
+      rec.cachedTokens = final.cachedTokens ?? 0;
+      rec.outputTokens = final.numTokens;
+      rec.reasoningTokens = final.reasoningTokens;
+      if (ctx.progress?.stopped === true) rec.toolCallCount = 0;
+      else if (Array.isArray(final.toolCalls)) rec.toolCallCount = final.toolCalls.length;
       const perf = final.performance;
       if (perf) {
         rec.ttftMs = perf.ttftMs;
-        rec.prefillTps = perf.prefillTokensPerSecond;
         rec.decodeTps = perf.decodeTokensPerSecond;
         rec.mtpCycles = perf.mtpCycles;
         // mlx-vlm-comparable headline accept rate (committed tokens per cycle).
         rec.mtpMeanAccepted = perf.mtpMeanAcceptedTokensTotal;
+        rec.mtpMeanDrafts = perf.mtpMeanAcceptedTokens;
+        rec.mtpMeanDepth = perf.mtpMeanDepth;
+        rec.mtpAcceptByPos = perf.mtpAcceptanceByPosition;
+      }
+      const measured = measuredPrefillOf(this.readProgress(ctx));
+      if (measured !== undefined) {
+        rec.prefillMs = measured.prefillMs;
+        rec.prefillTokens = measured.prefillTokens;
       }
       // One delta per counter field: current minus the LAST record's mark
       // (beginTurn seeds an unmarked field from that turn's own baseline, so
@@ -423,15 +762,80 @@ export class TurnTraceModel implements SessionCapableModel {
     } catch {
       // Telemetry is best-effort; a broken recorder must never break inference.
     }
+    notifyEdge();
   }
 
   /**
-   * Close a turn that will never record: thrown, aborted, errored, or ended
-   * on a stream that yielded no successful terminal event. Its cold/sidecar
+   * Record an `error` or `cancelled` turn. Marks advance exactly as
+   * {@link discardTurn} does; the record carries no cold fields.
+   *
+   * The live progress read comes first: a `finish_error` turn is recorded
+   * inside the stream loop, before the bridge clears the reader, so the
+   * captured snapshot is still null there.
+   */
+  private recordFailure(
+    ctx: TurnContext,
+    outcome: 'error' | 'cancelled',
+    errorKind?: TurnErrorKind,
+    final?: TurnFinal,
+  ): void {
+    if (ctx.done) return;
+    const snap = this.readProgress(ctx);
+    this.discardTurn(ctx);
+    const total = final !== undefined ? final.numTokens : snap?.generatedTokens;
+    this.settle(ctx, total);
+    COUNTERS[outcome] += 1;
+    try {
+      const rec = this.baseRecord(ctx);
+      rec.outcome = outcome;
+      rec.finishReason = outcome === 'cancelled' ? 'cancelled' : 'error';
+      if (outcome === 'error') rec.errorKind = errorKind;
+      rec.failPhase = failPhaseOf(snap);
+      if (final !== undefined) {
+        rec.promptTokens = final.promptTokens;
+        rec.cachedTokens = final.cachedTokens;
+        rec.outputTokens = final.numTokens;
+        rec.reasoningTokens = final.reasoningTokens;
+        if (Array.isArray(final.toolCalls)) rec.toolCallCount = final.toolCalls.length;
+      } else if (snap !== null) {
+        rec.outputTokens = snap.generatedTokens;
+        rec.cachedTokens = snap.cachedTokens;
+        if (snap.cachedTokens !== undefined && snap.prefillTotal !== undefined) {
+          rec.promptTokens = snap.cachedTokens + snap.prefillTotal;
+        }
+      }
+      if (snap !== null) rec.prefillDoneTokens = snap.prefillDone;
+      this.trace.record(rec);
+    } catch {
+      // Telemetry is best-effort; a broken recorder must never break inference.
+    }
+    notifyEdge();
+  }
+
+  private readProgress(ctx: TurnContext): ChatStreamProgress | null {
+    try {
+      return ctx.progress?.read?.() ?? ctx.progress?.last ?? null;
+    } catch {
+      return ctx.progress?.last ?? null;
+    }
+  }
+
+  /** Close a turn that is retried elsewhere and must not be recorded. */
+  private rerouteTurn(ctx: TurnContext): void {
+    if (ctx.done) return;
+    this.discardTurn(ctx);
+    this.settle(ctx, undefined);
+    notifyEdge();
+  }
+
+  /**
+   * Close the cold accounting of a turn that carries no cold fields: thrown,
+   * aborted, errored, rerouted, or ended on a stream that yielded no
+   * successful terminal event. Its cold/sidecar
    * increments are real process advances — leaving the marks stale would
    * fold them into the NEXT recorded turn's delta, attributing a failed
    * turn's cache activity to whoever records next. Advancing the marks
-   * without recording consumes the increment: uncommitted turns stay
+   * without attributing consumes the increment: uncommitted turns stay
    * unattributed on purpose.
    *
    * The advance is floored per field at the oldest OTHER live turn's begin
@@ -479,47 +883,63 @@ export class TurnTraceModel implements SessionCapableModel {
 
   /** The shared body of the three non-streaming dispatch entry points. */
   private async dispatch(
-    kind: 'chatSessionStart' | 'chatSessionContinue' | 'chatSessionContinueTool',
+    kind: DispatchKind,
     messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
   ): Promise<ChatResult> {
-    const ctx = this.beginTurn(config);
+    const ctx = this.beginTurn(config, messages, kind, false, signal, undefined);
     try {
       const result = await this.inner[kind](messages, config, signal);
-      // Record only committed turns: `finishReason: 'error'` results are
-      // returned, not thrown, and mirror the stream-side non-record rule.
-      if (ctx !== null && result.finishReason !== 'error') {
-        this.finishTurn(ctx, result);
+      if (ctx !== null) {
+        if (result.finishReason !== 'error') this.finishTurn(ctx, result);
+        else this.recordFailure(ctx, 'error', 'finish_error', result);
       }
       return result;
-    } finally {
-      // A turn that threw or returned 'error' never reached finishTurn —
-      // discard consumes its marks so its increments leak nowhere.
-      if (ctx !== null) this.discardTurn(ctx);
+    } catch (err) {
+      if (ctx !== null) this.settleThrown(ctx, err, signal);
+      throw err;
     }
+  }
+
+  /**
+   * A media-held restart is retried by `ChatSession` through
+   * `chatSessionStart`; recording it would invent a failure.
+   */
+  private settleThrown(ctx: TurnContext, err: unknown, signal: AbortSignal | undefined): void {
+    if (isMediaHeldRestartError(err)) this.rerouteTurn(ctx);
+    else if (signal?.aborted === true) this.recordFailure(ctx, 'cancelled');
+    else this.recordFailure(ctx, 'error', 'exception');
   }
 
   /** The shared body of the three streaming dispatch entry points. */
   private async *streamDispatch(
-    kind: 'chatStreamSessionStart' | 'chatStreamSessionContinue' | 'chatStreamSessionContinueTool',
+    kind: StreamDispatchKind,
     messages: ChatMessage[],
     config?: ChatConfig | null,
     signal?: AbortSignal,
     control?: ChatStreamControl,
   ): AsyncGenerator<ChatStreamEvent> {
-    const ctx = this.beginTurn(config);
+    const ctx = this.beginTurn(config, messages, kind, true, signal, control);
+    let thrown: { err: unknown } | null = null;
     try {
-      for await (const event of this.inner[kind](messages, config, signal, control)) {
-        if (ctx !== null && event.done && event.finishReason !== 'error') {
-          this.finishTurn(ctx, event);
+      for await (const event of this.inner[kind](messages, config, signal, ctx?.progress ?? control)) {
+        if (ctx !== null && event.done) {
+          if (event.finishReason !== 'error') this.finishTurn(ctx, event);
+          else this.recordFailure(ctx, 'error', 'finish_error', event);
         }
         yield event;
       }
+    } catch (err) {
+      thrown = { err };
+      throw err;
     } finally {
-      // Mid-stream throws, consumer abandonment, and error-terminal events
-      // all exit through here — the mark advance keeps the sums honest.
-      if (ctx !== null) this.discardTurn(ctx);
+      if (ctx !== null && !ctx.done) {
+        // A stream that ends with no terminal event and no throw was
+        // abandoned by its consumer or aborted.
+        if (thrown !== null) this.settleThrown(ctx, thrown.err, signal);
+        else this.recordFailure(ctx, 'cancelled');
+      }
     }
   }
 
