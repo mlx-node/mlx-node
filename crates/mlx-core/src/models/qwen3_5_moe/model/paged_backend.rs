@@ -541,8 +541,7 @@ impl Qwen35MoeInner {
             );
             return Ok((logits, Some(context)));
         }
-        let lane_states = mtp_seq.is_none()
-            && self.dflash2.is_none()
+        let lane_states = self.dflash2.is_none()
             && self
                 .dflash2_states
                 .turns
@@ -567,7 +566,7 @@ impl Qwen35MoeInner {
                 chunk_size,
                 rope_deltas,
                 turn_cancel.as_deref(),
-                None,
+                mtp_seq.map(|_| &mut mtp_hidden),
                 Some(&mut sink as &mut dyn crate::models::qwen3_5::paged_forward::PrefillTapSink),
             )?
         } else {

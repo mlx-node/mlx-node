@@ -1300,16 +1300,13 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
     cached_prefix_len: u32,
     gdn_prefix_already_primed: bool,
     embed: &Embedding,
-    layers: &mut [DecoderLayer],
-    caches: &mut [Qwen3_5LayerCache],
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
+    target: &mut dyn PrefillTarget<DecoderLayer>,
     layer_kinds: &[Qwen3_5LayerKind],
-    paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
     keep_last_hidden: Option<usize>,
     cached_rope_deltas: i32,
     turn_cancel: Option<&AtomicBool>,
+    mut taps: Option<&mut dyn PrefillTapSink>,
 ) -> Result<(MxArray, MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -1322,27 +1319,33 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
 
     check_prefill_chunk_rows(chunk_size)?;
 
-    let checkpoint_boundaries = prefill_checkpoint_boundaries(
+    let checkpoint_boundaries = prefill_ladder(
+        target.parts()?.adapter,
         full_tokens.len(),
         cached_prefix_len,
-        paged_adapter.block_size(),
+        taps.is_some(),
+    );
+    let capture_rows = capture_rows_of(taps.as_deref());
+    let breaks = prefill_breaks(
+        &checkpoint_boundaries,
+        &capture_rows,
+        cached_prefix_len,
+        full_tokens.len(),
     );
 
-    if checkpoint_boundaries.is_empty() && suffix_tokens.len() <= chunk_size as usize {
+    if breaks.is_empty() && suffix_tokens.len() <= chunk_size as usize {
         return run_paged_prefill_single_shot_with_hidden(
             full_tokens,
             suffix_tokens,
             cached_prefix_len,
             gdn_prefix_already_primed,
             embed,
-            layers,
-            caches,
-            final_norm,
-            lm_head,
+            target,
             layer_kinds,
-            paged_adapter,
             keep_last_hidden,
             cached_rope_deltas,
+            taps.as_mut()
+                .map(|sink| &mut **sink as &mut dyn PrefillTapSink),
         )
         .map(|(logits, hidden)| (logits, hidden, Vec::new()));
     }
@@ -1351,13 +1354,14 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
         tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
     let prefill_trace_start = inference_info_enabled.then(Instant::now);
     let chunk_size_usize = chunk_size as usize;
-    let suffix_offsets = checkpoint_suffix_offsets(&checkpoint_boundaries, cached_prefix_len);
+    let suffix_offsets = checkpoint_suffix_offsets(&breaks, cached_prefix_len);
     let chunk_ranges = paged_prefill_ranges(suffix_tokens.len(), chunk_size_usize, &suffix_offsets);
 
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let gdn_trace_start = inference_info_enabled.then(Instant::now);
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
-        run_gdn_only_prefill(prefix, embed, layers, caches)?;
+        let parts = target.parts()?;
+        run_gdn_only_prefill(prefix, embed, parts.layers, parts.caches)?;
         if let Some(start) = gdn_trace_start {
             let (active_mib, cache_mib, peak_mib) = trace_memory_mib();
             tracing::info!(
@@ -1375,7 +1379,9 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
     }
     // See the non-MTP chunked driver: discharge the auxiliary-state obligation
     // before the first `record_tokens` of the turn.
-    paged_adapter
+    target
+        .parts()?
+        .adapter
         .confirm_aux_prefix_primed(cached_prefix_len)
         .map_err(Error::from_reason)?;
 
@@ -1389,12 +1395,16 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
         .unwrap_or(0);
     let mut chunk_start_position = cached_prefix_len;
     let mut suffix_offset = 0usize;
+    let tap_layers = taps
+        .as_deref()
+        .map_or_else(Vec::new, |sink| sink.tap_layers().to_vec());
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
         // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary.
         // The Err rides the caller's `invalidate_dense_paged_session` /
-        // `abort_paged_turn` arm — the request is released, never finalized,
-        // so partial K/V is never registered as a live prefix.
+        // `abort_paged_turn` arm — the request is released, never finalized;
+        // only the blocks a tapped prefill's completed chunks registered stay
+        // cached (Splash `publishCommittedBlocks`).
         if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
             return Err(Error::from_reason("prefill cancelled"));
         }
@@ -1404,34 +1414,44 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
         let chunk_start = suffix_offset;
         let chunk_end = chunk_start + chunk.len();
         let overlaps_kept_tail = chunk_end > keep_start;
+        let context_after = chunk_start_position + chunk.len() as u32;
 
-        paged_adapter
-            .record_tokens(chunk)
-            .map_err(Error::from_reason)?;
+        let grant = book_chunk(
+            target,
+            taps.as_deref_mut(),
+            &capture_rows,
+            chunk,
+            context_after,
+            context_after as usize >= full_tokens.len(),
+        )?;
+        let parts = target.parts()?;
 
-        let hidden_states = run_paged_prefill_one_chunk(
+        let (hidden_states, chunk_taps) = run_paged_prefill_one_chunk_tapped(
             chunk,
             chunk_start_position,
             embed,
-            layers,
-            caches,
+            parts.layers,
+            parts.caches,
             layer_kinds,
-            paged_adapter,
+            parts.adapter,
             /* inputs_embeds */ None,
             /* position_ids */ None,
             cached_rope_deltas,
+            &tap_layers,
         )?;
+        if let Some(sink) = taps.as_deref_mut() {
+            sink.chunk(chunk_start_position as usize, chunk, &chunk_taps)?;
+        }
 
         let chunk_hidden = if overlaps_kept_tail || is_last_chunk {
             // Slice before normalization so a one-row seed cannot retain the
             // full normalized prompt allocation through an MLX view.
             let keep_from = keep_start.max(chunk_start) - chunk_start;
             let kept = hidden_states.slice_axis(1, keep_from as i64, chunk.len() as i64)?;
-            Some(final_norm.forward(&kept)?)
+            Some(parts.final_norm.forward(&kept)?)
         } else {
             None
         };
-        let context_after = chunk_start_position + chunk.len() as u32;
         let capture_checkpoint = checkpoint_boundaries.contains(&context_after);
 
         if is_last_chunk {
@@ -1443,7 +1463,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
             })?;
             let chunk_len = chunk_hidden.shape_at(1)?;
             let last_hidden = chunk_hidden.slice_axis(1, chunk_len - 1, chunk_len)?;
-            let logits = if let Some(head) = lm_head {
+            let logits = if let Some(head) = parts.lm_head {
                 head.forward(&last_hidden)?
             } else {
                 embed.as_linear(&last_hidden)?
@@ -1462,16 +1482,29 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
             hidden_chunks.push(kept_hidden);
         }
         if capture_checkpoint {
-            materialize_linear_layer_caches(caches)?;
-            if let Some(caches) = snapshot_materialized_linear_layer_caches(caches) {
+            materialize_linear_layer_caches(parts.caches)?;
+            if let Some(caches) = snapshot_materialized_linear_layer_caches(parts.caches) {
                 checkpoints.push(MaterializedGdnPrefixCheckpoint {
                     prefix_len: context_after,
                     caches,
                 });
             }
         }
+        if grant.as_ref().is_some_and(CaptureGrant::armed)
+            && let Some(sink) = taps.as_deref_mut()
+        {
+            capture_chunk_linear(parts.caches, sink, context_after, capture_checkpoint)?;
+        }
         if !is_last_chunk {
+            if let Some(sink) = taps.as_deref() {
+                sink.eval()?;
+            }
             crate::array::synchronize_and_clear_cache();
+        }
+        if !is_last_chunk || grant.is_some() {
+            reach_chunk(target, taps.as_deref_mut(), context_after, grant)?;
+        }
+        if !is_last_chunk {
             crate::engine::progress::with_turn_progress(|p| {
                 p.prefill_advanced(context_after - cached_prefix_len)
             });
@@ -1496,7 +1529,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
                 total_chunks,
                 chunk_tokens = chunk.len(),
                 context_before = chunk_start_position,
-                context_after = chunk_start_position + chunk.len() as u32,
+                context_after,
                 retained_hidden = overlaps_kept_tail,
                 materialized = overlaps_kept_tail || !is_last_chunk || capture_checkpoint,
                 gdn_checkpoint_materialized = capture_checkpoint,
@@ -1508,7 +1541,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
                 "paged MTP prefill chunk completed"
             );
         }
-        chunk_start_position += chunk.len() as u32;
+        chunk_start_position = context_after;
         suffix_offset = chunk_end;
     }
 
@@ -1554,46 +1587,52 @@ fn run_paged_prefill_single_shot_with_hidden(
     cached_prefix_len: u32,
     gdn_prefix_already_primed: bool,
     embed: &Embedding,
-    layers: &mut [DecoderLayer],
-    caches: &mut [Qwen3_5LayerCache],
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
+    target: &mut dyn PrefillTarget<DecoderLayer>,
     layer_kinds: &[Qwen3_5LayerKind],
-    paged_adapter: &mut PagedKVCacheAdapter,
     keep_last_hidden: Option<usize>,
     cached_rope_deltas: i32,
+    taps: Option<&mut dyn PrefillTapSink>,
 ) -> Result<(MxArray, MxArray)> {
     // GDN pre-pass before `record_tokens`; see `run_paged_prefill_single_shot`
     // for why the two are order-independent.
     if cached_prefix_len > 0 && !gdn_prefix_already_primed {
         let prefix = &full_tokens[..(cached_prefix_len as usize)];
-        run_gdn_only_prefill(prefix, embed, layers, caches)?;
+        let parts = target.parts()?;
+        run_gdn_only_prefill(prefix, embed, parts.layers, parts.caches)?;
     }
-    paged_adapter
+    target
+        .parts()?
+        .adapter
         .confirm_aux_prefix_primed(cached_prefix_len)
         .map_err(Error::from_reason)?;
 
-    paged_adapter
-        .record_tokens(suffix_tokens)
-        .map_err(Error::from_reason)?;
+    target.record(suffix_tokens)?;
+    let parts = target.parts()?;
 
-    let hidden_states = run_paged_prefill_one_chunk(
+    let tap_layers = taps
+        .as_deref()
+        .map_or_else(Vec::new, |sink| sink.tap_layers().to_vec());
+    let (hidden_states, chunk_taps) = run_paged_prefill_one_chunk_tapped(
         suffix_tokens,
         cached_prefix_len,
         embed,
-        layers,
-        caches,
+        parts.layers,
+        parts.caches,
         layer_kinds,
-        paged_adapter,
+        parts.adapter,
         /* inputs_embeds */ None,
         /* position_ids */ None,
         cached_rope_deltas,
+        &tap_layers,
     )?;
+    if let Some(sink) = taps {
+        sink.chunk(cached_prefix_len as usize, suffix_tokens, &chunk_taps)?;
+    }
 
     project_last_token_logits_with_full_hidden(
         &hidden_states,
-        final_norm,
-        lm_head,
+        parts.final_norm,
+        parts.lm_head,
         embed,
         keep_last_hidden,
     )

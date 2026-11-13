@@ -406,20 +406,55 @@ impl Qwen35Inner {
         // Cross-turn M-RoPE delta (0 unless this text turn warm-continues an
         // image prefill); feeds the scalar-offset RoPE for the suffix.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
-        let chunk_size = self.cold_gdn_prefill_chunk_size();
+        let chunk_size = crate::models::qwen3_5::paged_forward::prefill_chunk_rows(
+            self.cold_gdn_prefill_chunk_size(),
+        );
         // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
         // can borrow `self.layers`/`self.caches` mutably at the same time.
         // Threaded into BOTH arms: the AR chunk loop and the planned-MTP
         // `_with_hidden` chunk loop poll it at every chunk boundary.
         let turn_cancel = self.turn_cancel.clone();
-        let caches_ref = self
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason(format!("{context}: caches not initialized")))?;
-        let adapter = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason(format!("{context}: paged_adapter dropped")))?;
+        // Splash `publishReachedStateBoundaries` runs for every request: an
+        // MTP turn's prefill reaches its points as a plain one does.
+        let lane_states = self.dflash2.is_none()
+            && self
+                .dflash2_states
+                .turns
+                .contains_key(&crate::models::qwen3_5::dflash2_turn::DFlash2Target::lane_seq(self));
+        let cached = cached_prefix_len as usize;
+        let captures = if lane_states {
+            crate::models::qwen3_5::dflash2_turn::lane_command_breaks(
+                self,
+                cached,
+                cached + suffix.len(),
+                chunk_size,
+            )
+        } else {
+            Vec::new()
+        };
+        let mut sink = crate::models::qwen3_5::dflash2_turn::LaneStateSink::new(&captures);
+        let taps = lane_states
+            .then_some(&mut sink as &mut dyn crate::models::qwen3_5::paged_forward::PrefillTapSink);
+        let mut lane_target;
+        let mut plain_target;
+        let target: &mut dyn crate::models::qwen3_5::paged_forward::PrefillTarget<DecoderLayer> =
+            if lane_states {
+                lane_target = crate::models::qwen3_5::dflash2_turn::LanePrefill(&mut *self);
+                &mut lane_target
+            } else {
+                plain_target = crate::models::qwen3_5::paged_forward::PrefillParts {
+                    layers: &mut self.layers,
+                    caches: self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason(format!("{context}: caches not initialized"))
+                    })?,
+                    final_norm: &self.final_norm,
+                    lm_head: &self.lm_head,
+                    adapter: self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason(format!("{context}: paged_adapter dropped"))
+                    })?,
+                };
+                &mut plain_target
+            };
         if let Some(keep_tokens) = keep_prompt_hidden_tokens {
             let (logits, hidden, checkpoints) =
                 crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_hidden_with_size(
@@ -428,16 +463,13 @@ impl Qwen35Inner {
                     cached_prefix_len,
                     gdn_prefix_already_primed,
                     &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
+                    target,
                     layer_kinds,
-                    adapter,
                     chunk_size,
                     Some(keep_tokens),
                     rope_deltas,
                     turn_cancel.as_deref(),
+                    taps,
                 )?;
             Ok((logits, Some(hidden), checkpoints))
         } else {
@@ -448,18 +480,12 @@ impl Qwen35Inner {
                     cached_prefix_len,
                     gdn_prefix_already_primed,
                     &embed,
-                    &mut crate::models::qwen3_5::paged_forward::PrefillParts {
-                        layers: &mut self.layers,
-                        caches: caches_ref,
-                        final_norm: &self.final_norm,
-                        lm_head: &self.lm_head,
-                        adapter,
-                    },
+                    target,
                     layer_kinds,
                     chunk_size,
                     rope_deltas,
                     turn_cancel.as_deref(),
-                    None,
+                    taps,
                 )?;
             Ok((logits, None, checkpoints))
         }

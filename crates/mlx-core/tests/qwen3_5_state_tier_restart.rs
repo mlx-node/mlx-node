@@ -1,21 +1,29 @@
 //! Real-weights restart gate for the Qwen3.5 state tier on a load without a
-//! draft: a plain autoregressive conversation resumes after a restart
-//! without prefilling what the first process stored (Splash
-//! `publishReachedStateBoundaries` → `WriteBehind` → `closePersistentCache`
-//! → `Cache::adopt` → `acquireDeepest` → `promotedCopy`).
+//! draft: a conversation resumes after a restart without prefilling what
+//! the first process stored (Splash `publishReachedStateBoundaries` →
+//! `WriteBehind` → `closePersistentCache` → `Cache::adopt` →
+//! `acquireDeepest` → `promotedCopy`), on the default product path and on a
+//! plain autoregressive one.
 //!
-//! Three loads of one checkpoint, one at a time:
+//! The default path is what `mlx serve` runs through `ChatSession` on an
+//! MTP-head checkpoint (every official Qwen3.5 one, the CI checkpoint
+//! included): a streamed turn with `enableMtp` on, a native-MTP turn. The
+//! plain case turns MTP off and runs the non-streaming entry.
+//!
+//! Four loads of one checkpoint per case, one at a time; each restart's
+//! first turn is the one the conversation resumes with:
 //!
 //! | # | tier | prompts | role |
 //! |---|------|---------|------|
 //! | C | off  | P2 | cold reference |
 //! | A | persistent | P1 | publishes the checkpoint at 4096 and the replay point, closes cleanly |
-//! | B | persistent, same root | P3, P2 | takes the states back, resumes P2 at A's replay point |
+//! | B | persistent, same root | P2 | takes the states back, resumes P2 at A's replay point, closes cleanly |
+//! | D | persistent, same root | P3 | a shorter prompt over the same document: resumes at A's checkpoint |
 //!
 //! `MLX_E2E_EXPECT_LANE_DISK=1` (the CI leg) asserts the refused-capture
 //! path: on the 7 GB VM the host refuses every optional claim, so A's
 //! checkpoint goes from the lane to disk, and P3 resumes at it after the
-//! restart. Without it P3 resumes at the checkpoint or prefills cold, and
+//! restarts. Without it P3 resumes at the checkpoint or prefills cold, and
 //! the run prints which.
 //!
 //! ```shell
@@ -25,7 +33,7 @@
 
 use std::path::PathBuf;
 
-use mlx_core::engine::types::{ChatConfig, ChatResult};
+use mlx_core::engine::types::ChatConfig;
 use mlx_core::engine::{MemoryGovernorStatus, memory_governor_status};
 use mlx_core::models::qwen3_5::model::{Qwen3_5Model, Qwen35LoadOptions};
 use mlx_core::tokenizer::ChatMessage;
@@ -48,7 +56,26 @@ fn message(role: &str, content: &str) -> ChatMessage {
     }
 }
 
-fn config() -> ChatConfig {
+/// The decode a case's turns run.
+#[derive(Clone, Copy)]
+enum Decode {
+    /// `ChatSession`'s default on an MTP-head checkpoint: a streamed turn
+    /// with `enableMtp` on.
+    Mtp,
+    /// `enableMtp` off, through `chatSessionStart`.
+    Autoregressive,
+}
+
+/// What a turn's result (or a stream's terminal chunk) reports.
+struct Turn {
+    raw_text: String,
+    num_tokens: u32,
+    prompt_tokens: u32,
+    cached_tokens: u32,
+    mtp_cycles: u32,
+}
+
+fn config(decode: Decode) -> ChatConfig {
     ChatConfig {
         max_new_tokens: Some(24),
         temperature: Some(0.0),
@@ -56,8 +83,9 @@ fn config() -> ChatConfig {
         presence_penalty: Some(0.0),
         frequency_penalty: Some(0.0),
         include_reasoning: Some(true),
-        report_performance: Some(false),
+        report_performance: Some(true),
         reuse_cache: Some(true),
+        enable_mtp: Some(matches!(decode, Decode::Mtp)),
         ..ChatConfig::default()
     }
 }
@@ -114,14 +142,79 @@ async fn load(path: &std::path::Path, options: Qwen35LoadOptions) -> Qwen3_5Mode
         .await
         .expect("load the checkpoint");
     assert!(model.has_block_paged_cache(), "the load builds a pool");
+    assert!(
+        model.has_mtp_weights(),
+        "the gate's checkpoint carries MTP heads, so ChatSession turns MTP on"
+    );
     model
 }
 
-async fn turn(model: &Qwen3_5Model, messages: Vec<ChatMessage>) -> ChatResult {
-    model
-        .chat_session_start(messages, Some(config()))
-        .await
-        .expect("a turn")
+/// One turn. A plain turn runs no MTP cycle; an MTP turn that `drafts`
+/// (a model's first turn, before its acceptance gate has history) must
+/// have run draft/verify cycles. Later MTP turns may be gated to plain
+/// decode by the product's acceptance gate.
+async fn turn(
+    model: &Qwen3_5Model,
+    messages: Vec<ChatMessage>,
+    decode: Decode,
+    drafts: bool,
+) -> Turn {
+    let result = match decode {
+        Decode::Mtp => {
+            let (_handle, mut rx) = model
+                .chat_stream_session_start_for_test(messages, Some(config(decode)))
+                .expect("a streamed turn");
+            let mut last = None;
+            while let Some(chunk) = rx.recv().await {
+                let chunk = chunk.expect("a stream chunk");
+                if chunk.done {
+                    last = Some(chunk);
+                    break;
+                }
+            }
+            let last = last.expect("the stream ended with a terminal chunk");
+            Turn {
+                raw_text: last.raw_text.unwrap_or_default(),
+                num_tokens: last.num_tokens.unwrap_or(0),
+                prompt_tokens: last.prompt_tokens.unwrap_or(0),
+                cached_tokens: last.cached_tokens.unwrap_or(0),
+                mtp_cycles: last
+                    .performance
+                    .and_then(|metrics| metrics.mtp_cycles)
+                    .unwrap_or(0),
+            }
+        }
+        Decode::Autoregressive => {
+            let result = model
+                .chat_session_start(messages, Some(config(decode)))
+                .await
+                .expect("a turn");
+            Turn {
+                raw_text: result.raw_text,
+                num_tokens: result.num_tokens,
+                prompt_tokens: result.prompt_tokens,
+                cached_tokens: result.cached_tokens,
+                mtp_cycles: result
+                    .performance
+                    .and_then(|metrics| metrics.mtp_cycles)
+                    .unwrap_or(0),
+            }
+        }
+    };
+    match decode {
+        Decode::Mtp if drafts => assert!(
+            result.mtp_cycles >= 1,
+            "an MTP turn ran no MTP cycle: cached {} of {}",
+            result.cached_tokens,
+            result.prompt_tokens
+        ),
+        Decode::Mtp => {}
+        Decode::Autoregressive => {
+            assert_eq!(result.mtp_cycles, 0, "a plain turn ran MTP cycles")
+        }
+    }
+    assert!(result.num_tokens > 0, "the turn decoded");
+    result
 }
 
 /// The governor's status once `ready` holds: the model thread publishes its
@@ -155,13 +248,30 @@ fn now_ms() -> f64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 dense checkpoint"]
+async fn default_mtp_conversation_resumes_after_a_restart() {
+    conversation_resumes_after_a_restart(Decode::Mtp).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 dense checkpoint"]
 async fn plain_conversation_resumes_after_a_restart() {
+    conversation_resumes_after_a_restart(Decode::Autoregressive).await;
+}
+
+async fn conversation_resumes_after_a_restart(decode: Decode) {
     let Some(path) = source() else {
         return;
     };
     mlx_core::tracing::try_init_tracing();
     let expect_lane_disk = std::env::var("MLX_E2E_EXPECT_LANE_DISK").as_deref() == Ok("1");
-    let root = std::env::temp_dir().join(format!("mlx-state-tier-restart-{}", std::process::id()));
+    let label = match decode {
+        Decode::Mtp => "mtp",
+        Decode::Autoregressive => "ar",
+    };
+    let root = std::env::temp_dir().join(format!(
+        "mlx-state-tier-restart-{}-{label}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("cache root");
     let persistent = || Qwen35LoadOptions {
@@ -192,20 +302,20 @@ async fn plain_conversation_resumes_after_a_restart() {
         },
     )
     .await;
-    let cold = turn(&reference, p2()).await;
+    let cold = turn(&reference, p2(), decode, true).await;
     assert_eq!(cold.cached_tokens, 0);
     reference.dispose().await.expect("dispose C");
     drop(reference);
 
     let first = load(&path, persistent()).await;
-    let one = turn(&first, p1).await;
+    let one = turn(&first, p1, decode, true).await;
     let captured = status_once(&first, |status| {
         status.dflash2_states.replay_state_publications >= 1.0
     })
     .await
     .dflash2_states;
     eprintln!(
-        "A: prompt {} checkpoints {} replay {} disk {} failures {}/{}/{}",
+        "{label} A: prompt {} checkpoints {} replay {} disk {} failures {}/{}/{}",
         one.prompt_tokens,
         captured.checkpoint_publications,
         captured.replay_state_publications,
@@ -229,29 +339,21 @@ async fn plain_conversation_resumes_after_a_restart() {
     drop(first);
 
     let second = load(&path, persistent()).await;
-    let three = turn(&second, p3).await;
-    let adopted = status_once(&second, |status| {
-        status.dflash2_states.disk.mode == "persistent"
-    })
-    .await
-    .dflash2_states;
-    assert_eq!(adopted.disk.mode, "persistent");
-    assert!(
-        adopted.disk.taken_back >= 1.0,
-        "{}",
-        adopted.disk.taken_back
-    );
-    let two = turn(&second, p2()).await;
+    let two = turn(&second, p2(), decode, true).await;
     let restored = status_once(&second, |status| {
         let states = &status.dflash2_states;
         states.disk_promotions + states.disk_promotions_skipped >= 1.0
     })
     .await
     .dflash2_states;
+    assert_eq!(restored.disk.mode, "persistent");
+    assert!(
+        restored.disk.taken_back >= 1.0,
+        "{}",
+        restored.disk.taken_back
+    );
     eprintln!(
-        "B: P3 cached {} of {}; P2 cached {} of {} (A prompt {}); promotions {} skipped {}",
-        three.cached_tokens,
-        three.prompt_tokens,
+        "{label} B: P2 cached {} of {} (A prompt {}); promotions {} skipped {}",
         two.cached_tokens,
         two.prompt_tokens,
         one.prompt_tokens,
@@ -276,6 +378,22 @@ async fn plain_conversation_resumes_after_a_restart() {
         "P2 after the restart == cold P2"
     );
     assert_eq!(two.num_tokens, cold.num_tokens);
+    assert!(
+        second
+            .close_cache(now_ms() + 30_000.0)
+            .await
+            .expect("close"),
+        "the clean close wrote every waiting point"
+    );
+    second.dispose().await.expect("dispose B");
+    drop(second);
+
+    let third = load(&path, persistent()).await;
+    let three = turn(&third, p3, decode, true).await;
+    eprintln!(
+        "{label} D: P3 cached {} of {}",
+        three.cached_tokens, three.prompt_tokens
+    );
     if expect_lane_disk {
         assert!(captured.disk_state_publications >= 1.0);
         assert_eq!(three.cached_tokens, CHECKPOINT);
@@ -286,7 +404,7 @@ async fn plain_conversation_resumes_after_a_restart() {
             three.cached_tokens
         );
         eprintln!(
-            "P3 {}",
+            "{label} P3 {}",
             if three.cached_tokens == CHECKPOINT {
                 "resumed at the checkpoint"
             } else {
@@ -294,7 +412,7 @@ async fn plain_conversation_resumes_after_a_restart() {
             }
         );
     }
-    second.dispose().await.expect("dispose B");
-    drop(second);
+    third.dispose().await.expect("dispose D");
+    drop(third);
     let _ = std::fs::remove_dir_all(&root);
 }

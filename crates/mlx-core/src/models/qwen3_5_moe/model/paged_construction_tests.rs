@@ -2525,3 +2525,58 @@ fn moe_plain_restart_restores_the_disk_state() -> Result<()> {
     moe_small_plan(false);
     result
 }
+
+/// Splash `publishReachedStateBoundaries` for a scheduled MTP sequence on a
+/// MoE load without a draft: the prefill reaches the lane's checkpoint (64)
+/// and replay point (128) and publishes them while the same forward seeds
+/// the drafter with the prompt's hidden rows.
+/// Mutation MS1m (a scheduled MoE MTP prefill keeps no sink) → red.
+#[test]
+fn moe_scheduled_mtp_prefill_publishes_its_plan() -> Result<()> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::test_tier;
+    use crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget;
+    const TEST: &str = "moe_scheduled_mtp_prefill_publishes_its_plan";
+    let tier = test_tier("s13-moe-mtp-lane", 1 << 30);
+    let Some(mut inner) = plain_moe_on(&tier, TEST) else {
+        return Ok(());
+    };
+    moe_small_plan(true);
+    let result = (|| -> Result<()> {
+        let seq = 5u32;
+        let tokens: Vec<u32> = (0..140).map(|i| (i * 5 + 2) % 13 + 1).collect();
+        inner.activate_scheduled_recurrent(seq)?;
+        let prefix = inner.prime_prefix_state(&tokens, true, 16, &[], 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len, 0);
+        assert!(inner.begin_scheduled_mtp(seq, 0)?);
+        inner
+            .paged_prefill(
+                &tokens,
+                &prefix,
+                Stream::default(crate::stream::DeviceType::Gpu),
+            )?
+            .eval();
+        let counters = inner.dflash2_states.counters;
+        assert_eq!(
+            (
+                counters.checkpoint_publications,
+                counters.replay_state_publications
+            ),
+            (1, 1)
+        );
+        let mut depths: Vec<usize> = inner
+            .dflash2_states
+            .store
+            .entries()
+            .map(|entry| entry.depth())
+            .collect();
+        depths.sort_unstable();
+        assert_eq!(depths, vec![64, 128]);
+        assert!(
+            inner.mtp_state().owners[&seq].hidden.is_some(),
+            "the drafter is seeded"
+        );
+        Ok(())
+    })();
+    moe_small_plan(false);
+    result
+}

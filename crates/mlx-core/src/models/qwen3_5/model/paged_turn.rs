@@ -70,7 +70,6 @@ impl Qwen35Inner {
         let mut first_token_instant: Option<std::time::Instant> = None;
         let trace_enabled = inference_trace_enabled();
 
-        let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
         // Text-only turns: all-empty per-block extra_keys, bit-equal to `&[]`.
@@ -125,34 +124,12 @@ impl Qwen35Inner {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
         }
-        let plan_result = crate::models::qwen3_5::dflash2_turn::claimed(
-            self,
-            crate::models::qwen3_5::dflash2_turn::Keep {
-                tokens: &tokens,
-                keys: Some((lookup_extra_keys.as_slice(), cache_salt)),
-            },
-            |inner| {
-                inner
-                    .paged_adapter
-                    .as_mut()
-                    .ok_or_else(|| {
-                        Error::from_reason(
-                            "paged_turn_sync_core: paged_adapter is None — this load has \
-                             no block-paged pool",
-                        )
-                    })?
-                    .prepare_turn_per_block_with_max_cache_hit_tokens(
-                        seq_id,
-                        &tokens,
-                        total_budget,
-                        true,
-                        &lookup_extra_keys,
-                        cache_salt,
-                        false,
-                        max_cache_hit_tokens,
-                    )
-                    .map_err(Error::from_reason)
-            },
+        let plan_result = self.prepare_mtp_core_turn(
+            &tokens,
+            &lookup_extra_keys,
+            cache_salt,
+            max_cache_hit_tokens,
+            "paged_turn_sync_core",
         );
         let plan = match plan_result {
             Ok(plan) => plan,
@@ -223,6 +200,16 @@ impl Qwen35Inner {
             self.cached_rope_deltas,
             preserves_image_lineage,
         );
+
+        if let Err(error) = self.open_dense_lane_turn(
+            &tokens,
+            cached_prefix_len as usize,
+            cache_salt,
+            p.reuse_cache,
+        ) {
+            self.invalidate_dense_paged_session("planned-MTP state points");
+            return Err(error);
+        }
 
         let suffix_len = match prompt_token_count.checked_sub(cached_prefix_len) {
             Some(suffix_len) => suffix_len,
@@ -1513,7 +1500,6 @@ impl Qwen35Inner {
         );
         let prefix_plan_start = inference_info_enabled.then(std::time::Instant::now);
 
-        let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
         // Per-block extra_keys for prefix-cache lookup. See the matching
@@ -1561,34 +1547,12 @@ impl Qwen35Inner {
                 live_mismatch = token_prefix_mismatch_trace(&tokens, live_tokens);
             }
         }
-        let plan_result = crate::models::qwen3_5::dflash2_turn::claimed(
-            self,
-            crate::models::qwen3_5::dflash2_turn::Keep {
-                tokens: &tokens,
-                keys: Some((lookup_extra_keys.as_slice(), cache_salt)),
-            },
-            |inner| {
-                inner
-                    .paged_adapter
-                    .as_mut()
-                    .ok_or_else(|| {
-                        Error::from_reason(
-                            "paged_turn_stream_core: paged_adapter is None — this load has \
-                             no block-paged pool",
-                        )
-                    })?
-                    .prepare_turn_per_block_with_max_cache_hit_tokens(
-                        seq_id,
-                        &tokens,
-                        total_budget,
-                        true,
-                        &lookup_extra_keys,
-                        cache_salt,
-                        false,
-                        max_cache_hit_tokens,
-                    )
-                    .map_err(Error::from_reason)
-            },
+        let plan_result = self.prepare_mtp_core_turn(
+            &tokens,
+            &lookup_extra_keys,
+            cache_salt,
+            max_cache_hit_tokens,
+            "paged_turn_stream_core",
         );
         let plan = match plan_result {
             Ok(plan) => plan,
@@ -1667,6 +1631,16 @@ impl Qwen35Inner {
             self.cached_rope_deltas,
             preserves_image_lineage,
         );
+
+        if let Err(error) = self.open_dense_lane_turn(
+            &tokens,
+            cached_prefix_len as usize,
+            cache_salt,
+            p.reuse_cache,
+        ) {
+            self.invalidate_dense_paged_session("planned-MTP stream state points");
+            return Err(error);
+        }
 
         let suffix_len = match prompt_token_count.checked_sub(cached_prefix_len) {
             Some(suffix_len) => suffix_len,
@@ -2275,6 +2249,56 @@ impl Qwen35Inner {
 }
 
 impl Qwen35Inner {
+    /// The adapter's prepare for a planned-MTP core turn of `tokens`, with a
+    /// disk state's chain armed to come back with the KV lookup as an
+    /// autoregressive prime arms it (Splash `Cache::lookup` serves every
+    /// request alike).
+    fn prepare_mtp_core_turn(
+        &mut self,
+        tokens: &[u32],
+        lookup_extra_keys: &[Vec<u64>],
+        cache_salt: u64,
+        max_cache_hit_tokens: u32,
+        context: &'static str,
+    ) -> Result<crate::transformer::paged_kv_cache_adapter::PagedTurnPlan> {
+        let disk_state = crate::models::qwen3_5::dflash2_turn::disk_state_depth(
+            self,
+            tokens,
+            lookup_extra_keys,
+            cache_salt,
+            max_cache_hit_tokens,
+        );
+        crate::models::qwen3_5::dflash2_turn::claimed(
+            self,
+            crate::models::qwen3_5::dflash2_turn::Keep {
+                tokens,
+                keys: Some((lookup_extra_keys, cache_salt)),
+            },
+            |inner| {
+                let adapter = inner.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "{context}: paged_adapter is None — this load has no block-paged pool"
+                    ))
+                })?;
+                if let Some(depth) = disk_state {
+                    adapter.arm_state_restore(depth);
+                }
+                adapter
+                    .prepare_turn_per_block_with_max_cache_hit_tokens(
+                        0,
+                        tokens,
+                        tokens.len() as u32,
+                        true,
+                        lookup_extra_keys,
+                        cache_salt,
+                        false,
+                        max_cache_hit_tokens,
+                    )
+                    .map_err(Error::from_reason)
+            },
+        )
+    }
+
     /// Turn-admission speculative reservation for the paged MTP arm: reserve
     /// the lookahead rows past the (post-prefill) prompt cursor, sized by
     /// `engine::mtp_turn::turn_lookahead_rows` off the model's

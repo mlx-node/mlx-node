@@ -608,11 +608,16 @@ Qwen3.5 dense and MoE are not on the K/V restore allowlist. Like Splash, their S
 tier holds **DFlash2 states**, not per-turn K/V: a turn writes nothing to disk, and a
 K/V chain alone never backs a prefix (`ColdContextBacking::StateOnly`). The tier opens
 for every paged load, with a DFlash2 draft or without one. On a load without a draft,
-plain autoregressive text turns publish the same restore points as Splash
-(`publishReachedStateBoundaries`): a checkpoint every 4,096 prompt tokens (twice the
-2,048-token state window) and the replay point at the last whole block before the
-generation prompt. Their objects hold the GDN cell alone. MTP and image turns still
-keep their states in the in-process GDN ladder below, not on the tier.
+text turns publish the same restore points as Splash (`publishReachedStateBoundaries`
+runs for every request): a checkpoint every 4,096 prompt tokens (twice the 2,048-token
+state window) and the replay point at the last whole block before the generation
+prompt. That holds for autoregressive and native-MTP turns alike, whole-turn or
+scheduled: the MTP prefill reaches the points in the same forward that seeds its
+drafter, and an MTP turn resumes from a RAM or disk state as a plain one does. Their
+objects hold the GDN cell alone. Image turns still keep their states in the
+in-process GDN ladder below, not on the tier. `tests/qwen3_5_state_tier_restart.rs`
+gates a restart on the default `mlx serve` path (a streamed MTP turn) and on a plain
+autoregressive one.
 
 | What                 | Splash                                                                                                                            | mlx-node                                                                                                                                                                                                                                                                                                                         |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

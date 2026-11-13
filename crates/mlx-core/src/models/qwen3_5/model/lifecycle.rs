@@ -997,6 +997,7 @@ impl Qwen35Inner {
                 );
                 adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, cache_salt)
             });
+        crate::models::qwen3_5::dflash2_turn::end_turn_states(self);
         match finalize_result {
             Ok(_) => Ok(()),
             Err(error) => {

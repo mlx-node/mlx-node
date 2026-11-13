@@ -563,83 +563,78 @@ impl Qwen35Inner {
             );
             return Ok((logits, Some(context)));
         }
-        let (logits, checkpoint) = {
-            let caches_ref = self
-                .caches
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("paged_prefill: caches not initialized"))?;
-            let adapter = self
-                .paged_adapter
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
-            if mtp_seq.is_some() {
-                let (logits, hidden, checkpoint) = crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_hidden_with_size(
-                &prefix.full_tokens,
-                suffix_tokens,
-                prefix.effective_cached_prefix_len as u32,
-                prefix.gdn_prefix_already_primed,
-                &embed,
-                &mut self.layers,
-                caches_ref,
-                &self.final_norm,
-                &self.lm_head,
-                &layer_kinds,
-                adapter,
+        // Splash `publishReachedStateBoundaries` runs for every request: an
+        // MTP sequence's prefill reaches its points as a plain one does.
+        let lane_states = self.dflash2.is_none()
+            && self
+                .dflash2_states
+                .turns
+                .contains_key(&self.active_scheduled_seq.unwrap_or(0));
+        let cached = prefix.effective_cached_prefix_len;
+        let captures = if lane_states {
+            crate::models::qwen3_5::dflash2_turn::lane_command_breaks(
+                self,
+                cached,
+                cached + suffix_tokens.len(),
                 chunk_size,
-                Some(suffix_tokens.len()),
-                rope_deltas,
-                turn_cancel.as_deref(),
-            )?;
-                mtp_hidden = Some(hidden);
-                (logits, checkpoint)
-            } else if self.dflash2.is_none()
-                && self
-                    .dflash2_states
-                    .turns
-                    .contains_key(&self.active_scheduled_seq.unwrap_or(0))
-            {
-                let cached = prefix.effective_cached_prefix_len;
-                let captures = crate::models::qwen3_5::dflash2_turn::lane_command_breaks(
-                    self,
-                    cached,
-                    cached + suffix_tokens.len(),
-                    chunk_size,
-                );
-                let mut sink = crate::models::qwen3_5::dflash2_turn::LaneStateSink::new(&captures);
-                crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
+            )
+        } else {
+            Vec::new()
+        };
+        let mut sink = crate::models::qwen3_5::dflash2_turn::LaneStateSink::new(&captures);
+        let taps = lane_states.then_some(&mut sink as &mut dyn PrefillTapSink);
+        let mut lane_target;
+        let mut plain_target;
+        let target: &mut dyn crate::models::qwen3_5::paged_forward::PrefillTarget<DecoderLayer> =
+            if lane_states {
+                lane_target = crate::models::qwen3_5::dflash2_turn::LanePrefill(&mut *self);
+                &mut lane_target
+            } else {
+                plain_target = crate::models::qwen3_5::paged_forward::PrefillParts {
+                    layers: &mut self.layers,
+                    caches: self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason("paged_prefill: caches not initialized")
+                    })?,
+                    final_norm: &self.final_norm,
+                    lm_head: &self.lm_head,
+                    adapter: self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason("paged_prefill: paged_adapter dropped")
+                    })?,
+                };
+                &mut plain_target
+            };
+        let (logits, checkpoint) = if mtp_seq.is_some() {
+            let (logits, hidden, checkpoint) =
+                crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_hidden_with_size(
                     &prefix.full_tokens,
                     suffix_tokens,
                     cached as u32,
                     prefix.gdn_prefix_already_primed,
                     &embed,
-                    &mut crate::models::qwen3_5::dflash2_turn::LanePrefill(self),
+                    target,
                     &layer_kinds,
                     chunk_size,
+                    Some(suffix_tokens.len()),
                     rope_deltas,
                     turn_cancel.as_deref(),
-                    Some(&mut sink as &mut dyn PrefillTapSink),
-                )?
-            } else {
-                crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
-                    &prefix.full_tokens,
-                    suffix_tokens,
-                    prefix.effective_cached_prefix_len as u32,
-                    prefix.gdn_prefix_already_primed,
-                    &embed,
-                    &mut crate::models::qwen3_5::paged_forward::PrefillParts {
-                        layers: &mut self.layers,
-                        caches: caches_ref,
-                        final_norm: &self.final_norm,
-                        lm_head: &self.lm_head,
-                        adapter,
-                    },
-                    &layer_kinds,
-                    chunk_size,
-                    rope_deltas,
-                    turn_cancel.as_deref(),
-                    None,
-                )?
-            }
+                    taps,
+                )?;
+            mtp_hidden = Some(hidden);
+            (logits, checkpoint)
+        } else {
+            crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
+                &prefix.full_tokens,
+                suffix_tokens,
+                cached as u32,
+                prefix.gdn_prefix_already_primed,
+                &embed,
+                target,
+                &layer_kinds,
+                chunk_size,
+                rope_deltas,
+                turn_cancel.as_deref(),
+                taps,
+            )?
         };
         if let Some(seq) = mtp_seq {
             crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::prefill_scheduled_mtp(
@@ -1046,6 +1041,8 @@ impl Qwen35Inner {
         let mut p = extract_chat_params(&config);
         p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
         if planned_mtp {
+            self.dflash2_states.generation_suffix =
+                args.tokenizer.generation_suffix(args.config).ok().flatten();
             let report_perf = args.config.report_performance.unwrap_or(false);
             let tokenizer = args.tokenizer.clone();
             let thinking = args.thinking;

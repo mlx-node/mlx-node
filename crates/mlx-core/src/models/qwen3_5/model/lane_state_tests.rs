@@ -135,8 +135,43 @@ fn prompt(seed: u32, body: u32) -> Vec<u32> {
 /// One whole autoregressive turn of `tokens` (Splash `admit` → prefill →
 /// decode → `release`).
 fn ar_turn(inner: &mut Qwen35Inner, tokens: &[u32]) -> Result<ChatResult> {
+    whole_turn(inner, tokens, &config(), DecoderPlan::Autoregressive)
+}
+
+/// One whole native-MTP turn of `tokens`, greedy, eight tokens, as a
+/// session that leaves `enableMtp` unset runs it on an MTP-head checkpoint.
+fn mtp_turn(inner: &mut Qwen35Inner, tokens: &[u32], reuse: bool) -> Result<ChatResult> {
+    inner.mtp_weights_loaded = true;
+    let config = ChatConfig {
+        max_new_tokens: Some(8),
+        enable_mtp: Some(true),
+        report_performance: Some(true),
+        reuse_cache: Some(reuse),
+        ..config()
+    };
+    let result = whole_turn(
+        inner,
+        tokens,
+        &config,
+        DecoderPlan::Speculative(crate::engine::plan::SpeculativeKind::NativeMtp),
+    )?;
+    let cycles = result
+        .performance
+        .as_ref()
+        .and_then(|metrics| metrics.mtp_cycles)
+        .unwrap_or(0);
+    assert!(cycles >= 1, "the turn ran MTP cycles: {cycles}");
+    Ok(result)
+}
+
+fn whole_turn(
+    inner: &mut Qwen35Inner,
+    tokens: &[u32],
+    config: &ChatConfig,
+    decoder: DecoderPlan,
+) -> Result<ChatResult> {
     let tokenizer = tokenizer();
-    let config = config();
+    let config = config.clone();
     let params = ChatBackend::resolve_params(inner, &config);
     let thinking = ChatBackend::thinking_setup(inner, &config);
     let mut args = WholeTurnArgs {
@@ -151,7 +186,7 @@ fn ar_turn(inner: &mut Qwen35Inner, tokens: &[u32]) -> Result<ChatResult> {
             input_media: MediaCapabilities::NONE,
             context_media: MediaCapabilities::NONE,
             use_paged_attention: true,
-            decoder: DecoderPlan::Autoregressive,
+            decoder,
         },
         sink: None,
         cancelled: None,
@@ -502,4 +537,193 @@ fn state_at_lineage(inner: &Qwen35Inner, tokens: &[u32]) -> EntryId {
         .find(|entry| entry.tokens() == tokens)
         .expect("a state on the lineage")
         .id()
+}
+
+/// Splash `publishReachedStateBoundaries` runs for every request, a
+/// speculative one included: a native-MTP whole turn publishes the plan's
+/// checkpoint (64) and replay point (112) as a plain turn does, and one the
+/// ledger refused goes from the lane to disk; the token stream is the one a
+/// twin turn that keeps no state decodes (publishing reads the lane, never
+/// writes it).
+/// Mutations MW1 (the MTP prefill keeps no sink), MO1 (the MTP core opens
+/// no lane turn), MG1 (the MTP turn leaves the generation prompt unset, so
+/// the point moves to 128) and ME1 (the MTP core's finalize keeps the
+/// turn's points) → red.
+#[test]
+fn mtp_turn_publishes_its_plan_and_decodes_as_without_states() -> Result<()> {
+    use crate::engine::governor::governor::Governor;
+    use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+    const TEST: &str = "mtp_turn_publishes_its_plan_and_decodes_as_without_states";
+    let (Some(mut granted), Some(mut refused), Some(mut stateless)) = (
+        plain(0x5A13_0011, TEST),
+        plain(0x5A13_0011, TEST),
+        plain(0x5A13_0011, TEST),
+    ) else {
+        return Ok(());
+    };
+    let tier = test_tier("s13-mtp-lane", 1 << 30);
+    let granted_tier = test_tier("s13-mtp-lane-granted", 1 << 30);
+    attach(&mut refused, &tier);
+    attach(&mut granted, &granted_tier);
+    let _plan = SmallPlan::new();
+    let tokens = prompt(13, 127);
+
+    let reference = mtp_turn(&mut stateless, &tokens, false)?;
+    let counters = stateless.dflash2_states.counters;
+    assert_eq!(
+        (
+            counters.checkpoint_publications,
+            counters.replay_state_publications
+        ),
+        (0, 0),
+        "a turn without reuse plans no point"
+    );
+
+    let result = mtp_turn(&mut granted, &tokens, true)?;
+    assert_eq!(result.cached_tokens, 0);
+    let counters = granted.dflash2_states.counters;
+    assert_eq!(counters.checkpoint_publications, 1);
+    assert_eq!(counters.replay_state_publications, 1);
+    assert_eq!(counters.checkpoint_publication_failures, 0);
+    assert_eq!(counters.replay_state_publication_failures, 0);
+    assert_eq!(
+        states(&granted),
+        vec![(64, true, true, false), (112, false, true, false)]
+    );
+    assert!(granted.dflash2_states.turns.is_empty(), "the turn ended");
+    assert!(granted.dflash2_states.replay_points.is_empty());
+    assert_eq!(result.raw_text, reference.raw_text, "MTP decodes alike");
+    assert_eq!(result.num_tokens, reference.num_tokens);
+
+    let io = FakeIo::new(
+        stats(0),
+        host(32 * G, crate::engine::governor::host::Pressure::Normal),
+    );
+    let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+    refused.memory_registration =
+        Some(governor.register_model(model(16 * G, 0)).expect("register"));
+    STATE_CLAIM_SCRIPT.with(|script| {
+        *script.borrow_mut() = [ScriptedClaim::Refuse].into_iter().collect();
+    });
+    let lane = mtp_turn(&mut refused, &tokens, true)?;
+    let counters = refused.dflash2_states.counters;
+    assert_eq!(counters.disk_state_publications, 1);
+    assert_eq!(counters.checkpoint_publications, 1);
+    assert_eq!(
+        states(&refused),
+        vec![(64, true, false, true), (112, false, true, false)]
+    );
+    assert!(tier.tier.manager.drain(std::time::Duration::from_secs(10)));
+    poll_offload(&mut refused);
+    let object = read_object(&refused.dflash2_states, state_at(&refused, 64)).expect("the object");
+    assert_eq!(object, cell_bytes(&granted, state_at(&granted, 64)));
+    assert_eq!(lane.raw_text, reference.raw_text, "MTP decodes alike");
+    assert_eq!(lane.num_tokens, reference.num_tokens);
+    Ok(())
+}
+
+/// Splash `WriteBehind`, `Cache::adopt`, `acquireDeepest` and
+/// `promotedCopy` for a native-MTP conversation: the MTP turn's replay
+/// point waits behind and a clean close writes it; after a restart the
+/// next MTP turn of the same prompt arms the disk state's chain with its
+/// KV lookup, resumes at 112 with the stored cell, turns the read resident
+/// and ends its use of the state with the turn.
+/// Mutation MA1 (the MTP core arms no disk restore) → red.
+#[test]
+fn mtp_restart_restores_the_disk_state() -> Result<()> {
+    const TEST: &str = "mtp_restart_restores_the_disk_state";
+    let Some(mut first) = plain(0x5A13_0013, TEST) else {
+        return Ok(());
+    };
+    let tier = persistent_test_tier("s13-mtp-restart", 1 << 30);
+    attach(&mut first, &tier);
+    let _plan = SmallPlan::new();
+    let tokens = prompt(17, 127);
+    mtp_turn(&mut first, &tokens, true)?;
+    let behind = |inner: &Qwen35Inner| {
+        inner
+            .dflash2_states
+            .disk
+            .as_ref()
+            .expect("tier")
+            .write_behind
+            .snapshot()
+    };
+    assert_eq!(behind(&first).waiting, 1, "the replay point waits behind");
+    let stored = cell_bytes(&first, state_at(&first, 112));
+    assert!(close_cache(
+        &mut first,
+        std::time::Instant::now() + std::time::Duration::from_secs(30)
+    ));
+    assert_eq!(behind(&first).durable, 1);
+    drop(first);
+
+    let tier = tier.reopen("s13-mtp-restart", 1 << 30);
+    let Some(mut second) = plain(0x5A13_0013, TEST) else {
+        return Ok(());
+    };
+    attach(&mut second, &tier);
+    assert_eq!(
+        crate::models::qwen3_5::dflash2_state::disk::adopt_all(&mut second),
+        1
+    );
+    assert_eq!(states(&second), vec![(112, false, false, true)]);
+    let result = mtp_turn(&mut second, &tokens, true)?;
+    assert_eq!(result.cached_tokens, 112);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(
+        disk.counters.promotions + disk.counters.promotions_skipped,
+        1
+    );
+    assert_eq!(disk.counters.invalidations, 0);
+    assert_eq!(cell_bytes(&second, state_at(&second, 112)), stored);
+    assert_eq!(second.gdn_in_use_for_test(0), None, "the use ended");
+    Ok(())
+}
+
+/// Splash `publishReachedStateBoundaries` for a scheduled MTP sequence:
+/// its prefill slices reach the lane's points and publish them while the
+/// same forward seeds the drafter with the slice's hidden rows.
+/// Mutation MS1 (a scheduled MTP prefill keeps no sink) → red.
+#[test]
+fn scheduled_mtp_prefill_publishes_its_plan() -> Result<()> {
+    use crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget;
+    let Some(mut inner) = plain(0x5A13_0015, "scheduled_mtp_prefill_publishes_its_plan") else {
+        return Ok(());
+    };
+    inner.mtp_weights_loaded = true;
+    let _plan = SmallPlan::new();
+    let seq = 3u32;
+    let tokens = prompt(19, 138);
+    inner.activate_scheduled_recurrent(seq)?;
+    let base = PagedBackend::prime_prefix_state(&mut inner, &tokens, true, 16, &[], 0)?;
+    assert_eq!(base.effective_cached_prefix_len, 0);
+    assert!(inner.begin_scheduled_mtp(seq, 0)?);
+    for (start, end) in [(0usize, 64usize), (64, 140)] {
+        let prefix = HybridSchedulerBackend::build_scheduled_prefix(
+            &inner,
+            &base,
+            start,
+            end - start,
+            tokens.clone(),
+            start == 0,
+        );
+        PagedBackend::paged_prefill(
+            &mut inner,
+            &tokens[start..end],
+            &prefix,
+            crate::stream::Stream::default(crate::stream::DeviceType::Gpu),
+        )?
+        .eval();
+    }
+    let counters = inner.dflash2_states.counters;
+    assert_eq!(counters.checkpoint_publications, 1);
+    assert_eq!(counters.replay_state_publications, 1);
+    assert_eq!(
+        states(&inner),
+        vec![(64, true, true, false), (128, false, true, false)]
+    );
+    let owner = &inner.mtp_state().owners[&seq];
+    assert!(owner.hidden.is_some(), "the drafter is seeded");
+    Ok(())
 }

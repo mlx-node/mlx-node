@@ -1509,15 +1509,18 @@ impl Qwen35Inner {
                 0,
                 false,
                 &embed,
-                &mut self.layers,
-                caches,
-                &self.final_norm,
-                &self.lm_head,
+                &mut crate::models::qwen3_5::paged_forward::PrefillParts {
+                    layers: &mut self.layers,
+                    caches,
+                    final_norm: &self.final_norm,
+                    lm_head: &self.lm_head,
+                    adapter,
+                },
                 &layer_kinds,
-                adapter,
                 PREFILL_STEP_SIZE as i32,
                 None,
                 0,
+                None,
                 None,
             )?;
         Ok(hidden)

@@ -187,8 +187,8 @@ child whose resolver throws on `@mlx-node/core` or any `.node` specifier.
   dedup, telemetry counters). qwen3_5 and its MoE keep no sidecar: their SSD
   tier holds DFlash2 state objects (`qwen3_5/dflash2_state/disk.rs`, backing
   `ColdContextBacking::StateOnly`), so only a state object backs a cold
-  prefix. A load without a draft writes them too: its plain text turns
-  publish through `LaneStateSink` / `LanePrefill` (`dflash2_turn.rs`), and
+  prefix. A load without a draft writes them too: its text turns, plain or
+  native-MTP, publish through `LaneStateSink` / `LanePrefill` (`dflash2_turn.rs`), and
   `tests/qwen3_5_state_tier_restart.rs` is the restart gate. `ColdContextBacking::KvOnly` (plain full-attention families) gets
   KV capture/restore free from the finalize/lookup walks.
 
