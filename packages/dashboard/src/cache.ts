@@ -35,7 +35,13 @@ const KEY_HEX_LEN = 64;
  * Mirrors `ColdGroup::SIDECAR_GROUPS` exactly. `kv` is absent: a KV object is
  * only ever the bare `<64-hex>.safetensors` form.
  */
-const SIDECAR_GROUPS: ReadonlySet<string> = new Set(['conv_state', 'sliding_window', 'dflash2_state']);
+const SIDECAR_GROUPS: ReadonlySet<string> = new Set([
+  'conv_state',
+  'sliding_window',
+  'dflash2_state',
+  'hybrid_cell',
+  'hybrid_draft',
+]);
 
 function isLowerHexKey(value: string): boolean {
   if (value.length !== KEY_HEX_LEN) return false;

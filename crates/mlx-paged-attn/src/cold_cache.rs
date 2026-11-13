@@ -32,6 +32,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{BlockAllocator, LayerKVPool, PhysicalBlock};
 
+mod hybrid;
+pub use hybrid::ColdObject;
+
 const CACHE_ABI: &str = "mlx-paged-v1";
 /// Filename suffix shared by every cold object (KV blocks and sidecars).
 const OBJECT_SUFFIX: &str = ".safetensors";
@@ -117,13 +120,24 @@ pub enum ColdGroup {
     /// window. Not a sidecar: it carries its own label and is read straight
     /// into the caller's buffer.
     DFlash2State,
+    /// A Flash Next (qwen4_exp) prefix state at a block row: GDN conv and
+    /// recurrent state, PLE history and the draft rows waiting there.
+    HybridCell,
+    /// One Flash Next draft pass's K/V and pooled indexer keys, shared by
+    /// the states of one lineage.
+    HybridDraft,
 }
 
 impl ColdGroup {
     /// Every non-KV group, in a stable order. Used by name parsing and by the
     /// dashboard-facing filename contract.
-    pub const SIDECAR_GROUPS: [Self; 3] =
-        [Self::ConvState, Self::SlidingWindow, Self::DFlash2State];
+    pub const SIDECAR_GROUPS: [Self; 5] = [
+        Self::ConvState,
+        Self::SlidingWindow,
+        Self::DFlash2State,
+        Self::HybridCell,
+        Self::HybridDraft,
+    ];
 
     /// Domain-separation tag hashed as the first component of every key.
     ///
@@ -138,6 +152,8 @@ impl ColdGroup {
             Self::ConvState => b"mlx-node:cold-sidecar-conv-state:v1\0",
             Self::SlidingWindow => b"mlx-node:cold-sidecar-sliding-window:v1\0",
             Self::DFlash2State => b"mlx-node:cold-state-dflash2:v1\0",
+            Self::HybridCell => b"mlx-node:cold-sidecar-hybrid-cell:v1\0",
+            Self::HybridDraft => b"mlx-node:cold-sidecar-hybrid-draft:v1\0",
         }
     }
 
@@ -150,6 +166,8 @@ impl ColdGroup {
             Self::ConvState => "conv_state",
             Self::SlidingWindow => "sliding_window",
             Self::DFlash2State => "dflash2_state",
+            Self::HybridCell => "hybrid_cell",
+            Self::HybridDraft => "hybrid_draft",
         }
     }
 
@@ -159,6 +177,8 @@ impl ColdGroup {
             "conv_state" => Some(Self::ConvState),
             "sliding_window" => Some(Self::SlidingWindow),
             "dflash2_state" => Some(Self::DFlash2State),
+            "hybrid_cell" => Some(Self::HybridCell),
+            "hybrid_draft" => Some(Self::HybridDraft),
             _ => None,
         }
     }
@@ -2715,7 +2735,12 @@ fn max_encoded_len_for_pool(pool: &LayerKVPool) -> u64 {
     )
     .unwrap_or(0);
     let token_bytes = pool.block_size() as u64 * size_of::<u32>() as u64;
+    let index_bytes = pool
+        .layout()
+        .index_bytes()
+        .saturating_mul(pool.num_layers() as u64);
     kv_bytes
+        .saturating_add(index_bytes)
         .saturating_add(token_bytes)
         .saturating_add(header_overhead(pool.num_layers() as u64))
 }

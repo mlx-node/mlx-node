@@ -771,6 +771,14 @@ struct SafeDescriptor {
 }
 
 impl Store {
+    /// The digest of every GGUF shard's path, size and mtime; `None` for a
+    /// load that serves no GGUF source.
+    pub(super) fn checkpoint_identity(&self) -> Option<&str> {
+        self.gguf_source
+            .as_ref()
+            .map(|source| source.identity.as_str())
+    }
+
     /// Count `bytes` read from the checkpoint files, here and in the live
     /// counters `residencyInfo` reads.
     pub(super) fn count_bytes_read(&mut self, bytes: u64) {

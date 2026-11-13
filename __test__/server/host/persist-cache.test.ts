@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vite-plus/test';
 
+import { COLD_TIER_RESTORE_FAMILIES } from '../../../packages/lm/src/cold-tier.js';
 import { MAX_YARN_CONTEXT_TOKENS } from '../../../packages/server/src/host/max-context.js';
 import {
   COLD_CAPTURE_BLOCKS_ENV,
   COLD_CAPTURE_BUDGET_MS_ENV,
   PAGED_BLOCK_TOKENS,
+  PERSIST_PAGED_CACHE_ENV,
   parseCaptureEnv,
   parsePersistEnv,
   PERSIST_PAGED_CACHE_DEFAULT,
@@ -96,5 +98,25 @@ describe('resolveColdCapture', () => {
       writes: {},
     });
     expect(resolveColdCapture(true, false, {})).toEqual({ budget: null, writes: {} });
+  });
+});
+
+describe('Flash Next stored states on disk', () => {
+  // Every host asks with `byDefault: true`; a library load asks nothing and
+  // leaves the env unset.
+  const host = PERSIST_PAGED_CACHE_DEFAULT;
+
+  it('qwen4_exp is on the restore allowlist', () => {
+    expect(COLD_TIER_RESTORE_FAMILIES.has('qwen4_exp')).toBe(true);
+  });
+
+  it('is on by default for every host', () => {
+    expect(resolvePersistPagedCache(host, {})).toBe(true);
+  });
+
+  it('stays off when the user turns it off', () => {
+    expect(resolvePersistPagedCache({ ...host, flag: false }, {})).toBe(false);
+    expect(resolvePersistPagedCache(host, { [PERSIST_PAGED_CACHE_ENV]: '0' })).toBe(false);
+    expect(resolvePersistPagedCache({ byDefault: false }, {})).toBe(false);
   });
 });

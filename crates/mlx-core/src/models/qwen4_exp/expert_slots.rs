@@ -2552,15 +2552,24 @@ mod tests {
             active_bytes: active,
             registered_pool_bytes: 0,
         };
-        let decision =
-            load_plan::plan_store("Qwen4Exp", &c, &inventory, live(0), None, None, false).unwrap();
+        let decision = load_plan::plan_store(
+            "Qwen4Exp",
+            &c,
+            &inventory,
+            live(0),
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
         assert!(decision.store.whole, "the plan holds every expert");
         store.set_store_plan(decision.store, inventory.store_fixed_bytes);
         store.plan.physical_bytes = Some(128 << 30);
         let need =
             inventory.store_fixed_bytes + decision.store.row_cache_bytes + decision.allowance;
         let engine = |active: u64, held_back: u64| {
-            load_plan::plan_engine("Qwen4Exp", &c, live(active), held_back, None, false)
+            load_plan::plan_engine("Qwen4Exp", &c, live(active), held_back, None, false, false)
         };
         let adopted = |plan: &memory::Plan,
                        live: &Arc<Live>,

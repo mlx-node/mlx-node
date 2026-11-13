@@ -145,6 +145,70 @@ impl LayerCache {
         self.draft_rows = Some(end);
         Ok((keys.clone(), values.clone()))
     }
+    /// The rows of a draft history.
+    pub(super) fn draft_row_count(&self) -> usize {
+        self.draft_rows.unwrap_or(0)
+    }
+    /// Whether an indexer key waits for its block.
+    pub(super) fn index_pending(&self) -> bool {
+        !self.index_tail.is_empty()
+    }
+    /// Draft rows `[from, to)` and their pooled indexer keys in storage of
+    /// their own, evaluated; `None` where the history does not hold them
+    /// whole (`ratio` the indexer's compress ratio).
+    pub(super) fn draft_segment(
+        &self,
+        from: usize,
+        to: usize,
+        ratio: usize,
+    ) -> Result<Option<super::prefix_state::Segment>> {
+        let ratio = ratio.max(1);
+        let (Some(keys), Some(values), Some(index)) = (&self.keys, &self.values, &self.index_keys)
+        else {
+            return Ok(None);
+        };
+        if to > self.draft_row_count()
+            || !from.is_multiple_of(ratio)
+            || !to.is_multiple_of(ratio)
+            || to / ratio > index.shape_at(0)? as usize
+        {
+            return Ok(None);
+        }
+        let segment = super::prefix_state::Segment {
+            keys: keys.slice_axis(2, from as i64, to as i64)?.deep_copy()?,
+            values: values.slice_axis(2, from as i64, to as i64)?.deep_copy()?,
+            index: index
+                .slice_axis(0, (from / ratio) as i64, (to / ratio) as i64)?
+                .deep_copy()?,
+        };
+        MxArray::eval_arrays(&[&segment.keys, &segment.values, &segment.index])?;
+        Ok(Some(segment))
+    }
+    /// A draft history of `segments` in order, in a buffer of its own.
+    pub(super) fn from_draft_segments(segments: &[super::prefix_state::Segment]) -> Result<Self> {
+        if segments.is_empty() {
+            return Ok(Self::default());
+        }
+        let keys = MxArray::concatenate_many(segments.iter().map(|s| &s.keys).collect(), Some(2))?;
+        let values =
+            MxArray::concatenate_many(segments.iter().map(|s| &s.values).collect(), Some(2))?;
+        let index =
+            MxArray::concatenate_many(segments.iter().map(|s| &s.index).collect(), Some(0))?;
+        MxArray::eval_arrays(&[&keys, &values, &index])?;
+        let rows = keys.shape_at(2)? as usize;
+        Ok(Self {
+            keys: Some(keys),
+            values: Some(values),
+            draft_rows: Some(rows),
+            index_keys: Some(index),
+            ..Self::default()
+        })
+    }
+    /// The pooled indexer keys of a draft history.
+    #[cfg(test)]
+    pub(super) fn draft_index(&self) -> Option<&MxArray> {
+        self.index_keys.as_ref()
+    }
     /// (rows, K buffer, V buffer) of a draft history.
     #[cfg(test)]
     pub(super) fn draft_kv(&self) -> Option<(usize, &MxArray, &MxArray)> {
@@ -299,11 +363,16 @@ impl Decoder {
     /// The rows of the next prefill pass after `history`: the admitted
     /// window, halved where it would outgrow a refused gate's reservation.
     pub fn prefill_pass_window(&self) -> usize {
+        self.prefill_rows_at(self.history.len())
+    }
+
+    /// The rows of a prefill pass that starts after `history_len` tokens.
+    pub(super) fn prefill_rows_at(&self, history_len: usize) -> usize {
         let window = self.prefill_slice_size();
         window.min(super::memory::prefill_window(
             &self.config,
             self.host_prefill_scratch,
-            self.history.len() + window,
+            history_len + window,
         ))
     }
 
@@ -491,7 +560,11 @@ impl Decoder {
                 index_blocks: cache.index_blocks,
             });
         }
-        let cell = super::prefix_state::Cell { grid, layers };
+        let cell = super::prefix_state::Cell {
+            grid,
+            layers,
+            draft: None,
+        };
         let arrays: Vec<&MxArray> = cell.arrays().collect();
         if !arrays.is_empty() {
             MxArray::eval_arrays(&arrays)?;

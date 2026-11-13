@@ -31,7 +31,10 @@ function isCanonicalBlockName(name: string): boolean {
 }
 
 /** Canonical sidecar filename: same key, `ColdGroup` label as an infix. */
-function sidecarName(index: number, group: 'conv_state' | 'sliding_window' | 'dflash2_state'): string {
+function sidecarName(
+  index: number,
+  group: 'conv_state' | 'sliding_window' | 'dflash2_state' | 'hybrid_cell' | 'hybrid_draft',
+): string {
   return `${index.toString(16).padStart(64, '0')}.${group}.safetensors`;
 }
 
@@ -441,6 +444,16 @@ describe('cold-tier object counting (Cache page ↔ scan)', () => {
     // the 1-day arm is the only thing standing between the user and the quota.
     expect(evictPreview(histogram, 7)).toEqual({ count: 0, bytes: 0 });
     expect(evictPreview(histogram, 30)).toEqual({ count: 0, bytes: 0 });
+  });
+
+  it('counts and clears the Flash Next state objects as sidecars', () => {
+    writeFileSync(join(root, sidecarName(10, 'hybrid_cell')), Buffer.alloc(5));
+    writeFileSync(join(root, sidecarName(11, 'hybrid_draft')), Buffer.alloc(6));
+
+    const info = scanColdCache(root);
+    expect(info.sidecarCount).toBe(2);
+    expect(info.sidecarBytes).toBe(11);
+    expect(clearColdCache(root)).toEqual({ removed: 2, freedBytes: 11 });
   });
 
   it('treats a sidecar-only tier as non-empty so its quota is clearable', () => {
