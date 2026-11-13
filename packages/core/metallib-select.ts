@@ -206,7 +206,7 @@ export interface MetallibBinding {
    * cmake-install duplicate.
    */
   bakedPath: string;
-  /** `.../mlx-sys-<hash>/out` — OUT_DIR of the bound mlx-sys build (origin of paged_attn.metallib). */
+  /** `.../mlx-sys-<hash>/out` (`.../mlx-sys/<hash>/out` from cargo 1.100) — OUT_DIR of the bound mlx-sys build (origin of paged_attn.metallib). */
   outDir: string;
   /** `.../out/[mlx-cmake/]lib` — install dir holding both metallibs. */
   libDir: string;
@@ -216,15 +216,51 @@ export interface MetallibBinding {
   prebuiltTag?: string;
 }
 
+function isLowerHex(text: string): boolean {
+  if (text.length === 0) return false;
+  for (const ch of text) {
+    if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false;
+  }
+  return true;
+}
+
+/**
+ * An absolute mlx-sys build-script OUT_DIR: `.../mlx-sys-<hash>/out` before
+ * cargo 1.100, `.../mlx-sys/<hash>/out` from cargo 1.100 (its new build-dir
+ * layout). Both stay valid: the workspace MSRV predates 1.100.
+ */
+function isMlxSysOutDir(dir: string): boolean {
+  if (!dir.startsWith('/')) return false;
+  const segments = dir.split('/');
+  const n = segments.length;
+  if (n < 4 || segments[n - 1] !== 'out') return false;
+  const unit = segments[n - 2]!;
+  if (unit.startsWith('mlx-sys-')) return isLowerHex(unit.slice('mlx-sys-'.length));
+  return n >= 5 && segments[n - 3] === 'mlx-sys' && isLowerHex(unit);
+}
+
+function stripSuffix(text: string, suffix: string): string | undefined {
+  return text.endsWith(suffix) ? text.slice(0, text.length - suffix.length) : undefined;
+}
+
 /**
  * MLX compiles `device.cpp` with `-DMETAL_PATH="<kernels build dir>/mlx.metallib"`
  * (see `mlx/backend/metal/CMakeLists.txt`), so every Metal-enabled addon carries
- * the absolute path of the kernels dir it linked against. The trailing
+ * the absolute path of the kernels dir it linked against:
+ * `<OUT_DIR>[/mlx-cmake]/build/mlx/backend/metal/kernels/mlx.metallib`. The
  * `kernels//` double slash comes from CMake joining a dir that already ends in
  * `/`; accept both forms.
  */
-const BAKED_METAL_PATH_RE =
-  /^(\/.+\/mlx-sys-[0-9a-f]+\/out)(\/mlx-cmake)?\/build\/mlx\/backend\/metal\/kernels\/{1,2}mlx\.metallib$/;
+function parseSourceMetalPath(path: string): { outDir: string; cmakeChild: boolean } | undefined {
+  let rest = stripSuffix(path, '/mlx.metallib');
+  if (rest === undefined) return undefined;
+  rest = stripSuffix(rest, '/') ?? rest;
+  rest = stripSuffix(rest, '/build/mlx/backend/metal/kernels');
+  if (rest === undefined) return undefined;
+  if (isMlxSysOutDir(rest)) return { outDir: rest, cmakeChild: false };
+  const outDir = stripSuffix(rest, '/mlx-cmake');
+  return outDir !== undefined && isMlxSysOutDir(outDir) ? { outDir, cmakeChild: true } : undefined;
+}
 
 /**
  * METAL_PATH of a prebuilt libmlx.a: build.rs (`MLX_PREBUILT_EXPORT`) sets
@@ -237,10 +273,13 @@ const PREBUILT_METAL_PATH_RE =
 
 /**
  * `MLX_NODE_PAGED_ATTN_METALLIB` baked by build.rs into the bridge
- * (mlx_paged_dispatch.cpp): the OUT_DIR origin of paged_attn.metallib, which
- * names the mlx-sys build even when the METAL_PATH is a prebuilt sentinel.
+ * (mlx_paged_dispatch.cpp): `<OUT_DIR>/paged_attn.metallib`, which names the
+ * mlx-sys build even when the METAL_PATH is a prebuilt sentinel.
  */
-const PAGED_ORIGIN_RE = /^(\/.+\/mlx-sys-[0-9a-f]+\/out)\/paged_attn\.metallib$/;
+function parsePagedOrigin(path: string): string | undefined {
+  const outDir = stripSuffix(path, '/paged_attn.metallib');
+  return outDir !== undefined && isMlxSysOutDir(outDir) ? outDir : undefined;
+}
 
 /** Longest plausible baked path; bounds the NUL-terminated-string expansion. */
 const MAX_BAKED_PATH_BYTES = 4096;
@@ -276,7 +315,7 @@ function bakedStringsContaining(binary: Buffer, needle: string): string[] {
  */
 export function extractBakedMetallibBinding(addonBinary: Buffer): MetallibBinding | undefined {
   const metalPaths = bakedStringsContaining(addonBinary, 'mlx.metallib').filter(
-    (s) => BAKED_METAL_PATH_RE.test(s) || PREBUILT_METAL_PATH_RE.test(s),
+    (s) => parseSourceMetalPath(s) !== undefined || PREBUILT_METAL_PATH_RE.test(s),
   );
   if (metalPaths.length === 0) return undefined;
   if (metalPaths.length > 1) {
@@ -287,7 +326,7 @@ export function extractBakedMetallibBinding(addonBinary: Buffer): MetallibBindin
     );
   }
   const pagedOrigins = bakedStringsContaining(addonBinary, 'paged_attn.metallib')
-    .map((s) => PAGED_ORIGIN_RE.exec(s)?.[1])
+    .map(parsePagedOrigin)
     .filter((s): s is string => s !== undefined);
   if (pagedOrigins.length > 1) {
     throw new Error(
@@ -299,16 +338,16 @@ export function extractBakedMetallibBinding(addonBinary: Buffer): MetallibBindin
   const pagedOutDir = pagedOrigins[0];
   const metalPath = metalPaths[0]!;
 
-  const sourceMatch = BAKED_METAL_PATH_RE.exec(metalPath);
+  const sourceMatch = parseSourceMetalPath(metalPath);
   if (sourceMatch) {
-    const outDir = sourceMatch[1]!;
+    const outDir = sourceMatch.outDir;
     if (pagedOutDir !== undefined && pagedOutDir !== outDir) {
       throw new Error(
         `[build.ts metallib gate] the addon's METAL_PATH names the mlx-sys build ${outDir} but its ` +
           `paged_attn.metallib origin names ${pagedOutDir} — two different mlx-sys builds were linked.`,
       );
     }
-    const libDir = join(outDir, sourceMatch[2] === undefined ? '' : 'mlx-cmake', 'lib');
+    const libDir = join(outDir, sourceMatch.cmakeChild ? 'mlx-cmake' : '', 'lib');
     return {
       kind: 'source',
       // normalize() collapses the `kernels//mlx.metallib` double slash
@@ -323,8 +362,9 @@ export function extractBakedMetallibBinding(addonBinary: Buffer): MetallibBindin
   if (pagedOutDir === undefined) {
     throw new Error(
       `[build.ts metallib gate] the addon links prebuilt MLX ${releaseTag} (METAL_PATH ${metalPath}) ` +
-        `but bakes no paged_attn.metallib origin (MLX_NODE_PAGED_ATTN_METALLIB), so the mlx-sys build ` +
-        `that produced it cannot be identified. The bridge predates prebuilt support; re-run the native build.`,
+        `but bakes no paged_attn.metallib origin (MLX_NODE_PAGED_ATTN_METALLIB) in an mlx-sys OUT_DIR ` +
+        `(.../build/mlx-sys-<hash>/out, or .../build/mlx-sys/<hash>/out from cargo 1.100), so the ` +
+        `mlx-sys build that produced it cannot be identified. Re-run the native build.`,
     );
   }
   const libDir = join(pagedOutDir, 'lib');
@@ -481,7 +521,7 @@ export function selectMetallib(opts: {
   const candidates = collectMetallibCandidates(opts.targetRoot, opts.triple, opts.profile);
   if (candidates.length === 0) {
     throw new Error(
-      `mlx.metallib not found under ${join(opts.targetRoot, opts.triple, opts.profile, 'build')}/mlx-sys-*/out/lib/ ` +
+      `mlx.metallib not found under ${join(opts.targetRoot, opts.triple, opts.profile, 'build')}/mlx-sys{-*,/*}/out/lib/ ` +
         `(nor the plain ${join(opts.targetRoot, opts.profile, 'build')} layout).`,
     );
   }
@@ -686,18 +726,42 @@ export function collectMetallibCandidates(targetRoot: string, triple: string, pr
       if (isAbsenceError(err)) continue;
       throw new Error(`[build.ts metallib gate] cannot list ${buildRoot}: ${(err as Error).message}`);
     }
-    const candidates: MetallibCandidate[] = [];
+    // `invoked.timestamp` is rewritten when cargo (re)runs the build
+    // script; the metallib/`output` mtimes cover reused cached outputs.
+    // Cargo 1.100 moved both into `run/` (`output` became `stdout`).
+    const scriptDirs: { outDir: string; probes: string[] }[] = [];
     for (const dir of entries) {
-      if (!dir.startsWith('mlx-sys-')) continue;
-      const scriptDir = join(buildRoot, dir);
-      const outDir = join(scriptDir, 'out');
-      // `invoked.timestamp` is rewritten when cargo (re)runs the build
-      // script; the metallib/`output` mtimes cover reused cached outputs.
+      if (dir.startsWith('mlx-sys-')) {
+        const scriptDir = join(buildRoot, dir);
+        scriptDirs.push({
+          outDir: join(scriptDir, 'out'),
+          probes: [join(scriptDir, 'invoked.timestamp'), join(scriptDir, 'output')],
+        });
+      } else if (dir === 'mlx-sys') {
+        const pkgDir = join(buildRoot, dir);
+        let units: string[];
+        try {
+          units = readdirSync(pkgDir);
+        } catch (err) {
+          if (isAbsenceError(err)) continue;
+          throw new Error(`[build.ts metallib gate] cannot list ${pkgDir}: ${(err as Error).message}`);
+        }
+        for (const unit of units) {
+          const unitDir = join(pkgDir, unit);
+          scriptDirs.push({
+            outDir: join(unitDir, 'out'),
+            probes: [join(unitDir, 'run', 'invoked.timestamp'), join(unitDir, 'run', 'stdout')],
+          });
+        }
+      }
+    }
+    const candidates: MetallibCandidate[] = [];
+    for (const { outDir, probes } of scriptDirs) {
       let scriptMtimeMs = 0;
-      for (const probe of ['invoked.timestamp', 'output']) {
+      for (const probe of probes) {
         // Probe files are optional; when absent the mtimes we have rank the
         // dir. Unreadable probes throw — they would corrupt the ranking.
-        const probeStat = statIfExists(join(scriptDir, probe));
+        const probeStat = statIfExists(probe);
         if (probeStat !== undefined) {
           scriptMtimeMs = Math.max(scriptMtimeMs, probeStat.mtimeMs);
         }

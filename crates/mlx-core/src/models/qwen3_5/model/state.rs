@@ -96,6 +96,32 @@ impl GdnCheckpointLineage for DenseGdnPrefixCheckpoint {
     }
 }
 
+impl GdnCheckpointLineage for &DenseGdnPrefixCheckpoint {
+    fn owner_id(&self) -> &str {
+        &self.owner_id
+    }
+
+    fn prefix_len(&self) -> u32 {
+        self.prefix_len
+    }
+
+    fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    fn final_block_hash(&self) -> u64 {
+        self.final_block_hash
+    }
+
+    fn tokens(&self) -> &[u32] {
+        &self.tokens
+    }
+
+    fn block_hashes(&self) -> &[u64] {
+        &self.block_hashes
+    }
+}
+
 pub(super) struct DenseGdnHistoryCheckpoint {
     pub(super) owner_id: String,
     pub(super) image_key: Option<u64>,

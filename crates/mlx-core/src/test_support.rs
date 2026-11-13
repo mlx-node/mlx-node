@@ -386,8 +386,9 @@ pub(crate) fn metal_device_absent_when(require_metal: bool, msg: &str) -> bool {
 
 /// True, after printing `skipping {test}`, on a Metal device of no Apple GPU
 /// family (a hosted VM GPU): its compiler rejects the tensor ops the paged
-/// prefill kernels are built on, and that route has no fallback. A real Mac
-/// (Apple7 and up) runs the test, so a pipeline failure there stays red.
+/// prefill kernels are built on, and its turns attend through the varlen
+/// kernel instead. A real Mac (Apple7 and up) runs the test, so a pipeline
+/// failure there stays red.
 pub(crate) fn paged_prefill_unsupported(test: &str) -> bool {
     static LACKS: OnceLock<bool> = OnceLock::new();
     // SAFETY: nullary predicate that catches internally.

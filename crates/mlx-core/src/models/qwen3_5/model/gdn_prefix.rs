@@ -346,35 +346,43 @@ impl Qwen35Inner {
             return false;
         };
         let bytes = Qwen3_5LayerCache::linear_state_bytes(&checkpoint.caches);
-        if crate::models::qwen3_5::dflash2_turn::publish_claimed(
+        let claimed = crate::models::qwen3_5::dflash2_turn::publish_claimed(
             self,
             bytes,
             Keep::default(),
             |_| (),
         )
-        .is_none()
-        {
+        .is_some();
+        if !claimed && !self.wants_gdn_checkpoint_ladder() {
             return false;
         }
-
-        self.gdn_prefix_checkpoints.retain(|existing| {
-            !(existing.owner_id == self.active_cache_owner_id
+        let owner_id = self.active_cache_owner_id.clone();
+        let same_rung = |existing: &DenseGdnPrefixCheckpoint| {
+            existing.owner_id == owner_id
                 && existing.prefix_len == prefix_len
                 && existing.block_size == block_size
                 && existing.final_block_hash == final_block_hash
-                && existing.tokens.as_slice() == prefix_tokens)
-        });
+                && existing.tokens.as_slice() == prefix_tokens
+        };
+        let rung = DenseGdnPrefixCheckpoint {
+            owner_id: owner_id.clone(),
+            prefix_len,
+            block_size,
+            final_block_hash,
+            block_hashes,
+            tokens: prefix_tokens.to_vec(),
+            caches: checkpoint.caches,
+            last_used: self.cache_recency.next(),
+        };
+        if !claimed {
+            self.gdn_unclaimed_rungs
+                .retain(|existing| !same_rung(existing));
+            self.gdn_unclaimed_rungs.push_back(rung);
+            return false;
+        }
         self.gdn_prefix_checkpoints
-            .push_back(DenseGdnPrefixCheckpoint {
-                owner_id: self.active_cache_owner_id.clone(),
-                prefix_len,
-                block_size,
-                final_block_hash,
-                block_hashes,
-                tokens: prefix_tokens.to_vec(),
-                caches: checkpoint.caches,
-                last_used: self.cache_recency.next(),
-            });
+            .retain(|existing| !same_rung(existing));
+        self.gdn_prefix_checkpoints.push_back(rung);
         self.prune_dense_gdn_prefix_checkpoints();
         true
     }
@@ -594,10 +602,15 @@ impl Qwen35Inner {
         image_token_positions: &[(u32, u64)],
         cache_salt: u64,
     ) {
+        let checkpoints: VecDeque<&DenseGdnPrefixCheckpoint> = self
+            .gdn_prefix_checkpoints
+            .iter()
+            .chain(&self.gdn_unclaimed_rungs)
+            .collect();
         crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar(
             "qwen3_5",
             self.paged_adapter.as_ref(),
-            &self.gdn_prefix_checkpoints,
+            &checkpoints,
             &self.active_cache_owner_id,
             &self.config,
             image_token_positions,

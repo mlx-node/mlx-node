@@ -4394,13 +4394,13 @@ mod tests {
         assert!(live.contains_key("layers.0.linear_attn.out_proj.weight"));
         assert!(live.contains_key("layers.1.linear_attn.in_proj_qkvz.weight"));
 
-        for layer in 0..2 {
+        for (layer, decoder) in inner.layers.iter().enumerate().take(2) {
             let MLPVariant::Quantized {
                 gate_proj,
                 up_proj,
                 down_proj,
                 ..
-            } = &inner.layers[layer].mlp
+            } = &decoder.mlp
             else {
                 panic!("layer {layer} MLP must be quantized");
             };

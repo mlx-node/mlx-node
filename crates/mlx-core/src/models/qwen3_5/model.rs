@@ -215,6 +215,11 @@ pub(crate) struct Qwen35Inner {
     gdn_root_cache_owner_id: Option<String>,
     gdn_root_cache_owner_is_explicit: bool,
     gdn_prefix_checkpoints: VecDeque<DenseGdnPrefixCheckpoint>,
+    /// Ladder rungs the governor refused RAM for. They go to the cold tier
+    /// only (Splash `publishStateToDisk`): this turn's sidecar capture reads
+    /// them, and the turn's end drops them. Without this a host short of
+    /// spare memory persists no recurrent state at all.
+    gdn_unclaimed_rungs: VecDeque<DenseGdnPrefixCheckpoint>,
     gdn_last_history_checkpoint: Option<DenseGdnHistoryCheckpoint>,
     /// The replay point each running turn restored from (Splash
     /// `StateCache::useState`): no reclaim unit until its use ends.

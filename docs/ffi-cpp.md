@@ -116,12 +116,12 @@ fallbacks remain in the C++ adapters.
 
 `crates/mlx-paged-attn/metal/`:
 
-| File                                      | Purpose                                                                                     |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `attention/paged_attention.metal`         | Paged-attention attention kernel                                                            |
-| `attention/paged_prefill_attention.metal` | In-place prefill / verify attention over int8 and bf16 pages (Splash `paged_attention_tile`) |
-| `cache/reshape_and_cache.metal`           | KV cache reshape operations                                                                 |
-| `cache/kv_int8_store.metal`               | Int8 K/V store with per-row scales                                                          |
-| `utils.metal`                             | Common Metal utilities                                                                      |
+| File                                      | Purpose                                                                                                                                         |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `attention/paged_attention.metal`         | Paged-attention attention kernel                                                                                                                |
+| `attention/paged_prefill_attention.metal` | In-place prefill / verify attention over int8 and bf16 pages (Splash `paged_attention_tile`); a GPU that cannot build it uses the varlen kernel |
+| `cache/reshape_and_cache.metal`           | KV cache reshape operations                                                                                                                     |
+| `cache/kv_int8_store.metal`               | Int8 K/V store with per-row scales                                                                                                              |
+| `utils.metal`                             | Common Metal utilities                                                                                                                          |
 
 `crates/mlx-sys/build.rs` compiles these sources and the bridge kernels (`crates/mlx-sys/src/metal/kquant/{kquant,kquant_nax}.metal`, `segmented_sdpa/sdpa_segmented.metal`, `affine_mixed/affine_qmv_wide_mixed.metal`, with MLX's kernel flags) into `paged_attn.metallib`, skips any `.air` whose flags, toolchain and included files are unchanged, and copies both `paged_attn.metallib` and `mlx.metallib` into `target/<profile>/` and `target/<profile>/deps/` so integration tests discover them.

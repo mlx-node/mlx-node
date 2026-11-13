@@ -2029,13 +2029,12 @@ mod sparse_moe_autograd_tests {
             norm_topk_prob: true,
             mlp_only_layers: None,
             paged_cache_memory_mb: None,
-            paged_cache_initial_memory_mb: None,
             paged_block_size: None,
-            use_block_paged_cache: Some(false),
             persist_paged_cache: None,
             n_mtp_layers: 0,
             qwen35_gguf_gdn_layout: None,
             kv_format: None,
+            rope_scaling: None,
         }
     }
 

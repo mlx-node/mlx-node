@@ -17,7 +17,7 @@
 //! The "none" assertion is the negative control: it FAILS on P1 (paged
 //! hardcoded thinking_enabled=true → reasoning_tokens > 0) and PASSES on P2.
 //!
-//! The test clones the checkpoint dir with a small pool (mirrors
+//! The test clones the checkpoint dir with a pinned block size (mirrors
 //! qwen3_5_session.rs) and asserts `has_block_paged_cache()` before
 //! exercising the cores.
 //!
@@ -40,7 +40,8 @@ use mlx_core::models::qwen3_5::model::Qwen3_5Model;
 use mlx_core::tokenizer::ChatMessage;
 
 /// Clone the model dir into the workspace target, symlinking weights and
-/// copying config.json with a small pool injected.
+/// copying config.json with the block size pinned; the memory plan sizes
+/// the pool.
 fn clone_model_dir_paged(src: &Path, suffix: &str) -> Result<PathBuf, String> {
     let pid = std::process::id();
     let workspace_target = std::env::var_os("CARGO_TARGET_DIR")
@@ -81,8 +82,11 @@ fn clone_model_dir_paged(src: &Path, suffix: &str) -> Result<PathBuf, String> {
         .map_err(|e| format!("read config.json: {e} (path={})", cfg_path.display()))?;
     let mut cfg: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|e| format!("parse config.json: {e} (path={})", cfg_path.display()))?;
-    cfg["paged_cache_memory_mb"] = serde_json::Value::from(512u32);
     cfg["paged_block_size"] = serde_json::Value::from(16u32);
+    // A checkpoint's own pool ceiling can sit above the memory plan and fail the load.
+    if let Some(obj) = cfg.as_object_mut() {
+        obj.remove("paged_cache_memory_mb");
+    }
     let pretty =
         serde_json::to_string_pretty(&cfg).map_err(|e| format!("serialize config.json: {e}"))?;
     fs::write(&cfg_path, pretty)

@@ -1228,7 +1228,9 @@ fn export_prebuilt(
 /// colocated runtime lookups (MLX's `load_colocated_library` and
 /// `paged_attn_metallib_path`): `target/<profile>/`, `target/<profile>/deps/`
 /// and, for the `target/<triple>/<profile>` layout, the sibling `deps/`.
-/// Derived from OUT_DIR (`.../<profile>/build/mlx-sys-<hash>/out`).
+/// Cargo >= 1.100 has no `deps/` and runs tests from
+/// `<profile>/build/<pkg>/<hash>/out/`, which no build script can reach; those
+/// binaries find the metallibs through the baked OUT_DIR paths instead.
 fn test_binary_sinks(out_dir: &Path) -> Vec<PathBuf> {
     let Some(profile_dir) =
         find_ancestor_with_name(out_dir, "build").and_then(|p| p.parent().map(Path::to_path_buf))
@@ -1486,8 +1488,7 @@ fn main() -> io::Result<()> {
     // the same target dir runs against it: a source build after a prebuilt
     // one (or after a submodule bump) would otherwise pair fresh kernels
     // with a stale library and fail with "Unable to load kernel". Keeping
-    // the copy in step with the linked libmlx closes that; prebuilt mode
-    // needs it anyway, since its baked path names the producer's machine.
+    // the copy in step with the linked libmlx closes that.
     if let Some(paged_metallib) = paged_metallib_path.as_ref() {
         let paged_dests: Vec<PathBuf> = if prebuilt {
             let lib = out_dir_path.join("lib");
@@ -1597,6 +1598,19 @@ fn main() -> io::Result<()> {
             "MLX_NODE_PAGED_ATTN_METALLIB",
             format!("\"{}\"", paged_origin.display()).as_str(),
         );
+        if prebuilt {
+            // mlx_metallib_fallback.h: the prebuilt METAL_PATH names the
+            // producer's machine, so a binary with no colocated mlx.metallib
+            // needs this build's copy.
+            bridge.define(
+                "MLX_NODE_MLX_METALLIB",
+                format!(
+                    "\"{}\"",
+                    out_dir_path.join("lib").join("mlx.metallib").display()
+                )
+                .as_str(),
+            );
+        }
         build_bridge_preambles(&mut bridge, &mlx_dir, &src_dir, &out_dir_path)?;
     }
 

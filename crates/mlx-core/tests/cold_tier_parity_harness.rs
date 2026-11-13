@@ -281,9 +281,10 @@ pub struct ColdTierParitySpec {
     pub model_path_env: &'static str,
     /// `paged_block_size` forced into both clones.
     pub block_size: u32,
-    /// `paged_cache_memory_mb` forced into both clones — bounded so the test
-    /// stays light.
-    pub pool_memory_mb: u32,
+    /// `paged_cache_memory_mb` forced into both clones. `None` leaves it out
+    /// and the memory plan sizes the pool; a size above the plan's fails the
+    /// load.
+    pub pool_memory_mb: Option<u32>,
     /// Single-turn prompt run by the warm-up turns and by instance 1 (capture).
     /// Also by instances 2 and 3 unless [`Self::restore_prompt`] is set.
     pub prompt: &'static str,
@@ -360,7 +361,7 @@ impl ColdTierParitySpec {
             family,
             model_path_env: "MLX_TEST_MODEL_PATH",
             block_size: DEFAULT_BLOCK_SIZE,
-            pool_memory_mb: 256,
+            pool_memory_mb: Some(256),
             prompt: DEFAULT_PROMPT,
             restore_prompt: None,
             max_new_tokens: 32,
@@ -379,7 +380,13 @@ impl ColdTierParitySpec {
     }
 
     pub fn with_pool_memory_mb(mut self, pool_memory_mb: u32) -> Self {
-        self.pool_memory_mb = pool_memory_mb;
+        self.pool_memory_mb = Some(pool_memory_mb);
+        self
+    }
+
+    /// See [`Self::pool_memory_mb`].
+    pub fn with_planned_pool(mut self) -> Self {
+        self.pool_memory_mb = None;
         self
     }
 
@@ -570,7 +577,16 @@ fn clone_model_dir(
         cfg["persist_paged_cache"] = serde_json::Value::Bool(persist);
         // Bound the adapter pool so the test stays light, and pin the block
         // size the restore assertion is stated in terms of.
-        cfg["paged_cache_memory_mb"] = serde_json::Value::from(spec.pool_memory_mb);
+        match spec.pool_memory_mb {
+            Some(pool_memory_mb) => {
+                cfg["paged_cache_memory_mb"] = serde_json::Value::from(pool_memory_mb);
+            }
+            None => {
+                if let Some(obj) = cfg.as_object_mut() {
+                    obj.remove("paged_cache_memory_mb");
+                }
+            }
+        }
         cfg["paged_block_size"] = serde_json::Value::from(spec.block_size);
         let pretty = serde_json::to_string_pretty(&cfg)
             .map_err(|e| format!("serialize config.json: {e}"))?;

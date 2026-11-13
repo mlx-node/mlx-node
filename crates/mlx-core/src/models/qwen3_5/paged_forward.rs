@@ -254,9 +254,8 @@ thread_local! {
 
 fn cancel_hook(_row: u32) -> bool {
     #[cfg(test)]
-    if PREFILL_CANCEL_AT.with(std::cell::Cell::get) == Some(_row) {
-        return true;
-    }
+    return PREFILL_CANCEL_AT.with(std::cell::Cell::get) == Some(_row);
+    #[cfg(not(test))]
     false
 }
 

@@ -3517,6 +3517,93 @@ mod tests {
         (keys, values)
     }
 
+    /// The worst error of `got` `[rows, Hq, D]` over Splash's `checkOutput`
+    /// bound (`mass[d] / 256 + ulp_bf16(ref)`) against an f64 softmax of
+    /// `q` at `committed` over the stored rows `keys` / `values`
+    /// `[Hkv][visible][D]`.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn worst_of_bound(
+        got: &[f32],
+        q: &[f32],
+        keys: &[f64],
+        values: &[f64],
+        committed: usize,
+        rows: usize,
+        (hq, hkv, d): (usize, usize, usize),
+        scale: f32,
+    ) -> f64 {
+        let visible = committed + rows;
+        let mut worst = 0f64;
+        for row in 0..rows {
+            let end = committed + row + 1;
+            for head in 0..hq {
+                let kv = head / (hq / hkv);
+                let query = &q[(row * hq + head) * d..][..d];
+                let scores: Vec<f64> = (0..end)
+                    .map(|t| {
+                        let key = &keys[(kv * visible + t) * d..][..d];
+                        query
+                            .iter()
+                            .zip(key)
+                            .map(|(a, b)| f64::from(*a) * b)
+                            .sum::<f64>()
+                            * f64::from(scale)
+                    })
+                    .collect();
+                let max = scores.iter().cloned().fold(f64::MIN, f64::max);
+                let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                let sum: f64 = weights.iter().sum();
+                for dim in 0..d {
+                    let (mut out, mut mass) = (0f64, 0f64);
+                    for (t, w) in weights.iter().enumerate() {
+                        let value = values[(kv * visible + t) * d + dim];
+                        out += w / sum * value;
+                        mass += w / sum * value.abs();
+                    }
+                    let ulp = f64::from(bf16_ulp(out as f32));
+                    let error = (f64::from(got[(row * hq + head) * d + dim]) - out).abs();
+                    worst = worst.max(error / (mass / 256.0 + ulp));
+                }
+            }
+        }
+        worst
+    }
+
+    /// Store `rows` rows at `committed` into `adapter`'s pool and attend
+    /// them in `pass`; returns the bf16 queries and the output as f32.
+    #[cfg(target_os = "macos")]
+    fn store_attend_chunk(
+        adapter: &mut PagedKVCacheAdapter,
+        (committed, rows): (usize, usize),
+        pass: PagedPass,
+        (hq, hkv, d): (usize, usize, usize),
+        seed: u32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        adapter
+            .record_tokens(&(committed as u32..(committed + rows) as u32).collect::<Vec<_>>())
+            .unwrap();
+        let q = paged_attend_values(rows * hq * d, d, seed + 1, false);
+        let k = paged_attend_values(rows * hkv * d, d, seed + 2, true);
+        let v = paged_attend_values(rows * hkv * d, d, seed + 3, true);
+        let queries = bf16_array(&q, &[1, rows as i64, hq as i64, d as i64]);
+        let keys = bf16_array(&k, &[1, rows as i64, hkv as i64, d as i64]);
+        let values = bf16_array(&v, &[1, rows as i64, hkv as i64, d as i64]);
+        let got = paged_store_attend(
+            adapter,
+            0,
+            committed as u32,
+            pass,
+            &queries,
+            &keys,
+            &values,
+            1.0 / (d as f32).sqrt(),
+            DType::BFloat16,
+        )
+        .unwrap();
+        (f32_values(&queries), f32_values(&got))
+    }
+
     /// A paged prefill chunk stores its rows, then attends over the pool
     /// pages: every row, the chunk's own included, reads back as stored
     /// (int8 · scale on an int8 pool; Splash `addPrefillStore` then
@@ -3556,73 +3643,311 @@ mod tests {
             adapter.reset_for_new_request(1).unwrap();
             adapter.allocate_suffix_blocks(64).unwrap();
             for (seed, (committed, rows)) in [(0usize, 40usize), (40, 24)].into_iter().enumerate() {
-                adapter
-                    .record_tokens(
-                        &(committed as u32..(committed + rows) as u32).collect::<Vec<_>>(),
-                    )
-                    .unwrap();
-                let seed = seed as u32 * 10;
-                let q = paged_attend_values(rows * HQ * D, D, seed + 1, false);
-                let k = paged_attend_values(rows * HKV * D, D, seed + 2, true);
-                let v = paged_attend_values(rows * HKV * D, D, seed + 3, true);
-                let queries = bf16_array(&q, &[1, rows as i64, HQ as i64, D as i64]);
-                let keys = bf16_array(&k, &[1, rows as i64, HKV as i64, D as i64]);
-                let values = bf16_array(&v, &[1, rows as i64, HKV as i64, D as i64]);
-                let got = paged_store_attend(
+                let (q, got) = store_attend_chunk(
                     &mut adapter,
-                    0,
-                    committed as u32,
+                    (committed, rows),
                     PagedPass::Prefill,
-                    &queries,
-                    &keys,
-                    &values,
-                    scale,
-                    DType::BFloat16,
-                )
-                .unwrap();
-                let got = f32_values(&got);
-                let q = f32_values(&queries);
-                let visible = committed + rows;
+                    (HQ, HKV, D),
+                    seed as u32 * 10,
+                );
                 let ids = adapter.block_table().expect("table").block_ids();
-                let (k_pool, v_pool) = stored_rows(&_pool, &ids, visible, HKV, D);
-                let mut worst = 0f64;
-                for row in 0..rows {
-                    let end = committed + row + 1;
-                    for head in 0..HQ {
-                        let kv = head / (HQ / HKV);
-                        let query = &q[(row * HQ + head) * D..][..D];
-                        let scores: Vec<f64> = (0..end)
-                            .map(|t| {
-                                let key = &k_pool[(kv * visible + t) * D..][..D];
-                                query
-                                    .iter()
-                                    .zip(key)
-                                    .map(|(a, b)| f64::from(*a) * b)
-                                    .sum::<f64>()
-                                    * f64::from(scale)
-                            })
-                            .collect();
-                        let max = scores.iter().cloned().fold(f64::MIN, f64::max);
-                        let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
-                        let sum: f64 = weights.iter().sum();
-                        for d in 0..D {
-                            let (mut out, mut mass) = (0f64, 0f64);
-                            for (t, w) in weights.iter().enumerate() {
-                                let value = v_pool[(kv * visible + t) * D + d];
-                                out += w / sum * value;
-                                mass += w / sum * value.abs();
-                            }
-                            let ulp = f64::from(bf16_ulp(out as f32));
-                            let error = (f64::from(got[(row * HQ + head) * D + d]) - out).abs();
-                            worst = worst.max(error / (mass / 256.0 + ulp));
-                        }
-                    }
-                }
+                let (k_pool, v_pool) = stored_rows(&_pool, &ids, committed + rows, HKV, D);
+                let worst = worst_of_bound(
+                    &got,
+                    &q,
+                    &k_pool,
+                    &v_pool,
+                    committed,
+                    rows,
+                    (HQ, HKV, D),
+                    scale,
+                );
                 assert!(
                     worst <= 1.0,
                     "{dtype:?} P {committed} T {rows}: worst error {worst:.3} of the bound"
                 );
             }
         }
+    }
+
+    /// A GPU that cannot build the tensor-op prefill pipelines attends
+    /// through the varlen kernel: the same stored rows, within the same
+    /// `checkOutput` bound as the tile kernel, on int8 and bf16 pages, for
+    /// groups 4 / 8 / 16 at D128 / D256, a cold chunk, a cache-hit chunk, a
+    /// chunk past 512 tokens of context (the varlen kernel's partitioned
+    /// reduce) and a verify block. The tile half runs where its pipelines
+    /// build. Mutation PF2: the fallback attends at `committed - 1` → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn portable_prefill_matches_the_tile_kernel() {
+        use crate::transformer::paged_int8_tests::adapter_for;
+        use mlx_paged_attn::metal::MetalDtype;
+        let tile_builds = crate::transformer::paged_kv_cache_adapter::device_prefill_mpp_builds();
+        // (committed, rows, pass, checked); the unchecked chunk only fills
+        // the history the next chunks read.
+        let chunks = [
+            (0usize, 40usize, PagedPass::Prefill, true),
+            (40, 24, PagedPass::Prefill, true),
+            (64, 536, PagedPass::Prefill, false),
+            (600, 9, PagedPass::Prefill, true),
+            (609, 5, PagedPass::Verify, true),
+        ];
+        let mut largest_gap = 0f32;
+        for (hq, hkv, d) in [(8usize, 2usize, 128usize), (16, 2, 256), (32, 2, 256)] {
+            let config = mlx_paged_attn::PagedAttentionConfig {
+                block_size: 16,
+                gpu_memory_mb: 256,
+                head_size: d as u32,
+                num_kv_heads: hkv as u32,
+                num_layers: 1,
+                max_seq_len: Some(1024),
+                max_batch_size: Some(4),
+            };
+            let scale = 1.0 / (d as f32).sqrt();
+            for dtype in [MetalDtype::Int8, MetalDtype::BFloat16] {
+                let mut lanes = Vec::new();
+                for portable in [true, false] {
+                    if !portable && !tile_builds {
+                        continue;
+                    }
+                    let Some((mut adapter, pool)) = adapter_for(config.clone(), 48, 48, dtype)
+                    else {
+                        return;
+                    };
+                    if portable {
+                        adapter.force_portable_prefill();
+                    }
+                    adapter.reset_for_new_request(1).unwrap();
+                    adapter.allocate_suffix_blocks(614).unwrap();
+                    lanes.push((portable, adapter, pool));
+                }
+                for (seed, &(committed, rows, pass, checked)) in chunks.iter().enumerate() {
+                    let mut outputs = Vec::new();
+                    for (portable, adapter, pool) in lanes.iter_mut() {
+                        let (q, got) = store_attend_chunk(
+                            adapter,
+                            (committed, rows),
+                            pass,
+                            (hq, hkv, d),
+                            seed as u32 * 10,
+                        );
+                        if !checked {
+                            continue;
+                        }
+                        let ids = adapter.block_table().expect("table").block_ids();
+                        let (keys, values) = stored_rows(pool, &ids, committed + rows, hkv, d);
+                        let worst = worst_of_bound(
+                            &got,
+                            &q,
+                            &keys,
+                            &values,
+                            committed,
+                            rows,
+                            (hq, hkv, d),
+                            scale,
+                        );
+                        assert!(
+                            worst <= 1.0,
+                            "{dtype:?} {hq}/{hkv} D{d} P {committed} T {rows} {pass:?} \
+                             (portable {portable}): worst error {worst:.3} of the bound"
+                        );
+                        outputs.push(got);
+                    }
+                    if let [portable, tile] = outputs.as_slice() {
+                        let gap = portable
+                            .iter()
+                            .zip(tile)
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0f32, f32::max);
+                        largest_gap = largest_gap.max(gap);
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "portable vs tile prefill: largest |difference| {largest_gap} \
+             (tile pipelines build: {tile_builds})"
+        );
+    }
+
+    /// On a bf16 pool the portable prefill runs its rows in chunks of at
+    /// most 2,048 row-partitions, the bound the varlen kernel tiles an int8
+    /// pool to: 1,400 rows at 100 over 3 partitions run as 682 + 682 + 36,
+    /// every row bit-equal to one unchunked launch. Mutations PT1 (a later
+    /// piece attends at `committed + start - 1`) and PT2 (one launch) → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn portable_prefill_chunks_a_bf16_pool_to_the_tile_bound() {
+        use crate::transformer::paged_int8_tests::adapter_for;
+        use mlx_paged_attn::metal::MetalDtype;
+        const HQ: usize = 16;
+        const HKV: usize = 2;
+        const D: usize = 256;
+        let config = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: 256,
+            head_size: D as u32,
+            num_kv_heads: HKV as u32,
+            num_layers: 1,
+            max_seq_len: Some(2048),
+            max_batch_size: Some(4),
+        };
+        let scale = 1.0 / (D as f32).sqrt();
+        let Some((mut adapter, _pool)) = adapter_for(config, 112, 112, MetalDtype::BFloat16) else {
+            return;
+        };
+        adapter.force_portable_prefill();
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.allocate_suffix_blocks(1500).unwrap();
+        for (seed, (committed, rows)) in [(0usize, 100usize), (100, 1400)].into_iter().enumerate() {
+            adapter.portable_prefill_launches.clear();
+            let (q, got) = store_attend_chunk(
+                &mut adapter,
+                (committed, rows),
+                PagedPass::Prefill,
+                (HQ, HKV, D),
+                seed as u32 * 10,
+            );
+            for &(launch_rows, context) in &adapter.portable_prefill_launches {
+                assert!(
+                    u64::from(launch_rows) * u64::from(context).div_ceil(512) <= 2048,
+                    "P {committed} T {rows}: a launch of {launch_rows} rows over {context} \
+                     tokens holds more than 2,048 row-partitions"
+                );
+            }
+            if rows == 1400 {
+                assert_eq!(
+                    adapter.portable_prefill_launches,
+                    [(682, 782), (682, 1464), (36, 1500)],
+                    "the 1,400-row chunk's launches"
+                );
+            }
+            let queries = bf16_array(&q, &[rows as i64, HQ as i64, D as i64]);
+            let whole = adapter
+                .gather_kv_for_prefill_chunk_varlen(0, &queries, committed as u32, scale)
+                .unwrap();
+            let whole = f32_values(&whole);
+            let differing = got
+                .iter()
+                .zip(&whole)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "P {committed} T {rows}: chunked values differ from one launch"
+            );
+        }
+    }
+
+    /// Every piece a bf16 portable prefill launches passes the varlen
+    /// preflight and holds at most the tile kernel's priced workspace with a
+    /// second copy of the chunk's output (the concatenate): 2,048-row chunks
+    /// at histories up to 1,048,576 tokens (2,048 partitions), at 24 / 4 and
+    /// 16 / 2 heads, D256. One launch of the chunk fails the preflight from
+    /// 87,041 (24 heads) and 130,561 (16 heads) tokens. Mutation PT2 (one
+    /// launch) → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn portable_prefill_pieces_fit_the_priced_workspace() {
+        use crate::transformer::paged_kv_cache_adapter::{
+            PagedAttentionV2Layout, paged_attention_v2_aux_fits,
+            paged_attention_v2_partition_upper_bound, portable_prefill_pieces,
+        };
+        use mlx_paged_attn::prefill_plan::{Pass, attention_bytes, workspace_bound_floats};
+        const D: u32 = 256;
+        const ROWS: u32 = 2048;
+        const MOST: u32 = 1_048_576;
+        let fits = |rows, hq, hkv, context| {
+            paged_attention_v2_aux_fits(PagedAttentionV2Layout::Varlen, rows, hq, hkv, context, D)
+        };
+        for (hq, hkv, first_refused) in [(24u32, 4u32, 87_041u32), (16, 2, 130_561)] {
+            assert!(fits(ROWS, hq, hkv, first_refused - 1));
+            assert!(!fits(ROWS, hq, hkv, first_refused));
+            let workspace = workspace_bound_floats(Pass::Prefill, hq, D) * 4;
+            let priced = attention_bytes(ROWS, hq, hkv, D, Pass::Prefill);
+            let duplicate_output = u64::from(ROWS) * u64::from(hq) * u64::from(D) * 2;
+            let mut largest = 0u64;
+            let edges = [ROWS, first_refused, 262_144, MOST];
+            for total in (ROWS..=MOST).step_by(1021).chain(edges) {
+                let committed = total - ROWS;
+                let pieces = portable_prefill_pieces(committed, ROWS);
+                assert_eq!(pieces.first().map(|p| p.0), Some(0));
+                assert_eq!(pieces.last().map(|p| p.1), Some(ROWS));
+                assert!(pieces.windows(2).all(|w| w[0].1 == w[1].0));
+                for &(start, end) in &pieces {
+                    let (rows, context) = (end - start, committed + end);
+                    assert!(
+                        fits(rows, hq, hkv, context),
+                        "{hq}/{hkv} at {total}: piece {start}..{end} fails the preflight"
+                    );
+                    let partitions = paged_attention_v2_partition_upper_bound(
+                        PagedAttentionV2Layout::Varlen,
+                        rows,
+                        hq,
+                        hkv,
+                        context,
+                        D,
+                    );
+                    // bf16 partials, f32 exp sums and max logits.
+                    let aux = u64::from(rows) * u64::from(hq) * partitions * (2 * u64::from(D) + 8);
+                    largest = largest.max(aux);
+                    assert!(
+                        aux + duplicate_output <= workspace,
+                        "{hq}/{hkv} at {total}: piece {start}..{end} holds {aux} B of partials"
+                    );
+                }
+            }
+            eprintln!(
+                "{hq}/{hkv} D{D}: largest piece partials {largest} B, with the output copy {} B, \
+                 workspace bound {workspace} B, attention_bytes {priced} B",
+                largest + duplicate_output
+            );
+            assert!(largest + duplicate_output <= priced);
+        }
+    }
+
+    /// The device answer is made once per process, and a GPU that builds
+    /// the tensor-op pipelines (every Apple GPU family) launches them for
+    /// every prefill chunk. Mutations PF1 (the fallback always taken) and
+    /// PF3 (the probe asked at every chunk) → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prefill_routes_once_and_to_mpp_where_it_builds() {
+        if crate::test_support::paged_prefill_unsupported(
+            "prefill_routes_once_and_to_mpp_where_it_builds",
+        ) {
+            return;
+        }
+        use crate::transformer::paged_int8_tests::adapter_for;
+        let probe = |kind| unsafe { mlx_sys::mlx_paged_prefill_test_probe_count(kind) };
+        let config = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: 256,
+            head_size: 256,
+            num_kv_heads: 2,
+            num_layers: 1,
+            max_seq_len: Some(1024),
+            max_batch_size: Some(4),
+        };
+        let Some((mut adapter, _pool)) =
+            adapter_for(config, 8, 8, mlx_paged_attn::metal::MetalDtype::Int8)
+        else {
+            return;
+        };
+        adapter.reset_for_new_request(1).unwrap();
+        adapter.allocate_suffix_blocks(48).unwrap();
+        let launches = probe(0);
+        for (seed, chunk) in [(0usize, 40usize), (40, 8)].into_iter().enumerate() {
+            store_attend_chunk(
+                &mut adapter,
+                chunk,
+                PagedPass::Prefill,
+                (16, 2, 256),
+                seed as u32,
+            );
+        }
+        assert_eq!(probe(0) - launches, 2, "one tile launch per chunk");
+        assert!(crate::transformer::paged_kv_cache_adapter::device_prefill_mpp_builds());
+        assert_eq!(probe(2), 1, "the device is asked once per process");
     }
 }

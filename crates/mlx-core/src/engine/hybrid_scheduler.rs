@@ -3072,10 +3072,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         self.inner.release_scheduled_recurrent_for(victim);
         self.inner.release_scheduled_speculation(victim);
         release_cache(&mut self.inner, victim)?;
-        if !self.idle_reclaim_made_progress(seq_id, victim) {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(self.idle_reclaim_made_progress(seq_id, victim))
     }
 
     /// Idle owners, one at a time, until one gives back pool blocks or a
