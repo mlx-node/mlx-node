@@ -136,6 +136,9 @@ pub(crate) struct DFlash2States {
     /// prefill continues (Splash `QwenStateStorage::restore` writes the
     /// lane's window).
     pub(crate) lane_window: Option<DraftContextWindow>,
+    /// Each scheduled sequence's context window on a draft load, which its
+    /// prefill slices continue (Splash keeps one lane per request).
+    pub(crate) seq_windows: HashMap<u32, DraftContextWindow>,
     pub(crate) counters: StateCounters,
     /// The finalize released the DFlash2 turn's lane; its history save
     /// takes it.
@@ -226,6 +229,7 @@ impl DFlash2States {
             replay_points: HashMap::new(),
             generation_suffix: None,
             lane_window: None,
+            seq_windows: HashMap::new(),
             counters: StateCounters::default(),
             released: false,
             restore_uses: HashMap::new(),
@@ -243,6 +247,7 @@ impl DFlash2States {
         self.turns.clear();
         self.replay_points.clear();
         self.lane_window = None;
+        self.seq_windows.clear();
         self.disk_read = None;
         self.restore_uses.clear();
         self.idle_lane = IdleLane::default();
@@ -304,6 +309,17 @@ impl DFlash2States {
     pub(crate) fn end_turn(&mut self, seq: u32) {
         self.end_replay_point(seq);
         self.turns.remove(&seq);
+        let window = self.seq_windows.remove(&seq);
+        self.idle_lane.give_window(window);
+    }
+
+    /// `seq`'s context window: the serial lane's for sequence 0.
+    pub(crate) fn lane_window_of(&self, seq: u32) -> Option<&DraftContextWindow> {
+        if seq == 0 {
+            self.lane_window.as_ref()
+        } else {
+            self.seq_windows.get(&seq)
+        }
     }
 }
 

@@ -578,6 +578,45 @@ impl Qwen35Inner {
             );
             return Ok((logits, Some(context)));
         }
+        let draft_lane = self.dflash2.is_some()
+            && mtp_seq.is_none()
+            && self
+                .active_scheduled_seq
+                .is_some_and(|seq| self.dflash2_states.turns.contains_key(&seq));
+        if draft_lane {
+            let cached = prefix.effective_cached_prefix_len;
+            let (logits, checkpoint) =
+                crate::models::qwen3_5::dflash2_turn::scheduled_draft_prefill(
+                    self,
+                    &prefix.full_tokens,
+                    cached,
+                    cached + suffix_tokens.len(),
+                    chunk_size,
+                    |inner| inner.dflash2.take(),
+                    |inner, model| inner.dflash2 = Some(model),
+                    |target, sink| {
+                        crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
+                            &prefix.full_tokens,
+                            suffix_tokens,
+                            cached as u32,
+                            prefix.gdn_prefix_already_primed,
+                            &embed,
+                            target,
+                            &layer_kinds,
+                            chunk_size,
+                            rope_deltas,
+                            turn_cancel.as_deref(),
+                            Some(sink),
+                        )
+                    },
+                )?;
+            self.publish_dense_gdn_materialized_prefix_checkpoint(
+                &prefix.full_tokens,
+                prefix.cache_salt,
+                checkpoint,
+            );
+            return Ok((logits, None));
+        }
         // Splash `publishReachedStateBoundaries` runs for every request: an
         // MTP sequence's prefill reaches its points as a plain one does.
         let lane_states = self.dflash2.is_none()
@@ -733,6 +772,15 @@ impl PagedBackend for Qwen35Inner {
                 plan,
                 reuse_cache,
                 cache_salt,
+            );
+        }
+        if self.dflash2.is_some() {
+            return crate::models::qwen3_5::dflash2_turn::prime_scheduled_draft_lane(
+                self,
+                plan,
+                reuse_cache,
+                cache_salt,
+                |inner, hit| inner.prime_dense_prefix(plan, cache_salt, Some(hit)),
             );
         }
         let prefix = self.prime_dense_prefix(plan, cache_salt, None)?;

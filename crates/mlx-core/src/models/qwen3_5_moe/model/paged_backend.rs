@@ -556,12 +556,44 @@ impl Qwen35MoeInner {
             );
             return Ok((logits, Some(context)));
         }
+        let draft_lane = self.dflash2.is_some()
+            && mtp_seq.is_none()
+            && self
+                .active_scheduled_seq
+                .is_some_and(|seq| self.dflash2_states.turns.contains_key(&seq));
         let lane_states = self.dflash2.is_none()
             && self
                 .dflash2_states
                 .turns
                 .contains_key(&self.active_scheduled_seq.unwrap_or(0));
-        let (logits, gdn_checkpoint) = if lane_states {
+        let (logits, gdn_checkpoint) = if draft_lane {
+            let cached = prefix.effective_cached_prefix_len;
+            crate::models::qwen3_5::dflash2_turn::scheduled_draft_prefill(
+                self,
+                &prefix.full_tokens,
+                cached,
+                cached + suffix_tokens.len(),
+                chunk_size,
+                |inner| inner.dflash2.take(),
+                |inner, model| inner.dflash2 = Some(model),
+                |target, sink| {
+                    crate::models::qwen3_5_moe::paged_forward::run_paged_prefill_chunk_tapped(
+                        &prefix.full_tokens,
+                        suffix_tokens,
+                        cached as u32,
+                        prefix.gdn_prefix_already_primed,
+                        &embed,
+                        target,
+                        &layer_kinds,
+                        chunk_size,
+                        rope_deltas,
+                        turn_cancel.as_deref(),
+                        None,
+                        Some(sink),
+                    )
+                },
+            )?
+        } else if lane_states {
             let cached = prefix.effective_cached_prefix_len;
             let captures = crate::models::qwen3_5::dflash2_turn::lane_command_breaks(
                 self,
@@ -700,6 +732,15 @@ impl PagedBackend for Qwen35MoeInner {
             );
         }
         self.invalidate_dflash2_context("prime_prefix_state");
+        if self.dflash2.is_some() {
+            return crate::models::qwen3_5::dflash2_turn::prime_scheduled_draft_lane(
+                self,
+                plan,
+                reuse_cache,
+                cache_salt,
+                |inner, hit| inner.prime_moe_prefix(plan, cache_salt, Some(hit)),
+            );
+        }
         let prefix = self.prime_moe_prefix(plan, cache_salt, None)?;
         self.open_moe_lane_turn(
             plan,

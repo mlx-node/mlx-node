@@ -617,7 +617,11 @@ drafter, and an MTP turn resumes from a RAM or disk state as a plain one does. T
 objects hold the GDN cell alone. On a load with a draft, a whole autoregressive turn
 (speculation off for the request) primes and prefills as a DFlash2 turn does: its
 states carry the draft window, its lane is released at its end, and a suspended one
-resumes from its deepest state. Image turns publish the same points under their
+resumes from its deepest state. A scheduled autoregressive turn on a draft load (the
+scheduler never speculates there) resumes only at a stored state, with that state's
+window in a lane of its own sequence; each prefill slice's taps continue that window,
+so its states equal a whole turn's. A lane whose window did not come back keeps only
+the points a whole window past its resume. Image turns publish the same points under their
 blocks' image keys (Splash keys a block by its images, `KvBlockLabel::identity`): the
 state's label carries each block's extra keys beside the tokens and salt, so after a
 restart the same placeholder ids over another image restore nothing, and the same

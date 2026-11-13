@@ -788,8 +788,7 @@ fn settle_disk_read<T: DFlash2Target>(target: &mut T, tokens: &[u32], resumed: O
                 None => Some(
                     target
                         .dflash2_states()
-                        .lane_window
-                        .as_ref()
+                        .lane_window_of(target.lane_seq())
                         .ok_or_else(|| Error::from_reason("a disk restore left no lane window"))?
                         .snapshot()?,
                 ),
@@ -1845,6 +1844,13 @@ impl<'a> DraftTapSink<'a> {
         })
     }
 
+    /// The sink of a request that decodes autoregressively: only the
+    /// lane's window takes rows, the K/V ring none.
+    pub(crate) fn without_ring(mut self) -> Self {
+        self.kv_from = usize::MAX;
+        self
+    }
+
     /// The draft context the prefill advanced and the lane's window.
     pub(crate) fn into_parts(self) -> (DFlash2ContextCache, Option<DraftContextWindow>) {
         (self.context, self.lane)
@@ -2080,6 +2086,24 @@ pub(crate) fn open_lane_turn<T: DFlash2Target>(
     reuse: bool,
     restored: Option<EntryId>,
 ) -> Result<()> {
+    open_lane_turn_at(
+        target, tokens, extra_keys, cached, cache_salt, reuse, 0, restored,
+    )
+}
+
+/// [`open_lane_turn`] with the KV hit `junction` past `cached` (Splash
+/// `Cache::lookup`'s junction; 0 for none).
+#[allow(clippy::too_many_arguments)]
+fn open_lane_turn_at<T: DFlash2Target>(
+    target: &mut T,
+    tokens: &[u32],
+    extra_keys: &[Vec<u64>],
+    cached: usize,
+    cache_salt: u64,
+    reuse: bool,
+    junction: u32,
+    restored: Option<EntryId>,
+) -> Result<()> {
     if target.paged_adapter_ref().is_none() {
         return Ok(());
     }
@@ -2093,7 +2117,7 @@ pub(crate) fn open_lane_turn<T: DFlash2Target>(
         tokens,
         prompt,
         resume,
-        0,
+        junction,
         cache_salt,
         reuse,
         Some(extra_keys.to_vec()),
@@ -2181,11 +2205,13 @@ where
                 .is_some_and(|entry| entry.depth() == cached_rows)
     });
     let draft_config = target.dflash2().map(|draft| draft.config.clone());
+    let mut lane_end = cached;
     if let Some(config) = draft_config.as_ref() {
         let mut lane = target.dflash2_states_mut().idle_lane.take_window(config)?;
         if let Some(id) = resumed {
             restored_window(target, id, &mut lane);
         }
+        lane_end = lane.end();
         target.dflash2_states_mut().lane_window = Some(lane);
     }
     open_lane_turn(
@@ -2197,6 +2223,7 @@ where
         reuse,
         resumed,
     )?;
+    keep_drawable_points(target, cached, lane_end)?;
     let captures = lane_command_breaks(target, cached_rows, tokens.len(), chunk_rows);
     let Some(config) = draft_config else {
         let mut sink = LaneStateSink::new(&captures);
@@ -2257,6 +2284,187 @@ fn restored_window<T: DFlash2Target>(target: &mut T, id: EntryId, lane: &mut Dra
     if !filled {
         lane.restart(0);
     }
+}
+
+/// The deepest stored state a scheduled request of `tokens` resumes at,
+/// below its last token; one whose chain cannot come back whole is
+/// discarded and the next deepest taken (Splash `acquireDeepest`).
+fn scheduled_state_hit<T: DFlash2Target>(
+    target: &mut T,
+    tokens: &[u32],
+    cache_salt: u64,
+) -> Option<(EntryId, u32)> {
+    let cap = tokens.len().saturating_sub(1);
+    for _ in 0..=target.dflash2_states().store.bytes().entries {
+        let hit = target
+            .dflash2_states()
+            .store
+            .lookup_within(Lineage::text(tokens, cache_salt), cap)?;
+        if disk::restorable(&*target, hit.id) {
+            return u32::try_from(hit.depth).ok().map(|depth| (hit.id, depth));
+        }
+        disk::discard_state(target, hit.id);
+    }
+    None
+}
+
+/// Splash `Engine::admit` → `configureDraftStatePlan` for a scheduled
+/// request on a draft load, which decodes autoregressively (the scheduler
+/// never speculates on a draft load): it resumes only at a stored state's
+/// block, else from 0 with its KV hit as the junction (Splash
+/// `Cache::lookup`), and its lane's context window is the state's
+/// (Splash `QwenStateStorage::restore`), kept on its sequence for its
+/// prefill slices. `prime` prepares the prefix from the hit.
+pub(crate) fn prime_scheduled_draft_lane<T, P>(
+    target: &mut T,
+    tokens: &[u32],
+    reuse_cache: bool,
+    cache_salt: u64,
+    prime: impl FnOnce(&mut T, DFlash2Hit) -> Result<P>,
+) -> Result<P>
+where
+    T: DFlash2Target,
+    P: crate::engine::backend::PagedPrefix,
+{
+    let seq = target.lane_seq();
+    let config = target
+        .dflash2()
+        .ok_or_else(|| Error::from_reason("a draft lane prime without a draft"))?
+        .config
+        .clone();
+    let states = target.dflash2_states_mut();
+    let earlier = states.seq_windows.remove(&seq);
+    states.idle_lane.give_window(earlier);
+    let hit = if reuse_cache {
+        scheduled_state_hit(target, tokens, cache_salt)
+    } else {
+        None
+    };
+    let prefix = prime(
+        target,
+        hit.map_or(DFlash2Hit::Cold, |(_, depth)| DFlash2Hit::Stored(depth)),
+    )?;
+    let cached = prefix.effective_cached_prefix_len();
+    let resume = u32::try_from(cached)
+        .map_err(|_| Error::from_reason("a prime's prefix exceeds u32 tokens"))?;
+    let resumed = hit
+        .filter(|&(_, depth)| cached > 0 && depth == resume)
+        .map(|(id, _)| id);
+    let mut lane = target.dflash2_states_mut().idle_lane.take_window(&config)?;
+    if let Some(id) = resumed {
+        restored_window(target, id, &mut lane);
+    }
+    let lane_end = lane.end();
+    target.dflash2_states_mut().seq_windows.insert(seq, lane);
+    let junction = if reuse_cache {
+        junction_probe(&*target, tokens, cache_salt, resume)
+    } else {
+        0
+    };
+    open_lane_turn_at(
+        target,
+        tokens,
+        &[],
+        cached,
+        cache_salt,
+        reuse_cache,
+        junction,
+        resumed,
+    )?;
+    keep_drawable_points(target, resume, lane_end)?;
+    let states = target.dflash2_states_mut();
+    if states
+        .turns
+        .get(&seq)
+        .is_some_and(|turn| turn.junction != 0)
+    {
+        states.counters.lazy_junctions += 1;
+    }
+    Ok(prefix)
+}
+
+/// A lane resumed at `resume` whose context window does not end there
+/// draws no point's window from rows below it: only points a whole window
+/// past it stay on the turn (Splash restores a window with each state it
+/// resumes at).
+pub(crate) fn keep_drawable_points<T: DFlash2Target>(
+    target: &mut T,
+    resume: u32,
+    lane_end: u32,
+) -> Result<()> {
+    if lane_end == resume {
+        return Ok(());
+    }
+    let first = resume.saturating_add(state_window(&*target)?);
+    let seq = target.lane_seq();
+    if let Some(turn) = target.dflash2_states_mut().turns.get_mut(&seq) {
+        turn.plan.boundaries.retain(|point| point.tokens >= first);
+    }
+    Ok(())
+}
+
+/// Splash `publishReachedStateBoundaries` for one prefill slice, rows
+/// `[cached, end)` of `tokens`, of a scheduled request on a draft load:
+/// its chunks reach the lane's points with the context window the same
+/// forward's taps fill, continued from the sequence's window. The request
+/// decodes autoregressively, so no draft ring takes rows. `take_draft` and
+/// `give_draft` move the draft off the model for the slice.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn scheduled_draft_prefill<T, L, R>(
+    target: &mut T,
+    tokens: &[u32],
+    cached: usize,
+    end: usize,
+    chunk_rows: i32,
+    take_draft: impl FnOnce(&mut T) -> Option<DFlash2Model>,
+    give_draft: impl FnOnce(&mut T, DFlash2Model),
+    prefill: impl FnOnce(
+        &mut dyn crate::models::qwen3_5::paged_forward::PrefillTarget<L>,
+        &mut dyn crate::models::qwen3_5::paged_forward::PrefillTapSink,
+    ) -> Result<R>,
+) -> Result<R>
+where
+    T: DFlash2Target + crate::models::qwen3_5::paged_forward::PrefillTarget<L>,
+{
+    let seq = target.lane_seq();
+    let config = target
+        .dflash2()
+        .ok_or_else(|| Error::from_reason("a draft lane prefill without a draft"))?
+        .config
+        .clone();
+    let captures = lane_command_breaks(target, cached, end, chunk_rows);
+    let mut plan = target
+        .dflash2_states()
+        .turns
+        .get(&seq)
+        .map(|turn| turn.plan.clone())
+        .unwrap_or_default();
+    plan.boundaries
+        .retain(|point| point.tokens as usize > cached);
+    let states = target.dflash2_states_mut();
+    let lane = match states.seq_windows.remove(&seq) {
+        Some(lane) => lane,
+        None => states.idle_lane.take_window(&config)?,
+    };
+    let Some(model) = take_draft(target) else {
+        target.dflash2_states_mut().seq_windows.insert(seq, lane);
+        return Err(Error::from_reason(
+            "a scheduled prefill lost its DFlash2 draft",
+        ));
+    };
+    let ring = DFlash2ContextCache::new(&model.config);
+    let prefilled = DraftTapSink::new(&model, ring, lane, tokens, cached, &plan, &captures)
+        .map(DraftTapSink::without_ring)
+        .and_then(|mut sink| {
+            let prefilled = prefill(&mut LanePrefill(&mut *target), &mut sink);
+            let (_, lane) = sink.into_parts();
+            if let Some(lane) = lane {
+                target.dflash2_states_mut().seq_windows.insert(seq, lane);
+            }
+            prefilled
+        });
+    give_draft(target, model);
+    prefilled
 }
 
 /// Splash `reserveCaptures` over one prefill command of the lane's turn,
@@ -3243,8 +3451,8 @@ pub(crate) fn record_chunk_claimed<T: DFlash2Target>(target: &mut T, chunk: &[u3
 
 /// The model's accounts on the governor's books: its KV pool; its states
 /// (parked DFlash2 states, GDN ladder and history entries, the live
-/// scheduled GDN cells, `gdn_cells`, and the idle lane's draft ring and
-/// window); its image features.
+/// scheduled GDN cells, `gdn_cells`, the idle lane's draft ring and window,
+/// and the scheduled sequences' windows); its image features.
 pub(crate) fn memory_accounts<T: DFlash2Target>(
     target: &T,
     gdn_cells: u64,
@@ -3269,6 +3477,12 @@ pub(crate) fn memory_accounts<T: DFlash2Target>(
                 .window
                 .as_ref()
                 .map_or(0, DraftContextWindow::nbytes),
+        )
+        .saturating_add(
+            states
+                .seq_windows
+                .values()
+                .fold(0u64, |sum, window| sum.saturating_add(window.nbytes())),
         );
     crate::engine::governor::governor::MemoryAccounts {
         kv,
