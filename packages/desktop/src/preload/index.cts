@@ -24,10 +24,20 @@
 
 import { ipcRenderer, type IpcRendererEvent } from 'electron';
 
-/** Keep in sync with the three CONTROL PANEL channel constants in `src/main/window-policy.ts`. */
+/** Keep in sync with the CONTROL PANEL channel constants in `src/main/window-policy.ts`. */
 const CONTROL_PANEL_PORT_CHANNEL = 'mlx:control-panel-port';
 const CONTROL_PANEL_READY_CHANNEL = 'mlx:control-panel-ready';
 const CONTROL_PANEL_UNRESPONSIVE_CHANNEL = 'mlx:control-panel-unresponsive';
+const CONTROL_PANEL_PICK_FOLDER_CHANNEL = 'mlx:control-panel-pick-folder';
+const CONTROL_PANEL_FOLDER_CHANNEL = 'mlx:control-panel-folder';
+
+/** The page's folder request and its answer, as `window` messages. Keep in sync with `ui/src/lib/pick-folder.ts`. */
+const PICK_FOLDER_MESSAGE = 'mlx:pick-folder';
+const FOLDER_PICKED_MESSAGE = 'mlx:folder-picked';
+
+function isRequestId(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 64;
+}
 
 /**
  * Keep in sync with `DASHBOARD_PORT_MESSAGE` in
@@ -88,9 +98,13 @@ window.addEventListener('message', (event: MessageEvent) => {
   if (event.source !== window) return;
   const data: unknown = event.data;
   if (typeof data !== 'object' || data === null) return;
-  const message = data as { type?: unknown; generation?: unknown };
+  const message = data as { type?: unknown; generation?: unknown; requestId?: unknown };
   const type = message.type;
   if (type === CONTROL_PANEL_READY_CHANNEL) requestPort();
+  // Only a request id crosses: the dialog's folder, title and options are MAIN's alone.
+  if (type === PICK_FOLDER_MESSAGE && isRequestId(message.requestId)) {
+    ipcRenderer.send(CONTROL_PANEL_PICK_FOLDER_CHANNEL, message.requestId);
+  }
   if (type === CONTROL_PANEL_UNRESPONSIVE_CHANNEL && isBrokerGeneration(message.generation)) {
     recoverRuntime(message.generation);
   }
@@ -111,4 +125,11 @@ ipcRenderer.on(CONTROL_PANEL_PORT_CHANNEL, (event: IpcRendererEvent, generation:
   // connects — is indistinguishable from the broker being down. There is no
   // third party to protect against here; the message goes to this window only.
   window.postMessage({ type: DASHBOARD_PORT_MESSAGE, generation }, '*', [port]);
+});
+
+ipcRenderer.on(CONTROL_PANEL_FOLDER_CHANNEL, (_event: IpcRendererEvent, requestId: unknown, path: unknown) => {
+  if (!isRequestId(requestId)) return;
+  const folder = typeof path === 'string' && path !== '' ? path : null;
+  // `'*'` for the reason given at the port message above; the window cannot navigate away from the SPA.
+  window.postMessage({ type: FOLDER_PICKED_MESSAGE, requestId, path: folder }, '*');
 });

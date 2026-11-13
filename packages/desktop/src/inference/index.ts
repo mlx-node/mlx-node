@@ -23,7 +23,13 @@ import { writeSync } from 'node:fs';
 import { createInferenceHost } from '@mlx-node/server/host';
 import { publishDesktopEndpoint } from '@mlx-node/server/host/desktop-endpoint';
 
-import { NoParentChannelError, resolveParentChannel, runSidecar, sidecarHostOptions } from './sidecar.js';
+import {
+  endpointModels,
+  NoParentChannelError,
+  resolveParentChannel,
+  runSidecar,
+  sidecarHostOptions,
+} from './sidecar.js';
 
 /** stdout/stderr are async pipes under both transports; an exit right after a write truncates it. */
 function logError(line: string): void {
@@ -57,7 +63,7 @@ void runSidecar({
       version: 1,
       pid: process.pid,
       url,
-      models: models.map(({ name, path }) => ({ name, path })),
+      models: endpointModels(models),
       token: hostOptions.authToken,
     }),
   onStopSignal: (handler) => {

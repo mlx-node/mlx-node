@@ -8,14 +8,18 @@
  * `child-utility.ts`.
  */
 
-import { app, BrowserWindow, ipcMain, shell, type IpcMainEvent, type WebContents } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell, type IpcMainEvent, type WebContents } from 'electron';
 
 import { clampBoundsToDisplays, type Rect, type WindowBounds } from './settings.js';
 import {
+  CONTROL_PANEL_PICK_FOLDER_CHANNEL,
   CONTROL_PANEL_READY_CHANNEL,
   CONTROL_PANEL_UNRESPONSIVE_CHANNEL,
   CONTROL_PANEL_URL,
+  TRAFFIC_LIGHT_POSITION,
   classifyNavigation,
+  createFolderPicker,
+  windowBackground,
 } from './window-policy.js';
 
 /** Below this the dashboard's own layout collapses; the user cannot recover it by dragging. */
@@ -115,8 +119,19 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
     }
     options.onControlPanelUnresponsive?.(event.sender, expectedGeneration);
   };
+  const onPickFolder = createFolderPicker<WebContents, BrowserWindow>({
+    window: () => (win === null || win.isDestroyed() ? null : { win, contents: win.webContents }),
+    showOpenDialog: (target, dialogOptions) =>
+      dialog.showOpenDialog(target, { ...dialogOptions, properties: [...dialogOptions.properties] }),
+  });
   ipcMain.on(CONTROL_PANEL_READY_CHANNEL, onReady);
   ipcMain.on(CONTROL_PANEL_UNRESPONSIVE_CHANNEL, onUnresponsive);
+  ipcMain.on(CONTROL_PANEL_PICK_FOLDER_CHANNEL, onPickFolder);
+
+  const onThemeUpdated = (): void => {
+    if (win !== null && !win.isDestroyed()) win.setBackgroundColor(windowBackground(nativeTheme.shouldUseDarkColors));
+  };
+  nativeTheme.on('updated', onThemeUpdated);
 
   function persistBounds(): void {
     if (boundsTimer !== null) clearTimeout(boundsTimer);
@@ -147,8 +162,9 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
       title: 'mlx-node',
       // Painted before the SPA's first frame; without it the window opens as a
       // white flash even in dark mode.
-      backgroundColor: '#101014',
+      backgroundColor: windowBackground(nativeTheme.shouldUseDarkColors),
       titleBarStyle: 'hiddenInset',
+      trafficLightPosition: TRAFFIC_LIGHT_POSITION,
       // Shown from `ready-to-show` instead, so the first thing the user sees is
       // rendered content rather than an empty frame.
       show: false,
@@ -232,6 +248,8 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
       disposed = true;
       ipcMain.removeListener(CONTROL_PANEL_READY_CHANNEL, onReady);
       ipcMain.removeListener(CONTROL_PANEL_UNRESPONSIVE_CHANNEL, onUnresponsive);
+      ipcMain.removeListener(CONTROL_PANEL_PICK_FOLDER_CHANNEL, onPickFolder);
+      nativeTheme.removeListener('updated', onThemeUpdated);
       if (boundsTimer !== null) {
         clearTimeout(boundsTimer);
         boundsTimer = null;

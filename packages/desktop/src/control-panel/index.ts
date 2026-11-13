@@ -34,7 +34,7 @@ import { writeSync } from 'node:fs';
 
 import { bindEventEmitterPort, createDashboardRuntime } from '@mlx-node/dashboard';
 
-import { createCliLauncher, type DesktopCliConfig } from '../cli-launcher.js';
+import { createCliLauncher, runAgentUpdate, type DesktopCliConfig } from '../cli-launcher.js';
 import { createControlPanelSession } from './session.js';
 import { CONTROL_PANEL_PROCESS_EXIT_CAP_MS, CONTROL_PANEL_WORKER_SHUTDOWN_STEP_MS } from './shutdown-timings.js';
 
@@ -107,8 +107,14 @@ function teardown(code: number): void {
 const cli = process.env.MLX_DESKTOP_CLI
   ? createCliLauncher(JSON.parse(process.env.MLX_DESKTOP_CLI) as DesktopCliConfig)
   : undefined;
+
+/** The Chat page's Install action: the app's own `mlx agent update`. */
+function agentInstaller(launcher: NonNullable<typeof cli>): () => Promise<void> {
+  return async () => runAgentUpdate(await launcher.prepare());
+}
 const runtime = createDashboardRuntime({
   prepareDelegation: cli ? () => cli.prepare() : undefined,
+  ...(cli ? { chat: { installAgent: agentInstaller(cli) } } : {}),
   // One budget per sequential worker phase. The process/broker/app caps are
   // derived from this in `shutdown-timings.ts`.
   shutdownTimeoutMs: CONTROL_PANEL_WORKER_SHUTDOWN_STEP_MS,

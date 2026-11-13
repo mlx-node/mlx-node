@@ -88,7 +88,9 @@ export function sidecarHostOptions(env: NodeJS.ProcessEnv = process.env): Sideca
   return {
     ...SIDECAR_HOST_OPTIONS,
     authToken: newSidecarAuthToken(),
+    hostKind: 'desktop',
     persistPagedCache: { byDefault: true },
+    persistWholePrompt: true,
     ...(turnJournal !== null ? { turnJournal } : {}),
   };
 }
@@ -103,12 +105,15 @@ export interface SidecarHostOptions {
   port: number;
   host: string;
   authToken: string;
+  hostKind: 'desktop';
   /**
    * The paged KV disk cache: on unless `MLX_PERSIST_PAGED_CACHE` in this
    * process's env says otherwise. `InferenceHostOptions.persistPagedCache`,
    * restated for the reason {@link SidecarHost} gives.
    */
   persistPagedCache: { flag?: boolean; byDefault: boolean };
+  /** A turn of the cold tier families writes the whole prompt. `InferenceHostOptions.persistWholePrompt`. */
+  persistWholePrompt: boolean;
   turnJournal?: SidecarTurnJournal;
 }
 
@@ -137,9 +142,23 @@ export interface SidecarHost {
   port: number;
   modelsDir: string;
   boundModel: string;
-  models: readonly { name: string; path: string; modelType: string }[];
+  models: readonly {
+    name: string;
+    path: string;
+    modelType: string;
+    base: string;
+    variant: string;
+    format: 'gguf' | 'mlx';
+  }[];
   logDir: string | null;
   close(opts?: { timeoutMs?: number }): Promise<void>;
+}
+
+/** The endpoint file's `models[]`, field by field: the host's entries carry more than the file may hold. */
+export function endpointModels(
+  models: SidecarHost['models'],
+): { name: string; path: string; base: string; variant: string; format: 'gguf' | 'mlx' }[] {
+  return models.map(({ name, path, base, variant, format }) => ({ name, path, base, variant, format }));
 }
 
 /**

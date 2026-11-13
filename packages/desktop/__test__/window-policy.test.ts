@@ -8,12 +8,20 @@ import { describe, expect, it } from 'vite-plus/test';
 // path too. Imported rather than regex-matched so a rename over there fails to
 // compile here instead of quietly weakening the assertion.
 import { DASHBOARD_PORT_MESSAGE, DASHBOARD_UNRESPONSIVE_MESSAGE } from '../../dashboard/src/rpc/protocol.js';
+import { FOLDER_PICKED_MESSAGE, PICK_FOLDER_MESSAGE } from '../../dashboard/ui/src/lib/pick-folder.js';
 import {
+  CONTROL_PANEL_FOLDER_CHANNEL,
+  CONTROL_PANEL_PICK_FOLDER_CHANNEL,
   CONTROL_PANEL_PORT_CHANNEL,
   CONTROL_PANEL_READY_CHANNEL,
   CONTROL_PANEL_UNRESPONSIVE_CHANNEL,
   CONTROL_PANEL_URL,
+  TRAFFIC_LIGHT_POSITION,
+  WINDOW_BACKGROUND,
   classifyNavigation,
+  createFolderPicker,
+  FOLDER_DIALOG_OPTIONS,
+  windowBackground,
 } from '../src/main/window-policy.js';
 
 describe('classifyNavigation', () => {
@@ -115,9 +123,137 @@ describe('the preload contract', () => {
     expect(source).toContain(`document.readyState === 'loading'`);
   });
 
+  it('hard-codes the folder channels and the page messages of the folder dialog', () => {
+    expect(source).toContain(`'${CONTROL_PANEL_PICK_FOLDER_CHANNEL}'`);
+    expect(source).toContain(`'${CONTROL_PANEL_FOLDER_CHANNEL}'`);
+    expect(source).toContain(`'${PICK_FOLDER_MESSAGE}'`);
+    expect(source).toContain(`'${FOLDER_PICKED_MESSAGE}'`);
+  });
+
+  it('passes only the request id of a folder request to MAIN', () => {
+    expect(source).toContain(`ipcRenderer.send(CONTROL_PANEL_PICK_FOLDER_CHANNEL, message.requestId)`);
+    expect(source).toContain(`type === PICK_FOLDER_MESSAGE && isRequestId(message.requestId)`);
+    expect(source).toContain(`window.postMessage({ type: FOLDER_PICKED_MESSAGE, requestId, path: folder }, '*')`);
+  });
+
   it('maps the page recovery message to MAIN without exposing ipcRenderer', () => {
     expect(source).toContain(`type === CONTROL_PANEL_UNRESPONSIVE_CHANNEL && isBrokerGeneration(message.generation)`);
     expect(source).toContain(`recoverRuntime(message.generation)`);
     expect(source).toContain(`ipcRenderer.send(CONTROL_PANEL_UNRESPONSIVE_CHANNEL, generation)`);
+  });
+});
+
+describe('window chrome', () => {
+  it('paints the background the SPA boots on, per OS scheme', () => {
+    expect(WINDOW_BACKGROUND).toEqual({ light: '#ffffff', dark: '#141414' });
+    expect(windowBackground(false)).toBe('#ffffff');
+    expect(windowBackground(true)).toBe('#141414');
+  });
+
+  it('centres the traffic lights in the 40 px title bar', () => {
+    expect(TRAFFIC_LIGHT_POSITION).toEqual({ x: 14, y: 14 });
+  });
+});
+
+describe('the folder dialog', () => {
+  interface Sent {
+    channel: string;
+    args: unknown[];
+  }
+  function sender(log: Sent[]) {
+    return { send: (channel: string, ...args: unknown[]) => log.push({ channel, args }) };
+  }
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function setup() {
+    const sent: Sent[] = [];
+    const contents = sender(sent);
+    const win = { id: 'win' };
+    const calls: Array<{ win: unknown; options: unknown }> = [];
+    let next = deferred<{ canceled: boolean; filePaths: string[] }>();
+    let current: { win: typeof win; contents: typeof contents } | null = { win, contents };
+    const pick = createFolderPicker<typeof contents, typeof win>({
+      window: () => current,
+      showOpenDialog: (target, options) => {
+        calls.push({ win: target, options });
+        return next.promise;
+      },
+    });
+    return {
+      sent,
+      contents,
+      win,
+      calls,
+      pick,
+      answer: (result: { canceled: boolean; filePaths: string[] }) => {
+        const was = next;
+        next = deferred();
+        was.resolve(result);
+      },
+      fail: () => {
+        const was = next;
+        next = deferred();
+        was.reject(new Error('no dialog'));
+      },
+      noWindow: () => {
+        current = null;
+      },
+    };
+  }
+
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+  it('opens the fixed dialog on our window and answers the asking sender with the chosen folder', async () => {
+    const t = setup();
+    t.pick({ sender: t.contents }, 'req-1');
+    expect(t.calls).toEqual([{ win: t.win, options: FOLDER_DIALOG_OPTIONS }]);
+    expect(FOLDER_DIALOG_OPTIONS).toEqual({
+      title: 'Choose a folder for Work',
+      buttonLabel: 'Choose',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    t.answer({ canceled: false, filePaths: ['/Users/me/code/app'] });
+    await settle();
+    expect(t.sent).toEqual([{ channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['req-1', '/Users/me/code/app'] }]);
+  });
+
+  it('answers null on cancel, on a dialog failure, and to a second request while one is open', async () => {
+    const t = setup();
+    t.pick({ sender: t.contents }, 'a');
+    t.pick({ sender: t.contents }, 'b');
+    expect(t.calls).toHaveLength(1);
+    expect(t.sent).toEqual([{ channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['b', null] }]);
+    t.answer({ canceled: true, filePaths: ['/ignored'] });
+    await settle();
+    expect(t.sent.at(-1)).toEqual({ channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['a', null] });
+    t.pick({ sender: t.contents }, 'c');
+    t.fail();
+    await settle();
+    expect(t.sent.at(-1)).toEqual({ channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['c', null] });
+    t.pick({ sender: t.contents }, 'd');
+    t.answer({ canceled: false, filePaths: [] });
+    await settle();
+    expect(t.sent.at(-1)).toEqual({ channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['d', null] });
+  });
+
+  it('ignores another sender, a bad request id, and a request with no window', async () => {
+    const t = setup();
+    const otherSent: Sent[] = [];
+    t.pick({ sender: sender(otherSent) }, 'x');
+    for (const id of ['', 'x'.repeat(65), 42, null, { path: '/etc' }]) t.pick({ sender: t.contents }, id);
+    t.noWindow();
+    t.pick({ sender: t.contents }, 'y');
+    await settle();
+    expect(t.calls).toEqual([]);
+    expect(t.sent).toEqual([]);
+    expect(otherSent).toEqual([]);
   });
 });

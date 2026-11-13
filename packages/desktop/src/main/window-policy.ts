@@ -47,6 +47,74 @@ export const CONTROL_PANEL_READY_CHANNEL = 'mlx:control-panel-ready';
 export const CONTROL_PANEL_UNRESPONSIVE_CHANNEL = 'mlx:control-panel-unresponsive';
 
 /**
+ * Renderer → MAIN: "let the user choose a Work folder", with a request id. MAIN answers on
+ * {@link CONTROL_PANEL_FOLDER_CHANNEL}. Duplicated as a literal in the preload, pinned by `window-policy.test.ts`.
+ */
+export const CONTROL_PANEL_PICK_FOLDER_CHANNEL = 'mlx:control-panel-pick-folder';
+
+/** MAIN → renderer: the request id and the folder the user chose in the native dialog, or `null`. */
+export const CONTROL_PANEL_FOLDER_CHANNEL = 'mlx:control-panel-folder';
+
+/** A request id from the page: a string of 1–64 characters, echoed back and nothing else. */
+export function isFolderRequestId(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 64;
+}
+
+/**
+ * The folder dialog. Every option is fixed here: the page sends only a request id, so it can never choose a path,
+ * a title, a default folder or dialog flags. The answer is the path the user picked, or `null`.
+ */
+export const FOLDER_DIALOG_OPTIONS = {
+  title: 'Choose a folder for Work',
+  buttonLabel: 'Choose',
+  properties: ['openDirectory', 'createDirectory'],
+} as const;
+
+/** What the folder handler needs from Electron: the sender check and the dialog. */
+export interface FolderPickerDeps<Sender, Window> {
+  /** The window allowed to ask, or null while there is none. */
+  window(): { win: Window; contents: Sender } | null;
+  showOpenDialog(win: Window, options: typeof FOLDER_DIALOG_OPTIONS): Promise<{ canceled: boolean; filePaths: string[] }>;
+}
+
+/**
+ * The `ipcMain` handler for {@link CONTROL_PANEL_PICK_FOLDER_CHANNEL}: only our window may ask, one dialog at a time
+ * (a second request while one is open is answered `null`), and the reply goes back to the asking sender only.
+ */
+export function createFolderPicker<Sender extends { send(channel: string, ...args: unknown[]): void }, Window>(
+  deps: FolderPickerDeps<Sender, Window>,
+): (event: { sender: Sender }, requestId: unknown) => void {
+  let open = false;
+  return (event, requestId) => {
+    const current = deps.window();
+    if (current === null || event.sender !== current.contents || !isFolderRequestId(requestId)) return;
+    const reply = (path: string | null): void => {
+      try {
+        event.sender.send(CONTROL_PANEL_FOLDER_CHANNEL, requestId, path);
+      } catch {
+        // The window went away while the dialog was open.
+      }
+    };
+    if (open) {
+      reply(null);
+      return;
+    }
+    open = true;
+    deps.showOpenDialog(current.win, FOLDER_DIALOG_OPTIONS).then(
+      (result) => {
+        open = false;
+        const path = result.canceled ? undefined : result.filePaths[0];
+        reply(typeof path === 'string' && path !== '' ? path : null);
+      },
+      () => {
+        open = false;
+        reply(null);
+      },
+    );
+  };
+}
+
+/**
  * `allow` — same-origin SPA navigation.
  * `external` — hand to the user's browser; never navigate the shell to it.
  * `block` — refuse, and do not open it anywhere.
@@ -83,3 +151,13 @@ export function classifyNavigation(target: string): NavigationVerdict {
   if (url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'mailto:') return 'external';
   return 'block';
 }
+
+/** Painted before the SPA's first frame; equals Arc `--background` in each scheme and the boot screen in `ui/index.html`. */
+export const WINDOW_BACKGROUND = { light: '#ffffff', dark: '#141414' } as const;
+
+export function windowBackground(dark: boolean): string {
+  return dark ? WINDOW_BACKGROUND.dark : WINDOW_BACKGROUND.light;
+}
+
+/** Centres the 12 px traffic lights in the SPA's 40 px title bar. */
+export const TRAFFIC_LIGHT_POSITION = { x: 14, y: 14 } as const;
