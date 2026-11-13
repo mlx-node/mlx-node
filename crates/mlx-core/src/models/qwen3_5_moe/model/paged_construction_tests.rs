@@ -2866,6 +2866,15 @@ fn moe_scheduled_mtp_prefill_publishes_its_plan() -> Result<()> {
 /// finalize, the merge standing in as the token embeddings on a text
 /// M-RoPE grid. Returns the prefix the turn resumed at.
 fn moe_image_turn(inner: &mut Qwen35MoeInner, tokens: &[u32], hash: u64) -> Result<u32> {
+    moe_image_turn_logits(inner, tokens, hash).map(|(cached, _)| cached)
+}
+
+/// [`moe_image_turn`], with the last row's logits.
+fn moe_image_turn_logits(
+    inner: &mut Qwen35MoeInner,
+    tokens: &[u32],
+    hash: u64,
+) -> Result<(u32, MxArray)> {
     let positions: Vec<(u32, u64)> = (4..36).map(|row| (row, hash)).collect();
     let keys = crate::engine::build_paged_extra_keys(tokens.len(), 16, &positions);
     let len = tokens.len() as u32;
@@ -2899,7 +2908,7 @@ fn moe_image_turn(inner: &mut Qwen35MoeInner, tokens: &[u32], hash: u64) -> Resu
     logits.eval();
     inner.publish_moe_gdn_materialized_prefix_checkpoint(tokens, &keys, 0, rungs);
     inner.finalize_moe_manual_paged_turn(&positions, 0)?;
-    Ok(cached)
+    Ok((cached, logits))
 }
 
 /// [`crate::models::qwen3_5::model`]'s
@@ -2986,4 +2995,104 @@ fn moe_image_restart_restores_only_the_same_image() -> Result<()> {
     })();
     moe_small_plan(false);
     result
+}
+
+/// [`crate::models::qwen3_5::model`]'s
+/// `text_turn_on_an_image_session_publishes_image_keyed_states` on a MoE
+/// load: a text turn that extends an image session resumes on its live
+/// cell (128) and publishes its replay point (176) under the blocks' image
+/// keys; an image turn of the same prompt resumes there, in process and
+/// from disk after a restart, on a cold image turn's logits, while a
+/// text-only turn of the same ids restores nothing.
+/// Mutations IC1 (a lane with image positions plans no point) and IC2 (the
+/// lane turn opens with no image keys) → red.
+#[test]
+fn moe_text_turn_on_an_image_session_publishes_image_keyed_states() -> Result<()> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::persistent_test_tier;
+    const TEST: &str = "moe_text_turn_on_an_image_session_publishes_image_keyed_states";
+    const TAG: &str = "state-tier-moe-image-session-text-turn";
+    const IMAGE: u64 = 0xA11C_E017;
+    let _plan = MoeSmallPlan::new();
+    let tokens: Vec<u32> = (0..191).map(|i| (i * 7 + 3) % 13 + 1).collect();
+    let head = &tokens[..128];
+    let reference_tier = persistent_test_tier("state-tier-moe-image-session-cold", 1 << 30);
+    let Some(mut reference) = seeded_moe_on(&reference_tier, TEST) else {
+        return Ok(());
+    };
+    let (cached, cold) = moe_image_turn_logits(&mut reference, &tokens, IMAGE)?;
+    assert_eq!(cached, 0);
+    drop(reference);
+
+    let tier = persistent_test_tier(TAG, 1 << 30);
+    let Some(mut first) = seeded_moe_on(&tier, TEST) else {
+        return Ok(());
+    };
+    assert_eq!(moe_image_turn(&mut first, head, IMAGE)?, 0);
+    first.cached_token_history = head.to_vec();
+    first.cached_image_key = Some(IMAGE);
+    first.cached_paged_image_token_positions = (4..36).map(|row| (row, IMAGE)).collect();
+    first.cached_rope_deltas = Some(0);
+    let before = first.dflash2_states.counters.replay_state_publications;
+    let (cached, _) = moe_turn(&mut first, &tokens)?;
+    assert_eq!(cached, 128, "the text turn continued the session");
+    let counters = first.dflash2_states.counters;
+    assert_eq!(counters.replay_state_publications - before, 1);
+    assert_eq!(counters.replay_state_publication_failures, 0);
+    let keys = |inner: &Qwen35MoeInner, depth: usize| {
+        inner
+            .dflash2_states
+            .store
+            .entries()
+            .find(|entry| entry.depth() == depth)
+            .map(|entry| (entry.id(), entry.extra_keys().to_vec()))
+            .unwrap_or_else(|| panic!("a state at {depth}"))
+    };
+    let (_, published) = keys(&first, 176);
+    assert_eq!(
+        published.len(),
+        3,
+        "the text turn's state carries the image keys"
+    );
+    let stored = moe_cell_at(&first, 176);
+    let (cached, logits) = moe_image_turn_logits(&mut first, &tokens, IMAGE)?;
+    assert_eq!(cached, 176);
+    assert!(crate::models::qwen3_5::model::arrays_bits_equal_for_test(
+        &logits, &cold
+    )?);
+    let Some((_tier, mut second)) = moe_reopen_after(first, tier, TAG, TEST, |_, _| {}, 1)? else {
+        return Ok(());
+    };
+    let (adopted, adopted_keys) = keys(&second, 176);
+    assert_eq!(adopted_keys, published);
+    let (cached, _) = moe_turn(&mut second, &tokens)?;
+    assert_eq!(cached, 0, "a text-only prompt restores nothing");
+    assert!(
+        second.dflash2_states.store.get(adopted).is_some(),
+        "the image-keyed state stays"
+    );
+    let (cached, logits) = moe_image_turn_logits(&mut second, &tokens, IMAGE)?;
+    assert_eq!(cached, 176);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(
+        disk.counters.promotions + disk.counters.promotions_skipped,
+        1
+    );
+    assert_eq!(disk.counters.invalidations, 0);
+    let anchor = second
+        .dflash2_states
+        .store
+        .get(adopted)
+        .and_then(|entry| entry.ram())
+        .expect("the promoted state");
+    let cell = crate::models::qwen3_5::dflash2_state::disk::encode_anchor(
+        &second.dflash2_states,
+        &second.config.to_dense_config(),
+        anchor,
+    )
+    .expect("an encoded cell");
+    assert_eq!(cell, stored);
+    assert!(crate::models::qwen3_5::model::arrays_bits_equal_for_test(
+        &logits, &cold
+    )?);
+    Ok(())
 }

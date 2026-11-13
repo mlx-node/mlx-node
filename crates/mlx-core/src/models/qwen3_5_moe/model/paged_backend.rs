@@ -407,7 +407,8 @@ impl Qwen35MoeInner {
     }
 
     /// Opens the lane's state points once the prime put it at `cached`, on
-    /// a load without a draft (a draft load's turns open their own).
+    /// its image lineage, on a load without a draft (a draft load's turns
+    /// open their own).
     pub(crate) fn open_moe_lane_turn(
         &mut self,
         tokens: &[u32],
@@ -423,10 +424,12 @@ impl Qwen35MoeInner {
             Some(crate::engine::governor::ledger::UnitKey::Store(id)) => Some(*id),
             _ => None,
         };
+        let extra_keys =
+            crate::models::qwen3_5::dflash2_turn::lane_image_keys(&*self, tokens.len());
         crate::models::qwen3_5::dflash2_turn::open_lane_turn(
             self,
             tokens,
-            &[],
+            &extra_keys,
             cached,
             cache_salt,
             reuse,

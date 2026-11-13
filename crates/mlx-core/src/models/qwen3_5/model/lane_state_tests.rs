@@ -1169,6 +1169,11 @@ fn image_keys(len: usize, hash: u64) -> Vec<Vec<u64>> {
 /// merge standing in as the token embeddings on a text M-RoPE grid.
 /// Returns the prefix the turn resumed at.
 fn image_turn(inner: &mut Qwen35Inner, tokens: &[u32], hash: u64) -> Result<u32> {
+    image_turn_logits(inner, tokens, hash).map(|(cached, _)| cached)
+}
+
+/// [`image_turn`], with the last row's logits.
+fn image_turn_logits(inner: &mut Qwen35Inner, tokens: &[u32], hash: u64) -> Result<(u32, MxArray)> {
     inner.dflash2_states.generation_suffix = Some(Arc::from(&[2u32, 3][..]));
     let keys = image_keys(tokens.len(), hash);
     let len = tokens.len() as u32;
@@ -1203,7 +1208,16 @@ fn image_turn(inner: &mut Qwen35Inner, tokens: &[u32], hash: u64) -> Result<u32>
     logits.eval();
     inner.publish_dense_gdn_materialized_prefix_checkpoint_with_keys(tokens, &keys, 0, rungs);
     inner.finalize_dense_manual_paged_turn(&image_positions(hash), 0, tokens.len())?;
-    Ok(cached)
+    Ok((cached, logits))
+}
+
+/// The session an image turn of `tokens` over `hash` leaves as the VLM core
+/// leaves it, so a text turn that extends it continues the image lineage.
+fn keep_image_session(inner: &mut Qwen35Inner, tokens: &[u32], hash: u64) {
+    inner.cached_token_history = tokens.to_vec();
+    inner.cached_image_key = Some(hash);
+    inner.cached_paged_image_token_positions = image_positions(hash);
+    inner.cached_rope_deltas = Some(0);
 }
 
 /// Splash `publishReachedStateBoundaries` for an image request, and
@@ -1410,5 +1424,106 @@ fn image_turn_at_a_kv_hit_without_a_state_publishes_whole_windows() -> Result<()
         published, expected,
         "only whole windows past the resume are published"
     );
+    Ok(())
+}
+
+/// Splash `publishReachedStateBoundaries` for a text request that extends an
+/// image conversation: the text turn resumes on the session's live cell
+/// (128) and publishes its replay point (176) under the blocks' image keys.
+/// An image turn of the same prompt over the same image resumes there and
+/// ends on a cold image turn's logits; after a restart a text-only turn of
+/// the same ids restores nothing, while the image turn resumes at 176 from
+/// disk with the stored cell.
+/// Mutations IC1 (a lane with image positions plans no point) and IC2 (the
+/// lane turn opens with no image keys) → red.
+#[test]
+fn text_turn_on_an_image_session_publishes_image_keyed_states() -> Result<()> {
+    const TEST: &str = "text_turn_on_an_image_session_publishes_image_keyed_states";
+    const TAG: &str = "state-tier-image-session-text-turn";
+    const SEED: u64 = 0x5A13_0027;
+    const IMAGE: u64 = 0xA11C_E007;
+    let _plan = SmallPlan::new();
+    let head = prompt(31, 126);
+    let mut tokens = head.clone();
+    tokens.extend((0..61).map(|i| (i * 5 + 2) % 13 + 1));
+    tokens.extend([2, 3]);
+    let Some(mut reference) = plain(SEED, TEST) else {
+        return Ok(());
+    };
+    let (cached, cold) = image_turn_logits(&mut reference, &tokens, IMAGE)?;
+    assert_eq!(cached, 0);
+    drop(reference);
+
+    let Some(mut first) = plain(SEED, TEST) else {
+        return Ok(());
+    };
+    let tier = persistent_test_tier(TAG, 1 << 30);
+    attach(&mut first, &tier);
+    assert_eq!(image_turn(&mut first, &head, IMAGE)?, 0);
+    keep_image_session(&mut first, &head, IMAGE);
+    let before = first.dflash2_states.counters.replay_state_publications;
+    let result = ar_turn(&mut first, &tokens)?;
+    assert_eq!(
+        result.cached_tokens, 128,
+        "the text turn continued the session"
+    );
+    let counters = first.dflash2_states.counters;
+    assert_eq!(counters.replay_state_publications - before, 1);
+    assert_eq!(counters.replay_state_publication_failures, 0);
+    let blocks: Vec<Vec<u64>> = image_keys(tokens.len(), IMAGE)[..3].to_vec();
+    let replay = state_at(&first, 176);
+    assert_eq!(
+        first
+            .dflash2_states
+            .store
+            .get(replay)
+            .expect("the replay point")
+            .extra_keys(),
+        &blocks[..],
+        "the text turn's state carries the image keys"
+    );
+    let stored = cell_bytes(&first, replay);
+    let (cached, logits) = image_turn_logits(&mut first, &tokens, IMAGE)?;
+    assert_eq!(cached, 176);
+    assert!(crate::models::qwen3_5::model::arrays_bits_equal_for_test(
+        &logits, &cold
+    )?);
+    let Some((_tier, mut second)) = reopen_after(first, tier, TAG, SEED, TEST, |_, _| {}, 1)?
+    else {
+        return Ok(());
+    };
+    assert_eq!(
+        states(&second),
+        vec![(176, false, false, true)],
+        "the replay point supersedes the image turn's"
+    );
+    let adopted = state_at(&second, 176);
+    assert_eq!(
+        second
+            .dflash2_states
+            .store
+            .get(adopted)
+            .expect("adopted")
+            .extra_keys(),
+        &blocks[..]
+    );
+    let text = ar_turn(&mut second, &tokens)?;
+    assert_eq!(text.cached_tokens, 0, "a text-only prompt restores nothing");
+    assert!(
+        second.dflash2_states.store.get(adopted).is_some(),
+        "the image-keyed state stays"
+    );
+    let (cached, logits) = image_turn_logits(&mut second, &tokens, IMAGE)?;
+    assert_eq!(cached, 176);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(
+        disk.counters.promotions + disk.counters.promotions_skipped,
+        1
+    );
+    assert_eq!(disk.counters.invalidations, 0);
+    assert_eq!(cell_bytes(&second, adopted), stored);
+    assert!(crate::models::qwen3_5::model::arrays_bits_equal_for_test(
+        &logits, &cold
+    )?);
     Ok(())
 }

@@ -953,10 +953,9 @@ impl Qwen35MoeInner {
         self.cached_rope_deltas = None;
     }
 
-    /// The live GDN state agrees with its tokens and no image lineage rides
-    /// on it.
+    /// The live GDN state agrees with its tokens.
     pub(crate) fn dflash2_replay_state_exact(&self) -> bool {
-        !self.paged_gdn_state_dirty && self.cached_paged_image_token_positions.is_empty()
+        !self.paged_gdn_state_dirty
     }
 
     /// The lane's draft ring and context window go to the idle lane (Splash

@@ -131,8 +131,8 @@ pub(crate) trait DFlash2Target: ChatBackend {
         window: DFlash2ContextCache,
         history: Vec<u32>,
     );
-    /// The live GDN state agrees with its tokens and carries no image
-    /// lineage, so a state captured from it is exact on a text chain.
+    /// The live GDN state agrees with its tokens, so a state captured from
+    /// it is exact on its chain.
     fn replay_state_exact(&self) -> bool;
     /// Drops the draft state a tapped prefill handed the stepper.
     fn dflash2_turn_state_clear(&mut self);
@@ -666,6 +666,17 @@ fn open_turn<T: DFlash2Target>(
     Ok(plan)
 }
 
+/// The per-block image keys the lane's blocks of its first `tokens` rows
+/// register with; none on a text chain.
+pub(crate) fn lane_image_keys<T: DFlash2Target>(target: &T, tokens: usize) -> Vec<Vec<u64>> {
+    let keys = target.paged_block_keys(tokens);
+    if keys.iter().all(Vec::is_empty) {
+        Vec::new()
+    } else {
+        keys
+    }
+}
+
 /// Reopens the running turn's points from 0: its restore did not happen.
 fn reopen_cold<T: DFlash2Target>(target: &mut T, tokens: &[u32], prompt: u32) -> Result<()> {
     if let Some((salt, junction, reuse)) = target
@@ -998,9 +1009,9 @@ pub(crate) fn prime_dflash2_turn<T: DFlash2Target, P: crate::engine::backend::Pa
 
 /// Plans the DFlash2 prefill of `tokens` from `cached` in chunks of
 /// `chunk_rows` on the turn's points (Splash `reserveCaptures` passes a
-/// checkpoint the same chunk carries past). A lane whose GDN state is not
-/// exact on a text chain captures nothing: its points go. Returns the plan
-/// and the rows a chunk ends at to capture.
+/// checkpoint the same chunk carries past), on the lane's image lineage. A
+/// lane whose GDN state is not exact captures nothing: its points go.
+/// Returns the plan and the rows a chunk ends at to capture.
 pub(crate) fn turn_plan<T: DFlash2Target>(
     target: &mut T,
     tokens: &[u32],
@@ -1021,8 +1032,16 @@ pub(crate) fn turn_plan<T: DFlash2Target>(
             (turn.junction, turn.latest_checkpoint, turn.reuse)
         });
     let prompt = turn_prompt(&*target, tokens);
+    let extra_keys = lane_image_keys(&*target, tokens.len());
     let mut plan = open_turn(
-        target, tokens, prompt, resume, junction, cache_salt, reuse, None,
+        target,
+        tokens,
+        prompt,
+        resume,
+        junction,
+        cache_salt,
+        reuse,
+        Some(extra_keys),
     )?;
     if !target.replay_state_exact() {
         plan.boundaries.clear();
@@ -2152,8 +2171,8 @@ impl crate::models::qwen3_5::paged_forward::PrefillTapSink for LaneStateSink {
 /// disk copy resident under an optional claim (Splash `promotedCopy`), a
 /// checkpoint the lane's rolling one, and the prompt's replay point the
 /// turn's own, in use until the turn ends. A lane whose GDN state is not
-/// exact on its chain plans no point. `extra_keys` are the lineage's
-/// per-block image keys (an image turn's), none on a text chain.
+/// exact plans no point. `extra_keys` are the lineage's per-block image
+/// keys (an image lineage's), none on a text chain.
 pub(crate) fn open_lane_turn<T: DFlash2Target>(
     target: &mut T,
     tokens: &[u32],
@@ -2438,10 +2457,11 @@ where
     } else {
         0
     };
+    let extra_keys = lane_image_keys(&*target, tokens.len());
     open_lane_turn_at(
         target,
         tokens,
-        &[],
+        &extra_keys,
         cached,
         cache_salt,
         reuse_cache,
