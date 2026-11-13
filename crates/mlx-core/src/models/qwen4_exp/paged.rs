@@ -1,6 +1,8 @@
 //! QSA pages store only full-attention K/V. GDN, PLE and the compressed
-//! indexer remain request-owned; a KV-only prefix is never admitted.
-use super::{Inner, Step};
+//! indexer remain request-owned; a KV-only prefix is never admitted. A
+//! prefix resumes only where a stored state holds that request-owned cell
+//! (`prefix_state`) and the prefix cache still holds every block below it.
+use super::{Inner, Step, prefix_state};
 use crate::array::MxArray;
 use crate::engine::backend::{PagedBackend, PagedPrefix};
 use crate::engine::hybrid_scheduler::{
@@ -9,6 +11,7 @@ use crate::engine::hybrid_scheduler::{
 use crate::engine::paged_stepper::PagedStepper;
 use crate::stream::Stream;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
+use crate::vision::qwen::prompt::IMAGE_TOKEN_ID;
 use napi::{Error, Result};
 use std::sync::{Arc, Mutex};
 
@@ -232,6 +235,9 @@ impl PagedBackend for Inner {
     ) -> Result<Prefix> {
         let seq = self.active_seq.unwrap_or(0);
         self.activate_paged_seq(seq)?;
+        self.prefix_states.end_turn(seq);
+        // A live continuation needs the row's whole history (decode rows
+        // included) as the prompt's prefix; it publishes no state.
         let warm = reuse
             && !self.decoder.history.is_empty()
             && tokens.len() > self.decoder.history.len()
@@ -240,26 +246,51 @@ impl PagedBackend for Inner {
             self.decoder.reset();
             self.saved_history.clear();
         }
+        // Token ids do not identify an image: an image row neither resumes
+        // nor publishes.
+        let text = reuse
+            && !warm
+            && self.media_prefill.is_none()
+            && !tokens.contains(&(IMAGE_TOKEN_ID as u32));
+        let grid = self.decoder.prefill_slice_size();
+        let keys = if text {
+            prefix_state::pass_keys(tokens, grid)
+        } else {
+            Vec::new()
+        };
+        let hit = if text {
+            let adapter =
+                self.decoder.paged.as_ref().ok_or_else(|| {
+                    Error::from_reason("Qwen4 prefix preparation has no paged cache")
+                })?;
+            self.prefix_states.prune(adapter, grid);
+            self.prefix_states.lookup(tokens, &keys, salt)
+        } else {
+            None
+        };
         let adapter = self
             .decoder
             .paged
             .as_mut()
             .ok_or_else(|| Error::from_reason("Qwen4 prefix preparation has no paged cache"))?;
-        // skip_lookup disallows KV-only prefix restores: recurrent/indexer/PLE
-        // state cannot be reconstructed from attention pages.
+        // Without a stored state the lookup stays off: GDN, indexer and PLE
+        // state cannot be rebuilt from attention pages.
         let plan = adapter
-            .prepare_turn_with_max_cache_hit_tokens(
+            .prepare_turn_per_block_with_max_cache_hit_tokens(
                 seq,
                 tokens,
                 tokens.len() as u32,
                 warm,
-                &[],
+                &keys,
                 salt,
-                true,
-                tokens.len().saturating_sub(1) as u32,
+                hit.is_none(),
+                hit.map_or(tokens.len().saturating_sub(1), |hit| hit.depth) as u32,
             )
             .map_err(Error::from_reason)?;
-        if plan.cached_prefix_len as usize != self.decoder.history.len() {
+        let expected = hit.map_or(self.decoder.history.len(), |hit| hit.depth);
+        let mut resumed = None;
+        let mut cached = 0;
+        if plan.cached_prefix_len as usize != expected {
             adapter
                 .reset_for_new_request(seq)
                 .map_err(Error::from_reason)?;
@@ -267,68 +298,82 @@ impl PagedBackend for Inner {
                 .allocate_suffix_blocks(tokens.len() as u32)
                 .map_err(Error::from_reason)?;
             self.decoder.reset();
-            return Ok(Prefix {
-                cached: 0,
-                suffix: tokens.len(),
-            });
+        } else if let Some(hit) = hit {
+            cached = hit.depth;
+            let entry = self
+                .prefix_states
+                .store
+                .get(hit.id)
+                .ok_or_else(|| Error::from_reason("Qwen4 stored state vanished at restore"))?;
+            self.decoder
+                .restore_cell(entry.state(), &tokens[..hit.depth])?;
+            let mark = entry.mark();
+            self.prefix_states.store.touch(hit.id);
+            self.prefix_states.counters.restored += 1;
+            // The draft cache of an earlier turn on this sequence holds
+            // another history at this row.
+            self.mtp.forget(seq);
+            resumed = Some(mark);
+            tracing::debug!(
+                target: "mlx_core::qwen4_exp::prefix",
+                seq,
+                cached = hit.depth,
+                prompt = tokens.len(),
+                "resumed from a stored state"
+            );
+        } else {
+            cached = expected;
+        }
+        if text {
+            self.open_prefix_turn(seq, tokens, keys, salt, cached, resumed);
         }
         Ok(Prefix {
-            cached: plan.cached_prefix_len as usize,
-            suffix: plan.suffix_len as usize,
+            cached,
+            suffix: tokens.len() - cached,
         })
     }
     fn paged_prefill(&mut self, tokens: &[u32], _: &Prefix, stream: Stream) -> Result<MxArray> {
         let _context = crate::stream::StreamContext::new(stream);
+        let seq = self.active_seq.unwrap_or(0);
         // Group mode follows the direct-fill state at execution time.
         if self.media_prefill.is_none() && self.decoder.group_mode(tokens.len()) {
-            let seq = self.active_seq.unwrap_or(0);
-            let (windows, tail) = self.decoder.group_windows(tokens);
-            let tracking = self.mtp_tracking(seq);
-            let (logits, views) = self.decoder.prefill_group(&windows, tail, true, tracking)?;
-            if tracking {
-                for (window, hidden) in windows.iter().zip(&views) {
-                    self.observe_mtp(seq, window, hidden)?;
-                }
-                if !tail.is_empty() {
-                    let hidden = self.decoder.last_chunk_hidden.clone();
-                    self.observe_mtp(seq, tail, &hidden)?;
-                }
-            }
-            return logits.squeeze(Some(&[1]));
-        }
-        let mut logits = None;
-        // Read the admitted window before every pass.
-        let mut start = 0;
-        while start < tokens.len() {
-            let window = self.decoder.prefill_slice_size();
-            let end = (start + window).min(tokens.len());
-            let chunk = &tokens[start..end];
-            let next = &tokens[end..(end + window).min(tokens.len())];
+            // A group ends at the deepest checkpoint and the replay point
+            // inside it, so it never holds a captured cell of its own.
             let base = self.decoder.history.len();
-            let embeddings = if let Some(media) = &self.media_prefill {
-                self.decoder.positions = media.positions.clone();
-                self.decoder.rope_delta = media.delta;
-                self.decoder.media_digests = media.digests.clone();
-                Some(
-                    media
-                        .embeddings
-                        .slice_axis(1, base as i64, (base + chunk.len()) as i64)?,
-                )
-            } else {
-                None
-            };
-            logits = Some(self.decoder.prefill_chunk_ahead(
-                chunk,
-                next,
-                embeddings.as_ref(),
-                end == tokens.len(),
-            )?);
-            let hidden = self.decoder.last_chunk_hidden.clone();
-            self.observe_mtp(self.active_seq.unwrap_or(0), chunk, &hidden)?;
-            start = end;
+            let cuts = self
+                .prefix_states
+                .turns
+                .get(&seq)
+                .map(|turn| turn.group_cuts(base, base + tokens.len()))
+                .unwrap_or_default();
+            let mut logits = None;
+            let mut start = 0;
+            for end in cuts
+                .into_iter()
+                .map(|cut| cut - base)
+                .chain(std::iter::once(tokens.len()))
+            {
+                let part = &tokens[start..end];
+                let last = end == tokens.len();
+                let from = base + start;
+                logits = Some(if self.decoder.group_mode(part.len()) {
+                    let logits = self.prefill_group_part(seq, part, last)?;
+                    let grid = self.decoder.prefill_slice_size().max(1);
+                    let prompt_len = self.prefix_turn_prompt_len(seq);
+                    let cut_ok = from.is_multiple_of(grid)
+                        && (part.len().is_multiple_of(grid) || base + end == prompt_len);
+                    self.reach_prefix_point(seq, base + end, cut_ok);
+                    logits
+                } else {
+                    self.prefill_windows(seq, tokens, start, end)?
+                });
+                start = end;
+            }
+            return logits
+                .ok_or_else(|| Error::from_reason("Qwen4 empty paged prefill"))?
+                .squeeze(Some(&[1]));
         }
-        logits
-            .ok_or_else(|| Error::from_reason("Qwen4 empty paged prefill"))?
+        self.prefill_windows(seq, tokens, 0, tokens.len())?
             .squeeze(Some(&[1]))
     }
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
@@ -345,7 +390,11 @@ impl PagedBackend for Inner {
         // `run_paged_turn` refuses it before prefill.
         Ok(false)
     }
+    /// The row stays live without publishing its blocks: rows a decode wrote
+    /// are not what a cold prefill writes. States published during the
+    /// prefill stay.
     fn finalize_paged_turn(&mut self, reuse: bool, _: u64) {
+        self.prefix_states.end_turn(self.active_seq.unwrap_or(0));
         if let Some(adapter) = &mut self.decoder.paged {
             let result = if reuse {
                 adapter.finalize_turn_keep_live_no_prefix()
@@ -369,7 +418,10 @@ impl PagedBackend for Inner {
         };
         Ok(())
     }
+    /// States published before the failure stay: each was published only
+    /// once its blocks were registered.
     fn abort_paged_turn(&mut self) {
+        self.prefix_states.end_turn(self.active_seq.unwrap_or(0));
         if let Some(adapter) = &mut self.decoder.paged {
             let _ = adapter.release_request();
         }
@@ -429,6 +481,294 @@ impl Inner {
     }
 }
 impl Inner {
+    /// Opens `seq`'s points for a text turn of `tokens` (block keys `keys`)
+    /// that resumes at `resume`, with the block of the state it resumed from
+    /// in use.
+    fn open_prefix_turn(
+        &mut self,
+        seq: SeqId,
+        tokens: &[u32],
+        mut keys: Vec<Vec<u64>>,
+        salt: u64,
+        resume: usize,
+        resumed: Option<u64>,
+    ) {
+        let grid = self.decoder.prefill_slice_size();
+        let states = &mut self.prefix_states;
+        let replay = prefix_state::replay_row(tokens, states.turn_open, grid);
+        let points = prefix_state::plan_points(resume, replay, grid, states.interval);
+        if points.is_empty() && resumed.is_none() {
+            return;
+        }
+        let last = points.last().map_or(0, |point| point.row);
+        let blocks = last / prefix_state::BLOCK_ROWS;
+        keys.truncate(blocks);
+        let chain = if blocks == 0 {
+            Vec::new()
+        } else {
+            crate::models::qwen3_5::gdn_checkpoint_store::compute_paged_prefix_block_hashes(
+                tokens,
+                last as u32,
+                prefix_state::BLOCK_ROWS as u32,
+                &keys,
+                salt,
+            )
+            .unwrap_or_default()
+        };
+        let uses = resumed.into_iter().collect::<Vec<_>>();
+        for &block in &uses {
+            states.store.use_state(block);
+        }
+        states.turns.insert(
+            seq,
+            prefix_state::Turn {
+                salt,
+                prompt_len: tokens.len(),
+                lineage: tokens[..last].to_vec(),
+                canonical: chain.len() == blocks,
+                chain,
+                keys,
+                points,
+                cursor: 0,
+                uses,
+                checkpoint: None,
+            },
+        );
+    }
+
+    fn prefix_turn_prompt_len(&self, seq: SeqId) -> usize {
+        self.prefix_states
+            .turns
+            .get(&seq)
+            .map_or(usize::MAX, |turn| turn.prompt_len)
+    }
+
+    /// What stored states may hold now (see [`super::memory::state_room`]).
+    pub(super) fn state_room(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(room) = self.prefix_states.room_override {
+            return room;
+        }
+        let c = &self.decoder.config;
+        let held = (self.rows.len() + usize::from(self.active_seq.is_some())) as u64
+            * super::memory::row_state_bytes(c)
+            + self.mtp.held_bytes(c);
+        super::memory::state_room(
+            self.memory_plan.dynamic_budget_bytes,
+            super::memory::prefill_scratch(
+                c,
+                self.decoder.prefill_chunk_size,
+                self.decoder.context_window,
+            ),
+            &self.pool_charge(),
+            held,
+        )
+    }
+
+    /// A pass of `seq` ended at row `end`; `cut_ok` tells whether it was the
+    /// pass a cold prefill runs there. A planned point there is published
+    /// while every pass so far was.
+    fn reach_prefix_point(&mut self, seq: SeqId, end: usize, cut_ok: bool) {
+        let Some(turn) = self.prefix_states.turns.get_mut(&seq) else {
+            return;
+        };
+        let Some(point) = turn.reach(end, cut_ok) else {
+            return;
+        };
+        if !turn.canonical {
+            self.prefix_states.counters.refused_off_grid += 1;
+            return;
+        }
+        self.publish_prefix_point(seq, point);
+    }
+
+    /// Splash `Engine::publishReachedStateBoundaries` for one point: the
+    /// states to drop for room are chosen (checkpoints first), the request's
+    /// blocks below the point are registered, then those states go and the
+    /// cell is stored. A refusal drops nothing, costs reuse and never fails
+    /// the turn. A checkpoint retires the turn's previous one; the replay
+    /// point is in use until the turn ends. A block already cached under its
+    /// pass key came from the same pass over the same tokens, so the cache
+    /// keeping the first one gives this state the rows it was computed on.
+    fn publish_prefix_point(&mut self, seq: SeqId, point: prefix_state::Point) {
+        use crate::models::qwen3_5::dflash2_state::store::{Lineage, StateClass, lineage_bytes};
+        let row = point.row;
+        let blocks = row / prefix_state::BLOCK_ROWS;
+        let grid = self.decoder.prefill_slice_size();
+        let Some(adapter) = self.decoder.paged.as_ref() else {
+            return;
+        };
+        // Prune before registering: a state whose chain lost a block must
+        // be gone before that hash can be registered again by another run.
+        self.prefix_states.prune(adapter, grid);
+        let Some(turn) = self.prefix_states.turns.get_mut(&seq) else {
+            return;
+        };
+        if turn.chain.len() < blocks || turn.keys.len() < blocks {
+            self.prefix_states.counters.refused_register += 1;
+            turn.canonical = false;
+            return;
+        }
+        let need = super::memory::state_cell_bytes(&self.decoder.config)
+            .saturating_add(lineage_bytes(row, blocks));
+        let room = self.state_room();
+        let Some((victims, freed)) = self.prefix_states.room_for(room, need) else {
+            self.prefix_states.counters.refused_room += 1;
+            return;
+        };
+        let live = super::memory::host_memory().is_ok_and(|host| {
+            super::memory::state_fits_live(
+                &host,
+                crate::array::memory::anonymous_active_memory(),
+                self.decoder
+                    .weights
+                    .active_limit(crate::cache_limit::coordinator().registered_pool_bytes()),
+                need.saturating_sub(freed),
+                self.decoder.weights.plan.use_direct_turn_floor(),
+            )
+        });
+        if !live {
+            self.prefix_states.counters.refused_live += 1;
+            return;
+        }
+        let Some(adapter) = self.decoder.paged.as_mut() else {
+            return;
+        };
+        let states = &mut self.prefix_states;
+        let Some(turn) = states.turns.get_mut(&seq) else {
+            return;
+        };
+        let registered = adapter
+            .register_committed_blocks(row, &turn.keys[..blocks], turn.salt)
+            .is_ok()
+            && turn.chain[..blocks]
+                .iter()
+                .all(|&hash| adapter.prefix_cached(hash));
+        if !registered {
+            states.counters.refused_register += 1;
+            turn.canonical = false;
+            return;
+        }
+        for id in victims {
+            if states.store.remove(id) {
+                states.counters.dropped_memory += 1;
+            }
+        }
+        let cell = match self.decoder.cell(grid) {
+            Ok(Some(cell)) => cell,
+            Ok(None) | Err(_) => {
+                states.counters.refused_register += 1;
+                return;
+            }
+        };
+        let class = if point.checkpoint {
+            StateClass::Checkpoint
+        } else {
+            StateClass::Ordinary
+        };
+        let inserted = match states.store.insert(
+            Lineage {
+                tokens: &turn.lineage[..row],
+                extra_keys: &turn.keys[..blocks],
+                salt: turn.salt,
+            },
+            cell,
+            class,
+        ) {
+            Ok(inserted) => inserted,
+            Err(_) => {
+                states.counters.refused_register += 1;
+                return;
+            }
+        };
+        states.counters.published += 1;
+        if point.checkpoint {
+            if let Some(old) = turn.checkpoint.replace(inserted.id)
+                && old != inserted.id
+                && states.store.checkpoint_state(old).is_some()
+                && states.store.remove(old)
+            {
+                states.counters.retired += 1;
+            }
+        } else if let Some(mark) = states.store.get(inserted.id).map(|entry| entry.mark()) {
+            states.store.use_state(mark);
+            turn.uses.push(mark);
+        }
+        tracing::debug!(
+            target: "mlx_core::qwen4_exp::prefix",
+            seq,
+            row,
+            checkpoint = point.checkpoint,
+            states = states.store.bytes().entries,
+            bytes = states.store.bytes().state_bytes,
+            "published a stored state"
+        );
+    }
+
+    /// One layer-major group over `tokens` (and its tail), observed by the
+    /// MTP owner per window.
+    fn prefill_group_part(&mut self, seq: SeqId, tokens: &[u32], last: bool) -> Result<MxArray> {
+        let (windows, tail) = self.decoder.group_windows(tokens);
+        let tracking = self.mtp_tracking(seq);
+        let (logits, views) = self.decoder.prefill_group(&windows, tail, last, tracking)?;
+        if tracking {
+            for (window, hidden) in windows.iter().zip(&views) {
+                self.observe_mtp(seq, window, hidden)?;
+            }
+            if !tail.is_empty() {
+                let hidden = self.decoder.last_chunk_hidden.clone();
+                self.observe_mtp(seq, tail, &hidden)?;
+            }
+        }
+        Ok(logits)
+    }
+
+    /// `tokens[from..to]` one pass at a time, the admitted window read
+    /// before every pass; the logits of the last pass.
+    fn prefill_windows(
+        &mut self,
+        seq: SeqId,
+        tokens: &[u32],
+        from: usize,
+        to: usize,
+    ) -> Result<MxArray> {
+        let mut logits = None;
+        let mut start = from;
+        while start < to {
+            let window = self.decoder.prefill_pass_window();
+            let end = (start + window).min(to);
+            let chunk = &tokens[start..end];
+            let next = &tokens[end..(end + window).min(tokens.len())];
+            let base = self.decoder.history.len();
+            let embeddings = if let Some(media) = &self.media_prefill {
+                self.decoder.positions = media.positions.clone();
+                self.decoder.rope_delta = media.delta;
+                self.decoder.media_digests = media.digests.clone();
+                Some(
+                    media
+                        .embeddings
+                        .slice_axis(1, base as i64, (base + chunk.len()) as i64)?,
+                )
+            } else {
+                None
+            };
+            logits = Some(self.decoder.prefill_chunk_ahead(
+                chunk,
+                next,
+                embeddings.as_ref(),
+                end == tokens.len(),
+            )?);
+            let hidden = self.decoder.last_chunk_hidden.clone();
+            self.observe_mtp(seq, chunk, &hidden)?;
+            let reached = base + chunk.len();
+            let cut_ok = base.is_multiple_of(window.max(1))
+                && (chunk.len() == window || reached == self.prefix_turn_prompt_len(seq));
+            self.reach_prefix_point(seq, reached, cut_ok);
+            start = end;
+        }
+        logits.ok_or_else(|| Error::from_reason("Qwen4 empty paged prefill"))
+    }
+
     /// The model's wired lease: the store's budget and the plan's dynamic
     /// budget, which holds the pool, the rows' state and the transient.
     pub(super) fn wired_bytes(&self) -> usize {
@@ -568,13 +908,18 @@ impl HybridSchedulerBackend for Inner {
                 &self.pool_charge(),
             ),
             held: (self.rows.len() + usize::from(self.active_seq.is_some())) as u64 * row
-                + self.mtp.held_bytes(c),
+                + self.mtp.held_bytes(c)
+                + self.prefix_states.bytes(),
         })
     }
     /// The state budget is charged for every block the pool holds, and the
-    /// pool only grows: a refused state need takes its free extents back
-    /// (Splash `Cache::releaseExtent`), cached pages last.
+    /// pool only grows: a refused state need takes stored states first (rows
+    /// outrank them), then the pool's free extents back (Splash
+    /// `Cache::releaseExtent`), cached pages last.
     fn reclaim_for_scheduled_state(&mut self, shortfall: u64) -> bool {
+        if self.prefix_states.reclaim(shortfall) > 0 {
+            return true;
+        }
         let Some(paged) = self.decoder.paged.as_mut() else {
             return false;
         };
@@ -625,7 +970,28 @@ impl HybridSchedulerBackend for Inner {
         self.park_row();
         Ok(())
     }
+    /// A preempted turn's blocks go back without publication: its rows past
+    /// the last stored state include decode rows, which are not what a cold
+    /// prefill writes. Its replay resumes from its stored states.
+    fn preempt_scheduled_cache(
+        &mut self,
+        seq: SeqId,
+        _: u64,
+        _: crate::engine::scheduler::PreemptionMode,
+    ) -> Result<()> {
+        self.prefix_states.end_turn(seq);
+        let adapter = self.decoder.paged.as_mut().ok_or_else(|| {
+            Error::from_reason("qwen4_exp cache manager is unavailable during preemption")
+        })?;
+        if adapter.block_table_for(seq).is_some() {
+            adapter
+                .release_request_for(seq)
+                .map_err(Error::from_reason)?;
+        }
+        Ok(())
+    }
     fn release_scheduled_recurrent_for(&mut self, seq: SeqId) {
+        self.prefix_states.end_turn(seq);
         self.rows.remove(&seq);
         self.mtp.release(seq);
         if self.active_seq == Some(seq) {

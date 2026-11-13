@@ -4,6 +4,10 @@
 //! the ordinary loader. This never predicts an expert or approximates routing.
 use super::*;
 
+/// Decode tokens a request runs on the ordinary path after its tentative
+/// route missed the slots; the request keeps the count across row switches.
+const ROUTE_MISS_COOLDOWN: usize = 16;
+
 impl Decoder {
     pub(in super::super) fn deferred_state_submission(&self) -> bool {
         self.device_routes.is_some()
@@ -187,6 +191,10 @@ impl Decoder {
                 .map_err(Error::from_reason)?;
         }
         self.restore_state(base);
+        self.weights
+            .live
+            .route_replays
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The tentative pass already requested the next window's rows.
         self.prefill_chunk_inner(tokens, &[], embeddings, project)
     }
@@ -389,7 +397,6 @@ impl Decoder {
             return Ok(out);
         }
         drop(out);
-        self.device_route_cooldown = 16;
         self.replay_device_token(base, token, project)
     }
 
@@ -411,6 +418,11 @@ impl Decoder {
                 .map_err(Error::from_reason)?;
         }
         self.restore_state(base);
+        self.device_route_cooldown = ROUTE_MISS_COOLDOWN;
+        self.weights
+            .live
+            .route_replays
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.ordinary_token(token, project)
     }
 }

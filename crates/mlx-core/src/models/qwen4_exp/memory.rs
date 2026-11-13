@@ -103,7 +103,7 @@ impl Drop for TestHostGuard {
 
 /// A constrained host whose tiny direct fixtures fit the unchanged reserves.
 #[cfg(test)]
-fn fixture_host() -> HostMemory {
+pub(super) fn fixture_host() -> HostMemory {
     HostMemory {
         physical: 16 << 30,
         free: 8 << 30,
@@ -723,24 +723,64 @@ pub(super) fn scheduled_state_budget(dynamic: u64, transient: u64, pool: &PoolCh
         .saturating_sub(pool.bytes())
 }
 
-/// The prefill chunk the live host admits for a sequence of up to `context`
-/// tokens: the plan prices `MAX_PREFILL_CHUNK`, and only a host that cannot
-/// hold its scratch beside the store halves it.
-pub(super) fn prefill_window(c: &super::config::Config, plan: &Plan, context: usize) -> usize {
-    let anonymous_budget = plan.budget.saturating_sub(plan.direct_bytes);
-    let allowance = match (plan.available_bytes, plan.physical_bytes) {
-        (Some(a), Some(p)) => {
-            let reserve = if plan.partial_direct_gate {
-                DIRECT_TURN_FLOOR
-            } else {
-                system_reserve(p) + (2 << 30)
-            };
-            a.saturating_sub(anonymous_budget + reserve)
-        }
-        _ => u64::MAX,
+/// One stored state at a grid line: the cell without indexer keys waiting
+/// for a block (none wait at a multiple of the compress ratio).
+pub(super) fn state_cell_bytes(c: &super::config::Config) -> u64 {
+    let [conv, recurrent, ple, _] = row_state_parts(c);
+    conv + recurrent + ple
+}
+
+/// What stored states may hold: the dynamic budget less one pass's transient
+/// and the pool, the pool charged as it is and at its largest, so a state
+/// never takes room the pool can still grow into, less what the lanes'
+/// rows and draft state hold (`held`).
+pub(super) fn state_room(dynamic: u64, transient: u64, pool: &PoolCharge, held: u64) -> u64 {
+    let largest = PoolCharge {
+        total_blocks: pool.max_blocks.max(pool.total_blocks),
+        max_blocks: pool.max_blocks.max(pool.total_blocks),
+        physical_block_bytes: pool.physical_block_bytes,
+        growth_copy_bytes: 0,
+    };
+    scheduled_state_budget(dynamic, transient, pool)
+        .min(scheduled_state_budget(dynamic, transient, &largest))
+        .saturating_sub(held)
+}
+
+/// Whether a state of `bytes` leaves the host the headroom a pass checks
+/// for and keeps MLX's active memory within the SSD read limit: the plan's
+/// room is a ledger, these are the live readings the passes refuse on.
+pub(super) fn state_fits_live(
+    host: &HostMemory,
+    active: f64,
+    limit: Option<u64>,
+    bytes: u64,
+    direct_gate: bool,
+) -> bool {
+    let floor = if direct_gate {
+        DIRECT_TURN_FLOOR
+    } else {
+        system_reserve(host.physical)
+    };
+    host.available() >= floor.saturating_add(bytes)
+        && limit.is_none_or(|limit| active + bytes as f64 <= limit as f64)
+}
+
+/// The rows of a prefill pass that ends at up to `context` tokens. Every
+/// store prefills the `MAX_PREFILL_CHUNK` rows the memory plan prices (Splash
+/// sizes its arenas for one fixed chunk; live free memory never cuts it). A
+/// store whose host gate refused the whole bank set holds its slots beside the
+/// `reserved` scratch that gate priced at the allowance context, so a longer
+/// sequence halves the pass until its scratch fits there.
+pub(super) fn prefill_window(
+    c: &super::config::Config,
+    reserved: Option<u64>,
+    context: usize,
+) -> usize {
+    let Some(reserved) = reserved else {
+        return super::MAX_PREFILL_CHUNK;
     };
     let mut window = super::MAX_PREFILL_CHUNK;
-    while window > 1 && prefill_scratch(c, window, context) > allowance {
+    while window > 1 && prefill_scratch(c, window, context) > reserved {
         window /= 2;
     }
     window
@@ -787,29 +827,26 @@ pub(crate) fn flash_next_config() -> super::config::Config {
     .unwrap()
 }
 
+/// Without a refused gate every pass is the whole chunk. With one, a pass
+/// keeps the chunk up to the context the gate priced, one byte less halves
+/// it, and a pass at a longer context halves until its scratch fits the
+/// reservation.
 #[test]
-fn direct_prefill_window_excludes_the_full_bank_bytes_from_anonymous_scratch() {
+fn prefill_window_halves_only_past_the_scratch_a_refused_gate_reserved() {
     let c = flash_next_config();
-    let mut direct = tests::plan_without_snapshot();
-    direct.available_bytes = Some(112 << 30);
-    direct.physical_bytes = Some(128 << 30);
-    direct.budget = 80 << 30;
-    direct.direct = true;
-    direct.direct_bytes = 73 << 30;
-    direct.direct_layers = 48;
-    let mut without_bank_charge = direct.clone();
-    without_bank_charge.direct_bytes = 0;
-    without_bank_charge.direct_layers = 0;
-    without_bank_charge.budget = 7 << 30;
-    let context = 65_536;
-    assert_eq!(
-        prefill_window(&c, &direct, context),
-        prefill_window(&c, &without_bank_charge, context)
-    );
-    assert_eq!(
-        prefill_window(&c, &direct, context),
-        super::MAX_PREFILL_CHUNK
-    );
+    let chunk = super::MAX_PREFILL_CHUNK;
+    assert_eq!(prefill_window(&c, None, 262_144), chunk);
+    for context in [65_536, 262_144] {
+        let priced = prefill_scratch(&c, chunk, context);
+        assert_eq!(prefill_window(&c, Some(priced), context), chunk);
+        assert_eq!(prefill_window(&c, Some(priced - 1), context), chunk / 2);
+    }
+    let reserved = prefill_scratch(&c, chunk, 65_536);
+    let long = prefill_window(&c, Some(reserved), 262_144);
+    assert!((2..chunk).contains(&long), "{long} rows");
+    assert!(prefill_scratch(&c, long, 262_144) <= reserved);
+    assert!(prefill_scratch(&c, long * 2, 262_144) > reserved);
+    assert_eq!(prefill_window(&c, Some(0), 262_144), 1);
 }
 
 /// The Flash Next cell on its storage: 36 linear layers of 3 bf16 conv
@@ -874,4 +911,66 @@ fn flash_next_parked_owners_charge_their_waiting_hidden_rows() {
         ),
         ScheduledStateFit::Fits
     );
+}
+
+/// A Flash Next state at a grid line is the cell without pending index
+/// keys: 2,211,840 + 113,246,208 + 184,320 = 115,642,368 B, plus 4 B per
+/// lineage token and 8 B per lineage block. On the plan numbers of a busy
+/// host (dynamic 10,724,034,662 B, transient 5,746,196,480 B, a pool of
+/// 8,192 int8 pages of 423,936 B, one row held) the room holds 12 states of
+/// 4,096-token lineages and 11 of 61,440-token ones.
+/// Mutation: `state_room` charges the pool only as it is now (64 pages) →
+/// red (the room grows past 40 states).
+#[test]
+fn flash_next_states_fit_the_room_the_plan_leaves() {
+    use crate::models::qwen3_5::dflash2_state::store::lineage_bytes;
+    let c = flash_next_config();
+    assert_eq!(state_cell_bytes(&c), 115_642_368);
+    let state = |tokens: usize| state_cell_bytes(&c) + lineage_bytes(tokens, tokens / 32);
+    let pool = |total_blocks: u64| PoolCharge {
+        total_blocks,
+        max_blocks: 8_192,
+        physical_block_bytes: 423_936,
+        growth_copy_bytes: total_blocks * 423_936 / 12,
+    };
+    let room =
+        |pool: &PoolCharge| state_room(10_724_034_662, 5_746_196_480, pool, row_state_bytes(&c));
+    assert_eq!(room(&pool(8_192)), 1_389_302_886);
+    assert_eq!(room(&pool(64)), room(&pool(8_192)));
+    assert_eq!(room(&pool(8_192)) / state(4_096), 12);
+    assert_eq!(room(&pool(8_192)) / state(61_440), 11);
+}
+
+/// A state is refused when it would leave the host less than the pass
+/// gate's floor, or MLX's active memory past the SSD read limit.
+/// Mutation: `state_fits_live` drops the state's bytes from the host check
+/// → red.
+#[test]
+fn a_state_keeps_the_live_headroom_a_pass_checks() {
+    let host = HostMemory {
+        physical: 128 << 30,
+        free: 10 << 30,
+        file: 6 << 30,
+        ..HostMemory::default()
+    };
+    let floor = system_reserve(host.physical);
+    assert_eq!(floor, 16 << 30);
+    assert!(!state_fits_live(&host, 0.0, None, 1, false));
+    assert!(state_fits_live(&host, 0.0, None, 0, false));
+    assert!(state_fits_live(&host, 0.0, None, 14 << 30, true));
+    assert!(!state_fits_live(&host, 0.0, None, (14 << 30) + 1, true));
+    assert!(state_fits_live(
+        &host,
+        1e9,
+        Some(2_000_000_000),
+        1_000_000_000,
+        true
+    ));
+    assert!(!state_fits_live(
+        &host,
+        1e9,
+        Some(2_000_000_000),
+        1_000_000_001,
+        true
+    ));
 }

@@ -1237,3 +1237,58 @@ async fn capture_base_fixture_goldens() {
     }
     fs::remove_dir_all(&work).ok();
 }
+
+/// Invented GGUF GPT-2 vocabulary in the Qwen layout: the 256 byte-level
+/// symbols as NORMAL rows, then CONTROL `<|endoftext|>` / `<|im_start|>` /
+/// `<|im_end|>`, USER_DEFINED `<tool_call>` / `</tool_call>` / `<think>` /
+/// `</think>`, and one UNUSED row. `overrides` replace a row's type by token.
+pub(crate) fn qwen_tag_tokenizer_metadata(
+    overrides: &[(&str, i32)],
+) -> HashMap<String, GgufMetaValue> {
+    let mut alphabet: Vec<char> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
+        .into_iter()
+        .collect();
+    alphabet.sort_unstable();
+    let mut tokens: Vec<String> = alphabet.iter().map(char::to_string).collect();
+    let mut types = vec![1; tokens.len()];
+    for (token, token_type) in [
+        ("<|endoftext|>", 3),
+        ("<|im_start|>", 3),
+        ("<|im_end|>", 3),
+        ("<tool_call>", 4),
+        ("</tool_call>", 4),
+        ("<think>", 4),
+        ("</think>", 4),
+        ("<|unused_0|>", 5),
+    ] {
+        tokens.push(token.to_string());
+        types.push(
+            overrides
+                .iter()
+                .find(|(name, _)| *name == token)
+                .map_or(token_type, |(_, kind)| *kind),
+        );
+    }
+    HashMap::from([
+        (
+            "tokenizer.ggml.model".to_string(),
+            GgufMetaValue::String("gpt2".to_string()),
+        ),
+        (
+            "tokenizer.ggml.pre".to_string(),
+            GgufMetaValue::String("qwen35".to_string()),
+        ),
+        (
+            "tokenizer.ggml.tokens".to_string(),
+            GgufMetaValue::ArrayString(tokens),
+        ),
+        (
+            "tokenizer.ggml.token_type".to_string(),
+            GgufMetaValue::ArrayI32(types),
+        ),
+        (
+            "tokenizer.ggml.merges".to_string(),
+            GgufMetaValue::ArrayString(Vec::new()),
+        ),
+    ])
+}

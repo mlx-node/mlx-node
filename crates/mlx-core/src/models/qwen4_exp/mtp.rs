@@ -43,6 +43,12 @@ impl State {
         self.pending.remove(&seq);
         self.budget.clear();
     }
+    /// Drops `seq`'s owner: its draft cache holds a history the sequence no
+    /// longer has.
+    pub fn forget(&mut self, seq: u32) {
+        self.owners.remove(&seq);
+        self.pending.remove(&seq);
+    }
     /// (rows in the draft cache, trusted rows waiting for the next pass).
     #[cfg(test)]
     pub(super) fn draft_rows(&self, seq: u32) -> Option<(usize, usize)> {

@@ -172,11 +172,13 @@ pub(super) struct LoadInventory {
     pub rows: StreamedPart,
 }
 
-/// The store plan and the dynamic budget whose lanes hold the allowance.
+/// The store plan and the dynamic budget whose lanes hold the allowance of
+/// `allowance_tokens`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct StoreDecision {
     pub store: StorePlan,
     pub allowance: u64,
+    pub allowance_tokens: u32,
 }
 
 /// Splash `planStreamedMemory` for a target that cannot spill: the KV
@@ -197,7 +199,8 @@ pub(super) fn plan_store(
     let pool = pool_input(c, &transient, &state);
     let lane = |dynamic: u64| pool.plan_at(dynamic).lane.window.maximum();
     let automatic = pool.shape.trained.min(RESIDENT_ALLOWANCE_TOKENS);
-    let allowance = allowance_dynamic_bytes(&[&lane], max_context.unwrap_or(automatic));
+    let allowance_tokens = max_context.unwrap_or(automatic);
+    let allowance = allowance_dynamic_bytes(&[&lane], allowance_tokens);
     let minimum_dynamic = pool.plan_at(0).lane.minimum_bytes;
     let hard = hard_budget_bytes(
         live.working_set_bytes,
@@ -219,7 +222,11 @@ pub(super) fn plan_store(
         rows: inventory.rows,
     })
     .map_err(|error| Error::from_reason(error.message(label)))?;
-    Ok(StoreDecision { store, allowance })
+    Ok(StoreDecision {
+        store,
+        allowance,
+        allowance_tokens,
+    })
 }
 
 /// Splash `evaluateEngineMemoryPlan` after the load: what is resident now,
