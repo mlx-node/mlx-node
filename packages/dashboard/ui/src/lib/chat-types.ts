@@ -32,6 +32,9 @@ export interface ChatFailure {
   message: string;
 }
 
+/** The message of the Continue button and of the automatic continue after a length stop in Work. */
+export const CONTINUE_PROMPT = 'continue';
+
 export type TurnOutcome =
   | 'completed'
   | 'cancelled'
@@ -96,6 +99,8 @@ export interface TurnState {
   startedAt: number;
   /** `model`: the app waits for the engine to put this conversation's model in memory. */
   wait: 'model' | null;
+  /** Work: automatic continues sent after a length stop in this turn; absent while none was sent. */
+  continues?: number;
 }
 
 export interface PermissionInteraction {
@@ -220,7 +225,7 @@ export interface ConversationNotice {
 export type TranscriptOp =
   | { op: 'push'; entry: TranscriptEntry }
   /** The entry at `index` is `assistant` or `thinking`. */
-  | { op: 'text'; index: number; append: string }
+  | { op: 'text'; index: number; append: string; endTs?: number }
   /** Whole-entry replace: tool, plan, subagent. */
   | { op: 'set'; index: number; entry: TranscriptEntry }
   | { op: 'metric'; metric: TurnMetric };

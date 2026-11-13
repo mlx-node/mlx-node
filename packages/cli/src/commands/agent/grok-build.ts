@@ -51,6 +51,7 @@ import {
   readAgentTag,
   releasePin,
 } from '@mlx-node/agent/binary';
+import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 import { idleReleaseText } from '@mlx-node/server/host/idle-release';
 import {
   PERSIST_PAGED_CACHE_DEFAULT,
@@ -1473,6 +1474,16 @@ export async function applyAgentUpdate(
   };
 }
 
+/** The agent hosts' thinking bounds as `mlx serve` flags; the text in `=` form, so a leading `-` stays its value. */
+export function agentThinkingFlags(): string[] {
+  return [
+    '--thinking-token-budget',
+    String(AGENT_HOST_THINKING.tokenBudget),
+    ...(AGENT_HOST_THINKING.cycleGuard ? ['--thinking-cycle-guard'] : []),
+    `--thinking-end-text=${AGENT_HOST_THINKING.endText}`,
+  ];
+}
+
 /**
  * Spawn `mlx serve` as a subprocess.
  * `--port 0` binds an ephemeral port; the token comes back to us through
@@ -1497,6 +1508,7 @@ function spawnInferenceServer(opts: GrokAgentLaunchBase & { persistPagedCache?: 
     `--auth-token=${token}`,
     persistPagedCacheFlag(resolvePersistPagedCache(opts.persistPagedCache ?? PERSIST_PAGED_CACHE_DEFAULT)),
     PERSIST_WHOLE_PROMPT_FLAG,
+    ...agentThinkingFlags(),
     ...(opts.modelsDir ? ['--models-dir', opts.modelsDir] : []),
     ...(opts.preloadModel !== undefined ? ['--preload', opts.preloadModel] : []),
     ...(opts.kvFormat !== undefined ? ['--kv-format', opts.kvFormat] : []),

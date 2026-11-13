@@ -341,3 +341,48 @@ describe('conversation stream', () => {
     expect(fold(a).gone).toBe('deleted');
   });
 });
+
+describe('a live thought keeps its time on the page', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const T = 1_794_411_000_000;
+  const thought = (text: string, at: number): UpdateLine => ({
+    xai: false,
+    update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text } },
+    meta: { agentTimestampMs: at },
+  });
+
+  // Mutation: drop `endTs` from the `text` op → red (the page's thought ends where it started).
+  it('three deltas at t, t+2 s, t+5 s reach the page timed, 5 s long, also through a held-back key', () => {
+    const key = 'exa-KEY-0123456789abcdef';
+    const conv = new Conversation(INFO, { needles: () => [key] });
+    conv.seed([], [], null);
+    const events: ConversationEvent[] = [];
+    conv.attach((e) => events.push(e), HOST);
+    conv.userPrompt('go');
+    conv.applyLine(thought('First ', T));
+    vi.advanceTimersByTime(CHAT_FLUSH_MS);
+    conv.applyLine(thought('then exa-KEY', T + 2_000));
+    vi.advanceTimersByTime(CHAT_FLUSH_MS);
+    conv.applyLine(thought('-0123456789abcdef', T + 5_000));
+    vi.advanceTimersByTime(CHAT_FLUSH_MS);
+    const entry = fold(events).entries.find((e) => e.kind === 'thinking');
+    expect(entry).toMatchObject({ kind: 'thinking', ts: T, endTs: T + 5_000, timed: true });
+    expect(entry!.kind === 'thinking' && entry!.text).not.toContain(key);
+  });
+
+  it('merged text ops keep the later stamp', () => {
+    expect(
+      mergeTextOps([
+        { op: 'text', index: 0, append: 'a', endTs: 1 },
+        { op: 'text', index: 0, append: 'b', endTs: 2 },
+        { op: 'text', index: 0, append: 'c' },
+      ]),
+    ).toEqual([{ op: 'text', index: 0, append: 'abc', endTs: 2 }]);
+  });
+});

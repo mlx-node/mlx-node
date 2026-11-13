@@ -57,6 +57,10 @@ export interface HostEvents {
   notices: Array<{ sessionId: string; notice: ConversationNotice }>;
   /** Work: sessions that passed their guard after `session/new` or `session/load`. */
   ready: string[];
+  /** Work: automatic continues written to the agent. */
+  continues: Array<{ sessionId: string; n: number }>;
+  /** Every update line kind and automatic continue, in arrival order. */
+  timeline: string[];
 }
 
 /** An endpoint file model that is its own base, as an MLX folder with no build words in its name. */
@@ -85,6 +89,8 @@ export interface FakeHostOptions {
   tempRoots?: AgentHostOptions['tempRoots'];
   uid?: number;
   login?: string;
+  /** Replaces the endpoint read; gets the current endpoint holder. */
+  readEndpoint?: (endpoint: { current: InferenceEndpoint | null }) => Promise<InferenceEndpoint | null>;
 }
 
 export interface FakeHost {
@@ -178,6 +184,8 @@ export async function fakeHost(name: string, options: FakeHostOptions = {}): Pro
     models: [],
     notices: [],
     ready: [],
+    continues: [],
+    timeline: [],
   };
   const mode = options.mode ?? 'chat';
   const host = new AgentHost({
@@ -190,7 +198,8 @@ export async function fakeHost(name: string, options: FakeHostOptions = {}): Pro
       tag: null,
       versionVerified: false,
     }),
-    readEndpoint: async () => endpoint.current,
+    readEndpoint:
+      options.readEndpoint === undefined ? async () => endpoint.current : () => options.readEndpoint!(endpoint),
     providers: options.providers ?? noProviders(),
     clientVersion: '0.0.0-test',
     chatPrompt: 'TEST CHAT PROMPT',
@@ -211,7 +220,14 @@ export async function fakeHost(name: string, options: FakeHostOptions = {}): Pro
       ...(options.onModeMarked === undefined ? {} : { onModeMarked: options.onModeMarked }),
       ...(options.onModeWithdrawn === undefined ? {} : { onModeWithdrawn: options.onModeWithdrawn }),
       onState: (s) => events.states.push(s),
-      onUpdate: (sessionId, line) => events.updates.push({ sessionId, line }),
+      onUpdate: (sessionId, line) => {
+        events.updates.push({ sessionId, line });
+        events.timeline.push(String(line.update.sessionUpdate));
+      },
+      onAutoContinue: (sessionId, n) => {
+        events.continues.push({ sessionId, n });
+        events.timeline.push(`continue ${n}`);
+      },
       onTitle: (sessionId, title) => events.titles.push({ sessionId, title }),
       onTurn: (sessionId, turn) => events.turns.push({ sessionId, turn }),
       onTurnEnd: (sessionId, result) => events.ends.push({ sessionId, result }),

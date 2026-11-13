@@ -17,6 +17,7 @@
 
 import { randomBytes } from 'node:crypto';
 
+import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 import { SERVER_CLOSE_MS } from '@mlx-node/server/supervision';
 
 import { EXIT_STARTUP_FAILED } from './exit-codes.js';
@@ -91,6 +92,9 @@ export function sidecarHostOptions(env: NodeJS.ProcessEnv = process.env): Sideca
     hostKind: 'desktop',
     persistPagedCache: { byDefault: true },
     persistWholePrompt: true,
+    thinkingTokenBudget: AGENT_HOST_THINKING.tokenBudget,
+    thinkingCycleGuard: AGENT_HOST_THINKING.cycleGuard,
+    thinkingEndText: AGENT_HOST_THINKING.endText,
     ...(turnJournal !== null ? { turnJournal } : {}),
   };
 }
@@ -114,6 +118,13 @@ export interface SidecarHostOptions {
   persistPagedCache: { flag?: boolean; byDefault: boolean };
   /** A turn of the cold tier families writes the whole prompt. `InferenceHostOptions.persistWholePrompt`. */
   persistWholePrompt: boolean;
+  /**
+   * The engine runs the app's agents: Messages thinking gets the agent hosts'
+   * budget, cycle guard and end text (`AGENT_HOST_THINKING`).
+   */
+  thinkingTokenBudget: number;
+  thinkingCycleGuard: boolean;
+  thinkingEndText: string;
   turnJournal?: SidecarTurnJournal;
 }
 

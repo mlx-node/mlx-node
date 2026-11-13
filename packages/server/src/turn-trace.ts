@@ -57,12 +57,14 @@ import { canonicalCacheRoot } from '@mlx-node/lm/cold-tier';
 import {
   MetricsTrace,
   type MetricsTraceInput,
+  type TurnBudgetFrom,
   type TurnDispatch,
   type TurnEndpoint,
   type TurnErrorKind,
   type TurnFailPhase,
 } from './metrics-trace.js';
 import { readPipelineStats, type PipelineStats, type TurnProgressSnapshot } from './native-progress.js';
+import { reasoningOutcomeOf, type ThinkingChatConfig } from './native-thinking.js';
 import type { MeasuredPrefill } from './timing.js';
 
 /** Read the process-wide cold-tier snapshot; the native addon may be absent (unit tests). */
@@ -106,6 +108,8 @@ export interface TurnRequestMeta {
   loadWaitMs?: number;
   resolveMs?: number;
   preDispatchMs?: number;
+  /** Set when the turn has a thinking budget: the request's own, or the server's option. */
+  thinkingBudgetFrom?: TurnBudgetFrom;
 }
 
 /** Identity of the model a binding was created for. */
@@ -348,6 +352,10 @@ interface TurnContext {
   creditedTokens: number;
   /** The pipeline counter at dispatch; null while it is off. */
   pipelines: PipelineStats | null;
+  /** The thinking budget, the guard and `maxNewTokens` of the config sent to native. */
+  thinkingBudget: number | undefined;
+  thinkingGuard: boolean;
+  outputCap: number | undefined;
 }
 
 /**
@@ -593,6 +601,9 @@ export class TurnTraceModel implements SessionCapableModel {
       progress: stream ? new TraceControl(outerControl) : null,
       creditedTokens: 0,
       pipelines: this.pipelineStats(),
+      thinkingBudget: config?.thinkingTokenBudget ?? undefined,
+      thinkingGuard: (config as ThinkingChatConfig | null | undefined)?.thinkingCycleGuard === true,
+      outputCap: config?.maxNewTokens ?? undefined,
     };
     (marks.live ??= new Set()).add(ctx);
     this.liveCtx.add(ctx);
@@ -637,6 +648,10 @@ export class TurnTraceModel implements SessionCapableModel {
       loadWaitMs: meta?.loadWaitMs,
       resolveMs: meta?.resolveMs,
       preDispatchMs: meta?.preDispatchMs,
+      thinkingBudget: ctx.thinkingBudget,
+      thinkingBudgetFrom: meta?.thinkingBudgetFrom,
+      ...(ctx.thinkingGuard ? { thinkingGuard: true as const } : {}),
+      outputCap: ctx.outputCap,
       ctxWindow: this.ctxWindow,
       toolCount: ctx.toolCount,
       imageCount: ctx.imageCount,
@@ -705,6 +720,7 @@ export class TurnTraceModel implements SessionCapableModel {
       rec.cachedTokens = final.cachedTokens ?? 0;
       rec.outputTokens = final.numTokens;
       rec.reasoningTokens = final.reasoningTokens;
+      Object.assign(rec, reasoningOutcomeOf(final));
       if (ctx.progress?.stopped === true) rec.toolCallCount = 0;
       else if (Array.isArray(final.toolCalls)) rec.toolCallCount = final.toolCalls.length;
       const perf = final.performance;
@@ -827,6 +843,7 @@ export class TurnTraceModel implements SessionCapableModel {
         rec.cachedTokens = final.cachedTokens;
         rec.outputTokens = final.numTokens;
         rec.reasoningTokens = final.reasoningTokens;
+        Object.assign(rec, reasoningOutcomeOf(final));
         if (Array.isArray(final.toolCalls)) rec.toolCallCount = final.toolCalls.length;
       } else if (snap !== null) {
         rec.outputTokens = snap.generatedTokens;

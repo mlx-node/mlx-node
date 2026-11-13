@@ -47,7 +47,11 @@ function applyOp(entries: TranscriptEntry[], turns: TurnMetric[], op: Transcript
     case 'text': {
       const entry = entries[op.index];
       if (entry !== undefined && (entry.kind === 'assistant' || entry.kind === 'thinking')) {
-        entries[op.index] = { ...entry, text: entry.text + op.append };
+        entries[op.index] = {
+          ...entry,
+          text: entry.text + op.append,
+          ...(op.endTs === undefined ? {} : { endTs: op.endTs }),
+        };
       }
       return;
     }

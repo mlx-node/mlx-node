@@ -19,6 +19,7 @@ import {
   type MemoryGovernorHealth,
   type ServerHealth,
 } from './health.js';
+import { parseThinkingEndText } from './host/agent-thinking.js';
 import {
   createIdleSweeper,
   DEFAULT_IDLE_CLEAR_CACHE_MS,
@@ -197,6 +198,17 @@ export interface ServerConfig {
    * which its thinking closes (Splash `--thinking-token-budget`). Default: no cap.
    */
   thinkingTokenBudget?: number;
+  /**
+   * Messages requests get the native cycle guard: an exact repeat inside a
+   * thought closes it. Never for reasoning effort `none`. Default: off.
+   */
+  thinkingCycleGuard?: boolean;
+  /**
+   * Plain text written before the template's close when a cut (budget or
+   * cycle) ends a Messages request's thinking (Splash `--thinking-end-text`).
+   * 1 to 512 characters. Default: the close alone.
+   */
+  thinkingEndText?: string;
   /**
    * The desktop supervisor's turn journal and quarantine (Splash
    * `Quarantine`). Omitted: no journal and no refusal.
@@ -581,6 +593,8 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
         }
       : {}),
     ...(config?.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: config.thinkingTokenBudget } : {}),
+    ...(config?.thinkingCycleGuard === true ? { thinkingCycleGuard: true } : {}),
+    ...(config?.thinkingEndText !== undefined ? { thinkingEndText: parseThinkingEndText(config.thinkingEndText) } : {}),
     ...(config?.turnJournal !== undefined ? { turnJournal: new TurnJournal(config.turnJournal) } : {}),
   });
   /**

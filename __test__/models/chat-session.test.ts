@@ -3724,6 +3724,19 @@ describe('ChatSession', () => {
       expect(config?.thinkingTokenBudget).toBe(15_000);
     });
 
+    // The Work cap of the app (answer room 16,384 + budget 12,000) in a window
+    // that leaves 10,000. Mutation: divide by `requested` alone → red (4,227).
+    it('keeps the agent budget its share when the window lowers the Work cap', async () => {
+      const mock = makeMockModel();
+      const session = new ChatSession(withCapacity(mock.model, 262_144, 252_144));
+
+      await session.send('hello', { config: { maxNewTokens: 28_384, thinkingTokenBudget: 12_000 } });
+
+      const config = mock.chatSessionStart.mock.calls[0]?.[1];
+      expect(config?.maxNewTokens).toBe(10_000);
+      expect(config?.thinkingTokenBudget).toBe(5_454);
+    });
+
     // Mutation: scale when the output budget is omitted (as if unbounded) →
     // red (the omitted row gets 7,676, not 8,192).
     it('scales a budget under an unbounded limit, and leaves it when the limit is omitted', async () => {

@@ -475,9 +475,18 @@ async function runPrompt(id, params) {
   const block = Array.isArray(params.prompt) ? params.prompt[0] : null;
   const text = typeof block?.text === 'string' ? block.text : '';
   if (faults.exitOnPrompt !== undefined && faults.exitOnPrompt !== null) process.exit(faults.exitOnPrompt);
-  const script = scriptsOf(session).find((p) => text.includes(p.match ?? '')) ?? {
+  // A script with `once` answers one prompt of the session; the next match takes the prompt after it.
+  session.usedOnce ??= new Set();
+  const scripts = scriptsOf(session);
+  const index = scripts.findIndex((p, i) => text.includes(p.match ?? '') && !(p.once && session.usedOnce.has(i)));
+  if (index !== -1 && scripts[index].once) session.usedOnce.add(index);
+  // A script's `followUp` answers the session's next prompt that holds its `match`.
+  const pending = session.followUp;
+  session.followUp = undefined;
+  const script = (pending !== undefined && text.includes(pending.match ?? '') ? pending : scripts[index]) ?? {
     steps: [{ text: 'ok' }, { end: { stopReason: 'end_turn' } }],
   };
+  if (script.followUp !== undefined) session.followUp = script.followUp;
   session.turn = { promptId: randomUUID(), cancelled: false, wake: null, rpcId: id };
   session.messages += 1;
   persistLine(session, 'session/update', {
@@ -768,6 +777,7 @@ async function runPrompt(id, params) {
       update(session, 'tool_call', {
         toolCallId,
         title: t.title ?? t.toolName,
+        ...(t.kind === undefined ? {} : { kind: t.kind }),
         rawInput: t.rawInput ?? {},
         _meta: meta,
       });
@@ -796,6 +806,32 @@ async function runPrompt(id, params) {
         },
         true,
       );
+    } else if (step.lengthError !== undefined) {
+      // As the agent on a reasoning-only length stop: the prompt's error reply, then its durable turn end line.
+      const l = step.lengthError;
+      const promptId = session.turn.promptId;
+      session.turn = null;
+      replyError(id, -32603, 'Internal error', {
+        message: 'response truncated by max_tokens',
+        error_kind: 'max_tokens_truncation',
+      });
+      if (l.exitAfterMs !== undefined) setTimeout(() => process.exit(0), l.exitAfterMs);
+      if (l.noEnd === true) return;
+      if (l.endAfterMs !== undefined) await sleep(l.endAfterMs);
+      update(
+        session,
+        'turn_completed',
+        {
+          prompt_id: promptId,
+          stop_reason: 'error',
+          agent_result: 'response truncated by max_tokens',
+          error_kind: 'max_tokens_truncation',
+          usage: { inputTokens: 100, outputTokens: l.outputTokens ?? 28384, modelCalls: 1 },
+          elapsed_ms: 20,
+        },
+        true,
+      );
+      return;
     } else if (step.error !== undefined) {
       session.turn = null;
       return replyError(id, step.error.code, step.error.message ?? 'Internal error', step.error.data);

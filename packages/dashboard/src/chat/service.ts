@@ -60,17 +60,18 @@ import type {
 } from './route-input.js';
 import { defaultSkillsDir, readChatSkill } from './skills/manifest.js';
 import { agentTitle, promptTitle, resolveTitle } from './titles.js';
-import type {
-  AgentModeState,
-  PermissionMark,
-  PermissionMode,
-  ChatHostEvent,
-  ChatHostState,
-  ChatMode,
-  ConversationEvent,
-  ConversationInfo,
-  CwdProblem,
-  Interaction,
+import {
+  CONTINUE_PROMPT,
+  type AgentModeState,
+  type PermissionMark,
+  type PermissionMode,
+  type ChatHostEvent,
+  type ChatHostState,
+  type ChatMode,
+  type ConversationEvent,
+  type ConversationInfo,
+  type CwdProblem,
+  type Interaction,
 } from './types.js';
 import { checkWorkFolder, cwdError, realFolder, resolveTempRoot, type WorkFolderRules } from './work-folder.js';
 
@@ -1268,6 +1269,7 @@ export class ChatService {
         this.emitHost({ type: 'conversations-changed' });
       },
       onModel: (id, modelId) => conv(id)?.setInfo({ modelId }),
+      onAutoContinue: (id) => conv(id)?.userPrompt(CONTINUE_PROMPT),
       onTurn: (id, turn) => {
         const c = conv(id);
         if (c === undefined || turn === null) return;

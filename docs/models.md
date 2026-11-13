@@ -131,6 +131,15 @@ for await (const event of session.sendStream('Hello!')) {
 
 The streaming bridge is implemented in `packages/lm/src/stream.ts`: native callback-based methods are captured at module load and re-exposed as `AsyncGenerator` via `_runChatStream`.
 
+### Bounding a thought
+
+`thinkingTokenBudget` closes a thought at its budget the way the chat template closes it (Qwen: `\n</think>`), in every decode lane. Two config inputs extend it (native, `ChatConfig`):
+
+- `thinkingCycleGuard: true` — a thought that repeats one exact block of tokens twice, over at least 512 tokens (periods up to 2,048), gets its budget lowered so it closes 64 tokens later. It only lowers the budget, so every lane obeys it as it obeys the budget. Default off.
+- `thinkingEndText` — plain text (no close tag, no special token) written before the template's close when a cut (budget or guard) ends the thought, so the model turns to its answer (Splash `--thinking-end-text`). Unset or `''`: the close alone. A text that breaks the probe's rules (special tokens, more than 64 tokens with the close) is not used.
+
+The result (`ChatResult` and the terminal stream event) reports how the thought ended: `reasoningClose` (`model`, `budget`, `cycle`, `open`; absent when the turn did not start in thinking), `reasoningCutAt` (thinking tokens when a cut began), `reasoningCyclePeriod` and `reasoningStrayCloses` (close tokens after the thought ended). A cut never changes `finishReason`. An addon that predates them ignores the two inputs and sends none of the four outputs; the server reads them as not known (`packages/server/src/native-thinking.ts`). The server sets the three on Messages requests from its options (`thinkingTokenBudget`, `thinkingCycleGuard`, `thinkingEndText`); the desktop engine and the server `mlx agent` starts pass `AGENT_HOST_THINKING` (12,000, on, Splash's Qwen sentence).
+
 ## DeepSeek V4.1 Flash
 
 The `deepseek_v41` runtime (`DeepseekV41Model`) runs DeepSeek-V4.1-Flash-1017 from

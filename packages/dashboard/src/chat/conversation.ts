@@ -311,7 +311,14 @@ export class Conversation {
           this.open.set(op.index, redactor);
         }
         const safe = redactor.push(op.append);
-        if (safe !== '') out.push({ op: 'text', index: op.index, append: safe });
+        if (safe !== '' || op.endTs !== undefined) {
+          out.push({
+            op: 'text',
+            index: op.index,
+            append: safe,
+            ...(op.endTs === undefined ? {} : { endTs: op.endTs }),
+          });
+        }
       } else if (op.op === 'set') {
         this.open.delete(op.index);
         out.push({ op: 'set', index: op.index, entry: redactEntry(op.entry, needles) });
@@ -411,7 +418,13 @@ export function applyOp(entries: TranscriptEntry[], turns: TurnMetric[], op: Tra
       return;
     case 'text': {
       const entry = entries[op.index];
-      if (entry !== undefined && isText(entry)) entries[op.index] = { ...entry, text: entry.text + op.append };
+      if (entry !== undefined && isText(entry)) {
+        entries[op.index] = {
+          ...entry,
+          text: entry.text + op.append,
+          ...(op.endTs === undefined ? {} : { endTs: op.endTs }),
+        };
+      }
       return;
     }
     case 'set':
@@ -429,7 +442,13 @@ export function mergeTextOps(ops: readonly TranscriptOp[]): TranscriptOp[] {
   for (const op of ops) {
     const last = out[out.length - 1];
     if (op.op === 'text' && last !== undefined && last.op === 'text' && last.index === op.index) {
-      out[out.length - 1] = { op: 'text', index: op.index, append: last.append + op.append };
+      const endTs = op.endTs ?? last.endTs;
+      out[out.length - 1] = {
+        op: 'text',
+        index: op.index,
+        append: last.append + op.append,
+        ...(endTs === undefined ? {} : { endTs }),
+      };
     } else {
       out.push(op);
     }

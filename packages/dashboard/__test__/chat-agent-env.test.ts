@@ -1,8 +1,17 @@
 import { execFileSync } from 'node:child_process';
 
+import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 import { describe, expect, it } from 'vite-plus/test';
 
-import { chatAgentEnv, workAgentEnv, workOverlay } from '../src/chat/agent/env.js';
+import {
+  CHAT_ANSWER_TOKENS,
+  CHAT_MAX_COMPLETION_TOKENS,
+  chatAgentEnv,
+  WORK_ANSWER_TOKENS,
+  WORK_MAX_COMPLETION_TOKENS,
+  workAgentEnv,
+  workOverlay,
+} from '../src/chat/agent/env.js';
 import {
   AGENT_ARGS,
   CHAT_PROMPT_HEAD,
@@ -62,7 +71,7 @@ describe('chatAgentEnv', () => {
         GROK_CURSOR_SKILLS_ENABLED: 'false',
         GROK_TURN_SUMMARY: '0',
         GROK_SESSION_SEARCH: '0',
-        GROK_CONFIG: '{"models":{"max_completion_tokens":8192}}',
+        GROK_CONFIG: '{"models":{"max_completion_tokens":20192}}',
       });
     } finally {
       if (before === undefined) delete process.env.SOME_PARENT_VAR;
@@ -106,7 +115,7 @@ describe('workAgentEnv', () => {
     expect(env.GROK_IMAGE_EDIT).toBe('0');
     expect(env.GROK_RESUME_COMMAND).toBe('mlx agent');
     expect(env.GROK_TURN_SUMMARY).toBe('0');
-    expect(env.GROK_CONFIG).toBe('{"mine":true,"models":{"max_completion_tokens":16384}}');
+    expect(env.GROK_CONFIG).toBe('{"mine":true,"models":{"max_completion_tokens":28384}}');
     expect(env).not.toHaveProperty('GROK_HOME');
     expect(env.FIRECRAWL_NO_SEARCH_FEEDBACK).toBe('1');
     expect(env.FIRECRAWL_DISABLE_SEARCH_FEEDBACK).toBe('1');
@@ -121,14 +130,23 @@ describe('workAgentEnv', () => {
     }
   });
 
-  it('caps output at 16,384 tokens when the user set no config, and sets GROK_HOME only for a custom home', () => {
+  // Mutation: the cap is the answer room alone → red (16,384 and 8,192).
+  it('caps each mode at its answer room plus the host thinking budget', () => {
+    expect(AGENT_HOST_THINKING.tokenBudget).toBe(12_000);
+    expect(WORK_MAX_COMPLETION_TOKENS).toBe(28_384);
+    expect(CHAT_MAX_COMPLETION_TOKENS).toBe(20_192);
+    expect(WORK_MAX_COMPLETION_TOKENS - WORK_ANSWER_TOKENS).toBe(AGENT_HOST_THINKING.tokenBudget);
+    expect(CHAT_MAX_COMPLETION_TOKENS - CHAT_ANSWER_TOKENS).toBe(AGENT_HOST_THINKING.tokenBudget);
+  });
+
+  it('caps output at 28,384 tokens when the user set no config, and sets GROK_HOME only for a custom home', () => {
     const env = workAgentEnv({ base: { PATH: '/bin' }, endpoint, agentHome: '/custom/agent', providerKeys: {} });
-    expect(env.GROK_CONFIG).toBe('{"models":{"max_completion_tokens":16384}}');
+    expect(env.GROK_CONFIG).toBe('{"models":{"max_completion_tokens":28384}}');
     expect(env.GROK_HOME).toBe('/custom/agent');
   });
 
   it("keeps the user's own overlay and puts the cap inside it; a value that is not an object is replaced", () => {
-    const cap = '{"models":{"max_completion_tokens":16384}}';
+    const cap = '{"models":{"max_completion_tokens":28384}}';
     const rows: Array<[string | undefined, string]> = [
       [undefined, cap],
       ['', cap],
@@ -136,12 +154,13 @@ describe('workAgentEnv', () => {
       ['[1]', cap],
       ['null', cap],
       ['{"models":"x"}', cap],
-      ['{"features":{"a":true}}', '{"features":{"a":true},"models":{"max_completion_tokens":16384}}'],
+      ['{"features":{"a":true}}', '{"features":{"a":true},"models":{"max_completion_tokens":28384}}'],
       [
         '{"models":{"default_reasoning_effort":"low","max_completion_tokens":99999}}',
-        '{"models":{"default_reasoning_effort":"low","max_completion_tokens":16384}}',
+        '{"models":{"default_reasoning_effort":"low","max_completion_tokens":28384}}',
       ],
       ['{"models":{"max_completion_tokens":4096}}', '{"models":{"max_completion_tokens":4096}}'],
+      ['{"models":{"max_completion_tokens":20000}}', '{"models":{"max_completion_tokens":20000}}'],
       ['{"models":{"max_completion_tokens":0}}', cap],
       ['{"models":{"max_completion_tokens":"8"}}', cap],
     ];

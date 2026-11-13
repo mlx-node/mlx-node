@@ -93,11 +93,13 @@ import {
 } from '../mappers/anthropic-response.js';
 import { genId } from '../mappers/response.js';
 import { withNestedArguments } from '../mappers/tool-arguments.js';
+import type { TurnBudgetFrom } from '../metrics-trace.js';
 import {
   type ModelLoadAdmission,
   ModelLoadQueueFullError,
   type ModelWorkCoordinator,
 } from '../model-work-coordinator.js';
+import type { ThinkingChatConfig } from '../native-thinking.js';
 import type { ModelRegistry } from '../registry.js';
 import { MAX_OUTPUT_TOKENS, validateAndCanonicalizeHistoryToolOrder } from '../request-validation.js';
 import { QueueFullError, type PreDispatchAdmission, type SessionRegistry } from '../session-registry.js';
@@ -214,15 +216,37 @@ function applyClaudeCodeTitleFastPath(config: ChatConfig, body: AnthropicMessage
   };
 }
 
+/** The server's thinking options: `ServerConfig.thinkingTokenBudget`, `thinkingCycleGuard`, `thinkingEndText`. */
+export interface ServerThinking {
+  tokenBudget?: number;
+  cycleGuard?: boolean;
+  endText?: string;
+}
+
 /**
- * The server's `--thinking-token-budget` for a thinking request that sets
- * none (Splash `Frontend._generation_options`).
+ * The server's thinking options on a Messages request (Splash
+ * `Frontend._generation_options`): the budget only when the request sets
+ * none, the guard and the end text also beside a request's own budget, none
+ * of the three for reasoning effort `none`. `from` names where the budget
+ * came from.
  */
-function applyDefaultThinkingTokenBudget(config: ChatConfig, budget: number | undefined): ChatConfig {
-  if (budget === undefined || config.thinkingTokenBudget !== undefined || config.reasoningEffort === 'none') {
-    return config;
+export function applyServerThinking(
+  config: ChatConfig,
+  server: ServerThinking | undefined,
+): { config: ThinkingChatConfig; from: TurnBudgetFrom | undefined } {
+  const own = config.thinkingTokenBudget !== undefined;
+  if (server === undefined || config.reasoningEffort === 'none') {
+    return { config, from: own ? 'request' : undefined };
   }
-  return { ...config, thinkingTokenBudget: budget };
+  const budget = !own && server.tokenBudget !== undefined;
+  const guard = server.cycleGuard === true;
+  const endText = server.endText !== undefined && server.endText !== '' ? server.endText : undefined;
+  if (!budget && !guard && endText === undefined) return { config, from: own ? 'request' : undefined };
+  const out: ThinkingChatConfig = { ...config };
+  if (budget) out.thinkingTokenBudget = server.tokenBudget;
+  if (guard) out.thinkingCycleGuard = true;
+  if (endText !== undefined) out.thinkingEndText = endText;
+  return { config: out, from: own ? 'request' : budget ? 'server' : undefined };
 }
 
 // Non-streaming path
@@ -1220,7 +1244,7 @@ export async function handleCreateMessage(
   idleSweeper?: IdleSweeper | null,
   resolveModel?: (name: string) => Promise<void>,
   modelWorkCoordinator?: ModelWorkCoordinator,
-  defaultThinkingTokenBudget?: number,
+  serverThinking?: ServerThinking,
   turnJournal?: TurnJournal,
 ): Promise<void> {
   if (modelWorkCoordinator) {
@@ -1295,7 +1319,8 @@ export async function handleCreateMessage(
     return;
   }
   mappedConfig = applyClaudeCodeTitleFastPath(mappedConfig, body);
-  mappedConfig = applyDefaultThinkingTokenBudget(mappedConfig, defaultThinkingTokenBudget);
+  const thinking = applyServerThinking(mappedConfig, serverThinking);
+  mappedConfig = thinking.config;
   const turnFingerprint =
     turnJournal === undefined ? null : requestFingerprint(body.model, mappedMessages, mappedConfig);
   // Splash `_admit`: refused before admission and before any model load or swap.
@@ -1596,6 +1621,7 @@ export async function handleCreateMessage(
             loadWaitMs: serverLoadWaitMs,
             resolveMs: serverModelResolveMs,
             preDispatchMs: serverTiming.server_pre_inference_ms,
+            ...(thinking.from === undefined ? {} : { thinkingBudgetFrom: thinking.from }),
           };
           // Hot-swap race guard. `ModelRegistry.register()` is not coordinated with
           // `withExclusive`, so a concurrent re-register of the same friendly name

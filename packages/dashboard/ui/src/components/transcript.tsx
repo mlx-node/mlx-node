@@ -1,6 +1,8 @@
-import { BellRing, Cpu, GitBranch } from 'lucide-react';
+import { BellRing, Cpu, GitBranch, RotateCw } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type MouseEvent, type ReactElement, type ReactNode } from 'react';
 
+import { CHAT } from '../lib/chat-strings';
+import { thoughtDuration } from '../lib/chat-turns';
 import { formatClock, formatCount, formatCountNoun, formatDuration } from '../lib/format';
 import { groupTurns, turnTitle, wakeTitle, type TurnGroup } from '../lib/sessions';
 import type { TranscriptEntry, TurnMetric } from '../lib/types';
@@ -217,6 +219,15 @@ function GroupBody(props: BodyProps): ReactElement {
     i += 1;
     switch (entry.kind) {
       case 'user':
+        if (entry.continued === true) {
+          items.push(
+            <RuleLabel key={at}>
+              <RotateCw size={12} strokeWidth={1.75} aria-hidden="true" />
+              {CHAT.continued}
+            </RuleLabel>,
+          );
+          break;
+        }
         items.push(
           <Message
             key={at}
@@ -273,7 +284,7 @@ function GroupBody(props: BodyProps): ReactElement {
           <ReasoningBlock
             key={at}
             text={entry.text}
-            durationMs={!running && entry.endTs !== undefined && entry.ts > 0 ? entry.endTs - entry.ts : null}
+            durationMs={running ? null : thoughtDuration(entry)}
             live={running && live}
             startTs={running ? entry.ts : undefined}
             asOfMs={running ? asOfMs : undefined}

@@ -4,6 +4,7 @@ import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import {
   answerMarkdown,
   chatTitle,
+  continuingTurn,
   conversationMarkdown,
   engineNote,
   formatElapsed,
@@ -14,10 +15,12 @@ import {
   pendingRow,
   splitTurns,
   storedOutcome,
+  thoughtDuration,
   turnOutcome,
   turnStats,
   turnStatsTitle,
 } from '../ui/src/lib/chat-turns.js';
+import { CONTINUE_PROMPT } from '../ui/src/lib/chat-types.js';
 import { dayGroupLabel, groupByDay, matchesQuery } from '../ui/src/lib/conversations.js';
 import { JUMP_FAR, PIN_SLACK, distanceToEnd, jumpVisible, nextPinned } from '../ui/src/lib/stick-to-bottom.js';
 import type { TranscriptEntry } from '../ui/src/lib/types.js';
@@ -281,5 +284,88 @@ describe('stick to bottom', () => {
     expect(jumpVisible(false, true, at(1_490))).toBe(true);
     expect(jumpVisible(false, false, at(1_500 - JUMP_FAR))).toBe(false);
     expect(jumpVisible(false, false, at(1_500 - JUMP_FAR - 1))).toBe(true);
+  });
+});
+
+describe('the length stop and the thought time', () => {
+  const lengthEnd: TranscriptEntry = {
+    kind: 'turn-end',
+    ts: 5,
+    stopReason: 'error',
+    error: 'response truncated by max_tokens',
+    lengthLimit: true,
+  };
+  const continued: TranscriptEntry = { kind: 'user', ts: 6, text: CONTINUE_PROMPT, promptIndex: 1, continued: true };
+  const read: TranscriptEntry = {
+    kind: 'tool',
+    ts: 7,
+    id: 't1',
+    name: 'read_file',
+    title: 'Read',
+    status: 'completed',
+  };
+
+  it('a stored length end reads as the length line, with no raw error text', () => {
+    expect(storedOutcome(lengthEnd as Extract<TranscriptEntry, { kind: 'turn-end' }>)).toEqual({
+      tone: 'warning',
+      glyph: 'alert',
+      text: CHAT.outcomes['output-limit'],
+      action: 'continue',
+    });
+  });
+
+  it('a continued turn with no tool call that hits the limit again says so; one with a call does not', () => {
+    const [, again] = splitTurns([user('fix it'), lengthEnd, continued, { ...lengthEnd, ts: 9 }], []);
+    const state = { last: true, running: false, live: null, mode: 'work' as const };
+    expect(turnOutcome(again!, state)?.text).toBe(CHAT.outcomes['output-limit-twice']);
+    const live = splitTurns([user('fix it'), lengthEnd, continued], []);
+    expect(turnOutcome(live[1]!, { ...state, live: { outcome: 'output-limit' } })?.text).toBe(
+      CHAT.outcomes['output-limit-twice'],
+    );
+    const [, called] = splitTurns([user('fix it'), lengthEnd, continued, read, { ...lengthEnd, ts: 9 }], []);
+    expect(turnOutcome(called!, state)?.text).toBe(CHAT.outcomes['output-limit']);
+  });
+
+  // Mutation: the sentence says the app sent the continue → red.
+  it('the twice sentence names no sender: a hand-pressed Continue the app continues after reads true', () => {
+    const turns = splitTurns(
+      [user('fix it'), lengthEnd, continued, { ...lengthEnd, ts: 9 }, { ...continued, ts: 10, promptIndex: 2 }],
+      [],
+    );
+    const state = { last: false, running: false, live: null, mode: 'work' as const };
+    expect(turnOutcome(turns[1]!, state)?.text).toBe(
+      'The answer hit the length limit twice in a row. Continuing did not help.',
+    );
+  });
+
+  it('the pending row says the app continues while the turn holds only the divider', () => {
+    const [, only] = splitTurns([user('fix it'), lengthEnd, continued], []);
+    expect(continuingTurn(only, 1)).toBe(true);
+    expect(continuingTurn(only, undefined)).toBe(false);
+    const [, working] = splitTurns([user('fix it'), lengthEnd, continued, read], []);
+    expect(continuingTurn(working, 1)).toBe(false);
+    const base = {
+      creating: false,
+      phase: 'running' as const,
+      wait: null,
+      model: 'qwen-a',
+      loading: null,
+      inference: 'ready' as const,
+      quiet: false,
+      full: null,
+    };
+    expect(pendingRow({ ...base, continuing: true })).toEqual({
+      kind: 'label',
+      text: CHAT.pendingContinuing,
+      orb: 'think',
+    });
+  });
+
+  // Mutation: ignore `timed` → red (a thought read from disk shows a time).
+  it('a thought has a time only when it was timed live', () => {
+    expect(thoughtDuration({ ts: 1_000, endTs: 6_000, timed: true })).toBe(5_000);
+    expect(thoughtDuration({ ts: 1_000, endTs: 6_000 })).toBeNull();
+    expect(thoughtDuration({ ts: 1_000, endTs: 1_000, timed: true })).toBeNull();
+    expect(thoughtDuration({ ts: 0, endTs: 6_000, timed: true })).toBeNull();
   });
 });
