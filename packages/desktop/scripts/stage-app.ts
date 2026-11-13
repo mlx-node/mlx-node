@@ -38,8 +38,39 @@ export function stageRuntimeBuildFiles(desktopDir: string, stageDir: string): vo
 interface PackageJson {
   name?: string;
   version?: string;
+  files?: string[];
   dependencies?: Record<string, string>;
   optionalDependencies?: Record<string, string>;
+}
+
+/**
+ * `src` is listed for the `@mlx-node/source` export condition, which only dev and test runs set; the packaged app
+ * resolves every workspace export to `dist`.
+ */
+const SOURCE_ONLY_ENTRIES = new Set(['src']);
+
+/**
+ * What a staged workspace package ships beside its `package.json`: its own `files` list, minus source-only entries.
+ * The `files` list is the one place a package declares its runtime assets (the dashboard's `skills` bundle, for one),
+ * so staging cannot drift from it. A package without one, or with an entry that is not a plain top-level name, is
+ * refused rather than guessed at.
+ */
+export function workspaceShipEntries(name: string, pkg: PackageJson): string[] {
+  if (!Array.isArray(pkg.files)) throw new Error(`Workspace package "${name}" has no "files" list to stage from`);
+  const entries: string[] = [];
+  for (const entry of pkg.files) {
+    const plainName =
+      typeof entry === 'string' &&
+      entry !== '' &&
+      entry !== '.' &&
+      entry !== '..' &&
+      !['/', '\\', '*', '!'].some((c) => entry.includes(c));
+    if (!plainName) {
+      throw new Error(`Workspace package "${name}" has an unstageable "files" entry: ${JSON.stringify(entry)}`);
+    }
+    if (!SOURCE_ONLY_ENTRIES.has(entry)) entries.push(entry);
+  }
+  return entries;
 }
 
 function readJson(path: string): PackageJson | null {
@@ -381,14 +412,13 @@ export function stageApp(opts: {
     const to = join(modules, name);
     mkdirSync(to, { recursive: true });
     cpSync(join(from, 'package.json'), join(to, 'package.json'));
-    // Only what a consumer can actually import. Notably NOT the workspace's own
+    // Only what the package declares. Notably NOT the workspace's own
     // node_modules, which is where a second copy of a hoisted dependency (and a
     // second Electron) would sneak in.
-    for (const dir of ['dist', 'web']) {
-      if (existsSync(join(from, dir))) cpSync(join(from, dir), join(to, dir), { recursive: true, dereference: true });
-    }
-    for (const file of ['index.cjs', 'index.d.cts', 'index.js', 'index.d.ts']) {
-      if (existsSync(join(from, file))) cpSync(join(from, file), join(to, file));
+    for (const entry of workspaceShipEntries(name, readJson(join(from, 'package.json')) ?? {})) {
+      if (existsSync(join(from, entry))) {
+        cpSync(join(from, entry), join(to, entry), { recursive: true, dereference: true });
+      }
     }
     if (name === '@mlx-node/core') {
       const binding = join(to, 'index.cjs');
