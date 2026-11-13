@@ -133,7 +133,8 @@ fn bridge_dtype_code(dtype: MetalDtype) -> Result<i32, String> {
 /// `[num_kv_heads, head_size/x, block_size, x]`, V
 /// `[num_kv_heads, head_size, block_size]`). An int8 pool appends each
 /// side's f32 `[num_kv_heads, block_size]` scale slot to that side's data
-/// (Splash `PageStorage::layerSpans` order K, K scales, V, V scales).
+/// (Splash `PageStorage::layerSpans` order K, K scales, V, V scales), and a
+/// page with an index plane appends its index slot to the value side.
 pub type BlockLayerBytes = (Vec<u8>, Vec<u8>);
 
 /// How a pool's pages are laid out (Splash `kv::Layout`). The default is
@@ -172,9 +173,10 @@ pub struct PlaneBytes {
 }
 
 impl PlaneBytes {
-    /// Host-transfer bytes per side, data then scales.
+    /// Host-transfer bytes per side: K then K scales; V, V scales, then the
+    /// index slot (Splash `PageStorage::layerSpans` order).
     pub fn blob(&self) -> (u64, u64) {
-        (self.key + self.scale, self.value + self.scale)
+        (self.key + self.scale, self.value + self.scale + self.index)
     }
 
     #[cfg(target_os = "macos")]
@@ -199,7 +201,7 @@ impl PlaneBytes {
             Plane::Key | Plane::Value => 0,
             Plane::KeyScale => self.key,
             Plane::ValueScale => self.value,
-            Plane::Index => 0,
+            Plane::Index => self.value + self.scale,
         }
     }
 }
@@ -2567,7 +2569,6 @@ impl LayerKVPool {
     /// GPU work at all.
     #[cfg(target_os = "macos")]
     pub fn read_block_all_layers(&self, block_id: u32) -> Result<Vec<BlockLayerBytes>, String> {
-        self.require_vllm_page("LayerKVPool::read_block_all_layers")?;
         use crate::metal::command_buffer::observe;
         use crate::metal::{MetalState, is_metal_extraction_supported};
         use metal::MTLResourceOptions;
@@ -2897,7 +2898,6 @@ impl LayerKVPool {
     /// or GPU submission; private buffers retain the bounded blit fallback.
     #[cfg(target_os = "macos")]
     pub fn write_blocks_all_layers(&self, blocks: &[BlockUpload<'_>]) -> Result<(), String> {
-        self.require_vllm_page("LayerKVPool::write_blocks_all_layers")?;
         use crate::metal::MetalState;
         use crate::metal::command_buffer::observe;
         use metal::MTLResourceOptions;
@@ -5401,8 +5401,8 @@ mod int8_tests {
     /// A Flash Next page (Splash `QwenHybridLayout::kvLayout`): K and V
     /// token-major views, a bf16 index plane after the K/V planes in the
     /// block (Splash `PageStorage::indexPlaneOffset`), counted in the block
-    /// bytes and kept across a grow; no host blob (Splash slot version 1
-    /// carries such a page) and no raw kernel. Mutation H1:
+    /// bytes and kept across a grow; no per-layer host blob and no raw
+    /// kernel. Mutation H1:
     /// `require_vllm_page` accepts every layout → red.
     #[test]
     fn selected_block_page_has_an_index_plane_and_no_host_blob() {
@@ -5462,13 +5462,7 @@ mod int8_tests {
                 mlx_sys::mlx_array_delete(raw);
             }
         }
-        assert!(pool.read_block_all_layers(0).is_err());
         assert!(pool.read_blocks_to_host(0, &[0]).is_err());
-        let payload = blobs(0, 2);
-        assert!(
-            pool.write_blocks_all_layers(&[upload(0, &payload)])
-                .is_err()
-        );
         assert!(
             LayerKVPool::new_with_layout(
                 int8_config(2),
@@ -5482,6 +5476,52 @@ mod int8_tests {
             )
             .is_err()
         );
+    }
+
+    /// A Flash Next page crosses the host whole: the value side carries V,
+    /// its scales and the index slot, and a write then a read of every layer
+    /// gives each plane's bytes back, the index plane holding the index slot.
+    /// Mutation: the index slot sits at offset 0 of the value blob → red.
+    #[test]
+    fn flash_next_pages_cross_the_host() {
+        if !metal() {
+            return;
+        }
+        let layout = PageLayout {
+            values_token_major: true,
+            index_rows: 4,
+            index_dimension: 128,
+        };
+        let index = 4 * 128 * 2;
+        let pool =
+            LayerKVPool::new_with_layout(int8_config(2), 3, 3, MetalDtype::Int8, layout).unwrap();
+        assert_eq!(
+            pool.block_blob_bytes(),
+            Ok(((DATA + SCALES) as u64, (DATA + SCALES + index) as u64))
+        );
+        let side = |layer: usize, which: usize, len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|i| ((i * 7 + layer * 31 + which * 101) % 251) as u8)
+                .collect()
+        };
+        let payload: Vec<BlockLayerBytes> = (0..2)
+            .map(|layer| {
+                (
+                    side(layer, 0, DATA + SCALES),
+                    side(layer, 1, DATA + SCALES + index),
+                )
+            })
+            .collect();
+        pool.write_blocks_all_layers(&[upload(2, &payload)])
+            .unwrap();
+        assert_eq!(pool.read_block_all_layers(2).unwrap(), payload);
+        for (layer, (_, values)) in payload.iter().enumerate() {
+            let raw = pool.index_array_raw(layer as u32).unwrap();
+            let (_, _, data) = view(raw);
+            let plane = unsafe { std::slice::from_raw_parts(data.add(2 * index), index) }.to_vec();
+            unsafe { mlx_sys::mlx_array_delete(raw) };
+            assert_eq!(plane, &values[DATA + SCALES..], "layer {layer} index plane");
+        }
     }
 
     /// Mutation M2: `plane_bytes_for` leaves the scale bytes out.

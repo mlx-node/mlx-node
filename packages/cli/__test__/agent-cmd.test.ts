@@ -13,15 +13,15 @@ import { describe, expect, it } from 'vite-plus/test';
 import { agentPreambleText, scanAgentArgs } from '../src/commands/agent/index.js';
 
 describe('scanAgentArgs --no-persist-cache', () => {
-  it('defaults persistPagedCache to true when the flag is absent', () => {
+  it('keeps the disk cache on by default, with no flag over the env', () => {
     const scan = scanAgentArgs(['-c']);
-    expect(scan.persistPagedCache).toBe(true);
+    expect(scan.persistPagedCache).toEqual({ byDefault: true, wholePrompt: true });
     expect(scan.passthrough).toEqual(['-c']);
   });
 
-  it('is mlx-owned: flips the flag false and is not forwarded to the binary', () => {
+  it('is mlx-owned: sets the flag off and is not forwarded to the binary', () => {
     const scan = scanAgentArgs(['--no-persist-cache', '-c']);
-    expect(scan.persistPagedCache).toBe(false);
+    expect(scan.persistPagedCache).toEqual({ flag: false, byDefault: true, wholePrompt: true });
     expect(scan.passthrough).toEqual(['-c']);
   });
 
@@ -29,7 +29,7 @@ describe('scanAgentArgs --no-persist-cache', () => {
     const scan = scanAgentArgs(['--system-prompt', '--no-persist-cache']);
     // "--no-persist-cache" is the system-prompt VALUE here, so it stays enabled
     // and passes through verbatim.
-    expect(scan.persistPagedCache).toBe(true);
+    expect(scan.persistPagedCache).toEqual({ byDefault: true, wholePrompt: true });
     expect(scan.passthrough).toEqual(['--system-prompt', '--no-persist-cache']);
   });
 });

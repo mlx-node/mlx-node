@@ -395,11 +395,9 @@ pub(crate) struct PoolInput<'a> {
     /// holds it beside the pool only.
     pub lane_in_pool: bool,
     /// Lane state that grows with the window `W` (a speculative turn's
-    /// draft state), charged like `lane_bytes`: Splash `laneStateBytes`
+    /// draft state), charged once, beside the pool: Splash `laneStateBytes`
     /// carries every speculative buffer of the lane beside its KV.
     pub state: &'a dyn Fn(u32) -> u64,
-    /// `state` takes pool blocks as well (the scheduler books it there).
-    pub state_in_pool: bool,
 }
 
 impl PoolInput<'_> {
@@ -410,7 +408,6 @@ impl PoolInput<'_> {
             cap_blocks,
             lane_in_pool: self.lane_in_pool,
             state: self.state,
-            state_in_pool: self.state_in_pool,
         }
     }
 
@@ -423,6 +420,7 @@ impl PoolInput<'_> {
             runway_blocks: self.runway_blocks.min(max_blocks),
             bytes_per_block: self.bytes_per_block,
             lane,
+            lanes: 1,
         }
     }
 }
@@ -488,6 +486,9 @@ pub(crate) struct PoolPlan {
     pub runway_blocks: u32,
     pub bytes_per_block: u64,
     pub lane: LanePlan,
+    /// The concurrent decode lanes whose step the lane's transient prices
+    /// (Splash `kLaneCount`).
+    pub lanes: u32,
 }
 
 impl PoolPlan {
@@ -675,7 +676,6 @@ enum LaneKv<'a> {
         cap_blocks: Option<u64>,
         lane_in_pool: bool,
         state: &'a dyn Fn(u32) -> u64,
-        state_in_pool: bool,
     },
     /// Splash `KvExtent` arithmetic with no grow copy and no state: the
     /// dynamic budget less the lane and the transient.
@@ -703,7 +703,6 @@ impl LaneKv<'_> {
                 cap_blocks,
                 lane_in_pool,
                 state,
-                state_in_pool,
             } => {
                 // The lane state lives outside the pool (Splash
                 // availableForOneRequestKv = dynamic - laneStateBytes).
@@ -717,8 +716,7 @@ impl LaneKv<'_> {
                     / u128::from(layers + 1);
                 let blocks = (pool / u128::from(bytes_per_block.max(1))) as u64;
                 let blocks = cap_blocks.map_or(blocks, |cap| blocks.min(cap));
-                let in_pool = if lane_in_pool { shape.lane_bytes } else { 0 }
-                    .saturating_add(if state_in_pool { state } else { 0 });
+                let in_pool = if lane_in_pool { shape.lane_bytes } else { 0 };
                 let kv = blocks
                     .saturating_mul(bytes_per_block)
                     .saturating_sub(in_pool);
@@ -851,18 +849,11 @@ impl MemoryPlan {
             });
         }
         let layout = input.shape.layout;
-        let runway_tokens =
-            (layout.runway_pages() * KV_PAGE_TOKENS).min(u64::from(u32::MAX)) as u32;
         let in_pool = if input.lane_in_pool {
             input.shape.lane_bytes
         } else {
             0
-        }
-        .saturating_add(if input.state_in_pool {
-            (input.state)(runway_tokens)
-        } else {
-            0
-        });
+        };
         let minimum_blocks = in_pool
             .saturating_add(layout.runway_pages() * layout.page_bytes())
             .div_ceil(bytes_per_block);
@@ -954,6 +945,7 @@ impl MemoryPlan {
                 runway_blocks: max_blocks,
                 bytes_per_block,
                 lane: Self::bare_lane(resident, lane_bytes, 0),
+                lanes: 1,
             }),
             ..Self::bare()
         }
@@ -1081,10 +1073,11 @@ impl MemoryPlan {
         if let Some(pool) = &self.pool {
             let _ = write!(
                 out,
-                "\nKV pool: {} blocks of {} at most, {} at the start",
+                "\nKV pool: {} blocks of {} at most, {} at the start; {} decode lanes",
                 pool.max_blocks,
                 bytes_and_mib(pool.bytes_per_block),
-                pool.runway_blocks
+                pool.runway_blocks,
+                pool.lanes
             );
             lane(&mut out, "pool lane", &pool.lane);
         }

@@ -96,7 +96,7 @@ vi.mock('node:fs', async (importOriginal) => {
 });
 
 // Bound AFTER the (hoisted) mock so the module under test uses the wrapped `node:fs`.
-const { walkDirStats } = await import('../src/models.js');
+const { holdsModelFiles, summarizeForeignEntry, walkDirStats } = await import('../src/models.js');
 
 let dir: string;
 
@@ -254,4 +254,50 @@ it('does not opendir/follow a queued dir that is swapped to a symlink before it 
   expect(stats.fileCount).toBe(1);
   expect(stats.sizeBytes).toBe(4);
   expect(stats.truncated).toBe(false);
+});
+
+it('a blocker summary stops at its budget and says so, with no names', () => {
+  for (let i = 0; i < 8; i++) writeFileSync(join(dir, `f${i}`), Buffer.alloc(2));
+  const summary = summarizeForeignEntry(dir, 5);
+  expect(summary).toMatchObject({ kind: 'directory', truncated: true, fileCount: 5, names: [] });
+  expect(fsCounters.readdir).toBe(0);
+});
+
+it('a blocker summary reports a subtree it could not open as truncated', () => {
+  writeFileSync(join(dir, 'top.bin'), Buffer.alloc(4));
+  const sub = join(dir, 'sub');
+  mkdirSync(sub);
+  writeFileSync(join(sub, 'inner.bin'), Buffer.alloc(8));
+  fsFail.opendirThrowOn = sub;
+  expect(summarizeForeignEntry(dir)).toMatchObject({ truncated: true, fileCount: 1, sizeBytes: 4, names: [] });
+});
+
+it('a blocker summary holds at most one Dir handle on a deep tree', () => {
+  let current = dir;
+  for (let depth = 0; depth < 12; depth++) {
+    current = join(current, `d${depth}`);
+    mkdirSync(current);
+    writeFileSync(join(current, 'x'), 'x');
+  }
+  expect(summarizeForeignEntry(dir)).toMatchObject({ fileCount: 12, truncated: false });
+  expect(fsCounters.maxOpenHandles).toBe(1);
+});
+
+it('the held-model scan shares one entry budget across the tree, holds one Dir handle, and fails closed', () => {
+  for (let v = 0; v < 3; v++) {
+    const variant = join(dir, `v${v}`);
+    mkdirSync(variant);
+    for (let i = 0; i < 3; i++) writeFileSync(join(variant, `f${i}.txt`), 'x');
+  }
+  expect(holdsModelFiles(dir, 100)).toBe(false);
+  expect(fsCounters.maxOpenHandles).toBe(1);
+  fsCounters.readSync = 0;
+  expect(holdsModelFiles(dir, 6)).toBe(true);
+  // 6 entries, plus one end-of-stream or over-budget read per listing opened (root, and at most two folders).
+  expect(fsCounters.readSync).toBeLessThanOrEqual(6 + 3);
+  fsFail.opendirThrowOn = join(dir, 'v1');
+  expect(holdsModelFiles(dir, 100)).toBe(true);
+  fsFail.opendirThrowOn = null;
+  fsFail.readThrowOn = join(dir, 'v2');
+  expect(holdsModelFiles(dir, 100)).toBe(true);
 });

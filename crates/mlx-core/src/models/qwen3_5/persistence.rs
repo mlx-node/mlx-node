@@ -365,6 +365,63 @@ fn apply_sanitized_value_transforms(
     Ok(())
 }
 
+/// The part of a raw key from its `mtp.` segment on; the probe runs before
+/// the rename spec strips `model.` / `language_model.` wrappers.
+fn mtp_relative_key(key: &str) -> Option<&str> {
+    let mut from = 0;
+    while let Some(offset) = key[from..].find("mtp.") {
+        let at = from + offset;
+        if at == 0 || key.as_bytes()[at - 1] == b'.' {
+            return Some(&key[at..]);
+        }
+        from = at + 1;
+    }
+    None
+}
+
+/// The hidden-width MTP norms the shift decision reads.
+fn is_mtp_probe_norm(key: &str) -> bool {
+    mtp_relative_key(key).is_some_and(|rest| {
+        rest == "mtp.pre_fc_norm_embedding.weight"
+            || rest == "mtp.pre_fc_norm_hidden.weight"
+            || (rest.starts_with("mtp.layers.")
+                && (rest.ends_with(".input_layernorm.weight")
+                    || rest.ends_with(".post_attention_layernorm.weight")))
+    })
+}
+
+/// Whether the checkpoint's MTP norms are stored raw (γ−1) and need +1.0.
+/// One decision covers every MTP norm tensor; no MTP norm means no shift.
+pub(crate) fn mtp_norms_need_shift(
+    params: &HashMap<String, MxArray>,
+    family: &str,
+) -> Result<bool> {
+    // Raw ≈ 0, shifted ≈ 1: the mean of the per-tensor means of the hidden-width
+    // MTP norms (input, post-attention, both pre-fc); `mtp.norm` and q/k norms
+    // are left out because their raw means reach 0.7–3.4.
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for (key, value) in params {
+        if !is_mtp_probe_norm(key) || value.ndim()? != 1 {
+            continue;
+        }
+        let mean = value.astype(DType::Float32)?.mean(None, None)?;
+        mean.eval();
+        sum += f64::from(mean.item_at_float32(0)?);
+        count += 1;
+    }
+    if count == 0 {
+        return Ok(false);
+    }
+    let mean = sum / count as f64;
+    let need = mean < 0.5;
+    info!(
+        "{family} sanitize_weights: MTP-norm probe mean={mean:.4} over {count} norms \
+         (raw≈0 shifted≈1) → mtp_norms_need_shift={need}",
+    );
+    Ok(need)
+}
+
 /// 5. Norm weight +1.0 adjustment (when unsanitized weights detected)
 /// 6. Remove MTP (multi-token prediction) weights
 /// 7. FP8 E4M3 dequantization (weight + weight_scale_inv → bf16)
@@ -457,44 +514,9 @@ fn sanitize_weights(
         crate::array::memory::synchronize_and_clear_cache();
     }
 
-    // Probe whether MTP norm weights are in raw-HF form and need a +1.0
-    // shift. This is INDEPENDENT of `needs_norm_fix` above: `mlx convert`
-    // historically skipped the +1.0 shift for every `mtp.*` key, so a
-    // checkpoint converted before that fix carries already-shifted LM-body
-    // norms but raw (~0) MTP norms. `fast::rms_norm` is direct-convention,
-    // so a raw MTP norm evaluates (w-1)·x → garbage drafts → zero MTP
-    // acceptance. Probe a representative MTP norm's mean: raw ≈ 0.04,
-    // correct ≈ 1.04, so the 0.5 threshold has ~0.46 margin on each side.
-    // A probe failure conservatively defaults to "no shift" (no panic,
-    // no double-shift hazard).
-    let mtp_norms_need_shift = if has_mtp_weights {
-        // Probe by suffix, not exact key: this runs BEFORE the rename spec
-        // strips `model.` / `language_model.` prefixes, so a checkpoint
-        // with prefixed MTP keys (e.g. `model.mtp.layers.0...`) must still
-        // be matched. No non-MTP tensor ends with this suffix.
-        params
-            .iter()
-            .find(|(k, _)| k.ends_with("mtp.layers.0.input_layernorm.weight"))
-            .map(|(_, a)| a)
-            .and_then(|a| {
-                let f32a = a.astype(DType::Float32).ok()?;
-                let m = f32a.mean(None, None).ok()?;
-                m.eval();
-                m.item_at_float32(0).ok()
-            })
-            .map(|mean| {
-                let need = mean < 0.5;
-                info!(
-                    "Qwen3.5 sanitize_weights: MTP-norm probe mean={:.4} \
-                     (raw≈0.04 correct≈1.04) → mtp_norms_need_shift={}",
-                    mean, need,
-                );
-                need
-            })
-            .unwrap_or(false)
-    } else {
-        false
-    };
+    // Independent of `needs_norm_fix`: a checkpoint can pair a shifted body
+    // with raw MTP norms (e.g. mlx-community conversions keep `mtp.*` raw).
+    let mtp_norms_need_shift = mtp_norms_need_shift(&params, "Qwen3.5")?;
 
     // Declarative key rewrite — drop visual-encoder weights (for VL models),
     // strip the wrapper prefixes (VL models use `model.language_model.*`,
@@ -3236,6 +3258,7 @@ async fn load_with_thread_impl(
                 // registration, so a concurrent grow (or another model's load) never
                 // reads sibling pool totals that miss this reservation; the start's
                 // retry waits outside it. See `cache_limit::pool_growth_lock`.
+                inner.persist_cold = persist_cold;
                 let pool_cache_limit_guard =
                     crate::engine::governor::governor::start_under_growth_lock(
                         crate::engine::governor::governor(),
@@ -3309,6 +3332,7 @@ async fn load_with_thread_impl(
             let spatial_merge_size = inner.spatial_merge_size.unwrap_or(2);
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
+            let scheduled_lanes = inner.scheduled_lanes();
             let mtp_active = inner.has_speculative_weights();
             let vision_active = super::model::qwen35_dense_vision_active(
                 inner.vision_encoder.is_some(),
@@ -3339,6 +3363,7 @@ async fn load_with_thread_impl(
                     cache_limit_guard,
                     pool_cache_limit_guard,
                     paged_active,
+                    scheduled_lanes,
                     mtp_active,
                     vision_active,
                     context_limits,
@@ -3357,6 +3382,7 @@ async fn load_with_thread_impl(
         cache_limit_guard,
         pool_cache_limit_guard,
         paged_active,
+        scheduled_lanes,
         mtp_active,
         vision_active,
         context_limits,
@@ -3371,6 +3397,7 @@ async fn load_with_thread_impl(
         thread,
         config,
         paged_active,
+        scheduled_lanes,
         mtp_active,
         vision_active,
         image_processor,
@@ -3561,6 +3588,104 @@ pub fn create_random_qwen35_checkpoint<'env>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// MTP norm tensors with the given means, keyed under `prefix`.
+    fn mtp_norms(prefix: &str, means: [f32; 7]) -> HashMap<String, MxArray> {
+        let names = [
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.layers.0.post_attention_layernorm.weight",
+            "mtp.layers.0.self_attn.q_norm.weight",
+            "mtp.layers.0.self_attn.k_norm.weight",
+            "mtp.norm.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+        ];
+        let mut params = HashMap::new();
+        for (name, mean) in names.into_iter().zip(means) {
+            // A spread around the mean, as in a real norm vector.
+            let values = [mean - 0.3, mean + 0.3, mean - 0.1, mean + 0.1];
+            let array = MxArray::from_float32(&values, &[4])
+                .and_then(|a| a.astype(DType::BFloat16))
+                .expect("norm tensor");
+            params.insert(format!("{prefix}{name}"), array);
+        }
+        params.insert(
+            format!("{prefix}layers.0.input_layernorm.weight"),
+            MxArray::from_float32(&[0.0; 4], &[4]).expect("body norm"),
+        );
+        params
+    }
+
+    /// Raw MTP norms (γ−1) are shifted and shifted ones are not, decided
+    /// once from the hidden-width MTP norms. Means are the tensors' real
+    /// means; bf16 rounding moves them by < 0.01. Mutation: decide from
+    /// `mtp.layers.0.input_layernorm` alone (`< 0.5`) → the 0.8B case red.
+    #[test]
+    fn mtp_norm_shift_reads_every_hidden_width_mtp_norm() {
+        // [input, post-attention, q, k, mtp.norm, pre-fc embedding, pre-fc hidden]
+        let cases: [(&str, &str, [f32; 7], bool); 6] = [
+            (
+                "Qwen3.5-0.8B: raw, input norm just above 0.5",
+                "model.language_model.",
+                [0.5052, 0.4270, 0.8228, 0.7820, 3.4390, -0.4334, -0.3436],
+                true,
+            ),
+            (
+                "Qwen3.5-4B: raw",
+                "",
+                [0.3036, 0.3855, 0.7458, 0.7354, 2.5754, -0.4092, -0.2452],
+                true,
+            ),
+            (
+                "raw, every norm near 0-0.3",
+                "model.",
+                [0.0, 0.3, 0.2, 0.1, 0.25, 0.05, 0.15],
+                true,
+            ),
+            (
+                "Qwen3.6-35B-A3B converted: shifted, pre-fc norms below 0.5",
+                "language_model.model.",
+                [0.9049, 1.8685, 1.7670, 1.7418, 2.9253, 0.2734, 0.4937],
+                false,
+            ),
+            (
+                "shifted, every norm near 1.1-1.4",
+                "",
+                [1.1, 1.4, 1.3, 1.2, 1.25, 1.15, 1.35],
+                false,
+            ),
+            (
+                "shifted, input norm below the old 0.5 cut",
+                "",
+                [0.45, 1.3, 1.7, 1.7, 2.5, 1.2, 1.3],
+                false,
+            ),
+        ];
+        for (label, prefix, means, expected) in cases {
+            let params = mtp_norms(prefix, means);
+            assert_eq!(
+                mtp_norms_need_shift(&params, "test").expect("probe"),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    /// No MTP norm, or a key whose `mtp.` is not a path segment, decides
+    /// nothing.
+    #[test]
+    fn mtp_norm_shift_needs_an_mtp_norm() {
+        let mut params = HashMap::new();
+        params.insert(
+            "model.layers.0.input_layernorm.weight".to_string(),
+            MxArray::from_float32(&[0.0; 4], &[4]).expect("body norm"),
+        );
+        params.insert(
+            "model.notmtp.layers.0.input_layernorm.weight".to_string(),
+            MxArray::from_float32(&[0.0; 4], &[4]).expect("odd key"),
+        );
+        assert!(!mtp_norms_need_shift(&params, "test").expect("probe"));
+    }
 
     /// Splash `validateTextConfig`: `rope_type` when present, else `type`,
     /// must be `default`; an already scaled checkpoint is refused before

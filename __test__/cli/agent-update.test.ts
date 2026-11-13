@@ -19,12 +19,20 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { PassThrough } from 'node:stream';
 
+import {
+  agentTagFromBinPath,
+  managedAgentBinPath,
+  probeAgentInstall,
+  MLX_AGENT_BIN_ENV,
+  MLX_AGENT_TAG_ENV,
+  MLX_AGENT_MIN_RELEASE,
+  type AgentInstallProbe,
+} from '@mlx-node/agent/binary';
 import { describe, expect, it, vi, afterEach, beforeEach } from 'vitest';
 
 import {
   acquireInstallLock,
   lockDirPath,
-  agentTagFromBinPath,
   agentUpdateStatus,
   launchGrokAgent,
   leasePinnedManaged,
@@ -32,22 +40,17 @@ import {
   writeLeaseMarker,
   applyAgentUpdate,
   downloadAgentBinary,
-  managedAgentBinPath,
   markerProbePath,
   parseLockMarker,
-  probeAgentInstall,
   releaseInstallLock,
   removeIfUnchanged,
   resolveAgentBinary,
   scanMembers,
   resolveReleaseTag,
-  MLX_AGENT_BIN_ENV,
-  MLX_AGENT_TAG_ENV,
-  MLX_AGENT_MIN_RELEASE,
-  type AgentInstallProbe,
 } from '../../packages/cli/src/commands/agent/grok-build.js';
 import { run } from '../../packages/cli/src/commands/agent/index.js';
 import { parseServeArgs } from '../../packages/cli/src/commands/serve.js';
+import { AGENT_HOST_THINKING } from '../../packages/server/src/host/agent-thinking.js';
 
 const MANAGED = { source: 'managed', path: '/m/mlx-agent' } satisfies Partial<AgentInstallProbe>;
 
@@ -145,7 +148,13 @@ describe('probeAgentInstall', () => {
       writeFileSync(versioned(root, 'mlx-agent-v0.3.3'), 'v033');
       writeFileSync(versioned(root, 'mlx-agent-v0.4.0'), 'v040');
       writeFileSync(`${managedAgentBinPath(root)}.tag`, 'mlx-agent-v0.4.0');
-      const probe = probeAgentInstall(root, { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.3.3' }, root);
+      const probe = probeAgentInstall(
+        root,
+        { [MLX_AGENT_TAG_ENV]: 'mlx-agent-v0.3.3' },
+        root,
+        undefined,
+        writeLeaseMarker,
+      );
       // The pin selects its exact release even though the pointer names a newer one.
       expect(probe).toMatchObject({
         source: 'managed',
@@ -1831,6 +1840,7 @@ describe('launchGrokAgent server gating', () => {
   let savedAgentBin: string | undefined;
   let savedAgentTag: string | undefined;
 
+  const persistPagedCache = { byDefault: true, wholePrompt: true };
   const serveKills: ReturnType<typeof vi.fn>[] = [];
   const spawnServe = vi.fn((_argv: string[], _so: SpawnOptions) => {
     const kill = vi.fn();
@@ -1885,6 +1895,7 @@ describe('launchGrokAgent server gating', () => {
       argv: ['--system-prompt-override', '--help', '-p', 'hi'],
       spawnServe,
       spawnAgent,
+      persistPagedCache,
     });
     expect(code).toBe(0);
     expect(spawnServe).toHaveBeenCalledOnce();
@@ -1902,7 +1913,7 @@ describe('launchGrokAgent server gating', () => {
     process.env.NO_PROXY = 'corp.example';
     delete process.env.no_proxy;
     try {
-      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent });
+      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent, persistPagedCache });
     } finally {
       for (const [name, value] of Object.entries(saved)) {
         if (value === undefined) delete process.env[name];
@@ -1926,7 +1937,7 @@ describe('launchGrokAgent server gating', () => {
   });
 
   it('passes the auth token as one --auth-token=<tok> arg so a leading dash still parses', async () => {
-    await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent });
+    await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent, persistPagedCache });
     const serveArgv: string[] = spawnServe.mock.calls[0]![0];
     const tokenArg = serveArgv.find((a) => a.startsWith('--auth-token'));
     expect(tokenArg).toMatch(/^--auth-token=.+/);
@@ -1936,64 +1947,127 @@ describe('launchGrokAgent server gating', () => {
   });
 
   it('asks the spawned serve to preload the chosen model', async () => {
-    await launchGrokAgent({ argv: ['-m', 'qwen-local'], preloadModel: 'qwen-local', spawnServe, spawnAgent });
+    await launchGrokAgent({
+      argv: ['-m', 'qwen-local'],
+      preloadModel: 'qwen-local',
+      spawnServe,
+      spawnAgent,
+      persistPagedCache,
+    });
     const serveArgv = spawnServe.mock.calls[0]![0];
     expect(serveArgv.slice(serveArgv.indexOf('--preload'))).toEqual(['--preload', 'qwen-local']);
 
     spawnServe.mockClear();
-    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent, persistPagedCache });
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--preload');
+  });
+
+  describe('the paged KV disk cache of the spawned serve', () => {
+    const PERSIST_ENV = 'MLX_PERSIST_PAGED_CACHE';
+    let savedPersist: string | undefined;
+    beforeEach(() => {
+      savedPersist = process.env[PERSIST_ENV];
+      delete process.env[PERSIST_ENV];
+    });
+    afterEach(() => {
+      if (savedPersist === undefined) delete process.env[PERSIST_ENV];
+      else process.env[PERSIST_ENV] = savedPersist;
+    });
+
+    /** `mlx agent <argv>` from the argv scan to the spawned serve's own parse of its argv. */
+    async function serveDiskCache(argv: string[]): Promise<boolean | undefined> {
+      spawnServe.mockClear();
+      await run(argv, {
+        resolveModelsDir: (explicit) => explicit ?? '/fake/models',
+        discoverModels: () => Promise.resolve([{ name: 'qwen-local' }]),
+        readPersistedDefault: () => undefined,
+        launch: (opts) => launchGrokAgent({ ...opts, spawnServe, spawnAgent }),
+      });
+      expect(spawnServe).toHaveBeenCalledOnce();
+      return parseServeArgs(spawnServe.mock.calls[0]![0].slice(2)).persistCache;
+    }
+
+    it('mlx agent keeps the disk cache on', async () => {
+      expect(await serveDiskCache(['-p', 'hi'])).toBe(true);
+    });
+
+    it('mlx agent --no-persist-cache turns the disk cache off', async () => {
+      expect(await serveDiskCache(['--no-persist-cache', '-p', 'hi'])).toBe(false);
+    });
+
+    it('mlx agent asks the spawned serve to capture the whole prompt', async () => {
+      await serveDiskCache(['-p', 'hi']);
+      const serveArgv: string[] = spawnServe.mock.calls[0]![0];
+      expect(parseServeArgs(serveArgv.slice(2)).persistWholePrompt).toBe(true);
+    });
+
+    it('MLX_PERSIST_PAGED_CACHE turns it off without the flag, and the flag beats the env', async () => {
+      process.env[PERSIST_ENV] = '0';
+      expect(await serveDiskCache(['-p', 'hi'])).toBe(false);
+      process.env[PERSIST_ENV] = '1';
+      expect(await serveDiskCache(['--no-persist-cache', '-p', 'hi'])).toBe(false);
+    });
   });
 
   // Mutation: drop the `--kv-format` pair from the serve argv → red.
   it('hands --kv-format to the spawned serve', async () => {
-    await launchGrokAgent({ argv: ['-c'], kvFormat: 'bf16', spawnServe, spawnAgent });
+    await launchGrokAgent({ argv: ['-c'], kvFormat: 'bf16', spawnServe, spawnAgent, persistPagedCache });
     const serveArgv: string[] = spawnServe.mock.calls[0]![0];
     expect(serveArgv.slice(-2)).toEqual(['--kv-format', 'bf16']);
     expect(parseServeArgs(serveArgv.slice(2)).kvFormat).toBe('bf16');
 
     spawnServe.mockClear();
-    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent, persistPagedCache });
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--kv-format');
   });
 
   // Mutation: drop the `--max-memory` pair from the serve argv → red.
   it('hands --max-memory to the spawned serve as bytes', async () => {
-    await launchGrokAgent({ argv: ['-c'], maxMemoryBytes: 30_064_771_072, spawnServe, spawnAgent });
+    await launchGrokAgent({ argv: ['-c'], maxMemoryBytes: 30_064_771_072, spawnServe, spawnAgent, persistPagedCache });
     const serveArgv: string[] = spawnServe.mock.calls[0]![0];
     expect(serveArgv.slice(-2)).toEqual(['--max-memory', '30064771072']);
     expect(parseServeArgs(serveArgv.slice(2)).maxMemoryBytes).toBe(30_064_771_072);
 
     spawnServe.mockClear();
-    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent, persistPagedCache });
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--max-memory');
   });
 
   // Mutation: drop the `--max-context` pair from the serve argv → red.
   it('hands --max-context to the spawned serve as tokens', async () => {
-    await launchGrokAgent({ argv: ['-c'], maxContextTokens: 102_400, spawnServe, spawnAgent });
+    await launchGrokAgent({ argv: ['-c'], maxContextTokens: 102_400, spawnServe, spawnAgent, persistPagedCache });
     const serveArgv: string[] = spawnServe.mock.calls[0]![0];
     expect(serveArgv.slice(-2)).toEqual(['--max-context', '102400']);
     expect(parseServeArgs(serveArgv.slice(2)).maxContextTokens).toBe(102_400);
 
     spawnServe.mockClear();
-    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent, persistPagedCache });
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--max-context');
+  });
+
+  // The server `mlx agent` starts runs agents. Mutation: drop the budget pair from the serve argv → red.
+  it('hands the agent hosts thinking budget, cycle guard and end text to the spawned serve', async () => {
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent, persistPagedCache });
+    const serveArgv: string[] = spawnServe.mock.calls[0]![0];
+    const args = parseServeArgs(serveArgv.slice(2));
+    expect(args.thinkingTokenBudget).toBe(AGENT_HOST_THINKING.tokenBudget);
+    expect(args.thinkingCycleGuard).toBe(true);
+    expect(args.thinkingEndText).toBe(AGENT_HOST_THINKING.endText);
   });
 
   // Mutation: drop the `--idle-release` pair from the serve argv → red.
   it('hands --idle-release to the spawned serve as Splash spells it', async () => {
-    await launchGrokAgent({ argv: ['-c'], idleReleaseSeconds: 1800, spawnServe, spawnAgent });
+    await launchGrokAgent({ argv: ['-c'], idleReleaseSeconds: 1800, spawnServe, spawnAgent, persistPagedCache });
     const serveArgv: string[] = spawnServe.mock.calls[0]![0];
     expect(serveArgv.slice(-2)).toEqual(['--idle-release', '1800']);
     expect(parseServeArgs(serveArgv.slice(2)).idleReleaseSeconds).toBe(1800);
 
     spawnServe.mockClear();
-    await launchGrokAgent({ argv: ['-c'], idleReleaseSeconds: Infinity, spawnServe, spawnAgent });
+    await launchGrokAgent({ argv: ['-c'], idleReleaseSeconds: Infinity, spawnServe, spawnAgent, persistPagedCache });
     expect(spawnServe.mock.calls[0]![0].slice(-2)).toEqual(['--idle-release', 'off']);
 
     spawnServe.mockClear();
-    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent, persistPagedCache });
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--idle-release');
   });
 
@@ -2002,11 +2076,11 @@ describe('launchGrokAgent server gating', () => {
     const saved = mediaEnv.map((name) => process.env[name]);
     try {
       for (const name of mediaEnv) delete process.env[name];
-      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent });
+      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent, persistPagedCache });
       for (const name of mediaEnv) expect(spawnAgent.envs[0]![name]).toBe('0');
 
       process.env.GROK_IMAGE_GEN = '1';
-      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent });
+      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent, persistPagedCache });
       expect(spawnAgent.envs[1]!.GROK_IMAGE_GEN).toBe('1');
       expect(spawnAgent.envs[1]!.GROK_VIDEO_GEN).toBe('0');
 
@@ -2025,11 +2099,11 @@ describe('launchGrokAgent server gating', () => {
     const saved = process.env.GROK_RESUME_COMMAND;
     try {
       delete process.env.GROK_RESUME_COMMAND;
-      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent });
+      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent, persistPagedCache });
       expect(spawnAgent.envs[0]!.GROK_RESUME_COMMAND).toBe('mlx agent');
 
       process.env.GROK_RESUME_COMMAND = 'my-wrapper';
-      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent });
+      await launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent, persistPagedCache });
       expect(spawnAgent.envs[1]!.GROK_RESUME_COMMAND).toBe('my-wrapper');
     } finally {
       if (saved === undefined) delete process.env.GROK_RESUME_COMMAND;
@@ -2057,7 +2131,7 @@ describe('launchGrokAgent server gating', () => {
       spawnedAt.push(polls);
       return spawnAgent(bin, argv, so);
     };
-    const launch = { argv: ['-c'], preloadModel: 'qwen-local', spawnServe, preloadPollMs: 5 };
+    const launch = { argv: ['-c'], preloadModel: 'qwen-local', spawnServe, persistPagedCache, preloadPollMs: 5 };
     await launchGrokAgent({ ...launch, spawnAgent: agentAfterPolls });
     expect(spawnedAt).toEqual([4]);
 
@@ -2088,7 +2162,14 @@ describe('launchGrokAgent server gating', () => {
       return child as unknown as ChildProcess;
     });
     await expect(
-      launchGrokAgent({ argv: ['-c'], preloadModel: 'qwen-local', spawnServe, spawnAgent, preloadPollMs: 5 }),
+      launchGrokAgent({
+        argv: ['-c'],
+        preloadModel: 'qwen-local',
+        spawnServe,
+        spawnAgent,
+        persistPagedCache,
+        preloadPollMs: 5,
+      }),
     ).rejects.toThrow('mlx serve exited (1) while loading qwen-local');
     expect(spawnAgent.envs).toHaveLength(0);
   });
@@ -2106,7 +2187,7 @@ describe('launchGrokAgent server gating', () => {
       }) as unknown as ChildProcess;
     });
     await expect(
-      launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent, serveReadyTimeoutMs: 50 }),
+      launchGrokAgent({ argv: ['-p', 'hi'], spawnServe, spawnAgent, persistPagedCache, serveReadyTimeoutMs: 50 }),
     ).rejects.toThrow('timed out waiting for `mlx serve`');
     expect(serveKills[0]!).toHaveBeenCalledWith('SIGTERM');
   });
@@ -2121,6 +2202,7 @@ describe('launchGrokAgent server gating', () => {
       launchGrokAgent({
         argv: ['-p', 'hi'],
         spawnServe,
+        persistPagedCache,
         spawnAgent: () => {
           queueMicrotask(() => agent.emit('error', new Error('spawn EACCES')));
           return agent;
@@ -2158,6 +2240,7 @@ describe('launchGrokAgent server gating', () => {
       const launch = launchGrokAgent({
         argv: ['-p', 'hi'],
         spawnServe,
+        persistPagedCache,
         spawnAgent: () => {
           agentSpawned = true;
           return agent;
@@ -2264,6 +2347,7 @@ await launchGrokAgent({
   argv: ['-c'],
   preloadModel: 'qwen-local',
   preloadPollMs: 20,
+  persistPagedCache: { byDefault: true, wholePrompt: true },
   ${graceMs === undefined ? '' : `serveStopGraceMs: ${graceMs},`}
   ${readyTimeoutMs === undefined ? '' : `serveReadyTimeoutMs: ${readyTimeoutMs},`}
   spawnServe: (_argv, so) => spawn(process.execPath, [${JSON.stringify(fakeServe)}], so),

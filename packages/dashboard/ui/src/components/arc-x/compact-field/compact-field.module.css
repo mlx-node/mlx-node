@@ -1,0 +1,19 @@
+.compact {
+  position: relative;
+  min-width: 0;
+}
+
+.compact.compact label:first-of-type {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* A narrow field cuts its placeholder; the cut must read as one. */
+.compact input {
+  text-overflow: ellipsis;
+}

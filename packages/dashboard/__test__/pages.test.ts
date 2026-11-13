@@ -19,42 +19,62 @@
 
 import { MessageChannel } from 'node:worker_threads';
 
-import { categoryChartHeight, categoryLabels, truncateMiddle } from '@/lib/chart';
+import { categoryLabels, truncateMiddle } from '@/lib/labels';
+import { modelShareLabel } from '@/lib/metrics-view';
+import { toast } from '@/lib/toast';
 import type {
   CacheResponse,
   CacheScope,
+  CatalogBlocker,
   CatalogItem,
   CatalogResponse,
   CatalogUpdatesResponse,
   ColdTierHealth,
   DownloadJob,
   DownloadsResponse,
-  MetricsOverviewResponse,
   ModelsResponse,
 } from '@/lib/types';
 import Cache from '@/pages/cache';
 import Metrics from '@/pages/metrics';
 import Models from '@/pages/models';
+import { blockerPhrase, CatalogDownloadAction, reinstallContent } from '@/pages/models/catalog';
 import Overview from '@/pages/overview';
-import { act, createElement } from 'react';
+import { type AppCommand, usePageCommands } from '@/shell/commands';
+import { act, createElement, type ReactNode } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
-import { toast } from 'sonner';
-import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
+import { afterEach, describe, expect, it, onTestFinished, vi } from 'vite-plus/test';
 
+import type { ApiResponse } from '../src/api/errors.js';
 import type { DownloadEvent } from '../src/download.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
 import type { ApiCall } from '../src/runtime.js';
 import { connectDashboardApi, disconnectDashboardApi } from '../ui/src/lib/api.js';
+import { splitWhitespace } from '../ui/src/lib/text-scan.js';
+import { reloadMountedQueries } from '../ui/src/lib/use-api.js';
+import {
+  byModelRow,
+  dayStart,
+  distributions,
+  emptySummary,
+  live,
+  liveModel,
+  process,
+  summary,
+  timeseries,
+  turnsPage,
+} from './helpers/observability-fixtures.js';
 import {
   STUB_FAILURE,
-  TICK_CHAR_PX,
-  TICK_LINE_PX,
+  byRole,
   deferred,
+  observeWidth,
   renderPage,
   sequence,
+  statValue,
   stubApi,
-  stubChartMetrics,
+  waitFor,
   type RenderedPage,
 } from './render.js';
 
@@ -97,8 +117,8 @@ function cacheFixture(overrides: CacheFixtureOverrides = {}): CacheResponse {
       ...overrides.disk,
     },
     trend: overrides.trend ?? [
-      { day: '2026-07-20', hits: 16_000, misses: 40, bytesWritten: 8 * MIB, bytesRestored: 64 * MIB },
-      { day: '2026-07-21', hits: 189, misses: 9, bytesWritten: 2 * MIB, bytesRestored: 16 * MIB },
+      { t: dayStart(2), hits: 16_000, misses: 40, bytesWritten: 8 * MIB, bytesRestored: 64 * MIB },
+      { t: dayStart(1), hits: 189, misses: 9, bytesWritten: 2 * MIB, bytesRestored: 16 * MIB },
     ],
     scope: {
       root: '/private/tmp/cold/mlx-paged-v1',
@@ -107,6 +127,7 @@ function cacheFixture(overrides: CacheFixtureOverrides = {}): CacheResponse {
       otherRoots: { turns: 3, hits: 17, misses: 19 },
       unattributed: { turns: 0, hits: 0, misses: 0 },
       disabledTurns: 2,
+      enabledTurns: 30,
       unrootedSidecarCaptures: 0,
       ...overrides.scope,
     },
@@ -160,15 +181,12 @@ function emptyCacheFixture(): CacheResponse {
 
 let mounted: RenderedPage | undefined;
 let restoreApi: (() => void) | undefined;
-let restoreMetrics: (() => void) | undefined;
 
 afterEach(() => {
   mounted?.unmount();
   mounted = undefined;
   restoreApi?.();
   restoreApi = undefined;
-  restoreMetrics?.();
-  restoreMetrics = undefined;
 });
 
 /**
@@ -191,7 +209,11 @@ async function mount(
 
 describe('Cache page', () => {
   it('reports blocks and sidecars as separate units and totals them as objects', async () => {
-    const text = await mount(createElement(Cache), { '/cache': cacheFixture() }, 'mlx-paged-v1');
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Cache)),
+      { '/cache': cacheFixture() },
+      'mlx-paged-v1',
+    );
     // F2: the tile total must be blocks + sidecars (138), the same number the
     // age histogram charts, and the sub-line must name both units. Reverting
     // cache.tsx puts back a "Blocks 136" tile beside a 138-object histogram.
@@ -202,8 +224,27 @@ describe('Cache page', () => {
     expect(text).not.toContain('persisted prefix blocks');
   });
 
+  it('shows the cache root under the home folder as ~/…, the canonical root on hover', async () => {
+    await mount(
+      createElement(MemoryRouter, null, createElement(Cache)),
+      {
+        '/cache': cacheFixture(),
+        '/health': { status: 'ok', modelsDir: '', tracesDir: '', runtimeDir: '', homeDir: '/tmp' },
+      },
+      'mlx-paged-v1',
+    );
+    const root = (): string =>
+      mounted!.container.querySelector('[title="/private/tmp/cold/mlx-paged-v1"]')?.textContent ?? '';
+    await waitFor(() => root() === '~/cold/mlx-paged-v1');
+    expect(mounted!.text()).not.toContain('/tmp/cold');
+  });
+
   it('splits the usage tile into block bytes and sidecar bytes', async () => {
-    const text = await mount(createElement(Cache), { '/cache': cacheFixture() }, 'mlx-paged-v1');
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Cache)),
+      { '/cache': cacheFixture() },
+      'mlx-paged-v1',
+    );
     expect(text).toContain('200 MB blocks + 100 MB sidecars');
   });
 
@@ -212,7 +253,11 @@ describe('Cache page', () => {
     // plumbed agent → traces → API for exactly one reason: the stated
     // acceptance bar is "corruptions must be 0" and nothing shipped could show
     // it. Reverting cache.tsx deletes this whole card.
-    const text = await mount(createElement(Cache), { '/cache': cacheFixture() }, 'mlx-paged-v1');
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Cache)),
+      { '/cache': cacheFixture() },
+      'mlx-paged-v1',
+    );
     expect(text).toContain('Cold-tier health');
     expect(text).toContain('Corruptions');
     expect(text).toContain('none seen (acceptance bar: 0)');
@@ -236,7 +281,7 @@ describe('Cache page', () => {
    */
   it('raises an alarm when the cache root is refusing writes', async () => {
     const text = await mount(
-      createElement(Cache),
+      createElement(MemoryRouter, null, createElement(Cache)),
       {
         '/cache': cacheFixture({
           health: {
@@ -270,7 +315,7 @@ describe('Cache page', () => {
    */
   it('says reuse was refused rather than "no lookups" when restores were declined', async () => {
     const text = await mount(
-      createElement(Cache),
+      createElement(MemoryRouter, null, createElement(Cache)),
       {
         '/cache': cacheFixture({
           trend: [],
@@ -296,7 +341,7 @@ describe('Cache page', () => {
 
   it('flags a non-zero cumulative corruption total even when the window delta is 0', async () => {
     const text = await mount(
-      createElement(Cache),
+      createElement(MemoryRouter, null, createElement(Cache)),
       {
         '/cache': cacheFixture({
           health: {
@@ -328,7 +373,11 @@ describe('Cache page', () => {
    * never rendered is the same defect one layer up.
    */
   it('renders the sidecar install and capture counters', async () => {
-    const text = await mount(createElement(Cache), { '/cache': cacheFixture() }, 'mlx-paged-v1');
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Cache)),
+      { '/cache': cacheFixture() },
+      'mlx-paged-v1',
+    );
     expect(text).toContain('Sidecar installs');
     expect(text).toContain('restored prefixes that reused family state instead of replaying it');
     expect(text).toContain('Sidecar captures');
@@ -348,7 +397,7 @@ describe('Cache page', () => {
    */
   it('flags restored prefixes whose state was re-derived instead of installed', async () => {
     const text = await mount(
-      createElement(Cache),
+      createElement(MemoryRouter, null, createElement(Cache)),
       { '/cache': cacheFixture({ health: { sidecarInstalled: 0, sidecarAlreadyPersisted: 12 } }) },
       'mlx-paged-v1',
     );
@@ -369,7 +418,7 @@ describe('Cache page', () => {
    */
   it('flags a capture that never lands or finds a sidecar', async () => {
     const text = await mount(
-      createElement(Cache),
+      createElement(MemoryRouter, null, createElement(Cache)),
       {
         '/cache': cacheFixture({
           health: {
@@ -392,7 +441,7 @@ describe('Cache page', () => {
   // NORMAL qwen3 reading and must not wear an alarm.
   it('reads a zero capture count as a dense family, not a fault', async () => {
     const text = await mount(
-      createElement(Cache),
+      createElement(MemoryRouter, null, createElement(Cache)),
       {
         '/cache': cacheFixture({
           health: {
@@ -425,7 +474,7 @@ describe('Cache page', () => {
    */
   it('does not read a hybrid capture that never got a tier as a dense family', async () => {
     const text = await mount(
-      createElement(Cache),
+      createElement(MemoryRouter, null, createElement(Cache)),
       {
         '/cache': cacheFixture({
           scope: { unrootedSidecarCaptures: 34 },
@@ -450,7 +499,7 @@ describe('Cache page', () => {
   // as a share and never as a second population a reader could add.
   it('labels the sidecar queue counters as a share of the object counters', async () => {
     const text = await mount(
-      createElement(Cache),
+      createElement(MemoryRouter, null, createElement(Cache)),
       { '/cache': cacheFixture({ health: { sidecarEnqueued: 12, sidecarQueueDrops: 3 } }) },
       'mlx-paged-v1',
     );
@@ -460,7 +509,11 @@ describe('Cache page', () => {
   it('never rounds a hit rate with real misses up to 100%', async () => {
     // 16189 hits / 49 misses is 99.6982 %. `Math.round` renders that as "100%"
     // directly above the line that prints the 49 misses.
-    const text = await mount(createElement(Cache), { '/cache': cacheFixture() }, 'mlx-paged-v1');
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Cache)),
+      { '/cache': cacheFixture() },
+      'mlx-paged-v1',
+    );
     expect(text).toContain('>99%');
     expect(text).not.toContain('100%');
     expect(text).toContain('16.2K hits · 49 misses · this cache only');
@@ -468,11 +521,15 @@ describe('Cache page', () => {
 
   it('names the rows the root scope excluded instead of folding or dropping them', async () => {
     // F1: the trend is filtered to one cache root. Rows outside it are reported.
-    const text = await mount(createElement(Cache), { '/cache': cacheFixture() }, 'mlx-paged-v1');
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Cache)),
+      { '/cache': cacheFixture() },
+      'mlx-paged-v1',
+    );
     expect(text).toContain('7 turns recorded before cache attribution existed (11 hits · 13 misses)');
     expect(text).toContain('they age out within 30 days');
     expect(text).toContain('3 turns ran against a different cache directory (17 hits · 19 misses)');
-    expect(text).toContain('Lookups against THIS cache root, by day · last 30 days');
+    expect(text).toContain('Lookups against this cache root, per day · last 30 days');
   });
 
   it('names the tier-on-but-unattributed bucket instead of letting its lookups vanish', async () => {
@@ -480,7 +537,7 @@ describe('Cache page', () => {
     // all, so its hits appeared nowhere — not in the trend, not in any excluded
     // line. The page must say it out loud.
     const text = await mount(
-      createElement(Cache),
+      createElement(MemoryRouter, null, createElement(Cache)),
       {
         '/cache': cacheFixture({
           scope: {
@@ -501,7 +558,11 @@ describe('Cache page', () => {
   it('lists the served restore families in the empty state rather than "(qwen3 dense)"', async () => {
     // F5: four families are allowlisted; the hint used to name one, and the
     // list is served over the wire so it cannot drift from the native gate.
-    const text = await mount(createElement(Cache), { '/cache': emptyCacheFixture() }, 'mlx-paged-v1');
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Cache)),
+      { '/cache': emptyCacheFixture() },
+      'mlx-paged-v1',
+    );
     expect(text).toContain('gemma4, qwen3, qwen3_5, qwen3_5_moe');
     expect(text).not.toContain('(qwen3 dense)');
     expect(text).toContain('No cold-tier objects persisted yet.');
@@ -509,7 +570,11 @@ describe('Cache page', () => {
   });
 
   it('points an empty trend at the excluded lookups instead of a dead end', async () => {
-    const text = await mount(createElement(Cache), { '/cache': emptyCacheFixture() }, 'mlx-paged-v1');
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Cache)),
+      { '/cache': emptyCacheFixture() },
+      'mlx-paged-v1',
+    );
     expect(text).toContain('No hits or misses recorded for this cache.');
     expect(text).toContain('60 lookups were recorded against a different (or unattributed) cache root');
   });
@@ -521,27 +586,32 @@ describe('Cache page', () => {
     // The other F6 case (16189/16238) cannot discriminate, because formatPercent
     // was given the same >=99.5 saturation in this change and both return '>99%'.
     // '0%' here would be its own small lie: nothing was ever looked up.
-    const text = await mount(createElement(Cache), { '/cache': emptyCacheFixture() }, 'mlx-paged-v1');
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Cache)),
+      { '/cache': emptyCacheFixture() },
+      'mlx-paged-v1',
+    );
     // Scoped to the Hit rate tile: '0%' legitimately appears elsewhere on an
     // empty page (quota usage really is 0% of the quota).
-    expect(text).toContain('Hit rate—');
+    expect(statValue(mounted!.container, 'Hit rate')).toBe('—');
     expect(text).toContain('no lookups recorded for this cache');
-    expect(text).not.toContain('Hit rate0%');
   });
 
   it('labels the evict confirmation in objects, matching the count it shows', async () => {
-    // 9a: the dialog counted OBJECTS while its title said "blocks". Radix
-    // portals the content to document.body, so read from there.
+    // 9a: the dialog counted OBJECTS while its title said "blocks". The
+    // confirmation is a portalled dialog, so read it from the document.
     restoreApi = stubApi({ '/cache': cacheFixture() });
-    mounted = await renderPage(createElement(Cache), (text) => text.includes('mlx-paged-v1'));
+    mounted = await renderPage(createElement(MemoryRouter, null, createElement(Cache)), (text) =>
+      text.includes('mlx-paged-v1'),
+    );
     const evict = [...mounted.container.querySelectorAll('button')].find((b) => b.textContent?.includes('Evict older'));
     expect(evict).toBeDefined();
     expect(evict?.disabled).toBe(false);
-    const { act } = await import('react');
     await act(async () => {
       evict?.click();
     });
-    const dialog = (document.body.textContent ?? '').replace(/\s+/g, ' ');
+    await waitFor(() => document.querySelector('[role="dialog"]') !== null);
+    const dialog = splitWhitespace(document.querySelector('[role="dialog"]')?.textContent ?? '').join(' ');
     expect(dialog).toContain('Evict old cache objects?');
     expect(dialog).not.toContain('Evict old cache blocks?');
     // 7-30d (6) + >30d (2) = 8 objects, 50 MB.
@@ -551,12 +621,20 @@ describe('Cache page', () => {
 
 describe('Overview page', () => {
   function overviewRoutes(cache: CacheResponse): Record<string, unknown> {
-    const models: ModelsResponse = { models: [], warnings: [], dir: '/models' };
+    const models: ModelsResponse = {
+      models: [],
+      warnings: [],
+      dir: '/models',
+      host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
+    };
     const downloads: DownloadsResponse = { jobs: [] };
     return {
       '/models': models,
       '/downloads': downloads,
       '/cache': cache,
+      '/metrics/summary': emptySummary(),
+      '/metrics/timeseries': timeseries([]),
+      '/metrics/turns': turnsPage([]),
     };
   }
 
@@ -571,16 +649,13 @@ describe('Overview page', () => {
       ],
     };
     await mount(createElement(MemoryRouter, null, createElement(Overview)), routes, 'including companions');
-    const tile = [...mounted!.container.querySelectorAll('[data-slot="card"]')].find((el) =>
-      el.textContent?.startsWith('Local models'),
-    )!;
-    expect(tile.textContent).toContain('Local models0');
-    expect(tile.textContent).toContain('2.0 MB on disk, including companions');
+    const tile = byRole(mounted!.container, 'group', 'Local models');
+    expect(statValue(mounted!.container, 'Local models')).toBe('0');
+    expect(tile?.textContent).toContain('2.0 MB on disk, including companions');
   });
 
   it('never rounds the cold-cache hit rate up to 100% on the landing page', async () => {
-    // F6 at its second call site. Reverting overview.tsx restores
-    // `formatPercent(hits / lookups)`, which is 100% for 16189/16238.
+    // The landing page's hit rate saturates like the Cache page's: 16189/16238 is not 100%.
     const text = await mount(
       createElement(MemoryRouter, null, createElement(Overview)),
       overviewRoutes(cacheFixture()),
@@ -588,16 +663,9 @@ describe('Overview page', () => {
     );
     expect(text).toContain('hit rate >99%');
     expect(text).not.toContain('hit rate 100%');
-    // HONEST SCOPE: this asserts the rendered outcome, but it cannot fail if
-    // overview.tsx swaps formatRate back to formatPercent. overview.tsx:119
-    // guards the label on `cacheLookups > 0`, and above zero the two functions
-    // agree on every input — so the rounding rule itself is pinned by
-    // format.test.ts, and the page-level guard that DOES fail on revert is the
-    // quota-meter test below (percentInt). Left in place because it still
-    // catches the label disappearing or reverting to a raw Math.round.
   });
 
-  it('saturates the quota meter width the same way the label is saturated', async () => {
+  it('saturates the quota meter the same way the label is saturated', async () => {
     // `Math.round(quotaFraction * 100)` renders a 99.9%-full quota as a 100%
     // bar. `percentInt` caps it at 99 so the bar and the label agree.
     const nearlyFull = cacheFixture();
@@ -606,20 +674,17 @@ describe('Overview page', () => {
     mounted = await renderPage(createElement(MemoryRouter, null, createElement(Overview)), (text) =>
       text.includes('of 9.5 MB'),
     );
-    const widths = [...mounted.container.querySelectorAll<HTMLElement>('div[style*="width"]')].map(
-      (el) => el.style.width,
-    );
-    expect(widths).toContain('99%');
-    expect(widths).not.toContain('100%');
+    const meter = byRole(mounted.container, 'meter', 'Cold cache quota');
+    expect(meter?.getAttribute('aria-valuenow')).toBe('99');
+    expect(meter?.getAttribute('aria-valuetext')).toContain('>99%');
     expect(mounted.text()).toContain('>99% of 9.5 MB');
   });
 });
 
-describe('Metrics page — per-model bar charts', () => {
+describe('Metrics page — the Models table', () => {
   /**
-   * Eleven models, because eleven is what the bug report had and because the
-   * defect is a function of how many rows share a fixed-height plot. Two of them
-   * agree for their first 21 characters on purpose.
+   * Eleven models, because eleven is what the bug report had. Two of them agree
+   * for their first 21 characters on purpose.
    */
   const MODELS = [
     'Gemma-4-31B-IT-UD-Q4_K_XL-mlx',
@@ -635,244 +700,87 @@ describe('Metrics page — per-model bar charts', () => {
     'Harrier-embed-1B',
   ];
 
-  /**
-   * Only the three per-model bar charts carry data. The tokens/day, both trend
-   * charts and the usage-share pie stay empty on purpose, so every rendered
-   * chart in the page is one of the three under test and the assertions cannot
-   * accidentally read a numeric y-axis.
-   */
-  function metricsFixture(models: string[]): MetricsOverviewResponse {
+  function metricsRoutes(models: string[]): Record<string, unknown> {
     return {
-      range: { from: null, to: null },
-      tokensByDay: [],
-      throughputByModel: models.map((model, i) => ({
-        model,
-        avgDecodeTps: 120 - i,
-        avgPrefillTps: 900,
-        avgTtftMs: 200 + i,
-        samples: 10,
-      })),
-      throughputTrend: [],
-      mtpByModel: models.map((model, i) => ({ model, meanAccepted: 1.9 - i * 0.05, avgCycles: 4, samples: 5 })),
-      modelShare: [],
-      totals: { turns: 0, traces: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 },
+      '/metrics/models': {
+        models: models.map((model) => ({ model, modelType: null, firstTs: 0, lastTs: 0, turns: 10 })),
+      },
+      '/metrics/summary': summary({ byModel: models.map((model, i) => byModelRow(model, 100 - i)) }),
+      '/metrics/timeseries': timeseries([]),
+      '/models': {
+        models: [],
+        warnings: [],
+        dir: '/models',
+        host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
+      },
     };
   }
 
-  /**
-   * Mount the Metrics page with chart measurement stubbed in. The settle anchor
-   * is a model id short enough to survive shortening verbatim, so it can only
-   * appear once the charts have actually drawn their category axis.
-   */
-  async function mountMetrics(models: string[], options: { tickLinePx?: number } = {}): Promise<RenderedPage> {
-    restoreMetrics = stubChartMetrics(options);
-    restoreApi = stubApi({ '/metrics/overview': metricsFixture(models) });
-    mounted = await renderPage(createElement(Metrics), (text) => text.includes('qwen3-8b'));
-    return mounted;
-  }
-
-  /** The three rendered plots, in page order: decode, TTFT, MTP. */
-  function plots(page: RenderedPage): Element[] {
-    return [...page.container.querySelectorAll('.recharts-responsive-container')];
-  }
-
-  /**
-   * Category tick labels of one plot with the geometry that decides whether they
-   * are readable: `left` is where the glyphs start, and a left-of-zero label is
-   * outside the SVG and therefore cut off mid-name.
-   */
-  function categoryTicks(plot: Element): Array<{ label: string; left: number; y: number }> {
-    return [...plot.querySelectorAll('[class*="yAxis-tick-labels"] text')].map((node) => {
-      const label = node.textContent ?? '';
-      const x = Number(node.getAttribute('x'));
-      const width = label.length * TICK_CHAR_PX;
-      return {
-        label,
-        left: node.getAttribute('text-anchor') === 'end' ? x - width : x,
-        y: Number(node.getAttribute('y')),
-      };
-    });
-  }
-
-  it('draws a category label for every bar, with room for it', async () => {
-    const page = await mountMetrics(MODELS);
-    const charts = plots(page);
-    expect(charts).toHaveLength(3);
-    for (const chart of charts) {
-      expect(chart.querySelectorAll('.recharts-bar-rectangle')).toHaveLength(MODELS.length);
-      const ticks = categoryTicks(chart);
-      // A skipped tick on a numeric axis is inferable; a skipped model name is
-      // not. recharts hides overlapping ticks unless `interval={0}` says not to.
-      expect(ticks).toHaveLength(MODELS.length);
-      // …and `interval={0}` alone would only stack them on top of each other, so
-      // the rows must also carry more than a line of text apiece. recharts' own
-      // collision rule is the tick height plus its 5px `minTickGap`.
-      const gaps = ticks.slice(1).map((tick, i) => tick.y - ticks[i].y);
-      for (const gap of gaps) expect(gap).toBeGreaterThan(TICK_LINE_PX + 5);
-    }
-  });
-
-  it('still names every model when the tick text is taller than the row it sits in', async () => {
-    // Sizing the rows generously is not the same as guaranteeing a label. Once
-    // the measured text outgrows its row, recharts is back to hiding whichever
-    // ticks it thinks collide — and it hides model NAMES, silently. Only
-    // `interval={0}` says "draw them all anyway"; without it this render loses
-    // five of the eleven.
-    //
-    // The ids are suffixed rather than reused: recharts memoises every text
-    // measurement in a module-level LRU keyed by the string, so a name already
-    // measured by another test in this file would keep that test's height and
-    // this one would silently assert nothing.
-    const page = await mountMetrics(
-      MODELS.map((model) => `${model}-tall`),
-      { tickLinePx: 34 },
+  it('lists every model as its own row', async () => {
+    await mount(createElement(MemoryRouter, null, createElement(Metrics)), metricsRoutes(MODELS), 'qwen3-8b');
+    const rows = [...mounted!.container.querySelectorAll('tr[data-model]')].map((row) =>
+      row.getAttribute('data-model'),
     );
-    for (const chart of plots(page)) {
-      expect(chart.querySelectorAll('.recharts-bar-rectangle')).toHaveLength(MODELS.length);
-      expect(categoryTicks(chart)).toHaveLength(MODELS.length);
-    }
+    expect(rows).toHaveLength(MODELS.length);
+    expect(new Set(rows)).toEqual(new Set(MODELS));
   });
 
-  it('keeps every category label inside the plot instead of running off its left edge', async () => {
-    const page = await mountMetrics(MODELS);
-    for (const chart of plots(page)) {
-      const ticks = categoryTicks(chart);
-      expect(ticks.length).toBeGreaterThan(0);
-      for (const tick of ticks) {
-        expect({ label: tick.label, left: tick.left }).toMatchObject({ left: expect.any(Number) });
-        expect(tick.left).toBeGreaterThanOrEqual(0);
-      }
-    }
-  });
-
-  it('never renders two different models under the same name', async () => {
+  it('never renders two different models under the same visible name', async () => {
     // `Gemma-4-31B-IT-UD-Q4_K_XL-mlx` and `Gemma-4-31B-IT-UD-Q4_K_M-mlx` agree
     // for 21 characters, so any head-keeping shortener collapses them onto one
-    // string — two rows of a comparison chart claiming to be the same model.
-    const page = await mountMetrics(MODELS);
-    for (const chart of plots(page)) {
-      const labels = categoryTicks(chart).map((tick) => tick.label);
-      expect(new Set(labels).size).toBe(labels.length);
-    }
-    const rendered = categoryTicks(plots(page)[0]).map((tick) => tick.label);
-    expect(rendered).toContain('Gemma-4-31B-I…-Q4_K_XL-mlx');
-    expect(rendered).toContain('Gemma-4-31B-I…D-Q4_K_M-mlx');
+    // string — two rows claiming to be the same model.
+    await mount(createElement(MemoryRouter, null, createElement(Metrics)), metricsRoutes(MODELS), 'qwen3-8b');
+    const names = [...mounted!.container.querySelectorAll('tr[data-model]')].map((row) =>
+      splitWhitespace(row.querySelector('td')?.textContent ?? '').join(' '),
+    );
+    expect(new Set(names).size).toBe(MODELS.length);
   });
 
-  it('numbers the survivors when shortening cannot separate two ids at all', async () => {
-    // The residual case the render tests cannot reach: two ids that differ only
-    // past the budget on BOTH ends. A label may be ugly; it may not be a lie.
+  it('numbers the survivors when shortening cannot separate two ids at all', () => {
+    // Two ids that differ only past the budget on BOTH ends. A label may be
+    // ugly; it may not be a lie.
     const head = 'a'.repeat(20);
     const tail = 'b'.repeat(20);
     const labels = categoryLabels([`${head}X${tail}`, `${head}Y${tail}`]);
     expect(new Set(labels.values()).size).toBe(2);
-    expect([...labels.values()][1]).toMatch(/ \(2\)$/);
+    expect([...labels.values()][1].endsWith(' (2)')).toBe(true);
   });
 
   it('shortens from the middle so both ends of an id survive', () => {
     expect(truncateMiddle('Gemma-4-31B-IT-UD-Q4_K_XL-mlx', 26)).toBe('Gemma-4-31B-I…-Q4_K_XL-mlx');
     expect(truncateMiddle('Gemma-4-31B-IT-UD-Q4_K_XL-mlx', 26)).toHaveLength(26);
-    // Short enough already: untouched, no ellipsis.
     expect(truncateMiddle('qwen3-8b', 26)).toBe('qwen3-8b');
   });
 });
 
 describe('Metrics page — model usage share', () => {
-  /**
-   * Twenty-five models, the count from the bug report, and only the pie carries
-   * data — so the whole page holds exactly one legend and the queries below
-   * cannot pick up one of the other three.
-   *
-   * `qwen3-8b` holds the most turns AND sorts last alphabetically, which is what
-   * gives the ordering assertion something to fail on.
-   */
+  /** `qwen3-8b` holds the most turns AND sorts last alphabetically, which gives the order something to fail on. */
   const SHARE_MODELS = ['qwen3-8b', ...Array.from({ length: 24 }, (_, i) => `Gemma-4-31B-IT-UD-Q4_K_XL-mlx-${i}`)];
 
-  function shareFixture(models: string[]): MetricsOverviewResponse {
-    return {
-      range: { from: null, to: null },
-      tokensByDay: [],
-      throughputByModel: [],
-      throughputTrend: [],
-      mtpByModel: [],
-      modelShare: models.map((model, i) => ({ model, turns: 100 - i, outputTokens: 1000 })),
-      totals: { turns: 0, traces: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 },
-    };
-  }
-
-  async function mountShare(): Promise<RenderedPage> {
-    restoreMetrics = stubChartMetrics();
-    restoreApi = stubApi({ '/metrics/overview': shareFixture(SHARE_MODELS) });
-    mounted = await renderPage(createElement(Metrics), (text) => text.includes('qwen3-8b'));
-    return mounted;
-  }
-
-  /** The usage-share legend — the only one on a page whose other charts are empty. */
-  function shareLegend(page: RenderedPage): HTMLElement {
-    const wrappers = page.container.querySelectorAll<HTMLElement>('.recharts-legend-wrapper');
-    expect(wrappers).toHaveLength(1);
-    return wrappers[0];
-  }
-
-  it('anchors the usage-share legend to the top of its plot box and bounds its height', async () => {
-    // The reported defect. recharts portals the legend into `.recharts-wrapper`
-    // as an absolutely positioned div and, for `verticalAlign="middle"` with no
-    // `top` in `wrapperStyle`, computes `top: (chartHeight - measuredLegendHeight) / 2`
-    // from the wrapper's own `getBoundingClientRect`. Twenty-five two-line rows
-    // measure far taller than the plot, so that top goes NEGATIVE and the names
-    // paint above the card, over the TTFT card — nothing clips them, because
-    // `.recharts-wrapper` and the ResponsiveContainer's inner div are both
-    // `overflow: visible`.
-    //
-    // What this test can and cannot do: happy-dom performs no layout, so it
-    // cannot reproduce the negative number — the legend measures 0x0 here, and a
-    // zero-height legend is exactly the case that never escaped. It pins the
-    // style contract instead. That is still a real gate: on the unfixed page
-    // recharts computes `top: (224 - 0) / 2 = 112px`, so the first assertion
-    // fails. Whether the fix HOLDS at 25 rows in a real engine is a browser
-    // measurement, not a happy-dom one.
-    const legend = shareLegend(await mountShare());
-    expect(legend.querySelectorAll('.recharts-legend-item')).toHaveLength(SHARE_MODELS.length);
-    // An explicit `top` is the guard: recharts skips the centring branch outright
-    // when `wrapperStyle` already declares one, so no measurement can push the
-    // box above the plot.
-    expect(legend.style.top).toBe('0px');
-    // A non-negative top alone only moves the overflow to the bottom edge. These
-    // two bound the box to the plot area whatever the rows measure, and scroll
-    // the surplus inside it.
-    expect(legend.style.maxHeight).toBe('100%');
-    expect(legend.style.overflowY).toBe('auto');
+  it('lists all 25 models after "Show all 25", in usage rank', async () => {
+    restoreApi = stubApi({
+      '/metrics/models': { models: [] },
+      '/metrics/summary': summary({ byModel: SHARE_MODELS.map((model, i) => byModelRow(model, 100 - i)) }),
+      '/metrics/timeseries': timeseries([]),
+      '/metrics/distributions': distributions(),
+    });
+    mounted = await renderPage(
+      createElement(MemoryRouter, { initialEntries: ['/metrics?tab=usage'] }, createElement(Metrics)),
+      (text) => text.includes('Show all 25'),
+    );
+    const more = [...mounted.container.querySelectorAll('button')].find((b) => b.textContent === 'Show all 25');
+    await act(async () => {
+      more?.click();
+    });
+    const list = (): HTMLElement | null => byRole(mounted!.container, 'list', 'Turns by model (turns)');
+    await waitFor(() => (list()?.querySelectorAll('li').length ?? 0) === SHARE_MODELS.length);
+    const first = list()?.querySelector('li [data-model]')?.getAttribute('data-model');
+    expect(first).toBe('qwen3-8b');
   });
 
-  it('grows the usage-share card with the model count instead of scrolling 25 rows inside 224px', async () => {
-    // The bound above must not become the reading mode: 25 rows inside the 224px
-    // default hides two thirds of them behind a hover-only overlay scrollbar,
-    // which is the silent omission `categoryChartHeight` exists to prevent. This
-    // card was the only one in its grid taking the default.
-    const page = await mountShare();
-    const plot = shareLegend(page).closest('[data-slot="card-content"]')?.firstElementChild as HTMLElement;
-    expect(plot.style.height).toBe(`${categoryChartHeight(SHARE_MODELS.length)}px`);
-  });
-
-  it('lists the legend in usage rank rather than alphabetically', async () => {
-    // Only eight models get a distinct colour and the rest share one grey, so a
-    // row's POSITION is most of what the legend still tells the reader. recharts
-    // sorts legend items by label unless told not to (`itemSorter: 'value'`),
-    // which threw that away: measured on the unfixed page, the most-used model
-    // rendered LAST of 25.
-    const items = [...shareLegend(await mountShare()).querySelectorAll('.recharts-legend-item')];
-    expect(items).toHaveLength(SHARE_MODELS.length);
-    expect(items[0].textContent).toBe('qwen3-8b');
-    expect(items.at(-1)?.textContent).toBe(categoryLabels(SHARE_MODELS).get(SHARE_MODELS.at(-1) ?? ''));
-  });
-
-  it('never labels a slice 100% while another model still holds turns', async () => {
-    // 9b: the last surviving copy of the F6 rounding lie. 9999 of 10000 turns
-    // rounds to "100%" beside a two-model legend.
-    const { modelShareLabel } = await import('@/pages/metrics');
+  it('never labels a share 100% while another model still holds turns', () => {
     expect(modelShareLabel(9999, 10_000)).toBe('9,999 turns · >99%');
-    expect(modelShareLabel(1, 10_000)).toBe('1 turns · <1%');
-    // The endpoints stay reachable when they are actually true.
+    expect(modelShareLabel(1, 10_000)).toBe('1 turn · <1%');
     expect(modelShareLabel(10_000, 10_000)).toBe('10,000 turns · 100%');
     expect(modelShareLabel(0, 10_000)).toBe('0 turns · 0%');
   });
@@ -889,7 +797,12 @@ describe('Models page — the Install affordance', () => {
     jobs: DownloadJob[] = [],
     updates: CatalogUpdatesResponse = { items: [] },
   ): Record<string, unknown> {
-    const models: ModelsResponse = { models: [], warnings: [], dir: '/models' };
+    const models: ModelsResponse = {
+      models: [],
+      warnings: [],
+      dir: '/models',
+      host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
+    };
     const catalog: CatalogResponse = {
       items: [
         {
@@ -901,6 +814,7 @@ describe('Models page — the Install affordance', () => {
           installed: false,
           present: false,
           blockedByForeignDir: false,
+          blocker: null,
           localRevision: null,
           localAssetsRepo: null,
           localAssetsRevision: null,
@@ -912,9 +826,13 @@ describe('Models page — the Install affordance', () => {
     return { '/models': models, '/catalog': catalog, '/catalog/updates': updates, '/downloads': downloads };
   }
 
-  /** Trimmed label of every rendered button. */
+  /** Trimmed label of every rendered button, plus each card's "Installed" status (text beside a check, not a button). */
   function buttonLabels(): string[] {
-    return Array.from(mounted!.container.querySelectorAll('button')).map((b) => (b.textContent ?? '').trim());
+    const buttons = Array.from(mounted!.container.querySelectorAll('button')).map((b) => (b.textContent ?? '').trim());
+    const installed = Array.from(mounted!.container.querySelectorAll('[data-status="installed"]')).map(
+      () => 'Installed',
+    );
+    return [...buttons, ...installed];
   }
 
   /** Labels of the buttons a user can actually press — a disabled one cannot act. */
@@ -993,8 +911,18 @@ describe('Models page — the Install affordance', () => {
     return calls.filter((call) => call.method === 'DELETE').map((call) => call.url.replace('/api/downloads/', ''));
   }
 
+  /** Labels of the palette commands the mounted page registers, as of the last render. */
+  let paletteLabels: string[] = [];
+  function PaletteProbe(): null {
+    paletteLabels = usePageCommands().map((command) => String(command.label));
+    return null;
+  }
+
   async function mountModels(): Promise<void> {
-    mounted = await renderPage(createElement(Models), (text) => text.includes(LABEL));
+    mounted = await renderPage(
+      createElement(MemoryRouter, null, createElement(Models), createElement(PaletteProbe)),
+      (text) => text.includes(LABEL),
+    );
     // The hydration effect fires once `/downloads` lands, which is after the
     // catalog text the settle condition waits on; give it and its calls room.
     await settle();
@@ -1008,7 +936,7 @@ describe('Models page — the Install affordance', () => {
   it('offers Install for a recommended model that is simply absent', async () => {
     // The over-correction guard: the card must keep its button when the slug is
     // free, or the blocked branch below could be "fixed" by never offering Install.
-    await mount(createElement(Models), catalogRoutes({}), LABEL);
+    await mount(createElement(MemoryRouter, null, createElement(Models)), catalogRoutes({}), LABEL);
     expect(buttonLabels()).toContain('Install');
   });
 
@@ -1021,6 +949,7 @@ describe('Models page — the Install affordance', () => {
       present,
       installed: present,
       blockedByForeignDir: false,
+      blocker: null,
       localRevision: null,
     };
   }
@@ -1031,16 +960,20 @@ describe('Models page — the Install affordance', () => {
     const routes = catalogRoutes({ draft });
     const catalog = routes['/catalog'] as CatalogResponse;
     routes['/catalog'] = sequence(catalog, { items: [{ ...catalog.items[0], draft: draftItem(false) }] });
-    const initial: ModelsResponse = { models: [], companions: [companion], warnings: [], dir: '/models' };
+    const initial: ModelsResponse = {
+      models: [],
+      companions: [companion],
+      warnings: [],
+      dir: '/models',
+      host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
+    };
     routes['/models'] = sequence(initial, { ...initial, companions: [] });
     routes[`/models/${draft.slug}`] = { deleted: true, name: draft.slug };
     const calls = recordRequests(routes);
     await mountModels();
-    const tile = [...mounted!.container.querySelectorAll('[data-slot="card"]')].find((el) =>
-      el.textContent?.startsWith('Installed'),
-    )!;
-    expect(tile.textContent).toContain('Installed0');
-    expect(tile.textContent).toContain('2.0 MB on disk, including companions');
+    expect(statValue(mounted!.container, 'Installed')).toBe('0');
+    expect(statValue(mounted!.container, 'On disk')).toBe('2.0 MB');
+    expect(byRole(mounted!.container, 'group', 'On disk')?.textContent).toContain('including companions');
     expect(mounted!.container.querySelector('tbody')?.textContent ?? '').not.toContain(draft.slug);
     const toggle = [...mounted!.container.querySelectorAll('button')].find((button) =>
       button.textContent?.includes('Companion weights (1)'),
@@ -1060,8 +993,8 @@ describe('Models page — the Install affordance', () => {
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
       { method: 'DELETE', url: `/api/models/${draft.slug}` },
     ]);
-    expect(mounted!.container.textContent).not.toContain('Companion weights (1)');
-    expect(tile.textContent).toContain('0 B on disk');
+    await waitFor(() => !(mounted!.container.textContent ?? '').includes('Companion weights (1)'));
+    expect(statValue(mounted!.container, 'On disk')).not.toContain('2.0');
     expect(buttonLabels()).toContain('Install DFlash2');
   });
 
@@ -1069,18 +1002,27 @@ describe('Models page — the Install affordance', () => {
     'groups the companion download inside its installed target card (draft present: %s)',
     async (present) => {
       const draft = draftItem(present);
-      await mount(createElement(Models), catalogRoutes({ present: true, installed: true, draft }), LABEL);
+      await mount(
+        createElement(MemoryRouter, null, createElement(Models)),
+        catalogRoutes({ present: true, installed: true, draft }),
+        LABEL,
+      );
       const link = mounted!.container.querySelector(`a[href="https://huggingface.co/${draft.hfRepo}"]`)!;
-      const card = link.closest('[data-slot="card"]')!;
+      const card = link.closest('[data-model]')!;
       const target = mounted!.container.querySelector(`a[href="https://huggingface.co/${REPO}"]`)!;
-      expect(card).toBe(target.closest('[data-slot="card"]'));
+      expect(card).toBe(target.closest('[data-model]'));
       expect(link.textContent).toBe('DFlash2');
       const companion = link.closest('[role="group"]')!;
       expect(companion.textContent).toContain('Used automatically');
       expect(companion.textContent).toContain('3.85 GB');
-      const button = companion.querySelector('button')!;
-      expect(button.textContent?.trim()).toBe(present ? 'Installed' : 'Install DFlash2');
-      expect(button.disabled).toBe(present);
+      const button = companion.querySelector('button');
+      if (present) {
+        expect(companion.querySelector('[data-status="installed"]')?.textContent).toContain('Installed');
+        expect(button).toBeNull();
+      } else {
+        expect(button?.textContent?.trim()).toBe('Install DFlash2');
+        expect(button?.disabled).toBe(false);
+      }
     },
   );
 
@@ -1093,26 +1035,340 @@ describe('Models page — the Install affordance', () => {
     expect(openedStreams).toContain('draft-job');
     const card = mounted!.container
       .querySelector(`a[href="https://huggingface.co/${draft.hfRepo}"]`)!
-      .closest('[data-slot="card"]')!;
+      .closest('[data-model]')!;
     const companion = card.querySelector('[role="group"]')!;
     expect(companion.textContent).toContain('Cancel');
     expect(companion.textContent).not.toContain('Installed');
     expect(card.textContent).toContain('Installed');
   });
 
-  it('states the blockage instead of an Install that the runner always refuses', async () => {
-    // `<slug>` is occupied by an unowned directory (an interrupted `mlx download`).
-    // The download's ownership preflight refuses it every time, so the button would
-    // do nothing but raise a red toast.
-    const text = await mount(createElement(Models), catalogRoutes({ blockedByForeignDir: true }), LABEL);
+  const LEFTOVER = 'imatrix_unsloth.gguf_file';
+  const BLOCKER: CatalogBlocker = {
+    kind: 'directory',
+    fileCount: 1,
+    sizeBytes: 192_223_904,
+    truncated: false,
+    names: [LEFTOVER],
+    listed: false,
+    modelLike: false,
+    holdsModel: false,
+    linkTarget: null,
+    dangling: false,
+  };
+
+  it('names what is in the way and offers Reinstall instead of an Install the runner refuses', async () => {
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Models)),
+      catalogRoutes({ blockedByForeignDir: true, blocker: BLOCKER }),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Reinstall');
     expect(buttonLabels()).not.toContain('Install');
-    // And it says WHICH directory is in the way and what to do about it.
-    expect(text).toContain(SLUG);
-    expect(text).toMatch(/remove/i);
+    expect(text).toContain('Needs cleanup');
+    expect(text).toContain(`${SLUG} is in the way: a directory with 1 file (183 MB) that the app did not create.`);
+    expect(text).toContain('Reinstall downloads the model, then removes this directory.');
+    expect(text).not.toContain('already exists and was not created by the app');
+    expect(text.toLowerCase()).toContain('remove');
+  });
+
+  it.each<[string, boolean, string]>([
+    ['not listed', false, 'Move or delete it in Finder to install this one.'],
+    ['listed in Local models', true, 'Delete it in Local models to install this one.'],
+  ])('offers no Reinstall over a model mlx serve lists (%s)', async (_name, listed, hint) => {
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Models)),
+      catalogRoutes({ blockedByForeignDir: true, blocker: { ...BLOCKER, holdsModel: true, listed } }),
+      LABEL,
+    );
+    expect(buttonLabels()).not.toContain('Reinstall');
+    expect(buttonLabels()).not.toContain('Install');
+    expect(text).toContain('Needs cleanup');
+    expect(text).toContain(
+      `${SLUG} holds a model that the app did not create, so Reinstall cannot replace it. ${hint}`,
+    );
+  });
+
+  /** The visible text of a confirmation description. */
+  function textOf(node: ReactNode): string {
+    const holder = document.createElement('div');
+    holder.innerHTML = renderToStaticMarkup(createElement('div', null, node));
+    return splitWhitespace(holder.textContent ?? '').join(' ');
+  }
+
+  const blocker = (overrides: Partial<CatalogBlocker>): CatalogBlocker => ({ ...BLOCKER, names: [], ...overrides });
+
+  it.each<[string, Partial<CatalogBlocker>, string, string]>([
+    ['empty', { fileCount: 0, sizeBytes: 0 }, 'an empty directory', 'directory'],
+    ['one file', { fileCount: 1, sizeBytes: 2048 }, 'a directory with 1 file (2.0\u00a0KB)', 'directory'],
+    ['many files', { fileCount: 1234, sizeBytes: 2048 }, 'a directory with 1,234 files (2.0\u00a0KB)', 'directory'],
+    ['truncated', { fileCount: 2000, truncated: true }, 'a directory with more than 2,000 files', 'directory'],
+    [
+      'truncated before any file was counted',
+      { fileCount: 0, sizeBytes: 0, truncated: true },
+      'a directory the app could not fully read',
+      'directory',
+    ],
+    ['a file', { kind: 'file', fileCount: 1, sizeBytes: 2048 }, 'a file (2.0\u00a0KB)', 'file'],
+    ['a link', { kind: 'symlink', fileCount: 0, sizeBytes: 0 }, 'a link', 'link'],
+  ])('phrases the blocker on the card: %s', (_name, overrides, phrase, noun) => {
+    expect(blockerPhrase(blocker(overrides))).toEqual({ phrase, noun });
+  });
+
+  const handlers = { onReinstall: () => Promise.resolve(), onReinstallStarted: () => {} };
+
+  it.each<[string, Partial<CatalogBlocker>, string | null]>([
+    ['empty', { fileCount: 0, sizeBytes: 0 }, 'The directory is empty.'],
+    [
+      'named files',
+      { fileCount: 2, sizeBytes: 2048, names: ['a.bin', 'sub/b.bin'] },
+      'It holds 2 files (2.0 KB): a.bin, sub/b.bin.',
+    ],
+    ['one named file', { fileCount: 1, sizeBytes: 2048, names: ['a.bin'] }, 'It holds 1 file (2.0 KB): a.bin.'],
+    ['four files', { fileCount: 4, sizeBytes: 2048 }, 'It holds 4 files (2.0 KB).'],
+    [
+      'truncated',
+      { fileCount: 2000, sizeBytes: 2048, truncated: true },
+      'It holds more than 2,000 files (more than 2.0 KB).',
+    ],
+    [
+      'truncated before any file was counted',
+      { fileCount: 0, sizeBytes: 0, truncated: true },
+      'The app could not read all of it, so its size is not known.',
+    ],
+    ['a file', { kind: 'file', fileCount: 1, sizeBytes: 2048 }, 'The file is 2.0 KB.'],
+    ['a live link', { kind: 'symlink', fileCount: 0, linkTarget: '/Volumes/x/m' }, 'It points to /Volumes/x/m.'],
+    [
+      'a dangling link',
+      { kind: 'symlink', fileCount: 0, linkTarget: '/Volumes/x/m', dangling: true },
+      'It points to /Volumes/x/m, which does not exist.',
+    ],
+    ['a link with no text', { kind: 'symlink', fileCount: 0, linkTarget: null }, null],
+  ])('says what Reinstall deletes: %s', (_name, overrides, contents) => {
+    const item = blocker(overrides);
+    const noun = blockerPhrase(item).noun;
+    const text = textOf(reinstallContent({ slug: SLUG, blocker: item }, handlers).description);
+    const first = `This downloads the model, then permanently deletes the ${noun} ${SLUG} and installs the model in its place.`;
+    const last = 'Nothing is deleted if the download fails or you cancel it.';
+    expect(text).toBe(contents === null ? `${first} ${last}` : `${first} ${contents} ${last}`);
+  });
+
+  it('truncates a long file name in the middle and keeps the full name on hover', () => {
+    const long = `${'x'.repeat(30)}-middle-${'y'.repeat(30)}.gguf`;
+    const html = renderToStaticMarkup(
+      createElement(
+        'div',
+        null,
+        reinstallContent({ slug: SLUG, blocker: blocker({ fileCount: 1, names: [long] }) }, handlers).description,
+      ),
+    );
+    expect(html).toContain(`title="${long}"`);
+    expect(html).toContain(truncateMiddle(long, 40));
+  });
+
+  it('never lets a size wrap between its number and its unit', () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        'div',
+        null,
+        reinstallContent({ slug: SLUG, blocker: blocker({ fileCount: 4, sizeBytes: 2048 }) }, handlers).description,
+      ),
+    );
+    expect(html).toContain('It holds 4 files (2.0 KB).');
+  });
+
+  it.each<[string, Partial<CatalogBlocker>, string | undefined]>([
+    [
+      'a link, even one that lists',
+      { kind: 'symlink', listed: true, modelLike: true },
+      'This is a link. Only the link is removed. The target is not changed.',
+    ],
+    [
+      'a listed directory',
+      { listed: true, modelLike: true },
+      'Local models lists this directory. Make sure that you do not need it.',
+    ],
+    ['a config.json', { modelLike: true }, 'This directory has a config.json. Make sure that you do not need it.'],
+    ['nothing to warn about', {}, undefined],
+  ])('warns first about %s', (_name, overrides, notice) => {
+    const content = reinstallContent({ slug: SLUG, blocker: blocker(overrides) }, handlers);
+    expect(content.notice).toBe(notice);
+    expect(content).toMatchObject({
+      title: 'Reinstall model?',
+      confirmLabel: 'Reinstall',
+      workingLabel: 'Starting…',
+      successLabel: 'Started',
+      tone: 'danger',
+      errorTitle: 'Could not start the download',
+    });
+  });
+
+  /**
+   * Serve the catalog routes plus a POST /downloads answered by `post`. The route stub matches by path alone, and a
+   * Reinstall needs the GET and the POST of `/downloads` to answer differently.
+   */
+  function serveReinstall(
+    routes: Record<string, unknown>,
+    post: (body: unknown) => ApiResponse,
+  ): Array<{ method: string; path: string; body: unknown }> {
+    const calls: Array<{ method: string; path: string; body: unknown }> = [];
+    openedStreams = [];
+    const { port1, port2 } = new MessageChannel();
+    port1.unref();
+    port2.unref();
+    const dispose = serveRuntimeOverPort(
+      {
+        call: async (call: ApiCall) => {
+          const path = (call.path.startsWith('/api') ? call.path.slice('/api'.length) : call.path).split('?')[0]!;
+          calls.push({ method: call.method, path, body: call.body });
+          if (call.method === 'POST' && path === '/downloads') return post(call.body);
+          if (call.method === 'GET' && Object.hasOwn(routes, path)) {
+            return { ok: true as const, status: 200, body: routes[path] };
+          }
+          return { ok: false as const, status: 404, code: 'E_NOT_FOUND', message: `no stub for ${path}` };
+        },
+        subscribe: downloadSubscribeStub(),
+        watchLive: () => () => {},
+      },
+      bindEventTargetPort(port2),
+    );
+    connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+    restoreApi = () => {
+      disconnectDashboardApi();
+      dispose();
+      port1.close();
+      port2.close();
+    };
+    return calls;
+  }
+
+  function reinstallDialog(title = 'Reinstall model?'): HTMLElement | undefined {
+    return [...document.querySelectorAll<HTMLElement>('[role="dialog"]')].find((el) => el.textContent?.includes(title));
+  }
+
+  function buttonNamed(scope: ParentNode, label: string): HTMLButtonElement {
+    const button = [...scope.querySelectorAll<HTMLButtonElement>('button')].find(
+      (b) => (b.textContent ?? '').trim() === label,
+    );
+    expect(button, label).toBeTruthy();
+    return button!;
+  }
+
+  it('confirms, posts the numbers the user saw and nothing else, then follows the job', async () => {
+    const calls = serveReinstall(catalogRoutes({ blockedByForeignDir: true, blocker: BLOCKER }), () => ({
+      ok: true,
+      status: 202,
+      body: { id: 'job-reinstall', repo: REPO },
+    }));
+    await mountModels();
+    await act(async () => buttonNamed(mounted!.container, 'Reinstall').click());
+    const dialog = reinstallDialog()!;
+    expect(dialog).toBeTruthy();
+    const text = splitWhitespace(dialog.textContent ?? '').join(' ');
+    expect(text).toContain(`permanently deletes the directory ${SLUG}`);
+    expect(text).toContain(`It holds 1 file (183 MB): ${LEFTOVER}.`);
+    expect(text).toContain('Nothing is deleted if the download fails or you cancel it.');
+    expect(calls.filter((call) => call.method === 'POST')).toEqual([]);
+
+    await act(async () => buttonNamed(dialog, 'Reinstall').click());
+    await waitFor(() => openedStreams.includes('job-reinstall'));
+    const posts = calls.filter((call) => call.method === 'POST');
+    expect(posts.map((call) => call.body)).toEqual([
+      { repo: REPO, replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 192_223_904, truncated: false } },
+    ]);
+    const card = mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
+    await waitFor(() => (card.textContent ?? '').includes('Replaces the old directory when the download is complete.'));
+    expect(buttonNamed(card, 'Cancel')).toBeTruthy();
+    expect(card.textContent).not.toContain('Needs cleanup');
+  });
+
+  it('keeps a refused Reinstall in the confirmation, reloads the catalog, and raises no toast', async () => {
+    const error = vi.spyOn(toast, 'error');
+    const success = vi.spyOn(toast, 'success');
+    onTestFinished(() => {
+      error.mockRestore();
+      success.mockRestore();
+    });
+    const calls = serveReinstall(catalogRoutes({ blockedByForeignDir: true, blocker: BLOCKER }), () => ({
+      ok: false,
+      status: 409,
+      code: 'E_CONFLICT',
+      message: `"${SLUG}" changed on disk. Check it, then try again.`,
+    }));
+    await mountModels();
+    const catalogGets = calls.filter((call) => call.method === 'GET' && call.path === '/catalog').length;
+    await act(async () => buttonNamed(mounted!.container, 'Reinstall').click());
+    await act(async () => buttonNamed(reinstallDialog()!, 'Reinstall').click());
+    await waitFor(() => reinstallDialog()?.querySelector('[role="alert"]') !== null);
+    const alert = reinstallDialog()!.querySelector('[role="alert"]')!;
+    expect(alert.textContent).toContain('Could not start the download');
+    expect(alert.textContent).toContain('changed on disk. Check it, then try again.');
+    await waitFor(() => calls.filter((call) => call.method === 'GET' && call.path === '/catalog').length > catalogGets);
+    expect(error).not.toHaveBeenCalled();
+    expect(success).not.toHaveBeenCalled();
+    expect(openedStreams).toEqual([]);
+  });
+
+  it('turns Reinstall off while the last download is being checked', async () => {
+    const props = {
+      item: {
+        hfRepo: REPO,
+        slug: SLUG,
+        installed: false,
+        present: false,
+        blockedByForeignDir: true,
+        blocker: BLOCKER,
+        localRevision: null,
+        localAssetsRepo: null,
+        localAssetsRevision: null,
+      },
+      updateAvailable: false,
+      settling: true,
+      updateSettling: false,
+      job: undefined,
+      onInstall: () => Promise.resolve(),
+      onReinstall: () => Promise.resolve(),
+      onReinstallStarted: () => {},
+      onDone: () => {},
+      onError: () => {},
+      onCancelled: () => {},
+      onCancel: () => {},
+    };
+    mounted = await renderPage(createElement(CatalogDownloadAction, props), (text) => text.includes('Reinstall'));
+    const trigger = buttonNamed(mounted.container, 'Reinstall');
+    expect(trigger.getAttribute('aria-disabled')).toBe('true');
+    await act(async () => trigger.click());
+    expect(reinstallDialog()).toBeUndefined();
+  });
+
+  it('offers the same Reinstall for a blocked companion, with its own title', async () => {
+    const draft = {
+      ...draftItem(false),
+      blockedByForeignDir: true,
+      blocker: { ...BLOCKER, fileCount: 0, sizeBytes: 0, names: [] },
+    };
+    serveReinstall(catalogRoutes({ present: true, installed: true, draft }), () => ({
+      ok: true,
+      status: 202,
+      body: { id: 'job-draft', repo: draft.hfRepo },
+    }));
+    await mountModels();
+    const companion = mounted!.container
+      .querySelector(`a[href="https://huggingface.co/${draft.hfRepo}"]`)!
+      .closest('[role="group"]')!;
+    expect(companion.textContent).toContain('Needs cleanup');
+    expect(companion.textContent).toContain(`${draft.slug} is in the way: an empty directory`);
+    await act(async () => buttonNamed(companion, 'Reinstall').click());
+    const dialog = reinstallDialog('Reinstall companion weights?')!;
+    expect(dialog).toBeTruthy();
+    expect(dialog.textContent).toContain('The directory is empty.');
   });
 
   it('still shows an installed model as installed', async () => {
-    await mount(createElement(Models), catalogRoutes({ present: true, installed: true }), LABEL);
+    await mount(
+      createElement(MemoryRouter, null, createElement(Models)),
+      catalogRoutes({ present: true, installed: true }),
+      LABEL,
+    );
     expect(buttonLabels()).toContain('Installed');
     expect(buttonLabels()).not.toContain('Install');
   });
@@ -1121,7 +1377,7 @@ describe('Models page — the Install affordance', () => {
     // The whole point of the check: a re-upload lands new bytes at the SAME repo
     // id, so an installed model must still be offered the newer weights.
     await mount(
-      createElement(Models),
+      createElement(MemoryRouter, null, createElement(Models)),
       catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
         items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }],
       }),
@@ -1133,7 +1389,7 @@ describe('Models page — the Install affordance', () => {
 
   it('stays Installed when the revisions match', async () => {
     await mount(
-      createElement(Models),
+      createElement(MemoryRouter, null, createElement(Models)),
       catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
         items: [{ hfRepo: REPO, remoteRevision: 'a'.repeat(40) }],
       }),
@@ -1148,7 +1404,7 @@ describe('Models page — the Install affordance', () => {
     // the Installed button is otherwise disabled — so without comparing the
     // sidecar source too, the repair path is unreachable by design.
     await mount(
-      createElement(Models),
+      createElement(MemoryRouter, null, createElement(Models)),
       catalogRoutes(
         {
           present: true,
@@ -1172,7 +1428,7 @@ describe('Models page — the Install affordance', () => {
 
   it('stays Installed when the sidecar revision matches', async () => {
     await mount(
-      createElement(Models),
+      createElement(MemoryRouter, null, createElement(Models)),
       catalogRoutes(
         {
           present: true,
@@ -1199,7 +1455,7 @@ describe('Models page — the Install affordance', () => {
     // An unprobed sidecar repo (`null`) is "unknown", never "up to date" — and
     // it must not invent a badge either: no comparison, no update.
     await mount(
-      createElement(Models),
+      createElement(MemoryRouter, null, createElement(Models)),
       catalogRoutes(
         {
           present: true,
@@ -1227,7 +1483,7 @@ describe('Models page — the Install affordance', () => {
     // it lists only the catalog's current one — so comparing the marker's
     // repo alone can never see the change and the migration job never runs.
     await mount(
-      createElement(Models),
+      createElement(MemoryRouter, null, createElement(Models)),
       catalogRoutes(
         {
           present: true,
@@ -1254,7 +1510,7 @@ describe('Models page — the Install affordance', () => {
     // localAssetsRepo null + a prescribed assetsRepo means the install lacks
     // the tokenizer sidecars entirely — a repairable gap, not "unknown".
     await mount(
-      createElement(Models),
+      createElement(MemoryRouter, null, createElement(Models)),
       catalogRoutes(
         {
           present: true,
@@ -1282,7 +1538,7 @@ describe('Models page — the Install affordance', () => {
     // assetsRepo the entry no longer prescribes, no job could clear that
     // badge, and the old repo is unprobed — Installed, no update.
     await mount(
-      createElement(Models),
+      createElement(MemoryRouter, null, createElement(Models)),
       catalogRoutes(
         {
           present: true,
@@ -1312,7 +1568,7 @@ describe('Models page — the Install affordance', () => {
     // comparison arrive from two different requests, and only `installed` says
     // the stale one can be replaced.
     await mount(
-      createElement(Models),
+      createElement(MemoryRouter, null, createElement(Models)),
       catalogRoutes({ present: true, installed: false, localRevision: 'a'.repeat(40) }, [], {
         items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }],
       }),
@@ -1327,7 +1583,7 @@ describe('Models page — the Install affordance', () => {
     // cannot act on, and never a blocked page. `/catalog` never touched the
     // network, so install state is unaffected either way.
     await mount(
-      createElement(Models),
+      createElement(MemoryRouter, null, createElement(Models)),
       catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
         items: [{ hfRepo: REPO, remoteRevision: null }],
       }),
@@ -1434,7 +1690,7 @@ describe('Models page — the Install affordance', () => {
     // this repo — rendered "Installed" over a live multi-gigabyte transfer,
     // with no progress and no Cancel. A live job must speak for itself.
     await mount(
-      createElement(Models),
+      createElement(MemoryRouter, null, createElement(Models)),
       catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [downloadJob({})], {
         items: [],
       }),
@@ -1502,6 +1758,35 @@ describe('Models page — the Install affordance', () => {
     }
   });
 
+  it('shows a failed catalog reload after a settle with Try again, which reopens Install', async () => {
+    const failed = vi.spyOn(toast, 'error');
+    try {
+      const routes = catalogRoutes({}, [downloadJob({ id: 'job-run' })]);
+      const catalog = routes['/catalog'];
+      const calls = recordRequests({ ...routes, '/catalog': sequence(catalog, STUB_FAILURE, catalog) });
+      await mountModels();
+
+      emitDownload('error', { id: 'job-run', message: 'disk full' });
+      await settle();
+      expect(gets(calls, '/api/catalog')).toBe(2);
+      expect(mounted!.text()).toContain('stubbed failure for /catalog');
+      expect(mounted!.text()).toContain(LABEL);
+      expect(liveButtonLabels()).not.toContain('Install');
+      const retry = [...mounted!.container.querySelectorAll('button')].find(
+        (button) => button.textContent?.trim() === 'Try again',
+      );
+      expect(retry).toBeDefined();
+
+      await act(async () => retry!.click());
+      await settle();
+      expect(gets(calls, '/api/catalog')).toBe(3);
+      expect(mounted!.text()).not.toContain('stubbed failure for /catalog');
+      expect(liveButtonLabels()).toContain('Install');
+    } finally {
+      failed.mockRestore();
+    }
+  });
+
   it('cannot start a second job in the render between a settle and the refreshed catalog', async () => {
     // `setActive` clears synchronously while `reload()` only marks the previous
     // body refreshing, so one committed render still carries the pre-download
@@ -1535,10 +1820,12 @@ describe('Models page — the Install affordance', () => {
     // comparison — but it must not be pressable while it does.
     expect(buttonLabels()).toContain('Update available');
     expect(liveButtonLabels()).not.toContain('Update available');
+    expect(paletteLabels).not.toContain(`Update ${LABEL}`);
 
     held.release();
     await settle();
     expect(liveButtonLabels()).toContain('Update available');
+    expect(paletteLabels).toContain(`Update ${LABEL}`);
   });
 
   it('closes that window on the updates half too, when the catalog lands first', async () => {
@@ -1603,6 +1890,7 @@ describe('Models page — the Install affordance', () => {
     await settle();
     expect(buttonLabels()).toContain('Install');
     expect(liveButtonLabels()).not.toContain('Install');
+    expect(paletteLabels).not.toContain(`Install ${LABEL}`);
 
     held.release();
     await settle();
@@ -1822,7 +2110,7 @@ describe('Models page — the Install affordance', () => {
     const dispose = serveRuntimeOverPort(
       {
         call: async (call: ApiCall) => {
-          const path = call.path.replace(/^\/api/u, '');
+          const path = call.path.startsWith('/api') ? call.path.slice('/api'.length) : call.path;
           if (call.method === 'POST' && path === '/downloads') {
             return { ok: true as const, status: 202, body: { id: 'job-b', repo: REPO } };
           }
@@ -1836,6 +2124,7 @@ describe('Models page — the Install affordance', () => {
           return { ok: false as const, status: 404, code: 'E_NOT_FOUND', message: `no stub for ${path}` };
         },
         subscribe,
+        watchLive: () => () => {},
       },
       bindEventTargetPort(port2),
     );
@@ -1847,7 +2136,9 @@ describe('Models page — the Install affordance', () => {
       port2.close();
     };
 
-    mounted = await renderPage(createElement(Models), (text) => text.includes(LABEL));
+    mounted = await renderPage(createElement(MemoryRouter, null, createElement(Models)), (text) =>
+      text.includes(LABEL),
+    );
     await settle();
     const cancelButton = [...mounted.container.querySelectorAll('button')].find((button) =>
       button.textContent?.includes('Cancel'),
@@ -2122,7 +2413,7 @@ describe('Models page — the Install affordance', () => {
     const dispose = serveRuntimeOverPort(
       {
         call: async (call: ApiCall) => {
-          const path = call.path.replace(/^\/api/u, '');
+          const path = call.path.startsWith('/api') ? call.path.slice('/api'.length) : call.path;
           if (call.method === 'GET' && path === '/downloads') {
             return { ok: true as const, status: 200, body: await olderDownloads };
           }
@@ -2138,6 +2429,7 @@ describe('Models page — the Install affordance', () => {
           subscriptions.push(jobId);
           return () => {};
         },
+        watchLive: () => () => {},
       },
       bindEventTargetPort(port2),
     );
@@ -2149,7 +2441,9 @@ describe('Models page — the Install affordance', () => {
       port2.close();
     };
 
-    mounted = await renderPage(createElement(Models), (text) => text.includes(LABEL));
+    mounted = await renderPage(createElement(MemoryRouter, null, createElement(Models)), (text) =>
+      text.includes(LABEL),
+    );
     const install = [...mounted.container.querySelectorAll('button')].find((button) =>
       button.textContent?.includes('Install'),
     );
@@ -2192,5 +2486,361 @@ describe('Models page — the Install affordance', () => {
     recordRequests(catalogRoutes({}, [downloadJob({ id: 'job-commit', state: 'committing' })]));
     await mountModels();
     expect(buttonLabels()).not.toContain('Cancel');
+  });
+});
+
+describe('Models page — local models and the drawer', () => {
+  const NAME = 'qwen3.8-27b-gguf';
+  const SERVED = 'Qwen3.8-27B-UD-Q4_K_XL';
+
+  function modelsRoutes(extra: Record<string, unknown> = {}): Record<string, unknown> {
+    const models: ModelsResponse = {
+      models: [
+        {
+          name: NAME,
+          path: `/models/${NAME}`,
+          modelType: 'qwen3_5',
+          quant: 'Q4_K_XL',
+          contextWindow: 262_144,
+          sizeBytes: 17 * 1024 ** 3,
+          fileCount: 2,
+          servedIds: [SERVED],
+        },
+      ],
+      warnings: [],
+      dir: '/models',
+      host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
+    };
+    return {
+      '/models': models,
+      '/catalog': { items: [] },
+      '/catalog/updates': { items: [] },
+      '/downloads': { jobs: [] },
+      '/metrics/summary': summary({ byModel: [byModelRow(SERVED, 7)] }),
+      '/metrics/timeseries': timeseries([]),
+      '/metrics/turns': turnsPage([]),
+      ...extra,
+    };
+  }
+
+  let restoreWidth: (() => void) | undefined;
+  let api: ReturnType<typeof stubApi> | undefined;
+  let calls: ApiCall[] = [];
+  afterEach(() => {
+    restoreWidth?.();
+    restoreWidth = undefined;
+    api = undefined;
+    vi.restoreAllMocks();
+  });
+
+  async function mountModels(routes: Record<string, unknown>, url = '/models'): Promise<void> {
+    restoreWidth = observeWidth(1180);
+    calls = [];
+    api = stubApi(routes, { onCall: (call) => calls.push(call) });
+    restoreApi = api;
+    mounted = await renderPage(
+      createElement(MemoryRouter, { initialEntries: [url] }, createElement(Models), createElement(CommandsProbe)),
+      (text) => text.includes(NAME) && text.includes('Recommended models'),
+    );
+  }
+
+  let pageCommands: readonly AppCommand[] = [];
+  function CommandsProbe(): null {
+    pageCommands = usePageCommands();
+    return null;
+  }
+
+  function modelRow(): HTMLElement {
+    const tr = mounted!.container.querySelector<HTMLElement>(`tr[data-model="${NAME}"]`);
+    expect(tr).toBeTruthy();
+    return tr!;
+  }
+
+  function popover(): HTMLElement {
+    const found = [...document.querySelectorAll<HTMLElement>('[role="dialog"]')].find((el) =>
+      el.textContent?.includes('Delete model?'),
+    );
+    expect(found).toBeTruthy();
+    return found!;
+  }
+
+  function buttonIn(scope: ParentNode, text: string): HTMLButtonElement {
+    const button = [...scope.querySelectorAll<HTMLButtonElement>('button')].find((b) => b.textContent?.trim() === text);
+    expect(button).toBeTruthy();
+    return button!;
+  }
+
+  it('joins a GGUF checkpoint to its usage, live state and drawer through its served id', async () => {
+    await mountModels(modelsRoutes());
+    await waitFor(() => modelRow().textContent?.includes('7') === true);
+    await waitFor(() => {
+      act(() =>
+        api?.emitLive({ type: 'runtime', snapshot: live({ processes: [process({ models: [liveModel(SERVED)] })] }) }),
+      );
+      return modelRow().textContent?.includes('Loaded') === true;
+    }, 2000);
+    await act(async () => modelRow().querySelector<HTMLAnchorElement>(`a[href="/models?focus=${NAME}"]`)!.click());
+    await waitFor(() => calls.some((call) => call.path.includes(`model=${SERVED}`)));
+    expect(
+      calls.some((call) => call.path.startsWith('/api/metrics/summary') && call.path.includes(`model=${SERVED}`)),
+    ).toBe(true);
+  });
+
+  it('a failed daily series keeps the turn count and says why the spark is missing', async () => {
+    await mountModels(modelsRoutes({ '/metrics/timeseries': STUB_FAILURE }));
+    await waitFor(() => modelRow().querySelector('[title="Daily turns could not be loaded"]') !== null);
+    expect(modelRow().querySelector('[title="Daily turns could not be loaded"]')?.textContent).toBe('7');
+    expect(modelRow().querySelector('[title="No recorded turns for this model in the last 30 days"]')).toBeNull();
+  });
+
+  it('the row delete opens a confirm at the button and keeps a failure inside it', async () => {
+    await mountModels(modelsRoutes({ [`/models/${NAME}`]: STUB_FAILURE }));
+    await act(async () => modelRow().querySelector<HTMLButtonElement>(`button[aria-label="Delete ${NAME}"]`)!.click());
+    expect(popover().textContent).toContain(NAME);
+    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([]);
+    await act(async () => buttonIn(popover(), 'Delete').click());
+    await waitFor(() => popover().querySelector('[role="alert"]') !== null);
+    expect(popover().querySelector('[role="alert"]')?.textContent).toContain('Failed to delete model');
+  });
+
+  it('a row delete that succeeds calls the toast and reloads the lists', async () => {
+    const success = vi.spyOn(toast, 'success');
+    const routes = modelsRoutes({ [`/models/${NAME}`]: { deleted: true, name: NAME } });
+    routes['/models'] = sequence(routes['/models'], { ...(routes['/models'] as ModelsResponse), models: [] });
+    await mountModels(routes);
+    await act(async () => modelRow().querySelector<HTMLButtonElement>(`button[aria-label="Delete ${NAME}"]`)!.click());
+    await act(async () => buttonIn(popover(), 'Delete').click());
+    await waitFor(() => success.mock.calls.length > 0);
+    expect(success).toHaveBeenCalledWith('Model deleted', { description: NAME });
+    await waitFor(() => mounted!.container.querySelector(`tr[data-model="${NAME}"]`) === null);
+    expect(calls.filter((call) => call.method === 'GET' && call.path.split('?')[0] === '/api/catalog').length).toBe(2);
+  });
+
+  /** `/models` before and after NAME was deleted. */
+  function listings(): { before: ModelsResponse; after: ModelsResponse } {
+    const before = modelsRoutes()['/models'] as ModelsResponse;
+    return { before, after: { ...before, models: [] } };
+  }
+
+  async function deleteFromRow(): Promise<void> {
+    await act(async () => modelRow().querySelector<HTMLButtonElement>(`button[aria-label="Delete ${NAME}"]`)!.click());
+    await act(async () => buttonIn(popover(), 'Delete').click());
+  }
+
+  function rowGone(): boolean {
+    return mounted!.container.querySelector(`tr[data-model="${NAME}"]`) === null;
+  }
+
+  it('a row delete takes the row, its tile count and its bytes off at once, while the listing is still loading', async () => {
+    const success = vi.spyOn(toast, 'success');
+    const { before, after } = listings();
+    const held = deferred(after);
+    await mountModels(
+      modelsRoutes({ '/models': sequence(before, held.body), [`/models/${NAME}`]: { deleted: true, name: NAME } }),
+    );
+    expect(statValue(mounted!.container, 'Installed')).toBe('1');
+    expect(mounted!.container.querySelector('[aria-label^="Disk use by model:"]')).not.toBeNull();
+    await deleteFromRow();
+    await waitFor(() => success.mock.calls.length > 0);
+    await waitFor(rowGone);
+    expect(calls.filter((call) => call.method === 'GET' && call.path === '/api/models').length).toBe(2);
+    expect(statValue(mounted!.container, 'Installed')).toBe('0');
+    expect(statValue(mounted!.container, 'On disk')).not.toContain('17');
+    expect(document.querySelector(`button[aria-label="Delete ${NAME}"]`)).toBeNull();
+    expect(mounted!.container.querySelector('[aria-label^="Disk use by model:"]')).toBeNull();
+    held.release();
+    for (let i = 0; i < 10; i++) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+    expect(rowGone()).toBe(true);
+  });
+
+  it('a drawer delete takes the row off while the listing is still loading', async () => {
+    const { before, after } = listings();
+    const held = deferred(after);
+    await mountModels(
+      modelsRoutes({ '/models': sequence(before, held.body), [`/models/${NAME}`]: { deleted: true, name: NAME } }),
+      `/models?focus=${NAME}`,
+    );
+    await waitFor(() => byRole(document, 'dialog', NAME) !== null);
+    await act(async () => buttonIn(byRole(document, 'dialog', NAME)!, 'Delete model').click());
+    await act(async () => buttonIn(popover(), 'Delete').click());
+    await waitFor(() => byRole(document, 'dialog', NAME) === null, 2000);
+    await waitFor(rowGone);
+    expect(statValue(mounted!.container, 'Installed')).toBe('0');
+    held.release();
+  });
+
+  it('a delete whose reload fails keeps the row off and says the list could not be refreshed', async () => {
+    const { before, after } = listings();
+    await mountModels(
+      modelsRoutes({
+        '/models': sequence(before, STUB_FAILURE, after),
+        [`/models/${NAME}`]: { deleted: true, name: NAME },
+      }),
+    );
+    await deleteFromRow();
+    await waitFor(() => (mounted!.container.textContent ?? '').includes('Could not refresh the model list'));
+    expect(rowGone()).toBe(true);
+    await act(async () => buttonIn(mounted!.container, 'Try again').click());
+    await waitFor(() => !(mounted!.container.textContent ?? '').includes('Could not refresh the model list'));
+    expect(rowGone()).toBe(true);
+  });
+
+  it('a delete that answers not found takes the row off and fetches the list again', async () => {
+    const success = vi.spyOn(toast, 'success');
+    const { before, after } = listings();
+    await mountModels(modelsRoutes({ '/models': sequence(before, after) }));
+    await deleteFromRow();
+    await waitFor(() => success.mock.calls.length > 0);
+    expect(success).toHaveBeenCalledWith('Model was already gone', { description: NAME });
+    await waitFor(rowGone);
+    expect(calls.filter((call) => call.method === 'DELETE').map((call) => call.path)).toEqual([`/api/models/${NAME}`]);
+    await waitFor(() => calls.filter((call) => call.method === 'GET' && call.path === '/api/models').length === 2);
+  });
+
+  it('shows the row again when the runtime still lists it after the delete', async () => {
+    const { before } = listings();
+    await mountModels(
+      modelsRoutes({ '/models': sequence(before, before), [`/models/${NAME}`]: { deleted: true, name: NAME } }),
+    );
+    await deleteFromRow();
+    await waitFor(() => calls.filter((call) => call.method === 'GET' && call.path === '/api/models').length === 2);
+    await waitFor(() => !rowGone());
+  });
+
+  it('a listing read before the delete never seeds the next visit', async () => {
+    const { before, after } = listings();
+    const stale = deferred(before);
+    const neverAnswers = deferred(after);
+    const routes = modelsRoutes({
+      '/models': sequence(before, stale.body, after, neverAnswers.body),
+      [`/models/${NAME}`]: { deleted: true, name: NAME },
+    });
+    await mountModels(routes);
+    act(() => reloadMountedQueries());
+    await waitFor(() => calls.filter((call) => call.method === 'GET' && call.path === '/api/models').length === 2);
+    await deleteFromRow();
+    await waitFor(() => calls.filter((call) => call.method === 'GET' && call.path === '/api/models').length === 3);
+    await waitFor(rowGone);
+    for (let i = 0; i < 5; i++) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+    stale.release();
+    for (let i = 0; i < 5; i++) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+    mounted!.unmount();
+    mounted = await renderPage(
+      createElement(MemoryRouter, { initialEntries: ['/models'] }, createElement(Models)),
+      (text) => text.includes('Recommended models'),
+    );
+    expect(mounted.container.querySelector(`tr[data-model="${NAME}"]`)).toBeNull();
+    neverAnswers.release();
+  });
+
+  it('shows the models folder and the drawer Path under the home folder as ~/…, copying the full path', async () => {
+    const original = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+    const writeText = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    onTestFinished(() => {
+      if (original === undefined) Reflect.deleteProperty(navigator, 'clipboard');
+      else Object.defineProperty(navigator, 'clipboard', original);
+    });
+    const routes = modelsRoutes({
+      '/health': { status: 'ok', modelsDir: '/models', tracesDir: '', runtimeDir: '', homeDir: '/models' },
+    });
+    await mountModels(routes, `/models?focus=${NAME}`);
+    await waitFor(() => byRole(document, 'dialog', NAME) !== null);
+    const drawer = byRole(document, 'dialog', NAME)!;
+    await waitFor(() => drawer.querySelector(`[title="/models/${NAME}"]`)?.textContent === `~/${NAME}`);
+    expect(mounted!.container.querySelector('[title="/models"]')?.textContent).toBe('~');
+    await act(async () => byRole(drawer, 'button', 'Copy Path')?.click());
+    expect(writeText).toHaveBeenCalledWith(`/models/${NAME}`);
+  });
+
+  it('the palette copies the full models folder and its toast shows it under ~', async () => {
+    const original = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+    const writeText = vi.fn(() => Promise.resolve());
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    onTestFinished(() => {
+      if (original === undefined) Reflect.deleteProperty(navigator, 'clipboard');
+      else Object.defineProperty(navigator, 'clipboard', original);
+    });
+    const success = vi.spyOn(toast, 'success');
+    const routes = modelsRoutes({
+      '/health': { status: 'ok', modelsDir: '/home/ann/models', tracesDir: '', runtimeDir: '', homeDir: '/home/ann' },
+    });
+    routes['/models'] = { ...(routes['/models'] as ModelsResponse), dir: '/home/ann/models' };
+    await mountModels(routes);
+    await waitFor(() => mounted!.container.querySelector('[title="/home/ann/models"]')?.textContent === '~/models');
+    const copy = pageCommands.find((command) => command.id === 'models:copy-dir');
+    expect(copy).toBeTruthy();
+    await act(async () => {
+      await copy!.run();
+    });
+    await waitFor(() => success.mock.calls.length > 0);
+    expect(writeText).toHaveBeenCalledWith('/home/ann/models');
+    expect(success).toHaveBeenCalledWith('Path copied', { description: '~/models' });
+  });
+
+  it('a pointer-down on the drawer closes the delete confirm and keeps the drawer', async () => {
+    await mountModels(modelsRoutes(), `/models?focus=${NAME}`);
+    const drawer = await (async () => {
+      await waitFor(() => byRole(document, 'dialog', NAME) !== null);
+      return byRole(document, 'dialog', NAME)!;
+    })();
+    await act(async () => buttonIn(drawer, 'Delete model').click());
+    expect(popover()).toBeTruthy();
+    const heading = drawer.querySelector('h2') ?? drawer;
+    await waitFor(() => {
+      // Radix defers a primary-button outside press to its click.
+      heading.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+      heading.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      return ![...document.querySelectorAll('[role="dialog"]')].some((el) => el.textContent?.includes('Delete model?'));
+    });
+    expect(byRole(document, 'dialog', NAME)).toBeTruthy();
+  });
+
+  it('Escape closes the drawer and puts focus back on the row that opened it', async () => {
+    await mountModels(modelsRoutes());
+    const row = modelRow();
+    await act(async () => {
+      row.focus();
+      row.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    });
+    await waitFor(() => byRole(document, 'dialog', NAME) !== null);
+    await act(async () => {
+      document.activeElement?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    });
+    await waitFor(() => byRole(document, 'dialog', NAME) === null, 2000);
+    await waitFor(() => document.activeElement === modelRow(), 2000);
+  });
+
+  it('after a delete from the drawer the drawer is gone and focus is on the scroll root', async () => {
+    const routes = modelsRoutes({ [`/models/${NAME}`]: { deleted: true, name: NAME } });
+    await mountModels(routes);
+    const link = modelRow().querySelector<HTMLAnchorElement>(`a[href="/models?focus=${NAME}"]`)!;
+    await act(async () => {
+      link.focus();
+      link.click();
+    });
+    await waitFor(() => byRole(document, 'dialog', NAME) !== null);
+    const drawer = byRole(document, 'dialog', NAME)!;
+    await act(async () => buttonIn(drawer, 'Delete model').click());
+    await act(async () => buttonIn(popover(), 'Delete').click());
+    await waitFor(() => byRole(document, 'dialog', NAME) === null, 2000);
+    for (let i = 0; i < 10; i++) {
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+    }
+    await waitFor(() => document.activeElement?.hasAttribute('data-scroll-root') === true);
   });
 });

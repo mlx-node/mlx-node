@@ -1,47 +1,154 @@
-import { Button } from '@/components/ui/button';
-import { mutate } from '@/lib/api';
-import { getConnectionGeneration, subscribeConnection } from '@/lib/connection';
-import { useJson } from '@/lib/use-api';
-import { Check, Download, LoaderCircle, RefreshCw, Terminal } from 'lucide-react';
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { Link } from 'react-router-dom';
+import { Download, RefreshCw } from 'lucide-react';
+import {
+  Fragment,
+  type ReactElement,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 
 import type { CodingAgentId, CodingAgentsState } from '../../../src/coding-agents.js';
+import { AgentMark } from '../components/arc-x/agent-mark/agent-mark';
+import { ButtonLink } from '../components/arc-x/button-link/button-link';
+import { CodePanel } from '../components/arc-x/code-panel/code-panel';
+import { Disclosure } from '../components/arc-x/disclosure/disclosure';
+import { KeyValue } from '../components/arc-x/key-value/key-value';
+import { LiveLabel } from '../components/arc-x/live-label/live-label';
+import { ModelBadge } from '../components/arc-x/model-badge/model-badge';
+import { MorphLoader } from '../components/arc-x/morph-loader/morph-loader';
+import { Panel } from '../components/arc-x/panel/panel';
+import { PathText } from '../components/arc-x/path-text/path-text';
+import { Placeholder } from '../components/arc-x/placeholder/placeholder';
+import { Rule } from '../components/arc-x/rule/rule';
+import { Alert } from '../components/arc/alert/alert';
+import { Button } from '../components/arc/button/button';
+import { mutate } from '../lib/api';
+import { getConnectionGeneration, subscribeConnection } from '../lib/connection';
+import { useJson } from '../lib/use-api';
+import { type AppCommand, useCommands } from '../shell/commands';
+import { Page, PageHeader } from '../shell/page';
 
-function AgentLogo({ id }: { id: CodingAgentId }) {
-  if (id === 'claude')
-    return (
-      <svg viewBox="0 0 40 40" className="size-9 text-[#d97757]" fill="none" aria-hidden>
-        {Array.from({ length: 12 }, (_, i) => (
-          <path
-            key={i}
-            d="M20 4v32"
-            stroke="currentColor"
-            strokeWidth="2.4"
-            strokeLinecap="round"
-            transform={`rotate(${i * 15} 20 20)`}
-          />
-        ))}
-      </svg>
-    );
-  if (id === 'codex')
-    return (
-      <span className="flex size-9 items-center justify-center rounded-xl bg-gradient-to-br from-violet-300 to-indigo-500 text-white">
-        <Terminal className="size-6" aria-hidden />
-      </span>
-    );
+type Busy = null | 'refresh' | CodingAgentId;
+type Agent = CodingAgentsState['agents'][number];
+type Request = { action: 'refresh' } | { action: 'install'; agent: CodingAgentId };
+
+const REFRESH_MS = 30_000;
+
+function actionLabel(agent: Agent): string {
+  if (agent.status === 'error') return 'Check again';
+  if (agent.status === 'needs-update') return 'Update';
+  return 'Install';
+}
+
+function workingLabel(agent: Agent): string {
+  if (agent.status === 'error') return 'Checking…';
+  if (agent.status === 'needs-update') return 'Updating…';
+  return 'Installing…';
+}
+
+function requestFor(agent: Agent): Request {
+  return agent.status === 'error' ? { action: 'refresh' } : { action: 'install', agent: agent.id };
+}
+
+interface AgentRowProps {
+  agent: Agent;
+  available: boolean;
+  busy: Busy;
+  onRun: (body: Request, busy: Busy) => void;
+}
+
+function AgentRow({ agent, available, busy, onRun }: AgentRowProps): ReactElement {
+  const working = busy === agent.id;
+  const installed = agent.status === 'installed';
+  const showButton = !working && !installed;
+  const cell = useRef<HTMLDivElement>(null);
+  const hadFocus = useRef(false);
+
+  // A replaced button must not drop focus to <body>; when it comes back it takes focus again.
+  useLayoutEffect(() => {
+    const node = cell.current;
+    if (node === null || !hadFocus.current) return;
+    const button = node.querySelector('button');
+    if (button === null) {
+      node.focus();
+      return;
+    }
+    if (document.activeElement === node) button.focus();
+    hadFocus.current = false;
+  }, [showButton]);
+
   return (
-    <svg viewBox="0 0 40 40" className="size-9" fill="none" stroke="currentColor" strokeWidth="2.4" aria-hidden>
-      <path d="M30 9a14 14 0 1 0 2 19M8 34 34 5M19 22l14-13-8 17" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-3 p-4">
+      <AgentMark id={agent.id} size={28} className="shrink-0" />
+      <div className="grid min-w-[min(100%,14rem)] flex-1 grid-cols-1 gap-0.5">
+        <h2 className="m-0 text-strong font-medium text-foreground">{agent.name}</h2>
+        <p className="m-0 text-body text-secondary [overflow-wrap:anywhere]">
+          Instructions in{' '}
+          <span className="inline-flex max-w-full align-bottom">
+            <PathText path={agent.path} />.
+          </span>
+        </p>
+        {agent.detail !== null && agent.detail !== '' && !installed ? (
+          <p
+            className={agent.status === 'error' ? 'm-0 text-body text-danger' : 'm-0 text-body text-secondary'}
+            role={agent.status === 'error' ? 'alert' : undefined}
+          >
+            {agent.detail}
+          </p>
+        ) : null}
+      </div>
+      <div ref={cell} tabIndex={-1} aria-live="polite" className="flex min-w-[96px] justify-end">
+        {showButton ? (
+          <Button
+            type="button"
+            variant="secondary"
+            style={{ minWidth: 96 }}
+            disabled={!available || busy !== null}
+            onClick={() => {
+              hadFocus.current = true;
+              onRun(requestFor(agent), agent.id);
+            }}
+          >
+            {actionLabel(agent)}
+          </Button>
+        ) : (
+          <span key="status" className="flex min-h-8 items-center gap-1.5 text-body font-medium text-secondary">
+            <MorphLoader size={14} status={working ? 'loading' : 'success'} />
+            {working ? <LiveLabel active>{workingLabel(agent)}</LiveLabel> : <span>Installed</span>}
+          </span>
+        )}
+      </div>
+    </div>
   );
 }
 
-export default function CodingAgents() {
+function LoadingRows(): ReactElement {
+  return (
+    <div role="status" className="grid">
+      <span className="sr-only">Loading coding agents…</span>
+      {[0, 1, 2].map((index) => (
+        <div key={index} className="flex items-center gap-4 p-4" aria-hidden="true">
+          <Placeholder width={28} height={28} radius="pill" />
+          <div className="grid flex-1 gap-1.5">
+            <Placeholder width="30%" />
+            <Placeholder width="65%" />
+          </div>
+          <Placeholder width={96} height={32} radius="control" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export default function CodingAgents(): ReactElement {
   const state = useJson<CodingAgentsState>('/coding-agents');
   const { reload } = state;
   const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<Busy>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const active = useRef(true);
   useEffect(() => {
@@ -53,8 +160,8 @@ export default function CodingAgents() {
   const data = state.data;
 
   const run = useCallback(
-    async (body: { action: 'refresh' } | { action: 'install'; agent: CodingAgentId }) => {
-      setBusy(true);
+    async (body: Request, key: Busy) => {
+      setBusy(key);
       setProblem(null);
       try {
         await mutate('POST', '/coding-agents', body);
@@ -62,7 +169,7 @@ export default function CodingAgents() {
         if (active.current) setProblem(error instanceof Error ? error.message : 'Could not update coding agents.');
       } finally {
         if (active.current) {
-          setBusy(false);
+          setBusy(null);
           reload();
         }
       }
@@ -75,10 +182,10 @@ export default function CodingAgents() {
   }, [connection, reload]);
 
   useEffect(() => {
-    const refresh = () => {
+    const refresh = (): void => {
       if (!document.hidden) reload();
     };
-    const timer = setInterval(refresh, 30_000);
+    const timer = setInterval(refresh, REFRESH_MS);
     window.addEventListener('focus', refresh);
     return () => {
       clearInterval(timer);
@@ -86,122 +193,157 @@ export default function CodingAgents() {
     };
   }, [reload]);
 
+  const commands = useMemo((): AppCommand[] => {
+    const list: AppCommand[] = [
+      {
+        id: 'coding-agents:refresh',
+        label: 'Check coding agent status',
+        group: 'Coding Agents',
+        run: () => void run({ action: 'refresh' }, 'refresh'),
+      },
+    ];
+    if (data?.available === true) {
+      for (const agent of data.agents) {
+        if (agent.status === 'not-installed' || agent.status === 'needs-update') {
+          list.push({
+            id: `coding-agents:install:${agent.id}`,
+            label: `Install instructions for ${agent.name}`,
+            group: 'Coding Agents',
+            run: () => void run({ action: 'install', agent: agent.id }, agent.id),
+          });
+        }
+      }
+    }
+    return list;
+  }, [data, run]);
+  useCommands(commands);
+
+  const failure = problem ?? state.error?.message ?? null;
+
   return (
-    <section className="mx-auto max-w-4xl space-y-5" aria-labelledby="coding-agents-title">
-      <div className="flex items-center justify-between gap-4 pb-2">
-        <h1 id="coding-agents-title" className="text-3xl font-semibold tracking-tight">
-          Coding Agents
-        </h1>
-        <Button variant="ghost" size="sm" disabled={busy} onClick={() => void run({ action: 'refresh' })}>
-          <RefreshCw className={`size-4 ${busy ? 'animate-spin' : ''}`} aria-hidden /> Check status
-        </Button>
-      </div>
+    <Page width="reading" busy={state.refreshing}>
+      <PageHeader
+        title="Coding Agents"
+        description="Let coding agents hand GitHub work to a local model."
+        actions={
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            loading={busy === 'refresh'}
+            disabled={busy !== null}
+            onClick={() => void run({ action: 'refresh' }, 'refresh')}
+          >
+            {busy === 'refresh' ? null : <RefreshCw size={16} aria-hidden="true" />}
+            Check status
+          </Button>
+        }
+      />
 
-      <div className="bg-muted/70 rounded-3xl px-6 py-5">
-        <p className="text-muted-foreground text-base leading-relaxed">
-          Let your coding agents hand GitHub work to a local model. Review comments, investigate failed checks, and
-          gather context while using fewer cloud tokens. Your coding agent approves each delegated task before the local
-          worker runs it.
-        </p>
-      </div>
-
-      {data && !data.available && (
-        <div
-          className="bg-muted/70 flex flex-wrap items-center justify-between gap-4 rounded-3xl px-6 py-5"
-          role="status"
+      {data !== undefined && !data.available ? (
+        <Alert
+          tone="warning"
+          title={data.model !== null ? 'Command setup needs attention' : 'A local model is required'}
         >
-          <div>
-            <p className="font-medium">{data.model ? 'Command setup needs attention' : 'A local model is required'}</p>
-            <p className="text-muted-foreground mt-1 text-sm">{data.unavailableReason}</p>
-          </div>
-          {data.model ? (
-            <Button disabled={busy} onClick={() => void run({ action: 'refresh' })}>
-              Retry setup
-            </Button>
+          <span className="grid justify-items-start gap-2">
+            <span>{data.unavailableReason}</span>
+            {data.model !== null ? (
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                disabled={busy !== null}
+                onClick={() => void run({ action: 'refresh' }, 'refresh')}
+              >
+                Retry setup
+              </Button>
+            ) : (
+              <ButtonLink to="/welcome" variant="secondary" size="sm">
+                <Download size={16} aria-hidden="true" />
+                Install a model
+              </ButtonLink>
+            )}
+          </span>
+        </Alert>
+      ) : null}
+
+      {failure !== null ? (
+        <Alert tone="danger" title="Could not update coding agents">
+          {failure}
+        </Alert>
+      ) : null}
+
+      {data !== undefined ? (
+        <Panel title="Setup">
+          <KeyValue
+            layout="rows"
+            ariaLabel="Setup"
+            items={[
+              {
+                key: 'model',
+                label: 'Local model',
+                value: data.model !== null ? <ModelBadge name={data.model} size="sm" /> : 'None installed',
+              },
+              data.command !== null
+                ? {
+                    key: 'command',
+                    label: 'Command',
+                    value: <PathText path={data.command} />,
+                    mono: true,
+                    copy: data.command,
+                  }
+                : { key: 'command', label: 'Command', value: 'Not set up' },
+            ]}
+          />
+        </Panel>
+      ) : null}
+
+      <Panel ariaLabel="Coding agents" padding="none">
+        {data === undefined ? (
+          state.loading ? (
+            <LoadingRows />
           ) : (
-            <Button asChild>
-              <Link to="/welcome">
-                <Download className="size-4" aria-hidden /> Install a model
-              </Link>
-            </Button>
-          )}
-        </div>
-      )}
-
-      {(problem || state.error) && (
-        <p role="alert" className="text-destructive text-sm">
-          {problem || state.error?.message}
-        </p>
-      )}
-
-      {!data ? (
-        state.loading && (
-          <div role="status" className="bg-muted/70 flex items-center gap-3 rounded-3xl p-6 text-sm">
-            <LoaderCircle className="size-4 animate-spin" aria-hidden /> Loading coding agents…
+            <p className="m-0 p-4 text-body text-secondary">Coding agent status is not available.</p>
+          )
+        ) : (
+          <div className="grid">
+            {data.agents.map((agent, index) => (
+              <Fragment key={agent.id}>
+                {index > 0 ? <Rule /> : null}
+                <AgentRow
+                  agent={agent}
+                  available={data.available}
+                  busy={busy}
+                  onRun={(body, key) => void run(body, key)}
+                />
+              </Fragment>
+            ))}
           </div>
-        )
-      ) : (
-        <div className="bg-muted/70 rounded-3xl px-5 sm:px-6">
-          {data.agents.map((agent) => {
-            const installed = agent.status === 'installed';
-            const label =
-              agent.status === 'error' ? 'Check again' : agent.status === 'needs-update' ? 'Update' : 'Install';
-            return (
-              <div key={agent.id} className="flex items-center gap-4 border-b py-6 last:border-b-0 sm:gap-5">
-                <div className="flex w-10 shrink-0 justify-center">
-                  <AgentLogo id={agent.id} />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <h2 className="text-xl font-medium tracking-tight">{agent.name}</h2>
-                  <p className="text-muted-foreground mt-1 break-words text-sm leading-relaxed">
-                    Instructions in {agent.path}.
-                  </p>
-                  {agent.detail && agent.status !== 'installed' && (
-                    <p
-                      className={`mt-1 text-sm leading-relaxed ${agent.status === 'error' ? 'text-destructive' : 'text-muted-foreground'}`}
-                      role={agent.status === 'error' ? 'alert' : undefined}
-                    >
-                      {agent.detail}
-                    </p>
-                  )}
-                </div>
-                <div className="shrink-0" aria-live="polite">
-                  {installed ? (
-                    <span className="flex items-center gap-2 px-2 py-2 text-base font-medium">
-                      <span className="bg-foreground text-background flex size-5 items-center justify-center rounded-full">
-                        <Check className="size-3.5" strokeWidth={3} aria-hidden />
-                      </span>
-                      Installed
-                    </span>
-                  ) : (
-                    <Button
-                      variant="secondary"
-                      className="min-w-28 rounded-xl bg-black/[0.06] text-base shadow-none hover:bg-black/10 dark:bg-white/10"
-                      disabled={!data.available || busy}
-                      onClick={() =>
-                        void run(
-                          agent.status === 'error' ? { action: 'refresh' } : { action: 'install', agent: agent.id },
-                        )
-                      }
-                    >
-                      {busy && <LoaderCircle className="size-4 animate-spin" aria-hidden />}
-                      {label}
-                    </Button>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      )}
+        )}
+      </Panel>
 
-      {data?.available && (
-        <p className="text-muted-foreground px-1 text-sm">
-          Install adds a block between <code>portato managed instructions</code> markers. Update replaces only that
-          block. The app includes the mlx command. Start a new agent session after installation. GitHub work requires an
-          authenticated GitHub CLI.
-        </p>
-      )}
-    </section>
+      {data?.available === true ? (
+        <Panel title="How it works">
+          <div className="grid gap-3">
+            <ol className="m-0 grid list-decimal gap-2 ps-5 text-body text-foreground">
+              <li>
+                Install adds a block between <code className="font-mono">portato managed instructions</code> markers.
+                Update replaces only that block.
+              </li>
+              <li>Start a new agent session after installation.</li>
+              <li>Your coding agent approves each delegated task before the local worker runs it.</li>
+            </ol>
+            <p className="m-0 text-body text-secondary">
+              The app includes the mlx command. GitHub work requires an authenticated GitHub CLI.
+            </p>
+            {data.block !== null ? (
+              <Disclosure title="What gets added">
+                <CodePanel code={data.block} label="Instruction block" maxLines={16} />
+              </Disclosure>
+            ) : null}
+          </div>
+        </Panel>
+      ) : null}
+    </Page>
   );
 }

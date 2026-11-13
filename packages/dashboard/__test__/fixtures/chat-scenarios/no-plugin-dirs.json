@@ -1,0 +1,52 @@
+{
+  "persist": true,
+  "initialize": {
+    "protocolVersion": 1,
+    "loadSession": true,
+    "pluginDirs": false,
+    "agentVersion": "1.0.45",
+    "models": [
+      {
+        "modelId": "qwen3.5-4b",
+        "totalContextTokens": 32768
+      }
+    ]
+  },
+  "session": {
+    "agentName": "mlx-chat",
+    "toolDefinitionsCount": 2,
+    "skills": 1,
+    "mcpServers": 1,
+    "apiBackend": "Messages",
+    "mcpReadyAfterMs": 70,
+    "modelChangedOnNewAndLoad": true,
+    "replayOnLoad": true
+  },
+  "prompts": [
+    {
+      "match": "",
+      "steps": [
+        {
+          "thought": "The user greets me.",
+          "chunk": 5
+        },
+        {
+          "text": "Hello! How can I help?",
+          "chunk": 7
+        },
+        {
+          "turnCompleted": {
+            "inputTokens": 400,
+            "outputTokens": 30
+          }
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    }
+  ],
+  "faults": {}
+}

@@ -1,10 +1,10 @@
 import { existsSync, renameSync, rmSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
-import { getTableColumns } from 'drizzle-orm';
+import { getTableColumns, getTableName } from 'drizzle-orm';
 import { drizzle, type NodeSQLiteDatabase } from 'drizzle-orm/node-sqlite';
 
-import { traceFiles, traces } from './schema.js';
+import { ALL_TABLES } from './schema.js';
 
 export interface DashboardDb {
   db: NodeSQLiteDatabase;
@@ -18,29 +18,58 @@ export interface DashboardDb {
  * rather than migrated in place. The index is disposable and repopulated from
  * JSONL on boot, so a rebuild never loses source-of-truth data.
  */
-const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 12;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS traces (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   trace_id TEXT NOT NULL UNIQUE,
   session_id TEXT,
-  root_session_id TEXT,
   ts INTEGER NOT NULL,
+  pid INTEGER,
   model TEXT,
+  model_id TEXT,
+  model_type TEXT,
+  model_key TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  error_kind TEXT,
+  fail_phase TEXT,
+  endpoint TEXT,
+  stream INTEGER,
+  dispatch TEXT,
   ttft_ms REAL,
-  prefill_tps REAL,
+  prefill_ms REAL,
+  prefill_tokens INTEGER,
   decode_tps REAL,
   mtp_cycles INTEGER,
   mtp_mean_accepted REAL,
+  mtp_mean_drafts REAL,
+  mtp_mean_depth REAL,
+  mtp_accept_by_pos TEXT,
   duration_ms REAL,
-  queue_ms INTEGER,
+  queue_ms REAL,
+  load_wait_ms REAL,
+  resolve_ms REAL,
+  pre_dispatch_ms REAL,
+  wait_ms REAL,
+  slot_ms REAL,
+  prepare_ms REAL,
   finish_reason TEXT,
-  resident INTEGER,
   prompt_tokens INTEGER,
   cached_tokens INTEGER,
   output_tokens INTEGER,
   reasoning_tokens INTEGER,
+  prefill_done_tokens INTEGER,
+  ctx_window INTEGER,
+  tool_count INTEGER,
+  tool_call_count INTEGER,
+  image_count INTEGER,
+  concurrency INTEGER,
+  concurrency_peak INTEGER,
+  mem_active_bytes INTEGER,
+  mem_peak_bytes INTEGER,
+  pipelines_created INTEGER,
+  pipeline_create_ms REAL,
   cold_hits INTEGER,
   cold_misses INTEGER,
   cold_bytes_written INTEGER,
@@ -69,27 +98,131 @@ CREATE TABLE IF NOT EXISTS traces (
 CREATE TABLE IF NOT EXISTS trace_files (
   name TEXT PRIMARY KEY,
   last_ingested_mtime INTEGER NOT NULL,
-  last_ingested_size INTEGER NOT NULL
+  last_ingested_size INTEGER NOT NULL,
+  consumed INTEGER NOT NULL,
+  tail TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS runtime_files (
+  name TEXT PRIMARY KEY,
+  last_ingested_mtime INTEGER NOT NULL,
+  last_ingested_size INTEGER NOT NULL,
+  consumed INTEGER NOT NULL,
+  tail TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runtime_procs (
+  proc_key TEXT PRIMARY KEY,
+  pid INTEGER NOT NULL,
+  started_at INTEGER NOT NULL,
+  host TEXT,
+  version TEXT,
+  port INTEGER,
+  chip TEXT,
+  wired_limit_bytes INTEGER,
+  total_mem_bytes INTEGER,
+  first_ts INTEGER NOT NULL,
+  last_ts INTEGER NOT NULL,
+  exit_ts INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS runtime_samples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  proc_key TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  dt_ms INTEGER,
+  busy INTEGER NOT NULL,
+  busy_ms INTEGER,
+  health TEXT,
+  mem_active INTEGER,
+  mem_peak INTEGER,
+  mem_cache INTEGER,
+  rss INTEGER,
+  in_flight INTEGER,
+  queued INTEGER,
+  resident INTEGER,
+  d_ok INTEGER,
+  d_error INTEGER,
+  d_cancelled INTEGER,
+  d_out_tokens INTEGER,
+  d_rejected INTEGER,
+  source_file TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runtime_sched (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  proc_key TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  block_capacity INTEGER,
+  allocated_blocks INTEGER,
+  free_blocks INTEGER,
+  reclaimable_blocks INTEGER,
+  watermark_blocks INTEGER,
+  reserved_blocks INTEGER,
+  memory_capacity_bytes INTEGER,
+  memory_watermark_bytes INTEGER,
+  reserved_block_bytes INTEGER,
+  reserved_state_bytes INTEGER,
+  global_steps INTEGER,
+  admitted INTEGER,
+  completed INTEGER,
+  max_batch_occupancy INTEGER,
+  fused_greedy_epilogue_steps INTEGER,
+  admission_deferred_blocks INTEGER,
+  admission_deferred_state INTEGER,
+  rows_alloc_evicted INTEGER,
+  preemptions INTEGER,
+  preemptions_recompute INTEGER,
+  preemptions_ssd INTEGER,
+  ssd_restore_waiting INTEGER,
+  ssd_restore_bytes INTEGER,
+  ssd_restore_wait_ms REAL,
+  turns INTEGER,
+  occ_hist TEXT,
+  source_file TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS runtime_loads (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  proc_key TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  model TEXT NOT NULL,
+  model_type TEXT,
+  capability TEXT,
+  ms REAL,
+  ok INTEGER,
+  source_file TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces (ts);
+CREATE INDEX IF NOT EXISTS idx_traces_model_ts ON traces (model_key, ts);
 CREATE INDEX IF NOT EXISTS idx_traces_session_id ON traces (session_id);
-CREATE INDEX IF NOT EXISTS idx_traces_root_session_id ON traces (root_session_id);
-CREATE INDEX IF NOT EXISTS idx_traces_trace_id ON traces (trace_id);
 CREATE INDEX IF NOT EXISTS idx_traces_cold_root ON traces (cold_root);
+CREATE INDEX IF NOT EXISTS idx_traces_source_file ON traces (source_file);
+CREATE INDEX IF NOT EXISTS idx_runtime_samples_ts ON runtime_samples (ts);
+CREATE INDEX IF NOT EXISTS idx_runtime_samples_source_file ON runtime_samples (source_file);
+CREATE INDEX IF NOT EXISTS idx_runtime_sched_ts ON runtime_sched (ts);
+CREATE INDEX IF NOT EXISTS idx_runtime_loads_ts ON runtime_loads (ts);
 `;
 
-/** SQLite errors that mean the file on disk is not a usable database. */
-const CORRUPTION_RE = /not a database|malformed|disk image|corrupt/i;
+/** Lower-cased fragments of SQLite errors that mean the file on disk is not a usable database. */
+const CORRUPTION_TEXT = ['not a database', 'malformed', 'disk image', 'corrupt'];
 
-/** SQLite DDL errors that mean the on-disk schema predates this build. */
-const SCHEMA_MISMATCH_RE = /no such (table|column)|has no column named/i;
+/** Lower-cased fragments of SQLite DDL errors that mean the on-disk schema predates this build. */
+const SCHEMA_MISMATCH_TEXT = ['no such table', 'no such column', 'has no column named'];
+
+function errorTextHasAny(err: unknown, fragments: readonly string[]): boolean {
+  const text = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return fragments.some((fragment) => text.includes(fragment));
+}
 
 function isCorruptionError(err: unknown): boolean {
-  return CORRUPTION_RE.test(err instanceof Error ? err.message : String(err));
+  return errorTextHasAny(err, CORRUPTION_TEXT);
 }
 
 function isSchemaMismatchError(err: unknown): boolean {
-  return SCHEMA_MISMATCH_RE.test(err instanceof Error ? err.message : String(err));
+  return errorTextHasAny(err, SCHEMA_MISMATCH_TEXT);
 }
 
 /** An existing db whose pages are damaged or whose schema is older than this
@@ -102,7 +235,7 @@ class RebuildRequiredError extends Error {}
  *    only no-ops on an existing schema and never walks data leaf pages, so such
  *    damage would otherwise slip past open and throw later at query time.
  *  - `user_version` other than SCHEMA_VERSION means a foreign schema — older
- *    (e.g. a `traces` table predating root_session_id) OR newer (a future schema
+ *    (e.g. a `traces` table predating model_key) OR newer (a future schema
  *    this build predates). The index is disposable and rebuilt from JSONL, so an
  *    exact match is required; anything else is rebuilt rather than opened blind.
  * A non-database file makes `quick_check` throw "file is not a database", which
@@ -127,10 +260,9 @@ function assertUsableSchema(sqlite: DatabaseSync): void {
  * bump) is automatically part of this open-time contract. Keys are the SQLite
  * table names; values the full set of DB column names each must carry.
  */
-const EXPECTED_COLUMNS: Record<string, string[]> = {
-  traces: Object.values(getTableColumns(traces)).map((c) => c.name),
-  trace_files: Object.values(getTableColumns(traceFiles)).map((c) => c.name),
-};
+export const EXPECTED_COLUMNS: Record<string, string[]> = Object.fromEntries(
+  ALL_TABLES.map((table) => [getTableName(table), Object.values(getTableColumns(table)).map((c) => c.name)]),
+);
 
 /**
  * Verify every expected table carries every expected column on the UNTOUCHED

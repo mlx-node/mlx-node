@@ -184,7 +184,7 @@ export interface Supervisor {
 }
 
 /** Class-(b) errors kept per generation. See {@link recordSwallowed}. */
-const MAX_NATIVE_ERRORS = 20;
+export const MAX_NATIVE_ERRORS = 20;
 
 export function createSupervisor(opts: SupervisorOptions): Supervisor {
   const timings: SupervisorTimings = { ...DEFAULT_TIMINGS, ...opts.timings };

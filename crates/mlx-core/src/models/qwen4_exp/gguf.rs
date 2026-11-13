@@ -1,8 +1,8 @@
 use super::{config::Config, weights::Store};
 use crate::utils::gguf::{
-    GgufMetaValue, native_gguf_cache_root, native_gguf_lease_in_use,
-    native_gguf_lease_in_use_retry, native_gguf_sidecar_mutex, native_gguf_unlease_in_use,
-    source_file_identity_digest, write_embedded_gpt2_tokenizer,
+    GgufMetaValue, NATIVE_GGUF_ASSETS_PREFIX, native_gguf_assets_dir_name, native_gguf_cache_root,
+    native_gguf_lease_in_use, native_gguf_lease_in_use_retry, native_gguf_sidecar_mutex,
+    native_gguf_unlease_in_use, source_file_identity_digest, write_embedded_gpt2_tokenizer,
 };
 use napi::{Error, Result};
 use serde_json::{Value, json};
@@ -213,8 +213,7 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
         .canonicalize()
         .map_err(|e| Error::from_reason(e.to_string()))?;
     let metadata = std::fs::metadata(&source).map_err(|e| Error::from_reason(e.to_string()))?;
-    let identity = source_file_identity_digest(&source, &metadata);
-    let dir_name = format!(".mlx-qwen4-assets-v2-{identity}");
+    let dir_name = native_gguf_assets_dir_name(&source_file_identity_digest(&source, &metadata));
     let dir = root.join(&dir_name);
     // A sidecar that cannot replace a leased `dir` lands at this
     // deterministic same-pid name instead: the uuid temp it replaces could
@@ -225,9 +224,7 @@ fn assets_in(first: &Path, store: &Store, c: &Config, root: &Path) -> Result<Pat
     // because only the sidecar for `identity` can ever produce it.
     let live_dir_name = format!(
         ".mlx-qwen4-assets-live-{}-{}",
-        dir_name
-            .strip_prefix(".mlx-qwen4-assets-v2-")
-            .unwrap_or(identity.as_str()),
+        &dir_name[NATIVE_GGUF_ASSETS_PREFIX.len()..],
         std::process::id()
     );
     let live_dir = root.join(&live_dir_name);
@@ -601,14 +598,12 @@ mod tests {
         let (store, config) = tokenizer_fixture();
 
         // Hold the same lock file the sweep would hold while deleting the
-        // sidecar: `.mlx-qwen4-assets-v2-{identity}.lock`. flock is
+        // sidecar: `.mlx-qwen4-assets-v3-{identity}.lock`. flock is
         // per-open-description, so this fd blocks assets_sidecar_lock.
         let canonical = source.canonicalize().unwrap();
         let metadata = fs::metadata(&canonical).unwrap();
-        let dir_name = format!(
-            ".mlx-qwen4-assets-v2-{}",
-            source_file_identity_digest(&canonical, &metadata)
-        );
+        let dir_name =
+            native_gguf_assets_dir_name(&source_file_identity_digest(&canonical, &metadata));
         let lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -662,7 +657,7 @@ mod tests {
                 .file_name()
                 .unwrap()
                 .to_string_lossy()
-                .starts_with(".mlx-qwen4-assets-v2-")
+                .starts_with(NATIVE_GGUF_ASSETS_PREFIX)
         );
         fs::remove_file(published.join("complete")).unwrap();
 
@@ -718,10 +713,8 @@ mod tests {
 
         let canonical = source.canonicalize().unwrap();
         let metadata = fs::metadata(&canonical).unwrap();
-        let dir_name = format!(
-            ".mlx-qwen4-assets-v2-{}",
-            source_file_identity_digest(&canonical, &metadata)
-        );
+        let dir_name =
+            native_gguf_assets_dir_name(&source_file_identity_digest(&canonical, &metadata));
         // A directory at the sentinel path: opening it for write fails on
         // every platform, so the keyed lease fails closed.
         fs::create_dir_all(cache.join(format!("{dir_name}.lease"))).unwrap();
@@ -830,6 +823,55 @@ mod tests {
             "dead-pid debris must be reclaimed"
         );
         assert!(dir.join("complete").is_file());
+        native_gguf_unlease_in_use(&dir);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A completed sidecar of the previous version (special USER_DEFINED
+    /// rows), published or as this pid's live fallback, is never served:
+    /// the load rebuilds and the tags come back not special.
+    #[test]
+    fn asset_cache_never_reuses_an_older_sidecar_version() {
+        use crate::utils::gguf::sweep_env_lock;
+        let _env_guard = sweep_env_lock().lock().unwrap();
+        let root = std::env::temp_dir().join(format!("qwen4-assets-{}", uuid::Uuid::new_v4()));
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let source = root.join("model.gguf");
+        fs::write(&source, b"weights").unwrap();
+        let (mut store, config) = tokenizer_fixture();
+        store.metadata = crate::utils::gguf_test_fixtures::qwen_tag_tokenizer_metadata(&[]);
+        let canonical = source.canonicalize().unwrap();
+        let identity = source_file_identity_digest(&canonical, &fs::metadata(&canonical).unwrap());
+        let stale = |dir: &Path| {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("tokenizer.json"), b"{\"stale\":true}").unwrap();
+            fs::write(dir.join("complete"), b"1").unwrap();
+        };
+        let published = cache.join(format!(".mlx-qwen4-assets-v2-{identity}"));
+        let live = cache.join(format!(
+            ".mlx-qwen4-assets-live-{identity}-{}",
+            std::process::id()
+        ));
+        stale(&published);
+        stale(&live);
+
+        let dir = assets_in(&source, &store, &config, &cache).unwrap();
+        assert_ne!(dir, published);
+        assert_ne!(dir, live);
+        let tokenizer: Value =
+            serde_json::from_slice(&fs::read(dir.join("tokenizer.json")).unwrap()).unwrap();
+        let special = |content: &str| {
+            tokenizer["added_tokens"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|token| token["content"] == content)
+                .map(|token| token["special"].as_bool().unwrap())
+        };
+        assert_eq!(special("<tool_call>"), Some(false));
+        assert_eq!(special("</think>"), Some(false));
+        assert_eq!(special("<|im_end|>"), Some(true));
         native_gguf_unlease_in_use(&dir);
         fs::remove_dir_all(root).unwrap();
     }

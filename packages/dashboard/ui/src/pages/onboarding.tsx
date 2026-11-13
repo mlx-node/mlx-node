@@ -1,31 +1,23 @@
-import { ModelLogo, prettyModelName } from '@/components/model-logos';
-import { Button } from '@/components/ui/button';
-import { Skeleton } from '@/components/ui/skeleton';
-import { dismissOnboarding } from '@/lib/onboarding';
-import type { CatalogItem, CatalogResponse, ModelsResponse } from '@/lib/types';
-import type { AsyncState } from '@/lib/use-api';
-import {
-  ArrowDown,
-  ArrowRight,
-  Boxes,
-  Check,
-  CheckCheck,
-  CircleHelp,
-  Download,
-  ExternalLink,
-  HardDrive,
-  Laptop,
-  LockKeyhole,
-  RefreshCw,
-  Sparkles,
-} from 'lucide-react';
-import { type CSSProperties, type ReactNode, useEffect, useState } from 'react';
+import { ArrowRight, ExternalLink } from 'lucide-react';
+import { type ReactElement, type ReactNode, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-export interface ModelDownloadError {
-  repo: string;
-  message: string;
-}
+import { ChoiceCard } from '../components/arc-x/choice-card/choice-card';
+import { LiveLabel } from '../components/arc-x/live-label/live-label';
+import { ModelLogo, prettyModelName } from '../components/arc-x/model-badge/model-logos';
+import { Panel } from '../components/arc-x/panel/panel';
+import { Steps } from '../components/arc-x/steps/steps';
+import { Alert } from '../components/arc/alert/alert';
+import { Badge } from '../components/arc/badge/badge';
+import { Button } from '../components/arc/button/button';
+import { EmptyState } from '../components/arc/empty-state/empty-state';
+import { modelBlurb } from '../lib/catalog';
+import { dismissOnboarding } from '../lib/onboarding';
+import type { CatalogItem, CatalogResponse, ModelsResponse } from '../lib/types';
+import type { AsyncState } from '../lib/use-api';
+import { WindowDragStrip } from '../shell/window-chrome';
+import { hostNote } from './models/catalog';
+import type { ModelDownloadError } from './models/use-model-downloads';
 
 interface OnboardingProps {
   catalog: AsyncState<CatalogResponse>;
@@ -38,17 +30,12 @@ interface OnboardingProps {
   renderDownload: (item: CatalogItem) => ReactNode;
 }
 
-function modelStyle(item: CatalogItem): 'violet' | 'blue' | 'green' {
-  if (/gemma/i.test(item.label)) return 'green';
-  if (/agentworld/i.test(item.label)) return 'blue';
-  return 'violet';
-}
+const STEPS = ['Choose a model', 'Download', 'Set up coding agents'] as const;
 
-function modelDescription(item: CatalogItem): string {
-  if (/agentworld/i.test(item.label)) return 'Tuned for agent workflows, with fast responses.';
-  if (/gemma-4-26b/i.test(item.label)) return 'Fast responses, with a smaller download to get started.';
-  if (item.isDefault) return 'Our recommended starting point for working with tools.';
-  return item.description;
+function availability(item: CatalogItem): string {
+  if (item.blockedByForeignDir) return 'Folder needs cleanup';
+  if (item.present) return 'Downloaded';
+  return 'One-time download';
 }
 
 export default function Onboarding({
@@ -60,270 +47,245 @@ export default function Onboarding({
   downloadsError,
   reloadDownloads,
   renderDownload,
-}: OnboardingProps) {
+}: OnboardingProps): ReactElement {
   const navigate = useNavigate();
   const [selectedRepo, setSelectedRepo] = useState<string | null>(null);
   const items = (catalog.data?.items ?? []).filter((item) => !item.hidden);
   const activeRepo = activeRepos.find((repo) => items.some((item) => item.hfRepo === repo));
   const selected =
     items.find((item) => item.hfRepo === (activeRepo ?? selectedRepo)) ??
-    items.find((item) => item.isDefault && !item.blockedByForeignDir) ??
+    items.find((item) => item.isDefault === true && !item.blockedByForeignDir) ??
     items.find((item) => !item.blockedByForeignDir) ??
     items[0];
   const downloading = activeRepo !== undefined;
   const ready = selected?.present === true && !downloading;
   const error = catalog.error ?? models.error ?? downloadsError;
+  const loading = catalog.loading || models.loading || downloadsLoading;
   const modelsDir = models.data?.dir;
-  const canFinish = Boolean(modelsDir) && !models.loading && !models.refreshing && !models.error;
+  const canFinish =
+    modelsDir !== undefined && modelsDir !== '' && !models.loading && !models.refreshing && models.error === undefined;
+  const host = models.data?.host;
 
   useEffect(() => {
-    if (activeRepo) setSelectedRepo(activeRepo);
+    if (activeRepo !== undefined) setSelectedRepo(activeRepo);
   }, [activeRepo]);
 
   const finish = (to: string): void => {
-    // The root route checks dismissal for this library. Leaving before its
-    // identity is known would lose the skip and immediately reopen onboarding.
-    if (!canFinish || !modelsDir) return;
+    // The root route checks dismissal for this library; leaving before its identity is known would reopen onboarding.
+    if (!canFinish || modelsDir === undefined) return;
     dismissOnboarding(modelsDir);
     void navigate(to, { replace: true });
   };
 
+  let section: ReactNode;
+  if (error !== undefined) {
+    section = (
+      <Alert tone="danger" title="Could not load the model list">
+        <span className="grid justify-items-start gap-2">
+          <span>{error.message}</span>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              catalog.reload();
+              models.reload();
+              reloadDownloads();
+            }}
+          >
+            Try again
+          </Button>
+        </span>
+      </Alert>
+    );
+  } else if (loading) {
+    section = (
+      <div
+        role="status"
+        aria-label="Loading available models"
+        className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,12.5rem),1fr))] gap-3"
+      >
+        {[0, 1, 2].map((index) => (
+          <ChoiceCard
+            key={index}
+            loading
+            name="first-model"
+            value=""
+            checked={false}
+            onChange={() => {}}
+            ariaLabel=""
+            title=""
+            description=""
+          />
+        ))}
+      </div>
+    );
+  } else if (items.length === 0) {
+    section = (
+      <EmptyState
+        title="No models available yet"
+        description="You can explore the app and return to Models later."
+        action={
+          <Button variant="secondary" onClick={catalog.reload}>
+            Refresh models
+          </Button>
+        }
+      />
+    );
+  } else {
+    section = (
+      <fieldset
+        disabled={downloading}
+        className="m-0 grid min-w-0 grid-cols-[repeat(auto-fit,minmax(min(100%,12.5rem),1fr))] gap-3 p-0"
+      >
+        <legend className="sr-only">Choose your first model</legend>
+        {items.map((item) => {
+          const note = hostNote(item, host);
+          return (
+            <ChoiceCard
+              key={item.hfRepo}
+              name="first-model"
+              value={item.hfRepo}
+              checked={selected?.hfRepo === item.hfRepo}
+              disabled={item.blockedByForeignDir}
+              onChange={setSelectedRepo}
+              ariaLabel={item.label}
+              describedBy={`description-${item.slug}`}
+              descriptionId={`description-${item.slug}`}
+              media={<ModelLogo model={item.label} className="size-7" />}
+              badge={
+                item.present ? (
+                  <Badge tone="success" size="sm">
+                    On this Mac
+                  </Badge>
+                ) : item.isDefault === true ? (
+                  <Badge tone="info" size="sm">
+                    Recommended
+                  </Badge>
+                ) : undefined
+              }
+              title={prettyModelName(item.label)}
+              description={modelBlurb(item)}
+              meta={`~${item.sizeGb} GB · ${availability(item)}`}
+              warning={note ?? undefined}
+            />
+          );
+        })}
+      </fieldset>
+    );
+  }
+
+  const showDock = error === undefined && !loading && selected !== undefined;
+
   return (
-    <div className="onboarding h-screen overflow-hidden text-foreground">
-      <div className="h-9 shrink-0" style={{ WebkitAppRegion: 'drag' } as CSSProperties} aria-hidden />
-      <main className="onboarding-scroll overflow-y-auto">
-        <div className="onboarding-wrap">
-          <header className="onboarding-header">
+    <div data-onboarding="" className="grid h-screen grid-rows-[40px_minmax(0,1fr)_auto] text-foreground">
+      <WindowDragStrip />
+      <main data-scroll-root="" className="min-h-0 overflow-y-auto">
+        <div className="mx-auto grid w-full max-w-[880px] gap-6 px-4 pt-2 pb-8 md:px-6">
+          <header className="flex items-center justify-between gap-3">
             <button
               type="button"
               disabled={!canFinish}
               onClick={() => finish('/')}
-              className="onboarding-brand disabled:cursor-default disabled:opacity-60"
               aria-label="mlx-node home"
+              className="cursor-pointer font-heading text-strong font-medium text-foreground disabled:cursor-default disabled:text-muted"
             >
-              <span className="bg-brand-gradient text-primary-foreground flex size-9 items-center justify-center rounded-xl">
-                <Boxes className="size-5" aria-hidden />
-              </span>
               mlx-node
             </button>
-            <Button variant="ghost" className="text-muted-foreground" disabled={!canFinish} onClick={() => finish('/')}>
-              {downloading ? 'Explore while downloading' : 'Set up later'} <ArrowRight className="size-4" aria-hidden />
+            <Button variant="ghost" disabled={!canFinish} onClick={() => finish('/')}>
+              {downloading ? 'Explore while downloading' : 'Set up later'}
+              <ArrowRight size={16} aria-hidden="true" />
             </Button>
           </header>
 
-          <section className="onboarding-hero" aria-labelledby="welcome-title">
-            <div className="onboarding-eyebrow">
-              <span /> YOUR LOCAL AI STARTS HERE
-            </div>
-            <h1 id="welcome-title">
-              Powerful AI. <span>All yours.</span>
-            </h1>
-            <p>Start with a model. Download once, then run it on your own device.</p>
-            <div className="onboarding-promises">
-              <span>
-                <LockKeyhole aria-hidden /> Runs on your device
-              </span>
-              <span>
-                <Laptop aria-hidden /> Yours to use offline
-              </span>
-              <span>
-                <Sparkles aria-hidden /> No API key needed
-              </span>
-            </div>
-          </section>
+          <div className="grid gap-2">
+            <h1 className="m-0 font-heading text-hero font-normal text-foreground">Choose your first model</h1>
+            <p className="m-0 text-body text-secondary">
+              Download one model to run on this Mac. You can add more later.
+            </p>
+          </div>
 
-          <ol className="onboarding-steps" aria-label="Getting started">
-            {['Choose a model', 'Download', 'Make it yours'].map((label, index) => {
-              const step = ready ? 2 : downloading ? 1 : 0;
-              return (
-                <li key={label} aria-current={index === step ? 'step' : undefined} data-complete={index < step}>
-                  <span className="onboarding-step-number">
-                    {index < step ? <Check className="size-3.5" aria-hidden /> : `0${index + 1}`}
-                  </span>
-                  {label}
-                </li>
-              );
-            })}
-          </ol>
+          <Steps label="Getting started" steps={STEPS} current={ready ? 2 : downloading ? 1 : 0} />
 
-          <section aria-labelledby="model-choice-title" className="onboarding-models">
-            <div className="onboarding-section-heading">
-              <div>
-                <h2 id="model-choice-title">Choose your first model</h2>
-                <p>Choose one for now. You can add more anytime.</p>
-              </div>
-              <span className="onboarding-curated">
-                <CheckCheck className="size-4" aria-hidden /> Curated for mlx-node
-              </span>
-            </div>
+          <div className="grid gap-3">
+            {section}
+            <p className="m-0 text-caption text-secondary">
+              New to local models? Start with the recommended one. Download size is disk space; running a model needs
+              additional memory.
+            </p>
+          </div>
 
-            {error ? (
-              <div className="onboarding-notice" role="alert">
-                <div>
-                  <h3>We couldn’t load your model library.</h3>
-                  <p>{error.message}</p>
-                </div>
-                <Button
-                  variant="outline"
-                  onClick={() => {
-                    catalog.reload();
-                    models.reload();
-                    reloadDownloads();
-                  }}
-                >
-                  <RefreshCw className="size-4" aria-hidden /> Try again
-                </Button>
-              </div>
-            ) : catalog.loading || models.loading || downloadsLoading ? (
-              <div className="onboarding-card-grid" role="status" aria-label="Loading available models">
-                {[0, 1, 2].map((i) => (
-                  <Skeleton key={i} className="onboarding-model-skeleton rounded-3xl" />
-                ))}
-              </div>
-            ) : items.length === 0 ? (
-              <div className="onboarding-notice" role="status">
-                <div>
-                  <h3>No models available yet</h3>
-                  <p>You can explore the app and return to Models later.</p>
-                </div>
-                <Button variant="outline" onClick={catalog.reload}>
-                  Refresh models
-                </Button>
-              </div>
-            ) : (
-              <fieldset disabled={downloading} className="onboarding-card-grid">
-                <legend className="sr-only">Choose your first model</legend>
-                {items.map((item) => {
-                  const checked = selected?.hfRepo === item.hfRepo;
-                  return (
-                    <label
-                      key={item.hfRepo}
-                      className={`onboarding-model-card onboarding-${modelStyle(item)}`}
-                      data-selected={checked}
-                      data-blocked={item.blockedByForeignDir}
-                    >
-                      <input
-                        type="radio"
-                        name="first-model"
-                        value={item.hfRepo}
-                        checked={checked}
-                        disabled={item.blockedByForeignDir}
-                        onChange={() => setSelectedRepo(item.hfRepo)}
-                        aria-label={item.label}
-                        aria-describedby={`description-${item.slug}`}
-                      />
-                      <div className="onboarding-card-art" aria-hidden>
-                        <div className="onboarding-orbit onboarding-orbit-one" />
-                        <div className="onboarding-orbit onboarding-orbit-two" />
-                        <div className="onboarding-orbit onboarding-orbit-three" />
-                        <span className="onboarding-model-mark">
-                          <ModelLogo model={item.label} className="size-12" />
-                        </span>
-                      </div>
-                      <div className="onboarding-card-body">
-                        <span className="onboarding-card-badge">
-                          {item.present ? 'On your device' : item.isDefault ? 'Recommended' : 'Ready for local AI'}
-                        </span>
-                        <h3>{prettyModelName(item.label)}</h3>
-                        <p id={`description-${item.slug}`}>{modelDescription(item)}</p>
-                        <div className="onboarding-card-meta">
-                          <span>
-                            <HardDrive className="size-3.5" aria-hidden /> ~{item.sizeGb} GB
-                          </span>
-                          <span>
-                            {item.blockedByForeignDir
-                              ? 'Folder needs cleanup'
-                              : item.present
-                                ? 'Downloaded'
-                                : 'One-time download'}
-                          </span>
-                        </div>
-                      </div>
-                      <span className="onboarding-selection" aria-hidden>
-                        {checked && <Check className="size-3" />}
-                      </span>
-                    </label>
-                  );
-                })}
-              </fieldset>
-            )}
-
-            <div className="onboarding-guidance">
-              <CircleHelp className="size-4 shrink-0" aria-hidden />
-              <p>
-                New to local models? Start with the recommended option. Download size is disk space; running a model
-                needs additional memory.
-              </p>
-            </div>
-          </section>
-
-          <footer className="onboarding-footer">
-            <LockKeyhole className="size-3.5" aria-hidden />
-            <span>Downloaded from Hugging Face. Run locally, on your terms.</span>
-          </footer>
+          <p className="m-0 text-caption text-muted">Models download from Hugging Face and run on this Mac.</p>
         </div>
       </main>
 
-      {!error && !catalog.loading && !models.loading && !downloadsLoading && selected && (
-        <div className="onboarding-dock">
-          <section className="onboarding-download-panel" aria-label="Selected model">
-            <div className="onboarding-download-summary" aria-live="polite">
-              <span className={`onboarding-download-icon ${ready ? 'onboarding-ready' : ''}`}>
-                {ready ? (
-                  <Check className="size-5" aria-hidden />
-                ) : downloading ? (
-                  <Download className="size-5" aria-hidden />
-                ) : (
-                  <ArrowDown className="size-5" aria-hidden />
-                )}
-              </span>
-              <div>
-                <p className="onboarding-selected-label">
-                  {ready ? 'YOUR MODEL IS READY' : downloading ? 'MAKING IT LOCAL' : 'YOUR FIRST MODEL'}
-                </p>
-                <h3>{prettyModelName(selected.label)}</h3>
-                <p className="onboarding-download-note">
-                  {ready
-                    ? 'The download is complete. Let’s put your model to work.'
-                    : downloading
-                      ? 'Keep the app open. You can explore while your model downloads.'
-                      : `About ${selected.sizeGb} GB to download. A little setup, a lot of possibility.`}
-                </p>
+      {showDock ? (
+        <div className="px-4 pb-4 md:px-6">
+          <div className="mx-auto w-full max-w-[880px]">
+            <Panel ariaLabel="Selected model">
+              <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+                <div className="grid min-w-[min(100%,16rem)] flex-1 gap-1" aria-live="polite">
+                  {downloading ? (
+                    <LiveLabel active as="p" className="m-0 text-caption text-secondary">
+                      Downloading
+                    </LiveLabel>
+                  ) : (
+                    <p className="m-0 text-caption text-secondary">{ready ? 'Model ready' : 'Your first model'}</p>
+                  )}
+                  <h2 className="m-0 text-heading font-medium text-foreground">{prettyModelName(selected.label)}</h2>
+                  <p className="m-0 text-body text-secondary">
+                    {ready
+                      ? 'The download is complete.'
+                      : downloading
+                        ? 'Keep the app open. You can look around while it downloads.'
+                        : `About ${selected.sizeGb} GB to download.`}
+                  </p>
+                </div>
+                <div className="grid w-[17.5rem] max-w-full shrink-0 justify-items-center gap-2">
+                  {ready ? (
+                    <>
+                      <Button
+                        variant="primary"
+                        size="lg"
+                        className="w-full"
+                        disabled={!canFinish}
+                        onClick={() => finish('/coding-agents')}
+                      >
+                        Set up coding agents
+                        <ArrowRight size={16} aria-hidden="true" />
+                      </Button>
+                      <Button variant="ghost" size="sm" disabled={!canFinish} onClick={() => finish('/')}>
+                        Go to overview
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <div className="w-full">{renderDownload(selected)}</div>
+                      {downloading ? null : (
+                        <a
+                          className="link inline-flex items-center gap-1 text-caption"
+                          href={`https://huggingface.co/${selected.hfRepo}`}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          View model details
+                          <ExternalLink size={12} aria-hidden="true" />
+                        </a>
+                      )}
+                    </>
+                  )}
+                </div>
               </div>
-            </div>
-            <div className="onboarding-download-action">
-              {ready ? (
-                <Button className="w-full" disabled={!canFinish} onClick={() => finish('/coding-agents')}>
-                  Set up coding agents <ArrowRight className="size-4" aria-hidden />
-                </Button>
-              ) : (
-                renderDownload(selected)
-              )}
-              {ready ? (
-                <button className="onboarding-text-link" disabled={!canFinish} onClick={() => finish('/')}>
-                  Go to overview
-                </button>
-              ) : (
-                !downloading && (
-                  <a
-                    className="onboarding-text-link"
-                    href={`https://huggingface.co/${selected.hfRepo}`}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    View model details <ExternalLink className="size-3" aria-hidden />
-                  </a>
-                )
-              )}
-            </div>
-            {downloadError?.repo === selected.hfRepo && (
-              <p className="onboarding-download-error text-destructive" role="alert">
-                {downloadError.message} Please try again.
-              </p>
-            )}
-          </section>
+              {downloadError?.repo === selected.hfRepo ? (
+                <div className="mt-3">
+                  <Alert tone="danger" title="Download failed">
+                    {downloadError.message} Please try again.
+                  </Alert>
+                </div>
+              ) : null}
+            </Panel>
+          </div>
         </div>
-      )}
+      ) : null}
     </div>
   );
 }

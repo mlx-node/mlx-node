@@ -14,6 +14,7 @@
     { "path": "./packages/server" },
     { "path": "./packages/dashboard" },
     { "path": "./packages/dashboard/ui" },
+    { "path": "./packages/dashboard/scripts" },
     { "path": "./packages/desktop" },
     { "path": "./examples" },
     { "path": "./__test__" },

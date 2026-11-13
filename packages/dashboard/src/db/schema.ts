@@ -4,25 +4,60 @@ export const traces = sqliteTable('traces', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   traceId: text('trace_id').notNull().unique(),
   sessionId: text('session_id'),
-  /** Root session id (subagent turns correlate to their delegating root). */
-  rootSessionId: text('root_session_id'),
   ts: integer('ts').notNull(),
+  pid: integer('pid'),
+  /** The name the client asked for; may be an alias of `model_key`. */
   model: text('model'),
+  modelId: text('model_id'),
+  modelType: text('model_type'),
+  /** `modelId ?? model ?? 'unknown'`: the grouping key of every per-model query. */
+  modelKey: text('model_key').notNull(),
+  outcome: text('outcome').notNull(),
+  errorKind: text('error_kind'),
+  failPhase: text('fail_phase'),
+  endpoint: text('endpoint'),
+  stream: integer('stream'),
+  dispatch: text('dispatch'),
   ttftMs: real('ttft_ms'),
-  prefillTps: real('prefill_tps'),
+  /** Measured prefill window (`begin_prefill` → first token sampled); null when not measured. */
+  prefillMs: real('prefill_ms'),
+  /** Tokens that window processed; set with `prefillMs`, never alone. */
+  prefillTokens: integer('prefill_tokens'),
   decodeTps: real('decode_tps'),
   mtpCycles: integer('mtp_cycles'),
   mtpMeanAccepted: real('mtp_mean_accepted'),
+  mtpMeanDrafts: real('mtp_mean_drafts'),
+  mtpMeanDepth: real('mtp_mean_depth'),
+  /** JSON array text of at most 16 rates. */
+  mtpAcceptByPos: text('mtp_accept_by_pos'),
   durationMs: real('duration_ms'),
-  /** Queue + cold-load wait (ms) before native work began this turn. */
-  queueMs: integer('queue_ms'),
+  queueMs: real('queue_ms'),
+  loadWaitMs: real('load_wait_ms'),
+  resolveMs: real('resolve_ms'),
+  preDispatchMs: real('pre_dispatch_ms'),
+  /** Native creation → pickup; outside `ttft_ms`. NULL from a record that predates it. */
+  waitMs: real('wait_ms'),
+  /** Native time with no lane or memory to start; inside `ttft_ms`. */
+  slotMs: real('slot_ms'),
+  /** Native time preparing the prompt before its prefill; inside `ttft_ms`. */
+  prepareMs: real('prepare_ms'),
   finishReason: text('finish_reason'),
-  /** 1 when the model was already warm/resident, 0 on a cold load/swap; null if unknown. */
-  resident: integer('resident'),
   promptTokens: integer('prompt_tokens'),
   cachedTokens: integer('cached_tokens'),
   outputTokens: integer('output_tokens'),
   reasoningTokens: integer('reasoning_tokens'),
+  prefillDoneTokens: integer('prefill_done_tokens'),
+  ctxWindow: integer('ctx_window'),
+  toolCount: integer('tool_count'),
+  toolCallCount: integer('tool_call_count'),
+  imageCount: integer('image_count'),
+  concurrency: integer('concurrency'),
+  concurrencyPeak: integer('concurrency_peak'),
+  memActiveBytes: integer('mem_active_bytes'),
+  memPeakBytes: integer('mem_peak_bytes'),
+  /** GPU pipelines created while the turn ran (process-wide); NULL while the counter is off. */
+  pipelinesCreated: integer('pipelines_created'),
+  pipelineCreateMs: real('pipeline_create_ms'),
   coldHits: integer('cold_hits'),
   coldMisses: integer('cold_misses'),
   coldBytesWritten: integer('cold_bytes_written'),
@@ -99,14 +134,112 @@ export const traces = sqliteTable('traces', {
 });
 
 /**
- * Per-file ingest watermark for the trace JSONL directory. Trace rows are keyed
- * by `traceId` (many per file), so there is no 1:1 file↔row anchor to hang a
- * row-level watermark on; this dedicated table records the
- * `(mtime, size)` of each fully-ingested trace file so a 30s rescan can skip
- * unchanged files instead of re-reading the entire history every pass.
+ * Per-file ingest mark of a JSONL source. `consumed` always ends on a `\n`;
+ * `tail` is the base64 of the bytes just before it, which proves on the next
+ * pass that the file only grew (append) rather than being rewritten (replace).
  */
 export const traceFiles = sqliteTable('trace_files', {
   name: text('name').primaryKey(),
   lastIngestedMtime: integer('last_ingested_mtime').notNull(),
   lastIngestedSize: integer('last_ingested_size').notNull(),
+  consumed: integer('consumed').notNull(),
+  tail: text('tail').notNull(),
 });
+
+export const runtimeFiles = sqliteTable('runtime_files', {
+  name: text('name').primaryKey(),
+  lastIngestedMtime: integer('last_ingested_mtime').notNull(),
+  lastIngestedSize: integer('last_ingested_size').notNull(),
+  consumed: integer('consumed').notNull(),
+  tail: text('tail').notNull(),
+});
+
+/** One inference process, keyed `<startedAt>-<pid>`. */
+export const runtimeProcs = sqliteTable('runtime_procs', {
+  procKey: text('proc_key').primaryKey(),
+  pid: integer('pid').notNull(),
+  startedAt: integer('started_at').notNull(),
+  host: text('host'),
+  version: text('version'),
+  port: integer('port'),
+  chip: text('chip'),
+  wiredLimitBytes: integer('wired_limit_bytes'),
+  totalMemBytes: integer('total_mem_bytes'),
+  firstTs: integer('first_ts').notNull(),
+  lastTs: integer('last_ts').notNull(),
+  exitTs: integer('exit_ts'),
+});
+
+export const runtimeSamples = sqliteTable('runtime_samples', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  procKey: text('proc_key').notNull(),
+  ts: integer('ts').notNull(),
+  dtMs: integer('dt_ms'),
+  busy: integer('busy').notNull(),
+  busyMs: integer('busy_ms'),
+  health: text('health'),
+  memActive: integer('mem_active'),
+  memPeak: integer('mem_peak'),
+  memCache: integer('mem_cache'),
+  rss: integer('rss'),
+  inFlight: integer('in_flight'),
+  queued: integer('queued'),
+  resident: integer('resident'),
+  dOk: integer('d_ok'),
+  dError: integer('d_error'),
+  dCancelled: integer('d_cancelled'),
+  dOutTokens: integer('d_out_tokens'),
+  dRejected: integer('d_rejected'),
+  sourceFile: text('source_file').notNull(),
+});
+
+export const runtimeSched = sqliteTable('runtime_sched', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  procKey: text('proc_key').notNull(),
+  ts: integer('ts').notNull(),
+  model: text('model').notNull(),
+  blockCapacity: integer('block_capacity'),
+  allocatedBlocks: integer('allocated_blocks'),
+  freeBlocks: integer('free_blocks'),
+  reclaimableBlocks: integer('reclaimable_blocks'),
+  watermarkBlocks: integer('watermark_blocks'),
+  reservedBlocks: integer('reserved_blocks'),
+  memoryCapacityBytes: integer('memory_capacity_bytes'),
+  memoryWatermarkBytes: integer('memory_watermark_bytes'),
+  reservedBlockBytes: integer('reserved_block_bytes'),
+  reservedStateBytes: integer('reserved_state_bytes'),
+  globalSteps: integer('global_steps'),
+  admitted: integer('admitted'),
+  completed: integer('completed'),
+  maxBatchOccupancy: integer('max_batch_occupancy'),
+  fusedGreedyEpilogueSteps: integer('fused_greedy_epilogue_steps'),
+  admissionDeferredBlocks: integer('admission_deferred_blocks'),
+  admissionDeferredState: integer('admission_deferred_state'),
+  rowsAllocEvicted: integer('rows_alloc_evicted'),
+  preemptions: integer('preemptions'),
+  preemptionsRecompute: integer('preemptions_recompute'),
+  preemptionsSsd: integer('preemptions_ssd'),
+  ssdRestoreWaiting: integer('ssd_restore_waiting'),
+  ssdRestoreBytes: integer('ssd_restore_bytes'),
+  ssdRestoreWaitMs: real('ssd_restore_wait_ms'),
+  /** Turns sent to the model since its load, all lanes; null in a record of an engine that did not write it. */
+  turns: integer('turns'),
+  /** JSON `[[occupancy, steps], …]`. */
+  occHist: text('occ_hist'),
+  sourceFile: text('source_file').notNull(),
+});
+
+export const runtimeLoads = sqliteTable('runtime_loads', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  procKey: text('proc_key').notNull(),
+  ts: integer('ts').notNull(),
+  model: text('model').notNull(),
+  modelType: text('model_type'),
+  capability: text('capability'),
+  ms: real('ms'),
+  ok: integer('ok'),
+  sourceFile: text('source_file').notNull(),
+});
+
+/** Every table of the index. The open-time drift check is built from this list, so a table cannot escape it. */
+export const ALL_TABLES = [traces, traceFiles, runtimeFiles, runtimeProcs, runtimeSamples, runtimeSched, runtimeLoads];

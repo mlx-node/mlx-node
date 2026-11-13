@@ -26,7 +26,6 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
-  readFileSync,
   realpathSync,
   rmSync,
   statSync,
@@ -38,40 +37,61 @@ import { connect, createServer, type Server } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
-import { fileURLToPath } from 'node:url';
 
+import {
+  agentBinName,
+  type AgentInstallProbe,
+  compareReleaseTags,
+  findRepoRoot,
+  isReleaseTag,
+  managedAgentBinPath,
+  MLX_AGENT_BIN_ENV,
+  MLX_AGENT_MIN_RELEASE,
+  probeAgentInstall,
+  readAgentTag,
+  releasePin,
+} from '@mlx-node/agent/binary';
+import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 import { idleReleaseText } from '@mlx-node/server/host/idle-release';
-import semver from 'semver';
+import {
+  PERSIST_WHOLE_PROMPT_FLAG,
+  persistPagedCacheFlag,
+  resolvePersistPagedCache,
+  type PersistPagedCache,
+} from '@mlx-node/server/host/persist-cache';
 
 import { withLoopbackNoProxy } from '../loopback-env.js';
 
-/** Env override for a locally built or externally installed agent binary. */
-export const MLX_AGENT_BIN_ENV = 'MLX_AGENT_BIN';
-/** Env override to pin a specific release tag instead of resolving latest. */
-export const MLX_AGENT_TAG_ENV = 'MLX_AGENT_TAG';
 /** Release repo the prebuilt binary downloads from. */
 export const MLX_AGENT_RELEASE_REPO = 'mlx-node/grok-build';
-/**
- * Minimum release the CLI will accept: a cached binary stamped below this is
- * treated as stale and re-downloaded, and it is the last-resort tag when the
- * `latest` pointer is unreachable. Bump only when a release is REQUIRED —
- * resolving `latest` handles ordinary upgrades with no code change here.
- */
-export const MLX_AGENT_MIN_RELEASE = 'mlx-agent-v0.3.3';
 
 /** Options for {@link launchGrokAgent}. */
-export interface GrokAgentLaunchOptions {
+export type GrokAgentLaunchOptions = GrokAgentLaunchBase &
+  (
+    | { needsServer: false; persistPagedCache?: never }
+    | {
+        /**
+         * Whether to spawn `mlx serve` before the agent. The CALLER decides from
+         * its value-aware argv scan — the launcher must never rescan `argv`
+         * itself: a `--help`-looking token inside another option's value slot
+         * (`--system-prompt-override --help`) is data, not a one-shot.
+         */
+        needsServer?: true;
+        /**
+         * The paged KV disk cache for the spawned `mlx serve`, resolved here
+         * against this process's env and passed as an explicit
+         * `--persist-cache` / `--no-persist-cache`; `wholePrompt` adds
+         * `--persist-whole-prompt`.
+         */
+        persistPagedCache: PersistPagedCache;
+      }
+  );
+
+interface GrokAgentLaunchBase {
   /** Args forwarded to the agent binary verbatim (already default-injected). */
   argv: string[];
   /** Models directory for the spawned `mlx serve` (host resolves env/config itself when omitted). */
   modelsDir?: string;
-  /**
-   * Whether to spawn `mlx serve` before the agent. The CALLER decides from
-   * its value-aware argv scan — the launcher must never rescan `argv`
-   * itself: a `--help`-looking token inside another option's value slot
-   * (`--system-prompt-override --help`) is data, not a one-shot.
-   */
-  needsServer?: boolean;
   /** Discovered model the spawned `mlx serve` starts loading at boot (`--preload`). */
   preloadModel?: string;
   /** K/V cache format the spawned `mlx serve` loads with (`--kv-format`). */
@@ -101,147 +121,6 @@ export interface GrokAgentLaunchOptions {
 }
 
 /**
- * The binary's platform filename — CreateProcessW needs the `.exe` suffix.
- * With a release `tag` this is the versioned managed name (`<tag>` already
- * carries the `mlx-agent-` prefix, so the filename IS the tag); without one,
- * the legacy unversioned/base name.
- */
-function agentBinName(tag?: string): string {
-  const base = tag ?? 'mlx-agent';
-  return process.platform === 'win32' ? `${base}.exe` : base;
-}
-
-/**
- * Base path of the managed cache — the only location `mlx agent update`
- * writes. Its `.tag` sibling is the pointer naming the release tag whose
- * versioned binary (`bin/<tag>`) is live; legacy installs keep the binary at
- * the base name itself.
- */
-export function managedAgentBinPath(homeDir: string = homedir()): string {
-  return join(homeDir, '.mlx-node', 'bin', agentBinName());
-}
-
-export interface AgentInstallProbe {
-  /**
-   * What owns the resolved path: a user pin the updater must not touch
-   * (`env`/`vendored`), the signed app's bundle (`bundled` — still shadowed
-   * by a NEWER managed download, since the bundle is read-only), the managed
-   * download cache, or nothing found yet (`none`).
-   */
-  source: 'env' | 'vendored' | 'bundled' | 'managed' | 'none';
-  /** The binary `mlx agent` would run; undefined when `source === 'none'`. */
-  path?: string;
-  /**
-   * Release tag stamped beside the managed cache and the newest tag among
-   * the managed+bundled pair — the "current version" an update compares
-   * against. Bundled wins ties, mirroring resolveAgentBinary.
-   */
-  managedTag?: string;
-  bundledTag?: string;
-  effectiveTag?: string;
-}
-
-/**
- * Filesystem probe behind {@link resolveAgentBinary}, minus the download.
- * Everything is sync by contract: this runs inside the CLI utilityProcess,
- * never on the Electron main thread.
- */
-export function probeAgentInstall(
-  repoRoot = findRepoRoot(),
-  env = process.env,
-  homeDir: string = homedir(),
-  bundledBin?: string,
-): AgentInstallProbe {
-  const managed = managedAgentBinPath(homeDir);
-  // The pointer names the release whose versioned binary is live; a
-  // versioned miss or a legacy install falls back to the unversioned base.
-  const stamped = readAgentTag(managed);
-  const versioned = stamped !== undefined ? join(dirname(managed), agentBinName(stamped)) : undefined;
-  // The unversioned base is a fallback ONLY for installs that predate
-  // pointers: when a pointer names a release whose versioned binary is
-  // gone, that is a broken cache — stamping the leftover legacy binary
-  // with the orphaned tag would both run the wrong release and suppress
-  // the update check that could repair it.
-  const managedBin =
-    versioned !== undefined && existsSync(versioned)
-      ? versioned
-      : stamped === undefined && existsSync(managed)
-        ? managed
-        : undefined;
-  // The tag counts only with a binary on disk — an orphaned pointer left by
-  // a failed install must not suppress the next download.
-  const managedTag = managedBin !== undefined ? stamped : undefined;
-
-  const envBin = env[MLX_AGENT_BIN_ENV];
-  if (envBin) {
-    const path = resolve(envBin);
-    if (existsSync(path)) return { source: 'env', path, managedTag };
-    throw new Error(`${MLX_AGENT_BIN_ENV}=${envBin} does not exist`);
-  }
-
-  const vendored = repoRoot ? join(repoRoot, 'grok-build', 'target', 'release', agentBinName()) : undefined;
-  if (vendored && existsSync(vendored)) return { source: 'vendored', path: vendored, managedTag };
-
-  const bundled = bundledBin ?? findBundledAppBinary();
-  const bundledTag = bundled ? readAgentTag(bundled) : undefined;
-
-  // An MLX_AGENT_TAG pin selects exactly that managed release — newer or
-  // older than the pointer or bundle, the pin wins (developer env/vendored
-  // pins still shadow it). A pin neither the cache nor the bundle can
-  // satisfy resolves as 'none' so the launcher downloads that exact
-  // release instead of silently running whatever is cached.
-  const pin = releasePin(env);
-  if (pin !== undefined) {
-    const pinnedBin = join(dirname(managed), agentBinName(pin));
-    if (existsSync(pinnedBin)) {
-      // A cached pin still needs a lease: the launcher only spawns the
-      // returned path after serve startup and health checks, and an
-      // unpinned sweep in ANOTHER process could delete it in that window
-      // if the original installer's lease died with it. This write is
-      // best-effort — it lands outside the install lock, so a sweep that
-      // already snapshotted the directory can still miss it. The launch
-      // path (resolveAgentBinary) re-leases under the lock and re-verifies
-      // the binary survived; the marker here only covers direct probe
-      // callers such as the evals harness.
-      writeLeaseMarker(pinnedBin);
-      return { source: 'managed', path: pinnedBin, managedTag, bundledTag, effectiveTag: pin };
-    }
-    // A pin naming the bundled release is already satisfied: the bundle
-    // ships that exact binary, so a managed-cache miss must not force a
-    // download — a packaged app launched offline would fail for nothing.
-    if (bundled !== undefined && bundledTag === pin) {
-      return { source: 'bundled', path: bundled, managedTag, bundledTag, effectiveTag: pin };
-    }
-    return { source: 'none', managedTag, bundledTag };
-  }
-
-  // Bundled-vs-cache: the newer release tag wins. A freshly `mlx agent
-  // update`d download in ~/.mlx-node/bin must not be shadowed by the older
-  // bundled binary, and an unmarked cache never beats a stamped bundle.
-  if (bundled) {
-    const cacheWins = managedTag !== undefined && compareReleaseTags(managedTag, bundledTag ?? '') > 0;
-    return {
-      source: cacheWins ? 'managed' : 'bundled',
-      path: cacheWins ? managedBin : bundled,
-      managedTag,
-      bundledTag,
-      effectiveTag: cacheWins ? managedTag : bundledTag,
-    };
-  }
-
-  // The cached binary is valid only while it satisfies this CLI's minimum
-  // release: its marker records which tag produced it. An unmarked binary is
-  // treated as stale — cheaper than trusting whatever was downloaded before
-  // markers existed. No lease here: callers that RETAIN a managed path
-  // (resolveAgentBinary, the evals harness) re-lease under the install
-  // lock — the probe itself only reports.
-  if (managedTag !== undefined && compareReleaseTags(managedTag, MLX_AGENT_MIN_RELEASE) >= 0) {
-    return { source: 'managed', path: managedBin, managedTag, effectiveTag: managedTag };
-  }
-  return { source: 'none', managedTag };
-}
-
-/**
  * Locate the agent binary, in priority order:
  *   1. `$MLX_AGENT_BIN` — developer / vendored-build override.
  *   2. `<repo>/grok-build/target/release/mlx-agent` — `yarn build:agent` output.
@@ -259,7 +138,7 @@ export async function resolveAgentBinary(
   homeDir: string = homedir(),
 ): Promise<string> {
   const managed = managedAgentBinPath(homeDir);
-  const probe = probeAgentInstall(repoRoot, env, homeDir);
+  const probe = probeAgentInstall(repoRoot, env, homeDir, undefined, writeLeaseMarker);
   const probed = probe.path;
   // Pass the caller's pin through explicitly: resolveReleaseCandidates reads
   // process.env, which can diverge from the env this call probed under.
@@ -316,104 +195,10 @@ export async function leasePinnedManaged(managed: string, probed: string): Promi
   return survived ? probed : undefined;
 }
 
-/** Tag marker written beside a downloaded/bundled binary, e.g. `mlx-agent-v0.2.0`. */
-export function readAgentTag(bin: string): string | undefined {
-  try {
-    const tag = readFileSync(`${bin}.tag`, 'utf-8').trim();
-    return tag.length > 0 ? tag : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * `mlx agent` invoked from the packaged desktop app: the CLI sits at
- * `Contents/Resources/app/node_modules/@mlx-node/cli/dist/…` and package.ts
- * drops the release binary at `Contents/Resources/native/mlx-agent`. Walking
- * up for the `Contents/Resources/app` anchor is more robust than guessing how
- * many `node_modules` levels the packager will add.
- */
-export function findBundledAppBinary(start: string = fileURLToPath(import.meta.url)): string | undefined {
-  let dir = dirname(start);
-  for (let i = 0; i < 12; i++) {
-    if (dir.endsWith(join('Contents', 'Resources', 'app'))) {
-      const candidate = join(dir, '..', 'native', agentBinName());
-      return existsSync(candidate) ? candidate : undefined;
-    }
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return undefined;
-}
-
-/**
- * Walk up from this module (…/packages/cli/src|dist/commands/agent/) to the
- * repository root — the directory that contains `grok-build/` after
- * `scripts/agent-bootstrap.sh` clones the fork. Returns undefined outside a
- * checkout (e.g. a global npm install), which skips the vendored probe.
- */
-export function findRepoRoot(start: string = fileURLToPath(import.meta.url)): string | undefined {
-  let dir = dirname(start);
-  for (let i = 0; i < 8; i++) {
-    if (existsSync(join(dir, 'grok-build', 'Cargo.toml'))) return dir;
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return undefined;
-}
-
 /** Public R2 mirror of the release assets — Cloudflare edge, much faster than GitHub. */
 const MLX_AGENT_R2_BASE = 'https://dl.portato.si';
 /** The R2 key holding the newest release tag, written by the release pipeline. */
 const MLX_AGENT_LATEST_KEY = 'latest';
-
-const TAG_PREFIX = 'mlx-agent-v';
-
-/** `mlx-agent-v0.2.0` → '0.2.0' when it is a valid semver tag, else null. */
-function tagVersion(tag: string): semver.SemVer | null {
-  if (!tag.startsWith(TAG_PREFIX)) return null;
-  const suffix = tag.slice(TAG_PREFIX.length);
-  const v = semver.parse(suffix);
-  // semver.parse normalizes ('v0.3.0', ' 0.3.0' all parse), but the tag
-  // string is used literally for the asset name, versioned filename, and
-  // .tag marker — only the canonical form is a real release tag.
-  return v !== null && v.version === suffix ? v : null;
-}
-
-/**
- * Compare `mlx-agent-vX.Y.Z` tags semantically. A malformed tag sorts below
- * any valid one; two malformed tags are equal. Returns <0, 0, >0.
- */
-export function compareReleaseTags(a: string, b: string): number {
-  const va = tagVersion(a);
-  const vb = tagVersion(b);
-  if (va && vb) return semver.compare(va, vb);
-  if (va) return 1;
-  if (vb) return -1;
-  return 0;
-}
-
-/**
- * A valid `MLX_AGENT_TAG` pin selects exactly that release. Invalid pins
- * throw wherever the pin is consulted — probe included — so a stale or
- * mismatched cache can never mask a misspelled pin and run anyway.
- */
-function releasePin(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  const pinned = env[MLX_AGENT_TAG_ENV];
-  if (!pinned) return undefined;
-  // A pin that is malformed or below the minimum can never satisfy
-  // probeAgentInstall — its marker sorts below the floor, so every launch
-  // would redownload it and then reject its own cache as stale. Refuse the
-  // pin instead of downloading something we know we cannot keep.
-  if (!tagVersion(pinned) || compareReleaseTags(pinned, MLX_AGENT_MIN_RELEASE) < 0) {
-    throw new Error(
-      `${MLX_AGENT_TAG_ENV}=${pinned} is not a supported release tag (expected mlx-agent-vX.Y.Z at or above ${MLX_AGENT_MIN_RELEASE}).`,
-    );
-  }
-  return pinned;
-}
 
 /**
  * The platform's release asset for `tag`. Linux releases are musl-only: the
@@ -444,7 +229,7 @@ async function resolveReleaseCandidates(env: NodeJS.ProcessEnv = process.env): P
   const usable = (tag: string | undefined): tag is string =>
     tag !== undefined &&
     !candidates.includes(tag) &&
-    tagVersion(tag) !== null &&
+    isReleaseTag(tag) &&
     compareReleaseTags(tag, MLX_AGENT_MIN_RELEASE) >= 0;
 
   try {
@@ -1614,7 +1399,7 @@ export interface AgentUpdateDeps {
  * pin reports whatever it points at.
  */
 export async function agentUpdateStatus(deps: AgentUpdateDeps = {}): Promise<AgentUpdateStatus> {
-  const probe = deps.probe ?? (() => probeAgentInstall());
+  const probe = deps.probe ?? (() => probeAgentInstall(undefined, undefined, undefined, undefined, writeLeaseMarker));
   const resolveTag = deps.resolveTag ?? resolveReleaseTag;
   const managedPath = deps.managedPath ?? managedAgentBinPath();
   const [latest, install] = await Promise.all([resolveTag(), Promise.resolve(probe())]);
@@ -1682,15 +1467,14 @@ export async function applyAgentUpdate(
   };
 }
 
-/**
- * The release tag a versioned install path encodes (`…/mlx-agent-v1.2.3[.exe]`).
- * Lets packaging stamp the tag it actually downloaded rather than the tag
- * it asked for — a candidate fallback may have landed an older release.
- */
-export function agentTagFromBinPath(path: string): string | undefined {
-  const name = basename(path);
-  const tag = name.endsWith('.exe') ? name.slice(0, -'.exe'.length) : name;
-  return tagVersion(tag) !== null ? tag : undefined;
+/** The agent hosts' thinking bounds as `mlx serve` flags; the text in `=` form, so a leading `-` stays its value. */
+export function agentThinkingFlags(): string[] {
+  return [
+    '--thinking-token-budget',
+    String(AGENT_HOST_THINKING.tokenBudget),
+    ...(AGENT_HOST_THINKING.cycleGuard ? ['--thinking-cycle-guard'] : []),
+    `--thinking-end-text=${AGENT_HOST_THINKING.endText}`,
+  ];
 }
 
 /**
@@ -1700,7 +1484,10 @@ export function agentTagFromBinPath(path: string): string | undefined {
  * `process.argv[1]` (the `mlx` bin) with `src/cli.ts` as a fallback for
  * test/dev invocations.
  */
-function spawnInferenceServer(opts: GrokAgentLaunchOptions): { child: ChildProcess; token: string } {
+function spawnInferenceServer(opts: GrokAgentLaunchBase & { persistPagedCache: PersistPagedCache }): {
+  child: ChildProcess;
+  token: string;
+} {
   const token = randomBytes(24).toString('base64url');
   const cliEntry = process.env.MLX_CLI_ENTRY ?? process.argv[1];
   if (!cliEntry) throw new Error('mlx agent: cannot locate the cli entry point for spawning `mlx serve`');
@@ -1712,6 +1499,9 @@ function spawnInferenceServer(opts: GrokAgentLaunchOptions): { child: ChildProce
     '0',
     // `=` form: a base64url token can start with `-`, which parseArgs reads as a flag.
     `--auth-token=${token}`,
+    persistPagedCacheFlag(resolvePersistPagedCache(opts.persistPagedCache)),
+    ...(opts.persistPagedCache.wholePrompt ? [PERSIST_WHOLE_PROMPT_FLAG] : []),
+    ...agentThinkingFlags(),
     ...(opts.modelsDir ? ['--models-dir', opts.modelsDir] : []),
     ...(opts.preloadModel !== undefined ? ['--preload', opts.preloadModel] : []),
     ...(opts.kvFormat !== undefined ? ['--kv-format', opts.kvFormat] : []),

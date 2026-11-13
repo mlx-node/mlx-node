@@ -13,7 +13,7 @@
  */
 
 import { fork } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -46,6 +46,8 @@ function fakeModelsDir(): { home: string; modelsDir: string } {
 interface Live {
   send(payload: unknown, id: number): Promise<{ ok: boolean; value?: unknown; error?: string }>;
   url: string;
+  pid: number;
+  home: string;
   stderr: string[];
   exit: Promise<{ code: number | null; signal: string | null }>;
   kill(signal: NodeJS.Signals): void;
@@ -53,9 +55,13 @@ interface Live {
 
 async function startSidecar(env: Record<string, string> = {}): Promise<Live> {
   const { home, modelsDir } = fakeModelsDir();
+  // The engine's own defaults are under test, not the developer's shell.
+  const inherited = { ...process.env };
+  delete inherited.MLX_PERSIST_PAGED_CACHE;
+  delete inherited.MLX_AGENT_METRICS;
   const child = fork(ENTRY, [], {
     env: {
-      ...process.env,
+      ...inherited,
       // The child must not write a response store into the developer's real
       // ~/.mlx-node; `resolveMlxNodeHome()` is `$HOME/.mlx-node`.
       HOME: home,
@@ -91,6 +97,8 @@ async function startSidecar(env: Record<string, string> = {}): Promise<Live> {
 
   return {
     url,
+    pid: child.pid!,
+    home,
     stderr,
     exit,
     kill: (signal) => child.kill(signal),
@@ -135,6 +143,20 @@ describe.skipIf(!RUNNABLE)('the built sidecar entry', () => {
     const models = await live.send({ op: 'models' }, 1);
     expect(models.ok).toBe(true);
     expect(models.value).toEqual([expect.objectContaining({ name: 'tiny-qwen3', modelType: 'qwen3' }) as unknown]);
+  });
+
+  it('turns the paged KV disk cache on unless MLX_PERSIST_PAGED_CACHE says off', { timeout: 240_000 }, async () => {
+    const liveSwitch = async (env: Record<string, string>): Promise<unknown> => {
+      const live = await startSidecar(env);
+      const file = join(live.home, '.mlx-node', 'metrics', 'runtime', `live-${live.pid}.json`);
+      for (let i = 0; i < 500 && !existsSync(file); i++) await new Promise((r) => setTimeout(r, 10));
+      const value = (JSON.parse(readFileSync(file, 'utf8')) as { persistPagedCache?: unknown }).persistPagedCache;
+      live.kill('SIGTERM');
+      await live.exit;
+      return value;
+    };
+    expect(await liveSwitch({})).toBe(true);
+    expect(await liveSwitch({ MLX_PERSIST_PAGED_CACHE: '0' })).toBe(false);
   });
 
   it('runs close() and exits 0 on SIGTERM', { timeout: 120_000 }, async () => {

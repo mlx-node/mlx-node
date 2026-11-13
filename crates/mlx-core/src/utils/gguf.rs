@@ -5534,14 +5534,6 @@ pub(crate) fn embedded_gpt2_tokenizer_json(
     // row (DeepSeek-V4.1's BOS/EOS/pad at 0..2) must also be a vocab entry, as
     // in HF's tokenizer.json.
     let last_normal = types.iter().rposition(|&t| t == 1).unwrap_or(0);
-    // joyai-llm (DeepSeek-V4.1): USER_DEFINED rows (`<think>`, `</think>`,
-    // DSML markers) are `special: false` in HF's tokenizer.json, so a
-    // skip-special decode keeps them and the reasoning split can find
-    // `</think>` in the text.
-    let joyai = matches!(
-        metadata.get("tokenizer.ggml.pre"),
-        Some(GgufMetaValue::String(pre)) if pre == "joyai-llm"
-    );
     for (id, (token, token_type)) in tokens.iter().zip(types).enumerate() {
         if matches!(*token_type, 3 | 4) && id < last_normal {
             vocab.insert(token.clone(), serde_json::json!(id));
@@ -5551,9 +5543,12 @@ pub(crate) fn embedded_gpt2_tokenizer_json(
             1 => {
                 vocab.insert(token.clone(), serde_json::json!(id));
             }
-            // GGML_TOKEN_TYPE_CONTROL / USER_DEFINED. These are the exact
-            // special-token rows represented by added_tokens in HF's Qwen
-            // tokenizer; UNUSED rows deliberately remain ID holes.
+            // GGML_TOKEN_TYPE_CONTROL / USER_DEFINED are HF's added_tokens;
+            // UNUSED rows deliberately remain ID holes. Splash
+            // install/gguf.py (d8af1054): only CONTROL rows are special.
+            // USER_DEFINED rows (`<think>`, `</think>`, `<tool_call>`) must
+            // survive a skip-special decode, or the reasoning split and the
+            // tool-call parser never see them.
             3 | 4 => added.push(serde_json::json!({
                 "id": id,
                 "content": token,
@@ -5561,7 +5556,7 @@ pub(crate) fn embedded_gpt2_tokenizer_json(
                 "lstrip": false,
                 "rstrip": false,
                 "normalized": false,
-                "special": !(joyai && *token_type == 4)
+                "special": *token_type == 3
             })),
             _ => {}
         }
@@ -6399,7 +6394,7 @@ async fn convert_gguf_to_safetensors_inner(
 /// part of a split main GGUF); weights are read from the GGUF at every load.
 /// Older entries are stale and age out through the normal sweep grace and
 /// lease rules.
-pub(crate) const NATIVE_GGUF_ASSETS_FORMAT: u32 = 9;
+pub(crate) const NATIVE_GGUF_ASSETS_FORMAT: u32 = 10;
 
 fn native_gguf_format_is_current(format: u32) -> bool {
     format == NATIVE_GGUF_ASSETS_FORMAT
@@ -6623,7 +6618,18 @@ fn native_gguf_entry_is_current(
 /// fresher than this may belong to a concurrent load on another machine's
 /// clock or a writer that has not published its marker yet.
 const NATIVE_GGUF_SWEEP_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-const NATIVE_GGUF_ASSETS_PREFIX: &str = ".mlx-qwen4-assets-v2-";
+pub(crate) const NATIVE_GGUF_ASSETS_PREFIX: &str = ".mlx-qwen4-assets-v3-";
+
+/// `.mlx-qwen4-assets-v3-{identity}`: the identity hashes the prefix with the
+/// source identity, so a `-live-` dir an older sidecar version left under a
+/// reused pid never matches this version's name.
+pub(crate) fn native_gguf_assets_dir_name(source_identity: &str) -> String {
+    let identity: String = Sha256::digest(format!("{NATIVE_GGUF_ASSETS_PREFIX}{source_identity}"))
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{NATIVE_GGUF_ASSETS_PREFIX}{identity}")
+}
 const NATIVE_GGUF_ASSETS_TMP_PREFIX: &str = ".mlx-qwen4-assets-tmp-";
 /// `.mlx-qwen4-assets-live-{identity}-{pid}`: a tokenizer sidecar that
 /// could not replace a leased output, promoted to a deterministic same-pid
@@ -6680,7 +6686,7 @@ fn native_gguf_pid_dead(_pid: u32) -> bool {
 /// Lock file for a cache object keyed by `key`. Plain entry keys live beside
 /// their `.{key}.lock`; keys that already carry a leading dot (asset
 /// sidecars) append the suffix directly so readers and the sweep agree on one
-/// name — `.mlx-qwen4-assets-v2-{identity}.lock`, never a double dot.
+/// name — `.mlx-qwen4-assets-v3-{identity}.lock`, never a double dot.
 fn native_gguf_lock_name(key: &str) -> String {
     if key.starts_with('.') {
         format!("{key}{NATIVE_GGUF_LOCK_SUFFIX}")
@@ -6890,7 +6896,7 @@ fn native_gguf_try_entry_lock(_cache_root: &Path, _key: &str) -> Option<Option<f
 }
 
 // ── In-use sidecar leases ──────────────────────────────────────────────────
-// A published `.mlx-qwen4-assets-v2-*` dir handed to a loaded model stays in
+// A published `.mlx-qwen4-assets-v3-*` dir handed to a loaded model stays in
 // use for the process lifetime: the model opens `tokenizer.json` lazily on
 // first request, possibly days after `assets_in` returned. The registry and
 // shared flock below keep that live model's directory protected. The registry is the
@@ -9593,6 +9599,111 @@ mod tests {
             &[0, 1, 2]
         );
         fs::remove_dir_all(root).ok();
+    }
+
+    /// The tokenizer the pre-Splash rule built: every CONTROL and
+    /// USER_DEFINED row special.
+    fn all_added_special(json: &serde_json::Value) -> tokenizers::Tokenizer {
+        let mut json = json.clone();
+        for token in json["added_tokens"].as_array_mut().unwrap() {
+            token["special"] = serde_json::json!(true);
+        }
+        tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&json).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn embedded_gpt2_tokenizer_marks_only_control_rows_special() {
+        let metadata = crate::utils::gguf_test_fixtures::qwen_tag_tokenizer_metadata(&[]);
+        let json = embedded_gpt2_tokenizer_json(&metadata).unwrap().unwrap();
+        let flags: HashMap<&str, bool> = json["added_tokens"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                (
+                    t["content"].as_str().unwrap(),
+                    t["special"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            HashMap::from([
+                ("<|endoftext|>", true),
+                ("<|im_start|>", true),
+                ("<|im_end|>", true),
+                ("<tool_call>", false),
+                ("</tool_call>", false),
+                ("<think>", false),
+                ("</think>", false),
+            ])
+        );
+        let tokenizer =
+            tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&json).unwrap()).unwrap();
+        let id = |token: &str| tokenizer.token_to_id(token).unwrap();
+        assert_eq!(
+            tokenizer.decode(&[id("<tool_call>")], true).unwrap(),
+            "<tool_call>"
+        );
+        assert_eq!(tokenizer.decode(&[id("<|im_end|>")], true).unwrap(), "");
+        let a = tokenizer.encode("r", false).unwrap().get_ids()[0];
+        let b = tokenizer.encode("x", false).unwrap().get_ids()[0];
+        assert_eq!(
+            tokenizer
+                .decode(
+                    &[
+                        a,
+                        id("</think>"),
+                        id("<tool_call>"),
+                        b,
+                        id("</tool_call>"),
+                        id("<|im_end|>")
+                    ],
+                    true
+                )
+                .unwrap(),
+            "r</think><tool_call>x</tool_call>"
+        );
+    }
+
+    /// The flag only steers decoding: a rendered tool prompt encodes to the
+    /// same ids whether USER_DEFINED rows are special or not, and each tag
+    /// is one id.
+    #[test]
+    fn embedded_gpt2_tokenizer_flags_leave_prompt_ids_unchanged() {
+        let metadata = crate::utils::gguf_test_fixtures::qwen_tag_tokenizer_metadata(&[]);
+        let json = embedded_gpt2_tokenizer_json(&metadata).unwrap().unwrap();
+        let template = "{%- if tools %}<|im_start|>system\n<tools>\n{%- for tool in tools %}\n{{ tool | tojson }}{%- endfor %}\n</tools><|im_end|>\n{%- endif %}\
+            {%- for message in messages %}<|im_start|>{{ message.role }}\n\
+            {%- if message.reasoning_content %}<think>\n{{ message.reasoning_content }}\n</think>\n\n{%- endif %}\
+            {{ message.content }}\
+            {%- for call in message.tool_calls or [] %}\n<tool_call>\n<function={{ call.function.name }}>\n<parameter=q>\nv\n</parameter>\n</function>\n</tool_call>{%- endfor %}<|im_end|>\n{%- endfor %}\
+            {%- if add_generation_prompt %}<|im_start|>assistant\n<think>\n{%- endif %}";
+        let messages: Vec<crate::tokenizer::ChatMessage> =
+            serde_json::from_value(serde_json::json!([
+                {"role": "user", "content": "Find <tool_call> docs"},
+                {"role": "assistant", "content": "", "reasoning_content": "search",
+                 "tool_calls": [{"id": "c1", "name": "web_search", "arguments": "{\"q\":\"v\"}"}]},
+                {"role": "user", "content": "<tool_response>\nok\n</tool_response>"}
+            ]))
+            .unwrap();
+        let tools: Vec<crate::tokenizer::ToolDefinition> = serde_json::from_value(serde_json::json!([
+            {"type": "function", "function": {"name": "web_search", "description": "Search", "parameters": {"type": "object", "properties": "{\"q\":{\"type\":\"string\"}}"}}}
+        ]))
+        .unwrap();
+        let render = |tokenizer: tokenizers::Tokenizer| {
+            crate::tokenizer::Qwen3Tokenizer::from_tokenizer(tokenizer, Some(template.to_string()))
+                .unwrap()
+                .apply_chat_template_sync(&messages, Some(true), Some(&tools), Some(true), false)
+                .unwrap()
+        };
+        let ours = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&json).unwrap()).unwrap();
+        let tag = ours.token_to_id("<tool_call>").unwrap();
+        let think_end = ours.token_to_id("</think>").unwrap();
+        let ids = render(ours);
+        assert_eq!(ids, render(all_added_special(&json)));
+        assert_eq!(ids.iter().filter(|&&id| id == tag).count(), 2);
+        assert!(ids.contains(&think_end));
     }
 
     #[test]
@@ -15226,15 +15337,15 @@ mod tests {
     }
 
     #[test]
-    fn native_assets_format_is_v9_and_rejects_weight_entries() {
-        assert_eq!(NATIVE_GGUF_ASSETS_FORMAT, 9);
+    fn native_assets_format_is_v10_and_rejects_older_entries() {
+        assert_eq!(NATIVE_GGUF_ASSETS_FORMAT, 10);
         let root = std::env::temp_dir().join(format!(
             "mlx-node-native-cache-format-{}",
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("config.json"), "{}").unwrap();
-        for format in [5, 6, 7, 8] {
+        for format in [5, 6, 7, 8, 9] {
             fs::write(
                 root.join(".complete"),
                 format!(
@@ -15251,12 +15362,12 @@ mod tests {
                     "bf16",
                     &["config.json"],
                 ),
-                "v{format} weight entries must not satisfy the asset reader"
+                "v{format} entries must not satisfy the asset reader"
             );
         }
         fs::write(
             root.join(".complete"),
-            "format=9\nsource=x\nsource_identity_sha256=abc\nsize=1\nmodified_ns=1\nassets_sha256=def\nlayout=tiled\ncompanion_sha256=none\ndtype=bf16\n",
+            "format=10\nsource=x\nsource_identity_sha256=abc\nsize=1\nmodified_ns=1\nassets_sha256=def\nlayout=tiled\ncompanion_sha256=none\ndtype=bf16\n",
         )
         .unwrap();
         assert!(native_gguf_entry_is_current(
@@ -17581,7 +17692,11 @@ mod tests {
     /// else under the root is foreign and must survive the sweep.
     #[cfg(unix)]
     fn native_sweep_entry_name(stem: &str) -> String {
-        format!("{stem}-1-1-v9-{}-{}", "a".repeat(64), "b".repeat(64))
+        format!(
+            "{stem}-1-1-v{NATIVE_GGUF_ASSETS_FORMAT}-{}-{}",
+            "a".repeat(64),
+            "b".repeat(64)
+        )
     }
 
     // The std Mutex guard must stay held across the awaits below: it
@@ -17628,7 +17743,10 @@ mod tests {
         .unwrap();
 
         // Legacy v7 weight entries are stale once aged.
-        let outdated = cache_root.join(native_sweep_entry_name("outdated").replace("-v9-", "-v7-"));
+        let outdated = cache_root.join(native_sweep_entry_name("outdated").replace(
+            &format!("-v{NATIVE_GGUF_ASSETS_FORMAT}-"),
+            &format!("-v{}-", NATIVE_GGUF_ASSETS_FORMAT - 1),
+        ));
         fs::create_dir_all(&outdated).unwrap();
         let outdated_marker = outdated.join(".complete");
         fs::write(&outdated_marker, native_sweep_marker(&input, 7, None, true)).unwrap();
@@ -17808,7 +17926,7 @@ mod tests {
         fs::create_dir_all(&live_assets_tmp).unwrap();
         // Malformed asset-prefixed names are foreign tooling: never deleted
         // and never counted, however old.
-        let foreign_assets = cache_root.join(".mlx-qwen4-assets-v2-garbage");
+        let foreign_assets = cache_root.join(format!("{NATIVE_GGUF_ASSETS_PREFIX}garbage"));
         fs::create_dir_all(&foreign_assets).unwrap();
         native_sweep_age_dir(&foreign_assets);
         let foreign_assets_tmp = cache_root.join(".mlx-qwen4-assets-tmp-not-a-uuid");
@@ -17821,7 +17939,8 @@ mod tests {
             cache_root.join(".mlx-qwen4-assets-tmp-12345678-90ab-cdef-0123-456789abcdef");
         fs::create_dir_all(&foreign_assets_tmp_v3).unwrap();
         native_sweep_age_dir(&foreign_assets_tmp_v3);
-        let assets_sidecar = cache_root.join(format!(".mlx-qwen4-assets-v2-{}", "c".repeat(64)));
+        let assets_sidecar =
+            cache_root.join(format!("{NATIVE_GGUF_ASSETS_PREFIX}{}", "c".repeat(64)));
         fs::create_dir_all(&assets_sidecar).unwrap();
         fs::write(assets_sidecar.join("complete"), b"1").unwrap();
         native_sweep_age_file(&assets_sidecar.join("complete"));
@@ -18050,8 +18169,8 @@ mod tests {
         let root = NativeSweepTestDir::new("inuse");
         let cache_root = root.path().join("cache");
         fs::create_dir_all(&cache_root).unwrap();
-        let name_a = format!(".mlx-qwen4-assets-v2-{}", "a".repeat(64));
-        let name_b = format!(".mlx-qwen4-assets-v2-{}", "b".repeat(64));
+        let name_a = format!("{NATIVE_GGUF_ASSETS_PREFIX}{}", "a".repeat(64));
+        let name_b = format!("{NATIVE_GGUF_ASSETS_PREFIX}{}", "b".repeat(64));
         let dir_a = cache_root.join(&name_a);
         let dir_b = cache_root.join(&name_b);
         for (dir, marker) in [(&dir_a, "complete"), (&dir_b, "complete")] {
@@ -18771,6 +18890,104 @@ mod tests {
             n += a.len();
         }
         println!("joyai tokenizer: {specials} special ids, 50 strings, {n} ids bitwise == HF 1017");
+    }
+
+    /// Real file, shard 1 KV only (F_NOCACHE): the Qwen3.8-Flash-Next
+    /// (`qwen35` profile) tokenizer keeps every USER_DEFINED row in a
+    /// skip-special decode (as HF's tokenizer.json does when
+    /// `QWEN38_HF_TOKENIZER` names one), drops the CONTROL rows, and renders
+    /// the GGUF's own template with tools to the same ids as the all-special
+    /// build. HF is compared on USER_DEFINED rows only: llama.cpp's converter
+    /// types every `<|...|>` row CONTROL, also those HF keeps (`<|fim_*|>`).
+    #[test]
+    #[ignore = "real Qwen3.8-Flash-Next shard 1 KV; QWEN4_GGUF_SHARD1, optional QWEN38_HF_TOKENIZER"]
+    fn qwen4_gguf_tokenizer_keeps_user_defined_tags() {
+        let path = PathBuf::from(std::env::var("QWEN4_GGUF_SHARD1").unwrap());
+        let file = crate::moe_stream::io::open_nocache(&path).unwrap();
+        let g = parse_gguf_reader(std::io::BufReader::new(file)).unwrap();
+        assert_eq!(
+            g.metadata
+                .get("tokenizer.ggml.pre")
+                .and_then(GgufMetaValue::as_str),
+            Some("qwen35")
+        );
+        let json = embedded_gpt2_tokenizer_json(&g.metadata).unwrap().unwrap();
+        let ours = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&json).unwrap()).unwrap();
+        let (Some(GgufMetaValue::ArrayString(tokens)), Some(GgufMetaValue::ArrayI32(types))) = (
+            g.metadata.get("tokenizer.ggml.tokens"),
+            g.metadata.get("tokenizer.ggml.token_type"),
+        ) else {
+            panic!("tokenizer arrays");
+        };
+        for (tag, id) in [
+            ("<tool_call>", 248058),
+            ("</tool_call>", 248059),
+            ("<think>", 248068),
+            ("</think>", 248069),
+        ] {
+            assert_eq!(ours.token_to_id(tag), Some(id), "{tag}");
+            assert_eq!(ours.encode(tag, false).unwrap().get_ids(), &[id], "{tag}");
+            assert_eq!(ours.decode(&[id], true).unwrap(), tag);
+        }
+        assert_eq!(ours.decode(&[248046], true).unwrap(), "");
+        let hf = std::env::var("QWEN38_HF_TOKENIZER")
+            .ok()
+            .map(|p| tokenizers::Tokenizer::from_file(p).unwrap());
+        let (mut user_defined, mut control) = (0, 0);
+        for (id, ty) in types.iter().enumerate() {
+            let ids = [id as u32];
+            match *ty {
+                4 => {
+                    assert_eq!(ours.decode(&ids, true).unwrap(), tokens[id]);
+                    if let Some(hf) = &hf {
+                        assert_eq!(
+                            hf.decode(&ids, true).unwrap(),
+                            tokens[id],
+                            "HF decode {:?}",
+                            tokens[id]
+                        );
+                    }
+                    user_defined += 1;
+                }
+                3 => {
+                    assert_eq!(ours.decode(&ids, true).unwrap(), "", "{}", tokens[id]);
+                    control += 1;
+                }
+                _ => {}
+            }
+        }
+        let Some(GgufMetaValue::String(template)) = g.metadata.get("tokenizer.chat_template")
+        else {
+            panic!("chat template");
+        };
+        let messages: Vec<crate::tokenizer::ChatMessage> = serde_json::from_value(serde_json::json!([
+            {"role": "system", "content": "Small helper desk."},
+            {"role": "user", "content": "Search the web for the release date of the Foobar 9 phone."},
+            {"role": "assistant", "content": "", "reasoning_content": "Search first.",
+             "tool_calls": [{"id": "c1", "name": "web_search", "arguments": "{\"query\":\"Foobar 9 release date\"}"}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "No results."}
+        ]))
+        .unwrap();
+        let tools: Vec<crate::tokenizer::ToolDefinition> = serde_json::from_value(serde_json::json!([
+            {"type": "function", "function": {"name": "web_search", "description": "Search the web.",
+             "parameters": {"type": "object", "properties": "{\"query\":{\"type\":\"string\"}}", "required": ["query"]}}}
+        ]))
+        .unwrap();
+        let render = |tokenizer: tokenizers::Tokenizer| {
+            crate::tokenizer::Qwen3Tokenizer::from_tokenizer(tokenizer, Some(template.clone()))
+                .unwrap()
+                .apply_chat_template_sync(&messages, Some(true), Some(&tools), Some(true), false)
+                .unwrap()
+        };
+        let ids = render(ours);
+        assert_eq!(ids, render(all_added_special(&json)));
+        assert!(ids.contains(&248058) && ids.contains(&248069));
+        println!(
+            "qwen4 GGUF tokenizer: {user_defined} USER_DEFINED rows kept, {control} CONTROL rows dropped, \
+             rendered tool prompt {} ids identical under both flag rules, HF compared: {}",
+            ids.len(),
+            hf.is_some()
+        );
     }
 
     #[test]

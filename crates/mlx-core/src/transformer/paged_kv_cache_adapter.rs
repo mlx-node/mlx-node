@@ -8210,6 +8210,20 @@ impl PagedKVCacheAdapter {
         self.allocator_guard().is_cached(hash)
     }
 
+    /// The block the prefix cache holds under `hash`.
+    pub(crate) fn cached_block(&self, hash: u64) -> Option<Arc<PhysicalBlock>> {
+        self.allocator_guard().cached_block(hash)
+    }
+
+    /// Grows the pool by what `blocks` more blocks lack beyond the free (or
+    /// evictable) ones, for a restore that cannot grow it itself.
+    pub(crate) fn grow_for(&mut self, blocks: u32) {
+        let shortfall = self.grow_shortfall(&self.allocator_guard(), blocks);
+        if shortfall > 0 {
+            self.try_grow_pool(shortfall);
+        }
+    }
+
     /// [`BlockAllocator::freed_by_marks`].
     pub(crate) fn freed_by_marks(&self, marks: &[u64]) -> Vec<u32> {
         self.allocator_guard().freed_by_marks(marks)

@@ -28,13 +28,67 @@ model thread's PRNG in row order. The paged decode clear-cache interval is
   request-owned draft contexts and RNG. Explicit greedy adaptive DSpark also
   shares verification waves when no fixed confidence threshold is requested.
   Media, assistant drafts and sampled adaptive speculation retain ordered lanes;
-  reset and stats commands are barriers. Qwen native MTP uses per-owner GDN
-  replay and draft KV history when `MLX_CONTINUOUS_BATCHING=1`.
+  reset and stats commands are barriers. Qwen3.5 dense/MoE text turns are
+  scheduled by default on up to 4 lanes, computed from the machine's memory
+  at load; up to 8 on machines with 256 GB or more (see "Qwen3.5 decode
+  lanes" below); fixed-depth native MTP uses
+  per-owner GDN replay and
+  draft KV history there, while adaptive MTP, DFlash2 and media turns stay
+  exclusive.
   Muse DFlash packing is experimental (`MLX_SCHEDULED_DFLASH=1`); its default
   remains the existing flat speculative lane. Loading a draft leaves ordinary
   batched owners available on the resident target.
 - Different loaded models continue to run in parallel, one native model thread
   per model.
+
+### Qwen3.5 decode lanes
+
+A Qwen3.5 dense or MoE load runs up to 4 lanes, computed from the machine's
+memory at load; up to 8 on machines with 256 GB or more. The ceiling
+(`qwen35_lane_ceiling`) reads physical memory (`hw.memsize`), not the Metal
+working set: 8 (`HYBRID_LIVE_STATE_UNITS`) from 256,000,000,000 bytes, which a
+256 GB Mac (256 GiB) passes and a 192 GB Mac (192 GiB) does not; 4 below it
+or when the memory is unreadable. `MLX_SCHED_MAX_NUM_SEQS` only lowers it.
+The memory plan (`evaluate_qwen35_plan`) first plans one lane and its window.
+It then grants the most lanes, up to that ceiling, whose extra state (each
+lane's GDN state and, on an MTP load, its draft state at the full window) and
+joint decode step (one AR row, or 8 MTP verify rows, per lane; on a MoE load
+each row's top-k expert work besides) keep that window. Lanes give way first: the window is
+never made smaller for a lane, and a load the one-lane plan admits always
+loads. A load whose paged cache persists to the cold tier also prices, for
+every lane, the first included, the 2 GDN states of checkpoint rungs a
+sequence may keep past a refused claim until its turn-end sidecar capture.
+A scheduled turn reserves those 2 states after its GDN cell only when the
+memory governor has the room at once; a turn without that reservation keeps
+no refused rung, and the reservation never makes a turn wait or fail.
+`MLX_SERVE_FORCE_SERIAL=1` plans one lane. The granted count is the
+only source of the recurrent-state table width, the admission check, the
+scheduler's running-set capacity and `maxConcurrentSequences()`; the memory
+plan's log names it (`N decode lanes`).
+
+Unit-test table (`lanes_follow_the_device`; physical memory = the column,
+working set = 3/4 of it; one lane's window in tokens):
+
+| Model (weights)              | MTP | 16 GB      | 24 GB       | 36 GB       | 64 GB   | 128 GB | 192 GB | 256 GB | 512 GB |
+| ---------------------------- | --- | ---------- | ----------- | ----------- | ------- | ------ | ------ | ------ | ------ |
+| 0.8B bf16 (1,666 MiB)        | off | 4          | 4           | 4           | 4       | 4      | 4      | 8      | 8      |
+| 0.8B bf16 (1,666 MiB)        | on  | 4          | 4           | 4           | 4       | 4      | 4      | 8      | 8      |
+| 9B 8-bit (9,500 MiB)         | off | 2 (28,665) | 4           | 4           | 4       | 4      | 4      | 8      | 8      |
+| 9B 8-bit (9,500 MiB)         | on  | 1 (4,089)  | 1 (244,389) | 3           | 4       | 4      | 4      | 8      | 8      |
+| 27B (16,000 MiB)             | off | no load    | no load     | 1           | 4       | 4      | 4      | 8      | 8      |
+| 27B (16,000 MiB)             | on  | no load    | no load     | 1 (188,409) | 4       | 4      | 4      | 8      | 8      |
+| 35B-A3B 4-bit (18,780 MiB)   | off | no load    | no load     | 4           | 4       | 4      | 4      | 8      | 8      |
+| 35B-A3B 4-bit (18,780 MiB)   | on  | no load    | no load     | 1           | 4       | 4      | 4      | 8      | 8      |
+| 122B-A10B 4-bit (65,440 MiB) | off | no load    | no load     | no load     | no load | 4      | 4      | 8      | 8      |
+| 122B-A10B 4-bit (65,440 MiB) | on  | no load    | no load     | no load     | no load | 4      | 4      | 8      | 8      |
+
+Cells are granted lanes; the window is 262,144 unless given in brackets. With
+the cold tier on, five cells change: 9B MTP off at 16 GB is 1 (24,569), 9B
+MTP on is 1 (1,760) at 16 GB and 1 (241,173) at 24 GB, and 27B at 36 GB is
+1 (258,041) with MTP off and 1 (180,217) with MTP on. A
+window below 262,144 means the one-lane plan already spent the device's
+memory on context, so further lanes are granted only when their cost fits
+without lowering it.
 
 ```text
 request A ─┐
@@ -62,7 +116,7 @@ step's remaining token budget.
 | Native thread | One scheduler and executor live beside the model on its dedicated OS thread; `MxArray` never crosses threads. Idle waits block, while busy periods poll commands only between steps. Qwen3, LFM2/2.5, Qwen3.5 Dense/MoE, Gemma4, Muse-Glimmer, and NemotronH instantiate the same engine-owned `HybridSchedulerState<B>`; their backends provide cache/recurrent/prefix/decode hooks rather than duplicating request lifecycle code.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | Scheduler     | One global token ceiling serves decode rows first, then pinned prefill slices. Exclusive commands run only with an empty running set; reset/generate/save/train are barriers. Block growth and hybrid recurrent-state bytes share one unified-memory admission watermark; an actual lazy-allocation squeeze preempts exactly one newest running victim.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | Cache         | `PagedKVCacheAdapter` owns a request table keyed by sequence id over a refcounted block pool. Hybrid families add one manager per compatible KV group. Gemma4 owns distinct full/sliding pools; expired sliding blocks become null sentinels so logical positions remain absolute. A preempted victim releases its live tables and replays safely. Sidecar-free SSD reads can park in `WaitingForSsd`; hybrid exact-boundary restores currently reconcile their K/V and companion state synchronously.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| Executor      | Dense Qwen3 defaults to uniform `[N,1]` decode plus bounded prefill; `MLX_SCHED_RAGGED_STEP=1` instead packs every planned slice. LFM2 defaults to a row-exact decode wave — one N=1 forward per row inside the shared step, bit-identical to serial — because the fused `[N,1,H]` path's M=N GEMM tiles round differently than M=1 and the carried ShortConv state amplifies a few bf16 ULP into occasional greedy near-tie flips; `MLX_LFM2_FUSED_BATCH_DECODE=1` opts back into one fused forward (stacking/scattering private ShortConv rows) for benchmarking. Text-only Qwen3.5 dense and MoE stack/scatter private GDN rows; MoE expert routing consumes the same `[N,1,H]` tensor rather than falling back to one forward per row. NemotronH has a fused lane — stacking/scattering per-request Mamba-2 rows (conv `[3,6144]` + SSM `[64,64,128]` f32 per SSM layer) around each SSM layer, routing its pure MoE-FFN layers over the shared `[N,1,H]` tensor, and driving its six GQA layers through the batched paged kernels — but that lane is reachable only on a **dense/bf16** checkpoint. `load_inner` (`models/nemotron_h/persistence.rs`) sets `row_exact_decode_projections` for **any** quantized checkpoint (a top-level quant mode or any per-layer override), which the only published NemotronH checkpoint (NVFP4 30B-A3B) always is, so the decode wave instead dispatches to `run_row_exact_decode_wave` (`models/nemotron_h/model.rs`), one single-row decode per row with the logits concatenated — bit-identical to N serial decodes, but N full weight streams. On that checkpoint the batching win is the shared scheduler (prefill/decode interleaving, shared prefix blocks, no whole-turn TTFT queueing), **not** one fused decode forward; the fused branch is currently dead code there. Gemma4 fuses ordinary `[N,1]` rows through full and sliding paged groups, including KV-shared anchors and PLE. Eligible all-greedy rows stay batched through one argmax/eval epilogue; mixed sampling or penalties retain scalar per-row semantics. `schedulerStats().fusedGreedyEpilogueSteps` counts executor-confirmed fused epilogues rather than inferring them from planned occupancy. Every request retains private penalties, sampling, stop, stream, and cancellation state. |
+| Executor      | Dense Qwen3 defaults to uniform `[N,1]` decode plus bounded prefill; `MLX_SCHED_RAGGED_STEP=1` instead packs every planned slice. LFM2 defaults to a row-exact decode wave — one N=1 forward per row inside the shared step, bit-identical to serial — because the fused `[N,1,H]` path's M=N GEMM tiles round differently than M=1 and the carried ShortConv state amplifies a few bf16 ULP into occasional greedy near-tie flips; `MLX_LFM2_FUSED_BATCH_DECODE=1` opts back into one fused forward (stacking/scattering private ShortConv rows) for benchmarking. Text-only Qwen3.5 dense and MoE stack/scatter private GDN rows; MoE AR decode routes experts over the same `[N,1,H]` tensor rather than falling back to one forward per row. A MoE MTP verify step runs every projection, GDN layer, expert block and the LM head on each owner's own `[1,W]` rows (one paged attention kernel still serves all rows): a packed `[N*W]` matmul picks another kernel and rounding by row count, and a one-ulp change in a router input moves a row to other experts. Its tokens equal each lane run alone, but each verify step streams the non-expert weights once per owner, N weight streams (Qwen3.6-35B-A3B: about 1.94 B parameters a pass). NemotronH has a fused lane — stacking/scattering per-request Mamba-2 rows (conv `[3,6144]` + SSM `[64,64,128]` f32 per SSM layer) around each SSM layer, routing its pure MoE-FFN layers over the shared `[N,1,H]` tensor, and driving its six GQA layers through the batched paged kernels — but that lane is reachable only on a **dense/bf16** checkpoint. `load_inner` (`models/nemotron_h/persistence.rs`) sets `row_exact_decode_projections` for **any** quantized checkpoint (a top-level quant mode or any per-layer override), which the only published NemotronH checkpoint (NVFP4 30B-A3B) always is, so the decode wave instead dispatches to `run_row_exact_decode_wave` (`models/nemotron_h/model.rs`), one single-row decode per row with the logits concatenated — bit-identical to N serial decodes, but N full weight streams. On that checkpoint the batching win is the shared scheduler (prefill/decode interleaving, shared prefix blocks, no whole-turn TTFT queueing), **not** one fused decode forward; the fused branch is currently dead code there. Gemma4 fuses ordinary `[N,1]` rows through full and sliding paged groups, including KV-shared anchors and PLE. Eligible all-greedy rows stay batched through one argmax/eval epilogue; mixed sampling or penalties retain scalar per-row semantics. `schedulerStats().fusedGreedyEpilogueSteps` counts executor-confirmed fused epilogues rather than inferring them from planned occupancy. Every request retains private penalties, sampling, stop, stream, and cancellation state. |
 | Transport     | SSE writes honor Node backpressure and stop native pulls until drain or close. The 30-second default drain deadline aborts a connected stalled peer and releases admission. The chat model-thread output mailbox, native callback queue, and JS callback queue are independently capped at 64 events.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 
 Per-request prefix verification remains all-or-nothing. A miss releases and
@@ -84,7 +138,6 @@ same-binary uniform/ragged validation with separate model instances:
 | `MLX_SCHED_RAGGED_STEP`         | `0`     | Use one packed varlen Qwen3 forward for mixed prefill/decode slices.                                                                                                                                                                                                                                                                                  |
 | `MLX_LFM2_FUSED_BATCH_DECODE`   | `0`     | Opt LFM2 multi-row decode back into one fused `[N,1]` forward (default is a row-exact wave: per-row N=1 forwards, bit-identical to serial).                                                                                                                                                                                                           |
 | `MLX_PAGED_PER_SEQ_CTX`         | `unset` | Optional per-sequence **admit** cap and Qwen3/LFM2 pool-budget clip. Unset → admit `min(trained, live pool minus recurrent KV-equivalent)`. When set, Muse/Nemotron `contextLimits()` also publish that cap. Default 32768 applies only to the Qwen3/LFM2 **pool request** formula. Qwen3.5 dense/MoE ignore it: their windows are the memory plan's. |
-| `MLX_CONTINUOUS_BATCHING`       | `0`     | Opt default-off compatible checkpoints into the shared scheduled lane (currently Qwen3.5 dense and MoE).                                                                                                                                                                                                                                              |
 | `MLX_SERVE_FORCE_SERIAL`        | `0`     | Route eligible Qwen3/LFM2/Qwen3.5/Gemma4/Muse-Glimmer/NemotronH turns through the whole-turn path for A/B and rollback.                                                                                                                                                                                                                               |
 
 `MLX_SERVE_FORCE_SERIAL` is a process-start test/rollback switch, not a
@@ -322,9 +375,9 @@ Four additional mechanisms fit the single-process MLX runtime:
 
 Storage correctness does not imply that every family has the same scheduling
 throughput. Qwen3.5 MoE now defaults to paged K/V, has exact GDN-backed SSD
-restart parity, and admits eligible plain-text AR through the two-row hybrid
-scheduler. Fixed-depth native MTP also uses this opt-in lane; adaptive MTP and
-media remain whole-turn exclusive. Hybrid sidecar
+restart parity, and admits eligible plain-text AR through the hybrid scheduler by default
+(up to 4 lanes, computed from the machine's memory at load; up to 8 on machines with 256 GB or more). Fixed-depth native MTP also uses this lane; adaptive MTP,
+DFlash2 and media remain whole-turn exclusive. Hybrid sidecar
 restores also remain synchronous on the model thread, and Gemma4 still declines
 cross-owner in-process hot hits. These are latency/occupancy follow-ups, not
 holes in the paged or durable-state contract.
@@ -423,11 +476,15 @@ above as a cooled median-of-three 4-bit result.
   the random-weight mixed-step oracle proves a real one-forward decode+prefill
   path, though its tiny model is not a throughput gate.
 - **Stage 2c — wider hybrid execution (landed):**
-  text-only Qwen3.5 dense and MoE store at most two request-local GDN units, fuse
+  text-only Qwen3.5 dense and MoE store up to 4 request-local GDN units (the
+  lanes their memory plan grants; up to 8 on machines with 256 GB or more),
+  fuse
   their `[N,1,H]` decode, and reconcile preemption through the deepest
   K/V-backed GDN checkpoint/sidecar boundary. Paged-block growth and recurrent
-  state debit one byte budget. Eligible text-only paged checkpoints opt in with
-  `MLX_CONTINUOUS_BATCHING=1`. Fixed-depth native MTP now shares per-owner
+  state debit one byte budget. Eligible text-only paged checkpoints take this
+  lane by default (`MLX_SERVE_FORCE_SERIAL=1` rolls back to whole-turn); the
+  memory plan prices the MTP state once, beside the pool, either way.
+  Fixed-depth native MTP now shares per-owner
   verification; adaptive MTP, DFlash2 and media retain exclusive lanes. The tiny
   random-weight dense and genuinely sparse MoE fixtures prove token identity
   but are slower than two

@@ -3271,6 +3271,10 @@ export interface CleanupStats {
  * survives process death and kernel panic, but a sudden power loss can leave
  * it torn. Torn objects fail the payload checksum on the next read and are
  * pruned as a miss, so the cost is a recomputed prefix, never wrong state.
+ *
+ * The registered drain hooks run first, inside the same deadline: they hand
+ * the writes a family still holds (a state waiting for its delay) to the
+ * writer, which this drain then flushes.
  */
 export declare function coldCacheDrain(timeoutMs: number): boolean;
 
@@ -5898,6 +5902,47 @@ export interface Qwen4ExpResidencyInfo {
    */
   decodedRowEvictions: number;
   decodedRowEvictedBytes: number;
+  /** Routed experts the slots or banks served without a read since load. */
+  slotHits: number;
+  /** Routed experts a slot fill read from the checkpoint since load. */
+  slotMisses: number;
+  /**
+   * Bytes read from the checkpoint files since load (expert fills and row
+   * imports); the page cache may serve part of them.
+   */
+  checkpointBytesRead: number;
+  /**
+   * Decode tokens and prefill windows replayed after a tentative device
+   * route missed the slots.
+   */
+  routeReplays: number;
+  /** Stored prefix states in memory and their bytes. */
+  prefixStates: number;
+  prefixStateBytes: number;
+  /** States published since load, and turns that resumed from one. */
+  prefixPublished: number;
+  prefixRestored: number;
+  /** The stored states' disk tier is on. */
+  prefixDiskEnabled: boolean;
+  /** States parked for the disk and not handed to the writer yet. */
+  prefixDiskWaiting: number;
+  /** States handed to the writer and found on disk. */
+  prefixDiskDurable: number;
+  /** Parked states a newer state of their conversation replaced. */
+  prefixDiskUnneeded: number;
+  /** States not written: chain incomplete, budget, queue full. */
+  prefixDiskRefused: number;
+  /** States read back from disk into memory. */
+  prefixDiskRestored: number;
+  /**
+   * States removed from disk: a block or draft segment of their chain
+   * was not there, or they did not read back.
+   */
+  prefixDiskDroppedChain: number;
+  /** Block and draft-segment copies waiting for the writer. */
+  prefixDiskOwedBlocks: number;
+  /** Bytes of states written. */
+  prefixDiskStateBytesWritten: number;
 }
 
 /** Result of text recognition. */

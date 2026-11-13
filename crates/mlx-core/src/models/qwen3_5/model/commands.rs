@@ -195,7 +195,11 @@ impl HybridSchedulerBackend for Qwen35Inner {
     type StepExecutor<'a> = crate::engine::hybrid_scheduler::HybridStepExecutor<'a, Self>;
 
     const SCHEDULER_NAME: &'static str = "Qwen3.5 dense";
-    const ENABLED_BY_DEFAULT: bool = false;
+
+    /// The decode lanes the load's memory plan granted.
+    fn scheduler_capacity(&self) -> usize {
+        self.scheduled_lanes() as usize
+    }
 
     fn wired_residency(&self) -> Option<std::sync::Arc<crate::stream::WiredResidency>> {
         self.wired.clone()
@@ -397,6 +401,20 @@ impl HybridSchedulerBackend for Qwen35Inner {
 
     fn recurrent_state_bytes(&self) -> u64 {
         self.config.recurrent_state_bytes()
+    }
+
+    fn scheduled_unclaimed_prefill_bytes(&self) -> u64 {
+        if self.wants_gdn_checkpoint_ladder() {
+            crate::models::qwen3_5::gdn_checkpoint_store::refused_rung_bytes(
+                self.config.recurrent_state_bytes(),
+            )
+        } else {
+            0
+        }
+    }
+
+    fn book_unclaimed_prefill_state(&mut self, booked: bool) {
+        self.refused_rungs_booked = booked;
     }
 
     fn scheduled_recurrent_bytes(&self) -> u64 {

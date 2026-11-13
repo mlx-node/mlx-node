@@ -300,8 +300,20 @@ impl<T: GdnCheckpointLineage> GdnCheckpointLineage for &T {
     }
 }
 
+/// Most refused rungs one sequence holds ([`hold_refused_rung`]).
+pub(crate) const REFUSED_RUNGS_PER_SEQUENCE: u64 = 2;
+
+/// Bytes the refused rungs of one sequence hold at most: each is one GDN
+/// state of `recurrent_state_bytes`, outside every ledger claim, so the
+/// memory plan of a load that keeps them and the scheduler's admission book
+/// them.
+pub(crate) fn refused_rung_bytes(recurrent_state_bytes: u64) -> u64 {
+    recurrent_state_bytes.saturating_mul(REFUSED_RUNGS_PER_SEQUENCE)
+}
+
 /// Add `rung`, a ladder rung the governor refused RAM for, to the ones a
-/// sequence holds until its turn-end sidecar capture, and keep at most two:
+/// sequence holds until its turn-end sidecar capture, and keep at most
+/// [`REFUSED_RUNGS_PER_SEQUENCE`]:
 /// the deepest, and the deepest at or below `reach_tokens`, the reach
 /// predicted for this turn's K/V capture walk. The capture anchors only at or
 /// below the walk's reach, so a deepest rung past it alone persists nothing.
@@ -319,7 +331,7 @@ pub(crate) fn hold_refused_rung<T: GdnCheckpointLineage>(
             .filter(|&prefix_len| prefix_len <= reach)
             .max()
     });
-    let mut kept: Vec<T> = Vec::with_capacity(2);
+    let mut kept: Vec<T> = Vec::with_capacity(REFUSED_RUNGS_PER_SEQUENCE as usize);
     for candidate in held.drain(..).rev() {
         let prefix_len = Some(candidate.prefix_len());
         if (prefix_len == deepest || prefix_len == reachable)

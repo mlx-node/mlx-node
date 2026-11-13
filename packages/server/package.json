@@ -29,6 +29,11 @@
       "types": "./dist/host/index.d.ts",
       "import": "./dist/host/index.js"
     },
+    "./host/agent-thinking": {
+      "@mlx-node/source": "./src/host/agent-thinking.ts",
+      "types": "./dist/host/agent-thinking.d.ts",
+      "import": "./dist/host/agent-thinking.js"
+    },
     "./host/env-policy": {
       "@mlx-node/source": "./src/host/env-policy.ts",
       "types": "./dist/host/env-policy.d.ts",
@@ -38,6 +43,11 @@
       "@mlx-node/source": "./src/host/idle-release.ts",
       "types": "./dist/host/idle-release.d.ts",
       "import": "./dist/host/idle-release.js"
+    },
+    "./host/persist-cache": {
+      "@mlx-node/source": "./src/host/persist-cache.ts",
+      "types": "./dist/host/persist-cache.d.ts",
+      "import": "./dist/host/persist-cache.js"
     },
     "./host/decode-share": {
       "@mlx-node/source": "./src/host/decode-share.ts",

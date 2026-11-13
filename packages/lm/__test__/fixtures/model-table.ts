@@ -1,0 +1,630 @@
+/** A designed models folder: invented names, model types used as opaque keys, config quantization facts only. */
+
+export interface ModelRow {
+  /** The rule case the row is there for. */
+  covers: string;
+  /** The path under the models root. */
+  path: string;
+  modelType: string;
+  /** The quantization and dtype facts of an MLX folder's `config.json`. */
+  config?: Record<string, unknown>;
+  expected: { id: string; base: string; variant: string; format: 'gguf' | 'mlx' };
+}
+
+export const MODEL_TABLE: readonly ModelRow[] = [
+  // A GGUF repo with many quant files, MLX builds beside the repo, and three spellings of one base.
+  {
+    covers: 'UD + IQ*_M tag, repo drops gguf and mtp',
+    path: 'velda-40b-a4b-mtp-gguf/Velda-40B-A4B-UD-IQ3_M.gguf',
+    modelType: 'deepseek_v41',
+    expected: { id: 'Velda-40B-A4B-UD-IQ3_M', base: 'Velda-40B-A4B', variant: 'UD-IQ3_M', format: 'gguf' },
+  },
+  {
+    covers: 'UD + IQ*_XXS tag',
+    path: 'velda-40b-a4b-mtp-gguf/Velda-40B-A4B-UD-IQ2_XXS.gguf',
+    modelType: 'deepseek_v41',
+    expected: { id: 'Velda-40B-A4B-UD-IQ2_XXS', base: 'Velda-40B-A4B', variant: 'UD-IQ2_XXS', format: 'gguf' },
+  },
+  {
+    covers: 'UD + IQ*_XS tag',
+    path: 'velda-40b-a4b-mtp-gguf/Velda-40B-A4B-UD-IQ3_XS.gguf',
+    modelType: 'deepseek_v41',
+    expected: { id: 'Velda-40B-A4B-UD-IQ3_XS', base: 'Velda-40B-A4B', variant: 'UD-IQ3_XS', format: 'gguf' },
+  },
+  {
+    covers: 'UD + IQ*_S tag',
+    path: 'velda-40b-a4b-mtp-gguf/Velda-40B-A4B-UD-IQ2_S.gguf',
+    modelType: 'deepseek_v41',
+    expected: { id: 'Velda-40B-A4B-UD-IQ2_S', base: 'Velda-40B-A4B', variant: 'UD-IQ2_S', format: 'gguf' },
+  },
+  {
+    covers: 'UD + IQ*_NL tag',
+    path: 'velda-40b-a4b-mtp-gguf/Velda-40B-A4B-UD-IQ4_NL.gguf',
+    modelType: 'deepseek_v41',
+    expected: { id: 'Velda-40B-A4B-UD-IQ4_NL', base: 'Velda-40B-A4B', variant: 'UD-IQ4_NL', format: 'gguf' },
+  },
+  {
+    covers: 'UD + Q*_K_M tag',
+    path: 'velda-40b-a4b-mtp-gguf/Velda-40B-A4B-UD-Q3_K_M.gguf',
+    modelType: 'deepseek_v41',
+    expected: { id: 'Velda-40B-A4B-UD-Q3_K_M', base: 'Velda-40B-A4B', variant: 'UD-Q3_K_M', format: 'gguf' },
+  },
+  {
+    covers: 'UD + Q*_K_XL tag',
+    path: 'velda-40b-a4b-mtp-gguf/Velda-40B-A4B-UD-Q5_K_XL.gguf',
+    modelType: 'deepseek_v41',
+    expected: { id: 'Velda-40B-A4B-UD-Q5_K_XL', base: 'Velda-40B-A4B', variant: 'UD-Q5_K_XL', format: 'gguf' },
+  },
+  {
+    covers: 'MLX folder in the GGUF spelling: nvfp4 over an fp8 layer, mlx dropped',
+    path: 'Velda-40B-A4B-nvfp4-mlx',
+    modelType: 'deepseek_v41',
+    config: {
+      torch_dtype: 'bfloat16',
+      quantization: { group_size: 16, bits: 4, mode: 'nvfp4', 'model.layers.2.mlp': { bits: 8, mode: 'fp8_e4m3' } },
+    },
+    expected: { id: 'Velda-40B-A4B-nvfp4-mlx', base: 'Velda-40B-A4B', variant: 'NVFP4', format: 'mlx' },
+  },
+  {
+    covers: 'lower-case MLX folder takes the sibling spelling: mxfp8 over an affine layer, mtp dropped',
+    path: 'velda-40b-a4b-mxfp8-mtp',
+    modelType: 'deepseek_v41',
+    config: {
+      torch_dtype: 'bfloat16',
+      quantization: {
+        group_size: 32,
+        bits: 8,
+        mode: 'mxfp8',
+        'model.layers.5.self_attn': { bits: 8, group_size: 64, mode: 'affine' },
+      },
+    },
+    expected: { id: 'velda-40b-a4b-mxfp8-mtp', base: 'Velda-40B-A4B', variant: 'MXFP8', format: 'mlx' },
+  },
+  {
+    covers: 'plain BF16 folder takes the sibling spelling',
+    path: 'velda-40b-a4b',
+    modelType: 'deepseek_v41',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'velda-40b-a4b', base: 'Velda-40B-A4B', variant: 'BF16', format: 'mlx' },
+  },
+  // A GGUF repo with UD files and a plain MLX folder.
+  {
+    covers: 'UD + Q*_K_M, repo without mtp',
+    path: 'tarn-22b-gguf/Tarn-22B-UD-Q4_K_M.gguf',
+    modelType: 'qwen3',
+    expected: { id: 'Tarn-22B-UD-Q4_K_M', base: 'Tarn-22B', variant: 'UD-Q4_K_M', format: 'gguf' },
+  },
+  {
+    covers: 'UD + Q*_K_XL in a base of three',
+    path: 'tarn-22b-gguf/Tarn-22B-UD-Q6_K_XL.gguf',
+    modelType: 'qwen3',
+    expected: { id: 'Tarn-22B-UD-Q6_K_XL', base: 'Tarn-22B', variant: 'UD-Q6_K_XL', format: 'gguf' },
+  },
+  {
+    covers: 'Q*_1 tag',
+    path: 'tarn-22b-gguf/Tarn-22B-Q5_1.gguf',
+    modelType: 'qwen3',
+    expected: { id: 'Tarn-22B-Q5_1', base: 'Tarn-22B', variant: 'Q5_1', format: 'gguf' },
+  },
+  {
+    covers: 'plain BF16 folder joins the GGUF base',
+    path: 'tarn-22b',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'tarn-22b', base: 'Tarn-22B', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'UD + Q*_K_XL in a base of two',
+    path: 'okapi-mini-14b-gguf/Okapi-Mini-14B-UD-Q3_K_XL.gguf',
+    modelType: 'qwen3',
+    expected: { id: 'Okapi-Mini-14B-UD-Q3_K_XL', base: 'Okapi-Mini-14B', variant: 'UD-Q3_K_XL', format: 'gguf' },
+  },
+  {
+    covers: 'plain folder is the second build of a GGUF base',
+    path: 'okapi-mini-14b',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'okapi-mini-14b', base: 'Okapi-Mini-14B', variant: 'BF16', format: 'mlx' },
+  },
+  // A repo folder that adds only an active-parameter word names the base.
+  {
+    covers: 'repo adds a2b: the repo base wins',
+    path: 'brisk-18b-a2b-gguf/Brisk-18B-Q5_K_M.gguf',
+    modelType: 'deepseek_v41',
+    expected: { id: 'Brisk-18B-Q5_K_M', base: 'brisk-18b-a2b', variant: 'Q5_K_M', format: 'gguf' },
+  },
+  {
+    covers: 'plain folder equal to that repo base',
+    path: 'brisk-18b-a2b',
+    modelType: 'deepseek_v41',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'brisk-18b-a2b', base: 'brisk-18b-a2b', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'repo adds a word that is not active parameters: own base is the id',
+    path: 'teal-9b-chat-gguf/Teal-9B-Q4_K_M.gguf',
+    modelType: 'qwen3',
+    expected: { id: 'Teal-9B-Q4_K_M', base: 'Teal-9B-Q4_K_M', variant: 'Q4_K_M', format: 'gguf' },
+  },
+  // A repo folder that is the start of longer file names; untagged files join by case.
+  {
+    covers: 'repo is a prefix of the file base, Q*_K_M',
+    path: 'lumen-12b-gguf/Lumen-12B-Spark-Q5_K_M.gguf',
+    modelType: 'lfm2',
+    expected: { id: 'Lumen-12B-Spark-Q5_K_M', base: 'Lumen-12B-Spark', variant: 'Q5_K_M', format: 'gguf' },
+  },
+  {
+    covers: 'untagged file in another case than the repo: label GGUF, sibling spelling',
+    path: 'lumen-12b-gguf/Lumen-12b-spark.gguf',
+    modelType: 'lfm2',
+    expected: { id: 'Lumen-12b-spark', base: 'Lumen-12B-Spark', variant: 'GGUF', format: 'gguf' },
+  },
+  {
+    covers: 'repo is a prefix of the file base, Q*_K_XL',
+    path: 'lumen-12b-gguf/Lumen-12B-Wide-Q3_K_XL.gguf',
+    modelType: 'lfm2',
+    expected: { id: 'Lumen-12B-Wide-Q3_K_XL', base: 'Lumen-12B-Wide', variant: 'Q3_K_XL', format: 'gguf' },
+  },
+  {
+    covers: 'untagged lower-case file: label GGUF, sibling spelling',
+    path: 'lumen-12b-gguf/lumen-12b-wide.gguf',
+    modelType: 'lfm2',
+    expected: { id: 'lumen-12b-wide', base: 'Lumen-12B-Wide', variant: 'GGUF', format: 'gguf' },
+  },
+  {
+    covers: 'MLX folder named like the repo: a base of its own, not the longer file bases',
+    path: 'lumen-12b',
+    modelType: 'lfm2',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'lumen-12b', base: 'lumen-12b', variant: 'BF16', format: 'mlx' },
+  },
+  // Single GGUF repos.
+  {
+    covers: 'PQ tag',
+    path: 'quill-7b-gguf/Quill-7B-PQ2_0.gguf',
+    modelType: 'qwen3',
+    expected: { id: 'Quill-7B-PQ2_0', base: 'Quill-7B', variant: 'PQ2_0', format: 'gguf' },
+  },
+  {
+    covers: 'lower-case Q*_0 tag in the file and in the repo',
+    path: 'nimbus-6b-q4_0-gguf/nimbus-6b-q4_0.gguf',
+    modelType: 'gemma4',
+    expected: { id: 'nimbus-6b-q4_0', base: 'nimbus-6b', variant: 'Q4_0', format: 'gguf' },
+  },
+  {
+    covers: 'split set in a variant folder: the id loses the shard suffix',
+    path: 'corvid-70b-gguf/UD-Q3_K_XL/Corvid-70B-UD-Q3_K_XL-00001-of-00003.gguf',
+    modelType: 'deepseek_v41',
+    expected: { id: 'Corvid-70B-UD-Q3_K_XL', base: 'Corvid-70B', variant: 'UD-Q3_K_XL', format: 'gguf' },
+  },
+  {
+    covers: 'loose file in the models root, Q*_K_S tag',
+    path: 'Plover-3B-Q4_K_S.gguf',
+    modelType: 'qwen3',
+    expected: { id: 'Plover-3B-Q4_K_S', base: 'Plover-3B', variant: 'Q4_K_S', format: 'gguf' },
+  },
+  {
+    covers: 'tag-only split file: the variant folder names the model after the repo',
+    path: 'rook-pack/Rook-2B/Q6_K-00001-of-00002.gguf',
+    modelType: 'qwen3',
+    expected: { id: 'rook-pack-Rook-2B-Q6_K', base: 'rook-pack-Rook-2B', variant: 'Q6_K', format: 'gguf' },
+  },
+  {
+    covers: 'generic file name in a repo that names another model: own base is the id',
+    path: 'shrike-7b-gguf/model-Q8_0.gguf',
+    modelType: 'qwen3',
+    expected: { id: 'model-Q8_0', base: 'model-Q8_0', variant: 'Q8_0', format: 'gguf' },
+  },
+  // A non-chat family with GGUF and MLX builds in one base.
+  {
+    covers: 'Q*_0 tag, repo base equal by case',
+    path: 'pell-gguf/Pell-Q8_0.gguf',
+    modelType: 'harrier',
+    expected: { id: 'Pell-Q8_0', base: 'Pell', variant: 'Q8_0', format: 'gguf' },
+  },
+  {
+    covers: 'Q*_K_M tag',
+    path: 'pell-gguf/Pell-Q4_K_M.gguf',
+    modelType: 'harrier',
+    expected: { id: 'Pell-Q4_K_M', base: 'Pell', variant: 'Q4_K_M', format: 'gguf' },
+  },
+  {
+    covers: 'plain folder takes the GGUF spelling',
+    path: 'pell',
+    modelType: 'harrier',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'pell', base: 'Pell', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'sym8 quantization',
+    path: 'pell-sym8',
+    modelType: 'harrier',
+    config: { torch_dtype: 'bfloat16', quantization: { bits: 8, mode: 'sym8' } },
+    expected: { id: 'pell-sym8', base: 'Pell', variant: 'SYM8', format: 'mlx' },
+  },
+  // A sibling family whose name starts with the one above: a base of its own with the same labels.
+  {
+    covers: 'Q*_0 tag in a family whose name extends another family',
+    path: 'pell-lite-gguf/Pell-Lite-Q8_0.gguf',
+    modelType: 'harrier',
+    expected: { id: 'Pell-Lite-Q8_0', base: 'Pell-Lite', variant: 'Q8_0', format: 'gguf' },
+  },
+  {
+    covers: 'plain folder of that family takes its GGUF spelling',
+    path: 'pell-lite',
+    modelType: 'harrier',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'pell-lite', base: 'Pell-Lite', variant: 'BF16', format: 'mlx' },
+  },
+  // Equal BF16 labels in one base: the plain folder keeps the label, the others carry their id.
+  {
+    covers: 'plain folder keeps the tied label',
+    path: 'sorrel-2b-chat',
+    modelType: 'gemma4',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'sorrel-2b-chat', base: 'sorrel-2b-chat', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'lower-case 4bit tag agrees with an affine quantization',
+    path: 'sorrel-2b-chat-4bit',
+    modelType: 'gemma4',
+    config: { torch_dtype: 'bfloat16', quantization: { group_size: 64, bits: 4, mode: 'affine' } },
+    expected: { id: 'sorrel-2b-chat-4bit', base: 'sorrel-2b-chat', variant: '4-bit', format: 'mlx' },
+  },
+  {
+    covers: 'mlx dropped, tied BF16',
+    path: 'sorrel-2b-chat-mlx',
+    modelType: 'gemma4',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'sorrel-2b-chat-mlx', base: 'sorrel-2b-chat', variant: 'BF16 (sorrel-2b-chat-mlx)', format: 'mlx' },
+  },
+  {
+    covers: 'bf16 name tag with no quantization, tied BF16',
+    path: 'sorrel-2b-chat-bf16',
+    modelType: 'gemma4',
+    config: { torch_dtype: 'bfloat16' },
+    expected: {
+      id: 'sorrel-2b-chat-bf16',
+      base: 'sorrel-2b-chat',
+      variant: 'BF16 (sorrel-2b-chat-bf16)',
+      format: 'mlx',
+    },
+  },
+  {
+    covers: 'unsloth qualifier, affine range from the top level up',
+    path: 'sorrel-2b-chat-unsloth',
+    modelType: 'gemma4',
+    config: {
+      torch_dtype: 'bfloat16',
+      quantization: {
+        bits: 2,
+        group_size: 64,
+        mode: 'affine',
+        'model.layers.0.mlp': { bits: 4, group_size: 64, mode: 'affine' },
+        'model.layers.1.mlp': { bits: 3, group_size: 64, mode: 'affine' },
+      },
+    },
+    expected: { id: 'sorrel-2b-chat-unsloth', base: 'sorrel-2b-chat', variant: '2–4-bit Unsloth', format: 'mlx' },
+  },
+  {
+    covers: 'base of two: plain folder keeps the tied label',
+    path: 'ember-3b',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'ember-3b', base: 'ember-3b', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'base of two: mlx-bf16 folder carries its id',
+    path: 'ember-3b-mlx-bf16',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'ember-3b-mlx-bf16', base: 'ember-3b', variant: 'BF16 (ember-3b-mlx-bf16)', format: 'mlx' },
+  },
+  {
+    covers: 'base of two: plain folder keeps the tied label',
+    path: 'dune-1b',
+    modelType: 'lfm2',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'dune-1b', base: 'dune-1b', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'base of two: mlx folder carries its id',
+    path: 'dune-1b-mlx',
+    modelType: 'lfm2',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'dune-1b-mlx', base: 'dune-1b', variant: 'BF16 (dune-1b-mlx)', format: 'mlx' },
+  },
+  {
+    covers: 'thinking stays in the base: another model beside the base of two',
+    path: 'dune-1b-thinking',
+    modelType: 'lfm2',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'dune-1b-thinking', base: 'dune-1b-thinking', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'upper-case folder spells the base and carries its id',
+    path: 'Finch-1B-mlx',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'Finch-1B-mlx', base: 'Finch-1B', variant: 'BF16 (Finch-1B-mlx)', format: 'mlx' },
+  },
+  {
+    covers: 'lower-case plain folder keeps the tied label',
+    path: 'finch-1b',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'finch-1b', base: 'Finch-1B', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'lower-case mlx-bf16 folder carries its id',
+    path: 'finch-1b-mlx-bf16',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'finch-1b-mlx-bf16', base: 'Finch-1B', variant: 'BF16 (finch-1b-mlx-bf16)', format: 'mlx' },
+  },
+  // Words the rule keeps in the base (it, qat): each one names another model than the folder without it.
+  {
+    covers: 'plain folder beside the same name plus it',
+    path: 'wren-3b',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'wren-3b', base: 'wren-3b', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'it stays in the base; plain folder keeps the label tied in a base of three',
+    path: 'wren-3b-it',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'wren-3b-it', base: 'wren-3b-it', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'mlx dropped after it, tied BF16 pair in a base of three',
+    path: 'wren-3b-it-mlx',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'wren-3b-it-mlx', base: 'wren-3b-it', variant: 'BF16 (wren-3b-it-mlx)', format: 'mlx' },
+  },
+  {
+    covers: '8bit tag after it agrees with an affine quantization',
+    path: 'wren-3b-it-8bit',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16', quantization: { group_size: 32, bits: 8, mode: 'affine' } },
+    expected: { id: 'wren-3b-it-8bit', base: 'wren-3b-it', variant: '8-bit', format: 'mlx' },
+  },
+  {
+    covers: 'plain folder beside the same name plus qat',
+    path: 'marl-1b-lite',
+    modelType: 'gemma4',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'marl-1b-lite', base: 'marl-1b-lite', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'qat stays in the base; gemma quantization_config',
+    path: 'marl-1b-lite-qat',
+    modelType: 'gemma4',
+    config: { torch_dtype: 'bfloat16', quantization_config: { num_bits: 8, quant_method: 'gemma' } },
+    expected: { id: 'marl-1b-lite-qat', base: 'marl-1b-lite-qat', variant: '8-bit', format: 'mlx' },
+  },
+  {
+    covers: 'affine range beats the bf16 name tag after qat',
+    path: 'marl-1b-lite-qat-mlx-bf16',
+    modelType: 'gemma4',
+    config: {
+      torch_dtype: 'bfloat16',
+      quantization: {
+        group_size: 64,
+        bits: 4,
+        mode: 'affine',
+        'model.layers.1.self_attn': { bits: 4, group_size: 64, mode: 'affine' },
+        'model.layers.5.mlp': { bits: 3, group_size: 64, mode: 'affine' },
+      },
+    },
+    expected: { id: 'marl-1b-lite-qat-mlx-bf16', base: 'marl-1b-lite-qat', variant: '3–4-bit', format: 'mlx' },
+  },
+  {
+    covers: 'plain folder keeps the label tied with a bf16 folder in a base of three',
+    path: 'fallow-4b',
+    modelType: 'lfm2',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'fallow-4b', base: 'fallow-4b', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'bf16 name tag with no quantization carries its id',
+    path: 'fallow-4b-bf16',
+    modelType: 'lfm2',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'fallow-4b-bf16', base: 'fallow-4b', variant: 'BF16 (fallow-4b-bf16)', format: 'mlx' },
+  },
+  {
+    covers: '6bit tag agrees with an affine quantization',
+    path: 'fallow-4b-6bit',
+    modelType: 'lfm2',
+    config: { torch_dtype: 'bfloat16', quantization: { group_size: 64, bits: 6, mode: 'affine' } },
+    expected: { id: 'fallow-4b-6bit', base: 'fallow-4b', variant: '6-bit', format: 'mlx' },
+  },
+  // Config labels of MLX folders.
+  {
+    covers: 'mlx-bf16 folder alone',
+    path: 'stoat-5b-mlx-bf16',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'stoat-5b-mlx-bf16', base: 'stoat-5b', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'compressed-tensors float-quantized',
+    path: 'garnet-3b-fp8',
+    modelType: 'lfm2',
+    config: {
+      torch_dtype: 'bfloat16',
+      quantization_config: { quant_method: 'compressed-tensors', format: 'float-quantized', ignore: ['lm_head'] },
+    },
+    expected: { id: 'garnet-3b-fp8', base: 'garnet-3b', variant: 'FP8', format: 'mlx' },
+  },
+  {
+    covers: 'plain folder of a base of two',
+    path: 'linden-11b',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'linden-11b', base: 'linden-11b', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'mxfp4 top level over an affine layer',
+    path: 'linden-11b-mxfp4-mlx',
+    modelType: 'qwen3',
+    config: {
+      torch_dtype: 'bfloat16',
+      quantization: {
+        group_size: 32,
+        bits: 4,
+        mode: 'mxfp4',
+        'model.layers.9.self_attn': { bits: 6, group_size: 32, mode: 'affine' },
+      },
+    },
+    expected: { id: 'linden-11b-mxfp4-mlx', base: 'linden-11b', variant: 'MXFP4', format: 'mlx' },
+  },
+  {
+    covers: 'affine top level with fewer bits: the fewest-bit layer mode wins',
+    path: 'kestrel-5b-mxfp4-mlx',
+    modelType: 'qwen3',
+    config: {
+      torch_dtype: 'bfloat16',
+      quantization: {
+        group_size: 32,
+        bits: 2,
+        mode: 'affine',
+        'model.layers.2.self_attn': { bits: 8, group_size: 32, mode: 'mxfp8' },
+        'model.layers.6.mlp': { bits: 4, group_size: 32, mode: 'mxfp4' },
+      },
+    },
+    expected: { id: 'kestrel-5b-mxfp4-mlx', base: 'kestrel-5b', variant: 'MXFP4', format: 'mlx' },
+  },
+  {
+    covers: 'nvfp4 top level over affine layers, mtp dropped',
+    path: 'kestrel-5b-nvfp4-mtp',
+    modelType: 'qwen3',
+    config: {
+      torch_dtype: 'bfloat16',
+      quantization: {
+        group_size: 16,
+        bits: 4,
+        mode: 'nvfp4',
+        'model.layers.0.mlp': { bits: 6, group_size: 64, mode: 'affine' },
+        'model.layers.2.mlp': { bits: 8, group_size: 64, mode: 'affine' },
+      },
+    },
+    expected: { id: 'kestrel-5b-nvfp4-mtp', base: 'kestrel-5b', variant: 'NVFP4', format: 'mlx' },
+  },
+  {
+    covers: 'plain folder of a base of two',
+    path: 'moss-12b',
+    modelType: 'lfm2',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'moss-12b', base: 'moss-12b', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'k-quant modes: the fewest-bit layer wins over the top level',
+    path: 'moss-12b-q4k',
+    modelType: 'lfm2',
+    config: {
+      torch_dtype: 'bfloat16',
+      quantization: {
+        bits: 5,
+        group_size: 32,
+        mode: 'q5k',
+        'model.layers.3.self_attn': { bits: 6, group_size: 32, mode: 'q6k' },
+        'model.layers.7.mlp': { bits: 4, group_size: 32, mode: 'q4k' },
+      },
+    },
+    expected: { id: 'moss-12b-q4k', base: 'moss-12b', variant: 'Q4K', format: 'mlx' },
+  },
+  {
+    covers: 'plain folder beside two unsloth builds',
+    path: 'heron-6b',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'heron-6b', base: 'heron-6b', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'unsloth + mxfp4: equal bits, the top level wins',
+    path: 'heron-6b-unsloth-mxfp4-mlx',
+    modelType: 'qwen3',
+    config: {
+      torch_dtype: 'bfloat16',
+      quantization: {
+        group_size: 32,
+        bits: 4,
+        mode: 'mxfp4',
+        'model.layers.0.mlp': { bits: 4, group_size: 32, mode: 'mxfp4' },
+        'model.layers.6.mlp': { bits: 8, group_size: 32, mode: 'mxfp8' },
+      },
+    },
+    expected: { id: 'heron-6b-unsloth-mxfp4-mlx', base: 'heron-6b', variant: 'MXFP4 Unsloth', format: 'mlx' },
+  },
+  {
+    covers: 'unsloth + nvfp4 over an fp8 layer',
+    path: 'heron-6b-unsloth-nvfp4-mlx',
+    modelType: 'qwen3',
+    config: {
+      torch_dtype: 'bfloat16',
+      quantization: { group_size: 16, bits: 4, mode: 'nvfp4', 'model.layers.1.mlp': { bits: 8, mode: 'fp8_e4m3' } },
+    },
+    expected: { id: 'heron-6b-unsloth-nvfp4-mlx', base: 'heron-6b', variant: 'NVFP4 Unsloth', format: 'mlx' },
+  },
+  {
+    covers: 'foreign quantization_config the rule does not read: the name tag',
+    path: 'ivory-20b-nvfp4',
+    modelType: 'deepseek_v41',
+    config: { torch_dtype: 'bfloat16', quantization_config: { quant_method: 'modelopt', quant_algo: 'NVFP4' } },
+    expected: { id: 'ivory-20b-nvfp4', base: 'ivory-20b', variant: 'NVFP4', format: 'mlx' },
+  },
+  {
+    covers: 'nvfp4 top level over an affine layer, alone',
+    path: 'jasper-16b-nvfp4-mlx',
+    modelType: 'deepseek_v41',
+    config: {
+      torch_dtype: 'bfloat16',
+      quantization: {
+        group_size: 16,
+        bits: 4,
+        mode: 'nvfp4',
+        'model.layers.0.mixer': { bits: 8, group_size: 32, mode: 'affine' },
+      },
+    },
+    expected: { id: 'jasper-16b-nvfp4-mlx', base: 'jasper-16b', variant: 'NVFP4', format: 'mlx' },
+  },
+  {
+    covers: 'plain folder alone',
+    path: 'nettle-2b',
+    modelType: 'gemma4',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'nettle-2b', base: 'nettle-2b', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'MLX folder whose name says gguf keeps the whole name',
+    path: 'oriole-8b-gguf',
+    modelType: 'gemma4',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'oriole-8b-gguf', base: 'oriole-8b-gguf', variant: 'BF16', format: 'mlx' },
+  },
+  {
+    covers: 'plain folder of the same words without gguf: a base of its own',
+    path: 'oriole-8b',
+    modelType: 'gemma4',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'oriole-8b', base: 'oriole-8b', variant: 'BF16', format: 'mlx' },
+  },
+  // Two model types under one base: each becomes its own base.
+  {
+    covers: 'MLX side of a mixed-type key',
+    path: 'umber-1b',
+    modelType: 'qwen3',
+    config: { torch_dtype: 'bfloat16' },
+    expected: { id: 'umber-1b', base: 'umber-1b', variant: 'MLX', format: 'mlx' },
+  },
+  {
+    covers: 'GGUF side of a mixed-type key',
+    path: 'umber-1b-gguf/Umber-1B-Q4_K_M.gguf',
+    modelType: 'gemma4',
+    expected: { id: 'Umber-1B-Q4_K_M', base: 'Umber-1B-Q4_K_M', variant: 'GGUF', format: 'gguf' },
+  },
+];

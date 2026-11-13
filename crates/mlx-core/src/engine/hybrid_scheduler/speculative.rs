@@ -798,6 +798,7 @@ pub(super) mod tests {
             requested_tokens,
             claim: None,
             cell: None,
+            prefill_state: None,
             clock: Default::default(),
         };
         let mut turn = TurnState::new(seq, prompt, 0, Vec::new(), Some(cancel), payload).unwrap();

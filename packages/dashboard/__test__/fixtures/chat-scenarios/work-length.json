@@ -1,0 +1,72 @@
+{
+  "persist": true,
+  "initialize": {
+    "protocolVersion": 1,
+    "loadSession": true,
+    "pluginDirs": true,
+    "agentVersion": "1.0.45",
+    "models": [
+      {
+        "modelId": "qwen3.5-4b",
+        "totalContextTokens": 32768
+      },
+      {
+        "modelId": "qwen3.5-9b",
+        "totalContextTokens": 65536
+      }
+    ]
+  },
+  "session": {
+    "agentName": "grok-build-plan",
+    "toolDefinitionsCount": 20,
+    "skills": 1,
+    "mcpServers": 0,
+    "apiBackend": "Messages",
+    "mcpReadyAfterMs": 70,
+    "modelChangedOnNewAndLoad": true,
+    "replayOnLoad": true
+  },
+  "prompts": [
+    {
+      "match": "continue",
+      "steps": [
+        {
+          "tool": {
+            "toolName": "read_file",
+            "kind": "read",
+            "title": "Read a.txt",
+            "output": "x"
+          }
+        },
+        {
+          "text": "Done.",
+          "chunk": 5
+        },
+        {
+          "turnCompleted": {
+            "inputTokens": 120,
+            "outputTokens": 40
+          }
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    },
+    {
+      "match": "",
+      "steps": [
+        {
+          "thought": "Let me think about this.",
+          "chunk": 8
+        },
+        {
+          "lengthError": {}
+        }
+      ]
+    }
+  ],
+  "faults": {}
+}

@@ -7,6 +7,9 @@
 
 mod speculative;
 
+#[cfg(all(test, target_os = "macos"))]
+mod lane_wave_tests;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -162,7 +165,6 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         Self: 'a;
 
     const SCHEDULER_NAME: &'static str;
-    const ENABLED_BY_DEFAULT: bool = true;
     const CANCEL_PRECEDES_EOS: bool = false;
     const STREAM_EOS_TOKEN: bool = false;
 
@@ -287,6 +289,18 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn scheduler_prefill_slice_tokens(&self) -> u32 {
         scheduler_long_prefill_tokens()
     }
+    /// Every prefill slice end of `seq`'s prompt (`prompt_tokens`,
+    /// `cached_prefix` of them cached) when the family fixes them itself:
+    /// ascending, past `cached_prefix`, the last at `prompt_tokens`. They
+    /// replace the slice grid walked from the cached prefix.
+    fn scheduler_prefill_ends(
+        &self,
+        _seq_id: SeqId,
+        _prompt_tokens: u32,
+        _cached_prefix: u32,
+    ) -> Option<Vec<u32>> {
+        None
+    }
     /// The turn books its prompt plus one block and grows KV per step; a
     /// blocked step reclaims, then preempts, and a lone blocked row fails.
     /// Otherwise the whole turn is booked at admission.
@@ -409,6 +423,16 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn reclaim_for_scheduled_state(&mut self, _shortfall: u64) -> bool {
         false
     }
+    /// State a turn's prefill may allocate outside every claim and keep to
+    /// its turn end (refused GDN ladder rungs); its admission reserves it,
+    /// when the ledger has the room, until the prefill has run.
+    fn scheduled_unclaimed_prefill_bytes(&self) -> u64 {
+        0
+    }
+    /// Whether the sequence of the prefill slice about to run holds
+    /// [`Self::scheduled_unclaimed_prefill_bytes`]' reservation; without it
+    /// the model keeps none of that state.
+    fn book_unclaimed_prefill_state(&mut self, _booked: bool) {}
     /// Off-pool state this turn adds beside what the family already holds.
     fn scheduled_state_candidate_bytes(
         &self,
@@ -580,12 +604,6 @@ fn configured_scheduler_capacity(physical_capacity: usize) -> usize {
 
 pub(crate) fn scheduler_max_num_seqs_for(physical_capacity: usize) -> usize {
     configured_scheduler_capacity(physical_capacity)
-}
-
-/// Public Qwen3.5 capacity query. The hybrid GDN row store has two live units;
-/// other families pass their own physical capacity to the same engine policy.
-pub(crate) fn scheduler_max_num_seqs() -> usize {
-    configured_scheduler_capacity(crate::engine::recurrent_state::HYBRID_LIVE_STATE_UNITS)
 }
 
 fn scheduler_long_prefill_tokens() -> u32 {
@@ -1074,6 +1092,9 @@ pub(crate) struct ScheduledTurn<P> {
     /// The GDN cell its admission reserved, held until its first step ran
     /// (the cell's arrays are allocated lazily).
     pub(crate) cell: Option<Reservation<'static>>,
+    /// [`HybridSchedulerBackend::scheduled_unclaimed_prefill_bytes`] its
+    /// admission reserved, held until its last prefill slice ran.
+    pub(crate) prefill_state: Option<Reservation<'static>>,
     pub(crate) clock: TurnClock,
 }
 
@@ -1370,7 +1391,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             .map_or(turn.payload.prompt_tokens.as_slice(), |replay| {
                 replay.tokens.as_slice()
             });
-        let logits = match self.inner.run_scheduled_prefill_slice(
+        self.inner
+            .book_unclaimed_prefill_state(turn.payload.prefill_state.is_some());
+        let sliced = self.inner.run_scheduled_prefill_slice(
             row.seq_id,
             source,
             &turn.payload.prefix,
@@ -1378,7 +1401,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             end,
             turn.payload.generation_stream,
             first_chunk,
-        ) {
+        );
+        self.inner.book_unclaimed_prefill_state(true);
+        let logits = match sliced {
             Ok(logits) => logits,
             Err(error) if is_paged_allocation_blocked(&error.reason) => {
                 turn.payload.profiler.end_prefill();
@@ -1396,6 +1421,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             }
         };
         turn.payload.profiler.end_prefill();
+        if end >= source_len {
+            turn.payload.prefill_state = None;
+        }
         if end < source_len {
             if let Err(error) =
                 crate::array::memory::synchronize_and_clear_cache_checked("scheduled_prefill_slice")
@@ -2283,11 +2311,20 @@ fn row_work_end<P>(row: &engine::scheduler::StepRow, turn: &TurnState<P>) -> u32
 /// one whole-prompt step (then the grid is the one end `prompt`).
 fn prefill_breaks<B: HybridSchedulerBackend>(
     inner: &B,
+    seq_id: SeqId,
     cached_prefix: u32,
     prompt_tokens: u32,
     extra_breaks: Vec<u32>,
 ) -> (Vec<u32>, bool) {
     let whole = inner.scheduler_whole_prompt_prefill(prompt_tokens, cached_prefix);
+    if !whole
+        && let Some(ends) = inner.scheduler_prefill_ends(seq_id, prompt_tokens, cached_prefix)
+        && ends.last() == Some(&prompt_tokens)
+        && ends.first().is_some_and(|&end| end > cached_prefix)
+        && ends.windows(2).all(|pair| pair[0] < pair[1])
+    {
+        return (ends, false);
+    }
     let slice = if whole {
         u32::MAX
     } else {
@@ -2300,21 +2337,8 @@ fn prefill_breaks<B: HybridSchedulerBackend>(
 }
 
 impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
-    pub(crate) fn continuous_batching_enabled() -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("MLX_CONTINUOUS_BATCHING").is_ok_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-        })
-    }
-
     pub(crate) fn new(inner: B) -> Result<Self> {
-        let enabled = inner.scheduler_cache_available()
-            && (B::ENABLED_BY_DEFAULT || Self::continuous_batching_enabled());
+        let enabled = inner.scheduler_cache_available();
         let max_num_seqs = configured_scheduler_capacity(inner.scheduler_capacity());
         let mut scheduler =
             Scheduler::new(max_num_seqs, PREFILL_CHUNK_ROWS).map_err(Error::from_reason)?;
@@ -2979,7 +3003,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         true
     }
 
-    /// Keep the two-unit residency cap as a queueing boundary. An idle warm
+    /// Keep the live-unit residency cap as a queueing boundary. An idle warm
     /// row may be discarded because its owner history can rebuild the exact
     /// GDN state through the ordinary prefix-prime path; a scheduler-owned row
     /// is never evicted here.
@@ -3373,6 +3397,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         // A lane vacated before its first step drops its admission's cell
         // bytes: its resume reserves them again.
         turn.payload.cell = None;
+        turn.payload.prefill_state = None;
         turn.resume_target = target;
         defer_resource_retry(
             &mut turn.resource_wait,
@@ -3573,6 +3598,31 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     ) -> ClaimRef<'static> {
         slot.get_or_insert_with(|| governor.open(spec, model))
             .claim()
+    }
+
+    /// The turn's [`HybridSchedulerBackend::scheduled_unclaimed_prefill_bytes`]
+    /// when the ledger has the room now: an Optional claim of `request` that
+    /// neither waits, reclaims nor fails the turn, which without it keeps
+    /// none of that state.
+    fn reserve_unclaimed_prefill_state(
+        &self,
+        request: Option<ClaimRef<'static>>,
+    ) -> Option<Reservation<'static>> {
+        let bytes = self.inner.scheduled_unclaimed_prefill_bytes();
+        let request = request.filter(|_| bytes > 0)?;
+        let governor = request.governor;
+        let spec = governor.spec(request.id)?;
+        let claim = governor.open(
+            ClaimSpec {
+                cls: ClaimClass::Optional,
+                reach: ReachClass::Ordinary,
+                timing: NeedTiming::Immediate,
+                ..spec
+            },
+            self.inner.memory_model(),
+        );
+        let _scope = Scope::enter(claim.claim());
+        governor.try_reserve(bytes).ok()
     }
 
     /// Splash `Engine::admit`'s state claim: the GDN cell `seq_id`
@@ -4865,8 +4915,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 0
             },
         );
+        let ledger = self.judge_policy() == JudgePolicy::Ledger;
+        // On the ledger the state is claimed from the governor beside the
+        // pool, so only the KV blocks must fit the max pool.
+        let pool_state_bytes = if ledger { 0 } else { candidate_state_bytes };
         if cache_snapshot.as_ref().is_some_and(|snapshot| {
-            exceeds_max_pool_ceiling(snapshot, prepared.reservation_blocks, candidate_state_bytes)
+            exceeds_max_pool_ceiling(snapshot, prepared.reservation_blocks, pool_state_bytes)
         }) {
             self.cleanup_rejected_prepared(&prepared);
             let max_total_blocks = cache_snapshot.map_or(0, |snapshot| snapshot.max_total_blocks);
@@ -4876,11 +4930,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             );
             return Ok(None);
         }
-        let ledger = self.judge_policy() == JudgePolicy::Ledger;
         let mut cell = None;
+        let mut prefill_state = None;
         if ledger {
             match self.admit_claimed(&mut prepared) {
-                Admitted::Granted(reservation) => cell = reservation,
+                Admitted::Granted(reservation) => {
+                    cell = reservation;
+                    prefill_state = self.reserve_unclaimed_prefill_state(
+                        prepared.claim.as_ref().map(ClaimHandle::claim),
+                    );
+                }
                 Admitted::Wait => return Err(prepared),
                 Admitted::Fail(error) => {
                     self.cleanup_rejected_prepared(&prepared);
@@ -5156,6 +5215,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             requested_tokens,
             claim,
             cell,
+            prefill_state,
             clock: TurnClock {
                 ttft,
                 ..TurnClock::default()
@@ -5165,7 +5225,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let cached_prefix = payload.prefix.effective_cached_prefix_len() as u32;
         let extra_breaks = self.inner.extra_prefill_breaks(prompt_len, cached_prefix);
         let (breaks, whole_prompt_prefill) =
-            prefill_breaks(&self.inner, cached_prefix, prompt_len, extra_breaks);
+            prefill_breaks(&self.inner, seq_id, cached_prefix, prompt_len, extra_breaks);
         let turn_cancelled = Arc::clone(&cancelled);
         let draft_allowance = if payload.scheduled_speculation.is_some() {
             payload.params.mtp_depth as u32
@@ -5362,6 +5422,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                         .set_prompt_tokens(restored.profiler_prefill_tokens);
                     (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) = prefill_breaks(
                         &self.inner,
+                        seq_id,
                         turn.num_computed_tokens,
                         turn.prompt_tokens,
                         restored.extra_prefill_breaks,
@@ -5406,7 +5467,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         ) {
             Ok(replay) => {
                 (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) =
-                    prefill_breaks(&self.inner, 0, turn.prompt_tokens, Vec::new());
+                    prefill_breaks(&self.inner, turn.seq_id, 0, turn.prompt_tokens, Vec::new());
                 replay
             }
             Err(error) => {
@@ -5689,6 +5750,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             governor.lane_resumed(self.inner.memory_model());
             turn.resume_target = 0;
             turn.payload.cell = cell;
+            turn.payload.prefill_state = self.reserve_unclaimed_prefill_state(
+                turn.payload.claim.as_ref().map(ClaimHandle::claim),
+            );
             self.admissions = self.admissions.saturating_add(1);
             turn.admission = self.admissions;
         }
@@ -5701,8 +5765,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let extra_breaks = self
             .inner
             .extra_prefill_breaks(target, turn.num_computed_tokens);
-        (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) =
-            prefill_breaks(&self.inner, turn.num_computed_tokens, target, extra_breaks);
+        (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) = prefill_breaks(
+            &self.inner,
+            turn.seq_id,
+            turn.num_computed_tokens,
+            target,
+            extra_breaks,
+        );
         let Some(replay) = turn.payload.preemption_replay.as_mut() else {
             self.fail_preempted(
                 turn,
@@ -6373,12 +6442,79 @@ pub(crate) mod tests {
         assert_eq!(moe_state.scheduler.waiting_len(), 0);
         assert!(
             !dense_state.enabled,
-            "dense Qwen3.5 must keep the generic scheduler opt-in"
+            "a dense load without a paged pool keeps every turn exclusive"
         );
         assert!(
             !moe_state.enabled,
-            "Qwen3.5 MoE must keep the generic scheduler opt-in"
+            "a MoE load without a paged pool keeps every turn exclusive"
         );
+    }
+
+    /// With no env set, a paged dense and a paged MoE load schedule their
+    /// text turns: both schedulers are enabled, the plan offers eight decode
+    /// lanes and both models report the lanes their plan granted.
+    /// `MLX_SERVE_FORCE_SERIAL=1` offers and reports one lane. Each half runs in a child process with its own env,
+    /// so neither the shell's env nor a sibling test decides the result.
+    /// Mutation CB1: `new` leaves `enabled` false → red.
+    #[test]
+    fn paged_dense_and_moe_schedule_without_an_env() {
+        use crate::models::qwen3_5::model::qwen35_max_concurrent_sequences;
+        const CHILD: &str = "MLX_QWEN35_SCHEDULE_DEFAULT_CHILD";
+        const NAME: &str =
+            "engine::hybrid_scheduler::tests::paged_dense_and_moe_schedule_without_an_env";
+        let Some(child) = std::env::var_os(CHILD) else {
+            for (half, serial) in [("default", None), ("serial", Some("1"))] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", NAME])
+                    .env(CHILD, half)
+                    .env_remove("MLX_SCHED_MAX_NUM_SEQS")
+                    .env_remove("MLX_SERVE_FORCE_SERIAL");
+                if let Some(value) = serial {
+                    command.env("MLX_SERVE_FORCE_SERIAL", value);
+                }
+                let output = command.output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("test result: ok. 1 passed"),
+                    "{half}: {stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        if child == "serial" {
+            assert!(HybridSchedulerState::<Qwen35Inner>::force_serial());
+            assert_eq!(qwen35_max_concurrent_sequences(true, 4), 1);
+            assert_eq!(
+                crate::models::qwen3_5::load_plan::qwen35_scheduler_lanes(),
+                1
+            );
+            return;
+        }
+        assert!(!HybridSchedulerState::<Qwen35Inner>::force_serial());
+        assert_eq!(
+            crate::models::qwen3_5::load_plan::qwen35_scheduler_lanes() as usize,
+            crate::models::qwen3_5::load_plan::qwen35_lane_ceiling(
+                crate::utils::host::physical_memory()
+            )
+        );
+        assert_eq!(qwen35_max_concurrent_sequences(true, 8), 8);
+        assert_eq!(qwen35_max_concurrent_sequences(true, 2), 2);
+        assert_eq!(qwen35_max_concurrent_sequences(false, 4), 1);
+        if crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            let recency = Arc::new(mlx_paged_attn::CacheRecency::new());
+            let mut dense = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+            dense.paged_adapter = Some(tiny_paged_adapter_with(Arc::clone(&recency), 4, 16));
+            let mut moe = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE model");
+            moe.paged_adapter = Some(tiny_paged_adapter_with(recency, 4, 16));
+            let dense_state: HybridSchedulerState<Qwen35Inner> =
+                HybridSchedulerState::new(dense).expect("construct dense scheduler");
+            let moe_state: HybridSchedulerState<Qwen35MoeInner> =
+                HybridSchedulerState::new(moe).expect("construct MoE scheduler");
+            assert!(dense_state.enabled, "a paged dense load schedules");
+            assert!(moe_state.enabled, "a paged MoE load schedules");
+        }
     }
 
     #[test]
@@ -6792,24 +6928,24 @@ pub(crate) mod tests {
         let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
         let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
         state.owner_sequences.insert("history-only".into(), 1);
-        state.owner_sequences.insert("resident-a".into(), 2);
-        state.owner_sequences.insert("resident-b".into(), 3);
-        state
-            .inner
-            .activate_scheduled_recurrent(2)
-            .expect("activate resident a");
-        state
-            .inner
-            .activate_scheduled_recurrent(3)
-            .expect("park resident a and activate resident b");
+        for seq in 2..=9u32 {
+            state.owner_sequences.insert(format!("resident-{seq}"), seq);
+            state
+                .inner
+                .activate_scheduled_recurrent(seq)
+                .expect("park the previous resident and activate the next");
+        }
+        assert!(!state.inner.can_activate_scheduled_recurrent(10));
 
-        assert!(state.ensure_recurrent_slot(4));
+        assert!(state.ensure_recurrent_slot(10));
         assert!(
             !state.inner.has_scheduled_recurrent(2),
             "the oldest actual idle resident is evicted"
         );
-        assert!(state.inner.has_scheduled_recurrent(3));
-        assert!(state.inner.can_activate_scheduled_recurrent(4));
+        for seq in 3..=9u32 {
+            assert!(state.inner.has_scheduled_recurrent(seq));
+        }
+        assert!(state.inner.can_activate_scheduled_recurrent(10));
     }
 
     #[test]
@@ -6836,7 +6972,7 @@ pub(crate) mod tests {
         assert!(state.inner.has_scheduled_recurrent(1));
         assert!(
             state.ensure_recurrent_slot(2),
-            "one parked idle row does not fill the two-unit cap"
+            "one parked idle row does not fill the eight-unit cap"
         );
         assert!(
             state.inner.has_scheduled_recurrent(1),
@@ -8622,6 +8758,254 @@ pub(crate) mod tests {
         (Box::new(prepared), result)
     }
 
+    /// Attach a cold tier with the GDN sidecar policy, as a load with
+    /// persistence on does: the model then keeps refused ladder rungs.
+    #[cfg(target_os = "macos")]
+    fn attach_gdn_cold_tier(inner: &mut Qwen35Inner, root: &std::path::Path) {
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.to_path_buf())
+            .expect("temp-dir cold cache must open");
+        let activation =
+            crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&*inner)
+                .expect("activation dtype");
+        let policy = crate::models::qwen3_5::gdn_sidecar::policy(&inner.config, activation)
+            .expect("a GDN sidecar policy");
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("paged adapter")
+            .set_cold_tier(
+                crate::transformer::paged_kv_cache_adapter::ColdTierContext {
+                    manager: Arc::new(manager),
+                    fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
+                        b"unclaimed-prefill-state-test".as_slice(),
+                    ]),
+                    sidecar_policy: Some(policy),
+                },
+            );
+    }
+
+    /// A temp cold-tier root of its own for `name`.
+    #[cfg(target_os = "macos")]
+    fn cold_root(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("mlx-{name}-{}", std::process::id()))
+    }
+
+    /// A Qwen3.5 sequence keeps up to two refused GDN rungs to its turn end
+    /// when the cold tier is on, outside every claim: its admission reserves
+    /// them after its GDN cell, also when its row is live already (no cell).
+    /// The rungs are optional: a budget that holds the cell but not the
+    /// rungs admits the turn without them. Without the cold tier nothing is
+    /// added. Mutation U1: the backend reports no unclaimed prefill state →
+    /// red. Mutation U3: the cell's claim also takes the rungs' bytes → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn admission_reserves_the_refused_rungs_when_it_has_the_room() {
+        use crate::engine::governor::governor::tests::G;
+        let Some((mut state, governor, _io)) = ledger_state(16 * G, 0) else {
+            return;
+        };
+        let cell = state.inner.recurrent_state_bytes();
+        let rungs = crate::models::qwen3_5::gdn_checkpoint_store::refused_rung_bytes(cell);
+        assert_eq!(rungs, 2 * cell);
+        let (prepared, _plain) = prepared_turn(&mut state, 1, tokens_of(1, 1));
+        let turn = state
+            .admit_prepared(prepared)
+            .ok()
+            .flatten()
+            .expect("admitted without a cold tier");
+        assert!(
+            turn.payload.prefill_state.is_none(),
+            "no cold tier, no rungs"
+        );
+        assert_eq!(governor.reserved_bytes(), cell);
+        drop(turn);
+
+        let root = cold_root("admission-rungs");
+        attach_gdn_cold_tier(&mut state.inner, &root);
+        assert_eq!(state.inner.scheduled_unclaimed_prefill_bytes(), rungs);
+        let (prepared, _first) = prepared_turn(&mut state, 2, tokens_of(2, 1));
+        let mut turn = state
+            .admit_prepared(prepared)
+            .ok()
+            .flatten()
+            .expect("admitted");
+        assert!(turn.payload.cell.is_some(), "the cell is reserved");
+        assert!(
+            turn.payload.prefill_state.is_some(),
+            "the rungs are reserved"
+        );
+        assert_eq!(governor.reserved_bytes(), cell + rungs);
+        turn.payload.prefill_state = None;
+        assert_eq!(
+            governor.reserved_bytes(),
+            cell,
+            "the cell outlives the rungs"
+        );
+        drop(turn);
+
+        state
+            .inner
+            .activate_scheduled_recurrent(3)
+            .expect("a live row for sequence 3");
+        let (prepared, _live) = prepared_turn(&mut state, 3, tokens_of(3, 1));
+        let turn = state
+            .admit_prepared(prepared)
+            .ok()
+            .flatten()
+            .expect("admitted on its live row");
+        assert!(turn.payload.cell.is_none(), "the live row takes no cell");
+        assert!(turn.payload.prefill_state.is_some());
+        assert_eq!(governor.reserved_bytes(), rungs);
+        drop(turn);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&root);
+
+        let Some((mut state, governor, _io)) = ledger_state(cell + rungs - 1, 0) else {
+            return;
+        };
+        let root = cold_root("admission-rungs-short");
+        attach_gdn_cold_tier(&mut state.inner, &root);
+        let (prepared, _short) = prepared_turn(&mut state, 1, tokens_of(1, 1));
+        let turn = state
+            .admit_prepared(prepared)
+            .ok()
+            .flatten()
+            .expect("the rungs never refuse a turn");
+        assert!(turn.payload.cell.is_some(), "the cell is reserved");
+        assert!(
+            turn.payload.prefill_state.is_none(),
+            "no room for the rungs: the turn keeps none"
+        );
+        assert_eq!(governor.reserved_bytes(), cell);
+        drop(turn);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A prefill slice of a turn without the rungs' reservation keeps no
+    /// rung its claim refused; with it, the slice keeps the rung for the
+    /// turn-end capture. Mutation B1: the model holds a refused rung
+    /// whatever the booking → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_prefill_keeps_refused_rungs_only_when_booked() {
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use crate::engine::governor::governor::{Scope, whole_turn_spec};
+        use crate::engine::governor::host::Pressure;
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(8109);
+        let root = cold_root("booked-rungs");
+        attach_gdn_cold_tier(&mut inner, &root);
+        let refusing: &'static Governor = Box::leak(Box::new(Governor::new(FakeIo::new(
+            stats(0),
+            host(0, Pressure::Normal),
+        ))));
+        inner.memory_registration =
+            Some(refusing.register_model(model(16 * G, 0)).expect("register"));
+        let lender: &'static Governor = Box::leak(Box::new(Governor::new(FakeIo::new(
+            stats(0),
+            host(32 * G, Pressure::Normal),
+        ))));
+        let _lender = lender.register_model(model(16 * G, 0)).expect("register");
+        let claim = lender.open(whole_turn_spec(5), 7);
+        for (seq_id, booked) in [(1, false), (2, true)] {
+            let prompt = tokens_of(seq_id, 2);
+            let mut turn = speculative::tests::request(
+                &mut inner,
+                seq_id,
+                prompt.clone(),
+                false,
+                Arc::new(AtomicBool::new(false)),
+            );
+            turn.payload.prefill_state = booked.then(|| {
+                let _scope = Scope::enter(claim.claim());
+                lender.try_reserve(1 << 20).expect("the rungs' bytes")
+            });
+            let row = engine::scheduler::StepRow {
+                seq_id,
+                kind: StepKind::Prefill,
+                token_start: 0,
+                num_tokens: prompt.len() as u32,
+                cancel_snapshot: false,
+            };
+            HybridStepExecutor::new(&mut inner)
+                .execute_prefill(&row, &mut turn)
+                .expect("prefill");
+            assert!(
+                turn.payload.failure.is_none(),
+                "{:?}",
+                turn.payload.failure.as_ref().map(|error| &error.reason)
+            );
+            assert_eq!(
+                inner.held_refused_rungs(Some(seq_id)) > 0,
+                booked,
+                "sequence {seq_id} booked {booked}"
+            );
+        }
+        drop(inner);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The rungs' reservation lasts through the prefill that publishes
+    /// them: a slice short of the prompt's end keeps it, the last slice
+    /// releases it. Mutation U2: release it after the first slice → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_rungs_reservation_ends_with_the_prefill() {
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use crate::engine::governor::governor::{Scope, whole_turn_spec};
+        if !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            return;
+        }
+        let mut inner = crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(8107);
+        let io = FakeIo::new(
+            stats(0),
+            host(32 * G, crate::engine::governor::host::Pressure::Normal),
+        );
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+        let _registration = governor.register_model(model(16 * G, 0)).expect("register");
+        let prompt = tokens_of(4, 2);
+        let mut turn = speculative::tests::request(
+            &mut inner,
+            1,
+            prompt.clone(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let claim = governor.open(whole_turn_spec(5), 7);
+        turn.payload.prefill_state = {
+            let _scope = Scope::enter(claim.claim());
+            Some(governor.try_reserve(1 << 20).expect("the rungs' bytes"))
+        };
+        turn.payload.claim = Some(claim);
+        let row = |token_start: u32, num_tokens: u32| engine::scheduler::StepRow {
+            seq_id: 1,
+            kind: StepKind::Prefill,
+            token_start,
+            num_tokens,
+            cancel_snapshot: false,
+        };
+        let half = prompt.len() as u32 / 2;
+        let mut executor = HybridStepExecutor::new(&mut inner);
+        let first = executor
+            .execute_prefill(&row(0, half), &mut turn)
+            .expect("first slice");
+        assert!(
+            !first.finished,
+            "{:?}",
+            turn.payload.failure.as_ref().map(|error| &error.reason)
+        );
+        assert!(turn.payload.prefill_state.is_some(), "the prefill runs on");
+        assert_eq!(governor.reserved_bytes(), 1 << 20);
+        executor
+            .execute_prefill(&row(half, half), &mut turn)
+            .expect("last slice");
+        assert!(turn.payload.prefill_state.is_none(), "the prefill ended");
+        assert_eq!(governor.reserved_bytes(), 0);
+    }
+
     /// Splash `Engine::admit`: a request alone claims its GDN cell in
     /// service, one beside a resident lane as a Start. With room below the
     /// cell and nothing to take, the cell's reservation is refused and the
@@ -8726,23 +9110,87 @@ pub(crate) mod tests {
         }
     }
 
+    /// On the ledger an MTP turn's state is claimed beside the pool, so a
+    /// turn whose KV fills the whole max pool is admitted; one block past
+    /// the max pool is refused `context_length_exceeded`.
+    /// Mutation PC1: the ceiling counts the state inside the pool → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_speculative_turn_may_fill_the_max_pool_on_the_ledger() {
+        use crate::engine::governor::governor::tests::G;
+        for (extra_blocks, admitted) in [(0u32, true), (1, false)] {
+            let Some((mut state, _, _io)) = ledger_state(16 * G, 0) else {
+                return;
+            };
+            let snapshot = state
+                .inner
+                .scheduler_cache_snapshot()
+                .expect("scheduler snapshot")
+                .expect("paged adapter present");
+            let blocks = snapshot.max_total_blocks + extra_blocks;
+            let (mut prepared, mut result) =
+                prepared_turn(&mut state, 1, tokens_of(1, snapshot.max_total_blocks - 1));
+            prepared.admitted.plan.decoder =
+                engine::plan::DecoderPlan::Speculative(engine::plan::SpeculativeKind::NativeMtp);
+            prepared.reservation_blocks = blocks;
+            prepared.reservation_state_bytes = state.inner.recurrent_state_bytes()
+                + state.inner.scheduled_draft_state_bytes(blocks * 16);
+            assert!(state.inner.scheduled_draft_state_bytes(blocks * 16) > 0);
+            let turn = state.admit_prepared(prepared).ok().flatten();
+            assert_eq!(turn.is_some(), admitted, "{blocks} blocks");
+            if !admitted {
+                let error = result
+                    .try_recv()
+                    .expect("the turn has ended")
+                    .expect_err("the turn fails");
+                assert!(
+                    error.reason.starts_with("context_length_exceeded"),
+                    "{}",
+                    error.reason
+                );
+            }
+        }
+    }
+
     /// Splash `Engine::suspendLane` → `admit`: a lone lane the host refused
     /// at its slice end E is suspended to E and, once its retry time came,
     /// resumes holding E's KV at once. A lane suspended beside another
     /// keeps the KV it held as its target and waits out the drain while
     /// the other runs.
-    /// Mutation V1: the resume claims its chain only → red (no block past
-    /// the chain). Mutation V2: a waiting resume is retried every
-    /// iteration → red (resumed before its retry time).
+    /// The suspended lane gives up its prefill state reservation while it
+    /// waits. Mutation V1: the resume claims its chain only → red (no block
+    /// past the chain). Mutation V2: a waiting resume is retried every
+    /// iteration → red (resumed before its retry time). Mutation V3: the
+    /// suspension keeps the prefill state reservation → red.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_victim_resumes_to_its_suspended_target() {
+        use crate::engine::governor::governor::whole_turn_spec;
         let Some((mut state, governor, _replies)) = judged_state(&[1]) else {
             return;
         };
+        let claim = governor.open(whole_turn_spec(5), state.inner.memory_model());
+        let prefill_state = {
+            let _scope = Scope::enter(claim.claim());
+            governor
+                .try_reserve(1 << 20)
+                .expect("the prefill state's bytes")
+        };
+        state
+            .scheduler
+            .running_turn_mut(1)
+            .expect("running")
+            .payload
+            .prefill_state = Some(prefill_state);
+        assert_eq!(governor.reserved_bytes(), 1 << 20);
         state.row_work_ends.insert(1, 33);
         let blocked = vec![(1, kv_denial(Failure::HostPressure))];
         assert!(!state.settle_blocked(blocked, false, &[1]));
+        assert_eq!(
+            governor.reserved_bytes(),
+            0,
+            "a suspended lane holds no prefill state reservation"
+        );
         assert_eq!(
             state
                 .scheduler
@@ -10463,11 +10911,11 @@ pub(crate) mod tests {
     /// Splash `Engine::stop` on a suspended request: `settle` → `finish(Stop)`
     /// takes no lane back. Turn A generates beside owner B, which finishes and
     /// parks its recurrent row; A is preempted (its row dropped, its full
-    /// blocks registered) and owner C holds the second recurrent unit. A stop
-    /// on A ends it "stop" on the tokens it had, the full blocks through the
-    /// cut stay in the cache, and B and C keep their rows. `in_reap`: the
+    /// blocks registered) and peers C.. hold the other recurrent units. A
+    /// stop on A ends it "stop" on the tokens it had, the full blocks through
+    /// the cut stay in the cache, and B and C keep their rows. `in_reap`: the
     /// pass's reap settles it at once, not its resume.
-    fn a_vacated_stop_completes_beside_two_resident_peers<B: HybridSchedulerBackend>(
+    fn a_vacated_stop_completes_beside_resident_peers<B: HybridSchedulerBackend>(
         mut state: HybridSchedulerState<B>,
         in_reap: bool,
     ) {
@@ -10525,22 +10973,27 @@ pub(crate) mod tests {
         assert!(!state.inner.has_scheduled_recurrent(seq));
 
         // Admission waits behind a preempted turn (on-demand booking), so the
-        // second resident row is pinned for owner C directly.
-        let seq_c = state.next_seq_id;
-        state.next_seq_id += 1;
-        state.owner_sequences.insert("c".to_string(), seq_c);
-        state
-            .inner
-            .activate_scheduled_recurrent(seq_c)
-            .expect("C takes the second unit");
-        state
-            .inner
-            .park_active_scheduled_recurrent()
-            .expect("C parks");
+        // other resident rows are pinned for peers C.. directly.
+        let mut seq_c = None;
+        while state.inner.can_activate_scheduled_recurrent(seq) {
+            let peer = state.next_seq_id;
+            state.next_seq_id += 1;
+            state.owner_sequences.insert(format!("c{peer}"), peer);
+            state
+                .inner
+                .activate_scheduled_recurrent(peer)
+                .expect("a peer takes a free unit");
+            state
+                .inner
+                .park_active_scheduled_recurrent()
+                .expect("the peer parks");
+            seq_c.get_or_insert(peer);
+        }
+        let seq_c = seq_c.expect("at least one peer fills a unit");
         assert!(state.inner.has_scheduled_recurrent(seq_b), "B stays parked");
         assert!(
             !state.inner.can_activate_scheduled_recurrent(seq),
-            "B and C hold both recurrent units"
+            "B and the peers hold every recurrent unit"
         );
 
         let model = state.inner.memory_model();
@@ -10613,9 +11066,9 @@ pub(crate) mod tests {
     /// done chunk).
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_vacated_stop_completes_beside_two_resident_qwen35_peers() {
+    fn a_vacated_stop_completes_beside_resident_qwen35_peers() {
         if crate::test_support::paged_prefill_unsupported(
-            "a_vacated_stop_completes_beside_two_resident_qwen35_peers",
+            "a_vacated_stop_completes_beside_resident_qwen35_peers",
         ) {
             return;
         }
@@ -10632,7 +11085,7 @@ pub(crate) mod tests {
                     .register_model(model(16 * G, 0))
                     .expect("register"),
             );
-            a_vacated_stop_completes_beside_two_resident_peers(
+            a_vacated_stop_completes_beside_resident_peers(
                 HybridSchedulerState::new(inner).expect("scheduler"),
                 in_reap,
             );
@@ -10642,9 +11095,9 @@ pub(crate) mod tests {
     /// Mutation F4, SP1, PS1: as the dense test → red.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_vacated_stop_completes_beside_two_resident_qwen35_moe_peers() {
+    fn a_vacated_stop_completes_beside_resident_qwen35_moe_peers() {
         if crate::test_support::paged_prefill_unsupported(
-            "a_vacated_stop_completes_beside_two_resident_qwen35_moe_peers",
+            "a_vacated_stop_completes_beside_resident_qwen35_moe_peers",
         ) {
             return;
         }
@@ -10662,7 +11115,7 @@ pub(crate) mod tests {
                     .register_model(model(16 * G, 0))
                     .expect("register"),
             );
-            a_vacated_stop_completes_beside_two_resident_peers(
+            a_vacated_stop_completes_beside_resident_peers(
                 HybridSchedulerState::new(inner).expect("scheduler"),
                 in_reap,
             );

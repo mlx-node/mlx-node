@@ -4,7 +4,7 @@
  *
  * This is the durable sink behind the dashboard's `traces` table
  * (`packages/dashboard/src/ingest/traces.ts`). One record is written per
- * successful inference turn by the `mlx serve` process — the single writer —
+ * dispatched inference turn (ok, error or cancelled) by the inference process —
  * via the {@link ./turn-trace.ts} model wrapper, so every client of the
  * `/v1/responses` and `/v1/messages` endpoints lands in the same stream.
  *
@@ -81,62 +81,140 @@ export const COLD_DELTA_FIELDS = [...COLD_COUNTER_FIELDS, ...COLD_SIDECAR_FIELDS
 /** A key of {@link COLD_DELTA_FIELDS}; every one is an optional `number`. */
 export type ColdDeltaField = (typeof COLD_DELTA_FIELDS)[number];
 
+export type TurnOutcome = 'ok' | 'error' | 'cancelled';
+export type TurnErrorKind = 'finish_error' | 'exception';
+export type TurnFailPhase = 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode';
+export type TurnEndpoint = 'messages' | 'responses' | 'other';
+export type TurnDispatch = 'start' | 'continue' | 'continue_tool';
+/** Where a turn's thinking budget came from: the request, or the server's option. */
+export type TurnBudgetFrom = 'request' | 'server';
+/** How a thought ended (native `reasoningClose`). */
+export type TurnReasoningClose = 'model' | 'budget' | 'cycle' | 'open';
+
+export const TURN_OUTCOMES: readonly TurnOutcome[] = ['ok', 'error', 'cancelled'];
+export const TURN_ERROR_KINDS: readonly TurnErrorKind[] = ['finish_error', 'exception'];
+/** The phases of a running native turn, in order; `done` is left out. */
+export const TURN_FAIL_PHASES: readonly TurnFailPhase[] = ['queued', 'slot', 'prepare', 'prefill', 'decode'];
+export const TURN_ENDPOINTS: readonly TurnEndpoint[] = ['messages', 'responses', 'other'];
+export const TURN_DISPATCHES: readonly TurnDispatch[] = ['start', 'continue', 'continue_tool'];
+export const TURN_BUDGET_FROM: readonly TurnBudgetFrom[] = ['request', 'server'];
+export const TURN_REASONING_CLOSES: readonly TurnReasoningClose[] = ['model', 'budget', 'cycle', 'open'];
+
+/** Most MTP draft positions a record carries. */
+export const MTP_ACCEPT_BY_POS_MAX = 16;
+
 /**
- * One inference turn's telemetry. Every field is a number, a small
- * enumerated string (`finishReason`), or an identifier — never model output
- * text, tool arguments, or prompt content.
+ * One dispatched turn's telemetry. Every field is a number, a closed enum, or
+ * an identifier — never model output text, tool arguments, or prompt content.
  */
 export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, number>> {
-  /** Schema version. */
-  v: 1;
-  /** Per-turn unique id minted by the trace wrapper. */
+  v: 2;
   traceId: string;
-  /** Wall-clock write time (ms since epoch). */
+  /** Write time = end of the dispatch (ms since epoch). */
   ts: number;
-  /**
-   * The turn's `ChatSession` cache-owner id (`ChatConfig.cacheOwnerId`) —
-   * the serve-side equivalent of the retired producer's per-request session
-   * id: stable across the turns of one logical conversation. Absent when the
-   * dispatch carried no owner.
-   */
+  pid: number;
+  /** The turn's `ChatSession` cache-owner id (`ChatConfig.cacheOwnerId`). */
   sessionId?: string;
-  /**
-   * Legacy field: the retired pi-agent producer stamped the root session the
-   * turn was submitted under. The serve process has no equivalent concept;
-   * kept in the allowlist so records that carry it still write it.
-   */
-  rootSessionId?: string;
-  /** Legacy pi session JSONL path — see {@link rootSessionId}. */
-  rootSessionFile?: string;
-  /** Model name this turn was registered under in the `ModelRegistry`. */
+
+  /** Name the client asked for (may be an alias). */
   model: string;
-  /** Turn duration (ms) — the wrapped native model dispatch call. */
-  durationMs: number;
-  /**
-   * Queue + cold-load wait (ms) before native work began this turn — the gap
-   * between turn submission and the serialized inference callback firing.
-   * Not populated on the serve path: admission-lane waits happen upstream of
-   * the wrapped model call. Subtract from `durationMs` to isolate
-   * execution-only latency.
-   */
-  queueMs?: number;
-  /**
-   * `true` when the model was already warm/resident, `false` on a cold
-   * load/swap. Not populated on the serve path: a registered model is loaded
-   * before it is served, and there is no per-turn resident swap.
-   */
-  resident?: boolean;
-  /** Native finish reason (`stop` / `length` / `tool_calls` / …). */
+  /** Checkpoint name the binding was first registered under. */
+  modelId?: string;
+  /** Family id from discovery, e.g. `qwen3_5`. */
+  modelType?: string;
+
+  outcome: TurnOutcome;
+  /** Only when outcome is `error`. */
+  errorKind?: TurnErrorKind;
+  /** Only when outcome is not `ok` and a progress snapshot of the stream was readable. */
+  failPhase?: TurnFailPhase;
+  endpoint: TurnEndpoint;
+  stream: boolean;
+  dispatch: TurnDispatch;
+  /** Sanitized native reason; `cancelled` for cancelled turns, `error` for errors. */
   finishReason: string;
-  promptTokens: number;
-  cachedTokens: number;
-  outputTokens: number;
-  reasoningTokens: number;
+
+  /** The wrapped dispatch call. */
+  durationMs: number;
+  /** Admission lane wait plus the coordinator's read wait behind a running load. */
+  queueMs?: number;
+  /** Time parked behind another request's model load. */
+  loadWaitMs?: number;
+  /** Time this request spent loading the model itself (it owned the load). */
+  resolveMs?: number;
+  /** Handler start → dispatch. Includes `queueMs`, `loadWaitMs` and `resolveMs`. */
+  preDispatchMs?: number;
+  /** Native: creation → the model thread picked the turn up. Outside `ttftMs`. Streamed turns of a native that reports it. */
+  waitMs?: number;
+  /** Native: time the scheduler could not start the turn (lanes or memory). Inside `ttftMs`. */
+  slotMs?: number;
+  /** Native: render, prefix match, cache restore and GDN replay before the prefill. Inside `ttftMs`. */
+  prepareMs?: number;
+
+  /** Always present when outcome is `ok`. Best effort otherwise. */
+  promptTokens?: number;
+  cachedTokens?: number;
+  outputTokens?: number;
+  reasoningTokens?: number;
+  /** Native: how the thought ended; absent when the turn did not start in thinking or the addon does not report it. */
+  reasoningClose?: TurnReasoningClose;
+  /** Native: thinking tokens when a cut began. */
+  reasoningCutAt?: number;
+  /** Native: period in tokens of the cycle the check saw. */
+  reasoningCyclePeriod?: number;
+  /** Native: close tokens after the thought ended. */
+  reasoningStrayCloses?: number;
+  /** The thinking budget sent to native, after the window scaled it. */
+  thinkingBudget?: number;
+  thinkingBudgetFrom?: TurnBudgetFrom;
+  /** `true` when the cycle guard was sent; else absent. */
+  thinkingGuard?: true;
+  /** `maxNewTokens` sent to native. */
+  outputCap?: number;
+  /** Non-ok streams: prefill tokens materialized before the turn ended. */
+  prefillDoneTokens?: number;
+  /** Usable context of the loaded model, in tokens. */
+  ctxWindow?: number;
+
   ttftMs?: number;
-  prefillTps?: number;
+  /** Prefill window: `begin_prefill` to the first token sampled. Ok streamed turns that native measured only. */
+  prefillMs?: number;
+  /** Tokens that prefill window processed (cached prefix excluded); written with `prefillMs`, never alone. */
+  prefillTokens?: number;
+  /** Written only when > 0: native reports 0.0 for a rate it could not measure. */
   decodeTps?: number;
+
   mtpCycles?: number;
+  /** Committed tokens per cycle (drafts + 1). */
   mtpMeanAccepted?: number;
+  /** Accepted draft tokens per cycle. */
+  mtpMeanDrafts?: number;
+  mtpMeanDepth?: number;
+  /** Acceptance rate per draft position, at most {@link MTP_ACCEPT_BY_POS_MAX} entries. */
+  mtpAcceptByPos?: number[];
+
+  toolCount: number;
+  toolCallCount?: number;
+  imageCount: number;
+
+  /** Turns of this model in native flight when this one began, itself included. */
+  concurrency: number;
+  /** Highest value of the same count while this turn was live. */
+  concurrencyPeak: number;
+
+  /** MLX active bytes at turn end. */
+  memActiveBytes?: number;
+  /** MLX process high-water mark at turn end. Not a per-turn peak. */
+  memPeakBytes?: number;
+
+  /**
+   * GPU pipelines the process created while serving, between this turn's begin and end. Process-wide, so
+   * overlapping turns share them. Absent when the native counter is off.
+   */
+  pipelinesCreated?: number;
+  /** Time spent creating those pipelines. Written with `pipelinesCreated`. */
+  pipelineCreateMs?: number;
+
   /** Cold-tier restore hits accrued this turn (synchronous counter — exact). */
   coldHits?: number;
   /** Cold-tier lookup misses accrued this turn (synchronous counter — exact). */
@@ -196,8 +274,8 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
   /**
    * CUMULATIVE corruptions since the tier opened in this process, not a delta.
    * Carried because the acceptance bar is "corruptions must be 0" and a delta
-   * alone cannot prove it: a turn that aborts or errors never reaches
-   * `record()`, so a corruption during it lands in no delta at all. The next
+   * alone cannot prove it: a turn that aborts or errors carries no cold
+   * fields, so a corruption during it lands in no delta at all. The next
    * successful turn's absolute total still includes it, so `MAX(total) > 0`
    * over any window is the sound "did this ever happen" latch.
    */
@@ -293,9 +371,9 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
   coldSidecarInstalled?: number;
 }
 
-export type MetricsTraceInput = Omit<MetricsTraceRecord, 'v'>;
+export type MetricsTraceInput = Omit<MetricsTraceRecord, 'v' | 'pid'>;
 
-function envDisabled(): boolean {
+export function metricsEnvDisabled(): boolean {
   const raw = process.env.MLX_AGENT_METRICS;
   if (raw === undefined) return false;
   const normalized = raw.trim().toLowerCase();
@@ -303,17 +381,72 @@ function envDisabled(): boolean {
 }
 
 /** A finite number, or `undefined` if the value is absent / non-finite. */
-function finite(value: number | undefined): number | undefined {
+function finite(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+/** A finite number ≥ 0, or `undefined`. */
+function nonNeg(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/** A finite number > 0, or `undefined`. */
+function positive(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+export function nonNegInt(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+export function enumOf<T extends string>(value: unknown, allowed: readonly T[]): T | undefined {
+  if (typeof value !== 'string') return undefined;
+  for (const candidate of allowed) {
+    if (candidate === value) return candidate;
+  }
+  return undefined;
+}
+
+const SAFE_REASON_MAX = 32;
+
+/** `value` when it is 1–32 chars of `a-z`, `0-9`, `_`; otherwise `'other'`. */
+export function safeReason(value: unknown): string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > SAFE_REASON_MAX) return 'other';
+  for (let i = 0; i < value.length; i++) {
+    const c = value.charCodeAt(i);
+    const lower = c >= 97 && c <= 122;
+    const digit = c >= 48 && c <= 57;
+    if (!lower && !digit && c !== 95) return 'other';
+  }
+  return value;
+}
+
+/** First {@link MTP_ACCEPT_BY_POS_MAX} finite entries, each clamped to [0, 1] and rounded to 4 decimals. */
+export function rateList(value: unknown): number[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: number[] = [];
+  for (const entry of value as unknown[]) {
+    if (out.length >= MTP_ACCEPT_BY_POS_MAX) break;
+    if (typeof entry !== 'number' || !Number.isFinite(entry)) continue;
+    const clamped = entry < 0 ? 0 : entry > 1 ? 1 : entry;
+    out.push(Math.round(clamped * 1e4) / 1e4);
+  }
+  return out;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
 export class MetricsTrace {
   readonly enabled: boolean;
   private readonly dir: string;
   private readonly now: () => number;
+  /** The day file whose directory is known to exist. */
+  private readyFile: string | null = null;
 
   constructor(opts?: { dir?: string; now?: () => number }) {
-    this.enabled = !envDisabled();
+    this.enabled = !metricsEnvDisabled();
     this.dir = opts?.dir ?? metricsTraceDir();
     this.now = opts?.now ?? Date.now;
   }
@@ -327,44 +460,115 @@ export class MetricsTrace {
   /**
    * Append one allowlisted JSON line. Never throws: a broken sink must not
    * surface into the inference path. Excess input properties are dropped — the
-   * record is rebuilt field by field so free text can never reach disk.
+   * record is rebuilt field by field so free text can never reach disk. A
+   * record whose `outcome`, `endpoint` or `dispatch` is not a known value is
+   * dropped.
    */
   record(rec: MetricsTraceInput): void {
     if (!this.enabled) return;
     try {
+      const outcome = enumOf(rec.outcome, TURN_OUTCOMES);
+      const endpoint = enumOf(rec.endpoint, TURN_ENDPOINTS);
+      const dispatch = enumOf(rec.dispatch, TURN_DISPATCHES);
+      if (outcome === undefined || endpoint === undefined || dispatch === undefined) return;
+      if (typeof rec.traceId !== 'string' || typeof rec.model !== 'string') return;
       const out: MetricsTraceRecord = {
-        v: 1,
+        v: 2,
         traceId: rec.traceId,
-        ts: rec.ts,
+        ts: finite(rec.ts) ?? this.now(),
+        pid: process.pid,
         model: rec.model,
-        durationMs: rec.durationMs,
-        finishReason: rec.finishReason,
-        promptTokens: rec.promptTokens,
-        cachedTokens: rec.cachedTokens,
-        outputTokens: rec.outputTokens,
-        reasoningTokens: rec.reasoningTokens,
+        outcome,
+        endpoint,
+        stream: rec.stream === true,
+        dispatch,
+        finishReason: safeReason(rec.finishReason),
+        durationMs: nonNeg(rec.durationMs) ?? 0,
+        toolCount: nonNegInt(rec.toolCount) ?? 0,
+        imageCount: nonNegInt(rec.imageCount) ?? 0,
+        concurrency: nonNegInt(rec.concurrency) ?? 0,
+        concurrencyPeak: nonNegInt(rec.concurrencyPeak) ?? 0,
       };
-      if (rec.sessionId !== undefined) out.sessionId = rec.sessionId;
-      if (rec.rootSessionId !== undefined) out.rootSessionId = rec.rootSessionId;
-      if (rec.rootSessionFile !== undefined) out.rootSessionFile = rec.rootSessionFile;
-      const queueMs = finite(rec.queueMs);
-      if (queueMs !== undefined) out.queueMs = queueMs;
-      if (typeof rec.resident === 'boolean') out.resident = rec.resident;
-      const ttftMs = finite(rec.ttftMs);
-      if (ttftMs !== undefined) out.ttftMs = ttftMs;
-      const prefillTps = finite(rec.prefillTps);
-      if (prefillTps !== undefined) out.prefillTps = prefillTps;
-      const decodeTps = finite(rec.decodeTps);
+      const sessionId = nonEmptyString(rec.sessionId);
+      if (sessionId !== undefined) out.sessionId = sessionId;
+      const modelId = nonEmptyString(rec.modelId);
+      if (modelId !== undefined) out.modelId = modelId;
+      const modelType = nonEmptyString(rec.modelType);
+      if (modelType !== undefined) out.modelType = modelType;
+      if (outcome === 'error') {
+        const errorKind = enumOf(rec.errorKind, TURN_ERROR_KINDS);
+        if (errorKind !== undefined) out.errorKind = errorKind;
+      }
+      if (outcome !== 'ok') {
+        const failPhase = enumOf(rec.failPhase, TURN_FAIL_PHASES);
+        if (failPhase !== undefined) out.failPhase = failPhase;
+      }
+      for (const key of [
+        'queueMs',
+        'loadWaitMs',
+        'resolveMs',
+        'preDispatchMs',
+        'ttftMs',
+        'waitMs',
+        'slotMs',
+        'prepareMs',
+      ] as const) {
+        const value = nonNeg(rec[key]);
+        if (value !== undefined) out[key] = value;
+      }
+      for (const key of [
+        'promptTokens',
+        'cachedTokens',
+        'outputTokens',
+        'reasoningTokens',
+        'reasoningCutAt',
+        'reasoningStrayCloses',
+        'thinkingBudget',
+        'outputCap',
+        'prefillDoneTokens',
+        'ctxWindow',
+        'mtpCycles',
+        'toolCallCount',
+      ] as const) {
+        const value = nonNegInt(rec[key]);
+        if (value !== undefined) out[key] = value;
+      }
+      const reasoningClose = enumOf(rec.reasoningClose, TURN_REASONING_CLOSES);
+      if (reasoningClose !== undefined) out.reasoningClose = reasoningClose;
+      const cyclePeriod = nonNegInt(rec.reasoningCyclePeriod);
+      if (cyclePeriod !== undefined && cyclePeriod > 0) out.reasoningCyclePeriod = cyclePeriod;
+      const budgetFrom = enumOf(rec.thinkingBudgetFrom, TURN_BUDGET_FROM);
+      if (budgetFrom !== undefined) out.thinkingBudgetFrom = budgetFrom;
+      if (rec.thinkingGuard === true) out.thinkingGuard = true;
+      const prefillMs = positive(rec.prefillMs);
+      const prefillTokens = nonNegInt(rec.prefillTokens);
+      if (outcome === 'ok' && prefillMs !== undefined && prefillTokens !== undefined && prefillTokens > 0) {
+        out.prefillMs = prefillMs;
+        out.prefillTokens = prefillTokens;
+      }
+      const decodeTps = positive(rec.decodeTps);
       if (decodeTps !== undefined) out.decodeTps = decodeTps;
-      const mtpCycles = finite(rec.mtpCycles);
-      if (mtpCycles !== undefined) out.mtpCycles = mtpCycles;
-      const mtpMeanAccepted = finite(rec.mtpMeanAccepted);
-      if (mtpMeanAccepted !== undefined) out.mtpMeanAccepted = mtpMeanAccepted;
+      for (const key of [
+        'mtpMeanAccepted',
+        'mtpMeanDrafts',
+        'mtpMeanDepth',
+        'memActiveBytes',
+        'memPeakBytes',
+      ] as const) {
+        const value = nonNeg(rec[key]);
+        if (value !== undefined) out[key] = value;
+      }
+      const pipelinesCreated = nonNegInt(rec.pipelinesCreated);
+      const pipelineCreateMs = nonNeg(rec.pipelineCreateMs);
+      if (pipelinesCreated !== undefined && pipelineCreateMs !== undefined) {
+        out.pipelinesCreated = pipelinesCreated;
+        out.pipelineCreateMs = pipelineCreateMs;
+      }
+      const mtpAcceptByPos = rateList(rec.mtpAcceptByPos);
+      if (mtpAcceptByPos !== undefined) out.mtpAcceptByPos = mtpAcceptByPos;
       // Every cold-tier delta comes off ONE list, so a counter can only be
       // dropped from the JSONL by being dropped from `COLD_DELTA_FIELDS` —
       // which `__test__/server/cold-counter-fields.test.ts` pins to the native structs.
-      // Spelling them out here is what let four `coldCacheStats()` counters sit
-      // unwritten for the life of the feature.
       for (const key of COLD_DELTA_FIELDS) {
         const value = finite(rec[key]);
         if (value !== undefined) out[key] = value;
@@ -380,11 +584,26 @@ export class MetricsTrace {
       const coldWriteErrorsTotal = finite(rec.coldWriteErrorsTotal);
       if (coldWriteErrorsTotal !== undefined) out.coldWriteErrorsTotal = coldWriteErrorsTotal;
 
-      const file = this.currentFile();
-      mkdirSync(dirname(file), { recursive: true });
-      appendFileSync(file, `${JSON.stringify(out)}\n`);
+      this.append(`${JSON.stringify(out)}\n`);
     } catch {
       // Telemetry is best-effort; a broken sink must never break inference.
+    }
+  }
+
+  private append(line: string): void {
+    const file = this.currentFile();
+    if (this.readyFile !== file) {
+      mkdirSync(dirname(file), { recursive: true });
+      this.readyFile = file;
+    }
+    try {
+      appendFileSync(file, line);
+    } catch {
+      // The directory may have been removed under a cached flag: heal once.
+      this.readyFile = null;
+      mkdirSync(dirname(file), { recursive: true });
+      appendFileSync(file, line);
+      this.readyFile = file;
     }
   }
 }

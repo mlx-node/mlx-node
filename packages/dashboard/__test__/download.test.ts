@@ -1,12 +1,14 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -16,11 +18,20 @@ import { dirname, join } from 'node:path';
 
 import { catalogUpdateRepos, catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { findDFlash2Draft, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
+import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vite-plus/test';
 
+import type { ApiContext } from '../src/api/context.js';
+import { dispatch } from '../src/api/dispatch.js';
 import { catalogWithState } from '../src/catalog.js';
-import { type DownloadEvent, DownloadManager, pidAlive } from '../src/download.js';
-import { DOWNLOAD_COMPLETE_MARKER, isModelInstalled } from '../src/models.js';
+import {
+  DownloadConflictError,
+  type DownloadEvent,
+  DownloadManager,
+  pidAlive,
+  type ReplaceBlocker,
+} from '../src/download.js';
+import { DOWNLOAD_COMPLETE_MARKER, deleteLocalModel, isModelInstalled } from '../src/models.js';
 
 /** Filename of the atomic-publish completion marker (kept in sync with models.ts). */
 const MARKER_FILE = '.mlx-download-complete.json';
@@ -126,6 +137,16 @@ function recordRevision(repo: string | undefined, revision: string | undefined):
 const renameFault = vi.hoisted(() => ({
   failFromPath: null as string | null,
   failFromPrefix: null as string | null,
+  /** A second prefix, so a test can fail the swap AND its rollback. */
+  alsoFailFromPrefix: null as string | null,
+}));
+
+// Fires once around the first rename whose source is `from`: `before` runs just before the real rename, `after`
+// just after it, to act like a writer outside the app at the publish swap.
+const renameHook = vi.hoisted(() => ({
+  from: null as string | null,
+  before: null as (() => void) | null,
+  after: null as (() => void) | null,
 }));
 
 // Fires once when the completion marker is written, to inject a directory that
@@ -147,9 +168,18 @@ vi.mock('node:fs/promises', async (importActual) => {
       const f = String(from);
       if (
         (renameFault.failFromPath !== null && f === renameFault.failFromPath) ||
-        (renameFault.failFromPrefix !== null && f.startsWith(renameFault.failFromPrefix))
+        (renameFault.failFromPrefix !== null && f.startsWith(renameFault.failFromPrefix)) ||
+        (renameFault.alsoFailFromPrefix !== null && f.startsWith(renameFault.alsoFailFromPrefix))
       ) {
         throw new Error(`simulated rename failure moving ${f}`);
+      }
+      if (renameHook.from !== null && f === renameHook.from) {
+        const { before, after } = renameHook;
+        renameHook.from = null;
+        before?.();
+        await actual.rename(from, to);
+        after?.();
+        return;
       }
       return actual.rename(from, to);
     },
@@ -354,6 +384,10 @@ function jobStagingDirs(): string[] {
 function backupDirs(): string[] {
   return existsSync(stagingRoot()) ? readdirSync(stagingRoot()).filter((n) => n.includes('.backup-')) : [];
 }
+/** Reinstall backups left under `.staging` (`<slug>.reinstall-...`); empty when clean. */
+function reinstallDirs(): string[] {
+  return existsSync(stagingRoot()) ? readdirSync(stagingRoot()).filter((n) => n.includes('.reinstall-')) : [];
+}
 /** The legacy SHARED staging path (`<slug>@<rev>`), used only to plant pre-fix leftovers. */
 function legacyStagingDir(revision: string = hub.sha): string {
   return join(stagingRoot(), `${SLUG}@${revision}`);
@@ -389,6 +423,10 @@ beforeEach(() => {
   hub.failMessage = null;
   renameFault.failFromPath = null;
   renameFault.failFromPrefix = null;
+  renameFault.alsoFailFromPrefix = null;
+  renameHook.from = null;
+  renameHook.before = null;
+  renameHook.after = null;
   raceHook.onMarkerWrite = null;
   stagingHook.onVerifyWindow = null;
   hub.modelInfoRepos = [];
@@ -808,7 +846,7 @@ describe('DownloadManager', () => {
     // Through the resolver, mirroring the allowlist. Hidden entries carry no
     // CUDA build today, so this is the same string — but a raw `hfRepo` here
     // would silently start testing the wrong thing the day one does.
-    expect(() => manager.start(catalogRepo(hidden!))).toThrow(/not in the model catalog/);
+    expect(() => manager.start(catalogRepo(hidden!))).toThrow('not in the model catalog');
     // Rejected BEFORE any job is allocated — otherwise the SPA renders a job
     // that marches to a 401 instead of an immediate, actionable error.
     expect(manager.jobs()).toEqual([]);
@@ -1976,9 +2014,9 @@ describe('DownloadManager', () => {
     const err = events.find((event) => event.type === 'error');
     expect(err?.type).toBe('error');
     if (err?.type === 'error') {
-      // The message must not advertise an `overwrite` mode the API/UI never expose.
-      expect(err.message).not.toMatch(/overwrite/i);
-      expect(err.message).toMatch(/not created by the dashboard/i);
+      // A plain install names the refusal; only a Reinstall may replace the entry.
+      expect(err.message.toLowerCase()).not.toContain('overwrite');
+      expect(err.message).toContain('not created by the dashboard');
     }
 
     // The manual files are byte-for-byte intact; no marker written.
@@ -2010,7 +2048,7 @@ describe('DownloadManager', () => {
 
     const err = events.find((event) => event.type === 'error');
     expect(err?.type).toBe('error');
-    if (err?.type === 'error') expect(err.message).toMatch(/not created by the dashboard/i);
+    if (err?.type === 'error') expect(err.message).toContain('not created by the dashboard');
     // Zero bytes moved and the partial dir is untouched — a wart, not data loss.
     expect(hub.downloaded).toEqual([]);
     expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
@@ -2045,7 +2083,7 @@ describe('DownloadManager', () => {
     const err = events.find((event) => event.type === 'error');
     expect(err?.type).toBe('error');
     if (err?.type === 'error') {
-      expect(err.message).toMatch(/not created by the dashboard/i);
+      expect(err.message).toContain('not created by the dashboard');
     }
   });
 
@@ -2171,10 +2209,9 @@ describe('DownloadManager', () => {
   });
 
   it('refuses a dir whose marker is not the full shape we write, and leaves it intact', async () => {
-    // Ownership is the ONLY gate between `POST /api/downloads` and
-    // `rename(finalDir → backup)` + `rm(backup, { recursive: true })`: the route
-    // never parses `overwrite`, so all three guards on that path reduce to this
-    // one predicate. It used to accept anything carrying a `files` array, and the
+    // For a plain install, ownership is the ONLY gate between `POST /api/downloads`
+    // and `rename(finalDir → backup)` + `rm(backup, { recursive: true })`: all
+    // three guards on that path reduce to this one predicate. It used to accept anything carrying a `files` array, and the
     // marker we write has been the same four fields since the first commit that
     // emitted one — so a bare `{"files":[]}` authorized destroying a directory
     // that was never ours.
@@ -2259,20 +2296,23 @@ describe('DownloadManager', () => {
     expect(backupDirs()).toEqual([]);
   });
 
-  it('replaces an unowned dir only when overwrite is explicitly requested', async () => {
+  it('replaces an unowned dir only through a Reinstall that echoes its numbers', async () => {
     mkdirSync(finalDir(), { recursive: true });
-    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(finalDir(), 'notes.txt'), Buffer.alloc(12, 0xab));
 
     const manager = new DownloadManager({
       modelsDir,
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO, { overwrite: true });
+    const id = manager.start(REPO, {
+      replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 12, truncated: false },
+    });
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
-    // The freshly downloaded (zero-byte) content replaced the manual 0xAB copy.
+    // The freshly downloaded (zero-byte) content replaced the manual directory.
     expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12));
+    expect(existsSync(join(finalDir(), 'notes.txt'))).toBe(false);
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
   });
@@ -2788,7 +2828,7 @@ describe('DownloadManager', () => {
     writeFileSync(join(deadDir, WEIGHT), Buffer.alloc(10, 0x1));
 
     // finalDir is an UNOWNED real dir (a manual / `mlx download` copy, no marker), so
-    // the ownership preflight refuses this job (overwrite:false).
+    // the ownership preflight refuses this job (a plain install).
     mkdirSync(finalDir(), { recursive: true });
     writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
     writeFileSync(join(finalDir(), WEIGHT), Buffer.alloc(300, 0xab));
@@ -2809,7 +2849,7 @@ describe('DownloadManager', () => {
     const err = events.find((event) => event.type === 'error');
     expect(err?.type).toBe('error');
     if (err?.type === 'error') {
-      expect(err.message).toMatch(/not created by the dashboard/i);
+      expect(err.message).toContain('not created by the dashboard');
     }
 
     // …yet the crashed dead-owner staging tree WAS reaped despite the refusal.
@@ -2821,13 +2861,10 @@ describe('DownloadManager', () => {
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
   });
 
-  // Finding 1: a rollback backup can be a FOREIGN SYMLINK (a prior `overwrite`
-  // publish renamed a symlinked finalDir to its backup, then crashed before
-  // installing staging). With finalDir ABSENT, pre-fix recovery renamed that symlink
-  // onto finalDir AFTER the only ownership check, then skip-detection FOLLOWED the
-  // link and emitted `done` through the foreign target. Recovery must restore only an
-  // OWNED REAL-DIR backup, and a re-run preflight must refuse any foreign link at
-  // finalDir before skip-detection can follow it.
+  // An owned-upgrade backup name (`.backup-`) holding a FOREIGN SYMLINK is never
+  // promoted: the owned rule restores only what proves owned, and the second
+  // preflight refuses a foreign link at finalDir before skip-detection can follow
+  // it. A Reinstall names its backup `.reinstall-`, which has its own rule.
   it('does NOT restore a foreign-symlink backup onto an absent finalDir, and never reports done through it', async () => {
     const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
     writeFileSync(join(external, 'config.json'), Buffer.alloc(12, 0xab));
@@ -3334,7 +3371,7 @@ describe('DownloadManager', () => {
     // `shutdown` flips the manager closed before its first await, so the refusal
     // does not depend on how wide the in-flight job's unwind window happens to be.
     const shutdownP = manager.shutdown();
-    expect(() => manager.start(REPO)).toThrow(/shutting down/i);
+    expect(() => manager.start(REPO)).toThrow('shutting down');
     await shutdownP;
 
     // The refused job was never registered, so nothing extended the drain and the
@@ -3381,5 +3418,627 @@ describe('pidAlive (download.ts)', () => {
     expect(pidAlive(0)).toBe(true);
     expect(pidAlive(-1)).toBe(true);
     expect(pidAlive(Number.NaN)).toBe(true);
+  });
+});
+
+describe('Reinstall: replace the entry in the way after a verified download', () => {
+  const LEFTOVER = 'imatrix_unsloth.gguf_file';
+  const LEFTOVER_BYTES = 183;
+  const ONE_FILE: ReplaceBlocker = { kind: 'directory', fileCount: 1, sizeBytes: LEFTOVER_BYTES, truncated: false };
+
+  function plantLeftover(): void {
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), LEFTOVER), Buffer.alloc(LEFTOVER_BYTES, 0x5c));
+  }
+
+  function leftoverIntact(): boolean {
+    try {
+      return readFileSync(join(finalDir(), LEFTOVER)).equals(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
+    } catch {
+      return false;
+    }
+  }
+
+  function manager(fetchImpl: typeof fetch = makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 })): DownloadManager {
+    return new DownloadManager({ modelsDir, cacheDir, fetchImpl });
+  }
+
+  async function settled(m: DownloadManager, id: string): Promise<DownloadEvent[]> {
+    const events: DownloadEvent[] = [];
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((e) => e.type === 'done' || e.type === 'error' || e.type === 'cancelled'));
+    return events;
+  }
+
+  function errorOf(events: DownloadEvent[]): string {
+    const error = events.find((e) => e.type === 'error');
+    return error?.type === 'error' ? error.message : '';
+  }
+
+  function slugItem() {
+    return catalogWithState(modelsDir).find((e) => e.slug === SLUG)!;
+  }
+
+  it('replaces a one-file foreign directory once the download is verified', async () => {
+    plantLeftover();
+    expect(slugItem().blocker).toMatchObject(ONE_FILE);
+    const m = manager();
+    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
+    expect(errorOf(events)).toBe('');
+    expect(events.some((e) => e.type === 'done')).toBe(true);
+    expect(existsSync(join(finalDir(), LEFTOVER))).toBe(false);
+    expect(isModelInstalled(finalDir())).toBe(true);
+    expect(backupDirs()).toEqual([]);
+    expect(reinstallDirs()).toEqual([]);
+    expect(slugItem()).toMatchObject({ installed: true, blocker: null, blockedByForeignDir: false });
+  });
+
+  it('keeps the foreign entry while the download runs, and after a cancel', async () => {
+    plantLeftover();
+    let duringDownload: boolean | undefined;
+    let cancel = (): void => {};
+    const m = manager(
+      makeCancelFetch({ 'config.json': 12, [WEIGHT]: 300 }, WEIGHT, () => {
+        duringDownload = leftoverIntact();
+        queueMicrotask(cancel);
+      }),
+    );
+    const id = m.start(REPO, { replaceBlocker: ONE_FILE });
+    cancel = () => void m.cancel(id);
+    const events = await settled(m, id);
+    expect(duringDownload).toBe(true);
+    expect(events.some((e) => e.type === 'cancelled')).toBe(true);
+    expect(leftoverIntact()).toBe(true);
+    expect(m.jobs().find((job) => job.id === id)?.state).toBe('cancelled');
+  });
+
+  it('says nothing was removed when the download fails, and removes nothing', async () => {
+    plantLeftover();
+    hub.failOn = [WEIGHT];
+    const m = manager();
+    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
+    expect(errorOf(events).endsWith('. Nothing was removed.')).toBe(true);
+    expect(leftoverIntact()).toBe(true);
+    // The error frame is emitted before the job's `finally` removes its staging tree.
+    await waitFor(() => jobStagingDirs().length === 0);
+  });
+
+  it.each<[string, () => void, ReplaceBlocker]>([
+    ['a wrong file count', plantLeftover, { ...ONE_FILE, fileCount: 2 }],
+    ['a wrong size', plantLeftover, { ...ONE_FILE, sizeBytes: LEFTOVER_BYTES + 1 }],
+    ['a wrong kind', plantLeftover, { ...ONE_FILE, kind: 'file' }],
+    ['a path that is gone', () => {}, ONE_FILE],
+    [
+      'a path the downloader owns',
+      () => {
+        plantLeftover();
+        writeFileSync(
+          join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
+          JSON.stringify({ repo: REPO, revision: SHA_OLD, files: ['config.json', WEIGHT], completedAt: 'x' }),
+        );
+      },
+      ONE_FILE,
+    ],
+  ])('refuses at the request when the echo does not match: %s', (_name, plant, echo) => {
+    plant();
+    const before = existsSync(finalDir()) ? readdirSync(finalDir()).sort() : null;
+    const m = manager();
+    expect(() => m.start(REPO, { replaceBlocker: echo })).toThrow(DownloadConflictError);
+    expect(() => m.start(REPO, { replaceBlocker: echo })).toThrow(
+      `"${SLUG}" changed on disk. Check it, then try again.`,
+    );
+    expect(m.jobs()).toEqual([]);
+    expect(existsSync(finalDir()) ? readdirSync(finalDir()).sort() : null).toEqual(before);
+  });
+
+  it('refuses a complete model the app did not create, and leaves it intact', () => {
+    mkdirSync(finalDir(), { recursive: true });
+    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(finalDir(), WEIGHT), Buffer.alloc(300, 0xab));
+    const m = manager();
+    expect(() =>
+      m.start(REPO, { replaceBlocker: { kind: 'directory', fileCount: 2, sizeBytes: 312, truncated: false } }),
+    ).toThrow(`"${SLUG}" holds a model that the app did not create. Remove it yourself if you do not need it.`);
+    expect(m.jobs()).toEqual([]);
+    expect(readFileSync(join(finalDir(), WEIGHT))).toEqual(Buffer.alloc(300, 0xab));
+  });
+
+  function qwen35Gguf(): Buffer {
+    const string = (text: string): Buffer => {
+      const bytes = Buffer.from(text);
+      const length = Buffer.alloc(8);
+      length.writeBigUInt64LE(BigInt(bytes.length));
+      return Buffer.concat([length, bytes]);
+    };
+    const header = Buffer.alloc(24);
+    header.write('GGUF');
+    header.writeUInt32LE(3, 4);
+    header.writeBigUInt64LE(1n, 16);
+    const stringType = Buffer.alloc(4);
+    stringType.writeUInt32LE(8);
+    return Buffer.concat([header, string('general.architecture'), stringType, string('qwen35')]);
+  }
+
+  it.each<[string, string, boolean]>([
+    ['a GGUF at its root and no config.json', WEIGHT, false],
+    ['a config.json and a GGUF in a variant folder', join('UD-Q4_K_XL', WEIGHT), true],
+  ])('refuses an entry that mlx serve lists: %s', async (_name, gguf, withConfig) => {
+    mkdirSync(dirname(join(finalDir(), gguf)), { recursive: true });
+    writeFileSync(join(finalDir(), gguf), qwen35Gguf());
+    if (withConfig) writeFileSync(join(finalDir(), 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+    const served = (await discoverLocalChatModels(modelsDir)).map((model) => model.path);
+    expect(served).toEqual([join(finalDir(), gguf)]);
+    const blocker = slugItem().blocker!;
+    expect(blocker).toMatchObject({ holdsModel: true, listed: withConfig });
+    const m = manager();
+    expect(() => m.start(REPO, { replaceBlocker: blocker })).toThrow(
+      `"${SLUG}" holds a model that the app did not create. Remove it yourself if you do not need it.`,
+    );
+    expect(m.jobs()).toEqual([]);
+    expect(readFileSync(join(finalDir(), gguf))).toEqual(qwen35Gguf());
+  });
+
+  it('refuses at the swap when a GGUF lands in a variant folder during the download', async () => {
+    plantLeftover();
+    stagingHook.onVerifyWindow = () => {
+      mkdirSync(join(finalDir(), 'UD-Q4_K_XL'));
+      writeFileSync(join(finalDir(), 'UD-Q4_K_XL', WEIGHT), qwen35Gguf());
+    };
+    const m = manager();
+    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
+    expect(errorOf(events)).toBe(
+      `"${SLUG}" holds a model that the app did not create. Remove it yourself if you do not need it. Nothing was removed.`,
+    );
+    expect(leftoverIntact()).toBe(true);
+    expect(readFileSync(join(finalDir(), 'UD-Q4_K_XL', WEIGHT))).toEqual(qwen35Gguf());
+  });
+
+  it('refuses an entry that holds only companion GGUFs', () => {
+    mkdirSync(finalDir());
+    writeFileSync(join(finalDir(), 'imatrix_unsloth.gguf'), Buffer.alloc(10));
+    writeFileSync(join(finalDir(), 'mmproj-F16.gguf'), Buffer.alloc(20));
+    const blocker = slugItem().blocker!;
+    expect(blocker).toMatchObject({ holdsModel: true, fileCount: 2, sizeBytes: 30 });
+    expect(() => manager().start(REPO, { replaceBlocker: blocker })).toThrow(DownloadConflictError);
+    expect(readdirSync(finalDir()).sort()).toEqual(['imatrix_unsloth.gguf', 'mmproj-F16.gguf']);
+  });
+
+  it('refuses SafeTensors shards with no index that mlx serve lists, and keeps them', async () => {
+    mkdirSync(finalDir());
+    writeFileSync(join(finalDir(), 'config.json'), JSON.stringify({ model_type: 'qwen3' }));
+    writeFileSync(join(finalDir(), 'model-00001-of-00002.safetensors'), 'valuable-1');
+    writeFileSync(join(finalDir(), 'model-00002-of-00002.safetensors'), 'valuable-2');
+    expect((await discoverLocalChatModels(modelsDir)).map((model) => model.path)).toEqual([finalDir()]);
+    const blocker = slugItem().blocker!;
+    expect(blocker).toMatchObject({ holdsModel: true, listed: true });
+    expect(() => manager().start(REPO, { replaceBlocker: blocker })).toThrow(
+      `"${SLUG}" holds a model that the app did not create. Remove it yourself if you do not need it.`,
+    );
+    expect(readFileSync(join(finalDir(), 'model-00001-of-00002.safetensors'), 'utf-8')).toBe('valuable-1');
+  });
+
+  it.each<[string, number]>([
+    ['cannot be read or written', 0o000],
+    ['can be read but not written', 0o500],
+  ])('refuses at the request a directory the swap cannot move: one that %s', (_name, mode) => {
+    plantLeftover();
+    chmodSync(finalDir(), mode);
+    try {
+      const echo = { ...slugItem().blocker! };
+      const m = manager();
+      expect(() => m.start(REPO, { replaceBlocker: echo })).toThrow(DownloadConflictError);
+      expect(() => m.start(REPO, { replaceBlocker: echo })).toThrow(
+        `The app cannot move "${SLUG}": it has no write permission on it. Change its permissions, then try again.`,
+      );
+      expect(m.jobs()).toEqual([]);
+      expect(hub.downloaded).toEqual([]);
+    } finally {
+      chmodSync(finalDir(), 0o700);
+    }
+    expect(leftoverIntact()).toBe(true);
+  });
+
+  it('refuses at job start when the entry changed after the request', async () => {
+    plantLeftover();
+    const m = manager();
+    const id = m.start(REPO, { replaceBlocker: ONE_FILE });
+    writeFileSync(join(finalDir(), 'added.txt'), 'x');
+    const events = await settled(m, id);
+    expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+    expect(leftoverIntact()).toBe(true);
+    expect(hub.downloaded).toEqual([]);
+  });
+
+  it('refuses at the swap when a file was added during the download', async () => {
+    plantLeftover();
+    stagingHook.onVerifyWindow = () => writeFileSync(join(finalDir(), 'added.txt'), 'x');
+    const m = manager();
+    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
+    expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+    expect(leftoverIntact()).toBe(true);
+    expect(readFileSync(join(finalDir(), 'added.txt'), 'utf-8')).toBe('x');
+    expect(backupDirs()).toEqual([]);
+  });
+
+  it('checks the entry again right before it is moved aside', async () => {
+    plantLeftover();
+    raceHook.onMarkerWrite = () => writeFileSync(join(finalDir(), 'late.txt'), 'x');
+    const m = manager();
+    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
+    expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+    expect(leftoverIntact()).toBe(true);
+    expect(readFileSync(join(finalDir(), 'late.txt'), 'utf-8')).toBe('x');
+  });
+
+  it('refuses at the swap when the entry became a complete model during the download', async () => {
+    plantLeftover();
+    stagingHook.onVerifyWindow = () => {
+      writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
+      writeFileSync(join(finalDir(), WEIGHT), Buffer.alloc(300, 0xab));
+    };
+    const m = manager();
+    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
+    expect(errorOf(events)).toContain('holds a model that the app did not create');
+    expect(errorOf(events).endsWith('Nothing was removed.')).toBe(true);
+    expect(leftoverIntact()).toBe(true);
+    expect(readFileSync(join(finalDir(), WEIGHT))).toEqual(Buffer.alloc(300, 0xab));
+  });
+
+  it('installs when the entry was removed by hand during the download', async () => {
+    plantLeftover();
+    stagingHook.onVerifyWindow = () => rmSync(finalDir(), { recursive: true, force: true });
+    const m = manager();
+    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
+    expect(errorOf(events)).toBe('');
+    expect(isModelInstalled(finalDir())).toBe(true);
+  });
+
+  it('removes a dangling link as a link', async () => {
+    symlinkSync(join(modelsDir, 'nowhere'), finalDir());
+    const blocker = slugItem().blocker!;
+    expect(blocker).toMatchObject({ kind: 'symlink', dangling: true, fileCount: 0, sizeBytes: 0 });
+    const m = manager();
+    const events = await settled(m, m.start(REPO, { replaceBlocker: blocker }));
+    expect(errorOf(events)).toBe('');
+    expect(lstatSync(finalDir()).isSymbolicLink()).toBe(false);
+    expect(isModelInstalled(finalDir())).toBe(true);
+  });
+
+  it('removes a live link to an unmarked directory without touching its target', async () => {
+    const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
+    onTestFinished(() => rmSync(external, { recursive: true, force: true }));
+    writeFileSync(join(external, 'keep.txt'), Buffer.alloc(64, 0x33));
+    symlinkSync(external, finalDir());
+    const blocker = slugItem().blocker!;
+    expect(blocker).toMatchObject({ kind: 'symlink', dangling: false, fileCount: 0, sizeBytes: 0 });
+    const m = manager();
+    const events = await settled(m, m.start(REPO, { replaceBlocker: blocker }));
+    expect(errorOf(events)).toBe('');
+    expect(lstatSync(finalDir()).isSymbolicLink()).toBe(false);
+    expect(lstatSync(finalDir()).isDirectory()).toBe(true);
+    expect(readFileSync(join(external, 'keep.txt'))).toEqual(Buffer.alloc(64, 0x33));
+  });
+
+  it('replaces a regular file at the slug path', async () => {
+    writeFileSync(finalDir(), Buffer.alloc(40, 0x1));
+    const m = manager();
+    const events = await settled(
+      m,
+      m.start(REPO, { replaceBlocker: { kind: 'file', fileCount: 1, sizeBytes: 40, truncated: false } }),
+    );
+    expect(errorOf(events)).toBe('');
+    expect(lstatSync(finalDir()).isDirectory()).toBe(true);
+  });
+
+  it('replaces an empty directory', async () => {
+    mkdirSync(finalDir());
+    const m = manager();
+    const events = await settled(
+      m,
+      m.start(REPO, { replaceBlocker: { kind: 'directory', fileCount: 0, sizeBytes: 0, truncated: false } }),
+    );
+    expect(errorOf(events)).toBe('');
+    expect(isModelInstalled(finalDir())).toBe(true);
+  });
+
+  it('puts the foreign entry back when the swap rename fails', async () => {
+    plantLeftover();
+    renameFault.failFromPrefix = join(stagingRoot(), `${SLUG}@`);
+    const m = manager();
+    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
+    expect(errorOf(events).endsWith('. Nothing was removed.')).toBe(true);
+    expect(leftoverIntact()).toBe(true);
+    expect(readdirSync(finalDir())).toEqual([LEFTOVER]);
+    expect(backupDirs()).toEqual([]);
+    expect(reinstallDirs()).toEqual([]);
+  });
+
+  it('names the backup path, without "Nothing was removed", when the rollback fails too', async () => {
+    plantLeftover();
+    renameFault.failFromPrefix = join(stagingRoot(), `${SLUG}@`);
+    renameFault.alsoFailFromPrefix = join(stagingRoot(), `${SLUG}.reinstall-`);
+    const m = manager();
+    const message = errorOf(await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE })));
+    const [backup] = reinstallDirs();
+    expect(message).toBe(
+      `The install failed and "${SLUG}" could not be put back. It is now at "${join(stagingRoot(), backup!)}".`,
+    );
+    expect(readFileSync(join(stagingRoot(), backup!, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
+  });
+
+  it('refuses a Reinstall while a plain job holds the repo, and hands back a running Reinstall', async () => {
+    const block = makeCancelFetch({ 'config.json': 12, [WEIGHT]: 300 }, WEIGHT, () => {});
+    const plain = manager(block);
+    const plainId = plain.start(REPO);
+    plantLeftover();
+    expect(() => plain.start(REPO, { replaceBlocker: ONE_FILE })).toThrow(
+      'A download of this model is already in the queue. Cancel it, then use Reinstall.',
+    );
+    plain.cancel(plainId);
+    await settled(plain, plainId);
+
+    const m = manager(block);
+    const id = m.start(REPO, { replaceBlocker: ONE_FILE });
+    expect(m.start(REPO, { replaceBlocker: ONE_FILE })).toBe(id);
+    m.cancel(id);
+    await settled(m, id);
+    expect(leftoverIntact()).toBe(true);
+  });
+
+  it('compares a truncated walk by kind only', async () => {
+    // Past the size walk's budget, inside the held-model scan's larger one, and no file is named like a model.
+    const deep = join(finalDir(), 'a', 'b');
+    mkdirSync(deep, { recursive: true });
+    for (let i = 0; i < 2_001; i++) writeFileSync(join(deep, `f${i}`), '');
+    const blocker = slugItem().blocker!;
+    expect(blocker.truncated).toBe(true);
+    expect(blocker.holdsModel).toBe(false);
+    const m = manager();
+    expect(() =>
+      m.start(REPO, { replaceBlocker: { kind: 'directory', fileCount: 7, sizeBytes: 0, truncated: false } }),
+    ).toThrow(DownloadConflictError);
+    const events = await settled(
+      m,
+      m.start(REPO, { replaceBlocker: { kind: 'directory', fileCount: 7, sizeBytes: 99, truncated: true } }),
+    );
+    expect(errorOf(events)).toBe('');
+    expect(isModelInstalled(finalDir())).toBe(true);
+  });
+
+  describe('an outside writer at the swap', () => {
+    it('puts the entry back when model files arrive between the last check and the rename', async () => {
+      plantLeftover();
+      renameHook.from = finalDir();
+      renameHook.before = () => {
+        writeFileSync(join(finalDir(), 'config.json'), 'arrived');
+        writeFileSync(join(finalDir(), 'model.safetensors'), 'arrived');
+      };
+      const m = manager();
+      const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
+      expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+      expect(readFileSync(join(finalDir(), 'model.safetensors'), 'utf-8')).toBe('arrived');
+      expect(leftoverIntact()).toBe(true);
+      expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
+      expect(reinstallDirs()).toEqual([]);
+    });
+
+    it('puts the entry back when a directory of the same shape was swapped in before the rename', async () => {
+      plantLeftover();
+      const original = join(modelsDir, 'original');
+      renameHook.from = finalDir();
+      renameHook.before = () => {
+        renameSync(finalDir(), original);
+        plantLeftover();
+      };
+      const m = manager();
+      const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
+      expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+      expect(leftoverIntact()).toBe(true);
+      expect(readdirSync(original)).toEqual([LEFTOVER]);
+      expect(reinstallDirs()).toEqual([]);
+    });
+
+    it('keeps a changed entry at a named path when its own path is taken again after the rename', async () => {
+      plantLeftover();
+      renameHook.from = finalDir();
+      renameHook.before = () => writeFileSync(join(finalDir(), 'late.safetensors'), 'arrived');
+      renameHook.after = () => {
+        mkdirSync(finalDir());
+        writeFileSync(join(finalDir(), 'other.txt'), 'other');
+      };
+      const m = manager();
+      const message = errorOf(await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE })));
+      const kept = readdirSync(stagingRoot()).filter((n) => n.startsWith(`${SLUG}.kept-`));
+      expect(kept).toHaveLength(1);
+      const keptDir = join(stagingRoot(), kept[0]!);
+      expect(message).toBe(
+        `"${SLUG}" changed on disk during the download, and something else is now at its path. ` +
+          `The old entry is at "${keptDir}". Nothing was removed.`,
+      );
+      expect(readFileSync(join(keptDir, 'late.safetensors'), 'utf-8')).toBe('arrived');
+      expect(readFileSync(join(keptDir, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
+      expect(readdirSync(finalDir())).toEqual(['other.txt']);
+      // No sweep removes a kept entry, even once a model is installed at the slug.
+      rmSync(finalDir(), { recursive: true });
+      const next = manager();
+      expect(errorOf(await settled(next, next.start(REPO)))).toBe('');
+      expect(isModelInstalled(finalDir())).toBe(true);
+      expect(readdirSync(keptDir).sort()).toEqual([LEFTOVER, 'late.safetensors']);
+    });
+  });
+
+  describe('a crash between moving the old entry aside and deleting it', () => {
+    const DEAD_PID = 999999999;
+    function reinstallBackup(pid: number = DEAD_PID): string {
+      return join(stagingRoot(), `${SLUG}.reinstall-${pid}.55555555-5555-5555-5555-555555555555`);
+    }
+    /** The disk as a Reinstall left it when it died right after `rename(finalDir, backup)`. */
+    function crashedAfterFirstRename(pid: number = DEAD_PID): string {
+      plantLeftover();
+      const deadStaging = join(stagingRoot(), `${SLUG}@${SHA_DEFAULT}.${pid}.66666666-6666-6666-6666-666666666666`);
+      mkdirSync(deadStaging, { recursive: true });
+      writeFileSync(join(deadStaging, 'config.json'), 'new');
+      const backup = reinstallBackup(pid);
+      renameSync(finalDir(), backup);
+      return backup;
+    }
+
+    it('puts the old entry back when the manager starts, and the card offers Reinstall again', async () => {
+      const backup = crashedAfterFirstRename();
+      expect(slugItem().blocker).toBeNull();
+      manager();
+      await waitFor(() => existsSync(finalDir()));
+      expect(existsSync(backup)).toBe(false);
+      expect(leftoverIntact()).toBe(true);
+      expect(slugItem().blocker).toMatchObject({ ...ONE_FILE, holdsModel: false });
+    });
+
+    it('puts the old entry back before a job for the slug runs, and refuses the plain install', async () => {
+      const m = manager();
+      await settled(m, m.start(REPO_OTHER));
+      const backup = crashedAfterFirstRename();
+      const events = await settled(m, m.start(REPO));
+      expect(errorOf(events)).toContain('Refusing to install over');
+      expect(existsSync(backup)).toBe(false);
+      expect(leftoverIntact()).toBe(true);
+      expect(jobStagingDirs()).toEqual([]);
+    });
+
+    it('removes the backup once the new model is in place', async () => {
+      const m = manager();
+      expect(errorOf(await settled(m, m.start(REPO)))).toBe('');
+      expect(isModelInstalled(finalDir())).toBe(true);
+      const backup = reinstallBackup();
+      mkdirSync(join(backup, 'sub'), { recursive: true });
+      writeFileSync(join(backup, 'sub', LEFTOVER), 'old');
+      manager();
+      await waitFor(() => !existsSync(backup));
+      expect(isModelInstalled(finalDir())).toBe(true);
+    });
+
+    it('never removes a backup that holds model files, or one whose path something else took', async () => {
+      const m = manager();
+      expect(errorOf(await settled(m, m.start(REPO)))).toBe('');
+      const heldBackup = reinstallBackup();
+      mkdirSync(heldBackup, { recursive: true });
+      writeFileSync(join(heldBackup, 'model.safetensors'), 'arrived');
+      const again = manager();
+      await settled(again, again.start(REPO));
+      expect(readFileSync(join(heldBackup, 'model.safetensors'), 'utf-8')).toBe('arrived');
+
+      rmSync(finalDir(), { recursive: true });
+      mkdirSync(finalDir());
+      writeFileSync(join(finalDir(), 'someone-else.txt'), 'x');
+      const foreignBackup = join(stagingRoot(), `${SLUG}.reinstall-${DEAD_PID}.77777777-7777-7777-7777-777777777777`);
+      mkdirSync(foreignBackup);
+      writeFileSync(join(foreignBackup, LEFTOVER), 'old');
+      const third = manager();
+      await settled(third, third.start(REPO));
+      expect(readFileSync(join(foreignBackup, LEFTOVER), 'utf-8')).toBe('old');
+      expect(readdirSync(finalDir())).toEqual(['someone-else.txt']);
+    });
+
+    it('leaves the backup of a live owner alone', async () => {
+      const backup = crashedAfterFirstRename(process.pid);
+      const m = manager();
+      await settled(m, m.start(REPO));
+      expect(readFileSync(join(backup, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
+      expect(existsSync(finalDir())).toBe(true);
+    });
+  });
+
+  it('never lets Delete and Reinstall act on the same entry: Delete needs a config.json, Reinstall refuses one', () => {
+    const layouts: Array<() => void> = [
+      plantLeftover,
+      () => {
+        mkdirSync(finalDir());
+        writeFileSync(join(finalDir(), 'config.json'), '{}');
+      },
+      () => mkdirSync(join(finalDir(), 'config.json'), { recursive: true }),
+      () => {
+        const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
+        onTestFinished(() => rmSync(external, { recursive: true, force: true }));
+        writeFileSync(join(external, 'config.json'), '{}');
+        symlinkSync(external, finalDir());
+      },
+    ];
+    for (const plant of layouts) {
+      rmSync(finalDir(), { recursive: true, force: true });
+      plant();
+      const held = slugItem().blocker!.holdsModel;
+      let deleted = true;
+      try {
+        deleteLocalModel(modelsDir, SLUG);
+      } catch {
+        deleted = false;
+      }
+      expect(deleted).toBe(held);
+    }
+  });
+
+  describe('through the route', () => {
+    function post(m: DownloadManager, body: unknown): ReturnType<typeof dispatch> {
+      const ctx = { downloads: m, modelsDir } as unknown as ApiContext;
+      return dispatch(ctx, { method: 'POST', pathname: '/api/downloads', query: new URLSearchParams(), body });
+    }
+
+    it.each<[string, unknown]>([
+      ['a string', 'directory'],
+      ['an unknown kind', { ...ONE_FILE, kind: 'folder' }],
+      ['a negative count', { ...ONE_FILE, fileCount: -1 }],
+      ['a fractional size', { ...ONE_FILE, sizeBytes: 1.5 }],
+      ['a non-boolean truncated', { ...ONE_FILE, truncated: 'no' }],
+    ])('answers 400 for %s', async (_name, replaceBlocker) => {
+      plantLeftover();
+      const m = manager();
+      const res = await post(m, { repo: REPO, replaceBlocker });
+      expect(res.status).toBe(400);
+      expect(m.jobs()).toEqual([]);
+    });
+
+    it('ignores a path in the body: the target is the slug of the repo', async () => {
+      plantLeftover();
+      const elsewhere = join(modelsDir, 'elsewhere');
+      mkdirSync(elsewhere);
+      writeFileSync(join(elsewhere, 'keep'), 'k');
+      const m = manager();
+      const res = await post(m, { repo: REPO, replaceBlocker: ONE_FILE, path: elsewhere, slug: 'elsewhere' });
+      expect(res.status).toBe(202);
+      await settled(m, (res.ok ? (res.body as { id: string }) : { id: '' }).id);
+      expect(readFileSync(join(elsewhere, 'keep'), 'utf-8')).toBe('k');
+      expect(isModelInstalled(finalDir())).toBe(true);
+    });
+
+    it('maps a conflict to 409 with the gate text', async () => {
+      plantLeftover();
+      const res = await post(manager(), { repo: REPO, replaceBlocker: { ...ONE_FILE, fileCount: 3 } });
+      expect(res.status).toBe(409);
+      expect(res.ok ? '' : res.message).toBe(`"${SLUG}" changed on disk. Check it, then try again.`);
+    });
+
+    it('runs the whole flow: catalog blocker, POST with the echo, done, installed', async () => {
+      plantLeftover();
+      const ctx = { downloads: manager(), modelsDir } as unknown as ApiContext;
+      const get = (pathname: string) => dispatch(ctx, { method: 'GET', pathname, query: new URLSearchParams() });
+      const before = await get('/api/catalog');
+      const item = (
+        before.ok ? (before.body as { items: Array<{ slug: string; blocker: ReplaceBlocker }> }) : { items: [] }
+      ).items.find((entry) => entry.slug === SLUG)!;
+      const { kind, fileCount, sizeBytes, truncated } = item.blocker;
+      const res = await post(ctx.downloads as DownloadManager, {
+        repo: REPO,
+        replaceBlocker: { kind, fileCount, sizeBytes, truncated },
+      });
+      expect(res.status).toBe(202);
+      await settled(ctx.downloads as DownloadManager, (res.ok ? (res.body as { id: string }) : { id: '' }).id);
+      const after = await get('/api/catalog');
+      expect(
+        (after.ok ? (after.body as { items: Array<{ slug: string }> }) : { items: [] }).items.find(
+          (e) => e.slug === SLUG,
+        ),
+      ).toMatchObject({ installed: true, blocker: null });
+      // The stub download writes zero bytes, so the new config.json does not parse and the listing cannot show it.
+      expect(readdirSync(finalDir())).not.toContain(LEFTOVER);
+    });
   });
 });

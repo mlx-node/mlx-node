@@ -15,6 +15,21 @@
 
 import type { Handler, MainApiContext, WorkerApiContext } from './context.js';
 import { handleCacheDelete, handleCacheGet } from './handlers/cache.js';
+import {
+  handleChatAgent,
+  handleChatCancel,
+  handleChatConversations,
+  handleChatCreate,
+  handleChatDelete,
+  handleChatDraftPermissionMode,
+  handleChatEngineUnload,
+  handleChatInteraction,
+  handleChatPatch,
+  handleChatPermissionMode,
+  handleChatPrompt,
+  handleChatState,
+  handleChatWorkHooks,
+} from './handlers/chat.js';
 import { handleCodingAgents, handleCodingAgentAction } from './handlers/coding-agents.js';
 import {
   handleDownloadCancel,
@@ -24,7 +39,14 @@ import {
 } from './handlers/downloads.js';
 import { handleHealth } from './handlers/health.js';
 import { handleIngest } from './handlers/ingest.js';
-import { handleMetricsOverview } from './handlers/metrics.js';
+import {
+  handleMetricsDistributions,
+  handleMetricsModels,
+  handleMetricsSpeculative,
+  handleMetricsSummary,
+  handleMetricsTimeseries,
+  handleMetricsTurns,
+} from './handlers/metrics.js';
 import {
   handleCatalog,
   handleCatalogUpdates,
@@ -33,10 +55,20 @@ import {
   handleCodingAgentModels,
 } from './handlers/models.js';
 import {
+  handleProviderKeyDelete,
+  handleProviderKeyPut,
+  handleProviderSelection,
+  handleProvidersList,
+  handleProviderValidate,
+} from './handlers/providers.js';
+import { handleRuntimeLive } from './handlers/runtime-live.js';
+import { handleRuntimeSeries } from './handlers/runtime.js';
+import {
   handleSessionDelete,
   handleSessionDetail,
   handleSessionRename,
   handleSessionsList,
+  handleSessionTimeline,
 } from './handlers/sessions.js';
 
 /** Which thread answers a route. */
@@ -115,12 +147,42 @@ export const ROUTES: Route[] = [
   mainRoute('POST', '/api/downloads', handleDownloadStart, { successStatus: 202 }),
   mainRoute('DELETE', '/api/downloads/:id', handleDownloadCancel),
   mainRoute('GET', '/api/downloads/:id/events', handleDownloadEventsUnsupported, { stream: true }),
-  workerRoute('GET', '/api/metrics/overview', handleMetricsOverview),
+  workerRoute('GET', '/api/metrics/models', handleMetricsModels),
+  workerRoute('GET', '/api/metrics/summary', handleMetricsSummary),
+  workerRoute('GET', '/api/metrics/timeseries', handleMetricsTimeseries),
+  workerRoute('GET', '/api/metrics/distributions', handleMetricsDistributions),
+  workerRoute('GET', '/api/metrics/speculative', handleMetricsSpeculative),
+  workerRoute('GET', '/api/metrics/turns', handleMetricsTurns),
+  workerRoute('GET', '/api/runtime/series', handleRuntimeSeries),
+  // Small files read with async fs on the transport thread; no database involved.
+  mainRoute('GET', '/api/runtime/live', handleRuntimeLive),
   workerRoute('GET', '/api/cache', handleCacheGet),
   workerRoute('DELETE', '/api/cache', handleCacheDelete),
   workerRoute('POST', '/api/ingest', handleIngest),
   workerRoute('GET', '/api/sessions', handleSessionsList),
   workerRoute('GET', '/api/sessions/:id', handleSessionDetail),
+  workerRoute('GET', '/api/sessions/:id/timeline', handleSessionTimeline),
   workerRoute('PATCH', '/api/sessions/:id', handleSessionRename),
   workerRoute('DELETE', '/api/sessions/:id', handleSessionDelete),
+  // Chat routes own agent processes and their streams, so they live with the transport. Only the list reads the
+  // session folders synchronously, on the worker.
+  mainRoute('GET', '/api/chat/state', handleChatState),
+  workerRoute('GET', '/api/chat/conversations', handleChatConversations),
+  mainRoute('POST', '/api/chat/conversations', handleChatCreate, { successStatus: 201 }),
+  mainRoute('POST', '/api/chat/conversations/:id/prompt', handleChatPrompt, { successStatus: 202 }),
+  mainRoute('POST', '/api/chat/conversations/:id/cancel', handleChatCancel),
+  mainRoute('POST', '/api/chat/conversations/:id/interactions/:iid', handleChatInteraction),
+  mainRoute('POST', '/api/chat/conversations/:id/permission-mode', handleChatPermissionMode),
+  mainRoute('POST', '/api/chat/drafts/:draft/permission-mode', handleChatDraftPermissionMode),
+  mainRoute('GET', '/api/chat/work/hooks', handleChatWorkHooks),
+  mainRoute('PATCH', '/api/chat/conversations/:id', handleChatPatch),
+  mainRoute('DELETE', '/api/chat/conversations/:id', handleChatDelete),
+  mainRoute('POST', '/api/chat/agent', handleChatAgent),
+  mainRoute('POST', '/api/chat/engine/unload', handleChatEngineUnload),
+  // Provider routes call the Keychain and the provider APIs and hold the provider lock, with the Chat service.
+  mainRoute('GET', '/api/providers', handleProvidersList),
+  mainRoute('PUT', '/api/providers/selection', handleProviderSelection),
+  mainRoute('PUT', '/api/providers/:id/key', handleProviderKeyPut),
+  mainRoute('DELETE', '/api/providers/:id/key', handleProviderKeyDelete),
+  mainRoute('POST', '/api/providers/:id/validate', handleProviderValidate),
 ];

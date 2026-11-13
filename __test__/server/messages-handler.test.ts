@@ -4,8 +4,10 @@ import type { ChatMessage, ChatResult, ChatStreamProgress, ToolCallResult } from
 import { ChatSession, isContextCapacityError, type ChatStreamControl, type SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
-import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
+import { handleCreateMessage, type ServerThinking } from '../../packages/server/src/endpoints/messages.js';
+import { AGENT_HOST_THINKING } from '../../packages/server/src/host/agent-thinking.js';
 import { ModelWorkCoordinator } from '../../packages/server/src/model-work-coordinator.js';
+import type { TurnProgressSnapshot } from '../../packages/server/src/native-progress.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';
 
 // ---------------------------------------------------------------------------
@@ -1567,6 +1569,96 @@ describe('handleCreateMessage', () => {
       const msgDelta = events.find((e) => e.event === 'message_delta');
       expect((msgDelta!.data['delta'] as any).stop_reason).toBe('tool_use');
     });
+
+    // A Qwen ChatML turn as the native stream sends it once the decode keeps
+    // `</think>` and `<tool_call>`: the close rides the last reasoning delta,
+    // the answer or the call follows, and the done text is the post-reasoning
+    // answer. The stream must send the reasoning once and the answer once.
+    it.each([
+      {
+        label: 'tool call',
+        content: [
+          '\n\n',
+          '<tool_call>',
+          '\n<function=web_search>\n<parameter=query>\nFoobar 9 phone release date\n</parameter>\n</function>\n',
+          '</tool_call>',
+        ],
+        doneText: '',
+        toolCalls: [
+          { status: 'ok', id: 'call_1', name: 'web_search', arguments: '{"query":"Foobar 9 phone release date"}' },
+        ],
+        answer: '',
+        stopReason: 'tool_use',
+      },
+      {
+        label: 'answer',
+        content: ['\n\n', 'It is not ', 'out yet.'],
+        doneText: 'It is not out yet.',
+        toolCalls: [],
+        answer: 'It is not out yet.',
+        stopReason: 'end_turn',
+      },
+    ])(
+      'streams the reasoning and the $label once each',
+      async ({ content, doneText, toolCalls, answer, stopReason }) => {
+        const reasoning = 'The user wants the release date. Let me search the web.\n';
+        const registry = new ModelRegistry();
+        registry.register(
+          'test-model',
+          createMockStreamModel([
+            { text: 'The user wants the release date. ', done: false, isReasoning: true },
+            { text: 'Let me search the web.\n', done: false, isReasoning: true },
+            { text: '</think>', done: false, isReasoning: true },
+            ...content.map((text) => ({ text, done: false, isReasoning: false })),
+            {
+              text: doneText,
+              done: true,
+              finishReason: toolCalls.length > 0 ? 'tool_calls' : 'stop',
+              toolCalls,
+              thinking: reasoning.trim(),
+              numTokens: 40,
+              promptTokens: 400,
+              reasoningTokens: 12,
+              rawText: `${reasoning}</think>${content.join('')}`,
+            },
+          ]),
+        );
+        const { res, getBody } = createMockRes();
+        await handleCreateMessage(
+          res,
+          {
+            model: 'test-model',
+            messages: [{ role: 'user', content: 'Search the web for the release date of the Foobar 9 phone.' }],
+            max_tokens: 400,
+            stream: true,
+            tools: [
+              {
+                name: 'web_search',
+                input_schema: { type: 'object', properties: { query: { type: 'string' } } },
+              },
+            ],
+          },
+          registry,
+        );
+
+        const events = parseSSE(getBody());
+        const deltas = events.filter((e) => e.event === 'content_block_delta').map((e) => e.data['delta'] as any);
+        const thinking = deltas.filter((d) => d.type === 'thinking_delta').map((d) => d.thinking as string);
+        const text = deltas.filter((d) => d.type === 'text_delta').map((d) => d.text as string);
+        expect(thinking.join('')).toBe(reasoning);
+        expect(text.join('').trim()).toBe(answer);
+        const sent = [...thinking, ...text].join('');
+        expect(sent.split('Let me search the web.').length - 1).toBe(1);
+        expect(sent).not.toContain('<function=');
+        if (answer) expect(sent.split(answer).length - 1).toBe(1);
+        const tools = events.filter(
+          (e) => e.event === 'content_block_start' && (e.data['content_block'] as any).type === 'tool_use',
+        );
+        expect(tools.map((e) => (e.data['content_block'] as any).name)).toEqual(toolCalls.map((t) => t.name));
+        const msgDelta = events.find((e) => e.event === 'message_delta');
+        expect((msgDelta!.data['delta'] as any).stop_reason).toBe(stopReason);
+      },
+    );
 
     it('suppresses tool_call tag and skips text block when empty', async () => {
       const registry = new ModelRegistry();
@@ -7012,11 +7104,11 @@ const PROGRESS_DONE_EVENT = {
  */
 function createSteppedStreamModel(): {
   model: SessionCapableModel;
-  snapshot: { current: ChatStreamProgress | null };
+  snapshot: { current: TurnProgressSnapshot | null };
   push: (step: ProgressStep) => void;
   refs: Array<ChatStreamControl | undefined>;
 } {
-  const snapshot: { current: ChatStreamProgress | null } = { current: { phase: 'queued' } };
+  const snapshot: { current: TurnProgressSnapshot | null } = { current: { phase: 'queued' } };
   const pending: ProgressStep[] = [];
   const refs: Array<ChatStreamControl | undefined> = [];
   let wake: (() => void) | null = null;
@@ -7028,7 +7120,7 @@ function createSteppedStreamModel(): {
   };
   async function* stream(ref: ChatStreamControl | undefined): AsyncGenerator<Record<string, unknown>> {
     refs.push(ref);
-    if (ref !== undefined) ref.read = () => snapshot.current;
+    if (ref !== undefined) ref.read = () => snapshot.current as ChatStreamProgress | null;
     try {
       while (true) {
         while (pending.length === 0) {
@@ -7209,6 +7301,51 @@ describe('handleCreateMessage progress pings', () => {
     }
   });
 
+  it('puts the measured prefill window on the final message_delta usage', async () => {
+    vi.useFakeTimers();
+    try {
+      const mock = createSteppedStreamModel();
+      const { getBody, done } = await startStream(mock);
+      mock.snapshot.current = {
+        phase: 'done',
+        prefillTotal: 400,
+        prefillDone: 400,
+        cachedTokens: 0,
+        prefillElapsedMs: 250,
+        generatedTokens: 1,
+        decodeElapsedMs: 30,
+      };
+      mock.push({ event: PROGRESS_DONE_EVENT });
+      await vi.advanceTimersByTimeAsync(0);
+      await done;
+      const delta = parseSSE(getBody()).find((e) => e.event === 'message_delta');
+      expect(delta?.data['usage']).toMatchObject({ prefill_ms: 250, prefill_tokens: 400 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('leaves the prefill fields off a stream native did not measure', async () => {
+    vi.useFakeTimers();
+    try {
+      const mock = createSteppedStreamModel();
+      const { getBody, done } = await startStream(mock);
+      mock.snapshot.current = { phase: 'done', prefillElapsedMs: 250, decodeElapsedMs: 30 };
+      mock.push({ event: PROGRESS_DONE_EVENT });
+      await vi.advanceTimersByTimeAsync(0);
+      await done;
+      const usage = parseSSE(getBody()).find((e) => e.event === 'message_delta')?.data['usage'] as Record<
+        string,
+        unknown
+      >;
+      expect(usage).toBeDefined();
+      expect('prefill_ms' in usage).toBe(false);
+      expect('prefill_tokens' in usage).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('stops pinging once the client disconnects', async () => {
     vi.useFakeTimers();
     try {
@@ -7348,7 +7485,7 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
         undefined,
         undefined,
         undefined,
-        4096,
+        { tokenBudget: 4096 },
       );
       return (model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]?.thinkingTokenBudget;
     };
@@ -7356,6 +7493,68 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
     expect(await budgetFor({ thinking: { type: 'adaptive' } })).toBe(4096);
     expect(await budgetFor({ thinking: { type: 'enabled', budget_tokens: 2048 } })).toBe(2048);
     expect(await budgetFor({ extra_body: { reasoning_effort: 'none' } })).toBeUndefined();
+  });
+
+  // The agent hosts' three server options. Mutation: apply them for effort `none` → red.
+  it('sends the server budget, cycle guard and end text to native, never for effort none', async () => {
+    const thinkingOf = async (
+      extra: Record<string, unknown>,
+      server: ServerThinking | undefined,
+    ): Promise<Record<string, unknown>> => {
+      const registry = new ModelRegistry();
+      const model = createMockModel();
+      registry.register('test-model', model);
+      const { res } = createMockRes();
+      await handleCreateMessage(
+        res,
+        { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: 16, ...extra },
+        registry,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        server,
+      );
+      const config = ((model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] ?? {}) as Record<
+        string,
+        unknown
+      >;
+      return {
+        budget: config.thinkingTokenBudget,
+        guard: config.thinkingCycleGuard,
+        endText: config.thinkingEndText,
+        from: (config.turnMeta as { thinkingBudgetFrom?: string } | undefined)?.thinkingBudgetFrom,
+      };
+    };
+    const host = {
+      tokenBudget: AGENT_HOST_THINKING.tokenBudget,
+      cycleGuard: AGENT_HOST_THINKING.cycleGuard,
+      endText: AGENT_HOST_THINKING.endText,
+    };
+    expect(await thinkingOf({}, host)).toEqual({
+      budget: 12_000,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+      from: 'server',
+    });
+    expect(await thinkingOf({ thinking: { type: 'enabled', budget_tokens: 2048 } }, host)).toEqual({
+      budget: 2048,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+      from: 'request',
+    });
+    expect(await thinkingOf({ extra_body: { reasoning_effort: 'none' } }, host)).toEqual({
+      budget: undefined,
+      guard: undefined,
+      endText: undefined,
+      from: undefined,
+    });
+    expect(await thinkingOf({}, undefined)).toEqual({
+      budget: undefined,
+      guard: undefined,
+      endText: undefined,
+      from: undefined,
+    });
   });
 
   // Splash `StreamingToolCallProjector._begin_call`: an opening that names no function
@@ -7552,5 +7751,58 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
       expect(got.text).toBe(`BEFORE ${plain} MID `);
       expect(got.stopReason).toBe('stop_sequence');
     });
+  });
+});
+
+describe('handleCreateMessage trace metadata', () => {
+  it('a non-streamed response carries no prefill window', async () => {
+    const registry = new ModelRegistry();
+    registry.register('test-model', createMockModel());
+    const { res, getStatus, getBody } = createMockRes();
+    await handleCreateMessage(
+      res,
+      { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], max_tokens: 100 },
+      registry,
+    );
+    expect(getStatus()).toBe(200);
+    const usage = (JSON.parse(getBody()) as { usage: Record<string, unknown> }).usage;
+    expect('prefill_ms' in usage).toBe(false);
+    expect('prefill_tokens' in usage).toBe(false);
+  });
+
+  it('stamps turnMeta on the dispatched config', async () => {
+    const registry = new ModelRegistry();
+    const coordinator = new ModelWorkCoordinator();
+    const mockModel = createMockModel();
+    const resolveModel = vi.fn(async (name: string) => {
+      if (!registry.get(name)) registry.register(name, mockModel);
+    });
+    const { res, getStatus } = createMockRes();
+
+    await handleCreateMessage(
+      res,
+      { model: 'test-model', messages: [{ role: 'user', content: 'hi' }], max_tokens: 100 },
+      registry,
+      undefined,
+      null,
+      resolveModel,
+      coordinator,
+    );
+
+    expect(getStatus()).toBe(200);
+    // oxlint-disable-next-line @typescript-eslint/unbound-method
+    const startSpy = mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>;
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    const [, config] = startSpy.mock.calls[0] as [unknown, { modelAlias?: string; turnMeta?: Record<string, unknown> }];
+    expect(config.modelAlias).toBe('test-model');
+    expect(config.turnMeta).toEqual({
+      endpoint: 'messages',
+      queueMs: expect.any(Number),
+      loadWaitMs: expect.any(Number),
+      resolveMs: expect.any(Number),
+      preDispatchMs: expect.any(Number),
+    });
+    const meta = config.turnMeta as { queueMs: number; preDispatchMs: number };
+    expect(meta.preDispatchMs).toBeGreaterThanOrEqual(meta.queueMs);
   });
 });

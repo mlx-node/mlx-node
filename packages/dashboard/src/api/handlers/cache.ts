@@ -5,6 +5,7 @@ import { TRACE_RETENTION_DAYS } from '../../ingest/traces.js';
 import type { ApiPaths, ApiRequest, WorkerApiContext } from '../context.js';
 import { requireBody, toInt } from '../context.js';
 import { ApiError } from '../errors.js';
+import { bucketSql } from '../sql.js';
 
 /**
  * Cold-tier view for ONE cache root: the on-disk scan, the trace-derived trend
@@ -43,6 +44,8 @@ import { ApiError } from '../errors.js';
  *    the restore allowlist). Their deltas are all zero, so they are counted but
  *    carry no lookups. Overlaps the buckets above by design: it is a TURN
  *    count, not a lookup bucket.
+ *  - `enabledTurns` — the tier was on, whatever the root: with `disabledTurns`
+ *    the measured answer to "did the turns run with the disk cache".
  *  - `unrootedSidecarCaptures` — the one delta a rootless turn can still carry,
  *    and the reason "their deltas are all zero" is true of the BLOCK counters
  *    only. `record_capture_reached()` is the first statement of every family's
@@ -91,17 +94,18 @@ export function handleCacheGet(ctx: WorkerApiContext): unknown {
   // their own environments, and on macOS `/tmp` → `/private/tmp` alone makes
   // two identical-looking spellings unequal.
   const scopeRoot = canonicalCacheRoot(requestedRoot);
+  // Local-day buckets on the same epoch-ms axis every other page uses.
   const trend = ctx.dash.sqlite
     .prepare(
-      `SELECT date(ts / 1000, 'unixepoch') AS day,
+      `SELECT ${bucketSql('day')} AS t,
               COALESCE(SUM(cold_hits), 0) AS hits, COALESCE(SUM(cold_misses), 0) AS misses,
               COALESCE(SUM(cold_bytes_written), 0) AS bytesWritten,
               COALESCE(SUM(cold_bytes_restored), 0) AS bytesRestored
-       FROM traces WHERE ts > 0 AND cold_root = ? GROUP BY day ORDER BY day`,
+       FROM traces WHERE ts > 0 AND cold_root = ? GROUP BY t ORDER BY t`,
     )
     .all(scopeRoot)
     .map((row) => ({
-      day: String(row.day),
+      t: toInt(row.t),
       hits: toInt(row.hits),
       misses: toInt(row.misses),
       bytesWritten: toInt(row.bytesWritten),
@@ -109,7 +113,8 @@ export function handleCacheGet(ctx: WorkerApiContext): unknown {
     }));
 
   // `CASE WHEN` rather than `FILTER` — portable across whatever SQLite the
-  // bundled `node:sqlite` links.
+  // bundled `node:sqlite` links. Failed turns carry no cold fields at all, so
+  // without the outcome guard every one of them would count as a legacy turn.
   const excluded = ctx.dash.sqlite
     .prepare(
       `SELECT
@@ -126,9 +131,10 @@ export function handleCacheGet(ctx: WorkerApiContext): unknown {
          COALESCE(SUM(CASE WHEN cold_root IS NULL AND cold_enabled IS NOT NULL AND cold_enabled <> 0
                            THEN cold_misses END), 0) AS unattributedMisses,
          COUNT(CASE WHEN cold_enabled = 0 THEN 1 END) AS disabledTurns,
+         COUNT(CASE WHEN cold_enabled IS NOT NULL AND cold_enabled <> 0 THEN 1 END) AS enabledTurns,
          COALESCE(SUM(CASE WHEN cold_root IS NULL THEN cold_sidecar_capture_reached END), 0)
            AS unrootedSidecarCaptures
-       FROM traces WHERE ts > 0`,
+       FROM traces WHERE ts > 0 AND outcome = 'ok'`,
     )
     .get(scopeRoot, scopeRoot, scopeRoot);
 
@@ -181,6 +187,7 @@ export function handleCacheGet(ctx: WorkerApiContext): unknown {
         misses: toInt(excluded?.unattributedMisses),
       },
       disabledTurns: toInt(excluded?.disabledTurns),
+      enabledTurns: toInt(excluded?.enabledTurns),
       // The one counter above that keeps moving after the root is gone, so the
       // one the buckets above cannot stand in for: they carry hits and misses,
       // and a tier-less turn has neither. Reported here rather than merged into

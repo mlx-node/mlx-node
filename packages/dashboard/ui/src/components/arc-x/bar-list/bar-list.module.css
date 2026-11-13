@@ -1,0 +1,216 @@
+.root {
+  display: grid;
+  min-width: 0;
+  justify-items: start;
+  gap: var(--space-2);
+}
+
+.list {
+  display: grid;
+  width: 100%;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.row {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  min-height: var(--row-height-dense);
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  overflow: hidden;
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-chip);
+  font-size: var(--text-sm);
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .row[data-link]:hover {
+    background: var(--row-hover);
+  }
+}
+
+.fill,
+.cap {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.fill {
+  border-radius: var(--radius-chip);
+  background: color-mix(in oklab, var(--c) 16%, transparent);
+  clip-path: inset(0 var(--rest) 0 0 round var(--radius-chip));
+  transition: clip-path var(--duration-considered) var(--ease-standard);
+}
+
+.fill[data-pattern='hatch'] {
+  background:
+    repeating-linear-gradient(45deg, color-mix(in oklab, var(--c) 30%, transparent) 0 1px, transparent 1px 5px),
+    color-mix(in oklab, var(--c) 5%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--c) 24%, transparent);
+}
+
+.cap {
+  transform: translateX(calc(-1 * var(--rest)));
+  transition: transform var(--duration-considered) var(--ease-standard);
+}
+
+.cap::after {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 2px;
+  border-radius: 1px;
+  background: var(--c);
+  content: '';
+}
+
+.label {
+  position: relative;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.labelText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.link::after {
+  position: absolute;
+  inset: 0;
+  content: '';
+}
+
+.link:focus-visible {
+  outline: none;
+}
+
+.row:has(.link:focus-visible) {
+  outline: var(--focus-outline-width, 2px) solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.reading {
+  position: relative;
+  display: flex;
+  flex: none;
+  align-items: baseline;
+  gap: var(--space-1);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.unit,
+.hint {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.hint {
+  margin-left: var(--space-1-5);
+  color: var(--text-secondary);
+}
+
+.low {
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-mark);
+  background: var(--surface-muted);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.empty {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.row[data-arrive] {
+  animation: bar-list-reveal var(--duration-standard) var(--ease-enter) both;
+}
+
+[data-entrance='pending'] .row {
+  opacity: 0;
+}
+
+[data-entrance='pending'] .fill,
+[data-entrance='pending'] .cap {
+  opacity: 0;
+}
+
+[data-entrance='run'] .row {
+  animation: bar-list-reveal var(--duration-standard) var(--ease-enter) calc(var(--step) * var(--stagger-item)) both;
+}
+
+[data-entrance='run'] .fill {
+  animation: bar-list-fill var(--duration-considered) var(--ease-standard) calc(var(--step) * var(--stagger-item)) both;
+}
+
+[data-entrance='run'] .cap {
+  animation: bar-list-cap var(--duration-considered) var(--ease-standard) calc(var(--step) * var(--stagger-item)) both;
+}
+
+@keyframes bar-list-reveal {
+  from {
+    opacity: 0;
+    translate: 0 4px;
+  }
+  to {
+    opacity: 1;
+    translate: 0 0;
+  }
+}
+
+@keyframes bar-list-fill {
+  from {
+    clip-path: inset(0 100% 0 0 round var(--radius-chip));
+  }
+  to {
+    clip-path: inset(0 var(--rest) 0 0 round var(--radius-chip));
+  }
+}
+
+@keyframes bar-list-cap {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(calc(-1 * var(--rest)));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .row {
+    transition-duration: var(--duration-instant);
+  }
+  .fill,
+  .cap {
+    transition: none;
+  }
+  .row[data-arrive] {
+    animation: none;
+  }
+  [data-entrance='run'] .row,
+  [data-entrance='run'] .fill,
+  [data-entrance='run'] .cap {
+    animation: none;
+  }
+}

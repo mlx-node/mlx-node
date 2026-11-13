@@ -187,6 +187,45 @@ describe('_runChatStream bridge', () => {
     }
   });
 
+  // Mutation: drop the four copies from the terminal chunk → red.
+  it('copies the native thought outcome to the final event when the chunk carries it', async () => {
+    const native = (
+      _messages: unknown[],
+      _config: unknown,
+      callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+    ): Promise<ChatStreamHandle> => {
+      const handle = { cancel: () => {} } as ChatStreamHandle;
+      setTimeout(() => {
+        callback(null, {
+          text: 'done',
+          done: true,
+          finishReason: 'length',
+          toolCalls: [],
+          thinking: null,
+          thinkingEnabled: true,
+          numTokens: 1,
+          rawText: 'done',
+          reasoningClose: 'budget',
+          reasoningCutAt: 12_000,
+          reasoningCyclePeriod: 930,
+          reasoningStrayCloses: 0,
+        } as unknown as ChatStreamChunk);
+      }, 0);
+      return Promise.resolve(handle);
+    };
+    let finalEvent: ChatStreamEvent | null = null;
+    const gen = _runChatStream((callback) => native([{ role: 'user', content: 'Hi' }], null, callback));
+    for await (const event of gen) {
+      if (event.done) finalEvent = event;
+    }
+    expect(finalEvent).toMatchObject({
+      reasoningClose: 'budget',
+      reasoningCutAt: 12_000,
+      reasoningCyclePeriod: 930,
+      reasoningStrayCloses: 0,
+    });
+  });
+
   it('should cancel generation on break via finally block', async () => {
     let cancelCalled = false;
     const native = (
@@ -358,7 +397,7 @@ describe('_runChatStream bridge', () => {
   });
 
   it('fills the progress ref once the native handle resolves and clears it when the stream ends', async () => {
-    const snapshot: ChatStreamProgress = { phase: 'prefill', prefillTotal: 10, prefillDone: 4 };
+    const snapshot = { phase: 'prefill', prefillTotal: 10, prefillDone: 4 } as ChatStreamProgress;
     const progress = vi.fn(() => snapshot);
     let callback!: (err: Error | null, chunk: ChatStreamChunk) => void;
     let resolveHandle!: (handle: ChatStreamHandle) => void;

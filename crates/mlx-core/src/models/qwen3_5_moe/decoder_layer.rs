@@ -418,8 +418,10 @@ impl DecoderLayer {
     }
 
     /// One text decode forward over independent paged/GDN request rows.
-    /// Sparse expert routing already flattens `[B,T,H]`, so the MoE tail uses
-    /// the same batched tensor as attention without a serial fallback.
+    /// The MoE tail routes the batched `[B,T,H]` tensor, unless
+    /// `preserve_singleton_projection_graphs` runs every projection, GDN
+    /// layer and MoE block on each row's own graph (row-exact loads and the
+    /// MTP verify).
     pub(crate) fn forward_paged_batched(
         &mut self,
         x: &MxArray,

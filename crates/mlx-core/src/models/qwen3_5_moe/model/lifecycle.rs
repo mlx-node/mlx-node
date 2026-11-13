@@ -111,6 +111,8 @@ impl Qwen35MoeInner {
             gdn_root_cache_owner_is_explicit: false,
             gdn_prefix_checkpoints: VecDeque::new(),
             gdn_unclaimed_rungs: HashMap::new(),
+            refused_rungs_booked: true,
+            persist_cold: false,
             gdn_last_history_checkpoint: None,
             gdn_in_use: HashMap::new(),
             gdn_restored_from: None,
@@ -122,7 +124,7 @@ impl Qwen35MoeInner {
             paged_gdn_state_dirty: false,
             paged_adapter,
             row_exact_decode_projections: false,
-            scheduled_recurrent: RecurrentStateTable::stage2(),
+            scheduled_recurrent: RecurrentStateTable::new(HYBRID_LIVE_STATE_UNITS),
             scheduled_mtp: Default::default(),
             active_scheduled_seq: None,
             mtp,
@@ -160,6 +162,7 @@ impl Qwen35MoeInner {
                 recurrent,
                 self.has_mtp_weights(),
                 None,
+                self.persist_cold,
                 self.max_memory_bytes,
                 self.max_context,
             )?;
@@ -204,6 +207,7 @@ impl Qwen35MoeInner {
                 layers: attn_layer_count,
                 explicit_mib: self.config.paged_cache_memory_mb,
             }),
+            self.persist_cold,
             self.max_memory_bytes,
             self.max_context,
         )?
@@ -271,6 +275,8 @@ impl Qwen35MoeInner {
         }
         adapter.set_memory_ceiling(plan.ceiling_bytes());
         self.paged_adapter = Some(adapter);
+        self.scheduled_recurrent
+            .set_max_live_units(pool_plan.lanes as usize);
         info!(
             "Qwen3.5 MoE paged adapter enabled after weight materialization: initial_blocks={}, \
              max_blocks={}, block_size={}, pool_window_tokens={}, trained_window_tokens={}, \
@@ -332,7 +338,18 @@ impl Qwen35MoeInner {
 
     pub(super) fn can_activate_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
         self.has_scheduled_recurrent(seq_id)
-            || self.scheduled_recurrent_units() < HYBRID_LIVE_STATE_UNITS
+            || self.scheduled_recurrent_units() < self.scheduled_recurrent.max_live_units()
+    }
+
+    /// The decode lanes this load runs: the plan's grant.
+    pub(crate) fn scheduled_lanes(&self) -> u32 {
+        self.scheduled_recurrent.max_live_units() as u32
+    }
+
+    /// Stands in for a plan that granted `lanes` decode lanes.
+    #[cfg(test)]
+    pub(crate) fn grant_scheduled_lanes(&mut self, lanes: usize) {
+        self.scheduled_recurrent.set_max_live_units(lanes);
     }
 
     pub(super) fn activate_scheduled_recurrent(&mut self, seq_id: SeqId) -> Result<()> {
@@ -568,6 +585,11 @@ impl Qwen35MoeInner {
                 if let Some(cache) = gdn_cache.as_ref() {
                     self.scatter_gdn_cache(&seq_ids, layer_idx, cache)?;
                 }
+                crate::models::qwen3_5::paged_forward::maybe_submit_paged_decode_layer(
+                    layer_idx,
+                    self.layers.len(),
+                    &hidden_states,
+                );
             }
             let hidden_states = self.final_norm.forward(&hidden_states)?;
             if let Some(head) = &self.lm_head {
@@ -869,7 +891,8 @@ impl Qwen35MoeInner {
             }
         }
         self.caches = None;
-        self.scheduled_recurrent = RecurrentStateTable::stage2();
+        self.scheduled_recurrent =
+            RecurrentStateTable::new(self.scheduled_recurrent.max_live_units());
         self.scheduled_mtp = Default::default();
         self.active_scheduled_seq = None;
         self.dflash2_states.clear();

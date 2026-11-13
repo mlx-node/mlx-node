@@ -321,8 +321,9 @@ fn every_load_starts_at_the_runway() {
         assert!(runway < pool.max_blocks, "draft={draft}");
         assert_eq!(adapter.memory_ceiling(), Some(plan.ceiling_bytes()));
         assert_eq!(inner.pool_context_limit(), pool.lane.window.maximum());
+        // Without a draft the lane holds one GDN state per granted lane.
         assert_eq!(
-            pool.lane.lane_bytes > inner.config.recurrent_state_bytes(),
+            pool.lane.lane_bytes > inner.config.recurrent_state_bytes() * u64::from(pool.lanes),
             draft,
             "the draft state rides the pool lane"
         );
@@ -376,6 +377,13 @@ fn explicit_pool_size_above_the_plan_fails_load() {
 /// ("gpu_memory_mb too small").
 #[test]
 fn pool_below_the_config_floor_loads() {
+    // Its 1,200 MiB budget lowers the process-wide governor limit for every
+    // load beside it.
+    if !crate::test_support::in_own_process(
+        "models::qwen3_5::model::paged_construction_tests::pool_below_the_config_floor_loads",
+    ) {
+        return;
+    }
     for (explicit_mib, max_memory) in [(None, Some(1_200 << 20)), (Some(128), None)] {
         let mut cfg = tiny_paged_forward_cfg();
         cfg.paged_cache_memory_mb = explicit_mib;
@@ -470,29 +478,37 @@ fn paged_context_limits_and_preflight_use_scheduler_usable_window() {
 fn scheduled_recurrent_cap_counts_the_active_row_and_parked_rows() {
     let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
     let bytes = inner.config.recurrent_state_bytes();
+    assert_eq!(inner.scheduled_lanes(), 8);
 
-    inner
-        .activate_scheduled_recurrent(1)
-        .expect("activate first row");
-    assert_eq!(inner.scheduled_recurrent_units(), 1);
-    assert_eq!(inner.scheduled_recurrent_bytes(), bytes);
-
-    inner
-        .activate_scheduled_recurrent(2)
-        .expect("park first and activate second row");
-    assert_eq!(inner.scheduled_recurrent_units(), 2);
-    assert_eq!(inner.scheduled_recurrent_bytes(), bytes * 2);
+    for seq in 1..=8u32 {
+        assert!(inner.can_activate_scheduled_recurrent(seq));
+        inner
+            .activate_scheduled_recurrent(seq)
+            .expect("park the previous row and activate the next");
+        assert_eq!(inner.scheduled_recurrent_units(), seq as usize);
+        assert_eq!(inner.scheduled_recurrent_bytes(), bytes * u64::from(seq));
+    }
+    assert!(!inner.can_activate_scheduled_recurrent(9));
     assert!(
-        inner.activate_scheduled_recurrent(3).is_err(),
-        "the active row must count toward the two-unit cap"
+        inner.activate_scheduled_recurrent(9).is_err(),
+        "the active row must count toward the eight-unit cap"
     );
 
     inner.release_scheduled_recurrent_for(1);
     inner
-        .activate_scheduled_recurrent(3)
+        .activate_scheduled_recurrent(9)
         .expect("an idle row release opens exactly one slot");
-    assert_eq!(inner.scheduled_recurrent_units(), 2);
-    assert_eq!(inner.scheduled_recurrent_bytes(), bytes * 2);
+    assert_eq!(inner.scheduled_recurrent_units(), 8);
+    assert_eq!(inner.scheduled_recurrent_bytes(), bytes * 8);
+    assert!(inner.activate_scheduled_recurrent(10).is_err());
+
+    // The plan's grant survives a cache reset and caps admission there.
+    inner.scheduled_recurrent.set_max_live_units(2);
+    inner.reset_caches_sync().expect("reset");
+    assert_eq!(inner.scheduled_lanes(), 2);
+    inner.activate_scheduled_recurrent(1).expect("first row");
+    inner.activate_scheduled_recurrent(2).expect("second row");
+    assert!(inner.activate_scheduled_recurrent(3).is_err());
 }
 
 #[test]

@@ -24,20 +24,22 @@
  *
  * Publishing never destroys a checkpoint the downloader does not own: a final
  * dir WITHOUT our marker (a manual / `mlx download` copy, possibly fine-tuned) is
- * refused unless an explicit `overwrite` is requested — up front (a fast-fail
- * ownership preflight before any download, so no bytes move for a doomed job) and
- * again adjacent to the destructive swap so a dir that races in after the first
- * check is still never overwritten. An OWNED upgrade swaps via a temp
- * backup so a crash mid-rename rolls back to the original; an orphaned backup a
+ * refused — up front (a fast-fail ownership preflight before any download, so no
+ * bytes move for a doomed job) and again adjacent to the destructive swap so a dir
+ * that races in after the first check is still never overwritten. The one exception
+ * is a Reinstall (`replaceBlocker`): it replaces an unowned entry that holds no
+ * model files, and only while the entry still matches the numbers the user
+ * confirmed, checked at the request, at job start, right before the swap and on the moved entry before it is deleted.
+ * Both swaps go through a temp backup so a crash mid-rename rolls back to the original; an orphaned backup a
  * crash leaves behind is recovered (or reaped) by a best-effort sweep at the
- * start of the next download.
+ * start of the next download, and a Reinstall's backup also when the manager starts.
  *
  * Pure disk + network — never the native addon.
  */
 
 import { createHash, randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { createReadStream, existsSync, lstatSync, realpathSync, statSync } from 'node:fs';
+import { accessSync, constants, createReadStream, existsSync, lstatSync, realpathSync, statSync } from 'node:fs';
 import { copyFile, mkdir, open, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
@@ -67,15 +69,21 @@ const CATALOG_SHA_NEGATIVE_TTL_MS = 60 * 1000;
  */
 const CATALOG_SHA_PROBE_TIMEOUT_MS = 15 * 1000;
 
+import { catalogBlocker } from './catalog.js';
 import {
   type DownloadCompletion,
   DOWNLOAD_COMPLETE_MARKER,
+  type ForeignEntrySummary,
+  holdsModelFiles,
   isDownloaderOwned,
   isModelInstalled,
   isPathOccupied,
   isSafeRelPath,
   isWeightFile,
+  modelsChildPath,
   readCompletion,
+  sameForeignEntry,
+  summarizeForeignEntry,
 } from './models.js';
 
 /** Bounded re-fetch attempts for a staged file that fails post-copy verification. */
@@ -86,6 +94,28 @@ const STAGING_DIR_RE = /@[0-9a-f]{40}\.(\d+)\.[0-9a-f-]+$/i;
 
 /** Publish backup dir name `<slug>.backup-<pid>.<uuid>` — captures the owner pid (disjoint from STAGING_DIR_RE). */
 const BACKUP_DIR_RE = /\.backup-(\d+)\.[0-9a-f-]+$/i;
+
+/**
+ * Backup of an entry the app did not create, moved aside by a Reinstall: `<slug>.reinstall-<pid>.<uuid>`. Recovery
+ * puts it back without the ownership test the owned `.backup-` rule needs, so the two names must stay apart.
+ */
+const REINSTALL_MARK = '.reinstall-';
+/** A moved entry that changed and could not be put back: `<slug>.kept-<uuid>`. Nothing ever removes it. */
+const KEPT_MARK = '.kept-';
+
+/** The slug and owner pid of a `<slug>.reinstall-<pid>.<uuid>` name, or `null` for any other name. */
+function parseReinstallBackup(name: string): { slug: string; pid: number } | null {
+  const at = name.lastIndexOf(REINSTALL_MARK);
+  if (at <= 0) return null;
+  const rest = name.slice(at + REINSTALL_MARK.length);
+  const dot = rest.indexOf('.');
+  if (dot <= 0 || dot === rest.length - 1) return null;
+  const digits = rest.slice(0, dot);
+  for (const ch of digits) {
+    if (ch < '0' || ch > '9') return null;
+  }
+  return { slug: name.slice(0, at), pid: Number(digits) };
+}
 
 /**
  * Liveness of a pid via signal 0. An unparseable/invalid pid is treated as ALIVE
@@ -388,6 +418,87 @@ export class DownloadsClosedError extends Error {
 }
 
 /**
+ * A Reinstall that cannot be accepted as asked: another job holds the repo, or the entry in the way is not what the
+ * user confirmed. The API answers 409.
+ */
+export class DownloadConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DownloadConflictError';
+  }
+}
+
+/** The numbers of the blocking entry the user confirmed, echoed by `POST /api/downloads`. */
+export type ReplaceBlocker = Pick<ForeignEntrySummary, 'kind' | 'fileCount' | 'sizeBytes' | 'truncated'>;
+
+const NOTHING_REMOVED = 'Nothing was removed.';
+
+/** `lstat` identity of the entry itself, never followed, or `null` when nothing is there. */
+function entryIdentity(path: string): { dev: bigint; ino: bigint } | null {
+  try {
+    const stat = lstatSync(path, { bigint: true });
+    return { dev: stat.dev, ino: stat.ino };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The entry a Reinstall moved to `backupDir` is the one it checked last: same `dev:ino`, and for anything but a link
+ * still no model files and the numbers the user confirmed. A link is compared by identity only, because a relative
+ * link resolves somewhere else once it is moved, and the swap only unlinks it.
+ */
+function movedEntryMatches(
+  kept: ForeignEntrySummary,
+  identity: { dev: bigint; ino: bigint },
+  backupDir: string,
+): boolean {
+  const now = entryIdentity(backupDir);
+  if (now === null || now.dev !== identity.dev || now.ino !== identity.ino) return false;
+  if (kept.kind === 'symlink') return true;
+  const summary = summarizeForeignEntry(backupDir);
+  return summary !== null && !summary.holdsModel && sameForeignEntry(summary, kept);
+}
+
+/** The failure text of a Reinstall that stopped before the swap: it says the entry in the way is unchanged. */
+function withNothingRemoved(message: string): string {
+  return message.endsWith('.') ? `${message} ${NOTHING_REMOVED}` : `${message}. ${NOTHING_REMOVED}`;
+}
+
+function heldModelMessage(slug: string): string {
+  return `"${slug}" holds a model that the app did not create. Remove it yourself if you do not need it.`;
+}
+
+function isRealDirectory(path: string): boolean {
+  try {
+    return lstatSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function canWrite(path: string): boolean {
+  try {
+    accessSync(path, constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The unowned entry at `finalDir` may still be replaced by this Reinstall: it holds no model files and
+ * matches the summary the request was accepted with.
+ */
+function assertStillReplaceable(kept: ForeignEntrySummary, finalDir: string, slug: string): void {
+  if (holdsModelFiles(finalDir)) throw new Error(heldModelMessage(slug));
+  const now = summarizeForeignEntry(finalDir);
+  if (now === null || !sameForeignEntry(now, kept)) {
+    throw new Error(`"${slug}" changed on disk during the download.`);
+  }
+}
+
+/**
  * `committing` is the brief, non-cancellable window from just before `publish`
  * until the job settles: `cancel()`'s `state !== 'running'` gate rejects it, so a
  * cancel that arrives once the atomic swap has begun can no longer report success
@@ -408,8 +519,13 @@ interface JobState {
   receivedBytes: number;
   /** Sum of manifest file sizes; 0 until the manifest is fetched. */
   totalBytes: number;
-  /** Permit replacing a final dir the downloader does not own (default false). */
-  overwrite: boolean;
+  /**
+   * A Reinstall: the server's own summary of the unowned entry it may replace, taken when the request was accepted.
+   * `null` for a plain install, which never replaces an unowned entry.
+   */
+  replace: ForeignEntrySummary | null;
+  /** From just before the final entry is moved aside until a rollback put it back: the old entry is not in place. */
+  swapStarted: boolean;
   /**
    * Set by {@link DownloadManager.cancel}. An in-flight `processJob` unwinds at
    * its next boundary check (and its in-flight fetch is aborted via `controller`),
@@ -497,6 +613,8 @@ export class DownloadManager {
 
   private currentJob: JobState | null = null;
   private currentFile: FileContext | null = null;
+  /** The sweep of crashed Reinstall backups started with the manager; every job waits for it. */
+  private readonly reinstallRecovery: Promise<void>;
 
   constructor(opts: { modelsDir: string; cacheDir?: string; fetchImpl?: typeof fetch; probeTimeoutMs?: number }) {
     this.modelsDir = opts.modelsDir;
@@ -506,6 +624,7 @@ export class DownloadManager {
     this.wrappedFetch = this.makeCountingFetch();
     // Each job id can have many subscribers (SSE clients); lift the default cap.
     this.emitter.setMaxListeners(0);
+    this.reinstallRecovery = this.recoverReinstallBackups(null);
   }
 
   /**
@@ -513,9 +632,9 @@ export class DownloadManager {
    * refuses outright once {@link shutdown} has begun — the HTTP listener stays
    * attached across the drain, so a late POST would otherwise be adopted by the
    * loop `shutdown` is awaiting and could keep `close()` from ever completing.
-   * `overwrite` (default false) permits replacing a final dir the downloader does
-   * not own; callers (the API/UI) leave it unset so an unowned local checkpoint
-   * is never silently destroyed.
+   * `replaceBlocker` makes the job a Reinstall: the unowned entry at the repo's slug, which must hold no model
+   * files and must still match these numbers, is replaced once the new model is downloaded and verified. Refused with
+   * {@link DownloadConflictError} when either does not hold, and nothing is queued.
    *
    * At most ONE nonterminal job exists per repo: a request that arrives while a
    * job for that repo is queued or in flight hands back THAT job's id instead of
@@ -526,9 +645,10 @@ export class DownloadManager {
    * request idempotent — no 409 for the SPA to render as a red failure — and
    * matches the stance {@link processJob} already takes below, where re-asking for
    * an already-published repo+revision short-circuits to `done` rather than
-   * erroring. The existing job's `overwrite` stands; it is not re-negotiated.
+   * erroring. A Reinstall request while a plain job holds the repo is refused instead: that job would not replace
+   * the entry the user asked to replace.
    */
-  start(repo: string, opts?: { overwrite?: boolean }): string {
+  start(repo: string, opts?: { replaceBlocker?: ReplaceBlocker }): string {
     if (this.closed) throw new DownloadsClosedError();
     // `hidden` entries are unpublished repos. They stay in MODEL_CATALOG so a
     // locally converted checkpoint at the canonical slug is still recognized as
@@ -539,8 +659,17 @@ export class DownloadManager {
     if (!catalogDownloadRepos().includes(repo)) {
       throw new Error(`Repo "${repo}" is not in the model catalog`);
     }
+    const asked = opts?.replaceBlocker;
     const active = this.activeJobFor(repo);
-    if (active !== undefined) return active.id;
+    if (active !== undefined) {
+      if (asked !== undefined && active.replace === null) {
+        throw new DownloadConflictError(
+          'A download of this model is already in the queue. Cancel it, then use Reinstall.',
+        );
+      }
+      return active.id;
+    }
+    const replace = asked === undefined ? null : this.acceptReplace(repo, asked);
     const id = randomUUID();
     this.jobsById.set(id, {
       id,
@@ -548,7 +677,8 @@ export class DownloadManager {
       state: 'running',
       receivedBytes: 0,
       totalBytes: 0,
-      overwrite: opts?.overwrite ?? false,
+      replace,
+      swapStarted: false,
       cancelled: false,
       controller: new AbortController(),
     });
@@ -556,6 +686,28 @@ export class DownloadManager {
     this.queue.push(id);
     void this.drain();
     return id;
+  }
+
+  /**
+   * The server's summary of the entry a Reinstall of `repo` would replace, when it is still what the user confirmed.
+   * The target is the repo's own slug under the models directory, never a path from the caller.
+   */
+  private acceptReplace(repo: string, asked: ReplaceBlocker): ForeignEntrySummary {
+    const slug = repo.split('/').pop()!.toLowerCase();
+    const target = modelsChildPath(this.modelsDir, slug, 'replace');
+    // Moving a directory to a new parent (the swap's rename into `.staging`) needs write access on the directory.
+    // Checked first: a folder that cannot be read also counts as holding model files, and this text says why.
+    if (isRealDirectory(target) && !canWrite(target)) {
+      throw new DownloadConflictError(
+        `The app cannot move "${slug}": it has no write permission on it. Change its permissions, then try again.`,
+      );
+    }
+    if (holdsModelFiles(target)) throw new DownloadConflictError(heldModelMessage(slug));
+    const now = catalogBlocker(this.modelsDir, repo);
+    if (now === null || !sameForeignEntry(now, asked)) {
+      throw new DownloadConflictError(`"${slug}" changed on disk. Check it, then try again.`);
+    }
+    return now;
   }
 
   /**
@@ -917,12 +1069,14 @@ export class DownloadManager {
       // below still guard the narrow check-then-swap race for a dir that races in
       // after this point.
       const refuseIfUnownedFinal = (): void => {
-        if (isPathOccupied(finalDir) && !isDownloaderOwned(finalDir) && !job.overwrite) {
+        if (!isPathOccupied(finalDir) || isDownloaderOwned(finalDir)) return;
+        if (job.replace === null) {
           throw new Error(
             `Refusing to install over "${finalDir}": it was not created by the dashboard downloader. ` +
               `Remove it manually to reinstall.`,
           );
         }
+        assertStillReplaceable(job.replace, finalDir, slug);
       };
 
       // Refuse a symlinked (or non-directory) `.staging` root BEFORE creating it:
@@ -933,9 +1087,10 @@ export class DownloadManager {
       // touches the staging root, not finalDir) so the dead-tree reap below can run.
       assertRealDirOrAbsent(stagingRoot);
       await mkdir(stagingRoot, { recursive: true });
+      await this.reinstallRecovery;
 
       // Reap a crashed job's private staging tree BEFORE the ownership preflight, so
-      // even a job the preflight REFUSES (an unowned/foreign finalDir, no overwrite)
+      // even a job the preflight REFUSES (an unowned/foreign finalDir, not a Reinstall)
       // still frees a crashed multi-GB staging tree instead of leaking it until some
       // other eligible download for the slug runs. This touches only `.staging`
       // trees (never finalDir), so it is safe to run before the finalDir preflight.
@@ -950,8 +1105,8 @@ export class DownloadManager {
       // Pid-gated: a live peer's active publish backup is never reclaimed.
       await this.recoverBackup(slug, finalDir);
 
-      // Re-run the preflight after recovery: recovery restores only an owned real-dir
-      // backup, but this refuses any unowned occupant a race put at finalDir before
+      // Re-run the preflight after recovery: recovery puts back an owned backup or an
+      // entry a crashed Reinstall moved aside, and this refuses any unowned occupant at finalDir before
       // skip-detection (`readCompletion`/`isModelInstalled`, which FOLLOW symlinks)
       // could read an unowned dir's marker-free state and report a false `done`.
       refuseIfUnownedFinal();
@@ -1173,7 +1328,7 @@ export class DownloadManager {
       }
       job.state = 'committing';
 
-      await this.publish(stagingDir, finalDir, job.repo, revision, files, job.overwrite, sidecarPlan);
+      await this.publish(stagingDir, finalDir, job, revision, files, sidecarPlan);
 
       job.state = 'done';
       this.emit({ type: 'done', id: job.id, outputDir: finalDir });
@@ -1195,7 +1350,12 @@ export class DownloadManager {
           `[downloads] job ${job.id} (${job.repo}) failed:`,
           truncateMessage(error instanceof Error ? (error.stack ?? error.message) : String(error)),
         );
-        this.emit({ type: 'error', id: job.id, message: truncateMessage(describeFailure(error)) });
+        const message = truncateMessage(describeFailure(error));
+        this.emit({
+          type: 'error',
+          id: job.id,
+          message: job.replace !== null && !job.swapStarted ? withNothingRemoved(message) : message,
+        });
       }
     } finally {
       // Job-private staging is scratch: a successful publish already renamed it
@@ -1308,6 +1468,50 @@ export class DownloadManager {
         // else foreign symlink / unowned dir / incomplete-owned → retain untouched
       } catch {
         // A single un-recoverable backup must not block the job.
+      }
+    }
+    await this.recoverReinstallBackups(slug);
+  }
+
+  /**
+   * Settle the backups a Reinstall left when its process died between moving the old entry aside and deleting it
+   * (`<slug>.reinstall-<pid>.<uuid>`, owner pid dead), for one slug or for every slug when `onlySlug` is null. Looks
+   * at the final path without following a link:
+   *
+   *   - nothing there: the crash came before the new model was in place, so the old entry is renamed back;
+   *   - a complete model this app installed, as a real directory: the Reinstall finished, so the backup is removed,
+   *     unless it holds model files (a writer reached it after the last check), which are kept;
+   *   - anything else: something else took the path, so the backup is kept.
+   *
+   * The rename moves a link as a link. Never throws.
+   */
+  private async recoverReinstallBackups(onlySlug: string | null): Promise<void> {
+    const stagingRoot = join(this.modelsDir, '.staging');
+    let entries: string[];
+    try {
+      if (!lstatSync(stagingRoot).isDirectory()) return;
+      entries = await readdir(stagingRoot);
+    } catch {
+      return;
+    }
+    for (const name of entries) {
+      const parsed = parseReinstallBackup(name);
+      if (parsed === null || (onlySlug !== null && parsed.slug !== onlySlug) || pidAlive(parsed.pid)) continue;
+      const backupPath = join(stagingRoot, name);
+      try {
+        const finalDir = modelsChildPath(this.modelsDir, parsed.slug, 'restore');
+        let finalStat;
+        try {
+          finalStat = lstatSync(finalDir);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') await rename(backupPath, finalDir);
+          continue;
+        }
+        if (!finalStat.isDirectory() || !isDownloaderOwned(finalDir) || !isModelInstalled(finalDir)) continue;
+        if (lstatSync(backupPath).isDirectory() && holdsModelFiles(backupPath)) continue;
+        await rm(backupPath, { recursive: true, force: true });
+      } catch {
+        // One backup that cannot be settled must not block the rest.
       }
     }
   }
@@ -1645,29 +1849,34 @@ export class DownloadManager {
    * step (so it travels with the rename and only coexists with a full, verified
    * set). Then:
    *   - final dir absent → rename staging → final (+ fsync parent);
-   *   - final dir present but UNOWNED (no marker) and no `overwrite` → refuse,
-   *     leaving that dir and its files untouched;
-   *   - otherwise (OWNED, or explicit `overwrite`) → rollback-safe swap: move the
-   *     existing dir to a temp backup, rename staging → final, fsync the parent,
-   *     and only then remove the backup; if the swap rename fails, restore the
-   *     backup so a crash never leaves the model missing.
+   *   - final dir present but UNOWNED (no marker) → refuse, leaving that dir and
+   *     its files untouched, unless the job is a Reinstall whose entry still
+   *     matches what the user confirmed;
+   *   - otherwise → rollback-safe swap: move the existing entry to a temp backup,
+   *     rename staging → final, fsync the parent, and only then remove the backup;
+   *     if the swap rename fails, restore the backup so a crash never leaves the
+   *     model missing.
    */
   private async publish(
     stagingDir: string,
     finalDir: string,
-    repo: string,
+    job: JobState,
     revision: string,
     files: ListFileEntry[],
-    overwrite: boolean,
     sidecarPlan: { repo: { type: 'model'; name: string }; revision: string; files: ListFileEntry[] } | null,
   ): Promise<void> {
+    const repo = job.repo;
+    const slug = basename(finalDir);
     await mkdir(dirname(finalDir), { recursive: true });
 
-    if (isPathOccupied(finalDir) && !isDownloaderOwned(finalDir) && !overwrite) {
-      throw new Error(
-        `Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader. ` +
-          `Remove it manually to reinstall.`,
-      );
+    if (isPathOccupied(finalDir) && !isDownloaderOwned(finalDir)) {
+      if (job.replace === null) {
+        throw new Error(
+          `Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader. ` +
+            `Remove it manually to reinstall.`,
+        );
+      }
+      assertStillReplaceable(job.replace, finalDir, slug);
     }
 
     const marker: DownloadCompletion = {
@@ -1693,23 +1902,73 @@ export class DownloadManager {
     // no-op when finalDir was absent then, so an UNOWNED dir that raced in
     // between must still never be renamed away and deleted. This narrows the
     // window to the irreducible FS-level check-then-swap race.
-    if (!isDownloaderOwned(finalDir) && !overwrite) {
-      throw new Error(`Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader`);
+    let foreign: { kept: ForeignEntrySummary; identity: { dev: bigint; ino: bigint } } | null = null;
+    if (!isDownloaderOwned(finalDir)) {
+      if (job.replace === null) {
+        throw new Error(`Refusing to overwrite "${finalDir}": it was not created by the dashboard downloader`);
+      }
+      const identity = entryIdentity(finalDir);
+      assertStillReplaceable(job.replace, finalDir, slug);
+      if (identity === null) throw new Error(`"${slug}" changed on disk during the download.`);
+      foreign = { kept: job.replace, identity };
     }
 
-    // Rollback-safe swap of an owned (or explicitly overwritten) final dir. The
+    // Rollback-safe swap of an owned final dir, or of the entry a Reinstall replaces. The
     // backup lives under `.staging` (a dotdir skipped by model discovery) so a
-    // crash mid-swap never surfaces it as a phantom model.
-    const backupDir = join(this.modelsDir, '.staging', `${basename(finalDir)}.backup-${process.pid}.${randomUUID()}`);
-    await rename(finalDir, backupDir);
+    // crash mid-swap never surfaces it as a phantom model. A link is moved and
+    // unlinked as a link; its target is never touched.
+    const stagingRoot = join(this.modelsDir, '.staging');
+    const backupDir = join(
+      stagingRoot,
+      `${slug}${foreign === null ? '.backup-' : REINSTALL_MARK}${process.pid}.${randomUUID()}`,
+    );
+    job.swapStarted = true;
+    try {
+      await rename(finalDir, backupDir);
+    } catch (error) {
+      job.swapStarted = false;
+      throw error;
+    }
+    // A writer outside the app can change the entry between the last check and the rename. Once moved, writes by
+    // path no longer reach it, so this check of the moved entry holds until it is deleted.
+    if (foreign !== null && !movedEntryMatches(foreign.kept, foreign.identity, backupDir)) {
+      try {
+        await rename(backupDir, finalDir);
+      } catch {
+        const keptDir = join(stagingRoot, `${slug}${KEPT_MARK}${randomUUID()}`);
+        let at = backupDir;
+        try {
+          await rename(backupDir, keptDir);
+          at = keptDir;
+        } catch {}
+        throw new Error(
+          `"${slug}" changed on disk during the download, and something else is now at its path. ` +
+            `The old entry is at "${at}". ${NOTHING_REMOVED}`,
+        );
+      }
+      job.swapStarted = false;
+      throw new Error(`"${slug}" changed on disk during the download.`);
+    }
     try {
       await rename(stagingDir, finalDir);
     } catch (error) {
-      await rename(backupDir, finalDir).catch(() => {});
+      try {
+        await rename(backupDir, finalDir);
+      } catch {
+        throw new Error(`The install failed and "${slug}" could not be put back. It is now at "${backupDir}".`);
+      }
+      job.swapStarted = false;
       throw error;
     }
     await fsyncDir(dirname(finalDir));
-    await rm(backupDir, { recursive: true, force: true });
+    try {
+      await rm(backupDir, { recursive: true, force: true });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `${reason}. The model is installed. A part of the old "${slug}" can remain in "${join(this.modelsDir, '.staging')}".`,
+      );
+    }
   }
 
   /**

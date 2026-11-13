@@ -3,18 +3,28 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-import { getTableColumns } from 'drizzle-orm';
+import { getTableColumns, getTableName } from 'drizzle-orm';
 import type { SQLiteTable } from 'drizzle-orm/sqlite-core';
 import { describe, expect, it } from 'vite-plus/test';
 
-import { openDashboardDb } from '../src/db/open.js';
-import { traceFiles, traces } from '../src/db/schema.js';
+import { EXPECTED_COLUMNS, openDashboardDb, SCHEMA_VERSION } from '../src/db/open.js';
+import {
+  ALL_TABLES,
+  runtimeLoads,
+  runtimeProcs,
+  runtimeSamples,
+  runtimeSched,
+  traceFiles,
+  traces,
+} from '../src/db/schema.js';
 
-/** The two tables `assertSchemaSignature` checks, in the order it checks them. */
-const SCHEMA_TABLES: Array<[string, SQLiteTable]> = [
-  ['traces', traces],
-  ['trace_files', traceFiles],
-];
+/** Every table `assertSchemaSignature` checks, in the order it checks them. */
+const SCHEMA_TABLES: Array<[string, SQLiteTable]> = ALL_TABLES.map((table) => [getTableName(table), table]);
+
+/** A minimal valid `traces` insert. */
+function traceRow(traceId: string, extra: Partial<typeof traces.$inferInsert> = {}): typeof traces.$inferInsert {
+  return { traceId, ts: 1, model: 'qwen3_5', modelKey: 'qwen3_5', outcome: 'ok', ...extra };
+}
 
 /** DB column names the live drizzle schema declares for a table. */
 function columnNames(table: SQLiteTable): string[] {
@@ -56,6 +66,16 @@ function fixtureTable(name: string, table: SQLiteTable, omit: string[] = []): st
 }
 
 /**
+ * Every table of the live schema as `CREATE TABLE` statements, except the
+ * tables in `missing` and the columns in `omit` (keyed by table name).
+ */
+function fixtureSchema(missing: string[] = [], omit: Record<string, string[]> = {}): string {
+  return SCHEMA_TABLES.filter(([name]) => !missing.includes(name))
+    .map(([name, table]) => fixtureTable(name, table, omit[name] ?? []))
+    .join('\n');
+}
+
+/**
  * Assert the fixture on disk departs from the live schema in exactly the listed
  * places (`"trace_files"` for a whole table, `"traces.source_file"` for a single
  * column), reported in probe order.
@@ -88,7 +108,7 @@ function expectFixtureGaps(file: string, expected: string[]): void {
 describe('dashboard db', () => {
   it('bootstraps schema and round-trips a trace row', () => {
     const { db, close } = openDashboardDb(':memory:');
-    db.insert(traces).values({ traceId: 't1', ts: 1, model: 'qwen3_5' }).run();
+    db.insert(traces).values(traceRow('t1')).run();
     const rows = db.select().from(traces).all();
     expect(rows).toHaveLength(1);
     expect(rows[0].model).toBe('qwen3_5');
@@ -97,7 +117,7 @@ describe('dashboard db', () => {
   it('bootstraps idempotently on an existing db file', () => {
     const file = join(tmpdir(), `dash-${process.pid}-${Date.now()}.db`);
     const first = openDashboardDb(file);
-    first.db.insert(traces).values({ traceId: 't1', ts: 1, model: 'qwen3_5' }).run();
+    first.db.insert(traces).values(traceRow('t1')).run();
     first.close();
     const second = openDashboardDb(file);
     expect(second.db.select().from(traces).all()).toHaveLength(1);
@@ -114,7 +134,7 @@ describe('dashboard db', () => {
     const dash = openDashboardDb(file);
     // Fresh, empty, usable schema.
     expect(dash.db.select().from(traces).all()).toHaveLength(0);
-    dash.db.insert(traces).values({ traceId: 't1', ts: 1, model: 'qwen3_5' }).run();
+    dash.db.insert(traces).values(traceRow('t1')).run();
     expect(dash.db.select().from(traces).all()).toHaveLength(1);
     dash.close();
 
@@ -127,12 +147,12 @@ describe('dashboard db', () => {
   });
 
   // Finding D: an existing db with an older/incompatible schema (created before
-  // the traces.root_session_id column existed) must not wedge startup — the
-  // current DDL's CREATE INDEX on the missing column would otherwise throw.
-  it('quarantines an old-schema traces db (missing root_session_id) and rebuilds', () => {
+  // the traces.model_key column existed) must not wedge startup — the current
+  // DDL's CREATE INDEX on the missing column would otherwise throw.
+  it('quarantines an old-schema traces db (missing model_key) and rebuilds', () => {
     const d = mkdtempSync(join(tmpdir(), 'dash-oldschema-'));
     const file = join(d, 'index.db');
-    // Build the OLD traces schema by hand: no root_session_id column, unstamped.
+    // Build the OLD traces schema by hand: no model_key column, unstamped.
     const raw = new DatabaseSync(file);
     raw.exec(
       `CREATE TABLE traces (
@@ -145,11 +165,14 @@ describe('dashboard db', () => {
     raw.close();
 
     const dash = openDashboardDb(file);
-    // Current schema is live: an insert using root_session_id round-trips.
-    dash.db.insert(traces).values({ traceId: 't1', sessionId: 's1', rootSessionId: 'r1', ts: 1 }).run();
+    // Current schema is live: an insert using model_key round-trips.
+    dash.db
+      .insert(traces)
+      .values(traceRow('t1', { sessionId: 's1', modelKey: 'k1' }))
+      .run();
     const rows = dash.db.select().from(traces).all();
     expect(rows).toHaveLength(1);
-    expect(rows[0].rootSessionId).toBe('r1');
+    expect(rows[0].modelKey).toBe('k1');
     dash.close();
 
     // The old db is quarantined aside, not silently lost.
@@ -161,18 +184,47 @@ describe('dashboard db', () => {
   // Finding 8: a NEWER on-disk schema (a future build's index, stamped one
   // version ahead) is as unusable as an older one — an exact-match check must
   // reject it and rebuild, not open it blind.
+  it('stores the measured prefill window and rebuilds an index stamped 9', () => {
+    expect(SCHEMA_VERSION).toBe(12);
+    const d = mkdtempSync(join(tmpdir(), 'dash-prefill-'));
+    const file = join(d, 'index.db');
+    const seed = openDashboardDb(file);
+    seed.db.insert(traces).values(traceRow('old')).run();
+    seed.close();
+    const stamp = new DatabaseSync(file);
+    stamp.exec('PRAGMA user_version = 9;');
+    stamp.close();
+
+    const dash = openDashboardDb(file);
+    expect(dash.db.select().from(traces).all()).toHaveLength(0);
+    expect(readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'))).toHaveLength(1);
+    const names = (dash.sqlite.prepare('PRAGMA table_info(traces)').all() as Array<{ name: string }>).map(
+      (c) => c.name,
+    );
+    expect(names).toContain('prefill_ms');
+    expect(names).toContain('prefill_tokens');
+    expect(names).not.toContain('prefill_tps');
+    dash.db
+      .insert(traces)
+      .values(traceRow('t1', { prefillMs: 250.5, prefillTokens: 400 }))
+      .run();
+    expect(dash.db.select().from(traces).all()[0]).toMatchObject({ prefillMs: 250.5, prefillTokens: 400 });
+    dash.close();
+    rmSync(d, { recursive: true, force: true });
+  });
+
   it('quarantines a newer-schema db (user_version above this build) and rebuilds', () => {
     const d = mkdtempSync(join(tmpdir(), 'dash-newer-'));
     const file = join(d, 'index.db');
     const seed = openDashboardDb(file);
     seed.close();
     const bump = new DatabaseSync(file);
-    bump.exec('PRAGMA user_version = 9;'); // > SCHEMA_VERSION (8)
+    bump.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1};`);
     bump.close();
 
     const dash = openDashboardDb(file);
     expect(dash.db.select().from(traces).all()).toHaveLength(0);
-    dash.db.insert(traces).values({ traceId: 't1', ts: 1, model: 'qwen3_5' }).run();
+    dash.db.insert(traces).values(traceRow('t1')).run();
     expect(dash.db.select().from(traces).all()).toHaveLength(1);
     dash.close();
 
@@ -189,8 +241,8 @@ describe('dashboard db', () => {
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
     // Everything complete except the single dropped column under test.
-    raw.exec([fixtureTable('traces', traces, ['source_file']), fixtureTable('trace_files', traceFiles)].join('\n'));
-    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec(fixtureSchema([], { traces: ['source_file'] }));
+    raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces.source_file']);
 
@@ -198,7 +250,7 @@ describe('dashboard db', () => {
     // Rebuilt schema carries source_file; an insert using it round-trips.
     dash.db
       .insert(traces)
-      .values({ traceId: 't1', sessionId: 's1', rootSessionId: 'r1', ts: 1, sourceFile: 'f.jsonl' })
+      .values(traceRow('t1', { sessionId: 's1', sourceFile: 'f.jsonl' }))
       .run();
     const rows = dash.db.select().from(traces).all();
     expect(rows).toHaveLength(1);
@@ -220,14 +272,14 @@ describe('dashboard db', () => {
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
     // Every other table complete; NO traces table at all.
-    raw.exec(fixtureTable('trace_files', traceFiles));
-    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec(fixtureSchema(['traces']));
+    raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces']);
 
     const dash = openDashboardDb(file);
     // Rebuilt schema carries a real `traces` table; an insert round-trips.
-    dash.db.insert(traces).values({ traceId: 't1', ts: 1, model: 'qwen3_5' }).run();
+    dash.db.insert(traces).values(traceRow('t1')).run();
     const rows = dash.db.select().from(traces).all();
     expect(rows).toHaveLength(1);
     expect(rows[0].model).toBe('qwen3_5');
@@ -246,14 +298,14 @@ describe('dashboard db', () => {
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
     // traces is missing the `model` column; every other table is complete.
-    raw.exec([fixtureTable('traces', traces, ['model']), fixtureTable('trace_files', traceFiles)].join('\n'));
-    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec(fixtureSchema([], { traces: ['model'] }));
+    raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces.model']);
 
     const dash = openDashboardDb(file);
     // Rebuilt traces carries `model`; an insert using it round-trips.
-    dash.db.insert(traces).values({ traceId: 't1', ts: 1, model: 'qwen3_5' }).run();
+    dash.db.insert(traces).values(traceRow('t1')).run();
     const rows = dash.db.select().from(traces).all();
     expect(rows).toHaveLength(1);
     expect(rows[0].model).toBe('qwen3_5');
@@ -277,18 +329,18 @@ describe('dashboard db', () => {
     // table that projects exactly the expected `traces` columns.
     raw.exec(
       [
-        fixtureTable('trace_files', traceFiles),
+        fixtureSchema(['traces']),
         fixtureTable('traces_backing', traces),
         `CREATE VIEW traces AS SELECT ${columnNames(traces).join(', ')} FROM traces_backing;`,
       ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces']);
 
     const dash = openDashboardDb(file);
     // Rebuilt schema carries a real `traces` table; an insert round-trips.
-    dash.db.insert(traces).values({ traceId: 't1', ts: 1, model: 'qwen3_5' }).run();
+    dash.db.insert(traces).values(traceRow('t1')).run();
     const rows = dash.db.select().from(traces).all();
     expect(rows).toHaveLength(1);
     expect(rows[0].model).toBe('qwen3_5');
@@ -313,18 +365,17 @@ describe('dashboard db', () => {
     // Every other table is real and complete; `traces` is an FTS5 virtual table
     // whose declared columns are exactly the expected `traces` column set.
     raw.exec(
-      [
-        fixtureTable('trace_files', traceFiles),
-        `CREATE VIRTUAL TABLE traces USING fts5(${columnNames(traces).join(', ')});`,
-      ].join('\n'),
+      [fixtureSchema(['traces']), `CREATE VIRTUAL TABLE traces USING fts5(${columnNames(traces).join(', ')});`].join(
+        '\n',
+      ),
     );
-    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces']);
 
     const dash = openDashboardDb(file);
     // Rebuilt schema carries a real `traces` table; an insert round-trips.
-    dash.db.insert(traces).values({ traceId: 't1', ts: 1, model: 'qwen3_5' }).run();
+    dash.db.insert(traces).values(traceRow('t1')).run();
     const rows = dash.db.select().from(traces).all();
     expect(rows).toHaveLength(1);
     expect(rows[0].model).toBe('qwen3_5');
@@ -335,31 +386,32 @@ describe('dashboard db', () => {
     rmSync(d, { recursive: true, force: true });
   });
 
-  // Finding #7: a db predating the traces.queue_ms + traces.resident columns
+  // A db predating the traces.model_key + traces.outcome columns
   // (but matching version) must be caught by the signature probe and rebuilt.
   // The auto-derived EXPECTED_COLUMNS must include the new columns, and the
   // rebuilt DDL must carry them — a divergence would either wedge startup or
   // re-quarantine on every open. This asserts both: the rebuilt db round-trips
   // the new columns AND re-validates in place on a second open (no wedge).
-  it('quarantines a traces db missing queue_ms/resident and rebuilds, then re-validates without wedging', () => {
+  it('quarantines a traces db missing model_key/outcome and rebuilds, then re-validates without wedging', () => {
     const d = mkdtempSync(join(tmpdir(), 'dash-metrics-'));
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
-    // Every table complete; traces omits ONLY queue_ms + resident.
-    raw.exec(
-      [fixtureTable('traces', traces, ['queue_ms', 'resident']), fixtureTable('trace_files', traceFiles)].join('\n'),
-    );
-    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
+    // Every table complete; traces omits ONLY model_key + outcome.
+    raw.exec(fixtureSchema([], { traces: ['model_key', 'outcome'] }));
+    raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`); // matches SCHEMA_VERSION → version check passes
     raw.close();
-    expectFixtureGaps(file, ['traces.queue_ms', 'traces.resident']);
+    expectFixtureGaps(file, ['traces.model_key', 'traces.outcome']);
 
-    // First open: signature probe finds queue_ms/resident missing → quarantine+rebuild.
+    // First open: signature probe finds model_key/outcome missing → quarantine+rebuild.
     const first = openDashboardDb(file);
-    first.db.insert(traces).values({ traceId: 't1', ts: 1, queueMs: 42, resident: 1 }).run();
+    first.db
+      .insert(traces)
+      .values(traceRow('t1', { modelKey: 'k1', outcome: 'error' }))
+      .run();
     const rows = first.db.select().from(traces).all();
     expect(rows).toHaveLength(1);
-    expect(rows[0].queueMs).toBe(42);
-    expect(rows[0].resident).toBe(1);
+    expect(rows[0].modelKey).toBe('k1');
+    expect(rows[0].outcome).toBe('error');
     first.close();
 
     const quarantined = readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'));
@@ -391,15 +443,18 @@ describe('dashboard db', () => {
     const d = mkdtempSync(join(tmpdir(), 'dash-notracefiles-'));
     const file = join(d, 'index.db');
     const raw = new DatabaseSync(file);
-    // Full traces, but NO trace_files watermark table.
-    raw.exec(fixtureTable('traces', traces));
-    raw.exec('PRAGMA user_version = 8;'); // matches SCHEMA_VERSION → version check passes
+    // Every table but the trace_files watermark table.
+    raw.exec(fixtureSchema(['trace_files']));
+    raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['trace_files']);
 
     // First open: signature probe finds trace_files missing → quarantine+rebuild.
     const first = openDashboardDb(file);
-    first.db.insert(traceFiles).values({ name: 'f.jsonl', lastIngestedMtime: 5, lastIngestedSize: 9 }).run();
+    first.db
+      .insert(traceFiles)
+      .values({ name: 'f.jsonl', lastIngestedMtime: 5, lastIngestedSize: 9, consumed: 9, tail: '' })
+      .run();
     const rows = first.db.select().from(traceFiles).all();
     expect(rows).toHaveLength(1);
     expect(rows[0].name).toBe('f.jsonl');
@@ -459,8 +514,7 @@ describe('dashboard db', () => {
     first.db
       .insert(traces)
       .values({
-        traceId: 't1',
-        ts: 1,
+        ...traceRow('t1'),
         coldRoot: '/canonical/cache/root',
         coldEnabled: 1,
         coldEnqueued: 4,
@@ -517,7 +571,7 @@ describe('dashboard db', () => {
     // live schema via `fixtureTable`, so a new column lands in all of them at
     // once and each keeps exactly the one gap `expectFixtureGaps` pins.
     const uv = first.sqlite.prepare('PRAGMA user_version').get() as { user_version: number };
-    expect(uv.user_version).toBe(8);
+    expect(uv.user_version).toBe(12);
     first.close();
 
     // Reopening the rebuilt file validates in place: no second quarantine.
@@ -529,13 +583,137 @@ describe('dashboard db', () => {
     rmSync(d, { recursive: true, force: true });
   });
 
+  it('rebuilds a version 8 database', () => {
+    const d = mkdtempSync(join(tmpdir(), 'dash-v8-'));
+    const file = join(d, 'index.db');
+    const raw = new DatabaseSync(file);
+    raw.exec(
+      `CREATE TABLE traces (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, trace_id TEXT NOT NULL UNIQUE, session_id TEXT,
+        root_session_id TEXT, ts INTEGER NOT NULL, model TEXT, queue_ms INTEGER, resident INTEGER,
+        source_file TEXT
+      );
+      CREATE TABLE trace_files (
+        name TEXT PRIMARY KEY, last_ingested_mtime INTEGER NOT NULL, last_ingested_size INTEGER NOT NULL
+      );
+      INSERT INTO traces (trace_id, ts, model) VALUES ('old', 1, 'qwen3_5');
+      PRAGMA user_version = 8;`,
+    );
+    raw.close();
+
+    const dash = openDashboardDb(file);
+    expect(dash.db.select().from(traces).all()).toHaveLength(0);
+    const columns = (dash.sqlite.prepare('PRAGMA table_info(traces)').all() as Array<{ name: string }>).map(
+      (c) => c.name,
+    );
+    expect(columns).toContain('model_key');
+    expect(columns).not.toContain('root_session_id');
+    expect(columns).not.toContain('resident');
+    dash.close();
+    expect(readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'))).toHaveLength(1);
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it('rebuilds an index stamped 10 and keeps the turn count of a scheduler snapshot, null when absent', () => {
+    const d = mkdtempSync(join(tmpdir(), 'dash-turns-'));
+    const file = join(d, 'index.db');
+    const seed = openDashboardDb(file);
+    seed.db.insert(traces).values(traceRow('old')).run();
+    seed.close();
+    const stamp = new DatabaseSync(file);
+    stamp.exec('PRAGMA user_version = 10;');
+    stamp.close();
+
+    const dash = openDashboardDb(file);
+    expect(dash.db.select().from(traces).all()).toHaveLength(0);
+    expect(readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'))).toHaveLength(1);
+    dash.db
+      .insert(runtimeSched)
+      .values([
+        { procKey: '1-2', ts: 3, model: 'm', turns: 9, sourceFile: 'f.jsonl' },
+        { procKey: '1-2', ts: 4, model: 'm', sourceFile: 'f.jsonl' },
+      ])
+      .run();
+    expect(
+      dash.db
+        .select()
+        .from(runtimeSched)
+        .all()
+        .map((row) => row.turns),
+    ).toEqual([9, null]);
+    dash.close();
+    rmSync(d, { recursive: true, force: true });
+  });
+
+  it('creates the runtime tables', () => {
+    const { db, sqlite, close } = openDashboardDb(':memory:');
+    db.insert(runtimeProcs).values({ procKey: '1-2', pid: 2, startedAt: 1, firstTs: 1, lastTs: 3 }).run();
+    db.insert(runtimeSamples).values({ procKey: '1-2', ts: 3, busy: 1, busyMs: 900, sourceFile: 'f.jsonl' }).run();
+    db.insert(runtimeSched)
+      .values({ procKey: '1-2', ts: 3, model: 'm', occHist: '[[1,2]]', sourceFile: 'f.jsonl' })
+      .run();
+    db.insert(runtimeLoads).values({ procKey: '1-2', ts: 2, model: 'm', ms: 12.5, ok: 1, sourceFile: 'f.jsonl' }).run();
+    expect(db.select().from(runtimeSamples).all()[0].busyMs).toBe(900);
+    expect(db.select().from(runtimeSched).all()[0].occHist).toBe('[[1,2]]');
+    expect(db.select().from(runtimeLoads).all()[0].ms).toBe(12.5);
+    const indexes = (
+      sqlite.prepare("SELECT name FROM sqlite_schema WHERE type = 'index'").all() as Array<{
+        name: string;
+      }>
+    ).map((r) => r.name);
+    for (const name of [
+      'idx_traces_ts',
+      'idx_traces_model_ts',
+      'idx_traces_source_file',
+      'idx_runtime_samples_ts',
+      'idx_runtime_samples_source_file',
+      'idx_runtime_sched_ts',
+      'idx_runtime_loads_ts',
+    ]) {
+      expect(indexes).toContain(name);
+    }
+    close();
+  });
+
+  it('EXPECTED_COLUMNS covers all seven tables', () => {
+    expect(Object.keys(EXPECTED_COLUMNS).sort()).toEqual([
+      'runtime_files',
+      'runtime_loads',
+      'runtime_procs',
+      'runtime_samples',
+      'runtime_sched',
+      'trace_files',
+      'traces',
+    ]);
+    for (const [name, table] of SCHEMA_TABLES) expect(EXPECTED_COLUMNS[name]).toEqual(columnNames(table));
+  });
+
+  it('quarantines a db missing the runtime_samples table and rebuilds', () => {
+    const d = mkdtempSync(join(tmpdir(), 'dash-noruntime-'));
+    const file = join(d, 'index.db');
+    const raw = new DatabaseSync(file);
+    raw.exec(fixtureSchema(['runtime_samples']));
+    raw.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
+    raw.close();
+    expectFixtureGaps(file, ['runtime_samples']);
+
+    const dash = openDashboardDb(file);
+    expect(dash.db.select().from(runtimeSamples).all()).toHaveLength(0);
+    dash.close();
+    expect(readdirSync(d).filter((n) => n.startsWith('index.db.corrupt-'))).toHaveLength(1);
+    rmSync(d, { recursive: true, force: true });
+  });
+
   // Finding 6: a complete current-schema db must open WITHOUT rebuilding — the
   // full signature check must not false-positive on a matching schema.
   it('opens a complete current-schema db without rebuilding', () => {
     const d = mkdtempSync(join(tmpdir(), 'dash-complete-'));
     const file = join(d, 'index.db');
     const seed = openDashboardDb(file);
-    seed.db.insert(traces).values({ traceId: 't1', ts: 1, model: 'keep' }).run();
+    seed.db
+      .insert(traces)
+      .values(traceRow('t1', { model: 'keep' }))
+      .run();
     seed.close();
 
     const dash = openDashboardDb(file);
@@ -562,7 +740,7 @@ describe('dashboard db', () => {
     for (let i = 0; i < 500; i++) {
       seed.db
         .insert(traces)
-        .values({ traceId: `t${i}`, ts: i, model: 'x'.repeat(40) })
+        .values(traceRow(`t${i}`, { ts: i, model: 'x'.repeat(40) }))
         .run();
     }
     seed.close();
@@ -579,7 +757,7 @@ describe('dashboard db', () => {
     const dash = openDashboardDb(file);
     // Rebuilt empty schema that actually works (SELECT does not throw malformed).
     expect(dash.db.select().from(traces).all()).toHaveLength(0);
-    dash.db.insert(traces).values({ traceId: 't1', ts: 1, model: 'qwen3_5' }).run();
+    dash.db.insert(traces).values(traceRow('t1')).run();
     expect(dash.db.select().from(traces).all()).toHaveLength(1);
     dash.close();
 

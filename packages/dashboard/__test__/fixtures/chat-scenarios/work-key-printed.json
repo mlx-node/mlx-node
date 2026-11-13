@@ -1,0 +1,66 @@
+{
+  "persist": true,
+  "initialize": {
+    "protocolVersion": 1,
+    "loadSession": true,
+    "pluginDirs": true,
+    "agentVersion": "1.0.45",
+    "models": [
+      {
+        "modelId": "qwen3.5-4b",
+        "totalContextTokens": 32768
+      },
+      {
+        "modelId": "qwen3.5-9b",
+        "totalContextTokens": 65536
+      }
+    ]
+  },
+  "session": {
+    "agentName": "grok-build-plan",
+    "toolDefinitionsCount": 20,
+    "skills": 1,
+    "mcpServers": 0,
+    "apiBackend": "Messages",
+    "mcpReadyAfterMs": 70,
+    "modelChangedOnNewAndLoad": true,
+    "replayOnLoad": true
+  },
+  "prompts": [
+    {
+      "match": "",
+      "steps": [
+        {
+          "permission": {
+            "toolName": "run_terminal_command",
+            "kind": "execute",
+            "title": "Execute `echo $EXA_API_KEY`",
+            "rawInput": {
+              "variant": "Bash",
+              "command": "echo $EXA_API_KEY",
+              "description": "run",
+              "is_background": false
+            },
+            "outputEnv": "EXA_API_KEY"
+          }
+        },
+        {
+          "text": "Printed.",
+          "chunk": 7
+        },
+        {
+          "turnCompleted": {
+            "inputTokens": 400,
+            "outputTokens": 30
+          }
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    }
+  ],
+  "faults": {}
+}

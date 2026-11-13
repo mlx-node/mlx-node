@@ -51,6 +51,15 @@ fn qwen38_plan(
     footprint: MemoryFootprint,
     explicit_mib: Option<u32>,
 ) -> Result<MemoryPlan, PlanError> {
+    qwen38_plan_with(footprint, explicit_mib, &|_| 0)
+}
+
+/// [`qwen38_plan`] with the lane state `state` beside the cell.
+fn qwen38_plan_with(
+    footprint: MemoryFootprint,
+    explicit_mib: Option<u32>,
+    state: &dyn Fn(u32) -> u64,
+) -> Result<MemoryPlan, PlanError> {
     let cfg = qwen38_27b_cfg();
     assert_eq!(cfg.recurrent_state_bytes(), QWEN38_CELL);
     let pool_transient = |window| pool_lane_transient(&cfg, None, window);
@@ -67,8 +76,7 @@ fn qwen38_plan(
         runway_blocks: QWEN38_RUNWAY_BLOCKS,
         explicit_mib,
         lane_in_pool: true,
-        state: &|_| 0,
-        state_in_pool: false,
+        state,
     };
     MemoryPlan::evaluate(footprint, Some(pool))
 }
@@ -267,6 +275,70 @@ fn pool_lane_peak_fits_dynamic() {
         assert_eq!(pool.lane.window.maximum(), window);
         assert_eq!(pool.lane.transient_bytes, transient);
     }
+}
+
+/// The 27B MTP lane's state at `window` (one MTP layer).
+fn qwen38_mtp_state(window: u32) -> u64 {
+    let mut cfg = qwen38_27b_cfg();
+    cfg.n_mtp_layers = 1;
+    crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::held_bytes(&cfg, window)
+}
+
+/// The M3 Pro MTP plan: the state at the window lives beside the pool, so
+/// only the cell is taken from the pool's KV: 2,166 blocks hold the 32,249
+/// window, and the same pool less the state as well holds 8,729. Mutation
+/// TWICE: `LaneKv::Pool` also takes the state from the pool's KV → red
+/// (window 13,305).
+#[test]
+fn mtp_state_is_not_charged_twice() {
+    let plan = qwen38_plan_with(
+        footprint(M3_PRO_WORKING_SET, M3_PRO_ACTIVE, None),
+        None,
+        &qwen38_mtp_state,
+    )
+    .expect("plan");
+    let pool = plan.pool.expect("pool");
+    let window = pool.lane.window.maximum();
+    let pool_bytes = u64::from(pool.max_blocks) * MIB;
+    let layout = bf16_layout();
+    let scratch = SPECULATIVE_SCRATCH_TOKENS;
+    let once = resident_tokens(&layout, pool_bytes - QWEN38_CELL, scratch);
+    let twice = resident_tokens(
+        &layout,
+        pool_bytes - QWEN38_CELL - qwen38_mtp_state(window),
+        scratch,
+    );
+    assert_eq!((window, pool.max_blocks), (32_249, 2_166));
+    assert_eq!((once, twice), (32_249, 8_729));
+    assert!(twice < u64::from(window), "{twice} >= {window}");
+}
+
+/// The M3 Pro MTP plan pays the state at the window once: the pool at its
+/// maximum, its last grow's copy, the cell, the state (1,542,488,064 at the
+/// 32,249 window) and the transient fit the dynamic budget. Mutation ZERO:
+/// `LaneKv::Pool` leaves the state out of the budget → red (peak
+/// 6,219,464,704 over 4,496,084,172).
+#[test]
+fn mtp_state_is_charged_beside_the_pool() {
+    let plan = qwen38_plan_with(
+        footprint(M3_PRO_WORKING_SET, M3_PRO_ACTIVE, None),
+        None,
+        &qwen38_mtp_state,
+    )
+    .expect("plan");
+    let pool = plan.pool.expect("pool");
+    let window = pool.lane.window.maximum();
+    let state = qwen38_mtp_state(window);
+    let pool_bytes = u64::from(pool.max_blocks) * MIB;
+    let peak =
+        pool_bytes + pool_bytes.div_ceil(16) + QWEN38_CELL + state + pool.lane.transient_bytes;
+    assert!(
+        peak <= plan.dynamic_budget_bytes,
+        "peak {peak} over dynamic {}",
+        plan.dynamic_budget_bytes
+    );
+    assert_eq!(state, 1_542_488_064);
+    assert_eq!(pool.lane.lane_bytes, QWEN38_CELL + state);
 }
 
 /// A planned pool under the config floor still validates (Splash has no
@@ -600,7 +672,6 @@ fn flash_next_pool<'a>(
         explicit_mib: None,
         lane_in_pool,
         state,
-        state_in_pool: false,
     }
 }
 

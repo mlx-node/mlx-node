@@ -29,12 +29,13 @@
  * break on every reshuffle. The exclusion lists themselves are the contract.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vite-plus/test';
 
+import { loadManifest, readBundleFile, readChatSkill } from '../../dashboard/src/chat/skills/manifest.js';
 import {
   isNonRuntimeFile,
   pruneExcludedNested,
@@ -42,6 +43,7 @@ import {
   scopeCoreNativeOverride,
   stageApp,
   stageRuntimeBuildFiles,
+  workspaceShipEntries,
 } from '../scripts/stage-app.js';
 
 interface SeedDeps {
@@ -62,7 +64,7 @@ function seedPkg(root: string, name: string, deps: SeedDeps = {}): void {
 function seedWorkspace(root: string, dir: string, name: string, deps: SeedDeps = {}): void {
   const pkgDir = join(root, 'packages', dir);
   mkdirSync(join(pkgDir, 'dist'), { recursive: true });
-  writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name, version: '1.0.0', ...deps }));
+  writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name, version: '1.0.0', files: ['dist'], ...deps }));
   writeFileSync(join(pkgDir, 'dist', 'index.js'), 'export {};');
 }
 
@@ -196,7 +198,11 @@ it('stages a fat addon package verbatim, foreign .node slices included', () => {
     mkdirSync(join(dashboard, 'dist'), { recursive: true });
     writeFileSync(
       join(dashboard, 'package.json'),
-      JSON.stringify({ name: '@mlx-node/dashboard', dependencies: { 'fat-addon': '0.23.2', other: '1.0.0' } }),
+      JSON.stringify({
+        name: '@mlx-node/dashboard',
+        files: ['dist'],
+        dependencies: { 'fat-addon': '0.23.2', other: '1.0.0' },
+      }),
     );
     for (const name of ['fat-addon', 'other']) {
       const dir = join(root, 'node_modules', name);
@@ -219,6 +225,78 @@ it('stages a fat addon package verbatim, foreign .node slices included', () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+/**
+ * A workspace package ships what its `files` list declares, minus `src`. The dashboard's `skills` bundle is the
+ * case this guards: a staging copy that knew only `dist` and `web` shipped an app whose Chat was blocked as
+ * `skill-bundle-corrupt` on every install. The last test reads the real dashboard manifest and skills on purpose:
+ * that pair is the contract, and the dashboard's own bundle check must accept the staged copy.
+ */
+describe('workspace package contents', () => {
+  it('ships every files entry except src, and nothing the list leaves out', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-ws-files-'));
+    try {
+      const desktop = seedDesktop(root);
+      const stage = join(root, 'stage');
+      const pkgDir = join(root, 'packages', 'rerank');
+      seedWorkspace(root, 'rerank', '@mlx-node/rerank', {});
+      writeFileSync(
+        join(pkgDir, 'package.json'),
+        JSON.stringify({ name: '@mlx-node/rerank', files: ['dist', 'assets', 'src', 'NOTICE'] }),
+      );
+      mkdirSync(join(pkgDir, 'assets'), { recursive: true });
+      writeFileSync(join(pkgDir, 'assets', 'table.json'), '{}');
+      mkdirSync(join(pkgDir, 'src'), { recursive: true });
+      writeFileSync(join(pkgDir, 'src', 'index.ts'), 'export {};');
+      writeFileSync(join(pkgDir, 'NOTICE'), 'notice');
+      writeFileSync(join(pkgDir, 'README.md'), 'readme');
+      mkdirSync(join(pkgDir, 'node_modules', 'electron'), { recursive: true });
+
+      stageApp({ repoRoot: root, desktopDir: desktop, stageDir: stage, roots: ['@mlx-node/rerank'] });
+
+      const staged = join(stage, 'node_modules', '@mlx-node', 'rerank');
+      expect(readdirSync(staged).sort()).toEqual(['NOTICE', 'assets', 'dist', 'package.json']);
+      expect(readFileSync(join(staged, 'assets', 'table.json'), 'utf8')).toBe('{}');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a package without a files list, or with an entry it cannot copy as one name', () => {
+    expect(() => workspaceShipEntries('@mlx-node/x', {})).toThrow('has no "files" list');
+    for (const entry of ['dist/*.js', 'lib/index.js', '!dist', '..', '']) {
+      expect(() => workspaceShipEntries('@mlx-node/x', { files: ['dist', entry] }), entry).toThrow('unstageable');
+    }
+  });
+
+  it('stages the dashboard skills bundle so that the dashboard bundle check accepts it', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-ws-skills-'));
+    try {
+      const desktop = seedDesktop(root);
+      const stage = join(root, 'stage');
+      const realDashboard = join(import.meta.dirname, '..', '..', 'dashboard');
+      const real = JSON.parse(readFileSync(join(realDashboard, 'package.json'), 'utf8')) as { files: string[] };
+      const pkgDir = join(root, 'packages', 'dashboard');
+      seedWorkspace(root, 'dashboard', '@mlx-node/dashboard', {});
+      writeFileSync(join(pkgDir, 'package.json'), JSON.stringify({ name: '@mlx-node/dashboard', files: real.files }));
+      cpSync(join(realDashboard, 'skills'), join(pkgDir, 'skills'), { recursive: true });
+
+      stageApp({ repoRoot: root, desktopDir: desktop, stageDir: stage, roots: ['@mlx-node/dashboard'] });
+
+      const skills = join(stage, 'node_modules', '@mlx-node', 'dashboard', 'skills');
+      expect(readChatSkill(skills).length).toBeGreaterThan(0);
+      const manifest = loadManifest(skills);
+      expect(Object.keys(manifest.bundles).length).toBeGreaterThan(0);
+      for (const [id, bundle] of Object.entries(manifest.bundles)) {
+        for (const file of bundle.files) {
+          expect(readBundleFile(skills, bundle, file).length, `${id}/${file.path}`).toBe(file.bytes);
+        }
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('runtimeClosure', () => {

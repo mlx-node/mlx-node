@@ -19,6 +19,7 @@ import {
   type MemoryGovernorHealth,
   type ServerHealth,
 } from './health.js';
+import { parseThinkingEndText } from './host/agent-thinking.js';
 import {
   createIdleSweeper,
   DEFAULT_IDLE_CLEAR_CACHE_MS,
@@ -198,6 +199,17 @@ export interface ServerConfig {
    */
   thinkingTokenBudget?: number;
   /**
+   * Messages requests get the native cycle guard: an exact repeat inside a
+   * thought closes it. Never for reasoning effort `none`. Default: off.
+   */
+  thinkingCycleGuard?: boolean;
+  /**
+   * Plain text written before the template's close when a cut (budget or
+   * cycle) ends a Messages request's thinking (Splash `--thinking-end-text`).
+   * 1 to 512 characters. Default: the close alone.
+   */
+  thinkingEndText?: string;
+  /**
    * The desktop supervisor's turn journal and quarantine (Splash
    * `Quarantine`). Omitted: no journal and no refusal.
    */
@@ -296,6 +308,8 @@ export interface ServerConfig {
    * on disk while only the currently-resident one is registered).
    */
   listModels?: () => PublicModelEntry[];
+  /** Backs `POST /v1/models/unload`. See `HandlerOptions.unloadModels`. */
+  unloadModels?: () => Promise<string[]>;
 }
 
 /** Options for {@link ServerInstance.close}. */
@@ -569,6 +583,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     resolveModel: config?.resolveModel,
     modelWorkCoordinator,
     listModels: config?.listModels,
+    unloadModels: config?.unloadModels,
     authToken,
     health,
     ...(weights !== null
@@ -578,6 +593,8 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
         }
       : {}),
     ...(config?.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: config.thinkingTokenBudget } : {}),
+    ...(config?.thinkingCycleGuard === true ? { thinkingCycleGuard: true } : {}),
+    ...(config?.thinkingEndText !== undefined ? { thinkingEndText: parseThinkingEndText(config.thinkingEndText) } : {}),
     ...(config?.turnJournal !== undefined ? { turnJournal: new TurnJournal(config.turnJournal) } : {}),
   });
   /**

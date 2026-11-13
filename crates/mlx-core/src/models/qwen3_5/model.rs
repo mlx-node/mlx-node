@@ -118,6 +118,16 @@ use crate::vision::qwen::cache::{VisionCache, VisionCacheInner, vlm_prepare_visi
 pub(crate) type Qwen35SchedulerState =
     crate::engine::hybrid_scheduler::HybridSchedulerState<Qwen35Inner>;
 
+/// The text admission width a dense or MoE load reports to the server:
+/// the decode lanes its plan granted (`lanes`).
+pub(crate) fn qwen35_max_concurrent_sequences(paged_active: bool, lanes: u32) -> u32 {
+    if paged_active && !Qwen35SchedulerState::force_serial() {
+        crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for(lanes as usize) as u32
+    } else {
+        1
+    }
+}
+
 // The shared model-id counter lives in `crate::engine::compiled_lock` so the
 // dense + MoE families draw from one id space (per-instance ids never
 // overlap). Re-exported here for unqualified use by this module's
@@ -227,6 +237,13 @@ pub(crate) struct Qwen35Inner {
     /// while each prefill slice and turn end activates its own sequence (one
     /// per owner).
     gdn_unclaimed_rungs: HashMap<Option<SeqId>, Vec<DenseGdnPrefixCheckpoint>>,
+    /// False while a scheduled prefill slice runs for a sequence whose
+    /// admission reserved no room for its refused rungs: a rung its claim
+    /// refuses is then dropped, not held.
+    refused_rungs_booked: bool,
+    /// The load persists its paged cache to the cold tier
+    /// (`resolve_persist_cold`): its memory plan prices the refused rungs.
+    pub(crate) persist_cold: bool,
     gdn_last_history_checkpoint: Option<DenseGdnHistoryCheckpoint>,
     /// The replay point each running turn restored from (Splash
     /// `StateCache::useState`): no reclaim unit until its use ends.
@@ -258,7 +275,8 @@ pub(crate) struct Qwen35Inner {
     /// K/V remains in `paged_adapter`; each table value contains only the
     /// corresponding request's two GDN arrays at every linear layer.
     ///
-    /// The table has a two-unit cap. One state may be temporarily
+    /// The table caps live units at the plan's decode lanes (at most
+    /// eight). One state may be temporarily
     /// activated in `caches` for serial prefill/finalization, so activation
     /// first parks the previous owner and then removes the next owner from the
     /// table. Batched decode parks the active owner and stacks table rows.
@@ -476,6 +494,8 @@ pub struct Qwen3_5Model {
     /// flat path. Dense image turns only run on the paged-vision core. Surfaced
     /// through the `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
+    /// The decode lanes the load's memory plan granted.
+    pub(crate) scheduled_lanes: u32,
     /// Snapshot of `Qwen35Inner::has_speculative_weights()` captured
     /// at construction time, mirroring `paged_active`. Surfaced through
     /// the `hasMtpWeights()` NAPI method so the TS ChatSession can
@@ -542,14 +562,7 @@ impl Qwen3_5Model {
     /// lane by the scheduler.
     #[napi]
     pub fn max_concurrent_sequences(&self) -> u32 {
-        if self.paged_active
-            && Qwen35SchedulerState::continuous_batching_enabled()
-            && !Qwen35SchedulerState::force_serial()
-        {
-            crate::engine::hybrid_scheduler::scheduler_max_num_seqs() as u32
-        } else {
-            1
-        }
+        qwen35_max_concurrent_sequences(self.paged_active, self.scheduled_lanes)
     }
 
     /// Whether this instance has an inline MTP head or external DFlash2

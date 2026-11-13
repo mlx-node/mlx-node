@@ -30,6 +30,11 @@ import { DECODE_SHARE_ERROR, parseDecodeShare } from '@mlx-node/server/host/deco
 import { IDLE_RELEASE_ERROR, parseIdleRelease } from '@mlx-node/server/host/idle-release';
 import { MAX_CONTEXT_ERROR, parseMaxContext } from '@mlx-node/server/host/max-context';
 import { MAX_MEMORY_ERROR, parseMaxMemory } from '@mlx-node/server/host/max-memory';
+import {
+  WHOLE_PROMPT_CAPTURE_BLOCKS,
+  WHOLE_PROMPT_CAPTURE_BUDGET_MS,
+  type PersistPagedCache,
+} from '@mlx-node/server/host/persist-cache';
 
 import {
   agentUpdateStatus,
@@ -54,13 +59,11 @@ export interface AgentArgScan {
   /** `--trace-dir` was present without a value — usage error. */
   traceDirMissingValue: boolean;
   /**
-   * Whether to persist the SSD paged cold tier (on by default; the mlx-owned
-   * `--no-persist-cache` flag turns it off). A SINGLE process-wide boolean
-   * applied to every family in `COLD_TIER_RESTORE_FAMILIES` — not to qwen3
-   * alone. Lifted out of the argv like the other mlx flags — never forwarded
-   * to the agent binary.
+   * The paged KV disk cache for the spawned `mlx serve`: on by default,
+   * `--no-persist-cache` sets the flag off. Lifted out of the argv, never
+   * forwarded to the agent binary. A turn writes the whole prompt.
    */
-  persistPagedCache: boolean;
+  persistPagedCache: PersistPagedCache;
   /** Value of `--kv-format` (lifted out of the argv, forwarded to `mlx serve`). */
   kvFormat?: 'int8' | 'bf16';
   /** `--kv-format` had a missing or unknown value (the raw value, `''` when missing) — usage error. */
@@ -233,7 +236,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   let trace = false;
   let traceDir: string | undefined;
   let traceDirMissingValue = false;
-  let persistPagedCache = true;
+  let persistCacheOff = false;
   let kvFormat: 'int8' | 'bf16' | undefined;
   let kvFormatInvalid: string | undefined;
   const takeKvFormat = (value: string): void => {
@@ -336,7 +339,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       continue;
     }
     if (arg === '--no-persist-cache') {
-      persistPagedCache = false;
+      persistCacheOff = true;
       continue;
     }
     if (arg === '--kv-format') {
@@ -453,7 +456,9 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     trace,
     traceDir,
     traceDirMissingValue,
-    persistPagedCache,
+    persistPagedCache: persistCacheOff
+      ? { flag: false, byDefault: true, wholePrompt: true }
+      : { byDefault: true, wholePrompt: true },
     ...(kvFormat !== undefined ? { kvFormat } : {}),
     ...(kvFormatInvalid !== undefined ? { kvFormatInvalid } : {}),
     ...(maxMemoryBytes !== undefined ? { maxMemoryBytes } : {}),
@@ -682,10 +687,15 @@ mlx options (handled before the agent binary sees the args):
                             m or h suffix, e.g. 30m (default: 10m); off keeps
                             both, though POST /v1/memory/release still frees
                             the weights.
-  --no-persist-cache        Disable the on-by-default SSD cold tier for persisted
-                            paged prefix blocks. One switch for ALL restore-eligible
-                            families (${coldTierRestoreFamilyList().join(', ')});
-                            every other family never persists, flag or not.
+  --no-persist-cache        Turn off the paged KV disk cache, which is on by
+                            default (~/.mlx-node/cache/paged/v1: a prompt prefix
+                            survives an engine restart). MLX_PERSIST_PAGED_CACHE=0
+                            also turns it off when this flag is absent. One switch
+                            for ALL restore-eligible families
+                            (${coldTierRestoreFamilyList().join(', ')}); every
+                            other family never persists, flag or not. A turn
+                            writes the whole prompt (up to ${WHOLE_PROMPT_CAPTURE_BLOCKS} blocks
+                            within ${WHOLE_PROMPT_CAPTURE_BUDGET_MS} ms) before it ends.
 
 First run: when no local model exists, an interactive wizard offers a curated
 download. Agent config home: ~/.mlx-agent (override: GROK_HOME).
@@ -698,6 +708,9 @@ Environment:
                             downloads resolve (default: newest published).
   MLX_CLI_ENTRY             Path to this CLI's entry point, used to spawn the
                             inference host (default: the running 'mlx' bin).
+  MLX_COLD_CAPTURE_BLOCKS_PER_TURN, MLX_COLD_CAPTURE_BUDGET_MS
+                            Cap one turn's disk cache write (blocks, ms);
+                            a set value beats the whole-prompt default.
   MLX_NODE_LOG              Override the Rust tracing target filter used by --trace.
   MLX_NODE_LOG_FILE         Override the Rust tracing log file used by --trace.
 
@@ -928,6 +941,7 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     argv: agentArgv,
     modelsDir,
     needsServer: true,
+    persistPagedCache: scan.persistPagedCache,
     ...(preloadModel !== undefined ? { preloadModel } : {}),
     ...(scan.kvFormat !== undefined ? { kvFormat: scan.kvFormat } : {}),
     ...(scan.maxMemoryBytes !== undefined ? { maxMemoryBytes: scan.maxMemoryBytes } : {}),

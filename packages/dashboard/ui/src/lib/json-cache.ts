@@ -13,7 +13,7 @@
  * immediately and revalidates in the background, so what you see is at worst one
  * round-trip stale and is corrected without ever collapsing the layout.
  *
- * Bounded because the key space is not: `/metrics/overview?from=…&to=…`
+ * Bounded because the key space is not: `/metrics/summary?from=…&to=…`
  * mints a new key every time the range
  * selector moves. Insertion order is the recency order — a read reinserts — so
  * evicting from the front is a true LRU.
@@ -23,6 +23,14 @@
 const MAX_ENTRIES = 48;
 
 const store = new Map<string, unknown>();
+
+/** Bumped by every {@link clearCache}; a body read before a clear describes the state the clear invalidated. */
+let epoch = 0;
+
+/** The current cache epoch. A reader takes it before its request starts and hands it to {@link writeCache}. */
+export function cacheEpoch(): number {
+  return epoch;
+}
 
 /**
  * The cached body for `path`, wrapped so a hit is distinguishable from a miss.
@@ -40,7 +48,13 @@ export function readCache<T>(path: string): { value: T } | undefined {
   return { value };
 }
 
-export function writeCache(path: string, value: unknown): void {
+/**
+ * Store `value` for `path`, unless a clear happened after the request that read it started (`startedAt` is the
+ * {@link cacheEpoch} taken then): a GET in flight across a delete answers with the deleted row, and seeding the next
+ * mount with it would paint the row again.
+ */
+export function writeCache(path: string, value: unknown, startedAt: number = epoch): void {
+  if (startedAt !== epoch) return;
   store.delete(path);
   store.set(path, value);
   while (store.size > MAX_ENTRIES) {
@@ -62,4 +76,5 @@ export function writeCache(path: string, value: unknown): void {
  */
 export function clearCache(): void {
   store.clear();
+  epoch += 1;
 }

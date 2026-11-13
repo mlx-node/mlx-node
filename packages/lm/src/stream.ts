@@ -96,6 +96,16 @@ export interface ChatStreamFinal {
    */
   cachedTokens?: number;
   performance?: PerformanceMetrics;
+  /**
+   * How the thought ended (`model`, `budget`, `cycle`, `open`), the thinking
+   * tokens when a cut began, the cycle period, and close tokens after the
+   * thought. Copied from the terminal chunk only when the addon sends them;
+   * absent means not known.
+   */
+  reasoningClose?: string;
+  reasoningCutAt?: number;
+  reasoningCyclePeriod?: number;
+  reasoningStrayCloses?: number;
 }
 
 export type ChatStreamEvent = ChatStreamDelta | ChatStreamFinal;
@@ -377,6 +387,10 @@ export async function* _runChatStream(
             cachedTokens?: number;
             publicRawText?: string;
             textAuthoritative?: boolean;
+            reasoningClose?: unknown;
+            reasoningCutAt?: unknown;
+            reasoningCyclePeriod?: unknown;
+            reasoningStrayCloses?: unknown;
           };
           const finalEvent: ChatStreamFinal = {
             text: chunk.text,
@@ -399,6 +413,18 @@ export async function* _runChatStream(
           }
           if (typeof chunkWithCached.textAuthoritative === 'boolean') {
             finalEvent.textAuthoritative = chunkWithCached.textAuthoritative;
+          }
+          if (typeof chunkWithCached.reasoningClose === 'string') {
+            finalEvent.reasoningClose = chunkWithCached.reasoningClose;
+          }
+          if (typeof chunkWithCached.reasoningCutAt === 'number') {
+            finalEvent.reasoningCutAt = chunkWithCached.reasoningCutAt;
+          }
+          if (typeof chunkWithCached.reasoningCyclePeriod === 'number') {
+            finalEvent.reasoningCyclePeriod = chunkWithCached.reasoningCyclePeriod;
+          }
+          if (typeof chunkWithCached.reasoningStrayCloses === 'number') {
+            finalEvent.reasoningStrayCloses = chunkWithCached.reasoningStrayCloses;
           }
           yield finalEvent;
           return;

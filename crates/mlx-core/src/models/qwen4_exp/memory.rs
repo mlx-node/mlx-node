@@ -103,7 +103,7 @@ impl Drop for TestHostGuard {
 
 /// A constrained host whose tiny direct fixtures fit the unchanged reserves.
 #[cfg(test)]
-fn fixture_host() -> HostMemory {
+pub(super) fn fixture_host() -> HostMemory {
     HostMemory {
         physical: 16 << 30,
         free: 8 << 30,
@@ -677,17 +677,56 @@ pub(super) fn draft_hidden_row_bytes(c: &super::config::Config) -> u64 {
     (c.hc_count * c.hidden_size * 2) as u64
 }
 
-/// What an MTP owner holds now: draft K/V for the rows in its cache, the
-/// hidden rows still waiting (trusted rows and the seed), and the verify
-/// snapshots while it is inside an MTP turn. A waiting row has no K/V yet.
+/// The draft layer's pooled BF16 indexer keys per token.
+pub(super) fn draft_index_bytes_per_token(c: &super::config::Config) -> u64 {
+    (c.indexer_head_dim * 2 / c.indexer_compress_ratio.max(1)) as u64
+}
+
+/// The rows a cold prefill of `rows` tokens has in its draft cache: draft
+/// passes drain whole `chunk`-row windows of the trusted rows, which end one
+/// row before the frontier.
+pub(super) fn cached_draft_rows(rows: u64, chunk: u64) -> u64 {
+    let trusted = rows.saturating_sub(1);
+    trusted - trusted % chunk.max(1)
+}
+
+/// The draft part of a state at `row`: the draft K/V and indexer keys of its
+/// cached rows and the hidden rows waiting beside them (the seed included).
+pub(super) fn draft_cell_bytes(c: &super::config::Config, row: u64, chunk: u64) -> u64 {
+    let cached = cached_draft_rows(row, chunk);
+    cached * (draft_kv_bytes_per_token(c) + draft_index_bytes_per_token(c))
+        + (row - cached) * draft_hidden_row_bytes(c)
+}
+
+/// One stored state at `row` of a load whose prefill window is `chunk`, its
+/// draft part with the MTP head.
+pub(super) fn state_bytes(c: &super::config::Config, row: u64, chunk: u64, has_mtp: bool) -> u64 {
+    state_cell_bytes(c)
+        + if has_mtp {
+            draft_cell_bytes(c, row, chunk)
+        } else {
+            0
+        }
+}
+
+/// What an MTP owner holds now: draft K/V and indexer keys for the rows in
+/// its cache, the hidden rows still waiting (trusted rows and the seed), and
+/// the verify snapshots while it is inside an MTP turn. A waiting row has no
+/// K/V yet.
 pub(super) fn draft_owner_bytes(
     c: &super::config::Config,
     cached_rows: u64,
     hidden_rows: u64,
-    tracking: bool,
+    speculative: bool,
 ) -> u64 {
-    let snapshots = if tracking { 4 * row_state_bytes(c) } else { 0 };
-    snapshots + cached_rows * draft_kv_bytes_per_token(c) + hidden_rows * draft_hidden_row_bytes(c)
+    let snapshots = if speculative {
+        4 * row_state_bytes(c)
+    } else {
+        0
+    };
+    snapshots
+        + cached_rows * (draft_kv_bytes_per_token(c) + draft_index_bytes_per_token(c))
+        + hidden_rows * draft_hidden_row_bytes(c)
 }
 
 /// The pool's share of the dynamic budget the scheduled state competes
@@ -723,24 +762,101 @@ pub(super) fn scheduled_state_budget(dynamic: u64, transient: u64, pool: &PoolCh
         .saturating_sub(pool.bytes())
 }
 
-/// The prefill chunk the live host admits for a sequence of up to `context`
-/// tokens: the plan prices `MAX_PREFILL_CHUNK`, and only a host that cannot
-/// hold its scratch beside the store halves it.
-pub(super) fn prefill_window(c: &super::config::Config, plan: &Plan, context: usize) -> usize {
-    let anonymous_budget = plan.budget.saturating_sub(plan.direct_bytes);
-    let allowance = match (plan.available_bytes, plan.physical_bytes) {
-        (Some(a), Some(p)) => {
-            let reserve = if plan.partial_direct_gate {
-                DIRECT_TURN_FLOOR
-            } else {
-                system_reserve(p) + (2 << 30)
-            };
-            a.saturating_sub(anonymous_budget + reserve)
-        }
-        _ => u64::MAX,
+/// One stored state at a grid line: the cell without indexer keys waiting
+/// for a block (none wait at a multiple of the compress ratio).
+pub(super) fn state_cell_bytes(c: &super::config::Config) -> u64 {
+    let [conv, recurrent, ple, _] = row_state_parts(c);
+    conv + recurrent + ple
+}
+
+/// An encoded state's header (shapes, dtypes, index blocks) at most.
+const STATE_HEADER_BYTES: u64 = 1 << 16;
+
+/// One state as the disk tier encodes it: the cell, the draft's waiting rows
+/// and seed with the MTP head (its segments are objects of their own).
+pub(super) fn encoded_state_bytes(c: &super::config::Config, has_mtp: bool) -> u64 {
+    let waiting = if has_mtp {
+        (super::MAX_PREFILL_CHUNK as u64 + 1) * draft_hidden_row_bytes(c)
+    } else {
+        0
+    };
+    state_cell_bytes(c) + waiting + STATE_HEADER_BYTES
+}
+
+/// Host bytes the disk tier holds on a load with it on: every parked state
+/// and the copy the writer encodes of the one it writes; one array's host
+/// copy while the model thread encodes a state; the parker's queue of block
+/// and segment copies (one copy past its bound), the writer's queue behind
+/// it and the copy the writer encodes.
+pub(super) fn disk_staging_bytes(c: &super::config::Config, has_mtp: bool) -> u64 {
+    let window = super::MAX_PREFILL_CHUNK as u64;
+    let linear = (0..c.num_hidden_layers).filter(|&i| c.linear(i)).count() as u64;
+    let [conv, recurrent, ple, _] = row_state_parts(c);
+    let mut largest = (conv / linear.max(1))
+        .max(recurrent / linear.max(1))
+        .max(ple);
+    let mut item = super::load_plan::flash_next_layout(c).page_bytes();
+    if has_mtp {
+        largest = largest.max(window * draft_hidden_row_bytes(c));
+        item = item.max(window * (draft_kv_bytes_per_token(c) + draft_index_bytes_per_token(c)));
+    }
+    (super::prefix_disk::PARCELS as u64 + 1) * encoded_state_bytes(c, has_mtp)
+        + largest
+        + super::prefix_disk::QUEUE_BYTES
+        + (mlx_paged_attn::DEFAULT_QUEUE_DEPTH as u64 + 3) * item
+}
+
+/// What stored states may hold: the dynamic budget less one pass's transient
+/// and the pool, the pool charged as it is and at its largest, so a state
+/// never takes room the pool can still grow into, less what the lanes'
+/// rows and draft state hold (`held`).
+pub(super) fn state_room(dynamic: u64, transient: u64, pool: &PoolCharge, held: u64) -> u64 {
+    let largest = PoolCharge {
+        total_blocks: pool.max_blocks.max(pool.total_blocks),
+        max_blocks: pool.max_blocks.max(pool.total_blocks),
+        physical_block_bytes: pool.physical_block_bytes,
+        growth_copy_bytes: 0,
+    };
+    scheduled_state_budget(dynamic, transient, pool)
+        .min(scheduled_state_budget(dynamic, transient, &largest))
+        .saturating_sub(held)
+}
+
+/// Whether a state of `bytes` leaves the host the headroom a pass checks
+/// for and keeps MLX's active memory within the SSD read limit: the plan's
+/// room is a ledger, these are the live readings the passes refuse on.
+pub(super) fn state_fits_live(
+    host: &HostMemory,
+    active: f64,
+    limit: Option<u64>,
+    bytes: u64,
+    direct_gate: bool,
+) -> bool {
+    let floor = if direct_gate {
+        DIRECT_TURN_FLOOR
+    } else {
+        system_reserve(host.physical)
+    };
+    host.available() >= floor.saturating_add(bytes)
+        && limit.is_none_or(|limit| active + bytes as f64 <= limit as f64)
+}
+
+/// The rows of a prefill pass that ends at up to `context` tokens. Every
+/// store prefills the `MAX_PREFILL_CHUNK` rows the memory plan prices (Splash
+/// sizes its arenas for one fixed chunk; live free memory never cuts it). A
+/// store whose host gate refused the whole bank set holds its slots beside the
+/// `reserved` scratch that gate priced at the allowance context, so a longer
+/// sequence halves the pass until its scratch fits there.
+pub(super) fn prefill_window(
+    c: &super::config::Config,
+    reserved: Option<u64>,
+    context: usize,
+) -> usize {
+    let Some(reserved) = reserved else {
+        return super::MAX_PREFILL_CHUNK;
     };
     let mut window = super::MAX_PREFILL_CHUNK;
-    while window > 1 && prefill_scratch(c, window, context) > allowance {
+    while window > 1 && prefill_scratch(c, window, context) > reserved {
         window /= 2;
     }
     window
@@ -787,29 +903,26 @@ pub(crate) fn flash_next_config() -> super::config::Config {
     .unwrap()
 }
 
+/// Without a refused gate every pass is the whole chunk. With one, a pass
+/// keeps the chunk up to the context the gate priced, one byte less halves
+/// it, and a pass at a longer context halves until its scratch fits the
+/// reservation.
 #[test]
-fn direct_prefill_window_excludes_the_full_bank_bytes_from_anonymous_scratch() {
+fn prefill_window_halves_only_past_the_scratch_a_refused_gate_reserved() {
     let c = flash_next_config();
-    let mut direct = tests::plan_without_snapshot();
-    direct.available_bytes = Some(112 << 30);
-    direct.physical_bytes = Some(128 << 30);
-    direct.budget = 80 << 30;
-    direct.direct = true;
-    direct.direct_bytes = 73 << 30;
-    direct.direct_layers = 48;
-    let mut without_bank_charge = direct.clone();
-    without_bank_charge.direct_bytes = 0;
-    without_bank_charge.direct_layers = 0;
-    without_bank_charge.budget = 7 << 30;
-    let context = 65_536;
-    assert_eq!(
-        prefill_window(&c, &direct, context),
-        prefill_window(&c, &without_bank_charge, context)
-    );
-    assert_eq!(
-        prefill_window(&c, &direct, context),
-        super::MAX_PREFILL_CHUNK
-    );
+    let chunk = super::MAX_PREFILL_CHUNK;
+    assert_eq!(prefill_window(&c, None, 262_144), chunk);
+    for context in [65_536, 262_144] {
+        let priced = prefill_scratch(&c, chunk, context);
+        assert_eq!(prefill_window(&c, Some(priced), context), chunk);
+        assert_eq!(prefill_window(&c, Some(priced - 1), context), chunk / 2);
+    }
+    let reserved = prefill_scratch(&c, chunk, 65_536);
+    let long = prefill_window(&c, Some(reserved), 262_144);
+    assert!((2..chunk).contains(&long), "{long} rows");
+    assert!(prefill_scratch(&c, long, 262_144) <= reserved);
+    assert!(prefill_scratch(&c, long * 2, 262_144) > reserved);
+    assert_eq!(prefill_window(&c, Some(0), 262_144), 1);
 }
 
 /// The Flash Next cell on its storage: 36 linear layers of 3 bf16 conv
@@ -852,7 +965,7 @@ fn flash_next_parked_owners_charge_their_waiting_hidden_rows() {
     assert!(parked > kv_figure);
     assert_eq!(
         draft_owner_bytes(&c, 7, 1, true),
-        4 * row + 7 * 4096 + 20_480,
+        4 * row + 7 * (4096 + 64) + 20_480,
         "cached rows pay K/V, the seed pays its hidden row, a tracked owner its snapshots"
     );
     let candidate = row + draft_state_bytes(&c, 256);
@@ -874,4 +987,66 @@ fn flash_next_parked_owners_charge_their_waiting_hidden_rows() {
         ),
         ScheduledStateFit::Fits
     );
+}
+
+/// A Flash Next state at a grid line is the cell without pending index
+/// keys: 2,211,840 + 113,246,208 + 184,320 = 115,642,368 B, plus 4 B per
+/// lineage token and 8 B per lineage block. On the plan numbers of a busy
+/// host (dynamic 10,724,034,662 B, transient 5,746,196,480 B, a pool of
+/// 8,192 int8 pages of 423,936 B, one row held) the room holds 12 states of
+/// 4,096-token lineages and 11 of 61,440-token ones.
+/// Mutation: `state_room` charges the pool only as it is now (64 pages) →
+/// red (the room grows past 40 states).
+#[test]
+fn flash_next_states_fit_the_room_the_plan_leaves() {
+    use crate::models::qwen3_5::dflash2_state::store::lineage_bytes;
+    let c = flash_next_config();
+    assert_eq!(state_cell_bytes(&c), 115_642_368);
+    let state = |tokens: usize| state_cell_bytes(&c) + lineage_bytes(tokens, tokens / 32);
+    let pool = |total_blocks: u64| PoolCharge {
+        total_blocks,
+        max_blocks: 8_192,
+        physical_block_bytes: 423_936,
+        growth_copy_bytes: total_blocks * 423_936 / 12,
+    };
+    let room =
+        |pool: &PoolCharge| state_room(10_724_034_662, 5_746_196_480, pool, row_state_bytes(&c));
+    assert_eq!(room(&pool(8_192)), 1_389_302_886);
+    assert_eq!(room(&pool(64)), room(&pool(8_192)));
+    assert_eq!(room(&pool(8_192)) / state(4_096), 12);
+    assert_eq!(room(&pool(8_192)) / state(61_440), 11);
+}
+
+/// A state is refused when it would leave the host less than the pass
+/// gate's floor, or MLX's active memory past the SSD read limit.
+/// Mutation: `state_fits_live` drops the state's bytes from the host check
+/// → red.
+#[test]
+fn a_state_keeps_the_live_headroom_a_pass_checks() {
+    let host = HostMemory {
+        physical: 128 << 30,
+        free: 10 << 30,
+        file: 6 << 30,
+        ..HostMemory::default()
+    };
+    let floor = system_reserve(host.physical);
+    assert_eq!(floor, 16 << 30);
+    assert!(!state_fits_live(&host, 0.0, None, 1, false));
+    assert!(state_fits_live(&host, 0.0, None, 0, false));
+    assert!(state_fits_live(&host, 0.0, None, 14 << 30, true));
+    assert!(!state_fits_live(&host, 0.0, None, (14 << 30) + 1, true));
+    assert!(state_fits_live(
+        &host,
+        1e9,
+        Some(2_000_000_000),
+        1_000_000_000,
+        true
+    ));
+    assert!(!state_fits_live(
+        &host,
+        1e9,
+        Some(2_000_000_000),
+        1_000_000_001,
+        true
+    ));
 }
