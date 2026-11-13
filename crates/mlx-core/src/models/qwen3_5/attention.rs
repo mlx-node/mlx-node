@@ -3906,6 +3906,147 @@ mod tests {
         }
     }
 
+    /// A bf16 verify block of 8 rows at 131,072 tokens runs as 7 + 1 rows on
+    /// the portable path. The 1-row piece is a view 14,336 bytes into a
+    /// 16 KiB query buffer, which `contiguous` aliases rather than copies,
+    /// and the varlen primitive refuses a nonzero offset. Every row must
+    /// match one launch of the block bit for bit. Mutation F3 (no copy per
+    /// piece) → the second piece is refused → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn portable_verify_pieces_at_long_context_attend() {
+        use crate::transformer::paged_int8_tests::adapter_for;
+        use mlx_paged_attn::metal::MetalDtype;
+        const HQ: usize = 8;
+        const HKV: usize = 2;
+        const D: usize = 128;
+        const COMMITTED: usize = 131_072;
+        const ROWS: usize = 8;
+        let config = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: 256,
+            head_size: D as u32,
+            num_kv_heads: HKV as u32,
+            num_layers: 1,
+            max_seq_len: Some((COMMITTED + ROWS) as u32),
+            max_batch_size: Some(1),
+        };
+        let blocks = ((COMMITTED + ROWS) / 16 + 1) as u32;
+        let Some((mut adapter, _pool)) = adapter_for(config, blocks, blocks, MetalDtype::BFloat16)
+        else {
+            return;
+        };
+        adapter.force_portable_prefill();
+        adapter.reset_for_new_request(1).unwrap();
+        adapter
+            .allocate_suffix_blocks((COMMITTED + ROWS) as u32)
+            .unwrap();
+        adapter
+            .record_tokens(&(0..COMMITTED as u32).map(|t| t % 1000).collect::<Vec<_>>())
+            .unwrap();
+        let (q, got) = store_attend_chunk(
+            &mut adapter,
+            (COMMITTED, ROWS),
+            PagedPass::Verify,
+            (HQ, HKV, D),
+            70,
+        );
+        assert_eq!(
+            adapter.portable_prefill_launches,
+            [(7, 131_079), (1, 131_080)],
+            "the verify block's launches"
+        );
+        let queries = bf16_array(&q, &[ROWS as i64, HQ as i64, D as i64]);
+        let whole = adapter
+            .gather_kv_for_prefill_chunk_varlen(
+                0,
+                &queries,
+                COMMITTED as u32,
+                1.0 / (D as f32).sqrt(),
+            )
+            .unwrap();
+        let whole = f32_values(&whole);
+        let differing = got
+            .iter()
+            .zip(&whole)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(differing, 0, "the pieces differ from one launch");
+    }
+
+    /// The bf16 portable pieces of one chunk never hold their partials at
+    /// the same time: 1,024 rows at 15,360 tokens run as 16 pieces of 64 rows
+    /// over 32 partitions, each with 17,039,360 bytes of partials. MLX's peak
+    /// over the call stays under two pieces' partials plus three copies of
+    /// the output (pieces, concatenate, slack), where all 16 at once would
+    /// hold 272 MB. Mutation F2 (no evaluation between pieces) → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn portable_prefill_pieces_do_not_hold_their_partials_together() {
+        use crate::transformer::paged_int8_tests::adapter_for;
+        use mlx_paged_attn::metal::{MetalDtype, synchronize_mlx};
+        const HQ: usize = 16;
+        const HKV: usize = 2;
+        const D: usize = 256;
+        const COMMITTED: usize = 15_360;
+        const ROWS: usize = 1024;
+        let config = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: 256,
+            head_size: D as u32,
+            num_kv_heads: HKV as u32,
+            num_layers: 1,
+            max_seq_len: Some((COMMITTED + ROWS) as u32),
+            max_batch_size: Some(1),
+        };
+        let blocks = ((COMMITTED + ROWS) / 16 + 1) as u32;
+        let Some((mut adapter, _pool)) = adapter_for(config, blocks, blocks, MetalDtype::BFloat16)
+        else {
+            return;
+        };
+        adapter.force_portable_prefill();
+        adapter.reset_for_new_request(1).unwrap();
+        adapter
+            .allocate_suffix_blocks((COMMITTED + ROWS) as u32)
+            .unwrap();
+        adapter
+            .record_tokens(
+                &(0..(COMMITTED + ROWS) as u32)
+                    .map(|t| t % 1000)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let q = paged_attend_values(ROWS * HQ * D, D, 90, false);
+        let queries = bf16_array(&q, &[ROWS as i64, HQ as i64, D as i64]);
+        MxArray::eval_arrays(&[&queries]).unwrap();
+        synchronize_mlx();
+        let before = crate::array::get_active_memory();
+        crate::array::reset_peak_memory();
+        let out = adapter
+            .paged_prefill_attention(
+                0,
+                &queries,
+                COMMITTED as u32,
+                mlx_paged_attn::prefill_plan::Pass::Prefill,
+                1.0 / (D as f32).sqrt(),
+            )
+            .unwrap();
+        MxArray::eval_arrays(&[&out]).unwrap();
+        synchronize_mlx();
+        let grew = crate::array::get_peak_memory() - before;
+        assert_eq!(adapter.portable_prefill_launches.len(), 16);
+        let partials = (64 * HQ * 32 * (2 * D + 8)) as f64;
+        let output = (ROWS * HQ * D * 2) as f64;
+        eprintln!(
+            "portable prefill pieces: peak grew {grew} B; one piece's partials {partials} B, \
+             the output {output} B"
+        );
+        assert!(
+            grew <= 2.0 * partials + 3.0 * output,
+            "peak grew {grew} B: the pieces' partials overlap"
+        );
+    }
+
     /// The device answer is made once per process, and a GPU that builds
     /// the tensor-op pipelines (every Apple GPU family) launches them for
     /// every prefill chunk. Mutations PF1 (the fallback always taken) and

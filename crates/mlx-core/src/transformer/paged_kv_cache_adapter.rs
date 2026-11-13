@@ -6179,20 +6179,37 @@ impl PagedKVCacheAdapter {
         {
             return self.gather_kv_for_prefill_chunk_varlen(layer_idx, queries, committed, scale);
         }
+        let pieces = portable_prefill_pieces(committed, rows);
+        let last = pieces.len() - 1;
         let mut outputs = Vec::new();
-        for (start, end) in portable_prefill_pieces(committed, rows) {
-            let part = queries
+        for (index, (start, end)) in pieces.into_iter().enumerate() {
+            let mut part = queries
                 .slice_axis(0, i64::from(start), i64::from(end))
                 .map_err(|e| format!("paged_prefill_attention: query rows: {e}"))?;
+            // The varlen primitive refuses a query view at a nonzero offset,
+            // and `contiguous` keeps the view when the parent buffer is small.
+            if last > 0 {
+                part = part
+                    .deep_copy()
+                    .map_err(|e| format!("paged_prefill_attention: query rows: {e}"))?;
+            }
             #[cfg(test)]
             self.portable_prefill_launches
                 .push((end - start, committed + end));
-            outputs.push(self.gather_kv_for_prefill_chunk_varlen(
+            let output = self.gather_kv_for_prefill_chunk_varlen(
                 layer_idx,
                 &part,
                 committed + start,
                 scale,
-            )?);
+            )?;
+            // Each launch allocates its own partials and frees them when its
+            // command buffer completes; evaluating a piece before the next is
+            // built keeps one piece's partials live, the priced workspace.
+            if index < last {
+                MxArray::eval_arrays(&[&output])
+                    .map_err(|e| format!("paged_prefill_attention: piece: {e}"))?;
+            }
+            outputs.push(output);
         }
         if outputs.len() == 1 {
             return Ok(outputs.remove(0));
