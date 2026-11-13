@@ -20,6 +20,7 @@ export interface AsrModel {
 export type AudioModel = { kind: 'asr'; model: AsrModel } | { kind: 'tts'; model: TtsModel };
 
 import type { ModelAdmissionLane } from './model-work-coordinator.js';
+import { noteQueueRejection } from './queue-rejections.js';
 import type { PreDispatchAdmission } from './session-registry.js';
 
 export class AudioQueueFullError extends Error {}
@@ -77,8 +78,10 @@ export class AudioRegistry {
       );
   }
   private reserve(binding: Binding): PreDispatchAdmission {
-    if (this.maxQueueDepth !== undefined && binding.pending >= this.maxQueueDepth + 1)
+    if (this.maxQueueDepth !== undefined && binding.pending >= this.maxQueueDepth + 1) {
+      noteQueueRejection('audio');
       throw new AudioQueueFullError('Audio request queue is full');
+    }
     binding.pending++;
     const state = { binding, released: false, consumed: false };
     const permit = {

@@ -22,6 +22,7 @@ const PATHS_DIST = resolve(ROOT, 'packages/agent/dist/paths.js');
 const FAMILY_DATA_DIST = resolve(ROOT, 'packages/lm/dist/family-data.js');
 const LM_ROOT_DIST = resolve(ROOT, 'packages/lm/dist/index.js');
 const MODELS_DIST = resolve(ROOT, 'packages/agent/dist/models.js');
+const BINARY_DIST = resolve(ROOT, 'packages/agent/dist/binary.js');
 const MODEL_HANDLER_DIST = resolve(ROOT, 'packages/dashboard/dist/api/handlers/models.js');
 
 const RESOLVE_HOOK = `
@@ -66,6 +67,8 @@ describe('native-free catalog + family-data subpaths', () => {
     expect(Object.keys(agentPkg.exports)).toContain('./models');
     expect(Object.keys(lmPkg.exports)).toContain('./model-detection');
     expect(existsSync(MODELS_DIST)).toBe(true);
+    expect(Object.keys(agentPkg.exports)).toContain('./binary');
+    expect(existsSync(BINARY_DIST)).toBe(true);
   });
 
   it('discovers a standalone GGUF through the built dashboard handler without the addon', () => {
@@ -109,6 +112,8 @@ describe('native-free catalog + family-data subpaths', () => {
       const catalog = await import(${JSON.stringify(CATALOG_DIST)});
       const familyData = await import(${JSON.stringify(FAMILY_DATA_DIST)});
       const paths = await import(${JSON.stringify(PATHS_DIST)});
+      const binary = await import(${JSON.stringify(BINARY_DIST)});
+      if (typeof binary.probeAgentInstall !== 'function') throw new Error('binary.probeAgentInstall missing');
       const { pathToFileURL } = await import('node:url');
       const dir = ${JSON.stringify(resolve(ROOT, '.cache/agent #配置'))};
       if (paths.expandAgentDir(pathToFileURL(dir).href) !== dir) throw new Error('File URL expansion differs');

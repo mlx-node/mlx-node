@@ -1,6 +1,7 @@
 import type { DecisionModel } from '@mlx-node/lm';
 
 import type { ModelAdmissionLane } from './model-work-coordinator.js';
+import { noteQueueRejection } from './queue-rejections.js';
 import type { PreDispatchAdmission } from './session-registry.js';
 
 export class DecisionQueueFullError extends Error {}
@@ -26,8 +27,10 @@ export class DecisionRegistry {
   >();
   constructor(private readonly maxQueueDepth?: number) {}
   private reserve(binding: Binding): PreDispatchAdmission {
-    if (this.maxQueueDepth !== undefined && binding.pending >= this.maxQueueDepth + 1)
+    if (this.maxQueueDepth !== undefined && binding.pending >= this.maxQueueDepth + 1) {
+      noteQueueRejection('decision');
       throw new DecisionQueueFullError('CLEF request queue is full');
+    }
     binding.pending++;
     const state = { binding, released: false, consumed: false };
     const permit = {

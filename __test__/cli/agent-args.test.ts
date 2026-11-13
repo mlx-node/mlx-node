@@ -126,13 +126,13 @@ describe('scanAgentArgs', () => {
   describe('--no-persist-cache extraction', () => {
     it('lifts the mlx-owned flag out of passthrough', () => {
       const scan = scanAgentArgs(['--no-persist-cache', '-p', 'hi']);
-      expect(scan.persistPagedCache).toBe(false);
+      expect(scan.persistPagedCache).toEqual({ flag: false, byDefault: true, wholePrompt: true });
       expect(scan.passthrough).toEqual(['-p', 'hi']);
     });
 
     it('does not hijack the flag when it sits in a value-consumer slot', () => {
       const scan = scanAgentArgs(['--system-prompt-override', '--no-persist-cache']);
-      expect(scan.persistPagedCache).toBe(true);
+      expect(scan.persistPagedCache).toEqual({ byDefault: true, wholePrompt: true });
       expect(scan.passthrough).toEqual(['--system-prompt-override', '--no-persist-cache']);
     });
   });

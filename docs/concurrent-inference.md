@@ -70,6 +70,16 @@ rebuilds only that sequence's slot; it never resets a peer. Batched admission
 uses fresh JS sessions while retaining the native refcounted prefix cache, so
 correctness is independent of the warm single-slot registry.
 
+## Telemetry and the stats barrier
+
+`schedulerStats()` is a scheduler barrier: while it is queued, the model thread admits no new turn until the running
+batch drains. The runtime sampler (`packages/server/src/host/runtime-sampler.ts`) therefore never calls it on a busy
+model. It asks only when `shouldSnapshotScheduler` holds (no active dispatch, no queue, no live turn, idle for at least
+500 ms) and goes through `SessionRegistry.tryIdleProbe`, which refuses while a lane holds work and makes a dispatch that
+arrives during the probe wait until the reply settles. Scheduler counters are cumulative, so two idle snapshots give the
+exact totals of the burst between them. Live concurrency (turns in flight, queued) comes from TS-side state, not from
+the scheduler. See [perf.md](perf.md#what-telemetry-costs).
+
 ## Scheduler knobs
 
 The stable capacity knobs are read once per process. The ragged executor switch
@@ -84,7 +94,7 @@ same-binary uniform/ragged validation with separate model instances:
 | `MLX_SCHED_RAGGED_STEP`         | `0`     | Use one packed varlen Qwen3 forward for mixed prefill/decode slices.                                                                                                                                                                                                                                                                                  |
 | `MLX_LFM2_FUSED_BATCH_DECODE`   | `0`     | Opt LFM2 multi-row decode back into one fused `[N,1]` forward (default is a row-exact wave: per-row N=1 forwards, bit-identical to serial).                                                                                                                                                                                                           |
 | `MLX_PAGED_PER_SEQ_CTX`         | `unset` | Optional per-sequence **admit** cap and Qwen3/LFM2 pool-budget clip. Unset → admit `min(trained, live pool minus recurrent KV-equivalent)`. When set, Muse/Nemotron `contextLimits()` also publish that cap. Default 32768 applies only to the Qwen3/LFM2 **pool request** formula. Qwen3.5 dense/MoE ignore it: their windows are the memory plan's. |
-| `MLX_CONTINUOUS_BATCHING`       | `0`     | Opt default-off compatible checkpoints into the shared scheduled lane (currently Qwen3.5 dense and MoE).                                                                                                                                                                                                                                              |
+| `MLX_CONTINUOUS_BATCHING`       | `0`     | Opt default-off compatible checkpoints into the shared scheduled lane (currently Qwen3.5 dense and MoE). The desktop app sets `1` for its engine (`DESKTOP_ENGINE_POLICY`); a value in the user's shell wins.                                                                                                                                         |
 | `MLX_SERVE_FORCE_SERIAL`        | `0`     | Route eligible Qwen3/LFM2/Qwen3.5/Gemma4/Muse-Glimmer/NemotronH turns through the whole-turn path for A/B and rollback.                                                                                                                                                                                                                               |
 
 `MLX_SERVE_FORCE_SERIAL` is a process-start test/rollback switch, not a

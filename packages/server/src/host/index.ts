@@ -27,7 +27,8 @@
  * The returned host owns, and disposes on {@link InferenceHost.close}:
  *   1. the HTTP server,
  *   2. the verbose request logger (when `logDir` is set),
- *   3. the `PagedConfigOverrideManager`'s temp root.
+ *   3. the `PagedConfigOverrideManager`'s temp root,
+ *   4. the runtime sampler (series + `live-<pid>.json` heartbeat).
  *
  * The server goes first because the logger records a request from that
  * request's own `finish`/`close` handler. Ending the log streams while a
@@ -41,6 +42,7 @@
 import type { Server } from 'node:http';
 
 import {
+  coldCacheDrain as coldCacheDrainNative,
   estimateQwen35ContextWindow,
   estimateQwen4ExpContextWindow,
   releaseNativeGgufLease,
@@ -64,6 +66,7 @@ import type { AudioModel } from '../audio-registry.js';
 import type { AudioServiceOptions } from '../audio-service.js';
 import type { ServerHealth } from '../health.js';
 import { resolveRerankLimits, type RerankServiceOptions } from '../rerank-service.js';
+import type { HostKind, RuntimeCapability } from '../runtime-trace.js';
 import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance } from '../server.js';
 import type { TurnJournalOptions } from '../turn-journal.js';
 import { discoverAudioModels, loadAudioModel, audioCapabilities, type DiscoveredAudioModel } from './audio-models.js';
@@ -72,9 +75,19 @@ import { discoverModels, type DiscoveredModel } from './discover.js';
 import { applyEnginePolicy, type EnginePolicy } from './env-policy.js';
 import { DEFAULT_IDLE_RELEASE_SECONDS } from './idle-release.js';
 import { attachLogger as defaultAttachLogger, type Logger } from './logger.js';
+import { createModelReleaser, type Collector } from './model-release.js';
 import { hostUrl, isLoopbackBindHost, normalizeLoopbackBindHost, pickFreePort } from './net.js';
 import { resolveModelsDir } from './paths.js';
+import {
+  COLD_CACHE_DRAIN_TIMEOUT_MS,
+  PERSIST_PAGED_CACHE_ENV,
+  resolveColdCapture,
+  resolvePersistPagedCache,
+  type ColdCaptureBudget,
+  type PersistPagedCache,
+} from './persist-cache.js';
 import { loadRerankModel, rerankCapability } from './rerank-models.js';
+import { startRuntimeSampler, type RuntimeSampler } from './runtime-sampler.js';
 import { makeSwapController } from './swap.js';
 import { hostTempDirPrefix, sweepOrphanHostTempRoots } from './temp-root.js';
 
@@ -128,6 +141,8 @@ export class InferenceHostClosedError extends Error {
 }
 
 export interface InferenceHostOptions {
+  /** Who runs this host; stamped on the runtime series. Default `'embedded'`. */
+  hostKind?: HostKind;
   modelResidency?: 'capability' | 'single';
   audio?: AudioServiceOptions;
   rerank?: RerankServiceOptions;
@@ -202,6 +217,14 @@ export interface InferenceHostOptions {
   /** See `ServerConfig.turnJournal`. */
   turnJournal?: TurnJournalOptions;
   /**
+   * The paged KV disk cache (cold tier) for the families on the native
+   * restore allowlist. Written to `MLX_PERSIST_PAGED_CACHE` before any load,
+   * since a GGUF load reads no config this host can write. Omitted ⇒ the env
+   * decides, off when unset. `wholePrompt` writes the capture limits
+   * (`MLX_COLD_CAPTURE_*`) the env does not set, only when the cache is on.
+   */
+  persistPagedCache?: PersistPagedCache;
+  /**
    * Seconds without a request before the residency is unwired and the chat
    * weights are freed (`--idle-release`); the next request loads them again.
    * Omitted ⇒ {@link DEFAULT_IDLE_RELEASE_SECONDS} (10 minutes); `Infinity`
@@ -243,6 +266,10 @@ export interface InferenceHostOptions {
   attachLogger?: (server: Server, logDir: string) => Logger;
   /** Test seam: replaces the native residency keep-alive setter. */
   setResidencyKeepAlive?: (seconds: number) => void;
+  /** Test seam: replaces the V8 collector that releases a dropped chat model; `null` = none. */
+  collectGarbage?: Collector | null;
+  /** Test seam: replaces the native disk cache write drain `close()` runs. */
+  coldCacheDrain?: (timeoutMs: number) => boolean;
 }
 
 export interface InferenceHost {
@@ -262,6 +289,10 @@ export interface InferenceHost {
   boundModel: string;
   /** Verbose log directory, or `null` when logging is off. */
   logDir: string | null;
+  /** Whether model loads see the disk cache switched on. */
+  persistPagedCache: boolean;
+  /** The per-turn capture limits model loads read; `null` when the disk cache is off. */
+  coldCapture: ColdCaptureBudget | null;
   /** Escape hatch for callers that need the registry, store, or raw `http.Server`. */
   server: ServerInstance;
   /** Current readiness snapshot — the same body `GET /health` returns. */
@@ -333,6 +364,11 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   // these via `OnceLock` on first read, so a policy applied after a load has
   // silently done nothing.
   if (opts.enginePolicy !== undefined) applyEnginePolicy(opts.enginePolicy);
+  const persistOption = opts.persistPagedCache ?? { byDefault: false, wholePrompt: false };
+  const persistPagedCache = resolvePersistPagedCache(persistOption);
+  if (opts.persistPagedCache !== undefined) process.env[PERSIST_PAGED_CACHE_ENV] = persistPagedCache ? '1' : '0';
+  const coldCapture = resolveColdCapture(persistOption, persistPagedCache);
+  Object.assign(process.env, coldCapture.writes);
   // Splash keeps one value for both: the residency lapses and the weights go
   // after the same time without a request.
   (opts.setResidencyKeepAlive ?? setResidencyKeepAliveNative)(idleReleaseSeconds);
@@ -382,6 +418,12 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   // late-bound holder: the callbacks capture `ctrlRef.current` by closure.
   const ctrlRef: { current: ReturnType<typeof makeSwapController> | null } = { current: null };
   const chatRef: { current: ReturnType<typeof makeSwapController> | null } = { current: null };
+  // Started once the port is known; loads before that are not timed.
+  const samplerRef: { current: RuntimeSampler | null } = { current: null };
+  const timedLoad = <T>(
+    info: { model: string; modelType: string; capability: RuntimeCapability },
+    load: () => Promise<T>,
+  ): Promise<T> => (samplerRef.current === null ? load() : samplerRef.current.timedLoad(info, load));
   let acceptingHttpModelLoads = true;
   const activeHttpModelLoads = new Set<Promise<void>>();
 
@@ -405,6 +447,11 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     listModels: () => ctrlRef.current!.listModels(),
     idleReleaseMs: idleReleaseSeconds * 1000,
     releaseWeights: () => chatRef.current!.releaseAll!(),
+    unloadModels: async (): Promise<string[]> => {
+      const names = models.filter((m) => server.registry.getAny(m.name) !== undefined).map((m) => m.name);
+      await chatRef.current!.releaseAll!();
+      return names;
+    },
     ...(opts.authToken !== undefined ? { authToken: opts.authToken } : {}),
     ...(opts.storePath !== undefined ? { storePath: opts.storePath } : {}),
     ...(opts.disableStore !== undefined ? { disableStore: opts.disableStore } : {}),
@@ -413,6 +460,9 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     ...(opts.turnJournal !== undefined ? { turnJournal: opts.turnJournal } : {}),
   };
   const server = await createServer(serverConfig);
+  const collectGarbage = opts.collectGarbage;
+  const releaser = createModelReleaser(collectGarbage === undefined ? {} : { resolve: () => collectGarbage });
+  server.registry.setBindingReleaseListener(() => releaser.released());
 
   // Wrap the loader so `pagedModelTypes` families get `use_block_paged_cache:
   // true` injected via a temp-dir clone with a patched config.json. The temp
@@ -450,9 +500,9 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
         : {}),
     };
     try {
-      return Object.keys(options).length === 0
-        ? await loadModelFn(resolvedPath)
-        : await loadModelFn(resolvedPath, options);
+      return await timedLoad({ model: entry.name, modelType: String(entry.modelType), capability: 'chat' }, () =>
+        Object.keys(options).length === 0 ? loadModelFn(resolvedPath) : loadModelFn(resolvedPath, options),
+      );
     } catch (error) {
       if (leasedDir !== undefined) releaseNativeGgufLease(leasedDir);
       throw error;
@@ -473,14 +523,20 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     estimates.get(name),
   );
   chatRef.current = chatController;
+  const audioLoader = opts.loadAudioModel ?? loadAudioModel;
+  const rerankLoader =
+    opts.loadRerankModel ??
+    ((entry: DiscoveredReranker) => loadRerankModel(entry, familyLoadOptions(opts.reranker, entry.modelType)));
   const controller = withCapabilityModels(
     [
       chatCapability(chatController, server.registry),
-      ...audioCapabilities(audioModels, server.registry, opts.loadAudioModel ?? loadAudioModel),
-      rerankCapability(
-        rerankModels,
-        server.registry,
-        opts.loadRerankModel ?? ((entry) => loadRerankModel(entry, familyLoadOptions(opts.reranker, entry.modelType))),
+      ...audioCapabilities(audioModels, server.registry, (entry) =>
+        timedLoad({ model: entry.name, modelType: entry.modelType, capability: 'audio' }, () => audioLoader(entry)),
+      ),
+      rerankCapability(rerankModels, server.registry, (entry) =>
+        timedLoad({ model: entry.name, modelType: String(entry.modelType), capability: 'rerank' }, () =>
+          rerankLoader(entry),
+        ),
       ),
     ],
     opts.modelResidency ?? 'capability',
@@ -541,6 +597,14 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   const activeHostLoads = new Set<Promise<void>>();
   let closePromise: Promise<void> | null = null;
 
+  const sampler = startRuntimeSampler({
+    registry: server.registry,
+    health: () => server.health(),
+    models: models.map((m) => ({ name: m.name, modelType: String(m.modelType), contextWindow: m.contextWindow })),
+    host: { kind: opts.hostKind ?? 'embedded', port: boundPort, persistPagedCache, coldCapture: coldCapture.budget },
+  });
+  samplerRef.current = sampler;
+
   return {
     url: hostUrl(host, boundPort),
     port: boundPort,
@@ -551,6 +615,8 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     rerankModels,
     boundModel: boundEntry.name,
     logDir: logger?.logDir ?? null,
+    persistPagedCache,
+    coldCapture: coldCapture.budget,
     server,
     health: () => server.health(),
 
@@ -628,6 +694,18 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
           } catch (error) {
             disposalError ??= error;
           }
+        }
+        // Once no turn can still enqueue: the process exits right after
+        // `close()`, and a write left in the queue is lost.
+        try {
+          (opts.coldCacheDrain ?? coldCacheDrainNative)(COLD_CACHE_DRAIN_TIMEOUT_MS);
+        } catch {
+          /* the next restore recomputes what did not land */
+        }
+        try {
+          await sampler.stop();
+        } catch {
+          /* telemetry is best effort; never block shutdown */
         }
         // Only once nothing is still serving. The logger writes a request's
         // record from that request's `finish` handler, so ending the streams
@@ -726,7 +804,24 @@ export { DEFAULT_IDLE_RELEASE_SECONDS, IDLE_RELEASE_ERROR, idleReleaseText, pars
 export { MAX_CONTEXT_ERROR, MAX_YARN_CONTEXT_TOKENS, parseMaxContext } from './max-context.js';
 export { MAX_MEMORY_ERROR, parseMaxMemory } from './max-memory.js';
 export {
+  COLD_CACHE_DRAIN_TIMEOUT_MS,
+  COLD_CAPTURE_BLOCKS_ENV,
+  COLD_CAPTURE_BUDGET_MS_ENV,
+  PERSIST_PAGED_CACHE_ENV,
+  PERSIST_WHOLE_PROMPT_FLAG,
+  WHOLE_PROMPT_CAPTURE_BLOCKS,
+  WHOLE_PROMPT_CAPTURE_BUDGET_MS,
+  parseCaptureEnv,
+  parsePersistEnv,
+  persistPagedCacheFlag,
+  resolveColdCapture,
+  resolvePersistPagedCache,
+  type ColdCaptureBudget,
+  type PersistPagedCache,
+} from './persist-cache.js';
+export {
   applyEnginePolicy,
+  DESKTOP_ENGINE_POLICY,
   engineEnvFor,
   ENGINE_POLICY_ENV_VARS,
   LAUNCHER_ENGINE_POLICY,
