@@ -15,8 +15,17 @@ import {
 } from './family-data.js';
 import { isBonsaiPq2GgufName, isGgufCompanionName, isQwen35XlGgufName, parseGgufFileName } from './gguf-name.js';
 import { detectModelType, readGgufArchitecture, readModelConfig } from './model-detection.js';
+import {
+  folderVariant,
+  ggufNames,
+  ggufVariant,
+  settleVariants,
+  type ModelFormat,
+  type ModelVariantName,
+} from './model-variant.js';
 
-export { isGgufCompanionName, parseGgufFileName, type GgufFileName } from './gguf-name.js';
+export { ggufSplitPartNames, isGgufCompanionName, parseGgufFileName, type GgufFileName } from './gguf-name.js';
+export type { ModelFormat } from './model-variant.js';
 
 /** Native-free inventory shared by the agent, setup UI, and inference host. */
 export interface LocalChatModel {
@@ -27,21 +36,24 @@ export interface LocalChatModel {
   traits: FamilyTraits;
   contextWindow: number;
   supportsImages: boolean;
+  /** The model without its packaging: `Qwen3.8-Flash-Next`. Equal strings mean one model. */
+  base: string;
+  /** The build of that model: `UD-Q4_K_XL`, `MXFP4 Unsloth`, `BF16`. Unique inside one base. Never empty. */
+  variant: string;
+  format: ModelFormat;
 }
 
 interface DiscoveryMetadata {
   contextWindow: number;
   supportsImages: boolean;
   draftOnly: boolean;
+  /** The parsed `config.json`; undefined when it could not be read. */
+  config: unknown;
 }
 
 // Match the native loaders' primary files/shards. A draft or projector
 // SafeTensors file beside a GGUF is not a converted target checkpoint.
 const PRIMARY_SAFETENSORS = /^(?:model|weights)\.safetensors$|^model(?:-|\.safetensors-).+-of-.+\.safetensors$/;
-
-function ggufModelName(name: string): string {
-  return name.slice(0, -'.gguf'.length);
-}
 
 /**
  * The parts of a split GGUF name `STEM-0000K-of-0000N.gguf` (any `.gguf`
@@ -179,9 +191,10 @@ async function readDiscoveryMetadata(
       contextWindow: root ?? nested ?? fallbackContextWindow,
       supportsImages,
       draftOnly,
+      config,
     };
   } catch {
-    return { contextWindow: fallbackContextWindow, supportsImages: false, draftOnly: false };
+    return { contextWindow: fallbackContextWindow, supportsImages: false, draftOnly: false, config: undefined };
   }
 }
 
@@ -258,8 +271,16 @@ export async function discoverLocalChatModels(
   // IDs to keep persisted `mlx/<id>` selections stable across filesystems.
   entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
-  const out: LocalChatModel[] = [];
-  const usedNames = new Set<string>();
+  /** A listed model before its id: ids are given after the scan, in scan order. */
+  interface Found {
+    model: Omit<LocalChatModel, 'name' | 'base' | 'variant'>;
+    preferredName: string;
+    scopeName: string;
+    /** A split set's file name without `.gguf`: its id when every GGUF was named by its file. */
+    splitFileId: string | undefined;
+    naming: (id: string) => ModelVariantName;
+  }
+  const found: Found[] = [];
 
   const append = async (
     preferredName: string,
@@ -267,6 +288,9 @@ export async function discoverLocalChatModels(
     metadataRoot: string,
     modelType: ModelType,
     scopeName: string,
+    format: ModelFormat,
+    splitFileId: string | undefined,
+    naming: (config: unknown, id: string) => ModelVariantName,
   ): Promise<void> => {
     const decision = modelType === 'clef' && opts?.includeDecisions === true;
     if (NON_GENERATIVE_FAMILY_IDS.has(modelType) && !decision) return;
@@ -291,28 +315,34 @@ export async function discoverLocalChatModels(
       return;
     }
 
-    let name = preferredName;
-    if (usedNames.has(name)) {
-      name = `${scopeName}-${preferredName}`;
-      let suffix = 2;
-      while (usedNames.has(name)) name = `${scopeName}-${preferredName}-${suffix++}`;
-    }
-    usedNames.add(name);
     // Automatic companions can be installed or removed after this startup
     // scan. The host resolves them on each load; draftModelPath is reserved
     // for caller-supplied paths that the loader must treat as authoritative.
-    out.push({
-      name,
-      path,
-      modelType,
-      preset,
-      traits,
-      contextWindow: decision ? Math.min(16384, metadata.contextWindow) : metadata.contextWindow,
-      supportsImages: decision ? false : metadata.supportsImages,
+    found.push({
+      model: {
+        path,
+        modelType,
+        preset,
+        traits,
+        contextWindow: decision ? Math.min(16384, metadata.contextWindow) : metadata.contextWindow,
+        supportsImages: decision ? false : metadata.supportsImages,
+        format,
+      },
+      preferredName,
+      scopeName,
+      splitFileId,
+      naming: (id) => naming(metadata.config, id),
     });
   };
 
-  const appendGguf = async (name: string, metadataRoot: string, scopeName: string): Promise<void> => {
+  /** `repoFolder` is undefined for a loose file in the models root; `variantFolder` for a file in the repo folder. */
+  const appendGguf = async (
+    name: string,
+    metadataRoot: string,
+    scopeName: string,
+    repoFolder: string | undefined,
+    variantFolder: string | undefined,
+  ): Promise<void> => {
     const path = join(metadataRoot, name);
     try {
       // `resolveDirentKind` admits a symlinked `.gguf`, but native preflight
@@ -338,7 +368,11 @@ export async function discoverLocalChatModels(
           console.warn(`[mlx] skip ${path}: native ${modelType} GGUF requires sibling config.json and tokenizer.json`);
         return;
       }
-      await append(ggufModelName(name), path, assetsRoot, modelType, scopeName);
+      const names = ggufNames(name, repoFolder, variantFolder);
+      const splitFileId = names.split ? name.slice(0, -'.gguf'.length) : undefined;
+      await append(names.id, path, assetsRoot, modelType, scopeName, 'gguf', splitFileId, (_config, id) =>
+        ggufVariant(names.stem, repoFolder, variantFolder, id),
+      );
     } catch (err) {
       reportFailure(err, path);
       if (debug) console.warn(`[mlx] skip ${path}: ${(err as Error).message}`);
@@ -362,7 +396,7 @@ export async function discoverLocalChatModels(
         if (inventory.hasPrimarySafetensors) continue;
         for (const name of inventory.targetGgufs) {
           claimed = true;
-          await appendGguf(name, variantDir, scopeName);
+          await appendGguf(name, variantDir, scopeName, scopeName, child.name);
         }
       } catch (err) {
         reportFailure(err, variantDir);
@@ -377,7 +411,7 @@ export async function discoverLocalChatModels(
     // symlinked `.gguf` or model directory classifies by what it points at.
     const kind = await resolveDirentKind(modelsDir, entry);
     if (kind === 'file' && entry.name.toLowerCase().endsWith('.gguf') && !isGgufCompanionName(entry.name)) {
-      await appendGguf(entry.name, modelsDir, basename(modelsDir));
+      await appendGguf(entry.name, modelsDir, basename(modelsDir), undefined, undefined);
       continue;
     }
     // Native Qwen4 GGUF loads publish tokenizer/config sidecars here, including
@@ -391,7 +425,7 @@ export async function discoverLocalChatModels(
       // also handles Qwen4 split directories with no config/tokenizer sidecars.
       if (!inventory.hasPrimarySafetensors) {
         if (inventory.targetGgufs.length > 0) {
-          for (const name of inventory.targetGgufs) await appendGguf(name, full, entry.name);
+          for (const name of inventory.targetGgufs) await appendGguf(name, full, entry.name, entry.name, undefined);
           continue;
         }
         // `mlx download` keeps repo paths, so a variant folder such as
@@ -403,13 +437,37 @@ export async function discoverLocalChatModels(
         if (inventory.hasGguf) continue;
       }
       const modelType = await detectModelType(full);
-      await append(entry.name, full, full, modelType, entry.name);
+      await append(entry.name, full, full, modelType, entry.name, 'mlx', undefined, (config) =>
+        folderVariant(entry.name, config),
+      );
     } catch (err) {
       reportFailure(err, full);
       if (debug) console.warn(`[mlx] skip ${full}: ${(err as Error).message}`);
     }
   }
 
+  // A saved id (a conversation, `mlx serve --model`, the agent's default) must keep opening the same model: every
+  // model that is not a split set keeps the id it had when every GGUF was named by its file (split sets too, in scan
+  // order), and only then does a split set take its shorter id, where it is free.
+  const take = (used: Set<string>, preferredName: string, scopeName: string): string => {
+    let name = preferredName;
+    if (used.has(name)) {
+      name = `${scopeName}-${preferredName}`;
+      let suffix = 2;
+      while (used.has(name)) name = `${scopeName}-${preferredName}-${suffix++}`;
+    }
+    used.add(name);
+    return name;
+  };
+  const fileIds = new Set<string>();
+  const ids = found.map((f) => take(fileIds, f.splitFileId ?? f.preferredName, f.scopeName));
+  const usedNames = new Set(ids.filter((_id, index) => found[index]!.splitFileId === undefined));
+  const out: LocalChatModel[] = found.map(({ model, preferredName, scopeName, splitFileId, naming }, index) => {
+    const name = splitFileId === undefined ? ids[index]! : take(usedNames, preferredName, scopeName);
+    const { format, ...rest } = model;
+    return { name, ...rest, ...naming(name), format };
+  });
+  settleVariants(out);
   out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return out;
 }

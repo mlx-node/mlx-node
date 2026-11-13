@@ -6,12 +6,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { LoadableModel, LoadModelOptions } from '@mlx-node/lm';
-import { afterEach, describe, expect, it } from 'vite-plus/test';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { discoverMlxModels } from '../../../packages/agent/src/models.js';
 import { handleCodingAgentModels } from '../../../packages/dashboard/src/api/handlers/models.js';
+import { sidecarHostOptions } from '../../../packages/desktop/src/inference/sidecar.js';
 import { isServingStatus } from '../../../packages/desktop/src/main/supervisor/state.js';
 import {
+  COLD_CACHE_DRAIN_TIMEOUT_MS,
   createInferenceHost,
   InferenceHostClosedError,
   InsecureBindError,
@@ -37,6 +39,12 @@ import {
  */
 
 const CHUNK_ENV = 'MLX_PAGED_PREFILL_CHUNK_SIZE';
+const PERSIST_ENV = 'MLX_PERSIST_PAGED_CACHE';
+const originalPersistEnv = process.env[PERSIST_ENV];
+const BLOCKS_ENV = 'MLX_COLD_CAPTURE_BLOCKS_PER_TURN';
+const BUDGET_ENV = 'MLX_COLD_CAPTURE_BUDGET_MS';
+const originalBlocksEnv = process.env[BLOCKS_ENV];
+const originalBudgetEnv = process.env[BUDGET_ENV];
 
 let hosts: InferenceHost[] = [];
 let scratchDirs: string[] = [];
@@ -54,6 +62,12 @@ afterEach(async () => {
 
   if (originalChunkEnv === undefined) delete process.env[CHUNK_ENV];
   else process.env[CHUNK_ENV] = originalChunkEnv;
+  if (originalPersistEnv === undefined) delete process.env[PERSIST_ENV];
+  else process.env[PERSIST_ENV] = originalPersistEnv;
+  if (originalBlocksEnv === undefined) delete process.env[BLOCKS_ENV];
+  else process.env[BLOCKS_ENV] = originalBlocksEnv;
+  if (originalBudgetEnv === undefined) delete process.env[BUDGET_ENV];
+  else process.env[BUDGET_ENV] = originalBudgetEnv;
   if (originalAnthropicModel === undefined) delete process.env.ANTHROPIC_MODEL;
   else process.env.ANTHROPIC_MODEL = originalAnthropicModel;
 });
@@ -175,7 +189,7 @@ describe('createInferenceHost — discovery and model binding', () => {
     }
     const agentModels = await discoverMlxModels(modelsDir);
     expect(agentModels.map(({ discovered }) => discovered.name)).toEqual(names);
-    expect(await handleCodingAgentModels({ modelsDir, tracesDir: '', cacheRoot: '' })).toEqual({
+    expect(await handleCodingAgentModels({ modelsDir, tracesDir: '', runtimeDir: '', cacheRoot: '' })).toEqual({
       models: names.map((name) => ({ name })),
     });
 
@@ -494,6 +508,93 @@ describe('createInferenceHost — lazy load on the first request', () => {
 
     expect(res.status).not.toBe(404);
     expect(loads).toHaveLength(1);
+  });
+});
+
+describe('createInferenceHost — a dropped chat model is released', () => {
+  const TOKEN = 'per-launch-secret';
+
+  async function select(host: InferenceHost, model: string): Promise<void> {
+    const res = await fetch(`${host.url}/v1/messages/count_tokens`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': TOKEN },
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: '.' }] }),
+    });
+    await res.text();
+  }
+
+  it('collects once per swap and per unload, never for a request with no drop; the next request loads again', async () => {
+    const loads: string[] = [];
+    let collections = 0;
+    const host = await start({
+      modelsDir: await makeModelsDir(['alpha', 'beta']),
+      authToken: TOKEN,
+      loadModel: async (path: string) => {
+        loads.push(path);
+        return fakeModel();
+      },
+      collectGarbage: () => {
+        collections += 1;
+      },
+    });
+
+    await select(host, 'beta');
+    await select(host, 'mlx-local');
+    await select(host, 'beta');
+    expect(host.health().models.resident).toEqual(['beta', 'mlx-local']);
+    await select(host, 'alpha');
+    await vi.waitFor(() => expect(collections).toBe(1));
+    expect(host.health().models.resident).toEqual(['mlx-local', 'alpha']);
+    await select(host, 'alpha');
+    await select(host, 'mlx-local');
+
+    expect((await fetch(`${host.url}/v1/models/unload`, { method: 'POST' })).status).toBe(401);
+    expect(
+      (await fetch(`${host.url}/v1/models/unload`, { method: 'GET', headers: { 'x-api-key': TOKEN } })).status,
+    ).toBe(405);
+    const res = await fetch(`${host.url}/v1/models/unload`, { method: 'POST', headers: { 'x-api-key': TOKEN } });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ unloaded: ['alpha'] });
+    expect(host.health().models.resident).toEqual([]);
+    await vi.waitFor(() => expect(collections).toBe(2));
+
+    await select(host, 'mlx-local');
+    expect(loads).toHaveLength(3);
+    expect(host.health().models.resident).toEqual(['alpha', 'mlx-local']);
+  });
+
+  // Mutation: `unloadModels` calls `disposeAll` → red (dispose never runs).
+  it('the unload answers after the model is disposed', async () => {
+    const loads: string[] = [];
+    const disposed: string[] = [];
+    const host = await start({
+      modelsDir: await makeModelsDir(['alpha']),
+      authToken: TOKEN,
+      loadModel: async (path: string) => {
+        loads.push(path);
+        return { dispose: async () => void disposed.push(path) } as unknown as LoadableModel;
+      },
+      collectGarbage: () => undefined,
+    });
+    await select(host, 'alpha');
+    expect(loads).toHaveLength(1);
+    const res = await fetch(`${host.url}/v1/models/unload`, { method: 'POST', headers: { 'x-api-key': TOKEN } });
+    expect(await res.json()).toEqual({ unloaded: ['alpha'] });
+    expect(disposed).toEqual(loads);
+    expect(host.health().models.resident).toEqual([]);
+  });
+
+  it('a host with no collector still unloads', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const host = await start({ modelsDir: await makeModelsDir(['alpha']), authToken: TOKEN, collectGarbage: null });
+      await select(host, 'alpha');
+      const res = await fetch(`${host.url}/v1/models/unload`, { method: 'POST', headers: { 'x-api-key': TOKEN } });
+      expect(await res.json()).toEqual({ unloaded: ['alpha'] });
+      await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(1));
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
@@ -1026,6 +1127,162 @@ describe('createInferenceHost — engine policy', () => {
   });
 });
 
+describe('createInferenceHost — paged KV disk cache', () => {
+  /** Load `alpha` through the real host and return the disk-cache env the native load reads at that moment. */
+  async function persistEnvAtLoad(opts: InferenceHostOptions): Promise<{ env: string | undefined; host: boolean }> {
+    const modelsDir = await makeModelsDir(['alpha']);
+    const seen: (string | undefined)[] = [];
+    const host = await start({
+      modelsDir,
+      ...opts,
+      port: 0,
+      host: '127.0.0.1',
+      loadModel: async () => {
+        seen.push(process.env[PERSIST_ENV]);
+        return fakeModel();
+      },
+    });
+    await host.loadModel('alpha');
+    expect(seen).toHaveLength(1);
+    return { env: seen[0], host: host.persistPagedCache };
+  }
+
+  it('the desktop engine loads every model with the disk cache on', async () => {
+    delete process.env[PERSIST_ENV];
+    expect(await persistEnvAtLoad(sidecarHostOptions({}))).toEqual({ env: '1', host: true });
+  });
+
+  it('MLX_PERSIST_PAGED_CACHE turns a default-on engine off, and an explicit flag beats it', async () => {
+    process.env[PERSIST_ENV] = 'off';
+    expect(await persistEnvAtLoad(sidecarHostOptions({}))).toEqual({ env: '0', host: false });
+    process.env[PERSIST_ENV] = '0';
+    expect(await persistEnvAtLoad({ persistPagedCache: { flag: true, byDefault: false, wholePrompt: false } })).toEqual(
+      {
+        env: '1',
+        host: true,
+      },
+    );
+  });
+
+  it('close drains the disk cache writes after the last admitted load has finished', async () => {
+    const gate = deferred();
+    const events: string[] = [];
+    const host = await start({
+      modelsDir: await makeModelsDir(['alpha']),
+      loadModel: async () => {
+        await gate.promise;
+        events.push('load done');
+        return fakeModel();
+      },
+      coldCacheDrain: (timeoutMs) => {
+        events.push(`drain ${timeoutMs}`);
+        return true;
+      },
+    });
+    const load = host.loadModel('alpha');
+    const closing = host.close({ timeoutMs: 250 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(events).toEqual([]);
+    gate.resolve();
+    await load;
+    await closing;
+    expect(events).toEqual(['load done', `drain ${COLD_CACHE_DRAIN_TIMEOUT_MS}`]);
+  });
+
+  it('close still finishes when the disk cache drain throws', async () => {
+    let calls = 0;
+    const host = await start({
+      modelsDir: await makeModelsDir(['alpha']),
+      coldCacheDrain: () => {
+        calls += 1;
+        throw new Error('drain failed');
+      },
+    });
+    await expect(host.close({ timeoutMs: 250 })).resolves.toBeUndefined();
+    expect(calls).toBe(1);
+  });
+
+  /** Load `alpha` through the real host and return the capture limits the native load reads at that moment. */
+  async function captureEnvAtLoad(
+    opts: InferenceHostOptions,
+  ): Promise<{ blocks: string | undefined; ms: string | undefined; host: InferenceHost['coldCapture'] }> {
+    const modelsDir = await makeModelsDir(['alpha']);
+    const seen: { blocks: string | undefined; ms: string | undefined }[] = [];
+    const host = await start({
+      modelsDir,
+      ...opts,
+      port: 0,
+      host: '127.0.0.1',
+      loadModel: async () => {
+        seen.push({ blocks: process.env[BLOCKS_ENV], ms: process.env[BUDGET_ENV] });
+        return fakeModel();
+      },
+    });
+    await host.loadModel('alpha');
+    expect(seen).toHaveLength(1);
+    await host.close({ timeoutMs: 250 });
+    delete process.env[BLOCKS_ENV];
+    delete process.env[BUDGET_ENV];
+    return { ...seen[0]!, host: host.coldCapture };
+  }
+
+  it('the desktop engine loads every model with the whole-prompt capture limits', async () => {
+    delete process.env[PERSIST_ENV];
+    delete process.env[BLOCKS_ENV];
+    delete process.env[BUDGET_ENV];
+    expect(await captureEnvAtLoad(sidecarHostOptions({}))).toEqual({
+      blocks: '63125',
+      ms: '10000',
+      host: { blocksPerTurn: 63_125, budgetMs: 10_000 },
+    });
+  });
+
+  it('a capture limit the user set wins, one variable at a time, and a value native cannot parse does not', async () => {
+    delete process.env[PERSIST_ENV];
+    process.env[BLOCKS_ENV] = ' 4096 ';
+    expect(await captureEnvAtLoad(sidecarHostOptions({}))).toEqual({
+      blocks: ' 4096 ',
+      ms: '10000',
+      host: { blocksPerTurn: 4096, budgetMs: 10_000 },
+    });
+    process.env[BUDGET_ENV] = '0';
+    expect(await captureEnvAtLoad(sidecarHostOptions({}))).toEqual({
+      blocks: '63125',
+      ms: '0',
+      host: { blocksPerTurn: 63_125, budgetMs: 0 },
+    });
+    process.env[BLOCKS_ENV] = '1e4';
+    expect(await captureEnvAtLoad(sidecarHostOptions({}))).toEqual({
+      blocks: '63125',
+      ms: '10000',
+      host: { blocksPerTurn: 63_125, budgetMs: 10_000 },
+    });
+  });
+
+  it('writes no capture limit when the disk cache resolves off, or when the entry keeps the native defaults', async () => {
+    delete process.env[BLOCKS_ENV];
+    delete process.env[BUDGET_ENV];
+    process.env[PERSIST_ENV] = '0';
+    expect(await captureEnvAtLoad(sidecarHostOptions({}))).toEqual({ blocks: undefined, ms: undefined, host: null });
+    expect(await captureEnvAtLoad({ persistPagedCache: { flag: true, byDefault: false, wholePrompt: false } })).toEqual(
+      { blocks: undefined, ms: undefined, host: { blocksPerTurn: 128, budgetMs: 250 } },
+    );
+    process.env[PERSIST_ENV] = '1';
+    expect(await captureEnvAtLoad({})).toEqual({
+      blocks: undefined,
+      ms: undefined,
+      host: { blocksPerTurn: 128, budgetMs: 250 },
+    });
+  });
+
+  it('a host given no switch leaves the env alone and reports it', async () => {
+    delete process.env[PERSIST_ENV];
+    expect(await persistEnvAtLoad({})).toEqual({ env: undefined, host: false });
+    process.env[PERSIST_ENV] = 'true';
+    expect(await persistEnvAtLoad({})).toEqual({ env: 'true', host: true });
+  });
+});
+
 describe('createInferenceHost — paged-override temp roots', () => {
   // The host overlays only the families it is told to.
   const pagedModelTypes = ['qwen3_5'];
@@ -1320,5 +1577,69 @@ describe('createInferenceHost — paged-override temp roots', () => {
     await start({ modelsDir, sweepOrphanTempRoots: false });
 
     expect(existsSync(orphan)).toBe(true);
+  });
+});
+
+describe('createInferenceHost — runtime sampler', () => {
+  it('stops the sampler on close and removes the live file', async () => {
+    const savedHome = process.env.HOME;
+    const savedMetrics = process.env.MLX_AGENT_METRICS;
+    const home = await mkdtemp(join(tmpdir(), 'mlx-host-home-'));
+    scratchDirs.push(home);
+    process.env.HOME = home;
+    delete process.env.MLX_AGENT_METRICS;
+    try {
+      const host = await start({ modelsDir: await makeModelsDir(['alpha']), hostKind: 'serve' });
+      await host.loadModel('alpha');
+      const runtimeDir = join(home, '.mlx-node', 'metrics', 'runtime');
+      const liveFile = join(runtimeDir, `live-${process.pid}.json`);
+      for (let i = 0; i < 200 && !existsSync(liveFile); i++) await new Promise((r) => setTimeout(r, 10));
+      expect(existsSync(liveFile)).toBe(true);
+
+      await host.close({ timeoutMs: 250 });
+      expect(existsSync(liveFile)).toBe(false);
+      const series = (await readdir(runtimeDir)).filter((name) => name.endsWith('.jsonl'));
+      expect(series).toHaveLength(1);
+      const records = (await readFile(join(runtimeDir, series[0]!), 'utf8'))
+        .split('\n')
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as { k: string; host?: string; port?: number; model?: string; ok?: boolean });
+      expect(records[0]).toMatchObject({ k: 'proc', host: 'serve', port: host.port });
+      expect(records.find((r) => r.k === 'load')).toMatchObject({ model: 'alpha', ok: true });
+      expect(records.at(-1)!.k).toBe('exit');
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedMetrics === undefined) delete process.env.MLX_AGENT_METRICS;
+      else process.env.MLX_AGENT_METRICS = savedMetrics;
+    }
+  });
+
+  it('the live file reports the disk cache switch the host resolved', async () => {
+    const savedHome = process.env.HOME;
+    const savedMetrics = process.env.MLX_AGENT_METRICS;
+    const home = await mkdtemp(join(tmpdir(), 'mlx-host-home-'));
+    scratchDirs.push(home);
+    process.env.HOME = home;
+    delete process.env.MLX_AGENT_METRICS;
+    const liveFile = join(home, '.mlx-node', 'metrics', 'runtime', `live-${process.pid}.json`);
+    const liveSwitch = async (env: string | undefined): Promise<unknown> => {
+      if (env === undefined) delete process.env[PERSIST_ENV];
+      else process.env[PERSIST_ENV] = env;
+      const host = await start({ modelsDir: await makeModelsDir(['alpha']), ...sidecarHostOptions({}) });
+      for (let i = 0; i < 200 && !existsSync(liveFile); i++) await new Promise((r) => setTimeout(r, 10));
+      const live = JSON.parse(await readFile(liveFile, 'utf8')) as { persistPagedCache?: unknown };
+      await host.close({ timeoutMs: 250 });
+      return live.persistPagedCache;
+    };
+    try {
+      expect(await liveSwitch('0')).toBe(false);
+      expect(await liveSwitch(undefined)).toBe(true);
+    } finally {
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedMetrics === undefined) delete process.env.MLX_AGENT_METRICS;
+      else process.env.MLX_AGENT_METRICS = savedMetrics;
+    }
   });
 });

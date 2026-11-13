@@ -3,7 +3,7 @@ import { Readable, Writable } from 'node:stream';
 
 import type { ChatResult } from '@mlx-node/core';
 import type { SessionCapableModel } from '@mlx-node/lm';
-import { createHandler, ModelRegistry } from '@mlx-node/server';
+import { createHandler, ModelRegistry, ModelWorkCoordinator } from '@mlx-node/server';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 function createMockReq(method: string, url: string, body?: object): IncomingMessage {
@@ -334,5 +334,108 @@ describe('POST /v1/messages/count_tokens', () => {
     expect(parsed.error.message).toMatch(/running/i);
     expect(originalModel.applyChatTemplate).toHaveBeenCalledTimes(1);
     expect(swappedModel.applyChatTemplate).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /v1/messages/count_tokens beside a running answer', () => {
+  function holdAnswer(coordinator: ModelWorkCoordinator): () => Promise<void> {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const held = coordinator.withInference(() => gate);
+    return async () => {
+      release();
+      await held;
+    };
+  }
+
+  function countRequest(model: string): IncomingMessage {
+    return createMockReq('POST', '/v1/messages/count_tokens', {
+      model,
+      messages: [{ role: 'user', content: '.' }],
+    });
+  }
+
+  it('answers for a resident model while an answer holds a reader slot', async () => {
+    const registry = new ModelRegistry();
+    const model = createCountingModel(5);
+    registry.register('resident-model', model);
+    const coordinator = new ModelWorkCoordinator(registry.queueDepthLimit);
+    const resolveModel = vi.fn(async () => {});
+    const handler = createHandler(registry, { resolveModel, modelWorkCoordinator: coordinator });
+    const endAnswer = holdAnswer(coordinator);
+    const { res, getStatus, getBody, waitForEnd } = createMockRes();
+    let ended = false;
+    const countDone = (async () => {
+      await handler(countRequest('resident-model'), res);
+      await waitForEnd();
+      ended = true;
+    })();
+    try {
+      await vi.waitFor(() => expect(ended).toBe(true));
+      expect(coordinator.readerCount).toBe(1);
+      expect(getStatus()).toBe(200);
+      expect(JSON.parse(getBody())).toEqual({ input_tokens: 5 });
+      expect(resolveModel).not.toHaveBeenCalled();
+      expect(coordinator.lastLoad).toBeNull();
+    } finally {
+      await endAnswer();
+      await countDone;
+    }
+  });
+
+  it('takes the writer bracket for a name with no resident binding', async () => {
+    const registry = new ModelRegistry();
+    const coordinator = new ModelWorkCoordinator(registry.queueDepthLimit);
+    const resolveModel = vi.fn(async (name: string) => {
+      registry.register(name, createCountingModel(9));
+    });
+    const handler = createHandler(registry, { resolveModel, modelWorkCoordinator: coordinator });
+    const endAnswer = holdAnswer(coordinator);
+    const { res, getStatus, getBody, waitForEnd } = createMockRes();
+    const countDone = (async () => {
+      await handler(countRequest('cold-model'), res);
+      await waitForEnd();
+    })();
+
+    await vi.waitFor(() => expect(coordinator.waitingWriters).toBe(1));
+    expect(resolveModel).not.toHaveBeenCalled();
+    expect(res.headersSent).toBe(false);
+
+    await endAnswer();
+    await countDone;
+    expect(resolveModel).toHaveBeenCalledTimes(1);
+    expect(resolveModel).toHaveBeenCalledWith('cold-model');
+    expect(getStatus()).toBe(200);
+    expect(JSON.parse(getBody())).toEqual({ input_tokens: 9 });
+  });
+
+  it('still answers 400 when the binding changes while the count runs', async () => {
+    const registry = new ModelRegistry();
+    const originalModel = createCountingModel(3);
+    let resolveApply!: (tokens: Uint32Array) => void;
+    const applyGate = new Promise<Uint32Array>((resolve) => {
+      resolveApply = resolve;
+    });
+    originalModel.applyChatTemplate = vi.fn(() => applyGate);
+    registry.register('swap-model', originalModel);
+    const coordinator = new ModelWorkCoordinator(registry.queueDepthLimit);
+    const handler = createHandler(registry, { resolveModel: vi.fn(async () => {}), modelWorkCoordinator: coordinator });
+    const endAnswer = holdAnswer(coordinator);
+    const { res, getStatus, getBody, waitForEnd } = createMockRes();
+    const countDone = (async () => {
+      await handler(countRequest('swap-model'), res);
+      await waitForEnd();
+    })();
+
+    await vi.waitFor(() => expect(originalModel.applyChatTemplate).toHaveBeenCalledTimes(1));
+    registry.register('swap-model', createCountingModel(4));
+    resolveApply(new Uint32Array(3));
+    await countDone;
+    await endAnswer();
+
+    expect(getStatus()).toBe(400);
+    expect(JSON.parse(getBody()).error.message).toContain('binding changed');
   });
 });

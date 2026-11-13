@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import {
   applyEnginePolicy,
+  DESKTOP_ENGINE_POLICY,
   engineEnvFor,
   ENGINE_POLICY_ENV_VARS,
   LAUNCHER_ENGINE_POLICY,
@@ -21,6 +22,7 @@ import {
  */
 
 const CHUNK = 'MLX_PAGED_PREFILL_CHUNK_SIZE';
+const BATCHING = 'MLX_CONTINUOUS_BATCHING';
 
 const original = process.env[CHUNK];
 afterEach(() => {
@@ -31,6 +33,24 @@ afterEach(() => {
 describe('engineEnvFor', () => {
   it('renders the launcher policy as the child env map', () => {
     expect(engineEnvFor(LAUNCHER_ENGINE_POLICY)).toEqual({ [CHUNK]: '2048' });
+  });
+
+  it('keeps continuous batching out of the launcher policy', () => {
+    expect(engineEnvFor(LAUNCHER_ENGINE_POLICY)[BATCHING]).toBeUndefined();
+  });
+
+  it('turns continuous batching on in the desktop policy, on top of the launcher policy', () => {
+    expect(engineEnvFor(DESKTOP_ENGINE_POLICY)).toEqual({ [CHUNK]: '2048', [BATCHING]: '1' });
+  });
+
+  it('renders an explicit off as 0, which the native parser reads as off', () => {
+    expect(engineEnvFor({ continuousBatching: false })).toEqual({ [BATCHING]: '0' });
+  });
+
+  it('lets a value from the user env win over the desktop default', () => {
+    const env: NodeJS.ProcessEnv = { [BATCHING]: '0' };
+    expect(applyEnginePolicy(DESKTOP_ENGINE_POLICY, env)).toEqual([CHUNK]);
+    expect(env[BATCHING]).toBe('0');
   });
 
   it('omits knobs the policy leaves unset', () => {
@@ -46,11 +66,13 @@ describe('engineEnvFor', () => {
   });
 
   it('only ever names vars from the declared inventory', () => {
-    expect(Object.keys(engineEnvFor(LAUNCHER_ENGINE_POLICY))).toEqual(
+    expect(Object.keys(engineEnvFor(DESKTOP_ENGINE_POLICY))).toEqual(
       expect.arrayContaining([...ENGINE_POLICY_ENV_VARS]),
     );
-    for (const name of Object.keys(engineEnvFor(LAUNCHER_ENGINE_POLICY))) {
-      expect(ENGINE_POLICY_ENV_VARS).toContain(name);
+    for (const policy of [LAUNCHER_ENGINE_POLICY, DESKTOP_ENGINE_POLICY]) {
+      for (const name of Object.keys(engineEnvFor(policy))) {
+        expect(ENGINE_POLICY_ENV_VARS).toContain(name);
+      }
     }
   });
 

@@ -27,7 +27,7 @@
  */
 
 /** Env var names this module owns. Exported so tests can assert the exact set. */
-export const ENGINE_POLICY_ENV_VARS = ['MLX_PAGED_PREFILL_CHUNK_SIZE'] as const;
+export const ENGINE_POLICY_ENV_VARS = ['MLX_PAGED_PREFILL_CHUNK_SIZE', 'MLX_CONTINUOUS_BATCHING'] as const;
 
 export interface EnginePolicy {
   /**
@@ -35,6 +35,13 @@ export interface EnginePolicy {
    * `0` is the family default; Qwen3.5 caps values above 2048.
    */
   pagedPrefillChunkSize?: number;
+  /**
+   * `MLX_CONTINUOUS_BATCHING` — the shared scheduled lane for the families
+   * whose native default is off (Qwen3.5 dense and MoE). Unset, those models
+   * run one whole turn at a time, so a second request on the same model waits
+   * for the first one to end.
+   */
+  continuousBatching?: boolean;
 }
 
 /**
@@ -47,6 +54,16 @@ export interface EnginePolicy {
 export const LAUNCHER_ENGINE_POLICY: EnginePolicy = Object.freeze({ pagedPrefillChunkSize: 2048 });
 
 /**
+ * The desktop app's engine: the launcher policy plus concurrent turns on
+ * every scheduled family. One Work turn sends requests that overlap on one
+ * model (the main step, a helper agent, the agent's compaction request).
+ */
+export const DESKTOP_ENGINE_POLICY: EnginePolicy = Object.freeze({
+  ...LAUNCHER_ENGINE_POLICY,
+  continuousBatching: true,
+});
+
+/**
  * Render a policy as the environment map a forked child should start with.
  *
  * Unconditional by construction: there is no "already set" to respect in a
@@ -56,6 +73,9 @@ export function engineEnvFor(policy: EnginePolicy): Record<string, string> {
   const env: Record<string, string> = {};
   if (policy.pagedPrefillChunkSize !== undefined) {
     env.MLX_PAGED_PREFILL_CHUNK_SIZE = String(policy.pagedPrefillChunkSize);
+  }
+  if (policy.continuousBatching !== undefined) {
+    env.MLX_CONTINUOUS_BATCHING = policy.continuousBatching ? '1' : '0';
   }
   return env;
 }

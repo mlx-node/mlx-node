@@ -39,6 +39,11 @@
       "types": "./dist/host/idle-release.d.ts",
       "import": "./dist/host/idle-release.js"
     },
+    "./host/persist-cache": {
+      "@mlx-node/source": "./src/host/persist-cache.ts",
+      "types": "./dist/host/persist-cache.d.ts",
+      "import": "./dist/host/persist-cache.js"
+    },
     "./host/decode-share": {
       "@mlx-node/source": "./src/host/decode-share.ts",
       "types": "./dist/host/decode-share.d.ts",

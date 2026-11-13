@@ -8,7 +8,7 @@ import type { AudioService } from './audio-service.js';
 import { handleMemoryRelease, type MemoryReleaseAnswer } from './endpoints/memory-release.js';
 import { handleCountMessageTokens } from './endpoints/messages-count-tokens.js';
 import { handleCreateMessage } from './endpoints/messages.js';
-import { handleListModels } from './endpoints/models.js';
+import { handleListModels, handleUnloadModels } from './endpoints/models.js';
 import { handleCreateResponse } from './endpoints/responses.js';
 import { handleSystemOne } from './endpoints/systemone.js';
 import {
@@ -100,6 +100,8 @@ export interface RouteExtras {
   turnJournal?: TurnJournal;
   /** `POST /v1/memory/release`; omitted ⇒ the route is not served. */
   releaseMemory?: () => Promise<MemoryReleaseAnswer>;
+  /** Backs `POST /v1/models/unload`; the route answers 404 without it. */
+  unloadModels?: () => Promise<string[]>;
 }
 
 export async function routeRequest(
@@ -205,6 +207,15 @@ export async function routeRequest(
       return;
     }
     handleListModels(res, registry, listModels);
+    return;
+  }
+
+  if (path === '/v1/models/unload' && extras?.unloadModels && modelWorkCoordinator) {
+    if (req.method !== 'POST') {
+      sendMethodNotAllowed(res, 'POST');
+      return;
+    }
+    await handleUnloadModels(res, extras.unloadModels, registry, modelWorkCoordinator, idleSweeper);
     return;
   }
 

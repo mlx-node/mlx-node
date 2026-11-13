@@ -27,11 +27,13 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
  */
 const ADDON_FREE_SUBPATHS = [
   'host/decode-share.ts',
+  'host/desktop-endpoint.ts',
   'host/env-policy.ts',
   'host/idle-release.ts',
   'host/max-context.ts',
   'host/max-memory.ts',
   'host/paths.ts',
+  'host/persist-cache.ts',
 ];
 
 /** Modules that pull in the native addon, directly or by re-export. */

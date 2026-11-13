@@ -54,6 +54,10 @@ describe('launchClaudeHostOptions', () => {
     expect(opts.logDir).toBeUndefined();
   });
 
+  it('names the launcher as the host kind of the runtime series', () => {
+    expect(launchClaudeHostOptions({}).hostKind).toBe('launch');
+  });
+
   it('forwards the per-launch token onto the host', () => {
     // Dropping it here is invisible: `claude` still gets its token and still
     // works, because a host with no `authToken` accepts everyone. The server is

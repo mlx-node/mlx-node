@@ -20,6 +20,8 @@ import {
   parseMaxMemory,
   resolveLogDir,
   resolveMlxNodeHome,
+  WHOLE_PROMPT_CAPTURE_BLOCKS,
+  WHOLE_PROMPT_CAPTURE_BUDGET_MS,
   type InferenceHost,
   type InferenceHostOptions,
 } from '@mlx-node/server/host';
@@ -77,6 +79,16 @@ Options:
                       s, m or h suffix, e.g. 30m (default: 10m); off keeps
                       both, though POST /v1/memory/release still frees the
                       weights. The next request loads the weights again.
+  --persist-cache     Keep full paged KV blocks in the disk cache
+                      (~/.mlx-node/cache/paged/v1) so a prompt prefix survives
+                      an engine restart (default: off, or MLX_PERSIST_PAGED_CACHE).
+                      Only families on the restore allowlist persist.
+  --no-persist-cache  Turn the disk cache off, whatever MLX_PERSIST_PAGED_CACHE says.
+  --persist-whole-prompt  With the disk cache on, let one turn write the whole
+                      prompt: up to ${WHOLE_PROMPT_CAPTURE_BLOCKS} blocks within ${WHOLE_PROMPT_CAPTURE_BUDGET_MS} ms, where
+                      MLX_COLD_CAPTURE_BLOCKS_PER_TURN / MLX_COLD_CAPTURE_BUDGET_MS
+                      hold no number (default: 128 blocks, 250 ms). The turn ends
+                      after the write. \`mlx agent\` passes it.
   --thinking-token-budget <n>  Thinking tokens of a thinking request that
                       sets no budget, after which its thinking closes
                       (default: no cap).
@@ -115,6 +127,10 @@ export interface ServeArgs {
   decodeShare?: number;
   /** `--idle-release` in seconds; `Infinity` for `off`. */
   idleReleaseSeconds?: number;
+  /** `--persist-cache` (true) or `--no-persist-cache` (false); unset when neither was given. */
+  persistCache?: boolean;
+  /** `--persist-whole-prompt`; unset when not given. */
+  persistWholePrompt?: true;
   thinkingTokenBudget?: number;
   rerankConfig?: string;
   logDir?: string;
@@ -144,6 +160,9 @@ export function parseServeArgs(argv: string[]): ServeArgs {
       'max-context': { type: 'string' },
       'decode-share': { type: 'string' },
       'idle-release': { type: 'string' },
+      'persist-cache': { type: 'boolean' },
+      'no-persist-cache': { type: 'boolean' },
+      'persist-whole-prompt': { type: 'boolean' },
       'thinking-token-budget': { type: 'string' },
       'rerank-config': { type: 'string' },
       'auth-token': { type: 'string' },
@@ -178,6 +197,10 @@ export function parseServeArgs(argv: string[]): ServeArgs {
   const decodeShare = decodeShareText === undefined ? undefined : parseDecodeShare(decodeShareText);
   const idleReleaseText = values['idle-release'];
   const idleReleaseSeconds = idleReleaseText === undefined ? undefined : parseIdleRelease(idleReleaseText);
+  if (values['persist-cache'] === true && values['no-persist-cache'] === true)
+    throw new Error('--persist-cache and --no-persist-cache cannot be used together');
+  const persistCache =
+    values['persist-cache'] === true ? true : values['no-persist-cache'] === true ? false : undefined;
   const budgetText = values['thinking-token-budget'];
   const thinkingTokenBudget = budgetText === undefined ? undefined : parseThinkingTokenBudget(budgetText);
   const verbose = (values.verbose ?? false) || values['log-dir'] != null;
@@ -195,6 +218,8 @@ export function parseServeArgs(argv: string[]): ServeArgs {
     ...(maxContextTokens !== undefined ? { maxContextTokens } : {}),
     ...(decodeShare !== undefined ? { decodeShare } : {}),
     ...(idleReleaseSeconds !== undefined ? { idleReleaseSeconds } : {}),
+    ...(persistCache !== undefined ? { persistCache } : {}),
+    ...(values['persist-whole-prompt'] === true ? { persistWholePrompt: true as const } : {}),
     ...(thinkingTokenBudget !== undefined ? { thinkingTokenBudget } : {}),
     ...(values['rerank-config'] !== undefined ? { rerankConfig: values['rerank-config'] } : {}),
     authToken: values['auth-token'],
@@ -262,12 +287,18 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       ...(args.decodeShare !== undefined ? { decodeShare: args.decodeShare } : {}),
       ...(args.idleReleaseSeconds !== undefined ? { idleReleaseSeconds: args.idleReleaseSeconds } : {}),
       ...(args.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: args.thinkingTokenBudget } : {}),
+      persistPagedCache: {
+        ...(args.persistCache !== undefined ? { flag: args.persistCache } : {}),
+        byDefault: false,
+        wholePrompt: args.persistWholePrompt === true,
+      },
       ...(await readRerankConfig(args.rerankConfig)),
       authToken: args.authToken,
       logDir: args.logDir,
       // Same paged-prefill chunking `mlx launch claude` applies. A value
       // already in the environment wins; see `env-policy.ts`.
       enginePolicy: LAUNCHER_ENGINE_POLICY,
+      hostKind: 'serve',
       ...deps.hostOverrides,
     });
   } catch (err) {
@@ -289,6 +320,11 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
     `[mlx] models dir: ${host.modelsDir} | listening on ${host.url} | discovered ${host.models.length + (host.audioModels?.length ?? 0) + (host.rerankModels?.length ?? 0)} model(s) | default: ${host.boundModel}`,
   );
   if (host.logDir !== null) console.log(`[mlx] verbose logging → ${host.logDir}`);
+  console.log(`[mlx] paged KV disk cache: ${host.persistPagedCache ? 'on' : 'off'}`);
+  if (host.coldCapture !== null)
+    console.log(
+      `[mlx] paged KV disk capture per turn: ${host.coldCapture.blocksPerTurn} blocks, ${host.coldCapture.budgetMs} ms`,
+    );
   console.log('Press Ctrl+C to stop.');
 
   if (args.preload !== undefined) {

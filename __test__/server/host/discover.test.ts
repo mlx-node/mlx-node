@@ -43,6 +43,20 @@ describe('discoverModels', () => {
     expect(got[0].path.endsWith('qwen3.5-demo')).toBe(true);
   });
 
+  it('carries the base, build and format of each model', async () => {
+    makeModel('qwen3.5-demo-nvfp4-mlx', {
+      model_type: 'qwen3_5',
+      quantization: { bits: 4, group_size: 16, mode: 'nvfp4' },
+    });
+    makeModel('qwen3.5-demo', { model_type: 'qwen3_5', torch_dtype: 'bfloat16' });
+    expect(
+      (await discoverModels(root)).map(({ name, base, variant, format }) => ({ name, base, variant, format })),
+    ).toEqual([
+      { name: 'qwen3.5-demo', base: 'qwen3.5-demo', variant: 'BF16', format: 'mlx' },
+      { name: 'qwen3.5-demo-nvfp4-mlx', base: 'qwen3.5-demo', variant: 'NVFP4', format: 'mlx' },
+    ]);
+  });
+
   it('keeps draft companions out of the server model picker', async () => {
     makeModel('qwen3.8-27b-dflash2', { model_type: 'qwen3', architectures: ['DFlash2DraftModel'] });
     makeModel('qwen3.8-27b-mxfp4-mlx', { model_type: 'qwen3_5' });

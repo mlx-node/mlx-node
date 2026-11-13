@@ -8,17 +8,23 @@
  * temp-dir `MetricsTrace`.
  */
 
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { ChatResult, ColdCacheStats, ColdSidecarStats } from '@mlx-node/core';
-import { ChatSession, type ChatStreamEvent, type SessionCapableModel } from '@mlx-node/lm';
+import type { ChatResult, ChatStreamProgress, ColdCacheStats, ColdSidecarStats } from '@mlx-node/core';
+import { ChatSession, type ChatStreamControl, type ChatStreamEvent, type SessionCapableModel } from '@mlx-node/lm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { MetricsTrace, type MetricsTraceRecord } from '../../packages/server/src/metrics-trace.js';
 import { SessionRegistry } from '../../packages/server/src/session-registry.js';
-import { TurnTraceModel } from '../../packages/server/src/turn-trace.js';
+import {
+  measuredPrefillOf,
+  TurnTraceModel,
+  turnCounters,
+  type TracedChatConfig,
+  type TurnTraceDeps,
+} from '../../packages/server/src/turn-trace.js';
 
 const FIXED_NOW = Date.UTC(2026, 6, 21, 12, 0, 0); // 2026-07-21
 
@@ -164,7 +170,12 @@ describe('TurnTraceModel', () => {
     const lines = readTraceLines(dir);
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatchObject({
-      v: 1,
+      v: 2,
+      pid: process.pid,
+      outcome: 'ok',
+      endpoint: 'other',
+      stream: false,
+      dispatch: 'continue',
       sessionId: 'owner-1',
       model: 'qwen-small',
       finishReason: 'stop',
@@ -173,7 +184,6 @@ describe('TurnTraceModel', () => {
       outputTokens: 7,
       reasoningTokens: 2,
       ttftMs: 125,
-      prefillTps: 800,
       decodeTps: 50,
       mtpCycles: 3,
       mtpMeanAccepted: 1.6,
@@ -186,6 +196,10 @@ describe('TurnTraceModel', () => {
       coldSidecarCaptureReached: 0,
       durationMs: 0,
     });
+    // A non-streamed turn has no progress handle, so no prefill window.
+    expect('prefillMs' in lines[0]!).toBe(false);
+    expect('prefillTokens' in lines[0]!).toBe(false);
+    expect('prefillTps' in lines[0]!).toBe(false);
     // Free text from the result must never reach the file.
     const raw = readFileSync(traceFile(dir), 'utf8');
     expect(raw).not.toContain('"text"');
@@ -313,41 +327,637 @@ describe('TurnTraceModel', () => {
     expect(lines[0].traceId).toBeTruthy();
   });
 
-  it('writes nothing when the turn fails or ends on finishReason: error', async () => {
-    const inner = makeInner({
-      chatSessionStart: vi.fn(async () => makeResult({ finishReason: 'error' })),
-      chatSessionContinueTool: vi.fn(async () => {
-        throw new Error('native exploded');
-      }),
-      chatStreamSessionStart: vi.fn(async function* () {
-        yield makeFinalEvent({ finishReason: 'error' });
-      }),
-      chatStreamSessionContinue: vi.fn(async function* () {
-        yield { text: 'partial', done: false as const };
-        throw new Error('mid-stream failure');
-      }),
-    });
-    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
-    const model = new TurnTraceModel(inner, {
+  function deps(overrides: Partial<TurnTraceDeps> = {}): TurnTraceDeps {
+    return {
       modelName: 'qwen-small',
-      trace,
+      trace: new MetricsTrace({ dir, now: () => FIXED_NOW }),
       now: () => FIXED_NOW,
+      coldStats: () => coldStats(),
+      sidecarStats: () => sidecarStats(),
       watermarks: { cold: {}, sidecar: {} },
-    });
+      memory: () => ({ activeBytes: 1000, peakBytes: 2000 }),
+      ...overrides,
+    };
+  }
 
-    const errorResult = await model.chatSessionStart([]);
-    expect(errorResult.finishReason).toBe('error');
+  function progress(overrides: Partial<ChatStreamProgress> = {}): ChatStreamProgress {
+    return { phase: 'decode', prefillTotal: 40, prefillDone: 40, cachedTokens: 60, generatedTokens: 5, ...overrides };
+  }
+
+  it('records an error turn when the dispatch throws', async () => {
+    const model = new TurnTraceModel(
+      makeInner({
+        chatSessionContinueTool: vi.fn(async () => {
+          throw new Error('native exploded with secret prompt text');
+        }),
+      }),
+      deps(),
+    );
     await expect(model.chatSessionContinueTool([])).rejects.toThrow('native exploded');
-    for await (const _ of model.chatStreamSessionStart([])) {
-      // drains the error-finish stream
-    }
+
+    const lines = readTraceLines(dir);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      outcome: 'error',
+      errorKind: 'exception',
+      finishReason: 'error',
+      dispatch: 'continue_tool',
+      stream: false,
+      memActiveBytes: 1000,
+      memPeakBytes: 2000,
+    });
+    // A non-stream turn has no progress snapshot to place the failure.
+    expect('failPhase' in lines[0]!).toBe(false);
+    expect(readFileSync(traceFile(dir), 'utf8')).not.toContain('secret');
+  });
+
+  it('records a cancelled turn when the signal aborted', async () => {
+    const controller = new AbortController();
+    const model = new TurnTraceModel(
+      makeInner({
+        chatSessionStart: vi.fn(async () => {
+          controller.abort();
+          throw new Error('aborted');
+        }),
+      }),
+      deps(),
+    );
+    await expect(model.chatSessionStart([], null, controller.signal)).rejects.toThrow('aborted');
+
+    const lines = readTraceLines(dir);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ outcome: 'cancelled', finishReason: 'cancelled' });
+    expect('errorKind' in lines[0]!).toBe(false);
+  });
+
+  it('records a cancelled stream that ended without a terminal event', async () => {
+    const model = new TurnTraceModel(
+      makeInner({
+        chatStreamSessionStart: vi.fn(async function* (
+          _messages: unknown,
+          _config: unknown,
+          _signal: unknown,
+          ref?: ChatStreamControl,
+        ) {
+          const snap = progress({ phase: 'decode', generatedTokens: 3, decodeElapsedMs: 10, prefillElapsedMs: 5 });
+          if (ref) ref.read = () => snap;
+          try {
+            yield { text: 'a', done: false as const };
+            yield { text: 'b', done: false as const };
+          } finally {
+            if (ref) ref.read = null;
+          }
+        }),
+      }),
+      deps(),
+    );
+    // The consumer stops early: `return()` on the generator.
+    for await (const _ of model.chatStreamSessionStart([])) break;
+
+    const lines = readTraceLines(dir);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      outcome: 'cancelled',
+      finishReason: 'cancelled',
+      stream: true,
+      failPhase: 'decode',
+      outputTokens: 3,
+      cachedTokens: 60,
+      promptTokens: 100,
+      prefillDoneTokens: 40,
+    });
+  });
+
+  it('records finishReason error as outcome error with errorKind finish_error', async () => {
+    const model = new TurnTraceModel(
+      makeInner({ chatSessionStart: vi.fn(async () => makeResult({ finishReason: 'error', numTokens: 4 })) }),
+      deps(),
+    );
+    const result = await model.chatSessionStart([]);
+    expect(result.finishReason).toBe('error');
+
+    const lines = readTraceLines(dir);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({
+      outcome: 'error',
+      errorKind: 'finish_error',
+      finishReason: 'error',
+      outputTokens: 4,
+      promptTokens: 100,
+    });
+  });
+
+  it('does not record the media-held restart reroute', async () => {
+    const before = turnCounters();
+    const model = new TurnTraceModel(
+      makeInner({
+        chatSessionContinue: vi.fn(async () => {
+          throw new Error('IMAGE_CHANGE_REQUIRES_SESSION_RESTART: images changed');
+        }),
+      }),
+      deps(),
+    );
+    await expect(model.chatSessionContinue([])).rejects.toThrow('IMAGE_CHANGE_REQUIRES_SESSION_RESTART');
+
+    expect(existsSync(traceFile(dir))).toBe(false);
+    expect(model.turnStats().live).toBe(0);
+    const after = turnCounters();
+    expect(after.error).toBe(before.error);
+    expect(after.cancelled).toBe(before.cancelled);
+  });
+
+  it('failed turns carry no cold deltas and still advance the marks', async () => {
+    let counter = 10;
+    const shared = deps({ coldStats: () => coldStats({ hits: counter }), watermarks: { cold: {}, sidecar: {} } });
+    const failing = new TurnTraceModel(
+      makeInner({
+        chatSessionContinue: vi.fn(async () => {
+          counter += 3;
+          throw new Error('native exploded');
+        }),
+      }),
+      shared,
+    );
+    const passing = new TurnTraceModel(
+      makeInner({
+        chatSessionContinue: vi.fn(async () => {
+          counter += 1;
+          return makeResult();
+        }),
+      }),
+      shared,
+    );
+    await expect(failing.chatSessionContinue([])).rejects.toThrow('native exploded');
+    await passing.chatSessionContinue([]);
+
+    const lines = readTraceLines(dir);
+    expect(lines.map((l) => l.outcome)).toEqual(['error', 'ok']);
+    for (const key of Object.keys(lines[0]!)) expect(key.startsWith('cold')).toBe(false);
+    expect(lines[1]!.coldHits).toBe(1);
+  });
+
+  it('captures the last progress snapshot when the stream bridge clears the reader', async () => {
+    const model = new TurnTraceModel(
+      makeInner({
+        chatStreamSessionContinue: vi.fn(async function* (
+          _messages: unknown,
+          _config: unknown,
+          _signal: unknown,
+          ref?: ChatStreamControl,
+        ) {
+          let snap = progress({ phase: 'prefill', prefillDone: 10, generatedTokens: undefined, prefillElapsedMs: 3 });
+          if (ref) ref.read = () => snap;
+          try {
+            yield { text: '', done: false as const };
+            snap = progress({ phase: 'done', prefillDone: 20, generatedTokens: undefined, prefillElapsedMs: 8 });
+            throw new Error('native failure in prefill');
+          } finally {
+            if (ref) ref.read = null;
+          }
+        }),
+      }),
+      deps(),
+    );
     await expect(async () => {
       for await (const _ of model.chatStreamSessionContinue([])) {
-        // drains until the mid-stream throw
+        // drains until the throw
       }
-    }).rejects.toThrow('mid-stream failure');
+    }).rejects.toThrow('native failure');
 
-    expect(() => readFileSync(traceFile(dir), 'utf8')).toThrow();
+    const [line] = readTraceLines(dir);
+    expect(line).toMatchObject({
+      outcome: 'error',
+      errorKind: 'exception',
+      failPhase: 'prefill',
+      prefillDoneTokens: 20,
+    });
+  });
+
+  it("forwards progress to the caller's ref", async () => {
+    const seen: Array<ChatStreamProgress | null> = [];
+    const outer: ChatStreamControl = { read: null, stop: null };
+    const model = new TurnTraceModel(
+      makeInner({
+        chatStreamSessionStart: vi.fn(async function* (
+          _messages: unknown,
+          _config: unknown,
+          _signal: unknown,
+          ref?: ChatStreamControl,
+        ) {
+          const snap = progress();
+          if (ref) ref.read = () => snap;
+          try {
+            yield { text: 'a', done: false as const };
+            yield makeFinalEvent();
+          } finally {
+            if (ref) ref.read = null;
+          }
+        }),
+      }),
+      deps(),
+    );
+    for await (const event of model.chatStreamSessionStart([], null, undefined, outer)) {
+      if (!event.done) seen.push(outer.read?.() ?? null);
+    }
+    expect(seen).toEqual([progress()]);
+    expect(outer.read).toBeNull();
+  });
+
+  it("forwards stop to the caller's control", async () => {
+    const nativeStop = vi.fn(() => true);
+    const outer: ChatStreamControl = { read: null, stop: null };
+    const stopped: boolean[] = [];
+    const model = new TurnTraceModel(
+      makeInner({
+        chatStreamSessionStart: vi.fn(async function* (
+          _messages: unknown,
+          _config: unknown,
+          _signal: unknown,
+          control?: ChatStreamControl,
+        ) {
+          if (control) control.stop = nativeStop;
+          try {
+            yield { text: 'a', done: false as const };
+            yield makeFinalEvent();
+          } finally {
+            if (control) control.stop = null;
+          }
+        }),
+      }),
+      deps(),
+    );
+    for await (const event of model.chatStreamSessionStart([], null, undefined, outer)) {
+      if (!event.done) stopped.push(outer.stop?.() ?? false);
+    }
+    expect(stopped).toEqual([true]);
+    expect(nativeStop).toHaveBeenCalledTimes(1);
+    expect(outer.stop).toBeNull();
+  });
+
+  // Mutation: `finishTurn` ignores `stopped` → red (toolCallCount 1).
+  it('a turn a stop match ended records no tool calls, as ChatSession reports it', async () => {
+    const call = { id: 'c1', name: 'read', arguments: '{}', status: 'ok', rawContent: '' };
+    const turn = async (stopAccepted: boolean | null): Promise<void> => {
+      const outer: ChatStreamControl = { read: null, stop: null };
+      const model = new TurnTraceModel(
+        makeInner({
+          chatStreamSessionStart: vi.fn(async function* (
+            _messages: unknown,
+            _config: unknown,
+            _signal: unknown,
+            control?: ChatStreamControl,
+          ) {
+            if (control) control.stop = () => stopAccepted === true;
+            try {
+              yield { text: 'a', done: false as const };
+              yield makeFinalEvent({ toolCalls: [call] });
+            } finally {
+              if (control) control.stop = null;
+            }
+          }),
+        }),
+        deps(),
+      );
+      for await (const event of model.chatStreamSessionStart([], null, undefined, outer)) {
+        if (!event.done && stopAccepted !== null) outer.stop?.();
+      }
+    };
+    await turn(true);
+    await turn(false);
+    await turn(null);
+    expect(readTraceLines(dir).map((line) => line.toolCallCount)).toEqual([0, 1, 1]);
+  });
+
+  /** A streamed turn whose reader returns `snap` through the terminal event, then `after` until cleared. */
+  function streamWith(
+    snap: () => ChatStreamProgress,
+    final: ChatStreamEvent = makeFinalEvent(),
+    after?: ChatStreamProgress,
+  ) {
+    return makeInner({
+      chatStreamSessionStart: vi.fn(async function* (
+        _messages: unknown,
+        _config: unknown,
+        _signal: unknown,
+        ref?: ChatStreamControl,
+      ) {
+        let read = snap;
+        if (ref) ref.read = () => read();
+        try {
+          yield { text: 'a', done: false as const };
+          yield final;
+          if (after !== undefined) read = () => after;
+        } finally {
+          if (ref) ref.read = null;
+        }
+      }),
+    });
+  }
+
+  async function drainStart(model: TurnTraceModel): Promise<void> {
+    for await (const _ of model.chatStreamSessionStart([])) {
+      // drains
+    }
+  }
+
+  const FINISHED = { phase: 'done', prefillTotal: 400, prefillElapsedMs: 250, decodeElapsedMs: 900 } as const;
+
+  it('records the measured prefill window of a finished stream', async () => {
+    const model = new TurnTraceModel(
+      streamWith(() => ({ ...FINISHED })),
+      deps(),
+    );
+    await drainStart(model);
+    const [line] = readTraceLines(dir);
+    expect(line).toMatchObject({ outcome: 'ok', stream: true, prefillMs: 250, prefillTokens: 400 });
+    expect('prefillTps' in line!).toBe(false);
+  });
+
+  it('writes no prefill window when native never began a prefill', async () => {
+    const model = new TurnTraceModel(
+      streamWith(() => ({ phase: 'done', prefillElapsedMs: 250, decodeElapsedMs: 900 })),
+      deps(),
+    );
+    await drainStart(model);
+    const [line] = readTraceLines(dir);
+    expect(line!.outcome).toBe('ok');
+    expect('prefillMs' in line!).toBe(false);
+    expect('prefillTokens' in line!).toBe(false);
+  });
+
+  it('writes no prefill window while the window is still running', async () => {
+    const model = new TurnTraceModel(
+      streamWith(() => ({ phase: 'done', prefillTotal: 400, prefillElapsedMs: 250 })),
+      deps(),
+    );
+    await drainStart(model);
+    const [line] = readTraceLines(dir);
+    expect('prefillMs' in line!).toBe(false);
+    expect('prefillTokens' in line!).toBe(false);
+  });
+
+  it('reads the prefill window at the terminal event, before the reader is cleared', async () => {
+    const model = new TurnTraceModel(
+      streamWith(() => ({ ...FINISHED }), makeFinalEvent(), { phase: 'done', prefillElapsedMs: 9 }),
+      deps(),
+    );
+    await drainStart(model);
+    const [line] = readTraceLines(dir);
+    expect(line).toMatchObject({ prefillMs: 250, prefillTokens: 400 });
+  });
+
+  it('still records the turn when the progress reader throws', async () => {
+    const model = new TurnTraceModel(
+      streamWith(() => {
+        throw new Error('handle gone');
+      }),
+      deps(),
+    );
+    await drainStart(model);
+    const [line] = readTraceLines(dir);
+    expect(line).toMatchObject({ outcome: 'ok', finishReason: 'stop', outputTokens: 7 });
+    expect('prefillMs' in line!).toBe(false);
+  });
+
+  it('a finish_error stream carries no prefill window', async () => {
+    const model = new TurnTraceModel(
+      streamWith(() => ({ ...FINISHED }), makeFinalEvent({ finishReason: 'error', numTokens: 0 })),
+      deps(),
+    );
+    await drainStart(model);
+    const [line] = readTraceLines(dir);
+    expect(line!.outcome).toBe('error');
+    expect('prefillMs' in line!).toBe(false);
+    expect('prefillTokens' in line!).toBe(false);
+  });
+
+  it('a cancelled stream carries no prefill window', async () => {
+    const controller = new AbortController();
+    const model = new TurnTraceModel(
+      streamWith(() => ({ ...FINISHED })),
+      deps(),
+    );
+    for await (const event of model.chatStreamSessionStart([], null, controller.signal)) {
+      if (!event.done) {
+        controller.abort();
+        break;
+      }
+    }
+    const [line] = readTraceLines(dir);
+    expect(line!.outcome).toBe('cancelled');
+    expect('prefillMs' in line!).toBe(false);
+    expect('prefillTokens' in line!).toBe(false);
+  });
+
+  it('measuredPrefillOf rejects a snapshot that is not a measured window', () => {
+    expect(measuredPrefillOf(null)).toBeUndefined();
+    expect(measuredPrefillOf(undefined)).toBeUndefined();
+    expect(measuredPrefillOf({ ...FINISHED, prefillTotal: 0 })).toBeUndefined();
+    expect(measuredPrefillOf({ ...FINISHED, prefillElapsedMs: 0 })).toBeUndefined();
+    expect(measuredPrefillOf({ ...FINISHED, prefillElapsedMs: Number.NaN })).toBeUndefined();
+    expect(measuredPrefillOf({ ...FINISHED, prefillTotal: 1.5 })).toBeUndefined();
+    expect(measuredPrefillOf({ ...FINISHED })).toEqual({ prefillMs: 250, prefillTokens: 400 });
+  });
+
+  it('stamps queueMs, loadWaitMs, resolveMs, preDispatchMs and endpoint from turnMeta', async () => {
+    const model = new TurnTraceModel(makeInner(), deps());
+    const config: TracedChatConfig = {
+      turnMeta: { endpoint: 'responses', queueMs: 3, loadWaitMs: 4, resolveMs: 5, preDispatchMs: 15 },
+      tools: [
+        { type: 'function', function: { name: 'a' } },
+        { type: 'function', function: { name: 'b' } },
+      ] as TracedChatConfig['tools'],
+    };
+    await model.chatSessionStart(
+      [{ role: 'user', content: 'x', images: [new Uint8Array(1), new Uint8Array(1)] }],
+      config,
+    );
+
+    const [line] = readTraceLines(dir);
+    expect(line).toMatchObject({
+      endpoint: 'responses',
+      queueMs: 3,
+      loadWaitMs: 4,
+      resolveMs: 5,
+      preDispatchMs: 15,
+      toolCount: 2,
+      imageCount: 2,
+      dispatch: 'start',
+      toolCallCount: 0,
+    });
+  });
+
+  it('records a turn with no turnMeta as endpoint other', async () => {
+    const model = new TurnTraceModel(makeInner(), deps());
+    await model.chatSessionStart([]);
+    const [line] = readTraceLines(dir);
+    expect(line!.endpoint).toBe('other');
+    expect('queueMs' in line!).toBe(false);
+  });
+
+  it('a stream that ends in an error after decode began records failPhase decode', async () => {
+    const model = new TurnTraceModel(
+      makeInner({
+        chatStreamSessionStart: vi.fn(async function* (
+          _messages: unknown,
+          _config: unknown,
+          _signal: unknown,
+          ref?: ChatStreamControl,
+        ) {
+          // Native flips the phase to `done` before it sends the error.
+          const snap = progress({ phase: 'done', prefillElapsedMs: 5, decodeElapsedMs: 9, generatedTokens: 6 });
+          if (ref) ref.read = () => snap;
+          try {
+            yield { text: 'a', done: false as const };
+            throw new Error('decode failure');
+          } finally {
+            if (ref) ref.read = null;
+          }
+        }),
+      }),
+      deps(),
+    );
+    await expect(async () => {
+      for await (const _ of model.chatStreamSessionStart([])) {
+        // drains until the throw
+      }
+    }).rejects.toThrow('decode failure');
+    const [line] = readTraceLines(dir);
+    expect(line).toMatchObject({ outcome: 'error', failPhase: 'decode', outputTokens: 6 });
+  });
+
+  it('a finish_error turn reads the live progress, not the captured one', async () => {
+    const model = new TurnTraceModel(
+      makeInner({
+        chatStreamSessionStart: vi.fn(async function* (
+          _messages: unknown,
+          _config: unknown,
+          _signal: unknown,
+          ref?: ChatStreamControl,
+        ) {
+          const snap = progress({ phase: 'done', prefillElapsedMs: 5, decodeElapsedMs: undefined, prefillDone: 12 });
+          if (ref) ref.read = () => snap;
+          try {
+            yield makeFinalEvent({ finishReason: 'error', numTokens: 0 });
+          } finally {
+            if (ref) ref.read = null;
+          }
+        }),
+      }),
+      deps(),
+    );
+    for await (const _ of model.chatStreamSessionStart([])) {
+      // drains
+    }
+    const [line] = readTraceLines(dir);
+    expect(line).toMatchObject({
+      outcome: 'error',
+      errorKind: 'finish_error',
+      failPhase: 'prefill',
+      prefillDoneTokens: 12,
+    });
+  });
+
+  // Mutation: read the window from `inner.contextLimits()` again → red (spy count).
+  it('stamps modelId, modelType and ctxWindow from identity, preferring the served window', async () => {
+    const identity = { modelId: 'Qwen3.6-27B', modelType: 'qwen3_5', contextWindow: 131072 };
+    const contextLimits = vi.fn(() => ({
+      trainedWindowTokens: 262144,
+      effectiveWindowTokens: 99999,
+      pagedBlockCapacity: 0,
+      pagedBlockSize: 0,
+    }));
+    const withLimits = new TurnTraceModel(makeInner({ contextLimits }), deps({ identity, ctxWindow: 65536 }));
+    const withoutLimits = new TurnTraceModel(makeInner(), deps({ identity }));
+    await withLimits.chatSessionStart([], { modelAlias: 'claude-haiku-4-5' } as TracedChatConfig);
+    await withoutLimits.chatSessionStart([]);
+
+    const lines = readTraceLines(dir);
+    expect(lines[0]).toMatchObject({
+      model: 'claude-haiku-4-5',
+      modelId: 'Qwen3.6-27B',
+      modelType: 'qwen3_5',
+      ctxWindow: 65536,
+    });
+    expect(lines[1]).toMatchObject({ model: 'qwen-small', modelId: 'Qwen3.6-27B', ctxWindow: 131072 });
+    expect(contextLimits).not.toHaveBeenCalled();
+  });
+
+  it('reports concurrency and concurrencyPeak for overlapping turns', async () => {
+    const gates: Array<() => void> = [];
+    const inner = makeInner({
+      chatSessionContinue: vi.fn(
+        () =>
+          new Promise<ChatResult>((resolve) => {
+            gates.push(() => resolve(makeResult()));
+          }),
+      ),
+    });
+    const model = new TurnTraceModel(inner, deps());
+    const first = model.chatSessionContinue([]);
+    const second = model.chatSessionContinue([]);
+    expect(model.turnStats()).toMatchObject({ live: 2, begun: 2 });
+    gates[0]!();
+    await first;
+    const third = model.chatSessionContinue([]);
+    gates[1]!();
+    await second;
+    gates[2]!();
+    await third;
+
+    const lines = readTraceLines(dir);
+    expect(lines.map((l) => [l.concurrency, l.concurrencyPeak])).toEqual([
+      [1, 2],
+      [2, 2],
+      [2, 2],
+    ]);
+    expect(model.turnStats()).toMatchObject({ live: 0, begun: 3 });
+  });
+
+  it('credits streamed tokens to the process counter exactly once', async () => {
+    let snap = progress({ generatedTokens: 0 });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const model = new TurnTraceModel(
+      makeInner({
+        chatStreamSessionStart: vi.fn(async function* (
+          _messages: unknown,
+          _config: unknown,
+          _signal: unknown,
+          ref?: ChatStreamControl,
+        ) {
+          if (ref) ref.read = () => snap;
+          try {
+            yield { text: 'a', done: false as const };
+            await gate;
+            yield makeFinalEvent({ numTokens: 10 });
+          } finally {
+            if (ref) ref.read = null;
+          }
+        }),
+      }),
+      deps(),
+    );
+    const before = turnCounters().outputTokens;
+    const iterator = model.chatStreamSessionStart([])[Symbol.asyncIterator]();
+    await iterator.next();
+    snap = progress({ generatedTokens: 4 });
+    const [live] = model.liveTurns();
+    expect(live).toMatchObject({ model: 'qwen-small', stream: true, dispatch: 'start', progress: snap });
+    expect(turnCounters().outputTokens - before).toBe(4);
+    model.liveTurns();
+    expect(turnCounters().outputTokens - before).toBe(4);
+    snap = progress({ generatedTokens: 7 });
+    model.liveTurns();
+    expect(turnCounters().outputTokens - before).toBe(7);
+    release();
+    while (!(await iterator.next()).done) {
+      // drains
+    }
+    expect(turnCounters().outputTokens - before).toBe(10);
+    expect(model.liveTurns()).toEqual([]);
   });
 
   it("consumes a failed turn's counter increments instead of leaking them to the next record", async () => {
@@ -391,7 +1001,7 @@ describe('TurnTraceModel', () => {
     await expect(failing.chatSessionContinue([])).rejects.toThrow('native exploded');
     await passing.chatSessionContinue([]);
 
-    const lines = readTraceLines(dir);
+    const lines = readTraceLines(dir).filter((l) => l.outcome === 'ok');
     expect(lines).toHaveLength(1);
     expect(lines[0]!.coldHits).toBe(1);
   });
@@ -447,7 +1057,7 @@ describe('TurnTraceModel', () => {
     releaseSlow();
     await slowTurn;
 
-    const lines = readTraceLines(dir);
+    const lines = readTraceLines(dir).filter((l) => l.outcome === 'ok');
     expect(lines).toHaveLength(1);
     expect(lines[0]!.coldHits).toBe(6);
   });
@@ -490,7 +1100,7 @@ describe('TurnTraceModel', () => {
     expect(errorResult.finishReason).toBe('error');
     await passing.chatSessionContinue([]);
 
-    const lines = readTraceLines(dir);
+    const lines = readTraceLines(dir).filter((l) => l.outcome === 'ok');
     expect(lines).toHaveLength(1);
     expect(lines[0]!.coldHits).toBe(1);
   });

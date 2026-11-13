@@ -3,7 +3,12 @@
 import type { ChatResult, ChatStreamProgress } from '@mlx-node/core';
 
 import { sanitizeJsonString } from '../strict-json.js';
-import { mergeTimingUsageExtensions, type PerformanceMetricsForUsage, type ServerTimingForUsage } from '../timing.js';
+import {
+  mergeTimingUsageExtensions,
+  type MeasuredPrefill,
+  type PerformanceMetricsForUsage,
+  type ServerTimingForUsage,
+} from '../timing.js';
 import type {
   AnthropicContentBlockDeltaEvent,
   AnthropicContentBlockStartEvent,
@@ -390,6 +395,7 @@ export function buildMessageDelta(
   performance?: PerformanceMetricsForUsage,
   serverTiming?: ServerTimingForUsage,
   stopSequence?: string | null,
+  prefill?: MeasuredPrefill,
 ): AnthropicMessageDeltaEvent {
   // Streaming `message_delta` mirrors the non-streaming response's
   // cache accounting: when `cachedTokens > 0` we emit
@@ -413,7 +419,7 @@ export function buildMessageDelta(
   // cache-field block above. See `buildAnthropicResponse` for the
   // matching non-streaming branch and the docstring on
   // `AnthropicUsage` for the wire-format rationale.
-  mergeTimingUsageExtensions(usage, performance, inputTokens, outputTokens, cachedTokens, serverTiming);
+  mergeTimingUsageExtensions(usage, performance, inputTokens, outputTokens, cachedTokens, serverTiming, prefill);
   return {
     type: 'message_delta',
     delta: {

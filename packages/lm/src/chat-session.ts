@@ -290,7 +290,7 @@ export function mtpOnByDefault(model: SessionCapableModel): boolean {
  * unwrapped (NAPI surfaces `Error.from_reason` as `Error.message`
  * verbatim), so a `startsWith` match is exact.
  */
-function isMediaHeldRestartError(err: unknown): boolean {
+export function isMediaHeldRestartError(err: unknown): boolean {
   return err instanceof Error && err.message.startsWith(IMAGE_CHANGE_RESTART_PREFIX);
 }
 
