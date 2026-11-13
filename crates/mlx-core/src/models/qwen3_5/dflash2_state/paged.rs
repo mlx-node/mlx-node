@@ -96,6 +96,10 @@ pub(crate) struct TurnStates {
     /// The lane's rolling checkpoint and its publication.
     pub(crate) latest_checkpoint: Option<(EntryId, u64)>,
     pub(crate) cache_salt: u64,
+    /// Per-block image keys of the turn's lineage, none on a text chain
+    /// (Splash `CacheIdentity::images`): its blocks register and its states
+    /// publish under them.
+    pub(crate) extra_keys: Vec<Vec<u64>>,
     /// The KV hit the admission found a state below, 0 for none (Splash
     /// `CacheLookup::junctionBoundary`).
     pub(crate) junction: u32,

@@ -26,6 +26,12 @@
 //! restarts. Without it P3 resumes at the checkpoint or prefills cold, and
 //! the run prints which.
 //!
+//! The image case runs a conversation over `examples/ocr.png` (every
+//! Qwen3.5 checkpoint loads its vision tower): after the restart the same
+//! conversation over a second image of the same size, whose placeholder ids
+//! are the first one's, restores nothing, and the one over the first image
+//! resumes at A's replay point and decodes as a cold run does.
+//!
 //! ```shell
 //! MLX_TEST_MODEL_PATH=/path/to/qwen3.5-0.8b-mlx-bf16 \
 //!     cargo test -p mlx-core --test qwen3_5_state_tier_restart -- --ignored --nocapture
@@ -41,6 +47,29 @@ use mlx_core::tokenizer::ChatMessage;
 const FIXED_ANSWER: &str = "The access code is BLUE-HERON-4471.";
 const BLOCK: u32 = 16;
 const CHECKPOINT: u32 = 4096;
+
+fn image_message(content: &str, image: &[u8]) -> ChatMessage {
+    ChatMessage {
+        images: Some(vec![napi::bindgen_prelude::Uint8Array::new(image.to_vec())]),
+        ..message("user", content)
+    }
+}
+
+/// `examples/ocr.png`, and a second PNG of its size with every pixel
+/// inverted: the same placeholder ids, another image.
+fn images() -> (Vec<u8>, Vec<u8>) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ocr.png");
+    let first = std::fs::read(&path).expect("examples/ocr.png");
+    let mut other = image::load_from_memory(&first)
+        .expect("decode the image")
+        .to_rgb8();
+    image::imageops::invert(&mut other);
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    other
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .expect("encode the other image");
+    (first, encoded.into_inner())
+}
 
 fn message(role: &str, content: &str) -> ChatMessage {
     ChatMessage {
@@ -414,5 +443,137 @@ async fn conversation_resumes_after_a_restart(decode: Decode) {
     }
     third.dispose().await.expect("dispose D");
     drop(third);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The image case: C (cache off) is the cold reference of P2, A publishes
+/// P1's replay point over image X and closes cleanly, B takes it back and
+/// first runs P2 over image Y (same size, so the same placeholder ids),
+/// which restores nothing and leaves X's state, then P2 over X, which
+/// resumes at A's replay point and decodes as C did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 dense checkpoint"]
+async fn image_conversation_resumes_after_a_restart() {
+    let Some(path) = source() else {
+        return;
+    };
+    mlx_core::tracing::try_init_tracing();
+    let decode = Decode::Autoregressive;
+    let root = std::env::temp_dir().join(format!(
+        "mlx-state-tier-restart-{}-image",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("cache root");
+    let persistent = || Qwen35LoadOptions {
+        persistent_cache: Some(true),
+        cache_dir: Some(root.to_string_lossy().to_string()),
+        ..Qwen35LoadOptions::default()
+    };
+    let (x, y) = images();
+    let q1 = format!(
+        "{}\n\nRead the text in the image, then tell me the access code. Answer briefly.",
+        document(40)
+    );
+    let p1 = |image: &[u8]| vec![image_message(&q1, image)];
+    let p2 = |image: &[u8]| {
+        vec![
+            image_message(&q1, image),
+            message("assistant", FIXED_ANSWER),
+            message("user", "Which paragraph holds it? Answer with its number."),
+        ]
+    };
+
+    let reference = load(
+        &path,
+        Qwen35LoadOptions {
+            cache_disk: Some("0".to_string()),
+            ..Qwen35LoadOptions::default()
+        },
+    )
+    .await;
+    let cold = turn(&reference, p2(&x), decode, false).await;
+    assert_eq!(cold.cached_tokens, 0);
+    reference.dispose().await.expect("dispose C");
+    drop(reference);
+
+    let first = load(&path, persistent()).await;
+    let one = turn(&first, p1(&x), decode, false).await;
+    let captured = status_once(&first, |status| {
+        status.dflash2_states.replay_state_publications >= 1.0
+    })
+    .await
+    .dflash2_states;
+    eprintln!(
+        "image A: prompt {} checkpoints {} replay {} failures {}/{}",
+        one.prompt_tokens,
+        captured.checkpoint_publications,
+        captured.replay_state_publications,
+        captured.checkpoint_publication_failures,
+        captured.replay_state_publication_failures
+    );
+    assert!(captured.replay_state_publications >= 1.0);
+    assert_eq!(captured.replay_state_publication_failures, 0.0);
+    assert!(
+        first.close_cache(now_ms() + 30_000.0).await.expect("close"),
+        "the clean close wrote every waiting point"
+    );
+    first.dispose().await.expect("dispose A");
+    drop(first);
+
+    let second = load(&path, persistent()).await;
+    let other = turn(&second, p2(&y), decode, false).await;
+    eprintln!(
+        "image B: P2 over the other image cached {} of {}",
+        other.cached_tokens, other.prompt_tokens
+    );
+    assert_eq!(
+        other.prompt_tokens, cold.prompt_tokens,
+        "the same placeholder ids"
+    );
+    assert_eq!(
+        other.cached_tokens, 0,
+        "another image at the same placeholder ids restores nothing"
+    );
+    let two = turn(&second, p2(&x), decode, false).await;
+    let restored = status_once(&second, |status| {
+        let states = &status.dflash2_states;
+        states.disk_promotions + states.disk_promotions_skipped >= 1.0
+    })
+    .await
+    .dflash2_states;
+    eprintln!(
+        "image B: P2 cached {} of {} (A prompt {}); promotions {} skipped {}",
+        two.cached_tokens,
+        two.prompt_tokens,
+        one.prompt_tokens,
+        restored.disk_promotions,
+        restored.disk_promotions_skipped
+    );
+    assert!(
+        restored.disk.taken_back >= 1.0,
+        "{}",
+        restored.disk.taken_back
+    );
+    assert_eq!(two.cached_tokens % BLOCK, 0);
+    assert!(two.cached_tokens < one.prompt_tokens);
+    assert!(
+        two.cached_tokens + 64 >= one.prompt_tokens,
+        "P2 resumes at A's replay point: {} vs {}",
+        two.cached_tokens,
+        one.prompt_tokens
+    );
+    assert_eq!(
+        restored.invalidations, 0.0,
+        "the other image discarded nothing"
+    );
+    assert_eq!(restored.offload_failures, 0.0);
+    assert_eq!(
+        two.raw_text, cold.raw_text,
+        "P2 after the restart == cold P2"
+    );
+    assert_eq!(two.num_tokens, cold.num_tokens);
+    second.dispose().await.expect("dispose B");
+    drop(second);
     let _ = std::fs::remove_dir_all(&root);
 }

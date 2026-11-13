@@ -541,7 +541,9 @@ fn junction_probe<T: DFlash2Target>(
 /// Opens the DFlash2 turn's points for a lane of `tokens`, whose first
 /// `prompt` are the prompt, resuming at `resume` (Splash
 /// `Engine::configureDraftStatePlan` at admission). A turn without reuse,
-/// a draft or a pool opens an empty plan.
+/// a draft or a pool opens an empty plan. `extra_keys` are the lineage's
+/// per-block image keys; `None` keeps the lane's running turn's.
+#[allow(clippy::too_many_arguments)]
 fn open_turn<T: DFlash2Target>(
     target: &mut T,
     tokens: &[u32],
@@ -550,6 +552,7 @@ fn open_turn<T: DFlash2Target>(
     junction: u32,
     cache_salt: u64,
     reuse: bool,
+    extra_keys: Option<Vec<Vec<u64>>>,
 ) -> Result<StatePlan> {
     let plan = if reuse {
         state_plan(&*target, tokens, prompt, resume, junction)?
@@ -560,6 +563,14 @@ fn open_turn<T: DFlash2Target>(
     };
     let anchor_bytes = turn_anchor_bytes(&*target, &plan);
     let seq = target.lane_seq();
+    let extra_keys = extra_keys.unwrap_or_else(|| {
+        target
+            .dflash2_states_mut()
+            .turns
+            .get_mut(&seq)
+            .map(|turn| std::mem::take(&mut turn.extra_keys))
+            .unwrap_or_default()
+    });
     target.dflash2_states_mut().turns.insert(
         seq,
         TurnStates {
@@ -569,6 +580,7 @@ fn open_turn<T: DFlash2Target>(
             anchor_bytes,
             latest_checkpoint: None,
             cache_salt,
+            extra_keys,
             junction,
             prompt_tokens: prompt,
             reuse,
@@ -585,7 +597,7 @@ fn reopen_cold<T: DFlash2Target>(target: &mut T, tokens: &[u32], prompt: u32) ->
         .get(&target.lane_seq())
         .map(|turn| (turn.cache_salt, turn.junction, turn.reuse))
     {
-        open_turn(target, tokens, prompt, 0, junction, salt, reuse)?;
+        open_turn(target, tokens, prompt, 0, junction, salt, reuse, None)?;
     }
     Ok(())
 }
@@ -653,6 +665,7 @@ fn plan_resume<T: DFlash2Target>(
         junction,
         cache_salt,
         reuse_cache,
+        Some(Vec::new()),
     )?;
     let end = u32::try_from(tokens.len())
         .map_err(|_| Error::from_reason("DFlash2 prompt exceeds u32 tokens"))?;
@@ -932,7 +945,9 @@ pub(crate) fn turn_plan<T: DFlash2Target>(
             (turn.junction, turn.latest_checkpoint, turn.reuse)
         });
     let prompt = turn_prompt(&*target, tokens);
-    let mut plan = open_turn(target, tokens, prompt, resume, junction, cache_salt, reuse)?;
+    let mut plan = open_turn(
+        target, tokens, prompt, resume, junction, cache_salt, reuse, None,
+    )?;
     if !target.replay_state_exact() {
         plan.boundaries.clear();
     }
@@ -1340,15 +1355,25 @@ pub(crate) fn reached<T: DFlash2Target>(
     outcome: Reached<'_>,
 ) -> Result<()> {
     super::dflash2_state::disk::tick(target, super::dflash2_state::disk::Tick::Poll);
-    let Some(salt) = target
+    let Some((salt, image_keys)) = target
         .dflash2_states()
         .turns
         .get(&target.lane_seq())
-        .map(|turn| turn.cache_salt)
+        .map(|turn| (turn.cache_salt, !turn.extra_keys.is_empty()))
     else {
         return Ok(());
     };
-    let keys = target.paged_block_keys(row as usize);
+    let keys = if image_keys {
+        let blocks = target.paged_adapter_ref().map_or(0, |adapter| {
+            row as usize / adapter.block_size().max(1) as usize
+        });
+        let turn = &target.dflash2_states().turns[&target.lane_seq()];
+        (0..blocks)
+            .map(|block| turn.extra_keys.get(block).cloned().unwrap_or_default())
+            .collect()
+    } else {
+        target.paged_block_keys(row as usize)
+    };
     target
         .paged_adapter_mut_ref()
         .ok_or_else(|| Error::from_reason("a paged prefill lost its paged adapter"))?
@@ -1442,7 +1467,12 @@ fn publish_point<T: DFlash2Target>(
     } else {
         CaptureClass::Ordinary
     };
-    let text = Lineage::text(lineage, turn.cache_salt);
+    let extra_keys = turn.extra_keys.clone();
+    let text = Lineage {
+        tokens: lineage,
+        extra_keys: &extra_keys,
+        salt: turn.cache_salt,
+    };
     let (block, stored) = target.dflash2_states().store.locate(text);
     let registered = target
         .paged_adapter_ref()
@@ -2039,10 +2069,12 @@ impl crate::models::qwen3_5::paged_forward::PrefillTapSink for LaneStateSink {
 /// disk copy resident under an optional claim (Splash `promotedCopy`), a
 /// checkpoint the lane's rolling one, and the prompt's replay point the
 /// turn's own, in use until the turn ends. A lane whose GDN state is not
-/// exact on a text chain plans no point.
+/// exact on its chain plans no point. `extra_keys` are the lineage's
+/// per-block image keys (an image turn's), none on a text chain.
 pub(crate) fn open_lane_turn<T: DFlash2Target>(
     target: &mut T,
     tokens: &[u32],
+    extra_keys: &[Vec<u64>],
     cached: usize,
     cache_salt: u64,
     reuse: bool,
@@ -2056,7 +2088,16 @@ pub(crate) fn open_lane_turn<T: DFlash2Target>(
         .map_err(|_| Error::from_reason("a prime's prefix exceeds u32 tokens"))?;
     let prompt = u32::try_from(tokens.len())
         .map_err(|_| Error::from_reason("a prompt exceeds u32 tokens"))?;
-    let plan = open_turn(target, tokens, prompt, resume, 0, cache_salt, reuse)?;
+    let plan = open_turn(
+        target,
+        tokens,
+        prompt,
+        resume,
+        0,
+        cache_salt,
+        reuse,
+        Some(extra_keys.to_vec()),
+    )?;
     if !target.replay_state_exact()
         && let Some(turn) = target.dflash2_states_mut().turns.get_mut(&seq)
     {
@@ -2099,6 +2140,123 @@ pub(crate) fn open_lane_turn<T: DFlash2Target>(
         states.use_replay_point(seq, id);
     }
     Ok(())
+}
+
+/// Splash `configureDraftStatePlan` and `publishReachedStateBoundaries` for
+/// an image request: the image prefill of `tokens` from `cached` opens the
+/// lane's turn on its image lineage (`extra_keys`) and runs `prefill` with
+/// the turn's sink, so its chunks reach the plan's points. `restored` is the
+/// stored state a prime installed at `cached`. On a draft load the states
+/// carry the draft window the same forward's taps fill, the restored
+/// state's window first in the lane; `take_draft` and `give_draft` move the
+/// draft off the model for the prefill. An image turn decodes
+/// autoregressively, so the draft ring goes back to the idle lane.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn image_lane_prefill<T, L, R>(
+    target: &mut T,
+    tokens: &[u32],
+    extra_keys: &[Vec<u64>],
+    cached: u32,
+    cache_salt: u64,
+    reuse: bool,
+    restored: Option<EntryId>,
+    chunk_rows: i32,
+    take_draft: impl FnOnce(&mut T) -> Option<DFlash2Model>,
+    give_draft: impl FnOnce(&mut T, DFlash2Model),
+    prefill: impl FnOnce(
+        &mut dyn crate::models::qwen3_5::paged_forward::PrefillTarget<L>,
+        &mut dyn crate::models::qwen3_5::paged_forward::PrefillTapSink,
+    ) -> Result<R>,
+) -> Result<R>
+where
+    T: DFlash2Target + crate::models::qwen3_5::paged_forward::PrefillTarget<L>,
+{
+    let cached_rows = cached as usize;
+    let resumed = restored.filter(|&id| {
+        cached > 0
+            && target
+                .dflash2_states()
+                .store
+                .get(id)
+                .is_some_and(|entry| entry.depth() == cached_rows)
+    });
+    let draft_config = target.dflash2().map(|draft| draft.config.clone());
+    if let Some(config) = draft_config.as_ref() {
+        let mut lane = target.dflash2_states_mut().idle_lane.take_window(config)?;
+        if let Some(id) = resumed {
+            restored_window(target, id, &mut lane);
+        }
+        target.dflash2_states_mut().lane_window = Some(lane);
+    }
+    open_lane_turn(
+        target,
+        tokens,
+        extra_keys,
+        cached_rows,
+        cache_salt,
+        reuse,
+        resumed,
+    )?;
+    let captures = lane_command_breaks(target, cached_rows, tokens.len(), chunk_rows);
+    let Some(config) = draft_config else {
+        let mut sink = LaneStateSink::new(&captures);
+        return prefill(&mut LanePrefill(target), &mut sink);
+    };
+    let plan = target
+        .dflash2_states()
+        .turns
+        .get(&target.lane_seq())
+        .map(|turn| turn.plan.clone())
+        .unwrap_or_default();
+    let states = target.dflash2_states_mut();
+    let lane = match states.lane_window.take() {
+        Some(lane) => lane,
+        None => states.idle_lane.take_window(&config)?,
+    };
+    let mut ring = states.idle_lane.take_ring(&config);
+    ring.reset();
+    let Some(model) = take_draft(target) else {
+        let idle = &mut target.dflash2_states_mut().idle_lane;
+        idle.give_window(Some(lane));
+        idle.give_ring(Some(ring));
+        return Err(Error::from_reason(
+            "an image prefill lost its DFlash2 draft",
+        ));
+    };
+    let prefilled = ring
+        .record_only(&tokens[..cached_rows])
+        .and_then(|()| DraftTapSink::new(&model, ring, lane, tokens, cached_rows, &plan, &captures))
+        .and_then(|mut sink| {
+            let prefilled = prefill(&mut LanePrefill(&mut *target), &mut sink);
+            let (ring, lane) = sink.into_parts();
+            let idle = &mut target.dflash2_states_mut().idle_lane;
+            idle.give_window(lane);
+            idle.give_ring(Some(ring));
+            prefilled
+        });
+    give_draft(target, model);
+    prefilled
+}
+
+/// Puts the context window of stored state `id` into `lane`, which then
+/// ends at the state's row; an empty window when it does not read back.
+fn restored_window<T: DFlash2Target>(target: &mut T, id: EntryId, lane: &mut DraftContextWindow) {
+    let ram = target
+        .dflash2_states()
+        .store
+        .get(id)
+        .and_then(|entry| entry.ram())
+        .map(|anchor| match anchor.window.as_ref() {
+            Some(window) => lane.copy_from(window).is_ok(),
+            None => false,
+        });
+    let filled = match ram {
+        Some(filled) => filled,
+        None => disk::read_state(target, id, Some(lane)).is_some(),
+    };
+    if !filled {
+        lane.restart(0);
+    }
 }
 
 /// Splash `reserveCaptures` over one prefill command of the lane's turn,

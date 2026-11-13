@@ -196,11 +196,20 @@ pub(crate) fn raw_text_with_reasoning_suppressed(
     tools::strip_reasoning_preserving_tools(text)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The token ids the last result finalized on this thread decoded.
+    pub(crate) static LAST_GENERATED: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub(crate) fn finalize_chat_result_with(
     args: FinalizeArgs<'_>,
     parse: impl FnOnce(&str, &FinalizeArgs<'_>) -> (String, Vec<tools::ToolCallResult>, Option<String>),
     scrub: impl FnOnce(&str, &FinalizeArgs<'_>) -> String,
 ) -> Result<ChatResult> {
+    #[cfg(test)]
+    LAST_GENERATED.with(|last| *last.borrow_mut() = args.generated_tokens.to_vec());
     let text = args
         .tokenizer
         .decode_sync(args.generated_tokens, true)

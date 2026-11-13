@@ -2580,3 +2580,130 @@ fn moe_scheduled_mtp_prefill_publishes_its_plan() -> Result<()> {
     moe_small_plan(false);
     result
 }
+
+/// One MoE image turn of `tokens` over image `hash` (rows 4..36) as the VLM
+/// core runs it: the image-aware prepare, the lane's prefill and the
+/// finalize, the merge standing in as the token embeddings on a text
+/// M-RoPE grid. Returns the prefix the turn resumed at.
+fn moe_image_turn(inner: &mut Qwen35MoeInner, tokens: &[u32], hash: u64) -> Result<u32> {
+    let positions: Vec<(u32, u64)> = (4..36).map(|row| (row, hash)).collect();
+    let keys = crate::engine::build_paged_extra_keys(tokens.len(), 16, &positions);
+    let len = tokens.len() as u32;
+    let resolution =
+        inner.prepare_moe_vlm_paged_prefix(tokens, len, 16, &keys, true, false, hash)?;
+    let cached = resolution.effective_plan.cached_prefix_len;
+    let rows = tokens.len() as i64;
+    let merge = crate::engine::vision::VisionMerge {
+        inputs_embeds: inner
+            .embedding
+            .forward(&MxArray::from_uint32(tokens, &[1, rows])?)?,
+        position_ids: MxArray::from_int32(
+            &(0..3).flat_map(|_| 0..len as i32).collect::<Vec<_>>(),
+            &[3, 1, rows],
+        )?,
+        rope_deltas: 0,
+    };
+    let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
+        inner.config.num_layers as usize,
+        |i| inner.config.is_linear_layer(i),
+    );
+    let (logits, rungs) = inner.vlm_lane_prefill(
+        tokens,
+        &keys,
+        &merge,
+        cached,
+        resolution.gdn_prefix_already_primed,
+        true,
+        &layer_kinds,
+    )?;
+    logits.eval();
+    inner.publish_moe_gdn_materialized_prefix_checkpoint(tokens, &keys, 0, rungs);
+    inner.finalize_moe_manual_paged_turn(&positions, 0)?;
+    Ok(cached)
+}
+
+/// [`crate::models::qwen3_5::model`]'s
+/// `image_restart_restores_only_the_same_image` on a MoE load: the image
+/// turn publishes under its blocks' image keys, and after a restart only a
+/// turn over the same image resumes at the replay point (128).
+/// Mutations VK4m (the MoE image prepare arms no disk restore) and VK5m
+/// (the MoE image prefill keeps no sink) → red.
+#[test]
+fn moe_image_restart_restores_only_the_same_image() -> Result<()> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::persistent_test_tier;
+    const TEST: &str = "moe_image_restart_restores_only_the_same_image";
+    const IMAGE: u64 = 0xA11C_E011;
+    let tier = persistent_test_tier("s13-moe-image-restart", 1 << 30);
+    let Some(mut first) = plain_moe_on(&tier, TEST) else {
+        return Ok(());
+    };
+    moe_small_plan(true);
+    let result = (|| -> Result<()> {
+        let tokens: Vec<u32> = (0..140).map(|i| (i * 7 + 3) % 13 + 1).collect();
+        assert_eq!(moe_image_turn(&mut first, &tokens, IMAGE)?, 0);
+        let counters = first.dflash2_states.counters;
+        assert_eq!(
+            (
+                counters.checkpoint_publications,
+                counters.replay_state_publications
+            ),
+            (1, 1)
+        );
+        assert!(
+            first
+                .dflash2_states
+                .store
+                .entries()
+                .all(|entry| entry.extra_keys().len() == 3),
+            "every state carries the image keys"
+        );
+        assert!(first.dflash2_states.turns.is_empty(), "the turn ended");
+        let stored = moe_cell_at(&first, 128);
+        assert!(crate::models::qwen3_5::dflash2_state::disk::close_cache(
+            &mut first,
+            std::time::Instant::now() + std::time::Duration::from_secs(30)
+        ));
+        drop(first);
+
+        let tier = tier.reopen("s13-moe-image-restart", 1 << 30);
+        let Some(mut second) = plain_moe_on(&tier, TEST) else {
+            return Ok(());
+        };
+        assert_eq!(
+            crate::models::qwen3_5::dflash2_state::disk::adopt_all(&mut second),
+            1
+        );
+        let adopted = second
+            .dflash2_states
+            .store
+            .entries()
+            .next()
+            .map(|entry| entry.id())
+            .expect("the adopted state");
+        assert_eq!(moe_image_turn(&mut second, &tokens, 0xB0B0_E012)?, 0);
+        assert!(second.dflash2_states.store.get(adopted).is_some());
+        assert_eq!(moe_image_turn(&mut second, &tokens, IMAGE)?, 128);
+        let disk = second.dflash2_states.disk.as_ref().expect("tier");
+        assert_eq!(
+            disk.counters.promotions + disk.counters.promotions_skipped,
+            1
+        );
+        assert_eq!(disk.counters.invalidations, 0);
+        let anchor = second
+            .dflash2_states
+            .store
+            .get(adopted)
+            .and_then(|entry| entry.ram())
+            .expect("the promoted state");
+        let cell = crate::models::qwen3_5::dflash2_state::disk::encode_anchor(
+            &second.dflash2_states,
+            &second.config.to_dense_config(),
+            anchor,
+        )
+        .expect("an encoded cell");
+        assert_eq!(cell, stored);
+        Ok(())
+    })();
+    moe_small_plan(false);
+    result
+}

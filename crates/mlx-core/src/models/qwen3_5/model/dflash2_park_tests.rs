@@ -1982,6 +1982,7 @@ fn warning_holds_back_publications_not_the_lane() -> Result<()> {
             anchor_bytes: anchor(&inner).state_bytes(),
             latest_checkpoint: None,
             cache_salt: 0,
+            extra_keys: Vec::new(),
             junction: 0,
             prompt_tokens: row + 1,
             reuse: true,

@@ -552,7 +552,8 @@ pub(crate) fn media_prefill_ranges(
 ) -> Vec<Range<usize>> {
     paged_prefill_ranges(
         suffix_len,
-        crate::models::forward::paged_prefill_chunk_rows(),
+        prefill_chunk_rows(crate::models::forward::paged_prefill_chunk_rows() as i32).max(1)
+            as usize,
         &checkpoint_suffix_offsets(checkpoint_boundaries, cached_prefix_len),
     )
 }
@@ -1121,6 +1122,10 @@ fn run_paged_prefill_single_shot(
 /// position-zero prefill; replaying only the recurrent layers would omit the
 /// intervening attention/MLP residual stream and create a state that never
 /// existed in the original image prefill.
+///
+/// With `taps` the chunks book through `target` and reach the turn's state
+/// points as a text prefill's do (Splash `publishReachedStateBoundaries`
+/// runs for an image request too).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_paged_vlm_prefill(
     expanded_tokens: &[u32],
@@ -1128,13 +1133,10 @@ pub(crate) fn run_paged_vlm_prefill(
     cached_prefix_len: u32,
     gdn_prefix_already_primed: bool,
     embed: &Embedding,
-    layers: &mut [DecoderLayer],
-    caches: &mut [Qwen3_5LayerCache],
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
+    target: &mut dyn PrefillTarget<DecoderLayer>,
     layer_kinds: &[Qwen3_5LayerKind],
-    paged_adapter: &mut PagedKVCacheAdapter,
     turn_cancel: Option<&AtomicBool>,
+    mut taps: Option<&mut dyn PrefillTapSink>,
 ) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if expanded_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -1160,7 +1162,7 @@ pub(crate) fn run_paged_vlm_prefill(
             prompt_len, embed_len, position_len
         )));
     }
-    let adapter_prefix_len = paged_adapter.current_token_count();
+    let adapter_prefix_len = target.parts()?.adapter.current_token_count();
     if adapter_prefix_len != cached_prefix_len {
         return Err(Error::from_reason(format!(
             "run_paged_vlm_prefill adapter prefix mismatch: adapter={} requested={}",
@@ -1176,9 +1178,14 @@ pub(crate) fn run_paged_vlm_prefill(
     // Past the guard the recurrent half is exact by construction (an image
     // prefix is never replayed from token ids — the caller restarts cold
     // instead), so the adapter's obligation is discharged here.
-    paged_adapter
-        .confirm_aux_prefix_primed(cached_prefix_len)
-        .map_err(Error::from_reason)?;
+    let block_size = {
+        let parts = target.parts()?;
+        parts
+            .adapter
+            .confirm_aux_prefix_primed(cached_prefix_len)
+            .map_err(Error::from_reason)?;
+        parts.adapter.block_size()
+    };
 
     let suffix_tokens = &expanded_tokens[cached_prefix_len_us..];
     crate::engine::progress::with_turn_progress(|p| {
@@ -1186,21 +1193,26 @@ pub(crate) fn run_paged_vlm_prefill(
     });
     // Image-aware KV reuse also needs an exact recurrent sidecar: split once at
     // the reusable block boundary so a later non-live image-prefix hit remains
-    // exact.
-    // A media turn never writes a cold sidecar, so it keeps the single deepest
-    // boundary rather than a ladder: the extra rungs would only cost memory.
+    // exact. A media turn keeps the single deepest boundary rather than a
+    // ladder: the extra rungs would only cost memory.
     let checkpoint_boundaries: Vec<u32> =
-        gdn_checkpoint_target(prompt_len, cached_prefix_len, paged_adapter.block_size())
+        gdn_checkpoint_target(prompt_len, cached_prefix_len, block_size)
             .into_iter()
             .collect();
-    let chunk_ranges = media_prefill_ranges(
-        suffix_tokens.len(),
+    let capture_rows = capture_rows_of(taps.as_deref());
+    let breaks = prefill_breaks(
         &checkpoint_boundaries,
+        &capture_rows,
         cached_prefix_len,
+        prompt_len,
     );
+    let chunk_ranges = media_prefill_ranges(suffix_tokens.len(), &breaks, cached_prefix_len);
     let total_chunks = chunk_ranges.len();
     let mut last_logits = None;
     let mut checkpoints = Vec::new();
+    let tap_layers = taps
+        .as_deref()
+        .map_or_else(Vec::new, |sink| sink.tap_layers().to_vec());
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
         // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary.
@@ -1221,47 +1233,70 @@ pub(crate) fn run_paged_vlm_prefill(
                 .position_ids
                 .slice_axis(2, absolute_start as i64, absolute_end as i64)?;
 
-        paged_adapter
-            .record_tokens(chunk_tokens)
-            .map_err(Error::from_reason)?;
-        let hidden_states = run_paged_prefill_one_chunk(
+        let context_after = absolute_end as u32;
+        let is_last_chunk = chunk_idx + 1 == total_chunks;
+        let grant = book_chunk(
+            target,
+            taps.as_deref_mut(),
+            &capture_rows,
+            chunk_tokens,
+            context_after,
+            absolute_end >= prompt_len,
+        )?;
+        let parts = target.parts()?;
+        let (hidden_states, chunk_taps) = run_paged_prefill_one_chunk_tapped(
             chunk_tokens,
             absolute_start as u32,
             embed,
-            layers,
-            caches,
+            parts.layers,
+            parts.caches,
             layer_kinds,
-            paged_adapter,
+            parts.adapter,
             Some(&chunk_embeds),
             Some(&chunk_positions),
             // The explicit M-RoPE grid is authoritative for image prefill.
             0,
+            &tap_layers,
         )?;
+        if let Some(sink) = taps.as_deref_mut() {
+            sink.chunk(absolute_start, chunk_tokens, &chunk_taps)?;
+        }
 
-        let context_after = absolute_end as u32;
         let capture_checkpoint = checkpoint_boundaries.contains(&context_after);
-        let is_last_chunk = chunk_idx + 1 == total_chunks;
         if is_last_chunk {
             last_logits = Some(project_last_token_logits(
                 &hidden_states,
-                final_norm,
-                lm_head,
+                parts.final_norm,
+                parts.lm_head,
                 embed,
             )?);
         } else {
             MxArray::eval_arrays_with_context(&[&hidden_states], "paged_prefill_chunk")?;
+            if let Some(sink) = taps.as_deref() {
+                sink.eval()?;
+            }
         }
         if capture_checkpoint {
-            materialize_linear_layer_caches(caches)?;
-            if let Some(caches) = snapshot_materialized_linear_layer_caches(caches) {
+            materialize_linear_layer_caches(parts.caches)?;
+            if let Some(caches) = snapshot_materialized_linear_layer_caches(parts.caches) {
                 checkpoints.push(MaterializedGdnPrefixCheckpoint {
                     prefix_len: context_after,
                     caches,
                 });
             }
         }
+        if grant.as_ref().is_some_and(CaptureGrant::armed)
+            && let Some(sink) = taps.as_deref_mut()
+        {
+            capture_chunk_linear(parts.caches, sink, context_after, capture_checkpoint)?;
+        }
         if !is_last_chunk {
             crate::array::synchronize_and_clear_cache();
+        }
+        if !is_last_chunk || grant.is_some() {
+            reach_chunk(target, taps.as_deref_mut(), context_after, grant)?;
+        }
+        if !is_last_chunk {
             crate::engine::progress::with_turn_progress(|p| {
                 p.prefill_advanced(context_after - cached_prefix_len)
             });
@@ -1646,37 +1681,8 @@ fn run_paged_prefill_single_shot_with_hidden(
 /// `position_ids` is the per-chunk M-RoPE slice `[3, 1, T]` (full-attention
 /// layers only); both are `None` on the text-only path, which is byte-identical
 /// to the prior behaviour.
-#[allow(clippy::too_many_arguments)]
-fn run_paged_prefill_one_chunk(
-    chunk_tokens: &[u32],
-    chunk_first_position: u32,
-    embed: &Embedding,
-    layers: &mut [DecoderLayer],
-    caches: &mut [Qwen3_5LayerCache],
-    layer_kinds: &[Qwen3_5LayerKind],
-    paged_adapter: &mut PagedKVCacheAdapter,
-    inputs_embeds: Option<&MxArray>,
-    position_ids: Option<&MxArray>,
-    cached_rope_deltas: i32,
-) -> Result<MxArray> {
-    run_paged_prefill_one_chunk_tapped(
-        chunk_tokens,
-        chunk_first_position,
-        embed,
-        layers,
-        caches,
-        layer_kinds,
-        paged_adapter,
-        inputs_embeds,
-        position_ids,
-        cached_rope_deltas,
-        &[],
-    )
-    .map(|(hidden, _)| hidden)
-}
-
-/// [`run_paged_prefill_one_chunk`] that also returns the output rows of
-/// every layer in `tap_layers`, in that order.
+/// Also returns the output rows of every layer in `tap_layers`, in that
+/// order.
 #[allow(clippy::too_many_arguments)]
 fn run_paged_prefill_one_chunk_tapped(
     chunk_tokens: &[u32],

@@ -582,14 +582,33 @@ impl ColdStateLayout {
 
 /// What a persistent tier needs to adopt a state after a restart (Splash
 /// `StateLabel`), plus the lineage itself: cold KV keys and allocator hashes
-/// derive from the tokens and the block-zero salt.
+/// derive from the tokens, each block's extra keys (its images: Splash
+/// `KvBlockLabel::identity`) and the block-zero salt.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColdStateLabel {
     pub tokens: Vec<u32>,
+    /// Per whole block, from block 0; a block past the end carries none,
+    /// and the last one listed carries some.
+    pub extra_keys: Vec<Vec<u64>>,
     pub salt: u64,
     pub last_used: u64,
     pub checkpoint: bool,
 }
+
+impl ColdStateLabel {
+    fn validate(&self) -> Result<(), String> {
+        if self.extra_keys.len() > self.tokens.len()
+            || self.extra_keys.last().is_some_and(Vec::is_empty)
+        {
+            return Err("cold-cache state label extra keys are not canonical".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// The label layout a state object's header carries; an object of any other
+/// is rejected, never read as this one.
+const STATE_LABEL_FORMAT: &str = "2";
 
 /// One state write. `payload` is the tier's single staging buffer; the writer
 /// hands it back in [`Landed::State`] whatever the outcome.
@@ -608,6 +627,7 @@ impl ColdStateObject {
         if self.label.tokens.len() != self.layout.boundary_tokens as usize {
             return Err("cold-cache state label does not carry the boundary tokens".to_string());
         }
+        self.label.validate()?;
         if self.layout.payload_bytes() != Some(self.payload.len() as u64) {
             return Err("cold-cache state payload does not match its spans".to_string());
         }
@@ -1876,8 +1896,9 @@ impl ColdCacheManager {
     }
 
     /// Read the state object for `key` straight into `into`, which must be
-    /// exactly `expected`'s payload. A sound object whose spans, geometry or
-    /// boundary differ from `expected` is a miss that stays on disk (Splash
+    /// exactly `expected`'s payload. A sound object whose spans, geometry,
+    /// boundary or block extra keys differ from `expected` and `extra_keys`
+    /// is a miss that stays on disk (Splash
     /// `QwenStateStorage::adopt`: the payload must be `cachedBytes`); a
     /// damaged one is a miss, a corruption, and is pruned. On `None` the
     /// contents of `into` are unspecified.
@@ -1886,13 +1907,14 @@ impl ColdCacheManager {
         key: ColdCacheKey,
         fingerprint: ColdCacheFingerprint,
         expected: &ColdStateLayout,
+        extra_keys: &[Vec<u64>],
         into: &mut [u8],
     ) -> Option<ColdStateLabel> {
         if expected.validate().is_err() || expected.payload_bytes() != Some(into.len() as u64) {
             self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let cap = state_header_bound(expected);
+        let cap = state_header_bound(expected, extra_keys);
         self.load_object_with(key, ColdGroup::DFlash2State, true, |file| {
             let Ok(header) = read_state_header(file, key, fingerprint, cap) else {
                 return ObjectRead::Corrupt;
@@ -1900,6 +1922,7 @@ impl ColdCacheManager {
             if header.layout.boundary_tokens != expected.boundary_tokens
                 || header.layout.geometry != expected.geometry
                 || header.layout.spans != expected.spans
+                || header.label.extra_keys != extra_keys
             {
                 return ObjectRead::Mismatch;
             }
@@ -3183,6 +3206,49 @@ fn tokens_from_hex(value: &str) -> Option<Vec<u32>> {
     Some(tokens)
 }
 
+/// Each block's extra keys as 16 hex digits apiece (little-endian bytes),
+/// blocks separated by `;`.
+fn extra_keys_hex(blocks: &[Vec<u64>]) -> String {
+    let mut out = String::new();
+    for (index, keys) in blocks.iter().enumerate() {
+        if index > 0 {
+            out.push(';');
+        }
+        for key in keys {
+            out.push_str(&hex_encode(&key.to_le_bytes()));
+        }
+    }
+    out
+}
+
+fn extra_keys_from_hex(value: &str) -> Option<Vec<Vec<u64>>> {
+    if value.is_empty() {
+        return Some(Vec::new());
+    }
+    let nibble = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    let mut blocks = Vec::new();
+    for block in value.split(';') {
+        let bytes = block.as_bytes();
+        if !bytes.len().is_multiple_of(16) {
+            return None;
+        }
+        let mut keys = Vec::with_capacity(bytes.len() / 16);
+        for chunk in bytes.as_chunks::<16>().0 {
+            let mut le = [0u8; 8];
+            for (slot, pair) in le.iter_mut().zip(chunk.as_chunks::<2>().0) {
+                *slot = nibble(pair[0])? << 4 | nibble(pair[1])?;
+            }
+            keys.push(u64::from_le_bytes(le));
+        }
+        blocks.push(keys);
+    }
+    Some(blocks)
+}
+
 /// The safetensors container of a state object: the 8-byte length, then the
 /// JSON header (written here in a fixed order, so its length depends on the
 /// layout and label alone), space-padded to 8 bytes. One `U8` tensor per
@@ -3200,8 +3266,9 @@ fn state_header(
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    let fields: [(&str, String); 12] = [
+    let fields: [(&str, String); 14] = [
         ("abi", CACHE_ABI.to_string()),
+        ("label_format", STATE_LABEL_FORMAT.to_string()),
         ("group", ColdGroup::DFlash2State.label().to_string()),
         ("key", key.to_hex()),
         ("fingerprint", fingerprint.to_hex()),
@@ -3210,6 +3277,7 @@ fn state_header(
         ("spans", spans),
         ("geometry", layout.geometry.clone()),
         ("tokens", tokens_hex(&label.tokens)),
+        ("extra_keys", extra_keys_hex(&label.extra_keys)),
         ("salt", label.salt.to_string()),
         ("last_used", label.last_used.to_string()),
         ("checkpoint", label.checkpoint.to_string()),
@@ -3264,11 +3332,13 @@ pub fn block_object_bytes(pool: &LayerKVPool) -> u64 {
     max_encoded_len_for_pool(pool)
 }
 
-/// The longest header any label of `layout` can have: the read bound, with
-/// the payload, of [`ColdCacheManager::load_state`].
-fn state_header_bound(layout: &ColdStateLayout) -> u64 {
+/// The longest header any label of `layout` whose blocks carry
+/// `extra_keys` can have: the read bound, with the payload, of
+/// [`ColdCacheManager::load_state`].
+fn state_header_bound(layout: &ColdStateLayout, extra_keys: &[Vec<u64>]) -> u64 {
     let widest = ColdStateLabel {
         tokens: vec![u32::MAX; layout.boundary_tokens as usize],
+        extra_keys: extra_keys.to_vec(),
         salt: u64::MAX,
         last_used: u64::MAX,
         checkpoint: false,
@@ -3280,7 +3350,7 @@ fn state_header_bound(layout: &ColdStateLayout) -> u64 {
 /// label that no longer matches its payload is damage, not a different state.
 fn state_checksum_prefix(layout: &ColdStateLayout, label: &ColdStateLabel) -> Sha256 {
     let mut hasher = Sha256::new();
-    hasher.update(b"mlx-node:cold-state-payload:v1\0");
+    hasher.update(b"mlx-node:cold-state-payload:v2\0");
     hasher.update(layout.boundary_tokens.to_le_bytes());
     hasher.update((layout.spans.len() as u64).to_le_bytes());
     for span in &layout.spans {
@@ -3291,6 +3361,13 @@ fn state_checksum_prefix(layout: &ColdStateLayout, label: &ColdStateLabel) -> Sh
     hasher.update((label.tokens.len() as u64).to_le_bytes());
     for token in &label.tokens {
         hasher.update(token.to_le_bytes());
+    }
+    hasher.update((label.extra_keys.len() as u64).to_le_bytes());
+    for keys in &label.extra_keys {
+        hasher.update((keys.len() as u64).to_le_bytes());
+        for key in keys {
+            hasher.update(key.to_le_bytes());
+        }
     }
     hasher.update(label.salt.to_le_bytes());
     hasher.update(label.last_used.to_le_bytes());
@@ -3330,6 +3407,7 @@ fn read_state_header(
             .ok_or_else(|| format!("cold-cache state metadata `{name}` missing"))
     };
     if get("abi")? != CACHE_ABI
+        || get("label_format")? != STATE_LABEL_FORMAT
         || get("group")? != ColdGroup::DFlash2State.label()
         || get("key")? != key.to_hex()
         || get("fingerprint")? != fingerprint.to_hex()
@@ -3354,6 +3432,7 @@ fn read_state_header(
     layout.validate()?;
     let label = ColdStateLabel {
         tokens: tokens_from_hex(get("tokens")?).ok_or_else(|| invalid("tokens"))?,
+        extra_keys: extra_keys_from_hex(get("extra_keys")?).ok_or_else(|| invalid("extra_keys"))?,
         salt: get("salt")?.parse::<u64>().map_err(|_| invalid("salt"))?,
         last_used: get("last_used")?
             .parse::<u64>()
@@ -3367,6 +3446,7 @@ fn read_state_header(
     if label.tokens.len() != layout.boundary_tokens as usize {
         return Err("cold-cache state label does not carry the boundary tokens".to_string());
     }
+    label.validate()?;
     if parsed.tensors().len() != layout.spans.len() {
         return Err("cold-cache state tensor count does not match its spans".to_string());
     }
@@ -9440,6 +9520,7 @@ mod tests {
     fn state_label() -> ColdStateLabel {
         ColdStateLabel {
             tokens: vec![1, 2, 3, 4],
+            extra_keys: Vec::new(),
             salt: 7,
             last_used: 42,
             checkpoint: true,
@@ -9597,7 +9678,7 @@ mod tests {
 
         let mut into = vec![0u8; 160];
         assert_eq!(
-            manager.load_state(key, fingerprint(), &layout, &mut into),
+            manager.load_state(key, fingerprint(), &layout, &[], &mut into),
             Some(label.clone())
         );
         assert_eq!(into, payload);
@@ -9611,7 +9692,7 @@ mod tests {
         let wider = state_layout(vec![96, 65]);
         let mut wider_into = vec![0u8; 161];
         assert_eq!(
-            manager.load_state(key, fingerprint(), &wider, &mut wider_into),
+            manager.load_state(key, fingerprint(), &wider, &[], &mut wider_into),
             None
         );
         assert_eq!(manager.stats().misses, misses + 1);
@@ -9620,7 +9701,7 @@ mod tests {
             ..layout.clone()
         };
         assert_eq!(
-            manager.load_state(key, fingerprint(), &other, &mut into),
+            manager.load_state(key, fingerprint(), &other, &[], &mut into),
             None
         );
         assert_eq!(manager.stats().misses, misses + 2);
@@ -9630,6 +9711,60 @@ mod tests {
             root.join(object_file_name(&key, ColdGroup::DFlash2State))
                 .exists()
         );
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // A state's label carries its blocks' image keys (Splash `KvBlockLabel`
+    // keeps a block's identity): they come back with the header, a read
+    // expecting other keys is a miss that leaves the object, and an object
+    // whose label layout is not this build's is rejected, not read as one.
+    // Mutation LF1 (the reader skips the label format) → red.
+    #[test]
+    fn state_label_carries_image_keys_and_rejects_another_format() {
+        let root = temp_root("state-image-keys");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let key = state_key(3);
+        let mut object = state_object(key, vec![96, 64]);
+        object.label.extra_keys = vec![Vec::new(), vec![5, u64::MAX]];
+        let (layout, label, payload) = (
+            object.layout.clone(),
+            object.label.clone(),
+            object.payload.clone(),
+        );
+        let (tx, rx) = mpsc::channel();
+        manager.enqueue_state(object, MakeRoom::Evict, tx).unwrap();
+        assert!(matches!(landed(&rx), Landed::State { ok: true, .. }));
+        assert_eq!(
+            manager.state_label(key, fingerprint()),
+            Some((layout.clone(), label.clone()))
+        );
+        let mut into = vec![0u8; 160];
+        let keys = label.extra_keys.clone();
+        assert_eq!(
+            manager.load_state(key, fingerprint(), &layout, &keys, &mut into),
+            Some(label.clone())
+        );
+        assert_eq!(into, payload);
+        assert_eq!(
+            manager.load_state(key, fingerprint(), &layout, &[vec![5]], &mut into),
+            None,
+            "another image's keys do not read this state"
+        );
+        assert!(manager.contains_in(&key, ColdGroup::DFlash2State));
+        assert_eq!(manager.stats().corruptions, 0);
+
+        let path = root.join(object_file_name(&key, ColdGroup::DFlash2State));
+        let mut bytes = fs::read(&path).unwrap();
+        let field = b"\"label_format\":\"2\"";
+        let at = bytes
+            .windows(field.len())
+            .position(|window| window == field)
+            .expect("the header names its label format");
+        bytes[at + field.len() - 2] = b'1';
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(manager.state_label(key, fingerprint()), None);
+        assert_eq!(manager.stats().corruptions, 1, "an older label is rejected");
         drop(manager);
         let _ = fs::remove_dir_all(root);
     }

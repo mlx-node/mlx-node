@@ -87,6 +87,8 @@ pub(crate) struct Entry<S> {
     block_size: u32,
     salt: u64,
     tokens: Vec<u32>,
+    /// Per whole block, from block 0; blocks past the end carry none.
+    extra_keys: Vec<Vec<u64>>,
     chain: Vec<u64>,
     ram: Option<S>,
     /// The state's own bytes, its lineage aside (Splash `cachedBytes`).
@@ -110,6 +112,11 @@ impl<S> Entry<S> {
 
     pub(crate) fn tokens(&self) -> &[u32] {
         &self.tokens
+    }
+
+    /// Its blocks' image keys, the last listed one carrying some.
+    pub(crate) fn extra_keys(&self) -> &[Vec<u64>] {
+        &self.extra_keys
     }
 
     /// Chain hashes of the entry's whole blocks.
@@ -404,6 +411,15 @@ impl<S: StateBytes> HybridStateStore<S> {
         let mark = key.chain.last().copied().unwrap_or_default();
         let checkpoint = class == StateClass::Checkpoint && !self.in_use(mark);
         let lineage_bytes = lineage_bytes(lineage.tokens.len(), key.chain.len());
+        let mut extra_keys: Vec<Vec<u64>> = lineage
+            .extra_keys
+            .iter()
+            .take(key.chain.len())
+            .cloned()
+            .collect();
+        while extra_keys.last().is_some_and(Vec::is_empty) {
+            extra_keys.pop();
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.publications += 1;
@@ -413,6 +429,7 @@ impl<S: StateBytes> HybridStateStore<S> {
             block_size: self.block_size,
             salt: lineage.salt,
             tokens: lineage.tokens.to_vec(),
+            extra_keys,
             chain: key.chain,
             ram,
             cached_bytes,

@@ -221,8 +221,9 @@ impl StateDisk {
     }
 }
 
-/// `entry`'s chain keys in `group`: one per whole block, the salt on block
-/// 0, no extra keys (states are text-only).
+/// `entry`'s chain keys in `group`: one per whole block, with that block's
+/// image keys, the salt on block 0 (the adapter's cold walk keys a block
+/// alike).
 fn chain_keys<S>(
     group: ColdGroup,
     fingerprint: mlx_paged_attn::ColdCacheFingerprint,
@@ -231,25 +232,37 @@ fn chain_keys<S>(
     lineage_keys(
         group,
         fingerprint,
-        entry.tokens(),
+        Lineage {
+            tokens: entry.tokens(),
+            extra_keys: entry.extra_keys(),
+            salt: entry.salt(),
+        },
         entry.block_size(),
-        entry.salt(),
     )
 }
 
 fn lineage_keys(
     group: ColdGroup,
     fingerprint: mlx_paged_attn::ColdCacheFingerprint,
-    tokens: &[u32],
+    lineage: Lineage<'_>,
     block_size: u32,
-    salt: u64,
 ) -> Vec<ColdCacheKey> {
     let mut parent = None;
-    tokens
+    lineage
+        .tokens
         .chunks_exact(block_size.max(1) as usize)
         .enumerate()
         .map(|(index, tokens)| {
-            let key = ColdCacheKey::chain(group, fingerprint, parent, tokens, &[], salt, index);
+            let extra_keys = lineage.extra_keys.get(index).map_or(&[][..], Vec::as_slice);
+            let key = ColdCacheKey::chain(
+                group,
+                fingerprint,
+                parent,
+                tokens,
+                extra_keys,
+                lineage.salt,
+                index,
+            );
             parent = Some(key);
             key
         })
@@ -269,6 +282,7 @@ fn missing_keys(tier: &DiskTier, keys: &[ColdCacheKey]) -> usize {
 fn label_of<S>(entry: &Entry<S>) -> ColdStateLabel {
     ColdStateLabel {
         tokens: entry.tokens().to_vec(),
+        extra_keys: entry.extra_keys().to_vec(),
         salt: entry.salt(),
         last_used: entry.last_used(),
         checkpoint: entry.checkpoint(),
@@ -1010,19 +1024,12 @@ pub(crate) fn publish_from_lane<T: DFlash2Target>(
     let key = lineage_keys(
         ColdGroup::DFlash2State,
         disk.tier.state_fingerprint,
-        lineage.tokens,
+        lineage,
         block_size,
-        lineage.salt,
     )
     .last()
     .copied();
-    let chain = lineage_keys(
-        ColdGroup::Kv,
-        disk.tier.kv_fingerprint,
-        lineage.tokens,
-        block_size,
-        lineage.salt,
-    );
+    let chain = lineage_keys(ColdGroup::Kv, disk.tier.kv_fingerprint, lineage, block_size);
     let Some(key) = key else {
         disk.staging = Some(staging);
         return Ok(None);
@@ -1088,9 +1095,13 @@ pub(crate) fn read_object(states: &DFlash2States, id: EntryId) -> Option<Vec<u8>
     let copy = entry.disk()?;
     let layout = disk.layout(entry.depth())?;
     let mut bytes = vec![0; usize::try_from(disk.spans.iter().sum::<u64>()).ok()?];
-    disk.tier
-        .manager
-        .load_state(copy.key, disk.tier.state_fingerprint, &layout, &mut bytes)?;
+    disk.tier.manager.load_state(
+        copy.key,
+        disk.tier.state_fingerprint,
+        &layout,
+        entry.extra_keys(),
+        &mut bytes,
+    )?;
     Some(bytes)
 }
 
@@ -1245,6 +1256,7 @@ pub(crate) fn read_state<T: DFlash2Target>(
             copy.key,
             disk.tier.state_fingerprint,
             &layout,
+            entry.extra_keys(),
             &mut staging,
         )?;
         let (cell, rest) = staging.split_at(usize::try_from(disk.spans[0]).ok()?);
@@ -1311,20 +1323,18 @@ pub(crate) fn adopt_all<T: DFlash2Target>(target: &mut T) -> u64 {
             continue;
         };
         let depth = label.tokens.len();
+        let lineage = Lineage {
+            tokens: &label.tokens,
+            extra_keys: &label.extra_keys,
+            salt: label.salt,
+        };
         let own = lineage_keys(
             ColdGroup::DFlash2State,
             tier.state_fingerprint,
-            &label.tokens,
+            lineage,
             block_size,
-            label.salt,
         );
-        let chain = lineage_keys(
-            ColdGroup::Kv,
-            tier.kv_fingerprint,
-            &label.tokens,
-            block_size,
-            label.salt,
-        );
+        let chain = lineage_keys(ColdGroup::Kv, tier.kv_fingerprint, lineage, block_size);
         if layout.spans != disk.spans
             || layout.geometry != disk.geometry
             || own.len() * block_size as usize != depth
@@ -1348,7 +1358,6 @@ pub(crate) fn adopt_all<T: DFlash2Target>(target: &mut T) -> u64 {
         } else {
             StateClass::Ordinary
         };
-        let lineage = Lineage::text(&label.tokens, label.salt);
         if store
             .adopt_disk(lineage, cached_bytes, class, copy, label.last_used)
             .is_ok()

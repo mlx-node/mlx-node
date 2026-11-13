@@ -110,6 +110,7 @@ fn tiny_state(fingerprint: ColdCacheFingerprint) -> ColdStateObject {
         },
         label: ColdStateLabel {
             tokens,
+            extra_keys: Vec::new(),
             salt: 0,
             last_used: 1,
             checkpoint: false,

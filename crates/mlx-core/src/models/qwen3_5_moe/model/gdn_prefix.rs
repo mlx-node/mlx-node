@@ -127,6 +127,7 @@ impl Qwen35MoeInner {
                 );
                 adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, cache_salt)
             });
+        crate::models::qwen3_5::dflash2_turn::end_turn_states(self);
         match finalize_result {
             Ok(_) => Ok(()),
             Err(error) => {
@@ -743,14 +744,29 @@ impl Qwen35MoeInner {
             crate::models::qwen3_5::dflash2_turn::Keep::default()
         };
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
+        // A state on disk alone brings its image chain back with the KV
+        // lookup, as a text prime's does (Splash `Cache::lookup` serves
+        // every request alike).
+        let disk_state = if reuse_cache {
+            crate::models::qwen3_5::dflash2_turn::disk_state_depth(
+                self,
+                tokens,
+                extra_keys_per_block,
+                0,
+                max_cache_hit_tokens,
+            )
+        } else {
+            None
+        };
         let candidate_plan_result =
             crate::models::qwen3_5::dflash2_turn::claimed(self, keep, |inner| {
-                inner
-                    .paged_adapter
-                    .as_mut()
-                    .ok_or_else(|| {
-                        Error::from_reason("prepare_moe_vlm_paged_prefix: paged_adapter is None")
-                    })?
+                let adapter = inner.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason("prepare_moe_vlm_paged_prefix: paged_adapter is None")
+                })?;
+                if let Some(depth) = disk_state {
+                    adapter.arm_state_restore(depth);
+                }
+                adapter
                     .prepare_turn_per_block_with_max_cache_hit_tokens(
                         0,
                         tokens,

@@ -617,16 +617,22 @@ drafter, and an MTP turn resumes from a RAM or disk state as a plain one does. T
 objects hold the GDN cell alone. On a load with a draft, a whole autoregressive turn
 (speculation off for the request) primes and prefills as a DFlash2 turn does: its
 states carry the draft window, its lane is released at its end, and a suspended one
-resumes from its deepest state. Image turns still keep their states in the
-in-process GDN ladder below, not on the tier: the state label holds tokens and salt
-but no image keys, so a restart could not tell two images apart.
+resumes from its deepest state. Image turns publish the same points under their
+blocks' image keys (Splash keys a block by its images, `KvBlockLabel::identity`): the
+state's label carries each block's extra keys beside the tokens and salt, so after a
+restart the same placeholder ids over another image restore nothing, and the same
+image resumes at its state with the K/V chain the cold walk brings back under the same
+keys. On a draft load an image turn's states carry the draft window its prefill's taps
+fill (the restored state's window first). A state object whose label format is not
+this build's (`label_format` 2) is rejected at read, never read as one.
 `tests/qwen3_5_state_tier_restart.rs`
-gates a restart on the default `mlx serve` path (a streamed MTP turn) and on a plain
-autoregressive one.
+gates a restart on the default `mlx serve` path (a streamed MTP turn), on a plain
+autoregressive one, and on an image conversation (another image of the same size
+restores nothing; the same image resumes and decodes as a cold run).
 
 | What                 | Splash                                                                                                                            | mlx-node                                                                                                                                                                                                                                                                                                                         |
 | -------------------- | --------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Object               | `SlotFile` slot of `stateSpans`                                                                                                   | one `ColdGroup::DFlash2State` object: the GDN cell, then (with a draft) its 4-bit context window; its label carries the lineage tokens, salt, stamp and class                                                                                                                                                                    |
+| Object               | `SlotFile` slot of `stateSpans`                                                                                                   | one `ColdGroup::DFlash2State` object: the GDN cell, then (with a draft) its 4-bit context window; its label carries the lineage tokens, the blocks' image keys, salt, stamp and class                                                                                                                                            |
 | Quota                | `--max-cache-disk auto`: min(32 GiB, a quarter of the room beyond the floor)                                                      | the same (`disk_tier`); a state is charged its payload (K8)                                                                                                                                                                                                                                                                      |
 | Default              | temporary, gone with the process                                                                                                  | persistent (`<cache-dir>/<namespace>`) for `mlx serve`, `mlx agent`, `mlx launch claude` and the desktop app; a locked `$TMPDIR/mlx-node-cache-*` directory under `--no-persistent-cache` and for a library `loadModel` without `persistentCache`: `closeCache` removes it at a clean stop, the next start removes a crashed one |
 | `--persistent-cache` | per-namespace directory + lock, adopted at the next start                                                                         | `<cache-dir>/<namespace>` (default root `~/.mlx-node/cache/prefix-cache`); the namespace hashes the target, the draft (or none) and the cache geometry                                                                                                                                                                           |

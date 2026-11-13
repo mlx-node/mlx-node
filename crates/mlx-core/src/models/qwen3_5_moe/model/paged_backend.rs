@@ -424,7 +424,13 @@ impl Qwen35MoeInner {
             _ => None,
         };
         crate::models::qwen3_5::dflash2_turn::open_lane_turn(
-            self, tokens, cached, cache_salt, reuse, restored,
+            self,
+            tokens,
+            &[],
+            cached,
+            cache_salt,
+            reuse,
+            restored,
         )
     }
 

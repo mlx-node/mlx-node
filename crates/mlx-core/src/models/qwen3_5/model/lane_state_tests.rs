@@ -138,6 +138,11 @@ fn ar_turn(inner: &mut Qwen35Inner, tokens: &[u32]) -> Result<ChatResult> {
     whole_turn(inner, tokens, &config(), DecoderPlan::Autoregressive)
 }
 
+/// The token ids the last turn on this thread decoded.
+fn generated() -> Vec<u32> {
+    crate::engine::finalize::LAST_GENERATED.with(|last| last.borrow().clone())
+}
+
 /// One whole native-MTP turn of `tokens`, greedy, eight tokens, as a
 /// session that leaves `enableMtp` unset runs it on an MTP-head checkpoint.
 fn mtp_turn(inner: &mut Qwen35Inner, tokens: &[u32], reuse: bool) -> Result<ChatResult> {
@@ -569,6 +574,8 @@ fn mtp_turn_publishes_its_plan_and_decodes_as_without_states() -> Result<()> {
     let tokens = prompt(13, 127);
 
     let reference = mtp_turn(&mut stateless, &tokens, false)?;
+    let reference_ids = generated();
+    assert_eq!(reference_ids.len() as u32, reference.num_tokens);
     let counters = stateless.dflash2_states.counters;
     assert_eq!(
         (
@@ -594,6 +601,7 @@ fn mtp_turn_publishes_its_plan_and_decodes_as_without_states() -> Result<()> {
     assert!(granted.dflash2_states.replay_points.is_empty());
     assert_eq!(result.raw_text, reference.raw_text, "MTP decodes alike");
     assert_eq!(result.num_tokens, reference.num_tokens);
+    assert_eq!(generated(), reference_ids, "MTP decodes the same token ids");
 
     let io = FakeIo::new(
         stats(0),
@@ -617,8 +625,10 @@ fn mtp_turn_publishes_its_plan_and_decodes_as_without_states() -> Result<()> {
     poll_offload(&mut refused);
     let object = read_object(&refused.dflash2_states, state_at(&refused, 64)).expect("the object");
     assert_eq!(object, cell_bytes(&granted, state_at(&granted, 64)));
+    let lane_ids = generated();
     assert_eq!(lane.raw_text, reference.raw_text, "MTP decodes alike");
     assert_eq!(lane.num_tokens, reference.num_tokens);
+    assert_eq!(lane_ids, reference_ids, "MTP decodes the same token ids");
     Ok(())
 }
 
@@ -725,5 +735,181 @@ fn scheduled_mtp_prefill_publishes_its_plan() -> Result<()> {
     );
     let owner = &inner.mtp_state().owners[&seq];
     assert!(owner.hidden.is_some(), "the drafter is seeded");
+    Ok(())
+}
+
+/// Image placeholders at rows 4..36, all of image `hash`: blocks 0-2 carry
+/// its keys.
+fn image_positions(hash: u64) -> Vec<(u32, u64)> {
+    (4..36).map(|row| (row, hash)).collect()
+}
+
+/// The per-block keys an image turn of `len` tokens over `hash` looks up
+/// and registers with.
+fn image_keys(len: usize, hash: u64) -> Vec<Vec<u64>> {
+    crate::engine::build_paged_extra_keys(len, 16, &image_positions(hash))
+}
+
+/// One image turn of `tokens` over image `hash` as the VLM core runs it:
+/// the image-aware prepare, the lane's prefill and the finalize, the
+/// merge standing in as the token embeddings on a text M-RoPE grid.
+/// Returns the prefix the turn resumed at.
+fn image_turn(inner: &mut Qwen35Inner, tokens: &[u32], hash: u64) -> Result<u32> {
+    inner.dflash2_states.generation_suffix = Some(Arc::from(&[2u32, 3][..]));
+    let keys = image_keys(tokens.len(), hash);
+    let len = tokens.len() as u32;
+    let resolution =
+        inner.prepare_dense_vlm_paged_prefix(tokens, len, 16, &keys, true, false, hash, 0)?;
+    let cached = resolution.effective_plan.cached_prefix_len;
+    let rows = tokens.len() as i64;
+    let merge = crate::engine::vision::VisionMerge {
+        inputs_embeds: inner
+            .embedding
+            .forward(&MxArray::from_uint32(tokens, &[1, rows])?)?,
+        position_ids: MxArray::from_int32(
+            &(0..3).flat_map(|_| 0..len as i32).collect::<Vec<_>>(),
+            &[3, 1, rows],
+        )?,
+        rope_deltas: 0,
+    };
+    let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
+        inner.config.num_layers as usize,
+        |i| inner.config.is_linear_layer(i),
+    );
+    let (logits, rungs) = inner.vlm_lane_prefill(
+        tokens,
+        &keys,
+        &merge,
+        cached,
+        resolution.gdn_prefix_already_primed,
+        0,
+        true,
+        &layer_kinds,
+    )?;
+    logits.eval();
+    inner.publish_dense_gdn_materialized_prefix_checkpoint_with_keys(tokens, &keys, 0, rungs);
+    inner.finalize_dense_manual_paged_turn(&image_positions(hash), 0, tokens.len())?;
+    Ok(cached)
+}
+
+/// Splash `publishReachedStateBoundaries` for an image request, and
+/// `Cache::adopt` with the blocks' image identity (`KvBlockLabel`): an
+/// image turn publishes its plan's points under its blocks' image keys,
+/// the replay point is written behind with them, and after a restart a
+/// turn of the same placeholder ids over another image restores nothing
+/// (the stored state stays), while one over the same image resumes at the
+/// replay point with the stored cell.
+/// Mutations VK1 (the publication drops the image keys), VK2 (the tier's
+/// chain keys drop them), VK3 (the label drops them), VK4 (the image
+/// prepare arms no disk restore), VK5 (the image prefill keeps no sink) and
+/// VK6 (an image turn registers its blocks as text) → red.
+#[test]
+fn image_restart_restores_only_the_same_image() -> Result<()> {
+    const TEST: &str = "image_restart_restores_only_the_same_image";
+    const IMAGE: u64 = 0xA11C_E001;
+    const OTHER: u64 = 0xB0B0_E002;
+    let Some(mut first) = plain(0x5A13_0021, TEST) else {
+        return Ok(());
+    };
+    let tier = persistent_test_tier("s13-image-restart", 1 << 30);
+    attach(&mut first, &tier);
+    let _plan = SmallPlan::new();
+    let tokens = prompt(19, 125);
+    assert_eq!(image_turn(&mut first, &tokens, IMAGE)?, 0);
+    let counters = first.dflash2_states.counters;
+    assert_eq!(
+        (
+            counters.checkpoint_publications,
+            counters.replay_state_publications,
+            counters.replay_state_publication_failures,
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(
+        states(&first),
+        vec![(64, true, true, false), (112, false, true, false)]
+    );
+    let blocks: Vec<Vec<u64>> = image_keys(tokens.len(), IMAGE)[..3].to_vec();
+    for entry in first.dflash2_states.store.entries() {
+        assert_eq!(entry.extra_keys(), &blocks[..], "the image keys");
+    }
+    assert!(first.dflash2_states.turns.is_empty(), "the turn ended");
+    let stored = cell_bytes(&first, state_at(&first, 112));
+    assert!(close_cache(
+        &mut first,
+        std::time::Instant::now() + std::time::Duration::from_secs(30)
+    ));
+    drop(first);
+
+    let tier = tier.reopen("s13-image-restart", 1 << 30);
+    let Some(mut second) = plain(0x5A13_0021, TEST) else {
+        return Ok(());
+    };
+    attach(&mut second, &tier);
+    assert_eq!(
+        crate::models::qwen3_5::dflash2_state::disk::adopt_all(&mut second),
+        1
+    );
+    let adopted = state_at(&second, 112);
+    assert_eq!(
+        second
+            .dflash2_states
+            .store
+            .get(adopted)
+            .expect("adopted")
+            .extra_keys(),
+        &blocks[..]
+    );
+    assert_eq!(
+        image_turn(&mut second, &tokens, OTHER)?,
+        0,
+        "another image at the same placeholder ids restores nothing"
+    );
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 0);
+    assert_eq!(disk.counters.promotions, 0);
+    assert!(
+        second.dflash2_states.store.get(adopted).is_some(),
+        "the image's state stays"
+    );
+    assert_eq!(image_turn(&mut second, &tokens, IMAGE)?, 112);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(
+        disk.counters.promotions + disk.counters.promotions_skipped,
+        1
+    );
+    assert_eq!(disk.counters.invalidations, 0);
+    assert_eq!(cell_bytes(&second, adopted), stored);
+    Ok(())
+}
+
+/// Splash `configureDraftStatePlan` for an image request on a draft load:
+/// the image turn's states carry the draft window the prefill's taps fill,
+/// under the blocks' image keys.
+/// Mutation VD1 (an image turn on a draft load keeps the plain sink) → red.
+#[test]
+fn image_turn_on_a_draft_load_publishes_draft_states() -> Result<()> {
+    const TEST: &str = "image_turn_on_a_draft_load_publishes_draft_states";
+    if !metal_is_default_device() || crate::test_support::paged_prefill_unsupported(TEST) {
+        return Ok(());
+    }
+    let mut inner = tiny_dflash_inner_with_config(0x5A13_0023, |_| {});
+    install_pool(&mut inner, 32, 32, passing_probe()).expect("pool");
+    assert!(inner.dflash2.is_some());
+    let tokens = prompt(23, 125);
+    image_turn(&mut inner, &tokens, 0xA11C_E003)?;
+    assert!(inner.dflash2.is_some(), "the draft is back");
+    let blocks: Vec<Vec<u64>> = image_keys(tokens.len(), 0xA11C_E003)[..3].to_vec();
+    let entries: Vec<_> = inner.dflash2_states.store.entries().collect();
+    assert!(!entries.is_empty(), "the image turn published nothing");
+    for entry in entries {
+        assert!(
+            entry.ram().is_some_and(|state| state.window.is_some()),
+            "a state at {} carries no draft window",
+            entry.depth()
+        );
+        assert_eq!(entry.extra_keys(), &blocks[..]);
+    }
+    assert!(inner.dflash2_states.turns.is_empty(), "the turn ended");
     Ok(())
 }
