@@ -100,6 +100,9 @@ impl crate::engine::backend::ChunkSink for StopAt20<'_> {
 /// place of registering them; the hit stops inside the prompt.
 #[test]
 fn a_stopped_turn_commits_through_the_match() -> Result<()> {
+    if !own_process("a_stopped_turn_commits_through_the_match") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported("a_stopped_turn_commits_through_the_match") {
         return Ok(());
     }
@@ -180,6 +183,9 @@ fn a_stopped_turn_commits_through_the_match() -> Result<()> {
 /// `initialize_paged_adapter` → red (`None`).
 #[test]
 fn runway_pool_grows_by_splash_extents() -> Result<()> {
+    if !own_process("runway_pool_grows_by_splash_extents") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -199,6 +205,16 @@ fn runway_pool_grows_by_splash_extents() -> Result<()> {
         Some(crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks(bytes_per_block))
     );
     Ok(())
+}
+
+/// Runs `test` alone in a child process. Every fixture registers with the
+/// process-wide governor, whose ledger holds each waiting claim's need
+/// against every other claim's reserve, so a sibling's suspended or refused
+/// claim denies this test's reserve ("engine memory budget exceeded").
+fn own_process(test: &str) -> bool {
+    crate::test_support::in_own_process(&format!(
+        "models::qwen3_5::model::dflash2_park_tests::{test}"
+    ))
 }
 
 pub(crate) type Probe = Arc<dyn Fn(u32) -> std::result::Result<u32, String> + Send + Sync>;
@@ -339,6 +355,9 @@ fn reserve_step(
 /// refused the same need and the met list stops the loop: `Err`).
 #[test]
 fn dropping_a_ladder_entry_makes_its_chain_evictable() -> Result<()> {
+    if !own_process("dropping_a_ladder_entry_makes_its_chain_evictable") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -417,6 +436,9 @@ fn cap_with_a_shared_live_table_of(seed: u64, total: u32) -> Result<Qwen35Inner>
 /// the release in `prepare_turn_inner` → red (`Err`, no refusal).
 #[test]
 fn prefix_prepare_at_the_cap_frees_a_marked_chain() -> Result<()> {
+    if !own_process("prefix_prepare_at_the_cap_frees_a_marked_chain") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -437,6 +459,9 @@ fn prefix_prepare_at_the_cap_frees_a_marked_chain() -> Result<()> {
 /// rung is dropped).
 #[test]
 fn a_prefix_prepare_keeps_its_own_ladder_entry() -> Result<()> {
+    if !own_process("a_prefix_prepare_keeps_its_own_ladder_entry") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -494,6 +519,9 @@ fn a_prefix_prepare_keeps_its_own_ladder_entry() -> Result<()> {
 /// the release in `prepare_turn_inner` → red (`Err`).
 #[test]
 fn vlm_prefix_prepare_at_the_cap_frees_a_ladder_chain() -> Result<()> {
+    if !own_process("vlm_prefix_prepare_at_the_cap_frees_a_ladder_chain") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -524,6 +552,9 @@ fn vlm_prefix_prepare_at_the_cap_frees_a_ladder_chain() -> Result<()> {
 /// runs twice).
 #[test]
 fn stale_marks_are_resynced_before_the_count() -> Result<()> {
+    if !own_process("stale_marks_are_resynced_before_the_count") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -555,6 +586,9 @@ fn stale_marks_are_resynced_before_the_count() -> Result<()> {
 /// first: `[Ladder, Ladder]`).
 #[test]
 fn cap_reclaim_takes_the_deepest_rung_only() -> Result<()> {
+    if !own_process("cap_reclaim_takes_the_deepest_rung_only") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -603,6 +637,9 @@ fn cap_reclaim_takes_the_deepest_rung_only() -> Result<()> {
 /// is never taken).
 #[test]
 fn a_take_that_frees_nothing_measurable_lists_again() -> Result<()> {
+    if !own_process("a_take_that_frees_nothing_measurable_lists_again") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -750,6 +787,9 @@ fn rung_key(inner: &Qwen35Inner, prefix_len: u32, final_block_hash: u64) -> Unit
 /// goes first).
 #[test]
 fn a_replay_point_in_use_is_not_a_unit() -> Result<()> {
+    if !own_process("a_replay_point_in_use_is_not_a_unit") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported("a_replay_point_in_use_is_not_a_unit") {
         return Ok(());
     }
@@ -809,6 +849,9 @@ fn a_replay_point_in_use_is_not_a_unit() -> Result<()> {
 /// `remember_dense_gdn_history_checkpoint` → red (E below the history).
 #[test]
 fn use_end_stamps_the_replay_point_after_the_history() -> Result<()> {
+    if !own_process("use_end_stamps_the_replay_point_after_the_history") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported(
         "use_end_stamps_the_replay_point_after_the_history",
     ) {
@@ -901,6 +944,9 @@ fn cap_prompt_grow_drops_a_rung_on_another_chain(
 /// `KeptPoints::keeps` → red (the rung stays, the grow log is empty).
 #[test]
 fn cap_prompt_grow_drops_a_rung_on_another_salt() -> Result<()> {
+    if !own_process("cap_prompt_grow_drops_a_rung_on_another_salt") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -912,6 +958,9 @@ fn cap_prompt_grow_drops_a_rung_on_another_salt() -> Result<()> {
 /// `KeptPoints::keeps` → red (the rung stays, the grow log is empty).
 #[test]
 fn cap_prompt_grow_drops_a_rung_on_other_image_keys() -> Result<()> {
+    if !own_process("cap_prompt_grow_drops_a_rung_on_other_image_keys") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -929,6 +978,9 @@ fn cap_prompt_grow_drops_a_rung_on_other_image_keys() -> Result<()> {
 /// cache-only → red (`Err` "could not reserve", nothing taken).
 #[test]
 fn cap_reclaim_takes_a_rung_over_a_held_tail() -> Result<()> {
+    if !own_process("cap_reclaim_takes_a_rung_over_a_held_tail") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -984,6 +1036,9 @@ fn cap_reclaim_takes_a_rung_over_a_held_tail() -> Result<()> {
 /// → red (E stays InUse).
 #[test]
 fn scheduled_turn_close_ends_the_replay_points_use() -> Result<()> {
+    if !own_process("scheduled_turn_close_ends_the_replay_points_use") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported(
         "scheduled_turn_close_ends_the_replay_points_use",
     ) {
@@ -1025,6 +1080,9 @@ impl crate::engine::backend::ChunkSink for NullSink {
 /// `paged_turn_stream_core` → red on `stream` (`Err`).
 #[test]
 fn serial_prepare_at_the_cap_frees_a_ladder_chain() -> Result<()> {
+    if !own_process("serial_prepare_at_the_cap_frees_a_ladder_chain") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported(
         "serial_prepare_at_the_cap_frees_a_ladder_chain",
     ) {
@@ -1096,6 +1154,9 @@ fn serial_prepare_at_the_cap_frees_a_ladder_chain() -> Result<()> {
 /// `prepare_dense_vlm_paged_prefix` → red (`Err`).
 #[test]
 fn vlm_cold_restart_at_the_cap_frees_a_ladder_chain() -> Result<()> {
+    if !own_process("vlm_cold_restart_at_the_cap_frees_a_ladder_chain") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1174,6 +1235,9 @@ fn vlm_rung_on_the_prompts_chain(seed: u64) -> Result<(Qwen35Inner, Vec<u32>)> {
 /// context_length_exceeded).
 #[test]
 fn vlm_cold_restart_takes_the_prompts_own_rung() -> Result<()> {
+    if !own_process("vlm_cold_restart_takes_the_prompts_own_rung") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1205,6 +1269,9 @@ fn vlm_cold_restart_takes_the_prompts_own_rung() -> Result<()> {
 /// context_length_exceeded).
 #[test]
 fn vlm_prepare_without_reuse_takes_the_prompts_own_rung() -> Result<()> {
+    if !own_process("vlm_prepare_without_reuse_takes_the_prompts_own_rung") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1237,6 +1304,9 @@ fn vlm_prepare_without_reuse_takes_the_prompts_own_rung() -> Result<()> {
 /// the history write → red on `reuse true`.
 #[test]
 fn a_released_serial_turn_ends_the_replay_points_use() -> Result<()> {
+    if !own_process("a_released_serial_turn_ends_the_replay_points_use") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported(
         "a_released_serial_turn_ends_the_replay_points_use",
     ) {
@@ -1299,6 +1369,9 @@ fn a_released_serial_turn_ends_the_replay_points_use() -> Result<()> {
 /// → red (`Err` "could not reserve").
 #[test]
 fn cold_dflash2_prefill_reclaims_a_marked_live_chain() -> Result<()> {
+    if !own_process("cold_dflash2_prefill_reclaims_a_marked_live_chain") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported(
         "cold_dflash2_prefill_reclaims_a_marked_live_chain",
     ) {
@@ -1426,6 +1499,9 @@ impl crate::engine::backend::ChunkSink for LastChunk {
 /// Mutation M12: the cores force `</think>` alone → red on both.
 #[test]
 fn legacy_dense_cores_end_thinking_with_the_whole_close() -> Result<()> {
+    if !own_process("legacy_dense_cores_end_thinking_with_the_whole_close") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported(
         "legacy_dense_cores_end_thinking_with_the_whole_close",
     ) {
@@ -1545,6 +1621,9 @@ fn evictable(inner: &Qwen35Inner) -> u32 {
 /// evictable).
 #[test]
 fn dropping_a_parked_state_returns_its_blocks() -> Result<()> {
+    if !own_process("dropping_a_parked_state_returns_its_blocks") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1580,6 +1659,9 @@ fn dropping_a_parked_state_returns_its_blocks() -> Result<()> {
 /// (marked 4).
 #[test]
 fn resets_empty_the_store_and_its_marks() -> Result<()> {
+    if !own_process("resets_empty_the_store_and_its_marks") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1607,6 +1689,9 @@ fn resets_empty_the_store_and_its_marks() -> Result<()> {
 /// Mutation EV1 (no residency check in the install) → red (`Ok`).
 #[test]
 fn installing_a_state_whose_block_is_gone_fails() -> Result<()> {
+    if !own_process("installing_a_state_whose_block_is_gone_fails") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1644,6 +1729,9 @@ fn installing_a_state_whose_block_is_gone_fails() -> Result<()> {
 /// its bytes).
 #[test]
 fn model_units_list_bytes_and_blocks_per_unit() -> Result<()> {
+    if !own_process("model_units_list_bytes_and_blocks_per_unit") {
+        return Ok(());
+    }
     use crate::engine::governor::ledger::{
         CertainReuse, Need, Reserves, Stage, TakeRights, UnitKey as LedgerKey, VictimQuery,
         VictimSource,
@@ -1757,6 +1845,9 @@ fn model_units_list_bytes_and_blocks_per_unit() -> Result<()> {
 /// Mutation Q1 (wanted chains ignored) → red (the Start lists R).
 #[test]
 fn a_start_keeps_queued_chains_an_in_service_claim_takes_them() -> Result<()> {
+    if !own_process("a_start_keeps_queued_chains_an_in_service_claim_takes_them") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::Governor;
     use crate::engine::governor::governor::tests::{FakeIo, G, host, lane, model, stats};
     use crate::engine::governor::host::Pressure;
@@ -1844,6 +1935,9 @@ fn a_start_keeps_queued_chains_an_in_service_claim_takes_them() -> Result<()> {
 /// (`context_length_exceeded:`).
 #[test]
 fn serial_refusal_fails_capacity_exhausted() -> Result<()> {
+    if !own_process("serial_refusal_fails_capacity_exhausted") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1878,6 +1972,9 @@ fn serial_refusal_fails_capacity_exhausted() -> Result<()> {
 /// and the step runs twice).
 #[test]
 fn doomed_lone_turn_keeps_the_cache() -> Result<()> {
+    if !own_process("doomed_lone_turn_keeps_the_cache") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -1927,6 +2024,9 @@ fn doomed_lone_turn_keeps_the_cache() -> Result<()> {
 /// W5 (the replay point as Optional) → red (it is refused).
 #[test]
 fn warning_holds_back_publications_not_the_lane() -> Result<()> {
+    if !own_process("warning_holds_back_publications_not_the_lane") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::Governor;
     use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
     use crate::engine::governor::host::Pressure;
@@ -2026,6 +2126,9 @@ fn warning_holds_back_publications_not_the_lane() -> Result<()> {
 /// Mutation K2 (the control pass is skipped while idle) → red (both stay).
 #[test]
 fn idle_thread_gives_back_under_critical() -> Result<()> {
+    if !own_process("idle_thread_gives_back_under_critical") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::Governor;
     use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
     use crate::engine::governor::host::Pressure;
@@ -2077,6 +2180,9 @@ fn idle_thread_gives_back_under_critical() -> Result<()> {
 /// Mutation R3 (a dead-leaves take evicts nothing) → red (eight blocks).
 #[test]
 fn critical_host_pass_evicts_dead_leaves_to_cut_an_extent() -> Result<()> {
+    if !own_process("critical_host_pass_evicts_dead_leaves_to_cut_an_extent") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::Governor;
     use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
     use crate::engine::governor::host::Pressure;
@@ -2168,6 +2274,9 @@ fn critical_host_pass_evicts_dead_leaves_to_cut_an_extent() -> Result<()> {
 /// Mutation DL1 (the dead leaves go ahead of the checkpoints) → red.
 #[test]
 fn dead_leaves_go_after_checkpoints_before_ordinary_states() -> Result<()> {
+    if !own_process("dead_leaves_go_after_checkpoints_before_ordinary_states") {
+        return Ok(());
+    }
     use crate::engine::governor::ledger::{CertainReuse, Need, Reserves, TakeRights, VictimQuery};
     use crate::models::qwen3_5::dflash2_state::paged::PagedAnchor;
     use crate::models::qwen3_5::dflash2_state::store::{Lineage, StateClass};
@@ -2395,6 +2504,9 @@ pub(crate) fn fake_governor(
 /// (a whole turn's wait syncs no claim) → red (0 bytes refused waiting).
 #[test]
 fn host_yield_vacates_and_waits_in_place() -> Result<()> {
+    if !own_process("host_yield_vacates_and_waits_in_place") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported("host_yield_vacates_and_waits_in_place") {
         return Ok(());
     }
@@ -2504,6 +2616,9 @@ fn host_yield_vacates_and_waits_in_place() -> Result<()> {
 /// wait checks its limit before the stop) → red (`resource_timeout`).
 #[test]
 fn a_stop_in_the_suspend_wait_completes() -> Result<()> {
+    if !own_process("a_stop_in_the_suspend_wait_completes") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported("a_stop_in_the_suspend_wait_completes") {
         return Ok(());
     }
@@ -2579,6 +2694,9 @@ fn a_stop_in_the_suspend_wait_completes() -> Result<()> {
 /// (`prefill cancelled`).
 #[test]
 fn a_stop_during_the_replay_completes() -> Result<()> {
+    if !own_process("a_stop_during_the_replay_completes") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported("a_stop_during_the_replay_completes") {
         return Ok(());
     }
@@ -2683,6 +2801,9 @@ fn gdn_gap(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
 /// target).
 #[test]
 fn suspended_turn_replays_to_the_solo_tokens() -> Result<()> {
+    if !own_process("suspended_turn_replays_to_the_solo_tokens") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported("suspended_turn_replays_to_the_solo_tokens") {
         return Ok(());
     }
@@ -2752,6 +2873,9 @@ fn suspended_turn_replays_to_the_solo_tokens() -> Result<()> {
 /// (the raw MLX text, no recovery noted).
 #[test]
 fn a_verify_oom_outside_the_claim_arms_recovery() -> Result<()> {
+    if !own_process("a_verify_oom_outside_the_claim_arms_recovery") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported(
         "a_verify_oom_outside_the_claim_arms_recovery",
     ) {
@@ -2798,6 +2922,9 @@ fn a_verify_oom_outside_the_claim_arms_recovery() -> Result<()> {
 /// Mutation AP3 (the fresh cells keep the old pending rows) → red.
 #[test]
 fn a_suspended_dflash2_lane_drops_its_pending_rows() -> Result<()> {
+    if !own_process("a_suspended_dflash2_lane_drops_its_pending_rows") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported(
         "a_suspended_dflash2_lane_drops_its_pending_rows",
     ) {
@@ -2873,6 +3000,9 @@ fn a_suspended_dflash2_lane_drops_its_pending_rows() -> Result<()> {
 /// Mutation R1m (the stepper keeps its lane across the claim) → red.
 #[test]
 fn a_suspended_dflash2_lane_drops_its_cells_and_idles_its_ring() -> Result<()> {
+    if !own_process("a_suspended_dflash2_lane_drops_its_cells_and_idles_its_ring") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported(
         "a_suspended_dflash2_lane_drops_its_cells_and_idles_its_ring",
     ) {
@@ -2949,6 +3079,9 @@ fn a_suspended_dflash2_lane_drops_its_cells_and_idles_its_ring() -> Result<()> {
 /// restore runs before the KV target is held) → red.
 #[test]
 fn vacate_of_a_dflash2_turn_publishes_nothing() -> Result<()> {
+    if !own_process("vacate_of_a_dflash2_turn_publishes_nothing") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported("vacate_of_a_dflash2_turn_publishes_nothing")
     {
         return Ok(());
@@ -3073,6 +3206,9 @@ fn vacate_of_a_dflash2_turn_publishes_nothing() -> Result<()> {
 /// Mutation JR1 (the lookup counts its junction, resumes included) → red.
 #[test]
 fn a_resumed_lane_counts_no_junction() -> Result<()> {
+    if !own_process("a_resumed_lane_counts_no_junction") {
+        return Ok(());
+    }
     if crate::test_support::paged_prefill_unsupported("a_resumed_lane_counts_no_junction") {
         return Ok(());
     }
@@ -3142,6 +3278,9 @@ fn refused_runway(
 /// → red (it waits 30 s and fails `resource_timeout`).
 #[test]
 fn lookahead_refusal_decodes_ar_without_waiting() -> Result<()> {
+    if !own_process("lookahead_refusal_decodes_ar_without_waiting") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -3163,6 +3302,9 @@ fn lookahead_refusal_decodes_ar_without_waiting() -> Result<()> {
 /// Mutation LA2 (the lookahead reserves once, nothing freed) → red (false).
 #[test]
 fn lookahead_takes_units_before_refusing() -> Result<()> {
+    if !own_process("lookahead_takes_units_before_refusing") {
+        return Ok(());
+    }
     if !metal_is_default_device() {
         return Ok(());
     }
@@ -3193,6 +3335,9 @@ fn lookahead_takes_units_before_refusing() -> Result<()> {
 /// `resource_timeout`).
 #[test]
 fn a_scheduled_prepare_leaves_its_refusal_to_the_scheduler() -> Result<()> {
+    if !own_process("a_scheduled_prepare_leaves_its_refusal_to_the_scheduler") {
+        return Ok(());
+    }
     use crate::engine::governor::governor::{Scope, take_lane_denial, whole_turn_spec};
     if !metal_is_default_device() {
         return Ok(());

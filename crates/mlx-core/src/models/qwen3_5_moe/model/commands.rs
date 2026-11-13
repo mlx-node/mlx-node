@@ -164,7 +164,11 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
     type StepExecutor<'a> = crate::engine::hybrid_scheduler::HybridStepExecutor<'a, Self>;
 
     const SCHEDULER_NAME: &'static str = "Qwen3.5 MoE";
-    const ENABLED_BY_DEFAULT: bool = false;
+
+    /// The decode lanes the load's memory plan granted.
+    fn scheduler_capacity(&self) -> usize {
+        self.scheduled_lanes() as usize
+    }
 
     fn wired_residency(&self) -> Option<std::sync::Arc<crate::stream::WiredResidency>> {
         self.wired.clone()

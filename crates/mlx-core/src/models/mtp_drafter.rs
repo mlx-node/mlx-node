@@ -34,8 +34,7 @@
 //!
 //! The +1.0 shift is NOT re-applied here: the on-disk values are already in
 //! final (≈1.0) form, and the load-side `mtp_norms_need_shift` probe in each
-//! `sanitize_weights` samples `mtp.layers.0.input_layernorm.weight` (≈1.04 for
-//! a converted checkpoint) → probe is false → no second shift.
+//! `sanitize_weights` reads them as shifted → no second shift.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

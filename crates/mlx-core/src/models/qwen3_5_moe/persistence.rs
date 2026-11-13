@@ -104,43 +104,11 @@ pub(crate) fn sanitize_weights(
             || k.contains("model.layers.0.mlp.experts.0.up_proj.weight")
     });
 
-    // MTP-norm robustness probe. The `mtp.*` bypass below keeps MTP norms in
-    // final (already +1.0-shifted) form, on the assumption that `mlx convert`
-    // applied that shift. A RAW (unconverted) HF checkpoint never went through
-    // convert, so its MTP norms are still in deviation-from-1 form (~0); loading
-    // it directly leaves them un-shifted → the draft head sees ~0 RMSNorm
-    // weights → garbage logits → 0 accepted tokens. Because `enableMtp`
-    // auto-defaults ON for any checkpoint with MTP heads, that turns into a
-    // silent *slowdown* (draft cost with no accepts). Replicate convert's
-    // independent MTP-norm probe (`convert.rs` `is_mtp_norm` /
-    // `mtp_norms_need_shift`): if the sampled MTP norm sits near 0, shift the
-    // seven MTP norm tensors by +1.0 at load. A converted checkpoint reads
-    // near 1 → no shift → byte-identical to today. Note `mtp.norm` and the two
-    // `pre_fc_norm_*` tensors match none of `norm_suffixes`, so they need this
-    // dedicated set (the `is_mtp_norm` closure itself lives in
-    // `normalize_moe_weight_map`, where it is applied per renamed key).
-    let mtp_norms_need_shift = match params
-        .iter()
-        .find(|(k, _)| k.ends_with("mtp.layers.0.input_layernorm.weight"))
-    {
-        Some((_, v)) => {
-            let f32_v = v.astype(DType::Float32)?;
-            let m = f32_v.mean(None, None)?;
-            m.eval();
-            let mean = m.item_at_float32(0).unwrap_or(1.0);
-            let need = mean < 0.5;
-            if need {
-                warn!(
-                    "Qwen3.5-MoE: raw (unconverted) MTP norms detected (mean={:.4} ≈ 0); \
-                     applying +1.0 shift at load so the MTP draft head functions. \
-                     Prefer running `mlx convert` on the checkpoint.",
-                    mean
-                );
-            }
-            need
-        }
-        None => false,
-    };
+    // The `mtp.*` bypass below keeps MTP norms as stored, so raw (γ−1) MTP
+    // norms get the +1.0 here; the seven tensors are matched by `is_mtp_norm`
+    // in `normalize_moe_weight_map`.
+    let mtp_norms_need_shift =
+        crate::models::qwen3_5::persistence::mtp_norms_need_shift(&params, "Qwen3.5-MoE")?;
 
     // Declarative key rewrite — drop visual-encoder weights (for VL models),
     // strip the wrapper prefixes via the shared longest-first chain (keeps
@@ -2350,6 +2318,7 @@ pub(crate) async fn load_with_source(
             let spatial_merge_size = inner.spatial_merge_size.unwrap_or(2);
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
+            let scheduled_lanes = inner.scheduled_lanes();
             let mtp_active = inner.dflash2.is_some() || inner.has_mtp_weights();
             let vision_active = super::model::qwen35_moe_vision_active(
                 inner.vision_encoder.is_some(),
@@ -2378,6 +2347,7 @@ pub(crate) async fn load_with_source(
                     cache_limit_guard,
                     pool_cache_limit_guard,
                     paged_active,
+                    scheduled_lanes,
                     mtp_active,
                     vision_active,
                     context_limits,
@@ -2396,6 +2366,7 @@ pub(crate) async fn load_with_source(
         cache_limit_guard,
         pool_cache_limit_guard,
         paged_active,
+        scheduled_lanes,
         mtp_active,
         vision_active,
         context_limits,
@@ -2410,6 +2381,7 @@ pub(crate) async fn load_with_source(
         thread,
         config,
         paged_active,
+        scheduled_lanes,
         mtp_active,
         vision_active,
         image_processor,

@@ -7,6 +7,9 @@
 
 mod speculative;
 
+#[cfg(all(test, target_os = "macos"))]
+mod lane_wave_tests;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -162,7 +165,6 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         Self: 'a;
 
     const SCHEDULER_NAME: &'static str;
-    const ENABLED_BY_DEFAULT: bool = true;
     const CANCEL_PRECEDES_EOS: bool = false;
     const STREAM_EOS_TOKEN: bool = false;
 
@@ -580,12 +582,6 @@ fn configured_scheduler_capacity(physical_capacity: usize) -> usize {
 
 pub(crate) fn scheduler_max_num_seqs_for(physical_capacity: usize) -> usize {
     configured_scheduler_capacity(physical_capacity)
-}
-
-/// Public Qwen3.5 capacity query. The hybrid GDN row store has two live units;
-/// other families pass their own physical capacity to the same engine policy.
-pub(crate) fn scheduler_max_num_seqs() -> usize {
-    configured_scheduler_capacity(crate::engine::recurrent_state::HYBRID_LIVE_STATE_UNITS)
 }
 
 fn scheduler_long_prefill_tokens() -> u32 {
@@ -2300,21 +2296,8 @@ fn prefill_breaks<B: HybridSchedulerBackend>(
 }
 
 impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
-    pub(crate) fn continuous_batching_enabled() -> bool {
-        static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("MLX_CONTINUOUS_BATCHING").is_ok_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-        })
-    }
-
     pub(crate) fn new(inner: B) -> Result<Self> {
-        let enabled = inner.scheduler_cache_available()
-            && (B::ENABLED_BY_DEFAULT || Self::continuous_batching_enabled());
+        let enabled = inner.scheduler_cache_available();
         let max_num_seqs = configured_scheduler_capacity(inner.scheduler_capacity());
         let mut scheduler =
             Scheduler::new(max_num_seqs, PREFILL_CHUNK_ROWS).map_err(Error::from_reason)?;
@@ -2979,7 +2962,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         true
     }
 
-    /// Keep the two-unit residency cap as a queueing boundary. An idle warm
+    /// Keep the live-unit residency cap as a queueing boundary. An idle warm
     /// row may be discarded because its owner history can rebuild the exact
     /// GDN state through the ordinary prefix-prime path; a scheduler-owned row
     /// is never evicted here.
@@ -4865,8 +4848,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 0
             },
         );
+        let ledger = self.judge_policy() == JudgePolicy::Ledger;
+        // On the ledger the state is claimed from the governor beside the
+        // pool, so only the KV blocks must fit the max pool.
+        let pool_state_bytes = if ledger { 0 } else { candidate_state_bytes };
         if cache_snapshot.as_ref().is_some_and(|snapshot| {
-            exceeds_max_pool_ceiling(snapshot, prepared.reservation_blocks, candidate_state_bytes)
+            exceeds_max_pool_ceiling(snapshot, prepared.reservation_blocks, pool_state_bytes)
         }) {
             self.cleanup_rejected_prepared(&prepared);
             let max_total_blocks = cache_snapshot.map_or(0, |snapshot| snapshot.max_total_blocks);
@@ -4876,7 +4863,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             );
             return Ok(None);
         }
-        let ledger = self.judge_policy() == JudgePolicy::Ledger;
         let mut cell = None;
         if ledger {
             match self.admit_claimed(&mut prepared) {
@@ -6373,12 +6359,79 @@ pub(crate) mod tests {
         assert_eq!(moe_state.scheduler.waiting_len(), 0);
         assert!(
             !dense_state.enabled,
-            "dense Qwen3.5 must keep the generic scheduler opt-in"
+            "a dense load without a paged pool keeps every turn exclusive"
         );
         assert!(
             !moe_state.enabled,
-            "Qwen3.5 MoE must keep the generic scheduler opt-in"
+            "a MoE load without a paged pool keeps every turn exclusive"
         );
+    }
+
+    /// With no env set, a paged dense and a paged MoE load schedule their
+    /// text turns: both schedulers are enabled, the plan offers eight decode
+    /// lanes and both models report the lanes their plan granted.
+    /// `MLX_SERVE_FORCE_SERIAL=1` offers and reports one lane. Each half runs in a child process with its own env,
+    /// so neither the shell's env nor a sibling test decides the result.
+    /// Mutation CB1: `new` leaves `enabled` false → red.
+    #[test]
+    fn paged_dense_and_moe_schedule_without_an_env() {
+        use crate::models::qwen3_5::model::qwen35_max_concurrent_sequences;
+        const CHILD: &str = "MLX_QWEN35_SCHEDULE_DEFAULT_CHILD";
+        const NAME: &str =
+            "engine::hybrid_scheduler::tests::paged_dense_and_moe_schedule_without_an_env";
+        let Some(child) = std::env::var_os(CHILD) else {
+            for (half, serial) in [("default", None), ("serial", Some("1"))] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", NAME])
+                    .env(CHILD, half)
+                    .env_remove("MLX_SCHED_MAX_NUM_SEQS")
+                    .env_remove("MLX_SERVE_FORCE_SERIAL");
+                if let Some(value) = serial {
+                    command.env("MLX_SERVE_FORCE_SERIAL", value);
+                }
+                let output = command.output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                assert!(
+                    output.status.success() && stdout.contains("test result: ok. 1 passed"),
+                    "{half}: {stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        if child == "serial" {
+            assert!(HybridSchedulerState::<Qwen35Inner>::force_serial());
+            assert_eq!(qwen35_max_concurrent_sequences(true, 4), 1);
+            assert_eq!(
+                crate::models::qwen3_5::load_plan::qwen35_scheduler_lanes(),
+                1
+            );
+            return;
+        }
+        assert!(!HybridSchedulerState::<Qwen35Inner>::force_serial());
+        assert_eq!(
+            crate::models::qwen3_5::load_plan::qwen35_scheduler_lanes() as usize,
+            crate::models::qwen3_5::load_plan::qwen35_lane_ceiling(
+                crate::utils::host::physical_memory()
+            )
+        );
+        assert_eq!(qwen35_max_concurrent_sequences(true, 8), 8);
+        assert_eq!(qwen35_max_concurrent_sequences(true, 2), 2);
+        assert_eq!(qwen35_max_concurrent_sequences(false, 4), 1);
+        if crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device() {
+            let recency = Arc::new(mlx_paged_attn::CacheRecency::new());
+            let mut dense = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+            dense.paged_adapter = Some(tiny_paged_adapter_with(Arc::clone(&recency), 4, 16));
+            let mut moe = Qwen35MoeInner::new(tiny_moe_config()).expect("construct tiny MoE model");
+            moe.paged_adapter = Some(tiny_paged_adapter_with(recency, 4, 16));
+            let dense_state: HybridSchedulerState<Qwen35Inner> =
+                HybridSchedulerState::new(dense).expect("construct dense scheduler");
+            let moe_state: HybridSchedulerState<Qwen35MoeInner> =
+                HybridSchedulerState::new(moe).expect("construct MoE scheduler");
+            assert!(dense_state.enabled, "a paged dense load schedules");
+            assert!(moe_state.enabled, "a paged MoE load schedules");
+        }
     }
 
     #[test]
@@ -6792,24 +6845,24 @@ pub(crate) mod tests {
         let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
         let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
         state.owner_sequences.insert("history-only".into(), 1);
-        state.owner_sequences.insert("resident-a".into(), 2);
-        state.owner_sequences.insert("resident-b".into(), 3);
-        state
-            .inner
-            .activate_scheduled_recurrent(2)
-            .expect("activate resident a");
-        state
-            .inner
-            .activate_scheduled_recurrent(3)
-            .expect("park resident a and activate resident b");
+        for seq in 2..=9u32 {
+            state.owner_sequences.insert(format!("resident-{seq}"), seq);
+            state
+                .inner
+                .activate_scheduled_recurrent(seq)
+                .expect("park the previous resident and activate the next");
+        }
+        assert!(!state.inner.can_activate_scheduled_recurrent(10));
 
-        assert!(state.ensure_recurrent_slot(4));
+        assert!(state.ensure_recurrent_slot(10));
         assert!(
             !state.inner.has_scheduled_recurrent(2),
             "the oldest actual idle resident is evicted"
         );
-        assert!(state.inner.has_scheduled_recurrent(3));
-        assert!(state.inner.can_activate_scheduled_recurrent(4));
+        for seq in 3..=9u32 {
+            assert!(state.inner.has_scheduled_recurrent(seq));
+        }
+        assert!(state.inner.can_activate_scheduled_recurrent(10));
     }
 
     #[test]
@@ -6836,7 +6889,7 @@ pub(crate) mod tests {
         assert!(state.inner.has_scheduled_recurrent(1));
         assert!(
             state.ensure_recurrent_slot(2),
-            "one parked idle row does not fill the two-unit cap"
+            "one parked idle row does not fill the eight-unit cap"
         );
         assert!(
             state.inner.has_scheduled_recurrent(1),
@@ -8726,6 +8779,48 @@ pub(crate) mod tests {
         }
     }
 
+    /// On the ledger an MTP turn's state is claimed beside the pool, so a
+    /// turn whose KV fills the whole max pool is admitted; one block past
+    /// the max pool is refused `context_length_exceeded`.
+    /// Mutation PC1: the ceiling counts the state inside the pool → red.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_speculative_turn_may_fill_the_max_pool_on_the_ledger() {
+        use crate::engine::governor::governor::tests::G;
+        for (extra_blocks, admitted) in [(0u32, true), (1, false)] {
+            let Some((mut state, _, _io)) = ledger_state(16 * G, 0) else {
+                return;
+            };
+            let snapshot = state
+                .inner
+                .scheduler_cache_snapshot()
+                .expect("scheduler snapshot")
+                .expect("paged adapter present");
+            let blocks = snapshot.max_total_blocks + extra_blocks;
+            let (mut prepared, mut result) =
+                prepared_turn(&mut state, 1, tokens_of(1, snapshot.max_total_blocks - 1));
+            prepared.admitted.plan.decoder =
+                engine::plan::DecoderPlan::Speculative(engine::plan::SpeculativeKind::NativeMtp);
+            prepared.reservation_blocks = blocks;
+            prepared.reservation_state_bytes = state.inner.recurrent_state_bytes()
+                + state.inner.scheduled_draft_state_bytes(blocks * 16);
+            assert!(state.inner.scheduled_draft_state_bytes(blocks * 16) > 0);
+            let turn = state.admit_prepared(prepared).ok().flatten();
+            assert_eq!(turn.is_some(), admitted, "{blocks} blocks");
+            if !admitted {
+                let error = result
+                    .try_recv()
+                    .expect("the turn has ended")
+                    .expect_err("the turn fails");
+                assert!(
+                    error.reason.starts_with("context_length_exceeded"),
+                    "{}",
+                    error.reason
+                );
+            }
+        }
+    }
+
     /// Splash `Engine::suspendLane` → `admit`: a lone lane the host refused
     /// at its slice end E is suspended to E and, once its retry time came,
     /// resumes holding E's KV at once. A lane suspended beside another
@@ -10463,11 +10558,11 @@ pub(crate) mod tests {
     /// Splash `Engine::stop` on a suspended request: `settle` → `finish(Stop)`
     /// takes no lane back. Turn A generates beside owner B, which finishes and
     /// parks its recurrent row; A is preempted (its row dropped, its full
-    /// blocks registered) and owner C holds the second recurrent unit. A stop
-    /// on A ends it "stop" on the tokens it had, the full blocks through the
-    /// cut stay in the cache, and B and C keep their rows. `in_reap`: the
+    /// blocks registered) and peers C.. hold the other recurrent units. A
+    /// stop on A ends it "stop" on the tokens it had, the full blocks through
+    /// the cut stay in the cache, and B and C keep their rows. `in_reap`: the
     /// pass's reap settles it at once, not its resume.
-    fn a_vacated_stop_completes_beside_two_resident_peers<B: HybridSchedulerBackend>(
+    fn a_vacated_stop_completes_beside_resident_peers<B: HybridSchedulerBackend>(
         mut state: HybridSchedulerState<B>,
         in_reap: bool,
     ) {
@@ -10525,22 +10620,27 @@ pub(crate) mod tests {
         assert!(!state.inner.has_scheduled_recurrent(seq));
 
         // Admission waits behind a preempted turn (on-demand booking), so the
-        // second resident row is pinned for owner C directly.
-        let seq_c = state.next_seq_id;
-        state.next_seq_id += 1;
-        state.owner_sequences.insert("c".to_string(), seq_c);
-        state
-            .inner
-            .activate_scheduled_recurrent(seq_c)
-            .expect("C takes the second unit");
-        state
-            .inner
-            .park_active_scheduled_recurrent()
-            .expect("C parks");
+        // other resident rows are pinned for peers C.. directly.
+        let mut seq_c = None;
+        while state.inner.can_activate_scheduled_recurrent(seq) {
+            let peer = state.next_seq_id;
+            state.next_seq_id += 1;
+            state.owner_sequences.insert(format!("c{peer}"), peer);
+            state
+                .inner
+                .activate_scheduled_recurrent(peer)
+                .expect("a peer takes a free unit");
+            state
+                .inner
+                .park_active_scheduled_recurrent()
+                .expect("the peer parks");
+            seq_c.get_or_insert(peer);
+        }
+        let seq_c = seq_c.expect("at least one peer fills a unit");
         assert!(state.inner.has_scheduled_recurrent(seq_b), "B stays parked");
         assert!(
             !state.inner.can_activate_scheduled_recurrent(seq),
-            "B and C hold both recurrent units"
+            "B and the peers hold every recurrent unit"
         );
 
         let model = state.inner.memory_model();
@@ -10613,9 +10713,9 @@ pub(crate) mod tests {
     /// done chunk).
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_vacated_stop_completes_beside_two_resident_qwen35_peers() {
+    fn a_vacated_stop_completes_beside_resident_qwen35_peers() {
         if crate::test_support::paged_prefill_unsupported(
-            "a_vacated_stop_completes_beside_two_resident_qwen35_peers",
+            "a_vacated_stop_completes_beside_resident_qwen35_peers",
         ) {
             return;
         }
@@ -10632,7 +10732,7 @@ pub(crate) mod tests {
                     .register_model(model(16 * G, 0))
                     .expect("register"),
             );
-            a_vacated_stop_completes_beside_two_resident_peers(
+            a_vacated_stop_completes_beside_resident_peers(
                 HybridSchedulerState::new(inner).expect("scheduler"),
                 in_reap,
             );
@@ -10642,9 +10742,9 @@ pub(crate) mod tests {
     /// Mutation F4, SP1, PS1: as the dense test → red.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_vacated_stop_completes_beside_two_resident_qwen35_moe_peers() {
+    fn a_vacated_stop_completes_beside_resident_qwen35_moe_peers() {
         if crate::test_support::paged_prefill_unsupported(
-            "a_vacated_stop_completes_beside_two_resident_qwen35_moe_peers",
+            "a_vacated_stop_completes_beside_resident_qwen35_moe_peers",
         ) {
             return;
         }
@@ -10662,7 +10762,7 @@ pub(crate) mod tests {
                     .register_model(model(16 * G, 0))
                     .expect("register"),
             );
-            a_vacated_stop_completes_beside_two_resident_peers(
+            a_vacated_stop_completes_beside_resident_peers(
                 HybridSchedulerState::new(inner).expect("scheduler"),
                 in_reap,
             );

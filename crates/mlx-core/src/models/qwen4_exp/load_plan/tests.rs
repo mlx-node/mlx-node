@@ -526,8 +526,9 @@ fn int8_pool_window_from_the_plan() {
 
 /// The MTP draft state is the one lane's, charged once: at a fixed dynamic
 /// budget the int8 window is 67,407 (90,964 without MTP), and a load with
-/// MTP weights keeps 64K in both formats. Mutation O1: `state_in_pool: true`
-/// in `pool_input` (the state charged twice) → red (49,145).
+/// MTP weights keeps 64K in both formats. Mutation O1: `LaneKv::Pool`
+/// also takes the state from the pool's KV (the state charged twice) → red
+/// (49,145).
 #[test]
 fn mtp_state_prices_the_one_pool_window() {
     const DYNAMIC: u64 = 4_468_093_952;

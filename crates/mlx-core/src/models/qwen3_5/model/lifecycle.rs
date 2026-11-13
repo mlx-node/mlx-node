@@ -105,7 +105,7 @@ impl Qwen35Inner {
             paged_turn_seq: None,
             paged_finalize_failed: false,
             paged_adapter,
-            scheduled_recurrent: RecurrentStateTable::stage2(),
+            scheduled_recurrent: RecurrentStateTable::new(HYBRID_LIVE_STATE_UNITS),
             scheduled_mtp: Default::default(),
             active_scheduled_seq: None,
             paged_mtp_last_rollback_unemitted: 0,
@@ -261,6 +261,8 @@ impl Qwen35Inner {
         }
         adapter.set_memory_ceiling(plan.ceiling_bytes());
         self.paged_adapter = Some(adapter);
+        self.scheduled_recurrent
+            .set_max_live_units(pool_plan.lanes as usize);
         info!(
             "Qwen3.5 paged adapter enabled after weight materialization: initial_blocks={}, \
              max_blocks={}, block_size={}, pool_window_tokens={}, trained_window_tokens={}, \
@@ -519,7 +521,8 @@ impl Qwen35Inner {
     /// Initialize KV caches.
     pub(crate) fn init_caches_sync(&mut self) -> Result<()> {
         self.caches = Some(fresh_dense_layer_caches(&self.config));
-        self.scheduled_recurrent = RecurrentStateTable::stage2();
+        self.scheduled_recurrent =
+            RecurrentStateTable::new(self.scheduled_recurrent.max_live_units());
         self.scheduled_mtp = Default::default();
         self.active_scheduled_seq = None;
         self.clear_reuse_state();
@@ -539,7 +542,8 @@ impl Qwen35Inner {
         self.dflash2_states.clear();
         self.dflash2_prefix
             .note_drop("reset_caches_sync", DropKind::Invalidated);
-        self.scheduled_recurrent = RecurrentStateTable::stage2();
+        self.scheduled_recurrent =
+            RecurrentStateTable::new(self.scheduled_recurrent.max_live_units());
         self.scheduled_mtp = Default::default();
         self.active_scheduled_seq = None;
         self.clear_reuse_state();
@@ -602,7 +606,18 @@ impl Qwen35Inner {
 
     pub(super) fn can_activate_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
         self.has_scheduled_recurrent(seq_id)
-            || self.scheduled_recurrent_units() < HYBRID_LIVE_STATE_UNITS
+            || self.scheduled_recurrent_units() < self.scheduled_recurrent.max_live_units()
+    }
+
+    /// The decode lanes this load runs: the plan's grant.
+    pub(crate) fn scheduled_lanes(&self) -> u32 {
+        self.scheduled_recurrent.max_live_units() as u32
+    }
+
+    /// Stands in for a plan that granted `lanes` decode lanes.
+    #[cfg(test)]
+    pub(crate) fn grant_scheduled_lanes(&mut self, lanes: usize) {
+        self.scheduled_recurrent.set_max_live_units(lanes);
     }
 
     pub(super) fn activate_scheduled_recurrent(&mut self, seq_id: SeqId) -> Result<()> {
@@ -786,7 +801,8 @@ impl Qwen35Inner {
             let input_ids = MxArray::from_uint32(&token_ids, &[rows.len() as i64, 1])?;
             let mut hidden_states = self.embedding.forward(&input_ids)?;
 
-            for layer_idx in 0..self.layers.len() {
+            let num_layers = self.layers.len();
+            for layer_idx in 0..num_layers {
                 let kind = self.layer_kinds[layer_idx];
                 let mut gdn_cache = if matches!(
                     kind,
@@ -812,6 +828,11 @@ impl Qwen35Inner {
                 if let Some(cache) = gdn_cache.as_ref() {
                     self.scatter_gdn_cache(&seq_ids, layer_idx, cache)?;
                 }
+                crate::models::qwen3_5::paged_forward::maybe_submit_paged_decode_layer(
+                    layer_idx,
+                    num_layers,
+                    &hidden_states,
+                );
             }
 
             let hidden_states = self.final_norm.forward(&hidden_states)?;

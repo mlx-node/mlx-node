@@ -106,6 +106,11 @@ pub(crate) trait DFlash2Target: ChatBackend {
     fn dflash2_states_mut(&mut self) -> &mut DFlash2States;
     /// Dense-shaped config the load plan prices.
     fn dense_config(&self) -> std::borrow::Cow<'_, super::config::Qwen3_5Config>;
+    /// Bytes one decode row's MoE layers allocate past the dense view; 0
+    /// for a dense model.
+    fn decode_row_expert_bytes(&self) -> u64 {
+        0
+    }
     /// Embedding output dtype: what an unallocated BF16 cache will hold.
     fn embedding_dtype(&self) -> Result<DType>;
     fn paged_adapter_ref(&self) -> Option<&PagedKVCacheAdapter>;

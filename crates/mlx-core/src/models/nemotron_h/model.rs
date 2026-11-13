@@ -1665,8 +1665,8 @@ impl HybridSchedulerBackend for NemotronHInner {
     /// Residency cap on parked recurrent rows. Without this override the trait default
     /// (`true`) makes `ensure_recurrent_slot`'s idle-victim body dead code and
     /// `scheduled_caches` grows one row per owner forever. The cap matches
-    /// `max_concurrent_sequences()`, not `HYBRID_LIVE_STATE_UNITS = 2`, which would
-    /// cut batching from 8 rows to 2. Deliberately not qwen3_5's hard error inside
+    /// `max_concurrent_sequences()`, not `HYBRID_LIVE_STATE_UNITS`, a Qwen3.5
+    /// ceiling its memory plan lowers. Deliberately not qwen3_5's hard error inside
     /// `activate_scheduled_recurrent`: `finish_completed` reaches the same function
     /// with no `ensure_recurrent_slot` gate, so erroring there would fail live turns.
     fn can_activate_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
