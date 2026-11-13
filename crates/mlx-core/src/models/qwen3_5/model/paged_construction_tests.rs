@@ -2359,6 +2359,98 @@ fn dense_manual_paged_finalize_reaches_the_gdn_sidecar_capture() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A host short of spare memory refuses a ladder rung its RAM claim
+/// (`HostRule::admits` keeps the margin from Optional claims), so the rung
+/// goes to the cold tier through the turn's sidecar capture instead (Splash
+/// `publishStateToDisk`) and never into RAM.
+///
+/// Mutation: drop the refused rung → the capture finds no checkpoint
+/// (`boundary_skips` +1, `enqueued` +0) → red.
+#[test]
+fn a_rung_refused_ram_still_reaches_the_cold_tier() {
+    use crate::engine::governor::governor::Governor;
+    use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+    use crate::engine::governor::host::Pressure;
+    let Some(mut inner) =
+        dense_inner_with_test_adapter_or_skip("a_rung_refused_ram_still_reaches_the_cold_tier")
+    else {
+        return;
+    };
+    let root = temp_cold_root("dense-refused-rung-to-disk");
+    install_gdn_cold_tier(&mut inner, &root);
+    let io = FakeIo::new(stats(0), host(0, Pressure::Normal));
+    let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+    inner.memory_registration = Some(governor.register_model(model(16 * G, 0)).expect("register"));
+    let prompt: Vec<u32> = (0u32..32).collect();
+    record_whole_paged_request(&mut inner, &prompt);
+
+    let activation = crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&inner)
+        .expect("activation dtype");
+    let config = inner.config.clone();
+    let mut caches = fresh_dense_layer_caches(&config);
+    for cache in &mut caches {
+        if let Qwen3_5LayerCache::Linear(arrays) = cache {
+            let conv = MxArray::zeros(
+                &[
+                    1,
+                    i64::from(config.linear_conv_kernel_dim - 1),
+                    i64::from(config.linear_conv_dim()),
+                ],
+                Some(activation),
+            )
+            .expect("conv state");
+            let recurrent = MxArray::zeros(
+                &[
+                    1,
+                    i64::from(config.linear_num_value_heads),
+                    i64::from(config.linear_value_head_dim),
+                    i64::from(config.linear_key_head_dim),
+                ],
+                Some(DType::Float32),
+            )
+            .expect("recurrent state");
+            arrays.set(0, conv).expect("set conv");
+            arrays.set(1, recurrent).expect("set recurrent");
+        }
+    }
+    inner.publish_dense_gdn_materialized_prefix_checkpoint(
+        &prompt,
+        0,
+        vec![
+            crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint {
+                prefix_len: 16,
+                caches,
+            },
+        ],
+    );
+    assert!(
+        inner.gdn_prefix_checkpoints.is_empty(),
+        "the host refused the rung its RAM"
+    );
+
+    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
+    let before = crate::cold_tier::cold_sidecar_telemetry();
+    inner
+        .finalize_dense_manual_paged_turn(&[], 0, prompt.len())
+        .expect("manual paged finalization must succeed");
+    let after = crate::cold_tier::cold_sidecar_telemetry();
+    assert_eq!(
+        after.boundary_skips, before.boundary_skips,
+        "the refused rung must anchor the sidecar"
+    );
+    assert_eq!(
+        after.enqueued,
+        before.enqueued + 1,
+        "the refused rung must reach the cold tier"
+    );
+    assert!(
+        inner.gdn_unclaimed_rungs.is_empty(),
+        "the turn's end drops the refused rung"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// An int8 pool keeps the GDN sidecar: the policy and the capture label the
 /// conv history with the activation dtype, never the pool's K/V format
 /// (Splash `GdnStateLayout::convolutionLayerBytes` never follows the KV
