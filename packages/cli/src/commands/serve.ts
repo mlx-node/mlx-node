@@ -10,7 +10,6 @@
 import { parseArgs } from 'node:util';
 
 import {
-  checkCacheDiskArgs,
   createInferenceHost,
   LAUNCHER_ENGINE_POLICY,
   ModelNotFoundError,
@@ -21,6 +20,8 @@ import {
   parseMaxCacheDisk,
   parseMaxContext,
   parseMaxMemory,
+  PERSISTENT_CACHE_CONFLICT_ERROR,
+  resolveCacheDisk,
   resolveLogDir,
   resolveMlxNodeHome,
   type InferenceHost,
@@ -84,10 +85,11 @@ Options:
                       under 200G), at most 32G; a size such as 16G is held
                       as given while the volume keeps that floor; 0
                       disables (default: auto).
-  --persistent-cache  Keep the SSD cache across restarts (default: off; the
-                      cache's temporary files go when serve stops).
-  --cache-dir <dir>   Where --persistent-cache keeps its files; needs
-                      --persistent-cache (default:
+  --persistent-cache  Keep the SSD cache across restarts (default: on unless
+                      --max-cache-disk is 0).
+  --no-persistent-cache  Keep the SSD cache for this run only; its temporary
+                      files go when serve stops.
+  --cache-dir <dir>   Where the persistent cache keeps its files (default:
                       ~/.mlx-node/cache/prefix-cache).
   --thinking-token-budget <n>  Thinking tokens of a thinking request that
                       sets no budget, after which its thinking closes
@@ -161,7 +163,8 @@ export function parseServeArgs(argv: string[]): ServeArgs {
       'decode-share': { type: 'string' },
       'idle-release': { type: 'string' },
       'max-cache-disk': { type: 'string' },
-      'persistent-cache': { type: 'boolean', default: false },
+      'persistent-cache': { type: 'boolean' },
+      'no-persistent-cache': { type: 'boolean' },
       'cache-dir': { type: 'string' },
       'thinking-token-budget': { type: 'string' },
       'rerank-config': { type: 'string' },
@@ -199,10 +202,18 @@ export function parseServeArgs(argv: string[]): ServeArgs {
   const idleReleaseSeconds = idleReleaseText === undefined ? undefined : parseIdleRelease(idleReleaseText);
   const cacheDiskText = values['max-cache-disk'];
   const cacheDisk = cacheDiskText === undefined ? 'auto' : parseMaxCacheDisk(cacheDiskText);
-  const persistentCache = values['persistent-cache'] ?? false;
+  if (values['persistent-cache'] === true && values['no-persistent-cache'] === true) {
+    throw new Error(PERSISTENT_CACHE_CONFLICT_ERROR);
+  }
+  const persistentFlag =
+    values['persistent-cache'] === true ? true : values['no-persistent-cache'] === true ? false : undefined;
   const cacheDirText = values['cache-dir'];
-  const cacheDir = cacheDirText === undefined ? undefined : parseCacheDir(cacheDirText);
-  checkCacheDiskArgs({ cacheDisk, persistentCache, ...(cacheDir !== undefined ? { cacheDir } : {}) });
+  const cacheDirArg = cacheDirText === undefined ? undefined : parseCacheDir(cacheDirText);
+  const { persistentCache, cacheDir } = resolveCacheDisk({
+    cacheDisk,
+    ...(persistentFlag !== undefined ? { persistentCache: persistentFlag } : {}),
+    ...(cacheDirArg !== undefined ? { cacheDir: cacheDirArg } : {}),
+  });
   const budgetText = values['thinking-token-budget'];
   const thinkingTokenBudget = budgetText === undefined ? undefined : parseThinkingTokenBudget(budgetText);
   const verbose = (values.verbose ?? false) || values['log-dir'] != null;

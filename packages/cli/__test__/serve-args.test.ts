@@ -1,7 +1,8 @@
 /**
  * `mlx serve` SSD cache flags (Splash `serve_options.py`): `--max-cache-disk`
- * (default auto), `--persistent-cache` (default off), `--cache-dir` (needs
- * `--persistent-cache`), and the two usage errors of `check_serve_arguments`.
+ * (default auto), `--[no-]persistent-cache` (default on unless
+ * `--max-cache-disk 0`, where Splash defaults off), `--cache-dir`, and the
+ * usage errors of `check_serve_arguments`.
  */
 
 import { homedir } from 'node:os';
@@ -12,9 +13,10 @@ import { describe, expect, it } from 'vite-plus/test';
 import { parseServeArgs } from '../src/commands/serve.js';
 
 describe('mlx serve cache flags', () => {
-  it('defaults to an automatic temporary cache', () => {
+  // Mutation TSD1: serve defaults persistentCache to false → red.
+  it('defaults to an automatic persistent cache', () => {
     const args = parseServeArgs([]);
-    expect(args).toMatchObject({ cacheDisk: 'auto', persistentCache: false });
+    expect(args).toMatchObject({ cacheDisk: 'auto', persistentCache: true });
     expect(args.cacheDir).toBeUndefined();
   });
 
@@ -31,19 +33,33 @@ describe('mlx serve cache flags', () => {
     }
   });
 
-  it('keeps a persistent cache under --cache-dir, ~ expanded', () => {
-    expect(parseServeArgs(['--persistent-cache'])).toMatchObject({ cacheDisk: 'auto', persistentCache: true });
-    expect(parseServeArgs(['--persistent-cache', '--cache-dir', '/var/c']).cacheDir).toBe('/var/c');
-    expect(parseServeArgs(['--persistent-cache', '--cache-dir', '~/c']).cacheDir).toBe(join(homedir(), 'c'));
-    expect(() => parseServeArgs(['--persistent-cache', '--cache-dir', ' '])).toThrow(
-      '--cache-dir must name a directory',
-    );
+  // Mutation TSD4: the default turned persistent beside --max-cache-disk 0 errors → red.
+  it('turns the default off with --no-persistent-cache or --max-cache-disk 0', () => {
+    expect(parseServeArgs(['--no-persistent-cache'])).toMatchObject({ cacheDisk: 'auto', persistentCache: false });
+    expect(parseServeArgs(['--max-cache-disk', '0'])).toMatchObject({ cacheDisk: '0', persistentCache: false });
+    expect(parseServeArgs(['--no-persistent-cache', '--max-cache-disk', '0']).persistentCache).toBe(false);
   });
 
-  it('refuses the flag pairs Splash refuses', () => {
-    expect(() => parseServeArgs(['--cache-dir', '/var/c'])).toThrow('--cache-dir needs --persistent-cache');
+  it('keeps a persistent cache under --cache-dir, ~ expanded', () => {
+    expect(parseServeArgs(['--persistent-cache'])).toMatchObject({ cacheDisk: 'auto', persistentCache: true });
+    expect(parseServeArgs(['--cache-dir', '/var/c'])).toMatchObject({ persistentCache: true, cacheDir: '/var/c' });
+    expect(parseServeArgs(['--persistent-cache', '--cache-dir', '/var/c']).cacheDir).toBe('/var/c');
+    expect(parseServeArgs(['--cache-dir', '~/c']).cacheDir).toBe(join(homedir(), 'c'));
+    expect(() => parseServeArgs(['--cache-dir', ' '])).toThrow('--cache-dir must name a directory');
+  });
+
+  it('refuses the flag pairs that contradict', () => {
     expect(() => parseServeArgs(['--persistent-cache', '--max-cache-disk', '0'])).toThrow(
       '--persistent-cache needs the SSD cache --max-cache-disk 0 turns off',
+    );
+    expect(() => parseServeArgs(['--no-persistent-cache', '--cache-dir', '/var/c'])).toThrow(
+      '--cache-dir needs the persistent cache --no-persistent-cache turns off',
+    );
+    expect(() => parseServeArgs(['--max-cache-disk', '0', '--cache-dir', '/var/c'])).toThrow(
+      '--cache-dir needs the SSD cache --max-cache-disk 0 turns off',
+    );
+    expect(() => parseServeArgs(['--persistent-cache', '--no-persistent-cache'])).toThrow(
+      '--persistent-cache and --no-persistent-cache cannot be used together',
     );
   });
 });

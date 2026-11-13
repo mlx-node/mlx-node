@@ -79,7 +79,7 @@ describe('parseServeArgs', () => {
       authToken: undefined,
       logDir: undefined,
       cacheDisk: 'auto',
-      persistentCache: false,
+      persistentCache: true,
     });
   });
 
@@ -315,7 +315,7 @@ describe('mlx serve — end to end', () => {
         for (let i = 0; i < 200 && loads.length === 0; i++) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        expect(loads).toEqual([{ maxMemoryBytes: 30_064_771_072, cacheDisk: 'auto', persistentCache: false }]);
+        expect(loads).toEqual([{ maxMemoryBytes: 30_064_771_072, cacheDisk: 'auto', persistentCache: true }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
@@ -387,7 +387,7 @@ describe('mlx serve — end to end', () => {
         for (let i = 0; i < 200 && loads.length === 0; i++) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        expect(loads).toEqual([{ maxContextTokens: 102_400, cacheDisk: 'auto', persistentCache: false }]);
+        expect(loads).toEqual([{ maxContextTokens: 102_400, cacheDisk: 'auto', persistentCache: true }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
@@ -422,7 +422,7 @@ describe('mlx serve — end to end', () => {
         for (let i = 0; i < 200 && loads.length === 0; i++) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        expect(loads).toEqual([{ decodeShare: 0, cacheDisk: 'auto', persistentCache: false }]);
+        expect(loads).toEqual([{ decodeShare: 0, cacheDisk: 'auto', persistentCache: true }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
@@ -456,7 +456,7 @@ describe('mlx serve — end to end', () => {
         for (let i = 0; i < 200 && loads.length === 0; i++) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        expect(loads).toEqual([{ kvFormat: 'bf16', cacheDisk: 'auto', persistentCache: false }]);
+        expect(loads).toEqual([{ kvFormat: 'bf16', cacheDisk: 'auto', persistentCache: true }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {

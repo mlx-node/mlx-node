@@ -72,6 +72,7 @@ import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance 
 import { FLUSH_MS } from '../supervision.js';
 import type { TurnJournalOptions } from '../turn-journal.js';
 import { discoverAudioModels, loadAudioModel, audioCapabilities, type DiscoveredAudioModel } from './audio-models.js';
+import { defaultPersistentCache } from './cache-disk.js';
 import { chatCapability, withCapabilityModels } from './capability-models.js';
 import { discoverModels, type DiscoveredModel } from './discover.js';
 import { applyEnginePolicy, type EnginePolicy } from './env-policy.js';
@@ -204,8 +205,9 @@ export interface InferenceHostOptions {
    */
   cacheDisk?: string;
   /**
-   * Keep the SSD cache across restarts (`--persistent-cache`) for qwen3_5 /
-   * qwen3_5_moe loads. Omitted ⇒ a temporary cache that goes at `close()`.
+   * Keep the SSD cache across restarts (`--[no-]persistent-cache`) for
+   * qwen3_5 / qwen3_5_moe loads. Omitted ⇒ persistent unless `cacheDisk` is
+   * `'0'`; `false` ⇒ a temporary cache that goes at `close()`.
    */
   persistentCache?: boolean;
   /**
@@ -495,7 +497,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       ...(familyDataFor(entry.modelType)?.acceptsCacheDisk === true
         ? {
             ...(opts.cacheDisk !== undefined ? { cacheDisk: opts.cacheDisk } : {}),
-            ...(opts.persistentCache !== undefined ? { persistentCache: opts.persistentCache } : {}),
+            persistentCache: opts.persistentCache ?? defaultPersistentCache(opts.cacheDisk),
             ...(opts.cacheDir !== undefined ? { cacheDir: opts.cacheDir } : {}),
           }
         : {}),
@@ -815,11 +817,14 @@ export { MAX_CONTEXT_ERROR, MAX_YARN_CONTEXT_TOKENS, parseMaxContext } from './m
 export { MAX_MEMORY_ERROR, parseMaxMemory } from './max-memory.js';
 export {
   CACHE_DIR_ERROR,
-  checkCacheDiskArgs,
+  defaultPersistentCache,
   MAX_CACHE_DISK_ERROR,
   parseCacheDir,
   parseMaxCacheDisk,
+  PERSISTENT_CACHE_CONFLICT_ERROR,
+  resolveCacheDisk,
   type CacheDiskArgs,
+  type ResolvedCacheDisk,
 } from './cache-disk.js';
 export {
   applyEnginePolicy,

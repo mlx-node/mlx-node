@@ -1983,7 +1983,17 @@ describe('launchGrokAgent server gating', () => {
     await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
     const plainArgv: string[] = spawnServe.mock.calls[0]![0];
     expect(plainArgv).not.toContain('--persistent-cache');
+    expect(plainArgv).not.toContain('--no-persistent-cache');
     expect(plainArgv).not.toContain('--max-cache-disk');
+    expect(parseServeArgs(plainArgv.slice(2)).persistentCache).toBe(true);
+  });
+
+  // Mutation TSD3: grok-build drops `--no-persistent-cache` → red.
+  it('hands --no-persistent-cache to the spawned serve only when asked', async () => {
+    await launchGrokAgent({ argv: ['-c'], persistentCache: false, spawnServe, spawnAgent });
+    const offArgv: string[] = spawnServe.mock.calls[0]![0];
+    expect(offArgv.slice(-1)).toEqual(['--no-persistent-cache']);
+    expect(parseServeArgs(offArgv.slice(2))).toMatchObject({ cacheDisk: 'auto', persistentCache: false });
   });
 
   // Mutation: drop the `--max-memory` pair from the serve argv → red.

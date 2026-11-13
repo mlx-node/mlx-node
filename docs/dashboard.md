@@ -154,7 +154,7 @@ The `ColdCacheManager` SSD cold tier of the restore-allowlisted families: when
 enabled, full paged prefix blocks are captured to the cold tier on publish and
 restored on a hot-cache miss before falling back to a normal prefill. Qwen3.5
 dense and MoE are not among them: their SSD tier holds DFlash2 states
-(`mlx serve --max-cache-disk`, `--persistent-cache`; see
+(`mlx serve --max-cache-disk`, `--[no-]persistent-cache`, kept across restarts by default; see
 [paged-cache.md](paged-cache.md#dflash2-states-on-ssd-qwen3_5--qwen3_5_moe)), and
 this view does not list it.
 

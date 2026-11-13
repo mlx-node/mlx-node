@@ -26,7 +26,12 @@ import { dirname, join, resolve } from 'node:path';
 // the family list must have exactly ONE definition (the drift guard's).
 import { CHAT_FAMILY_IDS } from '@mlx-node/agent/catalog';
 import { readAgentDefaultModel } from '@mlx-node/agent/paths';
-import { checkCacheDiskArgs, parseCacheDir, parseMaxCacheDisk } from '@mlx-node/server/host/cache-disk';
+import {
+  parseCacheDir,
+  parseMaxCacheDisk,
+  PERSISTENT_CACHE_CONFLICT_ERROR,
+  resolveCacheDisk,
+} from '@mlx-node/server/host/cache-disk';
 import { DECODE_SHARE_ERROR, parseDecodeShare } from '@mlx-node/server/host/decode-share';
 import { IDLE_RELEASE_ERROR, parseIdleRelease } from '@mlx-node/server/host/idle-release';
 import { MAX_CONTEXT_ERROR, parseMaxContext } from '@mlx-node/server/host/max-context';
@@ -56,8 +61,11 @@ export interface AgentArgScan {
   traceDirMissingValue: boolean;
   /** Native text of `--max-cache-disk` (lifted out of the argv, forwarded to `mlx serve`). */
   cacheDisk?: string;
-  /** `--persistent-cache` seen (lifted out of the argv, forwarded to `mlx serve`). */
-  persistentCache: boolean;
+  /**
+   * `true` for `--persistent-cache`, `false` for `--no-persistent-cache`, unset
+   * for neither (lifted out of the argv; `mlx serve` keeps the cache by default).
+   */
+  persistentCache?: boolean;
   /** Absolute `--cache-dir` (lifted out of the argv, forwarded to `mlx serve`). */
   cacheDir?: string;
   /** A cache flag had a missing or bad value, or the cache flags conflict: the usage error. */
@@ -235,7 +243,8 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   let traceDir: string | undefined;
   let traceDirMissingValue = false;
   let cacheDisk: string | undefined;
-  let persistentCache = false;
+  let persistentCache: boolean | undefined;
+  let persistentCacheConflict = false;
   let cacheDir: string | undefined;
   let cacheDiskError: string | undefined;
   const takeCacheValue = (parse: (value: string) => string, value: string, assign: (parsed: string) => void) => {
@@ -349,8 +358,10 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       trace = true;
       continue;
     }
-    if (arg === '--persistent-cache') {
-      persistentCache = true;
+    if (arg === '--persistent-cache' || arg === '--no-persistent-cache') {
+      const value = arg === '--persistent-cache';
+      if (persistentCache !== undefined && persistentCache !== value) persistentCacheConflict = true;
+      persistentCache = value;
       continue;
     }
     if (arg === '--max-cache-disk' || arg === '--cache-dir') {
@@ -474,11 +485,12 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     passthrough.push(arg);
   }
 
+  if (cacheDiskError === undefined && persistentCacheConflict) cacheDiskError = PERSISTENT_CACHE_CONFLICT_ERROR;
   if (cacheDiskError === undefined) {
     try {
-      checkCacheDiskArgs({
+      resolveCacheDisk({
         cacheDisk: cacheDisk ?? 'auto',
-        persistentCache,
+        ...(persistentCache !== undefined ? { persistentCache } : {}),
         ...(cacheDir !== undefined ? { cacheDir } : {}),
       });
     } catch (error) {
@@ -498,7 +510,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     traceDir,
     traceDirMissingValue,
     ...(cacheDisk !== undefined ? { cacheDisk } : {}),
-    persistentCache,
+    ...(persistentCache !== undefined ? { persistentCache } : {}),
     ...(cacheDir !== undefined ? { cacheDir } : {}),
     ...(cacheDiskError !== undefined ? { cacheDiskError } : {}),
     ...(kvFormat !== undefined ? { kvFormat } : {}),
@@ -732,11 +744,12 @@ mlx options (handled before the agent binary sees the args):
                             MoE loads: auto (default; a quarter of the volume's
                             free space beyond its floor, at most 32G), a size
                             such as 16G, or 0 to disable.
-  --persistent-cache        Keep the SSD cache across restarts (default: off;
-                            its temporary files go when the agent stops).
-  --cache-dir <dir>         Where --persistent-cache keeps its files; needs
-                            --persistent-cache (default:
-                            ~/.mlx-node/cache/prefix-cache).
+  --persistent-cache        Keep the SSD cache across restarts (default: on
+                            unless --max-cache-disk is 0).
+  --no-persistent-cache     Keep the SSD cache for this run only; its
+                            temporary files go when the agent stops.
+  --cache-dir <dir>         Where the persistent cache keeps its files
+                            (default: ~/.mlx-node/cache/prefix-cache).
 
 First run: when no local model exists, an interactive wizard offers a curated
 download. Agent config home: ~/.mlx-agent (override: GROK_HOME).
@@ -992,7 +1005,7 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     ...(scan.decodeShare !== undefined ? { decodeShare: scan.decodeShare } : {}),
     ...(scan.idleReleaseSeconds !== undefined ? { idleReleaseSeconds: scan.idleReleaseSeconds } : {}),
     ...(scan.cacheDisk !== undefined ? { cacheDisk: scan.cacheDisk } : {}),
-    ...(scan.persistentCache ? { persistentCache: true } : {}),
+    ...(scan.persistentCache !== undefined ? { persistentCache: scan.persistentCache } : {}),
     ...(scan.cacheDir !== undefined ? { cacheDir: scan.cacheDir } : {}),
   });
 }

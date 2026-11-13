@@ -321,8 +321,9 @@ scheduler barrier, so simultaneous DFlash turns are serialized; set
 
 Paged AR prefixes can also survive hot-cache eviction and process restart via
 the SSD cold tier. Enable it with `persist_paged_cache: true` in the model
-config or `MLX_PERSIST_PAGED_CACHE=1`; `mlx agent` enables persistence by
-default for supported families. Muse persists the 13 full-attention layers as
+config or `MLX_PERSIST_PAGED_CACHE=1`. Qwen3.5 dense and MoE use a separate SSD
+state tier instead, which `mlx serve`, `mlx agent` and the desktop app keep across
+restarts by default (see [paged-cache.md](paged-cache.md#dflash2-states-on-ssd-qwen3_5--qwen3_5_moe)). Muse persists the 13 full-attention layers as
 the authoritative block chain and all 39 sliding layers as a companion sidecar
 at the same token boundary. A missing, corrupt, or mismatched sidecar discards
 the full-group hit and recomputes from the start. DFlash's flat caches are not

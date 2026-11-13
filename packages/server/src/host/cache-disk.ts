@@ -1,5 +1,5 @@
 /**
- * `--max-cache-disk SIZE`, `--persistent-cache` and `--cache-dir DIRECTORY`:
+ * `--max-cache-disk SIZE`, `--[no-]persistent-cache` and `--cache-dir DIRECTORY`:
  * Splash `parse_max_cache_disk`, `parse_cache_dir` and the cache checks of
  * `check_serve_arguments`.
  */
@@ -36,19 +36,48 @@ export function parseCacheDir(value: string): string {
   return resolve(value);
 }
 
-/** The SSD cache options of one `mlx serve`. */
+/** The SSD cache flags of one `mlx serve` as given; `persistentCache` unset when neither form was passed. */
 export interface CacheDiskArgs {
+  cacheDisk: string;
+  persistentCache?: boolean;
+  cacheDir?: string;
+}
+
+/** The SSD cache options a load receives. */
+export interface ResolvedCacheDisk {
   cacheDisk: string;
   persistentCache: boolean;
   cacheDir?: string;
 }
 
-/** Splash `check_serve_arguments`: the cache flags that need one another. */
-export function checkCacheDiskArgs(args: CacheDiskArgs): void {
-  if (args.persistentCache && args.cacheDisk === '0') {
+/**
+ * The cache kept across restarts unless `--no-persistent-cache` or
+ * `--max-cache-disk 0` turns it off. Splash defaults to a temporary cache;
+ * mlx-node keeps it because restart persistence is the point of the tier.
+ */
+export function defaultPersistentCache(cacheDisk: string | undefined): boolean {
+  return cacheDisk !== '0';
+}
+
+/** Splash `check_serve_arguments` over the persistent default. */
+export function resolveCacheDisk(args: CacheDiskArgs): ResolvedCacheDisk {
+  if (args.persistentCache === true && args.cacheDisk === '0') {
     throw new Error('--persistent-cache needs the SSD cache --max-cache-disk 0 turns off');
   }
-  if (args.cacheDir !== undefined && !args.persistentCache) {
-    throw new Error('--cache-dir needs --persistent-cache');
+  const persistentCache = args.persistentCache ?? defaultPersistentCache(args.cacheDisk);
+  if (args.cacheDir !== undefined && !persistentCache) {
+    throw new Error(
+      args.persistentCache === false
+        ? '--cache-dir needs the persistent cache --no-persistent-cache turns off'
+        : '--cache-dir needs the SSD cache --max-cache-disk 0 turns off',
+    );
   }
+  return {
+    cacheDisk: args.cacheDisk,
+    persistentCache,
+    ...(args.cacheDir !== undefined ? { cacheDir: args.cacheDir } : {}),
+  };
 }
+
+/** Both `--persistent-cache` and `--no-persistent-cache` given. */
+export const PERSISTENT_CACHE_CONFLICT_ERROR = '--persistent-cache and --no-persistent-cache cannot be used together';

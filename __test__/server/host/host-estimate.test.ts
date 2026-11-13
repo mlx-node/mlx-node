@@ -88,4 +88,35 @@ describe('host cache-disk options', () => {
       { name: 'gemma' },
     ]);
   });
+
+  // Mutation TSD2: the host forwards persistentCache only when the caller set it → red.
+  it('keeps a qwen3_5 cache across restarts unless asked not to or the cache is off', async () => {
+    const cases: Array<{
+      given: { cacheDisk?: string; persistentCache?: boolean };
+      want: { cacheDisk?: string; persistentCache: boolean };
+    }> = [
+      { given: {}, want: { persistentCache: true } },
+      { given: { cacheDisk: 'auto' }, want: { cacheDisk: 'auto', persistentCache: true } },
+      { given: { cacheDisk: '0' }, want: { cacheDisk: '0', persistentCache: false } },
+      { given: { persistentCache: false }, want: { persistentCache: false } },
+    ];
+    for (const { given, want } of cases) {
+      const loads: Array<LoadModelOptions | undefined> = [];
+      const host = await createInferenceHost({
+        port: 0,
+        disableStore: true,
+        sweepOrphanTempRoots: false,
+        modelsDir: await modelsDir(),
+        ...given,
+        estimateContextWindow: async () => null,
+        loadModel: async (_path, options) => {
+          loads.push(options);
+          return {} as unknown as LoadableModel;
+        },
+      });
+      hosts.push(host);
+      await host.loadModel('qwen');
+      expect(loads).toEqual([want]);
+    }
+  });
 });

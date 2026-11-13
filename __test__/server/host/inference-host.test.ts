@@ -657,7 +657,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     await writeFile(join(draft, 'model.safetensors'), 'weights');
     await host.loadModel(name);
     expect(calls).toHaveLength(1);
-    expect(calls[0].options).toEqual({ draftModelPath: draft });
+    expect(calls[0].options).toEqual({ draftModelPath: draft, persistentCache: true });
     expect(calls[0].path).toBe(join(modelsDir, name));
     expect(host.health().models.resident).toEqual([name]);
   });
@@ -678,7 +678,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     });
     await host.loadModel(name);
     expect(calls).toHaveLength(1);
-    expect(calls[0].options).toBeUndefined();
+    expect(calls[0].options).toEqual({ persistentCache: true });
     expect(calls[0].path).toBe(join(modelsDir, name));
   });
 
@@ -699,7 +699,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     expect(host.models.map((model) => model.name).sort()).toEqual(['gemma', 'qwen']);
     await host.loadModel('qwen');
     await host.loadModel('gemma');
-    expect(calls.map((call) => call.options)).toEqual([{ kvFormat: 'bf16' }, undefined]);
+    expect(calls.map((call) => call.options)).toEqual([{ kvFormat: 'bf16', persistentCache: true }, undefined]);
   });
 
   // Mutation: drop the `acceptsMaxMemory` check in the host → red (gemma4
@@ -723,7 +723,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     await host.loadModel('gemma');
     await host.loadModel('flash');
     expect(calls.map((call) => call.options)).toEqual([
-      { maxMemoryBytes: 30_064_771_072 },
+      { maxMemoryBytes: 30_064_771_072, persistentCache: true },
       undefined,
       { maxMemoryBytes: 30_064_771_072 },
     ]);
@@ -749,7 +749,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     await host.loadModel('gemma');
     await host.loadModel('flash');
     expect(calls.map((call) => call.options)).toEqual([
-      { maxContextTokens: 102_400 },
+      { maxContextTokens: 102_400, persistentCache: true },
       undefined,
       { maxContextTokens: 102_400 },
     ]);

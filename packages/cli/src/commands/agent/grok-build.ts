@@ -87,7 +87,10 @@ export interface GrokAgentLaunchOptions {
   idleReleaseSeconds?: number;
   /** SSD cache quota the spawned `mlx serve` loads with (`--max-cache-disk`, its native text). */
   cacheDisk?: string;
-  /** Keep the spawned `mlx serve`'s SSD cache across restarts (`--persistent-cache`). */
+  /**
+   * `--persistent-cache` / `--no-persistent-cache` for the spawned `mlx serve`;
+   * unset leaves serve's default (persistent).
+   */
   persistentCache?: boolean;
   /** The persistent cache's root (`--cache-dir`). */
   cacheDir?: string;
@@ -1728,6 +1731,7 @@ function spawnInferenceServer(opts: GrokAgentLaunchOptions): { child: ChildProce
     ...(opts.idleReleaseSeconds !== undefined ? ['--idle-release', idleReleaseText(opts.idleReleaseSeconds)] : []),
     ...(opts.cacheDisk !== undefined ? ['--max-cache-disk', opts.cacheDisk] : []),
     ...(opts.persistentCache === true ? ['--persistent-cache'] : []),
+    ...(opts.persistentCache === false ? ['--no-persistent-cache'] : []),
     ...(opts.cacheDir !== undefined ? [`--cache-dir=${opts.cacheDir}`] : []),
   ];
   const child = (opts.spawnServe ?? ((argv, so) => spawn(process.execPath, argv, so)))(serveArgv, {

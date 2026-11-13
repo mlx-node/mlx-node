@@ -128,11 +128,14 @@ describe('scanAgentArgs', () => {
       const scan = scanAgentArgs(['--persistent-cache', '-p', 'hi']);
       expect(scan.persistentCache).toBe(true);
       expect(scan.passthrough).toEqual(['-p', 'hi']);
+      const off = scanAgentArgs(['--no-persistent-cache', '-p', 'hi']);
+      expect(off.persistentCache).toBe(false);
+      expect(off.passthrough).toEqual(['-p', 'hi']);
     });
 
     it('does not hijack the flag when it sits in a value-consumer slot', () => {
       const scan = scanAgentArgs(['--system-prompt-override', '--persistent-cache']);
-      expect(scan.persistentCache).toBe(false);
+      expect(scan.persistentCache).toBeUndefined();
       expect(scan.passthrough).toEqual(['--system-prompt-override', '--persistent-cache']);
     });
   });
@@ -843,8 +846,9 @@ describe('run() argv routing', () => {
   it('exits 1 on bad SSD cache flags and hands good ones to the launcher', async () => {
     for (const argv of [
       ['--max-cache-disk', 'lots'],
-      ['--cache-dir', '/c'],
+      ['--no-persistent-cache', '--cache-dir', '/c'],
       ['--persistent-cache', '--max-cache-disk=0'],
+      ['--persistent-cache', '--no-persistent-cache'],
     ]) {
       const { deps, calls } = makeDeps();
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -869,6 +873,11 @@ describe('run() argv routing', () => {
     await run([], plain.deps);
     expect(plain.calls.launch[0]!.persistentCache).toBeUndefined();
     expect(plain.calls.launch[0]!.cacheDisk).toBeUndefined();
+
+    const off = makeDeps();
+    await run(['--no-persistent-cache'], off.deps);
+    expect(off.calls.launch[0]!.persistentCache).toBe(false);
+    expect(off.calls.launch[0]!.argv).not.toContain('--no-persistent-cache');
   });
 
   // Mutation: drop the `maxMemoryInvalid` usage check in `run` → red (a bad
