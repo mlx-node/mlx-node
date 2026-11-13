@@ -92,6 +92,7 @@ import {
   visibleAnswerText,
 } from '../mappers/anthropic-response.js';
 import { genId } from '../mappers/response.js';
+import { withNestedArguments } from '../mappers/tool-arguments.js';
 import {
   type ModelLoadAdmission,
   ModelLoadQueueFullError,
@@ -281,7 +282,7 @@ async function handleNonStreaming(
   // by default, matching how `cachedTokens` is treated through
   // `buildAnthropicResponse`.
   const response = buildAnthropicResponse(
-    responseResult,
+    { ...responseResult, toolCalls: withNestedArguments(responseResult.toolCalls, body.tools) },
     body,
     messageId,
     result.performance,
@@ -520,7 +521,10 @@ async function handleStreamingNativeWithAbort(
         const tagResidual = tagBuffer.flush();
         const heldPartial = stopBuffer.pending;
 
-        const parsedToolCalls = event.toolCalls.filter((t) => t.status === 'ok');
+        const parsedToolCalls = withNestedArguments(
+          event.toolCalls.filter((t) => t.status === 'ok'),
+          body.tools,
+        );
         if (!allowToolUse && parsedToolCalls.length > 0) {
           suppressedToolCalls = true;
         }
