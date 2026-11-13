@@ -11,6 +11,7 @@
 
 #include "mlx_paged_dispatch.h"
 #include "mlx_paged_metallib.h"
+#include "mlx_metallib_fallback.h"
 
 #include <algorithm>
 #include <atomic>

@@ -10,6 +10,7 @@
 #include "mlx/compile_impl.h"
 #include "mlx/backend/metal/metal.h"
 #include "mlx/backend/gpu/device_info.h"
+#include "mlx_metallib_fallback.h"
 
 #include <algorithm>
 #include <cmath>

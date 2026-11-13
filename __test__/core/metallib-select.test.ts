@@ -141,6 +141,45 @@ describe('collectMetallibCandidates', () => {
     expect(candidates[0]!.metallibPath).toBe(debug);
   });
 
+  /** Cargo >= 1.100 layout: `build/mlx-sys/<hash>/out` plus `run/invoked.timestamp`. */
+  function addUnitDir(rel: string, content: string, ageDays: number, stampAgeDays?: number): string {
+    const unitDir = join(root, rel);
+    const libDir = join(unitDir, 'out', 'lib');
+    mkdirSync(libDir, { recursive: true });
+    const metallib = join(libDir, 'mlx.metallib');
+    writeFileSync(metallib, content);
+    const when = new Date(Date.now() - ageDays * 86_400_000);
+    utimesSync(metallib, when, when);
+    if (stampAgeDays !== undefined) {
+      mkdirSync(join(unitDir, 'run'), { recursive: true });
+      const stamp = join(unitDir, 'run', 'invoked.timestamp');
+      writeFileSync(stamp, 'This file has an mtime of when this was started.');
+      const stampWhen = new Date(Date.now() - stampAgeDays * 86_400_000);
+      utimesSync(stamp, stampWhen, stampWhen);
+    }
+    return metallib;
+  }
+
+  it('finds cargo 1.100 build/mlx-sys/<hash>/out dirs and ranks them by run/invoked.timestamp', () => {
+    // The lib/build-script compile units of mlx-sys sit beside the run unit with no metallib.
+    mkdirSync(join(root, `${TRIPLE}/release/build/mlx-sys/0a0a0a0a0a0a0a0a/out`), { recursive: true });
+    addUnitDir(`${TRIPLE}/release/build/mlx-sys/aaaa1111aaaa1111`, 'other-toolchain', 2, 2);
+    const reused = addUnitDir(`${TRIPLE}/release/build/mlx-sys/bbbb2222bbbb2222`, 'current-build', 5, 0);
+
+    const candidates = collectMetallibCandidates(root, TRIPLE, 'release');
+    expect(candidates).toHaveLength(2);
+    expect(candidates[0]!.metallibPath).toBe(reused);
+    expect(candidates[0]!.outDir).toBe(join(root, `${TRIPLE}/release/build/mlx-sys/bbbb2222bbbb2222/out`));
+  });
+
+  it('ranks both layouts together when cargo < 1.100 and >= 1.100 share one target dir', () => {
+    addOutDir(`${TRIPLE}/release/build/mlx-sys-aaaa1111`, 'old-cargo', 7, true);
+    const fresh = addUnitDir(`${TRIPLE}/release/build/mlx-sys/ffff2222ffff2222`, 'new-cargo', 0, 0);
+    const candidates = collectMetallibCandidates(root, TRIPLE, 'release');
+    expect(candidates).toHaveLength(2);
+    expect(candidates[0]!.metallibPath).toBe(fresh);
+  });
+
   it.skipIf(runningAsRoot)(
     'THROWS when the newest candidate is untraversable (EACCES), instead of skipping it and picking an older one',
     () => {
@@ -312,6 +351,86 @@ describe('extractBakedMetallibBinding (prebuilt MLX sentinel)', () => {
     expect(() =>
       extractBakedMetallibBinding(fakeAddon([bakedPathFor(BAKED_DIR_A), sentinelFor(PREBUILT_TAG), PAGED_ORIGIN])),
     ).toThrow(/distinct METAL_PATH/);
+  });
+});
+
+/** Cargo >= 1.100 OUT_DIR form (`build/mlx-sys/<hash>/out`). */
+const NEW_LAYOUT_DIR_A = `/repo/target/${TRIPLE}/release/build/mlx-sys/407161123c8c9ab1/out`;
+const NEW_LAYOUT_DIR_B = `/repo/target/${TRIPLE}/release/build/mlx-sys/92e86f0b0e372b7d/out`;
+/** The METAL_PATH of mlx-prebuilt-6fe39a2b78f6-3d951e0b, verbatim from the failing CI run 43358288570. */
+const CI_SENTINEL =
+  '/Users/runner/work/mlx-node/mlx-node/target/aarch64-apple-darwin/release/build/mlx-sys-b4706bf8c7df393c/out/mlx-prebuilt/mlx-prebuilt-6fe39a2b78f6-3d951e0b/kernels/mlx.metallib';
+
+describe('extractBakedMetallibBinding (cargo 1.100 build-dir layout)', () => {
+  it('binds the CI prebuilt sentinel to a build/mlx-sys/<hash>/out paged origin', () => {
+    const addon = fakeAddon([
+      CI_SENTINEL,
+      `${NEW_LAYOUT_DIR_A}/paged_attn.metallib`,
+      // MLX_NODE_MLX_METALLIB (mlx_metallib_fallback.h) is not a METAL_PATH.
+      `${NEW_LAYOUT_DIR_A}/lib/mlx.metallib`,
+      "'paged_attn.metallib', ",
+    ]);
+    expect(extractBakedMetallibBinding(addon)).toEqual({
+      kind: 'prebuilt',
+      prebuiltTag: 'mlx-prebuilt-6fe39a2b78f6-3d951e0b',
+      outDir: NEW_LAYOUT_DIR_A,
+      libDir: `${NEW_LAYOUT_DIR_A}/lib`,
+      bakedPath: `${NEW_LAYOUT_DIR_A}/lib/mlx.metallib`,
+      installCopyPath: `${NEW_LAYOUT_DIR_A}/lib/mlx.metallib`,
+    });
+  });
+
+  it('binds a source METAL_PATH in the new layout, with and without the mlx-cmake child', () => {
+    expect(
+      extractBakedMetallibBinding(
+        fakeAddon([bakedPathFor(NEW_LAYOUT_DIR_A), `${NEW_LAYOUT_DIR_A}/paged_attn.metallib`]),
+      ),
+    ).toMatchObject({ kind: 'source', outDir: NEW_LAYOUT_DIR_A, libDir: `${NEW_LAYOUT_DIR_A}/lib` });
+    expect(extractBakedMetallibBinding(fakeAddon([bakedPathFor(`${NEW_LAYOUT_DIR_A}/mlx-cmake`, false)]))).toEqual({
+      kind: 'source',
+      outDir: NEW_LAYOUT_DIR_A,
+      libDir: `${NEW_LAYOUT_DIR_A}/mlx-cmake/lib`,
+      bakedPath: `${NEW_LAYOUT_DIR_A}/mlx-cmake/build/mlx/backend/metal/kernels/mlx.metallib`,
+      installCopyPath: `${NEW_LAYOUT_DIR_A}/mlx-cmake/lib/mlx.metallib`,
+    });
+  });
+
+  it('still tells two mlx-sys builds apart across and within layouts', () => {
+    expect(() =>
+      extractBakedMetallibBinding(fakeAddon([bakedPathFor(NEW_LAYOUT_DIR_A), `${BAKED_DIR_A}/paged_attn.metallib`])),
+    ).toThrow('two different mlx-sys builds');
+    expect(() =>
+      extractBakedMetallibBinding(
+        fakeAddon([bakedPathFor(NEW_LAYOUT_DIR_A), `${NEW_LAYOUT_DIR_B}/paged_attn.metallib`]),
+      ),
+    ).toThrow('two different mlx-sys builds');
+    expect(() =>
+      extractBakedMetallibBinding(
+        fakeAddon([CI_SENTINEL, `${NEW_LAYOUT_DIR_A}/paged_attn.metallib`, `${BAKED_DIR_A}/paged_attn.metallib`]),
+      ),
+    ).toThrow('distinct paged_attn.metallib origins');
+  });
+
+  it('rejects paths that only resemble an mlx-sys OUT_DIR', () => {
+    for (const origin of [
+      `/repo/target/release/build/mlx-sys/out/paged_attn.metallib`,
+      `/repo/target/release/build/mlx-sys/407161123C8C9AB1/out/paged_attn.metallib`,
+      `/repo/target/release/build/mlx-sys/407161123c8c9ab1/lib/paged_attn.metallib`,
+      `/repo/target/release/build/mlx-sys-/out/paged_attn.metallib`,
+      `/repo/target/release/build/mlx-sysx/407161123c8c9ab1/out/paged_attn.metallib`,
+      `/repo/target/release/build/mlx-core/407161123c8c9ab1/out/paged_attn.metallib`,
+      `repo/target/release/build/mlx-sys/407161123c8c9ab1/out/paged_attn.metallib`,
+      `/repo/target/release/build/mlx-sys/407161123c8c9ab1/out/paged_attn.metallib.bak`,
+    ]) {
+      expect(() => extractBakedMetallibBinding(fakeAddon([CI_SENTINEL, origin]))).toThrow(
+        'bakes no paged_attn.metallib origin',
+      );
+    }
+    expect(
+      extractBakedMetallibBinding(
+        fakeAddon([`/repo/target/release/build/mlx-sys/abc/out/build/mlx/backend/metal/kernels///mlx.metallib`]),
+      ),
+    ).toBeUndefined();
   });
 });
 
@@ -540,6 +659,23 @@ describe('selectMetallib', () => {
     });
     expect(picked).toEqual({ source: 'prebuilt', metallibPath: linked, outDir, libDir });
     expect(warnings).toHaveLength(0);
+  });
+
+  it('PREBUILT: ships <OUT_DIR>/lib/mlx.metallib of a cargo 1.100 build/mlx-sys/<hash>/out build', () => {
+    const outDir = join(root, `${TRIPLE}/release/build/mlx-sys/407161123c8c9ab1/out`);
+    const libDir = join(outDir, 'lib');
+    mkdirSync(libDir, { recursive: true });
+    const linked = join(libDir, 'mlx.metallib');
+    writeFileSync(linked, 'release-bytes');
+    const picked = selectMetallib({
+      addonBinary: fakeAddon([CI_SENTINEL, `${outDir}/paged_attn.metallib`, `${outDir}/lib/mlx.metallib`]),
+      addonPath: 'fake.node',
+      targetRoot: root,
+      triple: TRIPLE,
+      profile: 'release',
+      strict: true,
+    });
+    expect(picked).toEqual({ source: 'prebuilt', metallibPath: linked, outDir, libDir });
   });
 
   it('PREBUILT: throws (never scans) when <OUT_DIR>/lib/mlx.metallib is missing', () => {
