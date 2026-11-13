@@ -3,9 +3,7 @@
 //! MLX-DB: Shared database operations for MLX-Node
 //!
 //! This crate provides SQLite database operations using sqlx for storing and querying
-//! training outputs. It's shared between:
-//! - `mlx-core`: NAPI bindings for Node.js (async API)
-//! - `mlx-tui`: Native Rust TUI (sync API via `SyncDbReader`)
+//! training outputs through `mlx-core`'s NAPI bindings for Node.js.
 //!
 //! ## Features
 //!
@@ -20,17 +18,7 @@
 //! ### Async (for mlx-core/Node.js)
 //!
 //! Reader and writer functions take a `&SqlitePool` opened by the caller.
-//!
-//! ### Sync (for mlx-tui)
-//!
-//! ```ignore
-//! use mlx_db::{SyncDbReader, reader};
-//!
-//! let db = SyncDbReader::open("outputs.db")?;
-//! let runs = db.block_on(reader::list_runs(db.pool(), None, None))?;
-//! ```
 
-pub mod connection;
 pub mod error;
 pub mod reader;
 pub mod response_store;
@@ -39,7 +27,6 @@ pub mod types;
 pub mod writer;
 
 // Re-export main types for convenience
-pub use connection::SyncDbReader;
 pub use error::DbError;
 pub use types::*;
 

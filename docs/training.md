@@ -52,14 +52,6 @@ Capabilities:
 - `loadLocalGsm8kDataset` — preloads a JSONL gsm8k file
 - `SFTDataset`, `createSFTDataset` — SFT-format dataset
 
-## Training TUI
-
-```bash
-cargo build --release -p mlx-tui
-```
-
-Produces the `mlx-train` binary (Ratatui-based) — the standalone interactive training UI. `mlx-tui` is not part of the npm workspace; it talks to the same training engines through the Rust crates directly.
-
 ## Persistence
 
 Training outputs flow through three layers:

@@ -10,5 +10,4 @@ crate-type = ["rlib"]
 sqlx = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
 thiserror = { workspace = true }

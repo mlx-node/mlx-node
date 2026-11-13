@@ -263,11 +263,11 @@ function validateInputs(args: CliArgs): ValidationResult {
 
 const args = parseCliArgs();
 
-// Create logger (auto-detects TUI mode from MLX_TUI_MODE env var)
+// Create console/JSONL logger
 const logger = createTrainingLogger({
   outputDir: args.outputDir,
   runName: args.runName,
-  logConsole: process.env.MLX_TUI_MODE !== '1',
+  logConsole: true,
   logJsonl: true,
 });
 

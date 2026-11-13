@@ -337,8 +337,7 @@ import { convertModel, convertParquetToJsonl } from '@mlx-node/trl';
 
 - **Checkpoint resume** — automatic state restoration including optimizer, step count, and dataset position
 - **Emergency save** — catches NaN gradients and SIGTERM/SIGINT for safe recovery
-- **TUI mode** — interactive terminal UI with pause/resume/stop (via `mlx-tui` binary)
-- **JSONL logging** — structured training logs for external monitoring
+- **Console and JSONL logging** — live progress and structured training logs for external monitoring
 - **Multi-model** — supports Qwen3, Qwen3.5 Dense, and Qwen3.5 MoE architectures
 - **Reward timeout** — configurable timeout for async reward functions (default 60s)
 - **Path security** — traversal prevention for dataset file loading

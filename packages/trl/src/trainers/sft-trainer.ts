@@ -25,7 +25,6 @@
 
 import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, copyFileSync, rmSync } from 'node:fs';
 import { join, parse } from 'node:path';
-import * as readline from 'node:readline';
 
 import {
   SftTrainingEngine,
@@ -83,12 +82,8 @@ export class SFTTrainer {
   /** Original model path (for tokenizer files when saving checkpoints) */
   private originalModelPath?: string;
 
-  // TUI state
-  private paused: boolean = false;
   private stopRequested: boolean = false;
-  private stdinInterface?: readline.Interface;
   private logger: TrainingLogger;
-  private sampleDisplayMode: 'all' | 'best_worst' | 'random' = 'all';
   private signalHandlersInstalled: boolean = false;
 
   /**
@@ -105,12 +100,6 @@ export class SFTTrainer {
     config: Partial<SFTTrainerConfig> = {},
     logger?: TrainingLogger,
   ) {
-    // Auto-detect TUI mode from environment variable
-    const tuiModeFromEnv = process.env.MLX_TUI_MODE === '1';
-    if (tuiModeFromEnv && config.tuiMode === undefined) {
-      config.tuiMode = true;
-    }
-
     this.config = mergeSFTConfig(getDefaultSFTConfig(), config);
     this.model = model;
     this.tokenizer = tokenizer;
@@ -119,7 +108,7 @@ export class SFTTrainer {
     this.logger =
       logger ??
       createTrainingLogger({
-        logConsole: !this.config.tuiMode,
+        logConsole: true,
         logJsonl: this.config.logJsonl,
         outputDir: this.config.outputDir,
         runName: this.config.runName,
@@ -144,11 +133,6 @@ export class SFTTrainer {
       this.engine = new SftTrainingEngine(model, engineConfig);
     } else {
       throw new Error(`Unsupported model type: ${(model as object).constructor?.name ?? typeof model}`);
-    }
-
-    // Setup stdin handler if TUI mode
-    if (this.config.tuiMode) {
-      this.setupStdinHandler();
     }
   }
 
@@ -187,71 +171,6 @@ export class SFTTrainer {
   }
 
   /**
-   * Setup stdin handler for TUI control commands
-   */
-  private setupStdinHandler(): void {
-    if (!this.config.tuiMode) return;
-
-    this.stdinInterface = readline.createInterface({
-      input: process.stdin,
-      output: process.stdout,
-      terminal: false,
-    });
-
-    this.stdinInterface.on('line', (line: string) => {
-      const cmd = line.trim();
-      this.handleStdinCommand(cmd);
-    });
-  }
-
-  /**
-   * Handle a command received from stdin
-   */
-  private handleStdinCommand(cmd: string): void {
-    switch (cmd) {
-      case 'PAUSE':
-        this.paused = true;
-        this.logger.paused(this.currentStep);
-        break;
-      case 'RESUME':
-        this.paused = false;
-        this.logger.resumed(this.currentStep);
-        break;
-      case 'SAVE_CHECKPOINT':
-        this.saveCheckpoint().catch(() => {});
-        break;
-      case 'STOP':
-        this.stopRequested = true;
-        break;
-      default:
-        // Handle SET commands (e.g., SET sample_display=best_worst)
-        if (cmd.startsWith('SET ')) {
-          const keyValue = cmd.slice(4); // Remove 'SET ' prefix
-          const eqIdx = keyValue.indexOf('=');
-          if (eqIdx > 0) {
-            const key = keyValue.slice(0, eqIdx);
-            const value = keyValue.slice(eqIdx + 1);
-            if (key === 'sample_display') {
-              if (value === 'all' || value === 'best_worst' || value === 'random') {
-                this.sampleDisplayMode = value;
-              }
-            }
-          }
-        }
-        break;
-    }
-  }
-
-  /**
-   * Wait for resume if paused
-   */
-  private async waitForResume(): Promise<void> {
-    while (this.paused && !this.stopRequested) {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-  }
-
-  /**
    * Create a trainer by loading a model from disk
    *
    * @param config - Configuration including modelPath
@@ -264,7 +183,7 @@ export class SFTTrainer {
 
     // Create logger early
     const logger = createTrainingLogger({
-      logConsole: !config.tuiMode,
+      logConsole: true,
       logJsonl: config.logJsonl ?? true,
       outputDir: config.outputDir,
       runName: config.runName,
@@ -470,12 +389,6 @@ export class SFTTrainer {
           continue;
         }
 
-        // Wait if paused
-        if (this.paused) {
-          await this.waitForResume();
-          if (this.stopRequested) break;
-        }
-
         // Run training step
         const { metrics } = await this.trainStep(batch);
 
@@ -546,11 +459,6 @@ export class SFTTrainer {
 
     // Log completion
     this.logger.complete(this.currentStep);
-
-    // Cleanup
-    if (this.stdinInterface) {
-      this.stdinInterface.close();
-    }
   }
 
   /**
