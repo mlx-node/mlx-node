@@ -10,6 +10,7 @@ import { guarded } from '../../chat/route-errors.js';
 import {
   agentActionInput,
   createConversationInput,
+  draftPermissionModeInput,
   idParam,
   interactionInput,
   modeQuery,
@@ -17,6 +18,7 @@ import {
   patchConversationInput,
   permissionModeInput,
   promptInput,
+  workHooksQuery,
 } from '../../chat/route-input.js';
 import type { ChatService } from '../../chat/service.js';
 import { agentTitle } from '../../chat/titles.js';
@@ -113,6 +115,26 @@ export function handleChatPermissionMode(ctx: MainApiContext, req: ApiRequest): 
     const id = idParam(req.params.id);
     const input = permissionModeInput(requireBody(req));
     return service(ctx).setPermissionMode(id, input.mode, input.up, input.temp);
+  });
+}
+
+/**
+ * `POST /api/chat/drafts/:draft/permission-mode {mode, up, cwd?, temp?}`: the mode picked on the New Work screen,
+ * kept by the Control Panel for that draft and folder until the first message makes the conversation.
+ */
+export function handleChatDraftPermissionMode(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
+  return guarded('chat', () => {
+    const draft = idParam(req.params.draft);
+    const input = draftPermissionModeInput(requireBody(req));
+    return service(ctx).setDraftPermissionMode(draft, input.mode, input.up, input.cwd, input.temp);
+  });
+}
+
+/** `GET /api/chat/work/hooks?cwd=`: whether the user has tool hooks for that Work folder. */
+export function handleChatWorkHooks(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
+  return guarded('chat', () => {
+    noBody(req.body);
+    return service(ctx).workHooks(workHooksQuery(req.query));
   });
 }
 

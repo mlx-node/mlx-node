@@ -1329,3 +1329,358 @@ describe('the temp folder Auto covers', () => {
     }
   });
 });
+
+describe('the mode picked on the New Work screen', () => {
+  type Hooked = { startTurn: (conversation: Conversation, text: string, cwd?: string) => { turnId: string } };
+
+  /** Runs `spy` at each start of a turn while `run` runs. */
+  async function onStart(svc: ChatService, spy: (conversation: Conversation) => void, run: () => Promise<void>) {
+    const target = svc as unknown as Hooked;
+    const original = target.startTurn;
+    target.startTurn = function (this: ChatService, conversation, text, cwd) {
+      spy(conversation);
+      return Reflect.apply(original, this, [conversation, text, cwd]) as { turnId: string };
+    };
+    try {
+      await run();
+    } finally {
+      target.startTurn = original;
+    }
+  }
+
+  async function settledTurn(svc: ChatService, id: string): Promise<Page> {
+    const page = new Page(svc, id);
+    await until(() => page.state !== null && page.state.turn === null && (page.state.entries.length ?? 0) > 1, 8_000);
+    return page;
+  }
+
+  it('Bypass, then the first message: the mode line is on disk before the turn starts; its call runs with no card', async () => {
+    await withWork(async (fake, project) => {
+      const svc = fake.service;
+      const host = hostState(svc);
+      expect(await svc.setDraftPermissionMode('d1', 'bypass', true, project, null)).toEqual({ mode: 'bypass' });
+      await until(() => host.last()?.state.permissionDraft?.draft === 'd1');
+      expect(host.last()?.state.permissionDraft).toEqual({ draft: 'd1', mode: 'bypass' });
+      let atStart: Json[] | null = null;
+      let made: Awaited<ReturnType<ChatService['create']>> | null = null;
+      await onStart(
+        svc,
+        (c) => {
+          atStart = logLines(fake, c.info.id);
+          expect(svc.modeOf(c.info.id)).toBe('bypass');
+        },
+        async () => {
+          made = await svc.create({ mode: 'work', text: 'printf', cwd: project, draft: 'd1' });
+        },
+      );
+      const id = made!.conversation.id;
+      expect(made!.conversation.permissionMode).toBe('bypass');
+      expect(atStart).toEqual([expect.objectContaining({ kind: 'mode', mode: 'bypass', from: 'ask', by: 'user' })]);
+      await until(() => host.last()?.state.permissionRaised.some((r) => r.id === id && r.mode === 'bypass') === true);
+      expect(host.last()?.state.permissionDraft).toBeNull();
+      const page = await settledTurn(svc, id);
+      expect(page.cards()).toEqual([]);
+      expect(page.marks().map((m) => m.kind)).toEqual(['mode', 'allowed']);
+      expect(page.marks()[1]).toMatchObject({ kind: 'allowed', mode: 'bypass', card: { command: "printf '%d\\n' 5" } });
+      page.detach();
+      host.off();
+    });
+  }, 30_000);
+
+  it('the first message in another folder: Ask, and the pick is gone', async () => {
+    await withWork(async (fake, project) => {
+      const svc = fake.service;
+      const other = join(fake.root, 'home', 'code', 'other');
+      mkdirSync(other, { recursive: true });
+      await svc.setDraftPermissionMode('d1', 'bypass', true, project, null);
+      const { conversation } = await svc.create({ mode: 'work', text: 'ls', cwd: other, draft: 'd1' });
+      expect([conversation.permissionMode, svc.modeOf(conversation.id)]).toEqual(['ask', 'ask']);
+      expect((await svc.state()).permissionDraft).toBeNull();
+      const page = new Page(svc, conversation.id);
+      await until(() => page.cards().length === 1, 5_000);
+      await svc.answer(conversation.id, page.cards()[0]!.id, { optionId: 'reject-once' });
+      page.detach();
+      expect(logLines(fake, conversation.id)).toEqual([]);
+    });
+  }, 30_000);
+
+  it('one pick, one conversation: a second first message with the same draft is Ask', async () => {
+    await withWork(async (fake, project) => {
+      const svc = fake.service;
+      await svc.setDraftPermissionMode('d1', 'auto', true, project, null);
+      const a = await svc.create({ mode: 'work', text: 'ls', cwd: project, draft: 'd1' });
+      const b = await svc.create({ mode: 'work', text: 'ls', cwd: project, draft: 'd1' });
+      expect([a.conversation.permissionMode, b.conversation.permissionMode]).toEqual(['auto', 'ask']);
+      const up = await apiError(svc.setDraftPermissionMode('d1', 'bypass', true, project, null));
+      expect([up.code, up.reason]).toEqual(['E_CONFLICT', 'mode-changed']);
+      (await settledTurn(svc, a.conversation.id)).detach();
+      const page = new Page(svc, b.conversation.id);
+      await until(() => page.cards().length === 1, 5_000);
+      await svc.answer(b.conversation.id, page.cards()[0]!.id, { optionId: 'reject-once' });
+      page.detach();
+    });
+  }, 30_000);
+
+  it('a move down on the draft: to Ask the first message is Ask; Bypass to Auto starts in Auto with the temp folder', async () => {
+    const holder = realpathSync(mkdtempSync(join(tmpdir(), 'mlx-temp-holder-')));
+    const top = join(holder, 't');
+    mkdirSync(top);
+    try {
+      await withWork(
+        async (fake, project) => {
+          const svc = fake.service;
+          await svc.setDraftPermissionMode('d1', 'bypass', true, project, null);
+          expect(await svc.setDraftPermissionMode('d1', 'ask', false, null, null)).toEqual({ mode: 'ask' });
+          expect((await svc.state()).permissionDraft).toBeNull();
+          const a = await svc.create({ mode: 'work', text: 'printf', cwd: project, draft: 'd1' });
+          expect(a.conversation.permissionMode).toBe('ask');
+          await svc.cancel(a.conversation.id);
+          await svc.setDraftPermissionMode('d2', 'bypass', true, project, null);
+          expect(await svc.setDraftPermissionMode('d2', 'auto', false, null, null)).toEqual({ mode: 'auto' });
+          expect((await svc.state()).permissionDraft).toEqual({ draft: 'd2', mode: 'auto' });
+          const b = await svc.create({ mode: 'work', text: 'ls', cwd: project, draft: 'd2' });
+          expect(b.conversation.permissionMode).toBe('auto');
+          expect(logLines(fake, b.conversation.id)[0]).toMatchObject({
+            kind: 'mode',
+            mode: 'auto',
+            from: 'ask',
+            temp: true,
+          });
+          (await settledTurn(svc, b.conversation.id)).detach();
+        },
+        { tempRoots: [{ top, spellings: [top, '/tmp'], kind: 'temp' }] },
+      );
+    } finally {
+      rmSync(holder, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('a first message that fails before its conversation exists keeps the pick; the next one takes it', async () => {
+    await withWork(
+      async (fake, project) => {
+        const svc = fake.service;
+        await svc.setDraftPermissionMode('d1', 'bypass', true, project, null);
+        const host = (svc as unknown as { hosts: { work: { createSession: (o: unknown) => Promise<unknown> } } }).hosts
+          .work;
+        const original = host.createSession;
+        host.createSession = () => new Promise(() => {});
+        const slow = await apiError(svc.create({ mode: 'work', text: 'printf', cwd: project, draft: 'd1' }));
+        host.createSession = original;
+        expect(slow.reason).toBe('agent-slow');
+        expect((await svc.state()).permissionDraft).toEqual({ draft: 'd1', mode: 'bypass' });
+        const made = await svc.create({ mode: 'work', text: 'printf', cwd: project, draft: 'd1' });
+        expect(made.conversation.permissionMode).toBe('bypass');
+        (await settledTurn(svc, made.conversation.id)).detach();
+      },
+      { createBudgetMs: 1_500 },
+    );
+  }, 30_000);
+
+  it('a mode line that cannot be written at the first message: Ask, the turn runs, and its call is a card', async () => {
+    await withWork(async (fake, project) => {
+      const svc = fake.service;
+      await svc.setDraftPermissionMode('d1', 'bypass', true, project, null);
+      let made: Awaited<ReturnType<ChatService['create']>> | null = null;
+      await patchAppend(
+        async (line, original) => {
+          if (line.kind === 'mode') throw new Error('disk full');
+          await original();
+        },
+        async () => {
+          made = await svc.create({ mode: 'work', text: 'ls', cwd: project, draft: 'd1' });
+        },
+      );
+      const id = made!.conversation.id;
+      expect([made!.conversation.permissionMode, svc.modeOf(id)]).toEqual(['ask', 'ask']);
+      const page = new Page(svc, id);
+      await until(() => page.cards().length === 1, 5_000);
+      expect((page.cards()[0] as PermissionInteraction).autoAsk).toBeUndefined();
+      await svc.answer(id, page.cards()[0]!.id, { optionId: 'reject-once' });
+      page.detach();
+    });
+  }, 30_000);
+
+  it('an up that waits on the folder check, then a down: 409 mode-changed and no pick', async () => {
+    await withWork(async (_fake, project) => {
+      const svc = _fake.service;
+      const up = apiError(svc.setDraftPermissionMode('d1', 'bypass', true, project, null));
+      expect(await svc.setDraftPermissionMode('d1', 'ask', false, null, null)).toEqual({ mode: 'ask' });
+      const refused = await up;
+      expect([refused.code, refused.reason]).toEqual(['E_CONFLICT', 'mode-changed']);
+      expect((await svc.state()).permissionDraft).toBeNull();
+    });
+  }, 30_000);
+
+  it('a move down above the draft mode (a stale view) is 409 and moves nothing up', async () => {
+    await withWork(async (_fake, project) => {
+      const svc = _fake.service;
+      for (const mode of ['auto', 'bypass'] as const) {
+        const stale = await apiError(svc.setDraftPermissionMode('d1', mode, false, null, null));
+        expect([mode, stale.code, stale.reason]).toEqual([mode, 'E_CONFLICT', 'mode-changed']);
+      }
+      await svc.setDraftPermissionMode('d1', 'auto', true, project, null);
+      const stale = await apiError(svc.setDraftPermissionMode('d1', 'bypass', false, null, null));
+      expect([stale.code, stale.reason]).toEqual(['E_CONFLICT', 'mode-changed']);
+      expect((await svc.state()).permissionDraft).toEqual({ draft: 'd1', mode: 'auto' });
+    });
+  }, 30_000);
+
+  it('Auto on a draft must name the temp folder Auto covers', async () => {
+    const holder = realpathSync(mkdtempSync(join(tmpdir(), 'mlx-temp-holder-')));
+    const top = join(holder, 't');
+    mkdirSync(top);
+    try {
+      await withWork(
+        async (fake, project) => {
+          const svc = fake.service;
+          for (const temp of [null, top, '/private/tmp']) {
+            const refused = await apiError(svc.setDraftPermissionMode('d1', 'auto', true, project, temp));
+            expect([temp, refused.code, refused.reason]).toEqual([temp, 'E_CONFLICT', 'temp-unnamed']);
+          }
+          expect((await svc.state()).permissionDraft).toBeNull();
+          expect(await svc.setDraftPermissionMode('d1', 'auto', true, project, '/tmp')).toEqual({ mode: 'auto' });
+          expect(await svc.setDraftPermissionMode('d1', 'bypass', true, project, null)).toEqual({ mode: 'bypass' });
+        },
+        { tempRoots: [{ top, spellings: [top, '/tmp'], kind: 'temp' }] },
+      );
+    } finally {
+      rmSync(holder, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('a down on the draft while the first message raises the mode: Ask; a down after it moves the conversation', async () => {
+    await withWork(async (fake, project) => {
+      const svc = fake.service;
+      await svc.setDraftPermissionMode('d1', 'bypass', true, project, null);
+      const held = holdFolderCheck(svc);
+      const making = svc.create({ mode: 'work', text: 'ls', cwd: project, draft: 'd1' });
+      await until(() => held.entered(), 5_000);
+      expect(await svc.setDraftPermissionMode('d1', 'auto', false, null, null)).toEqual({ mode: 'ask' });
+      held.release();
+      const a = await making;
+      expect([a.conversation.permissionMode, svc.modeOf(a.conversation.id)]).toEqual(['ask', 'ask']);
+      const page = new Page(svc, a.conversation.id);
+      await until(() => page.cards().length === 1, 5_000);
+      await svc.answer(a.conversation.id, page.cards()[0]!.id, { optionId: 'reject-once' });
+      page.detach();
+
+      await svc.setDraftPermissionMode('d2', 'bypass', true, project, null);
+      const b = await svc.create({ mode: 'work', text: 'printf', cwd: project, draft: 'd2' });
+      expect(b.conversation.permissionMode).toBe('bypass');
+      expect(await svc.setDraftPermissionMode('d2', 'auto', false, null, null)).toEqual({ mode: 'auto' });
+      expect(svc.modeOf(b.conversation.id)).toBe('auto');
+      expect(await svc.setDraftPermissionMode('d2', 'ask', false, null, null)).toEqual({ mode: 'ask' });
+      expect(svc.modeOf(b.conversation.id)).toBe('ask');
+      await until(() => modeLines(fake, b.conversation.id).length === 3, 5_000);
+      expect(modeLines(fake, b.conversation.id)).toEqual(['ask>bypass:user', 'bypass>auto:user', 'auto>ask:user']);
+      await svc.cancel(b.conversation.id);
+    });
+  }, 30_000);
+
+  it('a down on the sent draft after another pick of a draft still reaches its conversation', async () => {
+    await withWork(async (fake, project) => {
+      const svc = fake.service;
+      await svc.setDraftPermissionMode('d1', 'bypass', true, project, null);
+      const held = holdFolderCheck(svc);
+      const making = svc.create({ mode: 'work', text: 'ls', cwd: project, draft: 'd1' });
+      await until(() => held.entered(), 5_000);
+      await svc.setDraftPermissionMode('d2', 'auto', true, project, null);
+      expect(await svc.setDraftPermissionMode('d1', 'ask', false, null, null)).toEqual({ mode: 'ask' });
+      held.release();
+      const made = await making;
+      const id = made.conversation.id;
+      expect([made.conversation.permissionMode, svc.modeOf(id)]).toEqual(['ask', 'ask']);
+      expect((await svc.state()).permissionDraft).toEqual({ draft: 'd2', mode: 'auto' });
+      const page = new Page(svc, id);
+      await until(() => page.cards().length === 1, 5_000);
+      await svc.answer(id, page.cards()[0]!.id, { optionId: 'reject-once' });
+      page.detach();
+    });
+  }, 30_000);
+
+  it('a down on the sent draft after the last window went still reaches its conversation', async () => {
+    const fake = fakeService('work-permission', { mutate: SCRIPTS });
+    try {
+      const svc = fake.service;
+      const project = join(fake.root, 'home', 'code', 'app');
+      mkdirSync(project, { recursive: true });
+      const window = hostState(svc);
+      await svc.setDraftPermissionMode('d1', 'bypass', true, project, null);
+      const held = holdFolderCheck(svc);
+      const making = svc.create({ mode: 'work', text: 'ls', cwd: project, draft: 'd1' });
+      await until(() => held.entered(), 5_000);
+      window.off();
+      expect(await svc.setDraftPermissionMode('d1', 'ask', false, null, null)).toEqual({ mode: 'ask' });
+      held.release();
+      const made = await making;
+      const id = made.conversation.id;
+      expect([made.conversation.permissionMode, svc.modeOf(id)]).toEqual(['ask', 'ask']);
+      await svc.cancel(id);
+    } finally {
+      await fake.close();
+    }
+  }, 30_000);
+
+  it('a turn that cannot start after the raise leaves the conversation in Ask', async () => {
+    await withWork(async (fake, project) => {
+      const svc = fake.service;
+      await svc.setDraftPermissionMode('d1', 'bypass', true, project, null);
+      let id = '';
+      const target = svc as unknown as Hooked;
+      const original = target.startTurn;
+      target.startTurn = (conversation) => {
+        id = conversation.info.id;
+        throw routeError('chat', new Error('no turn'));
+      };
+      try {
+        await apiError(svc.create({ mode: 'work', text: 'printf', cwd: project, draft: 'd1' }));
+      } finally {
+        target.startTurn = original;
+      }
+      expect(svc.modeOf(id)).toBe('ask');
+      await until(() => modeLines(fake, id).length === 2, 5_000);
+      expect(modeLines(fake, id)).toEqual(['ask>bypass:user', 'bypass>ask:user']);
+    });
+  }, 30_000);
+
+  it('the last window closes: the pick goes; after a Control Panel restart nothing is picked', async () => {
+    const fake = fakeService('work-permission', { mutate: SCRIPTS });
+    try {
+      const project = join(fake.root, 'home', 'code', 'app');
+      mkdirSync(project, { recursive: true });
+      const a = hostState(fake.service);
+      const b = hostState(fake.service);
+      await fake.service.setDraftPermissionMode('d1', 'bypass', true, project, null);
+      a.off();
+      expect((await fake.service.state()).permissionDraft).toEqual({ draft: 'd1', mode: 'bypass' });
+      b.off();
+      expect((await fake.service.state()).permissionDraft).toBeNull();
+      const c = hostState(fake.service);
+      await fake.service.setDraftPermissionMode('d2', 'bypass', true, project, null);
+      await fake.service.close();
+      const next = fake.restart();
+      expect((await next.state()).permissionDraft).toBeNull();
+      const made = await next.create({ mode: 'work', text: 'ls', cwd: project, draft: 'd2' });
+      expect(made.conversation.permissionMode).toBe('ask');
+      await next.cancel(made.conversation.id);
+      c.off();
+    } finally {
+      await fake.close();
+    }
+  }, 30_000);
+
+  it('one pick at a time: a second draft replaces the first, whose first message is Ask', async () => {
+    await withWork(async (_fake, project) => {
+      const svc = _fake.service;
+      await svc.setDraftPermissionMode('d1', 'bypass', true, project, null);
+      await svc.setDraftPermissionMode('d2', 'auto', true, project, null);
+      expect((await svc.state()).permissionDraft).toEqual({ draft: 'd2', mode: 'auto' });
+      const made = await svc.create({ mode: 'work', text: 'ls', cwd: project, draft: 'd1' });
+      expect(made.conversation.permissionMode).toBe('ask');
+      const page = new Page(svc, made.conversation.id);
+      await until(() => page.cards().length === 1, 5_000);
+      await svc.answer(made.conversation.id, page.cards()[0]!.id, { optionId: 'reject-once' });
+      page.detach();
+    });
+  }, 30_000);
+});

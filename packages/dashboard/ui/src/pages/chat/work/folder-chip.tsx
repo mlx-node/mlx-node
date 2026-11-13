@@ -55,6 +55,7 @@ export function NewFolderChip({ folder, recent, onChoose, onPick }: NewFolderChi
         <ToolChip
           icon={icon}
           label={label}
+          give={1}
           state={folder === null ? 'off' : 'on'}
           title={folder === null ? undefined : tildePath(folder, home)}
           aria-label={folder === null ? CHAT.folderChoose : fill(CHAT.folderLabel, { folder: tildePath(folder, home) })}
@@ -101,6 +102,7 @@ export function OpenFolderChip({ folder }: { folder: string }): ReactElement {
         <ToolChip
           icon={icon}
           label={truncateMiddle(folderName(folder), NAME_CHARS)}
+          give={1}
           title={shown}
           aria-label={fill(CHAT.folderLabel, { folder: shown })}
         />

@@ -18,11 +18,25 @@ export interface ToolChipProps extends Omit<ButtonHTMLAttributes<HTMLButtonEleme
   tone?: 'active' | 'danger';
   /** The label stays where a narrow row drops the labels of its chips. */
   keepLabel?: boolean;
+  /** Where it shortens in a full row: 1 first, then 2. A label of 8 characters or fewer never shortens. */
+  give?: 1 | 2;
 }
 
 /** A 28 px pill that names a tool of the composer and opens its menu. */
 export const ToolChip = forwardRef<HTMLButtonElement, ToolChipProps>(function ToolChip(
-  { icon, label, state = 'on', dot, compact = false, tone, keepLabel = false, className, type = 'button', ...rest },
+  {
+    icon,
+    label,
+    state = 'on',
+    dot,
+    compact = false,
+    tone,
+    keepLabel = false,
+    give,
+    className,
+    type = 'button',
+    ...rest
+  },
   ref,
 ) {
   const chip = (
@@ -34,6 +48,7 @@ export const ToolChip = forwardRef<HTMLButtonElement, ToolChipProps>(function To
       data-compact={compact ? '' : undefined}
       data-chip-tone={tone}
       data-keep-label={keepLabel ? '' : undefined}
+      data-give={give !== undefined && label.length > 8 ? give : undefined}
       aria-label={rest['aria-label'] ?? label}
       {...rest}
     >

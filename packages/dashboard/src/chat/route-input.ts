@@ -103,21 +103,30 @@ export interface CreateConversationInput {
   text: string;
   modelId?: string;
   cwd?: string;
+  /** Work: the New screen's draft id. The mode picked for it is the Control Panel's record, never the page's word. */
+  draft?: string;
 }
 
 export function createConversationInput(body: unknown): CreateConversationInput {
-  const record = exactBody(body, { mode: 'string', text: 'string', modelId: 'string', cwd: 'string' }, [
-    'mode',
-    'text',
-  ]);
+  const record = exactBody(
+    body,
+    { mode: 'string', text: 'string', modelId: 'string', cwd: 'string', draft: 'string' },
+    ['mode', 'text'],
+  );
   const mode = checkMode(record.mode);
   if (record.cwd !== undefined && mode !== 'work') throw bad('Field "cwd" is only accepted in Work mode.');
+  if (record.draft !== undefined && mode !== 'work') throw bad('Field "draft" is only accepted in Work mode.');
   const input: CreateConversationInput = { mode, text: checkText(record.text as string) };
   if (record.modelId !== undefined) input.modelId = checkModelId(record.modelId as string);
   if (record.cwd !== undefined) {
     const cwd = record.cwd as string;
     if (cwd === '' || cwd.length > MAX_CWD_CHARS) throw chatRouteError('cwd-invalid');
     input.cwd = cwd;
+  }
+  if (record.draft !== undefined) {
+    const draft = record.draft as string;
+    if (!isIdShape(draft)) throw bad('Field "draft" is not a draft id.');
+    input.draft = draft;
   }
   return input;
 }
@@ -177,6 +186,35 @@ export function permissionModeInput(body: unknown): { mode: PermissionMode; up: 
   return { mode, up: record.up as boolean, temp };
 }
 
+export interface DraftPermissionModeInput {
+  mode: PermissionMode;
+  up: boolean;
+  /** The folder the confirm named: required with `up: true`, refused with `up: false`. */
+  cwd: string | null;
+  temp: string | null;
+}
+
+/** `{mode, up, cwd?, temp?}` exactly: the mode picked on the New Work screen. A move up names its folder. */
+export function draftPermissionModeInput(body: unknown): DraftPermissionModeInput {
+  const record = exactBody(body, { mode: 'string', up: 'boolean', cwd: 'string', temp: 'string' }, ['mode', 'up']);
+  const { mode, up, temp } = permissionModeInput({
+    mode: record.mode,
+    up: record.up,
+    ...(record.temp === undefined ? {} : { temp: record.temp }),
+  });
+  const cwd = record.cwd === undefined ? null : (record.cwd as string);
+  if (!up && (cwd !== null || temp !== null)) throw bad('A move down names no folder.');
+  if (up && (cwd === null || cwd === '' || cwd.length > MAX_CWD_CHARS)) throw bad('Field "cwd" must be a path.');
+  return { mode, up, cwd, temp };
+}
+
+/** `?cwd=<path>`: the folder whose hooks the draft confirm names. */
+export function workHooksQuery(query: URLSearchParams): string {
+  const cwd = query.get('cwd');
+  if (cwd === null || cwd === '' || cwd.length > MAX_CWD_CHARS) throw chatRouteError('cwd-invalid');
+  return cwd;
+}
+
 export interface AgentActionInput {
   action: 'restart' | 'install';
   mode?: ChatMode;
@@ -199,16 +237,19 @@ export function modeQuery(query: URLSearchParams): ChatMode {
 
 /** A route `:id` / `:iid`: a session or interaction id shape, else it names nothing this service knows. */
 export function idParam(value: string | undefined): string {
-  if (value === undefined || value === '' || value.length > MAX_ID_CHARS) {
-    throw ApiError.notFound('No such conversation.');
-  }
+  if (value === undefined || !isIdShape(value)) throw ApiError.notFound('No such conversation.');
+  return value;
+}
+
+function isIdShape(value: string): boolean {
+  if (value === '' || value.length > MAX_ID_CHARS) return false;
   for (let i = 0; i < value.length; i++) {
     const c = value.charCodeAt(i);
     const ok =
       (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x2d || c === 0x5f;
-    if (!ok) throw ApiError.notFound('No such conversation.');
+    if (!ok) return false;
   }
-  return value;
+  return true;
 }
 
 /** A route with no body: anything sent is refused. */

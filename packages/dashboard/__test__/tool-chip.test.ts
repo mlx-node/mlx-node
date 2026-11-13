@@ -45,4 +45,15 @@ describe('ToolChip', () => {
     expect(chip.querySelector('[data-chip-label]')).toBeNull();
     expect(chip.hasAttribute('data-compact')).toBe(true);
   });
+
+  it('give: a tier only on a label longer than 8 characters, so a short chip never gets a floor wider than its text', () => {
+    const tier = (label: string, give?: 1 | 2): string | null =>
+      mount(createElement(ToolChip, { icon, label, give })).querySelector('button')!.getAttribute('data-give');
+    expect([tier('napi-rsxx', 1), tier('napi-rsx', 1), tier('Web · DeepSeek', 2), tier('Web · DeepSeek')]).toEqual([
+      '1',
+      null,
+      '2',
+      null,
+    ]);
+  });
 });

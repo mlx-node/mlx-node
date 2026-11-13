@@ -213,6 +213,14 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   stopped, no models, Work without a folder, text that starts with `/`. On the New screen such a state replaces the
   hero with a panel and its action; inside a conversation it is a strip over the composer. A send the server refuses
   puts the text back and shows the strip for its `reason` (`blockers.ts`).
+- Tools row: the chips, then the key legend (`↵ Send`, `⇧↵ New line`, or `Esc to stop` while an answer runs and the
+  text field has the focus; icons with hidden key names), then Send / Stop in a column of its own that never shrinks.
+  A legend part is drawn whole or not at all. As the row gets short, first the legend parts go (New line, then Send),
+  then the folder label shortens, then the web label, then (Work) the quantization badge goes, then the model name,
+  each label down to a floor (a label of 8 characters or fewer never shortens). A badge that does not fit whole is not
+  drawn and its room goes back to the folder and web labels (`data-fit-whole`, composer); under 520 px of composer
+  the chips are icons, under 320 px they wrap. The Bypass word and the Send button never give way. The reason Send is
+  off keeps up to two lines beside the chips.
 - Model: before each message goes to the agent, the app selects the conversation's model on the engine
   (`POST /v1/messages/count_tokens` over `node:http` to 127.0.0.1 only, the token in the `x-api-key` header, a 30 min
   ceiling; `src/chat/agent/select-model.ts`). Only that model loads. While the engine loads it, the thread shows the
@@ -227,7 +235,9 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   turn waits (starting, stopping, the engine, a full model, no event for 3 s), a waving band while events arrive. The
   load card has the orb in its head: a pulsing sphere while the engine loads this model, the slow ring otherwise.
 - Picker: the pill shows the base model and a badge with its quantization (`Qwen3.8-27B` `UD-Q4_K_XL`; the badge hides
-  under 520 px of composer), the title the full id. The popover has two lists: one row per base on the left, the
+  under 520 px of composer, and in Work it is drawn whenever the row has room for it with the folder and web labels
+  at their floors, else not at all; the picker, its title and its name always say it),
+  the title the full id. The popover has two lists: one row per base on the left, the
   quantizations of the open base on the right. A base opens on a click, `Enter`, `Space` or `→`, never on hover; a base
   with one quantization picks it at once. Both lists put the model in memory first, then the model in load, then the
   rest (bases by name, quantizations by size). The quantization that is active when a base opens: the conversation's
@@ -320,8 +330,9 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   confirm text in the chip's menu or the palette's "Permission mode: Auto…" / "Permission mode: Bypass…" dialog, and
   counts only a trusted click made 600 ms or more after the text it confirms was shown. A move down is one click (chip,
   header chip, palette), also during a turn, and wins over a move up sent before it (that one is refused with
-  `mode-changed`). A move up is refused on the New screen, while the agent cannot run, while the folder has a problem
-  and while the port is down; Ask → Auto also while a request of the conversation is open (409 `card-open`). A move up
+  `mode-changed`). A move up is refused while the agent cannot run, while the folder has a problem (on the New screen:
+  none chosen, or too long), while the first message is on its way and while the port is down; Ask → Auto also while a
+  request of the conversation is open (409 `card-open`). A move up
   writes its mode line first; when it cannot, it is 503 and the mode stays. `POST
   /api/chat/conversations/:id/permission-mode {mode, up}` is the only way up, and only with `up: true`, which the page
   sends from a confirm's action alone. Every other pick is sent with `up: false`: below the mode it is a move down; above
@@ -331,6 +342,23 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   a move down. The mode lives in the Control Panel's memory, is never read from a file, and is Ask for every
   conversation after the Control Panel restarts (quitting the app does that; the thread says so). A command that
   already runs is not stopped by a move down.
+
+  _Before the first message._ On the New Work screen the chip works the same way, for the conversation the first
+  message makes. The page names a draft id (made in the window, never stored); the confirm's action sends `POST
+  /api/chat/drafts/:draft/permission-mode {mode, up: true, cwd, temp?}` and pins the folder it named. The Control
+  Panel checks the folder as a create does and keeps one pick in memory (`ChatHostState.permissionDraft`), bound to
+  that draft id and folder; a second pick, from any window, replaces it. The first message names the draft
+  (`draft` on create), never a mode: after the session exists the Control Panel takes the pick when the id and the
+  folder match, writes the mode line (`from: ask`) and only then starts the turn, so the first turn shows the mode
+  line before its first call. A pick it cannot apply leaves the conversation in Ask, and the page shows a toast when the
+  reply's mode is below the one the chip showed. The pick goes back to Ask when the folder changes, the page goes to
+  Chat or leaves the New screen (the page posts `{mode: 'ask', up: false}` for the old id), the last window closes or
+  the Control Panel restarts. A send that fails before the conversation exists keeps it. While the first message is on
+  its way the chip keeps the mode it showed and only a move down is sent, always to the draft id the first message
+  named (a folder picked meanwhile does not change it); one that arrives after the pick was taken is applied to the new
+  conversation. The Control Panel keeps that draft-to-conversation link apart from the one pick, so a later pick or
+  the last window closing does not drop it; it goes when the conversation is deleted. The confirm reads the hooks line from `GET /api/chat/work/hooks?cwd=` and starts its
+  arm clock when that answers; its last line says the pick is for this new conversation only.
 
   _On the page._ The chip shows the mode the stream says, never its own click: Ask is a plain chip, Auto has a quiet
   fill, Bypass the danger border, tint and ink, and keeps its word where a narrow row drops the words of the other
@@ -948,13 +976,15 @@ runs), not through the session routes.
 
 | Route                                           | Method | Thread    | Purpose                                                                                                                               |
 | ----------------------------------------------- | ------ | --------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `/api/chat/state`                               | GET    | transport | `ChatHostState`: inference, the load, the models in memory, models, agent binary, both modes, providers, active turns                 |
+| `/api/chat/state`                               | GET    | transport | `ChatHostState`: inference, the load, the models in memory, models, agent binary, both modes, providers, active turns, mode picks     |
 | `/api/chat/conversations`                       | GET    | worker    | `?mode=chat\|work` → `{conversations: ConversationRow[]}`                                                                             |
-| `/api/chat/conversations`                       | POST   | transport | `{mode, text, modelId?, cwd?}` → 201 `{conversation, turnId}`; starts the first turn                                                  |
+| `/api/chat/conversations`                       | POST   | transport | `{mode, text, modelId?, cwd?, draft?}` → 201 `{conversation, turnId}`; starts the first turn; `draft` (Work) applies its picked mode  |
 | `/api/chat/conversations/:id/prompt`            | POST   | transport | `{text}` → 202 `{turnId}`                                                                                                             |
 | `/api/chat/conversations/:id/cancel`            | POST   | transport | → `{cancelled}`                                                                                                                       |
 | `/api/chat/conversations/:id/interactions/:iid` | POST   | transport | `{optionId}` or `{decision, feedback?}`; Work only, 404 for a Chat conversation                                                       |
 | `/api/chat/conversations/:id/permission-mode`   | POST   | transport | `{mode, up}` → `{mode}`; Work only; 409 `card-open` or `mode-changed`; 503 if a line write fails: see [Chat and Work](#chat-and-work) |
+| `/api/chat/drafts/:draft/permission-mode`       | POST   | transport | `{mode, up, cwd?, temp?}` → `{mode}`; the New Work screen's pick; `up: true` needs `cwd`; 409 `mode-changed` or `temp-unnamed`        |
+| `/api/chat/work/hooks`                          | GET    | transport | `?cwd=` → `{userHooks}`; the folder rule of create first                                                                              |
 | `/api/chat/conversations/:id`                   | PATCH  | transport | `{title}` or `{modelId}` → `ConversationInfo`                                                                                         |
 | `/api/chat/conversations/:id`                   | DELETE | transport | → `{}`; open streams end with `gone`                                                                                                  |
 | `/api/chat/agent`                               | POST   | transport | `{action: 'restart', mode?}` or `{action: 'install'}` → `ChatHostState`                                                               |

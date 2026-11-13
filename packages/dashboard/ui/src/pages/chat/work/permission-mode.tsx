@@ -24,6 +24,7 @@ import type { ProviderId, ProvidersResponse } from '../../../lib/providers-types
 import { toast } from '../../../lib/toast';
 import { providerName } from '../../../lib/web-tools';
 import { conversationPath } from '../conversation-actions';
+import { folderTooLong } from '../drafts';
 import { CARD_ARM_MS } from './permission';
 import styles from './permission-mode.module.css';
 
@@ -42,8 +43,10 @@ export interface PermissionFacts {
   folder: string | null;
   /** Providers whose key is in the Work environment. */
   keys: readonly ProviderId[];
-  /** A tool hook of the user was found. */
-  userHooks: boolean;
+  /** A tool hook of the user was found; null on the New screen, where the confirm reads it when it opens. */
+  userHooks: boolean | null;
+  /** The New screen: the mode is for the conversation its first message makes. */
+  draft: boolean;
   /** Open permission cards that offer "Allow once": a move to Bypass answers them. */
   openAllowOnce: number;
   /** The temp folder Auto covers beside the Work folder, as people type it (`/tmp`); null when none. */
@@ -67,26 +70,37 @@ export interface PermissionBlock {
   bypass: string | null;
 }
 
-/** First match wins: port down, New screen, (Auto only) an open card, the agent blocker, the folder. */
+/**
+ * First match wins: port down, a Work conversation still loading, the first message on its way (moves up only),
+ * (Auto only) an open card, the agent blocker, the folder.
+ */
 export function permissionModeBlocked(input: {
   connected: boolean;
-  /** The New screen, or a first message still on its way. */
-  isNew: boolean;
+  loading: boolean;
+  starting: boolean;
   cardOpen: boolean;
   /** The reason of the agent or engine state that stops Work. */
   blocker: string | undefined;
-  cwdProblem: CwdProblem | undefined;
+  /** Why the folder cannot be used. */
+  folder: string | undefined;
 }): PermissionBlock {
-  if (!input.connected) {
-    const why = CHAT.blockers.reconnecting;
+  if (!input.connected || input.loading) {
+    const why = input.connected ? CHAT.startingTip : CHAT.blockers.reconnecting;
     return { chip: why, auto: why, bypass: why };
   }
-  if (input.isNew) {
-    const why = CHAT.permission.newScreen;
-    return { chip: why, auto: why, bypass: why };
-  }
-  const rest = input.blocker ?? (input.cwdProblem !== undefined ? CHAT.cwdProblems[input.cwdProblem] : null);
-  return { chip: null, auto: input.cardOpen ? CHAT.permission.cardOpen : rest, bypass: rest };
+  const rest = input.starting ? CHAT.startingTip : (input.blocker ?? input.folder ?? null);
+  return { chip: null, auto: input.cardOpen && !input.starting ? CHAT.permission.cardOpen : rest, bypass: rest };
+}
+
+/** Why the folder of a conversation or of the New screen cannot be used. */
+export function folderReason(
+  isNew: boolean,
+  folder: string | null,
+  problem: CwdProblem | undefined,
+): string | undefined {
+  if (!isNew) return problem === undefined ? undefined : CHAT.cwdProblems[problem];
+  if (folder === null) return CHAT.folderNeeded;
+  return folderTooLong(folder) ? CHAT.folderTooLong : undefined;
 }
 
 /** Providers whose key the Work agent gets: the selected search provider, and Firecrawl when its Work skills are ready. */
@@ -144,32 +158,82 @@ export function permissionModeName(mode: PermissionMode, folder: string | null, 
   return fill(p.nameOf, { mode: p.modes[mode], note: modeNote(mode, folder, temp) });
 }
 
+/** What the mode is set on: an open Work conversation, or the New Work screen's draft and its folder. */
+export type PermissionSubject = { kind: 'conversation'; id: string } | { kind: 'draft'; id: string; cwd: string };
+
+function modePath(subject: PermissionSubject): string {
+  return subject.kind === 'draft'
+    ? `/chat/drafts/${encodeURIComponent(subject.id)}/permission-mode`
+    : `${conversationPath(subject.id)}/permission-mode`;
+}
+
+/** The New screen's draft ends with a raised mode shown: its pick goes back to Ask. */
+export function clearDraftMode(id: string): void {
+  mutate('POST', modePath({ kind: 'draft', id, cwd: '' }), { mode: 'ask', up: false }).catch(() => undefined);
+}
+
+/** Whether the user has tool hooks for `cwd`, read once per folder; null until it answers or with no folder. */
+export function useWorkHooks(cwd: string | null): boolean | null {
+  const [read, setRead] = useState<{ cwd: string; hooks: boolean } | null>(null);
+  useEffect(() => {
+    if (cwd === null) return;
+    let active = true;
+    getJson<{ userHooks: boolean }>(`/chat/work/hooks?cwd=${encodeURIComponent(cwd)}`).then(
+      (body) => {
+        if (active) setRead({ cwd, hooks: body.userHooks });
+      },
+      () => {
+        if (active) setRead({ cwd, hooks: true });
+      },
+    );
+    return () => {
+      active = false;
+    };
+  }, [cwd]);
+  return read !== null && read.cwd === cwd ? read.hooks : null;
+}
+
 /**
- * The mode call. `up` is true only from a confirm's action, which sends the temp folder its text named: the server never moves the mode up for a request sent
- * with `up: false`, so a pick made on a view older than the server's mode cannot raise it (409 `mode-changed`). A
- * move up is one at a time per conversation (a second one while it is in flight is dropped); a move down is sent at
- * once, also while an up is in flight. A failure is a toast, but 409 `mode-changed` is not: the stream shows the mode.
- * `pending` is the up in flight of this conversation only.
+ * The mode call. `up` is true only from a confirm's action, which sends the temp folder its text named (and on the New
+ * screen its folder): the server never moves the mode up for a request sent with `up: false`, so a pick made on a view
+ * older than the server's mode cannot raise it (409 `mode-changed`). A move up is one at a time per subject (a second
+ * one while it is in flight is dropped); a move down is sent at once, also while an up is in flight. A failure is a
+ * toast, but 409 `mode-changed` is not: the stream shows the mode. `pending` is the up in flight of this subject only.
+ * `onUp` runs as a move up is sent; `onMode` gets the mode the Control Panel answered.
  */
-export function usePermissionMode(conversationId: string | null): {
+export function usePermissionMode(
+  subject: PermissionSubject | null,
+  on: { onUp?: () => void; onMode?: (mode: PermissionMode) => void } = {},
+): {
   pending: boolean;
   set: (target: PermissionMode, up: boolean, temp?: string | null) => Promise<boolean>;
 } {
   const [raising, setRaising] = useState<ReadonlySet<string>>(() => new Set());
   const busy = useRef(new Set<string>());
+  const told = useRef(on);
+  useLayoutEffect(() => {
+    told.current = on;
+  });
+  const id = subject?.id ?? null;
+  const cwd = subject?.kind === 'draft' ? subject.cwd : null;
   const set = useCallback(
     async (target: PermissionMode, up: boolean, temp: string | null = null): Promise<boolean> => {
-      const id = conversationId;
       if (id === null || (up && busy.current.has(id))) return false;
       const flight = (on: boolean): void => {
         if (on) busy.current.add(id);
         else busy.current.delete(id);
         setRaising(new Set(busy.current));
       };
-      if (up) flight(true);
+      if (up) {
+        flight(true);
+        told.current.onUp?.();
+      }
       try {
         const named = up && target === 'auto' && temp !== null ? { temp } : {};
-        await mutate('POST', `${conversationPath(id)}/permission-mode`, { mode: target, up, ...named });
+        const folder = up && cwd !== null ? { cwd } : {};
+        const path = modePath(cwd === null ? { kind: 'conversation', id } : { kind: 'draft', id, cwd });
+        const reply = await mutate<{ mode: PermissionMode }>('POST', path, { mode: target, up, ...folder, ...named });
+        told.current.onMode?.(reply.mode);
         return true;
       } catch (err) {
         if (!(err instanceof DashboardApiError && err.reason === 'mode-changed')) toast.error(CHAT.permission.failed);
@@ -178,9 +242,9 @@ export function usePermissionMode(conversationId: string | null): {
         if (up) flight(false);
       }
     },
-    [conversationId],
+    [id, cwd],
   );
-  return { pending: conversationId !== null && raising.has(conversationId), set };
+  return { pending: id !== null && raising.has(id), set };
 }
 
 /**
@@ -205,12 +269,15 @@ function ConfirmView(props: {
   const place = placeWords(facts.folder, temp);
   const keys = useWorkKeys(true, props.providers);
   const key = keySentence(keys, target);
-  const hooks = facts.userHooks ? p[target].hooks : null;
+  const read = useWorkHooks(facts.draft ? facts.folder : null);
+  const userHooks = facts.draft ? read : facts.userHooks;
+  const hooks = userHooks === true ? p[target].hooks : null;
+  const known = userHooks !== null;
   const open = target === 'bypass' ? facts.openAllowOnce : 0;
   const shownAt = useRef<number | null>(null);
   useLayoutEffect(() => {
-    shownAt.current = performance.now();
-  }, [folder, temp, key, hooks, open]);
+    shownAt.current = known ? performance.now() : null;
+  }, [folder, temp, key, hooks, open, known]);
   const press = (event: MouseEvent<HTMLButtonElement>): void => {
     if (event.nativeEvent.isTrusted !== true) return;
     if (shownAt.current === null || event.timeStamp - shownAt.current < CARD_ARM_MS) return;
@@ -252,6 +319,7 @@ function ConfirmView(props: {
     line('ends', ends);
     line('open', open === 0 ? null : open === 1 ? b.cardOpen : fill(b.cardsOpen, { n: open }));
   }
+  line('draft', facts.draft ? p.draftFoot : null);
   return (
     <div className={styles.confirm} data-permission-confirm={target}>
       <div ref={props.textRef} tabIndex={-1} className={styles.text} data-permission-text="">
@@ -408,7 +476,7 @@ export function PermissionModeChip(props: PermissionModeChipProps): ReactElement
         {shown === null ? (
           <div className={styles.menu}>
             <OptionList label={p.name} value={mode} onValueChange={pick} options={options} wrap />
-            <p className={styles.foot}>{p.menuFoot}</p>
+            <p className={styles.foot}>{props.facts.draft ? p.draftFoot : p.menuFoot}</p>
           </div>
         ) : (
           <ConfirmView

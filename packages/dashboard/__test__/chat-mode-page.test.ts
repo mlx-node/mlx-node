@@ -42,6 +42,7 @@ import Chat from '../ui/src/pages/chat.js';
 import { forgetPlace, NEW_PLACE, writeDraft, chooseFolder } from '../ui/src/pages/chat/drafts.js';
 import { chatHostSnapshot } from '../ui/src/pages/chat/use-chat-host.js';
 import {
+  folderReason,
   keySentence,
   permissionModeBlocked,
   permissionModeName,
@@ -339,27 +340,30 @@ describe('rules of the page', () => {
   });
 
   it('the block reasons, first match wins; an open card blocks Auto only', () => {
-    const all = { connected: false, isNew: true, cardOpen: true, blocker: 'Agent', cwdProblem: 'missing' } as const;
+    const missing = CHAT.cwdProblems.missing;
+    const all = { connected: false, loading: true, starting: true, cardOpen: true, blocker: 'Agent', folder: missing };
     const down = CHAT.blockers.reconnecting;
+    const wait = CHAT.startingTip;
     expect(permissionModeBlocked(all)).toEqual({ chip: down, auto: down, bypass: down });
-    const fresh = P.newScreen;
-    expect(permissionModeBlocked({ ...all, connected: true })).toEqual({ chip: fresh, auto: fresh, bypass: fresh });
-    const up = { ...all, connected: true, isNew: false };
+    expect(permissionModeBlocked({ ...all, connected: true })).toEqual({ chip: wait, auto: wait, bypass: wait });
+    const sent = { ...all, connected: true, loading: false };
+    expect(permissionModeBlocked(sent)).toEqual({ chip: null, auto: wait, bypass: wait });
+    const up = { ...sent, starting: false };
     expect(permissionModeBlocked(up)).toEqual({ chip: null, auto: P.cardOpen, bypass: 'Agent' });
     expect(permissionModeBlocked({ ...up, cardOpen: false, blocker: undefined })).toEqual({
       chip: null,
-      auto: CHAT.cwdProblems.missing,
-      bypass: CHAT.cwdProblems.missing,
+      auto: missing,
+      bypass: missing,
     });
-    expect(
-      permissionModeBlocked({
-        connected: true,
-        isNew: false,
-        cardOpen: false,
-        blocker: undefined,
-        cwdProblem: undefined,
-      }),
-    ).toEqual({ chip: null, auto: null, bypass: null });
+    expect(permissionModeBlocked({ ...up, cardOpen: false, blocker: undefined, folder: undefined })).toEqual({
+      chip: null,
+      auto: null,
+      bypass: null,
+    });
+    expect(folderReason(true, null, undefined)).toBe(CHAT.folderNeeded);
+    expect(folderReason(true, `/Users/dev/${'a'.repeat(250)}`, undefined)).toBe(CHAT.folderTooLong);
+    expect(folderReason(true, FOLDER, 'missing')).toBeUndefined();
+    expect(folderReason(false, FOLDER, 'missing')).toBe(missing);
   });
 
   it('names the keys in the Work environment, worded for each confirm', () => {
@@ -1038,17 +1042,6 @@ describe('block reasons', () => {
     await waitFor(() => document.querySelector('[role="tooltip"]') !== null);
     return document.querySelector('[role="tooltip"]')!.textContent ?? '';
   }
-
-  it('the New screen: the chip is disabled and says why', async () => {
-    chooseFolder(FOLDER);
-    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle));
-    expect(chip().getAttribute('aria-disabled')).toBe('true');
-    expect(chip().getAttribute('data-permission-mode')).toBe('ask');
-    expect(await tooltipOf(chip())).toContain(P.newScreen);
-    click(chip());
-    await settle();
-    expect(menu()).toBeNull();
-  });
 
   it('the port down: the chip is disabled in every mode', async () => {
     await openIn('pm-port', 'bypass');
@@ -1785,5 +1778,295 @@ describe('the temp folder Auto covers', () => {
     expect(count(text, 'Allowed by auto')).toBe(2);
     const card = page!.container.querySelector<HTMLElement>('[data-interaction-card]')!;
     expect(shown(card)).toContain(`${start}other users can write to a folder on the way to "/tmp/napi-rs-b7kq".`);
+  });
+});
+
+describe('the New Work screen: a mode picked before the first message', () => {
+  const OTHER = '/tmp/work/other';
+  let made: string[] = [];
+  /** The page's draft ids are `d1`, `d2`, … in the order they are made. */
+  function draftIds(): void {
+    made = [];
+    vi.spyOn(crypto, 'randomUUID').mockImplementation(() => {
+      made.push(`d${String(made.length + 1)}`);
+      return made.at(-1) as ReturnType<typeof crypto.randomUUID>;
+    });
+  }
+  const draftPath = (id: string): string => `/chat/drafts/${id}/permission-mode`;
+  const draftHost = (id: string, mode: 'auto' | 'bypass'): ChatHostState => ({
+    ...READY_CHAT_HOST,
+    permissionDraft: { draft: id, mode },
+  });
+  /** Every mode call, as `path body`. */
+  const posts = (): string[] =>
+    calls
+      .filter((call) => call.method === 'POST' && pathOf(call).endsWith('/permission-mode'))
+      .map((call) => `${pathOf(call)} ${JSON.stringify(call.body)}`);
+  const creates = (): Array<Record<string, unknown>> =>
+    calls
+      .filter((call) => call.method === 'POST' && pathOf(call) === '/chat/conversations')
+      .map((call) => call.body as Record<string, unknown>);
+  const DRAFT_ROUTES: Record<string, unknown> = { '/chat/work/hooks': { userHooks: false } };
+  for (let n = 1; n <= 6; n += 1) DRAFT_ROUTES[`POST ${draftPath(`d${String(n)}`)}`] = { mode: 'ask' };
+  const hooksRead = (): number => calls.filter((call) => pathOf(call) === '/chat/work/hooks').length;
+  async function openNew(setup: Open = {}): Promise<void> {
+    draftIds();
+    if (setup.rows === undefined) chooseFolder(FOLDER);
+    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
+      ...setup,
+      routes: { ...DRAFT_ROUTES, ...setup.routes },
+    });
+  }
+  function typeText(text: string): void {
+    const area = page!.container.querySelector('textarea')!;
+    act(() => {
+      Reflect.set(HTMLTextAreaElement.prototype, 'value', text, area);
+      area.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+  }
+  function sendNow(): void {
+    const form = page!.container.querySelector<HTMLFormElement>(`form[aria-label="${CHAT.composerLabel}"]`)!;
+    act(() => [...form.querySelectorAll('button')].at(-1)!.click());
+  }
+
+  it('the chip is on; a higher row opens its confirm and posts nothing; the press after the arm posts to the draft', async () => {
+    useClock();
+    await openNew();
+    expect(chip().getAttribute('aria-disabled')).toBeNull();
+    expect(chip().getAttribute('data-permission-mode')).toBe('ask');
+    expect(shown(await openMenu())).toContain(P.draftFoot);
+    expect(shown(menu()!)).not.toContain(P.menuFoot);
+    const view = await openConfirm('bypass');
+    await waitFor(() => shown(view).includes(P.draftFoot) && hooksRead() === 1);
+    await settle();
+    expect(posts()).toEqual([]);
+    advance(CARD_ARM_MS);
+    press(action('bypass'), true);
+    await waitFor(() => posts().length === 1);
+    expect(posts()).toEqual([`${draftPath('d1')} ${JSON.stringify({ mode: 'bypass', up: true, cwd: FOLDER })}`]);
+    expect(calls.some((call) => pathOf(call).startsWith('/chat/conversations/'))).toBe(false);
+  });
+
+  it('the chip, the placeholder and the status say a raised mode only for this page draft', async () => {
+    await openNew();
+    const status = (): string => page!.container.querySelector('div.sr-only[role="status"]')?.textContent ?? '';
+    act(() => api!.emitChatHost({ type: 'state', state: draftHost('d-other', 'bypass') }));
+    await settle();
+    expect(chip().getAttribute('data-permission-mode')).toBe('ask');
+    act(() => api!.emitChatHost({ type: 'state', state: draftHost('d1', 'bypass') }));
+    await waitFor(() => chip().getAttribute('data-permission-mode') === 'bypass');
+    expect(page!.container.querySelector('textarea')!.placeholder).toBe(
+      fill(P.bypass.placeholderNew, { folder: 'proj' }),
+    );
+    await waitFor(() => status() === permissionModeName('bypass', FOLDER));
+    expect(page!.container.querySelector('[data-permission-chip="header"]')).toBeNull();
+  });
+
+  it('the folder changes, the page goes to Chat, another conversation opens: the pick is cleared and the id is new', async () => {
+    const rows = [
+      { ...info('pm-new-a', { cwd: FOLDER, updatedAt: NOW - 1_000 }), turns: 1 },
+      { ...info('pm-new-b', { cwd: OTHER, updatedAt: NOW - 2_000 }), turns: 1 },
+    ];
+    await openNew({ rows, conversations: { 'pm-new-a': sync('pm-new-a') } });
+    const label = `[aria-label="${fill(CHAT.folderLabel, { folder: FOLDER })}"]`;
+    await waitFor(() => page!.container.querySelector(label) !== null);
+    const first = made.at(-1)!;
+    act(() => api!.emitChatHost({ type: 'state', state: draftHost(first, 'auto') }));
+    await waitFor(() => chip().getAttribute('data-permission-mode') === 'auto');
+    click(page!.container.querySelector<HTMLElement>(label)!);
+    const options = (): HTMLElement[] => [
+      ...document.querySelectorAll<HTMLElement>(`[aria-label="${CHAT.folderRecent}"] [role="radio"]`),
+    ];
+    await waitFor(() => options().length === 2);
+    click(options().find((o) => (o.textContent ?? '').includes('other'))!);
+    await waitFor(() => posts().length === 1);
+    expect(posts()).toEqual([`${draftPath(first)} ${JSON.stringify({ mode: 'ask', up: false })}`]);
+    expect(chip().getAttribute('data-permission-mode')).toBe('ask');
+
+    const second = made.at(-1)!;
+    expect(second).not.toBe(first);
+    act(() => api!.emitChatHost({ type: 'state', state: draftHost(second, 'bypass') }));
+    await waitFor(() => chip().getAttribute('data-permission-mode') === 'bypass');
+    act(() => void navigate!('/chat?mode=chat'));
+    await waitFor(() => posts().length === 2);
+    expect(posts()[1]).toBe(`${draftPath(second)} ${JSON.stringify({ mode: 'ask', up: false })}`);
+    expect(page!.container.querySelector('[data-permission-chip]')).toBeNull();
+
+    act(() => void navigate!('/chat?mode=work'));
+    await waitFor(() => chip().getAttribute('data-permission-mode') === 'ask');
+    const id = made.at(-1)!;
+    act(() => api!.emitChatHost({ type: 'state', state: draftHost(id, 'auto') }));
+    await waitFor(() => chip().getAttribute('data-permission-mode') === 'auto');
+    act(() => void navigate!('/chat?c=pm-new-a'));
+    await waitFor(() => posts().length === 3);
+    expect(posts()[2]).toBe(`${draftPath(id)} ${JSON.stringify({ mode: 'ask', up: false })}`);
+    expect(new Set(made).size).toBe(made.length);
+  });
+
+  it('the create carries the draft id and no mode; while it is on its way only a move down posts; a lower reply is a toast', async () => {
+    const create = deferred({ conversation: info('pm-made', { permissionMode: 'ask' }), turnId: 't1' });
+    const error = vi.spyOn(toast, 'error');
+    await openNew({
+      routes: { 'POST /chat/conversations': create.body, [`POST ${draftPath('d1')}`]: { mode: 'auto' } },
+      conversations: { 'pm-made': sync('pm-made') },
+    });
+    act(() => api!.emitChatHost({ type: 'state', state: draftHost('d1', 'bypass') }));
+    await waitFor(() => chip().getAttribute('data-permission-mode') === 'bypass');
+    typeText('Fix the build');
+    sendNow();
+    await waitFor(() => creates().length === 1);
+    expect(creates()[0]).toEqual({
+      mode: 'work',
+      text: 'Fix the build',
+      modelId: 'qwen3.5-4b',
+      cwd: FOLDER,
+      draft: 'd1',
+    });
+    for (const key of ['permissionMode', 'bypass', 'up']) expect(Object.hasOwn(creates()[0]!, key)).toBe(false);
+    // The claim empties the host's draft; the chip keeps what it showed at Send.
+    act(() => api!.emitChatHost({ type: 'state', state: READY_CHAT_HOST }));
+    await settle();
+    expect(chip().getAttribute('data-permission-mode')).toBe('bypass');
+    await openMenu();
+    expect(radio('bypass').getAttribute('aria-checked')).toBe('true');
+    expect(radio('auto').getAttribute('aria-disabled')).toBeNull();
+    click(radio('auto'));
+    await waitFor(() => posts().length === 1);
+    expect(posts()).toEqual([`${draftPath('d1')} ${JSON.stringify({ mode: 'auto', up: false })}`]);
+    await waitFor(() => chip().getAttribute('data-permission-mode') === 'auto');
+    await act(async () => create.release());
+    await waitFor(() => error.mock.calls.some((c) => c[0] === P.failed));
+  });
+
+  it('a folder change while the first message is on its way: a move down still posts to the draft it sent', async () => {
+    const rows = [
+      { ...info('pm-new-a', { cwd: FOLDER, updatedAt: NOW - 1_000 }), turns: 1 },
+      { ...info('pm-new-b', { cwd: OTHER, updatedAt: NOW - 2_000 }), turns: 1 },
+    ];
+    const create = deferred({ conversation: info('pm-made', { permissionMode: 'ask' }), turnId: 't1' });
+    await openNew({
+      rows,
+      routes: { 'POST /chat/conversations': create.body },
+      conversations: { 'pm-new-a': sync('pm-new-a'), 'pm-made': sync('pm-made') },
+    });
+    const label = `[aria-label="${fill(CHAT.folderLabel, { folder: FOLDER })}"]`;
+    await waitFor(() => page!.container.querySelector(label) !== null);
+    const first = made.at(-1)!;
+    act(() => api!.emitChatHost({ type: 'state', state: draftHost(first, 'bypass') }));
+    await waitFor(() => chip().getAttribute('data-permission-mode') === 'bypass');
+    typeText('Fix the build');
+    sendNow();
+    await waitFor(() => creates().length === 1);
+    act(() => api!.emitChatHost({ type: 'state', state: READY_CHAT_HOST }));
+    click(page!.container.querySelector<HTMLElement>(label)!);
+    const options = (): HTMLElement[] => [
+      ...document.querySelectorAll<HTMLElement>(`[aria-label="${CHAT.folderRecent}"] [role="radio"]`),
+    ];
+    await waitFor(() => options().length === 2);
+    click(options().find((o) => (o.textContent ?? '').includes('other'))!);
+    await waitFor(() => made.at(-1) !== first);
+    await openMenu();
+    click(radio('ask'));
+    await waitFor(() => posts().length === 1);
+    expect(posts()).toEqual([`${draftPath(first)} ${JSON.stringify({ mode: 'ask', up: false })}`]);
+    await act(async () => create.release());
+    await settle();
+  });
+
+  it('a menu opened while the first message is on its way stays open, with focus, when the message lands', async () => {
+    const create = deferred({ conversation: info('pm-landed', { permissionMode: 'bypass' }), turnId: 't1' });
+    await openNew({
+      routes: {
+        'POST /chat/conversations': create.body,
+        'POST /chat/conversations/pm-landed/permission-mode': { mode: 'ask' },
+      },
+      conversations: { 'pm-landed': sync('pm-landed', { entries: [] }, { permissionMode: 'bypass' }) },
+    });
+    act(() => api!.emitChatHost({ type: 'state', state: draftHost('d1', 'bypass') }));
+    await waitFor(() => chip().getAttribute('data-permission-mode') === 'bypass');
+    typeText('Fix the build');
+    sendNow();
+    await waitFor(() => creates().length === 1);
+    act(() => api!.emitChatHost({ type: 'state', state: raisedHost('pm-landed', 'bypass') }));
+    await act(async () => create.release());
+    const area = page!.container.querySelector('textarea')!;
+    await waitFor(() => document.activeElement === area);
+    await openMenu();
+    act(() => api!.emitChat('pm-landed', sync('pm-landed', { seq: 1 }, { permissionMode: 'bypass' })));
+    await waitFor(() => page!.container.querySelector('[data-permission-chip="header"]') !== null);
+    const owned = document.getElementById(chip().getAttribute('aria-controls') ?? '');
+    expect([chip().getAttribute('aria-expanded'), owned === menu(), owned?.contains(document.activeElement)]).toEqual([
+      'true',
+      true,
+      true,
+    ]);
+    click(radio('ask'));
+    await waitFor(() => posts().length === 1);
+    expect(posts()).toEqual([
+      `/chat/conversations/pm-landed/permission-mode ${JSON.stringify({ mode: 'ask', up: false })}`,
+    ]);
+  });
+
+  it('a reply in the mode the chip showed is no toast', async () => {
+    const error = vi.spyOn(toast, 'error');
+    await openNew({
+      routes: {
+        'POST /chat/conversations': { conversation: info('pm-made2', { permissionMode: 'bypass' }), turnId: 't1' },
+      },
+      conversations: { 'pm-made2': sync('pm-made2', {}, { permissionMode: 'bypass' }) },
+    });
+    act(() => api!.emitChatHost({ type: 'state', state: draftHost('d1', 'bypass') }));
+    await waitFor(() => chip().getAttribute('data-permission-mode') === 'bypass');
+    typeText('Fix the build');
+    sendNow();
+    await waitFor(() => creates().length === 1);
+    await settle();
+    expect(error.mock.calls.some((c) => c[0] === P.failed)).toBe(false);
+  });
+
+  it('the hooks line waits for the hooks answer, and so does the arm', async () => {
+    useClock();
+    const hooks = deferred({ userHooks: true });
+    await openNew({ routes: { '/chat/work/hooks': hooks.body } });
+    const view = await openConfirm('bypass');
+    advance(CARD_ARM_MS * 2);
+    press(action('bypass'), true);
+    await settle();
+    expect(posts()).toEqual([]);
+    expect(shown(view)).not.toContain(P.bypass.hooks);
+    await act(async () => hooks.release());
+    await waitFor(() => shown(confirmView()!).includes(P.bypass.hooks));
+    press(action('bypass'), true);
+    await settle();
+    expect(posts()).toEqual([]);
+    advance(CARD_ARM_MS);
+    press(action('bypass'), true);
+    await waitFor(() => posts().length === 1);
+  });
+
+  it('no folder: the higher rows say to choose one; the lower row needs none', async () => {
+    draftIds();
+    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), { routes: DRAFT_ROUTES });
+    await openMenu();
+    expect(radio('auto').getAttribute('aria-disabled')).toBe('true');
+    expect(radio('bypass').getAttribute('aria-disabled')).toBe('true');
+    expect(radio('ask').getAttribute('aria-disabled')).toBeNull();
+  });
+
+  it('Chat: no chip on the New screen', async () => {
+    draftIds();
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle));
+    expect(page!.container.querySelector('[data-permission-chip]')).toBeNull();
+  });
+
+  it('the tools row: the folder and web chips carry their tier, the mode chip none, the picker wrapper 3', async () => {
+    chooseFolder('/tmp/work/a-twenty-char-folder');
+    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
+      host: { ...READY_CHAT_HOST, providers: { ...READY_CHAT_HOST.providers, search: 'deepseek' } },
+    });
+    const start = chip().parentElement!;
+    const tiers = [...start.children].map((child) => child.getAttribute('data-give'));
+    expect(tiers).toEqual(['3', '1', '2', null]);
+    expect(chip().getAttribute('data-give')).toBeNull();
   });
 });

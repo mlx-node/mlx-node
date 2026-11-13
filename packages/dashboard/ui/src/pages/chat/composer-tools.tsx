@@ -217,6 +217,7 @@ export function WebChip({ providers, mode }: { providers: ChatHostState['provide
         <ToolChip
           icon={<Globe size={14} strokeWidth={1.75} />}
           label={view.label}
+          give={2}
           state={view.state}
           dot={view.dot}
           aria-label={view.name}

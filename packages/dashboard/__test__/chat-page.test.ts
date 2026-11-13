@@ -736,12 +736,12 @@ describe('Chat page: Escape and the stop hint', () => {
 
   it('the hint names Esc only while an answer runs and the composer has the focus', async () => {
     await openRunning('p-esc-hint');
-    const hint = (): boolean => shown().includes(CHAT.hintStop);
+    const hint = (): boolean => shown().includes(`${CHAT.keyNames.esc} ${CHAT.hintStop[0].label}`);
     act(() => composer().focus());
     await waitFor(hint);
     act(() => composer().blur());
     await waitFor(() => !hint());
-    expect(shown()).not.toContain(CHAT.hintSend);
+    expect(shown()).not.toContain(CHAT.hintSend[1].label);
     expect(accessibleName(sendFace())).toBe(CHAT.stop);
   });
 });

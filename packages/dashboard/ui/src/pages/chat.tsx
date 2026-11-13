@@ -53,7 +53,7 @@ import type {
 } from '../lib/chat-types';
 import { getTransportUp, subscribeConnection } from '../lib/connection';
 import { formatBytes } from '../lib/format';
-import { folderName, settingsToast, tempFor } from '../lib/permission-text';
+import { folderName, modeRank, settingsToast, tempFor } from '../lib/permission-text';
 import { pickFolder } from '../lib/pick-folder';
 import { useStickToBottom } from '../lib/stick-to-bottom';
 import { toast } from '../lib/toast';
@@ -94,11 +94,14 @@ import { useUnload } from './chat/use-unload';
 import { NewFolderChip, OpenFolderChip } from './chat/work/folder-chip';
 import { asksSentence, type InteractionAnswer, PermissionCard, PlanCard } from './chat/work/permission';
 import {
+  clearDraftMode,
+  folderReason,
   PermissionModeChip,
   PermissionModeDialog,
   permissionModeBlocked,
   permissionModeName,
   permissionModeShown,
+  type PermissionSubject,
   usePermissionMode,
 } from './chat/work/permission-mode';
 
@@ -121,6 +124,8 @@ interface Sending {
   base: number;
   lastEnd: ConversationState['lastEnd'];
   ts: number;
+  /** A Work create: the mode the chip showed when Send was pressed, and the draft and folder the create named. */
+  permission: { shown: PermissionMode; draft: string; cwd: string } | null;
 }
 
 const NO_RAISED: ChatHostState['permissionRaised'] = [];
@@ -247,6 +252,28 @@ export default function Chat(): ReactElement {
       if (createdId !== null) setCreatedId(null);
     }
   }
+  // The New Work screen's draft: a mode picked there is kept by the Control Panel for this id and folder only.
+  const [modeDraft, setModeDraft] = useState(() => ({
+    id: crypto.randomUUID(),
+    folder: newFolder,
+    visit: threadKey,
+    mode,
+  }));
+  if (modeDraft.folder !== newFolder || modeDraft.visit !== threadKey || modeDraft.mode !== mode)
+    setModeDraft({ id: crypto.randomUUID(), folder: newFolder, visit: threadKey, mode });
+  const draftShownId = useRef<string | null>(null);
+  const draftSent = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    draftShownId.current = host?.permissionDraft?.draft ?? null;
+  });
+  useEffect(() => {
+    const id = modeDraft.id;
+    return () => {
+      if (draftShownId.current === id && draftSent.current !== id) clearDraftMode(id);
+    };
+  }, [modeDraft.id]);
+  const [lowered, setLowered] = useState<{ ts: number; mode: PermissionMode } | null>(null);
+  const [born, setBorn] = useState<{ conversation: string; draft: string } | null>(null);
   const placeRef = useRef(place);
   useLayoutEffect(() => {
     placeRef.current = place;
@@ -396,6 +423,10 @@ export default function Chat(): ReactElement {
       base,
       lastEnd: fromNew ? null : (conv?.lastEnd ?? null),
       ts: Date.now(),
+      permission:
+        fromNew && mode === 'work' && newFolder !== null
+          ? { shown: permissionMode, draft: modeDraft.id, cwd: newFolder }
+          : null,
     };
     setSending(next);
     // A Retry of a failed message leaves text typed since then in the composer.
@@ -407,11 +438,27 @@ export default function Chat(): ReactElement {
     const drop = (): void => setSending((current) => (current === next ? null : current));
     try {
       if (fromNew) {
-        const body: { mode: ChatMode; text: string; modelId?: string; cwd?: string } = { mode, text };
+        const body: { mode: ChatMode; text: string; modelId?: string; cwd?: string; draft?: string } = { mode, text };
         if (chosenNew !== null) body.modelId = chosenNew;
-        if (mode === 'work' && newFolder !== null) body.cwd = newFolder;
-        const reply = await mutate<CreateReply>('POST', '/chat/conversations', body);
+        if (next.permission !== null) {
+          body.cwd = next.permission.cwd;
+          body.draft = next.permission.draft;
+          draftSent.current = next.permission.draft;
+        }
+        let reply: CreateReply;
+        try {
+          reply = await mutate<CreateReply>('POST', '/chat/conversations', body);
+        } catch (err) {
+          if (draftSent.current === body.draft) draftSent.current = null;
+          throw err;
+        }
         const id = reply.conversation.id;
+        const answered = reply.conversation.permissionMode;
+        if (next.permission !== null) {
+          if (modeRank(answered) < modeRank(startShown.current)) toast.error(CHAT.permission.failed);
+          lowerStart(next.ts, answered);
+          setBorn({ conversation: id, draft: next.permission.draft });
+        }
         rememberPlace(mode, id);
         reloadLists();
         if (stillShown()) {
@@ -840,17 +887,59 @@ export default function Chat(): ReactElement {
     },
     [conversationId],
   );
-  // The permission mode of the open Work conversation: the stream decides what is shown, never this page.
+  // The permission mode of the open Work conversation or of the New Work screen's draft: the stream decides what is
+  // shown, never this page. While the first message is on its way the chip keeps the mode it showed at Send.
   const workInfo = !isNew && conv !== null && conv.conversation.mode === 'work' ? conv.conversation : null;
-  const workId = workInfo?.id ?? null;
-  const permissionMode = permissionModeShown(host?.permissionRaised ?? null, workInfo);
-  const permissionSwitch = usePermissionMode(workId);
+  const sent = sendingHere ? (sending?.permission ?? null) : null;
+  const startedWith = sent?.shown ?? null;
+  const onDraft = sent !== null || (isNew && mode === 'work');
+  const subject: PermissionSubject | null =
+    sent !== null
+      ? { kind: 'draft', id: sent.draft, cwd: sent.cwd }
+      : onDraft
+        ? { kind: 'draft', id: modeDraft.id, cwd: newFolder ?? '' }
+        : workInfo !== null
+          ? { kind: 'conversation', id: workInfo.id }
+          : null;
+  const subjectId = subject?.id ?? null;
+  // The chip keeps its menu when its first message lands: the conversation takes the key of the draft that made it.
+  const chipKey = born !== null && subjectId === born.conversation ? born.draft : (subjectId ?? '');
+  const draftMode = host?.permissionDraft?.draft === modeDraft.id ? host.permissionDraft.mode : 'ask';
+  const startMode =
+    startedWith === null || sending === null
+      ? null
+      : lowered !== null && lowered.ts === sending.ts && modeRank(lowered.mode) < modeRank(startedWith)
+        ? lowered.mode
+        : startedWith;
+  const permissionMode: PermissionMode =
+    startMode ?? (onDraft ? draftMode : permissionModeShown(host?.permissionRaised ?? null, workInfo));
+  const startShown = useRef<PermissionMode>('ask');
+  useLayoutEffect(() => {
+    startShown.current = startMode ?? 'ask';
+  });
+  const lowerStart = (ts: number, answered: PermissionMode): void =>
+    setLowered((current) =>
+      current !== null && current.ts === ts && modeRank(current.mode) <= modeRank(answered)
+        ? current
+        : { ts, mode: answered },
+    );
+  const permissionSwitch = usePermissionMode(subject, {
+    onUp: () => {
+      if (subject?.kind !== 'draft' || newFolder === null) return;
+      chooseFolder(newFolder);
+      setFolderChoice(newFolder);
+    },
+    onMode: (answered) => {
+      if (startMode !== null && sending !== null) lowerStart(sending.ts, answered);
+    },
+  });
   const permissionBlock = permissionModeBlocked({
     connected,
-    isNew: isNew || workInfo === null,
+    loading: subject === null,
+    starting: startMode !== null,
     cardOpen: openCards.length > 0,
     blocker: modeBlocker(connected, host, 'work')?.reason,
-    cwdProblem,
+    folder: folderReason(onDraft, newFolder, cwdProblem),
   });
   const openAllowOnce = openCards.filter(
     (item) =>
@@ -859,13 +948,14 @@ export default function Chat(): ReactElement {
   ).length;
   const permissionFacts = {
     folder: openFolder ?? newFolder,
-    userHooks: workInfo?.userHooks === true,
+    userHooks: onDraft ? null : workInfo?.userHooks === true,
+    draft: onDraft,
     openAllowOnce,
     temp: tempFor(host, openFolder ?? newFolder),
   };
   const [permissionAsked, setPermissionAsked] = useState<{ id: string; target: 'auto' | 'bypass' } | null>(null);
   // Only in its own conversation: a dialog keyed by the next one would mount open and never finish its exit.
-  const permissionDialog = permissionAsked !== null && permissionAsked.id === workId ? permissionAsked.target : null;
+  const permissionDialog = permissionAsked !== null && permissionAsked.id === subjectId ? permissionAsked.target : null;
   const permissionSeen = useRef<{ id: string | null; mode: PermissionMode; marks: number }>({
     id: null,
     mode: 'ask',
@@ -877,7 +967,7 @@ export default function Chat(): ReactElement {
   useEffect(() => {
     const seen = permissionSeen.current;
     const count = permissionMarks?.length ?? 0;
-    if (workId !== null && seen.id === workId) {
+    if (subjectId !== null && seen.id === subjectId) {
       if (seen.mode !== permissionMode) announce(permissionModeName(permissionMode, permissionFolder, permissionTemp));
       const settings = (permissionMarks?.slice(seen.marks) ?? []).filter((m) => m.kind === 'settings');
       if (settings.length > 0) {
@@ -886,8 +976,8 @@ export default function Chat(): ReactElement {
         toast.warning(CHAT.permission.settingsLabel, { description: settingsToast(changed) });
       }
     }
-    permissionSeen.current = { id: workId, mode: permissionMode, marks: count };
-  }, [workId, permissionMode, permissionMarks, permissionFolder, permissionTemp, announce]);
+    permissionSeen.current = { id: subjectId, mode: permissionMode, marks: count };
+  }, [subjectId, permissionMode, permissionMarks, permissionFolder, permissionTemp, announce]);
   const setPermissionMode = permissionSwitch.set;
   // A confirm whose facts went stale closes and does not open again by itself.
   const dialogBlocked = permissionDialog !== null && permissionBlock[permissionDialog] !== null;
@@ -896,9 +986,9 @@ export default function Chat(): ReactElement {
   }, [dialogBlocked]);
   useEffect(() => {
     setPermissionAsked(null);
-  }, [workId, permissionMode]);
+  }, [subjectId, permissionMode]);
   const permissionCommands = useMemo<AppCommand[]>(() => {
-    if (workId === null) return [];
+    if (subjectId === null) return [];
     const group = CHAT.commands.group;
     const p = CHAT.permission;
     const label = (target: PermissionMode): string => fill(p.command, { mode: p.modes[target] });
@@ -927,7 +1017,7 @@ export default function Chat(): ReactElement {
         label: `${label('auto')}…`,
         group,
         icon: glyph(ShieldCheck),
-        run: () => setPermissionAsked({ id: workId, target: 'auto' }),
+        run: () => setPermissionAsked({ id: subjectId, target: 'auto' }),
       });
     if (permissionMode !== 'bypass' && free('bypass'))
       list.push({
@@ -935,10 +1025,17 @@ export default function Chat(): ReactElement {
         label: `${label('bypass')}…`,
         group,
         icon: glyph(ShieldOff),
-        run: () => setPermissionAsked({ id: workId, target: 'bypass' }),
+        run: () => setPermissionAsked({ id: subjectId, target: 'bypass' }),
       });
     return list;
-  }, [workId, permissionMode, permissionBlock.chip, permissionBlock.auto, permissionBlock.bypass, setPermissionMode]);
+  }, [
+    subjectId,
+    permissionMode,
+    permissionBlock.chip,
+    permissionBlock.auto,
+    permissionBlock.bypass,
+    setPermissionMode,
+  ]);
   useCommands(permissionCommands);
 
   const position = { index: 1, count: openCards.length };
@@ -1099,12 +1196,14 @@ export default function Chat(): ReactElement {
     : mode === 'work'
       ? newFolder === null
         ? CHAT.placeholderWorkNoFolder
-        : fill(CHAT.placeholderWork, { folder: folderName(newFolder) })
+        : fill(permissionMode === 'bypass' ? CHAT.permission.bypass.placeholderNew : CHAT.placeholderWork, {
+            folder: folderName(newFolder),
+          })
       : CHAT.placeholderChat;
 
   const tools = (
     <>
-      <span ref={pickerRef} className="inline-flex">
+      <span ref={pickerRef} className="inline-flex min-w-0" data-give="3">
         <ModelPicker
           value={modelValue}
           bases={bases}
@@ -1133,7 +1232,7 @@ export default function Chat(): ReactElement {
       {host !== null ? <WebChip providers={host.providers} mode={mode} /> : null}
       {mode === 'work' ? (
         <PermissionModeChip
-          key={workId ?? ''}
+          key={chipKey}
           place="composer"
           mode={permissionMode}
           block={permissionBlock}
@@ -1171,9 +1270,9 @@ export default function Chat(): ReactElement {
             trailing={docked ? null : newButton}
             folder={openFolder !== null ? <OpenFolderChip folder={openFolder} /> : null}
             permission={
-              permissionMode !== 'ask' ? (
+              subject?.kind === 'conversation' && permissionMode !== 'ask' ? (
                 <PermissionModeChip
-                  key={workId ?? ''}
+                  key={subjectId}
                   place="header"
                   mode={permissionMode}
                   block={permissionBlock}
@@ -1258,9 +1357,9 @@ export default function Chat(): ReactElement {
         onRenamed={() => reloadLists()}
         returnFocus={returnFocus}
       />
-      {workId !== null ? (
+      {subjectId !== null ? (
         <PermissionModeDialog
-          key={workId}
+          key={subjectId}
           target={permissionDialog}
           mode={permissionMode}
           onClose={() => setPermissionAsked(null)}

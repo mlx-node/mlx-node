@@ -371,7 +371,11 @@ export function ModelPicker(props: ModelPickerProps): ReactElement {
             maxChars={22}
           />
           {selected !== undefined ? (
-            <span data-chip-label="" className={styles.variant}>
+            <span
+              data-chip-label=""
+              data-fit-whole={props.crowded === true ? '' : undefined}
+              className={styles.variant}
+            >
               <Badge tone="neutral" size="sm" outline>
                 {truncateMiddle(selected.label, 14)}
               </Badge>
