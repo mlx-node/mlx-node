@@ -18,6 +18,7 @@ import { AddressInfo } from 'node:net';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import {
+  endpointModels,
   EXIT_STARTUP_FAILED,
   handleSidecarRequest,
   NoParentChannelError,
@@ -65,7 +66,9 @@ async function realHost(overrides: Partial<SidecarHost> = {}): Promise<SidecarHo
     port,
     modelsDir: '/models',
     boundModel: 'a-model',
-    models: [{ name: 'a-model', path: '/models/a-model', modelType: 'qwen3' }],
+    models: [
+      { name: 'a-model', path: '/models/a-model', modelType: 'qwen3', base: 'a-model', variant: 'BF16', format: 'mlx' },
+    ],
     logDir: null,
     close: async () => {
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -176,6 +179,14 @@ describe('the readiness handshake', () => {
     // which makes it a published password.
     const tokens = new Set(Array.from({ length: 8 }, () => sidecarHostOptions().authToken));
     expect(tokens.size).toBe(8);
+  });
+
+  it('names the desktop as the host kind of the runtime series', () => {
+    expect(sidecarHostOptions().hostKind).toBe('desktop');
+  });
+
+  it('the desktop engine keeps the disk cache on by default, with no flag over the env', () => {
+    expect(sidecarHostOptions().persistPagedCache).toEqual({ byDefault: true, wholePrompt: true });
   });
 
   it('keeps the bind that the token protects', () => {
@@ -294,6 +305,28 @@ describe('handleSidecarRequest', () => {
     const value = (await handleSidecarRequest(host, { op: 'models' })) as unknown[];
     expect(value).toEqual([{ name: 'm', path: '/p', modelType: 'gemma4' }]);
     expect(() => structuredClone(value)).not.toThrow();
+  });
+});
+
+describe('endpointModels', () => {
+  it('writes each served model field by field, with its base, variant and format', () => {
+    const models = [
+      { name: 'm-Q4_K_M', path: '/m.gguf', modelType: 'qwen4_exp', base: 'm', variant: 'Q4_K_M', format: 'gguf' },
+      {
+        name: 'm-bf16',
+        path: '/m-bf16',
+        modelType: 'qwen4_exp',
+        base: 'm',
+        variant: 'BF16',
+        format: 'mlx',
+        preset: {},
+      },
+    ] as SidecarHost['models'];
+    const value = endpointModels(models);
+    expect(value).toEqual([
+      { name: 'm-Q4_K_M', path: '/m.gguf', base: 'm', variant: 'Q4_K_M', format: 'gguf' },
+      { name: 'm-bf16', path: '/m-bf16', base: 'm', variant: 'BF16', format: 'mlx' },
+    ]);
   });
 });
 

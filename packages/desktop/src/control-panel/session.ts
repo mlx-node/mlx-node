@@ -32,7 +32,7 @@ export interface ControlPanelSessionOptions {
   runtime: ControlPanelSessionRuntime;
   /**
    * Test seam. Defaults to `serveRuntimeOverPort`, which is what makes only
-   * `call` and `subscribe` reachable over the port — `close`, `drain` and
+   * `call`, `subscribe` and `watchLive` reachable over the port — `close`, `drain` and
    * `ingestNow` stay this process's, because a renderer that could close the
    * runtime it is rendering is not a feature.
    */

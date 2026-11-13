@@ -49,8 +49,8 @@ export const SIDECAR_HOST_OPTIONS = Object.freeze({ port: 0, host: '127.0.0.1' }
  *
  * Kept explicit at the process seam rather than relying on the server package's
  * default: MAIN's supervisor must allow this whole interval PLUS time for
- * `InferenceHost.close()` to flush its logger and remove the paged-config temp
- * root before escalating SIGTERM to SIGKILL.
+ * `InferenceHost.close()` to drain the disk cache writes, flush its logger and
+ * remove the paged-config temp root before escalating SIGTERM to SIGKILL.
  */
 export const SIDECAR_HOST_CLOSE_TIMEOUT_MS = 5_000;
 
@@ -87,6 +87,8 @@ export function sidecarHostOptions(env: NodeJS.ProcessEnv = process.env): Sideca
   return {
     ...SIDECAR_HOST_OPTIONS,
     authToken: newSidecarAuthToken(),
+    hostKind: 'desktop',
+    persistPagedCache: { byDefault: true, wholePrompt: true },
     ...(turnJournal !== null ? { turnJournal } : {}),
   };
 }
@@ -101,6 +103,14 @@ export interface SidecarHostOptions {
   port: number;
   host: string;
   authToken: string;
+  hostKind: 'desktop';
+  /**
+   * The paged KV disk cache: on unless `MLX_PERSIST_PAGED_CACHE` in this
+   * process's env says otherwise, and a turn writes the whole prompt.
+   * `InferenceHostOptions.persistPagedCache`, restated for the reason
+   * {@link SidecarHost} gives.
+   */
+  persistPagedCache: { flag?: boolean; byDefault: boolean; wholePrompt: boolean };
   turnJournal?: SidecarTurnJournal;
 }
 
@@ -129,9 +139,23 @@ export interface SidecarHost {
   port: number;
   modelsDir: string;
   boundModel: string;
-  models: readonly { name: string; path: string; modelType: string }[];
+  models: readonly {
+    name: string;
+    path: string;
+    modelType: string;
+    base: string;
+    variant: string;
+    format: 'gguf' | 'mlx';
+  }[];
   logDir: string | null;
   close(opts?: { timeoutMs?: number }): Promise<void>;
+}
+
+/** The endpoint file's `models[]`, field by field: the host's entries carry more than the file may hold. */
+export function endpointModels(
+  models: SidecarHost['models'],
+): { name: string; path: string; base: string; variant: string; format: 'gguf' | 'mlx' }[] {
+  return models.map(({ name, path, base, variant, format }) => ({ name, path, base, variant, format }));
 }
 
 /**

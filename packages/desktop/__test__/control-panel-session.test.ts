@@ -57,6 +57,9 @@ function stubRuntime(): StubRuntime {
         runtime.released[index] = true;
       };
     },
+    watchLive(): () => void {
+      return () => {};
+    },
     emit(index: number, event: DownloadEvent): void {
       listeners[index](event);
     },
