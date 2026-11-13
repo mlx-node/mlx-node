@@ -1388,6 +1388,131 @@ pub(crate) mod tests {
         crate::engine::persistence::compiled_forward_backend_available()
             && unsafe { mlx_sys::mlx_default_device() } == 1
     }
+
+    /// Word-level `t0`..`t15` plus `<|im_end|>` (16, outside the 16-token
+    /// head); the template renders each message's content and the
+    /// generation prompt `t2 t3`.
+    pub(crate) fn content_tokenizer() -> std::sync::Arc<crate::tokenizer::Qwen3Tokenizer> {
+        let vocab = (0..16)
+            .map(|i| format!("\"t{i}\": {i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let json = format!(
+            r#"{{
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": {{ "type": "Whitespace" }},
+                "post_processor": null,
+                "decoder": null,
+                "model": {{
+                    "type": "WordLevel",
+                    "vocab": {{ {vocab}, "<|im_end|>": 16 }},
+                    "unk_token": "t0"
+                }}
+            }}"#
+        );
+        let tokenizer = tokenizers::Tokenizer::from_bytes(json.as_bytes())
+            .unwrap_or_else(|error| panic!("fixture tokenizer: {error}"));
+        std::sync::Arc::new(
+            crate::tokenizer::Qwen3Tokenizer::from_tokenizer(
+                tokenizer,
+                Some(
+                    "{% for message in messages %}{{ message.content }} {% endfor %}\
+                     {% if add_generation_prompt %}t2 t3{% endif %}"
+                        .to_string(),
+                ),
+            )
+            .expect("tokenizer"),
+        )
+    }
+
+    /// The generation prompt [`content_tokenizer`]'s template appends.
+    pub(crate) const GENERATION_PROMPT: [u32; 2] = [2, 3];
+
+    /// The prompt [`content_tokenizer`] renders for one user message of
+    /// `body`.
+    pub(crate) fn rendered_prompt(body: &[u32]) -> Vec<u32> {
+        let mut tokens = body.to_vec();
+        tokens.extend(GENERATION_PROMPT);
+        tokens
+    }
+
+    /// One `chatSessionStart` per `(owner, body)` (Splash `Engine::submit`),
+    /// all queued before the first drive pass, driven through the model
+    /// thread's scheduler until every one replies. Returns the replies and
+    /// the most turns live in one pass.
+    pub(crate) fn drive_session_starts<B>(
+        state: &mut crate::engine::hybrid_scheduler::HybridSchedulerState<B>,
+        starts: &[(&str, &[u32])],
+        max_new_tokens: i32,
+    ) -> Result<(Vec<crate::engine::types::ChatResult>, usize)>
+    where
+        B: crate::engine::hybrid_scheduler::HybridSchedulerBackend,
+    {
+        use crate::engine::cmd::ChatCmd;
+        use crate::engine::model_command::ModelCommand;
+        use crate::model_thread::LoopControl;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut replies = Vec::new();
+        for (owner, body) in starts {
+            let content = body
+                .iter()
+                .map(|id| format!("t{id}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let message: crate::tokenizer::ChatMessage =
+                serde_json::from_value(serde_json::json!({"role": "user", "content": content}))
+                    .map_err(|error| Error::from_reason(error.to_string()))?;
+            let (reply, result) = tokio::sync::oneshot::channel();
+            let command = ChatCmd::SessionStart {
+                messages: vec![message],
+                config: crate::engine::types::ChatConfig {
+                    max_new_tokens: Some(max_new_tokens),
+                    temperature: Some(0.0),
+                    enable_mtp: Some(false),
+                    max_consecutive_tokens: Some(0),
+                    max_ngram_repeats: Some(0),
+                    reasoning_effort: Some("none".to_string()),
+                    cache_owner_id: Some((*owner).to_string()),
+                    ..Default::default()
+                },
+                reply,
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            if sender
+                .send(ModelCommand::<B::FamilyCommand>::from_chat(command))
+                .is_err()
+            {
+                return Err(Error::from_reason("the command channel closed"));
+            }
+            replies.push((result, None));
+        }
+        // An idle pass with every sender gone ends the loop instead of
+        // blocking this thread.
+        drop(sender);
+        let mut most_live = 0;
+        for _ in 0..256 {
+            if !matches!(state.drive(&mut receiver), LoopControl::Continue) {
+                return Err(Error::from_reason("the scheduler stopped"));
+            }
+            most_live = most_live.max(state.live_turns());
+            for (result, done) in &mut replies {
+                if done.is_none()
+                    && let Ok(reply) = result.try_recv()
+                {
+                    *done = Some(reply?);
+                }
+            }
+            if replies.iter().all(|(_, done)| done.is_some()) {
+                let results = replies.into_iter().filter_map(|(_, done)| done).collect();
+                return Ok((results, most_live));
+            }
+        }
+        Err(Error::from_reason("the scheduled turns did not finish"))
+    }
 }
 
 #[cfg(test)]
@@ -2849,6 +2974,166 @@ mod paged_dflash2_tests {
                 "the state past the resume continues the window"
             );
             assert_eq!(bits(&logits)?, reference_logits);
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result
+    }
+
+    /// The states a whole autoregressive turn of `tokens` on a draft load
+    /// publishes when its generation prompt is the template's.
+    fn whole_turn_states_with_prompt(seed: u64, tokens: &[u32]) -> Result<Vec<DraftState>> {
+        let mut inner = wide_draft_inner(seed, 40);
+        inner.dflash2_states.generation_suffix =
+            Some(std::sync::Arc::from(&super::tests::GENERATION_PROMPT[..]));
+        let prefix = inner.prime_dspark_prefix_state(tokens, true, 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len(), 0);
+        inner.paged_prefill_with_draft_state(tokens, &prefix, Stream::generation())?;
+        draft_states(&inner, tokens)
+    }
+
+    /// Splash `Engine::submit` → `admit` → `configureDraftStatePlan` →
+    /// `publishReachedStateBoundaries` → `release` through the model
+    /// thread's scheduler on a draft load, which decodes autoregressively
+    /// (the scheduler never speculates there): two sessions started together
+    /// run as two live sequences, and each publishes the states, GDN cells
+    /// and draft windows a whole turn of its own prompt does; their windows
+    /// go back to the idle lane at their ends. After a restart (Splash
+    /// `Cache::adopt` → `acquireDeepest` → `QwenStateStorage::restore`) a
+    /// session whose prompt extends the first one's resumes at that one's
+    /// replay point (144) from disk, and the states it publishes past it,
+    /// windows reaching below 144 included, are the whole turn's of the
+    /// longer prompt.
+    /// Mutation DS1 (the scheduled prime on a draft load primes plain) → red.
+    #[test]
+    fn scheduler_runs_draft_load_ar_sessions_on_the_state_tier() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "scheduler_runs_draft_load_ar_sessions_on_the_state_tier",
+        ) || !super::tests::metal_is_default_device()
+        {
+            return Ok(());
+        }
+        use super::tests::{content_tokenizer, drive_session_starts, rendered_prompt};
+        use crate::engine::governor::governor::Governor;
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use crate::engine::hybrid_scheduler::HybridSchedulerState;
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{
+            TestTier, attach_tier, persistent_test_tier,
+        };
+        use crate::models::qwen3_5::dflash2_state::disk::{adopt_all, close_cache};
+        let _ctx = StreamContext::new(Stream::generation());
+        let seed = 0x5_81A0;
+        let scheduler_on = |tier: &TestTier| -> Result<HybridSchedulerState<Qwen35Inner>> {
+            let mut inner = wide_draft_inner(seed, 40);
+            let window = inner
+                .dflash2
+                .as_ref()
+                .expect("draft")
+                .config
+                .context_window()?;
+            attach_tier(
+                &mut inner.dflash2_states,
+                &inner.config,
+                inner.paged_adapter.as_ref().expect("pool"),
+                tier,
+                window.nbytes(),
+                window.slots(),
+            );
+            inner.paged_adapter.as_mut().expect("pool").set_cold_tier(
+                crate::models::qwen3_5::dflash2_state::disk::state_context(&tier.tier),
+            );
+            inner.tokenizer = Some(content_tokenizer());
+            let io = FakeIo::new(
+                stats(0),
+                host(32 * G, crate::engine::governor::host::Pressure::Normal),
+            );
+            let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+            inner.memory_registration =
+                Some(governor.register_model(model(16 * G, 0)).expect("register"));
+            let mut state = HybridSchedulerState::new(inner)?;
+            state.enable_continuous_batching();
+            Ok(state)
+        };
+        let first = prompt(150);
+        let second: Vec<u32> = (0..150u32).map(|i| (i * 5 + 1) % VOCAB).collect();
+        let longer = prompt(180);
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(16)));
+        let result = (|| -> Result<()> {
+            let references = [
+                whole_turn_states_with_prompt(seed, &rendered_prompt(&first))?,
+                whole_turn_states_with_prompt(seed, &rendered_prompt(&second))?,
+            ];
+            for reference in &references {
+                assert_eq!(
+                    reference.iter().map(|state| state.0).collect::<Vec<_>>(),
+                    vec![80, 144]
+                );
+            }
+            let longer_reference = whole_turn_states_with_prompt(seed, &rendered_prompt(&longer))?;
+            let tier = persistent_test_tier("s13-sched-drive-draft", 1 << 30);
+            let mut state = scheduler_on(&tier)?;
+            let (results, most_live) =
+                drive_session_starts(&mut state, &[("a", &first), ("b", &second)], 2)?;
+            assert_eq!(most_live, 2, "the two sessions ran as two live sequences");
+            for (result, (body, reference)) in results
+                .iter()
+                .zip([&first, &second].into_iter().zip(&references))
+            {
+                assert_eq!(result.cached_tokens, 0);
+                assert_eq!(
+                    &draft_states(&state.inner, &rendered_prompt(body))?,
+                    reference,
+                    "each session publishes its own whole turn's states"
+                );
+            }
+            assert!(state.inner.dflash2.is_some(), "the draft is back");
+            assert!(state.inner.dflash2_states.seq_windows.is_empty());
+            assert!(state.inner.dflash2_states.turns.is_empty());
+            assert!(state.inner.dflash2_states.idle_lane.window.is_some());
+            let replay = draft_states(&state.inner, &rendered_prompt(&first))?
+                .into_iter()
+                .find(|stored| stored.0 == 144)
+                .expect("the replay point at 144");
+            assert!(close_cache(
+                &mut state.inner,
+                std::time::Instant::now() + std::time::Duration::from_secs(30)
+            ));
+            drop(state);
+
+            let tier = tier.reopen("s13-sched-drive-draft", 1 << 30);
+            let mut state = scheduler_on(&tier)?;
+            assert!(adopt_all(&mut state.inner) >= 1);
+            let (results, _) = drive_session_starts(&mut state, &[("c", &longer)], 2)?;
+            assert_eq!(
+                results[0].cached_tokens, 144,
+                "the session resumed from disk"
+            );
+            let disk = state
+                .inner
+                .dflash2_states
+                .disk
+                .as_ref()
+                .expect("tier")
+                .counters;
+            assert_eq!((disk.promotions, disk.invalidations), (1, 0));
+            let states = draft_states(&state.inner, &rendered_prompt(&longer))?;
+            assert!(
+                states.contains(&replay),
+                "the promoted state is the stored one"
+            );
+            let past: Vec<_> = states.into_iter().filter(|stored| stored.0 > 144).collect();
+            let expected: Vec<_> = longer_reference
+                .into_iter()
+                .filter(|stored| stored.0 > 144)
+                .collect();
+            assert!(
+                expected.iter().any(|stored| stored.2.0 < 144),
+                "a window past the resume reaches below it"
+            );
+            assert_eq!(
+                past, expected,
+                "the states past the resume continue the stored window"
+            );
             Ok(())
         })();
         PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));

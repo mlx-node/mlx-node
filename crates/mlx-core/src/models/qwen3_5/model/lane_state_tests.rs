@@ -913,3 +913,88 @@ fn image_turn_on_a_draft_load_publishes_draft_states() -> Result<()> {
     assert!(inner.dflash2_states.turns.is_empty(), "the turn ended");
     Ok(())
 }
+
+/// Each RAM state's depth, window bounds and window rows' bits.
+fn state_windows(inner: &Qwen35Inner) -> Result<Vec<(usize, (u32, u32), Vec<u32>)>> {
+    let mut windows = Vec::new();
+    for entry in inner.dflash2_states.store.entries() {
+        let window = entry
+            .ram()
+            .and_then(|state| state.window.as_ref())
+            .unwrap_or_else(|| panic!("a state at {} carries no draft window", entry.depth()));
+        let rows = window
+            .load_rows(window.begin(), window.end() - window.begin())?
+            .astype(crate::array::DType::Float32)?;
+        rows.eval();
+        let bits = rows
+            .to_float32()?
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        windows.push((entry.depth(), (window.begin(), window.end()), bits));
+    }
+    windows.sort_by_key(|window| window.0);
+    Ok(windows)
+}
+
+/// Splash restores a window with each state it resumes at, so a lane that
+/// resumes with none draws no point's window from rows below its resume.
+/// An image turn on a draft load whose prompt extends the session's last
+/// one resumes at its KV hit (128) on the session's live GDN cell, with no
+/// stored state there: it publishes only the points a whole draft window
+/// (40) past 128, the replay point (208) and not the checkpoint (160), each
+/// with the whole window a cold turn of the same prompt publishes there.
+/// Mutation KI1 (`image_lane_prefill` keeps every point) → red.
+#[test]
+fn image_turn_at_a_kv_hit_without_a_state_publishes_whole_windows() -> Result<()> {
+    const TEST: &str = "image_turn_at_a_kv_hit_without_a_state_publishes_whole_windows";
+    const IMAGE: u64 = 0xA11C_E005;
+    if !metal_is_default_device() || crate::test_support::paged_prefill_unsupported(TEST) {
+        return Ok(());
+    }
+    let draft_load = || {
+        let mut inner = tiny_dflash_inner_with_config(0x5A13_0025, |_| {});
+        install_pool(&mut inner, 32, 32, passing_probe()).expect("pool");
+        inner.dflash2.as_mut().expect("draft").config.sliding_window = 40;
+        inner
+    };
+    let _plan = SmallPlan::new();
+    let tokens = prompt(29, 220);
+    let mut cold = draft_load();
+    assert_eq!(image_turn(&mut cold, &tokens, IMAGE)?, 0);
+    let reference = state_windows(&cold)?;
+    assert_eq!(
+        reference.iter().map(|window| window.0).collect::<Vec<_>>(),
+        vec![160, 208],
+        "the checkpoint at 160 retired the one at 80 (Splash `retireCheckpoint`)"
+    );
+
+    let mut inner = draft_load();
+    let head = &tokens[..128];
+    assert_eq!(image_turn(&mut inner, head, IMAGE)?, 0);
+    assert!(
+        inner
+            .dflash2_states
+            .store
+            .entries()
+            .all(|entry| entry.depth() < 128),
+        "no state at the KV hit"
+    );
+    inner.cached_token_history = head.to_vec();
+    inner.cached_image_key = Some(IMAGE);
+    assert_eq!(image_turn(&mut inner, &tokens, IMAGE)?, 128);
+    assert!(inner.dflash2.is_some(), "the draft is back");
+    let published: Vec<_> = state_windows(&inner)?
+        .into_iter()
+        .filter(|window| window.0 > 128)
+        .collect();
+    let expected: Vec<_> = reference
+        .into_iter()
+        .filter(|window| window.0 == 208)
+        .collect();
+    assert_eq!(
+        published, expected,
+        "only whole windows past the resume are published"
+    );
+    Ok(())
+}

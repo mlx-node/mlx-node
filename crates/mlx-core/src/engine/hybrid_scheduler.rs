@@ -3052,6 +3052,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     }
 
     #[cfg(test)]
+    pub(crate) fn enable_continuous_batching(&mut self) {
+        self.enabled = true;
+    }
+
+    #[cfg(test)]
     pub(crate) fn live_turns(&self) -> usize {
         self.scheduler.waiting_len() + self.scheduler.running_len()
     }

@@ -1866,6 +1866,163 @@ mod paged_dflash2_tests {
         result
     }
 
+    /// The states a whole autoregressive MoE turn of `tokens` on a draft
+    /// load publishes when its generation prompt is the template's.
+    fn whole_turn_states_with_prompt(seed: u64, tokens: &[u32]) -> Result<Vec<DraftState>> {
+        let mut inner = wide_draft_inner(seed, 40);
+        inner.dflash2_states.generation_suffix = Some(std::sync::Arc::from(
+            &crate::models::qwen3_5::dflash2_decode::tests::GENERATION_PROMPT[..],
+        ));
+        let prefix = inner.prime_dspark_prefix_state(tokens, true, 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len(), 0);
+        inner.paged_prefill_with_draft_state(tokens, &prefix, Stream::generation())?;
+        draft_states(&inner, tokens)
+    }
+
+    /// The dense `scheduler_runs_draft_load_ar_sessions_on_the_state_tier`
+    /// on a MoE load: through the model thread's scheduler, two sessions
+    /// started together run as two live sequences and each publishes the
+    /// states, GDN cells and draft windows a whole turn of its own prompt
+    /// does; after a restart a session extending the first one's prompt
+    /// resumes at its replay point (144) from disk, and the states past it
+    /// are the whole turn's of the longer prompt.
+    /// Mutation DS1m (the scheduled MoE prime on a draft load primes plain)
+    /// → red.
+    #[test]
+    fn moe_scheduler_runs_draft_load_ar_sessions_on_the_state_tier() -> Result<()> {
+        use crate::models::qwen3_5::dflash2_decode::tests::{
+            content_tokenizer, drive_session_starts, metal_is_default_device, rendered_prompt,
+        };
+        if crate::test_support::paged_prefill_unsupported(
+            "moe_scheduler_runs_draft_load_ar_sessions_on_the_state_tier",
+        ) || !metal_is_default_device()
+        {
+            return Ok(());
+        }
+        use crate::engine::governor::governor::Governor;
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use crate::engine::hybrid_scheduler::HybridSchedulerState;
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{
+            TestTier, attach_tier, persistent_test_tier,
+        };
+        use crate::models::qwen3_5::dflash2_state::disk::{adopt_all, close_cache};
+        use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
+        let _ctx = StreamContext::new(Stream::generation());
+        let seed = 0x5_81B0;
+        let scheduler_on = |tier: &TestTier| -> Result<HybridSchedulerState<Qwen35MoeInner>> {
+            let mut inner = wide_draft_inner(seed, 40);
+            let window = inner
+                .dflash2
+                .as_ref()
+                .expect("draft")
+                .config
+                .context_window()?;
+            let dense = inner.config.to_dense_config();
+            attach_tier(
+                &mut inner.dflash2_states,
+                &dense,
+                inner.paged_adapter.as_ref().expect("pool"),
+                tier,
+                window.nbytes(),
+                window.slots(),
+            );
+            inner.paged_adapter.as_mut().expect("pool").set_cold_tier(
+                crate::models::qwen3_5::dflash2_state::disk::state_context(&tier.tier),
+            );
+            inner.tokenizer = Some(content_tokenizer());
+            let io = FakeIo::new(
+                stats(0),
+                host(32 * G, crate::engine::governor::host::Pressure::Normal),
+            );
+            let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+            inner.memory_registration =
+                Some(governor.register_model(model(16 * G, 0)).expect("register"));
+            let mut state = HybridSchedulerState::new(inner)?;
+            state.enable_continuous_batching();
+            Ok(state)
+        };
+        let first = prompt(150);
+        let second: Vec<u32> = (0..150u32).map(|i| (i * 5 + 1) % VOCAB).collect();
+        let longer = prompt(180);
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(16)));
+        let result = (|| -> Result<()> {
+            let references = [
+                whole_turn_states_with_prompt(seed, &rendered_prompt(&first))?,
+                whole_turn_states_with_prompt(seed, &rendered_prompt(&second))?,
+            ];
+            for reference in &references {
+                assert_eq!(
+                    reference.iter().map(|state| state.0).collect::<Vec<_>>(),
+                    vec![80, 144]
+                );
+            }
+            let longer_reference = whole_turn_states_with_prompt(seed, &rendered_prompt(&longer))?;
+            let tier = persistent_test_tier("s13-moe-sched-drive-draft", 1 << 30);
+            let mut state = scheduler_on(&tier)?;
+            let (results, most_live) =
+                drive_session_starts(&mut state, &[("a", &first), ("b", &second)], 2)?;
+            assert_eq!(most_live, 2, "the two sessions ran as two live sequences");
+            for (result, (body, reference)) in results
+                .iter()
+                .zip([&first, &second].into_iter().zip(&references))
+            {
+                assert_eq!(result.cached_tokens, 0);
+                assert_eq!(
+                    &draft_states(&state.inner, &rendered_prompt(body))?,
+                    reference,
+                    "each session publishes its own whole turn's states"
+                );
+            }
+            assert!(state.inner.dflash2.is_some(), "the draft is back");
+            assert!(state.inner.dflash2_states.seq_windows.is_empty());
+            assert!(state.inner.dflash2_states.turns.is_empty());
+            let replay = draft_states(&state.inner, &rendered_prompt(&first))?
+                .into_iter()
+                .find(|stored| stored.0 == 144)
+                .expect("the replay point at 144");
+            assert!(close_cache(
+                &mut state.inner,
+                std::time::Instant::now() + std::time::Duration::from_secs(30)
+            ));
+            drop(state);
+
+            let tier = tier.reopen("s13-moe-sched-drive-draft", 1 << 30);
+            let mut state = scheduler_on(&tier)?;
+            assert!(adopt_all(&mut state.inner) >= 1);
+            let (results, _) = drive_session_starts(&mut state, &[("c", &longer)], 2)?;
+            assert_eq!(
+                results[0].cached_tokens, 144,
+                "the session resumed from disk"
+            );
+            let disk = state
+                .inner
+                .dflash2_states
+                .disk
+                .as_ref()
+                .expect("tier")
+                .counters;
+            assert_eq!((disk.promotions, disk.invalidations), (1, 0));
+            let states = draft_states(&state.inner, &rendered_prompt(&longer))?;
+            assert!(
+                states.contains(&replay),
+                "the promoted state is the stored one"
+            );
+            let past: Vec<_> = states.into_iter().filter(|stored| stored.0 > 144).collect();
+            let expected: Vec<_> = longer_reference
+                .into_iter()
+                .filter(|stored| stored.0 > 144)
+                .collect();
+            assert!(expected.iter().any(|stored| stored.2.0 < 144));
+            assert_eq!(
+                past, expected,
+                "the states past the resume continue the stored window"
+            );
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result
+    }
+
     /// The dense `scheduled_ar_on_a_draft_load_resumes_after_a_restart` on
     /// a MoE load: after a restart a scheduled request extending a stored
     /// prompt resumes at its replay point (144) from disk with the stored
