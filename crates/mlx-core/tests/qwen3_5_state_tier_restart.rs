@@ -166,6 +166,24 @@ fn source() -> Option<PathBuf> {
     Some(path)
 }
 
+/// The image checkpoint; `None` when `MLX_TEST_VLM_MODEL_PATH` is unset.
+/// Separate from `source()` because a 7 GB runner has no vision headroom.
+fn vlm_source() -> Option<PathBuf> {
+    let Ok(path) = std::env::var("MLX_TEST_VLM_MODEL_PATH") else {
+        eprintln!(
+            "skipping image_conversation_resumes_after_a_restart: MLX_TEST_VLM_MODEL_PATH unset"
+        );
+        return None;
+    };
+    let path = PathBuf::from(path.trim());
+    assert!(
+        path.is_dir(),
+        "MLX_TEST_VLM_MODEL_PATH is set but is not a directory: {}",
+        path.display()
+    );
+    Some(path)
+}
+
 async fn load(path: &std::path::Path, options: Qwen35LoadOptions) -> Qwen3_5Model {
     let model = Qwen3_5Model::load(path.to_string_lossy().to_string(), Some(options))
         .await
@@ -452,9 +470,9 @@ async fn conversation_resumes_after_a_restart(decode: Decode) {
 /// which restores nothing and leaves X's state, then P2 over X, which
 /// resumes at A's replay point and decodes as C did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 dense checkpoint"]
+#[ignore = "needs MLX_TEST_VLM_MODEL_PATH pointing to a real Qwen3.5 dense checkpoint"]
 async fn image_conversation_resumes_after_a_restart() {
-    let Some(path) = source() else {
+    let Some(path) = vlm_source() else {
         return;
     };
     mlx_core::tracing::try_init_tracing();

@@ -256,7 +256,7 @@ fn plain_paged_load_opens_the_state_tier() {
         return;
     };
     let root = std::env::temp_dir().join(format!(
-        "mlx-s13-plain-tier-{}-{}",
+        "mlx-state-tier-plain-tier-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -353,8 +353,8 @@ fn refused_ar_checkpoint_goes_to_disk_from_the_lane() -> Result<()> {
     ) else {
         return Ok(());
     };
-    let tier = test_tier("s13-ar-lane", 1 << 30);
-    let twin_tier = test_tier("s13-ar-lane-twin", 1 << 30);
+    let tier = test_tier("state-tier-ar-lane", 1 << 30);
+    let twin_tier = test_tier("state-tier-ar-lane-twin", 1 << 30);
     attach(&mut inner, &tier);
     attach(&mut twin, &twin_tier);
     let _plan = SmallPlan::new();
@@ -410,7 +410,7 @@ fn ar_restart_restores_the_disk_state() -> Result<()> {
     let Some(mut first) = plain(0x5A13_0005, "ar_restart_restores_the_disk_state") else {
         return Ok(());
     };
-    let tier = persistent_test_tier("s13-ar-restart", 1 << 30);
+    let tier = persistent_test_tier("state-tier-ar-restart", 1 << 30);
     attach(&mut first, &tier);
     let _plan = SmallPlan::new();
     let tokens = prompt(11, 127);
@@ -433,7 +433,7 @@ fn ar_restart_restores_the_disk_state() -> Result<()> {
     assert_eq!(behind(&first).durable, 1);
     drop(first);
 
-    let tier = tier.reopen("s13-ar-restart", 1 << 30);
+    let tier = tier.reopen("state-tier-ar-restart", 1 << 30);
     let Some(mut second) = plain(0x5A13_0005, "ar_restart_restores_the_disk_state") else {
         return Ok(());
     };
@@ -566,8 +566,8 @@ fn mtp_turn_publishes_its_plan_and_decodes_as_without_states() -> Result<()> {
     ) else {
         return Ok(());
     };
-    let tier = test_tier("s13-mtp-lane", 1 << 30);
-    let granted_tier = test_tier("s13-mtp-lane-granted", 1 << 30);
+    let tier = test_tier("state-tier-mtp-lane", 1 << 30);
+    let granted_tier = test_tier("state-tier-mtp-lane-granted", 1 << 30);
     attach(&mut refused, &tier);
     attach(&mut granted, &granted_tier);
     let _plan = SmallPlan::new();
@@ -645,7 +645,7 @@ fn mtp_restart_restores_the_disk_state() -> Result<()> {
     let Some(mut first) = plain(0x5A13_0013, TEST) else {
         return Ok(());
     };
-    let tier = persistent_test_tier("s13-mtp-restart", 1 << 30);
+    let tier = persistent_test_tier("state-tier-mtp-restart", 1 << 30);
     attach(&mut first, &tier);
     let _plan = SmallPlan::new();
     let tokens = prompt(17, 127);
@@ -668,7 +668,7 @@ fn mtp_restart_restores_the_disk_state() -> Result<()> {
     assert_eq!(behind(&first).durable, 1);
     drop(first);
 
-    let tier = tier.reopen("s13-mtp-restart", 1 << 30);
+    let tier = tier.reopen("state-tier-mtp-restart", 1 << 30);
     let Some(mut second) = plain(0x5A13_0013, TEST) else {
         return Ok(());
     };
@@ -811,7 +811,7 @@ fn image_restart_restores_only_the_same_image() -> Result<()> {
     let Some(mut first) = plain(0x5A13_0021, TEST) else {
         return Ok(());
     };
-    let tier = persistent_test_tier("s13-image-restart", 1 << 30);
+    let tier = persistent_test_tier("state-tier-image-restart", 1 << 30);
     attach(&mut first, &tier);
     let _plan = SmallPlan::new();
     let tokens = prompt(19, 125);
@@ -841,7 +841,7 @@ fn image_restart_restores_only_the_same_image() -> Result<()> {
     ));
     drop(first);
 
-    let tier = tier.reopen("s13-image-restart", 1 << 30);
+    let tier = tier.reopen("state-tier-image-restart", 1 << 30);
     let Some(mut second) = plain(0x5A13_0021, TEST) else {
         return Ok(());
     };

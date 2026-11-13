@@ -2412,7 +2412,7 @@ fn moe_plain_paged_load_opens_the_state_tier() {
         return;
     };
     let root = std::env::temp_dir().join(format!(
-        "mlx-s13-moe-plain-tier-{}-{}",
+        "mlx-state-tier-moe-plain-tier-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2466,7 +2466,7 @@ fn moe_plain_paged_load_opens_the_state_tier() {
 fn moe_plain_restart_restores_the_disk_state() -> Result<()> {
     use crate::models::qwen3_5::dflash2_state::disk::tests::persistent_test_tier;
     const TEST: &str = "moe_plain_restart_restores_the_disk_state";
-    let tier = persistent_test_tier("s13-moe-ar-restart", 1 << 30);
+    let tier = persistent_test_tier("state-tier-moe-ar-restart", 1 << 30);
     let Some(mut first) = plain_moe_on(&tier, TEST) else {
         return Ok(());
     };
@@ -2504,7 +2504,7 @@ fn moe_plain_restart_restores_the_disk_state() -> Result<()> {
         assert_eq!(waiting(&first).durable, 1);
         drop(first);
 
-        let tier = tier.reopen("s13-moe-ar-restart", 1 << 30);
+        let tier = tier.reopen("state-tier-moe-ar-restart", 1 << 30);
         let Some(mut second) = plain_moe_on(&tier, TEST) else {
             return Ok(());
         };
@@ -2536,7 +2536,7 @@ fn moe_scheduled_mtp_prefill_publishes_its_plan() -> Result<()> {
     use crate::models::qwen3_5::dflash2_state::disk::tests::test_tier;
     use crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget;
     const TEST: &str = "moe_scheduled_mtp_prefill_publishes_its_plan";
-    let tier = test_tier("s13-moe-mtp-lane", 1 << 30);
+    let tier = test_tier("state-tier-moe-mtp-lane", 1 << 30);
     let Some(mut inner) = plain_moe_on(&tier, TEST) else {
         return Ok(());
     };
@@ -2633,7 +2633,7 @@ fn moe_image_restart_restores_only_the_same_image() -> Result<()> {
     use crate::models::qwen3_5::dflash2_state::disk::tests::persistent_test_tier;
     const TEST: &str = "moe_image_restart_restores_only_the_same_image";
     const IMAGE: u64 = 0xA11C_E011;
-    let tier = persistent_test_tier("s13-moe-image-restart", 1 << 30);
+    let tier = persistent_test_tier("state-tier-moe-image-restart", 1 << 30);
     let Some(mut first) = plain_moe_on(&tier, TEST) else {
         return Ok(());
     };
@@ -2665,7 +2665,7 @@ fn moe_image_restart_restores_only_the_same_image() -> Result<()> {
         ));
         drop(first);
 
-        let tier = tier.reopen("s13-moe-image-restart", 1 << 30);
+        let tier = tier.reopen("state-tier-moe-image-restart", 1 << 30);
         let Some(mut second) = plain_moe_on(&tier, TEST) else {
             return Ok(());
         };

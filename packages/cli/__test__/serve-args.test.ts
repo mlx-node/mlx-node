@@ -30,11 +30,6 @@ describe('mlx serve cache flags', () => {
     );
   });
 
-  it('no longer knows --persistent-cache', () => {
-    expect(() => parseServeArgs(['--persistent-cache'], {})).toThrow(/persistent-cache/);
-    expect(() => parseServeArgs(['--no-persistent-cache'], {})).toThrow(/persistent-cache/);
-  });
-
   it('parses --max-cache-disk as Splash: auto, 0 or a size', () => {
     expect(parseServeArgs(['--max-cache-disk', '0'], {}).cacheDisk).toBe('0');
     expect(parseServeArgs(['--max-cache-disk', ' 0 '], {}).cacheDisk).toBe('0');

@@ -2916,7 +2916,7 @@ mod paged_dflash2_tests {
         PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(16)));
         let result = (|| -> Result<()> {
             let (reference, reference_logits) = whole_turn_states(seed, &longer)?;
-            let tier = persistent_test_tier("s13-sched-draft-restart", 1 << 30);
+            let tier = persistent_test_tier("state-tier-sched-draft-restart", 1 << 30);
             let mut inner = on_tier(&tier)?;
             let base = scheduled_prime(&mut inner, 1, &first)?;
             for (start, end) in [(0, 64), (64, 150)] {
@@ -2936,7 +2936,7 @@ mod paged_dflash2_tests {
             ));
             drop(inner);
 
-            let tier = tier.reopen("s13-sched-draft-restart", 1 << 30);
+            let tier = tier.reopen("state-tier-sched-draft-restart", 1 << 30);
             let mut inner = on_tier(&tier)?;
             assert!(adopt_all(&mut inner) >= 1);
             let base = scheduled_prime(&mut inner, 4, &longer)?;
@@ -3070,7 +3070,7 @@ mod paged_dflash2_tests {
                 );
             }
             let longer_reference = whole_turn_states_with_prompt(seed, &rendered_prompt(&longer))?;
-            let tier = persistent_test_tier("s13-sched-drive-draft", 1 << 30);
+            let tier = persistent_test_tier("state-tier-sched-drive-draft", 1 << 30);
             let mut state = scheduler_on(&tier)?;
             let (results, most_live) =
                 drive_session_starts(&mut state, &[("a", &first), ("b", &second)], 2)?;
@@ -3100,7 +3100,7 @@ mod paged_dflash2_tests {
             ));
             drop(state);
 
-            let tier = tier.reopen("s13-sched-drive-draft", 1 << 30);
+            let tier = tier.reopen("state-tier-sched-drive-draft", 1 << 30);
             let mut state = scheduler_on(&tier)?;
             assert!(adopt_all(&mut state.inner) >= 1);
             let (results, _) = drive_session_starts(&mut state, &[("c", &longer)], 2)?;
@@ -3611,7 +3611,7 @@ mod paged_dflash2_tests {
         use crate::models::qwen3_5::dflash2_turn::ScriptedClaim;
         let _ctx = StreamContext::new(Stream::generation());
         let prompt = prompt(52);
-        let tier = test_tier("s13-from-lane", 1 << 30);
+        let tier = test_tier("state-tier-from-lane", 1 << 30);
         let run = |claims: &[ScriptedClaim], held: bool| -> Result<Qwen35Inner> {
             let mut inner = tiny_paged_int8_dflash_inner(0x5_8191);
             with_ledger(&mut inner);
@@ -3858,7 +3858,7 @@ mod paged_dflash2_tests {
         let dflash2 = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
         let first = prompt(100);
         let seed = 0x5_8200;
-        let tier = test_tier("s13-restore", 1 << 30);
+        let tier = test_tier("state-tier-restore", 1 << 30);
         let reference = whole_turn(
             &mut tiny_paged_int8_dflash_inner(seed),
             &first,
@@ -3943,7 +3943,7 @@ mod paged_dflash2_tests {
         };
         let optional = (ClaimClass::Optional, NeedTiming::Immediate);
         for granted in [true, false] {
-            let tier = test_tier("s13-promote", 1 << 30);
+            let tier = test_tier("state-tier-promote", 1 << 30);
             let mut inner = disk_fixture(0x5_8210, &tier, true)?;
             whole_turn(&mut inner, &first, dflash2)?;
             let r = state_at(&inner, 96).expect("R");
@@ -4006,7 +4006,7 @@ mod paged_dflash2_tests {
             DecoderPlan::Autoregressive,
         )?;
         for damage in ["object", "chain"] {
-            let tier = test_tier("s13-bad-read", 1 << 30);
+            let tier = test_tier("state-tier-bad-read", 1 << 30);
             let mut inner = disk_fixture(seed, &tier, false)?;
             PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(4)));
             let turn = whole_turn(&mut inner, &first, dflash2);
@@ -4068,7 +4068,7 @@ mod paged_dflash2_tests {
         let stream = Stream::generation();
         let _ctx = StreamContext::new(stream);
         let first = prompt(100);
-        let tier = test_tier("s13-ar-read", 1 << 30);
+        let tier = test_tier("state-tier-ar-read", 1 << 30);
         let mut inner = disk_fixture(0x5_8230, &tier, false)?;
         let salt = ChatBackend::resolve_params(&inner, &Default::default()).cache_salt;
         whole_turn(
@@ -4123,7 +4123,7 @@ mod paged_dflash2_tests {
         use crate::models::qwen3_5::dflash2_state::disk::tests::{kv_key, test_tier};
         let _ctx = StreamContext::new(Stream::generation());
         let first = prompt(100);
-        let tier = test_tier("s13-ar-gone", 1 << 30);
+        let tier = test_tier("state-tier-ar-gone", 1 << 30);
         let mut inner = disk_fixture(0x5_8231, &tier, false)?;
         let salt = ChatBackend::resolve_params(&inner, &Default::default()).cache_salt;
         whole_turn(
@@ -4159,7 +4159,7 @@ mod paged_dflash2_tests {
         use crate::models::qwen3_5::dflash2_state::write_behind::{MINIMUM_TOKENS, published};
         use crate::models::qwen3_5::model::Qwen35FamilyCommand;
         let _ctx = StreamContext::new(Stream::generation());
-        let tier = persistent_test_tier("s13-close-command", 1 << 30);
+        let tier = persistent_test_tier("state-tier-close-command", 1 << 30);
         let mut inner = disk_fixture(0x5_8250, &tier, false)?;
         let block_size = inner.paged_adapter.as_ref().expect("pool").block_size();
         let blocks = MINIMUM_TOKENS.div_ceil(block_size);
@@ -4214,7 +4214,7 @@ mod paged_dflash2_tests {
             DecoderPlan::Autoregressive,
         )?;
         for broken in [false, true] {
-            let tier = persistent_test_tier("s13-adopt", 1 << 30);
+            let tier = persistent_test_tier("state-tier-adopt", 1 << 30);
             let mut inner = disk_fixture(seed, &tier, false)?;
             whole_turn(&mut inner, &first, dflash2)?;
             let r = state_at(&inner, 96).expect("the replay point at 96");
@@ -4240,7 +4240,7 @@ mod paged_dflash2_tests {
                 assert!(tier.tier.manager.remove(&lost));
             }
 
-            let tier = tier.reopen("s13-adopt", 1 << 30);
+            let tier = tier.reopen("state-tier-adopt", 1 << 30);
             let mut inner = disk_fixture(seed, &tier, false)?;
             assert_eq!(adopt_all(&mut inner), if broken { 1 } else { 2 });
             let disk = inner.dflash2_states.disk.as_ref().expect("tier");

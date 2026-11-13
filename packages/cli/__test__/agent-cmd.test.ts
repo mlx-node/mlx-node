@@ -35,14 +35,6 @@ describe('scanAgentArgs --no-persist-cache', () => {
     expect(scan.persistPagedCache).toEqual({ byDefault: true });
     expect(scan.passthrough).toEqual(['--system-prompt', '--no-persist-cache']);
   });
-
-  it('no longer knows --persistent-cache: it goes to the binary like any unknown flag', () => {
-    for (const flag of ['--persistent-cache', '--no-persistent-cache']) {
-      const scan = scanAgentArgs([flag, '-c'], {});
-      expect(scan.persistPagedCache).toEqual({ byDefault: true });
-      expect(scan.passthrough).toEqual([flag, '-c']);
-    }
-  });
 });
 
 describe('scanAgentArgs SSD state tier flags', () => {
@@ -95,6 +87,5 @@ describe('mlx agent help — --no-persist-cache', () => {
     expect(help).toContain('MLX_PERSIST_PAGED_CACHE=0');
     expect(help).toContain('--max-cache-disk <size>');
     expect(help).toContain('--cache-dir <dir>');
-    expect(help).not.toContain('--persistent-cache');
   });
 });

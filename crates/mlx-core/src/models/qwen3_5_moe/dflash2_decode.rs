@@ -1539,7 +1539,7 @@ mod paged_dflash2_tests {
         use crate::models::qwen3_5::dflash2_turn::DFlash2Target;
         use crate::models::qwen3_5_moe::model::Qwen35MoeFamilyCommand;
         let _ctx = StreamContext::new(Stream::generation());
-        let tier = persistent_test_tier("s13-moe-close-command", 1 << 30);
+        let tier = persistent_test_tier("state-tier-moe-close-command", 1 << 30);
         let mut inner = tiny_paged_int8_moe_dflash_inner(0x5_8260);
         let dense = DFlash2Target::dense_config(&inner).into_owned();
         let window = inner
@@ -1957,7 +1957,7 @@ mod paged_dflash2_tests {
                 );
             }
             let longer_reference = whole_turn_states_with_prompt(seed, &rendered_prompt(&longer))?;
-            let tier = persistent_test_tier("s13-moe-sched-drive-draft", 1 << 30);
+            let tier = persistent_test_tier("state-tier-moe-sched-drive-draft", 1 << 30);
             let mut state = scheduler_on(&tier)?;
             let (results, most_live) =
                 drive_session_starts(&mut state, &[("a", &first), ("b", &second)], 2)?;
@@ -1986,7 +1986,7 @@ mod paged_dflash2_tests {
             ));
             drop(state);
 
-            let tier = tier.reopen("s13-moe-sched-drive-draft", 1 << 30);
+            let tier = tier.reopen("state-tier-moe-sched-drive-draft", 1 << 30);
             let mut state = scheduler_on(&tier)?;
             assert!(adopt_all(&mut state.inner) >= 1);
             let (results, _) = drive_session_starts(&mut state, &[("c", &longer)], 2)?;
@@ -2071,7 +2071,7 @@ mod paged_dflash2_tests {
         PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(16)));
         let result = (|| -> Result<()> {
             let (reference, reference_logits) = whole_turn_states(seed, &longer)?;
-            let tier = persistent_test_tier("s13-moe-sched-draft-restart", 1 << 30);
+            let tier = persistent_test_tier("state-tier-moe-sched-draft-restart", 1 << 30);
             let mut inner = on_tier(&tier)?;
             let base = scheduled_prime(&mut inner, 1, &first)?;
             for (start, end) in [(0, 64), (64, 150)] {
@@ -2089,7 +2089,7 @@ mod paged_dflash2_tests {
             ));
             drop(inner);
 
-            let tier = tier.reopen("s13-moe-sched-draft-restart", 1 << 30);
+            let tier = tier.reopen("state-tier-moe-sched-draft-restart", 1 << 30);
             let mut inner = on_tier(&tier)?;
             assert!(adopt_all(&mut inner) >= 1);
             let base = scheduled_prime(&mut inner, 4, &longer)?;

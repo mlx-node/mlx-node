@@ -78,7 +78,7 @@ fn write_behind_copies_points_like_splash() {
         0x5713_1801,
         32,
         32,
-        persistent_test_tier("s13-wb-persistent", 1 << 30),
+        persistent_test_tier("state-tier-wb-persistent", 1 << 30),
     ) else {
         return;
     };
@@ -142,7 +142,8 @@ fn write_behind_copies_points_like_splash() {
     drop(tier);
 
     // A temporary tier, its pool able to grow by an extent.
-    let Some((mut inner, tier)) = fixture_on(0x5713_1802, 8, 32, test_tier("s13-wb-temp", 1 << 30))
+    let Some((mut inner, tier)) =
+        fixture_on(0x5713_1802, 8, 32, test_tier("state-tier-wb-temp", 1 << 30))
     else {
         return;
     };
@@ -200,7 +201,7 @@ fn close_at_stop_writes_every_waiting_point() {
         0x5713_2501,
         32,
         32,
-        persistent_test_tier("s13-close-persistent", 1 << 30),
+        persistent_test_tier("state-tier-close-persistent", 1 << 30),
     ) else {
         return;
     };
@@ -240,9 +241,12 @@ fn close_at_stop_writes_every_waiting_point() {
     drop(inner);
     drop(tier);
 
-    let Some((mut inner, tier)) =
-        fixture_on(0x5713_2502, 32, 32, test_tier("s13-close-temp", 1 << 30))
-    else {
+    let Some((mut inner, tier)) = fixture_on(
+        0x5713_2502,
+        32,
+        32,
+        test_tier("state-tier-close-temp", 1 << 30),
+    ) else {
         return;
     };
     let p = park_blocks(&mut inner, 130, blocks, StateClass::Ordinary);

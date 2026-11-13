@@ -266,7 +266,7 @@ failure resets all groups to zero.
 
 Hybrid sidecar capture uses the same `cache_salt` as the K/V chain. The salt is
 part of the first-block domain for both the hot prefix checkpoint and the
-persisted GDN/ShortConv/sliding sidecar key, so a salted request can use the cold tier
+persisted ShortConv/sliding sidecar key, so a salted request can use the cold tier
 without either crossing domains or failing at finalization.
 
 **Reconcile-down (`ColdSidecarPolicy`).** A family whose out-of-pool state _is_

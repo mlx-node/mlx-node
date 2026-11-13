@@ -10010,7 +10010,7 @@ pub(crate) mod tests {
                 .is_some_and(|entry| entry.ram().is_none() && entry.disk().is_some())
         };
         let with_tier = |state: &mut HybridSchedulerState<Qwen35Inner>| {
-            let tier = test_tier("s13-after-vision", 1 << 30);
+            let tier = test_tier("state-tier-after-vision", 1 << 30);
             attach_tier(
                 &mut state.inner.dflash2_states,
                 &state.inner.config,
@@ -10126,7 +10126,7 @@ pub(crate) mod tests {
                 })
                 .expect("register"),
         );
-        let tier = test_tier("s13-idle-drain", 1 << 30);
+        let tier = test_tier("state-tier-idle-drain", 1 << 30);
         attach_tier(
             &mut state.inner.dflash2_states,
             &state.inner.config,
@@ -10234,7 +10234,7 @@ pub(crate) mod tests {
         // A copy ahead on a persistent tier, due at 10 s.
         use crate::models::qwen3_5::dflash2_state::disk::tests::persistent_test_tier;
         use crate::models::qwen3_5::dflash2_state::write_behind::{DELAY_SECONDS, published};
-        let persistent = persistent_test_tier("s13-idle-copy", 1 << 30);
+        let persistent = persistent_test_tier("state-tier-idle-copy", 1 << 30);
         attach_tier(
             &mut state.inner.dflash2_states,
             &state.inner.config,

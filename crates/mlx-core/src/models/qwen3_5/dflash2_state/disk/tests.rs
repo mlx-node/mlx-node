@@ -305,7 +305,7 @@ pub(crate) fn disk_copy(inner: &Qwen35Inner, id: EntryId) -> Option<DiskCopy> {
 /// `later` false); IF1 (an in-flight copy's RAM goes at the take) → red.
 #[test]
 fn reclaim_stages_one_write_and_frees_at_once() {
-    let Some((mut inner, tier)) = fixture(0x5713_1301, "s13-reclaim") else {
+    let Some((mut inner, tier)) = fixture(0x5713_1301, "state-tier-reclaim") else {
         return;
     };
     let query = waits_for_writes();
@@ -375,7 +375,7 @@ fn reclaim_stages_one_write_and_frees_at_once() {
 /// Mutation WF1 (the failed copy is kept) → red.
 #[test]
 fn a_failed_write_leaves_no_state() {
-    let Some((mut inner, tier)) = fixture(0x5713_1501, "s13-failed-write") else {
+    let Some((mut inner, tier)) = fixture(0x5713_1501, "state-tier-failed-write") else {
         return;
     };
     let query = waits_for_writes();
@@ -410,7 +410,7 @@ fn pending_write_holds_a_waiting_claim() {
     use crate::engine::governor::governor::tests::{FakeIo, G, host, lane, model, stats};
     use crate::engine::governor::host::Pressure;
     use crate::engine::governor::ledger::{ClaimClass, ClaimSpec, NeedTiming};
-    let Some((mut inner, tier)) = fixture(0x5713_1401, "s13-pending-hold") else {
+    let Some((mut inner, tier)) = fixture(0x5713_1401, "state-tier-pending-hold") else {
         return;
     };
     let query = waits_for_writes();
@@ -590,7 +590,7 @@ fn disk_state_keeps_its_chain_until_it_lands() {
     use crate::engine::governor::governor::Governor;
     use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
     use crate::engine::governor::host::Pressure;
-    let Some((mut inner, tier)) = fixture(0x5713_1701, "s13-chain") else {
+    let Some((mut inner, tier)) = fixture(0x5713_1701, "state-tier-chain") else {
         return;
     };
     let io = FakeIo::new(stats(G), host(32 * G, Pressure::Normal));
@@ -687,13 +687,13 @@ fn chain_refuses_and_fails_like_splash() {
     let enqueued = |tier: &TestTier| tier.tier.manager.stats().enqueued;
 
     // The tier's limit holds one block object and no state.
-    let Some((mut inner, _)) = fixture(0x5713_3201, "s13-fits") else {
+    let Some((mut inner, _)) = fixture(0x5713_3201, "state-tier-fits") else {
         return;
     };
     let block_bytes = mlx_paged_attn::block_object_bytes(
         inner.paged_adapter.as_ref().expect("pool").layer_kv_pool(),
     );
-    let small = test_tier("s13-fits-small", block_bytes);
+    let small = test_tier("state-tier-fits-small", block_bytes);
     let lane = window(&inner);
     attach_tier(
         &mut inner.dflash2_states,
@@ -723,7 +723,7 @@ fn chain_refuses_and_fails_like_splash() {
     assert!(ram(&inner, p) && disk_copy(&inner, p).is_none());
 
     // A chain block's write fails.
-    let Some((mut inner, tier)) = fixture(0x5713_3202, "s13-block-fails") else {
+    let Some((mut inner, tier)) = fixture(0x5713_3202, "state-tier-block-fails") else {
         return;
     };
     let o = park(&mut inner, 72, StateClass::Ordinary);
@@ -743,7 +743,7 @@ fn chain_refuses_and_fails_like_splash() {
     assert_eq!(enqueued(&tier), written, "nothing is written again");
 
     // The state's object leaves the tier under its chain.
-    let Some((mut inner, tier)) = fixture(0x5713_3203, "s13-state-gone") else {
+    let Some((mut inner, tier)) = fixture(0x5713_3203, "state-tier-state-gone") else {
         return;
     };
     let o = park(&mut inner, 73, StateClass::Ordinary);
@@ -766,13 +766,13 @@ fn chain_refuses_and_fails_like_splash() {
 /// Mutation MU1 (the listing writes every RAM-only state) → red.
 #[test]
 fn a_state_the_tier_cannot_hold_frees_its_chain_now() {
-    let Some((mut inner, _)) = fixture(0x5713_3204, "s13-unfit") else {
+    let Some((mut inner, _)) = fixture(0x5713_3204, "state-tier-unfit") else {
         return;
     };
     let block_bytes = mlx_paged_attn::block_object_bytes(
         inner.paged_adapter.as_ref().expect("pool").layer_kv_pool(),
     );
-    let small = test_tier("s13-unfit-small", block_bytes);
+    let small = test_tier("state-tier-unfit-small", block_bytes);
     let lane = window(&inner);
     attach_tier(
         &mut inner.dflash2_states,
@@ -823,7 +823,7 @@ fn status_reports_the_disk_tier() {
     use crate::engine::governor::host::Pressure;
     use crate::engine::governor::status::{MemoryGovernorStatus, status};
     use crate::models::qwen3_5::dflash2_turn::state_status;
-    let Some((mut inner, tier)) = fixture(0x5713_2601, "s13-status") else {
+    let Some((mut inner, tier)) = fixture(0x5713_2601, "state-tier-status") else {
         return;
     };
     let query = waits_for_writes();
@@ -847,7 +847,8 @@ fn status_reports_the_disk_tier() {
 /// Mutation CY1 (the cursor stays on the copy ahead) → red.
 #[test]
 fn a_reclaim_chain_goes_before_a_copy_ahead() {
-    let Some((mut inner, tier)) = fixture_on(0x5713_1702, 16, 16, test_tier("s13-yield", 1 << 30))
+    let Some((mut inner, tier)) =
+        fixture_on(0x5713_1702, 16, 16, test_tier("state-tier-yield", 1 << 30))
     else {
         return;
     };
@@ -903,7 +904,7 @@ fn adoption_fits_a_lower_limit() {
         0x5713_2401,
         16,
         16,
-        persistent_test_tier("s13-adopt-fit", 1 << 30),
+        persistent_test_tier("state-tier-adopt-fit", 1 << 30),
     ) else {
         return;
     };
@@ -921,7 +922,7 @@ fn adoption_fits_a_lower_limit() {
     }
     let total = tier.tier.manager.total_bytes();
     drop(inner);
-    let tier = tier.reopen("s13-adopt-fit", total - 1);
+    let tier = tier.reopen("state-tier-adopt-fit", total - 1);
     let Some((mut inner, tier)) = fixture_on(0x5713_2401, 16, 16, tier) else {
         return;
     };
@@ -938,7 +939,8 @@ fn a_failed_write_stops_the_tier() {
     use crate::models::qwen3_5::dflash2_state::write_behind::{
         DELAY_SECONDS, MINIMUM_TOKENS, published, run,
     };
-    let Some((mut inner, tier)) = fixture_on(0x5713_1503, 16, 16, test_tier("s13-stop", 1 << 30))
+    let Some((mut inner, tier)) =
+        fixture_on(0x5713_1503, 16, 16, test_tier("state-tier-stop", 1 << 30))
     else {
         return;
     };
@@ -968,7 +970,7 @@ fn a_full_volume_refuses_before_writing() {
     use crate::models::qwen3_5::dflash2_state::write_behind::{
         DELAY_SECONDS, MINIMUM_TOKENS, published, run,
     };
-    let tier = test_tier_with("s13-full", 1 << 30, 8, u64::MAX / 2);
+    let tier = test_tier_with("state-tier-full", 1 << 30, 8, u64::MAX / 2);
     let Some((mut inner, tier)) = fixture_on(0x5713_1504, 16, 16, tier) else {
         return;
     };
@@ -1004,9 +1006,12 @@ fn settle(inner: &mut Qwen35Inner, tier: &TestTier, id: EntryId) {
 /// Mutation EV1 (`poll_offload` skips the tier's evictions) → red.
 #[test]
 fn a_quota_eviction_takes_the_disk_only_state() {
-    let Some((mut probe, probe_tier)) =
-        fixture_on(0x5713_4101, 16, 16, test_tier("s13-evict-probe", 1 << 30))
-    else {
+    let Some((mut probe, probe_tier)) = fixture_on(
+        0x5713_4101,
+        16,
+        16,
+        test_tier("state-tier-evict-probe", 1 << 30),
+    ) else {
         return;
     };
     let id = park(&mut probe, 70, StateClass::Checkpoint);
@@ -1017,7 +1022,8 @@ fn a_quota_eviction_takes_the_disk_only_state() {
     drop(probe_tier);
 
     let limit = 2 * point + point / 2;
-    let Some((mut inner, tier)) = fixture_on(0x5713_4101, 16, 16, test_tier("s13-evict", limit))
+    let Some((mut inner, tier)) =
+        fixture_on(0x5713_4101, 16, 16, test_tier("state-tier-evict", limit))
     else {
         return;
     };
@@ -1078,7 +1084,7 @@ fn a_full_tick_measures_the_cache_root() {
         0x5713_4201,
         16,
         16,
-        persistent_test_tier("s13-measure-probe", 1 << 30),
+        persistent_test_tier("state-tier-measure-probe", 1 << 30),
     ) else {
         return;
     };
@@ -1090,7 +1096,7 @@ fn a_full_tick_measures_the_cache_root() {
     drop(probe_tier);
 
     let root = std::env::temp_dir().join(format!(
-        "mlx-s13-measure-{}-{}",
+        "mlx-state-tier-measure-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1104,7 +1110,7 @@ fn a_full_tick_measures_the_cache_root() {
         .expect("the sibling's object");
     let limit = point + point / 2;
     let tier = TestTier {
-        tier: tier_at(&root, "s13-measure", limit, true),
+        tier: tier_at(&root, "state-tier-measure", limit, true),
         root,
     };
     assert!(sibling.exists(), "the root fits its limit at open");
@@ -1131,7 +1137,7 @@ fn a_draft_changed_during_load_keeps_the_tier_temporary() {
     );
     install_pool(&mut inner, 8, 8, passing_probe()).expect("pool");
     let root = std::env::temp_dir().join(format!(
-        "mlx-s13-draft-guard-{}-{}",
+        "mlx-state-tier-draft-guard-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
