@@ -390,6 +390,10 @@ impl Qwen35Inner {
     /// a processor.
     fn multimodal_turn_entry(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         let (tokenizer, p, report_perf) = self.vision_turn_params(args)?;
+        // The image prompt's replay point sits before the generation prompt
+        // (Splash `promptReplayBoundary`).
+        self.dflash2_states.generation_suffix =
+            args.tokenizer.generation_suffix(args.config).ok().flatten();
         let tokens = args.tokens.to_vec();
         match (args.sink, args.cancelled) {
             (Some(sink), Some(cancelled)) => {

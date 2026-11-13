@@ -43,7 +43,6 @@ pub(super) fn tiny_moe_cfg() -> Qwen3_5MoeConfig {
         mlp_only_layers: None,
         paged_cache_memory_mb: Some(64),
         paged_block_size: Some(16),
-        persist_paged_cache: None,
         n_mtp_layers: 0,
         qwen35_gguf_gdn_layout: None,
         kv_format: None,
@@ -556,13 +555,7 @@ fn test_moe_gdn_root_rotation_retains_new_root() {
     // lands here: `cacheRootOwnerId` is set in exactly one place
     // (`packages/agent/src/provider/chat-config.ts`), so a plain
     // `@mlx-node/lm` ChatSession publishes under the implicit owner `""`.
-    // This model has no paged adapter and so no cold GDN policy, which
-    // makes the pre-ladder cap the right one — see the dense twin.
     let mut legacy = Qwen35MoeInner::new(tiny_moe_cfg()).expect("construct legacy MoE");
-    assert!(
-        !legacy.wants_gdn_checkpoint_ladder(),
-        "a model with no paged adapter cannot have a cold GDN sidecar policy"
-    );
     for marker in 1..=(GDN_PREFIX_CHECKPOINTS_PER_OWNER as u32 + 1) {
         crate::engine::backend::ChatBackend::set_cache_owner_id(&mut legacy, "", None);
         let tokens: Vec<u32> = (0..16).map(|offset| marker * 100 + offset).collect();
@@ -583,79 +576,16 @@ fn test_moe_gdn_root_rotation_retains_new_root() {
     assert!(!legacy.gdn_root_cache_owner_is_explicit);
     assert_eq!(
         legacy.gdn_prefix_checkpoints.len(),
-        GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER
+        GDN_PREFIX_CHECKPOINTS_PER_OWNER
     );
 }
 
 /// MoE twin of
-/// `qwen3_5::model::paged_construction_tests::dense_gdn_retention_follows_the_installed_cold_sidecar_policy`.
-/// The retention cap is chosen at the call site, and the twins have two of
-/// them.
-///
-/// Catches: hardcoding either arm in `prune_moe_gdn_prefix_checkpoints`.
-#[test]
-fn moe_gdn_retention_follows_the_installed_cold_sidecar_policy() {
-    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "moe_gdn_retention_follows_the_installed_cold_sidecar_policy",
-    ) else {
-        return;
-    };
-    let tokens: Vec<u32> = (0..64u32).collect();
-    let extra_keys = vec![Vec::new(); 4];
-
-    let push_ladder = |inner: &mut Qwen35MoeInner| {
-        inner.gdn_prefix_checkpoints.clear();
-        crate::engine::backend::ChatBackend::set_cache_owner_id(inner, "", None);
-        for rung in 1..=4u32 {
-            let prefix_len = rung * 16;
-            let block_hashes =
-                compute_paged_prefix_block_hashes(&tokens, prefix_len, 16, &extra_keys, 0)
-                    .expect("block-aligned rung must hash");
-            inner
-                .gdn_prefix_checkpoints
-                .push_back(MoeGdnPrefixCheckpoint {
-                    owner_id: inner.active_cache_owner_id.clone(),
-                    prefix_len,
-                    block_size: 16,
-                    final_block_hash: block_hashes.last().copied().unwrap_or_default(),
-                    block_hashes,
-                    tokens: tokens[..prefix_len as usize].to_vec(),
-                    caches: Vec::new(),
-                    last_used: 0,
-                });
-            inner.prune_moe_gdn_prefix_checkpoints();
-        }
-        inner.gdn_prefix_checkpoints.len()
-    };
-
-    assert!(!inner.wants_gdn_checkpoint_ladder());
-    assert_eq!(
-        push_ladder(&mut inner),
-        GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER,
-        "with no cold GDN policy the store must stay at the pre-ladder cap"
-    );
-
-    let root = moe_temp_cold_root("moe-gdn-retention-policy");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    assert!(inner.wants_gdn_checkpoint_ladder());
-    assert_eq!(
-        push_ladder(&mut inner),
-        GDN_PREFIX_CHECKPOINTS_PER_OWNER,
-        "a cold GDN sidecar policy must keep the whole published ladder"
-    );
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// MoE twin of
-/// `qwen3_5::model::paged_construction_tests::test_dense_ladder_survives_sibling_owners_through_the_model_call_site`.
+/// `qwen3_5::model::paged_construction_tests::test_dense_gdn_retention_keeps_sibling_owners_through_the_model_call_site`.
 /// The two share `prune_gdn_checkpoints` but not the call site that tells
 /// it which owner is publishing, which is exactly where they can drift.
-///
-/// Like the dense twin, both arms are driven: publisher deferral exists
-/// only under `GdnRetentionPolicy::Ladder`, so the cold tier has to be
-/// installed for the mutation to be expressible at all.
 #[test]
-fn test_moe_ladder_survives_sibling_owners_through_the_model_call_site() {
+fn test_moe_gdn_retention_keeps_sibling_owners_through_the_model_call_site() {
     fn push(inner: &mut Qwen35MoeInner, owner_id: &str, root_owner_id: &str, blocks: u32) {
         crate::engine::backend::ChatBackend::set_cache_owner_id(
             inner,
@@ -695,12 +625,11 @@ fn test_moe_ladder_survives_sibling_owners_through_the_model_call_site() {
     }
 
     let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "test_moe_ladder_survives_sibling_owners_through_the_model_call_site",
+        "test_moe_gdn_retention_keeps_sibling_owners_through_the_model_call_site",
     ) else {
         return;
     };
 
-    assert!(!inner.wants_gdn_checkpoint_ladder());
     assert_eq!(
         run_fleet(&mut inner),
         vec![
@@ -710,27 +639,8 @@ fn test_moe_ladder_survives_sibling_owners_through_the_model_call_site() {
             ("child-3".to_string(), 256),
             ("child-3".to_string(), 1024),
         ],
-        "a persistence-OFF turn takes the pre-ladder victim order, which \
-         keeps the publisher's DEEPEST rungs and defers nobody"
+        "the retention keeps the publisher's DEEPEST rungs and defers nobody"
     );
-
-    let root = moe_temp_cold_root("moe-ladder-sibling-call-site");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    assert!(inner.wants_gdn_checkpoint_ladder());
-    assert_eq!(
-        run_fleet(&mut inner),
-        vec![
-            ("root".to_string(), 1024),
-            ("child-0".to_string(), 1024),
-            ("child-1".to_string(), 1024),
-            ("child-3".to_string(), 16),
-            ("child-3".to_string(), 1024),
-        ],
-        "the publishing subagent must keep the shallow rung this turn's \
-         capture anchors on, paid for by the root's spare rung, and no \
-         sibling may be pushed to zero"
-    );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
@@ -1042,38 +952,6 @@ fn moe_inner_with_test_adapter_or_skip(test_name: &str) -> Option<Qwen35MoeInner
     Some(inner)
 }
 
-/// Attach the cold tier shape `build_cold_tier_context` installs for MoE.
-fn install_moe_gdn_cold_tier(inner: &mut Qwen35MoeInner, root: &std::path::Path) {
-    let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.to_path_buf())
-        .expect("temp-dir cold cache must open");
-    let activation = crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&*inner)
-        .expect("activation dtype");
-    let policy =
-        crate::models::qwen3_5::gdn_sidecar::policy(&inner.config.to_dense_config(), activation)
-            .expect("a hybrid config must yield a GDN sidecar policy");
-    let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-    adapter.set_cold_tier(
-        crate::transformer::paged_kv_cache_adapter::ColdTierContext {
-            manager: Arc::new(manager),
-            fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
-                b"qwen3-5-moe-sidecar-test".as_slice(),
-            ]),
-            sidecar_policy: Some(policy),
-        },
-    );
-}
-
-fn moe_temp_cold_root(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "mlx-{name}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ))
-}
-
 fn record_whole_moe_paged_request(inner: &mut Qwen35MoeInner, prompt: &[u32]) {
     let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
     adapter.reset_for_new_request(0).expect("reset request");
@@ -1179,397 +1057,6 @@ fn moe_paged_rollback_without_a_cycle_refuses_instead_of_retracting() {
         prompt.len(),
         "the refusal must leave the adapter untouched — no hand retraction"
     );
-}
-
-/// MoE mirror of the dense case: the hand-written cores finalize through
-/// `finalize_moe_manual_paged_turn`, which must run the GDN sidecar capture.
-///
-/// Catches: deleting `capture_moe_gdn_cold_sidecar` from the `Ok` arm of
-/// `finalize_moe_manual_paged_turn` — both deltas drop to zero.
-#[test]
-fn moe_manual_paged_finalize_reaches_the_gdn_sidecar_capture() {
-    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "moe_manual_paged_finalize_reaches_the_gdn_sidecar_capture",
-    ) else {
-        return;
-    };
-    let root = moe_temp_cold_root("moe-manual-finalize-capture");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    let prompt: Vec<u32> = (0u32..32).collect();
-    record_whole_moe_paged_request(&mut inner, &prompt);
-
-    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
-    let before = crate::cold_tier::cold_sidecar_telemetry();
-    inner
-        .finalize_moe_manual_paged_turn(&[], 0)
-        .expect("manual paged finalization must succeed");
-    let after = crate::cold_tier::cold_sidecar_telemetry();
-
-    assert_eq!(
-        after.capture_reached,
-        before.capture_reached + 1,
-        "the manual finalize must enter the GDN sidecar capture exactly once"
-    );
-    // The chain really carried both blocks off the GPU. Asserted here
-    // because everything below depends on it and nothing below can see it:
-    // a pool whose buffers are too small makes `read_block_all_layers`
-    // return `Err`, the chain capture stops at its first block, and the
-    // boundary assertion after this one becomes unreachable rather than
-    // false. Without this line that failure reads as "the capture did not
-    // reach its boundary selection", three layers from the real cause.
-    assert_eq!(
-        inner
-            .paged_adapter
-            .as_ref()
-            .expect("paged_adapter")
-            .cold_captured_blocks(),
-        2,
-        "both whole blocks must have been captured off the pool"
-    );
-    // The finalize published two whole blocks to the cold chain, so the
-    // capture ran to its boundary selection and found no in-memory
-    // checkpoint. Reaching THAT arm proves it got past the policy and media
-    // guards rather than bailing at its first line.
-    assert_eq!(
-        after.boundary_skips,
-        before.boundary_skips + 1,
-        "the capture must reach its boundary selection under a GdnState policy"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// MoE mirror of the dense case: a host short of spare memory refuses a
-/// ladder rung its RAM claim (`HostRule::admits`), so the rung goes to the
-/// cold tier through the turn's sidecar capture instead (Splash
-/// `publishStateToDisk`) and never into RAM. With the capture walk reaching
-/// the whole prompt only the deepest refused rung is held until the capture:
-/// rungs 16 and 32, then 16 again, leave 32.
-///
-/// Mutation F4: drop the refused rung → no rung is held and the capture
-/// finds no checkpoint → red.
-#[test]
-fn moe_rung_refused_ram_still_reaches_the_cold_tier() {
-    let Some(mut inner) =
-        moe_inner_with_test_adapter_or_skip("moe_rung_refused_ram_still_reaches_the_cold_tier")
-    else {
-        return;
-    };
-    let root = moe_temp_cold_root("moe-refused-rung-to-disk");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    moe_refuse_optional_claims(&mut inner);
-    let prompt: Vec<u32> = (0u32..32).collect();
-    record_whole_moe_paged_request(&mut inner, &prompt);
-
-    let extra_keys = engine::build_paged_extra_keys(prompt.len(), 16, &[]);
-    let rungs = vec![moe_zero_gdn_rung(&inner, 16), moe_zero_gdn_rung(&inner, 32)];
-    inner.publish_moe_gdn_materialized_prefix_checkpoint(&prompt, &extra_keys, 0, rungs);
-    let rungs = vec![moe_zero_gdn_rung(&inner, 16)];
-    inner.publish_moe_gdn_materialized_prefix_checkpoint(&prompt, &extra_keys, 0, rungs);
-    assert!(
-        inner.gdn_prefix_checkpoints.is_empty(),
-        "the host refused the rungs their RAM"
-    );
-    assert_eq!(
-        moe_held_rungs(&inner),
-        vec![(None, 32)],
-        "only the deepest refused rung is held"
-    );
-
-    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
-    let before = crate::cold_tier::cold_sidecar_telemetry();
-    inner
-        .finalize_moe_manual_paged_turn(&[], 0)
-        .expect("manual paged finalization must succeed");
-    let after = crate::cold_tier::cold_sidecar_telemetry();
-    assert_eq!(
-        after.boundary_skips, before.boundary_skips,
-        "the refused rung must anchor the sidecar"
-    );
-    assert_eq!(
-        after.enqueued,
-        before.enqueued + 1,
-        "the refused rung must reach the cold tier"
-    );
-    assert!(
-        inner.gdn_unclaimed_rungs.is_empty(),
-        "the turn's end drops the refused rung"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// MoE mirror: with a one-block capture budget the refused rungs 16, 32 and
-/// 48 leave 48 (the deepest) and 16 (the deepest the walk reaches), and the
-/// capture anchors at 16.
-///
-/// Mutation: hold only the deepest refused rung → the held set is
-/// `[(None, 48)]` and the capture finds no checkpoint within the one-block
-/// chain → red.
-#[test]
-fn moe_refused_rung_within_the_capture_reach_reaches_the_cold_tier() {
-    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "moe_refused_rung_within_the_capture_reach_reaches_the_cold_tier",
-    ) else {
-        return;
-    };
-    let root = moe_temp_cold_root("moe-refused-rung-within-reach");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    moe_refuse_optional_claims(&mut inner);
-    inner
-        .paged_adapter
-        .as_mut()
-        .expect("paged_adapter")
-        .set_cold_capture_budget(crate::transformer::cold_tier::ColdCaptureBudget {
-            max_blocks: 1,
-            max_walk: std::time::Duration::from_secs(60),
-        });
-    let prompt: Vec<u32> = (0u32..48).collect();
-    record_whole_moe_paged_request(&mut inner, &prompt);
-
-    let extra_keys = engine::build_paged_extra_keys(prompt.len(), 16, &[]);
-    let rungs = vec![
-        moe_zero_gdn_rung(&inner, 16),
-        moe_zero_gdn_rung(&inner, 32),
-        moe_zero_gdn_rung(&inner, 48),
-    ];
-    inner.publish_moe_gdn_materialized_prefix_checkpoint(&prompt, &extra_keys, 0, rungs);
-    assert_eq!(
-        moe_held_rungs(&inner),
-        vec![(None, 16), (None, 48)],
-        "the deepest refused rung and the deepest within the capture reach are held"
-    );
-
-    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
-    let before = crate::cold_tier::cold_sidecar_telemetry();
-    inner
-        .finalize_moe_manual_paged_turn(&[], 0)
-        .expect("manual paged finalization must succeed");
-    let after = crate::cold_tier::cold_sidecar_telemetry();
-    assert_eq!(
-        after.boundary_skips, before.boundary_skips,
-        "the rung within the capture reach must anchor the sidecar"
-    );
-    assert_eq!(
-        after.enqueued,
-        before.enqueued + 1,
-        "the rung within the capture reach must reach the cold tier"
-    );
-    assert!(
-        inner.gdn_unclaimed_rungs.is_empty(),
-        "the turn's end drops the refused rungs"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// MoE mirror: under the continuous-batching scheduler two sequences
-/// overlap; each prefill slice and each turn end activates its own sequence,
-/// while the cache owner is set only at admission. Each sequence holds its
-/// own deepest refused rung, its turn end captures that one, and a peer's
-/// stays held.
-///
-/// Mutation H1 (one slot for the model, the turn end empties it): B's
-/// deeper rung replaces A's, the held set is `[(None, 48)]` → red.
-#[test]
-fn moe_overlapped_sequences_each_send_their_refused_rung_to_the_cold_tier() {
-    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "moe_overlapped_sequences_each_send_their_refused_rung_to_the_cold_tier",
-    ) else {
-        return;
-    };
-    let root = moe_temp_cold_root("moe-refused-rung-per-sequence");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    moe_refuse_optional_claims(&mut inner);
-    let prompt_a: Vec<u32> = (0u32..32).collect();
-    let prompt_b: Vec<u32> = (100u32..148).collect();
-    for (seq_id, owner, prompt) in [(1, "owner-a", &prompt_a), (2, "owner-b", &prompt_b)] {
-        crate::engine::backend::ChatBackend::set_cache_owner_id(&mut inner, owner, None);
-        inner.activate_paged_seq(seq_id).expect("admit sequence");
-        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-        adapter
-            .allocate_suffix_blocks(prompt.len() as u32)
-            .expect("allocate suffix blocks");
-        adapter.record_tokens(prompt).expect("record tokens");
-    }
-    let keys_a = engine::build_paged_extra_keys(prompt_a.len(), 16, &[]);
-    let keys_b = engine::build_paged_extra_keys(prompt_b.len(), 16, &[]);
-    inner.activate_paged_seq(1).expect("A's prefill slice");
-    let rungs = vec![moe_zero_gdn_rung(&inner, 32)];
-    inner.publish_moe_gdn_materialized_prefix_checkpoint(&prompt_a, &keys_a, 0, rungs);
-    inner.activate_paged_seq(2).expect("B's prefill slice");
-    let rungs = vec![moe_zero_gdn_rung(&inner, 48)];
-    inner.publish_moe_gdn_materialized_prefix_checkpoint(&prompt_b, &keys_b, 0, rungs);
-    assert_eq!(
-        moe_held_rungs(&inner),
-        vec![(Some(1), 32), (Some(2), 48)],
-        "each sequence holds its own refused rung"
-    );
-
-    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
-    let before = crate::cold_tier::cold_sidecar_telemetry();
-    inner.activate_paged_seq(1).expect("A's turn end");
-    inner
-        .finalize_moe_manual_paged_turn(&[], 0)
-        .expect("A's finalization must succeed");
-    let after_a = crate::cold_tier::cold_sidecar_telemetry();
-    assert_eq!(
-        after_a.enqueued,
-        before.enqueued + 1,
-        "A's refused rung must reach the cold tier"
-    );
-    assert_eq!(
-        moe_held_rungs(&inner),
-        vec![(Some(2), 48)],
-        "A's turn end leaves B's rung held"
-    );
-
-    inner.activate_paged_seq(2).expect("B's turn end");
-    inner
-        .finalize_moe_manual_paged_turn(&[], 0)
-        .expect("B's finalization must succeed");
-    let after_b = crate::cold_tier::cold_sidecar_telemetry();
-    assert_eq!(
-        after_b.enqueued,
-        after_a.enqueued + 1,
-        "B's refused rung must reach the cold tier"
-    );
-    assert_eq!(
-        after_b.boundary_skips, before.boundary_skips,
-        "both captures anchor on their own rung"
-    );
-    assert!(
-        inner.gdn_unclaimed_rungs.is_empty(),
-        "every turn end drops its own rung"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// A host that keeps its spare-memory margin from every Optional claim
-/// (`HostRule::admits`), so each ladder rung is refused its RAM.
-fn moe_refuse_optional_claims(inner: &mut Qwen35MoeInner) {
-    use crate::engine::governor::governor::Governor;
-    use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
-    use crate::engine::governor::host::Pressure;
-    let io = FakeIo::new(stats(0), host(0, Pressure::Normal));
-    let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
-    inner.memory_registration = Some(governor.register_model(model(16 * G, 0)).expect("register"));
-}
-
-fn moe_held_rungs(inner: &Qwen35MoeInner) -> Vec<(Option<SeqId>, u32)> {
-    let mut held: Vec<_> = inner
-        .gdn_unclaimed_rungs
-        .iter()
-        .flat_map(|(seq_id, rungs)| rungs.iter().map(|rung| (*seq_id, rung.prefix_len)))
-        .collect();
-    held.sort_unstable();
-    held
-}
-
-fn moe_zero_gdn_rung(
-    inner: &Qwen35MoeInner,
-    prefix_len: u32,
-) -> crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint {
-    let activation = crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(inner)
-        .expect("activation dtype");
-    let config = inner.config.to_dense_config();
-    let mut caches = Qwen3_5LayerCache::fresh_layer_caches(&config);
-    for cache in &mut caches {
-        if let Qwen3_5LayerCache::Linear(arrays) = cache {
-            let conv = MxArray::zeros(
-                &[
-                    1,
-                    i64::from(config.linear_conv_kernel_dim - 1),
-                    i64::from(config.linear_conv_dim()),
-                ],
-                Some(activation),
-            )
-            .expect("conv state");
-            let recurrent = MxArray::zeros(
-                &[
-                    1,
-                    i64::from(config.linear_num_value_heads),
-                    i64::from(config.linear_value_head_dim),
-                    i64::from(config.linear_key_head_dim),
-                ],
-                Some(DType::Float32),
-            )
-            .expect("recurrent state");
-            arrays.set(0, conv).expect("set conv");
-            arrays.set(1, recurrent).expect("set recurrent");
-        }
-    }
-    crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint { prefix_len, caches }
-}
-
-/// The v1 text-only guard must read the turn's OWN media map, not
-/// `self.cached_paged_image_token_positions` (cleared mid-turn by the VLM
-/// cores).
-///
-/// Catches: reverting the guard to the `self` field — empty here, so the
-/// capture would run on past it and bump `boundary_skips`.
-#[test]
-fn moe_gdn_sidecar_capture_refuses_the_turns_own_media_map() {
-    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "moe_gdn_sidecar_capture_refuses_the_turns_own_media_map",
-    ) else {
-        return;
-    };
-    let root = moe_temp_cold_root("moe-manual-finalize-media");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    let prompt: Vec<u32> = (0u32..32).collect();
-    record_whole_moe_paged_request(&mut inner, &prompt);
-    assert!(
-        inner.cached_paged_image_token_positions.is_empty(),
-        "the model-level media map is empty mid-turn; only the argument carries the truth"
-    );
-
-    let _serialized = crate::cold_tier::sidecar_counter_test_lock();
-    let before = crate::cold_tier::cold_sidecar_telemetry();
-    inner
-        .finalize_moe_manual_paged_turn(&[(4, 99)], 0)
-        .expect("manual paged finalization must succeed");
-    let after = crate::cold_tier::cold_sidecar_telemetry();
-
-    assert_eq!(
-        after.capture_reached,
-        before.capture_reached + 1,
-        "a media turn still enters the capture"
-    );
-    assert_eq!(
-        after.boundary_skips, before.boundary_skips,
-        "a media turn must be refused before the capture inspects the cold chain"
-    );
-    assert_eq!(
-        after.chain_empty, before.chain_empty,
-        "a media turn must be refused before the capture inspects the cold chain"
-    );
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// MoE mirror of the dense chunk-size gate.
-///
-/// Catches: a `0` (single-shot) arm without a policy, or an `i32::MAX` arm
-/// under a policy, in `cold_gdn_prefill_chunk_size`.
-#[test]
-fn moe_cold_gdn_prefill_chunk_size_is_the_step_with_or_without_a_sidecar_policy() {
-    if crate::array::paged_prefill_chunk_size() != 0 {
-        return;
-    }
-    let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
-        "moe_cold_gdn_prefill_chunk_size_is_the_step_with_or_without_a_sidecar_policy",
-    ) else {
-        return;
-    };
-    assert_eq!(inner.cold_gdn_prefill_chunk_size(), 2048);
-
-    let root = moe_temp_cold_root("moe-chunk-size-policy");
-    install_moe_gdn_cold_tier(&mut inner, &root);
-    assert_eq!(inner.cold_gdn_prefill_chunk_size(), 2048);
-
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Tiny MoE config shaped for a REAL paged prefill, unlike [`tiny_moe_cfg`].
@@ -2644,8 +2131,6 @@ fn moe_a_released_serial_turn_ends_the_replay_points_use() {
         // saves no history here.
         let saved: &[u32] = if reuse { &[] } else { &prompt };
         {
-            // The finalize bumps the global sidecar capture counter.
-            let _serialized = crate::cold_tier::sidecar_counter_test_lock();
             PagedBackend::finalize_paged_turn(&mut inner, false, 0);
             PagedBackend::save_paged_history(&mut inner, saved, &[], false, reuse)
                 .expect("the save");
@@ -2861,4 +2346,753 @@ fn moe_metal_load_has_no_flat_lane() {
         "{}",
         refused.reason
     );
+}
+
+/// The tiny MoE model with no draft on a production-shaped pool, its states
+/// on `tier`: the GDN cell alone. A 32-row state window and 16-row chunks
+/// on this thread plan a checkpoint at 64 and the replay point at 128 for a
+/// 140-token prompt.
+fn plain_moe_on(
+    tier: &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
+    test: &str,
+) -> Option<Qwen35MoeInner> {
+    if crate::test_support::paged_prefill_unsupported(test) {
+        return None;
+    }
+    let mut inner = moe_paged_inner_or_skip(test)?;
+    cast_moe_inner_weights_bf16(&mut inner);
+    assert!(inner.dflash2.is_none());
+    let dense = inner.config.to_dense_config();
+    crate::models::qwen3_5::dflash2_state::disk::tests::attach_tier(
+        &mut inner.dflash2_states,
+        &dense,
+        inner.paged_adapter.as_ref().expect("pool"),
+        tier,
+        0,
+        0,
+    );
+    inner.paged_adapter.as_mut().expect("pool").set_cold_tier(
+        crate::models::qwen3_5::dflash2_state::disk::state_context(&tier.tier),
+    );
+    Some(inner)
+}
+
+fn moe_small_plan(on: bool) {
+    crate::models::qwen3_5::dflash2_state::plan::STATE_WINDOW_OVERRIDE
+        .with(|window| window.set(on.then_some(32)));
+    crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE
+        .with(|rows| rows.set(on.then_some(16)));
+}
+
+/// The encoded GDN cell of the RAM copy of the state `depth` deep.
+fn moe_cell_at(inner: &Qwen35MoeInner, depth: usize) -> Vec<u8> {
+    let anchor = inner
+        .dflash2_states
+        .store
+        .entries()
+        .find(|entry| entry.depth() == depth)
+        .and_then(|entry| entry.ram())
+        .unwrap_or_else(|| panic!("a RAM state at {depth}"));
+    crate::models::qwen3_5::dflash2_state::disk::encode_anchor(
+        &inner.dflash2_states,
+        &inner.config.to_dense_config(),
+        anchor,
+    )
+    .expect("an encoded cell")
+}
+
+/// Splash `openDiskTier` for a MoE load without a draft: a pool load whose
+/// plan set a state's staging aside opens the tier with one span, the GDN
+/// cell.
+/// Mutation AT1m (the MoE tier opens only with a draft) → red.
+#[test]
+fn moe_plain_paged_load_opens_the_state_tier() {
+    let Some(mut inner) = moe_paged_inner_or_skip("moe_plain_paged_load_opens_the_state_tier")
+    else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!(
+        "mlx-state-tier-moe-plain-tier-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let target = root.join("target");
+    std::fs::create_dir_all(&target).expect("target dir");
+    std::fs::create_dir_all(root.join("tmp")).expect("temp root");
+    std::fs::write(target.join("model.safetensors"), b"target").expect("target shard");
+    inner.disk_options = crate::disk_tier::DiskTierOptions {
+        cache_disk: crate::disk_tier::CacheDisk::Bytes(1 << 30),
+        persistent: false,
+        cache_dir: Some(root.join("cache")),
+        temp_root: Some(root.join("tmp")),
+    };
+    let dense = inner.config.to_dense_config();
+    let activation =
+        crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&inner).unwrap();
+    let cell = crate::models::qwen3_5::gdn_sidecar::geometry(&dense, activation)
+        .and_then(|geometry| geometry.cell_bytes())
+        .expect("a GDN cell");
+    install_plan(&mut inner, Some(512), false);
+    if let Some(plan) = inner.memory_plan.as_mut() {
+        plan.footprint.state_staging_bytes = dense.recurrent_state_bytes();
+    }
+    let weights = crate::array::memory::WeightsResident::for_test(1, 4096);
+    let files = crate::cold_tier::CheckpointFiles::Dir(&target);
+    let mut guard = crate::cold_tier::CheckpointLoadGuard::before_read(files, true);
+    guard.record_read();
+    inner.build_disk_tier_context(files, None, &weights, &guard);
+    let disk = inner
+        .dflash2_states
+        .disk
+        .as_ref()
+        .expect("a plain MoE paged load opens the state tier");
+    assert_eq!(disk.spans, vec![cell]);
+    assert!(disk.geometry.ends_with("draft none\ncontext none\n"));
+    disk.tier.close(std::time::Instant::now());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Splash `publishReachedStateBoundaries`, `WriteBehind`, `Cache::adopt`
+/// and `promotedCopy` on a MoE load without a draft: its plain turn
+/// publishes the checkpoint and the replay point, the replay point waits
+/// behind and a clean close writes it, and after a restart the next load's
+/// prime resumes at it from disk with the stored cell, the read turned
+/// resident.
+/// Mutation AP1m (the MoE prime opens no lane turn) → red.
+#[test]
+fn moe_plain_restart_restores_the_disk_state() -> Result<()> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::persistent_test_tier;
+    const TEST: &str = "moe_plain_restart_restores_the_disk_state";
+    let tier = persistent_test_tier("state-tier-moe-ar-restart", 1 << 30);
+    let Some(mut first) = plain_moe_on(&tier, TEST) else {
+        return Ok(());
+    };
+    moe_small_plan(true);
+    let result = (|| -> Result<()> {
+        let tokens: Vec<u32> = (0..140).map(|i| (i * 7 + 3) % 13 + 1).collect();
+        let stream = Stream::default(crate::stream::DeviceType::Gpu);
+        let prefix = first.prime_prefix_state(&tokens, true, 16, &[], 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len, 0);
+        first.paged_prefill(&tokens, &prefix, stream)?.eval();
+        first.finalize_paged_turn(true, 0);
+        let counters = first.dflash2_states.counters;
+        assert_eq!(
+            (
+                counters.checkpoint_publications,
+                counters.replay_state_publications
+            ),
+            (1, 1)
+        );
+        let waiting = |inner: &Qwen35MoeInner| {
+            inner
+                .dflash2_states
+                .disk
+                .as_ref()
+                .expect("tier")
+                .write_behind
+                .snapshot()
+        };
+        assert_eq!(waiting(&first).waiting, 1);
+        let stored = moe_cell_at(&first, 128);
+        assert!(crate::models::qwen3_5::dflash2_state::disk::close_cache(
+            &mut first,
+            std::time::Instant::now() + std::time::Duration::from_secs(30)
+        ));
+        assert_eq!(waiting(&first).durable, 1);
+        drop(first);
+
+        let tier = tier.reopen("state-tier-moe-ar-restart", 1 << 30);
+        let Some(mut second) = plain_moe_on(&tier, TEST) else {
+            return Ok(());
+        };
+        assert_eq!(
+            crate::models::qwen3_5::dflash2_state::disk::adopt_all(&mut second),
+            1
+        );
+        let prefix = second.prime_prefix_state(&tokens, true, 16, &[], 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len, 128);
+        let disk = second.dflash2_states.disk.as_ref().expect("tier");
+        assert_eq!(
+            disk.counters.promotions + disk.counters.promotions_skipped,
+            1
+        );
+        assert_eq!(moe_cell_at(&second, 128), stored);
+        Ok(())
+    })();
+    moe_small_plan(false);
+    result
+}
+
+/// The small plan on this thread until the guard drops.
+struct MoeSmallPlan;
+
+impl MoeSmallPlan {
+    fn new() -> Self {
+        moe_small_plan(true);
+        Self
+    }
+}
+
+impl Drop for MoeSmallPlan {
+    fn drop(&mut self) {
+        moe_small_plan(false);
+    }
+}
+
+/// One MoE text turn: prime, prefill of the rest, finalize. Returns the
+/// prefix it resumed from and its last logits.
+fn moe_turn(inner: &mut Qwen35MoeInner, tokens: &[u32]) -> Result<(usize, MxArray)> {
+    let prefix = inner.prime_prefix_state(tokens, true, 16, &[], 0)?;
+    let cached = prefix.effective_cached_prefix_len;
+    let logits = inner.paged_prefill(
+        &tokens[cached..],
+        &prefix,
+        Stream::default(crate::stream::DeviceType::Gpu),
+    )?;
+    logits.eval();
+    inner.finalize_paged_turn(true, 0);
+    Ok((cached, logits))
+}
+
+/// The tiny MoE load on `tier`, its weights drawn from one seed so every
+/// load of a test holds the same model.
+fn seeded_moe_on(
+    tier: &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
+    test: &str,
+) -> Option<Qwen35MoeInner> {
+    unsafe { mlx_sys::mlx_seed(0x5A13_0021) };
+    plain_moe_on(tier, test)
+}
+
+/// A first MoE process runs `turns`, then [`moe_reopen_after`]. Returns
+/// the reopened tier, the new load and the first process's last logits.
+fn moe_restart_after(
+    tag: &str,
+    test: &str,
+    turns: &[Vec<u32>],
+    damage: impl FnOnce(&Qwen35MoeInner, &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier),
+    adopted: u64,
+) -> Result<
+    Option<(
+        crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
+        Qwen35MoeInner,
+        MxArray,
+    )>,
+> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::persistent_test_tier;
+    let tier = persistent_test_tier(tag, 1 << 30);
+    let Some(mut first) = seeded_moe_on(&tier, test) else {
+        return Ok(None);
+    };
+    let mut last = None;
+    for tokens in turns {
+        last = Some(moe_turn(&mut first, tokens)?.1);
+    }
+    let logits = last.expect("a turn");
+    Ok(moe_reopen_after(first, tier, tag, test, damage, adopted)?
+        .map(|(tier, second)| (tier, second, logits)))
+}
+
+/// `first` closes the tier cleanly; the next MoE load on it, after
+/// `damage`, adopts what is left.
+fn moe_reopen_after(
+    mut first: Qwen35MoeInner,
+    tier: crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
+    tag: &str,
+    test: &str,
+    damage: impl FnOnce(&Qwen35MoeInner, &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier),
+    adopted: u64,
+) -> Result<
+    Option<(
+        crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
+        Qwen35MoeInner,
+    )>,
+> {
+    assert!(crate::models::qwen3_5::dflash2_state::disk::close_cache(
+        &mut first,
+        std::time::Instant::now() + std::time::Duration::from_secs(30)
+    ));
+    damage(&first, &tier);
+    drop(first);
+    let tier = tier.reopen(tag, 1 << 30);
+    let Some(mut second) = seeded_moe_on(&tier, test) else {
+        return Ok(None);
+    };
+    assert_eq!(
+        crate::models::qwen3_5::dflash2_state::disk::adopt_all(&mut second),
+        adopted
+    );
+    Ok(Some((tier, second)))
+}
+
+/// The MoE twin of the dense case: the only disk state's object is damaged
+/// after a clean close, so the prime reads it before it arms the chain,
+/// discards it and restores no KV; the turn prefills cold, bit-equal to the
+/// first process's cold turn.
+/// Mutation M1 (the prime arms a state it did not read) → red.
+#[test]
+fn moe_a_state_that_fails_its_read_restores_no_kv() -> Result<()> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::{corrupt_state_object, state_key_at};
+    const TEST: &str = "moe_a_state_that_fails_its_read_restores_no_kv";
+    let _plan = MoeSmallPlan::new();
+    let tokens: Vec<u32> = (0..140).map(|i| (i * 7 + 3) % 13 + 1).collect();
+    let Some((tier, mut second, cold)) = moe_restart_after(
+        "state-tier-moe-corrupt",
+        TEST,
+        std::slice::from_ref(&tokens),
+        |first, tier| corrupt_state_object(tier, state_key_at(&first.dflash2_states, 128)),
+        1,
+    )?
+    else {
+        return Ok(());
+    };
+    let hits = tier.tier.manager.stats().hits;
+    let (cached, logits) = moe_turn(&mut second, &tokens)?;
+    assert_eq!(cached, 0);
+    assert_eq!(
+        tier.tier.manager.stats().hits,
+        hits,
+        "no KV block came back"
+    );
+    assert!(crate::models::qwen3_5::model::arrays_bits_equal_for_test(
+        &logits, &cold
+    )?);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
+    Ok(())
+}
+
+/// A damaged MoE state above a sound one on the same lineage: the prime
+/// discards the deeper one at its read and resumes at the one below, its
+/// KV chain and its GDN cell at the same depth. The sound state reaches the
+/// disk in an earlier process.
+/// Mutation M1 (the prime arms a state it did not read) → red.
+#[test]
+fn moe_a_damaged_state_resumes_at_the_sound_state_below() -> Result<()> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::{corrupt_state_object, state_key_at};
+    const TEST: &str = "moe_a_damaged_state_resumes_at_the_sound_state_below";
+    const TAG: &str = "state-tier-moe-corrupt-deeper";
+    let _plan = MoeSmallPlan::new();
+    let tokens: Vec<u32> = (0..140).map(|i| (i * 7 + 3) % 13 + 1).collect();
+    let Some((tier, mut middle, _)) =
+        moe_restart_after(TAG, TEST, &[tokens[..100].to_vec()], |_, _| {}, 1)?
+    else {
+        return Ok(());
+    };
+    assert_eq!(moe_turn(&mut middle, &tokens)?.0, 96);
+    let Some((tier, mut second)) = moe_reopen_after(
+        middle,
+        tier,
+        TAG,
+        TEST,
+        |first, tier| {
+            let mut on_disk: Vec<usize> = first
+                .dflash2_states
+                .store
+                .entries()
+                .filter(|entry| entry.disk().is_some())
+                .map(|entry| entry.depth())
+                .collect();
+            on_disk.sort_unstable();
+            assert_eq!(on_disk, vec![96, 128]);
+            corrupt_state_object(tier, state_key_at(&first.dflash2_states, 128));
+        },
+        2,
+    )?
+    else {
+        return Ok(());
+    };
+    let hits = tier.tier.manager.stats().hits;
+    let prefix = second.prime_prefix_state(&tokens, true, 16, &[], 0)?;
+    assert_eq!(prefix.effective_cached_prefix_len, 96);
+    assert_eq!(
+        tier.tier.manager.stats().hits - hits,
+        6,
+        "the chain below 96 came back"
+    );
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
+    Ok(())
+}
+
+/// The MoE read a prime armed with is gone before the GDN prime takes it,
+/// and the state does not read back: the turn restarts cold instead of
+/// replaying GDN alone over the restored KV, bit-equal to a cold turn.
+/// Mutation M2 (the prime keeps the KV and replays) → red.
+#[test]
+fn moe_a_state_lost_after_its_chain_came_back_restarts_cold() -> Result<()> {
+    const TEST: &str = "moe_a_state_lost_after_its_chain_came_back_restarts_cold";
+    let _plan = MoeSmallPlan::new();
+    let tokens: Vec<u32> = (0..140).map(|i| (i * 7 + 3) % 13 + 1).collect();
+    let Some((tier, mut second, cold)) = moe_restart_after(
+        "state-tier-moe-lost-read",
+        TEST,
+        std::slice::from_ref(&tokens),
+        |_, _| {},
+        1,
+    )?
+    else {
+        return Ok(());
+    };
+    let hits = tier.tier.manager.stats().hits;
+    let (cached, logits) = {
+        let _lost = crate::models::qwen3_5::dflash2_turn::StateReadLost::new();
+        moe_turn(&mut second, &tokens)?
+    };
+    assert_eq!(
+        tier.tier.manager.stats().hits - hits,
+        8,
+        "the state's chain came back"
+    );
+    assert_eq!(cached, 0);
+    assert!(crate::models::qwen3_5::model::arrays_bits_equal_for_test(
+        &logits, &cold
+    )?);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
+    Ok(())
+}
+
+/// The MoE twin with a RAM state below the armed disk state: the lost read
+/// leaves that lower state as the GDN prime's best, so the prime would
+/// replay GDN from it over the KV the disk state's chain brought back. The
+/// turn restarts cold instead, bit-equal to a cold turn.
+/// Mutation M3 (the checkpoint-replay arm keeps the restored KV) → red.
+#[test]
+fn moe_a_state_lost_above_a_ram_state_restarts_cold() -> Result<()> {
+    const TEST: &str = "moe_a_state_lost_above_a_ram_state_restarts_cold";
+    let _plan = MoeSmallPlan::new();
+    let tokens: Vec<u32> = (0..140).map(|i| (i * 7 + 3) % 13 + 1).collect();
+    let Some((tier, mut second, cold)) = moe_restart_after(
+        "state-tier-moe-lost-above-ram",
+        TEST,
+        std::slice::from_ref(&tokens),
+        |_, _| {},
+        1,
+    )?
+    else {
+        return Ok(());
+    };
+    let mut short = tokens[..100].to_vec();
+    short[99] = 14;
+    assert_eq!(moe_turn(&mut second, &short)?.0, 0);
+    let mut held: Vec<(usize, bool)> = second
+        .dflash2_states
+        .store
+        .entries()
+        .map(|entry| (entry.depth(), entry.ram().is_some()))
+        .collect();
+    held.sort_unstable();
+    assert_eq!(held, vec![(64, true), (96, true), (128, false)]);
+    let hits = tier.tier.manager.stats().hits;
+    let (cached, logits) = {
+        let _lost = crate::models::qwen3_5::dflash2_turn::StateReadLost::new();
+        moe_turn(&mut second, &tokens)?
+    };
+    assert_eq!(
+        tier.tier.manager.stats().hits - hits,
+        2,
+        "the state's chain above the hot hit came back"
+    );
+    assert_eq!(cached, 0);
+    assert!(crate::models::qwen3_5::model::arrays_bits_equal_for_test(
+        &logits, &cold
+    )?);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(disk.counters.invalidations, 1);
+    Ok(())
+}
+
+/// Splash `publishReachedStateBoundaries` for a scheduled MTP sequence on a
+/// MoE load without a draft: the prefill reaches the lane's checkpoint (64)
+/// and replay point (128) and publishes them while the same forward seeds
+/// the drafter with the prompt's hidden rows.
+/// Mutation MS1m (a scheduled MoE MTP prefill keeps no sink) → red.
+#[test]
+fn moe_scheduled_mtp_prefill_publishes_its_plan() -> Result<()> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::test_tier;
+    use crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget;
+    const TEST: &str = "moe_scheduled_mtp_prefill_publishes_its_plan";
+    let tier = test_tier("state-tier-moe-mtp-lane", 1 << 30);
+    let Some(mut inner) = plain_moe_on(&tier, TEST) else {
+        return Ok(());
+    };
+    moe_small_plan(true);
+    let result = (|| -> Result<()> {
+        let seq = 5u32;
+        let tokens: Vec<u32> = (0..140).map(|i| (i * 5 + 2) % 13 + 1).collect();
+        inner.activate_scheduled_recurrent(seq)?;
+        let prefix = inner.prime_prefix_state(&tokens, true, 16, &[], 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len, 0);
+        assert!(inner.begin_scheduled_mtp(seq, 0)?);
+        inner
+            .paged_prefill(
+                &tokens,
+                &prefix,
+                Stream::default(crate::stream::DeviceType::Gpu),
+            )?
+            .eval();
+        let counters = inner.dflash2_states.counters;
+        assert_eq!(
+            (
+                counters.checkpoint_publications,
+                counters.replay_state_publications
+            ),
+            (1, 1)
+        );
+        let mut depths: Vec<usize> = inner
+            .dflash2_states
+            .store
+            .entries()
+            .map(|entry| entry.depth())
+            .collect();
+        depths.sort_unstable();
+        assert_eq!(depths, vec![64, 128]);
+        assert!(
+            inner.mtp_state().owners[&seq].hidden.is_some(),
+            "the drafter is seeded"
+        );
+        Ok(())
+    })();
+    moe_small_plan(false);
+    result
+}
+
+/// One MoE image turn of `tokens` over image `hash` (rows 4..36) as the VLM
+/// core runs it: the image-aware prepare, the lane's prefill and the
+/// finalize, the merge standing in as the token embeddings on a text
+/// M-RoPE grid. Returns the prefix the turn resumed at.
+fn moe_image_turn(inner: &mut Qwen35MoeInner, tokens: &[u32], hash: u64) -> Result<u32> {
+    moe_image_turn_logits(inner, tokens, hash).map(|(cached, _)| cached)
+}
+
+/// [`moe_image_turn`], with the last row's logits.
+fn moe_image_turn_logits(
+    inner: &mut Qwen35MoeInner,
+    tokens: &[u32],
+    hash: u64,
+) -> Result<(u32, MxArray)> {
+    let positions: Vec<(u32, u64)> = (4..36).map(|row| (row, hash)).collect();
+    let keys = crate::engine::build_paged_extra_keys(tokens.len(), 16, &positions);
+    let len = tokens.len() as u32;
+    let resolution =
+        inner.prepare_moe_vlm_paged_prefix(tokens, len, 16, &keys, true, false, hash)?;
+    let cached = resolution.effective_plan.cached_prefix_len;
+    let rows = tokens.len() as i64;
+    let merge = crate::engine::vision::VisionMerge {
+        inputs_embeds: inner
+            .embedding
+            .forward(&MxArray::from_uint32(tokens, &[1, rows])?)?,
+        position_ids: MxArray::from_int32(
+            &(0..3).flat_map(|_| 0..len as i32).collect::<Vec<_>>(),
+            &[3, 1, rows],
+        )?,
+        rope_deltas: 0,
+    };
+    let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
+        inner.config.num_layers as usize,
+        |i| inner.config.is_linear_layer(i),
+    );
+    let (logits, rungs) = inner.vlm_lane_prefill(
+        tokens,
+        &keys,
+        &merge,
+        cached,
+        resolution.gdn_prefix_already_primed,
+        true,
+        &layer_kinds,
+    )?;
+    logits.eval();
+    inner.publish_moe_gdn_materialized_prefix_checkpoint(tokens, &keys, 0, rungs);
+    inner.finalize_moe_manual_paged_turn(&positions, 0)?;
+    Ok((cached, logits))
+}
+
+/// [`crate::models::qwen3_5::model`]'s
+/// `image_restart_restores_only_the_same_image` on a MoE load: the image
+/// turn publishes under its blocks' image keys, and after a restart only a
+/// turn over the same image resumes at the replay point (128).
+/// Mutations VK4m (the MoE image prepare arms no disk restore) and VK5m
+/// (the MoE image prefill keeps no sink) → red.
+#[test]
+fn moe_image_restart_restores_only_the_same_image() -> Result<()> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::persistent_test_tier;
+    const TEST: &str = "moe_image_restart_restores_only_the_same_image";
+    const IMAGE: u64 = 0xA11C_E011;
+    let tier = persistent_test_tier("state-tier-moe-image-restart", 1 << 30);
+    let Some(mut first) = plain_moe_on(&tier, TEST) else {
+        return Ok(());
+    };
+    moe_small_plan(true);
+    let result = (|| -> Result<()> {
+        let tokens: Vec<u32> = (0..140).map(|i| (i * 7 + 3) % 13 + 1).collect();
+        assert_eq!(moe_image_turn(&mut first, &tokens, IMAGE)?, 0);
+        let counters = first.dflash2_states.counters;
+        assert_eq!(
+            (
+                counters.checkpoint_publications,
+                counters.replay_state_publications
+            ),
+            (1, 1)
+        );
+        assert!(
+            first
+                .dflash2_states
+                .store
+                .entries()
+                .all(|entry| entry.extra_keys().len() == 3),
+            "every state carries the image keys"
+        );
+        assert!(first.dflash2_states.turns.is_empty(), "the turn ended");
+        let stored = moe_cell_at(&first, 128);
+        assert!(crate::models::qwen3_5::dflash2_state::disk::close_cache(
+            &mut first,
+            std::time::Instant::now() + std::time::Duration::from_secs(30)
+        ));
+        drop(first);
+
+        let tier = tier.reopen("state-tier-moe-image-restart", 1 << 30);
+        let Some(mut second) = plain_moe_on(&tier, TEST) else {
+            return Ok(());
+        };
+        assert_eq!(
+            crate::models::qwen3_5::dflash2_state::disk::adopt_all(&mut second),
+            1
+        );
+        let adopted = second
+            .dflash2_states
+            .store
+            .entries()
+            .next()
+            .map(|entry| entry.id())
+            .expect("the adopted state");
+        assert_eq!(moe_image_turn(&mut second, &tokens, 0xB0B0_E012)?, 0);
+        assert!(second.dflash2_states.store.get(adopted).is_some());
+        assert_eq!(moe_image_turn(&mut second, &tokens, IMAGE)?, 128);
+        let disk = second.dflash2_states.disk.as_ref().expect("tier");
+        assert_eq!(
+            disk.counters.promotions + disk.counters.promotions_skipped,
+            1
+        );
+        assert_eq!(disk.counters.invalidations, 0);
+        let anchor = second
+            .dflash2_states
+            .store
+            .get(adopted)
+            .and_then(|entry| entry.ram())
+            .expect("the promoted state");
+        let cell = crate::models::qwen3_5::dflash2_state::disk::encode_anchor(
+            &second.dflash2_states,
+            &second.config.to_dense_config(),
+            anchor,
+        )
+        .expect("an encoded cell");
+        assert_eq!(cell, stored);
+        Ok(())
+    })();
+    moe_small_plan(false);
+    result
+}
+
+/// [`crate::models::qwen3_5::model`]'s
+/// `text_turn_on_an_image_session_publishes_image_keyed_states` on a MoE
+/// load: a text turn that extends an image session resumes on its live
+/// cell (128) and publishes its replay point (176) under the blocks' image
+/// keys; an image turn of the same prompt resumes there, in process and
+/// from disk after a restart, on a cold image turn's logits, while a
+/// text-only turn of the same ids restores nothing.
+/// Mutations IC1 (a lane with image positions plans no point) and IC2 (the
+/// lane turn opens with no image keys) → red.
+#[test]
+fn moe_text_turn_on_an_image_session_publishes_image_keyed_states() -> Result<()> {
+    use crate::models::qwen3_5::dflash2_state::disk::tests::persistent_test_tier;
+    const TEST: &str = "moe_text_turn_on_an_image_session_publishes_image_keyed_states";
+    const TAG: &str = "state-tier-moe-image-session-text-turn";
+    const IMAGE: u64 = 0xA11C_E017;
+    let _plan = MoeSmallPlan::new();
+    let tokens: Vec<u32> = (0..191).map(|i| (i * 7 + 3) % 13 + 1).collect();
+    let head = &tokens[..128];
+    let reference_tier = persistent_test_tier("state-tier-moe-image-session-cold", 1 << 30);
+    let Some(mut reference) = seeded_moe_on(&reference_tier, TEST) else {
+        return Ok(());
+    };
+    let (cached, cold) = moe_image_turn_logits(&mut reference, &tokens, IMAGE)?;
+    assert_eq!(cached, 0);
+    drop(reference);
+
+    let tier = persistent_test_tier(TAG, 1 << 30);
+    let Some(mut first) = seeded_moe_on(&tier, TEST) else {
+        return Ok(());
+    };
+    assert_eq!(moe_image_turn(&mut first, head, IMAGE)?, 0);
+    first.cached_token_history = head.to_vec();
+    first.cached_image_key = Some(IMAGE);
+    first.cached_paged_image_token_positions = (4..36).map(|row| (row, IMAGE)).collect();
+    first.cached_rope_deltas = Some(0);
+    let before = first.dflash2_states.counters.replay_state_publications;
+    let (cached, _) = moe_turn(&mut first, &tokens)?;
+    assert_eq!(cached, 128, "the text turn continued the session");
+    let counters = first.dflash2_states.counters;
+    assert_eq!(counters.replay_state_publications - before, 1);
+    assert_eq!(counters.replay_state_publication_failures, 0);
+    let keys = |inner: &Qwen35MoeInner, depth: usize| {
+        inner
+            .dflash2_states
+            .store
+            .entries()
+            .find(|entry| entry.depth() == depth)
+            .map(|entry| (entry.id(), entry.extra_keys().to_vec()))
+            .unwrap_or_else(|| panic!("a state at {depth}"))
+    };
+    let (_, published) = keys(&first, 176);
+    assert_eq!(
+        published.len(),
+        3,
+        "the text turn's state carries the image keys"
+    );
+    let stored = moe_cell_at(&first, 176);
+    let (cached, logits) = moe_image_turn_logits(&mut first, &tokens, IMAGE)?;
+    assert_eq!(cached, 176);
+    assert!(crate::models::qwen3_5::model::arrays_bits_equal_for_test(
+        &logits, &cold
+    )?);
+    let Some((_tier, mut second)) = moe_reopen_after(first, tier, TAG, TEST, |_, _| {}, 1)? else {
+        return Ok(());
+    };
+    let (adopted, adopted_keys) = keys(&second, 176);
+    assert_eq!(adopted_keys, published);
+    let (cached, _) = moe_turn(&mut second, &tokens)?;
+    assert_eq!(cached, 0, "a text-only prompt restores nothing");
+    assert!(
+        second.dflash2_states.store.get(adopted).is_some(),
+        "the image-keyed state stays"
+    );
+    let (cached, logits) = moe_image_turn_logits(&mut second, &tokens, IMAGE)?;
+    assert_eq!(cached, 176);
+    let disk = second.dflash2_states.disk.as_ref().expect("tier");
+    assert_eq!(
+        disk.counters.promotions + disk.counters.promotions_skipped,
+        1
+    );
+    assert_eq!(disk.counters.invalidations, 0);
+    let anchor = second
+        .dflash2_states
+        .store
+        .get(adopted)
+        .and_then(|entry| entry.ram())
+        .expect("the promoted state");
+    let cell = crate::models::qwen3_5::dflash2_state::disk::encode_anchor(
+        &second.dflash2_states,
+        &second.config.to_dense_config(),
+        anchor,
+    )
+    .expect("an encoded cell");
+    assert_eq!(cell, stored);
+    assert!(crate::models::qwen3_5::model::arrays_bits_equal_for_test(
+        &logits, &cold
+    )?);
+    Ok(())
 }

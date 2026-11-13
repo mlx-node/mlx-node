@@ -243,6 +243,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // `&mut backend` directly. Safe in both sub-cases: if the adapter was
     // `None` (prime failed on the None check) abort is a no-op; if
     // prepare_turn failed mid-mutation abort releases the live request.
+    backend.set_generation_suffix(tokenizer.generation_suffix(args.config).ok().flatten());
     let prefix = match backend.prime_prefix_state(args.tokens, reuse_cache, 0, &[], p.cache_salt) {
         Ok(prefix) => prefix,
         Err(e) => {

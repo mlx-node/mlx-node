@@ -107,6 +107,10 @@ impl Admission for StateAdmission<'_> {
 /// borrows, one after the other.
 pub(crate) trait UnitSources {
     fn sources(&mut self) -> Vec<&mut dyn VictimSource>;
+
+    /// Takes the landings of the owner's SSD writes before the attempt
+    /// (Splash `Engine::tick` polls its transfers), reading no block.
+    fn poll_landings(&mut self) {}
 }
 
 /// Splash `Denial`.
@@ -187,6 +191,7 @@ pub(crate) fn allocate<C: UnitSources, A: Admission>(
 ) -> Allocation<A> {
     let governor = claim.governor;
     let id = claim.id;
+    ctx.poll_landings();
     let model = governor.ledger(|ledger| {
         ledger.update(id, spec);
         ledger.claim(id).map_or(0, |state| state.model)

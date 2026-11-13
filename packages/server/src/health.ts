@@ -224,6 +224,25 @@ export interface DFlash2StatesHealth {
   checkpoint_entries: number;
   checkpoint_bytes: number;
   in_use: number;
+  disk_entries: number;
+  disk_bytes: number;
+  offloads: number;
+  offload_failures: number;
+  invalidations: number;
+  disk_promotions: number;
+  disk_promotions_skipped: number;
+  disk_state_publications: number;
+  disk: DFlash2DiskHealth;
+}
+
+/** Splash's `/status` `disk` for the states' SSD tier. */
+export interface DFlash2DiskHealth {
+  /** `persistent`, `temp` or `off`. */
+  mode: string;
+  limit_bytes: number;
+  held_bytes: number;
+  taken_back: { states: number };
+  write_behind: { waiting: number; durable: number; unneeded: number; refused: number };
 }
 
 /** The native status in `/health`'s keys. */
@@ -319,6 +338,21 @@ export function toMemoryGovernorHealth(status: MemoryGovernorStatus): MemoryGove
       checkpoint_entries: states.checkpointEntries,
       checkpoint_bytes: states.checkpointBytes,
       in_use: states.inUse,
+      disk_entries: states.diskEntries,
+      disk_bytes: states.diskBytes,
+      offloads: states.offloads,
+      offload_failures: states.offloadFailures,
+      invalidations: states.invalidations,
+      disk_promotions: states.diskPromotions,
+      disk_promotions_skipped: states.diskPromotionsSkipped,
+      disk_state_publications: states.diskStatePublications,
+      disk: {
+        mode: states.disk.mode,
+        limit_bytes: states.disk.limitBytes,
+        held_bytes: states.disk.heldBytes,
+        taken_back: { states: states.disk.takenBack },
+        write_behind: { ...states.disk.writeBehind },
+      },
     },
   };
 }

@@ -80,3 +80,53 @@ fn dflash_disables_adaptive_fallback_without_changing_native_mtp() {
         assert_eq!(native.mtp_adaptive_depth, adaptive.unwrap_or(false));
     }
 }
+
+/// A load with no `persistPagedCache` takes `MLX_PERSIST_PAGED_CACHE`, the
+/// env every host entry writes from `--no-persist-cache` > env > its default
+/// (on): on keeps a persistent tier, off a temporary one removed at close.
+/// Mutation PS2 (`disk_tier` reads the option only) → red.
+#[test]
+fn load_takes_the_shared_persist_switch() {
+    let mode = |options: &Qwen35LoadOptions, env: Option<&str>| {
+        let tier = options.disk_tier_with_env("Qwen3.5", env).unwrap();
+        (tier.persistent, tier.cache_disk)
+    };
+    let auto = crate::disk_tier::CacheDisk::Auto;
+    let unset = Qwen35LoadOptions::default();
+    assert_eq!(mode(&unset, Some("1")), (true, auto));
+    assert_eq!(mode(&unset, Some("0")), (false, auto));
+    assert_eq!(mode(&unset, None), (false, auto));
+    let off = Qwen35LoadOptions {
+        persist_paged_cache: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(mode(&off, Some("1")), (false, auto));
+    let on = Qwen35LoadOptions {
+        persist_paged_cache: Some(true),
+        ..Default::default()
+    };
+    assert_eq!(mode(&on, Some("0")), (true, auto));
+    let no_tier = Qwen35LoadOptions {
+        cache_disk: Some("0".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        mode(&no_tier, Some("1")),
+        (false, crate::disk_tier::CacheDisk::Off)
+    );
+    let dir = Qwen35LoadOptions {
+        cache_dir: Some("/c".to_string()),
+        ..Default::default()
+    };
+    assert_eq!(
+        dir.disk_tier_with_env("Qwen3.5", Some("0"))
+            .unwrap_err()
+            .reason,
+        "Qwen3.5 load: --cache-dir needs the persistent cache --no-persist-cache turns off"
+    );
+    assert!(
+        dir.disk_tier_with_env("Qwen3.5", Some("1"))
+            .unwrap()
+            .persistent
+    );
+}

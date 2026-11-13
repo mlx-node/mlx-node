@@ -212,25 +212,14 @@ impl Qwen35MoeInner {
             // === PREFILL ===
             let last_logits = {
                 let _stream_ctx = StreamContext::new(generation_stream);
-                let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("vision_paged_turn_sync_core: caches not initialized")
-                })?;
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason("vision_paged_turn_sync_core: paged_adapter dropped")
-                })?;
-                crate::models::qwen3_5_moe::paged_forward::run_paged_vlm_prefill_moe(
+                self.vlm_lane_prefill(
                     &expanded_tokens,
+                    &lookup_extra_keys,
                     &merge,
                     cached_prefix_len,
                     gdn_prefix_already_primed,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
+                    p.reuse_cache,
                     &layer_kinds,
-                    adapter,
-                    turn_cancel.as_deref(),
                 )?
             };
             let (last_logits, gdn_checkpoint) = last_logits;
@@ -585,30 +574,18 @@ impl Qwen35MoeInner {
             |i| self.config.is_linear_layer(i),
         );
 
-        let turn_cancel = self.turn_cancel.clone();
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             // === PREFILL ===
             let last_logits = {
                 let _stream_ctx = StreamContext::new(generation_stream);
-                let caches_ref = self.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("vision_paged_turn_stream_core: caches not initialized")
-                })?;
-                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                    Error::from_reason("vision_paged_turn_stream_core: paged_adapter dropped")
-                })?;
-                crate::models::qwen3_5_moe::paged_forward::run_paged_vlm_prefill_moe(
+                self.vlm_lane_prefill(
                     &expanded_tokens,
+                    &lookup_extra_keys,
                     &merge,
                     cached_prefix_len,
                     gdn_prefix_already_primed,
-                    &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
+                    p.reuse_cache,
                     &layer_kinds,
-                    adapter,
-                    turn_cancel.as_deref(),
                 )?
             };
             let (last_logits, gdn_checkpoint) = last_logits;
@@ -862,5 +839,62 @@ impl Qwen35MoeInner {
         );
 
         Ok(())
+    }
+}
+
+impl Qwen35MoeInner {
+    /// The image prefill of `expanded_tokens` from `cached`, whose blocks
+    /// carry `extra_keys` under the salt its lookup used (0): its chunks
+    /// reach the turn's state points
+    /// ([`crate::models::qwen3_5::dflash2_turn::image_lane_prefill`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn vlm_lane_prefill(
+        &mut self,
+        expanded_tokens: &[u32],
+        extra_keys: &[Vec<u64>],
+        merge: &crate::engine::vision::VisionMerge,
+        cached: u32,
+        gdn_prefix_already_primed: bool,
+        reuse: bool,
+        layer_kinds: &[super::super::decoder_layer::Qwen3_5LayerKind],
+    ) -> Result<(
+        MxArray,
+        Vec<crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint>,
+    )> {
+        let embed = self.embedding.clone();
+        let turn_cancel = self.turn_cancel.clone();
+        let seq = crate::models::qwen3_5::dflash2_turn::DFlash2Target::lane_seq(self);
+        let restored = match self.gdn_in_use.get(&seq) {
+            Some(crate::engine::governor::ledger::UnitKey::Store(id)) => Some(*id),
+            _ => None,
+        };
+        let chunk_rows = crate::models::qwen3_5::paged_forward::prefill_chunk_rows(
+            self.cold_gdn_prefill_chunk_size(),
+        );
+        crate::models::qwen3_5::dflash2_turn::image_lane_prefill(
+            self,
+            expanded_tokens,
+            extra_keys,
+            cached,
+            0,
+            reuse,
+            restored,
+            chunk_rows,
+            |inner| inner.dflash2.take(),
+            |inner, draft| inner.dflash2 = Some(draft),
+            |target, sink| {
+                crate::models::qwen3_5_moe::paged_forward::run_paged_vlm_prefill_moe(
+                    expanded_tokens,
+                    merge,
+                    cached,
+                    gdn_prefix_already_primed,
+                    &embed,
+                    target,
+                    layer_kinds,
+                    turn_cancel.as_deref(),
+                    Some(sink),
+                )
+            },
+        )
     }
 }

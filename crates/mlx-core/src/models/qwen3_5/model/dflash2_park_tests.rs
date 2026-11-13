@@ -256,7 +256,7 @@ fn pool_block_size(inner: &Qwen35Inner) -> u32 {
     inner.paged_adapter.as_ref().expect("adapter").block_size()
 }
 
-fn chain_tokens(seed: u32, blocks: u32, block_size: u32) -> Vec<u32> {
+pub(crate) fn chain_tokens(seed: u32, blocks: u32, block_size: u32) -> Vec<u32> {
     (0..blocks * block_size)
         .map(|i| (seed * 11 + i * 7) % 15 + 1)
         .collect()
@@ -264,7 +264,7 @@ fn chain_tokens(seed: u32, blocks: u32, block_size: u32) -> Vec<u32> {
 
 /// Caches `tokens` (whole blocks) as a chain nothing holds; returns its
 /// block hashes.
-pub(super) fn cache_chain(inner: &Qwen35Inner, tokens: &[u32]) -> Vec<u64> {
+pub(crate) fn cache_chain(inner: &Qwen35Inner, tokens: &[u32]) -> Vec<u64> {
     cache_keyed_chain(inner, tokens, &[], 0)
 }
 
@@ -412,7 +412,7 @@ fn cap_with_a_shared_live_table_of(seed: u64, total: u32) -> Result<Qwen35Inner>
 
 /// A prefix prepare at the cap whose only takeable chain is a ladder rung
 /// the prompt does not share frees it and prepares.
-/// Mutations: drop the `claimed` wrapper in dense `prime_prefix_state`
+/// Mutations: drop the `claimed` wrapper in dense `prime_dense_prefix`
 /// → red (`Err` "paged cache could not reserve"); drop the record after
 /// the release in `prepare_turn_inner` → red (`Err`, no refusal).
 #[test]
@@ -424,7 +424,7 @@ fn prefix_prepare_at_the_cap_frees_a_marked_chain() -> Result<()> {
     let block_size = pool_block_size(&inner);
     let prompt = chain_tokens(7, 2, block_size);
     clear_grow_reclaim_log();
-    PagedBackend::prime_prefix_state(&mut inner, &prompt, true, block_size as usize, &[], 0)?;
+    inner.prime_dense_prefix(&prompt, 0, None)?;
     assert_eq!(grow_reclaim_log(), vec![GrowReclaim::Ladder]);
     assert!(inner.ladder_entries_for_test().is_empty());
     Ok(())
@@ -635,14 +635,13 @@ fn a_take_that_frees_nothing_measurable_lists_again() -> Result<()> {
     Ok(())
 }
 
-/// GDN caches a ladder rung can restore: the live state of a finished
-/// DFlash2 turn.
+/// GDN caches a ladder rung can restore: the lane the last turn on the
+/// draft load released.
 fn restorable_caches(inner: &Qwen35Inner) -> Vec<Qwen3_5LayerCache> {
-    super::state::clone_dense_linear_layer_caches(
-        &inner.config,
-        inner.caches.as_ref().expect("live caches"),
-    )
-    .expect("ready linear caches")
+    let lane = crate::models::qwen3_5::dflash2_turn::RELEASED_LANE
+        .with(|lane| lane.borrow_mut().take())
+        .expect("the turn released its lane");
+    restorable_caches_from(inner, &lane)
 }
 
 /// A fixture whose sequence 0 restored its prompt's GDN state from rung E
@@ -1250,8 +1249,6 @@ fn a_released_serial_turn_ends_the_replay_points_use() -> Result<()> {
         let e_key = rung_key(&inner, 2 * pool_block_size(&inner), e_final);
         assert_eq!(inner.gdn_in_use_for_test(0), Some(&e_key), "reuse {reuse}");
         {
-            // The finalize bumps the global sidecar capture counter.
-            let _serialized = crate::cold_tier::sidecar_counter_test_lock();
             crate::engine::backend::PagedBackend::finalize_paged_turn(&mut inner, false, 0);
             crate::engine::backend::PagedBackend::save_paged_history(
                 &mut inner,
@@ -1509,7 +1506,10 @@ fn anchor(inner: &Qwen35Inner) -> crate::models::qwen3_5::dflash2_state::paged::
             .unwrap();
         }
     }
-    PagedAnchor { linear, window }
+    PagedAnchor {
+        linear,
+        window: Some(window),
+    }
 }
 
 /// A parked DFlash2 state on `tokens` (whole blocks) of this model's
@@ -1560,7 +1560,7 @@ fn dropping_a_parked_state_returns_its_blocks() -> Result<()> {
     assert_eq!(evictable(&inner) + 6, before);
     let taken =
         crate::models::qwen3_5::dflash2_turn::take_state_unit(&mut inner, &UnitKey::Store(id));
-    assert!(taken);
+    assert_eq!(taken, crate::models::qwen3_5::dflash2_turn::StateTake::Took);
     assert_eq!(inner.dflash2_states.store.bytes().entries, 0);
     assert_eq!(
         inner
@@ -1967,23 +1967,27 @@ fn warning_holds_back_publications_not_the_lane() -> Result<()> {
     );
 
     let row = block_size;
-    inner.dflash2_states.turn = Some(TurnStates {
-        plan: StatePlan {
-            boundaries: vec![StateBoundary {
-                tokens: row,
-                disposable: false,
-            }],
-            prompt_replay: row,
+    inner.dflash2_states.turns.insert(
+        0,
+        TurnStates {
+            plan: StatePlan {
+                boundaries: vec![StateBoundary {
+                    tokens: row,
+                    disposable: false,
+                }],
+                prompt_replay: row,
+            },
+            cursor: 0,
+            passed: Vec::new(),
+            anchor_bytes: anchor(&inner).state_bytes(),
+            latest_checkpoint: None,
+            cache_salt: 0,
+            extra_keys: Vec::new(),
+            junction: 0,
+            prompt_tokens: row + 1,
+            reuse: true,
         },
-        cursor: 0,
-        passed: Vec::new(),
-        anchor_bytes: anchor(&inner).state_bytes(),
-        latest_checkpoint: None,
-        cache_salt: 0,
-        junction: 0,
-        prompt_tokens: row + 1,
-        reuse: true,
-    });
+    );
     assert!(
         matches!(
             reserve_capture(&mut inner, row)?,
@@ -1991,7 +1995,7 @@ fn warning_holds_back_publications_not_the_lane() -> Result<()> {
         ),
         "the replay point's capture is granted"
     );
-    inner.dflash2_states.turn = None;
+    inner.dflash2_states.turns.remove(&0);
     assert_eq!(governor.publications_refused(7), 1);
 
     let mut lane = fixture(0xDFA5_3802);
@@ -2195,7 +2199,7 @@ fn dead_leaves_go_after_checkpoints_before_ordinary_states() -> Result<()> {
     cache_chain(&inner, &chain_tokens(96, 4, block_size));
     let anchor = || PagedAnchor {
         linear: Vec::new(),
-        window: DraftContextWindow::new(64, 8).expect("window"),
+        window: Some(DraftContextWindow::new(64, 8).expect("window")),
     };
     let (ordinary, checkpoint) = (
         chain_tokens(97, 1, block_size),

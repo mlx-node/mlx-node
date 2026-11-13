@@ -126,13 +126,13 @@ describe('scanAgentArgs', () => {
   describe('--no-persist-cache extraction', () => {
     it('lifts the mlx-owned flag out of passthrough', () => {
       const scan = scanAgentArgs(['--no-persist-cache', '-p', 'hi']);
-      expect(scan.persistPagedCache).toBe(false);
+      expect(scan.persistPagedCache).toEqual({ flag: false, byDefault: true });
       expect(scan.passthrough).toEqual(['-p', 'hi']);
     });
 
     it('does not hijack the flag when it sits in a value-consumer slot', () => {
       const scan = scanAgentArgs(['--system-prompt-override', '--no-persist-cache']);
-      expect(scan.persistPagedCache).toBe(true);
+      expect(scan.persistPagedCache).toEqual({ byDefault: true });
       expect(scan.passthrough).toEqual(['--system-prompt-override', '--no-persist-cache']);
     });
   });
@@ -839,6 +839,46 @@ describe('run() argv routing', () => {
     expect(calls.launch[0]!.argv).not.toContain('--kv-format');
   });
 
+  // Mutation TPA2: drop `persistPagedCache` from the launcher pass-through → red.
+  it('exits 1 on bad SSD cache flags and hands good ones to the launcher', async () => {
+    for (const argv of [
+      ['--max-cache-disk', 'lots'],
+      ['--no-persist-cache', '--cache-dir', '/c'],
+      ['--max-cache-disk=0', '--cache-dir', '/c'],
+    ]) {
+      const { deps, calls } = makeDeps();
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const prevExitCode = process.exitCode;
+      try {
+        await run(argv, deps);
+        expect(process.exitCode).toBe(1);
+        expect(errorSpy.mock.calls.flat().join('\n')).toContain('--');
+      } finally {
+        process.exitCode = prevExitCode;
+        errorSpy.mockRestore();
+      }
+      expect(calls.launch).toHaveLength(0);
+    }
+    const { deps, calls } = makeDeps();
+    await run(['--max-cache-disk', '64G', '--cache-dir', '/c'], deps);
+    expect(calls.launch).toHaveLength(1);
+    expect(calls.launch[0]).toMatchObject({
+      cacheDisk: String(64 * 1024 ** 3),
+      persistPagedCache: { byDefault: true },
+      cacheDir: '/c',
+    });
+
+    const plain = makeDeps();
+    await run([], plain.deps);
+    expect(plain.calls.launch[0]!.persistPagedCache).toEqual({ byDefault: true });
+    expect(plain.calls.launch[0]!.cacheDisk).toBeUndefined();
+
+    const off = makeDeps();
+    await run(['--no-persist-cache'], off.deps);
+    expect(off.calls.launch[0]!.persistPagedCache).toEqual({ flag: false, byDefault: true });
+    expect(off.calls.launch[0]!.argv).not.toContain('--no-persist-cache');
+  });
+
   // Mutation: drop the `maxMemoryInvalid` usage check in `run` → red (a bad
   // size launches). Mutation: drop the launcher pass-through → red.
   it('exits 1 on a bad --max-memory and hands a good one to the launcher', async () => {
@@ -927,6 +967,8 @@ describe('run() argv routing', () => {
       expect(output).toContain('--trace');
       expect(output).toContain('--trace-dir <dir>');
       expect(output).toContain('--no-persist-cache');
+      expect(output).toContain('--max-cache-disk <size>');
+      expect(output).toContain('--cache-dir <dir>');
       expect(output).toContain('MLX_NODE_LOG');
       expect(output).toContain('MLX_NODE_LOG_FILE');
       expect(output).toContain('MLX_AGENT_BIN');

@@ -20,12 +20,13 @@ use super::plan::StatePlan;
 use super::store::{Entry, EntryId, HybridStateStore, StateBytes};
 
 /// GDN slots (full-attention slots are empty placeholders) and the 4-bit
-/// draft context window, both at the same block-aligned row. Neither shares
-/// a buffer a later turn writes: the window is a snapshot, and the GDN
-/// arrays are snapshots a forward never writes in place.
+/// draft context window, both at the same block-aligned row; a load without
+/// a draft keeps the GDN cell alone. Neither shares a buffer a later turn
+/// writes: the window is a snapshot, and the GDN arrays are snapshots a
+/// forward never writes in place.
 pub(crate) struct PagedAnchor {
     pub(crate) linear: Vec<Qwen3_5LayerCache>,
-    pub(crate) window: DraftContextWindow,
+    pub(crate) window: Option<DraftContextWindow>,
 }
 
 impl PagedAnchor {
@@ -36,22 +37,26 @@ impl PagedAnchor {
                 cache.collect_arrays(out);
             }
         }
-        self.window.collect_arrays(out);
+        if let Some(window) = &self.window {
+            window.collect_arrays(out);
+        }
     }
 }
 
 impl StateBytes for PagedAnchor {
     fn state_bytes(&self) -> u64 {
-        Qwen3_5LayerCache::linear_state_bytes(&self.linear).saturating_add(self.window.nbytes())
+        Qwen3_5LayerCache::linear_state_bytes(&self.linear)
+            .saturating_add(self.window.as_ref().map_or(0, DraftContextWindow::nbytes))
     }
 }
 
 /// Bytes of one state of `target` with `draft`, its lineage aside (Splash
-/// `CompositeStateLayout::cachedBytes`: one GDN cell and the window).
-pub(crate) fn anchor_bytes(target: &Qwen3_5Config, draft: &DFlash2Config) -> u64 {
+/// `CompositeStateLayout::cachedBytes`: one GDN cell and the window; no
+/// window without a draft).
+pub(crate) fn anchor_bytes(target: &Qwen3_5Config, draft: Option<&DFlash2Config>) -> u64 {
     target
         .recurrent_state_bytes()
-        .saturating_add(draft.context_window_bytes())
+        .saturating_add(draft.map_or(0, DFlash2Config::context_window_bytes))
 }
 
 /// What the turn states published, retired and missed (Splash
@@ -70,9 +75,12 @@ pub(crate) struct StateCounters {
     pub(crate) lazy_junctions: u64,
     pub(crate) checkpoint_evictions: u64,
     pub(crate) evictions: u64,
+    /// States no RAM copy took, written from the lane to the SSD tier
+    /// (Splash `diskStatePublications`).
+    pub(crate) disk_state_publications: u64,
 }
 
-/// The running DFlash2 turn's state points (Splash `Request`
+/// A running turn's state points on one sequence (Splash `Request`
 /// `stateBoundaries`, `stateBoundaryCursor`, `latestCheckpoint`).
 pub(crate) struct TurnStates {
     pub(crate) plan: StatePlan,
@@ -88,6 +96,10 @@ pub(crate) struct TurnStates {
     /// The lane's rolling checkpoint and its publication.
     pub(crate) latest_checkpoint: Option<(EntryId, u64)>,
     pub(crate) cache_salt: u64,
+    /// Per-block image keys of the turn's lineage, none on a text chain
+    /// (Splash `CacheIdentity::images`): its blocks register and its states
+    /// publish under them.
+    pub(crate) extra_keys: Vec<Vec<u64>>,
     /// The KV hit the admission found a state below, 0 for none (Splash
     /// `CacheLookup::junctionBoundary`).
     pub(crate) junction: u32,
@@ -107,13 +119,16 @@ pub(crate) struct PrefillYield {
     pub(crate) failure: Option<crate::engine::governor::governor::Failure>,
 }
 
-/// One loaded model's parked DFlash2 states and the running turn's points.
+/// One loaded model's stored states and the running turns' points.
 pub(crate) struct DFlash2States {
     pub(crate) store: HybridStateStore<PagedAnchor>,
-    pub(crate) turn: Option<TurnStates>,
-    /// The block whose state the running turn resumes from or published at
-    /// its own replay point (Splash `ActiveRequest::replayPoint`).
-    pub(crate) replay_point: Option<u64>,
+    /// Each running turn's points by its sequence (Splash `Request`): the
+    /// serial lane's is sequence 0, a scheduled lane's its own.
+    pub(crate) turns: HashMap<u32, TurnStates>,
+    /// The block whose state each sequence's turn resumes from or published
+    /// at its own replay point (Splash `ActiveRequest::replayPoint`); a
+    /// vacated lane keeps it.
+    pub(crate) replay_points: HashMap<u32, u64>,
     /// The generation prompt of the turn's render, which places its replay
     /// point.
     pub(crate) generation_suffix: Option<Arc<[u32]>>,
@@ -121,6 +136,9 @@ pub(crate) struct DFlash2States {
     /// prefill continues (Splash `QwenStateStorage::restore` writes the
     /// lane's window).
     pub(crate) lane_window: Option<DraftContextWindow>,
+    /// Each scheduled sequence's context window on a draft load, which its
+    /// prefill slices continue (Splash keeps one lane per request).
+    pub(crate) seq_windows: HashMap<u32, DraftContextWindow>,
     pub(crate) counters: StateCounters,
     /// The finalize released the DFlash2 turn's lane; its history save
     /// takes it.
@@ -139,6 +157,27 @@ pub(crate) struct DFlash2States {
     /// The refusal that suspended the tapped prefill, until the prefill's
     /// owner vacates the lane.
     pub(crate) prefill_yield: Option<PrefillYield>,
+    /// The model's SSD tier for its states, when a load opened one.
+    pub(crate) disk: Option<super::disk::StateDisk>,
+    /// The disk state the turn's lane read, until the admission promotes
+    /// or discards it (Splash `Engine::pollRestores`).
+    pub(crate) disk_read: Option<DiskRead>,
+    /// The disk state an autoregressive prime read and checked before it
+    /// armed the state's chain, until the GDN prime takes it.
+    pub(crate) state_read: Option<StateRead>,
+}
+
+/// A disk state's GDN cell, read before its chain is restored.
+pub(crate) struct StateRead {
+    pub(crate) id: EntryId,
+    pub(crate) linear: Vec<Qwen3_5LayerCache>,
+}
+
+/// A disk state a lane read (Splash `StateRestore`): the window the read
+/// took when the lane's turn does not keep it.
+pub(crate) struct DiskRead {
+    pub(crate) id: EntryId,
+    pub(crate) window: Option<DraftContextWindow>,
 }
 
 /// A released lane's buffers: the draft ring with its rows dropped and the
@@ -195,49 +234,56 @@ impl DFlash2States {
         store.share_recency(recency);
         Self {
             store,
-            turn: None,
-            replay_point: None,
+            turns: HashMap::new(),
+            replay_points: HashMap::new(),
             generation_suffix: None,
             lane_window: None,
+            seq_windows: HashMap::new(),
             counters: StateCounters::default(),
             released: false,
             restore_uses: HashMap::new(),
             idle_lane: IdleLane::default(),
             prefill_suspends: false,
             prefill_yield: None,
+            disk: None,
+            disk_read: None,
+            state_read: None,
         }
     }
 
     /// Drops every parked state.
     pub(crate) fn clear(&mut self) {
         self.store.clear();
-        self.turn = None;
-        self.replay_point = None;
+        self.turns.clear();
+        self.replay_points.clear();
         self.lane_window = None;
+        self.seq_windows.clear();
+        self.disk_read = None;
+        self.state_read = None;
         self.restore_uses.clear();
         self.idle_lane = IdleLane::default();
     }
 
-    /// Marks `id`'s block as the running turn's replay point (Splash
+    /// Marks `id`'s block as `seq`'s turn's replay point (Splash
     /// `StateCache::useState`).
-    pub(crate) fn use_replay_point(&mut self, id: EntryId) {
+    pub(crate) fn use_replay_point(&mut self, seq: u32, id: EntryId) {
         if let Some(block) = self.store.get(id).map(Entry::mark) {
-            self.use_replay_block(block);
+            self.use_replay_block(seq, block);
         }
     }
 
-    /// Marks `block` as the running turn's replay point, with a state there
-    /// or yet to be published (Splash `StateCache::useState`).
-    pub(crate) fn use_replay_block(&mut self, block: u64) {
-        self.end_replay_point();
+    /// Marks `block` as `seq`'s turn's replay point, with a state there or
+    /// yet to be published (Splash `StateCache::useState`).
+    pub(crate) fn use_replay_block(&mut self, seq: u32, block: u64) {
+        self.end_replay_point(seq);
         self.store.use_state(block);
-        self.replay_point = Some(block);
+        self.replay_points.insert(seq, block);
     }
 
-    /// Ends the running turn's use of its replay point (Splash
+    /// Ends `seq`'s turn's use of its replay point (Splash
     /// `StateCache::unuse`: it becomes the newest state).
-    pub(crate) fn end_replay_point(&mut self) {
-        if let Some(block) = self.replay_point.take() {
+    pub(crate) fn end_replay_point(&mut self, seq: u32) {
+        if let Some(block) = self.replay_points.remove(&seq) {
             self.store.end_use(block);
         }
     }
@@ -266,14 +312,26 @@ impl DFlash2States {
         }
     }
 
-    /// The turn ended (finalize, abort, cancel), after its request was
+    /// `seq`'s turn ended (finalize, abort, cancel), after its request was
     /// released: its replay point is no longer in use, stamped newer than
     /// its KV tail, and its points go (Splash `Engine::release`). What it
     /// published stays: each state was published only once its block
-    /// registered.
-    pub(crate) fn end_turn(&mut self) {
-        self.end_replay_point();
-        self.turn = None;
+    /// registered, and its checkpoint is not retired.
+    pub(crate) fn end_turn(&mut self, seq: u32) {
+        self.end_replay_point(seq);
+        self.turns.remove(&seq);
+        self.state_read = None;
+        let window = self.seq_windows.remove(&seq);
+        self.idle_lane.give_window(window);
+    }
+
+    /// `seq`'s context window: the serial lane's for sequence 0.
+    pub(crate) fn lane_window_of(&self, seq: u32) -> Option<&DraftContextWindow> {
+        if seq == 0 {
+            self.lane_window.as_ref()
+        } else {
+            self.seq_windows.get(&seq)
+        }
     }
 }
 
@@ -314,6 +372,36 @@ pub(crate) fn install_linear(
     Ok(())
 }
 
+/// Moves the GDN slots a disk read decoded into `caches`' linear slots, in
+/// layer order, and evaluates them; full-attention slots are left alone.
+pub(crate) fn adopt_linear(
+    caches: &mut [Qwen3_5LayerCache],
+    linear: Vec<Qwen3_5LayerCache>,
+) -> Result<()> {
+    if caches.len() != linear.len() {
+        return Err(Error::from_reason(format!(
+            "a DFlash2 disk state holds {} layers for {} cache slots",
+            linear.len(),
+            caches.len()
+        )));
+    }
+    for (slot, state) in caches.iter_mut().zip(linear) {
+        if matches!(state, Qwen3_5LayerCache::Linear(_)) {
+            *slot = state;
+        }
+    }
+    let mut arrays = Vec::new();
+    for slot in caches.iter() {
+        if matches!(slot, Qwen3_5LayerCache::Linear(_)) {
+            slot.collect_arrays(&mut arrays);
+        }
+    }
+    if !arrays.is_empty() {
+        MxArray::eval_arrays(&arrays)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,7 +426,7 @@ mod tests {
                 Qwen3_5LayerCache::Linear(gdn),
                 Qwen3_5LayerCache::new_full_attention(),
             ],
-            window: config.context_window().unwrap(),
+            window: Some(config.context_window().unwrap()),
         }
     }
 
@@ -376,6 +464,7 @@ mod tests {
         let draft = crate::models::qwen3_5::dflash2::dflash2_config_with_context(5120, 2048);
         assert_eq!(target.recurrent_state_bytes(), 153_944_064);
         assert_eq!(DraftContextWindow::bytes(5120, 2048), 5_898_240);
-        assert_eq!(anchor_bytes(&target, &draft), 159_842_304);
+        assert_eq!(anchor_bytes(&target, Some(&draft)), 159_842_304);
+        assert_eq!(anchor_bytes(&target, None), 153_944_064);
     }
 }

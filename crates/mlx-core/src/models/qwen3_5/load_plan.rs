@@ -7,6 +7,7 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use crate::array::DType;
+use crate::disk_tier::CacheDisk;
 use crate::engine::checkpoint_source::CheckpointSource;
 use crate::engine::memory_plan::{
     ContextBounds, KvLayout, LaneShape, LiveMemory, MeasuredMemory, MemoryFootprint, MemoryPlan,
@@ -174,6 +175,8 @@ pub(crate) struct DraftTerms {
     pub tap_layers: usize,
     /// The lane's draft ring and context window.
     pub lane_bytes: u64,
+    /// The 4-bit context window a stored state keeps.
+    pub window_bytes: u64,
     pub weight_bytes: u64,
 }
 
@@ -182,6 +185,7 @@ impl DraftTerms {
         Self {
             tap_layers: config.target_layers.len(),
             lane_bytes: config.lane_bytes(),
+            window_bytes: config.context_window_bytes(),
             weight_bytes,
         }
     }
@@ -198,6 +202,8 @@ pub(crate) struct LoadLanes<'a> {
     pub mtp: bool,
     /// The scheduler books that state inside the pool as well.
     pub mtp_state_in_pool: bool,
+    /// The SSD tier's state staging the plan sets aside.
+    pub state_staging_bytes: u64,
 }
 
 /// Whether the hybrid scheduler serves this process's Qwen3.5 turns: it
@@ -228,6 +234,7 @@ pub(crate) fn evaluate_qwen35_plan(
         } else {
             0
         },
+        state_staging_bytes: lanes.state_staging_bytes,
         draft_weights_bytes: draft.map_or(0, |draft| draft.weight_bytes),
         held_back_bytes: 0,
         margin: crate::engine::memory_plan::Margin::Ledger,
@@ -281,6 +288,69 @@ pub(crate) fn evaluate_qwen35_plan(
         .map_err(|error| Error::from_reason(error.message(label)))
 }
 
+/// Bytes of one stored state of `lanes`' load (Splash
+/// `CompositeStateLayout::cachedBytes`: the GDN cell and the draft window,
+/// the cell alone without a draft); 0 without a pool.
+fn lanes_state_bytes(lanes: &LoadLanes<'_>) -> u64 {
+    match (lanes.draft, lanes.pool) {
+        (Some(draft), Some(_)) => lanes
+            .recurrent_state_bytes
+            .saturating_add(draft.window_bytes),
+        (None, Some(_)) => lanes.recurrent_state_bytes,
+        _ => 0,
+    }
+}
+
+/// Splash `RuntimeResources` staging rules over `evaluate_qwen35_plan`: a
+/// draft load whose SSD tier quota holds one state sets that state's staging
+/// aside; the automatic tier turns off (`diskOff`) when the plan cannot hold
+/// the model beside it, or `--max-context` beside it while it can without.
+/// The plan's `state_staging_bytes` says whether the tier may open.
+pub(crate) fn plan_with_disk(
+    label: &str,
+    lanes: &mut LoadLanes<'_>,
+    live: LiveMemory,
+    max_memory_bytes: Option<u64>,
+    max_context: Option<u32>,
+    cache_disk: CacheDisk,
+) -> Result<MemoryPlan> {
+    let state = lanes_state_bytes(lanes);
+    lanes.state_staging_bytes = 0;
+    if state > 0 && cache_disk != CacheDisk::Off {
+        if cache_disk.nominal_bytes() >= state {
+            lanes.state_staging_bytes = state;
+        } else {
+            tracing::info!(
+                "{label} SSD cache off: its quota holds no state of {} MiB; no state staging is \
+                 set aside.",
+                state.div_ceil(1 << 20)
+            );
+        }
+    }
+    if lanes.state_staging_bytes > 0 && cache_disk == CacheDisk::Auto {
+        let off = match evaluate_qwen35_plan(label, lanes, live, max_memory_bytes) {
+            Err(_) => Some("the memory plan cannot hold the model beside its state staging"),
+            Ok(plan) if check_qwen35_max_context(label, &plan, max_context).is_err() => {
+                let staging = std::mem::take(&mut lanes.state_staging_bytes);
+                let without = evaluate_qwen35_plan(label, lanes, live, max_memory_bytes)
+                    .is_ok_and(|plan| check_qwen35_max_context(label, &plan, max_context).is_ok());
+                lanes.state_staging_bytes = staging;
+                without.then_some(
+                    "the memory plan cannot hold the requested context beside its state staging",
+                )
+            }
+            Ok(_) => None,
+        };
+        if let Some(reason) = off {
+            tracing::info!("{label} SSD cache off: {reason}; no state staging is set aside.");
+            lanes.state_staging_bytes = 0;
+        }
+    }
+    let plan = evaluate_qwen35_plan(label, lanes, live, max_memory_bytes)?;
+    check_qwen35_max_context(label, &plan, max_context)?;
+    Ok(plan)
+}
+
 /// Every turn's window: the pool lane's.
 fn turn_window(plan: &MemoryPlan) -> Option<ContextBounds> {
     plan.pool.as_ref().map(|pool| pool.lane.window)
@@ -326,6 +396,7 @@ pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
     pool: Option<PoolGeometry>,
     max_memory_bytes: Option<u64>,
     max_context: Option<u32>,
+    cache_disk: CacheDisk,
 ) -> Result<Option<MemoryPlan>> {
     let draft = target.dflash2();
     let config = target.dense_config();
@@ -333,16 +404,23 @@ pub(crate) fn plan_qwen35_load<T: DFlash2Target>(
         check_unplanned_max_context(label, &config, max_context)?;
         return Ok(None);
     };
-    let lanes = LoadLanes {
+    let mut lanes = LoadLanes {
         config: &config,
         recurrent_state_bytes,
         pool,
         draft: draft.map(|draft| DraftTerms::of(&draft.config, draft.weight_bytes)),
         mtp: mtp_weights && draft.is_none(),
         mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
+        state_staging_bytes: 0,
     };
-    let plan = evaluate_qwen35_plan(label, &lanes, live, max_memory_bytes)?;
-    check_qwen35_max_context(label, &plan, max_context)?;
+    let plan = plan_with_disk(
+        label,
+        &mut lanes,
+        live,
+        max_memory_bytes,
+        max_context,
+        cache_disk,
+    )?;
     if let Some(line) = plan.max_memory_ignored() {
         tracing::info!("{label} {line}");
     }
@@ -444,6 +522,7 @@ pub async fn estimate_qwen35_context_window(
     let max_memory_bytes = max_memory_option(label, options.max_memory_bytes)?;
     let max_context =
         crate::nn::rope_scaling::max_context_option(label, options.max_context_tokens)?;
+    let cache_disk = options.disk_tier(label)?.cache_disk;
     let source = CheckpointSource::resolve(Path::new(&model_path), family).await?;
     let estimate = checkpoint_weight_bytes(&source).and_then(|weight_bytes| {
         estimate_qwen35_load(
@@ -457,6 +536,7 @@ pub async fn estimate_qwen35_context_window(
                 kv_format,
                 max_memory_bytes,
                 max_context,
+                cache_disk,
             },
         )
     });
@@ -653,6 +733,7 @@ pub(crate) struct EstimateInput<'a> {
     pub kv_format: Option<KvFormat>,
     pub max_memory_bytes: Option<u64>,
     pub max_context: Option<u32>,
+    pub cache_disk: CacheDisk,
 }
 
 /// The plan a load of `input` would make on the device now, with the
@@ -755,16 +836,23 @@ pub(crate) fn estimate_qwen35_load(
         .active_bytes
         .saturating_add(input.weight_bytes)
         .saturating_add(draft.map_or(0, |draft| draft.weight_bytes));
-    let lanes = LoadLanes {
+    let mut lanes = LoadLanes {
         config: &config,
         recurrent_state_bytes: config.recurrent_state_bytes(),
         pool,
         draft,
         mtp: mtp_head && draft.is_none(),
         mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
+        state_staging_bytes: 0,
     };
-    let plan = evaluate_qwen35_plan(label, &lanes, live, input.max_memory_bytes)?;
-    check_qwen35_max_context(label, &plan, input.max_context)?;
+    let plan = plan_with_disk(
+        label,
+        &mut lanes,
+        live,
+        input.max_memory_bytes,
+        input.max_context,
+        input.cache_disk,
+    )?;
     let window = turn_window(&plan);
     Ok(Some(Qwen35ContextEstimate {
         window_tokens: window.map_or(served, |window| window.maximum()).min(cap),

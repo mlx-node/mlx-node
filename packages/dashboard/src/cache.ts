@@ -12,8 +12,8 @@
  * Two canonical object shapes are counted and removed, matching
  * `object_file_name` in cold_cache.rs: KV blocks
  * (`<64-hex-sha256>.safetensors`) and state sidecars
- * (`<64-hex-sha256>.<group>.safetensors`, group ∈ `gdn_state`,
- * `sliding_window`). Both consume the same quota, so both are counted in
+ * (`<64-hex-sha256>.<group>.safetensors`, group ∈ `conv_state`,
+ * `sliding_window`, `dflash2_state`). Both consume the same quota, so both are counted in
  * `totalBytes` and both are removed by clear/evict — a sidecar left behind
  * would sit outside every quota view forever. They are reported separately so
  * "N blocks" stays a block count.
@@ -28,16 +28,40 @@ import { type Stats, lstatSync, readdirSync, statSync, statfsSync, unlinkSync } 
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-/** Canonical persisted KV-block filename (`ColdCacheKey::to_hex` + suffix). */
-const BLOCK_FILE = /^[0-9a-f]{64}\.safetensors$/;
+const OBJECT_SUFFIX = '.safetensors';
+const KEY_HEX_LEN = 64;
 
 /**
- * Canonical sidecar filename: the same 64-hex key with its `ColdGroup` label
- * as an infix. The label alternatives mirror `ColdGroup::SIDECAR_GROUPS`
- * exactly — `kv` is deliberately absent, since a KV object is only ever the
- * bare `BLOCK_FILE` form.
+ * Mirrors `ColdGroup::SIDECAR_GROUPS` exactly. `kv` is absent: a KV object is
+ * only ever the bare `<64-hex>.safetensors` form.
  */
-const SIDECAR_FILE = /^[0-9a-f]{64}\.(?:gdn_state|sliding_window)\.safetensors$/;
+const SIDECAR_GROUPS: ReadonlySet<string> = new Set(['conv_state', 'sliding_window', 'dflash2_state']);
+
+function isLowerHexKey(value: string): boolean {
+  if (value.length !== KEY_HEX_LEN) return false;
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    const digit = code >= 0x30 && code <= 0x39;
+    const lower = code >= 0x61 && code <= 0x66;
+    if (!digit && !lower) return false;
+  }
+  return true;
+}
+
+/**
+ * Inverse of `object_file_name` in cold_cache.rs: `<64-hex>.safetensors` is a
+ * KV block, `<64-hex>.<group>.safetensors` a state sidecar; anything else is
+ * foreign.
+ */
+function objectKind(name: string): 'block' | 'sidecar' | null {
+  if (!name.endsWith(OBJECT_SUFFIX)) return null;
+  const stem = name.slice(0, name.length - OBJECT_SUFFIX.length);
+  if (!isLowerHexKey(stem.slice(0, KEY_HEX_LEN))) return null;
+  const rest = stem.slice(KEY_HEX_LEN);
+  if (rest.length === 0) return 'block';
+  if (!rest.startsWith('.')) return null;
+  return SIDECAR_GROUPS.has(rest.slice(1)) ? 'sidecar' : null;
+}
 
 const GIB = 1024 ** 3;
 /** `MAX_DEFAULT_QUOTA` in cold_cache.rs. */
@@ -131,11 +155,7 @@ function listBlocks(root: string): BlockEntry[] {
   }
   const blocks: BlockEntry[] = [];
   for (const name of names) {
-    const kind: BlockEntry['kind'] | null = BLOCK_FILE.test(name)
-      ? 'block'
-      : SIDECAR_FILE.test(name)
-        ? 'sidecar'
-        : null;
+    const kind = objectKind(name);
     if (kind === null) continue;
     const path = join(root, name);
     let stat: Stats;

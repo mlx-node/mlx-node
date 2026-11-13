@@ -16,6 +16,9 @@ use crate::transformer::paged_kv_cache_adapter::SeqId;
 
 const MIB: f64 = (1u64 << 20) as f64;
 
+/// Splash `MemoryLedger::kCopyDemandSeconds`.
+const COPY_DEMAND_SECONDS: f64 = 60.0;
+
 /// Why an allocation is made: decides the host's rule and what `free` may
 /// take. Floor (load) is a host rule only and takes nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +146,8 @@ pub(crate) enum UnitKey {
     /// The pool's dead leaves, taken until one more extent is cut.
     DeadLeaves,
     Vision(u64),
+    /// A disk-only state's chain blocks still to reach the SSD tier.
+    StoreChain(EntryId),
 }
 
 /// One unit a source would give up. `bytes` and `pages` may over-count
@@ -156,6 +161,9 @@ pub(crate) struct Victim {
     pub bytes: u64,
     pub pages: u32,
     pub stage: Stage,
+    /// It frees memory only once a copy lands (Splash `Victim::later`): an
+    /// Immediate claim passes over it.
+    pub later: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -203,21 +211,40 @@ pub(crate) trait VictimSource {
     fn take(&mut self, query: &VictimQuery, victim: &Victim) -> Taken;
 }
 
-/// A model source's units in two runs (Splash `Cache::WalkCursor::Phase`): `ahead`
-/// (the empty extents, the stored checkpoints no turn uses, oldest first,
-/// then the dead leaves) goes before every other unit of the source;
-/// `merged` is in stamp order, into which the scheduler merges its idle
-/// owners.
+/// A model source's units in Splash's walk phases (`Cache::WalkCursor::Phase`,
+/// `Cache::peek` over `ReclaimPhase`): `ahead` (the empty extents, the
+/// stored checkpoints no turn uses, oldest first, then the dead leaves),
+/// `merged` in stamp order, into which the scheduler merges its idle
+/// owners, then `after` (image features, then the states turns use). The
+/// source lists them stably sorted by `(stage, later)`, so the phase order
+/// holds within each group: a write goes after every unit that frees now
+/// and after the image features.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct UnitRuns {
     pub(crate) ahead: Vec<Victim>,
     pub(crate) merged: Vec<Victim>,
+    pub(crate) after: Vec<Victim>,
 }
 
 impl UnitRuns {
     pub(crate) fn into_units(self) -> Vec<Victim> {
+        self.merge_into_units(Vec::new())
+    }
+
+    /// The units with `owners` (stamp order) merged into `merged` by
+    /// stamp, a state first on a tie.
+    pub(crate) fn merge_into_units(self, owners: Vec<Victim>) -> Vec<Victim> {
+        let mut merged: Vec<(Victim, bool)> = self
+            .merged
+            .into_iter()
+            .map(|unit| (unit, false))
+            .chain(owners.into_iter().map(|unit| (unit, true)))
+            .collect();
+        merged.sort_by_key(|(unit, owner)| (unit.stamp, *owner));
         let mut units = self.ahead;
-        units.extend(self.merged);
+        units.extend(merged.into_iter().map(|(unit, _)| unit));
+        units.extend(self.after);
+        units.sort_by_key(|unit| (unit.stage, unit.later));
         units
     }
 }
@@ -260,6 +287,17 @@ pub(crate) struct Returning {
     pub owed_bytes: u64,
     pub landing_pages: u32,
     pub owed_pages: u32,
+}
+
+impl Returning {
+    fn plus(self, other: Self) -> Self {
+        Self {
+            landing_bytes: self.landing_bytes.saturating_add(other.landing_bytes),
+            owed_bytes: self.owed_bytes.saturating_add(other.owed_bytes),
+            landing_pages: self.landing_pages.saturating_add(other.landing_pages),
+            owed_pages: self.owed_pages.saturating_add(other.owed_pages),
+        }
+    }
 }
 
 /// Splash `MemoryGovernor::chargedBytes` parts: `allocated` = MLX active +
@@ -423,6 +461,8 @@ pub(crate) struct Run {
     pub freed: FreeResult,
     /// A unit it reached waits for a transfer in flight.
     pub pending: bool,
+    /// It reached a unit that frees memory only once its copy lands.
+    pub uncopied: bool,
 }
 
 impl Default for Run {
@@ -437,6 +477,7 @@ impl Default for Run {
                 ..FreeResult::default()
             },
             pending: false,
+            uncopied: false,
         }
     }
 }
@@ -474,14 +515,24 @@ impl Order {
     }
 
     /// The head to count or take next, units that meet none of the lack
-    /// passed over; none above `ceiling`.
-    fn best(&mut self, lack: &Lacking, rights: &TakeRights, ceiling: Stage) -> Option<usize> {
+    /// passed over, and with `pass_later` the units that land later (which
+    /// set `uncopied`); none above `ceiling`.
+    fn best(
+        &mut self,
+        lack: &Lacking,
+        rights: &TakeRights,
+        ceiling: Stage,
+        pass_later: bool,
+        uncopied: &mut bool,
+    ) -> Option<usize> {
         let mut best: Option<(Stage, u64, usize)> = None;
         for (index, head) in self.heads.iter_mut().enumerate() {
             while let Some(victim) = head.units.get(head.at) {
-                if lack.meets(victim) && Self::admitted(rights, victim) {
+                let passed_later = pass_later && victim.later;
+                if lack.meets(victim) && Self::admitted(rights, victim) && !passed_later {
                     break;
                 }
+                *uncopied |= passed_later;
                 head.at += 1;
             }
             let Some(victim) = head.units.get(head.at) else {
@@ -518,15 +569,25 @@ impl Order {
 }
 
 /// Splash `MemoryLedger::bound`: the most the order gives, counted without
-/// taking, up to the unit that covers the lack.
+/// taking, up to the unit that covers the lack. A unit that lands later is
+/// reached (`uncopied`) and, for a claim that cannot wait for writes,
+/// passed over.
 fn bound(sources: &[&mut dyn VictimSource], query: &VictimQuery, lack: &Lacking) -> Run {
     let mut run = Run::default();
     if !query.rights.units {
         return run;
     }
     let mut order = Order::new(sources, query);
-    while let Some(head) = order.best(lack, &query.rights, Stage::LaneStart) {
+    let mut passed = false;
+    while let Some(head) = order.best(lack, &query.rights, Stage::LaneStart, false, &mut passed) {
         let victim = order.victim(head);
+        if victim.later {
+            run.uncopied = true;
+            if !query.rights.waits_for_writes {
+                order.pass(head);
+                continue;
+            }
+        }
         run.bytes = run.bytes.saturating_add(victim.bytes);
         run.pages = run.pages.saturating_add(victim.pages);
         if lack.covered(run.bytes, run.pages) {
@@ -546,12 +607,15 @@ fn take(sources: &mut [&mut dyn VictimSource], query: &VictimQuery, lack: &Lacki
     let mut order = Order::new(sources, query);
     let mut run = Run::default();
     let mut ceiling = Stage::LaneStart;
+    let pass_later = !query.rights.waits_for_writes;
     while !lack.none() && !lack.covered(run.bytes, run.pages) {
-        let Some(head) = order.best(lack, &query.rights, ceiling) else {
+        let Some(head) = order.best(lack, &query.rights, ceiling, pass_later, &mut run.uncopied)
+        else {
             break;
         };
         let unit = order.victim(head).clone();
         let taken = sources[head].take(query, &unit);
+        run.uncopied |= unit.later;
         if !taken.gave() {
             if taken.outcome == FreeOutcome::Pending && query.rights.waits_for_writes {
                 run.pending = true;
@@ -636,6 +700,9 @@ fn held_pages(need_pages: u32, held_bytes: u64, room: u64, page_bytes: u64) -> u
 pub(crate) struct Decision {
     pub result: FreeResult,
     pub run: Option<Run>,
+    /// The count or the take reached a unit that lands later (Splash
+    /// `MemoryLedger::free`: `most.uncopied`, `run->uncopied`).
+    pub uncopied: bool,
 }
 
 /// Splash `MemoryLedger::free` without the books: the free pool first;
@@ -707,6 +774,7 @@ pub(crate) fn decide(
     let in_place = need.host_refused && need.pages == 0 && need.bytes > 0;
 
     let mut run = None;
+    let mut uncopied = false;
     if !need.host_refused && lacking_bytes == 0 && (need.bytes > 0 || lacking_pages == 0) {
         result.outcome = FreeOutcome::Met;
     } else if waits(false) {
@@ -722,8 +790,10 @@ pub(crate) fn decide(
             in_place,
         };
         let most = bound(sources, &query, &lack);
+        uncopied = most.uncopied;
         if most.covered {
             let taken_run = take(sources, &query, &lack);
+            uncopied |= taken_run.uncopied;
             let mut taken = taken_run.freed;
             // The dropped buffers land in the MLX free pool, which charged
             // still counts, unless they meet the need in place.
@@ -766,7 +836,11 @@ pub(crate) fn decide(
             };
         }
     }
-    Decision { result, run }
+    Decision {
+        result,
+        run,
+        uncopied,
+    }
 }
 
 /// What `count_available` reads from the books.
@@ -840,10 +914,15 @@ pub(crate) struct Ledger {
     page_bytes: BTreeMap<u64, u64>,
     returning: Option<ReturningFn>,
     returning_for: Option<ReturningForFn>,
+    /// Each model's transfers in flight (Splash `Cache::returningOf`).
+    returning_models: Vec<(u64, ReturningFn)>,
     log: Option<LogFn>,
     now: f64,
     /// Splash `MemoryLedger::poolReleases`: pool extents taken.
     pool_releases: u64,
+    /// When a `free` last reached a unit that frees memory only once its
+    /// copy lands (Splash `uncopiedReachedSeconds_`).
+    uncopied_reached: Option<f64>,
 }
 
 impl Default for Ledger {
@@ -861,14 +940,24 @@ impl Ledger {
             page_bytes: BTreeMap::new(),
             returning: None,
             returning_for: None,
+            returning_models: Vec::new(),
             log: None,
             now: 0.0,
             pool_releases: 0,
+            uncopied_reached: None,
         }
     }
 
     pub(crate) fn pool_releases(&self) -> u64 {
         self.pool_releases
+    }
+
+    /// Splash `MemoryLedger::copyDemand`: a `free` reached a unit that frees
+    /// memory only once its copy lands within the last
+    /// [`COPY_DEMAND_SECONDS`].
+    pub(crate) fn copy_demand(&self, now: f64) -> bool {
+        self.uncopied_reached
+            .is_some_and(|reached| now - reached <= COPY_DEMAND_SECONDS)
     }
 
     /// The control clock waits are dated by.
@@ -904,9 +993,17 @@ impl Ledger {
         });
     }
 
+    /// What `model`'s transfers in flight free when they land, pulled at
+    /// each decision.
+    pub(crate) fn add_returning(&mut self, model: u64, returning: ReturningFn) {
+        self.returning_models.retain(|(owner, _)| *owner != model);
+        self.returning_models.push((model, returning));
+    }
+
     /// A model's accounts and page size leave the books.
     pub(crate) fn remove_model(&mut self, model: u64) {
         self.accounts.retain(|account| account.model != model);
+        self.returning_models.retain(|(owner, _)| *owner != model);
         self.page_bytes.remove(&model);
     }
 
@@ -1072,9 +1169,12 @@ impl Ledger {
     }
 
     pub(crate) fn returning(&self) -> Returning {
-        self.returning
-            .as_ref()
-            .map_or_else(Returning::default, |all| all())
+        self.returning_models.iter().fold(
+            self.returning
+                .as_ref()
+                .map_or_else(Returning::default, |all| all()),
+            |sum, (_, returning)| sum.plus(returning()),
+        )
     }
 
     fn returning_of(&self, request_id: u64) -> Returning {
@@ -1118,6 +1218,9 @@ impl Ledger {
         let mut result = decision.result;
         let need = inputs.need;
         let now = self.now;
+        if decision.uncopied {
+            self.uncopied_reached = Some(now);
+        }
         if let Some(run) = &decision.run {
             let released = run
                 .took

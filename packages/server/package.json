@@ -49,6 +49,16 @@
       "types": "./dist/host/max-context.d.ts",
       "import": "./dist/host/max-context.js"
     },
+    "./host/persist-cache": {
+      "@mlx-node/source": "./src/host/persist-cache.ts",
+      "types": "./dist/host/persist-cache.d.ts",
+      "import": "./dist/host/persist-cache.js"
+    },
+    "./host/cache-disk": {
+      "@mlx-node/source": "./src/host/cache-disk.ts",
+      "types": "./dist/host/cache-disk.d.ts",
+      "import": "./dist/host/cache-disk.js"
+    },
     "./host/max-memory": {
       "@mlx-node/source": "./src/host/max-memory.ts",
       "types": "./dist/host/max-memory.d.ts",
@@ -58,6 +68,11 @@
       "@mlx-node/source": "./src/host/paths.ts",
       "types": "./dist/host/paths.d.ts",
       "import": "./dist/host/paths.js"
+    },
+    "./supervision": {
+      "@mlx-node/source": "./src/supervision.ts",
+      "types": "./dist/supervision.d.ts",
+      "import": "./dist/supervision.js"
     },
     "./host/desktop-endpoint": {
       "@mlx-node/source": "./src/host/desktop-endpoint.ts",

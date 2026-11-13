@@ -28,6 +28,13 @@ describe('cold-tier restore allowlist', () => {
     expect([...COLD_TIER_RESTORE_FAMILIES].sort()).toEqual([...coldRestoreFamilies()].sort());
   });
 
+  // Splash keeps no per-turn KV on disk for these: their tier holds DFlash2
+  // states, so a KV chain alone must never back a restore.
+  it('leaves the qwen3_5 families out', () => {
+    expect(COLD_TIER_RESTORE_FAMILIES.has('qwen3_5')).toBe(false);
+    expect(COLD_TIER_RESTORE_FAMILIES.has('qwen3_5_moe')).toBe(false);
+  });
+
   // Identity, not equality: a re-export that ever became a second `new Set([…])`
   // would satisfy a deep compare on the day it was written and drift the day
   // after. The catalog subpath is what the dashboard and the CLI help text

@@ -54,14 +54,6 @@ pub struct Qwen3_5Config {
     #[napi(ts_type = "number | undefined")]
     pub paged_block_size: Option<u32>,
 
-    /// Persist the out-of-pool GDN recurrent state (and the paged KV blocks it
-    /// gates) to the SSD cold tier so warm prefixes survive process restarts.
-    /// Off unless explicitly enabled. See `crate::models::qwen3_5::gdn_sidecar`
-    /// and `crate::cold_tier::resolve_persist_cold`.
-    #[serde(default)]
-    #[napi(ts_type = "boolean | undefined")]
-    pub persist_paged_cache: Option<bool>,
-
     /// Number of MTP (Multi-Token Prediction) head layers shipped with the
     /// checkpoint. Populated from `mtp_num_hidden_layers` /
     /// `num_nextn_predict_layers` in `config.json`. `0` means the
@@ -286,7 +278,6 @@ mod tests {
             rope_theta: 10_000.0,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            persist_paged_cache: None,
             n_mtp_layers: 0,
         };
         // Two linear layers. conv=[3, (1*4)*2 + (2*3)=14] bf16, recurrent=[2,3,4] f32.

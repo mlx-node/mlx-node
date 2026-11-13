@@ -1,76 +1,21 @@
-//! Qwen3.5 (dense + MoE) GDN recurrent state as a cold-tier [`ColdSidecar`].
+//! Qwen3.5 (dense + MoE) GDN recurrent state as bytes: the GDN cell span of
+//! a DFlash2 state object (Splash `stateSpans`), and the `gdn` geometry its
+//! namespace and layout name.
 //!
-//! # Why qwen3_5 needs one at all
-//!
-//! Qwen3.5 is a HYBRID: `Qwen35Inner` sizes its paged pool over the
-//! FULL-ATTENTION layers only (`full_attention_layer_count`, the `num_layers`
-//! it feeds into `PagedAttentionConfig`). The interleaved GDN (gated delta-net)
-//! layers keep their recurrent state in a per-layer
-//! [`Qwen3_5LayerCache::Linear`] (`ArraysCache` with two slots: conv state and
-//! recurrent state) that the pool never sees. A restored paged K/V prefix
-//! therefore reconstructs only part of the model state; the missing half is
-//! today RECOMPUTED by `run_gdn_only_prefill_materialized`, an O(prefix) replay
-//! over the reused prefix. This sidecar persists it instead.
-//!
-//! # Why a recurrent state is valid ONLY at its exact prefix length
-//!
-//! A GDN recurrent state is a running summary of every preceding token (vLLM's
-//! `MambaSpec`), so — unlike a sliding window — it is meaningful ONLY at the
-//! exact block-aligned prefix length it was produced at. There is no windowed
-//! truncation and no partial-block fixup: restore reconciles DOWN to a boundary
-//! a validated sidecar actually backs, or to zero, and recomputes. That is the
-//! fail-closed direction (vLLM `MambaManager.find_longest_cache_hit`:
-//! full-block-aligned reuse only).
-//!
-//! # The payload — one concatenated blob per GDN layer
-//!
-//! [`ColdSidecarLayout`] carries a SINGLE `bytes_per_tensor` and
-//! [`mlx_paged_attn::ColdSidecar::validate`] rejects any sidecar whose tensors
-//! are not all that length. The two GDN tensors per layer have DIFFERENT sizes
-//! (`conv_state` is `(K-1)*conv_dim` bf16; `recurrent_state` is `Hv*Dv*Dk` f32,
-//! ~50x larger on the 27B). Padding conv up to rec size would nearly double the
-//! sidecar, and two `tensors_per_layer` is impossible. So each GDN layer stores
-//! ONE blob = `conv_state` bytes followed by `recurrent_state` bytes, with
-//! `tensors_per_layer = 1`. The layout's `dims` carries both shapes
-//! (`[K-1, conv_dim, Hv, Dv, Dk]`) so the decoder knows the exact split offset
-//! and a geometry drift is a layout mismatch (miss), not a reinterpretation.
-//!
-//! # Why the chain key, not a token-local key
-//!
-//! A GDN layer's recurrent state at position `i` is a function of the hidden
-//! stream that has already passed through the interleaved FULL-attention layers
-//! (which attend to the whole prefix), so it is NOT a function of any bounded
-//! suffix. The parent-linked chain from block 0 that
-//! `ColdTierWalk::deepest_backed_boundary` builds — same per-block `extra_keys`
-//! and `cache_salt` as the K/V chain, under the `GdnState` domain tag — is the
-//! right identity.
-//!
-//! # Bit-exactness
-//!
-//! No f32 round trip: 16-bit state goes out via `to_uint16_native` and back via
-//! `from_bfloat16` / `from_float16`; f32 state via `to_float32` / `from_float32`.
-//! The conv history's element type is the GDN activation dtype (the
-//! embedding's output dtype), fixed at load (`build_cold_tier_context`); the
-//! pool's K/V format never labels it (Splash
-//! `GdnStateLayout::convolutionLayerBytes` never follows the KV format). The
-//! recurrent state is ALWAYS f32 ([`RECURRENT_DTYPE`], the carried precision
-//! of the GDN kernels). Capture re-checks each array's
-//! actual dtype and SKIPS (fail closed) on any mismatch rather than mislabel.
+//! Each GDN layer writes ONE blob, `conv_state` bytes then `recurrent_state`
+//! bytes, in layer order. No f32 round trip: 16-bit state goes out via
+//! `to_uint16_native` and back via `from_bfloat16` / `from_float16`; the f32
+//! recurrent state via `to_float32` / `from_float32`. The conv history's
+//! element type is the GDN activation dtype (the embedding's output dtype); the
+//! recurrent state is ALWAYS f32 ([`RECURRENT_DTYPE`]). Encoding re-checks each
+//! array's dtype and shape and refuses (fail closed) on any mismatch rather
+//! than mislabel.
 
-use std::collections::VecDeque;
-
-use mlx_paged_attn::{ColdGroup, ColdSidecarLayout, ColdSidecarPolicy};
 use napi::bindgen_prelude::*;
 
 use crate::array::{DType, MxArray};
-use crate::engine;
-use crate::inference_trace::{enabled as inference_trace_enabled, write as write_inference_trace};
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::config::Qwen3_5Config;
-use super::gdn_checkpoint_store::{
-    GdnCheckpointLineage, GdnSidecarBoundary, select_gdn_sidecar_boundary,
-};
 use super::layer_cache::Qwen3_5LayerCache;
 
 /// One blob per GDN layer (conv ++ recurrent), so exactly one tensor per layer.
@@ -122,8 +67,7 @@ fn element_size(dtype: DType) -> usize {
 }
 
 /// Geometry of qwen3_5's out-of-pool GDN state, derived once from the config +
-/// the activation dtype. Every field is boundary-invariant, which is what
-/// lets it back a [`ColdSidecarPolicy`].
+/// the activation dtype.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GdnSidecarGeometry {
     /// Count of GDN (linear-attention) layers = `gdn_layers(config).len()`.
@@ -166,25 +110,20 @@ impl GdnSidecarGeometry {
             .checked_mul(element_size(self.dtype()?))
     }
 
+    /// Bytes of the whole cell: every GDN layer's blob (Splash
+    /// `GdnStateLayout`; 153,944,064 on the 27B).
+    pub(crate) fn cell_bytes(&self) -> Option<u64> {
+        u64::try_from(self.bytes_per_tensor()?)
+            .ok()?
+            .checked_mul(u64::from(self.gdn_layers))
+    }
+
     /// Byte length of the single per-layer blob = conv bytes ++ recurrent bytes.
     fn bytes_per_tensor(&self) -> Option<usize> {
         self.conv_bytes()?.checked_add(
             self.recurrent_elements()?
                 .checked_mul(element_size(RECURRENT_DTYPE))?,
         )
-    }
-
-    /// `[K-1, conv_dim, Hv, Dv, Dk]` — five entries (batch dropped; always 1),
-    /// well within `MAX_SIDECAR_DIMS = 8`. Gives the decoder the split offset
-    /// and both concrete shapes.
-    fn dims(&self) -> Vec<u32> {
-        vec![
-            self.conv_rows,
-            self.conv_dim,
-            self.num_v_heads,
-            self.v_head_dim,
-            self.k_head_dim,
-        ]
     }
 
     fn conv_shape(&self) -> [i64; 3] {
@@ -197,6 +136,19 @@ impl GdnSidecarGeometry {
             self.num_v_heads as i64,
             self.v_head_dim as i64,
             self.k_head_dim as i64,
+        ]
+    }
+
+    /// The namespace's `gdn` line: layers, conv history, conv channels, value
+    /// heads, value and key head dims (Splash `persistentCacheNamespace`).
+    pub(crate) fn namespace_gdn(&self) -> [u32; 6] {
+        [
+            self.gdn_layers,
+            self.conv_rows,
+            self.conv_dim,
+            self.num_v_heads,
+            self.v_head_dim,
+            self.k_head_dim,
         ]
     }
 
@@ -263,67 +215,38 @@ pub(crate) fn geometry(config: &Qwen3_5Config, activation: DType) -> Option<GdnS
     Some(geo)
 }
 
-/// The layout a sidecar anchored at `boundary_tokens` must have. `boundary` is
-/// stamped by [`ColdSidecarPolicy::expected_at`] on the read side; the capture
-/// side builds the same value here so the two compare equal.
-pub(crate) fn layout_at(geo: &GdnSidecarGeometry, boundary_tokens: u32) -> ColdSidecarLayout {
-    ColdSidecarLayout {
-        group: ColdGroup::GdnState,
-        boundary_tokens,
-        num_layers: geo.gdn_layers,
-        tensors_per_layer: TENSORS_PER_LAYER,
-        dtype: geo.dtype.clone(),
-        dims: geo.dims(),
-        // `bytes_per_tensor` is checked non-`None` by `geometry`.
-        bytes_per_tensor: geo.bytes_per_tensor().unwrap_or(0),
-    }
-}
-
-/// Build the reconcile-down policy for this config + activation dtype, or
-/// `None` when there is no GDN state to back (see [`geometry`]).
-pub(crate) fn policy(config: &Qwen3_5Config, activation: DType) -> Option<ColdSidecarPolicy> {
-    let geo = geometry(config, activation)?;
-    ColdSidecarPolicy::new(layout_at(&geo, 0)).ok()
-}
-
-/// Serialize one GDN array (`conv_state` or `recurrent_state`) into `blob`.
-///
-/// Returns `Ok(false)` — a graceful skip, never an error — when the array does
-/// not match the sidecar's fixed geometry (wrong dtype, wrong shape, wrong
-/// element count). Skipping is the fail-closed direction: writing bytes that do
-/// not match the label would restore wrong state instead of missing.
+/// Writes one GDN array (`conv_state` or `recurrent_state`) into `out`, whose
+/// length is the array's bytes. `Ok(false)` when the array does not match the
+/// geometry (dtype, shape, element count): writing bytes that do not match the
+/// label would restore wrong state instead of missing.
 fn encode_array(
     array: &MxArray,
     expected_dtype: DType,
     expected_shape: &[i64],
-    expected_elements: usize,
-    blob: &mut Vec<u8>,
+    out: &mut [u8],
 ) -> Result<bool> {
-    // FAIL CLOSED on dtype: reinterpreting f32 storage as bf16 (or vice versa)
-    // would be silent corruption, so refuse to capture at all.
-    if array.dtype()? != expected_dtype {
-        return Ok(false);
-    }
-    if array.shape()?.as_ref() != expected_shape {
+    if array.dtype()? != expected_dtype || array.shape()?.as_ref() != expected_shape {
         return Ok(false);
     }
     match expected_dtype {
         DType::BFloat16 | DType::Float16 => {
             let raw = array.to_uint16_native()?;
-            if raw.len() != expected_elements {
+            let (chunks, rest) = out.as_chunks_mut::<{ std::mem::size_of::<u16>() }>();
+            if raw.len() != chunks.len() || !rest.is_empty() {
                 return Ok(false);
             }
-            for value in raw {
-                blob.extend_from_slice(&value.to_le_bytes());
+            for (chunk, value) in chunks.iter_mut().zip(raw.iter()) {
+                *chunk = value.to_le_bytes();
             }
         }
         DType::Float32 => {
-            let raw = array.to_float32()?.to_vec();
-            if raw.len() != expected_elements {
+            let raw = array.to_float32()?;
+            let (chunks, rest) = out.as_chunks_mut::<{ std::mem::size_of::<f32>() }>();
+            if raw.len() != chunks.len() || !rest.is_empty() {
                 return Ok(false);
             }
-            for value in raw {
-                blob.extend_from_slice(&value.to_le_bytes());
+            for (chunk, value) in chunks.iter_mut().zip(raw.iter()) {
+                *chunk = value.to_le_bytes();
             }
         }
         _ => return Ok(false),
@@ -331,330 +254,53 @@ fn encode_array(
     Ok(true)
 }
 
-/// Fires at most once per process: a GDN cold sidecar that can never be written
-/// because the state's dtype does not match the geometry the pool fixed.
-static DTYPE_MISMATCH_WARNED: std::sync::Once = std::sync::Once::new();
-
-/// Report a permanently-unwritable sidecar exactly once.
+/// Writes the materialized GDN caches into `cell`, layer-major: per GDN layer
+/// its conv bytes, then its recurrent bytes. `cell` must be exactly
+/// [`GdnSidecarGeometry::cell_bytes`] long. `Ok(false)` when the state does
+/// not match the geometry: a missing slot, a wrong dtype, or a shape that is
+/// not `[1, K-1, conv_dim]` / `[1, Hv, Dv, Dk]`.
 ///
-/// [`encode_array`] fails closed on a dtype mismatch, which is right — it must
-/// never reinterpret f32 storage as bf16. But the resulting `Ok(None)` is
-/// indistinguishable from the benign structural skips around it, so a
-/// misconfigured tier degrades into silence. A `dtype()` probe that itself
-/// errors is left to the encode path to surface.
-fn warn_once_on_dtype_mismatch(conv: &MxArray, rec: &MxArray, expected: DType) {
-    let (Ok(conv_dtype), Ok(rec_dtype)) = (conv.dtype(), rec.dtype()) else {
-        return;
-    };
-    if conv_dtype == expected && rec_dtype == RECURRENT_DTYPE {
-        return;
-    }
-    DTYPE_MISMATCH_WARNED.call_once(|| {
-        tracing::warn!(
-            expected_conv = ?expected,
-            expected_recurrent = ?RECURRENT_DTYPE,
-            conv_state = ?conv_dtype,
-            recurrent_state = ?rec_dtype,
-            "qwen3_5 GDN cold sidecar can never be captured: the paged pool's cache dtype fixes \
-             the conv-history element type (the recurrent state is always f32), but the GDN \
-             state carries a different dtype. The cold tier will keep persisting K/V blocks it \
-             can never restore from (hits stay at 0). Align the paged pool cache dtype with the \
-             GDN activation dtype, or disable persistPagedCache."
-        );
-    });
-}
-
-/// Serialize the materialized GDN caches for one boundary into the layer-major
-/// single-blob-per-layer payload.
-///
-/// `caches` is the full-length (`num_layers`) layer-cache vector; only the GDN
-/// (linear) layers are read, in `gdn_layers` order. Returns `Ok(None)` — a
-/// graceful skip — when the state does not match the sidecar's fixed geometry:
-/// a missing slot, a wrong dtype, or a shape that is not
-/// `[1, K-1, conv_dim]` / `[1, Hv, Dv, Dk]`.
-///
-/// The caller must have materialized the caches first
-/// (`materialize_linear_layer_caches` = `eval_arrays`).
-pub(crate) fn encode_tensors(
+/// The caller must have materialized the caches first.
+#[allow(dead_code)]
+pub(crate) fn encode_into(
     config: &Qwen3_5Config,
     geo: &GdnSidecarGeometry,
     caches: &[Qwen3_5LayerCache],
-    _boundary_tokens: u32,
-) -> Result<Option<Vec<Vec<u8>>>> {
+    cell: &mut [u8],
+) -> Result<bool> {
     let layers = gdn_layers(config);
     if layers.len() != geo.gdn_layers as usize || caches.len() != config.num_layers.max(0) as usize
     {
-        return Ok(None);
+        return Ok(false);
     }
-    let Some(dtype) = geo.dtype() else {
-        return Ok(None);
-    };
-    let (Some(conv_elements), Some(rec_elements), Some(bytes_per_tensor)) = (
-        geo.conv_elements(),
-        geo.recurrent_elements(),
+    let (Some(dtype), Some(conv_bytes), Some(bytes_per_tensor), Some(cell_bytes)) = (
+        geo.dtype(),
+        geo.conv_bytes(),
         geo.bytes_per_tensor(),
+        geo.cell_bytes(),
     ) else {
-        return Ok(None);
+        return Ok(false);
     };
+    if cell.len() as u64 != cell_bytes {
+        return Ok(false);
+    }
     let conv_shape = geo.conv_shape();
     let rec_shape = geo.recurrent_shape();
-
-    let mut tensors = Vec::with_capacity(layers.len());
-    for &layer_idx in &layers {
+    for (&layer_idx, blob) in layers.iter().zip(cell.chunks_exact_mut(bytes_per_tensor)) {
         let Some(Qwen3_5LayerCache::Linear(arrays)) = caches.get(layer_idx) else {
-            return Ok(None);
+            return Ok(false);
         };
         let (Some(conv), Some(rec)) = (arrays.get(0), arrays.get(1)) else {
-            return Ok(None);
+            return Ok(false);
         };
-        // A dtype mismatch here is not a transient skip, it is a permanent
-        // misconfiguration: the sidecar geometry fixes its element type from
-        // the POOL's cache dtype at load, while these arrays carry the GDN
-        // ACTIVATION dtype. If those disagree the skip below repeats on every
-        // turn forever, so the tier keeps writing K/V blocks it can never
-        // restore from — quota and I/O burned, hits pinned at zero, outwardly
-        // indistinguishable from a cold cache. Say it once, loudly.
-        warn_once_on_dtype_mismatch(conv, rec, dtype);
-        let mut blob = Vec::with_capacity(bytes_per_tensor);
-        if !encode_array(conv, dtype, &conv_shape, conv_elements, &mut blob)? {
-            return Ok(None);
+        let (conv_out, rec_out) = blob.split_at_mut(conv_bytes);
+        if !encode_array(conv, dtype, &conv_shape, conv_out)?
+            || !encode_array(rec, RECURRENT_DTYPE, &rec_shape, rec_out)?
+        {
+            return Ok(false);
         }
-        if !encode_array(rec, RECURRENT_DTYPE, &rec_shape, rec_elements, &mut blob)? {
-            return Ok(None);
-        }
-        if blob.len() != bytes_per_tensor {
-            return Ok(None);
-        }
-        tensors.push(blob);
     }
-    Ok(Some(tensors))
-}
-
-/// Persist this turn's GDN recurrent state to the SSD cold tier, so a later
-/// process can resume from the restored paged K/V prefix WITHOUT replaying
-/// GDN over it (`run_gdn_only_prefill_materialized`).
-///
-/// Best-effort and infallible by construction — every failure path is a
-/// silent skip. A missing sidecar is never a correctness problem: the
-/// restore walk reconciles the candidate prefix down past that boundary and
-/// the state is recomputed exactly as it is today.
-///
-/// A GDN recurrent state is valid ONLY at the exact prefix length it was
-/// produced at (vLLM `MambaSpec`), so the boundary is not chosen freely: it
-/// is the DEEPEST already-materialized in-memory GDN checkpoint (a rung of
-/// the `gdn_prefill_checkpoint_boundaries` ladder a prior prefill published)
-/// whose block-aligned prefix the persisted K/V chain ALSO reaches
-/// (`cold_captured_blocks`). A sidecar past the chain's frontier could never
-/// be selected on restore, so writing one would only burn quota.
-///
-/// At most ONE sidecar per turn; the writer queue is bounded. Media turns are
-/// skipped: the GDN VLM exactness gate is not modeled here, so refusing is the
-/// fail-closed answer.
-///
-/// `image_token_positions` is the turn's OWN media map, passed in rather
-/// than read off the model: the VLM cores clear
-/// `cached_paged_image_token_positions` before their prefill and reassign it
-/// only after finalization returns, so a model-field read guard would see an
-/// empty vec on exactly the media turns it exists to refuse.
-///
-/// Family deltas are parameters: `family` labels the MLX_TRACE lines;
-/// `geometry_config` is the dense-shaped config the sidecar geometry and
-/// codec read (MoE passes `to_dense_config()`, for BOTH the `geometry` and
-/// `encode_tensors` calls) while `caches_ready` closes over the family's own
-/// config; `log_enqueue_failure(boundary, error)` (`None` = writer queue
-/// full, `Some` = enqueue error) carries the two per-family
-/// `tracing::debug!` lines, which cannot move here because a `tracing`
-/// target must be a literal.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn capture_gdn_cold_sidecar<T: GdnCheckpointLineage>(
-    family: &'static str,
-    adapter: Option<&PagedKVCacheAdapter>,
-    checkpoints: &VecDeque<T>,
-    owner_id: &str,
-    geometry_config: &Qwen3_5Config,
-    image_token_positions: &[(u32, u64)],
-    cache_salt: u64,
-    caches_ready: impl FnMut(&T) -> bool,
-    checkpoint_caches: impl Fn(&T) -> &[Qwen3_5LayerCache],
-    log_enqueue_failure: impl Fn(u32, Option<&str>),
-) {
-    crate::cold_tier::cold_sidecar_counters().record_capture_reached();
-    let Some(adapter) = adapter else {
-        return;
-    };
-    let Some(cold) = adapter.cold_tier() else {
-        return;
-    };
-    let Some(policy) = cold.sidecar_policy.as_ref() else {
-        return;
-    };
-    if policy.group() != mlx_paged_attn::ColdGroup::GdnState {
-        return;
-    }
-    // Text-only: media turns are refused (see the fn doc).
-    if !image_token_positions.is_empty() {
-        return;
-    }
-    let Some(geometry) =
-        dtype_from_label(&policy.layout().dtype).and_then(|dtype| geometry(geometry_config, dtype))
-    else {
-        return;
-    };
-    let block_size = adapter.block_size();
-    // The K/V capture walk that just ran spends its budget waiting for
-    // writer-queue slots, so it hands this sidecar a queue it may well have
-    // filled microseconds ago. A non-blocking offer here loses that race,
-    // and a dropped sidecar is strictly worse than a dropped block: the
-    // restore reconciles down to the deepest boundary a VALIDATED sidecar
-    // backs, so losing it makes the turn's entire persisted K/V chain
-    // unusable. Wait out the same budget the walk did.
-    let sidecar_wait = adapter.cold_capture_budget().max_walk;
-    if block_size == 0 {
-        return;
-    }
-    let request_tokens = adapter.request_tokens();
-    // Whole blocks of this request the persisted K/V chain actually covers.
-    let full_blocks = request_tokens.len() / block_size as usize;
-    let chain_blocks = (adapter.cold_captured_blocks() as usize).min(full_blocks);
-    if chain_blocks == 0 {
-        // A different diagnosis from the boundary miss below: the persisted
-        // chain covers no whole block of this request, so no checkpoint at
-        // any depth could have been used. This is the arm a genuinely cold
-        // process hits on its first turns, while the bounded writer queue is
-        // still ratcheting the chain forward.
-        crate::cold_tier::cold_sidecar_counters().record_chain_empty();
-        if inference_trace_enabled() {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] {} gdn_cold_sidecar_capture_skipped reason=persisted_chain_covers_no_whole_block cold_captured_blocks={} full_blocks={} block_size={} prompt_len={}",
-                family,
-                adapter.cold_captured_blocks(),
-                full_blocks,
-                block_size,
-                request_tokens.len()
-            ));
-        }
-        return;
-    }
-    let ceiling_tokens =
-        u32::try_from((chain_blocks as u64).saturating_mul(block_size as u64)).unwrap_or(u32::MAX);
-    let extra_keys_per_block =
-        engine::build_paged_extra_keys(request_tokens.len(), block_size, image_token_positions);
-
-    // Deepest same-owner in-memory GDN checkpoint whose block-hash chain
-    // matches this request and whose prefix the K/V chain reaches. The
-    // sidecar uses the turn's exact cache security domain so capture and
-    // restore derive the same parent-linked chain.
-    let (idx, boundary) = match select_gdn_sidecar_boundary(
-        checkpoints,
-        owner_id,
-        request_tokens,
-        ceiling_tokens,
-        block_size,
-        &extra_keys_per_block,
-        cache_salt,
-        caches_ready,
-    ) {
-        GdnSidecarBoundary::Selected { index, boundary } => (index, boundary),
-        GdnSidecarBoundary::Missed(miss) => {
-            // Nothing is written and the restore walk will later reconcile
-            // the whole candidate prefix away. Count and trace it, otherwise
-            // a session that never persists recurrent state is
-            // indistinguishable from one that needs none.
-            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
-            if inference_trace_enabled() {
-                let reason = match miss.deepest_retained {
-                    Some(deepest) if deepest > ceiling_tokens => {
-                        "deepest_checkpoint_past_chain_reach"
-                    }
-                    _ => "no_checkpoint_on_this_lineage_at_or_below_chain_reach",
-                };
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] {} gdn_cold_sidecar_capture_skipped reason={} ceiling_tokens={} chain_blocks={} cold_captured_blocks={} block_size={} prompt_len={} deepest_retained_boundary={} retained_for_owner={} retained_total={}",
-                    family,
-                    reason,
-                    ceiling_tokens,
-                    chain_blocks,
-                    adapter.cold_captured_blocks(),
-                    block_size,
-                    request_tokens.len(),
-                    miss.deepest_retained.unwrap_or(0),
-                    miss.retained_for_owner,
-                    miss.retained_total
-                ));
-            }
-            return;
-        }
-    };
-    let checkpoint = &checkpoints[idx];
-
-    // Derive the GdnState chain key for blocks `0..boundary/block_size` — the
-    // KV chain recomputed under the `GdnState` domain tag (vLLM's
-    // `BlockHashWithGroupId`). `ColdTierWalk::deepest_backed_boundary`
-    // derives the identical chain on restore. Built BEFORE the payload so the
-    // `contains_in` dedup below can skip the whole encode (a device->host
-    // readback of tens of MiB) when the chain is already on disk.
-    let blocks = boundary as usize / block_size as usize;
-    let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
-    for index in 0..blocks {
-        let (Some(extra_keys), Some(tokens)) = (
-            extra_keys_per_block.get(index),
-            request_tokens.get(index * block_size as usize..(index + 1) * block_size as usize),
-        ) else {
-            return;
-        };
-        parent = Some(mlx_paged_attn::ColdCacheKey::chain(
-            mlx_paged_attn::ColdGroup::GdnState,
-            cold.fingerprint,
-            parent,
-            tokens,
-            extra_keys,
-            cache_salt,
-            index,
-        ));
-    }
-    let Some(key) = parent else {
-        return;
-    };
-    // Already persisted for this exact chain: nothing to do. `contains_in` is
-    // explicitly side-effect free (no hit/miss accounting), so this arm must
-    // do its own — an unrecorded exit here reads downstream as `enqueued=0`,
-    // which is also what a collapsed checkpoint ladder produces.
-    if cold
-        .manager
-        .contains_in(&key, mlx_paged_attn::ColdGroup::GdnState)
-    {
-        crate::cold_tier::cold_sidecar_counters().record_already_persisted();
-        return;
-    }
-
-    let Ok(Some(tensors)) = encode_tensors(
-        geometry_config,
-        &geometry,
-        checkpoint_caches(checkpoint),
-        boundary,
-    ) else {
-        return;
-    };
-    let sidecar = mlx_paged_attn::ColdSidecar {
-        key,
-        fingerprint: cold.fingerprint,
-        layout: layout_at(&geometry, boundary),
-        tensors,
-    };
-    match cold
-        .manager
-        .enqueue_sidecar_before(sidecar, std::time::Instant::now() + sidecar_wait)
-    {
-        Ok(true) => crate::cold_tier::cold_sidecar_counters().record_enqueued(),
-        // The bounded writer queue stayed full for the whole capture
-        // budget. Nothing is written and nothing failed, so this turn is
-        // otherwise indistinguishable from a successful capture.
-        Ok(false) => {
-            crate::cold_tier::cold_sidecar_counters().record_queue_drop();
-            log_enqueue_failure(boundary, None);
-        }
-        Err(error) => log_enqueue_failure(boundary, Some(&error)),
-    }
+    Ok(true)
 }
 
 /// Rebuild one GDN array from a byte slice of the layer blob.
@@ -676,9 +322,6 @@ fn decode_array(
                 .iter()
                 .map(|pair| u16::from_le_bytes(*pair))
                 .collect();
-            if raw.len() != elements {
-                return Ok(None);
-            }
             if dtype == DType::BFloat16 {
                 MxArray::from_bfloat16(&raw, shape)?
             } else {
@@ -692,9 +335,6 @@ fn decode_array(
                 .iter()
                 .map(|quad| f32::from_le_bytes(*quad))
                 .collect();
-            if raw.len() != elements {
-                return Ok(None);
-            }
             MxArray::from_float32(&raw, shape)?
         }
         _ => return Ok(None),
@@ -702,48 +342,46 @@ fn decode_array(
     Ok(Some(array))
 }
 
-/// Rebuild the full-length layer-cache vector from a validated sidecar payload,
-/// ready to assign to `Qwen35Inner::caches`.
-///
-/// `tensors` must already have passed [`mlx_paged_attn::ColdSidecar`] validation
-/// (tensor count and per-tensor byte length pinned by the layout); this
-/// re-checks anyway so a contract slip is a graceful `None` rather than a panic
-/// or a wrong-shaped array. Full-attention layers become fresh
+/// Rebuild the full-length layer-cache vector from a GDN cell written by
+/// [`encode_into`]. Full-attention layers become fresh
 /// [`Qwen3_5LayerCache::FullAttention`] shells (their K/V lives in the paged
-/// pool), exactly like `fresh_dense_layer_caches` produces.
+/// pool). `None` when `cell` is not this geometry's cell.
+#[allow(dead_code)]
 pub(crate) fn decode_caches(
     config: &Qwen3_5Config,
     geo: &GdnSidecarGeometry,
-    tensors: &[Vec<u8>],
-    _boundary_tokens: u32,
+    cell: &[u8],
 ) -> Result<Option<Vec<Qwen3_5LayerCache>>> {
     let layers = gdn_layers(config);
-    if layers.len() != geo.gdn_layers as usize || tensors.len() != layers.len() {
+    if layers.len() != geo.gdn_layers as usize {
         return Ok(None);
     }
-    let Some(dtype) = geo.dtype() else {
-        return Ok(None);
-    };
-    let (Some(conv_elements), Some(rec_elements), Some(conv_bytes), Some(bytes_per_tensor)) = (
+    let (
+        Some(dtype),
+        Some(conv_elements),
+        Some(rec_elements),
+        Some(conv_bytes),
+        Some(bytes_per_tensor),
+        Some(cell_bytes),
+    ) = (
+        geo.dtype(),
         geo.conv_elements(),
         geo.recurrent_elements(),
         geo.conv_bytes(),
         geo.bytes_per_tensor(),
-    ) else {
+        geo.cell_bytes(),
+    )
+    else {
         return Ok(None);
     };
+    if cell.len() as u64 != cell_bytes {
+        return Ok(None);
+    }
     let conv_shape = geo.conv_shape();
     let rec_shape = geo.recurrent_shape();
 
     let mut caches: Vec<Qwen3_5LayerCache> = Qwen3_5LayerCache::fresh_layer_caches(config);
-
-    for (ordinal, &layer_idx) in layers.iter().enumerate() {
-        let Some(blob) = tensors.get(ordinal) else {
-            return Ok(None);
-        };
-        if blob.len() != bytes_per_tensor {
-            return Ok(None);
-        }
+    for (&layer_idx, blob) in layers.iter().zip(cell.chunks_exact(bytes_per_tensor)) {
         let (conv_slice, rec_slice) = blob.split_at(conv_bytes);
         let Some(conv) = decode_array(conv_slice, dtype, &conv_shape, conv_elements)? else {
             return Ok(None);
@@ -795,7 +433,6 @@ mod tests {
             rope_theta: 100_000.0,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            persist_paged_cache: None,
             n_mtp_layers: 0,
         }
     }
@@ -819,29 +456,6 @@ mod tests {
         assert!(geometry(&cfg, DType::BFloat16).is_none());
         // Unsupported dtype: codec cannot round-trip.
         assert!(geometry(&config(), DType::Int8).is_none());
-    }
-
-    #[test]
-    fn layout_is_boundary_invariant_except_the_boundary() {
-        let cfg = config();
-        let geo = geo_of(&cfg);
-        let a = layout_at(&geo, 32);
-        let b = layout_at(&geo, 64);
-        assert_eq!(a.boundary_tokens, 32);
-        assert_eq!(b.boundary_tokens, 64);
-        assert_eq!(a.dims, b.dims);
-        assert_eq!(a.bytes_per_tensor, b.bytes_per_tensor);
-        assert_eq!(a.num_layers, 6);
-        assert_eq!(a.tensors_per_layer, 1);
-        // conv_dim = key_dim*2 + value_dim = (1*3)*2 + (2*4) = 14; K-1 = 3.
-        assert_eq!(a.dims, vec![3, 14, 2, 4, 3]);
-        // conv 3*14 bf16 (2 B) + recurrent 2*4*3 f32 (4 B) = 84 + 96 = 180.
-        assert_eq!(a.bytes_per_tensor, 3 * 14 * 2 + 2 * 4 * 3 * 4);
-
-        let policy = policy(&cfg, DType::BFloat16).expect("policy");
-        assert_eq!(policy.group(), ColdGroup::GdnState);
-        assert_eq!(policy.expected_at(32), a);
-        assert_eq!(policy.expected_at(64), b);
     }
 
     /// Build a full-length cache vec, filling each GDN layer's conv (bf16, or
@@ -912,14 +526,14 @@ mod tests {
         let geo = geo_of(&cfg);
         let caches = caches_for(&cfg, &geo, true, DType::Float32);
 
-        let tensors = encode_tensors(&cfg, &geo, &caches, 32)
-            .unwrap()
-            .expect("bf16 conv + f32 recurrent caches must encode");
-        let layout = layout_at(&geo, 32);
-        assert_eq!(tensors.len(), layout.tensor_count().unwrap());
-        assert!(tensors.iter().all(|t| t.len() == layout.bytes_per_tensor));
+        let mut cell = vec![0u8; geo.cell_bytes().unwrap() as usize];
+        assert!(
+            encode_into(&cfg, &geo, &caches, &mut cell).unwrap(),
+            "bf16 conv + f32 recurrent caches must encode"
+        );
+        assert_eq!(cell.len(), 6 * (3 * 14 * 2 + 2 * 4 * 3 * 4));
 
-        let decoded = decode_caches(&cfg, &geo, &tensors, 32)
+        let decoded = decode_caches(&cfg, &geo, &cell)
             .unwrap()
             .expect("payload must decode");
         assert_eq!(decoded.len(), caches.len());
@@ -950,14 +564,26 @@ mod tests {
         // it through and the label would lie about the element type.
         let caches = caches_for(&cfg, &geo, false, DType::Float32);
         assert!(
-            encode_tensors(&cfg, &geo, &caches, 32).unwrap().is_none(),
+            !encode_into(
+                &cfg,
+                &geo,
+                &caches,
+                &mut vec![0u8; geo.cell_bytes().unwrap() as usize]
+            )
+            .unwrap(),
             "a non-bf16 conv GDN cache must skip capture, not reinterpret its bytes"
         );
         // A bf16 recurrent state (the pre-f32 carry) must never be widened
         // into an f32-labelled blob.
         let caches = caches_for(&cfg, &geo, true, DType::BFloat16);
         assert!(
-            encode_tensors(&cfg, &geo, &caches, 32).unwrap().is_none(),
+            !encode_into(
+                &cfg,
+                &geo,
+                &caches,
+                &mut vec![0u8; geo.cell_bytes().unwrap() as usize]
+            )
+            .unwrap(),
             "a non-f32 recurrent GDN cache must skip capture"
         );
     }
@@ -970,31 +596,45 @@ mod tests {
         if let Some(Qwen3_5LayerCache::Linear(arrays)) = caches.get_mut(2) {
             arrays.reset();
         }
-        assert!(encode_tensors(&cfg, &geo, &caches, 32).unwrap().is_none());
+        assert!(
+            !encode_into(
+                &cfg,
+                &geo,
+                &caches,
+                &mut vec![0u8; geo.cell_bytes().unwrap() as usize]
+            )
+            .unwrap()
+        );
     }
 
     #[test]
     fn decode_refuses_short_payloads() {
         let cfg = config();
         let geo = geo_of(&cfg);
-        let tensors = encode_tensors(
-            &cfg,
-            &geo,
-            &caches_for(&cfg, &geo, true, DType::Float32),
-            32,
-        )
-        .unwrap()
-        .unwrap();
-
-        // One blob short of the layer count.
-        let mut truncated = tensors.clone();
-        truncated.pop();
-        assert!(decode_caches(&cfg, &geo, &truncated, 32).unwrap().is_none());
-
-        // One byte short of the blob length.
-        let mut clipped = tensors.clone();
-        clipped[0].pop();
-        assert!(decode_caches(&cfg, &geo, &clipped, 32).unwrap().is_none());
+        let mut cell = vec![0u8; geo.cell_bytes().unwrap() as usize];
+        assert!(
+            encode_into(
+                &cfg,
+                &geo,
+                &caches_for(&cfg, &geo, true, DType::Float32),
+                &mut cell,
+            )
+            .unwrap()
+        );
+        assert!(
+            decode_caches(&cfg, &geo, &cell[..cell.len() - 1])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !encode_into(
+                &cfg,
+                &geo,
+                &caches_for(&cfg, &geo, true, DType::Float32),
+                &mut cell[1..],
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -1044,9 +684,8 @@ mod tests {
         assert_eq!(geo.conv_bytes(), Some(61_440));
         assert_eq!(geo.bytes_per_tensor(), Some(61_440 + 3_145_728));
 
-        let layout = layout_at(&geo, 4096);
-        let per_checkpoint = layout.bytes_per_tensor * layout.num_layers as usize;
-        assert_eq!(per_checkpoint, 153_944_064);
+        assert_eq!(geo.cell_bytes(), Some(153_944_064));
+        assert_eq!(geo.namespace_gdn(), [48, 3, 10240, 48, 128, 128]);
     }
 
     /// Checks the shape calculation above against what the MLX allocator actually
@@ -1057,8 +696,7 @@ mod tests {
         use crate::array::{DType, MxArray, get_active_memory};
 
         let geo = geometry(&qwen3_6_27b_config(), DType::BFloat16).expect("geometry");
-        let layout = layout_at(&geo, 4096);
-        let claimed = layout.bytes_per_tensor * layout.num_layers as usize;
+        let claimed = geo.cell_bytes().expect("cell bytes") as usize;
 
         // Warm the allocator so the delta measures the checkpoint only.
         let warmup = MxArray::zeros(&[1024], Some(DType::BFloat16)).expect("warmup");

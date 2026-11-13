@@ -101,6 +101,16 @@ export interface LoadModelOptions {
    * and finite, default 0.5. Other model families reject it.
    */
   decodeShare?: number;
+  /**
+   * SSD state tier of `qwen3_5` and `qwen3_5_moe` targets
+   * (`--max-cache-disk`): `'auto'` (the default), a decimal byte count, or
+   * `'0'` (off). Whether it survives a restart is the paged KV disk cache
+   * switch every family reads, `MLX_PERSIST_PAGED_CACHE`. Other model
+   * families reject it, as they do `cacheDir`.
+   */
+  cacheDisk?: string;
+  /** The persistent tier's root (`--cache-dir`); needs the switch on. */
+  cacheDir?: string;
 }
 
 /** The native Qwen3.5 load options of `options`; `null` when none is set. */
@@ -110,7 +120,9 @@ function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOpt
     options?.kvFormat === undefined &&
     options?.maxMemoryBytes === undefined &&
     options?.maxContextTokens === undefined &&
-    options?.decodeShare === undefined
+    options?.decodeShare === undefined &&
+    options?.cacheDisk === undefined &&
+    options?.cacheDir === undefined
   )
     return null;
   return {
@@ -119,6 +131,8 @@ function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOpt
     maxMemoryBytes: options.maxMemoryBytes,
     maxContextTokens: options.maxContextTokens,
     decodeShare: options.decodeShare,
+    cacheDisk: options.cacheDisk,
+    cacheDir: options.cacheDir,
   };
 }
 
@@ -296,6 +310,15 @@ function dispatchLoad(
   if (options?.decodeShare !== undefined && requireFamilyData(modelType).acceptsDecodeShare !== true) {
     throw new Error(
       `decodeShare (decode time owed per unit of prefill time) is only supported by qwen3_5 and qwen3_5_moe models; ` +
+        `${modelPath} has model_type "${modelType}"`,
+    );
+  }
+  if (
+    (options?.cacheDisk !== undefined || options?.cacheDir !== undefined) &&
+    requireFamilyData(modelType).acceptsCacheDisk !== true
+  ) {
+    throw new Error(
+      `cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5 and qwen3_5_moe models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }

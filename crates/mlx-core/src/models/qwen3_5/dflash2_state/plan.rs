@@ -66,6 +66,27 @@ pub(crate) struct CommandBreaks {
     pub(crate) passed: Vec<u32>,
 }
 
+/// Splash `ExecutionLimits::draftContextTokens` (`SPLASH_DRAFT_SLIDING_WINDOW`):
+/// the window a load without a draft plans its states with, so its
+/// checkpoints and junction gain match a draft load's.
+pub(crate) const STATE_WINDOW_TOKENS: u32 = 2048;
+
+#[cfg(test)]
+thread_local! {
+    /// Stands in for [`STATE_WINDOW_TOKENS`] on this thread.
+    pub(crate) static STATE_WINDOW_OVERRIDE: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`STATE_WINDOW_TOKENS`], or the test override on this thread.
+pub(crate) fn state_window_tokens() -> u32 {
+    #[cfg(test)]
+    if let Some(window) = STATE_WINDOW_OVERRIDE.with(std::cell::Cell::get) {
+        return window;
+    }
+    STATE_WINDOW_TOKENS
+}
+
 /// Splash `kPrefillCheckpointTokens`: two draft windows, whole KV blocks.
 pub(crate) fn checkpoint_interval(window: u32, block: u32) -> u32 {
     window.saturating_mul(2).next_multiple_of(block.max(1))

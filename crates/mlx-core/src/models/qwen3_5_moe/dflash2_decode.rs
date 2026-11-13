@@ -767,15 +767,15 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35MoeInner {
             |inner, hit| inner.prime_moe_prefix(tokens, cache_salt, Some(hit)),
         )
     }
-
-    fn set_generation_suffix(&mut self, suffix: Option<std::sync::Arc<[u32]>>) {
-        self.dflash2_states.generation_suffix = suffix;
-    }
 }
 
 impl DFlash2Target for Qwen35MoeInner {
     fn dflash2(&self) -> Option<&crate::models::qwen3_5::dflash2::DFlash2Model> {
         self.dflash2.as_ref()
+    }
+
+    fn lane_seq(&self) -> u32 {
+        self.active_scheduled_seq.unwrap_or(0)
     }
 
     fn dflash2_states(&self) -> &crate::models::qwen3_5::dflash2_state::paged::DFlash2States {
@@ -1143,9 +1143,9 @@ mod paged_dflash2_tests {
 
     /// Greedy paged AR: `n` tokens and the cursor after them.
     fn paged_ar(inner: &mut Qwen35MoeInner, prompt: &[u32], n: usize) -> Result<(Vec<u32>, u32)> {
-        let prefix = inner.prime_prefix_state(prompt, true, 0, &[], 0)?;
+        let prefix = inner.prime_moe_prefix(prompt, 0, None)?;
         let suffix = &prompt[prefix.effective_cached_prefix_len()..];
-        let logits = inner.paged_prefill(suffix, &prefix, Stream::generation())?;
+        let logits = inner.moe_paged_prefill(suffix, &prefix, None)?.0;
         let mut tokens = argmax_rows(&logits)?;
         while tokens.len() < n {
             let last = *tokens.last().expect("one token");
@@ -1378,6 +1378,53 @@ mod paged_dflash2_tests {
         logits.eval();
         Ok(())
     }
+    /// An autoregressive MoE turn on a draft load primes and prefills as a
+    /// DFlash2 turn (Splash `configureDraftStatePlan` runs for every
+    /// request): it parks its replay point with the draft window, its first
+    /// token is plain paged AR's, and the next autoregressive turn of the
+    /// prefix resumes there.
+    /// Mutation MDL1m (`draft_lane_turn` false) → red (nothing parked).
+    #[test]
+    fn moe_ar_turn_on_a_draft_load_publishes_draft_states() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "moe_ar_turn_on_a_draft_load_publishes_draft_states",
+        ) {
+            return Ok(());
+        }
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let a1 = prompt(40);
+        let mut plain = tiny_paged_int8_moe_dflash_inner(0x5_8105);
+        let (reference, _) = paged_ar(&mut plain, &a1, 1)?;
+        let mut inner = tiny_paged_int8_moe_dflash_inner(0x5_8105);
+        let prefix = PagedBackend::prime_prefix_state(&mut inner, &a1, true, 0, &[], 0)?;
+        let logits = PagedBackend::paged_prefill(
+            &mut inner,
+            &a1[prefix.effective_cached_prefix_len()..],
+            &prefix,
+            stream,
+        )?;
+        assert_eq!(argmax_rows(&logits)?[..1], reference[..1]);
+        inner.finalize_paged_turn(true, 0);
+        let parked: Vec<(usize, bool)> = inner
+            .dflash2_states
+            .store
+            .entries()
+            .map(|entry| {
+                (
+                    entry.depth(),
+                    entry.ram().is_some_and(|state| state.window.is_some()),
+                )
+            })
+            .collect();
+        assert_eq!(parked, vec![(32, true)]);
+        let mut a2 = a1[..32].to_vec();
+        a2.extend((0..20u32).map(|i| (i * 5 + 2) % VOCAB));
+        let prefix = PagedBackend::prime_prefix_state(&mut inner, &a2, true, 0, &[], 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len(), 32);
+        Ok(())
+    }
+
     /// Splash `Runtime::suspend` → `QwenStateStorage::releaseLane` on the
     /// MoE serial lane: a verify the host refuses (critical) suspends the
     /// lane; its two GDN cells and pending rows are gone before the wait,
@@ -1477,6 +1524,92 @@ mod paged_dflash2_tests {
         Ok(())
     }
 
+    /// The MoE model's `closeCache` command at a clean stop, its deadline in
+    /// milliseconds on `Date.now()`'s clock: a persistent tier writes the
+    /// waiting point with its chain before that deadline and reports it.
+    /// Mutation CC1 (the deadline is read as now) → red.
+    #[test]
+    fn moe_close_cache_command_flushes_by_its_deadline() -> Result<()> {
+        use crate::engine::model_command::FamilyCommand;
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{
+            attach_tier, persistent_test_tier, writable_anchor,
+        };
+        use crate::models::qwen3_5::dflash2_state::store::{Lineage, StateClass};
+        use crate::models::qwen3_5::dflash2_state::write_behind::{MINIMUM_TOKENS, published};
+        use crate::models::qwen3_5::dflash2_turn::DFlash2Target;
+        use crate::models::qwen3_5_moe::model::Qwen35MoeFamilyCommand;
+        let _ctx = StreamContext::new(Stream::generation());
+        let tier = persistent_test_tier("state-tier-moe-close-command", 1 << 30);
+        let mut inner = tiny_paged_int8_moe_dflash_inner(0x5_8260);
+        let dense = DFlash2Target::dense_config(&inner).into_owned();
+        let window = inner
+            .dflash2
+            .as_ref()
+            .expect("draft")
+            .config
+            .context_window()?;
+        attach_tier(
+            &mut inner.dflash2_states,
+            &dense,
+            inner.paged_adapter.as_ref().expect("pool"),
+            &tier,
+            window.nbytes(),
+            window.slots(),
+        );
+        let adapter = inner.paged_adapter.as_ref().expect("pool");
+        let block_size = adapter.block_size();
+        let blocks = MINIMUM_TOKENS.div_ceil(block_size);
+        let tokens: Vec<u32> = (0..blocks * block_size)
+            .map(|i| (i * 3 + 1) % VOCAB)
+            .collect();
+        {
+            let mut allocator = adapter.allocator().lock().expect("allocator");
+            let held: Vec<_> = (0..blocks)
+                .map(|_| allocator.allocate().expect("a block for the chain"))
+                .collect();
+            allocator
+                .cache_full_blocks_with_keys(
+                    &tokens,
+                    &held,
+                    block_size,
+                    mlx_paged_attn::PrefixKeys::Uniform(&[]),
+                    0,
+                )
+                .expect("cache the chain");
+            for block in held {
+                allocator.free(block);
+            }
+        }
+        let anchor = writable_anchor(&dense, window);
+        let p = inner
+            .dflash2_states
+            .store
+            .insert(Lineage::text(&tokens, 0), anchor, StateClass::Ordinary)
+            .expect("a whole-block state")
+            .id;
+        inner.sync_gdn_state_marks();
+        published(&mut inner.dflash2_states, p, blocks * block_size, 0.0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1000.0;
+        let (reply, mut flushed) = tokio::sync::oneshot::channel();
+        Qwen35MoeFamilyCommand::CloseCache {
+            deadline_ms: now_ms + 6000.0,
+            reply,
+        }
+        .execute(&mut inner);
+        assert!(flushed.try_recv().expect("a reply")?);
+        let copy = inner
+            .dflash2_states
+            .store
+            .get(p)
+            .and_then(|entry| entry.disk().copied());
+        assert!(copy.is_some_and(|copy| copy.landed && !copy.chain_owed));
+        Ok(())
+    }
+
     /// Splash `Engine::vacateLane` on a MoE DFlash2 turn: the host refuses
     /// the tapped prefill's chunk after 64 of a 100-token prompt, then (a
     /// second run) a verify once the lane fed 113. Each time the lane is
@@ -1552,6 +1685,445 @@ mod paged_dflash2_tests {
                 assert_eq!(suspended_rings, rings, "{what}: the idle ring comes back");
                 assert_eq!(log.done, solo.done, "{what}: the unsuspended tokens");
             }
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result
+    }
+
+    fn bits(array: &MxArray) -> Result<Vec<u32>> {
+        let f = array.astype(DType::Float32)?;
+        f.eval();
+        Ok(f.to_float32()?
+            .iter()
+            .map(|value| value.to_bits())
+            .collect())
+    }
+
+    /// One stored state: its depth, its GDN slots' bits, and its window's
+    /// bounds and rows' bits.
+    type DraftState = (usize, Vec<Vec<u32>>, (u32, u32), Vec<u32>);
+
+    fn window_state(
+        window: &crate::models::qwen3_5::draft_context::DraftContextWindow,
+    ) -> Result<((u32, u32), Vec<u32>)> {
+        let rows = bits(&window.load_rows(window.begin(), window.end() - window.begin())?)?;
+        Ok(((window.begin(), window.end()), rows))
+    }
+
+    /// The states on `tokens`' lineage, by depth.
+    fn draft_states(inner: &Qwen35MoeInner, tokens: &[u32]) -> Result<Vec<DraftState>> {
+        let mut states = Vec::new();
+        for entry in inner.dflash2_states.store.entries() {
+            if !tokens.starts_with(entry.tokens()) {
+                continue;
+            }
+            let anchor = entry.ram().expect("a RAM copy");
+            let mut arrays = Vec::new();
+            for cache in &anchor.linear {
+                if matches!(
+                    cache,
+                    crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache::Linear(_)
+                ) {
+                    cache.collect_arrays(&mut arrays);
+                }
+            }
+            let cell = arrays.into_iter().map(bits).collect::<Result<Vec<_>>>()?;
+            let (bounds, rows) = window_state(anchor.window.as_ref().expect("a draft window"))?;
+            states.push((entry.depth(), cell, bounds, rows));
+        }
+        states.sort_by_key(|state| state.0);
+        Ok(states)
+    }
+
+    /// The fixture with a `rows`-row draft window, so a point's window
+    /// spans prefill slices.
+    fn wide_draft_inner(seed: u64, rows: usize) -> Qwen35MoeInner {
+        let mut inner = tiny_paged_int8_moe_dflash_inner(seed);
+        inner.dflash2.as_mut().expect("draft").config.sliding_window = rows;
+        inner
+    }
+
+    /// The states a whole autoregressive MoE turn of `tokens` on a draft
+    /// load publishes (its tapped prime and prefill), and its logits.
+    fn whole_turn_states(seed: u64, tokens: &[u32]) -> Result<(Vec<DraftState>, Vec<u32>)> {
+        let mut inner = wide_draft_inner(seed, 40);
+        let prefix = inner.prime_dspark_prefix_state(tokens, true, 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len(), 0);
+        let logits = inner.paged_prefill_with_draft_state(tokens, &prefix, Stream::generation())?;
+        Ok((draft_states(&inner, tokens)?, bits(&logits)?))
+    }
+
+    /// The scheduled prime of `tokens` on `seq`, the sequence parked after
+    /// it.
+    fn scheduled_prime(
+        inner: &mut Qwen35MoeInner,
+        seq: u32,
+        tokens: &[u32],
+    ) -> Result<<Qwen35MoeInner as PagedBackend>::PrefixState> {
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        HybridSchedulerBackend::activate_scheduled_recurrent(inner, seq)?;
+        let base = PagedBackend::prime_prefix_state(inner, tokens, true, 16, &[], 0)?;
+        HybridSchedulerBackend::park_active_scheduled_recurrent(inner)?;
+        Ok(base)
+    }
+
+    /// The prefill slice `[start, end)` of `seq`'s request, the sequence
+    /// parked after it; returns the slice's logits.
+    fn scheduled_slice(
+        inner: &mut Qwen35MoeInner,
+        seq: u32,
+        tokens: &[u32],
+        base: &<Qwen35MoeInner as PagedBackend>::PrefixState,
+        start: usize,
+        end: usize,
+    ) -> Result<MxArray> {
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        HybridSchedulerBackend::activate_paged_seq(inner, seq)?;
+        let prefix = HybridSchedulerBackend::build_scheduled_prefix(
+            inner,
+            base,
+            start,
+            end - start,
+            tokens.to_vec(),
+            start == base.effective_cached_prefix_len(),
+        );
+        let logits = PagedBackend::paged_prefill(
+            inner,
+            &tokens[start..end],
+            &prefix,
+            Stream::default(crate::stream::DeviceType::Gpu),
+        )?;
+        logits.eval();
+        HybridSchedulerBackend::park_active_scheduled_recurrent(inner)?;
+        Ok(logits)
+    }
+
+    /// The dense `scheduled_ar_on_a_draft_load_publishes_draft_states` on a
+    /// MoE load: two scheduled sequences whose prefill slices interleave
+    /// each publish the states, GDN cells and draft windows a whole turn of
+    /// their prompt does; the turns' ends give the windows back.
+    /// Mutation SD1m (a scheduled MoE prefill on a draft load keeps no
+    /// sink) → red.
+    #[test]
+    fn moe_scheduled_ar_on_a_draft_load_publishes_draft_states() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "moe_scheduled_ar_on_a_draft_load_publishes_draft_states",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
+        let _ctx = StreamContext::new(Stream::generation());
+        let seed = 0x5_8180;
+        let prompts = [
+            (1u32, prompt(150)),
+            (
+                2u32,
+                (0..150u32).map(|i| (i * 5 + 1) % VOCAB).collect::<Vec<_>>(),
+            ),
+        ];
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(16)));
+        let result = (|| -> Result<()> {
+            let mut references = Vec::new();
+            for (_, tokens) in &prompts {
+                let (states, _) = whole_turn_states(seed, tokens)?;
+                assert_eq!(
+                    states.iter().map(|state| state.0).collect::<Vec<_>>(),
+                    vec![80, 144]
+                );
+                references.push(states);
+            }
+            let mut inner = wide_draft_inner(seed, 40);
+            let mut bases = Vec::new();
+            for (seq, tokens) in &prompts {
+                let base = scheduled_prime(&mut inner, *seq, tokens)?;
+                assert_eq!(base.effective_cached_prefix_len(), 0);
+                bases.push(base);
+            }
+            for (start, end) in [(0, 48), (48, 112), (112, 150)] {
+                for ((seq, tokens), base) in prompts.iter().zip(&bases) {
+                    scheduled_slice(&mut inner, *seq, tokens, base, start, end)?;
+                }
+            }
+            assert!(inner.dflash2.is_some(), "the draft is back");
+            for ((seq, tokens), reference) in prompts.iter().zip(&references) {
+                assert_eq!(
+                    &draft_states(&inner, tokens)?,
+                    reference,
+                    "sequence {seq} publishes the whole turn's states"
+                );
+            }
+            assert_eq!(inner.dflash2_states.seq_windows.len(), 2);
+            for (seq, _) in &prompts {
+                HybridSchedulerBackend::scheduled_turn_closed(&mut inner, *seq);
+            }
+            assert!(inner.dflash2_states.seq_windows.is_empty());
+            assert!(inner.dflash2_states.idle_lane.window.is_some());
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result
+    }
+
+    /// The states a whole autoregressive MoE turn of `tokens` on a draft
+    /// load publishes when its generation prompt is the template's.
+    fn whole_turn_states_with_prompt(seed: u64, tokens: &[u32]) -> Result<Vec<DraftState>> {
+        let mut inner = wide_draft_inner(seed, 40);
+        inner.dflash2_states.generation_suffix = Some(std::sync::Arc::from(
+            &crate::models::qwen3_5::dflash2_decode::tests::GENERATION_PROMPT[..],
+        ));
+        let prefix = inner.prime_dspark_prefix_state(tokens, true, 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len(), 0);
+        inner.paged_prefill_with_draft_state(tokens, &prefix, Stream::generation())?;
+        draft_states(&inner, tokens)
+    }
+
+    /// The dense `scheduler_runs_draft_load_ar_sessions_on_the_state_tier`
+    /// on a MoE load: through the model thread's scheduler, two sessions
+    /// started together run as two live sequences and each publishes the
+    /// states, GDN cells and draft windows a whole turn of its own prompt
+    /// does; after a restart a session extending the first one's prompt
+    /// resumes at its replay point (144) from disk, and the states past it
+    /// are the whole turn's of the longer prompt.
+    /// Mutation DS1m (the scheduled MoE prime on a draft load primes plain)
+    /// → red.
+    #[test]
+    fn moe_scheduler_runs_draft_load_ar_sessions_on_the_state_tier() -> Result<()> {
+        use crate::models::qwen3_5::dflash2_decode::tests::{
+            content_tokenizer, drive_session_starts, metal_is_default_device, rendered_prompt,
+        };
+        if crate::test_support::paged_prefill_unsupported(
+            "moe_scheduler_runs_draft_load_ar_sessions_on_the_state_tier",
+        ) || !metal_is_default_device()
+        {
+            return Ok(());
+        }
+        use crate::engine::governor::governor::Governor;
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use crate::engine::hybrid_scheduler::HybridSchedulerState;
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{
+            TestTier, attach_tier, persistent_test_tier,
+        };
+        use crate::models::qwen3_5::dflash2_state::disk::{adopt_all, close_cache};
+        use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
+        let _ctx = StreamContext::new(Stream::generation());
+        let seed = 0x5_81B0;
+        let scheduler_on = |tier: &TestTier| -> Result<HybridSchedulerState<Qwen35MoeInner>> {
+            let mut inner = wide_draft_inner(seed, 40);
+            let window = inner
+                .dflash2
+                .as_ref()
+                .expect("draft")
+                .config
+                .context_window()?;
+            let dense = inner.config.to_dense_config();
+            attach_tier(
+                &mut inner.dflash2_states,
+                &dense,
+                inner.paged_adapter.as_ref().expect("pool"),
+                tier,
+                window.nbytes(),
+                window.slots(),
+            );
+            inner.paged_adapter.as_mut().expect("pool").set_cold_tier(
+                crate::models::qwen3_5::dflash2_state::disk::state_context(&tier.tier),
+            );
+            inner.tokenizer = Some(content_tokenizer());
+            let io = FakeIo::new(
+                stats(0),
+                host(32 * G, crate::engine::governor::host::Pressure::Normal),
+            );
+            let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+            inner.memory_registration =
+                Some(governor.register_model(model(16 * G, 0)).expect("register"));
+            let mut state = HybridSchedulerState::new(inner)?;
+            state.enable_continuous_batching();
+            Ok(state)
+        };
+        let first = prompt(150);
+        let second: Vec<u32> = (0..150u32).map(|i| (i * 5 + 1) % VOCAB).collect();
+        let longer = prompt(180);
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(16)));
+        let result = (|| -> Result<()> {
+            let references = [
+                whole_turn_states_with_prompt(seed, &rendered_prompt(&first))?,
+                whole_turn_states_with_prompt(seed, &rendered_prompt(&second))?,
+            ];
+            for reference in &references {
+                assert_eq!(
+                    reference.iter().map(|state| state.0).collect::<Vec<_>>(),
+                    vec![80, 144]
+                );
+            }
+            let longer_reference = whole_turn_states_with_prompt(seed, &rendered_prompt(&longer))?;
+            let tier = persistent_test_tier("state-tier-moe-sched-drive-draft", 1 << 30);
+            let mut state = scheduler_on(&tier)?;
+            let (results, most_live) =
+                drive_session_starts(&mut state, &[("a", &first), ("b", &second)], 2)?;
+            assert_eq!(most_live, 2, "the two sessions ran as two live sequences");
+            for (result, (body, reference)) in results
+                .iter()
+                .zip([&first, &second].into_iter().zip(&references))
+            {
+                assert_eq!(result.cached_tokens, 0);
+                assert_eq!(
+                    &draft_states(&state.inner, &rendered_prompt(body))?,
+                    reference,
+                    "each session publishes its own whole turn's states"
+                );
+            }
+            assert!(state.inner.dflash2.is_some(), "the draft is back");
+            assert!(state.inner.dflash2_states.seq_windows.is_empty());
+            assert!(state.inner.dflash2_states.turns.is_empty());
+            let replay = draft_states(&state.inner, &rendered_prompt(&first))?
+                .into_iter()
+                .find(|stored| stored.0 == 144)
+                .expect("the replay point at 144");
+            assert!(close_cache(
+                &mut state.inner,
+                std::time::Instant::now() + std::time::Duration::from_secs(30)
+            ));
+            drop(state);
+
+            let tier = tier.reopen("state-tier-moe-sched-drive-draft", 1 << 30);
+            let mut state = scheduler_on(&tier)?;
+            assert!(adopt_all(&mut state.inner) >= 1);
+            let (results, _) = drive_session_starts(&mut state, &[("c", &longer)], 2)?;
+            assert_eq!(
+                results[0].cached_tokens, 144,
+                "the session resumed from disk"
+            );
+            let disk = state
+                .inner
+                .dflash2_states
+                .disk
+                .as_ref()
+                .expect("tier")
+                .counters;
+            assert_eq!((disk.promotions, disk.invalidations), (1, 0));
+            let states = draft_states(&state.inner, &rendered_prompt(&longer))?;
+            assert!(
+                states.contains(&replay),
+                "the promoted state is the stored one"
+            );
+            let past: Vec<_> = states.into_iter().filter(|stored| stored.0 > 144).collect();
+            let expected: Vec<_> = longer_reference
+                .into_iter()
+                .filter(|stored| stored.0 > 144)
+                .collect();
+            assert!(expected.iter().any(|stored| stored.2.0 < 144));
+            assert_eq!(
+                past, expected,
+                "the states past the resume continue the stored window"
+            );
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result
+    }
+
+    /// The dense `scheduled_ar_on_a_draft_load_resumes_after_a_restart` on
+    /// a MoE load: after a restart a scheduled request extending a stored
+    /// prompt resumes at its replay point (144) from disk with the stored
+    /// window; the states it publishes past it and its logits equal a whole
+    /// turn's of the longer prompt.
+    /// Mutation SR1 (the scheduled prime resumes at no state) → red.
+    #[test]
+    fn moe_scheduled_ar_on_a_draft_load_resumes_after_a_restart() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "moe_scheduled_ar_on_a_draft_load_resumes_after_a_restart",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{
+            TestTier, attach_tier, persistent_test_tier,
+        };
+        use crate::models::qwen3_5::dflash2_state::disk::{adopt_all, close_cache};
+        use crate::models::qwen3_5::paged_forward::PREFILL_CHUNK_ROWS_OVERRIDE;
+        let _ctx = StreamContext::new(Stream::generation());
+        let seed = 0x5_8190;
+        let on_tier = |tier: &TestTier| -> Result<Qwen35MoeInner> {
+            let mut inner = wide_draft_inner(seed, 40);
+            let window = inner
+                .dflash2
+                .as_ref()
+                .expect("draft")
+                .config
+                .context_window()?;
+            let dense = inner.config.to_dense_config();
+            attach_tier(
+                &mut inner.dflash2_states,
+                &dense,
+                inner.paged_adapter.as_ref().expect("pool"),
+                tier,
+                window.nbytes(),
+                window.slots(),
+            );
+            inner.paged_adapter.as_mut().expect("pool").set_cold_tier(
+                crate::models::qwen3_5::dflash2_state::disk::state_context(&tier.tier),
+            );
+            Ok(inner)
+        };
+        let first = prompt(150);
+        let longer = prompt(180);
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(16)));
+        let result = (|| -> Result<()> {
+            let (reference, reference_logits) = whole_turn_states(seed, &longer)?;
+            let tier = persistent_test_tier("state-tier-moe-sched-draft-restart", 1 << 30);
+            let mut inner = on_tier(&tier)?;
+            let base = scheduled_prime(&mut inner, 1, &first)?;
+            for (start, end) in [(0, 64), (64, 150)] {
+                scheduled_slice(&mut inner, 1, &first, &base, start, end)?;
+            }
+            HybridSchedulerBackend::release_scheduled_cache(&mut inner, 1)?;
+            HybridSchedulerBackend::scheduled_turn_closed(&mut inner, 1);
+            let replay = draft_states(&inner, &first)?
+                .into_iter()
+                .find(|state| state.0 == 144)
+                .expect("the replay point at 144");
+            assert!(close_cache(
+                &mut inner,
+                std::time::Instant::now() + std::time::Duration::from_secs(30)
+            ));
+            drop(inner);
+
+            let tier = tier.reopen("state-tier-moe-sched-draft-restart", 1 << 30);
+            let mut inner = on_tier(&tier)?;
+            assert!(adopt_all(&mut inner) >= 1);
+            let base = scheduled_prime(&mut inner, 4, &longer)?;
+            assert_eq!(base.effective_cached_prefix_len(), 144);
+            assert_eq!(
+                window_state(
+                    inner
+                        .dflash2_states
+                        .seq_windows
+                        .get(&4)
+                        .expect("the lane's window")
+                )?,
+                (replay.2, replay.3.clone()),
+                "the lane holds the stored window"
+            );
+            let logits = scheduled_slice(&mut inner, 4, &longer, &base, 144, 180)?;
+            let disk = inner.dflash2_states.disk.as_ref().expect("tier").counters;
+            assert_eq!((disk.promotions, disk.invalidations), (1, 0));
+            let states = draft_states(&inner, &longer)?;
+            assert!(
+                states.contains(&replay),
+                "the promoted state is the stored one"
+            );
+            let past: Vec<_> = states.into_iter().filter(|state| state.0 > 144).collect();
+            let expected: Vec<_> = reference
+                .into_iter()
+                .filter(|state| state.0 > 144)
+                .collect();
+            assert!(expected.iter().any(|state| state.0 == 176));
+            assert_eq!(
+                past, expected,
+                "the state past the resume continues the window"
+            );
+            assert_eq!(bits(&logits)?, reference_logits);
             Ok(())
         })();
         PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));

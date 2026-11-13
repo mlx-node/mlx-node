@@ -63,14 +63,38 @@ pub(crate) struct Inserted {
     pub(crate) upgraded: bool,
 }
 
+/// A state's copy on the SSD tier (Splash `StateCache::Entry::disk`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiskCopy {
+    pub(crate) key: mlx_paged_attn::ColdCacheKey,
+    /// The object's file size, what the tier's quota is charged.
+    pub(crate) bytes: u64,
+    /// The write landed; until then the copy is in flight.
+    pub(crate) landed: bool,
+    /// The first row the copy's context window holds (Splash
+    /// `QwenLogicalLengths`, which the entry keeps beside its slot).
+    pub(crate) window_begin: u32,
+    /// Some block of the state's chain is not on the tier yet: the chain
+    /// stays marked (Splash `StateCache::marks`: a disk state needs its KV
+    /// as it is).
+    pub(crate) chain_owed: bool,
+}
+
+/// One state on one block: a RAM copy, a disk copy, or both (Splash
+/// `StateCache::Entry`).
 pub(crate) struct Entry<S> {
     id: EntryId,
     block_size: u32,
     salt: u64,
     tokens: Vec<u32>,
+    /// Per whole block, from block 0; blocks past the end carry none.
+    extra_keys: Vec<Vec<u64>>,
     chain: Vec<u64>,
-    state: S,
-    state_bytes: u64,
+    ram: Option<S>,
+    /// The state's own bytes, its lineage aside (Splash `cachedBytes`).
+    cached_bytes: u64,
+    lineage_bytes: u64,
+    disk: Option<DiskCopy>,
     last_used: u64,
     checkpoint: bool,
     publication: u64,
@@ -90,6 +114,11 @@ impl<S> Entry<S> {
         &self.tokens
     }
 
+    /// Its blocks' image keys, the last listed one carrying some.
+    pub(crate) fn extra_keys(&self) -> &[Vec<u64>] {
+        &self.extra_keys
+    }
+
     /// Chain hashes of the entry's whole blocks.
     pub(crate) fn chain(&self) -> &[u64] {
         &self.chain
@@ -100,13 +129,38 @@ impl<S> Entry<S> {
         self.chain.last().copied().unwrap_or_default()
     }
 
-    pub(crate) fn state(&self) -> &S {
-        &self.state
+    /// The RAM copy; `None` for a state on disk only.
+    pub(crate) fn ram(&self) -> Option<&S> {
+        self.ram.as_ref()
     }
 
-    /// The state, its lineage's token and chain vectors included.
+    pub(crate) fn disk(&self) -> Option<&DiskCopy> {
+        self.disk.as_ref()
+    }
+
+    pub(crate) fn salt(&self) -> u64 {
+        self.salt
+    }
+
+    pub(crate) fn block_size(&self) -> u32 {
+        self.block_size
+    }
+
+    /// The RAM copy's bytes and its lineage's token and chain vectors: a
+    /// state on disk only holds its lineage alone.
     pub(crate) fn state_bytes(&self) -> u64 {
-        self.state_bytes
+        let ram = if self.ram.is_some() {
+            self.cached_bytes
+        } else {
+            0
+        };
+        ram.saturating_add(self.lineage_bytes)
+    }
+
+    /// Its block's chain must stay resident: a RAM copy, or a disk copy
+    /// whose chain is not all on the tier yet.
+    fn marks_chain(&self) -> bool {
+        self.ram.is_some() || self.disk.is_some_and(|disk| disk.chain_owed)
     }
 
     pub(crate) fn last_used(&self) -> u64 {
@@ -123,11 +177,18 @@ impl<S> Entry<S> {
         self.publication
     }
 
-    /// The entry's lineage equals `prompt[..depth]`, `depth < |prompt|`.
+    /// The bytes its RAM copy holds once it has one, its lineage's too.
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        self.cached_bytes.saturating_add(self.lineage_bytes)
+    }
+
+    /// The entry's lineage equals `prompt[..depth]` and `depth < |prompt|`
+    /// (a RAM copy or a disk copy: Splash `StateCache::acquireDeepest`).
     fn resumes(&self, prompt: &PromptKey<'_>) -> bool {
         let depth = self.depth();
         let blocks = self.chain.len();
-        depth > 0
+        (self.ram.is_some() || self.disk.is_some())
+            && depth > 0
             && depth < prompt.tokens.len()
             && self.block_size == prompt.block_size
             && self.salt == prompt.salt
@@ -213,7 +274,6 @@ impl<S: StateBytes> HybridStateStore<S> {
         self.recency = recency;
     }
 
-    #[cfg(test)]
     pub(crate) fn block_size(&self) -> u32 {
         self.block_size
     }
@@ -224,7 +284,7 @@ impl<S: StateBytes> HybridStateStore<S> {
             state_bytes: self
                 .entries
                 .iter()
-                .fold(0, |sum, entry| sum.saturating_add(entry.state_bytes)),
+                .fold(0, |sum, entry| sum.saturating_add(entry.state_bytes())),
         }
     }
 
@@ -278,11 +338,88 @@ impl<S: StateBytes> HybridStateStore<S> {
                 upgraded,
             });
         }
+        let cached_bytes = state.state_bytes();
+        Ok(self.push_entry(lineage, key, Some(state), cached_bytes, class, None))
+    }
+
+    /// Publishes a state whose only copy is `disk`, `cached_bytes` long,
+    /// at the end of `lineage` (Splash `StateCache::publishStateToDisk`: a
+    /// block's state is published once, so no state may sit there).
+    pub(crate) fn insert_disk(
+        &mut self,
+        lineage: Lineage<'_>,
+        cached_bytes: u64,
+        class: StateClass,
+        disk: DiskCopy,
+    ) -> Result<EntryId> {
+        let row = lineage.tokens.len();
+        if row == 0 || !row.is_multiple_of(self.block_size as usize) {
+            return Err(Error::from_reason(format!(
+                "DFlash2 state at row {row} is not a complete KV block"
+            )));
+        }
+        let key = self.prompt_key(lineage);
+        if self.entry_on(&key).is_some() {
+            return Err(Error::from_reason(
+                "a block's state is published once; reuse it instead",
+            ));
+        }
+        Ok(self
+            .push_entry(lineage, key, None, cached_bytes, class, Some(disk))
+            .id)
+    }
+
+    /// Takes back a persistent tier's state whose only copy is `disk`,
+    /// stamped `last_used` as its earlier process left it (Splash
+    /// `StateCache::adoptDisk`: one state per block).
+    pub(crate) fn adopt_disk(
+        &mut self,
+        lineage: Lineage<'_>,
+        cached_bytes: u64,
+        class: StateClass,
+        disk: DiskCopy,
+        last_used: u64,
+    ) -> Result<EntryId> {
+        let id = self.insert_disk(lineage, cached_bytes, class, disk)?;
+        if let Some(entry) = self.get_mut(id) {
+            entry.last_used = last_used;
+        }
+        Ok(id)
+    }
+
+    /// New stamps continue after `stamp`, one an earlier process handed out
+    /// (Splash `CacheRecency::continueAfter`).
+    pub(crate) fn continue_after(&self, stamp: u64) {
+        self.recency.continue_after(stamp);
+    }
+
+    /// The clock's next stamp.
+    #[cfg(test)]
+    pub(crate) fn next_stamp(&self) -> u64 {
+        self.recency.next()
+    }
+
+    fn push_entry(
+        &mut self,
+        lineage: Lineage<'_>,
+        key: PromptKey<'_>,
+        ram: Option<S>,
+        cached_bytes: u64,
+        class: StateClass,
+        disk: Option<DiskCopy>,
+    ) -> Inserted {
         let mark = key.chain.last().copied().unwrap_or_default();
         let checkpoint = class == StateClass::Checkpoint && !self.in_use(mark);
-        let state_bytes = state
-            .state_bytes()
-            .saturating_add(lineage_bytes(row, key.chain.len()));
+        let lineage_bytes = lineage_bytes(lineage.tokens.len(), key.chain.len());
+        let mut extra_keys: Vec<Vec<u64>> = lineage
+            .extra_keys
+            .iter()
+            .take(key.chain.len())
+            .cloned()
+            .collect();
+        while extra_keys.last().is_some_and(Vec::is_empty) {
+            extra_keys.pop();
+        }
         let id = self.next_id;
         self.next_id += 1;
         self.publications += 1;
@@ -292,18 +429,45 @@ impl<S: StateBytes> HybridStateStore<S> {
             block_size: self.block_size,
             salt: lineage.salt,
             tokens: lineage.tokens.to_vec(),
+            extra_keys,
             chain: key.chain,
-            state,
-            state_bytes,
+            ram,
+            cached_bytes,
+            lineage_bytes,
+            disk,
             last_used: stamp,
             checkpoint,
             publication: self.publications,
         });
-        Ok(Inserted {
+        Inserted {
             id,
             new: true,
             upgraded: false,
-        })
+        }
+    }
+
+    /// Splash `Cache::superseded`: the ordinary states past `id`'s block
+    /// all go on through one next block, so its conversation went on from
+    /// it.
+    pub(crate) fn superseded(&self, id: EntryId) -> bool {
+        let Some(entry) = self.get(id) else {
+            return false;
+        };
+        let depth = entry.chain.len();
+        let mut next: Option<u64> = None;
+        for other in &self.entries {
+            if other.checkpoint
+                || other.chain.len() <= depth
+                || other.chain[..depth] != entry.chain[..]
+            {
+                continue;
+            }
+            match next {
+                Some(block) if block != other.chain[depth] => return false,
+                _ => next = Some(other.chain[depth]),
+            }
+        }
+        next.is_some()
     }
 
     fn entry_on(&self, key: &PromptKey<'_>) -> Option<EntryId> {
@@ -468,9 +632,38 @@ impl<S: StateBytes> HybridStateStore<S> {
         self.entries.len() < before
     }
 
-    /// The block of every entry.
+    /// The block of every entry whose chain must stay resident.
     pub(crate) fn marks(&self) -> impl Iterator<Item = u64> + '_ {
-        self.entries.iter().map(Entry::mark)
+        self.entries
+            .iter()
+            .filter(|entry| entry.marks_chain())
+            .map(Entry::mark)
+    }
+
+    /// Sets `id`'s disk copy; false when it is gone.
+    pub(crate) fn set_disk(&mut self, id: EntryId, disk: Option<DiskCopy>) -> bool {
+        self.get_mut(id).map(|entry| entry.disk = disk).is_some()
+    }
+
+    pub(crate) fn disk_mut(&mut self, id: EntryId) -> Option<&mut DiskCopy> {
+        self.get_mut(id).and_then(|entry| entry.disk.as_mut())
+    }
+
+    /// Gives disk-only `id` its RAM copy back (Splash
+    /// `StateCache::promote`); false when it is gone or holds one.
+    pub(crate) fn promote(&mut self, id: EntryId, state: S) -> bool {
+        match self.get_mut(id) {
+            Some(entry) if entry.ram.is_none() => {
+                entry.ram = Some(state);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Drops `id`'s RAM copy (Splash `StateCache::discardRam`).
+    pub(crate) fn drop_ram(&mut self, id: EntryId) -> Option<S> {
+        self.get_mut(id).and_then(|entry| entry.ram.take())
     }
 
     /// Drops every entry and use (`ResetScope::Command`, a new pool).

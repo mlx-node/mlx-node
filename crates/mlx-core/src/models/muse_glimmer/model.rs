@@ -333,7 +333,7 @@ impl MuseGlimmerInner {
         };
         let has_sliding_sidecar = full
             .cold_tier()
-            .and_then(|cold| cold.sidecar_policy.as_ref())
+            .and_then(|cold| cold.sidecar_policy())
             .is_some_and(|policy| policy.group() == mlx_paged_attn::ColdGroup::SlidingWindow);
         if has_sliding_sidecar {
             super::cold_sidecar::anchor_rungs(full.block_size())
@@ -374,7 +374,9 @@ impl MuseGlimmerInner {
             Some(fingerprint) => Some(ColdTierContext {
                 manager,
                 fingerprint,
-                sidecar_policy: Some(sidecar_policy),
+                backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar(
+                    sidecar_policy,
+                ),
             }),
             None => {
                 tracing::warn!(
@@ -643,8 +645,7 @@ impl MuseGlimmerInner {
                 let full = paged.coordinator.full_adapter();
                 let cold = full.cold_tier()?;
                 if cold
-                    .sidecar_policy
-                    .as_ref()
+                    .sidecar_policy()
                     .is_none_or(|policy| policy.group() != mlx_paged_attn::ColdGroup::SlidingWindow)
                 {
                     return None;
@@ -2072,7 +2073,9 @@ mod spec_paged_settle_tests {
                 fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
                     b"muse-spec-paged-settle".as_slice(),
                 ]),
-                sidecar_policy: Some(policy),
+                backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar(
+                    policy,
+                ),
             });
     }
 

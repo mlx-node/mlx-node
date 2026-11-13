@@ -58,6 +58,9 @@ pub(super) struct MoeGdnHistoryCheckpoint {
 pub(crate) struct MoeGdnPrefixPreparation {
     #[cfg(test)]
     pub(crate) state: &'static str,
+    /// The KV prefix the turn resumes from: the prepare's, or 0 once a
+    /// disk state's KV without its GDN state restarted the turn cold.
+    pub(crate) cached_prefix_len: u32,
     pub(crate) already_primed: bool,
     pub(crate) restored_prefix_tokens: u32,
     pub(crate) replayed_prefix_tokens: u32,

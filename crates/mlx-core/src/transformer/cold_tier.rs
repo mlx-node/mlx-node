@@ -5,7 +5,7 @@
 //! the shared block allocator / K/V pool lives here —
 //!
 //! - [`ColdTierContext`], the per-adapter handle (manager + fingerprint +
-//!   optional [`mlx_paged_attn::ColdSidecarPolicy`]);
+//!   [`ColdContextBacking`]);
 //! - [`ColdTierWalk`], the borrowed-field bundle both capture and restore
 //!   walks run against, with `restore_extend` (incl. the reconcile-down a
 //!   sidecar policy requires), `begin_restore_extend`, `capture_chain`,
@@ -56,17 +56,58 @@ use super::paged_kv_cache_adapter::{PagedTurnPlanReason, SeqId};
 pub struct ColdTierContext {
     pub manager: std::sync::Arc<mlx_paged_attn::ColdCacheManager>,
     pub fingerprint: mlx_paged_attn::ColdCacheFingerprint,
-    /// The auxiliary (non-KV) state this family REQUIRES at any boundary it
-    /// resumes from, or `None` when the paged pool already holds every piece
-    /// of per-token state the forward pass carries between turns.
-    ///
-    /// `None` is the dense-`qwen3` control: the restore walk behaves exactly
-    /// as it did before sidecars existed. `Some(policy)` turns the walk into
-    /// vLLM's reconcile-down — the candidate prefix is reduced to the deepest
-    /// boundary a VALIDATED sidecar backs, and a boundary no sidecar backs
-    /// restores nothing rather than handing back attention state whose
-    /// recurrent half never existed.
-    pub sidecar_policy: Option<mlx_paged_attn::ColdSidecarPolicy>,
+    /// What backs a cold KV prefix beside its blocks.
+    pub backing: ColdContextBacking,
+}
+
+/// What a cold KV prefix needs beside its blocks before a turn resumes on it.
+pub enum ColdContextBacking {
+    /// The paged pool holds every piece of per-token state the forward pass
+    /// carries between turns (dense `qwen3`): the restore walk takes the KV
+    /// chain alone.
+    KvOnly,
+    /// The family's out-of-pool state at the same boundary: the walk reduces
+    /// the candidate prefix to the deepest boundary a VALIDATED sidecar backs
+    /// (vLLM's reconcile-down), and a boundary no sidecar backs restores
+    /// nothing.
+    Sidecar(mlx_paged_attn::ColdSidecarPolicy),
+    /// A DFlash2 state object of the model's own tier backs the prefix
+    /// (Splash `Cache::persist` writes KV only for a state's chain): no cold
+    /// walk runs without a state, no turn captures KV, and a cold-restored
+    /// block no state install acknowledged blocks the turn.
+    StateOnly,
+}
+
+impl ColdTierContext {
+    /// The family's sidecar policy, when its prefix needs one.
+    pub(crate) fn sidecar_policy(&self) -> Option<&mlx_paged_attn::ColdSidecarPolicy> {
+        match &self.backing {
+            ColdContextBacking::Sidecar(policy) => Some(policy),
+            ColdContextBacking::KvOnly | ColdContextBacking::StateOnly => None,
+        }
+    }
+
+    /// The pool alone backs a cold prefix: the dense async restore and the
+    /// per-turn capture walk serve it.
+    pub(crate) fn kv_only(&self) -> bool {
+        matches!(self.backing, ColdContextBacking::KvOnly)
+    }
+
+    /// Only a state object backs a cold prefix.
+    pub(crate) fn state_only(&self) -> bool {
+        matches!(self.backing, ColdContextBacking::StateOnly)
+    }
+}
+
+/// What one restore walk reconciles its blocks against.
+#[derive(Clone, Copy)]
+pub(crate) enum ColdBacking<'a> {
+    /// The family's sidecar policy, `None` for a pool that holds every
+    /// piece of per-token state.
+    Sidecar(Option<&'a mlx_paged_attn::ColdSidecarPolicy>),
+    /// A disk state `depth` deep: the blocks below it come back whole or
+    /// not at all, and no sidecar is read.
+    State { depth: usize },
 }
 
 /// The adapter fields the cold-tier restore and capture walks need, borrowed
@@ -137,7 +178,7 @@ impl ColdTierWalk<'_> {
         extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
         hot_hashes: impl FnOnce(usize) -> Vec<u64>,
     ) -> Option<PendingColdRestore> {
-        if self.cold.sidecar_policy.is_some() {
+        if !self.cold.kv_only() {
             return None;
         }
         let bs = self.block_size as usize;
@@ -301,16 +342,21 @@ impl ColdTierWalk<'_> {
     /// half is covered by the `aux_prefix_unbacked` latch, which turns that
     /// obligation into a checked one (see its field doc).
     ///
-    /// With `sidecar_policy: None` every phase above is skipped and the body is
+    /// Without a sidecar policy every phase above is skipped and the body is
     /// the pre-sidecar walk verbatim.
     pub(crate) fn restore_extend<'k>(
         &self,
         lookup_tokens: &[u32],
         hot_cached_tokens: usize,
         cache_salt: u64,
+        backing: ColdBacking<'_>,
         extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
         hot_hashes: impl FnOnce(usize) -> Vec<u64>,
     ) -> ColdRestore {
+        let (sidecar_policy, state_blocks) = match backing {
+            ColdBacking::Sidecar(policy) => (policy, None),
+            ColdBacking::State { depth } => (None, Some(depth / self.block_size.max(1) as usize)),
+        };
         let bs = self.block_size as usize;
         // `checked_div` folds the degenerate `block_size == 0` case into a
         // no-op: both counts become 0, so the extension loop never runs.
@@ -363,8 +409,22 @@ impl ColdTierWalk<'_> {
         // state actually backs, BEFORE any Metal blit or hot-cache publish, so
         // an unbacked prefix is never materialized in the first place.
         let mut limit = full_blocks;
+        if let Some(blocks) = state_blocks {
+            if blocks > full_blocks {
+                self.record_decline(
+                    "state_past_lookup",
+                    base,
+                    blocks,
+                    full_blocks,
+                    bs,
+                    lookup_tokens.len(),
+                );
+                return ColdRestore::miss();
+            }
+            limit = blocks;
+        }
         let mut sidecar = None;
-        if let Some(policy) = self.cold.sidecar_policy.as_ref() {
+        if let Some(policy) = sidecar_policy {
             let ceiling = self.kv_chain_upper_bound(
                 lookup_tokens,
                 cache_salt,
@@ -467,7 +527,26 @@ impl ColdTierWalk<'_> {
         // the blocks that actually landed and release the tail. Fail-closed:
         // when nothing shorter is backed either, the whole extension is
         // dropped rather than returned without state.
-        if let Some(policy) = self.cold.sidecar_policy.as_ref()
+        if state_blocks.is_some() && idx < limit {
+            let mut guard = self
+                .allocator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for block in restored.drain(..) {
+                guard.free(block);
+            }
+            drop(guard);
+            self.record_decline(
+                "state_chain_incomplete",
+                base,
+                idx,
+                limit,
+                bs,
+                lookup_tokens.len(),
+            );
+            return ColdRestore::miss();
+        }
+        if let Some(policy) = sidecar_policy
             && idx < limit
         {
             let keep = match self.deepest_backed_boundary(
@@ -818,52 +897,6 @@ impl ColdTierWalk<'_> {
         outcome.elapsed = started.elapsed();
         outcome
     }
-
-    /// The leading blocks of `request_tokens` that [`Self::capture_chain`]
-    /// would cover if it ran now under `max_blocks` and every enqueue landed:
-    /// the blocks already on disk, which it re-walks for free, and up to
-    /// `max_blocks` absent ones. Blocks persisted before the capture only
-    /// deepen the real walk, so this is a lower bound on its reach.
-    pub(crate) fn capture_reach<'k>(
-        &self,
-        request_tokens: &[u32],
-        cache_salt: u64,
-        max_blocks: usize,
-        extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
-    ) -> usize {
-        let bs = self.block_size as usize;
-        if bs == 0 {
-            return 0;
-        }
-        let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
-        let mut absent = 0usize;
-        let mut reach = 0usize;
-        for i in 0..request_tokens.len() / bs {
-            let (Some(extra_keys), Some(toks)) =
-                (extra_keys_for(i), request_tokens.get(i * bs..(i + 1) * bs))
-            else {
-                break;
-            };
-            let key = mlx_paged_attn::ColdCacheKey::chain(
-                mlx_paged_attn::ColdGroup::Kv,
-                self.cold.fingerprint,
-                parent,
-                toks,
-                extra_keys,
-                cache_salt,
-                i,
-            );
-            if !self.cold.manager.contains(&key) {
-                if absent >= max_blocks {
-                    break;
-                }
-                absent += 1;
-            }
-            parent = Some(key);
-            reach = i + 1;
-        }
-        reach
-    }
 }
 
 /// How much of the prompt one turn's cold-tier capture walk may persist.
@@ -1038,12 +1071,16 @@ pub(crate) fn trace_cold_capture_walk(
 pub(crate) fn aux_prefix_state_missing(
     cold_tier: Option<&ColdTierContext>,
     cached_token_count: u32,
+    cold_restored_blocks: usize,
     restored_sidecar: Option<&mlx_paged_attn::ColdSidecar>,
 ) -> bool {
     let Some(cold) = cold_tier else {
         return false;
     };
-    if cold.sidecar_policy.is_none() {
+    if cold.state_only() {
+        return cold_restored_blocks > 0;
+    }
+    if cold.sidecar_policy().is_none() {
         return false;
     }
     if cached_token_count == 0 {

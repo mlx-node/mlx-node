@@ -4,6 +4,7 @@ import { join } from 'node:path';
 
 import type { LoadableModel } from '@mlx-node/lm';
 import type { InferenceHost } from '@mlx-node/server/host';
+import { SERVER_CLOSE_MS } from '@mlx-node/server/supervision';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { parseServeArgs, run } from '../../packages/cli/src/commands/serve.js';
@@ -77,6 +78,7 @@ describe('parseServeArgs', () => {
       model: undefined,
       authToken: undefined,
       logDir: undefined,
+      cacheDisk: 'auto',
     });
   });
 
@@ -194,6 +196,7 @@ describe('mlx serve — end to end', () => {
 
     let healthUrl = '';
     let observedUrl = '';
+    let closeSpy: { mock: { calls: unknown[][] } } | undefined;
 
     await run(['--port', '0', '--models-dir', modelsDir], {
       hostOverrides: {
@@ -220,6 +223,8 @@ describe('mlx serve — end to end', () => {
         // The launcher engine policy is applied by `serve`, not by the engine.
         expect(process.env[CHUNK_ENV]).toBe('2048');
 
+        closeSpy = vi.spyOn(host, 'close');
+
         // Invoke the handler `run` actually registered rather than emitting a
         // real signal — emitting would also fire the test runner's own
         // handlers and tear the run down.
@@ -235,6 +240,8 @@ describe('mlx serve — end to end', () => {
 
     expect(observedUrl).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
     expect(exitCodes).toEqual([0]);
+    // Splash `supervision`: the server close leaves the flush its share of STOP_MS.
+    expect(closeSpy?.mock.calls).toEqual([[{ timeoutMs: SERVER_CLOSE_MS }]]);
     await expect(fetch(healthUrl)).rejects.toThrow();
 
     // Handlers detached on shutdown: a leaked one would keep a closed host
@@ -307,7 +314,7 @@ describe('mlx serve — end to end', () => {
         for (let i = 0; i < 200 && loads.length === 0; i++) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        expect(loads).toEqual([{ maxMemoryBytes: 30_064_771_072 }]);
+        expect(loads).toEqual([{ maxMemoryBytes: 30_064_771_072, cacheDisk: 'auto' }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
@@ -316,6 +323,50 @@ describe('mlx serve — end to end', () => {
       },
     });
     expect(exitCodes).toEqual([0]);
+  });
+
+  // Mutation TPS1: serve hands the host `byDefault: false` → red.
+  it('turns the paged KV disk cache on for every load unless --no-persist-cache or the env turns it off', async () => {
+    const modelsDir = await makeModelsDir(['alpha']);
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const previous = process.env.MLX_PERSIST_PAGED_CACHE;
+    const serveOnce = async (argv: string[]): Promise<{ on: boolean; env: string | undefined }> => {
+      const exitCodes: number[] = [];
+      const sigintBefore = new Set(listenersOf('SIGINT'));
+      let seen: { on: boolean; env: string | undefined } | undefined;
+      await run(['--port', '0', '--models-dir', modelsDir, ...argv], {
+        hostOverrides: {
+          disableStore: true,
+          sweepOrphanTempRoots: false,
+          pagedModelTypes: [],
+          estimateContextWindow: async () => null,
+          loadModel: async () => ({}) as unknown as LoadableModel,
+        },
+        exit: (code) => exitCodes.push(code),
+        onReady: async (host) => {
+          seen = { on: host.persistPagedCache, env: process.env.MLX_PERSIST_PAGED_CACHE };
+          const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
+          added[0]!('SIGINT');
+          for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        },
+      });
+      expect(exitCodes).toEqual([0]);
+      return seen!;
+    };
+    try {
+      delete process.env.MLX_PERSIST_PAGED_CACHE;
+      expect(await serveOnce([])).toEqual({ on: true, env: '1' });
+      expect(logSpy.mock.calls.flat().join('\n')).toContain('[mlx] paged KV disk cache: on');
+      expect(await serveOnce(['--no-persist-cache'])).toEqual({ on: false, env: '0' });
+      process.env.MLX_PERSIST_PAGED_CACHE = '0';
+      expect(await serveOnce([])).toEqual({ on: false, env: '0' });
+      expect(await serveOnce(['--persist-cache'])).toEqual({ on: true, env: '1' });
+    } finally {
+      if (previous === undefined) delete process.env.MLX_PERSIST_PAGED_CACHE;
+      else process.env.MLX_PERSIST_PAGED_CACHE = previous;
+    }
   });
 
   // Mutation: drop `idleReleaseSeconds` from the `createInferenceHost` call → red.
@@ -379,7 +430,7 @@ describe('mlx serve — end to end', () => {
         for (let i = 0; i < 200 && loads.length === 0; i++) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        expect(loads).toEqual([{ maxContextTokens: 102_400 }]);
+        expect(loads).toEqual([{ maxContextTokens: 102_400, cacheDisk: 'auto' }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
@@ -414,7 +465,7 @@ describe('mlx serve — end to end', () => {
         for (let i = 0; i < 200 && loads.length === 0; i++) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        expect(loads).toEqual([{ decodeShare: 0 }]);
+        expect(loads).toEqual([{ decodeShare: 0, cacheDisk: 'auto' }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
@@ -448,7 +499,7 @@ describe('mlx serve — end to end', () => {
         for (let i = 0; i < 200 && loads.length === 0; i++) {
           await new Promise((resolve) => setTimeout(resolve, 10));
         }
-        expect(loads).toEqual([{ kvFormat: 'bf16' }]);
+        expect(loads).toEqual([{ kvFormat: 'bf16', cacheDisk: 'auto' }]);
         const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
         added[0]!('SIGINT');
         for (let i = 0; i < 200 && exitCodes.length === 0; i++) {

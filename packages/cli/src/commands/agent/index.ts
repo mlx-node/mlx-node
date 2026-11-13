@@ -26,10 +26,16 @@ import { dirname, join, resolve } from 'node:path';
 // the family list must have exactly ONE definition (the drift guard's).
 import { CHAT_FAMILY_IDS, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
 import { readAgentDefaultModel } from '@mlx-node/agent/paths';
+import { parseCacheDir, parseMaxCacheDisk, resolveCacheDisk } from '@mlx-node/server/host/cache-disk';
 import { DECODE_SHARE_ERROR, parseDecodeShare } from '@mlx-node/server/host/decode-share';
 import { IDLE_RELEASE_ERROR, parseIdleRelease } from '@mlx-node/server/host/idle-release';
 import { MAX_CONTEXT_ERROR, parseMaxContext } from '@mlx-node/server/host/max-context';
 import { MAX_MEMORY_ERROR, parseMaxMemory } from '@mlx-node/server/host/max-memory';
+import {
+  PERSIST_PAGED_CACHE_DEFAULT,
+  resolvePersistPagedCache,
+  type PersistPagedCache,
+} from '@mlx-node/server/host/persist-cache';
 
 import {
   agentUpdateStatus,
@@ -53,14 +59,19 @@ export interface AgentArgScan {
   traceDir?: string;
   /** `--trace-dir` was present without a value — usage error. */
   traceDirMissingValue: boolean;
+  /** Native text of `--max-cache-disk` (lifted out of the argv, forwarded to `mlx serve`). */
+  cacheDisk?: string;
   /**
-   * Whether to persist the SSD paged cold tier (on by default; the mlx-owned
-   * `--no-persist-cache` flag turns it off). A SINGLE process-wide boolean
-   * applied to every family in `COLD_TIER_RESTORE_FAMILIES` — not to qwen3
-   * alone. Lifted out of the argv like the other mlx flags — never forwarded
-   * to the agent binary.
+   * The paged KV disk cache for the spawned `mlx serve`: on by default,
+   * `--no-persist-cache` sets the flag off. A SINGLE process-wide switch for
+   * every family in `COLD_TIER_RESTORE_FAMILIES` and the qwen3_5 state tier.
+   * Lifted out of the argv, never forwarded to the agent binary.
    */
-  persistPagedCache: boolean;
+  persistPagedCache: PersistPagedCache;
+  /** Absolute `--cache-dir` (lifted out of the argv, forwarded to `mlx serve`). */
+  cacheDir?: string;
+  /** A cache flag had a missing or bad value, or the cache flags conflict: the usage error. */
+  cacheDiskError?: string;
   /** Value of `--kv-format` (lifted out of the argv, forwarded to `mlx serve`). */
   kvFormat?: 'int8' | 'bf16';
   /** `--kv-format` had a missing or unknown value (the raw value, `''` when missing) — usage error. */
@@ -225,15 +236,32 @@ function i_next(index: number, argv: readonly string[]): number {
  * forwarded verbatim, never hijacked as mlx's flag. Routing (help/update/
  * subcommand) reads the value-aware passthrough head, so a stripped
  * `--models-dir` pair cannot mask what the binary will see at argv[0].
+ * `env` is read only to check `--cache-dir` against the resolved switch.
  */
-export function scanAgentArgs(argv: string[]): AgentArgScan {
+export function scanAgentArgs(
+  argv: string[],
+  env: NodeJS.ProcessEnv | Readonly<Record<string, string | undefined>> = process.env,
+): AgentArgScan {
   const passthrough: string[] = [];
   let modelsDir: string | undefined;
   let modelsDirMissingValue = false;
   let trace = false;
   let traceDir: string | undefined;
   let traceDirMissingValue = false;
-  let persistPagedCache = true;
+  let cacheDisk: string | undefined;
+  let persistCacheOff = false;
+  let cacheDir: string | undefined;
+  let cacheDiskError: string | undefined;
+  const takeCacheValue = (parse: (value: string) => string, value: string, assign: (parsed: string) => void) => {
+    try {
+      assign(parse(value));
+    } catch (error) {
+      cacheDiskError = error instanceof Error ? error.message : String(error);
+    }
+  };
+  const takeCacheDisk = (value: string): void =>
+    takeCacheValue(parseMaxCacheDisk, value, (parsed) => (cacheDisk = parsed));
+  const takeCacheDir = (value: string): void => takeCacheValue(parseCacheDir, value, (parsed) => (cacheDir = parsed));
   let kvFormat: 'int8' | 'bf16' | undefined;
   let kvFormatInvalid: string | undefined;
   const takeKvFormat = (value: string): void => {
@@ -336,7 +364,25 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
       continue;
     }
     if (arg === '--no-persist-cache') {
-      persistPagedCache = false;
+      persistCacheOff = true;
+      continue;
+    }
+    if (arg === '--max-cache-disk' || arg === '--cache-dir') {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('-')) {
+        cacheDiskError = `Missing value for ${arg}`;
+      } else {
+        (arg === '--max-cache-disk' ? takeCacheDisk : takeCacheDir)(next);
+        i++;
+      }
+      continue;
+    }
+    if (arg.startsWith('--max-cache-disk=')) {
+      takeCacheDisk(arg.slice('--max-cache-disk='.length));
+      continue;
+    }
+    if (arg.startsWith('--cache-dir=')) {
+      takeCacheDir(arg.slice('--cache-dir='.length));
       continue;
     }
     if (arg === '--kv-format') {
@@ -442,6 +488,22 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     passthrough.push(arg);
   }
 
+  const persistPagedCache: PersistPagedCache = persistCacheOff
+    ? { flag: false, byDefault: PERSIST_PAGED_CACHE_DEFAULT.byDefault }
+    : PERSIST_PAGED_CACHE_DEFAULT;
+  if (cacheDiskError === undefined) {
+    try {
+      resolveCacheDisk({
+        cacheDisk: cacheDisk ?? 'auto',
+        persistPagedCache: resolvePersistPagedCache(persistPagedCache, env),
+        offByFlag: persistCacheOff,
+        ...(cacheDir !== undefined ? { cacheDir } : {}),
+      });
+    } catch (error) {
+      cacheDiskError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
   // Route on what the binary will actually see at argv[0] — the value-aware
   // passthrough head — so a stripped `--models-dir` pair or a consumed value
   // cannot mask a subcommand or the blocked `update`.
@@ -454,6 +516,9 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     traceDir,
     traceDirMissingValue,
     persistPagedCache,
+    ...(cacheDisk !== undefined ? { cacheDisk } : {}),
+    ...(cacheDir !== undefined ? { cacheDir } : {}),
+    ...(cacheDiskError !== undefined ? { cacheDiskError } : {}),
     ...(kvFormat !== undefined ? { kvFormat } : {}),
     ...(kvFormatInvalid !== undefined ? { kvFormatInvalid } : {}),
     ...(maxMemoryBytes !== undefined ? { maxMemoryBytes } : {}),
@@ -682,10 +747,21 @@ mlx options (handled before the agent binary sees the args):
                             m or h suffix, e.g. 30m (default: 10m); off keeps
                             both, though POST /v1/memory/release still frees
                             the weights.
-  --no-persist-cache        Disable the on-by-default SSD cold tier for persisted
-                            paged prefix blocks. One switch for ALL restore-eligible
-                            families (${coldTierRestoreFamilyList().join(', ')});
-                            every other family never persists, flag or not.
+  --no-persist-cache        Turn off the paged KV disk cache, which is on by
+                            default (a conversation resumes after an engine
+                            restart without prefilling again).
+                            MLX_PERSIST_PAGED_CACHE=0 also turns it off when this
+                            flag is absent. One switch for ALL restore-eligible
+                            families (${coldTierRestoreFamilyList().join(', ')})
+                            and the Qwen3.5 dense and MoE state tier, whose files
+                            are then temporary; every other family never
+                            persists, flag or not.
+  --max-cache-disk <size>   SSD quota for the states of Qwen3.5 dense and MoE
+                            loads: auto (default; a quarter of the volume's
+                            free space beyond its floor, at most 32G), a size
+                            such as 16G, or 0 to disable.
+  --cache-dir <dir>         Where the persistent Qwen3.5 state tier keeps its
+                            files (default: ~/.mlx-node/cache/prefix-cache).
 
 First run: when no local model exists, an interactive wizard offers a curated
 download. Agent config home: ~/.mlx-agent (override: GROK_HOME).
@@ -867,6 +943,12 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     return;
   }
 
+  if (scan.cacheDiskError !== undefined) {
+    console.error(scan.cacheDiskError);
+    process.exitCode = 1;
+    return;
+  }
+
   // Must run before the spawned `mlx serve` starts so its native tracing
   // subscriber picks up the env we export here.
   configureAgentTracing(scan);
@@ -934,5 +1016,8 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     ...(scan.maxContextTokens !== undefined ? { maxContextTokens: scan.maxContextTokens } : {}),
     ...(scan.decodeShare !== undefined ? { decodeShare: scan.decodeShare } : {}),
     ...(scan.idleReleaseSeconds !== undefined ? { idleReleaseSeconds: scan.idleReleaseSeconds } : {}),
+    persistPagedCache: scan.persistPagedCache,
+    ...(scan.cacheDisk !== undefined ? { cacheDisk: scan.cacheDisk } : {}),
+    ...(scan.cacheDir !== undefined ? { cacheDir: scan.cacheDir } : {}),
   });
 }

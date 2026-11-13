@@ -4,7 +4,8 @@
  * Fork it, know whether it is alive, know how it died, restart it, and never
  * lie about its state. Nothing in this file imports an Electron symbol — the
  * one that does is `child-utility.ts`, which is a fork call and no decisions —
- * and nothing imports `@mlx-node/server` either: its `/host` entry statically
+ * and nothing imports `@mlx-node/server` but its addon-free `/supervision` leaf
+ * (through `shutdown-timings.ts`): its `/host` entry statically
  * pulls `@mlx-node/lm`, which maps the 233 MB native addon into whatever
  * process evaluates it. MAIN staying free of that IS the three-process split.
  *
@@ -29,6 +30,7 @@
 import { existsSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { INFERENCE_KILL_GRACE_MS } from '../../control-panel/shutdown-timings.js';
 import { buildChildEnv } from './env.js';
 import { readStartedFingerprints } from './journal.js';
 import {
@@ -89,9 +91,9 @@ export interface SupervisorTimings {
   /**
    * SIGTERM → SIGKILL escalation window.
    *
-   * The default must remain longer than the sidecar host's 5 s HTTP drain
-   * budget: after forced connection teardown the child still has to flush its
-   * request logs and remove its paged-config temp root before it exits.
+   * The default must remain longer than the sidecar host's HTTP drain plus its
+   * persistent SSD cache flush: a SIGKILL inside the flush loses the restore
+   * points a restart resumes from.
    */
   killGraceMs: number;
   /**
@@ -112,9 +114,9 @@ export const DEFAULT_TIMINGS: SupervisorTimings = Object.freeze({
   healthIntervalMs: 5_000,
   healthRequestTimeoutMs: 2_000,
   requestTimeoutMs: 60_000,
-  // 5 s for the sidecar host's HTTP drain, then 3 s for log flush + temp-root
-  // cleanup. Still below MAIN's independent whole-app quit deadline.
-  killGraceMs: 8_000,
+  // The sidecar host's HTTP drain, its SSD cache flush, then cleanup; below
+  // MAIN's whole-app quit deadline.
+  killGraceMs: INFERENCE_KILL_GRACE_MS,
   stdioFlushMs: 50,
   tracePollMs: 1_000,
 });

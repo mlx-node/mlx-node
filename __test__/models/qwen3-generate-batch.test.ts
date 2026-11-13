@@ -28,7 +28,7 @@ describe('Qwen3Model - generateBatch', () => {
 
     // Load model with tokenizer
     model = await Qwen3Model.load(modelPath);
-  });
+  }, 60000);
 
   it('should generate multiple completions for multiple prompts', async () => {
     if (!model) {

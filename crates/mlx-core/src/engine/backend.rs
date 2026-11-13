@@ -1346,6 +1346,11 @@ pub(crate) trait PagedBackend: ChatBackend {
     /// adapter prepare call. `block_size` / `extra_keys` / `cache_salt`
     /// thread the VLM per-block image keys (qwen3 ignores `block_size`,
     /// passes `&[]`, `0`).
+    /// The generation prompt this turn's render appends, which places the
+    /// prompt's replay point (Splash `Engine::promptReplayBoundary`); set
+    /// before [`Self::prime_prefix_state`].
+    fn set_generation_suffix(&mut self, _suffix: Option<std::sync::Arc<[u32]>>) {}
+
     fn prime_prefix_state(
         &mut self,
         plan: &[u32],

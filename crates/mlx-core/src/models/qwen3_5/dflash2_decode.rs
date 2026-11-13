@@ -1068,15 +1068,15 @@ impl crate::engine::dspark_turn::PagedDsparkBackend for Qwen35Inner {
             |inner, hit| inner.prime_dense_prefix(tokens, cache_salt, Some(hit)),
         )
     }
-
-    fn set_generation_suffix(&mut self, suffix: Option<std::sync::Arc<[u32]>>) {
-        self.dflash2_states.generation_suffix = suffix;
-    }
 }
 
 impl DFlash2Target for Qwen35Inner {
     fn dflash2(&self) -> Option<&super::dflash2::DFlash2Model> {
         self.dflash2.as_ref()
+    }
+
+    fn lane_seq(&self) -> u32 {
+        self.active_scheduled_seq.unwrap_or(0)
     }
 
     fn dflash2_states(&self) -> &crate::models::qwen3_5::dflash2_state::paged::DFlash2States {
@@ -1291,7 +1291,6 @@ pub(crate) mod tests {
             rope_theta: 10_000_000.0,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            persist_paged_cache: None,
             n_mtp_layers: 0,
         }
     }
@@ -1388,6 +1387,131 @@ pub(crate) mod tests {
     pub(crate) fn metal_is_default_device() -> bool {
         crate::engine::persistence::compiled_forward_backend_available()
             && unsafe { mlx_sys::mlx_default_device() } == 1
+    }
+
+    /// Word-level `t0`..`t15` plus `<|im_end|>` (16, outside the 16-token
+    /// head); the template renders each message's content and the
+    /// generation prompt `t2 t3`.
+    pub(crate) fn content_tokenizer() -> std::sync::Arc<crate::tokenizer::Qwen3Tokenizer> {
+        let vocab = (0..16)
+            .map(|i| format!("\"t{i}\": {i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let json = format!(
+            r#"{{
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": {{ "type": "Whitespace" }},
+                "post_processor": null,
+                "decoder": null,
+                "model": {{
+                    "type": "WordLevel",
+                    "vocab": {{ {vocab}, "<|im_end|>": 16 }},
+                    "unk_token": "t0"
+                }}
+            }}"#
+        );
+        let tokenizer = tokenizers::Tokenizer::from_bytes(json.as_bytes())
+            .unwrap_or_else(|error| panic!("fixture tokenizer: {error}"));
+        std::sync::Arc::new(
+            crate::tokenizer::Qwen3Tokenizer::from_tokenizer(
+                tokenizer,
+                Some(
+                    "{% for message in messages %}{{ message.content }} {% endfor %}\
+                     {% if add_generation_prompt %}t2 t3{% endif %}"
+                        .to_string(),
+                ),
+            )
+            .expect("tokenizer"),
+        )
+    }
+
+    /// The generation prompt [`content_tokenizer`]'s template appends.
+    pub(crate) const GENERATION_PROMPT: [u32; 2] = [2, 3];
+
+    /// The prompt [`content_tokenizer`] renders for one user message of
+    /// `body`.
+    pub(crate) fn rendered_prompt(body: &[u32]) -> Vec<u32> {
+        let mut tokens = body.to_vec();
+        tokens.extend(GENERATION_PROMPT);
+        tokens
+    }
+
+    /// One `chatSessionStart` per `(owner, body)` (Splash `Engine::submit`),
+    /// all queued before the first drive pass, driven through the model
+    /// thread's scheduler until every one replies. Returns the replies and
+    /// the most turns live in one pass.
+    pub(crate) fn drive_session_starts<B>(
+        state: &mut crate::engine::hybrid_scheduler::HybridSchedulerState<B>,
+        starts: &[(&str, &[u32])],
+        max_new_tokens: i32,
+    ) -> Result<(Vec<crate::engine::types::ChatResult>, usize)>
+    where
+        B: crate::engine::hybrid_scheduler::HybridSchedulerBackend,
+    {
+        use crate::engine::cmd::ChatCmd;
+        use crate::engine::model_command::ModelCommand;
+        use crate::model_thread::LoopControl;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut replies = Vec::new();
+        for (owner, body) in starts {
+            let content = body
+                .iter()
+                .map(|id| format!("t{id}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let message: crate::tokenizer::ChatMessage =
+                serde_json::from_value(serde_json::json!({"role": "user", "content": content}))
+                    .map_err(|error| Error::from_reason(error.to_string()))?;
+            let (reply, result) = tokio::sync::oneshot::channel();
+            let command = ChatCmd::SessionStart {
+                messages: vec![message],
+                config: crate::engine::types::ChatConfig {
+                    max_new_tokens: Some(max_new_tokens),
+                    temperature: Some(0.0),
+                    enable_mtp: Some(false),
+                    max_consecutive_tokens: Some(0),
+                    max_ngram_repeats: Some(0),
+                    reasoning_effort: Some("none".to_string()),
+                    cache_owner_id: Some((*owner).to_string()),
+                    ..Default::default()
+                },
+                reply,
+                cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            if sender
+                .send(ModelCommand::<B::FamilyCommand>::from_chat(command))
+                .is_err()
+            {
+                return Err(Error::from_reason("the command channel closed"));
+            }
+            replies.push((result, None));
+        }
+        // An idle pass with every sender gone ends the loop instead of
+        // blocking this thread.
+        drop(sender);
+        let mut most_live = 0;
+        for _ in 0..256 {
+            if !matches!(state.drive(&mut receiver), LoopControl::Continue) {
+                return Err(Error::from_reason("the scheduler stopped"));
+            }
+            most_live = most_live.max(state.live_turns());
+            for (result, done) in &mut replies {
+                if done.is_none()
+                    && let Ok(reply) = result.try_recv()
+                {
+                    *done = Some(reply?);
+                }
+            }
+            if replies.iter().all(|(_, done)| done.is_some()) {
+                let results = replies.into_iter().filter_map(|(_, done)| done).collect();
+                return Ok((results, most_live));
+            }
+        }
+        Err(Error::from_reason("the scheduled turns did not finish"))
     }
 }
 
@@ -1499,9 +1623,9 @@ mod paged_dflash2_tests {
 
     /// Greedy paged AR: `n` tokens and the cursor after them.
     fn paged_ar(inner: &mut Qwen35Inner, prompt: &[u32], n: usize) -> Result<(Vec<u32>, u32)> {
-        let prefix = inner.prime_prefix_state(prompt, true, 0, &[], 0)?;
+        let prefix = inner.prime_dense_prefix(prompt, 0, None)?;
         let suffix = &prompt[prefix.effective_cached_prefix_len()..];
-        let logits = inner.paged_prefill(suffix, &prefix, Stream::generation())?;
+        let logits = inner.dense_paged_prefill(suffix, &prefix, None)?.0;
         let mut tokens = argmax_rows(&logits)?;
         while tokens.len() < n {
             let last = *tokens.last().expect("one token");
@@ -1917,8 +2041,8 @@ mod paged_dflash2_tests {
         let _ctx = StreamContext::new(stream);
         let mut inner = tiny_paged_int8_dflash_inner(0x5_8005);
         let prompt = prompt(44);
-        let prefix = inner.prime_prefix_state(&prompt, true, 0, &[], 0)?;
-        inner.paged_prefill(&prompt, &prefix, stream)?.eval();
+        let prefix = inner.prime_dense_prefix(&prompt, 0, None)?;
+        inner.dense_paged_prefill(&prompt, &prefix, None)?.0.eval();
         assert_eq!(cursor(&inner), 44);
         let taps = inner
             .dflash2
@@ -2046,8 +2170,8 @@ mod paged_dflash2_tests {
         PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(128)));
         let result = (|| -> Result<(Vec<u32>, Vec<u32>)> {
             let mut plain = tiny_paged_int8_dflash_inner(0x5_8007);
-            let prefix = plain.prime_prefix_state(&prompt, true, 0, &[], 0)?;
-            let plain_logits = plain.paged_prefill(&prompt, &prefix, stream)?;
+            let prefix = plain.prime_dense_prefix(&prompt, 0, None)?;
+            let plain_logits = plain.dense_paged_prefill(&prompt, &prefix, None)?.0;
             let mut tapped = tiny_paged_int8_dflash_inner(0x5_8007);
             let prefix = tapped.prime_dspark_prefix_state(&prompt, true, 0)?;
             let tapped_logits = tapped.paged_prefill_with_draft_state(&prompt, &prefix, stream)?;
@@ -2174,6 +2298,16 @@ mod paged_dflash2_tests {
         tokens: &[u32],
         decoder: crate::engine::plan::DecoderPlan,
     ) -> Result<Vec<u32>> {
+        whole_turn_with(inner, tokens, decoder, None).map(|(history, _)| history)
+    }
+
+    /// [`whole_turn`] with the request's `reuse_cache`; also the raw text.
+    fn whole_turn_with(
+        inner: &mut Qwen35Inner,
+        tokens: &[u32],
+        decoder: crate::engine::plan::DecoderPlan,
+        reuse_cache: Option<bool>,
+    ) -> Result<(Vec<u32>, String)> {
         use crate::engine::backend::{ChatBackend, TurnOutput, WholeTurnArgs};
         use crate::engine::plan::{MediaCapabilities, MediaInputs, TurnPlan};
         let tokenizer = crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer();
@@ -2181,6 +2315,7 @@ mod paged_dflash2_tests {
             temperature: Some(0.0),
             max_new_tokens: Some(20),
             reasoning_effort: Some("none".to_string()),
+            reuse_cache,
             ..Default::default()
         };
         let params = ChatBackend::resolve_params(inner, &config);
@@ -2210,7 +2345,7 @@ mod paged_dflash2_tests {
             panic!("a sync turn completes");
         };
         assert_eq!(result.num_tokens, 20);
-        Ok(inner.cached_token_history.clone())
+        Ok((inner.cached_token_history.clone(), result.raw_text))
     }
 
     fn block_ids(inner: &Qwen35Inner) -> Vec<u32> {
@@ -2345,6 +2480,61 @@ mod paged_dflash2_tests {
         Ok(())
     }
 
+    /// A qwen3_5 SSD tier holds DFlash2 states only (Splash keeps no
+    /// per-turn KV on disk): an AR turn and a DFlash2 turn with the tier open
+    /// write no KV object and no sidecar, and the adapter captures nothing.
+    /// Mutation PT1: the tier's context backed `KvOnly` → red.
+    #[test]
+    fn qwen35_turns_write_no_kv_per_turn() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("qwen35_turns_write_no_kv_per_turn") {
+            return Ok(());
+        }
+        use crate::disk_tier::{CacheDisk, DiskTierOptions, open_disk_tier};
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let root = std::env::temp_dir().join(format!(
+            "mlx-qwen35-no-kv-per-turn-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let options = DiskTierOptions {
+            cache_disk: CacheDisk::Bytes(1 << 30),
+            temp_root: Some(root.clone()),
+            ..DiskTierOptions::default()
+        };
+        let tier = open_disk_tier(&options, || None, 1 << 20).expect("a temporary tier");
+        let dflash2 = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
+        for decoder in [DecoderPlan::Autoregressive, dflash2] {
+            let mut inner = tiny_paged_int8_dflash_inner(0x7_1010);
+            inner
+                .paged_adapter
+                .as_mut()
+                .expect("pool")
+                .set_cold_tier(super::super::dflash2_state::disk::state_context(&tier));
+            whole_turn(&mut inner, &prompt(100), decoder)?;
+            let adapter = inner.paged_adapter.as_ref().expect("pool");
+            assert_eq!(adapter.cold_captured_blocks(), 0, "{decoder:?}");
+            assert_eq!(adapter.cold_capture().enqueued, 0, "{decoder:?}");
+        }
+        assert!(tier.manager.drain(std::time::Duration::from_secs(10)));
+        for group in [
+            mlx_paged_attn::ColdGroup::Kv,
+            mlx_paged_attn::ColdGroup::ConvState,
+            mlx_paged_attn::ColdGroup::SlidingWindow,
+        ] {
+            assert!(tier.manager.keys_in(group).is_empty(), "{group:?}");
+        }
+        assert_eq!(tier.manager.total_bytes(), 0);
+        drop(tier);
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
     /// The next turn of the prompt that published R restores the draft from
     /// R's 4-bit window (Splash `planDraftContext`: its first point, the
     /// prompt's end, lies within a window of R): the ring holds the
@@ -2395,8 +2585,11 @@ mod paged_dflash2_tests {
             .entries()
             .next()
             .expect("R")
-            .state()
-            .window;
+            .ram()
+            .expect("a RAM copy")
+            .window
+            .as_ref()
+            .expect("a window");
         let begin = window
             .begin()
             .max(48 - (draft.config.sliding_window as u32 - 1));
@@ -2433,6 +2626,557 @@ mod paged_dflash2_tests {
             whole_turn(&mut ar, &far, DecoderPlan::Autoregressive)?
         );
         Ok(())
+    }
+
+    /// An autoregressive turn on a draft load publishes the points a DFlash2
+    /// turn of its prompt does, each with its draft window (Splash
+    /// `configureDraftStatePlan` runs for every request), and decodes the
+    /// tokens of a twin that keeps no state; its conversation's next
+    /// autoregressive turn resumes at its replay point.
+    /// Mutation MDL1 (`draft_lane_turn` false) → red (nothing parked).
+    #[test]
+    fn ar_turn_on_a_draft_load_publishes_draft_states() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "ar_turn_on_a_draft_load_publishes_draft_states",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::backend::ChatBackend;
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let first = prompt(100);
+        let mut spec = tiny_paged_int8_dflash_inner(0x5_8140);
+        whole_turn(
+            &mut spec,
+            &first,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+        )?;
+        let mut ar = tiny_paged_int8_dflash_inner(0x5_8140);
+        let (history, text) =
+            whole_turn_with(&mut ar, &first, DecoderPlan::Autoregressive, Some(true))?;
+        let depths = parked_depths(&ar);
+        assert!(!depths.is_empty(), "the AR turn published nothing");
+        assert_eq!(depths, parked_depths(&spec));
+        assert!(
+            ar.dflash2_states
+                .store
+                .entries()
+                .all(|entry| entry.ram().is_some_and(|state| state.window.is_some())),
+            "every state carries the draft window"
+        );
+        let mut cold = tiny_paged_int8_dflash_inner(0x5_8140);
+        let (_, cold_text) =
+            whole_turn_with(&mut cold, &first, DecoderPlan::Autoregressive, Some(false))?;
+        assert!(parked_depths(&cold).is_empty());
+        assert_eq!(text, cold_text, "publishing changed the tokens");
+        let mut next = history.clone();
+        next.extend((0..12u32).map(|i| (i * 7 + 3) % VOCAB));
+        let salt = ChatBackend::resolve_params(&ar, &Default::default()).cache_salt;
+        let prefix = PagedBackend::prime_prefix_state(&mut ar, &next, true, 0, &[], salt)?;
+        assert_eq!(
+            prefix.effective_cached_prefix_len(),
+            *depths.iter().max().expect("a depth")
+        );
+        Ok(())
+    }
+
+    /// One stored state: its depth, its GDN slots' bits, and its window's
+    /// bounds and rows' bits.
+    type DraftState = (usize, Vec<Vec<u32>>, (u32, u32), Vec<u32>);
+
+    fn window_state(
+        window: &crate::models::qwen3_5::draft_context::DraftContextWindow,
+    ) -> Result<((u32, u32), Vec<u32>)> {
+        let bounds = (window.begin(), window.end());
+        let rows = bits(&window.load_rows(window.begin(), window.end() - window.begin())?)?;
+        Ok((bounds, rows))
+    }
+
+    /// The states on `tokens`' lineage, by depth.
+    fn draft_states(inner: &Qwen35Inner, tokens: &[u32]) -> Result<Vec<DraftState>> {
+        let mut states = Vec::new();
+        for entry in inner.dflash2_states.store.entries() {
+            if !tokens.starts_with(entry.tokens()) {
+                continue;
+            }
+            let anchor = entry.ram().expect("a RAM copy");
+            let mut arrays = Vec::new();
+            for cache in &anchor.linear {
+                if matches!(
+                    cache,
+                    crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache::Linear(_)
+                ) {
+                    cache.collect_arrays(&mut arrays);
+                }
+            }
+            let cell = arrays.into_iter().map(bits).collect::<Result<Vec<_>>>()?;
+            let (bounds, rows) = window_state(anchor.window.as_ref().expect("a draft window"))?;
+            states.push((entry.depth(), cell, bounds, rows));
+        }
+        states.sort_by_key(|state| state.0);
+        Ok(states)
+    }
+
+    /// The fixture with a `rows`-row draft window, so a point's window
+    /// spans prefill slices.
+    fn wide_draft_inner(seed: u64, rows: usize) -> Qwen35Inner {
+        let mut inner = tiny_paged_int8_dflash_inner(seed);
+        inner.dflash2.as_mut().expect("draft").config.sliding_window = rows;
+        inner
+    }
+
+    /// The states a whole autoregressive turn of `tokens` on a draft load
+    /// publishes (task B's tapped prime and prefill), and its logits.
+    fn whole_turn_states(seed: u64, tokens: &[u32]) -> Result<(Vec<DraftState>, Vec<u32>)> {
+        let mut inner = wide_draft_inner(seed, 40);
+        let prefix = inner.prime_dspark_prefix_state(tokens, true, 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len(), 0);
+        let logits = inner.paged_prefill_with_draft_state(tokens, &prefix, Stream::generation())?;
+        Ok((draft_states(&inner, tokens)?, bits(&logits)?))
+    }
+
+    /// The scheduled prime of `tokens` on `seq` (Splash `admit` on a lane of
+    /// its own), the sequence parked after it.
+    fn scheduled_prime(
+        inner: &mut Qwen35Inner,
+        seq: u32,
+        tokens: &[u32],
+    ) -> Result<<Qwen35Inner as PagedBackend>::PrefixState> {
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        HybridSchedulerBackend::activate_scheduled_recurrent(inner, seq)?;
+        let base = PagedBackend::prime_prefix_state(inner, tokens, true, 16, &[], 0)?;
+        HybridSchedulerBackend::park_active_scheduled_recurrent(inner)?;
+        Ok(base)
+    }
+
+    /// The prefill slice `[start, end)` of `seq`'s request, the sequence
+    /// parked after it; returns the slice's logits.
+    fn scheduled_slice(
+        inner: &mut Qwen35Inner,
+        seq: u32,
+        tokens: &[u32],
+        base: &<Qwen35Inner as PagedBackend>::PrefixState,
+        start: usize,
+        end: usize,
+    ) -> Result<MxArray> {
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        HybridSchedulerBackend::activate_paged_seq(inner, seq)?;
+        let prefix = HybridSchedulerBackend::build_scheduled_prefix(
+            inner,
+            base,
+            start,
+            end - start,
+            tokens.to_vec(),
+            start == base.effective_cached_prefix_len(),
+        );
+        let logits = PagedBackend::paged_prefill(
+            inner,
+            &tokens[start..end],
+            &prefix,
+            Stream::default(crate::stream::DeviceType::Gpu),
+        )?;
+        logits.eval();
+        HybridSchedulerBackend::park_active_scheduled_recurrent(inner)?;
+        Ok(logits)
+    }
+
+    /// Splash `configureDraftStatePlan` and `publishReachedStateBoundaries`
+    /// for scheduled requests on a draft load, which decode
+    /// autoregressively (the scheduler never speculates there): two
+    /// sequences whose prefill slices interleave each publish the states a
+    /// whole turn of their prompt does, each with the whole turn's GDN cell
+    /// and draft window, the window carried across the slices on its own
+    /// sequence; the turn's end gives the window to the idle lane.
+    /// Mutations SD1 (a scheduled prefill on a draft load keeps no sink),
+    /// SW1 (a slice starts its window empty), EW1 (the turn's end keeps the
+    /// sequence's window) and MA1 (the accounts leave the sequences'
+    /// windows out) → red.
+    #[test]
+    fn scheduled_ar_on_a_draft_load_publishes_draft_states() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "scheduled_ar_on_a_draft_load_publishes_draft_states",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        let _ctx = StreamContext::new(Stream::generation());
+        let seed = 0x5_8150;
+        let prompts = [
+            (1u32, prompt(150)),
+            (
+                2u32,
+                (0..150u32).map(|i| (i * 5 + 1) % VOCAB).collect::<Vec<_>>(),
+            ),
+        ];
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(16)));
+        let result = (|| -> Result<()> {
+            let mut references = Vec::new();
+            for (_, tokens) in &prompts {
+                references.push(whole_turn_states(seed, tokens)?.0);
+            }
+            let mut inner = wide_draft_inner(seed, 40);
+            let mut bases = Vec::new();
+            for (seq, tokens) in &prompts {
+                let base = scheduled_prime(&mut inner, *seq, tokens)?;
+                assert_eq!(base.effective_cached_prefix_len(), 0);
+                bases.push(base);
+            }
+            for (start, end) in [(0, 48), (48, 112), (112, 150)] {
+                for ((seq, tokens), base) in prompts.iter().zip(&bases) {
+                    scheduled_slice(&mut inner, *seq, tokens, base, start, end)?;
+                }
+            }
+            assert!(inner.dflash2.is_some(), "the draft is back");
+            for ((seq, tokens), reference) in prompts.iter().zip(&references) {
+                let depths: Vec<usize> = reference.iter().map(|state| state.0).collect();
+                assert!(
+                    depths.iter().any(|&depth| depth > 48 && depth - 40 < 48)
+                        && depths.iter().any(|&depth| depth > 112 && depth - 40 < 112),
+                    "a window spans each slice end: {depths:?}"
+                );
+                assert_eq!(
+                    &draft_states(&inner, tokens)?,
+                    reference,
+                    "sequence {seq} publishes the whole turn's states"
+                );
+            }
+            assert_eq!(inner.dflash2_states.seq_windows.len(), 2);
+            let window = inner
+                .dflash2
+                .as_ref()
+                .expect("draft")
+                .config
+                .context_window_bytes();
+            let held = crate::models::qwen3_5::dflash2_turn::memory_accounts(&inner, 0).states;
+            for (seq, _) in &prompts {
+                HybridSchedulerBackend::scheduled_turn_closed(&mut inner, *seq);
+            }
+            assert_eq!(
+                crate::models::qwen3_5::dflash2_turn::memory_accounts(&inner, 0).states,
+                held - window,
+                "the lanes' windows were on the books; the idle lane keeps one"
+            );
+            assert!(inner.dflash2_states.seq_windows.is_empty());
+            assert!(inner.dflash2_states.turns.is_empty());
+            assert!(inner.dflash2_states.idle_lane.window.is_some());
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result
+    }
+
+    /// Splash `Cache::adopt` → `acquireDeepest` → `QwenStateStorage::restore`
+    /// for a scheduled request on a draft load: after a restart, a scheduled
+    /// request whose prompt extends a stored one resumes at its replay point
+    /// (144) from disk with the stored window in its lane; the point it
+    /// publishes 32 rows on (176) continues that window, and it and the
+    /// logits equal a whole turn's of the longer prompt; the read turns
+    /// resident.
+    /// Mutations SR1 (the scheduled prime on a draft load resumes at no
+    /// state), SR2 (its lane takes no stored window) and SP1 (the promotion
+    /// snapshots the serial lane's window) → red.
+    #[test]
+    fn scheduled_ar_on_a_draft_load_resumes_after_a_restart() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "scheduled_ar_on_a_draft_load_resumes_after_a_restart",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{
+            TestTier, attach_tier, persistent_test_tier,
+        };
+        use crate::models::qwen3_5::dflash2_state::disk::{adopt_all, close_cache};
+        let _ctx = StreamContext::new(Stream::generation());
+        let seed = 0x5_8160;
+        let on_tier = |tier: &TestTier| -> Result<Qwen35Inner> {
+            let mut inner = wide_draft_inner(seed, 40);
+            let window = inner
+                .dflash2
+                .as_ref()
+                .expect("draft")
+                .config
+                .context_window()?;
+            attach_tier(
+                &mut inner.dflash2_states,
+                &inner.config,
+                inner.paged_adapter.as_ref().expect("pool"),
+                tier,
+                window.nbytes(),
+                window.slots(),
+            );
+            inner.paged_adapter.as_mut().expect("pool").set_cold_tier(
+                crate::models::qwen3_5::dflash2_state::disk::state_context(&tier.tier),
+            );
+            Ok(inner)
+        };
+        let first = prompt(150);
+        let longer = prompt(180);
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(16)));
+        let result = (|| -> Result<()> {
+            let (reference, reference_logits) = whole_turn_states(seed, &longer)?;
+            let tier = persistent_test_tier("state-tier-sched-draft-restart", 1 << 30);
+            let mut inner = on_tier(&tier)?;
+            let base = scheduled_prime(&mut inner, 1, &first)?;
+            for (start, end) in [(0, 64), (64, 150)] {
+                scheduled_slice(&mut inner, 1, &first, &base, start, end)?;
+            }
+            HybridSchedulerBackend::release_scheduled_cache(&mut inner, 1)?;
+            HybridSchedulerBackend::scheduled_turn_closed(&mut inner, 1);
+            let stored = draft_states(&inner, &first)?;
+            let replay = stored
+                .iter()
+                .find(|state| state.0 == 144)
+                .cloned()
+                .expect("the replay point at 144");
+            assert!(close_cache(
+                &mut inner,
+                std::time::Instant::now() + std::time::Duration::from_secs(30)
+            ));
+            drop(inner);
+
+            let tier = tier.reopen("state-tier-sched-draft-restart", 1 << 30);
+            let mut inner = on_tier(&tier)?;
+            assert!(adopt_all(&mut inner) >= 1);
+            let base = scheduled_prime(&mut inner, 4, &longer)?;
+            assert_eq!(base.effective_cached_prefix_len(), 144);
+            assert_eq!(
+                window_state(
+                    inner
+                        .dflash2_states
+                        .seq_windows
+                        .get(&4)
+                        .expect("the lane's window")
+                )?,
+                (replay.2, replay.3.clone()),
+                "the lane holds the stored window"
+            );
+            let logits = scheduled_slice(&mut inner, 4, &longer, &base, 144, 180)?;
+            let disk = inner.dflash2_states.disk.as_ref().expect("tier").counters;
+            assert_eq!((disk.promotions, disk.invalidations), (1, 0));
+            let states = draft_states(&inner, &longer)?;
+            assert!(
+                states.contains(&replay),
+                "the promoted state is the stored one"
+            );
+            let past: Vec<_> = states.into_iter().filter(|state| state.0 > 144).collect();
+            let expected: Vec<_> = reference
+                .into_iter()
+                .filter(|state| state.0 > 144)
+                .collect();
+            assert!(
+                expected.iter().any(|state| state.0 == 176),
+                "the replay point at 176"
+            );
+            assert_eq!(
+                past, expected,
+                "the state past the resume continues the window"
+            );
+            assert_eq!(bits(&logits)?, reference_logits);
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result
+    }
+
+    /// The states a whole autoregressive turn of `tokens` on a draft load
+    /// publishes when its generation prompt is the template's.
+    fn whole_turn_states_with_prompt(seed: u64, tokens: &[u32]) -> Result<Vec<DraftState>> {
+        let mut inner = wide_draft_inner(seed, 40);
+        inner.dflash2_states.generation_suffix =
+            Some(std::sync::Arc::from(&super::tests::GENERATION_PROMPT[..]));
+        let prefix = inner.prime_dspark_prefix_state(tokens, true, 0)?;
+        assert_eq!(prefix.effective_cached_prefix_len(), 0);
+        inner.paged_prefill_with_draft_state(tokens, &prefix, Stream::generation())?;
+        draft_states(&inner, tokens)
+    }
+
+    /// Splash `Engine::submit` → `admit` → `configureDraftStatePlan` →
+    /// `publishReachedStateBoundaries` → `release` through the model
+    /// thread's scheduler on a draft load, which decodes autoregressively
+    /// (the scheduler never speculates there): two sessions started together
+    /// run as two live sequences, and each publishes the states, GDN cells
+    /// and draft windows a whole turn of its own prompt does; their windows
+    /// go back to the idle lane at their ends. After a restart (Splash
+    /// `Cache::adopt` → `acquireDeepest` → `QwenStateStorage::restore`) a
+    /// session whose prompt extends the first one's resumes at that one's
+    /// replay point (144) from disk, and the states it publishes past it,
+    /// windows reaching below 144 included, are the whole turn's of the
+    /// longer prompt.
+    /// Mutation DS1 (the scheduled prime on a draft load primes plain) → red.
+    #[test]
+    fn scheduler_runs_draft_load_ar_sessions_on_the_state_tier() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "scheduler_runs_draft_load_ar_sessions_on_the_state_tier",
+        ) || !super::tests::metal_is_default_device()
+        {
+            return Ok(());
+        }
+        use super::tests::{content_tokenizer, drive_session_starts, rendered_prompt};
+        use crate::engine::governor::governor::Governor;
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+        use crate::engine::hybrid_scheduler::HybridSchedulerState;
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{
+            TestTier, attach_tier, persistent_test_tier,
+        };
+        use crate::models::qwen3_5::dflash2_state::disk::{adopt_all, close_cache};
+        let _ctx = StreamContext::new(Stream::generation());
+        let seed = 0x5_81A0;
+        let scheduler_on = |tier: &TestTier| -> Result<HybridSchedulerState<Qwen35Inner>> {
+            let mut inner = wide_draft_inner(seed, 40);
+            let window = inner
+                .dflash2
+                .as_ref()
+                .expect("draft")
+                .config
+                .context_window()?;
+            attach_tier(
+                &mut inner.dflash2_states,
+                &inner.config,
+                inner.paged_adapter.as_ref().expect("pool"),
+                tier,
+                window.nbytes(),
+                window.slots(),
+            );
+            inner.paged_adapter.as_mut().expect("pool").set_cold_tier(
+                crate::models::qwen3_5::dflash2_state::disk::state_context(&tier.tier),
+            );
+            inner.tokenizer = Some(content_tokenizer());
+            let io = FakeIo::new(
+                stats(0),
+                host(32 * G, crate::engine::governor::host::Pressure::Normal),
+            );
+            let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+            inner.memory_registration =
+                Some(governor.register_model(model(16 * G, 0)).expect("register"));
+            let mut state = HybridSchedulerState::new(inner)?;
+            state.enable_continuous_batching();
+            Ok(state)
+        };
+        let first = prompt(150);
+        let second: Vec<u32> = (0..150u32).map(|i| (i * 5 + 1) % VOCAB).collect();
+        let longer = prompt(180);
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(16)));
+        let result = (|| -> Result<()> {
+            let references = [
+                whole_turn_states_with_prompt(seed, &rendered_prompt(&first))?,
+                whole_turn_states_with_prompt(seed, &rendered_prompt(&second))?,
+            ];
+            for reference in &references {
+                assert_eq!(
+                    reference.iter().map(|state| state.0).collect::<Vec<_>>(),
+                    vec![80, 144]
+                );
+            }
+            let longer_reference = whole_turn_states_with_prompt(seed, &rendered_prompt(&longer))?;
+            let tier = persistent_test_tier("state-tier-sched-drive-draft", 1 << 30);
+            let mut state = scheduler_on(&tier)?;
+            let (results, most_live) =
+                drive_session_starts(&mut state, &[("a", &first), ("b", &second)], 2)?;
+            assert_eq!(most_live, 2, "the two sessions ran as two live sequences");
+            for (result, (body, reference)) in results
+                .iter()
+                .zip([&first, &second].into_iter().zip(&references))
+            {
+                assert_eq!(result.cached_tokens, 0);
+                assert_eq!(
+                    &draft_states(&state.inner, &rendered_prompt(body))?,
+                    reference,
+                    "each session publishes its own whole turn's states"
+                );
+            }
+            assert!(state.inner.dflash2.is_some(), "the draft is back");
+            assert!(state.inner.dflash2_states.seq_windows.is_empty());
+            assert!(state.inner.dflash2_states.turns.is_empty());
+            assert!(state.inner.dflash2_states.idle_lane.window.is_some());
+            let replay = draft_states(&state.inner, &rendered_prompt(&first))?
+                .into_iter()
+                .find(|stored| stored.0 == 144)
+                .expect("the replay point at 144");
+            assert!(close_cache(
+                &mut state.inner,
+                std::time::Instant::now() + std::time::Duration::from_secs(30)
+            ));
+            drop(state);
+
+            let tier = tier.reopen("state-tier-sched-drive-draft", 1 << 30);
+            let mut state = scheduler_on(&tier)?;
+            assert!(adopt_all(&mut state.inner) >= 1);
+            let (results, _) = drive_session_starts(&mut state, &[("c", &longer)], 2)?;
+            assert_eq!(
+                results[0].cached_tokens, 144,
+                "the session resumed from disk"
+            );
+            let disk = state
+                .inner
+                .dflash2_states
+                .disk
+                .as_ref()
+                .expect("tier")
+                .counters;
+            assert_eq!((disk.promotions, disk.invalidations), (1, 0));
+            let states = draft_states(&state.inner, &rendered_prompt(&longer))?;
+            assert!(
+                states.contains(&replay),
+                "the promoted state is the stored one"
+            );
+            let past: Vec<_> = states.into_iter().filter(|stored| stored.0 > 144).collect();
+            let expected: Vec<_> = longer_reference
+                .into_iter()
+                .filter(|stored| stored.0 > 144)
+                .collect();
+            assert!(
+                expected.iter().any(|stored| stored.2.0 < 144),
+                "a window past the resume reaches below it"
+            );
+            assert_eq!(
+                past, expected,
+                "the states past the resume continue the stored window"
+            );
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result
+    }
+
+    /// A scheduled lane whose window did not come back with its state
+    /// draws no point's window from rows below its resume (48): only the
+    /// points a whole window (40) past it stay.
+    /// Mutation KD1 (every point stays) → red.
+    #[test]
+    fn a_lane_without_its_window_keeps_only_drawable_points() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "a_lane_without_its_window_keeps_only_drawable_points",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        let _ctx = StreamContext::new(Stream::generation());
+        let mut inner = wide_draft_inner(0x5_8170, 40);
+        let tokens = prompt(150);
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(16)));
+        let result = (|| -> Result<()> {
+            scheduled_prime(&mut inner, 3, &tokens)?;
+            HybridSchedulerBackend::activate_paged_seq(&mut inner, 3)?;
+            let points = |inner: &Qwen35Inner| -> Vec<u32> {
+                inner.dflash2_states.turns[&3]
+                    .plan
+                    .boundaries
+                    .iter()
+                    .map(|point| point.tokens)
+                    .collect()
+            };
+            let before = points(&inner);
+            assert_eq!(before, vec![80, 144]);
+            crate::models::qwen3_5::dflash2_turn::keep_drawable_points(&mut inner, 48, 48)?;
+            assert_eq!(points(&inner), before, "a lane at its resume keeps them");
+            crate::models::qwen3_5::dflash2_turn::keep_drawable_points(&mut inner, 48, 0)?;
+            assert_eq!(points(&inner), vec![144]);
+            Ok(())
+        })();
+        PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+        result
     }
 
     /// The tapped prefill ends a chunk at the prompt's replay point (Splash
@@ -2482,9 +3226,10 @@ mod paged_dflash2_tests {
                 .next()
                 .ok_or_else(|| Error::from_reason("no parked state"))?;
             assert_eq!(entry.tokens(), &full[..192]);
-            assert_eq!(entry.state().window.end(), 192);
+            let anchor = entry.ram().expect("a RAM copy");
+            assert_eq!(anchor.window.as_ref().expect("a window").end(), 192);
             let mut arrays = Vec::new();
-            entry.state().collect_arrays(&mut arrays);
+            anchor.collect_arrays(&mut arrays);
             arrays.into_iter().map(bits).collect()
         };
         assert!(anchor_bits(&inner)? == anchor_bits(&twin)?);
@@ -2690,7 +3435,7 @@ mod paged_dflash2_tests {
         script_claims(&[ScriptedClaim::Wait, ScriptedClaim::Grant { freed: false }]);
         let prefix = inner.prime_dspark_prefix_state(&prompt, true, 0)?;
         let draft = inner.dflash2.as_ref().expect("draft");
-        let bytes = anchor_bytes(&inner.config, &draft.config) + draft.config.kv_ring_bytes();
+        let bytes = anchor_bytes(&inner.config, Some(&draft.config)) + draft.config.kv_ring_bytes();
         assert_eq!(
             restore_log(take_claim_log()),
             vec![(ClaimClass::InService, Refusal::Waits, bytes); 2]
@@ -2806,8 +3551,8 @@ mod paged_dflash2_tests {
             let prefix = inner.prime_dspark_prefix_state(&prompt, true, 0)?;
             let anchor = inner
                 .dflash2_states
-                .turn
-                .as_ref()
+                .turns
+                .get(&0)
                 .expect("the turn's plan")
                 .anchor_bytes;
             let limit = grow.max(anchor) + grow.min(anchor) / 2;
@@ -2841,6 +3586,697 @@ mod paged_dflash2_tests {
             .block_telemetry()
             .expect("telemetry");
         assert_eq!(telemetry.total_blocks, 16, "the chunk grew the pool");
+        Ok(())
+    }
+
+    /// The ledger refuses both the capture of checkpoint 32 and its claim
+    /// from the lane: no RAM copy takes it, so the tier takes it from the
+    /// lane (Splash `publishStateToDisk` with `snapshotToDisk`). 32 is a
+    /// disk-only checkpoint whose object, once landed, holds the bytes a
+    /// granted twin's RAM state at 32 encodes to; the replay point 48 keeps
+    /// it. With the staging buffer out (a write in flight) 32 fails as
+    /// before the tier.
+    /// Mutation DP1 (no disk arm) → red.
+    #[test]
+    fn refused_capture_goes_to_disk_from_the_lane() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "refused_capture_goes_to_disk_from_the_lane",
+        ) {
+            return Ok(());
+        }
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{attach_tier, test_tier};
+        use crate::models::qwen3_5::dflash2_state::disk::{
+            encode_anchor, hold_staging, poll_offload, read_object,
+        };
+        use crate::models::qwen3_5::dflash2_turn::ScriptedClaim;
+        let _ctx = StreamContext::new(Stream::generation());
+        let prompt = prompt(52);
+        let tier = test_tier("state-tier-from-lane", 1 << 30);
+        let run = |claims: &[ScriptedClaim], held: bool| -> Result<Qwen35Inner> {
+            let mut inner = tiny_paged_int8_dflash_inner(0x5_8191);
+            with_ledger(&mut inner);
+            let window = inner
+                .dflash2
+                .as_ref()
+                .expect("draft")
+                .config
+                .context_window()?;
+            attach_tier(
+                &mut inner.dflash2_states,
+                &inner.config,
+                inner.paged_adapter.as_ref().expect("pool"),
+                &tier,
+                window.nbytes(),
+                window.slots(),
+            );
+            if held {
+                assert!(hold_staging(&mut inner.dflash2_states).is_some());
+            }
+            script_claims(claims);
+            tapped_prefill_by_four(&mut inner, &prompt)?;
+            Ok(inner)
+        };
+        let entries = |inner: &Qwen35Inner| -> Vec<(usize, bool, bool)> {
+            inner
+                .dflash2_states
+                .store
+                .entries()
+                .map(|entry| (entry.depth(), entry.checkpoint(), entry.ram().is_some()))
+                .collect()
+        };
+        let granted = ScriptedClaim::Grant { freed: false };
+
+        let twin = run(&[], false)?;
+        assert_eq!(entries(&twin), vec![(32, true, true), (48, false, true)]);
+        let want = {
+            let entry = twin
+                .dflash2_states
+                .store
+                .entries()
+                .find(|entry| entry.depth() == 32)
+                .expect("the twin's 32");
+            encode_anchor(
+                &twin.dflash2_states,
+                &twin.config,
+                entry.ram().expect("a RAM copy"),
+            )
+            .expect("the twin's bytes")
+        };
+
+        let mut inner = run(
+            &[granted, ScriptedClaim::Refuse, ScriptedClaim::Refuse],
+            false,
+        )?;
+        let counters = inner.dflash2_states.counters;
+        assert_eq!(counters.disk_state_publications, 1);
+        assert_eq!(counters.checkpoint_publication_failures, 0);
+        assert_eq!(entries(&inner), vec![(32, true, false), (48, false, true)]);
+        assert!(tier.tier.manager.drain(std::time::Duration::from_secs(10)));
+        poll_offload(&mut inner);
+        let id = inner
+            .dflash2_states
+            .store
+            .entries()
+            .find(|entry| entry.depth() == 32)
+            .map(|entry| entry.id())
+            .expect("32");
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(id)
+                .and_then(|entry| entry.disk())
+                .is_some_and(|copy| copy.landed)
+        );
+        assert!(
+            read_object(&inner.dflash2_states, id) == Some(want),
+            "the object holds the lane's state at 32"
+        );
+
+        let inner = run(
+            &[granted, ScriptedClaim::Refuse, ScriptedClaim::Refuse],
+            true,
+        )?;
+        let counters = inner.dflash2_states.counters;
+        assert_eq!(counters.disk_state_publications, 0);
+        assert_eq!(counters.checkpoint_publication_failures, 1);
+        assert_eq!(entries(&inner), vec![(48, false, true)]);
+        Ok(())
+    }
+
+    /// A fresh fixture whose states and cold KV are on `tier`; with
+    /// `ledger` its claims go through a ledger of its own.
+    fn disk_fixture(
+        seed: u64,
+        tier: &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
+        ledger: bool,
+    ) -> Result<Qwen35Inner> {
+        use crate::models::qwen3_5::dflash2_state::disk::tests::attach_tier;
+        let mut inner = tiny_paged_int8_dflash_inner(seed);
+        if ledger {
+            with_ledger(&mut inner);
+        }
+        let window = inner
+            .dflash2
+            .as_ref()
+            .expect("draft")
+            .config
+            .context_window()?;
+        attach_tier(
+            &mut inner.dflash2_states,
+            &inner.config,
+            inner.paged_adapter.as_ref().expect("pool"),
+            tier,
+            window.nbytes(),
+            window.slots(),
+        );
+        inner.paged_adapter.as_mut().expect("pool").set_cold_tier(
+            crate::models::qwen3_5::dflash2_state::disk::state_context(&tier.tier),
+        );
+        Ok(inner)
+    }
+
+    fn state_at(
+        inner: &Qwen35Inner,
+        depth: usize,
+    ) -> Option<crate::models::qwen3_5::dflash2_state::store::EntryId> {
+        inner
+            .dflash2_states
+            .store
+            .entries()
+            .find(|entry| entry.depth() == depth)
+            .map(|entry| entry.id())
+    }
+
+    /// Erases every state but `keep`.
+    fn keep_only(
+        inner: &mut Qwen35Inner,
+        keep: crate::models::qwen3_5::dflash2_state::store::EntryId,
+    ) {
+        let others: Vec<_> = inner
+            .dflash2_states
+            .store
+            .entries()
+            .map(|entry| entry.id())
+            .filter(|&id| id != keep)
+            .collect();
+        for id in others {
+            crate::models::qwen3_5::dflash2_state::disk::erase(&mut inner.dflash2_states, id);
+        }
+        inner.sync_gdn_state_marks();
+    }
+
+    /// `id`'s RAM copy as the tier writes it.
+    fn ram_bytes(
+        inner: &Qwen35Inner,
+        id: crate::models::qwen3_5::dflash2_state::store::EntryId,
+    ) -> Option<Vec<u8>> {
+        use crate::models::qwen3_5::dflash2_state::disk::encode_anchor;
+        let anchor = inner.dflash2_states.store.get(id)?.ram()?;
+        encode_anchor(&inner.dflash2_states, &inner.config, anchor)
+    }
+
+    /// Writes `id` to the tier as a reclaim does, lands its chain, and
+    /// evicts every block no other state holds. Returns its bytes.
+    fn to_disk_alone(
+        inner: &mut Qwen35Inner,
+        tier: &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
+        id: crate::models::qwen3_5::dflash2_state::store::EntryId,
+    ) -> Vec<u8> {
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{disk_copy, drained};
+        use crate::models::qwen3_5::dflash2_state::disk::{Reclaimed, Tick, reclaim, tick};
+        let want = ram_bytes(inner, id).expect("a RAM copy");
+        assert_eq!(reclaim(inner, id), Reclaimed::Written);
+        for _ in 0..64 {
+            drained(tier);
+            tick(inner, Tick::Full { command_pages: 0 });
+            if disk_copy(inner, id).is_some_and(|copy| copy.landed && !copy.chain_owed) {
+                break;
+            }
+        }
+        assert!(
+            disk_copy(inner, id).is_some_and(|copy| copy.landed && !copy.chain_owed),
+            "the state and its chain are on the tier"
+        );
+        let adapter = inner.paged_adapter.as_mut().expect("pool");
+        let _ = adapter.release_request_for(0);
+        let allocator = std::sync::Arc::clone(adapter.allocator());
+        let mut guard = allocator.lock().expect("allocator");
+        while guard.evict_oldest_dead_leaf().is_some() {}
+        want
+    }
+
+    /// The tier's object for `id`'s disk copy, as a file.
+    fn object_file(
+        inner: &Qwen35Inner,
+        tier: &crate::models::qwen3_5::dflash2_state::disk::tests::TestTier,
+        id: crate::models::qwen3_5::dflash2_state::store::EntryId,
+    ) -> std::path::PathBuf {
+        let key = inner
+            .dflash2_states
+            .store
+            .get(id)
+            .and_then(|entry| entry.disk().copied())
+            .expect("a disk copy")
+            .key
+            .to_hex();
+        let root = tier.tier.manager.root().to_path_buf();
+        std::fs::read_dir(&root)
+            .expect("the tier's root")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(&key))
+            })
+            .expect("the state's object")
+    }
+
+    /// R (96) of a 100-token turn goes to the tier: its chain lands and
+    /// every block of it leaves RAM. The same prompt's next turn resumes
+    /// at R from the tier: the KV chain comes back from the walk, the lane
+    /// gets R's exact cell and window (its promoted RAM copy is the lane's
+    /// copy), and the greedy tokens equal paged AR's (03-PLAN gate). With
+    /// another state's write in flight, the read waits for its landing and
+    /// restores the same bytes.
+    /// Mutations RT1 (the writer drops the window span: the payload check
+    /// refuses, the turn goes cold) and SW1 (the read does not wait for
+    /// the staging buffer) → red.
+    #[test]
+    fn disk_state_restores_byte_equal_and_greedy_equal() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "disk_state_restores_byte_equal_and_greedy_equal",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{insert_state, test_tier};
+        use crate::models::qwen3_5::dflash2_state::disk::{Staged, stage};
+        use crate::models::qwen3_5::model::dflash2_park_tests::chain_tokens;
+        let _ctx = StreamContext::new(Stream::generation());
+        let dflash2 = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
+        let first = prompt(100);
+        let seed = 0x5_8200;
+        let tier = test_tier("state-tier-restore", 1 << 30);
+        let reference = whole_turn(
+            &mut tiny_paged_int8_dflash_inner(seed),
+            &first,
+            DecoderPlan::Autoregressive,
+        )?;
+
+        let mut inner = disk_fixture(seed, &tier, false)?;
+        whole_turn(&mut inner, &first, dflash2)?;
+        let r = state_at(&inner, 96).expect("the replay point at 96");
+        keep_only(&mut inner, r);
+        let want = to_disk_alone(&mut inner, &tier, r);
+        let mark = inner.dflash2_states.store.get(r).expect("R").mark();
+        assert!(
+            !inner
+                .paged_adapter
+                .as_ref()
+                .expect("pool")
+                .prefix_cached(mark),
+            "R's blocks left RAM"
+        );
+        let hits = tier.tier.manager.stats().hits;
+
+        assert_eq!(whole_turn(&mut inner, &first, dflash2)?, reference);
+        assert_eq!(
+            tier.tier.manager.stats().hits - hits,
+            6,
+            "R's chain came back from the tier"
+        );
+        let counters = inner.dflash2_states.disk.as_ref().expect("tier").counters;
+        assert_eq!((counters.promotions, counters.invalidations), (1, 0));
+        assert!(ram_bytes(&inner, r) == Some(want.clone()), "R's bytes");
+
+        // R on disk alone again, its blocks resident; another state's write
+        // holds the staging buffer.
+        assert_eq!(
+            crate::models::qwen3_5::dflash2_state::disk::reclaim(&mut inner, r),
+            crate::models::qwen3_5::dflash2_state::disk::Reclaimed::RamDropped
+        );
+        let block_size = inner.paged_adapter.as_ref().expect("pool").block_size();
+        let other = insert_state(
+            &mut inner,
+            &chain_tokens(77, 1, block_size),
+            crate::models::qwen3_5::dflash2_state::store::StateClass::Ordinary,
+        );
+        assert_eq!(
+            stage(&mut inner, other, mlx_paged_attn::MakeRoom::Evict, false),
+            Staged::Started
+        );
+        assert_eq!(whole_turn(&mut inner, &first, dflash2)?, reference);
+        let counters = inner.dflash2_states.disk.as_ref().expect("tier").counters;
+        assert_eq!((counters.promotions, counters.invalidations), (2, 0));
+        assert!(
+            ram_bytes(&inner, r) == Some(want),
+            "R's bytes after the wait"
+        );
+        Ok(())
+    }
+
+    /// The restore of a disk state is promoted under one optional,
+    /// immediate claim of its RAM copy and lineage, settled (Splash
+    /// `promotedCopy`): granted, R holds RAM and disk copies; refused, R
+    /// stays on disk and the next turn reads the tier again.
+    /// Mutation PR1 (the promotion is claimed in service) → red.
+    #[test]
+    fn promotion_is_optional_and_immediate() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("promotion_is_optional_and_immediate") {
+            return Ok(());
+        }
+        use crate::engine::governor::allocate::Refusal;
+        use crate::engine::governor::ledger::{ClaimClass, NeedTiming};
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        use crate::models::qwen3_5::dflash2_state::disk::tests::test_tier;
+        use crate::models::qwen3_5::dflash2_turn::ScriptedClaim;
+        let _ctx = StreamContext::new(Stream::generation());
+        let dflash2 = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
+        let first = prompt(100);
+        let promotions = |log: &[crate::models::qwen3_5::dflash2_turn::ClaimLog], bytes: u64| {
+            log.iter()
+                .filter(|claim| claim.bytes == bytes && claim.refusal == Refusal::Settled)
+                .map(|claim| (claim.cls, claim.timing))
+                .collect::<Vec<_>>()
+        };
+        let optional = (ClaimClass::Optional, NeedTiming::Immediate);
+        for granted in [true, false] {
+            let tier = test_tier("state-tier-promote", 1 << 30);
+            let mut inner = disk_fixture(0x5_8210, &tier, true)?;
+            whole_turn(&mut inner, &first, dflash2)?;
+            let r = state_at(&inner, 96).expect("R");
+            keep_only(&mut inner, r);
+            to_disk_alone(&mut inner, &tier, r);
+            let bytes = inner
+                .dflash2_states
+                .store
+                .get(r)
+                .expect("R")
+                .resident_bytes();
+            take_claim_log();
+            let promotion = if granted {
+                ScriptedClaim::Grant { freed: false }
+            } else {
+                ScriptedClaim::Refuse
+            };
+            script_claims(&[ScriptedClaim::Grant { freed: false }, promotion]);
+            whole_turn(&mut inner, &first, dflash2)?;
+            assert_eq!(promotions(&take_claim_log(), bytes), vec![optional]);
+            let entry = inner.dflash2_states.store.get(r).expect("R stays");
+            let counters = inner.dflash2_states.disk.as_ref().expect("tier").counters;
+            assert!(entry.disk().is_some());
+            if granted {
+                assert!(entry.ram().is_some());
+                assert_eq!((counters.promotions, counters.promotions_skipped), (1, 0));
+                continue;
+            }
+            assert!(entry.ram().is_none());
+            assert_eq!((counters.promotions, counters.promotions_skipped), (0, 1));
+            whole_turn(&mut inner, &first, dflash2)?;
+            let counters = inner.dflash2_states.disk.as_ref().expect("tier").counters;
+            assert_eq!(counters.promotions, 1, "the next turn read the tier again");
+            assert!(ram_bytes(&inner, r).is_some());
+        }
+        Ok(())
+    }
+
+    /// A disk state that does not read back (one byte of its object
+    /// flipped) is discarded and the turn resumes at the next deepest state,
+    /// the RAM checkpoint at 80, with paged AR's greedy tokens; so is one
+    /// whose chain lost a KV object.
+    /// Mutation BR1 (a failed read keeps the state) → red.
+    #[test]
+    fn a_bad_read_discards_the_state_and_resumes_lower() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "a_bad_read_discards_the_state_and_resumes_lower",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{kv_key, test_tier};
+        let _ctx = StreamContext::new(Stream::generation());
+        let dflash2 = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
+        let first = prompt(100);
+        let seed = 0x5_8220;
+        let reference = whole_turn(
+            &mut tiny_paged_int8_dflash_inner(seed),
+            &first,
+            DecoderPlan::Autoregressive,
+        )?;
+        for damage in ["object", "chain"] {
+            let tier = test_tier("state-tier-bad-read", 1 << 30);
+            let mut inner = disk_fixture(seed, &tier, false)?;
+            PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(Some(4)));
+            let turn = whole_turn(&mut inner, &first, dflash2);
+            PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
+            turn?;
+            let r = state_at(&inner, 96).expect("R");
+            let checkpoint = state_at(&inner, 80).expect("the checkpoint at 80");
+            to_disk_alone(&mut inner, &tier, r);
+            if damage == "object" {
+                let path = object_file(&inner, &tier, r);
+                let mut bytes = std::fs::read(&path)?;
+                let last = bytes.len() - 1;
+                bytes[last] ^= 0x5a;
+                std::fs::write(&path, bytes)?;
+            } else {
+                assert!(tier.tier.manager.remove(&kv_key(&inner, &tier, r, 5)));
+            }
+            let salt =
+                crate::engine::backend::ChatBackend::resolve_params(&inner, &Default::default())
+                    .cache_salt;
+            let prefix = inner.prime_dspark_prefix_state(&first, true, salt)?;
+            assert_eq!(
+                prefix.effective_cached_prefix_len(),
+                80,
+                "{damage}: the turn resumes at the checkpoint"
+            );
+            inner.abort_paged_turn();
+            let counters = inner.dflash2_states.disk.as_ref().expect("tier").counters;
+            assert_eq!(counters.invalidations, 1, "{damage}");
+            assert!(
+                inner.dflash2_states.store.get(r).is_none(),
+                "{damage}: R is gone"
+            );
+            assert!(inner.dflash2_states.store.get(checkpoint).is_some());
+            assert_eq!(
+                whole_turn(&mut inner, &first, dflash2)?,
+                reference,
+                "{damage}"
+            );
+        }
+        Ok(())
+    }
+
+    /// An autoregressive turn after a DFlash2 turn whose replay point (96)
+    /// is on the tier alone, its chain there and out of RAM: the KV lookup
+    /// restores the chain below 96 from the tier and the GDN prime takes
+    /// the cell from R's object, replaying nothing.
+    /// Mutation AR2 (disk states are no GDN candidates) → red (the prime
+    /// replays the prefix).
+    #[test]
+    fn ar_turn_reads_a_disk_state() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("ar_turn_reads_a_disk_state") {
+            return Ok(());
+        }
+        use crate::engine::backend::ChatBackend;
+        use crate::engine::governor::ledger::UnitKey;
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        use crate::models::qwen3_5::dflash2_state::disk::tests::test_tier;
+        let stream = Stream::generation();
+        let _ctx = StreamContext::new(stream);
+        let first = prompt(100);
+        let tier = test_tier("state-tier-ar-read", 1 << 30);
+        let mut inner = disk_fixture(0x5_8230, &tier, false)?;
+        let salt = ChatBackend::resolve_params(&inner, &Default::default()).cache_salt;
+        whole_turn(
+            &mut inner,
+            &first,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+        )?;
+        let r = state_at(&inner, 96).expect("the replay point at 96");
+        keep_only(&mut inner, r);
+        to_disk_alone(&mut inner, &tier, r);
+        let hits = tier.tier.manager.stats().hits;
+        let mut second = first.clone();
+        second.extend((0..20u32).map(|i| (i * 5 + 1) % VOCAB));
+        let prefix = inner.prime_dense_prefix(&second, salt, None)?;
+        assert_eq!(
+            crate::engine::backend::PagedPrefix::effective_cached_prefix_len(&prefix),
+            96
+        );
+        assert_eq!(
+            tier.tier.manager.stats().hits - hits,
+            6,
+            "the chain came back"
+        );
+        assert_eq!(inner.last_gdn_prefix_prepare_state, "checkpoint");
+        assert_eq!(inner.gdn_in_use_for_test(0), Some(&UnitKey::Store(r)));
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(r)
+                .is_some_and(|entry| entry.ram().is_none()),
+            "an autoregressive read promotes nothing"
+        );
+        inner.abort_paged_turn();
+        Ok(())
+    }
+
+    /// An autoregressive turn whose deepest disk state lost a block of its
+    /// chain discards it at the lookup (Splash `pollRestores` →
+    /// `discardState`), so no later turn arms it or walks the tier for it.
+    /// Mutation DD1 (the disk arm takes a state its chain cannot restore)
+    /// → red (R stays).
+    #[test]
+    fn ar_turn_discards_a_disk_state_whose_chain_is_gone() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "ar_turn_discards_a_disk_state_whose_chain_is_gone",
+        ) {
+            return Ok(());
+        }
+        use crate::engine::backend::ChatBackend;
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{kv_key, test_tier};
+        let _ctx = StreamContext::new(Stream::generation());
+        let first = prompt(100);
+        let tier = test_tier("state-tier-ar-gone", 1 << 30);
+        let mut inner = disk_fixture(0x5_8231, &tier, false)?;
+        let salt = ChatBackend::resolve_params(&inner, &Default::default()).cache_salt;
+        whole_turn(
+            &mut inner,
+            &first,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+        )?;
+        let r = state_at(&inner, 96).expect("the replay point at 96");
+        keep_only(&mut inner, r);
+        to_disk_alone(&mut inner, &tier, r);
+        assert!(tier.tier.manager.remove(&kv_key(&inner, &tier, r, 5)));
+        let mut second = first.clone();
+        second.extend((0..20u32).map(|i| (i * 5 + 1) % VOCAB));
+        let _prefix = inner.prime_dense_prefix(&second, salt, None)?;
+        inner.abort_paged_turn();
+        assert!(inner.dflash2_states.store.get(r).is_none(), "R is gone");
+        let counters = inner.dflash2_states.disk.as_ref().expect("tier").counters;
+        assert_eq!(counters.invalidations, 1);
+        Ok(())
+    }
+
+    /// The model's `closeCache` command at a clean stop, its deadline in
+    /// milliseconds on `Date.now()`'s clock: a persistent tier writes the
+    /// waiting point with its chain before that deadline and reports it.
+    /// Mutation CC1 (the deadline is read as now) → red.
+    #[test]
+    fn close_cache_command_flushes_by_its_deadline() -> Result<()> {
+        use crate::engine::model_command::FamilyCommand;
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{
+            disk_copy, park_blocks, persistent_test_tier,
+        };
+        use crate::models::qwen3_5::dflash2_state::store::StateClass;
+        use crate::models::qwen3_5::dflash2_state::write_behind::{MINIMUM_TOKENS, published};
+        use crate::models::qwen3_5::model::Qwen35FamilyCommand;
+        let _ctx = StreamContext::new(Stream::generation());
+        let tier = persistent_test_tier("state-tier-close-command", 1 << 30);
+        let mut inner = disk_fixture(0x5_8250, &tier, false)?;
+        let block_size = inner.paged_adapter.as_ref().expect("pool").block_size();
+        let blocks = MINIMUM_TOKENS.div_ceil(block_size);
+        let p = park_blocks(&mut inner, 140, blocks, StateClass::Ordinary);
+        published(&mut inner.dflash2_states, p, blocks * block_size, 0.0);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1000.0;
+        let (reply, mut flushed) = tokio::sync::oneshot::channel();
+        Qwen35FamilyCommand::CloseCache {
+            deadline_ms: now_ms + 6000.0,
+            reply,
+        }
+        .execute(&mut inner);
+        assert!(flushed.try_recv().expect("a reply")?);
+        assert!(disk_copy(&inner, p).is_some_and(|copy| copy.landed && !copy.chain_owed));
+        assert!(!inner.dflash2_states.disk.as_ref().expect("tier").writable());
+        Ok(())
+    }
+
+    /// A persistent tier's next load takes back what the last one closed
+    /// (Splash `Cache::adopt`): R (96) and a checkpoint on another chain
+    /// reach the disk at `closeCache`, the checkpoint by a reclaim and R by
+    /// the write-behind flush. The next load has both on disk alone, stamps
+    /// continuing past R's, and a turn on the same prompt resumes at R from
+    /// the tier with paged AR's greedy tokens. With one KV object of the
+    /// checkpoint's chain gone, only R comes back.
+    /// Mutation AD1 (a state comes back without its whole chain) → red.
+    #[test]
+    fn restart_adopts_states_with_whole_chains() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported("restart_adopts_states_with_whole_chains")
+        {
+            return Ok(());
+        }
+        use crate::engine::plan::{DecoderPlan, SpeculativeKind};
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{
+            disk_copy, kv_key, park_blocks, persistent_test_tier,
+        };
+        use crate::models::qwen3_5::dflash2_state::disk::{
+            Reclaimed, adopt_all, close_cache, reclaim,
+        };
+        use crate::models::qwen3_5::dflash2_state::store::StateClass;
+        let _ctx = StreamContext::new(Stream::generation());
+        let dflash2 = DecoderPlan::Speculative(SpeculativeKind::DraftModel);
+        let first = prompt(100);
+        let seed = 0x5_8240;
+        let reference = whole_turn(
+            &mut tiny_paged_int8_dflash_inner(seed),
+            &first,
+            DecoderPlan::Autoregressive,
+        )?;
+        for broken in [false, true] {
+            let tier = persistent_test_tier("state-tier-adopt", 1 << 30);
+            let mut inner = disk_fixture(seed, &tier, false)?;
+            whole_turn(&mut inner, &first, dflash2)?;
+            let r = state_at(&inner, 96).expect("the replay point at 96");
+            keep_only(&mut inner, r);
+            let c = park_blocks(&mut inner, 77, 2, StateClass::Checkpoint);
+            assert_eq!(reclaim(&mut inner, c), Reclaimed::Written);
+            assert!(close_cache(
+                &mut inner,
+                std::time::Instant::now() + std::time::Duration::from_secs(6)
+            ));
+            let r_copy = disk_copy(&inner, r).expect("R on disk");
+            let c_copy = disk_copy(&inner, c).expect("the checkpoint on disk");
+            assert!(r_copy.landed && !r_copy.chain_owed);
+            assert!(c_copy.landed && !c_copy.chain_owed);
+            let (_, r_label) = tier
+                .tier
+                .manager
+                .state_label(r_copy.key, tier.tier.state_fingerprint)
+                .expect("R's label");
+            let lost = kv_key(&inner, &tier, c, 1);
+            drop(inner);
+            if broken {
+                assert!(tier.tier.manager.remove(&lost));
+            }
+
+            let tier = tier.reopen("state-tier-adopt", 1 << 30);
+            let mut inner = disk_fixture(seed, &tier, false)?;
+            assert_eq!(adopt_all(&mut inner), if broken { 1 } else { 2 });
+            let disk = inner.dflash2_states.disk.as_ref().expect("tier");
+            assert_eq!(disk.counters.adopted, if broken { 1 } else { 2 });
+            let entries: Vec<(usize, bool, bool)> = inner
+                .dflash2_states
+                .store
+                .entries()
+                .map(|entry| (entry.depth(), entry.checkpoint(), entry.ram().is_some()))
+                .collect();
+            let block = inner.paged_adapter.as_ref().expect("pool").block_size() as usize;
+            assert_eq!(entries.len(), if broken { 1 } else { 2 });
+            assert!(entries.contains(&(96, false, false)), "R on disk alone");
+            assert_eq!(
+                entries.contains(&(2 * block, true, false)),
+                !broken,
+                "the checkpoint only with its whole chain"
+            );
+            let adopted = state_at(&inner, 96).expect("R");
+            let copy = disk_copy(&inner, adopted).expect("R's disk copy");
+            assert_eq!(
+                (copy.key, copy.window_begin, copy.landed, copy.chain_owed),
+                (r_copy.key, r_copy.window_begin, true, false)
+            );
+            assert!(inner.dflash2_states.store.next_stamp() > r_label.last_used);
+
+            let hits = tier.tier.manager.stats().hits;
+            assert_eq!(whole_turn(&mut inner, &first, dflash2)?, reference);
+            assert_eq!(
+                tier.tier.manager.stats().hits - hits,
+                6,
+                "R's chain came back from the tier"
+            );
+            let counters = inner.dflash2_states.disk.as_ref().expect("tier").counters;
+            assert_eq!((counters.promotions, counters.invalidations), (1, 0));
+        }
         Ok(())
     }
 
@@ -2912,8 +4348,8 @@ mod paged_dflash2_tests {
             assert_eq!(inner.dflash2_states.counters.lazy_junctions, 2);
             let points: Vec<u32> = inner
                 .dflash2_states
-                .turn
-                .as_ref()
+                .turns
+                .get(&0)
                 .expect("D's turn")
                 .plan
                 .boundaries
@@ -2960,14 +4396,14 @@ mod paged_dflash2_tests {
         TURN_END_LOG.with(|log| log.borrow_mut().clear());
         let history = whole_turn(&mut spec, &first, dflash2)?;
         assert_eq!(
+            TURN_END_LOG.with(|log| std::mem::take(&mut *log.borrow_mut())),
+            vec!["register", "release", "end_use"]
+        );
+        assert_eq!(
             history,
             whole_turn(&mut ar, &first, DecoderPlan::Autoregressive)?
         );
         assert_eq!(history.len(), first.len() + 19);
-        assert_eq!(
-            TURN_END_LOG.with(|log| std::mem::take(&mut *log.borrow_mut())),
-            vec!["register", "release", "end_use"]
-        );
         assert!(
             !spec
                 .paged_adapter
@@ -3176,7 +4612,7 @@ mod paged_dflash2_tests {
         })();
         PREFILL_CHUNK_ROWS_OVERRIDE.with(|rows| rows.set(None));
         result?;
-        let turn = inner.dflash2_states.turn.as_ref().expect("the turn state");
+        let turn = inner.dflash2_states.turns.get(&0).expect("the turn state");
         assert!(
             turn.plan.boundaries.is_empty(),
             "{:?}",

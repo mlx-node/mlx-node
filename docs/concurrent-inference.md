@@ -425,7 +425,7 @@ above as a cooled median-of-three 4-bit result.
 - **Stage 2c — wider hybrid execution (landed):**
   text-only Qwen3.5 dense and MoE store at most two request-local GDN units, fuse
   their `[N,1,H]` decode, and reconcile preemption through the deepest
-  K/V-backed GDN checkpoint/sidecar boundary. Paged-block growth and recurrent
+  K/V-backed GDN checkpoint boundary. Paged-block growth and recurrent
   state debit one byte budget. Eligible text-only paged checkpoints opt in with
   `MLX_CONTINUOUS_BATCHING=1`. Fixed-depth native MTP now shares per-owner
   verification; adaptive MTP, DFlash2 and media retain exclusive lanes. The tiny

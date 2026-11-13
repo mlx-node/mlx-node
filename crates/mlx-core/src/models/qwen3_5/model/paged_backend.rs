@@ -213,12 +213,28 @@ impl Qwen35Inner {
             tokens: plan,
             keys: Some((&lookup_extra_keys, cache_salt)),
         };
+        // A disk state's chain comes back with the KV lookup.
+        let disk_state = dflash2_hit
+            .is_none()
+            .then(|| {
+                crate::models::qwen3_5::dflash2_turn::disk_state_depth(
+                    self,
+                    plan,
+                    &lookup_extra_keys,
+                    cache_salt,
+                    max_cache_hit_tokens,
+                )
+            })
+            .flatten();
         let turn_plan = crate::models::qwen3_5::dflash2_turn::claimed(self, keep, |inner| {
             let adapter = inner
                 .paged_adapter
                 .as_mut()
                 .ok_or_else(|| Error::from_reason("prime_prefix_state: paged_adapter is None"))?;
             let Some(hit) = dflash2_hit else {
+                if let Some(depth) = disk_state {
+                    adapter.arm_state_restore(depth);
+                }
                 // A scheduled lane books nothing past its hit: each prefill
                 // slice's step claim books the slice (Splash
                 // `Engine::workEndOf`).
@@ -254,7 +270,8 @@ impl Qwen35Inner {
                 cache_salt,
                 hit,
             )
-        })?;
+        })
+        .inspect_err(|_| self.dflash2_states.state_read = None)?;
         let cached_prefix_len = turn_plan.cached_prefix_len;
         let continued_live_prefix = turn_plan.continued_live_prefix;
         if trace_enabled {
@@ -309,10 +326,13 @@ impl Qwen35Inner {
             .get(cached..)
             .ok_or_else(|| Error::from_reason("a replay's prefix passed its tokens"))?;
         let logits = match decode {
-            crate::models::qwen3_5::dflash2_turn::SerialDecode::Autoregressive => {
+            crate::models::qwen3_5::dflash2_turn::SerialDecode::Autoregressive
+                if self.dflash2.is_none() =>
+            {
+                self.open_dense_lane_turn(tokens, cached, cache_salt, true)?;
                 self.dense_paged_prefill(suffix, &prefix, None)?.0
             }
-            crate::models::qwen3_5::dflash2_turn::SerialDecode::DFlash2 => {
+            _ => {
                 if cached == 0 {
                     self.dflash2_context = None;
                 }
@@ -347,19 +367,18 @@ impl Qwen35Inner {
         carries_image_lineage: bool,
         turn_plan: &crate::transformer::paged_kv_cache_adapter::PagedTurnPlan,
     ) -> Result<Qwen35PrefixState> {
-        let cached_prefix_len = turn_plan.cached_prefix_len;
-        let continued_live_prefix = turn_plan.continued_live_prefix;
         let total_budget = plan.len() as u32;
         // GDN recurrent-state prime (live / checkpoint / replay). No qwen3/lfm2
         // analog — dense carries GDN recurrent state across turns.
         let gdn_prefix_preparation = self.prepare_dense_gdn_prefix_state(
             plan,
-            cached_prefix_len,
+            turn_plan.cached_prefix_len,
             block_size,
             lookup_extra_keys,
             cache_salt,
-            continued_live_prefix,
+            turn_plan.continued_live_prefix,
         )?;
+        let cached_prefix_len = gdn_prefix_preparation.cached_prefix_len;
         let reconciled_prefix = crate::engine::recurrent_state::reconcile_hybrid_prefix(&[
             cached_prefix_len,
             gdn_prefix_preparation
@@ -415,8 +434,47 @@ impl Qwen35Inner {
 }
 
 impl Qwen35Inner {
+    /// An autoregressive whole turn on a draft load primes and prefills as a
+    /// DFlash2 turn (Splash `configureDraftStatePlan` for every request): its
+    /// states carry the draft window, and its lane is released at its end.
+    pub(crate) fn draft_lane_turn(&self) -> bool {
+        self.dflash2.is_some() && self.active_scheduled_seq.is_none()
+    }
+
+    /// Opens the lane's state points once the prime put it at `cached`, on
+    /// its image lineage, on a load without a draft (a draft load's turns
+    /// open their own).
+    pub(crate) fn open_dense_lane_turn(
+        &mut self,
+        tokens: &[u32],
+        cached: usize,
+        cache_salt: u64,
+        reuse: bool,
+    ) -> Result<()> {
+        if self.dflash2.is_some() || self.paged_adapter.is_none() {
+            return Ok(());
+        }
+        let seq = crate::models::qwen3_5::dflash2_turn::DFlash2Target::lane_seq(self);
+        let restored = match self.gdn_in_use.get(&seq) {
+            Some(crate::engine::governor::ledger::UnitKey::Store(id)) => Some(*id),
+            _ => None,
+        };
+        let extra_keys =
+            crate::models::qwen3_5::dflash2_turn::lane_image_keys(&*self, tokens.len());
+        crate::models::qwen3_5::dflash2_turn::open_lane_turn(
+            self,
+            tokens,
+            &extra_keys,
+            cached,
+            cache_salt,
+            reuse,
+            restored,
+        )
+    }
+
     /// The paged prefill; with `draft`, the draft context advanced over the
-    /// prompt from the same forward's taps.
+    /// prompt from the same forward's taps. Without one, on a load without
+    /// a draft, the turn's state points publish as the chunks reach them.
     pub(crate) fn dense_paged_prefill(
         &mut self,
         suffix_tokens: &[u32],
@@ -523,56 +581,117 @@ impl Qwen35Inner {
             );
             return Ok((logits, Some(context)));
         }
-        let (logits, checkpoint) = {
-            let caches_ref = self
-                .caches
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("paged_prefill: caches not initialized"))?;
-            let adapter = self
-                .paged_adapter
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
-            if mtp_seq.is_some() {
-                let (logits, hidden, checkpoint) = crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_hidden_with_size(
+        let draft_lane = self.dflash2.is_some()
+            && mtp_seq.is_none()
+            && self
+                .active_scheduled_seq
+                .is_some_and(|seq| self.dflash2_states.turns.contains_key(&seq));
+        if draft_lane {
+            let cached = prefix.effective_cached_prefix_len;
+            let (logits, checkpoint) =
+                crate::models::qwen3_5::dflash2_turn::scheduled_draft_prefill(
+                    self,
+                    &prefix.full_tokens,
+                    cached,
+                    cached + suffix_tokens.len(),
+                    chunk_size,
+                    |inner| inner.dflash2.take(),
+                    |inner, model| inner.dflash2 = Some(model),
+                    |target, sink| {
+                        crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
+                            &prefix.full_tokens,
+                            suffix_tokens,
+                            cached as u32,
+                            prefix.gdn_prefix_already_primed,
+                            &embed,
+                            target,
+                            &layer_kinds,
+                            chunk_size,
+                            rope_deltas,
+                            turn_cancel.as_deref(),
+                            Some(sink),
+                        )
+                    },
+                )?;
+            self.publish_dense_gdn_materialized_prefix_checkpoint(
                 &prefix.full_tokens,
-                suffix_tokens,
-                prefix.effective_cached_prefix_len as u32,
-                prefix.gdn_prefix_already_primed,
-                &embed,
-                &mut self.layers,
-                caches_ref,
-                &self.final_norm,
-                &self.lm_head,
-                &layer_kinds,
-                adapter,
+                prefix.cache_salt,
+                checkpoint,
+            );
+            return Ok((logits, None));
+        }
+        // Splash `publishReachedStateBoundaries` runs for every request: an
+        // MTP sequence's prefill reaches its points as a plain one does.
+        let lane_states = self.dflash2.is_none()
+            && self
+                .dflash2_states
+                .turns
+                .contains_key(&self.active_scheduled_seq.unwrap_or(0));
+        let cached = prefix.effective_cached_prefix_len;
+        let captures = if lane_states {
+            crate::models::qwen3_5::dflash2_turn::lane_command_breaks(
+                self,
+                cached,
+                cached + suffix_tokens.len(),
                 chunk_size,
-                Some(suffix_tokens.len()),
-                rope_deltas,
-                turn_cancel.as_deref(),
-            )?;
-                mtp_hidden = Some(hidden);
-                (logits, checkpoint)
+            )
+        } else {
+            Vec::new()
+        };
+        let mut sink = crate::models::qwen3_5::dflash2_turn::LaneStateSink::new(&captures);
+        let taps = lane_states.then_some(&mut sink as &mut dyn PrefillTapSink);
+        let mut lane_target;
+        let mut plain_target;
+        let target: &mut dyn crate::models::qwen3_5::paged_forward::PrefillTarget<DecoderLayer> =
+            if lane_states {
+                lane_target = crate::models::qwen3_5::dflash2_turn::LanePrefill(&mut *self);
+                &mut lane_target
             } else {
-                crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
+                plain_target = crate::models::qwen3_5::paged_forward::PrefillParts {
+                    layers: &mut self.layers,
+                    caches: self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason("paged_prefill: caches not initialized")
+                    })?,
+                    final_norm: &self.final_norm,
+                    lm_head: &self.lm_head,
+                    adapter: self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason("paged_prefill: paged_adapter dropped")
+                    })?,
+                };
+                &mut plain_target
+            };
+        let (logits, checkpoint) = if mtp_seq.is_some() {
+            let (logits, hidden, checkpoint) =
+                crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_hidden_with_size(
                     &prefix.full_tokens,
                     suffix_tokens,
-                    prefix.effective_cached_prefix_len as u32,
+                    cached as u32,
                     prefix.gdn_prefix_already_primed,
                     &embed,
-                    &mut crate::models::qwen3_5::paged_forward::PrefillParts {
-                        layers: &mut self.layers,
-                        caches: caches_ref,
-                        final_norm: &self.final_norm,
-                        lm_head: &self.lm_head,
-                        adapter,
-                    },
+                    target,
                     &layer_kinds,
                     chunk_size,
+                    Some(suffix_tokens.len()),
                     rope_deltas,
                     turn_cancel.as_deref(),
-                    None,
-                )?
-            }
+                    taps,
+                )?;
+            mtp_hidden = Some(hidden);
+            (logits, checkpoint)
+        } else {
+            crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
+                &prefix.full_tokens,
+                suffix_tokens,
+                cached as u32,
+                prefix.gdn_prefix_already_primed,
+                &embed,
+                target,
+                &layer_kinds,
+                chunk_size,
+                rope_deltas,
+                turn_cancel.as_deref(),
+                taps,
+            )?
         };
         if let Some(seq) = mtp_seq {
             crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::prefill_scheduled_mtp(
@@ -638,23 +757,59 @@ impl PagedBackend for Qwen35Inner {
         Self: 'a;
     type PrefixState = Qwen35PrefixState;
 
+    fn set_generation_suffix(&mut self, suffix: Option<std::sync::Arc<[u32]>>) {
+        self.dflash2_states.generation_suffix = suffix;
+    }
+
     fn prime_prefix_state(
         &mut self,
         plan: &[u32],
-        _reuse_cache: bool,
+        reuse_cache: bool,
         _block_size: usize,
         _extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<Self::PrefixState> {
-        self.prime_dense_prefix(plan, cache_salt, None)
+        if self.draft_lane_turn() {
+            return crate::engine::dspark_turn::PagedDsparkBackend::prime_dspark_prefix_state(
+                self,
+                plan,
+                reuse_cache,
+                cache_salt,
+            );
+        }
+        if self.dflash2.is_some() {
+            return crate::models::qwen3_5::dflash2_turn::prime_scheduled_draft_lane(
+                self,
+                plan,
+                reuse_cache,
+                cache_salt,
+                |inner, hit| inner.prime_dense_prefix(plan, cache_salt, Some(hit)),
+            );
+        }
+        let prefix = self.prime_dense_prefix(plan, cache_salt, None)?;
+        self.open_dense_lane_turn(
+            plan,
+            prefix.effective_cached_prefix_len,
+            cache_salt,
+            reuse_cache,
+        )?;
+        Ok(prefix)
     }
 
     fn paged_prefill(
         &mut self,
         suffix_tokens: &[u32],
         prefix: &Self::PrefixState,
-        _stream: Stream,
+        stream: Stream,
     ) -> Result<MxArray> {
+        if self.draft_lane_turn() {
+            return crate::engine::dspark_turn::PagedDsparkBackend::paged_prefill_with_draft_state(
+                self,
+                suffix_tokens,
+                prefix,
+                stream,
+            );
+        }
         self.dense_paged_prefill(suffix_tokens, prefix, None)
             .map(|(logits, _)| logits)
     }
@@ -685,7 +840,11 @@ impl PagedBackend for Qwen35Inner {
             .and_then(PagedKVCacheAdapter::active_seq_id);
         // A DFlash2 turn's lane is released at its end (Splash
         // `Engine::release`): its states are the published ones.
-        let dflash2 = self.dflash2_states.turn.is_some();
+        let dflash2 = self.dflash2.is_some()
+            && self
+                .dflash2_states
+                .turns
+                .contains_key(&self.active_scheduled_seq.unwrap_or(0));
         let mut release_pending = false;
         let mut finalize_error = match self.paged_adapter.as_mut() {
             Some(adapter) if reuse_cache && !dflash2 => {
@@ -708,9 +867,7 @@ impl PagedBackend for Qwen35Inner {
                     block_size,
                     &self.cached_paged_image_token_positions,
                 );
-                // The release is attempted below (even when registration fails),
-                // but only AFTER the GDN sidecar capture — releasing resets the
-                // adapter's cold-chain frontier to 0.
+                // The release is attempted below, even when registration fails.
                 release_pending = true;
                 crate::models::qwen3_5::dflash2_turn::log_turn_end("register");
                 adapter
@@ -719,22 +876,6 @@ impl PagedBackend for Qwen35Inner {
             }
             None => Some("paged_adapter is None during dense finalization".to_owned()),
         };
-        // Persist the out-of-pool GDN recurrent state for the SAME chain the
-        // adapter just captured (its `cold_captured_blocks` is now set), so a
-        // later process can resume from the restored K/V prefix instead of
-        // replaying GDN over it. Runs BEFORE the release below, which resets the
-        // captured-chain frontier to 0. Skipped when the finalize failed: the
-        // K/V chain the sidecar would anchor on was not published, so nothing
-        // could ever select it. Also skipped while the refuse-to-persist latch
-        // is armed — same gate as the manual epilogue, so no durable GDN state
-        // is enqueued anywhere while a frontier disagreement stands.
-        if finalize_error.is_none() && !self.paged_gdn_state_dirty {
-            self.capture_dense_gdn_cold_sidecar(
-                &self.cached_paged_image_token_positions,
-                cache_salt,
-            );
-        }
-        self.gdn_unclaimed_rungs.remove(&self.active_scheduled_seq);
         // Always attempt the release for the non-reuse path, even when
         // registration failed.
         if release_pending && let Some(adapter) = self.paged_adapter.as_mut() {
@@ -982,6 +1123,8 @@ impl Qwen35Inner {
         let mut p = extract_chat_params(&config);
         p.extra_eos_ids = self.gen_defaults.eos_token_ids.clone();
         if planned_mtp {
+            self.dflash2_states.generation_suffix =
+                args.tokenizer.generation_suffix(args.config).ok().flatten();
             let report_perf = args.config.report_performance.unwrap_or(false);
             let tokenizer = args.tokenizer.clone();
             let thinking = args.thinking;
@@ -1024,13 +1167,12 @@ impl Qwen35Inner {
         // `ChatSession` preflight.
         let mut constrained_params = args.params.clone();
         self.preflight_paged_context(args.tokens.len(), &mut constrained_params)?;
-        // An AR turn advances the request without DFlash2 taps: a future
-        // equal-length prompt must not mistake the stale draft window for the
-        // paged prefix. A rejected request has not touched the pool.
-        self.dflash2_context = None;
-        self.dflash2_turn_state = None;
-        self.dflash2_prefix
-            .note_drop("paged_whole_turn", DropKind::Dirtied);
+        if !self.draft_lane_turn() {
+            self.dflash2_context = None;
+            self.dflash2_turn_state = None;
+            self.dflash2_prefix
+                .note_drop("paged_whole_turn", DropKind::Dirtied);
+        }
         let mut constrained_args = WholeTurnArgs {
             tokens: args.tokens,
             tokenizer: args.tokenizer,

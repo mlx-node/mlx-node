@@ -194,7 +194,7 @@ impl Qwen35Inner {
         );
         let rung_len = rung.map_or(0, |index| self.gdn_prefix_checkpoints[index].prefix_len);
         if let Some((id, depth, caches)) = crate::models::qwen3_5::dflash2_turn::stored_gdn_prefix(
-            &*self,
+            self,
             tokens,
             extra_keys_per_block,
             cache_salt,
@@ -219,103 +219,6 @@ impl Qwen35Inner {
         });
         self.gdn_prefix_checkpoints.push_back(checkpoint);
         Some((prefix_len, caches))
-    }
-
-    /// Install GDN recurrent state the SSD cold tier restored alongside this
-    /// turn's paged K/V prefix.
-    ///
-    /// This is the cold-tier twin of the in-memory checkpoint lookups above:
-    /// same destination (`self.caches`), different source (an on-disk
-    /// [`mlx_paged_attn::ColdSidecar`] instead of a live materialized
-    /// checkpoint). Consulted ONLY after every in-memory source missed, because
-    /// those are already materialized and cost no decode.
-    ///
-    /// `ColdTierWalk::restore_extend` guarantees the sidecar backs EXACTLY the
-    /// prefix the adapter reported. The shared cold-tier preparation re-checks
-    /// group, boundary, and loaded-config geometry before this family decodes
-    /// it. A contract slip degrades to a MISS (`Ok(false)`) that falls through
-    /// to the caller's replay, never state installed at the wrong offset.
-    ///
-    /// Taking the sidecar is unconditional so a rejected one cannot be
-    /// reconsidered later in the same turn. On success the decoded state is also
-    /// fed into the in-memory prefix store so later same-process turns hit RAM.
-    fn install_dense_gdn_cold_sidecar(
-        &mut self,
-        tokens: &[u32],
-        cached_prefix_len: u32,
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-    ) -> Result<bool> {
-        let (restored, activation_dtype) = {
-            let Some(adapter) = self.paged_adapter.as_mut() else {
-                return Ok(false);
-            };
-            (
-                adapter.take_restored_sidecar(),
-                adapter
-                    .cold_tier()
-                    .and_then(|cold| cold.sidecar_policy.as_ref())
-                    .and_then(|policy| {
-                        crate::models::qwen3_5::gdn_sidecar::dtype_from_label(
-                            &policy.layout().dtype,
-                        )
-                    }),
-            )
-        };
-        let Some(geometry) = activation_dtype.and_then(|activation| {
-            crate::models::qwen3_5::gdn_sidecar::geometry(&self.config, activation)
-        }) else {
-            return Ok(false);
-        };
-        let expected_layout =
-            crate::models::qwen3_5::gdn_sidecar::layout_at(&geometry, cached_prefix_len);
-        let installed_boundary = crate::cold_tier::try_install_cold_sidecar(
-            restored,
-            &expected_layout,
-            |tensors, boundary| {
-                let Some(caches) = crate::models::qwen3_5::gdn_sidecar::decode_caches(
-                    &self.config,
-                    &geometry,
-                    tensors,
-                    boundary,
-                )?
-                else {
-                    return Ok(None);
-                };
-                self.caches = Some(caches);
-                Ok(Some(boundary))
-            },
-        )?;
-        let Some(boundary) = installed_boundary else {
-            return Ok(false);
-        };
-        // The one observable that separates "the tier restored the recurrent
-        // half" from "the tier read it and every arm above declined". Both
-        // produce identical text, identical `num_tokens` and identical
-        // `cached_tokens`; only the second re-forwards the whole prefix.
-        // Feed the in-memory store so later turns in this process hit RAM
-        // instead of decoding the sidecar again. Best-effort: a failure to
-        // clone/store never invalidates the freshly installed live caches.
-        if let Some(snapshot) = self
-            .caches
-            .as_ref()
-            .and_then(|caches| clone_dense_linear_layer_caches(&self.config, caches))
-        {
-            let checkpoint =
-                crate::models::qwen3_5::paged_forward::MaterializedGdnPrefixCheckpoint {
-                    prefix_len: boundary,
-                    caches: snapshot,
-                };
-            self.remember_dense_gdn_materialized_prefix_checkpoint(
-                tokens,
-                block_size,
-                extra_keys_per_block,
-                cache_salt,
-                checkpoint,
-            );
-        }
-        Ok(true)
     }
 
     fn remember_dense_gdn_materialized_prefix_checkpoint(
@@ -346,74 +249,47 @@ impl Qwen35Inner {
             return false;
         };
         let bytes = Qwen3_5LayerCache::linear_state_bytes(&checkpoint.caches);
-        let claimed = crate::models::qwen3_5::dflash2_turn::publish_claimed(
+        if crate::models::qwen3_5::dflash2_turn::publish_claimed(
             self,
             bytes,
             Keep::default(),
             |_| (),
         )
-        .is_some();
-        if !claimed && !self.wants_gdn_checkpoint_ladder() {
+        .is_none()
+        {
             return false;
         }
-        let owner_id = self.active_cache_owner_id.clone();
-        let same_rung = |existing: &DenseGdnPrefixCheckpoint| {
-            existing.owner_id == owner_id
+
+        self.gdn_prefix_checkpoints.retain(|existing| {
+            !(existing.owner_id == self.active_cache_owner_id
                 && existing.prefix_len == prefix_len
                 && existing.block_size == block_size
                 && existing.final_block_hash == final_block_hash
-                && existing.tokens.as_slice() == prefix_tokens
-        };
-        let rung = DenseGdnPrefixCheckpoint {
-            owner_id: owner_id.clone(),
-            prefix_len,
-            block_size,
-            final_block_hash,
-            block_hashes,
-            tokens: prefix_tokens.to_vec(),
-            caches: checkpoint.caches,
-            last_used: self.cache_recency.next(),
-        };
-        if !claimed {
-            let reach_tokens = self.paged_adapter.as_ref().and_then(|adapter| {
-                adapter.cold_capture_reach_tokens(tokens, extra_keys_per_block, cache_salt)
-            });
-            crate::models::qwen3_5::gdn_checkpoint_store::hold_refused_rung(
-                self.gdn_unclaimed_rungs
-                    .entry(self.active_scheduled_seq)
-                    .or_default(),
-                rung,
-                reach_tokens,
-            );
-            return false;
-        }
+                && existing.tokens.as_slice() == prefix_tokens)
+        });
         self.gdn_prefix_checkpoints
-            .retain(|existing| !same_rung(existing));
-        self.gdn_prefix_checkpoints.push_back(rung);
+            .push_back(DenseGdnPrefixCheckpoint {
+                owner_id: self.active_cache_owner_id.clone(),
+                prefix_len,
+                block_size,
+                final_block_hash,
+                block_hashes,
+                tokens: prefix_tokens.to_vec(),
+                caches: checkpoint.caches,
+                last_used: self.cache_recency.next(),
+            });
         self.prune_dense_gdn_prefix_checkpoints();
         true
     }
 
     pub(super) fn prune_dense_gdn_prefix_checkpoints(&mut self) {
-        // Probe the ladder predicate BEFORE the `&mut self` borrows below:
-        // `get_or_insert_with` takes one and `wants_gdn_checkpoint_ladder`
-        // needs `&self`, so an inline call in the argument list does not
-        // borrow-check.
-        let caps = gdn_retention_caps(
-            self.wants_gdn_checkpoint_ladder(),
-            self.gdn_root_cache_owner_is_explicit,
-        );
+        let caps = gdn_retention_caps(self.gdn_root_cache_owner_is_explicit);
         let active_owner_id = self.active_cache_owner_id.clone();
         let root_owner_id = self
             .gdn_root_cache_owner_id
             .get_or_insert_with(|| active_owner_id.clone())
             .clone();
-        prune_gdn_checkpoints(
-            &mut self.gdn_prefix_checkpoints,
-            caps,
-            &root_owner_id,
-            &active_owner_id,
-        );
+        prune_gdn_checkpoints(&mut self.gdn_prefix_checkpoints, caps, &root_owner_id);
         self.sync_gdn_state_marks();
     }
 
@@ -490,10 +366,8 @@ impl Qwen35Inner {
     /// Paged-prefill chunk size for EVERY paged prefill this model runs — the
     /// engine's `paged_prefill` and the hand-written sync/stream cores alike.
     ///
-    /// Always positive: the GDN cold sidecar can only persist recurrent state
-    /// at a `gdn_prefill_checkpoint_boundaries` rung the prefill materialized,
-    /// and `paged_prefill_ranges` adds those rungs on top of the chunk cuts.
-    /// The chunk length is the GEMM's M, so a different chunk size can change
+    /// Always positive: `paged_prefill_ranges` adds the GDN checkpoint
+    /// boundary on top of the chunk cuts. The chunk length is the GEMM's M, so a different chunk size can change
     /// the sampled tokens of an otherwise identical request.
     ///
     /// A caller must read this BEFORE it takes the `&mut self` borrows the
@@ -503,23 +377,12 @@ impl Qwen35Inner {
         crate::models::forward::paged_prefill_chunk_rows() as i32
     }
 
-    /// Whether this turn's prefill should publish the whole checkpoint ladder.
-    ///
-    /// Thin wrapper over [`crate::models::qwen3_5::paged_forward::gdn_cold_sidecar_ladder_wanted`]
-    /// so the model layer and the prefill body probe the SAME predicate.
-    pub(super) fn wants_gdn_checkpoint_ladder(&self) -> bool {
-        self.paged_adapter
-            .as_ref()
-            .is_some_and(crate::models::qwen3_5::paged_forward::gdn_cold_sidecar_ladder_wanted)
-    }
-
     /// Prefill for the hand-written paged cores (sync + stream, text).
     ///
     /// The engine's `PagedBackend::paged_prefill` serves only AR turns; a
     /// planned-MTP turn returns from `paged_whole_turn` before the engine runs
     /// and prefills here instead. Both cores share this one body so the chunk
-    /// size — and with it the whole checkpoint ladder a cold sidecar is anchored
-    /// on — cannot be right in one core and wrong in the other.
+    /// size cannot be right in one core and wrong in the other.
     ///
     /// `keep_prompt_hidden_tokens` is `Some` exactly when the caller wants the
     /// per-token prompt hidden for the MTP prompt-prefix seed; the returned
@@ -543,20 +406,55 @@ impl Qwen35Inner {
         // Cross-turn M-RoPE delta (0 unless this text turn warm-continues an
         // image prefill); feeds the scalar-offset RoPE for the suffix.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
-        let chunk_size = self.cold_gdn_prefill_chunk_size();
+        let chunk_size = crate::models::qwen3_5::paged_forward::prefill_chunk_rows(
+            self.cold_gdn_prefill_chunk_size(),
+        );
         // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
         // can borrow `self.layers`/`self.caches` mutably at the same time.
         // Threaded into BOTH arms: the AR chunk loop and the planned-MTP
         // `_with_hidden` chunk loop poll it at every chunk boundary.
         let turn_cancel = self.turn_cancel.clone();
-        let caches_ref = self
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason(format!("{context}: caches not initialized")))?;
-        let adapter = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| Error::from_reason(format!("{context}: paged_adapter dropped")))?;
+        // Splash `publishReachedStateBoundaries` runs for every request: an
+        // MTP turn's prefill reaches its points as a plain one does.
+        let lane_states = self.dflash2.is_none()
+            && self
+                .dflash2_states
+                .turns
+                .contains_key(&crate::models::qwen3_5::dflash2_turn::DFlash2Target::lane_seq(self));
+        let cached = cached_prefix_len as usize;
+        let captures = if lane_states {
+            crate::models::qwen3_5::dflash2_turn::lane_command_breaks(
+                self,
+                cached,
+                cached + suffix.len(),
+                chunk_size,
+            )
+        } else {
+            Vec::new()
+        };
+        let mut sink = crate::models::qwen3_5::dflash2_turn::LaneStateSink::new(&captures);
+        let taps = lane_states
+            .then_some(&mut sink as &mut dyn crate::models::qwen3_5::paged_forward::PrefillTapSink);
+        let mut lane_target;
+        let mut plain_target;
+        let target: &mut dyn crate::models::qwen3_5::paged_forward::PrefillTarget<DecoderLayer> =
+            if lane_states {
+                lane_target = crate::models::qwen3_5::dflash2_turn::LanePrefill(&mut *self);
+                &mut lane_target
+            } else {
+                plain_target = crate::models::qwen3_5::paged_forward::PrefillParts {
+                    layers: &mut self.layers,
+                    caches: self.caches.as_mut().ok_or_else(|| {
+                        Error::from_reason(format!("{context}: caches not initialized"))
+                    })?,
+                    final_norm: &self.final_norm,
+                    lm_head: &self.lm_head,
+                    adapter: self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason(format!("{context}: paged_adapter dropped"))
+                    })?,
+                };
+                &mut plain_target
+            };
         if let Some(keep_tokens) = keep_prompt_hidden_tokens {
             let (logits, hidden, checkpoints) =
                 crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_hidden_with_size(
@@ -565,16 +463,13 @@ impl Qwen35Inner {
                     cached_prefix_len,
                     gdn_prefix_already_primed,
                     &embed,
-                    &mut self.layers,
-                    caches_ref,
-                    &self.final_norm,
-                    &self.lm_head,
+                    target,
                     layer_kinds,
-                    adapter,
                     chunk_size,
                     Some(keep_tokens),
                     rope_deltas,
                     turn_cancel.as_deref(),
+                    taps,
                 )?;
             Ok((logits, Some(hidden), checkpoints))
         } else {
@@ -585,61 +480,15 @@ impl Qwen35Inner {
                     cached_prefix_len,
                     gdn_prefix_already_primed,
                     &embed,
-                    &mut crate::models::qwen3_5::paged_forward::PrefillParts {
-                        layers: &mut self.layers,
-                        caches: caches_ref,
-                        final_norm: &self.final_norm,
-                        lm_head: &self.lm_head,
-                        adapter,
-                    },
+                    target,
                     layer_kinds,
                     chunk_size,
                     rope_deltas,
                     turn_cancel.as_deref(),
-                    None,
+                    taps,
                 )?;
             Ok((logits, None, checkpoints))
         }
-    }
-
-    /// Cold-tier GDN sidecar capture
-    /// ([`crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar`]).
-    pub(super) fn capture_dense_gdn_cold_sidecar(
-        &self,
-        image_token_positions: &[(u32, u64)],
-        cache_salt: u64,
-    ) {
-        let checkpoints: VecDeque<&DenseGdnPrefixCheckpoint> = self
-            .gdn_prefix_checkpoints
-            .iter()
-            .chain(
-                self.gdn_unclaimed_rungs
-                    .get(&self.active_scheduled_seq)
-                    .into_iter()
-                    .flatten(),
-            )
-            .collect();
-        crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar(
-            "qwen3_5",
-            self.paged_adapter.as_ref(),
-            &checkpoints,
-            &self.active_cache_owner_id,
-            &self.config,
-            image_token_positions,
-            cache_salt,
-            |checkpoint| dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)),
-            |checkpoint| &checkpoint.caches,
-            |boundary, error| match error {
-                None => tracing::debug!(
-                    target: "mlx_core::qwen3_5::paged",
-                    "qwen3.5 GDN sidecar dropped at boundary {boundary}: cold-cache writer queue full"
-                ),
-                Some(error) => tracing::debug!(
-                    target: "mlx_core::qwen3_5::paged",
-                    "qwen3.5 GDN sidecar enqueue failed at boundary {boundary}: {error}"
-                ),
-            },
-        );
     }
 
     pub(super) fn prepare_dense_gdn_prefix_state(
@@ -653,7 +502,7 @@ impl Qwen35Inner {
     ) -> Result<DenseGdnPrefixPreparation> {
         let dirty = self.paged_gdn_state_dirty;
         let seq_id = self.begin_gdn_use();
-        let result = self.prepare_dense_gdn_prefix_state_inner(
+        let mut result = self.prepare_dense_gdn_prefix_state_inner(
             tokens,
             cached_prefix_len,
             block_size,
@@ -661,6 +510,31 @@ impl Qwen35Inner {
             cache_salt,
             continued_live_prefix,
         );
+        if matches!(result, Ok(None)) {
+            self.gdn_restored_from = None;
+            result = crate::models::qwen3_5::dflash2_turn::restart_turn_cold(
+                self,
+                tokens,
+                extra_keys_per_block,
+                cache_salt,
+            )
+            .and_then(|()| {
+                self.prepare_dense_gdn_prefix_state_inner(
+                    tokens,
+                    0,
+                    block_size,
+                    extra_keys_per_block,
+                    cache_salt,
+                    false,
+                )
+            });
+        }
+        self.dflash2_states.state_read = None;
+        let result = result.and_then(|preparation| {
+            preparation.ok_or_else(|| {
+                Error::from_reason("a cold restart left a disk state's KV without its GDN state")
+            })
+        });
         self.record_gdn_use(seq_id, result.is_ok());
         if let Ok(preparation) = &result {
             self.last_gdn_prefix_prepare_state = preparation.state;
@@ -683,7 +557,7 @@ impl Qwen35Inner {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
         continued_live_prefix: bool,
-    ) -> Result<DenseGdnPrefixPreparation> {
+    ) -> Result<Option<DenseGdnPrefixPreparation>> {
         let image_aware_prefix = extra_keys_per_block.iter().any(|keys| !keys.is_empty());
         let trace_enabled = inference_trace_enabled();
         let inference_info_enabled =
@@ -711,6 +585,7 @@ impl Qwen35Inner {
             }
             let preparation = DenseGdnPrefixPreparation {
                 state,
+                cached_prefix_len,
                 already_primed: cached_prefix_len > 0,
                 restored_prefix_tokens,
                 replayed_prefix_tokens,
@@ -732,14 +607,14 @@ impl Qwen35Inner {
         let gdn_caches_ready =
             dense_paged_linear_caches_ready(&self.config, self.caches.as_deref());
         if !gdn_state_dirty && gdn_caches_ready && continued_live_prefix {
-            return Ok(finish("live", cached_prefix_len, 0));
+            return Ok(Some(finish("live", cached_prefix_len, 0)));
         }
 
         let gdn_prefix_from_history = cached_prefix_len > 0
             && self.cached_token_history.len() == cached_prefix_len as usize
             && tokens.starts_with(&self.cached_token_history);
         if !gdn_state_dirty && gdn_caches_ready && gdn_prefix_from_history {
-            return Ok(finish("last_history", cached_prefix_len, 0));
+            return Ok(Some(finish("last_history", cached_prefix_len, 0)));
         }
 
         if !gdn_state_dirty && cached_prefix_len > 0 {
@@ -749,7 +624,11 @@ impl Qwen35Inner {
             let history_lookup_ms = history_lookup_start.map(elapsed_ms);
             if let Some(checkpoint) = history_checkpoint {
                 self.caches = Some(checkpoint);
-                return Ok(finish("last_history_checkpoint", cached_prefix_len, 0));
+                return Ok(Some(finish(
+                    "last_history_checkpoint",
+                    cached_prefix_len,
+                    0,
+                )));
             } else if trace_enabled {
                 let history_checkpoint_len = self
                     .gdn_last_history_checkpoint
@@ -791,7 +670,7 @@ impl Qwen35Inner {
                 })?;
             if replayed_prefix_len == 0 {
                 self.caches = Some(checkpoint);
-                return Ok(finish("checkpoint", restored_prefix_len, 0));
+                return Ok(Some(finish("checkpoint", restored_prefix_len, 0)));
             }
             if image_aware_prefix {
                 if let Some(adapter) = self.paged_adapter.as_mut() {
@@ -801,6 +680,9 @@ impl Qwen35Inner {
                 return Err(Error::from_reason(
                     "image-conditioned GDN prefix requires an exact checkpoint or the original image embeddings",
                 ));
+            }
+            if self.state_restored_prefix() {
+                return Ok(None);
             }
 
             let replay_suffix = tokens
@@ -822,35 +704,17 @@ impl Qwen35Inner {
                     turn_cancel.as_deref(),
                 )
             })?;
-            return Ok(finish(
+            return Ok(Some(finish(
                 "checkpoint_replay_materialized",
                 restored_prefix_len,
                 replayed_prefix_len,
-            ));
-        }
-
-        // Cold-tier GDN sidecar: on-SSD recurrent state the restore walk brought
-        // back for EXACTLY this cached prefix (reconcile-down guarantees the
-        // boundary). Consulted only after every in-memory source above missed —
-        // i.e. the common process-restart case. Text-only: an image-aware
-        // prefix still goes through the exactness gates below.
-        if cached_prefix_len > 0
-            && !image_aware_prefix
-            && self.install_dense_gdn_cold_sidecar(
-                tokens,
-                cached_prefix_len,
-                block_size,
-                extra_keys_per_block,
-                cache_salt,
-            )?
-        {
-            return Ok(finish("cold_sidecar", cached_prefix_len, 0));
+            )));
         }
 
         let fresh_caches = fresh_dense_layer_caches(&self.config);
         if cached_prefix_len == 0 {
             self.caches = Some(fresh_caches);
-            return Ok(finish("cold", 0, 0));
+            return Ok(Some(finish("cold", 0, 0)));
         }
         if image_aware_prefix {
             if let Some(adapter) = self.paged_adapter.as_mut() {
@@ -860,6 +724,9 @@ impl Qwen35Inner {
             return Err(Error::from_reason(
                 "image-conditioned GDN prefix cannot be reconstructed from placeholder token ids",
             ));
+        }
+        if self.state_restored_prefix() {
+            return Ok(None);
         }
 
         let prefix = tokens.get(..cached_prefix_len as usize).ok_or_else(|| {
@@ -877,7 +744,16 @@ impl Qwen35Inner {
                 turn_cancel.as_deref(),
             )
         })?;
-        Ok(finish("replay_materialized", 0, cached_prefix_len))
+        Ok(Some(finish("replay_materialized", 0, cached_prefix_len)))
+    }
+
+    /// The prepare's KV prefix came back with a disk state's chain, so only
+    /// an exact GDN state at its end backs it: a replay would decode on a
+    /// state the KV never had.
+    fn state_restored_prefix(&self) -> bool {
+        self.paged_adapter
+            .as_ref()
+            .is_some_and(PagedKVCacheAdapter::state_restored)
     }
 
     /// Restore only an identity-matched GDN sidecar for an image-bearing
@@ -905,6 +781,7 @@ impl Qwen35Inner {
             continued_live_prefix,
             image_key,
         );
+        self.dflash2_states.state_read = None;
         self.record_gdn_use(seq_id, result.is_ok());
         if result.is_ok() && dirty {
             // The armed latch skipped every live/history reuse arm inside, so
@@ -1000,14 +877,29 @@ impl Qwen35Inner {
             crate::models::qwen3_5::dflash2_turn::Keep::default()
         };
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
+        // A state on disk alone brings its image chain back with the KV
+        // lookup, as a text prime's does (Splash `Cache::lookup` serves
+        // every request alike).
+        let disk_state = if reuse_cache {
+            crate::models::qwen3_5::dflash2_turn::disk_state_depth(
+                self,
+                tokens,
+                extra_keys_per_block,
+                cache_salt,
+                max_cache_hit_tokens,
+            )
+        } else {
+            None
+        };
         let candidate_plan_result =
             crate::models::qwen3_5::dflash2_turn::claimed(self, keep, |inner| {
-                inner
-                    .paged_adapter
-                    .as_mut()
-                    .ok_or_else(|| {
-                        Error::from_reason("prepare_dense_vlm_paged_prefix: paged_adapter is None")
-                    })?
+                let adapter = inner.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason("prepare_dense_vlm_paged_prefix: paged_adapter is None")
+                })?;
+                if let Some(depth) = disk_state {
+                    adapter.arm_state_restore(depth);
+                }
+                adapter
                     .prepare_turn_per_block_with_max_cache_hit_tokens(
                         0,
                         tokens,
@@ -1023,6 +915,7 @@ impl Qwen35Inner {
         let candidate_plan = match candidate_plan_result {
             Ok(plan) => plan,
             Err(error) => {
+                self.dflash2_states.state_read = None;
                 self.invalidate_dense_paged_session("VLM paged-prefix preparation failure");
                 return Err(error);
             }
@@ -1130,7 +1023,11 @@ impl Qwen35Inner {
                 }
             }
             UnitKey::Store(_) => self.dflash2_states.end_restored(seq_id),
-            UnitKey::Owner(_) | UnitKey::Extent | UnitKey::DeadLeaves | UnitKey::Vision(_) => {}
+            UnitKey::Owner(_)
+            | UnitKey::Extent
+            | UnitKey::DeadLeaves
+            | UnitKey::Vision(_)
+            | UnitKey::StoreChain(_) => {}
         }
     }
 
@@ -1213,7 +1110,8 @@ impl Qwen35Inner {
             | UnitKey::Owner(_)
             | UnitKey::Extent
             | UnitKey::DeadLeaves
-            | UnitKey::Vision(_) => false,
+            | UnitKey::Vision(_)
+            | UnitKey::StoreChain(_) => false,
         };
         if dropped {
             self.sync_gdn_state_marks();

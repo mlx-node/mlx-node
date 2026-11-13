@@ -421,6 +421,22 @@ impl DFlash2Config {
         DraftContextWindow::bytes(self.hidden_size as u32, self.sliding_window as u32)
     }
 
+    /// The namespace's `draft` line: layers, KV heads, head size and sliding
+    /// window (Splash `persistentCacheNamespace`).
+    pub(crate) fn namespace_geometry(&self) -> (u32, u32, u32, u32) {
+        (
+            self.num_hidden_layers as u32,
+            self.num_key_value_heads as u32,
+            self.head_dim as u32,
+            self.sliding_window as u32,
+        )
+    }
+
+    /// The context window's row width (the namespace's `context` line).
+    pub(crate) fn context_width(&self) -> u32 {
+        self.hidden_size as u32
+    }
+
     /// An empty context window of this draft's geometry.
     pub(crate) fn context_window(&self) -> Result<DraftContextWindow> {
         DraftContextWindow::new(self.hidden_size as u32, self.sliding_window as u32)
@@ -4500,7 +4516,6 @@ mod tests {
             rope_theta: 10_000.0,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            persist_paged_cache: None,
             n_mtp_layers: 0,
         };
         unsafe { mlx_sys::mlx_seed(0xDF1A_5A11) };

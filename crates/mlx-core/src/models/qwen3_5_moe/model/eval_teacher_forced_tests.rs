@@ -50,7 +50,6 @@ fn tiny_moe_cfg() -> Qwen3_5MoeConfig {
         mlp_only_layers: None,
         paged_cache_memory_mb: Some(64),
         paged_block_size: Some(16),
-        persist_paged_cache: None,
         n_mtp_layers: 0,
         qwen35_gguf_gdn_layout: None,
         kv_format: None,

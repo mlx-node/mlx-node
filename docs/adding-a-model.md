@@ -182,12 +182,15 @@ child whose resolver throws on `@mlx-node/core` or any `.node` specifier.
 - A family with out-of-pool state writes a sidecar codec
   (geometry/policy/encode/decode) plus a capture function called after turn
   finalize, and installs restores through the shared transactional
-  `try_install_cold_sidecar`. Dense and MoE qwen3_5 now share one capture
-  implementation — `capture_gdn_cold_sidecar` in `qwen3_5/gdn_sidecar.rs` —
-  so a new GDN-hybrid family reuses that skeleton (checkpoint-lineage
-  resolve, chain-frontier ceiling, disk dedup, telemetry counters) rather
-  than re-typing it. `sidecar_policy: None` (plain full-attention families)
-  gets KV capture/restore free from the finalize/lookup walks.
+  `try_install_cold_sidecar`. `capture_lfm2_conv_cold_sidecar` in
+  `lfm2/model.rs` is the reference capture (chain-frontier ceiling, disk
+  dedup, telemetry counters). qwen3_5 and its MoE keep no sidecar: their SSD
+  tier holds DFlash2 state objects (`qwen3_5/dflash2_state/disk.rs`, backing
+  `ColdContextBacking::StateOnly`), so only a state object backs a cold
+  prefix. A load without a draft writes them too: its text turns, plain or
+  native-MTP, publish through `LaneStateSink` / `LanePrefill` (`dflash2_turn.rs`), and
+  `tests/qwen3_5_state_tier_restart.rs` is the restart gate. `ColdContextBacking::KvOnly` (plain full-attention families) gets
+  KV capture/restore free from the finalize/lookup walks.
 
 ## Stage 4 — speculative
 

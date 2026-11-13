@@ -5,7 +5,8 @@
 use napi_derive::napi;
 
 use super::governor::{
-    Counters, DFlash2StateStatus, Governor, GovernorSnapshot, ResourceWaitStatus, SchedulerStatus,
+    Counters, DFlash2DiskStatus, DFlash2StateStatus, Governor, GovernorSnapshot,
+    ResourceWaitStatus, SchedulerStatus,
 };
 use super::metrics::{GAP_CAUSES, Metrics, TtftPart};
 use crate::engine::latency::LatencyStats;
@@ -223,6 +224,54 @@ pub struct MemoryGovernorDFlash2States {
     pub checkpoint_entries: f64,
     pub checkpoint_bytes: f64,
     pub in_use: f64,
+    pub disk_entries: f64,
+    pub disk_bytes: f64,
+    pub offloads: f64,
+    pub offload_failures: f64,
+    pub invalidations: f64,
+    pub disk_promotions: f64,
+    pub disk_promotions_skipped: f64,
+    pub disk_state_publications: f64,
+    pub disk: MemoryGovernorDFlash2Disk,
+}
+
+/// Splash `WriteBehindSnapshot`.
+#[napi(object)]
+pub struct MemoryGovernorWriteBehind {
+    pub waiting: f64,
+    pub durable: f64,
+    pub unneeded: f64,
+    pub refused: f64,
+}
+
+/// The SSD tier of the models' DFlash2 states (Splash `/status` `disk`):
+/// `persistent`, `temp` or `off` (the most lasting over the models), its
+/// limit and the bytes of the caches nobody holds under its root, the
+/// states taken back at load, and the write-behind.
+#[napi(object)]
+pub struct MemoryGovernorDFlash2Disk {
+    pub mode: String,
+    pub limit_bytes: f64,
+    pub held_bytes: f64,
+    pub taken_back: f64,
+    pub write_behind: MemoryGovernorWriteBehind,
+}
+
+impl From<DFlash2DiskStatus> for MemoryGovernorDFlash2Disk {
+    fn from(disk: DFlash2DiskStatus) -> Self {
+        Self {
+            mode: disk.mode.name().to_string(),
+            limit_bytes: disk.limit_bytes as f64,
+            held_bytes: disk.held_bytes as f64,
+            taken_back: disk.taken_back as f64,
+            write_behind: MemoryGovernorWriteBehind {
+                waiting: disk.write_behind_waiting as f64,
+                durable: disk.write_behind_durable as f64,
+                unneeded: disk.write_behind_unneeded as f64,
+                refused: disk.write_behind_refused as f64,
+            },
+        }
+    }
 }
 
 impl From<DFlash2StateStatus> for MemoryGovernorDFlash2States {
@@ -245,6 +294,15 @@ impl From<DFlash2StateStatus> for MemoryGovernorDFlash2States {
             checkpoint_entries: states.checkpoint_entries as f64,
             checkpoint_bytes: states.checkpoint_bytes as f64,
             in_use: states.in_use as f64,
+            disk_entries: states.disk_entries as f64,
+            disk_bytes: states.disk_bytes as f64,
+            offloads: states.offloads as f64,
+            offload_failures: states.offload_failures as f64,
+            invalidations: states.invalidations as f64,
+            disk_promotions: states.disk_promotions as f64,
+            disk_promotions_skipped: states.disk_promotions_skipped as f64,
+            disk_state_publications: states.disk_state_publications as f64,
+            disk: states.disk.into(),
         }
     }
 }

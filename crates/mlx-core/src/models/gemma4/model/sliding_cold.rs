@@ -277,8 +277,7 @@ impl Gemma4Inner {
                 let full = coordinator.full_adapter();
                 let cold = full.cold_tier()?;
                 if cold
-                    .sidecar_policy
-                    .as_ref()
+                    .sidecar_policy()
                     .is_none_or(|policy| policy.group() != mlx_paged_attn::ColdGroup::SlidingWindow)
                 {
                     return None;
@@ -902,7 +901,10 @@ impl Gemma4Inner {
                 crate::transformer::paged_kv_cache_adapter::ColdTierContext {
                     manager,
                     fingerprint,
-                    sidecar_policy: Some(sidecar_policy),
+                    backing:
+                        crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar(
+                            sidecar_policy,
+                        ),
                 },
             ),
             None => {

@@ -302,6 +302,7 @@ fn estimate_matches_the_load_plan() {
             kv_format: None,
             max_memory_bytes: None,
             max_context: None,
+            cache_disk: CacheDisk::Auto,
         },
     );
     crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
@@ -329,7 +330,7 @@ fn estimate_matches_the_load_plan() {
         .unwrap(),
     )
     .unwrap();
-    let lanes = LoadLanes {
+    let mut lanes = LoadLanes {
         config: &config,
         recurrent_state_bytes: config.recurrent_state_bytes(),
         pool: crate::engine::persistence::compiled_forward_backend_available().then_some(
@@ -344,22 +345,26 @@ fn estimate_matches_the_load_plan() {
         draft: Some(DraftTerms::of(&draft_config, 1_357 * MIB)),
         mtp: false,
         mtp_state_in_pool: false,
+        state_staging_bytes: 0,
     };
-    let plan = evaluate_qwen35_plan(
+    let plan = plan_with_disk(
         "Qwen3.5",
-        &lanes,
+        &mut lanes,
         LiveMemory {
             active_bytes: 17_357 * MIB,
             ..live
         },
         None,
+        None,
+        CacheDisk::Auto,
     )
     .expect("load plan");
     std::fs::remove_dir_all(&target).unwrap();
     std::fs::remove_dir_all(&draft).unwrap();
 
     let window = plan.pool.expect("pool lane").lane.window;
-    assert_eq!(window.maximum(), 221_177);
+    assert_eq!(plan.footprint.state_staging_bytes, 159_842_304);
+    assert_eq!(window.maximum(), 212_985);
     assert_eq!(
         estimate,
         Qwen35ContextEstimate {
@@ -397,6 +402,7 @@ fn sym8_estimate_plans_the_pool() {
                 kv_format: None,
                 max_memory_bytes: None,
                 max_context: None,
+                cache_disk: CacheDisk::Off,
             },
         )
     };
@@ -452,6 +458,7 @@ fn audit_counts_this_pools_staging_once() {
             active_bytes: active,
             other_pool_bytes: others,
             staging_bytes: staging,
+            state_staging_bytes: 0,
             draft_weights_bytes: 0,
             held_back_bytes: 0,
             margin: crate::engine::memory_plan::Margin::Ledger,
@@ -519,6 +526,7 @@ fn estimate_27b(
             kv_format: None,
             max_memory_bytes,
             max_context,
+            cache_disk: CacheDisk::Off,
         },
     );
     crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
@@ -571,6 +579,28 @@ fn plan_27b_lanes(
     kv_format: Option<KvFormat>,
     mtp: Option<bool>,
 ) -> MemoryPlan {
+    plan_27b_disk(
+        tag,
+        working_set,
+        max_context,
+        draft_trained,
+        kv_format,
+        mtp,
+        None,
+    )
+    .expect("load plan")
+}
+
+/// [`plan_27b_lanes`] through [`plan_with_disk`] when `cache_disk` is set.
+fn plan_27b_disk(
+    tag: &str,
+    working_set: u64,
+    max_context: Option<u32>,
+    draft_trained: u32,
+    kv_format: Option<KvFormat>,
+    mtp: Option<bool>,
+    cache_disk: Option<CacheDisk>,
+) -> Result<MemoryPlan> {
     let target = estimate_fixture_dir(tag);
     let draft = estimate_fixture_dir(&format!("{tag}-draft"));
     write_27b_fixture(&target, &draft);
@@ -608,7 +638,7 @@ fn plan_27b_lanes(
         .unwrap(),
     )
     .unwrap();
-    let lanes = LoadLanes {
+    let mut lanes = LoadLanes {
         config: &config,
         recurrent_state_bytes: config.recurrent_state_bytes(),
         pool: Some(PoolGeometry {
@@ -623,18 +653,93 @@ fn plan_27b_lanes(
             .then(|| DraftTerms::of(&draft_config, 1_357 * MIB)),
         mtp: mtp.is_some(),
         mtp_state_in_pool: mtp.unwrap_or(false),
+        state_staging_bytes: 0,
     };
-    evaluate_qwen35_plan(
-        "Qwen3.5",
-        &lanes,
-        LiveMemory {
-            working_set_bytes: working_set,
-            active_bytes: 17_357 * MIB,
-            registered_pool_bytes: 0,
-        },
+    let live = LiveMemory {
+        working_set_bytes: working_set,
+        active_bytes: 17_357 * MIB,
+        registered_pool_bytes: 0,
+    };
+    match cache_disk {
+        Some(cache_disk) => {
+            plan_with_disk("Qwen3.5", &mut lanes, live, None, max_context, cache_disk)
+        }
+        None => evaluate_qwen35_plan("Qwen3.5", &lanes, live, None),
+    }
+}
+
+/// Splash `stateStagingBytes`: a draft load with the SSD tier sets one
+/// state (GDN cell + draft window, 159,842,304 B on 27B) aside as fixed
+/// bytes, and the window gives up what those bytes held; a pool load
+/// without a draft sets its GDN cell aside (153,944,064 B). A quota below
+/// one state sets nothing aside; an automatic tier that would cost a
+/// `--max-context` the plan holds without it turns off.
+/// Mutations SG1 (staging left out of fixed bytes) and AL1 (a load without
+/// a draft stages nothing) → red.
+#[test]
+fn staging_moves_the_plan_once() {
+    const STATE: u64 = 159_842_304;
+    let plan = |tag, max_context, mtp, disk| {
+        plan_27b_disk(tag, 27 << 30, max_context, 262_144, None, mtp, disk)
+    };
+    let off = plan("staging-off", None, None, Some(CacheDisk::Off)).expect("off plan");
+    let auto = plan("staging-auto", None, None, Some(CacheDisk::Auto)).expect("auto plan");
+    assert_eq!(off.footprint.state_staging_bytes, 0);
+    assert_eq!(auto.footprint.state_staging_bytes, STATE);
+    assert_eq!(auto.fixed_bytes, off.fixed_bytes + STATE);
+    let window = |plan: &MemoryPlan| plan.pool.as_ref().expect("pool lane").lane.window;
+    let (off_window, auto_window) = (window(&off).maximum(), window(&auto).maximum());
+    assert!(auto_window < off_window, "{auto_window} vs {off_window}");
+    assert_eq!(
+        auto.dynamic_budget_bytes + STATE,
+        off.dynamic_budget_bytes,
+        "the staging comes out of the dynamic budget once"
+    );
+    assert_eq!((off_window, auto_window), (221_177, 212_985));
+
+    // A load without a draft stages its GDN cell alone (Splash
+    // `QwenStateStorage::stagingBytes` with no window span).
+    const CELL: u64 = 153_944_064;
+    let mtp_off = plan("staging-mtp-off", None, Some(false), Some(CacheDisk::Off)).unwrap();
+    let mtp_auto = plan("staging-mtp-auto", None, Some(false), Some(CacheDisk::Auto)).unwrap();
+    assert_eq!(mtp_off.footprint.state_staging_bytes, 0);
+    assert_eq!(mtp_auto.footprint.state_staging_bytes, CELL);
+    assert_eq!(mtp_auto.fixed_bytes, mtp_off.fixed_bytes + CELL);
+    let (plain_off, plain_auto) = (window(&mtp_off).maximum(), window(&mtp_auto).maximum());
+    assert_eq!((plain_off, plain_auto), (155_641, 151_545));
+
+    let small = plan(
+        "staging-small",
         None,
+        None,
+        Some(CacheDisk::Bytes(100 << 20)),
     )
-    .expect("load plan")
+    .unwrap();
+    assert_eq!(small.footprint.state_staging_bytes, 0);
+    assert_eq!(small, off);
+
+    let between = (auto_window + off_window) / 2;
+    let capped_off =
+        plan("staging-cap-off", Some(between), None, Some(CacheDisk::Off)).expect("fits without");
+    let capped_auto = plan(
+        "staging-cap-auto",
+        Some(between),
+        None,
+        Some(CacheDisk::Auto),
+    )
+    .expect("the automatic tier turns off");
+    assert_eq!(capped_auto.footprint.state_staging_bytes, 0);
+    assert_eq!(capped_auto, capped_off);
+    assert!(
+        plan(
+            "staging-cap-sized",
+            Some(between),
+            None,
+            Some(CacheDisk::Bytes(1 << 30))
+        )
+        .is_err(),
+        "a sized tier keeps its staging and refuses the context"
+    );
 }
 
 /// Splash `ServingRuntime::start`: an explicit `--max-context` above the one
@@ -755,6 +860,7 @@ fn unplanned_estimate_refuses_what_the_load_refuses() {
                 kv_format: None,
                 max_memory_bytes: None,
                 max_context,
+                cache_disk: CacheDisk::Off,
             },
         )
     };
@@ -836,6 +942,7 @@ fn draft_without_a_pool_is_refused() {
             kv_format: None,
             max_memory_bytes: None,
             max_context: None,
+            cache_disk: CacheDisk::Off,
         },
     );
     crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
@@ -976,6 +1083,7 @@ fn load_window(
         draft: None,
         mtp,
         mtp_state_in_pool: qwen35_scheduler_books_state_in_pool(),
+        state_staging_bytes: 0,
     };
     let plan = evaluate_qwen35_plan(
         "Qwen3.5",
@@ -1059,6 +1167,7 @@ fn estimate_resolves_the_compute_dtype_like_the_load() {
                     kv_format,
                     max_memory_bytes: None,
                     max_context: None,
+                    cache_disk: CacheDisk::Off,
                 },
             );
             crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
@@ -1224,6 +1333,7 @@ fn estimate_prices_mtp_only_when_the_load_enables_it() {
                 kv_format: None,
                 max_memory_bytes: None,
                 max_context: None,
+                cache_disk: CacheDisk::Off,
             },
         );
         crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
@@ -1417,6 +1527,7 @@ fn estimate_122b_takes_the_int8_pool() {
                 kv_format,
                 max_memory_bytes: None,
                 max_context: None,
+                cache_disk: CacheDisk::Off,
             },
         );
         crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));

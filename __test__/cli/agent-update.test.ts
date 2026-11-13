@@ -1957,6 +1957,55 @@ describe('launchGrokAgent server gating', () => {
     expect(spawnServe.mock.calls[0]![0]).not.toContain('--kv-format');
   });
 
+  it('hands the SSD state tier flags to the spawned serve', async () => {
+    await launchGrokAgent({ argv: ['-c'], cacheDisk: '0', spawnServe, spawnAgent });
+    const offArgv: string[] = spawnServe.mock.calls[0]![0];
+    expect(offArgv.slice(-2)).toEqual(['--max-cache-disk', '0']);
+    expect(parseServeArgs(offArgv.slice(2), {}).cacheDisk).toBe('0');
+
+    spawnServe.mockClear();
+    await launchGrokAgent({ argv: ['-c'], cacheDir: '/c', spawnServe, spawnAgent });
+    const dirArgv: string[] = spawnServe.mock.calls[0]![0];
+    expect(dirArgv.slice(-1)).toEqual(['--cache-dir=/c']);
+    expect(parseServeArgs(dirArgv.slice(2), {})).toMatchObject({ cacheDisk: 'auto', cacheDir: '/c' });
+
+    spawnServe.mockClear();
+    await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+    const plainArgv: string[] = spawnServe.mock.calls[0]![0];
+    expect(plainArgv).not.toContain('--max-cache-disk');
+    expect(plainArgv.some((arg) => arg.startsWith('--cache-dir'))).toBe(false);
+  });
+
+  // Mutation TPG1: grok-build passes no persist flag to the spawned serve → red.
+  it('hands the resolved paged KV disk cache switch to the spawned serve, on by default', async () => {
+    const flagOf = (argv: string[]): boolean | undefined => parseServeArgs(argv.slice(2), {}).persistPagedCache;
+    const previous = process.env.MLX_PERSIST_PAGED_CACHE;
+    try {
+      delete process.env.MLX_PERSIST_PAGED_CACHE;
+      await launchGrokAgent({ argv: ['-c'], spawnServe, spawnAgent });
+      expect(spawnServe.mock.calls[0]![0]).toContain('--persist-cache');
+      expect(flagOf(spawnServe.mock.calls[0]![0])).toBe(true);
+
+      spawnServe.mockClear();
+      await launchGrokAgent({
+        argv: ['-c'],
+        persistPagedCache: { flag: false, byDefault: true },
+        spawnServe,
+        spawnAgent,
+      });
+      expect(spawnServe.mock.calls[0]![0]).toContain('--no-persist-cache');
+      expect(flagOf(spawnServe.mock.calls[0]![0])).toBe(false);
+
+      spawnServe.mockClear();
+      process.env.MLX_PERSIST_PAGED_CACHE = '0';
+      await launchGrokAgent({ argv: ['-c'], persistPagedCache: { byDefault: true }, spawnServe, spawnAgent });
+      expect(flagOf(spawnServe.mock.calls[0]![0])).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.MLX_PERSIST_PAGED_CACHE;
+      else process.env.MLX_PERSIST_PAGED_CACHE = previous;
+    }
+  });
+
   // Mutation: drop the `--max-memory` pair from the serve argv → red.
   it('hands --max-memory to the spawned serve as bytes', async () => {
     await launchGrokAgent({ argv: ['-c'], maxMemoryBytes: 30_064_771_072, spawnServe, spawnAgent });

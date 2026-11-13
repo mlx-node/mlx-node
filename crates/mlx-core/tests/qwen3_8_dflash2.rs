@@ -39,6 +39,9 @@ async fn qwen38_dflash2_loads_and_runs_a_verified_cycle() {
             max_memory_bytes: None,
             max_context_tokens: None,
             decode_share: None,
+            cache_disk: None,
+            persist_paged_cache: None,
+            cache_dir: None,
         }),
     )
     .await

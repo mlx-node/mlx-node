@@ -220,6 +220,14 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     ) -> LedgerTaken {
         LedgerTaken::default()
     }
+    /// One tick of the model's SSD tier for its states (Splash
+    /// `Engine::tick` → `pollTransfers`); true when anything landed.
+    fn tick_state_disk(
+        &mut self,
+        _tick: crate::models::qwen3_5::dflash2_state::disk::Tick,
+    ) -> bool {
+        false
+    }
     /// A GPU command exhausted Metal memory: every cache its writes may
     /// have reached goes (Splash restarts the engine).
     /// The model's accounts on the governor's books.
@@ -2067,6 +2075,7 @@ impl<B: HybridSchedulerBackend> SchedUnits<'_, B> {
                     bytes,
                     pages,
                     stage: Stage::FreeNow,
+                    later: false,
                 }
             })
             .filter(|unit| unit.bytes > 0 || unit.pages > 0)
@@ -2076,17 +2085,15 @@ impl<B: HybridSchedulerBackend> SchedUnits<'_, B> {
 
 impl<B: HybridSchedulerBackend> VictimSource for SchedUnits<'_, B> {
     /// The model's checkpoints go first (Splash `Phase::Checkpoints`),
-    /// ahead of an older idle owner.
+    /// ahead of an older idle owner; the owners join the model's stamp
+    /// order.
     fn units(&self, query: &VictimQuery) -> Vec<Victim> {
-        let UnitRuns { mut ahead, merged } = self.state.inner.victim_units(query, self.kept);
-        let mut units: Vec<(Victim, bool)> = merged
-            .into_iter()
-            .map(|unit| (unit, false))
-            .chain(self.owner_units(query).into_iter().map(|unit| (unit, true)))
-            .collect();
-        units.sort_by_key(|(unit, owner)| (unit.stage, unit.stamp, *owner));
-        ahead.extend(units.into_iter().map(|(unit, _)| unit));
-        ahead
+        let mut owners = self.owner_units(query);
+        owners.sort_by_key(|unit| unit.stamp);
+        self.state
+            .inner
+            .victim_units(query, self.kept)
+            .merge_into_units(owners)
     }
 
     /// An owner's take credits the measured drop in MLX's active bytes and
@@ -2106,6 +2113,9 @@ impl<B: HybridSchedulerBackend> VictimSource for SchedUnits<'_, B> {
         if !self.state.release_owner(seq_id) {
             return LedgerTaken::default();
         }
+        crate::models::qwen3_5::dflash2_turn::log_reclaim(
+            crate::models::qwen3_5::dflash2_turn::GrowReclaim::Idle,
+        );
         let now_bytes = active.saturating_sub(crate::array::memory::active_memory_bytes());
         let pages = takeable(self.state).saturating_sub(blocks);
         LedgerTaken {
@@ -2124,6 +2134,12 @@ impl<B: HybridSchedulerBackend> VictimSource for SchedUnits<'_, B> {
 impl<B: HybridSchedulerBackend> UnitSources for SchedUnits<'_, B> {
     fn sources(&mut self) -> Vec<&mut dyn VictimSource> {
         vec![self]
+    }
+
+    fn poll_landings(&mut self) {
+        self.state
+            .inner
+            .tick_state_disk(crate::models::qwen3_5::dflash2_state::disk::Tick::Poll);
     }
 }
 
@@ -2277,6 +2293,36 @@ fn row_work_end<P>(row: &engine::scheduler::StepRow, turn: &TurnState<P>) -> u32
         StepKind::Prefill => row.token_start.saturating_add(row.num_tokens),
         StepKind::Decode => turn.num_tokens.saturating_add(turn.decode_draft_allowance),
     }
+}
+
+/// Splash `Engine::copyDemandBytes`'s pages: the KV pages the running
+/// lanes' next commands add beyond what they hold, a prefilling lane's next
+/// slice of its prompt and a decoding lane's pending token with its draft
+/// rows.
+pub(crate) fn next_command_pages<P>(
+    running: &[TurnState<P>],
+    slice_tokens: u32,
+    block_size: u32,
+    held_blocks: impl Fn(SeqId) -> u32,
+) -> u64 {
+    if block_size == 0 {
+        return 0;
+    }
+    running
+        .iter()
+        .filter(|turn| turn.status == TurnStatus::Running)
+        .map(|turn| {
+            let end = if turn.num_computed_tokens < turn.prompt_tokens {
+                turn.num_computed_tokens
+                    .saturating_add(slice_tokens)
+                    .min(turn.prompt_tokens)
+            } else {
+                turn.num_tokens.saturating_add(turn.decode_draft_allowance)
+            };
+            let needed = end.div_ceil(block_size);
+            u64::from(needed.saturating_sub(held_blocks(turn.seq_id)))
+        })
+        .sum()
 }
 
 /// The pinned prefill ends of one prompt and whether the family runs it as
@@ -3003,6 +3049,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     #[cfg(test)]
     fn reclaim_one_idle_scheduled(&mut self, seq_id: SeqId) -> Result<bool> {
         self.reclaim_one_idle_scheduled_with(seq_id, B::release_scheduled_cache)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_continuous_batching(&mut self) {
+        self.enabled = true;
     }
 
     #[cfg(test)]
@@ -4996,6 +5047,14 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .claim
             .as_ref()
             .map(|claim| Scope::enter_lane(claim.claim()));
+        self.inner.set_generation_suffix(
+            prepared
+                .admitted
+                .tokenizer
+                .generation_suffix(&prepared.admitted.config)
+                .ok()
+                .flatten(),
+        );
         let prefix_admission = self.inner.prepare_scheduled_prefix(
             seq_id,
             &prepared.admitted.tokens,
@@ -5621,6 +5680,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .claim
             .as_ref()
             .map(|claim| Scope::enter_lane(claim.claim()));
+        self.inner.set_generation_suffix(
+            turn.payload
+                .tokenizer
+                .generation_suffix(&turn.payload.config)
+                .ok()
+                .flatten(),
+        );
         let prefix_admission = self.inner.prepare_scheduled_prefix(
             turn.seq_id,
             &replay_tokens,
@@ -5995,6 +6061,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         self.reap_cancelled_waiters();
         self.poll_restores();
         self.tick_waits();
+        let command_pages = next_command_pages(
+            self.scheduler.running(),
+            self.inner.scheduler_prefill_slice_tokens(),
+            self.inner.scheduler_block_size().unwrap_or(0),
+            |seq_id| self.inner.scheduler_materialized_blocks(seq_id),
+        );
+        self.inner
+            .tick_state_disk(crate::models::qwen3_5::dflash2_state::disk::Tick::Full {
+                command_pages,
+            });
         self.refresh_wanted_chains();
         self.run_control_pass(woke);
 
@@ -6244,7 +6320,6 @@ pub(crate) mod tests {
             rope_theta: 100_000.0,
             paged_cache_memory_mb: Some(64),
             paged_block_size: Some(16),
-            persist_paged_cache: None,
             n_mtp_layers: 0,
         }
     }
@@ -6283,7 +6358,6 @@ pub(crate) mod tests {
             mlp_only_layers: None,
             paged_cache_memory_mb: Some(64),
             paged_block_size: Some(16),
-            persist_paged_cache: None,
             n_mtp_layers: 0,
             qwen35_gguf_gdn_layout: None,
             kv_format: None,
@@ -6326,6 +6400,59 @@ pub(crate) mod tests {
             paged_block_size: Some(16),
             use_block_paged_cache: Some(true),
         }
+    }
+
+    /// Splash `Engine::copyDemandBytes`: the pages the running lanes' next
+    /// commands add beyond what they hold, a prefilling lane's next slice and
+    /// a decoding lane's pending token with its draft rows; a waiting lane
+    /// adds none. Twice those pages' bytes are the copy demand, and none
+    /// without a recent claim that reached an uncopied state.
+    /// Mutation CP1 (what a lane holds is not subtracted) → red.
+    #[test]
+    fn copy_demand_counts_the_lanes_next_commands() {
+        use crate::engine::governor::governor::Governor;
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, stats};
+        use crate::engine::governor::host::Pressure;
+        use crate::models::qwen3_5::dflash2_state::disk::copy_demand_bytes;
+        let turn = |seq_id: SeqId, prompt: u32, computed: u32| {
+            let mut turn = TurnState::new(
+                seq_id,
+                (0..prompt).collect(),
+                computed,
+                Vec::new(),
+                None,
+                (),
+            )
+            .expect("a turn");
+            turn.status = TurnStatus::Running;
+            turn
+        };
+        // Prefill: 100 of 300 computed, slices of 64 → rows to 164, 11 blocks
+        // of 16; it holds 7.
+        let prefill = turn(1, 300, 100);
+        // Decode: 40 tokens with 7 draft rows → 47, 3 blocks; it holds 3.
+        let mut decode = turn(2, 40, 40);
+        decode.decode_draft_allowance = 7;
+        // Decode past its blocks: 48 + 1 draft row → 4 blocks; it holds 3.
+        let mut growing = turn(3, 48, 48);
+        growing.decode_draft_allowance = 1;
+        let mut waiting = turn(4, 300, 0);
+        waiting.status = TurnStatus::Waiting;
+        let held = |seq_id: SeqId| match seq_id {
+            1 => 7,
+            2 | 3 => 3,
+            _ => 0,
+        };
+        let running = [prefill, decode, growing, waiting];
+        assert_eq!(next_command_pages(&running, 64, 16, held), 4 + 1);
+        assert_eq!(next_command_pages(&running, 64, 0, held), 0);
+
+        let governor = Governor::new(FakeIo::new(stats(G), host(32 * G, Pressure::Normal)));
+        assert_eq!(
+            copy_demand_bytes(&governor, 0.0, 5, 1024),
+            0,
+            "no copy demand"
+        );
     }
 
     #[test]
@@ -9690,7 +9817,7 @@ pub(crate) mod tests {
         state.owner_last_used.insert(2, 0);
         let anchor = || PagedAnchor {
             linear: Vec::new(),
-            window: DraftContextWindow::new(64, 8).expect("window"),
+            window: Some(DraftContextWindow::new(64, 8).expect("window")),
         };
         let (ordinary, checkpoint) = (tokens_of(41, 1), tokens_of(42, 1));
         let store = &mut state.inner.dflash2_states.store;
@@ -9785,6 +9912,387 @@ pub(crate) mod tests {
         let after = keys(units.units(&bytes));
         assert!(!after.contains(&LedgerKey::Store(c)), "the checkpoint went");
         assert!(after.contains(&LedgerKey::Owner(2)), "the owner stays");
+    }
+
+    /// A state that needs a write goes after every unit that frees memory
+    /// now, idle owners included whatever their stamps, and after the
+    /// image features (Splash `Cache::peek` over `ReclaimPhase`, then
+    /// `MemoryLedger::Order::stage`): a need both cover takes the owner or
+    /// the image first, then stages the state's write.
+    /// Mutation NW1 (a writable state frees now, in the stamp order) → red
+    /// (`[StoreWrite, Idle]` with the newer owner, `[StoreWrite, Vision]`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_state_that_needs_a_write_goes_after_vision() {
+        use crate::engine::governor::ledger::{
+            Charge, ClaimClass, ClaimRank, ClaimSpec, FreePool, Ledger, NeedTiming, ReachClass,
+            Room, take_rights,
+        };
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{
+            attach_tier, test_tier, writable_anchor,
+        };
+        use crate::models::qwen3_5::dflash2_state::store::{EntryId, Lineage, StateClass};
+        use crate::models::qwen3_5::dflash2_turn::{
+            GrowReclaim, Keep, ModelUnits, clear_grow_reclaim_log, grow_reclaim_log,
+        };
+        use crate::models::qwen3_5::draft_context::DraftContextWindow;
+        struct NoPool;
+        impl FreePool for NoPool {
+            fn charge(&self) -> Charge {
+                Charge::default()
+            }
+            fn clear(&mut self) {}
+        }
+        let spec = ClaimSpec {
+            cls: ClaimClass::InService,
+            request_id: 1,
+            rank: ClaimRank::default(),
+            reach: ReachClass::InUse,
+            timing: NeedTiming::CanWait,
+        };
+        let free = |sources: &mut dyn VictimSource| {
+            let probe = Need {
+                bytes: 1,
+                ..Need::default()
+            };
+            let query = VictimQuery {
+                rights: take_rights(&spec, &probe, false),
+                need: probe,
+            };
+            let bytes = sources
+                .units(&query)
+                .iter()
+                .filter(|unit| unit.key != LedgerKey::Extent && unit.key != LedgerKey::DeadLeaves)
+                .map(|unit| unit.bytes)
+                .sum();
+            let mut ledger = Ledger::new();
+            let claim = ledger.open(spec, 7);
+            clear_grow_reclaim_log();
+            ledger.free(
+                claim,
+                Need {
+                    bytes,
+                    ..Need::default()
+                },
+                Room {
+                    bytes: 0,
+                    critical: false,
+                    exempts: false,
+                },
+                &mut NoPool,
+                &mut [sources],
+            );
+            grow_reclaim_log()
+        };
+        let park = |state: &mut HybridSchedulerState<Qwen35Inner>| -> EntryId {
+            let tokens = tokens_of(41, 1);
+            cache_dead_chain(state, &tokens);
+            let anchor = writable_anchor(
+                &state.inner.config,
+                DraftContextWindow::new(64, 8).expect("window"),
+            );
+            let id = state
+                .inner
+                .dflash2_states
+                .store
+                .insert(Lineage::text(&tokens, 0), anchor, StateClass::Ordinary)
+                .expect("a whole-block state")
+                .id;
+            state.inner.sync_gdn_state_marks();
+            id
+        };
+        let written = |state: &HybridSchedulerState<Qwen35Inner>, id: EntryId| {
+            state
+                .inner
+                .dflash2_states
+                .store
+                .get(id)
+                .is_some_and(|entry| entry.ram().is_none() && entry.disk().is_some())
+        };
+        let with_tier = |state: &mut HybridSchedulerState<Qwen35Inner>| {
+            let tier = test_tier("state-tier-after-vision", 1 << 30);
+            attach_tier(
+                &mut state.inner.dflash2_states,
+                &state.inner.config,
+                state.inner.paged_adapter.as_ref().expect("pool"),
+                &tier,
+                DraftContextWindow::bytes(64, 8),
+                8,
+            );
+            tier
+        };
+
+        for owner_newer in [true, false] {
+            let Some(mut state) = qwen35_pool_state(8, 8, passing()) else {
+                return;
+            };
+            let _tier = with_tier(&mut state);
+            drop(speculative::tests::request(
+                &mut state.inner,
+                2,
+                (0..20).map(|token| 400 + token).collect(),
+                false,
+                Arc::new(AtomicBool::new(false)),
+            ));
+            state.owner_sequences.insert("idle".into(), 2);
+            let id = park(&mut state);
+            let stamp = state
+                .inner
+                .dflash2_states
+                .store
+                .get(id)
+                .expect("parked")
+                .last_used();
+            state
+                .owner_last_used
+                .insert(2, if owner_newer { stamp + 4 } else { 0 });
+            let mut units = SchedUnits {
+                state: &mut state,
+                claimant: 1,
+                kept: &[],
+            };
+            assert_eq!(
+                free(&mut units),
+                vec![GrowReclaim::Idle, GrowReclaim::StoreWrite],
+                "owner newer: {owner_newer}"
+            );
+            assert!(written(&state, id));
+        }
+
+        let Some(mut state) = qwen35_pool_state(8, 8, passing()) else {
+            return;
+        };
+        let _tier = with_tier(&mut state);
+        let id = park(&mut state);
+        let features = MxArray::zeros(&[1024], Some(crate::array::DType::Float32)).expect("zeros");
+        features.eval();
+        state
+            .inner
+            .vision_cache
+            .lock()
+            .expect("vision cache")
+            .insert_for_test(9, features, 4096);
+        let mut units = ModelUnits {
+            target: &mut state.inner,
+            keep: Keep::default(),
+        };
+        assert_eq!(
+            free(&mut units),
+            vec![GrowReclaim::Vision, GrowReclaim::StoreWrite]
+        );
+        assert!(written(&state, id));
+    }
+
+    /// An idle model moves a written state's owed chain with no request:
+    /// each tracked landing wakes its thread (Splash `Engine::tick` polls
+    /// its transfers), whose tick hands the writer the next blocks, until
+    /// the chain is on the tier and its mark goes. An allocation polls the
+    /// landings and reads no block. On a persistent tier a copy ahead due
+    /// at 10 s is made when the monitor's wake for the model's published
+    /// wakeup fires (Splash `WriteBehind::nextWakeup`), with no request.
+    /// Mutations WK1 (the tier's landing wake is not installed) → red (no
+    /// wake reaches the idle model); WD2 (the tick publishes no wakeup) →
+    /// red (the due point is never copied).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn idle_model_drains_the_chain() {
+        use std::sync::atomic::AtomicU32;
+
+        use crate::engine::governor::allocate::{Admission, Refusal, StateAdmission, allocate};
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, lane, stats};
+        use crate::engine::governor::governor::{Governor, ModelRegistration};
+        use crate::engine::governor::host::Pressure;
+        use crate::engine::governor::ledger::ClaimClass;
+        use crate::engine::governor::monitor;
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{
+            attach_tier, test_tier, writable_anchor,
+        };
+        use crate::models::qwen3_5::dflash2_state::disk::{Staged, stage};
+        use crate::models::qwen3_5::dflash2_state::store::{Lineage, StateClass};
+        use crate::models::qwen3_5::draft_context::DraftContextWindow;
+        const MODEL: u64 = 0x5713_3301;
+        let Some(mut state) = qwen35_pool_state(24, 24, passing()) else {
+            return;
+        };
+        let io = FakeIo::new(stats(G), host(32 * G, Pressure::Normal));
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io.clone())));
+        state.inner.memory_registration = Some(
+            governor
+                .register_model(ModelRegistration {
+                    model_id: MODEL,
+                    hard_budget: 16 * G,
+                    untracked: 0,
+                    page_bytes: G / 4,
+                })
+                .expect("register"),
+        );
+        let tier = test_tier("state-tier-idle-drain", 1 << 30);
+        attach_tier(
+            &mut state.inner.dflash2_states,
+            &state.inner.config,
+            state.inner.paged_adapter.as_ref().expect("pool"),
+            &tier,
+            DraftContextWindow::bytes(64, 8),
+            8,
+        );
+        state
+            .inner
+            .dflash2_states
+            .disk
+            .as_ref()
+            .expect("tier")
+            .wake_model_on_landing(MODEL);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let direct = sender.clone();
+        let wakes = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&wakes);
+        monitor::register_waker(
+            MODEL,
+            Box::new(move || {
+                counted.fetch_add(1, Ordering::AcqRel);
+                sender.send(ModelCommand::MemoryControl).is_ok()
+            }),
+        );
+
+        let tokens = tokens_of(43, 20);
+        cache_dead_chain(&state, &tokens);
+        let anchor = writable_anchor(
+            &state.inner.config,
+            DraftContextWindow::new(64, 8).expect("window"),
+        );
+        let id = state
+            .inner
+            .dflash2_states
+            .store
+            .insert(Lineage::text(&tokens, 0), anchor, StateClass::Ordinary)
+            .expect("a whole-block state")
+            .id;
+        state.inner.sync_gdn_state_marks();
+        assert_eq!(
+            stage(&mut state.inner, id, mlx_paged_attn::MakeRoom::Evict, false),
+            Staged::Started
+        );
+        let copy = |state: &HybridSchedulerState<Qwen35Inner>| {
+            state
+                .inner
+                .dflash2_states
+                .store
+                .get(id)
+                .and_then(|entry| entry.disk().copied())
+        };
+        let drained = || assert!(tier.tier.manager.drain(std::time::Duration::from_secs(10)));
+        drained();
+
+        let written = tier.tier.manager.stats().enqueued;
+        let spec = lane(ClaimClass::InService, 1, 0);
+        let claim = governor.open(spec, MODEL);
+        let allocation = allocate(
+            claim.claim(),
+            spec,
+            Refusal::Settled,
+            false,
+            &mut SchedUnits {
+                state: &mut state,
+                claimant: SeqId::MAX,
+                kept: &[],
+            },
+            |_| StateAdmission(governor.try_reserve(1)),
+        );
+        assert!(allocation.admission.granted());
+        drop(allocation);
+        drop(claim);
+        assert!(
+            copy(&state).is_some_and(|copy| copy.landed && copy.chain_owed),
+            "the allocation polled the state's landing"
+        );
+        assert_eq!(
+            tier.tier.manager.stats().enqueued,
+            written,
+            "a poll reads no block"
+        );
+
+        for _ in 0..64 {
+            assert!(!receiver.is_empty(), "a landing woke the idle model");
+            assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+            drained();
+            if !copy(&state).is_some_and(|copy| copy.chain_owed) {
+                break;
+            }
+        }
+        assert!(copy(&state).is_some_and(|copy| copy.landed && !copy.chain_owed));
+        assert!(wakes.load(Ordering::Acquire) >= 2);
+        assert_eq!(
+            state
+                .inner
+                .paged_adapter
+                .as_ref()
+                .expect("pool")
+                .marked_blocks(),
+            0
+        );
+
+        // A copy ahead on a persistent tier, due at 10 s.
+        use crate::models::qwen3_5::dflash2_state::disk::tests::persistent_test_tier;
+        use crate::models::qwen3_5::dflash2_state::write_behind::{DELAY_SECONDS, published};
+        let persistent = persistent_test_tier("state-tier-idle-copy", 1 << 30);
+        attach_tier(
+            &mut state.inner.dflash2_states,
+            &state.inner.config,
+            state.inner.paged_adapter.as_ref().expect("pool"),
+            &persistent,
+            DraftContextWindow::bytes(64, 8),
+            8,
+        );
+        state
+            .inner
+            .dflash2_states
+            .disk
+            .as_ref()
+            .expect("tier")
+            .wake_model_on_landing(MODEL);
+        let tokens = tokens_of(44, 3);
+        cache_dead_chain(&state, &tokens);
+        let anchor = writable_anchor(
+            &state.inner.config,
+            DraftContextWindow::new(64, 8).expect("window"),
+        );
+        let point = state
+            .inner
+            .dflash2_states
+            .store
+            .insert(Lineage::text(&tokens, 0), anchor, StateClass::Ordinary)
+            .expect("a whole-block state")
+            .id;
+        state.inner.sync_gdn_state_marks();
+        published(
+            &mut state.inner.dflash2_states,
+            point,
+            tokens.len() as u32,
+            0.0,
+        );
+        let copied = |state: &HybridSchedulerState<Qwen35Inner>| {
+            state
+                .inner
+                .dflash2_states
+                .store
+                .get(point)
+                .is_some_and(|entry| entry.disk().is_some())
+        };
+        while receiver.try_recv().is_ok() {}
+        monitor::wake_taken(MODEL);
+        direct
+            .send(ModelCommand::MemoryControl)
+            .expect("the model's channel");
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        assert!(!copied(&state), "not due yet");
+        monitor::tick(governor);
+        assert!(receiver.is_empty(), "no wake before the point falls due");
+        io.with(|fake| fake.now = DELAY_SECONDS);
+        monitor::tick(governor);
+        assert!(!receiver.is_empty(), "the due wakeup woke the idle model");
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        assert!(copied(&state), "the due point is copied");
+        monitor::forget_waker(MODEL);
     }
 
     /// MoE twin of `lone_turn_takes_a_suspended_turns_replay_point_last`.

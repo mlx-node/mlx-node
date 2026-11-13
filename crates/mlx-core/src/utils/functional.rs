@@ -2030,7 +2030,6 @@ mod sparse_moe_autograd_tests {
             mlp_only_layers: None,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            persist_paged_cache: None,
             n_mtp_layers: 0,
             qwen35_gguf_gdn_layout: None,
             kv_format: None,

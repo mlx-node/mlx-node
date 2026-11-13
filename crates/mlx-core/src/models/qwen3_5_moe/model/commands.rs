@@ -27,6 +27,13 @@ pub(crate) enum Qwen35MoeFamilyCommand {
         save_path: String,
         reply: ResponseTx<()>,
     },
+    /// Closes the SSD cache at a clean stop by `deadline_ms` (milliseconds
+    /// on `Date.now()`'s clock); replies whether every restore point and
+    /// queued write reached the disk.
+    CloseCache {
+        deadline_ms: f64,
+        reply: ResponseTx<bool>,
+    },
     /// Training-session commands shared with the model-neutral engine. The
     /// thread loop routes these to
     /// [`crate::engine::cmd::handle_train_cmd`], which drives the
@@ -136,6 +143,10 @@ impl crate::engine::model_command::FamilyCommand<Qwen35MoeInner> for Qwen35MoeFa
             Qwen35MoeFamilyCommand::SaveModel { save_path, reply } => {
                 let _ = reply.send(inner.save_model_sync(&save_path));
             }
+            Qwen35MoeFamilyCommand::CloseCache { deadline_ms, reply } => {
+                use crate::models::qwen3_5::dflash2_state::disk::{close_cache, instant_at};
+                let _ = reply.send(Ok(close_cache(inner, instant_at(deadline_ms))));
+            }
             Qwen35MoeFamilyCommand::Train(train_cmd) => {
                 handle_train_cmd(inner, train_cmd);
             }
@@ -181,6 +192,7 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
     /// The turn's replay point leaves InUse when it closes.
     fn scheduled_turn_closed(&mut self, seq_id: SeqId) {
         self.end_gdn_use(seq_id);
+        self.dflash2_states.end_turn(seq_id);
     }
 
     fn reclaims_in_order(&self) -> bool {
@@ -226,6 +238,10 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
 
     fn sync_state_marks(&mut self) {
         self.sync_gdn_state_marks();
+    }
+
+    fn tick_state_disk(&mut self, tick: crate::models::qwen3_5::dflash2_state::disk::Tick) -> bool {
+        crate::models::qwen3_5::dflash2_state::disk::tick(self, tick)
     }
 
     fn memory_governor(&self) -> Option<&'static crate::engine::governor::governor::Governor> {

@@ -2228,7 +2228,6 @@ mod tests {
             rope_theta: 10_000.0,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            persist_paged_cache: None,
             n_mtp_layers: 0,
         };
         let mut net = GatedDeltaNet::new(&config).unwrap();
@@ -2608,7 +2607,6 @@ mod tests {
             rope_theta: 10_000.0,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            persist_paged_cache: None,
             n_mtp_layers: 0,
         };
         // Deterministic dense sidecars so both nets share every weight.

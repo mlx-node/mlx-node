@@ -33,8 +33,7 @@ use crate::inference_trace::{
 use crate::model_thread::{ResponseTx, send_and_await};
 #[cfg(test)]
 use crate::models::qwen3_5::gdn_checkpoint_store::{
-    GDN_PREFIX_CHECKPOINTS_PER_OWNER, GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER,
-    compute_paged_prefix_block_hash,
+    GDN_PREFIX_CHECKPOINTS_PER_OWNER, compute_paged_prefix_block_hash,
 };
 use crate::models::qwen3_5::gdn_checkpoint_store::{
     GdnCheckpointLineage, compute_paged_prefix_block_hashes,
@@ -157,6 +156,8 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) memory_registration: Option<crate::engine::governor::governor::ModelGuard<'static>>,
     /// `--max-memory`: it only lowers the automatic hard budget.
     pub(crate) max_memory_bytes: Option<u64>,
+    /// The load's SSD tier options; a model built without a load keeps none.
+    pub(crate) disk_options: crate::disk_tier::DiskTierOptions,
     /// `--max-context`: the context every turn may hold, at most the plan's.
     pub(crate) max_context: Option<u32>,
     /// `--decode-share` (Splash `EngineConfig::decodeShare`).
@@ -178,18 +179,6 @@ pub(crate) struct Qwen35MoeInner {
     gdn_root_cache_owner_id: Option<String>,
     gdn_root_cache_owner_is_explicit: bool,
     gdn_prefix_checkpoints: VecDeque<MoeGdnPrefixCheckpoint>,
-    /// Per scheduled sequence (`None` = the serial lane), the ladder rungs
-    /// the governor refused RAM for this turn: the deepest, and the deepest
-    /// within the reach predicted for the turn's K/V capture walk
-    /// ([`crate::models::qwen3_5::gdn_checkpoint_store::hold_refused_rung`]).
-    /// They go to the cold tier only (Splash `publishStateToDisk`): the
-    /// sequence's sidecar capture reads them, and its turn's end drops them,
-    /// so a refused host holds at most two extra states per live sequence.
-    /// Keyed by sequence, not `active_cache_owner_id`: the scheduler sets that
-    /// only at admission, so under overlap it names the last admitted owner,
-    /// while each prefill slice and turn end activates its own sequence (one
-    /// per owner).
-    gdn_unclaimed_rungs: HashMap<Option<SeqId>, Vec<MoeGdnPrefixCheckpoint>>,
     gdn_last_history_checkpoint: Option<MoeGdnHistoryCheckpoint>,
     /// The replay point each running turn restored from (Splash
     /// `StateCache::useState`): no reclaim unit until its use ends.
@@ -491,6 +480,7 @@ impl Qwen3_5MoeModel {
         options: Option<crate::models::qwen3_5::model::Qwen35LoadOptions>,
     ) -> Result<Qwen3_5MoeModel> {
         let options = options.unwrap_or_default();
+        let disk = options.disk_tier("Qwen3.5 MoE")?;
         let draft_model_path = options.draft_model_path;
         let kv_format = options
             .kv_format
@@ -520,6 +510,7 @@ impl Qwen3_5MoeModel {
             max_memory_bytes,
             max_context,
             decode_share,
+            disk,
         )
         .await;
         if loaded.is_err() {
@@ -668,6 +659,22 @@ impl Qwen3_5MoeModel {
                 .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
         })?;
         Ok(promise)
+    }
+
+    /// Closes the model's SSD cache at a clean stop (Splash
+    /// `closePersistentCache`): a persistent cache first writes every
+    /// restore point still waiting, newest first, until `deadlineMs`
+    /// (milliseconds on `Date.now()`'s clock, so models closed in turn
+    /// share one deadline); a temporary cache is removed. The cache takes no
+    /// write afterwards. Resolves false when something missed the deadline.
+    ///
+    /// Dispatches to model thread.
+    #[napi]
+    pub async fn close_cache(&self, deadline_ms: f64) -> Result<bool> {
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35MoeFamilyCommand::CloseCache { deadline_ms, reply }
+        })
+        .await
     }
 }
 

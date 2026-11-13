@@ -873,7 +873,9 @@ fn settle_at_committed_equals_cursor_when_equal() {
             fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
                 b"gemma4-spec-paged-settle".as_slice(),
             ]),
-            sidecar_policy: Some(policy),
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar(
+                policy,
+            ),
         });
 
     let cursor_trace = drive_settles(&mut inner, 21, false);
@@ -962,7 +964,9 @@ fn settle_below_cursor_stays_on_the_committed_basis() {
             fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
                 b"gemma4-spec-paged-settle-below".as_slice(),
             ]),
-            sidecar_policy: Some(policy),
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar(
+                policy,
+            ),
         });
     assert_eq!(
         inner.scheduled_cold_anchor_rungs().first(),
@@ -1157,7 +1161,9 @@ fn family_settle_at_the_committed_frontier_captures_the_cold_rung() {
             fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
                 b"gemma4-spec-paged-rung".as_slice(),
             ]),
-            sidecar_policy: Some(policy),
+            backing: crate::transformer::paged_kv_cache_adapter::ColdContextBacking::Sidecar(
+                policy,
+            ),
         });
     assert_eq!(
         inner.scheduled_cold_anchor_rungs().first(),
