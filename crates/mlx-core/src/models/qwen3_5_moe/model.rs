@@ -178,6 +178,12 @@ pub(crate) struct Qwen35MoeInner {
     gdn_root_cache_owner_id: Option<String>,
     gdn_root_cache_owner_is_explicit: bool,
     gdn_prefix_checkpoints: VecDeque<MoeGdnPrefixCheckpoint>,
+    /// The deepest ladder rung the governor refused RAM for this turn. It
+    /// goes to the cold tier only (Splash `publishStateToDisk`): this turn's
+    /// sidecar capture reads it, and the turn's end drops it. One rung, the
+    /// one the capture's deepest-boundary pick can use, so a refused host
+    /// holds at most one extra state.
+    gdn_unclaimed_rung: Option<MoeGdnPrefixCheckpoint>,
     gdn_last_history_checkpoint: Option<MoeGdnHistoryCheckpoint>,
     /// The replay point each running turn restored from (Splash
     /// `StateCache::useState`): no reclaim unit until its use ends.

@@ -110,6 +110,7 @@ impl Qwen35MoeInner {
             gdn_root_cache_owner_id: None,
             gdn_root_cache_owner_is_explicit: false,
             gdn_prefix_checkpoints: VecDeque::new(),
+            gdn_unclaimed_rung: None,
             gdn_last_history_checkpoint: None,
             gdn_in_use: HashMap::new(),
             gdn_restored_from: None,
@@ -1003,6 +1004,7 @@ impl Qwen35MoeInner {
         self.cached_paged_image_token_positions.clear();
         self.cached_rope_deltas = None;
         self.gdn_prefix_checkpoints.clear();
+        self.gdn_unclaimed_rung = None;
         self.gdn_last_history_checkpoint = None;
         self.gdn_in_use.clear();
         self.dflash2_states.end_all_restored();

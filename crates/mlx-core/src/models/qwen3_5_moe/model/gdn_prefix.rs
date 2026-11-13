@@ -130,9 +130,11 @@ impl Qwen35MoeInner {
         match finalize_result {
             Ok(_) => {
                 self.capture_moe_gdn_cold_sidecar(image_token_positions, cache_salt);
+                self.gdn_unclaimed_rung = None;
                 Ok(())
             }
             Err(error) => {
+                self.gdn_unclaimed_rung = None;
                 self.invalidate_moe_paged_session("manual finalization failure");
                 Err(Error::from_reason(format!(
                     "MoE paged finalization failed: {error}"
@@ -342,35 +344,44 @@ impl Qwen35MoeInner {
             return false;
         };
         let bytes = Qwen3_5LayerCache::linear_state_bytes(&checkpoint.caches);
-        if crate::models::qwen3_5::dflash2_turn::publish_claimed(
+        let claimed = crate::models::qwen3_5::dflash2_turn::publish_claimed(
             self,
             bytes,
             Keep::default(),
             |_| (),
         )
-        .is_none()
-        {
+        .is_some();
+        if !claimed && !self.wants_gdn_checkpoint_ladder() {
             return false;
         }
-
+        let rung = MoeGdnPrefixCheckpoint {
+            owner_id: self.active_cache_owner_id.clone(),
+            prefix_len,
+            block_size,
+            final_block_hash,
+            block_hashes,
+            tokens: prefix_tokens.to_vec(),
+            caches: checkpoint.caches,
+            last_used: self.cache_recency.next(),
+        };
+        if !claimed {
+            let keep_older = self
+                .gdn_unclaimed_rung
+                .as_ref()
+                .is_some_and(|kept| kept.prefix_len > prefix_len);
+            if !keep_older {
+                self.gdn_unclaimed_rung = Some(rung);
+            }
+            return false;
+        }
         self.gdn_prefix_checkpoints.retain(|existing| {
-            !(existing.owner_id == self.active_cache_owner_id
+            !(existing.owner_id == rung.owner_id
                 && existing.prefix_len == prefix_len
                 && existing.block_size == block_size
                 && existing.final_block_hash == final_block_hash
-                && existing.tokens.as_slice() == prefix_tokens)
+                && existing.tokens.as_slice() == rung.tokens.as_slice())
         });
-        self.gdn_prefix_checkpoints
-            .push_back(MoeGdnPrefixCheckpoint {
-                owner_id: self.active_cache_owner_id.clone(),
-                prefix_len,
-                block_size,
-                final_block_hash,
-                block_hashes,
-                tokens: prefix_tokens.to_vec(),
-                caches: checkpoint.caches,
-                last_used: self.cache_recency.next(),
-            });
+        self.gdn_prefix_checkpoints.push_back(rung);
         self.prune_moe_gdn_prefix_checkpoints();
         true
     }
@@ -562,10 +573,15 @@ impl Qwen35MoeInner {
         cache_salt: u64,
     ) {
         let dense_config = self.config.to_dense_config();
+        let checkpoints: VecDeque<&MoeGdnPrefixCheckpoint> = self
+            .gdn_prefix_checkpoints
+            .iter()
+            .chain(&self.gdn_unclaimed_rung)
+            .collect();
         crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar(
             "qwen3_5_moe",
             self.paged_adapter.as_ref(),
-            &self.gdn_prefix_checkpoints,
+            &checkpoints,
             &self.active_cache_owner_id,
             &dense_config,
             image_token_positions,
