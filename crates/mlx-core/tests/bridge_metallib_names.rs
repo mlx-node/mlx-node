@@ -146,8 +146,8 @@ fn every_paged_prefill_kernel_is_in_the_metallib() {
     assert_names("paged_prefill", PAGED_PREFILL_NAMES);
 }
 
-/// The only paged prefill route: every pipeline builds on every Apple GPU
-/// family. A hosted VM GPU has none and builds none.
+/// Every paged prefill pipeline builds on every Apple GPU family. A hosted
+/// VM GPU builds none and prefills through the varlen kernel.
 #[test]
 fn every_paged_prefill_kernel_builds_a_pipeline() {
     let c = check("paged_prefill", true);
@@ -163,7 +163,7 @@ fn every_paged_prefill_kernel_builds_a_pipeline() {
 
 /// A paged prefill pipeline that does not build fails loudly with the
 /// kernel and the device's Apple GPU family named (Splash
-/// `DeviceCapabilities::validationMessage`); there is no other route.
+/// `DeviceCapabilities::validationMessage`).
 /// Mutation F1: the loader rethrows the bare load error → red.
 #[test]
 fn a_paged_prefill_pipeline_failure_names_the_gpu_family() {

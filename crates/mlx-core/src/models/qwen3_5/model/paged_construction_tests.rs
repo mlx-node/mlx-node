@@ -4153,3 +4153,113 @@ fn image_turn_without_a_pool_is_refused_at_admission() {
     let inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny model");
     assert!(!inner.execution_plan().media.admitted().images);
 }
+
+/// A greedy turn on `inner`: `prompt` in 16-row chunks, then `steps - 1`
+/// decode steps. Each step's logits as f32.
+#[cfg(target_os = "macos")]
+fn greedy_paged_logits(inner: &mut Qwen35Inner, prompt: &[u32], steps: usize) -> Vec<Vec<f32>> {
+    reset_paged_request(inner, prompt);
+    let prefill = run_dense_paged_prefill_with_size(inner, prompt, prompt, 0, 16)
+        .unwrap_or_else(|error| panic!("paged prefill: {}", error.reason));
+    let mut out = vec![logits_to_f32_vec(&prefill)];
+    while out.len() < steps {
+        let last = out.last().expect("a step");
+        let token = (0..last.len()).fold(0, |best, i| if last[i] > last[best] { i } else { best });
+        let embed = inner.embedding.clone();
+        let layer_kinds = inner.layer_kinds.clone();
+        let caches = inner.caches.as_mut().expect("caches");
+        let adapter = inner.paged_adapter.as_mut().expect("adapter");
+        let logits = crate::models::qwen3_5::paged_forward::run_paged_decode_step(
+            token as u32,
+            &embed,
+            &mut inner.layers,
+            caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            &layer_kinds,
+            adapter,
+            0,
+        )
+        .expect("paged decode step");
+        out.push(logits_to_f32_vec(
+            &logits.reshape(&[-1]).expect("flat logits"),
+        ));
+    }
+    out
+}
+
+/// A GPU that cannot build the tensor-op prefill pipelines runs the turn
+/// through the varlen kernel: a 70-token prompt in 16-row chunks and 15
+/// greedy decode steps on a bf16 (D128, group 4) and an int8 (D256, group
+/// 4) pool keep every step's logits within `BOUND` of the tile turn and
+/// pick the same token, until a step whose top-2 margin the bound could
+/// flip picks another (the turns then diverge).
+#[cfg(target_os = "macos")]
+#[test]
+fn portable_prefill_turn_matches_the_tile_turn() {
+    // Twice the largest difference measured on an M5 (0.0098, bf16).
+    const BOUND: f32 = 0.02;
+    const STEPS: usize = 16;
+    if crate::test_support::paged_prefill_unsupported("portable_prefill_turn_matches_the_tile_turn")
+    {
+        return;
+    }
+    let prompt: Vec<u32> = (0u32..70).map(|i| (i * 37 + 5) % 997).collect();
+    // SAFETY: seeds MLX's global key; the weights are random.
+    unsafe { mlx_sys::mlx_seed(0x7066_0001) };
+    let bf16 =
+        paged_inner_or_skip("portable_prefill_turn_matches_the_tile_turn").map(|(mut inner, _)| {
+            cast_qwen35_inner_weights_bf16(&mut inner);
+            inner
+        });
+    // SAFETY: as above.
+    unsafe { mlx_sys::mlx_seed(0x7066_0002) };
+    let int8 = planned_head256_load("int8", true)
+        .map(|load| load.unwrap_or_else(|error| panic!("int8 load: {}", error.reason)));
+    let (Some(bf16), Some(int8)) = (bf16, int8) else {
+        return;
+    };
+    let argmax = |l: &[f32]| (0..l.len()).fold(0, |b, i| if l[i] > l[b] { i } else { b });
+    for (label, mut inner) in [("bf16", bf16), ("int8", int8)] {
+        let tile = greedy_paged_logits(&mut inner, &prompt, STEPS);
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("adapter")
+            .force_portable_prefill();
+        let portable = greedy_paged_logits(&mut inner, &prompt, STEPS);
+        let mut same = 0;
+        let mut largest = 0f32;
+        for (step, (a, b)) in tile.iter().zip(&portable).enumerate() {
+            let gap = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max);
+            largest = largest.max(gap);
+            assert!(gap <= BOUND, "{label} step {step}: logits differ by {gap}");
+            let best = argmax(a);
+            if argmax(b) == best {
+                same += 1;
+                continue;
+            }
+            let runner_up = a
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != best)
+                .map(|(_, v)| *v)
+                .fold(f32::MIN, f32::max);
+            assert!(
+                a[best] - runner_up <= 2.0 * BOUND,
+                "{label} step {step}: a margin of {} picked another token",
+                a[best] - runner_up
+            );
+            break;
+        }
+        eprintln!("{label}: largest logit difference {largest}, {same} tokens equal");
+        assert!(
+            same >= STEPS / 2,
+            "{label}: the turns diverge at step {same}"
+        );
+    }
+}

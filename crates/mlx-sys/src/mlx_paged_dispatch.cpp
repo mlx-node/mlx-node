@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "mlx/allocator.h"
+#include "mlx/backend/metal/metal.h"
 #include "mlx/memory.h"
 #include "mlx/dtype.h"
 #include "mlx/transforms.h"
@@ -2147,7 +2148,7 @@ std::string apple_gpu_family_name(mlx::core::metal::Device& device) {
 }
 
 std::atomic<uint64_t>& paged_prefill_probe_counter(int kind) {
-  static std::atomic<uint64_t> counters[2] = {{0}, {0}};
+  static std::atomic<uint64_t> counters[3] = {{0}, {0}, {0}};
   return counters[kind];
 }
 
@@ -2285,6 +2286,20 @@ void dispatch_paged_prefill_attention(
 
 } // namespace mlx::core::fast::paged
 
+extern "C" bool mlx_paged_prefill_mpp_builds() {
+  using namespace mlx::core;
+  fast::paged::paged_prefill_probe_counter(2).fetch_add(1, std::memory_order_relaxed);
+  try {
+    if (!metal::is_available()) {
+      return false;
+    }
+    fast::paged::build_paged_prefill_attention_pipelines(metal::device(Device::gpu));
+    return true;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
 extern "C" void mlx_paged_prefill_test_probe_reset() {
   using namespace mlx::core::fast::paged;
   paged_prefill_probe_counter(0).store(0, std::memory_order_relaxed);
@@ -2293,10 +2308,11 @@ extern "C" void mlx_paged_prefill_test_probe_reset() {
   paged_prefill_probe_last_max_splits().store(0, std::memory_order_relaxed);
 }
 
-// kind 0: prefill launches, 1: verify launches.
+// kind 0: prefill launches, 1: verify launches, 2: build probes (never
+// reset).
 extern "C" uint64_t mlx_paged_prefill_test_probe_count(int kind) {
   using namespace mlx::core::fast::paged;
-  if (kind != 0 && kind != 1) {
+  if (kind < 0 || kind > 2) {
     return 0;
   }
   return paged_prefill_probe_counter(kind).load(std::memory_order_relaxed);

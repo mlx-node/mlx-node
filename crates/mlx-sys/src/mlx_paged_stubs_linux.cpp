@@ -223,6 +223,8 @@ bool mlx_paged_prefill_attention_forward(
   return false;
 }
 
+bool mlx_paged_prefill_mpp_builds() { return false; }
+
 void mlx_paged_prefill_test_probe_reset() {}
 
 uint64_t mlx_paged_prefill_test_probe_count(int) { return 0; }

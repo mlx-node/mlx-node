@@ -1209,8 +1209,13 @@ unsafe extern "C-unwind" {
         out_workspace: *mut *mut mlx_array,
     ) -> bool;
 
+    /// True when every in-place prefill attention pipeline builds on this
+    /// GPU.
+    pub fn mlx_paged_prefill_mpp_builds() -> bool;
+
     /// Reset/read the in-place prefill attention launch probe (counted at
-    /// every dispatch). `kind` 0 counts prefill launches, 1 verify launches.
+    /// every dispatch). `kind` 0 counts prefill launches, 1 verify launches,
+    /// 2 calls of `mlx_paged_prefill_mpp_builds` (never reset).
     pub fn mlx_paged_prefill_test_probe_reset();
     pub fn mlx_paged_prefill_test_probe_count(kind: i32) -> u64;
     pub fn mlx_paged_prefill_test_last_splits() -> u32;

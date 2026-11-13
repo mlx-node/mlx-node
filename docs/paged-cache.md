@@ -57,8 +57,14 @@ query group of 4, 6, 8 or 16, head 128 or 256, 16- or 32-token blocks); a
 layout with no kernel fails the load ("no paged-attention kernel for
 layout"). Every GPU family runs the kernel (Splash's Apple9 floor is
 engine-wide, not this kernel's); M1 and M2 take the Apple9 pages-per-split
-row, unmeasured there. A pipeline that does not build fails the turn with the
-kernel and the Apple GPU family named.
+row, unmeasured there. A GPU whose compiler cannot build its pipelines (the
+hosted macOS VM, "no known Apple GPU family"; asked once per process,
+`device_prefill_mpp_builds`) attends the same stored rows through the plain
+Metal varlen kernel instead (`gather_kv_for_prefill_chunk_varlen`). Splash has
+no such fallback. That route is not bit-equal to the kernel (another
+reduction order), and the plan does not charge its bf16 partials (about
+`rows x Hq x ceil(ctx / 512) x (D + 2) x 4` B past 512 tokens of context; int8
+tiles them to 2,048 row-partitions).
 
 Every load starts the pool at the **runway**: 2048 tokens of blocks plus one
 GDN cell (`qwen35_runway_blocks`, Splash `warmupKvPages`; 275 blocks on the

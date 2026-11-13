@@ -604,6 +604,26 @@ fn device_pages_per_split() -> u32 {
     })
 }
 
+/// Whether this GPU builds the in-place prefill attention pipelines, asked
+/// once per process.
+#[cfg(target_os = "macos")]
+pub(crate) fn device_prefill_mpp_builds() -> bool {
+    static BUILDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *BUILDS.get_or_init(|| {
+        // SAFETY: nullary probe that catches internally.
+        let builds = unsafe { mlx_sys::mlx_paged_prefill_mpp_builds() };
+        if !builds {
+            tracing::warn!(
+                target: "mlx_core::inference",
+                event = "paged_prefill_portable",
+                "this GPU cannot build the tensor-op paged prefill pipelines; prefill and \
+                 verify attend through the varlen kernel"
+            );
+        }
+        builds
+    })
+}
+
 /// The pages a decode query at context length `context` reads: the first
 /// retained logical block and the token count visible from it. Sliding
 /// groups omit whole blocks before their live window (the kernel masks the
@@ -1141,6 +1161,11 @@ pub struct PagedKVCacheAdapter {
     /// grow-target block count and returns the probe's `selected_blocks`.
     #[cfg(test)]
     grow_headroom_probe_override: Option<Arc<dyn Fn(u32) -> Result<u32, String> + Send + Sync>>,
+
+    /// Test-only: prefill and verify take the varlen route on a GPU that
+    /// builds the tensor-op pipelines.
+    #[cfg(all(test, target_os = "macos"))]
+    portable_prefill_forced: bool,
 }
 
 /// One layer's pool arrays as a native write consumes and returns them.
@@ -1364,6 +1389,8 @@ impl PagedKVCacheAdapter {
             admission: None,
             #[cfg(test)]
             grow_headroom_probe_override: None,
+            #[cfg(all(test, target_os = "macos"))]
+            portable_prefill_forced: false,
         })
     }
 
@@ -6085,6 +6112,20 @@ impl PagedKVCacheAdapter {
         })
     }
 
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn force_portable_prefill(&mut self) {
+        self.portable_prefill_forced = true;
+    }
+
+    #[cfg(target_os = "macos")]
+    fn portable_prefill(&self) -> bool {
+        #[cfg(test)]
+        if self.portable_prefill_forced {
+            return true;
+        }
+        !device_prefill_mpp_builds()
+    }
+
     /// In-place attention of the active sequence's chunk over this layer's
     /// pool pages, its rows already stored (Splash `PagedAttention::addPrefill`
     /// and `addVerify`): `queries` `[rows, Hq, D]` at positions
@@ -6112,6 +6153,13 @@ impl PagedKVCacheAdapter {
                 "paged_prefill_attention: layer_idx {layer_idx} out of range (num_layers = {})",
                 self.layer_kv_pool.num_layers()
             ));
+        }
+        // Splash has no fallback: its prefill reads pages only through the
+        // tensor-op tile (kernels/prefill/paged_attention.metal,
+        // paged_attention_tile.h). A GPU that cannot build these pipelines
+        // (a hosted VM GPU) attends through the plain-Metal varlen kernel.
+        if self.portable_prefill() {
+            return self.gather_kv_for_prefill_chunk_varlen(layer_idx, queries, committed, scale);
         }
         let q_meta = KvTensorMeta::from_array(queries, "prefill_queries")?;
         if q_meta.ndim != 3 || q_meta.shape.len() < 3 {
