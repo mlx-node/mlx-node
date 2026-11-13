@@ -1020,7 +1020,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
                 );
             }
         } else {
-            hidden_states.eval();
+            MxArray::eval_arrays_with_context(&[&hidden_states], "paged_prefill_chunk")?;
             if let Some(sink) = taps.as_deref() {
                 sink.eval()?;
             }
@@ -1348,7 +1348,7 @@ pub(crate) fn run_paged_vlm_prefill(
                 embed,
             )?);
         } else {
-            hidden_states.eval();
+            MxArray::eval_arrays_with_context(&[&hidden_states], "paged_prefill_chunk")?;
         }
         if capture_checkpoint {
             materialize_linear_layer_caches(caches)?;

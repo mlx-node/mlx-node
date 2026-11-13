@@ -116,6 +116,31 @@ pub fn synchronize_and_clear_cache() {
     }
 }
 
+/// [`synchronize_and_clear_cache`] that fails on a native error. MLX throws a
+/// failed GPU command's error (e.g. Metal OOM) once, at the next
+/// synchronize, so a caller that drops it runs on what the command wrote
+/// (Splash `NativeRuntime::executionFailed`).
+pub(crate) fn synchronize_and_clear_cache_checked(context: &str) -> napi::Result<()> {
+    #[cfg(test)]
+    super::data::arm_native_failure_at(context);
+    let synchronized = unsafe { sys::mlx_synchronize() };
+    let detail = if synchronized {
+        None
+    } else {
+        Some(
+            super::data::take_native_error()
+                .unwrap_or_else(|| "unknown native MLX exception".to_owned()),
+        )
+    };
+    unsafe { sys::mlx_clear_cache() };
+    match detail {
+        None => Ok(()),
+        Some(detail) => Err(Error::from_reason(format!(
+            "MLX synchronize failed in {context}: {detail}"
+        ))),
+    }
+}
+
 /// Default paged-decode-step cache cleanup cadence.
 ///
 /// Per-step transients (~30+ MB across many layers from GDN/MoE/attention

@@ -29,10 +29,20 @@ pub(crate) fn evaluate_pending_samples(pending: Vec<Result<PendingSample>>) -> V
         .flat_map(|sample| [&sample.token, &sample.logits])
         .collect();
     let evaluated = MxArray::eval_arrays_with_context(&roots, "scheduled_sampling");
+    // MLX throws a failed GPU command's error once; a per-row retry would
+    // sample what it wrote.
+    let gpu_oom = evaluated
+        .as_ref()
+        .err()
+        .filter(|error| crate::engine::governor::is_gpu_out_of_memory(&error.reason))
+        .map(|error| error.reason.clone());
     pending
         .into_iter()
         .map(|sample| {
             let sample = sample?;
+            if let Some(reason) = &gpu_oom {
+                return Err(Error::from_reason(reason.clone()));
+            }
             if evaluated.is_err() {
                 // Retry materialization per row, never sampling. An independent
                 // bad graph must not fail healthy peers or consume a new RNG key.
@@ -72,9 +82,32 @@ pub(crate) fn can_batch_greedy_wave<'a>(
 }
 
 /// Select one greedy token per row from production-shaped
-/// `[batch, 1, vocab]` logits with one MLX graph evaluation. The returned
-/// vector preserves row order.
-pub(crate) fn batch_greedy_tokens(logits: &MxArray) -> Result<Vec<u32>> {
+/// `[batch, 1, vocab]` logits with one MLX graph evaluation, in row order.
+///
+/// `Ok(None)`: the logits do not fit the batched epilogue (a shape or graph
+/// regression), and the caller samples each row instead. A failed eval or
+/// read fails the wave: MLX throws a failed GPU command's error once, so a
+/// per-row retry would sample what that command wrote.
+pub(crate) fn batch_greedy_tokens_or_fallback(logits: &MxArray) -> Result<Option<Vec<u32>>> {
+    let (tokens, batch) = match batch_greedy_argmax(logits) {
+        Ok(argmax) => argmax,
+        Err(error) => {
+            tracing::warn!(
+                target: "mlx_core::scheduler",
+                "batched greedy epilogue failed; falling back to scalar sampling: {}",
+                error.reason
+            );
+            return Ok(None);
+        }
+    };
+    MxArray::eval_arrays_with_context(&[&tokens], "scheduled_greedy_sampling")?;
+    (0..batch)
+        .map(|row| tokens.item_at_int32(row).map(|token| token as u32))
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+fn batch_greedy_argmax(logits: &MxArray) -> Result<(MxArray, usize)> {
     let ndim = logits.ndim()?;
     if ndim != 3 || logits.shape_at(1)? != 1 {
         return Err(Error::from_reason(format!(
@@ -89,30 +122,7 @@ pub(crate) fn batch_greedy_tokens(logits: &MxArray) -> Result<Vec<u32>> {
             "batch_greedy_tokens received a negative batch dimension",
         ));
     }
-    let tokens = logits.argmax(2, None)?;
-    tokens.eval();
-    (0..batch as usize)
-        .map(|row| tokens.item_at_int32(row).map(|token| token as u32))
-        .collect()
-}
-
-/// Availability-preserving wrapper for the optional fused epilogue.
-///
-/// A shared optimization must never turn a successfully-computed model
-/// forward into a wave-wide request failure. Shape/kernel regressions are
-/// reported and the callers fall back to the established per-row sampler.
-pub(crate) fn batch_greedy_tokens_or_fallback(logits: &MxArray) -> Option<Vec<u32>> {
-    match batch_greedy_tokens(logits) {
-        Ok(tokens) => Some(tokens),
-        Err(error) => {
-            tracing::warn!(
-                target: "mlx_core::scheduler",
-                "batched greedy epilogue failed; falling back to scalar sampling: {}",
-                error.reason
-            );
-            None
-        }
-    }
+    Ok((logits.argmax(2, None)?, batch as usize))
 }
 
 #[cfg(test)]
@@ -291,8 +301,8 @@ mod tests {
         )
         .expect("logits");
         assert_eq!(
-            batch_greedy_tokens(&logits).expect("batched argmax"),
-            vec![1, 2, 3]
+            batch_greedy_tokens_or_fallback(&logits).expect("batched argmax"),
+            Some(vec![1, 2, 3])
         );
     }
 
@@ -321,9 +331,57 @@ mod tests {
         assert!(!can_batch_greedy_wave(std::iter::empty()));
     }
 
+    const OOM: &str = "[malloc] Unable to allocate 1073741824 bytes.";
+
+    /// Mutation F1_GREEDY_EVAL (the eval's error is ignored) and
+    /// F1_GREEDY_FALLBACK (a failed eval falls back to per-row sampling) → red.
+    #[test]
+    fn a_native_error_at_the_greedy_eval_fails_the_wave() {
+        let logits = MxArray::from_float32(&[1.0, 9.0, 3.0, 2.0], &[1, 1, 4]).expect("logits");
+        let _armed = crate::array::fail_native_call_at("scheduled_greedy_sampling", OOM);
+        let error = batch_greedy_tokens_or_fallback(&logits).expect_err("the native OOM fails");
+        assert_eq!(
+            error.reason,
+            format!(
+                "MLX eval failed in scheduled_greedy_sampling while materializing 1 arrays: {OOM}"
+            )
+        );
+    }
+
+    /// Mutation F1_SAMPLING_RETRY (a GPU OOM at the wave eval is retried per
+    /// row) → red.
+    #[test]
+    fn a_gpu_oom_at_the_sampling_wave_fails_every_row() {
+        let logits = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4]).unwrap();
+        let _armed = crate::array::fail_native_call_at("scheduled_sampling", OOM);
+        let rows = evaluate_pending_samples(vec![
+            prepare_row(&logits, 0, 4),
+            Err(Error::from_reason("invalid row configuration")),
+            prepare_row(&logits, 0, 4),
+        ]);
+        let reasons: Vec<_> = rows
+            .into_iter()
+            .map(|row| row.expect_err("the row fails").reason)
+            .collect();
+        let failed =
+            format!("MLX eval failed in scheduled_sampling while materializing 4 arrays: {OOM}");
+        assert_eq!(
+            reasons,
+            vec![
+                failed.clone(),
+                "invalid row configuration".to_owned(),
+                failed
+            ]
+        );
+    }
+
     #[test]
     fn malformed_batch_shape_falls_back_instead_of_failing_the_wave() {
         let logits = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]).expect("logits");
-        assert!(batch_greedy_tokens_or_fallback(&logits).is_none());
+        assert!(
+            batch_greedy_tokens_or_fallback(&logits)
+                .expect("a shape miss is no error")
+                .is_none()
+        );
     }
 }

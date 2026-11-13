@@ -40,6 +40,9 @@ pub use memory::{
     set_memory_limit, set_thread_tf32, synchronize, synchronize_and_clear_cache,
 };
 
+#[cfg(test)]
+pub(crate) use data::fail_native_call_at;
+
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;

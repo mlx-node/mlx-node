@@ -518,7 +518,7 @@ pub(crate) fn run_paged_prefill_chunk_tapped(
             // memory-bounding purpose. Skipping `final_norm`/`lm_head`
             // on intermediate chunks matches vLLM's `is_prefill_chunk`
             // skip — those projections would be discarded anyway.
-            hidden.eval();
+            MxArray::eval_arrays_with_context(&[&hidden], "paged_prefill_chunk")?;
             if let Some(sink) = taps.as_deref() {
                 sink.eval()?;
             }
@@ -797,7 +797,7 @@ pub(crate) fn run_paged_vlm_prefill_moe(
                 None,
             )?);
         } else {
-            hidden_states.eval();
+            MxArray::eval_arrays_with_context(&[&hidden_states], "paged_prefill_chunk")?;
         }
         if capture_checkpoint {
             materialize_linear_layer_caches(caches)?;
@@ -1768,6 +1768,28 @@ mod tests {
             adapter.release_request().expect("release_request");
         }
         Ok(Some(v))
+    }
+
+    /// A native failure at a MoE paged prefill chunk's eval fails the
+    /// prefill with MLX's text.
+    /// Mutation F1_MOE_CHUNK (the chunk eval drops its error) → red.
+    #[test]
+    fn a_failed_moe_prefill_chunk_eval_fails_the_prefill() {
+        if crate::test_support::paged_prefill_unsupported(
+            "a_failed_moe_prefill_chunk_eval_fails_the_prefill",
+        ) || !crate::models::qwen3_5::dflash2_decode::tests::metal_is_default_device()
+        {
+            return;
+        }
+        const OOM: &str = "[malloc] Unable to allocate 1073741824 bytes.";
+        let mut inner = crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(0x5730_0003);
+        let prompt: Vec<u32> = (0u32..40).map(|i| (i * 7 + 3) % 16).collect();
+        let _armed = crate::array::fail_native_call_at("paged_prefill_chunk", OOM);
+        let error = run_one(&mut inner, &prompt, 16).expect_err("the chunk eval fails");
+        assert_eq!(
+            error.reason,
+            format!("MLX eval failed in paged_prefill_chunk while materializing 1 arrays: {OOM}")
+        );
     }
 
     /// **Parity test (multi-chunk)**: 96-token prompt with chunk_size=16

@@ -157,7 +157,7 @@ pub(crate) fn accept_dspark_proposal(
         // (mirrors `accept_with_residual`'s T=0 shortcut).
         (|| {
             let argmax_arr = logits.argmax(-1, None)?;
-            argmax_arr.eval();
+            MxArray::eval_arrays_with_context(&[&argmax_arr], "speculative_greedy_accept")?;
             // The verify graph (incl. a device-resident proposal path) is
             // now materialized: the host back-fill below is a plain copy.
             proposal.materialize_draft_ids()?;

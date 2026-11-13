@@ -31,6 +31,84 @@ fn eval_native(handles: &mut [*mut sys::mlx_array]) -> std::result::Result<(), S
     }
 }
 
+/// The native exception the last `mlx_array_item_at_*` or `mlx_synchronize`
+/// on this thread caught, cleared on read (Splash
+/// `NativeRuntime::executionFailed`).
+pub(crate) fn take_native_error() -> Option<String> {
+    let mut text = [0_u8; MLX_EVAL_ERROR_CAPACITY];
+    let length = unsafe { sys::mlx_take_native_error(text.as_mut_ptr().cast(), text.len()) };
+    if length == 0 {
+        return None;
+    }
+    let detail = unsafe { CStr::from_ptr(text.as_ptr().cast()) }
+        .to_string_lossy()
+        .trim()
+        .to_owned();
+    Some(if detail.is_empty() {
+        "unknown native MLX exception".to_owned()
+    } else {
+        detail
+    })
+}
+
+/// A failed host read: the native exception it caught, else `fallback`.
+fn read_error(context: &str, fallback: String) -> Error {
+    match take_native_error() {
+        Some(detail) => Error::from_reason(format!("MLX eval failed in {context}: {detail}")),
+        None => Error::from_reason(fallback),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static NATIVE_FAILURE_AT: std::cell::RefCell<Option<(String, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only: the next checked eval or synchronize named `context` on this
+/// thread throws `text` natively. Disarmed when the guard drops.
+#[cfg(test)]
+pub(crate) fn fail_native_call_at(context: &str, text: &str) -> NativeFailureGuard {
+    NATIVE_FAILURE_AT.with(|slot| *slot.borrow_mut() = Some((context.to_owned(), text.to_owned())));
+    NativeFailureGuard
+}
+
+/// Test-only: the next native eval, read or synchronize on this thread throws
+/// `text`. Disarmed when the guard drops.
+#[cfg(test)]
+pub(crate) fn fail_next_native_call(text: &str) -> NativeFailureGuard {
+    let text = std::ffi::CString::new(text).expect("failure text has no NUL");
+    unsafe { sys::mlx_test_fail_next_native_call(text.as_ptr()) };
+    NativeFailureGuard
+}
+
+#[cfg(test)]
+pub(crate) struct NativeFailureGuard;
+
+#[cfg(test)]
+impl Drop for NativeFailureGuard {
+    fn drop(&mut self) {
+        NATIVE_FAILURE_AT.with(|slot| slot.borrow_mut().take());
+        unsafe { sys::mlx_test_fail_next_native_call(std::ptr::null()) };
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn arm_native_failure_at(context: &str) {
+    let armed = NATIVE_FAILURE_AT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(at, _)| at == context) {
+            slot.take().map(|(_, text)| text)
+        } else {
+            None
+        }
+    });
+    if let Some(text) = armed {
+        let text = std::ffi::CString::new(text).expect("failure text has no NUL");
+        unsafe { sys::mlx_test_fail_next_native_call(text.as_ptr()) };
+    }
+}
+
 /// Whether MLX's Metal backend is available on this host (cached; constant per
 /// process). False on the CUDA/Linux build, which must use synchronous eval to
 /// avoid the async-eval cross-stream `cu::AtomicEvent::wait` segfault.
@@ -118,6 +196,8 @@ impl MxArray {
             return Ok(());
         }
         let mut handles: Vec<*mut sys::mlx_array> = arrays.iter().map(|arr| arr.handle.0).collect();
+        #[cfg(test)]
+        arm_native_failure_at(context);
         match eval_native(&mut handles) {
             Ok(()) => Ok(()),
             Err(detail) => {
@@ -184,8 +264,9 @@ impl MxArray {
         if ok {
             Ok(value)
         } else {
-            Err(Error::from_reason(
-                "Failed to extract int32 scalar (array must have size=1)",
+            Err(read_error(
+                "array_item_at_int32",
+                "Failed to extract int32 scalar (array must have size=1)".to_owned(),
             ))
         }
     }
@@ -197,8 +278,9 @@ impl MxArray {
         if ok {
             Ok(value)
         } else {
-            Err(Error::from_reason(
-                "Failed to extract uint32 scalar (array must have size=1)",
+            Err(read_error(
+                "array_item_at_uint32",
+                "Failed to extract uint32 scalar (array must have size=1)".to_owned(),
             ))
         }
     }
@@ -211,10 +293,12 @@ impl MxArray {
         if ok {
             Ok(value)
         } else {
-            Err(Error::from_reason(format!(
-                "Failed to extract float32 at index {} (check bounds and eval status)",
-                index
-            )))
+            Err(read_error(
+                "array_item_at_float32",
+                format!(
+                    "Failed to extract float32 at index {index} (check bounds and eval status)"
+                ),
+            ))
         }
     }
 
@@ -331,5 +415,84 @@ impl MxArray {
                 "Failed to extract uint16 from array (must be bf16 or f16 dtype)",
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod native_error_tests {
+    use super::*;
+    use crate::engine::governor::is_gpu_out_of_memory;
+
+    const OOM: &str = "[malloc] Unable to allocate 1073741824 bytes.";
+
+    fn lazy_six() -> MxArray {
+        let three = MxArray::from_int32(&[3], &[1]).expect("array");
+        three.add(&three).expect("add")
+    }
+
+    /// Splash `NativeRuntime::executionFailed`: a native failure while a host
+    /// read evaluates its array reaches the Rust error with its text, so the
+    /// GPU OOM classifier matches; the failure is thrown once.
+    /// Mutation F1_ITEM (a failed read drops the native text) → red.
+    #[test]
+    fn a_failed_read_carries_the_native_error() {
+        let lazy = lazy_six();
+        type Read = fn(&MxArray) -> Result<String>;
+        let reads: [(&str, Read); 3] = [
+            ("array_item_at_int32", |a| {
+                a.item_at_int32(0).map(|v| v.to_string())
+            }),
+            ("array_item_at_uint32", |a| {
+                a.item_at_uint32(0).map(|v| v.to_string())
+            }),
+            ("array_item_at_float32", |a| {
+                a.item_at_float32(0).map(|v| v.to_string())
+            }),
+        ];
+        for (context, read) in reads {
+            let _armed = fail_next_native_call(OOM);
+            let error = read(&lazy).expect_err("the read fails");
+            assert_eq!(error.reason, format!("MLX eval failed in {context}: {OOM}"));
+            assert!(is_gpu_out_of_memory(&error.reason), "{}", error.reason);
+        }
+        assert_eq!(
+            lazy.item_at_int32(0).expect("the failure was thrown once"),
+            6
+        );
+    }
+
+    /// A native error no caller took never attaches to a later read's failure.
+    /// Mutation F1_STALE (an item read keeps the previous native error) → red.
+    #[test]
+    fn a_stale_native_error_never_attaches() {
+        let lazy = lazy_six();
+        {
+            let _armed = fail_next_native_call(OOM);
+            crate::array::synchronize();
+        }
+        let error = lazy
+            .item_at_int32(1)
+            .expect_err("index 1 of a 1-element array");
+        assert_eq!(
+            error.reason,
+            "Failed to extract int32 scalar (array must have size=1)"
+        );
+    }
+
+    /// A native failure thrown at synchronize fails the checked synchronize
+    /// with its text, once.
+    /// Mutation F1_SYNC (the checked synchronize ignores the native status)
+    /// → red.
+    #[test]
+    fn a_failed_synchronize_returns_the_native_error() {
+        let _armed = crate::array::fail_native_call_at("probe_sync", OOM);
+        let error = crate::array::memory::synchronize_and_clear_cache_checked("probe_sync")
+            .expect_err("the synchronize fails");
+        assert_eq!(
+            error.reason,
+            format!("MLX synchronize failed in probe_sync: {OOM}")
+        );
+        assert!(is_gpu_out_of_memory(&error.reason), "{}", error.reason);
+        assert!(crate::array::memory::synchronize_and_clear_cache_checked("probe_sync").is_ok());
     }
 }
