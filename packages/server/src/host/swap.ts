@@ -4,7 +4,7 @@
  * The host discovers every local model up-front but loads at most one into
  * the `ModelRegistry` at a time. Switching models (e.g. via Claude Code's
  * `/model` picker, or the desktop app's model menu) unregisters the previous
- * instance, letting GC + native destructors reclaim memory, before loading
+ * instance, disposing it and waiting for native resource release before loading
  * the new one.
  */
 
@@ -107,12 +107,15 @@ export function makeSwapController(
       if (oldResident && oldResident.name !== targetEntry.name) {
         // Drop our local alias bookkeeping AND the old resident's primary
         // name binding, but leave the alias *names* in the registry pointed
-        // at the old model — they hold the only refcount preventing GC,
+        // at the old model — they hold the only refcount preventing disposal,
         // and an in-flight `registry.getAny(alias)` must keep resolving to
         // *some* live instance until the new model is in hand.
         aliases.clear();
-        registry.unregister(oldResident.name);
+        registry.unregister(oldResident.name, { dispose: true });
         resident = null;
+        // With no aliases this joins the old model thread before the new load.
+        // Aliased or leased bindings finish through the same tracked disposal path.
+        await registry.settleModelDisposals();
       }
 
       // Ensure the target is resident. If the load throws, restore the
@@ -196,6 +199,9 @@ export function makeSwapController(
         });
         aliases.add(name);
       }
+
+      // Re-pointing the last old alias can start its disposal only now.
+      await registry.settleModelDisposals();
     });
     currentOp = next.catch(() => undefined);
     await next;

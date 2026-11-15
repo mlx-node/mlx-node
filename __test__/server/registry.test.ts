@@ -160,6 +160,22 @@ describe('ModelRegistry', () => {
     expect(dispose).not.toHaveBeenCalled();
   });
 
+  it('cancels a requested disposal when swap recovery revives an aliased binding', async () => {
+    const registry = new ModelRegistry();
+    const dispose = vi.fn(async () => undefined);
+    const model = Object.assign(createMockSessionModel(), { dispose });
+    registry.register('model-a', model);
+    registry.register('alias', model);
+
+    registry.unregister('model-a', { dispose: true });
+    registry.register('model-a', model);
+    registry.unregister('alias');
+    registry.unregister('model-a');
+    await registry.settleModelDisposals();
+
+    expect(dispose).not.toHaveBeenCalled();
+  });
+
   it('returns false when unregistering a non-existent model', () => {
     const registry = new ModelRegistry();
     expect(registry.unregister('nonexistent')).toBe(false);
