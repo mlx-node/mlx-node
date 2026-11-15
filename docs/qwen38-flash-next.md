@@ -316,15 +316,19 @@ largest, one pass's transient, the rows and the MTP state (about 12 states
 without the head on a busy 128 GB host, from plan numbers); a row's admission
 takes stored states back first, checkpoints before replay points, never one a
 running turn uses. `resetCaches` and a GPU reset drop them and purge the
-prefix cache. With the paged cache's disk switch on (every host by default:
-`mlx serve`, `mlx agent` and the desktop engine; GGUF loads only) a turn's
-replay state, its KV blocks and its draft segments also go to the model's own
-SSD tier behind the turn (a locked directory under
-`~/.mlx-node/cache/prefix-cache`, `--max-cache-disk` / `--cache-dir`; a second
-process on the same checkpoint keeps its states in memory), and a restarted
-engine restores the deepest state of a prompt whose chain is whole (see
-paged-cache.md, "qwen4_exp (Flash Next) on disk"); otherwise a restart starts
-cold. A clean stop calls the model's `closeCache`.
+prefix cache. A turn of 2,048 prompt tokens or more also writes its replay
+state, its KV blocks and its draft segments to the model's own SSD tier
+behind the turn (`--max-cache-disk` / `--cache-dir`): the blocks from the
+state's publication on, the state 10 s after it as one fixed-size state
+record through the tier's one staging buffer, the turn running or not. With the paged cache's
+disk switch on (every host by default: `mlx serve`, `mlx agent` and the
+desktop engine) a GGUF load keeps that tier persistent, a locked directory
+under `~/.mlx-node/cache/prefix-cache`, and a restarted engine restores the
+deepest state of a prompt whose chain is whole (see paged-cache.md,
+"qwen4_exp (Flash Next) on disk"). The switch off, a non-GGUF load or a
+second process on the same checkpoint keep a temporary cache that takes
+copies only while memory drops states and goes at the stop; a restart then
+starts cold. A clean stop calls the model's `closeCache`.
 
 Native MTP is **opt-in** (`enableMtp: true`); it drafts two tokens per cycle
 unless `mtpDepth` says otherwise, capped at three. It runs

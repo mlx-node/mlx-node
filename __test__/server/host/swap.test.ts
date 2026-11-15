@@ -432,4 +432,33 @@ describe('makeSwapController', () => {
     expect(loader.mock.calls.map(([path]) => path)).toEqual(['/fake/b', '/fake/b']);
     expect(reg.list().map((e) => e.id)).toEqual(['b', 'mlx-local']);
   });
+
+  it("closes a dropped model's SSD cache before the same model loads again", async () => {
+    const reg = fakeRegistry();
+    const events: string[] = [];
+    const deadlines: number[] = [];
+    const loader = vi.fn(async (path: string) => {
+      events.push(`load ${path}`);
+      return {
+        closeCache: async (deadlineMs: number) => {
+          deadlines.push(deadlineMs - Date.now());
+          events.push(`close ${path}`);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          events.push(`closed ${path}`);
+          return true;
+        },
+      } as unknown as LoadableModel;
+    });
+    const ctrl = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, loader, 'a');
+    await ctrl.resolveModel('a');
+    await ctrl.resolveModel('b');
+    await ctrl.resolveModel('a');
+    expect(events).toEqual(['load /fake/a', 'load /fake/b', 'close /fake/a', 'closed /fake/a', 'load /fake/a']);
+
+    events.length = 0;
+    await ctrl.disposeAll!();
+    await ctrl.resolveModel('a');
+    expect(events).toEqual(['close /fake/a', 'closed /fake/a', 'load /fake/a']);
+    for (const left of deadlines) expect(left).toBeGreaterThan(5000);
+  });
 });

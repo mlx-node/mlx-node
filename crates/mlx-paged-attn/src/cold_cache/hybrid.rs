@@ -1,8 +1,7 @@
 //! Index operations a family with its own state objects needs beside the
-//! block and sidecar paths: a byte budget over some groups (oldest first),
-//! removal of one object, recency for a chain it still needs, a sidecar read
-//! whose layout the caller checks, and a write that waits for a queue slot
-//! and gives the object back when none freed.
+//! block and sidecar paths: removal of one object, recency for a chain it
+//! still needs, a sidecar read whose layout the caller checks, and a write
+//! that waits for a queue slot and gives the object back when none freed.
 
 use super::*;
 
@@ -30,29 +29,6 @@ impl ColdObject {
 }
 
 impl ColdCacheManager {
-    /// Bytes the index holds in `groups`.
-    pub fn group_bytes(&self, groups: &[ColdGroup]) -> u64 {
-        self.shared.index.lock().map_or(0, |index| {
-            index
-                .entries
-                .values()
-                .filter(|entry| groups.contains(&entry.group))
-                .map(|entry| entry.size)
-                .sum()
-        })
-    }
-
-    /// The least recently used object of `groups`.
-    pub fn oldest_in(&self, groups: &[ColdGroup]) -> Option<(ColdCacheKey, ColdGroup)> {
-        let index = self.shared.index.lock().ok()?;
-        index
-            .entries
-            .iter()
-            .filter(|(_, entry)| groups.contains(&entry.group))
-            .min_by_key(|(_, entry)| entry.last_access)
-            .map(|(key, entry)| (*key, entry.group))
-    }
-
     /// Removes the object `key` of `group`: true once its name is clear and
     /// the index no longer holds it.
     pub fn remove_object(&self, key: ColdCacheKey, group: ColdGroup) -> bool {
@@ -187,7 +163,7 @@ mod tests {
     fn an_offer_keeps_the_block_lane_count() {
         let dir = root("offer");
         let manager = ColdCacheManager::open_at(dir.clone(), 1 << 30, 0, 4).unwrap();
-        let object = sidecar(ColdGroup::HybridCell, 9, 64);
+        let object = sidecar(ColdGroup::HybridDraft, 9, 64);
         let key = object.key;
         let deadline = Instant::now() + Duration::from_secs(10);
         assert!(matches!(
@@ -196,60 +172,53 @@ mod tests {
         ));
         assert!(manager.drain(Duration::from_secs(10)));
         assert!(manager.has_block_room());
-        assert!(manager.contains_in(&key, ColdGroup::HybridCell));
+        assert!(manager.contains_in(&key, ColdGroup::HybridDraft));
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The budget's view of the index: bytes per group set, the oldest
-    /// object first, a touch makes an object the newest, a removal frees its
-    /// file and its bytes, a read of another group or a smaller bound is a
-    /// miss. Mutation: `touch` leaves the recency alone → red (the touched
-    /// object is still the oldest).
+    /// A family object under the store's one quota: a touch makes it the
+    /// newest, so a write that needs room takes an object used before it; a
+    /// read of another group or a smaller bound is a miss that removes it,
+    /// and a removal frees its file and its bytes.
+    /// Mutation: `touch` leaves the recency alone → red (the touched object
+    /// is the one evicted).
     #[test]
-    fn a_state_budget_sees_its_groups_oldest_first() {
-        let dir = root("budget");
-        let manager = ColdCacheManager::open_at(dir.clone(), 1 << 30, 0, 4).unwrap();
-        let groups = [ColdGroup::HybridCell, ColdGroup::HybridDraft];
-        let first = state(&manager, ColdGroup::HybridCell, 1, 100);
-        let second = state(&manager, ColdGroup::HybridDraft, 2, 200);
-        let other = state(&manager, ColdGroup::ConvState, 3, 300);
-        let total = manager.group_bytes(&groups);
-        let conv = manager.group_bytes(&[ColdGroup::ConvState]);
-        assert!(total > 300 && conv > 300, "{total} {conv}");
-        assert_eq!(
-            manager.group_bytes(&[
-                ColdGroup::HybridCell,
-                ColdGroup::HybridDraft,
-                ColdGroup::ConvState
-            ]),
-            total + conv
-        );
-        assert_eq!(
-            manager.oldest_in(&groups),
-            Some((first, ColdGroup::HybridCell))
-        );
+    fn a_family_object_is_touched_read_and_removed() {
+        let probe = root("probe");
+        let one = {
+            let manager = ColdCacheManager::open_at(probe.clone(), 1 << 30, 0, 4).unwrap();
+            state(&manager, ColdGroup::HybridDraft, 9, 100);
+            manager.total_bytes()
+        };
+        let _ = fs::remove_dir_all(probe);
+        let dir = root("touch");
+        let manager = ColdCacheManager::open_at(dir.clone(), one * 5 / 2, 0, 4).unwrap();
+        let first = state(&manager, ColdGroup::HybridDraft, 1, 100);
+        let second = state(&manager, ColdGroup::HybridDraft, 2, 100);
         manager.touch(&[first]);
-        assert_eq!(
-            manager.oldest_in(&groups),
-            Some((second, ColdGroup::HybridDraft))
-        );
+        let third = state(&manager, ColdGroup::HybridDraft, 3, 100);
+        assert!(manager.contains_in(&first, ColdGroup::HybridDraft));
+        assert!(!manager.contains_in(&second, ColdGroup::HybridDraft));
+        assert!(manager.contains_in(&third, ColdGroup::HybridDraft));
         let fingerprint = ColdCacheFingerprint::from_components([b"hybrid".as_slice()]);
         assert!(
             manager
-                .load_object(first, fingerprint, ColdGroup::HybridCell, 1 << 20)
+                .load_object(first, fingerprint, ColdGroup::HybridDraft, 1 << 20)
                 .is_some()
         );
         assert!(
             manager
-                .load_object(first, fingerprint, ColdGroup::HybridCell, 50)
+                .load_object(first, fingerprint, ColdGroup::HybridDraft, 50)
                 .is_none(),
             "a read past the bound is a miss"
         );
-        assert!(!manager.contains_in(&first, ColdGroup::HybridCell));
-        assert!(!manager.remove_object(other, ColdGroup::HybridCell));
-        assert!(manager.remove_object(second, ColdGroup::HybridDraft));
-        assert!(!manager.contains_in(&second, ColdGroup::HybridDraft));
-        assert_eq!(manager.group_bytes(&groups), 0);
+        assert!(!manager.contains_in(&first, ColdGroup::HybridDraft));
+        let other = state(&manager, ColdGroup::ConvState, 4, 100);
+        assert!(!manager.remove_object(other, ColdGroup::HybridDraft));
+        let before = manager.total_bytes();
+        assert!(manager.remove_object(third, ColdGroup::HybridDraft));
+        assert!(!manager.contains_in(&third, ColdGroup::HybridDraft));
+        assert!(manager.total_bytes() < before);
         assert!(manager.contains_in(&other, ColdGroup::ConvState));
         let _ = fs::remove_dir_all(dir);
     }

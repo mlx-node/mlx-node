@@ -4164,6 +4164,34 @@ mod paged_dflash2_tests {
         Ok(())
     }
 
+    /// The napi object's handle names the namespace directory the model's
+    /// persistent state tier opened, read from the tier; after `closeCache`,
+    /// and for a temporary tier, it names none.
+    /// Mutation: the tier names its namespace after its close → red.
+    #[test]
+    fn the_tier_handle_names_the_open_namespace() -> Result<()> {
+        use crate::models::qwen3_5::dflash2_state::disk::close_cache;
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{persistent_test_tier, test_tier};
+        let _ctx = StreamContext::new(Stream::generation());
+        let tier = persistent_test_tier("state-tier-namespace", 1 << 30);
+        let mut inner = disk_fixture(0x5_8251, &tier, false)?;
+        let handle = inner.dflash2_states.tier_handle();
+        let dir = tier.tier.dir();
+        assert_eq!(
+            handle.namespace().as_deref(),
+            dir.file_name().and_then(|name| name.to_str())
+        );
+        assert!(close_cache(
+            &mut inner,
+            std::time::Instant::now() + std::time::Duration::from_secs(2)
+        ));
+        assert_eq!(handle.namespace(), None);
+        let temporary = test_tier("state-tier-namespace-temp", 1 << 30);
+        let inner = disk_fixture(0x5_8252, &temporary, false)?;
+        assert_eq!(inner.dflash2_states.tier_handle().namespace(), None);
+        Ok(())
+    }
+
     /// The model's `closeCache` command at a clean stop, its deadline in
     /// milliseconds on `Date.now()`'s clock: a persistent tier writes the
     /// waiting point with its chain before that deadline and reports it.

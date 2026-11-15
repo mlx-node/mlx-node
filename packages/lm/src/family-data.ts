@@ -281,7 +281,7 @@ interface ModelFamilyDataBase {
    * (`--max-cache-disk`, `--cache-dir`): its stored states (DFlash2 states,
    * Flash Next prefix states) get the model's own SSD tier (Splash
    * `openDiskTier`), persistent under the paged KV disk cache switch
-   * (`MLX_PERSIST_PAGED_CACHE`).
+   * (`MLX_PERSIST_PAGED_CACHE`), else temporary.
    */
   readonly acceptsCacheDisk?: true;
   /**

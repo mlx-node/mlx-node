@@ -756,9 +756,9 @@ mlx options (handled before the agent binary sees the args):
                             MLX_PERSIST_PAGED_CACHE=0 also turns it off when this
                             flag is absent. One switch for ALL restore-eligible
                             families (${coldTierRestoreFamilyList().join(', ')})
-                            and the Qwen3.5 dense and MoE state tier, whose files
-                            are then temporary, and the Flash Next state tier,
-                            then off; every other family never persists, flag
+                            and the Qwen3.5 dense and MoE state tier and the
+                            Flash Next state tier, whose files are then
+                            temporary; every other family never persists, flag
                             or not. A turn of those
                             restore-eligible families writes the whole prompt
                             (up to ${WHOLE_PROMPT_CAPTURE_BLOCKS} blocks within

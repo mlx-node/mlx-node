@@ -229,6 +229,11 @@ impl IdleLane {
 }
 
 impl DFlash2States {
+    /// The napi object's handle on the state tier.
+    pub(crate) fn tier_handle(&self) -> crate::disk_tier::TierHandle {
+        crate::disk_tier::TierHandle::of(self.disk.as_ref().map(|disk| &disk.tier))
+    }
+
     pub(crate) fn new(block_size: u32, recency: Arc<CacheRecency>) -> Self {
         let mut store = HybridStateStore::new(block_size);
         store.share_recency(recency);

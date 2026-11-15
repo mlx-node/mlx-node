@@ -115,14 +115,12 @@ pub enum ColdGroup {
     /// Sliding-window (`RotatingKVCache`) state at a block boundary (gemma4),
     /// likewise outside the paged pool.
     SlidingWindow,
-    /// One DFlash2 state object (Splash `QwenCompositeState` slot): byte spans
-    /// in Splash `stateSpans` order, the GDN cell then the draft context
-    /// window. Not a sidecar: it carries its own label and is read straight
-    /// into the caller's buffer.
+    /// One stored state object (Splash `QwenCompositeState` slot): DFlash2
+    /// states, byte spans in Splash `stateSpans` order (the GDN cell then the
+    /// draft context window), and Flash Next (qwen4_exp) prefix states, one
+    /// fixed span. Not a sidecar: it carries its own label and is read
+    /// straight into the caller's buffer.
     DFlash2State,
-    /// A Flash Next (qwen4_exp) prefix state at a block row: GDN conv and
-    /// recurrent state, PLE history and the draft rows waiting there.
-    HybridCell,
     /// One Flash Next draft pass's K/V and pooled indexer keys, shared by
     /// the states of one lineage.
     HybridDraft,
@@ -131,11 +129,10 @@ pub enum ColdGroup {
 impl ColdGroup {
     /// Every non-KV group, in a stable order. Used by name parsing and by the
     /// dashboard-facing filename contract.
-    pub const SIDECAR_GROUPS: [Self; 5] = [
+    pub const SIDECAR_GROUPS: [Self; 4] = [
         Self::ConvState,
         Self::SlidingWindow,
         Self::DFlash2State,
-        Self::HybridCell,
         Self::HybridDraft,
     ];
 
@@ -152,7 +149,6 @@ impl ColdGroup {
             Self::ConvState => b"mlx-node:cold-sidecar-conv-state:v1\0",
             Self::SlidingWindow => b"mlx-node:cold-sidecar-sliding-window:v1\0",
             Self::DFlash2State => b"mlx-node:cold-state-dflash2:v1\0",
-            Self::HybridCell => b"mlx-node:cold-sidecar-hybrid-cell:v1\0",
             Self::HybridDraft => b"mlx-node:cold-sidecar-hybrid-draft:v1\0",
         }
     }
@@ -166,7 +162,6 @@ impl ColdGroup {
             Self::ConvState => "conv_state",
             Self::SlidingWindow => "sliding_window",
             Self::DFlash2State => "dflash2_state",
-            Self::HybridCell => "hybrid_cell",
             Self::HybridDraft => "hybrid_draft",
         }
     }
@@ -177,7 +172,6 @@ impl ColdGroup {
             "conv_state" => Some(Self::ConvState),
             "sliding_window" => Some(Self::SlidingWindow),
             "dflash2_state" => Some(Self::DFlash2State),
-            "hybrid_cell" => Some(Self::HybridCell),
             "hybrid_draft" => Some(Self::HybridDraft),
             _ => None,
         }
@@ -2971,7 +2965,10 @@ fn persist_with(
         // therefore leaves in-process accounting consistent with the
         // renamed canonical file — the cleanup `unlink(&temp)` stays a
         // harmless NotFound no-op and `rebuild_index` still heals on
-        // restart — rather than orphaning the block outside the quota.
+        // restart — rather than orphaning the block outside the quota. It
+        // runs after the lock: a model thread reading the index never waits
+        // for it.
+        drop(index);
         shared.sync()?;
         Ok(())
     })() {
@@ -4605,7 +4602,7 @@ mod restore_decomposition_bench {
         }
 
         // ---- phase F: CONTENDED load. The reader's `openat` sits inside the same
-        //      index mutex the writer holds across `renameat` + directory fsync
+        //      index mutex the writer holds across `renameat` + the index publish
         //      (cold_cache.rs:1727-1758), and nothing drains the write queue before
         //      a restore. Reproduce that overlap: keep the writer committing while
         //      the same objects are loaded.
@@ -5036,8 +5033,9 @@ mod write_decomposition_bench {
     /// Instrumented clone of [`persist_block`] + [`persist_encoded`]
     /// (cold_cache.rs:1695-1776). Phase boundaries and lock scopes match the
     /// production body exactly — in particular the index guard spans
-    /// `renameat`, the index publish AND the directory fsync — with only the
-    /// payload-durability call parameterised. Production is untouched.
+    /// `renameat` and the index publish, and the directory fsync runs after
+    /// it — with only the payload-durability call parameterised. Production
+    /// is untouched.
     fn persist_instrumented(
         shared: &Shared,
         block: &ColdCacheBlock,
@@ -5103,6 +5101,7 @@ mod write_decomposition_bench {
                 index.total_bytes = index.total_bytes.saturating_sub(old.size);
             }
             index.total_bytes = index.total_bytes.saturating_add(size);
+            drop(index);
             phases.commit = ms(t.elapsed());
 
             let t = Instant::now();
@@ -6723,6 +6722,38 @@ mod tests {
         release.store(true, Ordering::Relaxed);
         drop(manager);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A reader of the index never waits for the writer's directory fsync:
+    /// with the writer parked inside it, the object it just renamed in is
+    /// indexed and `contains` answers at once.
+    /// Mutation: the index lock spans the directory fsync → red.
+    #[test]
+    fn the_index_is_free_during_the_directory_fsync() {
+        let root = temp_root("fsync-unlocked");
+        let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
+        let release = slow_writer(&manager, 10_000);
+        let toks = vec![u32::MAX, u32::MAX - 1, u32::MAX - 2, u32::MAX - 3];
+        let wedge = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &toks, &[], 0, 0);
+        let (answered_tx, answered) = std::sync::mpsc::channel();
+        let reader = {
+            let manager = Arc::new(manager);
+            let reader_manager = Arc::clone(&manager);
+            let handle = std::thread::spawn(move || {
+                let _ = answered_tx.send(reader_manager.contains(&wedge));
+            });
+            (manager, handle)
+        };
+        let seen = answered.recv_timeout(Duration::from_secs(2));
+        release.store(true, Ordering::Relaxed);
+        reader.1.join().unwrap();
+        drop(reader.0);
+        let _ = fs::remove_dir_all(root);
+        assert_eq!(
+            seen,
+            Ok(true),
+            "a reader of the index waited for the directory fsync"
+        );
     }
 
     /// Park the writer inside its post-rename directory fsync for `commit_ms`

@@ -12,6 +12,7 @@ import type { LoadableModel, SessionCapableModel, DecisionModel } from '@mlx-nod
 
 import type { PublicModelEntry } from '../handler.js';
 import type { ModelRegistry } from '../registry.js';
+import { FLUSH_MS } from '../supervision.js';
 import type { ModelIdentity } from '../turn-trace.js';
 import type { DiscoveredModel } from './discover.js';
 
@@ -29,6 +30,15 @@ export interface SwapController {
 
 function identityOf(entry: DiscoveredModel): ModelIdentity {
   return { modelId: entry.name, modelType: String(entry.modelType), contextWindow: entry.contextWindow };
+}
+
+/** A model whose SSD state cache holds its directory's lock until it closes. */
+interface CacheClosingModel {
+  closeCache(deadlineMs: number): Promise<boolean>;
+}
+
+function hasCacheToClose(model: unknown): model is CacheClosingModel {
+  return typeof (model as Partial<CacheClosingModel> | undefined)?.closeCache === 'function';
 }
 
 /**
@@ -73,7 +83,40 @@ export function makeSwapController(
   // alive past the user's swap.
   const aliases = new Set<string>();
   let currentOp: Promise<unknown> = Promise.resolve();
+  // A dropped model frees its SSD cache only when V8 collects it, and a lease
+  // or a persist can keep it for long. A new load of the same model opens
+  // the same cache directory and would wait 20 s for its lock, then keep a
+  // temporary cache for life: the old one's cache is closed first.
+  const dropped = new Map<string, WeakRef<CacheClosingModel>>();
+  const drop = (name: string, opts?: { dispose?: boolean }): void => {
+    const model = registry.getAny(name);
+    if (hasCacheToClose(model)) dropped.set(name, new WeakRef(model));
+    if (opts) registry.unregister(name, opts);
+    else registry.unregister(name);
+  };
+  const closeWithin = async (model: CacheClosingModel): Promise<void> => {
+    const deadline = Date.now() + FLUSH_MS;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        model.closeCache(deadline),
+        new Promise<void>((resolveTimer) => {
+          timer = setTimeout(resolveTimer, FLUSH_MS);
+          timer.unref?.();
+        }),
+      ]);
+    } catch {
+      /* the new load opens a temporary cache if the old one still holds the directory */
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 
+  const closeDropped = (name: string): Promise<void> | undefined => {
+    const model = dropped.get(name)?.deref();
+    dropped.delete(name);
+    return model ? closeWithin(model) : undefined;
+  };
   async function resolveModel(name: string): Promise<void> {
     // Fast path: already registered under this name (either as a real
     // resident or as an alias we previously installed). Avoid chaining.
@@ -116,7 +159,7 @@ export function makeSwapController(
         // and an in-flight `registry.getAny(alias)` must keep resolving to
         // *some* live instance until the new model is in hand.
         aliases.clear();
-        registry.unregister(oldResident.name);
+        drop(oldResident.name);
         resident = null;
       }
 
@@ -129,6 +172,8 @@ export function makeSwapController(
       // pinned to a stale model.
       let instance = registry.getAny(targetEntry.name);
       if (!instance) {
+        const closing = closeDropped(targetEntry.name);
+        if (closing) await closing;
         let loaded: LoadableModel;
         try {
           loaded = await loadModelFn(targetEntry.path);
@@ -234,7 +279,7 @@ export function makeSwapController(
   async function unloadAll(dispose: boolean): Promise<void> {
     await currentOp;
     const sessions = registry.listSessionRegistries();
-    for (const entry of registry.list()) if (registry.getAny(entry.id)) registry.unregister(entry.id, { dispose });
+    for (const entry of registry.list()) if (registry.getAny(entry.id)) drop(entry.id, { dispose });
     resident = null;
     aliases.clear();
     await Promise.all(sessions.map((session) => session.flushPendingDisposals()));

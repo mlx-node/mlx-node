@@ -60,6 +60,12 @@ pub fn create_fixture(config: &super::config::Config) -> Result<PagedKVCacheAdap
 
 /// The Flash Next page (Splash `QwenHybridLayout::kvLayout`, `SelectedBlocks`):
 /// token-major K and V, and the indexer's pooled block keys in the page.
+/// The stored states memory dropped so far, its room or the pool's blocks
+/// taking them: what asks a temporary disk tier for copies.
+fn memory_drops(counters: &prefix_state::Counters) -> u64 {
+    counters.dropped_memory + counters.dropped_kv
+}
+
 fn page_layout(config: &super::config::Config) -> mlx_paged_attn::PageLayout {
     mlx_paged_attn::PageLayout {
         values_token_major: true,
@@ -275,7 +281,7 @@ impl PagedBackend for Inner {
                     Error::from_reason("Qwen4 prefix preparation has no paged cache")
                 })?;
             self.prefix_states.prune(adapter, grid);
-            self.prefix_states.lookup(tokens, &keys, salt)
+            self.prefix_states.lookup_ram(tokens, &keys, salt)
         } else {
             None
         };
@@ -287,7 +293,7 @@ impl PagedBackend for Inner {
             .is_some_and(super::prefix_disk::Disk::take_skip);
         let mut from_disk = None;
         let hit = if publish && !skip_disk && self.disk.is_some() {
-            match self.restore_from_disk(tokens, &ends, &keys, salt, hit) {
+            match self.resume_from_disk(tokens, &keys, salt, hit) {
                 Some((deeper, id)) => {
                     from_disk = Some(id);
                     Some(deeper)
@@ -320,8 +326,8 @@ impl PagedBackend for Inner {
         let mut resumed = None;
         let mut cached = 0;
         if plan.cached_prefix_len as usize != expected {
-            if let Some(id) = from_disk {
-                self.prefix_states.store.remove(id);
+            if let (Some(id), Some(disk)) = (from_disk, self.disk.as_mut()) {
+                disk.discard(&mut self.prefix_states.store, id);
             }
             adapter
                 .reset_for_new_request(seq)
@@ -607,73 +613,56 @@ impl Inner {
         }
     }
 
-    /// Ends `seq`'s turn: its replay state is parked for the disk, then the
-    /// states it used become the newest of their class.
+    /// Ends `seq`'s turn: the states it used become the newest of their
+    /// class, then the disk takes what is due.
     pub(super) fn close_prefix_turn(&mut self, seq: SeqId) {
-        if let (Some(disk), Some(adapter)) = (self.disk.as_mut(), self.decoder.paged.as_mut()) {
-            let replay = self
-                .prefix_states
-                .turns
-                .get(&seq)
-                .and_then(|turn| turn.replay);
-            if let Some((id, row)) = replay
-                && let Some(cell) = self
-                    .prefix_states
-                    .store
-                    .get(id)
-                    .and_then(|entry| entry.ram())
-            {
-                disk.park(seq, cell, row, adapter);
-            }
+        if let Some(disk) = self.disk.as_mut() {
+            disk.drops(memory_drops(&self.prefix_states.counters));
             disk.close(seq);
-            disk.top_up_all(adapter);
         }
         self.prefix_states.end_turn(seq);
+        if let (Some(disk), Some(adapter)) = (self.disk.as_mut(), self.decoder.paged.as_mut()) {
+            disk.step_now(&mut self.prefix_states.store, adapter);
+        }
         self.telemetry.sync(&self.prefix_states);
     }
 
-    /// After a decode step: copies out what the running turns owe the
-    /// disk, within its queue, at most every few steps.
-    pub(super) fn top_up_disk(&mut self) {
+    /// After a decode step and on every drive pass: the disk's landings,
+    /// and at most every few steps its due states and block copies.
+    pub(super) fn top_up_disk(&mut self) -> bool {
+        let (Some(disk), Some(adapter)) = (self.disk.as_mut(), self.decoder.paged.as_mut()) else {
+            return false;
+        };
+        disk.drops(memory_drops(&self.prefix_states.counters));
+        disk.step(&mut self.prefix_states.store, adapter)
+    }
+
+    /// The disk's pass now, without its interval.
+    #[cfg(test)]
+    pub(super) fn step_disk_now(&mut self) {
         if let (Some(disk), Some(adapter)) = (self.disk.as_mut(), self.decoder.paged.as_mut()) {
-            disk.top_up_step(adapter);
+            disk.step_now(&mut self.prefix_states.store, adapter);
         }
     }
 
-    /// Splash's restart restore: the deepest state of `tokens` on disk past
-    /// the memory `hit`, whose chain is whole, read back into the memory
-    /// store under the room and live checks of a publication, with the pool
-    /// grown for the blocks the adapter then restores. The state's id and
-    /// its hit; `None` keeps `hit`.
-    fn restore_from_disk(
-        &mut self,
-        tokens: &[u32],
-        ends: &[usize],
-        keys: &[Vec<u64>],
-        salt: u64,
-        hit: Option<StoreHit>,
-    ) -> Option<(StoreHit, EntryId)> {
-        use crate::models::qwen3_5::dflash2_state::store::{Lineage, StateClass, lineage_bytes};
+    /// Writes the waiting states newest first and drains the copies, until
+    /// `deadline`.
+    #[cfg(test)]
+    pub(super) fn flush_disk(&mut self, deadline: std::time::Instant) {
+        if let (Some(disk), Some(adapter)) = (self.disk.as_mut(), self.decoder.paged.as_mut()) {
+            disk.flush_points(&mut self.prefix_states.store, adapter, deadline);
+        }
+    }
+
+    /// Whether a state of `row` rows fits beside the stored ones: the states
+    /// memory gives up for it and its bytes, or `None` after counting the
+    /// refusal.
+    fn room_for_state(&mut self, row: usize) -> Option<(Vec<EntryId>, u64)> {
+        use crate::models::qwen3_5::dflash2_state::store::lineage_bytes;
         let grid = self.decoder.prefill_slice_size();
-        let floor = hit.map_or(0, |hit| hit.depth);
-        let candidate = {
-            let disk = self.disk.as_ref()?;
-            let adapter = self.decoder.paged.as_ref()?;
-            disk.candidate(
-                tokens,
-                ends,
-                keys,
-                salt,
-                floor,
-                adapter,
-                self.has_mtp.then_some(grid),
-            )?
-        };
-        let row = candidate.row;
-        let blocks = row / prefix_state::BLOCK_ROWS;
         let need =
             super::memory::state_bytes(&self.decoder.config, row as u64, grid as u64, self.has_mtp)
-                .saturating_add(lineage_bytes(row, blocks));
+                .saturating_add(lineage_bytes(row, row / prefix_state::BLOCK_ROWS));
         let Some((victims, freed)) = self.prefix_states.room_for(self.state_room(), need) else {
             self.prefix_states.counters.refused_room += 1;
             return None;
@@ -693,45 +682,105 @@ impl Inner {
             self.prefix_states.counters.refused_live += 1;
             return None;
         }
-        let cell = self.disk.as_ref()?.load(
-            &candidate,
-            self.decoder.caches.len(),
-            grid,
-            self.has_mtp,
-            need.saturating_mul(2).saturating_add(1 << 20),
-        )?;
-        for id in victims {
-            if self.prefix_states.store.remove(id) {
-                self.prefix_states.counters.dropped_memory += 1;
-            }
-        }
-        let inserted = self
+        Some((victims, need))
+    }
+
+    /// Splash's restore from disk: the deepest state of `tokens` on disk
+    /// only past the memory `hit`, whose chain is whole, read back under the
+    /// room and live checks of a publication and given its RAM copy back,
+    /// with the pool grown for the blocks the adapter then restores. A state
+    /// whose chain is not whole or that does not read back goes with its
+    /// object and the next is tried, two at most. The state's id and its
+    /// hit; `None` keeps `hit`.
+    fn resume_from_disk(
+        &mut self,
+        tokens: &[u32],
+        keys: &[Vec<u64>],
+        salt: u64,
+        hit: Option<StoreHit>,
+    ) -> Option<(StoreHit, EntryId)> {
+        let grid = self.decoder.prefill_slice_size();
+        let floor = hit.map_or(0, |hit| hit.depth);
+        let found = self
             .prefix_states
-            .store
-            .insert(
-                Lineage {
-                    tokens: &tokens[..row],
-                    extra_keys: &keys[..blocks],
+            .disk_only_above(tokens, keys, salt, floor);
+        for found in found.into_iter().take(2) {
+            let id = found.id;
+            let row = found.depth;
+            let (key, extra_keys) = {
+                let entry = self.prefix_states.store.get(id)?;
+                (entry.disk()?.key, entry.extra_keys().to_vec())
+            };
+            let segments = {
+                let disk = self.disk.as_ref()?;
+                let adapter = self.decoder.paged.as_ref()?;
+                disk.chain_whole(
+                    tokens,
+                    keys,
                     salt,
-                },
-                cell,
-                StateClass::Ordinary,
-            )
-            .ok()?;
-        let hit = self
-            .prefix_states
-            .lookup(tokens, keys, salt)
-            .filter(|hit| hit.id == inserted.id && hit.depth == row);
-        let Some(hit) = hit else {
-            self.prefix_states.store.remove(inserted.id);
-            return None;
-        };
+                    row,
+                    adapter,
+                    self.has_mtp.then_some(grid),
+                )
+            };
+            let Some(segments) = segments else {
+                self.disk
+                    .as_mut()?
+                    .discard(&mut self.prefix_states.store, id);
+                continue;
+            };
+            let (victims, need) = self.room_for_state(row)?;
+            let read = self.disk.as_mut()?.read_state(
+                &mut self.prefix_states.store,
+                key,
+                row,
+                &extra_keys,
+                &segments,
+                (self.decoder.caches.len(), grid, self.has_mtp),
+                need.saturating_mul(2).saturating_add(1 << 20),
+            );
+            let cell = match read {
+                super::prefix_disk::Read::Cell(cell) => cell,
+                super::prefix_disk::Read::Busy => return None,
+                super::prefix_disk::Read::Failed => {
+                    self.prefix_states.store.remove(id);
+                    continue;
+                }
+            };
+            for victim in victims {
+                self.prefix_states.release(victim);
+            }
+            if !self.prefix_states.store.promote(id, cell) {
+                return None;
+            }
+            self.grow_for_restore(tokens, keys, salt, row)?;
+            tracing::debug!(
+                target: "mlx_core::qwen4_exp::prefix",
+                row,
+                prompt = tokens.len(),
+                "read a stored state back from disk"
+            );
+            return Some((StoreHit { id, depth: row }, id));
+        }
+        None
+    }
+
+    /// The pool grows for the blocks of `tokens`' first `row` rows the
+    /// prefix cache does not hold, which the adapter's cold walk restores.
+    fn grow_for_restore(
+        &mut self,
+        tokens: &[u32],
+        keys: &[Vec<u64>],
+        salt: u64,
+        row: usize,
+    ) -> Option<()> {
+        let blocks = row / prefix_state::BLOCK_ROWS;
         let adapter = self.decoder.paged.as_mut()?;
         let hot = crate::models::qwen3_5::gdn_checkpoint_store::compute_paged_prefix_block_hashes(
             tokens,
             row as u32,
             prefix_state::BLOCK_ROWS as u32,
-            &keys[..blocks],
+            keys.get(..blocks)?,
             salt,
         )
         .unwrap_or_default();
@@ -740,13 +789,7 @@ impl Inner {
             .take_while(|&&hash| adapter.prefix_cached(hash))
             .count();
         adapter.grow_for(u32::try_from(blocks - cached.min(blocks)).unwrap_or(u32::MAX));
-        tracing::debug!(
-            target: "mlx_core::qwen4_exp::prefix",
-            row,
-            prompt = tokens.len(),
-            "read a stored state back from disk"
-        );
-        Some((hit, inserted.id))
+        Some(())
     }
 
     /// What stored states may hold now (see [`super::memory::state_room`]).
@@ -873,9 +916,7 @@ impl Inner {
             return;
         }
         for id in victims {
-            if states.store.remove(id) {
-                states.counters.dropped_memory += 1;
-            }
+            prefix_state::release(&mut states.store, &mut states.counters, id);
         }
         let cell = match self.decoder.cell(grid) {
             Ok(Some(cell)) => prefix_state::Cell { draft, ..cell },
@@ -889,42 +930,56 @@ impl Inner {
         } else {
             StateClass::Ordinary
         };
-        let inserted = match states.store.insert(
-            Lineage {
-                tokens: &turn.lineage[..row],
-                extra_keys: &turn.keys[..blocks],
-                salt: turn.salt,
-            },
-            cell,
-            class,
-        ) {
-            Ok(inserted) => inserted,
-            Err(_) => {
-                states.counters.refused_register += 1;
-                return;
+        let lineage = Lineage {
+            tokens: &turn.lineage[..row],
+            extra_keys: &turn.keys[..blocks],
+            salt: turn.salt,
+        };
+        // A state on disk only at this block takes its RAM copy back and is
+        // not written again.
+        let (_, on_block) = states.store.locate(lineage);
+        let disk_only = on_block.filter(|&id| {
+            states
+                .store
+                .get(id)
+                .is_some_and(|entry| entry.ram().is_none())
+        });
+        let id = if let Some(id) = disk_only {
+            states.store.promote(id, cell);
+            states.store.reuse(id, point.checkpoint);
+            id
+        } else {
+            match states.store.insert(lineage, cell, class) {
+                Ok(inserted) => inserted.id,
+                Err(_) => {
+                    states.counters.refused_register += 1;
+                    return;
+                }
             }
         };
         states.counters.published += 1;
         if point.checkpoint {
-            if let Some(old) = turn.checkpoint.replace(inserted.id)
-                && old != inserted.id
+            if let Some(old) = turn.checkpoint.replace(id)
+                && old != id
                 && states.store.checkpoint_state(old).is_some()
                 && states.store.remove(old)
             {
                 states.counters.retired += 1;
             }
-        } else if let Some(mark) = states.store.get(inserted.id).map(|entry| entry.mark()) {
+        } else if let Some(mark) = states.store.get(id).map(|entry| entry.mark()) {
             states.store.use_state(mark);
             turn.uses.push(mark);
-            turn.replay = Some((inserted.id, row));
+            turn.replay = Some((id, row));
         }
         if let (Some(disk), Some(adapter)) = (self.disk.as_mut(), self.decoder.paged.as_mut()) {
             let draft = states
                 .store
-                .get(inserted.id)
+                .get(id)
                 .and_then(|entry| entry.ram())
                 .and_then(|cell| cell.draft.as_ref());
-            disk.published(seq, row, draft);
+            disk.drops(memory_drops(&states.counters));
+            let replay = (!point.checkpoint).then_some(id);
+            disk.published(&states.store, seq, row, draft, replay);
             disk.top_up(seq, adapter);
         }
         self.telemetry.sync(states);
@@ -1303,6 +1358,12 @@ impl HybridSchedulerBackend for Inner {
         let logits = self.in_decode_pass(|inner| inner.decode_step_rows(rows))?;
         self.top_up_disk();
         Ok(logits)
+    }
+    fn tick_state_disk(
+        &mut self,
+        _tick: crate::models::qwen3_5::dflash2_state::disk::Tick,
+    ) -> bool {
+        self.top_up_disk()
     }
     fn replace_cached_token_history(&mut self, history: Vec<u32>) {
         self.saved_history = history;

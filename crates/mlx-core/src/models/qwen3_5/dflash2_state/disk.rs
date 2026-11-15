@@ -32,7 +32,7 @@ use crate::transformer::paged_kv_cache_adapter::{
 };
 
 use super::paged::{DFlash2States, PagedAnchor};
-use super::store::{DiskCopy, Entry, EntryId, HybridStateStore, Lineage, StateClass};
+use super::store::{DiskCopy, Entry, EntryId, HybridStateStore, Lineage, StateBytes, StateClass};
 use super::write_behind::WriteBehind;
 
 /// The model's state tier: one per model, so one state write in flight.
@@ -241,7 +241,7 @@ fn chain_keys<S>(
     )
 }
 
-fn lineage_keys(
+pub(crate) fn lineage_keys(
     group: ColdGroup,
     fingerprint: mlx_paged_attn::ColdCacheFingerprint,
     lineage: Lineage<'_>,
@@ -279,7 +279,7 @@ fn missing_keys(tier: &DiskTier, keys: &[ColdCacheKey]) -> usize {
         .count()
 }
 
-fn label_of<S>(entry: &Entry<S>) -> ColdStateLabel {
+pub(crate) fn label_of<S>(entry: &Entry<S>) -> ColdStateLabel {
     ColdStateLabel {
         tokens: entry.tokens().to_vec(),
         extra_keys: entry.extra_keys().to_vec(),
@@ -1309,9 +1309,29 @@ pub(crate) fn adopt_all<T: DFlash2Target>(target: &mut T) -> u64 {
     if !disk.tier.persistent || store.entries().next().is_some() {
         return 0;
     }
-    let block_size = store.block_size();
     let cached_bytes = disk.spans.iter().sum();
+    let window_slots = disk.window_slots;
     let tier = Arc::clone(&disk.tier);
+    let adopted = adopt_states(store, &tier, &disk.spans, &disk.geometry, |label| {
+        let row = u32::try_from(label.tokens.len()).ok()?;
+        Some((cached_bytes, row - row.min(window_slots)))
+    });
+    disk.counters.adopted += adopted;
+    adopted
+}
+
+/// The adoption loop of [`adopt_all`] over any store: each state object of
+/// `spans` and `geometry` whose own key and whole KV chain are on `tier`
+/// comes back as a disk-only state. `copy` gives its `cached_bytes` and its
+/// copy's `window_begin`, or `None` to leave it.
+pub(crate) fn adopt_states<S: StateBytes>(
+    store: &mut HybridStateStore<S>,
+    tier: &DiskTier,
+    spans: &[u64],
+    geometry: &str,
+    mut copy: impl FnMut(&ColdStateLabel) -> Option<(u64, u32)>,
+) -> u64 {
+    let block_size = store.block_size();
     let manager = &tier.manager;
     // A lower limit than the earlier process had takes the oldest copies
     // first, so only chains that survive come back.
@@ -1335,22 +1355,25 @@ pub(crate) fn adopt_all<T: DFlash2Target>(target: &mut T) -> u64 {
             block_size,
         );
         let chain = lineage_keys(ColdGroup::Kv, tier.kv_fingerprint, lineage, block_size);
-        if layout.spans != disk.spans
-            || layout.geometry != disk.geometry
+        if layout.spans != spans
+            || layout.geometry != geometry
             || own.len() * block_size as usize != depth
             || own.last() != Some(&key)
-            || missing_keys(&tier, &chain) > 0
+            || missing_keys(tier, &chain) > 0
         {
             continue;
         }
-        let Ok(row) = u32::try_from(depth) else {
+        if u32::try_from(depth).is_err() {
+            continue;
+        }
+        let Some((cached_bytes, window_begin)) = copy(&label) else {
             continue;
         };
         let copy = DiskCopy {
             key,
             bytes: state_object_bytes(&layout, &label),
             landed: true,
-            window_begin: row - row.min(disk.window_slots),
+            window_begin,
             chain_owed: false,
         };
         let class = if label.checkpoint {
@@ -1367,7 +1390,6 @@ pub(crate) fn adopt_all<T: DFlash2Target>(target: &mut T) -> u64 {
         }
     }
     store.continue_after(newest);
-    disk.counters.adopted += adopted;
     adopted
 }
 

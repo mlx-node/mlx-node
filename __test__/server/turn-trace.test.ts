@@ -1015,18 +1015,21 @@ describe('TurnTraceModel', () => {
   // Mutation: leave `qwen4_exp` out of `COLD_TIER_STATE_FAMILIES` → red.
   // Mutation: read the governor instead of the model's method → red.
   it('a qwen4_exp turn records its model tier', async () => {
-    const inner = Object.assign(makeInner(), { stateTierMode: () => 'persistent' });
-    await new TurnTraceModel(
-      inner,
-      deps({
-        identity: { modelId: 'flash', modelType: 'qwen4_exp', contextWindow: 4096 },
-        coldStats: () => coldStats({ enabled: false, root: '' }),
-        stateTierMode: undefined,
-      }),
-    ).chatSessionStart([]);
+    for (const mode of ['persistent', 'temp']) {
+      const inner = Object.assign(makeInner(), { stateTierMode: () => mode });
+      await new TurnTraceModel(
+        inner,
+        deps({
+          identity: { modelId: 'flash', modelType: 'qwen4_exp', contextWindow: 4096 },
+          coldStats: () => coldStats({ enabled: false, root: '' }),
+          stateTierMode: undefined,
+        }),
+      ).chatSessionStart([]);
+    }
 
-    const [line] = readTraceLines(dir);
-    expect(line).toMatchObject({ modelType: 'qwen4_exp', coldEnabled: false, stateTier: 'persistent' });
+    const lines = readTraceLines(dir);
+    expect(lines[0]).toMatchObject({ modelType: 'qwen4_exp', coldEnabled: false, stateTier: 'persistent' });
+    expect(lines[1]).toMatchObject({ modelType: 'qwen4_exp', coldEnabled: false, stateTier: 'temp' });
   });
 
   it('reports concurrency and concurrencyPeak for overlapping turns', async () => {

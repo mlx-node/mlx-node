@@ -635,26 +635,30 @@ fn the_load_plan_prices_the_lane_draft() {
 }
 
 /// With the disk tier on, the plan books its host staging beside the lane,
-/// whatever the window (`MemoryFootprint::state_staging_bytes`): an encoded
-/// state (cell and, with the head, a window of waiting rows and the seed) for
-/// every parcel and one more for the writer's copy, the copy queue and the
+/// whatever the window (`MemoryFootprint::state_staging_bytes`): one encoded
+/// state for the one staging buffer every state record goes through (cell
+/// and, with the head, a window of waiting rows and the seed), the largest
+/// array's host copy while a state is encoded, the copy queue and the
 /// writer's queue of pages or draft segments behind it; off, nothing. The
 /// lane's own state holds none of it.
-/// Mutation: two states are booked, as before the parcels went per lane →
-/// red. Mutation: the engine plan leaves the staging out of its footprint →
-/// red.
+/// Mutation: a staging buffer per lane → red. Mutation: the engine plan
+/// leaves the staging out of its footprint → red.
 #[test]
 fn the_load_plan_books_the_state_staging() {
-    use crate::models::qwen4_exp::prefix_disk::{PARCELS, QUEUE_BYTES};
+    use crate::models::qwen4_exp::prefix_disk::QUEUE_BYTES;
     let c = flash_next_config();
     let cell = memory::state_cell_bytes(&c);
     let page = super::flash_next_layout(&c).page_bytes();
     let writer = (mlx_paged_attn::DEFAULT_QUEUE_DEPTH as u64 + 3) * page;
-    let states = (PARCELS as u64 + 1) * memory::encoded_state_bytes(&c, false);
-    assert!(memory::encoded_state_bytes(&c, false) > cell);
+    let encoded = memory::encoded_state_bytes(&c, false);
+    assert!(encoded > cell);
     assert!(memory::encoded_state_bytes(&c, true) > cell + 1025 * 20_480);
+    let linear = (0..c.num_hidden_layers).filter(|&i| c.linear(i)).count() as u64;
+    let [conv, recurrent, ple, _] = memory::row_state_parts(&c);
+    let largest = (conv / linear).max(recurrent / linear).max(ple);
     let off = state_staging(&c, false, true);
-    assert!(off > states + QUEUE_BYTES + writer, "{off}");
+    assert_eq!(off, encoded + largest + QUEUE_BYTES + writer);
+    assert!(off < 2 * encoded + largest + QUEUE_BYTES + writer);
     assert_eq!(off, memory::disk_staging_bytes(&c, false));
     assert_eq!(
         state_staging(&c, true, true),
@@ -699,8 +703,9 @@ fn the_load_plan_books_the_state_staging() {
 }
 
 /// The context estimate sets the state staging aside exactly when the load
-/// would: `--max-cache-disk 0` under the host's switch plans no staging,
-/// the bare switch plans the load's.
+/// would: `--max-cache-disk 0` plans no staging; the bare load plans the
+/// load's, with the switch on (a persistent tier) and with it unset (a
+/// temporary one).
 /// Mutation: the disk plan ignores `cacheDisk` → red.
 #[test]
 fn the_estimate_follows_the_load_switch() {
@@ -709,14 +714,16 @@ fn the_estimate_follows_the_load_switch() {
         cache_disk: Some("0".to_string()),
         ..Default::default()
     };
-    let disk = |options| {
-        crate::models::qwen4_exp::disk_plan("Qwen4Exp", options, Some("1"), Some("id"))
-            .unwrap()
-            .1
-    };
-    assert!(!disk(&off));
-    assert_eq!(state_staging(&c, true, disk(&off)), 0);
     let bare = crate::models::qwen4_exp::Qwen4ExpLoadOptions::default();
-    assert!(disk(&bare));
-    assert!(state_staging(&c, true, disk(&bare)) > 0);
+    for env in [Some("1"), None] {
+        let disk = |options| {
+            crate::models::qwen4_exp::disk_plan("Qwen4Exp", options, env)
+                .unwrap()
+                .1
+        };
+        assert!(!disk(&off), "{env:?}");
+        assert_eq!(state_staging(&c, true, disk(&off)), 0, "{env:?}");
+        assert!(disk(&bare), "{env:?}");
+        assert!(state_staging(&c, true, disk(&bare)) > 0, "{env:?}");
+    }
 }

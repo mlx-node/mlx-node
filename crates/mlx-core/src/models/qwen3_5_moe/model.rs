@@ -337,6 +337,8 @@ pub struct Qwen3_5MoeModel {
     /// For direct GGUF loads this is the lossless native-packed cache rather
     /// than the source file path.
     pub(crate) model_assets_path: String,
+    /// The model thread's state tier, never held open from here.
+    pub(crate) state_tier: crate::disk_tier::TierHandle,
     /// RAII: this model's baseline and its paged pool's debit with the
     /// cache-limit coordinator, released by `dispose` or on drop. The pool's
     /// entry must outlive every grow the adapter makes.
@@ -371,6 +373,13 @@ impl Qwen3_5MoeModel {
     #[napi]
     pub fn model_assets_path(&self) -> String {
         self.model_assets_path.clone()
+    }
+    /// The directory name of the model's open persistent SSD cache under
+    /// its cache root, read from the cache itself; null without one, for a
+    /// temporary cache, and after `closeCache` or `dispose`.
+    #[napi]
+    pub fn state_tier_namespace(&self) -> Option<String> {
+        self.state_tier.namespace()
     }
 
     /// What the load's warm-up did; `null` for a load with no paged pool,

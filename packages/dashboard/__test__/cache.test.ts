@@ -31,10 +31,7 @@ function isCanonicalBlockName(name: string): boolean {
 }
 
 /** Canonical sidecar filename: same key, `ColdGroup` label as an infix. */
-function sidecarName(
-  index: number,
-  group: 'conv_state' | 'sliding_window' | 'dflash2_state' | 'hybrid_cell' | 'hybrid_draft',
-): string {
+function sidecarName(index: number, group: 'conv_state' | 'sliding_window' | 'dflash2_state' | 'hybrid_draft'): string {
   return `${index.toString(16).padStart(64, '0')}.${group}.safetensors`;
 }
 
@@ -447,7 +444,7 @@ describe('cold-tier object counting (Cache page ↔ scan)', () => {
   });
 
   it('counts and clears the Flash Next state objects as sidecars', () => {
-    writeFileSync(join(root, sidecarName(10, 'hybrid_cell')), Buffer.alloc(5));
+    writeFileSync(join(root, sidecarName(10, 'dflash2_state')), Buffer.alloc(5));
     writeFileSync(join(root, sidecarName(11, 'hybrid_draft')), Buffer.alloc(6));
 
     const info = scanColdCache(root);

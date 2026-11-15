@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use crate::array::MxArray;
 use crate::models::qwen3_5::dflash2_state::plan::planned_checkpoints;
 use crate::models::qwen3_5::dflash2_state::store::{
-    EntryId, HybridStateStore, Lineage, StateBytes, StoreHit,
+    Entry, EntryId, HybridStateStore, Lineage, StateBytes, StoreHit, lineage_bytes,
 };
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 
@@ -444,42 +444,116 @@ impl States {
         self.store.bytes().state_bytes
     }
 
-    /// Drops every state and turn (a command reset, a GPU reset).
-    pub(super) fn clear(&mut self) {
-        self.store.clear();
-        self.turns.clear();
-    }
-
-    /// Drops every state with a block of its chain no longer cached, or made
-    /// with another prefill window.
-    pub(super) fn prune(&mut self, adapter: &PagedKVCacheAdapter, grid: usize) {
-        let gone: Vec<EntryId> = self
+    /// A command reset: every turn ends; a state whose whole chain is on
+    /// disk keeps its disk copy alone when `keep_durable`, every other one
+    /// goes.
+    pub(super) fn reset(&mut self, keep_durable: bool) {
+        let seqs: Vec<SeqId> = self.turns.keys().copied().collect();
+        for seq in seqs {
+            self.end_turn(seq);
+        }
+        if !keep_durable {
+            self.store.clear();
+            return;
+        }
+        let entries: Vec<(EntryId, bool)> = self
             .store
             .entries()
-            .filter(|entry| {
-                entry.ram().is_none_or(|cell| cell.grid != grid)
-                    || !entry
-                        .chain()
-                        .iter()
-                        .all(|&hash| adapter.prefix_cached(hash))
-            })
-            .map(|entry| entry.id())
+            .map(|entry| (entry.id(), durable(entry)))
             .collect();
-        for id in gone {
-            if self.store.remove(id) {
+        for (id, kept) in entries {
+            if kept {
+                self.store.drop_ram(id);
+            } else {
+                self.store.remove(id);
+            }
+        }
+    }
+
+    /// Drops the RAM copy of every state with a block of its chain no longer
+    /// cached: a state whose whole chain is on disk stays there alone, any
+    /// other goes. A state made with another prefill window goes; one on
+    /// disk only stays.
+    pub(super) fn prune(&mut self, adapter: &PagedKVCacheAdapter, grid: usize) {
+        let stale: Vec<(EntryId, bool)> = self
+            .store
+            .entries()
+            .filter_map(|entry| {
+                let cell = entry.ram()?;
+                if cell.grid != grid {
+                    return Some((entry.id(), false));
+                }
+                let cached = entry
+                    .chain()
+                    .iter()
+                    .all(|&hash| adapter.prefix_cached(hash));
+                (!cached).then(|| (entry.id(), durable(entry)))
+            })
+            .collect();
+        for (id, kept) in stale {
+            if kept {
+                self.store.drop_ram(id);
+            } else if self.store.remove(id) {
                 self.counters.dropped_kv += 1;
             }
         }
     }
 
-    /// The deepest state whose lineage is a strict prefix of `tokens`, whose
-    /// blocks carry `keys` ([`pass_keys`]).
-    pub(super) fn lookup(&self, tokens: &[u32], keys: &[Vec<u64>], salt: u64) -> Option<StoreHit> {
-        self.store.lookup(Lineage {
+    /// The deepest state with a RAM copy whose lineage is a strict prefix of
+    /// `tokens`, whose blocks carry `keys` ([`pass_keys`]).
+    pub(super) fn lookup_ram(
+        &self,
+        tokens: &[u32],
+        keys: &[Vec<u64>],
+        salt: u64,
+    ) -> Option<StoreHit> {
+        let lineage = Lineage {
             tokens,
             extra_keys: keys,
             salt,
-        })
+        };
+        let mut hit = self.store.lookup(lineage)?;
+        loop {
+            if self
+                .store
+                .get(hit.id)
+                .is_some_and(|entry| entry.ram().is_some())
+            {
+                return Some(hit);
+            }
+            hit = self
+                .store
+                .lookup_within(lineage, hit.depth.checked_sub(1)?)?;
+        }
+    }
+
+    /// The states of `tokens` on disk only, deeper than `floor`, the deepest
+    /// first.
+    pub(super) fn disk_only_above(
+        &self,
+        tokens: &[u32],
+        keys: &[Vec<u64>],
+        salt: u64,
+        floor: usize,
+    ) -> Vec<StoreHit> {
+        let lineage = Lineage {
+            tokens,
+            extra_keys: keys,
+            salt,
+        };
+        let mut out = Vec::new();
+        let mut hit = self.store.lookup(lineage);
+        while let Some(found) = hit.filter(|found| found.depth > floor) {
+            if self
+                .store
+                .get(found.id)
+                .is_some_and(|entry| entry.ram().is_none())
+            {
+                out.push(found);
+            }
+            hit = self.store.lookup_within(lineage, found.depth - 1);
+        }
+        out
     }
 
     /// Ends `seq`'s turn: the states it used become the newest of their
@@ -493,13 +567,16 @@ impl States {
     }
 
     /// The state memory gives up first: a checkpoint (oldest publication),
-    /// else the least recently used ordinary state; never one in use, nor
-    /// one of `skip`.
+    /// else the least recently used ordinary state; only a RAM copy with no
+    /// disk write in flight, never one in use, nor one of `skip`.
     fn victim(&self, skip: &[EntryId]) -> Option<EntryId> {
         let free = || {
-            self.store
-                .entries()
-                .filter(|entry| !self.store.in_use(entry.mark()) && !skip.contains(&entry.id()))
+            self.store.entries().filter(|entry| {
+                entry.ram().is_some()
+                    && entry.disk().is_none_or(|copy| copy.landed)
+                    && !self.store.in_use(entry.mark())
+                    && !skip.contains(&entry.id())
+            })
         };
         free()
             .filter(|entry| entry.checkpoint())
@@ -516,24 +593,55 @@ impl States {
         let mut freed = 0u64;
         while self.bytes().saturating_sub(freed).saturating_add(need) > room {
             let id = self.victim(&victims)?;
-            freed = freed.saturating_add(self.store.get(id).map_or(0, |entry| entry.state_bytes()));
+            let gives = self.store.get(id).map_or(0, |entry| {
+                let lineage = if durable(entry) {
+                    lineage_bytes(entry.depth(), entry.chain().len())
+                } else {
+                    0
+                };
+                entry.state_bytes().saturating_sub(lineage)
+            });
+            freed = freed.saturating_add(gives);
             victims.push(id);
         }
         Some((victims, freed))
     }
 
-    /// Drops states toward `shortfall` bytes; the bytes freed.
+    /// Memory gives up `id`'s RAM copy: a state whose whole chain is on disk
+    /// stays there alone, any other goes.
+    pub(super) fn release(&mut self, id: EntryId) {
+        release(&mut self.store, &mut self.counters, id);
+    }
+
+    /// Gives up RAM copies toward `shortfall` bytes; the bytes freed.
     pub(super) fn reclaim(&mut self, shortfall: u64) -> u64 {
         let before = self.bytes();
         while before.saturating_sub(self.bytes()) < shortfall {
             let Some(id) = self.victim(&[]) else {
                 break;
             };
-            self.store.remove(id);
-            self.counters.dropped_memory += 1;
+            self.release(id);
         }
         before.saturating_sub(self.bytes())
     }
+}
+
+/// [`States::release`] over the store and counters alone, while a turn is
+/// borrowed.
+pub(super) fn release(store: &mut HybridStateStore<Cell>, counters: &mut Counters, id: EntryId) {
+    if store.get(id).is_some_and(durable) {
+        store.drop_ram(id);
+    } else if store.remove(id) {
+        counters.dropped_memory += 1;
+    }
+}
+
+/// A landed disk copy whose whole chain is on disk too: the state comes back
+/// from there.
+pub(super) fn durable(entry: &Entry<Cell>) -> bool {
+    entry
+        .disk()
+        .is_some_and(|copy| copy.landed && !copy.chain_owed)
 }
 
 #[cfg(test)]

@@ -1631,6 +1631,12 @@ export declare class Qwen35Model {
    */
   modelAssetsPath(): string;
   /**
+   * The directory name of the model's open persistent SSD cache under
+   * its cache root, read from the cache itself; null without one, for a
+   * temporary cache, and after `closeCache` or `dispose`.
+   */
+  stateTierNamespace(): string | null;
+  /**
    * What the load's warm-up did; `null` for a load with no paged pool,
    * which runs none.
    */
@@ -1823,6 +1829,12 @@ export declare class Qwen35MoeModel {
    * reads the reconstructed sidecars from the native-packed cache.
    */
   modelAssetsPath(): string;
+  /**
+   * The directory name of the model's open persistent SSD cache under
+   * its cache root, read from the cache itself; null without one, for a
+   * temporary cache, and after `closeCache` or `dispose`.
+   */
+  stateTierNamespace(): string | null;
   /**
    * What the load's warm-up did; `null` for a load with no paged pool,
    * which runs none.
@@ -2412,21 +2424,32 @@ export declare class Qwen4ExpModel {
   dispose(): Promise<void>;
   static load(modelPath: string, options?: Qwen4ExpLoadOptions | undefined | null): Promise<Qwen4ExpModel>;
   /**
-   * Closes the stored states' SSD cache at a clean stop: every copy and
-   * every parked state whose chain is on disk goes to the writer, which
-   * drains until `deadlineMs` (milliseconds on `Date.now()`'s clock, so
-   * models closed in turn share one deadline). The cache takes no write
-   * afterwards. Resolves false when something missed the deadline; true
-   * without a cache, or after `dispose`, which closed it.
-   *
-   * Runs off the model thread: a turn in flight does not hold it.
+   * Closes the stored states' SSD cache at a clean stop: on a persistent
+   * cache it asks the model thread to write the waiting states, the
+   * newest first, then drains every copy, until `deadlineMs`
+   * (milliseconds on `Date.now()`'s clock, so models closed in turn share
+   * one deadline); a temporary cache is removed. The model thread gets
+   * all of the time but the last second (at most half of it): a turn in
+   * flight that holds it longer leaves its waiting states unwritten,
+   * while the copies already queued still land. The cache takes no write
+   * and removes nothing afterwards. Resolves true only when no state was
+   * left waiting and every copy and write landed by the deadline; true
+   * without a cache, or after `dispose`, which closed it. A call while
+   * another close runs gets that close's outcome.
    */
   closeCache(deadlineMs: number): Promise<boolean>;
   /**
-   * The stored states' SSD cache: `'persistent'` while it is open,
-   * `'off'` without one or after `closeCache`.
+   * The stored states' SSD cache: `'persistent'` or `'temp'` while it is
+   * open, `'off'` without one, after `closeCache`, and once a write failed
+   * for anything but room (it takes no write after).
    */
-  stateTierMode(): 'persistent' | 'off';
+  stateTierMode(): 'persistent' | 'temp' | 'off';
+  /**
+   * The directory name of the stored states' open persistent SSD cache
+   * under its cache root, read from the cache itself; null without one,
+   * for a temporary cache, and after `closeCache` or `dispose`.
+   */
+  stateTierNamespace(): string | null;
   /** Whether the validated checkpoint has a supported image tower. */
   supportsImages(): boolean;
   /** Plan the expanded prompt using the same processor and limits as prefill. */
@@ -5991,14 +6014,15 @@ export interface Qwen4ExpLoadOptions {
   /**
    * SSD cache for the stored states (`--max-cache-disk`): `'auto'` (the
    * default: up to 32 GiB, a quarter of the volume's room), a byte count,
-   * or `'0'` (off).
+   * or `'0'`, which turns the SSD cache off.
    */
   cacheDisk?: string;
   /**
    * The paged KV disk cache switch every family shares (`--no-persist-cache`):
    * keep the stored states on SSD across restarts in a directory of the
-   * model's own under `cacheDir`; off, they stay in memory.
-   * Unset ⇒ `MLX_PERSIST_PAGED_CACHE`, else off.
+   * model's own under `cacheDir`; off, the cache is temporary: a directory
+   * under the temp root that takes copies only while memory drops states,
+   * removed at the stop. Unset ⇒ `MLX_PERSIST_PAGED_CACHE`, else off.
    */
   persistPagedCache?: boolean;
   /**
@@ -6088,24 +6112,35 @@ export interface Qwen4ExpResidencyInfo {
    * route missed the slots.
    */
   routeReplays: number;
-  /** Stored prefix states in memory and their bytes. */
+  /**
+   * Stored prefix states with a RAM copy, and the bytes of every stored
+   * state.
+   */
   prefixStates: number;
   prefixStateBytes: number;
   /** States published since load, and turns that resumed from one. */
   prefixPublished: number;
   prefixRestored: number;
-  /** The stored states' disk tier is on. */
+  /** The stored states' disk tier is open and takes writes. */
   prefixDiskEnabled: boolean;
-  /** States parked for the disk and not handed to the writer yet. */
+  /** States waiting for their disk write, the one in flight included. */
   prefixDiskWaiting: number;
-  /** States handed to the writer and found on disk. */
+  /** States written whose whole chain is on disk. */
   prefixDiskDurable: number;
-  /** Parked states a newer state of their conversation replaced. */
+  /** Waiting states not written: their conversation went on. */
   prefixDiskUnneeded: number;
-  /** States not written: chain incomplete, budget, queue full. */
+  /**
+   * States not written or dropped (chain incomplete, room, a failed
+   * write, a closed cache), and copies the writer refused.
+   */
   prefixDiskRefused: number;
   /** States read back from disk into memory. */
   prefixDiskRestored: number;
+  /**
+   * States a persistent cache took back at load: on disk only until a
+   * turn reads one back.
+   */
+  prefixDiskAdopted: number;
   /**
    * States removed from disk: a block or draft segment of their chain
    * was not there, or they did not read back.
@@ -6676,15 +6711,24 @@ export interface WarmupReport {
   /** Wall time of the warm-up. */
   ms: number;
   steps: number;
-  /** Steps not run, or run smaller than planned. */
+  /**
+   * Steps not run, or run smaller than planned, by the attempt that
+   * warmed the model (a retry runs a refused attempt's steps again).
+   */
   skipped: number;
-  /** 1 when a cache reset made the model's state read as before. */
+  /**
+   * 1 when a cache reset, in any attempt, made the model's state read as
+   * before.
+   */
   reset: number;
   /** Pipelines and source libraries created during the warm-up. */
   pipelines: number;
   /** Time inside those creations. */
   compileMs: number;
-  /** The process allocator's peak, read after the warm-up. */
+  /**
+   * The process allocator's peak over every attempt, read after the
+   * warm-up.
+   */
   peakBytes: number;
 }
 

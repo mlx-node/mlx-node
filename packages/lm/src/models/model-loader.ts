@@ -105,8 +105,8 @@ export interface LoadModelOptions {
    * SSD state tier of `qwen3_5`, `qwen3_5_moe` and `qwen4_exp` targets
    * (`--max-cache-disk`): `'auto'` (the default), a decimal byte count, or
    * `'0'` (off). Whether it survives a restart is the paged KV disk cache
-   * switch every family reads, `MLX_PERSIST_PAGED_CACHE`. Other model
-   * families reject it, as they do `cacheDir`.
+   * switch every family reads, `MLX_PERSIST_PAGED_CACHE`; off, the tier is
+   * temporary. Other model families reject it, as they do `cacheDir`.
    */
   cacheDisk?: string;
   /** The persistent tier's root (`--cache-dir`); needs the switch on. */

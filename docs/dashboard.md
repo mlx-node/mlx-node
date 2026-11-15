@@ -975,8 +975,9 @@ this view does not list it.
   `coldEnabled`: its row carries `stateTier` (Qwen3.5: `persistent`, `temp` or
   `off`, the most lasting mode over the engine's loaded models, with its numbers
   in `/health` `memory_governor.dflash2_states`; Flash Next: the model's own
-  `stateTierMode()`, `persistent` or `off`, with its numbers in
-  `residencyInfo()`'s `prefixDisk*` counters).
+  `stateTierMode()`, `persistent`, `temp` or `off`, with its numbers in
+  `residencyInfo()`'s `prefixDisk*` counters; `prefixDiskAdopted` is what a
+  restarted load took back from the SSD before any turn).
 - **One turn writes the whole prompt in both agent paths** (the restore-allowlisted
   families; not the Qwen3.5 state tier). By default a turn's capture walk writes at
   most 128 blocks (2,048 tokens) within 250 ms. `mlx agent` (through

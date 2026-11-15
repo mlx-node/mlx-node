@@ -265,67 +265,130 @@ exact-boundary sidecar or a second paged group:
 
 **qwen4_exp (Flash Next) on disk** (`qwen4_exp/prefix_disk.rs`, Splash
 `WriteBehind` / `StateDisk`). The objects live in the model's own SSD tier
-(`disk_tier.rs`), never in the process cold tier: a namespace directory
-`<cacheDir>/<ns>` (default root `~/.mlx-node/cache/prefix-cache`), where `ns` is
-the first 32 hex digits of the fingerprint below, held by its lock for the
-load's life. The tier is on only as a persistent one: the persistence switch
-(`persistPagedCache`, else `MLX_PERSIST_PAGED_CACHE`, which every host, `mlx
-serve`, `mlx agent` and the desktop engine, sets on by default) is on,
-`cacheDisk` is not `'0'`, and the load is a GGUF store; a safetensors
-directory, the switch off, or a namespace another process holds (after a 20 s
-wait) keeps the states in memory (one log line). The load, the tier's open
-and the `/v1/models` context estimate decide this through one function
-(`qwen4_exp::disk_plan`). Quota and lock follow Splash: `cacheDisk` `'auto'` is a
-quarter of the volume's room up to 32 GiB, and Flash Next and Qwen3.5 share
-one root limit under `prefix-cache/`: the oldest idle namespace of either
-goes first, and one unused for 14 days goes at the next open. Objects, all in
-the tier's one store and writer:
+(`disk_tier.rs`, the open Qwen3.5 uses), never in the process cold tier. The
+tier is on unless `cacheDisk` is `'0'`. It is persistent when the persistence
+switch (`persistPagedCache`, else `MLX_PERSIST_PAGED_CACHE`, which every host,
+`mlx serve`, `mlx agent` and the desktop engine, sets on by default) is on and
+the load is a GGUF store: a namespace directory `<cacheDir>/<ns>` (default
+root `~/.mlx-node/cache/prefix-cache`), where `ns` is the first 32 hex digits
+of the fingerprint below, held by its lock for the load's life. Otherwise it
+is temporary (Splash's temporary cache): the switch off, a safetensors
+directory, a persistent open that failed, or a namespace a second process on
+the same checkpoint holds (after a 20 s wait) give a directory
+`$TMPDIR/mlx-node-cache-*` under a random fingerprint, which nothing else
+reads, removed at `closeCache` or `dispose` (a crash leaves it for the next
+start's sweep). The load, the tier's open and the `/v1/models` context
+estimate decide on/off through one function (`qwen4_exp::disk_plan`). Quota
+and lock follow Splash: `cacheDisk` `'auto'` is a quarter of the volume's
+room up to 32 GiB, and Flash Next and Qwen3.5 share one root limit under
+`prefix-cache/`: the oldest idle namespace of either goes first, and one
+unused for 14 days goes at the next open. A reopen under a lower limit than
+the last process had trims the namespace to it at once. Objects, all in the
+tier's one store and writer:
 a KV block in `Kv` under its chain key with the block's pass keys; a draft
-segment (MTP loads) in `HybridDraft`; a state in `HybridCell`, keyed by its
-chain of blocks. The fingerprint binds the GGUF shard identity, the auxiliary
-checkpoint's files, the config (KV format, served YaRN), the page layout, the
-prefill window and its halving, the assistant opening ids, the MTP head, the
-GPU generation and a format tag.
+segment (MTP loads) in `HybridDraft`; a state as a state record on the
+store's one-slot state lane, group `DFlash2State` (file
+`<key>.dflash2_state.safetensors`), keyed by its chain of blocks: a label
+with its lineage (tokens, pass keys, salt) and one fixed span of
+`encoded_state_bytes` (the cell and, with the MTP head, a prefill window of
+waiting rows and the seed; zeros after a shorter state). The fingerprint
+binds the GGUF shard identity, the auxiliary checkpoint's files, the config
+(KV format, served YaRN), the page layout, the prefill window and its
+halving, the assistant opening ids, the MTP head, the GPU generation and the
+format tag `qwen4-prefix-v3`: a build with another tag opens another
+directory and reads no object of the old one, which goes by the 14-day rule
+or the root limit.
 
+- Only a turn whose prompt reaches 2,048 tokens before its replay row
+  writes (Splash `WriteBehind::kMinimumTokens`: a shorter one prefills again
+  faster than its state is written); a shorter turn copies no block either.
 - Write-behind, never on the turn: at each publication, and at most every
-  250 ms of decode steps, the model thread copies the chain's blocks and
-  draft segments not on disk yet into a host queue (at most 128 MiB); at the
-  turn's end it encodes the replay state (never a checkpoint) and parks it,
-  one parked state per lane; a state past them is refused before it is
-  copied. A parker thread writes the copies (one that finds no writer slot
-  stays first in line), then the state 10 s after the turn ended once every
-  object of its chain is on disk, and holds it until the writer is past it;
-  a newer state of the same conversation replaces a parked one
-  (`prefixDiskUnneeded`). A state whose chain never lands is dropped
-  (`prefixDiskRefused`). The model's `closeCache(deadlineMs)` (which
-  `InferenceHost.close()` calls before `cold_cache_drain`) and its `dispose`
-  (2 s) hand everything parked over first, stop waiting once the handed
-  writes are done and no other state's chain can land, then drain the writer
-  and close the tier inside the same deadline; a write not landed by then is
-  dropped. `closeCache` runs off the model thread, so a turn in flight does
-  not hold it; afterwards lookups still read the directory and nothing more
-  is written.
-- States on disk (with their draft segments) stay within `min(quota / 4,
-  16 GiB)`, oldest first; a state handed over marks its chain as used.
+  250 ms of the model thread's passes (decode steps and the scheduler's
+  drive passes alike), the model thread copies the chain's blocks and draft
+  segments not on disk yet into a host queue (at most 128 MiB), which a
+  parker thread hands to the writer (a copy that finds no writer slot stays
+  first in line). A replay state (never a checkpoint) waits 10 s after its
+  publication, its turn running or not, then the model thread encodes it
+  into the tier's one staging buffer and hands it to the state lane, one at
+  a time in publication order; a state that waits for the buffer holds the
+  ones behind it (`prefixDiskWaiting` counts them and the one in flight). A
+  state whose conversation went on (a newer ordinary state of the same
+  lineage) is not written (`prefixDiskUnneeded`). A written state counts as
+  durable (`prefixDiskDurable`) only once every block and segment of its
+  chain is on disk; nothing reads a state without its whole chain, so a
+  crash between the two only leaves an object for the quota to take. A
+  chain that nothing can add to any more (no copy queued or owed) for 10 s
+  drops its state (`prefixDiskRefused`), as does a failed write. With no
+  request the parker wakes the idle model thread (one drive pass, at most
+  every 250 ms) for a due state and for an owed chain, and a landed state
+  write wakes it too.
+- The model's `closeCache(deadlineMs)` (which `InferenceHost.close()` calls
+  before `cold_cache_drain`) asks the model thread to write every waiting
+  state, the newest first, due or not, and waits for it until the last
+  second of the deadline (at most half of it); then the copies go to the
+  writer, the writer drains and the tier closes inside the same deadline.
+  A model thread inside one long command leaves its waiting states
+  unwritten; the copies already queued still land. A `dispose` gives the
+  waiting states and the copies 2 s together on the model thread, then
+  closes the tier by the same bound; it never waits for anything else. A
+  write not landed by then is dropped. A temporary tier writes nothing at a
+  close: its directory goes. Two closes at once share one outcome, true only
+  when no state was left waiting and every copy and write landed;
+  afterwards lookups still read the directory, and nothing in it is written
+  or removed. The host closes the cache of a model it dropped (a swap, an
+  unload) before a new load of the same model opens the same directory.
+- A temporary tier copies only on memory demand (our stand-in for Splash's
+  copy demand): while memory dropped a stored state in the last 60 s (the
+  room or the pool's blocks took it). Its states wait for demand, only the
+  newest of a conversation, and one whose turn still runs waits for the
+  turn's end; the one memory drops first is lost.
+- States and their chains share the tier's one quota: a persistent tier's
+  state write takes the least recently used objects (the write marks its
+  chain as used first), a temporary one's takes none, so a state is refused
+  only when the tier cannot hold it. A block taken from the middle of a
+  chain drops that chain's state at its next lookup; a state object the
+  quota takes leaves the store at the model thread's next pass (a state in
+  memory keeps its RAM copy, one on disk only goes).
+- A state whose whole chain is on disk keeps its entry when memory lets go
+  of it: the room, a reclaim, the pool losing its blocks or a command reset
+  drops only its RAM copy, and the state stays on disk only (memory never
+  picks one as a victim, nor a RAM copy whose write is in flight). Any other
+  state goes as before. A publication at the block of a state on disk only
+  gives it its RAM copy back and writes nothing.
+- A restarted load of a persistent tier takes back, before any turn, every
+  state record of its shape whose own object, whole KV chain and, with the
+  MTP head, draft segments are on the tier, as states on disk only, stamped
+  as the last process left them (Splash `Cache::adopt`; the tier first fits
+  its limit, so nothing the trim took comes back). Only the header of each
+  object is read. `residencyInfo().prefixDiskAdopted` counts them; a
+  temporary tier takes nothing back.
 - Restore at the turn's start (text, not a live continuation, not the turn
-  right after a command reset): past the memory store's hit, the deepest
-  block-aligned pass end of the prompt with a state on disk whose KV blocks
-  and draft segments are all there is read back under the memory checks of
-  a publication, the pool grows for its blocks, and the adapter's cold walk
-  restores them; any miss prefills as before and a state whose chain is
-  incomplete is removed (`prefixDiskDroppedChain`). `residencyInfo()` carries
-  the `prefix*` counters.
+  right after a command reset): past the deepest state of the prompt with a
+  RAM copy, the deepest state on disk only whose KV blocks and draft
+  segments are all there is read back under the memory checks of a
+  publication and gets its RAM copy back, the pool grows for its blocks, and
+  the adapter's cold walk restores them; any miss prefills as before, and a
+  state whose chain is incomplete or that does not read back goes with its
+  object (`prefixDiskDroppedChain`), two at most per turn. The read goes
+  through the staging buffer: it waits up to 2 s for a write in flight, else
+  the turn prefills. A state read back is not written again.
+  `residencyInfo()` carries the `prefix*` counters; `prefixStates` counts
+  the states with a RAM copy.
 - The load plan books the tier's host staging beside the lane, as its state
-  staging (`state_staging_bytes`, part of the untracked reserve): an encoded
-  state per lane and one more for the writer's copy, one array's copy while
+  staging (`state_staging_bytes`, part of the untracked reserve), on every
+  load whose tier is on, temporary ones included: the one staging buffer
+  (one encoded state), allocated at the tier's open, one array's copy while
   a state is encoded, the copy queue, and the writer's queue of pages or
   draft segments behind it.
 - A restart restore reads the state and its blocks on the model thread at
   the turn's admission, as every family's cold restore does; other lanes
   wait for it.
-- The proof that the tier is on is `stateTier: "persistent"` on the turn's
-  trace row (the model's `stateTierMode()`) plus `prefixDiskRestored > 0` in
-  `residencyInfo()` after a restart. `coldEnabled` reads `false` on those rows,
+- The proof that the tier persists is `stateTier: "persistent"` on the
+  turn's trace row (the model's `stateTierMode()`: `persistent`, `temp` or
+  `off`; `off` too once a write failed for anything but room, as the tier
+  then takes no write) plus, after a restart, `prefixDiskAdopted > 0` in
+  `residencyInfo()` before any turn and `prefixDiskRestored > 0` after a
+  follow-up. `coldEnabled` reads `false` on those rows,
   as it does for Qwen3.5: `cold_cache_stats` never opens the process tier.
 
 The allowlist is enforced **natively**, not only in the agent:

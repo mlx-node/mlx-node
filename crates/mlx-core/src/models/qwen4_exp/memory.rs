@@ -783,8 +783,8 @@ pub(super) fn encoded_state_bytes(c: &super::config::Config, has_mtp: bool) -> u
     state_cell_bytes(c) + waiting + STATE_HEADER_BYTES
 }
 
-/// Host bytes the disk tier holds on a load with it on: every parked state
-/// and the copy the writer encodes of the one it writes; one array's host
+/// Host bytes the disk tier holds on a load with it on: the one staging
+/// buffer every state record is written and read through; one array's host
 /// copy while the model thread encodes a state; the parker's queue of block
 /// and segment copies (one copy past its bound), the writer's queue behind
 /// it and the copy the writer encodes.
@@ -800,7 +800,7 @@ pub(super) fn disk_staging_bytes(c: &super::config::Config, has_mtp: bool) -> u6
         largest = largest.max(window * draft_hidden_row_bytes(c));
         item = item.max(window * (draft_kv_bytes_per_token(c) + draft_index_bytes_per_token(c)));
     }
-    (super::prefix_disk::PARCELS as u64 + 1) * encoded_state_bytes(c, has_mtp)
+    encoded_state_bytes(c, has_mtp)
         + largest
         + super::prefix_disk::QUEUE_BYTES
         + (mlx_paged_attn::DEFAULT_QUEUE_DEPTH as u64 + 3) * item

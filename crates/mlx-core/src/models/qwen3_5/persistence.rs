@@ -3346,6 +3346,7 @@ async fn load_with_thread_impl(
             }
 
             let model_id = inner.model_id;
+            let state_tier = inner.dflash2_states.tier_handle();
             let config_out = inner.config.clone();
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
             let spatial_merge_size = inner.spatial_merge_size.unwrap_or(2);
@@ -3388,6 +3389,7 @@ async fn load_with_thread_impl(
                     vision_active,
                     context_limits,
                     warmup,
+                    state_tier,
                 ),
             ))
         },
@@ -3408,6 +3410,7 @@ async fn load_with_thread_impl(
         vision_active,
         context_limits,
         warmup,
+        state_tier,
     ) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
@@ -3427,6 +3430,7 @@ async fn load_with_thread_impl(
         spatial_merge_size,
         context_limits,
         model_assets_path,
+        state_tier,
         cache_limit_guards: std::sync::Mutex::new(Some((
             cache_limit_guard,
             pool_cache_limit_guard,

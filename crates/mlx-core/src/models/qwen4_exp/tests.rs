@@ -1491,6 +1491,8 @@ fn flash_next_load_writes_no_derived_weight_pack() {
     write_direct_gguf_fixture(&model);
     let home = temp.0.join("fresh-research-home");
     let assets = home.join("native-gguf");
+    let tmp = temp.0.join("tmp");
+    std::fs::create_dir(&tmp).unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -1501,6 +1503,7 @@ fn flash_next_load_writes_no_derived_weight_pack() {
         .env(MODEL, &model)
         .env(memory::FIXTURE_HOST_ENV, "1")
         .env("HOME", &home)
+        .env("TMPDIR", &tmp)
         .env("MLX_NATIVE_GGUF_CACHE_DIR", &assets)
         .env_remove("MLX_QWEN4_RESIDENCY")
         .output()
