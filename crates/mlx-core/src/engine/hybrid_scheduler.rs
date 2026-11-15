@@ -2480,10 +2480,19 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         Ok(state)
     }
 
-    /// A throwaway scheduler for a load's warm-up. It plans prefill on the
-    /// fixed unit, the one that cuts at pinned ends.
+    /// [`Self::scratch_from`] at the first sequence.
+    #[cfg(test)]
     pub(crate) fn scratch(inner: B) -> Result<Self> {
-        Self::build(inner, true)
+        Self::scratch_from(inner, 1)
+    }
+
+    /// A throwaway scheduler for a load's warm-up whose sequences start at
+    /// `next_seq_id` (an attempt after a refused one continues them). It
+    /// plans prefill on the fixed unit, the one that cuts at pinned ends.
+    pub(crate) fn scratch_from(inner: B, next_seq_id: SeqId) -> Result<Self> {
+        let mut state = Self::build(inner, true)?;
+        state.next_seq_id = next_seq_id.max(1);
+        Ok(state)
     }
 
     /// The model and the next sequence id, for [`Self::resume`].
@@ -3449,10 +3458,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .unwrap_or_else(crate::engine::governor::governor)
     }
 
-    /// A request failed `capacity_exhausted`. A scratch turn is not a
-    /// request: the governor's counters are process-wide.
-    fn count_capacity_exhausted(&self) {
-        if !self.scratch {
+    /// A request failed `capacity_exhausted` for `failure`. A scratch turn
+    /// is not a request: the governor's counters are process-wide, and its
+    /// failure is left for the start's retry.
+    fn count_capacity_exhausted(&self, failure: Option<Failure>) {
+        if self.scratch {
+            crate::engine::governor::governor::start_refused(failure);
+        } else {
             self.memory_governor().capacity_exhausted();
         }
     }
@@ -3489,15 +3501,22 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// yield first when it holds its memory outside the step and yields
     /// before the refused row. Otherwise a step that ran some rows replans
     /// the refused ones at the next step, and a step that ran none waits
-    /// for memory on its way back, or judges the row that yields first.
+    /// for memory on its way back, or judges the row that yields first. A
+    /// settled row, and every row of a scratch scheduler, fails at once.
     fn settle_blocked(
         &mut self,
         blocked: Vec<(SeqId, Denial)>,
         progressed: bool,
         planned: &[SeqId],
     ) -> bool {
+        let (failed, blocked): (Vec<_>, Vec<_>) = blocked
+            .into_iter()
+            .partition(|(_, denial)| denial.settled || self.scratch);
+        for &(seq_id, denial) in &failed {
+            self.fail_refused(seq_id, &denial);
+        }
         if blocked.is_empty() {
-            return true;
+            return failed.is_empty();
         }
         let yielding = self.scheduler.lane_to_yield();
         if let Some(yielding) = yielding
@@ -3541,21 +3560,24 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 };
                 self.yield_lane(yielding, target, denial.failure);
             }
-            Verdict::Fail => {
-                let what = if denial.blocks.is_some() {
-                    "KV target"
-                } else {
-                    "draft state"
-                };
-                let error =
-                    capacity_exhausted(what, denial.failure, &page_shortfall(denial.blocks));
-                self.count_capacity_exhausted();
-                if let Some(turn) = self.scheduler.take_running(victim) {
-                    self.fail_preempted(turn, error);
-                }
-            }
+            Verdict::Fail => self.fail_refused(victim, &denial),
         }
         false
+    }
+
+    /// The running row `seq_id`, refused `denial`, fails
+    /// `capacity_exhausted`.
+    fn fail_refused(&mut self, seq_id: SeqId, denial: &Denial) {
+        let what = if denial.blocks.is_some() {
+            "KV target"
+        } else {
+            "draft state"
+        };
+        let error = capacity_exhausted(what, denial.failure, &page_shortfall(denial.blocks));
+        self.count_capacity_exhausted(denial.failure);
+        if let Some(turn) = self.scheduler.take_running(seq_id) {
+            self.fail_preempted(turn, error);
+        }
     }
 
     /// Splash `refuse`'s wait: every refused lane takes a retry deadline.
@@ -3594,7 +3616,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let governor = self.memory_governor();
         let model = self.inner.memory_model();
         if judge(&denial, self.scheduler.another_resident(seq_id)) == Verdict::Fail {
-            self.count_capacity_exhausted();
+            self.count_capacity_exhausted(denial.failure);
             return Some(Err(Error::from_reason(capacity_exhausted(
                 "KV target",
                 denial.failure,
@@ -3934,6 +3956,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             let denial = allocation.denial;
             let verdict = judge(&denial, self.scheduler.another_resident(seq_id));
             if verdict == Verdict::Fail
+                && !denial.settled
                 && !dropped_lease
                 && self.inner.scheduler_materialized_blocks(seq_id) > 0
             {
@@ -3943,7 +3966,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 }
             }
             if verdict == Verdict::Fail {
-                self.count_capacity_exhausted();
+                self.count_capacity_exhausted(denial.failure);
                 return Admitted::Fail(Error::from_reason(capacity_exhausted(
                     "request state",
                     denial.failure,
@@ -4007,7 +4030,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
         let denial = allocation.denial;
         if judge(&denial, self.scheduler.another_resident(seq_id)) == Verdict::Fail {
-            self.count_capacity_exhausted();
+            self.count_capacity_exhausted(denial.failure);
             return Admitted::Fail(Error::from_reason(capacity_exhausted(
                 "request state",
                 denial.failure,
@@ -4086,7 +4109,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             );
         }
         if judge(&denial, self.scheduler.another_resident(seq_id)) == Verdict::Fail {
-            self.count_capacity_exhausted();
+            self.count_capacity_exhausted(denial.failure);
             return Admitted::Fail(Error::from_reason(capacity_exhausted(
                 "KV target",
                 denial.failure,
@@ -8897,6 +8920,7 @@ pub(crate) mod tests {
                 additional: 3,
                 available: 1,
             }),
+            settled: false,
         }
     }
 
@@ -8994,6 +9018,63 @@ pub(crate) mod tests {
         assert_eq!(state.live_turns(), 0);
     }
 
+    /// A refused scratch row fails its turn in the same pass, also when
+    /// another row ran in the step: nothing is suspended or preempted, and
+    /// its failure is left for the start. The same refusal on a serving
+    /// scheduler is replanned.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refused_scratch_row_fails_its_turn_at_once() {
+        use crate::engine::governor::governor::{START_WARMUP, StartScope, take_start_refusal};
+        let Some((mut state, governor, mut replies)) = judged_state(&[1, 2]) else {
+            return;
+        };
+        state.scratch = true;
+        let start = StartScope::enter();
+        let _ = take_start_refusal();
+        let denial = Denial {
+            settled: true,
+            ..kv_denial(Failure::EngineBudget)
+        };
+        assert!(!state.settle_blocked(vec![(2, denial)], true, &[1, 2]));
+        let error = replies[1]
+            .try_recv()
+            .expect("lane 2 has ended")
+            .expect_err("lane 2 fails");
+        assert!(
+            error.reason.starts_with("capacity_exhausted:"),
+            "{}",
+            error.reason
+        );
+        assert!(replies[0].try_recv().is_err(), "lane 1 runs on");
+        assert_eq!(
+            state
+                .scheduler
+                .running()
+                .iter()
+                .map(|turn| turn.seq_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(state.scheduler.stats().preemptions, 0);
+        assert_eq!(governor.suspensions(7), 0);
+        assert_eq!(
+            take_start_refusal(),
+            Some((Failure::EngineBudget, START_WARMUP))
+        );
+        drop(start);
+
+        let Some((mut state, governor, mut replies)) = judged_state(&[1, 2]) else {
+            return;
+        };
+        let blocked = vec![(2, kv_denial(Failure::EngineBudget))];
+        assert!(!state.settle_blocked(blocked, true, &[1, 2]));
+        assert!(replies[1].try_recv().is_err(), "lane 2 runs on");
+        assert_eq!(state.scheduler.running_len(), 2);
+        assert_eq!(state.scheduler.stats().preemptions, 0);
+        assert_eq!(governor.suspensions(7), 0);
+    }
+
     /// Splash `Engine::prepare`: before a step that ran no row refuses its
     /// lanes, a refusal that is not KV and that nothing returns yields the
     /// lane to yield first when that lane is outside the plan and yields
@@ -9027,6 +9108,7 @@ pub(crate) mod tests {
             failure: Some(Failure::EngineBudget),
             pending: false,
             blocks: None,
+            settled: false,
         };
         let blocked = vec![(1, pending), (3, draft)];
         assert!(!state.settle_blocked(blocked, false, &[1, 3]));

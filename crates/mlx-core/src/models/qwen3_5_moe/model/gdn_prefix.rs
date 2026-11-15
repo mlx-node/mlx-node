@@ -93,7 +93,7 @@ impl Qwen35MoeInner {
     }
 
     pub(super) fn invalidate_moe_paged_session(&mut self, context: &str) {
-        if crate::engine::warmup::warming() {
+        if crate::engine::governor::governor::starting() {
             tracing::debug!(
                 target: "mlx_core::qwen3_5_moe::paged",
                 "invalidating MoE paged session after {context} (load warm-up)",

@@ -4,7 +4,7 @@
 //! left now.
 
 use super::governor::{ClaimRef, Failure, Reservation, Scope};
-use super::ledger::{ClaimSpec, FreeOutcome, Need, VictimSource};
+use super::ledger::{ClaimClass, ClaimSpec, FreeOutcome, Need, VictimSource};
 use crate::transformer::paged_kv_cache_adapter::BlockRefusal;
 
 /// What a refused allocation leaves (Splash `Refusal`).
@@ -121,6 +121,8 @@ pub(crate) struct Denial {
     pub pending: bool,
     /// What a KV reservation lacked.
     pub blocks: Option<BlockRefusal>,
+    /// The claim retries nothing and frees nothing: its request fails.
+    pub settled: bool,
 }
 
 /// Splash `Engine::Verdict`.
@@ -136,6 +138,9 @@ pub(crate) enum Verdict {
 /// refuses when its pressure lifts; only a lane that cannot fit on its own
 /// has hit the capacity.
 pub(crate) fn judge(denial: &Denial, another_resident: bool) -> Verdict {
+    if denial.settled {
+        return Verdict::Fail;
+    }
     if denial.pending {
         return Verdict::Wait;
     }
@@ -180,7 +185,10 @@ pub(crate) struct Allocation<A> {
 
 /// Splash `Engine::allocate`. `claim` is the request's (or one the caller
 /// opened for this allocation alone); `hold_ended` is the request's wait
-/// past its hold's limit, whose claim waits holding nothing.
+/// past its hold's limit, whose claim waits holding nothing. Under a
+/// [`super::governor::StartScope`] the claim is the start's: `Floor` and
+/// one attempt, always both (`take_rights` panics on a `Floor` claim), and
+/// its refusal is settled; only MLX's free pool is emptied for it.
 pub(crate) fn allocate<C: UnitSources, A: Admission>(
     claim: ClaimRef<'_>,
     spec: ClaimSpec,
@@ -191,6 +199,18 @@ pub(crate) fn allocate<C: UnitSources, A: Admission>(
 ) -> Allocation<A> {
     let governor = claim.governor;
     let id = claim.id;
+    let start = super::governor::starting();
+    let (spec, refusal) = if start {
+        (
+            ClaimSpec {
+                cls: ClaimClass::Floor,
+                ..spec
+            },
+            Refusal::SettledOnce,
+        )
+    } else {
+        (spec, refusal)
+    };
     ctx.poll_landings();
     let model = governor.ledger(|ledger| {
         ledger.update(id, spec);
@@ -208,6 +228,19 @@ pub(crate) fn allocate<C: UnitSources, A: Admission>(
         denial: Denial::default(),
         freed: false,
     };
+    // Splash's backend frees a buffer at once; MLX keeps it in its free
+    // pool, still charged. A start claim refused for bytes empties that pool
+    // and runs its one attempt again, or a load fails on memory that is
+    // only cached.
+    if start
+        && matches!(
+            result.admission.failure(),
+            Some(Failure::EngineBudget | Failure::HostPressure | Failure::DriverRejected)
+        )
+        && governor.clear_free_pool()
+    {
+        result.admission = try_once(ctx);
+    }
     // The loop stops at a refusal the ledger cannot help: one that lacks
     // nothing it counts, one the host refuses after exempting the claim,
     // or a need already freed for once in this allocation.
@@ -255,6 +288,7 @@ pub(crate) fn allocate<C: UnitSources, A: Admission>(
     if !granted {
         result.denial.failure = result.admission.failure();
         result.denial.blocks = result.admission.blocks();
+        result.denial.settled = start && result.admission.memory_denied();
         if result.admission.memory_denied() && !result.denial.pending && refusal == Refusal::Waits {
             governor.note_allocation_failed(model);
         }

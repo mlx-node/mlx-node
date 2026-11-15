@@ -33,8 +33,8 @@ const MIB: u64 = 1 << 20;
 /// Splash `MemoryStatusReporter`'s decision log length.
 const DECISIONS_KEPT: usize = 64;
 /// Splash `supervision::kStartRetryWindow` and `kStartupMemoryRecoveryPoll`.
-const START_RETRY_SECONDS: f64 = 30.0;
-const START_POLL_SECONDS: f64 = 1.0;
+pub(crate) const START_RETRY_SECONDS: f64 = 30.0;
+pub(crate) const START_POLL_SECONDS: f64 = 1.0;
 
 /// The counters `charged` is made of: MLX active and free-pool bytes, and
 /// the paged pools registered with the cache-limit coordinator, which sit
@@ -151,6 +151,8 @@ thread_local! {
     /// What refused this thread's latest pool load, and the stage it
     /// reached (Splash `RuntimeBootstrapReport`).
     static START_REFUSAL: Cell<Option<(Failure, u8)>> = const { Cell::new(None) };
+    /// This thread's allocations are the start's (Splash's start claim).
+    static START: Cell<bool> = const { Cell::new(false) };
     static CANCEL: std::cell::RefCell<Option<Arc<AtomicBool>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -176,6 +178,49 @@ impl Drop for CancelScope {
         let previous = self.previous.take();
         CANCEL.with(|cancel| *cancel.borrow_mut() = previous);
     }
+}
+
+/// While one lives, this thread's allocations are the start's: class
+/// `Floor`, one attempt, nothing freed, and a refused one fails its request
+/// (Splash's start claim around its runway, arenas and warm-up). It
+/// restores the value it replaced.
+pub(crate) struct StartScope {
+    previous: bool,
+    _thread: PhantomData<*const ()>,
+}
+
+impl StartScope {
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: START.replace(true),
+            _thread: PhantomData,
+        }
+    }
+}
+
+impl Drop for StartScope {
+    fn drop(&mut self) {
+        START.set(self.previous);
+    }
+}
+
+/// Whether this thread's allocations are the start's.
+pub(crate) fn starting() -> bool {
+    START.get()
+}
+
+/// A turn the start runs failed for `failure`: left for the start's retry.
+pub(crate) fn start_refused(failure: Option<Failure>) {
+    if starting()
+        && let Some(failure) = failure
+    {
+        START_REFUSAL.set(Some((failure, START_WARMUP)));
+    }
+}
+
+/// What failed a turn of the start since the last take.
+pub(crate) fn take_start_refusal() -> Option<(Failure, u8)> {
+    START_REFUSAL.take()
 }
 
 /// The turn this thread runs was cancelled.
@@ -1048,6 +1093,16 @@ impl Governor {
         })
     }
 
+    /// Empties MLX's free pool, which the charge counts although its
+    /// buffers hold no live array. True when it held bytes.
+    pub(crate) fn clear_free_pool(&self) -> bool {
+        if self.io.stats().cache == 0 {
+            return false;
+        }
+        self.io.clear_cache();
+        true
+    }
+
     /// Metal returned no buffer for `bytes` the scope's claim was admitted:
     /// a refusal of the same bytes (Splash `allocationAdmission` catching
     /// `MetalAllocationError`).
@@ -1387,6 +1442,16 @@ impl Governor {
     pub(crate) fn capacity_exhausted(&self) {
         let mut metrics = self.metrics_lock();
         metrics.capacity_exhausted = metrics.capacity_exhausted.saturating_add(1);
+    }
+
+    /// A turn failed `capacity_exhausted` for `failure`. A turn the start
+    /// runs is not a request: its failure is left for the start's retry.
+    pub(crate) fn turn_exhausted(&self, failure: Option<Failure>) {
+        if starting() {
+            start_refused(failure);
+        } else {
+            self.capacity_exhausted();
+        }
     }
 
     pub(crate) fn metrics(&self) -> Metrics {
@@ -1773,6 +1838,7 @@ impl Governor {
 /// The stages a start reaches, in order (Splash `RuntimeResourceStage`).
 const START_REGISTER: u8 = 1;
 const START_RUNWAY: u8 = 2;
+pub(crate) const START_WARMUP: u8 = 3;
 
 /// Splash `StartupRetryWindow`: a start the host or the Metal driver
 /// refused is retried for 30 s from its first refusal, and again from a

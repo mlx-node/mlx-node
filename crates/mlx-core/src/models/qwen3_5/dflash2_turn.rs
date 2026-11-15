@@ -1820,7 +1820,10 @@ fn run_control_pass<T: DFlash2Target>(
     target: &mut T,
     keep: Keep<'_>,
 ) {
-    if model == 0 || crate::engine::warmup::warming() || !governor.control_due(model, forced) {
+    if model == 0
+        || crate::engine::governor::governor::starting()
+        || !governor.control_due(model, forced)
+    {
         return;
     }
     let mut units = ModelUnits { target, keep };
@@ -2890,7 +2893,7 @@ pub(crate) fn claimed<T: DFlash2Target, R>(
         }
         let verdict = judge(&denial, false);
         if verdict == Verdict::Fail {
-            governor.capacity_exhausted();
+            governor.turn_exhausted(denial.failure);
             return Err(Error::from_reason(capacity_exhausted(
                 "KV target",
                 denial.failure,
@@ -3451,7 +3454,7 @@ fn wait_and_resume<T: DFlash2Target>(
         }
         let denial = allocation.denial;
         if judge(&denial, false) == Verdict::Fail {
-            governor.capacity_exhausted();
+            governor.turn_exhausted(denial.failure);
             return Err(Error::from_reason(capacity_exhausted(
                 "KV target",
                 denial.failure,

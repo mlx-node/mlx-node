@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use super::*;
 use crate::engine::cmd::ChatCmd;
-use crate::engine::governor::governor::tests::{G, model};
+use crate::engine::governor::governor::tests::{FakeIo, G, host, model};
+use crate::engine::governor::host::{HOST_MARGIN_BYTES, Pressure};
 use crate::engine::load_progress;
 use crate::engine::types::ChatConfig;
 use crate::model_thread::LoopControl;
@@ -52,11 +53,19 @@ fn content_tokenizer() -> Arc<Qwen3Tokenizer> {
     )
 }
 
+fn registration_on() -> (
+    crate::engine::governor::governor::ModelGuard<'static>,
+    Arc<FakeIo>,
+) {
+    let (io, governor) = crate::engine::hybrid_scheduler::tests::roomy_governor();
+    (
+        governor.register_model(model(16 * G, 0)).expect("register"),
+        io,
+    )
+}
+
 fn registration() -> crate::engine::governor::governor::ModelGuard<'static> {
-    crate::engine::hybrid_scheduler::tests::roomy_governor()
-        .1
-        .register_model(model(16 * G, 0))
-        .expect("register")
+    registration_on().0
 }
 
 fn dense(lanes: usize) -> Qwen35Inner {
@@ -66,6 +75,14 @@ fn dense(lanes: usize) -> Qwen35Inner {
     inner.mtp_weights_loaded = true;
     inner.grant_scheduled_lanes(lanes);
     inner
+}
+
+/// [`dense`] on a governor whose host, counters and clock the test sets.
+fn dense_on(lanes: usize) -> (Qwen35Inner, Arc<FakeIo>) {
+    let mut inner = dense(lanes);
+    let (registration, io) = registration_on();
+    inner.memory_registration = Some(registration);
+    (inner, io)
 }
 
 fn moe(lanes: usize) -> Qwen35MoeInner {
@@ -1345,4 +1362,300 @@ fn a_warmed_real_geometry_dense_load_creates_no_pipeline_in_serving() {
         4096,
         true,
     );
+}
+
+/// The warm-up's claims are the start's: under a macOS warning, and with
+/// the host below its margin, it skips nothing.
+#[test]
+fn a_warm_up_under_a_macos_warning_skips_nothing() {
+    const NAME: &str = "engine::warmup::tests::a_warm_up_under_a_macos_warning_skips_nothing";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    for sample in [
+        host(32 * G, Pressure::Warning),
+        host(HOST_MARGIN_BYTES / 2, Pressure::Normal),
+    ] {
+        let (inner, io) = dense_on(4);
+        io.with(|state| state.host = sample);
+        let warmed = warm(inner);
+        assert_eq!(
+            warmed.report.skipped, 0,
+            "{sample:?}: {:?}",
+            warmed.trace.skipped
+        );
+    }
+}
+
+/// A scratch claim the engine limit refuses frees nothing for itself: the
+/// prefix and states a served turn left stay, no pool extent is released,
+/// and the turn fails `capacity_exhausted` in its first pass.
+#[test]
+fn a_refused_scratch_claim_frees_nothing() {
+    const NAME: &str = "engine::warmup::tests::a_refused_scratch_claim_frees_nothing";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    let (inner, io) = dense_on(4);
+    let mut state = HybridSchedulerState::new(inner).expect("scheduler");
+    serve(&mut state, vec![turn("cached", 40, None)]);
+    let (inner, next_seq_id) = state.into_parts();
+    let (governor, _) = governor_of(&inner);
+    let cached = Snapshot::take(&inner);
+    assert!(
+        cached.retained_states > 0 && cached.store.is_some_and(|store| store[0] > 0),
+        "{cached:?}"
+    );
+    let releases = governor.pool_releases();
+    let denied = governor.snapshot().denied_reservations;
+    io.with(|state| state.stats.active = 16 * G);
+    let _start = StartScope::enter();
+    let mut scratch = HybridSchedulerState::scratch_from(inner, next_seq_id).expect("scratch");
+    let mut refused = scratch
+        .admit_scratch(ScratchRequest {
+            tokens: (1..=40).collect(),
+            breaks: Vec::new(),
+            mtp_depth: None,
+            owner_id: "refused".to_string(),
+            cache_salt: "refused".to_string(),
+        })
+        .expect("admit");
+    let (sender, mut idle) = tokio::sync::mpsc::unbounded_channel::<
+        ModelCommand<<Qwen35Inner as HybridSchedulerBackend>::FamilyCommand>,
+    >();
+    drop(sender);
+    scratch.drive(&mut idle);
+    let error = refused
+        .reply
+        .try_recv()
+        .expect("the turn has ended")
+        .expect_err("the turn fails");
+    assert!(
+        error.reason.starts_with("capacity_exhausted:"),
+        "{}",
+        error.reason
+    );
+    assert!(governor.snapshot().denied_reservations > denied);
+    assert_eq!(governor.pool_releases(), releases);
+    let (inner, _) = scratch.into_parts();
+    let after = Snapshot::take(&inner);
+    assert_eq!(after.allocated_blocks, cached.allocated_blocks);
+    assert_eq!(after.evictable_blocks, cached.evictable_blocks);
+    assert_eq!(after.retained_states, cached.retained_states);
+    assert_eq!(after.store, cached.store);
+}
+
+/// A host refusal of a required step runs the warm-up again: macOS is
+/// critical for the first 5 seconds, then the load warms up with nothing
+/// skipped, the model and its books as before, and sequences past the
+/// first attempt's.
+#[test]
+fn a_host_refusal_of_a_required_step_is_retried() {
+    const NAME: &str = "engine::warmup::tests::a_host_refusal_of_a_required_step_is_retried";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    let (inner, io) = dense_on(4);
+    let (governor, model) = governor_of(&inner);
+    let before = Snapshot::take(&inner);
+    let books = governor.model_books(model);
+    io.with(|state| {
+        state.host = host(32 * G, Pressure::Critical);
+        state.on_sleep = Some(Box::new(|state| {
+            if state.now >= 5.0 {
+                state.host = host(32 * G, Pressure::Normal);
+            }
+        }));
+    });
+    let warmed = warm(inner);
+    assert_eq!(io.with(|state| state.sleeps), 5);
+    assert_eq!(warmed.report.skipped, 0, "{:?}", warmed.trace.skipped);
+    assert_eq!(Snapshot::take(&warmed.inner), before);
+    assert_eq!(governor.model_books(model), books);
+    assert!(
+        warmed.trace.seq_ids.iter().all(|&seq_id| seq_id > 1),
+        "{:?}",
+        warmed.trace.seq_ids
+    );
+    assert!(warmed.next_seq_id > 2);
+}
+
+/// A required step the host refuses for the whole window fails the load 30
+/// seconds after its first refusal, naming the step and the cause, with no
+/// claim left open.
+#[test]
+fn a_required_step_refused_for_the_window_fails_the_load() {
+    const NAME: &str =
+        "engine::warmup::tests::a_required_step_refused_for_the_window_fails_the_load";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    let (inner, io) = dense_on(4);
+    let (governor, model) = governor_of(&inner);
+    let open = governor.model_books(model).open_claims;
+    io.with(|state| state.host = host(32 * G, Pressure::Critical));
+    match run_with(inner, &LoadProgressCell::default(), SLICE) {
+        Ok(warmed) => panic!("the warm-up succeeded: {:?}", warmed.report),
+        Err(error) => assert_eq!(
+            error.reason,
+            "memory plan: the load's warm-up (MaxPrefill) could not be allocated: host memory \
+             reserve protected"
+        ),
+    }
+    assert_eq!(io.with(|state| (state.sleeps, state.now)), (30, 30.0));
+    assert_eq!(governor.model_books(model).open_claims, open);
+}
+
+/// A required step the engine limit refuses fails the load at once: no
+/// wait, and no request counted `capacity_exhausted`.
+#[test]
+fn an_engine_budget_refusal_fails_at_once() {
+    const NAME: &str = "engine::warmup::tests::an_engine_budget_refusal_fails_at_once";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    let (inner, io) = dense_on(4);
+    let (governor, _) = governor_of(&inner);
+    io.with(|state| state.stats.active = 16 * G);
+    match run_with(inner, &LoadProgressCell::default(), SLICE) {
+        Ok(warmed) => panic!("the warm-up succeeded: {:?}", warmed.report),
+        Err(error) => assert_eq!(
+            error.reason,
+            "memory plan: the load's warm-up (MaxPrefill) could not be allocated: engine memory \
+             budget exceeded"
+        ),
+    }
+    assert_eq!(io.with(|state| (state.sleeps, state.now)), (0, 0.0));
+    assert_eq!(governor.metrics().capacity_exhausted, 0);
+}
+
+/// A refused optional step is skipped and the steps after it run: macOS is
+/// critical for `Widen(3)` alone; the widths it leaves no lanes for are
+/// skipped as before, and `Narrow(1)` runs.
+#[test]
+fn a_refused_optional_step_is_skipped() {
+    const NAME: &str = "engine::warmup::tests::a_refused_optional_step_is_skipped";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    let (inner, io) = dense_on(4);
+    let hook_io = Arc::clone(&io);
+    BEFORE_STEP.set(Some(Box::new(move |step| {
+        let pressure = if step == Step::Widen(3) {
+            Pressure::Critical
+        } else {
+            Pressure::Normal
+        };
+        hook_io.with(|state| state.host = host(32 * G, pressure));
+    })));
+    let warmed = warm(inner);
+    BEFORE_STEP.set(None);
+    assert_eq!(
+        warmed.trace.skipped,
+        [
+            Step::Widen(3),
+            Step::Widen(4),
+            Step::Narrow(3),
+            Step::Narrow(2)
+        ]
+    );
+    assert_eq!(io.with(|state| state.sleeps), 0);
+}
+
+/// MLX's free pool full past the engine limit as `Class(1)` begins (another
+/// model's cached buffers count too): the start claim empties the pool, the
+/// load warms up with nothing skipped and no wait.
+#[test]
+fn cached_memory_does_not_fail_a_required_step() {
+    const NAME: &str = "engine::warmup::tests::cached_memory_does_not_fail_a_required_step";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    let (inner, io) = dense_on(4);
+    let hook_io = Arc::clone(&io);
+    BEFORE_STEP.set(Some(Box::new(move |step| {
+        if step == Step::Class(1) {
+            hook_io.with(|state| state.stats.cache = 16 * G);
+        }
+    })));
+    let warmed = run_with(inner, &LoadProgressCell::default(), SLICE);
+    BEFORE_STEP.set(None);
+    let warmed = warmed.unwrap_or_else(|error| panic!("warm-up failed: {}", error.reason));
+    assert_eq!(warmed.report.skipped, 0, "{:?}", warmed.trace.skipped);
+    assert_eq!(io.with(|state| (state.stats.cache, state.sleeps)), (0, 0));
+}
+
+/// A host refusal of each required step after `MaxPrefill` runs the warm-up
+/// again: macOS is critical at that step until the first wait. The first
+/// attempt's first turn ends by length, so its cache reset is reported.
+#[test]
+fn a_host_refusal_of_a_later_required_step_is_retried() {
+    const NAME: &str = "engine::warmup::tests::a_host_refusal_of_a_later_required_step_is_retried";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    for refused in [
+        Step::Class(1),
+        Step::Narrow(1),
+        Step::Speculative {
+            width: 1,
+            drafts: LONG_DRAFTS,
+        },
+    ] {
+        let (inner, io) = dense_on(4);
+        let (governor, model) = governor_of(&inner);
+        let before = Snapshot::take(&inner);
+        let books = governor.model_books(model);
+        let waited = Arc::new(AtomicBool::new(false));
+        let hook_io = Arc::clone(&io);
+        let hook_waited = Arc::clone(&waited);
+        BEFORE_STEP.set(Some(Box::new(move |step| {
+            let pressure = if step == refused && !hook_waited.load(Ordering::Relaxed) {
+                Pressure::Critical
+            } else {
+                Pressure::Normal
+            };
+            hook_io.with(|state| state.host = host(32 * G, pressure));
+        })));
+        let sleep_waited = Arc::clone(&waited);
+        io.with(|state| {
+            state.on_sleep = Some(Box::new(move |_| {
+                sleep_waited.store(true, Ordering::Relaxed);
+            }));
+        });
+        FINISH_NEXT_TURN.set(true);
+        let warmed = run_with(inner, &LoadProgressCell::default(), SLICE);
+        BEFORE_STEP.set(None);
+        let warmed =
+            warmed.unwrap_or_else(|error| panic!("{refused:?}: warm-up failed: {}", error.reason));
+        assert!(!FINISH_NEXT_TURN.get(), "{refused:?}");
+        assert_eq!(io.with(|state| state.sleeps), 1, "{refused:?}");
+        assert_eq!(
+            warmed.report.skipped, 0,
+            "{refused:?}: {:?}",
+            warmed.trace.skipped
+        );
+        assert_eq!(
+            warmed.report.reset, 1,
+            "{refused:?}: the first attempt's reset"
+        );
+        assert_eq!(Snapshot::take(&warmed.inner), before, "{refused:?}");
+        assert_eq!(governor.model_books(model), books, "{refused:?}");
+    }
 }

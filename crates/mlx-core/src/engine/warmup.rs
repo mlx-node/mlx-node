@@ -5,9 +5,11 @@
 //! by its cancel. The pool keeps its size, the SSD state tier and the
 //! states it took back are set aside, no scratch turn (nor its replay after
 //! a preemption) reuses or publishes a cache entry, the model's state must
-//! read as it did before, and the model's governor books are put back; a
-//! memory limit skips a step, a claim left open or any other error fails the
-//! load. A load that serves no chat turn runs none.
+//! read as it did before, and the model's governor books are put back. Its
+//! claims are the start's (`Floor`, one attempt, nothing freed): a refused
+//! optional step is skipped; a refused required step fails the load, after
+//! the start's retry for a host or driver refusal; a claim left open or any
+//! other error fails the load. A load that serves no chat turn runs none.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -17,7 +19,10 @@ use napi::bindgen_prelude::{Error, Result};
 use napi_derive::napi;
 
 use crate::engine::backend::ResetScope;
-use crate::engine::governor::governor::ModelBooks;
+use crate::engine::governor::governor::{
+    Failure, ModelBooks, START_POLL_SECONDS, START_WARMUP, StartScope, StartupRetryWindow,
+    take_start_refusal,
+};
 use crate::engine::hybrid_scheduler::{
     HybridSchedulerBackend, HybridSchedulerState, ScratchRequest, ScratchStep,
     scheduler_max_num_seqs_for,
@@ -62,6 +67,9 @@ thread_local! {
     /// The model's next control pass time, read after the steps.
     pub(crate) static CONTROL_AFTER_STEPS: std::cell::Cell<Option<f64>> =
         const { std::cell::Cell::new(None) };
+    /// Runs as each step begins, with the step.
+    pub(crate) static BEFORE_STEP: std::cell::RefCell<Option<Box<dyn FnMut(Step)>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn oversize_max_prefill() -> bool {
@@ -72,31 +80,6 @@ fn oversize_max_prefill() -> bool {
     #[cfg(not(test))]
     {
         false
-    }
-}
-
-thread_local! {
-    static WARMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Whether this thread runs a load's warm-up: what its scratch turns'
-/// cancels tear down is expected, not worth a warning.
-pub(crate) fn warming() -> bool {
-    WARMING.get()
-}
-
-struct WarmingScope;
-
-impl WarmingScope {
-    fn enter() -> Self {
-        WARMING.set(true);
-        Self
-    }
-}
-
-impl Drop for WarmingScope {
-    fn drop(&mut self) {
-        WARMING.set(false);
     }
 }
 
@@ -116,15 +99,18 @@ pub struct WarmupReport {
     /// Wall time of the warm-up.
     pub ms: f64,
     pub steps: u32,
-    /// Steps not run, or run smaller than planned.
+    /// Steps not run, or run smaller than planned, by the attempt that
+    /// warmed the model (a retry runs a refused attempt's steps again).
     pub skipped: u32,
-    /// 1 when a cache reset made the model's state read as before.
+    /// 1 when a cache reset, in any attempt, made the model's state read as
+    /// before.
     pub reset: u32,
     /// Pipelines and source libraries created during the warm-up.
     pub pipelines: u32,
     /// Time inside those creations.
     pub compile_ms: f64,
-    /// The process allocator's peak, read after the warm-up.
+    /// The process allocator's peak over every attempt, read after the
+    /// warm-up.
     pub peak_bytes: f64,
 }
 
@@ -144,6 +130,24 @@ pub(crate) enum Step {
     Class(u32),
     /// Two verify cycles of `width` speculative rows at `drafts` drafts.
     Speculative { width: u32, drafts: u32 },
+}
+
+impl Step {
+    /// A step the serving model needs (Splash's required warm-up): the
+    /// largest prefill, each row class and width 1. A refusal of its claim
+    /// fails the load; any other step's is skipped.
+    pub(crate) fn required(self) -> bool {
+        matches!(
+            self,
+            Step::MaxPrefill
+                | Step::Class(_)
+                | Step::Narrow(1)
+                | Step::Speculative {
+                    width: 1,
+                    drafts: LONG_DRAFTS,
+                }
+        )
+    }
 }
 
 /// The steps of one load's warm-up.
@@ -409,7 +413,9 @@ fn left_changed(when: &str, rows: &[&str]) -> Error {
     ))
 }
 
-/// A memory limit skips; anything else fails the load.
+/// A memory limit ends the turn: its step is skipped, or fails the load
+/// when it is required and a claim was refused; anything else fails the
+/// load.
 fn memory_limited(error: &Error) -> bool {
     error.reason.starts_with("capacity_exhausted:")
         || error.reason.starts_with("context_length_exceeded:")
@@ -453,15 +459,95 @@ pub(crate) fn run<B: HybridSchedulerBackend>(
     run_with(inner, progress, PREFILL_CHUNK_ROWS)
 }
 
+/// What one attempt of the warm-up ended with.
+enum Attempt<B> {
+    Warmed(Warmed<B>),
+    /// A claim of a required step was refused: the model reads as loaded
+    /// and its sequences continue from `next_seq_id`.
+    Refused {
+        inner: B,
+        next_seq_id: SeqId,
+        step: Step,
+        failure: Failure,
+        reset: u32,
+    },
+}
+
+/// The warm-up under the start's claims. A refused required step runs the
+/// warm-up again after a poll while the start's window retries its
+/// failure (the host or the Metal driver, 30 s); otherwise it fails the
+/// load.
 pub(crate) fn run_with<B: HybridSchedulerBackend>(
     mut inner: B,
     progress: &LoadProgressCell,
     slice_rows: u32,
 ) -> Result<Warmed<B>> {
     let started = Instant::now();
-    let _warming = WarmingScope::enter();
+    let _start = StartScope::enter();
     let _loading = crate::engine::pipeline_counter::loading_scope();
     let pipelines_before = crate::engine::pipeline_counter::read();
+    let mut window = StartupRetryWindow::default();
+    let mut next_seq_id: SeqId = 1;
+    let mut reset = 0;
+    loop {
+        match attempt(inner, progress, slice_rows, next_seq_id)? {
+            Attempt::Warmed(mut warmed) => {
+                warmed.report.reset = warmed.report.reset.max(reset);
+                let pipelines_after = crate::engine::pipeline_counter::read();
+                let (pipelines, compile_ms) = match (&pipelines_before, &pipelines_after) {
+                    (Some(before), Some(after)) => (
+                        after.created_loading.saturating_sub(before.created_loading),
+                        (after.loading_ms - before.loading_ms).max(0.0),
+                    ),
+                    _ => (0, 0.0),
+                };
+                if pipelines_before.is_some()
+                    && let Some(after) = &pipelines_after
+                {
+                    crate::engine::pipeline_counter::check_first_warmup(
+                        !warmed.trace.seq_ids.is_empty(),
+                        after.created_loading.saturating_add(after.created_serving),
+                    );
+                }
+                warmed.report.pipelines = pipelines;
+                warmed.report.compile_ms = compile_ms;
+                warmed.report.ms = started.elapsed().as_secs_f64() * 1000.0;
+                return Ok(warmed);
+            }
+            Attempt::Refused {
+                inner: back,
+                next_seq_id: next,
+                step,
+                failure,
+                reset: refused_reset,
+            } => {
+                reset = reset.max(refused_reset);
+                let text = format!(
+                    "memory plan: the load's warm-up ({step:?}) could not be allocated: {}",
+                    Failure::name(Some(failure))
+                );
+                let Some(governor) = back.memory_governor() else {
+                    return Err(Error::from_reason(text));
+                };
+                if !window.retry(Some((failure, START_WARMUP)), governor.now(), &text) {
+                    return Err(Error::from_reason(text));
+                }
+                governor.sleep(START_POLL_SECONDS);
+                inner = back;
+                next_seq_id = next;
+            }
+        }
+    }
+}
+
+/// One run of the plan on a scratch scheduler whose sequences start at
+/// `next_seq_id`, then the checks that the model reads as loaded.
+fn attempt<B: HybridSchedulerBackend>(
+    mut inner: B,
+    progress: &LoadProgressCell,
+    slice_rows: u32,
+    next_seq_id: SeqId,
+) -> Result<Attempt<B>> {
     let plan = WarmupPlan::for_backend(&inner, slice_rows);
     progress.begin_kernels(plan.steps.len() as u32);
     let attached = Snapshot::take(&inner);
@@ -475,7 +561,7 @@ pub(crate) fn run_with<B: HybridSchedulerBackend>(
     let (sender, idle) = tokio::sync::mpsc::unbounded_channel::<ModelCommand<B::FamilyCommand>>();
     drop(sender);
     let mut run = Run {
-        scratch: HybridSchedulerState::scratch(inner)?,
+        scratch: HybridSchedulerState::scratch_from(inner, next_seq_id)?,
         idle,
         live: Vec::new(),
         progress,
@@ -486,6 +572,8 @@ pub(crate) fn run_with<B: HybridSchedulerBackend>(
         turns: 0,
         finalized: false,
         limited: false,
+        failure: None,
+        refused: None,
         trace: WarmupTrace::default(),
     };
     #[cfg(test)]
@@ -500,7 +588,7 @@ pub(crate) fn run_with<B: HybridSchedulerBackend>(
     #[cfg(test)]
     run.after_steps_hooks();
     let preempted = run.scratch.preemptions() > 0;
-    let (finalized, trace) = (run.finalized, std::mem::take(&mut run.trace));
+    let (finalized, refused, trace) = (run.finalized, run.refused, std::mem::take(&mut run.trace));
     let (mut inner, next_seq_id) = run.scratch.into_parts();
     if let Some(adapter) = inner.paged_adapter_mut() {
         adapter.set_growth_hold(false);
@@ -529,36 +617,29 @@ pub(crate) fn run_with<B: HybridSchedulerBackend>(
         return Err(Error::from_reason("load warm-up left a memory claim open"));
     }
     put_back_books(&inner, &attached.books, &after.books);
-    let pipelines_after = crate::engine::pipeline_counter::read();
-    let (pipelines, compile_ms) = match (&pipelines_before, &pipelines_after) {
-        (Some(before), Some(after)) => (
-            after.created_loading.saturating_sub(before.created_loading),
-            (after.loading_ms - before.loading_ms).max(0.0),
-        ),
-        _ => (0, 0.0),
-    };
-    if pipelines_before.is_some()
-        && let Some(after) = &pipelines_after
-    {
-        crate::engine::pipeline_counter::check_first_warmup(
-            !trace.seq_ids.is_empty(),
-            after.created_loading.saturating_add(after.created_serving),
-        );
+    if let Some((step, failure)) = refused {
+        return Ok(Attempt::Refused {
+            inner,
+            next_seq_id,
+            step,
+            failure,
+            reset,
+        });
     }
-    Ok(Warmed {
+    Ok(Attempt::Warmed(Warmed {
         inner,
         next_seq_id,
         report: WarmupReport {
-            ms: started.elapsed().as_secs_f64() * 1000.0,
+            ms: 0.0,
             steps: plan.steps.len() as u32,
             skipped: trace.skipped.len() as u32,
             reset,
-            pipelines,
-            compile_ms,
+            pipelines: 0,
+            compile_ms: 0.0,
             peak_bytes,
         },
         trace,
-    })
+    }))
 }
 
 struct Live {
@@ -581,6 +662,10 @@ struct Run<'a, B: HybridSchedulerBackend> {
     finalized: bool,
     /// A scratch turn met a memory limit since the last step began.
     limited: bool,
+    /// What failed a turn of the step in hand.
+    failure: Option<Failure>,
+    /// The first required step a claim refused.
+    refused: Option<(Step, Failure)>,
     trace: WarmupTrace,
 }
 
@@ -616,6 +701,9 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
     fn all_steps(&mut self) -> Result<()> {
         let reached = self.max_prefill()?;
         self.done();
+        if self.refused.is_some() {
+            return self.cancel_all();
+        }
         if reached {
             self.restore_copy()?;
         } else {
@@ -641,10 +729,16 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
                 self.skip(Step::Narrow(width));
             }
             self.done();
+            if self.refused.is_some() {
+                return self.cancel_all();
+            }
         }
         self.cancel_all()?;
         self.classes()?;
         self.cancel_all()?;
+        if self.refused.is_some() {
+            return Ok(());
+        }
         let speculative: Vec<(u32, u32)> = self
             .plan
             .steps
@@ -666,6 +760,9 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
                 self.skip(Step::Speculative { width, drafts });
             }
             self.done();
+            if self.refused.is_some() {
+                return self.cancel_all();
+            }
         }
         self.cancel_all()
     }
@@ -674,7 +771,31 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
         self.progress.step_done();
     }
 
+    /// A step begins: no turn of it has met a memory limit yet.
+    fn begin(&mut self, _step: Step) {
+        #[cfg(test)]
+        BEFORE_STEP.with_borrow_mut(|hook| {
+            if let Some(hook) = hook {
+                hook(_step);
+            }
+        });
+        self.limited = false;
+        self.failure = None;
+        take_start_refusal();
+    }
+
+    /// What refused a turn of `step` fails the load when `step` is
+    /// required.
+    fn record_refusal(&mut self, step: Step) {
+        if let Some(failure) = self.failure.take()
+            && step.required()
+        {
+            self.refused.get_or_insert((step, failure));
+        }
+    }
+
     fn skip(&mut self, step: Step) {
+        self.record_refusal(step);
         self.trace.skipped.push(step);
     }
 
@@ -693,6 +814,7 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
     /// Step A: whether it ran. A pool too small for its rows runs it on the
     /// rows that fit, counted skipped.
     fn max_prefill(&mut self) -> Result<bool> {
+        self.begin(Step::MaxPrefill);
         let growth = (2 * self.plan.lanes).div_ceil(self.block_size);
         let free = self.free_blocks();
         let mut rows = self.plan.slice_rows;
@@ -709,8 +831,12 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
             Some(seq_id) => self.run_until(|step| step.decode == [seq_id])?,
             None => false,
         };
-        if !reached && !counted {
-            self.skip(Step::MaxPrefill);
+        if !reached {
+            if counted {
+                self.record_refusal(Step::MaxPrefill);
+            } else {
+                self.skip(Step::MaxPrefill);
+            }
         }
         Ok(reached)
     }
@@ -731,6 +857,7 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
     /// Step W at `width`: one more 1-row lane, two decode steps of `width`
     /// rows.
     fn widen(&mut self, width: u32) -> Result<bool> {
+        self.begin(Step::Widen(width));
         if self.live.len() as u32 + 1 != width || self.blocks(1) > self.free_blocks() {
             self.skip(Step::Widen(width));
             return Ok(false);
@@ -749,6 +876,7 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
     /// Step N at `width`: the oldest lanes cancelled until `width` decode;
     /// with none left, one 1-row lane.
     fn narrow(&mut self, width: u32) -> Result<bool> {
+        self.begin(Step::Narrow(width));
         while self.live.len() as u32 > width {
             self.cancel_oldest()?;
         }
@@ -770,7 +898,8 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
     fn classes(&mut self) -> Result<()> {
         let mut pending: std::collections::VecDeque<u32> = self.plan.classes().into();
         let mut limited = false;
-        while !pending.is_empty() {
+        while let Some(&first) = pending.front() {
+            self.begin(Step::Class(first));
             let fit = self.free_blocks().saturating_sub(1) * self.block_size;
             let limit = self.plan.slice_rows.min(fit);
             let mut turn = Vec::new();
@@ -810,6 +939,9 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
             }
             limited = ran < turn.len();
             self.cancel_all()?;
+            if self.refused.is_some() {
+                return Ok(());
+            }
         }
         Ok(())
     }
@@ -839,6 +971,7 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
     /// Step E: one more speculative 1-row lane at `drafts` drafts, two
     /// verify cycles of `width` rows.
     fn speculative(&mut self, width: u32, drafts: u32) -> Result<bool> {
+        self.begin(Step::Speculative { width, drafts });
         let rows = 1 + GOAL_STEPS as u32 * (drafts + 1) + 1;
         if self.live.len() as u32 + 1 != width || self.blocks(rows) + 1 > self.free_blocks() {
             return Ok(false);
@@ -941,7 +1074,12 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
                 Ok(Err(error))
                     if live.cancel.load(Ordering::Relaxed)
                         && error.reason == CHAT_SESSION_CANCELLED => {}
-                Ok(Err(error)) if memory_limited(&error) => self.limited = true,
+                Ok(Err(error)) if memory_limited(&error) => {
+                    self.limited = true;
+                    self.failure = self
+                        .failure
+                        .or(take_start_refusal().map(|(failure, _)| failure));
+                }
                 Ok(Err(error)) => return Err(error),
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                     return Err(Error::from_reason(format!(

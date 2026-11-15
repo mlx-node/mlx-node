@@ -9,6 +9,7 @@ fn refused(failure: Failure) -> Denial {
         failure: Some(failure),
         pending: false,
         blocks: None,
+        settled: false,
     }
 }
 
@@ -109,6 +110,7 @@ fn resource_deadline_restarts_only_for_earlier_lanes() {
             failure: Some(Failure::EngineBudget),
             pending: true,
             blocks: None,
+            settled: false,
         },
         0,
     );
@@ -204,6 +206,7 @@ fn hold_ends_30s_after_first_pending() {
         failure: Some(Failure::EngineBudget),
         pending: true,
         blocks: None,
+        settled: false,
     };
     let t0 = 10.0;
     let mut wait = ResourceWait::default();
