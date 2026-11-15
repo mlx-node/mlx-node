@@ -74,7 +74,14 @@ export {
   mlxNodeHome,
 } from './paths.js';
 export { createRpcClient, type RpcClient, type RpcClientOptions } from './rpc/client.js';
-export { serveRuntimeOverPort, type RpcRuntime } from './rpc/host.js';
+export {
+  createOpenCalls,
+  serveRuntimeOverPort,
+  type OpenCall,
+  type OpenCalls,
+  type RpcRuntime,
+  type ServeOptions,
+} from './rpc/host.js';
 export {
   bindEventEmitterPort,
   bindEventTargetPort,

@@ -404,13 +404,13 @@ describe('dashboard runtime — worker death', () => {
       expect(res.ok).toBe(false);
       expect(res.ok ? '' : res.code).toBe('E_UNAVAILABLE');
 
-      // And a call issued after the death fails fast rather than queueing onto a
-      // thread that will never read it.
+      // A call issued after the death goes to the replacement worker (this
+      // fixture dies again) and settles typed rather than hanging.
       const after = await withDeadline(crashed.call({ method: 'GET', path: '/api/models' }), 10_000);
       expect(after).not.toBe('HUNG');
       expect((after as Exclude<typeof after, 'HUNG'>).status).toBe(503);
 
-      expect(order).toContain('worker-down');
+      expect(order).toContain('worker-restarted');
       // A transport-thread route is untouched by the worker's death.
       const downloads = await crashed.call({ method: 'GET', path: '/api/downloads' });
       expect(downloads.status).toBe(200);
@@ -507,11 +507,11 @@ describe('dashboard runtime — worker death', () => {
 
       // No cancellation acknowledgement and no real response means the worker
       // cannot remain alive after the caller is failed: it could otherwise
-      // execute the queued mutation later.
-      const down = lifecycle.find((event) => event.type === 'worker-down');
-      expect(down).toMatchObject({ type: 'worker-down' });
-      expect(down?.type === 'worker-down' ? down.reason : '').toContain('cancellation outcome');
-      expect(down?.type === 'worker-down' ? down.reason : '').toContain('remained unknown');
+      // execute the queued mutation later. It is replaced, not left down.
+      expect(lifecycle.find((event) => event.type === 'worker-restarted')).toMatchObject({
+        type: 'worker-restarted',
+        reason: 'no-ack',
+      });
       expect(await withDeadline(client.call({ method: 'GET', path: '/api/models' }), 5_000)).not.toBe('HUNG');
     } finally {
       expect(await withDeadline(client.close(), 10_000)).not.toBe('HUNG');
@@ -692,10 +692,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
     // expires before the fresh worker can finish its boot ingest and reach the
     // queued DELETE. This is the renderer's shorter deadline racing the worker's
     // independent 60 s deadline — the production defect, end to end.
-    const renderer = createRpcClient(bindEventTargetPort(port1), {
-      timeoutMs: 0,
-      onUnresponsive: () => port2.close(),
-    });
+    const renderer = createRpcClient(bindEventTargetPort(port1), { timeoutMs: 0 });
 
     try {
       const res = await withDeadline(renderer.call({ method: 'DELETE', path: '/api/models/rt-2' }), 10_000);

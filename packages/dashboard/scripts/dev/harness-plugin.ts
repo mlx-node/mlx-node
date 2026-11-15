@@ -12,9 +12,11 @@ import type { Plugin } from 'vite-plus';
 
 import { failure } from '../../src/api/errors.js';
 import type { AllowedRoot } from '../../src/chat/agent/roots.js';
+import { readWorkIndexSync, workIds } from '../../src/chat/index-file.js';
 import { MemorySecretStore } from '../../src/chat/providers/secrets.js';
 import { PROVIDER_IDS } from '../../src/chat/providers/settings.js';
 import type { ProviderId } from '../../src/chat/providers/types.js';
+import type { AppEnd } from '../../src/chat/types.js';
 import { isLoopbackHttpOrigin } from '../../src/chat/web/http.js';
 import { type RpcRuntime, serveRuntimeOverPort } from '../../src/rpc/host.js';
 import type { RpcPort, RpcPortEvents } from '../../src/rpc/port.js';
@@ -257,6 +259,33 @@ export function harnessChatOptions(
       return Promise.resolve(entry === undefined ? null : Math.round(entry.gb * 1024 ** 3));
     },
   };
+}
+
+/**
+ * `MLX_DEV_APP_END=no-ping|crash|signal|user`: one earlier Control Panel end, as MAIN's ledger would hand it to the next
+ * panel, ending at `at` and listing every Work conversation of the fixture home. The last unfinished turn of each then
+ * shows the line of that end. Anything else: no end.
+ */
+export function harnessAppEnds(kind: string | undefined, home: string, at: number): AppEnd[] {
+  const trigger = kind === 'no-ping' || kind === 'crash' || kind === 'signal' || kind === 'user' ? kind : null;
+  if (trigger === null) return [];
+  let ids: string[] = [];
+  try {
+    ids = [...workIds(readWorkIndexSync(join(home, 'chat', 'conversations.json')))].slice(0, 8);
+  } catch {
+    ids = [];
+  }
+  return [
+    {
+      trigger,
+      decidedAt: at - (trigger === 'no-ping' ? 2_000 : 12_000),
+      exitAt: at,
+      silentMs: trigger === 'no-ping' ? 120_000 : null,
+      code: trigger === 'crash' ? 1 : 0,
+      convs: ids,
+      cancelled: ids,
+    },
+  ];
 }
 
 /**

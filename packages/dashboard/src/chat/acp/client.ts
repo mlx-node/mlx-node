@@ -146,9 +146,14 @@ export class AcpClient {
   }
 
   request(method: string, params: unknown, timeoutMs: number | null): Promise<unknown> {
-    if (this.closed) return Promise.reject(new AcpClosedError());
+    return this.start(method, params, timeoutMs).reply;
+  }
+
+  /** {@link request} with the request's id, for {@link isPending}. */
+  start(method: string, params: unknown, timeoutMs: number | null): { id: number; reply: Promise<unknown> } {
     const id = this.nextId++;
-    return new Promise<unknown>((resolve, reject) => {
+    if (this.closed) return { id, reply: Promise.reject(new AcpClosedError()) };
+    const reply = new Promise<unknown>((resolve, reject) => {
       const entry: Pending = { method, resolve, reject, timer: null };
       if (timeoutMs !== null) {
         entry.timer = setTimeout(() => {
@@ -166,6 +171,12 @@ export class AcpClient {
         reject(error instanceof Error ? error : new AcpClosedError());
       }
     });
+    return { id, reply };
+  }
+
+  /** Whether request `id` has no reply yet. False from the line that carries its reply on, before any promise job. */
+  isPending(id: number): boolean {
+    return this.pending.has(id);
   }
 
   notify(method: string, params: unknown): void {

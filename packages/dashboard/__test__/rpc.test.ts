@@ -124,7 +124,7 @@ function stubRuntime(answer?: (call: ApiCall, signal?: AbortSignal) => ApiRespon
 /** A live client/host pair over a real MessageChannel. */
 function connected(
   stub: Stub,
-  opts: { timeoutMs?: number; cancellationGraceMs?: number; onUnresponsive?(reason: string): void } = {},
+  opts: { timeoutMs?: number; cancellationGraceMs?: number } = {},
 ): { client: RpcClient; dispose: () => void; hostPort: MessagePort; clientPort: MessagePort } {
   const { port1, port2 } = new MessageChannel();
   // Never hold the event loop open on a test channel's account.
@@ -133,13 +133,7 @@ function connected(
   // No cast: `node:worker_threads`' MessagePort satisfies `EventTargetPort`
   // structurally, which is the point of keeping that interface to four members.
   const dispose = serveRuntimeOverPort(stub.runtime, bindEventTargetPort(port2));
-  const client = createRpcClient(bindEventTargetPort(port1), {
-    ...opts,
-    onUnresponsive(reason): void {
-      if (opts.onUnresponsive === undefined) port2.close();
-      else opts.onUnresponsive(reason);
-    },
-  });
+  const client = createRpcClient(bindEventTargetPort(port1), opts);
   cleanups.push(() => {
     client.close();
     dispose();
@@ -362,10 +356,11 @@ describe('rpc request/response', () => {
 });
 
 describe('rpc never hangs a caller', () => {
-  it('takes down a transport that stays silent after cancellation without claiming the mutation was cancelled', async () => {
+  it('fails only the silent call with E_TIMEOUT at 35 s; streams, later calls and the port stay', async () => {
     vi.useFakeTimers();
     try {
       const order: string[] = [];
+      const downs: string[] = [];
       let closes = 0;
       let events: RpcPortEvents | undefined;
       const client = createRpcClient(
@@ -384,71 +379,81 @@ describe('rpc never hangs a caller', () => {
             order.push('closed');
           },
         },
-        {
-          timeoutMs: 100,
-          cancellationGraceMs: 50,
-          onUnresponsive: () => order.push('recover'),
-        },
+        { onDown: (reason) => downs.push(reason) },
       );
+      const chat: Array<ChatHostEvent | ConversationEvent> = [];
+      client.watchChat({ scope: 'conversation', conversationId: 'c1' }, (event) => chat.push(event));
+      const streamId = 1;
 
+      let settled = false;
       const response = client.call({ method: 'DELETE', path: '/api/models/queued' }).then((result) => {
-        order.push('settled');
+        settled = true;
         return result;
       });
-      await vi.advanceTimersByTimeAsync(100);
-      expect(order).toEqual(['call', 'cancel']);
-
-      // The first deadline only requests withdrawal. The original response is
-      // still authoritative throughout the grace window.
-      await vi.advanceTimersByTimeAsync(49);
-      expect(order).toEqual(['call', 'cancel']);
-
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(order).toEqual(['chat', 'call']);
       await vi.advanceTimersByTimeAsync(1);
-      expect(order).toEqual(['call', 'cancel', 'recover']);
-      expect(closes).toBe(0);
-
-      // Merely posting the recovery request is not proof that the queued
-      // mutation died. The old process's port close is that witness.
-      events!.onClose();
+      // 30 s: the host is asked to withdraw it; the original reply still counts for 5 s more.
+      expect(order).toEqual(['chat', 'call', 'cancel']);
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
       const result = await response;
-      expect(result).toMatchObject({ ok: false, code: 'E_UNAVAILABLE', status: 503 });
-      expect((result as { message: string }).message).toContain('outcome is unknown');
-      expect((result as { message: string }).message.toLowerCase()).not.toContain('cancellation acknowledged');
-      // Recovery is requested before the peer-death witness exposes the unknown
-      // outcome, and the suspect port is then retired.
-      expect(order).toEqual(['call', 'cancel', 'recover', 'detached', 'closed', 'settled']);
-      expect(closes).toBe(1);
+      expect(result).toMatchObject({ ok: false, code: 'E_TIMEOUT', status: 504 });
+      expect((result as { message: string }).message).toBe(
+        'The app did not answer in 35 s. The change may or may not have been applied.',
+      );
+      // Nothing else happened: no recovery, no port teardown, no down report.
+      expect(order).toEqual(['chat', 'call', 'cancel']);
+      expect([closes, downs]).toEqual([0, []]);
+
+      // The stream opened before still delivers.
+      const event = { type: 'gone', seq: 1, reason: 'unknown' } as ConversationEvent;
+      events!.onMessage({ kind: 'chat', id: streamId, event });
+      expect(chat).toEqual([event]);
+
+      // The late reply of the timed-out call is dropped, and a new call works.
+      const next = client.call({ method: 'GET', path: '/api/models' });
+      events!.onMessage({ kind: 'response', id: 2, response: { ok: true, status: 200, body: 'late' } });
+      events!.onMessage({ kind: 'response', id: 3, response: { ok: true, status: 200, body: 'fresh' } });
+      expect(await next).toEqual({ ok: true, status: 200, body: 'fresh' });
+      expect(await response).toMatchObject({ code: 'E_TIMEOUT' });
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('bounds graceful close when its cancellation acknowledgement never arrives', async () => {
+  it('names a GET timeout without the mutation clause', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = createRpcClient({ postMessage: () => {}, listen: () => () => {}, close: () => {} });
+      const response = client.call({ method: 'GET', path: '/api/chat/conversations' });
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect(await response).toMatchObject({
+        ok: false,
+        code: 'E_TIMEOUT',
+        message: 'The app did not answer in 35 s.',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds graceful close: an unacknowledged cancellation ends in E_TIMEOUT, then the port closes', async () => {
     vi.useFakeTimers();
     try {
       const posted: RpcRequest[] = [];
       let closes = 0;
-      let recoveries = 0;
-      let events: RpcPortEvents | undefined;
       let settled = false;
       const client = createRpcClient(
         {
           postMessage: (message) => posted.push(message as RpcRequest),
-          listen(next): () => void {
-            events = next;
-            return () => {};
-          },
+          listen: () => () => {},
           close: () => {
             closes += 1;
           },
         },
-        {
-          timeoutMs: 60_000,
-          cancellationGraceMs: 25,
-          onUnresponsive: () => {
-            recoveries += 1;
-          },
-        },
+        { timeoutMs: 60_000, cancellationGraceMs: 25 },
       );
 
       const pending = client.call({ method: 'POST', path: '/api/models/queued' }).then((result) => {
@@ -458,17 +463,11 @@ describe('rpc never hangs a caller', () => {
       client.close();
       expect(posted.map((message) => message.kind)).toEqual(['call', 'cancel']);
       await vi.advanceTimersByTimeAsync(24);
-      expect(closes).toBe(0);
+      expect([closes, settled]).toEqual([0, false]);
 
       await vi.advanceTimersByTimeAsync(1);
-      expect(recoveries).toBe(1);
-      expect(closes).toBe(0);
-      expect(settled).toBe(false);
-
-      events!.onClose();
       const result = await pending;
-      expect(result).toMatchObject({ ok: false, code: 'E_UNAVAILABLE' });
-      expect((result as { message: string }).message).toContain('outcome is unknown');
+      expect(result).toMatchObject({ ok: false, code: 'E_TIMEOUT' });
       expect(closes).toBe(1);
     } finally {
       vi.useRealTimers();
@@ -489,7 +488,7 @@ describe('rpc never hangs a caller', () => {
         },
         close: () => {},
       },
-      { timeoutMs: 0, onUnresponsive: () => events?.onClose() },
+      { timeoutMs: 0 },
     );
 
     try {
@@ -641,20 +640,17 @@ describe('rpc never hangs a caller', () => {
     const posted: RpcRequest[] = [];
     let detaches = 0;
     let closes = 0;
-    const client = createRpcClient(
-      {
-        postMessage(message: unknown): void {
-          posted.push(message as RpcRequest);
-        },
-        listen: () => () => {
-          detaches += 1;
-        },
-        close(): void {
-          closes += 1;
-        },
+    const client = createRpcClient({
+      postMessage(message: unknown): void {
+        posted.push(message as RpcRequest);
       },
-      { onUnresponsive: () => {} },
-    );
+      listen: () => () => {
+        detaches += 1;
+      },
+      close(): void {
+        closes += 1;
+      },
+    });
 
     const unsubscribe = client.subscribe('job', () => {});
     client.close();

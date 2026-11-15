@@ -119,6 +119,7 @@ export const READY_CHAT_HOST: ChatHostState = {
   permissionDraft: null,
   tempRoot: null,
   tempTop: null,
+  appEnds: [],
 };
 
 export type ChatSync = Extract<ConversationEvent, { type: 'sync' }>;
@@ -287,7 +288,7 @@ export function stubApi(routes: ApiStub, options: ApiStubOptions = {}): StubbedA
     },
     bindEventTargetPort(port2),
   );
-  connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+  connectDashboardApi(bindEventTargetPort(port1));
   const stop = (): void => {
     liveListeners.clear();
     hostWatchers.clear();

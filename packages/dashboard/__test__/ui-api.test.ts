@@ -15,7 +15,7 @@ import { failure, type ApiResponse } from '../src/api/errors.js';
 import type { DownloadEvent } from '../src/download.js';
 import type { LiveEvent } from '../src/live.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
-import { bindEventTargetPort, type RpcPort, type RpcPortEvents } from '../src/rpc/port.js';
+import { bindEventTargetPort, type RpcPort } from '../src/rpc/port.js';
 import type { ApiCall } from '../src/runtime.js';
 import {
   connectDashboardApi,
@@ -79,7 +79,7 @@ function connect(answer?: (call: ApiCall) => ApiResponse): Harness {
     },
     bindEventTargetPort(port2),
   );
-  connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+  connectDashboardApi(bindEventTargetPort(port1));
   teardown = dispose;
 
   return {
@@ -213,49 +213,36 @@ describe('SPA api client', () => {
     const { port1, port2 } = new MessageChannel();
     port1.unref();
     port2.unref();
-    connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+    connectDashboardApi(bindEventTargetPort(port1));
     port2.close();
     await flush();
     expect(h.liveSubscriptions()).toBe(0);
   });
 
-  it('does not let a retired connection restart the runtime serving its replacement', async () => {
+  it("fails a retired connection's unanswered mutation alone, with E_TIMEOUT", async () => {
     vi.useFakeTimers();
     try {
-      let oldEvents: RpcPortEvents | undefined;
       const oldPort: RpcPort = {
         postMessage: () => {},
-        listen(events): () => void {
-          oldEvents = events;
-          return () => {};
-        },
+        listen: () => () => {},
         close: () => {},
       };
-      let recoveries = 0;
-      connectDashboardApi(oldPort, {
-        timeoutMs: 60_000,
-        cancellationGraceMs: 10,
-        onUnresponsive: () => {
-          recoveries += 1;
-        },
-      });
+      connectDashboardApi(oldPort, { timeoutMs: 60_000, cancellationGraceMs: 10 });
       const oldMutation = mutate('DELETE', '/models/old').catch((error: unknown) => error);
 
-      // Reconnection asks the old client to cancel. If that old port is wedged,
-      // its grace timer must not later kill the runtime behind this new port.
-      connectDashboardApi(
-        {
-          postMessage: () => {},
-          listen: () => () => {},
-          close: () => {},
-        },
-        { onUnresponsive: () => {} },
-      );
+      // Reconnection asks the old client to cancel. A peer that never answers
+      // costs that one call its grace, and nothing else.
+      connectDashboardApi({
+        postMessage: () => {},
+        listen: () => () => {},
+        close: () => {},
+      });
       await vi.advanceTimersByTimeAsync(10);
-      expect(recoveries).toBe(0);
-
-      oldEvents!.onClose();
-      await oldMutation;
+      const error = await oldMutation;
+      expect(error).toBeInstanceOf(DashboardApiError);
+      expect((error as DashboardApiError).code).toBe('E_TIMEOUT');
+      expect((error as DashboardApiError).status).toBe(504);
+      expect((error as DashboardApiError).message).toContain('may or may not have been applied');
     } finally {
       vi.useRealTimers();
     }

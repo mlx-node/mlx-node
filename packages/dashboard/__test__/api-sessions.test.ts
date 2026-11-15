@@ -410,7 +410,7 @@ describe('GET /api/sessions/:id/timeline', () => {
     expect(routeThreadFor('GET', `/api/sessions/${P}/timeline`)).toBe('worker');
     const { port1, port2 } = new MessageChannel();
     const dispose = serveRuntimeOverPort(runtime, bindEventTargetPort(port2));
-    const client = createRpcClient(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+    const client = createRpcClient(bindEventTargetPort(port1));
     try {
       const res = await createTestClient(client).fetch(`/api/sessions/${P}/timeline?turn=1`);
       expect(res.status).toBe(200);
@@ -616,7 +616,7 @@ describe('Sessions API over the RPC port', () => {
   it('lists, renames and refuses over a real MessageChannel', async () => {
     const { port1, port2 } = new MessageChannel();
     const dispose = serveRuntimeOverPort(runtime, bindEventTargetPort(port2));
-    const client = createRpcClient(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+    const client = createRpcClient(bindEventTargetPort(port1));
     const rpc = createTestClient(client);
     try {
       const list = await rpc.fetch('/api/sessions?limit=2');

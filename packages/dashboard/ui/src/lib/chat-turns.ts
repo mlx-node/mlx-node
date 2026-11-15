@@ -3,6 +3,7 @@
  * the stored `turn-end`), its numbers, and the Markdown a copy puts on the clipboard.
  */
 
+import { appEndFor, appEndText, type AppEndContext } from './app-ends';
 import { CHAT, fill } from './chat-strings';
 import type { ChatFailure, ChatHostState, ChatMode, TurnOutcome } from './chat-types';
 import { formatCountNoun, formatDuration, formatNumber, formatTps } from './format';
@@ -156,11 +157,19 @@ export interface TurnEndState {
   running: boolean;
   live: { outcome?: TurnOutcome; failure?: ChatFailure; unsent?: true } | null;
   mode: ChatMode;
+  /** How earlier Control Panel lives ended, for this conversation: see `app-ends.ts`. */
+  app?: AppEndContext;
+}
+
+/** The time of a turn's prompt or wake, or null. */
+export function turnStartedAt(turn: ThreadTurn): number | null {
+  return turn.entries.find(startsTurn)?.ts ?? null;
 }
 
 /**
- * The outcome line of a turn: live for the last turn when the stream saw it end, else stored, else "did not finish".
- * A finished turn always has a stored end, so an earlier turn without one did not finish either.
+ * The outcome line of a turn: live for the last turn when the stream saw it end, else the Control Panel restart that
+ * stopped it, else stored, else "did not finish". A finished turn always has a stored end, so an earlier turn without
+ * one did not finish either.
  */
 export function turnOutcome(turn: ThreadTurn, state: TurnEndState): OutcomeLine | null {
   if (state.last && state.running) return null;
@@ -168,6 +177,9 @@ export function turnOutcome(turn: ThreadTurn, state: TurnEndState): OutcomeLine 
     const line = liveOutcome(state.live.outcome, state.mode, state.live.unsent === true);
     return state.live.outcome === 'output-limit' && continuedWithoutTool(turn) ? twice(line) : line;
   }
+  const appEnd =
+    state.app === undefined ? null : appEndFor({ end: turn.end, startedAt: turnStartedAt(turn) }, state.app);
+  if (appEnd !== null) return { tone: 'warning', glyph: 'alert', text: appEndText(appEnd), action: 'continue' };
   if (turn.end !== null) {
     const line = storedOutcome(turn.end);
     return isLengthEnd(turn.end) && continuedWithoutTool(turn) ? twice(line) : line;

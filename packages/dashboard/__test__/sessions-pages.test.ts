@@ -402,7 +402,7 @@ function stubRoutes(routes: Record<string, Reply | Reply[]>, calls: ApiCall[]): 
     },
     bindEventTargetPort(port2),
   );
-  connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+  connectDashboardApi(bindEventTargetPort(port1));
   return () => {
     disconnectDashboardApi();
     dispose();

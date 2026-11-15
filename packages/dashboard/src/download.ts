@@ -62,10 +62,9 @@ const CATALOG_SHA_NEGATIVE_TTL_MS = 60 * 1000;
  *
  * Load-bearing, not defensive. Hugging Face connections DO stall rather than
  * reject — one was observed here holding a socket in CLOSE_WAIT for hours at
- * zero CPU. Without a deadline the `Promise.all` below never settles, the route
- * never answers, and the RPC client declares the whole runtime unresponsive
- * and restarts it, killing any download in flight. A probe must degrade to
- * `null`, never hang the process that serves it.
+ * zero CPU. Without a deadline the `Promise.all` below never settles and the
+ * route never answers: every such call fails with `E_TIMEOUT` and the update
+ * check never completes. A probe must degrade to `null`, never hang the route.
  */
 const CATALOG_SHA_PROBE_TIMEOUT_MS = 15 * 1000;
 

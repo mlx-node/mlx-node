@@ -90,6 +90,23 @@ export function routeThreadFor(method: string, pathname: string): RouteThread | 
   return null;
 }
 
+/**
+ * The route pattern (`GET /api/sessions/:id`) and owning thread of the route this request names, or null when
+ * nothing matches or the path is malformed. The pattern never carries a concrete value.
+ */
+export function routePatternFor(method: string, pathname: string): { pattern: string; thread: RouteThread } | null {
+  const segments = splitSegments(pathname);
+  try {
+    for (const r of ROUTES) {
+      if (matchRoute(r, method, segments) !== null)
+        return { pattern: `${r.method} /${r.segments.join('/')}`, thread: r.thread };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 /** Runs the matched route's handler against whatever context the caller holds. */
 type RouteRunner = (route: Route, req: ApiRequest) => unknown;
 

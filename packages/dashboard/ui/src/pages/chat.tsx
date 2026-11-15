@@ -1162,7 +1162,13 @@ export default function Chat(): ReactElement {
         host={
           host === null
             ? null
-            : { inference: host.inference, loading: host.loading, resident: unload.resident, answers: host.answers }
+            : {
+                inference: host.inference,
+                loading: host.loading,
+                resident: unload.resident,
+                answers: host.answers,
+                appEnds: host.appEnds,
+              }
         }
         modelSize={modelSize}
         unload={threadUnload}

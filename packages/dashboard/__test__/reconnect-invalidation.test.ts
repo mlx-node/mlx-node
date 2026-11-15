@@ -61,19 +61,16 @@ interface ControlledApi {
 function connectControlledApi(): ControlledApi {
   const posted: RpcRequest[] = [];
   let events: RpcPortEvents | undefined;
-  connectDashboardApi(
-    {
-      postMessage(message: unknown): void {
-        posted.push(message as RpcRequest);
-      },
-      listen(next): () => void {
-        events = next;
-        return () => {};
-      },
-      close: () => {},
-    } satisfies RpcPort,
-    { onUnresponsive: () => {} },
-  );
+  connectDashboardApi({
+    postMessage(message: unknown): void {
+      posted.push(message as RpcRequest);
+    },
+    listen(next): () => void {
+      events = next;
+      return () => {};
+    },
+    close: () => {},
+  } satisfies RpcPort);
   return {
     posted,
     respond(body: unknown): void {

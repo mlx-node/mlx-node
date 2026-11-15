@@ -1231,7 +1231,7 @@ describe('Models page — the Install affordance', () => {
       },
       bindEventTargetPort(port2),
     );
-    connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+    connectDashboardApi(bindEventTargetPort(port1));
     restoreApi = () => {
       disconnectDashboardApi();
       dispose();
@@ -2128,7 +2128,7 @@ describe('Models page — the Install affordance', () => {
       },
       bindEventTargetPort(port2),
     );
-    connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+    connectDashboardApi(bindEventTargetPort(port1));
     restoreApi = () => {
       disconnectDashboardApi();
       dispose();
@@ -2433,7 +2433,7 @@ describe('Models page — the Install affordance', () => {
       },
       bindEventTargetPort(port2),
     );
-    connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+    connectDashboardApi(bindEventTargetPort(port1));
     restoreApi = () => {
       disconnectDashboardApi();
       dispose();

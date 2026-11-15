@@ -7,14 +7,14 @@ import { describe, expect, it } from 'vite-plus/test';
 // `rpc/protocol.js` but not this constant, and the SPA reaches it by relative
 // path too. Imported rather than regex-matched so a rename over there fails to
 // compile here instead of quietly weakening the assertion.
-import { DASHBOARD_PORT_MESSAGE, DASHBOARD_UNRESPONSIVE_MESSAGE } from '../../dashboard/src/rpc/protocol.js';
+import * as rpcProtocol from '../../dashboard/src/rpc/protocol.js';
+import { DASHBOARD_PORT_MESSAGE } from '../../dashboard/src/rpc/protocol.js';
 import { FOLDER_PICKED_MESSAGE, PICK_FOLDER_MESSAGE } from '../../dashboard/ui/src/lib/pick-folder.js';
 import {
   CONTROL_PANEL_FOLDER_CHANNEL,
   CONTROL_PANEL_PICK_FOLDER_CHANNEL,
   CONTROL_PANEL_PORT_CHANNEL,
   CONTROL_PANEL_READY_CHANNEL,
-  CONTROL_PANEL_UNRESPONSIVE_CHANNEL,
   CONTROL_PANEL_URL,
   TRAFFIC_LIGHT_POSITION,
   WINDOW_BACKGROUND,
@@ -23,6 +23,7 @@ import {
   FOLDER_DIALOG_OPTIONS,
   windowBackground,
 } from '../src/main/window-policy.js';
+import * as windowPolicy from '../src/main/window-policy.js';
 
 describe('classifyNavigation', () => {
   it('allows the SPA to route within itself', () => {
@@ -79,8 +80,6 @@ describe('the preload contract', () => {
   it('hard-codes exactly the channel names main sends on', () => {
     expect(source).toContain(`'${CONTROL_PANEL_PORT_CHANNEL}'`);
     expect(source).toContain(`'${CONTROL_PANEL_READY_CHANNEL}'`);
-    expect(source).toContain(`'${CONTROL_PANEL_UNRESPONSIVE_CHANNEL}'`);
-    expect(CONTROL_PANEL_UNRESPONSIVE_CHANNEL).toBe(DASHBOARD_UNRESPONSIVE_MESSAGE);
   });
 
   // Same constraint, the other half: a relative import compiles to a relative
@@ -96,11 +95,7 @@ describe('the preload contract', () => {
     expect(source).not.toContain('exposeInMainWorld');
   });
 
-  /*
-   * The page-facing half of the hop. The tag and broker generation travel
-   * together so a recovery report returns the identity of the exact channel
-   * that observed the wedge.
-   */
+  /* The page-facing half of the hop: the tag and the broker generation travel together. */
   it('posts the tag and validated broker generation the SPA is listening for', () => {
     expect(source).toContain(`'${DASHBOARD_PORT_MESSAGE}'`);
     expect(source).toContain(`window.postMessage({ type: DASHBOARD_PORT_MESSAGE, generation }, '*', [port])`);
@@ -136,10 +131,49 @@ describe('the preload contract', () => {
     expect(source).toContain(`window.postMessage({ type: FOLDER_PICKED_MESSAGE, requestId, path: folder }, '*')`);
   });
 
-  it('maps the page recovery message to MAIN without exposing ipcRenderer', () => {
-    expect(source).toContain(`type === CONTROL_PANEL_UNRESPONSIVE_CHANNEL && isBrokerGeneration(message.generation)`);
-    expect(source).toContain(`recoverRuntime(message.generation)`);
-    expect(source).toContain(`ipcRenderer.send(CONTROL_PANEL_UNRESPONSIVE_CHANNEL, generation)`);
+  /*
+   * No page message can stop or restart the Control Panel: only MAIN's broker
+   * judges whether it is alive. The preload forwards exactly two page requests,
+   * and neither carries that power.
+   */
+  it('forwards only the port request and the folder request to MAIN', () => {
+    const sends: string[] = [];
+    let at = source.indexOf('ipcRenderer.send(');
+    while (at >= 0) {
+      const start = at + 'ipcRenderer.send('.length;
+      let end = start;
+      while (source[end] !== ',' && source[end] !== ')') end += 1;
+      sends.push(source.slice(start, end));
+      at = source.indexOf('ipcRenderer.send(', end);
+    }
+    expect(sends).toEqual(['CONTROL_PANEL_READY_CHANNEL', 'CONTROL_PANEL_PICK_FOLDER_CHANNEL']);
+  });
+});
+
+describe('the page cannot restart the Control Panel', () => {
+  const read = (relative: string): string => readFileSync(fileURLToPath(new URL(relative, import.meta.url)), 'utf8');
+
+  it('has no unresponsive channel in the page, the preload or MAIN', () => {
+    for (const file of [
+      '../src/preload/index.cts',
+      '../../dashboard/ui/src/main.tsx',
+      '../../dashboard/ui/src/lib/api.ts',
+      '../../dashboard/src/rpc/client.ts',
+      '../../dashboard/src/rpc/protocol.ts',
+      '../src/main/window.ts',
+      '../src/main/window-policy.ts',
+      '../src/main/index.ts',
+    ]) {
+      expect(read(file).toLowerCase(), file).not.toContain('unresponsive');
+    }
+    expect(Object.keys(rpcProtocol).filter((name) => name.includes('UNRESPONSIVE'))).toEqual([]);
+    expect(Object.keys(windowPolicy).filter((name) => name.includes('UNRESPONSIVE'))).toEqual([]);
+  });
+
+  it('gives MAIN no public recover: the broker decides from the child alone', () => {
+    const broker = read('../src/main/broker.ts');
+    expect(broker).not.toContain('recover(target');
+    expect(read('../src/main/index.ts')).not.toContain('broker?.recover');
   });
 });
 

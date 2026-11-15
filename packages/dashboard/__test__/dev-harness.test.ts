@@ -1,6 +1,6 @@
 /** @vitest-environment happy-dom */
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -23,6 +23,7 @@ import {
   HARNESS_CHAT_SCENARIO,
   HARNESS_LONG_MODEL,
   HARNESS_MODELS,
+  harnessAppEnds,
   harnessChatOptions,
   type HarnessChannel,
   type HarnessClient,
@@ -340,5 +341,34 @@ describe('dev harness Chat', () => {
     const guarded = guardRuntime(runtime, false);
     guarded.watchChat!({ scope: 'host' }, () => {})();
     expect(calls).toEqual(['host']);
+  });
+});
+
+describe('dev harness Control Panel end', () => {
+  it('MLX_DEV_APP_END gives one end over every Work conversation of the fixture home; anything else none', () => {
+    const home = mkdtempSync(join(tmpdir(), 'mlx-dev-app-end-'));
+    try {
+      const id = '019a1f2e-7b3c-7d4e-8f50-61728394a5b6';
+      mkdirSync(join(home, 'chat'), { recursive: true });
+      writeFileSync(
+        join(home, 'chat', 'conversations.json'),
+        JSON.stringify({ version: 1, work: [{ id, createdAt: 1 }] }),
+      );
+      expect(harnessAppEnds('no-ping', home, 50_000)).toEqual([
+        {
+          trigger: 'no-ping',
+          decidedAt: 48_000,
+          exitAt: 50_000,
+          silentMs: 120_000,
+          code: 0,
+          convs: [id],
+          cancelled: [id],
+        },
+      ]);
+      expect(harnessAppEnds(undefined, home, 50_000)).toEqual([]);
+      expect(harnessAppEnds('reboot', home, 50_000)).toEqual([]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });

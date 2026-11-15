@@ -14,7 +14,6 @@ import { clampBoundsToDisplays, type Rect, type WindowBounds } from './settings.
 import {
   CONTROL_PANEL_PICK_FOLDER_CHANNEL,
   CONTROL_PANEL_READY_CHANNEL,
-  CONTROL_PANEL_UNRESPONSIVE_CHANNEL,
   CONTROL_PANEL_URL,
   TRAFFIC_LIGHT_POSITION,
   classifyNavigation,
@@ -69,11 +68,6 @@ export interface ControlPanelWindowOptions {
    * crash at startup.
    */
   onControlPanelReady?(contents: WebContents): void;
-  /**
-   * Called only for this window when its RPC transport misses the
-   * post-cancellation bound. The broker kills and replaces the runtime.
-   */
-  onControlPanelUnresponsive?(contents: WebContents, expectedGeneration: number): void;
 }
 
 export interface ControlPanelWindowManager {
@@ -107,25 +101,12 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
     if (win === null || win.isDestroyed() || event.sender !== win.webContents) return;
     options.onControlPanelReady?.(event.sender);
   };
-  const onUnresponsive = (event: IpcMainEvent, expectedGeneration: unknown): void => {
-    // Restarting the utility process is a larger capability than asking for a
-    // fresh port, so keep the same exact-sender boundary.
-    if (win === null || win.isDestroyed() || event.sender !== win.webContents) return;
-    // The generation is also an authority boundary: malformed input and a
-    // delayed report for a retired channel must never be resolved against the
-    // process that happens to be current now.
-    if (typeof expectedGeneration !== 'number' || !Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) {
-      return;
-    }
-    options.onControlPanelUnresponsive?.(event.sender, expectedGeneration);
-  };
   const onPickFolder = createFolderPicker<WebContents, BrowserWindow>({
     window: () => (win === null || win.isDestroyed() ? null : { win, contents: win.webContents }),
     showOpenDialog: (target, dialogOptions) =>
       dialog.showOpenDialog(target, { ...dialogOptions, properties: [...dialogOptions.properties] }),
   });
   ipcMain.on(CONTROL_PANEL_READY_CHANNEL, onReady);
-  ipcMain.on(CONTROL_PANEL_UNRESPONSIVE_CHANNEL, onUnresponsive);
   ipcMain.on(CONTROL_PANEL_PICK_FOLDER_CHANNEL, onPickFolder);
 
   const onThemeUpdated = (): void => {
@@ -247,7 +228,6 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
       if (disposed) return;
       disposed = true;
       ipcMain.removeListener(CONTROL_PANEL_READY_CHANNEL, onReady);
-      ipcMain.removeListener(CONTROL_PANEL_UNRESPONSIVE_CHANNEL, onUnresponsive);
       ipcMain.removeListener(CONTROL_PANEL_PICK_FOLDER_CHANNEL, onPickFolder);
       nativeTheme.removeListener('updated', onThemeUpdated);
       if (boundsTimer !== null) {

@@ -27,7 +27,6 @@ import { ipcRenderer, type IpcRendererEvent } from 'electron';
 /** Keep in sync with the CONTROL PANEL channel constants in `src/main/window-policy.ts`. */
 const CONTROL_PANEL_PORT_CHANNEL = 'mlx:control-panel-port';
 const CONTROL_PANEL_READY_CHANNEL = 'mlx:control-panel-ready';
-const CONTROL_PANEL_UNRESPONSIVE_CHANNEL = 'mlx:control-panel-unresponsive';
 const CONTROL_PANEL_PICK_FOLDER_CHANNEL = 'mlx:control-panel-pick-folder';
 const CONTROL_PANEL_FOLDER_CHANNEL = 'mlx:control-panel-folder';
 
@@ -59,11 +58,6 @@ function requestPort(): void {
 
 function isBrokerGeneration(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1;
-}
-
-/** Ask MAIN to replace the process that owns this exact brokered generation. */
-function recoverRuntime(generation: number): void {
-  ipcRenderer.send(CONTROL_PANEL_UNRESPONSIVE_CHANNEL, generation);
 }
 
 /**
@@ -98,15 +92,12 @@ window.addEventListener('message', (event: MessageEvent) => {
   if (event.source !== window) return;
   const data: unknown = event.data;
   if (typeof data !== 'object' || data === null) return;
-  const message = data as { type?: unknown; generation?: unknown; requestId?: unknown };
+  const message = data as { type?: unknown; requestId?: unknown };
   const type = message.type;
   if (type === CONTROL_PANEL_READY_CHANNEL) requestPort();
   // Only a request id crosses: the dialog's folder, title and options are MAIN's alone.
   if (type === PICK_FOLDER_MESSAGE && isRequestId(message.requestId)) {
     ipcRenderer.send(CONTROL_PANEL_PICK_FOLDER_CHANNEL, message.requestId);
-  }
-  if (type === CONTROL_PANEL_UNRESPONSIVE_CHANNEL && isBrokerGeneration(message.generation)) {
-    recoverRuntime(message.generation);
   }
 });
 
@@ -115,8 +106,7 @@ ipcRenderer.on(CONTROL_PANEL_PORT_CHANNEL, (event: IpcRendererEvent, generation:
   if (port === undefined) return;
   if (!isBrokerGeneration(generation)) {
     // MAIN and the preload disagree about the envelope. Retire the transferred
-    // capability rather than hand the page a port whose recovery identity is
-    // unknowable.
+    // capability rather than hand the page a port of unknown origin.
     port.close();
     return;
   }

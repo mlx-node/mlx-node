@@ -12,6 +12,7 @@
  * `MLX_DEV_FLIGHT=phases`: three more turns before their prefill: model busy, waiting for a slot, preparing.
  * `MLX_DEV_LOAD_KERNELS=<done>/<steps>`: the heartbeat reports a load as "Preparing GPU kernels", done of steps.
  * `MLX_DEV_DISK_CACHE=native|off|older`: the disk cache the heartbeat reports (default: on, whole prompt).
+ * `MLX_DEV_APP_END=no-ping|crash|signal|user`: an earlier Control Panel end over every Work conversation of the fixture.
  */
 
 import { mkdirSync, rmSync } from 'node:fs';
@@ -35,7 +36,7 @@ import {
   writeFixtureHome,
   writeLiveFile,
 } from './dev-fixture.js';
-import { devHarness, harnessChatOptions, harnessTempRoot } from './dev/harness-plugin.js';
+import { devHarness, harnessAppEnds, harnessChatOptions, harnessTempRoot } from './dev/harness-plugin.js';
 
 const UI_ROOT = join(import.meta.dirname, '../ui');
 /** `MLX_DEV_WORK_DEEP=1`: the folder dialog answers a folder whose encoded path is too long for the agent. */
@@ -118,7 +119,11 @@ async function main(): Promise<void> {
       writeLiveFile(home, live);
     },
   });
-  const chat = { ...harnessChatOptions(home, providers.baseUrls, engine.url), tempRoots: harnessTempRoot(home) };
+  const chat = {
+    ...harnessChatOptions(home, providers.baseUrls, engine.url),
+    tempRoots: harnessTempRoot(home),
+    appEnds: Promise.resolve(harnessAppEnds(process.env.MLX_DEV_APP_END, home, Date.now())),
+  };
   const workFolder = join(home, 'work', ...(process.env.MLX_DEV_WORK_DEEP === '1' ? DEEP_FOLDER : []));
   mkdirSync(workFolder, { recursive: true });
   const runtime = createDashboardRuntime({

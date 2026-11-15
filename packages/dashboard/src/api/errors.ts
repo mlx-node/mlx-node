@@ -22,6 +22,7 @@ const STATUS_BY_CODE = {
   E_PAYLOAD_TOO_LARGE: 413,
   E_INTERNAL: 500,
   E_UNAVAILABLE: 503,
+  E_TIMEOUT: 504,
 } as const;
 
 export type ApiErrorCode = keyof typeof STATUS_BY_CODE;

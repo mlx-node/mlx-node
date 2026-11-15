@@ -346,5 +346,22 @@ export interface ChatHostState {
   tempRoot: string | null;
   /** The real top of that temp root: a Work folder that holds or equals it gets no temp root. */
   tempTop: string | null;
+  /** How earlier Control Panel lives ended, newest first, from MAIN's ledger: what stopped a turn that was running. */
+  appEnds: AppEnd[];
+}
+
+/**
+ * One end of a Control Panel life. `decidedAt` is when MAIN decided the stop (for an exit nobody asked for, the exit
+ * less the kill grace); `silentMs` how long the panel had not answered (`no-ping` only); `convs` the turns MAIN's last
+ * pong listed; `cancelled` the turns the dying panel said it cancelled, null when that note never arrived.
+ */
+export interface AppEnd {
+  trigger: 'no-ping' | 'crash' | 'signal' | 'user';
+  decidedAt: number;
+  exitAt: number;
+  silentMs: number | null;
+  code: number | null;
+  convs: string[];
+  cancelled: string[] | null;
 }
 export type ChatHostEvent = { type: 'state'; state: ChatHostState } | { type: 'conversations-changed' };

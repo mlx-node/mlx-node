@@ -52,21 +52,17 @@ function apiPath(path: string): string {
 }
 
 let client: RpcClient | null = null;
-/** Identity guard for recovery callbacks from clients retired by a reconnect. */
+/** Identity guard for down reports from clients retired by a reconnect. */
 let rpcGeneration = 0;
 
 /**
  * Attach the API to a port. Call once, before rendering anything that fetches.
- * `opts.onUnresponsive` must tear down the runtime that owns the peer port.
  * Replacing an existing connection closes the old one, so a reconnect cannot
  * leave the previous client's subscriptions registered on the runtime.
  */
-export function connectDashboardApi(port: RpcPort, opts: RpcClientOptions): void {
+export function connectDashboardApi(port: RpcPort, opts: RpcClientOptions = {}): void {
   const generation = ++rpcGeneration;
   const previous = client;
-  // Invalidate the old generation BEFORE asking it to drain. A synchronous
-  // postMessage failure during `close()` must not let a retired client restart
-  // the healthy runtime whose replacement port just arrived.
   client = null;
   previous?.close();
   // Cached bodies describe the runtime on the other end of the OLD port. A
@@ -79,12 +75,6 @@ export function connectDashboardApi(port: RpcPort, opts: RpcClientOptions): void
   bumpConnectionGeneration();
   client = createRpcClient(port, {
     ...opts,
-    onUnresponsive(reason): void {
-      // A delayed timer from a superseded connection is not evidence about the
-      // runtime currently serving the page. A plain disconnect does not advance
-      // this generation, so its close drain still retains recovery coverage.
-      if (generation === rpcGeneration) opts.onUnresponsive(reason);
-    },
     onDown(reason): void {
       if (generation === rpcGeneration) {
         markTransportDown();
@@ -135,7 +125,7 @@ interface SharedGet {
 
 /**
  * Identical GETs in flight, by `/api` path. The runtime interleaves its handlers, so N copies of one slow listing each
- * take N times as long, and enough of them cross the unresponsive deadline and restart the runtime.
+ * take N times as long, and enough of them cross the call deadline and fail.
  */
 const inFlight = new Map<string, SharedGet>();
 let lastGetSeq = 0;

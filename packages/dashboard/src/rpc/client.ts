@@ -9,13 +9,13 @@
  * branch on instead of a bare rejection it can only stringify.
  *
  * Three independent things can stop an ordinary reply from arriving: the peer
- * closing (the port's `close` event), the peer wedging (the per-request deadline
- * starts an acknowledged cancellation), and the payload being unclonable
- * (`postMessage` throws synchronously before the message ever leaves).
+ * closing (the port's `close` event), a slow peer (the per-request deadline
+ * starts an acknowledged cancellation, and the grace after it fails that one
+ * call with `E_TIMEOUT`), and the payload being unclonable (`postMessage` throws
+ * synchronously before the message ever leaves).
  *
- * A MessagePort cannot kill its peer. The required `onUnresponsive` hook is the
- * supervision seam: a generic caller with no way to tear down the peer cannot
- * provide both a finite bound and the guarantee that queued mutations are dead.
+ * The page never judges whether the peer is alive. A call with no reply fails
+ * alone; streams and other calls are untouched.
  *
  * No `node:` imports — this module runs in the renderer.
  */
@@ -28,38 +28,24 @@ import type { ApiCall } from '../runtime.js';
 import type { RpcPort } from './port.js';
 import { isRpcReply, type ChatScope, type RpcRequest } from './protocol.js';
 
-/**
- * Per-request cancellation deadline. It is generous: its job is to detect a
- * wedged peer, not police slow queries. Expiry does not itself assert failure —
- * the original call stays pending for the runtime's acknowledged skip or real
- * result.
- */
+/** Per-request deadline: at expiry the client asks the host to withdraw the call. */
 const DEFAULT_TIMEOUT_MS = 30_000;
-/** How long an acknowledged cancellation may take before the transport itself is declared wedged. */
+/** After the withdrawal request, how long the original reply may still take before the call fails with `E_TIMEOUT`. */
 const DEFAULT_CANCELLATION_GRACE_MS = 5_000;
 
 export interface RpcClientOptions {
   /** Delay before requesting acknowledged cancellation. Defaults to 30 s. */
   timeoutMs?: number;
-  /**
-   * Hard bound after cancellation is requested. Expiry asks the supervisor to
-   * replace the whole transport. Defaults to 5 s.
-   */
+  /** Bound after cancellation is requested; expiry fails that call with `E_TIMEOUT`. Defaults to 5 s. */
   cancellationGraceMs?: number;
-  /**
-   * Called synchronously when the cancellation grace expires. The desktop shell
-   * uses this to restart the supervised runtime whose transport stopped making
-   * progress. Old calls remain pending until the old port closes or returns an
-   * authoritative response. The hook must initiate peer teardown; locally
-   * closing this port is not a substitute for proving queued work is dead.
-   */
-  onUnresponsive(reason: string): void;
-  /**
-   * Called once when the transport stops carrying calls on its own: the peer
-   * closed the port, or recovery started for a wedged peer. Never called after
-   * `close()`.
-   */
+  /** Called once when the peer closed the port. Never called after `close()`. */
   onDown?(reason: string): void;
+}
+
+/** The failure of a call that got no reply of any kind within the deadline and its grace. */
+export function timeoutFailure(method: string, seconds: number): ApiResponse {
+  const base = `The app did not answer in ${String(seconds)} s.`;
+  return failure('E_TIMEOUT', method === 'GET' ? base : `${base} The change may or may not have been applied.`);
 }
 
 export interface RpcClient {
@@ -79,14 +65,16 @@ export interface RpcClient {
   close(): void;
 }
 
-export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClient {
+export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): RpcClient {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const cancellationGraceMs = opts.cancellationGraceMs ?? DEFAULT_CANCELLATION_GRACE_MS;
+  const timeoutSeconds = Math.round((timeoutMs + cancellationGraceMs) / 1000);
 
   const pending = new Map<
     number,
     {
       settle: (response: ApiResponse) => void;
+      method: string;
       timer: ReturnType<typeof setTimeout>;
       cancellationRequested: boolean;
     }
@@ -100,7 +88,6 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
 
   let closed = false;
   let portFinished = false;
-  let recoveryStarted = false;
   let downReported = false;
   let detach = (): void => {};
 
@@ -179,32 +166,20 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
     port.postMessage(request);
   };
 
-  const startRecovery = (reason: string): void => {
-    if (recoveryStarted || portFinished) return;
-    recoveryStarted = true;
-    closed = true;
-    down = `${reason}; runtime recovery is in progress`;
-    listeners.clear();
-    liveListeners.clear();
-    chatListeners.clear();
-    for (const entry of pending.values()) clearTimeout(entry.timer);
-    reportDown(reason);
-    // Do NOT settle or locally close the port here. Posting the recovery signal
-    // is not proof that queued work is dead. The old process's port-close event
-    // is the teardown witness; until then only an authoritative original
-    // response may settle a call.
-    try {
-      opts.onUnresponsive(reason);
-    } catch {
-      // A recovery hook runs from a timer callback. It must not throw through
-      // the browser's event loop; the old call remains pending for a real
-      // response or a peer-close witness.
-    }
+  const expire = (id: number, entry: { settle: (response: ApiResponse) => void; method: string }): void => {
+    // No reply of any kind for the whole deadline and grace. Only THIS call fails: whether the peer is alive is
+    // MAIN's to judge, never one slow reply's. A late reply finds no entry and is dropped.
+    if (pending.get(id) !== entry) return;
+    pending.delete(id);
+    entry.settle(timeoutFailure(entry.method, timeoutSeconds));
+    finishClose();
   };
 
   const requestCancellation = (
     id: number,
     entry: {
+      settle: (response: ApiResponse) => void;
+      method: string;
       timer: ReturnType<typeof setTimeout>;
       cancellationRequested: boolean;
     },
@@ -215,16 +190,9 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
     try {
       post({ kind: 'cancel', id });
     } catch {
-      startRecovery('the cancellation request could not cross the message port');
-      return;
+      // The withdrawal could not cross; the grace below still bounds the call.
     }
-    entry.timer = setTimeout(() => {
-      // A responsive host answers the ORIGINAL request with either its real
-      // result or an acknowledged withdrawal. Silence beyond this second
-      // deadline means the transport cannot be trusted to retire queued work.
-      if (pending.get(id) !== entry) return;
-      startRecovery('the runtime did not acknowledge cancellation before the recovery deadline');
-    }, cancellationGraceMs);
+    entry.timer = setTimeout(() => expire(id, entry), cancellationGraceMs);
   };
 
   /** Register `listener` under a fresh id and post the opening request; returns the unsubscribe. */
@@ -272,7 +240,7 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
           const entry = pending.get(id);
           if (entry !== undefined) requestCancellation(id, entry);
         }, timeoutMs);
-        pending.set(id, { settle: resolve, timer, cancellationRequested: false });
+        pending.set(id, { settle: resolve, method: apiCall.method, timer, cancellationRequested: false });
         try {
           post({ kind: 'call', id, call: apiCall });
         } catch (err) {
@@ -324,13 +292,10 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
       chatListeners.clear();
 
       // A graceful reconnect is not permission to guess the outcome of old
-      // mutations. Stop their timers, request cancellation, and retain both the
-      // listener and port until each receives an acknowledged skip or the real
-      // result of already-started work.
-      for (const [id, entry] of pending) {
-        requestCancellation(id, entry);
-        if (recoveryStarted) return;
-      }
+      // mutations. Request cancellation and retain the port until each call gets
+      // an acknowledged skip, the real result of already-started work, or its
+      // `E_TIMEOUT` after the grace.
+      for (const [id, entry] of pending) requestCancellation(id, entry);
       finishClose();
     },
   };

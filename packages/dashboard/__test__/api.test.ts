@@ -1943,7 +1943,7 @@ describe('dashboard api — the RPC transport carries the error model over a por
     port1.unref();
     port2.unref();
     const dispose = serveRuntimeOverPort(runtime, bindEventTargetPort(port2));
-    const client = createRpcClient(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+    const client = createRpcClient(bindEventTargetPort(port1));
     rpc = createTestClient(client);
     teardown = () => {
       client.close();

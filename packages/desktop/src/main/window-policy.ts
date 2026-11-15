@@ -38,15 +38,6 @@ export const CONTROL_PANEL_PORT_CHANNEL = 'mlx:control-panel-port';
 export const CONTROL_PANEL_READY_CHANNEL = 'mlx:control-panel-ready';
 
 /**
- * Renderer → MAIN: the CONTROL PANEL transport failed to acknowledge
- * cancellation within its hard bound.
- *
- * A fresh channel to the same process cannot recover a wedged event loop, so
- * this signal enters the broker's supervised kill/restart path instead.
- */
-export const CONTROL_PANEL_UNRESPONSIVE_CHANNEL = 'mlx:control-panel-unresponsive';
-
-/**
  * Renderer → MAIN: "let the user choose a Work folder", with a request id. MAIN answers on
  * {@link CONTROL_PANEL_FOLDER_CHANNEL}. Duplicated as a literal in the preload, pinned by `window-policy.test.ts`.
  */

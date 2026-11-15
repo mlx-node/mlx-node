@@ -34,14 +34,6 @@ export type ChatScope = { scope: 'host' } | { scope: 'conversation'; conversatio
  */
 export const DASHBOARD_PORT_MESSAGE = 'mlx:dashboard-port';
 
-/**
- * Page → preload: the RPC transport missed its post-cancellation bound and the
- * supervised CONTROL PANEL runtime must be replaced, not merely handed another
- * port to the same wedged process. The envelope also carries the broker
- * generation so MAIN can reject a delayed report after replacement.
- */
-export const DASHBOARD_UNRESPONSIVE_MESSAGE = 'mlx:control-panel-unresponsive';
-
 export type RpcRequest =
   | { kind: 'call'; id: number; call: ApiCall }
   /**

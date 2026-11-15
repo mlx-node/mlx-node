@@ -26,7 +26,7 @@ import { readDesktopEndpoint } from '@mlx-node/server/host/desktop-endpoint';
 
 import type { SessionDetailResponse } from './agent-sessions/types.js';
 import type { IngestSummary, MainApiContext } from './api/context.js';
-import { dispatchMain, isApiPath, routeThreadFor, splitSegments } from './api/dispatch.js';
+import { dispatchMain, isApiPath, routePatternFor, splitSegments } from './api/dispatch.js';
 import { failure, toFailure, type ApiResponse } from './api/errors.js';
 import { launchFromProbe, type HostTimings } from './chat/agent/agent-host.js';
 import type { EndpointReader } from './chat/agent/endpoint.js';
@@ -37,7 +37,7 @@ import { ProvidersService } from './chat/providers/service.js';
 import type { ProviderId } from './chat/providers/types.js';
 import { redactDeep, redactEntry } from './chat/redact.js';
 import { ChatService, webServerScript, type AgentResolution } from './chat/service.js';
-import type { ChatHostEvent, ConversationEvent } from './chat/types.js';
+import type { AppEnd, ChatHostEvent, ConversationEvent } from './chat/types.js';
 import { CodingAgentsService } from './coding-agents.js';
 import type { CodingAgentsOptions } from './coding-agents.js';
 import { DownloadManager, type DownloadEvent } from './download.js';
@@ -45,7 +45,7 @@ import { createLiveWatcher, type LiveEvent } from './live.js';
 import { defaultModelsDir } from './models.js';
 import { dashboardDbPath, desktopSupervisorStatePath, metricsRuntimeDir, metricsTraceDir } from './paths.js';
 import type { ChatScope } from './rpc/protocol.js';
-import { startDbWorker, type DbWorkerLifecycle } from './worker/client.js';
+import { startDbWorker, type DbWorkerLifecycle, type WorkerQueue } from './worker/client.js';
 
 /** Incremental rescan cadence while the runtime is alive. */
 const INGEST_INTERVAL_MS = 30_000;
@@ -84,6 +84,10 @@ export interface ChatRuntimeOptions {
   createBudgetMs?: number;
   flushMs?: number;
   stateCoalesceMs?: number;
+  /** How earlier Control Panel lives ended, read from MAIN's ledger at start. */
+  appEnds?: Promise<readonly AppEnd[]>;
+  /** Called when a turn starts or ends, so the process can tell MAIN at once. */
+  onBusyChange?: () => void;
 }
 
 export interface DashboardRuntimeOptions {
@@ -109,6 +113,8 @@ export interface DashboardRuntimeOptions {
    * should set this below that deadline.
    */
   shutdownTimeoutMs?: number;
+  /** One database worker call's deadline before it is withdrawn. Default 60 s. */
+  workerRequestTimeoutMs?: number;
   /** Periodic rescan cadence. Default 30 s. */
   ingestIntervalMs?: number;
   /** Worker lifecycle notifications, for a supervisor that must react to a dead worker. */
@@ -157,6 +163,12 @@ export interface DashboardRuntime {
   watchLive(listener: (event: LiveEvent) => void): () => void;
   /** Open a Chat stream: the host state, or one conversation. Returns the unsubscribe. */
   watchChat(scope: ChatScope, send: (event: ChatHostEvent | ConversationEvent) => void): () => void;
+  /** The conversations with a turn running, both modes. Synchronous: no worker, no fs. */
+  busyConversations(): string[];
+  /** The running turns a close would stop: those not already stopping for another cause. Synchronous. */
+  closingConversations(): string[];
+  /** The database worker's queue right now, or null when nothing waits. Synchronous. */
+  workerQueue(): WorkerQueue | null;
   /** Run (and await) an incremental rescan, serialized with every other ingest. */
   ingestNow(): Promise<IngestSummary>;
   /**
@@ -275,6 +287,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
   const worker = startDbWorker({
     workerUrl: opts.workerUrl ?? defaultWorkerUrl(),
     shutdownTimeoutMs: opts.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS,
+    ...(opts.workerRequestTimeoutMs === undefined ? {} : { requestTimeoutMs: opts.workerRequestTimeoutMs }),
     onLifecycle: opts.onLifecycle ?? ((): void => {}),
     dbPath,
     modelsDir,
@@ -333,6 +346,8 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     createBudgetMs: chatOpts.createBudgetMs,
     flushMs: chatOpts.flushMs,
     stateCoalesceMs: chatOpts.stateCoalesceMs,
+    appEnds: chatOpts.appEnds,
+    onBusyChange: chatOpts.onBusyChange,
   });
   const context: MainApiContext = {
     modelsDir,
@@ -404,7 +419,8 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
         // catch, so `call` rejected instead of answering — breaking the contract
         // the catch below exists to keep. `worker.call` returns envelopes rather
         // than throwing, so nesting it changes nothing else.
-        if (routeThreadFor(c.method, url.pathname) === 'worker') {
+        const route = routePatternFor(c.method, url.pathname);
+        if (route?.thread === 'worker') {
           const text = c.method === 'GET' ? sessionTextRoute(url.pathname) : null;
           const needles = text === null ? null : chat.redactionNeedles();
           const response = await worker.call(
@@ -413,6 +429,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
               path: c.path,
               body: c.body,
               ...(c.bodyError !== undefined ? { bodyError: c.bodyError } : {}),
+              route: route.pattern,
             },
             signal,
           );
@@ -444,6 +461,15 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     },
     watchChat(scope: ChatScope, send: (event: ChatHostEvent | ConversationEvent) => void): () => void {
       return chat.watch(scope, send);
+    },
+    busyConversations(): string[] {
+      return chat.busyConversations();
+    },
+    closingConversations(): string[] {
+      return chat.closingConversations();
+    },
+    workerQueue(): WorkerQueue | null {
+      return worker.queue();
     },
     ingestNow(): Promise<IngestSummary> {
       return worker.ingest();

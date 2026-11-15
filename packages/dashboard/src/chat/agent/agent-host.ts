@@ -14,7 +14,7 @@ import { compareReleaseTags, MLX_AGENT_MIN_RELEASE, type AgentInstallProbe } fro
 
 import type { UpdateLine } from '../../agent-sessions/transcript.js';
 import type { TranscriptEntry } from '../../agent-sessions/types.js';
-import { ACP_TIMEOUTS, AcpRpcError, type ProtocolErrorReason } from '../acp/client.js';
+import { ACP_TIMEOUTS, AcpRpcError, type AcpClient, type ProtocolErrorReason } from '../acp/client.js';
 import {
   readInitialize,
   readPermissionRequest,
@@ -375,6 +375,8 @@ interface TurnRecord {
   toolSeen: boolean;
   /** The agent's `turn_completed` of the last prompt arrived. */
   endSeen: boolean;
+  /** The last `session/prompt` written: its client and request id. */
+  prompt: { client: AcpClient; id: number } | null;
   /** Length stops in a row with no tool call between. */
   lengthStops: number;
   /** Automatic continues sent. */
@@ -545,6 +547,17 @@ export class AgentHost {
     return this.sessions.get(sessionId)?.turn != null;
   }
 
+  /**
+   * Whether the typed turn's prompt is not answered yet: a turn starting, or its `session/prompt` with no reply. Read
+   * per stdout line, so a line after the reply in the same chunk already reads false.
+   */
+  promptOpen(sessionId: string): boolean {
+    const turn = this.sessions.get(sessionId)?.turn;
+    if (turn == null) return false;
+    if (turn.prompt === null) return !turn.between;
+    return turn.prompt.client.isPending(turn.prompt.id);
+  }
+
   turnState(sessionId: string): TurnState | null {
     const t = this.sessions.get(sessionId)?.turn;
     return t == null ? null : turnStateOf(t);
@@ -570,10 +583,15 @@ export class AgentHost {
   }
 
   /** The host's sessions with their busy and waiting flags. */
-  active(): Array<{ sessionId: string; busy: boolean; waiting: boolean }> {
+  active(): Array<{ sessionId: string; busy: boolean; waiting: boolean; stopping: boolean }> {
     return [...this.sessions.values()]
       .filter((s) => s.hot || s.turn !== null)
-      .map((s) => ({ sessionId: s.id, busy: s.turn !== null, waiting: s.interactions.size > 0 }));
+      .map((s) => ({
+        sessionId: s.id,
+        busy: s.turn !== null,
+        waiting: s.interactions.size > 0,
+        stopping: s.turn !== null && s.turn.recorded !== null,
+      }));
   }
 
   /** A config change (endpoint, providers, models, binary). The host restarts as soon as no turn is in flight. */
@@ -675,6 +693,7 @@ export class AgentHost {
       gap: null,
       toolSeen: false,
       endSeen: false,
+      prompt: null,
       lengthStops: 0,
       continues: 0,
     };
@@ -1370,9 +1389,10 @@ export class AgentHost {
         turn.between = false;
         turn.toolSeen = false;
         turn.endSeen = false;
-        const sent = running.process.client.request('session/prompt', promptParams(session.id, prompt), null);
+        const sent = running.process.client.start('session/prompt', promptParams(session.id, prompt), null);
+        turn.prompt = { client: running.process.client, id: sent.id };
         if (turn.continues > 0) this.opts.listener?.onAutoContinue?.(session.id, turn.continues);
-        const end = await this.promptEnd(sent, turn, running, () => exited);
+        const end = await this.promptEnd(sent.reply, turn, running, () => exited);
         if (end.outcome !== 'output-limit' || this.mode !== 'work') return this.withContinues(turn, end);
         turn.between = true;
         const recordedAtReply = turn.recorded;

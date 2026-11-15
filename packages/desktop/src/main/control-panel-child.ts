@@ -37,8 +37,15 @@ export function electronBrokerDeps(options: ControlPanelChildOptions): BrokerDep
       };
       attachLineReader(child.stdout, 'stdout', log);
       attachLineReader(child.stderr, 'stderr', log);
+      let pid: number | null = null;
+      child.on('spawn', () => {
+        pid = child.pid ?? null;
+      });
       child.on('exit', (code: number) => {
         events.onExit(code);
+      });
+      child.on('message', (message: unknown) => {
+        events.onMessage(message);
       });
       child.on('error', (type: string, location: string) => {
         // A non-continuable V8 fault. Electron documents that `exit` follows, so
@@ -54,6 +61,12 @@ export function electronBrokerDeps(options: ControlPanelChildOptions): BrokerDep
         },
         kill(): void {
           child.kill();
+        },
+        ping(n: number): void {
+          child.postMessage({ type: 'mlx-ping', n });
+        },
+        pid(): number | null {
+          return pid ?? child.pid ?? null;
         },
         forceKill(): void {
           // `utilityProcess.kill()` cannot escalate, so SIGKILL has to go through
@@ -87,6 +100,11 @@ export function electronBrokerDeps(options: ControlPanelChildOptions): BrokerDep
     report(): void {
       // Replaced by the caller; a default that swallows keeps this factory
       // usable without one.
+    },
+
+    record(): string | null {
+      // Replaced by the caller with the ledger's writer.
+      return null;
     },
 
     now: () => Date.now(),

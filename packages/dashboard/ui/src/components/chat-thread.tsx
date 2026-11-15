@@ -2,6 +2,7 @@ import { BellRing, Cpu, FilePen, FileText, Folder, GitBranch, RotateCw, Search, 
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 
+import type { AppEndContext } from '../lib/app-ends';
 import type { ConversationState } from '../lib/chat-store';
 import { CHAT, fill } from '../lib/chat-strings';
 import {
@@ -16,6 +17,7 @@ import {
   thoughtDuration,
   turnOutcome,
   turnPrompt,
+  turnStartedAt,
   turnStats,
   turnStatsTitle,
   type OutcomeLine,
@@ -92,8 +94,13 @@ export interface ChatThreadProps {
   lastEnd: ConversationState['lastEnd'];
   /** The create call is in flight: the pending row says "Starting…". */
   creating?: boolean;
-  /** For the pending row's engine words and the engine note under the last end line. */
-  host?: Pick<ChatHostState, 'inference' | 'loading' | 'resident' | 'answers'> | null;
+  /**
+   * For the pending row's engine words and the engine note under the last end line; `appEnds` for the line of a turn
+   * that a Control Panel restart stopped.
+   */
+  host?:
+    | (Pick<ChatHostState, 'inference' | 'loading' | 'resident' | 'answers'> & Partial<Pick<ChatHostState, 'appEnds'>>)
+    | null;
   /** Size on disk of a model, null when unknown: the load card prints it. */
   modelSize?: (modelId: string) => number | null;
   /** The Unload action of the engine note, for the conversation's model. None: the note has no button. */
@@ -982,8 +989,16 @@ export function ChatThread(props: ChatThreadProps): ReactElement {
   const visible = list.slice(hidden);
   // A turn runs before its prompt entry arrives: until then the last turn is the previous, ended one.
   const liveLast = running && last !== undefined && last.end === null;
+  const appEnds = props.host?.appEnds;
+  const conversationId = props.conversationId ?? null;
+  const app = (next: ThreadTurn | undefined): AppEndContext | undefined =>
+    appEnds === undefined || appEnds.length === 0 || conversationId === null
+      ? undefined
+      : { ends: appEnds, conversationId, next: next === undefined ? null : { startedAt: turnStartedAt(next) } };
   const endLine =
-    last === undefined ? null : turnOutcome(last, { last: true, running: liveLast, live: props.lastEnd, mode });
+    last === undefined
+      ? null
+      : turnOutcome(last, { last: true, running: liveLast, live: props.lastEnd, mode, app: app(undefined) });
   const note =
     endLine === null || liveLast || props.lastEnd == null
       ? null
@@ -1062,7 +1077,13 @@ export function ChatThread(props: ChatThreadProps): ReactElement {
         const seen = seenEnds.get(turn.start);
         const outcome = isLast
           ? lastOutcome
-          : turnOutcome(turn, { last: seen !== undefined, running: false, live: seen ?? null, mode });
+          : turnOutcome(turn, {
+              last: seen !== undefined,
+              running: false,
+              live: seen ?? null,
+              mode,
+              app: app(list[absolute + 1]),
+            });
         return (
           <TurnView
             key={turn.start}

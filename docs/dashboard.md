@@ -87,6 +87,96 @@ and the end text written before the close when a cut ends a thought. The cut tho
 Thought card. Responses on the same server gets none of them. An engine whose addon predates the
 guard ignores it and the end text; the budget alone still bounds the thought.
 
+## Control Panel liveness and recovery
+
+A slow reply to a page request never ends a turn. MAIN's broker is the only judge of whether the Control Panel is
+alive, and it judges from the child alone; a stuck database worker is restarted alone; every recovery leaves a record,
+and the thread says what stopped a turn.
+
+```
+page call, no reply                   MAIN broker (dk/main/broker.ts)              Control Panel
+  30 s   cancel (withdraws a           every 5 s: {type:'mlx-ping', n} ──────────▶  parent port, main thread:
+         worker call not started)                                                    one synchronous function,
+  35 s   THAT call fails: E_TIMEOUT    ◀── {type:'mlx-pong', n, open, convs, slow}   no worker, no fs, no route
+         (504). Nothing else.          any message from the child counts as life
+                                       a tick > 1 s off schedule is not counted
+                                       (MAIN stalled, the Mac slept, the clock jumped)
+                                       6 silent ticks (30 s), no turn in the last pong
+                                       24 silent ticks (120 s), a turn runs or the
+                                         child never spoke
+                                         -> intent row, SIGTERM, +12 s SIGKILL, restart
+worker call 60 s + 4 s with no
+  reply or withdrawal ack, or the
+  worker dies -> the WORKER restarts  ◀── {type:'mlx-worker', reason, route, …}      process, agents, turns stay
+```
+
+No page message can stop or restart the Control Panel: the page, the preload and MAIN have no such channel. A page call
+that gets no reply of any kind in 35 s fails alone with `E_TIMEOUT` ("The app did not answer in 35 s.", and for a
+mutation "The change may or may not have been applied."); streams and other calls are untouched, and the page gets no
+retry timer. A turn of any length passes the liveness check as long as the Control Panel answers one ping in 120 s;
+the Control Panel also pushes a pong when a turn starts and when one ends, so MAIN never holds a turn count older than
+the turn. A turn the agent starts by itself (a wake) counts as running from its first update with no typed prompt open
+(the typed turn's reply may come in the same stdout chunk) until its `turn_completed` line or the agent's exit. At a
+signal the Control Panel tells MAIN once which turns its close cancels; a turn the user already stopped is not listed.
+
+A stuck or dead database worker is replaced once its exit is confirmed (a queued mutation must be dead first). Its open
+calls fail with `E_UNAVAILABLE` "Dashboard database restarted; the request was not answered"; the next call goes to the
+new worker. Restart delays are 0, then 5, 10, 20 and 40 s for each worker that dies, or hangs on a call posted, within
+60 s of its start; after six such deaths in a row worker routes fail at once, and a call 60 s or more later starts one
+new worker.
+
+| timer                                         | value                                 | what it does                                                         |
+| --------------------------------------------- | ------------------------------------- | -------------------------------------------------------------------- |
+| page call                                     | 30 s + 5 s                            | fails that call (`E_TIMEOUT`)                                        |
+| database worker call                          | 60 s + 4 s                            | restarts the worker                                                  |
+| MAIN silence, no turn                         | 30 s (6 ticks)                        | restarts the Control Panel                                           |
+| MAIN silence, a turn runs or no first message | 120 s (24 ticks)                      | restarts the Control Panel: the one app deadline that can end a turn |
+| kill grace                                    | 12 s                                  | SIGKILL after SIGTERM                                                |
+| Control Panel exit cap                        | 10 s                                  | its own teardown                                                     |
+| agent stop ladder                             | EOF, +1.5 s, +1 s                     | stops the agent at teardown                                          |
+| `pageGoneMs`                                  | 60 s                                  | with no window, open Work requests are denied                        |
+| Chat turn cap                                 | 10 min, Chat only                     | ends a Chat turn                                                     |
+| restart budget                                | 6 short lives, 0 / 5 / 10 / 20 / 40 s | a liveness restart counts                                            |
+
+**The record.** MAIN writes `~/.mlx-node/ledger/main-<startMs>-<pid>.1.jsonl` (folder 0700, file 0600, append only, one
+synchronous write per row, no fsync; files older than 30 days are deleted at MAIN start). Every row has `v`, `t`
+(epoch ms), `m` (monotonic ms), `p` (`<pid>.<startMs>`), `n` (row number) and `k` (kind):
+
+| `k`           | written                                                      | fields                                                                                                               |
+| ------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| `proc`        | first row                                                    | `role: main`, `host: desktop`, `pid`, `ppid`, `ver`, `seq`                                                           |
+| `child.spawn` | each fork                                                    | `role: panel`, `gen`, `pid` when known                                                                               |
+| `slow`        | 2 silent ticks (`op: loop`), and the first message after     | `target: panel`, `state` (`open`, `done`), `ageMs`                                                                   |
+| `slow`        | once per page call a pong shows 30 s old (`op: rpc`)         | `route` (a pattern such as `GET /api/sessions/:id`), `thread`, `ageMs`, `wq`, `wbusyMs`, `wroute`                    |
+| `intent`      | before the SIGTERM; at SIGKILL; at a worker restart; at quit | `what`, `cause`, `stage` (`start`, `idle`, `turn`), `ageMs`, `open`, `convs`, `target`, `by`, `reason`               |
+| `child.exit`  | every exit: one row per recovery                             | `child`, `pid`, `code`, `asked`, `cause`, `by`, `sinceIntentMs`, `uptimeMs`, `crashes`, `open`, `convs`, `cancelled` |
+| `note`        | after a dropped field, or a failed write                     | `what`, `count`, `from`, `to`                                                                                        |
+
+`cause` of an exit: `main.panel_no_pong` (the broker's own restart), `panel.exit_unasked` (a crash: not asked, code
+other than 0), `os.signal_term` (not asked, code 0: the Control Panel's own SIGTERM/SIGINT handler ran), `user.app_quit`.
+`convs` are the turns of MAIN's last pong; `cancelled` the turns the dying Control Panel said it was cancelling as
+`app-closed`, posted before its teardown does anything async. One encoder writes every line: a row holds numbers,
+booleans, list members, UUIDs, row ids and route patterns only; anything else is dropped and counted. A failed write
+is counted, said once on MAIN's stderr, and never delays or changes a stop. MAIN hands the folder to the Control Panel
+as `MLX_PANEL_LEDGER_DIR`.
+
+**The thread.** The next Control Panel reads the ends at start (newest first, at most 32, from the last 1 MiB of the newest files) and sends them in
+the host state as `appEnds`. A turn of conversation C gets the line of an end when its stored end is `cancelled`, C is
+in the end's `cancelled` list and the end lies between the decision and the exit (1 s of slack each side); or when it
+has no stored end, C is in either list, it started by the exit, and the conversation's next turn, if any, started after
+the exit (so the line stays after Continue). The line replaces "This answer stopped before the end." or "This answer did
+not finish.", with Continue:
+
+| trigger | line                                                                                                                         |
+| ------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| no-ping | The app restarted its Control Panel because it did not answer for 120 s. The turn was stopped by the app, not by you.        |
+| crash   | The Control Panel of the app stopped by itself (exit code 1) and was restarted. The turn was stopped by the app, not by you. |
+| signal  | Something outside the app stopped its Control Panel. The turn was stopped with it, not by you.                               |
+| quit    | The app was closed during this turn.                                                                                         |
+
+A Stop the user pressed is never in the `cancelled` list, so it keeps its own words; with no `cancelled` list (the
+note was lost) a stored `cancelled` end keeps "This answer stopped before the end.".
+
 ## Using it as a library
 
 ```ts
@@ -783,6 +873,8 @@ yarn workspace @mlx-node/dashboard dev:shots         # PNGs, light/dark x 1180x8
   reports: on with the native 128-block limit, off, or no field at all (default: on, the whole prompt).
   `MLX_DEV_FLIGHT=phases` adds three turns before their prefill: model busy, waiting for a slot, preparing.
   `MLX_DEV_LOAD_KERNELS=3/50` reports the harness engine's load as "Preparing GPU kernels", 3 of 50.
+- `MLX_DEV_APP_END=no-ping|crash|signal|user` hands the runtime one earlier Control Panel end over every Work
+  conversation of the fixture home, so the last unfinished turn of each shows its line.
 - Chat and Work run only on the scripted fake agent (`__test__/helpers/fake-agent.mjs`, script
   `__test__/fixtures/chat-scenarios/chat-harness.json`, picked by a word of the prompt), with keys in memory and the
   providers on loopback. The folder dialog answers a throwaway folder in the fixture home.

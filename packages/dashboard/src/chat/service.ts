@@ -15,6 +15,7 @@ import { agentConfigDir } from '@mlx-node/agent/paths';
 import { ggufSplitPartNames, parseGgufFileName } from '@mlx-node/lm/model-discovery';
 
 import { AgentSessionsReader } from '../agent-sessions/reader.js';
+import type { UpdateLine } from '../agent-sessions/transcript.js';
 import type { SessionDetailResponse } from '../agent-sessions/types.js';
 import { deleteSession, renameSession, SessionWriteError, validateRenameTitle } from '../agent-sessions/writes.js';
 import { ApiError } from '../api/errors.js';
@@ -63,6 +64,7 @@ import { agentTitle, promptTitle, resolveTitle } from './titles.js';
 import {
   CONTINUE_PROMPT,
   type AgentModeState,
+  type AppEnd,
   type PermissionMark,
   type PermissionMode,
   type ChatHostEvent,
@@ -139,6 +141,10 @@ export interface ChatServiceOptions {
   stateCoalesceMs?: number;
   unloadMaxMs?: number;
   now?: () => number;
+  /** How earlier Control Panel lives ended (MAIN's ledger), carried in the host state. */
+  appEnds?: Promise<readonly AppEnd[]>;
+  /** Called when a turn starts or ends. */
+  onBusyChange?: () => void;
 }
 
 /** The web server entry: the built `server.js` when it exists, else the source bootstrap. */
@@ -204,9 +210,14 @@ export class ChatService {
   private readonly draft = new PermissionDraft();
   private readonly home: string;
   private readonly workHome: string;
+  /** Read once at start; a failed read is no ends. */
+  private readonly appEnds: Promise<readonly AppEnd[]>;
+  /** Conversations whose agent works with no typed turn running (a woken turn, or work between turns). */
+  private readonly woken = new Set<string>();
 
   constructor(options: ChatServiceOptions) {
     this.opts = options;
+    this.appEnds = (options.appEnds ?? Promise.resolve([])).catch(() => []);
     this.now = options.now ?? Date.now;
     this.readEndpoint = safeReader(options.readEndpoint);
     this.providers = options.providers;
@@ -300,6 +311,26 @@ export class ChatService {
 
   async state(): Promise<ChatHostState> {
     return this.computeState();
+  }
+
+  /** The conversations with a turn running, both modes, woken turns included. Synchronous: no worker, no fs. */
+  busyConversations(): string[] {
+    const out = new Set<string>();
+    for (const mode of ['chat', 'work'] as const) {
+      for (const a of this.hosts[mode].active()) if (a.busy) out.add(a.sessionId);
+    }
+    for (const id of this.woken) out.add(id);
+    return [...out];
+  }
+
+  /** {@link busyConversations} less the turns already stopping for another cause (a Stop, a cap): a close keeps it. */
+  closingConversations(): string[] {
+    const out = new Set<string>();
+    for (const mode of ['chat', 'work'] as const) {
+      for (const a of this.hosts[mode].active()) if (a.busy && !a.stopping) out.add(a.sessionId);
+    }
+    for (const id of this.woken) out.add(id);
+    return [...out];
   }
 
   /**
@@ -1250,6 +1281,7 @@ export class ChatService {
     conversation.userPrompt(text);
     void started.done.catch(() => {});
     this.updateLive();
+    this.busyChanged();
     return { turnId: started.turnId };
   }
 
@@ -1260,7 +1292,10 @@ export class ChatService {
     };
     return {
       onState: () => this.scheduleState(),
-      onUpdate: (id, line) => conv(id)?.applyLine(line),
+      onUpdate: (id, line) => {
+        conv(id)?.applyLine(line);
+        this.trackWake(mode, id, line);
+      },
       onTitle: (id, title) => {
         const c = conv(id);
         const named = resolveTitle(title, null);
@@ -1271,6 +1306,7 @@ export class ChatService {
       onModel: (id, modelId) => conv(id)?.setInfo({ modelId }),
       onAutoContinue: (id) => conv(id)?.userPrompt(CONTINUE_PROMPT),
       onTurn: (id, turn) => {
+        if (turn !== null) this.woken.delete(id);
         const c = conv(id);
         if (c === undefined || turn === null) return;
         if (turn.phase === 'running' && !c.info.hot && this.hosts[mode].isHot(id)) c.setInfo({ hot: true });
@@ -1285,6 +1321,7 @@ export class ChatService {
         }
         this.updateLive();
         this.scheduleState();
+        this.busyChanged();
       },
       onInteraction: (id, interaction) => {
         conv(id)?.interaction(interaction);
@@ -1300,10 +1337,13 @@ export class ChatService {
       onModeMarked: (id, mark) => this.modeMarked(id, mark),
       onModeWithdrawn: (id, mark) => this.modeWithdrawn(id, mark),
       onCold: (ids) => {
+        let woke = false;
         for (const id of ids) {
+          if (this.woken.delete(id)) woke = true;
           const c = conv(id);
           if (c !== undefined) void this.goCold(c);
         }
+        if (woke) this.busyChanged();
       },
     };
   }
@@ -1350,6 +1390,30 @@ export class ChatService {
     } else if (!wanted && this.liveOff !== null) {
       this.liveOff();
       this.liveOff = null;
+    }
+  }
+
+  /**
+   * A content update with no typed prompt open starts a woken turn; the agent's `turn_completed` ends it. A wake that
+   * follows the typed turn's reply in one stdout chunk counts although the typed turn has not cleared yet.
+   */
+  private trackWake(mode: ChatMode, id: string, line: UpdateLine): void {
+    if (this.hosts[mode].promptOpen(id)) return;
+    const kind = line.update.sessionUpdate;
+    if (line.xai) {
+      if (kind === 'turn_completed' && this.woken.delete(id)) this.busyChanged();
+      return;
+    }
+    if (typeof kind !== 'string' || !WAKE_KINDS.has(kind) || this.woken.has(id)) return;
+    this.woken.add(id);
+    this.busyChanged();
+  }
+
+  private busyChanged(): void {
+    try {
+      this.opts.onBusyChange?.();
+    } catch {
+      // A notice to MAIN never changes a turn.
     }
   }
 
@@ -1447,6 +1511,7 @@ export class ChatService {
       });
     }
     const agent = this.agentState();
+    const appEnds = [...(await this.appEnds)];
     const active: ChatHostState['active'] = [];
     for (const mode of ['chat', 'work'] as const) {
       for (const a of this.hosts[mode].active()) {
@@ -1474,6 +1539,7 @@ export class ChatService {
       permissionDraft: this.draft.shown(),
       tempRoot: typedTop(this.tempRoots[0]),
       tempTop: this.tempRoots[0]?.top ?? null,
+      appEnds,
     };
   }
 
@@ -1532,6 +1598,16 @@ async function pathSize(path: string, depth: number): Promise<number> {
   for (const name of await readdir(path)) total += await pathSize(join(path, name), depth + 1);
   return total;
 }
+
+/** Update kinds that mean the agent is working. */
+const WAKE_KINDS: ReadonlySet<string> = new Set([
+  'user_message_chunk',
+  'agent_message_chunk',
+  'agent_thought_chunk',
+  'tool_call',
+  'tool_call_update',
+  'plan',
+]);
 
 function infoOf(detail: SessionDetailResponse, mode: ChatMode, hot: boolean): ConversationInfo {
   const s = detail.session;

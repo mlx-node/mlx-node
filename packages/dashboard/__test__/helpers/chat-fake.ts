@@ -302,6 +302,9 @@ export interface FakeServiceOptions {
   live?: ChatServiceOptions['live'];
   /** The temp roots Auto covers (default: none); `'default'` leaves the service's own default. */
   tempRoots?: ChatServiceOptions['tempRoots'] | 'default';
+  /** Read at each service start (a Control Panel restart reads MAIN's ledger again). */
+  appEnds?: () => ChatServiceOptions['appEnds'];
+  onBusyChange?: ChatServiceOptions['onBusyChange'];
 }
 
 export interface FakeService {
@@ -398,6 +401,8 @@ export function fakeService(name: string, options: FakeServiceOptions = {}): Fak
       flushMs: 5,
       stateCoalesceMs: 5,
       createBudgetMs: options.createBudgetMs,
+      appEnds: options.appEnds?.(),
+      onBusyChange: options.onBusyChange,
     });
   const records = (): Json[] => {
     try {

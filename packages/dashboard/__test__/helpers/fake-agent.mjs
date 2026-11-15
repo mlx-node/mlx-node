@@ -8,7 +8,7 @@
 // request the agent sends (`ask`), and each permission-gated tool it runs (`exec`) with the request that allowed it.
 
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const scenario = JSON.parse(readFileSync(process.argv[2], 'utf8'));
@@ -42,8 +42,12 @@ record({
 });
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+// Lines held for one stdout write while non-null.
+let batch = null;
 function send(message) {
-  process.stdout.write(`${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`);
+  const line = `${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`;
+  if (batch === null) process.stdout.write(line);
+  else batch.push(line);
 }
 function reply(id, result) {
   send({ id, result });
@@ -423,6 +427,38 @@ function endCancelled(id, session, category) {
   });
   session.turn = null;
   reply(id, { stopReason: 'cancelled', _meta: { sessionId: session.id, cancellationCategory: category } });
+}
+
+// A turn the agent starts by itself after a background task: once `startOn` exists it sends a hidden prompt and an
+// answer; once `endOn` exists, its end line. With `together`, the prompt and answer go at once, in the same stdout
+// write as the typed turn's end line and reply.
+async function wakeLater(session, wake) {
+  const fileAppears = async (path) => {
+    while (!existsSync(path)) await sleep(10);
+  };
+  if (wake.together !== true) await fileAppears(wake.startOn);
+  const promptId = `task-${randomUUID()}`;
+  update(session, 'user_message_chunk', {
+    content: { type: 'text', text: 'A background task finished.' },
+    _meta: { hideFromScrollback: true },
+  });
+  update(session, 'agent_message_chunk', { content: { type: 'text', text: 'Looked at it.' } });
+  if (batch !== null) {
+    process.stdout.write(batch.join(''));
+    batch = null;
+  }
+  await fileAppears(wake.endOn);
+  update(
+    session,
+    'turn_completed',
+    {
+      prompt_id: promptId,
+      stop_reason: 'end_turn',
+      usage: { inputTokens: 1, outputTokens: 1, modelCalls: 1 },
+      elapsed_ms: 10,
+    },
+    true,
+  );
 }
 
 async function streamText(session, kind, text, chunk, delayMs) {
@@ -839,7 +875,23 @@ async function runPrompt(id, params) {
       session.turn = null;
       commandsUpdate(session);
       persistSummary(session);
-      return reply(id, { stopReason: step.end.stopReason, _meta: { sessionId: session.id, ...step.end.meta } });
+      if (step.end.wake?.together === true) {
+        batch = [];
+        update(
+          session,
+          'turn_completed',
+          {
+            prompt_id: `typed-${randomUUID()}`,
+            stop_reason: step.end.stopReason,
+            usage: { inputTokens: 1, outputTokens: 1, modelCalls: 1 },
+            elapsed_ms: 10,
+          },
+          true,
+        );
+      }
+      reply(id, { stopReason: step.end.stopReason, _meta: { sessionId: session.id, ...step.end.meta } });
+      if (step.end.wake !== undefined) void wakeLater(session, step.end.wake);
+      return;
     }
   }
   if (session.turn?.cancelled) return endCancelled(id, session, 'MidTurnAbort');

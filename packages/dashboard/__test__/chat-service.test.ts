@@ -1388,3 +1388,98 @@ describe('Chat service — Work', () => {
     );
   }, 30_000);
 });
+
+describe('Chat service — what MAIN learns of turns and of earlier panel lives', () => {
+  it('carries the earlier ends in the host state, and tells of each turn start and end at once', async () => {
+    const appEnd = {
+      trigger: 'no-ping' as const,
+      decidedAt: 1_000,
+      exitAt: 3_000,
+      silentMs: 120_000,
+      code: 0,
+      convs: ['01a1d519-7b3c-7d4e-8f50-61728394a5b6'],
+      cancelled: null,
+    };
+    const busy: string[][] = [];
+    let service: ChatService | null = null;
+    const fake = fakeService('chat-basic', {
+      appEnds: () => Promise.resolve([appEnd]),
+      onBusyChange: () => busy.push(service?.busyConversations() ?? []),
+    });
+    service = fake.service;
+    try {
+      expect((await fake.service.state()).appEnds).toEqual([appEnd]);
+      const { conversation } = await fake.service.create({ mode: 'chat', text: 'hello' });
+      const page = new Page(fake.service, conversation.id);
+      await until(() => page.ends().length === 1, 5_000);
+      page.detach();
+      expect(busy).toEqual([[conversation.id], []]);
+      expect(fake.service.busyConversations()).toEqual([]);
+    } finally {
+      await fake.close();
+    }
+  }, 20_000);
+
+  it('a turn the agent wakes by itself counts as running until its end line', async () => {
+    const flags = mkdtempSync(join(tmpdir(), 'mlx-wake-'));
+    const startOn = join(flags, 'start');
+    const endOn = join(flags, 'end');
+    const busy: string[][] = [];
+    let service: ChatService | null = null;
+    const fake = fakeService('chat-basic', {
+      mutate: (scenario) => {
+        const steps = (scenario.prompts as Array<{ steps: Array<Record<string, unknown>> }>)[0]!.steps;
+        steps[steps.length - 1] = { end: { stopReason: 'end_turn', wake: { startOn, endOn } } };
+      },
+      onBusyChange: () => busy.push(service?.busyConversations() ?? []),
+    });
+    service = fake.service;
+    try {
+      const { conversation } = await fake.service.create({ mode: 'chat', text: 'hello' });
+      await until(() => busy.length === 2, 5_000);
+      expect(busy).toEqual([[conversation.id], []]);
+      writeFileSync(startOn, '');
+      await until(() => busy.length === 3, 5_000);
+      expect(busy[2]).toEqual([conversation.id]);
+      expect(fake.service.busyConversations()).toEqual([conversation.id]);
+      writeFileSync(endOn, '');
+      await until(() => busy.length === 4, 5_000);
+      expect(busy[3]).toEqual([]);
+    } finally {
+      await fake.close();
+      rmSync(flags, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('a wake whose lines share one stdout chunk with the turn reply counts as running', async () => {
+    const flags = mkdtempSync(join(tmpdir(), 'mlx-wake-'));
+    const endOn = join(flags, 'end');
+    const fake = fakeService('chat-basic', {
+      mutate: (scenario) => {
+        const steps = (scenario.prompts as Array<{ steps: Array<Record<string, unknown>> }>)[0]!.steps;
+        steps[steps.length - 1] = { end: { stopReason: 'end_turn', wake: { together: true, endOn } } };
+      },
+    });
+    try {
+      const { conversation } = await fake.service.create({ mode: 'chat', text: 'hello' });
+      const page = new Page(fake.service, conversation.id);
+      await until(() => page.ends().length === 1, 5_000);
+      page.detach();
+      expect(fake.service.busyConversations()).toEqual([conversation.id]);
+      writeFileSync(endOn, '');
+      await until(() => fake.service.busyConversations().length === 0, 5_000);
+    } finally {
+      await fake.close();
+      rmSync(flags, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('a failed ledger read leaves the host state with no ends', async () => {
+    const fake = fakeService('chat-basic', { appEnds: () => Promise.reject(new Error('EACCES')) });
+    try {
+      expect((await fake.service.state()).appEnds).toEqual([]);
+    } finally {
+      await fake.close();
+    }
+  }, 20_000);
+});

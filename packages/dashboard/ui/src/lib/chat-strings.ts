@@ -414,6 +414,14 @@ export const CHAT = {
     'refused-work': 'Work could not be started safely.',
     ended: 'Ended: {stopReason}',
     unfinished: 'This answer did not finish.',
+    'app-no-ping':
+      'The app restarted its Control Panel because it did not answer for {n} s. The turn was stopped by the app, not by you.',
+    'app-crash':
+      'The Control Panel of the app stopped by itself (exit code {code}) and was restarted. The turn was stopped by the app, not by you.',
+    'app-crash-no-code':
+      'The Control Panel of the app stopped by itself and was restarted. The turn was stopped by the app, not by you.',
+    'app-signal': 'Something outside the app stopped its Control Panel. The turn was stopped with it, not by you.',
+    'app-quit': 'The app was closed during this turn.',
   },
   sendAgain: 'Send again',
   continueAnswer: 'Continue',
