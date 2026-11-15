@@ -1371,6 +1371,41 @@ pub(crate) fn adopt_all<T: DFlash2Target>(target: &mut T) -> u64 {
     adopted
 }
 
+/// A model's state tier with the states it holds, set aside while its
+/// load's warm-up runs.
+pub(crate) struct HeldTier {
+    store: HybridStateStore<PagedAnchor>,
+    disk: StateDisk,
+    cold: Option<ColdTierContext>,
+}
+
+/// Sets the tier, its states and the adapter's view of it aside behind an
+/// empty store: what a warm-up's cache reset clears is not theirs, and no
+/// scratch turn can stage, write, adopt or evict one. `None` without a tier.
+pub(crate) fn hold_tier<T: DFlash2Target>(target: &mut T) -> Option<HeldTier> {
+    let states = target.dflash2_states_mut();
+    let disk = states.disk.take()?;
+    let empty = HybridStateStore::new(states.store.block_size());
+    let store = std::mem::replace(&mut states.store, empty);
+    let cold = target
+        .paged_adapter_mut_ref()
+        .and_then(PagedKVCacheAdapter::take_cold_tier);
+    target.sync_gdn_state_marks();
+    Some(HeldTier { store, disk, cold })
+}
+
+/// Puts a [`hold_tier`] back; the store that stood in for it goes.
+pub(crate) fn release_tier<T: DFlash2Target>(target: &mut T, held: HeldTier) {
+    let HeldTier { store, disk, cold } = held;
+    let states = target.dflash2_states_mut();
+    states.store = store;
+    states.disk = Some(disk);
+    if let (Some(cold), Some(adapter)) = (cold, target.paged_adapter_mut_ref()) {
+        adapter.set_cold_tier(cold);
+    }
+    target.sync_gdn_state_marks();
+}
+
 /// Splash `closePersistentCache` with `FdTransport::runFlush` at a clean
 /// stop: a persistent tier copies every restore point still waiting,
 /// newest first, moving owed chains between landings, until `deadline`,

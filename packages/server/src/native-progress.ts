@@ -1,61 +1,25 @@
 /**
- * The native load, warm-up and turn-phase reports the server reads, typed
- * here so an addon that predates them reads as "not known": every reader
- * returns null (or leaves a field out) when the export or the field is
- * missing, never 0 and never an error.
+ * The native load, warm-up and turn-phase reports the server reads. Every
+ * reader returns null (or leaves a field out) when a report is missing or
+ * malformed, never 0 and never an error.
  */
 
 import * as core from '@mlx-node/core';
-import type { ChatStreamProgress } from '@mlx-node/core';
+import type { ChatStreamProgress, LoadProgress, PipelineStats, WarmupReport } from '@mlx-node/core';
+
+export type { LoadProgress, PipelineStats, WarmupReport };
 
 /** Every phase a native turn reports. */
-export type TurnPhase = 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode' | 'done';
+export type TurnPhase = ChatStreamProgress['phase'];
 
 /**
  * A native progress snapshot. `waitMs` runs from creation to pickup;
  * `slotMs` and `prepareMs` are absent before pickup. An older addon sends
- * none of the three, so all three are optional here whatever the addon's
- * declaration says.
+ * none of the three, so `waitMs` is optional here.
  */
-export interface TurnProgressSnapshot extends Omit<ChatStreamProgress, 'phase' | 'waitMs' | 'slotMs' | 'prepareMs'> {
-  phase: TurnPhase;
+export interface TurnProgressSnapshot extends Omit<ChatStreamProgress, 'waitMs'> {
   waitMs?: number;
-  slotMs?: number;
-  prepareMs?: number;
 }
-
-/** One model load in flight. `weights`: `steps` and `stepsDone` are 0. */
-export interface LoadProgress {
-  phase: 'weights' | 'kernels';
-  steps: number;
-  stepsDone: number;
-}
-
-/** The load-time warm-up of a paged Qwen3.5 load. */
-export interface WarmupReport {
-  ms: number;
-  steps: number;
-  skipped: number;
-  reset: number;
-  pipelines: number;
-  compileMs: number;
-  peakBytes: number;
-}
-
-/** Process-wide, cumulative GPU pipeline creation counts. */
-export interface PipelineStats {
-  createdLoading: number;
-  createdServing: number;
-  loadingMs: number;
-  servingMs: number;
-}
-
-interface NativeReports {
-  loadProgress?: (path: string) => unknown;
-  pipelineStats?: () => unknown;
-}
-
-const NATIVE = core as unknown as NativeReports;
 
 type Obj = Record<string, unknown>;
 
@@ -108,21 +72,19 @@ export function warmupReportOf(value: unknown): WarmupReport | null {
   return report as WarmupReport;
 }
 
-/** The native load progress of `path`; null when no load reports or the addon predates the export. */
+/** The native load progress of `path`; null when no load reports. */
 export function readLoadProgress(path: string): LoadProgress | null {
   try {
-    const read = NATIVE.loadProgress;
-    return typeof read === 'function' ? loadProgressOf(read(path)) : null;
+    return loadProgressOf(core.loadProgress(path));
   } catch {
     return null;
   }
 }
 
-/** The process-wide pipeline counter; null while it is off, dead, or the addon predates it. */
+/** The process-wide pipeline counter; null while it is off or dead. */
 export function readPipelineStats(): PipelineStats | null {
   try {
-    const read = NATIVE.pipelineStats;
-    return typeof read === 'function' ? pipelineStatsOf(read()) : null;
+    return pipelineStatsOf(core.pipelineStats());
   } catch {
     return null;
   }

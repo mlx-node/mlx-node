@@ -104,6 +104,7 @@ mod free_released_wiring_tests {
                     None,
                     crate::engine::scheduler::DEFAULT_DECODE_SHARE,
                     crate::disk_tier::DiskTierOptions::default(),
+                    crate::engine::load_progress::LoadProgressCell::detached(),
                 )
                 .await
                 .map(drop),
@@ -115,6 +116,7 @@ mod free_released_wiring_tests {
                     None,
                     crate::engine::scheduler::DEFAULT_DECODE_SHARE,
                     crate::disk_tier::DiskTierOptions::default(),
+                    crate::engine::load_progress::LoadProgressCell::detached(),
                 )
                 .await
                 .map(drop),

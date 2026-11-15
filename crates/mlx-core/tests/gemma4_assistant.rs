@@ -134,6 +134,8 @@ fn chat_config(max_new_tokens: i32, enable_mtp: bool) -> ChatConfig {
         tools: None,
         reasoning_effort: None,
         thinking_token_budget: None,
+        thinking_cycle_guard: None,
+        thinking_end_text: None,
         include_reasoning: Some(false),
         report_performance: Some(true),
         reuse_cache: Some(true),

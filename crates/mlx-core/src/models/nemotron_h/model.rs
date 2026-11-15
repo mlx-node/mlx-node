@@ -2364,8 +2364,10 @@ impl NemotronHInner {
             crate::engine::params::generated_capacity_hint(max_new_tokens),
         );
         let mut finish_reason = String::from("length");
-        let mut reasoning_tracker =
-            crate::engine::ReasoningTracker::from_setup(&args.thinking, &tokenizer.think_end());
+        let mut reasoning_tracker = crate::engine::ReasoningTracker::from_setup(
+            &args.thinking,
+            &tokenizer.think_end(args.config),
+        );
         let extra_eos_ids = ChatBackend::extra_eos_ids(self);
         let eos_before_emit = ChatBackend::eos_before_emit(self);
         let stream_skip_special = ChatBackend::stream_skip_special_tokens(self);
@@ -2483,7 +2485,7 @@ impl NemotronHInner {
                 include_reasoning: p.include_reasoning,
                 thinking_enabled: args.thinking.enabled,
                 prompt_tokens: tokens.len() as u32,
-                reasoning_tokens: reasoning_tracker.reasoning_token_count(),
+                reasoning: reasoning_tracker.outcome(),
             },
         )?;
         result.cached_tokens = cached_prefix_len as u32;
@@ -2662,8 +2664,10 @@ impl NemotronHInner {
         debug_assert_eq!(committed_len as usize, tokens.len());
         self.pending_mtp_draft_seed = Some((mtp_caches, committed_len));
 
-        let mut reasoning_tracker =
-            crate::engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
+        let mut reasoning_tracker = crate::engine::ReasoningTracker::from_setup(
+            &thinking,
+            &tokenizer.think_end(args.config),
+        );
         let mut rng = rand::rng();
         let outcome = crate::engine::mtp_turn::run_mtp_turn(
             self,
@@ -2726,7 +2730,7 @@ impl NemotronHInner {
             p.include_reasoning,
             thinking.enabled,
             tokens.len() as u32,
-            reasoning_tracker.reasoning_token_count(),
+            reasoning_tracker.outcome(),
         )?;
         // The flat MTP path re-prefills the full prompt every turn.
         result.cached_tokens = 0;
@@ -3897,6 +3901,7 @@ mod scheduler_tests {
             thinking: ThinkingSetup {
                 enabled: false,
                 budget: None,
+                cycle_guard: false,
             },
             plan,
             sink: Some(&sink),
@@ -3993,6 +3998,7 @@ mod scheduler_tests {
                 thinking: ThinkingSetup {
                     enabled: false,
                     budget: None,
+                    cycle_guard: false,
                 },
                 plan,
                 sink: None,
@@ -4102,6 +4108,7 @@ mod scheduler_tests {
             thinking: ThinkingSetup {
                 enabled: false,
                 budget: None,
+                cycle_guard: false,
             },
             plan,
             sink: None,

@@ -1109,6 +1109,18 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
         self.max_num_seqs
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_max_num_seqs(&mut self, max_num_seqs: usize) {
+        self.max_num_seqs = max_num_seqs.max(1);
+    }
+
+    /// One shared token budget per step, each prefill row also ending at its
+    /// pinned break, in place of the measured unit.
+    #[cfg(test)]
+    pub(crate) fn set_fixed_prefill_budget(&mut self, budget: u32) {
+        self.prefill = PrefillUnit::Fixed { budget };
+    }
+
     pub fn contains_seq(&self, seq_id: SeqId) -> bool {
         self.waiting
             .iter()

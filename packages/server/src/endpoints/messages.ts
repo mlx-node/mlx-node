@@ -99,7 +99,6 @@ import {
   ModelLoadQueueFullError,
   type ModelWorkCoordinator,
 } from '../model-work-coordinator.js';
-import type { ThinkingChatConfig } from '../native-thinking.js';
 import type { ModelRegistry } from '../registry.js';
 import { MAX_OUTPUT_TOKENS, validateAndCanonicalizeHistoryToolOrder } from '../request-validation.js';
 import { QueueFullError, type PreDispatchAdmission, type SessionRegistry } from '../session-registry.js';
@@ -233,7 +232,7 @@ export interface ServerThinking {
 export function applyServerThinking(
   config: ChatConfig,
   server: ServerThinking | undefined,
-): { config: ThinkingChatConfig; from: TurnBudgetFrom | undefined } {
+): { config: ChatConfig; from: TurnBudgetFrom | undefined } {
   const own = config.thinkingTokenBudget !== undefined;
   if (server === undefined || config.reasoningEffort === 'none') {
     return { config, from: own ? 'request' : undefined };
@@ -242,7 +241,7 @@ export function applyServerThinking(
   const guard = server.cycleGuard === true;
   const endText = server.endText !== undefined && server.endText !== '' ? server.endText : undefined;
   if (!budget && !guard && endText === undefined) return { config, from: own ? 'request' : undefined };
-  const out: ThinkingChatConfig = { ...config };
+  const out: ChatConfig = { ...config };
   if (budget) out.thinkingTokenBudget = server.tokenBudget;
   if (guard) out.thinkingCycleGuard = true;
   if (endText !== undefined) out.thinkingEndText = endText;

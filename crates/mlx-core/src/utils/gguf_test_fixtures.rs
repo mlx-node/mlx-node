@@ -217,6 +217,29 @@ pub(crate) fn build_minimal_gguf(
     metadata: &[(&str, GgufMetaValue)],
     tensors: &[(&str, &[u64], GgufTensorType, &[u8])],
 ) -> Vec<u8> {
+    let described: Vec<(&str, &[u64], GgufTensorType, u64)> = tensors
+        .iter()
+        .map(|(name, dims, ty, data)| (*name, *dims, *ty, data.len() as u64))
+        .collect();
+    let (mut buf, tensor_offsets) = gguf_header(metadata, &described);
+    let data_start = buf.len();
+    for (i, (_, _, _, data)) in tensors.iter().enumerate() {
+        let target_offset = data_start + tensor_offsets[i] as usize;
+        while buf.len() < target_offset {
+            buf.push(0);
+        }
+        buf.extend_from_slice(data);
+    }
+    buf
+}
+
+/// A GGUF file's bytes before its data section (padded to the alignment),
+/// and each tensor's offset in that section, for tensors of the given byte
+/// lengths.
+fn gguf_header(
+    metadata: &[(&str, GgufMetaValue)],
+    tensors: &[(&str, &[u64], GgufTensorType, u64)],
+) -> (Vec<u8>, Vec<u64>) {
     let mut buf = Vec::new();
 
     // Magic
@@ -335,19 +358,17 @@ pub(crate) fn build_minimal_gguf(
 
     // Compute tensor data: collect offsets
     let alignment: u64 = GGUF_DEFAULT_ALIGNMENT;
-    let mut tensor_data_parts: Vec<&[u8]> = Vec::new();
     let mut tensor_offsets: Vec<u64> = Vec::new();
     let mut current_offset: u64 = 0;
 
-    for (_, _, _, data) in tensors {
+    for (_, _, _, len) in tensors {
         // Align offset
         let remainder = current_offset % alignment;
         if remainder != 0 {
             current_offset += alignment - remainder;
         }
         tensor_offsets.push(current_offset);
-        tensor_data_parts.push(data);
-        current_offset += data.len() as u64;
+        current_offset += len;
     }
 
     // Write tensor info descriptors
@@ -374,17 +395,7 @@ pub(crate) fn build_minimal_gguf(
         buf.extend(vec![0u8; padding as usize]);
     }
 
-    // Write tensor data
-    let data_start = buf.len();
-    for (i, data) in tensor_data_parts.iter().enumerate() {
-        let target_offset = data_start + tensor_offsets[i] as usize;
-        while buf.len() < target_offset {
-            buf.push(0);
-        }
-        buf.extend_from_slice(data);
-    }
-
-    buf
+    (buf, tensor_offsets)
 }
 
 /// A GGUF read back whole: metadata sorted by key, tensors in file order with
@@ -728,12 +739,7 @@ pub(crate) fn fixture_payload(ty: GgufTensorType, elements: usize, seed: u64) ->
                 .flat_map(|v| half::bf16::from_f32(v).to_bits().to_le_bytes())
                 .collect();
         }
-        GgufTensorType::Q4K => (256, 144, &[0, 2]),
-        GgufTensorType::Q5K => (256, 176, &[0, 2]),
-        GgufTensorType::Q6K => (256, 210, &[208]),
-        GgufTensorType::Q8_0 => (32, 34, &[0]),
-        GgufTensorType::Q4_0 => (32, 18, &[0]),
-        other => panic!("no fixture payload for {other:?}"),
+        other => block_layout(other).unwrap_or_else(|| panic!("no fixture payload for {other:?}")),
     };
     assert_eq!(elements % block_elems, 0, "{ty:?} needs whole blocks");
     let blocks = elements / block_elems;
@@ -751,6 +757,36 @@ pub(crate) fn fixture_payload(ty: GgufTensorType, elements: usize, seed: u64) ->
         }
     }
     data
+}
+
+/// A block type's values per block, bytes per block and the offsets of its
+/// f16 scale fields.
+fn block_layout(ty: GgufTensorType) -> Option<(usize, usize, &'static [usize])> {
+    Some(match ty {
+        GgufTensorType::Q3K => (256, 110, &[108]),
+        GgufTensorType::Q4K => (256, 144, &[0, 2]),
+        GgufTensorType::Q5K => (256, 176, &[0, 2]),
+        GgufTensorType::Q6K => (256, 210, &[208]),
+        GgufTensorType::Q8_0 => (32, 34, &[0]),
+        GgufTensorType::Q4_0 => (32, 18, &[0]),
+        GgufTensorType::IQ4NL => (32, 18, &[0]),
+        GgufTensorType::IQ4XS => (256, 136, &[0]),
+        GgufTensorType::IQ3S => (256, 110, &[0]),
+        _ => return None,
+    })
+}
+
+/// Bytes [`fixture_payload`] writes for `elements` values of `ty`.
+fn payload_len(ty: GgufTensorType, elements: u64) -> u64 {
+    match ty {
+        GgufTensorType::F32 => elements * 4,
+        GgufTensorType::BF16 => elements * 2,
+        other => {
+            let (block_elems, block_bytes, _) =
+                block_layout(other).unwrap_or_else(|| panic!("no fixture payload for {other:?}"));
+            elements / block_elems as u64 * block_bytes as u64
+        }
+    }
 }
 
 type FixtureTensor = (&'static str, Vec<u64>, GgufTensorType);
@@ -1291,4 +1327,429 @@ pub(crate) fn qwen_tag_tokenizer_metadata(
             GgufMetaValue::ArrayString(Vec::new()),
         ),
     ])
+}
+
+/// The dimensions of a synthetic Qwen3.5 checkpoint; the role-to-type class
+/// tables are fixed per family, the sizes are the checkpoint's or small ones.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Qwen35Geometry {
+    pub hidden: u64,
+    pub vocab: u64,
+    pub heads: u64,
+    pub kv_heads: u64,
+    pub key: u64,
+    pub rope: u64,
+    pub ssm_inner: u64,
+    pub ssm_rank: u64,
+    pub ssm_groups: u64,
+    pub ssm_state: u64,
+    /// Dense FFN width; 0 for MoE.
+    pub ffn: u64,
+    pub experts: u64,
+    pub experts_used: u64,
+    pub expert_ffn: u64,
+    /// Decoder blocks before the MTP block.
+    pub blocks: u64,
+}
+
+impl Qwen35Geometry {
+    /// Ornith-1.5-35B Q4_K_M, with 4 decoder blocks.
+    pub(crate) const ORNITH_35B: Self = Self {
+        hidden: 2048,
+        vocab: 248_320,
+        heads: 16,
+        kv_heads: 2,
+        key: 256,
+        rope: 64,
+        ssm_inner: 4096,
+        ssm_rank: 32,
+        ssm_groups: 16,
+        ssm_state: 128,
+        ffn: 0,
+        experts: 256,
+        experts_used: 8,
+        expert_ffn: 512,
+        blocks: 4,
+    };
+
+    /// Qwen3.8-27B UD-Q4_K_XL, with 12 decoder blocks: enough for every
+    /// (role, type) class of its header once.
+    pub(crate) const QWEN38_27B: Self = Self {
+        hidden: 5120,
+        vocab: 248_320,
+        heads: 24,
+        kv_heads: 4,
+        key: 256,
+        rope: 64,
+        ssm_inner: 6144,
+        ssm_rank: 48,
+        ssm_groups: 16,
+        ssm_state: 128,
+        ffn: 17_408,
+        experts: 0,
+        experts_used: 0,
+        expert_ffn: 0,
+        blocks: 12,
+    };
+
+    /// The same class tables at dimensions small enough for a default test.
+    pub(crate) const fn small(self) -> Self {
+        let moe = self.experts > 0;
+        Self {
+            hidden: 256,
+            vocab: 512,
+            heads: 4,
+            kv_heads: 1,
+            key: 128,
+            rope: 64,
+            ssm_inner: 256,
+            ssm_rank: 2,
+            ssm_groups: 2,
+            ssm_state: 128,
+            ffn: if moe { 0 } else { 512 },
+            experts: if moe { 8 } else { 0 },
+            experts_used: if moe { 2 } else { 0 },
+            expert_ffn: if moe { 256 } else { 0 },
+            blocks: self.blocks,
+        }
+    }
+
+    fn moe(&self) -> bool {
+        self.experts > 0
+    }
+
+    fn arch(&self) -> &'static str {
+        if self.moe() { "qwen35moe" } else { "qwen35" }
+    }
+
+    fn attention_block(&self, block: u64) -> bool {
+        block == self.blocks || (block + 1).is_multiple_of(4)
+    }
+}
+
+/// Per-role quant types, by the role's block index (cycled): the classes of
+/// the real checkpoint's header.
+fn qwen35_classes(moe: bool, role: &str) -> &'static [GgufTensorType] {
+    use GgufTensorType::*;
+    if moe {
+        return match role {
+            "attn_qkv" | "ffn_down_exps" | "ffn_down_shexp" | "attn_v" => &[Q6K, Q4K],
+            "token_embd" | "attn_gate" | "ssm_out" | "ssm_alpha" | "ssm_beta" | "ffn_gate_exps"
+            | "ffn_up_exps" | "ffn_gate_shexp" | "ffn_up_shexp" | "attn_q" | "attn_k"
+            | "attn_output" | "nextn.eh_proj" => &[Q4K],
+            "output" => &[Q6K],
+            other => panic!("no class for {other}"),
+        };
+    }
+    match role {
+        "attn_qkv" => &[Q5K, Q4K, Q6K, IQ4NL, IQ4XS],
+        "attn_gate" => &[Q5K, Q4K, IQ4XS, Q6K],
+        "ssm_alpha" | "ssm_beta" => &[Q8_0],
+        "ssm_out" => &[Q8_0, Q6K, Q5K, Q4K],
+        "ffn_down" => &[IQ4XS, IQ4NL, Q5K, Q4K, IQ3S, Q6K],
+        "ffn_gate" => &[IQ4XS, Q4K, Q3K, IQ4NL, Q5K, Q6K],
+        "ffn_up" => &[Q3K, IQ4XS, Q5K, Q4K, IQ4NL, Q6K],
+        "attn_q" => &[Q5K, Q4K, IQ4XS, Q6K],
+        "attn_k" => &[Q4K, Q5K, Q6K, Q8_0],
+        "attn_v" => &[Q5K, Q8_0, Q6K],
+        "attn_output" => &[Q6K, Q5K, IQ4XS],
+        "token_embd" => &[Q4K],
+        "output" | "nextn.eh_proj" => &[Q6K],
+        other => panic!("no class for {other}"),
+    }
+}
+
+/// A synthetic checkpoint's header and tensors at `geometry`.
+pub(crate) fn qwen35_geometry_checkpoint(
+    geometry: &Qwen35Geometry,
+) -> (
+    Vec<(String, GgufMetaValue)>,
+    Vec<(String, Vec<u64>, GgufTensorType)>,
+) {
+    let g = geometry;
+    let arch = g.arch();
+    let mut metadata: Vec<(String, GgufMetaValue)> = vec![(
+        "general.architecture".into(),
+        GgufMetaValue::String(arch.into()),
+    )];
+    let mut key = |suffix: &str, value: u64| {
+        metadata.push((
+            format!("{arch}.{suffix}"),
+            GgufMetaValue::Uint32(value as u32),
+        ));
+    };
+    key("block_count", g.blocks + 1);
+    key("context_length", 262_144);
+    key("embedding_length", g.hidden);
+    key("vocab_size", g.vocab);
+    key("attention.head_count", g.heads);
+    key("attention.head_count_kv", g.kv_heads);
+    key("attention.key_length", g.key);
+    key("attention.value_length", g.key);
+    key("rope.dimension_count", g.rope);
+    key("nextn_predict_layers", 1);
+    key("ssm.conv_kernel", 4);
+    key("ssm.state_size", g.ssm_state);
+    key("ssm.group_count", g.ssm_groups);
+    key("ssm.time_step_rank", g.ssm_rank);
+    key("ssm.inner_size", g.ssm_inner);
+    key("full_attention_interval", 4);
+    if g.moe() {
+        key("expert_count", g.experts);
+        key("expert_used_count", g.experts_used);
+        key("expert_feed_forward_length", g.expert_ffn);
+        key("expert_shared_feed_forward_length", g.expert_ffn);
+    } else {
+        key("feed_forward_length", g.ffn);
+    }
+    metadata.push((
+        format!("{arch}.rope.freq_base"),
+        GgufMetaValue::Float32(10_000_000.0),
+    ));
+    metadata.push((
+        format!("{arch}.attention.layer_norm_rms_epsilon"),
+        GgufMetaValue::Float32(1e-6),
+    ));
+    let mut tokenizer: Vec<(String, GgufMetaValue)> =
+        qwen_tag_tokenizer_metadata(&[]).into_iter().collect();
+    tokenizer.sort_by(|a, b| a.0.cmp(&b.0));
+    metadata.extend(tokenizer);
+    for (name, id) in [
+        ("tokenizer.ggml.bos_token_id", 256),
+        ("tokenizer.ggml.padding_token_id", 256),
+        ("tokenizer.ggml.eos_token_id", 258),
+    ] {
+        metadata.push((name.into(), GgufMetaValue::Uint32(id)));
+    }
+    metadata.push((
+        "tokenizer.chat_template".into(),
+        GgufMetaValue::String(
+            "{% for message in messages %}<|im_start|>{{ message['role'] }}\n\
+             {{ message['content'] }}<|im_end|>\n{% endfor %}\
+             {% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+                .into(),
+        ),
+    ));
+
+    let qkv = 2 * g.ssm_groups * g.ssm_state + g.ssm_inner;
+    let mut tensors = Vec::new();
+    let mut counts: HashMap<&'static str, usize> = HashMap::new();
+    let mut quant = |tensors: &mut Vec<(String, Vec<u64>, GgufTensorType)>,
+                     name: String,
+                     role: &'static str,
+                     dims: Vec<u64>| {
+        let classes = qwen35_classes(g.moe(), role);
+        let index = counts.entry(role).or_default();
+        tensors.push((name, dims, classes[*index % classes.len()]));
+        *index += 1;
+    };
+    let float =
+        |tensors: &mut Vec<(String, Vec<u64>, GgufTensorType)>, name: String, dims: Vec<u64>| {
+            tensors.push((name, dims, GgufTensorType::F32));
+        };
+    quant(
+        &mut tensors,
+        "token_embd.weight".into(),
+        "token_embd",
+        vec![g.hidden, g.vocab],
+    );
+    float(&mut tensors, "output_norm.weight".into(), vec![g.hidden]);
+    quant(
+        &mut tensors,
+        "output.weight".into(),
+        "output",
+        vec![g.hidden, g.vocab],
+    );
+    for block in 0..=g.blocks {
+        let b = |suffix: &str| format!("blk.{block}.{suffix}");
+        float(&mut tensors, b("attn_norm.weight"), vec![g.hidden]);
+        float(
+            &mut tensors,
+            b("post_attention_norm.weight"),
+            vec![g.hidden],
+        );
+        if g.attention_block(block) {
+            quant(
+                &mut tensors,
+                b("attn_q.weight"),
+                "attn_q",
+                vec![g.hidden, 2 * g.heads * g.key],
+            );
+            quant(
+                &mut tensors,
+                b("attn_k.weight"),
+                "attn_k",
+                vec![g.hidden, g.kv_heads * g.key],
+            );
+            quant(
+                &mut tensors,
+                b("attn_v.weight"),
+                "attn_v",
+                vec![g.hidden, g.kv_heads * g.key],
+            );
+            float(&mut tensors, b("attn_q_norm.weight"), vec![g.key]);
+            float(&mut tensors, b("attn_k_norm.weight"), vec![g.key]);
+            quant(
+                &mut tensors,
+                b("attn_output.weight"),
+                "attn_output",
+                vec![g.heads * g.key, g.hidden],
+            );
+        } else {
+            quant(
+                &mut tensors,
+                b("attn_qkv.weight"),
+                "attn_qkv",
+                vec![g.hidden, qkv],
+            );
+            quant(
+                &mut tensors,
+                b("attn_gate.weight"),
+                "attn_gate",
+                vec![g.hidden, g.ssm_inner],
+            );
+            float(&mut tensors, b("ssm_a"), vec![g.ssm_rank]);
+            quant(
+                &mut tensors,
+                b("ssm_alpha.weight"),
+                "ssm_alpha",
+                vec![g.hidden, g.ssm_rank],
+            );
+            quant(
+                &mut tensors,
+                b("ssm_beta.weight"),
+                "ssm_beta",
+                vec![g.hidden, g.ssm_rank],
+            );
+            float(&mut tensors, b("ssm_conv1d.weight"), vec![4, qkv]);
+            float(&mut tensors, b("ssm_dt.bias"), vec![g.ssm_rank]);
+            float(&mut tensors, b("ssm_norm.weight"), vec![g.ssm_state]);
+            quant(
+                &mut tensors,
+                b("ssm_out.weight"),
+                "ssm_out",
+                vec![g.ssm_inner, g.hidden],
+            );
+        }
+        if g.moe() {
+            float(
+                &mut tensors,
+                b("ffn_gate_inp.weight"),
+                vec![g.hidden, g.experts],
+            );
+            float(&mut tensors, b("ffn_gate_inp_shexp.weight"), vec![g.hidden]);
+            for (suffix, role) in [
+                ("ffn_gate_exps.weight", "ffn_gate_exps"),
+                ("ffn_up_exps.weight", "ffn_up_exps"),
+            ] {
+                quant(
+                    &mut tensors,
+                    b(suffix),
+                    role,
+                    vec![g.hidden, g.expert_ffn, g.experts],
+                );
+            }
+            quant(
+                &mut tensors,
+                b("ffn_down_exps.weight"),
+                "ffn_down_exps",
+                vec![g.expert_ffn, g.hidden, g.experts],
+            );
+            for (suffix, role) in [
+                ("ffn_gate_shexp.weight", "ffn_gate_shexp"),
+                ("ffn_up_shexp.weight", "ffn_up_shexp"),
+            ] {
+                quant(&mut tensors, b(suffix), role, vec![g.hidden, g.expert_ffn]);
+            }
+            quant(
+                &mut tensors,
+                b("ffn_down_shexp.weight"),
+                "ffn_down_shexp",
+                vec![g.expert_ffn, g.hidden],
+            );
+        } else {
+            quant(
+                &mut tensors,
+                b("ffn_gate.weight"),
+                "ffn_gate",
+                vec![g.hidden, g.ffn],
+            );
+            quant(
+                &mut tensors,
+                b("ffn_up.weight"),
+                "ffn_up",
+                vec![g.hidden, g.ffn],
+            );
+            quant(
+                &mut tensors,
+                b("ffn_down.weight"),
+                "ffn_down",
+                vec![g.ffn, g.hidden],
+            );
+        }
+        if block == g.blocks {
+            quant(
+                &mut tensors,
+                b("nextn.eh_proj.weight"),
+                "nextn.eh_proj",
+                vec![2 * g.hidden, g.hidden],
+            );
+            for suffix in [
+                "nextn.enorm.weight",
+                "nextn.hnorm.weight",
+                "nextn.shared_head_norm.weight",
+            ] {
+                float(&mut tensors, b(suffix), vec![g.hidden]);
+            }
+        }
+    }
+    (metadata, tensors)
+}
+
+/// Writes a GGUF of `tensors` with [`fixture_payload`] values one tensor
+/// at a time; `ssm_a` rows are negative as a real decay is.
+pub(crate) fn write_streamed_gguf(
+    path: &Path,
+    metadata: &[(String, GgufMetaValue)],
+    tensors: &[(String, Vec<u64>, GgufTensorType)],
+    seed: u64,
+) -> std::io::Result<u64> {
+    use std::io::Write;
+    let metadata: Vec<(&str, GgufMetaValue)> = metadata
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.clone()))
+        .collect();
+    let described: Vec<(&str, &[u64], GgufTensorType, u64)> = tensors
+        .iter()
+        .map(|(name, dims, ty)| {
+            let elements = dims.iter().product::<u64>();
+            (
+                name.as_str(),
+                dims.as_slice(),
+                *ty,
+                payload_len(*ty, elements),
+            )
+        })
+        .collect();
+    let (header, offsets) = gguf_header(&metadata, &described);
+    let mut file = std::io::BufWriter::with_capacity(8 << 20, fs::File::create(path)?);
+    file.write_all(&header)?;
+    let mut written = 0u64;
+    for (i, (name, dims, ty)) in tensors.iter().enumerate() {
+        let pad = offsets[i] - written;
+        file.write_all(&vec![0u8; pad as usize])?;
+        let elements = dims.iter().product::<u64>() as usize;
+        let data = if name.ends_with("ssm_a") {
+            fixture_f32(seed + i as u64, elements, -2.0, -0.5)
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect()
+        } else {
+            fixture_payload(*ty, elements, seed + i as u64)
+        };
+        file.write_all(&data)?;
+        written = offsets[i] + data.len() as u64;
+    }
+    file.flush()?;
+    Ok(header.len() as u64 + written)
 }

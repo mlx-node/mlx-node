@@ -146,7 +146,10 @@ mod tests {
                 "type": "WordLevel",
                 "vocab": {
                     "<unk>": 0, "\n": 1, " ": 2, "user": 3, "assistant": 4, "Hello": 5,
-                    "system": 6, "Hi": 7, "again": 8,
+                    "system": 6, "Hi": 7, "again": 8, "Considering": 9, "the": 10,
+                    "limited": 11, "time,": 12, "I": 13, "have": 14, "to": 15, "give": 16,
+                    "solution": 17, "based": 18, "on": 19, "thinking": 20, "directly": 21,
+                    "now.": 22,
                 },
                 "unk_token": "<unk>",
             },
@@ -357,7 +360,7 @@ mod tests {
     fn probe_finds_the_template_close() {
         for template in [QWEN38_TEMPLATE, QWEN36_TEMPLATE] {
             let f = fixture(template);
-            let end = f.tok.think_end().thinking_end;
+            let end = f.tok.think_end(&ChatConfig::default()).thinking_end;
             assert_eq!(&*end, encode(&f.tok, "\n</think>").as_slice());
             assert_eq!(&*end, &[1, f.tok.think_end_id().unwrap()]);
         }
@@ -371,7 +374,7 @@ mod tests {
 
         let none = fixture(&rewritten("'\\n\\n' + content"));
         assert_eq!(
-            &*none.tok.think_end().thinking_end,
+            &*none.tok.think_end(&ChatConfig::default()).thinking_end,
             &[none.tok.think_end_id().unwrap()]
         );
 
@@ -401,7 +404,13 @@ mod tests {
         assert!(long.contains("takes 81 tokens; the most is 64"), "{long}");
 
         let no_close = fixture_with(QWEN38_TEMPLATE, &["<|im_start|>", "<|im_end|>"], false);
-        assert!(no_close.tok.think_end().thinking_end.is_empty());
+        assert!(
+            no_close
+                .tok
+                .think_end(&ChatConfig::default())
+                .thinking_end
+                .is_empty()
+        );
     }
 
     /// A budget cut, then the next request's re-render of the whole history:
@@ -427,11 +436,12 @@ mod tests {
                 .unwrap();
 
             // A loop that observes, then takes; the budget cuts after "again".
-            let close = tok.think_end();
+            let close = tok.think_end(&thinking_on);
             let mut tracker = ReasoningTracker::from_setup(
                 &ThinkingSetup {
                     enabled: true,
                     budget: Some(3),
+                    cycle_guard: false,
                 },
                 &close,
             );
@@ -492,6 +502,149 @@ mod tests {
             let cut = prompt1.len() + 3;
             assert!(hit > floor(cut), "the hit must run past the cut");
             assert_eq!(generated, [7, 2, 8, 1, close_id, 1, 1, 5, im_end]);
+        }
+    }
+
+    const END_TEXT: &str = "\n\nConsidering the limited time, I have to give the solution based on the thinking directly now.";
+
+    fn with_end_text(text: &str) -> ChatConfig {
+        ChatConfig {
+            thinking_end_text: Some(text.to_string()),
+            ..ChatConfig::default()
+        }
+    }
+
+    #[test]
+    fn an_end_text_comes_before_the_template_close() {
+        for template in [QWEN38_TEMPLATE, QWEN36_TEMPLATE] {
+            let f = fixture(template);
+            let close_id = f.tok.think_end_id().unwrap();
+            let end = f.tok.think_end(&with_end_text(END_TEXT)).thinking_end;
+            assert_eq!(
+                &*end,
+                encode(&f.tok, &format!("{END_TEXT}\n</think>")).as_slice()
+            );
+            assert_eq!(end.last(), Some(&close_id));
+            assert!(end.len() > 2 && end.len() <= MAX_THINKING_END_TOKENS);
+
+            // 62 text tokens + "\n</think>" = 64: the most the rules allow.
+            let longest = format!("\nx{}", " x".repeat(30));
+            let end = f.tok.think_end(&with_end_text(&longest)).thinking_end;
+            assert_eq!(end.len(), MAX_THINKING_END_TOKENS);
+
+            let probed = f.tok.think_end(&ChatConfig::default()).thinking_end;
+            assert_eq!(&*probed, &[1, close_id]);
+            let rejected = [
+                String::new(),
+                "a <|im_end|> b".to_string(),
+                "a </think> b".to_string(),
+                // 79 text tokens + "\n</think>" = 81.
+                format!("x{}", " x".repeat(39)),
+            ];
+            for text in rejected {
+                let end = f.tok.think_end(&with_end_text(&text)).thinking_end;
+                assert_eq!(end, probed, "{text:?}");
+            }
+        }
+
+        let close = "'\\n</think>\\n\\n' + content";
+        let none = fixture(&QWEN38_TEMPLATE.replace(close, "'\\n\\n' + content"));
+        assert_eq!(
+            &*none.tok.think_end(&with_end_text(END_TEXT)).thinking_end,
+            &[none.tok.think_end_id().unwrap()],
+            "a template that writes no close keeps the close token alone"
+        );
+    }
+
+    /// A cycle cut with the end text, then the next request's re-render of the
+    /// whole history: the reply's tokens come back through the forced close.
+    #[test]
+    fn cycle_cut_with_the_end_text_rerenders_through_the_close() {
+        use crate::engine::penalties::{ReasoningClose, ReasoningTracker};
+
+        // Period 5 cuts after "Hi"; period 6 cuts after a line break.
+        for (pattern, cut_after) in [(&[7u32, 2, 8, 2, 2][..], 7), (&[7, 2, 8, 2, 7, 1][..], 1)] {
+            for template in [QWEN38_TEMPLATE, QWEN36_TEMPLATE] {
+                let f = fixture_with(
+                    template,
+                    &["<|im_start|>", "<|im_end|>", "<think>", "</think>"],
+                    true,
+                );
+                let tok = &f.tok;
+                let config = ChatConfig {
+                    thinking_cycle_guard: Some(true),
+                    ..with_end_text(END_TEXT)
+                };
+                let prompt1 = tok
+                    .apply_chat_template_with_config(&[msg("user", "Hello")], true, &config, true)
+                    .unwrap();
+                let close = tok.think_end(&config);
+                let mut tracker = ReasoningTracker::from_setup(
+                    &crate::engine::params::resolve(
+                        crate::engine::params::ThinkingPolicy::TemplateHonoring,
+                        &config,
+                    ),
+                    &close,
+                );
+                let im_end = encode(tok, "<|im_end|>")[0];
+                let mut thought = pattern.iter().copied().cycle();
+                let mut answer = [1, 1, 5, im_end].into_iter();
+                let mut generated = Vec::new();
+                loop {
+                    let token = match tracker.take_forced_token() {
+                        Some(token) => token,
+                        None if tracker.outcome().close == Some(ReasoningClose::Open) => {
+                            thought.next().unwrap()
+                        }
+                        None => answer.next().unwrap(),
+                    };
+                    tracker.observe_token(token);
+                    generated.push(token);
+                    if token == im_end {
+                        break;
+                    }
+                }
+                let outcome = tracker.outcome();
+                assert_eq!(outcome.close, Some(ReasoningClose::Cycle));
+                assert_eq!(outcome.cycle_period, Some(pattern.len() as u32));
+                let cut = outcome.cut_at.unwrap() as usize;
+                assert_eq!(generated[cut - 1], cut_after);
+                assert_eq!(
+                    &generated[cut..cut + close.thinking_end.len()],
+                    &*close.thinking_end
+                );
+                assert_eq!(outcome.tokens as usize, cut + close.thinking_end.len() - 1);
+
+                let raw = tok.decode_sync(&generated, true).unwrap();
+                let (content, _, reasoning) = crate::engine::finalize::parse_thinking_and_tools(
+                    &raw,
+                    &generated,
+                    true,
+                    close.think_end_id,
+                    close.think_end_str.as_deref(),
+                    true,
+                );
+                let reasoning = reasoning.unwrap();
+                assert!(
+                    reasoning.trim_end().ends_with(END_TEXT.trim()),
+                    "{reasoning:?}"
+                );
+                let reply = ChatMessage {
+                    reasoning_content: Some(reasoning),
+                    ..msg("assistant", &content)
+                };
+                let history = [msg("user", "Hello"), reply, msg("user", "Hi again")];
+                let turn2 = tok
+                    .apply_chat_template_with_config(&history, true, &config, true)
+                    .unwrap();
+                let mut turn1 = prompt1.clone();
+                turn1.extend_from_slice(&generated);
+                let common = turn1.iter().zip(&turn2).take_while(|(a, b)| a == b).count();
+                assert!(common >= prompt1.len() + cut, "the reuse covers the cut");
+                if cut_after != 1 {
+                    assert!(turn2.starts_with(&turn1), "{turn1:?}\n{turn2:?}");
+                }
+            }
         }
     }
 }

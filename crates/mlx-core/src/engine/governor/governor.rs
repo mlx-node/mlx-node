@@ -569,6 +569,21 @@ struct ModelEntry {
     dflash2_states: DFlash2StateStatus,
 }
 
+/// What one model's requests moved in the governor's books. The
+/// process-wide refusal counters are not in them: another model's requests
+/// move those.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ModelBooks {
+    pub metal_out_of_memory: u64,
+    pub gpu_oom: bool,
+    pub suspensions: u64,
+    pub resumptions: u64,
+    pub replans: u64,
+    pub drain_end: f64,
+    pub allocation_failed: bool,
+    pub open_claims: usize,
+}
+
 /// One model's scheduler as the status reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SchedulerStatus {
@@ -1677,6 +1692,26 @@ impl Governor {
             entry.metal_out_of_memory = entry.metal_out_of_memory.saturating_add(1);
         }
         noted
+    }
+
+    /// The books a request of `model` can move, as numbers.
+    pub(crate) fn model_books(&self, model: u64) -> ModelBooks {
+        let mut books = self.lock();
+        let open_claims = books.ledger.open_claims(model);
+        let mut out = ModelBooks {
+            open_claims,
+            ..ModelBooks::default()
+        };
+        if let Some(entry) = books.model(model) {
+            out.metal_out_of_memory = entry.metal_out_of_memory;
+            out.gpu_oom = entry.gpu_oom;
+            out.suspensions = entry.suspensions;
+            out.resumptions = entry.resumptions;
+            out.replans = entry.replans;
+            out.drain_end = entry.drain_end;
+            out.allocation_failed = entry.allocation_failed;
+        }
+        out
     }
 
     #[cfg(test)]

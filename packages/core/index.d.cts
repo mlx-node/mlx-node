@@ -1631,6 +1631,11 @@ export declare class Qwen35Model {
    */
   modelAssetsPath(): string;
   /**
+   * What the load's warm-up did; `null` for a load with no paged pool,
+   * which runs none.
+   */
+  get warmup(): WarmupReport | null;
+  /**
    * Whether the block-paged KV cache adapter is active on this model
    * instance.
    *
@@ -1818,6 +1823,11 @@ export declare class Qwen35MoeModel {
    * reads the reconstructed sidecars from the native-packed cache.
    */
   modelAssetsPath(): string;
+  /**
+   * What the load's warm-up did; `null` for a load with no paged pool,
+   * which runs none.
+   */
+  get warmup(): WarmupReport | null;
   /**
    * Whether the block-paged KV cache adapter is active on this model
    * instance.
@@ -2994,6 +3004,19 @@ export interface ChatConfig {
    */
   thinkingTokenBudget?: number | undefined;
   /**
+   * Close the thought when its tokens repeat one cycle exactly: two
+   * periods (up to 2,048 tokens each) over at least 512 tokens lower the
+   * budget to 64 thinking tokens later. Default: false.
+   */
+  thinkingCycleGuard?: boolean | undefined;
+  /**
+   * Plain text a cut thought ends with before the chat template's close,
+   * without the close tag and without special tokens. Unset, empty, or a
+   * text whose end breaks the close rules (the close token last, no other
+   * special token, at most 64 tokens): the template's close alone.
+   */
+  thinkingEndText?: string | undefined;
+  /**
    * Whether to include reasoning/thinking content in the output.
    * When false, the `thinking` field of ChatResult/ChatStreamChunk will always be None.
    * Default: true (false when reasoningEffort is "none").
@@ -3138,6 +3161,18 @@ export interface ChatResult {
   numTokens: number;
   promptTokens: number;
   reasoningTokens: number;
+  /**
+   * How thinking ended: `model` (the model's own close), `budget`,
+   * `cycle` (the cycle guard lowered the budget), `open` (the turn ended
+   * in thinking). Absent when the turn did not start in thinking.
+   */
+  reasoningClose?: 'model' | 'budget' | 'cycle' | 'open' | undefined;
+  /** Thinking tokens when a cut began. */
+  reasoningCutAt?: number | undefined;
+  /** Period in tokens of the cycle the guard saw. */
+  reasoningCyclePeriod?: number | undefined;
+  /** Close tokens after the thought ended; present with `reasoning_close`. */
+  reasoningStrayCloses?: number | undefined;
   finishReason: string;
   rawText: string;
   /**
@@ -3185,6 +3220,11 @@ export interface ChatStreamChunk {
   numTokens?: number;
   promptTokens?: number;
   reasoningTokens?: number;
+  /** `ChatResult::reasoning_close`, on the terminal chunk only. */
+  reasoningClose?: 'model' | 'budget' | 'cycle' | 'open' | undefined;
+  reasoningCutAt?: number | undefined;
+  reasoningCyclePeriod?: number | undefined;
+  reasoningStrayCloses?: number | undefined;
   rawText?: string;
   /** Reasoning-redacted counterpart to `raw_text` on terminal chunks. */
   publicRawText?: string | undefined;
@@ -3223,11 +3263,26 @@ export interface ChatStreamChunk {
  */
 export interface ChatStreamProgress {
   /**
-   * `queued` until the model thread picks the request up, then
-   * `prefill`, `decode` from the first sampled token, `done` after the
-   * terminal chunk or error.
+   * Before the prefill: `queued` while the model thread runs other work,
+   * `slot` while the scheduler cannot start the turn for lanes or memory,
+   * `prepare` while the thread prepares it (render, prefix match, cache
+   * restore). Then `prefill`, `decode` from the first sampled token,
+   * `done` after the terminal chunk or error. Never moves back from
+   * `prefill`.
    */
-  phase: 'queued' | 'prefill' | 'decode' | 'done';
+  phase: 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode' | 'done';
+  /**
+   * Milliseconds from the request's creation to the model thread taking
+   * it off its channel; runs until then, then frozen.
+   */
+  waitMs: number;
+  /** Milliseconds in `slot`, the open span included; absent before pickup. */
+  slotMs?: number;
+  /**
+   * Milliseconds in `prepare`, the open span included; absent before
+   * pickup.
+   */
+  prepareMs?: number;
   /** Tokens this turn prefills, excluding the cached prefix. */
   prefillTotal?: number;
   /**
@@ -3235,7 +3290,7 @@ export interface ChatStreamProgress {
    * one shot stay at 0 until the first token.
    */
   prefillDone?: number;
-  /** Prefix tokens reused from the cache. */
+  /** Prefix tokens reused from the cache; can be set during `prepare`. */
   cachedTokens?: number;
   /** Tokens kept so far; known from the `decode` phase on. */
   generatedTokens?: number;
@@ -4735,6 +4790,19 @@ export interface Lfm2Config {
   routedScalingFactor?: number | undefined;
 }
 
+/**
+ * The load of `path` in flight (the oldest when several are); `null` when
+ * none is, or its family does not report.
+ */
+export declare function loadProgress(path: string): LoadProgress | null;
+
+/** A model load in flight. */
+export interface LoadProgress {
+  phase: 'weights' | 'kernels';
+  steps: number;
+  stepsDone: number;
+}
+
 export interface MemoryGovernorAccount {
   name: string;
   current: number;
@@ -5253,6 +5321,24 @@ export interface PhaseProfile {
   avgUsPerToken: number;
   /** Number of invocations. */
   count: number;
+}
+
+/**
+ * Pipeline creation totals of this process; `null` while the counter is
+ * not installed (it is installed only with `MLX_PIPELINE_COUNTER=1`).
+ */
+export declare function pipelineStats(): PipelineStats | null;
+
+/** Process-wide, cumulative pipeline creation totals. */
+export interface PipelineStats {
+  /** Pipelines and source libraries created inside a model load. */
+  createdLoading: number;
+  /** Pipelines and source libraries created outside any model load. */
+  createdServing: number;
+  /** Milliseconds spent in the loading creations. */
+  loadingMs: number;
+  /** Milliseconds spent in the serving creations. */
+  servingMs: number;
 }
 
 /**
@@ -6553,6 +6639,26 @@ export interface VlmChatConfig {
 export interface VlmChatMessage {
   role: ChatRole;
   content: string;
+}
+
+/** What a load's warm-up did. */
+export interface WarmupReport {
+  /** Wall time of the warm-up. */
+  ms: number;
+  steps: number;
+  /** Steps not run, or run smaller than planned. */
+  skipped: number;
+  /**
+   * 1 when a cache reset made the model's state read as before, or when
+   * the warm-up moved this model's governor books, which no reset undoes.
+   */
+  reset: number;
+  /** Pipelines and source libraries created during the warm-up. */
+  pipelines: number;
+  /** Time inside those creations. */
+  compileMs: number;
+  /** The process allocator's peak, read after the warm-up. */
+  peakBytes: number;
 }
 
 export declare namespace __internal__ {

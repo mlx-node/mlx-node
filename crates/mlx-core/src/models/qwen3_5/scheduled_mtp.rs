@@ -61,6 +61,11 @@ pub(crate) struct ScheduledMtpState {
 }
 
 impl ScheduledMtpState {
+    /// Sequences holding drafting state, pending ones included.
+    pub fn owner_count(&self) -> usize {
+        self.owners.len() + self.pending.len()
+    }
+
     pub fn release(&mut self, seq_id: u32) {
         self.owners.remove(&seq_id);
         self.pending.remove(&seq_id);

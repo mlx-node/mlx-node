@@ -189,7 +189,10 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
         let handle = match std::thread::Builder::new()
             .name("mlx-model".into())
             .spawn(move || {
-                let mut state = match init_fn() {
+                let loading = crate::engine::pipeline_counter::loading_scope();
+                let init = init_fn();
+                drop(loading);
+                let mut state = match init {
                     Ok((state, init_result)) => {
                         send_init_result(&thread_init_tx, Ok(init_result));
                         state
@@ -244,7 +247,10 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
         let handle = match std::thread::Builder::new()
             .name("mlx-model".into())
             .spawn(move || {
-                let mut state = match init_fn() {
+                let loading = crate::engine::pipeline_counter::loading_scope();
+                let init = init_fn();
+                drop(loading);
+                let mut state = match init {
                     Ok((state, init_result)) => {
                         send_init_result(&thread_init_tx, Ok(init_result));
                         state

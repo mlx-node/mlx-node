@@ -372,6 +372,21 @@ pub(crate) fn install_linear(
     Ok(())
 }
 
+/// Runs [`install_linear`] from `cell` into `fresh` and drops the result;
+/// false when `cell` holds no materialized GDN cell.
+pub(crate) fn warm_install_linear(
+    cell: Option<&[Qwen3_5LayerCache]>,
+    mut fresh: Vec<Qwen3_5LayerCache>,
+) -> Result<bool> {
+    let Some(anchor) = cell
+        .and_then(crate::models::qwen3_5::paged_forward::snapshot_materialized_linear_layer_caches)
+    else {
+        return Ok(false);
+    };
+    install_linear(&mut fresh, &anchor)?;
+    Ok(true)
+}
+
 /// Moves the GDN slots a disk read decoded into `caches`' linear slots, in
 /// layer order, and evaluates them; full-attention slots are left alone.
 pub(crate) fn adopt_linear(

@@ -38,7 +38,7 @@ use crate::utils::gguf_import::GgufPreload;
 use super::config::Qwen3_5Config;
 use super::decoder_layer::AttentionType;
 use super::model::Qwen35FamilyCommand;
-use super::model::{Qwen3_5Model, Qwen35Inner, Qwen35SchedulerState};
+use super::model::{Qwen3_5Model, Qwen35Inner};
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, LinearProj, MLPVariant, PerLayerMode,
     PerLayerQuant, SYM8_BITS, SYM8_GROUP_SIZE, is_mxfp8_checkpoint, is_quantized_checkpoint,
@@ -2580,6 +2580,7 @@ pub async fn load_with_thread(
         None,
         crate::engine::scheduler::DEFAULT_DECODE_SHARE,
         crate::disk_tier::DiskTierOptions::default(),
+        crate::engine::load_progress::LoadProgressCell::detached(),
     )
     .await
 }
@@ -2593,6 +2594,7 @@ pub(crate) async fn load_with_source(
     max_context: Option<u32>,
     decode_share: f64,
     disk: crate::disk_tier::DiskTierOptions,
+    progress: Arc<crate::engine::load_progress::LoadProgressCell>,
 ) -> Result<Qwen3_5Model> {
     load_with_thread_impl(
         source,
@@ -2603,6 +2605,7 @@ pub(crate) async fn load_with_source(
         decode_share,
         disk,
         false,
+        progress,
     )
     .await
 }
@@ -2622,6 +2625,7 @@ pub(crate) async fn load_clef_with_source(source: &CheckpointSource) -> Result<Q
             ..Default::default()
         },
         true,
+        crate::engine::load_progress::LoadProgressCell::detached(),
     )
     .await
 }
@@ -2677,6 +2681,7 @@ async fn load_with_thread_impl(
     decode_share: f64,
     disk: crate::disk_tier::DiskTierOptions,
     clef: bool,
+    progress: Arc<crate::engine::load_progress::LoadProgressCell>,
 ) -> Result<Qwen3_5Model> {
     let model_assets_path = source.asset_dir().to_string_lossy().into_owned();
     let model_path = model_assets_path.clone();
@@ -3333,9 +3338,10 @@ async fn load_with_thread_impl(
                 ));
             }
             let context_limits = inner.finish_load_limits()?;
+            let (state, warmup) = crate::engine::warmup::serving_scheduler(inner, &progress)?;
 
             Ok((
-                Qwen35SchedulerState::new(inner)?,
+                state,
                 (
                     config_out,
                     model_id,
@@ -3349,6 +3355,7 @@ async fn load_with_thread_impl(
                     mtp_active,
                     vision_active,
                     context_limits,
+                    warmup,
                 ),
             ))
         },
@@ -3368,6 +3375,7 @@ async fn load_with_thread_impl(
         mtp_active,
         vision_active,
         context_limits,
+        warmup,
     ) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
@@ -3378,6 +3386,7 @@ async fn load_with_thread_impl(
     Ok(Qwen3_5Model {
         thread,
         config,
+        warmup,
         paged_active,
         scheduled_lanes,
         mtp_active,

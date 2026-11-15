@@ -501,6 +501,8 @@ use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHa
 pub struct Qwen3_5Model {
     /// Dedicated model thread for inference and training.
     pub(crate) thread: crate::model_thread::ModelThread<Qwen35Cmd>,
+    /// What the load's warm-up did; `None` for a load with no paged pool.
+    pub(crate) warmup: Option<crate::engine::warmup::WarmupReport>,
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5Config,
     /// Snapshot of `Qwen35Inner::paged_adapter.is_some()` captured at
@@ -555,6 +557,13 @@ impl Qwen3_5Model {
     #[napi]
     pub fn model_assets_path(&self) -> String {
         self.model_assets_path.clone()
+    }
+
+    /// What the load's warm-up did; `null` for a load with no paged pool,
+    /// which runs none.
+    #[napi(getter)]
+    pub fn warmup(&self) -> Option<crate::engine::warmup::WarmupReport> {
+        self.warmup.clone()
     }
 
     /// Whether the block-paged KV cache adapter is active on this model
@@ -639,6 +648,7 @@ impl Qwen3_5Model {
     /// - tokenizer.json + tokenizer_config.json
     #[napi]
     pub async fn load(path: String, options: Option<Qwen35LoadOptions>) -> Result<Qwen3_5Model> {
+        let progress = crate::engine::load_progress::begin(&path);
         let options = options.unwrap_or_default();
         let disk = options.disk_tier("Qwen3.5")?;
         let draft_model_path = options.draft_model_path;
@@ -672,6 +682,7 @@ impl Qwen3_5Model {
             max_context,
             decode_share,
             disk,
+            progress.cell(),
         )
         .await;
         if loaded.is_err() {

@@ -1046,8 +1046,80 @@ mod run_decode_loop_tests {
             }
             assert_eq!(out.generated.len(), b + 4);
             assert_eq!(out.finish_reason, "length");
-            assert_eq!(tracker.reasoning_token_count(), budget as u32 + 1);
+            assert_eq!(tracker.outcome().tokens, budget as u32 + 1);
         }
+    }
+
+    /// A model whose next token is a function of its input: a thought of 100
+    /// distinct tokens (10..110) runs into a 300-token cycle (200..500); after
+    /// the close (9) it answers 150, then the EOS 7.
+    struct LoopingStep;
+
+    impl LoopingStep {
+        const VOCAB: i64 = 512;
+
+        fn next(token: u32) -> u32 {
+            match token {
+                9 => 150,
+                150 => 7,
+                109 | 499 => 200,
+                token => token + 1,
+            }
+        }
+    }
+
+    impl DecodeStep for LoopingStep {
+        fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
+            let input = input_ids.item_at_int32(0)? as u32;
+            let mut v = vec![0.0f32; Self::VOCAB as usize];
+            v[Self::next(input) as usize] = 10.0;
+            Ok((MxArray::from_float32(&v, &[1, Self::VOCAB])?, false))
+        }
+
+        fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, budget_forced: bool) {
+            MxArray::async_eval_arrays(&[next_token]);
+            if budget_forced {
+                logits.eval();
+            }
+        }
+    }
+
+    #[test]
+    fn a_looping_thought_is_closed_with_the_end_and_answered() {
+        let params = greedy_params(|cfg| {
+            cfg.max_consecutive_tokens = Some(0);
+            cfg.max_ngram_repeats = Some(0);
+        });
+        let mut tracker = ReasoningTracker::guarded(true, None, &[3, 4, 9], true);
+        let out = drive(&mut LoopingStep, 10, &params, &mut tracker, 1000, 7, &[])
+            .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+        let thought: Vec<u32> = (10..110)
+            .chain((0..).flat_map(|_| 200..500))
+            .take(764)
+            .collect();
+        assert_eq!(&out.generated[..764], thought.as_slice());
+        assert_eq!(&out.generated[764..], &[3, 4, 9, 150, 7]);
+        assert_eq!(out.finish_reason, "stop");
+        let outcome = tracker.outcome();
+        assert_eq!(
+            outcome.close,
+            Some(crate::engine::penalties::ReasoningClose::Cycle)
+        );
+        assert_eq!(
+            (outcome.cut_at, outcome.cycle_period),
+            (Some(764), Some(300))
+        );
+        assert_eq!(outcome.tokens, 764 + 3 - 1);
+
+        // Guard off: the same model loops to the output limit.
+        let mut off = ReasoningTracker::guarded(true, None, &[3, 4, 9], false);
+        let out = drive(&mut LoopingStep, 10, &params, &mut off, 1000, 7, &[]).unwrap();
+        let thought: Vec<u32> = (10..110)
+            .chain((0..).flat_map(|_| 200..500))
+            .take(1000)
+            .collect();
+        assert_eq!(out.generated, thought);
+        assert_eq!(out.finish_reason, "length");
     }
 
     #[test]
@@ -1057,7 +1129,7 @@ mod run_decode_loop_tests {
         let mut step = MockStep::new(vec![9, 5], 16);
         let out = drive(&mut step, 4, &params, &mut tracker, 6, 7, &[]).unwrap();
         assert_eq!(out.generated, vec![4, 9, 5, 5, 5, 5]);
-        assert_eq!(tracker.reasoning_token_count(), 1);
+        assert_eq!(tracker.outcome().tokens, 1);
     }
 
     #[test]
@@ -2509,6 +2581,10 @@ mod run_decode_loop_tests {
                 num_tokens: Some(generated_tokens.len() as u32),
                 prompt_tokens: None,
                 reasoning_tokens: None,
+                reasoning_close: None,
+                reasoning_cut_at: None,
+                reasoning_cycle_period: None,
+                reasoning_stray_closes: None,
                 raw_text: None,
                 public_raw_text: None,
                 text_authoritative: None,

@@ -349,7 +349,7 @@ fn finalize_reports_tool_calls() {
                 include_reasoning,
                 thinking_enabled: true,
                 prompt_tokens: 7,
-                reasoning_tokens: 1,
+                reasoning: crate::engine::penalties::ReasoningOutcome::counted(1),
             },
             tok.token_to_id(DSML.to_string()),
         )

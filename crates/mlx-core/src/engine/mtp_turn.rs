@@ -2300,6 +2300,10 @@ mod tests {
             self.committed_history
         }
 
+        fn chained_cycles_supported(&self) -> bool {
+            false
+        }
+
         fn profiler_relabel(&self) -> Option<&'static str> {
             self.record(Call::ProfilerRelabel);
             self.relabel
@@ -3662,10 +3666,9 @@ mod tests {
     // snapshot / verify / commit / rollback / rollback_unemitted /
     // take_replay_error / into_desynced) the engine drives.
     //
-    // Chained cycles are forced OFF (`MLX_MTP_CHAINED_CYCLES=0`) so the loop
-    // runs its deterministic always-Step-A mode — the chained path is a
-    // GPU-gen-gated cross-cycle optimization whose ledger shape depends on
-    // host hardware, which would make these structural assertions flaky.
+    // The mock stepper reports no chained-cycle support, so the loop runs its
+    // always-Step-A mode on every GPU generation: the chained default is on
+    // from M5, and these ledgers assert the Step-A shape.
     // -----------------------------------------------------------------------
 
     use std::rc::Rc;
@@ -3680,27 +3683,6 @@ mod tests {
     use crate::engine::types::ChatResult;
     use crate::stream::Stream;
     use crate::tokenizer::Qwen3Tokenizer;
-
-    /// Serializes the `MLX_MTP_CHAINED_CYCLES` set + the `mtp_chained_cycles_enabled`
-    /// OnceLock read across the turn tests so the forced-OFF value is the one
-    /// that caches. The OnceLock has no in-process caller other than
-    /// `run_mtp_turn`, so a single deterministic "0" write before the first
-    /// `run_mtp_turn` of the binary pins it OFF for all three tests.
-    static CHAINED_OFF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Force chained cycles OFF for a turn test, returning the lock guard that
-    /// keeps the env write + the loop's `mtp_chained_cycles_enabled` read
-    /// serialized.
-    fn force_chained_off() -> std::sync::MutexGuard<'static, ()> {
-        let guard = CHAINED_OFF_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: the lock serializes this write with every other turn test's
-        // write + read; all write the SAME value, and no production code in
-        // the lib-test binary writes this var.
-        unsafe {
-            std::env::set_var("MLX_MTP_CHAINED_CYCLES", "0");
-        }
-        guard
-    }
 
     /// A never-constructed [`DecodeStep`] so `MockMtpBackend` can satisfy the
     /// `ChatBackend::Decode<'a>: DecodeStep` bound. `begin_decode` is never
@@ -4050,6 +4032,52 @@ mod tests {
         }
     }
 
+    /// 507 thinking tokens of a loop, then the loop goes on: the guard hits at
+    /// 512, later cycles stop at the cut 64 tokens on, and the end comes one
+    /// token per step, the tokens the whole-turn lane emits. At 507 the cut
+    /// falls inside a cycle at both depths, so an uncapped cycle would run
+    /// past it.
+    #[test]
+    fn a_cycle_hit_inside_an_mtp_cycle_caps_the_cycles_after_it() {
+        for depth in [1, 3] {
+            let cycle = CycleArgmax {
+                draft_argmax: vec![5; 4],
+                verify_argmax: vec![5; 5],
+            };
+            let mut backend = MockMtpBackend::new(16, 4, vec![5; 200], vec![cycle; 200], false);
+            let mut tracker = ReasoningTracker::guarded(true, None, &[8, 9], true);
+            for _ in 0..507 {
+                tracker.observe_token(5);
+            }
+            let out = drive_turn_with_tracker(&mut backend, 5, 72, 15, depth, None, tracker);
+            assert_eq!(out.generated.len(), 72);
+            assert!(out.generated[..69].iter().all(|&t| t == 5), "depth={depth}");
+            assert_eq!(&out.generated[69..71], &[8, 9], "depth={depth}");
+            let forced: Vec<usize> = out
+                .ledger
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    matches!(
+                        c,
+                        Call::EvalStep {
+                            budget_forced: true
+                        }
+                    )
+                })
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(forced.len(), 2, "depth={depth}");
+            assert!(
+                !out.ledger[forced[0]..forced[1]]
+                    .iter()
+                    .any(|c| matches!(c, Call::DraftStep | Call::VerifyStep { .. })),
+                "depth={depth}"
+            );
+            assert!(!out.desynced);
+        }
+    }
+
     #[test]
     fn thinking_budget_is_exact_across_mtp_cycles() {
         for budget in [0, 1, 2, 3, 16] {
@@ -4154,7 +4182,6 @@ mod tests {
     /// not a default or a locally re-derived value.
     #[test]
     fn run_mtp_turn_threads_plan_lookahead_into_setup() {
-        let _chained_off = force_chained_off();
         let cycle = CycleArgmax {
             draft_argmax: vec![4, 5],
             verify_argmax: vec![4, 5, 6],
@@ -4175,7 +4202,6 @@ mod tests {
     /// exhaustion to a turn error instead of the pre-cycle AR fallback.
     #[test]
     fn run_mtp_turn_reserves_lookahead_per_cycle_and_falls_back_to_ar() {
-        let _chained_off = force_chained_off();
         // depth 2, full-accept cycles scripted for FOUR cycles — but the
         // reservation budget admits only the FIRST. Cycle 1 runs MTP and
         // commits [4, 5, bonus 6]; every later iteration's reservation
@@ -4231,7 +4257,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_normal_full_length_run() {
-        let _chained_off = force_chained_off();
         // depth 2, every cycle FULL-ACCEPT, no EOS — a genuine MULTI-cycle run
         // that walks to the LENGTH budget. Step A emits the prefill seed (3)
         // first; then each outer iteration's Step A forwards the prior accepted
@@ -4347,7 +4372,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_depth1_records_acceptance() {
-        let _chained_off = force_chained_off();
         // depth 1, full accept (draft 4 + bonus 5), clean length exit:
         //   gen: [3] (seed) + N x (Step A + cycle)
         let cycle = CycleArgmax {
@@ -4371,7 +4395,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_single_cycle_still_records_counts() {
-        let _chained_off = force_chained_off();
         // A 1-cycle depth-1 turn records its raw (accepted, attempted)
         // counts — undersampling is NOT filtered at the recording layer;
         // the gate's confidence-aware decision (mtp_accept_gate_blocks)
@@ -4396,7 +4419,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_requested_depth_gt_1_never_publishes() {
-        let _chained_off = force_chained_off();
         // The gate is scoped to REQUESTED depth-1 turns: eligibility is
         // decided by `p.mtp_depth`, not the observed mean. A depth-2
         // request whose only cycle is near-tail-capped to depth 1 observes
@@ -4426,7 +4448,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_early_eos_stop() {
-        let _chained_off = force_chained_off();
         // depth 2. The FIRST cycle's verify emits the EOS id (15) at accept
         // position 1, so the emit loop commits the accepted draft (4) then the
         // EOS (15) and STOPS with finish_reason "stop". last_in_cache is false:
@@ -4490,7 +4511,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_mid_cycle_stop_rolls_back_unemitted() {
-        let _chained_off = force_chained_off();
         // A TRUE mid-cycle stop: the cycle FULLY accepts depth-3 drafts but an
         // EOS lands as the 2nd ACCEPTED draft (not the last token), so the emit
         // loop breaks BEFORE the cycle's remaining tokens — leaving an
@@ -4572,7 +4592,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_mid_cycle_stop_rewinds_paged_state() {
-        let _chained_off = force_chained_off();
         // PAGED twin of `run_mtp_turn_mid_cycle_stop_rolls_back_unemitted`:
         // same mid-cycle EOS script, but the stepper models the paged
         // target-state frontier (`state_pos`) with the paged rewind semantics
@@ -4640,7 +4659,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "recurrent state at a different frontier")]
     fn run_mtp_turn_mid_cycle_stop_stale_recurrent_trips_frontier_assert() {
-        let _chained_off = force_chained_off();
         // Same mid-cycle EOS script as
         // `run_mtp_turn_mid_cycle_stop_rewinds_paged_state`: full-accept
         // depth-3 cycle, EOS lands as the 2nd emitted token, unemitted = 2.
@@ -4672,7 +4690,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "recurrent state at a different frontier")]
     fn run_mtp_cycle_partial_accept_stale_recurrent_trips_frontier_assert() {
-        let _chained_off = force_chained_off();
         // drafts [4, 5, 6]; verify [4, 9, ..] → d0 accepted, d1 rejected →
         // rollback(accepted=1, depth=3) lands attn at snapshot+2 while the
         // forgetful recurrent side stays at the verify end (snapshot+4).
@@ -4693,7 +4710,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_replay_error_prevents_completed_profile() {
-        let _chained_off = force_chained_off();
         let mut backend =
             MockMtpBackend::new(16, 4, Vec::new(), Vec::new(), /* desynced */ false)
                 .with_replay_error("scripted replay failure");
@@ -4768,7 +4784,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_sync_preset_cancel_stops_before_any_forward() {
-        let _chained_off = force_chained_off();
         // H2: a NON-streaming turn (streaming ctx None) whose cancel flag is
         // already set when the loop starts — the ungated loop-top poll must
         // exit "cancelled" after the seed, before ANY Step-A forward or
@@ -4808,7 +4823,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_sync_cancel_during_step_a_forward() {
-        let _chained_off = force_chained_off();
         // H2: the disconnect lands DURING the first Step-A forward (the mock
         // flips the shared flag inside `forward_with_hidden`). The ungated
         // Step-A poll — same snapshot point as the streaming twin's: after
@@ -4855,7 +4869,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_sync_cancel_mid_cycle_rolls_back_unemitted() {
-        let _chained_off = force_chained_off();
         // H2: the disconnect lands BETWEEN the cycle's verify/commit and the
         // emit loop (the mock flips the flag inside `commit_mtp`). The
         // ungated emit-loop poll — same snapshot point as the streaming
@@ -4963,7 +4976,6 @@ mod tests {
     /// MUTATION: moving `step.begin_cycle(...)` back above the near-tail guard.
     #[test]
     fn near_tail_skipped_cycle_does_not_anchor_the_drafter() {
-        let _chained_off = force_chained_off();
         let cycle = CycleArgmax {
             // depth 1, full accept: draft 4 matches verify slot 0, bonus 5.
             draft_argmax: vec![4],

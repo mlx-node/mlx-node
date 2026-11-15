@@ -118,6 +118,16 @@ impl ChatCmd {
             Self::ResetCaches { .. } | Self::ReleaseCacheOwner { .. } => None,
         }
     }
+
+    /// A streaming turn's progress; `None` for every other command.
+    pub(crate) fn progress(&self) -> Option<&Arc<crate::engine::progress::TurnProgress>> {
+        match self {
+            Self::StreamSessionStart { stream_tx, .. }
+            | Self::StreamSessionContinue { stream_tx, .. }
+            | Self::StreamSessionContinueTool { stream_tx, .. } => stream_tx.progress(),
+            _ => None,
+        }
+    }
 }
 
 /// Training commands dispatched from the GRPO / SFT engines to a
@@ -623,6 +633,8 @@ mod mock_backend_tests {
         /// Whether a whole-turn progress was installed on this thread when
         /// each `prefill` ran.
         progress_installed_in_prefill: Vec<bool>,
+        /// The installed progress's phase when each `prefill` ran.
+        phase_in_prefill: Vec<String>,
         /// Returned from `context_window`.
         context_window_knob: Option<u32>,
         /// `params.max_new_tokens` seen by each `begin_decode`.
@@ -673,6 +685,7 @@ mod mock_backend_tests {
                 turn_cancel_events: Vec::new(),
                 flip_cancel_in_prefill_knob: None,
                 progress_installed_in_prefill: Vec::new(),
+                phase_in_prefill: Vec::new(),
                 context_window_knob: None,
                 decode_max_new_tokens: Vec::new(),
                 speculative_max_new_tokens: Vec::new(),
@@ -700,6 +713,7 @@ mod mock_backend_tests {
             ThinkingSetup {
                 enabled: true,
                 budget: config.thinking_token_budget,
+                cycle_guard: false,
             }
         }
 
@@ -859,6 +873,10 @@ mod mock_backend_tests {
                 num_tokens: 1,
                 prompt_tokens: 1,
                 reasoning_tokens: 0,
+                reasoning_close: None,
+                reasoning_cut_at: None,
+                reasoning_cycle_period: None,
+                reasoning_stray_closes: None,
                 finish_reason: "stop".to_string(),
                 raw_text: "PAGED_COMPLETE".to_string(),
                 public_raw_text: None,
@@ -885,6 +903,10 @@ mod mock_backend_tests {
                 num_tokens: 1,
                 prompt_tokens: 1,
                 reasoning_tokens: 0,
+                reasoning_close: None,
+                reasoning_cut_at: None,
+                reasoning_cycle_period: None,
+                reasoning_stray_closes: None,
                 finish_reason: "stop".to_string(),
                 raw_text: "SPECULATIVE_COMPLETE".to_string(),
                 public_raw_text: None,
@@ -907,7 +929,7 @@ mod mock_backend_tests {
                 args.include_reasoning,
                 args.thinking_enabled,
                 args.prompt_tokens,
-                args.reasoning_tokens,
+                args.reasoning,
             )?;
             if self.finalize_marker_knob {
                 result.text = format!("FINALIZED:{}", result.text);
@@ -967,6 +989,9 @@ mod mock_backend_tests {
             self.prefill_calls.push(prompt_tokens.to_vec());
             self.progress_installed_in_prefill
                 .push(crate::engine::progress::turn_progress_installed());
+            crate::engine::progress::with_turn_progress(|p| {
+                self.phase_in_prefill.push(p.snapshot().phase);
+            });
             // Knob: model a cancel landing DURING the prefill forward
             // (after the pre-start guard, before the decode loop's first
             // per-step snapshot).
@@ -1444,6 +1469,35 @@ mod mock_backend_tests {
         assert_eq!(progress.cached_tokens, Some(0));
         assert!(progress.prefill_elapsed_ms.is_some());
         assert!(progress.decode_elapsed_ms.is_some());
+    }
+
+    /// P-T7 (whole-turn half): the flat lane reads `queued`, then `prefill`
+    /// from pickup with today's prefill clock, and never `prepare` or
+    /// `slot`. Mutation P7 (`begin_turn` enters `prepare`) -> red.
+    #[test]
+    fn a_whole_turn_has_no_prepare_phase() {
+        let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_IM_END]]);
+        let (plumbing, mut stream_rx) = crate::engine::napi_glue::chat_stream_plumbing();
+        let handle = plumbing.handle;
+        let before = handle.progress();
+        assert_eq!(before.phase, "queued");
+        assert_eq!((before.slot_ms, before.prepare_ms), (None, None));
+        handle_chat_cmd(
+            &mut backend,
+            ChatCmd::StreamSessionStart {
+                messages: user_messages("hello"),
+                config: greedy_config(),
+                stream_tx: plumbing.stream_tx,
+                cancelled: plumbing.cancelled,
+            },
+        );
+        while stream_rx.blocking_recv().is_some() {}
+        assert_eq!(backend.phase_in_prefill, vec!["prefill".to_string()]);
+        let done = handle.progress();
+        assert_eq!(done.phase, "done");
+        assert_eq!((done.slot_ms, done.prepare_ms), (Some(0.0), Some(0.0)));
+        assert!(done.prefill_elapsed_ms.is_some());
+        assert!(done.wait_ms >= before.wait_ms);
     }
 
     /// The streaming wrappers install the request's progress for the whole

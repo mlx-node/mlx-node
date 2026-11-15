@@ -1501,7 +1501,7 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
             retain_final_length_token: true,
             generation_start,
             first_token_instant,
-            reasoning_tokens: reasoning_tracker.reasoning_token_count(),
+            reasoning: reasoning_tracker.outcome(),
             profiler: &profiler,
             stream_skip_special,
             // The epilogue takes scalar copies — the same defaults the
@@ -2738,6 +2738,59 @@ mod tests {
             "exhaustion must degrade the cycle, never fail the turn"
         );
         assert_eq!(out.generated.len(), 6, "the turn still fills its budget");
+    }
+
+    /// 510 thinking tokens of a loop, then the loop goes on: the guard hits at
+    /// 512 inside the first block, later blocks stop at the cut 64 tokens on,
+    /// and each end token is its own one-row cycle.
+    #[test]
+    fn a_cycle_hit_inside_a_dspark_block_caps_the_blocks_after_it() {
+        let mut cycles = vec![CycleScript::greedy(vec![5, 5], vec![5, 5, 5])];
+        let mut count = 514;
+        while count < 576 {
+            let depth = 2.min(576 - count - 1);
+            cycles.push(CycleScript::greedy(vec![5; depth], vec![5; depth + 1]));
+            count += depth + 1;
+        }
+        for _ in 0..2 {
+            cycles.push(CycleScript::greedy(vec![], vec![5]));
+        }
+        let mut backend = MockDsparkBackend::greedy(16, cycles);
+        let mut params = greedy_params();
+        params.max_new_tokens = 70;
+        let mut tracker = ReasoningTracker::guarded(true, None, &[8, 9], true);
+        for _ in 0..510 {
+            tracker.observe_token(5);
+        }
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(42);
+        let out = drive_turn_with_tracker(
+            &mut backend,
+            params,
+            5,
+            15,
+            2,
+            &mut rng,
+            None,
+            None,
+            tracker,
+        );
+        assert!(out.result.is_ok(), "{:?}", out.result.err());
+        let mut expected = vec![5; 66];
+        expected.extend([8, 9, 0, 0]);
+        assert_eq!(out.generated, expected);
+        let caps: Vec<usize> = backend
+            .ledger_snapshot()
+            .iter()
+            .filter_map(|call| match call {
+                Call::Propose { max_len, .. } => Some(*max_len),
+                _ => None,
+            })
+            .collect();
+        assert!(caps[..21].iter().all(|&cap| cap == 2), "{caps:?}");
+        assert_eq!(
+            caps[21], 1,
+            "the last block before the cut is capped: {caps:?}"
+        );
     }
 
     #[test]

@@ -248,6 +248,26 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
         crate::models::qwen3_5::dflash2_state::disk::tick(self, tick)
     }
 
+    fn hold_state_tier(&mut self) -> Option<crate::models::qwen3_5::dflash2_state::disk::HeldTier> {
+        crate::models::qwen3_5::dflash2_state::disk::hold_tier(self)
+    }
+
+    fn release_state_tier(&mut self, held: crate::models::qwen3_5::dflash2_state::disk::HeldTier) {
+        crate::models::qwen3_5::dflash2_state::disk::release_tier(self, held);
+    }
+
+    fn warm_state_restore(&mut self, seq_id: SeqId) -> Result<bool> {
+        let cell = if self.active_scheduled_seq == Some(seq_id) {
+            self.caches.as_deref()
+        } else {
+            self.scheduled_recurrent.live(seq_id).map(Vec::as_slice)
+        };
+        crate::models::qwen3_5::dflash2_state::paged::warm_install_linear(
+            cell,
+            self.fresh_dflash2_layer_caches(),
+        )
+    }
+
     fn memory_governor(&self) -> Option<&'static crate::engine::governor::governor::Governor> {
         self.memory_registration
             .as_ref()
@@ -380,6 +400,13 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
         self.scheduled_mtp.release(seq_id);
     }
 
+    fn token_vocab_size(&self) -> u32 {
+        let rows = self.config.vocab_size.max(1) as u32;
+        self.tokenizer
+            .as_ref()
+            .map_or(rows, |tokenizer| tokenizer.vocab_size().clamp(1, rows))
+    }
+
     fn max_position_embeddings(&self) -> i32 {
         self.context_cap() as i32
     }
@@ -390,6 +417,21 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
 
     fn scheduled_recurrent_bytes(&self) -> u64 {
         self.scheduled_recurrent_bytes()
+    }
+
+    fn per_sequence_entries(&self) -> usize {
+        self.paged_adapter
+            .as_ref()
+            .map_or(0, PagedKVCacheAdapter::per_sequence_entries)
+            + self.gdn_in_use.len()
+    }
+
+    fn retained_state_entries(&self) -> usize {
+        self.gdn_prefix_checkpoints.len() + usize::from(self.gdn_last_history_checkpoint.is_some())
+    }
+
+    fn scheduled_speculation_owners(&self) -> usize {
+        self.scheduled_mtp.owner_count()
     }
 
     fn has_scheduled_recurrent(&self, seq_id: SeqId) -> bool {

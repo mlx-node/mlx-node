@@ -9,6 +9,8 @@ mod speculative;
 
 #[cfg(all(test, target_os = "macos"))]
 mod lane_wave_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod progress_tests;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +46,7 @@ use crate::engine::governor::wait::{
     resource_timeout, retry_ready, sync_claims, tick,
 };
 use crate::engine::model_command::{FamilyCommand, ModelCommand, handle_model_command};
+use crate::engine::progress::{TurnProgress, Waiting};
 use crate::engine::scheduler::{
     BlockTelemetry, JudgePolicy, MeasuredConfig, PREFILL_CHUNK_ROWS, PreemptedTurn, PreemptionMode,
     PreemptionReplay, Prepared, RetryClock, RowGrant, RowStepResult, Scheduler, SchedulerAction,
@@ -230,6 +233,19 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     ) -> bool {
         false
     }
+    /// Sets the model's SSD state tier aside with the states it holds, so
+    /// no turn reaches either until [`Self::release_state_tier`]; `None`
+    /// when the model has no tier.
+    fn hold_state_tier(&mut self) -> Option<crate::models::qwen3_5::dflash2_state::disk::HeldTier> {
+        None
+    }
+    fn release_state_tier(&mut self, _held: crate::models::qwen3_5::dflash2_state::disk::HeldTier) {
+    }
+    /// Runs a stored state's restore copy on `seq_id`'s live GDN cell and
+    /// drops the copy; false when the sequence holds no cell.
+    fn warm_state_restore(&mut self, _seq_id: SeqId) -> Result<bool> {
+        Ok(false)
+    }
     /// A GPU command exhausted Metal memory: every cache its writes may
     /// have reached goes (Splash restarts the engine).
     /// The model's accounts on the governor's books.
@@ -376,7 +392,28 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
             .map_err(Error::from_reason)
     }
     fn max_position_embeddings(&self) -> i32;
+    /// Token ids a prompt may hold: `0..token_vocab_size()`.
+    fn token_vocab_size(&self) -> u32 {
+        self.tokenizer()
+            .map_or(1, |tokenizer| tokenizer.vocab_size())
+            .max(1)
+    }
     fn recurrent_state_bytes(&self) -> u64 {
+        0
+    }
+    /// Entries kept per sequence outside the scheduler: the paged
+    /// adapter's request, turn-end and refusal tables, and the family's.
+    fn per_sequence_entries(&self) -> usize {
+        self.paged_adapter()
+            .map_or(0, PagedKVCacheAdapter::per_sequence_entries)
+    }
+    /// Recurrent states kept between turns: checkpoints, refused rungs and
+    /// the last history checkpoint.
+    fn retained_state_entries(&self) -> usize {
+        0
+    }
+    /// Sequences holding scheduled speculation state.
+    fn scheduled_speculation_owners(&self) -> usize {
         0
     }
     fn scheduled_recurrent_bytes(&self) -> u64 {
@@ -1144,8 +1181,25 @@ impl<C> std::ops::Deref for Queued<C> {
     }
 }
 
+/// The progress of a streaming chat command, if `command` is one.
+fn command_progress<C>(command: &ModelCommand<C>) -> Option<&Arc<TurnProgress>> {
+    command.as_chat().and_then(ChatCmd::progress)
+}
+
+fn reply_progress(response: &ScheduledReply) -> Option<&Arc<TurnProgress>> {
+    response.sink().and_then(|sink| sink.progress())
+}
+
+fn mark(progress: Option<&Arc<TurnProgress>>, waiting: Waiting) {
+    if let Some(progress) = progress {
+        progress.enter(waiting);
+    }
+}
+
 struct PreparedTurn {
     admitted: engine::session::AdmittedPagedTurn,
+    /// Prefill ends pinned beside the family's own.
+    extra_breaks: Vec<u32>,
     response: ScheduledReply,
     cancelled: Arc<AtomicBool>,
     owner_id: String,
@@ -1168,6 +1222,17 @@ struct PreparedTurn {
     order: Option<u64>,
     /// Splash `Request::overtaken` while it is held.
     overtaken: u32,
+}
+
+/// Who a prepared turn answers and the sequence it runs as.
+struct TurnRoute {
+    response: ScheduledReply,
+    cancelled: Arc<AtomicBool>,
+    owner_id: String,
+    seq_id: SeqId,
+    newly_assigned: bool,
+    arrival: Arrival,
+    extra_breaks: Vec<u32>,
 }
 
 struct PreparedDecodeRow {
@@ -2281,6 +2346,15 @@ pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     /// this text.
     #[cfg(test)]
     prefix_failure: Option<&'static str>,
+    /// Runs right after each lane admission's prefix preparation, while the
+    /// turn is still preparing.
+    #[cfg(test)]
+    after_prefix_prepare: Option<Box<dyn FnMut() + Send>>,
+    /// The next step that plans rows fails in its executor with this text.
+    #[cfg(test)]
+    step_failure: Option<&'static str>,
+    /// Why the last pass stopped the scheduler.
+    stopped: Option<Error>,
     /// The current drive pass: its start on the governor's clock and what
     /// it ran.
     pass_start: f64,
@@ -2290,6 +2364,37 @@ pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     /// When the model's accounts are next published.
     accounts_due: f64,
     next_seq_id: SeqId,
+    /// A load's warm-up scheduler: its turns feed no governor statistic,
+    /// end by cancel only and record the rows each step ran.
+    scratch: bool,
+    scratch_steps: Vec<ScratchStep>,
+}
+
+/// The granted rows of one step of a scratch scheduler.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScratchStep {
+    /// Each prefill row's sequence and rows.
+    pub prefill: Vec<(SeqId, u32)>,
+    /// The sequences of its decode rows.
+    pub decode: Vec<SeqId>,
+}
+
+/// A scratch turn's tokens and how they run.
+pub(crate) struct ScratchRequest {
+    pub tokens: Vec<u32>,
+    /// Prefill ends pinned inside the prompt.
+    pub breaks: Vec<u32>,
+    /// Draft depth of a speculative turn; `None` decodes autoregressively.
+    pub mtp_depth: Option<u32>,
+    pub owner_id: String,
+    pub cache_salt: String,
+}
+
+/// An admitted scratch turn: its sequence, its result and its cancel.
+pub(crate) struct ScratchTurn {
+    pub seq_id: SeqId,
+    pub reply: tokio::sync::oneshot::Receiver<Result<ChatResult>>,
+    pub cancel: Arc<AtomicBool>,
 }
 
 /// The tokens a planned row's step writes up to (Splash
@@ -2364,15 +2469,40 @@ fn prefill_breaks<B: HybridSchedulerBackend>(
 
 impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     pub(crate) fn new(inner: B) -> Result<Self> {
+        Self::resume(inner, 1)
+    }
+
+    /// The serving scheduler of a load whose warm-up handed out sequences
+    /// below `next_seq_id`.
+    pub(crate) fn resume(inner: B, next_seq_id: SeqId) -> Result<Self> {
+        let mut state = Self::build(inner, false)?;
+        state.next_seq_id = next_seq_id.max(1);
+        Ok(state)
+    }
+
+    /// A throwaway scheduler for a load's warm-up. It plans prefill on the
+    /// fixed unit, the one that cuts at pinned ends.
+    pub(crate) fn scratch(inner: B) -> Result<Self> {
+        Self::build(inner, true)
+    }
+
+    /// The model and the next sequence id, for [`Self::resume`].
+    pub(crate) fn into_parts(self) -> (B, SeqId) {
+        (self.inner, self.next_seq_id)
+    }
+
+    fn build(inner: B, scratch: bool) -> Result<Self> {
         let enabled = inner.scheduler_cache_available();
         let max_num_seqs = configured_scheduler_capacity(inner.scheduler_capacity());
         let mut scheduler =
             Scheduler::new(max_num_seqs, PREFILL_CHUNK_ROWS).map_err(Error::from_reason)?;
-        if let Some(config) = inner.measured_prefill_cut() {
-            scheduler = scheduler.with_measured_prefill_cut(config);
-        }
-        if let Some(governor) = inner.memory_governor() {
-            governor.register_scheduler(inner.memory_model(), scheduler.counters());
+        if !scratch {
+            if let Some(config) = inner.measured_prefill_cut() {
+                scheduler = scheduler.with_measured_prefill_cut(config);
+            }
+            if let Some(governor) = inner.memory_governor() {
+                governor.register_scheduler(inner.memory_model(), scheduler.counters());
+            }
         }
         Ok(Self {
             inner,
@@ -2392,11 +2522,18 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             gpu_oom: None,
             #[cfg(test)]
             prefix_failure: None,
+            #[cfg(test)]
+            after_prefix_prepare: None,
+            #[cfg(test)]
+            step_failure: None,
+            stopped: None,
             pass_start: 0.0,
             pass_work: PassWork::default(),
             timeline: Timeline::default(),
             accounts_due: 0.0,
             next_seq_id: 1,
+            scratch,
+            scratch_steps: Vec::new(),
         })
     }
 
@@ -2700,6 +2837,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             );
             return None;
         }
+        mark(reply_progress(&response), Waiting::Prepare);
         if config.reuse_cache == Some(false) {
             response.send_error(
                 Error::from_reason(format!(
@@ -2754,7 +2892,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let owner_state = self.owner_states.entry(owner_id.clone()).or_default();
         self.inner.install_owner_state(seq_id, owner_state);
         let streaming = matches!(response, ScheduledReply::Stream(_));
-        let mut admitted = match engine::session::admit_paged_turn(
+        let admitted = match engine::session::admit_paged_turn(
             &mut self.inner,
             messages,
             config,
@@ -2771,6 +2909,37 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 return None;
             }
         };
+        self.prepare_admitted(
+            admitted,
+            TurnRoute {
+                response,
+                cancelled,
+                owner_id,
+                seq_id,
+                newly_assigned,
+                arrival,
+                extra_breaks: Vec::new(),
+            },
+        )
+    }
+
+    /// The scheduled half of a turn's preparation, after its prompt: the
+    /// lane check, the output budget and the booking.
+    fn prepare_admitted(
+        &mut self,
+        mut admitted: engine::session::AdmittedPagedTurn,
+        route: TurnRoute,
+    ) -> Option<Box<PreparedTurn>> {
+        let TurnRoute {
+            response,
+            cancelled,
+            owner_id,
+            seq_id,
+            newly_assigned,
+            arrival,
+            extra_breaks,
+        } = route;
+        let streaming = matches!(response, ScheduledReply::Stream(_));
         // `chat_requires_barrier` already routes Barrier-lane speculation to
         // the exclusive lane; admission re-consults the SAME lane decision
         // against the decoder the planner actually resolved, so a routing gap
@@ -2864,9 +3033,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 } else {
                     0
                 });
-        admitted.params.extra_eos_ids = self.inner.extra_eos_ids();
+        if !self.scratch {
+            admitted.params.extra_eos_ids = self.inner.extra_eos_ids();
+        }
         Some(Box::new(PreparedTurn {
             reservation_state_bytes,
+            extra_breaks,
             admitted,
             response,
             cancelled,
@@ -3090,6 +3262,18 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         true
     }
 
+    /// The next lane admission's prefix preparation fails with `reason`.
+    #[cfg(test)]
+    pub(crate) fn fail_next_prefix(&mut self, reason: &'static str) {
+        self.prefix_failure = Some(reason);
+    }
+
+    /// The next step that plans rows fails in its executor with `reason`.
+    #[cfg(test)]
+    pub(crate) fn fail_next_step(&mut self, reason: &'static str) {
+        self.step_failure = Some(reason);
+    }
+
     #[cfg(test)]
     pub(crate) fn resume_preempted(&mut self) {
         self.try_resume_preempted();
@@ -3265,6 +3449,21 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .unwrap_or_else(crate::engine::governor::governor)
     }
 
+    /// A request failed `capacity_exhausted`. A scratch turn is not a
+    /// request: the governor's counters are process-wide.
+    fn count_capacity_exhausted(&self) {
+        if !self.scratch {
+            self.memory_governor().capacity_exhausted();
+        }
+    }
+
+    /// A request's resource wait timed out; not counted for a scratch turn.
+    fn count_resource_timeout(&self) {
+        if !self.scratch {
+            self.memory_governor().resource_timed_out();
+        }
+    }
+
     /// The KV a lane holds now, in tokens (Splash `Engine::kvCapacity`).
     fn kv_capacity(&self, seq_id: SeqId) -> u32 {
         self.inner
@@ -3350,7 +3549,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 };
                 let error =
                     capacity_exhausted(what, denial.failure, &page_shortfall(denial.blocks));
-                self.memory_governor().capacity_exhausted();
+                self.count_capacity_exhausted();
                 if let Some(turn) = self.scheduler.take_running(victim) {
                     self.fail_preempted(turn, error);
                 }
@@ -3395,7 +3594,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let governor = self.memory_governor();
         let model = self.inner.memory_model();
         if judge(&denial, self.scheduler.another_resident(seq_id)) == Verdict::Fail {
-            governor.capacity_exhausted();
+            self.count_capacity_exhausted();
             return Some(Err(Error::from_reason(capacity_exhausted(
                 "KV target",
                 denial.failure,
@@ -3744,7 +3943,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 }
             }
             if verdict == Verdict::Fail {
-                governor.capacity_exhausted();
+                self.count_capacity_exhausted();
                 return Admitted::Fail(Error::from_reason(capacity_exhausted(
                     "request state",
                     denial.failure,
@@ -3808,7 +4007,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
         let denial = allocation.denial;
         if judge(&denial, self.scheduler.another_resident(seq_id)) == Verdict::Fail {
-            self.memory_governor().capacity_exhausted();
+            self.count_capacity_exhausted();
             return Admitted::Fail(Error::from_reason(capacity_exhausted(
                 "request state",
                 denial.failure,
@@ -3887,7 +4086,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             );
         }
         if judge(&denial, self.scheduler.another_resident(seq_id)) == Verdict::Fail {
-            self.memory_governor().capacity_exhausted();
+            self.count_capacity_exhausted();
             return Admitted::Fail(Error::from_reason(capacity_exhausted(
                 "KV target",
                 denial.failure,
@@ -3913,6 +4112,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             Ok(planned) => planned,
             Err(action) => return Ok(action),
         };
+        #[cfg(test)]
+        if let Some(reason) = self.step_failure.take() {
+            return Err(SchedulerError::Executor(Error::from_reason(reason)));
+        }
         let policy = self.judge_policy();
         // The step's batched forward is the engine's own (Splash's engine
         // claim); each row's work is its request's (`HybridStepExecutor`).
@@ -3965,6 +4168,21 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
         }
         let claims = B::claim_step_rows(self, &plan);
+        if self.scratch {
+            let mut step = ScratchStep::default();
+            for (row, _) in plan
+                .rows
+                .iter()
+                .zip(&claims.grants)
+                .filter(|(row, grant)| grant.is_none() && !row.cancel_snapshot)
+            {
+                match row.kind {
+                    StepKind::Prefill => step.prefill.push((row.seq_id, row.num_tokens)),
+                    StepKind::Decode => step.decode.push(row.seq_id),
+                }
+            }
+            self.scratch_steps.push(step);
+        }
         for (row, grant) in plan.rows.iter().zip(&claims.grants) {
             if grant.is_none() {
                 match row.kind {
@@ -4092,7 +4310,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         drop(waiters);
         for (key, failure) in timed_out {
             let error = resource_timeout(failure);
-            governor.resource_timed_out();
+            self.count_resource_timeout();
             match key {
                 None => {
                     if let Some(prepared) = self.prepared_waiting.take() {
@@ -4127,6 +4345,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 true
             }
             command => {
+                if let Some(progress) = command_progress(&command) {
+                    progress.picked_up();
+                }
                 self.pending.push_back(Queued {
                     command,
                     arrival: Arrival {
@@ -4256,6 +4477,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let work = std::mem::take(&mut self.pass_work);
         let releases = governor.pool_releases();
         let replans = self.scheduler.stats().replans;
+        let scratch = self.scratch;
         let waits = |claim: Option<&ClaimHandle<'static>>| {
             claim.is_some_and(|claim| {
                 governor.ledger(|ledger| {
@@ -4280,11 +4502,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 .worked(work.prefill_beside(turn.seq_id), claim_waits);
             if clock.token_events > clock.seen_events {
                 clock.seen_events = clock.token_events;
-                if let Some(parts) = clock.ttft.first_tokens() {
-                    governor.first_tokens(&parts);
-                }
-                if let Some(gap) = clock.gap.token(now, releases, replans) {
-                    governor.decode_gap(&gap);
+                let parts = clock.ttft.first_tokens();
+                let gap = clock.gap.token(now, releases, replans);
+                if !scratch {
+                    if let Some(parts) = parts {
+                        governor.first_tokens(&parts);
+                    }
+                    if let Some(gap) = gap {
+                        governor.decode_gap(&gap);
+                    }
                 }
             }
         }
@@ -4393,6 +4619,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             "{} scheduler execution failed: {error:?}",
             B::SCHEDULER_NAME
         );
+        self.stopped = Some(error);
         LoopControl::Break
     }
 
@@ -5062,6 +5289,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 .ok()
                 .flatten(),
         );
+        let progress = reply_progress(&prepared.response).cloned();
+        mark(progress.as_ref(), Waiting::Prepare);
+        let installed = engine::progress::install_prepare_progress(progress);
         let prefix_admission = self.inner.prepare_scheduled_prefix(
             seq_id,
             &prepared.admitted.tokens,
@@ -5070,6 +5300,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             prepared.admitted.params.cache_salt,
             prepared.block_size,
         );
+        #[cfg(test)]
+        if let Some(hook) = self.after_prefix_prepare.as_mut() {
+            hook();
+        }
+        drop(installed);
         drop(scope);
         #[cfg(test)]
         let prefix_admission = match self.prefix_failure.take() {
@@ -5106,6 +5341,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         };
         let PreparedTurn {
             admitted,
+            extra_breaks: pinned_breaks,
             response,
             cancelled,
             owner_id,
@@ -5171,6 +5407,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
         });
         let reuse_cache = admitted.plan.is_delta || admitted.params.reuse_cache;
+        let extra_eos_ids = admitted.params.extra_eos_ids.clone();
         let payload = ScheduledTurn {
             owner_id,
             scheduled_speculation: matches!(
@@ -5198,7 +5435,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 &admitted.thinking,
                 &admitted.close,
             ),
-            extra_eos_ids: self.inner.extra_eos_ids(),
+            extra_eos_ids,
             generation_start,
             first_token_instant: None,
             generation_stream,
@@ -5208,7 +5445,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     self.inner.stream_emitter(),
                 ))
             }),
-            turn_token_observer: self.inner.turn_token_observer(),
+            turn_token_observer: if self.scratch {
+                None
+            } else {
+                self.inner.turn_token_observer()
+            },
             stream_skip_special: self.inner.stream_skip_special_tokens(),
             decode_ids: Vec::new(),
             decode_prefix: String::new(),
@@ -5229,7 +5470,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         };
         let prompt_len = admitted.tokens.len() as u32;
         let cached_prefix = payload.prefix.effective_cached_prefix_len() as u32;
-        let extra_breaks = self.inner.extra_prefill_breaks(prompt_len, cached_prefix);
+        let mut extra_breaks = self.inner.extra_prefill_breaks(prompt_len, cached_prefix);
+        extra_breaks.extend(pinned_breaks);
         let (breaks, whole_prompt_prefill) =
             prefill_breaks(&self.inner, seq_id, cached_prefix, prompt_len, extra_breaks);
         let turn_cancelled = Arc::clone(&cancelled);
@@ -5293,6 +5535,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
             Ok(None)
         } else {
+            mark(reply_progress(&turn.payload.response), Waiting::Queued);
             Ok(Some(turn))
         }
     }
@@ -5417,6 +5660,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                         let _ = self.inner.release_scheduled_cache(seq_id);
                         continue;
                     };
+                    mark(reply_progress(&turn.payload.response), Waiting::Queued);
                     turn.num_computed_tokens = restored.prefix.effective_cached_prefix_len() as u32;
                     turn.block_materialized_blocks = restored.materialized_blocks;
                     if let Some(replay) = turn.payload.preemption_replay.as_mut() {
@@ -5695,6 +5939,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 .ok()
                 .flatten(),
         );
+        let progress = reply_progress(&turn.payload.response).cloned();
+        mark(progress.as_ref(), Waiting::Prepare);
+        let installed = engine::progress::install_prepare_progress(progress.clone());
         let prefix_admission = self.inner.prepare_scheduled_prefix(
             turn.seq_id,
             &replay_tokens,
@@ -5702,10 +5949,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 .get(&turn.payload.owner_id)
                 .map(B::owner_tokens)
                 .unwrap_or_default(),
-            true,
+            !self.scratch,
             turn.payload.params.cache_salt,
             turn.block_size,
         );
+        drop(installed);
+        mark(progress.as_ref(), Waiting::Queued);
         #[cfg(test)]
         let prefix_admission = match self.prefix_failure.take() {
             Some(reason) => Err(Error::from_reason(reason)),
@@ -5901,7 +6150,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 retain_final_length_token: false,
                 generation_start: turn.payload.generation_start,
                 first_token_instant: turn.payload.first_token_instant,
-                reasoning_tokens: turn.payload.reasoning_tracker.reasoning_token_count(),
+                reasoning: turn.payload.reasoning_tracker.outcome(),
                 profiler: &turn.payload.profiler,
                 stream_skip_special: turn.payload.stream_skip_special,
                 streamed_text_len: turn.payload.streamed_text_len,
@@ -5973,8 +6222,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         match self.admit_prepared(prepared) {
             Ok(Some(turn)) => self.enqueue_turn_or_reject(turn),
             Ok(None) => {}
-            Err(prepared) if prepared.held => self.held.push_back(prepared),
+            Err(prepared) if prepared.held => {
+                mark(reply_progress(&prepared.response), Waiting::Slot);
+                self.held.push_back(prepared);
+            }
             Err(prepared) => {
+                mark(reply_progress(&prepared.response), Waiting::Slot);
                 self.prepared_waiting = Some(prepared);
                 return true;
             }
@@ -6054,6 +6307,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         &mut self,
         receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ModelCommand<B::FamilyCommand>>,
     ) -> LoopControl {
+        let control = self.drive_pass(receiver);
+        engine::pipeline_counter::warn_serving();
+        control
+    }
+
+    fn drive_pass(
+        &mut self,
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ModelCommand<B::FamilyCommand>>,
+    ) -> LoopControl {
         let mut woke = false;
         if !self.scheduler.has_work()
             && self.pending.is_empty()
@@ -6126,6 +6388,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         {
             self.process_deferred_cleanup(&blocked_owner_id);
         }
+        let mut lanes_or_held = false;
         while !deferred
             && !self.scheduler.has_pending_control()
             && let Some(command) = self.pending.front()
@@ -6134,6 +6397,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 Self::chat_requires_legacy_owner_drain(chat) && self.scheduler.has_work()
             });
             if must_wait_for_legacy_owner || self.waits_behind_held(command) {
+                lanes_or_held = true;
                 break;
             }
             if command
@@ -6142,6 +6406,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 && self.scheduler.waiting_len() + self.scheduler.running_len()
                     >= self.scheduler.max_num_seqs()
             {
+                lanes_or_held = true;
                 break;
             }
             let Some(Queued { command, arrival }) = self.pending.pop_front() else {
@@ -6152,6 +6417,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     .as_chat()
                     .is_some_and(|chat| matches!(chat, ChatCmd::ReleaseCacheOwner { .. }))
             {
+                if self.scheduler.has_work() {
+                    mark(command_progress(&command), Waiting::Slot);
+                }
                 self.scheduler
                     .enqueue_exclusive(Queued { command, arrival });
                 break;
@@ -6178,6 +6446,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                             || self.ownerless_speculation_is_scheduled(&chat))
                         || self.chat_requires_barrier(&chat)
                     {
+                        if self.scheduler.has_work() {
+                            mark(chat.progress(), Waiting::Slot);
+                        }
                         self.scheduler.enqueue_exclusive(Queued {
                             command: ModelCommand::from_chat(chat),
                             arrival,
@@ -6200,6 +6471,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     break;
                 }
             }
+        }
+
+        let waiting = if lanes_or_held || deferred {
+            Waiting::Slot
+        } else {
+            Waiting::Queued
+        };
+        for queued in &self.pending {
+            mark(command_progress(queued), waiting);
         }
 
         self.begin_scheduled_step();
@@ -6228,10 +6508,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
             Err(SchedulerError::Executor(error)) => return self.executor_failed(error),
             Err(SchedulerError::InvalidResult(message)) => {
-                tracing::error!(
+                let reason = format!(
                     "{} scheduler returned an invalid result: {message}",
                     B::SCHEDULER_NAME
                 );
+                tracing::error!("{reason}");
+                self.stopped = Some(Error::from_reason(reason));
                 return LoopControl::Break;
             }
         }
@@ -6289,6 +6571,110 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
         }
         self.scheduler.publish_gauges(queued, waiting_resources);
+    }
+}
+
+impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
+    /// Whether a turn is queued, held, waiting for memory or running.
+    pub(crate) fn has_turns(&self) -> bool {
+        self.scheduler.has_work()
+            || !self.pending.is_empty()
+            || self.prepared_waiting.is_some()
+            || !self.held.is_empty()
+            || !self.pending_restores.is_empty()
+    }
+
+    /// Whether `seq_id` was held back or refused memory at its admission.
+    pub(crate) fn admission_waits_for(&self, seq_id: SeqId) -> bool {
+        self.prepared_waiting
+            .iter()
+            .chain(&self.held)
+            .any(|prepared| prepared.seq_id == seq_id)
+    }
+
+    /// The rows each step of a scratch scheduler granted since the last
+    /// call.
+    /// Why the last pass stopped the scheduler: a failed execution or an
+    /// invalid result. `None` when it stopped for want of work.
+    pub(crate) fn take_stop(&mut self) -> Option<Error> {
+        self.stopped.take()
+    }
+
+    pub(crate) fn take_scratch_steps(&mut self) -> Vec<ScratchStep> {
+        std::mem::take(&mut self.scratch_steps)
+    }
+
+    /// Turns this scheduler preempted.
+    pub(crate) fn preemptions(&self) -> u64 {
+        let stats = self.scheduler.stats();
+        stats.preemptions_recompute + stats.preemptions_ssd
+    }
+
+    /// Admits a turn of `request.tokens` on a scratch scheduler: the
+    /// scheduled turn a chat start is, past its render, with no end but its
+    /// cancel (no EOS, no stop, no repetition cut, the window for budget).
+    pub(crate) fn admit_scratch(&mut self, request: ScratchRequest) -> Result<ScratchTurn> {
+        let ScratchRequest {
+            tokens,
+            breaks,
+            mtp_depth,
+            owner_id,
+            cache_salt,
+        } = request;
+        let config = ChatConfig {
+            cache_owner_id: Some(owner_id.clone()),
+            cache_salt: Some(cache_salt),
+            reuse_cache: Some(false),
+            reasoning_effort: Some("none".to_string()),
+            max_consecutive_tokens: Some(0),
+            max_ngram_repeats: Some(0),
+            enable_mtp: Some(mtp_depth.is_some()),
+            mtp_depth: mtp_depth.map(|depth| depth as i32),
+            mtp_adaptive_depth: Some(false),
+            #[cfg(test)]
+            max_new_tokens: crate::engine::warmup::FINISH_NEXT_TURN.take().then_some(1),
+            ..ChatConfig::default()
+        };
+        let seq_id = self.next_seq_id;
+        self.next_seq_id = self.next_seq_id.saturating_add(1);
+        self.owner_sequences.insert(owner_id.clone(), seq_id);
+        let owner_state = self.owner_states.entry(owner_id.clone()).or_default();
+        self.inner.install_owner_state(seq_id, owner_state);
+        let mut admitted = match engine::session::admit_tokens(&mut self.inner, tokens, config) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                self.owner_sequences.remove(&owner_id);
+                self.owner_states.remove(&owner_id);
+                return Err(error);
+            }
+        };
+        admitted.eos_id = u32::MAX;
+        admitted.params.extra_eos_ids.clear();
+        let (reply, result) = tokio::sync::oneshot::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let arrival = Arrival {
+            at: Instant::now(),
+            mark: self.timeline,
+        };
+        if let Some(prepared) = self.prepare_admitted(
+            admitted,
+            TurnRoute {
+                response: ScheduledReply::Sync(reply),
+                cancelled: Arc::clone(&cancel),
+                owner_id,
+                seq_id,
+                newly_assigned: true,
+                arrival,
+                extra_breaks: breaks,
+            },
+        ) {
+            self.start_prepared(prepared);
+        }
+        Ok(ScratchTurn {
+            seq_id,
+            reply: result,
+            cancel,
+        })
     }
 }
 
@@ -8785,6 +9171,7 @@ pub(crate) mod tests {
         state.owner_sequences.insert(owner_id.clone(), seq_id);
         let (reply, result) = tokio::sync::oneshot::channel();
         let prepared = PreparedTurn {
+            extra_breaks: Vec::new(),
             admitted: engine::session::AdmittedPagedTurn {
                 tokenizer: tiny_qwen_tokenizer(),
                 eos_id: 999,
@@ -9175,6 +9562,59 @@ pub(crate) mod tests {
         assert_eq!(state.live_turns(), 0);
         assert_eq!(state.inner.scheduler_materialized_blocks(1), 0);
         assert_eq!(state.inner.scheduled_recurrent_bytes(), 0);
+    }
+
+    /// The same lone blocked turn on a serving scheduler moves the governor's
+    /// process-wide `capacity_exhausted` counter by one; on a scratch
+    /// scheduler it fails the same way and moves nothing. In its own
+    /// process: the counter is the global governor's.
+    /// Mutation ms (scratch refusals counted) → red (2 ≠ 1).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_scratch_refusal_moves_no_governor_counter() {
+        const NAME: &str =
+            "engine::hybrid_scheduler::tests::a_scratch_refusal_moves_no_governor_counter";
+        if !crate::test_support::in_own_process(NAME) {
+            return;
+        }
+        let counted = || {
+            crate::engine::governor::governor()
+                .metrics()
+                .capacity_exhausted
+        };
+        let start = counted();
+        for scratch in [false, true] {
+            let Some((state, _)) = mtp_step_state_with(64, 64) else {
+                return;
+            };
+            let (inner, _) = state.into_parts();
+            let mut state = if scratch {
+                HybridSchedulerState::scratch(inner)
+            } else {
+                HybridSchedulerState::new(inner)
+            }
+            .expect("state");
+            let mut turn = speculative::tests::request(
+                &mut state.inner,
+                1,
+                (0..40).map(|token| token % 16).collect(),
+                false,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let (reply, mut result) = tokio::sync::oneshot::channel();
+            turn.payload.response = ScheduledReply::Sync(reply);
+            settle_blocked_step(&mut state, turn);
+            let error = result
+                .try_recv()
+                .expect("the turn has ended")
+                .expect_err("the turn fails");
+            assert!(
+                error.reason.starts_with("capacity_exhausted:"),
+                "{}",
+                error.reason
+            );
+            assert_eq!(counted() - start, 1, "scratch: {scratch}");
+        }
     }
 
     /// Every turn takes the pool lane's one window: the plan prices the MTP
@@ -11227,7 +11667,7 @@ pub(crate) mod tests {
     }
 
     /// A governor of its own with room for the fixtures, and its clock.
-    fn roomy_governor() -> (
+    pub(crate) fn roomy_governor() -> (
         Arc<crate::engine::governor::governor::tests::FakeIo>,
         &'static crate::engine::governor::governor::Governor,
     ) {

@@ -985,20 +985,7 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
     turn_kind: TurnKind,
     streaming: bool,
 ) -> Result<AdmittedPagedTurn> {
-    let tokenizer = backend.tokenizer()?;
-    let eos_id = backend.session_eos_id(&tokenizer)?;
-    // Per-turn reasoning close token — the default hook answers the
-    // tokenizer-global `</think>`; K2-Horizon's override resolves the
-    // effort-dependent `</ifm|think*>` variant.
-    let close = backend.think_end_for_turn(&config, &tokenizer);
-    let params = backend.resolve_params(&config);
-    let template_thinking_enabled =
-        crate::engine::params::resolve_enable_thinking(&config).unwrap_or(true);
-    backend.set_cache_owner_id(
-        &params.cache_owner_id,
-        params.cache_root_owner_id.as_deref(),
-    );
-    let thinking = backend.thinking_setup(&config);
+    let setup = AdmissionSetup::resolve(backend, &config)?;
     let execution = backend.execution_plan();
     let admitted_media = execution.media.admitted();
 
@@ -1028,12 +1015,16 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
         )));
     }
 
-    let full_tokens =
-        backend.render_prompt(&tokenizer, &messages, &config, SESSION_PRESERVE_THINKING)?;
+    let full_tokens = backend.render_prompt(
+        &setup.tokenizer,
+        &messages,
+        &config,
+        SESSION_PRESERVE_THINKING,
+    )?;
     let live_continuation = if turn_kind == TurnKind::Continue {
         render_live_continuation(
             backend,
-            &tokenizer,
+            &setup.tokenizer,
             &messages,
             &config,
             &full_tokens,
@@ -1096,23 +1087,92 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
             is_delta,
             input_media,
             context_media,
-            speculative_requested: params.enable_mtp,
+            speculative_requested: setup.params.enable_mtp,
             streaming,
         },
     );
-    Ok(AdmittedPagedTurn {
-        tokenizer,
-        eos_id,
-        close,
-        config,
-        params,
-        thinking,
-        template_thinking_enabled,
-        tokens,
-        images,
-        audio,
-        plan,
-    })
+    Ok(setup.admitted(config, tokens, images, audio, plan))
+}
+
+/// [`admit_paged_turn`] for a turn whose tokens are given: no render, no
+/// media, a fresh (non-delta) prompt on a sync reply.
+pub(crate) fn admit_tokens<B: ChatBackend>(
+    backend: &mut B,
+    tokens: Vec<u32>,
+    config: ChatConfig,
+) -> Result<AdmittedPagedTurn> {
+    let setup = AdmissionSetup::resolve(backend, &config)?;
+    let plan = TurnPlan::resolve(
+        backend.execution_plan(),
+        TurnRequest {
+            is_delta: false,
+            input_media: MediaCapabilities::NONE,
+            context_media: MediaCapabilities::NONE,
+            speculative_requested: setup.params.enable_mtp,
+            streaming: false,
+        },
+    );
+    Ok(setup.admitted(config, tokens, Vec::new(), Vec::new(), plan))
+}
+
+/// What a turn resolves from its config before its prompt.
+struct AdmissionSetup {
+    tokenizer: Arc<crate::tokenizer::Qwen3Tokenizer>,
+    eos_id: u32,
+    close: ThinkEndResolution,
+    params: ChatParams,
+    thinking: ThinkingSetup,
+    template_thinking_enabled: bool,
+}
+
+impl AdmissionSetup {
+    fn resolve<B: ChatBackend>(backend: &mut B, config: &ChatConfig) -> Result<Self> {
+        let tokenizer = backend.tokenizer()?;
+        let eos_id = backend.session_eos_id(&tokenizer)?;
+        // Per-turn reasoning close token — the default hook answers the
+        // tokenizer-global `</think>`; K2-Horizon's override resolves the
+        // effort-dependent `</ifm|think*>` variant.
+        let close = backend.think_end_for_turn(config, &tokenizer);
+        let params = backend.resolve_params(config);
+        let template_thinking_enabled =
+            crate::engine::params::resolve_enable_thinking(config).unwrap_or(true);
+        backend.set_cache_owner_id(
+            &params.cache_owner_id,
+            params.cache_root_owner_id.as_deref(),
+        );
+        let thinking = backend.thinking_setup(config);
+        Ok(Self {
+            tokenizer,
+            eos_id,
+            close,
+            params,
+            thinking,
+            template_thinking_enabled,
+        })
+    }
+
+    fn admitted(
+        self,
+        config: ChatConfig,
+        tokens: Vec<u32>,
+        images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
+        plan: TurnPlan,
+    ) -> AdmittedPagedTurn {
+        AdmittedPagedTurn {
+            tokenizer: self.tokenizer,
+            eos_id: self.eos_id,
+            close: self.close,
+            config,
+            params: self.params,
+            thinking: self.thinking,
+            template_thinking_enabled: self.template_thinking_enabled,
+            tokens,
+            images,
+            audio,
+            plan,
+        }
+    }
 }
 
 /// One chat turn, generic over the backend.
@@ -1434,7 +1494,7 @@ fn chat_turn_core<B: ChatBackend>(
     } else {
         None
     };
-    let reasoning_tokens = reasoning_tracker.reasoning_token_count();
+    let reasoning = reasoning_tracker.outcome();
 
     if let (Some(s), Some(ts)) = (streaming.as_ref(), turn_streaming.as_mut()) {
         // Flush residual buffered bytes from the incremental decode
@@ -1467,7 +1527,7 @@ fn chat_turn_core<B: ChatBackend>(
         include_reasoning: p.include_reasoning,
         thinking_enabled: thinking.enabled,
         prompt_tokens: prompt_token_count as u32,
-        reasoning_tokens,
+        reasoning,
     });
     let mut result = match finalized {
         Ok(result) => result,

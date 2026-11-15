@@ -444,6 +444,9 @@ pub struct Qwen3Tokenizer {
     /// the chat template's close (Qwen: `"\n</think>"`), else the close token
     /// alone; empty without a close token. See [`Self::probe_thinking_end`].
     thinking_end: Arc<[u32]>,
+    /// The text of `thinking_end` when the chat template wrote it (Qwen:
+    /// `"\n</think>"`); empty when the end is the close token alone.
+    thinking_end_tail: String,
     /// Family-specific control markers to strip from caller-supplied content, on
     /// top of the generic ChatML set. Empty for every family that has none —
     /// see [`Qwen3Tokenizer::detect_control_markers`].
@@ -556,6 +559,7 @@ impl Qwen3Tokenizer {
                     think_end_id,
                     think_end_str,
                     thinking_end: Arc::from([]),
+                    thinking_end_tail: String::new(),
                     control_markers,
                     generation_suffixes: Arc::default(),
                 }
@@ -1245,6 +1249,7 @@ impl Qwen3Tokenizer {
             think_end_id,
             think_end_str,
             thinking_end: Arc::from([]),
+            thinking_end_tail: String::new(),
             control_markers,
             generation_suffixes: Arc::default(),
         }
@@ -2869,6 +2874,7 @@ impl Qwen3Tokenizer {
             think_end_id,
             think_end_str,
             thinking_end: Arc::from([]),
+            thinking_end_tail: String::new(),
             control_markers,
             generation_suffixes: Arc::default(),
         }
@@ -3233,6 +3239,7 @@ impl Clone for Qwen3Tokenizer {
             think_end_id: self.think_end_id,
             think_end_str: self.think_end_str.clone(),
             thinking_end: self.thinking_end.clone(),
+            thinking_end_tail: self.thinking_end_tail.clone(),
             control_markers: self.control_markers,
             generation_suffixes: self.generation_suffixes.clone(),
         }
@@ -3320,19 +3327,78 @@ impl Qwen3Tokenizer {
     }
 
     /// This tokenizer's close of thinking for a turn: the close token, its tag,
-    /// and the tokens a thinking budget ends thinking with.
-    pub(crate) fn think_end(&self) -> crate::engine::backend::ThinkEndResolution {
+    /// and the tokens a thinking budget ends thinking with. With
+    /// `config.thinking_end_text` set, the end is that text followed by the
+    /// template's close, encoded as one string, when it passes the probe's
+    /// rules; otherwise the probed close.
+    pub(crate) fn think_end(
+        &self,
+        config: &crate::engine::types::ChatConfig,
+    ) -> crate::engine::backend::ThinkEndResolution {
+        let thinking_end = match (
+            config.thinking_end_text.as_deref(),
+            self.think_end_id,
+            self.think_end_str.as_deref(),
+        ) {
+            (Some(text), Some(close_id), Some(tag))
+                if !text.is_empty() && !self.thinking_end_tail.is_empty() =>
+            {
+                let end = format!("{text}{}", self.thinking_end_tail);
+                self.thinking_end_tokens(&end, close_id, tag)
+                    .map_or_else(|_| self.thinking_end.clone(), Arc::from)
+            }
+            _ => self.thinking_end.clone(),
+        };
         crate::engine::backend::ThinkEndResolution {
             think_end_id: self.think_end_id,
             think_end_str: self.think_end_str.clone(),
-            thinking_end: self.thinking_end.clone(),
+            thinking_end,
             think_end_extra_ids: Vec::new(),
         }
     }
 
     fn with_thinking_end(mut self) -> std::result::Result<Self, String> {
-        self.thinking_end = self.probe_thinking_end()?;
+        let (end, tail) = self.probe_thinking_end()?;
+        self.thinking_end = end;
+        self.thinking_end_tail = tail;
         Ok(self)
+    }
+
+    /// `text` as the tokens a thinking budget ends thinking with, checked like
+    /// Splash `backend.thinking_end_tokens`: the close token last, no other
+    /// added token, at most [`crate::engine::gen_prompt::MAX_THINKING_END_TOKENS`].
+    fn thinking_end_tokens(
+        &self,
+        text: &str,
+        close_id: u32,
+        tag: &str,
+    ) -> std::result::Result<Vec<u32>, String> {
+        let ids = Self::encode_internal(&self.tokenizer, text, Some(false))
+            .map_err(|e| e.reason)?
+            .get_ids()
+            .to_vec();
+        let added = self
+            .tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder();
+        let Some((&last, before)) = ids.split_last() else {
+            return Err(format!(
+                "the thinking end {text:?} must end with {tag} and hold no other special token"
+            ));
+        };
+        if last != close_id || before.iter().any(|id| added.contains_key(id)) {
+            return Err(format!(
+                "the thinking end {text:?} must end with {tag} and hold no other special token"
+            ));
+        }
+        if ids.len() > crate::engine::gen_prompt::MAX_THINKING_END_TOKENS {
+            return Err(format!(
+                "the thinking end {text:?} takes {} tokens; the most is {}",
+                ids.len(),
+                crate::engine::gen_prompt::MAX_THINKING_END_TOKENS
+            ));
+        }
+        Ok(ids)
     }
 
     /// What the chat template writes from the end of a reply's reasoning through
@@ -3343,9 +3409,9 @@ impl Qwen3Tokenizer {
     /// breaks a rule fails the load (Splash `ThinkingEndError` refuses the start).
     /// A template that renders no close, or fails to render the probe, ends
     /// thinking with the close token alone (Splash `NativeBackend._thinking_budget`).
-    fn probe_thinking_end(&self) -> std::result::Result<Arc<[u32]>, String> {
+    fn probe_thinking_end(&self) -> std::result::Result<(Arc<[u32]>, String), String> {
         let (Some(close_id), Some(tag)) = (self.think_end_id, self.think_end_str.as_deref()) else {
-            return Ok(Arc::from([]));
+            return Ok((Arc::from([]), String::new()));
         };
         const REASONING: &str = "Look it up";
         let message = |role: &str, content: &str| ChatMessage {
@@ -3397,39 +3463,15 @@ impl Qwen3Tokenizer {
             None,
             RenderContextOptions::default(),
         ) else {
-            return Ok(Arc::from([close_id]));
+            return Ok((Arc::from([close_id]), String::new()));
         };
         let Some(text) =
             crate::engine::gen_prompt::thinking_end_from_render(&rendered, REASONING, tag)
         else {
-            return Ok(Arc::from([close_id]));
+            return Ok((Arc::from([close_id]), String::new()));
         };
-        let ids = Self::encode_internal(&self.tokenizer, text, Some(false))
-            .map_err(|e| e.reason)?
-            .get_ids()
-            .to_vec();
-        let added = self
-            .tokenizer
-            .get_added_vocabulary()
-            .get_added_tokens_decoder();
-        let Some((&last, before)) = ids.split_last() else {
-            return Err(format!(
-                "the thinking end {text:?} must end with {tag} and hold no other special token"
-            ));
-        };
-        if last != close_id || before.iter().any(|id| added.contains_key(id)) {
-            return Err(format!(
-                "the thinking end {text:?} must end with {tag} and hold no other special token"
-            ));
-        }
-        if ids.len() > crate::engine::gen_prompt::MAX_THINKING_END_TOKENS {
-            return Err(format!(
-                "the thinking end {text:?} takes {} tokens; the most is {}",
-                ids.len(),
-                crate::engine::gen_prompt::MAX_THINKING_END_TOKENS
-            ));
-        }
-        Ok(Arc::from(ids))
+        let ids = self.thinking_end_tokens(text, close_id, tag)?;
+        Ok((Arc::from(ids), text.to_string()))
     }
 
     /// Get the `<|im_end|>` token ID, if the tokenizer has it in its vocab.
@@ -3994,6 +4036,7 @@ pub(crate) fn audio_test_tokenizer() -> Qwen3Tokenizer {
         think_end_id: None,
         think_end_str: None,
         thinking_end: Arc::from([]),
+        thinking_end_tail: String::new(),
         control_markers: &[],
         generation_suffixes: Arc::default(),
     }

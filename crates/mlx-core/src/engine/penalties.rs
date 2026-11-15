@@ -42,13 +42,134 @@ pub(crate) fn apply_all_penalties(
     Ok(logits)
 }
 
+/// The longest cycle the guard looks for, in tokens.
+const CYCLE_MAX_PERIOD: usize = 2048;
+/// Copies of a cycle, in a row, that make a hit.
+const CYCLE_MIN_REPEATS: u32 = 2;
+/// The fewest tokens the repeated stretch must span.
+const CYCLE_MIN_SPAN: u32 = 512;
+/// Thinking tokens a hit still allows before the end is forced. A speculative
+/// lane commits a block of up to 7 tokens before it reads the budget again,
+/// so the cut never lands inside a block in flight.
+const CYCLE_CUT_GRACE: i32 = 64;
+
+/// Exact cycles in the thinking tokens: the last [`CYCLE_MAX_PERIOD`] tokens
+/// and, for each period `p`, how many tokens in a row equal the token `p`
+/// places back.
+struct CycleDetector {
+    history: Box<[u32]>,
+    runs: Box<[u32]>,
+    seen: usize,
+}
+
+impl CycleDetector {
+    fn new() -> Self {
+        Self {
+            history: vec![0; CYCLE_MAX_PERIOD].into_boxed_slice(),
+            runs: vec![0; CYCLE_MAX_PERIOD + 1].into_boxed_slice(),
+            seen: 0,
+        }
+    }
+
+    /// Feed one thinking token; the smallest period whose cycle is now there
+    /// [`CYCLE_MIN_REPEATS`] times over at least [`CYCLE_MIN_SPAN`] tokens.
+    fn push(&mut self, token: u32) -> Option<u32> {
+        let n = self.seen;
+        let mut hit = None;
+        for p in 1..=n.min(CYCLE_MAX_PERIOD) {
+            let run = if self.history[(n - p) % CYCLE_MAX_PERIOD] == token {
+                self.runs[p] + 1
+            } else {
+                0
+            };
+            self.runs[p] = run;
+            let period = p as u32;
+            if hit.is_none()
+                && run >= (CYCLE_MIN_REPEATS - 1) * period
+                && run + period >= CYCLE_MIN_SPAN
+            {
+                hit = Some(period);
+            }
+        }
+        self.history[n % CYCLE_MAX_PERIOD] = token;
+        self.seen += 1;
+        hit
+    }
+}
+
+/// How a turn's thinking ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReasoningClose {
+    /// The model wrote the close itself.
+    Model,
+    /// The budget ran out and the end was forced.
+    Budget,
+    /// The cycle guard lowered the budget, and the end was forced.
+    Cycle,
+    /// The turn ended in thinking.
+    Open,
+}
+
+impl ReasoningClose {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Budget => "budget",
+            Self::Cycle => "cycle",
+            Self::Open => "open",
+        }
+    }
+}
+
+/// What a turn's thinking did, read from the tracker when the turn ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ReasoningOutcome {
+    /// Tokens generated during reasoning before the close, the end tokens a
+    /// cut forces included (Splash `count_reasoning_tokens`).
+    pub tokens: u32,
+    /// `None` when the turn did not start in thinking or has no close token.
+    pub close: Option<ReasoningClose>,
+    /// Thinking tokens when a cut began.
+    pub cut_at: Option<u32>,
+    /// Period in tokens of the cycle the guard saw.
+    pub cycle_period: Option<u32>,
+    /// Close tokens observed after thinking ended.
+    pub stray_closes: u32,
+}
+
+impl ReasoningOutcome {
+    /// An outcome with a count only.
+    #[cfg(test)]
+    pub(crate) fn counted(tokens: u32) -> Self {
+        Self {
+            tokens,
+            ..Self::default()
+        }
+    }
+
+    /// `ChatResult::reasoning_close`.
+    pub(crate) fn close_name(&self) -> Option<String> {
+        self.close.map(|close| close.as_str().to_string())
+    }
+
+    /// `ChatResult::reasoning_stray_closes`: present with the close.
+    pub(crate) fn reported_stray_closes(&self) -> Option<u32> {
+        self.close.map(|_| self.stray_closes)
+    }
+}
+
 /// Tracks reasoning vs content state during token-by-token generation.
 ///
 /// The template opens `<think>` when thinking is on; the model thinks, then
 /// emits the close token, then content. When a thinking budget runs out the
-/// turn ends thinking with `end`, the chat template's close (Splash
-/// `ThinkingBudget.end`, e.g. Qwen's `"\n</think>"`), one token per step, so
-/// the next request's re-render of the reply matches the tokens decoded.
+/// turn ends thinking with `end` (Splash `ThinkingBudget.end`: an end text when
+/// the request set one, then the chat template's close, e.g. Qwen's
+/// `"\n</think>"`), one token per step, so the next request's re-render of the
+/// reply matches the tokens decoded.
+///
+/// With the cycle guard on, an exact repeat in the thinking tokens lowers the
+/// budget to [`CYCLE_CUT_GRACE`] tokens past the hit; the cut then runs the
+/// same way.
 ///
 /// An end token is in flight from [`Self::take_forced_token`] until it is
 /// observed, and the next one is handed out only after that (Splash
@@ -57,6 +178,7 @@ pub(crate) fn apply_all_penalties(
 /// emit the end once, in order.
 pub(crate) struct ReasoningTracker {
     in_thinking: bool,
+    started_in_thinking: bool,
     thinking_token_count: i32,
     budget: Option<i32>,
     /// The tokens a budget ends thinking with, the close token last.
@@ -71,33 +193,67 @@ pub(crate) struct ReasoningTracker {
     /// End tokens handed out, and end tokens observed, since the cut.
     taken: usize,
     observed: usize,
+    cycles: Option<Box<CycleDetector>>,
+    cycle_period: Option<u32>,
+    cycle_lowered: bool,
+    cut_at: Option<u32>,
+    close: Option<ReasoningClose>,
+    stray_closes: u32,
 }
 
 impl ReasoningTracker {
     fn with_end(
-        starts_in_thinking: bool,
-        budget: Option<i32>,
+        setup: &crate::engine::backend::ThinkingSetup,
         end: Arc<[u32]>,
         extra_think_end_ids: Vec<u32>,
     ) -> Self {
+        let starts_in_thinking = setup.enabled;
         // Budget 0 ends thinking before any thinking token.
-        let cut = starts_in_thinking && budget == Some(0) && !end.is_empty();
+        let cut = starts_in_thinking && setup.budget == Some(0) && !end.is_empty();
+        let cycles = (setup.cycle_guard && starts_in_thinking && !end.is_empty() && !cut)
+            .then(|| Box::new(CycleDetector::new()));
         Self {
             in_thinking: starts_in_thinking,
+            started_in_thinking: starts_in_thinking,
             thinking_token_count: 0,
-            budget,
+            budget: setup.budget,
             end,
             extra_think_end_ids,
             cut,
             taken: 0,
             observed: 0,
+            cycles,
+            cycle_period: None,
+            cycle_lowered: false,
+            cut_at: cut.then_some(0),
+            close: None,
+            stray_closes: 0,
         }
     }
 
     /// A tracker over explicit end tokens, for tests.
     #[cfg(test)]
     pub(crate) fn new(starts_in_thinking: bool, budget: Option<i32>, end: &[u32]) -> Self {
-        Self::with_end(starts_in_thinking, budget, Arc::from(end), Vec::new())
+        Self::guarded(starts_in_thinking, budget, end, false)
+    }
+
+    /// [`Self::new`] with the cycle guard set, for tests.
+    #[cfg(test)]
+    pub(crate) fn guarded(
+        starts_in_thinking: bool,
+        budget: Option<i32>,
+        end: &[u32],
+        cycle_guard: bool,
+    ) -> Self {
+        Self::with_end(
+            &crate::engine::backend::ThinkingSetup {
+                enabled: starts_in_thinking,
+                budget,
+                cycle_guard,
+            },
+            Arc::from(end),
+            Vec::new(),
+        )
     }
 
     /// The one production construction point: the turn's thinking state and
@@ -108,11 +264,14 @@ impl ReasoningTracker {
         close: &crate::engine::backend::ThinkEndResolution,
     ) -> Self {
         Self::with_end(
-            setup.enabled,
-            setup.budget,
+            setup,
             close.thinking_end.clone(),
             close.think_end_extra_ids.clone(),
         )
+    }
+
+    fn is_close(&self, token_id: u32) -> bool {
+        self.end.last() == Some(&token_id) || self.extra_think_end_ids.contains(&token_id)
     }
 
     /// Process a generated token. Returns whether this token is reasoning content.
@@ -120,14 +279,23 @@ impl ReasoningTracker {
     /// Call AFTER extracting the token ID from the GPU each decode step.
     pub fn observe_token(&mut self, token_id: u32) -> bool {
         if !self.in_thinking {
+            if self.started_in_thinking && !self.end.is_empty() && self.is_close(token_id) {
+                self.stray_closes += 1;
+            }
             return false;
         }
 
-        if self.end.last() == Some(&token_id) || self.extra_think_end_ids.contains(&token_id) {
+        if self.is_close(token_id) {
+            self.close = Some(match (self.cut, self.cycle_lowered) {
+                (false, _) => ReasoningClose::Model,
+                (true, false) => ReasoningClose::Budget,
+                (true, true) => ReasoningClose::Cycle,
+            });
             self.in_thinking = false;
             self.cut = false;
             self.taken = 0;
             self.observed = 0;
+            self.cycles = None;
             return true; // the close itself is part of reasoning
         }
 
@@ -138,11 +306,25 @@ impl ReasoningTracker {
             } else {
                 debug_assert!(false, "thinking went past its budget");
             }
-        } else if !self.end.is_empty()
-            && let Some(budget) = self.budget
-            && self.thinking_token_count >= budget
-        {
-            self.cut = true;
+        } else if !self.end.is_empty() {
+            if let Some(cycles) = self.cycles.as_mut()
+                && let Some(period) = cycles.push(token_id)
+            {
+                self.cycles = None;
+                self.cycle_period = Some(period);
+                let limit = self.thinking_token_count + CYCLE_CUT_GRACE;
+                if self.budget.is_none_or(|budget| limit < budget) {
+                    self.budget = Some(limit);
+                    self.cycle_lowered = true;
+                }
+            }
+            if let Some(budget) = self.budget
+                && self.thinking_token_count >= budget
+            {
+                self.cut = true;
+                self.cut_at = Some(self.thinking_token_count as u32);
+                self.cycles = None;
+            }
         }
         true
     }
@@ -194,10 +376,22 @@ impl ReasoningTracker {
             .map(|budget| budget.saturating_sub(self.thinking_token_count).max(0) as usize)
     }
 
-    /// Number of tokens generated during reasoning before the close, the end
-    /// tokens a cut forces included (Splash `count_reasoning_tokens`).
-    pub fn reasoning_token_count(&self) -> u32 {
-        self.thinking_token_count.max(0) as u32
+    /// The turn's thinking as it stands.
+    pub(crate) fn outcome(&self) -> ReasoningOutcome {
+        let close = if !self.started_in_thinking || self.end.is_empty() {
+            None
+        } else if self.in_thinking {
+            Some(ReasoningClose::Open)
+        } else {
+            self.close
+        };
+        ReasoningOutcome {
+            tokens: self.thinking_token_count.max(0) as u32,
+            close,
+            cut_at: close.and(self.cut_at),
+            cycle_period: close.and(self.cycle_period),
+            stray_closes: self.stray_closes,
+        }
     }
 }
 
@@ -419,7 +613,7 @@ mod tests {
         assert_eq!(tracker.take_forced_token(), None);
         assert!(!tracker.observe_token(5));
         // Splash count_reasoning_tokens: budget + len(end) - 1.
-        assert_eq!(tracker.reasoning_token_count(), 3);
+        assert_eq!(tracker.outcome().tokens, 3);
 
         // Budget 0: the first token is the end's first.
         let mut zero = ReasoningTracker::new(true, Some(0), &[8, 9]);
@@ -428,7 +622,7 @@ mod tests {
         zero.observe_token(8);
         assert_eq!(zero.take_forced_token(), Some(9));
         zero.observe_token(9);
-        assert_eq!(zero.reasoning_token_count(), 1);
+        assert_eq!(zero.outcome().tokens, 1);
     }
 
     #[test]
@@ -437,5 +631,191 @@ mod tests {
         let mut tracker = ReasoningTracker::new(true, Some(1), &[8, 9]);
         tracker.observe_token(100); // the cut starts
         tracker.observe_token(101); // not the end: Splash commitSelected throws
+    }
+
+    /// 100 distinct tokens, then one 300-token block over and over.
+    fn looping_thought() -> impl Iterator<Item = u32> {
+        (1000..1100).chain((0..).flat_map(|_| 2000..2300))
+    }
+
+    /// A lane: the forced token when one is due, else the next thought token,
+    /// until the close or `limit` tokens.
+    fn run_lane(
+        tracker: &mut ReasoningTracker,
+        mut thought: impl Iterator<Item = u32>,
+        limit: usize,
+    ) -> Vec<u32> {
+        let mut emitted = Vec::new();
+        while emitted.len() < limit {
+            let token = match tracker.take_forced_token() {
+                Some(token) => token,
+                None => thought.next().unwrap(),
+            };
+            let reasoning = tracker.observe_token(token);
+            emitted.push(token);
+            if reasoning
+                && !tracker
+                    .outcome()
+                    .close
+                    .is_none_or(|c| c == ReasoningClose::Open)
+            {
+                break;
+            }
+        }
+        emitted
+    }
+
+    #[test]
+    fn a_cycle_closes_the_thought_64_tokens_after_two_periods() {
+        let mut tracker = ReasoningTracker::guarded(true, None, &[8, 9], true);
+        let mut thought = looping_thought();
+        for _ in 0..699 {
+            tracker.observe_token(thought.next().unwrap());
+        }
+        assert_eq!(tracker.unforced_token_budget(), None);
+        tracker.observe_token(thought.next().unwrap()); // count 700: two periods
+        assert_eq!(tracker.unforced_token_budget(), Some(64));
+
+        let mut tracker = ReasoningTracker::guarded(true, None, &[8, 9], true);
+        let emitted = run_lane(&mut tracker, looping_thought(), 2000);
+        assert_eq!(emitted.len(), 766);
+        assert!(
+            emitted[..764]
+                .iter()
+                .copied()
+                .eq(looping_thought().take(764))
+        );
+        assert_eq!(&emitted[764..], &[8, 9]);
+        let outcome = tracker.outcome();
+        assert_eq!(outcome.close, Some(ReasoningClose::Cycle));
+        assert_eq!(outcome.cycle_period, Some(300));
+        assert_eq!(outcome.cut_at, Some(764));
+        assert_eq!(outcome.tokens, 764 + 2 - 1);
+    }
+
+    #[test]
+    fn two_periods_are_enough() {
+        let mut tracker = ReasoningTracker::guarded(true, None, &[8, 9], true);
+        let emitted = run_lane(&mut tracker, looping_thought(), 2000);
+        assert_eq!(tracker.outcome().cut_at, Some(764), "not 1,064");
+        assert_eq!(emitted.len(), 766);
+    }
+
+    #[test]
+    fn short_or_broken_repeats_are_not_cycles() {
+        let pattern = |len: usize| (0..len).map(|i| 500 + (i % 2) as u32);
+        let cases: [(&str, Vec<u32>); 4] = [
+            (
+                "66-token block x 2.45, then new text",
+                (0..162)
+                    .map(|i| 3000 + (i % 66) as u32)
+                    .chain(4000..4400)
+                    .collect(),
+            ),
+            ("400 distinct tokens", (5000..5400).collect()),
+            (
+                "a block, 50 other tokens, the block again",
+                (6000..6300).chain(7000..7050).chain(6000..6300).collect(),
+            ),
+            ("a 2-token pattern for 400 tokens", pattern(400).collect()),
+        ];
+        for (name, thought) in cases {
+            let mut tracker = ReasoningTracker::guarded(true, None, &[8, 9], true);
+            for token in thought {
+                tracker.observe_token(token);
+            }
+            assert_eq!(tracker.unforced_token_budget(), None, "{name}");
+            assert_eq!(tracker.outcome().cycle_period, None, "{name}");
+        }
+        let mut tracker = ReasoningTracker::guarded(true, None, &[8, 9], true);
+        for token in pattern(512) {
+            tracker.observe_token(token);
+        }
+        assert_eq!(tracker.outcome().cycle_period, Some(2));
+        assert_eq!(tracker.unforced_token_budget(), Some(64));
+    }
+
+    #[test]
+    fn a_block_in_flight_at_the_hit_stays_inside_the_grace() {
+        let mut tracker = ReasoningTracker::guarded(true, None, &[8, 9], true);
+        let mut thought = (0..).map(|i| 500 + (i % 2) as u32);
+        for _ in 0..512 {
+            tracker.observe_token(thought.next().unwrap());
+        }
+        for _ in 0..16 {
+            tracker.observe_token(thought.next().unwrap());
+        }
+        assert_eq!(tracker.unforced_token_budget(), Some(48));
+        assert!(!tracker.ending());
+    }
+
+    #[test]
+    fn the_close_names_its_cause() {
+        let cut = |budget: Option<i32>| {
+            let mut tracker = ReasoningTracker::guarded(true, budget, &[8, 9], true);
+            run_lane(&mut tracker, looping_thought(), 2000);
+            tracker.outcome()
+        };
+        let early = cut(Some(500));
+        assert_eq!(early.close, Some(ReasoningClose::Budget));
+        assert_eq!((early.cut_at, early.cycle_period), (Some(500), None));
+        let late = cut(Some(5000));
+        assert_eq!(late.close, Some(ReasoningClose::Cycle));
+        assert_eq!((late.cut_at, late.cycle_period), (Some(764), Some(300)));
+        let near = cut(Some(740));
+        assert_eq!(near.close, Some(ReasoningClose::Budget));
+        assert_eq!((near.cut_at, near.cycle_period), (Some(740), Some(300)));
+
+        let mut model = ReasoningTracker::guarded(true, None, &[8, 9], true);
+        let emitted = run_lane(&mut model, looping_thought().take(720).chain([9]), 2000);
+        assert_eq!(emitted.len(), 721);
+        let model = model.outcome();
+        assert_eq!(model.close, Some(ReasoningClose::Model));
+        assert_eq!((model.cut_at, model.cycle_period), (None, Some(300)));
+
+        let mut open = ReasoningTracker::guarded(true, None, &[8, 9], true);
+        let emitted = run_lane(&mut open, looping_thought(), 765);
+        assert_eq!(emitted[764], 8);
+        let open = open.outcome();
+        assert_eq!(open.close, Some(ReasoningClose::Open));
+        assert_eq!((open.cut_at, open.cycle_period), (Some(764), Some(300)));
+    }
+
+    #[test]
+    fn closes_after_the_thought_are_stray() {
+        let mut tracker = ReasoningTracker::new(true, None, &[8, 9]);
+        for token in [100, 9, 5, 9, 6] {
+            tracker.observe_token(token);
+        }
+        let outcome = tracker.outcome();
+        assert_eq!(outcome.close, Some(ReasoningClose::Model));
+        assert_eq!(outcome.stray_closes, 1);
+        assert_eq!(outcome.close_name().as_deref(), Some("model"));
+        assert_eq!(outcome.reported_stray_closes(), Some(1));
+        assert_eq!((outcome.cut_at, outcome.cycle_period), (None, None));
+
+        let mut content = ReasoningTracker::new(false, None, &[8, 9]);
+        for token in [100, 9, 5] {
+            content.observe_token(token);
+        }
+        let content = content.outcome();
+        assert_eq!(content.close_name(), None);
+        assert_eq!(content.reported_stray_closes(), None);
+        assert_eq!((content.cut_at, content.cycle_period), (None, None));
+    }
+
+    #[test]
+    fn without_the_guard_or_a_close_a_loop_runs_on() {
+        for (guard, end) in [(false, &[8u32, 9][..]), (true, &[][..])] {
+            let mut tracker = ReasoningTracker::guarded(true, None, end, guard);
+            let emitted = run_lane(&mut tracker, looping_thought(), 3000);
+            assert!(emitted.iter().copied().eq(looping_thought().take(3000)));
+            let outcome = tracker.outcome();
+            assert_eq!(outcome.tokens, 3000);
+            assert_eq!(outcome.cycle_period, None);
+            assert_eq!(outcome.cut_at, None);
+            let close = (!end.is_empty()).then_some(ReasoningClose::Open);
+            assert_eq!(outcome.close, close);
+        }
     }
 }

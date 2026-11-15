@@ -357,6 +357,10 @@ impl DefaultStreamEmitter {
                 num_tokens: None,
                 prompt_tokens: None,
                 reasoning_tokens: None,
+                reasoning_close: None,
+                reasoning_cut_at: None,
+                reasoning_cycle_period: None,
+                reasoning_stray_closes: None,
                 raw_text: None,
                 public_raw_text: None,
                 text_authoritative: None,
@@ -405,6 +409,10 @@ impl StreamEmitter for DefaultStreamEmitter {
             num_tokens: Some(result.num_tokens),
             prompt_tokens: Some(result.prompt_tokens),
             reasoning_tokens: Some(result.reasoning_tokens),
+            reasoning_close: result.reasoning_close.clone(),
+            reasoning_cut_at: result.reasoning_cut_at,
+            reasoning_cycle_period: result.reasoning_cycle_period,
+            reasoning_stray_closes: result.reasoning_stray_closes,
             raw_text: Some(result.raw_text.clone()),
             public_raw_text: result.public_raw_text.clone(),
             text_authoritative: Some(true),
@@ -487,7 +495,7 @@ pub(crate) struct FinalizeArgs<'a> {
     pub include_reasoning: bool,
     pub thinking_enabled: bool,
     pub prompt_tokens: u32,
-    pub reasoning_tokens: u32,
+    pub reasoning: crate::engine::penalties::ReasoningOutcome,
 }
 
 /// Resolved thinking-mode state for one turn.
@@ -509,6 +517,9 @@ pub(crate) struct ThinkingSetup {
     /// budget, else derived via
     /// [`crate::engine::params::default_thinking_budget_for_effort`].
     pub budget: Option<i32>,
+    /// `ChatConfig::thinking_cycle_guard`: an exact repeat in the thinking
+    /// lowers the budget (`ReasoningTracker`).
+    pub cycle_guard: bool,
 }
 
 /// Per-turn reasoning-close resolution from
@@ -773,9 +784,10 @@ pub(crate) trait ChatBackend {
 
     /// Resolve the turn's reasoning-close resolution.
     ///
-    /// Default = the tokenizer-global values (`tok.think_end_id()` /
-    /// `tok.think_end_str()`): every ChatML-family turn closes reasoning
-    /// on the same `</think>` token, so a per-tokenizer answer suffices.
+    /// Default = the tokenizer's close (`tok.think_end(config)`): every
+    /// ChatML-family turn closes reasoning on the same `</think>` token, and
+    /// the end a cut forces is the request's `thinking_end_text` (when it
+    /// passes the probe's rules) before the template's close.
     /// Families whose close tag is a FUNCTION of the request (K2-Horizon
     /// picks `</ifm|think>` / `</ifm|think_fast>` / `</ifm|think_faster>`
     /// by `reasoning_effort`) override this to answer per-turn. The
@@ -788,8 +800,8 @@ pub(crate) trait ChatBackend {
     /// tracker is built), so it must be a pure function of
     /// `(config, tokenizer)`: same inputs ⇒ same resolution, no side
     /// effects.
-    fn think_end_for_turn(&self, _config: &ChatConfig, tok: &Qwen3Tokenizer) -> ThinkEndResolution {
-        tok.think_end()
+    fn think_end_for_turn(&self, config: &ChatConfig, tok: &Qwen3Tokenizer) -> ThinkEndResolution {
+        tok.think_end(config)
     }
 
     /// Resolve the turn's [`ChatParams`] — sampling configuration,
@@ -1006,7 +1018,7 @@ pub(crate) trait ChatBackend {
             args.include_reasoning,
             args.thinking_enabled,
             args.prompt_tokens,
-            args.reasoning_tokens,
+            args.reasoning,
         )
     }
 

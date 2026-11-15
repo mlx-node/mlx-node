@@ -67,7 +67,7 @@ import {
   type TurnFailPhase,
 } from './metrics-trace.js';
 import { readPipelineStats, type PipelineStats, type TurnProgressSnapshot } from './native-progress.js';
-import { reasoningOutcomeOf, type ThinkingChatConfig } from './native-thinking.js';
+import { reasoningOutcomeOf, type NativeReasoningOutcome } from './native-thinking.js';
 import type { MeasuredPrefill } from './timing.js';
 
 /** Read the process-wide cold-tier snapshot; the native addon may be absent (unit tests). */
@@ -428,7 +428,7 @@ const OPTIONAL_MEMBER_NAMES = [
  * `done: true` `ChatStreamEvent` (streaming) both satisfy it — the union's
  * shared telemetry fields only; free-text members never reach the record.
  */
-interface TurnFinal {
+interface TurnFinal extends NativeReasoningOutcome {
   finishReason: string;
   promptTokens: number;
   numTokens: number;
@@ -616,7 +616,7 @@ export class TurnTraceModel implements SessionCapableModel {
       creditedTokens: 0,
       pipelines: this.pipelineStats(),
       thinkingBudget: config?.thinkingTokenBudget ?? undefined,
-      thinkingGuard: (config as ThinkingChatConfig | null | undefined)?.thinkingCycleGuard === true,
+      thinkingGuard: config?.thinkingCycleGuard === true,
       outputCap: config?.maxNewTokens ?? undefined,
     };
     (marks.live ??= new Set()).add(ctx);

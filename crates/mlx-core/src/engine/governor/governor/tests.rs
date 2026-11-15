@@ -586,3 +586,17 @@ fn load_refused_when_macos_is_short() {
     });
     assert!(governor.register_model(model(8 * G, 0)).is_ok());
 }
+
+/// A model's books leave out the process-wide refusal counters, so another
+/// model's refusals and timeouts move no model's books.
+/// Mutation mb (the books count the process-wide refusals) → red.
+#[test]
+fn another_models_refusals_leave_a_models_books() {
+    let io = FakeIo::new(stats(0), host(32 * G, Pressure::Normal));
+    let governor = Governor::new(io);
+    let guard = governor.register_model(model(8 * G, 0)).expect("register");
+    let before = governor.model_books(guard.model_id());
+    governor.capacity_exhausted();
+    governor.resource_timed_out();
+    assert_eq!(governor.model_books(guard.model_id()), before);
+}

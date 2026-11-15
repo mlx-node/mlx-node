@@ -1121,6 +1121,7 @@ fn serial_prepare_at_the_cap_frees_a_ladder_chain() -> Result<()> {
                 params,
                 false,
                 thinking,
+                &config,
             )?;
         } else {
             let sink = NullSink;
@@ -1133,6 +1134,7 @@ fn serial_prepare_at_the_cap_frees_a_ladder_chain() -> Result<()> {
                 &super::paged_backend::StreamSender(&sink),
                 &std::sync::atomic::AtomicBool::new(false),
                 thinking,
+                &config,
             )?;
         }
         assert_eq!(
@@ -1508,15 +1510,16 @@ fn legacy_dense_cores_end_thinking_with_the_whole_close() -> Result<()> {
         return Ok(());
     }
     let tokenizer = closing_tokenizer();
-    assert_eq!(&*tokenizer.think_end().thinking_end, &[13, 15]);
     let config = ChatConfig {
         temperature: Some(0.0),
         max_new_tokens: Some(4),
         ..ChatConfig::default()
     };
+    assert_eq!(&*tokenizer.think_end(&config).thinking_end, &[13, 15]);
     let thinking = ThinkingSetup {
         enabled: true,
         budget: Some(1),
+        cycle_guard: false,
     };
     for entry in ["sync", "stream"] {
         let mut inner = fixture(0xDFA5_1831);
@@ -1530,6 +1533,7 @@ fn legacy_dense_cores_end_thinking_with_the_whole_close() -> Result<()> {
                 params,
                 false,
                 thinking,
+                &config,
             )?;
             (result.reasoning_tokens, result.raw_text)
         } else {
@@ -1543,6 +1547,7 @@ fn legacy_dense_cores_end_thinking_with_the_whole_close() -> Result<()> {
                 &super::paged_backend::StreamSender(&sink),
                 &std::sync::atomic::AtomicBool::new(false),
                 thinking,
+                &config,
             )?;
             let last = sink.0.lock().unwrap().take().expect("final chunk");
             (

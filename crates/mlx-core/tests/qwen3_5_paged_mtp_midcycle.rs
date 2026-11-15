@@ -122,6 +122,8 @@ fn turn_cfg(salt: &str, max_new_tokens: i32, depth: i32, mtp: bool) -> ChatConfi
         tools: None,
         reasoning_effort: Some("none".to_string()),
         thinking_token_budget: None,
+        thinking_cycle_guard: None,
+        thinking_end_text: None,
         include_reasoning: None,
         report_performance: Some(true),
         reuse_cache: Some(true),

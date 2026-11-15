@@ -52,6 +52,8 @@ fn cfg(max_new_tokens: i32) -> ChatConfig {
         tools: None,
         reasoning_effort: None,
         thinking_token_budget: Some(32),
+        thinking_cycle_guard: None,
+        thinking_end_text: None,
         include_reasoning: Some(true),
         report_performance: Some(true),
         reuse_cache: Some(true),

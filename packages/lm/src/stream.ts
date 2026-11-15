@@ -102,7 +102,7 @@ export interface ChatStreamFinal {
    * thought. Copied from the terminal chunk only when the addon sends them;
    * absent means not known.
    */
-  reasoningClose?: string;
+  reasoningClose?: ChatStreamChunk['reasoningClose'];
   reasoningCutAt?: number;
   reasoningCyclePeriod?: number;
   reasoningStrayCloses?: number;
@@ -387,10 +387,6 @@ export async function* _runChatStream(
             cachedTokens?: number;
             publicRawText?: string;
             textAuthoritative?: boolean;
-            reasoningClose?: unknown;
-            reasoningCutAt?: unknown;
-            reasoningCyclePeriod?: unknown;
-            reasoningStrayCloses?: unknown;
           };
           const finalEvent: ChatStreamFinal = {
             text: chunk.text,
@@ -414,17 +410,17 @@ export async function* _runChatStream(
           if (typeof chunkWithCached.textAuthoritative === 'boolean') {
             finalEvent.textAuthoritative = chunkWithCached.textAuthoritative;
           }
-          if (typeof chunkWithCached.reasoningClose === 'string') {
-            finalEvent.reasoningClose = chunkWithCached.reasoningClose;
+          if (typeof chunk.reasoningClose === 'string') {
+            finalEvent.reasoningClose = chunk.reasoningClose;
           }
-          if (typeof chunkWithCached.reasoningCutAt === 'number') {
-            finalEvent.reasoningCutAt = chunkWithCached.reasoningCutAt;
+          if (typeof chunk.reasoningCutAt === 'number') {
+            finalEvent.reasoningCutAt = chunk.reasoningCutAt;
           }
-          if (typeof chunkWithCached.reasoningCyclePeriod === 'number') {
-            finalEvent.reasoningCyclePeriod = chunkWithCached.reasoningCyclePeriod;
+          if (typeof chunk.reasoningCyclePeriod === 'number') {
+            finalEvent.reasoningCyclePeriod = chunk.reasoningCyclePeriod;
           }
-          if (typeof chunkWithCached.reasoningStrayCloses === 'number') {
-            finalEvent.reasoningStrayCloses = chunkWithCached.reasoningStrayCloses;
+          if (typeof chunk.reasoningStrayCloses === 'number') {
+            finalEvent.reasoningStrayCloses = chunk.reasoningStrayCloses;
           }
           yield finalEvent;
           return;

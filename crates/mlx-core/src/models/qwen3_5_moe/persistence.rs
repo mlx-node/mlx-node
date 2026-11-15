@@ -39,7 +39,7 @@ use crate::vision::qwen::processing::QwenImageProcessor;
 
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
-use super::model::{Qwen3_5MoeModel, Qwen35MoeInner, Qwen35MoeSchedulerState};
+use super::model::{Qwen3_5MoeModel, Qwen35MoeInner};
 use super::switch_glu::SwitchGLU;
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
@@ -1767,6 +1767,7 @@ pub async fn load_with_thread(
         None,
         crate::engine::scheduler::DEFAULT_DECODE_SHARE,
         crate::disk_tier::DiskTierOptions::default(),
+        crate::engine::load_progress::LoadProgressCell::detached(),
     )
     .await
 }
@@ -1804,6 +1805,7 @@ pub(crate) async fn load_with_source(
     max_context: Option<u32>,
     decode_share: f64,
     disk: crate::disk_tier::DiskTierOptions,
+    progress: Arc<crate::engine::load_progress::LoadProgressCell>,
 ) -> Result<Qwen3_5MoeModel> {
     // Snapshot once, before spawning; forward/compiled graphs never read this
     // diagnostic setting and another load cannot change an existing model.
@@ -2313,9 +2315,10 @@ pub(crate) async fn load_with_source(
                 crate::stream::WiredResidency::working_set_minus_pools,
             ));
             let context_limits = inner.finish_load_limits()?;
+            let (state, warmup) = crate::engine::warmup::serving_scheduler(inner, &progress)?;
 
             Ok((
-                Qwen35MoeSchedulerState::new(inner)?,
+                state,
                 (
                     config_out,
                     model_id,
@@ -2329,6 +2332,7 @@ pub(crate) async fn load_with_source(
                     mtp_active,
                     vision_active,
                     context_limits,
+                    warmup,
                 ),
             ))
         },
@@ -2348,6 +2352,7 @@ pub(crate) async fn load_with_source(
         mtp_active,
         vision_active,
         context_limits,
+        warmup,
     ) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
@@ -2358,6 +2363,7 @@ pub(crate) async fn load_with_source(
     Ok(Qwen3_5MoeModel {
         thread,
         config,
+        warmup,
         paged_active,
         scheduled_lanes,
         mtp_active,
