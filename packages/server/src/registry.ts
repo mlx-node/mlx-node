@@ -390,10 +390,10 @@ export class ModelRegistry {
       if (limits !== undefined) binding.context = { limits };
       this.sessionRegistriesByModel.set(model, binding);
     } else {
-      if (binding.pendingTeardown) {
-        binding.pendingTeardown = false;
-        binding.disposeOnTeardown = false;
-      }
+      // Registering the object revives it, including swap-error recovery while
+      // another alias still holds the binding and teardown is not pending yet.
+      binding.pendingTeardown = false;
+      binding.disposeOnTeardown = false;
       // Aliasing or reviving an existing binding: if this call passed
       // `samplingDefaults` explicitly, overwrite the shared binding's
       // defaults so the latest registration wins for every alias.
