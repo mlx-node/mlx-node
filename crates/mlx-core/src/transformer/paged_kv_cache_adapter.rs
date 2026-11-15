@@ -80,12 +80,15 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(any(target_os = "macos", test))]
+use std::time::Instant;
 
 use mlx_paged_attn::{
-    BlockAllocator, CacheRecency, LayerKVPool, PagedAttentionConfig, PhysicalBlock, PrefixKeys,
-    SequenceBlockTable,
+    BlockAllocator, CacheRecency, LayerKVPool, PhysicalBlock, PrefixKeys, SequenceBlockTable,
 };
+#[cfg(any(target_os = "macos", test))]
+use mlx_paged_attn::PagedAttentionConfig;
 
 #[cfg(target_os = "macos")]
 use super::paged_metadata_cache::{
@@ -104,6 +107,7 @@ pub use super::cold_tier::{
 };
 
 use crate::array::{DType, MxArray};
+#[cfg(target_os = "macos")]
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -276,6 +280,7 @@ pub(crate) fn paged_attention_v2_partition_upper_bound(
 /// the caller needs after a successful validation. Splitting validation off
 /// `update_keys_values` lets us assert all shape/dtype rejection paths in
 /// pure-CPU unit tests (no `LayerKVPool`, no `MetalState::get()`).
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KvInputInfo {
     pub num_tokens: u32,
@@ -291,6 +296,7 @@ pub(crate) struct KvInputInfo {
 /// cannot link against the MLX C++ runtime (constructing an `MxArray` via
 /// `MxArray::zeros` calls into MLX, which aborts inside sandboxes that
 /// disallow foreign exceptions before any assertion can run).
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone)]
 pub(crate) struct KvTensorMeta {
     pub ndim: u32,
@@ -298,6 +304,7 @@ pub(crate) struct KvTensorMeta {
     pub dtype: DType,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl KvTensorMeta {
     /// Extract metadata from a live `MxArray`. Only called from the
     /// production `update_keys_values` path; tests construct `KvTensorMeta`
@@ -348,6 +355,7 @@ fn metal_io_dtype(cache_dtype: mlx_paged_attn::metal::MetalDtype) -> Result<DTyp
 ///    rows, Splash io is always bf16).
 ///
 /// Returns `KvInputInfo { num_tokens, input_metal_dtype }` on success.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn validate_kv_input(
     keys: &KvTensorMeta,
     values: &KvTensorMeta,
@@ -486,6 +494,7 @@ pub(crate) fn validate_kv_input(
 /// shape: returns the primitives the caller needs after a successful
 /// validation. `num_query_heads` is `queries.shape[1]` extracted once so
 /// `gather_kv_for_decode` doesn't redo the lookup.
+#[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QueryInputInfo {
     pub num_query_heads: u32,
@@ -508,6 +517,7 @@ pub(crate) struct QueryInputInfo {
 /// 6. `layer_idx < num_layers`.
 ///
 /// Returns `QueryInputInfo { num_query_heads }` on success.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn validate_query_input(
     queries: &KvTensorMeta,
     config: &PagedAttentionConfig,
@@ -661,6 +671,7 @@ pub(crate) fn device_prefill_mpp_builds() -> bool {
 /// context length from here. The paged kernels partition by that context
 /// length, so a route that saw the full table plus a mask would reduce the
 /// same keys over different partitions and round to different bf16 bits.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn decode_read_span(context: u32, sliding_window: u32, block_size: u32) -> (u32, u32) {
     let first_block = if sliding_window == 0 {
         0
@@ -689,6 +700,7 @@ pub(crate) fn build_decode_block_ids(table: &SequenceBlockTable, first_block: u3
 /// table. Normal suffix prefill records exactly through the current chunk; a
 /// cached-prefix replay can have `block_table.num_tokens()` already advanced to
 /// the full cached prefix while each replay chunk attends over a subrange.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn build_prefill_block_ids_for_total(
     table: &SequenceBlockTable,
     required_tokens: u32,
@@ -3192,6 +3204,7 @@ impl PagedKVCacheAdapter {
                 .saturating_mul(2)
                 .max(current.saturating_add(needed_additional_blocks)),
         };
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut new_num_blocks = self.layer_kv_pool.max_num_blocks().min(target);
         if let Some(admission) = self.admission.clone() {
             if new_num_blocks <= current {

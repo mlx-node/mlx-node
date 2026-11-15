@@ -200,7 +200,7 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
             .spawn(move || {
                 let loading = crate::engine::pipeline_counter::loading_scope();
                 let init = init_fn();
-                drop(loading);
+                let _ = loading;
                 let mut state = match init {
                     Ok((state, init_result)) => {
                         send_init_result(&thread_init_tx, Ok(init_result));
@@ -261,7 +261,7 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
             .spawn(move || {
                 let loading = crate::engine::pipeline_counter::loading_scope();
                 let init = init_fn();
-                drop(loading);
+                let _ = loading;
                 let mut state = match init {
                     Ok((state, init_result)) => {
                         send_init_result(&thread_init_tx, Ok(init_result));
