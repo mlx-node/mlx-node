@@ -49,8 +49,9 @@ const CYCLE_MIN_REPEATS: u32 = 2;
 /// The fewest tokens the repeated stretch must span.
 const CYCLE_MIN_SPAN: u32 = 512;
 /// Thinking tokens a hit still allows before the end is forced. A speculative
-/// lane commits a block of up to 7 tokens before it reads the budget again,
-/// so the cut never lands inside a block in flight.
+/// cycle commits up to 8 tokens (7 drafts and the bonus) after it read the
+/// cut; the grace is wider, so a hit inside a cycle never puts the cut among
+/// the tokens that cycle already chose.
 const CYCLE_CUT_GRACE: i32 = 64;
 
 /// Exact cycles in the thinking tokens: the last [`CYCLE_MAX_PERIOD`] tokens
@@ -164,8 +165,9 @@ impl ReasoningOutcome {
 /// emits the close token, then content. When a thinking budget runs out the
 /// turn ends thinking with `end` (Splash `ThinkingBudget.end`: an end text when
 /// the request set one, then the chat template's close, e.g. Qwen's
-/// `"\n</think>"`), one token per step, so the next request's re-render of the
-/// reply matches the tokens decoded.
+/// `"\n</think>"`), by an AR loop one token per step, by a speculative cycle
+/// as its rows from the cut row on ([`ThinkingCut`]), so the next request's
+/// re-render of the reply matches the tokens decoded.
 ///
 /// With the cycle guard on, an exact repeat in the thinking tokens lowers the
 /// budget to [`CYCLE_CUT_GRACE`] tokens past the hit; the cut then runs the
@@ -175,7 +177,8 @@ impl ReasoningOutcome {
 /// observed, and the next one is handed out only after that (Splash
 /// `commitSelected` advances the end on commit). A loop that picks the next
 /// token before observing the current one and a loop that observes first both
-/// emit the end once, in order.
+/// emit the end once, in order. A speculative cycle takes nothing: it observes
+/// the end tokens its cut rows selected.
 pub(crate) struct ReasoningTracker {
     in_thinking: bool,
     started_in_thinking: bool,
@@ -301,8 +304,9 @@ impl ReasoningTracker {
 
         self.thinking_token_count += 1;
         if self.cut {
-            if self.observed < self.taken && self.end[self.observed] == token_id {
+            if self.end.get(self.observed) == Some(&token_id) {
                 self.observed += 1;
+                self.taken = self.taken.max(self.observed);
             } else {
                 debug_assert!(false, "thinking went past its budget");
             }
@@ -364,7 +368,7 @@ impl ReasoningTracker {
     }
 
     /// Largest unforced output prefix whose tokens can be emitted before the
-    /// budget requires a forced end token. A speculative cycle cannot cross it.
+    /// budget requires a forced end token.
     pub(crate) fn unforced_token_budget(&self) -> Option<usize> {
         if !self.in_thinking || self.end.is_empty() {
             return None;
@@ -374,6 +378,21 @@ impl ReasoningTracker {
         }
         self.budget
             .map(|budget| budget.saturating_sub(self.thinking_token_count).max(0) as usize)
+    }
+
+    /// The cut a speculative cycle starting now must apply: `None` with no
+    /// budget, no close, outside thinking, or once every end token is out.
+    /// Read when a cycle starts; a guard hit inside the cycle lowers the
+    /// budget at least [`CYCLE_CUT_GRACE`] tokens past the cycle's last row.
+    pub(crate) fn thinking_cut(&self) -> Option<ThinkingCut> {
+        let row = self.unforced_token_budget()?;
+        let from = self.taken.max(self.observed);
+        (from < self.end.len()).then(|| ThinkingCut {
+            row,
+            end: Arc::clone(&self.end),
+            from,
+            extra: self.extra_think_end_ids.clone(),
+        })
     }
 
     /// The turn's thinking as it stands.
@@ -392,6 +411,85 @@ impl ReasoningTracker {
             cycle_period: close.and(self.cycle_period),
             stray_closes: self.stray_closes,
         }
+    }
+}
+
+/// Where a thinking budget cuts one speculative cycle (Splash
+/// `ThinkingCutoff`). The cycle keeps its depth: rows before `row` are the
+/// model's, rows from `row` on select the end tokens not yet emitted, one
+/// each, and rows after the close are the model's again. At `row == 0` the end
+/// tokens also take the place of the cycle's first proposals, so one cycle
+/// commits up to `drafts + 1` of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThinkingCut {
+    /// Thinking tokens left before the end.
+    pub row: usize,
+    end: Arc<[u32]>,
+    /// `end[from..]`: the end tokens not yet emitted, the close last.
+    from: usize,
+    extra: Vec<u32>,
+}
+
+impl ThinkingCut {
+    fn left(&self) -> usize {
+        self.end.len() - self.from
+    }
+
+    fn is_close(&self, token: i32) -> bool {
+        u32::try_from(token)
+            .is_ok_and(|token| self.end.last() == Some(&token) || self.extra.contains(&token))
+    }
+
+    /// The cut row is one of a cycle's `drafts + 1` rows.
+    pub(crate) fn touches(&self, drafts: usize) -> bool {
+        self.row <= drafts
+    }
+
+    /// Proposals the end tokens replace (Splash `replacedProposals`); they
+    /// are not counted as drafted.
+    pub(crate) fn replaced(&self, drafts: usize) -> usize {
+        if self.row != 0 {
+            0
+        } else {
+            self.left().min(drafts)
+        }
+    }
+
+    /// The end tokens that take the place of a cycle's first proposals.
+    pub(crate) fn proposals(&self, drafts: usize) -> &[u32] {
+        &self.end[self.from..self.from + self.replaced(drafts)]
+    }
+
+    /// The token each verify row must select, for a cycle that verifies
+    /// `drafts`; row `drafts.len()` is the bonus row. No row is decided when
+    /// a draft before the cut row closes thinking: that row, if accepted,
+    /// ends the thought by the model.
+    pub(crate) fn targets(&self, drafts: &[i32]) -> CutTargets {
+        let before = &drafts[..self.row.min(drafts.len())];
+        let closed = before.iter().any(|&d| self.is_close(d));
+        CutTargets {
+            first: self.row,
+            tokens: if closed {
+                Vec::new()
+            } else {
+                self.end[self.from..].to_vec()
+            },
+        }
+    }
+}
+
+/// The rows of one cycle that a [`ThinkingCut`] decides.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CutTargets {
+    first: usize,
+    tokens: Vec<u32>,
+}
+
+impl CutTargets {
+    /// The end token row `row` selects; `None` for a row that is the model's.
+    pub(crate) fn at(&self, row: usize) -> Option<u32> {
+        row.checked_sub(self.first)
+            .and_then(|index| self.tokens.get(index).copied())
     }
 }
 
@@ -816,6 +914,11 @@ mod tests {
                     budgeted.peek_forced_token(),
                     "token {emitted}"
                 );
+                assert_eq!(
+                    guarded.thinking_cut(),
+                    budgeted.thinking_cut(),
+                    "token {emitted}"
+                );
             }
         }
         assert_eq!(emitted, 766);
@@ -824,6 +927,118 @@ mod tests {
         assert_eq!(budgeted.close, Some(ReasoningClose::Budget));
         assert_eq!(guarded.cut_at, budgeted.cut_at);
         assert_eq!(guarded.tokens, budgeted.tokens);
+    }
+
+    #[test]
+    fn the_cut_follows_the_budget() {
+        let mut tracker = ReasoningTracker::new(true, Some(5), &[8, 9]);
+        for token in [100, 101, 102] {
+            tracker.observe_token(token);
+        }
+        let cut = tracker.thinking_cut().expect("a budget cuts");
+        assert_eq!((cut.row, cut.from, cut.left()), (2, 0, 2));
+        tracker.observe_token(103);
+        tracker.observe_token(104); // the cut starts
+        let cut = tracker.thinking_cut().expect("the cut");
+        assert_eq!((cut.row, cut.from, cut.left()), (0, 0, 2));
+        tracker.observe_token(8);
+        let cut = tracker.thinking_cut().expect("the close is left");
+        assert_eq!((cut.row, cut.from, cut.left()), (0, 1, 1));
+        assert_eq!(cut.proposals(3), &[9]);
+        tracker.observe_token(9);
+        assert_eq!(tracker.thinking_cut(), None);
+
+        let mut taken = ReasoningTracker::new(true, Some(0), &[8, 9]);
+        assert_eq!(taken.take_forced_token(), Some(8));
+        assert_eq!(
+            taken.thinking_cut().map(|cut| cut.from),
+            Some(1),
+            "an end token in flight is not handed out twice"
+        );
+        taken.observe_token(8);
+        assert_eq!(taken.thinking_cut().map(|cut| cut.from), Some(1));
+
+        assert_eq!(
+            ReasoningTracker::new(true, None, &[8, 9]).thinking_cut(),
+            None
+        );
+        assert_eq!(
+            ReasoningTracker::new(true, Some(2), &[]).thinking_cut(),
+            None
+        );
+        assert_eq!(
+            ReasoningTracker::new(false, Some(2), &[8, 9]).thinking_cut(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_cycle_observes_its_end_tokens_without_a_take() {
+        let mut cycle = ReasoningTracker::new(true, Some(1), &[7, 8, 9]);
+        cycle.observe_token(100); // the cut starts
+        assert!(cycle.observe_token(7));
+        assert!(cycle.observe_token(8));
+        assert_eq!(cycle.take_forced_token(), Some(9));
+        assert!(cycle.observe_token(9));
+        assert!(!cycle.observe_token(5));
+        let outcome = cycle.outcome();
+        assert_eq!(outcome.close, Some(ReasoningClose::Budget));
+        assert_eq!((outcome.tokens, outcome.cut_at), (3, Some(1)));
+
+        // An AR step takes the first end token, a cycle the rest.
+        let mut mixed = ReasoningTracker::new(true, Some(1), &[7, 8, 9]);
+        mixed.observe_token(100);
+        assert_eq!(mixed.take_forced_token(), Some(7));
+        mixed.observe_token(7);
+        mixed.observe_token(8);
+        assert_eq!(mixed.thinking_cut().map(|cut| cut.from), Some(2));
+        assert_eq!(mixed.take_forced_token(), Some(9));
+        mixed.observe_token(9);
+        assert_eq!(mixed.outcome(), outcome);
+    }
+
+    #[test]
+    fn cut_targets_stop_at_a_close_before_the_row() {
+        let mut tracker = ReasoningTracker::new(true, Some(4), &[8, 9]);
+        tracker.observe_token(100);
+        tracker.observe_token(101);
+        let cut = tracker.thinking_cut().expect("row 2");
+        assert!(cut.touches(2) && !cut.touches(1));
+        assert_eq!((cut.replaced(3), cut.proposals(3)), (0, &[][..]));
+        let open = cut.targets(&[5, 6, 7]);
+        assert_eq!(
+            (0..5).map(|row| open.at(row)).collect::<Vec<_>>(),
+            vec![None, None, Some(8), Some(9), None]
+        );
+        let closed = cut.targets(&[5, 9, 7]);
+        assert!((0..4).all(|row| closed.at(row).is_none()));
+        // A close at or after the cut row does not stop the cut.
+        assert_eq!(cut.targets(&[5, 6, 9]).at(2), Some(8));
+
+        let mut extra = ReasoningTracker::with_end(
+            &crate::engine::backend::ThinkingSetup {
+                enabled: true,
+                budget: Some(2),
+                cycle_guard: false,
+            },
+            Arc::from(&[8u32, 9][..]),
+            vec![11],
+        );
+        extra.observe_token(100);
+        let cut = extra.thinking_cut().expect("row 1");
+        assert!((0..3).all(|row| cut.targets(&[11, 5]).at(row).is_none()));
+
+        // Row 0: the end replaces the first proposals, then the model's rows.
+        tracker.observe_token(102);
+        tracker.observe_token(103);
+        tracker.observe_token(8);
+        let cut = tracker.thinking_cut().expect("the close is left");
+        assert_eq!((cut.replaced(3), cut.proposals(3)), (1, &[9][..]));
+        let targets = cut.targets(&[9, 4, 4]);
+        assert_eq!(
+            (0..4).map(|row| targets.at(row)).collect::<Vec<_>>(),
+            vec![Some(9), None, None, None]
+        );
     }
 
     #[test]

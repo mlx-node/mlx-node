@@ -2,6 +2,7 @@
 use super::*;
 use engine::backend::DsparkProposal;
 use engine::dspark_turn::{CycleStop, accept_dspark_proposal, clamp_dspark_cycle};
+use engine::penalties::ThinkingCut;
 use engine::scheduler::SpeculativeRowResult;
 
 struct VerifyWork {
@@ -10,7 +11,7 @@ struct VerifyWork {
     anchor: u32,
     cap: usize,
     proposal: DsparkProposal,
-    forced: Option<u32>,
+    cut: Option<ThinkingCut>,
 }
 
 fn empty_proposal() -> DsparkProposal {
@@ -181,15 +182,8 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 0
             };
             cap = cap.min(remaining.saturating_sub(1));
-            if let Some(budget) = turn.payload.reasoning_tracker.unforced_token_budget() {
-                cap = cap.min(budget.saturating_sub(1));
-            }
-            let forced = if let Some(token) = turn.payload.reasoning_tracker.peek_forced_token() {
-                cap = 0;
-                Some(token)
-            } else {
-                None
-            };
+            // A thinking cut is a row of this verify: the row keeps its cap.
+            let cut = turn.payload.reasoning_tracker.thinking_cut();
             // Reserve before proposal construction. On pressure retry only the
             // known anchor; the scheduler can preempt if even that cannot fit.
             let reserve = self
@@ -222,7 +216,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 anchor,
                 cap,
                 proposal: empty_proposal(),
-                forced,
+                cut,
             });
         }
         if work.is_empty() {
@@ -318,7 +312,20 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                         && proposal.draft_ids.iter().all(|&token| token >= 0) =>
                 {
                     item.proposal = proposal;
-                    proposed.push(item);
+                    // At row 0 the end tokens are the first proposals; their
+                    // keep probability is 1 before the wave's budget reads it.
+                    let replaced = match &item.cut {
+                        Some(cut) => {
+                            let len = item.proposal.draft_ids.len();
+                            item.proposal.replace_prefix(cut.proposals(len))
+                        }
+                        None => Ok(()),
+                    };
+                    match replaced {
+                        Ok(()) => proposed.push(item),
+                        Err(error) => results
+                            .push((item.plan_index, Self::speculative_failure(turn, row, error))),
+                    }
                 }
                 outcome => {
                     let error = outcome
@@ -411,14 +418,12 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         };
         let greedy = work.iter().all(|item| {
             let params = &running[item.turn_index].payload.params;
-            item.forced.is_none()
-                && crate::sampling::is_greedy_temperature(
-                    params
-                        .sampling_config
-                        .and_then(|config| config.temperature)
-                        .unwrap_or(1.0),
-                )
-                && params.repetition_penalty == 1.0
+            crate::sampling::is_greedy_temperature(
+                params
+                    .sampling_config
+                    .and_then(|config| config.temperature)
+                    .unwrap_or(1.0),
+            ) && params.repetition_penalty == 1.0
                 && params.presence_penalty == 0.0
                 && params.frequency_penalty == 0.0
         });
@@ -453,7 +458,18 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                         let tokens = tokens
                             .as_ref()
                             .map_err(|error| Error::from_reason(error.reason.clone()))?;
-                        let target = &tokens[offset as usize..end as usize];
+                        let mut target = tokens[offset as usize..end as usize].to_vec();
+                        if let Some(forced) = item
+                            .cut
+                            .as_ref()
+                            .map(|c| c.targets(&item.proposal.draft_ids))
+                        {
+                            for (row, token) in target.iter_mut().enumerate() {
+                                if let Some(end) = forced.at(row) {
+                                    *token = end as i32;
+                                }
+                            }
+                        }
                         let mut count = 0;
                         while count < item.proposal.draft_ids.len()
                             && target[count] == item.proposal.draft_ids[count]
@@ -461,10 +477,6 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                             count += 1;
                         }
                         Ok((count, target[count] as u32))
-                    } else if let Some(forced) = item.forced {
-                        // A forced host id must still complete the target/cache writes.
-                        MxArray::eval_arrays_with_context(&[&row], "scheduled_verify_forced")?;
-                        Ok((0, forced))
                     } else if let Some(rng) = turn.payload.scheduled_speculation.as_mut() {
                         accept_dspark_proposal(
                             &row,
@@ -472,6 +484,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                             &turn.token_history,
                             &turn.payload.params,
                             rng,
+                            item.cut.as_ref(),
                         )
                     } else {
                         accept_dspark_proposal(
@@ -480,6 +493,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                             &turn.token_history,
                             &turn.payload.params,
                             &mut rand::rng(),
+                            item.cut.as_ref(),
                         )
                     }
                 });
@@ -590,13 +604,12 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                         continue;
                     }
                 };
-            if item.forced.is_some() {
-                turn.payload.reasoning_tracker.take_forced_token();
-            }
-            if !item.proposal.draft_ids.is_empty() {
+            let drafted = item.proposal.draft_ids.len();
+            let replaced = item.cut.as_ref().map_or(0, |c| c.replaced(drafted));
+            if drafted > replaced {
                 turn.payload
                     .profiler
-                    .record_mtp_cycle(item.proposal.draft_ids.len(), accepted_count);
+                    .record_mtp_cycle(drafted - replaced, accepted_count.saturating_sub(replaced));
             }
             for (index, &token) in tokens.iter().enumerate() {
                 turn.payload.generated_tokens.push(token);
@@ -967,6 +980,24 @@ pub(super) mod tests {
     /// Two owners cut at a thinking budget of 2 with the end `[13, 14]`; owner
     /// 42 speculates when `speculate_second`.
     fn run_ending(speculate_second: bool) -> Vec<(u32, Vec<u32>)> {
+        run_ending_with(speculate_second, &[13, 14]).0
+    }
+
+    /// [`run_ending`] with `end`; also owner 42's generated length after each
+    /// step.
+    fn run_ending_with(speculate_second: bool, end: &[u32]) -> (Vec<(u32, Vec<u32>)>, Vec<usize>) {
+        run_ending_stopped(speculate_second, end, None, None, &[])
+    }
+
+    /// [`run_ending_with`] with a `max_new_tokens`, an EOS id and extra EOS
+    /// ids of its own.
+    fn run_ending_stopped(
+        speculate_second: bool,
+        end: &[u32],
+        max_new_tokens: Option<i32>,
+        eos: Option<u32>,
+        extra: &[u32],
+    ) -> (Vec<(u32, Vec<u32>)>, Vec<usize>) {
         let mut inner = seeded_tiny_paged_inner_with_draft(1729).unwrap();
         let mut scheduler = Scheduler::<_, (), ()>::new(2, 12).unwrap();
         for (seq, prompt, speculate) in [
@@ -981,10 +1012,19 @@ pub(super) mod tests {
                 Arc::new(AtomicBool::new(false)),
             );
             turn.payload.reasoning_tracker =
-                engine::penalties::ReasoningTracker::new(true, Some(2), &[13, 14]);
+                engine::penalties::ReasoningTracker::new(true, Some(2), end);
+            if let Some(max) = max_new_tokens {
+                turn.payload.params.max_new_tokens = max;
+            }
+            if let Some(eos) = eos {
+                turn.payload.eos_id = eos;
+            }
+            turn.payload.params.extra_eos_ids = extra.to_vec();
+            turn.payload.extra_eos_ids = extra.to_vec();
             scheduler.enqueue_turn(turn).unwrap();
         }
         let mut completed = Vec::new();
+        let mut lengths = Vec::new();
         for _ in 0..100 {
             if let SchedulerAction::Stepped {
                 completed: turns, ..
@@ -995,15 +1035,21 @@ pub(super) mod tests {
                 for turn in turns {
                     assert!(turn.payload.failure.is_none(), "{:?}", turn.payload.failure);
                     inner.release_scheduled_speculation(turn.seq_id);
+                    if turn.seq_id == 42 {
+                        lengths.push(turn.payload.generated_tokens.len());
+                    }
                     completed.push((turn.seq_id, turn.payload.generated_tokens));
                 }
+            }
+            if let Some(turn) = scheduler.running().iter().find(|turn| turn.seq_id == 42) {
+                lengths.push(turn.payload.generated_tokens.len());
             }
             if completed.len() == 2 {
                 break;
             }
         }
         completed.sort_by_key(|(seq, _)| *seq);
-        completed
+        (completed, lengths)
     }
 
     #[test]
@@ -1014,6 +1060,72 @@ pub(super) mod tests {
             assert_eq!(&generated[2..4], &[13, 14], "owner {seq}: {generated:?}");
         }
         assert_eq!(ar, mixed, "a speculative row commits the end exactly as AR");
+    }
+
+    #[test]
+    fn a_scheduled_end_is_drafted() {
+        let mut end = vec![13; 8];
+        end.push(14);
+        let (ar, _) = run_ending_with(false, &end);
+        let (mixed, lengths) = run_ending_with(true, &end);
+        for (seq, generated) in &ar {
+            assert_eq!(
+                &generated[2..11],
+                end.as_slice(),
+                "owner {seq}: {generated:?}"
+            );
+        }
+        assert_eq!(ar, mixed, "a speculative row commits the end exactly as AR");
+        let stretch = 2..2 + end.len();
+        let mut before = 0;
+        let mut steps = 0;
+        for &now in &lengths {
+            if (before..now).any(|n| stretch.contains(&n)) {
+                steps += 1;
+            }
+            before = now;
+        }
+        assert!(
+            steps <= 1 + (end.len() - 1).div_ceil(4),
+            "{steps} steps grew the end: {lengths:?}"
+        );
+    }
+
+    /// `max_new_tokens` reached inside the end text ends a speculative row
+    /// where it ends an AR row.
+    #[test]
+    fn a_scheduled_end_cut_by_max_new_tokens_matches_ar() {
+        let mut end = vec![13; 8];
+        end.push(14);
+        for inside in [1, 3, 5, 8] {
+            let max = Some(2 + inside as i32);
+            let (ar, _) = run_ending_stopped(false, &end, max, None, &[]);
+            let (mixed, _) = run_ending_stopped(true, &end, max, None, &[]);
+            for (seq, generated) in &ar {
+                assert_eq!(generated.len(), 2 + inside, "owner {seq}: {generated:?}");
+                assert_eq!(&generated[2..], &end[..inside], "owner {seq}");
+            }
+            assert_eq!(ar, mixed, "inside={inside}");
+        }
+    }
+
+    /// An EOS, or an extra EOS id, inside the end text stops a speculative
+    /// row on it, as it stops an AR row.
+    #[test]
+    fn a_scheduled_eos_inside_the_end_stops_the_row() {
+        let end = [13, 14, 13, 13, 13, 13, 9];
+        for (label, eos, extra) in [("eos", Some(14), vec![]), ("extra eos", None, vec![14])] {
+            let (ar, _) = run_ending_stopped(false, &end, None, eos, &extra);
+            let (mixed, _) = run_ending_stopped(true, &end, None, eos, &extra);
+            for (seq, generated) in &ar {
+                assert_eq!(
+                    &generated[2..],
+                    &[13, 14],
+                    "{label}: owner {seq}: {generated:?}"
+                );
+            }
+            assert_eq!(ar, mixed, "{label}");
+        }
     }
 
     #[test]

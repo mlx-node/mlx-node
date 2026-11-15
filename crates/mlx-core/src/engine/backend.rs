@@ -1932,14 +1932,40 @@ impl DsparkProposal {
     /// Back-fill `draft_ids` from `device_draft_ids` and drop the device
     /// handle. Forces evaluation of the proposal path — callers must only
     /// invoke this AFTER the consuming verify graph has been forced (inside
-    /// or after acceptance); an early call reintroduces the readback the
-    /// device path exists to avoid. No-op for host-resident proposals.
+    /// or after acceptance), or before the verify on a cycle whose rows a
+    /// thinking cut decides: that cycle verifies host ids. Otherwise an early
+    /// call reintroduces the readback the device path exists to avoid. No-op
+    /// for host-resident proposals.
     pub fn materialize_draft_ids(&mut self) -> Result<()> {
         let Some(ids) = self.device_draft_ids.take() else {
             return Ok(());
         };
         let host = ids.to_int32()?;
         self.draft_ids = host.as_ref().to_vec();
+        Ok(())
+    }
+
+    /// Put `tokens` in place of the first proposals: the end tokens a
+    /// thinking cut drafts. Their keep probability is 1, so an adaptive
+    /// verification budget never cuts them; the distributions stay, one per
+    /// row. Host ids only.
+    pub fn replace_prefix(&mut self, tokens: &[u32]) -> Result<()> {
+        if self.device_draft_ids.is_some() || tokens.len() > self.draft_ids.len() {
+            return Err(Error::from_reason(
+                "a thinking cut replaces host proposal ids within the proposal",
+            ));
+        }
+        for (row, &token) in tokens.iter().enumerate() {
+            self.draft_ids[row] = i32::try_from(token)
+                .map_err(|_| Error::from_reason("end token id does not fit i32"))?;
+            if let Some(keep) = self
+                .keep_probabilities
+                .as_mut()
+                .and_then(|probs| probs.get_mut(row))
+            {
+                *keep = 1.0;
+            }
+        }
         Ok(())
     }
 
