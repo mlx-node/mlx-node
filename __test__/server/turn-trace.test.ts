@@ -343,6 +343,7 @@ describe('TurnTraceModel', () => {
       watermarks: { cold: {}, sidecar: {} },
       memory: () => ({ activeBytes: 1000, peakBytes: 2000 }),
       pipelineStats: () => null,
+      stateTierMode: () => undefined,
       ...overrides,
     };
   }
@@ -976,6 +977,36 @@ describe('TurnTraceModel', () => {
     });
     expect(lines[1]).toMatchObject({ model: 'qwen-small', modelId: 'Qwen3.6-27B', ctxWindow: 131072 });
     expect(contextLimits).not.toHaveBeenCalled();
+  });
+
+  // A qwen3_5 / qwen3_5_moe turn's disk cache is the SSD state tier, which
+  // `coldEnabled` (the process tier) does not see: the record carries its mode.
+  // Mutation: drop the family gate → the qwen3 line carries `stateTier` → red.
+  // Mutation: drop the `stateTier` write → the qwen3_5 lines lack it → red.
+  it('records the SSD state tier mode on qwen3_5 and qwen3_5_moe turns only', async () => {
+    const tierOf = (modelType: string) =>
+      new TurnTraceModel(
+        makeInner(),
+        deps({
+          identity: { modelId: modelType, modelType, contextWindow: 4096 },
+          coldStats: () => coldStats({ enabled: false, root: '' }),
+          stateTierMode: () => 'persistent',
+        }),
+      );
+    await tierOf('qwen3_5').chatSessionStart([]);
+    await tierOf('qwen3_5_moe').chatSessionStart([]);
+    await tierOf('qwen3').chatSessionStart([]);
+    await new TurnTraceModel(
+      makeInner(),
+      deps({ identity: { modelId: 'q', modelType: 'qwen3_5', contextWindow: 4096 }, stateTierMode: () => 'later' }),
+    ).chatSessionStart([]);
+
+    const lines = readTraceLines(dir);
+    expect(lines[0]).toMatchObject({ modelType: 'qwen3_5', coldEnabled: false, stateTier: 'persistent' });
+    expect(lines[1]).toMatchObject({ modelType: 'qwen3_5_moe', coldEnabled: false, stateTier: 'persistent' });
+    expect(lines[2]).toMatchObject({ modelType: 'qwen3', coldEnabled: false });
+    expect(lines[2]).not.toHaveProperty('stateTier');
+    expect(lines[3]).not.toHaveProperty('stateTier');
   });
 
   it('reports concurrency and concurrencyPeak for overlapping turns', async () => {

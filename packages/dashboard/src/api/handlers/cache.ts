@@ -43,9 +43,13 @@ import { bucketSql } from '../sql.js';
  *  - `disabledTurns` — the tier was off (`--no-persist-cache`, or a family off
  *    the restore allowlist). Their deltas are all zero, so they are counted but
  *    carry no lookups. Overlaps the buckets above by design: it is a TURN
- *    count, not a lookup bucket.
+ *    count, not a lookup bucket. A qwen3_5 / qwen3_5_moe turn counts by its
+ *    own disk cache, the SSD state tier (`state_tier`): off when that tier was
+ *    `off` or only `temp` (gone at the engine's stop).
  *  - `enabledTurns` — the tier was on, whatever the root: with `disabledTurns`
- *    the measured answer to "did the turns run with the disk cache".
+ *    the measured answer to "did the turns run with the disk cache". A
+ *    qwen3_5 / qwen3_5_moe turn counts here when its state tier was
+ *    `persistent`.
  *  - `unrootedSidecarCaptures` — the one delta a rootless turn can still carry,
  *    and the reason "their deltas are all zero" is true of the BLOCK counters
  *    only. `record_capture_reached()` is the first statement of every family's
@@ -130,8 +134,10 @@ export function handleCacheGet(ctx: WorkerApiContext): unknown {
                            THEN cold_hits END), 0) AS unattributedHits,
          COALESCE(SUM(CASE WHEN cold_root IS NULL AND cold_enabled IS NOT NULL AND cold_enabled <> 0
                            THEN cold_misses END), 0) AS unattributedMisses,
-         COUNT(CASE WHEN cold_enabled = 0 THEN 1 END) AS disabledTurns,
-         COUNT(CASE WHEN cold_enabled IS NOT NULL AND cold_enabled <> 0 THEN 1 END) AS enabledTurns,
+         COUNT(CASE WHEN state_tier IS NULL AND cold_enabled = 0 THEN 1
+                    WHEN state_tier IN ('temp', 'off') THEN 1 END) AS disabledTurns,
+         COUNT(CASE WHEN state_tier IS NULL AND cold_enabled IS NOT NULL AND cold_enabled <> 0 THEN 1
+                    WHEN state_tier = 'persistent' THEN 1 END) AS enabledTurns,
          COALESCE(SUM(CASE WHEN cold_root IS NULL THEN cold_sidecar_capture_reached END), 0)
            AS unrootedSidecarCaptures
        FROM traces WHERE ts > 0 AND outcome = 'ok'`,

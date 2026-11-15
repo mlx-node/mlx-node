@@ -37,6 +37,7 @@ import {
   coldCacheStats,
   coldSidecarStats,
   getMemorySnapshot,
+  memoryGovernorStatus,
   type ChatConfig,
   type ChatMessage,
   type ChatResult,
@@ -52,10 +53,12 @@ import {
   type ChatStreamControl,
   type SessionCapableModel,
 } from '@mlx-node/lm';
-import { canonicalCacheRoot } from '@mlx-node/lm/cold-tier';
+import { canonicalCacheRoot, COLD_TIER_STATE_FAMILIES } from '@mlx-node/lm/cold-tier';
 
 import {
+  enumOf,
   MetricsTrace,
+  STATE_TIER_MODES,
   type MetricsTraceInput,
   type TurnBudgetFrom,
   type TurnDispatch,
@@ -86,6 +89,15 @@ function safeColdStats(): ColdCacheStats | undefined {
 function safeSidecarStats(): ColdSidecarStats | undefined {
   try {
     return coldSidecarStats();
+  } catch {
+    return undefined;
+  }
+}
+
+/** The SSD state tier's mode over the loaded models; the native addon may be absent (unit tests). */
+function safeStateTierMode(): string | undefined {
+  try {
+    return memoryGovernorStatus()?.dflash2States.disk.mode;
   } catch {
     return undefined;
   }
@@ -276,6 +288,8 @@ export interface TurnTraceDeps {
   coldStats?: () => ColdCacheStats | undefined;
   /** Process-wide sidecar-counter reader; defaults to the native addon. */
   sidecarStats?: () => ColdSidecarStats | undefined;
+  /** The SSD state tier's mode over the loaded models; defaults to the native addon. */
+  stateTierMode?: () => string | undefined;
   /** Clock for `ts`, `durationMs`, and the trace filename. Default: `Date.now`. */
   now?: () => number;
   /**
@@ -794,6 +808,11 @@ export class TurnTraceModel implements SessionCapableModel {
           const canonicalRoot = canonicalCacheRoot(cold.root);
           if (canonicalRoot.length > 0) rec.coldRoot = canonicalRoot;
         }
+      }
+      const modelType = this.deps.identity?.modelType;
+      if (modelType !== undefined && COLD_TIER_STATE_FAMILIES.has(modelType)) {
+        const mode = enumOf((this.deps.stateTierMode ?? safeStateTierMode)(), STATE_TIER_MODES);
+        if (mode !== undefined) rec.stateTier = mode;
       }
       const sidecar = sidecarStats();
       if (sidecar && ctx.sidecar) {

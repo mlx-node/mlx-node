@@ -90,6 +90,8 @@ export type TurnDispatch = 'start' | 'continue' | 'continue_tool';
 export type TurnBudgetFrom = 'request' | 'server';
 /** How a thought ended (native `reasoningClose`). */
 export type TurnReasoningClose = 'model' | 'budget' | 'cycle' | 'open';
+/** Splash `/status` `disk.mode` of the SSD state tier. */
+export type StateTierMode = 'persistent' | 'temp' | 'off';
 
 export const TURN_OUTCOMES: readonly TurnOutcome[] = ['ok', 'error', 'cancelled'];
 export const TURN_ERROR_KINDS: readonly TurnErrorKind[] = ['finish_error', 'exception'];
@@ -99,6 +101,7 @@ export const TURN_ENDPOINTS: readonly TurnEndpoint[] = ['messages', 'responses',
 export const TURN_DISPATCHES: readonly TurnDispatch[] = ['start', 'continue', 'continue_tool'];
 export const TURN_BUDGET_FROM: readonly TurnBudgetFrom[] = ['request', 'server'];
 export const TURN_REASONING_CLOSES: readonly TurnReasoningClose[] = ['model', 'budget', 'cycle', 'open'];
+export const STATE_TIER_MODES: readonly StateTierMode[] = ['persistent', 'temp', 'off'];
 
 /** Most MTP draft positions a record carries. */
 export const MTP_ACCEPT_BY_POS_MAX = 16;
@@ -245,6 +248,13 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
   coldRoot?: string;
   /** Whether the cold tier was open for this turn (`ColdCacheStats.enabled`). */
   coldEnabled?: boolean;
+  /**
+   * The SSD state tier's mode at the end of a qwen3_5 / qwen3_5_moe turn: their
+   * disk cache, which {@link coldEnabled} does not see. The most lasting mode
+   * over the engine's loaded models (`memoryGovernorStatus().dflash2States.disk`).
+   * Absent for every other family.
+   */
+  stateTier?: StateTierMode;
   /**
    * Cold-tier write-queue submissions accrued this turn. Incremented on the
    * calling thread, so this delta is EXACT.
@@ -577,6 +587,8 @@ export class MetricsTrace {
       // an empty root would create a bucket no dashboard root can ever match.
       if (typeof rec.coldRoot === 'string' && rec.coldRoot.length > 0) out.coldRoot = rec.coldRoot;
       if (typeof rec.coldEnabled === 'boolean') out.coldEnabled = rec.coldEnabled;
+      const stateTier = enumOf(rec.stateTier, STATE_TIER_MODES);
+      if (stateTier !== undefined) out.stateTier = stateTier;
       const coldCorruptionsTotal = finite(rec.coldCorruptionsTotal);
       if (coldCorruptionsTotal !== undefined) out.coldCorruptionsTotal = coldCorruptionsTotal;
       const coldQueueDropsTotal = finite(rec.coldQueueDropsTotal);

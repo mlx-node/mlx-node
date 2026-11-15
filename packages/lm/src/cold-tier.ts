@@ -73,6 +73,12 @@ export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType
   MODEL_FAMILY_DATA.filter((row) => 'coldRestoreEligible' in row).map((row) => row.id),
 );
 
+/**
+ * Model families whose disk cache is the SSD state tier (`disk_tier.rs`), not
+ * the process cold tier above: their turns never touch `coldCacheStats()`.
+ */
+export const COLD_TIER_STATE_FAMILIES: ReadonlySet<string> = new Set<ModelType>(['qwen3_5', 'qwen3_5_moe']);
+
 /** Allowlisted families in a stable, human-facing order (help text, API payload). */
 export function coldTierRestoreFamilyList(): string[] {
   return [...COLD_TIER_RESTORE_FAMILIES].sort();

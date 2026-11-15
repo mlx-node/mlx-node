@@ -71,6 +71,11 @@ export const traces = sqliteTable('traces', {
   coldRoot: text('cold_root'),
   /** 1 when the cold tier was open for the turn, 0 when off; NULL if unknown. */
   coldEnabled: integer('cold_enabled'),
+  /**
+   * `persistent`, `temp` or `off`: the SSD state tier of a qwen3_5 / qwen3_5_moe
+   * turn, whose disk cache `coldEnabled` does not see. NULL for every other family.
+   */
+  stateTier: text('state_tier'),
   coldEnqueued: integer('cold_enqueued'),
   coldQueueDrops: integer('cold_queue_drops'),
   coldEvictions: integer('cold_evictions'),

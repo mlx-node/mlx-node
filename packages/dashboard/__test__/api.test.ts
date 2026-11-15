@@ -1363,6 +1363,16 @@ describe('dashboard api — cache trend scoping', () => {
         coldEnabled: false,
         coldSidecarCaptureReached: 13,
       },
+      // qwen3_5 turns: the process tier never opened for them (`coldEnabled:
+      // false`), their disk cache is the SSD state tier. Persistent counts as
+      // on, temporary as off.
+      {
+        traceId: 'state-persistent-1',
+        ts: Date.UTC(2026, 6, 20, 12),
+        coldEnabled: false,
+        stateTier: 'persistent',
+      },
+      { traceId: 'state-temp-1', ts: Date.UTC(2026, 6, 20, 12), coldEnabled: false, stateTier: 'temp' },
       // The partition hole: tier ON, root NULL. Matches none of `cold_root = ?`,
       // `cold_root IS NULL AND cold_enabled IS NULL`, `cold_root <> ?`, or
       // `cold_enabled = 0` — so before the fourth bucket these 777 hits were
@@ -1405,9 +1415,11 @@ describe('dashboard api — cache trend scoping', () => {
     expect(body.scope.trendWindowDays).toBe(TRACE_RETENTION_DAYS);
     // A turn that ran with the tier OFF is a different story from an
     // unattributable one, and must not be folded into `legacy`.
-    expect(body.scope.disabledTurns).toBe(1);
-    // Tier on, whatever the root: two here, one elsewhere, one with no root. Legacy rows count in neither.
-    expect(body.scope.enabledTurns).toBe(4);
+    // Mutation: count qwen3_5 turns by `cold_enabled` alone → disabled 3, enabled 4 → red.
+    expect(body.scope.disabledTurns).toBe(2);
+    // Tier on, whatever the root: two here, one elsewhere, one with no root, one
+    // persistent state tier. Legacy rows count in neither.
+    expect(body.scope.enabledTurns).toBe(5);
   });
 
   /**
@@ -1433,7 +1445,7 @@ describe('dashboard api — cache trend scoping', () => {
     await ingest();
     const body = (await (await api.fetch('/api/cache')).json()) as CacheBody;
     expect(body.scope.legacy).toEqual({ turns: 1, hits: 5000, misses: 11 });
-    expect(body.scope.disabledTurns).toBe(1);
+    expect(body.scope.disabledTurns).toBe(2);
   });
 
   it('accounts for every trace row: the buckets partition the table, they do not just avoid overlap', async () => {

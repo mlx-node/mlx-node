@@ -30,6 +30,7 @@ const ERROR_KINDS = ['finish_error', 'exception'];
 const FAIL_PHASES = ['queued', 'slot', 'prepare', 'prefill', 'decode'];
 const ENDPOINTS = ['messages', 'responses', 'other'];
 const DISPATCHES = ['start', 'continue', 'continue_tool'];
+const STATE_TIER_MODES = ['persistent', 'temp', 'off'];
 const MTP_ACCEPT_BY_POS_MAX = 16;
 
 const DAY_MS = 86_400_000;
@@ -141,6 +142,7 @@ function traceRow(trace: ParsedTrace, sourceFile: string): typeof traces.$inferI
     // absent value stays NULL: the "unattributed" bucket of the Cache page.
     coldRoot: strOrNull(trace.coldRoot),
     coldEnabled: boolToInt(trace.coldEnabled),
+    stateTier: enumOrNull(trace.stateTier, STATE_TIER_MODES),
     coldEnqueued: numOrNull(trace.coldEnqueued),
     coldQueueDrops: numOrNull(trace.coldQueueDrops),
     coldEvictions: numOrNull(trace.coldEvictions),
