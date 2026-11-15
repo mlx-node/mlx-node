@@ -144,6 +144,15 @@ pub(crate) enum LoopControl {
     Break,
 }
 
+fn clear_streams_before_thread_exit() {
+    // CUDA calls fail from Windows thread-local destructors. MLX requires an
+    // explicit clear_streams() on the worker before its thread exit begins.
+    #[cfg(windows)]
+    unsafe {
+        mlx_sys::mlx_clear_streams();
+    }
+}
+
 impl<Cmd: Send + 'static> ModelThread<Cmd> {
     fn from_parts(
         cmd_tx: tokio::sync::mpsc::UnboundedSender<Cmd>,
@@ -196,10 +205,13 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
                     }
                     Err(error) => {
                         send_init_result(&thread_init_tx, Err(error));
+                        clear_streams_before_thread_exit();
                         return;
                     }
                 };
                 while matches!(loop_body(&mut state, &mut cmd_rx), LoopControl::Continue) {}
+                drop(state);
+                clear_streams_before_thread_exit();
             }) {
             Ok(handle) => Some(handle),
             Err(error) => {
@@ -251,6 +263,7 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
                     }
                     Err(e) => {
                         send_init_result(&thread_init_tx, Err(e));
+                        clear_streams_before_thread_exit();
                         return;
                     }
                 };
@@ -258,6 +271,8 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
                 while let Some(cmd) = cmd_rx.blocking_recv() {
                     handler(&mut state, cmd);
                 }
+                drop(state);
+                clear_streams_before_thread_exit();
             }) {
             Ok(handle) => Some(handle),
             Err(error) => {

@@ -350,6 +350,7 @@ unsafe extern "C-unwind" {
     /// `mlx_take_native_error`.
     pub fn mlx_synchronize() -> bool;
     pub fn mlx_clear_cache();
+    pub fn mlx_clear_streams();
     pub fn mlx_compile_clear_cache() -> bool;
     pub fn mlx_stop_gradient(a: *mut mlx_array) -> *mut mlx_array;
 
