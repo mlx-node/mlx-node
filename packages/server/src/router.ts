@@ -8,7 +8,7 @@ import type { AudioService } from './audio-service.js';
 import { handleMemoryRelease, type MemoryReleaseAnswer } from './endpoints/memory-release.js';
 import { handleCountMessageTokens } from './endpoints/messages-count-tokens.js';
 import { handleCreateMessage } from './endpoints/messages.js';
-import { handleListModels } from './endpoints/models.js';
+import { handleListModels, handleUnloadModels } from './endpoints/models.js';
 import { handleCreateResponse } from './endpoints/responses.js';
 import { handleSystemOne } from './endpoints/systemone.js';
 import {
@@ -96,10 +96,16 @@ export interface RouteExtras {
   rerank?: RerankService;
   /** Thinking budget of a Messages thinking request that sets none. */
   thinkingTokenBudget?: number;
+  /** The cycle guard of a Messages request. */
+  thinkingCycleGuard?: boolean;
+  /** The end text of a Messages request's cut thought. */
+  thinkingEndText?: string;
   /** The desktop supervisor's turn journal and quarantine. */
   turnJournal?: TurnJournal;
   /** `POST /v1/memory/release`; omitted ⇒ the route is not served. */
   releaseMemory?: () => Promise<MemoryReleaseAnswer>;
+  /** Backs `POST /v1/models/unload`; the route answers 404 without it. */
+  unloadModels?: () => Promise<string[]>;
 }
 
 export async function routeRequest(
@@ -208,6 +214,15 @@ export async function routeRequest(
     return;
   }
 
+  if (path === '/v1/models/unload' && extras?.unloadModels && modelWorkCoordinator) {
+    if (req.method !== 'POST') {
+      sendMethodNotAllowed(res, 'POST');
+      return;
+    }
+    await handleUnloadModels(res, extras.unloadModels, registry, modelWorkCoordinator, idleSweeper);
+    return;
+  }
+
   if (path === '/v1/responses') {
     if (req.method !== 'POST') {
       sendMethodNotAllowed(res, 'POST');
@@ -289,7 +304,11 @@ export async function routeRequest(
       idleSweeper,
       resolveModel,
       modelWorkCoordinator,
-      extras?.thinkingTokenBudget,
+      {
+        tokenBudget: extras?.thinkingTokenBudget,
+        cycleGuard: extras?.thinkingCycleGuard,
+        endText: extras?.thinkingEndText,
+      },
       extras?.turnJournal,
     );
     return;

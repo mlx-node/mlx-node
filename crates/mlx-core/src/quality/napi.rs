@@ -49,8 +49,7 @@ async fn run_on_model(
     match read_model_type(model_path)?.as_str() {
         "qwen3_5" => {
             let model =
-                crate::models::qwen3_5::persistence::load_with_thread(model_path, None, format)
-                    .await?;
+                crate::models::qwen3_5::persistence::load_for_tool(model_path, format).await?;
             crate::model_thread::send_and_await(&model.thread, |reply| {
                 Qwen35FamilyCommand::EvalTeacherForced { request, reply }
             })
@@ -58,8 +57,7 @@ async fn run_on_model(
         }
         "qwen3_5_moe" => {
             let model =
-                crate::models::qwen3_5_moe::persistence::load_with_thread(model_path, None, format)
-                    .await?;
+                crate::models::qwen3_5_moe::persistence::load_for_tool(model_path, format).await?;
             crate::model_thread::send_and_await(&model.thread, |reply| {
                 Qwen35MoeFamilyCommand::EvalTeacherForced { request, reply }
             })

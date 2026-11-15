@@ -861,7 +861,8 @@ impl Gemma4Inner {
         profiler.set_prompt_tokens(prefill_tokens.len() as u32);
         profiler.snapshot_memory_before();
 
-        let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
+        let mut reasoning_tracker =
+            ReasoningTracker::from_setup(&thinking, &tokenizer.think_end(args.config));
 
         // Streaming decode state (mirrors the generic core) — one bundle:
         // detokenizer + cursors + emitter, built only when a sink exists
@@ -1024,7 +1025,7 @@ impl Gemma4Inner {
         } else {
             None
         };
-        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
+        let reasoning = reasoning_tracker.outcome();
 
         if let (Some(sink), Some(ts)) = (args.sink, turn_streaming.as_mut()) {
             // Residual flush through the emitter (same skip-special flag as
@@ -1074,7 +1075,7 @@ impl Gemma4Inner {
                 include_reasoning: p.include_reasoning,
                 thinking_enabled: thinking.enabled,
                 prompt_tokens: reported_prompt_tokens,
-                reasoning_tokens,
+                reasoning,
             },
         )?;
         // `thinking_enabled` is replay provenance for the model-provided

@@ -72,6 +72,8 @@ fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
         tools: None,
         reasoning_effort: Some("none".to_string()),
         thinking_token_budget: Some(0),
+        thinking_cycle_guard: None,
+        thinking_end_text: None,
         include_reasoning: Some(false),
         report_performance: Some(true),
         // MUST be true (or None): the engine's session_start guard rejects an

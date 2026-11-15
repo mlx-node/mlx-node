@@ -259,20 +259,24 @@ pub(crate) fn resolve(
     config: &ChatConfig,
 ) -> crate::engine::backend::ThinkingSetup {
     use crate::engine::backend::ThinkingSetup;
+    let cycle_guard = config.thinking_cycle_guard.unwrap_or(false);
     match policy {
         ThinkingPolicy::None => ThinkingSetup {
             enabled: false,
             budget: None,
+            cycle_guard: false,
         },
         ThinkingPolicy::TemplateHonoring => ThinkingSetup {
             enabled: resolve_enable_thinking(config).unwrap_or(true),
             budget: config.thinking_token_budget,
+            cycle_guard,
         },
         ThinkingPolicy::AlwaysOnBudgetFromEffort => ThinkingSetup {
             enabled: true,
             budget: config
                 .thinking_token_budget
                 .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref())),
+            cycle_guard,
         },
     }
 }
@@ -454,6 +458,8 @@ mod mtp_params_tests {
             tools: None,
             reasoning_effort: None,
             thinking_token_budget: None,
+            thinking_cycle_guard: None,
+            thinking_end_text: None,
             include_reasoning: None,
             report_performance: None,
             reuse_cache: None,
@@ -784,5 +790,46 @@ mod tests {
         assert_eq!(default_thinking_budget_for_effort(Some("high")), None);
         assert_eq!(default_thinking_budget_for_effort(None), None);
         assert_eq!(default_thinking_budget_for_effort(Some("bogus")), None);
+    }
+
+    #[test]
+    fn the_cycle_guard_is_off_unless_the_request_sets_it() {
+        use crate::engine::backend::ThinkEndResolution;
+        use crate::engine::penalties::{ReasoningClose, ReasoningTracker};
+        let close = ThinkEndResolution {
+            think_end_id: Some(9),
+            think_end_str: Some("</think>".to_string()),
+            thinking_end: std::sync::Arc::from([8, 9]),
+            think_end_extra_ids: Vec::new(),
+        };
+        let run = |policy: ThinkingPolicy, guard: Option<bool>| {
+            let config = ChatConfig {
+                thinking_cycle_guard: guard,
+                ..ChatConfig::default()
+            };
+            let mut tracker = ReasoningTracker::from_setup(&resolve(policy, &config), &close);
+            let thought = (1000..1100).chain((0..).flat_map(|_| 2000..2300));
+            for token in thought.take(1500) {
+                if tracker.ending() {
+                    break;
+                }
+                tracker.observe_token(token);
+            }
+            tracker.outcome()
+        };
+        for policy in [
+            || ThinkingPolicy::TemplateHonoring,
+            || ThinkingPolicy::AlwaysOnBudgetFromEffort,
+        ] {
+            let off = run(policy(), None);
+            assert_eq!(off.close, Some(ReasoningClose::Open));
+            assert_eq!((off.cut_at, off.cycle_period), (None, None));
+            assert_eq!(off.tokens, 1500);
+            let on = run(policy(), Some(true));
+            assert_eq!((on.cut_at, on.cycle_period), (Some(764), Some(300)));
+        }
+        let none = run(ThinkingPolicy::None, Some(true));
+        assert_eq!(none.close, None);
+        assert_eq!(none.cycle_period, None);
     }
 }

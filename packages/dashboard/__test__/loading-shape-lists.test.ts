@@ -20,7 +20,7 @@
  * happy-dom performs no layout — `getBoundingClientRect()` answers 0 for
  * everything — so a pixel assertion here would be worth nothing. Structure is
  * what these check: the same column headers, the same cells per row, the same
- * card wrappers. That is what a box you cannot measure is made of.
+ * panels. That is what a box you cannot measure is made of.
  *
  * `happy-dom` is scoped to this file by the docblock above; the repo default
  * environment stays `node`.
@@ -40,7 +40,7 @@ import { act, createElement, type ReactElement } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
-import { renderPage, type RenderedPage, stubApi } from './render.js';
+import { allByRole, byRole, renderPage, type RenderedPage, stubApi } from './render.js';
 
 let mounted: RenderedPage | undefined;
 let restoreApi: (() => void) | undefined;
@@ -111,31 +111,37 @@ interface ShapeSnapshot {
   heads: string[];
   /** Cells per body row: one entry per row, so a short row is visible. */
   rowWidths: number[];
-  /** Cards inside the recommended-models grid; `-1` when the grid is absent. */
+  /** Placeholders per body cell, row by row. */
+  cellPlaceholders: number[][];
+  /** The table's `aria-busy`. */
+  busy: string | null;
+  /** Panels inside the recommended-models section; `-1` when the section is absent. */
   catalogCards: number;
   /** Placeholders on the page — zero means this is not a loading tree. */
   skeletons: number;
 }
 
 function shapeOf(container: HTMLElement): ShapeSnapshot {
+  const rows = [...container.querySelectorAll('tbody tr')];
   return {
     heads: [...container.querySelectorAll('thead th')].map((th) => (th.textContent ?? '').trim()),
-    rowWidths: [...container.querySelectorAll('tbody tr')].map((tr) => tr.querySelectorAll('td').length),
+    rowWidths: rows.map((tr) => tr.querySelectorAll('td').length),
+    cellPlaceholders: rows.map((tr) =>
+      [...tr.querySelectorAll('td')].map((td) => td.querySelectorAll('[data-placeholder]').length),
+    ),
+    busy: container.querySelector('table')?.getAttribute('aria-busy') ?? null,
     catalogCards: catalogCardCount(container),
-    skeletons: container.querySelectorAll('[data-slot="skeleton"]').length,
+    skeletons: container.querySelectorAll('[data-placeholder]').length,
   };
 }
 
 /**
- * Cards after the recommended-models heading, independent of responsive classes.
- *
- * `-1` rather than `0` when the grid is missing: two zeroes compare equal, and a
- * grid that stopped rendering would then read as a match.
+ * Panels in the recommended-models section. `-1` rather than `0` when the section is missing: two zeroes compare
+ * equal, and a section that stopped rendering would then read as a match.
  */
 function catalogCardCount(container: HTMLElement): number {
-  const heading = [...container.querySelectorAll('h2')].find((h2) => h2.textContent === 'Recommended models');
-  const grid = heading?.parentElement?.nextElementSibling;
-  return grid == null ? -1 : grid.querySelectorAll('[data-slot="card"]').length;
+  const section = byRole(container, 'region', 'Recommended models');
+  return section === null ? -1 : allByRole(section, 'region').length;
 }
 
 function localModel(overrides: Partial<LocalModel>): LocalModel {
@@ -147,6 +153,7 @@ function localModel(overrides: Partial<LocalModel>): LocalModel {
     contextWindow: 262_144,
     sizeBytes: 4_800_000_000,
     fileCount: 7,
+    servedIds: [],
     ...overrides,
   };
 }
@@ -157,6 +164,7 @@ function modelsRoutes(): Record<string, unknown> {
     models: [localModel({}), localModel({ name: 'gemma-4-12b', modelType: 'gemma4', quant: null })],
     warnings: [],
     dir: '/models',
+    host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
   };
   // Three visible entries, matching the served catalog — one of them the default.
   const catalog: CatalogResponse = {
@@ -171,6 +179,7 @@ function modelsRoutes(): Record<string, unknown> {
         installed: false,
         present: false,
         blockedByForeignDir: false,
+        blocker: null,
         localRevision: null,
         localAssetsRepo: null,
         localAssetsRevision: null,
@@ -184,6 +193,7 @@ function modelsRoutes(): Record<string, unknown> {
         installed: false,
         present: false,
         blockedByForeignDir: false,
+        blocker: null,
         localRevision: null,
         localAssetsRepo: null,
         localAssetsRevision: null,
@@ -197,6 +207,7 @@ function modelsRoutes(): Record<string, unknown> {
         installed: false,
         present: false,
         blockedByForeignDir: false,
+        blocker: null,
         localRevision: null,
         localAssetsRepo: null,
         localAssetsRevision: null,
@@ -207,41 +218,36 @@ function modelsRoutes(): Record<string, unknown> {
   return { '/models': models, '/catalog': catalog, '/catalog/updates': { items: [] }, '/downloads': downloads };
 }
 
+const MODEL_HEADS = ['Model', 'Family', 'Quant', 'Context', 'Size', 'Activity (30 d)', 'Decode', 'Last used', ''];
+
 describe('Models page — the loading tree holds the loaded page’s box', () => {
+  function page(): ReactElement {
+    return createElement(MemoryRouter, null, createElement(Models));
+  }
+
   /**
    * The regression guard for the whole class. A header rendered by only one of
    * the two branches is 40px that appears the instant the request lands, and it
    * takes every row below it along.
    */
   it('renders the same column headers while loading as it does when loaded', async () => {
-    const { loading, loaded } = await shapesAcrossLoad(createElement(Models), modelsRoutes(), (text) =>
-      text.includes('qwen3-8b'),
-    );
+    const { loading, loaded } = await shapesAcrossLoad(page(), modelsRoutes(), (text) => text.includes('qwen3-8b'));
     expect(loading.skeletons).toBeGreaterThan(0);
-    expect(loaded.heads).toEqual(['Name', 'Family', 'Quantization', 'Size', 'Context', '']);
+    expect(loaded.heads).toEqual(MODEL_HEADS);
     expect(loading.heads).toEqual(loaded.heads);
   });
 
-  it('gives every placeholder row the cells a real row has', async () => {
-    // A skeleton row one cell short would let the fixed-width action column
-    // collapse and pull the whole grid sideways when the rows arrive.
-    const { loading, loaded } = await shapesAcrossLoad(createElement(Models), modelsRoutes(), (text) =>
-      text.includes('qwen3-8b'),
-    );
-    expect(loading.skeletons).toBeGreaterThan(0);
-    expect(new Set(loaded.rowWidths)).toEqual(new Set([6]));
+  it('gives every placeholder row the cells a real row has, one placeholder each, under a busy table', async () => {
+    const { loading, loaded } = await shapesAcrossLoad(page(), modelsRoutes(), (text) => text.includes('qwen3-8b'));
+    expect(loading.busy).toBe('true');
+    expect(loaded.busy).not.toBe('true');
+    expect(new Set(loaded.rowWidths)).toEqual(new Set([MODEL_HEADS.length]));
     expect(new Set(loading.rowWidths)).toEqual(new Set(loaded.rowWidths));
+    expect(new Set(loading.cellPlaceholders.flat())).toEqual(new Set([1]));
   });
 
-  /**
-   * The catalog grid's own version of the defect: three fixed-height blocks
-   * stood in for cards whose height comes from their padding, their title line,
-   * their description line and their button. Building the placeholder from the
-   * same `Card` wrappers is what makes the two heights the same expression
-   * rather than a number someone measured once.
-   */
-  it('builds the recommended-models placeholders out of real cards', async () => {
-    const { loading, loaded } = await shapesAcrossLoad(createElement(Models), modelsRoutes(), (text) =>
+  it('builds the recommended-models placeholders out of the same panels', async () => {
+    const { loading, loaded } = await shapesAcrossLoad(page(), modelsRoutes(), (text) =>
       text.includes('Qwen-AgentWorld-35B-A3B'),
     );
     expect(loading.skeletons).toBeGreaterThan(0);
@@ -253,6 +259,7 @@ describe('Models page — the loading tree holds the loaded page’s box', () =>
 function sessionRow(overrides: Partial<SessionRow>): SessionRow {
   return {
     id: '019a0000-0000-7000-8000-000000000001',
+    origin: 'agent',
     title: 'Refactor the planner',
     cwd: '/work/mlx-node',
     model: 'qwen3.8-27b',
@@ -295,25 +302,14 @@ describe('Sessions page — the loading tree holds the loaded page’s box', () 
     expect(loading.heads).toEqual(loaded.heads);
   });
 
-  it('gives every placeholder row the cells a real row has', async () => {
-    // `table-fixed` with percentage widths: the header solves the grid, and a
-    // short placeholder row would be laid out differently from a real one.
+  it('gives every placeholder row the cells a real row has, one placeholder each, under a busy table', async () => {
     const { loading, loaded } = await shapesAcrossLoad(page(), sessionsRoutes(), (text) =>
       text.includes('Refactor the planner'),
     );
-    expect(loading.skeletons).toBeGreaterThan(0);
+    expect(loading.busy).toBe('true');
+    expect(loaded.busy).not.toBe('true');
     expect(new Set(loaded.rowWidths)).toEqual(new Set([8]));
     expect(new Set(loading.rowWidths)).toEqual(new Set(loaded.rowWidths));
-  });
-
-  it('gives each placeholder cell its loaded cell’s classes', async () => {
-    const cellClasses = (container: HTMLElement): string[] =>
-      [...(container.querySelector('tbody tr')?.querySelectorAll('td') ?? [])].map((td) => td.className);
-    restoreApi = stubApi(sessionsRoutes());
-    mounted = await renderPage(page(), () => true);
-    const loading = cellClasses(mounted.container);
-    expect(mounted.container.querySelectorAll('[data-slot="skeleton"]').length).toBeGreaterThan(0);
-    await walkToLoaded(mounted, (text) => text.includes('Refactor the planner'));
-    expect(loading).toEqual(cellClasses(mounted.container));
+    expect(new Set(loading.cellPlaceholders.flat())).toEqual(new Set([1]));
   });
 });

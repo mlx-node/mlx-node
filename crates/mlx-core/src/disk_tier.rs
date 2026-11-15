@@ -1,4 +1,4 @@
-//! A loaded model's SSD cache tier for its DFlash2 states and their KV
+//! A loaded model's SSD cache tier for its stored states and their KV
 //! chains (Splash `openDiskTier`, `DiskSpace`, `CacheDirectory`).
 //!
 //! Temporary by default: a locked directory under the temp root that the
@@ -214,6 +214,8 @@ thread_local! {
     /// opens take.
     pub(crate) static TEST_WRITER: std::cell::Cell<Option<(usize, u64)>> =
         const { std::cell::Cell::new(None) };
+    /// The [`DiskTier::measure`] calls this thread made.
+    pub(crate) static MEASURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The writer's queue depth and its free-space reserve over a volume whose
@@ -467,6 +469,8 @@ impl DiskTier {
     /// stops counting, and while this tier and the others hold more than
     /// the limit the oldest other goes.
     pub(crate) fn measure(&self) {
+        #[cfg(test)]
+        MEASURES.with(|count| count.set(count.get() + 1));
         let mut others = self
             .others
             .lock()
@@ -497,9 +501,54 @@ impl DiskTier {
         }
     }
 
+    /// The namespace directory a persistent tier holds until its close;
+    /// `None` for a temporary tier and after the close.
+    pub(crate) fn open_namespace(&self) -> Option<String> {
+        let hold = self
+            .hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        matches!(*hold, Some(TierHold::Persistent { .. })).then(|| self.namespace.clone())
+    }
+
+    /// `remove` while this tier still holds its directory, under the same
+    /// lock its close takes: after a close this process removes nothing from
+    /// a directory another process may hold by then.
+    pub(crate) fn while_held<R>(&self, remove: impl FnOnce() -> R) -> Option<R> {
+        let hold = self
+            .hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hold.is_some().then(remove)
+    }
+
     #[cfg(test)]
     pub(crate) fn dir(&self) -> PathBuf {
         self.manager.root().to_path_buf()
+    }
+}
+
+/// What a model's napi object keeps of its state tier: a weak handle, so the
+/// tier goes with the model thread's state.
+#[derive(Clone, Default)]
+pub(crate) struct TierHandle(Option<std::sync::Weak<DiskTier>>);
+
+impl TierHandle {
+    pub(crate) fn of(tier: Option<&Arc<DiskTier>>) -> Self {
+        Self(tier.map(Arc::downgrade))
+    }
+
+    /// [`DiskTier::open_namespace`] while the tier lives.
+    pub(crate) fn namespace(&self) -> Option<String> {
+        self.0.as_ref()?.upgrade()?.open_namespace()
+    }
+
+    /// [`DiskTier::is_open`] while the tier lives.
+    pub(crate) fn is_open(&self) -> bool {
+        self.0
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|tier| tier.is_open())
     }
 }
 

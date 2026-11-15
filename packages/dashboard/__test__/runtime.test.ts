@@ -4,7 +4,7 @@
  */
 
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { MessageChannel } from 'node:worker_threads';
 
@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 import type { MainApiContext, WorkerApiContext } from '../src/api/context.js';
 import { dispatchMain, dispatchWorker, routeThreadFor } from '../src/api/dispatch.js';
 import { ROUTES } from '../src/api/routes.js';
+import type { LiveEvent } from '../src/live.js';
 import { createRpcClient } from '../src/rpc/client.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
@@ -73,6 +74,7 @@ beforeEach(() => {
 
   order = [];
   runtime = createDashboardRuntime({
+    chat: { tempRoots: [] },
     dbPath: ':memory:',
     tracesDir,
     modelsDir,
@@ -123,12 +125,12 @@ describe('dashboard runtime — call', () => {
   it('answers an API call with the route body, no socket involved', async () => {
     const res = await runtime.call({ method: 'GET', path: '/api/health' });
     expect(res.status).toBe(200);
-    expect(res.ok ? res.body : null).toMatchObject({ status: 'ok', tracesDir, modelsDir });
+    expect(res.ok ? res.body : null).toMatchObject({ status: 'ok', tracesDir, modelsDir, homeDir: homedir() });
   });
 
   it('parses the query string off the path', async () => {
     await runtime.ingestNow();
-    const res = await runtime.call({ method: 'GET', path: '/api/metrics/overview?from=0&to=10' });
+    const res = await runtime.call({ method: 'GET', path: '/api/metrics/summary?from=0&to=10' });
     expect(res.ok).toBe(true);
     const body = res.ok ? (res.body as { range: { from: number | null; to: number | null } }) : null;
     expect(body?.range).toEqual({ from: 0, to: 10 });
@@ -153,6 +155,33 @@ describe('dashboard runtime — call', () => {
 // events. Asserting SETTLE ORDER rather than a duration keeps it deterministic —
 // a transport-thread route is answered in microtasks, so it cannot lose to a
 // cross-thread round trip, let alone one queued behind a 120-file ingest.
+describe('dashboard runtime — coding agents sandbox', () => {
+  it('looks up instruction files under the home it was given, never the real one', async () => {
+    const home = join(base, 'home');
+    const sandboxed = createDashboardRuntime({
+      chat: { tempRoots: [] },
+      dbPath: ':memory:',
+      tracesDir,
+      modelsDir,
+      codingAgents: { home, env: {} },
+    });
+    try {
+      const response = await sandboxed.call({
+        method: 'POST',
+        path: '/api/coding-agents',
+        body: { action: 'refresh' },
+      });
+      expect(response.ok).toBe(true);
+      const agents = (response as { body: { agents: { id: string; path: string }[] } }).body.agents;
+      expect(agents.map((agent) => agent.id)).toEqual(['claude', 'codex', 'grok']);
+      for (const agent of agents) expect(agent.path.startsWith(`${home}/`)).toBe(true);
+      expect(agents.find((agent) => agent.id === 'claude')?.path).toBe(join(home, '.claude', 'CLAUDE.md'));
+    } finally {
+      await sandboxed.close();
+    }
+  });
+});
+
 describe('dashboard runtime — thread split', () => {
   it('answers a transport-thread route while the worker is busy ingesting', async () => {
     const settled: string[] = [];
@@ -173,7 +202,7 @@ describe('dashboard runtime — thread split', () => {
 
   it('answers a transport-thread route before the worker has even booted', async () => {
     // A cancel click during startup must not wait for the database to open.
-    const fresh = createDashboardRuntime({ dbPath: ':memory:', tracesDir, modelsDir });
+    const fresh = createDashboardRuntime({ chat: { tempRoots: [] }, dbPath: ':memory:', tracesDir, modelsDir });
     try {
       const settled: string[] = [];
       const boot = fresh.call({ method: 'GET', path: '/api/health' }).then(() => settled.push('worker'));
@@ -203,6 +232,24 @@ describe('dashboard runtime — route ownership', () => {
       'POST /api/downloads',
       'DELETE /api/downloads/:id',
       'GET /api/downloads/:id/events',
+      'GET /api/runtime/live',
+      'GET /api/chat/state',
+      'POST /api/chat/conversations',
+      'POST /api/chat/conversations/:id/prompt',
+      'POST /api/chat/conversations/:id/cancel',
+      'POST /api/chat/conversations/:id/interactions/:iid',
+      'POST /api/chat/conversations/:id/permission-mode',
+      'POST /api/chat/drafts/:draft/permission-mode',
+      'GET /api/chat/work/hooks',
+      'PATCH /api/chat/conversations/:id',
+      'DELETE /api/chat/conversations/:id',
+      'POST /api/chat/agent',
+      'POST /api/chat/engine/unload',
+      'GET /api/providers',
+      'PUT /api/providers/selection',
+      'PUT /api/providers/:id/key',
+      'DELETE /api/providers/:id/key',
+      'POST /api/providers/:id/validate',
     ]);
   });
 
@@ -228,6 +275,40 @@ describe('dashboard runtime — route ownership', () => {
     const downloadOnWorker = await dispatchWorker(workerCtx, { method: 'GET', pathname: '/api/downloads', query });
     expect(downloadOnWorker.status).toBe(500);
     expect(downloadOnWorker.ok ? '' : downloadOnWorker.message).toContain('owned by the main thread');
+  });
+});
+
+describe('dashboard runtime — live', () => {
+  it('the periodic ingest emits a data event when it wrote records', async () => {
+    const liveBase = join(base, 'live');
+    const liveTraces = join(liveBase, 'traces');
+    mkdirSync(liveTraces, { recursive: true });
+    const periodic = createDashboardRuntime({
+      chat: { tempRoots: [] },
+      dbPath: ':memory:',
+      tracesDir: liveTraces,
+      modelsDir,
+      supervisorPath: join(liveBase, 'supervisor.json'),
+      ingestIntervalMs: 50,
+    });
+    try {
+      await periodic.ingestNow();
+      const events: LiveEvent[] = [];
+      const stop = periodic.watchLive((event) => events.push(event));
+      writeFileSync(
+        join(liveTraces, '2026-11-10-1.jsonl'),
+        `${JSON.stringify({ v: 2, traceId: 'live-1', ts: 1, model: 'm', outcome: 'ok' })}\n`,
+      );
+      const deadline = Date.now() + 5000;
+      while (!events.some((e) => e.type === 'data') && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      stop();
+      const data = events.find((e) => e.type === 'data');
+      expect(data).toMatchObject({ type: 'data', traces: true, runtime: false });
+    } finally {
+      await periodic.close();
+    }
   });
 });
 
@@ -271,10 +352,10 @@ describe('dashboard runtime — shutdown', () => {
     for (let i = 0; i < 5; i++) void runtime.ingestNow();
     // Awaiting one more ingestNow drains every segment queued before it.
     await runtime.ingestNow();
-    const res = await runtime.call({ method: 'GET', path: '/api/metrics/overview' });
+    const res = await runtime.call({ method: 'GET', path: '/api/metrics/summary' });
     expect(res.ok).toBe(true);
-    const body = res.ok ? (res.body as { totals: { traces: number } }) : null;
-    expect(body?.totals.traces).toBe(TRACE_FILE_COUNT);
+    const body = res.ok ? (res.body as { totals: { turns: number } }) : null;
+    expect(body?.totals.turns).toBe(TRACE_FILE_COUNT);
   });
 
   // Downloads must drain BEFORE anything else tears down: a shutdown that killed
@@ -309,6 +390,7 @@ describe('dashboard runtime — shutdown', () => {
 describe('dashboard runtime — worker death', () => {
   it('settles an in-flight call when the worker dies under it', async () => {
     const crashed = createDashboardRuntime({
+      chat: { tempRoots: [] },
       dbPath: ':memory:',
       tracesDir,
       modelsDir,
@@ -322,13 +404,13 @@ describe('dashboard runtime — worker death', () => {
       expect(res.ok).toBe(false);
       expect(res.ok ? '' : res.code).toBe('E_UNAVAILABLE');
 
-      // And a call issued after the death fails fast rather than queueing onto a
-      // thread that will never read it.
+      // A call issued after the death goes to the replacement worker (this
+      // fixture dies again) and settles typed rather than hanging.
       const after = await withDeadline(crashed.call({ method: 'GET', path: '/api/models' }), 10_000);
       expect(after).not.toBe('HUNG');
       expect((after as Exclude<typeof after, 'HUNG'>).status).toBe(503);
 
-      expect(order).toContain('worker-down');
+      expect(order).toContain('worker-restarted');
       // A transport-thread route is untouched by the worker's death.
       const downloads = await crashed.call({ method: 'GET', path: '/api/downloads' });
       expect(downloads.status).toBe(200);
@@ -339,6 +421,7 @@ describe('dashboard runtime — worker death', () => {
 
   it('rejects an unconfirmed drain and still closes on a bounded timeout', async () => {
     const wedged = createDashboardRuntime({
+      chat: { tempRoots: [] },
       dbPath: ':memory:',
       tracesDir,
       modelsDir,
@@ -403,8 +486,12 @@ describe('dashboard runtime — worker death', () => {
       dbPath: ':memory:',
       modelsDir,
       tracesDir,
+      runtimeDir: join(base, 'runtime'),
       cacheRoot: undefined,
+      prefixCacheRoot: undefined,
       agentHome: join(base, 'agent'),
+      chatAgentHome: join(base, 'chat', 'chat-agent'),
+      chatIndexPath: join(base, 'chat', 'conversations.json'),
     });
 
     try {
@@ -421,11 +508,11 @@ describe('dashboard runtime — worker death', () => {
 
       // No cancellation acknowledgement and no real response means the worker
       // cannot remain alive after the caller is failed: it could otherwise
-      // execute the queued mutation later.
-      const down = lifecycle.find((event) => event.type === 'worker-down');
-      expect(down).toMatchObject({ type: 'worker-down' });
-      expect(down?.type === 'worker-down' ? down.reason : '').toContain('cancellation outcome');
-      expect(down?.type === 'worker-down' ? down.reason : '').toContain('remained unknown');
+      // execute the queued mutation later. It is replaced, not left down.
+      expect(lifecycle.find((event) => event.type === 'worker-restarted')).toMatchObject({
+        type: 'worker-restarted',
+        reason: 'no-ack',
+      });
       expect(await withDeadline(client.call({ method: 'GET', path: '/api/models' }), 5_000)).not.toBe('HUNG');
     } finally {
       expect(await withDeadline(client.close(), 10_000)).not.toBe('HUNG');
@@ -458,8 +545,12 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       dbPath: ':memory:',
       modelsDir,
       tracesDir,
+      runtimeDir: join(base, 'runtime'),
       cacheRoot: undefined,
+      prefixCacheRoot: undefined,
       agentHome: join(base, 'agent'),
+      chatAgentHome: join(base, 'chat', 'chat-agent'),
+      chatIndexPath: join(base, 'chat', 'conversations.json'),
     });
   }
 
@@ -546,8 +637,12 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       dbPath: ':memory:',
       modelsDir,
       tracesDir,
+      runtimeDir: join(base, 'runtime'),
       cacheRoot: undefined,
+      prefixCacheRoot: undefined,
       agentHome: join(base, 'agent'),
+      chatAgentHome: join(base, 'chat', 'chat-agent'),
+      chatIndexPath: join(base, 'chat', 'conversations.json'),
     });
 
     try {
@@ -600,10 +695,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
     // expires before the fresh worker can finish its boot ingest and reach the
     // queued DELETE. This is the renderer's shorter deadline racing the worker's
     // independent 60 s deadline — the production defect, end to end.
-    const renderer = createRpcClient(bindEventTargetPort(port1), {
-      timeoutMs: 0,
-      onUnresponsive: () => port2.close(),
-    });
+    const renderer = createRpcClient(bindEventTargetPort(port1), { timeoutMs: 0 });
 
     try {
       const res = await withDeadline(renderer.call({ method: 'DELETE', path: '/api/models/rt-2' }), 10_000);

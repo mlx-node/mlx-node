@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vite-plus/test';
 
-import { isBonsaiPq2GgufName, isGgufCompanionName, isQwen35XlGgufName, parseGgufFileName } from '../src/gguf-name.js';
+import {
+  ggufSplitPartNames,
+  isBonsaiPq2GgufName,
+  isGgufCompanionName,
+  isQwen35XlGgufName,
+  parseGgufFileName,
+} from '../src/gguf-name.js';
 
 describe('parseGgufFileName', () => {
   it('reads a llama.cpp split name, keeping the folder in the stem', () => {
@@ -34,6 +40,42 @@ describe('parseGgufFileName', () => {
   it('rejects non-GGUF paths', () => {
     expect(parseGgufFileName('model.safetensors')).toBeUndefined();
     expect(parseGgufFileName('.gguf')).toBeUndefined();
+  });
+});
+
+describe('ggufSplitPartNames', () => {
+  const set = ['M-00001-of-00003.gguf', 'M-00002-of-00003.gguf', 'M-00003-of-00003.gguf'];
+
+  it('names every part of a complete set in part order, and ignores other files', () => {
+    const folder = [...set].reverse().concat(['M-00001-of-00002.gguf', 'mmproj-F16.gguf', 'm-00002-of-00003.txt']);
+    expect(ggufSplitPartNames('M-00001-of-00003.gguf', folder)).toEqual(set);
+    expect(ggufSplitPartNames('M-00001-of-00002.GGUF', ['M-00001-of-00002.GGUF', 'M-00002-of-00002.Gguf'])).toEqual([
+      'M-00001-of-00002.GGUF',
+      'M-00002-of-00002.Gguf',
+    ]);
+  });
+
+  it('names the file alone when it is not a split set', () => {
+    expect(ggufSplitPartNames('M-Q4_K_M.gguf', [])).toEqual(['M-Q4_K_M.gguf']);
+    expect(ggufSplitPartNames('M-00001-of-00001.gguf', [])).toEqual(['M-00001-of-00001.gguf']);
+  });
+
+  it('gives nothing for a set the loader cannot open', () => {
+    expect(ggufSplitPartNames('M-00001-of-00003.gguf', ['M-00001-of-00003.gguf'])).toBeUndefined();
+    expect(ggufSplitPartNames('M-00001-of-00003.gguf', set.slice(0, 2))).toBeUndefined();
+    expect(ggufSplitPartNames('M-00001-of-00003.gguf', [...set, 'M-00002-of-00003.GGUF'])).toBeUndefined();
+    expect(ggufSplitPartNames('M-00002-of-00003.gguf', set)).toBeUndefined();
+    expect(
+      ggufSplitPartNames('M-00001-OF-00002.gguf', ['M-00001-OF-00002.gguf', 'M-00002-OF-00002.gguf']),
+    ).toBeUndefined();
+    expect(
+      ggufSplitPartNames('M-00001-OF-00002.gguf', ['M-00001-OF-00002.gguf', 'M-00002-of-00002.gguf']),
+    ).toBeUndefined();
+    expect(ggufSplitPartNames('M-00001-of-00002.gguf', ['M-00001-of-00002.gguf', 'm-00002-of-00002.gguf'])).toBe(
+      undefined,
+    );
+    expect(ggufSplitPartNames('M-00001-of-01025.gguf', [])).toBeUndefined();
+    expect(ggufSplitPartNames('model.safetensors', [])).toBeUndefined();
   });
 });
 

@@ -80,7 +80,8 @@ import { createHash, createHmac, randomBytes } from 'node:crypto';
 import type { ChatConfig } from '@mlx-node/core';
 import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
 
-import { TurnTraceModel, type TurnTraceDeps } from './turn-trace.js';
+import { noteQueueRejection } from './queue-rejections.js';
+import { TurnTraceModel, type LiveTurn, type ModelIdentity, type TurnTraceDeps } from './turn-trace.js';
 
 /**
  * Tier-2 `prompt_cache_key` reuse is **ON by default** so the server
@@ -350,7 +351,11 @@ export interface SessionRegistryOptions {
    * on the model. Production callers leave it unset — the defaults read the
    * native cold-tier counters and write to the standard trace directory.
    */
-  traceDeps?: Omit<TurnTraceDeps, 'modelName'>;
+  traceDeps?: Omit<TurnTraceDeps, 'modelName' | 'identity' | 'ctxWindow'>;
+  /** Identity of the model this binding was created for; stamped on its traces. */
+  identity?: ModelIdentity;
+  /** The served window the model registry read once for this binding; stamped on its traces. */
+  servedWindowTokens?: number;
 }
 
 /**
@@ -459,6 +464,11 @@ function nowSec(): number {
 
 export class SessionRegistry {
   private readonly model: SessionCapableModel;
+  private readonly traced: TurnTraceModel;
+  /** Identity of the model this binding was created for. */
+  readonly identity: ModelIdentity | undefined;
+  /** The served window of this binding, when the model publishes one. */
+  readonly servedWindowTokens: number | undefined;
   private readonly ttlSec: number;
   private readonly maxQueueDepth: number | undefined;
   private readonly maxConcurrentDispatches: number;
@@ -556,13 +566,23 @@ export class SessionRegistry {
   private activeAdmissions = 0;
   /** FIFO waiters parked behind the continuous-batching admission limit. */
   private readonly admissionWaiters: Array<() => void> = [];
+  /** An idle native probe in flight; both lanes hold `fn` until it settles. */
+  private idleProbe: Promise<void> | null = null;
 
   constructor(opts: SessionRegistryOptions) {
     // Wrap the model ONCE so every `ChatSession` this registry allocates
     // (warm slot, tier-2 hit, `createFreshSession`) dispatches through the
     // per-turn trace recorder. This is the one funnel every serve-path turn
     // — `/v1/responses` and `/v1/messages`, streaming or not — shares.
-    this.model = new TurnTraceModel(opts.model, { ...opts.traceDeps, modelName: opts.modelName });
+    this.traced = new TurnTraceModel(opts.model, {
+      ...opts.traceDeps,
+      modelName: opts.modelName,
+      identity: opts.identity,
+      ctxWindow: opts.servedWindowTokens,
+    });
+    this.model = this.traced;
+    this.identity = opts.identity;
+    this.servedWindowTokens = opts.servedWindowTokens;
     this.ttlSec = opts.ttlSec ?? 1800;
     this.maxQueueDepth = opts.maxQueueDepth;
     const requestedConcurrency = opts.maxConcurrentDispatches ?? 1;
@@ -687,6 +707,48 @@ export class SessionRegistry {
     return this.maxConcurrentDispatches;
   }
 
+  /** Dispatches currently inside the admission lane (running, not queued). */
+  get activeDispatches(): number {
+    if (this.maxConcurrentDispatches > 1) return this.activeAdmissions;
+    return this.execLock === this.initialLock ? 0 : 1;
+  }
+
+  /**
+   * Run `call` only while no dispatch is active, queued or pre-dispatch, and hold every dispatch that
+   * enters a lane meanwhile until it settles. A native barrier command (scheduler stats) sent from
+   * an idle check alone can reach the model thread after a racing turn and stall admission behind it.
+   * Returns null without calling when the model is not idle.
+   */
+  tryIdleProbe<T>(call: () => Promise<T>): Promise<T> | null {
+    if (
+      this.idleProbe !== null ||
+      this.activeDispatches !== 0 ||
+      this.queuedCount !== 0 ||
+      this.preDispatchAdmits !== 0
+    )
+      return null;
+    const request = call();
+    const gate: Promise<void> = request
+      .then(
+        () => {},
+        () => {},
+      )
+      .finally(() => {
+        if (this.idleProbe === gate) this.idleProbe = null;
+      });
+    this.idleProbe = gate;
+    return request;
+  }
+
+  /** Turns of this model in native flight. */
+  liveTurns(): LiveTurn[] {
+    return this.traced.liveTurns();
+  }
+
+  turnStats(): { live: number; begun: number; lastSettleAt: number } {
+    return this.traced.turnStats();
+  }
+
   /**
    * Outstanding pre-dispatch permits — requests admitted by
    * {@link beginPreDispatchAdmission} that have neither handed their
@@ -728,10 +790,9 @@ export class SessionRegistry {
    */
   private assertAdmissionCapacity(): void {
     if (this.maxQueueDepth === undefined) return;
-    const activeDispatches =
-      this.maxConcurrentDispatches > 1 ? this.activeAdmissions : this.execLock === this.initialLock ? 0 : 1;
-    const footprint = activeDispatches + this.queuedCount + this.preDispatchAdmits;
+    const footprint = this.activeDispatches + this.queuedCount + this.preDispatchAdmits;
     if (footprint >= this.maxQueueDepth + this.maxConcurrentDispatches) {
+      noteQueueRejection('chat');
       throw new QueueFullError(this.queuedCount, this.preDispatchAdmits, this.maxQueueDepth);
     }
   }
@@ -1317,6 +1378,7 @@ export class SessionRegistry {
   private async _runAdmission<T>(acquired: Promise<void>, fn: () => Promise<T>): Promise<T> {
     await acquired;
     try {
+      while (this.idleProbe !== null) await this.idleProbe;
       return await fn();
     } finally {
       this.activeAdmissions -= 1;
@@ -1364,6 +1426,7 @@ export class SessionRegistry {
           waitingDecremented = true;
         }
       }
+      while (this.idleProbe !== null) await this.idleProbe;
       return await fn();
     } finally {
       // Belt-and-suspenders: if `await prev` managed to throw before

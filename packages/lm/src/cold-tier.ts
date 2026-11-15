@@ -53,6 +53,8 @@ import { MODEL_FAMILY_DATA } from './family-data.js';
  *
  * `qwen3_5` / `qwen3_5_moe` are not in it: like Splash, their SSD tier holds
  * DFlash2 states, not per-turn KV, so a KV chain alone never backs a prefix.
+ * Nor is `qwen4_exp`: its prefix states and their chains live in the model's
+ * own tier ({@link COLD_TIER_STATE_FAMILIES}).
  *
  * Widening this set is a correctness decision, never a perf one, and it is
  * authorized by exactly one thing: the family's native restart-parity gate
@@ -62,9 +64,10 @@ import { MODEL_FAMILY_DATA } from './family-data.js';
  * set, not to one of them: it is a SINGLE process-wide boolean, written to
  * `MLX_PERSIST_PAGED_CACHE` before any load (`@mlx-node/server/host/persist-cache`).
  * The same switch makes the `qwen3_5` / `qwen3_5_moe` SSD state tier
- * persistent. Families off the allowlist never persist — not because the
- * flag spares them, but because `cold_tier::resolve_persist_cold` refuses
- * them under ANY setting. The help text says so in exactly one place, built
+ * persistent, and turns the `qwen4_exp` one on. No family off the allowlist
+ * persists through the cold tier — not because the flag spares them, but
+ * because `cold_tier::resolve_persist_cold` refuses them under ANY setting.
+ * The help text says so in exactly one place, built
  * from {@link coldTierRestoreFamilyList} in
  * `packages/cli/src/commands/agent/index.ts` and asserted by
  * `packages/cli/__test__/agent-cmd.test.ts`.
@@ -72,6 +75,17 @@ import { MODEL_FAMILY_DATA } from './family-data.js';
 export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType>(
   MODEL_FAMILY_DATA.filter((row) => 'coldRestoreEligible' in row).map((row) => row.id),
 );
+
+/**
+ * Model families whose disk cache is the model's own SSD state tier
+ * (`disk_tier.rs`), not the process cold tier above: their turns never touch
+ * `coldCacheStats()`.
+ */
+export const COLD_TIER_STATE_FAMILIES: ReadonlySet<string> = new Set<ModelType>([
+  'qwen3_5',
+  'qwen3_5_moe',
+  'qwen4_exp',
+]);
 
 /** Allowlisted families in a stable, human-facing order (help text, API payload). */
 export function coldTierRestoreFamilyList(): string[] {

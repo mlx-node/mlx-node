@@ -39,7 +39,7 @@ use crate::vision::qwen::processing::QwenImageProcessor;
 
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
-use super::model::{Qwen3_5MoeModel, Qwen35MoeInner, Qwen35MoeSchedulerState};
+use super::model::{Qwen3_5MoeModel, Qwen35MoeInner};
 use super::switch_glu::SwitchGLU;
 use crate::models::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
@@ -104,43 +104,11 @@ pub(crate) fn sanitize_weights(
             || k.contains("model.layers.0.mlp.experts.0.up_proj.weight")
     });
 
-    // MTP-norm robustness probe. The `mtp.*` bypass below keeps MTP norms in
-    // final (already +1.0-shifted) form, on the assumption that `mlx convert`
-    // applied that shift. A RAW (unconverted) HF checkpoint never went through
-    // convert, so its MTP norms are still in deviation-from-1 form (~0); loading
-    // it directly leaves them un-shifted → the draft head sees ~0 RMSNorm
-    // weights → garbage logits → 0 accepted tokens. Because `enableMtp`
-    // auto-defaults ON for any checkpoint with MTP heads, that turns into a
-    // silent *slowdown* (draft cost with no accepts). Replicate convert's
-    // independent MTP-norm probe (`convert.rs` `is_mtp_norm` /
-    // `mtp_norms_need_shift`): if the sampled MTP norm sits near 0, shift the
-    // seven MTP norm tensors by +1.0 at load. A converted checkpoint reads
-    // near 1 → no shift → byte-identical to today. Note `mtp.norm` and the two
-    // `pre_fc_norm_*` tensors match none of `norm_suffixes`, so they need this
-    // dedicated set (the `is_mtp_norm` closure itself lives in
-    // `normalize_moe_weight_map`, where it is applied per renamed key).
-    let mtp_norms_need_shift = match params
-        .iter()
-        .find(|(k, _)| k.ends_with("mtp.layers.0.input_layernorm.weight"))
-    {
-        Some((_, v)) => {
-            let f32_v = v.astype(DType::Float32)?;
-            let m = f32_v.mean(None, None)?;
-            m.eval();
-            let mean = m.item_at_float32(0).unwrap_or(1.0);
-            let need = mean < 0.5;
-            if need {
-                warn!(
-                    "Qwen3.5-MoE: raw (unconverted) MTP norms detected (mean={:.4} ≈ 0); \
-                     applying +1.0 shift at load so the MTP draft head functions. \
-                     Prefer running `mlx convert` on the checkpoint.",
-                    mean
-                );
-            }
-            need
-        }
-        None => false,
-    };
+    // The `mtp.*` bypass below keeps MTP norms as stored, so raw (γ−1) MTP
+    // norms get the +1.0 here; the seven tensors are matched by `is_mtp_norm`
+    // in `normalize_moe_weight_map`.
+    let mtp_norms_need_shift =
+        crate::models::qwen3_5::persistence::mtp_norms_need_shift(&params, "Qwen3.5-MoE")?;
 
     // Declarative key rewrite — drop visual-encoder weights (for VL models),
     // strip the wrapper prefixes via the shared longest-first chain (keeps
@@ -1799,6 +1767,35 @@ pub async fn load_with_thread(
         None,
         crate::engine::scheduler::DEFAULT_DECODE_SHARE,
         crate::disk_tier::DiskTierOptions::default(),
+        crate::engine::load_progress::LoadProgressCell::detached(),
+    )
+    .await
+}
+
+/// [`load_with_thread`] for a tool that drives the model directly (`mlx
+/// eval`, FP8 calibration): no load warm-up, since no scheduled turn runs.
+pub async fn load_for_tool(
+    model_path: &str,
+    kv_format: Option<crate::transformer::KvFormat>,
+) -> Result<Qwen3_5MoeModel> {
+    load_tool_source(&CheckpointSource::Dir(PathBuf::from(model_path)), kv_format).await
+}
+
+/// The caller releases `source`'s lease when this fails.
+pub(crate) async fn load_tool_source(
+    source: &CheckpointSource,
+    kv_format: Option<crate::transformer::KvFormat>,
+) -> Result<Qwen3_5MoeModel> {
+    load_with_source_impl(
+        source,
+        None,
+        kv_format,
+        None,
+        None,
+        crate::engine::scheduler::DEFAULT_DECODE_SHARE,
+        crate::disk_tier::DiskTierOptions::default(),
+        false,
+        crate::engine::load_progress::LoadProgressCell::detached(),
     )
     .await
 }
@@ -1836,6 +1833,33 @@ pub(crate) async fn load_with_source(
     max_context: Option<u32>,
     decode_share: f64,
     disk: crate::disk_tier::DiskTierOptions,
+    progress: Arc<crate::engine::load_progress::LoadProgressCell>,
+) -> Result<Qwen3_5MoeModel> {
+    load_with_source_impl(
+        source,
+        draft_model_path,
+        kv_format,
+        max_memory_bytes,
+        max_context,
+        decode_share,
+        disk,
+        true,
+        progress,
+    )
+    .await
+}
+
+/// `warm`: the load serves chat turns and warms up first.
+async fn load_with_source_impl(
+    source: &CheckpointSource,
+    draft_model_path: Option<String>,
+    kv_format: Option<crate::transformer::KvFormat>,
+    max_memory_bytes: Option<u64>,
+    max_context: Option<u32>,
+    decode_share: f64,
+    disk: crate::disk_tier::DiskTierOptions,
+    warm: bool,
+    progress: Arc<crate::engine::load_progress::LoadProgressCell>,
 ) -> Result<Qwen3_5MoeModel> {
     // Snapshot once, before spawning; forward/compiled graphs never read this
     // diagnostic setting and another load cannot change an existing model.
@@ -2323,11 +2347,13 @@ pub(crate) async fn load_with_source(
             }
 
             let model_id = inner.model_id;
+            let state_tier = inner.dflash2_states.tier_handle();
             let config_out = inner.config.clone();
             let image_processor = inner.image_processor.as_ref().map(Arc::clone);
             let spatial_merge_size = inner.spatial_merge_size.unwrap_or(2);
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
+            let scheduled_lanes = inner.scheduled_lanes();
             let mtp_active = inner.dflash2.is_some() || inner.has_mtp_weights();
             let vision_active = super::model::qwen35_moe_vision_active(
                 inner.vision_encoder.is_some(),
@@ -2344,9 +2370,10 @@ pub(crate) async fn load_with_source(
                 crate::stream::WiredResidency::working_set_minus_pools,
             ));
             let context_limits = inner.finish_load_limits()?;
+            let (state, warmup) = crate::engine::warmup::serving_scheduler(inner, &progress, warm)?;
 
             Ok((
-                Qwen35MoeSchedulerState::new(inner)?,
+                state,
                 (
                     config_out,
                     model_id,
@@ -2356,9 +2383,12 @@ pub(crate) async fn load_with_source(
                     cache_limit_guard,
                     pool_cache_limit_guard,
                     paged_active,
+                    scheduled_lanes,
                     mtp_active,
                     vision_active,
                     context_limits,
+                    warmup,
+                    state_tier,
                 ),
             ))
         },
@@ -2374,9 +2404,12 @@ pub(crate) async fn load_with_source(
         cache_limit_guard,
         pool_cache_limit_guard,
         paged_active,
+        scheduled_lanes,
         mtp_active,
         vision_active,
         context_limits,
+        warmup,
+        state_tier,
     ) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
@@ -2387,13 +2420,16 @@ pub(crate) async fn load_with_source(
     Ok(Qwen3_5MoeModel {
         thread,
         config,
+        warmup,
         paged_active,
+        scheduled_lanes,
         mtp_active,
         vision_active,
         image_processor,
         spatial_merge_size,
         context_limits,
         model_assets_path,
+        state_tier,
         cache_limit_guards: std::sync::Mutex::new(Some((
             cache_limit_guard,
             pool_cache_limit_guard,

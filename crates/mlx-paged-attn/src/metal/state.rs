@@ -53,14 +53,8 @@ impl MetalState {
         {
             let device = Device::system_default().ok_or("No Metal device found")?;
 
-            // Write metallib to temp file and load
-            // (Metal requires loading from file path, not memory)
-            let temp_path = std::env::temp_dir().join("mlx_paged_attn.metallib");
-            std::fs::write(&temp_path, METALLIB_BYTES)
-                .map_err(|e| format!("Failed to write metallib to temp: {}", e))?;
-
             let library = device
-                .new_library_with_file(&temp_path)
+                .new_library_with_data(METALLIB_BYTES)
                 .map_err(|e| format!("Failed to load metallib: {}", e))?;
 
             let command_queue = device
@@ -353,6 +347,96 @@ mod tests {
             }
             Err(e) => panic!("unexpected MetalState::get failure: {e}"),
         }
+    }
+
+    const TEST_CHILD: &str = "MLX_PAGED_ATTN_TEST_CHILD";
+
+    /// This process is the child [`run_child_with_tmpdir`] started for `name`.
+    fn is_child(name: &str) -> bool {
+        std::env::var(TEST_CHILD).is_ok_and(|child| child == name)
+    }
+
+    /// Runs test `name` alone in a child test process whose `TMPDIR` is
+    /// `tmpdir`. `MetalState` is a process-wide singleton, so only a fresh
+    /// process loads the library again.
+    fn run_child_with_tmpdir(name: &str, tmpdir: &std::path::Path) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads=1"])
+            .env(TEST_CHILD, name)
+            .env("TMPDIR", tmpdir)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{name} in its own process:\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mlx-paged-attn-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Loads the library and builds one pipeline; `false` on a host with no
+    /// Metal device.
+    fn load_and_build(test: &str) -> bool {
+        let state = match MetalState::get() {
+            Ok(state) => state,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping {test}: {e}");
+                return false;
+            }
+            Err(e) => panic!("{test}: MetalState::get: {e}"),
+        };
+        if let Err(e) = state.get_pipeline("residency_kick") {
+            panic!("{test}: residency_kick: {e}");
+        }
+        true
+    }
+
+    /// The library loads with a temp dir that does not exist: init needs no
+    /// file.
+    #[test]
+    fn metal_state_needs_no_temp_dir() {
+        const NAME: &str = "metal::state::tests::metal_state_needs_no_temp_dir";
+        if is_child(NAME) {
+            let tmpdir = std::env::temp_dir();
+            assert!(!tmpdir.exists(), "{} exists", tmpdir.display());
+            load_and_build(NAME);
+            return;
+        }
+        let parent = scratch_dir("no-tmp");
+        run_child_with_tmpdir(NAME, &parent.join("missing"));
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// Init writes nothing into the temp dir.
+    #[test]
+    fn metal_state_writes_no_file() {
+        const NAME: &str = "metal::state::tests::metal_state_writes_no_file";
+        if is_child(NAME) {
+            let tmpdir = std::env::temp_dir();
+            if load_and_build(NAME) {
+                let left: Vec<_> = std::fs::read_dir(&tmpdir)
+                    .unwrap()
+                    .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                    .collect();
+                assert!(left.is_empty(), "init wrote into the temp dir: {left:?}");
+            }
+            return;
+        }
+        let dir = scratch_dir("empty-tmp");
+        run_child_with_tmpdir(NAME, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

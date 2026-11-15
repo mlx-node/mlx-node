@@ -8,6 +8,7 @@ import { describe, expect, it, vi } from 'vite-plus/test';
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
 import { handleCreateResponse } from '../../packages/server/src/endpoints/responses.js';
 import { ModelLoadQueueFullError, ModelWorkCoordinator } from '../../packages/server/src/model-work-coordinator.js';
+import { queueRejections } from '../../packages/server/src/queue-rejections.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';
 import { DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL } from '../../packages/server/src/server.js';
 import { QueueFullError } from '../../packages/server/src/session-registry.js';
@@ -132,6 +133,15 @@ async function waitForQueueDepth(registry: ModelRegistry, modelName: string, exp
 }
 
 describe('ModelWorkCoordinator + SessionRegistry queue cap', () => {
+  it('counts a rejection when the queue is full', () => {
+    const coordinator = new ModelWorkCoordinator(0);
+    const first = coordinator.beginRequestLoadAdmission('model-a');
+    const before = queueRejections();
+    expect(() => coordinator.beginRequestLoadAdmission('model-a')).toThrow(ModelLoadQueueFullError);
+    expect(queueRejections()).toBe(before + 1);
+    first.release();
+  });
+
   it('keys cold-load admission independently by requested model', () => {
     const coordinator = new ModelWorkCoordinator(1);
     const a1 = coordinator.beginRequestLoadAdmission('model-a');

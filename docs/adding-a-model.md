@@ -137,7 +137,7 @@ child whose resolver throws on `@mlx-node/core` or any `.node` specifier.
 - Implement **`HybridSchedulerBackend`** (`engine/hybrid_scheduler.rs`): 4
   associated types (`FamilyCommand`, `RestoreTicket`, `OwnerState`,
   `StepExecutor<'a>`), `const SCHEDULER_NAME`, the defaulted consts
-  `ENABLED_BY_DEFAULT` / `CANCEL_PRECEDES_EOS` / `STREAM_EOS_TOKEN`, and 10
+  `CANCEL_PRECEDES_EOS` / `STREAM_EOS_TOKEN`, and 10
   required methods: `paged_adapter`, `paged_adapter_mut`,
   `max_position_embeddings`, `activate_paged_seq`,
   `run_paged_decode_step_batched`, `replace_cached_token_history`,
@@ -158,8 +158,8 @@ child whose resolver throws on `@mlx-node/core` or any `.node` specifier.
   `scheduler_capacity`, `prepare_scheduled_prefix`,
   `run_scheduled_prefill_slice`, `finish_scheduled_decode_batch`, and write a
   custom `execute_chat_barrier` managing the flat-vs-paged owner lanes.
-- Gates: `ENABLED_BY_DEFAULT` is `false` only for qwen3_5 dense/MoE, which
-  opt in via `MLX_CONTINUOUS_BATCHING=1`; `MLX_SERVE_FORCE_SERIAL=1` is the
+- Gates: every family with a paged adapter takes the scheduled lane by
+  default (`scheduler_cache_available`); `MLX_SERVE_FORCE_SERIAL=1` is the
   engine-generic whole-turn rollback for every scheduler family.
 
 ## Stage 3 — cold restore (SSD)

@@ -52,6 +52,7 @@ napi-build = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = "0.14.2"
+mlx_metal = { package = "mlx-metal", path = "../mlx-metal" }
 objc2 = "0.6.4"
 objc2-core-audio = "0.3.2"
 objc2-core-audio-types = "0.3.2"

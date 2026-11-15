@@ -1,0 +1,97 @@
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: oklch(10% 0 0 / .38);
+  -webkit-backdrop-filter: blur(4px); backdrop-filter: blur(4px);
+}
+
+.content {
+  --drawer-size: min(30rem, calc(100vw - var(--space-4)));
+  /* Critically damped, like a sheet spring: it never overshoots past the edge it is anchored to. */
+  --ease-drawer: cubic-bezier(.32,.72,0,1);
+  --drawer-from: translateX(100%);
+  position: fixed;
+  z-index: 51;
+  display: flex;
+  flex-direction: column;
+  width: var(--drawer-size);
+  max-width: 100vw;
+  max-height: 100dvh;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--surface-raised);
+  color: var(--foreground);
+  box-shadow: var(--shadow-floating);
+}
+/* While a layer leaves it lets clicks through, so pressing the trigger again during the close reopens the drawer from wherever it is. */
+/* Radix writes pointer-events inline on the overlay, so the closing state has to win over it. */
+.overlay[data-state="closed"], .content[data-state="closed"] { pointer-events: none !important; }
+
+.content[data-side="right"] { inset: 0 0 0 auto; border-width: 1px 0 1px 1px; border-radius: 22px 0 0 22px; }
+.content[data-side="left"] { inset: 0 auto 0 0; border-width: 1px 1px 1px 0; border-radius: 0 22px 22px 0; }
+.content[data-side="top"] { inset: 0 0 auto; width: 100%; max-width: none; max-height: min(32rem, 100dvh); border-width: 0 0 1px; border-radius: 0 0 22px 22px; }
+.content[data-side="bottom"] { inset: auto 0 0; width: 100%; max-width: none; max-height: min(32rem, 100dvh); border-width: 1px 0 0; border-radius: 22px 22px 0 0; }
+.content[data-side="bottom"]::before { position: absolute; top: 9px; left: 50%; width: 2.25rem; height: 4px; border-radius: var(--radius-pill); background: var(--border-strong); content: ""; opacity: .75; transform: translateX(-50%); }
+
+/* Motion springs the panel from its edge. Keyframes only run when DrawerContent sits under a bare Radix root. */
+.content[data-side="left"] { --drawer-from: translateX(-100%); }
+.content[data-side="top"] { --drawer-from: translateY(-100%); }
+.content[data-side="bottom"] { --drawer-from: translateY(100%); }
+.keyframes.overlay[data-state="open"] { animation: overlay-in var(--duration-standard) var(--ease-enter) both; }
+.keyframes.overlay[data-state="closed"] { animation: overlay-out var(--duration-fast) var(--ease-standard) both; }
+.keyframes.content[data-state="open"] { animation: drawer-in var(--duration-considered) var(--ease-drawer) both; }
+.keyframes.content[data-state="closed"] { animation: drawer-out var(--duration-standard) var(--ease-standard) both; }
+.content:focus { outline: none; }
+/* Inside a container the layers anchor to that element instead of the viewport. */
+.overlay[data-contained], .content[data-contained] { position: absolute; }
+.overlay[data-contained] { z-index: 1; background: oklch(10% 0 0 / .16); backdrop-filter: none; }
+.content[data-contained] { --drawer-size: min(22rem, calc(100% - var(--space-8))); z-index: 2; max-height: 100%; box-shadow: none; }
+.content[data-contained][data-side="top"], .content[data-contained][data-side="bottom"] { max-height: min(32rem, calc(100% - var(--space-8))); }
+/* The container already draws the outer edges, so only the inner edge keeps a border. */
+.content[data-contained][data-side] { border-width: 0; }
+.content[data-contained][data-side="right"] { border-left-width: 1px; }
+.content[data-contained][data-side="left"] { border-right-width: 1px; }
+.content[data-contained][data-side="top"] { border-bottom-width: 1px; }
+.content[data-contained][data-side="bottom"] { border-top-width: 1px; }
+
+.header { display: flex; flex: 0 0 auto; align-items: flex-start; justify-content: space-between; gap: var(--space-5); padding: var(--space-6); border-bottom: 1px solid var(--border); }
+/* The header doubles as the drag handle, so touch drags move the panel instead of the page. */
+.handle { touch-action: none; user-select: none; }
+.content[data-side="bottom"] .handle, .content[data-side="top"] .handle { cursor: grab; }
+.title, .description { position: relative; }
+/* The copy sets its own line height so a page-level heading rule cannot squeeze the title. */
+.swap { display: block; line-height: var(--leading-body); }
+.title { margin: 0; font-family: var(--font-body); font-size: var(--text-lg); font-weight: 500; letter-spacing: var(--tracking-body); line-height: var(--leading-body); }
+.description { max-width: 32rem; margin: var(--space-2) 0 0; color: var(--text-secondary); font-size: var(--text-sm); line-height: var(--leading-body); }
+/* Centered on the first line of the title rather than its top edge. */
+.close { display: grid; flex: 0 0 auto; width: var(--space-8); height: var(--space-8); margin-top: calc((var(--text-lg) * var(--leading-body) - var(--space-8)) / 2); place-items: center; border: 1px solid var(--border); border-radius: var(--radius-control); background: color-mix(in oklab, var(--surface-muted) 65%, transparent); color: var(--text-secondary); cursor: pointer; transition: background-color var(--duration-fast) var(--ease-standard), color var(--duration-fast) var(--ease-standard), transform var(--duration-spring) var(--ease-spring); }
+@media (hover: hover) and (pointer: fine) { .close:hover { background: var(--surface-muted); color: var(--foreground); } }
+.close:active { transform: scale(.96); transition: background-color var(--duration-fast) var(--ease-standard), color var(--duration-fast) var(--ease-standard), transform var(--duration-instant) var(--ease-standard); }
+.body { min-height: 0; overflow: auto; padding: var(--space-6); font-size: var(--text-sm); line-height: var(--leading-body); overscroll-behavior: contain; scrollbar-width: thin; }
+
+@media (max-width: 40rem) {
+  .content { --drawer-size: calc(100vw - var(--space-3)); }
+  .content[data-side="right"] { border-radius: 18px 0 0 18px; }
+  .content[data-side="left"] { border-radius: 0 18px 18px 0; }
+  .content[data-side="top"] { border-radius: 0 0 18px 18px; }
+  .content[data-side="bottom"] { border-radius: 18px 18px 0 0; }
+  .header, .body { padding: var(--space-5); }
+}
+
+@keyframes overlay-in { from { opacity: 0; } }
+@keyframes overlay-out { to { opacity: 0; } }
+@keyframes drawer-in { from { transform: var(--drawer-from); } }
+/* The late fade lets the floating shadow leave with the panel instead of popping away at unmount. */
+@keyframes drawer-out { 65% { opacity: 1; } to { opacity: 0; transform: var(--drawer-from); } }
+@keyframes drawer-fade-in { from { opacity: 0; } }
+@keyframes drawer-fade-out { to { opacity: 0; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .keyframes.overlay[data-state="open"] { animation: overlay-in var(--duration-instant) linear both; }
+  .keyframes.overlay[data-state="closed"] { animation: overlay-out 100ms linear both; }
+  .keyframes.content[data-state="open"] { animation: drawer-fade-in var(--duration-instant) linear both; }
+  .keyframes.content[data-state="closed"] { animation: drawer-fade-out 100ms linear both; }
+  .close, .close:active { transition: none; }
+  .close:active { transform: none; }
+}

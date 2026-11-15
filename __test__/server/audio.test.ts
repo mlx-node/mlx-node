@@ -6,8 +6,9 @@ import type { Qwen3AsrResult } from '@mlx-node/core';
 import { InvalidWavError, WavReader } from '@mlx-node/tts';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import type { AsrModel } from '../../packages/server/src/audio-registry.js';
+import { AudioQueueFullError, AudioRegistry, type AsrModel } from '../../packages/server/src/audio-registry.js';
 import type { AudioServiceOptions } from '../../packages/server/src/audio-service.js';
+import { queueRejections } from '../../packages/server/src/queue-rejections.js';
 import { createServer, type ServerInstance } from '../../packages/server/src/server.js';
 import { createTtsModel, type TtsBackend } from '../../packages/tts/src/model.js';
 
@@ -558,4 +559,19 @@ it('releases a complete WAV spool before the client can begin the next synthesis
     expect(res.status).toBe(200);
     expect((await res.arrayBuffer()).byteLength).toBe(50);
   }
+});
+
+describe('audio admission', () => {
+  it('counts a rejection when the queue is full', () => {
+    const registry = new AudioRegistry(0);
+    registry.register('asr', { kind: 'asr', model: asr().model });
+    const lane = registry.lane('asr')!;
+    const first = lane.beginPreDispatchAdmission();
+    const before = queueRejections();
+    expect(() => lane.beginPreDispatchAdmission()).toThrow(AudioQueueFullError);
+    expect(queueRejections()).toBe(before + 1);
+    first.release();
+    expect(() => lane.beginPreDispatchAdmission().release()).not.toThrow();
+    expect(queueRejections()).toBe(before + 1);
+  });
 });

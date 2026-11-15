@@ -36,6 +36,15 @@ pub struct Live {
     pub bank_budget: AtomicU64,
     pub live_non_reclaimable: AtomicU64,
     pub prefill_chunk_tokens: AtomicU64,
+    /// Routed experts the slots or banks served without a read since load,
+    /// and the ones a slot fill had to read.
+    pub slot_hits: AtomicU64,
+    pub slot_misses: AtomicU64,
+    /// Bytes read from the checkpoint files since load: expert fills and
+    /// row imports.
+    pub bytes_read: AtomicU64,
+    /// Passes replayed after a tentative device route missed the slots.
+    pub route_replays: AtomicU64,
     pub fallback: Mutex<Option<Fallback>>,
 }
 
@@ -52,6 +61,10 @@ impl Default for Live {
             bank_budget: AtomicU64::new(0),
             live_non_reclaimable: AtomicU64::new(0),
             prefill_chunk_tokens: AtomicU64::new(0),
+            slot_hits: AtomicU64::new(0),
+            slot_misses: AtomicU64::new(0),
+            bytes_read: AtomicU64::new(0),
+            route_replays: AtomicU64::new(0),
             fallback: Mutex::new(None),
         }
     }

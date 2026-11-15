@@ -1,0 +1,46 @@
+{
+  "persist": true,
+  "initialize": {
+    "protocolVersion": 1,
+    "loadSession": true,
+    "pluginDirs": true,
+    "agentVersion": "1.0.45",
+    "models": [
+      {
+        "modelId": "qwen3.5-4b",
+        "totalContextTokens": 32768
+      },
+      {
+        "modelId": "qwen3.5-9b",
+        "totalContextTokens": 65536
+      }
+    ]
+  },
+  "session": {
+    "agentName": "mlx-chat",
+    "toolDefinitionsCount": 2,
+    "skills": 1,
+    "mcpServers": 1,
+    "apiBackend": "Messages",
+    "mcpReadyAfterMs": 70,
+    "modelChangedOnNewAndLoad": true,
+    "replayOnLoad": true
+  },
+  "prompts": [
+    {
+      "match": "",
+      "steps": [
+        {
+          "error": {
+            "code": -32603,
+            "message": "boom marker-KEY-12345678",
+            "data": {
+              "message": "marker-KEY-12345678"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "faults": {}
+}

@@ -27,15 +27,24 @@
  * belongs to INFERENCE alone; that split is the reason there are three processes.
  *
  * Nothing is decided here: `session.ts` holds the one rule (a new port replaces
- * the old), and the runtime and the RPC host come from `@mlx-node/dashboard`.
+ * the old), `lifecycle.ts` what is told to MAIN, and the runtime and the RPC host
+ * come from `@mlx-node/dashboard`. No worker event ends this process: a stuck or
+ * dead database worker is replaced inside the runtime.
  */
 
 import { writeSync } from 'node:fs';
 
-import { bindEventEmitterPort, createDashboardRuntime } from '@mlx-node/dashboard';
+import {
+  bindEventEmitterPort,
+  createDashboardRuntime,
+  createOpenCalls,
+  serveRuntimeOverPort,
+  type DashboardRuntime,
+} from '@mlx-node/dashboard';
 
-import { createCliLauncher, type DesktopCliConfig } from '../cli-launcher.js';
-import { createControlPanelSession } from './session.js';
+import { createCliLauncher, runAgentUpdate, type DesktopCliConfig } from '../cli-launcher.js';
+import { firstClosing, LEDGER_DIR_ENV, onRuntimeLifecycle, pongOf, readAppEnds, readPing } from './lifecycle.js';
+import { createControlPanelSession, type ControlPanelSession } from './session.js';
 import { CONTROL_PANEL_PROCESS_EXIT_CAP_MS, CONTROL_PANEL_WORKER_SHUTDOWN_STEP_MS } from './shutdown-timings.js';
 
 /**
@@ -48,6 +57,7 @@ import { CONTROL_PANEL_PROCESS_EXIT_CAP_MS, CONTROL_PANEL_WORKER_SHUTDOWN_STEP_M
  */
 interface ParentPort {
   on(event: 'message', listener: (event: { data: unknown; ports: unknown[] }) => void): void;
+  postMessage(message: unknown): void;
 }
 
 function logError(line: string): void {
@@ -61,39 +71,58 @@ if (parentPort === undefined) {
   logError('[mlx] dist/control-panel/index.js must be forked as an Electron utilityProcess');
   process.exit(78);
 }
+const toMain: ParentPort = parentPort;
 
-/**
- * Set before any deliberate teardown, so a worker death during it is read as
- * part of the teardown rather than as a crash.
- *
- * The runtime's own `closing` latch is not enough: it flips inside
- * `worker.close()`, which runs AFTER `drain()`. A worker that dies during the
- * drain phase therefore still reports `worker-down`, and reacting to that by
- * exiting would abort the in-flight download shutdown that drain exists to
- * perform — orphaning a partial multi-GB `.staging` tree.
- */
-let shuttingDown = false;
+function post(message: unknown): void {
+  try {
+    toMain.postMessage(message);
+  } catch {
+    // MAIN is gone; the process is about to be.
+  }
+}
 
-/** Distinct from the clean `0` so a crash report says which path exited. */
-const EXIT_WORKER_DOWN = 70;
+const calls = createOpenCalls();
+let runtime: DashboardRuntime | null = null;
+let session: ControlPanelSession | null = null;
+/** Ports MAIN handed over before the session existed. */
+const earlyPorts: unknown[] = [];
 
-/**
- * Close the runtime, then leave. Shared by the signal handlers and `worker-down`.
- *
- * Only reachable after module init — from a signal, or from the worker's async
- * `error`/`exit` events — so `session` below is always assigned by the time this
- * runs. Do not call it during construction.
- */
+function attachPort(port: unknown): void {
+  if (session === null) {
+    earlyPorts.push(port);
+    return;
+  }
+  session.attach(bindEventEmitterPort(port as Parameters<typeof bindEventEmitterPort>[0]));
+}
+
+// First, before the runtime: MAIN's ping must be answered from this thread alone, from the first tick on.
+toMain.on('message', (event) => {
+  const ping = readPing(event.data);
+  if (ping !== null) {
+    post(pongOf(ping.n, runtime, calls, Date.now()));
+    return;
+  }
+  const port = event.ports.at(0);
+  // Every other message MAIN sends carries a port; one that does not is not a
+  // handshake, and dropping it is better than tearing down the live session.
+  if (port === undefined) return;
+  attachPort(port);
+});
+
+const closing = firstClosing();
+
+/** Close the runtime, then leave. Reached only from a signal. */
 function teardown(code: number): void {
-  shuttingDown = true;
+  // Before anything async: MAIN keeps the list even when the close below never finishes.
+  const note = closing(runtime);
+  if (note !== null) post(note);
   // `runtime.close()` spends up to one worker deadline draining ingest, then a
   // SECOND worker deadline closing SQLite/terminating the thread. The enclosing
   // cap includes both sequential phases plus cleanup margin; MAIN's still-larger
   // broker grace is the next backstop.
   const cap = setTimeout(() => process.exit(code), CONTROL_PANEL_PROCESS_EXIT_CAP_MS);
   cap.unref();
-  void session
-    .close()
+  void (session?.close() ?? Promise.resolve())
     .catch((error: unknown) => {
       logError(
         `[mlx] dashboard runtime did not close cleanly: ${error instanceof Error ? error.message : String(error)}`,
@@ -107,38 +136,31 @@ function teardown(code: number): void {
 const cli = process.env.MLX_DESKTOP_CLI
   ? createCliLauncher(JSON.parse(process.env.MLX_DESKTOP_CLI) as DesktopCliConfig)
   : undefined;
-const runtime = createDashboardRuntime({
+
+/** The Chat page's Install action: the app's own `mlx agent update`. */
+function agentInstaller(launcher: NonNullable<typeof cli>): () => Promise<void> {
+  return async () => runAgentUpdate(await launcher.prepare());
+}
+runtime = createDashboardRuntime({
   prepareDelegation: cli ? () => cli.prepare() : undefined,
+  chat: {
+    ...(cli ? { installAgent: agentInstaller(cli) } : {}),
+    appEnds: readAppEnds(process.env[LEDGER_DIR_ENV]),
+    // MAIN never holds a turn count older than the turn itself.
+    onBusyChange: () => post(pongOf(0, runtime, calls, Date.now())),
+  },
   // One budget per sequential worker phase. The process/broker/app caps are
   // derived from this in `shutdown-timings.ts`.
   shutdownTimeoutMs: CONTROL_PANEL_WORKER_SHUTDOWN_STEP_MS,
-  onLifecycle: (event) => {
-    // The database worker dying is invisible from the UI: every worker-thread
-    // route just starts failing. Say so where the crash report can see it.
-    logError(`[mlx] dashboard db worker: ${JSON.stringify(event)}`);
-
-    // `down` is a write-once latch with no respawn, so 12 of the 16 dashboard
-    // routes now fail forever while this process stays perfectly healthy. The
-    // broker sees no exit, so its restart budget never runs; reloading or
-    // reopening the window re-attaches to this same dead runtime. Exiting is
-    // what hands the problem to `broker.ts`, which restarts CONTROL PANEL and
-    // re-brokers a fresh port to the window that is still open.
-    //
-    // `db-closed` is the normal witness of a clean close and must not trigger
-    // this.
-    if (event.type === 'worker-down' && !shuttingDown) teardown(EXIT_WORKER_DOWN);
-  },
+  // A worker restart is told to MAIN; it never ends this process or a turn.
+  onLifecycle: (event) => onRuntimeLifecycle(event, post, () => runtime?.busyConversations().length ?? 0, logError),
 });
 
-const session = createControlPanelSession({ runtime });
-
-parentPort.on('message', (event) => {
-  const port = event.ports.at(0);
-  // Every message MAIN sends carries a port; one that does not is not a
-  // handshake, and dropping it is better than tearing down the live session.
-  if (port === undefined) return;
-  session.attach(bindEventEmitterPort(port as Parameters<typeof bindEventEmitterPort>[0]));
+session = createControlPanelSession({
+  runtime,
+  serve: (served, port) => serveRuntimeOverPort(served, port, { calls }),
 });
+for (const port of earlyPorts.splice(0)) attachPort(port);
 
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   process.on(signal, () => {

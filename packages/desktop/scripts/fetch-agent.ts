@@ -19,9 +19,10 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..', '..');
 // `dist` — this script runs after `yarn build`, and the source condition does
 // not apply to the release scripts' oxnode invocation.
-const { downloadAgentBinary, agentTagFromBinPath } = await import(
+const { downloadAgentBinary } = await import(
   join(REPO_ROOT, 'packages', 'cli', 'dist', 'commands', 'agent', 'grok-build.js')
 );
+const { agentTagFromBinPath } = await import(join(REPO_ROOT, 'packages', 'agent', 'dist', 'binary.js'));
 
 const dest = join(HERE, '..', 'out', 'agent', 'mlx-agent');
 mkdirSync(dirname(dest), { recursive: true });

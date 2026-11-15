@@ -12,7 +12,7 @@ use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup};
 use crate::engine::params::ChatParams;
-use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
+use crate::engine::penalties::{ReasoningTracker, ThinkingCut, apply_all_penalties};
 use crate::models::qwen3_5::mtp_decode::{
     MtpCommitAnchor, MtpCycleOutcome, MtpVerifyOutput, mtp_draft_sampling_config,
     mtp_trace_acceptance, sparse_accept_gate, trace_acceptance_dense, trace_acceptance_emit,
@@ -70,6 +70,10 @@ fn debug_assert_one_frontier<S: MtpStepper>(step: &S, site: &str) {
 /// tokens, verify them in one batched forward, accept a prefix, commit it,
 /// and roll the drafter back to that prefix. Returns the accepted tokens
 /// plus `verify_hiddens[:, K, :]` — the seed the next cycle chains from.
+///
+/// `cut` decides the rows at and after a thinking cut: they select the end
+/// tokens, and at row 0 the end tokens are also the first proposals.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     step: &mut S,
     prev_hidden_in: MxArray,
@@ -85,10 +89,13 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         &mut crate::models::qwen3_5::adaptive_depth::ExpectedValueDepthPolicy,
     >,
     commit_anchor: MtpCommitAnchor,
+    cut: Option<&ThinkingCut>,
 ) -> Result<(MtpCycleOutcome, MxArray)> {
     use crate::array::{DType, MxArray as A};
 
     debug_assert!(depth >= 1, "run_mtp_cycle: depth must be >= 1");
+    let replaced = cut.map_or(0, |c| c.replaced(depth));
+    let end_proposals = cut.map_or(&[][..], |c| c.proposals(replaced));
 
     // Keep the ORIGINAL cycle-seed hidden alive for the committed-history
     // commit. `prev_hidden_in` is h(token before `last_committed_id`) —
@@ -136,7 +143,11 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     } else {
         Vec::new()
     };
-    for _ in 0..depth {
+    for slot in 0..depth {
+        // A slot an end token replaces still runs the drafter (its K/V and
+        // the distribution row stay in line with the rows after it); only
+        // its token is the end's, with no draw.
+        let end_token = end_proposals.get(slot).copied();
         let (h_next, draft_logits) = step.draft_step(&prev_hidden, &prev_emb)?;
         let logits_1d = if use_sparse_accept {
             None
@@ -205,9 +216,14 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
                 )
             })?;
             let draft_dist = sparse_rows.row_owned(0)?;
-            let sampled = draft_dist.as_row().sample(rng)?;
+            let sampled = match end_token {
+                Some(token) => token as i32,
+                None => draft_dist.as_row().sample(rng)?,
+            };
             sparse_draft = Some(draft_dist);
             A::from_int32(&[sampled], &[1])?
+        } else if let Some(token) = end_token {
+            A::from_int32(&[token as i32], &[1])?
         } else {
             // Sample the drafted token using the same sampling pipeline
             // the main path uses — drafter and verifier must agree on
@@ -238,14 +254,17 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         draft_tokens.push(token);
         if let Some(policy) = ev_depth_policy.as_mut()
             && draft_tokens.len() < depth
+            && end_token.is_none()
         {
             profiler.begin("mtp_draft_gate");
+            // Positions count drafted tokens only, as `observe` files them.
+            let drafted = draft_tokens.len() - replaced;
             let decision =
-                policy.should_continue_after_draft(draft_tokens.len(), depth, draft_metrics);
+                policy.should_continue_after_draft(drafted, depth - replaced, draft_metrics);
             profiler.end();
             tracing::trace!(
                 target: "mlx_core::mtp::adaptive",
-                drafted_depth = draft_tokens.len(),
+                drafted_depth = drafted,
                 next_depth = decision.next_depth,
                 expected_extra_accept = decision.expected_extra_accept,
                 required_extra_accept = decision.required_extra_accept,
@@ -258,6 +277,8 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         }
     }
     let draft_ids = sampling::materialize_draft_tokens(&draft_tokens)?;
+    let forced = cut.map(|c| c.targets(&draft_ids));
+    let forced_at = |row: usize| forced.as_ref().and_then(|f| f.at(row));
     for (index, &token) in draft_ids.iter().enumerate() {
         tracing::trace!(
             target: "mlx_core::mtp::draft",
@@ -406,7 +427,10 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         // `[1, D+1]`. We read flat positions 0..=depth.
         let mut target_argmax: Vec<i32> = Vec::with_capacity(effective_depth + 1);
         for i in 0..=effective_depth {
-            target_argmax.push(argmax_arr.item_at_int32(i)?);
+            target_argmax.push(match forced_at(i) {
+                Some(token) => token as i32,
+                None => argmax_arr.item_at_int32(i)?,
+            });
         }
         profiler.end();
 
@@ -486,6 +510,16 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         // so a single `enumerate()` over one of them would not be clearer.
         #[allow(clippy::needless_range_loop)]
         for i in 0..effective_depth {
+            if let Some(token) = forced_at(i) {
+                let accept = draft_ids[i] == token as i32;
+                accepted_tokens.push(token);
+                if !accept {
+                    all_accepted = false;
+                    rejection_residual = Some(token as i32);
+                    break;
+                }
+                continue;
+            }
             let target_p = target_sparse.row(i)?;
             let draft_q = draft_sparse_probs
                 .get(i)
@@ -532,7 +566,10 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         }
 
         if all_accepted {
-            let bonus_id = target_sparse.row(effective_depth)?.sample(rng)? as u32;
+            let bonus_id = match forced_at(effective_depth) {
+                Some(token) => token,
+                None => target_sparse.row(effective_depth)?.sample(rng)? as u32,
+            };
             tracing::trace!(
                 target: "mlx_core::mtp::accept",
                 bonus_id,
@@ -572,6 +609,16 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
                 None
             };
         for (i, p_target) in targets.iter().enumerate() {
+            if let Some(token) = forced_at(i) {
+                let accept = draft_ids[i] == token as i32;
+                accepted_tokens.push(token);
+                if !accept {
+                    all_accepted = false;
+                    rejection_residual = Some(token as i32);
+                    break;
+                }
+                continue;
+            }
             let (accept, out_tok) = if let Some(targets) = &greedy_targets {
                 (targets[i] == draft_ids[i], targets[i])
             } else {
@@ -635,12 +682,18 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
             // drafts accepted). Apply penalties consistent with the
             // extended history.
             let i = effective_depth;
-            let v_slice = verify_logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
-            let v_logits_1d = v_slice.squeeze(Some(&[0, 1]))?;
-            let penalized = apply_all_penalties(v_logits_1d, &hist_extended, params)?;
-            let bonus = sampling::sample(&penalized, params.sampling_config)?;
-            bonus.eval();
-            let bonus_id = bonus.item_at_int32(0)? as u32;
+            let bonus_id = match forced_at(i) {
+                Some(token) => token,
+                None => {
+                    let v_slice =
+                        verify_logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
+                    let v_logits_1d = v_slice.squeeze(Some(&[0, 1]))?;
+                    let penalized = apply_all_penalties(v_logits_1d, &hist_extended, params)?;
+                    let bonus = sampling::sample(&penalized, params.sampling_config)?;
+                    bonus.eval();
+                    bonus.item_at_int32(0)? as u32
+                }
+            };
             tracing::trace!(
                 target: "mlx_core::mtp::accept",
                 bonus_id,
@@ -742,12 +795,19 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         // accepted_tokens contains `K` accepted drafts + 1 residual.
         accepted_tokens.len() - 1
     };
-    if let Some(policy) = ev_depth_policy.as_mut() {
-        policy.observe(effective_depth, accepted_drafts);
-    }
     // Per-cycle acceptance: feeds the profiler's acceptance summary
-    // (surfaced on `PerformanceMetrics` + the stderr report).
-    profiler.record_mtp_cycle(effective_depth, accepted_drafts);
+    // (surfaced on `PerformanceMetrics` + the stderr report). End tokens that
+    // replaced proposals are not drafts.
+    let (drafted, drafts_accepted) = (
+        effective_depth - replaced,
+        accepted_drafts.saturating_sub(replaced),
+    );
+    if drafted > 0 {
+        if let Some(policy) = ev_depth_policy.as_mut() {
+            policy.observe(drafted, drafts_accepted);
+        }
+        profiler.record_mtp_cycle(drafted, drafts_accepted);
+    }
     tracing::debug!(
         target: "mlx_core::mtp",
         depth = effective_depth,
@@ -1170,9 +1230,6 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     //   - `None` on the FIRST iteration (no prior verify) — Step A
     //     runs unconditionally and re-seeds the hidden from a real
     //     main forward.
-    //   - `None` when forced-think-end fires — that path needs Step
-    //     A's forward to write `y`'s K/V before injecting the
-    //     forced token. (See the force-end branch below.)
     //   - `Some(hidden)` after every successful cycle, to be drained
     //     by the NEXT iteration before its cycle runs.
     //
@@ -1365,10 +1422,8 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         // GPU-generation-gated: default ON on M5+/gen>=17, OFF on
         // M1–M4; override via `MLX_MTP_CHAINED_CYCLES=0/1`): skip
         // Step A's full main-model forward when a chained verify
-        // hidden is available from the prior cycle, unless the
-        // tracker is ending thinking (the forced-token path needs
-        // Step A to forward `y` so its K/V is committed before we
-        // inject the end's next token, which Step A takes below).
+        // hidden is available from the prior cycle. While thinking is
+        // being ended the chained cycle's proposals are the end tokens.
         //
         // When chained cycles are disabled (M1–M4 default, or
         // `MLX_MTP_CHAINED_CYCLES=0`): always Step A, byte-exact with
@@ -1385,7 +1440,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         // parity is preserved because verify (= main model) is the
         // ground truth and at T=0 the residual-sampler picks the
         // same token regardless of draft accuracy.
-        let do_step_a = !chained_cycles_enabled || chained_hidden_opt.is_none() || tracker.ending();
+        let do_step_a = !chained_cycles_enabled || chained_hidden_opt.is_none();
         let cycle_seed_was_chained = !do_step_a;
 
         let _stream_ctx = crate::stream::StreamContext::new(generation_stream);
@@ -1572,15 +1627,6 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             }
             break;
         }
-        if tracker.ending() {
-            // Thinking is being ended: no cycle may draft before the close.
-            // The next Step A takes the end's next token.
-            tracing::debug!(
-                target: "mlx_core::mtp",
-                "MTP cycle skipped: thinking end queued, deferring to next Step A"
-            );
-            continue;
-        }
         // Per-cycle speculative admission: the turn-entry reservation only
         // covered the first cycle's cursor — every committed token moves the
         // frontier, so re-reserve the lookahead region for THIS cycle (a
@@ -1637,9 +1683,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         // broke the loop otherwise). With `effective_depth =
         // remaining - 1` the verify writes exactly `remaining`
         // slots and the cycle emits at most `remaining` tokens.
-        let remaining: usize = max_as_usize
-            .saturating_sub(generated.len())
-            .min(tracker.unforced_token_budget().unwrap_or(usize::MAX));
+        let remaining: usize = max_as_usize.saturating_sub(generated.len());
         let cycle_depth: usize = cycle_depth.min(remaining.saturating_sub(1));
         if cycle_depth < 1 {
             // Only 1 token of budget left — an MTP cycle would
@@ -1684,6 +1728,8 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         } else {
             None
         };
+        let cut = tracker.thinking_cut();
+        let replaced = cut.as_ref().map_or(0, |c| c.replaced(cycle_depth));
         let cycle_res = run_mtp_cycle(
             &mut step,
             prev_h,
@@ -1697,6 +1743,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             cycle_depth,
             ev_depth_policy,
             commit_anchor,
+            cut.as_ref(),
         );
         profiler.end();
         // `run_mtp_cycle` returns the verify-final hidden so
@@ -1717,7 +1764,10 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             .as_nanos()
             .min(u128::from(u64::MAX)) as u64;
         let cycle_committed: u32 = outcome.tokens.len() as u32;
+        // A cycle whose proposals are end tokens says nothing about the
+        // drafter.
         if p.mtp_adaptive_depth
+            && replaced == 0
             && matches!(
                 mtp_adaptive_depth_mode,
                 crate::models::qwen3_5::adaptive_depth::AdaptiveDepthMode::Throughput
@@ -2090,6 +2140,8 @@ mod tests {
         // with room for exactly n more verify cycles.
         reserve_ok_budget: Option<usize>,
         reserve_calls: std::cell::Cell<usize>,
+        chained: bool,
+        spans: Rc<RefCell<Vec<Span>>>,
     }
 
     /// Canned per-cycle script for the `run_mtp_cycle` integration tests.
@@ -2117,6 +2169,8 @@ mod tests {
         /// deterministic BY CONSTRUCTION, independent of both the MLX sampler
         /// RNG and the Rust accept RNG.
         neg_fill: f32,
+        /// Non-argmax fill of the draft logits.
+        draft_fill: f32,
     }
 
     /// Per-cycle argmax script for the whole-turn [`TurnScript`].
@@ -2149,6 +2203,44 @@ mod tests {
         fwd_cursor: std::cell::Cell<usize>,
         cycle_cursor: std::cell::Cell<usize>,
         draft_in_cycle: std::cell::Cell<usize>,
+        /// When set, every target and draft is read from the output index it
+        /// predicts instead of `step_a_tokens` / `cycles`.
+        positions: Option<Positions>,
+    }
+
+    /// The draft at a listed output index.
+    const MISS: i32 = 30;
+
+    /// A position script: the target at output index `n` is `targets[n]`; the
+    /// draft for `n` is the same except at `misses`. The mock reads the index
+    /// from its committed length (`state_pos`).
+    #[derive(Clone)]
+    struct Positions {
+        targets: Vec<i32>,
+        misses: Vec<usize>,
+    }
+
+    impl Positions {
+        fn target(&self, n: usize) -> i32 {
+            self.targets.get(n).copied().unwrap_or(0)
+        }
+
+        fn draft(&self, n: usize) -> i32 {
+            if self.misses.contains(&n) {
+                MISS
+            } else {
+                self.target(n)
+            }
+        }
+    }
+
+    /// One verify of a turn: the output index its row 0 predicts, its depth,
+    /// and the tokens it emitted.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Span {
+        start: usize,
+        depth: usize,
+        emitted: usize,
     }
 
     impl MockMtpStepper {
@@ -2175,6 +2267,8 @@ mod tests {
                 forget_recurrent_on_rollback_unemitted: false,
                 reserve_ok_budget: None,
                 reserve_calls: std::cell::Cell::new(0),
+                chained: false,
+                spans: Rc::new(RefCell::new(Vec::new())),
             }
         }
 
@@ -2200,6 +2294,7 @@ mod tests {
                 verify_argmax,
                 next_draft: std::cell::Cell::new(0),
                 neg_fill: 0.0,
+                draft_fill: 0.0,
             });
             s
         }
@@ -2226,6 +2321,7 @@ mod tests {
             let mut s = Self::with_cycle(vocab, hidden, draft_argmax, verify_argmax);
             if let Some(c) = s.cycle.as_mut() {
                 c.neg_fill = -1.0e30;
+                c.draft_fill = -1.0e30;
             }
             s
         }
@@ -2253,6 +2349,7 @@ mod tests {
                 fwd_cursor: std::cell::Cell::new(0),
                 cycle_cursor: std::cell::Cell::new(0),
                 draft_in_cycle: std::cell::Cell::new(0),
+                positions: None,
             });
             s
         }
@@ -2300,6 +2397,10 @@ mod tests {
             self.committed_history
         }
 
+        fn chained_cycles_supported(&self) -> bool {
+            self.chained
+        }
+
         fn profiler_relabel(&self) -> Option<&'static str> {
             self.record(Call::ProfilerRelabel);
             self.relabel
@@ -2331,7 +2432,10 @@ mod tests {
                     let n = t.fwd_cursor.get();
                     t.fwd_cursor.set(n + 1);
                     let idx = n.min(t.step_a_tokens.len().saturating_sub(1));
-                    let argmax_id = t.step_a_tokens.get(idx).copied().unwrap_or(0);
+                    let argmax_id = match &t.positions {
+                        Some(positions) => positions.target(self.state_pos.get() as usize),
+                        None => t.step_a_tokens.get(idx).copied().unwrap_or(0),
+                    };
                     let logits =
                         MxArray::from_float32(&logits_row(t.vocab, argmax_id), &[1, 1, t.vocab])?;
                     let hidden =
@@ -2355,11 +2459,14 @@ mod tests {
                 let c_idx = t.cycle_cursor.get();
                 let i = t.draft_in_cycle.get();
                 t.draft_in_cycle.set(i + 1);
-                let argmax_id = t
-                    .cycles
-                    .get(c_idx)
-                    .and_then(|c| c.draft_argmax.get(i).copied())
-                    .unwrap_or(0);
+                let argmax_id = match &t.positions {
+                    Some(positions) => positions.draft(self.state_pos.get() as usize + 1 + i),
+                    None => t
+                        .cycles
+                        .get(c_idx)
+                        .and_then(|c| c.draft_argmax.get(i).copied())
+                        .unwrap_or(0),
+                };
                 let h_next =
                     MxArray::from_float32(&vec![0.0f32; t.hidden as usize], &[1, 1, t.hidden])?;
                 let draft_logits =
@@ -2376,7 +2483,7 @@ mod tests {
                     let h_next =
                         MxArray::from_float32(&vec![0.0f32; c.hidden as usize], &[1, 1, c.hidden])?;
                     let draft_logits = MxArray::from_float32(
-                        &logits_row_filled(c.vocab, argmax_id, c.neg_fill),
+                        &logits_row_filled(c.vocab, argmax_id, c.draft_fill),
                         &[1, c.vocab],
                     )?;
                     Ok((h_next, draft_logits))
@@ -2404,13 +2511,22 @@ mod tests {
                 // reset the in-cycle draft cursor.
                 let c_idx = t.cycle_cursor.get();
                 let rows = depth + 1;
+                let start = (self.state_pos.get() as usize + 1) - rows;
+                self.spans.borrow_mut().push(Span {
+                    start,
+                    depth,
+                    emitted: 0,
+                });
                 let mut flat: Vec<f32> = Vec::with_capacity(rows * t.vocab as usize);
                 for j in 0..rows {
-                    let argmax_id = t
-                        .cycles
-                        .get(c_idx)
-                        .and_then(|c| c.verify_argmax.get(j).copied())
-                        .unwrap_or(0);
+                    let argmax_id = match &t.positions {
+                        Some(positions) => positions.target(start + j),
+                        None => t
+                            .cycles
+                            .get(c_idx)
+                            .and_then(|c| c.verify_argmax.get(j).copied())
+                            .unwrap_or(0),
+                    };
                     flat.extend(logits_row(t.vocab, argmax_id));
                 }
                 let logits = MxArray::from_float32(&flat, &[1, rows as i64, t.vocab])?;
@@ -2457,6 +2573,9 @@ mod tests {
                 accepted: accepted_drafts,
                 depth,
             });
+            if let Some(span) = self.spans.borrow_mut().last_mut() {
+                span.emitted = accepted_drafts + 1;
+            }
             // Replay semantics: snapshot + [anchor, d_0..d_{K-1}] — the
             // accepted frontier, dropping the rejected verify tail.
             self.state_pos
@@ -2860,6 +2979,7 @@ mod tests {
             depth,
             ev.as_mut(),
             commit_anchor,
+            None,
         )
         .expect("scripted run_mtp_cycle must succeed");
         let ledger = step.snapshot();
@@ -2957,6 +3077,7 @@ mod tests {
             depth,
             None,
             commit_anchor,
+            None,
         )
         .expect("scripted dense run_mtp_cycle must succeed");
         DenseScriptedCycle {
@@ -3662,10 +3783,9 @@ mod tests {
     // snapshot / verify / commit / rollback / rollback_unemitted /
     // take_replay_error / into_desynced) the engine drives.
     //
-    // Chained cycles are forced OFF (`MLX_MTP_CHAINED_CYCLES=0`) so the loop
-    // runs its deterministic always-Step-A mode — the chained path is a
-    // GPU-gen-gated cross-cycle optimization whose ledger shape depends on
-    // host hardware, which would make these structural assertions flaky.
+    // The mock stepper reports no chained-cycle support, so the loop runs its
+    // always-Step-A mode on every GPU generation: the chained default is on
+    // from M5, and these ledgers assert the Step-A shape.
     // -----------------------------------------------------------------------
 
     use std::rc::Rc;
@@ -3676,31 +3796,10 @@ mod tests {
     use crate::engine::backend::{
         ChatBackend, FinalizeArgs, MtpBackend, MtpTurnSetup, ResetScope, SaveStateArgs, TurnSetup,
     };
-    use crate::engine::penalties::ReasoningTracker;
+    use crate::engine::penalties::{ReasoningClose, ReasoningTracker};
     use crate::engine::types::ChatResult;
     use crate::stream::Stream;
     use crate::tokenizer::Qwen3Tokenizer;
-
-    /// Serializes the `MLX_MTP_CHAINED_CYCLES` set + the `mtp_chained_cycles_enabled`
-    /// OnceLock read across the turn tests so the forced-OFF value is the one
-    /// that caches. The OnceLock has no in-process caller other than
-    /// `run_mtp_turn`, so a single deterministic "0" write before the first
-    /// `run_mtp_turn` of the binary pins it OFF for all three tests.
-    static CHAINED_OFF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Force chained cycles OFF for a turn test, returning the lock guard that
-    /// keeps the env write + the loop's `mtp_chained_cycles_enabled` read
-    /// serialized.
-    fn force_chained_off() -> std::sync::MutexGuard<'static, ()> {
-        let guard = CHAINED_OFF_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        // SAFETY: the lock serializes this write with every other turn test's
-        // write + read; all write the SAME value, and no production code in
-        // the lib-test binary writes this var.
-        unsafe {
-            std::env::set_var("MLX_MTP_CHAINED_CYCLES", "0");
-        }
-        guard
-    }
 
     /// A never-constructed [`DecodeStep`] so `MockMtpBackend` can satisfy the
     /// `ChatBackend::Decode<'a>: DecodeStep` bound. `begin_decode` is never
@@ -3755,6 +3854,9 @@ mod tests {
         /// see [`MockMtpStepper::recurrent_pos`].
         forget_recurrent_on_rollback: bool,
         forget_recurrent_on_rollback_unemitted: bool,
+        positions: Option<Positions>,
+        chained: bool,
+        spans: Rc<RefCell<Vec<Span>>>,
     }
 
     impl MockMtpBackend {
@@ -3782,7 +3884,28 @@ mod tests {
                 reserve_ok_budget: None,
                 forget_recurrent_on_rollback: false,
                 forget_recurrent_on_rollback_unemitted: false,
+                positions: None,
+                chained: false,
+                spans: Rc::new(RefCell::new(Vec::new())),
             }
+        }
+
+        /// A turn over a position script (vocab 32).
+        fn positions(targets: Vec<i32>, misses: Vec<usize>) -> Self {
+            let mut backend = Self::new(32, 4, Vec::new(), Vec::new(), false);
+            backend.positions = Some(Positions { targets, misses });
+            backend
+        }
+
+        /// The stepper reports chained-cycle support; the loop chains when
+        /// the process switch is on too.
+        fn with_chained_cycles(mut self, chained: bool) -> Self {
+            self.chained = chained;
+            self
+        }
+
+        fn spans(&self) -> Vec<Span> {
+            self.spans.borrow().clone()
         }
 
         /// Model a stepper whose `rollback` rewinds only its attention side,
@@ -3923,6 +4046,11 @@ mod tests {
             step.forget_recurrent_on_rollback = self.forget_recurrent_on_rollback;
             step.forget_recurrent_on_rollback_unemitted =
                 self.forget_recurrent_on_rollback_unemitted;
+            if let Some(turn) = step.turn.as_mut() {
+                turn.positions = self.positions.clone();
+            }
+            step.chained = self.chained;
+            step.spans = Rc::clone(&self.spans);
             Ok(step)
         }
 
@@ -3933,6 +4061,8 @@ mod tests {
     }
 
     struct TurnOut {
+        outcome: crate::engine::penalties::ReasoningOutcome,
+        acceptance: Option<(f64, Vec<f64>, u32)>,
         generated: Vec<u32>,
         profiled_generated_tokens: u64,
         profiled_decode_tokens: u64,
@@ -3985,15 +4115,28 @@ mod tests {
         eos_id: u32,
         depth: usize,
         cancel_flag: Option<&AtomicBool>,
-        mut tracker: ReasoningTracker,
+        tracker: ReasoningTracker,
     ) -> TurnOut {
-        let _force_sparse = ForceSparseAcceptGuard::force(true);
         let params = {
             let mut p = greedy_params();
             p.max_new_tokens = max_new_tokens;
             p.mtp_depth = depth;
             p
         };
+        drive_turn_with_params(backend, first_token, params, eos_id, cancel_flag, tracker)
+    }
+
+    fn drive_turn_with_params(
+        backend: &mut MockMtpBackend,
+        first_token: u32,
+        params: ChatParams,
+        eos_id: u32,
+        cancel_flag: Option<&AtomicBool>,
+        mut tracker: ReasoningTracker,
+    ) -> TurnOut {
+        let _force_sparse = ForceSparseAcceptGuard::force(true);
+        let max_new_tokens = params.max_new_tokens;
+        let depth = params.mtp_depth;
         let mut profiler = crate::decode_profiler::DecodeProfiler::new("mtp_turn_test", "test");
         // The production profiler is enabled by tracing/profiling config. Force
         // it on here so `mark_first_token` participates in the test-only total
@@ -4039,6 +4182,8 @@ mod tests {
         let (profiled_generated_tokens, profiled_decode_tokens) = profiler.token_counts_for_test();
 
         TurnOut {
+            outcome: tracker.outcome(),
+            acceptance: profiler.mtp_acceptance_summary(),
             generated,
             profiled_generated_tokens,
             profiled_decode_tokens,
@@ -4050,62 +4195,514 @@ mod tests {
         }
     }
 
-    #[test]
-    fn thinking_budget_is_exact_across_mtp_cycles() {
-        for budget in [0, 1, 2, 3, 16] {
-            for depth in [1, 3] {
-                let cycle = CycleArgmax {
-                    draft_argmax: vec![5; 4],
-                    verify_argmax: vec![5; 5],
-                };
-                let mut backend = MockMtpBackend::new(16, 4, vec![5; 40], vec![cycle; 40], false);
-                let out = drive_turn_with_tracker(
-                    &mut backend,
-                    4,
-                    budget + 4,
-                    15,
-                    depth,
-                    None,
-                    ReasoningTracker::new(true, Some(budget), &[8, 9]),
-                );
-                let b = budget as usize;
-                assert_eq!(
-                    &out.generated[b..b + 2],
-                    &[8, 9],
-                    "budget={budget}, depth={depth}, output={:?}",
-                    out.generated
-                );
-                for id in [8, 9] {
-                    assert_eq!(out.generated.iter().filter(|&&t| t == id).count(), 1);
-                }
-                assert_eq!(out.generated.len(), b + 4);
-                // No MTP cycle drafts between the end's tokens: each is a Step A.
-                let forced: Vec<usize> = out
-                    .ledger
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| {
-                        matches!(
-                            c,
-                            Call::EvalStep {
-                                budget_forced: true
-                            }
-                        )
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
-                assert_eq!(forced.len(), if budget == 0 { 1 } else { 2 });
-                let cycle_before_close = out.ledger[..forced[forced.len() - 1]]
-                    .iter()
-                    .skip(if budget == 0 { 0 } else { forced[0] })
-                    .any(|c| matches!(c, Call::DraftStep | Call::VerifyStep { .. }));
-                assert!(!cycle_before_close, "budget={budget}, depth={depth}");
-                assert!(
-                    !out.desynced,
-                    "forced reasoning boundary must retain cache synchronization"
-                );
+    /// Plain decoding over a position script: the end token when one is due,
+    /// else the target, until `eos` or `max` tokens.
+    fn plain(
+        targets: &[i32],
+        mut tracker: ReasoningTracker,
+        eos: u32,
+        max: usize,
+    ) -> (Vec<u32>, crate::engine::penalties::ReasoningOutcome) {
+        let mut out = Vec::new();
+        while out.len() < max {
+            let token = tracker
+                .take_forced_token()
+                .unwrap_or(targets[out.len()] as u32);
+            tracker.observe_token(token);
+            out.push(token);
+            if token == eos {
+                break;
             }
         }
+        (out, tracker.outcome())
+    }
+
+    fn verify_depths(ledger: &[Call]) -> Vec<usize> {
+        ledger
+            .iter()
+            .filter_map(|c| match c {
+                Call::VerifyStep { depth } => Some(*depth),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Content tokens 1..=7 by position; no end token, no EOS.
+    fn content(n: usize) -> i32 {
+        1 + (n % 7) as i32
+    }
+
+    /// 507 thinking tokens of a loop, then the loop goes on: the guard hits at
+    /// 512 and the cut lands 64 tokens on; the cycle that holds the cut runs
+    /// at full depth and selects the end at its cut row.
+    #[test]
+    fn a_cycle_hit_inside_an_mtp_cycle_cuts_as_a_row() {
+        for depth in [1, 3] {
+            for chained in [false, true] {
+                let mut targets = vec![5; 200];
+                targets[75] = 15;
+                let mut backend =
+                    MockMtpBackend::positions(targets, Vec::new()).with_chained_cycles(chained);
+                let mut tracker = ReasoningTracker::guarded(true, None, &[8, 9], true);
+                for _ in 0..507 {
+                    tracker.observe_token(5);
+                }
+                let out = drive_turn_with_tracker(&mut backend, 5, 200, 15, depth, None, tracker);
+                let label = format!("depth={depth}, chained={chained}");
+                assert!(out.generated[..69].iter().all(|&t| t == 5), "{label}");
+                assert_eq!(&out.generated[69..71], &[8, 9], "{label}");
+                assert!(out.generated[71..75].iter().all(|&t| t == 5), "{label}");
+                assert_eq!(out.generated.len(), 76, "{label}");
+                assert_eq!(out.finish_reason, "stop", "{label}");
+                assert!(
+                    verify_depths(&out.ledger).iter().all(|&d| d == depth),
+                    "{label}: {:?}",
+                    verify_depths(&out.ledger)
+                );
+                assert!(
+                    backend
+                        .spans()
+                        .iter()
+                        .any(|span| span.start <= 69 && 69 < span.start + span.emitted),
+                    "{label}: a cycle selects the end at its cut row"
+                );
+                assert_eq!(out.outcome.close, Some(ReasoningClose::Cycle), "{label}");
+                assert!(!out.desynced);
+            }
+        }
+    }
+
+    #[test]
+    fn thinking_budget_is_exact_across_mtp_cycles() {
+        let end = [8, 10, 9];
+        for budget in [0, 1, 2, 3, 5, 12, 16] {
+            for depth in [1, 3, 5] {
+                for chained in [false, true] {
+                    let stop = budget as usize + end.len() + 10;
+                    let mut targets: Vec<i32> = (0..200).map(content).collect();
+                    targets[stop] = 15;
+                    let misses = vec![2, 7, budget as usize + 1, budget as usize + 5];
+                    let mut backend = MockMtpBackend::positions(targets.clone(), misses)
+                        .with_chained_cycles(chained);
+                    let tracker = || ReasoningTracker::new(true, Some(budget), &end);
+                    let out = drive_turn_with_tracker(
+                        &mut backend,
+                        targets[0] as u32,
+                        200,
+                        15,
+                        depth,
+                        None,
+                        tracker(),
+                    );
+                    let (expected, outcome) = plain(&targets, tracker(), 15, 200);
+                    let label = format!("budget={budget}, depth={depth}, chained={chained}");
+                    assert_eq!(out.generated, expected, "{label}");
+                    assert_eq!(out.outcome, outcome, "{label}");
+                    assert_eq!(out.outcome.close, Some(ReasoningClose::Budget), "{label}");
+                    assert_eq!(out.outcome.cut_at, Some(budget as u32), "{label}");
+                    assert_eq!(out.finish_reason, "stop", "{label}");
+                    assert!(
+                        verify_depths(&out.ledger).iter().all(|&d| d == depth),
+                        "{label}: every cycle keeps its depth, {:?}",
+                        verify_depths(&out.ledger)
+                    );
+                    assert!(!out.desynced, "{label}");
+                }
+            }
+        }
+    }
+
+    /// Plain decoding that stops on any of `stops`.
+    fn plain_stops(
+        targets: &[i32],
+        mut tracker: ReasoningTracker,
+        stops: &[u32],
+        max: usize,
+    ) -> (Vec<u32>, crate::engine::penalties::ReasoningOutcome) {
+        let mut out = Vec::new();
+        while out.len() < max {
+            let token = tracker
+                .take_forced_token()
+                .unwrap_or(targets[out.len()] as u32);
+            tracker.observe_token(token);
+            out.push(token);
+            if stops.contains(&token) {
+                break;
+            }
+        }
+        (out, tracker.outcome())
+    }
+
+    /// `max_new_tokens` reached inside the end text: the turn ends there,
+    /// as plain decoding does.
+    #[test]
+    fn max_new_tokens_inside_the_end_matches_plain() {
+        let end = [8, 10, 11, 12, 9];
+        for budget in [0, 1, 3, 5] {
+            for inside in 1..end.len() {
+                for depth in [1, 3, 5] {
+                    for chained in [false, true] {
+                        let max = budget as usize + inside;
+                        let targets: Vec<i32> = (0..200).map(content).collect();
+                        let misses = vec![2, budget as usize + 1];
+                        let mut backend = MockMtpBackend::positions(targets.clone(), misses)
+                            .with_chained_cycles(chained);
+                        let tracker = || ReasoningTracker::new(true, Some(budget), &end);
+                        let out = drive_turn_with_tracker(
+                            &mut backend,
+                            targets[0] as u32,
+                            max as i32,
+                            15,
+                            depth,
+                            None,
+                            tracker(),
+                        );
+                        let (expected, outcome) = plain(&targets, tracker(), 15, max);
+                        let label = format!(
+                            "budget={budget}, inside={inside}, depth={depth}, chained={chained}"
+                        );
+                        assert_eq!(out.generated, expected, "{label}");
+                        assert_eq!(out.outcome, outcome, "{label}");
+                        assert_eq!(out.finish_reason, "length", "{label}");
+                        assert!(!out.desynced, "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// An EOS, or an extra EOS id, inside the end text stops the turn on it,
+    /// as plain decoding does.
+    #[test]
+    fn an_eos_inside_the_end_stops_the_turn() {
+        for (label, end, extra) in [
+            ("eos", [8, 15, 9], Vec::new()),
+            ("extra eos", [8, 14, 9], vec![14]),
+        ] {
+            for budget in [0, 1, 3, 5] {
+                for depth in [1, 3, 5] {
+                    for chained in [false, true] {
+                        let targets: Vec<i32> = (0..200).map(content).collect();
+                        let misses = vec![2, budget as usize + 1];
+                        let mut backend = MockMtpBackend::positions(targets.clone(), misses)
+                            .with_chained_cycles(chained);
+                        let tracker = || ReasoningTracker::new(true, Some(budget), &end);
+                        let mut params = greedy_params();
+                        params.max_new_tokens = 200;
+                        params.mtp_depth = depth;
+                        params.extra_eos_ids = extra.clone();
+                        let out = drive_turn_with_params(
+                            &mut backend,
+                            targets[0] as u32,
+                            params,
+                            15,
+                            None,
+                            tracker(),
+                        );
+                        let mut stops = vec![15];
+                        stops.extend(&extra);
+                        let (expected, outcome) = plain_stops(&targets, tracker(), &stops, 200);
+                        let label =
+                            format!("{label}: budget={budget}, depth={depth}, chained={chained}");
+                        assert_eq!(expected.len(), budget as usize + 2, "{label}");
+                        assert_eq!(out.generated, expected, "{label}");
+                        assert_eq!(out.outcome, outcome, "{label}");
+                        assert_eq!(out.finish_reason, "stop", "{label}");
+                        assert!(!out.desynced, "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_64_token_end_takes_at_most_twelve_cycles_at_depth_5() {
+        let mut end = vec![10u32; 63];
+        end.push(9);
+        let budget = 3;
+        for chained in [false, true] {
+            let mut targets: Vec<i32> = (0..200).map(content).collect();
+            targets[budget + end.len() + 4] = 15;
+            let mut backend =
+                MockMtpBackend::positions(targets.clone(), Vec::new()).with_chained_cycles(chained);
+            let tracker = || ReasoningTracker::new(true, Some(budget as i32), &end);
+            let out = drive_turn_with_tracker(
+                &mut backend,
+                targets[0] as u32,
+                200,
+                15,
+                5,
+                None,
+                tracker(),
+            );
+            let (expected, _) = plain(&targets, tracker(), 15, 200);
+            assert_eq!(out.generated, expected, "chained={chained}");
+            let ends = budget..budget + end.len();
+            let cycles = backend
+                .spans()
+                .iter()
+                .filter(|span| (span.start..span.start + span.emitted).any(|n| ends.contains(&n)))
+                .count();
+            assert!(
+                cycles <= 1 + (end.len() - 1).div_ceil(6),
+                "chained={chained}: {cycles} cycles"
+            );
+        }
+    }
+
+    #[test]
+    fn end_tokens_are_not_counted_as_drafts() {
+        let end: Vec<u32> = (16..28).chain([9]).collect();
+        for chained in [false, true] {
+            let targets: Vec<i32> = (0..200).map(content).collect();
+            let mut backend =
+                MockMtpBackend::positions(targets.clone(), Vec::new()).with_chained_cycles(chained);
+            let tracker = || ReasoningTracker::new(true, Some(0), &end);
+            let out = drive_turn_with_tracker(
+                &mut backend,
+                targets[0] as u32,
+                end.len() as i32,
+                15,
+                3,
+                None,
+                tracker(),
+            );
+            assert_eq!(out.generated, end, "chained={chained}");
+            assert!(
+                count(&out.ledger, |c| matches!(c, Call::VerifyStep { .. })) > 0,
+                "chained={chained}: cycles drafted the end"
+            );
+            assert_eq!(
+                out.acceptance.map(|(_, _, cycles)| cycles),
+                None,
+                "chained={chained}: end tokens are not drafts"
+            );
+        }
+    }
+
+    #[test]
+    fn end_cycles_do_not_feed_the_depth_policy() {
+        let content_depths = |thinking: bool| {
+            let targets: Vec<i32> = (0..200).map(content).collect();
+            let mut backend = MockMtpBackend::positions(targets.clone(), Vec::new());
+            let end: Vec<u32> = (16..28).chain([9]).collect();
+            let tracker = if thinking {
+                ReasoningTracker::new(true, Some(0), &end)
+            } else {
+                ReasoningTracker::new(false, None, &[])
+            };
+            let mut params = greedy_params();
+            params.max_new_tokens = 60;
+            params.mtp_depth = 3;
+            params.mtp_adaptive_depth = true;
+            let out =
+                drive_turn_with_params(&mut backend, targets[0] as u32, params, 15, None, tracker);
+            let after = if thinking { end.len() } else { 0 };
+            assert_eq!(&out.generated[..after], &end[..after]);
+            backend
+                .spans()
+                .iter()
+                .filter(|span| span.start >= after)
+                .map(|span| span.depth)
+                .take(6)
+                .collect::<Vec<_>>()
+        };
+        let plain = content_depths(false);
+        assert_eq!(plain, vec![1, 1, 2, 2, 3, 3]);
+        assert_eq!(content_depths(true), plain);
+    }
+
+    /// One cycle of `run_mtp_cycle` with a cut, over the canned mock.
+    #[allow(clippy::too_many_arguments)]
+    fn cut_cycle(
+        params: &ChatParams,
+        verify_fill: f32,
+        draft_argmax: Vec<i32>,
+        verify_argmax: Vec<i32>,
+        depth: usize,
+        cut: Option<&crate::engine::penalties::ThinkingCut>,
+        seed: u64,
+    ) -> Result<(MtpCycleOutcome, Option<(f64, Vec<f64>, u32)>)> {
+        cut_cycle_ev(
+            params,
+            verify_fill,
+            draft_argmax,
+            verify_argmax,
+            depth,
+            cut,
+            seed,
+            None,
+        )
+    }
+
+    /// [`cut_cycle`] with the expected-value depth gate.
+    #[allow(clippy::too_many_arguments)]
+    fn cut_cycle_ev(
+        params: &ChatParams,
+        verify_fill: f32,
+        draft_argmax: Vec<i32>,
+        verify_argmax: Vec<i32>,
+        depth: usize,
+        cut: Option<&crate::engine::penalties::ThinkingCut>,
+        seed: u64,
+        ev: Option<&mut ExpectedValueDepthPolicy>,
+    ) -> Result<(MtpCycleOutcome, Option<(f64, Vec<f64>, u32)>)> {
+        let _force = ForceSparseAcceptGuard::force(true);
+        let mut step = MockMtpStepper::with_cycle(16, 4, draft_argmax, verify_argmax);
+        if let Some(c) = step.cycle.as_mut() {
+            c.neg_fill = verify_fill;
+            c.draft_fill = -1.0e30;
+        }
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(seed);
+        let mut profiler = crate::decode_profiler::DecodeProfiler::new("mtp_cut_test", "test");
+        profiler.enable_for_test();
+        let emb = step.embedding.clone();
+        let zeros = || MxArray::from_float32(&[0.0f32; 4], &[1, 1, 4]).unwrap();
+        let (outcome, _) = run_mtp_cycle(
+            &mut step,
+            zeros(),
+            zeros(),
+            0,
+            &emb,
+            &[1, 2, 3],
+            params,
+            &mut rng,
+            &mut profiler,
+            depth,
+            ev,
+            MtpCommitAnchor::IncludeAnchor,
+            cut,
+        )?;
+        Ok((outcome, profiler.mtp_acceptance_summary()))
+    }
+
+    fn sparse_params() -> ChatParams {
+        ChatParams {
+            sampling_config: Some(SamplingConfig {
+                temperature: Some(1.0),
+                top_k: Some(4),
+                top_p: Some(1.0),
+                min_p: Some(0.0),
+            }),
+            ..greedy_params()
+        }
+    }
+
+    /// The cut of a tracker with `budget` and `end` after `thought` thinking
+    /// tokens and `ended` end tokens.
+    fn cut_after(
+        budget: i32,
+        end: &[u32],
+        thought: usize,
+        ended: usize,
+    ) -> crate::engine::penalties::ThinkingCut {
+        let mut tracker = ReasoningTracker::new(true, Some(budget), end);
+        for _ in 0..thought {
+            tracker.observe_token(5);
+        }
+        for &token in &end[..ended] {
+            tracker.observe_token(token);
+        }
+        tracker.thinking_cut().expect("a cut")
+    }
+
+    #[test]
+    fn a_cut_row_accepts_a_drafted_end_and_rejects_the_rest() {
+        let cut = cut_after(1, &[8, 9], 0, 0);
+        assert_eq!(cut.row, 1);
+        for (label, params, fill) in [
+            ("greedy", greedy_params(), 0.0),
+            ("sparse", sparse_params(), -1.0e30),
+            ("dense", dense_params(), -1.0e30),
+        ] {
+            let (outcome, acceptance) = cut_cycle(
+                &params,
+                fill,
+                vec![5, 8, 7],
+                vec![5, 6, 7, 7],
+                3,
+                Some(&cut),
+                7,
+            )
+            .unwrap_or_else(|e| panic!("{label}: {}", e.reason));
+            assert_eq!(outcome.tokens, vec![5, 8, 9], "{label}");
+            assert_eq!(outcome.effective_depth, 3, "{label}");
+            let (mean, _, cycles) = acceptance.expect("a drafted cycle");
+            assert_eq!((mean, cycles), (2.0, 1), "{label}");
+        }
+    }
+
+    #[test]
+    fn rows_beside_the_cut_keep_their_draws() {
+        let row2 = cut_after(2, &[8, 9], 0, 0);
+        let row3 = cut_after(3, &[8, 9], 0, 0);
+        assert_eq!((row2.row, row3.row), (2, 3));
+        for (label, params) in [("sparse", sparse_params()), ("dense", dense_params())] {
+            let mut two_rows = 0;
+            for seed in 0..16 {
+                let run = |cut: Option<&crate::engine::penalties::ThinkingCut>| {
+                    cut_cycle(&params, 6.0, vec![5, 6, 7], vec![5, 6, 7, 7], 3, cut, seed)
+                        .unwrap_or_else(|e| panic!("{label}: {}", e.reason))
+                        .0
+                        .tokens
+                };
+                let none = run(None);
+                let at2 = run(Some(&row2));
+                let at3 = run(Some(&row3));
+                let n = none.len().min(2);
+                assert_eq!(at2[..at2.len().min(2)], none[..n], "{label} seed={seed}");
+                assert_eq!(at3[..at3.len().min(2)], none[..n], "{label} seed={seed}");
+                two_rows += usize::from(none.len() >= 2);
+            }
+            assert!(two_rows > 0, "{label}: no seed reached row 1");
+        }
+
+        // Row 0 with the close left: it replaces the first proposal, and the
+        // drafter's own rows 1-2 still accept against their own q.
+        let close = cut_after(0, &[8, 9], 0, 1);
+        assert_eq!((close.row, close.replaced(3)), (0, 1));
+        for (label, params) in [("sparse", sparse_params()), ("dense", dense_params())] {
+            let (outcome, acceptance) = cut_cycle(
+                &params,
+                -1.0e30,
+                vec![1, 5, 6],
+                vec![4, 5, 6, 7],
+                3,
+                Some(&close),
+                3,
+            )
+            .unwrap_or_else(|e| panic!("{label}: {}", e.reason));
+            assert_eq!(outcome.tokens, vec![9, 5, 6, 7], "{label}");
+            let (mean, _, cycles) = acceptance.expect("two drafted rows");
+            assert_eq!((mean, cycles), (2.0, 1), "{label}");
+        }
+    }
+
+    /// The depth gate counts drafted positions only: two end tokens fill
+    /// rows 0-1, the drafter's first token is position 0 (EWMA 0.99) and
+    /// goes on to a second; that one's next position (EWMA 0.10) stops it.
+    /// Counting the end tokens would judge the first draft at position 2 and
+    /// stop after it. The policy then holds what the two drafts did.
+    #[test]
+    fn the_depth_gate_counts_drafted_positions_only() {
+        let cut = cut_after(0, &[8, 9], 0, 0);
+        assert_eq!((cut.row, cut.replaced(5)), (0, 2));
+        let mut ev = ExpectedValueDepthPolicy::for_test(5, 1, [0.99, 0.99, 0.10, 0.10, 0.10], 0.30);
+        let (outcome, acceptance) = cut_cycle_ev(
+            &greedy_params(),
+            0.0,
+            vec![1, 1, 5, 6, 7],
+            vec![8, 9, 5, 6, 7, 7],
+            5,
+            Some(&cut),
+            7,
+            Some(&mut ev),
+        )
+        .unwrap_or_else(|e| panic!("{}", e.reason));
+        assert_eq!(outcome.effective_depth, 4, "{:?}", outcome.tokens);
+        assert_eq!(outcome.tokens, vec![8, 9, 5, 6, 7]);
+        let (mean, _, cycles) = acceptance.expect("a drafted cycle");
+        assert_eq!((mean, cycles), (2.0, 1));
     }
 
     /// Count ledger entries matching a predicate.
@@ -4154,7 +4751,6 @@ mod tests {
     /// not a default or a locally re-derived value.
     #[test]
     fn run_mtp_turn_threads_plan_lookahead_into_setup() {
-        let _chained_off = force_chained_off();
         let cycle = CycleArgmax {
             draft_argmax: vec![4, 5],
             verify_argmax: vec![4, 5, 6],
@@ -4175,7 +4771,6 @@ mod tests {
     /// exhaustion to a turn error instead of the pre-cycle AR fallback.
     #[test]
     fn run_mtp_turn_reserves_lookahead_per_cycle_and_falls_back_to_ar() {
-        let _chained_off = force_chained_off();
         // depth 2, full-accept cycles scripted for FOUR cycles — but the
         // reservation budget admits only the FIRST. Cycle 1 runs MTP and
         // commits [4, 5, bonus 6]; every later iteration's reservation
@@ -4231,7 +4826,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_normal_full_length_run() {
-        let _chained_off = force_chained_off();
         // depth 2, every cycle FULL-ACCEPT, no EOS — a genuine MULTI-cycle run
         // that walks to the LENGTH budget. Step A emits the prefill seed (3)
         // first; then each outer iteration's Step A forwards the prior accepted
@@ -4347,7 +4941,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_depth1_records_acceptance() {
-        let _chained_off = force_chained_off();
         // depth 1, full accept (draft 4 + bonus 5), clean length exit:
         //   gen: [3] (seed) + N x (Step A + cycle)
         let cycle = CycleArgmax {
@@ -4371,7 +4964,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_single_cycle_still_records_counts() {
-        let _chained_off = force_chained_off();
         // A 1-cycle depth-1 turn records its raw (accepted, attempted)
         // counts — undersampling is NOT filtered at the recording layer;
         // the gate's confidence-aware decision (mtp_accept_gate_blocks)
@@ -4396,7 +4988,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_requested_depth_gt_1_never_publishes() {
-        let _chained_off = force_chained_off();
         // The gate is scoped to REQUESTED depth-1 turns: eligibility is
         // decided by `p.mtp_depth`, not the observed mean. A depth-2
         // request whose only cycle is near-tail-capped to depth 1 observes
@@ -4426,7 +5017,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_early_eos_stop() {
-        let _chained_off = force_chained_off();
         // depth 2. The FIRST cycle's verify emits the EOS id (15) at accept
         // position 1, so the emit loop commits the accepted draft (4) then the
         // EOS (15) and STOPS with finish_reason "stop". last_in_cache is false:
@@ -4490,7 +5080,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_mid_cycle_stop_rolls_back_unemitted() {
-        let _chained_off = force_chained_off();
         // A TRUE mid-cycle stop: the cycle FULLY accepts depth-3 drafts but an
         // EOS lands as the 2nd ACCEPTED draft (not the last token), so the emit
         // loop breaks BEFORE the cycle's remaining tokens — leaving an
@@ -4572,7 +5161,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_mid_cycle_stop_rewinds_paged_state() {
-        let _chained_off = force_chained_off();
         // PAGED twin of `run_mtp_turn_mid_cycle_stop_rolls_back_unemitted`:
         // same mid-cycle EOS script, but the stepper models the paged
         // target-state frontier (`state_pos`) with the paged rewind semantics
@@ -4640,7 +5228,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "recurrent state at a different frontier")]
     fn run_mtp_turn_mid_cycle_stop_stale_recurrent_trips_frontier_assert() {
-        let _chained_off = force_chained_off();
         // Same mid-cycle EOS script as
         // `run_mtp_turn_mid_cycle_stop_rewinds_paged_state`: full-accept
         // depth-3 cycle, EOS lands as the 2nd emitted token, unemitted = 2.
@@ -4672,7 +5259,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "recurrent state at a different frontier")]
     fn run_mtp_cycle_partial_accept_stale_recurrent_trips_frontier_assert() {
-        let _chained_off = force_chained_off();
         // drafts [4, 5, 6]; verify [4, 9, ..] → d0 accepted, d1 rejected →
         // rollback(accepted=1, depth=3) lands attn at snapshot+2 while the
         // forgetful recurrent side stays at the verify end (snapshot+4).
@@ -4693,7 +5279,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_replay_error_prevents_completed_profile() {
-        let _chained_off = force_chained_off();
         let mut backend =
             MockMtpBackend::new(16, 4, Vec::new(), Vec::new(), /* desynced */ false)
                 .with_replay_error("scripted replay failure");
@@ -4768,7 +5353,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_sync_preset_cancel_stops_before_any_forward() {
-        let _chained_off = force_chained_off();
         // H2: a NON-streaming turn (streaming ctx None) whose cancel flag is
         // already set when the loop starts — the ungated loop-top poll must
         // exit "cancelled" after the seed, before ANY Step-A forward or
@@ -4808,7 +5392,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_sync_cancel_during_step_a_forward() {
-        let _chained_off = force_chained_off();
         // H2: the disconnect lands DURING the first Step-A forward (the mock
         // flips the shared flag inside `forward_with_hidden`). The ungated
         // Step-A poll — same snapshot point as the streaming twin's: after
@@ -4855,7 +5438,6 @@ mod tests {
 
     #[test]
     fn run_mtp_turn_sync_cancel_mid_cycle_rolls_back_unemitted() {
-        let _chained_off = force_chained_off();
         // H2: the disconnect lands BETWEEN the cycle's verify/commit and the
         // emit loop (the mock flips the flag inside `commit_mtp`). The
         // ungated emit-loop poll — same snapshot point as the streaming
@@ -4963,7 +5545,6 @@ mod tests {
     /// MUTATION: moving `step.begin_cycle(...)` back above the near-tail guard.
     #[test]
     fn near_tail_skipped_cycle_does_not_anchor_the_drafter() {
-        let _chained_off = force_chained_off();
         let cycle = CycleArgmax {
             // depth 1, full accept: draft 4 matches verify slot 0, bonus 5.
             draft_argmax: vec![4],

@@ -523,9 +523,12 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{name}: {}", e.reason));
             let dir = ckpt.asset_dir.clone();
             let entry = dir.file_name().unwrap().to_string_lossy().into_owned();
-            assert!(entry.contains("-v9-"), "{name}: entry key {entry}");
+            assert!(entry.contains("-v10-"), "{name}: entry key {entry}");
             let marker = fs::read_to_string(dir.join(".complete")).unwrap();
-            assert!(marker.starts_with("format=9\n"), "{name}: marker\n{marker}");
+            assert!(
+                marker.starts_with("format=10\n"),
+                "{name}: marker\n{marker}"
+            );
 
             let files = names(&dir);
             let weights: Vec<&String> = files
@@ -687,7 +690,7 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     #[cfg(unix)]
     #[tokio::test]
-    async fn sweep_removes_v8_and_keeps_v9_after_cutover() {
+    async fn sweep_removes_v9_and_keeps_v10_after_cutover() {
         let _env_guard = crate::utils::gguf::sweep_env_lock().lock().unwrap();
         let work = work_dir("formats");
         let fx = write_import_fixture("qwen35-dense-untied", &work.join("src"));
@@ -696,7 +699,7 @@ mod tests {
             .await
             .unwrap();
         let marker = fs::read_to_string(ckpt.asset_dir.join(".complete")).unwrap();
-        assert!(marker.starts_with("format=9\n"), "{marker}");
+        assert!(marker.starts_with("format=10\n"), "{marker}");
         let entry = |format: u32| {
             let dir = cache.join(format!(
                 "aged-1-1-v{format}-{}-{}",
@@ -708,17 +711,20 @@ mod tests {
             let path = dir.join(".complete");
             fs::write(
                 &path,
-                marker.replacen("format=9\n", &format!("format={format}\n"), 1),
+                marker.replacen("format=10\n", &format!("format={format}\n"), 1),
             )
             .unwrap();
             set_mtime(&path, TWO_DAYS);
             dir
         };
-        let (v7, v8, v9) = (entry(7), entry(8), entry(9));
-        sweep_until_removed(&cache, "unrelated-key", &[&v7, &v8]);
-        assert!(!v7.exists(), "an aged v7 entry must be swept (control)");
-        assert!(!v8.exists(), "an aged v8 one-file entry must be swept");
-        assert!(v9.is_dir(), "a healthy aged v9 asset entry must survive");
+        let (v8, v9, v10) = (entry(8), entry(9), entry(10));
+        sweep_until_removed(&cache, "unrelated-key", &[&v8, &v9]);
+        assert!(!v8.exists(), "an aged v8 entry must be swept (control)");
+        assert!(
+            !v9.exists(),
+            "an aged v9 entry (special USER_DEFINED tokenizer) must be swept"
+        );
+        assert!(v10.is_dir(), "a healthy aged v10 asset entry must survive");
         native_gguf_unlease_in_use(&ckpt.asset_dir);
         fs::remove_dir_all(&work).ok();
     }

@@ -624,8 +624,20 @@ impl Store {
         #[cfg(test)]
         self.direct_read_windows
             .extend(stats.windows.iter().copied());
-        self.bytes_read += stats.source_bytes;
+        self.count_bytes_read(stats.source_bytes);
         self.slot_upload_bytes += stats.bank_bytes;
+    }
+
+    /// Count `n` routed experts served from slots or banks, here and in the
+    /// live counters `residencyInfo` reads.
+    fn count_slot_hits(&mut self, n: u64) {
+        self.slot_hits += n;
+        self.live.slot_hits.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn count_slot_misses(&mut self, n: u64) {
+        self.slot_misses += n;
+        self.live.slot_misses.fetch_add(n, Ordering::Relaxed);
     }
 
     fn fill_direct_chunk(
@@ -1454,8 +1466,9 @@ impl Store {
                 .get(&layer)
                 .filter(|slots| slots.identity_ready())
                 .ok_or_else(|| err("Qwen4 direct layer has no filled expert banks"))?;
-            self.slot_hits += wanted.len() as u64;
-            return Ok(Some((slots.banks.clone(), ids.to_vec(), experts)));
+            let banks = slots.banks.clone();
+            self.count_slot_hits(wanted.len() as u64);
+            return Ok(Some((banks, ids.to_vec(), experts)));
         }
         let mut slots = if let Some(slots) = self.slots.remove(&layer) {
             slots
@@ -1480,8 +1493,8 @@ impl Store {
                 .copied()
                 .collect();
             missing.sort_unstable();
-            self.slot_hits += (wanted.len() - missing.len()) as u64;
-            self.slot_misses += missing.len() as u64;
+            self.count_slot_hits((wanted.len() - missing.len()) as u64);
+            self.count_slot_misses(missing.len() as u64);
             if !missing.is_empty() {
                 slots.device_mapping = None;
                 MxArray::eval_arrays_with_context(
@@ -1725,7 +1738,7 @@ impl Store {
                         "Qwen4 device route names an expert outside the direct banks",
                     ));
                 }
-                self.slot_hits += selected.iter().collect::<HashSet<_>>().len() as u64;
+                self.count_slot_hits(selected.iter().collect::<HashSet<_>>().len() as u64);
             }
             return Ok(true);
         }
@@ -1763,7 +1776,7 @@ impl Store {
                 slots.tick += 1;
                 *age = slots.tick;
             }
-            self.slot_hits += selected.iter().collect::<HashSet<_>>().len() as u64;
+            self.count_slot_hits(selected.iter().collect::<HashSet<_>>().len() as u64);
         }
         Ok(true)
     }
@@ -2438,11 +2451,9 @@ mod tests {
         let c = memory::flash_next_config();
         let scratch = memory::prefill_scratch(&c, 1024, 32_768);
         assert_eq!(scratch, 1_988_100_096);
-        assert_eq!(memory::prefill_window(&c, &store.plan, 32_768), 1024);
         let mut ordinary = store.plan.clone();
         ordinary.partial_direct_gate = false;
         assert!(!ordinary.use_direct_turn_floor());
-        assert_eq!(memory::prefill_window(&c, &ordinary, 32_768), 1);
 
         let post_available = host.available() - FIXED_BANK_BYTES - planned;
         assert_eq!(post_available, 7_944_761_856);
@@ -2473,6 +2484,207 @@ mod tests {
         );
         assert_eq!(store.bytes_read, 0);
         assert_eq!(store.slot_bytes, 0);
+    }
+
+    /// A 128 GiB Mac (a 115,448,725,504-byte Metal working set, nothing
+    /// else loaded) on the released text geometry, through the load's own
+    /// steps: the store plan, the host gate, the engine plan and the plan the
+    /// decoder adopts. A quiet host admits every expert bank; a busy one
+    /// (72 GiB it cannot reclaim) refuses them and the store keeps about 300
+    /// of 512 slots under the plan's cap. Both prefill 1,024 rows up to the
+    /// 65,536-token allowance the gate priced; past it only the refused
+    /// store halves its passes, to fit the scratch that gate reserved.
+    /// MUTATION: `adopt_plan` keeps no reservation on a refused gate → red
+    /// (1,024-row passes at 200,000 tokens on the busy host).
+    #[test]
+    fn busy_host_prefills_the_planned_chunk_on_a_partial_store() {
+        use super::super::super::{Qwen4ExpContextLimits, load_plan, memory};
+        use crate::engine::memory_plan::LiveMemory;
+        if !gpu_repack_available() {
+            return;
+        }
+        let Some((mut store, layers)) = draft_bank_store(None) else {
+            return;
+        };
+        store.tensors.retain(|name, _| !name.starts_with("mtp."));
+        let routed: u64 = layers.iter().sum();
+        let shard = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/qwen4-exp/config.json")
+            .canonicalize()
+            .unwrap();
+        for tensor in store.tensors.values_mut() {
+            tensor.path = shard.clone();
+        }
+        store.gguf_source = Some(DirectGgufSource::new(std::slice::from_ref(&shard)).unwrap());
+        store.direct_gguf = true;
+        store.metadata.insert(
+            "qwen4exp.expert_used_count".into(),
+            GgufMetaValue::Uint32(10),
+        );
+        const WORKING_SET: u64 = 115_448_725_504;
+        let gib = |n: f64| (n * (1u64 << 30) as f64) as u64;
+        let quiet = memory::HostMemory {
+            physical: 128 << 30,
+            free: gib(77.3),
+            file: gib(10.0),
+            anonymous: gib(20.1),
+            purgeable: gib(0.7),
+            wired: gib(13.2),
+            compressor: gib(7.5),
+        };
+        let busy = memory::HostMemory {
+            physical: 128 << 30,
+            free: 30 << 30,
+            file: 25 << 30,
+            anonymous: 51 << 30,
+            purgeable: 0,
+            wired: 13 << 30,
+            compressor: 8 << 30,
+        };
+        let c = load_plan::tests::int8_config();
+        let inventory = load_plan::LoadInventory {
+            store_fixed_bytes: FIXED_BANK_BYTES,
+            ..store.load_inventory(&c, false).unwrap()
+        };
+        assert_eq!(inventory.experts.all, routed);
+        let live = |active: u64| LiveMemory {
+            working_set_bytes: WORKING_SET,
+            active_bytes: active,
+            registered_pool_bytes: 0,
+        };
+        let decision = load_plan::plan_store(
+            "Qwen4Exp",
+            &c,
+            &inventory,
+            live(0),
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(decision.store.whole, "the plan holds every expert");
+        store.set_store_plan(decision.store, inventory.store_fixed_bytes);
+        store.plan.physical_bytes = Some(128 << 30);
+        let need =
+            inventory.store_fixed_bytes + decision.store.row_cache_bytes + decision.allowance;
+        let engine = |active: u64, held_back: u64| {
+            load_plan::plan_engine("Qwen4Exp", &c, live(active), held_back, None, false, false)
+        };
+        let adopted = |plan: &memory::Plan,
+                       live: &Arc<Live>,
+                       engine_plan: &crate::engine::memory_plan::MemoryPlan| {
+            let limits =
+                Qwen4ExpContextLimits::from_plan(&c, engine_plan, c.served_context_tokens())
+                    .unwrap();
+            let (mut decoder, _) = super::super::super::tests::tiny_decoder();
+            decoder.config = Arc::new(c.clone());
+            decoder.weights.plan = plan.clone();
+            decoder.weights.live = Arc::clone(live);
+            decoder.adopt_plan(
+                limits.effective_window_tokens as usize,
+                decision.allowance_tokens,
+            );
+            assert_eq!(
+                decoder
+                    .weights
+                    .live
+                    .prefill_chunk_tokens
+                    .load(Ordering::Acquire),
+                decoder.prefill_chunk_size as u64
+            );
+            let passes = [0, 64_000, 200_000].map(|position| {
+                decoder.history = vec![0; position];
+                decoder.prefill_pass_window()
+            });
+            (
+                decoder.prefill_chunk_size,
+                passes,
+                limits.effective_window_tokens,
+            )
+        };
+
+        let mut direct = store.plan.clone();
+        {
+            let _quiet = memory::scoped_test_host(quiet);
+            memory::direct_gate(&mut direct, need, routed).unwrap();
+        }
+        direct.direct = true;
+        direct.direct_bytes = routed;
+        let direct_engine =
+            engine(FIXED_BANK_BYTES + routed, decision.store.row_cache_bytes).unwrap();
+        let (direct_window, direct_passes, direct_context) =
+            adopted(&direct, &Arc::default(), &direct_engine);
+
+        {
+            let _busy = memory::scoped_test_host(busy);
+            assert!(
+                store
+                    .select_direct_residency_with(
+                        512,
+                        need,
+                        &mut memory::direct_gate,
+                        &mut |_| panic!("a refused gate must not allocate"),
+                    )
+                    .unwrap()
+            );
+        }
+        assert!(!store.plan.direct && store.plan.partial_direct_gate);
+        let slots = store.plan.partial_expert_slots;
+        assert!((250..=350).contains(&slots), "{slots} slots");
+        let held_back = store.held_back_bytes();
+        let partial_engine = load_plan::settle(
+            &|held_back| engine(0, held_back),
+            held_back,
+            decision.allowance,
+            &mut |bytes| store.lower_store_cap(bytes),
+        )
+        .unwrap();
+        let (partial_window, partial_passes, partial_context) =
+            adopted(&store.plan, &store.live, &partial_engine);
+
+        let scratch = |rows, context| memory::prefill_scratch(&c, rows, context);
+        eprintln!(
+            "busy host: hard {} B; store plan {:?}; allowance {} B; gate need {} B; routed {} B; \
+             quiet bank budget {} B; busy bank budget {} B, {} slots, planned slot bytes {} B, \
+             weight budget {} B, available at gate {:?} B; direct engine dynamic {} B, window {}, \
+             transient {:?} B, pool max blocks {:?}; partial engine dynamic {} B, window {}, \
+             transient {:?} B, pool max blocks {:?}, passes at 0 / 64,000 / 200,000: {:?}; scratch 1024 rows at 65,536 / 262,144: {} / {} B; \
+             2048 rows: {} / {} B",
+            partial_engine.hard_budget_bytes,
+            decision.store,
+            decision.allowance,
+            need,
+            routed,
+            direct.bank_budget,
+            store.plan.bank_budget,
+            slots,
+            store.planned_slot_bytes().unwrap(),
+            store.plan.budget,
+            store.plan.available_bytes,
+            direct_engine.dynamic_budget_bytes,
+            direct_context,
+            direct_engine.pool.map(|pool| pool.lane.transient_bytes),
+            direct_engine.pool.map(|pool| pool.max_blocks),
+            partial_engine.dynamic_budget_bytes,
+            partial_context,
+            partial_engine.pool.map(|pool| pool.lane.transient_bytes),
+            partial_engine.pool.map(|pool| pool.max_blocks),
+            partial_passes,
+            scratch(1024, 65_536),
+            scratch(1024, 262_144),
+            scratch(2048, 65_536),
+            scratch(2048, 262_144),
+        );
+        assert_eq!(direct_window, 1024);
+        assert_eq!(partial_window, 1024);
+        assert_eq!(direct_passes, [1024; 3]);
+        assert_eq!(partial_passes[..2], [1024, 1024]);
+        let long = partial_passes[2];
+        assert!(long < 1024, "{partial_passes:?}");
+        assert!(scratch(long, 200_000 + 1024) <= scratch(1024, 65_536));
+        assert_eq!(store.slot_bytes, 0);
+        assert_eq!(store.bytes_read, 0);
     }
 
     /// A slot count cached with no room for the draft banks beside it: the
@@ -2798,6 +3010,14 @@ mod tests {
             }
             lazy.push(output);
         }
+        assert_eq!(
+            [
+                store.live.slot_hits.load(Ordering::Relaxed),
+                store.live.slot_misses.load(Ordering::Relaxed),
+            ],
+            [store.slot_hits, store.slot_misses],
+            "slot and device-route hits reach the live counters"
+        );
         let reduced = lazy.last().unwrap().sum(Some(&[-1]), Some(false)).unwrap();
         store.complete_expert_window(0, &reduced).unwrap();
         assert!(store.slots[&0].readers.is_empty());

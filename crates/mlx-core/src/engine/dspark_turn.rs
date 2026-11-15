@@ -26,7 +26,7 @@ use crate::engine::backend::{
 use crate::engine::decode::{StreamingCtx, TurnStreaming};
 use crate::engine::paged_turn::FinishPagedTurnArgs;
 use crate::engine::params::{ChatParams, generated_capacity_hint};
-use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
+use crate::engine::penalties::{CutTargets, ReasoningTracker, ThinkingCut, apply_all_penalties};
 use crate::engine::plan::SpeculativeDraftWidth;
 use crate::engine::spec_paged::SpecTurnEpilogue;
 use crate::sampling;
@@ -36,11 +36,13 @@ use crate::stream::Stream;
 /// Prepare every deterministic decision from that prefix, then cross the device
 /// boundary once. Decisions after the first mismatch are discarded. This must
 /// not be used for stochastic acceptance, whose residual draws are sequential.
+/// A row `forced` decides takes its token from there.
 fn penalized_greedy_accept(
     logits: &MxArray,
     drafts: &[i32],
     history: &[u32],
     params: &ChatParams,
+    forced: Option<&CutTargets>,
 ) -> Result<(usize, u32)> {
     let vocab = logits.shape_at(2)?;
     let mut prefix = history.to_vec();
@@ -59,7 +61,10 @@ fn penalized_greedy_accept(
         "speculative_greedy_accept",
     )?;
     for (i, decision) in decisions.iter().enumerate() {
-        let target = decision.item_at_int32(0)?;
+        let target = match forced.and_then(|f| f.at(i)) {
+            Some(token) => token as i32,
+            None => decision.item_at_int32(0)?,
+        };
         if drafts.get(i) != Some(&target) {
             return Ok((i, target as u32));
         }
@@ -119,12 +124,16 @@ fn accept_device_budgeted_greedy(
 /// after the acceptance eval has forced the shared verify graph — never
 /// earlier (an early read would reintroduce the proposal-boundary sync the
 /// device path exists to remove).
+///
+/// `cut` decides the rows at and after a thinking cut: each selects its end
+/// token, with no draw.
 pub(crate) fn accept_dspark_proposal(
     logits: &MxArray,
     proposal: &mut DsparkProposal,
     hist: &[u32],
     p: &ChatParams,
     rng: &mut dyn rand::Rng,
+    cut: Option<&ThinkingCut>,
 ) -> Result<(usize, u32)> {
     let draft_len = proposal.draft_len()?;
     if logits.ndim()? != 3
@@ -161,9 +170,13 @@ pub(crate) fn accept_dspark_proposal(
             // The verify graph (incl. a device-resident proposal path) is
             // now materialized: the host back-fill below is a plain copy.
             proposal.materialize_draft_ids()?;
+            let forced = cut_targets(cut, &proposal.draft_ids);
             let mut target_argmax: Vec<i32> = Vec::with_capacity(draft_len + 1);
             for i in 0..=draft_len {
-                target_argmax.push(argmax_arr.item_at_int32(i)?);
+                target_argmax.push(match forced.as_ref().and_then(|f| f.at(i)) {
+                    Some(token) => token as i32,
+                    None => argmax_arr.item_at_int32(i)?,
+                });
             }
             let mut k = 0usize;
             while k < draft_len && target_argmax[k] == proposal.draft_ids[k] {
@@ -175,7 +188,8 @@ pub(crate) fn accept_dspark_proposal(
         // Host ids feed the penalized history prefix before the eval, so a
         // device path (not produced under active penalties) must land first.
         proposal.materialize_draft_ids()?;
-        penalized_greedy_accept(logits, &proposal.draft_ids, hist, p)
+        let forced = cut_targets(cut, &proposal.draft_ids);
+        penalized_greedy_accept(logits, &proposal.draft_ids, hist, p, forced.as_ref())
     } else {
         // Sampled path: per-position Leviathan accept + residual
         // resample against the stepper's proposal densities.
@@ -184,6 +198,14 @@ pub(crate) fn accept_dspark_proposal(
             // (a device path is not produced for sampled turns today; this
             // keeps the contract correct if one ever is).
             proposal.materialize_draft_ids()?;
+            let forced = cut_targets(cut, &proposal.draft_ids);
+            if forced.is_some() {
+                // A cycle whose rows are all decided reads no target; the
+                // verify graph is still forced before its anchor's cache state
+                // is kept.
+                MxArray::eval_arrays_with_context(&[logits], "speculative_cut_accept")?;
+            }
+            let forced_at = |row: usize| forced.as_ref().and_then(|f| f.at(row));
             // A zero-draft cycle is the intentional AR-through-verify
             // fallback: it owns no proposal rows and samples only the
             // verifier boundary below. Enforce exclusive dense/sparse
@@ -223,7 +245,9 @@ pub(crate) fn accept_dspark_proposal(
             let mut k = 0usize;
             let mut boundary: Option<u32> = None;
             for (i, p_target) in targets.iter().enumerate() {
-                let (accept, out_tok) = if has_sparse {
+                let (accept, out_tok) = if let Some(token) = forced_at(i) {
+                    (proposal.draft_ids[i] == token as i32, token as i32)
+                } else if has_sparse {
                     sampling::accept_with_residual_dense_target_sparse_draft(
                         p_target,
                         proposal.draft_sparse_dists[i].as_row(),
@@ -246,7 +270,7 @@ pub(crate) fn accept_dspark_proposal(
                     break;
                 }
             }
-            let boundary_id = match boundary {
+            let boundary_id = match boundary.or_else(|| forced_at(draft_len)) {
                 Some(b) => b,
                 None => {
                     // All L drafts accepted: bonus sample from row L.
@@ -263,6 +287,11 @@ pub(crate) fn accept_dspark_proposal(
             Ok((k, boundary_id))
         })()
     }
+}
+
+/// The rows `cut` decides for `drafts`.
+fn cut_targets(cut: Option<&ThinkingCut>, drafts: &[i32]) -> Option<CutTargets> {
+    cut.map(|c| c.targets(drafts))
 }
 
 /// Required arguments of [`run_dspark_turn`] — the DSpark analog of
@@ -852,17 +881,16 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             measurement_cycle = DsparkMeasurementCycle::None;
         }
 
-        // Reserve the boundary token too: no verified/committed speculative
-        // prefix may cross the remaining reasoning budget. At zero, verify only
-        // the existing anchor; the boundary is the thinking end's next token.
-        if let Some(remaining_thinking) = tracker.unforced_token_budget() {
-            let capped = l_cap.min(remaining_thinking.saturating_sub(1));
-            if capped != l_cap {
-                measurement_cycle = DsparkMeasurementCycle::None;
-            }
-            l_cap = capped;
+        // A thinking cut is a row of this cycle's verify: the cycle keeps its
+        // depth, and a probe never times a cycle the cut decides.
+        let cut = if tf.is_forcing() {
+            None
+        } else {
+            tracker.thinking_cut()
+        };
+        if l_cap >= 1 && cut.as_ref().is_some_and(|c| c.touches(l_cap)) {
+            measurement_cycle = DsparkMeasurementCycle::None;
         }
-        let forced = tracker.take_forced_token();
 
         // `L_cap == 0` (remaining == 1): skip propose entirely — the cycle
         // degenerates to a single AR step THROUGH verify (verify_ids =
@@ -895,6 +923,13 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                  (the DsparkStepper::propose contract allows fewer, never more)"
             )));
         }
+        // At row 0 the end tokens are the first proposals; the cycle then
+        // verifies host ids.
+        let touched = cut.as_ref().is_some_and(|c| c.touches(proposed_len));
+        if touched && let Some(c) = cut.as_ref() {
+            proposal.materialize_draft_ids()?;
+            proposal.replace_prefix(c.proposals(proposed_len))?;
+        }
 
         let proposal_ns = cycle_started_at
             .elapsed()
@@ -912,6 +947,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             proposal.truncate(keep);
         }
         let draft_len = proposal.draft_len()?;
+        let replaced = cut.as_ref().map_or(0, |c| c.replaced(draft_len));
 
         profiler.begin("dspark_verify");
         // The one-token calibration path deliberately omits speculative
@@ -951,13 +987,9 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // boundary token (bonus on full accept, residual on rejection).
         profiler.begin("dspark_accept");
         let mut device_budget_observation = None;
-        let accept_res = if let Some(token) = forced {
-            // Force the verify graph before retaining its anchor's cache state.
-            logits.eval();
-            Ok((0, token))
-        } else if tf_ids.is_some() {
+        let accept_res = if tf_ids.is_some() {
             tf.accept(&logits, &mut proposal, generated)
-        } else if let Some(budget) = step.device_verification_budget() {
+        } else if !touched && let Some(budget) = step.device_verification_budget() {
             let temperature = p.sampling_config.and_then(|c| c.temperature).unwrap_or(1.0);
             if !sampling::is_greedy_temperature(temperature)
                 || p.repetition_penalty != 1.0
@@ -975,15 +1007,14 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                 },
             )
         } else {
-            accept_dspark_proposal(&logits, &mut proposal, hist, p, rng)
+            accept_dspark_proposal(&logits, &mut proposal, hist, p, rng, cut.as_ref())
         };
         profiler.end();
         let (accepted_drafts_k, boundary_id) = accept_res?;
         // Acceptance has forced the verify graph. Back-fill a device proposal
         // now so commit can reuse the engine's exact verify provenance instead
         // of reading the concatenated verify input from the device again. The
-        // ordinary accept paths already did this; this call also covers the
-        // force-think branch.
+        // ordinary accept paths already did this.
         proposal.materialize_draft_ids()?;
         let verify_ns = verify_started_at
             .elapsed()
@@ -1150,9 +1181,13 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // count `k` — the same argument semantics as `run_mtp_cycle`'s
         // `record_mtp_cycle(effective_depth, accepted_drafts)` (boundary
         // excluded from both). Degenerate `L == 0` cycles are plain AR
-        // steps and are NOT recorded.
-        if draft_len >= 1 {
-            profiler.record_mtp_cycle(draft_len, accepted_drafts_k);
+        // steps and are NOT recorded, nor are end tokens that replaced
+        // proposals.
+        if draft_len - replaced >= 1 {
+            profiler.record_mtp_cycle(
+                draft_len - replaced,
+                accepted_drafts_k.saturating_sub(replaced),
+            );
         }
 
         // Emit the clamped prefix — `run_mtp_turn`'s emit-block bookkeeping
@@ -1501,7 +1536,7 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
             retain_final_length_token: true,
             generation_start,
             first_token_instant,
-            reasoning_tokens: reasoning_tracker.reasoning_token_count(),
+            reasoning: reasoning_tracker.outcome(),
             profiler: &profiler,
             stream_skip_special,
             // The epilogue takes scalar copies — the same defaults the
@@ -1544,7 +1579,7 @@ mod tests {
     };
     use crate::engine::decode::StreamingCtx;
     use crate::engine::params::ChatParams;
-    use crate::engine::penalties::ReasoningTracker;
+    use crate::engine::penalties::{ReasoningClose, ReasoningOutcome, ReasoningTracker};
     use crate::engine::types::{ChatResult, ChatStreamChunk};
     use crate::sampling::SamplingConfig;
     use crate::stream::Stream;
@@ -1552,8 +1587,8 @@ mod tests {
 
     use super::{
         DSPARK_BREAK_EVEN_SPEC_CYCLES, DsparkBreakEvenChoice, DsparkBreakEvenPolicy,
-        DsparkMeasurementCycle, DsparkTurnArgs, apply_all_penalties, penalized_greedy_accept,
-        run_dspark_turn,
+        DsparkMeasurementCycle, DsparkTurnArgs, accept_dspark_proposal, apply_all_penalties,
+        penalized_greedy_accept, run_dspark_turn,
     };
 
     #[test]
@@ -1752,6 +1787,46 @@ mod tests {
         verify_row_budget: Option<MxArray>,
         pending_committed_state: RefCell<Option<MxArray>>,
         ledger: Rc<RefCell<Vec<Call>>>,
+        /// When set, targets and drafts are read from the output index each
+        /// row predicts; `committed` is the anchor's index.
+        positions: Option<Positions>,
+        committed: Cell<usize>,
+        last_verify: RefCell<Vec<u32>>,
+        spans: Rc<RefCell<Vec<Span>>>,
+    }
+
+    /// The draft at a listed output index.
+    const MISS: i32 = 30;
+
+    /// The target at output index `n` is `targets[n]`; the draft for `n` is
+    /// the same except at `misses`.
+    #[derive(Clone)]
+    struct Positions {
+        targets: Vec<i32>,
+        misses: Vec<usize>,
+    }
+
+    impl Positions {
+        fn target(&self, n: usize) -> i32 {
+            self.targets.get(n).copied().unwrap_or(0)
+        }
+
+        fn draft(&self, n: usize) -> i32 {
+            if self.misses.contains(&n) {
+                MISS
+            } else {
+                self.target(n)
+            }
+        }
+    }
+
+    /// One verify: the output index its row 0 predicts, its drafts, and the
+    /// tokens its commit kept.
+    #[derive(Clone, Copy, Debug)]
+    struct Span {
+        start: usize,
+        drafts: usize,
+        kept: usize,
     }
 
     impl MockDsparkStepper {
@@ -1765,6 +1840,23 @@ mod tests {
         fn scripted_verify_output(&self, rows: usize) -> Result<DsparkVerifyOutput> {
             let script = self.script();
             let mut flat: Vec<f32> = Vec::with_capacity(rows * self.vocab as usize);
+            if let Some(positions) = &self.positions {
+                let start = self.committed.get() + 1;
+                self.spans.borrow_mut().push(Span {
+                    start,
+                    drafts: rows - 1,
+                    kept: 0,
+                });
+                for j in 0..rows {
+                    flat.extend(logits_row(
+                        self.vocab,
+                        positions.target(start + j),
+                        self.neg_fill,
+                    ));
+                }
+                let logits = MxArray::from_float32(&flat, &[1, rows as i64, self.vocab])?;
+                return Ok(DsparkVerifyOutput { logits });
+            }
             for j in 0..rows {
                 match script.verify_rows.as_ref().and_then(|r| r.get(j)) {
                     Some(row) => flat.extend_from_slice(row),
@@ -1824,6 +1916,7 @@ mod tests {
 
         fn commit_ar_probe(&mut self) -> Result<()> {
             self.ledger.borrow_mut().push(Call::CommitArProbe);
+            self.committed.set(self.committed.get() + 1);
             self.cursor.set(self.cursor.get() + 1);
             Ok(())
         }
@@ -1845,6 +1938,32 @@ mod tests {
                 anchor: anchor_id,
                 max_len,
             });
+            if let Some(positions) = &self.positions {
+                let draft_ids = (0..max_len)
+                    .map(|i| positions.draft(self.committed.get() + 1 + i))
+                    .collect::<Vec<_>>();
+                let greedy = crate::sampling::is_greedy_temperature(
+                    params
+                        .sampling_config
+                        .and_then(|c| c.temperature)
+                        .unwrap_or(1.0),
+                );
+                let draft_dists = if greedy {
+                    Vec::new()
+                } else {
+                    draft_ids
+                        .iter()
+                        .map(|&id| MxArray::from_float32(&one_hot(self.vocab, id), &[self.vocab]))
+                        .collect::<Result<Vec<_>>>()?
+                };
+                return Ok(DsparkProposal {
+                    draft_ids,
+                    device_draft_ids: None,
+                    draft_dists,
+                    draft_sparse_dists: Vec::new(),
+                    keep_probabilities: None,
+                });
+            }
             let script = self.script();
             self.verify_row_budget = (self.device_budget_enabled && params.mtp_adaptive_depth)
                 .then(|| MxArray::from_int32(&[script.draft_ids.len() as i32 + 1], &[1]))
@@ -1883,6 +2002,7 @@ mod tests {
             self.ledger.borrow_mut().push(Call::Verify {
                 ids: verify_ids.to_vec(),
             });
+            *self.last_verify.borrow_mut() = verify_ids.to_vec();
             self.scripted_verify_output(verify_ids.len())
         }
 
@@ -1929,6 +2049,12 @@ mod tests {
                 keep,
                 total: total_written,
             });
+            self.committed.set(self.committed.get() + keep);
+            if self.positions.is_some()
+                && let Some(span) = self.spans.borrow_mut().last_mut()
+            {
+                span.kept = keep;
+            }
             if self.verify_row_budget.is_some() {
                 let pending = MxArray::from_int32(&[keep as i32], &[1])?.add_scalar(1.0)?;
                 *self.pending_committed_state.borrow_mut() = Some(pending);
@@ -1943,6 +2069,17 @@ mod tests {
             total_written: usize,
             verified_ids: &[u32],
         ) -> Result<()> {
+            if self.positions.is_some() {
+                if verified_ids != self.last_verify.borrow().as_slice()
+                    || verified_ids.len() != total_written
+                {
+                    return Err(Error::from_reason(format!(
+                        "mock commit provenance mismatch: ids={verified_ids:?}, verified={:?}",
+                        self.last_verify.borrow()
+                    )));
+                }
+                return self.commit(keep, total_written);
+            }
             let expected_drafts = self
                 .script()
                 .draft_ids
@@ -2007,6 +2144,8 @@ mod tests {
         begin_calls: Cell<usize>,
         /// `block_size` observed by `begin_dspark_decode` (setup plumbing).
         seen_block_size: Cell<usize>,
+        positions: Option<Positions>,
+        spans: Rc<RefCell<Vec<Span>>>,
     }
 
     impl MockDsparkBackend {
@@ -2026,7 +2165,25 @@ mod tests {
                 ledger: Rc::new(RefCell::new(Vec::new())),
                 begin_calls: Cell::new(0),
                 seen_block_size: Cell::new(usize::MAX),
+                positions: None,
+                spans: Rc::new(RefCell::new(Vec::new())),
             }
+        }
+
+        /// A turn over a position script (vocab 32); `sampled` gives one-hot
+        /// verify rows for the sampled path.
+        fn positions(targets: Vec<i32>, misses: Vec<usize>, sampled: bool) -> Self {
+            let mut backend = if sampled {
+                Self::sampled(32, Vec::new())
+            } else {
+                Self::greedy(32, Vec::new())
+            };
+            backend.positions = Some(Positions { targets, misses });
+            backend
+        }
+
+        fn spans(&self) -> Vec<Span> {
+            self.spans.borrow().clone()
         }
 
         /// Sampled-path backend: `-1e30` fill makes verify softmax rows
@@ -2171,6 +2328,10 @@ mod tests {
                 verify_row_budget: None,
                 pending_committed_state: RefCell::new(None),
                 ledger: Rc::clone(&self.ledger),
+                positions: self.positions.clone(),
+                committed: Cell::new(0),
+                last_verify: RefCell::new(Vec::new()),
+                spans: Rc::clone(&self.spans),
             })
         }
     }
@@ -2239,6 +2400,7 @@ mod tests {
     /// Raw outcome of a SYNC turn drive — keeps the `Result` so contract-
     /// error tests can assert the failure alongside the ledger state.
     struct RawTurnOut {
+        outcome: ReasoningOutcome,
         result: Result<super::DsparkTurnOutcome>,
         generated: Vec<u32>,
         profiled_generated_tokens: u64,
@@ -2346,6 +2508,7 @@ mod tests {
         let (profiled_generated_tokens, profiled_decode_tokens) = profiler.token_counts_for_test();
 
         RawTurnOut {
+            outcome: tracker.outcome(),
             result,
             generated,
             profiled_generated_tokens,
@@ -2740,92 +2903,356 @@ mod tests {
         assert_eq!(out.generated.len(), 6, "the turn still fills its budget");
     }
 
+    /// Plain decoding over a position script: the end token when one is due,
+    /// else the target, until `eos` or `max` tokens.
+    fn plain(
+        targets: &[i32],
+        mut tracker: ReasoningTracker,
+        eos: u32,
+        max: usize,
+    ) -> (Vec<u32>, ReasoningOutcome) {
+        let mut out = Vec::new();
+        while out.len() < max {
+            let token = tracker
+                .take_forced_token()
+                .unwrap_or(targets[out.len()] as u32);
+            tracker.observe_token(token);
+            out.push(token);
+            if token == eos {
+                break;
+            }
+        }
+        (out, tracker.outcome())
+    }
+
+    fn content(n: usize) -> i32 {
+        1 + (n % 7) as i32
+    }
+
+    fn verify_widths(ledger: &[Call]) -> Vec<usize> {
+        ledger
+            .iter()
+            .filter_map(|call| match call {
+                Call::Verify { ids } => Some(ids.len()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 510 thinking tokens of a loop, then the loop goes on: the guard hits at
+    /// 512 inside the first block and the cut lands 64 tokens on, a row of a
+    /// full block.
     #[test]
-    fn thinking_budget_caps_speculative_prefix_and_commits_forced_boundary_once() {
-        for budget in [0, 1, 2, 3, 16] {
-            for sampled in [false, true] {
-                let mut cycles = Vec::new();
-                let mut remaining = (budget as usize).saturating_sub(1);
-                while remaining > 0 {
-                    let depth = 2.min(remaining - 1);
-                    let mut script = CycleScript::greedy(vec![5; depth], vec![5; depth + 1]);
-                    if sampled {
-                        script.draft_dists = vec![one_hot(16, 5); depth];
-                    }
-                    cycles.push(script);
-                    remaining -= depth + 1;
-                }
-                // One one-row cycle per forced end token after the first
-                // (budget 0 forces the first as the prefill anchor).
-                let forced_cycles = if budget > 0 { 2 } else { 1 };
-                for _ in 0..forced_cycles {
-                    cycles.push(CycleScript::greedy(vec![], vec![5]));
-                }
-                let mut backend = if sampled {
-                    MockDsparkBackend::sampled(16, cycles)
-                } else {
-                    MockDsparkBackend::greedy(16, cycles)
-                };
-                let mut params = if sampled {
-                    dense_params()
-                } else {
-                    greedy_params()
-                };
-                params.max_new_tokens = budget + 4;
-                let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(42);
-                let out = drive_turn_with_tracker(
-                    &mut backend,
-                    params,
-                    4,
-                    15,
-                    2,
-                    &mut rng,
-                    None,
-                    None,
-                    ReasoningTracker::new(true, Some(budget), &[8, 9]),
-                );
-                assert!(
-                    out.result.is_ok(),
-                    "budget={budget}: {:?}",
-                    out.result.err()
-                );
-                let mut expected = vec![5; budget as usize];
-                if budget > 0 {
-                    expected[0] = 4;
-                }
-                expected.extend([8, 9, 0, 0]);
-                assert_eq!(
-                    out.generated, expected,
-                    "budget={budget}, sampled={sampled}"
-                );
-                let ledger = backend.ledger_snapshot();
-                assert_eq!(
-                    commits(&ledger).iter().map(|(keep, _)| keep).sum::<usize>(),
-                    out.generated.len() - 1,
-                    "every token except the final boundary is cached exactly once"
-                );
-                let verifies: Vec<&Vec<u32>> = ledger
-                    .iter()
-                    .filter_map(|call| match call {
-                        Call::Verify { ids } => Some(ids),
-                        _ => None,
-                    })
-                    .collect();
-                for id in [8, 9] {
+    fn a_cycle_hit_inside_a_dspark_block_cuts_as_a_row() {
+        let mut targets = vec![5; 200];
+        targets[75] = 15;
+        let mut backend = MockDsparkBackend::positions(targets, Vec::new(), false);
+        let mut params = greedy_params();
+        params.max_new_tokens = 200;
+        let mut tracker = ReasoningTracker::guarded(true, None, &[8, 9], true);
+        for _ in 0..510 {
+            tracker.observe_token(5);
+        }
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(42);
+        let out = drive_turn_with_tracker(
+            &mut backend,
+            params,
+            5,
+            15,
+            2,
+            &mut rng,
+            None,
+            None,
+            tracker,
+        );
+        assert!(out.result.is_ok(), "{:?}", out.result.err());
+        let mut expected = vec![5; 66];
+        expected.extend([8, 9, 5, 5, 5, 5, 5, 5, 5, 15]);
+        assert_eq!(out.generated, expected);
+        assert_eq!(out.outcome.close, Some(ReasoningClose::Cycle));
+        let caps: Vec<usize> = backend
+            .ledger_snapshot()
+            .iter()
+            .filter_map(|call| match call {
+                Call::Propose { max_len, .. } => Some(*max_len),
+                _ => None,
+            })
+            .collect();
+        assert!(caps.iter().all(|&cap| cap == 2), "{caps:?}");
+    }
+
+    #[test]
+    fn thinking_budget_is_exact_across_dspark_cycles() {
+        let end = [8, 10, 9];
+        for budget in [0, 1, 2, 3, 5, 12, 16] {
+            for block in [1, 3, 7] {
+                for sampled in [false, true] {
+                    let stop = budget as usize + end.len() + 10;
+                    let mut targets: Vec<i32> = (0..200).map(content).collect();
+                    targets[stop] = 15;
+                    let misses = vec![2, 7, budget as usize + 1, budget as usize + 5];
+                    let mut backend =
+                        MockDsparkBackend::positions(targets.clone(), misses, sampled);
+                    let mut params = if sampled {
+                        dense_params()
+                    } else {
+                        greedy_params()
+                    };
+                    params.max_new_tokens = 200;
+                    params.mtp_depth = block;
+                    let tracker = || ReasoningTracker::new(true, Some(budget), &end);
+                    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(42);
+                    let out = drive_turn_with_tracker(
+                        &mut backend,
+                        params,
+                        targets[0] as u32,
+                        15,
+                        block,
+                        &mut rng,
+                        None,
+                        None,
+                        tracker(),
+                    );
+                    let label = format!("budget={budget}, block={block}, sampled={sampled}");
+                    assert!(out.result.is_ok(), "{label}: {:?}", out.result.err());
+                    let (expected, outcome) = plain(&targets, tracker(), 15, 200);
+                    assert_eq!(out.generated, expected, "{label}");
+                    assert_eq!(out.outcome, outcome, "{label}");
+                    assert_eq!(out.outcome.close, Some(ReasoningClose::Budget), "{label}");
+                    assert_eq!(out.outcome.cut_at, Some(budget as u32), "{label}");
+                    assert_eq!(out.finish_reason, "stop", "{label}");
+                    let ledger = backend.ledger_snapshot();
+                    assert!(
+                        verify_widths(&ledger).iter().all(|&w| w == block + 1),
+                        "{label}: every block keeps its depth, {:?}",
+                        verify_widths(&ledger)
+                    );
                     assert_eq!(
-                        verifies.iter().filter(|ids| ids.contains(&id)).count(),
-                        1,
-                        "forced {id} enters the target cache exactly once"
+                        commits(&ledger).iter().map(|(keep, _)| keep).sum::<usize>(),
+                        out.generated.len() - 1,
+                        "{label}: every token but the last is cached once"
                     );
                 }
-                // 8's own one-row verify forces 9, and 9 anchors the next verify.
-                let eight = verifies.iter().position(|ids| ids.as_slice() == [8]);
-                let nine = verifies.iter().position(|ids| ids.first() == Some(&9));
-                assert!(
-                    eight.is_some() && nine.is_some() && eight < nine,
-                    "budget={budget}, sampled={sampled}, verifies={verifies:?}"
-                );
             }
+        }
+    }
+
+    /// Plain decoding that stops on any of `stops`.
+    fn plain_stops(
+        targets: &[i32],
+        mut tracker: ReasoningTracker,
+        stops: &[u32],
+        max: usize,
+    ) -> (Vec<u32>, ReasoningOutcome) {
+        let mut out = Vec::new();
+        while out.len() < max {
+            let token = tracker
+                .take_forced_token()
+                .unwrap_or(targets[out.len()] as u32);
+            tracker.observe_token(token);
+            out.push(token);
+            if stops.contains(&token) {
+                break;
+            }
+        }
+        (out, tracker.outcome())
+    }
+
+    /// One turn over the position script with `end`, `max` tokens and the
+    /// extra EOS ids; its transcript, outcome and finish reason.
+    fn ending_turn(
+        targets: &[i32],
+        end: &[u32],
+        budget: i32,
+        max: i32,
+        extra: &[u32],
+        block: usize,
+        sampled: bool,
+    ) -> (Vec<u32>, ReasoningOutcome, String) {
+        let misses = vec![2, budget as usize + 1];
+        let mut backend = MockDsparkBackend::positions(targets.to_vec(), misses, sampled);
+        let mut params = if sampled {
+            dense_params()
+        } else {
+            greedy_params()
+        };
+        params.max_new_tokens = max;
+        params.mtp_depth = block;
+        params.extra_eos_ids = extra.to_vec();
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(42);
+        let out = drive_turn_with_tracker(
+            &mut backend,
+            params,
+            targets[0] as u32,
+            15,
+            block,
+            &mut rng,
+            None,
+            None,
+            ReasoningTracker::new(true, Some(budget), end),
+        );
+        if let Err(error) = &out.result {
+            panic!("{}", error.reason);
+        }
+        (out.generated, out.outcome, out.finish_reason)
+    }
+
+    /// `max_new_tokens` reached inside the end text: the turn ends there,
+    /// as plain decoding does.
+    #[test]
+    fn max_new_tokens_inside_the_end_matches_plain() {
+        let end = [8, 10, 11, 12, 9];
+        let targets: Vec<i32> = (0..200).map(content).collect();
+        for budget in [0, 1, 3, 5] {
+            for inside in 1..end.len() {
+                for block in [1, 3, 7] {
+                    for sampled in [false, true] {
+                        let max = budget as usize + inside;
+                        let label = format!(
+                            "budget={budget}, inside={inside}, block={block}, sampled={sampled}"
+                        );
+                        let (generated, outcome, finish) =
+                            ending_turn(&targets, &end, budget, max as i32, &[], block, sampled);
+                        let tracker = ReasoningTracker::new(true, Some(budget), &end);
+                        let (expected, plain_outcome) = plain(&targets, tracker, 15, max);
+                        assert_eq!(generated, expected, "{label}");
+                        assert_eq!(outcome, plain_outcome, "{label}");
+                        assert_eq!(finish, "length", "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// An EOS, or an extra EOS id, inside the end text stops the turn on it,
+    /// as plain decoding does.
+    #[test]
+    fn an_eos_inside_the_end_stops_the_turn() {
+        let targets: Vec<i32> = (0..200).map(content).collect();
+        for (label, end, extra) in [
+            ("eos", [8, 15, 9], vec![]),
+            ("extra eos", [8, 14, 9], vec![14]),
+        ] {
+            for budget in [0, 1, 3, 5] {
+                for block in [1, 3, 7] {
+                    for sampled in [false, true] {
+                        let label =
+                            format!("{label}: budget={budget}, block={block}, sampled={sampled}");
+                        let (generated, outcome, finish) =
+                            ending_turn(&targets, &end, budget, 200, &extra, block, sampled);
+                        let mut stops = vec![15];
+                        stops.extend(&extra);
+                        let tracker = ReasoningTracker::new(true, Some(budget), &end);
+                        let (expected, plain_outcome) = plain_stops(&targets, tracker, &stops, 200);
+                        assert_eq!(expected.len(), budget as usize + 2, "{label}");
+                        assert_eq!(generated, expected, "{label}");
+                        assert_eq!(outcome, plain_outcome, "{label}");
+                        assert_eq!(finish, "stop", "{label}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_64_token_end_takes_at_most_nine_cycles_at_block_7() {
+        let mut end = vec![10u32; 63];
+        end.push(9);
+        let budget = 3;
+        let mut targets: Vec<i32> = (0..200).map(content).collect();
+        targets[budget + end.len() + 4] = 15;
+        let mut backend = MockDsparkBackend::positions(targets.clone(), Vec::new(), false);
+        let mut params = greedy_params();
+        params.max_new_tokens = 200;
+        params.mtp_depth = 7;
+        let tracker = || ReasoningTracker::new(true, Some(budget as i32), &end);
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(42);
+        let out = drive_turn_with_tracker(
+            &mut backend,
+            params,
+            targets[0] as u32,
+            15,
+            7,
+            &mut rng,
+            None,
+            None,
+            tracker(),
+        );
+        assert!(out.result.is_ok(), "{:?}", out.result.err());
+        let (expected, _) = plain(&targets, tracker(), 15, 200);
+        assert_eq!(out.generated, expected);
+        let ends = budget..budget + end.len();
+        let spans = backend.spans();
+        assert!(spans.iter().all(|span| span.drafts == 7), "{spans:?}");
+        let cycles = spans
+            .iter()
+            .filter(|span| (span.start..span.start + span.kept).any(|n| ends.contains(&n)))
+            .count();
+        assert!(cycles <= 1 + (end.len() - 1).div_ceil(8), "{cycles} cycles");
+    }
+
+    #[test]
+    fn a_cut_row_decides_the_accept_in_every_path() {
+        let vocab = 16;
+        let cut = ReasoningTracker::new(true, Some(1), &[8, 9])
+            .thinking_cut()
+            .expect("row 1");
+        assert_eq!(cut.row, 1);
+        let rows = |fill: f32| {
+            [5, 6, 7, 7]
+                .iter()
+                .flat_map(|&id| logits_row(vocab, id, fill))
+                .collect::<Vec<_>>()
+        };
+        let drafts = vec![5, 8, 7];
+        let mut penalized = greedy_params();
+        penalized.repetition_penalty = 1.1;
+        penalized.repetition_context_size = 8;
+        let mut sparse = dense_params();
+        sparse.sampling_config.as_mut().unwrap().top_k = Some(4);
+        for (label, params, sampled, sparse_q) in [
+            ("greedy_fast", greedy_params(), false, false),
+            ("penalized", penalized, false, false),
+            ("sampled dense", dense_params(), true, false),
+            ("sampled sparse", sparse, true, true),
+        ] {
+            let fill = if sampled { -1.0e30 } else { 0.0 };
+            let logits = MxArray::from_float32(&rows(fill), &[1, 4, vocab]).unwrap();
+            let mut proposal = DsparkProposal {
+                draft_ids: drafts.clone(),
+                device_draft_ids: None,
+                draft_dists: Vec::new(),
+                draft_sparse_dists: Vec::new(),
+                keep_probabilities: None,
+            };
+            if sampled && sparse_q {
+                let q = drafts
+                    .iter()
+                    .flat_map(|&id| logits_row(vocab, id, -1.0e30))
+                    .collect::<Vec<_>>();
+                let q = MxArray::from_float32(&q, &[3, vocab]).unwrap();
+                let config = params.sampling_config.unwrap();
+                let q = crate::sampling::sparse_distributions_from_logits(&q, &config)
+                    .unwrap()
+                    .expect("sparse rows");
+                proposal.draft_sparse_dists = (0..3).map(|i| q.row_owned(i).unwrap()).collect();
+            } else if sampled {
+                proposal.draft_dists = drafts
+                    .iter()
+                    .map(|&id| MxArray::from_float32(&one_hot(vocab, id), &[vocab]).unwrap())
+                    .collect();
+            }
+            let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(9);
+            let accepted = accept_dspark_proposal(
+                &logits,
+                &mut proposal,
+                &[1, 2],
+                &params,
+                &mut rng,
+                Some(&cut),
+            )
+            .unwrap_or_else(|e| panic!("{label}: {}", e.reason));
+            assert_eq!(accepted, (2, 9), "{label}");
         }
     }
 
@@ -3190,7 +3617,7 @@ mod tests {
                         serial_penalized_accept(&logits, &proposal, &history, &p).unwrap();
                     assert_eq!(expected.0, rejection);
                     assert_eq!(
-                        penalized_greedy_accept(&logits, &proposal, &history, &p).unwrap(),
+                        penalized_greedy_accept(&logits, &proposal, &history, &p, None).unwrap(),
                         expected,
                         "context={context}, len={len}, rejection={rejection}"
                     );
@@ -3238,7 +3665,7 @@ mod tests {
                             let out = if mode == 0 {
                                 serial_penalized_accept(&logits, &proposal, &history, &p)
                             } else {
-                                penalized_greedy_accept(&logits, &proposal, &history, &p)
+                                penalized_greedy_accept(&logits, &proposal, &history, &p, None)
                             };
                             std::hint::black_box(out.unwrap());
                         }

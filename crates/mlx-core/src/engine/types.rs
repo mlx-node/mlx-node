@@ -90,6 +90,17 @@ pub struct ChatConfig {
     /// the next token is forced to be the think_end token. None = unlimited.
     #[napi(ts_type = "number | undefined")]
     pub thinking_token_budget: Option<i32>,
+    /// Close the thought when its tokens repeat one cycle exactly: two
+    /// periods (up to 2,048 tokens each) over at least 512 tokens lower the
+    /// budget to 64 thinking tokens later. Default: false.
+    #[napi(ts_type = "boolean | undefined")]
+    pub thinking_cycle_guard: Option<bool>,
+    /// Plain text a cut thought ends with before the chat template's close,
+    /// without the close tag and without special tokens. Unset, empty, or a
+    /// text whose end breaks the close rules (the close token last, no other
+    /// special token, at most 64 tokens): the template's close alone.
+    #[napi(ts_type = "string | undefined")]
+    pub thinking_end_text: Option<String>,
     /// Whether to include reasoning/thinking content in the output.
     /// When false, the `thinking` field of ChatResult/ChatStreamChunk will always be None.
     /// Default: true (false when reasoningEffort is "none").
@@ -191,6 +202,20 @@ pub struct ChatResult {
     pub num_tokens: u32,
     pub prompt_tokens: u32,
     pub reasoning_tokens: u32,
+    /// How thinking ended: `model` (the model's own close), `budget`,
+    /// `cycle` (the cycle guard lowered the budget), `open` (the turn ended
+    /// in thinking). Absent when the turn did not start in thinking.
+    #[napi(ts_type = "'model' | 'budget' | 'cycle' | 'open' | undefined")]
+    pub reasoning_close: Option<String>,
+    /// Thinking tokens when a cut began.
+    #[napi(ts_type = "number | undefined")]
+    pub reasoning_cut_at: Option<u32>,
+    /// Period in tokens of the cycle the guard saw.
+    #[napi(ts_type = "number | undefined")]
+    pub reasoning_cycle_period: Option<u32>,
+    /// Close tokens after the thought ended; present with `reasoning_close`.
+    #[napi(ts_type = "number | undefined")]
+    pub reasoning_stray_closes: Option<u32>,
     pub finish_reason: String,
     pub raw_text: String,
     /// Reasoning-redacted raw output computed from the same token-aware
@@ -228,6 +253,15 @@ pub struct ChatStreamChunk {
     pub num_tokens: Option<u32>,
     pub prompt_tokens: Option<u32>,
     pub reasoning_tokens: Option<u32>,
+    /// `ChatResult::reasoning_close`, on the terminal chunk only.
+    #[napi(ts_type = "'model' | 'budget' | 'cycle' | 'open' | undefined")]
+    pub reasoning_close: Option<String>,
+    #[napi(ts_type = "number | undefined")]
+    pub reasoning_cut_at: Option<u32>,
+    #[napi(ts_type = "number | undefined")]
+    pub reasoning_cycle_period: Option<u32>,
+    #[napi(ts_type = "number | undefined")]
+    pub reasoning_stray_closes: Option<u32>,
     pub raw_text: Option<String>,
     /// Reasoning-redacted counterpart to `raw_text` on terminal chunks.
     #[napi(ts_type = "string | undefined")]
@@ -298,17 +332,28 @@ impl ChatStreamHandle {
 #[napi(object)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatStreamProgress {
-    /// `queued` until the model thread picks the request up, then
-    /// `prefill`, `decode` from the first sampled token, `done` after the
-    /// terminal chunk or error.
-    #[napi(ts_type = "'queued' | 'prefill' | 'decode' | 'done'")]
+    /// Before the prefill: `queued` while the model thread runs other work,
+    /// `slot` while the scheduler cannot start the turn for lanes or memory,
+    /// `prepare` while the thread prepares it (render, prefix match, cache
+    /// restore). Then `prefill`, `decode` from the first sampled token,
+    /// `done` after the terminal chunk or error. Never moves back from
+    /// `prefill`.
+    #[napi(ts_type = "'queued' | 'slot' | 'prepare' | 'prefill' | 'decode' | 'done'")]
     pub phase: String,
+    /// Milliseconds from the request's creation to the model thread taking
+    /// it off its channel; runs until then, then frozen.
+    pub wait_ms: f64,
+    /// Milliseconds in `slot`, the open span included; absent before pickup.
+    pub slot_ms: Option<f64>,
+    /// Milliseconds in `prepare`, the open span included; absent before
+    /// pickup.
+    pub prepare_ms: Option<f64>,
     /// Tokens this turn prefills, excluding the cached prefix.
     pub prefill_total: Option<u32>,
     /// Tokens of `prefill_total` materialized so far. Paths that prefill in
     /// one shot stay at 0 until the first token.
     pub prefill_done: Option<u32>,
-    /// Prefix tokens reused from the cache.
+    /// Prefix tokens reused from the cache; can be set during `prepare`.
     pub cached_tokens: Option<u32>,
     /// Tokens kept so far; known from the `decode` phase on.
     pub generated_tokens: Option<u32>,

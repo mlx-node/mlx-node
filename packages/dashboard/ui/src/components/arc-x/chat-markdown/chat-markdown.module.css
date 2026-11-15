@@ -1,0 +1,146 @@
+.root {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2-5);
+  color: var(--foreground);
+  font-size: var(--text-sm);
+  line-height: var(--leading-prose);
+  overflow-wrap: anywhere;
+}
+
+.p,
+.list,
+.quote,
+.rule {
+  margin: 0;
+}
+
+.p {
+  white-space: normal;
+}
+
+.plain {
+  white-space: pre-wrap;
+}
+
+.h1,
+.h2,
+.h3 {
+  margin: var(--space-1) 0 0;
+  font-weight: 500;
+  line-height: var(--leading-body);
+}
+
+.h1 {
+  font-size: var(--text-lg);
+}
+
+.h2,
+.h3 {
+  font-size: var(--text-base);
+}
+
+.list {
+  display: grid;
+  gap: var(--space-1);
+  padding-inline-start: var(--space-5);
+}
+
+.list:is(ul) {
+  list-style-type: disc;
+}
+
+.list:is(ol) {
+  list-style-type: decimal;
+}
+
+.item {
+  min-width: 0;
+}
+
+.item::marker {
+  color: var(--text-secondary);
+}
+
+.item > :is(.p, .list, .quote, .block, .tableWrap) + :is(.p, .list, .quote, .block, .tableWrap) {
+  margin-top: var(--space-1-5);
+}
+
+.quote {
+  display: grid;
+  gap: var(--space-2);
+  border-inline-start: 2px solid var(--border-strong);
+  padding-inline-start: var(--space-3);
+  color: var(--text-secondary);
+}
+
+.rule {
+  height: 1px;
+  border: 0;
+  background: var(--border-subtle);
+}
+
+.tableWrap {
+  min-width: 0;
+  overflow-x: auto;
+}
+
+.table {
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+.table :is(th, td) {
+  padding: var(--space-1) var(--space-2-5);
+  box-shadow: inset 0 -1px 0 var(--border-subtle);
+  text-align: start;
+  vertical-align: top;
+}
+
+.table th {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.link {
+  color: var(--accent-strong);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.host {
+  color: var(--text-secondary);
+  unicode-bidi: isolate;
+}
+
+.inlineCode {
+  border-radius: var(--radius-mark);
+  padding: 0 var(--space-1);
+  background: var(--surface-muted);
+  font-family: var(--font-code);
+  font-size: var(--text-code);
+  letter-spacing: 0;
+}
+
+.block {
+  min-width: 0;
+}
+
+.fresh {
+  animation: chat-markdown-chunk var(--duration-fast) var(--ease-standard) both;
+}
+
+@keyframes chat-markdown-chunk {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fresh {
+    animation: none;
+  }
+}

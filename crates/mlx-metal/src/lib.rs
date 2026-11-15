@@ -10,9 +10,10 @@
 //! control flow stay unchanged while avoiding the deprecated `metal-rs`,
 //! `objc`, and `block` crates.
 
+pub mod pipeline_counter;
+
 use std::ffi::c_void;
 use std::ops::Deref;
-use std::path::Path;
 use std::ptr::NonNull;
 
 use foreign_types::ForeignTypeRef;
@@ -179,14 +180,11 @@ impl Device {
         self.0.hasUnifiedMemory()
     }
 
-    pub fn new_library_with_file(&self, path: &Path) -> Result<Library, String> {
-        let path = path
-            .to_str()
-            .ok_or_else(|| format!("Metal library path is not UTF-8: {}", path.display()))?;
-        let path = NSString::from_str(path);
-        #[allow(deprecated)]
+    /// A library from metallib bytes in memory; no file is read or written.
+    pub fn new_library_with_data(&self, bytes: &'static [u8]) -> Result<Library, String> {
+        let data = dispatch2::DispatchData::from_static_bytes(bytes);
         self.0
-            .newLibraryWithFile_error(&path)
+            .newLibraryWithData_error(&data)
             .map(Library)
             .map_err(error_string)
     }

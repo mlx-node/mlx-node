@@ -2,20 +2,75 @@
  * The runtime's end of the dashboard RPC: answer {@link RpcRequest}s arriving on
  * one {@link RpcPort}.
  *
- * Only `call` and `subscribe` are reachable over the port. `ingestNow`, `drain`
+ * Only `call`, `subscribe`, `watch` and `chat` are reachable over the port. `ingestNow`, `drain`
  * and `close` are deliberately NOT — they are the supervisor's, and the process
  * that owns the runtime already holds it directly. A renderer that could close
  * the runtime it is rendering is not a feature.
  */
 
+import { routePatternFor } from '../api/dispatch.js';
 import { toFailure, type ApiResponse } from '../api/errors.js';
+import type { RouteThread } from '../api/routes.js';
 import type { DownloadEvent } from '../download.js';
-import type { DashboardRuntime } from '../runtime.js';
+import type { LiveEvent } from '../live.js';
+import type { ApiCall, DashboardRuntime } from '../runtime.js';
 import type { RpcPort } from './port.js';
-import { isRpcRequest, type RpcReply } from './protocol.js';
+import { isRpcRequest, type ChatScope, type RpcReply } from './protocol.js';
 
-/** Everything a port peer may reach. A stub satisfying this is enough to test the host. */
-export type RpcRuntime = Pick<DashboardRuntime, 'call' | 'subscribe'>;
+/**
+ * Everything a port peer may reach. A stub satisfying this is enough to test the host. A runtime without Chat leaves
+ * `watchChat` out: a Chat stream on it stays silent.
+ */
+export type RpcRuntime = Pick<DashboardRuntime, 'call' | 'subscribe' | 'watchLive'> &
+  Partial<Pick<DashboardRuntime, 'watchChat'>>;
+
+/** One page call the runtime has not answered yet, by route pattern only. */
+export interface OpenCall {
+  seq: number;
+  route: string | null;
+  thread: RouteThread | null;
+  startedAt: number;
+}
+
+/** The page calls of every port of one process that the runtime has not answered yet. */
+export interface OpenCalls {
+  /** Register a call; the returned function removes it. */
+  open(call: ApiCall): () => void;
+  /** The oldest open call, or null. */
+  oldest(): OpenCall | null;
+}
+
+export function createOpenCalls(now: () => number = Date.now): OpenCalls {
+  const open = new Map<number, OpenCall>();
+  let seq = 0;
+  return {
+    open(call: ApiCall): () => void {
+      seq += 1;
+      let pathname: string | null = null;
+      try {
+        pathname = new URL(call.path, 'http://localhost').pathname;
+      } catch {
+        pathname = null;
+      }
+      const route = pathname === null ? null : routePatternFor(call.method, pathname);
+      const entry: OpenCall = { seq, route: route?.pattern ?? null, thread: route?.thread ?? null, startedAt: now() };
+      open.set(entry.seq, entry);
+      return () => {
+        open.delete(entry.seq);
+      };
+    },
+    oldest(): OpenCall | null {
+      // Insertion order is start order.
+      for (const entry of open.values()) return entry;
+      return null;
+    },
+  };
+}
+
+export interface ServeOptions {
+  /** Where this port's open calls are tracked, so the process can name its oldest in a pong. */
+  calls?: OpenCalls;
+}
 
 /**
  * Serve `runtime` over `port` until the returned dispose is called (or the peer
@@ -24,8 +79,8 @@ export type RpcRuntime = Pick<DashboardRuntime, 'call' | 'subscribe'>;
  * keep the retired response path alive until cancellation is acknowledged or
  * already-started work returns its real result.
  */
-export function serveRuntimeOverPort(runtime: RpcRuntime, port: RpcPort): () => void {
-  /** Live subscriptions, keyed by the subscribe request's id. */
+export function serveRuntimeOverPort(runtime: RpcRuntime, port: RpcPort, options: ServeOptions = {}): () => void {
+  /** Live subscriptions of both kinds, keyed by the subscribe / watch request's id. */
   const subscriptions = new Map<number, () => void>();
   /**
    * Calls owned by this renderer connection. The controller is deliberately
@@ -132,11 +187,13 @@ export function serveRuntimeOverPort(runtime: RpcRuntime, port: RpcPort): () => 
           discardCall(id);
           const controller = new AbortController();
           calls.set(id, controller);
+          const close = options.calls?.open(data.call);
           // `runtime.call` documents that it never rejects; the catch is here so
           // that a broken contract costs one failure envelope instead of a caller
           // hanging until its deadline.
           void Promise.resolve()
             .then(() => runtime.call(data.call, controller.signal))
+            .finally(() => close?.())
             .then(
               (response) => {
                 // Missing or different means this connection discarded the
@@ -168,6 +225,31 @@ export function serveRuntimeOverPort(runtime: RpcRuntime, port: RpcPort): () => 
             id,
             runtime.subscribe(data.jobId, (event: DownloadEvent) => {
               post({ kind: 'event', id, event });
+            }),
+          );
+          return;
+        }
+        case 'watch': {
+          const id = data.id;
+          release(id);
+          subscriptions.set(
+            id,
+            runtime.watchLive((event: LiveEvent) => {
+              post({ kind: 'live', id, event });
+            }),
+          );
+          return;
+        }
+        case 'chat': {
+          const id = data.id;
+          const scope: ChatScope =
+            data.scope === 'host' ? { scope: 'host' } : { scope: 'conversation', conversationId: data.conversationId };
+          release(id);
+          if (runtime.watchChat === undefined) return;
+          subscriptions.set(
+            id,
+            runtime.watchChat(scope, (event) => {
+              post({ kind: 'chat', id, event });
             }),
           );
           return;

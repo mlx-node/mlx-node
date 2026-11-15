@@ -17,6 +17,7 @@
 
 import { randomBytes } from 'node:crypto';
 
+import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 import { SERVER_CLOSE_MS } from '@mlx-node/server/supervision';
 
 import { EXIT_STARTUP_FAILED } from './exit-codes.js';
@@ -88,7 +89,12 @@ export function sidecarHostOptions(env: NodeJS.ProcessEnv = process.env): Sideca
   return {
     ...SIDECAR_HOST_OPTIONS,
     authToken: newSidecarAuthToken(),
+    hostKind: 'desktop',
     persistPagedCache: { byDefault: true },
+    persistWholePrompt: true,
+    thinkingTokenBudget: AGENT_HOST_THINKING.tokenBudget,
+    thinkingCycleGuard: AGENT_HOST_THINKING.cycleGuard,
+    thinkingEndText: AGENT_HOST_THINKING.endText,
     ...(turnJournal !== null ? { turnJournal } : {}),
   };
 }
@@ -103,12 +109,22 @@ export interface SidecarHostOptions {
   port: number;
   host: string;
   authToken: string;
+  hostKind: 'desktop';
   /**
    * The paged KV disk cache: on unless `MLX_PERSIST_PAGED_CACHE` in this
    * process's env says otherwise. `InferenceHostOptions.persistPagedCache`,
    * restated for the reason {@link SidecarHost} gives.
    */
   persistPagedCache: { flag?: boolean; byDefault: boolean };
+  /** A turn of the cold tier families writes the whole prompt. `InferenceHostOptions.persistWholePrompt`. */
+  persistWholePrompt: boolean;
+  /**
+   * The engine runs the app's agents: Messages thinking gets the agent hosts'
+   * budget, cycle guard and end text (`AGENT_HOST_THINKING`).
+   */
+  thinkingTokenBudget: number;
+  thinkingCycleGuard: boolean;
+  thinkingEndText: string;
   turnJournal?: SidecarTurnJournal;
 }
 
@@ -137,9 +153,23 @@ export interface SidecarHost {
   port: number;
   modelsDir: string;
   boundModel: string;
-  models: readonly { name: string; path: string; modelType: string }[];
+  models: readonly {
+    name: string;
+    path: string;
+    modelType: string;
+    base: string;
+    variant: string;
+    format: 'gguf' | 'mlx';
+  }[];
   logDir: string | null;
   close(opts?: { timeoutMs?: number }): Promise<void>;
+}
+
+/** The endpoint file's `models[]`, field by field: the host's entries carry more than the file may hold. */
+export function endpointModels(
+  models: SidecarHost['models'],
+): { name: string; path: string; base: string; variant: string; format: 'gguf' | 'mlx' }[] {
+  return models.map(({ name, path, base, variant, format }) => ({ name, path, base, variant, format }));
 }
 
 /**

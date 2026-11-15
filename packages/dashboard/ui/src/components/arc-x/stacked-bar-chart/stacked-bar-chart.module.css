@@ -1,0 +1,72 @@
+.root {
+  min-width: 0;
+}
+
+.bars {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.column {
+  transform-box: view-box;
+  transition: opacity var(--duration-fast) var(--ease-standard);
+}
+
+.column[data-dim] {
+  opacity: var(--dim-opacity);
+}
+
+.bar {
+  fill: var(--c);
+}
+
+.alt {
+  stroke: color-mix(in oklab, var(--c) 24%, transparent);
+  stroke-width: 1;
+}
+
+.hatchBase {
+  fill: color-mix(in oklab, var(--c) 5%, transparent);
+}
+
+.hatchLine {
+  fill: color-mix(in oklab, var(--c) 30%, transparent);
+}
+
+.dash {
+  fill: var(--border-strong);
+}
+
+.selected {
+  fill: var(--accent);
+}
+
+[data-entrance='pending'] .column {
+  transform: scaleY(0);
+}
+
+[data-entrance='run'] .column {
+  animation: bars-grow var(--duration-spring) var(--ease-spring)
+    calc(var(--i) * min(var(--stagger-bar), calc(var(--stagger-budget) / var(--n)))) both;
+}
+
+@keyframes bars-grow {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .column {
+    transition-duration: var(--duration-instant);
+  }
+  [data-entrance='run'] .column {
+    animation: none;
+  }
+}

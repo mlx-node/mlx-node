@@ -10,6 +10,8 @@
  * Electron-free so both tables are testable; MAIN reads them and passes them on.
  */
 
+import { LEDGER_DIR_ENV } from '../panel-ledger.js';
+
 /**
  * `packages/core/index.cjs`'s `requireNative()` checks this FIRST and passes it
  * straight to `require()`.
@@ -66,8 +68,16 @@ export function sidecarEnvOverrides(input: ChildEnvInput): Record<string, string
  * `defaultModelsDir` finds, and a user who moved their models in the UI would
  * see a catalog that does not match what is servable.
  */
-export function controlPanelEnvOverrides(input: Pick<ChildEnvInput, 'modelsDir'>): Record<string, string> {
-  return modelsDirEnv(input.modelsDir);
+export function controlPanelEnvOverrides(
+  input: Pick<ChildEnvInput, 'modelsDir'> & {
+    /** MAIN's ledger folder: the panel reads the ends of earlier panel lives from it at start. */
+    ledgerDir?: string;
+  },
+): Record<string, string> {
+  return {
+    ...modelsDirEnv(input.modelsDir),
+    ...(input.ledgerDir === undefined ? {} : { [LEDGER_DIR_ENV]: input.ledgerDir }),
+  };
 }
 
 function modelsDirEnv(modelsDir: string | null): Record<string, string> {

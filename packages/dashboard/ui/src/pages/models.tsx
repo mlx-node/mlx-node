@@ -1,603 +1,108 @@
-import { DownloadProgress } from '@/components/download-progress';
-import { StatTile } from '@/components/stat-tile';
-import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
-import {
-  Dialog,
-  DialogClose,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
-import { Skeleton } from '@/components/ui/skeleton';
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
-import { mutate } from '@/lib/api';
-import { getConnectionGeneration, subscribeConnection } from '@/lib/connection';
-import { formatBytes, formatCount, formatNumber } from '@/lib/format';
+import { useEffect, useMemo, useRef, useState, type ReactElement } from 'react';
+import { useSearchParams } from 'react-router-dom';
+
+import { StatGroup, StatTile } from '../components/arc-x/stat-tile/stat-tile';
+import { SwapText } from '../components/arc-x/swap-text/swap-text';
+import { Alert } from '../components/arc/alert/alert';
+import { Badge } from '../components/arc/badge/badge';
+import { Button } from '../components/arc/button/button';
+import { EmptyState } from '../components/arc/empty-state/empty-state';
+import { formatBytes, formatBytesParts, formatCount } from '../lib/format';
+import { useHomeDir } from '../lib/home-dir';
+import { useDataVersion, useRuntimeLive } from '../lib/live';
+import { joinModelUsage } from '../lib/model-usage';
+import { tildePath } from '../lib/paths';
+import { alignedRange } from '../lib/range';
+import { toast } from '../lib/toast';
 import type {
-  CancelDownloadResponse,
   CatalogItem,
   CatalogResponse,
   CatalogUpdatesResponse,
-  DeleteModelResponse,
-  DownloadJob,
-  DownloadStartResponse,
-  DownloadsResponse,
-  LocalModel,
+  MetricsSummary,
+  MetricsTimeseries,
   ModelsResponse,
-} from '@/lib/types';
-import { useJson } from '@/lib/use-api';
-import Onboarding, { type ModelDownloadError } from '@/pages/onboarding';
-import {
-  AlertCircle,
-  Check,
-  ChevronRight,
-  Download,
-  FileWarning,
-  Inbox,
-  Loader2,
-  Package,
-  Trash2,
-  X,
-} from 'lucide-react';
-import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { toast } from 'sonner';
+  RuntimeLive,
+} from '../lib/types';
+import { useJson } from '../lib/use-api';
+import { useCommands, type AppCommand } from '../shell/commands';
+import { Page, PageHeader, PageSection } from '../shell/page';
+import { CatalogCard, CatalogCardPlaceholder, CatalogDownloadAction, CatalogGrid } from './models/catalog';
+import { LocalModels, type UsageView } from './models/local-models';
+import { ModelDrawer } from './models/model-drawer';
+import { useModelDownloads } from './models/use-model-downloads';
+import Onboarding from './onboarding';
 
-function errMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
+export type { ModelDownloadError } from './models/use-model-downloads';
 
-// Size columns from the content area: viewport breakpoints include the sidebar
-// and can force two cards into a space too narrow for their titles and sizes.
-const CATALOG_GRID_CLASS_NAME = 'grid grid-cols-[repeat(auto-fit,minmax(min(100%,19rem),1fr))] items-start gap-4';
+const CHECK_NOTE_MS = 6_000;
 
-/**
- * A settled job — it holds no in-flight work and the server will never move it
- * out of this state again. Mirrors `isTerminal` in `src/download.ts`, and is
- * deliberately not spelled `state !== 'running'`: `committing` is the brief
- * non-cancellable publish window of a job that is still installing a model.
- */
-function isTerminalJob(state: DownloadJob['state']): boolean {
-  return state === 'done' || state === 'error' || state === 'cancelled';
-}
-
-/**
- * A download this page is following: the one job the server holds for a repo
- * while it is neither settled nor absent. `committing` is carried because the
- * card has to drop its Cancel there — `cancel()` refuses a publishing job, so the
- * button could only ever raise a red toast.
- */
-interface ActiveJob {
-  id: string;
-  committing: boolean;
-  /**
-   * This page's own cancel has been accepted, but the job has not emitted its
-   * terminal frame yet. Carried for the same reason as `committing`: the card
-   * drops its Cancel (a second one answers 404) while staying subscribed, so the
-   * frame still arrives and `onDownloadCancelled` can refresh the snapshots.
-   */
-  cancelling: boolean;
-  /** Runtime generation that produced this id; ids do not survive a reconnect. */
-  connection: number;
-  /**
-   * A POST result is newer than the GET that was already in flight when the
-   * user clicked Install. Server entries, by contrast, are reconciled exactly
-   * against the next authoritative snapshot.
-   */
-  source: 'local' | 'server';
-}
-
-/**
- * The two response bodies a card's verdict is joined from, captured at the
- * instant a job settled. Identity is the whole point: a reload replaces the
- * object, so `!==` is "the refreshed body arrived".
- */
-interface SettledBodies {
-  catalog: unknown;
-  updates: unknown;
-}
-
-function QuantBadge({ quant }: { quant: string | null }) {
-  if (quant === null) {
-    return (
-      <Badge variant="outline" className="text-muted-foreground font-normal">
-        full precision
-      </Badge>
-    );
+function loadedNow(live: RuntimeLive | undefined): { value: string | null; hint: string } {
+  if (live === undefined) return { value: null, hint: 'no live status yet' };
+  if (live.status === 'stopped') return { value: '0', hint: 'inference stopped' };
+  const names = new Set<string>();
+  let inFlight = 0;
+  for (const process of live.processes) {
+    if (process.status !== 'running') continue;
+    for (const model of process.models) {
+      names.add(model.name);
+      inFlight += model.inFlight;
+    }
   }
-  return (
-    <Badge variant="secondary" className="font-mono font-normal">
-      {quant}
-    </Badge>
-  );
+  return {
+    value: formatCount(names.size),
+    hint: inFlight > 0 ? `${formatCount(inFlight)} turn${inFlight === 1 ? '' : 's'} in flight` : 'idle',
+  };
 }
 
-/**
- * The column set of the local-models table, rendered by the loading branch and
- * the loaded branch from this one definition.
- *
- * Both branches need it, and they must never disagree. A header that only the
- * loaded branch renders is not a cosmetic difference: it appears out of nowhere
- * when the request lands and pushes every row down by its own 40px, which is the
- * jump this page was reported for. Sharing the markup is what makes the two
- * branches structurally incapable of drifting apart again.
- */
-function LocalModelsHead() {
-  return (
-    <TableHeader>
-      <TableRow>
-        <TableHead>Name</TableHead>
-        <TableHead>Family</TableHead>
-        <TableHead>Quantization</TableHead>
-        <TableHead className="text-right">Size</TableHead>
-        <TableHead className="text-right">Context</TableHead>
-        <TableHead className="w-0" />
-      </TableRow>
-    </TableHeader>
-  );
+/** The body without the checkpoint the runtime just deleted, so its row and its bytes leave at once. */
+export function withoutEntry(body: ModelsResponse, name: string): ModelsResponse {
+  return {
+    ...body,
+    models: body.models.filter((model) => model.name !== name),
+    ...(body.companions === undefined
+      ? {}
+      : { companions: body.companions.filter((companion) => companion.name !== name) }),
+  };
 }
 
-/**
- * Three placeholder rows in the real table, under the real header.
- *
- * Three because a working install carries a handful of checkpoints, and because
- * a fresh one resolves to the empty state below rather than to rows — three rows
- * sit within half a row of that empty state's own height, so both outcomes land
- * near the space held for them. The exact length cannot be known before the
- * response arrives and that residual is unavoidable; what is fixed here is the
- * header and the per-row box.
- *
- * Every bar is `h-[1lh]` — one line box of the text of the very cell it sits in
- * — and the last cell reserves the delete button's `size-9`, which is what
- * actually sets the row height (36px of button beats 20px of text inside the
- * cell's `p-2`). Sized bars rather than full-width ones because this table uses
- * the browser's automatic column algorithm, so the columns are solved from their
- * content: a row of full-width bars would widen every column and then snap back.
- */
-function LocalModelsSkeletonRows() {
-  return (
-    <TableBody>
-      {Array.from({ length: 3 }).map((_, i) => (
-        <TableRow key={i}>
-          <TableCell className="max-w-[22rem] truncate font-medium">
-            <Skeleton className="h-[1lh] w-52" />
-          </TableCell>
-          <TableCell className="text-muted-foreground">
-            <Skeleton className="h-[1lh] w-20" />
-          </TableCell>
-          <TableCell>
-            <Skeleton className="h-[1lh] w-16" />
-          </TableCell>
-          <TableCell className="text-right tabular-nums">
-            <Skeleton className="ml-auto h-[1lh] w-14" />
-          </TableCell>
-          <TableCell className="text-muted-foreground text-right tabular-nums">
-            <Skeleton className="ml-auto h-[1lh] w-14" />
-          </TableCell>
-          <TableCell className="text-right">
-            <Skeleton className="ml-auto size-9" />
-          </TableCell>
-        </TableRow>
-      ))}
-    </TableBody>
-  );
+/** After a check the user asked for: one short line, gone after a few seconds. */
+function useCheckNote(updates: { refreshing: boolean; loading: boolean; error: Error | undefined }) {
+  const [asked, setAsked] = useState(false);
+  const [note, setNote] = useState<'ok' | 'error' | null>(null);
+  const busy = updates.refreshing || updates.loading;
+  if (asked && !busy) {
+    setAsked(false);
+    setNote(updates.error === undefined ? 'ok' : 'error');
+  }
+  useEffect(() => {
+    if (note === null) return;
+    const handle = setTimeout(() => setNote(null), CHECK_NOTE_MS);
+    return () => clearTimeout(handle);
+  }, [note]);
+  return { note, ask: () => setAsked(true) };
 }
 
-/**
- * Upstream holds different bytes at this repo than the local install records.
- *
- * Joined here rather than served ready-made: `/api/catalog/updates` runs on the
- * transport thread, which also emits download progress, so it reads the network
- * only and never walks the models directory.
- *
- * Gated on `installed`, never `present`: only a dashboard-owned install at the
- * canonical slug carries a revision to compare AND can actually be re-installed.
- * A `null` on either side means staleness is unknowable, never "up to date".
- */
-function hasUpdate(
-  item: Pick<
-    CatalogItem,
-    'hfRepo' | 'installed' | 'localRevision' | 'assetsRepo' | 'localAssetsRepo' | 'localAssetsRevision'
-  >,
-  remoteRevisions: ReadonlyMap<string, string | null>,
-): boolean {
-  if (!item.installed || item.localRevision === null) return false;
-  const remoteRevision = remoteRevisions.get(item.hfRepo) ?? null;
-  if (remoteRevision !== null && remoteRevision !== item.localRevision) return true;
-  // The catalog's CURRENT assets repo participates too: when the entry
-  // switches sources the marker still names the old one — which the sweep
-  // never probes — so the lookup below returns null and the badge could
-  // never appear; a changed source is an update on its own (the job re-plans
-  // sidecars from it). A marker with no recorded source gets the same
-  // verdict: the entry prescribes sidecars the install lacks. The reverse —
-  // a catalog that dropped its assetsRepo — adds no verdict of its own: the
-  // entry prescribes no sidecars for a job to apply.
-  if (item.assetsRepo !== undefined && item.assetsRepo !== item.localAssetsRepo) return true;
-  // The tokenizer sidecars come from a second repo that moves on its own
-  // revision; a fix there repairs nothing unless the badge appears, because
-  // the Installed button is otherwise disabled and no job ever runs.
-  if (item.localAssetsRepo === null || item.localAssetsRevision === null) return false;
-  const remoteAssets = remoteRevisions.get(item.localAssetsRepo) ?? null;
-  return remoteAssets !== null && remoteAssets !== item.localAssetsRevision;
-}
-
-export default function Models({ onboarding = false }: { onboarding?: boolean }) {
+export default function Models({ onboarding = false }: { onboarding?: boolean }): ReactElement {
   const models = useJson<ModelsResponse>('/models');
   const catalog = useJson<CatalogResponse>('/catalog');
-  // Deliberately a SEPARATE request from `/catalog`: this one dials Hugging Face
-  // and is allowed to fail. Its error is never rendered — a card that cannot
-  // reach the network simply shows no update badge.
+  // A separate request on purpose: it dials Hugging Face and may fail; a failure only means no update badge.
   const updates = useJson<CatalogUpdatesResponse>('/catalog/updates');
-  const downloads = useJson<DownloadsResponse>('/downloads');
-  const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
-
-  /**
-   * For a repo whose job just settled, the catalog body that was current when it
-   * did. `setActive` clears synchronously while `reload()` only marks the old
-   * body refreshing, so one committed render still carries the pre-download
-   * state — a live Install (or Update available) for work that just finished.
-   * Clicking there is not idempotent: the settled job was already dismissed, so
-   * the server allocates a second one that can only short-circuit to `done`.
-   *
-   * Holding the body rather than a flag is what makes the window self-closing.
-   * `useJson` hands back a newly deserialized object per response, so the
-   * identity no longer matching IS the refreshed catalog arriving; nothing has
-   * to remember to clear it, and a reload that never returns cannot strand it
-   * (a failed one renders the error card in place of the whole grid).
-   *
-   * BOTH bodies, because the verdict is a join of both and they arrive
-   * independently. `/catalog` is a worker route reading only the filesystem
-   * while `/catalog/updates` may have to dial Hugging Face on a cold sha cache,
-   * so the catalog routinely wins — and on its own it lifts the guard over a
-   * remote sha from before the job ran, which is the pre-download "Update
-   * available" this whole mechanism exists to withhold.
-   */
-  const [settledOn, setSettledOn] = useState<ReadonlyMap<string, SettledBodies>>(() => new Map());
-  /**
-   * The same bodies, reachable from the reconcile effect below. That effect
-   * cannot depend on `catalog.data` or `updates.data`: it calls `reloadCatalog()`
-   * and `reloadUpdates()`, so listing the bodies they produce would re-run the
-   * effect on arrival and reload forever.
-   */
-  const catalogBody = useRef(catalog.data);
-  catalogBody.current = catalog.data;
-  const updatesBody = useRef(updates.data);
-  updatesBody.current = updates.data;
-  /** The pair as it stands right now, for the three live settle handlers. */
-  const settledBodies = (): SettledBodies => ({ catalog: catalog.data, updates: updates.data });
-
-  const [pendingDelete, setPendingDelete] = useState<
-    (Pick<LocalModel, 'name' | 'path' | 'sizeBytes'> & { companion?: boolean }) | null
-  >(null);
-  const [deleting, setDeleting] = useState(false);
-  /** repo → active download job (seeded from the server, added on install). */
-  const [active, setActive] = useState<Record<string, ActiveJob>>({});
-  const [downloadError, setDownloadError] = useState<ModelDownloadError | null>(null);
-  // `useJson` is stale-while-revalidate: on a connection bump it intentionally
-  // keeps the old body on screen until the replacement runtime answers. Remember
-  // that exact object so the reconciliation effect below does not mistake it for
-  // the new runtime's authoritative download registry.
-  const seenConnection = useRef(connection);
-  const staleDownloads = useRef<DownloadsResponse | undefined>(undefined);
-  if (seenConnection.current !== connection) {
-    seenConnection.current = connection;
-    staleDownloads.current = downloads.data;
-  }
-  // Destructured, and that is load-bearing: `models`/`catalog` are new objects on
-  // every render, so naming THEM in the effect's deps below would re-run it every
-  // render — a dismiss/reload loop. `reload` is a `useCallback(…, [])`, so it is
-  // stable for the life of the hook and the deps array stays honest.
-  const { reload: reloadModels } = models;
-  const { reload: reloadCatalog } = catalog;
-  const { reload: reloadUpdates } = updates;
-
-  useEffect(() => {
-    const snapshot = downloads.data;
-    const jobs = snapshot?.jobs;
-    if (jobs === undefined) return;
-    // On a reconnect, the first render still carries the previous runtime's
-    // stale-while-revalidate body. It is neither authoritative presence nor
-    // authoritative absence for this connection.
-    if (snapshot === staleDownloads.current) return;
-
-    // Every NONTERMINAL job — the exact complement of the dismiss loop below.
-    // Start from the authoritative snapshot rather than merging it into `prev`:
-    // job ids belong to one runtime, so omission removes a dead runtime's card
-    // and the same repo under a new id must replace it.
-    setActive((prev) => {
-      const next: Record<string, ActiveJob> = {};
-      for (const job of jobs) {
-        if (isTerminalJob(job.state)) continue;
-        next[job.repo] = {
-          id: job.id,
-          committing: job.state === 'committing',
-          cancelling: false,
-          connection,
-          source: 'server',
-        };
-      }
-      // The GET above begins in the hook's mount/reconnect effect. A user can
-      // click Install while it is in flight and receive a POST result before
-      // that older snapshot arrives. Preserve only those locally-started jobs
-      // from THIS connection; all server-hydrated and prior-runtime entries are
-      // governed by the snapshot.
-      for (const [repo, job] of Object.entries(prev)) {
-        if (job.source === 'local' && job.connection === connection && next[repo]?.id !== job.id) {
-          next[repo] = job;
-        }
-      }
-      return next;
-    });
-    // A job that settled while this page was unmounted got no DownloadProgress
-    // callback, so nothing sent its terminal-dismiss DELETE: it sits in the
-    // server registry for the life of the process and Overview keeps counting a
-    // "completed" download beside a model that is simply installed. Dismiss it
-    // here, exactly as onDownloadDone/onDownloadError would have.
-    //
-    // A FAILED job is announced first. It is the one terminal state whose
-    // outcome is invisible on this page — its card reverts to a plain Install,
-    // as if the download had never been started — so a silent dismiss would be
-    // the only trace of the failure. `done` and `cancelled` stay quiet: the
-    // models table, the Installed card and the user's own Cancel already say it.
-    // The failure TEXT lives only in the SSE stream (`/api/downloads` carries no
-    // message), so this names the repo the way the toasts below do.
-    //
-    // Racing is safe: terminal is final on the server, so a job that reads
-    // terminal here cannot be running by the time the DELETE lands, and a
-    // duplicate dismiss (a second dashboard tab) answers 404 and is swallowed.
-    let settled = false;
-    for (const job of jobs) {
-      if (!isTerminalJob(job.state)) continue;
-      if (job.state === 'error') toast.error('Download failed', { description: job.repo });
-      settled = true;
-      void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(job.id)}`).catch(() => {});
-    }
-    // The catalog and models snapshots may predate the publish this job just
-    // finished: the runner sets `done` strictly AFTER `publish()` renames the
-    // staging dir into place, so a mount that spans that instant reads
-    // `present: false` from one request and `done` from the other. Nothing else
-    // repairs it — neither query polls, and a terminal job gets no
-    // `DownloadProgress`, so `onDownloadDone`'s reload never runs.
-    //
-    // Any terminal state, not just `done`. A model can be installed under an
-    // `error` too: `publish()` renames staging into final and only THEN removes
-    // the backup, and that `rm` is inside the job's try — so an EPERM there
-    // reports a failed download for a model that is on disk. `recoverBackup`
-    // likewise restores a crashed publish before the job can be cancelled.
-    if (settled) {
-      // Same window as the live path: `active` never held these jobs (the
-      // hydration above skips terminal ones), so until the reload lands the
-      // stale body offers a live button for work that has already finished.
-      setSettledOn((prev) => {
-        const next = new Map(prev);
-        for (const job of jobs) {
-          if (isTerminalJob(job.state))
-            next.set(job.repo, { catalog: catalogBody.current, updates: updatesBody.current });
-        }
-        return next;
-      });
-      reloadModels();
-      reloadCatalog();
-      // The update comparison predates the publish too, and it is the one
-      // snapshot that would otherwise keep re-offering "Update available" for
-      // the revision this job just installed.
-      reloadUpdates();
-    }
-  }, [downloads.data, connection, reloadModels, reloadCatalog, reloadUpdates]);
-
-  const install = async (repo: string): Promise<void> => {
-    setDownloadError(null);
-    const startedConnection = connection;
-    try {
-      const res = await mutate<DownloadStartResponse>('POST', '/downloads', { repo });
-      // A late response from the client that was just replaced cannot name a
-      // job in the new runtime. `connectDashboardApi` normally rejects it while
-      // closing the old client; this is the final generation guard.
-      if (getConnectionGeneration() !== startedConnection) return;
-      setActive((prev) => ({
-        ...prev,
-        [repo]: { id: res.id, committing: false, cancelling: false, connection: startedConnection, source: 'local' },
-      }));
-    } catch (err) {
-      setDownloadError({ repo, message: errMessage(err) });
-      toast.error('Failed to start download', { description: errMessage(err) });
-    }
-  };
-
-  const onDownloadDone = (repo: string): void => {
-    toast.success('Download complete', { description: repo });
-    const id = active[repo]?.id;
-    setActive((prev) => {
-      const next = { ...prev };
-      delete next[repo];
-      return next;
-    });
-    // The job has settled terminally on the server; drop it from `active` and
-    // dismiss it via DELETE (mirroring onDownloadError/cancel). Otherwise the
-    // completed job id lingers, and a later delete of this model would remount
-    // DownloadProgress on that stale job — replaying `done` → a spurious "complete"
-    // toast + a Complete/Cancel card instead of an Install button.
-    if (id !== undefined) {
-      void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`).catch(() => {});
-    }
-    setSettledOn((prev) => new Map(prev).set(repo, settledBodies()));
-    models.reload();
-    catalog.reload();
-    // The update comparison is a SEPARATE request, so it holds the pre-download
-    // verdict until told otherwise: the fresh local revision would be compared
-    // against the sha the map held BEFORE the job ran, re-offering "Update
-    // available" for the revision just installed and starting a fresh job on
-    // every click. The job writes its resolved sha straight into the server's
-    // cached map, so this reload costs no new network call.
-    updates.reload();
-  };
-
-  const onDownloadError = (repo: string, message: string): void => {
-    setDownloadError({ repo, message });
-    toast.error('Download failed', { description: message });
-    // `error` does not mean nothing was installed. `publish()` renames staging
-    // into the final dir and only THEN fsyncs and removes the backup, and those
-    // run inside the job's try — so a failure there reports `error` for a model
-    // whose new marker and weights are already on disk. Leaving the previous
-    // verdict in place would immediately re-offer "Update available" for it.
-    // BOTH halves: the marker it must be compared against is `/catalog`'s
-    // `localRevision`, so refreshing the remote shas alone repairs nothing.
-    setSettledOn((prev) => new Map(prev).set(repo, settledBodies()));
-    catalog.reload();
-    updates.reload();
-    const id = active[repo]?.id;
-    setActive((prev) => {
-      const next = { ...prev };
-      delete next[repo];
-      return next;
-    });
-    // The job has settled terminally on the server; dismiss it via DELETE so
-    // GET /api/downloads stops returning the failed row and a retry (Install)
-    // starts clean. Best-effort — a failed eviction just leaves an inert row the
-    // next dismiss/restart can still clear. Mirrors `cancel`'s DELETE (no abort).
-    if (id !== undefined) {
-      void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`).catch(() => {});
-    }
-  };
-
-  /**
-   * The job stopped without finishing, learned from the STREAM rather than from a
-   * DELETE this page issued. `cancel()` below already clears `active` when the
-   * user's own cancel resolves, so this is the case it cannot see: the server
-   * answers a cancel while the job is still `running` and lets `processJob` emit
-   * the terminal frame as it unwinds, so a cancel from a second tab — or from
-   * `shutdown()` aborting the in-flight job — arrives here having clicked nothing.
-   * Without this the card renders "Cancelled" beside a live Cancel button and
-   * never recovers: no query polls, and `downloads` is never reloaded.
-   *
-   * Silent, unlike `onDownloadError`. A cancel is not a failure, and whoever
-   * issued it already got their own confirmation.
-   *
-   * It still refreshes, because `cancelled` does not mean nothing reached disk.
-   * `processJob` runs `recoverBackup` BEFORE its first cancel boundary: a
-   * crashed publish leaves an owned backup under `.staging/<slug>.backup-<pid>-…`
-   * and recovery renames it onto the final dir. Every cancel check comes after
-   * that, so a job cancelled anywhere in the fetch loop settles `cancelled` with
-   * a model installed that these snapshots have never seen — and nothing else
-   * repairs it, because the reconcile effect above runs only on mount and
-   * reconnect. All three move for the same reasons the other two settle paths
-   * give: `/models` lists the recovered checkpoint, `/catalog` carries the
-   * marker its verdict is computed from, and the job resolved a fresh upstream
-   * sha into the server's cached map before it was cancelled.
-   */
-  const onDownloadCancelled = (repo: string): void => {
-    setActive((prev) => {
-      if (prev[repo] === undefined) return prev;
-      const next = { ...prev };
-      delete next[repo];
-      return next;
-    });
-    setSettledOn((prev) => new Map(prev).set(repo, settledBodies()));
-    models.reload();
-    catalog.reload();
-    updates.reload();
-  };
-
-  const cancel = async (repo: string, id: string): Promise<void> => {
-    try {
-      await mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`);
-      toast.success('Download cancelled', { description: repo });
-      // Keep following the job rather than dropping it here. The server accepts a
-      // cancel while the in-flight job is still `running` and lets `processJob`
-      // emit the terminal frame as it unwinds, so clearing `active` at this
-      // acknowledgement unmounts `DownloadProgress` and closes its subscription
-      // BEFORE that frame lands — and `onDownloadCancelled`, the one path that
-      // refreshes the snapshots, never runs at all.
-      //
-      // Refreshing here instead would not do: the unwind can still install.
-      // `recoverBackup` renames a crashed publish onto the final dir at
-      // download.ts:868 and every cancel boundary comes after it, so a reload
-      // issued now can read the disk before that rename. Only the terminal frame
-      // proves the job is done touching it.
-      //
-      // Marking rather than deleting is what keeps the stream open. It drops the
-      // Cancel button (a second cancel answers 404) and leaves the progress bar
-      // standing for the unwind, which is honest — the job is still running.
-      // Cancel only aborts the job (its staging cleans up); the shared HF cache
-      // is deliberately left intact for `mlx download` to resume.
-      setActive((prev) => {
-        const job = prev[repo];
-        // A QUEUED job is settled inside `cancel()` itself, so its terminal frame
-        // can beat this acknowledgement and clear the entry first. Never put one
-        // back, and never mark a job this cancel did not name.
-        if (job === undefined || job.id !== id) return prev;
-        return { ...prev, [repo]: { ...job, cancelling: true } };
-      });
-    } catch (err) {
-      toast.error('Failed to cancel download', { description: errMessage(err) });
-    }
-  };
-
-  const confirmDelete = async (): Promise<void> => {
-    if (pendingDelete === null) return;
-    const { name, companion } = pendingDelete;
-    setDeleting(true);
-    try {
-      await mutate<DeleteModelResponse>('DELETE', `/models/${encodeURIComponent(name)}`);
-      toast.success(companion ? 'Companion deleted' : 'Model deleted', { description: name });
-      setPendingDelete(null);
-      models.reload();
-      catalog.reload();
-      updates.reload();
-    } catch (err) {
-      toast.error('Failed to delete model', { description: errMessage(err) });
-    } finally {
-      setDeleting(false);
-    }
-  };
-
-  const localModels = models.data?.models ?? [];
-  const companions = models.data?.companions ?? [];
-  const warnings = models.data?.warnings ?? [];
-  const modelsDir = models.data?.dir ?? '';
-  const totalBytes = [...localModels, ...companions].reduce((sum, m) => sum + m.sizeBytes, 0);
-  const catalogItems = (catalog.data?.items ?? []).filter((item) => !item.hidden);
-  // Empty whenever the update check failed or has not resolved yet, which is the
-  // correct default: no badge, cards render exactly as they did before.
-  //
-  // `updates.error` is part of that gate. `useJson` deliberately keeps the last
-  // `data` when a reload fails, so consuming it blindly would let a transient
-  // failure of the POST-DOWNLOAD refresh keep serving the pre-install verdict —
-  // re-offering "Update available" for the revision just installed, and
-  // admitting repeated no-op jobs until some later probe happens to succeed.
-  const remoteRevisions = new Map<string, string | null>(
-    updates.error !== undefined ? [] : (updates.data?.items ?? []).map((item) => [item.hfRepo, item.remoteRevision]),
-  );
-  const downloadProps = (item: CatalogDownloadProps['item']): CatalogDownloadProps => ({
-    item,
-    updateAvailable: hasUpdate(item, remoteRevisions),
-    settling: settledOn.has(item.hfRepo) && settledOn.get(item.hfRepo)?.catalog === catalog.data,
-    updateSettling: settledOn.has(item.hfRepo) && settledOn.get(item.hfRepo)?.updates === updates.data,
-    job: active[item.hfRepo],
-    onInstall: () => install(item.hfRepo),
-    onDone: () => onDownloadDone(item.hfRepo),
-    onError: (message) => onDownloadError(item.hfRepo, message),
-    onCancelled: () => onDownloadCancelled(item.hfRepo),
-    onCancel: (id) => void cancel(item.hfRepo, id),
-  });
+  const downloads = useModelDownloads(models, catalog, updates);
 
   if (onboarding) {
     return (
       <Onboarding
         catalog={catalog}
         models={models}
-        activeRepos={Object.keys(active)}
-        downloadError={downloadError}
-        downloadsLoading={downloads.loading}
-        downloadsError={downloads.error}
-        reloadDownloads={downloads.reload}
+        activeRepos={Object.keys(downloads.active)}
+        downloadError={downloads.downloadError}
+        downloadsLoading={downloads.downloadsLoading}
+        downloadsError={downloads.downloadsError}
+        reloadDownloads={downloads.reloadDownloads}
         renderDownload={(item) => (
           <CatalogDownloadAction
-            {...downloadProps(item)}
+            {...downloads.downloadProps(item)}
+            prominent
             installLabel="Download model"
             settlingLabel="Checking download…"
           />
@@ -605,497 +110,331 @@ export default function Models({ onboarding = false }: { onboarding?: boolean })
       />
     );
   }
+  return <ModelsPage models={models} catalog={catalog} updates={updates} downloads={downloads} />;
+}
+
+interface ModelsPageProps {
+  models: ReturnType<typeof useJson<ModelsResponse>>;
+  catalog: ReturnType<typeof useJson<CatalogResponse>>;
+  updates: ReturnType<typeof useJson<CatalogUpdatesResponse>>;
+  downloads: ReturnType<typeof useModelDownloads>;
+}
+
+function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): ReactElement {
+  const dataVersion = useDataVersion();
+  const range = useMemo(() => alignedRange('30d'), [dataVersion]);
+  const scope = `from=${String(range.from)}&to=${String(range.to)}`;
+  const summary = useJson<MetricsSummary>(`/metrics/summary?${scope}`, { live: true });
+  const series = useJson<MetricsTimeseries>(`/metrics/timeseries?${scope}&bucket=day&groupBy=model`, {
+    live: true,
+  });
+  const live = useRuntimeLive();
+  const [params, setParams] = useSearchParams();
+  const focus = params.get('focus');
+  const deletedRef = useRef(false);
+  const check = useCheckNote(updates);
+
+  const localModels = models.data?.models ?? [];
+  const companions = models.data?.companions ?? [];
+  const usage = useMemo(() => joinModelUsage(models.data?.models ?? [], summary.data), [models.data, summary.data]);
+  const usageFailed = summary.error !== undefined && summary.data === undefined;
+  const view: UsageView = {
+    usage,
+    points: series.data?.points,
+    starts: range.starts,
+    loading: (summary.data === undefined && !usageFailed) || (series.data === undefined && series.error === undefined),
+    failed: usageFailed || (series.error !== undefined && series.data === undefined),
+    usageFailed,
+    retry: () => {
+      summary.reload();
+      series.reload();
+    },
+  };
+  const focused = focus === null ? undefined : localModels.find((model) => model.name === focus);
+  const catalogItems = (catalog.data?.items ?? []).filter((item) => !item.hidden);
+  const present = catalogItems.filter((item) => item.present).length;
+  const activeCount = Object.keys(downloads.active).length;
+  const host = models.data?.host;
+
+  const setFocus = (name: string | null): void => {
+    setParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        if (name === null) next.delete('focus');
+        else next.set('focus', name);
+        return next;
+      },
+      { replace: true },
+    );
+  };
+  const unknownFocus = focus !== null && models.data !== undefined && focused === undefined;
+  useEffect(() => {
+    if (unknownFocus) setFocus(null);
+  });
+
+  const { reload: reloadCatalog } = catalog;
+  const { reload: reloadUpdates } = updates;
+  const onDeleted = (name: string): void => {
+    if (focus === name) {
+      deletedRef.current = true;
+      setFocus(null);
+    }
+    models.patch((body) => withoutEntry(body, name));
+    reloadCatalog();
+    reloadUpdates();
+  };
+
+  const checkUpdates = (): void => {
+    check.ask();
+    reloadUpdates();
+  };
+  const dir = models.data?.dir ?? '';
+  const home = useHomeDir();
+  const settlingRepos = catalogItems
+    .filter((item) => {
+      const props = downloads.downloadProps(item);
+      return props.settling || props.updateSettling;
+    })
+    .map((item) => item.hfRepo)
+    .join('\n');
+  const commands = useMemo((): AppCommand[] => {
+    const list: AppCommand[] = [];
+    for (const item of catalogItems) {
+      const props = downloads.downloadProps(item);
+      if (props.job !== undefined || props.settling) continue;
+      if (!item.present && !item.blockedByForeignDir) {
+        list.push({
+          id: `models:install:${item.hfRepo}`,
+          label: `Install ${item.label}`,
+          group: 'Models',
+          run: props.onInstall,
+        });
+      } else if (item.present && props.updateAvailable && !props.updateSettling) {
+        list.push({
+          id: `models:update:${item.hfRepo}`,
+          label: `Update ${item.label}`,
+          group: 'Models',
+          run: props.onInstall,
+        });
+      }
+    }
+    list.push({ id: 'models:check-updates', label: 'Check for updates', group: 'Models', run: checkUpdates });
+    if (dir !== '') {
+      list.push({
+        id: 'models:copy-dir',
+        label: 'Copy models directory path',
+        group: 'Models',
+        run: () =>
+          void navigator.clipboard.writeText(dir).then(
+            () => toast.success('Path copied', { description: tildePath(dir, home) }),
+            () => toast.error('Failed to copy to clipboard'),
+          ),
+      });
+    }
+    return list;
+  }, [catalog.data, updates.data, updates.error, downloads.active, settlingRepos, dir, home]);
+  useCommands(commands);
+
+  const totalBytes = [...localModels, ...companions].reduce((sum, model) => sum + model.sizeBytes, 0);
+  const disk = formatBytesParts(totalBytes);
+  const diskHint =
+    host !== undefined && host.diskFreeBytes !== null
+      ? `${formatBytes(host.diskFreeBytes)} free`
+      : companions.length > 0
+        ? 'including companions'
+        : undefined;
+  let used = 0;
+  for (const model of localModels) if ((usage.get(model.name)?.turns ?? 0) > 0) used += 1;
+  const loaded = loadedNow(live);
+  const modelsLoading = models.loading;
+  const modelsError = models.error !== undefined && models.data === undefined ? 'Failed to load models' : undefined;
+  const usageTile =
+    usageFailed || summary.error !== undefined
+      ? { value: null, hint: 'usage unavailable' }
+      : {
+          value: `${formatCount(used)} of ${formatCount(localModels.length)}`,
+          hint: used < localModels.length ? `${formatCount(localModels.length - used)} not used` : 'all in use',
+        };
+
+  const jumpToDownload = (): void => {
+    const section = document.getElementById('recommended-models');
+    section?.scrollIntoView({ block: 'start' });
+    const card = section?.querySelector<HTMLElement>('[data-downloading] a');
+    card?.focus();
+  };
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Models</h1>
-        <p className="text-muted-foreground text-sm">Local checkpoints and downloads from the recommended list.</p>
-      </div>
+    <Page busy={models.refreshing || catalog.refreshing}>
+      <PageHeader
+        title="Models"
+        description="Checkpoints on this Mac and the recommended list."
+        meta={
+          activeCount > 0 ? (
+            <a
+              href="#recommended-models"
+              onClick={(event) => {
+                event.preventDefault();
+                jumpToDownload();
+              }}
+            >
+              <Badge tone="info" size="sm" dot>
+                {`${formatCount(activeCount)} downloading`}
+              </Badge>
+            </a>
+          ) : undefined
+        }
+      />
 
-      <div className="grid gap-4 sm:grid-cols-2">
+      <StatGroup label="Models summary">
         <StatTile
           label="Installed"
-          icon={Package}
-          value={models.loading ? <Skeleton className="h-[1lh] w-12" /> : formatCount(localModels.length)}
-          sub={
-            models.loading ? (
-              // Two lines, because the loaded sub is two lines: the directory
-              // below is drawn whenever the server names one, which is every
-              // case except an unconfigured install. Reserving one line here
-              // would leave the tile 22px short and shove the table below it
-              // down the moment the response lands — and the response is what
-              // says whether the second line exists at all, so the shape has to
-              // be guessed. Guess the common one.
-              <>
-                <Skeleton className="block h-[1lh] w-24" />
-                <span className="mt-0.5 block font-mono text-[11px]">
-                  <Skeleton className="h-[1lh] w-40 max-w-full" />
-                </span>
-              </>
-            ) : (
-              <>
-                <span className="block">
-                  {formatBytes(totalBytes)} on disk{companions.length > 0 ? ', including companions' : ''}
-                </span>
-                {modelsDir !== '' && (
-                  // The models directory is configurable (`--models-dir`), so name
-                  // it — a bare count doesn't say where these checkpoints live.
-                  <span className="mt-0.5 block truncate font-mono text-[11px]" title={modelsDir}>
-                    {modelsDir}
-                  </span>
-                )}
-              </>
-            )
-          }
+          value={models.data === undefined ? null : formatCount(localModels.length)}
+          hint={companions.length > 0 ? `${formatCount(companions.length)} companion weights` : undefined}
+          loading={modelsLoading}
+          error={modelsError}
         />
         <StatTile
-          label="Recommended"
-          icon={Download}
-          value={catalog.loading ? <Skeleton className="h-[1lh] w-12" /> : formatCount(catalogItems.length)}
-          sub={
-            catalog.loading ? (
-              <Skeleton className="h-[1lh] w-28" />
-            ) : (
-              // Count `present` (loadable on disk, incl. a renamed dashboard
-              // install / a CLI install), matching what each card labels
-              // "Installed" — not the dashboard-owned `installed` marker.
-              `${formatCount(catalogItems.filter((i) => i.present).length)} installed`
-            )
-          }
+          label="On disk"
+          value={models.data === undefined ? null : disk.value}
+          unit={disk.unit}
+          hint={diskHint}
+          loading={modelsLoading}
+          error={modelsError}
         />
-      </div>
+        <StatTile
+          label="Used in 30 days"
+          value={usageTile.value}
+          hint={usageTile.hint}
+          loading={modelsLoading || (summary.data === undefined && summary.error === undefined)}
+        />
+        <StatTile label="Loaded now" value={loaded.value} hint={loaded.hint} to="/engine" />
+      </StatGroup>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Local models</CardTitle>
-          <CardDescription>Checkpoints discovered in the models directory.</CardDescription>
-        </CardHeader>
-        <CardContent>
-          {warnings.length > 0 && (
-            // Skipped directories are routine noise (GGUF folders, source trees)
-            // and can run to dozens of lines, so keep the list folded behind a
-            // count and let anyone who cares expand it.
-            <Collapsible className="text-muted-foreground bg-muted/50 mb-4 rounded-md border">
-              <CollapsibleTrigger className="hover:bg-muted/70 group flex w-full items-center gap-2 rounded-md p-3 text-xs transition-colors data-[state=open]:rounded-b-none">
-                <FileWarning className="size-4 shrink-0" aria-hidden />
-                <span className="font-medium">
-                  {formatCount(warnings.length)} {warnings.length === 1 ? 'directory' : 'directories'} skipped
+      {models.error !== undefined && models.data !== undefined ? (
+        <Alert tone="warning" title="Could not refresh the model list">
+          <span className="grid justify-items-start gap-2">
+            <span>{models.error.message}</span>
+            <Button variant="secondary" size="sm" onClick={models.reload}>
+              Try again
+            </Button>
+          </span>
+        </Alert>
+      ) : null}
+
+      <LocalModels
+        data={models.data}
+        loading={modelsLoading}
+        error={models.data === undefined ? models.error : undefined}
+        retry={models.reload}
+        usage={view}
+        live={live}
+        focus={focus}
+        onDeleted={onDeleted}
+      />
+
+      <div id="recommended-models" className="min-w-0">
+        <PageSection
+          title="Recommended models"
+          description="Curated checkpoints. Install downloads into the models directory."
+          actions={
+            <span className="flex flex-wrap items-center justify-end gap-2">
+              {catalog.data !== undefined ? (
+                <span className="text-body text-secondary tabular-nums">
+                  {`${formatCount(present)} of ${formatCount(catalogItems.length)} installed`}
                 </span>
-                <ChevronRight
-                  className="ml-auto size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-90"
-                  aria-hidden
-                />
-              </CollapsibleTrigger>
-              <CollapsibleContent className="px-3 pb-3 text-xs">
-                <ul className="space-y-0.5 pl-6">
-                  {warnings.map((warning) => (
-                    <li key={warning}>{warning}</li>
-                  ))}
-                </ul>
-              </CollapsibleContent>
-            </Collapsible>
-          )}
-
-          {models.error ? (
-            <div className="text-destructive flex items-center gap-2 text-sm">
-              <AlertCircle className="size-4 shrink-0" aria-hidden />
-              {models.error.message}
-            </div>
-          ) : models.loading ? (
-            <Table>
-              <LocalModelsHead />
-              <LocalModelsSkeletonRows />
-            </Table>
-          ) : localModels.length === 0 ? (
-            <div className="text-muted-foreground flex flex-col items-center gap-2 py-10 text-sm">
-              <Inbox className="size-6" aria-hidden />
-              No local models yet — install one from the recommended list below.
-            </div>
-          ) : (
-            <Table>
-              <LocalModelsHead />
-              <TableBody>
-                {localModels.map((model) => (
-                  <TableRow key={model.name}>
-                    <TableCell className="max-w-[22rem] truncate font-medium" title={model.path}>
-                      {model.name}
-                    </TableCell>
-                    <TableCell className="text-muted-foreground">{model.modelType}</TableCell>
-                    <TableCell>
-                      <QuantBadge quant={model.quant} />
-                    </TableCell>
-                    <TableCell className="text-right tabular-nums">{formatBytes(model.sizeBytes)}</TableCell>
-                    <TableCell className="text-muted-foreground text-right tabular-nums">
-                      {model.contextWindow === null ? '—' : formatNumber(model.contextWindow)}
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="text-muted-foreground hover:text-destructive"
-                        aria-label={`Delete ${model.name}`}
-                        onClick={() => setPendingDelete(model)}
-                      >
-                        <Trash2 className="size-4" />
-                      </Button>
-                    </TableCell>
-                  </TableRow>
+              ) : null}
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                loading={updates.refreshing || (updates.loading && check.note === null)}
+                onClick={checkUpdates}
+              >
+                Check for updates
+              </Button>
+              {check.note !== null ? (
+                <span className={check.note === 'error' ? 'text-body text-danger' : 'text-body text-secondary'}>
+                  <SwapText text={check.note === 'ok' ? 'Checked just now' : 'Could not reach Hugging Face'} />
+                </span>
+              ) : null}
+            </span>
+          }
+        >
+          {catalog.error !== undefined ? (
+            <Alert tone="danger" title="Could not load the recommended list">
+              <span className="grid justify-items-start gap-2">
+                <span>{catalog.error.message}</span>
+                <Button variant="secondary" size="sm" onClick={catalog.reload}>
+                  Try again
+                </Button>
+              </span>
+            </Alert>
+          ) : null}
+          {catalog.data === undefined ? (
+            catalog.error !== undefined ? null : (
+              <CatalogGrid>
+                {[0, 1, 2].map((index) => (
+                  <CatalogCardPlaceholder key={index} withDraft={index === 0} />
                 ))}
-              </TableBody>
-            </Table>
-          )}
-          {!models.loading && models.error === undefined && companions.length > 0 && (
-            <Collapsible className="mt-4 border-t pt-4">
-              <CollapsibleTrigger className="text-muted-foreground group flex w-full items-center gap-2 text-sm">
-                <Package className="size-4 shrink-0" aria-hidden />
-                <span className="font-medium">Companion weights ({formatCount(companions.length)})</span>
-                <ChevronRight
-                  className="ml-auto size-4 shrink-0 transition-transform group-data-[state=open]:rotate-90"
-                  aria-hidden
+              </CatalogGrid>
+            )
+          ) : catalogItems.length === 0 ? (
+            <EmptyState
+              title="Nothing to recommend yet"
+              description="New models appear here when they are published."
+            />
+          ) : (
+            <CatalogGrid>
+              {catalogItems.map((item) => (
+                <CatalogCardEntry
+                  key={item.hfRepo}
+                  item={item}
+                  downloads={downloads}
+                  host={host}
+                  detailsTo={
+                    localModels.some((model) => model.name === item.slug)
+                      ? `/models?focus=${encodeURIComponent(item.slug)}`
+                      : undefined
+                  }
                 />
-              </CollapsibleTrigger>
-              <CollapsibleContent className="mt-3">
-                <p className="text-muted-foreground mb-2 text-xs">Optional weights used with a model.</p>
-                <ul className="space-y-2">
-                  {companions.map((companion) => (
-                    <li key={companion.name} className="flex items-center gap-3 text-sm">
-                      <span className="min-w-0 flex-1 truncate" title={companion.path}>
-                        {companion.name}
-                      </span>
-                      <span className="text-muted-foreground shrink-0 text-xs tabular-nums">
-                        {formatBytes(companion.sizeBytes)}
-                      </span>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="text-muted-foreground hover:text-destructive shrink-0"
-                        aria-label={`Delete companion ${companion.name}`}
-                        onClick={() => setPendingDelete({ ...companion, companion: true })}
-                      >
-                        <Trash2 className="size-4" />
-                      </Button>
-                    </li>
-                  ))}
-                </ul>
-              </CollapsibleContent>
-            </Collapsible>
+              ))}
+            </CatalogGrid>
           )}
-        </CardContent>
-      </Card>
-
-      <div>
-        <h2 className="text-lg font-semibold tracking-tight">Recommended models</h2>
-        <p className="text-muted-foreground text-sm">
-          Curated checkpoints — install downloads them into the models directory.
-        </p>
+        </PageSection>
       </div>
 
-      {catalog.error ? (
-        <Card>
-          <CardContent className="text-destructive flex items-center gap-2 py-6 text-sm">
-            <AlertCircle className="size-4 shrink-0" aria-hidden />
-            {catalog.error.message}
-          </CardContent>
-        </Card>
-      ) : catalog.loading ? (
-        <div className={CATALOG_GRID_CLASS_NAME}>
-          {Array.from({ length: 3 }).map((_, i) => (
-            <CatalogCardSkeleton key={i} withDraft={i === 0} />
-          ))}
-        </div>
-      ) : (
-        <div className={CATALOG_GRID_CLASS_NAME}>
-          {catalogItems.map((item) => (
-            <CatalogCard
-              key={item.hfRepo}
-              {...downloadProps(item)}
-              item={item}
-              draftDownload={
-                item.draft === undefined
-                  ? undefined
-                  : // Drafts carry no tokenizer sidecars of their own.
-                    downloadProps({ ...item.draft, localAssetsRepo: null, localAssetsRevision: null })
-              }
-            />
-          ))}
-        </div>
-      )}
-
-      <Dialog open={pendingDelete !== null} onOpenChange={(open) => !open && setPendingDelete(null)}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>{pendingDelete?.companion ? 'Delete companion weights?' : 'Delete model?'}</DialogTitle>
-            <DialogDescription>
-              This permanently removes <span className="text-foreground font-medium">{pendingDelete?.name}</span> (
-              {pendingDelete !== null ? formatBytes(pendingDelete.sizeBytes) : ''}) from disk. This cannot be undone.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <DialogClose asChild>
-              <Button variant="outline" disabled={deleting}>
-                Cancel
-              </Button>
-            </DialogClose>
-            <Button variant="destructive" onClick={() => void confirmDelete()} disabled={deleting}>
-              {deleting && <Loader2 className="size-4 animate-spin" />}
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-    </div>
+      <ModelDrawer
+        model={focused ?? null}
+        usage={usage}
+        catalog={catalog.data?.items ?? []}
+        remoteRevisions={downloads.remoteRevisions}
+        live={live}
+        range={range}
+        onClose={() => setFocus(null)}
+        onDeleted={onDeleted}
+        deletedRef={deletedRef}
+      />
+    </Page>
   );
 }
 
-/**
- * Reserve the catalog's header, metadata, and download controls while loading.
- * The first curated entry also reserves its companion section, keeping the
- * optional download grouped with the same target before and after data arrives.
- */
-function CatalogCardSkeleton({ withDraft = false }: { withDraft?: boolean }) {
-  return (
-    <Card className="gap-4">
-      <CardHeader>
-        <div className="flex items-start justify-between gap-2">
-          <CardTitle className="text-base">
-            <Skeleton className="h-[1lh] w-40" />
-          </CardTitle>
-          <Skeleton className="h-4 w-12 shrink-0" />
-        </div>
-        <CardDescription>
-          <Skeleton className="h-[1lh] w-full" />
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="mt-auto space-y-3">
-        <div className="text-xs">
-          <Skeleton className="h-[1lh] w-12" />
-        </div>
-        {/* The button box, not a button: `h-9` is what `Button`'s default size
-            resolves to, and it is the tallest thing in the card's content. */}
-        <Skeleton className="h-9 w-full" />
-      </CardContent>
-      {withDraft && (
-        <div className="mx-6 space-y-3 border-t pt-4">
-          <div className="flex items-center justify-between gap-2">
-            <Skeleton className="h-5 w-28" />
-            <Skeleton className="h-4 w-12" />
-          </div>
-          <Skeleton className="h-8 w-full" />
-          <Skeleton className="h-9 w-full" />
-        </div>
-      )}
-    </Card>
-  );
-}
-
-interface CatalogDownloadProps {
-  installLabel?: string;
-  settlingLabel?: string;
-  item: Pick<
-    CatalogItem,
-    | 'hfRepo'
-    | 'installed'
-    | 'localRevision'
-    | 'assetsRepo'
-    | 'localAssetsRepo'
-    | 'localAssetsRevision'
-    | 'present'
-    | 'blockedByForeignDir'
-    | 'slug'
-  >;
-  /** Upstream has different bytes at this repo than the local marker records. */
-  updateAvailable: boolean;
-  /**
-   * This repo's job has settled but the catalog body it invalidated has not
-   * arrived, so every field here still describes the state before the download.
-   */
-  settling: boolean;
-  /**
-   * The same, for the separately fetched remote shas {@link updateAvailable} is
-   * computed against. Gates only the update action: a failed `/catalog/updates`
-   * empties the sha map, so that branch is not rendered at all and this can
-   * never strand a button.
-   */
-  updateSettling: boolean;
-  job: ActiveJob | undefined;
-  onInstall: () => Promise<void>;
-  onDone: () => void;
-  onError: (message: string) => void;
-  onCancelled: () => void;
-  onCancel: (id: string) => void;
-}
-
-interface CatalogCardProps extends Omit<CatalogDownloadProps, 'item'> {
+function CatalogCardEntry(props: {
   item: CatalogItem;
-  draftDownload?: CatalogDownloadProps;
-}
-
-function CatalogCard({ item, draftDownload, ...download }: CatalogCardProps) {
-  // The resolved catalog repo names the build for this platform (MXFP4 or NVFP4).
-  const quantization = item.hfRepo
-    .split('/')
-    .at(-1)
-    ?.match(/(?:^|-)((?:mx|nv)fp[48]?)(?:-|$)/i)?.[1]
-    ?.toUpperCase();
-
+  downloads: ReturnType<typeof useModelDownloads>;
+  host: ModelsResponse['host'] | undefined;
+  detailsTo: string | undefined;
+}): ReactElement {
+  const { item, downloads } = props;
+  const download = downloads.downloadProps(item);
+  const draft =
+    item.draft === undefined
+      ? undefined
+      : // Drafts carry no tokenizer sidecars of their own.
+        downloads.downloadProps({ ...item.draft, localAssetsRepo: null, localAssetsRevision: null });
+  const busy = download.job !== undefined || draft?.job !== undefined;
   return (
-    <Card className="gap-4">
-      <CardHeader>
-        <div className="flex items-start justify-between gap-2">
-          <CardTitle className="text-base">
-            <a
-              href={`https://huggingface.co/${item.hfRepo}`}
-              target="_blank"
-              rel="noreferrer"
-              className="focus-visible:ring-ring rounded-sm underline-offset-4 hover:underline focus-visible:ring-2 focus-visible:outline-none"
-            >
-              {item.label}
-            </a>
-          </CardTitle>
-          <div className="flex shrink-0 items-center gap-2">
-            {item.isDefault === true && (
-              <Badge variant="secondary" className="font-normal">
-                default
-              </Badge>
-            )}
-            <span className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">~{item.sizeGb} GB</span>
-          </div>
-        </div>
-        <CardDescription>{item.description}</CardDescription>
-      </CardHeader>
-      <CardContent className="mt-auto space-y-3">
-        <div className="text-muted-foreground font-mono text-xs">{quantization ?? '—'}</div>
-        <CatalogDownloadAction item={item} {...download} />
-      </CardContent>
-      {item.draft !== undefined && draftDownload !== undefined && (
-        <div role="group" aria-label={`${item.draft.label} companion`} className="mx-6 space-y-3 border-t pt-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <a
-                href={`https://huggingface.co/${item.draft.hfRepo}`}
-                target="_blank"
-                rel="noreferrer"
-                className="focus-visible:ring-ring rounded-sm text-sm font-medium underline-offset-4 hover:underline focus-visible:ring-2 focus-visible:outline-none"
-              >
-                {item.draft.label}
-              </a>
-              <Badge variant="secondary" className="font-normal">
-                Optional
-              </Badge>
-            </div>
-            <span className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">
-              ~{item.draft.sizeGb} GB
-            </span>
-          </div>
-          <p className="text-muted-foreground text-xs leading-relaxed">
-            Can speed up replies. Used automatically the next time this model loads.
-          </p>
-          <CatalogDownloadAction {...draftDownload} installLabel={`Install ${item.draft.label}`} />
-        </div>
-      )}
-    </Card>
-  );
-}
-
-function CatalogDownloadAction({
-  item,
-  installLabel = 'Install',
-  settlingLabel = installLabel,
-  updateAvailable,
-  settling,
-  updateSettling,
-  job,
-  onInstall,
-  onDone,
-  onError,
-  onCancelled,
-  onCancel,
-}: CatalogDownloadProps) {
-  const [starting, setStarting] = useState(false);
-  const start = async (): Promise<void> => {
-    if (starting) return;
-    setStarting(true);
-    try {
-      await onInstall();
-    } finally {
-      setStarting(false);
-    }
-  };
-  // Gate on `present` (loadable checkpoint on disk), not `installed` (dashboard
-  // marker): a model installed via the `mlx download` CLI / wizard is present but
-  // unowned, so offering Install would refuse to overwrite it and fail.
-  // A live job is sufficient, and is the ONLY safe gate. `active` never holds a
-  // terminal job (the hydration effect skips them), so `job !== undefined` means
-  // a download is genuinely in flight right now.
-  //
-  // It must not be qualified by catalog state. Both earlier forms lost the card:
-  // `!item.present` hid an update, which by definition re-installs something
-  // already present; adding `|| updateAvailable` then hid it again whenever the
-  // update probe was still loading or could not resolve that repo — a remount
-  // mid-update would render "Installed" over a live multi-gigabyte transfer,
-  // with no progress and no Cancel.
-  const downloading = job !== undefined;
-  return (
-    <>
-      {downloading && job !== undefined ? (
-        <div className="space-y-2">
-          <DownloadProgress id={job.id} onDone={onDone} onError={onError} onCancelled={onCancelled} />
-          {/* No Cancel while publishing: `cancel()` refuses a `committing` job
-                and the route 404s, so the button could only report a failure for
-                an install that then succeeds anyway. The progress bar stays.
-                Nor while `cancelling`: this page's cancel was already accepted
-                and the job is unwinding toward its terminal frame, so a second
-                one answers 404 too. */}
-          {!job.committing && !job.cancelling && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="text-muted-foreground hover:text-destructive w-full"
-              onClick={() => onCancel(job.id)}
-            >
-              <X className="size-4" />
-              Cancel
-            </Button>
-          )}
-        </div>
-      ) : item.present && updateAvailable ? (
-        // Same job pipeline as a first install: the runner already re-downloads
-        // whenever the installed marker's revision differs from upstream, and
-        // its owned-swap replaces the stale directory.
-        <Button className="w-full" onClick={() => void start()} disabled={starting || settling || updateSettling}>
-          <Download className="size-4" />
-          Update available
-        </Button>
-      ) : item.present ? (
-        <Button variant="outline" className="w-full" disabled>
-          <Check className="size-4" />
-          Installed
-        </Button>
-      ) : item.blockedByForeignDir ? (
-        // The download's ownership preflight refuses an occupied directory it
-        // did not write, so an Install here can only ever raise a red toast.
-        // Name the directory in the way and the one step that clears it.
-        <div className="space-y-2">
-          <Button variant="outline" className="w-full" disabled>
-            <AlertCircle className="size-4" />
-            Needs cleanup
-          </Button>
-          <p className="text-muted-foreground text-xs">
-            <span className="font-mono">{item.slug}</span> already exists and was not created by the dashboard. Remove
-            it (or delete it below, if it is listed) to install.
-          </p>
-        </div>
-      ) : (
-        <Button className="w-full" onClick={() => void start()} disabled={starting || settling}>
-          {starting ? (
-            <Loader2 className="size-4 animate-spin" aria-hidden />
-          ) : (
-            <Download className="size-4" aria-hidden />
-          )}
-          {starting ? 'Starting download…' : settling ? settlingLabel : installLabel}
-        </Button>
-      )}
-    </>
+    <div className="min-w-0" data-downloading={busy ? '' : undefined}>
+      <CatalogCard {...download} item={item} draftDownload={draft} host={props.host} detailsTo={props.detailsTo} />
+    </div>
   );
 }

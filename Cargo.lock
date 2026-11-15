@@ -778,6 +778,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags",
+ "block2",
  "objc2",
 ]
 
@@ -1613,6 +1614,7 @@ dependencies = [
  "mimalloc-safe",
  "minijinja",
  "mlx-db",
+ "mlx-metal",
  "mlx-paged-attn",
  "mlx-sys",
  "mlx-tts",
@@ -1658,6 +1660,7 @@ dependencies = [
 name = "mlx-metal"
 version = "0.0.0"
 dependencies = [
+ "dispatch2",
  "foreign-types",
  "objc2",
  "objc2-foundation",
@@ -1938,6 +1941,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a0125f776a10d00af4152d74616409f0d4a2053a6f57fa5b7d6aa2854ac04794"
 dependencies = [
  "bitflags",
+ "dispatch2",
  "objc2",
  "objc2-foundation",
 ]

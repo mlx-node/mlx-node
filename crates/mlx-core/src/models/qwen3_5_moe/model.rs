@@ -48,9 +48,6 @@ use crate::transformer::paged_kv_cache_adapter::SeqId;
 use crate::vision::qwen::encoder::QwenVisionEncoder;
 use crate::vision::qwen::processing::QwenImageProcessor;
 
-pub(crate) type Qwen35MoeSchedulerState =
-    crate::engine::hybrid_scheduler::HybridSchedulerState<Qwen35MoeInner>;
-
 use crate::array::MxArray;
 use crate::engine;
 use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup, SpecFrontier};
@@ -309,12 +306,16 @@ pub struct MoeMtpPagedGdnStateForTest {
 pub struct Qwen3_5MoeModel {
     /// Dedicated model thread for inference and training.
     pub(crate) thread: crate::model_thread::ModelThread<Qwen35MoeCmd>,
+    /// What the load's warm-up did; `None` for a load with no paged pool.
+    pub(crate) warmup: Option<crate::engine::warmup::WarmupReport>,
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5MoeConfig,
     /// Snapshot of `Qwen35MoeInner::paged_adapter.is_some()` captured at
     /// construction time: every load on Metal has the adapter; a load off
     /// Metal has none. Surfaced through the `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
+    /// The decode lanes the load's memory plan granted.
+    pub(crate) scheduled_lanes: u32,
     /// Snapshot of `Qwen35MoeInner::has_mtp_weights()` captured at
     /// construction time, mirroring `paged_active`. Surfaced through the
     /// `hasMtpWeights()` NAPI method so the TS ChatSession can auto-default
@@ -336,6 +337,8 @@ pub struct Qwen3_5MoeModel {
     /// For direct GGUF loads this is the lossless native-packed cache rather
     /// than the source file path.
     pub(crate) model_assets_path: String,
+    /// The model thread's state tier, never held open from here.
+    pub(crate) state_tier: crate::disk_tier::TierHandle,
     /// RAII: this model's baseline and its paged pool's debit with the
     /// cache-limit coordinator, released by `dispose` or on drop. The pool's
     /// entry must outlive every grow the adapter makes.
@@ -371,6 +374,20 @@ impl Qwen3_5MoeModel {
     pub fn model_assets_path(&self) -> String {
         self.model_assets_path.clone()
     }
+    /// The directory name of the model's open persistent SSD cache under
+    /// its cache root, read from the cache itself; null without one, for a
+    /// temporary cache, and after `closeCache` or `dispose`.
+    #[napi]
+    pub fn state_tier_namespace(&self) -> Option<String> {
+        self.state_tier.namespace()
+    }
+
+    /// What the load's warm-up did; `null` for a load with no paged pool,
+    /// which runs none.
+    #[napi(getter)]
+    pub fn warmup(&self) -> Option<crate::engine::warmup::WarmupReport> {
+        self.warmup.clone()
+    }
 
     /// Whether the block-paged KV cache adapter is active on this model
     /// instance.
@@ -391,14 +408,10 @@ impl Qwen3_5MoeModel {
     /// admission policy instead of using this plain autoregressive width.
     #[napi]
     pub fn max_concurrent_sequences(&self) -> u32 {
-        if self.paged_active
-            && Qwen35MoeSchedulerState::continuous_batching_enabled()
-            && !Qwen35MoeSchedulerState::force_serial()
-        {
-            crate::engine::hybrid_scheduler::scheduler_max_num_seqs() as u32
-        } else {
-            1
-        }
+        crate::models::qwen3_5::model::qwen35_max_concurrent_sequences(
+            self.paged_active,
+            self.scheduled_lanes,
+        )
     }
 
     /// Test-only: snapshot the paged-MTP GDN bookkeeping between turns.
@@ -479,6 +492,7 @@ impl Qwen3_5MoeModel {
         path: String,
         options: Option<crate::models::qwen3_5::model::Qwen35LoadOptions>,
     ) -> Result<Qwen3_5MoeModel> {
+        let progress = crate::engine::load_progress::begin(&path);
         let options = options.unwrap_or_default();
         let disk = options.disk_tier("Qwen3.5 MoE")?;
         let draft_model_path = options.draft_model_path;
@@ -511,6 +525,7 @@ impl Qwen3_5MoeModel {
             max_context,
             decode_share,
             disk,
+            progress.cell(),
         )
         .await;
         if loaded.is_err() {

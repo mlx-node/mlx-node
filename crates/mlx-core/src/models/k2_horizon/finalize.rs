@@ -416,7 +416,7 @@ mod tests {
                 include_reasoning: true,
                 thinking_enabled: true,
                 prompt_tokens: 7,
-                reasoning_tokens: 1,
+                reasoning: crate::engine::penalties::ReasoningOutcome::counted(1),
             })
             .unwrap();
             assert_eq!(result.text, "answer");
@@ -438,7 +438,7 @@ mod tests {
             include_reasoning: true,
             thinking_enabled: true,
             prompt_tokens: 3,
-            reasoning_tokens: 1,
+            reasoning: crate::engine::penalties::ReasoningOutcome::counted(1),
         })
         .unwrap();
         assert_eq!(alternate.text, "answer");
@@ -455,7 +455,7 @@ mod tests {
             include_reasoning: false,
             thinking_enabled: true,
             prompt_tokens: 3,
-            reasoning_tokens: 1,
+            reasoning: crate::engine::penalties::ReasoningOutcome::counted(1),
         })
         .unwrap();
         assert_eq!(hidden.thinking.as_deref(), Some(""));
@@ -477,7 +477,7 @@ mod tests {
             include_reasoning: false,
             thinking_enabled: true,
             prompt_tokens: 3,
-            reasoning_tokens: 1,
+            reasoning: crate::engine::penalties::ReasoningOutcome::counted(1),
         })
         .unwrap();
         assert_eq!(truncated.thinking.as_deref(), Some(""));

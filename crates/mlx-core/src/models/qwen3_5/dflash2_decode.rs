@@ -347,6 +347,19 @@ pub(crate) fn pool_lane_transient(
     }
 }
 
+/// One decode step of `rows` target rows over `window` keys, the rows of
+/// every lane in the step together: logits, GDN tapes, one layer's scratch
+/// and the attention partials. One row is the single-lane AR step
+/// [`pool_lane_transient`] prices.
+pub(crate) fn pool_decode_step_bytes(
+    config: &super::config::Qwen3_5Config,
+    rows: u64,
+    window: u32,
+) -> u64 {
+    let block = usize::try_from(rows.max(1) - 1).unwrap_or(usize::MAX);
+    dflash2_cycle_transient(config, block, u64::from(window)).total()
+}
+
 /// The pending GDN tape a DFlash2 lane holds between cycles: per linear
 /// layer, 8 rows of raw conv inputs, k and v (bf16), decay (f32) and beta
 /// (bf16) (Splash `gdn_tape_layer_bytes`). The verify's own tape is in the
@@ -1976,6 +1989,12 @@ mod paged_dflash2_tests {
     /// launch).
     #[test]
     fn verify_takes_the_verify_split_rule() -> Result<()> {
+        // The launch probe counts every paged prefill in the process.
+        if !crate::test_support::in_own_process(
+            "models::qwen3_5::dflash2_decode::paged_dflash2_tests::verify_takes_the_verify_split_rule",
+        ) {
+            return Ok(());
+        }
         if crate::test_support::paged_prefill_unsupported("verify_takes_the_verify_split_rule") {
             return Ok(());
         }
@@ -4142,6 +4161,34 @@ mod paged_dflash2_tests {
         assert!(inner.dflash2_states.store.get(r).is_none(), "R is gone");
         let counters = inner.dflash2_states.disk.as_ref().expect("tier").counters;
         assert_eq!(counters.invalidations, 1);
+        Ok(())
+    }
+
+    /// The napi object's handle names the namespace directory the model's
+    /// persistent state tier opened, read from the tier; after `closeCache`,
+    /// and for a temporary tier, it names none.
+    /// Mutation: the tier names its namespace after its close → red.
+    #[test]
+    fn the_tier_handle_names_the_open_namespace() -> Result<()> {
+        use crate::models::qwen3_5::dflash2_state::disk::close_cache;
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{persistent_test_tier, test_tier};
+        let _ctx = StreamContext::new(Stream::generation());
+        let tier = persistent_test_tier("state-tier-namespace", 1 << 30);
+        let mut inner = disk_fixture(0x5_8251, &tier, false)?;
+        let handle = inner.dflash2_states.tier_handle();
+        let dir = tier.tier.dir();
+        assert_eq!(
+            handle.namespace().as_deref(),
+            dir.file_name().and_then(|name| name.to_str())
+        );
+        assert!(close_cache(
+            &mut inner,
+            std::time::Instant::now() + std::time::Duration::from_secs(2)
+        ));
+        assert_eq!(handle.namespace(), None);
+        let temporary = test_tier("state-tier-namespace-temp", 1 << 30);
+        let inner = disk_fixture(0x5_8252, &temporary, false)?;
+        assert_eq!(inner.dflash2_states.tier_handle().namespace(), None);
         Ok(())
     }
 

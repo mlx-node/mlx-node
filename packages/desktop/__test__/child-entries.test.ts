@@ -255,6 +255,7 @@ describe('CONTROL PANEL never links the native addon', () => {
     const specifiers = specifiersOf(src('control-panel/index.ts')).sort();
     expect(specifiers).toEqual([
       '../cli-launcher.js',
+      './lifecycle.js',
       './session.js',
       './shutdown-timings.js',
       '@mlx-node/dashboard',

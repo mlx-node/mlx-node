@@ -1116,7 +1116,8 @@ impl Qwen3_5Attention {
         let offsets = MxArray::from_int32(&offsets, &[batch])?;
         let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
 
-        // K-quant projections retain a separate graph per owner.
+        // Row-exact loads (K-quant projections) and the MoE MTP verify retain a
+        // separate projection graph per owner.
         // Packed kernels may select a different reduction path for `B > 1`,
         // which can change greedy tokens even though the paged attention
         // operation itself is row-independent. Projection rows are cheap to

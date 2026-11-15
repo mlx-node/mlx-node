@@ -3,9 +3,12 @@ import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 
 import { bindEventTargetPort } from '../../src/rpc/port.js';
-import { DASHBOARD_PORT_MESSAGE, DASHBOARD_UNRESPONSIVE_MESSAGE } from '../../src/rpc/protocol.js';
+import { DASHBOARD_PORT_MESSAGE } from '../../src/rpc/protocol.js';
 import App from './App.tsx';
 import './index.css';
+import { initTheme } from './theme/theme';
+
+initTheme();
 
 const rootEl = document.getElementById('root');
 if (rootEl === null) throw new Error('#root element not found');
@@ -36,14 +39,7 @@ window.addEventListener('message', (event: MessageEvent) => {
   }
   const port = event.ports[0];
   if (port === undefined) return;
-  const generation = data.generation;
-  connectDashboardApi(bindEventTargetPort(port), {
-    onUnresponsive(): void {
-      // The preload maps this narrow signal to MAIN's supervised restart path.
-      // Asking for another port would reconnect to the SAME wedged process.
-      window.postMessage({ type: DASHBOARD_UNRESPONSIVE_MESSAGE, generation }, '*');
-    },
-  });
+  connectDashboardApi(bindEventTargetPort(port));
   root.render(
     <StrictMode>
       <App />

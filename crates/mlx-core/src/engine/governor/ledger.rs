@@ -1091,6 +1091,14 @@ impl Ledger {
         self.claims.get(&claim.0)
     }
 
+    /// Claims open in `model`'s pool.
+    pub(crate) fn open_claims(&self, model: u64) -> usize {
+        self.claims
+            .values()
+            .filter(|state| state.model == model)
+            .count()
+    }
+
     #[cfg(test)]
     pub(crate) fn claims(&self) -> impl Iterator<Item = (ClaimId, &ClaimState)> {
         self.claims.iter().map(|(id, state)| (ClaimId(*id), state))

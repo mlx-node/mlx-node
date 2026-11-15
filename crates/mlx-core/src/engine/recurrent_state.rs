@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 
-/// Maximum live recurrent units for the Stage-2 hybrid lane.
-pub(crate) const HYBRID_LIVE_STATE_UNITS: usize = 2;
+/// Most live recurrent units, and so decode lanes, a hybrid load holds.
+/// The load's memory plan grants 1 to this many from the device's memory.
+pub(crate) const HYBRID_LIVE_STATE_UNITS: usize = 8;
 
 struct LiveState<S> {
     bytes: u64,
@@ -25,11 +26,20 @@ pub(crate) struct RecurrentStateTable<S> {
 }
 
 impl<S> RecurrentStateTable<S> {
-    pub(crate) fn stage2() -> Self {
+    pub(crate) fn new(max_live_units: usize) -> Self {
         Self {
             live: BTreeMap::new(),
-            max_live_units: HYBRID_LIVE_STATE_UNITS,
+            max_live_units: max_live_units.max(1),
         }
+    }
+
+    pub(crate) fn max_live_units(&self) -> usize {
+        self.max_live_units
+    }
+
+    /// Lowers or raises the cap; rows already live stay.
+    pub(crate) fn set_max_live_units(&mut self, max_live_units: usize) {
+        self.max_live_units = max_live_units.max(1);
     }
 
     pub(crate) fn live_len(&self) -> usize {
@@ -102,18 +112,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn live_table_caps_two_units_and_keeps_rows_isolated() {
-        let mut table = RecurrentStateTable::stage2();
-        table.insert_live(1, 10, vec![11]).unwrap();
-        table.insert_live(2, 20, vec![22]).unwrap();
-        assert_eq!(table.live_len(), 2);
-        assert_eq!(table.live_bytes(), 30);
-        assert_eq!(table.live(1), Some(&vec![11]));
-        assert_eq!(table.live(2), Some(&vec![22]));
-        assert!(table.insert_live(3, 30, vec![33]).is_err());
+    fn live_table_caps_eight_units_and_keeps_rows_isolated() {
+        assert_eq!(HYBRID_LIVE_STATE_UNITS, 8);
+        let mut table = RecurrentStateTable::new(HYBRID_LIVE_STATE_UNITS);
+        for seq in 1..=8u32 {
+            assert!(table.can_insert_live(seq));
+            table
+                .insert_live(seq, u64::from(seq) * 10, vec![seq * 11])
+                .unwrap();
+        }
+        assert_eq!(table.live_len(), 8);
+        assert_eq!(table.live_bytes(), 360);
+        for seq in 1..=8u32 {
+            assert_eq!(table.live(seq), Some(&vec![seq * 11]));
+        }
+        assert!(!table.can_insert_live(9));
+        assert!(table.insert_live(9, 90, vec![99]).is_err());
+        assert!(table.can_insert_live(8), "a live row replaces itself");
         table.live_mut(1).unwrap().push(12);
         assert_eq!(table.live(1), Some(&vec![11, 12]));
         assert_eq!(table.live(2), Some(&vec![22]));
+    }
+
+    /// A finished or cancelled row frees its unit for the next one.
+    #[test]
+    fn a_released_unit_admits_the_next_row() {
+        let mut table = RecurrentStateTable::new(HYBRID_LIVE_STATE_UNITS);
+        for seq in 1..=8u32 {
+            table.insert_live(seq, 10, seq).unwrap();
+        }
+        assert!(table.insert_live(9, 10, 9).is_err());
+        assert!(table.remove_live(2));
+        assert!(table.can_insert_live(9));
+        table.insert_live(9, 10, 9).unwrap();
+        assert!(table.insert_live(10, 10, 10).is_err());
+        assert_eq!(table.take_live(3), Some(3));
+        table.insert_live(10, 10, 10).unwrap();
+        assert_eq!(table.live_len(), 8);
+    }
+
+    /// A plan that grants fewer lanes caps the table there.
+    #[test]
+    fn a_lowered_cap_refuses_rows_past_it() {
+        let mut table = RecurrentStateTable::new(HYBRID_LIVE_STATE_UNITS);
+        table.set_max_live_units(2);
+        table.insert_live(1, 10, 1).unwrap();
+        table.insert_live(2, 10, 2).unwrap();
+        assert!(table.insert_live(3, 10, 3).is_err());
+        assert_eq!(RecurrentStateTable::<u32>::new(0).max_live_units(), 1);
     }
 
     #[test]

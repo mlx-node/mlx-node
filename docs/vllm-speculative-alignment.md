@@ -166,7 +166,19 @@ diverges between paged MTP and paged AR — and equally between _flat_ MTP and _
 AR and flat AR with no speculation involved — while every screened fixture is byte-identical across all three.
 A `D*` gate written on an unscreened prompt therefore measures kernel rounding, and reads as a correctness bug.
 
-**Reopens if:** screening cost ever exceeds the bugs it catches.
+**Sampled output and the thinking cut.** The contract has two halves:
+
+- `T=0`: on tie-screened fixtures, speculative output is byte-equal to plain decoding, at any depth.
+- `T>0`: each token follows the exact target distribution. The chat API takes no seed, so no sampled run
+  repeats, and the tokens of the last cycles before a thinking cut are not comparable between runs: the
+  depth sets how many draws a cycle uses. The cut is a row of the verify (Splash `ThinkingCutoff`): depth
+  is not lowered before it, rows from it on select the end tokens with no draw, and with no thinking token
+  left the end tokens are drafted, so one cycle commits up to `depth + 1` of them.
+
+The thinking cycle guard lowers the same budget a request sets, so it adds no sampling path
+(`penalties::tests::a_cycle_hit_cuts_as_a_budget_of_that_size`).
+
+**Reopens if:** screening cost ever exceeds the bugs it catches, or the chat API gains a seed.
 
 ### X9. `preserve_thinking` is opt-in, not on
 

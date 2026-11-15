@@ -1,3 +1,5 @@
+import { homedir } from 'node:os';
+
 import type { ApiPaths } from '../context.js';
 
 export function handleHealth(ctx: ApiPaths): unknown {
@@ -5,5 +7,7 @@ export function handleHealth(ctx: ApiPaths): unknown {
     status: 'ok',
     modelsDir: ctx.modelsDir,
     tracesDir: ctx.tracesDir,
+    runtimeDir: ctx.runtimeDir,
+    homeDir: homedir(),
   };
 }

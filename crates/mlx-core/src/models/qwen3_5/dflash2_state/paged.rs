@@ -229,6 +229,11 @@ impl IdleLane {
 }
 
 impl DFlash2States {
+    /// The napi object's handle on the state tier.
+    pub(crate) fn tier_handle(&self) -> crate::disk_tier::TierHandle {
+        crate::disk_tier::TierHandle::of(self.disk.as_ref().map(|disk| &disk.tier))
+    }
+
     pub(crate) fn new(block_size: u32, recency: Arc<CacheRecency>) -> Self {
         let mut store = HybridStateStore::new(block_size);
         store.share_recency(recency);
@@ -370,6 +375,21 @@ pub(crate) fn install_linear(
         MxArray::eval_arrays(&arrays)?;
     }
     Ok(())
+}
+
+/// Runs [`install_linear`] from `cell` into `fresh` and drops the result;
+/// false when `cell` holds no materialized GDN cell.
+pub(crate) fn warm_install_linear(
+    cell: Option<&[Qwen3_5LayerCache]>,
+    mut fresh: Vec<Qwen3_5LayerCache>,
+) -> Result<bool> {
+    let Some(anchor) = cell
+        .and_then(crate::models::qwen3_5::paged_forward::snapshot_materialized_linear_layer_caches)
+    else {
+        return Ok(false);
+    };
+    install_linear(&mut fresh, &anchor)?;
+    Ok(true)
 }
 
 /// Moves the GDN slots a disk read decoded into `caches`' linear slots, in

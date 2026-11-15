@@ -29,6 +29,15 @@ import {
   resumeCommand,
 } from '../src/agent-sessions/reader.js';
 import { deleteSession, renameSession, sweepTombstones, TOMBSTONE_PREFIX } from '../src/agent-sessions/writes.js';
+import {
+  answerLine,
+  eventsText,
+  finishedLine,
+  spawnedLine,
+  turnLine,
+  userLine,
+  writeSession,
+} from './helpers/agent-session-files.js';
 
 const FIXTURE_HOME = fileURLToPath(new URL('./fixtures/grok-sessions/home', import.meta.url));
 const NOW = Date.parse('2026-10-29T12:00:00Z');
@@ -127,6 +136,7 @@ describe('AgentSessionsReader.list', () => {
     const p = rows.find((s) => s.id === P)!;
     expect(p).toEqual({
       id: P,
+      origin: 'agent',
       title: 'Research the project layout',
       cwd: '/Users/dev/proj',
       model: 'Qwen3.8-27B-UD-Q4_K_M',
@@ -393,7 +403,7 @@ describe('liveness', () => {
     setMtimes(dir, NOW - 2 * 60_000);
     expect(reader().liveness(H, true)).toEqual({ live: true, reason: 'open-turn', sessionId: H });
     expect(reader().liveness(H, false).live).toBe(false);
-    expect(() => deleteSession(reader(), H)).toThrow(/turn in progress/);
+    expect(() => deleteSession(reader(), H)).toThrow('turn in progress');
     expect(existsSync(dir)).toBe(true);
     // Idle past the open-turn window, it can be deleted like a parsed one.
     setMtimes(dir, NOW - 11 * 60_000);
@@ -408,8 +418,8 @@ describe('liveness', () => {
     expect(r.liveness(C1, true)).toEqual({ live: true, reason: 'registered', sessionId: P });
     expect(r.liveness(G, true)).toEqual({ live: true, reason: 'registered', sessionId: P });
     expect(r.liveness(G, false)).toEqual({ live: true, reason: 'registered', sessionId: P });
-    expect(() => renameSession(r, G, 'Renamed')).toThrow(/open in a running mlx agent \(via parent/);
-    expect(() => deleteSession(r, C1)).toThrow(/open in a running mlx agent \(via parent/);
+    expect(() => renameSession(r, G, 'Renamed')).toThrow('open in a running mlx agent (via parent');
+    expect(() => deleteSession(r, C1)).toThrow('open in a running mlx agent (via parent');
     expect(existsSync(sessionDir(PROJ, C1))).toBe(true);
     expect(existsSync(sessionDir(PROJ, G))).toBe(true);
 
@@ -417,7 +427,8 @@ describe('liveness', () => {
     rmSync(join(home, 'active_sessions.json'));
     expect(r.liveness(G, true)).toEqual({ live: true, reason: 'ancestry-unknown', sessionId: P });
     expect(r.liveness(G, false).live).toBe(false);
-    expect(() => deleteSession(r, C1)).toThrow(/spawned by .*summary cannot be read/);
+    expect(() => deleteSession(r, C1)).toThrow('spawned by');
+    expect(() => deleteSession(r, C1)).toThrow('summary cannot be read');
     expect(existsSync(sessionDir(PROJ, G))).toBe(true);
   });
 
@@ -429,7 +440,7 @@ describe('liveness', () => {
       expect(r.scan().unreadable).toEqual([subagents]);
       expect(r.liveness(M, true)).toEqual({ live: true, reason: 'ancestry-unknown', sessionId: M });
       expect(r.liveness(M, false).live).toBe(false);
-      expect(() => deleteSession(r, G)).toThrow(/cannot be listed/);
+      expect(() => deleteSession(r, G)).toThrow('cannot be listed');
       expect(existsSync(sessionDir(PROJ, G))).toBe(true);
     } finally {
       chmodSync(subagents, 0o755);
@@ -518,7 +529,10 @@ describe('deleteSession', () => {
     }
     expect(existsSync(sessionDir(PROJ, G))).toBe(false);
     expect(existsSync(join(sessionDir(WORKTREE, C2), 'summary.json'))).toBe(true);
-    expect((error as Error).message).toMatch(new RegExp(`Could not delete session ${C2}.*already deleted: ${G}`));
+    const message = (error as Error).message;
+    const head = message.indexOf(`Could not delete session ${C2}`);
+    expect(head).toBeGreaterThanOrEqual(0);
+    expect(message.indexOf(`already deleted: ${G}`, head)).toBeGreaterThan(head);
     expect(tombstones()).toEqual([]);
     const index = r.scan();
     for (const sid of [P, C1, C2]) expect(index.sessions.has(sid)).toBe(true);
@@ -565,6 +579,139 @@ describe('deleteSession', () => {
     } finally {
       rmSync(outside, { recursive: true, force: true });
     }
+  });
+});
+
+describe('AgentSessionsReader.timeline', () => {
+  const childUpdates = () => join(sessionDir(PROJ, C1), 'updates.jsonl');
+  /** Child C1's events moved inside its run (spawn 279070, return 279072). */
+  function childInsideRun(answerAt = 1791643279071): void {
+    writeFileSync(
+      childUpdates(),
+      eventsText(C1, [
+        userLine(1791643279070, 'Trace it'),
+        answerLine(answerAt, 'Done'),
+        turnLine(1791643279072, 2, 50),
+      ]),
+    );
+    setMtimes(sessionDir(PROJ, C1), NOW - DAY);
+  }
+  const laneOf = (r: AgentSessionsReader, childId: string) => {
+    const timeline = r.timeline(P, 1);
+    if (timeline === null || timeline === 'no-turn') throw new Error('no timeline');
+    return {
+      lane: timeline.lanes.find((l) => l.id === childId)!,
+      spans: timeline.spans.filter((s) => s.lane === childId),
+    };
+  };
+
+  it('returns null for an unknown or ambiguous id and no-turn past the last turn', () => {
+    const r = reader();
+    expect(r.timeline(id(0x99), 1)).toBeNull();
+    expect(r.timeline(D, 1)).toBeNull();
+    expect(r.timeline(P, 3)).toBe('no-turn');
+    expect(r.timeline(P, 2)).toMatchObject({ turn: 2, turns: 2, open: false, live: false, asOfMs: NOW });
+  });
+
+  it('a child folder that is gone is missing; a child without events or with an empty file is empty', () => {
+    expect(laneOf(reader(), C2).lane).toMatchObject({ noSteps: 'empty', sessionId: C2 });
+    writeFileSync(
+      join(home, 'sessions', '%2FUsers%2Fdev%2F.mlx-agent%2Fworktrees%2Fproj%2Fsubagent-' + C2, C2, 'updates.jsonl'),
+      '',
+    );
+    expect(laneOf(reader(), C2).lane.noSteps).toBe('empty');
+    rmSync(sessionDir(PROJ, C1), { recursive: true });
+    expect(laneOf(reader(), C1).lane).toMatchObject({ noSteps: 'missing', sessionId: null });
+  });
+
+  it('refuses a child file over the size cap without reading it', () => {
+    chmodSync(childUpdates(), 0o000);
+    try {
+      expect(laneOf(reader({ maxTimelineChildBytes: 1024 }), C1).lane).toMatchObject({
+        noSteps: 'too-large',
+        fileBytes: 1406,
+      });
+      expect(laneOf(reader(), C1).lane).toMatchObject({ noSteps: 'unreadable', fileBytes: null });
+    } finally {
+      chmodSync(childUpdates(), 0o644);
+    }
+  });
+
+  it('reuses a child digest while its stamp holds and refreshes it when the file grows', () => {
+    childInsideRun();
+    const r = reader();
+    const first = laneOf(r, C1);
+    expect(first.lane).toMatchObject({ noSteps: null, tokenReports: [{ atMs: 50, tokens: 50 }] });
+    expect(first.spans.map((s) => s.kind)).toEqual(['wait', 'generate']);
+    // Same size, same mtime: the answer moved out of the run, but the cached digest is served.
+    const text = readFileSync(childUpdates(), 'utf8');
+    writeFileSync(childUpdates(), text.replace('1791643279071', '1791643279099'));
+    setMtimes(sessionDir(PROJ, C1), NOW - DAY);
+    expect(laneOf(r, C1).spans.map((s) => s.kind)).toEqual(['wait', 'generate']);
+    appendFileSync(childUpdates(), '\n');
+    setMtimes(sessionDir(PROJ, C1), NOW - DAY);
+    const grown = laneOf(r, C1);
+    expect(grown.spans).toEqual([]);
+    expect(grown.lane).toMatchObject({ noSteps: null, tokenReports: [{ atMs: 50, tokens: 50 }] });
+  });
+
+  it('child event files never push the parent out of the transcript cache', () => {
+    const T0 = 1_800_000_000_000;
+    const kids = ['k1', 'k2', 'k3', 'k4', 'k5'].map(
+      (k) => `01b20000-0000-7000-8000-0000000000${k.slice(1).padStart(2, '0')}`,
+    );
+    const parentId = '01b20000-0000-7000-8000-000000000000';
+    const lines = [userLine(T0, 'Plan the work')];
+    kids.forEach((kid, i) => lines.push(spawnedLine(T0 + 10 + i, kid, `Part ${String(i)}`)));
+    kids.forEach((kid, i) => lines.push(finishedLine(T0 + 50 + i, kid)));
+    lines.push(answerLine(T0 + 60, 'All parts done'), turnLine(T0 + 70, 70));
+    const parentDir = writeSession(home, { id: parentId, lines });
+    kids.forEach((kid, i) =>
+      writeSession(home, {
+        id: kid,
+        lines: [userLine(T0 + 10 + i, 'Do a part'), answerLine(T0 + 20 + i, 'Part done'), turnLine(T0 + 30 + i, 20)],
+        parent: { id: parentId, status: 'completed', description: `Part ${String(i)}` },
+      }),
+    );
+    setMtimes(home, NOW - DAY);
+    const r = reader();
+    expect(r.detail(parentId)!.transcript[0]).toMatchObject({ text: 'Plan the work' });
+    const timeline = r.timeline(parentId, 1);
+    expect(
+      timeline !== null && timeline !== 'no-turn' && timeline.lanes.filter((l) => l.noSteps === null),
+    ).toHaveLength(6);
+    const updates = join(parentDir, 'updates.jsonl');
+    writeFileSync(updates, readFileSync(updates, 'utf8').replace('Plan the work', 'PLAN THE WORK'));
+    setMtimes(parentDir, NOW - DAY);
+    expect(r.detail(parentId)!.transcript[0]).toMatchObject({ text: 'Plan the work' });
+  });
+});
+
+describe('AgentSessionsReader titles', () => {
+  const T0 = 1_800_000_000_000;
+  const sid = (n: number) => `01c20000-0000-7000-8000-${n.toString(16).padStart(12, '0')}`;
+
+  it('a session the agent did not name is titled by its first prompt; an agent title wins', () => {
+    const lines = [
+      userLine(T0, '\n   Explain   the MLX\tallocator, please\nsecond line'),
+      answerLine(T0 + 1, 'Sure'),
+      turnLine(T0 + 2, 2),
+    ];
+    writeSession(home, { id: sid(1), title: '', lines });
+    writeSession(home, { id: sid(2), title: 'Agent named it', lines });
+    writeSession(home, { id: sid(3), title: '', lines: [] });
+    const dir = writeSession(home, { id: sid(4), title: '', lines });
+    const summary = JSON.parse(readFileSync(join(dir, 'summary.json'), 'utf8')) as Record<string, unknown>;
+    writeFileSync(join(dir, 'summary.json'), JSON.stringify({ ...summary, num_messages: 0 }));
+    setMtimes(home, NOW - DAY);
+    const r = reader();
+    const rows = new Map(r.list({ limit: 200 }).sessions.map((row) => [row.id, row.title]));
+    expect(rows.get(sid(1))).toBe('Explain the MLX allocator, please');
+    expect(rows.get(sid(2))).toBe('Agent named it');
+    expect(rows.get(sid(3))).toBe('');
+    expect(rows.has(sid(4))).toBe(false);
+    expect(r.detail(sid(1))!.session.title).toBe('Explain the MLX allocator, please');
+    expect(r.list({ q: 'mlx alloc' }).sessions.map((row) => row.id)).toEqual([sid(1)]);
   });
 });
 

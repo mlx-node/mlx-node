@@ -17,7 +17,10 @@ use crate::engine::memory_plan::{
 use crate::transformer::KvFormat;
 
 use super::config::Config;
-use super::memory::{draft_state_bytes, prefill_scratch, row_state_bytes};
+use super::memory::{
+    draft_hidden_row_bytes, draft_index_bytes_per_token, draft_state_bytes, prefill_scratch,
+    row_state_bytes,
+};
 
 /// The Flash Next KV page (Splash `QwenHybridLayout::kvLayout`): K/V of the
 /// attention layers in the load's format and the indexer's bf16 block keys
@@ -124,20 +127,34 @@ pub(super) fn pool_input<'a>(
         explicit_mib: None,
         lane_in_pool: false,
         state,
-        state_in_pool: false,
     }
 }
 
-/// The lane's state besides the cell: with MTP weights, the MTP draft state
-/// of a `W`-token turn, which grows with `W`. The lane is one and charged
-/// once (Splash `evaluateEngineMemoryPlan` `availableForOneRequestKv`).
-pub(super) fn mtp_state(c: &Config, has_mtp: bool) -> impl Fn(u32) -> u64 + '_ {
+/// The lane's state besides the cell: with MTP weights, the draft history
+/// every prefill keeps for a `W`-token turn (draft K/V and indexer keys of
+/// every row, a full prefill window of hidden rows waiting) and an MTP
+/// turn's verify snapshots, which grows with `W`. The lane is one and
+/// charged once (Splash `evaluateEngineMemoryPlan`
+/// `availableForOneRequestKv`).
+pub(super) fn lane_state(c: &Config, has_mtp: bool) -> impl Fn(u32) -> u64 + '_ {
     move |window| {
         if has_mtp {
             draft_state_bytes(c, u64::from(window))
+                + u64::from(window) * draft_index_bytes_per_token(c)
+                + super::MAX_PREFILL_CHUNK as u64 * draft_hidden_row_bytes(c)
         } else {
             0
         }
+    }
+}
+
+/// The disk tier's host staging on a load with it on
+/// (`MemoryFootprint::state_staging_bytes`): fixed, whatever the window.
+pub(super) fn state_staging(c: &Config, has_mtp: bool, disk: bool) -> u64 {
+    if disk {
+        super::memory::disk_staging_bytes(c, has_mtp)
+    } else {
+        0
     }
 }
 
@@ -172,11 +189,13 @@ pub(super) struct LoadInventory {
     pub rows: StreamedPart,
 }
 
-/// The store plan and the dynamic budget whose lanes hold the allowance.
+/// The store plan and the dynamic budget whose lanes hold the allowance of
+/// `allowance_tokens`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct StoreDecision {
     pub store: StorePlan,
     pub allowance: u64,
+    pub allowance_tokens: u32,
 }
 
 /// Splash `planStreamedMemory` for a target that cannot spill: the KV
@@ -191,13 +210,15 @@ pub(super) fn plan_store(
     max_memory: Option<u64>,
     max_context: Option<u32>,
     has_mtp: bool,
+    disk: bool,
 ) -> Result<StoreDecision> {
     let transient = |window: u32| transient(c, window);
-    let state = mtp_state(c, has_mtp);
+    let state = lane_state(c, has_mtp);
     let pool = pool_input(c, &transient, &state);
     let lane = |dynamic: u64| pool.plan_at(dynamic).lane.window.maximum();
     let automatic = pool.shape.trained.min(RESIDENT_ALLOWANCE_TOKENS);
-    let allowance = allowance_dynamic_bytes(&[&lane], max_context.unwrap_or(automatic));
+    let allowance_tokens = max_context.unwrap_or(automatic);
+    let allowance = allowance_dynamic_bytes(&[&lane], allowance_tokens);
     let minimum_dynamic = pool.plan_at(0).lane.minimum_bytes;
     let hard = hard_budget_bytes(
         live.working_set_bytes,
@@ -208,7 +229,8 @@ pub(super) fn plan_store(
         .active_bytes
         .saturating_add(live.registered_pool_bytes)
         .saturating_add(inventory.store_fixed_bytes)
-        .saturating_add(inventory.vision_bytes);
+        .saturating_add(inventory.vision_bytes)
+        .saturating_add(state_staging(c, has_mtp, disk));
     let store = plan_streamed_store(&StreamedInputs {
         hard,
         bound: MemoryBound::of(max_memory, hard),
@@ -219,7 +241,11 @@ pub(super) fn plan_store(
         rows: inventory.rows,
     })
     .map_err(|error| Error::from_reason(error.message(label)))?;
-    Ok(StoreDecision { store, allowance })
+    Ok(StoreDecision {
+        store,
+        allowance,
+        allowance_tokens,
+    })
 }
 
 /// Splash `evaluateEngineMemoryPlan` after the load: what is resident now,
@@ -231,16 +257,17 @@ pub(super) fn plan_engine(
     held_back: u64,
     max_memory: Option<u64>,
     has_mtp: bool,
+    disk: bool,
 ) -> Result<MemoryPlan> {
     let transient = |window: u32| transient(c, window);
-    let state = mtp_state(c, has_mtp);
+    let state = lane_state(c, has_mtp);
     let footprint = MemoryFootprint {
         working_set_bytes: live.working_set_bytes,
         max_memory_bytes: max_memory,
         active_bytes: live.active_bytes,
         other_pool_bytes: live.registered_pool_bytes,
         staging_bytes: 0,
-        state_staging_bytes: 0,
+        state_staging_bytes: state_staging(c, has_mtp, disk),
         draft_weights_bytes: 0,
         held_back_bytes: held_back,
         margin: crate::engine::memory_plan::Margin::Unguarded,
@@ -320,8 +347,18 @@ pub(super) fn estimate(
     max_memory: Option<u64>,
     max_context: Option<u32>,
     has_mtp: bool,
+    disk: bool,
 ) -> Result<Qwen4ExpContextEstimate> {
-    let decision = plan_store(label, c, inventory, live, max_memory, max_context, has_mtp)?;
+    let decision = plan_store(
+        label,
+        c,
+        inventory,
+        live,
+        max_memory,
+        max_context,
+        has_mtp,
+        disk,
+    )?;
     let loaded = LiveMemory {
         active_bytes: live
             .active_bytes
@@ -333,7 +370,7 @@ pub(super) fn estimate(
         .expert_cap_bytes
         .saturating_add(decision.store.row_cache_bytes)
         .saturating_add(inventory.vision_bytes);
-    let plan = plan_engine(label, c, loaded, held_back, max_memory, has_mtp)?;
+    let plan = plan_engine(label, c, loaded, held_back, max_memory, has_mtp, disk)?;
     check_context(label, &plan, max_context)?;
     let pool = plan.pool.as_ref().ok_or_else(|| {
         Error::from_reason(format!("{label} memory plan: the load planned no pool"))
@@ -378,6 +415,8 @@ pub async fn estimate_qwen4_exp_context_window(
         let has_mtp = super::auxiliary::validate_mtp(&weights, &config)?;
         let vision = super::media::Vision::metadata(&raw, &weights, &config)?.available();
         let inventory = weights.load_inventory(&config, vision)?;
+        let env = std::env::var(crate::cold_tier::PERSIST_PAGED_CACHE_ENV).ok();
+        let disk = super::disk_plan(LABEL, &options, env.as_deref())?.1;
         estimate(
             LABEL,
             &config,
@@ -386,6 +425,7 @@ pub async fn estimate_qwen4_exp_context_window(
             max_memory,
             max_context,
             has_mtp,
+            disk,
         )
         .map(Some)
     })

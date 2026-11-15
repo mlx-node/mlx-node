@@ -120,6 +120,8 @@ fn chat_config(reasoning_effort: Option<&str>) -> ChatConfig {
         tools: None,
         reasoning_effort: reasoning_effort.map(|s| s.to_string()),
         thinking_token_budget: None,
+        thinking_cycle_guard: None,
+        thinking_end_text: None,
         include_reasoning: Some(true),
         report_performance: Some(false),
         reuse_cache: Some(true),

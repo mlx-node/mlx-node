@@ -408,6 +408,7 @@ impl Qwen35Inner {
                     &cb,
                     cancelled,
                     args.thinking,
+                    args.config,
                 )?;
                 Ok(TurnOutput::Streamed)
             }
@@ -420,6 +421,7 @@ impl Qwen35Inner {
                     p,
                     report_perf,
                     args.thinking,
+                    args.config,
                 )?;
                 Ok(TurnOutput::Complete(Box::new(result)))
             }

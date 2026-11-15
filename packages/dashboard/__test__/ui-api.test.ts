@@ -13,8 +13,9 @@ import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { failure, type ApiResponse } from '../src/api/errors.js';
 import type { DownloadEvent } from '../src/download.js';
+import type { LiveEvent } from '../src/live.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
-import { bindEventTargetPort, type RpcPort, type RpcPortEvents } from '../src/rpc/port.js';
+import { bindEventTargetPort, type RpcPort } from '../src/rpc/port.js';
 import type { ApiCall } from '../src/runtime.js';
 import {
   connectDashboardApi,
@@ -23,6 +24,7 @@ import {
   getJson,
   mutate,
   subscribeDownload,
+  subscribeLive,
 } from '../ui/src/lib/api.js';
 
 let teardown: (() => void) | null = null;
@@ -41,6 +43,8 @@ interface Harness {
   calls: ApiCall[];
   emit(jobId: string, event: DownloadEvent): void;
   liveSubscriptions(): number;
+  emitLive(event: LiveEvent): void;
+  watchers(): number;
 }
 
 /** Connect the SPA client to a stub runtime over a real MessageChannel. */
@@ -48,6 +52,7 @@ function connect(answer?: (call: ApiCall) => ApiResponse): Harness {
   const calls: ApiCall[] = [];
   const subscribers = new Map<number, { jobId: string; listener: (event: DownloadEvent) => void }>();
   let nextKey = 1;
+  const watchers = new Set<(event: LiveEvent) => void>();
 
   const { port1, port2 } = new MessageChannel();
   port1.unref();
@@ -65,10 +70,16 @@ function connect(answer?: (call: ApiCall) => ApiResponse): Harness {
           subscribers.delete(key);
         };
       },
+      watchLive: (listener: (event: LiveEvent) => void) => {
+        watchers.add(listener);
+        return () => {
+          watchers.delete(listener);
+        };
+      },
     },
     bindEventTargetPort(port2),
   );
-  connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+  connectDashboardApi(bindEventTargetPort(port1));
   teardown = dispose;
 
   return {
@@ -77,6 +88,10 @@ function connect(answer?: (call: ApiCall) => ApiResponse): Harness {
       for (const s of subscribers.values()) if (s.jobId === jobId) s.listener(event);
     },
     liveSubscriptions: () => subscribers.size,
+    emitLive(event) {
+      for (const listener of watchers) listener(event);
+    },
+    watchers: () => watchers.size,
   };
 }
 
@@ -156,6 +171,37 @@ describe('SPA api client', () => {
     expect(seen).toHaveLength(1);
   });
 
+  it('delivers live-channel events and stops on close', async () => {
+    const h = connect();
+    const seen: unknown[] = [];
+    const sub = subscribeLive((event) => seen.push(event));
+    await flush();
+    expect(h.watchers()).toBe(1);
+
+    h.emitLive({ type: 'data', version: 3, traces: true, runtime: false });
+    await flush();
+    expect(seen).toEqual([{ type: 'data', version: 3, traces: true, runtime: false }]);
+
+    sub.close();
+    await flush();
+    expect(h.watchers()).toBe(0);
+    h.emitLive({ type: 'data', version: 4, traces: true, runtime: true });
+    await flush();
+    expect(seen).toHaveLength(1);
+  });
+
+  it('refuses a live watch with E_UNAVAILABLE when no port has been connected', () => {
+    disconnectDashboardApi();
+    let err: unknown = null;
+    try {
+      subscribeLive(() => {});
+    } catch (caught) {
+      err = caught;
+    }
+    expect(err).toBeInstanceOf(DashboardApiError);
+    expect((err as DashboardApiError).code).toBe('E_UNAVAILABLE');
+  });
+
   it('closes the previous connection when a new port is connected', async () => {
     const h = connect();
     subscribeDownload('job-1', () => {});
@@ -167,49 +213,36 @@ describe('SPA api client', () => {
     const { port1, port2 } = new MessageChannel();
     port1.unref();
     port2.unref();
-    connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+    connectDashboardApi(bindEventTargetPort(port1));
     port2.close();
     await flush();
     expect(h.liveSubscriptions()).toBe(0);
   });
 
-  it('does not let a retired connection restart the runtime serving its replacement', async () => {
+  it("fails a retired connection's unanswered mutation alone, with E_TIMEOUT", async () => {
     vi.useFakeTimers();
     try {
-      let oldEvents: RpcPortEvents | undefined;
       const oldPort: RpcPort = {
         postMessage: () => {},
-        listen(events): () => void {
-          oldEvents = events;
-          return () => {};
-        },
+        listen: () => () => {},
         close: () => {},
       };
-      let recoveries = 0;
-      connectDashboardApi(oldPort, {
-        timeoutMs: 60_000,
-        cancellationGraceMs: 10,
-        onUnresponsive: () => {
-          recoveries += 1;
-        },
-      });
+      connectDashboardApi(oldPort, { timeoutMs: 60_000, cancellationGraceMs: 10 });
       const oldMutation = mutate('DELETE', '/models/old').catch((error: unknown) => error);
 
-      // Reconnection asks the old client to cancel. If that old port is wedged,
-      // its grace timer must not later kill the runtime behind this new port.
-      connectDashboardApi(
-        {
-          postMessage: () => {},
-          listen: () => () => {},
-          close: () => {},
-        },
-        { onUnresponsive: () => {} },
-      );
+      // Reconnection asks the old client to cancel. A peer that never answers
+      // costs that one call its grace, and nothing else.
+      connectDashboardApi({
+        postMessage: () => {},
+        listen: () => () => {},
+        close: () => {},
+      });
       await vi.advanceTimersByTimeAsync(10);
-      expect(recoveries).toBe(0);
-
-      oldEvents!.onClose();
-      await oldMutation;
+      const error = await oldMutation;
+      expect(error).toBeInstanceOf(DashboardApiError);
+      expect((error as DashboardApiError).code).toBe('E_TIMEOUT');
+      expect((error as DashboardApiError).status).toBe(504);
+      expect((error as DashboardApiError).message).toContain('may or may not have been applied');
     } finally {
       vi.useRealTimers();
     }

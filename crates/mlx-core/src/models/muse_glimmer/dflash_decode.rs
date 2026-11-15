@@ -421,7 +421,8 @@ impl MuseGlimmerInner {
 
         let mut generated = Vec::with_capacity(generated_capacity_hint(params.max_new_tokens));
         let mut finish_reason = String::from("length");
-        let mut reasoning = ReasoningTracker::from_setup(&args.thinking, &tokenizer.think_end());
+        let mut reasoning =
+            ReasoningTracker::from_setup(&args.thinking, &tokenizer.think_end(args.config));
         let stream_skip_special = ChatBackend::stream_skip_special_tokens(self);
         // One streaming bundle — detokenizer + cursors + emitter — built
         // only when a sink exists so the sync path never runs the emitter
@@ -527,7 +528,7 @@ impl MuseGlimmerInner {
                 include_reasoning: params.include_reasoning,
                 thinking_enabled: args.thinking.enabled,
                 prompt_tokens,
-                reasoning_tokens: reasoning.reasoning_token_count(),
+                reasoning: reasoning.outcome(),
             },
         )?;
         result.cached_tokens = cached_prefix as u32;

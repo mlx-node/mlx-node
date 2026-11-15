@@ -1,0 +1,62 @@
+.root {
+  display: inline-block;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.wheels {
+  display: inline-grid;
+  font-variant-numeric: tabular-nums;
+}
+
+.wheels > *,
+.wheels::before {
+  grid-area: 1 / 1;
+}
+
+.wheels.wheels > * {
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  line-height: inherit;
+}
+
+.wheels[data-prev]::before {
+  content: attr(data-prev);
+  pointer-events: none;
+  user-select: none;
+  animation: number-swap-out var(--duration-instant) var(--ease-standard) both;
+}
+
+.wheels[data-prev] > * {
+  animation: number-swap-in var(--duration-fast) var(--ease-enter) both;
+}
+
+@keyframes number-swap-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes number-swap-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wheels[data-prev]::before {
+    display: none;
+  }
+  .wheels[data-prev] > * {
+    animation: none;
+  }
+}

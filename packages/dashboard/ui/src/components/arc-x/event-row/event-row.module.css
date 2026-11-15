@@ -1,0 +1,111 @@
+.row {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  padding: 0 var(--space-2-5);
+  font-size: var(--text-sm);
+}
+
+.row[data-tone='danger'] {
+  border-color: color-mix(in oklab, var(--danger) 40%, var(--border));
+}
+
+.line {
+  display: flex;
+  min-width: 0;
+  min-height: var(--control-height-md);
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.icon {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  color: var(--text-muted);
+}
+
+.icon > svg {
+  width: 14px;
+  height: 14px;
+}
+
+.label {
+  flex: none;
+  font-weight: 500;
+}
+
+.text {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.facts {
+  flex: none;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.time {
+  flex: none;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.error {
+  margin: 0 0 var(--space-2);
+  color: var(--danger);
+  font-size: var(--text-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.ruleRoot {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.rule {
+  display: grid;
+  grid-template-columns: minmax(var(--space-4), 1fr) auto minmax(var(--space-4), 1fr);
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.rule::before,
+.rule::after {
+  height: 1px;
+  background: var(--border);
+  content: '';
+}
+
+.ruleRoot[data-tone='danger'] .rule {
+  color: var(--danger);
+}
+
+.ruleText {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-1);
+  text-align: center;
+}
+
+.detail {
+  margin: 0;
+  color: var(--danger);
+  font-size: var(--text-xs);
+  text-align: center;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

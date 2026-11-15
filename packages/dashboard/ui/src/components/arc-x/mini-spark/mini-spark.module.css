@@ -1,0 +1,81 @@
+.root {
+  display: inline-block;
+  flex: none;
+  overflow: visible;
+  vertical-align: middle;
+}
+
+.base {
+  stroke: var(--border-subtle);
+  stroke-width: 1;
+}
+
+.line {
+  fill: none;
+  stroke: var(--spark-line);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.5;
+}
+
+.lone {
+  fill: var(--spark-line);
+}
+
+.end {
+  fill: var(--spark-end);
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.root[data-entrance='pending'] .trace {
+  clip-path: inset(0 100% 0 0);
+}
+
+.root[data-entrance='pending'] .end {
+  opacity: 0;
+}
+
+.root[data-entrance='run'] .trace {
+  animation: spark-trace var(--duration-considered) var(--ease-in-out) both;
+}
+
+.root[data-entrance='run'] .end {
+  animation:
+    spark-fade var(--duration-fast) var(--ease-enter) var(--duration-considered) both,
+    spark-pop var(--duration-spring) var(--ease-spring) var(--duration-considered) both;
+}
+
+@keyframes spark-trace {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    clip-path: inset(0 -10% 0 0);
+  }
+}
+
+@keyframes spark-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes spark-pop {
+  from {
+    transform: scale(0.5);
+  }
+  to {
+    transform: scale(1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .root[data-entrance='run'] .trace,
+  .root[data-entrance='run'] .end {
+    animation: none;
+  }
+}

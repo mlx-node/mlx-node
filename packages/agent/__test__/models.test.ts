@@ -251,6 +251,7 @@ describe('discoverMlxModels', () => {
       }
       const entries = await discoverMlxModels(root);
       expect(entries.map((e) => e.discovered.path).sort()).toEqual([direct, first].sort());
+      expect(entries.map((e) => e.agentModel.id).sort()).toEqual(['direct', 'split-UD-Q4_K_XL']);
       expect(entries.every((e) => e.discovered.modelType === 'qwen4_exp' && e.agentModel.input.length === 1)).toBe(
         true,
       );

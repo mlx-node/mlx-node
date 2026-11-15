@@ -54,10 +54,28 @@ function discovered(names: string[]): DiscoveredModel[] {
     },
     contextWindow: 262144,
     supportsImages: false,
+    base: n,
+    variant: 'MLX',
+    format: 'mlx' as const,
   }));
 }
 
 describe('makeSwapController', () => {
+  it('registers the target binding with its identity', async () => {
+    const reg = fakeRegistry();
+    const loader = vi.fn(async (path: string) => ({ marker: path }) as unknown as LoadableModel);
+    const ctrl = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, loader, 'a');
+    await ctrl.resolveModel('b');
+    await ctrl.resolveModel('claude-haiku-4-5');
+
+    const calls = reg.registerAny.mock.calls as Array<[string, unknown, { identity?: unknown }]>;
+    const target = calls.find(([name]) => name === 'b');
+    expect(target?.[2].identity).toEqual({ modelId: 'b', modelType: 'qwen3_5', contextWindow: 262144 });
+    const alias = calls.find(([name]) => name === 'claude-haiku-4-5');
+    expect(alias).toBeDefined();
+    expect(alias?.[2].identity).toBeUndefined();
+  });
+
   it.each(['asr', 'rerank'] as const)('preserves the selected chat target after %s evicts it', async (kind) => {
     const reg = fakeRegistry();
     const loader = vi.fn(async (path: string) => ({ marker: path }) as unknown as LoadableModel);
@@ -397,5 +415,50 @@ describe('makeSwapController', () => {
       expect(entry.owned_by).toBe('mlx-node');
       expect(typeof entry.created).toBe('number');
     }
+  });
+
+  it('disposeAll empties the registry and the aliases but keeps the selection for the next unknown name', async () => {
+    const reg = fakeRegistry();
+    const loader = vi.fn(async (path: string) => ({ marker: path }) as unknown as LoadableModel);
+    const ctrl = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, loader, 'a');
+    await ctrl.resolveModel('b');
+    await ctrl.resolveModel('mlx-local');
+    expect(reg.list().map((e) => e.id)).toEqual(['b', 'mlx-local']);
+
+    await ctrl.disposeAll!();
+    expect(reg.list()).toEqual([]);
+
+    await ctrl.resolveModel('mlx-local');
+    expect(loader.mock.calls.map(([path]) => path)).toEqual(['/fake/b', '/fake/b']);
+    expect(reg.list().map((e) => e.id)).toEqual(['b', 'mlx-local']);
+  });
+
+  it("closes a dropped model's SSD cache before the same model loads again", async () => {
+    const reg = fakeRegistry();
+    const events: string[] = [];
+    const deadlines: number[] = [];
+    const loader = vi.fn(async (path: string) => {
+      events.push(`load ${path}`);
+      return {
+        closeCache: async (deadlineMs: number) => {
+          deadlines.push(deadlineMs - Date.now());
+          events.push(`close ${path}`);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          events.push(`closed ${path}`);
+          return true;
+        },
+      } as unknown as LoadableModel;
+    });
+    const ctrl = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, loader, 'a');
+    await ctrl.resolveModel('a');
+    await ctrl.resolveModel('b');
+    await ctrl.resolveModel('a');
+    expect(events).toEqual(['load /fake/a', 'load /fake/b', 'close /fake/a', 'closed /fake/a', 'load /fake/a']);
+
+    events.length = 0;
+    await ctrl.disposeAll!();
+    await ctrl.resolveModel('a');
+    expect(events).toEqual(['close /fake/a', 'closed /fake/a', 'load /fake/a']);
+    for (const left of deadlines) expect(left).toBeGreaterThan(5000);
   });
 });

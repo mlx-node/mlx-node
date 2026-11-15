@@ -20,9 +20,9 @@
  * `happy-dom` is scoped to this file by the docblock above.
  */
 
-import { DownloadProgress } from '@/components/download-progress';
+import { DownloadProgress, INITIAL_PROGRESS, reduceProgress, type ProgressState } from '@/components/download-progress';
 import { act, createElement } from 'react';
-import { afterEach, describe, expect, it } from 'vite-plus/test';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import type { DownloadEvent } from '../src/download.js';
 import { renderPage, stubApi, type RenderedPage } from './render.js';
@@ -193,5 +193,78 @@ describe('DownloadProgress — aggregate bytes across a sharded job', () => {
     // The unsubscribe crosses the port too.
     await settle();
     expect(source.closed).toBe(true);
+  });
+});
+
+describe('DownloadProgress — rate, glyph and stall', () => {
+  it('shows a rate after two progress frames a second apart', async () => {
+    let clock = 10_000;
+    const now = vi.spyOn(performance, 'now').mockImplementation(() => clock);
+    try {
+      const source = await mountCard();
+      await deliver(source, startEvent, { ...latestEvent, jobReceivedBytes: 2 * MIB });
+      expect(mounted!.text()).not.toContain('/s');
+      clock += 1000;
+      await deliver(source, { ...latestEvent, jobReceivedBytes: 4 * MIB });
+      expect(mounted!.text()).toContain('File 3 of 3 · 2.0 MB/s · under a minute left');
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("the glyph's data-status goes loading -> success on done", async () => {
+    const source = await mountCard();
+    const glyph = (): string | null | undefined =>
+      mounted!.container.querySelector('svg[data-status]')?.getAttribute('data-status');
+    expect(glyph()).toBe('loading');
+    await deliver(source, startEvent, latestEvent);
+    expect(glyph()).toBe('loading');
+    await deliver(source, { type: 'done', id: 'job-1', outputDir: '/models/sharded-model' });
+    expect(glyph()).toBe('success');
+  });
+
+  it("the glyph's data-status goes loading -> error on error", async () => {
+    const source = await mountCard();
+    await deliver(source, startEvent, latestEvent, { type: 'error', id: 'job-1', message: 'disk full' });
+    expect(mounted!.container.querySelector('svg[data-status]')?.getAttribute('data-status')).toBe('error');
+    expect(mounted!.text()).toContain('disk full');
+    expect(mounted!.container.querySelector('[role="progressbar"]')!.getAttribute('aria-valuenow')).toBe('57');
+  });
+});
+
+describe('reduceProgress', () => {
+  const running = (): ProgressState => reduceProgress(INITIAL_PROGRESS, startEvent, 0);
+
+  it('ignores a rewind on reconnect when computing the rate', () => {
+    let state = reduceProgress(running(), { ...latestEvent, jobReceivedBytes: 2 * MIB }, 0);
+    state = reduceProgress(state, { ...latestEvent, jobReceivedBytes: 4 * MIB }, 1000);
+    expect(state.rate?.bytesPerSec).toBe(2 * MIB);
+    state = reduceProgress(state, { ...latestEvent, jobReceivedBytes: MIB }, 2000);
+    expect(state.rate).toEqual({ at: 2000, bytes: MIB, bytesPerSec: 2 * MIB });
+    state = reduceProgress(state, { ...latestEvent, jobReceivedBytes: 2 * MIB }, 3000);
+    expect(state.rate?.bytesPerSec).toBeCloseTo(0.3 * MIB + 0.7 * 2 * MIB);
+  });
+
+  it('keeps the anchor for frames less than a second apart, and a start resets the rate', () => {
+    let state = reduceProgress(running(), { ...latestEvent, jobReceivedBytes: MIB }, 0);
+    state = reduceProgress(state, { ...latestEvent, jobReceivedBytes: 3 * MIB }, 400);
+    expect(state.rate).toEqual({ at: 0, bytes: MIB, bytesPerSec: null });
+    state = reduceProgress(state, startEvent, 500);
+    expect(state.rate).toBeNull();
+  });
+
+  it('stalled sets stalled and leaves the phase; the next progress or start clears it', () => {
+    const stalled = reduceProgress(reduceProgress(running(), latestEvent, 0), { type: 'stalled' });
+    expect(stalled).toMatchObject({ phase: 'running', stalled: true });
+    expect(reduceProgress(stalled, latestEvent, 10).stalled).toBe(false);
+    expect(reduceProgress(stalled, startEvent, 10).stalled).toBe(false);
+    expect(reduceProgress(INITIAL_PROGRESS, { type: 'stalled' })).toMatchObject({ phase: 'connecting', stalled: true });
+  });
+
+  it('stalled in done or error changes nothing', () => {
+    const done = reduceProgress(running(), { type: 'done', id: 'job-1', outputDir: '/m' }, 0);
+    expect(reduceProgress(done, { type: 'stalled' })).toBe(done);
+    const failed = reduceProgress(running(), { type: 'error', id: 'job-1', message: 'x' }, 0);
+    expect(reduceProgress(failed, { type: 'stalled' })).toBe(failed);
   });
 });

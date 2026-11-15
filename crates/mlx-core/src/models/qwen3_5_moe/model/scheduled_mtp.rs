@@ -115,6 +115,10 @@ impl ScheduledMtpTarget for Qwen35MoeInner {
             .collect::<Vec<_>>();
         let ids = MxArray::from_uint32(&ids, &[rows.len() as i64, width as i64])?;
         let mut hidden = self.embedding.forward(&ids)?;
+        // Every weight projection runs on one owner's [1, W] rows, the shape
+        // of the owner's serial verify: MLX picks the matmul kernel by row
+        // count, and a one-ulp change in a router input moves a row to other
+        // experts, so a packed [N * W] projection changes greedy tokens.
         for index in 0..self.layers.len() {
             let adapter = self
                 .paged_adapter
@@ -126,13 +130,21 @@ impl ScheduledMtpTarget for Qwen35MoeInner {
                 adapter,
                 &positions,
                 Some(&mut caches[index]),
-                self.row_exact_decode_projections,
+                true,
                 Some(&mut tape[index]),
             )?;
         }
         let hidden = self.final_norm.forward(&hidden)?;
-        let logits =
-            super::forward::project_logits_from_hidden(&hidden, &self.lm_head, &self.embedding)?;
+        let logits = (0..rows.len() as i64)
+            .map(|row| {
+                super::forward::project_logits_from_hidden(
+                    &hidden.slice_axis(0, row, row + 1)?,
+                    &self.lm_head,
+                    &self.embedding,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let logits = MxArray::concatenate_many(logits.iter().collect(), Some(0))?;
         Ok((logits, hidden))
     }
 }

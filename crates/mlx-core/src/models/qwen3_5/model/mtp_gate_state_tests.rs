@@ -116,6 +116,7 @@ fn a_gated_paged_mtp_turn_leaves_the_speculative_lane() {
         thinking: ThinkingSetup {
             enabled: false,
             budget: None,
+            cycle_guard: false,
         },
         plan: TurnPlan {
             is_delta: false,

@@ -1,0 +1,79 @@
+.root { position: relative; display: flex; min-width: 0; min-height: 0; flex-direction: column; overflow: hidden; }
+
+/* Native scrolling with the platform scrollbars hidden; the overlay bars below replace them. */
+.viewport {
+  --fade-top: 0px; --fade-bottom: 0px; --fade-left: 0px; --fade-right: 0px;
+  min-width: 0;
+  min-height: 0;
+  flex: 1 1 auto;
+  overscroll-behavior-x: contain;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+}
+.viewport::-webkit-scrollbar { display: none; }
+.root[data-orientation="vertical"] > .viewport { overflow-x: hidden; overflow-y: auto; }
+.root[data-orientation="horizontal"] > .viewport { overflow-x: auto; overflow-y: hidden; }
+.root[data-orientation="both"] > .viewport { overflow: auto; }
+
+/* Each fade is exactly as long as the content hidden past that edge, up to the fade size, so it grows in with the first pixels of scroll. */
+.viewport[data-fade="vertical"] {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 var(--fade-top), #000 calc(100% - var(--fade-bottom)), transparent);
+  mask-image: linear-gradient(to bottom, transparent, #000 var(--fade-top), #000 calc(100% - var(--fade-bottom)), transparent);
+}
+.viewport[data-fade="horizontal"] {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 var(--fade-left), #000 calc(100% - var(--fade-right)), transparent);
+  mask-image: linear-gradient(to right, transparent, #000 var(--fade-left), #000 calc(100% - var(--fade-right)), transparent);
+}
+.viewport[data-fade="both"] {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 var(--fade-top), #000 calc(100% - var(--fade-bottom)), transparent), linear-gradient(to right, transparent, #000 var(--fade-left), #000 calc(100% - var(--fade-right)), transparent);
+  -webkit-mask-composite: source-in;
+  mask-image: linear-gradient(to bottom, transparent, #000 var(--fade-top), #000 calc(100% - var(--fade-bottom)), transparent), linear-gradient(to right, transparent, #000 var(--fade-left), #000 calc(100% - var(--fade-right)), transparent);
+  mask-composite: intersect;
+}
+
+/* Overlay scrollbars: a generous hit area around a thin pill that thickens under the pointer. */
+.track {
+  position: absolute;
+  z-index: 1;
+  opacity: 0;
+  pointer-events: none;
+  touch-action: none;
+  transition: opacity var(--duration-considered) var(--ease-standard);
+}
+.track[data-axis="y"] { top: 3px; right: 1px; bottom: 3px; width: 11px; }
+.track[data-axis="x"] { right: 3px; bottom: 1px; left: 3px; height: 11px; }
+.root[data-orientation="both"] > .track[data-axis="y"] { bottom: 13px; }
+.root[data-orientation="both"] > .track[data-axis="x"] { right: 13px; }
+.track[data-hidden] { display: none; }
+
+.thumb { position: absolute; top: 0; left: 0; will-change: transform; }
+.track[data-axis="y"] .thumb { width: 100%; }
+.track[data-axis="x"] .thumb { height: 100%; }
+.thumb::after {
+  content: "";
+  position: absolute;
+  border-radius: var(--radius-pill);
+  background: color-mix(in oklab, var(--foreground) 30%, transparent);
+  transition: width var(--duration-fast) var(--ease-standard), height var(--duration-fast) var(--ease-standard), background-color var(--duration-fast) var(--ease-standard);
+}
+.track[data-axis="y"] .thumb::after { top: 0; right: 3px; bottom: 0; width: 5px; }
+.track[data-axis="x"] .thumb::after { right: 0; bottom: 3px; left: 0; height: 5px; }
+
+/* Visible while scrolling, while the pointer is over the area, and always when asked. Appearing is quick; leaving lingers. */
+.root[data-scrolling] > .track,
+.root[data-dragging] > .track,
+.root[data-scrollbars="always"] > .track { opacity: 1; pointer-events: auto; transition-duration: var(--duration-fast); }
+
+@media (hover: hover) and (pointer: fine) {
+  .root:hover > .track { opacity: 1; pointer-events: auto; transition-duration: var(--duration-fast); }
+  .track:hover .thumb::after,
+  .root[data-dragging] .thumb::after { background: color-mix(in oklab, var(--foreground) 46%, transparent); }
+  .track[data-axis="y"]:hover .thumb::after,
+  .root[data-dragging="y"] .track[data-axis="y"] .thumb::after { width: 7px; right: 2px; }
+  .track[data-axis="x"]:hover .thumb::after,
+  .root[data-dragging="x"] .track[data-axis="x"] .thumb::after { height: 7px; bottom: 2px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .track, .thumb::after { transition: none; }
+}

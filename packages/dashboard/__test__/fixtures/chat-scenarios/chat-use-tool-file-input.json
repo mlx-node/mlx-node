@@ -1,0 +1,118 @@
+{
+  "persist": true,
+  "initialize": {
+    "protocolVersion": 1,
+    "loadSession": true,
+    "pluginDirs": true,
+    "agentVersion": "1.0.45",
+    "models": [
+      {
+        "modelId": "qwen3.5-4b",
+        "totalContextTokens": 32768
+      },
+      {
+        "modelId": "qwen3.5-9b",
+        "totalContextTokens": 65536
+      }
+    ]
+  },
+  "session": {
+    "agentName": "mlx-chat",
+    "toolDefinitionsCount": 2,
+    "skills": 1,
+    "mcpServers": 1,
+    "apiBackend": "Messages",
+    "mcpReadyAfterMs": 70,
+    "modelChangedOnNewAndLoad": true,
+    "replayOnLoad": true
+  },
+  "prompts": [
+    {
+      "match": "file form",
+      "steps": [
+        {
+          "webCall": {
+            "shape": "use_tool",
+            "id": "toolu_f1",
+            "tool_name": "mlx_web__web_search",
+            "tool_input": {},
+            "rawInput": {
+              "variant": "UseTool",
+              "tool_name": "mlx_web__web_search",
+              "tool_input_file": "/etc/hosts"
+            }
+          }
+        },
+        {
+          "text": "never sent",
+          "chunk": 7
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    },
+    {
+      "match": "second form",
+      "steps": [
+        {
+          "webCall": {
+            "shape": "use_tool",
+            "id": "toolu_f2",
+            "tool_name": "mlx_web__web_search",
+            "tool_input": {},
+            "rawInput": {
+              "variant": "UseTool",
+              "tool_name": "mlx_web__web_search",
+              "file": "/etc/hosts"
+            }
+          }
+        },
+        {
+          "text": "never sent",
+          "chunk": 7
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    },
+    {
+      "match": "extra key",
+      "steps": [
+        {
+          "webCall": {
+            "shape": "direct",
+            "id": "toolu_f3",
+            "tool_name": "mlx_web__web_search",
+            "tool_input": {
+              "query": "x"
+            },
+            "rawInput": {
+              "variant": "MCPTool",
+              "tool_name": "mlx_web__web_search",
+              "tool_input": {
+                "query": "x"
+              },
+              "extra": 1
+            }
+          }
+        },
+        {
+          "text": "never sent",
+          "chunk": 7
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    }
+  ],
+  "faults": {}
+}

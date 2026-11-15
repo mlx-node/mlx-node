@@ -3,6 +3,8 @@ import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
 import { QueueFullError, SessionRegistry } from '@mlx-node/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
+import { queueRejections } from '../../packages/server/src/queue-rejections.js';
+
 /**
  * Build a minimal `SessionCapableModel` stub whose methods return
  * predictable `ChatResult` / `ChatStreamEvent` shapes. The mock only
@@ -726,6 +728,51 @@ describe('SessionRegistry', () => {
       releaseA();
       await dispatchA;
       await dispatchB;
+    });
+
+    it('counts a rejection when the queue is full', async () => {
+      const reg = new SessionRegistry({ model: makeMockModel(), maxQueueDepth: 0 });
+      let releaseA!: () => void;
+      const aDone = new Promise<void>((r) => {
+        releaseA = r;
+      });
+      const dispatchA = reg.withExclusive(async () => {
+        await aDone;
+      });
+      await Promise.resolve();
+      const before = queueRejections();
+      expect(() => reg.withExclusive(async () => {})).toThrowError(QueueFullError);
+      expect(queueRejections()).toBe(before + 1);
+      releaseA();
+      await dispatchA;
+    });
+
+    it('activeDispatches counts running holders in both lanes', async () => {
+      const exclusive = new SessionRegistry({ model: makeMockModel() });
+      const batched = new SessionRegistry({ model: makeMockModel(), maxConcurrentDispatches: 4 });
+      const gates: Array<() => void> = [];
+      const hold = () =>
+        new Promise<void>((r) => {
+          gates.push(r);
+        });
+      expect(exclusive.activeDispatches).toBe(0);
+      expect(batched.activeDispatches).toBe(0);
+
+      const ex1 = exclusive.withExclusive(hold);
+      const ex2 = exclusive.withExclusive(async () => {});
+      const b1 = batched.withAdmission(hold);
+      const b2 = batched.withAdmission(hold);
+      await Promise.resolve();
+      await Promise.resolve();
+      // One runner plus one waiter on the exclusive lane; two runners on the batched lane.
+      expect(exclusive.activeDispatches).toBe(1);
+      expect(exclusive.queueDepth).toBe(1);
+      expect(batched.activeDispatches).toBe(2);
+
+      for (const release of gates) release();
+      await Promise.all([ex1, ex2, b1, b2]);
+      expect(exclusive.activeDispatches).toBe(0);
+      expect(batched.activeDispatches).toBe(0);
     });
 
     it('reports queue depth separately from the combined admission footprint', async () => {
@@ -1460,5 +1507,67 @@ describe('SessionRegistry pre-dispatch permit handoff', () => {
     await runner;
     await waiter;
     expect(reg.queueDepth).toBe(0);
+  });
+});
+
+describe('SessionRegistry idle probe', () => {
+  function deferred(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => {
+      resolve = r;
+    });
+    return { promise, resolve };
+  }
+
+  async function settle(): Promise<void> {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  }
+
+  for (const lane of ['withAdmission', 'withExclusive'] as const) {
+    it(`a dispatch entering ${lane} during an idle probe runs only after the probe settles`, async () => {
+      const reg = new SessionRegistry({
+        model: makeMockModel(),
+        maxConcurrentDispatches: lane === 'withAdmission' ? 2 : 1,
+      });
+      const probe = deferred();
+      expect(reg.tryIdleProbe(() => probe.promise)).not.toBeNull();
+      expect(reg.tryIdleProbe(() => Promise.resolve())).toBeNull();
+
+      const ran: string[] = [];
+      const dispatch = reg[lane](async () => {
+        ran.push('dispatch');
+      });
+      expect(reg.activeDispatches).toBe(1);
+      await settle();
+      expect(ran).toEqual([]);
+
+      probe.resolve();
+      await dispatch;
+      expect(ran).toEqual(['dispatch']);
+    });
+
+    it(`refuses an idle probe while ${lane} holds a dispatch`, async () => {
+      const reg = new SessionRegistry({
+        model: makeMockModel(),
+        maxConcurrentDispatches: lane === 'withAdmission' ? 2 : 1,
+      });
+      const hold = deferred();
+      const dispatch = reg[lane](() => hold.promise);
+      const call = vi.fn(() => Promise.resolve());
+      expect(reg.tryIdleProbe(call)).toBeNull();
+      expect(call).not.toHaveBeenCalled();
+      hold.resolve();
+      await dispatch;
+      expect(reg.tryIdleProbe(call)).not.toBeNull();
+      expect(call).toHaveBeenCalledTimes(1);
+    });
+  }
+
+  it('releases held dispatches when the probe rejects', async () => {
+    const reg = new SessionRegistry({ model: makeMockModel(), maxConcurrentDispatches: 2 });
+    const request = reg.tryIdleProbe(() => Promise.reject(new Error('model exited')));
+    expect(request).not.toBeNull();
+    await expect(request).rejects.toThrow('model exited');
+    await expect(reg.withAdmission(async () => 'ran')).resolves.toBe('ran');
   });
 });

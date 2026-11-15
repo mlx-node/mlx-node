@@ -32,7 +32,7 @@ use crate::transformer::paged_kv_cache_adapter::{
 };
 
 use super::paged::{DFlash2States, PagedAnchor};
-use super::store::{DiskCopy, Entry, EntryId, HybridStateStore, Lineage, StateClass};
+use super::store::{DiskCopy, Entry, EntryId, HybridStateStore, Lineage, StateBytes, StateClass};
 use super::write_behind::WriteBehind;
 
 /// The model's state tier: one per model, so one state write in flight.
@@ -241,7 +241,7 @@ fn chain_keys<S>(
     )
 }
 
-fn lineage_keys(
+pub(crate) fn lineage_keys(
     group: ColdGroup,
     fingerprint: mlx_paged_attn::ColdCacheFingerprint,
     lineage: Lineage<'_>,
@@ -279,7 +279,7 @@ fn missing_keys(tier: &DiskTier, keys: &[ColdCacheKey]) -> usize {
         .count()
 }
 
-fn label_of<S>(entry: &Entry<S>) -> ColdStateLabel {
+pub(crate) fn label_of<S>(entry: &Entry<S>) -> ColdStateLabel {
     ColdStateLabel {
         tokens: entry.tokens().to_vec(),
         extra_keys: entry.extra_keys().to_vec(),
@@ -1309,9 +1309,29 @@ pub(crate) fn adopt_all<T: DFlash2Target>(target: &mut T) -> u64 {
     if !disk.tier.persistent || store.entries().next().is_some() {
         return 0;
     }
-    let block_size = store.block_size();
     let cached_bytes = disk.spans.iter().sum();
+    let window_slots = disk.window_slots;
     let tier = Arc::clone(&disk.tier);
+    let adopted = adopt_states(store, &tier, &disk.spans, &disk.geometry, |label| {
+        let row = u32::try_from(label.tokens.len()).ok()?;
+        Some((cached_bytes, row - row.min(window_slots)))
+    });
+    disk.counters.adopted += adopted;
+    adopted
+}
+
+/// The adoption loop of [`adopt_all`] over any store: each state object of
+/// `spans` and `geometry` whose own key and whole KV chain are on `tier`
+/// comes back as a disk-only state. `copy` gives its `cached_bytes` and its
+/// copy's `window_begin`, or `None` to leave it.
+pub(crate) fn adopt_states<S: StateBytes>(
+    store: &mut HybridStateStore<S>,
+    tier: &DiskTier,
+    spans: &[u64],
+    geometry: &str,
+    mut copy: impl FnMut(&ColdStateLabel) -> Option<(u64, u32)>,
+) -> u64 {
+    let block_size = store.block_size();
     let manager = &tier.manager;
     // A lower limit than the earlier process had takes the oldest copies
     // first, so only chains that survive come back.
@@ -1335,22 +1355,25 @@ pub(crate) fn adopt_all<T: DFlash2Target>(target: &mut T) -> u64 {
             block_size,
         );
         let chain = lineage_keys(ColdGroup::Kv, tier.kv_fingerprint, lineage, block_size);
-        if layout.spans != disk.spans
-            || layout.geometry != disk.geometry
+        if layout.spans != spans
+            || layout.geometry != geometry
             || own.len() * block_size as usize != depth
             || own.last() != Some(&key)
-            || missing_keys(&tier, &chain) > 0
+            || missing_keys(tier, &chain) > 0
         {
             continue;
         }
-        let Ok(row) = u32::try_from(depth) else {
+        if u32::try_from(depth).is_err() {
+            continue;
+        }
+        let Some((cached_bytes, window_begin)) = copy(&label) else {
             continue;
         };
         let copy = DiskCopy {
             key,
             bytes: state_object_bytes(&layout, &label),
             landed: true,
-            window_begin: row - row.min(disk.window_slots),
+            window_begin,
             chain_owed: false,
         };
         let class = if label.checkpoint {
@@ -1367,8 +1390,42 @@ pub(crate) fn adopt_all<T: DFlash2Target>(target: &mut T) -> u64 {
         }
     }
     store.continue_after(newest);
-    disk.counters.adopted += adopted;
     adopted
+}
+
+/// A model's state tier with the states it holds, set aside while its
+/// load's warm-up runs.
+pub(crate) struct HeldTier {
+    store: HybridStateStore<PagedAnchor>,
+    disk: StateDisk,
+    cold: Option<ColdTierContext>,
+}
+
+/// Sets the tier, its states and the adapter's view of it aside behind an
+/// empty store: what a warm-up's cache reset clears is not theirs, and no
+/// scratch turn can stage, write, adopt or evict one. `None` without a tier.
+pub(crate) fn hold_tier<T: DFlash2Target>(target: &mut T) -> Option<HeldTier> {
+    let states = target.dflash2_states_mut();
+    let disk = states.disk.take()?;
+    let empty = HybridStateStore::new(states.store.block_size());
+    let store = std::mem::replace(&mut states.store, empty);
+    let cold = target
+        .paged_adapter_mut_ref()
+        .and_then(PagedKVCacheAdapter::take_cold_tier);
+    target.sync_gdn_state_marks();
+    Some(HeldTier { store, disk, cold })
+}
+
+/// Puts a [`hold_tier`] back; the store that stood in for it goes.
+pub(crate) fn release_tier<T: DFlash2Target>(target: &mut T, held: HeldTier) {
+    let HeldTier { store, disk, cold } = held;
+    let states = target.dflash2_states_mut();
+    states.store = store;
+    states.disk = Some(disk);
+    if let (Some(cold), Some(adapter)) = (cold, target.paged_adapter_mut_ref()) {
+        adapter.set_cold_tier(cold);
+    }
+    target.sync_gdn_state_marks();
 }
 
 /// Splash `closePersistentCache` with `FdTransport::runFlush` at a clean

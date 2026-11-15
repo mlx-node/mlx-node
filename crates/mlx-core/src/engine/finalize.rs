@@ -243,7 +243,11 @@ pub(crate) fn finalize_chat_result_with(
         thinking_enabled: args.thinking_enabled,
         num_tokens,
         prompt_tokens: args.prompt_tokens,
-        reasoning_tokens: args.reasoning_tokens,
+        reasoning_tokens: args.reasoning.tokens,
+        reasoning_close: args.reasoning.close_name(),
+        reasoning_cut_at: args.reasoning.cut_at,
+        reasoning_cycle_period: args.reasoning.cycle_period,
+        reasoning_stray_closes: args.reasoning.reported_stray_closes(),
         finish_reason,
         raw_text,
         public_raw_text: Some(public_raw_text),
@@ -267,7 +271,7 @@ pub(crate) fn finalize_chat_result(
     include_reasoning: bool,
     thinking_enabled: bool,
     prompt_tokens: u32,
-    reasoning_tokens: u32,
+    reasoning: crate::engine::penalties::ReasoningOutcome,
 ) -> Result<ChatResult> {
     finalize_chat_result_with(
         FinalizeArgs {
@@ -281,7 +285,7 @@ pub(crate) fn finalize_chat_result(
             include_reasoning,
             thinking_enabled,
             prompt_tokens,
-            reasoning_tokens,
+            reasoning,
         },
         |text, args| {
             parse_thinking_and_tools(
@@ -309,6 +313,7 @@ pub(crate) fn finalize_chat_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::penalties::ReasoningOutcome;
 
     const THINK_END_ID: u32 = 151668; // example </think> token ID
 
@@ -364,7 +369,7 @@ mod tests {
             false,
             false,
             9,
-            4,
+            ReasoningOutcome::counted(4),
         )
         .unwrap();
         assert_eq!(raw.text, "raw");
@@ -385,7 +390,7 @@ mod tests {
             false,
             true,
             1,
-            1,
+            ReasoningOutcome::counted(1),
         )
         .unwrap();
         let visible = finalize_chat_result(
@@ -398,7 +403,7 @@ mod tests {
             true,
             true,
             1,
-            1,
+            ReasoningOutcome::counted(1),
         )
         .unwrap();
         assert_eq!(hidden.thinking, None);
@@ -417,7 +422,7 @@ mod tests {
             false,
             false,
             1,
-            0,
+            ReasoningOutcome::counted(0),
         )
         .unwrap();
         assert_eq!(valid.finish_reason, "tool_calls");
@@ -432,11 +437,83 @@ mod tests {
             false,
             false,
             1,
-            0,
+            ReasoningOutcome::counted(0),
         )
         .unwrap();
         assert_eq!(invalid.finish_reason, "length");
         assert!(invalid.tool_calls.iter().all(|call| call.status != "ok"));
+    }
+
+    #[test]
+    fn the_reasoning_outcome_reaches_the_result_and_the_final_chunk() {
+        use crate::engine::backend::{ChunkSink, DefaultStreamEmitter, StreamEmitter};
+        use crate::engine::penalties::ReasoningTracker;
+
+        struct Last(std::sync::Mutex<Option<ChatStreamChunk>>);
+        impl ChunkSink for Last {
+            fn send(&self, chunk: Result<ChatStreamChunk>) {
+                *self.0.lock().unwrap() = chunk.ok();
+            }
+        }
+
+        let tokenizer = finalizer_tokenizer();
+        // End [2, 3]: a cut at 6 thinking tokens, then the model's own `</think>`
+        // once more in the answer.
+        let mut tracker = ReasoningTracker::new(true, Some(6), &[2, 3]);
+        let mut generated = Vec::new();
+        let mut script = [0, 0, 0, 0, 0, 0, 4, 3, 4].into_iter();
+        while let Some(token) = tracker.take_forced_token().or_else(|| script.next()) {
+            tracker.observe_token(token);
+            generated.push(token);
+        }
+        assert_eq!(&generated[6..8], &[2, 3]);
+        let outcome = tracker.outcome();
+        for finish in ["stop", "length", "cancelled"] {
+            let result = finalize_chat_result(
+                &tokenizer,
+                &generated,
+                finish.to_string(),
+                Some(3),
+                Some("</think>"),
+                None,
+                true,
+                true,
+                1,
+                outcome,
+            )
+            .unwrap();
+            assert_eq!(result.finish_reason, finish, "a cut never changes it");
+            assert_eq!(result.reasoning_close.as_deref(), Some("budget"));
+            assert_eq!(result.reasoning_cut_at, Some(6));
+            assert_eq!(result.reasoning_tokens, 6 + 2 - 1);
+            assert_eq!(result.reasoning_cycle_period, None);
+            assert_eq!(result.reasoning_stray_closes, Some(1));
+
+            let sink = Last(std::sync::Mutex::new(None));
+            DefaultStreamEmitter.finish(&result, &sink);
+            let last = sink.0.into_inner().unwrap().unwrap();
+            assert_eq!(last.reasoning_tokens, Some(7));
+            assert_eq!(last.reasoning_close.as_deref(), Some("budget"));
+            assert_eq!(last.reasoning_cut_at, Some(6));
+            assert_eq!(last.reasoning_cycle_period, None);
+            assert_eq!(last.reasoning_stray_closes, Some(1));
+        }
+
+        let plain = finalize_chat_result(
+            &tokenizer,
+            &[4],
+            "stop".to_string(),
+            Some(3),
+            Some("</think>"),
+            None,
+            true,
+            false,
+            1,
+            ReasoningTracker::new(false, None, &[2, 3]).outcome(),
+        )
+        .unwrap();
+        assert_eq!(plain.reasoning_close, None);
+        assert_eq!(plain.reasoning_stray_closes, None);
     }
 
     #[test]

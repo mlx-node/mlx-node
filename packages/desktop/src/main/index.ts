@@ -18,10 +18,11 @@
 
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 
 import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
 import { engineEnvFor, LAUNCHER_ENGINE_POLICY } from '@mlx-node/server/host/env-policy';
-import { resolveModelsDirAsync } from '@mlx-node/server/host/paths';
+import { resolveMlxNodeHome, resolveModelsDirAsync } from '@mlx-node/server/host/paths';
 import {
   app,
   autoUpdater,
@@ -36,6 +37,7 @@ import electronUpdater from 'electron-updater';
 
 import { createCliLauncher, type DesktopCliConfig } from '../cli-launcher.js';
 import { DESKTOP_QUIT_DEADLINE_MS } from '../control-panel/shutdown-timings.js';
+import { createPanelLedger, ledgerFileName, sweepLedger, type PanelLedger } from '../panel-ledger.js';
 import {
   collectAgentUpdateResult,
   createAgentUpdater,
@@ -60,6 +62,11 @@ import {
   type Rect,
   type WindowBounds,
 } from './settings.js';
+import {
+  createSupervisorStateWriter,
+  projectSupervisorState,
+  supervisorStateFilePath,
+} from './supervisor-state-file.js';
 import { utilityChildTransport } from './supervisor/child-utility.js';
 import { createSupervisor, type Supervisor } from './supervisor/index.js';
 import { prepareExtraCaBundle, securityText } from './system-ca.js';
@@ -79,9 +86,11 @@ let saveDirty = false;
 let saveInFlight: Promise<void> = Promise.resolve();
 
 let supervisor: Supervisor | null = null;
+let supervisorStateWriter: ReturnType<typeof createSupervisorStateWriter> | null = null;
 let tray: TrayController | null = null;
 let controlPanel: ControlPanelWindowManager | null = null;
 let broker: ControlPanelBroker<WebContents> | null = null;
+let panelLedger: PanelLedger | null = null;
 let updates: DesktopUpdater | null = null;
 let agentUpdates: AgentUpdater | null = null;
 const launchVisibility = createLaunchVisibility();
@@ -312,9 +321,12 @@ async function bootstrap(): Promise<void> {
     env: sidecarEnvOverrides({ nativeAddon: paths.nativeAddon, modelsDir: settings.modelsDir }),
   });
 
+  const stateWriter = createSupervisorStateWriter(supervisorStateFilePath());
+  supervisorStateWriter = stateWriter;
   supervisor.on((event) => {
     if (event.type === 'state') {
       tray?.update(event.snapshot);
+      stateWriter.write(projectSupervisorState(event.snapshot, process.pid, Date.now()));
       return;
     }
     if (event.type === 'crashed') {
@@ -372,6 +384,21 @@ async function bootstrap(): Promise<void> {
   const extraCaBundlePath = extraCaBundleResult === TIMED_OUT ? null : extraCaBundleResult;
   if (quitting) return;
 
+  const ledgerDir = join(resolveMlxNodeHome(), 'ledger');
+  const startMs = Math.round(performance.timeOrigin);
+  const ledger = createPanelLedger({
+    dir: ledgerDir,
+    pid: process.pid,
+    ppid: process.ppid,
+    ver: app.getVersion().toLowerCase(),
+    startMs,
+    now: () => Date.now(),
+    mono: () => performance.now(),
+    log: (line) => console.error(line),
+  });
+  panelLedger = ledger;
+  void sweepLedger(ledgerDir, Date.now(), ledgerFileName(startMs, process.pid));
+
   broker = createControlPanelBroker<WebContents>({
     ...electronBrokerDeps({
       entry: paths.controlPanelEntry,
@@ -380,7 +407,7 @@ async function bootstrap(): Promise<void> {
         // After `...process.env` on purpose: the bundle already MERGED any
         // inherited NODE_EXTRA_CA_CERTS, so this replaces rather than duplicates.
         ...(extraCaBundlePath === null ? {} : { NODE_EXTRA_CA_CERTS: extraCaBundlePath }),
-        ...controlPanelEnvOverrides({ modelsDir: settings.modelsDir }),
+        ...controlPanelEnvOverrides({ modelsDir: settings.modelsDir, ledgerDir }),
         MLX_DESKTOP_CLI: JSON.stringify(cliConfig),
       } as Record<string, string>,
       onLog: (stream, line) => {
@@ -391,6 +418,7 @@ async function bootstrap(): Promise<void> {
       if (event.type === 'brokered') return;
       console.error(`[mlx] control panel ${event.type}:`, event);
     },
+    record: (row) => ledger.record(row),
   });
 
   controlPanel = createControlPanelWindowManager({
@@ -407,9 +435,6 @@ async function bootstrap(): Promise<void> {
     // died with the old page.
     onControlPanelReady: (contents) => {
       broker?.attach(contents);
-    },
-    onControlPanelUnresponsive: (contents, expectedGeneration) => {
-      broker?.recover(contents, expectedGeneration);
     },
   });
   launchVisibility.ready(controlPanel);
@@ -654,4 +679,6 @@ async function shutdown(): Promise<void> {
   // its temp root. Serialising them would spend two kill-grace periods against
   // one whole-app quit deadline.
   await Promise.all([broker?.dispose(), supervisor?.dispose()]);
+  panelLedger?.close();
+  await supervisorStateWriter?.dispose();
 }

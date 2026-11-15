@@ -20,6 +20,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   rmSync,
   statSync,
 } from 'node:fs';
@@ -44,10 +45,25 @@ export interface LocalModel {
   sizeBytes: number;
   /** Number of files in the checkpoint directory, recursively. */
   fileCount: number;
+  /**
+   * Names the inference host serves from this directory (one per GGUF variant),
+   * sorted. The join key to traces (`model_key`) and live models. Empty when the
+   * directory serves nothing, or when discovery could not run.
+   */
+  servedIds: string[];
 }
 
 /** Draft-only storage, managed on disk but excluded from standalone model lists. */
 export type LocalCompanion = Pick<LocalModel, 'name' | 'path' | 'sizeBytes' | 'fileCount'>;
+
+/** `/api/models`: the inventory plus what the host can say about room to grow it. */
+export interface ModelsResponse {
+  models: LocalModel[];
+  companions: LocalCompanion[];
+  warnings: string[];
+  dir: string;
+  host: { totalMemBytes: number; diskFreeBytes: number | null };
+}
 
 /**
  * Filename of the atomic-publish completion marker the download runner writes as
@@ -134,7 +150,7 @@ export function isModelInstalled(modelDir: string): boolean {
  *
  * FOLLOWS a symlink on the final component — `statSync`, not `lstatSync` — so a
  * symlinked model directory admits exactly like a real one. That mirrors the
- * loader and discovery (`entryIsUsableDir`), which resolve a symlink to the
+ * loader and discovery (`isUsableDir`), which resolve a symlink to the
  * directory it points at: refusing to follow here would report `present=false`
  * for a checkpoint that loads and lists, and would flag it
  * `blockedByForeignDir` via the {@link isPathOccupied} fallback — a false
@@ -179,6 +195,72 @@ export function isModelPresent(modelDir: string): boolean {
   // shard would falsely read as present (matches the CLI's completeness check,
   // `isModelAlreadyDownloaded`). A lone shard without its index is not complete.
   return shardsComplete(modelDir);
+}
+
+/** Entries {@link holdsModelFiles} reads before it gives up and answers "holds model files". */
+export const HELD_SCAN_MAX_ENTRIES = 20_000;
+
+/** File name endings of weights that discovery, the loaders or `mlx convert` read, compared in lower case. */
+const MODEL_FILE_SUFFIXES = ['.safetensors', '.gguf', '.pdiparams', '.pdparams', '.npz', '.bin', '.pt', '.pth', '.pkl'];
+
+function isModelFileName(name: string): boolean {
+  // Lower case: on a case-insensitive volume discovery and Delete open `Config.json` as `config.json`.
+  const lower = name.toLowerCase();
+  if (lower === 'config.json') return true;
+  return MODEL_FILE_SUFFIXES.some((suffix) => lower.endsWith(suffix));
+}
+
+/**
+ * Whether `dir` holds model files, so Reinstall must never replace it: an entry named `config.json`, or named like
+ * weights (see {@link MODEL_FILE_SUFFIXES}, companion GGUFs included), of any type, at any depth. Every layout that
+ * discovery lists or the loader opens has one of these, so this cannot fall behind either of them.
+ *
+ * Follows a link at the root and links to folders inside it (discovery and the loader do too); a `dev:ino` set stops
+ * a cycle. A folder that cannot be read, or more than `maxEntries` entries, counts as holding model files.
+ */
+export function holdsModelFiles(dir: string, maxEntries: number = HELD_SCAN_MAX_ENTRIES): boolean {
+  try {
+    if (!statSync(dir).isDirectory()) return false;
+  } catch {
+    return false;
+  }
+  let left = maxEntries;
+  const visited = new Set<string>();
+  const stack: string[] = [dir];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    let handle: Dir;
+    try {
+      const self = statSync(current);
+      const key = `${self.dev}:${self.ino}`;
+      if (visited.has(key)) continue;
+      visited.add(key);
+      handle = opendirSync(current);
+    } catch {
+      return true;
+    }
+    try {
+      for (;;) {
+        let entry: Dirent | null;
+        try {
+          entry = handle.readSync();
+        } catch {
+          return true;
+        }
+        if (entry === null) break;
+        if (left <= 0) return true;
+        left -= 1;
+        if (isModelFileName(entry.name)) return true;
+        const full = join(current, entry.name);
+        if (isUsableDir(full, entry)) stack.push(full);
+      }
+    } finally {
+      try {
+        handle.closeSync();
+      } catch {}
+    }
+  }
+  return false;
 }
 
 /**
@@ -299,10 +381,10 @@ export function isPathOccupied(path: string): boolean {
  * non-directory resolves to false.
  *
  * The shape test is {@link readCompletion}, our FULL marker, not merely "carries a
- * `files` array". This is the only gate between `POST /api/downloads` and a
- * `rename(finalDir → backup)` + `rm(backup, { recursive: true })`: the route never
- * parses `overwrite`, so all three guards on that path reduce to this one predicate.
- * A `{"files":[]}` file is not something we ever wrote — the marker has been the same
+ * `files` array". For a plain install this is the only gate between `POST /api/downloads`
+ * and a `rename(finalDir → backup)` + `rm(backup, { recursive: true })`; only a
+ * Reinstall (`replaceBlocker`) passes an unowned entry, and only one that still matches
+ * the numbers the user confirmed. A `{"files":[]}` file is not something we ever wrote — the marker has been the same
  * four fields since the first commit that emitted one — so accepting it authorized
  * the destructive swap on a directory we do not own. Going through the same reader
  * as every other ownership, identity and completeness check is also what stops those
@@ -494,6 +576,13 @@ function detectContextWindow(config: Record<string, unknown>): number | null {
  */
 const MAX_WALK_ENTRIES = 100_000;
 
+export interface WalkMode {
+  /** Stat the root and every entry with `lstat`: links count as files of 0 bytes and are never followed. */
+  noFollow?: boolean;
+  /** Keep the first N relative paths of the files counted (no-follow mode). */
+  keepNames?: number;
+}
+
 /**
  * Iterative size + file count of a directory, bounded so it can never hang the
  * event loop. Traversal is an explicit worklist of directory PATHS, not recursion:
@@ -519,7 +608,11 @@ const MAX_WALK_ENTRIES = 100_000;
 export function walkDirStats(
   dir: string,
   maxEntries: number = MAX_WALK_ENTRIES,
-): { sizeBytes: number; fileCount: number; truncated: boolean } {
+  mode: WalkMode = {},
+): { sizeBytes: number; fileCount: number; truncated: boolean; names: string[] } {
+  const noFollow = mode.noFollow === true;
+  const keepNames = mode.keepNames ?? 0;
+  const names: string[] = [];
   let sizeBytes = 0;
   let fileCount = 0;
   let entriesSeen = 0;
@@ -543,7 +636,7 @@ export function walkDirStats(
       // The ROOT is followed (`statSync`) — discovery admits a symlinked model
       // dir, so its real tree must be sized; children stay no-follow (`lstatSync`)
       // so a symlink is never descended into and a cycle stays broken.
-      const self = (current === dir ? statSync : lstatSync)(current);
+      const self = (current === dir && !noFollow ? statSync : lstatSync)(current);
       const key = `${self.dev}:${self.ino}`;
       if (visited.has(key)) continue;
       visited.add(key);
@@ -619,6 +712,20 @@ export function walkDirStats(
           stack.push(full);
           continue;
         }
+        if (noFollow) {
+          // A foreign entry the app may remove: every non-directory is one file, and only a regular file adds
+          // bytes. Nothing is followed or opened, so a link to a large external file or a FIFO costs nothing.
+          fileCount += 1;
+          if (names.length < keepNames) names.push(full.slice(dir.length + 1));
+          if (entry.isFile()) {
+            try {
+              sizeBytes += lstatSync(full).size;
+            } catch {
+              // Gone since the read: counted, with no bytes.
+            }
+          }
+          continue;
+        }
         try {
           // `statSync` follows symlinks so HF-cache-symlinked blobs count at their
           // real byte size rather than the ~100-byte link. A symlink whose target is
@@ -642,7 +749,7 @@ export function walkDirStats(
     }
   }
 
-  return { sizeBytes, fileCount, truncated };
+  return { sizeBytes, fileCount, truncated, names };
 }
 
 /**
@@ -653,14 +760,39 @@ export function walkDirStats(
  * link resolves to false (skipped silently, like sockets/fifos — a broken link
  * admits nothing).
  */
-function entryIsUsableDir(modelsDir: string, entry: Dirent): boolean {
-  if (entry.isDirectory()) return true;
-  if (!entry.isSymbolicLink()) return false;
+function isUsableDir(path: string, kind: Pick<Dirent, 'isDirectory' | 'isSymbolicLink'>): boolean {
+  if (kind.isDirectory()) return true;
+  if (!kind.isSymbolicLink()) return false;
   try {
-    return statSync(join(modelsDir, entry.name)).isDirectory();
+    return statSync(path).isDirectory();
   } catch {
     return false;
   }
+}
+
+/** A checkpoint's `config.json` as a JSON object, or why discovery skips the directory. */
+function readCheckpointConfig(dir: string): { config: Record<string, unknown> } | { problem: string } {
+  // Read through the type gate, not `readFileSync(path)`: discovery walks
+  // every child of the models dir, so a single `config.json` FIFO would hang
+  // this loop and the whole server with it.
+  const raw = readRegularFile(join(dir, 'config.json'));
+  if (raw === undefined) return { problem: 'no readable config.json' };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return { problem: 'no readable config.json' };
+  }
+  const config = asObject(parsed);
+  return config === undefined ? { problem: 'config.json root is not a JSON object' } : { config };
+}
+
+/**
+ * Discovery's rule for one entry of the models directory: a usable directory (real, or a live link to one) whose
+ * name does not start with `.`, carrying a `config.json` that is a readable regular file with a JSON object root.
+ */
+function isListedEntry(path: string, kind: Pick<Dirent, 'isDirectory' | 'isSymbolicLink'>): boolean {
+  return !basename(path).startsWith('.') && isUsableDir(path, kind) && 'config' in readCheckpointConfig(path);
 }
 
 /**
@@ -693,34 +825,17 @@ export function discoverLocalModels(
     // A symlink whose target is a directory is admitted: the loader resolves it,
     // so it lists like a real checkpoint dir. A link to a file, a dangling link,
     // and every other non-directory is skipped before it can warn.
-    if (!entryIsUsableDir(modelsDir, entry)) continue;
+    const full = join(modelsDir, entry.name);
+    if (!isUsableDir(full, entry)) continue;
     // Hidden dirs are runner scratch (`.staging/<slug>`), never checkpoints:
     // skip them silently so an in-flight download raises no spurious warning.
     if (entry.name.startsWith('.')) continue;
-    const full = join(modelsDir, entry.name);
-    const configPath = join(full, 'config.json');
-
-    let config: Record<string, unknown>;
-    try {
-      // Read through the type gate, not `readFileSync(path)`: discovery walks
-      // every child of the models dir, so a single `config.json` FIFO would hang
-      // this loop and the whole server with it.
-      const raw = readRegularFile(configPath);
-      if (raw === undefined) {
-        warnings.push(`${entry.name}: no readable config.json; skipped`);
-        continue;
-      }
-      const parsed = JSON.parse(raw) as unknown;
-      const object = asObject(parsed);
-      if (object === undefined) {
-        warnings.push(`${entry.name}: config.json root is not a JSON object; skipped`);
-        continue;
-      }
-      config = object;
-    } catch {
-      warnings.push(`${entry.name}: no readable config.json; skipped`);
+    const read = readCheckpointConfig(full);
+    if ('problem' in read) {
+      warnings.push(`${entry.name}: ${read.problem}; skipped`);
       continue;
     }
+    const { config } = read;
 
     const { sizeBytes, fileCount, truncated } =
       options.includeStats === false ? { sizeBytes: 0, fileCount: 0, truncated: false } : walkDirStats(full);
@@ -739,12 +854,153 @@ export function discoverLocalModels(
       contextWindow: detectContextWindow(config),
       sizeBytes,
       fileCount,
+      servedIds: [],
     });
   }
 
   models.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   companions.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return { models, companions, warnings };
+}
+
+/**
+ * The path of `name` as a SINGLE direct child of `modelsDir`, the gate every removal under the models directory goes
+ * through (a delete by route name, a reinstall over a catalog slug). Throws `Refusing to {verb} "{name}": …` when
+ * `name` could reach anything else.
+ */
+export function modelsChildPath(modelsDir: string, name: string, verb: string): string {
+  // A safe relative path (no `.`/`..`/backslash/NUL/drive prefix — shared with the download gate) that carries no
+  // separator, so a decoded route param like `link%2Fvictim` or `../../etc` can never traverse out of the store.
+  if (!isSafeRelPath(name) || name.includes('/')) {
+    throw new Error(`Refusing to ${verb} "${name}": not a direct child of the models directory`);
+  }
+  // A legitimate checkpoint dir never starts with `.` — discovery skips dotdirs.
+  // Rejecting them keeps the runner's reserved scratch (`.staging`, and any leaked
+  // `<slug>.backup-*` / `<slug>@<sha>...` under it) out of reach.
+  if (name.startsWith('.')) {
+    throw new Error(`Refusing to ${verb} "${name}": reserved dashboard directory`);
+  }
+  const root = resolve(modelsDir);
+  const target = join(root, name);
+  if (dirname(target) !== root) {
+    throw new Error(`Refusing to ${verb} "${name}": resolves outside the models directory`);
+  }
+  return target;
+}
+
+/** Entries a blocker summary walks before it reports `truncated`. */
+export const BLOCKER_WALK_MAX_ENTRIES = 2_000;
+/** Names are listed only for this few files. */
+const BLOCKER_MAX_NAMES = 3;
+const LINK_TARGET_MAX_CHARS = 200;
+
+/**
+ * What occupies a path the app did not create. The counts come from `lstat` and never follow a link or open a file;
+ * `listed` reads the root `config.json` and `holdsModel` lists the whole tree (both through a link at the root too).
+ */
+export interface ForeignEntrySummary {
+  /** `lstat` of the path, never followed. `file` = not a directory and not a link. */
+  kind: 'directory' | 'symlink' | 'file';
+  /** directory: files below it, recursive, bounded. file: 1. symlink: 0. */
+  fileCount: number;
+  /** directory: sum of the regular files. file: its size. symlink: 0. */
+  sizeBytes: number;
+  /** The walk stopped at its budget or could not read a part: both numbers are lower bounds. */
+  truncated: boolean;
+  /** Relative POSIX paths, sorted, only when `!truncated && fileCount <= 3`; else `[]`. */
+  names: string[];
+  /** Local models lists this entry (model or companion). */
+  listed: boolean;
+  /** A `config.json` of any type is at the root of the entry. */
+  modelLike: boolean;
+  /** {@link holdsModelFiles}: it holds a config or weights, so Reinstall refuses to replace it. */
+  holdsModel: boolean;
+  /** symlink: the `readlink` text (at most 200 characters), else `null`. */
+  linkTarget: string | null;
+  /** symlink whose target does not exist. */
+  dangling: boolean;
+}
+
+/**
+ * Measure what is at `path`, or `null` when nothing is. The walk never follows a link and never opens a file; the
+ * one read is the root `config.json`, to decide `listed`, and `holdsModel` lists the tree by file names.
+ */
+export function summarizeForeignEntry(
+  path: string,
+  maxEntries: number = BLOCKER_WALK_MAX_ENTRIES,
+): ForeignEntrySummary | null {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    return null;
+  }
+  const listed = isListedEntry(path, stat);
+  if (stat.isSymbolicLink()) {
+    let linkTarget: string | null = null;
+    try {
+      const text = readlinkSync(path);
+      linkTarget = text.length > LINK_TARGET_MAX_CHARS ? `${text.slice(0, LINK_TARGET_MAX_CHARS)}…` : text;
+    } catch {
+      linkTarget = null;
+    }
+    const dangling = !existsSync(path);
+    return {
+      kind: 'symlink',
+      fileCount: 0,
+      sizeBytes: 0,
+      truncated: false,
+      names: [],
+      listed,
+      modelLike: !dangling && existsSync(join(path, 'config.json')),
+      holdsModel: holdsModelFiles(path),
+      linkTarget,
+      dangling,
+    };
+  }
+  if (!stat.isDirectory()) {
+    return {
+      kind: 'file',
+      fileCount: 1,
+      sizeBytes: stat.isFile() ? stat.size : 0,
+      truncated: false,
+      names: [],
+      listed: false,
+      modelLike: false,
+      holdsModel: false,
+      linkTarget: null,
+      dangling: false,
+    };
+  }
+  const walk = walkDirStats(path, maxEntries, { noFollow: true, keepNames: BLOCKER_MAX_NAMES + 1 });
+  const names =
+    !walk.truncated && walk.fileCount <= BLOCKER_MAX_NAMES
+      ? [...walk.names].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+      : [];
+  return {
+    kind: 'directory',
+    fileCount: walk.fileCount,
+    sizeBytes: walk.sizeBytes,
+    truncated: walk.truncated,
+    names,
+    listed,
+    modelLike: isPathOccupied(join(path, 'config.json')),
+    holdsModel: holdsModelFiles(path),
+    linkTarget: null,
+    dangling: false,
+  };
+}
+
+/** The entry still matches what the user was shown. A truncated walk is compared by kind only. */
+export function sameForeignEntry(
+  a: Pick<ForeignEntrySummary, 'kind' | 'fileCount' | 'sizeBytes' | 'truncated'>,
+  b: Pick<ForeignEntrySummary, 'kind' | 'fileCount' | 'sizeBytes' | 'truncated'>,
+): boolean {
+  return (
+    a.kind === b.kind &&
+    a.truncated === b.truncated &&
+    (a.truncated || (a.fileCount === b.fileCount && a.sizeBytes === b.sizeBytes))
+  );
 }
 
 /**
@@ -758,26 +1014,7 @@ export function discoverLocalModels(
  * never touched.
  */
 export function deleteLocalModel(modelsDir: string, name: string): void {
-  // A deletable model is a SINGLE direct child: it must be a safe relative path
-  // (no `.`/`..`/backslash/NUL/drive prefix — shared with the download gate) AND
-  // carry no separator, so a decoded route param like `link%2Fvictim` or
-  // `../../etc` can never traverse out of the store.
-  if (!isSafeRelPath(name) || name.includes('/')) {
-    throw new Error(`Refusing to delete "${name}": not a direct child of the models directory`);
-  }
-  // A legitimate checkpoint dir never starts with `.` — discovery skips dotdirs.
-  // Rejecting them keeps the runner's reserved scratch (`.staging`, and any leaked
-  // `<slug>.backup-*` / `<slug>@<sha>...` under it) out of reach of a delete route.
-  if (name.startsWith('.')) {
-    throw new Error(`Refusing to delete "${name}": reserved dashboard directory`);
-  }
-
-  const root = resolve(modelsDir);
-  const target = join(root, name);
-  // Belt-and-braces: the resolved child must sit exactly one level under root.
-  if (dirname(target) !== root) {
-    throw new Error(`Refusing to delete "${name}": resolves outside the models directory`);
-  }
+  const target = modelsChildPath(modelsDir, name, 'delete');
 
   let stat;
   try {

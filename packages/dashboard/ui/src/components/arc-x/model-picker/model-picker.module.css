@@ -1,0 +1,287 @@
+.trigger {
+  box-sizing: border-box;
+  display: inline-flex;
+  height: var(--control-height-sm);
+  min-width: 0;
+  max-width: 100%;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1);
+  border: 0;
+  border-radius: var(--radius-pill);
+  padding: 0 var(--space-2) 0 var(--space-1-5);
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+  cursor: pointer;
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+
+.trigger:hover:not(:disabled),
+.trigger[aria-expanded='true'] {
+  background: var(--row-hover);
+}
+
+.trigger:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.tipTarget {
+  display: inline-flex;
+  min-width: 0;
+}
+
+.name {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-1-5);
+  animation: picker-swap var(--duration-fast) var(--ease-enter) both;
+}
+
+.variant {
+  display: inline-flex;
+  flex: none;
+}
+
+.none {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.chevron {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-secondary);
+}
+
+.panel.panel {
+  --picker-row: 44px;
+  box-sizing: border-box;
+  display: flex;
+  width: 545px;
+  max-width: calc(100vw - 20px);
+  max-height: var(--radix-popover-content-available-height, 100vh);
+  flex-direction: column;
+  padding: var(--space-1);
+}
+
+/* The left list sets the height: max(rows, 4) up to 8.5 rows, as a basis that may shrink under the window cap. */
+.columns {
+  display: grid;
+  min-height: 0;
+  flex: 0 1 calc(var(--control-height-sm) + var(--picker-row) * var(--picker-rows));
+  grid-template-columns: minmax(0, 300fr) minmax(0, 237fr);
+}
+
+.column {
+  display: grid;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.quants {
+  border-inline-start: 1px solid var(--border);
+  padding-inline-start: var(--space-1);
+}
+
+.body {
+  position: relative;
+  min-height: 0;
+}
+
+.list.inner {
+  position: absolute;
+  inset: 0;
+}
+
+.heading {
+  display: flex;
+  flex: none;
+  height: var(--control-height-sm);
+  align-items: center;
+  margin: 0;
+  padding: 0 var(--space-2-5);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 500;
+}
+
+.list {
+  position: relative;
+  display: grid;
+  min-height: 0;
+  align-content: start;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  outline: none;
+}
+
+.list:focus-visible {
+  outline: 2px solid var(--focus-ring, var(--accent));
+  outline-offset: 1px;
+  border-radius: var(--radius-inset);
+}
+
+.row {
+  display: grid;
+  min-height: var(--picker-row);
+  grid-template-columns: minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: var(--space-2);
+  border-radius: var(--radius-inset);
+  padding: 0 var(--space-2-5);
+  cursor: pointer;
+}
+
+.row[data-active] {
+  background: var(--row-hover);
+}
+
+.row[data-open] {
+  background: var(--row-active);
+}
+
+.baseRow {
+  grid-template-columns: minmax(0, 1fr) auto 14px;
+}
+
+.chev,
+.end {
+  color: var(--text-secondary);
+}
+
+.row[data-open] > .chev {
+  color: var(--foreground);
+}
+
+.end {
+  max-width: 96px;
+  overflow: hidden;
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.swap {
+  animation: picker-swap var(--duration-fast) var(--ease-enter) both;
+}
+
+.rowText {
+  display: grid;
+  min-width: 0;
+}
+
+.rowName {
+  display: flex;
+  min-width: 0;
+  color: var(--foreground);
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+.rowFacts {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.warning {
+  color: var(--warning);
+}
+
+.warning > svg {
+  display: inline-block;
+  margin-inline-end: 2px;
+  vertical-align: -1px;
+}
+
+.check {
+  color: var(--foreground);
+}
+
+.footer {
+  display: flex;
+  flex: none;
+  align-items: flex-start;
+  gap: var(--space-1-5);
+  margin: var(--space-1) 0 0;
+  border-top: 1px solid var(--border);
+  padding: var(--space-2) var(--space-2-5);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-body);
+}
+
+.memory {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-1) 0 0;
+  border-top: 1px solid var(--border);
+  padding: var(--space-1) var(--space-1) var(--space-1) var(--space-2-5);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-body);
+}
+
+.footer + .memory {
+  margin-top: 0;
+  border-top: 0;
+  padding-top: 0;
+}
+
+.memoryText {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+}
+
+.footer[data-warning] > svg {
+  flex: none;
+  margin-top: 2px;
+  color: var(--warning);
+}
+
+/* Work: a badge with no room beside the name wraps to a clipped second line, so it goes before the name shortens. */
+.trigger[data-crowded] .name {
+  align-self: stretch;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  row-gap: var(--space-2);
+  overflow: clip;
+}
+
+.trigger[data-crowded] .name::before {
+  width: 0;
+  height: var(--control-height-sm);
+  margin-inline-end: calc(var(--space-1-5) * -1);
+  content: '';
+}
+
+@keyframes picker-swap {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trigger {
+    transition: none;
+  }
+
+  .name,
+  .swap {
+    animation: none;
+  }
+}

@@ -12,7 +12,18 @@ import { join } from 'node:path';
 import { type CatalogEntry, catalogRepo, catalogSelectionForRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { findDFlash2Draft, isDFlash2Companion } from '@mlx-node/lm/draft-companion';
 
-import { isDownloaderOwned, isModelInstalled, isModelPresent, isPathOccupied, readCompletion } from './models.js';
+import {
+  type ForeignEntrySummary,
+  isDownloaderOwned,
+  isModelInstalled,
+  isModelPresent,
+  isPathOccupied,
+  readCompletion,
+  summarizeForeignEntry,
+} from './models.js';
+
+/** What is in the way of a blocked install: the numbers Reinstall shows and echoes back. */
+export type CatalogBlocker = ForeignEntrySummary;
 
 export interface CatalogItem extends CatalogEntry {
   draft?: CatalogDraftItem;
@@ -50,6 +61,8 @@ export interface CatalogItem extends CatalogEntry {
    * legitimately re-installable through the owned swap.
    */
   blockedByForeignDir: boolean;
+  /** What occupies `<slug>`; non-null exactly when {@link blockedByForeignDir} is true. */
+  blocker: CatalogBlocker | null;
   /**
    * The commit sha the local bytes were pinned to, read off the completion
    * marker at the canonical slug — or `null` when there is no marker to read.
@@ -88,7 +101,13 @@ export interface CatalogDraftItem {
   installed: boolean;
   present: boolean;
   blockedByForeignDir: boolean;
+  blocker: CatalogBlocker | null;
   localRevision: string | null;
+}
+
+/** The blocker at `dir` when the catalog calls it blocked; walked only then. */
+function blockerAt(dir: string, blocked: boolean): CatalogBlocker | null {
+  return blocked ? summarizeForeignEntry(dir) : null;
 }
 
 /**
@@ -167,7 +186,8 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
     // Exactly the state the download runner's ownership preflight refuses, computed
     // with the SAME predicates it uses (isPathOccupied stays no-follow; a live
     // symlink into a marked dir counts as owned) so the two cannot disagree.
-    const blockedByForeignDir = !present && isPathOccupied(dir) && !isDownloaderOwned(dir);
+    const blocker = blockerAt(dir, !present && isPathOccupied(dir) && !isDownloaderOwned(dir));
+    const blockedByForeignDir = blocker !== null;
     const installed = isModelInstalled(dir);
     // Read from the canonical slug ONLY — see `localRevision` on CatalogItem for why
     // a provenance-matched renamed dir deliberately reports null.
@@ -179,13 +199,17 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
       const draftDir = findDFlash2Draft(dir, 'qwen3_5', modelsDir) ?? canonicalDraftDir;
       const draftPresent = isModelPresent(draftDir) && isDFlash2Companion(draftDir);
       const draftInstalled = draftPresent && draftDir === canonicalDraftDir && isModelInstalled(draftDir);
+      const draftBlocker = blockerAt(
+        canonicalDraftDir,
+        !draftPresent && isPathOccupied(canonicalDraftDir) && !isDownloaderOwned(canonicalDraftDir),
+      );
       draft = {
         ...entry.draft,
         slug: draftSlug,
         present: draftPresent,
         installed: draftInstalled,
-        blockedByForeignDir:
-          !draftPresent && isPathOccupied(canonicalDraftDir) && !isDownloaderOwned(canonicalDraftDir),
+        blockedByForeignDir: draftBlocker !== null,
+        blocker: draftBlocker,
         localRevision: draftInstalled ? (readCompletion(draftDir)?.revision ?? null) : null,
       };
     }
@@ -202,9 +226,19 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
       installed,
       present,
       blockedByForeignDir,
+      blocker,
       localRevision: completion?.revision ?? null,
       localAssetsRepo: completion?.assetsRepo ?? null,
       localAssetsRevision: completion?.assetsRevision ?? null,
     };
   });
+}
+
+/** The blocker of the catalog item or draft that installs `repo`, read the same way the card reads it. */
+export function catalogBlocker(modelsDir: string, repo: string): CatalogBlocker | null {
+  for (const item of catalogWithState(modelsDir)) {
+    if (item.hfRepo === repo) return item.blocker;
+    if (item.draft?.hfRepo === repo) return item.draft.blocker;
+  }
+  return null;
 }

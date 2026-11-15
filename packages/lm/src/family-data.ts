@@ -144,6 +144,20 @@ export const MUSE_GLIMMER_SAMPLING_DEFAULTS: ChatConfig = {
   repetitionPenalty: 1.0,
 };
 
+/**
+ * Qwen3.8-Flash-Next: the sampling its GGUF states (`general.sampling.temp`
+ * 1.0, `general.sampling.top_p` 0.95, `general.sampling.top_k` 20), the same as
+ * Splash's `QWEN_SAMPLING` (install/families.py).
+ */
+export const QWEN4_EXP_SAMPLING_DEFAULTS: ChatConfig = {
+  temperature: 1.0,
+  topP: 0.95,
+  topK: 20,
+  minP: 0.0,
+  presencePenalty: 0.0,
+  repetitionPenalty: 1.0,
+};
+
 /** Sampling defaults from NVIDIA's Nemotron 3.5 Lightning release recipe. */
 export const NEMOTRON_SAMPLING_DEFAULTS: ChatConfig = {
   temperature: 1.0,
@@ -264,9 +278,10 @@ interface ModelFamilyDataBase {
   readonly acceptsDecodeShare?: true;
   /**
    * Native `load` accepts `LoadModelOptions.cacheDisk` and `cacheDir`
-   * (`--max-cache-disk`, `--cache-dir`): its DFlash2 states get an SSD tier
-   * (Splash `openDiskTier`), persistent under the paged KV disk cache switch
-   * (`MLX_PERSIST_PAGED_CACHE`).
+   * (`--max-cache-disk`, `--cache-dir`): its stored states (DFlash2 states,
+   * Flash Next prefix states) get the model's own SSD tier (Splash
+   * `openDiskTier`), persistent under the paged KV disk cache switch
+   * (`MLX_PERSIST_PAGED_CACHE`), else temporary.
    */
   readonly acceptsCacheDisk?: true;
   /**
@@ -494,11 +509,12 @@ export const MODEL_FAMILY_DATA = [
     acceptsKvFormat: true,
     acceptsMaxMemory: true,
     acceptsMaxContext: true,
+    acceptsCacheDisk: true,
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen4exp'],
     ggufDiscovery: { variants: 'all', split: true },
     traits: { reasoning: true, fallbackContextWindow: 262144 },
-    launchPreset: { sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding, maxOutputTokens: 8192 },
+    launchPreset: { sampling: QWEN4_EXP_SAMPLING_DEFAULTS, maxOutputTokens: 8192 },
   },
   {
     id: 'deepseek_v41',

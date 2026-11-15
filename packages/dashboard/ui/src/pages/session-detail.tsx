@@ -1,393 +1,85 @@
-import { Transcript } from '@/components/transcript';
-import { Badge } from '@/components/ui/badge';
-import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
-import { Skeleton } from '@/components/ui/skeleton';
-import { AXIS_TICK, ChartCard, TOOLTIP_CONTENT_STYLE } from '@/lib/chart';
-import { formatCount, formatNumber, formatRelativeTime } from '@/lib/format';
+import { GitBranch, RefreshCw } from 'lucide-react';
+import { type ReactElement, useEffect, useMemo, useState } from 'react';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+
+import { ButtonLink } from '../components/arc-x/button-link/button-link';
+import { IconButton } from '../components/arc-x/icon-button/icon-button';
+import { KeyValue, type KeyValueItem } from '../components/arc-x/key-value/key-value';
+import { ModelBadge } from '../components/arc-x/model-badge/model-badge';
+import { Panel } from '../components/arc-x/panel/panel';
+import { PathText } from '../components/arc-x/path-text/path-text';
+import { Alert } from '../components/arc/alert/alert';
+import { Badge } from '../components/arc/badge/badge';
+import { ExpandableText } from '../components/arc/expandable-text/expandable-text';
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/arc/tabs/tabs';
 import {
+  isAppConversation,
+  locked,
+  openInChatUrl,
+  SessionActions,
+  sessionUrl,
+  useSessionActions,
+} from '../components/session-dialogs';
+import { Transcript } from '../components/transcript';
+import { CHAT } from '../lib/chat-strings';
+import { formatNumber, formatRelativeTime } from '../lib/format';
+import {
+  AGENT_MESSAGES,
+  AGENT_MESSAGES_TIP,
   copyResumeCommand,
+  groupTurns,
   isoMs,
+  LIVE_FRESH_MS,
   LIVE_HINT,
-  PREFILL_MIN_TOKENS,
-  prefillAverage,
+  openTurnGroup,
   sessionTitle,
-  turnPrefill,
-  turnTokenBars,
-  type TurnTokenBars,
-} from '@/lib/sessions';
-import type { SessionDetail as SessionDetailData, SessionDetailResponse, TurnMetric } from '@/lib/types';
-import { useJson } from '@/lib/use-api';
-import { AlertCircle, ArrowLeft, Copy, FileWarning, GitBranch, Inbox } from 'lucide-react';
-import { useMemo } from 'react';
-import { Link, useParams } from 'react-router-dom';
-import {
-  Bar,
-  BarChart,
-  CartesianGrid,
-  Legend,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts';
+  sessionTitleTip,
+  TRANSCRIPT_ROWS_TIP,
+  useFreshness,
+} from '../lib/sessions';
+import type { SessionDetail as SessionDetailData, SessionDetailResponse } from '../lib/types';
+import { useJson } from '../lib/use-api';
+import { type AppCommand, useCommands } from '../shell/commands';
+import { Page, PageHeader } from '../shell/page';
+import { Activity } from './session-detail/activity';
+import { INSPECTOR_ID } from './session-detail/turn-inspector';
 
-function isFiniteNumber(value: number | null | undefined): value is number {
-  return typeof value === 'number' && Number.isFinite(value);
-}
+type Tab = 'activity' | 'transcript';
 
-function mean(values: number[]): number | null {
-  if (values.length === 0) return null;
-  return values.reduce((a, b) => a + b, 0) / values.length;
-}
-
-interface TurnPoint extends TurnTokenBars {
-  turn: number;
-  decodeTps: number | null;
-  prefillTps: number | null;
-  prefillTokens: number | null;
-  prefillSeconds: number | null;
-}
-
-function toPoints(turns: TurnMetric[]): TurnPoint[] {
-  return turns.map((t, i) => {
-    const prefill = turnPrefill(t);
-    return {
-      ...turnTokenBars(t),
-      turn: i + 1,
-      decodeTps: isFiniteNumber(t.decodeTps) ? t.decodeTps : null,
-      prefillTps: prefill?.tps ?? null,
-      prefillTokens: prefill?.tokens ?? null,
-      prefillSeconds: prefill?.seconds ?? null,
-    };
-  });
-}
-
-function prefillTooltip(point: TurnPoint): string {
-  if (point.prefillTps === null || point.prefillTokens === null || point.prefillSeconds === null) return '';
-  return `${formatNumber(point.prefillTps)} tok/s · ${formatCount(point.prefillTokens)} tokens in ${point.prefillSeconds.toFixed(1)} s`;
-}
+const CRUMBS = [{ label: 'Sessions', to: '/sessions' }] as const;
 
 function isSubagentKind(kind: string | null): boolean {
   return kind !== null && kind.startsWith('subagent');
 }
 
-export default function SessionDetail() {
-  const { id = '' } = useParams();
-  const detail = useJson<SessionDetailResponse>(`/sessions/${encodeURIComponent(id)}`);
-
-  const data = detail.data;
-  const session = data?.session;
-  const turns = useMemo(() => data?.turns ?? [], [data]);
-  const points = useMemo(() => toPoints(turns), [turns]);
-
-  const models = useMemo(() => {
-    const set = new Set<string>();
-    if (session?.model != null && session.model !== '') set.add(session.model);
-    for (const t of turns) if (t.model !== null && t.model !== '') set.add(t.model);
-    return [...set];
-  }, [session, turns]);
-
-  const totals = useMemo(() => {
-    let input = 0;
-    let output = 0;
-    let cached = 0;
-    for (const t of turns) {
-      input += t.inputTokens;
-      output += t.outputTokens;
-      cached += t.cachedTokens;
-    }
-    const avgDecode = mean(turns.map((t) => t.decodeTps).filter(isFiniteNumber));
-    const avgTtft = mean(turns.map((t) => t.ttftMs).filter(isFiniteNumber));
-    const avgPrefill = prefillAverage(turns.map(turnPrefill));
-    return { input, output, cached, avgDecode, avgTtft, avgPrefill };
-  }, [turns]);
-
-  const hasTokenData = points.some((p) => p.uncached + p.cached + p.output > 0);
-  const hasDecodeData = points.some((p) => p.decodeTps !== null);
-  const hasPrefillData = points.some((p) => p.prefillTps !== null);
-
-  return (
-    <div className="space-y-6">
-      <Link
-        to="/sessions"
-        className="text-muted-foreground hover:text-foreground inline-flex items-center gap-1.5 text-sm"
-      >
-        <ArrowLeft className="size-4" aria-hidden />
-        Sessions
-      </Link>
-
-      {detail.error ? (
-        <Card>
-          <CardContent className="text-destructive flex items-center gap-2 py-6 text-sm">
-            <AlertCircle className="size-4 shrink-0" aria-hidden />
-            {detail.error.message}
-          </CardContent>
-        </Card>
-      ) : detail.loading || session === undefined || data === undefined ? (
-        /*
-          The loaded header's own markup with the leaf text swapped for bars:
-          same row, same `space-y-2` column, and each bar INSIDE the element
-          carrying the font, so `1lh` measures that element's line box. The
-          model badges are not reserved: a session that names no model would
-          then collapse a row it never shows.
-        */
-        <div className="flex flex-wrap items-start justify-between gap-4">
-          <div className="min-w-0 space-y-2">
-            {/* The title's classes but not its tag: an empty heading is still announced. */}
-            <div className="text-2xl font-semibold tracking-tight break-words">
-              <Skeleton className="h-[1lh] w-96 max-w-full" />
-            </div>
-            <div className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
-              <Skeleton className="h-[1lh] w-72 max-w-full" />
-            </div>
-          </div>
-          <Skeleton className="h-9 w-44" />
-        </div>
-      ) : (
-        <>
-          <div className="flex flex-wrap items-start justify-between gap-4">
-            <div className="min-w-0 space-y-2">
-              <h1 className="text-2xl font-semibold tracking-tight break-words">{sessionTitle(session)}</h1>
-              <div className="text-muted-foreground flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
-                <span className="font-mono text-xs break-all" title={session.cwd}>
-                  {session.cwd}
-                </span>
-                {session.branch !== null && (
-                  <>
-                    <span aria-hidden>·</span>
-                    <span className="inline-flex items-center gap-1 font-mono text-xs">
-                      <GitBranch className="size-3.5" aria-hidden />
-                      {session.branch}
-                    </span>
-                  </>
-                )}
-                <span aria-hidden>·</span>
-                <span title={session.createdAt}>Created {formatRelativeTime(isoMs(session.createdAt))}</span>
-                <span aria-hidden>·</span>
-                <span title={session.lastActiveAt}>Active {formatRelativeTime(isoMs(session.lastActiveAt))}</span>
-              </div>
-              {(models.length > 0 || session.live || session.kind !== null) && (
-                <div className="flex flex-wrap items-center gap-1">
-                  {session.live && (
-                    <Badge className="bg-emerald-600 text-white" title={LIVE_HINT}>
-                      Live
-                    </Badge>
-                  )}
-                  {session.kind !== null && (
-                    <Badge variant="outline" className="font-normal">
-                      {session.kind}
-                    </Badge>
-                  )}
-                  {models.map((model) => (
-                    <Badge key={model} variant="secondary" className="font-normal">
-                      {model}
-                    </Badge>
-                  ))}
-                </div>
-              )}
-              <ParentLink session={session} />
-            </div>
-            <Button variant="outline" onClick={() => copyResumeCommand(data.resumeCommand)}>
-              <Copy className="size-4" />
-              Copy resume command
-            </Button>
-          </div>
-
-          {session.lastTurnSummary !== null && session.lastTurnSummary !== '' && (
-            <p className="text-muted-foreground text-sm">
-              <span className="text-foreground font-medium">Last turn:</span> {session.lastTurnSummary}
-            </p>
-          )}
-
-          {turns.length > 0 && (
-            <div className="flex flex-wrap gap-2">
-              <MetricChip label="Turns" value={formatNumber(turns.length)} />
-              <MetricChip label="Input" value={formatCount(totals.input)} unit="tokens" />
-              <MetricChip label="Output" value={formatCount(totals.output)} unit="tokens" />
-              <MetricChip label="Cached" value={formatCount(totals.cached)} unit="tokens" />
-              {totals.avgTtft !== null && (
-                <MetricChip label="TTFT" value={Math.round(totals.avgTtft).toString()} unit="ms avg" />
-              )}
-              {totals.avgPrefill !== null && (
-                <MetricChip label="Prefill" value={formatNumber(totals.avgPrefill)} unit="tok/s avg" />
-              )}
-              {totals.avgDecode !== null && (
-                <MetricChip label="Decode" value={totals.avgDecode.toFixed(1)} unit="tok/s avg" />
-              )}
-            </div>
-          )}
-
-          {(hasTokenData || hasDecodeData || hasPrefillData) && (
-            <div className="grid gap-4 lg:grid-cols-2">
-              {hasTokenData && (
-                <div className={hasDecodeData && hasPrefillData ? 'lg:col-span-2' : undefined}>
-                  <ChartCard title="Tokens per turn" subtitle="Prompt (uncached and cached) and output tokens by turn">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
-                        <XAxis dataKey="turn" tick={AXIS_TICK} tickLine={false} axisLine={false} />
-                        <YAxis
-                          tick={AXIS_TICK}
-                          tickLine={false}
-                          axisLine={false}
-                          width={44}
-                          tickFormatter={(v) => formatCount(Number(v))}
-                        />
-                        <Tooltip
-                          cursor={{ fill: 'var(--color-muted)', opacity: 0.35 }}
-                          contentStyle={TOOLTIP_CONTENT_STYLE}
-                          labelFormatter={(label) => `Turn ${Number(label)}`}
-                          formatter={(value) => formatNumber(Number(value))}
-                        />
-                        <Legend
-                          wrapperStyle={{ fontSize: 12 }}
-                          formatter={(value) => <span className="text-foreground">{value}</span>}
-                        />
-                        <Bar
-                          dataKey="uncached"
-                          stackId="tokens"
-                          name="Input (uncached)"
-                          fill="var(--viz-input)"
-                          stroke="var(--color-card)"
-                          strokeWidth={1}
-                        />
-                        <Bar
-                          dataKey="cached"
-                          stackId="tokens"
-                          name="Input (cached)"
-                          fill="var(--viz-cached)"
-                          stroke="var(--color-card)"
-                          strokeWidth={1}
-                        />
-                        <Bar
-                          dataKey="output"
-                          stackId="tokens"
-                          name="Output"
-                          fill="var(--viz-output)"
-                          stroke="var(--color-card)"
-                          strokeWidth={1}
-                          radius={[4, 4, 0, 0]}
-                        />
-                      </BarChart>
-                    </ResponsiveContainer>
-                  </ChartCard>
-                </div>
-              )}
-              {hasDecodeData && (
-                <ChartCard title="Decode throughput per turn" subtitle="Tokens per second (turns that reported it)">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
-                      <XAxis dataKey="turn" tick={AXIS_TICK} tickLine={false} axisLine={false} />
-                      <YAxis
-                        tick={AXIS_TICK}
-                        tickLine={false}
-                        axisLine={false}
-                        width={44}
-                        tickFormatter={(v) => Number(v).toFixed(0)}
-                      />
-                      <Tooltip
-                        cursor={{ stroke: 'var(--color-muted-foreground)', strokeWidth: 1 }}
-                        contentStyle={TOOLTIP_CONTENT_STYLE}
-                        labelFormatter={(label) => `Turn ${Number(label)}`}
-                        formatter={(value) => `${Number(value).toFixed(1)} tok/s`}
-                      />
-                      <Line
-                        type="monotone"
-                        dataKey="decodeTps"
-                        name="Decode tok/s"
-                        stroke="var(--viz-input)"
-                        strokeWidth={2}
-                        dot={{ r: 3, fill: 'var(--viz-input)' }}
-                        activeDot={{ r: 5 }}
-                        connectNulls={false}
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </ChartCard>
-              )}
-              {hasPrefillData && (
-                <ChartCard
-                  title="Prefill throughput per turn"
-                  subtitle={`Tokens per second (turns with ${PREFILL_MIN_TOKENS}+ new tokens)`}
-                >
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={points} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--color-border)" vertical={false} />
-                      <XAxis dataKey="turn" tick={AXIS_TICK} tickLine={false} axisLine={false} />
-                      <YAxis
-                        tick={AXIS_TICK}
-                        tickLine={false}
-                        axisLine={false}
-                        width={44}
-                        tickFormatter={(v) => formatCount(Number(v))}
-                      />
-                      <Tooltip
-                        cursor={{ stroke: 'var(--color-muted-foreground)', strokeWidth: 1 }}
-                        contentStyle={TOOLTIP_CONTENT_STYLE}
-                        labelFormatter={(label) => `Turn ${Number(label)}`}
-                        formatter={(_value, _name, item) => prefillTooltip(item.payload as TurnPoint)}
-                      />
-                      <Line
-                        type="monotone"
-                        dataKey="prefillTps"
-                        name="Prefill"
-                        stroke="var(--viz-series-4)"
-                        strokeWidth={2}
-                        dot={{ r: 3, fill: 'var(--viz-series-4)' }}
-                        activeDot={{ r: 5 }}
-                        connectNulls={false}
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </ChartCard>
-              )}
-            </div>
-          )}
-
-          {session.subagents.length > 0 && <SubagentsCard subagents={session.subagents} />}
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Transcript</CardTitle>
-            </CardHeader>
-            <CardContent>
-              {data.transcriptError !== undefined && (
-                <div className="text-muted-foreground bg-muted/50 mb-4 flex items-start gap-2 rounded-md border p-3 text-xs">
-                  <FileWarning className="mt-0.5 size-4 shrink-0" aria-hidden />
-                  Transcript could not be read: {data.transcriptError}
-                </div>
-              )}
-              {data.transcript.length === 0 ? (
-                <div className="text-muted-foreground flex flex-col items-center gap-2 py-10 text-sm">
-                  <Inbox className="size-6" aria-hidden />
-                  No messages in this session.
-                </div>
-              ) : (
-                <Transcript entries={data.transcript} />
-              )}
-            </CardContent>
-          </Card>
-        </>
-      )}
-    </div>
-  );
+function isTab(value: string | null): value is Tab {
+  return value === 'activity' || value === 'transcript';
 }
 
-function ParentLink({ session }: { session: SessionDetailData }) {
+/** What fits the narrowest facts-grid cell in 12 px mono beside the copy button, so the CSS ellipsis never cuts the tail too. */
+const DIRECTORY_CHARS = 17;
+
+/** The agent writes `git_root_dir` with a trailing slash and `cwd` without one. */
+function withoutTrailingSlash(path: string): string {
+  let end = path.length;
+  while (end > 1 && path[end - 1] === '/') end -= 1;
+  return path.slice(0, end);
+}
+
+function ParentLine({ session }: { session: SessionDetailData }): ReactElement | null {
   const parent = session.parent;
   if (parent === null) return null;
-  const label = isSubagentKind(session.kind) ? 'Subagent of' : 'Forked from';
   return (
-    <p className="text-muted-foreground text-sm">
-      {label}{' '}
+    <p className="m-0 text-body text-secondary">
+      {isSubagentKind(session.kind) ? 'Subagent of' : 'Forked from'}{' '}
       {parent.title === null ? (
         <span title={parent.id}>a session that no longer exists</span>
       ) : (
-        <Link to={`/sessions/${encodeURIComponent(parent.id)}`} className="text-primary hover:underline">
+        <Link
+          className="link"
+          to={sessionUrl(parent.id)}
+          title={sessionTitleTip({ id: parent.id, title: parent.title })}
+        >
           {sessionTitle({ id: parent.id, title: parent.title })}
         </Link>
       )}
@@ -395,65 +87,380 @@ function ParentLink({ session }: { session: SessionDetailData }) {
   );
 }
 
-function SubagentsCard({ subagents }: { subagents: SessionDetailData['subagents'] }) {
-  return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Subagents</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <ul className="divide-y">
-          {subagents.map((child) => {
-            const title = sessionTitle(child);
-            return (
-              <li
-                key={child.id}
-                className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2 text-sm first:pt-0 last:pb-0"
-              >
-                {child.exists ? (
-                  <Link
-                    to={`/sessions/${encodeURIComponent(child.id)}`}
-                    className="min-w-0 flex-1 truncate font-medium hover:underline"
-                    title={title}
-                  >
-                    {title}
-                  </Link>
-                ) : (
-                  <span className="text-muted-foreground min-w-0 flex-1 truncate" title={`${title} (folder missing)`}>
-                    {title}
-                  </span>
-                )}
-                {child.type !== '' && (
-                  <Badge variant="outline" className="font-normal">
-                    {child.type}
-                  </Badge>
-                )}
-                {child.model !== null && (
-                  <Badge variant="secondary" className="font-normal">
-                    {child.model}
-                  </Badge>
-                )}
-                <span
-                  className={child.status === 'failed' ? 'text-destructive text-xs' : 'text-muted-foreground text-xs'}
-                >
-                  {child.status}
-                  {!child.exists && ' · folder missing'}
-                </span>
-              </li>
-            );
-          })}
-        </ul>
-      </CardContent>
-    </Card>
-  );
+function sessionModels(data: SessionDetailResponse): string[] {
+  const models: string[] = [];
+  const add = (model: string | null): void => {
+    if (model !== null && model !== '' && !models.includes(model)) models.push(model);
+  };
+  add(data.session.model);
+  for (const turn of data.turns) add(turn.model);
+  return models;
 }
 
-function MetricChip({ label, value, unit }: { label: string; value: string; unit?: string }) {
+function facts(data: SessionDetailResponse): KeyValueItem[] {
+  const session = data.session;
+  const models = sessionModels(data);
+  const items: KeyValueItem[] = [
+    {
+      key: 'cwd',
+      label: 'Directory',
+      value: <PathText path={session.cwd} maxChars={DIRECTORY_CHARS} />,
+      mono: true,
+      copy: session.cwd,
+    },
+    {
+      key: 'branch',
+      label: 'Branch',
+      value:
+        session.branch === null ? null : (
+          <span className="inline-flex min-w-0 items-center gap-1">
+            <GitBranch size={12} aria-hidden="true" className="shrink-0" />
+            <span className="truncate">{session.branch}</span>
+          </span>
+        ),
+      mono: true,
+    },
+    {
+      key: 'models',
+      label: 'Models',
+      value:
+        models.length === 0 ? null : (
+          <span className="flex min-w-0 flex-wrap gap-1">
+            {models.map((model) => (
+              <ModelBadge key={model} name={model} size="sm" maxChars={24} />
+            ))}
+          </span>
+        ),
+    },
+    {
+      key: 'created',
+      label: 'Created',
+      value: <span title={session.createdAt}>{formatRelativeTime(isoMs(session.createdAt))}</span>,
+    },
+    {
+      key: 'last',
+      label: 'Last active',
+      value: <span title={session.lastActiveAt}>{formatRelativeTime(isoMs(session.lastActiveAt))}</span>,
+    },
+    {
+      key: 'messages',
+      label: AGENT_MESSAGES,
+      labelTitle: AGENT_MESSAGES_TIP,
+      value: formatNumber(session.messageCount),
+      numeric: true,
+    },
+  ];
+  if (session.title.trim() === '')
+    items.push({ key: 'id', label: 'Session ID', value: session.id, mono: true, copy: session.id });
+  if (session.headCommit !== null) {
+    items.push({
+      key: 'commit',
+      label: 'Commit',
+      value: session.headCommit.slice(0, 7),
+      mono: true,
+      copy: session.headCommit,
+    });
+  }
+  if (session.gitRoot !== null && withoutTrailingSlash(session.gitRoot) !== withoutTrailingSlash(session.cwd)) {
+    items.push({
+      key: 'root',
+      label: 'Git root',
+      value: <PathText path={session.gitRoot} maxChars={DIRECTORY_CHARS} />,
+      mono: true,
+    });
+  }
+  if (session.remotes.length > 0) {
+    const more = session.remotes.length - 1;
+    items.push({
+      key: 'remotes',
+      label: 'Remotes',
+      value: (
+        <span title={session.remotes.join('\n')}>{`${session.remotes[0]!}${more > 0 ? ` +${String(more)}` : ''}`}</span>
+      ),
+      mono: true,
+    });
+  }
+  if (isAppConversation(session.origin))
+    items.push({ key: 'mode', label: CHAT.mode, value: session.origin === 'work' ? CHAT.modeWork : CHAT.modeChat });
+  else if (session.agentName !== null) items.push({ key: 'agent', label: 'Agent', value: session.agentName });
+  if (session.reasoningEffort !== null) {
+    items.push({ key: 'reasoning', label: 'Reasoning', value: session.reasoningEffort });
+  }
+  return items;
+}
+
+export default function SessionDetail(): ReactElement {
+  const { id = '' } = useParams();
+  const navigate = useNavigate();
+  const [params, setParams] = useSearchParams();
+  // Live refetching only while the last body said the session runs.
+  const [liveQuery, setLiveQuery] = useState(false);
+  const detail = useJson<SessionDetailResponse>(`/sessions/${encodeURIComponent(id)}`, { live: liveQuery });
+  const data = detail.data;
+  const bodyLive = data?.session.live === true;
+  if (data !== undefined && bodyLive !== liveQuery) setLiveQuery(bodyLive);
+  const { fresh, arrivedAt } = useFreshness(data, LIVE_FRESH_MS);
+  const live = bodyLive && fresh;
+  const reloadDetail = detail.reload;
+  useEffect(() => {
+    window.addEventListener('focus', reloadDetail);
+    return () => window.removeEventListener('focus', reloadDetail);
+  }, [reloadDetail]);
+
+  const turns = data?.turns ?? [];
+  const groups = useMemo(() => groupTurns(data?.transcript ?? [], data?.turns ?? []), [data]);
+  // Chosen from the first body of each session only: a live refetch that brings the first turn must not switch tabs.
+  const [defaultTab, setDefaultTab] = useState<{ id: string; tab: Tab } | null>(null);
+  if (data !== undefined && defaultTab?.id !== id) {
+    setDefaultTab({ id, tab: data.turns.length > 0 ? 'activity' : 'transcript' });
+  }
+  const rawTab = params.get('tab');
+  const tab: Tab = isTab(rawTab)
+    ? rawTab
+    : defaultTab?.id === id
+      ? defaultTab.tab
+      : turns.length > 0
+        ? 'activity'
+        : 'transcript';
+  const rawTurn = Number(params.get('turn'));
+  const hasTurnParam = params.get('turn') !== null && Number.isInteger(rawTurn) && rawTurn >= 1;
+  const openGroup = useMemo(() => openTurnGroup(groups), [groups]);
+  const count = turns.length + (openGroup !== null ? 1 : 0);
+  const defaultTurn = turns.length === 0 || (bodyLive && openGroup !== null) ? count : turns.length;
+  const selected = hasTurnParam && rawTurn <= count ? rawTurn : defaultTurn;
+  const focusTurn = hasTurnParam ? rawTurn : null;
+  const [scrollToInspector, setScrollToInspector] = useState(0);
+
+  const update = (changes: Record<string, string | null>): void => {
+    setParams(
+      (current) => {
+        const next = new URLSearchParams(current);
+        for (const [key, value] of Object.entries(changes)) {
+          if (value === null) next.delete(key);
+          else next.set(key, value);
+        }
+        return next;
+      },
+      { replace: true },
+    );
+  };
+
+  useEffect(() => {
+    if (scrollToInspector === 0) return;
+    document.getElementById(INSPECTOR_ID)?.scrollIntoView?.({ block: 'start' });
+  }, [scrollToInspector]);
+
+  const session = data?.session;
+  const reload = detail.reload;
+  const onDeleted = (): void => void navigate('/sessions', { replace: true });
+  const handles = useSessionActions(
+    session ?? { id, title: '', live: false, subagentCount: 0, origin: 'agent', cwd: '' },
+    {
+      onRenamed: reload,
+      onDeleted,
+      onConflict: reload,
+    },
+  );
+
+  const parent = session?.parent ?? null;
+  const resumeCommand = data?.resumeCommand;
+  const commands = useMemo((): AppCommand[] => {
+    if (session === undefined || resumeCommand === undefined) return [];
+    const list: AppCommand[] = [];
+    if (resumeCommand !== null)
+      list.push({
+        id: 'session:copy-resume',
+        label: 'Copy resume command',
+        group: 'Session',
+        run: () => copyResumeCommand(resumeCommand),
+      });
+    if (isAppConversation(session.origin))
+      list.push({
+        id: 'session:open-in-chat',
+        label: CHAT.commands.openInChat,
+        group: 'Session',
+        run: () => void navigate(openInChatUrl(session.id)),
+      });
+    if (!locked(session)) {
+      list.push(
+        { id: 'session:rename', label: 'Rename session…', group: 'Session', run: () => handles.rename() },
+        { id: 'session:delete', label: 'Delete session…', group: 'Session', run: () => handles.remove() },
+      );
+    }
+    list.push(
+      tab === 'activity'
+        ? {
+            id: 'session:show-transcript',
+            label: 'Show transcript',
+            group: 'Session',
+            run: () => update({ tab: 'transcript' }),
+          }
+        : {
+            id: 'session:show-activity',
+            label: 'Show activity',
+            group: 'Session',
+            run: () => update({ tab: 'activity' }),
+          },
+    );
+    if (parent !== null && parent.title !== null) {
+      list.push({
+        id: 'session:open-parent',
+        label: 'Open parent session',
+        group: 'Session',
+        run: () => void navigate(sessionUrl(parent.id)),
+      });
+    }
+    return list;
+  }, [session, resumeCommand, tab, parent]);
+  useCommands(commands);
+
+  if (detail.error !== undefined && data === undefined) {
+    return (
+      <Page>
+        <PageHeader title="Session" crumbs={CRUMBS} />
+        <Alert tone="danger" title="Could not open this session">
+          <span className="grid justify-items-start gap-2">
+            <span>{detail.error.message}</span>
+            <ButtonLink to="/sessions" variant="secondary" size="sm">
+              Back to sessions
+            </ButtonLink>
+          </span>
+        </Alert>
+      </Page>
+    );
+  }
+
+  if (data === undefined || session === undefined) {
+    return (
+      <Page busy>
+        <PageHeader title="Session" crumbs={CRUMBS} titlePlaceholder="24rem" />
+        <Panel ariaLabel="Session details" busy>
+          <KeyValue
+            loading
+            ariaLabel="Session details"
+            items={['Directory', 'Branch', 'Models', 'Created', 'Last active', AGENT_MESSAGES].map((label) => ({
+              key: label,
+              label,
+              value: null,
+            }))}
+          />
+        </Panel>
+      </Page>
+    );
+  }
+
+  const transcriptLink = (turn: number): string => {
+    const next = new URLSearchParams(params);
+    next.set('tab', 'transcript');
+    next.set('turn', String(turn));
+    return `?${next.toString()}`;
+  };
+
   return (
-    <div className="bg-muted/40 flex items-baseline gap-1.5 rounded-md border px-3 py-1.5">
-      <span className="text-muted-foreground text-xs font-medium">{label}</span>
-      <span className="text-sm font-semibold tabular-nums">{value}</span>
-      {unit !== undefined && <span className="text-muted-foreground text-xs">{unit}</span>}
-    </div>
+    <Page busy={detail.refreshing}>
+      <PageHeader
+        title={sessionTitle(session)}
+        crumbs={CRUMBS}
+        meta={
+          <>
+            {session.live ? (
+              <Badge tone="success" size="sm" dot title={LIVE_HINT}>
+                Live
+              </Badge>
+            ) : null}
+            {session.kind !== null ? (
+              <Badge size="sm" outline>
+                {session.kind}
+              </Badge>
+            ) : null}
+            {isAppConversation(session.origin) ? (
+              <Badge size="sm" outline>
+                {session.origin === 'work' ? CHAT.modeWork : CHAT.modeChat}
+              </Badge>
+            ) : null}
+          </>
+        }
+        actions={
+          <>
+            {isAppConversation(session.origin) ? (
+              <ButtonLink to={openInChatUrl(session.id)} variant="secondary">
+                {CHAT.commands.openInChat}
+              </ButtonLink>
+            ) : null}
+            <SessionActions
+              session={session}
+              resumeCommand={data.resumeCommand}
+              onRenamed={reload}
+              onDeleted={onDeleted}
+              onConflict={reload}
+            />
+            <IconButton
+              label="Refresh"
+              variant="secondary"
+              icon={<RefreshCw size={16} aria-hidden="true" />}
+              loading={detail.refreshing}
+              onClick={reload}
+            />
+          </>
+        }
+      />
+
+      <Panel ariaLabel="Session details">
+        <div className="grid min-w-0 gap-3">
+          <ParentLine session={session} />
+          <KeyValue ariaLabel="Session details" items={facts(data)} />
+          {session.lastTurnSummary !== null && session.lastTurnSummary !== '' ? (
+            <div className="grid min-w-0 gap-1">
+              <span className="text-caption text-secondary">Last turn</span>
+              <ExpandableText lines={2} moreLabel="Show more" lessLabel="Show less" className="text-body">
+                {session.lastTurnSummary}
+              </ExpandableText>
+            </div>
+          ) : null}
+        </div>
+      </Panel>
+
+      <Tabs value={tab} onValueChange={(value) => update({ tab: isTab(value) ? value : null })}>
+        <TabsList aria-label="Session views">
+          <TabsTrigger value="activity">Activity</TabsTrigger>
+          <TabsTrigger value="transcript" title={TRANSCRIPT_ROWS_TIP}>
+            Transcript
+            <span className="ms-1.5 text-muted tabular-nums">{formatNumber(data.transcript.length)}</span>
+          </TabsTrigger>
+        </TabsList>
+        <TabsContent value="activity">
+          {tab === 'activity' ? (
+            <Activity
+              data={data}
+              groups={groups}
+              selected={selected}
+              onSelect={(turn) => update({ turn: String(turn) })}
+              transcriptLink={transcriptLink}
+              liveQuery={liveQuery}
+              live={live}
+            />
+          ) : null}
+        </TabsContent>
+        <TabsContent value="transcript">
+          {tab === 'transcript' ? (
+            <Transcript
+              entries={data.transcript}
+              turns={data.turns}
+              focusTurn={focusTurn}
+              model={session.model}
+              sessionLive={session.live}
+              live={live}
+              asOfMs={arrivedAt ?? undefined}
+              transcriptError={data.transcriptError}
+              onInspectTurn={(turn) => {
+                update({ tab: 'activity', turn: String(turn) });
+                setScrollToInspector((count) => count + 1);
+              }}
+            />
+          ) : null}
+        </TabsContent>
+      </Tabs>
+      {handles.dialogs}
+    </Page>
   );
 }

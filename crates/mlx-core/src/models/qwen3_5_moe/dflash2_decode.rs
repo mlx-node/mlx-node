@@ -796,6 +796,10 @@ impl DFlash2Target for Qwen35MoeInner {
         std::borrow::Cow::Owned(self.config.to_dense_config())
     }
 
+    fn decode_row_expert_bytes(&self) -> u64 {
+        self.config.decode_row_expert_bytes()
+    }
+
     fn embedding_dtype(&self) -> Result<DType> {
         self.embedding
             .forward(&MxArray::from_int32(&[0], &[1, 1])?)?
@@ -1084,6 +1088,12 @@ mod paged_dflash2_tests {
     /// launch).
     #[test]
     fn verify_takes_the_verify_split_rule() -> Result<()> {
+        // The launch probe counts every paged prefill in the process.
+        if !crate::test_support::in_own_process(
+            "models::qwen3_5_moe::dflash2_decode::paged_dflash2_tests::verify_takes_the_verify_split_rule",
+        ) {
+            return Ok(());
+        }
         if crate::test_support::paged_prefill_unsupported("verify_takes_the_verify_split_rule") {
             return Ok(());
         }
@@ -1521,6 +1531,53 @@ mod paged_dflash2_tests {
         );
         assert!(ring > 0, "{ring} ring arrays recorded");
         assert_eq!(idle, ring, "the idle lane keeps the ring");
+        Ok(())
+    }
+
+    /// The MoE napi object's handle names the namespace directory the
+    /// model's persistent state tier opened, read from the tier; after
+    /// `closeCache`, and for a temporary tier, it names none.
+    /// Mutation: the tier names its namespace after its close → red.
+    #[test]
+    fn moe_tier_handle_names_the_open_namespace() -> Result<()> {
+        use crate::models::qwen3_5::dflash2_state::disk::close_cache;
+        use crate::models::qwen3_5::dflash2_state::disk::tests::{
+            attach_tier, persistent_test_tier, test_tier,
+        };
+        use crate::models::qwen3_5::dflash2_turn::DFlash2Target;
+        let _ctx = StreamContext::new(Stream::generation());
+        for persistent in [true, false] {
+            let tier = if persistent {
+                persistent_test_tier("state-tier-moe-namespace", 1 << 30)
+            } else {
+                test_tier("state-tier-moe-namespace-temp", 1 << 30)
+            };
+            let mut inner = tiny_paged_int8_moe_dflash_inner(0x5_8261);
+            let dense = DFlash2Target::dense_config(&inner).into_owned();
+            let window = inner
+                .dflash2
+                .as_ref()
+                .expect("draft")
+                .config
+                .context_window()?;
+            attach_tier(
+                &mut inner.dflash2_states,
+                &dense,
+                inner.paged_adapter.as_ref().expect("pool"),
+                &tier,
+                window.nbytes(),
+                window.slots(),
+            );
+            let handle = inner.dflash2_states.tier_handle();
+            let dir = tier.tier.dir();
+            let want = persistent.then(|| dir.file_name().and_then(|name| name.to_str()));
+            assert_eq!(handle.namespace().as_deref(), want.flatten());
+            assert!(close_cache(
+                &mut inner,
+                std::time::Instant::now() + std::time::Duration::from_secs(2)
+            ));
+            assert_eq!(handle.namespace(), None);
+        }
         Ok(())
     }
 

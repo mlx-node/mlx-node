@@ -1631,6 +1631,17 @@ export declare class Qwen35Model {
    */
   modelAssetsPath(): string;
   /**
+   * The directory name of the model's open persistent SSD cache under
+   * its cache root, read from the cache itself; null without one, for a
+   * temporary cache, and after `closeCache` or `dispose`.
+   */
+  stateTierNamespace(): string | null;
+  /**
+   * What the load's warm-up did; `null` for a load with no paged pool,
+   * which runs none.
+   */
+  get warmup(): WarmupReport | null;
+  /**
    * Whether the block-paged KV cache adapter is active on this model
    * instance.
    *
@@ -1818,6 +1829,17 @@ export declare class Qwen35MoeModel {
    * reads the reconstructed sidecars from the native-packed cache.
    */
   modelAssetsPath(): string;
+  /**
+   * The directory name of the model's open persistent SSD cache under
+   * its cache root, read from the cache itself; null without one, for a
+   * temporary cache, and after `closeCache` or `dispose`.
+   */
+  stateTierNamespace(): string | null;
+  /**
+   * What the load's warm-up did; `null` for a load with no paged pool,
+   * which runs none.
+   */
+  get warmup(): WarmupReport | null;
   /**
    * Whether the block-paged KV cache adapter is active on this model
    * instance.
@@ -2401,6 +2423,33 @@ export declare class Qwen4ExpModel {
    */
   dispose(): Promise<void>;
   static load(modelPath: string, options?: Qwen4ExpLoadOptions | undefined | null): Promise<Qwen4ExpModel>;
+  /**
+   * Closes the stored states' SSD cache at a clean stop: on a persistent
+   * cache it asks the model thread to write the waiting states, the
+   * newest first, then drains every copy, until `deadlineMs`
+   * (milliseconds on `Date.now()`'s clock, so models closed in turn share
+   * one deadline); a temporary cache is removed. The model thread gets
+   * all of the time but the last second (at most half of it): a turn in
+   * flight that holds it longer leaves its waiting states unwritten,
+   * while the copies already queued still land. The cache takes no write
+   * and removes nothing afterwards. Resolves true only when no state was
+   * left waiting and every copy and write landed by the deadline; true
+   * without a cache, or after `dispose`, which closed it. A call while
+   * another close runs gets that close's outcome.
+   */
+  closeCache(deadlineMs: number): Promise<boolean>;
+  /**
+   * The stored states' SSD cache: `'persistent'` or `'temp'` while it is
+   * open, `'off'` without one, after `closeCache`, and once a write failed
+   * for anything but room (it takes no write after).
+   */
+  stateTierMode(): 'persistent' | 'temp' | 'off';
+  /**
+   * The directory name of the stored states' open persistent SSD cache
+   * under its cache root, read from the cache itself; null without one,
+   * for a temporary cache, and after `closeCache` or `dispose`.
+   */
+  stateTierNamespace(): string | null;
   /** Whether the validated checkpoint has a supported image tower. */
   supportsImages(): boolean;
   /** Plan the expanded prompt using the same processor and limits as prefill. */
@@ -2856,8 +2905,8 @@ export declare const enum BuiltinRewardType {
  * The nvidia recipe covers BOTH `qwen3_5` (dense) and `qwen3_5_moe` (MoE), so
  * this reads `<model_path>/config.json`'s `model_type` and dispatches to the
  * matching loader + `CalibratePrefillRaw` command (any other `model_type` is a
- * clear error). Both loaders are the SAME ones the inference session uses
- * ([`persistence::load_with_thread`]) — the model is only usable on its
+ * clear error). Both loaders are the inference loader without its warm-up
+ * ([`persistence::load_for_tool`]) — the model is only usable on its
  * dedicated model thread. Then:
  *   1. dispatches `{Qwen35Cmd,Qwen35MoeCmd}::CalibratePrefillRaw`, which on the
  *      model thread SELF-ARMS that thread's thread-local
@@ -2993,6 +3042,19 @@ export interface ChatConfig {
    * the next token is forced to be the think_end token. None = unlimited.
    */
   thinkingTokenBudget?: number | undefined;
+  /**
+   * Close the thought when its tokens repeat one cycle exactly: two
+   * periods (up to 2,048 tokens each) over at least 512 tokens lower the
+   * budget to 64 thinking tokens later. Default: false.
+   */
+  thinkingCycleGuard?: boolean | undefined;
+  /**
+   * Plain text a cut thought ends with before the chat template's close,
+   * without the close tag and without special tokens. Unset, empty, or a
+   * text whose end breaks the close rules (the close token last, no other
+   * special token, at most 64 tokens): the template's close alone.
+   */
+  thinkingEndText?: string | undefined;
   /**
    * Whether to include reasoning/thinking content in the output.
    * When false, the `thinking` field of ChatResult/ChatStreamChunk will always be None.
@@ -3138,6 +3200,18 @@ export interface ChatResult {
   numTokens: number;
   promptTokens: number;
   reasoningTokens: number;
+  /**
+   * How thinking ended: `model` (the model's own close), `budget`,
+   * `cycle` (the cycle guard lowered the budget), `open` (the turn ended
+   * in thinking). Absent when the turn did not start in thinking.
+   */
+  reasoningClose?: 'model' | 'budget' | 'cycle' | 'open' | undefined;
+  /** Thinking tokens when a cut began. */
+  reasoningCutAt?: number | undefined;
+  /** Period in tokens of the cycle the guard saw. */
+  reasoningCyclePeriod?: number | undefined;
+  /** Close tokens after the thought ended; present with `reasoning_close`. */
+  reasoningStrayCloses?: number | undefined;
   finishReason: string;
   rawText: string;
   /**
@@ -3185,6 +3259,11 @@ export interface ChatStreamChunk {
   numTokens?: number;
   promptTokens?: number;
   reasoningTokens?: number;
+  /** `ChatResult::reasoning_close`, on the terminal chunk only. */
+  reasoningClose?: 'model' | 'budget' | 'cycle' | 'open' | undefined;
+  reasoningCutAt?: number | undefined;
+  reasoningCyclePeriod?: number | undefined;
+  reasoningStrayCloses?: number | undefined;
   rawText?: string;
   /** Reasoning-redacted counterpart to `raw_text` on terminal chunks. */
   publicRawText?: string | undefined;
@@ -3223,11 +3302,26 @@ export interface ChatStreamChunk {
  */
 export interface ChatStreamProgress {
   /**
-   * `queued` until the model thread picks the request up, then
-   * `prefill`, `decode` from the first sampled token, `done` after the
-   * terminal chunk or error.
+   * Before the prefill: `queued` while the model thread runs other work,
+   * `slot` while the scheduler cannot start the turn for lanes or memory,
+   * `prepare` while the thread prepares it (render, prefix match, cache
+   * restore). Then `prefill`, `decode` from the first sampled token,
+   * `done` after the terminal chunk or error. Never moves back from
+   * `prefill`.
    */
-  phase: 'queued' | 'prefill' | 'decode' | 'done';
+  phase: 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode' | 'done';
+  /**
+   * Milliseconds from the request's creation to the model thread taking
+   * it off its channel; runs until then, then frozen.
+   */
+  waitMs: number;
+  /** Milliseconds in `slot`, the open span included; absent before pickup. */
+  slotMs?: number;
+  /**
+   * Milliseconds in `prepare`, the open span included; absent before
+   * pickup.
+   */
+  prepareMs?: number;
   /** Tokens this turn prefills, excluding the cached prefix. */
   prefillTotal?: number;
   /**
@@ -3235,7 +3329,7 @@ export interface ChatStreamProgress {
    * one shot stay at 0 until the first token.
    */
   prefillDone?: number;
-  /** Prefix tokens reused from the cache. */
+  /** Prefix tokens reused from the cache; can be set during `prepare`. */
   cachedTokens?: number;
   /** Tokens kept so far; known from the `decode` phase on. */
   generatedTokens?: number;
@@ -4731,6 +4825,19 @@ export interface Lfm2Config {
   routedScalingFactor?: number | undefined;
 }
 
+/**
+ * The load of `path` in flight (the oldest when several are); `null` when
+ * none is, or its family does not report.
+ */
+export declare function loadProgress(path: string): LoadProgress | null;
+
+/** A model load in flight. */
+export interface LoadProgress {
+  phase: 'weights' | 'kernels';
+  steps: number;
+  stepsDone: number;
+}
+
 export interface MemoryGovernorAccount {
   name: string;
   current: number;
@@ -5249,6 +5356,24 @@ export interface PhaseProfile {
   avgUsPerToken: number;
   /** Number of invocations. */
   count: number;
+}
+
+/**
+ * Pipeline creation totals of this process; `null` while the counter is
+ * not installed (it is installed only with `MLX_PIPELINE_COUNTER=1`).
+ */
+export declare function pipelineStats(): PipelineStats | null;
+
+/** Process-wide, cumulative pipeline creation totals. */
+export interface PipelineStats {
+  /** Pipelines and source libraries created inside a model load. */
+  createdLoading: number;
+  /** Pipelines and source libraries created outside any model load. */
+  createdServing: number;
+  /** Milliseconds spent in the loading creations. */
+  loadingMs: number;
+  /** Milliseconds spent in the serving creations. */
+  servingMs: number;
 }
 
 /**
@@ -5886,6 +6011,25 @@ export interface Qwen4ExpLoadOptions {
    * the load.
    */
   kvFormat?: 'int8' | 'bf16' | undefined;
+  /**
+   * SSD cache for the stored states (`--max-cache-disk`): `'auto'` (the
+   * default: up to 32 GiB, a quarter of the volume's room), a byte count,
+   * or `'0'`, which turns the SSD cache off.
+   */
+  cacheDisk?: string;
+  /**
+   * The paged KV disk cache switch every family shares (`--no-persist-cache`):
+   * keep the stored states on SSD across restarts in a directory of the
+   * model's own under `cacheDir`; off, the cache is temporary: a directory
+   * under the temp root that takes copies only while memory drops states,
+   * removed at the stop. Unset ⇒ `MLX_PERSIST_PAGED_CACHE`, else off.
+   */
+  persistPagedCache?: boolean;
+  /**
+   * The persistent cache's root (`--cache-dir`), default
+   * `~/.mlx-node/cache/prefix-cache`; needs `persistPagedCache`.
+   */
+  cacheDir?: string;
 }
 
 /**
@@ -5954,6 +6098,58 @@ export interface Qwen4ExpResidencyInfo {
    */
   decodedRowEvictions: number;
   decodedRowEvictedBytes: number;
+  /** Routed experts the slots or banks served without a read since load. */
+  slotHits: number;
+  /** Routed experts a slot fill read from the checkpoint since load. */
+  slotMisses: number;
+  /**
+   * Bytes read from the checkpoint files since load (expert fills and row
+   * imports); the page cache may serve part of them.
+   */
+  checkpointBytesRead: number;
+  /**
+   * Decode tokens and prefill windows replayed after a tentative device
+   * route missed the slots.
+   */
+  routeReplays: number;
+  /**
+   * Stored prefix states with a RAM copy, and the bytes of every stored
+   * state.
+   */
+  prefixStates: number;
+  prefixStateBytes: number;
+  /** States published since load, and turns that resumed from one. */
+  prefixPublished: number;
+  prefixRestored: number;
+  /** The stored states' disk tier is open and takes writes. */
+  prefixDiskEnabled: boolean;
+  /** States waiting for their disk write, the one in flight included. */
+  prefixDiskWaiting: number;
+  /** States written whose whole chain is on disk. */
+  prefixDiskDurable: number;
+  /** Waiting states not written: their conversation went on. */
+  prefixDiskUnneeded: number;
+  /**
+   * States not written or dropped (chain incomplete, room, a failed
+   * write, a closed cache), and copies the writer refused.
+   */
+  prefixDiskRefused: number;
+  /** States read back from disk into memory. */
+  prefixDiskRestored: number;
+  /**
+   * States a persistent cache took back at load: on disk only until a
+   * turn reads one back.
+   */
+  prefixDiskAdopted: number;
+  /**
+   * States removed from disk: a block or draft segment of their chain
+   * was not there, or they did not read back.
+   */
+  prefixDiskDroppedChain: number;
+  /** Block and draft-segment copies waiting for the writer. */
+  prefixDiskOwedBlocks: number;
+  /** Bytes of states written. */
+  prefixDiskStateBytesWritten: number;
 }
 
 /** Result of text recognition. */
@@ -6508,6 +6704,32 @@ export interface VlmChatConfig {
 export interface VlmChatMessage {
   role: ChatRole;
   content: string;
+}
+
+/** What a load's warm-up did. */
+export interface WarmupReport {
+  /** Wall time of the warm-up. */
+  ms: number;
+  steps: number;
+  /**
+   * Steps not run, or run smaller than planned, by the attempt that
+   * warmed the model (a retry runs a refused attempt's steps again).
+   */
+  skipped: number;
+  /**
+   * 1 when a cache reset, in any attempt, made the model's state read as
+   * before.
+   */
+  reset: number;
+  /** Pipelines and source libraries created during the warm-up. */
+  pipelines: number;
+  /** Time inside those creations. */
+  compileMs: number;
+  /**
+   * The process allocator's peak over every attempt, read after the
+   * warm-up.
+   */
+  peakBytes: number;
 }
 
 export declare namespace __internal__ {

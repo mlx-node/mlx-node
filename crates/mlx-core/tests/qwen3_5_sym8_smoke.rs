@@ -64,6 +64,8 @@ async fn sym8_checkpoint_loads_and_generates_coherent_text() {
         tools: None,
         reasoning_effort: None,
         thinking_token_budget: Some(48),
+        thinking_cycle_guard: None,
+        thinking_end_text: None,
         include_reasoning: Some(true),
         report_performance: Some(true),
         reuse_cache: Some(true),

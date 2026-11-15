@@ -1,0 +1,34 @@
+.root {
+  display: grid;
+  min-width: 0;
+}
+
+.item {
+  grid-area: 1 / 1;
+  min-width: 0;
+}
+
+.item[data-hidden] {
+  visibility: hidden;
+}
+
+.item[data-enter] {
+  animation: swap-cell-in var(--duration-fast) var(--ease-enter) both;
+}
+
+@keyframes swap-cell-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .item[data-enter] {
+    animation: none;
+  }
+}

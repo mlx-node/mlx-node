@@ -5314,11 +5314,12 @@ mod tests {
         seq: u32,
         budget: Option<i32>,
         enabled: bool,
+        max_new: i32,
     ) -> TurnState<QwenScheduledTurn> {
         use crate::engine::types::ChatConfig;
 
         let config = ChatConfig {
-            max_new_tokens: Some(5),
+            max_new_tokens: Some(max_new),
             temperature: Some(0.0),
             reasoning_effort: Some(if enabled { "high" } else { "none" }.into()),
             thinking_token_budget: budget,
@@ -5375,7 +5376,7 @@ mod tests {
             preemption_replay: None,
             requested_tokens: engine::scheduler::scheduled_materialized_tokens(
                 prompt.len() as u32,
-                5,
+                max_new as u32,
             ),
             claim: None,
             cell: None,
@@ -5417,7 +5418,7 @@ mod tests {
         let mut scheduler = Scheduler::<_, (), ()>::new(cases.len(), 12).unwrap();
         for (index, &(budget, enabled)) in cases.iter().enumerate() {
             let turn =
-                scheduled_thinking_budget_turn(&mut inner, index as u32 + 10, budget, enabled);
+                scheduled_thinking_budget_turn(&mut inner, index as u32 + 10, budget, enabled, 5);
             scheduler.enqueue_turn(turn).unwrap();
         }
         let mut completed = 0;
@@ -5446,7 +5447,7 @@ mod tests {
                         "ragged={ragged_step}, budget={budget:?}, thinking={enabled}"
                     );
                     assert_eq!(
-                        turn.payload.reasoning_tracker.reasoning_token_count(),
+                        turn.payload.reasoning_tracker.outcome().tokens,
                         if enabled {
                             budget.map_or(5, |budget| budget as u32 + 1)
                         } else {
@@ -5476,6 +5477,93 @@ mod tests {
         assert!(
             scheduler.stats().max_batch_occupancy > 1,
             "requests must share scheduler steps"
+        );
+    }
+
+    /// Two lanes of one batch think in a loop (every unforced greedy sample is
+    /// token 0) after 509 thinking tokens of the same loop; one has the cycle
+    /// guard. The guarded lane hits at 512 thinking tokens and ends thinking
+    /// with `[3, 1]` 64 tokens later; the other lane's tokens are its solo run.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_scheduled_cycle_cut_leaves_the_other_lane_alone() {
+        use crate::array::DType;
+        use crate::engine::penalties::{ReasoningClose, ReasoningTracker};
+        use crate::engine::scheduler::{Scheduler, SchedulerAction};
+
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            assert!(!crate::test_support::metal_required());
+            return;
+        }
+        let mut inner = match super::Qwen3Inner::new(paged_tiny_config(Some(true))) {
+            Ok(inner) => inner,
+            Err(error) if crate::test_support::metal_device_absent(&error.reason) => return,
+            Err(error) => panic!("construct scheduled cycle fixture: {error}"),
+        };
+        cast_paged_inner_to_bf16(&mut inner);
+        inner
+            .lm_head
+            .set_weight(&MxArray::zeros(&[100, 64], Some(DType::BFloat16)).unwrap())
+            .unwrap();
+        const MAX_NEW: i32 = 72;
+        let turn = |inner: &mut super::Qwen3Inner, seq: u32, guard: bool| {
+            let mut turn = scheduled_thinking_budget_turn(inner, seq, None, true, MAX_NEW);
+            let mut tracker = ReasoningTracker::guarded(true, None, &[3, 1], guard);
+            for _ in 0..509 {
+                tracker.observe_token(0);
+            }
+            turn.payload.reasoning_tracker = tracker;
+            turn
+        };
+        let run = |inner: &mut super::Qwen3Inner, turns: Vec<TurnState<QwenScheduledTurn>>| {
+            let count = turns.len();
+            let mut scheduler = Scheduler::<_, (), ()>::new(count, 12).unwrap();
+            for turn in turns {
+                scheduler.enqueue_turn(turn).unwrap();
+            }
+            let mut done = Vec::new();
+            for _ in 0..400 {
+                if let SchedulerAction::Stepped { completed, .. } = scheduler
+                    .drive_once(&mut QwenStepExecutor {
+                        inner: &mut *inner,
+                        ragged_step: false,
+                    })
+                    .unwrap()
+                {
+                    done.extend(completed);
+                }
+                if done.len() == count {
+                    break;
+                }
+            }
+            assert_eq!(done.len(), count);
+            done.sort_by_key(|turn| turn.seq_id);
+            (done, scheduler.stats().max_batch_occupancy)
+        };
+        let guarded = turn(&mut inner, 20, true);
+        let open = turn(&mut inner, 21, false);
+        let (batch, occupancy) = run(&mut inner, vec![guarded, open]);
+        assert!(occupancy > 1, "the two lanes must share steps");
+        let solo = turn(&mut inner, 22, false);
+        let (solo, _) = run(&mut inner, vec![solo]);
+
+        for turn in batch.iter().chain(&solo) {
+            assert!(turn.payload.failure.is_none(), "{:?}", turn.payload.failure);
+        }
+        let mut expected = vec![0; MAX_NEW as usize];
+        expected[67] = 3;
+        expected[68] = 1;
+        assert_eq!(batch[0].payload.generated_tokens, expected);
+        let outcome = batch[0].payload.reasoning_tracker.outcome();
+        assert_eq!(outcome.close, Some(ReasoningClose::Cycle));
+        assert_eq!((outcome.cut_at, outcome.cycle_period), (Some(576), Some(1)));
+        assert_eq!(
+            batch[1].payload.generated_tokens,
+            solo[0].payload.generated_tokens
+        );
+        assert_eq!(
+            batch[1].payload.reasoning_tracker.outcome().close,
+            Some(ReasoningClose::Open)
         );
     }
 
@@ -5513,7 +5601,7 @@ mod tests {
         };
         cast_paged_inner_to_bf16(&mut inner);
         let (plumbing, _rx) = crate::engine::napi_glue::chat_stream_plumbing();
-        let mut turn = scheduled_thinking_budget_turn(&mut inner, 10, None, false);
+        let mut turn = scheduled_thinking_budget_turn(&mut inner, 10, None, false, 5);
         turn.payload.response =
             engine::hybrid_scheduler::ScheduledReply::Stream(plumbing.stream_tx.clone());
         turn.payload.generated_tokens = vec![0, 0];

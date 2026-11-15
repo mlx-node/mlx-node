@@ -40,6 +40,7 @@ impl Qwen35Inner {
         mut p: engine::ChatParams,
         report_perf: bool,
         thinking: ThinkingSetup,
+        config: &crate::engine::types::ChatConfig,
     ) -> Result<ChatResult> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
@@ -60,7 +61,7 @@ impl Qwen35Inner {
         // `enable_thinking=false`.
         let thinking_enabled = thinking.enabled;
         let mut reasoning_tracker =
-            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
+            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end(config));
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -318,7 +319,7 @@ impl Qwen35Inner {
             p.include_reasoning,
             thinking_enabled,
             prompt_token_count,
-            reasoning_tracker.reasoning_token_count(),
+            reasoning_tracker.outcome(),
         )?;
         result.cached_tokens = cached_prefix_len;
         Ok(result)
@@ -609,6 +610,7 @@ impl Qwen35Inner {
         mut p: engine::ChatParams,
         report_perf: bool,
         thinking: ThinkingSetup,
+        config: &crate::engine::types::ChatConfig,
     ) -> Result<ChatResult> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
@@ -634,7 +636,7 @@ impl Qwen35Inner {
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let thinking_enabled = thinking.enabled;
         let mut reasoning_tracker =
-            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
+            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end(config));
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -961,7 +963,7 @@ impl Qwen35Inner {
             p.include_reasoning,
             thinking_enabled,
             prompt_token_count,
-            reasoning_tracker.reasoning_token_count(),
+            reasoning_tracker.outcome(),
         )?;
         result.cached_tokens = cached_prefix_len;
         Ok(result)
@@ -984,6 +986,7 @@ impl Qwen35Inner {
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
         thinking: ThinkingSetup,
+        config: &crate::engine::types::ChatConfig,
     ) -> Result<()> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
@@ -1010,7 +1013,7 @@ impl Qwen35Inner {
         let think_end_str = tokenizer.think_end_str().map(|s| s.to_string());
         let thinking_enabled = thinking.enabled;
         let mut reasoning_tracker =
-            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
+            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end(config));
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -1201,6 +1204,10 @@ impl Qwen35Inner {
                             num_tokens: None,
                             prompt_tokens: None,
                             reasoning_tokens: None,
+                            reasoning_close: None,
+                            reasoning_cut_at: None,
+                            reasoning_cycle_period: None,
+                            reasoning_stray_closes: None,
                             raw_text: None,
                             public_raw_text: None,
                             text_authoritative: None,
@@ -1361,7 +1368,7 @@ impl Qwen35Inner {
             None
         };
 
-        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
+        let reasoning = reasoning_tracker.outcome();
         let result = finalize_chat_result(
             &tokenizer,
             &generated_tokens,
@@ -1372,7 +1379,7 @@ impl Qwen35Inner {
             include_reasoning,
             thinking_enabled,
             prompt_token_count,
-            reasoning_tokens,
+            reasoning,
         )?;
 
         cb.call(
@@ -1386,6 +1393,10 @@ impl Qwen35Inner {
                 num_tokens: Some(result.num_tokens),
                 prompt_tokens: Some(result.prompt_tokens),
                 reasoning_tokens: Some(result.reasoning_tokens),
+                reasoning_close: result.reasoning_close.clone(),
+                reasoning_cut_at: result.reasoning_cut_at,
+                reasoning_cycle_period: result.reasoning_cycle_period,
+                reasoning_stray_closes: result.reasoning_stray_closes,
                 raw_text: Some(result.raw_text.clone()),
                 public_raw_text: result.public_raw_text.clone(),
                 text_authoritative: Some(true),
@@ -1415,6 +1426,7 @@ impl Qwen35Inner {
         cb: &StreamSender<'_>,
         cancelled: &AtomicBool,
         thinking: ThinkingSetup,
+        config: &crate::engine::types::ChatConfig,
     ) -> Result<()> {
         static NEXT_TRACE_TURN_ID: AtomicU64 = AtomicU64::new(1);
         if tokens.is_empty() {
@@ -1458,7 +1470,7 @@ impl Qwen35Inner {
         // `enable_thinking=false`.
         let thinking_enabled = thinking.enabled;
         let mut reasoning_tracker =
-            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end());
+            engine::ReasoningTracker::from_setup(&thinking, &tokenizer.think_end(config));
 
         let generation_start = if report_perf {
             Some(std::time::Instant::now())
@@ -1801,7 +1813,7 @@ impl Qwen35Inner {
             None
         };
 
-        let reasoning_tokens = reasoning_tracker.reasoning_token_count();
+        let reasoning = reasoning_tracker.outcome();
 
         let mut result = finalize_chat_result(
             &tokenizer,
@@ -1813,7 +1825,7 @@ impl Qwen35Inner {
             include_reasoning,
             thinking_enabled,
             prompt_token_count,
-            reasoning_tokens,
+            reasoning,
         )?;
         result.cached_tokens = cached_prefix_len;
 
@@ -1863,6 +1875,10 @@ impl Qwen35Inner {
                 num_tokens: Some(result.num_tokens),
                 prompt_tokens: Some(result.prompt_tokens),
                 reasoning_tokens: Some(result.reasoning_tokens),
+                reasoning_close: result.reasoning_close.clone(),
+                reasoning_cut_at: result.reasoning_cut_at,
+                reasoning_cycle_period: result.reasoning_cycle_period,
+                reasoning_stray_closes: result.reasoning_stray_closes,
                 raw_text: Some(result.raw_text.clone()),
                 public_raw_text: result.public_raw_text.clone(),
                 text_authoritative: Some(true),
@@ -2156,6 +2172,10 @@ impl Qwen35Inner {
                         num_tokens: None,
                         prompt_tokens: None,
                         reasoning_tokens: None,
+                        reasoning_close: None,
+                        reasoning_cut_at: None,
+                        reasoning_cycle_period: None,
+                        reasoning_stray_closes: None,
                         raw_text: None,
                         public_raw_text: None,
                         text_authoritative: None,

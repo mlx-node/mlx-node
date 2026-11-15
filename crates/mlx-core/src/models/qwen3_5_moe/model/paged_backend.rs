@@ -346,6 +346,7 @@ impl Qwen35MoeInner {
         let total_budget = plan.len() as u32;
         // GDN recurrent-state prime (live / checkpoint / replay). No qwen3/lfm2
         // analog — moe carries GDN recurrent state across turns.
+        crate::engine::progress::with_turn_progress(|p| p.restoring(turn_plan.cached_prefix_len));
         let gdn_prefix_preparation = self.prepare_moe_gdn_prefix_state(
             plan,
             turn_plan.cached_prefix_len,

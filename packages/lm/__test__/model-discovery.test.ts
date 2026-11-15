@@ -1,6 +1,6 @@
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vite-plus/test';
 
@@ -53,12 +53,381 @@ describe('discoverLocalChatModels — GGUF variant folders', () => {
     const failures: string[] = [];
     expect(await discoverLocalChatModels(dir, { onEntryFailure: (_e, path) => failures.push(path) })).toEqual([
       expect.objectContaining({
-        name: 'Flash-UD-Q4_K_XL-00001-of-00004',
+        name: 'Flash-UD-Q4_K_XL',
         path: join(dir, 'flash', FLASH_SHARDS[0]),
         modelType: 'qwen4_exp',
+        base: 'Flash',
+        variant: 'UD-Q4_K_XL',
+        format: 'gguf',
       }),
     ]);
     expect(failures).toEqual([]);
+  });
+
+  it('keeps the id of a single file, and a split set beside it with the same stem takes its folder', async () => {
+    const dir = modelsDir('split-beside-single', {
+      'direct/X.gguf': minimalGguf('qwen4exp'),
+      'direct/X-00001-of-00002.gguf': minimalGguf('qwen4exp'),
+      'direct/X-00002-of-00002.gguf': 'shard',
+    });
+    expect(
+      (await discoverLocalChatModels(dir)).map(({ name, path, base, variant }) => ({ name, path, base, variant })),
+    ).toEqual([
+      { name: 'X', path: join(dir, 'direct', 'X.gguf'), base: 'X', variant: 'GGUF' },
+      { name: 'direct-X', path: join(dir, 'direct', 'X-00001-of-00002.gguf'), base: 'direct-X', variant: 'GGUF' },
+    ]);
+  });
+
+  describe('ids against the scan that named every GGUF by its file name', () => {
+    const G = minimalGguf('qwen4exp');
+    const MLX = JSON.stringify({ model_type: 'qwen3', max_position_embeddings: 4096 });
+    const split = (stem: string): Record<string, string | Buffer> => ({
+      [`${stem}-00001-of-00002.gguf`]: G,
+      [`${stem}-00002-of-00002.gguf`]: 'shard',
+    });
+    /** `head`: id -> path as that scan gave them; `split`: path of a split set -> its id now. */
+    const layouts: ReadonlyArray<{
+      files: Record<string, string | Buffer>;
+      head: Record<string, string>;
+      split: Record<string, string>;
+    }> = [
+      {
+        files: { 'direct/X.gguf': G, ...split('direct/X') },
+        head: { X: 'direct/X.gguf', 'X-00001-of-00002': 'direct/X-00001-of-00002.gguf' },
+        split: { 'direct/X-00001-of-00002.gguf': 'direct-X' },
+      },
+      {
+        files: { ...split('a-repo/Model-Q4_K_M'), 'b-repo/Model-Q4_K_M.gguf': G },
+        head: {
+          'Model-Q4_K_M': 'b-repo/Model-Q4_K_M.gguf',
+          'Model-Q4_K_M-00001-of-00002': 'a-repo/Model-Q4_K_M-00001-of-00002.gguf',
+        },
+        split: { 'a-repo/Model-Q4_K_M-00001-of-00002.gguf': 'a-repo-Model-Q4_K_M' },
+      },
+      {
+        files: { ...split('A-repo/Model-Q4_K_M'), 'Model-Q4_K_M.gguf': G },
+        head: {
+          'Model-Q4_K_M': 'Model-Q4_K_M.gguf',
+          'Model-Q4_K_M-00001-of-00002': 'A-repo/Model-Q4_K_M-00001-of-00002.gguf',
+        },
+        split: { 'A-repo/Model-Q4_K_M-00001-of-00002.gguf': 'A-repo-Model-Q4_K_M' },
+      },
+      { files: { 'Foo-GGUF/Q4_K_M.gguf': G }, head: { Q4_K_M: 'Foo-GGUF/Q4_K_M.gguf' }, split: {} },
+      {
+        files: { 'Foo-GGUF/Q4_K_M.gguf': G, 'Foo-Q4_K_M.gguf': G },
+        head: { 'Foo-Q4_K_M': 'Foo-Q4_K_M.gguf', Q4_K_M: 'Foo-GGUF/Q4_K_M.gguf' },
+        split: {},
+      },
+      {
+        files: { 'A-GGUF/Q4_K_M.gguf': G, 'Q4_K_M.gguf': G },
+        head: { Q4_K_M: 'A-GGUF/Q4_K_M.gguf', 'models5-Q4_K_M': 'Q4_K_M.gguf' },
+        split: {},
+      },
+      {
+        files: { 'a-GGUF/Q4_K_M.gguf': G, 'b-GGUF/Q4_K_M.gguf': G },
+        head: { Q4_K_M: 'a-GGUF/Q4_K_M.gguf', 'b-GGUF-Q4_K_M': 'b-GGUF/Q4_K_M.gguf' },
+        split: {},
+      },
+      { files: { 'repo/Q4_K_M/Q4_K_M.gguf': G }, head: { Q4_K_M: 'repo/Q4_K_M/Q4_K_M.gguf' }, split: {} },
+      { files: { 'pack/Qwen4-8B/Q4_K_M.gguf': G }, head: { Q4_K_M: 'pack/Qwen4-8B/Q4_K_M.gguf' }, split: {} },
+      {
+        files: { ...split('Foo-GGUF/UD-Q4_K_XL/UD-Q4_K_XL'), 'Foo-UD-Q4_K_XL.gguf': G },
+        head: {
+          'Foo-UD-Q4_K_XL': 'Foo-UD-Q4_K_XL.gguf',
+          'UD-Q4_K_XL-00001-of-00002': 'Foo-GGUF/UD-Q4_K_XL/UD-Q4_K_XL-00001-of-00002.gguf',
+        },
+        split: { 'Foo-GGUF/UD-Q4_K_XL/UD-Q4_K_XL-00001-of-00002.gguf': 'Foo-GGUF-Foo-UD-Q4_K_XL' },
+      },
+      {
+        files: { ...split('A-repo/X'), 'X/config.json': MLX },
+        head: { X: 'X', 'X-00001-of-00002': 'A-repo/X-00001-of-00002.gguf' },
+        split: { 'A-repo/X-00001-of-00002.gguf': 'A-repo-X' },
+      },
+      {
+        files: { 'Foo-GGUF/Q4_K_M.gguf': G, 'Foo-Q4_K_M/config.json': MLX },
+        head: { 'Foo-Q4_K_M': 'Foo-Q4_K_M', Q4_K_M: 'Foo-GGUF/Q4_K_M.gguf' },
+        split: {},
+      },
+      {
+        files: { 'a-repo/Model-Q4_K_M.gguf': G, ...split('b-repo/Model-Q4_K_M') },
+        head: {
+          'Model-Q4_K_M': 'a-repo/Model-Q4_K_M.gguf',
+          'Model-Q4_K_M-00001-of-00002': 'b-repo/Model-Q4_K_M-00001-of-00002.gguf',
+        },
+        split: { 'b-repo/Model-Q4_K_M-00001-of-00002.gguf': 'b-repo-Model-Q4_K_M' },
+      },
+      {
+        files: { ...split('a/X'), 'b/X.gguf': G, 'b-X.gguf': G },
+        head: { X: 'b/X.gguf', 'X-00001-of-00002': 'a/X-00001-of-00002.gguf', 'b-X': 'b-X.gguf' },
+        split: { 'a/X-00001-of-00002.gguf': 'a-X' },
+      },
+      {
+        files: { ...split('A/M'), 'M-00001-of-00002/config.json': MLX },
+        head: {
+          'M-00001-of-00002': 'A/M-00001-of-00002.gguf',
+          'M-00001-of-00002-M-00001-of-00002': 'M-00001-of-00002',
+        },
+        split: { 'A/M-00001-of-00002.gguf': 'M' },
+      },
+      {
+        files: split('qwen3.8-flash-next-gguf/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL'),
+        head: {
+          'Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00002':
+            'qwen3.8-flash-next-gguf/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00002.gguf',
+        },
+        split: {
+          'qwen3.8-flash-next-gguf/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00002.gguf':
+            'Qwen3.8-Flash-Next-UD-Q4_K_XL',
+        },
+      },
+    ];
+
+    it.each(layouts.map((layout, index) => [index, layout] as const))(
+      'layout %i: same id and path for every model that is not a split set; a split set takes its stem when free',
+      async (index, { files, head, split: splitIds }) => {
+        const dir = modelsDir(join('ids', `models${index}`), files);
+        const now = (await discoverLocalChatModels(dir)).map((m) => `${m.name} -> ${relative(dir, m.path)}`);
+        const expected = Object.entries(head).map(([id, path]) => `${splitIds[path] ?? id} -> ${path}`);
+        expect(now.sort()).toEqual(expected.sort());
+        for (const [id, path] of Object.entries(head)) {
+          if (splitIds[path] === undefined) expect(now).toContain(`${id} -> ${path}`);
+        }
+      },
+    );
+
+    it('keeps the picker row of a file named only by its tag: the base comes from its folder', async () => {
+      const dir = modelsDir(join('ids', 'tag-row'), { 'Foo-GGUF/Q4_K_M.gguf': G });
+      expect((await discoverLocalChatModels(dir)).map(({ name, base, variant }) => ({ name, base, variant }))).toEqual([
+        { name: 'Q4_K_M', base: 'Foo', variant: 'Q4_K_M' },
+      ]);
+    });
+  });
+
+  describe('a file whose name is a short form of its folder', () => {
+    const G = minimalGguf('qwen4exp');
+    const MLX = JSON.stringify({ model_type: 'qwen4_exp' });
+    type Row = { name: string; base: string; variant: string };
+    const suffixPair = (suffix: string): [string, Record<string, string | Buffer>, Row[]] => [
+      `${suffix} repo, plain and ${suffix} files`,
+      {
+        [`Qwen4-8B-${suffix}-GGUF/Qwen4-8B-Q4_K_M.gguf`]: G,
+        [`Qwen4-8B-${suffix}-GGUF/Qwen4-8B-${suffix}-Q8_0.gguf`]: G,
+      },
+      [
+        { name: 'Qwen4-8B-Q4_K_M', base: 'Qwen4-8B-Q4_K_M', variant: 'Q4_K_M' },
+        { name: `Qwen4-8B-${suffix}-Q8_0`, base: `Qwen4-8B-${suffix}`, variant: 'Q8_0' },
+      ],
+    ];
+    const rows: ReadonlyArray<[string, Record<string, string | Buffer>, Row[]]> = [
+      ...['Instruct', 'Thinking', 'Coder', 'Vision', 'Base', 'Thinking-2507'].map(suffixPair),
+      [
+        '-it repo',
+        { 'gemma-5-4b-it-GGUF/gemma-5-4b-Q4_K_M.gguf': G, 'gemma-5-4b-it-GGUF/gemma-5-4b-it-Q8_0.gguf': G },
+        [
+          { name: 'gemma-5-4b-Q4_K_M', base: 'gemma-5-4b-Q4_K_M', variant: 'Q4_K_M' },
+          { name: 'gemma-5-4b-it-Q8_0', base: 'gemma-5-4b-it', variant: 'Q8_0' },
+        ],
+      ],
+      [
+        'v2 repo beside a v1 MLX folder',
+        { 'Qwen4-8B-v2-GGUF/Qwen4-8B-Q4_K_M.gguf': G, 'Qwen4-8B-4bit/config.json': MLX },
+        [
+          { name: 'Qwen4-8B-4bit', base: 'Qwen4-8B', variant: '4-bit' },
+          { name: 'Qwen4-8B-Q4_K_M', base: 'Qwen4-8B-Q4_K_M', variant: 'Q4_K_M' },
+        ],
+      ],
+      [
+        'version word in the repo only',
+        { 'Ornith-1.5-GGUF/Ornith-Q4_K_M.gguf': G, 'Ornith-GGUF/Ornith-Q8_0.gguf': G },
+        [
+          { name: 'Ornith-Q4_K_M', base: 'Ornith-Q4_K_M', variant: 'Q4_K_M' },
+          { name: 'Ornith-Q8_0', base: 'Ornith', variant: 'Q8_0' },
+        ],
+      ],
+      [
+        '8B and 14B repos with size-less files',
+        { 'Qwen4-8B-GGUF/Qwen4-Q4_K_M.gguf': G, 'Qwen4-14B-GGUF/Qwen4-Q8_0.gguf': G },
+        [
+          { name: 'Qwen4-Q4_K_M', base: 'Qwen4-Q4_K_M', variant: 'Q4_K_M' },
+          { name: 'Qwen4-Q8_0', base: 'Qwen4-Q8_0', variant: 'Q8_0' },
+        ],
+      ],
+      [
+        'upper-case repo',
+        { 'QWEN4-8B-INSTRUCT-GGUF/qwen4-8b-q4_k_m.gguf': G, 'QWEN4-8B-INSTRUCT-GGUF/qwen4-8b-instruct-q8_0.gguf': G },
+        [
+          { name: 'qwen4-8b-instruct-q8_0', base: 'qwen4-8b-instruct', variant: 'Q8_0' },
+          { name: 'qwen4-8b-q4_k_m', base: 'qwen4-8b-q4_k_m', variant: 'Q4_K_M' },
+        ],
+      ],
+      [
+        'active-parameter word: joins the MLX folder',
+        { 'Foo-35B-A3B-GGUF/Foo-35B-Q4_K_M.gguf': G, 'foo-35b-a3b/config.json': MLX },
+        [
+          { name: 'Foo-35B-Q4_K_M', base: 'Foo-35B-A3B', variant: 'Q4_K_M' },
+          { name: 'foo-35b-a3b', base: 'Foo-35B-A3B', variant: 'MLX' },
+        ],
+      ],
+      [
+        'decimal active-parameter word, any case',
+        { 'Foo-35B-a3.5b-GGUF/Foo-35B-Q4_K_M.gguf': G },
+        [{ name: 'Foo-35B-Q4_K_M', base: 'Foo-35B-a3.5b', variant: 'Q4_K_M' }],
+      ],
+      [
+        'active-parameter word and another word',
+        { 'Foo-35B-A3B-Instruct-GGUF/Foo-35B-Q4_K_M.gguf': G, 'Foo-35B-Q8_0.gguf': G },
+        [
+          { name: 'Foo-35B-Q4_K_M', base: 'Foo-35B-Q4_K_M', variant: 'Q4_K_M' },
+          { name: 'Foo-35B-Q8_0', base: 'Foo-35B', variant: 'Q8_0' },
+        ],
+      ],
+      [
+        'the same generic file name in repos of different models',
+        {
+          'Alpha-7B-GGUF/model-Q4_K_M.gguf': G,
+          'Beta-9B-GGUF/model-Q8_0.gguf': G,
+          'pack/Alpha/ggml-model-Q4_K_M.gguf': G,
+          'pack/Beta/ggml-model-Q8_0.gguf': G,
+        },
+        [
+          { name: 'ggml-model-Q4_K_M', base: 'ggml-model-Q4_K_M', variant: 'Q4_K_M' },
+          { name: 'ggml-model-Q8_0', base: 'ggml-model-Q8_0', variant: 'Q8_0' },
+          { name: 'model-Q4_K_M', base: 'model-Q4_K_M', variant: 'Q4_K_M' },
+          { name: 'model-Q8_0', base: 'model-Q8_0', variant: 'Q8_0' },
+        ],
+      ],
+      [
+        'files of one model in a pack folder named after it',
+        { 'pack/Alpha/Alpha-Q4_K_M.gguf': G, 'pack/Alpha/Alpha-Q8_0.gguf': G },
+        [
+          { name: 'Alpha-Q4_K_M', base: 'Alpha', variant: 'Q4_K_M' },
+          { name: 'Alpha-Q8_0', base: 'Alpha', variant: 'Q8_0' },
+        ],
+      ],
+      [
+        'files named only by their tag, in folders that name no model',
+        { 'Q4_K_M.gguf': G, 'GGUF/Q4_K_M.gguf': G, 'HF-GGUF/Q4_K_M.gguf': G },
+        [
+          { name: 'HF-GGUF-Q4_K_M', base: 'HF-GGUF-Q4_K_M', variant: 'Q4_K_M' },
+          { name: 'Q4_K_M', base: 'Q4_K_M', variant: 'Q4_K_M' },
+          { name: 'family-16-Q4_K_M', base: 'family-16-Q4_K_M', variant: 'Q4_K_M' },
+        ],
+      ],
+    ];
+
+    it.each(rows.map(([title, files, expected], index) => [title, index, files, expected] as const))(
+      '%s',
+      async (_title, index, files, expected) => {
+        const dir = modelsDir(join('family', `family-${index}`), files);
+        const byName = (a: Row, b: Row): number => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+        expect(
+          (await discoverLocalChatModels(dir)).map(({ name, base, variant }) => ({ name, base, variant })),
+        ).toEqual([...expected].sort(byName));
+      },
+    );
+  });
+
+  it('puts the repo folder base before a split stem that is only a quant tag, in any folder order', async () => {
+    const dir = modelsDir('split-tag-only', {
+      ...Object.fromEntries(
+        [1, 2].flatMap((k) => [
+          [`b-gguf/UD-Q4_K_XL/UD-Q4_K_XL-0000${k}-of-00002.gguf`, k === 1 ? minimalGguf('qwen4exp') : 'shard'],
+          [`a-gguf/UD-Q4_K_XL-0000${k}-of-00002.gguf`, k === 1 ? minimalGguf('qwen4exp') : 'shard'],
+        ]),
+      ),
+      'UD-Q8_0.gguf': minimalGguf('qwen4exp'),
+    });
+    expect(
+      (await discoverLocalChatModels(dir)).map(({ name, path, base, variant }) => ({ name, path, base, variant })),
+    ).toEqual([
+      { name: 'UD-Q8_0', path: join(dir, 'UD-Q8_0.gguf'), base: 'UD-Q8_0', variant: 'UD-Q8_0' },
+      {
+        name: 'a-UD-Q4_K_XL',
+        path: join(dir, 'a-gguf', 'UD-Q4_K_XL-00001-of-00002.gguf'),
+        base: 'a',
+        variant: 'UD-Q4_K_XL',
+      },
+      {
+        name: 'b-UD-Q4_K_XL',
+        path: join(dir, 'b-gguf', 'UD-Q4_K_XL', 'UD-Q4_K_XL-00001-of-00002.gguf'),
+        base: 'b',
+        variant: 'UD-Q4_K_XL',
+      },
+    ]);
+  });
+
+  it('never joins tag-only files of variant folders named after different models', async () => {
+    const dir = modelsDir(
+      'tag-only-model-folders',
+      Object.fromEntries(
+        ['Qwen4-8B', 'Qwen4-14B'].flatMap((model) =>
+          [1, 2].map((k) => [
+            `qwen-pack/${model}/Q4_K_M-0000${k}-of-00002.gguf`,
+            k === 1 ? minimalGguf('qwen4exp') : 'shard',
+          ]),
+        ),
+      ),
+    );
+    expect(
+      (await discoverLocalChatModels(dir)).map(({ name, path, base, variant }) => ({ name, path, base, variant })),
+    ).toEqual([
+      {
+        name: 'qwen-pack-Qwen4-14B-Q4_K_M',
+        path: join(dir, 'qwen-pack', 'Qwen4-14B', 'Q4_K_M-00001-of-00002.gguf'),
+        base: 'qwen-pack-Qwen4-14B',
+        variant: 'Q4_K_M',
+      },
+      {
+        name: 'qwen-pack-Qwen4-8B-Q4_K_M',
+        path: join(dir, 'qwen-pack', 'Qwen4-8B', 'Q4_K_M-00001-of-00002.gguf'),
+        base: 'qwen-pack-Qwen4-8B',
+        variant: 'Q4_K_M',
+      },
+    ]);
+  });
+
+  it('names a split set behind a linked repo folder by its stem and keeps the link path', async () => {
+    const external = modelsDir(
+      'split-link-target',
+      Object.fromEntries(
+        [1, 2, 3, 4].map((k) => [
+          `UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-0000${k}-of-00004.gguf`,
+          k === 1 ? minimalGguf('qwen4exp') : 'shard',
+        ]),
+      ),
+    );
+    const dir = modelsDir('split-link', {});
+    mkdirSync(dir, { recursive: true });
+    symlinkSync(external, join(dir, 'qwen3.8-flash-next-gguf'));
+    expect(await discoverLocalChatModels(dir)).toEqual([
+      expect.objectContaining({
+        name: 'Qwen3.8-Flash-Next-UD-Q4_K_XL',
+        path: join(dir, 'qwen3.8-flash-next-gguf', 'UD-Q4_K_XL', 'Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf'),
+        base: 'Qwen3.8-Flash-Next',
+        variant: 'UD-Q4_K_XL',
+        format: 'gguf',
+      }),
+    ]);
+  });
+
+  it('groups the builds of one repo and an MLX folder of the same model under one base', async () => {
+    const dir = modelsDir('variant-group', {
+      'qwen3.8-27b-gguf/Qwen3.8-27B-UD-Q4_K_M.gguf': minimalGguf('qwen4exp'),
+      'qwen3.8-27b-gguf/Qwen3.8-27B-UD-Q4_K_XL.gguf': minimalGguf('qwen4exp'),
+      'qwen3.8-27b-nvfp4/config.json': JSON.stringify({
+        model_type: 'qwen4_exp',
+        quantization: { group_size: 16, bits: 4, mode: 'nvfp4', 'model.embed_tokens': { bits: 8, group_size: 64 } },
+      }),
+      'qwen3.8-27b-mlx/config.json': JSON.stringify({ model_type: 'qwen4_exp', torch_dtype: 'bfloat16' }),
+    });
+    expect(
+      (await discoverLocalChatModels(dir)).map(({ name, base, variant, format }) => ({ name, base, variant, format })),
+    ).toEqual([
+      { name: 'Qwen3.8-27B-UD-Q4_K_M', base: 'Qwen3.8-27B', variant: 'UD-Q4_K_M', format: 'gguf' },
+      { name: 'Qwen3.8-27B-UD-Q4_K_XL', base: 'Qwen3.8-27B', variant: 'UD-Q4_K_XL', format: 'gguf' },
+      { name: 'qwen3.8-27b-mlx', base: 'Qwen3.8-27B', variant: 'BF16', format: 'mlx' },
+      { name: 'qwen3.8-27b-nvfp4', base: 'Qwen3.8-27B', variant: 'NVFP4', format: 'mlx' },
+    ]);
   });
 
   it('does not register the repo folder itself when it has a root config.json', async () => {

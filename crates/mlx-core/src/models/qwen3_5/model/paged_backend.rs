@@ -370,6 +370,7 @@ impl Qwen35Inner {
         let total_budget = plan.len() as u32;
         // GDN recurrent-state prime (live / checkpoint / replay). No qwen3/lfm2
         // analog — dense carries GDN recurrent state across turns.
+        crate::engine::progress::with_turn_progress(|p| p.restoring(turn_plan.cached_prefix_len));
         let gdn_prefix_preparation = self.prepare_dense_gdn_prefix_state(
             plan,
             turn_plan.cached_prefix_len,
@@ -1140,6 +1141,7 @@ impl Qwen35Inner {
                         &cb,
                         cancelled,
                         thinking,
+                        args.config,
                     )?;
                     Ok(TurnOutput::Streamed)
                 }
@@ -1151,6 +1153,7 @@ impl Qwen35Inner {
                         p,
                         report_perf,
                         thinking,
+                        args.config,
                     )?;
                     Ok(TurnOutput::Complete(Box::new(result)))
                 }

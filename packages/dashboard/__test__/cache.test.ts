@@ -10,7 +10,7 @@ import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
 import type { ApiCall } from '../src/runtime.js';
 import { connectDashboardApi, disconnectDashboardApi, mutate } from '../ui/src/lib/api.js';
-import { coldObjectCounts, evictPreview } from '../ui/src/lib/cold-tier.js';
+import { coldObjectCounts, evictPreview, hitRateSeries, sidecarReading } from '../ui/src/lib/cold-tier.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -19,8 +19,19 @@ function hexName(index: number): string {
   return `${index.toString(16).padStart(64, '0')}.safetensors`;
 }
 
+/** `<64 lowercase hex>.safetensors`: the name of a canonical cold-tier block. */
+function isCanonicalBlockName(name: string): boolean {
+  const suffix = '.safetensors';
+  if (name.length !== 64 + suffix.length || !name.endsWith(suffix)) return false;
+  for (let i = 0; i < 64; i += 1) {
+    const ch = name[i];
+    if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false;
+  }
+  return true;
+}
+
 /** Canonical sidecar filename: same key, `ColdGroup` label as an infix. */
-function sidecarName(index: number, group: 'conv_state' | 'sliding_window' | 'dflash2_state'): string {
+function sidecarName(index: number, group: 'conv_state' | 'sliding_window' | 'dflash2_state' | 'hybrid_draft'): string {
   return `${index.toString(16).padStart(64, '0')}.${group}.safetensors`;
 }
 
@@ -236,7 +247,7 @@ describe('evictOlderThan', () => {
     for (const stranger of STRANGERS) expect(existsSync(join(root, stranger))).toBe(true);
 
     // Remaining canonical blocks are exactly the two kept ones.
-    const names = readdirSync(root).filter((n) => /^[0-9a-f]{64}\.safetensors$/.test(n));
+    const names = readdirSync(root).filter(isCanonicalBlockName);
     expect(names.sort()).toEqual([hexName(1), hexName(2)].sort());
   });
 
@@ -297,10 +308,11 @@ describe('cache DELETE request body (Cache page → mutate)', () => {
           return { ok: true, status: 200, body: { removed: 0, freedBytes: 0 } };
         },
         subscribe: () => () => {},
+        watchLive: () => () => {},
       },
       bindEventTargetPort(port2),
     );
-    connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+    connectDashboardApi(bindEventTargetPort(port1));
 
     try {
       // The bodies cache.tsx constructs per action kind.
@@ -431,6 +443,16 @@ describe('cold-tier object counting (Cache page ↔ scan)', () => {
     expect(evictPreview(histogram, 30)).toEqual({ count: 0, bytes: 0 });
   });
 
+  it('counts and clears the Flash Next state objects as sidecars', () => {
+    writeFileSync(join(root, sidecarName(10, 'dflash2_state')), Buffer.alloc(5));
+    writeFileSync(join(root, sidecarName(11, 'hybrid_draft')), Buffer.alloc(6));
+
+    const info = scanColdCache(root);
+    expect(info.sidecarCount).toBe(2);
+    expect(info.sidecarBytes).toBe(11);
+    expect(clearColdCache(root)).toEqual({ removed: 2, freedBytes: 11 });
+  });
+
   it('treats a sidecar-only tier as non-empty so its quota is clearable', () => {
     // Reachable state: blocks evicted, sidecars left behind. Gating the
     // destructive controls on `entryCount` showed occupied quota the UI refused
@@ -443,5 +465,65 @@ describe('cold-tier object counting (Cache page ↔ scan)', () => {
     expect(info.totalBytes).toBeGreaterThan(0);
     expect(coldObjectCounts(info).objects).toBe(1);
     expect(clearColdCache(root).removed).toBe(1);
+  });
+
+  const HEALTHY = {
+    sidecarCaptureReached: 20,
+    sidecarChainEmpty: 1,
+    sidecarBoundarySkips: 2,
+    sidecarAlreadyPersisted: 16,
+    sidecarEnqueued: 1,
+    sidecarInstalled: 15,
+  };
+
+  it('reads a healthy hybrid run with no alarm', () => {
+    const reading = sidecarReading(HEALTHY, { unrootedSidecarCaptures: 0 }, 100);
+    expect(reading).toMatchObject({ captures: 20, written: 1, persisted: 16, noAnchor: 3, installed: 15 });
+    expect(reading.replayed).toBe(false);
+    expect(reading.stranded).toBe(false);
+  });
+
+  it('flags restored prefixes whose state was on disk but never installed', () => {
+    expect(sidecarReading({ ...HEALTHY, sidecarInstalled: 0 }, undefined, 5).replayed).toBe(true);
+    // No restore happened, so nothing was replayed in its place.
+    expect(sidecarReading({ ...HEALTHY, sidecarInstalled: 0 }, undefined, 0).replayed).toBe(false);
+  });
+
+  it('flags captures that never wrote nor found a sidecar', () => {
+    const reading = sidecarReading({ ...HEALTHY, sidecarEnqueued: 0, sidecarAlreadyPersisted: 0 }, undefined, 0);
+    expect(reading.stranded).toBe(true);
+  });
+
+  it('reads a dense family as zero captures and no alarm, and keeps unrooted captures apart', () => {
+    const dense = sidecarReading(
+      {
+        sidecarCaptureReached: 0,
+        sidecarChainEmpty: 0,
+        sidecarBoundarySkips: 0,
+        sidecarAlreadyPersisted: 0,
+        sidecarEnqueued: 0,
+        sidecarInstalled: 0,
+      },
+      { unrootedSidecarCaptures: 0 },
+      50,
+    );
+    expect(dense).toMatchObject({ captures: 0, stranded: false, replayed: false, unrooted: 0 });
+    expect(sidecarReading(undefined, { unrootedSidecarCaptures: 34 }, 0).unrooted).toBe(34);
+  });
+
+  it('gives a day with no lookup a null hit rate, never 0 %', () => {
+    const series = hitRateSeries(
+      [
+        { t: 100, hits: 3, misses: 1 },
+        { t: 100, hits: 1, misses: 0 },
+        { t: 300, hits: 0, misses: 2 },
+      ],
+      [100, 200, 300],
+    );
+    expect(series).toEqual([
+      { t: 100, rate: 80, lookups: 5, hits: 4 },
+      { t: 200, rate: null, lookups: 0, hits: 0 },
+      { t: 300, rate: 0, lookups: 2, hits: 0 },
+    ]);
   });
 });

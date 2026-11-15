@@ -33,7 +33,8 @@ interface UsageSummary {
   input_tokens_details?: { cached_tokens?: number };
   output_tokens?: number;
   time_to_first_token_ms?: number;
-  prefill_tokens_per_second?: number;
+  prefill_ms?: number;
+  prefill_tokens?: number;
   decode_tokens_per_second?: number;
   server_inference_elapsed_ms?: number;
   server_total_time_to_first_token_ms?: number;
@@ -98,6 +99,11 @@ function fmtMs(ms: number | undefined): string | undefined {
 
 function fmtRate(rate: number | undefined): string | undefined {
   return typeof rate === 'number' && Number.isFinite(rate) ? `${rate.toFixed(2)}/s` : undefined;
+}
+
+function prefillRate(usage: UsageSummary): number | undefined {
+  const { prefill_ms: ms, prefill_tokens: tokens } = usage;
+  return typeof ms === 'number' && ms > 0 && typeof tokens === 'number' ? (tokens * 1000) / ms : undefined;
 }
 
 function addMs(left: number | undefined, right: number | undefined): number | undefined {
@@ -180,7 +186,7 @@ function buildTimingSummary(reqBody: string, resBody: string): string {
     const timingParts = [
       fmtMs(totalFirstTokenMs) ? `ttfb=${fmtMs(totalFirstTokenMs)}` : undefined,
       fmtMs(usage.time_to_first_token_ms) ? `ttft=${fmtMs(usage.time_to_first_token_ms)}` : undefined,
-      fmtRate(usage.prefill_tokens_per_second) ? `prefill=${fmtRate(usage.prefill_tokens_per_second)}` : undefined,
+      fmtRate(prefillRate(usage)) ? `prefill=${fmtRate(prefillRate(usage))}` : undefined,
       fmtRate(usage.decode_tokens_per_second) ? `decode=${fmtRate(usage.decode_tokens_per_second)}` : undefined,
       fmtMs(usage.server_inference_elapsed_ms) ? `infer=${fmtMs(usage.server_inference_elapsed_ms)}` : undefined,
     ].filter((part): part is string => part != null);

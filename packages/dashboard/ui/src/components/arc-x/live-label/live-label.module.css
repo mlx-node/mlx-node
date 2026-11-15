@@ -1,0 +1,5 @@
+/* The shimmer paints its glyphs only inside the label box. In a line box as tall as the font, descenders are cut without this room. */
+.shimmer > span > span {
+  padding-block: 0.25em;
+  margin-block: -0.25em;
+}

@@ -1,0 +1,204 @@
+.root {
+  display: grid;
+  min-width: 0;
+  margin: 0;
+  gap: var(--space-3);
+}
+
+.head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.reading {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-0-5);
+}
+
+.valueLine {
+  display: inline-flex;
+  min-width: 5ch;
+  align-items: baseline;
+  gap: var(--space-1-5);
+  font-family: var(--font-display);
+  font-size: var(--text-3xl);
+  white-space: nowrap;
+}
+
+.value {
+  font-family: var(--font-display);
+  font-size: var(--text-3xl);
+  font-weight: 400;
+  letter-spacing: var(--tracking-display);
+  line-height: 1;
+}
+
+.unit {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.status {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.pill {
+  display: inline-flex;
+  min-height: var(--control-height-sm);
+  flex: none;
+  box-sizing: border-box;
+  align-items: center;
+  gap: var(--space-1-5);
+  padding: 0 var(--space-2-5) 0 var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  transition:
+    color var(--duration-fast) var(--ease-standard),
+    background-color var(--duration-fast) var(--ease-standard),
+    transform var(--duration-instant) var(--ease-standard);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .pill:hover {
+    background: var(--surface-muted);
+    color: var(--foreground);
+  }
+}
+
+.pill:active {
+  transform: scale(0.97);
+}
+
+.pillDot {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--success);
+  transition:
+    border-radius var(--duration-standard) var(--ease-standard),
+    background-color var(--duration-standard) var(--ease-standard),
+    box-shadow var(--duration-standard) var(--ease-standard),
+    scale var(--duration-spring) var(--ease-spring);
+}
+
+.pill[aria-pressed='true'] .pillDot {
+  border-radius: 1px;
+  background: transparent;
+  box-shadow:
+    inset 3px 0 0 var(--text-secondary),
+    inset -3px 0 0 var(--text-secondary);
+  scale: 0.9;
+}
+
+.pillLabel {
+  display: inline-block;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.pillText {
+  display: inline-block;
+}
+
+.clip {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.slide {
+  position: absolute;
+  inset: 0;
+}
+
+.marks,
+.endLayer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.line {
+  fill: none;
+  stroke: var(--c);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
+.area {
+  fill: color-mix(in oklab, var(--c) 10%, transparent);
+}
+
+.lone {
+  fill: var(--c);
+}
+
+.dot {
+  fill: var(--c);
+  stroke: var(--surface);
+  stroke-width: 2;
+  transform-box: view-box;
+}
+
+[data-entrance='pending'] .trace {
+  clip-path: inset(0 100% 0 0);
+}
+
+[data-entrance='pending'] .dot {
+  opacity: 0;
+}
+
+[data-entrance='run'] .trace {
+  animation: stream-trace var(--duration-trace) var(--ease-in-out) both;
+}
+
+[data-entrance='run'] .dot {
+  animation: stream-pop var(--duration-fast) var(--ease-enter) var(--duration-trace) both;
+}
+
+@keyframes stream-trace {
+  from {
+    clip-path: inset(0 100% 0 0);
+  }
+  to {
+    clip-path: inset(0 0 0 0);
+  }
+}
+
+@keyframes stream-pop {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pill,
+  .pillDot {
+    transition: none;
+  }
+  .pill:active {
+    transform: none;
+  }
+  [data-entrance='run'] .trace,
+  [data-entrance='run'] .dot {
+    animation: none;
+  }
+}

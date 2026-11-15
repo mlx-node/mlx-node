@@ -1184,6 +1184,9 @@ pub struct PagedKVCacheAdapter {
     /// `&self`; it is locked after the allocator, never before.
     refusals: Mutex<BTreeMap<SeqId, BlockRefusal>>,
 
+    /// While set the pool keeps its size: no grow, no extent release.
+    growth_hold: bool,
+
     /// The memory plan's ceiling a pool growth is probed against; `None`
     /// probes the automatic hard budget.
     memory_ceiling: Option<u64>,
@@ -1426,6 +1429,7 @@ impl PagedKVCacheAdapter {
             recency,
             turn_end_stamps: HashMap::new(),
             refusals: Mutex::new(BTreeMap::new()),
+            growth_hold: false,
             memory_ceiling: None,
             admission: None,
             #[cfg(test)]
@@ -1506,6 +1510,10 @@ impl PagedKVCacheAdapter {
     /// every persisted block off `ctx.fingerprint`.
     pub fn set_cold_tier(&mut self, ctx: ColdTierContext) {
         self.cold_tier = Some(ctx);
+    }
+
+    pub(crate) fn take_cold_tier(&mut self) -> Option<ColdTierContext> {
+        self.cold_tier.take()
     }
 
     /// Install (or clear) the callback that fires once per pool grow or
@@ -3139,6 +3147,9 @@ impl PagedKVCacheAdapter {
     /// (`HybridSchedulerState::try_grow_reservation_pool`); admission runs
     /// on the model thread, so the same thread/contract holds there.
     pub(crate) fn try_grow_pool(&mut self, needed_additional_blocks: u32) -> bool {
+        if self.growth_hold {
+            return false;
+        }
         // Serialize the whole probe → grow → notify sequence process-wide
         // (see crate::cache_limit::pool_growth_lock). Scope-drop releases
         // the guard on every exit path, including the decline/failure
@@ -3410,7 +3421,7 @@ impl PagedKVCacheAdapter {
         let Some(extent) = self.extent_growth_blocks else {
             return 0;
         };
-        if want_bytes == 0 {
+        if want_bytes == 0 || self.growth_hold {
             return 0;
         }
         let Ok(bytes_per_block) = self.bytes_per_block() else {
@@ -8174,6 +8185,21 @@ impl PagedKVCacheAdapter {
         self.refusals().clear();
     }
 
+    /// Holds the pool at its size (no grow, no extent release) until
+    /// called with `false`.
+    pub(crate) fn set_growth_hold(&mut self, hold: bool) {
+        self.growth_hold = hold;
+    }
+
+    /// Entries of the per-sequence tables: parked and active requests,
+    /// kept tables' turn-end stamps and refused reservations.
+    pub(crate) fn per_sequence_entries(&self) -> usize {
+        self.requests.len()
+            + usize::from(self.active_seq.is_some())
+            + self.turn_end_stamps.len()
+            + self.refusals().len()
+    }
+
     /// Blocks every refused reservation lacked, summed over sequences; the
     /// record clears. `None` when nothing was refused.
     #[cfg(test)]
@@ -8229,6 +8255,20 @@ impl PagedKVCacheAdapter {
     /// Whether the prefix cache holds a block under `hash`.
     pub(crate) fn prefix_cached(&self, hash: u64) -> bool {
         self.allocator_guard().is_cached(hash)
+    }
+
+    /// The block the prefix cache holds under `hash`.
+    pub(crate) fn cached_block(&self, hash: u64) -> Option<Arc<PhysicalBlock>> {
+        self.allocator_guard().cached_block(hash)
+    }
+
+    /// Grows the pool by what `blocks` more blocks lack beyond the free (or
+    /// evictable) ones, for a restore that cannot grow it itself.
+    pub(crate) fn grow_for(&mut self, blocks: u32) {
+        let shortfall = self.grow_shortfall(&self.allocator_guard(), blocks);
+        if shortfall > 0 {
+            self.try_grow_pool(shortfall);
+        }
     }
 
     /// [`BlockAllocator::freed_by_marks`].

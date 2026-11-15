@@ -8,5 +8,5 @@
     "types": ["node"]
   },
   "include": ["src/**/*.ts"],
-  "references": [{ "path": "../agent" }]
+  "references": [{ "path": "../agent" }, { "path": "../server" }]
 }

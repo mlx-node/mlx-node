@@ -109,7 +109,7 @@ core ── native addon boundary
 ├── trl, vlm, server ── core + lm
 ├── agent ───────────── core + lm + server
 ├── cli ─────────────── agent + core + lm + privacy + server
-├── dashboard ───────── agent + lm (native-free catalog boundary)
+├── dashboard ───────── agent + lm (native-free catalog boundary; spawns mlx-agent for Chat / Work)
 └── desktop ─────────── dashboard + lm + server (process-isolated native)
 ```
 
@@ -161,7 +161,7 @@ mlx-node/
 │   ├── agent/                  @mlx-node/agent
 │   ├── asr/                    @mlx-node/asr
 │   ├── privacy/                @mlx-node/privacy
-│   ├── dashboard/              @mlx-node/dashboard (native-free UI/catalog)
+│   ├── dashboard/              @mlx-node/dashboard (native-free UI/catalog, Chat and Work host)
 │   ├── desktop/                @mlx-node/desktop (process-isolated native)
 │   └── internal-tools/         development tooling
 │

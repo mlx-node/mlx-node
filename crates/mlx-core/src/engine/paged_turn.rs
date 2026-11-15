@@ -42,7 +42,7 @@ pub(crate) struct FinishPagedTurnArgs<'a> {
     pub retain_final_length_token: bool,
     pub generation_start: Option<Instant>,
     pub first_token_instant: Option<Instant>,
-    pub reasoning_tokens: u32,
+    pub reasoning: crate::engine::penalties::ReasoningOutcome,
     pub profiler: &'a crate::decode_profiler::DecodeProfiler,
     pub stream_skip_special: bool,
     pub streamed_text_len: usize,
@@ -151,7 +151,7 @@ pub(crate) fn emit_paged_turn_result<B: PagedBackend>(
         include_reasoning: args.params.include_reasoning,
         thinking_enabled: args.thinking.enabled,
         prompt_tokens: reported_prompt_tokens,
-        reasoning_tokens: args.reasoning_tokens,
+        reasoning: args.reasoning,
     }) {
         Ok(result) => result,
         Err(error) => {
@@ -508,7 +508,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
             retain_final_length_token: true,
             generation_start,
             first_token_instant,
-            reasoning_tokens: reasoning_tracker.reasoning_token_count(),
+            reasoning: reasoning_tracker.outcome(),
             profiler: &profiler,
             stream_skip_special,
             // The epilogue takes scalar copies — the same defaults the
@@ -821,7 +821,11 @@ mod tests {
                 thinking_enabled: args.thinking_enabled,
                 num_tokens: args.generated_tokens.len() as u32,
                 prompt_tokens: args.prompt_tokens,
-                reasoning_tokens: args.reasoning_tokens,
+                reasoning_tokens: args.reasoning.tokens,
+                reasoning_close: args.reasoning.close_name(),
+                reasoning_cut_at: args.reasoning.cut_at,
+                reasoning_cycle_period: args.reasoning.cycle_period,
+                reasoning_stray_closes: args.reasoning.reported_stray_closes(),
                 finish_reason: args.finish_reason,
                 raw_text,
                 public_raw_text: None,
@@ -1104,6 +1108,7 @@ mod tests {
         let thinking = ThinkingSetup {
             enabled: false,
             budget: None,
+            cycle_guard: false,
         };
 
         let tokens = vec![0u32, 1, 2]; // arbitrary non-empty prompt
@@ -1272,6 +1277,7 @@ mod tests {
             thinking: ThinkingSetup {
                 enabled: false,
                 budget: None,
+                cycle_guard: false,
             },
             plan: paged_test_plan(),
             sink: Some(&sink),
@@ -1393,6 +1399,7 @@ mod tests {
         let thinking = ThinkingSetup {
             enabled: false,
             budget: None,
+            cycle_guard: false,
         };
 
         let sink = RecSink {
@@ -1535,6 +1542,7 @@ mod tests {
         let thinking = ThinkingSetup {
             enabled: false,
             budget: None,
+            cycle_guard: false,
         };
 
         let tokens = vec![0u32, 1, 2];
@@ -1802,6 +1810,7 @@ mod tests {
         let thinking = ThinkingSetup {
             enabled: false,
             budget: None,
+            cycle_guard: false,
         };
 
         let prompt_vec = prompt.to_vec();
@@ -1969,6 +1978,7 @@ mod tests {
                 thinking: ThinkingSetup {
                     enabled: false,
                     budget: None,
+                    cycle_guard: false,
                 },
                 is_delta: false,
                 reuse_cache: true,
@@ -1980,7 +1990,7 @@ mod tests {
                 retain_final_length_token: false,
                 generation_start: None,
                 first_token_instant: None,
-                reasoning_tokens: 0,
+                reasoning: crate::engine::penalties::ReasoningOutcome::default(),
                 profiler: &profiler,
                 stream_skip_special: false,
                 streamed_text_len: 0,
@@ -2123,6 +2133,7 @@ mod tests {
         let thinking = ThinkingSetup {
             enabled: false,
             budget: None,
+            cycle_guard: false,
         };
         let prompt = PROMPT.to_vec();
         let mut plan = paged_test_plan();

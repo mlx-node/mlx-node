@@ -1,0 +1,116 @@
+/* A rule across the thread, not a box: it marks where something starts. */
+.mark {
+  display: grid;
+  grid-template-columns: minmax(var(--space-4), 1fr) auto minmax(var(--space-4), 1fr);
+  align-items: center;
+  column-gap: var(--space-2);
+  row-gap: var(--space-0-5);
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+.mark::before,
+.mark::after {
+  height: 1px;
+  background: var(--border);
+  content: '';
+}
+
+.mark::before {
+  grid-area: 1 / 1;
+}
+
+.mark::after {
+  grid-area: 1 / 3;
+}
+
+.mark[data-tone='danger']::before,
+.mark[data-tone='danger']::after {
+  background: color-mix(in oklab, var(--danger) 40%, var(--border));
+}
+
+.mark[data-tone='warning']::before,
+.mark[data-tone='warning']::after {
+  background: color-mix(in oklab, var(--warning) 40%, var(--border));
+}
+
+.line {
+  display: inline-flex;
+  grid-area: 1 / 2;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-1-5);
+  white-space: nowrap;
+}
+
+.icon {
+  display: inline-grid;
+  flex: none;
+  place-items: center;
+  color: var(--text-muted);
+}
+
+.icon > svg {
+  width: 12px;
+  height: 12px;
+}
+
+.label {
+  flex: none;
+  color: var(--foreground);
+  font-weight: 500;
+}
+
+.fact {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.time {
+  flex: none;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.mark[data-tone='warning'] .icon {
+  color: var(--warning);
+}
+
+.mark[data-tone='danger'] .icon,
+.mark[data-tone='danger'] .label {
+  color: color-mix(in oklab, var(--danger) 84%, var(--foreground));
+}
+
+.detail {
+  grid-area: 2 / 1 / 3 / 4;
+  justify-self: center;
+  max-width: 34rem;
+  margin: 0;
+  text-align: center;
+  text-wrap: balance;
+}
+
+/* A path is one word: it never breaks; one still longer than the line gives way at its end. */
+.detail code {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  color: var(--foreground);
+  font-family: var(--font-code);
+  font-size: inherit;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+  white-space: nowrap;
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

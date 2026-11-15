@@ -185,6 +185,39 @@ common/target_rope.h at the revision above. It preserves the source
 256-thread reduction, BF16 normalization boundary and FP32 rotary
 arithmetic while accepting separately owned strided MLX inputs.
 
+The GGUF tokenizer token rule in
+crates/mlx-core/src/utils/gguf.rs (embedded_gpt2_tokenizer_json: CONTROL rows
+are special added tokens, USER_DEFINED rows are added tokens that are not
+special) follows Splash install/gguf.py, and the Qwen3.8-Flash-Next load check
+in crates/mlx-core/src/models/qwen4_exp/mod.rs (check_tokenizer_tags: the
+reasoning and tool-call tags and the stop text each encode as one token)
+follows validate_tokenizer in Splash server/constraints.py, both at Splash
+revision d8af1054aab0f97de21d043e01aa98af3754f10e. The check also requires
+each tag to survive a skip-special decode, because mlx-node parses decoded
+text.
+
+The Qwen3.8-Flash-Next prefill window in
+crates/mlx-core/src/models/qwen4_exp/memory.rs (prefill_window: one fixed
+chunk of rows whose scratch the memory plan prices as the lane transient,
+never cut by live free memory) follows the fixed prefill chunk of Splash
+runtime/metal/abi/ExecutionGeometry.h (SPLASH_PREFILL_TOKEN_BUDGET) and
+runtime/model/RuntimeArenas.hpp (kPrefillRows) at Splash revision
+d8af1054aab0f97de21d043e01aa98af3754f10e. mlx-node keeps its own chunk of
+1,024 rows.
+
+The Qwen3.8-Flash-Next prefix states in
+crates/mlx-core/src/models/qwen4_exp/prefix_state.rs and paged.rs (a
+replay point before the generation prompt, rolling checkpoints every 4,096
+tokens with one prefill chunk of margin, each checkpoint retiring the lane's
+previous one, the replay point in use until its request ends, checkpoints
+given up before ordinary states and states in use never) follow
+promptReplayBoundary, kPrefillCheckpointTokens and plannedCheckpoints in
+Splash runtime/engine/Engine.hpp and the "Replay points and checkpoints"
+section of Splash docs/internals.md at revision
+d8af1054aab0f97de21d043e01aa98af3754f10e. mlx-node places the replay point
+and the checkpoints on its prefill pass grid (1,024 rows) instead of 32-token
+pages, and keeps the states in the existing qwen3_5 HybridStateStore.
+
 Splash's LICENSE is the Apache License,
 Version 2.0, whose copyright line it leaves as the template text:
 
@@ -244,3 +277,65 @@ The native Rust implementation changes execution to MLX and adds validation
 and cancellation. Small reference-generated test fixtures and their source
 revision are in __test__/fixtures/clef; the upstream license is reproduced at
 __test__/fixtures/clef/LICENSE. No released model weights are redistributed.
+
+Arc (https://github.com/kuratlielia/arc-library), MIT
+
+The Control Panel components in packages/dashboard/ui/src/components/arc/ are
+copied from Arc's free component registry (https://uiarc.dev/r/). The local
+changes are listed in packages/dashboard/ui/src/components/arc/PROVENANCE.md,
+and the license is reproduced at
+packages/dashboard/ui/src/components/arc/LICENSE:
+
+   MIT License
+
+   Copyright (c) 2026 Elia Kuratli
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in all
+   copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+thinking-orbs (https://github.com/Jakubantalik/Libraries.dev), MIT
+
+The geometry of the Control Panel's waiting orb in
+packages/dashboard/ui/src/components/arc-x/wait-orb/engine.ts is derived from
+the npm package thinking-orbs 0.3.2 (packages/thinking-orbs in the repository
+above). The local changes are listed in
+packages/dashboard/ui/src/components/arc-x/wait-orb/PROVENANCE.md, and the
+license is reproduced at
+packages/dashboard/ui/src/components/arc-x/wait-orb/LICENSE:
+
+   MIT License
+
+   Copyright (c) 2026 Jakub Antalik
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in all
+   copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.

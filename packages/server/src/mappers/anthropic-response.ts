@@ -1,9 +1,15 @@
 /** ChatResult / ChatStreamEvent → Anthropic Messages API output. */
 
-import type { ChatResult, ChatStreamProgress } from '@mlx-node/core';
+import type { ChatResult } from '@mlx-node/core';
 
+import type { TurnProgressSnapshot } from '../native-progress.js';
 import { sanitizeJsonString } from '../strict-json.js';
-import { mergeTimingUsageExtensions, type PerformanceMetricsForUsage, type ServerTimingForUsage } from '../timing.js';
+import {
+  mergeTimingUsageExtensions,
+  type MeasuredPrefill,
+  type PerformanceMetricsForUsage,
+  type ServerTimingForUsage,
+} from '../timing.js';
 import type {
   AnthropicContentBlockDeltaEvent,
   AnthropicContentBlockStartEvent,
@@ -390,6 +396,7 @@ export function buildMessageDelta(
   performance?: PerformanceMetricsForUsage,
   serverTiming?: ServerTimingForUsage,
   stopSequence?: string | null,
+  prefill?: MeasuredPrefill,
 ): AnthropicMessageDeltaEvent {
   // Streaming `message_delta` mirrors the non-streaming response's
   // cache accounting: when `cachedTokens > 0` we emit
@@ -413,7 +420,7 @@ export function buildMessageDelta(
   // cache-field block above. See `buildAnthropicResponse` for the
   // matching non-streaming branch and the docstring on
   // `AnthropicUsage` for the wire-format rationale.
-  mergeTimingUsageExtensions(usage, performance, inputTokens, outputTokens, cachedTokens, serverTiming);
+  mergeTimingUsageExtensions(usage, performance, inputTokens, outputTokens, cachedTokens, serverTiming, prefill);
   return {
     type: 'message_delta',
     delta: {
@@ -457,8 +464,8 @@ function phaseRate(
  * is done: its terminal frames are about to follow.
  */
 export function buildProgressPing(
-  snapshot: ChatStreamProgress,
-  previous: ChatStreamProgress | null,
+  snapshot: TurnProgressSnapshot,
+  previous: TurnProgressSnapshot | null,
   elapsedMs: number,
 ): AnthropicPingEvent | null {
   if (snapshot.phase === 'done') return null;
@@ -466,6 +473,13 @@ export function buildProgressPing(
     phase: snapshot.phase,
     elapsed_ms: Math.max(0, Math.round(elapsedMs)),
   };
+  for (const [key, value] of [
+    ['wait_ms', snapshot.waitMs],
+    ['slot_ms', snapshot.slotMs],
+    ['prepare_ms', snapshot.prepareMs],
+  ] as const) {
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) progress[key] = Math.round(value);
+  }
   if (snapshot.prefillTotal !== undefined) progress.prefill_total = snapshot.prefillTotal;
   if (snapshot.prefillDone !== undefined) progress.prefill_done = snapshot.prefillDone;
   if (snapshot.cachedTokens !== undefined) progress.cached_tokens = snapshot.cachedTokens;

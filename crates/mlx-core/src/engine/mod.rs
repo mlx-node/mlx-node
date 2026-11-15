@@ -20,6 +20,7 @@ pub(crate) mod gen_prompt;
 pub(crate) mod governor;
 pub(crate) mod hybrid_scheduler;
 pub(crate) mod latency;
+pub mod load_progress;
 pub(crate) mod memory_plan;
 pub(crate) mod model_command;
 pub(crate) mod mtp_turn;
@@ -30,6 +31,7 @@ pub(crate) mod paged_turn;
 pub(crate) mod params;
 pub(crate) mod penalties;
 pub(crate) mod persistence;
+pub mod pipeline_counter;
 pub(crate) mod plan;
 pub(crate) mod progress;
 pub(crate) mod recurrent_state;
@@ -42,6 +44,7 @@ pub(crate) mod tf_research;
 pub mod types;
 pub(crate) mod verification_budget;
 pub(crate) mod vision;
+pub mod warmup;
 
 // Flat re-exports of the focused submodules' items so family code and
 // engine-internal callers can import everything through a single

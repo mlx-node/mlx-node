@@ -1,7 +1,7 @@
 # @mlx-node/dashboard
 
-The mlx-node Control Panel UI: browse local models, agent sessions, inference metrics, and
-the paged-attention cold cache. Rendered inside the mlx-node desktop app — there is
+The mlx-node Control Panel UI: Chat and Work with a local model, local models, agent sessions,
+inference metrics, web search providers, and the paged-attention cold cache. Rendered inside the mlx-node desktop app — there is
 no server and no port.
 
 ## Requirements
@@ -16,8 +16,8 @@ Not started on its own. The desktop app creates the runtime, serves the built SP
 over its `app://` scheme, and hands the page one end of a `MessageChannel`; the SPA
 calls `connectDashboardApi(port)` and every API call rides it.
 
-See [`docs/dashboard.md`](../../docs/dashboard.md) for pages, data sources,
-`persistPagedCache`, and the `MLX_AGENT_METRICS` / `MLX_COLD_CACHE_DIR` env vars.
+See [`docs/dashboard.md`](../../docs/dashboard.md) for the eleven routes, Chat and Work, web search providers, data sources, the live channel,
+the design system, the dev harness, `persistPagedCache`, and the env vars.
 
 ## Design
 
@@ -32,8 +32,16 @@ See [`docs/dashboard.md`](../../docs/dashboard.md) for pages, data sources,
   `node:worker_threads` worker owns the synchronous SQLite index, so a heavy query
   cannot stall download progress. Ownership is declared per route in
   `src/api/routes.ts`.
-- **`node:sqlite` + Drizzle ORM** index over pi session JSONL and metric traces.
-- **React + Vite + Tailwind + shadcn/ui** SPA in `ui/`, built to `web/`.
+- **`node:sqlite` + Drizzle ORM** index over metric traces and the runtime series.
+- **Live push.** A `watch` request over the port gets `live` events: heartbeat snapshots and "new data" after a
+  finished turn. No page polls for live state; the one timer re-reads the Coding Agents status every 30 s
+  while the window is visible.
+- **Chat and Work.** `src/chat/` starts the bundled `mlx-agent` on demand, one process per mode, over ACP on stdio.
+  Chat has no shell, an empty `HOME` and the app's `mlx_web` search / fetch tools; Work runs in a folder the user
+  chooses, with the real `HOME` and `~/.mlx-agent`, and asks through a card in the page before a command or an edit that no saved grant allows.
+  Provider keys live in the macOS Keychain; the provider skills ship in `skills/`.
+- **React + Vite + Arc** SPA in `ui/`, built to `web/`: vendored Arc free components in `ui/src/components/arc/`,
+  own components in `ui/src/components/arc-x/`, a locked Tailwind layer for page layout, fonts bundled.
 
 ## Layout
 
@@ -45,12 +53,16 @@ packages/dashboard/
 │   ├── api/          route table + handlers + the typed error model
 │   ├── worker/       the SQLite worker thread and its message contract
 │   ├── db/           Drizzle schema + node:sqlite driver
-│   ├── ingest/       pi JSONL + metric traces → sqlite
+│   ├── ingest/       metric traces + runtime series → sqlite (tail reads)
+│   ├── live.ts       live watcher: heartbeat files + supervisor.json → live events
 │   ├── models.ts     discover / size / quant / delete
 │   ├── download.ts   @huggingface/hub runner with structured progress
 │   ├── catalog.ts    installed-state overlay on the agent's catalog
+│   ├── chat/         Chat and Work: agent processes, ACP, permissions, providers, the mlx_web server
 │   └── cache.ts      cold-tier dir scan + management
-└── ui/               Vite app (React + Tailwind + shadcn/ui) → built to web/
+├── skills/           provider skill folders, pinned, with manifest.json
+├── scripts/          dev harness: dev, dev:fixture, dev:shots, the /__gallery page (never shipped)
+└── ui/               Vite app (React + Arc + locked Tailwind) → built to web/
 ```
 
 ## Build
@@ -58,6 +70,7 @@ packages/dashboard/
 ```bash
 yarn workspace @mlx-node/dashboard build       # tsc -b + vite build (ui → web)
 yarn workspace @mlx-node/dashboard build:ui    # ui only
+yarn workspace @mlx-node/dashboard dev         # dev harness on a fixture home: http://127.0.0.1:5179/
 ```
 
 The package publishes `dist` and `web` (the built SPA).

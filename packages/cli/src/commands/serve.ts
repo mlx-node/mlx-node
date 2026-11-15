@@ -24,8 +24,12 @@ import {
   PERSIST_PAGED_CACHE_DEFAULT,
   resolveCacheDisk,
   resolvePersistPagedCache,
+  parseThinkingEndText,
   resolveLogDir,
   resolveMlxNodeHome,
+  THINKING_END_TEXT_MAX,
+  WHOLE_PROMPT_CAPTURE_BLOCKS,
+  WHOLE_PROMPT_CAPTURE_BUDGET_MS,
   type InferenceHost,
   type InferenceHostOptions,
   type PersistPagedCache,
@@ -98,9 +102,21 @@ Options:
                       (default: auto).
   --cache-dir <dir>   Where the persistent Qwen3.5 state tier keeps its files
                       (default: ~/.mlx-node/cache/prefix-cache).
+  --persist-whole-prompt  With the disk cache on, let one turn of Qwen3, Gemma4,
+                      Muse-Glimmer and LFM2 write the whole prompt to the
+                      cold tier: up to ${WHOLE_PROMPT_CAPTURE_BLOCKS} blocks within ${WHOLE_PROMPT_CAPTURE_BUDGET_MS} ms,
+                      where MLX_COLD_CAPTURE_BLOCKS_PER_TURN /
+                      MLX_COLD_CAPTURE_BUDGET_MS hold no number (default: 128
+                      blocks, 250 ms); not the Qwen3.5 state tier. The turn
+                      ends after the write. \`mlx agent\` passes it.
   --thinking-token-budget <n>  Thinking tokens of a thinking request that
                       sets no budget, after which its thinking closes
                       (default: no cap).
+  --thinking-cycle-guard  Close a thought that repeats one exact block of
+                      tokens: twice, over at least 512 tokens (default: off).
+  --thinking-end-text <text>  Text written before the close when the budget or
+                      the guard ends a thought, 1 to 512 characters (default:
+                      the close alone). \`mlx agent\` passes all three.
   --rerank-config <file>    JSON { policy?, families?, service? } for rerank limits
   --auth-token <tok>  Require this secret on every route except /health,
                       as \`x-api-key\` or \`authorization: Bearer\`. Also
@@ -141,7 +157,12 @@ export interface ServeArgs {
   /** `--persist-cache` (true) or `--no-persist-cache` (false); unset when neither was given. */
   persistPagedCache?: boolean;
   cacheDir?: string;
+  /** `--persist-whole-prompt`; unset when not given. */
+  persistWholePrompt?: true;
   thinkingTokenBudget?: number;
+  /** `--thinking-cycle-guard`; unset when not given. */
+  thinkingCycleGuard?: true;
+  thinkingEndText?: string;
   rerankConfig?: string;
   logDir?: string;
 }
@@ -179,7 +200,10 @@ export function parseServeArgs(
       'persist-cache': { type: 'boolean' },
       'no-persist-cache': { type: 'boolean' },
       'cache-dir': { type: 'string' },
+      'persist-whole-prompt': { type: 'boolean' },
       'thinking-token-budget': { type: 'string' },
+      'thinking-cycle-guard': { type: 'boolean' },
+      'thinking-end-text': { type: 'string' },
       'rerank-config': { type: 'string' },
       'auth-token': { type: 'string' },
       verbose: { type: 'boolean', short: 'v', default: false },
@@ -230,6 +254,8 @@ export function parseServeArgs(
   });
   const budgetText = values['thinking-token-budget'];
   const thinkingTokenBudget = budgetText === undefined ? undefined : parseThinkingTokenBudget(budgetText);
+  const endText = values['thinking-end-text'];
+  const thinkingEndText = endText === undefined ? undefined : parseServeEndText(endText);
   const verbose = (values.verbose ?? false) || values['log-dir'] != null;
 
   return {
@@ -248,7 +274,10 @@ export function parseServeArgs(
     cacheDisk,
     ...(persistPagedCache !== undefined ? { persistPagedCache } : {}),
     ...(cacheDir !== undefined ? { cacheDir } : {}),
+    ...(values['persist-whole-prompt'] === true ? { persistWholePrompt: true as const } : {}),
     ...(thinkingTokenBudget !== undefined ? { thinkingTokenBudget } : {}),
+    ...(values['thinking-cycle-guard'] === true ? { thinkingCycleGuard: true as const } : {}),
+    ...(thinkingEndText !== undefined ? { thinkingEndText } : {}),
     ...(values['rerank-config'] !== undefined ? { rerankConfig: values['rerank-config'] } : {}),
     authToken: values['auth-token'],
     logDir: verbose ? resolveLogDir(values['log-dir'], resolveMlxNodeHome()) : undefined,
@@ -275,6 +304,14 @@ function parseThinkingTokenBudget(text: string): number {
     throw new Error(`Invalid --thinking-token-budget "${text}": expected a nonnegative integer.`);
   }
   return value;
+}
+
+function parseServeEndText(text: string): string {
+  try {
+    return parseThinkingEndText(text);
+  } catch {
+    throw new Error(`Invalid --thinking-end-text: expected 1 to ${THINKING_END_TEXT_MAX} characters.`);
+  }
 }
 
 /** Seams injected only by tests; production callers pass nothing. */
@@ -323,12 +360,16 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       persistPagedCache: persistOption(args.persistPagedCache),
       ...(args.cacheDir !== undefined ? { cacheDir: args.cacheDir } : {}),
       ...(args.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: args.thinkingTokenBudget } : {}),
+      ...(args.persistWholePrompt === true ? { persistWholePrompt: true } : {}),
+      ...(args.thinkingCycleGuard === true ? { thinkingCycleGuard: true } : {}),
+      ...(args.thinkingEndText !== undefined ? { thinkingEndText: args.thinkingEndText } : {}),
       ...(await readRerankConfig(args.rerankConfig)),
       authToken: args.authToken,
       logDir: args.logDir,
       // Same paged-prefill chunking `mlx launch claude` applies. A value
       // already in the environment wins; see `env-policy.ts`.
       enginePolicy: LAUNCHER_ENGINE_POLICY,
+      hostKind: 'serve',
       ...deps.hostOverrides,
     });
   } catch (err) {
@@ -351,6 +392,10 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
   );
   console.log(`[mlx] paged KV disk cache: ${host.persistPagedCache ? 'on' : 'off'}`);
   if (host.logDir !== null) console.log(`[mlx] verbose logging → ${host.logDir}`);
+  if (host.coldCapture !== null)
+    console.log(
+      `[mlx] paged KV disk capture per turn: ${host.coldCapture.blocksPerTurn} blocks, ${host.coldCapture.budgetMs} ms`,
+    );
   console.log('Press Ctrl+C to stop.');
 
   if (args.preload !== undefined) {

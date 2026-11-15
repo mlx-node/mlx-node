@@ -1,5 +1,5 @@
 /**
- * The caller's end of the dashboard RPC: `call` / `subscribe` over one
+ * The caller's end of the dashboard RPC: `call` / `subscribe` / `watchLive` / `watchChat` over one
  * {@link RpcPort}, shaped so no caller can hang.
  *
  * `call` mirrors `runtime.call` exactly — same argument, same
@@ -9,49 +9,43 @@
  * branch on instead of a bare rejection it can only stringify.
  *
  * Three independent things can stop an ordinary reply from arriving: the peer
- * closing (the port's `close` event), the peer wedging (the per-request deadline
- * starts an acknowledged cancellation), and the payload being unclonable
- * (`postMessage` throws synchronously before the message ever leaves).
+ * closing (the port's `close` event), a slow peer (the per-request deadline
+ * starts an acknowledged cancellation, and the grace after it fails that one
+ * call with `E_TIMEOUT`), and the payload being unclonable (`postMessage` throws
+ * synchronously before the message ever leaves).
  *
- * A MessagePort cannot kill its peer. The required `onUnresponsive` hook is the
- * supervision seam: a generic caller with no way to tear down the peer cannot
- * provide both a finite bound and the guarantee that queued mutations are dead.
+ * The page never judges whether the peer is alive. A call with no reply fails
+ * alone; streams and other calls are untouched.
  *
  * No `node:` imports — this module runs in the renderer.
  */
 
 import { failure, type ApiResponse } from '../api/errors.js';
+import type { ChatHostEvent, ConversationEvent } from '../chat/types.js';
 import type { DownloadEvent } from '../download.js';
+import type { LiveEvent } from '../live.js';
 import type { ApiCall } from '../runtime.js';
 import type { RpcPort } from './port.js';
-import { isRpcReply, type RpcRequest } from './protocol.js';
+import { isRpcReply, type ChatScope, type RpcRequest } from './protocol.js';
 
-/**
- * Per-request cancellation deadline. It is generous: its job is to detect a
- * wedged peer, not police slow queries. Expiry does not itself assert failure —
- * the original call stays pending for the runtime's acknowledged skip or real
- * result.
- */
+/** Per-request deadline: at expiry the client asks the host to withdraw the call. */
 const DEFAULT_TIMEOUT_MS = 30_000;
-/** How long an acknowledged cancellation may take before the transport itself is declared wedged. */
+/** After the withdrawal request, how long the original reply may still take before the call fails with `E_TIMEOUT`. */
 const DEFAULT_CANCELLATION_GRACE_MS = 5_000;
 
 export interface RpcClientOptions {
   /** Delay before requesting acknowledged cancellation. Defaults to 30 s. */
   timeoutMs?: number;
-  /**
-   * Hard bound after cancellation is requested. Expiry asks the supervisor to
-   * replace the whole transport. Defaults to 5 s.
-   */
+  /** Bound after cancellation is requested; expiry fails that call with `E_TIMEOUT`. Defaults to 5 s. */
   cancellationGraceMs?: number;
-  /**
-   * Called synchronously when the cancellation grace expires. The desktop shell
-   * uses this to restart the supervised runtime whose transport stopped making
-   * progress. Old calls remain pending until the old port closes or returns an
-   * authoritative response. The hook must initiate peer teardown; locally
-   * closing this port is not a substitute for proving queued work is dead.
-   */
-  onUnresponsive(reason: string): void;
+  /** Called once when the peer closed the port. Never called after `close()`. */
+  onDown?(reason: string): void;
+}
+
+/** The failure of a call that got no reply of any kind within the deadline and its grace. */
+export function timeoutFailure(method: string, seconds: number): ApiResponse {
+  const base = `The app did not answer in ${String(seconds)} s.`;
+  return failure('E_TIMEOUT', method === 'GET' ? base : `${base} The change may or may not have been applied.`);
 }
 
 export interface RpcClient {
@@ -59,6 +53,10 @@ export interface RpcClient {
   call(call: ApiCall): Promise<ApiResponse>;
   /** Subscribe to a download job's progress events; returns the unsubscribe. */
   subscribe(jobId: string, listener: (event: DownloadEvent) => void): () => void;
+  /** Subscribe to live engine state and data-change events; returns the unsubscribe. */
+  watchLive(listener: (event: LiveEvent) => void): () => void;
+  /** Open a Chat stream (host state, or one conversation); returns the unsubscribe. */
+  watchChat(scope: ChatScope, listener: (event: ChatHostEvent | ConversationEvent) => void): () => void;
   /**
    * Stop new work and subscriptions, then drain in-flight calls to an
    * acknowledged cancellation or real result before closing the port.
@@ -67,27 +65,41 @@ export interface RpcClient {
   close(): void;
 }
 
-export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClient {
+export function createRpcClient(port: RpcPort, opts: RpcClientOptions = {}): RpcClient {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const cancellationGraceMs = opts.cancellationGraceMs ?? DEFAULT_CANCELLATION_GRACE_MS;
+  const timeoutSeconds = Math.round((timeoutMs + cancellationGraceMs) / 1000);
 
   const pending = new Map<
     number,
     {
       settle: (response: ApiResponse) => void;
+      method: string;
       timer: ReturnType<typeof setTimeout>;
       cancellationRequested: boolean;
     }
   >();
   const listeners = new Map<number, (event: DownloadEvent) => void>();
+  const liveListeners = new Map<number, (event: LiveEvent) => void>();
+  const chatListeners = new Map<number, (event: ChatHostEvent | ConversationEvent) => void>();
   let nextId = 1;
   /** Set once no further reply can arrive; every later call fails fast instead of waiting out its deadline. */
   let down: string | null = null;
 
   let closed = false;
   let portFinished = false;
-  let recoveryStarted = false;
+  let downReported = false;
   let detach = (): void => {};
+
+  const reportDown = (reason: string): void => {
+    if (downReported) return;
+    downReported = true;
+    try {
+      opts.onDown?.(reason);
+    } catch {
+      // Runs from the port's own event dispatch or a timer; nothing could catch it.
+    }
+  };
 
   const finishClose = (): void => {
     if (!closed || portFinished || pending.size > 0) return;
@@ -107,6 +119,8 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
     const waiting = [...pending.values()];
     pending.clear();
     listeners.clear();
+    liveListeners.clear();
+    chatListeners.clear();
     for (const entry of waiting) {
       clearTimeout(entry.timer);
       entry.settle(failure('E_UNAVAILABLE', `Dashboard runtime is unavailable: ${down}`));
@@ -124,6 +138,14 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
         listeners.get(data.id)?.(data.event);
         return;
       }
+      if (data.kind === 'live') {
+        liveListeners.get(data.id)?.(data.event);
+        return;
+      }
+      if (data.kind === 'chat') {
+        chatListeners.get(data.id)?.(data.event);
+        return;
+      }
       const entry = pending.get(data.id);
       // No entry means the request already settled or the client went down.
       // Dropping the late reply is what keeps a caller from being settled twice.
@@ -136,6 +158,7 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
     onClose(): void {
       closed = true;
       goDown('the message port was closed; call outcome is unknown');
+      reportDown('the message port was closed');
     },
   });
 
@@ -143,29 +166,20 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
     port.postMessage(request);
   };
 
-  const startRecovery = (reason: string): void => {
-    if (recoveryStarted || portFinished) return;
-    recoveryStarted = true;
-    closed = true;
-    down = `${reason}; runtime recovery is in progress`;
-    listeners.clear();
-    for (const entry of pending.values()) clearTimeout(entry.timer);
-    // Do NOT settle or locally close the port here. Posting the recovery signal
-    // is not proof that queued work is dead. The old process's port-close event
-    // is the teardown witness; until then only an authoritative original
-    // response may settle a call.
-    try {
-      opts.onUnresponsive(reason);
-    } catch {
-      // A recovery hook runs from a timer callback. It must not throw through
-      // the browser's event loop; the old call remains pending for a real
-      // response or a peer-close witness.
-    }
+  const expire = (id: number, entry: { settle: (response: ApiResponse) => void; method: string }): void => {
+    // No reply of any kind for the whole deadline and grace. Only THIS call fails: whether the peer is alive is
+    // MAIN's to judge, never one slow reply's. A late reply finds no entry and is dropped.
+    if (pending.get(id) !== entry) return;
+    pending.delete(id);
+    entry.settle(timeoutFailure(entry.method, timeoutSeconds));
+    finishClose();
   };
 
   const requestCancellation = (
     id: number,
     entry: {
+      settle: (response: ApiResponse) => void;
+      method: string;
       timer: ReturnType<typeof setTimeout>;
       cancellationRequested: boolean;
     },
@@ -176,16 +190,43 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
     try {
       post({ kind: 'cancel', id });
     } catch {
-      startRecovery('the cancellation request could not cross the message port');
-      return;
+      // The withdrawal could not cross; the grace below still bounds the call.
     }
-    entry.timer = setTimeout(() => {
-      // A responsive host answers the ORIGINAL request with either its real
-      // result or an acknowledged withdrawal. Silence beyond this second
-      // deadline means the transport cannot be trusted to retire queued work.
-      if (pending.get(id) !== entry) return;
-      startRecovery('the runtime did not acknowledge cancellation before the recovery deadline');
-    }, cancellationGraceMs);
+    entry.timer = setTimeout(() => expire(id, entry), cancellationGraceMs);
+  };
+
+  /** Register `listener` under a fresh id and post the opening request; returns the unsubscribe. */
+  const open = <E>(
+    registry: Map<number, (event: E) => void>,
+    listener: (event: E) => void,
+    request: (id: number) => RpcRequest,
+  ): (() => void) => {
+    // A dead port can deliver nothing; hand back an inert unsubscribe rather
+    // than register a listener that would leak until `close()`.
+    if (down !== null) return () => {};
+    const id = nextId++;
+    registry.set(id, listener);
+    try {
+      post(request(id));
+    } catch {
+      registry.delete(id);
+      return () => {};
+    }
+    let live = true;
+    return () => {
+      if (!live) return;
+      live = false;
+      // Local first: an event the host posted before the unsubscribe reached it
+      // is already in flight, and dropping the listener here is the only thing
+      // that stops it being delivered after the caller asked it to stop.
+      registry.delete(id);
+      if (down !== null) return;
+      try {
+        post({ kind: 'unsubscribe', id });
+      } catch {
+        // The peer is gone; its subscription died with it.
+      }
+    };
   };
 
   return {
@@ -199,7 +240,7 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
           const entry = pending.get(id);
           if (entry !== undefined) requestCancellation(id, entry);
         }, timeoutMs);
-        pending.set(id, { settle: resolve, timer, cancellationRequested: false });
+        pending.set(id, { settle: resolve, method: apiCall.method, timer, cancellationRequested: false });
         try {
           post({ kind: 'call', id, call: apiCall });
         } catch (err) {
@@ -219,43 +260,27 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
     },
 
     subscribe(jobId: string, listener: (event: DownloadEvent) => void): () => void {
-      // A dead port can deliver nothing; hand back an inert unsubscribe rather
-      // than register a listener that would leak until `close()`.
-      if (down !== null) return () => {};
-      const id = nextId++;
-      listeners.set(id, listener);
-      try {
-        post({ kind: 'subscribe', id, jobId });
-      } catch {
-        listeners.delete(id);
-        return () => {};
-      }
-      let live = true;
-      return () => {
-        if (!live) return;
-        live = false;
-        // Local first: an event the host posted before the unsubscribe reached it
-        // is already in flight, and dropping the listener here is the only thing
-        // that stops it being delivered after the caller asked it to stop.
-        listeners.delete(id);
-        if (down !== null) return;
-        try {
-          post({ kind: 'unsubscribe', id });
-        } catch {
-          // The peer is gone; its subscription died with it.
-        }
-      };
+      return open(listeners, listener, (id) => ({ kind: 'subscribe', id, jobId }));
+    },
+
+    watchLive(listener: (event: LiveEvent) => void): () => void {
+      return open(liveListeners, listener, (id) => ({ kind: 'watch', id, topic: 'live' }));
+    },
+
+    watchChat(scope: ChatScope, listener: (event: ChatHostEvent | ConversationEvent) => void): () => void {
+      return open(chatListeners, listener, (id) => ({ kind: 'chat', id, ...scope }));
     },
 
     close(): void {
       if (closed) return;
       closed = true;
+      downReported = true;
       down = 'the client was closed';
 
       // Subscriptions have no terminal acknowledgement to wait for. Drop local
       // delivery immediately and ask the host to release each registration
       // while the old port remains alive for pending calls.
-      for (const id of listeners.keys()) {
+      for (const id of [...listeners.keys(), ...liveListeners.keys(), ...chatListeners.keys()]) {
         try {
           post({ kind: 'unsubscribe', id });
         } catch {
@@ -263,15 +288,14 @@ export function createRpcClient(port: RpcPort, opts: RpcClientOptions): RpcClien
         }
       }
       listeners.clear();
+      liveListeners.clear();
+      chatListeners.clear();
 
       // A graceful reconnect is not permission to guess the outcome of old
-      // mutations. Stop their timers, request cancellation, and retain both the
-      // listener and port until each receives an acknowledged skip or the real
-      // result of already-started work.
-      for (const [id, entry] of pending) {
-        requestCancellation(id, entry);
-        if (recoveryStarted) return;
-      }
+      // mutations. Request cancellation and retain the port until each call gets
+      // an acknowledged skip, the real result of already-started work, or its
+      // `E_TIMEOUT` after the grace.
+      for (const [id, entry] of pending) requestCancellation(id, entry);
       finishClose();
     },
   };

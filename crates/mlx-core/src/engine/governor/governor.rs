@@ -33,8 +33,8 @@ const MIB: u64 = 1 << 20;
 /// Splash `MemoryStatusReporter`'s decision log length.
 const DECISIONS_KEPT: usize = 64;
 /// Splash `supervision::kStartRetryWindow` and `kStartupMemoryRecoveryPoll`.
-const START_RETRY_SECONDS: f64 = 30.0;
-const START_POLL_SECONDS: f64 = 1.0;
+pub(crate) const START_RETRY_SECONDS: f64 = 30.0;
+pub(crate) const START_POLL_SECONDS: f64 = 1.0;
 
 /// The counters `charged` is made of: MLX active and free-pool bytes, and
 /// the paged pools registered with the cache-limit coordinator, which sit
@@ -151,6 +151,8 @@ thread_local! {
     /// What refused this thread's latest pool load, and the stage it
     /// reached (Splash `RuntimeBootstrapReport`).
     static START_REFUSAL: Cell<Option<(Failure, u8)>> = const { Cell::new(None) };
+    /// This thread's allocations are the start's (Splash's start claim).
+    static START: Cell<bool> = const { Cell::new(false) };
     static CANCEL: std::cell::RefCell<Option<Arc<AtomicBool>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -176,6 +178,49 @@ impl Drop for CancelScope {
         let previous = self.previous.take();
         CANCEL.with(|cancel| *cancel.borrow_mut() = previous);
     }
+}
+
+/// While one lives, this thread's allocations are the start's: class
+/// `Floor`, one attempt, nothing freed, and a refused one fails its request
+/// (Splash's start claim around its runway, arenas and warm-up). It
+/// restores the value it replaced.
+pub(crate) struct StartScope {
+    previous: bool,
+    _thread: PhantomData<*const ()>,
+}
+
+impl StartScope {
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: START.replace(true),
+            _thread: PhantomData,
+        }
+    }
+}
+
+impl Drop for StartScope {
+    fn drop(&mut self) {
+        START.set(self.previous);
+    }
+}
+
+/// Whether this thread's allocations are the start's.
+pub(crate) fn starting() -> bool {
+    START.get()
+}
+
+/// A turn the start runs failed for `failure`: left for the start's retry.
+pub(crate) fn start_refused(failure: Option<Failure>) {
+    if starting()
+        && let Some(failure) = failure
+    {
+        START_REFUSAL.set(Some((failure, START_WARMUP)));
+    }
+}
+
+/// What failed a turn of the start since the last take.
+pub(crate) fn take_start_refusal() -> Option<(Failure, u8)> {
+    START_REFUSAL.take()
 }
 
 /// The turn this thread runs was cancelled.
@@ -567,6 +612,29 @@ struct ModelEntry {
     scheduler: Option<Arc<SchedulerCounters>>,
     /// What the model thread last published.
     dflash2_states: DFlash2StateStatus,
+}
+
+/// Every per-model counter or timer a request moves, except `epoch`. The
+/// process-wide refusal counters are not in them: another model's requests
+/// move those. The published copies (`accounts`, `dflash2_states`) are not
+/// here: the warm-up republishes them. `scheduler` is never set by a
+/// scratch scheduler. A field a request moves that is added to the model's
+/// entry belongs here and in [`Governor::restore_model_books`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ModelBooks {
+    pub metal_out_of_memory: u64,
+    pub gpu_oom: bool,
+    pub suspensions: u64,
+    pub resumptions: u64,
+    pub replans: u64,
+    pub drain_end: f64,
+    pub allocation_failed: bool,
+    pub publications_refused: u64,
+    pub waits: ResourceWaitStatus,
+    pub wanted: Arc<WantedChains>,
+    pub next_control: f64,
+    pub next_host_pass: f64,
+    pub open_claims: usize,
 }
 
 /// One model's scheduler as the status reads it.
@@ -1025,6 +1093,16 @@ impl Governor {
         })
     }
 
+    /// Empties MLX's free pool, which the charge counts although its
+    /// buffers hold no live array. True when it held bytes.
+    pub(crate) fn clear_free_pool(&self) -> bool {
+        if self.io.stats().cache == 0 {
+            return false;
+        }
+        self.io.clear_cache();
+        true
+    }
+
     /// Metal returned no buffer for `bytes` the scope's claim was admitted:
     /// a refusal of the same bytes (Splash `allocationAdmission` catching
     /// `MetalAllocationError`).
@@ -1366,6 +1444,16 @@ impl Governor {
         metrics.capacity_exhausted = metrics.capacity_exhausted.saturating_add(1);
     }
 
+    /// A turn failed `capacity_exhausted` for `failure`. A turn the start
+    /// runs is not a request: its failure is left for the start's retry.
+    pub(crate) fn turn_exhausted(&self, failure: Option<Failure>) {
+        if starting() {
+            start_refused(failure);
+        } else {
+            self.capacity_exhausted();
+        }
+    }
+
     pub(crate) fn metrics(&self) -> Metrics {
         self.metrics_lock().clone()
     }
@@ -1679,6 +1767,66 @@ impl Governor {
         noted
     }
 
+    /// The books a request of `model` can move, as numbers.
+    pub(crate) fn model_books(&self, model: u64) -> ModelBooks {
+        let mut books = self.lock();
+        let open_claims = books.ledger.open_claims(model);
+        let mut out = ModelBooks {
+            open_claims,
+            ..ModelBooks::default()
+        };
+        if let Some(entry) = books.model(model) {
+            out.metal_out_of_memory = entry.metal_out_of_memory;
+            out.gpu_oom = entry.gpu_oom;
+            out.suspensions = entry.suspensions;
+            out.resumptions = entry.resumptions;
+            out.replans = entry.replans;
+            out.drain_end = entry.drain_end;
+            out.allocation_failed = entry.allocation_failed;
+            out.publications_refused = entry.publications_refused;
+            out.waits = entry.waits;
+            out.wanted = Arc::clone(&entry.wanted);
+            out.next_control = entry.next_control;
+            out.next_host_pass = entry.next_host_pass;
+        }
+        out
+    }
+
+    /// Writes `books` back as `model`'s, all but its open claims (the
+    /// ledger's). The epoch keeps moving: a wait only needs it to differ.
+    pub(crate) fn restore_model_books(&self, model: u64, books: &ModelBooks) {
+        let mut guard = self.lock();
+        let Some(entry) = guard.model(model) else {
+            return;
+        };
+        entry.metal_out_of_memory = books.metal_out_of_memory;
+        entry.gpu_oom = books.gpu_oom;
+        entry.suspensions = books.suspensions;
+        entry.resumptions = books.resumptions;
+        entry.replans = books.replans;
+        entry.drain_end = books.drain_end;
+        entry.allocation_failed = books.allocation_failed;
+        entry.publications_refused = books.publications_refused;
+        entry.waits = books.waits;
+        entry.wanted = Arc::clone(&books.wanted);
+        entry.next_control = books.next_control;
+        entry.next_host_pass = books.next_host_pass;
+    }
+
+    /// The accounts `model`'s thread last published.
+    #[cfg(test)]
+    pub(crate) fn published_accounts(&self, model: u64) -> Option<MemoryAccounts> {
+        let published = self
+            .lock()
+            .model(model)
+            .map(|entry| Arc::clone(&entry.accounts))?;
+        Some(MemoryAccounts {
+            kv: published.kv.load(Ordering::Relaxed),
+            states: published.states.load(Ordering::Relaxed),
+            embeddings: published.embeddings.load(Ordering::Relaxed),
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn metal_out_of_memory(&self, model: u64) -> u64 {
         self.lock()
@@ -1690,6 +1838,7 @@ impl Governor {
 /// The stages a start reaches, in order (Splash `RuntimeResourceStage`).
 const START_REGISTER: u8 = 1;
 const START_RUNWAY: u8 = 2;
+pub(crate) const START_WARMUP: u8 = 3;
 
 /// Splash `StartupRetryWindow`: a start the host or the Metal driver
 /// refused is retried for 30 s from its first refusal, and again from a

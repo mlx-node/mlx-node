@@ -11,7 +11,9 @@ import { MessageChannel, type MessagePort } from 'node:worker_threads';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { failure, type ApiResponse } from '../src/api/errors.js';
+import type { ChatHostEvent, ConversationEvent } from '../src/chat/types.js';
 import type { DownloadEvent } from '../src/download.js';
+import type { LiveEvent } from '../src/live.js';
 import { createRpcClient, type RpcClient } from '../src/rpc/client.js';
 import { serveRuntimeOverPort, type RpcRuntime } from '../src/rpc/host.js';
 import {
@@ -21,7 +23,7 @@ import {
   type EventTargetPort,
   type RpcPortEvents,
 } from '../src/rpc/port.js';
-import type { RpcRequest } from '../src/rpc/protocol.js';
+import { isRpcReply, isRpcRequest, type RpcRequest } from '../src/rpc/protocol.js';
 import type { ApiCall } from '../src/runtime.js';
 
 const cleanups: Array<() => void> = [];
@@ -66,12 +68,17 @@ interface Stub {
   emit(jobId: string, event: DownloadEvent): void;
   /** How many `runtime.subscribe` registrations are still live. */
   liveSubscriptions(): number;
+  /** Fire a live event at every watcher. */
+  emitLive(event: LiveEvent): void;
+  /** How many `runtime.watchLive` registrations are still live. */
+  liveWatchers(): number;
   calls: ApiCall[];
   signals: Array<AbortSignal | undefined>;
 }
 
 function stubRuntime(answer?: (call: ApiCall, signal?: AbortSignal) => ApiResponse | Promise<ApiResponse>): Stub {
   const subscribers = new Map<number, { jobId: string; listener: (event: DownloadEvent) => void }>();
+  const watchers = new Map<number, (event: LiveEvent) => void>();
   let nextKey = 1;
   const calls: ApiCall[] = [];
   const signals: Array<AbortSignal | undefined> = [];
@@ -91,6 +98,13 @@ function stubRuntime(answer?: (call: ApiCall, signal?: AbortSignal) => ApiRespon
           subscribers.delete(key);
         };
       },
+      watchLive(listener: (event: LiveEvent) => void): () => void {
+        const key = nextKey++;
+        watchers.set(key, listener);
+        return () => {
+          watchers.delete(key);
+        };
+      },
     },
     emit(jobId: string, event: DownloadEvent): void {
       for (const s of subscribers.values()) if (s.jobId === jobId) s.listener(event);
@@ -98,13 +112,19 @@ function stubRuntime(answer?: (call: ApiCall, signal?: AbortSignal) => ApiRespon
     liveSubscriptions(): number {
       return subscribers.size;
     },
+    emitLive(event: LiveEvent): void {
+      for (const listener of watchers.values()) listener(event);
+    },
+    liveWatchers(): number {
+      return watchers.size;
+    },
   };
 }
 
 /** A live client/host pair over a real MessageChannel. */
 function connected(
   stub: Stub,
-  opts: { timeoutMs?: number; cancellationGraceMs?: number; onUnresponsive?(reason: string): void } = {},
+  opts: { timeoutMs?: number; cancellationGraceMs?: number } = {},
 ): { client: RpcClient; dispose: () => void; hostPort: MessagePort; clientPort: MessagePort } {
   const { port1, port2 } = new MessageChannel();
   // Never hold the event loop open on a test channel's account.
@@ -113,13 +133,7 @@ function connected(
   // No cast: `node:worker_threads`' MessagePort satisfies `EventTargetPort`
   // structurally, which is the point of keeping that interface to four members.
   const dispose = serveRuntimeOverPort(stub.runtime, bindEventTargetPort(port2));
-  const client = createRpcClient(bindEventTargetPort(port1), {
-    ...opts,
-    onUnresponsive(reason): void {
-      if (opts.onUnresponsive === undefined) port2.close();
-      else opts.onUnresponsive(reason);
-    },
-  });
+  const client = createRpcClient(bindEventTargetPort(port1), opts);
   cleanups.push(() => {
     client.close();
     dispose();
@@ -342,10 +356,11 @@ describe('rpc request/response', () => {
 });
 
 describe('rpc never hangs a caller', () => {
-  it('takes down a transport that stays silent after cancellation without claiming the mutation was cancelled', async () => {
+  it('fails only the silent call with E_TIMEOUT at 35 s; streams, later calls and the port stay', async () => {
     vi.useFakeTimers();
     try {
       const order: string[] = [];
+      const downs: string[] = [];
       let closes = 0;
       let events: RpcPortEvents | undefined;
       const client = createRpcClient(
@@ -364,71 +379,81 @@ describe('rpc never hangs a caller', () => {
             order.push('closed');
           },
         },
-        {
-          timeoutMs: 100,
-          cancellationGraceMs: 50,
-          onUnresponsive: () => order.push('recover'),
-        },
+        { onDown: (reason) => downs.push(reason) },
       );
+      const chat: Array<ChatHostEvent | ConversationEvent> = [];
+      client.watchChat({ scope: 'conversation', conversationId: 'c1' }, (event) => chat.push(event));
+      const streamId = 1;
 
+      let settled = false;
       const response = client.call({ method: 'DELETE', path: '/api/models/queued' }).then((result) => {
-        order.push('settled');
+        settled = true;
         return result;
       });
-      await vi.advanceTimersByTimeAsync(100);
-      expect(order).toEqual(['call', 'cancel']);
-
-      // The first deadline only requests withdrawal. The original response is
-      // still authoritative throughout the grace window.
-      await vi.advanceTimersByTimeAsync(49);
-      expect(order).toEqual(['call', 'cancel']);
-
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(order).toEqual(['chat', 'call']);
       await vi.advanceTimersByTimeAsync(1);
-      expect(order).toEqual(['call', 'cancel', 'recover']);
-      expect(closes).toBe(0);
-
-      // Merely posting the recovery request is not proof that the queued
-      // mutation died. The old process's port close is that witness.
-      events!.onClose();
+      // 30 s: the host is asked to withdraw it; the original reply still counts for 5 s more.
+      expect(order).toEqual(['chat', 'call', 'cancel']);
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
       const result = await response;
-      expect(result).toMatchObject({ ok: false, code: 'E_UNAVAILABLE', status: 503 });
-      expect((result as { message: string }).message).toMatch(/outcome is unknown/i);
-      expect((result as { message: string }).message).not.toMatch(/cancellation acknowledged/i);
-      // Recovery is requested before the peer-death witness exposes the unknown
-      // outcome, and the suspect port is then retired.
-      expect(order).toEqual(['call', 'cancel', 'recover', 'detached', 'closed', 'settled']);
-      expect(closes).toBe(1);
+      expect(result).toMatchObject({ ok: false, code: 'E_TIMEOUT', status: 504 });
+      expect((result as { message: string }).message).toBe(
+        'The app did not answer in 35 s. The change may or may not have been applied.',
+      );
+      // Nothing else happened: no recovery, no port teardown, no down report.
+      expect(order).toEqual(['chat', 'call', 'cancel']);
+      expect([closes, downs]).toEqual([0, []]);
+
+      // The stream opened before still delivers.
+      const event = { type: 'gone', seq: 1, reason: 'unknown' } as ConversationEvent;
+      events!.onMessage({ kind: 'chat', id: streamId, event });
+      expect(chat).toEqual([event]);
+
+      // The late reply of the timed-out call is dropped, and a new call works.
+      const next = client.call({ method: 'GET', path: '/api/models' });
+      events!.onMessage({ kind: 'response', id: 2, response: { ok: true, status: 200, body: 'late' } });
+      events!.onMessage({ kind: 'response', id: 3, response: { ok: true, status: 200, body: 'fresh' } });
+      expect(await next).toEqual({ ok: true, status: 200, body: 'fresh' });
+      expect(await response).toMatchObject({ code: 'E_TIMEOUT' });
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('bounds graceful close when its cancellation acknowledgement never arrives', async () => {
+  it('names a GET timeout without the mutation clause', async () => {
+    vi.useFakeTimers();
+    try {
+      const client = createRpcClient({ postMessage: () => {}, listen: () => () => {}, close: () => {} });
+      const response = client.call({ method: 'GET', path: '/api/chat/conversations' });
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect(await response).toMatchObject({
+        ok: false,
+        code: 'E_TIMEOUT',
+        message: 'The app did not answer in 35 s.',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds graceful close: an unacknowledged cancellation ends in E_TIMEOUT, then the port closes', async () => {
     vi.useFakeTimers();
     try {
       const posted: RpcRequest[] = [];
       let closes = 0;
-      let recoveries = 0;
-      let events: RpcPortEvents | undefined;
       let settled = false;
       const client = createRpcClient(
         {
           postMessage: (message) => posted.push(message as RpcRequest),
-          listen(next): () => void {
-            events = next;
-            return () => {};
-          },
+          listen: () => () => {},
           close: () => {
             closes += 1;
           },
         },
-        {
-          timeoutMs: 60_000,
-          cancellationGraceMs: 25,
-          onUnresponsive: () => {
-            recoveries += 1;
-          },
-        },
+        { timeoutMs: 60_000, cancellationGraceMs: 25 },
       );
 
       const pending = client.call({ method: 'POST', path: '/api/models/queued' }).then((result) => {
@@ -438,17 +463,11 @@ describe('rpc never hangs a caller', () => {
       client.close();
       expect(posted.map((message) => message.kind)).toEqual(['call', 'cancel']);
       await vi.advanceTimersByTimeAsync(24);
-      expect(closes).toBe(0);
+      expect([closes, settled]).toEqual([0, false]);
 
       await vi.advanceTimersByTimeAsync(1);
-      expect(recoveries).toBe(1);
-      expect(closes).toBe(0);
-      expect(settled).toBe(false);
-
-      events!.onClose();
       const result = await pending;
-      expect(result).toMatchObject({ ok: false, code: 'E_UNAVAILABLE' });
-      expect((result as { message: string }).message).toMatch(/outcome is unknown/i);
+      expect(result).toMatchObject({ ok: false, code: 'E_TIMEOUT' });
       expect(closes).toBe(1);
     } finally {
       vi.useRealTimers();
@@ -469,7 +488,7 @@ describe('rpc never hangs a caller', () => {
         },
         close: () => {},
       },
-      { timeoutMs: 0, onUnresponsive: () => events?.onClose() },
+      { timeoutMs: 0 },
     );
 
     try {
@@ -551,7 +570,7 @@ describe('rpc never hangs a caller', () => {
     expect(settled).not.toBe('HUNG');
     for (const res of settled as ApiResponse[]) {
       expect(res).toMatchObject({ ok: false, code: 'E_UNAVAILABLE', status: 503 });
-      expect((res as { message: string }).message).toMatch(/call outcome is unknown/i);
+      expect((res as { message: string }).message).toContain('call outcome is unknown');
     }
   });
 
@@ -621,20 +640,17 @@ describe('rpc never hangs a caller', () => {
     const posted: RpcRequest[] = [];
     let detaches = 0;
     let closes = 0;
-    const client = createRpcClient(
-      {
-        postMessage(message: unknown): void {
-          posted.push(message as RpcRequest);
-        },
-        listen: () => () => {
-          detaches += 1;
-        },
-        close(): void {
-          closes += 1;
-        },
+    const client = createRpcClient({
+      postMessage(message: unknown): void {
+        posted.push(message as RpcRequest);
       },
-      { onUnresponsive: () => {} },
-    );
+      listen: () => () => {
+        detaches += 1;
+      },
+      close(): void {
+        closes += 1;
+      },
+    });
 
     const unsubscribe = client.subscribe('job', () => {});
     client.close();
@@ -661,7 +677,7 @@ describe('rpc never hangs a caller', () => {
     // synchronously and the request never leaves this side.
     const res = await within(client.call({ method: 'POST', path: '/api/ingest', body: () => 'nope' }), 1000);
     expect(res).toMatchObject({ ok: false, code: 'E_BAD_REQUEST', status: 400 });
-    expect((res as { message: string }).message).toMatch(/cannot cross the message port/i);
+    expect((res as { message: string }).message).toContain('cannot cross the message port');
     // Nothing was delivered, so the runtime never saw it.
     expect(stub.calls).toHaveLength(0);
   });
@@ -672,7 +688,7 @@ describe('rpc never hangs a caller', () => {
 
     const res = await within(client.call({ method: 'GET', path: '/api/models' }), 1000);
     expect(res).toMatchObject({ ok: false, code: 'E_INTERNAL', status: 500 });
-    expect((res as { message: string }).message).toMatch(/cannot cross the message port/i);
+    expect((res as { message: string }).message).toContain('cannot cross the message port');
   });
 });
 
@@ -772,5 +788,154 @@ describe('rpc subscriptions', () => {
     await flush();
 
     expect(seen).toEqual([]);
+  });
+});
+
+describe('rpc live watch', () => {
+  const DATA: LiveEvent = { type: 'data', version: 3, traces: true, runtime: false };
+
+  it('watch delivers live events and unsubscribe stops them', async () => {
+    const stub = stubRuntime();
+    const { client } = connected(stub);
+
+    const seen: LiveEvent[] = [];
+    const download: DownloadEvent[] = [];
+    const off = client.watchLive((e) => seen.push(e));
+    client.subscribe('job', (e) => download.push(e));
+    await flush();
+    expect(stub.liveWatchers()).toBe(1);
+
+    stub.emitLive(DATA);
+    stub.emit('job', PROGRESS);
+    await flush();
+    expect(seen).toEqual([DATA]);
+    expect(download).toEqual([PROGRESS]);
+
+    off();
+    stub.emitLive({ ...DATA, version: 4 });
+    await flush();
+    expect(seen).toEqual([DATA]);
+    expect(stub.liveWatchers()).toBe(0);
+    expect(stub.liveSubscriptions()).toBe(1);
+  });
+
+  it('rejects a watch with an unknown topic', async () => {
+    const stub = stubRuntime();
+    const { client, clientPort } = connected(stub);
+
+    const leaked: unknown[] = [];
+    clientPort.on('message', (m: unknown) => leaked.push(m));
+    clientPort.postMessage({ kind: 'watch', id: 95, topic: 'everything' });
+    clientPort.postMessage({ kind: 'watch', id: 96 });
+    await flush();
+    expect(stub.liveWatchers()).toBe(0);
+
+    stub.emitLive(DATA);
+    await flush();
+    expect(leaked).toEqual([]);
+    expect(await within(client.call({ method: 'GET', path: '/api/models' }))).not.toBe('HUNG');
+  });
+
+  it('releases every live watcher when the peer closes', async () => {
+    const stub = stubRuntime();
+    const { client, clientPort } = connected(stub);
+
+    client.watchLive(() => {});
+    await flush();
+    expect(stub.liveWatchers()).toBe(1);
+
+    clientPort.close();
+    await flush();
+    expect(stub.liveWatchers()).toBe(0);
+  });
+});
+
+describe('rpc chat streams', () => {
+  /** The stub runtime plus a `watchChat` that records each open scope and can push to it. */
+  function withChat(stub: Stub): {
+    scopes: string[];
+    open(): number;
+    push(event: ChatHostEvent | ConversationEvent): void;
+  } {
+    const sinks = new Map<number, (event: ChatHostEvent | ConversationEvent) => void>();
+    const scopes: string[] = [];
+    let key = 0;
+    stub.runtime.watchChat = (scope, send) => {
+      scopes.push(scope.scope === 'host' ? 'host' : scope.conversationId);
+      const k = key++;
+      sinks.set(k, send);
+      return () => {
+        sinks.delete(k);
+      };
+    };
+    return {
+      scopes,
+      open: () => sinks.size,
+      push: (event) => {
+        for (const send of sinks.values()) send(event);
+      },
+    };
+  }
+
+  const CHANGED: ChatHostEvent = { type: 'conversations-changed' };
+
+  it('opens a host and a conversation stream, delivers each its events, and closes on unsubscribe', async () => {
+    const stub = stubRuntime();
+    const chat = withChat(stub);
+    const { client } = connected(stub);
+    const host: unknown[] = [];
+    const conv: unknown[] = [];
+    const offHost = client.watchChat({ scope: 'host' }, (e) => host.push(e));
+    const offConv = client.watchChat({ scope: 'conversation', conversationId: 'c1' }, (e) => conv.push(e));
+    await flush();
+    expect(chat.scopes).toEqual(['host', 'c1']);
+    chat.push(CHANGED);
+    await flush();
+    expect(host).toEqual([CHANGED]);
+    expect(conv).toEqual([CHANGED]);
+    offConv();
+    await flush();
+    expect(chat.open()).toBe(1);
+    offHost();
+    await flush();
+    expect(chat.open()).toBe(0);
+  });
+
+  it('refuses a chat request with no scope or an empty conversation id', async () => {
+    const stub = stubRuntime();
+    const chat = withChat(stub);
+    const { clientPort } = connected(stub);
+    clientPort.postMessage({ kind: 'chat', id: 90 });
+    clientPort.postMessage({ kind: 'chat', id: 91, scope: 'conversation', conversationId: '' });
+    clientPort.postMessage({ kind: 'chat', id: 92, scope: 'conversation', conversationId: 7 });
+    clientPort.postMessage({ kind: 'chat', id: 93, scope: 'everything' });
+    await flush();
+    expect(chat.scopes).toEqual([]);
+    expect(isRpcRequest({ kind: 'chat', id: 1, scope: 'host' })).toBe(true);
+    expect(isRpcReply({ kind: 'chat', id: 1, event: CHANGED })).toBe(true);
+    expect(isRpcReply({ kind: 'chat', id: 1, event: null })).toBe(false);
+  });
+
+  it('releases every chat stream when the peer closes', async () => {
+    const stub = stubRuntime();
+    const chat = withChat(stub);
+    const { client, clientPort } = connected(stub);
+    client.watchChat({ scope: 'host' }, () => {});
+    client.watchChat({ scope: 'conversation', conversationId: 'c1' }, () => {});
+    await flush();
+    expect(chat.open()).toBe(2);
+    clientPort.close();
+    await flush();
+    expect(chat.open()).toBe(0);
+  });
+
+  it('opens nothing on a runtime without chat streams', async () => {
+    const stub = stubRuntime();
+    const { client } = connected(stub);
+    const seen: unknown[] = [];
+    client.watchChat({ scope: 'host' }, (e) => seen.push(e));
+    await flush();
+    expect(seen).toEqual([]);
+    expect(await within(client.call({ method: 'GET', path: '/api/models' }))).not.toBe('HUNG');
   });
 });

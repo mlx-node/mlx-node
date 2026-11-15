@@ -117,6 +117,16 @@ use crate::vision::qwen::cache::{VisionCache, VisionCacheInner, vlm_prepare_visi
 pub(crate) type Qwen35SchedulerState =
     crate::engine::hybrid_scheduler::HybridSchedulerState<Qwen35Inner>;
 
+/// The text admission width a dense or MoE load reports to the server:
+/// the decode lanes its plan granted (`lanes`).
+pub(crate) fn qwen35_max_concurrent_sequences(paged_active: bool, lanes: u32) -> u32 {
+    if paged_active && !Qwen35SchedulerState::force_serial() {
+        crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for(lanes as usize) as u32
+    } else {
+        1
+    }
+}
+
 // The shared model-id counter lives in `crate::engine::compiled_lock` so the
 // dense + MoE families draw from one id space (per-instance ids never
 // overlap). Re-exported here for unqualified use by this module's
@@ -247,7 +257,8 @@ pub(crate) struct Qwen35Inner {
     /// K/V remains in `paged_adapter`; each table value contains only the
     /// corresponding request's two GDN arrays at every linear layer.
     ///
-    /// The table has a two-unit cap. One state may be temporarily
+    /// The table caps live units at the plan's decode lanes (at most
+    /// eight). One state may be temporarily
     /// activated in `caches` for serial prefill/finalization, so activation
     /// first parks the previous owner and then removes the next owner from the
     /// table. Batched decode parks the active owner and stacks table rows.
@@ -490,6 +501,8 @@ use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk, ChatStreamHa
 pub struct Qwen3_5Model {
     /// Dedicated model thread for inference and training.
     pub(crate) thread: crate::model_thread::ModelThread<Qwen35Cmd>,
+    /// What the load's warm-up did; `None` for a load with no paged pool.
+    pub(crate) warmup: Option<crate::engine::warmup::WarmupReport>,
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5Config,
     /// Snapshot of `Qwen35Inner::paged_adapter.is_some()` captured at
@@ -498,6 +511,8 @@ pub struct Qwen3_5Model {
     /// flat path. Dense image turns only run on the paged-vision core. Surfaced
     /// through the `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
+    /// The decode lanes the load's memory plan granted.
+    pub(crate) scheduled_lanes: u32,
     /// Snapshot of `Qwen35Inner::has_speculative_weights()` captured
     /// at construction time, mirroring `paged_active`. Surfaced through
     /// the `hasMtpWeights()` NAPI method so the TS ChatSession can
@@ -523,6 +538,8 @@ pub struct Qwen3_5Model {
     /// For direct GGUF loads this is the lossless native-packed cache rather
     /// than the source file path.
     pub(crate) model_assets_path: String,
+    /// The model thread's state tier, never held open from here.
+    pub(crate) state_tier: crate::disk_tier::TierHandle,
     /// RAII: this model's baseline and its paged pool's debit with the
     /// cache-limit coordinator, released by `dispose` or on drop. The pool's
     /// entry must outlive every grow the adapter makes.
@@ -542,6 +559,20 @@ impl Qwen3_5Model {
     #[napi]
     pub fn model_assets_path(&self) -> String {
         self.model_assets_path.clone()
+    }
+    /// The directory name of the model's open persistent SSD cache under
+    /// its cache root, read from the cache itself; null without one, for a
+    /// temporary cache, and after `closeCache` or `dispose`.
+    #[napi]
+    pub fn state_tier_namespace(&self) -> Option<String> {
+        self.state_tier.namespace()
+    }
+
+    /// What the load's warm-up did; `null` for a load with no paged pool,
+    /// which runs none.
+    #[napi(getter)]
+    pub fn warmup(&self) -> Option<crate::engine::warmup::WarmupReport> {
+        self.warmup.clone()
     }
 
     /// Whether the block-paged KV cache adapter is active on this model
@@ -564,14 +595,7 @@ impl Qwen3_5Model {
     /// lane by the scheduler.
     #[napi]
     pub fn max_concurrent_sequences(&self) -> u32 {
-        if self.paged_active
-            && Qwen35SchedulerState::continuous_batching_enabled()
-            && !Qwen35SchedulerState::force_serial()
-        {
-            crate::engine::hybrid_scheduler::scheduler_max_num_seqs() as u32
-        } else {
-            1
-        }
+        qwen35_max_concurrent_sequences(self.paged_active, self.scheduled_lanes)
     }
 
     /// Whether this instance has an inline MTP head or external DFlash2
@@ -633,6 +657,7 @@ impl Qwen3_5Model {
     /// - tokenizer.json + tokenizer_config.json
     #[napi]
     pub async fn load(path: String, options: Option<Qwen35LoadOptions>) -> Result<Qwen3_5Model> {
+        let progress = crate::engine::load_progress::begin(&path);
         let options = options.unwrap_or_default();
         let disk = options.disk_tier("Qwen3.5")?;
         let draft_model_path = options.draft_model_path;
@@ -666,6 +691,7 @@ impl Qwen3_5Model {
             max_context,
             decode_share,
             disk,
+            progress.cell(),
         )
         .await;
         if loaded.is_err() {

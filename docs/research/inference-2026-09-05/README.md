@@ -40,7 +40,7 @@ This matches vLLM's separation of lookahead capacity and finalized prefix tokens
 | ------------------ | ------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
 | Gemma DSpark       | Fixed-depth text verification shares scheduler waves; greedy adaptive requests use measured allocation costs | Draft context, RNG, sliding/full KV frontiers and accepted target taps              |
 | Muse DFlash        | Scheduled verification requires `MLX_SCHEDULED_DFLASH=1`; default keeps the flat route                       | Draft KV and target-context provenance                                              |
-| Qwen dense/MoE MTP | Scheduled fixed-depth MTP requires `MLX_CONTINUOUS_BATCHING=1`; adaptive MTP retains its whole-turn lane     | Normalized target seed, draft KV history, GDN snapshot and tape slices              |
+| Qwen dense/MoE MTP | Fixed-depth MTP is scheduled by default; adaptive MTP retains its whole-turn lane                            | Normalized target seed, draft KV history, GDN snapshot and tape slices              |
 | Qwen DFlash2       | Retains its flat whole-turn route                                                                            | Exact flat-cache provenance; paged AR state cannot be reused as flat verifier state |
 
 Native MTP groups equal verifier widths so GDN sees `[N,T,H]`; only attention
@@ -235,7 +235,7 @@ without MTP cycles.
 MLX_TEST_REQUIRE_METAL=1 cargo test -p mlx-core --lib -- \
   --nocapture --skip models::qwen3_5::int8_gemm::tests --test-threads=1
 
-MLX_CONTINUOUS_BATCHING=1 MLX_PERSIST_PAGED_CACHE=0 MLX_AGENT_METRICS=0 \
+MLX_PERSIST_PAGED_CACHE=0 MLX_AGENT_METRICS=0 \
   oxnode docs/research/inference-2026-09-05/benchmarks/mtp-concurrent.ts \
   /absolute/binding/index.cjs /absolute/model /tmp/mtp.json revision-label Qwen35 1,2 2
 ```

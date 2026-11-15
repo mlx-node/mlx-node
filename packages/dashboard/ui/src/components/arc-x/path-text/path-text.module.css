@@ -1,0 +1,39 @@
+/* A path never breaks its line: it gives way with one ellipsis at the end. */
+.root {
+  display: inline-block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+  white-space: nowrap;
+}
+
+.root[data-mono] {
+  font-family: var(--font-code);
+  letter-spacing: 0;
+}
+
+.root[data-wrap] {
+  display: inline;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.root[data-keep-end] {
+  display: inline-flex;
+}
+
+.head {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tail {
+  min-width: 0;
+  max-width: 100%;
+  flex: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
