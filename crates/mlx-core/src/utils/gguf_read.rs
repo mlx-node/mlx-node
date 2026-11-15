@@ -577,7 +577,9 @@ pub(crate) fn set_nocache(_file: &std::fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 const RESIDENT_PROBES: usize = 8;
+#[cfg(unix)]
 const RESIDENT_PROBE_PAGES: usize = 16;
 
 /// Fraction of sampled pages of `file[..len]` in the page cache. Maps the file

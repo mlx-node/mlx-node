@@ -147,10 +147,12 @@ impl DiskTierOptions {
         self.persistent && self.cache_disk != CacheDisk::Off
     }
 
+    #[cfg(unix)]
     fn temp_root(&self) -> PathBuf {
         self.temp_root.clone().unwrap_or_else(std::env::temp_dir)
     }
 
+    #[cfg(unix)]
     fn cache_root(&self) -> Option<PathBuf> {
         if cfg!(test) {
             return self.cache_dir.clone();
@@ -418,6 +420,7 @@ fn temporary_fingerprint() -> ColdCacheFingerprint {
 
 /// A persistent tier's identity, built only when `persistPagedCache` asks
 /// for one.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct PersistentIdentity {
     pub namespace: String,
     pub state: ColdCacheFingerprint,
