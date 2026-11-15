@@ -20,9 +20,14 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import { scopeCoreNativeOverride } from '../scripts/stage-app.js';
-import { createCliLauncher, type DesktopCliConfig } from '../src/cli-launcher.js';
+import { createCliLauncher, launcherScript, type DesktopCliConfig } from '../src/cli-launcher.js';
 
 const execute = promisify(execFile);
+const windows = process.platform === 'win32';
+const runLauncher = (path: string, args: string[], options: import('node:child_process').ExecFileOptions) =>
+  windows
+    ? execute(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'call', path, ...args], options)
+    : execute(path, args, options);
 const roots: string[] = [];
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
@@ -58,6 +63,17 @@ async function fixture() {
 }
 
 describe('app-owned command', () => {
+  it('uses a batch launcher and cmd-compatible environment on Windows', async () => {
+    const { root, config } = await fixture();
+    const launcher = createCliLauncher(config, root, 'win32');
+    const script = launcherScript(config, 'win32');
+    expect(launcher.path).toBe(join(root, '.mlx-node', 'bin', 'mlx.cmd'));
+    expect(script.startsWith('@echo off\r\n')).toBe(true);
+    expect(script).toContain('setlocal DisableDelayedExpansion\r\n');
+    expect(script).toContain('set "NAPI_RS_NATIVE_LIBRARY_PATH="\r\n');
+    expect(script).toContain(`"${config.executable}" "${config.entry}" %*\r\n`);
+  });
+
   it('loads core and Keyring independently, even with a stale inherited generic override', async () => {
     const { root, config } = await fixture();
     const binding = join(root, 'core.cjs');
@@ -81,7 +97,7 @@ describe('app-owned command', () => {
     );
     const path = await createCliLauncher(config, root).prepare();
     await expect(
-      execute(path, ['download', '--help'], {
+      runLauncher(path, ['download', '--help'], {
         env: { PATH: '/usr/bin:/bin', NAPI_RS_NATIVE_LIBRARY_PATH: config.nativeAddon },
       }),
     ).resolves.toMatchObject({ stdout: expect.stringContaining('Usage: mlx delegate') });
@@ -91,11 +107,11 @@ describe('app-owned command', () => {
     const { root, config, launcher } = await fixture();
     const path = await launcher.prepare();
     const args = ['github', '--repo', 'owner/repo', 'PR #1: spaces; $(echo untouched)', ''];
-    const { stdout } = await execute(path, args, {
+    const { stdout } = await runLauncher(path, args, {
       cwd: root,
       env: { PATH: '/usr/bin:/bin', CODEX_THREAD_ID: 'caller-thread' },
     });
-    expect(JSON.parse(stdout)).toEqual({
+    expect(JSON.parse(stdout.toString())).toEqual({
       args,
       cwd: await realpath(root),
       caller: 'caller-thread',
@@ -103,7 +119,7 @@ describe('app-owned command', () => {
       addon: config.nativeAddon,
       nodeMode: '1',
     });
-    expect((await stat(path)).mode & 0o777).toBe(0o755);
+    if (!windows) expect((await stat(path)).mode & 0o777).toBe(0o755);
   });
 
   it('coalesces probes and caches success until a runtime file changes', async () => {
@@ -123,7 +139,7 @@ describe('app-owned command', () => {
     const cache = await readFile(cachePath, 'utf8');
     expect(cache).not.toContain(root);
     expect(cache).not.toContain(await readFile(config.entry, 'utf8'));
-    expect((await stat(cachePath)).mode & 0o777).toBe(0o600);
+    if (!windows) expect((await stat(cachePath)).mode & 0o777).toBe(0o600);
     const saved = await stat(cachePath);
     await createCliLauncher(config, root).prepare();
     expect((await stat(cachePath)).mtimeMs).toBe(saved.mtimeMs);
@@ -194,9 +210,11 @@ describe('app-owned command', () => {
     await rm(config.entry);
     const next = createCliLauncher({ ...config, entry: moved }, root);
     expect(await next.prepare()).toBe(launcher.path);
-    await chmod(launcher.path, 0o600);
-    await next.prepare();
-    expect((await stat(launcher.path)).mode & 0o777).toBe(0o755);
+    if (!windows) {
+      await chmod(launcher.path, 0o600);
+      await next.prepare();
+      expect((await stat(launcher.path)).mode & 0o777).toBe(0o755);
+    }
     expect(await readFile(launcher.path, 'utf8')).toContain('Moved.app');
   });
 
@@ -209,7 +227,13 @@ describe('app-owned command', () => {
     await rm(launcher.path);
     const target = join(root, 'foreign');
     await writeFile(target, 'preserve');
-    await symlink(target, launcher.path);
+    try {
+      await symlink(target, launcher.path);
+    } catch (error) {
+      // Windows grants symlink creation only to privileged/developer-mode hosts.
+      if (windows && (error as NodeJS.ErrnoException).code === 'EPERM') return;
+      throw error;
+    }
     await expect(launcher.prepare()).rejects.toThrow('not a regular file');
     expect(await readFile(target, 'utf8')).toBe('preserve');
   });

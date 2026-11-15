@@ -8,8 +8,8 @@ by dragging mlx-node to Applications. The app requires Apple Silicon and macOS 2
 Open **Coding Agents** in the control panel to let other agents delegate GitHub
 work to `mlx delegate github`. The app includes the CLI and runs it with Electron's
 bundled Node runtime; users do not need npm or a separate Node installation. At
-launch it creates `~/.mlx-node/bin/mlx`, verifies delegation support, and repairs
-its target after the app moves or updates. It never overwrites a foreign command
+launch it creates `~/.mlx-node/bin/mlx` (`mlx.cmd` on Windows), verifies delegation
+support, and repairs its target after the app moves or updates. It never overwrites a foreign command
 at that location or changes shell startup files or an existing global `mlx`.
 
 Setup writes the launcher's quoted absolute path into the routing prompt, so
