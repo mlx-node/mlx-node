@@ -113,47 +113,43 @@ struct Inner {
     telemetry: Arc<prefix_disk::Telemetry>,
 }
 
-const PERSIST_ENV: &str = "MLX_PERSIST_PAGED_CACHE";
-
-/// Whether a load keeps its stored states on disk: the paged cache's
-/// persistence switch (`MLX_PERSIST_PAGED_CACHE`, which the host writes from
-/// `--persist-cache` before any load) for this family, on a GGUF store whose
-/// identity the stored objects are bound to.
-fn disk_tier_on(weights: &weights::Store) -> bool {
-    let env = std::env::var(PERSIST_ENV).ok();
-    disk_switch(env.as_deref(), weights.checkpoint_identity())
-}
-
-/// [`disk_tier_on`] for the switch's value `env` and the store's identity.
-fn disk_switch(env: Option<&str>, identity: Option<&str>) -> bool {
-    if !crate::cold_tier::resolve_persist_cold("qwen4_exp", env, None) {
-        return false;
-    }
-    if identity.is_none() {
+/// The disk tier a load of `options` plans, under the persistence switch's
+/// environment value `env`, for a checkpoint of `identity`: its options and
+/// whether it is on. On only as a persistent tier of a GGUF store whose
+/// identity the stored objects are bound to. The load, the tier's open and
+/// the context estimate all decide through this one function.
+pub(super) fn disk_plan(
+    label: &str,
+    options: &Qwen4ExpLoadOptions,
+    env: Option<&str>,
+    identity: Option<&str>,
+) -> Result<(crate::disk_tier::DiskTierOptions, bool)> {
+    let tier = crate::disk_tier::DiskTierOptions::from_load(
+        options.cache_disk.as_deref(),
+        crate::disk_tier::resolve_persist(options.persist_paged_cache, env),
+        options.cache_dir.clone(),
+    )
+    .map_err(|message| Error::from_reason(format!("{label} load: {message}")))?;
+    if tier.persistent && identity.is_none() {
         tracing::info!(
             "qwen4_exp: stored states stay in memory: the disk tier needs a GGUF checkpoint"
         );
-        return false;
     }
-    true
+    let on = tier.persistent && identity.is_some();
+    Ok((tier, on))
 }
 
 impl Inner {
-    /// Opens the disk tier of the stored states when the persistence
-    /// switch `env` turns it on for a checkpoint of `identity`, over
-    /// `manager` (the process's cold store), and hands the store to the
-    /// adapter for the states' KV blocks. Fails open: the states stay in
-    /// memory.
+    /// Opens the stored states' persistent tier of `options` (a namespace
+    /// directory of the checkpoint `identity` and the math the fingerprint
+    /// binds) and hands its store to the adapter for the states' KV blocks.
+    /// Fails open: the states stay in memory.
     fn open_prefix_disk(
         &mut self,
-        env: Option<&str>,
+        options: &crate::disk_tier::DiskTierOptions,
         identity: Option<&str>,
         auxiliary: Option<&Path>,
-        manager: impl FnOnce() -> Option<Arc<mlx_paged_attn::ColdCacheManager>>,
     ) {
-        if !disk_switch(env, identity) {
-            return;
-        }
         let window = self.decoder.prefill_slice_size();
         let scratch = self.decoder.host_prefill_scratch;
         let fingerprint = match (identity, self.decoder.paged.as_ref()) {
@@ -173,11 +169,22 @@ impl Inner {
             tracing::warn!("qwen4_exp: stored states stay in memory: no checkpoint identity");
             return;
         };
-        let Some(manager) = manager() else {
-            tracing::warn!("qwen4_exp: stored states stay in memory: the cold store did not open");
+        let namespace = fingerprint.to_hex();
+        let Some(tier) = crate::disk_tier::open_persistent_tier(
+            options,
+            || {
+                Some(crate::disk_tier::PersistentIdentity {
+                    namespace: namespace.get(..32)?.to_string(),
+                    state: fingerprint,
+                    kv: fingerprint,
+                })
+            },
+            memory::encoded_state_bytes(&self.decoder.config, self.has_mtp),
+        ) else {
+            tracing::warn!("qwen4_exp: stored states stay in memory: the SSD cache did not open");
             return;
         };
-        match prefix_disk::Disk::open(manager, fingerprint, Arc::clone(&self.telemetry)) {
+        match prefix_disk::Disk::open(tier, fingerprint, Arc::clone(&self.telemetry)) {
             Ok(disk) => {
                 if let Some(adapter) = self.decoder.paged.as_mut() {
                     disk.attach(adapter);
@@ -479,6 +486,18 @@ pub struct Qwen4ExpLoadOptions {
     /// the load.
     #[napi(ts_type = "'int8' | 'bf16' | undefined")]
     pub kv_format: Option<String>,
+    /// SSD cache for the stored states (`--max-cache-disk`): `'auto'` (the
+    /// default: up to 32 GiB, a quarter of the volume's room), a byte count,
+    /// or `'0'` (off).
+    pub cache_disk: Option<String>,
+    /// The paged KV disk cache switch every family shares (`--no-persist-cache`):
+    /// keep the stored states on SSD across restarts in a directory of the
+    /// model's own under `cacheDir`; off, they stay in memory.
+    /// Unset ⇒ `MLX_PERSIST_PAGED_CACHE`, else off.
+    pub persist_paged_cache: Option<bool>,
+    /// The persistent cache's root (`--cache-dir`), default
+    /// `~/.mlx-node/cache/prefix-cache`; needs `persistPagedCache`.
+    pub cache_dir: Option<String>,
 }
 
 /// Load-time residency decision (the budget is admitted before payload
@@ -622,6 +641,7 @@ pub struct Qwen4ExpModel {
     lookup: Arc<weights::LookupStats>,
     supports_images: bool,
     prefix: Arc<prefix_disk::Telemetry>,
+    prefix_closer: Option<std::sync::Weak<prefix_disk::Closer>>,
 }
 #[napi]
 impl Qwen4ExpModel {
@@ -669,8 +689,13 @@ impl Qwen4ExpModel {
                 config.kv_format =
                     load_plan::resolve_kv_format(LABEL, options.kv_format.as_deref(), &config)?;
                 let has_mtp = auxiliary::validate_mtp(&weights, &config)?;
-                let persist = std::env::var(PERSIST_ENV).ok();
-                let disk = disk_switch(persist.as_deref(), weights.checkpoint_identity());
+                let env = std::env::var(crate::cold_tier::PERSIST_PAGED_CACHE_ENV).ok();
+                let (tier_options, disk) = disk_plan(
+                    LABEL,
+                    &options,
+                    env.as_deref(),
+                    weights.checkpoint_identity(),
+                )?;
                 let vision = media::Vision::metadata(&raw, &weights, &config)?;
                 let supports_images = vision.available();
                 let tokenizer = Arc::new(Qwen3Tokenizer::load_from_file_sync(
@@ -821,12 +846,12 @@ impl Qwen4ExpModel {
                         .checkpoint_identity()
                         .map(str::to_owned);
                     inner.open_prefix_disk(
-                        persist.as_deref(),
+                        &tier_options,
                         identity.as_deref(),
                         options.auxiliary_model_path.as_deref().map(Path::new),
-                        crate::cold_tier::global_cold_cache,
                     );
                 }
+                let prefix_closer = inner.disk.as_ref().map(prefix_disk::Disk::closer);
                 if let Some(adapter) = inner.decoder.paged.as_ref() {
                     adapter
                         .layer_kv_pool()
@@ -847,6 +872,7 @@ impl Qwen4ExpModel {
                         lookup,
                         supports_images,
                         telemetry,
+                        prefix_closer,
                     ),
                 ))
             },
@@ -862,6 +888,7 @@ impl Qwen4ExpModel {
             lookup,
             supports_images,
             prefix,
+            prefix_closer,
         ) = match ready.await {
             Ok(Ok(init)) => init,
             Ok(Err(error)) => {
@@ -896,7 +923,41 @@ impl Qwen4ExpModel {
             lookup,
             supports_images,
             prefix,
+            prefix_closer,
         })
+    }
+    /// Closes the stored states' SSD cache at a clean stop: every copy and
+    /// every parked state whose chain is on disk goes to the writer, which
+    /// drains until `deadlineMs` (milliseconds on `Date.now()`'s clock, so
+    /// models closed in turn share one deadline). The cache takes no write
+    /// afterwards. Resolves false when something missed the deadline; true
+    /// without a cache, or after `dispose`, which closed it.
+    ///
+    /// Runs off the model thread: a turn in flight does not hold it.
+    #[napi]
+    pub async fn close_cache(&self, deadline_ms: f64) -> Result<bool> {
+        let Some(closer) = self
+            .prefix_closer
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            return Ok(true);
+        };
+        let deadline = crate::models::qwen3_5::dflash2_state::disk::instant_at(deadline_ms);
+        napi::bindgen_prelude::spawn_blocking(move || closer.close(deadline))
+            .await
+            .map_err(|error| Error::from_reason(format!("Qwen4Exp closeCache: {error}")))
+    }
+    /// The stored states' SSD cache: `'persistent'` while it is open,
+    /// `'off'` without one or after `closeCache`.
+    #[napi(ts_return_type = "'persistent' | 'off'")]
+    pub fn state_tier_mode(&self) -> String {
+        let open = self
+            .prefix
+            .disk_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0;
+        if open { "persistent" } else { "off" }.to_string()
     }
     /// Whether the validated checkpoint has a supported image tower.
     #[napi]

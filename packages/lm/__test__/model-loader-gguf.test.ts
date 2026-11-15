@@ -146,6 +146,21 @@ describe('standalone GGUF model detection', () => {
     );
   });
 
+  // Mutation: leave `cacheDisk` / `cacheDir` out of `qwen4ExpLoadOptions`' null
+  // test → red (a lone option never reaches the loader).
+  it('passes cacheDisk and cacheDir alone to the Flash Next loader and rejects them for gemma4', async () => {
+    const flashNext = await writeStandaloneGguf('qwen4exp');
+    const loadSpy = vi.spyOn(Qwen4ExpModel, 'load').mockResolvedValue({} as Qwen4ExpModel);
+    await loadModel(flashNext.modelPath, { cacheDisk: '0', autoLoadDraft: false });
+    expect(loadSpy).toHaveBeenLastCalledWith(flashNext.modelPath, { cacheDisk: '0' });
+    await loadModel(flashNext.modelPath, { cacheDir: '/var/cache/mlx', autoLoadDraft: false });
+    expect(loadSpy).toHaveBeenLastCalledWith(flashNext.modelPath, { cacheDir: '/var/cache/mlx' });
+    const gemma = await writeStandaloneGguf('gemma4');
+    await expect(loadModel(gemma.modelPath, { cacheDisk: '0' })).rejects.toThrow(
+      'cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5, qwen3_5_moe and qwen4_exp',
+    );
+  });
+
   it('passes a MoE companion and cache precision to the native loader', async () => {
     const { modelPath } = await writeStandaloneGguf('qwen35moe');
     const loaded = {} as Qwen35MoeModel;

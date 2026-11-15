@@ -1009,6 +1009,26 @@ describe('TurnTraceModel', () => {
     expect(lines[3]).not.toHaveProperty('stateTier');
   });
 
+  // Flash Next's tier is its own: the governor never sees it, so with no reader
+  // passed in the row takes the wrapped model's `stateTierMode()`. Its proof of
+  // persistence is this field; `coldEnabled` stays false.
+  // Mutation: leave `qwen4_exp` out of `COLD_TIER_STATE_FAMILIES` → red.
+  // Mutation: read the governor instead of the model's method → red.
+  it('a qwen4_exp turn records its model tier', async () => {
+    const inner = Object.assign(makeInner(), { stateTierMode: () => 'persistent' });
+    await new TurnTraceModel(
+      inner,
+      deps({
+        identity: { modelId: 'flash', modelType: 'qwen4_exp', contextWindow: 4096 },
+        coldStats: () => coldStats({ enabled: false, root: '' }),
+        stateTierMode: undefined,
+      }),
+    ).chatSessionStart([]);
+
+    const [line] = readTraceLines(dir);
+    expect(line).toMatchObject({ modelType: 'qwen4_exp', coldEnabled: false, stateTier: 'persistent' });
+  });
+
   it('reports concurrency and concurrencyPeak for overlapping turns', async () => {
     const gates: Array<() => void> = [];
     const inner = makeInner({

@@ -697,3 +697,26 @@ fn the_load_plan_books_the_state_staging() {
         "the lane holds no staging"
     );
 }
+
+/// The context estimate sets the state staging aside exactly when the load
+/// would: `--max-cache-disk 0` under the host's switch plans no staging,
+/// the bare switch plans the load's.
+/// Mutation: the disk plan ignores `cacheDisk` → red.
+#[test]
+fn the_estimate_follows_the_load_switch() {
+    let c = flash_next_config();
+    let off = crate::models::qwen4_exp::Qwen4ExpLoadOptions {
+        cache_disk: Some("0".to_string()),
+        ..Default::default()
+    };
+    let disk = |options| {
+        crate::models::qwen4_exp::disk_plan("Qwen4Exp", options, Some("1"), Some("id"))
+            .unwrap()
+            .1
+    };
+    assert!(!disk(&off));
+    assert_eq!(state_staging(&c, true, disk(&off)), 0);
+    let bare = crate::models::qwen4_exp::Qwen4ExpLoadOptions::default();
+    assert!(disk(&bare));
+    assert!(state_staging(&c, true, disk(&bare)) > 0);
+}

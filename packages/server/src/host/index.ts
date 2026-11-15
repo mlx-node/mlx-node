@@ -213,7 +213,7 @@ export interface InferenceHostOptions {
    */
   maxContextTokens?: number;
   /**
-   * SSD cache size (`--max-cache-disk`) for qwen3_5 / qwen3_5_moe loads:
+   * SSD cache size (`--max-cache-disk`) for qwen3_5 / qwen3_5_moe / qwen4_exp loads:
    * `'auto'` or a byte count, `'0'` turns the cache off. Their memory plan
    * sets one DFlash2 state's staging aside while the cache is on. Other
    * families never see it. Omitted ⇒ `'auto'`.
@@ -221,8 +221,9 @@ export interface InferenceHostOptions {
   cacheDisk?: string;
   /**
    * The paged KV disk cache switch for every family: the cold tier of
-   * `COLD_TIER_RESTORE_FAMILIES`, and for qwen3_5 / qwen3_5_moe a persistent
-   * SSD state tier (off ⇒ a temporary one that goes at `close()`). Resolved
+   * `COLD_TIER_RESTORE_FAMILIES`, for qwen3_5 / qwen3_5_moe a persistent
+   * SSD state tier (off ⇒ a temporary one that goes at `close()`), and for
+   * qwen4_exp a persistent one (off ⇒ none). Resolved
    * `flag` > `MLX_PERSIST_PAGED_CACHE` > `byDefault` and written to
    * `MLX_PERSIST_PAGED_CACHE` before any load. Omitted ⇒
    * {@link PERSIST_PAGED_CACHE_DEFAULT} (on).
@@ -230,7 +231,7 @@ export interface InferenceHostOptions {
   persistPagedCache?: PersistPagedCache;
   /**
    * The persistent SSD state tier's root (`--cache-dir`) for qwen3_5 /
-   * qwen3_5_moe loads; needs the switch on. Omitted ⇒
+   * qwen3_5_moe / qwen4_exp loads; needs the switch on. Omitted ⇒
    * `~/.mlx-node/cache/prefix-cache`.
    */
   cacheDir?: string;
@@ -309,7 +310,7 @@ export interface InferenceHostOptions {
   collectGarbage?: Collector | null;
 }
 
-/** A loaded model with an SSD cache to close at a clean stop (qwen3_5 / qwen3_5_moe). */
+/** A loaded model with an SSD cache to close at a clean stop (qwen3_5 / qwen3_5_moe / qwen4_exp). */
 interface CacheClosingModel {
   closeCache(deadlineMs: number): Promise<boolean>;
 }
@@ -852,8 +853,9 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
  * The native load-free estimate of an entry's family: qwen4_exp has its own
  * memory plan (a streamed expert store), so the qwen3_5 estimator never prices
  * it. Every qwen4_exp turn (AR or MTP) takes its one window, which is the
- * estimate. qwen4_exp takes `kvFormat`, `maxMemoryBytes` and
- * `maxContextTokens`.
+ * estimate. qwen4_exp takes `kvFormat`, `maxMemoryBytes`, `maxContextTokens`
+ * and `cacheDisk`: the load sets its state staging aside only while its SSD
+ * cache is on, so the estimate must decide that as the load does.
  */
 export function nativeContextEstimate(
   qwen35: typeof estimateQwen35ContextWindow = estimateQwen35ContextWindow,
@@ -865,6 +867,7 @@ export function nativeContextEstimate(
       ...(options?.kvFormat !== undefined ? { kvFormat: options.kvFormat } : {}),
       ...(options?.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
       ...(options?.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
+      ...(options?.cacheDisk !== undefined ? { cacheDisk: options.cacheDisk } : {}),
     };
     const estimate = await qwen4Exp(path, Object.keys(qwen4Options).length === 0 ? null : qwen4Options);
     return estimate == null ? null : { windowTokens: estimate.windowTokens, bound: estimate.bound };

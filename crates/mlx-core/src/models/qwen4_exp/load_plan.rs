@@ -415,7 +415,14 @@ pub async fn estimate_qwen4_exp_context_window(
         let has_mtp = super::auxiliary::validate_mtp(&weights, &config)?;
         let vision = super::media::Vision::metadata(&raw, &weights, &config)?.available();
         let inventory = weights.load_inventory(&config, vision)?;
-        let disk = super::disk_tier_on(&weights);
+        let env = std::env::var(crate::cold_tier::PERSIST_PAGED_CACHE_ENV).ok();
+        let disk = super::disk_plan(
+            LABEL,
+            &options,
+            env.as_deref(),
+            weights.checkpoint_identity(),
+        )?
+        .1;
         estimate(
             LABEL,
             &config,

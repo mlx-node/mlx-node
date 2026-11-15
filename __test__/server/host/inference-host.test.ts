@@ -946,6 +946,8 @@ describe('createInferenceHost — out-of-band loadModel', () => {
 
   // Mutation: drop `maxContextTokens` from the qwen4_exp estimator options in
   // `nativeContextEstimate` → red. Mutation: drop `kvFormat` from them → red.
+  // Mutation: drop `cacheDisk` from them → red (a load with the SSD cache off
+  // plans no staging, the estimate would).
   it('hands maxContextTokens to both estimators', async () => {
     const asked: Array<{ family: string; options?: unknown }> = [];
     const estimate = nativeContextEstimate(
@@ -960,10 +962,12 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     );
     await estimate('/flash', 'qwen4_exp', { maxContextTokens: 102_400 });
     await estimate('/flash', 'qwen4_exp', { kvFormat: 'int8' });
+    await estimate('/flash', 'qwen4_exp', { cacheDisk: '0' });
     await estimate('/qwen', 'qwen3_5', { maxContextTokens: 409_600 });
     expect(asked).toEqual([
       { family: 'flash-next', options: { maxContextTokens: 102_400 } },
       { family: 'flash-next', options: { kvFormat: 'int8' } },
+      { family: 'flash-next', options: { cacheDisk: '0' } },
       { family: 'qwen3_5', options: { maxContextTokens: 409_600 } },
     ]);
   });

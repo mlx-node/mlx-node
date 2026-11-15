@@ -240,8 +240,8 @@ of its heartbeat: On, Off, or Unknown for an engine started before the field), t
 write (`coldCapture`: up to N prefix blocks, or "the whole prompt" from 63,125 blocks, and the walk's time cap; a
 walk the time cap ends early is picked up by the next turn; nothing for an older engine), and how many recorded
 turns ran with the tier on (`scope.enabledTurns`) and off (`scope.disabledTurns`). The turn counts cover every
-cache folder, not only the one the page shows. A Qwen3.5 dense or MoE turn counts by its own disk cache, the SSD
-state tier its trace row carries as `stateTier`: on when `persistent`, off when `temp` or `off`. When more than one
+cache folder, not only the one the page shows. A Qwen3.5 dense or MoE or a Flash Next turn counts by its own disk
+cache, the SSD state tier its trace row carries as `stateTier`: on when `persistent`, off when `temp` or `off`. When more than one
 engine runs, the line names the one it reads.
 Neither the switch nor the turn counts prove a write: a turn with the tier on may write nothing. The written side is
 the rest of the page (bytes and blocks on disk, restores).
@@ -971,10 +971,12 @@ this view does not list it.
   `null` when the cache is off). The dashboard live snapshot reads both per
   process; both are `null` from an engine that predates them. Whether a turn of a
   restore-allowlisted family used the cold tier is the trace row's `coldEnabled`;
-  the Cache page shows both. A Qwen3.5 turn's state tier is not in `coldEnabled`:
-  its row carries `stateTier` (`persistent`, `temp` or `off`, the most lasting
-  mode over the engine's loaded models), and its numbers are `/health`
-  `memory_governor.dflash2_states`.
+  the Cache page shows both. A Qwen3.5 or Flash Next turn's state tier is not in
+  `coldEnabled`: its row carries `stateTier` (Qwen3.5: `persistent`, `temp` or
+  `off`, the most lasting mode over the engine's loaded models, with its numbers
+  in `/health` `memory_governor.dflash2_states`; Flash Next: the model's own
+  `stateTierMode()`, `persistent` or `off`, with its numbers in
+  `residencyInfo()`'s `prefixDisk*` counters).
 - **One turn writes the whole prompt in both agent paths** (the restore-allowlisted
   families; not the Qwen3.5 state tier). By default a turn's capture walk writes at
   most 128 blocks (2,048 tokens) within 250 ms. `mlx agent` (through

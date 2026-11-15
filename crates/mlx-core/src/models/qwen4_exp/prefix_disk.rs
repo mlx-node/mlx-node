@@ -2,8 +2,9 @@
 //! blocks of its chain survive an engine restart (Splash d8af1054
 //! `WriteBehind`, docs/server.md "state persistence").
 //!
-//! Everything goes through the paged cold store (`ColdCacheManager`: temp
-//! file, fsync, rename, payload checksum, identity check, quota, LRU). A KV
+//! Everything goes through the model's own tier (`disk_tier.rs`: a locked
+//! namespace directory, its quota, and a `ColdCacheManager` for temp file,
+//! fsync, rename, payload checksum, identity check and LRU). A KV
 //! block is a `Kv` object under its chain key (tokens, pass keys, salt), a
 //! draft segment a `HybridDraft` object, a state a `HybridCell` object, all
 //! under one fingerprint of everything that changes the math.
@@ -17,7 +18,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use mlx_paged_attn::{
@@ -28,6 +29,7 @@ use napi::{Error, Result};
 
 use super::prefix_state::{BLOCK_ROWS, Cell, DraftCell, LayerCell, Segment};
 use crate::array::{DType, MxArray};
+use crate::disk_tier::DiskTier;
 use crate::transformer::paged_kv_cache_adapter::{
     ColdContextBacking, ColdTierContext, PagedKVCacheAdapter, SeqId,
 };
@@ -816,15 +818,35 @@ pub(super) struct Candidate {
     pub(super) segments: Vec<ColdCacheKey>,
 }
 
+/// Closes the tier from any thread: the parker hands over what can land,
+/// then the tier drains its writer and takes no write after.
+pub(super) struct Closer {
+    parker: Arc<Parker>,
+    tier: Arc<DiskTier>,
+    telemetry: Arc<Telemetry>,
+}
+
+impl Closer {
+    /// Every queued copy and every parked state whose chain landed goes to
+    /// the writer, and the tier closes, by `deadline`. False when the drain
+    /// missed it. Safe to call again and after the parker stopped.
+    pub(super) fn close(&self, deadline: Instant) -> bool {
+        self.parker.flush(deadline);
+        let landed = self.tier.close(deadline);
+        self.telemetry.disk_enabled.store(0, Ordering::Relaxed);
+        landed
+    }
+}
+
 pub(super) struct Disk {
     manager: Arc<ColdCacheManager>,
+    closer: Arc<Closer>,
     fingerprint: ColdCacheFingerprint,
     #[cfg(test)]
     budget: Arc<AtomicU64>,
     pub(super) delay: Duration,
     parker: Arc<Parker>,
     thread: Option<std::thread::JoinHandle<()>>,
-    hook: u64,
     cursors: HashMap<SeqId, Cursor>,
     telemetry: Arc<Telemetry>,
     skip_once: bool,
@@ -837,13 +859,13 @@ pub(super) struct Disk {
 }
 
 impl Disk {
-    /// The tier over `manager` under `fingerprint`, its parker started and
-    /// its flush registered with `cold_cache_drain`.
+    /// The states over `tier` under `fingerprint`, its parker started.
     pub(super) fn open(
-        manager: Arc<ColdCacheManager>,
+        tier: Arc<DiskTier>,
         fingerprint: ColdCacheFingerprint,
         telemetry: Arc<Telemetry>,
     ) -> Result<Self> {
+        let manager = Arc::clone(&tier.manager);
         let budget = Arc::new(AtomicU64::new((manager.quota_bytes() / 4).min(BUDGET_CAP)));
         let parker = Arc::new(Parker {
             slot: Mutex::new(Slot::default()),
@@ -862,20 +884,21 @@ impl Disk {
                 .spawn(move || run(parker, manager, budget, telemetry))
                 .map_err(|e| Error::from_reason(format!("Qwen4 prefix disk: {e}")))?
         };
-        let hook = {
-            let parker = Arc::clone(&parker);
-            crate::cold_tier::register_drain_hook(Arc::new(move |deadline| parker.flush(deadline)))
-        };
         telemetry.disk_enabled.store(1, Ordering::Relaxed);
+        let closer = Arc::new(Closer {
+            parker: Arc::clone(&parker),
+            tier,
+            telemetry: Arc::clone(&telemetry),
+        });
         Ok(Self {
             manager,
+            closer,
             fingerprint,
             #[cfg(test)]
             budget,
             delay: DELAY,
             parker,
             thread: Some(thread),
-            hook,
             cursors: HashMap::new(),
             telemetry,
             skip_once: false,
@@ -895,6 +918,17 @@ impl Disk {
             fingerprint: self.fingerprint,
             backing: ColdContextBacking::KvOnly,
         });
+    }
+
+    /// Weak: the parked states, the queued copies and the tier go with this
+    /// disk, not with the napi object, whose memory V8 does not see.
+    pub(super) fn closer(&self) -> Weak<Closer> {
+        Arc::downgrade(&self.closer)
+    }
+
+    #[cfg(test)]
+    pub(super) fn tier(&self) -> &Arc<DiskTier> {
+        &self.closer.tier
     }
 
     #[cfg(test)]
@@ -1010,7 +1044,7 @@ impl Disk {
     /// draft segments it published that are not on disk yet, within the host
     /// queue's bytes. Never waits for the writer.
     pub(super) fn top_up(&mut self, seq: SeqId, adapter: &mut PagedKVCacheAdapter) {
-        if !self.owes(seq) {
+        if !self.closer.tier.is_open() || !self.owes(seq) {
             return;
         }
         let mut bytes = self.parker.lock().item_bytes;
@@ -1123,12 +1157,14 @@ impl Disk {
         for seq in owing {
             self.top_up(seq, adapter);
         }
+        // A closed tier takes no copy, so a closed cursor owes it nothing.
+        let open = self.closer.tier.is_open();
         let done: Vec<SeqId> = self
             .cursors
             .iter()
             .filter(|(_, cursor)| cursor.closed)
             .map(|(&seq, _)| seq)
-            .filter(|&seq| !self.owes(seq))
+            .filter(|&seq| !open || !self.owes(seq))
             .collect();
         for seq in done {
             self.cursors.remove(&seq);
@@ -1167,6 +1203,9 @@ impl Disk {
             return;
         };
         cursor.closed = true;
+        if !self.closer.tier.is_open() {
+            return;
+        }
         let window = cell.grid;
         let blocks = row / BLOCK_ROWS;
         let segments = cell.draft.as_ref().map_or(0, |draft| draft.segments.len());
@@ -1246,6 +1285,8 @@ impl Disk {
         }
         self.telemetry.waiting.fetch_add(1, Ordering::Relaxed);
         self.parker.wake.notify_all();
+        drop(slot);
+        self.closer.tier.measure();
     }
 
     /// The deepest state of a `tokens` prompt above `floor` on disk, at one
@@ -1429,8 +1470,7 @@ impl Disk {
 
 impl Drop for Disk {
     fn drop(&mut self) {
-        crate::cold_tier::unregister_drain_hook(self.hook);
-        self.parker.flush(Instant::now() + SLOT_WAIT);
+        self.closer.close(Instant::now() + SLOT_WAIT);
         {
             let mut slot = self.parker.lock();
             slot.stop = true;

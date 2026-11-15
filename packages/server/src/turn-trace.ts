@@ -94,7 +94,10 @@ function safeSidecarStats(): ColdSidecarStats | undefined {
   }
 }
 
-/** The SSD state tier's mode over the loaded models; the native addon may be absent (unit tests). */
+/**
+ * The Qwen3.5 SSD state tier's mode over the loaded models, from the governor's
+ * DFlash2 states; the native addon may be absent (unit tests).
+ */
 function safeStateTierMode(): string | undefined {
   try {
     return memoryGovernorStatus()?.dflash2States.disk.mode;
@@ -288,7 +291,11 @@ export interface TurnTraceDeps {
   coldStats?: () => ColdCacheStats | undefined;
   /** Process-wide sidecar-counter reader; defaults to the native addon. */
   sidecarStats?: () => ColdSidecarStats | undefined;
-  /** The SSD state tier's mode over the loaded models; defaults to the native addon. */
+  /**
+   * The SSD state tier's mode over the loaded models. Default: the wrapped
+   * model's own `stateTierMode()` where it has one (`qwen4_exp`, which the
+   * governor does not see), else the native addon's governor status.
+   */
   stateTierMode?: () => string | undefined;
   /** Clock for `ts`, `durationMs`, and the trace filename. Default: `Date.now`. */
   now?: () => number;
@@ -632,6 +639,22 @@ export class TurnTraceModel implements SessionCapableModel {
     return ctx;
   }
 
+  /**
+   * The wrapped model's own state tier reader (`qwen4_exp`'s `stateTierMode()`),
+   * else the governor's, which only Qwen3.5 publishes to.
+   */
+  private modelStateTierMode(): () => string | undefined {
+    const model = this.inner as { stateTierMode?: () => string };
+    if (typeof model.stateTierMode !== 'function') return safeStateTierMode;
+    return () => {
+      try {
+        return model.stateTierMode?.();
+      } catch {
+        return undefined;
+      }
+    };
+  }
+
   private pipelineStats(): PipelineStats | null {
     try {
       return (this.deps.pipelineStats ?? readPipelineStats)();
@@ -811,7 +834,7 @@ export class TurnTraceModel implements SessionCapableModel {
       }
       const modelType = this.deps.identity?.modelType;
       if (modelType !== undefined && COLD_TIER_STATE_FAMILIES.has(modelType)) {
-        const mode = enumOf((this.deps.stateTierMode ?? safeStateTierMode)(), STATE_TIER_MODES);
+        const mode = enumOf((this.deps.stateTierMode ?? this.modelStateTierMode())(), STATE_TIER_MODES);
         if (mode !== undefined) rec.stateTier = mode;
       }
       const sidecar = sidecarStats();

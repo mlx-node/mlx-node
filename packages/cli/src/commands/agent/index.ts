@@ -66,7 +66,8 @@ export interface AgentArgScan {
   /**
    * The paged KV disk cache for the spawned `mlx serve`: on by default,
    * `--no-persist-cache` sets the flag off. A SINGLE process-wide switch for
-   * every family in `COLD_TIER_RESTORE_FAMILIES` and the qwen3_5 state tier.
+   * every family in `COLD_TIER_RESTORE_FAMILIES` and the qwen3_5 and qwen4_exp
+   * state tiers.
    * Lifted out of the argv, never forwarded to the agent binary.
    */
   persistPagedCache: PersistPagedCache;
@@ -756,17 +757,19 @@ mlx options (handled before the agent binary sees the args):
                             flag is absent. One switch for ALL restore-eligible
                             families (${coldTierRestoreFamilyList().join(', ')})
                             and the Qwen3.5 dense and MoE state tier, whose files
-                            are then temporary; every other family never
-                            persists, flag or not. A turn of those
+                            are then temporary, and the Flash Next state tier,
+                            then off; every other family never persists, flag
+                            or not. A turn of those
                             restore-eligible families writes the whole prompt
                             (up to ${WHOLE_PROMPT_CAPTURE_BLOCKS} blocks within
                             ${WHOLE_PROMPT_CAPTURE_BUDGET_MS} ms) before it ends.
   --max-cache-disk <size>   SSD quota for the states of Qwen3.5 dense and MoE
-                            loads: auto (default; a quarter of the volume's
-                            free space beyond its floor, at most 32G), a size
-                            such as 16G, or 0 to disable.
-  --cache-dir <dir>         Where the persistent Qwen3.5 state tier keeps its
-                            files (default: ~/.mlx-node/cache/prefix-cache).
+                            and Flash Next loads: auto (default; a quarter of
+                            the volume's free space beyond its floor, at most
+                            32G), a size such as 16G, or 0 to disable.
+  --cache-dir <dir>         Where the persistent Qwen3.5 and Flash Next state
+                            tiers keep their files (default:
+                            ~/.mlx-node/cache/prefix-cache).
 
 First run: when no local model exists, an interactive wizard offers a curated
 download. Agent config home: ~/.mlx-agent (override: GROK_HOME).

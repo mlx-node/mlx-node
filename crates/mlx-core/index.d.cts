@@ -2411,6 +2411,22 @@ export declare class Qwen4ExpModel {
    */
   dispose(): Promise<void>;
   static load(modelPath: string, options?: Qwen4ExpLoadOptions | undefined | null): Promise<Qwen4ExpModel>;
+  /**
+   * Closes the stored states' SSD cache at a clean stop: every copy and
+   * every parked state whose chain is on disk goes to the writer, which
+   * drains until `deadlineMs` (milliseconds on `Date.now()`'s clock, so
+   * models closed in turn share one deadline). The cache takes no write
+   * afterwards. Resolves false when something missed the deadline; true
+   * without a cache, or after `dispose`, which closed it.
+   *
+   * Runs off the model thread: a turn in flight does not hold it.
+   */
+  closeCache(deadlineMs: number): Promise<boolean>;
+  /**
+   * The stored states' SSD cache: `'persistent'` while it is open,
+   * `'off'` without one or after `closeCache`.
+   */
+  stateTierMode(): 'persistent' | 'off';
   /** Whether the validated checkpoint has a supported image tower. */
   supportsImages(): boolean;
   /** Plan the expanded prompt using the same processor and limits as prefill. */
@@ -3348,10 +3364,6 @@ export interface CleanupStats {
  * survives process death and kernel panic, but a sudden power loss can leave
  * it torn. Torn objects fail the payload checksum on the next read and are
  * pruned as a miss, so the cost is a recomputed prefix, never wrong state.
- *
- * The registered drain hooks run first, inside the same deadline: they hand
- * the writes a family still holds (a state waiting for its delay) to the
- * writer, which this drain then flushes.
  */
 export declare function coldCacheDrain(timeoutMs: number): boolean;
 
@@ -5976,6 +5988,24 @@ export interface Qwen4ExpLoadOptions {
    * the load.
    */
   kvFormat?: 'int8' | 'bf16' | undefined;
+  /**
+   * SSD cache for the stored states (`--max-cache-disk`): `'auto'` (the
+   * default: up to 32 GiB, a quarter of the volume's room), a byte count,
+   * or `'0'` (off).
+   */
+  cacheDisk?: string;
+  /**
+   * The paged KV disk cache switch every family shares (`--no-persist-cache`):
+   * keep the stored states on SSD across restarts in a directory of the
+   * model's own under `cacheDir`; off, they stay in memory.
+   * Unset ⇒ `MLX_PERSIST_PAGED_CACHE`, else off.
+   */
+  persistPagedCache?: boolean;
+  /**
+   * The persistent cache's root (`--cache-dir`), default
+   * `~/.mlx-node/cache/prefix-cache`; needs `persistPagedCache`.
+   */
+  cacheDir?: string;
 }
 
 /**

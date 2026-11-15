@@ -278,8 +278,9 @@ interface ModelFamilyDataBase {
   readonly acceptsDecodeShare?: true;
   /**
    * Native `load` accepts `LoadModelOptions.cacheDisk` and `cacheDir`
-   * (`--max-cache-disk`, `--cache-dir`): its DFlash2 states get an SSD tier
-   * (Splash `openDiskTier`), persistent under the paged KV disk cache switch
+   * (`--max-cache-disk`, `--cache-dir`): its stored states (DFlash2 states,
+   * Flash Next prefix states) get the model's own SSD tier (Splash
+   * `openDiskTier`), persistent under the paged KV disk cache switch
    * (`MLX_PERSIST_PAGED_CACHE`).
    */
   readonly acceptsCacheDisk?: true;
@@ -508,7 +509,7 @@ export const MODEL_FAMILY_DATA = [
     acceptsKvFormat: true,
     acceptsMaxMemory: true,
     acceptsMaxContext: true,
-    coldRestoreEligible: true,
+    acceptsCacheDisk: true,
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen4exp'],
     ggufDiscovery: { variants: 'all', split: true },

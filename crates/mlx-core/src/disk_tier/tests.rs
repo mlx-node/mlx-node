@@ -641,3 +641,33 @@ fn persistent_close_releases_the_namespace_after_the_writer() {
     }
     drop(tier);
 }
+
+/// A persistent-only open (a load whose states have no use in a temporary
+/// tier) gives a persistent tier when its namespace is free, and none, with
+/// nothing in the temporary root, when the switch is off, the size is 0,
+/// the identity is unreadable or another open holds the namespace.
+/// Mutation: the open falls back to a temporary tier → red.
+#[test]
+fn a_persistent_only_open_makes_no_temporary_tier() {
+    let root = Root::new("persistent-only");
+    fs::create_dir_all(root.join("tmp")).unwrap();
+    set_volume(&root.0, Some(volume(4096, 2048)));
+    let temp_is_empty = || fs::read_dir(root.join("tmp")).unwrap().next().is_none();
+    let off = DiskTierOptions {
+        cache_disk: CacheDisk::Bytes(1 << 40),
+        ..temp_options(&root)
+    };
+    assert!(open_persistent_tier(&off, || identity(NS), 160).is_none());
+    assert!(temp_is_empty());
+    let zero = persistent_options(&root, CacheDisk::Off);
+    assert!(open_persistent_tier(&zero, || identity(NS), 160).is_none());
+    assert!(temp_is_empty());
+    let options = persistent_options(&root, CacheDisk::Bytes(1 << 40));
+    assert!(open_persistent_tier(&options, || None, 160).is_none());
+    assert!(temp_is_empty());
+    let first = open_persistent_tier(&options, || identity(NS), 160).expect("persistent tier");
+    assert!(first.persistent);
+    assert_eq!(first.dir(), root.join("cache").join(NS));
+    assert!(open_persistent_tier(&options, || identity(NS), 160).is_none());
+    assert!(temp_is_empty());
+}

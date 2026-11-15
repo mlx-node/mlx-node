@@ -102,7 +102,7 @@ export interface LoadModelOptions {
    */
   decodeShare?: number;
   /**
-   * SSD state tier of `qwen3_5` and `qwen3_5_moe` targets
+   * SSD state tier of `qwen3_5`, `qwen3_5_moe` and `qwen4_exp` targets
    * (`--max-cache-disk`): `'auto'` (the default), a decimal byte count, or
    * `'0'` (off). Whether it survives a restart is the paged KV disk cache
    * switch every family reads, `MLX_PERSIST_PAGED_CACHE`. Other model
@@ -141,7 +141,9 @@ function qwen4ExpLoadOptions(options: LoadModelOptions | undefined): Qwen4ExpLoa
     options?.auxiliaryModelPath === undefined &&
     options?.kvFormat === undefined &&
     options?.maxMemoryBytes === undefined &&
-    options?.maxContextTokens === undefined
+    options?.maxContextTokens === undefined &&
+    options?.cacheDisk === undefined &&
+    options?.cacheDir === undefined
   )
     return null;
   return {
@@ -149,6 +151,8 @@ function qwen4ExpLoadOptions(options: LoadModelOptions | undefined): Qwen4ExpLoa
     ...(options.kvFormat !== undefined ? { kvFormat: options.kvFormat } : {}),
     ...(options.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
     ...(options.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
+    ...(options.cacheDisk !== undefined ? { cacheDisk: options.cacheDisk } : {}),
+    ...(options.cacheDir !== undefined ? { cacheDir: options.cacheDir } : {}),
   };
 }
 
@@ -318,7 +322,7 @@ function dispatchLoad(
     requireFamilyData(modelType).acceptsCacheDisk !== true
   ) {
     throw new Error(
-      `cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5 and qwen3_5_moe models; ` +
+      `cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }

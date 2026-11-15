@@ -1,8 +1,9 @@
 /**
  * The paged KV disk cache switch each host entry hands to the inference host,
  * one for every family: the cold tier of the families in
- * `COLD_TIER_RESTORE_FAMILIES`, and the SSD state tier of `qwen3_5` /
- * `qwen3_5_moe` (persistent on, temporary off). The native loads read
+ * `COLD_TIER_RESTORE_FAMILIES`, the SSD state tier of `qwen3_5` /
+ * `qwen3_5_moe` (persistent on, temporary off) and that of `qwen4_exp`
+ * (persistent on, none off). The native loads read
  * `MLX_PERSIST_PAGED_CACHE` at every load when nothing more explicit decides;
  * a GGUF load reads no config TS can write, so that env is the one input that
  * reaches every family and format. The same module resolves the per-turn

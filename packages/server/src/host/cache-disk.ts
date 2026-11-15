@@ -46,7 +46,7 @@ export interface CacheDiskArgs {
   cacheDir?: string;
 }
 
-/** The SSD cache options a qwen3_5 / qwen3_5_moe load receives. */
+/** The SSD cache options a qwen3_5 / qwen3_5_moe / qwen4_exp load receives. */
 export interface ResolvedCacheDisk {
   cacheDisk: string;
   cacheDir?: string;

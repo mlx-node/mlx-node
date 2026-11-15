@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vite-plus/test';
 
-import { COLD_TIER_RESTORE_FAMILIES } from '../../../packages/lm/src/cold-tier.js';
+import { COLD_TIER_RESTORE_FAMILIES, COLD_TIER_STATE_FAMILIES } from '../../../packages/lm/src/cold-tier.js';
 import { MAX_YARN_CONTEXT_TOKENS } from '../../../packages/server/src/host/max-context.js';
 import {
   COLD_CAPTURE_BLOCKS_ENV,
@@ -106,8 +106,11 @@ describe('Flash Next stored states on disk', () => {
   // leaves the env unset.
   const host = PERSIST_PAGED_CACHE_DEFAULT;
 
-  it('qwen4_exp is on the restore allowlist', () => {
-    expect(COLD_TIER_RESTORE_FAMILIES.has('qwen4_exp')).toBe(true);
+  // Its states and their chains live in the model's own tier, not the
+  // process cold tier.
+  it('qwen4_exp keeps its states in its own tier', () => {
+    expect(COLD_TIER_RESTORE_FAMILIES.has('qwen4_exp')).toBe(false);
+    expect(COLD_TIER_STATE_FAMILIES.has('qwen4_exp')).toBe(true);
   });
 
   it('is on by default for every host', () => {

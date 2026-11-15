@@ -249,10 +249,11 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
   /** Whether the cold tier was open for this turn (`ColdCacheStats.enabled`). */
   coldEnabled?: boolean;
   /**
-   * The SSD state tier's mode at the end of a qwen3_5 / qwen3_5_moe turn: their
-   * disk cache, which {@link coldEnabled} does not see. The most lasting mode
-   * over the engine's loaded models (`memoryGovernorStatus().dflash2States.disk`).
-   * Absent for every other family.
+   * The SSD state tier's mode at the end of a qwen3_5 / qwen3_5_moe / qwen4_exp
+   * turn: their disk cache, which {@link coldEnabled} does not see. For
+   * qwen4_exp the model's own `stateTierMode()`; for the others the most
+   * lasting mode over the engine's loaded models
+   * (`memoryGovernorStatus().dflash2States.disk`). Absent for every other family.
    */
   stateTier?: StateTierMode;
   /**

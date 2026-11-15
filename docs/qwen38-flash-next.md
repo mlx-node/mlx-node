@@ -316,12 +316,15 @@ largest, one pass's transient, the rows and the MTP state (about 12 states
 without the head on a busy 128 GB host, from plan numbers); a row's admission
 takes stored states back first, checkpoints before replay points, never one a
 running turn uses. `resetCaches` and a GPU reset drop them and purge the
-prefix cache. With the paged cache's disk tier on (every host by default:
+prefix cache. With the paged cache's disk switch on (every host by default:
 `mlx serve`, `mlx agent` and the desktop engine; GGUF loads only) a turn's
-replay state, its KV blocks and its draft segments also go to disk behind the
-turn, and a restarted engine restores the deepest state of a prompt whose
-chain is whole (see paged-cache.md, "SSD cold tier"); otherwise a restart
-starts cold.
+replay state, its KV blocks and its draft segments also go to the model's own
+SSD tier behind the turn (a locked directory under
+`~/.mlx-node/cache/prefix-cache`, `--max-cache-disk` / `--cache-dir`; a second
+process on the same checkpoint keeps its states in memory), and a restarted
+engine restores the deepest state of a prompt whose chain is whole (see
+paged-cache.md, "qwen4_exp (Flash Next) on disk"); otherwise a restart starts
+cold. A clean stop calls the model's `closeCache`.
 
 Native MTP is **opt-in** (`enableMtp: true`); it drafts two tokens per cycle
 unless `mtpDepth` says otherwise, capped at three. It runs
