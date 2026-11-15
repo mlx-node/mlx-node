@@ -5634,8 +5634,8 @@ export interface Qwen3AsrCaptureOptions {
   /** Audio source. Omit to capture the microphone. */
   source?: Qwen3AsrCaptureSource;
   /**
-   * Stable Core Audio device UID returned by `qwen3AsrAudioDevices()` or
-   * `qwen3AsrInputDevices()`.
+   * Stable native device ID returned by `qwen3AsrAudioDevices()` or
+   * `qwen3AsrInputDevices()` (Core Audio UID on macOS, WASAPI endpoint ID on Windows).
    */
   deviceId?: string;
   /**

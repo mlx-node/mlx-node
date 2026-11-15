@@ -69,7 +69,14 @@ tokenizers = { workspace = true, features = ["esaxx_fast"] }
 [target.'cfg(windows)'.dependencies]
 # esaxx_fast forces the static MSVC CRT. The pure Rust trainer works with Node's DLL CRT.
 tokenizers = { workspace = true }
-windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_SystemInformation",
+  "Win32_System_Variant",
+] }
 
 [[bench]]
 name = "attention_vjp_bench"
