@@ -2866,8 +2866,8 @@ export declare const enum BuiltinRewardType {
  * The nvidia recipe covers BOTH `qwen3_5` (dense) and `qwen3_5_moe` (MoE), so
  * this reads `<model_path>/config.json`'s `model_type` and dispatches to the
  * matching loader + `CalibratePrefillRaw` command (any other `model_type` is a
- * clear error). Both loaders are the SAME ones the inference session uses
- * ([`persistence::load_with_thread`]) — the model is only usable on its
+ * clear error). Both loaders are the inference loader without its warm-up
+ * ([`persistence::load_for_tool`]) — the model is only usable on its
  * dedicated model thread. Then:
  *   1. dispatches `{Qwen35Cmd,Qwen35MoeCmd}::CalibratePrefillRaw`, which on the
  *      model thread SELF-ARMS that thread's thread-local
@@ -6648,10 +6648,7 @@ export interface WarmupReport {
   steps: number;
   /** Steps not run, or run smaller than planned. */
   skipped: number;
-  /**
-   * 1 when a cache reset made the model's state read as before, or when
-   * the warm-up moved this model's governor books, which no reset undoes.
-   */
+  /** 1 when a cache reset made the model's state read as before. */
   reset: number;
   /** Pipelines and source libraries created during the warm-up. */
   pipelines: number;

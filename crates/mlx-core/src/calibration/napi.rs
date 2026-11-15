@@ -195,8 +195,8 @@ fn persist_amax_if_any(config_path: &Path, amax: &HashMap<String, f32>) -> Resul
 /// The nvidia recipe covers BOTH `qwen3_5` (dense) and `qwen3_5_moe` (MoE), so
 /// this reads `<model_path>/config.json`'s `model_type` and dispatches to the
 /// matching loader + `CalibratePrefillRaw` command (any other `model_type` is a
-/// clear error). Both loaders are the SAME ones the inference session uses
-/// ([`persistence::load_with_thread`]) — the model is only usable on its
+/// clear error). Both loaders are the inference loader without its warm-up
+/// ([`persistence::load_for_tool`]) — the model is only usable on its
 /// dedicated model thread. Then:
 ///   1. dispatches `{Qwen35Cmd,Qwen35MoeCmd}::CalibratePrefillRaw`, which on the
 ///      model thread SELF-ARMS that thread's thread-local
@@ -262,9 +262,8 @@ pub async fn calibrate_activation_amax_raw(
         // dedicated model thread via a command.
         "qwen3_5" => {
             // A bf16 pool: the amax must not depend on the serving K/V format.
-            let model = crate::models::qwen3_5::persistence::load_with_thread(
+            let model = crate::models::qwen3_5::persistence::load_for_tool(
                 &model_path,
-                None,
                 Some(crate::transformer::KvFormat::Bf16),
             )
             .await?;
@@ -284,9 +283,8 @@ pub async fn calibrate_activation_amax_raw(
         // input_amax for its mxfp8 attn/GDN sites (agentworld etc.).
         "qwen3_5_moe" => {
             // A bf16 pool: the amax must not depend on the serving K/V format.
-            let model = crate::models::qwen3_5_moe::persistence::load_with_thread(
+            let model = crate::models::qwen3_5_moe::persistence::load_for_tool(
                 &model_path,
-                None,
                 Some(crate::transformer::KvFormat::Bf16),
             )
             .await?;

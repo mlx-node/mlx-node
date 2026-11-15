@@ -1811,7 +1811,8 @@ pub(crate) fn drop_unheld_vision<T: DFlash2Target>(target: &T) {
 }
 
 /// Splash `MemoryControl::run` between a whole turn's steps: the
-/// governor's control pass over this model's units, `keep` kept.
+/// governor's control pass over this model's units, `keep` kept. A load's
+/// warm-up runs none: the pass writes process-wide books other models read.
 fn run_control_pass<T: DFlash2Target>(
     governor: &Governor,
     model: u64,
@@ -1819,7 +1820,7 @@ fn run_control_pass<T: DFlash2Target>(
     target: &mut T,
     keep: Keep<'_>,
 ) {
-    if model == 0 || !governor.control_due(model, forced) {
+    if model == 0 || crate::engine::warmup::warming() || !governor.control_due(model, forced) {
         return;
     }
     let mut units = ModelUnits { target, keep };

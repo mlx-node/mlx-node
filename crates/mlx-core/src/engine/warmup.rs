@@ -4,9 +4,10 @@
 //! copy a first turn would otherwise compile pipelines for, each turn ended
 //! by its cancel. The pool keeps its size, the SSD state tier and the
 //! states it took back are set aside, no scratch turn (nor its replay after
-//! a preemption) reuses or publishes a cache entry, and the model's state
-//! must read as it did before; a memory limit skips a step, any other error
-//! fails the load.
+//! a preemption) reuses or publishes a cache entry, the model's state must
+//! read as it did before, and the model's governor books are put back; a
+//! memory limit skips a step, a claim left open or any other error fails the
+//! load. A load that serves no chat turn runs none.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -48,6 +49,19 @@ thread_local! {
     /// Step A admits its full rows without checking that they fit.
     pub(crate) static OVERSIZE_MAX_PREFILL: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Accounts no serving model has are published before the warm-up's
+    /// end.
+    pub(crate) static STALE_ACCOUNTS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// A claim for the model is opened after the steps and never closed.
+    pub(crate) static LEAK_CLAIM: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// A lane of the model is suspended after the steps.
+    pub(crate) static SUSPEND_AFTER_STEPS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// The model's next control pass time, read after the steps.
+    pub(crate) static CONTROL_AFTER_STEPS: std::cell::Cell<Option<f64>> =
+        const { std::cell::Cell::new(None) };
 }
 
 fn oversize_max_prefill() -> bool {
@@ -104,8 +118,7 @@ pub struct WarmupReport {
     pub steps: u32,
     /// Steps not run, or run smaller than planned.
     pub skipped: u32,
-    /// 1 when a cache reset made the model's state read as before, or when
-    /// the warm-up moved this model's governor books, which no reset undoes.
+    /// 1 when a cache reset made the model's state read as before.
     pub reset: u32,
     /// Pipelines and source libraries created during the warm-up.
     pub pipelines: u32,
@@ -293,9 +306,9 @@ impl Snapshot {
         }
     }
 
-    /// The rows of the model's state that differ from `before`, and whether
-    /// the governor's books differ.
-    fn differs(&self, before: &Self) -> (Vec<&'static str>, bool) {
+    /// The rows of the model's state that differ from `before`; the
+    /// governor's books are not rows: the warm-up puts them back.
+    fn differs(&self, before: &Self) -> Vec<&'static str> {
         let mut rows = Vec::new();
         let mut row = |name: &'static str, same: bool| {
             if !same {
@@ -333,7 +346,37 @@ impl Snapshot {
             "speculation owners",
             self.speculation_owners == before.speculation_owners,
         );
-        (rows, self.books != before.books)
+        rows
+    }
+}
+
+/// Puts back what the scratch turns moved in `inner`'s governor books and
+/// republishes the serving model's accounts and states over the last
+/// scratch pass's.
+fn put_back_books<B: HybridSchedulerBackend>(inner: &B, attached: &ModelBooks, after: &ModelBooks) {
+    let model = inner.memory_model();
+    let Some(governor) = inner.memory_governor().filter(|_| model != 0) else {
+        return;
+    };
+    #[cfg(test)]
+    if STALE_ACCOUNTS.take() {
+        governor.publish_accounts(
+            model,
+            crate::engine::governor::governor::MemoryAccounts {
+                kv: 1 << 40,
+                states: 1 << 40,
+                embeddings: 1 << 40,
+            },
+        );
+    }
+    if after != attached {
+        governor.restore_model_books(model, attached);
+    }
+    if let Some(accounts) = inner.memory_accounts() {
+        governor.publish_accounts(model, accounts);
+    }
+    if let Some(states) = inner.dflash2_state_status() {
+        governor.publish_dflash2_states(model, states);
     }
 }
 
@@ -372,13 +415,15 @@ fn memory_limited(error: &Error) -> bool {
         || error.reason.starts_with("context_length_exceeded:")
 }
 
-/// The serving scheduler of a load: a paged load warms up first; a load
-/// with no pool serves at once and reports no warm-up.
+/// The serving scheduler of a load: a paged load that will serve chat
+/// turns (`warm`) warms up first; a load with no pool, or one whose model a
+/// tool drives directly, starts at once and reports no warm-up.
 pub(crate) fn serving_scheduler<B: HybridSchedulerBackend>(
     inner: B,
     progress: &LoadProgressCell,
+    warm: bool,
 ) -> Result<(HybridSchedulerState<B>, Option<WarmupReport>)> {
-    if !inner.scheduler_cache_available() {
+    if !warm || !inner.scheduler_cache_available() {
         return Ok((HybridSchedulerState::new(inner)?, None));
     }
     let warmed = run(inner, progress)?;
@@ -452,6 +497,8 @@ pub(crate) fn run_with<B: HybridSchedulerBackend>(
         run.scratch.fail_next_step(reason);
     }
     run.all_steps()?;
+    #[cfg(test)]
+    run.after_steps_hooks();
     let preempted = run.scratch.preemptions() > 0;
     let (finalized, trace) = (run.finalized, std::mem::take(&mut run.trace));
     let (mut inner, next_seq_id) = run.scratch.into_parts();
@@ -460,12 +507,12 @@ pub(crate) fn run_with<B: HybridSchedulerBackend>(
     }
     crate::array::memory::synchronize_and_clear_cache_checked("load warm-up")?;
     let peak_bytes = crate::array::memory::get_peak_memory();
-    let (rows, books) = Snapshot::take(&inner).differs(&before);
+    let rows = Snapshot::take(&inner).differs(&before);
     let mut reset = 0;
     if finalized || preempted || !rows.is_empty() {
         inner.reset_caches(ResetScope::Command)?;
         reset = 1;
-        let (rows, _) = Snapshot::take(&inner).differs(&before);
+        let rows = Snapshot::take(&inner).differs(&before);
         if !rows.is_empty() {
             return Err(left_changed("after a cache reset", &rows));
         }
@@ -473,18 +520,15 @@ pub(crate) fn run_with<B: HybridSchedulerBackend>(
     if let Some(held) = held_tier {
         inner.release_state_tier(held);
     }
-    let (rows, _) = Snapshot::take(&inner).differs(&attached);
+    let after = Snapshot::take(&inner);
+    let rows = after.differs(&attached);
     if !rows.is_empty() {
         return Err(left_changed("with its state tier back", &rows));
     }
-    if books {
-        tracing::warn!(
-            target: "mlx_core::inference",
-            "load warm-up moved the memory governor's books of model {}",
-            inner.memory_model()
-        );
-        reset = 1;
+    if after.books.open_claims != attached.books.open_claims {
+        return Err(Error::from_reason("load warm-up left a memory claim open"));
     }
+    put_back_books(&inner, &attached.books, &after.books);
     let pipelines_after = crate::engine::pipeline_counter::read();
     let (pipelines, compile_ms) = match (&pipelines_before, &pipelines_after) {
         (Some(before), Some(after)) => (
@@ -541,6 +585,34 @@ struct Run<'a, B: HybridSchedulerBackend> {
 }
 
 impl<B: HybridSchedulerBackend> Run<'_, B> {
+    #[cfg(test)]
+    fn after_steps_hooks(&self) {
+        let model = self.scratch.inner.memory_model();
+        let Some(governor) = self.scratch.inner.memory_governor() else {
+            return;
+        };
+        CONTROL_AFTER_STEPS.set(Some(governor.model_books(model).next_control));
+        if SUSPEND_AFTER_STEPS.take() {
+            governor.lane_suspended(model, governor.now(), None);
+        }
+        if LEAK_CLAIM.take() {
+            use crate::engine::governor::ledger::{
+                ClaimClass, ClaimRank, ClaimSpec, NeedTiming, ReachClass,
+            };
+            let claim = governor.open(
+                ClaimSpec {
+                    cls: ClaimClass::InService,
+                    request_id: 1,
+                    rank: ClaimRank::default(),
+                    reach: ReachClass::InUse,
+                    timing: NeedTiming::CanWait,
+                },
+                model,
+            );
+            std::mem::forget(claim);
+        }
+    }
+
     fn all_steps(&mut self) -> Result<()> {
         let reached = self.max_prefill()?;
         self.done();

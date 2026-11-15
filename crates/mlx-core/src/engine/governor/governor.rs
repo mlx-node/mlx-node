@@ -569,9 +569,12 @@ struct ModelEntry {
     dflash2_states: DFlash2StateStatus,
 }
 
-/// What one model's requests moved in the governor's books. The
+/// Every per-model counter or timer a request moves, except `epoch`. The
 /// process-wide refusal counters are not in them: another model's requests
-/// move those.
+/// move those. The published copies (`accounts`, `dflash2_states`) are not
+/// here: the warm-up republishes them. `scheduler` is never set by a
+/// scratch scheduler. A field a request moves that is added to the model's
+/// entry belongs here and in [`Governor::restore_model_books`].
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ModelBooks {
     pub metal_out_of_memory: u64,
@@ -581,6 +584,11 @@ pub(crate) struct ModelBooks {
     pub replans: u64,
     pub drain_end: f64,
     pub allocation_failed: bool,
+    pub publications_refused: u64,
+    pub waits: ResourceWaitStatus,
+    pub wanted: Arc<WantedChains>,
+    pub next_control: f64,
+    pub next_host_pass: f64,
     pub open_claims: usize,
 }
 
@@ -1710,8 +1718,48 @@ impl Governor {
             out.replans = entry.replans;
             out.drain_end = entry.drain_end;
             out.allocation_failed = entry.allocation_failed;
+            out.publications_refused = entry.publications_refused;
+            out.waits = entry.waits;
+            out.wanted = Arc::clone(&entry.wanted);
+            out.next_control = entry.next_control;
+            out.next_host_pass = entry.next_host_pass;
         }
         out
+    }
+
+    /// Writes `books` back as `model`'s, all but its open claims (the
+    /// ledger's). The epoch keeps moving: a wait only needs it to differ.
+    pub(crate) fn restore_model_books(&self, model: u64, books: &ModelBooks) {
+        let mut guard = self.lock();
+        let Some(entry) = guard.model(model) else {
+            return;
+        };
+        entry.metal_out_of_memory = books.metal_out_of_memory;
+        entry.gpu_oom = books.gpu_oom;
+        entry.suspensions = books.suspensions;
+        entry.resumptions = books.resumptions;
+        entry.replans = books.replans;
+        entry.drain_end = books.drain_end;
+        entry.allocation_failed = books.allocation_failed;
+        entry.publications_refused = books.publications_refused;
+        entry.waits = books.waits;
+        entry.wanted = Arc::clone(&books.wanted);
+        entry.next_control = books.next_control;
+        entry.next_host_pass = books.next_host_pass;
+    }
+
+    /// The accounts `model`'s thread last published.
+    #[cfg(test)]
+    pub(crate) fn published_accounts(&self, model: u64) -> Option<MemoryAccounts> {
+        let published = self
+            .lock()
+            .model(model)
+            .map(|entry| Arc::clone(&entry.accounts))?;
+        Some(MemoryAccounts {
+            kv: published.kv.load(Ordering::Relaxed),
+            states: published.states.load(Ordering::Relaxed),
+            embeddings: published.embeddings.load(Ordering::Relaxed),
+        })
     }
 
     #[cfg(test)]

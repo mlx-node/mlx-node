@@ -823,6 +823,223 @@ fn a_change_left_after_the_tier_came_back_names_its_rows() {
     );
 }
 
+fn governor_of<B: HybridSchedulerBackend>(
+    inner: &B,
+) -> (&'static crate::engine::governor::governor::Governor, u64) {
+    let model = inner.memory_model();
+    assert_ne!(model, 0, "the fixture is registered");
+    (inner.memory_governor().expect("governor"), model)
+}
+
+/// A preempted scratch turn's resume and a lane suspended during the
+/// warm-up move this model's books; the load leaves them as they were, and
+/// serving starts with no drain. Mutation: the books are not put back → red
+/// (`resumptions` 1 ≠ 0).
+#[test]
+fn a_moved_book_is_put_back() {
+    const NAME: &str = "engine::warmup::tests::a_moved_book_is_put_back";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    let inner = dense(4);
+    let (governor, model) = governor_of(&inner);
+    let before = governor.model_books(model);
+    PREEMPT_FIRST_DECODE.set(true);
+    SUSPEND_AFTER_STEPS.set(true);
+    let warmed = warm(inner);
+    assert!(!PREEMPT_FIRST_DECODE.get(), "a scratch turn was preempted");
+    assert!(!SUSPEND_AFTER_STEPS.get(), "a lane was suspended");
+    assert_eq!(warmed.report.reset, 1, "{:?}", warmed.report);
+    assert_eq!(governor.model_books(model), before);
+    assert!(!governor.draining_for_recovery(model, governor.now(), true));
+}
+
+/// A drive pass woken by the memory monitor runs the control pass on a
+/// serving scheduler and none on a scratch one. Mutation: a scratch
+/// scheduler runs it → red.
+#[test]
+fn a_scratch_pass_runs_no_control_pass() {
+    const NAME: &str = "engine::warmup::tests::a_scratch_pass_runs_no_control_pass";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    for scratch in [false, true] {
+        let inner = dense(4);
+        let (governor, model) = governor_of(&inner);
+        assert_eq!(governor.model_books(model).next_control, 0.0);
+        let mut state = if scratch {
+            HybridSchedulerState::scratch(inner)
+        } else {
+            HybridSchedulerState::new(inner)
+        }
+        .expect("scheduler");
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert!(sender.send(ModelCommand::MemoryControl).is_ok());
+        state.drive(&mut receiver);
+        let next_control = governor.model_books(model).next_control;
+        if scratch {
+            assert_eq!(next_control, 0.0, "a scratch pass ran the control pass");
+        } else {
+            assert!(next_control > 0.0, "a serving pass ran the control pass");
+        }
+        drop(sender);
+    }
+}
+
+/// No control pass runs during a warm-up: neither the scratch scheduler's
+/// nor the one a scratch turn's claimed step runs. Mutation: a claimed step
+/// runs it while warming → red (`next_control` 0.5).
+#[test]
+fn a_warm_up_runs_no_control_pass() {
+    const NAME: &str = "engine::warmup::tests::a_warm_up_runs_no_control_pass";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    let inner = dense(4);
+    let (governor, model) = governor_of(&inner);
+    CONTROL_AFTER_STEPS.set(None);
+    let warmed = warm(inner);
+    assert!(!warmed.trace.seq_ids.is_empty());
+    assert_eq!(CONTROL_AFTER_STEPS.take(), Some(0.0));
+    assert_eq!(governor.model_books(model).next_control, 0.0);
+}
+
+/// A claim the warm-up leaves open fails the load. Mutation: the open
+/// claim is not checked → red (`Ok`).
+#[test]
+fn an_open_claim_fails_the_load() {
+    const NAME: &str = "engine::warmup::tests::an_open_claim_fails_the_load";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    LEAK_CLAIM.set(true);
+    let failed = run_with(dense(4), &LoadProgressCell::default(), SLICE);
+    assert!(!LEAK_CLAIM.get(), "a claim was left open");
+    match failed {
+        Ok(warmed) => panic!("the warm-up succeeded: {:?}", warmed.report),
+        Err(error) => assert_eq!(error.reason, "load warm-up left a memory claim open"),
+    }
+}
+
+/// The accounts published at the warm-up's end are the serving model's,
+/// not what a scratch pass left. Mutation: no republish → red (the
+/// sentinel stays).
+#[test]
+fn accounts_read_the_serving_model_after_warm_up() {
+    const NAME: &str = "engine::warmup::tests::accounts_read_the_serving_model_after_warm_up";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    let inner = dense(4);
+    let (governor, model) = governor_of(&inner);
+    STALE_ACCOUNTS.set(true);
+    let warmed = warm(inner);
+    assert!(!STALE_ACCOUNTS.get(), "the stale accounts were published");
+    let serving = warmed.inner.memory_accounts().expect("accounts");
+    assert_ne!(serving.kv, 1 << 40);
+    assert_eq!(governor.published_accounts(model), Some(serving));
+}
+
+/// A load that serves no chat turn starts its scheduler with no warm-up
+/// and no scratch sequence; a serving load warms up. Mutation: the flag is
+/// ignored → red (`Some`).
+#[test]
+fn a_load_that_serves_nothing_runs_no_warm_up() {
+    const NAME: &str = "engine::warmup::tests::a_load_that_serves_nothing_runs_no_warm_up";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    let (state, report) =
+        serving_scheduler(dense(4), &LoadProgressCell::default(), false).expect("tool load");
+    assert_eq!(report, None);
+    assert_eq!(state.into_parts().1, 1, "no scratch sequence ran");
+    let (state, report) =
+        serving_scheduler(dense(4), &LoadProgressCell::default(), true).expect("serving load");
+    let report = report.expect("a serving load warms up");
+    assert!(report.steps > 0, "{report:?}");
+    assert!(state.into_parts().1 > 1);
+}
+
+/// `mlx eval` and FP8 calibration load through [`load_tool_source`] with no
+/// warm-up, on both families' small synthetic checkpoints with a pool.
+/// Mutation: the tool load warms up → red.
+///
+/// [`load_tool_source`]: crate::models::qwen3_5::persistence::load_tool_source
+#[test]
+fn a_tool_load_reports_no_warm_up() {
+    use crate::engine::checkpoint_source::CheckpointSource;
+    use crate::utils::gguf::NativeGgufFamily;
+    use crate::utils::gguf_test_fixtures::Qwen35Geometry;
+    const NAME: &str = "engine::warmup::tests::a_tool_load_reports_no_warm_up";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    for (label, geometry, family) in [
+        (
+            "tool-dense",
+            Qwen35Geometry::QWEN38_27B.small(),
+            NativeGgufFamily::Qwen35,
+        ),
+        (
+            "tool-moe",
+            Qwen35Geometry::ORNITH_35B.small(),
+            NativeGgufFamily::Qwen35Moe,
+        ),
+    ] {
+        let dir = GeometryDir(std::env::temp_dir().join(format!(
+            "mlx-warmup-geometry-{label}-{}",
+            std::process::id()
+        )));
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let path = dir.0.join(format!("{label}.gguf"));
+        let (metadata, tensors) =
+            crate::utils::gguf_test_fixtures::qwen35_geometry_checkpoint(&geometry);
+        crate::utils::gguf_test_fixtures::write_streamed_gguf(
+            &path,
+            &metadata,
+            &tensors,
+            0x5741_7300,
+        )
+        .expect("write the synthetic checkpoint");
+        let (paged, warmup) = runtime.block_on(async {
+            let source = CheckpointSource::resolve_in(&path, family, Some(&dir.0.join("cache")))
+                .await
+                .unwrap_or_else(|error| panic!("{label}: resolve: {}", error.reason));
+            let loaded = match family {
+                NativeGgufFamily::Qwen35Moe => {
+                    crate::models::qwen3_5_moe::persistence::load_tool_source(&source, None)
+                        .await
+                        .map(|model| (model.paged_active, model.warmup.clone()))
+                }
+                _ => crate::models::qwen3_5::persistence::load_tool_source(&source, None)
+                    .await
+                    .map(|model| (model.paged_active, model.warmup.clone())),
+            };
+            loaded.unwrap_or_else(|error| {
+                source.release_lease();
+                panic!("{label}: load: {}", error.reason)
+            })
+        });
+        assert!(paged, "{label}: the load has a pool");
+        assert_eq!(warmup, None, "{label}");
+    }
+}
+
 /// [`crate::test_support::in_own_process`] that also prints the child's
 /// `W-T1r` lines.
 fn in_own_process_printing(name: &str) -> bool {

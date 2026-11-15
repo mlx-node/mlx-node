@@ -61,6 +61,24 @@ only source of the recurrent-state table width, the admission check, the
 scheduler's running-set capacity and `maxConcurrentSequences()`; the memory
 plan's log names it (`N decode lanes`).
 
+**Load warm-up.** A paged Qwen3.5 dense or MoE load that will serve chat
+turns warms up before it serves (`engine/warmup.rs`): scratch turns on a
+throwaway scheduler run the prefill row classes, each decode width and the
+speculative shapes, so a first turn compiles no pipeline. `mlx eval`, FP8
+calibration and CLEF drive the model directly and load with no warm-up
+(`load_for_tool`). The model's state must read as before; a cache reset
+puts back what a scratch turn left in the caches (`WarmupReport.reset`),
+and the model's governor books (suspensions, resumptions, drain, waits,
+timers, refused publications) are written back to their values before the
+warm-up. No memory control pass runs during the warm-up (it writes
+process-wide books other models read), and a claim a scratch turn leaves
+open fails the load. Differences from Splash's start,
+which runs the warm-up under one `Floor` claim: our scratch claims are
+ordinary ones, so the host margin, a macOS warning or the band can refuse
+them; a refused one may free this model's cache units (the reset and the
+state check catch it); and a memory limit skips any step, where Splash
+requires the largest prefill, the row classes and width 1.
+
 Unit-test table (`lanes_follow_the_device`; physical memory = the column,
 working set = 3/4 of it; one lane's window in tokens):
 

@@ -782,6 +782,51 @@ mod tests {
     }
 
     #[test]
+    fn a_cycle_hit_cuts_as_a_budget_of_that_size() {
+        let mut probe = ReasoningTracker::guarded(true, None, &[8, 9], true);
+        let mut thought = looping_thought();
+        let mut hit = 0;
+        while probe.unforced_token_budget().is_none() {
+            probe.observe_token(thought.next().unwrap());
+            hit += 1;
+        }
+        assert_eq!(hit, 700);
+
+        let mut guarded = ReasoningTracker::guarded(true, None, &[8, 9], true);
+        let mut budgeted =
+            ReasoningTracker::guarded(true, Some(hit + CYCLE_CUT_GRACE), &[8, 9], false);
+        let mut thought = looping_thought();
+        let mut emitted = 0;
+        while guarded.in_thinking || budgeted.in_thinking {
+            assert!(emitted < 2000, "the cut never closed the thought");
+            let forced = guarded.take_forced_token();
+            assert_eq!(forced, budgeted.take_forced_token(), "token {emitted}");
+            let token = forced.unwrap_or_else(|| thought.next().unwrap());
+            assert_eq!(guarded.observe_token(token), budgeted.observe_token(token));
+            emitted += 1;
+            if emitted >= hit {
+                assert_eq!(
+                    guarded.unforced_token_budget(),
+                    budgeted.unforced_token_budget(),
+                    "token {emitted}"
+                );
+                assert_eq!(guarded.ending(), budgeted.ending(), "token {emitted}");
+                assert_eq!(
+                    guarded.peek_forced_token(),
+                    budgeted.peek_forced_token(),
+                    "token {emitted}"
+                );
+            }
+        }
+        assert_eq!(emitted, 766);
+        let (guarded, budgeted) = (guarded.outcome(), budgeted.outcome());
+        assert_eq!(guarded.close, Some(ReasoningClose::Cycle));
+        assert_eq!(budgeted.close, Some(ReasoningClose::Budget));
+        assert_eq!(guarded.cut_at, budgeted.cut_at);
+        assert_eq!(guarded.tokens, budgeted.tokens);
+    }
+
+    #[test]
     fn closes_after_the_thought_are_stray() {
         let mut tracker = ReasoningTracker::new(true, None, &[8, 9]);
         for token in [100, 9, 5, 9, 6] {

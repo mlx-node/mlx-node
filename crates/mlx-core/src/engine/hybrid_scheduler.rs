@@ -4363,9 +4363,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// Splash `MemoryControl::run` on the model thread: the governor's
     /// control pass over the model's units and idle owners, once per
     /// monitor period, at once on the monitor's wake, and again while the
-    /// pass waits for what lands.
+    /// pass waits for what lands. A scratch scheduler runs none: the pass
+    /// writes process-wide books other models read.
     fn run_control_pass(&mut self, woke: bool) {
-        if self.judge_policy() != JudgePolicy::Ledger {
+        if self.scratch || self.judge_policy() != JudgePolicy::Ledger {
             return;
         }
         let model = self.inner.memory_model();

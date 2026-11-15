@@ -1772,6 +1772,34 @@ pub async fn load_with_thread(
     .await
 }
 
+/// [`load_with_thread`] for a tool that drives the model directly (`mlx
+/// eval`, FP8 calibration): no load warm-up, since no scheduled turn runs.
+pub async fn load_for_tool(
+    model_path: &str,
+    kv_format: Option<crate::transformer::KvFormat>,
+) -> Result<Qwen3_5MoeModel> {
+    load_tool_source(&CheckpointSource::Dir(PathBuf::from(model_path)), kv_format).await
+}
+
+/// The caller releases `source`'s lease when this fails.
+pub(crate) async fn load_tool_source(
+    source: &CheckpointSource,
+    kv_format: Option<crate::transformer::KvFormat>,
+) -> Result<Qwen3_5MoeModel> {
+    load_with_source_impl(
+        source,
+        None,
+        kv_format,
+        None,
+        None,
+        crate::engine::scheduler::DEFAULT_DECODE_SHARE,
+        crate::disk_tier::DiskTierOptions::default(),
+        false,
+        crate::engine::load_progress::LoadProgressCell::detached(),
+    )
+    .await
+}
+
 /// The text weights of the checkpoint: a GGUF preload when `preload_input` is
 /// set (`path` is then its asset directory and holds no weights), else the
 /// safetensors in `path`. Runs on the model thread.
@@ -1805,6 +1833,32 @@ pub(crate) async fn load_with_source(
     max_context: Option<u32>,
     decode_share: f64,
     disk: crate::disk_tier::DiskTierOptions,
+    progress: Arc<crate::engine::load_progress::LoadProgressCell>,
+) -> Result<Qwen3_5MoeModel> {
+    load_with_source_impl(
+        source,
+        draft_model_path,
+        kv_format,
+        max_memory_bytes,
+        max_context,
+        decode_share,
+        disk,
+        true,
+        progress,
+    )
+    .await
+}
+
+/// `warm`: the load serves chat turns and warms up first.
+async fn load_with_source_impl(
+    source: &CheckpointSource,
+    draft_model_path: Option<String>,
+    kv_format: Option<crate::transformer::KvFormat>,
+    max_memory_bytes: Option<u64>,
+    max_context: Option<u32>,
+    decode_share: f64,
+    disk: crate::disk_tier::DiskTierOptions,
+    warm: bool,
     progress: Arc<crate::engine::load_progress::LoadProgressCell>,
 ) -> Result<Qwen3_5MoeModel> {
     // Snapshot once, before spawning; forward/compiled graphs never read this
@@ -2315,7 +2369,7 @@ pub(crate) async fn load_with_source(
                 crate::stream::WiredResidency::working_set_minus_pools,
             ));
             let context_limits = inner.finish_load_limits()?;
-            let (state, warmup) = crate::engine::warmup::serving_scheduler(inner, &progress)?;
+            let (state, warmup) = crate::engine::warmup::serving_scheduler(inner, &progress, warm)?;
 
             Ok((
                 state,

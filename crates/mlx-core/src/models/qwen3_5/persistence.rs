@@ -2585,6 +2585,35 @@ pub async fn load_with_thread(
     .await
 }
 
+/// [`load_with_thread`] for a tool that drives the model directly (`mlx
+/// eval`, FP8 calibration): no load warm-up, since no scheduled turn runs.
+pub async fn load_for_tool(
+    model_path: &str,
+    kv_format: Option<crate::transformer::KvFormat>,
+) -> Result<Qwen3_5Model> {
+    load_tool_source(&CheckpointSource::Dir(PathBuf::from(model_path)), kv_format).await
+}
+
+/// The caller releases `source`'s lease when this fails.
+pub(crate) async fn load_tool_source(
+    source: &CheckpointSource,
+    kv_format: Option<crate::transformer::KvFormat>,
+) -> Result<Qwen3_5Model> {
+    load_with_thread_impl(
+        source,
+        None,
+        kv_format,
+        None,
+        None,
+        crate::engine::scheduler::DEFAULT_DECODE_SHARE,
+        crate::disk_tier::DiskTierOptions::default(),
+        false,
+        false,
+        crate::engine::load_progress::LoadProgressCell::detached(),
+    )
+    .await
+}
+
 /// The caller releases `source`'s lease when this fails.
 pub(crate) async fn load_with_source(
     source: &CheckpointSource,
@@ -2605,6 +2634,7 @@ pub(crate) async fn load_with_source(
         decode_share,
         disk,
         false,
+        true,
         progress,
     )
     .await
@@ -2625,6 +2655,7 @@ pub(crate) async fn load_clef_with_source(source: &CheckpointSource) -> Result<Q
             ..Default::default()
         },
         true,
+        false,
         crate::engine::load_progress::LoadProgressCell::detached(),
     )
     .await
@@ -2681,6 +2712,7 @@ async fn load_with_thread_impl(
     decode_share: f64,
     disk: crate::disk_tier::DiskTierOptions,
     clef: bool,
+    warm: bool,
     progress: Arc<crate::engine::load_progress::LoadProgressCell>,
 ) -> Result<Qwen3_5Model> {
     let model_assets_path = source.asset_dir().to_string_lossy().into_owned();
@@ -3338,7 +3370,7 @@ async fn load_with_thread_impl(
                 ));
             }
             let context_limits = inner.finish_load_limits()?;
-            let (state, warmup) = crate::engine::warmup::serving_scheduler(inner, &progress)?;
+            let (state, warmup) = crate::engine::warmup::serving_scheduler(inner, &progress, warm)?;
 
             Ok((
                 state,
