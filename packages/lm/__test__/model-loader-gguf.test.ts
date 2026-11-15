@@ -193,7 +193,10 @@ describe('standalone GGUF model detection', () => {
 
     const inside = await writeDraft(store);
     await loadModel(modelPath);
-    expect(loadSpy).toHaveBeenLastCalledWith(modelPath, { draftModelPath: inside });
+    expect(loadSpy).toHaveBeenLastCalledWith(
+      modelPath,
+      process.platform === 'darwin' ? { draftModelPath: inside } : null,
+    );
     await rm(inside, { recursive: true });
     await loadModel(modelPath);
     expect(loadSpy).toHaveBeenLastCalledWith(modelPath, null);

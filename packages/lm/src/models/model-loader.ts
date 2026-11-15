@@ -329,8 +329,12 @@ function dispatchLoad(
     );
   }
   const binding: LoaderBinding = LOADER_BINDINGS[modelType];
-  const draftModelPath =
-    options?.draftModelPath ?? (options?.autoLoadDraft === false ? undefined : findDFlash2Draft(modelPath, modelType));
+  // Automatic DFlash2 verification needs the Metal-only fused GDN kernel. Explicit drafts retain native validation.
+  const automaticDraft =
+    options?.autoLoadDraft === false || process.platform !== 'darwin'
+      ? undefined
+      : findDFlash2Draft(modelPath, modelType);
+  const draftModelPath = options?.draftModelPath ?? automaticDraft;
   return binding.load(modelPath, draftModelPath === undefined ? options : { ...options, draftModelPath });
 }
 
