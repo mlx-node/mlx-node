@@ -87,7 +87,7 @@ export function listTestFiles(): string[] {
     const testDir = join(packagesRoot, pkg, '__test__');
     if (existsSync(testDir) && statSync(testDir).isDirectory()) walk(testDir, files, /\.(test|spec)\.ts$/);
   }
-  return files.map((f) => relative(ROOT, f)).sort();
+  return files.map((f) => relative(ROOT, f).replaceAll('\\', '/')).sort();
 }
 
 interface PkgExports {
