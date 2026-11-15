@@ -15,13 +15,14 @@
  * `MLX_DEV_APP_END=no-ping|crash|signal|user`: an earlier Control Panel end over every Work conversation of the fixture.
  */
 
-import { mkdirSync, rmSync } from 'node:fs';
+import { closeSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createServer } from 'vite-plus';
 
 import { HARNESS_LOAD_MS, startHarnessEngine } from '../__test__/helpers/fake-engine.js';
 import { startHarnessProviders } from '../__test__/helpers/fake-providers.js';
+import { takeNamespaceLock } from '../src/prefix-cache.js';
 import { createDashboardRuntime } from '../src/runtime.js';
 import {
   assertFixtureTree,
@@ -30,6 +31,7 @@ import {
   fixtureArgs,
   fixtureExists,
   fixturePaths,
+  fixturePrefixNamespaces,
   type LiveProcess,
   refreshRuntime,
   resetHome,
@@ -98,6 +100,12 @@ async function main(): Promise<void> {
     live.startedAt = summary.live.startedAt;
   }
   const heartbeat = setInterval(() => writeLiveFile(home, live), HEARTBEAT_MS);
+  let prefixLock: number | null = null;
+  try {
+    prefixLock = takeNamespaceLock(join(paths.prefixCacheRoot, fixturePrefixNamespaces()[0]!));
+  } catch {
+    prefixLock = null;
+  }
 
   const providers = await startHarnessProviders();
   const loadMs = Number.parseInt(process.env.MLX_DEV_LOAD_MS ?? '', 10);
@@ -127,13 +135,7 @@ async function main(): Promise<void> {
   const workFolder = join(home, 'work', ...(process.env.MLX_DEV_WORK_DEEP === '1' ? DEEP_FOLDER : []));
   mkdirSync(workFolder, { recursive: true });
   const runtime = createDashboardRuntime({
-    dbPath: paths.dbPath,
-    modelsDir: paths.modelsDir,
-    tracesDir: paths.tracesDir,
-    runtimeDir: paths.runtimeDir,
-    supervisorPath: paths.supervisorPath,
-    cacheRoot: paths.cacheRoot,
-    agentHome: paths.agentHome,
+    ...paths,
     codingAgents: { home, env: {} },
     prepareDelegation: async () => FIXTURE_COMMAND,
     chat,
@@ -162,6 +164,7 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     clearInterval(heartbeat);
+    if (prefixLock !== null) closeSync(prefixLock);
     try {
       await server.close();
     } finally {

@@ -1,6 +1,6 @@
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import type { ChatResult, SchedulerStats } from '@mlx-node/core';
 import type { SessionCapableModel } from '@mlx-node/lm';
@@ -12,6 +12,7 @@ import {
   SAMPLE_IDLE_MS,
   shouldSnapshotScheduler,
   startRuntimeSampler,
+  stateRootLimit,
   type RuntimeSampler,
   type RuntimeSamplerDeps,
 } from '../../../packages/server/src/host/runtime-sampler.js';
@@ -227,6 +228,7 @@ describe('runtime sampler', () => {
           return false;
         },
         coldCapture: { blocksPerTurn: 63_125, budgetMs: 10_000 },
+        cacheDir: null,
       },
       trace,
       dir,
@@ -438,6 +440,7 @@ describe('runtime sampler', () => {
         queued: 0,
         queueLimit: 16,
         pool: null,
+        stateNamespace: null,
       },
     ]);
     expect(live.turns).toEqual([
@@ -479,6 +482,7 @@ describe('runtime sampler', () => {
           return false;
         },
         coldCapture: null,
+        cacheDir: null,
       },
     });
     await landed();
@@ -486,6 +490,81 @@ describe('runtime sampler', () => {
     const live = JSON.parse(readFileSync(liveFile, 'utf8')) as RuntimeLiveFile;
     expect(live.persistPagedCache).toBe(false);
     expect(live.coldCapture).toBeNull();
+  });
+
+  it('the heartbeat carries the state cache dir and its limit', async () => {
+    const { entry } = fakeBinding();
+    start([entry], {
+      health: () => ({
+        status: 'ok',
+        memory_governor: { dflash2_states: { disk: { mode: 'persistent', limit_bytes: 123 } } },
+      }),
+      host: {
+        kind: 'serve',
+        port: 8080,
+        get persistPagedCache() {
+          liveBuiltAt = Date.now();
+          return true;
+        },
+        coldCapture: null,
+        cacheDir: '/x',
+      },
+    });
+    await landed();
+    expect(readLive().stateCache).toEqual({ dir: '/x', limitBytes: 123 });
+  });
+
+  it('the heartbeat carries a relative cache dir as an absolute one', async () => {
+    start([], {
+      host: {
+        kind: 'embedded',
+        port: 0,
+        get persistPagedCache() {
+          liveBuiltAt = Date.now();
+          return true;
+        },
+        coldCapture: null,
+        cacheDir: 'rel/states',
+      },
+    });
+    await landed();
+    expect(readLive().stateCache.dir).toBe(resolve('rel/states'));
+  });
+
+  it('each model row carries the namespace its stateTierNamespace() reports', async () => {
+    const named = fakeBinding();
+    (named.entry.model as { stateTierNamespace?: () => string | null }).stateTierNamespace = () =>
+      '0123456789abcdef0123456789abcdef';
+    const closed = fakeBinding();
+    (closed.entry.model as { stateTierNamespace?: () => string | null }).stateTierNamespace = () => null;
+    const broken = fakeBinding();
+    (broken.entry.model as { stateTierNamespace?: () => string | null }).stateTierNamespace = () => {
+      throw new Error('gone');
+    };
+    const plain = fakeBinding();
+    start([named.entry, closed.entry, broken.entry, plain.entry]);
+    await landed();
+    expect(readLive().models.map((model) => model.stateNamespace)).toEqual([
+      '0123456789abcdef0123456789abcdef',
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  it('no limit when two state-tier models are resident', () => {
+    const disk = { mode: 'persistent', limit_bytes: 123 };
+    expect(stateRootLimit(disk, ['qwen3_5', 'qwen3_5_moe'])).toBeNull();
+    expect(stateRootLimit(disk, ['qwen3_5', ''])).toBeNull();
+    expect(stateRootLimit(disk, ['qwen3_5', 'qwen3'])).toBe(123);
+    expect(stateRootLimit(disk, ['qwen4_exp'])).toBeNull();
+    expect(stateRootLimit(undefined, ['qwen3_5'])).toBeNull();
+  });
+
+  it('no limit from a temporary tier', () => {
+    expect(stateRootLimit({ mode: 'temp', limit_bytes: 123 }, ['qwen3_5'])).toBeNull();
+    expect(stateRootLimit({ mode: 'off', limit_bytes: 123 }, ['qwen3_5'])).toBeNull();
+    expect(stateRootLimit({ mode: 'persistent', limit_bytes: 0 }, ['qwen3_5'])).toBeNull();
   });
 
   it('live decodeTps counts streamed tokens only, not a non-stream turn that settles', async () => {

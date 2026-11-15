@@ -60,6 +60,7 @@ import {
   emptySummary,
   live,
   liveModel,
+  prefixCacheResponse,
   process,
   summary,
   timeseries,
@@ -202,7 +203,8 @@ async function mount(
   routes: Record<string, unknown>,
   settledWhen: string,
 ): Promise<string> {
-  restoreApi = stubApi(routes);
+  const prefix = '/cache' in routes && !('/cache/prefix' in routes) ? { '/cache/prefix': prefixCacheResponse() } : {};
+  restoreApi = stubApi({ ...prefix, ...routes });
   mounted = await renderPage(element, (text) => text.includes(settledWhen));
   return mounted.text();
 }

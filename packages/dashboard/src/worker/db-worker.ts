@@ -22,6 +22,7 @@ import { readWorkIndexSync } from '../chat/index-file.js';
 import { openDashboardDb } from '../db/open.js';
 import { ingestRuntime } from '../ingest/runtime.js';
 import { ingestTraces } from '../ingest/traces.js';
+import { closePrefixCacheWalks } from '../prefix-cache.js';
 import type { DbWorkerBoot, MainToWorker, WorkerToMain } from './protocol.js';
 
 /** Trace-file retention passed to the periodic + boot ingest. */
@@ -33,8 +34,18 @@ function requireParentPort(): MessagePort {
 }
 const port = requireParentPort();
 
-const { dbPath, modelsDir, tracesDir, runtimeDir, cacheRoot, agentHome, chatAgentHome, chatIndexPath, withdrawPort } =
-  workerData as DbWorkerBoot;
+const {
+  dbPath,
+  modelsDir,
+  tracesDir,
+  runtimeDir,
+  cacheRoot,
+  prefixCacheRoot,
+  agentHome,
+  chatAgentHome,
+  chatIndexPath,
+  withdrawPort,
+} = workerData as DbWorkerBoot;
 
 /**
  * Requests the transport thread stopped waiting for before this thread reached
@@ -129,6 +140,7 @@ const ctx: WorkerApiContext = {
   tracesDir,
   runtimeDir,
   cacheRoot,
+  prefixCacheRoot,
   agentHome,
   runIngest,
   agentSessions: new AgentSessionsReader({ agentHome }),
@@ -203,6 +215,7 @@ async function handle(message: MainToWorker): Promise<void> {
       // that must finish against an OPEN database.
       await drainIngest();
       dash.close();
+      closePrefixCacheWalks();
       post({ kind: 'closed', id: message.id });
       // Ending the message loop is what lets the thread exit on its own; the
       // runtime still terminates it if this never happens.

@@ -12,7 +12,7 @@ import { toast } from '../ui/src/lib/toast.js';
 import type { RuntimeLive } from '../ui/src/lib/types.js';
 import Cache from '../ui/src/pages/cache.js';
 import { WHOLE_PROMPT_CAPTURE_BLOCKS } from '../ui/src/pages/cache/disk-cache-line.js';
-import { cacheResponse, dayStart, live, MIB, process } from './helpers/observability-fixtures.js';
+import { cacheResponse, dayStart, live, MIB, prefixCacheResponse, process } from './helpers/observability-fixtures.js';
 import {
   byRole,
   chartTable,
@@ -39,7 +39,7 @@ afterEach(() => {
 });
 
 async function mountCache(routes: Record<string, unknown>, onCall?: (call: ApiCall) => void): Promise<RenderedPage> {
-  restoreApi = stubApi(routes, { onCall });
+  restoreApi = stubApi({ '/cache/prefix': prefixCacheResponse(), ...routes }, { onCall });
   mounted = await renderPage(createElement(MemoryRouter, null, createElement(Cache)), (text) =>
     text.includes('mlx-paged-v1'),
   );

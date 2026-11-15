@@ -82,7 +82,13 @@ function ggufHeader(architecture: string): Buffer {
 }
 
 describe('GET /api/models', () => {
-  const paths = (dir: string) => ({ modelsDir: dir, tracesDir: '', runtimeDir: '', cacheRoot: undefined });
+  const paths = (dir: string) => ({
+    modelsDir: dir,
+    tracesDir: '',
+    runtimeDir: '',
+    cacheRoot: undefined,
+    prefixCacheRoot: undefined,
+  });
 
   it('servedIds lists the served names of a GGUF directory', async () => {
     const repo = join(modelsDir, 'gguf-repo');

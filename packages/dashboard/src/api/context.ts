@@ -52,6 +52,8 @@ export interface ApiPaths {
   runtimeDir: string;
   /** Cold-tier root; `undefined` lets `cache.ts` resolve the running-tier default. */
   cacheRoot: string | undefined;
+  /** Model caches root; `undefined` = `~/.mlx-node/cache/prefix-cache`. */
+  prefixCacheRoot: string | undefined;
 }
 
 /** The database worker's context: it alone holds the SQLite handle and the ingest chain. */

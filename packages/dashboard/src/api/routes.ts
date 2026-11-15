@@ -54,6 +54,7 @@ import {
   handleModels,
   handleCodingAgentModels,
 } from './handlers/models.js';
+import { handlePrefixCacheDelete, handlePrefixCacheGet } from './handlers/prefix-cache.js';
 import {
   handleProviderKeyDelete,
   handleProviderKeyPut,
@@ -158,6 +159,8 @@ export const ROUTES: Route[] = [
   mainRoute('GET', '/api/runtime/live', handleRuntimeLive),
   workerRoute('GET', '/api/cache', handleCacheGet),
   workerRoute('DELETE', '/api/cache', handleCacheDelete),
+  workerRoute('GET', '/api/cache/prefix', handlePrefixCacheGet),
+  workerRoute('DELETE', '/api/cache/prefix/:namespace', handlePrefixCacheDelete),
   workerRoute('POST', '/api/ingest', handleIngest),
   workerRoute('GET', '/api/sessions', handleSessionsList),
   workerRoute('GET', '/api/sessions/:id', handleSessionDetail),

@@ -725,7 +725,13 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     registry: server.registry,
     health: () => server.health(),
     models: models.map((m) => ({ name: m.name, modelType: String(m.modelType), contextWindow: m.contextWindow })),
-    host: { kind: opts.hostKind ?? 'embedded', port: boundPort, persistPagedCache, coldCapture: coldCapture.budget },
+    host: {
+      kind: opts.hostKind ?? 'embedded',
+      port: boundPort,
+      persistPagedCache,
+      coldCapture: coldCapture.budget,
+      cacheDir: opts.cacheDir ?? null,
+    },
   });
   samplerRef.current = sampler;
 

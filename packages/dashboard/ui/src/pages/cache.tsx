@@ -47,6 +47,7 @@ import { LIVE_REFETCH_FAST_MS, reloadMountedQueries, useJson } from '../lib/use-
 import { useCommands, type AppCommand } from '../shell/commands';
 import { Page, PageGrid, PageHeader } from '../shell/page';
 import { DiskCacheLine } from './cache/disk-cache-line';
+import { ModelCaches } from './cache/model-caches';
 
 type EvictDays = 1 | 7 | 30;
 type Pending = { kind: 'clear' } | { kind: 'evict'; days: EvictDays } | null;
@@ -347,7 +348,7 @@ export default function Cache(): ReactElement {
       title="Cache"
       description={
         <>
-          <span className="block">Paged cold tier on disk: use, reuse and health.</span>
+          <span className="block">Disk caches: use, reuse and health.</span>
           {disk === undefined ? null : (
             <span className="mt-1 flex min-w-0 items-center gap-1">
               <span className="min-w-0 truncate text-caption text-secondary">
@@ -465,6 +466,7 @@ export default function Cache(): ReactElement {
           {scopeSentences.join(' ')}
         </Alert>
       ) : null}
+      <ModelCaches />
 
       <StatGroup label="Cold cache">
         <StatTile

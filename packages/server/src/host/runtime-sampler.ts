@@ -12,7 +12,7 @@
 
 import { readFile, readdir, mkdir, rename, unlink, writeFile } from 'node:fs/promises';
 import { cpus, totalmem } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { memoryStats, type SchedulerStats } from '@mlx-node/core';
 
@@ -57,12 +57,25 @@ export const LIVE_DEAD_AFTER_MS = 300_000;
 
 const DAY_MS = 86_400_000;
 
+/** The part of the server's health the heartbeat reads. */
+export interface SamplerHealth {
+  status: ServerHealthStatus;
+  memory_governor?: { dflash2_states: { disk: { mode: string; limit_bytes: number } } };
+}
+
 export interface RuntimeSamplerDeps {
   registry: { listResidentModels(): ResidentModel[] };
-  health: () => { status: ServerHealthStatus };
+  health: () => SamplerHealth;
   /** Discovered inventory: name → family, window. */
   models: ReadonlyArray<{ name: string; modelType: string; contextWindow: number }>;
-  host: { kind: HostKind; port: number; persistPagedCache: boolean; coldCapture: ColdCaptureBudget | null };
+  host: {
+    kind: HostKind;
+    port: number;
+    persistPagedCache: boolean;
+    coldCapture: ColdCaptureBudget | null;
+    /** `--cache-dir`; null for the default root. */
+    cacheDir: string | null;
+  };
   trace?: RuntimeTrace;
   now?: () => number;
   memory?: () => { activeBytes: number; peakBytes: number; cacheBytes: number };
@@ -160,6 +173,36 @@ function warmupFields(report: WarmupReport): Partial<RuntimeLoadRecord> {
     warmupCompileMs: report.compileMs,
     warmupPeakBytes: report.peakBytes,
   };
+}
+
+/** Model types whose loads open a state tier; `''` is a resident of unknown type. */
+const STATE_TIER_TYPES: ReadonlySet<string> = new Set(['qwen3_5', 'qwen3_5_moe', '']);
+
+/**
+ * One persistent state tier's limit, or null when the governor's figure is not one tier's: the governor sums the
+ * limits of every state-tier model and reports the largest mode.
+ */
+export function stateRootLimit(
+  disk: { mode: string; limit_bytes: number } | undefined,
+  modelTypes: readonly string[],
+): number | null {
+  if (disk === undefined || disk.mode !== 'persistent') return null;
+  let tiers = 0;
+  for (const type of modelTypes) if (STATE_TIER_TYPES.has(type)) tiers += 1;
+  if (tiers !== 1) return null;
+  return Number.isFinite(disk.limit_bytes) && disk.limit_bytes > 0 ? disk.limit_bytes : null;
+}
+
+/** The model's `stateTierNamespace()`: a weak read of its tier, no call into the model thread. */
+function stateNamespaceOf(model: object): string | null {
+  const read = (model as { stateTierNamespace?: () => unknown }).stateTierNamespace;
+  if (typeof read !== 'function') return null;
+  try {
+    const namespace = read.call(model);
+    return typeof namespace === 'string' && namespace.length > 0 ? namespace : null;
+  } catch {
+    return null;
+  }
 }
 
 function liveColdCapture(budget: ColdCaptureBudget | null): RuntimeLiveFile['coldCapture'] {
@@ -625,6 +668,7 @@ class Sampler implements RuntimeSampler {
       queued: view.queued,
       queueLimit: sessions.queueDepthLimit ?? null,
       pool: schedState?.pool ?? null,
+      stateNamespace: stateNamespaceOf(view.entry.model as object),
     };
   }
 
@@ -670,6 +714,13 @@ class Sampler implements RuntimeSampler {
     }
     this.lastLiveAt = now;
     this.lastLiveTokens = counters.streamedTokens;
+    let health: SamplerHealth | null;
+    try {
+      health = this.deps.health();
+    } catch {
+      health = null;
+    }
+    const models = views.map((view) => this.liveModel(view));
     return {
       v: 2,
       pid: process.pid,
@@ -681,7 +732,14 @@ class Sampler implements RuntimeSampler {
       port: this.deps.host.port,
       persistPagedCache: this.deps.host.persistPagedCache,
       coldCapture: liveColdCapture(this.deps.host.coldCapture),
-      health: this.health(),
+      stateCache: {
+        dir: this.deps.host.cacheDir === null ? null : resolve(this.deps.host.cacheDir),
+        limitBytes: stateRootLimit(
+          health?.memory_governor?.dflash2_states.disk,
+          models.map((model) => model.modelType),
+        ),
+      },
+      health: health?.status ?? 'error',
       mem: {
         active: finiteOr0(mem.activeBytes),
         peak: finiteOr0(mem.peakBytes),
@@ -699,7 +757,7 @@ class Sampler implements RuntimeSampler {
         loads: this.loads,
         rejected: queueRejections(),
       },
-      models: views.map((view) => this.liveModel(view)),
+      models,
       turns: this.liveTurns(views),
     };
   }

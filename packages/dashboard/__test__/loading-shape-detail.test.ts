@@ -26,6 +26,10 @@ import { connectDashboardApi, disconnectDashboardApi } from '../ui/src/lib/api.j
 import {
   cacheResponse,
   dayStart,
+  GIB,
+  prefixCacheResponse,
+  prefixNamespace,
+  prefixRoot,
   distributions,
   speculative,
   summary,
@@ -128,6 +132,20 @@ function cachePage(): ReactElement {
 
 const CACHE_TILES = ['Usage', 'Objects', 'Hit rate', 'Bytes restored', 'Oldest object'];
 
+const MODEL_CACHE_TILES = ['Size on disk', 'Caches', 'Files', 'Free on volume'];
+
+const CACHE_ROUTES = {
+  '/cache': cacheResponse(),
+  '/cache/prefix': prefixCacheResponse({
+    roots: [
+      prefixRoot({
+        namespaces: [prefixNamespace()],
+        engines: [{ pid: 4411, host: 'desktop', limitBytes: 32 * GIB }],
+      }),
+    ],
+  }),
+};
+
 const HEALTH_TILES = [
   'Corruptions',
   'Queue drops',
@@ -140,16 +158,14 @@ const HEALTH_TILES = [
 ];
 
 function cacheLoaded(page: RenderedPage): boolean {
-  return page.text().includes('mlx-paged-v1') && noChartLoading(page);
+  return page.text().includes('mlx-paged-v1') && page.text().includes('/tmp/prefix-cache') && noChartLoading(page);
 }
 
 describe('Cache page — the placeholders take the boxes they will hold', () => {
   it('gives every tile the same slots loading and loaded', async () => {
-    const labels = [...CACHE_TILES, ...HEALTH_TILES];
+    const labels = [...CACHE_TILES, ...MODEL_CACHE_TILES, ...HEALTH_TILES];
     const loading = await whileLoading(cachePage(), 'Corruptions', (page) => tileSlots(page, labels));
-    const loaded = await whenLoaded(cachePage(), { '/cache': cacheResponse() }, cacheLoaded, (page) =>
-      tileSlots(page, labels),
-    );
+    const loaded = await whenLoaded(cachePage(), CACHE_ROUTES, cacheLoaded, (page) => tileSlots(page, labels));
     for (const label of labels) expect(loading[label], label).toEqual(loaded[label]);
   });
 
@@ -162,7 +178,7 @@ describe('Cache page — the placeholders take the boxes they will hold', () => 
 
   it('keeps each chart body the same height loading and loaded', async () => {
     const loading = await whileLoading(cachePage(), 'Corruptions', chartBoxes);
-    const loaded = await whenLoaded(cachePage(), { '/cache': cacheResponse() }, cacheLoaded, chartBoxes);
+    const loaded = await whenLoaded(cachePage(), CACHE_ROUTES, cacheLoaded, chartBoxes);
     expect(loading.length).toBeGreaterThan(0);
     expect(loading).toEqual(loaded);
   });

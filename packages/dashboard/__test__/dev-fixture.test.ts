@@ -6,6 +6,7 @@
 import {
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -15,7 +16,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join, relative } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
@@ -43,6 +44,7 @@ import { ingestRuntime } from '../src/ingest/runtime.js';
 import { ingestTraces } from '../src/ingest/traces.js';
 import { classifyProcess, parseLiveFile, parseSupervisorFile } from '../src/live.js';
 import { discoverLocalModels } from '../src/models.js';
+import { closePrefixCacheWalks, scanPrefixCaches } from '../src/prefix-cache.js';
 
 let home: string;
 let dash: DashboardDb | undefined;
@@ -53,6 +55,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  closePrefixCacheWalks();
   dash?.sqlite.close();
   dash = undefined;
   rmSync(home, { recursive: true, force: true });
@@ -244,6 +247,23 @@ describe('dev fixture home', () => {
 });
 
 describe('dev fixture content for the manage pages', () => {
+  it('writes three model caches the scan reads', () => {
+    writeFixtureHome(home, { now });
+    writeFixtureHome(home, { now });
+    const paths = fixturePaths(home);
+    const scan = scanPrefixCaches([{ root: paths.prefixCacheRoot, isDefault: true, engines: [] }], { canLock: true });
+    const rows = scan.roots[0]!.namespaces;
+    expect(rows).toHaveLength(3);
+    expect(rows.every((row) => row.complete && row.files > 0 && row.lock === 'free')).toBe(true);
+    const stored = rows.map((row) => lstatSync(join(paths.prefixCacheRoot, row.namespace, 'lock')).mtimeMs);
+    expect(rows.map((row) => row.lastUsedMs)).toEqual(stored);
+    expect(stored.map((ms) => Math.round((now - ms) / 60_000)).sort((a, b) => a - b)).toEqual([
+      2,
+      3 * 24 * 60,
+      12 * 24 * 60,
+    ]);
+  });
+
   it('blocks one catalog slug with a one-file leftover that Reinstall can replace', () => {
     writeFixtureHome(home, { now });
     const entry = catalogWithState(fixturePaths(home).modelsDir).find((item) => item.slug === CATALOG_BLOCKED.slug);
@@ -414,6 +434,15 @@ describe('dev fixture content for the manage pages', () => {
 });
 
 describe('dev fixture home guard', () => {
+  it('keeps every runtime root inside the fixture home', () => {
+    const paths = fixturePaths(home);
+    expect(paths.prefixCacheRoot).toBe(join(home, 'prefix-cache'));
+    for (const [key, value] of Object.entries(paths)) {
+      const inside = relative(home, value);
+      expect(inside.length > 0 && !inside.startsWith('..') && !isAbsolute(inside), key).toBe(true);
+    }
+  });
+
   it('refuses the user home, the real ~/.mlx-node, anything inside it and every ancestor', () => {
     const userHome = join(home, 'Users', 'dev');
     for (const target of [

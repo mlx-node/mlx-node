@@ -13,6 +13,8 @@ import {
   deriveEngineStatus,
   LIVE_DEAD_AFTER_MS,
   parseLiveFile,
+  parseStateCache,
+  parseStateNamespaces,
   parseSupervisorFile,
   pidAlive,
   type LiveEvent,
@@ -34,6 +36,7 @@ function liveFile(pid: number, extra: Partial<WriterLiveFile> = {}): WriterLiveF
     port: 8765,
     persistPagedCache: true,
     coldCapture: { blocks: 63_125, ms: 10_000 },
+    stateCache: { dir: null, limitBytes: null },
     health: 'ok',
     mem: { active: 1, peak: 2, cache: 3, wiredLimit: 4, rss: 5 },
     decodeTps: 42.5,
@@ -52,6 +55,7 @@ function liveFile(pid: number, extra: Partial<WriterLiveFile> = {}): WriterLiveF
         queued: 0,
         queueLimit: 32,
         pool: { at: T - 1000, blockCapacity: 100, allocatedBlocks: 10, freeBlocks: 80, reclaimableBlocks: 10 },
+        stateNamespace: null,
       },
     ],
     turns: [
@@ -235,8 +239,9 @@ describe('live: watcher', () => {
     expect(snapshot.status).toBe('running');
     expect(snapshot.supervisor).toBeNull();
     expect(snapshot.processes).toHaveLength(1);
-    const { v: _v, ...fields } = liveFile(31);
-    expect(snapshot.processes[0]).toEqual({ ...fields, status: 'running', ageMs: 500 });
+    const { v: _v, stateCache: _state, models, ...fields } = liveFile(31);
+    const liveModels = models.map(({ stateNamespace: _namespace, ...model }) => model);
+    expect(snapshot.processes[0]).toEqual({ ...fields, models: liveModels, status: 'running', ageMs: 500 });
   });
 
   it('a heartbeat of an older engine (v1) lists no process and breaks nothing', async () => {
@@ -315,6 +320,31 @@ describe('live: watcher', () => {
     const { coldCapture: _omitted, ...older } = liveFile(31);
     expect(parseLiveFile(older)?.coldCapture).toBeNull();
     expect(parseLiveFile({ ...liveFile(31), coldCapture: { blocks: '128', ms: 250 } })?.coldCapture).toBeNull();
+  });
+
+  it('parseStateCache reads the field, and null from an engine without it', () => {
+    expect(parseStateCache(liveFile(31).stateCache)).toEqual({ dir: null, limitBytes: null });
+    expect(parseStateCache({ dir: '/Volumes/fast/cache', limitBytes: 123 })).toEqual({
+      dir: '/Volumes/fast/cache',
+      limitBytes: 123,
+    });
+    expect(parseStateCache({ dir: null, limitBytes: 0 })).toEqual({ dir: null, limitBytes: null });
+    const { stateCache: _omitted, ...older } = liveFile(31) as unknown as Record<string, unknown>;
+    expect(parseStateCache(older.stateCache)).toBeNull();
+    expect(parseStateCache({ dir: 'relative/cache', limitBytes: 123 })).toBeNull();
+    expect(parseStateCache({ dir: '', limitBytes: 123 })).toBeNull();
+    expect(parseStateCache({ dir: 7, limitBytes: 123 })).toBeNull();
+  });
+
+  it('parseStateNamespaces reads the open state cache of each model that names one', () => {
+    const base = liveFile(31).models[0]!;
+    const models = [
+      { ...base, name: 'a', stateNamespace: '0123456789abcdef0123456789abcdef' },
+      { ...base, name: 'b', stateNamespace: null },
+      { ...base, name: 'c' },
+    ];
+    expect(parseStateNamespaces(models)).toEqual([{ model: 'a', namespace: '0123456789abcdef0123456789abcdef' }]);
+    expect(parseStateNamespaces(undefined)).toEqual([]);
   });
 
   it('replays the latest snapshot to a new subscriber', async () => {

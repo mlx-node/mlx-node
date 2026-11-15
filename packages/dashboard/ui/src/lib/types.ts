@@ -289,6 +289,63 @@ export interface CacheMutationResult {
   freedBytes: number;
 }
 
+/** The model caches under `prefix-cache/` (server: `src/prefix-cache.ts`). */
+export type PrefixLockState = 'held' | 'free' | 'unknown';
+
+export interface PrefixCacheNamespace {
+  /** The directory's name: 32 lowercase hex digits. */
+  namespace: string;
+  /** The model a running engine reports for this cache; null when no running engine reports it. */
+  model: string | null;
+  /** Regular files but `lock`, by size. A lower bound while `complete` is false. */
+  bytes: number;
+  files: number;
+  /** Newest mtime of the files and of `lock`: the last open, write or restore. */
+  lastUsedMs: number | null;
+  /** The lock file's time: when an engine last opened this cache. A delete sends it back. */
+  openedMs: number;
+  /** False until a first walk of this directory reached its end. */
+  complete: boolean;
+  /** When the walk behind `bytes` and `files` ended. */
+  measuredAtMs: number;
+  lock: PrefixLockState;
+}
+
+export interface PrefixCacheEngine {
+  pid: number;
+  host: HostKind;
+  /** One open persistent state tier's limit; null when the engine's figure is not one tier's or it does not say. */
+  limitBytes: number | null;
+}
+
+export interface PrefixCacheRoot {
+  root: string;
+  exists: boolean;
+  /** Why the folder could not be read (an error code); null otherwise. */
+  readError: string | null;
+  isDefault: boolean;
+  namespaces: PrefixCacheNamespace[];
+  truncated: boolean;
+  volume: { availableBytes: number; sizeBytes: number } | null;
+  engines: PrefixCacheEngine[];
+}
+
+export interface PrefixCacheResponse {
+  roots: PrefixCacheRoot[];
+  /** A first walk is unfinished: one more GET continues it. */
+  counting: boolean;
+  canLock: boolean;
+}
+
+/** One step of `DELETE /api/cache/prefix/:namespace`. */
+export interface PrefixCacheDeleteResult {
+  removed: number;
+  freedBytes: number;
+  done: boolean;
+  left: number;
+  directoryRemoved: boolean;
+}
+
 /**
  * Sessions API (server: `src/agent-sessions/types.ts`), read from grok-build
  * (`mlx agent`) session folders. Timestamps in `SessionRow` are ISO strings as

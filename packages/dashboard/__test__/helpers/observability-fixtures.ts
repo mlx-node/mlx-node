@@ -8,6 +8,9 @@ import type {
   MetricsTimeseries,
   MetricsTotals,
   MetricsTurns,
+  PrefixCacheNamespace,
+  PrefixCacheResponse,
+  PrefixCacheRoot,
   Quantiles,
   RuntimeLive,
   RuntimeProcessLive,
@@ -450,6 +453,41 @@ export function runtimeSeries(overrides: Partial<RuntimeSeries> = {}): RuntimeSe
 export function dayStart(daysAgo: number): number {
   const now = new Date();
   return new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo).getTime();
+}
+
+/** One model cache row: an idle, fully counted cache. */
+export function prefixNamespace(overrides: Partial<PrefixCacheNamespace> = {}): PrefixCacheNamespace {
+  return {
+    namespace: '3e5088fc2280a1b2c3d4e5f677c10b0f',
+    model: null,
+    bytes: 6 * GIB,
+    files: 14_190,
+    lastUsedMs: Date.now() - 3 * 86_400_000,
+    openedMs: Date.now() - 3 * 86_400_000,
+    complete: true,
+    measuredAtMs: Date.now() - 1000,
+    lock: 'free',
+    ...overrides,
+  };
+}
+
+/** One root of the model caches listing; no namespace and no engine by default. */
+export function prefixRoot(overrides: Partial<PrefixCacheRoot> = {}): PrefixCacheRoot {
+  return {
+    root: '/tmp/prefix-cache',
+    exists: true,
+    readError: null,
+    isDefault: true,
+    namespaces: [],
+    truncated: false,
+    volume: { availableBytes: 212 * GIB, sizeBytes: 994 * GIB },
+    engines: [],
+    ...overrides,
+  };
+}
+
+export function prefixCacheResponse(overrides: Partial<PrefixCacheResponse> = {}): PrefixCacheResponse {
+  return { roots: [prefixRoot()], counting: false, canLock: true, ...overrides };
 }
 
 export function cacheResponse(overrides: Partial<CacheResponse> = {}): CacheResponse {

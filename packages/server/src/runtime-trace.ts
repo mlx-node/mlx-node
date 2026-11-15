@@ -172,6 +172,8 @@ export interface RuntimeLiveModel {
     freeBlocks: number;
     reclaimableBlocks: number;
   } | null;
+  /** The directory name of the model's open persistent state cache under its cache root; null without one. */
+  stateNamespace: string | null;
 }
 
 export interface RuntimeLiveTurn {
@@ -220,6 +222,8 @@ export interface RuntimeLiveFile {
   persistPagedCache: boolean;
   /** The per-turn capture limits the paged loads read; null when the disk cache is off. */
   coldCapture: { blocks: number; ms: number } | null;
+  /** The stored states' cache folder (`--cache-dir`, null for the default) and one open tier's limit, else null. */
+  stateCache: { dir: string | null; limitBytes: number | null };
   health: RuntimeHealth;
   mem: { active: number; peak: number; cache: number; wiredLimit: number; rss: number };
   /** Output tokens per second across all in-flight turns since the previous write; null when idle. */

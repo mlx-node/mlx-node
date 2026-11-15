@@ -37,7 +37,7 @@ const SWITCH: Record<DiskCacheSwitch, { word: string; tone: BadgeTone; note: str
   'no-engine': { word: 'No engine', tone: 'neutral', note: 'inference is not running' },
 };
 
-const HOST_WORD: Record<HostKind, string> = {
+export const HOST_WORD: Record<HostKind, string> = {
   desktop: 'desktop',
   serve: 'mlx serve',
   launch: 'mlx launch',

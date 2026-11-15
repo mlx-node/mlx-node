@@ -13,7 +13,7 @@
  */
 
 import { readdir, readFile, stat, unlink } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 
 import type { IngestSummary } from './api/context.js';
 
@@ -226,6 +226,29 @@ function parseColdCapture(value: unknown): RuntimeLiveFile['coldCapture'] {
   const blocks = fin(value.blocks);
   const ms = fin(value.ms);
   return blocks === null || ms === null ? null : { blocks, ms };
+}
+
+/**
+ * A heartbeat's `stateCache`: the engine's state cache folder (null: the default root) and one open tier's limit.
+ * Null when the engine does not say, or says a folder that is not an absolute path.
+ */
+export function parseStateCache(value: unknown): { dir: string | null; limitBytes: number | null } | null {
+  if (!isObj(value)) return null;
+  const dir = value.dir;
+  if (dir !== null && (typeof dir !== 'string' || dir.length === 0 || !isAbsolute(dir))) return null;
+  const limit = fin(value.limitBytes);
+  return { dir, limitBytes: limit !== null && limit > 0 ? limit : null };
+}
+
+/** The open state cache each model of a heartbeat names (`models[].stateNamespace`); models without one are left out. */
+export function parseStateNamespaces(models: unknown): Array<{ model: string; namespace: string }> {
+  if (!Array.isArray(models)) return [];
+  const out: Array<{ model: string; namespace: string }> = [];
+  for (const raw of models.slice(0, LIVE_MODELS_MAX)) {
+    if (!isObj(raw) || typeof raw.name !== 'string' || typeof raw.stateNamespace !== 'string') continue;
+    out.push({ model: raw.name, namespace: raw.stateNamespace });
+  }
+  return out;
 }
 
 function parseModel(value: unknown): RuntimeLiveModel | null {

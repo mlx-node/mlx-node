@@ -189,7 +189,15 @@ describe('createInferenceHost — discovery and model binding', () => {
     }
     const agentModels = await discoverMlxModels(modelsDir);
     expect(agentModels.map(({ discovered }) => discovered.name)).toEqual(names);
-    expect(await handleCodingAgentModels({ modelsDir, tracesDir: '', runtimeDir: '', cacheRoot: '' })).toEqual({
+    expect(
+      await handleCodingAgentModels({
+        modelsDir,
+        tracesDir: '',
+        runtimeDir: '',
+        cacheRoot: '',
+        prefixCacheRoot: undefined,
+      }),
+    ).toEqual({
       models: names.map((name) => ({ name })),
     });
 
@@ -1248,12 +1256,10 @@ describe('createInferenceHost — paged KV disk cache', () => {
     process.env[PERSIST_ENV] = 'off';
     expect(await persistEnvAtLoad(sidecarHostOptions({}))).toEqual({ env: '0', host: false });
     process.env[PERSIST_ENV] = '0';
-    expect(await persistEnvAtLoad({ persistPagedCache: { flag: true, byDefault: false } })).toEqual(
-      {
-        env: '1',
-        host: true,
-      },
-    );
+    expect(await persistEnvAtLoad({ persistPagedCache: { flag: true, byDefault: false } })).toEqual({
+      env: '1',
+      host: true,
+    });
   });
 
   /** Load `alpha` through the real host and return the capture limits the native load reads at that moment. */
@@ -1318,9 +1324,11 @@ describe('createInferenceHost — paged KV disk cache', () => {
     delete process.env[BUDGET_ENV];
     process.env[PERSIST_ENV] = '0';
     expect(await captureEnvAtLoad(sidecarHostOptions({}))).toEqual({ blocks: undefined, ms: undefined, host: null });
-    expect(await captureEnvAtLoad({ persistPagedCache: { flag: true, byDefault: false } })).toEqual(
-      { blocks: undefined, ms: undefined, host: { blocksPerTurn: 128, budgetMs: 250 } },
-    );
+    expect(await captureEnvAtLoad({ persistPagedCache: { flag: true, byDefault: false } })).toEqual({
+      blocks: undefined,
+      ms: undefined,
+      host: { blocksPerTurn: 128, budgetMs: 250 },
+    });
     process.env[PERSIST_ENV] = '1';
     expect(await captureEnvAtLoad({})).toEqual({
       blocks: undefined,

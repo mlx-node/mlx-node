@@ -100,6 +100,8 @@ export interface DashboardRuntimeOptions {
   /** Desktop supervisor state file. Default `desktopSupervisorStatePath()`. */
   supervisorPath?: string;
   cacheRoot?: string;
+  /** The model caches root. Default `~/.mlx-node/cache/prefix-cache`. */
+  prefixCacheRoot?: string;
   /** grok-build (`mlx agent`) config home for the Sessions API. Default `agentConfigDir()`. */
   agentHome?: string;
   /**
@@ -140,6 +142,7 @@ export interface DashboardRuntime {
   readonly tracesDir: string;
   readonly runtimeDir: string;
   readonly cacheRoot: string | undefined;
+  readonly prefixCacheRoot: string | undefined;
   readonly agentHome: string;
   /**
    * What THIS thread owns, for a transport that dispatches its own main-thread
@@ -268,6 +271,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
   const runtimeDir =
     opts.runtimeDir ?? (opts.tracesDir !== undefined ? join(dirname(tracesDir), 'runtime') : metricsRuntimeDir());
   const cacheRoot = opts.cacheRoot;
+  const prefixCacheRoot = opts.prefixCacheRoot;
   // Absolute: the resume command `cd`s into the session cwd before setting
   // GROK_HOME, and grok uses it verbatim, so a relative home would point elsewhere.
   const agentHome = resolve(opts.agentHome ?? agentConfigDir());
@@ -294,6 +298,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     tracesDir,
     runtimeDir,
     cacheRoot,
+    prefixCacheRoot,
     agentHome,
     chatAgentHome: paths.chatAgent,
     chatIndexPath: paths.conversations,
@@ -354,6 +359,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     tracesDir,
     runtimeDir,
     cacheRoot,
+    prefixCacheRoot,
     downloads,
     codingAgents,
     live,
@@ -393,6 +399,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     tracesDir,
     runtimeDir,
     cacheRoot,
+    prefixCacheRoot,
     agentHome,
     context,
     async call(c: ApiCall, signal?: AbortSignal): Promise<ApiResponse> {

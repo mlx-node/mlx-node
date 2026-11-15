@@ -64,6 +64,7 @@ export function fixturePaths(home: string): {
   runtimeDir: string;
   supervisorPath: string;
   cacheRoot: string;
+  prefixCacheRoot: string;
   agentHome: string;
 } {
   return {
@@ -73,6 +74,7 @@ export function fixturePaths(home: string): {
     runtimeDir: join(home, 'metrics', 'runtime'),
     supervisorPath: join(home, 'desktop', 'supervisor.json'),
     cacheRoot: join(home, 'cold'),
+    prefixCacheRoot: join(home, 'prefix-cache'),
     agentHome: join(home, '.mlx-agent'),
   };
 }
@@ -875,6 +877,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
     port: LIVE_PORT,
     persistPagedCache: diskCache !== 'off',
     coldCapture,
+    stateCache: { dir: null, limitBytes: 32 * GIB },
     health: 'ok',
     mem: {
       active: live.ticker?.memActive ?? 27 * GIB,
@@ -905,6 +908,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
           freeBlocks: 2916,
           reclaimableBlocks: 420,
         },
+        stateNamespace: fixturePrefixNamespaces()[0]!,
       },
       {
         name: small,
@@ -918,6 +922,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         queued: 0,
         queueLimit: 32,
         pool: { at: now - 40_000, blockCapacity: 2048, allocatedBlocks: 310, freeBlocks: 1738, reclaimableBlocks: 120 },
+        stateNamespace: null,
       },
       ...(live.chatModels ?? []).map((name) => ({
         name,
@@ -931,6 +936,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         queued: 0,
         queueLimit: 32,
         pool: null,
+        stateNamespace: null,
       })),
       ...(live.engineStates === true ? engineStateModels(live, now) : []),
     ],
@@ -975,7 +981,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
     ],
   };
   if (diskCache === 'older') {
-    const { persistPagedCache: _switch, coldCapture: _capture, ...older } = file;
+    const { persistPagedCache: _switch, coldCapture: _capture, stateCache: _state, ...older } = file;
     writeFileSync(`${path}.tmp`, JSON.stringify(older));
   } else {
     writeFileSync(`${path}.tmp`, JSON.stringify(file));
@@ -1006,6 +1012,7 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
         freeBlocks: SERIAL_CAPACITY - model.held,
         reclaimableBlocks: 0,
       },
+      stateNamespace: null,
     };
   });
   const loadedAt = live.startedAt + 3000;
@@ -1021,6 +1028,7 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
       queued: 0,
       queueLimit: 16,
       pool: null,
+      stateNamespace: null,
     },
     {
       ...UNREAD_MODEL,
@@ -1032,6 +1040,7 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
       queued: 0,
       queueLimit: 32,
       pool: null,
+      stateNamespace: null,
     },
   ];
 }
@@ -1075,6 +1084,43 @@ function writeColdCache(home: string, random: Random, now: number): void {
     const mtime = new Date(now - age);
     utimesSync(path, mtime, mtime);
   }
+}
+
+/** The seeded model caches: last used 2 minutes, 3 days and 12 days ago; files of each, and their apparent size. */
+const PREFIX_CACHES = [
+  { ageMs: 2 * 60_000, files: 8, bytes: 1536 * MIB },
+  { ageMs: 3 * DAY_MS, files: 4, bytes: 1536 * MIB },
+  { ageMs: 12 * DAY_MS, files: 14, bytes: 8 * MIB },
+] as const;
+
+/** The names of the seeded model caches, from their own random stream so every other fixture file stays the same. */
+export function fixturePrefixNamespaces(seed: number = DEFAULT_SEED): string[] {
+  const random = mulberry32(seed ^ 0x70726566);
+  return PREFIX_CACHES.map(() => hex(random, 32));
+}
+
+function writePrefixCache(home: string, seed: number, now: number): void {
+  const { prefixCacheRoot } = fixturePaths(home);
+  const names = fixturePrefixNamespaces(seed);
+  const random = mulberry32(seed ^ 0x6f626a73);
+  PREFIX_CACHES.forEach((cache, index) => {
+    const dir = join(prefixCacheRoot, names[index]!);
+    assertInsideHome(home, dir);
+    mkdirSync(dir, { recursive: true });
+    const at = new Date(now - cache.ageMs);
+    for (let i = 0; i < cache.files; i += 1) {
+      const key = hex(random, 64);
+      const path = join(dir, i % 4 === 3 ? `${key}.dflash2_state.safetensors` : `${key}.safetensors`);
+      assertInsideHome(home, path);
+      writeFileSync(path, '');
+      truncateSync(path, cache.bytes);
+      utimesSync(path, at, at);
+    }
+    const lock = join(dir, 'lock');
+    assertInsideHome(home, lock);
+    writeFileSync(lock, '');
+    utimesSync(lock, at, at);
+  });
 }
 
 function cloneId(n: number): string {
@@ -2110,6 +2156,7 @@ export function writeFixtureHome(home: string, options: FixtureOptions = {}): Fi
   writeLiveFile(home, live, now);
   writeSupervisorFile(home, process.pid, process.pid, now);
   writeColdCache(home, random, now);
+  writePrefixCache(home, options.seed ?? DEFAULT_SEED, now);
   const sessions = writeSessions(home, random, now);
   writeAgentWork(home, random, now, process.pid);
   writeCatalogInstall(home, now);

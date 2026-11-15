@@ -205,6 +205,7 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
         tracesDir: opts.tracesDir,
         runtimeDir: opts.runtimeDir,
         cacheRoot: opts.cacheRoot,
+        prefixCacheRoot: opts.prefixCacheRoot,
         agentHome: opts.agentHome,
         chatAgentHome: opts.chatAgentHome,
         chatIndexPath: opts.chatIndexPath,
