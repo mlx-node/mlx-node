@@ -13,6 +13,7 @@ const { positionals, values } = parseArgs({
     zip: { type: 'string' },
     blockmap: { type: 'string' },
     manifest: { type: 'string' },
+    'windows-zip': { type: 'string' },
   },
 });
 const tag = values.tag;
@@ -29,10 +30,22 @@ if (revision(`refs/tags/${tag}^{commit}`) !== commit) {
 const github = (args: string[]): string => execFileSync('gh', args, { encoding: 'utf8' });
 if (positionals[0] === 'prepare') {
   prepareDraftRelease(tag, github);
-} else if (positionals[0] === 'publish' && values.dmg && values.zip && values.blockmap && values.manifest) {
-  await publishDesktopRelease(tag, commit, [values.dmg, values.zip, values.blockmap, values.manifest], github);
+} else if (
+  positionals[0] === 'publish' &&
+  values.dmg &&
+  values.zip &&
+  values.blockmap &&
+  values.manifest &&
+  values['windows-zip']
+) {
+  await publishDesktopRelease(
+    tag,
+    commit,
+    [values.dmg, values.zip, values.blockmap, values.manifest, values['windows-zip']],
+    github,
+  );
 } else {
   throw new Error(
-    'usage: publish-release.ts <prepare|publish> --tag <tag> [--dmg <dmg> --zip <zip> --blockmap <blockmap> --manifest <manifest>]',
+    'usage: publish-release.ts <prepare|publish> --tag <tag> [--dmg <dmg> --zip <zip> --blockmap <blockmap> --manifest <manifest> --windows-zip <zip>]',
   );
 }

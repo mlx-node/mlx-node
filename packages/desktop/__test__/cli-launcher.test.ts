@@ -72,6 +72,17 @@ describe('app-owned command', () => {
     expect(script).toContain('setlocal DisableDelayedExpansion\r\n');
     expect(script).toContain('set "NAPI_RS_NATIVE_LIBRARY_PATH="\r\n');
     expect(script).toContain(`"${config.executable}" "${config.entry}" %*\r\n`);
+    expect(script).not.toContain('set "CUDA_HOME=');
+  });
+
+  it('sets the app-owned CUDA runtime only for a packaged Windows app', async () => {
+    const { config } = await fixture();
+    config.nativeRuntimeDir = dirname(config.nativeAddon);
+    const script = launcherScript(config, 'win32');
+    expect(script).toContain(`set "CUDA_HOME=${config.nativeRuntimeDir}"\r\n`);
+    expect(script).toContain(`set "CUDA_PATH=${config.nativeRuntimeDir}"\r\n`);
+    expect(script).toContain(`set "PATH=${config.nativeRuntimeDir};%PATH%"\r\n`);
+    expect(script).toContain('set "MLX_CUDA_USE_CUDNN_SDPA=0"\r\n');
   });
 
   it('loads core and Keyring independently, even with a stale inherited generic override', async () => {

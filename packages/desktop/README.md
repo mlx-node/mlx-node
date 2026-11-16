@@ -93,11 +93,14 @@ The [desktop release workflow](../../.github/workflows/desktop-release.yml) prod
 - `mlx-node-<version>-darwin-arm64.zip` for automatic updates.
 - `mlx-node-<version>-darwin-arm64.zip.blockmap` for differential downloads.
 - `latest-mac.yml` with the update version, archive size/hash, minimum macOS, and rollout percentage.
+- `mlx-node-<version>-win32-arm64.zip`, an unsigned portable Windows ARM64 app
+  with the native addon, CUDA/cuDNN/OpenBLAS DLLs, and NVRTC headers. Extract it
+  and run `mlx-node.exe`; no Apple signing or automatic update feed is used.
 
-Both contain the same Developer ID signed, notarized, and stapled app. The ZIP is
+The macOS DMG and update ZIP contain the same Developer ID signed, notarized, and stapled app. The ZIP is
 created after stapling, then extracted to verify its signature, ticket, and version
-before publication. Dry runs build and verify both archives but skip notarization
-and release uploads.
+before publication. Dry runs build and verify the macOS and Windows archives but
+skip notarization and release uploads.
 
 The app uses [electron-updater](https://www.electron.build/v26/docs/features/auto-update/)
 with public GitHub Releases. macOS installation still uses Squirrel.Mac. Keep the

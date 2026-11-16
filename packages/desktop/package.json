@@ -2,7 +2,7 @@
   "name": "@mlx-node/desktop",
   "version": "0.0.21",
   "private": true,
-  "description": "mlx-node macOS desktop app (Electron shell: tray, control panel window, supervised inference sidecar)",
+  "description": "mlx-node desktop app (Electron shell: tray, control panel window, supervised inference sidecar)",
   "homepage": "https://github.com/mlx-node/mlx-node",
   "bugs": {
     "url": "https://github.com/mlx-node/mlx-node/issues"
@@ -19,6 +19,7 @@
     "build": "tsc -b",
     "icons": "oxnode build/make-icons.ts",
     "package": "oxnode scripts/package.ts",
+    "package:windows": "oxnode scripts/package-windows.ts",
     "spike:electron": "electron spike/main.mjs",
     "spike:node": "node spike/workload.mjs",
     "start": "electron ."

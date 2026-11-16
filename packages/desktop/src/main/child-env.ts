@@ -37,6 +37,10 @@ export interface ChildEnvInput {
   nativeAddon: string;
   /** The models root chosen in the UI, or `null` to leave the default resolution alone. */
   modelsDir: string | null;
+  /** Packaged Windows runtime containing the addon, DLLs, and NVRTC headers. */
+  nativeRuntimeDir?: string | null;
+  /** Inherited environment, used to preserve the host's PATH entry casing and value. */
+  baseEnv?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -52,6 +56,19 @@ export function sidecarEnvOverrides(input: ChildEnvInput): Record<string, string
   return {
     [NATIVE_LIBRARY_PATH]: input.nativeAddon,
     ...modelsDirEnv(input.modelsDir),
+    ...(input.nativeRuntimeDir == null ? {} : windowsRuntimeEnv(input.nativeRuntimeDir, input.baseEnv ?? process.env)),
+  };
+}
+
+function windowsRuntimeEnv(runtimeDir: string, baseEnv: NodeJS.ProcessEnv): Record<string, string> {
+  const pathName = Object.keys(baseEnv).find((name) => name.toUpperCase() === 'PATH') ?? 'PATH';
+  const inheritedPath = baseEnv[pathName];
+  return {
+    CUDA_HOME: runtimeDir,
+    CUDA_PATH: runtimeDir,
+    [pathName]: inheritedPath ? `${runtimeDir};${inheritedPath}` : runtimeDir,
+    // The supported Windows configuration avoids the cuDNN shutdown crash.
+    MLX_CUDA_USE_CUDNN_SDPA: '0',
   };
 }
 

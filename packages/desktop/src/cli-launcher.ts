@@ -26,6 +26,8 @@ export interface DesktopCliConfig {
   executable: string;
   entry: string;
   nativeAddon: string;
+  /** Set only for a packaged Windows app; development keeps its prepared CUDA_HOME. */
+  nativeRuntimeDir?: string | null;
   modelsDir: string | null;
 }
 
@@ -33,11 +35,21 @@ const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
 const batchValue = (value: string): string => value.replaceAll('%', '%%');
 
 export function launcherScript(config: DesktopCliConfig, platform: NodeJS.Platform = process.platform): string {
-  for (const path of [config.executable, config.entry, config.nativeAddon]) {
+  for (const path of [
+    config.executable,
+    config.entry,
+    config.nativeAddon,
+    ...(config.nativeRuntimeDir == null ? [] : [config.nativeRuntimeDir]),
+  ]) {
     if (!isAbsolute(path) || /[\0\r\n]/.test(path)) throw new Error('The app command has an invalid runtime path.');
   }
   if (platform === 'win32') {
-    return `${WINDOWS_HEADER}setlocal DisableDelayedExpansion\r\nset "ELECTRON_RUN_AS_NODE=1"\r\nset "NAPI_RS_NATIVE_LIBRARY_PATH="\r\nset "MLX_CORE_NATIVE_LIBRARY_PATH=${batchValue(config.nativeAddon)}"\r\n${
+    const runtimeDir = config.nativeRuntimeDir == null ? null : batchValue(config.nativeRuntimeDir);
+    const runtimeEnv =
+      runtimeDir === null
+        ? ''
+        : `set "CUDA_HOME=${runtimeDir}"\r\nset "CUDA_PATH=${runtimeDir}"\r\nset "PATH=${runtimeDir};%PATH%"\r\nset "MLX_CUDA_USE_CUDNN_SDPA=0"\r\n`;
+    return `${WINDOWS_HEADER}setlocal DisableDelayedExpansion\r\nset "ELECTRON_RUN_AS_NODE=1"\r\nset "NAPI_RS_NATIVE_LIBRARY_PATH="\r\nset "MLX_CORE_NATIVE_LIBRARY_PATH=${batchValue(config.nativeAddon)}"\r\n${runtimeEnv}${
       config.modelsDir ? `set "MLX_MODELS_DIR=${batchValue(config.modelsDir)}"\r\n` : ''
     }"${batchValue(config.executable)}" "${batchValue(config.entry)}" %*\r\nexit /b %ERRORLEVEL%\r\n`;
   }

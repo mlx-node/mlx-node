@@ -553,7 +553,8 @@ enum MlxSource {
         reason: String,
         export: Option<PathBuf>,
     },
-    /// An unpacked artifact: `lib/libmlx.a`, `lib/mlx.metallib`, `include/`.
+    /// An unpacked artifact: the target's MLX library, `include/`, and (on
+    /// Metal targets) `lib/mlx.metallib`.
     Prebuilt { dir: PathBuf, label: String },
 }
 
@@ -582,7 +583,7 @@ fn json_string_after(text: &str, key: &str, from: usize) -> Option<String> {
 fn parse_prebuilt_pin(text: &str, triple: &str) -> Option<PrebuiltPin> {
     let repo = json_string_after(text, "repo", 0)?;
     let mlx_commit = json_string_after(text, "mlx_commit", 0)?;
-    let release_tag = json_string_after(text, "release_tag", 0)?;
+    let mut release_tag = json_string_after(text, "release_tag", 0)?;
     let mut asset_file = None;
     let mut asset_sha256 = None;
     if let Some(assets_at) = text.find("\"assets\"")
@@ -598,6 +599,11 @@ fn parse_prebuilt_pin(text: &str, triple: &str) -> Option<PrebuiltPin> {
         let object = &text[..object_end];
         asset_file = json_string_after(object, "file", triple_at);
         asset_sha256 = json_string_after(object, "sha256", triple_at);
+        // Different backends can have different build keys and therefore
+        // different immutable releases. The root tag remains the default.
+        if let Some(asset_tag) = json_string_after(object, "release_tag", triple_at) {
+            release_tag = asset_tag;
+        }
     }
     Some(PrebuiltPin {
         repo,
@@ -715,6 +721,10 @@ fn portable_cmake_defines(
         if target_os == "windows" {
             define("CMAKE_CUDA_RUNTIME_LIBRARY", "Shared");
             define("CMAKE_CUDA_ARCHITECTURES", &cuda_archs);
+            // Delay-loaded CUDA/cuDNN DLLs ship beside the addon, not at the
+            // toolkit's absolute build-machine paths.
+            define("MLX_CUDA_BIN_DIR", ".");
+            define("MLX_CUDNN_BIN_DIR", ".");
             // CUTLASS 4.4 fails to parse with MSVC's strict mode in C++20.
             // https://github.com/NVIDIA/cutlass/issues/3065
             define("CMAKE_CUDA_FLAGS", "-Xcompiler=/permissive,/EHsc");
@@ -792,11 +802,17 @@ fn submodule_state(mlx_dir: &Path) -> Result<(String, bool), String> {
 
 fn sha256_file(path: &Path) -> io::Result<String> {
     // The host tools avoid a hashing build-dependency: `shasum` ships with
-    // macOS, `sha256sum` with coreutils on Linux.
+    // macOS, `sha256sum` with coreutils on Linux, and Get-FileHash with Windows.
     let output = if cfg!(target_os = "macos") {
         Command::new("shasum")
             .args(["-a", "256"])
             .arg(path)
+            .output()
+    } else if cfg!(target_os = "windows") {
+        Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command"])
+            .arg("(Get-FileHash -Algorithm SHA256 -LiteralPath $env:MLX_PREBUILT_HASH_PATH).Hash")
+            .env("MLX_PREBUILT_HASH_PATH", path)
             .output()
     } else {
         Command::new("sha256sum").arg(path).output()
@@ -819,21 +835,38 @@ fn marker_content(release_tag: &str, sha256: &str) -> String {
     format!("{release_tag}\nsha256:{sha256}\n")
 }
 
+fn prebuilt_mlx_library(triple: &str) -> &'static str {
+    if triple.ends_with("-pc-windows-msvc") {
+        "mlx.lib"
+    } else {
+        "libmlx.a"
+    }
+}
+
 /// The files every consumer path reads; a cache dir missing one of them is
 /// treated as absent rather than discovered at link time.
-fn prebuilt_layout_complete(dir: &Path) -> bool {
-    dir.join("lib").join("libmlx.a").is_file()
-        && dir.join("lib").join("mlx.metallib").is_file()
+fn prebuilt_layout_complete(dir: &Path, triple: &str) -> bool {
+    let windows = triple.ends_with("-pc-windows-msvc");
+    let target_files = if windows {
+        dir.join("lib").join("openblas.lib").is_file()
+            && dir.join("include").join("fmt").is_dir()
+    } else {
+        dir.join("lib").join("mlx.metallib").is_file()
+    };
+    dir.join("lib")
+        .join(prebuilt_mlx_library(triple))
+        .is_file()
         && dir.join("include").join("mlx").is_dir()
+        && target_files
 }
 
 /// A complete unpack of the pinned artifact: marker (tag + digest) matches
 /// and the layout is there. The marker is written last, so a partial
 /// unpack never passes.
-fn prebuilt_unpack_is_current(dir: &Path, release_tag: &str, sha256: &str) -> bool {
+fn prebuilt_unpack_is_current(dir: &Path, triple: &str, release_tag: &str, sha256: &str) -> bool {
     std::fs::read_to_string(dir.join(PREBUILT_MARKER))
         .is_ok_and(|text| text.trim() == marker_content(release_tag, sha256).trim())
-        && prebuilt_layout_complete(dir)
+        && prebuilt_layout_complete(dir, triple)
 }
 
 fn curl_download(url: &str, dest: &Path, token: Option<&str>) -> Result<(), String> {
@@ -868,6 +901,7 @@ fn fetch_prebuilt(
     asset_file: &str,
     sha256: &str,
     unpack_dir: &Path,
+    triple: &str,
 ) -> Result<(), String> {
     let parent = unpack_dir
         .parent()
@@ -918,15 +952,20 @@ fn fetch_prebuilt(
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(format!("tar -xzf of {asset_file} failed: {status}"));
     }
-    if !prebuilt_layout_complete(&tmp) {
+    if !prebuilt_layout_complete(&tmp, triple) {
         let _ = std::fs::remove_dir_all(&tmp);
+        let expected = if triple.ends_with("-pc-windows-msvc") {
+            "lib/mlx.lib, lib/openblas.lib, include/mlx, include/fmt"
+        } else {
+            "lib/libmlx.a, lib/mlx.metallib, include/mlx"
+        };
         panic!(
-            "mlx-sys: {url} does not have the prebuilt layout (lib/libmlx.a, lib/mlx.metallib, \
-             include/mlx); the release asset is malformed."
+            "mlx-sys: {url} does not have the prebuilt layout ({expected}); the release asset is \
+             malformed."
         );
     }
     // Another cargo (other target dir, same cache) may have finished first.
-    if prebuilt_unpack_is_current(unpack_dir, &pin.release_tag, sha256) {
+    if prebuilt_unpack_is_current(unpack_dir, triple, &pin.release_tag, sha256) {
         let _ = std::fs::remove_dir_all(&tmp);
         return Ok(());
     }
@@ -1000,11 +1039,23 @@ fn resolve_mlx_source(
     }
     if let Some(dir) = env_non_empty("MLX_PREBUILT_DIR") {
         let dir = PathBuf::from(dir);
-        if !dir.join("lib").join("libmlx.a").is_file() || !dir.join("include").join("mlx").is_dir()
+        let mlx_library = prebuilt_mlx_library(triple);
+        if !dir.join("lib").join(mlx_library).is_file()
+            || !dir.join("include").join("mlx").is_dir()
         {
             panic!(
-                "mlx-sys: MLX_PREBUILT_DIR={} has no lib/libmlx.a or include/mlx; expected an \
+                "mlx-sys: MLX_PREBUILT_DIR={} has no lib/{mlx_library} or include/mlx; expected an \
                  unpacked prebuilt MLX artifact (lib/, include/, manifest.json).",
+                dir.display()
+            );
+        }
+        if triple.ends_with("-pc-windows-msvc")
+            && (!dir.join("lib").join("openblas.lib").is_file()
+                || !dir.join("include").join("fmt").is_dir())
+        {
+            panic!(
+                "mlx-sys: MLX_PREBUILT_DIR={} has no lib/openblas.lib or include/fmt; expected a \
+                 complete Windows CUDA prebuilt MLX artifact.",
                 dir.display()
             );
         }
@@ -1055,14 +1106,20 @@ fn resolve_mlx_source(
             dir,
         };
     }
-    if triple != "aarch64-apple-darwin" || !build_metal {
-        return source(&format!(
-            "no prebuilt MLX for {triple} (Metal {})",
-            if build_metal { "on" } else { "off" }
-        ));
-    }
-    let Some(deployment_target) = deployment_target else {
-        return source("no macOS deployment target");
+    let (prebuilt_os, prebuilt_arch) = match triple {
+        "aarch64-apple-darwin" if build_metal => {
+            if deployment_target.is_none() {
+                return source("no macOS deployment target");
+            }
+            ("macos", "aarch64")
+        }
+        "aarch64-pc-windows-msvc" if !build_metal => ("windows", "aarch64"),
+        _ => {
+            return source(&format!(
+                "no prebuilt MLX for {triple} (Metal {})",
+                if build_metal { "on" } else { "off" }
+            ));
+        }
     };
 
     let pin_path = manifest_dir.join(PREBUILT_PIN_FILE);
@@ -1101,7 +1158,7 @@ fn resolve_mlx_source(
     // The tag encodes the cmake build inputs too: a pin left pointing at a
     // release built with other defines (or another `cmake/` include) is
     // refused rather than linked.
-    let defines = portable_cmake_defines(build_metal, "macos", "aarch64", Some(deployment_target));
+    let defines = portable_cmake_defines(build_metal, prebuilt_os, prebuilt_arch, deployment_target);
     let build_key = match prebuilt_build_key(manifest_dir, &defines) {
         Ok(key) => key,
         Err(error) => return source(&format!("cannot compute the prebuilt build key: {error}")),
@@ -1119,8 +1176,8 @@ fn resolve_mlx_source(
     let unpack_dir = prebuilt_cache_root(manifest_dir)
         .join(&pin.release_tag)
         .join(triple);
-    if !prebuilt_unpack_is_current(&unpack_dir, &pin.release_tag, &sha256)
-        && let Err(error) = fetch_prebuilt(&pin, &asset_file, &sha256, &unpack_dir)
+    if !prebuilt_unpack_is_current(&unpack_dir, triple, &pin.release_tag, &sha256)
+        && let Err(error) = fetch_prebuilt(&pin, &asset_file, &sha256, &unpack_dir, triple)
     {
         return source(&error);
     }
@@ -1144,15 +1201,18 @@ fn resolve_mlx_source(
             }
         }
     }
-    match prebuilt_manifest_deployment_target(&unpack_dir) {
-        Some(recorded) if recorded == deployment_target => {}
-        recorded => {
-            return source(&format!(
-                "prebuilt {} was built for macOS deployment target {}, this build targets \
-                 {deployment_target}",
-                pin.release_tag,
-                recorded.as_deref().unwrap_or("<unknown>")
-            ));
+    if prebuilt_os == "macos" {
+        let deployment_target = deployment_target.expect("macOS prebuilt has a deployment target");
+        match prebuilt_manifest_deployment_target(&unpack_dir) {
+            Some(recorded) if recorded == deployment_target => {}
+            recorded => {
+                return source(&format!(
+                    "prebuilt {} was built for macOS deployment target {}, this build targets \
+                     {deployment_target}",
+                    pin.release_tag,
+                    recorded.as_deref().unwrap_or("<unknown>")
+                ));
+            }
         }
     }
     MlxSource::Prebuilt {
@@ -1197,11 +1257,17 @@ fn export_prebuilt(
     let _ = std::fs::remove_dir_all(export_dir);
     let lib_dir = export_dir.join("lib");
     std::fs::create_dir_all(&lib_dir)?;
-    for (name, required) in [
-        ("libmlx.a", true),
-        ("libjaccl.a", false),
-        ("mlx.metallib", true),
-    ] {
+    let windows = triple.ends_with("-pc-windows-msvc");
+    let libraries: Vec<(&str, bool)> = if windows {
+        vec![("mlx.lib", true), ("openblas.lib", true)]
+    } else {
+        vec![
+            ("libmlx.a", true),
+            ("libjaccl.a", false),
+            ("mlx.metallib", true),
+        ]
+    };
+    for (name, required) in libraries {
         let from = dst.join("lib").join(name);
         if from.is_file() {
             std::fs::copy(&from, lib_dir.join(name))?;
@@ -1213,8 +1279,25 @@ fn export_prebuilt(
         }
     }
     copy_dir_recursive(&dst.join("include"), &export_dir.join("include"))?;
-    let built_at = command_stdout(Command::new("date").args(["-u", "+%Y-%m-%dT%H:%M:%SZ"]))
-        .unwrap_or_default();
+    if windows {
+        // CUDA's public headers include fmt, which CMake keeps in its build
+        // tree rather than installing. The consumer still builds the bridge.
+        copy_dir_recursive(
+            &dst.join("build/_deps/fmt-src/include/fmt"),
+            &export_dir.join("include/fmt"),
+        )?;
+    }
+    let built_at = if cfg!(target_os = "windows") {
+        command_stdout(Command::new("powershell").args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')",
+        ]))
+    } else {
+        command_stdout(Command::new("date").args(["-u", "+%Y-%m-%dT%H:%M:%SZ"]))
+    }
+    .unwrap_or_default();
     let defines = cmake_defines
         .iter()
         .map(|(k, v)| format!("    \"-D{}={}\"", json_escape(k), json_escape(v)))
@@ -1345,6 +1428,10 @@ fn main() -> io::Result<()> {
                 "unknown-linux-{}",
                 env::var("CARGO_CFG_TARGET_ENV").unwrap_or_else(|_| "gnu".into())
             ),
+            "windows" => format!(
+                "pc-windows-{}",
+                env::var("CARGO_CFG_TARGET_ENV").unwrap_or_else(|_| "msvc".into())
+            ),
             other => format!("unknown-{other}"),
         }
     );
@@ -1466,7 +1553,9 @@ fn main() -> io::Result<()> {
             // of failing at link time.
             println!(
                 "cargo:rerun-if-changed={}",
-                dir.join("lib").join("libmlx.a").display()
+                dir.join("lib")
+                    .join(prebuilt_mlx_library(&triple))
+                    .display()
             );
             (dir.clone(), vec![dir.join("lib")], true)
         }
@@ -1637,8 +1726,10 @@ fn main() -> io::Result<()> {
         bridge
             .define("MLX_NODE_CUDA_ENABLED", None)
             .include(cuda.join("include"))
-            .include(cuda.join("include/cccl"))
-            .include(mlx_root.join("build/_deps/fmt-src/include"));
+            .include(cuda.join("include/cccl"));
+        if !prebuilt {
+            bridge.include(mlx_root.join("build/_deps/fmt-src/include"));
+        }
     }
     if target_os == "windows" {
         bridge

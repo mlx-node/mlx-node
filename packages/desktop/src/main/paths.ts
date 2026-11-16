@@ -10,7 +10,7 @@
  * packaging run.
  */
 
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 /**
  * The addon's filename, duplicated from `scripts/payload.ts`'s `NATIVE_FILES[0]`.
@@ -83,6 +83,8 @@ export interface AppPaths {
    * this whole app is built to avoid.
    */
   nativeAddon: string;
+  /** Packaged Windows CUDA runtime root; null where no app-owned CUDA runtime exists. */
+  nativeRuntimeDir: string | null;
   /** Per-generation `MLX_INFERENCE_TRACE_FILE` directory. Created by the supervisor. */
   traceDir: string;
   settingsFile: string;
@@ -96,6 +98,7 @@ export function resolveAppPaths(layout: AppLayout): AppPaths {
   const { appPath, resourcesPath, packaged, userData } = layout;
   const windowsArm64 = layout.platform === 'win32' && layout.arch === 'arm64';
   const addon = windowsArm64 ? 'mlx-core.win32-arm64-msvc.node' : ADDON_FILE;
+  const nativeAddon = packaged ? join(resourcesPath, 'native', addon) : join(appPath, '..', 'core', addon);
   return {
     cliEntry: packaged
       ? join(appPath, 'node_modules', '@mlx-node', 'cli', 'dist', 'cli.js')
@@ -114,7 +117,8 @@ export function resolveAppPaths(layout: AppLayout): AppPaths {
     // which is also where napi's own fallback would have found it: the variable
     // is set in both modes anyway so that dev and the bundle take the same code
     // path through `requireNative()`.
-    nativeAddon: packaged ? join(resourcesPath, 'native', addon) : join(appPath, '..', 'core', addon),
+    nativeAddon,
+    nativeRuntimeDir: packaged && windowsArm64 ? dirname(nativeAddon) : null,
     traceDir: join(userData, 'traces'),
     settingsFile: join(userData, 'settings.json'),
     trayIcon: join(appPath, 'build', 'iconTemplate.png'),

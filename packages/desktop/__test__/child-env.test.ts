@@ -37,6 +37,20 @@ describe('sidecarEnvOverrides', () => {
     expect(sidecarEnvOverrides({ nativeAddon: ADDON, modelsDir: '/models' }).MLX_MODELS_DIR).toBe('/models');
   });
 
+  it('points packaged Windows children at the bundled DLLs and NVRTC headers', () => {
+    const env = sidecarEnvOverrides({
+      nativeAddon: 'C:\\app\\resources\\native\\mlx-core.win32-arm64-msvc.node',
+      nativeRuntimeDir: 'C:\\app\\resources\\native',
+      modelsDir: null,
+      baseEnv: { Path: 'C:\\Windows\\system32' },
+    });
+    expect(env.CUDA_HOME).toBe('C:\\app\\resources\\native');
+    expect(env.CUDA_PATH).toBe('C:\\app\\resources\\native');
+    expect(env.Path).toBe('C:\\app\\resources\\native;C:\\Windows\\system32');
+    expect(env).not.toHaveProperty('PATH');
+    expect(env.MLX_CUDA_USE_CUDNN_SDPA).toBe('0');
+  });
+
   it('is exactly the set that has to beat the user’s shell', () => {
     // This is the `overrides` layer of `buildChildEnv` — above the inherited
     // environment. Anything added here silently wins over a value the developer

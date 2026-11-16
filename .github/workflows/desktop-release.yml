@@ -63,8 +63,111 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  windows:
+    name: Package Windows ARM64
+    # The runner must provide an ARM64 MSVC/Windows SDK plus CUDA 13.4 and
+    # cuDNN 9 through CUDA_PATH/CUDNN_PATH. No Apple signing secrets are used.
+    runs-on: [self-hosted, windows, arm64]
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.dry_run && github.ref || (inputs.release_tag && format('refs/tags/{0}', inputs.release_tag)) || github.ref }}
+          submodules: recursive
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: 'yarn'
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          target: aarch64-pc-windows-msvc
+          cache: false
+          rustflags: ''
+
+      - name: Setup the ARM64 MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v1-rust
+          shared-key: windows-arm64-release
+
+      - name: Check the Windows build environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((node -p "process.arch") -ne 'arm64') { throw 'The release requires ARM64 Node.js.' }
+          if ([string]::IsNullOrWhiteSpace($env:CUDA_PATH)) { throw 'CUDA_PATH must name the Windows ARM64 CUDA 13.4 toolkit.' }
+          if ([string]::IsNullOrWhiteSpace($env:CUDNN_PATH)) { throw 'CUDNN_PATH must name the Windows ARM64 cuDNN 9 SDK.' }
+          if (-not (Test-Path -LiteralPath "$env:CUDA_PATH\bin\arm64\cudart64_13.dll")) { throw 'CUDA_PATH has no ARM64 runtime DLLs.' }
+          if (-not (Test-Path -LiteralPath "$env:CUDNN_PATH\bin\arm64\cudnn64_9.dll")) { throw 'CUDNN_PATH has no ARM64 cuDNN 9 runtime.' }
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Resolve release version
+        id: version
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+        run: yarn oxnode packages/desktop/scripts/check-release.ts resolve --tag "$env:TAG" --manifest packages/desktop/package.json
+
+      # Match the macOS job: a release packages a fresh addon and its matching
+      # runtime rather than reusing a stale CI artifact.
+      - name: Build native + TypeScript
+        run: yarn build
+
+      - name: Build dashboard UI
+        run: yarn workspace @mlx-node/dashboard build:ui
+
+      - name: Package the portable Windows ZIP
+        id: package
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          yarn oxnode packages/desktop/scripts/package-windows.ts --app-version "$env:APP_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw 'Windows packaging failed.' }
+          $resultPath = 'packages/desktop/out/windows-package-result.json'
+          if (-not (Test-Path -LiteralPath $resultPath)) { throw "Packaging produced no $resultPath" }
+          $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+          if (-not (Test-Path -LiteralPath $result.appPath -PathType Container)) { throw "Missing packaged app: $($result.appPath)" }
+          if (-not (Test-Path -LiteralPath $result.zipPath -PathType Leaf)) { throw "Missing Windows ZIP: $($result.zipPath)" }
+          "app=$($result.appPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "zip=$($result.zipPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Validate the Windows app and artifact versions
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+          APP: ${{ steps.package.outputs.app }}
+          ZIP: ${{ steps.package.outputs.zip }}
+        run: yarn oxnode packages/desktop/scripts/check-release.ts verify-windows --tag "$env:TAG" --manifest packages/desktop/package.json --app "$env:APP" --zip "$env:ZIP"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mlx-node-desktop-windows-arm64
+          path: ${{ steps.package.outputs.zip }}
+          if-no-files-found: error
+
   release:
     name: Sign, notarize, publish
+    needs: windows
     runs-on: macos-26
     permissions:
       contents: write
@@ -326,6 +429,14 @@ jobs:
           hdiutil create -volname "mlx-node" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
 
+      # Publish the Windows ZIP in the same draft transaction as the macOS
+      # assets. The Windows job has already verified its packaged app and archive.
+      - name: Download the Windows ARM64 artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: mlx-node-desktop-windows-arm64
+          path: packages/desktop/out/windows-release
+
       # Re-derives nothing. It reads CFBundleShortVersionString and CFBundleVersion
       # out of the plist that was actually written and the version out of the DMG's
       # actual filename, and fails unless they and the tag and the manifest are one
@@ -334,11 +445,12 @@ jobs:
       - name: Validate artifact versions
         env:
           TAG: ${{ env.RELEASE_TAG }}
+          WINDOWS_ZIP: packages/desktop/out/windows-release/${{ steps.version.outputs.windows_zip_name }}
         run: |
           yarn oxnode packages/desktop/scripts/check-release.ts verify \
             --tag "$TAG" --manifest packages/desktop/package.json \
             --app "${{ steps.package.outputs.app }}" --dmg "${{ steps.dmg.outputs.path }}" \
-            --zip "${{ steps.zip.outputs.path }}"
+            --zip "${{ steps.zip.outputs.path }}" --windows-zip "$WINDOWS_ZIP"
 
       # The DMG is a separate distributable and Gatekeeper assesses it on its own,
       # so it needs its own signature, notarization and ticket. Skipping this is the
@@ -382,9 +494,11 @@ jobs:
           ZIP: ${{ steps.zip.outputs.path }}
           BLOCKMAP: ${{ steps.update.outputs.blockmap }}
           MANIFEST: ${{ steps.update.outputs.manifest }}
+          WINDOWS_ZIP: packages/desktop/out/windows-release/${{ steps.version.outputs.windows_zip_name }}
         run: |
           yarn oxnode packages/desktop/scripts/publish-release.ts publish --tag "$RELEASE_TAG" \
-            --dmg "$DMG" --zip "$ZIP" --blockmap "$BLOCKMAP" --manifest "$MANIFEST"
+            --dmg "$DMG" --zip "$ZIP" --blockmap "$BLOCKMAP" --manifest "$MANIFEST" \
+            --windows-zip "$WINDOWS_ZIP"
 
       # The `secrets` context is NOT available in a step `if` — only github, needs,
       # strategy, matrix, job, runner, env, vars, steps and inputs are. Writing
