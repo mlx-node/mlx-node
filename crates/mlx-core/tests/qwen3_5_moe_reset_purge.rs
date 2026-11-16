@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Gated session-reset regression test for Qwen3.5 MoE on the PAGED
 //! adapter.
 //!

@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! Real-weights paged-vs-flat numerical-equivalence gate for LFM2.
 //!
 //! LFM2 is the second of the two models with full forward dispatch wired

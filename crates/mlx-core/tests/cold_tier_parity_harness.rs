@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Reusable restart-parity gate for the SSD cold tier, shared by every family.
 //!
 //! Lifted verbatim (behaviour-wise) out of `qwen3_cold_tier_parity.rs` so a

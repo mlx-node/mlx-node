@@ -522,6 +522,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn asset_cache_never_writes_beside_read_only_source() {
         use crate::utils::gguf::sweep_env_lock;

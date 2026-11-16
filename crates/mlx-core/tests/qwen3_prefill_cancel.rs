@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Real-weights mid-prefill cancellation gate for Qwen3 (hazard H1b,
 //! fail closed).
 //!

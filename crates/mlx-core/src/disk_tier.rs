@@ -229,12 +229,16 @@ thread_local! {
     /// Volumes the tests give paths under these roots.
     pub(crate) static VOLUMES: std::cell::RefCell<Vec<(PathBuf, Option<Volume>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The [`DiskTier::measure`] calls this thread made.
+    pub(crate) static MEASURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The writer's queue depth and free-space reserve the tiers a test
     /// opens take.
     pub(crate) static TEST_WRITER: std::cell::Cell<Option<(usize, u64)>> =
         const { std::cell::Cell::new(None) };
-    /// The [`DiskTier::measure`] calls this thread made.
-    pub(crate) static MEASURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The writer's queue depth and its free-space reserve over a volume whose
@@ -551,7 +555,10 @@ impl DiskTier {
         hold.is_some().then(remove)
     }
 
-    #[cfg(test)]
+}
+
+#[cfg(test)]
+impl DiskTier {
     pub(crate) fn dir(&self) -> PathBuf {
         self.manager.root().to_path_buf()
     }

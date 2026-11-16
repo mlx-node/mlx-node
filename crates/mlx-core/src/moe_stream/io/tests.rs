@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
+
 use super::*;
 use crate::array::{DType, MxArray};
 use crate::utils::gguf::{GgufFile, GgufMetaValue, GgufTensorType, parse_gguf, parse_gguf_reader};
@@ -586,7 +589,10 @@ fn real_smoke() {
     let plain: Vec<File> = paths.iter().map(|p| open_nocache(p).unwrap()).collect();
     let plain_read = |e: Extent| {
         let mut buf = vec![0u8; e.len as usize];
+        #[cfg(unix)]
         plain[e.shard].read_exact_at(&mut buf, e.offset).unwrap();
+        #[cfg(windows)]
+        plain[e.shard].seek_read(&mut buf, e.offset).unwrap();
         buf
     };
 

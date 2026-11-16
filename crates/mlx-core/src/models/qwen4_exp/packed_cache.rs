@@ -231,6 +231,7 @@ mod tests {
         assert!(foreign.iter().all(|dir| dir.exists()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_pack_and_validly_named_file_are_not_removed() {
         let temp = Temp::new();

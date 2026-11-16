@@ -5,15 +5,15 @@ use std::mem::size_of;
 use std::ptr::{NonNull, null, null_mut};
 
 use napi::bindgen_prelude::{Error, Result};
-use windows_sys::core::{GUID, HRESULT};
 use windows_sys::Win32::Foundation::PROPERTYKEY;
 use windows_sys::Win32::Media::Audio::{WAVEFORMATEX, WAVEFORMATEXTENSIBLE};
-use windows_sys::Win32::System::Com::StructuredStorage::{PropVariantClear, PROPVARIANT};
+use windows_sys::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
 use windows_sys::Win32::System::Com::{
-    CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
-    COINIT_MULTITHREADED, STGM_READ,
+    CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
+    CoUninitialize, STGM_READ,
 };
 use windows_sys::Win32::System::Variant::{VT_BLOB, VT_LPWSTR};
+use windows_sys::core::{GUID, HRESULT};
 
 use super::capture::{Qwen3AsrAudioDevice, Qwen3AsrInputDevice};
 use super::config::Qwen3AsrCaptureSource;
@@ -31,12 +31,9 @@ const HRESULT_ERROR_FILE_NOT_FOUND: HRESULT = 0x80070002u32 as HRESULT;
 const HRESULT_ERROR_PATH_NOT_FOUND: HRESULT = 0x80070003u32 as HRESULT;
 const HRESULT_ERROR_NOT_FOUND: HRESULT = 0x80070490u32 as HRESULT;
 
-const CLSID_MM_DEVICE_ENUMERATOR: GUID =
-    GUID::from_u128(0xbcde0395_e52f_467c_8e3d_c4579291692e);
-const IID_MM_DEVICE_ENUMERATOR: GUID =
-    GUID::from_u128(0xa95664d2_9614_4f35_a746_de8db63617e6);
-const KSDATAFORMAT_SUBTYPE_PCM: GUID =
-    GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
+const CLSID_MM_DEVICE_ENUMERATOR: GUID = GUID::from_u128(0xbcde0395_e52f_467c_8e3d_c4579291692e);
+const IID_MM_DEVICE_ENUMERATOR: GUID = GUID::from_u128(0xa95664d2_9614_4f35_a746_de8db63617e6);
+const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
 const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
     GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
 const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
@@ -155,10 +152,7 @@ struct DeviceCollectionVtbl {
     ) -> HRESULT,
     _add_ref: unsafe extern "system" fn(this: *mut DeviceCollection) -> u32,
     _release: unsafe extern "system" fn(this: *mut DeviceCollection) -> u32,
-    get_count: unsafe extern "system" fn(
-        this: *mut DeviceCollection,
-        count: *mut u32,
-    ) -> HRESULT,
+    get_count: unsafe extern "system" fn(this: *mut DeviceCollection, count: *mut u32) -> HRESULT,
     item: unsafe extern "system" fn(
         this: *mut DeviceCollection,
         index: u32,
@@ -257,7 +251,9 @@ impl ComApartment {
             Ok(Self { uninitialize: true })
         } else if hresult == RPC_E_CHANGED_MODE {
             // Existing single-threaded apartments can still enumerate WASAPI endpoints.
-            Ok(Self { uninitialize: false })
+            Ok(Self {
+                uninitialize: false,
+            })
         } else {
             Err(WasapiError::hresult("initialize COM", hresult))
         }
@@ -316,9 +312,7 @@ impl PropertyValue {
                 "WASAPI returned an invalid device format",
             ));
         }
-        Ok(unsafe {
-            std::slice::from_raw_parts(blob.pBlobData, blob.cbSize as usize).to_vec()
-        })
+        Ok(unsafe { std::slice::from_raw_parts(blob.pBlobData, blob.cbSize as usize).to_vec() })
     }
 }
 
@@ -534,9 +528,8 @@ fn default_endpoint_id(
 
 fn endpoint_id(device: &ComPtr<Device>) -> NativeResult<String> {
     let mut id = null_mut();
-    let hresult = unsafe {
-        (interface_vtable::<_, DeviceVtbl>(device).get_id)(device.0.as_ptr(), &mut id)
-    };
+    let hresult =
+        unsafe { (interface_vtable::<_, DeviceVtbl>(device).get_id)(device.0.as_ptr(), &mut id) };
     check_hresult("read WASAPI endpoint ID", hresult)?;
     if id.is_null() {
         return Err(WasapiError::invalid("WASAPI returned a null endpoint ID"));
@@ -727,8 +720,7 @@ mod tests {
             assert!(WasapiError::hresult("read endpoint", hresult).is_missing_device());
         }
         assert!(
-            !WasapiError::hresult("read endpoint", 0x80070005u32 as HRESULT)
-                .is_missing_device()
+            !WasapiError::hresult("read endpoint", 0x80070005u32 as HRESULT).is_missing_device()
         );
         assert!(!WasapiError::invalid("invalid format").is_missing_device());
     }

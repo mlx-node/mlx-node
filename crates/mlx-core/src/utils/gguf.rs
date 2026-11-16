@@ -8645,7 +8645,7 @@ fn native_gguf_marker_text(
 
 /// Serialize sweep and sidecar tests whose try-lock and skip outcomes are
 /// timing-dependent. Shared with `models::qwen4_exp::gguf` sidecar tests.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn sweep_env_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))

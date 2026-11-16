@@ -965,6 +965,7 @@ pub(super) mod tests {
         (completed, scheduler.stats().max_batch_occupancy)
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn concurrent_dflash_matches_ar_tokens_and_isolates_cancelled_owner() {
         use crate::models::muse_glimmer::model::scheduled_dflash::tests::seeded_inner;
@@ -1241,6 +1242,7 @@ pub(super) mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn sampled_dspark_and_dflash_keep_per_owner_rng_and_committed_history() {
         fn check<B: HybridSchedulerBackend>(build: impl Fn() -> B) {

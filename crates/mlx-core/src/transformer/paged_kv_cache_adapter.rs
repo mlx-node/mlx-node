@@ -84,11 +84,11 @@ use std::time::Duration;
 #[cfg(any(target_os = "macos", test))]
 use std::time::Instant;
 
+#[cfg(any(target_os = "macos", test))]
+use mlx_paged_attn::PagedAttentionConfig;
 use mlx_paged_attn::{
     BlockAllocator, CacheRecency, LayerKVPool, PhysicalBlock, PrefixKeys, SequenceBlockTable,
 };
-#[cfg(any(target_os = "macos", test))]
-use mlx_paged_attn::PagedAttentionConfig;
 
 #[cfg(target_os = "macos")]
 use super::paged_metadata_cache::{

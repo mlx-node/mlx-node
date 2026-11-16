@@ -191,10 +191,7 @@ impl Qwen3AsrCapture {
     }
 
     #[napi]
-    pub fn stop<'env>(
-        &mut self,
-        env: &'env Env,
-    ) -> Result<PromiseRaw<'env, Qwen3AsrCaptureStats>> {
+    pub fn stop<'env>(&mut self, env: &'env Env) -> Result<PromiseRaw<'env, Qwen3AsrCaptureStats>> {
         env.spawn_future(stop_capture(self))
     }
 }
@@ -228,15 +225,9 @@ fn start_prepared_capture(
     prepared: Result<PreparedCapture>,
 ) -> Result<Qwen3AsrCapture> {
     let callback = Arc::new(callback);
-    start_prepared_capture_with_callback(
-        sender,
-        stream_id,
-        options,
-        prepared,
-        move |result| {
-            callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
-        },
-    )
+    start_prepared_capture_with_callback(sender, stream_id, options, prepared, move |result| {
+        callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+    })
 }
 
 fn start_prepared_capture_with_callback(
@@ -317,9 +308,7 @@ fn start_prepared_capture_with_callback(
                     })
                     .is_err()
                 {
-                    worker_callback(Err(Error::from_reason(
-                        "Qwen3-ASR model thread exited",
-                    )));
+                    worker_callback(Err(Error::from_reason("Qwen3-ASR model thread exited")));
                     break;
                 }
                 match rx.blocking_recv() {
@@ -331,9 +320,7 @@ fn start_prepared_capture_with_callback(
                         worker_callback(Err(error));
                     }
                     Err(_) => {
-                        worker_callback(Err(Error::from_reason(
-                            "Qwen3-ASR model thread exited",
-                        )));
+                        worker_callback(Err(Error::from_reason("Qwen3-ASR model thread exited")));
                         break;
                     }
                 }
@@ -806,11 +793,7 @@ mod tests {
         prepare_reply
             .send(Err(Error::from_reason("prepare rejected")))
             .unwrap();
-        let error = startup
-            .join()
-            .unwrap()
-            .err()
-            .expect("prepare should fail");
+        let error = startup.join().unwrap().err().expect("prepare should fail");
         assert!(error.to_string().contains("prepare rejected"));
         assert!(state.started.load(Ordering::Acquire));
         assert!(state.dropped.load(Ordering::Acquire));

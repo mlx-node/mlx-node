@@ -1090,6 +1090,7 @@ fn close_cache_before_a_dispose_reports_a_state_left_unwritten() {
 /// A state write that fails for anything but room stops the tier: it takes
 /// no write after, and the turn's row reads `off`, as Qwen3.5 reports it.
 /// Mutation: the mode ignores whether the tier still takes writes → red.
+#[cfg(unix)]
 #[test]
 fn a_failed_state_write_turns_the_mode_off() {
     use std::os::unix::fs::PermissionsExt;

@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! Real-weights paged-vs-flat numerical-equivalence gate for Gemma4.
 //!
 //! Validates that the block-paged KV cache adapter (reached via

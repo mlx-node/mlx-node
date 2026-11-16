@@ -2224,6 +2224,7 @@ mod tests {
     /// vs 2) so a crossed pair cannot pass.
     #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_failed_write_and_a_refused_restore_land_in_different_block_counters() {
         use std::os::unix::fs::PermissionsExt;
 

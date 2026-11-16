@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! Correctness gate for the Gemma4 **vision** (image+text) PAGED path.
 //!
 //! Gemma4 image turns run ONLY on the block-paged KV backend; there is no

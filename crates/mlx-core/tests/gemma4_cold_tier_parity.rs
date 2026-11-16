@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Real-weights cold-tier restart-parity gates for Gemma4 (hybrid).
 //!
 //! Same three-instance scenario as the qwen3 gate — see
