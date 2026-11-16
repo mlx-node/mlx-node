@@ -809,7 +809,7 @@ fn sha256_file(path: &Path) -> io::Result<String> {
             .arg(path)
             .output()
     } else if cfg!(target_os = "windows") {
-        Command::new("powershell")
+        Command::new("pwsh")
             .args(["-NoProfile", "-NonInteractive", "-Command"])
             .arg("(Get-FileHash -Algorithm SHA256 -LiteralPath $env:MLX_PREBUILT_HASH_PATH).Hash")
             .env("MLX_PREBUILT_HASH_PATH", path)
