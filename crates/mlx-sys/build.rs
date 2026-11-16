@@ -848,14 +848,11 @@ fn prebuilt_mlx_library(triple: &str) -> &'static str {
 fn prebuilt_layout_complete(dir: &Path, triple: &str) -> bool {
     let windows = triple.ends_with("-pc-windows-msvc");
     let target_files = if windows {
-        dir.join("lib").join("openblas.lib").is_file()
-            && dir.join("include").join("fmt").is_dir()
+        dir.join("lib").join("openblas.lib").is_file() && dir.join("include").join("fmt").is_dir()
     } else {
         dir.join("lib").join("mlx.metallib").is_file()
     };
-    dir.join("lib")
-        .join(prebuilt_mlx_library(triple))
-        .is_file()
+    dir.join("lib").join(prebuilt_mlx_library(triple)).is_file()
         && dir.join("include").join("mlx").is_dir()
         && target_files
 }
@@ -1040,8 +1037,7 @@ fn resolve_mlx_source(
     if let Some(dir) = env_non_empty("MLX_PREBUILT_DIR") {
         let dir = PathBuf::from(dir);
         let mlx_library = prebuilt_mlx_library(triple);
-        if !dir.join("lib").join(mlx_library).is_file()
-            || !dir.join("include").join("mlx").is_dir()
+        if !dir.join("lib").join(mlx_library).is_file() || !dir.join("include").join("mlx").is_dir()
         {
             panic!(
                 "mlx-sys: MLX_PREBUILT_DIR={} has no lib/{mlx_library} or include/mlx; expected an \
@@ -1158,7 +1154,8 @@ fn resolve_mlx_source(
     // The tag encodes the cmake build inputs too: a pin left pointing at a
     // release built with other defines (or another `cmake/` include) is
     // refused rather than linked.
-    let defines = portable_cmake_defines(build_metal, prebuilt_os, prebuilt_arch, deployment_target);
+    let defines =
+        portable_cmake_defines(build_metal, prebuilt_os, prebuilt_arch, deployment_target);
     let build_key = match prebuilt_build_key(manifest_dir, &defines) {
         Ok(key) => key,
         Err(error) => return source(&format!("cannot compute the prebuilt build key: {error}")),

@@ -351,7 +351,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $installer = Join-Path $env:RUNNER_TEMP 'cuda-13.4.2.exe'
-          Invoke-WebRequest -Uri 'https://developer.download.nvidia.com/compute/cuda/13.4.2/local_installers/cuda_13.4.2_windows_arm64_network.exe' -OutFile $installer
+          Invoke-WebRequest -Uri 'https://developer.download.nvidia.com/compute/cuda/13.4.2/local_installers/cuda_13.4.2_windows_arm64.exe' -OutFile $installer
           $packages = @(
             'crt_13.4',
             'cudart_13.4',

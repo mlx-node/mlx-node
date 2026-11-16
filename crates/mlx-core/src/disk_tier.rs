@@ -554,7 +554,6 @@ impl DiskTier {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         hold.is_some().then(remove)
     }
-
 }
 
 #[cfg(test)]
