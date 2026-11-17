@@ -325,6 +325,9 @@ fn start_prepared_capture_with_callback(
                     }
                 }
             }
+            let _ = worker_sender.send(Qwen3AsrCmd::ReleaseCapture {
+                id: worker_stream_id,
+            });
         })
         .map_err(|error| Error::from_reason(format!("Failed to start capture worker: {error}")))?;
 
@@ -682,6 +685,9 @@ mod tests {
     }
 
     fn assert_no_command(commands: &mut mpsc::UnboundedReceiver<Qwen3AsrCmd>) {
+        if let Ok(Qwen3AsrCmd::ReleaseCapture { .. }) = commands.try_recv() {
+            // The worker releases its capture on exit; that notification is expected.
+        }
         assert!(matches!(
             commands.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
