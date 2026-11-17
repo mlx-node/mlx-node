@@ -11,13 +11,14 @@ ml-explore/mlx main  bebd6422f (2026-10-14)
         │  + 10 patches  fork fn-d1
         │  + 1 patch     local CUDA fix
         │  + 1 patch     thread-scoped TF32
+        │  + 1 patch     Windows cuDNN thread-exit release
         ▼
-mlx-node/mlx         6fe39a2b7  ◄── gitlink at crates/mlx-sys/mlx
+mlx-node/mlx         849f89346  ◄── gitlink at crates/mlx-sys/mlx
 ```
 
 Name a patch by its subject and use its commit hash for the exact gitlink.
 
-## The 12 patches
+## The 13 patches
 
 | #   | commit      | patch                                                                                                                                                                                                                                                                 | why it cannot live in mlx-node                                                                                                                                                                                                                                                                                                                                                                                                                                    | upstream candidate |
 | --- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
@@ -33,11 +34,12 @@ Name a patch by its subject and use its commit hash for the exact gitlink.
 | 10  | `7aa7d680b` | Sparse input budget: `set_input_array_with_budget` supplies an explicit storage-unit scheduling estimate; repeated or shared bindings restore the full charge. Users: Splash MoE expert weights, paged-attention pool planes (charged by the blocks the tables reach) | The scheduling estimate and discount restoration live in `CommandEncoder`'s private input-binding state. Actual resource tracking, hazards, retention and memory limits remain there too                                                                                                                                                                                                                                                                          | not proposed       |
 | 11  | `e0dcc863e` | Pass explicit `CompileOptions::Data` zero at both CUDA `CustomKernel` construction sites                                                                                                                                                                              | `std::make_shared` cannot deduce the type of a braced `{}` argument; zero preserves the default safe math mode and completes patch 1's `output_shapes` support on CUDA. The constructor and call sites are inside MLX. This is our local fork commit, not an upstream `ml-explore/mlx` commit                                                                                                                                                                     | yes                |
 | 12  | `6fe39a2b7` | `enable_tf32()` reads a per-thread override first; `set_thread_tf32(-1\|0\|1)` sets it (`mlx/utils.{h,cpp}`)                                                                                                                                                          | `enable_tf32()` was an inline process static read inside `eval_gpu` at every NAX GEMM, quantized and SDPA dispatch. The other routes are the process-wide `MLX_ENABLE_TF32` (Qwen3.8 Flash Next needs TF32 on) or per-primitive state. DeepSeek V4.1 Flash sets true f32 on its model thread (`Model::from_gguf`)                                                                                                                                                 | yes                |
+| 13  | `849f89346` | `clear_streams()` synchronizes encoders, clears the cuDNN graph caches, and destroys the cuDNN handle before thread exit                                                                                                                                             | Windows destroys a used cuDNN handle from its `thread_local` destructor. `cudnnDestroy` then returns `CUDNN_STATUS_INTERNAL_ERROR`, `CHECK_CUDNN_ERROR` throws, and the `noexcept` destructor terminates the process with `0xC0000409`. The release has to run while the thread can still call CUDA.                                                                                                                                                            | yes                |
 
 The active pin merges the 10 direct commits from the fork's `fn-d1` branch with
 our local CUDA constructor fix `e0dcc863e`, which is not an upstream
 `ml-explore/mlx` change, and carries the thread-scoped TF32 commit `6fe39a2b7`
-on top. The retired workspace commit remains an inactive
+and the cuDNN thread-exit commit `849f89346` on top. The retired workspace commit remains an inactive
 descendant on `fn-d1`; moving the gitlink to its parent does not rewrite that
 branch. `build.rs` uses the checked-out submodule directly for CMake, bridge
 headers, Metal kernels and generated preambles. There is no parent-repo patch

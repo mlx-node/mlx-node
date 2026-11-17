@@ -301,3 +301,311 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice title=mlx-prebuilt.json::$TARGET sha256=$SHA256 release_tag=$TAG mlx_commit=$MLX_COMMIT"
+
+  prebuilt-windows:
+    name: mlx aarch64-pc-windows-msvc
+    if: github.repository == 'mlx-node/mlx-node'
+    runs-on: windows-11-arm
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ASSET: mlx-aarch64-pc-windows-msvc.tar.gz
+      TARGET: aarch64-pc-windows-msvc
+      CMAKE_GENERATOR: Ninja
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          target: aarch64-pc-windows-msvc
+          cache: false
+          rustflags: ''
+
+      - name: Setup native ARM64 MSVC environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vsWhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vsWhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio with the ARM64 C++ tools was not found' }
+          $devCmd = Join-Path $vs 'Common7/Tools/VsDevCmd.bat'
+          $environment = cmd.exe /d /c "call `"$devCmd`" -arch=arm64 -host_arch=arm64 >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not enter the ARM64 MSVC environment' }
+          foreach ($line in $environment) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              $name = $Matches[1]
+              $value = $Matches[2]
+              [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+              "$name=$value" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
+
+      # CUDA 13.4 is the first toolkit with native Windows ARM64 packages.
+      # Install only the compiler, headers and libraries used by MLX; no GPU
+      # or display driver is needed because MLX_CUDA_ARCHITECTURES is pinned.
+      - name: Install CUDA Toolkit 13.4
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda-13.4.2.exe'
+          Invoke-WebRequest -Uri 'https://developer.download.nvidia.com/compute/cuda/13.4.2/local_installers/cuda_13.4.2_windows_arm64.exe' -OutFile $installer
+          $packages = @(
+            'crt_13.4',
+            'cudart_13.4',
+            'nvcc_13.4',
+            'nvvm_13.4',
+            'nvptxcompiler_13.4',
+            'nvrtc_13.4',
+            'nvrtc_dev_13.4',
+            'nvjitlink_13.4',
+            'nvtx_13.4',
+            'cublas_13.4',
+            'cublas_dev_13.4',
+            'cufft_13.4',
+            'cufft_dev_13.4',
+            'cusolver_13.4',
+            'cusolver_dev_13.4',
+            'cusparse_13.4',
+            'cusparse_dev_13.4'
+          )
+          $process = Start-Process -FilePath $installer -ArgumentList (@('-s') + $packages) -NoNewWindow -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "CUDA installer exited with $($process.ExitCode)" }
+          $cuda = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4'
+          if (-not (Test-Path -LiteralPath "$cuda\bin\nvcc.exe" -PathType Leaf)) { throw 'CUDA nvcc.exe was not installed' }
+          "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$cuda\bin", "$cuda\bin\arm64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install cuDNN 9
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'cudnn.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'cudnn-extracted'
+          Invoke-WebRequest -Uri 'https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-arm64/cudnn-windows-arm64-9.27.0.42_cuda13.4-archive.zip' -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
+          $cudnn = Get-ChildItem -LiteralPath $extract -Directory | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $cudnn -or -not (Test-Path -LiteralPath "$cudnn\lib\arm64\cudnn.lib" -PathType Leaf)) {
+            throw 'The cuDNN archive did not contain the ARM64 SDK'
+          }
+          "CUDNN_PATH=$cudnn" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$cudnn\bin\arm64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # MLX's CMake fetches CCCL / NVTX / cuDNN-frontend / CUTLASS from
+      # GitHub. Authenticate those downloads to avoid anonymous rate limits.
+      - name: Configure GitHub token for CMake downloads
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $netrc = @(
+            'machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}',
+            'machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}'
+          )
+          foreach ($name in '.netrc', '_netrc') {
+            $netrc | Set-Content -LiteralPath (Join-Path $env:USERPROFILE $name) -Encoding ascii
+          }
+
+      - name: Probe the release tag
+        id: meta
+        shell: pwsh
+        env:
+          MLX_PREBUILT: '0'
+          MLX_PREBUILT_EXPORT: ${{ github.workspace }}/prebuilt-out
+          MLX_PREBUILT_PROBE: ${{ github.workspace }}/probe.json
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --locked -p mlx-sys --target aarch64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'Cargo probe failed' }
+          if (-not (Test-Path -LiteralPath probe.json -PathType Leaf)) { throw 'probe.json was not written' }
+          $probe = Get-Content -LiteralPath probe.json -Raw | ConvertFrom-Json
+          foreach ($key in 'mlx_commit', 'release_tag', 'build_key') {
+            $property = $probe.PSObject.Properties[$key]
+            if ($null -eq $property -or [string]::IsNullOrEmpty([string]$property.Value)) {
+              throw "probe.json is missing $key"
+            }
+            $value = [string]$property.Value
+            "$key=$value" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            Write-Host "${key}: $value"
+          }
+
+      - name: Check for an existing release
+        id: existing
+        shell: pwsh
+        env:
+          TAG: ${{ steps.meta.outputs.release_tag }}
+          FORCE: ${{ inputs.force_reupload == true && 'true' || 'false' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exists = $false
+          $complete = $false
+          $assets = @(gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name' 2>$null)
+          if ($LASTEXITCODE -eq 0) {
+            $exists = $true
+            $complete = ($assets -contains $env:ASSET) -and ($assets -contains "$($env:ASSET).sha256")
+          }
+          "release_exists=$($exists.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          if ($exists -and $complete -and $env:FORCE -ne 'true') {
+            Write-Host "::notice::Release $env:TAG already carries $env:ASSET and its .sha256; nothing to publish (set force_reupload to overwrite)."
+            'skip=true' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          } else {
+            'skip=false' | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+
+      - name: Build MLX from source
+        if: steps.existing.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          MLX_PREBUILT: '0'
+          MLX_PREBUILT_EXPORT: ${{ github.workspace }}/prebuilt-out
+          TAG: ${{ steps.meta.outputs.release_tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --locked -p mlx-sys --target aarch64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { throw 'MLX source build failed' }
+          $manifest = Get-Content -LiteralPath prebuilt-out/manifest.json -Raw | ConvertFrom-Json
+          if ($manifest.release_tag -ne $env:TAG) {
+            throw "manifest names $($manifest.release_tag) but the probe said $env:TAG"
+          }
+
+      # CUDA uses NVRTC and the exported CCCL/CUTLASS headers, so unlike the
+      # macOS archive there is deliberately no Metal metallib in this asset.
+      - name: Package
+        if: steps.existing.outputs.skip != 'true'
+        id: pkg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in 'prebuilt-out/lib/mlx.lib', 'prebuilt-out/lib/openblas.lib') {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "$path is missing" }
+          }
+          foreach ($path in 'prebuilt-out/include/mlx', 'prebuilt-out/include/fmt', 'prebuilt-out/include/cccl', 'prebuilt-out/include/cutlass') {
+            if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw "$path is missing" }
+          }
+          Get-ChildItem -LiteralPath prebuilt-out, prebuilt-out/lib
+          tar -C prebuilt-out -czf $env:ASSET .
+          if ($LASTEXITCODE -ne 0) { throw 'tar failed' }
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $env:ASSET).Hash.ToLowerInvariant()
+          "$sha  $env:ASSET" | Set-Content -LiteralPath "$($env:ASSET).sha256" -Encoding ascii
+          "sha256=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Get-Item -LiteralPath $env:ASSET | Select-Object Name, Length
+
+      # Keep the same immutable-release and concurrent-publisher rules as the
+      # macOS job. Prereleases never become the repository's latest release.
+      - name: Create or update release
+        if: steps.existing.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          MLX_COMMIT: ${{ steps.meta.outputs.mlx_commit }}
+          BUILD_KEY: ${{ steps.meta.outputs.build_key }}
+          TAG: ${{ steps.meta.outputs.release_tag }}
+          RELEASE_EXISTS: ${{ steps.existing.outputs.release_exists }}
+          FORCE: ${{ inputs.force_reupload == true && 'true' || 'false' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Assert-NativeSuccess([string]$action) {
+            if ($LASTEXITCODE -ne 0) { throw "$action failed with exit code $LASTEXITCODE" }
+          }
+          function Test-ReleaseAsset {
+            $names = @(gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name' 2>$null)
+            return ($LASTEXITCODE -eq 0 -and ($names -contains $env:ASSET))
+          }
+          $notes = @"
+          Prebuilt MLX C++ library for crates/mlx-sys — not an application release.
+
+          - mlx fork commit: https://github.com/mlx-node/mlx/commit/$env:MLX_COMMIT
+          - cmake build key: $env:BUILD_KEY (portable defines + crates/mlx-sys/cmake/ + build.rs key revision)
+          - built from mlx-node commit: $env:GITHUB_SHA
+          - target: $env:TARGET (CUDA 13.4, sm_121a)
+          - contents: lib/mlx.lib, lib/openblas.lib, include/**, manifest.json
+
+          crates/mlx-sys/build.rs downloads the asset named in crates/mlx-sys/mlx-prebuilt.json,
+          checks its sha256, and links against it instead of running the cmake build.
+          MLX_PREBUILT=0 always forces a source build.
+          "@
+          $notesFile = Join-Path $env:RUNNER_TEMP 'notes.md'
+          $notes | Set-Content -LiteralPath $notesFile -Encoding utf8
+          if ($env:FORCE -eq 'true') {
+            if ($env:RELEASE_EXISTS -ne 'true') {
+              gh release create $env:TAG --repo $env:GITHUB_REPOSITORY --prerelease --title "MLX prebuilt $($env:MLX_COMMIT.Substring(0, 12))" --notes-file $notesFile --target $env:GITHUB_SHA
+              Assert-NativeSuccess 'gh release create'
+            }
+            gh release upload $env:TAG --repo $env:GITHUB_REPOSITORY --clobber $env:ASSET "$($env:ASSET).sha256"
+            Assert-NativeSuccess 'gh release upload'
+          } else {
+            $created = $false
+            if ($env:RELEASE_EXISTS -ne 'true') {
+              gh release create $env:TAG --repo $env:GITHUB_REPOSITORY --prerelease --title "MLX prebuilt $($env:MLX_COMMIT.Substring(0, 12))" --notes-file $notesFile --target $env:GITHUB_SHA $env:ASSET "$($env:ASSET).sha256"
+              $created = $LASTEXITCODE -eq 0
+            }
+            if ($created) {
+              # This publisher won the race and uploaded both assets.
+            } elseif (Test-ReleaseAsset) {
+              Write-Host "::notice::Release $env:TAG already carries $env:ASSET (concurrent run or earlier partial upload); keeping its bytes."
+            } else {
+              gh release upload $env:TAG --repo $env:GITHUB_REPOSITORY $env:ASSET "$($env:ASSET).sha256"
+              Assert-NativeSuccess 'gh release upload'
+            }
+          }
+          Write-Host "::notice::Published $env:ASSET to release $env:TAG"
+
+      # Hash the published archive, not the local one: a concurrent publisher
+      # may have won, and tar metadata / manifest built_at can differ.
+      - name: Emit pin snippet
+        if: steps.existing.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          MLX_COMMIT: ${{ steps.meta.outputs.mlx_commit }}
+          TAG: ${{ steps.meta.outputs.release_tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Assert-NativeSuccess([string]$action) {
+            if ($LASTEXITCODE -ne 0) { throw "$action failed with exit code $LASTEXITCODE" }
+          }
+          $published = Join-Path $env:RUNNER_TEMP 'published'
+          Remove-Item -LiteralPath $published -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $published | Out-Null
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern $env:ASSET --dir $published
+          Assert-NativeSuccess 'gh release download'
+          $assetPath = Join-Path $published $env:ASSET
+          $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $assetPath).Hash.ToLowerInvariant()
+          $assets = @(gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name')
+          Assert-NativeSuccess 'gh release view'
+          $sidecarName = "$($env:ASSET).sha256"
+          if ($assets -notcontains $sidecarName) {
+            "$sha256  $env:ASSET" | Set-Content -LiteralPath (Join-Path $published $sidecarName) -Encoding ascii
+            gh release upload $env:TAG --repo $env:GITHUB_REPOSITORY (Join-Path $published $sidecarName)
+            Assert-NativeSuccess 'gh release upload sidecar'
+          } else {
+            gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern $sidecarName --dir $published
+            Assert-NativeSuccess 'gh release download sidecar'
+            $sidecar = ((Get-Content -LiteralPath (Join-Path $published $sidecarName) -Raw).Trim() -split '\s+')[0]
+            if ($sidecar -ne $sha256) {
+              throw "$sidecarName on $env:TAG ($sidecar) does not match the published archive ($sha256)"
+            }
+          }
+          $snippet = @"
+          {
+            "repo": "$env:GITHUB_REPOSITORY",
+            "mlx_commit": "$env:MLX_COMMIT",
+            "release_tag": "$env:TAG",
+            "assets": {
+              "$env:TARGET": {
+                "file": "$env:ASSET",
+                "sha256": "$sha256",
+                "release_tag": "$env:TAG"
+              }
+            }
+          }
+          "@
+          @(
+            "## MLX prebuilt $env:TAG",
+            '',
+            'Merge this target entry into crates/mlx-sys/mlx-prebuilt.json assets. Keep the existing root release_tag; this entry carries its own:',
+            '',
+            '```json',
+            $snippet,
+            '```'
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+          Write-Host "::notice title=mlx-prebuilt.json::$env:TARGET sha256=$sha256 release_tag=$env:TAG mlx_commit=$env:MLX_COMMIT"

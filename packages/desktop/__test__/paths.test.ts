@@ -92,6 +92,23 @@ describe('resolveAppPaths', () => {
     expect(resolveAppPaths(PACKAGED).nativeAddon).toBe(bundledAddonPath(PACKAGED.resourcesPath));
   });
 
+  it('uses the Windows ARM64 addon and packaged CUDA runtime only on Windows', () => {
+    const windows = resolveAppPaths({
+      appPath: 'C:\\Program Files\\mlx-node\\resources\\app',
+      resourcesPath: 'C:\\Program Files\\mlx-node\\resources',
+      packaged: true,
+      userData: 'C:\\Users\\x\\AppData\\Roaming\\mlx-node',
+      platform: 'win32',
+      arch: 'arm64',
+    });
+    expect(windows.nativeAddon).toBe(
+      join('C:\\Program Files\\mlx-node\\resources', 'native', 'mlx-core.win32-arm64-msvc.node'),
+    );
+    expect(windows.nativeRuntimeDir).toBe(join('C:\\Program Files\\mlx-node\\resources', 'native'));
+    expect(resolveAppPaths(PACKAGED).nativeRuntimeDir).toBeNull();
+    expect(resolveAppPaths({ ...DEV, platform: 'win32', arch: 'arm64' }).nativeRuntimeDir).toBeNull();
+  });
+
   it('reads the addon out of the workspace in dev', () => {
     // The same file napi's own platform lookup would have found, so dev and the
     // bundle take the same branch of `requireNative()` rather than the packaged

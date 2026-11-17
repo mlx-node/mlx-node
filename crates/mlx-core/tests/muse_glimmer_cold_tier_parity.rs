@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Real-weight restart parity for Muse-Glimmer's grouped full + sliding cache.
 //!
 //! The test is the admission gate for the native/TypeScript cold-tier

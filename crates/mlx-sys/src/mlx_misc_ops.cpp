@@ -41,6 +41,11 @@ void mlx_clear_cache() {
   }
 }
 
+// Windows requires worker streams to be destroyed before thread teardown.
+void mlx_clear_streams() {
+  mlx::core::clear_streams();
+}
+
 // Clear the compiler cache (traced computation graphs)
 // This releases memory from compiled/traced functions
 // Returns true on success, false on failure

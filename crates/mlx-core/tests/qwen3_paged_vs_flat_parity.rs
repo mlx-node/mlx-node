@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! Real-weights paged-vs-flat numerical-equivalence gate for Qwen3.
 //!
 //! Validates that the block-paged KV cache adapter (`forward_paged_adapter`,

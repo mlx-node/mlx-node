@@ -8,8 +8,8 @@ by dragging mlx-node to Applications. The app requires Apple Silicon and macOS 2
 Open **Coding Agents** in the control panel to let other agents delegate GitHub
 work to `mlx delegate github`. The app includes the CLI and runs it with Electron's
 bundled Node runtime; users do not need npm or a separate Node installation. At
-launch it creates `~/.mlx-node/bin/mlx`, verifies delegation support, and repairs
-its target after the app moves or updates. It never overwrites a foreign command
+launch it creates `~/.mlx-node/bin/mlx` (`mlx.cmd` on Windows), verifies delegation
+support, and repairs its target after the app moves or updates. It never overwrites a foreign command
 at that location or changes shell startup files or an existing global `mlx`.
 
 Setup writes the launcher's quoted absolute path into the routing prompt, so
@@ -93,11 +93,14 @@ The [desktop release workflow](../../.github/workflows/desktop-release.yml) prod
 - `mlx-node-<version>-darwin-arm64.zip` for automatic updates.
 - `mlx-node-<version>-darwin-arm64.zip.blockmap` for differential downloads.
 - `latest-mac.yml` with the update version, archive size/hash, minimum macOS, and rollout percentage.
+- `mlx-node-<version>-win32-arm64.zip`, an unsigned portable Windows ARM64 app
+  with the native addon, CUDA/cuDNN/OpenBLAS DLLs, and NVRTC headers. Extract it
+  and run `mlx-node.exe`; no Apple signing or automatic update feed is used.
 
-Both contain the same Developer ID signed, notarized, and stapled app. The ZIP is
+The macOS DMG and update ZIP contain the same Developer ID signed, notarized, and stapled app. The ZIP is
 created after stapling, then extracted to verify its signature, ticket, and version
-before publication. Dry runs build and verify both archives but skip notarization
-and release uploads.
+before publication. Dry runs build and verify the macOS and Windows archives but
+skip notarization and release uploads.
 
 The app uses [electron-updater](https://www.electron.build/v26/docs/features/auto-update/)
 with public GitHub Releases. macOS installation still uses Squirrel.Mac. Keep the

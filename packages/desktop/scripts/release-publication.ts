@@ -2,7 +2,7 @@ import { statSync } from 'node:fs';
 import { basename } from 'node:path';
 
 import { waitForReleaseCI } from './release-ci.js';
-import { dmgFileName, updateZipFileName, versionFromTag } from './release-version.js';
+import { dmgFileName, updateZipFileName, versionFromTag, windowsZipFileName } from './release-version.js';
 
 type GitHub = (args: string[]) => string;
 interface Release {
@@ -59,12 +59,12 @@ export async function publishDesktopRelease(
 ): Promise<void> {
   const version = versionFromTag(tag);
   const zip = updateZipFileName(version);
-  const expected = [dmgFileName(version), zip, `${zip}.blockmap`, 'latest-mac.yml'];
+  const expected = [dmgFileName(version), zip, `${zip}.blockmap`, 'latest-mac.yml', windowsZipFileName(version)];
   if (
     files.length !== expected.length ||
     expected.some((name) => files.filter((file) => basename(file) === name).length !== 1)
   ) {
-    throw new Error('Publication requires the matching DMG, update ZIP, blockmap, and latest-mac.yml');
+    throw new Error('Publication requires the matching DMG, macOS update files, and Windows ARM64 ZIP');
   }
   const assets = files.map((file) => {
     const stat = statSync(file);

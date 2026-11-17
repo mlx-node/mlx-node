@@ -536,7 +536,9 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   const loadModelPagedAware = async (path: string): Promise<LoadableModel> => {
     const entry = models.find((model) => model.path === path)!;
     // Resolve against the source directory before creating the paged config overlay.
-    const draftModelPath = findDFlash2Draft(path, entry.modelType, modelsDir);
+    // The host's explicit draft option would bypass the loader's Metal-only automatic-DFlash2 guard.
+    const draftModelPath =
+      process.platform === 'darwin' ? findDFlash2Draft(path, entry.modelType, modelsDir) : undefined;
     const resolvedPath = await pagedConfigOverrides.resolve(path, entry.modelType);
     // A muse_glimmer .gguf resolve leased the prepared asset dir; that
     // reference is this attempt's. A successful load keeps the lazy
@@ -906,7 +908,8 @@ function startContextEstimates(
   void (async () => {
     for (const entry of models) {
       if (familyDataFor(entry.modelType)?.acceptsMaxMemory !== true) continue;
-      const draftModelPath = findDFlash2Draft(entry.path, entry.modelType, modelsDir);
+      const draftModelPath =
+        process.platform === 'darwin' ? findDFlash2Draft(entry.path, entry.modelType, modelsDir) : undefined;
       try {
         // Price the directory the load reads (the paged overlay's clone).
         const path = await resolvePath(entry);

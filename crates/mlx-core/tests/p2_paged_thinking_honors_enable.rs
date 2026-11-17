@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! P2 gate: the PAGED whole-turn cores must honor `enable_thinking`
 //! (resolved from `reasoning_effort` via the single-source ThinkingSetup)
 //! instead of the pre-P2 hardcoded `thinking_enabled = true`.

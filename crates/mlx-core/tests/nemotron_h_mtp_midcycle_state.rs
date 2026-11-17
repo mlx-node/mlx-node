@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! Nemotron-H mid-cycle-stop seam gates: drafted-EOS strand, warm continuation,
 //! Mamba-2 recompute oracle, and the flat-MTP -> paged-AR lane crossing. Reads
 //! `MLX_TEST_NEMOTRON_H_MODEL_PATH`, while `nemotron_h_paged_vs_flat_parity.rs`

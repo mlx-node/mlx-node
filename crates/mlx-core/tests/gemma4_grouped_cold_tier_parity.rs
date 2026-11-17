@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Real-weight restart parity for Gemma4's grouped full + sliding paged cache.
 //!
 //! The full-attention chain is restored only when the co-keyed sliding-group

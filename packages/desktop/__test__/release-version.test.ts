@@ -22,6 +22,8 @@ import {
   versionFromTag,
   updateZipFileName,
   versionFromUpdateZipPath,
+  versionFromWindowsZipPath,
+  windowsZipFileName,
 } from '../scripts/release-version.js';
 
 /** Everything agreeing on 0.0.9 — the shape a good release has. */
@@ -153,6 +155,23 @@ describe('assertVersionsAgree, untagged path', () => {
       zip: 'nightly',
     };
     expect(() => assertVersionsAgree(junk)).toThrow(/packages\/desktop\/package\.json version/);
+  });
+});
+
+describe('Windows ZIP release versions', () => {
+  it('round-trips a Windows path and checks the version against the other artifacts', () => {
+    const path = `packages\\desktop\\out\\${windowsZipFileName('0.0.14')}`;
+    expect(windowsZipFileName('0.0.14')).toBe('mlx-node-0.0.14-win32-arm64.zip');
+    expect(versionFromWindowsZipPath(path)).toBe('0.0.14');
+    expect(assertVersionsAgree({ ...AGREED, windowsZip: '0.0.9' })).toBe('0.0.9');
+    expect(() => assertVersionsAgree({ ...AGREED, windowsZip: '0.0.8' })).toThrow(/Windows ZIP filename/);
+  });
+
+  it('rejects other platforms, architectures, and invalid versions', () => {
+    expect(versionFromWindowsZipPath('mlx-node-0.0.14-darwin-arm64.zip')).toBeNull();
+    expect(versionFromWindowsZipPath('mlx-node-0.0.14-win32-x64.zip')).toBeNull();
+    expect(versionFromWindowsZipPath('mlx-node-nightly-win32-arm64.zip')).toBeNull();
+    expect(() => windowsZipFileName('nightly')).toThrow();
   });
 });
 

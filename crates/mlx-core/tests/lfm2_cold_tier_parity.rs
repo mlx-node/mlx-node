@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Real-weight restart parity for LFM2's hybrid paged K/V + ShortConv state.
 //!
 //! A fresh restore instance can report non-zero cached tokens only when both

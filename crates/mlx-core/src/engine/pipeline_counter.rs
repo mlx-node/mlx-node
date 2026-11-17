@@ -9,6 +9,7 @@
 
 use napi_derive::napi;
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) const SWITCH: &str = "MLX_PIPELINE_COUNTER";
 
 /// Process-wide, cumulative pipeline creation totals.
@@ -25,6 +26,7 @@ pub struct PipelineStats {
     pub serving_ms: f64,
 }
 
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn enabled() -> bool {
     if cfg!(test) {
         return true;

@@ -854,7 +854,7 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     await writeFile(join(draft, 'model.safetensors'), 'weights');
     await host.loadModel(name);
     expect(calls).toHaveLength(1);
-    expect(calls[0].options).toEqual({ draftModelPath: draft });
+    expect(calls[0].options).toEqual(process.platform === 'darwin' ? { draftModelPath: draft } : undefined);
     expect(calls[0].path).toBe(join(modelsDir, name));
     expect(host.health().models.resident).toEqual([name]);
   });

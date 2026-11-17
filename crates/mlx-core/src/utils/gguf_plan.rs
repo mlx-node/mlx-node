@@ -933,8 +933,8 @@ mod tests {
     use crate::engine::checkpoint_source::{CheckpointSource, native_import_plans};
     use crate::utils::gguf::parse_gguf;
     #[cfg(debug_assertions)]
-    use crate::utils::gguf::{GgufConversionOptions, GgufTensorType, convert_gguf_to_safetensors};
-    use crate::utils::gguf::{NativeGgufFamily, preflight_muse_dflash_gguf};
+    use crate::utils::gguf::{GgufConversionOptions, convert_gguf_to_safetensors};
+    use crate::utils::gguf::{GgufTensorType, NativeGgufFamily, preflight_muse_dflash_gguf};
     use crate::utils::gguf_test_fixtures::{
         IMPORT_FIXTURE_NAMES, ImportFixture, ImportFixtureFamily, convert_import_fixture,
         import_golden_root as golden_root, safetensors_manifest, sha256_hex, t64_prefixes,

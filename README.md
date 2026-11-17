@@ -9,7 +9,7 @@
 
 MLX-Node runs [MLX](https://github.com/ml-explore/mlx) models from Node.js. It includes language and multimodal inference, an HTTP server, model conversion, and GRPO/SFT training. The public APIs are TypeScript; the native layer is Rust and C++. Python is not required at runtime.
 
-The main target is Apple Silicon with Metal. There is also an experimental CUDA backend for Linux on NVIDIA GB10 / DGX Spark.
+The main target is Apple Silicon with Metal. CUDA source builds are available for Linux on NVIDIA DGX Spark and Windows ARM64 on NVIDIA RTX Spark.
 
 ## Install
 
@@ -137,10 +137,11 @@ See [docs/training.md](docs/training.md) for GRPO, SFT, datasets, and checkpoint
 
 ## Platform support
 
-| Platform                   | Backend | Status                              |
-| -------------------------- | ------- | ----------------------------------- |
-| macOS, Apple Silicon       | Metal   | Inference, training, and multimodal |
-| Linux aarch64, NVIDIA GB10 | CUDA    | Experimental, inference only        |
+| Platform                        | Backend | Status                              |
+| ------------------------------- | ------- | ----------------------------------- |
+| macOS, Apple Silicon            | Metal   | Inference, training, and multimodal |
+| Linux aarch64, NVIDIA GB10      | CUDA    | Experimental, inference only        |
+| Windows ARM64, NVIDIA RTX Spark | CUDA    | Experimental, source build          |
 
 The npm `darwin-arm64` binary has a macOS 26.2 deployment target. It does not load on macOS 26.1 or older. It contains NAX kernels for M5-class GPUs. A local source build needs the macOS 26.2 SDK or newer and a deployment target of at least 26.2 (the default; `MACOSX_DEPLOYMENT_TARGET` can raise it). A lower target fails the build, because MLX would build without its NAX kernels.
 
@@ -150,7 +151,11 @@ The CUDA path has been tested with Qwen3.6 27B Dense and 35B-A3B MoE on GB10 / D
 
 The wizard's three default models (Qwen3.8-27B, Qwen-AgentWorld-35B-A3B, Gemma-4-26B-A4B) install Unsloth **UD-Q4_K_XL GGUF** files on every platform — one repo per model, one quantization variant, with base-model tokenizer sidecars fetched automatically (`--assets-repo`). Each load reads the GGUF directly and repacks K-quants losslessly into MLX layout in memory. Only a small config/tokenizer asset directory is cached; no second packed-weight checkpoint is written.
 
-One CUDA caveat: the K-quant modes that import produces (`q4k`/`q5k`/`q6k`) have no CUDA kernels yet — mlx-node's K-quant primitives throw `"… K-quant modes are not implemented on this GPU backend."` on any GPU but Metal (`crates/mlx-sys/src/mlx_kquant_metal.cpp`). On DGX Spark today, convert the same GGUF with the NVIDIA recipes (`mlx convert --q-recipe nvidia`, `docs/cuda-poc-benchmark.md`) to get a CUDA-executable affine/NVFP4 layout; running the raw K-quant import on CUDA waits on kernel support.
+The three GGUF presets use the CUDA K-quant implementations for their packed
+embeddings, dense projections, and expert projections. The CUDA implementation
+covers `q2k` through `q6k`, `iq4nl`, and `iq4xs`. The lower-bit IQ grid
+formats still require the CPU or Metal. The NVIDIA quantization recipes in
+[the CUDA benchmark notes](docs/cuda-poc-benchmark.md) apply to SafeTensors inputs.
 
 Build it on an aarch64 glibc host with CUDA 13.0 and `nvcc` on `PATH`:
 
@@ -191,6 +196,43 @@ yarn lint
 ```
 
 Use `yarn build:native` to build the Node addon. A direct `cargo build` does not produce it. More development notes are in [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/architecture.md](docs/architecture.md).
+
+### Windows ARM64 CUDA
+
+Use an ARM64 Visual Studio developer shell with MSVC and the Windows SDK. Install
+ARM64 Node.js and Rust, CMake 4.4 or newer, Ninja, the Windows ARM64 CUDA Toolkit
+13.4, and the matching Windows ARM64 cuDNN 9 SDK. Set `CUDA_PATH` and
+`CUDNN_PATH` to the toolkit roots containing `include`, `lib/arm64`, and
+`bin/arm64`.
+
+```powershell
+$env:CMAKE_GENERATOR = 'Ninja'
+$env:Path = "$env:CUDA_PATH\bin;$env:CUDA_PATH\bin\arm64;$env:CUDNN_PATH\bin\arm64;$env:Path"
+git submodule update --init --recursive
+yarn install --immutable
+yarn build
+```
+
+Prepare the runtime include tree so NVRTC can find the CUDA, CCCL, and CUTLASS
+headers. Launch Node or the desktop app from the same shell:
+
+```powershell
+$runtime = New-Item -ItemType Directory -Force .cache/cuda-runtime
+$include = Join-Path $runtime.FullName include
+Copy-Item -LiteralPath "$env:CUDA_PATH\include" -Destination $runtime.FullName -Recurse -Force
+Copy-Item -LiteralPath "$env:CUDA_PATH\include\cccl\cuda","$env:CUDA_PATH\include\cccl\nv" -Destination $include -Recurse -Force
+Copy-Item -LiteralPath packages/core/include/cute,packages/core/include/cutlass -Destination $include -Recurse -Force
+$env:CUDA_HOME = $runtime.FullName.Replace('\', '/')
+$env:MLX_CUDA_USE_CUDNN_SDPA = '0'
+yarn workspace @mlx-node/desktop start
+```
+
+The attention setting selects MLX's CUDA implementation. The cuDNN attention
+path can crash during process shutdown on this Windows configuration.
+
+The Windows source build targets RTX Spark (`sm_121a`) by default. Qwen3-0.6B
+BF16 SafeTensors is a small inference smoke test. Paged attention and DFlash2's
+SSD cache are unavailable on Windows.
 
 ## Packages
 

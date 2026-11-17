@@ -74,7 +74,7 @@ export function dmgFileName(version: string): string {
 
 /** The inverse of {@link dmgFileName}. `null` when the name is not one of ours. */
 export function versionFromDmgPath(path: string): string | null {
-  const base = path.split('/').pop() ?? path;
+  const base = artifactBaseName(path);
   const match = /^mlx-node-(.+)-arm64\.dmg$/.exec(base);
   if (match === null) return null;
   return SEMVER.test(match[1]) ? match[1] : null;
@@ -86,9 +86,22 @@ export function updateZipFileName(version: string): string {
 }
 
 export function versionFromUpdateZipPath(path: string): string | null {
-  const base = path.split('/').pop() ?? path;
-  const match = /^mlx-node-(.+)-darwin-arm64\.zip$/.exec(base);
+  const match = /^mlx-node-(.+)-darwin-arm64\.zip$/.exec(artifactBaseName(path));
   return match !== null && SEMVER.test(match[1]) ? match[1] : null;
+}
+
+/** Unsigned portable Windows installation archive. */
+export function windowsZipFileName(version: string): string {
+  return `mlx-node-${assertSemver('version', version)}-win32-arm64.zip`;
+}
+
+export function versionFromWindowsZipPath(path: string): string | null {
+  const match = /^mlx-node-(.+)-win32-arm64\.zip$/.exec(artifactBaseName(path));
+  return match !== null && SEMVER.test(match[1]) ? match[1] : null;
+}
+
+function artifactBaseName(path: string): string {
+  return path.split(/[\\/]/).pop() ?? path;
 }
 
 export interface ReleaseVersions {
@@ -104,6 +117,8 @@ export interface ReleaseVersions {
   dmg: string | null;
   /** Parsed out of the Squirrel.Mac update archive filename. */
   zip: string | null;
+  /** Parsed out of the portable Windows archive, when that job has produced it. */
+  windowsZip?: string | null;
 }
 
 /**
@@ -142,6 +157,11 @@ export function assertVersionsAgree(versions: ReleaseVersions): string {
     },
     { label: 'DMG filename', value: versions.dmg, remedy: 'the DMG was named from a different version than it holds' },
     { label: 'ZIP filename', value: versions.zip, remedy: 'the update ZIP must match the version of the app it holds' },
+    {
+      label: 'Windows ZIP filename',
+      value: versions.windowsZip ?? null,
+      remedy: 'the Windows ZIP must match the version of the app it holds',
+    },
   ];
 
   for (const check of checks) {

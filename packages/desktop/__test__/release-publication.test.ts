@@ -13,6 +13,7 @@ const names = [
   'mlx-node-0.0.14-darwin-arm64.zip',
   'mlx-node-0.0.14-darwin-arm64.zip.blockmap',
   'latest-mac.yml',
+  'mlx-node-0.0.14-win32-arm64.zip',
 ];
 let root: string;
 let files: string[];
@@ -91,7 +92,7 @@ describe('desktop release publication', () => {
     ]);
   });
 
-  it('publishes only after all four assets are uploaded and CI succeeds', async () => {
+  it('publishes only after all five assets are uploaded and CI succeeds', async () => {
     const { github, release, onUpload } = harness();
     prepareDraftRelease(tag, github);
     onUpload.mockImplementation(() => expect(release.isDraft).toBe(true));
@@ -109,7 +110,9 @@ describe('desktop release publication', () => {
       onUpload.mockImplementationOnce(() => {
         const manifest = release.assets.find((asset) => asset.name === 'latest-mac.yml')!;
         if (failure === 'upload throws') throw new Error('connection lost');
-        if (failure === 'missing manifest') release.assets.pop();
+        if (failure === 'missing manifest') {
+          release.assets = release.assets.filter((asset) => asset.name !== 'latest-mac.yml');
+        }
         if (failure === 'wrong size') manifest.size++;
         if (failure === 'unfinished upload') manifest.state = 'starter';
       });

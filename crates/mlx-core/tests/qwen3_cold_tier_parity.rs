@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Real-weights cold-tier restart-parity gate for Qwen3 (dense).
 //!
 //! Validates the full A1–A4 cold-tier pipeline end to end at the model level:

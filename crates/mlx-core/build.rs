@@ -21,10 +21,17 @@ fn build_ggml_kquant_reference() {
     println!("cargo:rerun-if-changed={dir}/ggml_kquant_ref.c");
     println!("cargo:rerun-if-changed={dir}/ggml_kquant_ref.h");
     println!("cargo:rerun-if-changed={dir}/ggml_grid_tables.inc");
-    cc::Build::new()
+    let mut build = cc::Build::new();
+    let no_contraction = if build.get_compiler().is_like_msvc() {
+        build.flag("/utf-8");
+        "/fp:strict"
+    } else {
+        "-ffp-contract=off"
+    };
+    build
         .file(format!("{dir}/ggml_kquant_ref.c"))
         .include(dir)
-        .flag("-ffp-contract=off")
+        .flag(no_contraction)
         .std("c11")
         .warnings(true)
         .compile("ggml_kquant_ref");

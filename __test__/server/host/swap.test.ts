@@ -18,6 +18,7 @@ interface FakeRegistry {
   unregister: ReturnType<typeof vi.fn>;
   list: () => { id: string }[];
   listSessionRegistries: () => [];
+  settleModelDisposals: ReturnType<typeof vi.fn<() => Promise<void>>>;
   servedContext: () => undefined;
 }
 
@@ -39,6 +40,7 @@ function fakeRegistry(): FakeRegistry {
     unregister,
     list: () => [...resident.keys()].map((id) => ({ id })),
     listSessionRegistries: () => [],
+    settleModelDisposals: vi.fn(async () => undefined),
     servedContext: () => undefined,
   };
 }
@@ -130,8 +132,50 @@ describe('makeSwapController', () => {
     await ctrl.resolveModel('b');
 
     expect(loader.mock.calls.map((c) => c[0])).toEqual(['/fake/a', '/fake/b']);
-    expect(reg.unregister).toHaveBeenCalledWith('a');
+    expect(reg.unregister).toHaveBeenCalledWith('a', { dispose: true });
     expect(reg.register.mock.calls.map((c) => c[0])).toEqual(['a', 'b']);
+  });
+
+  it('waits for native disposal before loading the next resident', async () => {
+    const registry = new ModelRegistry();
+    const events: string[] = [];
+    const a = {
+      dispose: vi.fn(async () => {
+        events.push('dispose:a:start');
+        await Promise.resolve();
+        events.push('dispose:a:end');
+      }),
+    };
+    const b = {};
+    const loader = vi.fn(async (path: string) => {
+      events.push(`load:${path}`);
+      return (path.endsWith('/a') ? a : b) as unknown as LoadableModel;
+    });
+    const ctrl = makeSwapController(discovered(['a', 'b']), registry, loader);
+
+    await ctrl.resolveModel('a');
+    await ctrl.resolveModel('b');
+
+    expect(events).toEqual(['load:/fake/a', 'dispose:a:start', 'dispose:a:end', 'load:/fake/b']);
+  });
+
+  it('disposes an aliased resident after re-pointing its aliases', async () => {
+    const registry = new ModelRegistry();
+    const events: string[] = [];
+    const a = { dispose: vi.fn(async () => void events.push('dispose:a')) };
+    const b = {};
+    const loader = vi.fn(async (path: string) => {
+      events.push(`load:${path}`);
+      return (path.endsWith('/a') ? a : b) as unknown as LoadableModel;
+    });
+    const ctrl = makeSwapController(discovered(['a', 'b']), registry, loader);
+
+    await ctrl.resolveModel('a');
+    await ctrl.resolveModel('claude-haiku-x');
+    await ctrl.resolveModel('b');
+
+    expect(events).toEqual(['load:/fake/a', 'load:/fake/b', 'dispose:a']);
+    expect(a.dispose).toHaveBeenCalledTimes(1);
   });
 
   it('deduplicates concurrent calls targeting the same name', async () => {

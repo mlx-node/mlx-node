@@ -1,3 +1,5 @@
+#![cfg(target_os = "macos")]
+
 //! Real-weights paged-vs-flat numerical-equivalence gate for NemotronH.
 //!
 //! Only the `full_attention` layers route through the block-paged adapter;

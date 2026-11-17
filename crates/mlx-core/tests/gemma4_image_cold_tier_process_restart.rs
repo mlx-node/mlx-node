@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Real-weights Gemma4 image recovery across an actual OS-process restart.
 //!
 //! This is deliberately separate from `gemma4_cold_tier_parity.rs`: that

@@ -2,10 +2,11 @@
  * The release gate for versions. Run from `.github/workflows/desktop-release.yml`.
  *
  *   check-release.ts resolve --tag <tag> --manifest <package.json>
- *   check-release.ts verify  --tag <tag> --manifest <package.json> --app <.app> [--dmg <dmg>] [--zip <zip>]
+ *   check-release.ts verify  --tag <tag> --manifest <package.json> --app <.app> [--dmg <dmg>] [--zip <zip>] [--windows-zip <zip>]
+ *   check-release.ts verify-windows --tag <tag> --manifest <package.json> --app <packaged-dir> --zip <zip>
  *
  * `resolve` runs BEFORE the ~16-minute build so a stale manifest costs a minute
- * instead of a full release cycle, and emits `version`, `dmg_name`, and `zip_name` to
+ * instead of a full release cycle, and emits `version`, `dmg_name`, `zip_name`, and `windows_zip_name` to
  * `$GITHUB_OUTPUT` so every later step reads one value rather than re-deriving it.
  *
  * `verify` runs after the artifacts exist and re-checks the same thing against
@@ -21,6 +22,7 @@ import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 
+import { PayloadError } from './payload.js';
 import {
   assertVersionsAgree,
   dmgFileName,
@@ -29,7 +31,10 @@ import {
   versionFromTag,
   updateZipFileName,
   versionFromUpdateZipPath,
+  versionFromWindowsZipPath,
+  windowsZipFileName,
 } from './release-version.js';
+import { readPackagedWindowsApp } from './windows-payload.js';
 
 const { positionals, values } = parseArgs({
   allowPositionals: true,
@@ -39,13 +44,14 @@ const { positionals, values } = parseArgs({
     app: { type: 'string' },
     dmg: { type: 'string', default: '' },
     zip: { type: 'string', default: '' },
+    'windows-zip': { type: 'string', default: '' },
   },
 });
 
 const command = positionals[0];
-if (command !== 'resolve' && command !== 'verify') {
+if (command !== 'resolve' && command !== 'verify' && command !== 'verify-windows') {
   console.error(
-    'usage: check-release.ts <resolve|verify> --tag <tag> --manifest <package.json> [--app <.app>] [--dmg <dmg>] [--zip <zip>]',
+    'usage: check-release.ts <resolve|verify|verify-windows> --tag <tag> --manifest <package.json> [--app <path>] [--dmg <dmg>] [--zip <zip>] [--windows-zip <zip>]',
   );
   process.exit(2);
 }
@@ -68,10 +74,10 @@ let tag: string | null = null;
 try {
   // Empty means "not a release build", not "a tag we failed to read".
   tag = values.tag.trim() === '' ? null : versionFromTag(values.tag);
-  const version = command === 'resolve' ? resolve() : verify();
+  const version = command === 'resolve' ? resolve() : command === 'verify' ? verify() : verifyWindows();
   console.log(`release version: ${version}`);
 } catch (err) {
-  if (err instanceof ReleaseVersionError) {
+  if (err instanceof ReleaseVersionError || err instanceof PayloadError) {
     // `::error::` so it lands on the job summary rather than only in the log.
     console.error(`::error::${err.message}`);
     console.error(`  ${err.remedy}`);
@@ -95,7 +101,7 @@ function resolve(): string {
   if (output !== undefined && output !== '') {
     appendFileSync(
       output,
-      `version=${version}\ndmg_name=${dmgFileName(version)}\nzip_name=${updateZipFileName(version)}\n`,
+      `version=${version}\ndmg_name=${dmgFileName(version)}\nzip_name=${updateZipFileName(version)}\nwindows_zip_name=${windowsZipFileName(version)}\n`,
     );
   }
   return version;
@@ -123,6 +129,11 @@ function verify(): string {
     console.error(`::error::update ZIP ${zip} must exist and be named mlx-node-<version>-darwin-arm64.zip`);
     process.exit(1);
   }
+  const windowsZip = values['windows-zip'].trim();
+  if (windowsZip !== '' && (versionFromWindowsZipPath(windowsZip) === null || !existsSync(windowsZip))) {
+    console.error(`::error::Windows ZIP ${windowsZip} must exist and be named mlx-node-<version>-win32-arm64.zip`);
+    process.exit(1);
+  }
 
   return assertVersionsAgree({
     tag,
@@ -131,6 +142,29 @@ function verify(): string {
     bundleVersion: plistString(plist, 'CFBundleVersion'),
     dmg: dmg === '' ? null : versionFromDmgPath(dmg),
     zip: zip === '' ? null : versionFromUpdateZipPath(zip),
+    windowsZip: windowsZip === '' ? null : versionFromWindowsZipPath(windowsZip),
+  });
+}
+
+function verifyWindows(): string {
+  if (values.app === undefined) {
+    console.error('verify-windows needs --app');
+    process.exit(2);
+  }
+  const zip = values.zip.trim();
+  if (zip === '' || versionFromWindowsZipPath(zip) === null || !existsSync(zip)) {
+    console.error(`::error::Windows ZIP ${zip} must exist and be named mlx-node-<version>-win32-arm64.zip`);
+    process.exit(1);
+  }
+  const app = readPackagedWindowsApp(values.app);
+  return assertVersionsAgree({
+    tag,
+    manifest,
+    bundleShort: app.version,
+    bundleVersion: app.version,
+    dmg: null,
+    zip: null,
+    windowsZip: versionFromWindowsZipPath(zip),
   });
 }
 

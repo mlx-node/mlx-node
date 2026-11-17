@@ -560,6 +560,7 @@ mod tests {
 
     /// A cancel raised before the prefill keeps the live session: no reset
     /// and no prefill chunk.
+    #[cfg(target_os = "macos")]
     #[test]
     fn cancel_before_prefill_keeps_the_session_and_runs_no_chunk() {
         let Some(mut inner) =

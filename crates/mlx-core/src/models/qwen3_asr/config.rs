@@ -244,8 +244,8 @@ pub struct Qwen3AsrStreamOptions {
 pub struct Qwen3AsrCaptureOptions {
     /// Audio source. Omit to capture the microphone.
     pub source: Option<Qwen3AsrCaptureSource>,
-    /// Stable Core Audio device UID returned by `qwen3AsrAudioDevices()` or
-    /// `qwen3AsrInputDevices()`.
+    /// Stable native device ID returned by `qwen3AsrAudioDevices()` or
+    /// `qwen3AsrInputDevices()` (Core Audio UID on macOS, WASAPI endpoint ID on Windows).
     pub device_id: Option<String>,
     /// Device name. Omit to use the default input or output device for the
     /// selected source.

@@ -155,9 +155,19 @@ static const int8_t kvalues_mxfp4[16] = {
 };
 
 float ggml_ref_fp16_to_fp32(ggml_half h) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    // MSVC does not expose __fp16. All finite binary16 values are exact in binary32.
+    const int exponent = (h >> 10) & 31;
+    const int fraction = h & 1023;
+    const float value = exponent == 31 ? (fraction == 0 ? INFINITY : NAN)
+        : exponent == 0 ? ldexpf((float)fraction, -24)
+        : ldexpf((float)(1024 + fraction), exponent - 25);
+    return h & 0x8000 ? -value : value;
+#else
     __fp16 tmp;
     memcpy(&tmp, &h, sizeof(ggml_half));
     return (float)tmp;
+#endif
 }
 
 // ===== ggml-quants.c:880 =====================================================

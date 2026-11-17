@@ -197,6 +197,8 @@ async function bootstrap(): Promise<void> {
     resourcesPath: process.resourcesPath,
     packaged: app.isPackaged,
     userData,
+    platform: process.platform,
+    arch: process.arch,
   });
 
   // Synchronously, before the first await: a window created by anything that
@@ -318,7 +320,11 @@ async function bootstrap(): Promise<void> {
     // which runs while `@mlx-node/lm` is being imported at the sidecar entry's
     // module scope. Writing it from MAIN afterwards is a no-op that looks like it
     // worked.
-    env: sidecarEnvOverrides({ nativeAddon: paths.nativeAddon, modelsDir: settings.modelsDir }),
+    env: sidecarEnvOverrides({
+      nativeAddon: paths.nativeAddon,
+      nativeRuntimeDir: paths.nativeRuntimeDir,
+      modelsDir: settings.modelsDir,
+    }),
   });
 
   const stateWriter = createSupervisorStateWriter(supervisorStateFilePath());
@@ -358,6 +364,7 @@ async function bootstrap(): Promise<void> {
     executable: process.execPath,
     entry: paths.cliEntry,
     nativeAddon: paths.nativeAddon,
+    nativeRuntimeDir: paths.nativeRuntimeDir,
     modelsDir: settings.modelsDir,
   };
   // Failure is surfaced on Coding Agents; command setup must not stop the app.
