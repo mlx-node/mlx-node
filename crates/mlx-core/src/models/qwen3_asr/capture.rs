@@ -325,9 +325,6 @@ fn start_prepared_capture_with_callback(
                     }
                 }
             }
-            let _ = worker_sender.send(Qwen3AsrCmd::ReleaseCapture {
-                id: worker_stream_id,
-            });
         })
         .map_err(|error| Error::from_reason(format!("Failed to start capture worker: {error}")))?;
 
