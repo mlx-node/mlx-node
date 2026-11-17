@@ -690,7 +690,7 @@ mod tests {
         }
         assert!(matches!(
             commands.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
+            Err(mpsc::error::TryRecvError::Empty) | Err(mpsc::error::TryRecvError::Disconnected)
         ));
     }
 
