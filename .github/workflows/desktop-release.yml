@@ -432,7 +432,7 @@ jobs:
       # Publish the Windows ZIP in the same draft transaction as the macOS
       # assets. The Windows job has already verified its packaged app and archive.
       - name: Download the Windows ARM64 artifact
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: mlx-node-desktop-windows-arm64
           path: packages/desktop/out/windows-release
