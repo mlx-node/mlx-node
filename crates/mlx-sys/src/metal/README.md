@@ -37,6 +37,12 @@ Organize them by their mathematical and storage contracts:
   `paged_attn.metallib` with the K-quant flags, and their dispatchers load them
   from there (no JIT fallback). The host names must match the dispatchers'
   name builders; `bridge_metallib_names` checks both ways.
+- `sampling/dflash2_rows.metal`: the target rows of a sampled, unpenalized
+  DFlash2 cycle (`mlx_dflash2_rows.cpp`, prebuilt into `paged_attn.metallib`):
+  a sharded softmax denominator per row, then one threadgroup per row that
+  finds the row's top_k tokens by key brackets (1 <= top_k <= 256, no
+  vocabulary sort), applies top_p and min_p in the sampler's order
+  (`compiled_sampler_logits`) and draws by inverse CDF from host uniforms.
 - The three kernel families above (`kquant/`, `affine_qmv_wide_mixed`,
   `sdpa_segmented`) are guarded by `#[ignore]` golden-digest gates in
   `crates/mlx-core/tests/*_golden_gate.rs`, run on every MLX pin bump. A change
@@ -52,14 +58,14 @@ The C++ family adapters retain shape checks, dispatch policy, and fallbacks.
 Moving a shader to `common/` does not enable it for another model automatically.
 Before adding a caller, validate its storage layout and exact arithmetic:
 
-| Common operation                                             | Required contract                                                                                                                                                            |
-| ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `quantized_expert_*`, `affine_expert_down`, `packed_group32` | Match packed bits, group size, companion dtypes, expert-aligned tiles and output rounding. NAX paths require supported hardware.                                             |
-| `route_counts`                                               | Eight SIMD groups per block; the ballot count serves 257-512 experts, the shared-memory count every other width.                                                             |
-| `group_rms_norm`                                             | Independent groups with per-group F32 weights; widths divisible by 128, at most 4096, and evenly partitioned SIMD slices.                                                    |
+| Common operation                                             | Required contract                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `quantized_expert_*`, `affine_expert_down`, `packed_group32` | Match packed bits, group size, companion dtypes, expert-aligned tiles and output rounding. NAX paths require supported hardware.                                                                                                                                        |
+| `route_counts`                                               | Eight SIMD groups per block; the ballot count serves 257-512 experts, the shared-memory count every other width.                                                                                                                                                        |
+| `group_rms_norm`                                             | Independent groups with per-group F32 weights; widths divisible by 128, at most 4096, and evenly partitioned SIMD slices.                                                                                                                                               |
 | `qk_norm_rope`                                               | Bit-identical to `fast::rms_norm` then `fast::rope(traditional=false)`: N_READS=4 row mapping, the two `simd_sum` folds, `precise::rsqrt`, `exp2(-d * log2(base))`, `fast::cos/sin`; the normed row is rounded to T before rotation. D % 128 == 0, int32 `[B]` offsets. |
-| `conv1d_silu_k4`                                             | Four F32 taps, three rows of separately owned history, ordered products and rounded SiLU.                                                                                    |
-| `precise_sigmoid`                                            | Precise exponential; this is not interchangeable with the native BF16 lookup tables.                                                                                         |
+| `conv1d_silu_k4`                                             | Four F32 taps, three rows of separately owned history, ordered products and rounded SiLU.                                                                                                                                                                               |
+| `precise_sigmoid`                                            | Precise exponential; this is not interchangeable with the native BF16 lookup tables.                                                                                                                                                                                    |
 
 `build.rs` watches this directory recursively. Source attribution for the
 mlx.fast ports is retained in the shaders and [MLXFAST-LICENSE.txt](MLXFAST-LICENSE.txt).

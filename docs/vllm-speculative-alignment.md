@@ -33,6 +33,15 @@ These are vLLM's rules, and they are now ours. They are enforced in code, not ju
 | Greedy acceptance is `target_argmax[k] == draft[k]`, and the boundary token is the target's argmax.                                                              | `rejection_sampler.py`                                                                      | `engine/dspark_turn.rs` greedy fast path; `run_mtp_turn`'s accept loop. The sampled arms: dense `accept_with_residual` and sparse `accept_with_residual_dense_target_sparse_draft` (DFlash2, `sampling.rs`), both consumed by `run_dspark_turn`'s sampled arm |
 | Prefix reuse is longest-common-prefix over full blocks.                                                                                                          | `get_computed_blocks` → `find_longest_cache_hit`                                            | `find_cached_prefix_for_prepare` → `BlockAllocator::find_longest_cache_hit` (**paged lane only** — see Part 3)                                                                                                                                                |
 
+An unpenalized sampled DFlash2 turn with `top_k` 1 to 256 takes the device rows: the row kernels
+(`submit_sampled_rows`, `dflash2_rows.metal`) compute each verify row's distribution, the draft
+token's target and draft probabilities and the row's draw, and the host reads those records and
+accepts by the law of `accept_dspark_proposal` (`SampledRows::accept`). A whole turn the rows do
+not take, with a device-drawn proposal and no thinking cut on its rows, accepts in one device graph
+(`accept_device_sampled`, Splash's rule: a draft row stays while `u * q(d) < p(d)`). Penalized
+turns, whole turns with a host-drawn proposal or a thinking cut on their rows, and lanes the rows
+do not take keep the host arms above (`sampled_rows_take`).
+
 ### Three constants, never conflated
 
 vLLM keeps three per-method speculative quantities apart, and its own docs forbid deriving one from
@@ -169,6 +178,13 @@ A `D*` gate written on an unscreened prompt therefore measures kernel rounding, 
 **Sampled output and the thinking cut.** The contract has two halves:
 
 - `T=0`: on tie-screened fixtures, speculative output is byte-equal to plain decoding, at any depth.
+  This holds with either qwen3_5 load option `activations`: under `'auto'` (the default of a load with a DFlash2 draft) a query row
+  scores int8 codes iff its KV position is 7,168 or later, in the verify and in plain AR decode alike,
+  so a row's queries never depend on the pass (see models.md, "Int8 queries"). The class is wider
+  under `'auto'`: int8 rounding turns the ULPs a launch shape leaves in later layers' queries into
+  code steps (spec-vs-AR logits gap 0.9 to 2.2 times the bf16-query gap on the sharp fixtures), so
+  fixtures past 7,168 tokens are screened under the mode they run in, with about twice the bf16
+  margin.
 - `T>0`: each token follows the exact target distribution. The chat API takes no seed, so no sampled run
   repeats, and the tokens of the last cycles before a thinking cut are not comparable between runs: the
   depth sets how many draws a cycle uses. The cut is a row of the verify (Splash `ThinkingCutoff`): depth
@@ -199,6 +215,45 @@ model thread, so there is no shared budget to account against.
 
 **Reopens if:** C2 lands. Adopt the per-method lookahead and the drafting input budget first;
 adaptive verification and dynamic `K` only if N>1 speculative rows ever become real.
+
+### X11. Scheduled DFlash2 lanes verify in a wave that shares weights, not in one batched forward
+
+**vLLM:** every running request's draft tokens go through one batched target forward per step.
+**Us:** text turns of a Qwen3.5 dense load with a DFlash2 draft are scheduled lanes
+(`models/qwen3_5/scheduled_dflash2.rs`). The lanes that reach verify in one step run one verify wave
+of 2 to 4 lanes (`paged_forward.rs` `paged_verify_wave`), inside the shared scheduled-verify
+transaction (`ScheduledDraftVerify`). Embed, norms, SwiGLU and every K-quant projection run once over
+the stacked `[N, 8]` rows, the projections on the K-quant 16- and 32-row tier, whose rows are the 8-row
+tier's bits. Attention (one verify plan per lane) and the GDN core (the complete kernel on the lane's
+own cells) run per lane. A lone lane, a fifth lane past four, a lane whose cells cannot be lent, an
+autoregressive peer's one-row decode, and every lane of a load whose layers are not all on the tier
+run their own forward. The lane rule holds: a lane's tokens, logits bits, recurrent cells and draft
+ring are the ones it has when it runs alone (X8 across lanes; kernel tests at the 27B geometry and
+formats, scheduler tests on a small fixture).
+
+**Why not vLLM's shape:** a stacked forward through attention and the GDN core changes kernel choice
+and rounding by row count, which the lane rule forbids, and it was slower. A fully fused
+`[2, 8]` forward ran the generic GDN route in all 48 GDN layers and the varlen
+attention kernel; its two-lane step cost 185 ms against 62-65 ms for one lane, 0.66x of one lane
+alone. The wave shares only the weight streams, which is where the time goes. Measured on Qwen3.8-27B
+UD-Q4_K_XL + its draft through the desktop app's engine entry (one trial per case, M5 Max, 2026-11-17;
+see [concurrent-inference.md](concurrent-inference.md)):
+
+| Verify shape                             | Two-lane step against one lane alone | Sum tok/s against one lane alone     |
+| ---------------------------------------- | ------------------------------------ | ------------------------------------ |
+| one `[1, 8]` verify per lane (waves off) | 123.4 ms, 2 x 63.5 / 123.4 = 1.03x   | 0.92x                                |
+| the wave (the code)                      | 83.4 ms, 2 x 62.1 / 83.4 = 1.49x     | 1.57x; three lanes 1.62x, four 1.90x |
+
+One lane alone is within 2 % of the per-owner route (ms x GPU MHz), and its greedy text is the same.
+
+**Divergences that stay:** attention and the GDN core are per lane, so a lane's cost still grows with
+its history (a real pair at 150K tokens measured 1.34x-1.39x, one trial, 2026-11-18, against about
+1.45x at 25K). A device without the tensor op
+(before M5) has no lane tier, so its lanes verify per owner; not measured.
+
+**Reopens if:** an N-lane verify plan launch or an N-lane complete GDN launch that gives each lane its
+one-lane bits exists (both would cut launch overhead per extra lane), or deep-history pairs measure
+under 1.25x.
 
 ---
 

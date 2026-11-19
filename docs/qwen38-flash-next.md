@@ -85,6 +85,31 @@ RAM minus a 4 GiB margin and the host's live non-reclaimable memory (wired,
 compressor, and anonymous pages other than purgeable pages). Full direct banks
 have no misses or LRU replacement.
 
+A store this host gate refused (the plan loads the experts whole and its cap
+still holds every bank) asks the same gate again when the last open turn
+closes, with this model's own ledgered bytes (store, KV pool, stored states)
+taken out of the host's non-reclaimable number. When it admits the bank set
+and the live host holds the move's growth (the whole banks less the partial
+ones, plus a layer's staging) before any bank drops,
+the store moves up layer by layer (a partial bank goes, its whole bank is
+allocated) and the direct fill starts: from the next turn the store is
+`direct`, as after a whole load, and stays so until unload. Prefix states,
+the pool, the window and the wired lease do not change. A refused allocation
+on the way leaves a partial store at the old slot count. A streamed plan, a
+lowered cap and a load with the MTP head never move. `residencyPromotions`
+counts the moves; `residencyPromotionRefusals` counts the closes whose gate
+admitted the move but whose live host could not hold its growth.
+A refused store halves its prefill passes past the gate's allowance (65,536
+tokens), and a state written on halved passes is not bit-equal to the state
+whole passes write at that row, so after a move the next turn resumes from
+the deepest state below the first halved pass and prefills the rest once.
+A model switch to Flash Next from an idle old model disposes the old model
+and waits for its weights to go before the load reads live memory (a busy old
+model keeps the old order: it stays in memory until the new load ends; a
+request that has resolved the old model but not yet taken its dispatch lease
+counts as busy), and a
+failed load then leaves nothing resident and the old model selected.
+
 Eight reader threads fill every layer's three banks from the main GGUF shard
 set through the GPU repack pipeline, in layer order, with at most 8 MiB per
 read window and four staging buffers. A cold layer-major prefill waits only for
@@ -96,11 +121,30 @@ partially written banks are never published.
 
 A streamed plan, or a host refusal of the whole bank set, gives partial
 slots: the plan's expert cap (less its staging) sizes and caps the slot
-capacity. Partial misses use the same direct-GGUF GPU fill pipeline and
-8 MiB read bound. Prefill keeps its last-assignment expert groups, whose expert
-sets are disjoint, so a cold window reads each selected expert at most once per
-layer. `direct` reports only the full identity-resident plan; partial direct
-fills report `direct: false`. Unsupported source layouts retain the bounded
+capacity. A partial miss reads every missing expert of a lease in one
+fill: each expert's source range rounded out to 16 KiB pages, ranges that
+share a page in one read and no bytes between them, packed into 64 MiB
+batches. Eight reader threads and a ring of four 64 MiB staging buffers are
+made by the first slot fill and kept; a fill waits for its own repacks, and
+the GPU runs those after the work queued before them. A prefill window above
+eight rows that misses runs the experts its slots hold first, then the missing
+ones in last-use chunks of the capacity, so it reads each missing expert once
+per layer; the reads of each next chunk, up to the ring's four batches, are
+queued (victims chosen, no bank or mapping touched) before the rows of the chunk before it are submitted, and its
+lease writes the banks only after those rows completed. Windows of up to eight
+rows and decode tokens keep their path. A partial store runs a prefill window on tentative device routes only
+while every layer holds every expert in a slot; otherwise each window reads its
+routes back from the start and is never run twice. A prompt of two or more
+windows on partial slots runs as layer-major groups of up to four windows while
+their arrays fit beside one pass's scratch inside the lane transient the memory
+plan priced (no live host read); each layer leases the union of the group's
+experts, the slots' experts first, so a missing expert is read once per layer
+and group, its reads running beside the chunk before it. A group ends at every stored-state point. A turn that is the only
+open one is pinned to its group ends, one group per scheduler step; with
+another turn open its slices stay one pass each, and when a second turn is
+admitted the first turn's rest is pinned again to pass ends, so the newcomer's
+first prefill row runs in the step after the group in flight. `direct` reports only the
+full identity-resident plan; partial direct fills report `direct: false`. Unsupported source layouts retain the bounded
 per-row CPU checkpoint importer; they do not select another residency format.
 
 Banks stay resident and non-volatile between turns, at any gap (Splash
@@ -182,10 +226,27 @@ them beside the scratch of one 1,024-row chunk at the 65,536-token allowance
 its scratch fits that reservation. The expert counters since load are `slotHits` and
 `slotMisses` (routed experts served without a read, and read by a slot fill),
 `checkpointBytesRead` (bytes read from the checkpoint files by expert fills
-and row imports; the page cache may serve part of them) and `routeReplays`
-(decode tokens and prefill windows replayed after a tentative device route
-missed the slots). A request keeps its own replay cooldown when the scheduler
-switches rows. The live decoded-row counters are
+and row imports; the page cache may serve part of them), `routeTries` and
+`routeMissTokens` (decode tokens that ran a tentative device-route pass, and
+those of them whose routes missed the slots: misses per token are
+`routeMissTokens / routeTries`), `routeReplays` (replay passes: each pass a
+decode token runs again from its missed layer, on device or host routes, so
+one missed token can count several, plus each prefill window replayed),
+`replayedLayers` (device layers those passes built a second time) and
+`hostTailLayers` (layers a missed token ran on host routes once its replays
+would pass one whole pass). Every decode token tries device routes; a request's route
+guard sends its next 16 tokens to host routes only when its last 32 tokens
+re-ran more than 64 device-layer equivalents each on average
+(`routeGuardTrips`), and the request keeps its guard when the scheduler
+switches rows. Slot fills (one per lease that misses) report `fillCalls`,
+`fillMicros` (wall time inside the fills) and `fillReadBytes` (bytes asked of the
+files: whole 16 KiB pages, so it can exceed the wanted bytes in `checkpointBytesRead`); layer-major
+prefill groups of two or more windows report `groupPasses` and
+`groupWindows`. These counters count since load and mix prefill with decode;
+`prefillFillCalls`, `prefillFillMicros`, `prefillFillReadBytes`,
+`prefillSlotMisses`, `prefillCheckpointBytesRead` and `prefillRouteReplays`
+are the share of each that prefill passes moved, so a turn's delta of
+`prefillFillMicros` is its prefill's fill time. The live decoded-row counters are
 `decodedRowLookups`, `decodedRowMisses`, `decodedRowHitRate`,
 `decodedRowEvictions`, `decodedRowEvictedBytes`, plus `prefetchedRows` /
 `lateRows` (imports the reader threads had ready versus rows the model thread
@@ -240,7 +301,16 @@ SSD tier, so nothing round-trips its pages; the pool refuses host transfers of
 a token-major page.
 `contextLimits().kvFormat` names the load's format.
 
-The shared scheduler supports up to four live owners. The QSA K/V pool starts at
+The shared scheduler supports up to four live owners. On a whole store a decode
+step of 2-4 owners runs their rows through the verify pass's row-exact kernels
+(each weight read once for all rows, each row the bits of that owner's one-row
+step) and waits for the GPU once, at the step's end: the rows' page writes
+chain through the pool arrays every owner shares, so no row drains its write
+before the next; the store's residency is read at every step, and a partial
+store keeps the shared step. `residencyInfo().laneSteps` (and the turn trace
+row's per-turn delta) counts these lane steps. The lane step is proven on small
+fixtures only; on a whole store of the real checkpoint it has no measured row
+yet. The QSA K/V pool starts at
 the format's runway (int8 256 blocks = 8,192 tokens, bf16 96) and grows by
 128 MiB extents (int8 317 blocks, bf16 165) to the plan's maximum, each
 growth checked against the plan's ceiling; a turn books its pages as it writes
@@ -313,7 +383,10 @@ of 110 MiB.
 
 Stored states use the room the dynamic budget leaves after the pool at its
 largest, one pass's transient, the rows and the MTP state (about 12 states
-without the head on a busy 128 GB host, from plan numbers); a row's admission
+without the head on a busy 128 GB host, from plan numbers). The store plan
+keeps room for three states of the allowance window beside the pool on every
+load, under `--max-memory` too: streamed experts give those bytes up, and a
+whole store whose slack cannot hold them streams. A row's admission
 takes stored states back first, checkpoints before replay points, never one a
 running turn uses. `resetCaches` and a GPU reset drop them and purge the
 prefix cache. A turn of 2,048 prompt tokens or more also writes its replay
@@ -349,6 +422,44 @@ and drafts keep streaming expert rows for the life of the process.
 `residencyInfo().residentBankBytes` includes the banks from load on.
 Head availability alone does not establish a latency benefit. Stochastic MTP
 keeps distribution-correct verification and disables the greedy adaptive policy.
+
+### DFlash2 draft
+
+**Attach.** The load option `draftModelPath` names an
+`incoai/Qwen3.8-Flash-Next-DFlash2` checkpoint directory. Nothing finds the
+draft on disk: `loadModel()` and the inference host attach it only from that
+option. The host has no per-model draft option; a host caller hands the option
+through its own `loadModel` and `estimateContextWindow` hooks. A load serves one
+speculation source, so a draft beside the checkpoint's MTP head is refused. The
+draft's config is checked against the target before a tensor is read. A given
+draft that does not serve the target, or does not load, fails the load (as the
+Qwen3.8-27B draft does). With the draft attached, `hasMtpWeights()` is true, and
+the memory plan prices the draft's weights and its lane (one context, the taps
+of one tapped pass and the taps kept between cycles).
+
+**When a turn drafts.** An `enableMtp` turn runs the draft's cycle only when it
+starts alone on a whole store (`residency` `direct`, every expert slot) whose
+banks are filled. Every other turn decodes plain: a turn during the direct fill,
+a turn on a partial store, a turn that starts beside another. When a turn opens
+beside a drafted one, the drafted one verifies its anchor alone from its next
+cycle. A cycle proposes the draft's block, verifies the anchor and up to three
+proposals in one row-exact pass, and commits the accepted rows; greedy text is
+the target's own, and a sampled turn keeps the target's distribution.
+
+| request (`enableMtp` on)                                           | rows per verify                                                      |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| `mtpDepth` and `mtpAdaptiveDepth` unset (`generation_mode: "mtp"`) | the draft's rule: 1-4 rows from its confidence and the turn's record |
+| `mtpAdaptiveDepth: true`                                           | the rule, at most `mtpDepth` + 1                                     |
+| `mtpDepth` set, `mtpAdaptiveDepth` unset or `false`                | fixed `mtpDepth` + 1 (`mtpDepth` capped at 3)                        |
+| `mtpAdaptiveDepth: false`, `mtpDepth` unset                        | fixed 4                                                              |
+| sampled (temperature > 0)                                          | fixed, as the two rows above                                         |
+
+`residencyInfo().draftOneRowCycles` (and the turn trace row's per-turn delta)
+counts the drafted cycles whose rows the rule set to one: the draft proposed and
+the verify took the anchor alone. `mtpCycles` leaves these out, so a drafted
+turn's cycles are `mtpCycles` + `draftOneRowCycles`.
+
+The draft is proven on small fixtures only. It has no real-model speed row yet.
 
 Image turns run behind an exclusive scheduler barrier. Up to four images are
 accepted per rendered conversation, with a 16-megapixel / 32-MiB input limit per

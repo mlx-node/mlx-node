@@ -1,7 +1,8 @@
 # Provenance of `components/arc-x/wait-orb/`
 
 `engine.ts` holds geometry derived from `thinking-orbs`, the free (MIT) dotted-orb package. `wait-orb.tsx` (the React
-component, the painter, the states, the loop and its gates) is our own code.
+component, the painter, the states, the loop and its gates) and `fold.ts` (the `fold` state of a compaction: dotted
+lines that squeeze into one bar) are our own code.
 
 |                |                                                                                                                                         |
 | -------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
