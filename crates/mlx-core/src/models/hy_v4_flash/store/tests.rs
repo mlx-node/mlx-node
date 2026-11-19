@@ -205,7 +205,7 @@ fn pick_below_the_floor() {
     };
     let ws = 96_000_000_000;
     let got = pick(&p, &b, 4096, &Limits::default(), &h, &Own::default(), ws).unwrap();
-    assert_eq!((got.ctx, got.chunk), (4096, CHUNKS[0]));
+    assert_eq!((got.ctx, got.chunk), (4096, 4096));
     let m = ModelSize { ctx: 4096, ..b };
     assert_eq!(got.admission.terms, Terms::with(&p, &m, ws, 4096));
     let busy = HostMemory {
@@ -216,6 +216,61 @@ fn pick_below_the_floor() {
         .unwrap_err()
         .reason;
     assert!(e.contains("refused at context 8192"), "{e}");
+}
+
+/// The second turn of a 256K load bound by live memory: the sessions' KV,
+/// allocated after the load's reading, is this model's and keeps the bank;
+/// read as others' it would drop the bank to staging only.
+#[test]
+fn readmission_counts_the_session_kv_as_own() {
+    let f = fixture("admission-addons.json");
+    let inputs = &f["inputs"];
+    let v = &f["variants"]["mtp_on"];
+    let p = profile(u(&v["kv_per_ctx"]));
+    let b = base(inputs, v);
+    let others = 50 * G;
+    let (h0, ws) = host(inputs, others);
+    let max_ctx = u(&inputs["max_context"]) as usize;
+    let load = pick(
+        &p,
+        &b,
+        max_ctx,
+        &Limits::default(),
+        &h0,
+        &Own::default(),
+        ws,
+    )
+    .unwrap();
+    assert_eq!(load.ctx, max_ctx);
+    assert_eq!(load.admission.bound, Bound::Live);
+    let m = ModelSize {
+        ctx: load.ctx as u64,
+        ..b
+    };
+    let kv = p.kv_per_ctx * load.ctx as u64;
+    assert!(kv > crate::moe_stream::budget::KEEP_SLACK);
+    let h1 = HostMemory {
+        wired: others + b.dense + kv,
+        ..h0
+    };
+    let turn = |own: Own| {
+        readmit_with(
+            &p,
+            &load.admission,
+            &m,
+            load.chunk as u64,
+            &Limits::default(),
+            &h1,
+            &own,
+            ws,
+        )
+        .unwrap()
+    };
+    assert_eq!(turn(own_of(b.dense, kv, 0, true)), Turn::Keep);
+    assert!(matches!(
+        turn(own_of(b.dense, 0, 0, true)),
+        Turn::StagingOnly(_)
+    ));
 }
 
 #[test]
@@ -447,7 +502,7 @@ fn lease_rebuilds_keeps_and_refuses() {
     );
     bank.end_turn().unwrap();
     TEST_HOST.with(|c| c.set(Some(roomy)));
-    lease.begin_turn(&bank, 0).unwrap();
+    lease.begin_turn(&bank, 0, 0).unwrap();
     assert!(lease.in_turn() && bank.in_turn());
     let a = lease.admission().unwrap();
     assert_eq!(a.cache_slots, 64);
@@ -456,7 +511,7 @@ fn lease_rebuilds_keeps_and_refuses() {
     assert_eq!(lease.switches().len(), 1);
     lease.end_turn(&bank).unwrap();
     assert!(!lease.in_turn() && !bank.in_turn());
-    lease.begin_turn(&bank, 0).unwrap();
+    lease.begin_turn(&bank, 0, 0).unwrap();
     assert_eq!(lease.admission().unwrap(), a);
     assert_eq!(lease.switches().len(), 1);
     lease.end_turn(&bank).unwrap();
@@ -468,7 +523,7 @@ fn lease_rebuilds_keeps_and_refuses() {
         roomy.1,
     );
     TEST_HOST.with(|c| c.set(Some(full)));
-    let e = lease.begin_turn(&bank, 0).unwrap_err().reason;
+    let e = lease.begin_turn(&bank, 0, 0).unwrap_err().reason;
     TEST_HOST.with(|c| c.set(None));
     assert!(e.contains("vs budget"), "{e}");
     assert!(!lease.in_turn() && !bank.in_turn());
@@ -487,7 +542,7 @@ fn lease_without_admission_only_flips_the_bank() {
     };
     let lease = Lease::new(profile(100), size, 64, classes, None, None, &bank);
     bank.end_turn().unwrap();
-    lease.begin_turn(&bank, 0).unwrap();
+    lease.begin_turn(&bank, 0, 0).unwrap();
     assert!(bank.in_turn() && !lease.in_turn());
     assert_eq!(bank.cache_slots(), [2, 2]);
     lease.end_turn(&bank).unwrap();

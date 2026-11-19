@@ -19,6 +19,7 @@ use super::indexer::{IndexerMark, IndexerState};
 use super::moe::{ExpertSource, Routes};
 use super::ops::{hc_head, head_logits};
 use super::rows::EngramRows;
+use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{HcWeights, LayerWeights, Resident};
 use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::attention::rms_norm;
@@ -139,10 +140,12 @@ enum LayerMark {
 }
 
 /// A point of a session to go back to: valid while no write lands below
-/// its length.
+/// its length (`Session::restore` refuses it after one).
 #[derive(Clone)]
 pub struct Mark {
     len: usize,
+    /// The call that wrote position `len - 1`.
+    last: Option<u64>,
     layers: Vec<LayerMark>,
 }
 
@@ -159,6 +162,9 @@ impl Mark {
 /// One sequence's state: its token ids and every layer's attention state.
 pub struct Session {
     tokens: Vec<u32>,
+    /// Per position, the call that wrote it (`calls` at that call).
+    written: Vec<u64>,
+    calls: u64,
     cap: usize,
     kpool: usize,
     layers: Vec<LayerState>,
@@ -187,12 +193,15 @@ impl Session {
     }
 
     pub fn nbytes(&self) -> usize {
-        self.layers.iter().map(LayerState::nbytes).sum::<usize>() + self.tokens.len() * 4
+        self.layers.iter().map(LayerState::nbytes).sum::<usize>()
+            + self.tokens.len() * std::mem::size_of::<u32>()
+            + self.written.len() * std::mem::size_of::<u64>()
     }
 
     pub fn mark(&self) -> Mark {
         Mark {
             len: self.tokens.len(),
+            last: self.written.last().copied(),
             layers: self
                 .layers
                 .iter()
@@ -208,6 +217,8 @@ impl Session {
     }
 
     /// Goes back to `m` (taken from this session at a length <= now).
+    /// Refused, with nothing changed, when a position below `m`'s length was
+    /// rewritten since `m` was taken.
     pub fn restore(&mut self, m: &Mark) -> Result<()> {
         if m.layers.len() != self.layers.len() || m.len > self.tokens.len() {
             return Err(bad(format!(
@@ -216,6 +227,16 @@ impl Session {
                 m.layers.len(),
                 self.tokens.len(),
                 self.layers.len()
+            )));
+        }
+        let last = m
+            .len
+            .checked_sub(1)
+            .and_then(|i| self.written.get(i).copied());
+        if last != m.last {
+            return Err(bad(format!(
+                "mark of {} positions: its rows were rewritten since",
+                m.len
             )));
         }
         for (l, (st, lm)) in self.layers.iter().zip(&m.layers).enumerate() {
@@ -249,6 +270,7 @@ impl Session {
             }
         }
         self.tokens.truncate(m.len);
+        self.written.truncate(m.len);
         Ok(())
     }
 
@@ -303,6 +325,7 @@ impl Session {
             }
         }
         self.tokens.truncate(len);
+        self.written.truncate(len);
         Ok(())
     }
 }
@@ -381,7 +404,9 @@ impl Model {
     }
 
     /// An empty sequence of at most `cap` positions (the admitted context);
-    /// its indexed-layer buffers are made at the first write.
+    /// its indexed-layer buffers are made at the first write and kept. A new
+    /// conversation reuses a session through `truncate(0)`: a second live
+    /// session holds a second set of buffers the admission did not charge.
     pub fn new_session(&self, cap: usize) -> Result<Session> {
         if cap == 0 || cap > self.cfg.context_length {
             return Err(bad(format!(
@@ -391,6 +416,8 @@ impl Model {
         }
         Ok(Session {
             tokens: Vec::new(),
+            written: Vec::new(),
+            calls: 0,
             cap,
             kpool: self.cfg.indexer.kpool,
             layers: self.blocks.iter().map(|b| b.new_state(cap)).collect(),
@@ -459,12 +486,14 @@ impl Model {
                 self.cfg.vocab_size
             )));
         }
+        let tp = prof_start();
         let rows = call_engram_rows(
             &self.hasher,
             self.cfg.engram.max_ngram - 1,
             &sess.tokens,
             ids,
         )?;
+        prof_end(Phase::Engram, tp, &[])?;
         if let Some(t) = trace.as_deref_mut() {
             t.engram_rows = rows.clone();
         }
@@ -482,7 +511,12 @@ impl Model {
                 return Err(bad(format!("cancelled before layer {l}")));
             }
             let table_rows = match blk.engram() {
-                Some(e) => Some(self.table.rows(e, &self.hasher.layer_ids(&rows, e)?)?),
+                Some(e) => {
+                    let tp = prof_start();
+                    let r = self.table.rows(e, &self.hasher.layer_ids(&rows, e)?)?;
+                    prof_end(Phase::Engram, tp, &[])?;
+                    Some(r)
+                }
                 None => None,
             };
             let (y, routes) = blk.forward(&w.layers()[l], &x, start, st, table_rows.as_deref())?;
@@ -495,7 +529,11 @@ impl Model {
                 }
             }
         }
+        let tp = prof_start();
         let out = self.head(&x, want)?;
+        prof_end(Phase::Head, tp, &[])?;
+        sess.calls += 1;
+        sess.written.extend(std::iter::repeat_n(sess.calls, n));
         sess.tokens.extend_from_slice(ids);
         Ok(out)
     }

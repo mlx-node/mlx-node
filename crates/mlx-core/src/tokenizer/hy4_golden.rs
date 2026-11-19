@@ -406,10 +406,15 @@ fn tojson_takes_only_the_byte_preserving_kwargs() {
     ] {
         assert!(render_expr(bad, ctx()).is_err(), "{bad}");
     }
-    let positional = render_expr("{{ v | tojson(2) }}", ctx()).unwrap_err();
-    assert!(positional.contains("too many arguments"), "{positional}");
-    let unknown = render_expr("{{ v | tojson(sort_keys=false) }}", ctx()).unwrap_err();
-    assert!(unknown.contains("too many arguments"), "{unknown}");
+    for bad in [
+        "{{ v | tojson(ensure_ascii=True) }}",
+        "{{ v | tojson(indent=2) }}",
+        "{{ v | tojson(sort_keys=false) }}",
+        "{{ v | tojson(2) }}",
+    ] {
+        let e = render_expr(bad, ctx()).unwrap_err();
+        assert!(e.contains("too many arguments"), "{bad}: {e}");
+    }
 }
 
 fn tokenizer_with(vocab_len: u32, added: &[(u32, String, bool)]) -> Tokenizer {

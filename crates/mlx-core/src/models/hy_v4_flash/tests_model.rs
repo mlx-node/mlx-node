@@ -18,6 +18,7 @@ use super::moe::ExpertSource;
 use super::ops::head_logits;
 use super::rows::{F8Table, ResidentF8Table};
 use super::scan::{ExpertClass, ExpertLayer, Located, Scan};
+use super::stats::{PHASES, Phase, phase_seconds, set_profiling};
 use super::weights::{
     AttnWeights, EngramWeights, Ffn, HcWeights, IndexerWeights, LayerWeights, MoeWeights, Resident,
     Residual,
@@ -667,6 +668,51 @@ fn mark_restore_replays_exactly() {
     let later = sess.mark();
     sess.restore(&mark).unwrap();
     assert!(sess.restore(&later).is_err(), "a mark past the session");
+}
+
+/// A mark whose rows were rewritten after a restore to an earlier mark is
+/// refused and leaves the session; the earlier mark still restores.
+#[test]
+fn restore_refuses_a_rewritten_mark() {
+    let f = fixture();
+    let ids = prompt();
+    let mut sess = f.model.new_session(CTX).unwrap();
+    f.model.forward_last(&mut sess, &ids[..14], None).unwrap();
+    let early = sess.mark();
+    decode(&f.model, &mut sess, &ids[14..]);
+    let late = sess.mark();
+    sess.restore(&early).unwrap();
+    let other = vec![5u32; 10];
+    let want = decode(&f.model, &mut sess, &other);
+    assert_eq!(sess.len(), 24);
+    assert!(sess.restore(&late).is_err(), "restored over rewritten rows");
+    assert_eq!(sess.len(), 24);
+    assert_eq!(&sess.tokens()[14..], &other[..]);
+    sess.restore(&early).unwrap();
+    assert_eq!(sess.len(), 14);
+    assert_eq!(decode(&f.model, &mut sess, &other), want);
+}
+
+/// With the phase split on, a trunk call times every phase but the MTP
+/// layer's, and its logits stay those of an unprofiled call.
+#[test]
+fn profiled_call_times_every_trunk_phase() {
+    let f = fixture();
+    let ids = prompt();
+    let mut plain = f.model.new_session(CTX).unwrap();
+    let want = read(&f.model.forward_last(&mut plain, &ids, None).unwrap());
+    let before = phase_seconds();
+    set_profiling(true);
+    let mut sess = f.model.new_session(CTX).unwrap();
+    let got = f.model.forward_last(&mut sess, &ids, None);
+    set_profiling(false);
+    let after = phase_seconds();
+    assert_close(&[read(&got.unwrap())], &[want], "profiled logits");
+    for (i, p) in PHASES.iter().enumerate() {
+        if *p != Phase::Mtp {
+            assert!(after[i] > before[i], "{} not timed", p.name());
+        }
+    }
 }
 
 #[test]

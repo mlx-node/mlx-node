@@ -16,8 +16,9 @@ use super::config::{Attn, HcConfig, HyV4FlashConfig};
 use super::engram;
 use super::indexer::{Indexer, IndexerGeometry, IndexerState, Indexing};
 use super::moe::{ExpertSource, FfnConfig, LayerFfn, Routes};
-use super::ops::{hc_mix, hc_post_identity, hc_reduce};
-use super::weights::{LayerWeights, Residual};
+use super::ops::{HcGates, hc_mix, hc_post_identity, hc_reduce};
+use super::stats::{Phase, prof_end, prof_start};
+use super::weights::{HcWeights, LayerWeights, Residual};
 use crate::array::MxArray;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
@@ -159,7 +160,12 @@ impl Block {
             return Err(bad(format!("layer {}: no HC weights", self.layer)));
         };
         let x = match (self.engram, &w.engram, rows) {
-            (Some(_), Some(ew), Some(r)) => engram::forward(x, r, ew)?,
+            (Some(_), Some(ew), Some(r)) => {
+                let tp = prof_start();
+                let y = engram::forward(x, r, ew)?;
+                prof_end(Phase::Engram, tp, &[&y])?;
+                y
+            }
             (None, None, None) => x.clone(),
             (e, _, r) => {
                 return Err(bad(format!(
@@ -171,8 +177,7 @@ impl Block {
             }
         };
 
-        let g = hc_mix(&x, hc_attn, self.eps, &self.hc)?;
-        let h = hc_reduce(&x, &g.pre)?;
+        let (g, h) = self.mix(&x, hc_attn)?;
         let index = match (&self.indexer, &w.indexer, st.index.as_mut()) {
             (Some(indexer), Some(weights), Some(state)) => Some(Indexing {
                 indexer,
@@ -188,11 +193,27 @@ impl Block {
             }
         };
         let a = self.mla.forward(&w.attn, &h, start, &mut st.cache, index)?;
-        let x = hc_post_identity(&a, &x, &g.post)?;
+        let x = post(&a, &x, &g.post)?;
 
-        let g = hc_mix(&x, hc_ffn, self.eps, &self.hc)?;
-        let h = hc_reduce(&x, &g.pre)?;
+        let (g, h) = self.mix(&x, hc_ffn)?;
         let (f, routes) = self.ffn.forward(w, &h)?;
-        Ok((hc_post_identity(&f, &x, &g.post)?, routes))
+        Ok((post(&f, &x, &g.post)?, routes))
     }
+
+    /// A sublayer's gates and its reduced input, under the HC clock.
+    fn mix(&self, x: &MxArray, hw: &HcWeights) -> Result<(HcGates, MxArray)> {
+        let tp = prof_start();
+        let g = hc_mix(x, hw, self.eps, &self.hc)?;
+        let h = hc_reduce(x, &g.pre)?;
+        prof_end(Phase::Hc, tp, &[&g.post, &h])?;
+        Ok((g, h))
+    }
+}
+
+/// `hc_post_identity` under the HC clock.
+fn post(y: &MxArray, x: &MxArray, gate: &MxArray) -> Result<MxArray> {
+    let tp = prof_start();
+    let out = hc_post_identity(y, x, gate)?;
+    prof_end(Phase::Hc, tp, &[&out])?;
+    Ok(out)
 }

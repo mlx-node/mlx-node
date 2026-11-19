@@ -210,6 +210,7 @@ impl Sizes {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pick {
     pub ctx: usize,
+    /// At most `ctx`.
     pub chunk: usize,
     pub admission: Admission,
 }
@@ -239,7 +240,7 @@ pub fn pick(
                 Ok(a) if a.cache_bytes() >= p.second_staging_min_cache => {
                     return Ok(Pick {
                         ctx,
-                        chunk,
+                        chunk: chunk.min(ctx),
                         admission: a,
                     });
                 }
@@ -251,7 +252,7 @@ pub fn pick(
         if let Some(admission) = fallback {
             return Ok(Pick {
                 ctx,
-                chunk: smallest,
+                chunk: smallest.min(ctx),
                 admission,
             });
         }
@@ -334,16 +335,21 @@ fn host_reading() -> Result<(HostMemory, u64)> {
     Ok((h, working_set()))
 }
 
-/// This model's bytes inside `host_used`: resident arrays + the bank's
-/// resident pages (volatile between turns). KV, scratch and the shared pool
-/// stay in `others` (conservative).
-pub fn own(bank: &KqBank, dense: u64) -> Result<Own> {
-    let resident = bank.resident_bytes()?;
-    Ok(Own {
-        active: dense + resident,
+/// This model's bytes inside `host_used`: resident arrays, the sessions'
+/// buffers `kv` (made at their first write and kept, already charged in
+/// `fixed`) and the bank's resident pages (volatile between turns).
+/// Scratch and the shared pool stay in `others` (conservative).
+pub fn own(bank: &KqBank, dense: u64, kv: u64) -> Result<Own> {
+    Ok(own_of(dense, kv, bank.resident_bytes()?, bank.in_turn()))
+}
+
+/// [`own`] from its parts.
+pub fn own_of(dense: u64, kv: u64, resident: u64, in_turn: bool) -> Own {
+    Own {
+        active: dense + kv + resident,
         pool: 0,
-        volatile: if bank.in_turn() { 0 } else { resident },
-    })
+        volatile: if in_turn { 0 } else { resident },
+    }
 }
 
 struct TurnState {
@@ -352,6 +358,9 @@ struct TurnState {
     guard: CacheLimitGuard,
     /// Bank switches: (cache slots, seconds to free the old bank and allocate).
     switches: Vec<(usize, f64)>,
+    /// The last switch failed: the bank may hold no slots, so the next turn
+    /// rebuilds even when the admission is kept.
+    lost: bool,
 }
 
 /// The per-turn re-admission and wired-limit lease of one bank.
@@ -388,6 +397,7 @@ impl Lease {
                 wired: None,
                 guard: coordinator().register_with_cache_limit(bank.nbytes(), Some(POOL_LIMIT)),
                 switches: Vec::new(),
+                lost: false,
             }),
         }
     }
@@ -412,7 +422,9 @@ impl Lease {
     fn switch(&self, t: &mut TurnState, bank: &KqBank, a: &Admission) -> Result<()> {
         let t0 = Instant::now();
         let slots = self.classes.split(a.cache_bytes());
+        t.lost = true;
         bank.rebuild(slots, a.staging_layers as usize)?;
+        t.lost = false;
         t.guard = coordinator().register_with_cache_limit(bank.nbytes(), Some(POOL_LIMIT));
         let s = t0.elapsed().as_secs_f64();
         let n = slots[0] + slots[1];
@@ -422,9 +434,10 @@ impl Lease {
     }
 
     /// Turn start: make the bank non-volatile, re-admit, switch the bank if
-    /// the admission says so, take the wired-limit lease. Errs (bank volatile
-    /// again) when the fixed working set alone no longer fits.
-    pub fn begin_turn(&self, bank: &KqBank, dense: u64) -> Result<()> {
+    /// the admission says so, take the wired-limit lease. `kv`: bytes of
+    /// every live session (`Session::nbytes`). Errs (bank volatile again)
+    /// when the fixed working set alone no longer fits.
+    pub fn begin_turn(&self, bank: &KqBank, dense: u64, kv: u64) -> Result<()> {
         let mut t = self.turn();
         if let Some(limits) = &self.limits
             && t.wired.is_none()
@@ -435,7 +448,7 @@ impl Lease {
             bank.begin_turn()?;
             let next = (|| {
                 let (h, ws) = host_reading()?;
-                let o = own(bank, dense)?;
+                let o = own(bank, dense, kv)?;
                 match readmit_with(
                     &self.profile,
                     &cur,
@@ -446,7 +459,11 @@ impl Lease {
                     &o,
                     ws,
                 )? {
-                    Turn::Keep => Ok(cur),
+                    Turn::Keep if !t.lost => Ok(cur),
+                    Turn::Keep => {
+                        self.switch(&mut t, bank, &cur)?;
+                        Ok(cur)
+                    }
                     Turn::StagingOnly(a) | Turn::Rebuild(a) => {
                         self.switch(&mut t, bank, &a)?;
                         tracing::info!("hy_v4_flash re-admission: {a}");
@@ -546,13 +563,13 @@ impl Store {
             }
             #[cfg(test)]
             (None, CachePlan::Slots { cache, staging }) => {
-                (max_ctx, smallest, *cache, *staging, None)
+                (max_ctx, smallest.min(max_ctx), *cache, *staging, None)
             }
-            _ => (max_ctx, smallest, [0, 0], 1, None),
+            _ => (max_ctx, smallest.min(max_ctx), [0, 0], 1, None),
         };
         // the re-admission charges the rows the load admitted, the env only
         // lowers the chunk the driver runs
-        let rows = admitted.min(ctx) as u64;
+        let rows = admitted as u64;
         let chunk = opts.chunk_cap.map_or(admitted, |c| admitted.min(c));
         let size = ModelSize {
             ctx: ctx as u64,
@@ -616,12 +633,14 @@ impl Store {
         self.bank.cache_slots()
     }
 
-    pub fn own(&self) -> Result<Own> {
-        own(&self.bank, self.dense_bytes)
+    /// `kv`: bytes of every live session (`Session::nbytes`).
+    pub fn own(&self, kv: u64) -> Result<Own> {
+        own(&self.bank, self.dense_bytes, kv)
     }
 
-    pub fn begin_turn(&self) -> Result<()> {
-        self.lease.begin_turn(&self.bank, self.dense_bytes)
+    /// `kv`: bytes of every live session (`Session::nbytes`).
+    pub fn begin_turn(&self, kv: u64) -> Result<()> {
+        self.lease.begin_turn(&self.bank, self.dense_bytes, kv)
     }
 
     pub fn end_turn(&self) -> Result<()> {

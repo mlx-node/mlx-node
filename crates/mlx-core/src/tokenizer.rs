@@ -3697,8 +3697,9 @@ impl RenderInputs {
 ///    kwargs (`ensure_ascii` / `indent` / `separators` / `sort_keys`), only the
 ///    two that leave these bytes unchanged: `ensure_ascii=False` and
 ///    `indent=None` ([`check_tojson_kwargs`]; Hy4-flash writes
-///    `tojson(ensure_ascii=False)`). Any other kwarg, e.g. `tojson(indent=4)`,
-///    fails to render with "too many arguments".
+///    `tojson(ensure_ascii=False)`). Any other kwarg or value, e.g.
+///    `tojson(indent=4)`, fails to render with "too many arguments", as every
+///    kwarg did before.
 struct PythonDefaultFormatter;
 
 impl serde_json::ser::Formatter for PythonDefaultFormatter {
@@ -3820,19 +3821,21 @@ fn to_json_python_separators<T: Serialize + ?Sized>(value: &T) -> Option<String>
 
 /// HF's `tojson` kwargs that leave [`to_json_python_separators`]'s bytes as
 /// they are: `ensure_ascii=False` (HF's default) and `indent=None`. Any other
-/// value or kwarg is a render error, not a silently different JSON.
+/// value or kwarg is a render error, not a silently different JSON, of the
+/// kind ("too many arguments") the one-argument filter gave every kwarg: the
+/// cross-family gates record unrenderable templates by that text.
 fn check_tojson_kwargs(
     kwargs: &minijinja::value::Kwargs,
 ) -> std::result::Result<(), minijinja::Error> {
     if kwargs.get::<Option<bool>>("ensure_ascii")? == Some(true) {
         return Err(minijinja::Error::new(
-            minijinja::ErrorKind::InvalidOperation,
+            minijinja::ErrorKind::TooManyArguments,
             "tojson: ensure_ascii=True is not supported",
         ));
     }
     if kwargs.get::<Option<minijinja::Value>>("indent")?.is_some() {
         return Err(minijinja::Error::new(
-            minijinja::ErrorKind::InvalidOperation,
+            minijinja::ErrorKind::TooManyArguments,
             "tojson: only indent=None is supported",
         ));
     }
@@ -5859,10 +5862,11 @@ mod tests {
     ///    where its date comes from, which is a plumbing change, not a filter fix.
     /// 2. `too many arguments` — HF's `tojson` takes `ensure_ascii` / `indent` /
     ///    `separators` / `sort_keys` kwargs and ours only `ensure_ascii=False`
-    ///    and `indent=None`. `step-3.7-flash` (not a supported family) failed
-    ///    here when no kwarg was accepted; which kwargs it writes is unverified
-    ///    (no local copy of its template), so if it now renders, compare it to
-    ///    its fixture and drop it from `KNOWN_UNRENDERABLE_FAMILIES`. See
+    ///    and `indent=None`; any other kwarg or value still fails with this
+    ///    text. `step-3.7-flash` (not a supported family) failed here when no
+    ///    kwarg was accepted; which kwargs it writes is unverified (no local
+    ///    copy of its template), so if it now renders, compare it to its
+    ///    fixture and drop it from `KNOWN_UNRENDERABLE_FAMILIES`. See
     ///    [`PythonDefaultFormatter`].
     const KNOWN_UNRENDERABLE_CAUSES: &[&str] =
         &["unknown function: strftime_now", "too many arguments"];

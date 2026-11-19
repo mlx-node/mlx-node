@@ -20,6 +20,7 @@ use super::cache::{LatentBuf, LayerCache, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
 use super::indexer::Indexing;
 use super::sparse::gather_sink_attention;
+use super::stats::{Phase, prof_end, prof_start};
 use super::weights::AttnWeights;
 use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::attention::{linear, rms_norm};
@@ -210,6 +211,14 @@ impl Mla {
         rms_norm(&y, &w.post_norm, g.eps)
     }
 
+    /// `finish` under the attention-projection clock.
+    fn finish_timed(&self, w: &AttnWeights, x: &MxArray, o_lat: &MxArray) -> Result<MxArray> {
+        let tp = prof_start();
+        let y = self.finish(w, x, o_lat)?;
+        prof_end(Phase::AttnProj, tp, &[&y])?;
+        Ok(y)
+    }
+
     /// The sublayer output for `h [n, dim]` (the HC-reduced stream, before
     /// `attn_norm`) at positions `start..start + n`; appends this call's
     /// rows to `cache` (and to the indexer state of an indexed layer, which
@@ -247,9 +256,12 @@ impl Mla {
         ring: &mut WindowRing,
     ) -> Result<MxArray> {
         let n = h.shape_at(0)? as usize;
+        let tp = prof_start();
         let p = self.project(w, h, start)?;
         let before = ring.clone();
         let out = ring.append(&p.kv, start).and_then(|(keys, first)| {
+            prof_end(Phase::AttnProj, tp, &[&p.q, &p.x])?;
+            let tp = prof_start();
             let window = self.g.window;
             let idx = MxArray::from_int32(
                 &window_rows(start, n, first, window),
@@ -263,7 +275,8 @@ impl Mla {
                 &w.sinks,
                 self.g.scale,
             )?;
-            self.finish(w, &p.x, &o)
+            prof_end(Phase::Sparse, tp, &[&o])?;
+            self.finish_timed(w, &p.x, &o)
         });
         if out.is_err() {
             *ring = before;
@@ -279,12 +292,17 @@ impl Mla {
         buf: &mut LatentBuf,
         ix: Indexing<'_>,
     ) -> Result<MxArray> {
+        let tp = prof_start();
         let p = self.project(w, h, start)?;
         let mark = ix.state.mark();
         let out = buf.write(&p.kv, start).and_then(|()| {
+            prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr])?;
+            let tp = prof_start();
             let idx = ix
                 .indexer
                 .select(ix.weights, &p.x, &p.qr, start, ix.state)?;
+            prof_end(Phase::Indexer, tp, &[&idx])?;
+            let tp = prof_start();
             let o = gather_sink_attention(
                 &p.q,
                 buf.rows()?,
@@ -293,7 +311,8 @@ impl Mla {
                 &w.sinks,
                 self.g.scale,
             )?;
-            self.finish(w, &p.x, &o)
+            prof_end(Phase::Sparse, tp, &[&o])?;
+            self.finish_timed(w, &p.x, &o)
         });
         if out.is_err() {
             if buf.len() > start {

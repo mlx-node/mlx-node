@@ -851,6 +851,62 @@ fn bank_moe_matches_dequantized_experts() {
     bank.end_turn().unwrap();
 }
 
+/// A 6-row call cut into FFN chunks of 5 + 1 is one prefill: its 1-row
+/// chunk stages its misses and leaves the cache as it was, so a decode of
+/// that row in the next turn finds nothing cached. One cache slot for the
+/// two Q6_K layers leaves prefill no seeding quota.
+#[test]
+fn prefill_tail_chunk_leaves_the_cache() {
+    let mut rng = Rng::new(23);
+    let m = moe_cfg(6, 2, 512, 256);
+    let c = ffn_cfg(128, m.clone(), 0.5);
+    let mut file = rng.bytes(1000);
+    let experts = vec![
+        None,
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            1,
+            ExpertClass::Q6kDown,
+            &mut file,
+        )),
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            2,
+            ExpertClass::Q4kDown,
+            &mut file,
+        )),
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            3,
+            ExpertClass::Q6kDown,
+            &mut file,
+        )),
+    ];
+    let dir = Temp::new();
+    let path = dir.0.join("data.bin");
+    std::fs::write(&path, &file).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+    let bank = Arc::new(KqBank::new(pool, &m, &experts, [1, 1], 1).unwrap());
+    let (w, norm, post) = moe_weights(&mut rng, &c, 64);
+    let ffn = Ffn::Moe(w);
+    let layer = LayerFfn::new(&c, 1, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
+    let hs = inputs(&mut rng, 6, c.dim);
+    let hits = || bank.stats().iter().map(|s| s.hits).sum::<usize>();
+    layer
+        .forward_chunked(&ffn, &norm, &post, &rows_arr(&hs), 5)
+        .unwrap();
+    bank.end_turn().unwrap();
+    let before = hits();
+    layer
+        .forward_chunked(&ffn, &norm, &post, &rows_arr(&hs[5..6]), FFN_CHUNK_ROWS)
+        .unwrap();
+    bank.end_turn().unwrap();
+    assert_eq!(hits(), before, "the prefill's 1-row chunk filled the cache");
+}
+
 fn real_scan() -> Scan {
     let dir = std::env::var("HY4_DIR").expect("HY4_DIR = directory of the two Hy4 shards");
     let paths = crate::models::deepseek_v41::chat::shard_paths(Path::new(&dir)).unwrap();

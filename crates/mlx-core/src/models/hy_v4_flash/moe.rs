@@ -23,6 +23,7 @@ use napi::{Error, Result};
 use super::bank::{KqBank, Prepared};
 use super::config::{HyV4FlashConfig, MoeConfig};
 use super::ops::{route, router_scores};
+use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{Ffn, LayerWeights, MoeWeights};
 use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::attention::{linear, rms_norm};
@@ -385,24 +386,39 @@ impl Moe {
     }
 
     /// `x [rows, dim]` f32 (after `ffn_norm`) -> the FFN output before
-    /// `post_ffw_norm`, and the routes.
-    fn forward(&self, layer: usize, w: &MoeWeights, x: &MxArray) -> Result<(MxArray, Routes)> {
+    /// `post_ffw_norm`, and the routes. `decode`: the whole call is one
+    /// decode step (bank cache victims) rather than a prefill (staging).
+    fn forward(
+        &self,
+        layer: usize,
+        w: &MoeWeights,
+        x: &MxArray,
+        decode: bool,
+    ) -> Result<(MxArray, Routes)> {
+        let tp = prof_start();
         let scores = router_scores(x, &w.router)?;
         let (ids, weights) = route(&scores, self.bias.as_deref(), &self.moe)?;
+        prof_end(Phase::Router, tp, &[])?;
         let routes = Routes {
             k: self.moe.n_used,
             ids,
             weights,
         };
+        let tp = prof_start();
         let z = linear(x, &w.routed_down)?;
-        let r = self.routed(layer, &z, &routes)?;
+        prof_end(Phase::Routed, tp, &[&z])?;
+        let r = self.routed(layer, &z, &routes, decode)?;
+        let tp = prof_start();
         let up = linear(&r, &w.routed_up)?;
-        let shared = mlp(x, &w.shared_gate, &w.shared_up, &w.shared_down)?;
-        Ok((up.add(&shared)?, routes))
+        prof_end(Phase::Routed, tp, &[&up])?;
+        let tp = prof_start();
+        let f = up.add(&mlp(x, &w.shared_gate, &w.shared_up, &w.shared_down)?)?;
+        prof_end(Phase::Shared, tp, &[&f])?;
+        Ok((f, routes))
     }
 
     /// `z [rows, latent]` -> `Σ w_e · expert_e(z)` `[rows, latent]` f32.
-    fn routed(&self, layer: usize, z: &MxArray, routes: &Routes) -> Result<MxArray> {
+    fn routed(&self, layer: usize, z: &MxArray, routes: &Routes, decode: bool) -> Result<MxArray> {
         let rows = z.shape_at(0)?;
         let n = self.moe.n_experts as u32;
         if routes.k != self.moe.n_used
@@ -421,17 +437,24 @@ impl Moe {
         let (ids, w) = routes.by_expert();
         match &self.experts {
             ExpertSource::Resident(a) => {
+                let tp = prof_start();
                 let idx = MxArray::from_uint32(&ids, &[rows, routes.k as i64])?;
-                self.combine(z, &idx, &w, |p, x, i| a.gather(p, x, i))
+                let y = self.combine(z, &idx, &w, |p, x, i| a.gather(p, x, i))?;
+                prof_end(Phase::Routed, tp, &[&y])?;
+                Ok(y)
             }
             ExpertSource::Bank(bank) => {
                 let (used, uses) = distinct_uses(&ids);
-                let p = bank.prepare(layer, &used, &uses, decode_step(rows as usize))?;
+                let tp = prof_start();
+                let p = bank.prepare(layer, &used, &uses, decode)?;
+                prof_end(Phase::Fill, tp, &[])?;
                 bank.assert_slots(&p);
+                let tp = prof_start();
                 let out = self.banked(z, &ids, &w, &p);
                 if out.is_ok() {
                     bank.done(&p);
                 }
+                prof_end(Phase::Routed, tp, &[])?;
                 out
             }
         }
@@ -562,7 +585,9 @@ impl LayerFfn {
     }
 
     /// `forward` from the parts, `chunk` rows per expert step; every chunk
-    /// is evaluated before the next starts when there is more than one.
+    /// is evaluated before the next starts when there is more than one. A
+    /// call of more than one row is a prefill in every chunk, so a short
+    /// last chunk never evicts the bank's cache.
     pub fn forward_chunked(
         &self,
         ffn: &Ffn,
@@ -585,6 +610,7 @@ impl LayerFfn {
             return Err(bad("chunk of 0 rows"));
         }
         let x = rms_norm(&h.astype(DType::Float32)?, norm, self.eps)?;
+        let decode = decode_step(n);
         let parts = chunks(n, chunk);
         let mut routes = match &self.kind {
             Kind::Dense => None,
@@ -602,9 +628,14 @@ impl LayerFfn {
                 x.slice(&[lo as i64, 0], &[hi as i64, self.dim as i64])?
             };
             let f = match (&self.kind, ffn) {
-                (Kind::Dense, Ffn::Mlp { gate, up, down }) => mlp(&xc, gate, up, down)?,
+                (Kind::Dense, Ffn::Mlp { gate, up, down }) => {
+                    let tp = prof_start();
+                    let f = mlp(&xc, gate, up, down)?;
+                    prof_end(Phase::Shared, tp, &[&f])?;
+                    f
+                }
                 (Kind::Moe(m), Ffn::Moe(mw)) => {
-                    let (f, r) = m.forward(self.layer, mw, &xc)?;
+                    let (f, r) = m.forward(self.layer, mw, &xc, decode)?;
                     if let Some(all) = routes.as_mut() {
                         all.append(r);
                     }
