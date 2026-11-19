@@ -226,21 +226,21 @@ describe('the answer never holds the reasoning', () => {
       rawText: `plan\n</think>\n\n${qwenBlock}`,
       publicRawText: `\n\n${qwenBlock}`,
       before: 'plan\n</think>\n\n',
-      after: '\n\n',
+      after: '',
     },
     {
       family: 'LFM2',
       rawText: `plan</think>\n${lfm2Block}`,
       publicRawText: `\n${lfm2Block}`,
       before: 'plan</think>\n',
-      after: '\n',
+      after: '',
     },
     ...['6124c78e', 'opensource'].map((x) => ({
       family: `Hy4 :${x}`,
       rawText: `plan</think:${x}>\n${hy4Block(x)}`,
       publicRawText: `\n${hy4Block(x)}`,
       before: `plan</think:${x}>\n`,
-      after: '\n',
+      after: '',
     })),
     {
       family: 'Hy4 thinking off',
@@ -254,7 +254,7 @@ describe('the answer never holds the reasoning', () => {
       rawText: `plan</think>\n\n${dsmlBlock()}`,
       publicRawText: `\n\n${dsmlBlock()}`,
       before: 'plan</think>\n\n',
-      after: '\n\n',
+      after: '',
     },
     { family: 'Gemma4 prompted channel', rawText: `plan<channel|>${gemmaCall}<turn|>`, before: 'plan', after: '' },
     {

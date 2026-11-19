@@ -120,7 +120,7 @@ export function visibleAnswerText(
     result.text.length === 0 &&
     result.toolCalls.some((t) => t.status === 'ok') &&
     containsToolCallMarkup(answerRaw)
-      ? recoverSuppressedToolCallText(answerRaw)
+      ? withoutWhitespaceOnly(recoverSuppressedToolCallText(answerRaw))
       : result.text;
   if (!result.toolCalls.some((call) => call.status === 'missing_name')) return text;
   const placed = withNamelessCallsInPlace(text, answerRaw, result.toolCalls);
@@ -135,6 +135,11 @@ export function visibleAnswerText(
 
 function isWhitespace(ch: string): boolean {
   return ch.trim().length === 0;
+}
+
+// vLLM `_strip_content_whitespace`: whitespace-only content beside a tool call is no text.
+function withoutWhitespaceOnly(text: string): string {
+  return text.trim().length === 0 ? '' : text;
 }
 
 /**

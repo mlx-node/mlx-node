@@ -1477,6 +1477,56 @@ describe('handleCreateMessage', () => {
       expect(text).not.toContain('tool_call');
     });
 
+    // vLLM `_strip_content_whitespace` drops whitespace-only content beside a
+    // tool call. Mutation: keep the whitespace-only recovered text → red.
+    it('a suppressed call after the reasoning opens no whitespace text block', async () => {
+      const block = '<tool_call>\n{"name":"get_weather","arguments":{"city":"Paris"}}\n</tool_call>';
+      const done = {
+        text: '',
+        done: true,
+        finishReason: 'tool_calls',
+        toolCalls: [{ status: 'ok', id: 'call_x', name: 'get_weather', arguments: '{"city":"Paris"}' }],
+        thinking: 'plan',
+        numTokens: 12,
+        promptTokens: 4,
+        reasoningTokens: 2,
+        rawText: `plan\n</think>\n\n${block}`,
+        publicRawText: `\n\n${block}`,
+      };
+      const request = { model: 'test-model', messages: [{ role: 'user' as const, content: 'go' }], max_tokens: 100 };
+
+      const streamRegistry = new ModelRegistry();
+      streamRegistry.register(
+        'test-model',
+        createMockStreamModel([{ text: 'plan', done: false, isReasoning: true }, done]),
+      );
+      const streamed = createMockRes();
+      await handleCreateMessage(streamed.res, { ...request, stream: true }, streamRegistry);
+      const starts = parseSSE(streamed.getBody())
+        .filter((e) => e.event === 'content_block_start')
+        .map((e) => (e.data['content_block'] as any).type as string);
+      expect(starts).toEqual(['thinking']);
+
+      const registry = new ModelRegistry();
+      registry.register(
+        'test-model',
+        createMockModel(
+          makeChatResult({
+            text: '',
+            thinking: 'plan',
+            rawText: done.rawText,
+            publicRawText: done.publicRawText,
+            finishReason: 'tool_calls',
+            toolCalls: [done.toolCalls[0] as ToolCallResult],
+          }),
+        ),
+      );
+      const { res, getBody } = createMockRes();
+      await handleCreateMessage(res, request, registry);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content.filter((b: any) => b.type === 'text').map((b: any) => b.text)).toEqual(['']);
+    });
+
     it('emits thinking + text with correct content block indices', async () => {
       const registry = new ModelRegistry();
       const streamEvents = [
