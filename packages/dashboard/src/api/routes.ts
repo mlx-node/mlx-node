@@ -18,6 +18,7 @@ import { handleCacheDelete, handleCacheGet } from './handlers/cache.js';
 import {
   handleChatAgent,
   handleChatCancel,
+  handleChatStopRun,
   handleChatConversations,
   handleChatCreate,
   handleChatDelete,
@@ -174,6 +175,7 @@ export const ROUTES: Route[] = [
   mainRoute('POST', '/api/chat/conversations', handleChatCreate, { successStatus: 201 }),
   mainRoute('POST', '/api/chat/conversations/:id/prompt', handleChatPrompt, { successStatus: 202 }),
   mainRoute('POST', '/api/chat/conversations/:id/cancel', handleChatCancel),
+  mainRoute('POST', '/api/chat/conversations/:id/runs/:runId/stop', handleChatStopRun),
   mainRoute('POST', '/api/chat/conversations/:id/interactions/:iid', handleChatInteraction),
   mainRoute('POST', '/api/chat/conversations/:id/permission-mode', handleChatPermissionMode),
   mainRoute('POST', '/api/chat/drafts/:draft/permission-mode', handleChatDraftPermissionMode),

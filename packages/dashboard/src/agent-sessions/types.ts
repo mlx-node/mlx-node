@@ -123,6 +123,47 @@ export type TranscriptEntry =
       noSpawn?: true;
     }
   | { kind: 'model'; ts: number; modelId: string }
+  /** The agent summarized older messages to free context (`auto_compact_*`): done, failed, or stopped by Stop. */
+  | {
+      kind: 'compaction';
+      ts: number;
+      outcome: 'done' | 'failed' | 'stopped';
+      tokensBefore?: number;
+      tokensAfter?: number;
+      /** A failure the agent tries again at its next step. */
+      retry?: true;
+    }
+  /**
+   * One workflow run, from its `workflow_updated` lines: made at the first, replaced by each with a higher `revision`.
+   * `status`, `phases[].state` and `agents[].state` are the agent's words.
+   */
+  | {
+      kind: 'workflow';
+      /** The first update. */
+      ts: number;
+      /** The update applied last. */
+      updatedTs: number;
+      runId: string;
+      revision: number;
+      name: string;
+      status: string;
+      phases: { title: string; state: string }[];
+      currentPhase: string | null;
+      agentBudget: number | null;
+      agentsUsed: number;
+      agents: {
+        agentId: string;
+        label: string;
+        phase: string | null;
+        state: string;
+        tokens: number;
+        durationMs: number;
+      }[];
+      pauseMessage?: string;
+      /** `result_summary`, cut at 16 KB. */
+      report?: string;
+      truncated?: true;
+    }
   | {
       kind: 'turn-end';
       ts: number;
@@ -172,6 +213,8 @@ export interface SessionDetailResponse {
   transcript: TranscriptEntry[];
   turns: TurnMetric[];
   transcriptError?: string;
+  /** The last `_meta.totalTokens` in `updates.jsonl`: the conversation's current context in tokens. */
+  contextUsed?: number;
   /** Null for a Chat conversation: a terminal cannot open the Chat agent's home. */
   resumeCommand: string | null;
 }

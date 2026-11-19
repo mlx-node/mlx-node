@@ -1267,9 +1267,11 @@ describe('buildTimeline: a woken turn', () => {
     const parsed = parseUpdates(wokenParentText());
     const windows = turnWindows(digestUpdates(parsed).entries);
     const groups = groupTurns(parsed.transcript, parsed.turns);
+    // The digest has no lane for a workflow entry; it stays in the group of the turn that started the run.
     expect(windows.map((w) => [w.number, w.entries.map((e) => e.kind)])).toEqual(
-      groups.map((g) => [g.number, g.entries.map((e) => e.kind)]),
+      groups.map((g) => [g.number, g.entries.filter((e) => e.kind !== 'workflow').map((e) => e.kind)]),
     );
+    expect(groups.map((g) => g.entries.filter((e) => e.kind === 'workflow').length)).toEqual([1, 0]);
     expect(groups.map((g) => g.number)).toEqual([1, 2]);
     expect(groups[1]!.entries.filter((e) => e.kind === 'wake')).toHaveLength(1);
   });

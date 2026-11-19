@@ -58,6 +58,7 @@ function bashRequest(command: string): PermissionRequest {
     rawInput: { variant: 'Bash', command, description: 'run', is_background: false },
     options: OPTIONS,
     hookAsk: { hookName: GUARD, reason: null },
+    requester: null,
   };
 }
 

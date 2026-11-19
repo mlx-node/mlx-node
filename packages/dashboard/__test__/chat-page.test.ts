@@ -8,6 +8,7 @@ import type { ApiCall } from '../src/runtime.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import type { ChatHostState, ChatMode, ConversationInfo, ConversationRow } from '../ui/src/lib/chat-types.js';
 import { toast } from '../ui/src/lib/toast.js';
+import type { TranscriptEntry } from '../ui/src/lib/types.js';
 import Chat from '../ui/src/pages/chat.js';
 import { modeBlocker, sendFailure } from '../ui/src/pages/chat/blockers.js';
 import { webChip } from '../ui/src/pages/chat/composer-tools.js';
@@ -99,6 +100,7 @@ function sync(id: string, over: Partial<ChatSync> = {}, conversation: Partial<Co
     notices: [],
     transcriptError: null,
     permissionMarks: [],
+    runs: [],
     ...over,
   };
 }
@@ -682,7 +684,7 @@ describe('Chat page: sending', () => {
   });
 });
 
-describe('Chat page: Escape and the stop hint', () => {
+describe('Chat page: Escape', () => {
   const RUNNING = { turnId: 't', phase: 'running' as const, startedAt: NOW, wait: null };
   const cancels = (): number => writes().filter((w) => w.path.endsWith('/cancel')).length;
   const openRunning = async (id: string): Promise<void> => {
@@ -734,15 +736,45 @@ describe('Chat page: Escape and the stop hint', () => {
     await waitFor(() => cancels() === 1);
   });
 
-  it('the hint names Esc only while an answer runs and the composer has the focus', async () => {
+  it('the tools row draws no key legend while an answer runs', async () => {
     await openRunning('p-esc-hint');
-    const hint = (): boolean => shown().includes(`${CHAT.keyNames.esc} ${CHAT.hintStop[0].label}`);
     act(() => composer().focus());
-    await waitFor(hint);
-    act(() => composer().blur());
-    await waitFor(() => !hint());
-    expect(shown()).not.toContain(CHAT.hintSend[1].label);
+    await flushTimers();
+    expect(composer().closest('form')!.querySelector('[data-side] kbd')).toBeNull();
     expect(accessibleName(sendFace())).toBe(CHAT.stop);
+  });
+});
+
+describe('Chat page: the context hint', () => {
+  const hint = (): HTMLElement | null =>
+    page!.container.querySelector<HTMLElement>('form [role="img"][aria-label^="Context:"]');
+
+  it('the composer shows the conversation’s use of its model’s window, and it moves with the stream', async () => {
+    const host: ChatHostState = { ...READY_CHAT_HOST, models: [hostModel('qwen3.5-4b', 262_144)] };
+    await open('/chat?c=p-context', (text) => text.includes('Hi there'), {
+      host,
+      conversations: { 'p-context': sync('p-context', { contextUsed: 11_971 }) },
+    });
+    await waitFor(() => hint() !== null);
+    expect(hint()!.getAttribute('aria-label')).toBe('Context: 11,971 of 262,144 tokens (5%)');
+    act(() => api!.emitChat('p-context', { type: 'ops', seq: 1, ops: [{ op: 'context', used: 220_000 }] }));
+    await waitFor(() => hint()?.getAttribute('aria-label') === 'Context: 220,000 of 262,144 tokens (84%)');
+    expect(hint()!.getAttribute('data-tone')).toBe('warning');
+  });
+
+  it('no hint while the used count or the window is unknown', async () => {
+    await open('/chat?c=p-no-count', (text) => text.includes('Hi there'), {
+      host: { ...READY_CHAT_HOST, models: [hostModel('qwen3.5-4b', 262_144)] },
+      conversations: { 'p-no-count': sync('p-no-count') },
+    });
+    expect(hint()).toBeNull();
+    page!.unmount();
+    api!();
+    await open('/chat?c=p-no-window', (text) => text.includes('Hi there'), {
+      host: { ...READY_CHAT_HOST, models: [hostModel('qwen3.5-4b', null)] },
+      conversations: { 'p-no-window': sync('p-no-window', { contextUsed: 11_971 }) },
+    });
+    expect(hint()).toBeNull();
   });
 });
 
@@ -836,6 +868,111 @@ describe('Chat page: a message that waits for its model', () => {
     );
     await waitFor(() => shown().includes('First words'));
     expect(shown()).not.toContain(queuedLine);
+  });
+
+  it("between two steps the thread says what the engine does with this conversation's request, from the host stream", async () => {
+    const request = (
+      phase: 'queued' | 'prefill',
+      prefill: [number, number] | null = null,
+    ): ChatHostState['requests'][number] => ({
+      session: 'p-steps',
+      modelId: 'qwen3.5-4b',
+      phase,
+      startedAt: NOW,
+      prefillDone: prefill?.[0] ?? null,
+      prefillTotal: prefill?.[1] ?? null,
+      generated: null,
+    });
+    const engine = (requests: ChatHostState['requests']): ChatHostState =>
+      host({
+        resident: [{ modelId: 'qwen3.5-4b', sizeBytes: null }],
+        answers: [{ modelId: 'qwen3.5-4b', inFlight: 2, maxConcurrent: 4, queued: 0, lastStart: NOW }],
+        requests,
+      });
+    const read: TranscriptEntry = {
+      kind: 'tool',
+      ts: NOW - 5_000,
+      id: 'r1',
+      name: 'probe',
+      title: 'Probe the file',
+      status: 'completed',
+      endTs: NOW - 4_000,
+    };
+    await open('/chat?c=p-steps', (text) => text.includes('Probe the file'), {
+      conversations: {
+        'p-steps': sync('p-steps', {
+          entries: [user('Hello'), read],
+          turn: { turnId: 't', phase: 'running', startedAt: NOW - 9_000, wait: null },
+        }),
+      },
+      host: engine([request('queued')]),
+    });
+    await waitFor(() => shown().includes(CHAT.pendingQueued));
+    act(() => api!.emitChatHost({ type: 'state', state: engine([request('prefill', [69_300, 121_300])]) }));
+    await waitFor(() => shown().includes(fill(CHAT.pendingReadingOf, { done: '69.3K', total: '121.3K' })));
+    expect(byRole(page!.container, 'meter', CHAT.pendingReadMeter)).not.toBeNull();
+    act(() =>
+      api!.emitChat('p-steps', {
+        type: 'ops',
+        seq: 1,
+        ops: [
+          {
+            op: 'push',
+            entry: { kind: 'tool', ts: NOW + 1, id: 'r2', name: 'probe', title: 'Probe again', status: 'in_progress' },
+          },
+        ],
+      }),
+    );
+    await waitFor(() => shown().includes('Probe again'));
+    expect(page!.container.querySelector('[data-wait-line]')).toBeNull();
+  });
+
+  it('a compaction on the conversation stream takes the wait line, Stop stays, and its end leaves the marker', async () => {
+    await open('/chat?c=p-compact', (text) => text.includes('Probe the file'), {
+      routes: { '/chat/conversations/p-compact/cancel': { cancelled: true } },
+      conversations: {
+        'p-compact': sync('p-compact', {
+          entries: [
+            user('Hello'),
+            {
+              kind: 'tool',
+              ts: NOW - 5_000,
+              id: 'r1',
+              name: 'probe',
+              title: 'Probe the file',
+              status: 'completed',
+              endTs: NOW - 4_000,
+            },
+          ],
+          turn: { turnId: 't', phase: 'running', startedAt: NOW - 9_000, wait: null },
+          compaction: { phase: 'running', startedAt: NOW - 1_000, tokensBefore: 222_822 },
+        }),
+      },
+    });
+    await waitFor(() => page!.container.querySelector('[data-wait-line="fold"]') !== null);
+    expect(page!.container.querySelectorAll('[data-wait-line]')).toHaveLength(1);
+    expect(shown()).toContain(CHAT.compacting);
+    expect(accessibleName(sendFace())).toBe(CHAT.stop);
+    click(sendFace());
+    await waitFor(() => writes().filter((w) => w.path.endsWith('/p-compact/cancel')).length === 1);
+    act(() =>
+      api!.emitChat('p-compact', {
+        type: 'ops',
+        seq: 1,
+        ops: [
+          {
+            op: 'push',
+            entry: { kind: 'compaction', ts: NOW, outcome: 'done', tokensBefore: 222_822, tokensAfter: 31_204 },
+          },
+        ],
+      }),
+    );
+    act(() => api!.emitChat('p-compact', { type: 'compaction', seq: 2, compaction: null }));
+    await waitFor(() => page!.container.querySelector('[data-wait-line="fold"]') === null);
+    expect(page!.container.querySelector('[data-compaction-mark="done"]')?.textContent).toContain(
+      fill(CHAT.compactedTokens, { before: '222.8K', after: '31.2K' }),
+    );
+    expect(page!.container.querySelectorAll('[data-wait-line]')).toHaveLength(1);
   });
 
   it('a select that waits on a model in memory shows the in-memory card, not the load words', async () => {
@@ -955,7 +1092,7 @@ describe('Chat page: Unload', () => {
     const error = vi.spyOn(toast, 'error');
     const busy = host({
       ...RESIDENT,
-      active: [{ conversationId: 'p-other', mode: 'chat', busy: true, waiting: false }],
+      active: [{ conversationId: 'p-other', mode: 'chat', busy: true, waiting: false, background: false }],
     });
     await open('/chat?c=p-unload-busy', (text) => text.includes('Hi there'), {
       routes: {
@@ -1228,11 +1365,12 @@ describe('Chat page: the live stream', () => {
     expect(sendFace().disabled).toBe(false);
   });
 
-  it('starts no interval timer', async () => {
+  it("polls nothing: its one interval is the wait line's 1 s clock, and a tick sends no request", async () => {
     const spy = vi.spyOn(globalThis, 'setInterval');
     await open('/chat?c=p-timer', (text) => text.includes('Hi there'), {
       conversations: { 'p-timer': sync('p-timer') },
     });
+    expect(spy).not.toHaveBeenCalled();
     act(() =>
       api!.emitChat('p-timer', {
         type: 'turn',
@@ -1241,7 +1379,11 @@ describe('Chat page: the live stream', () => {
       }),
     );
     await waitFor(() => accessibleName(sendFace()) === CHAT.stop);
-    expect(spy).not.toHaveBeenCalled();
+    expect(page!.container.querySelector('[data-wait-clock]')).not.toBeNull();
+    expect(spy.mock.calls.map(([, ms]) => ms)).toEqual([1000]);
+    const sent = calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    expect(calls.length).toBe(sent);
   });
 });
 

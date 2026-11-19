@@ -475,6 +475,13 @@ export class ModelRegistry {
     return leases;
   }
 
+  /** Pre-dispatch permits outstanding across every chat binding. */
+  get preDispatchAdmitCount(): number {
+    let admits = 0;
+    for (const binding of this.sessionRegistriesByModel.values()) admits += binding.registry.preDispatchAdmitCount;
+    return admits;
+  }
+
   /** Post-commit persists still retaining a chat binding. */
   get persistRetainCount(): number {
     let retains = 0;

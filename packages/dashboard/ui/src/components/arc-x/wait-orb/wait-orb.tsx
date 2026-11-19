@@ -5,23 +5,32 @@ import { useTheme } from '../../../theme/theme';
 import { motionTokens } from '../../arc/motion-tokens';
 import { motionX } from '../motion/motion';
 import { useStaticMotion } from '../motion/use-static-motion';
-import { ORB_SIZE, orbFrame, TAU, type OrbShape } from './engine';
+import { ORB_SIZE, orbFrame, TAU, type Dot, type OrbShape } from './engine';
+import { foldFrame } from './fold';
 
-export type WaitOrbState = 'hold' | 'load' | 'think';
+export type WaitOrbState = 'hold' | 'load' | 'think' | 'fold';
 
 export interface WaitOrbProps {
-  /** Which wait this is: the turn waits for something else, the engine loads the model, the model works. */
+  /**
+   * Which wait this is: the turn waits for something else, the engine loads the model, the model works, the agent
+   * compacts the conversation.
+   */
   state: WaitOrbState;
   /** Accessible name. Omit when the status text stands next to it (then the orb is aria-hidden). */
   label?: string;
 }
 
 /** `pace` multiplies the clock, `ink` every dot's alpha. */
-const LOOK: Record<WaitOrbState, { shape: OrbShape; pace: number; ink: number }> = {
+const LOOK: Record<WaitOrbState, { shape: OrbShape | 'fold'; pace: number; ink: number }> = {
   hold: { shape: 'ring', pace: motionX.orb.holdPace, ink: 0.7 },
   load: { shape: 'wave', pace: 1, ink: 1 },
   think: { shape: 'band', pace: 1, ink: 1 },
+  fold: { shape: 'fold', pace: 1, ink: 1 },
 };
+
+function dotsOf(shape: OrbShape | 'fold', seconds: number): Dot[] {
+  return shape === 'fold' ? foldFrame(seconds) : orbFrame(shape, seconds);
+}
 
 /**
  * The dotted orb of a wait: its shape says which wait. Decoration; the status is text beside it. One canvas, drawn
@@ -54,7 +63,7 @@ export function WaitOrb({ state, label }: WaitOrbProps): ReactElement {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, ORB_SIZE, ORB_SIZE);
       ctx.fillStyle = ink;
-      for (const dot of orbFrame(look.shape, seconds === null ? motionX.orb.still : seconds * look.pace)) {
+      for (const dot of dotsOf(look.shape, seconds === null ? motionX.orb.still : seconds * look.pace)) {
         ctx.globalAlpha = dot.a * (1 - dot.white) * look.ink * strength;
         ctx.beginPath();
         ctx.arc(dot.x, dot.y, dot.r, 0, TAU);

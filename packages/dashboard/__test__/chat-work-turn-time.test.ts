@@ -1,6 +1,7 @@
 /**
  * How long a turn may run, on the scripted fake agent with a fake clock: a Work turn has no time limit (it ends when
- * the agent ends it, at Stop, or when the engine or the agent is gone); a Chat turn still stops at its cap.
+ * the agent ends it, at Stop, or when the engine or the agent is gone); a Chat turn still stops at its cap, and the
+ * time the agent compacts the conversation is not counted against it.
  */
 
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
@@ -124,6 +125,44 @@ describe('a Chat turn', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(fake.host.modeState().turnsInFlight).toBe(1);
       vi.advanceTimersByTime(1_001);
+      expect((await turn.done).outcome).toBe('turn-timeout');
+    });
+  }, 20_000);
+
+  it('a compaction holds the cap; the cap runs on with the time that was left', async () => {
+    let clock = 1_000_000;
+    const compacting = (scenario: Json): void => {
+      scenario.prompts = [
+        {
+          match: '',
+          steps: [
+            { text: 'Working on it', chunk: 5 },
+            { sleepMs: 300 },
+            { compact: { ms: 1_500 } },
+            { text: ' and done.', chunk: 5 },
+            { sleepMs: 20_000 },
+            { end: { stopReason: 'end_turn' } },
+          ],
+        },
+      ];
+    };
+    await withHost('cancel', { mode: 'chat', mutate: compacting, now: () => clock }, async (fake) => {
+      const advance = (ms: number): void => {
+        clock += ms;
+        vi.advanceTimersByTime(ms);
+      };
+      const { sessionId } = await fake.host.createSession({ modelId: MODEL });
+      const turn = await running(fake, sessionId);
+      advance(CHAT_TURN_MAX_MS - 2_000);
+      await until(() => fake.host.compaction(sessionId) !== null, 5_000);
+      advance(DAY_MS);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(fake.host.modeState().turnsInFlight).toBe(1);
+      await until(() => fake.host.compaction(sessionId) === null, 5_000);
+      advance(1_500);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(fake.host.modeState().turnsInFlight).toBe(1);
+      advance(600);
       expect((await turn.done).outcome).toBe('turn-timeout');
     });
   }, 20_000);

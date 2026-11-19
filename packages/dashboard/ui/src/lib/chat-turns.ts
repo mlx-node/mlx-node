@@ -6,7 +6,7 @@
 import { appEndFor, appEndText, type AppEndContext } from './app-ends';
 import { CHAT, fill } from './chat-strings';
 import type { ChatFailure, ChatHostState, ChatMode, TurnOutcome } from './chat-types';
-import { formatCountNoun, formatDuration, formatNumber, formatTps } from './format';
+import { formatCount, formatCountNoun, formatDuration, formatNumber, formatTps } from './format';
 import type { TranscriptEntry, TurnMetric } from './types';
 import { oneLine, parseWebCall } from './web-tools';
 
@@ -293,6 +293,9 @@ export function loadFor(loading: readonly EngineLoad[], model: string | null): E
   return loading.find((load) => load.modelId === model) ?? loading[0] ?? null;
 }
 
+/** One request the engine holds now: `ChatHostState.requests`. */
+export type EngineRequest = ChatHostState['requests'][number];
+
 export interface PendingInput {
   creating: boolean;
   phase: 'starting' | 'running' | 'cancelling' | null;
@@ -308,28 +311,160 @@ export interface PendingInput {
   full: number | null;
   /** The app sent the automatic `continue` and nothing of its answer came yet. */
   continuing?: boolean;
+  /** The turn has shown work (a thought, a tool row, text): with nothing known the line says "Working…". */
+  work?: boolean;
+  /** What the engine does about this conversation now ({@link engineWait}); null when nothing is known. */
+  engine?: EngineWait | null;
 }
 
-export type PendingRow = { kind: 'label'; text: string; orb: 'hold' | 'think' } | { kind: 'load'; modelId: string };
+export type PendingRow =
+  | { kind: 'label'; text: string; orb: 'hold' | 'think'; progress?: { done: number; total: number } }
+  | { kind: 'load'; modelId: string };
+
+/**
+ * `ours`: a request that named this conversation's agent session. `model`: no request named it, but the model holds a
+ * request that named no session and started in this wait, or requests wait in a queue the engine does not list while
+ * every listed one is known to be another's; the words are then the model's, never this conversation's. `reading` is a
+ * prefill on the model with its counts.
+ */
+export type EngineWait =
+  | { kind: 'ours'; phase: EngineRequest['phase']; done: number | null; total: number | null }
+  | { kind: 'model'; reading: { done: number; total: number } | null };
+
+/** The counts of a prefill that reports them; null for any other phase. */
+function readCounts(
+  phase: EngineRequest['phase'],
+  done: number | null,
+  total: number | null,
+): { done: number; total: number } | null {
+  if (phase !== 'prefill' || done === null || total === null || total <= 0) return null;
+  return { done: Math.min(Math.max(done, 0), total), total };
+}
+
+/**
+ * What the engine does for a conversation: its newest request that named `session`, else the model's state when one of
+ * its requests may be this conversation's (it named no session and started at or after `since`, or `hidden` requests
+ * wait unlisted behind listed ones that are all another's), else null.
+ */
+export function engineWait(input: {
+  requests: readonly EngineRequest[];
+  session: string | null;
+  model: string | null;
+  /** Start of this wait (epoch ms). */
+  since: number | null;
+  /** Requests on the model that wait where the engine lists none ({@link fullLimit}'s `queued`). */
+  hidden: number;
+}): EngineWait | null {
+  if (input.model === null) return null;
+  const onModel = input.requests.filter((request) => request.modelId === input.model);
+  let ours: EngineRequest | null = null;
+  if (input.session !== null)
+    for (const request of onModel)
+      if (request.session === input.session && (ours === null || request.startedAt >= ours.startedAt)) ours = request;
+  if (ours !== null) {
+    return { kind: 'ours', phase: ours.phase, done: ours.prefillDone, total: ours.prefillTotal };
+  }
+  const since = input.since;
+  const mayBeOurs = (request: EngineRequest): boolean =>
+    request.session === null && (since === null || request.startedAt >= since);
+  const unknown = since !== null && onModel.some(mayBeOurs);
+  const queuedBehind = input.hidden > 0 && onModel.length > 0 && !onModel.some(mayBeOurs);
+  if (!unknown && !queuedBehind) return null;
+  let reading: { done: number; total: number } | null = null;
+  for (const request of onModel) reading ??= readCounts(request.phase, request.prefillDone, request.prefillTotal);
+  return { kind: 'model', reading };
+}
 
 /** What the pending row shows, first match wins. */
 export function pendingRow(input: PendingInput): PendingRow {
   const label = (text: string, orb: 'hold' | 'think' = 'hold'): PendingRow => ({ kind: 'label', text, orb });
+  const queued = (): PendingRow | null =>
+    input.full !== null && input.model !== null
+      ? label(
+          input.full === 1
+            ? fill(CHAT.pendingQueuedOne, { model: input.model })
+            : fill(CHAT.pendingQueuedMany, { model: input.model, n: String(input.full) }),
+        )
+      : null;
+  const reading = (text: string, counts: { done: number; total: number }, orb: 'hold' | 'think'): PendingRow => ({
+    kind: 'label',
+    text: fill(text, { done: formatCount(counts.done), total: formatCount(counts.total) }),
+    orb,
+    progress: counts,
+  });
+  const engine = input.phase === 'running' ? (input.engine ?? null) : null;
   if (input.creating) return label(CHAT.pendingStarting);
   if (input.phase === 'cancelling') return label(CHAT.pendingStopping);
+  if (engine?.kind === 'ours') {
+    if (engine.phase === 'queued' || engine.phase === 'slot') return queued() ?? label(CHAT.pendingQueued);
+    if (engine.phase === 'prepare' || engine.phase === 'prefill') {
+      const counts = readCounts(engine.phase, engine.done, engine.total);
+      return counts === null ? label(CHAT.pendingReading, 'think') : reading(CHAT.pendingReadingOf, counts, 'think');
+    }
+    return label(CHAT.pendingThinking, 'think');
+  }
   if (input.wait === 'model' && input.model !== null) return { kind: 'load', modelId: input.model };
   if (input.phase === 'running' && input.loading !== null) return { kind: 'load', modelId: input.loading.modelId };
   if (input.phase === 'starting') return label(CHAT.pendingStarting);
   if (input.inference === 'starting') return label(CHAT.pendingEngine);
-  if (input.phase === 'running' && input.full !== null && input.model !== null)
-    return label(
-      input.full === 1
-        ? fill(CHAT.pendingQueuedOne, { model: input.model })
-        : fill(CHAT.pendingQueuedMany, { model: input.model, n: String(input.full) }),
-    );
+  if (input.phase === 'running') {
+    const full = queued();
+    if (full !== null) return full;
+  }
+  if (engine?.kind === 'model')
+    return engine.reading === null ? label(CHAT.pendingBusy) : reading(CHAT.pendingBusyReading, engine.reading, 'hold');
   if (input.phase === 'running' && input.continuing === true) return label(CHAT.pendingContinuing, 'think');
   if (input.quiet) return label(CHAT.pendingWaiting);
-  return label(CHAT.pendingThinking, 'think');
+  return input.work === true ? label(CHAT.pendingWorking, 'think') : label(CHAT.pendingThinking, 'think');
+}
+
+/** The quieter words of the compaction line: the summary request reads the conversation, then writes. */
+export interface CompactionDetail {
+  text: string;
+  progress?: { done: number; total: number };
+}
+
+/**
+ * What the conversation's newest request since the compaction started (`since`) does: its prompt read with counts, or
+ * its writing with the tokens so far; null when no such request is listed or its phase says nothing.
+ */
+export function compactionDetail(input: {
+  requests: readonly EngineRequest[];
+  session: string | null;
+  since: number;
+}): CompactionDetail | null {
+  let ours: EngineRequest | null = null;
+  for (const request of input.requests)
+    if (
+      input.session !== null &&
+      request.session === input.session &&
+      request.startedAt >= input.since &&
+      (ours === null || request.startedAt >= ours.startedAt)
+    )
+      ours = request;
+  if (ours === null) return null;
+  const counts = readCounts(ours.phase, ours.prefillDone, ours.prefillTotal);
+  if (counts !== null)
+    return {
+      text: fill(CHAT.compactingReading, { done: formatCount(counts.done), total: formatCount(counts.total) }),
+      progress: counts,
+    };
+  if (ours.phase !== 'decode') return null;
+  return ours.generated === null || ours.generated <= 0
+    ? { text: CHAT.compactingWriting }
+    : { text: fill(CHAT.compactingWritingOf, { n: formatCount(ours.generated) }) };
+}
+
+/**
+ * The words of a compaction marker; the counts only when the agent sent both and `after` is at least 1% below
+ * `before` (an agent that reports the count from before the summary sends about the same number twice).
+ */
+export function compactionText(entry: Extract<TranscriptEntry, { kind: 'compaction' }>): string {
+  if (entry.outcome === 'stopped') return CHAT.compactStopped;
+  if (entry.outcome === 'failed') return entry.retry === true ? CHAT.compactFailedRetry : CHAT.compactFailed;
+  const { tokensBefore: before, tokensAfter: after } = entry;
+  if (before === undefined || after === undefined || after * 100 > before * 99) return CHAT.compacted;
+  return fill(CHAT.compactedTokens, { before: formatCount(before), after: formatCount(after) });
 }
 
 /** The time of a thought, from its first to its last live chunk; null for a thought read from disk. */

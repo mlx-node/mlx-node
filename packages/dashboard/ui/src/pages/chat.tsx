@@ -27,7 +27,12 @@ import {
 import { useNavigate, useSearchParams } from 'react-router-dom';
 
 import { ChatFrame, JumpButton, useChatDocked } from '../components/arc-x/chat-frame/chat-frame';
-import { Composer, type ComposerNotice, type ComposerPhase } from '../components/arc-x/composer/composer';
+import {
+  Composer,
+  type ComposerNotice,
+  type ComposerPhase,
+  type ContextUse,
+} from '../components/arc-x/composer/composer';
 import { ConfirmDialog } from '../components/arc-x/confirm-dialog/confirm-dialog';
 import type { ConversationItem } from '../components/arc-x/conversation-list/conversation-list';
 import { InteractionPresence } from '../components/arc-x/interaction-card/interaction-card';
@@ -344,7 +349,13 @@ export default function Chat(): ReactElement {
       null,
     [host],
   );
-  const otherRunning = host?.active.some((entry) => entry.busy && entry.conversationId !== conversationId) === true;
+  const otherRunning =
+    host?.active.some((entry) => (entry.busy || entry.background) && entry.conversationId !== conversationId) === true;
+  // A live workflow run holds the conversation's model and folder: no model change, no delete until it ends.
+  const runLive =
+    !isNew &&
+    ((conv?.runs.length ?? 0) > 0 ||
+      host?.active.some((entry) => entry.conversationId === conversationId && entry.background) === true);
   const residentSize = residentId === null ? null : modelSize(residentId);
   const memory =
     residentId === null
@@ -357,6 +368,13 @@ export default function Chat(): ReactElement {
           action: <UnloadButton control={unload.control(residentId)} />,
         };
   const threadModel = conv?.conversation.modelId ?? modelValue;
+  const contextUsed = conv?.contextUsed ?? null;
+  const contextWindow =
+    conv === null
+      ? null
+      : (host?.models.find((model) => model.id === conv.conversation.modelId)?.contextTokens ?? null);
+  const context: ContextUse | undefined =
+    contextUsed === null || contextWindow === null ? undefined : { used: contextUsed, window: contextWindow };
   const threadUnload = useMemo(
     () => (threadModel === null ? undefined : unloadControl(threadModel)),
     [threadModel, unloadControl],
@@ -522,6 +540,13 @@ export default function Chat(): ReactElement {
       toast.error(CHAT.sendErrors.other[0]);
     });
   }, [conversationId, turn]);
+  const stopRun = useCallback(
+    async (runId: string): Promise<void> => {
+      if (conversationId === null) return;
+      await mutate('POST', `${conversationPath(conversationId)}/runs/${encodeURIComponent(runId)}/stop`);
+    },
+    [conversationId],
+  );
 
   const runAction = (action: BlockAction): void => {
     setStripError(null);
@@ -1039,6 +1064,19 @@ export default function Chat(): ReactElement {
   useCommands(permissionCommands);
 
   const position = { index: 1, count: openCards.length };
+  // A run's helper asks: its run card says so. Its card does not count as the typed turn waiting for the person.
+  const interactions = conv?.interactions;
+  const runAsks = useMemo(() => {
+    const map = new Map<string, string>();
+    if (mode !== 'work' || interactions === undefined) return map;
+    for (const item of interactions) {
+      if (closedCards.has(item.id) || item.kind !== 'permission') continue;
+      const from = item.from;
+      if (from !== undefined && from.run !== null && !map.has(from.run)) map.set(from.run, from.label);
+    }
+    return map;
+  }, [mode, interactions, closedCards]);
+  const turnAsks = card !== undefined && (card.kind !== 'permission' || card.from?.run == null);
   const cardNode =
     mode === 'work' ? (
       <InteractionPresence>
@@ -1167,6 +1205,7 @@ export default function Chat(): ReactElement {
                 loading: host.loading,
                 resident: unload.resident,
                 answers: host.answers,
+                requests: host.requests,
                 appEnds: host.appEnds,
               }
         }
@@ -1185,7 +1224,12 @@ export default function Chat(): ReactElement {
         folder={openFolder}
         tempRoot={permissionTemp}
         card={cardNode}
+        asking={turnAsks}
         marks={permissionMarks}
+        compaction={conv?.compaction ?? null}
+        runs={conv?.runs}
+        runAsks={runAsks}
+        onStopRun={stopRun}
       />
     );
   }
@@ -1215,8 +1259,8 @@ export default function Chat(): ReactElement {
           bases={bases}
           fallback={startsOn}
           onValueChange={(id) => void changeModel(id)}
-          disabled={!isNew && busy}
-          disabledReason={!isNew && busy ? CHAT.modelBusy : undefined}
+          disabled={!isNew && (busy || runLive)}
+          disabledReason={!isNew && busy ? CHAT.modelBusy : runLive ? CHAT.modelBusyRun : undefined}
           working={modelWorking}
           crowded={mode === 'work'}
           footer={
@@ -1267,7 +1311,7 @@ export default function Chat(): ReactElement {
             title={title}
             open={
               removeContent !== null && conversationId !== null
-                ? { id: conversationId, running: busy, remove: removeContent }
+                ? { id: conversationId, running: busy, runLive, remove: removeContent }
                 : null
             }
             onRename={() => {
@@ -1343,8 +1387,7 @@ export default function Chat(): ReactElement {
               blocked={blocked}
               notice={strip === null ? undefined : toNotice(strip)}
               tools={tools}
-              hint={running ? CHAT.hintStop : CHAT.hintSend}
-              hintOnFocus={running}
+              context={context}
               textareaRef={composerRef}
             />
           </div>

@@ -15,7 +15,6 @@ import { agentConfigDir } from '@mlx-node/agent/paths';
 import { ggufSplitPartNames, parseGgufFileName } from '@mlx-node/lm/model-discovery';
 
 import { AgentSessionsReader } from '../agent-sessions/reader.js';
-import type { UpdateLine } from '../agent-sessions/transcript.js';
 import type { SessionDetailResponse } from '../agent-sessions/types.js';
 import { deleteSession, renameSession, SessionWriteError, validateRenameTitle } from '../agent-sessions/writes.js';
 import { ApiError } from '../api/errors.js';
@@ -36,9 +35,10 @@ import { safeReader } from './agent/endpoint.js';
 import { ALLOW_ONCE_OPTION_ID, chatPrompt, REJECT_ONCE_OPTION_ID } from './agent/profiles.js';
 import { tempRoots, type AllowedRoot } from './agent/roots.js';
 import { UNLOAD_MAX_MS, unloadModels } from './agent/select-model.js';
-import { Conversation, type ConversationSink } from './conversation.js';
+import { Conversation, type ConversationSink, type HostView } from './conversation.js';
 import { PermissionDraft } from './draft-mode.js';
 import { readWorkIndexSync, writeWorkIndex, type WorkIndex } from './index-file.js';
+import { readModelWindowsSync, writeModelWindows } from './model-windows.js';
 import { removeChatPromptHistory, type ChatPaths } from './paths.js';
 import {
   changedSettings,
@@ -89,6 +89,16 @@ export const NEEDLES_WAIT_MS = 10_000;
 const MODE_RANK: Readonly<Record<PermissionMode, number>> = { ask: 0, auto: 1, bypass: 2 };
 
 type AllowedMark = Extract<PermissionMark, { kind: 'allowed' }>;
+
+/** What the host holds live for a conversation, for a page's `sync`. */
+function hostView(host: AgentHost, id: string): HostView {
+  return {
+    turn: host.turnState(id),
+    interactions: host.openInteractions(id),
+    compaction: host.compaction(id),
+    runs: host.runs(id),
+  };
+}
 
 /** A temp root as people type it: its last spelling. */
 function typedTop(root: AllowedRoot | undefined): string | null {
@@ -190,6 +200,9 @@ export class ChatService {
   /** Sizes on disk by model path, for the engine process `sizesPid`: another process may see other files. */
   private readonly sizes = new Map<string, Promise<number | null>>();
   private sizesPid: number | null = null;
+  /** The window per model from the last list an agent process gave; on disk, as no agent runs after an idle stop. */
+  private readonly windows: Map<string, number>;
+  private windowsWrite: Promise<void> = Promise.resolve();
   /** The last unload: a heartbeat of that engine written before `at` still names the models it dropped. */
   private unloaded: { pid: number; names: ReadonlySet<string>; at: number } | null = null;
   private closed = false;
@@ -212,11 +225,10 @@ export class ChatService {
   private readonly workHome: string;
   /** Read once at start; a failed read is no ends. */
   private readonly appEnds: Promise<readonly AppEnd[]>;
-  /** Conversations whose agent works with no typed turn running (a woken turn, or work between turns). */
-  private readonly woken = new Set<string>();
 
   constructor(options: ChatServiceOptions) {
     this.opts = options;
+    this.windows = readModelWindowsSync(options.paths.modelWindows);
     this.appEnds = (options.appEnds ?? Promise.resolve([])).catch(() => []);
     this.now = options.now ?? Date.now;
     this.readEndpoint = safeReader(options.readEndpoint);
@@ -233,13 +245,13 @@ export class ChatService {
           if (conversation.listeners === 0) continue;
           const host = this.hosts[conversation.info.mode];
           const id = conversation.info.id;
-          conversation.resync({ turn: host.turnState(id), interactions: host.openInteractions(id) });
+          conversation.resync(hostView(host, id));
         }
       },
       applyPending: () =>
         (['chat', 'work'] as const).some((mode) => {
           const state = this.hosts[mode].modeState();
-          return state.stale && state.turnsInFlight > 0;
+          return state.stale && (state.turnsInFlight > 0 || state.background > 0);
         }),
     });
     const skillsDir = options.skillsDir ?? defaultSkillsDir();
@@ -313,13 +325,15 @@ export class ChatService {
     return this.computeState();
   }
 
-  /** The conversations with a turn running, both modes, woken turns included. Synchronous: no worker, no fs. */
+  /**
+   * The conversations with a turn running, both modes, wake turns and workflow runs included. Synchronous: no worker,
+   * no fs.
+   */
   busyConversations(): string[] {
     const out = new Set<string>();
     for (const mode of ['chat', 'work'] as const) {
-      for (const a of this.hosts[mode].active()) if (a.busy) out.add(a.sessionId);
+      for (const a of this.hosts[mode].active()) if (a.busy || a.background) out.add(a.sessionId);
     }
-    for (const id of this.woken) out.add(id);
     return [...out];
   }
 
@@ -327,9 +341,8 @@ export class ChatService {
   closingConversations(): string[] {
     const out = new Set<string>();
     for (const mode of ['chat', 'work'] as const) {
-      for (const a of this.hosts[mode].active()) if (a.busy && !a.stopping) out.add(a.sessionId);
+      for (const a of this.hosts[mode].active()) if ((a.busy && !a.stopping) || a.background) out.add(a.sessionId);
     }
-    for (const id of this.woken) out.add(id);
     return [...out];
   }
 
@@ -523,6 +536,15 @@ export class ChatService {
   async cancel(id: string): Promise<{ cancelled: boolean }> {
     const conversation = await this.known(id);
     return { cancelled: this.hosts[conversation.info.mode].cancel(id) };
+  }
+
+  /** Work: the user's Stop of one workflow run. */
+  async stopRun(id: string, runId: string): Promise<Record<string, never>> {
+    const conversation = await this.known(id);
+    if (conversation.info.mode !== 'work' || !(await this.hosts.work.stopRun(id, runId))) {
+      throw ApiError.notFound('No such run.');
+    }
+    return {};
   }
 
   async answer(id: string, interactionId: string, input: InteractionAnswerInput): Promise<Record<string, never>> {
@@ -902,6 +924,8 @@ export class ChatService {
     const host = this.hosts[mode];
     await host.settled();
     if (host.isBusy(id) || this.deleting.has(id)) throw chatRouteError('conversation-busy');
+    // A workflow run's helpers use the conversation's model: a change waits for the run.
+    if (!('title' in input) && host.isWorking(id)) throw chatRouteError('conversation-busy');
     if ('title' in input) {
       const title = validateRenameTitle(input.title);
       if (host.isHot(id)) await host.rename(id, title);
@@ -932,7 +956,7 @@ export class ChatService {
     if (conversation.info.mode === 'work') return this.deleteWork(conversation);
     const host = this.hosts.chat;
     await host.settled();
-    if (host.isBusy(id) || this.deleting.has(id)) throw chatRouteError('conversation-busy');
+    if (host.isWorking(id) || this.deleting.has(id)) throw chatRouteError('conversation-busy');
     this.deleting.add(id);
     try {
       if (host.isHot(id) || (await this.agentCanStart(host))) await host.deleteSession(id, '');
@@ -949,14 +973,17 @@ export class ChatService {
 
   /**
    * Frees the engine's memory: the resident chat model is unloaded, and it loads again on the next message. Refused
-   * while an answer runs in Chat or Work or the engine loads a model.
+   * while an answer, a wake turn or a workflow run is live in Chat or Work, or the engine loads a model.
    */
   async unloadModels(): Promise<{ unloaded: string[] }> {
     this.assertOpen();
     const endpoint = await this.endpoint();
     if (endpoint === null) throw chatRouteError('inference-stopped');
     const loading = await this.engineLoading(endpoint.pid);
-    const turns = this.hosts.chat.modeState().turnsInFlight + this.hosts.work.modeState().turnsInFlight;
+    const turns = (['chat', 'work'] as const).reduce((n, mode) => {
+      const state = this.hosts[mode].modeState();
+      return n + state.turnsInFlight + state.background;
+    }, 0);
     if (loading.length > 0 || turns > 0) throw chatRouteError('engine-busy');
     const answer = await unloadModels(endpoint, { maxMs: this.opts.unloadMaxMs ?? UNLOAD_MAX_MS });
     if (answer === 'busy') throw chatRouteError('engine-busy');
@@ -993,7 +1020,7 @@ export class ChatService {
     const id = conversation.info.id;
     const host = this.hosts.work;
     await host.settled();
-    if (host.isBusy(id) || this.deleting.has(id)) throw chatRouteError('conversation-busy');
+    if (host.isWorking(id) || this.deleting.has(id)) throw chatRouteError('conversation-busy');
     this.deleting.add(id);
     try {
       await host.deleteSession(id, conversation.info.cwd ?? '');
@@ -1070,10 +1097,7 @@ export class ChatService {
       }
       const host = this.hosts[conversation.info.mode];
       conversation.info = { ...conversation.info, hot: host.isHot(id) };
-      pending.detach = conversation.attach(send, {
-        turn: host.turnState(id),
-        interactions: host.openInteractions(id),
-      });
+      pending.detach = conversation.attach(send, hostView(host, id));
     };
     void attach();
     return () => {
@@ -1103,6 +1127,7 @@ export class ChatService {
     await Promise.all([this.hosts.chat.close(), this.hosts.work.close()]);
     for (const conversation of this.conversations.values()) conversation.flush();
     this.hostSinks.clear();
+    await this.windowsWrite;
   }
 
   // ── internals ────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -1241,7 +1266,7 @@ export class ChatService {
     const existing = this.conversations.get(id);
     if (existing !== undefined) return existing;
     const conversation = this.newConversation(infoOf(detail, origin, this.hosts[origin].isHot(id)));
-    conversation.seed(detail.transcript, detail.turns, detail.transcriptError ?? null);
+    conversation.seed(detail.transcript, detail.turns, detail.transcriptError ?? null, detail.contextUsed ?? null);
     await this.loadMarks(conversation);
     const raced = this.conversations.get(id);
     if (raced !== undefined) return raced;
@@ -1257,7 +1282,7 @@ export class ChatService {
       return;
     }
     conversation.info = { ...conversation.info, title: agentTitle(detail.session.title) || conversation.info.title };
-    conversation.seed(detail.transcript, detail.turns, detail.transcriptError ?? null);
+    conversation.seed(detail.transcript, detail.turns, detail.transcriptError ?? null, detail.contextUsed ?? null);
   }
 
   private startTurn(conversation: Conversation, text: string, cwd?: string): { turnId: string } {
@@ -1291,11 +1316,11 @@ export class ChatService {
       return c?.info.mode === mode ? c : undefined;
     };
     return {
-      onState: () => this.scheduleState(),
-      onUpdate: (id, line) => {
-        conv(id)?.applyLine(line);
-        this.trackWake(mode, id, line);
+      onState: () => {
+        this.rememberWindows(this.hosts[mode].models());
+        this.scheduleState();
       },
+      onUpdate: (id, line) => conv(id)?.applyLine(line),
       onTitle: (id, title) => {
         const c = conv(id);
         const named = resolveTitle(title, null);
@@ -1304,13 +1329,23 @@ export class ChatService {
         this.emitHost({ type: 'conversations-changed' });
       },
       onModel: (id, modelId) => conv(id)?.setInfo({ modelId }),
+      onCompaction: (id, compaction) => conv(id)?.compactionChanged(compaction),
       onAutoContinue: (id) => conv(id)?.userPrompt(CONTINUE_PROMPT),
       onTurn: (id, turn) => {
-        if (turn !== null) this.woken.delete(id);
+        if (turn?.origin === 'wake') {
+          this.updateLive();
+          this.busyChanged();
+        }
         const c = conv(id);
         if (c === undefined || turn === null) return;
         if (turn.phase === 'running' && !c.info.hot && this.hosts[mode].isHot(id)) c.setInfo({ hot: true });
         c.turnChanged(turn);
+      },
+      onRuns: (id, runs) => {
+        conv(id)?.runsChanged(runs);
+        this.updateLive();
+        this.scheduleState();
+        this.busyChanged();
       },
       onTurnEnd: (id, result: TurnResult) => {
         const c = conv(id);
@@ -1337,13 +1372,10 @@ export class ChatService {
       onModeMarked: (id, mark) => this.modeMarked(id, mark),
       onModeWithdrawn: (id, mark) => this.modeWithdrawn(id, mark),
       onCold: (ids) => {
-        let woke = false;
         for (const id of ids) {
-          if (this.woken.delete(id)) woke = true;
           const c = conv(id);
           if (c !== undefined) void this.goCold(c);
         }
-        if (woke) this.busyChanged();
       },
     };
   }
@@ -1363,11 +1395,9 @@ export class ChatService {
     if (host.isHot(id)) return;
     // A prompt sent during the read is in the base and not on disk yet: a reseed would drop it.
     const reseed = detail !== null && !host.isBusy(id) && conversation.baseVersion === version;
-    if (reseed) conversation.seed(detail.transcript, detail.turns, detail.transcriptError ?? null);
-    conversation.resync({
-      turn: host.turnState(conversation.info.id),
-      interactions: host.openInteractions(conversation.info.id),
-    });
+    if (reseed)
+      conversation.seed(detail.transcript, detail.turns, detail.transcriptError ?? null, detail.contextUsed ?? null);
+    conversation.resync(hostView(host, id));
   }
 
   private installDone(result: 'idle' | 'failed'): void {
@@ -1375,14 +1405,16 @@ export class ChatService {
     this.scheduleState();
   }
 
-  /** The live watcher is open while a turn runs or a host stream is attached. */
+  /** The live watcher (it feeds the endpoint check) is open while a turn, wake or run is live, or a host stream is attached. */
   private updateLive(): void {
     const live = this.opts.live;
     if (live === undefined || this.closed) return;
     const wanted =
       this.hostSinks.size > 0 ||
-      this.hosts.chat.modeState().turnsInFlight > 0 ||
-      this.hosts.work.modeState().turnsInFlight > 0;
+      (['chat', 'work'] as const).some((mode) => {
+        const state = this.hosts[mode].modeState();
+        return state.turnsInFlight > 0 || state.background > 0;
+      });
     if (wanted && this.liveOff === null) {
       this.liveOff = live.subscribe((event) => {
         if (event.type === 'runtime') this.onRuntimeEvent();
@@ -1393,28 +1425,33 @@ export class ChatService {
     }
   }
 
-  /**
-   * A content update with no typed prompt open starts a woken turn; the agent's `turn_completed` ends it. A wake that
-   * follows the typed turn's reply in one stdout chunk counts although the typed turn has not cleared yet.
-   */
-  private trackWake(mode: ChatMode, id: string, line: UpdateLine): void {
-    if (this.hosts[mode].promptOpen(id)) return;
-    const kind = line.update.sessionUpdate;
-    if (line.xai) {
-      if (kind === 'turn_completed' && this.woken.delete(id)) this.busyChanged();
-      return;
-    }
-    if (typeof kind !== 'string' || !WAKE_KINDS.has(kind) || this.woken.has(id)) return;
-    this.woken.add(id);
-    this.busyChanged();
-  }
-
   private busyChanged(): void {
     try {
       this.opts.onBusyChange?.();
     } catch {
       // A notice to MAIN never changes a turn.
     }
+  }
+
+  /** A running agent's list replaces each listed model's window (a null drops it); other models keep theirs. */
+  private rememberWindows(models: ReturnType<AgentHost['models']>): void {
+    if (models === null) return;
+    let changed = false;
+    for (const { modelId, contextTokens } of models) {
+      if (contextTokens === null ? !this.windows.has(modelId) : this.windows.get(modelId) === contextTokens) continue;
+      if (contextTokens === null) this.windows.delete(modelId);
+      else this.windows.set(modelId, contextTokens);
+      changed = true;
+    }
+    if (!changed) return;
+    const path = this.opts.paths.modelWindows;
+    const root = this.opts.paths.root;
+    this.windowsWrite = this.windowsWrite
+      .then(async () => {
+        await mkdir(root, { recursive: true, mode: 0o700 });
+        await writeModelWindows(path, this.windows);
+      })
+      .catch(() => {});
   }
 
   private emitHost(event: ChatHostEvent): void {
@@ -1469,7 +1506,6 @@ export class ChatService {
         : supervisor === 'starting' || supervisor === 'restarting'
           ? 'starting'
           : 'stopped';
-    const known = this.hosts.chat.models() ?? this.hosts.work.models() ?? [];
     const served = endpoint?.models ?? [];
     if (endpoint !== null && endpoint.pid !== this.sizesPid) {
       this.sizes.clear();
@@ -1481,7 +1517,7 @@ export class ChatService {
       base: m.base,
       variant: m.variant,
       format: m.format,
-      contextTokens: known.find((k) => k.modelId === m.name)?.contextTokens ?? null,
+      contextTokens: this.windows.get(m.name) ?? null,
       sizeBytes: sizes[index]!,
     }));
     const inMemory = new Map<string, RuntimeLiveModel>();
@@ -1510,12 +1546,24 @@ export class ChatService {
         lastStart,
       });
     }
+    const requests: ChatHostState['requests'] = running
+      .flatMap((p) => p.turns)
+      .sort((a, b) => a.startedAt - b.startedAt)
+      .map((turn) => ({
+        session: turn.clientSession,
+        modelId: turn.model,
+        phase: turn.phase,
+        startedAt: turn.startedAt,
+        prefillDone: turn.prefillDone,
+        prefillTotal: turn.prefillTotal,
+        generated: turn.generatedTokens,
+      }));
     const agent = this.agentState();
     const appEnds = [...(await this.appEnds)];
     const active: ChatHostState['active'] = [];
     for (const mode of ['chat', 'work'] as const) {
       for (const a of this.hosts[mode].active()) {
-        active.push({ conversationId: a.sessionId, mode, busy: a.busy, waiting: a.waiting });
+        active.push({ conversationId: a.sessionId, mode, busy: a.busy, waiting: a.waiting, background: a.background });
       }
     }
     return {
@@ -1529,6 +1577,7 @@ export class ChatService {
       })),
       resident,
       answers,
+      requests,
       models,
       defaultModelId: resident[0]?.modelId ?? models[0]?.id ?? null,
       agent,
@@ -1598,16 +1647,6 @@ async function pathSize(path: string, depth: number): Promise<number> {
   for (const name of await readdir(path)) total += await pathSize(join(path, name), depth + 1);
   return total;
 }
-
-/** Update kinds that mean the agent is working. */
-const WAKE_KINDS: ReadonlySet<string> = new Set([
-  'user_message_chunk',
-  'agent_message_chunk',
-  'agent_thought_chunk',
-  'tool_call',
-  'tool_call_update',
-  'plan',
-]);
 
 function infoOf(detail: SessionDetailResponse, mode: ChatMode, hot: boolean): ConversationInfo {
   const s = detail.session;

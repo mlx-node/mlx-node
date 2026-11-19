@@ -101,6 +101,18 @@ export interface TurnState {
   wait: 'model' | null;
   /** Work: automatic continues sent after a length stop in this turn; absent while none was sent. */
   continues?: number;
+  /** Work: the agent started this turn itself (a wake after a workflow run); no prompt was typed. */
+  origin?: 'wake';
+}
+
+/**
+ * The agent summarizes older messages of this conversation now (from its `auto_compact_started` until the end update,
+ * the turn's end or the agent's exit). `startedAt` is the app's clock; `tokensBefore` the context the agent counted.
+ */
+export interface CompactionState {
+  phase: 'running';
+  startedAt: number;
+  tokensBefore?: number;
 }
 
 export interface PermissionInteraction {
@@ -135,6 +147,11 @@ export interface PermissionInteraction {
    * when the cause names no part; `more`: other simple commands that ask too.
    */
   autoAskDetail?: { part: string; more: number; cause: AutoAskCause | 'redirect' | null };
+  /**
+   * Work: a helper agent asks, not the conversation's own turn. `run`: the workflow run's name, null for a helper the
+   * turn started; `cwd`: the helper's folder when it is not the Work folder.
+   */
+  from?: { label: string; run: string | null; cwd: string | null };
 }
 export interface PlanInteraction {
   id: string;
@@ -228,7 +245,15 @@ export type TranscriptOp =
   | { op: 'text'; index: number; append: string; endTs?: number }
   /** Whole-entry replace: tool, plan, subagent. */
   | { op: 'set'; index: number; entry: TranscriptEntry }
-  | { op: 'metric'; metric: TurnMetric };
+  | { op: 'metric'; metric: TurnMetric }
+  /** The conversation's current context in tokens: the agent's `_meta.totalTokens`. */
+  | { op: 'context'; used: number };
+
+/** A workflow run the agent still holds as `active`; `stopping`: Stop run was sent and the run has not ended. */
+export interface RunView {
+  runId: string;
+  stopping: boolean;
+}
 
 /** How a turn ended: the `turn` event with `turn: null` carries it, and `sync` repeats the last one (memory only). */
 export interface TurnEnd {
@@ -253,6 +278,12 @@ export type ConversationEvent =
       lastEnd?: TurnEnd;
       /** Every permission mark of the conversation; card text for the newest 200 only. */
       permissionMarks: PermissionMark[];
+      /** The conversation's current context in tokens; absent while no agent update carried it. */
+      contextUsed?: number;
+      /** A compaction runs now; absent when none does. */
+      compaction?: CompactionState;
+      /** Work: the conversation's live workflow runs. */
+      runs: RunView[];
     }
   | { type: 'ops'; seq: number; ops: TranscriptOp[] }
   | { type: 'notice'; seq: number; notice: ConversationNotice }
@@ -266,6 +297,10 @@ export type ConversationEvent =
       failure?: ChatFailure;
       unsent?: true;
     }
+  /** A compaction started (the state) or ended (null). */
+  | { type: 'compaction'; seq: number; compaction: CompactionState | null }
+  /** Work: the live workflow runs changed; the whole list. */
+  | { type: 'runs'; seq: number; runs: RunView[] }
   | { type: 'interaction'; seq: number; interaction: Interaction }
   | { type: 'interaction-closed'; seq: number; id: string; reason: 'answered' | 'cancelled' | 'expired' }
   | { type: 'conversation'; seq: number; conversation: ConversationInfo }
@@ -278,6 +313,8 @@ export interface AgentModeState {
   failure: ChatFailure | null;
   agentVersion: string | null;
   turnsInFlight: number;
+  /** Sessions with a live workflow run or a wake turn. */
+  background: number;
 }
 export interface ChatHostState {
   inference: 'ready' | 'starting' | 'loading' | 'stopped';
@@ -306,9 +343,24 @@ export interface ChatHostState {
     lastStart: number | null;
   }>;
   /**
+   * The requests the engine holds now, oldest first: `modelId` is the name the request asked for, `session` the agent
+   * session it named (null when it named none or the engine is older), `phase`, the prefill counts and the tokens
+   * generated so far as the In flight panel shows them.
+   */
+  requests: Array<{
+    session: string | null;
+    modelId: string;
+    phase: 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode' | null;
+    startedAt: number;
+    prefillDone: number | null;
+    prefillTotal: number | null;
+    generated: number | null;
+  }>;
+  /**
    * The chat models the engine serves. `base` groups the builds of one model (equal strings, letter for letter);
    * `variant` names the build, unique inside its base; `sizeBytes` is the size on disk (every part of a split GGUF), null
-   * when unknown; `contextTokens` is the window the agent process listed for the model, null before it runs.
+   * when unknown; `contextTokens` is the window an agent process last listed for the model (kept on disk, so known
+   * while no agent runs), null before any agent listed one.
    */
   models: Array<{
     id: string;
@@ -336,8 +388,8 @@ export interface ChatHostState {
     fetch: ProviderId | null;
     applyPending: boolean;
   };
-  /** `waiting`: an interaction is open. */
-  active: Array<{ conversationId: string; mode: ChatMode; busy: boolean; waiting: boolean }>;
+  /** `waiting`: an interaction is open. `background`: a workflow run or a wake turn is live. */
+  active: Array<{ conversationId: string; mode: ChatMode; busy: boolean; waiting: boolean; background: boolean }>;
   /** The Work conversations not in Ask, with their mode (the list has no other source). */
   permissionRaised: Array<{ id: string; mode: 'auto' | 'bypass' }>;
   /** The mode picked on the New Work screen for the draft `draft`, before its conversation exists. */

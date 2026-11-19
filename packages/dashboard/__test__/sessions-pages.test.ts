@@ -43,6 +43,7 @@ import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
 import type { ApiCall } from '../src/runtime.js';
 import { connectDashboardApi, disconnectDashboardApi } from '../ui/src/lib/api.js';
+import { finishedRun, workflowRun } from './helpers/chat-thread-fixtures.js';
 import { cssRules, cssValue } from './helpers/css-rules.js';
 import { HIDDEN_TEXT, wokenParentText, wokenTimeline } from './helpers/woken-turn.js';
 import { allByRole, byLabel, byRole, chartTable, renderPage, type RenderedPage, statValue, waitFor } from './render.js';
@@ -1522,6 +1523,34 @@ describe('Session detail page: a woken turn', () => {
     const woken: TranscriptEntry[] = [...base, { kind: 'wake', ts, cause: 'workflow', text: 'Go on' }];
     await mountDetail(PARENT_ID, routes(woken), 'Per turn', '?tab=activity');
     await waitFor(() => byRole(mounted!.container, 'region', 'Turn 2 · in progress') !== null);
+  });
+
+  it('the transcript draws each workflow run as a read-only card: the agent words, the report, no Stop run', async () => {
+    const ts = Date.UTC(2026, 9, 20, 10);
+    const transcript: TranscriptEntry[] = [
+      { kind: 'user', ts, text: 'Research the lanes', promptIndex: 0 },
+      workflowRun({ ts: ts + 1_000, updatedTs: ts + 2_000 }),
+      finishedRun({ ts: ts + 1_500, updatedTs: ts + 9_000, runId: 'wf_02', name: 'verify-claims' }),
+      { kind: 'assistant', ts: ts + 3_000, text: 'Started two runs.' },
+      { kind: 'turn-end', ts: ts + 4_000, stopReason: 'end_turn', elapsedMs: 4_000 },
+    ];
+    await mountDetail(
+      PARENT_ID,
+      { [`GET /sessions/${PARENT_ID}`]: { body: { ...detailBody({}, transcript), turns: [turn({})] } } },
+      'Started two runs.',
+      '?tab=transcript',
+    );
+    const card = (id: string): HTMLElement =>
+      mounted!.container.querySelector<HTMLElement>(`[data-run="${id}"]`)!.closest('section')!;
+    const running = card('wf_01');
+    expect(running.querySelector('h3')?.textContent).toBe('Workflow · deep-research');
+    expect(running.querySelector('header [data-tone]')?.textContent).toBe(CHAT.run.status.active);
+    expect(running.textContent).toContain('Step 2 of 4: Research');
+    const done = card('wf_02');
+    expect(done.querySelector('header [data-tone]')?.textContent).toBe(CHAT.run.status.complete);
+    expect(done.querySelector('strong')?.textContent).toBe('4 lanes');
+    expect(byRole(mounted!.container, 'button', CHAT.run.stop)).toBeNull();
+    expect(mounted!.text()).not.toContain(CHAT.run.status.interrupted);
   });
 });
 

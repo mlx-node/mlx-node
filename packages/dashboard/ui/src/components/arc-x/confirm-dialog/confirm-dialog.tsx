@@ -76,7 +76,7 @@ export function ConfirmDialog(props: ConfirmDialogProps): ReactElement {
           ) : null}
           <div className={styles.footer}>
             <Button type="button" variant="ghost" size="md" disabled={working} onClick={() => onOpenChange(false)}>
-              Cancel
+              {props.cancelLabel ?? 'Cancel'}
             </Button>
             <Button
               type="button"

@@ -718,6 +718,24 @@ export interface SessionCapableModel {
    * DFlash2 uses flat target caches so hybrid GDN state can be rewound by
    * snapshot plus tape replay after verification.
    *
+   * ## Qwen3.8-Flash-Next DFlash2 (`draftModelPath`)
+   *
+   * A `qwen4_exp` target attaches `incoai/Qwen3.8-Flash-Next-DFlash2` only
+   * from `draftModelPath`; the loader and the host never find it on disk.
+   * A verify takes the anchor and up to three proposals (4 rows). The knobs
+   * pick its rows (resolved in `qwen4_exp/mod.rs` `resolve_params`):
+   *
+   * - both unset (the server's `generation_mode: "mtp"`): the draft's rule
+   *   picks 1-4 rows per cycle from its confidence and the turn's record;
+   * - `mtpAdaptiveDepth: true`: the rule, at most `mtpDepth` + 1 rows;
+   * - `mtpDepth` set and `mtpAdaptiveDepth` unset or `false`: a fixed
+   *   `mtpDepth` + 1 rows (`mtpDepth` capped at 3); `mtpAdaptiveDepth:
+   *   false` alone: a fixed 4 rows;
+   * - sampled (temperature > 0): fixed rows, as the line before.
+   *
+   * A turn drafts only when it starts alone on a whole store (`direct`, every
+   * expert slot) whose banks are filled; any other turn decodes plain.
+   *
    * ## Gemma4 external drafts (`draftModelPath`)
    *
    * Gemma4 reinterprets the knobs per draft variant (resolved in

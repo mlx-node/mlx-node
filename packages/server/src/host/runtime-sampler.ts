@@ -20,10 +20,14 @@ import pkgJson from '../../package.json' with { type: 'json' };
 import type { ServerHealthStatus } from '../health.js';
 import { metricsEnvDisabled, TURN_FAIL_PHASES } from '../metrics-trace.js';
 import {
+  expertsLiveOf,
+  LOAD_RESIDENCY_FIELDS,
   readLoadProgress,
   readPipelineStats,
+  readResidency,
   type LoadProgress,
   type PipelineStats,
+  type ResidencySnapshot,
   type WarmupReport,
 } from '../native-progress.js';
 import { queueRejections } from '../queue-rejections.js';
@@ -99,6 +103,8 @@ export interface TimedLoadInfo<T> {
   path: string;
   /** The warm-up report of a loaded model; null when the load ran none. */
   warmupOf?: (result: T) => WarmupReport | null;
+  /** The expert residency of a loaded model; null for a model without one. */
+  residencyOf?: (result: T) => ResidencySnapshot | null;
 }
 
 export interface RuntimeSampler {
@@ -175,6 +181,16 @@ function warmupFields(report: WarmupReport): Partial<RuntimeLoadRecord> {
   };
 }
 
+function residencyFields(snapshot: ResidencySnapshot): Partial<RuntimeLoadRecord> {
+  const fields: Partial<RuntimeLoadRecord> = {
+    residency: snapshot.residency,
+    expertSlots: snapshot.expertSlots,
+    expertCount: snapshot.expertCount,
+  };
+  for (const key of LOAD_RESIDENCY_FIELDS) fields[key] = snapshot.load[key];
+  return fields;
+}
+
 /** Model types whose loads open a state tier; `''` is a resident of unknown type. */
 const STATE_TIER_TYPES: ReadonlySet<string> = new Set(['qwen3_5', 'qwen3_5_moe', '']);
 
@@ -203,6 +219,11 @@ function stateNamespaceOf(model: object): string | null {
   } catch {
     return null;
   }
+}
+
+function liveExperts(model: object): RuntimeLiveModel['experts'] {
+  const snapshot = readResidency(model);
+  return snapshot === null ? null : expertsLiveOf(snapshot);
 }
 
 function liveColdCapture(budget: ColdCaptureBudget | null): RuntimeLiveFile['coldCapture'] {
@@ -669,6 +690,7 @@ class Sampler implements RuntimeSampler {
       queueLimit: sessions.queueDepthLimit ?? null,
       pool: schedState?.pool ?? null,
       stateNamespace: stateNamespaceOf(view.entry.model as object),
+      experts: liveExperts(view.entry.model as object),
     };
   }
 
@@ -698,6 +720,7 @@ class Sampler implements RuntimeSampler {
         prefillTotal,
         prefillDone: p?.prefillDone ?? null,
         generatedTokens: p?.generatedTokens ?? null,
+        clientSession: turn.clientSession,
       };
     });
   }
@@ -821,6 +844,7 @@ class Sampler implements RuntimeSampler {
     this.pullIn();
     let ok = false;
     let warmup: WarmupReport | null = null;
+    let residency: ResidencySnapshot | null = null;
     try {
       const result = await load();
       ok = true;
@@ -828,6 +852,11 @@ class Sampler implements RuntimeSampler {
         warmup = info.warmupOf?.(result) ?? null;
       } catch {
         warmup = null;
+      }
+      try {
+        residency = info.residencyOf?.(result) ?? null;
+      } catch {
+        residency = null;
       }
       return result;
     } finally {
@@ -849,6 +878,7 @@ class Sampler implements RuntimeSampler {
           ms,
           ok,
           ...(warmup === null ? {} : warmupFields(warmup)),
+          ...(residency === null ? {} : residencyFields(residency)),
         });
         this.noteBusy(end, this.busyNow());
         this.pullIn();

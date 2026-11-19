@@ -12,10 +12,11 @@ import { homedir, userInfo } from 'node:os';
 
 import { compareReleaseTags, MLX_AGENT_MIN_RELEASE, type AgentInstallProbe } from '@mlx-node/agent/binary';
 
-import type { UpdateLine } from '../../agent-sessions/transcript.js';
+import { WAKE_PROMPT_ID, type UpdateLine } from '../../agent-sessions/transcript.js';
 import type { TranscriptEntry } from '../../agent-sessions/types.js';
 import { ACP_TIMEOUTS, AcpRpcError, type AcpClient, type ProtocolErrorReason } from '../acp/client.js';
 import {
+  readCompaction,
   readInitialize,
   readPermissionRequest,
   readPromptResult,
@@ -23,9 +24,14 @@ import {
   readSessionInfo,
   readSessionReply,
   readSessionUpdate,
+  readSpawnedChild,
   readTitle,
+  readWorkflowStop,
+  readWorkflowUpdate,
+  type CompactionUpdate,
   type PermissionRequest,
   type SessionInfoFacts,
+  type WorkflowUpdate,
 } from '../acp/messages.js';
 import { AgentProcess, spawnAgent, type AgentExit, type SpawnAgent } from '../acp/process.js';
 import {
@@ -44,6 +50,7 @@ import {
   CONTINUE_PROMPT,
   type AgentModeState,
   type AutoAsk,
+  type CompactionState,
   type PermissionMark,
   type PermissionMode,
   type ChatFailure,
@@ -52,6 +59,7 @@ import {
   type ConversationNotice,
   type Interaction,
   type PermissionInteraction,
+  type RunView,
   type TurnOutcome,
   type TurnState,
 } from '../types.js';
@@ -63,7 +71,6 @@ import {
   autoFacts,
   changesFolder,
   decideAuto,
-  helperStart,
   staysBehind,
   type AutoAskDetail,
   type AutoDecision,
@@ -116,7 +123,7 @@ import { MODEL_SELECT_MAX_MS, selectModel, type SelectAnswer, type SelectTarget 
 import { applyWebResult, readWebToolResult } from './web-results.js';
 
 export const AGENT_IDLE_STOP_MS = 600_000;
-/** Chat only: a Work turn has no time limit. */
+/** Chat only: a Work turn has no time limit. The time the agent compacts the conversation is not counted. */
 export const CHAT_TURN_MAX_MS = 600_000;
 /** After `session/cancel` the prompt reply must come inside this, else the agent broke the protocol. */
 export const CANCEL_REPLY_MS = 5_000;
@@ -145,8 +152,8 @@ export const FAILURE_MESSAGES: Readonly<Record<ChatFailureCode, string>> = {
   'model-load-failed': 'The model did not load.',
   'cwd-invalid': 'That folder cannot be used.',
   'cwd-mismatch': 'The agent opened another folder.',
-  'conversation-busy': 'An answer is still running.',
-  'engine-busy': 'The engine is busy: an answer or a model load runs.',
+  'conversation-busy': 'An answer or a workflow is still running.',
+  'engine-busy': 'The engine is busy: an answer, a workflow or a model load runs.',
   'slash-text': 'Start the message with a word, not /.',
   'keychain-unavailable': 'The Keychain cannot be reached. Keys cannot be saved.',
   'skill-bundle-corrupt': "The app's skill files are damaged. Reinstall the app.",
@@ -264,7 +271,12 @@ export interface AgentHostListener {
   onTitle?(sessionId: string, title: string): void;
   /** The agent switched the model during a turn; `ConversationInfo.modelId` follows. */
   onModel?(sessionId: string, modelId: string): void;
+  /** A compaction of the conversation started (its state) or ended (null). */
+  onCompaction?(sessionId: string, compaction: CompactionState | null): void;
+  /** The typed turn, or the wake turn the agent started itself (`origin: 'wake'`); null when neither runs. */
   onTurn?(sessionId: string, turn: TurnState | null): void;
+  /** Work: the session's live workflow runs changed. */
+  onRuns?(sessionId: string, runs: RunView[]): void;
   onTurnEnd?(sessionId: string, result: TurnResult): void;
   /** Work: the automatic `continue` after a length stop was written to the agent; `n` counts them in the turn. */
   onAutoContinue?(sessionId: string, n: number): void;
@@ -328,16 +340,33 @@ export interface AgentHostOptions {
   listener?: AgentHostListener;
 }
 
+/** Who a request is answered for: the typed turn, a live workflow run, or the wake turn. */
+type Owner = { kind: 'turn'; turn: TurnRecord } | { kind: 'run'; runId: string } | { kind: 'wake'; wake: WakeRecord };
+
 interface OpenInteraction {
   interaction: Interaction;
   /** Answers the agent's request with this JSON-RPC result. */
   settle: (result: unknown) => void;
   /** The result that withdraws the request. */
   withdrawn: unknown;
-  /** A helper start that can work in another folder: once allowed, Auto asks for every call of the session. */
-  helper: boolean;
+  owner: Owner;
+  /** The session whose call this is: the requester (a helper) or the session itself. */
+  callSession: string;
   /** The call can go on after it reports its end ({@link staysBehind}). */
   stays: boolean;
+}
+
+/** A turn the agent started with no prompt open: from its first content update to its `turn_completed`. */
+interface WakeRecord {
+  turnId: string;
+  startedAt: number;
+  phase: 'running' | 'cancelling';
+}
+
+/** Calls Auto allowed for an owner since the user's last allow; `approvalEpoch` goes up at each allow by the user. */
+interface ApprovalCount {
+  approvals: number;
+  approvalEpoch: number;
 }
 
 type AllowedMark = Extract<PermissionMark, { kind: 'allowed' }>;
@@ -364,6 +393,9 @@ interface TurnRecord {
   approvalEpoch: number;
   /** Chat only. */
   capTimer: ReturnType<typeof setTimeout> | null;
+  /** Chat only: the cap's time left when `capTimer` was armed at `capFrom`, or since a compaction paused it. */
+  capLeft: number | null;
+  capFrom: number;
   graceTimer: ReturnType<typeof setTimeout> | null;
   /** Ends the turn before the prompt was sent (cancel during start). */
   abort: ((result: TurnResult) => void) | null;
@@ -402,12 +434,25 @@ interface HostSession {
   interactions: Map<string, OpenInteraction>;
   /** Work: providers whose key was already reported printed in this session. */
   printed: Set<ProviderId>;
-  /** Work: the user allowed a helper that can work in another folder, in this process. */
-  elsewhere: boolean;
+  /** Work: runs whose last `workflow_updated` is `active`, by run id. */
+  runs: Map<string, { name: string; stopping: boolean }>;
+  /** The highest `workflow_updated` revision seen per run: a lower one changes nothing. */
+  revisions: Map<string, number>;
+  wake: WakeRecord | null;
+  /**
+   * A run reached a status the agent reports in a wake turn and its wake has not started yet: a stale restart now
+   * would drop the wake, so it waits for the wake's end (or the idle stop when the agent sends none). The run and
+   * its terminal revision name the wake row before the wake's `turn_completed` does.
+   */
+  wakeDue: { runId: string; revision: number } | null;
+  /** Auto's count for the asks of the runs and the wake turn. */
+  bg: ApprovalCount;
   /** Work: the user picked "allow all edits" in this process: the agent no longer asks for edits. */
   editsGranted: boolean;
   /** Work: the user picked an "always" option: the agent may run calls with no request. */
   granted: boolean;
+  /** The agent compacts the conversation now. */
+  compaction: CompactionState | null;
 }
 
 /**
@@ -502,6 +547,8 @@ export class AgentHost {
    * exits.
    */
   private readonly folders = new Map<string, FolderCalls>();
+  /** Work: child session id → its parent, from the parent's `subagent_spawned`; until the process exits. */
+  private readonly children = new Map<string, HostSession>();
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
   private crashes: number[] = [];
   private mismatches = 0;
@@ -515,13 +562,18 @@ export class AgentHost {
 
   modeState(): AgentModeState {
     let turnsInFlight = 0;
-    for (const s of this.sessions.values()) if (s.turn !== null) turnsInFlight++;
+    let background = 0;
+    for (const s of this.sessions.values()) {
+      if (s.turn !== null) turnsInFlight++;
+      if (hasBackground(s)) background++;
+    }
     return {
       state: this.state,
       stale: this.stale,
       failure: this.failure,
       agentVersion: this.running?.agentVersion ?? null,
       turnsInFlight,
+      background,
     };
   }
 
@@ -543,8 +595,22 @@ export class AgentHost {
     if (this.retiring !== null) await this.retiring.process.exited;
   }
 
+  /** A typed turn or a wake turn runs: no prompt, rename or reseed. A workflow run alone is not busy. */
   isBusy(sessionId: string): boolean {
-    return this.sessions.get(sessionId)?.turn != null;
+    const s = this.sessions.get(sessionId);
+    return s !== undefined && (s.turn !== null || s.wake !== null);
+  }
+
+  /** {@link isBusy}, or a workflow run is live: no delete and no model change. */
+  isWorking(sessionId: string): boolean {
+    const s = this.sessions.get(sessionId);
+    return s !== undefined && (s.turn !== null || hasBackground(s));
+  }
+
+  /** Work: the session's live workflow runs. */
+  runs(sessionId: string): RunView[] {
+    const s = this.sessions.get(sessionId);
+    return s === undefined ? [] : runViews(s);
   }
 
   /**
@@ -559,8 +625,8 @@ export class AgentHost {
   }
 
   turnState(sessionId: string): TurnState | null {
-    const t = this.sessions.get(sessionId)?.turn;
-    return t == null ? null : turnStateOf(t);
+    const s = this.sessions.get(sessionId);
+    return s === undefined ? null : shownTurn(s);
   }
 
   openInteractions(sessionId: string): Interaction[] {
@@ -573,6 +639,11 @@ export class AgentHost {
     return this.sessions.get(sessionId)?.editsGranted === true;
   }
 
+  compaction(sessionId: string): CompactionState | null {
+    const state = this.sessions.get(sessionId)?.compaction;
+    return state == null ? null : { ...state };
+  }
+
   sessionModel(sessionId: string): string | null {
     return this.sessions.get(sessionId)?.modelId ?? null;
   }
@@ -582,19 +653,26 @@ export class AgentHost {
     return this.sessions.get(sessionId)?.ledger ?? null;
   }
 
-  /** The host's sessions with their busy and waiting flags. */
-  active(): Array<{ sessionId: string; busy: boolean; waiting: boolean; stopping: boolean }> {
+  /**
+   * The host's sessions with their flags. `busy`: a typed turn runs; `stopping`: it ends for a recorded cause;
+   * `background`: a workflow run or a wake turn is live.
+   */
+  active(): Array<{ sessionId: string; busy: boolean; waiting: boolean; stopping: boolean; background: boolean }> {
     return [...this.sessions.values()]
-      .filter((s) => s.hot || s.turn !== null)
+      .filter((s) => s.hot || s.turn !== null || hasBackground(s))
       .map((s) => ({
         sessionId: s.id,
         busy: s.turn !== null,
         waiting: s.interactions.size > 0,
         stopping: s.turn !== null && s.turn.recorded !== null,
+        background: hasBackground(s),
       }));
   }
 
-  /** A config change (endpoint, providers, models, binary). The host restarts as soon as no turn is in flight. */
+  /**
+   * A config change (endpoint, providers, models, binary). The host restarts as soon as no turn, wake or workflow run
+   * is live.
+   */
   markStale(): void {
     if (this.running === null && this.starting === null) return;
     this.stale = true;
@@ -616,7 +694,8 @@ export class AgentHost {
 
   /**
    * Re-reads the endpoint while turns run (on runtime events). A missing file cancels every running turn as
-   * `inference-lost`; a changed one marks the host stale.
+   * `inference-lost`; a missing or changed one stops every workflow run (the process holds the old address and
+   * token, so its helpers can never reach the engine again) and marks the host stale.
    */
   async checkEndpoint(): Promise<void> {
     const running = this.running;
@@ -625,10 +704,46 @@ export class AgentHost {
     if (this.running !== running) return;
     if (endpoint === null) {
       for (const s of this.sessions.values()) if (s.turn !== null) this.cancelTurn(s, 'inference-lost');
+      this.stopAllRuns();
       this.markStale();
       return;
     }
-    if (!sameEndpoint(endpointFingerprint(endpoint), running.fingerprint)) this.markStale();
+    if (!sameEndpoint(endpointFingerprint(endpoint), running.fingerprint)) {
+      this.stopAllRuns();
+      this.markStale();
+    }
+  }
+
+  /**
+   * Work: the user's Stop of one workflow run, through `_x.ai/workflows/stop`. False when the run is not live. Its open
+   * cards are answered `cancelled` at once; the run leaves on its terminal `workflow_updated`, and a rejected or failed
+   * stop gives it back.
+   */
+  async stopRun(sessionId: string, runId: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    const run = session?.runs.get(runId);
+    const running = this.running;
+    if (session === undefined || run === undefined || running === null) return false;
+    run.stopping = true;
+    this.closeOwned(session, (o) => o.kind === 'run' && o.runId === runId, 'cancelled');
+    this.emitRuns(session);
+    let outcome: 'stopped' | 'rejected' | null = null;
+    try {
+      outcome = readWorkflowStop(
+        await this.call(running, '_x.ai/workflows/stop', { sessionId, runId }, ACP_TIMEOUTS['_x.ai/workflows/stop']),
+      );
+    } catch {
+      outcome = null;
+    }
+    if (outcome !== 'stopped' && session.runs.get(runId) === run) {
+      run.stopping = false;
+      this.emitRuns(session);
+    }
+    return true;
+  }
+
+  private stopAllRuns(): void {
+    for (const s of this.sessions.values()) for (const runId of s.runs.keys()) void this.stopRun(s.id, runId);
   }
 
   /** Starts the process if needed. Resolves when the self-check passed. */
@@ -674,7 +789,7 @@ export class AgentHost {
   startTurn(sessionId: string, text: string, load: LoadInput): { turnId: string; done: Promise<TurnResult> } {
     if (this.closed) throw new AgentHostError('agent-crashed');
     const existing = this.sessions.get(sessionId);
-    if (existing?.turn != null || existing?.creating === true) throw new AgentHostError('conversation-busy');
+    if (this.isBusy(sessionId) || existing?.creating === true) throw new AgentHostError('conversation-busy');
     const session = existing ?? this.register(sessionId, load.cwd ?? '', load.modelId, false);
     if (!session.guarded) this.seedLedger(session, load.entries);
     const turn: TurnRecord = {
@@ -687,6 +802,8 @@ export class AgentHost {
       approvals: 0,
       approvalEpoch: 0,
       capTimer: null,
+      capLeft: null,
+      capFrom: 0,
       graceTimer: null,
       abort: null,
       between: false,
@@ -708,11 +825,31 @@ export class AgentHost {
     return { turnId: turn.turnId, done };
   }
 
-  /** The user's stop. Open permission requests are answered `cancelled` first. */
+  /**
+   * The user's stop of the typed turn, else of the wake turn. Open requests of that turn are answered `cancelled`
+   * first. A wake gets `session/cancel` and no grace kill: a kill would also end the workflow runs.
+   */
   cancel(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
-    if (session?.turn == null) return false;
-    this.cancelTurn(session, 'cancelled');
+    if (session === undefined) return false;
+    if (session.turn !== null) {
+      this.cancelTurn(session, 'cancelled');
+      return true;
+    }
+    const wake = session.wake;
+    if (wake === null) return false;
+    if (wake.phase === 'cancelling') return true;
+    wake.phase = 'cancelling';
+    this.closeOwned(session, (o) => o.kind === 'wake', 'cancelled');
+    this.emitTurn(session);
+    const running = this.running;
+    if (running !== null) {
+      try {
+        running.process.client.notify('session/cancel', { sessionId: session.id });
+      } catch {
+        // The process is gone: the wake ends at its exit.
+      }
+    }
     return true;
   }
 
@@ -727,18 +864,16 @@ export class AgentHost {
     if (this.modeOf(sessionId) !== 'ask' && optionId !== REJECT_ONCE_OPTION_ID && optionId !== ALLOW_ONCE_OPTION_ID) {
       throw new InteractionError('not-offered');
     }
-    if (optionId === REJECT_ONCE_OPTION_ID && session.turn !== null && session.turn.recorded === null) {
-      session.turn.recorded = 'denied';
-    }
+    if (optionId === REJECT_ONCE_OPTION_ID) this.recordDenied(session, open.owner);
     if (optionId !== REJECT_ONCE_OPTION_ID) {
-      if (session.turn !== null) {
-        session.turn.approvals = 0;
-        session.turn.approvalEpoch += 1;
+      const count = this.countOf(session, open.owner);
+      if (count !== null) {
+        count.approvals = 0;
+        count.approvalEpoch += 1;
       }
       if (optionId === ALLOW_EDITS_SESSION_OPTION_ID) session.editsGranted = true;
       if (optionId === ALLOW_EDITS_SESSION_OPTION_ID || optionId === ALWAYS_ALLOW_OPTION_ID) session.granted = true;
-      if (open.helper) session.elsewhere = true;
-      this.callStarted(session, open.interaction.toolCallId, { changes: true, wide: true });
+      this.callStarted(session, open.callSession, open.interaction.toolCallId, { changes: true, wide: true });
     }
     this.settleInteraction(session, interactionId, { outcome: { outcome: 'selected', optionId } }, 'answered');
   }
@@ -752,8 +887,7 @@ export class AgentHost {
     const open = session?.interactions.get(interactionId);
     if (session === undefined || open === undefined || open.interaction.kind !== 'permission') return false;
     if (!open.interaction.options.some((o) => o.optionId === ALLOW_ONCE_OPTION_ID)) return false;
-    if (open.helper) session.elsewhere = true;
-    this.callStarted(session, open.interaction.toolCallId, {
+    this.callStarted(session, open.callSession, open.interaction.toolCallId, {
       changes: true,
       wide: true,
       ...(open.stays ? { stays: true as const } : {}),
@@ -772,7 +906,7 @@ export class AgentHost {
     ) {
       return false;
     }
-    if (session.turn !== null && session.turn.recorded === null) session.turn.recorded = 'denied';
+    this.recordDenied(session, open.owner);
     this.settleInteraction(session, interactionId, open.withdrawn, 'cancelled');
     return true;
   }
@@ -792,15 +926,15 @@ export class AgentHost {
   }
 
   /**
-   * Nobody can answer (the window is gone): every open permission request is denied, which ends its turn as
-   * `denied`, and every open plan is withdrawn.
+   * Nobody can answer (the window is gone): every open permission request is denied, which ends a typed turn that
+   * owns it as `denied`, and every open plan is withdrawn.
    */
   denyOpen(): void {
     for (const session of this.sessions.values()) {
       for (const [id, open] of session.interactions) {
         if (open.interaction.kind === 'permission') {
           const deny = open.interaction.options.some((o) => o.optionId === REJECT_ONCE_OPTION_ID);
-          if (session.turn !== null && session.turn.recorded === null) session.turn.recorded = 'denied';
+          this.recordDenied(session, open.owner);
           const result = deny ? { outcome: { outcome: 'selected', optionId: REJECT_ONCE_OPTION_ID } } : open.withdrawn;
           this.settleInteraction(session, id, result, 'expired');
         } else {
@@ -834,7 +968,7 @@ export class AgentHost {
     const session = this.sessions.get(sessionId);
     const running = this.running;
     if (session === undefined || !session.guarded || running === null) throw new AgentHostError('agent-crashed');
-    if (session.turn !== null || session.loading !== null) throw new AgentHostError('conversation-busy');
+    if (this.isBusy(sessionId) || session.loading !== null) throw new AgentHostError('conversation-busy');
     const result = await this.call(
       running,
       '_x.ai/session/rename',
@@ -850,7 +984,7 @@ export class AgentHost {
    */
   async deleteSession(sessionId: string, cwd: string): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (session?.turn != null) throw new AgentHostError('conversation-busy');
+    if (this.isWorking(sessionId)) throw new AgentHostError('conversation-busy');
     const running = await this.ensureRunning();
     const sessionCwd = session?.cwd || (this.mode === 'chat' ? await this.sessionCwd(undefined) : cwd);
     const result = await this.call(
@@ -869,7 +1003,7 @@ export class AgentHost {
     const session = this.sessions.get(sessionId);
     const running = this.running;
     if (session === undefined || !session.guarded || running === null) throw new AgentHostError('agent-crashed');
-    if (session.turn !== null || session.loading !== null) throw new AgentHostError('conversation-busy');
+    if (this.isWorking(sessionId) || session.loading !== null) throw new AgentHostError('conversation-busy');
     if (!running.models.some((m) => m.modelId === modelId)) throw new AgentHostError('model-unavailable');
     try {
       await this.call(running, 'session/set_model', { sessionId, modelId }, ACP_TIMEOUTS['session/set_model']);
@@ -904,7 +1038,7 @@ export class AgentHost {
         throw new AgentHostError('agent-incompatible');
       }
       if (this.running !== null && !this.stale) return this.running;
-      if (this.running !== null && this.stale && !this.hasTurns(caller)) await this.stopProcess();
+      if (this.running !== null && this.stale && !this.hasWork(caller)) await this.stopProcess();
       if (this.running !== null) return this.running;
       if (this.retiring !== null) {
         await this.retiring.process.exited;
@@ -1047,7 +1181,25 @@ export class AgentHost {
       folder.gen += 1;
     }
     const cold: string[] = [];
+    this.children.clear();
+    const crashed = !exit.asked || protocolError;
     for (const s of this.sessions.values()) {
+      this.endCompaction(s);
+      this.closeOwned(s, (o) => o.kind !== 'turn', 'cancelled');
+      s.revisions.clear();
+      s.wakeDue = null;
+      if (s.runs.size > 0) {
+        s.runs.clear();
+        this.emitRuns(s);
+      }
+      if (s.wake !== null) {
+        this.endWake(
+          s,
+          crashed
+            ? { turnId: s.wake.turnId, outcome: 'agent-crashed', failure: chatFailure('agent-crashed') }
+            : { turnId: s.wake.turnId, outcome: 'interrupted' },
+        );
+      }
       if (s.hot) cold.push(s.id);
       s.hot = false;
       s.guarded = false;
@@ -1094,19 +1246,38 @@ export class AgentHost {
     if (starting !== null) await starting.catch(() => {});
   }
 
-  private hasTurns(except?: TurnRecord): boolean {
-    for (const s of this.sessions.values()) if (s.turn !== null && s.turn !== except) return true;
+  /** A typed turn other than `except`, a wake turn or a workflow run is live: the process must keep running. */
+  private hasWork(except?: TurnRecord): boolean {
+    for (const s of this.sessions.values()) {
+      if ((s.turn !== null && s.turn !== except) || hasBackground(s)) return true;
+    }
     return false;
   }
 
+  /** After a turn, a wake or a run ended: the stale restart, else the idle timer. */
+  private idleStep(): void {
+    if (this.stale) this.restartIfIdle();
+    else this.scheduleIdle();
+  }
+
   private restartIfIdle(): void {
-    if (!this.stale || this.hasTurns() || this.running === null) return;
-    void this.stopProcess().then(() => {
-      if (this.running === null && this.starting === null && !this.closed) {
-        this.stale = false;
-        this.emitState();
+    if (!this.stale || this.hasWork() || this.running === null) return;
+    for (const s of this.sessions.values()) {
+      if (s.wakeDue !== null) {
+        this.scheduleIdle();
+        return;
       }
-    });
+    }
+    void this.stopIdle();
+  }
+
+  /** Stops an idle process; a stale host is fresh once it is gone. */
+  private async stopIdle(): Promise<void> {
+    await this.stopProcess();
+    if (this.stale && this.running === null && this.starting === null && !this.closed) {
+      this.stale = false;
+      this.emitState();
+    }
   }
 
   private clearIdle(): void {
@@ -1116,10 +1287,10 @@ export class AgentHost {
 
   private scheduleIdle(): void {
     this.clearIdle();
-    if (this.running === null || this.hasTurns() || this.closed) return;
+    if (this.running === null || this.hasWork() || this.closed) return;
     this.idleTimer = setTimeout(() => {
       this.idleTimer = null;
-      if (!this.hasTurns()) void this.stopProcess();
+      if (!this.hasWork()) void this.stopIdle();
     }, this.timings.idleStopMs);
     this.idleTimer.unref?.();
   }
@@ -1140,9 +1311,14 @@ export class AgentHost {
       turn: null,
       interactions: new Map(),
       printed: new Set(),
-      elsewhere: false,
+      runs: new Map(),
+      revisions: new Map(),
+      wake: null,
+      wakeDue: null,
+      bg: { approvals: 0, approvalEpoch: 0 },
       editsGranted: false,
       granted: false,
+      compaction: null,
     };
     this.sessions.set(id, session);
     return session;
@@ -1151,6 +1327,7 @@ export class AgentHost {
   private drop(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (session !== undefined) this.closeInteractions(session, 'cancelled');
+    for (const [child, parent] of this.children) if (parent === session) this.children.delete(child);
     this.sessions.delete(sessionId);
     this.readyServers.delete(sessionId);
     this.readyWaiters.delete(sessionId);
@@ -1302,7 +1479,6 @@ export class AgentHost {
     const reply = readSessionReply(await this.call(running, 'session/load', params, ACP_TIMEOUTS['session/load']));
     const guard = await this.guard(running, session, { ...reply, sessionId: session.id }, load.modelId, false);
     if (guard.ok && this.mode === 'work') {
-      session.elsewhere = false;
       session.editsGranted = false;
       this.opts.listener?.onSessionReady?.(session.id);
     }
@@ -1360,7 +1536,7 @@ export class AgentHost {
           }
           // The old process holds the old address or token: the prompt never goes to it.
           this.markStale();
-          if (attempt > 0 || this.hasTurns(turn)) return unsent({ failure: 'inference-failed' });
+          if (attempt > 0 || this.hasWork(turn)) return unsent({ failure: 'inference-failed' });
         }
       } catch (error) {
         return unsent({ failure: error instanceof AgentHostError ? error.code : 'agent-crashed' });
@@ -1374,9 +1550,7 @@ export class AgentHost {
     turn.abort = null;
     turn.phase = 'running';
     this.emitTurn(session);
-    if (this.mode === 'chat') {
-      turn.capTimer = setTimeout(() => this.cancelTurn(session, 'turn-timeout'), this.timings.chatTurnMaxMs);
-    }
+    if (this.mode === 'chat') this.armCap(session, turn, this.timings.chatTurnMaxMs);
     let exited = false;
     const onExit: ExitWaiter = () => {
       exited = true;
@@ -1494,19 +1668,62 @@ export class AgentHost {
     if (turn.capTimer !== null) clearTimeout(turn.capTimer);
     if (turn.graceTimer !== null) clearTimeout(turn.graceTimer);
     if (session.turn === turn) session.turn = null;
-    this.closeInteractions(session, 'cancelled');
+    this.endCompaction(session);
+    this.closeOwned(session, (o) => o.kind === 'turn' && o.turn === turn, 'cancelled');
     this.opts.listener?.onTurn?.(session.id, null);
     this.opts.listener?.onTurnEnd?.(session.id, result);
+    // A wake whose first lines came in the stdout chunk of this turn's reply shows from here.
+    if (session.wake !== null && session.turn === null) this.emitTurn(session);
     this.emitState();
-    if (this.stale) this.restartIfIdle();
-    else this.scheduleIdle();
+    this.idleStep();
+  }
+
+  private armCap(session: HostSession, turn: TurnRecord, ms: number): void {
+    turn.capLeft = ms;
+    turn.capFrom = this.now();
+    turn.capTimer = setTimeout(() => this.cancelTurn(session, 'turn-timeout'), ms);
+  }
+
+  /** A compaction holds the Chat cap: the time left is kept, and the cap runs on from it when the compaction ends. */
+  private pauseCap(turn: TurnRecord): void {
+    if (turn.capTimer === null || turn.capLeft === null) return;
+    clearTimeout(turn.capTimer);
+    turn.capTimer = null;
+    turn.capLeft = Math.max(0, turn.capLeft - (this.now() - turn.capFrom));
+  }
+
+  private resumeCap(session: HostSession, turn: TurnRecord): void {
+    if (turn.capTimer !== null || turn.capLeft === null || turn.phase !== 'running') return;
+    this.armCap(session, turn, turn.capLeft);
+  }
+
+  private onCompaction(session: HostSession, update: CompactionUpdate): void {
+    const turn = session.turn;
+    if (update.kind !== 'started') {
+      if (turn !== null) this.resumeCap(session, turn);
+      this.endCompaction(session);
+      return;
+    }
+    if (turn !== null) this.pauseCap(turn);
+    session.compaction = {
+      phase: 'running',
+      startedAt: this.now(),
+      ...(update.tokensUsed === null ? {} : { tokensBefore: update.tokensUsed }),
+    };
+    this.opts.listener?.onCompaction?.(session.id, { ...session.compaction });
+  }
+
+  private endCompaction(session: HostSession): void {
+    if (session.compaction === null) return;
+    session.compaction = null;
+    this.opts.listener?.onCompaction?.(session.id, null);
   }
 
   private cancelTurn(session: HostSession, cause: TurnEndCause): void {
     const turn = session.turn;
     if (turn === null) return;
     if (turn.recorded === null) turn.recorded = cause;
-    this.closeInteractions(session, 'cancelled');
+    this.closeOwned(session, (o) => o.kind === 'turn' && o.turn === turn, 'cancelled');
     // No prompt is in flight: nothing goes to the agent, and the turn ends on its length reply.
     if (turn.between) {
       turn.gap?.();
@@ -1577,11 +1794,99 @@ export class AgentHost {
   }
 
   private closeInteractions(session: HostSession, reason: 'cancelled' | 'expired'): void {
+    this.closeOwned(session, () => true, reason);
+  }
+
+  /** Withdraws the open requests whose owner matches. */
+  private closeOwned(session: HostSession, match: (owner: Owner) => boolean, reason: 'cancelled' | 'expired'): void {
     for (const [id, open] of session.interactions) {
+      if (!match(open.owner)) continue;
       session.interactions.delete(id);
       open.settle(open.withdrawn);
       this.opts.listener?.onInteractionClosed?.(session.id, id, reason);
     }
+  }
+
+  /** A typed turn that owns an answered or withdrawn card ends as `denied`; a run or the wake records nothing. */
+  private recordDenied(session: HostSession, owner: Owner): void {
+    if (owner.kind === 'turn' && session.turn === owner.turn && owner.turn.recorded === null) {
+      owner.turn.recorded = 'denied';
+    }
+  }
+
+  /** Auto's count of an owner: the typed turn's, or the session's for runs and the wake; null for a gone turn. */
+  private countOf(session: HostSession, owner: Owner): ApprovalCount | null {
+    if (owner.kind !== 'turn') return session.bg;
+    return session.turn === owner.turn ? owner.turn : null;
+  }
+
+  // ── workflow runs and the wake turn ──────────────────────────────────────────────────────────────────────────
+
+  /** The highest revision wins; a run is live while its status is `active`, and leaving `active` closes its cards. */
+  private onWorkflow(session: HostSession, update: WorkflowUpdate): void {
+    const seen = session.revisions.get(update.runId);
+    if (seen !== undefined && update.revision <= seen) return;
+    session.revisions.set(update.runId, update.revision);
+    const run = session.runs.get(update.runId);
+    if (update.status === 'active') {
+      if (run !== undefined) {
+        run.name = update.name;
+        return;
+      }
+      session.runs.set(update.runId, { name: update.name, stopping: false });
+      this.clearIdle();
+      this.emitRuns(session);
+      this.emitState();
+      return;
+    }
+    if (run === undefined) return;
+    session.runs.delete(update.runId);
+    if (wakeAfter(update.status, run.stopping)) session.wakeDue = { runId: update.runId, revision: update.revision };
+    this.closeOwned(session, (o) => o.kind === 'run' && o.runId === update.runId, 'cancelled');
+    this.emitRuns(session);
+    this.emitState();
+    this.idleStep();
+  }
+
+  /**
+   * A content update with no typed prompt open starts the wake turn. When it comes in the stdout chunk of the typed
+   * turn's reply, the typed turn has not ended yet: the wake shows once it has ({@link finishTurn}).
+   */
+  private startWake(session: HostSession): void {
+    session.wake = { turnId: randomUUID(), startedAt: this.now(), phase: 'running' };
+    const due = session.wakeDue;
+    session.wakeDue = null;
+    this.clearIdle();
+    if (session.turn === null) this.emitTurn(session);
+    this.emitState();
+    // The agent writes a wake's prompt to disk only. Without this line the live transcript has no wake row, and the
+    // answer joins the turn before it. A wake no run made due gets its cause from its `turn_completed`.
+    this.opts.listener?.onUpdate?.(session.id, {
+      xai: false,
+      update: {
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text: '' },
+        _meta: {
+          hideFromScrollback: true,
+          ...(due === null ? {} : { [WAKE_PROMPT_ID]: `workflow-completed-${due.runId}-${due.revision}` }),
+        },
+      },
+      meta: undefined,
+    });
+  }
+
+  private endWake(session: HostSession, result: TurnResult): void {
+    if (session.wake === null) return;
+    session.wake = null;
+    this.closeOwned(session, (o) => o.kind === 'wake', 'cancelled');
+    if (session.turn === null) this.opts.listener?.onTurn?.(session.id, null);
+    this.opts.listener?.onTurnEnd?.(session.id, result);
+    this.emitState();
+    this.idleStep();
+  }
+
+  private emitRuns(session: HostSession): void {
+    this.opts.listener?.onRuns?.(session.id, runViews(session));
   }
 
   // ── agent → client ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -1611,16 +1916,33 @@ export class AgentHost {
     const message = readSessionUpdate(method, params);
     if (message === null) return;
     const session = this.sessions.get(message.sessionId);
-    if (session === undefined) return;
-    if (this.mode === 'work') this.trackCall(session, message.update);
+    if (session === undefined) {
+      // A helper's own line: its call leaves the folder and its output is checked for keys. Nothing else reads it.
+      const parent = this.mode === 'work' ? this.children.get(message.sessionId) : undefined;
+      if (parent !== undefined) {
+        this.trackCall(parent, message.update, message.sessionId);
+        this.checkPrinted(parent, message.update);
+      }
+      return;
+    }
+    if (this.mode === 'work') this.trackCall(session, message.update, session.id);
     const title = readTitle(message.update);
     if (title !== null) {
       this.opts.listener?.onTitle?.(session.id, title);
       return;
     }
     const line: UpdateLine = { xai: message.xai, update: message.update, meta: message.meta };
-    const turnRunning = session.turn !== null && session.turn.phase !== 'starting';
+    const turnRunning = (session.turn !== null && session.turn.phase !== 'starting') || session.wake !== null;
     if (liveFilter(line, { turnRunning, modelId: session.modelId }) === 'drop') return;
+    if (
+      !line.xai &&
+      session.wake === null &&
+      WAKE_KINDS.has(String(line.update.sessionUpdate)) &&
+      !this.promptOpen(session.id) &&
+      session.turn?.between !== true
+    ) {
+      this.startWake(session);
+    }
     const turn = session.turn;
     if (
       turn !== null &&
@@ -1635,9 +1957,23 @@ export class AgentHost {
       this.opts.listener?.onModel?.(session.id, session.modelId);
     }
     this.opts.listener?.onUpdate?.(session.id, line);
+    if (line.xai) {
+      const compaction = readCompaction(line.update);
+      if (compaction !== null) this.onCompaction(session, compaction);
+      else if (line.update.sessionUpdate === 'turn_completed') this.endCompaction(session);
+      const workflow = readWorkflowUpdate(line.update);
+      if (workflow !== null) this.onWorkflow(session, workflow);
+      const child = this.mode === 'work' ? readSpawnedChild(line.update) : null;
+      if (child !== null) this.children.set(child, session);
+    }
     if (turn !== null && line.xai && line.update.sessionUpdate === 'turn_completed') {
       turn.endSeen = true;
       turn.gap?.();
+    }
+    const wake = session.wake;
+    if (wake !== null && line.xai && line.update.sessionUpdate === 'turn_completed' && !this.promptOpen(session.id)) {
+      const outcome: TurnOutcome = line.update.stop_reason === 'cancelled' ? 'cancelled' : 'completed';
+      this.endWake(session, { turnId: wake.turnId, outcome });
     }
     if (this.mode === 'work') this.checkPrinted(session, line.update);
     if (this.mode === 'chat') {
@@ -1735,41 +2071,49 @@ export class AgentHost {
   }
 
   /**
-   * Work: the request is decided by the conversation's permission mode ({@link openWorkCard}). A request that asks
-   * after Stop, after its turn ended, or from a process that is gone is answered `cancelled`.
+   * Work: the request is decided by the conversation's permission mode ({@link openWorkCard}) for its owner: a helper
+   * of a live run asks for the run, else the typed turn owns it, else the wake turn. A request with no live owner, or
+   * from a process that is gone, is answered `cancelled`.
    */
   private workPermission(proc: AgentProcess, req: PermissionRequest): Promise<unknown> {
     const session = this.sessions.get(req.sessionId);
-    const turn = session?.turn ?? null;
-    if (session === undefined || turn === null || !this.asks(proc, session, turn)) {
+    const owner = session === undefined ? null : ownerOf(session, req);
+    if (session === undefined || owner === null || !this.asks(proc, session, owner)) {
       return Promise.resolve(PERMISSION_CANCELLED);
     }
-    const place = { cwd: session.cwd, home: this.opts.homeDir ?? homedir() };
+    const requester = req.requester;
+    const elsewhere = requester !== null && folderKey(requester.cwd) !== folderKey(session.cwd);
+    // A helper in another folder names its paths from there.
+    const place = { cwd: elsewhere ? requester.cwd : session.cwd, home: this.opts.homeDir ?? homedir() };
+    const ask: Ask = { proc, session, owner, req, place, callSession: requester?.sessionId ?? session.id, elsewhere };
     const seen: Seen = { work: this.folderCalls(session.cwd).gen, temps: new Map() };
     for (const top of tempRoots(this.gatePlace(place)).map((r) => r.top)) {
       seen.temps.set(top, this.folderCalls(top).gen);
     }
     const path = requestTarget(req).path;
-    if (path === null) return this.openWorkCard(proc, session, turn, req, place, null, seen);
+    if (path === null) return this.openWorkCard(ask, null, seen);
     return editLanding(agentPath(path, place)).then(
-      (landing) => this.openWorkCard(proc, session, turn, req, place, landing, seen),
-      () => this.openWorkCard(proc, session, turn, req, place, null, seen),
+      (landing) => this.openWorkCard(ask, landing, seen),
+      () => this.openWorkCard(ask, null, seen),
     );
   }
 
   /**
-   * A card opens only for the turn and process that asked, while that turn still runs: a request that resolves after
-   * Stop, after the turn ended, or from a process that is gone is answered `cancelled`.
+   * A card opens only for a live owner of the process that asked: the typed turn while it runs (not stopped), a run
+   * while it is `active` and not stopping, the wake turn while it runs. Anything else is answered `cancelled`.
    */
-  private asks(proc: AgentProcess, session: HostSession, turn: TurnRecord): boolean {
-    return (
-      session.guarded &&
-      this.sessions.get(session.id) === session &&
-      session.turn === turn &&
-      turn.phase !== 'cancelling' &&
-      turn.recorded === null &&
-      this.running?.process === proc
-    );
+  private asks(proc: AgentProcess, session: HostSession, owner: Owner): boolean {
+    if (!session.guarded || this.sessions.get(session.id) !== session || this.running?.process !== proc) return false;
+    switch (owner.kind) {
+      case 'turn':
+        return session.turn === owner.turn && owner.turn.phase !== 'cancelling' && owner.turn.recorded === null;
+      case 'run': {
+        const run = session.runs.get(owner.runId);
+        return run !== undefined && !run.stopping;
+      }
+      case 'wake':
+        return session.wake === owner.wake && owner.wake.phase === 'running';
+    }
   }
 
   /** The permission mode of a session now; Ask when the host has no mode source. */
@@ -1783,48 +2127,63 @@ export class AgentHost {
    * Bypass allows. A round whose mode moved during a wait (disk facts, history line) ends `moved`, and the next round
    * decides under the new mode, so a request never opens a card or gets an allow under a mode that is gone.
    */
-  private async openWorkCard(
-    proc: AgentProcess,
-    session: HostSession,
-    turn: TurnRecord,
-    req: PermissionRequest,
-    place: WorkPlace,
-    landing: string | null,
-    seen: Seen,
-  ): Promise<unknown> {
+  private async openWorkCard(ask: Ask, landing: string | null, seen: Seen): Promise<unknown> {
+    const { proc, session, owner, req } = ask;
     for (let round = 0; round < MODE_ROUNDS; round++) {
-      if (!this.asks(proc, session, turn)) return PERMISSION_CANCELLED;
+      if (!this.asks(proc, session, owner)) return PERMISSION_CANCELLED;
       const mode = this.modeOf(session.id);
       if (mode !== 'ask' && !offersOnce(req)) {
-        turn.recorded = 'denied';
+        this.recordDenied(session, owner);
         return PERMISSION_CANCELLED;
       }
       if (mode === 'bypass') {
-        const answer = await this.allowAll(proc, session, turn, req, place, landing);
+        const answer = await this.allowAll(ask, landing);
         if (answer !== MOVED) return answer;
         continue;
       }
-      if (!showableWhole(req)) return this.tooLong(turn, req);
-      const interaction = workInteraction(randomUUID(), req, this.cardNeedles(), place, landing);
-      if (mode === 'ask') return this.workCard(session, req, interaction);
-      const answer = await this.autoAnswer(proc, session, turn, req, place, landing, seen, interaction);
+      if (!showableWhole(req)) return this.tooLong(ask);
+      const interaction = this.card(ask, landing);
+      if (mode === 'ask') return this.workCard(ask, interaction);
+      const answer = await this.autoAnswer(ask, landing, seen, interaction);
       if (answer !== MOVED) return answer;
     }
-    if (!this.asks(proc, session, turn)) return PERMISSION_CANCELLED;
-    if (!showableWhole(req)) return this.tooLong(turn, req);
-    return this.workCard(session, req, workInteraction(randomUUID(), req, this.cardNeedles(), place, landing));
+    if (!this.asks(proc, session, owner)) return PERMISSION_CANCELLED;
+    if (!showableWhole(req)) return this.tooLong(ask);
+    return this.workCard(ask, this.card(ask, landing));
+  }
+
+  /** The card a request would open: who asks (a helper, its run, its folder when not the Work folder) included. */
+  private card(ask: Ask, landing: string | null): PermissionInteraction {
+    const { req, session } = ask;
+    const requester = req.requester;
+    const from =
+      requester === null
+        ? undefined
+        : {
+            label: requester.label,
+            run: requester.runId === null ? null : (session.runs.get(requester.runId)?.name ?? null),
+            cwd: ask.elsewhere ? requester.cwd : null,
+          };
+    return workInteraction(randomUUID(), req, this.cardNeedles(), ask.place, landing, from);
   }
 
   /** A command or path too long to show whole is denied without asking: the card must show exactly what would run. */
-  private tooLong(turn: TurnRecord, req: PermissionRequest): unknown {
-    turn.recorded = 'denied';
-    const deny = req.options.some((o) => o.optionId === REJECT_ONCE_OPTION_ID && o.kind === 'reject_once');
+  private tooLong(ask: Ask): unknown {
+    this.recordDenied(ask.session, ask.owner);
+    const deny = ask.req.options.some((o) => o.optionId === REJECT_ONCE_OPTION_ID && o.kind === 'reject_once');
     return deny ? { outcome: { outcome: 'selected', optionId: REJECT_ONCE_OPTION_ID } } : PERMISSION_CANCELLED;
   }
 
   /** The card, opened in this tick; the user's answer settles it. */
-  private workCard(session: HostSession, req: PermissionRequest, interaction: PermissionInteraction): Promise<unknown> {
-    return this.openInteraction(session, interaction, PERMISSION_CANCELLED, helperStart(req), staysBehind(req));
+  private workCard(ask: Ask, interaction: PermissionInteraction): Promise<unknown> {
+    return this.openInteraction(
+      ask.session,
+      interaction,
+      PERMISSION_CANCELLED,
+      ask.owner,
+      ask.callSession,
+      staysBehind(ask.req),
+    );
   }
 
   /**
@@ -1832,21 +2191,13 @@ export class AgentHost {
    * check. With no `allow-once` offered the card opens. The mode is read again after the line: a move away ends the
    * round `moved`, and a line that was written then is withdrawn.
    */
-  private async allowAll(
-    proc: AgentProcess,
-    session: HostSession,
-    turn: TurnRecord,
-    req: PermissionRequest,
-    place: WorkPlace,
-    landing: string | null,
-  ): Promise<unknown> {
+  private async allowAll(ask: Ask, landing: string | null): Promise<unknown> {
+    const { proc, session, owner, req } = ask;
     if (!req.options.some((o) => o.optionId === ALLOW_ONCE_OPTION_ID && o.kind === 'allow_once')) {
-      if (!showableWhole(req)) return this.tooLong(turn, req);
-      return this.workCard(session, req, workInteraction(randomUUID(), req, this.cardNeedles(), place, landing));
+      if (!showableWhole(req)) return this.tooLong(ask);
+      return this.workCard(ask, this.card(ask, landing));
     }
-    const shown = showableWhole(req)
-      ? { ...workInteraction(randomUUID(), req, this.cardNeedles(), place, landing), options: [] }
-      : null;
+    const shown = showableWhole(req) ? { ...this.card(ask, landing), options: [] } : null;
     const mark: AllowedMark = {
       kind: 'allowed',
       at: this.now(),
@@ -1856,7 +2207,7 @@ export class AgentHost {
       card: shown,
     };
     const written = await this.writeLine(session, mark);
-    if (!this.asks(proc, session, turn)) {
+    if (!this.asks(proc, session, owner)) {
       if (written) this.withdraw(session, mark);
       return PERMISSION_CANCELLED;
     }
@@ -1864,8 +2215,7 @@ export class AgentHost {
       if (written) this.withdraw(session, mark);
       return MOVED;
     }
-    if (helperStart(req)) session.elsewhere = true;
-    this.callStarted(session, req.toolCallId, {
+    this.callStarted(session, ask.callSession, req.toolCallId, {
       changes: true,
       wide: true,
       ...(staysBehind(req) ? { stays: true as const } : {}),
@@ -1910,9 +2260,12 @@ export class AgentHost {
     }
   }
 
-  /** A call of the session's folder (and of each temp root it reaches) starts running; one that may change it raises `gen`. */
-  private callStarted(session: HostSession, toolCallId: string, call: FolderCall): void {
-    const id = callKey(session.id, toolCallId);
+  /**
+   * A call of the session's folder (and of each temp root it reaches) starts running; one that may change it raises
+   * `gen`. `callSession` is the session that runs it: a helper's own id for a helper's call.
+   */
+  private callStarted(session: HostSession, callSession: string, toolCallId: string, call: FolderCall): void {
+    const id = callKey(callSession, toolCallId);
     this.folderCalls(session.cwd).busy.set(id, call);
     for (const top of call.reach ?? []) this.folderCalls(top).busy.set(id, call);
     if (call.changes) this.raise(session, call.wide, call.reach);
@@ -1922,9 +2275,9 @@ export class AgentHost {
    * A call leaves the folder (it ended, or its allow was given back). `gen` goes up when it could change the folder,
    * and for an unknown call of a session the agent may run calls for without asking.
    */
-  private callEnded(session: HostSession, toolCallId: string): void {
+  private callEnded(session: HostSession, callSession: string, toolCallId: string): void {
     const folder = this.folderCalls(session.cwd);
-    const key = callKey(session.id, toolCallId);
+    const key = callKey(callSession, toolCallId);
     const call = folder.busy.get(key);
     if (call?.stays === true) {
       this.raise(session, call.wide, call.reach);
@@ -1940,8 +2293,14 @@ export class AgentHost {
    * Another call runs that this one could race: in this folder, a folder that holds it or one it holds, either may
    * change the folder; anywhere else, the other may change any folder.
    */
-  private folderBusy(session: HostSession, toolCallId: string, changes: boolean, reach: readonly string[]): boolean {
-    const own = callKey(session.id, toolCallId);
+  private folderBusy(
+    session: HostSession,
+    callSession: string,
+    toolCallId: string,
+    changes: boolean,
+    reach: readonly string[],
+  ): boolean {
+    const own = callKey(callSession, toolCallId);
     const place = folderKey(session.cwd);
     const temps = reach.map((top) => folderKey(top));
     for (const [key, folder] of this.folders) {
@@ -1967,19 +2326,20 @@ export class AgentHost {
 
   /**
    * Work: an ended call leaves its folder. In a session with an "always" grant the agent runs calls with no request,
-   * so a new call that is not a read joins the folder as one that may change it.
+   * so a new call that is not a read joins the folder as one that may change it. `callSession` is the session whose
+   * line this is: the session itself, or a helper of it.
    */
-  private trackCall(session: HostSession, update: Record<string, unknown>): void {
+  private trackCall(session: HostSession, update: Record<string, unknown>, callSession: string): void {
     const ended = endedCall(update);
     if (ended !== null) {
-      this.callEnded(session, ended);
+      this.callEnded(session, callSession, ended);
       return;
     }
     if (!session.granted || update.sessionUpdate !== 'tool_call' || typeof update.toolCallId !== 'string') return;
     const kind = update.kind;
     if (kind === 'read' || kind === 'search' || kind === 'think' || kind === 'fetch') return;
-    if (!this.folderCalls(session.cwd).busy.has(callKey(session.id, update.toolCallId))) {
-      this.callStarted(session, update.toolCallId, { changes: true, wide: true });
+    if (!this.folderCalls(session.cwd).busy.has(callKey(callSession, update.toolCallId))) {
+      this.callStarted(session, callSession, update.toolCallId, { changes: true, wide: true });
     }
   }
 
@@ -1990,15 +2350,14 @@ export class AgentHost {
    * a call that does not get its allow gives the count back. Any error asks.
    */
   private async autoAnswer(
-    proc: AgentProcess,
-    session: HostSession,
-    turn: TurnRecord,
-    req: PermissionRequest,
-    place: WorkPlace,
+    ask: Ask,
     landing: string | null,
     seen: Seen,
     interaction: PermissionInteraction,
   ): Promise<unknown> {
+    const { proc, session, owner, req, place, callSession } = ask;
+    const count = this.countOf(session, owner);
+    if (count === null) return PERMISSION_CANCELLED;
     let decision: AutoDecision;
     let changes = true;
     let stale = false;
@@ -2012,7 +2371,7 @@ export class AgentHost {
       folder.gen !== seen.work || reach.some((top) => this.folderCalls(top).gen !== (seen.temps.get(top) ?? -1));
     try {
       facts = await autoFacts(req, gate, landing, { cdpath: this.cdpath() });
-      if (!this.asks(proc, session, turn)) return PERMISSION_CANCELLED;
+      if (!this.asks(proc, session, owner)) return PERMISSION_CANCELLED;
       if (moved(facts.reach)) {
         // A call that may change the folder started or ended while the facts were read: read them once more.
         const again = gens(facts.reach);
@@ -2020,7 +2379,7 @@ export class AgentHost {
         if (path !== null && (await editLanding(agentPath(path, place)).catch(() => null)) !== landing) stale = true;
         const reach = facts.reach;
         facts = await autoFacts(req, gate, landing, { cdpath: this.cdpath() });
-        if (!this.asks(proc, session, turn)) return PERMISSION_CANCELLED;
+        if (!this.asks(proc, session, owner)) return PERMISSION_CANCELLED;
         if (facts.reach.some((top) => !reach.includes(top))) stale = true;
         else if (gens(reach).some((gen, k) => gen !== again[k])) stale = true;
       }
@@ -2031,9 +2390,9 @@ export class AgentHost {
         request: req,
         interaction,
         guardHook: this.running?.guardHook ?? null,
-        elsewhere: session.elsewhere,
+        elsewhere: ask.elsewhere,
         facts,
-        allowed: turn.approvals,
+        allowed: count.approvals,
       });
     } catch {
       decision = { allow: false, why: 'unread' };
@@ -2047,20 +2406,24 @@ export class AgentHost {
           cause: found.cause,
         };
       }
-      return this.workCard(session, req, interaction);
+      return this.workCard(ask, interaction);
     };
     if (this.modeOf(session.id) !== 'auto') return MOVED;
     if (!decision.allow) return asking(decision.why ?? 'unread', decision.detail);
     if (interaction.access !== 'bash' && interaction.access !== 'edit') return asking('not-covered');
     const reach = facts?.reach ?? tempRoots(gate).map((r) => r.top);
-    if (stale || this.folderBusy(session, req.toolCallId, changes, reach)) return asking('unknown-target');
-    this.callStarted(session, req.toolCallId, { changes, wide: false, ...(reach.length > 0 ? { reach } : {}) });
+    if (stale || this.folderBusy(session, callSession, req.toolCallId, changes, reach)) return asking('unknown-target');
+    this.callStarted(session, callSession, req.toolCallId, {
+      changes,
+      wide: false,
+      ...(reach.length > 0 ? { reach } : {}),
+    });
     const mine = gens(reach);
-    const epoch = turn.approvalEpoch;
-    turn.approvals += 1;
+    const epoch = count.approvalEpoch;
+    count.approvals += 1;
     const giveBack = (): void => {
-      if (turn.approvalEpoch === epoch && turn.approvals > 0) turn.approvals -= 1;
-      this.callEnded(session, req.toolCallId);
+      if (count.approvalEpoch === epoch && count.approvals > 0) count.approvals -= 1;
+      this.callEnded(session, callSession, req.toolCallId);
     };
     const mark: AllowedMark = {
       kind: 'allowed',
@@ -2072,7 +2435,7 @@ export class AgentHost {
       ...(facts?.touched === true ? { temp: true as const } : {}),
     };
     const written = await this.writeLine(session, mark);
-    if (!this.asks(proc, session, turn)) {
+    if (!this.asks(proc, session, owner)) {
       giveBack();
       if (written) this.withdraw(session, mark);
       return PERMISSION_CANCELLED;
@@ -2107,11 +2470,11 @@ export class AgentHost {
     const req = readPlanRequest(params);
     const session = req === null ? undefined : this.sessions.get(req.sessionId);
     const turn = session?.turn ?? null;
-    if (req === null || session === undefined || turn === null || !this.asks(proc, session, turn)) {
-      return Promise.resolve(PLAN_CANCELLED);
-    }
+    if (req === null || session === undefined || turn === null) return Promise.resolve(PLAN_CANCELLED);
+    const owner: Owner = { kind: 'turn', turn };
+    if (!this.asks(proc, session, owner)) return Promise.resolve(PLAN_CANCELLED);
     const interaction = planInteraction(randomUUID(), req, this.cardNeedles());
-    return this.openInteraction(session, interaction, PLAN_CANCELLED, false);
+    return this.openInteraction(session, interaction, PLAN_CANCELLED, owner, session.id);
   }
 
   /** Every needle is known before a card text is cut: a key cut in two would no longer match. */
@@ -2123,11 +2486,12 @@ export class AgentHost {
     session: HostSession,
     interaction: Interaction,
     withdrawn: unknown,
-    helper: boolean,
+    owner: Owner,
+    callSession: string,
     stays = false,
   ): Promise<unknown> {
     return new Promise<unknown>((resolve) => {
-      session.interactions.set(interaction.id, { interaction, settle: resolve, withdrawn, helper, stays });
+      session.interactions.set(interaction.id, { interaction, settle: resolve, withdrawn, owner, callSession, stays });
       this.opts.listener?.onInteraction?.(session.id, interaction);
       this.emitState();
     });
@@ -2146,8 +2510,7 @@ export class AgentHost {
   }
 
   private emitTurn(session: HostSession): void {
-    const t = session.turn;
-    this.opts.listener?.onTurn?.(session.id, t === null ? null : turnStateOf(t));
+    this.opts.listener?.onTurn?.(session.id, shownTurn(session));
   }
 
   private emitState(): void {
@@ -2164,6 +2527,78 @@ function turnStateOf(t: TurnRecord): TurnState {
     ...(t.continues > 0 ? { continues: t.continues } : {}),
   };
 }
+
+/** The turn the page shows: the typed one, else the wake. */
+function shownTurn(s: HostSession): TurnState | null {
+  if (s.turn !== null) return turnStateOf(s.turn);
+  if (s.wake === null) return null;
+  return { turnId: s.wake.turnId, phase: s.wake.phase, startedAt: s.wake.startedAt, wait: null, origin: 'wake' };
+}
+
+/** A workflow run or a wake turn is live. */
+function hasBackground(s: HostSession): boolean {
+  return s.wake !== null || s.runs.size > 0;
+}
+
+/**
+ * The agent starts a wake turn after a run reaches `interrupted`, `complete`, `failed`, `cancelled` or `budget_limited`,
+ * except a run cancelled by Stop run (the stop marks it reported).
+ */
+function wakeAfter(status: string, stopping: boolean): boolean {
+  switch (status) {
+    case 'interrupted':
+    case 'complete':
+    case 'failed':
+    case 'budget_limited':
+      return true;
+    case 'cancelled':
+      return !stopping;
+    default:
+      return false;
+  }
+}
+
+function runViews(s: HostSession): RunView[] {
+  return [...s.runs].map(([runId, run]) => ({ runId, stopping: run.stopping }));
+}
+
+/**
+ * The owner of a Work request: a helper of a live, not stopping run asks for that run (a helper of a gone run has
+ * none); else the typed turn; else the wake turn; else none.
+ */
+function ownerOf(s: HostSession, req: PermissionRequest): Owner | null {
+  const runId = req.requester?.runId ?? null;
+  if (runId !== null) {
+    const run = s.runs.get(runId);
+    return run === undefined || run.stopping ? null : { kind: 'run', runId };
+  }
+  if (s.turn !== null) return { kind: 'turn', turn: s.turn };
+  if (s.wake !== null) return { kind: 'wake', wake: s.wake };
+  return null;
+}
+
+/** One Work request being decided, with its owner and where its call runs. */
+interface Ask {
+  proc: AgentProcess;
+  session: HostSession;
+  owner: Owner;
+  req: PermissionRequest;
+  /** The folder the request's paths are named from: the helper's own when it is not the Work folder. */
+  place: WorkPlace;
+  callSession: string;
+  /** A helper whose folder is not the Work folder. */
+  elsewhere: boolean;
+}
+
+/** Update kinds that mean the agent is working. */
+const WAKE_KINDS: ReadonlySet<string> = new Set([
+  'user_message_chunk',
+  'agent_message_chunk',
+  'agent_thought_chunk',
+  'tool_call',
+  'tool_call_update',
+  'plan',
+]);
 
 /** The request offers `allow-once` or `reject-once`, each with its own kind. */
 function offersOnce(req: PermissionRequest): boolean {

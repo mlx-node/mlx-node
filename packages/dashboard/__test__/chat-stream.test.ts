@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 
 import type { UpdateLine } from '../src/agent-sessions/transcript.js';
 import type { TranscriptEntry } from '../src/agent-sessions/types.js';
-import { CHAT_FLUSH_MS, Conversation, mergeTextOps } from '../src/chat/conversation.js';
+import { CHAT_FLUSH_MS, Conversation, mergeTextOps, type HostView } from '../src/chat/conversation.js';
 import type { ConversationEvent, ConversationInfo } from '../src/chat/types.js';
 import { applyConversationEvent, type ConversationState } from '../ui/src/lib/chat-store.js';
 
@@ -23,7 +23,7 @@ const INFO: ConversationInfo = {
   hot: true,
   permissionMode: 'ask',
 };
-const HOST = { turn: null, interactions: [] };
+const HOST: HostView = { turn: null, interactions: [], compaction: null, runs: [] };
 
 function chunk(text: string, kind = 'agent_message_chunk'): UpdateLine {
   return { xai: false, update: { sessionUpdate: kind, content: { type: 'text', text } }, meta: undefined };
@@ -323,9 +323,97 @@ describe('conversation stream', () => {
     conv.attach((e) => running.push(e), {
       turn: { turnId: 't11', phase: 'running', startedAt: 3, wait: null },
       interactions: [],
+      compaction: null,
+      runs: [],
     });
     expect(running[0]).not.toHaveProperty('lastEnd');
     expect(fold(running).lastEnd).toBeNull();
+  });
+
+  it('the context use: seeded from disk, moved by _meta.totalTokens, kept by a line without it, sent to every page', () => {
+    const counted = (text: string, totalTokens?: number): UpdateLine => ({
+      ...chunk(text),
+      meta: totalTokens === undefined ? undefined : { totalTokens },
+    });
+    const conv = new Conversation(INFO, { needles: () => [] });
+    conv.seed([{ kind: 'user', ts: 1, text: 'earlier', promptIndex: 0 }], [], null, 4475);
+    const a: ConversationEvent[] = [];
+    conv.attach((e) => a.push(e), HOST);
+    expect(a[0]).toMatchObject({ type: 'sync', contextUsed: 4475 });
+    expect(fold(a).contextUsed).toBe(4475);
+
+    conv.userPrompt('next');
+    conv.applyLine(counted('a', 4872));
+    conv.applyLine(counted('b', 5833));
+    conv.applyLine(counted('c'));
+    vi.advanceTimersByTime(CHAT_FLUSH_MS);
+    const ops = a[1]!;
+    // One batch: the text ops still merge, and only the last count goes out.
+    expect(ops.type === 'ops' && ops.ops.map((o) => o.op)).toEqual(['push', 'push', 'text', 'context']);
+    expect(fold(a).contextUsed).toBe(5833);
+    expect(texts(fold(a))).toEqual(['abc']);
+
+    const late: ConversationEvent[] = [];
+    conv.attach((e) => late.push(e), HOST);
+    expect(fold(late).contextUsed).toBe(5833);
+
+    // Loaded again from disk (hot → cold, or an app restart): the stored count comes back with the thread.
+    conv.seed([{ kind: 'user', ts: 1, text: 'earlier', promptIndex: 0 }], [], null, 6262);
+    conv.resync(HOST);
+    expect(fold(a).contextUsed).toBe(6262);
+    conv.seed([], [], null);
+    conv.resync(HOST);
+    expect(fold(a).contextUsed).toBeNull();
+  });
+
+  it('a compaction: its state on the stream and in a late sync, its marker as an op, the state gone at its end', () => {
+    const conv = new Conversation(INFO, { needles: () => [] });
+    conv.seed([], [], null);
+    const a: ConversationEvent[] = [];
+    conv.attach((e) => a.push(e), HOST);
+    expect(a[0]).not.toHaveProperty('compaction');
+    expect(fold(a).compaction).toBeNull();
+    const running = { phase: 'running' as const, startedAt: 7, tokensBefore: 222_822 };
+    conv.compactionChanged(running);
+    expect(fold(a).compaction).toEqual(running);
+    const late: ConversationEvent[] = [];
+    conv.attach((e) => late.push(e), { ...HOST, compaction: running });
+    expect(late[0]).toMatchObject({ type: 'sync', compaction: running });
+    expect(fold(late).compaction).toEqual(running);
+
+    conv.applyLine({
+      xai: true,
+      update: { sessionUpdate: 'auto_compact_completed', tokens_before: 222_822, tokens_after: 31_204 },
+      meta: { agentTimestampMs: 9 },
+    });
+    conv.compactionChanged(null);
+    // The marker op goes out before the state ends: the page never shows neither.
+    expect(a.slice(-2).map((e) => e.type)).toEqual(['ops', 'compaction']);
+    expect(fold(a).compaction).toBeNull();
+    expect(fold(a).entries).toEqual([
+      { kind: 'compaction', ts: 9, outcome: 'done', tokensBefore: 222_822, tokensAfter: 31_204 },
+    ]);
+  });
+
+  it('a compaction that starts shows the text held back for redaction at once, and later text still redacts', () => {
+    const key = 'sk-current-KEY-0001';
+    const conv = new Conversation(INFO, { needles: () => [key] });
+    conv.seed([], [], null);
+    const a: ConversationEvent[] = [];
+    conv.attach((e) => a.push(e), HOST);
+    conv.userPrompt('compact two');
+    conv.applyLine(chunk('Let me look.'));
+    vi.advanceTimersByTime(CHAT_FLUSH_MS);
+    expect(texts(fold(a))).toEqual(['']);
+    conv.compactionChanged({ phase: 'running', startedAt: 7 });
+    expect(texts(fold(a))).toEqual(['Let me look.']);
+    expect(a.at(-1)!.type).toBe('compaction');
+
+    conv.compactionChanged(null);
+    conv.applyLine(chunk(` Now ${key} end`));
+    conv.turnEnded({ turnId: 't', outcome: 'completed' });
+    expect(JSON.stringify(a)).not.toContain(key);
+    expect(texts(fold(a))).toEqual(['Let me look. Now [redacted] end']);
   });
 
   it('ends the stream with gone', () => {

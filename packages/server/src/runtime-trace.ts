@@ -12,7 +12,7 @@ import { appendFile, mkdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { resolveMlxNodeHome } from './host/paths.js';
-import { metricsEnvDisabled } from './metrics-trace.js';
+import { metricsEnvDisabled, type ExpertResidency } from './metrics-trace.js';
 
 export type HostKind = 'serve' | 'launch' | 'desktop' | 'embedded';
 export const HOST_KINDS: readonly HostKind[] = ['serve', 'launch', 'desktop', 'embedded'];
@@ -138,6 +138,25 @@ export interface RuntimeLoadRecord extends RuntimeBase {
   warmupPipelines?: number;
   warmupCompileMs?: number;
   warmupPeakBytes?: number;
+  /**
+   * Where the routed experts live after the load, the slots per layer (the expert count on a direct store) and
+   * the checkpoint's experts per layer; models with `residencyInfo()` only.
+   */
+  residency?: ExpertResidency;
+  expertSlots?: number;
+  expertCount?: number;
+  /** The bank bytes the host gate admits beside what stays anonymous, read when residency was chosen. */
+  bankBudgetBytes?: number;
+  /** Wired + compressor + anonymous − purgeable at that read, and its four parts. */
+  liveNonReclaimableBytes?: number;
+  hostWiredBytes?: number;
+  hostCompressorBytes?: number;
+  hostAnonymousBytes?: number;
+  hostPurgeableBytes?: number;
+  /** What the plan holds beside the experts. */
+  anonymousNeedBytes?: number;
+  /** This process's MLX active plus cache bytes when residency was chosen. */
+  selfMlxBytes?: number;
 }
 
 /** Clean shutdown only. A killed process leaves none. */
@@ -174,6 +193,11 @@ export interface RuntimeLiveModel {
   } | null;
   /** The directory name of the model's open persistent state cache under its cache root; null without one. */
   stateNamespace: string | null;
+  /**
+   * Routed experts per layer held in memory, the checkpoint's experts per layer, and whether the others stream
+   * from the SSD; null for a model without `residencyInfo()`.
+   */
+  experts: { inMemory: number; total: number; streaming: boolean } | null;
 }
 
 export interface RuntimeLiveTurn {
@@ -196,6 +220,8 @@ export interface RuntimeLiveTurn {
   prefillTotal: number | null;
   prefillDone: number | null;
   generatedTokens: number | null;
+  /** The session the client named on the request (`x-grok-session-id`); null when it named none. */
+  clientSession: string | null;
 }
 
 /** One model load in flight. `stepsDone` / `steps` are null when native reports no progress for it. */

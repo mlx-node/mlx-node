@@ -20,7 +20,7 @@ export function chatHostSnapshot(): ChatHostSnapshot {
   return store.getSnapshot();
 }
 
-/** Turns that run and conversations that wait for the user, over both modes. Null before the first `state`. */
+/** Conversations with a turn or a workflow run, and those that wait for the user, over both modes. Null before the first `state`. */
 export function chatActivity(snapshot: ChatHostSnapshot): { running: number; waiting: number } | null {
   const state = snapshot.state;
   if (state === null) return null;
@@ -28,7 +28,7 @@ export function chatActivity(snapshot: ChatHostSnapshot): { running: number; wai
   let waiting = 0;
   for (const item of state.active) {
     if (item.waiting) waiting += 1;
-    else if (item.busy) running += 1;
+    else if (item.busy || item.background) running += 1;
   }
   return { running, waiting };
 }

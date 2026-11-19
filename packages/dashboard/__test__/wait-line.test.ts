@@ -38,6 +38,22 @@ describe('WaitLine', () => {
     container.remove();
   });
 
+  it('draws its trail after the status, inside the one article', () => {
+    globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+    const container = document.createElement('div');
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const trail = createElement('span', { 'data-trail': '' }, '1:05');
+    act(() => root.render(createElement(WaitLine, { orb: 'think', text: 'Reading', trail })));
+    const line = container.querySelector('article')!;
+    expect(line.lastElementChild?.hasAttribute('data-trail')).toBe(true);
+    expect(line.textContent).toBe('Reading1:05');
+    act(() => root.render(createElement(WaitLine, { orb: 'think', text: 'Reading' })));
+    expect(container.querySelector('[data-trail]')).toBeNull();
+    act(() => root.unmount());
+    container.remove();
+  });
+
   it('keeps one box: at least 24 px high, 13 px secondary text, and no rise under reduced motion', () => {
     const rules = cssRules('components/arc-x/wait-line/wait-line.module.css');
     expect(cssValue(rules, '.root', 'min-height')).toBe('24px');

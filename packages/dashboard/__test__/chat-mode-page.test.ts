@@ -128,6 +128,7 @@ function sync(id: string, over: Partial<ChatSync> = {}, conversation: Partial<Co
     notices: [],
     transcriptError: null,
     permissionMarks: [],
+    runs: [],
     ...over,
   };
 }

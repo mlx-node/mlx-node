@@ -237,6 +237,7 @@ describe('dashboard runtime — route ownership', () => {
       'POST /api/chat/conversations',
       'POST /api/chat/conversations/:id/prompt',
       'POST /api/chat/conversations/:id/cancel',
+      'POST /api/chat/conversations/:id/runs/:runId/stop',
       'POST /api/chat/conversations/:id/interactions/:iid',
       'POST /api/chat/conversations/:id/permission-mode',
       'POST /api/chat/drafts/:draft/permission-mode',

@@ -1,5 +1,16 @@
 import { BellRing, Cpu, FilePen, FileText, Folder, GitBranch, RotateCw, Search, SquareTerminal } from 'lucide-react';
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from 'react';
+import {
+  createContext,
+  memo,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactElement,
+  type ReactNode,
+} from 'react';
 import { Link } from 'react-router-dom';
 
 import type { AppEndContext } from '../lib/app-ends';
@@ -7,8 +18,10 @@ import type { ConversationState } from '../lib/chat-store';
 import { CHAT, fill } from '../lib/chat-strings';
 import {
   answerMarkdown,
+  compactionDetail,
   continuingTurn,
   engineNote,
+  engineWait,
   fullLimit,
   loadFor,
   loadVariant,
@@ -27,7 +40,9 @@ import type {
   PermissionMark,
   ChatHostState,
   ChatMode,
+  CompactionState,
   ConversationNotice,
+  RunView,
   TurnOutcome,
   TurnState,
 } from '../lib/chat-types';
@@ -65,6 +80,7 @@ import { Message } from './arc-x/message/message';
 import { PlanList } from './arc-x/plan-list/plan-list';
 import { ReasoningBlock } from './arc-x/reasoning-block/reasoning-block';
 import { SourceList, type SourceItem } from './arc-x/source-list/source-list';
+import { Meter } from './arc-x/split-bar/split-bar';
 import { ToolCall, ToolCallField, ToolCallGroup, type ToolStatus } from './arc-x/tool-call/tool-call';
 import { TurnFooter } from './arc-x/turn-footer/turn-footer';
 import { WaitLine } from './arc-x/wait-line/wait-line';
@@ -73,8 +89,11 @@ import { Button } from './arc/button/button';
 import { CopyButton } from './arc/copy-button/copy-button';
 import { ExpandableText } from './arc/expandable-text/expandable-text';
 import { AllowedCard, AllowedLine, ModeLine } from './chat-permission-marks';
+import { CompactionMark } from './compaction-mark';
+import { RunCard, type RunEntry } from './run-card';
 import { freshOffset, toolStatus } from './transcript';
 import { UnloadButton, type UnloadControl } from './unload-button';
+import { WaitClock } from './wait-clock';
 
 /** What a turn's action asks the page to do. `text` is the message to send. */
 export type TurnAction =
@@ -99,7 +118,8 @@ export interface ChatThreadProps {
    * that a Control Panel restart stopped.
    */
   host?:
-    | (Pick<ChatHostState, 'inference' | 'loading' | 'resident' | 'answers'> & Partial<Pick<ChatHostState, 'appEnds'>>)
+    | (Pick<ChatHostState, 'inference' | 'loading' | 'resident' | 'answers'> &
+        Partial<Pick<ChatHostState, 'appEnds' | 'requests'>>)
     | null;
   /** Size on disk of a model, null when unknown: the load card prints it. */
   modelSize?: (modelId: string) => number | null;
@@ -125,8 +145,42 @@ export interface ChatThreadProps {
   tempRoot?: string | null;
   /** The open request of the agent, drawn after the newest entry (the tool row it waits on). */
   card?: ReactNode;
+  /** A request of the agent is open: the turn waits for the person, so no wait line shows. */
+  asking?: boolean;
   /** Work: the permission marks of the conversation, oldest first. */
   marks?: readonly PermissionMark[];
+  /** The agent compacts the conversation now: its line takes the place of the wait line. */
+  compaction?: CompactionState | null;
+  /** Work: the runs the host still holds; a run card whose run is not listed reads "Ended early". */
+  runs?: readonly RunView[];
+  /** Work: run name to the label of the helper of that run whose request is open. */
+  runAsks?: ReadonlyMap<string, string>;
+  /** Work: Stop run; rejects with the reason to show. */
+  onStopRun?: (runId: string) => Promise<void>;
+}
+
+interface ThreadRuns {
+  runs: readonly RunView[];
+  asks: ReadonlyMap<string, string>;
+  onStop: ((runId: string) => Promise<void>) | undefined;
+}
+
+const NO_RUNS: ThreadRuns = { runs: [], asks: new Map(), onStop: undefined };
+/** Read by each run card, so a finished turn does not re-render when a run's host state changes. */
+const RunsContext = createContext<ThreadRuns>(NO_RUNS);
+
+function ThreadRunCard({ entry }: { entry: RunEntry }): ReactElement {
+  const { runs, asks, onStop } = useContext(RunsContext);
+  const view = runs.find((run) => run.runId === entry.runId);
+  return (
+    <RunCard
+      entry={entry}
+      live
+      view={view}
+      asking={asks.get(entry.name) ?? null}
+      onStop={onStop === undefined ? undefined : () => onStop(entry.runId)}
+    />
+  );
 }
 
 type Entry<K extends TranscriptEntry['kind']> = Extract<TranscriptEntry, { kind: K }>;
@@ -419,6 +473,8 @@ interface TurnViewProps {
   links: LinkRule;
   /** This turn runs now. */
   running: boolean;
+  /** The running turn's newest thought or text still streams; false while the wait line stands for the turn. */
+  tailLive: boolean;
   isLast: boolean;
   outcome: OutcomeLine | null;
   /** The live outcome of this turn when it is the last one and ended: its refused call says why. */
@@ -648,7 +704,7 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement {
         );
         break;
       case 'assistant': {
-        const streaming = running && entry === tail;
+        const streaming = running && props.tailLive && entry === tail;
         const fresh = streaming ? freshOffset(props.shownText.get(at), entry.text) : undefined;
         if (streaming) rendered.push([at, entry.text]);
         const index = turn.entries.indexOf(entry);
@@ -668,7 +724,7 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement {
         break;
       }
       case 'thinking': {
-        const live = running && entry === tail;
+        const live = running && props.tailLive && entry === tail;
         if (live) rendered.push([at, entry.text]);
         items.push(
           <ReasoningBlock
@@ -724,6 +780,12 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement {
             {`Model switched to ${entry.modelId}`}
           </RuleLabel>,
         );
+        break;
+      case 'compaction':
+        items.push(<CompactionMark key={at} entry={entry} />);
+        break;
+      case 'workflow':
+        items.push(<ThreadRunCard key={at} entry={entry} />);
         break;
       case 'turn-end':
         break;
@@ -825,20 +887,21 @@ function PendingRow(props: {
   continuing: boolean;
   turn: TurnState | null;
   host: ChatThreadProps['host'];
-  asOfMs: number | undefined;
   model: string | null;
+  conversationId: string | null;
+  /** No stream event for 3 s while the turn runs. */
+  quiet: boolean;
+  /** The turn has shown work. */
+  work: boolean;
+  /** Start of this wait (epoch ms): the clock counts from it; null shows no clock. */
+  since: number | null;
   modelSize: ChatThreadProps['modelSize'];
   onStatus: ChatThreadProps['onStatus'];
 }): ReactElement {
-  const [quiet, setQuiet] = useState(false);
+  const since = props.since;
   const phase = props.turn?.phase ?? null;
-  useEffect(() => {
-    setQuiet(false);
-    if (phase !== 'running') return;
-    const timer = setTimeout(() => setQuiet(true), QUIET_MS);
-    return () => clearTimeout(timer);
-  }, [phase, props.asOfMs]);
   const loading = loadFor(props.host?.loading ?? [], props.model);
+  const answers = props.host?.answers ?? [];
   const row = pendingRow({
     creating: props.creating,
     phase,
@@ -846,9 +909,17 @@ function PendingRow(props: {
     model: props.model,
     loading,
     inference: props.host?.inference ?? null,
-    quiet,
-    full: fullLimit(props.host?.answers ?? [], props.model, props.turn?.startedAt ?? null),
+    quiet: props.quiet,
+    full: fullLimit(answers, props.model, props.turn?.startedAt ?? null),
     continuing: props.continuing,
+    work: props.work,
+    engine: engineWait({
+      requests: props.host?.requests ?? [],
+      session: props.conversationId,
+      model: props.model,
+      since,
+      hidden: answers.find((entry) => entry.modelId === props.model)?.queued ?? 0,
+    }),
   });
   const loadModel = row.kind === 'load' ? row.modelId : null;
   const variant = loadVariant(loadModel ?? '', loading, props.host?.resident ?? []);
@@ -862,19 +933,105 @@ function PendingRow(props: {
   useEffect(() => {
     if (loadStatus !== null) onStatus?.(loadStatus);
   }, [loadStatus, onStatus]);
-  if (row.kind === 'label') return <WaitLine orb={row.orb} text={row.text} enter />;
-  const since = variant === 'loading' && loading !== null ? loading.startedAt : (props.turn?.startedAt ?? Date.now());
+  if (row.kind === 'label') {
+    const progress = row.progress;
+    return (
+      <WaitLine
+        orb={row.orb}
+        text={row.text}
+        enter
+        trail={
+          <>
+            {progress === undefined ? null : (
+              <Meter
+                label={CHAT.pendingReadMeter}
+                value={progress.done}
+                max={progress.total}
+                formatValue={() =>
+                  fill(CHAT.pendingReadCount, { done: formatCount(progress.done), total: formatCount(progress.total) })
+                }
+                size="dense"
+                warnAt={2}
+                dangerAt={2}
+                busy
+                className="w-48 min-w-0"
+              />
+            )}
+            {since === null || props.creating ? null : <WaitClock since={since} />}
+          </>
+        }
+      />
+    );
+  }
+  const loadSince =
+    variant === 'loading' && loading !== null ? loading.startedAt : (props.turn?.startedAt ?? Date.now());
   return (
     <Message role="assistant" variant="chat" enter>
       <LoadCard
         modelId={row.modelId}
         variant={variant}
         other={loading?.modelId ?? null}
-        since={since}
+        since={loadSince}
         sizeBytes={props.modelSize?.(row.modelId) ?? null}
         progress={variant === 'loading' ? loading : null}
       />
     </Message>
+  );
+}
+
+/** The thread end while the agent compacts: one wait line with the fold orb, and a note the first time. */
+function CompactionRow(props: {
+  compaction: CompactionState;
+  requests: ChatHostState['requests'];
+  conversationId: string | null;
+  /** No earlier compaction in this conversation. */
+  first: boolean;
+  onStatus: ChatThreadProps['onStatus'];
+}): ReactElement {
+  const detail = compactionDetail({
+    requests: props.requests,
+    session: props.conversationId,
+    since: props.compaction.startedAt,
+  });
+  const progress = detail?.progress;
+  const onStatus = props.onStatus;
+  useEffect(() => {
+    onStatus?.(CHAT.compacting);
+  }, [onStatus]);
+  return (
+    <div className="grid min-w-0 gap-1" data-compaction-line="">
+      <WaitLine
+        orb="fold"
+        text={CHAT.compacting}
+        enter
+        trail={
+          <>
+            {detail === null ? null : <span className="min-w-0 truncate text-caption text-muted">{detail.text}</span>}
+            {progress === undefined ? null : (
+              <Meter
+                label={CHAT.pendingReadMeter}
+                value={progress.done}
+                max={progress.total}
+                formatValue={() =>
+                  fill(CHAT.pendingReadCount, { done: formatCount(progress.done), total: formatCount(progress.total) })
+                }
+                size="dense"
+                warnAt={2}
+                dangerAt={2}
+                busy
+                className="w-48 min-w-0"
+              />
+            )}
+            <WaitClock since={props.compaction.startedAt} />
+          </>
+        }
+      />
+      {props.first ? (
+        <p className="text-caption text-muted" style={{ paddingInlineStart: 'calc(20px + var(--space-2))' }}>
+          {CHAT.compactingHelp}
+        </p>
+      ) : null}
+    </div>
   );
 }
 
@@ -933,6 +1090,27 @@ function hasWork(turn: ThreadTurn | undefined): boolean {
     turn !== undefined &&
     turn.entries.some((entry) => !(entry.kind === 'user' || entry.kind === 'wake' || entry.kind === 'model'))
   );
+}
+
+/** Something of a running turn moves on screen: a drawn tool row runs, or text or a thought got an event in 3 s. */
+function moving(turn: ThreadTurn, mode: ChatMode, quiet: boolean): boolean {
+  for (const entry of turn.entries) {
+    if (entry.kind !== 'tool' || !isDrawn(entry, mode)) continue;
+    const status = toolStatus(entry.status).status;
+    if (status === 'running' || status === 'pending') return true;
+  }
+  const tail = turn.entries[turn.entries.length - 1];
+  return !quiet && (tail?.kind === 'assistant' || tail?.kind === 'thinking');
+}
+
+/** The newest time of a turn's entries (a step's end, else its start); null when none carries one. */
+function lastStepAt(turn: ThreadTurn): number | null {
+  let at = 0;
+  for (const entry of turn.entries) {
+    const end = 'endTs' in entry && entry.endTs !== undefined ? entry.endTs : entry.ts;
+    if (end > at) at = end;
+  }
+  return at > 0 ? at : null;
 }
 
 /** Status sentence of a finished turn. */
@@ -1043,96 +1221,132 @@ export function ChatThread(props: ChatThreadProps): ReactElement {
     }
   });
 
-  const pending = (props.creating === true || running) && !(liveLast && hasWork(last));
+  const timing = running && props.turn?.phase === 'running';
+  const [quiet, setQuiet] = useState(false);
+  useEffect(() => {
+    setQuiet(false);
+    if (!timing) return;
+    const timer = setTimeout(() => setQuiet(true), QUIET_MS);
+    return () => clearTimeout(timer);
+  }, [timing, props.asOfMs]);
+  const working = liveLast && hasWork(last);
+  const compaction = props.compaction ?? null;
+  const pending =
+    compaction === null &&
+    (props.creating === true || running) &&
+    !(working && (props.asking === true || moving(last, mode, quiet)));
+  const waitSince = (working ? lastStepAt(last) : null) ?? props.turn?.startedAt ?? null;
+  const runs = props.runs;
+  const runAsks = props.runAsks;
+  const onStopRun = props.onStopRun;
+  const threadRuns = useMemo<ThreadRuns>(
+    () => ({ runs: runs ?? NO_RUNS.runs, asks: runAsks ?? NO_RUNS.asks, onStop: onStopRun }),
+    [runs, runAsks, onStopRun],
+  );
 
   return (
-    <div ref={props.contentRef} className="grid min-w-0 gap-6">
-      {props.transcriptError !== undefined && props.transcriptError !== null ? (
-        <Alert tone="warning" title={CHAT.transcriptError}>
-          {props.inspectHref !== undefined ? (
-            <ButtonLink to={props.inspectHref} size="sm" variant="ghost">
-              {CHAT.inspect}
-            </ButtonLink>
-          ) : null}
-        </Alert>
-      ) : null}
-      {hidden > 0 ? (
-        <span className="flex justify-center">
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            onClick={() => {
-              before.current = root?.scrollHeight ?? null;
-              setMounted((n) => n + MOUNTED_TURNS);
-            }}
-          >
-            {fill(CHAT.earlier, { n: Math.min(MOUNTED_TURNS, hidden) })}
-          </Button>
-        </span>
-      ) : null}
-      {visible.map((turn, index) => {
-        const absolute = hidden + index;
-        const isLast = absolute === lastIndex;
-        const seen = seenEnds.get(turn.start);
-        const outcome = isLast
-          ? lastOutcome
-          : turnOutcome(turn, {
-              last: seen !== undefined,
-              running: false,
-              live: seen ?? null,
-              mode,
-              app: app(list[absolute + 1]),
-            });
-        return (
-          <TurnView
-            key={turn.start}
-            turn={turn}
-            mode={mode}
-            links={links}
-            running={isLast && liveLast}
-            isLast={isLast}
-            outcome={outcome}
-            endOutcome={isLast && !liveLast ? props.lastEnd?.outcome : undefined}
-            asOfMs={props.asOfMs}
-            model={props.model ?? null}
-            folder={props.folder ?? null}
-            tempRoot={props.tempRoot ?? null}
-            offscreen={absolute < list.length - ALWAYS_PAINTED}
-            liveFrom={liveFrom}
-            shownText={shownText}
-            actionDisabledReason={props.actionDisabledReason}
-            onTurnAction={props.onTurnAction}
-            unload={isLast ? props.unload : undefined}
-            turnMarks={turnMarks?.get(turn.start)}
+    <RunsContext.Provider value={threadRuns}>
+      <div ref={props.contentRef} className="grid min-w-0 gap-6">
+        {props.transcriptError !== undefined && props.transcriptError !== null ? (
+          <Alert tone="warning" title={CHAT.transcriptError}>
+            {props.inspectHref !== undefined ? (
+              <ButtonLink to={props.inspectHref} size="sm" variant="ghost">
+                {CHAT.inspect}
+              </ButtonLink>
+            ) : null}
+          </Alert>
+        ) : null}
+        {hidden > 0 ? (
+          <span className="flex justify-center">
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={() => {
+                before.current = root?.scrollHeight ?? null;
+                setMounted((n) => n + MOUNTED_TURNS);
+              }}
+            >
+              {fill(CHAT.earlier, { n: Math.min(MOUNTED_TURNS, hidden) })}
+            </Button>
+          </span>
+        ) : null}
+        {visible.map((turn, index) => {
+          const absolute = hidden + index;
+          const isLast = absolute === lastIndex;
+          const seen = seenEnds.get(turn.start);
+          const outcome = isLast
+            ? lastOutcome
+            : turnOutcome(turn, {
+                last: seen !== undefined,
+                running: false,
+                live: seen ?? null,
+                mode,
+                app: app(list[absolute + 1]),
+              });
+          return (
+            <TurnView
+              key={turn.start}
+              turn={turn}
+              mode={mode}
+              links={links}
+              running={isLast && liveLast}
+              tailLive={!((pending || compaction !== null) && working)}
+              isLast={isLast}
+              outcome={outcome}
+              endOutcome={isLast && !liveLast ? props.lastEnd?.outcome : undefined}
+              asOfMs={props.asOfMs}
+              model={props.model ?? null}
+              folder={props.folder ?? null}
+              tempRoot={props.tempRoot ?? null}
+              offscreen={absolute < list.length - ALWAYS_PAINTED}
+              liveFrom={liveFrom}
+              shownText={shownText}
+              actionDisabledReason={props.actionDisabledReason}
+              onTurnAction={props.onTurnAction}
+              unload={isLast ? props.unload : undefined}
+              turnMarks={turnMarks?.get(turn.start)}
+            />
+          );
+        })}
+        {placed !== null && placed.end.length > 0 ? (
+          <div className="grid min-w-0 gap-3" data-thread-end-marks="">
+            {placed.end.map((mark, n) =>
+              mark.kind === 'allowed' ? (
+                <AllowedLine key={`mark-end-${n}`} mark={mark} temp={props.tempRoot ?? null} />
+              ) : (
+                <ModeLine key={`mark-end-${n}`} mark={mark} temp={props.tempRoot ?? null} />
+              ),
+            )}
+          </div>
+        ) : null}
+        {props.card}
+        {compaction !== null ? (
+          <CompactionRow
+            compaction={compaction}
+            requests={props.host?.requests ?? []}
+            conversationId={conversationId}
+            first={!entries.some((entry) => entry.kind === 'compaction')}
+            onStatus={props.onStatus}
           />
-        );
-      })}
-      {placed !== null && placed.end.length > 0 ? (
-        <div className="grid min-w-0 gap-3" data-thread-end-marks="">
-          {placed.end.map((mark, n) =>
-            mark.kind === 'allowed' ? (
-              <AllowedLine key={`mark-end-${n}`} mark={mark} temp={props.tempRoot ?? null} />
-            ) : (
-              <ModeLine key={`mark-end-${n}`} mark={mark} temp={props.tempRoot ?? null} />
-            ),
-          )}
-        </div>
-      ) : null}
-      {props.card}
-      {pending ? (
-        <PendingRow
-          creating={props.creating === true}
-          continuing={running && continuingTurn(last, props.turn?.continues)}
-          turn={props.turn}
-          host={props.host}
-          asOfMs={props.asOfMs}
-          model={props.model ?? null}
-          modelSize={props.modelSize}
-          onStatus={props.onStatus}
-        />
-      ) : null}
-    </div>
+        ) : null}
+        {pending ? (
+          <PendingRow
+            creating={props.creating === true}
+            continuing={running && continuingTurn(last, props.turn?.continues)}
+            turn={props.turn}
+            host={props.host}
+            model={props.model ?? null}
+            conversationId={conversationId}
+            quiet={quiet}
+            work={working}
+            since={waitSince}
+            modelSize={props.modelSize}
+            onStatus={props.onStatus}
+          />
+        ) : null}
+      </div>
+    </RunsContext.Provider>
   );
 }
 

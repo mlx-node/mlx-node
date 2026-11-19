@@ -21,6 +21,8 @@
 import { appendFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 
+import type { Qwen4ExpResidencyInfo } from '@mlx-node/core';
+
 import { resolveMlxNodeHome } from './host/paths.js';
 
 /** Directory holding this process's `<YYYY-MM-DD>-<pid>.jsonl` trace files. */
@@ -81,6 +83,71 @@ export const COLD_DELTA_FIELDS = [...COLD_COUNTER_FIELDS, ...COLD_SIDECAR_FIELDS
 /** A key of {@link COLD_DELTA_FIELDS}; every one is an optional `number`. */
 export type ColdDeltaField = (typeof COLD_DELTA_FIELDS)[number];
 
+/**
+ * The cumulative `residencyInfo()` counters of an SSD-streaming model that a turn row carries as per-turn deltas,
+ * under the native names. `routeReplays` counts replay passes (one decode token can run several) plus prefill
+ * window replays; `routeMissTokens` counts the decode tokens that missed. The `prefix*` keys are the stored
+ * prefix states: published, resumed from, each reason a point was not published (`prefixRefused*` count points,
+ * `prefixSkipped*` and `prefixMissedReplay` count turns) and the states dropped. `residencyPromotions` counts a
+ * host-gate partial store moving up to whole banks after a turn; `residencyPromotionRefusals` counts such a move the
+ * gate admitted but the host could not take before any bank dropped. `draftOneRowCycles` counts drafted cycles at one
+ * row (the draft proposed, the verify took the anchor alone), which `mtpCycles` leaves out. `laneSteps` counts decode
+ * steps that ran the rows of 2-4 scheduled turns in one pass. A model without `residencyInfo()` writes none of them.
+ */
+export const RESIDENCY_DELTA_FIELDS = [
+  'slotHits',
+  'slotMisses',
+  'checkpointBytesRead',
+  'decodedRowLookups',
+  'decodedRowMisses',
+  'routeTries',
+  'routeMissTokens',
+  'routeReplays',
+  'replayedLayers',
+  'hostTailLayers',
+  'routeGuardTrips',
+  'fillCalls',
+  'fillMicros',
+  'fillReadBytes',
+  'groupPasses',
+  'groupWindows',
+  'prefillFillCalls',
+  'prefillFillMicros',
+  'prefillFillReadBytes',
+  'prefillSlotMisses',
+  'prefillCheckpointBytesRead',
+  'prefillRouteReplays',
+  'prefixPublished',
+  'prefixRestored',
+  'prefixRefusedRoom',
+  'prefixRefusedLive',
+  'prefixRefusedRegister',
+  'prefixRefusedOffGrid',
+  'prefixRefusedDraft',
+  'prefixSkippedReuseOff',
+  'prefixSkippedNoPoints',
+  'prefixMissedReplay',
+  'prefixDroppedKv',
+  'prefixDroppedMemory',
+  'residencyPromotions',
+  'residencyPromotionRefusals',
+  'draftOneRowCycles',
+  'laneSteps',
+] as const satisfies readonly (keyof Qwen4ExpResidencyInfo)[];
+
+/** A key of {@link RESIDENCY_DELTA_FIELDS}; every one is an optional `number`. */
+export type ResidencyDeltaField = (typeof RESIDENCY_DELTA_FIELDS)[number];
+
+/** Where a model's routed experts live (`residencyInfo().residency`). */
+export type ExpertResidency = Qwen4ExpResidencyInfo['residency'];
+
+export const EXPERT_RESIDENCIES = [
+  'direct',
+  'host-gate',
+  'store-plan',
+  'rows',
+] as const satisfies readonly ExpertResidency[];
+
 export type TurnOutcome = 'ok' | 'error' | 'cancelled';
 export type TurnErrorKind = 'finish_error' | 'exception';
 export type TurnFailPhase = 'queued' | 'slot' | 'prepare' | 'prefill' | 'decode';
@@ -110,7 +177,8 @@ export const MTP_ACCEPT_BY_POS_MAX = 16;
  * One dispatched turn's telemetry. Every field is a number, a closed enum, or
  * an identifier — never model output text, tool arguments, or prompt content.
  */
-export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, number>> {
+export interface MetricsTraceRecord
+  extends Partial<Record<ColdDeltaField, number>>, Partial<Record<ResidencyDeltaField, number>> {
   v: 2;
   traceId: string;
   /** Write time = end of the dispatch (ms since epoch). */
@@ -187,12 +255,22 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
   /** Written only when > 0: native reports 0.0 for a rate it could not measure. */
   decodeTps?: number;
 
+  /**
+   * Speculative cycles that verified at least one proposal. A drafted cycle at one row (the anchor alone) is not
+   * one of them: it is counted in `draftOneRowCycles`.
+   */
   mtpCycles?: number;
   /** Committed tokens per cycle (drafts + 1). */
   mtpMeanAccepted?: number;
   /** Accepted draft tokens per cycle. */
   mtpMeanDrafts?: number;
   mtpMeanDepth?: number;
+  /** Draft tokens proposed over all cycles. */
+  mtpProposed?: number;
+  /** Draft tokens accepted over all cycles. */
+  mtpAcceptedDrafts?: number;
+  /** Rows per verify (drafts + the anchor), the mean over the `mtpCycles` cycles. */
+  mtpVerifyRows?: number;
   /** Acceptance rate per draft position, at most {@link MTP_ACCEPT_BY_POS_MAX} entries. */
   mtpAcceptByPos?: number[];
 
@@ -380,6 +458,12 @@ export interface MetricsTraceRecord extends Partial<Record<ColdDeltaField, numbe
    * `coldCorruptions` and the output text are all identical either way.
    */
   coldSidecarInstalled?: number;
+  /**
+   * Where the model's routed experts lived at the end of the turn, and the slots per layer (the expert count on a
+   * direct store). Written with the {@link RESIDENCY_DELTA_FIELDS} deltas, by models with `residencyInfo()` only.
+   */
+  expertResidency?: ExpertResidency;
+  expertSlots?: number;
 }
 
 export type MetricsTraceInput = Omit<MetricsTraceRecord, 'v' | 'pid'>;
@@ -539,6 +623,8 @@ export class MetricsTrace {
         'prefillDoneTokens',
         'ctxWindow',
         'mtpCycles',
+        'mtpProposed',
+        'mtpAcceptedDrafts',
         'toolCallCount',
       ] as const) {
         const value = nonNegInt(rec[key]);
@@ -563,6 +649,7 @@ export class MetricsTrace {
         'mtpMeanAccepted',
         'mtpMeanDrafts',
         'mtpMeanDepth',
+        'mtpVerifyRows',
         'memActiveBytes',
         'memPeakBytes',
       ] as const) {
@@ -596,6 +683,14 @@ export class MetricsTrace {
       if (coldQueueDropsTotal !== undefined) out.coldQueueDropsTotal = coldQueueDropsTotal;
       const coldWriteErrorsTotal = finite(rec.coldWriteErrorsTotal);
       if (coldWriteErrorsTotal !== undefined) out.coldWriteErrorsTotal = coldWriteErrorsTotal;
+      for (const key of RESIDENCY_DELTA_FIELDS) {
+        const value = nonNeg(rec[key]);
+        if (value !== undefined) out[key] = value;
+      }
+      const expertResidency = enumOf(rec.expertResidency, EXPERT_RESIDENCIES);
+      if (expertResidency !== undefined) out.expertResidency = expertResidency;
+      const expertSlots = nonNegInt(rec.expertSlots);
+      if (expertSlots !== undefined) out.expertSlots = expertSlots;
 
       this.append(`${JSON.stringify(out)}\n`);
     } catch {

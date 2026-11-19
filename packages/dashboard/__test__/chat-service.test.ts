@@ -190,6 +190,51 @@ describe('Chat service — a conversation end to end on the fake agent', () => {
     });
   }, 30_000);
 
+  it('the context use moves while an answer streams and comes back after a restart', async () => {
+    const counted = (scenario: Json): void => {
+      scenario.initialize = { models: [{ modelId: 'qwen3.5-4b', totalContextTokens: 262144 }] };
+      scenario.prompts = [
+        {
+          match: '',
+          steps: [
+            { thought: 'Think.', totalTokens: 535 },
+            { text: 'Answer.', totalTokens: 1929 },
+            { turnCompleted: { inputTokens: 400, outputTokens: 30 } },
+            { end: { stopReason: 'end_turn' } },
+          ],
+        },
+      ];
+    };
+    const windowOf = async (svc: ChatService): Promise<number | null | undefined> =>
+      (await svc.state()).models.find((m) => m.id === 'qwen3.5-4b')?.contextTokens;
+    await withService(async (fake) => {
+      const svc = fake.service;
+      expect(await windowOf(svc)).toBeNull();
+      const created = await svc.create({ mode: 'chat', text: 'count me' });
+      const id = created.conversation.id;
+      const page = new Page(svc, id);
+      await until(() => page.ends().length === 1, 5_000);
+      expect(page.state!.contextUsed).toBe(1929);
+      const sent = page.events.flatMap((e) =>
+        e.type === 'ops' ? e.ops.flatMap((op) => (op.op === 'context' ? [op.used] : [])) : [],
+      );
+      expect(sent.at(-1)).toBe(1929);
+      expect(await windowOf(svc)).toBe(262144);
+      page.detach();
+
+      // The agent is stopped, as after its idle stop and after a restart: the window stays known.
+      await svc.close();
+      const svc2 = fake.restart();
+      const cold = new Page(svc2, id);
+      await until(() => cold.state !== null, 5_000);
+      expect(cold.state!.conversation.hot).toBe(false);
+      expect(cold.state!.contextUsed).toBe(1929);
+      const state = await svc2.state();
+      expect(state.modes.chat.state).toBe('stopped');
+      expect(state.models.find((m) => m.id === 'qwen3.5-4b')?.contextTokens).toBe(262144);
+    }, counted);
+  }, 30_000);
+
   it('a title the agent writes reaches the page as one plain line', async () => {
     await withService(async (fake) => {
       const svc = fake.service;
@@ -243,6 +288,64 @@ describe('Chat service — a conversation end to end on the fake agent', () => {
       await fake.close();
     }
   }, 15_000);
+
+  it('a compaction is on the stream while it runs, and its marker comes back from disk after a restart', async () => {
+    const compacting = (scenario: Json): void => {
+      scripted(scenario);
+      (scenario.prompts as Json[]).unshift({
+        match: 'compact',
+        steps: [
+          { text: 'Working', chunk: 7 },
+          { compact: { ms: 1_000, tokensBefore: 222_822, tokensAfter: 31_204 } },
+          { text: ' done.', chunk: 6, totalTokens: 31_204 },
+          { turnCompleted: { inputTokens: 400, outputTokens: 30 } },
+          { end: { stopReason: 'end_turn' } },
+        ],
+      });
+    };
+    await withService(async (fake) => {
+      const { conversation } = await fake.service.create({ mode: 'chat', text: 'compact please' });
+      const id = conversation.id;
+      const page = new Page(fake.service, id);
+      await until(() => page.state?.compaction != null, 5_000);
+      expect(page.state!.compaction).toEqual({
+        phase: 'running',
+        startedAt: expect.any(Number),
+        tokensBefore: 222_822,
+      });
+      const late = new Page(fake.service, id);
+      await until(() => late.state !== null, 5_000);
+      expect(late.state!.compaction).toEqual(page.state!.compaction);
+      await until(() => page.ends().length === 1, 5_000);
+      expect(page.lastOutcome()).toBe('completed');
+      expect(page.state!.compaction).toBeNull();
+      const marker = {
+        kind: 'compaction',
+        ts: expect.any(Number),
+        outcome: 'done',
+        tokensBefore: 222_822,
+        tokensAfter: 31_204,
+      };
+      expect(page.state!.entries.filter((e) => e.kind === 'compaction')).toEqual([marker]);
+      expect(page.state!.contextUsed).toBe(31_204);
+      page.detach();
+      late.detach();
+      await fake.service.close();
+
+      const reread = new Page(fake.restart(), id);
+      await until(() => reread.state !== null, 5_000);
+      expect(reread.state!.compaction).toBeNull();
+      expect(reread.state!.entries.map((e) => e.kind)).toEqual([
+        'user',
+        'assistant',
+        'compaction',
+        'assistant',
+        'turn-end',
+      ]);
+      expect(reread.state!.entries[2]).toEqual(marker);
+      expect(reread.state!.contextUsed).toBe(31_204);
+    }, compacting);
+  }, 20_000);
 
   it('renames a cold conversation through the session writer, without starting the agent', async () => {
     await withService(async (fake) => {
@@ -580,6 +683,88 @@ describe('Chat service — engine facts and unload', () => {
     } finally {
       await fake.close();
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("lists the app engine's requests, oldest first, with the session each named, its phase and its prefill counts", async () => {
+    let snapshot = live({
+      processes: [liveProcess({ pid: process.pid, loading: [], models: [liveModel('qwen3.5-4b')], turns: [] })],
+    }) as unknown as RuntimeLive;
+    const fake = fakeService('chat-basic', {
+      mutate: scripted,
+      endpointModels: [endpointModel('qwen3.5-4b', '/nowhere/a'), endpointModel('qwen3.5-9b', '/nowhere/b')],
+      live: { subscribe: () => () => {}, readNow: async () => snapshot },
+    });
+    try {
+      expect((await fake.service.state()).requests).toEqual([]);
+      const turn = liveTurn('x', { model: 'qwen3.5-4b' });
+      snapshot = live({
+        processes: [
+          liveProcess({
+            pid: process.pid,
+            loading: [],
+            models: [liveModel('qwen3.5-4b', { maxConcurrent: 4, inFlight: 3, queued: 0 }), liveModel('qwen3.5-9b')],
+            turns: [
+              liveTurn('t-held', {
+                model: 'qwen3.5-4b',
+                startedAt: 9_000,
+                phase: 'queued',
+                prefillTotal: null,
+                prefillDone: null,
+                generatedTokens: null,
+                clientSession: 'acp-ours',
+              }),
+              liveTurn('t-other', {
+                model: 'qwen3.5-4b',
+                startedAt: 5_000,
+                phase: 'prefill',
+                prefillTotal: 121_300,
+                prefillDone: 69_300,
+                clientSession: 'acp-other',
+              }),
+              liveTurn('t-terminal', { model: 'qwen3.5-9b', startedAt: 7_000, phase: 'decode', clientSession: null }),
+            ],
+          }),
+          liveProcess({
+            pid: process.pid + 1,
+            host: 'launch',
+            loading: [],
+            models: [liveModel('qwen3.5-4b')],
+            turns: [{ ...turn, startedAt: 1_000, clientSession: 'acp-ours' }],
+          }),
+        ],
+      }) as unknown as RuntimeLive;
+      expect((await fake.service.state()).requests).toEqual([
+        {
+          session: 'acp-other',
+          modelId: 'qwen3.5-4b',
+          phase: 'prefill',
+          startedAt: 5_000,
+          prefillDone: 69_300,
+          prefillTotal: 121_300,
+          generated: 1_204,
+        },
+        {
+          session: null,
+          modelId: 'qwen3.5-9b',
+          phase: 'decode',
+          startedAt: 7_000,
+          prefillDone: 1_000,
+          prefillTotal: 1_000,
+          generated: 1_204,
+        },
+        {
+          session: 'acp-ours',
+          modelId: 'qwen3.5-4b',
+          phase: 'queued',
+          startedAt: 9_000,
+          prefillDone: null,
+          prefillTotal: null,
+          generated: null,
+        },
+      ]);
+    } finally {
+      await fake.close();
     }
   });
 
@@ -1389,6 +1574,85 @@ describe('Chat service — Work', () => {
   }, 30_000);
 });
 
+describe('Chat service — a Work workflow run', () => {
+  /** `work-workflow-run` with the step's options merged in. */
+  const workflow =
+    (options: Json) =>
+    (scenario: Json): void => {
+      const steps = (scenario.prompts as Json[])[0]!.steps as Json[];
+      steps[1] = { workflow: { ...(steps[1]!.workflow as Json), ...options } };
+    };
+
+  it('the page gets the runs; delete, a model change and unload wait for it; a rename does not; Stop run ends it', async () => {
+    const flags = mkdtempSync(join(tmpdir(), 'mlx-wf-'));
+    const childOn = join(flags, 'child');
+    const snapshot = live({
+      processes: [liveProcess({ pid: process.pid, models: [liveModel('qwen3.5-4b')] })],
+    }) as unknown as RuntimeLive;
+    const busy: string[][] = [];
+    let service: ChatService | null = null;
+    try {
+      await withWork(
+        'work-workflow-run',
+        async (fake, project) => {
+          service = fake.service;
+          const svc = fake.service;
+          const { conversation } = await svc.create({ mode: 'work', text: 'research', cwd: project });
+          const id = conversation.id;
+          const page = new Page(svc, id);
+          await until(() => interactionsOf(page).length === 1, 5_000);
+          await svc.answer(id, interactionsOf(page)[0]!.id, { optionId: 'allow-once' });
+          await until(() => page.lastOutcome() !== undefined, 5_000);
+          expect(page.lastOutcome()).toBe('completed');
+          const runs = (): unknown[] => page.events.flatMap((e) => (e.type === 'runs' ? [e.runs] : []));
+          expect(runs()).toEqual([[{ runId: 'wf_1', stopping: false }]]);
+          expect(svc.busyConversations()).toEqual([id]);
+          expect(svc.closingConversations()).toEqual([id]);
+          const state = await svc.state();
+          expect(state.active).toEqual([
+            { conversationId: id, mode: 'work', busy: false, waiting: false, background: true },
+          ]);
+          expect(state.modes.work.background).toBe(1);
+          const late = new Page(svc, id);
+          await until(() => late.events.length > 0, 5_000);
+          const sync = late.events[0]!;
+          expect(sync.type === 'sync' ? sync.runs : null).toEqual([{ runId: 'wf_1', stopping: false }]);
+          late.detach();
+          expect((await apiError(svc.delete(id))).reason).toBe('conversation-busy');
+          expect((await apiError(svc.patch(id, { modelId: 'qwen3.5-9b' }))).reason).toBe('conversation-busy');
+          expect((await apiError(svc.unloadModels())).reason).toBe('engine-busy');
+          expect((await svc.patch(id, { title: 'Research' })).title).toBe('Research');
+          const missing = await apiError(svc.stopRun(id, 'wf_none'));
+          expect([missing.code, missing.message]).toEqual(['E_NOT_FOUND', 'No such run.']);
+          expect(await svc.stopRun(id, 'wf_1')).toEqual({});
+          await until(() => runs().length === 3, 5_000);
+          expect(runs()).toEqual([[{ runId: 'wf_1', stopping: false }], [{ runId: 'wf_1', stopping: true }], []]);
+          await until(() => svc.busyConversations().length === 0, 5_000);
+          expect(busy.at(-1)).toEqual([]);
+          expect(page.state?.entries.filter((e) => e.kind === 'workflow').map((e) => e.status)).toEqual(['cancelled']);
+          page.detach();
+          await svc.delete(id);
+        },
+        {
+          mutate: workflow({ childOn }),
+          live: { subscribe: () => () => {}, readNow: async () => snapshot },
+          onBusyChange: () => busy.push(service?.busyConversations() ?? []),
+        },
+      );
+    } finally {
+      rmSync(flags, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('Stop run of a Chat conversation is 404', async () => {
+    await withService(async (fake) => {
+      const { conversation } = await fake.service.create({ mode: 'chat', text: 'hello' });
+      const error = await apiError(fake.service.stopRun(conversation.id, 'wf_1'));
+      expect([error.code, error.message]).toEqual(['E_NOT_FOUND', 'No such run.']);
+    });
+  }, 20_000);
+});
+
 describe('Chat service — what MAIN learns of turns and of earlier panel lives', () => {
   it('carries the earlier ends in the host state, and tells of each turn start and end at once', async () => {
     const appEnd = {
@@ -1420,7 +1684,7 @@ describe('Chat service — what MAIN learns of turns and of earlier panel lives'
     }
   }, 20_000);
 
-  it('a turn the agent wakes by itself counts as running until its end line', async () => {
+  it("the host's wake turn counts as running until its end line, and the page sees it as a turn with origin wake", async () => {
     const flags = mkdtempSync(join(tmpdir(), 'mlx-wake-'));
     const startOn = join(flags, 'start');
     const endOn = join(flags, 'end');
@@ -1436,22 +1700,28 @@ describe('Chat service — what MAIN learns of turns and of earlier panel lives'
     service = fake.service;
     try {
       const { conversation } = await fake.service.create({ mode: 'chat', text: 'hello' });
+      const page = new Page(fake.service, conversation.id);
       await until(() => busy.length === 2, 5_000);
       expect(busy).toEqual([[conversation.id], []]);
       writeFileSync(startOn, '');
       await until(() => busy.length === 3, 5_000);
       expect(busy[2]).toEqual([conversation.id]);
       expect(fake.service.busyConversations()).toEqual([conversation.id]);
+      const wake = page.events.find((e) => e.type === 'turn' && e.turn?.origin === 'wake');
+      expect(wake?.type === 'turn' ? wake.turn : null).toMatchObject({ phase: 'running', origin: 'wake' });
+      expect((await apiError(fake.service.prompt(conversation.id, 'again'))).reason).toBe('conversation-busy');
       writeFileSync(endOn, '');
       await until(() => busy.length === 4, 5_000);
       expect(busy[3]).toEqual([]);
+      expect(page.lastOutcome()).toBe('completed');
+      page.detach();
     } finally {
       await fake.close();
       rmSync(flags, { recursive: true, force: true });
     }
   }, 20_000);
 
-  it('a wake whose lines share one stdout chunk with the turn reply counts as running', async () => {
+  it("a host wake whose lines share one stdout chunk with the turn reply shows after the typed turn's end", async () => {
     const flags = mkdtempSync(join(tmpdir(), 'mlx-wake-'));
     const endOn = join(flags, 'end');
     const fake = fakeService('chat-basic', {
@@ -1464,10 +1734,13 @@ describe('Chat service — what MAIN learns of turns and of earlier panel lives'
       const { conversation } = await fake.service.create({ mode: 'chat', text: 'hello' });
       const page = new Page(fake.service, conversation.id);
       await until(() => page.ends().length === 1, 5_000);
-      page.detach();
+      await until(() => page.state?.turn?.origin === 'wake', 5_000);
       expect(fake.service.busyConversations()).toEqual([conversation.id]);
       writeFileSync(endOn, '');
       await until(() => fake.service.busyConversations().length === 0, 5_000);
+      await until(() => page.ends().length === 2, 5_000);
+      expect(page.state?.turn).toBeNull();
+      page.detach();
     } finally {
       await fake.close();
       rmSync(flags, { recursive: true, force: true });

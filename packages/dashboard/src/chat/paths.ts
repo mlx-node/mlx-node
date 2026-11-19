@@ -17,6 +17,7 @@ export interface ChatPaths {
   root: string;
   providers: string;
   conversations: string;
+  modelWindows: string;
   /** `HOME` of the Chat agent: empty, never written by the app. */
   chatHome: string;
   /** cwd of the Chat agent process and of every Chat session: empty. */
@@ -41,6 +42,7 @@ export function chatPaths(root: string = defaultChatRoot()): ChatPaths {
     root,
     providers: join(root, 'providers.json'),
     conversations: join(root, 'conversations.json'),
+    modelWindows: join(root, 'model-windows.json'),
     chatHome: join(root, 'chat-home'),
     chatWorkspace: join(root, 'chat-workspace'),
     chatAgent,

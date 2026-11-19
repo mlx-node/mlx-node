@@ -120,6 +120,24 @@ function update(session, sessionUpdate, fields, xai = false, extraMeta = {}) {
   persistLine(session, xai ? '_x.ai/session/update' : 'session/update', params);
 }
 
+/** A wake turn's prompt: the real agent stores it in updates.jsonl and never sends it live; `live` sends it too. */
+function wakePrompt(session, text, live = false) {
+  if (live) {
+    const meta = { hideFromScrollback: true, promptIndex: session.messages };
+    update(session, 'user_message_chunk', { content: { type: 'text', text }, _meta: meta });
+    return;
+  }
+  persistLine(session, 'session/update', {
+    sessionId: session.id,
+    update: {
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text },
+      _meta: { hideFromScrollback: true },
+    },
+    _meta: { eventId: `${session.id}-${++seq}`, agentTimestampMs: Date.now() },
+  });
+}
+
 function xaiTool(name) {
   if (name === 'use_tool')
     return {
@@ -311,6 +329,7 @@ async function handle(message) {
         authMethods: [{ id: 'xai.api_key', name: 'xai.api_key' }],
         _meta: {
           'x.ai/pluginDirs': init.pluginDirs ?? true,
+          ...(init.workflowControl === false ? {} : { 'x.ai/workflowControl': true }),
           ...(init.agentVersion === null ? {} : { agentVersion: init.agentVersion ?? '1.0.45' }),
           modelState: { currentModelId: models[0]?.modelId ?? 'mlx-local', ...modelsBlock(models[0]?.modelId) },
         },
@@ -413,9 +432,12 @@ async function handle(message) {
       if (faults.abortOnCancel && session?.turn?.asking)
         return endCancelled(session.turn.rpcId, session, 'MidTurnAbort');
       if (session?.turn) session.turn.cancelled = true;
+      else session?.wakeTurn?.cancel();
       session?.turn?.wake?.();
       return;
     }
+    case '_x.ai/workflows/stop':
+      return stopRun(id, params);
     default:
       if (id !== undefined) replyError(id, -32601, 'Method not found');
   }
@@ -438,10 +460,7 @@ async function wakeLater(session, wake) {
   };
   if (wake.together !== true) await fileAppears(wake.startOn);
   const promptId = `task-${randomUUID()}`;
-  update(session, 'user_message_chunk', {
-    content: { type: 'text', text: 'A background task finished.' },
-    _meta: { hideFromScrollback: true },
-  });
+  wakePrompt(session, 'A background task finished.');
   update(session, 'agent_message_chunk', { content: { type: 'text', text: 'Looked at it.' } });
   if (batch !== null) {
     process.stdout.write(batch.join(''));
@@ -461,11 +480,261 @@ async function wakeLater(session, wake) {
   );
 }
 
-async function streamText(session, kind, text, chunk, delayMs) {
+// Workflow runs by id, as the agent's tracker keeps them.
+const runs = new Map();
+
+// As the agent's `build_workflow_updated` (notify.rs): the phases before the current one are done, the current one is
+// done only when the run is `complete` (else active, also once it failed or was cancelled), the rest pending; the
+// current phase stays named after the run ends. Fields the agent has no value for are left out.
+function workflowUpdate(run) {
+  run.revision += 1;
+  const complete = run.status === 'complete';
+  const running = run.agents.find((a) => a.state === 'running');
+  update(
+    run.session,
+    'workflow_updated',
+    {
+      run_id: run.id,
+      revision: run.revision,
+      name: run.name,
+      objective: run.objective,
+      status: run.status,
+      foreground: false,
+      phases: run.phases.map((title, k) => ({
+        title,
+        state: k < run.phase || (k === run.phase && complete) ? 'done' : k === run.phase ? 'active' : 'pending',
+      })),
+      current_phase: run.phases[run.phase],
+      agent_budget: run.budget,
+      agents_used: run.agents.length,
+      agents_reserved: 0,
+      agents_remaining: run.budget - run.agents.length,
+      agent_usage_incomplete: false,
+      elapsed_ms: Date.now() - run.startedAt,
+      active_agents: run.agents.filter((a) => a.state === 'running').length,
+      ...(running === undefined ? {} : { current_agent_label: running.label }),
+      agents: run.agents.map((a) => ({
+        agent_id: a.id,
+        label: a.label,
+        phase: a.phase,
+        model: run.session.model,
+        state: a.state,
+        tokens_used: a.tokens,
+        duration_ms: a.durationMs,
+      })),
+      last_event: run.lastEvent,
+      last_event_timestamp: new Date().toISOString(),
+      ...(run.pauseMessage === null ? {} : { pause_message: run.pauseMessage }),
+      ...(complete ? { result_summary: run.report } : {}),
+    },
+    true,
+  );
+}
+
+/** Waits for the gate file, or `ms`; false when the run was stopped meanwhile. */
+async function runGate(run, path, ms) {
+  if (typeof path === 'string') while (!existsSync(path) && !run.stopped) await sleep(10);
+  else if (typeof ms === 'number') await sleep(ms);
+  return !run.stopped;
+}
+
+// A `workflow` step: the run starts inside the typed turn (`workflow_updated` active, `subagent_spawned`, a second
+// `workflow_updated` with the helper row); the rest runs on its own after the step, each part behind its gate (a file
+// path, else a delay): the helper's shell call and its permission request with `x.ai/requester` (`childOn`/`childAfterMs`),
+// the helper's end and the terminal `workflow_updated` with `result_summary` (`completeOn`/`completeAfterMs`), then the
+// wake turn (`wakeEndOn`/`wakeEndAfterMs` holds its end line). `_x.ai/workflows/stop` ends the run at any gate
+// (`stopOn` holds the stop until its file exists). `askAfterEnd`: the helper asks only after the terminal update, as a
+// late ask of a run that has ended. A `complete` run reaches its last phase first; `failed` keeps its phase and sends
+// `pause_message`.
+function startWorkflow(session, w, n) {
+  const run = {
+    id: w.runId ?? `wf_${n}`,
+    session,
+    name: w.name ?? 'deep-research',
+    objective: w.objective ?? 'Answer the question.',
+    status: 'active',
+    revision: 0,
+    phases: w.phases ?? ['Plan', 'Research', 'Report'],
+    phase: 0,
+    budget: w.budget ?? 8,
+    agents: [],
+    lastEvent: 'run_started',
+    report: w.report ?? '# Findings\n\nThe probe found three files.',
+    startedAt: Date.now(),
+    stopped: false,
+    stopOn: w.stopOn ?? null,
+    pauseMessage: null,
+  };
+  runs.set(run.id, run);
+  workflowUpdate(run);
+  const agent = {
+    id: `${run.id}-a0`,
+    child: w.childSessionId ?? `${session.id}-child-${n}`,
+    label: w.label ?? 'researcher-0',
+    phase: run.phases[1] ?? run.phases[0],
+    state: 'running',
+    tokens: 0,
+    durationMs: 0,
+  };
+  run.agents.push(agent);
+  update(
+    session,
+    'subagent_spawned',
+    {
+      subagent_id: agent.id,
+      child_session_id: agent.child,
+      parent_session_id: session.id,
+      subagent_type: 'general-purpose',
+      description: agent.label,
+      workflow_run_id: run.id,
+    },
+    true,
+  );
+  run.phase = Math.min(1, run.phases.length - 1);
+  run.lastEvent = 'agent_started';
+  workflowUpdate(run);
+  void runWorkflow(run, agent, w);
+}
+
+async function runWorkflow(run, agent, w) {
+  const session = run.session;
+  const child = { id: agent.child, cwd: w.childCwd ?? session.cwd };
+  if (!(await runGate(run, w.childOn, w.childAfterMs))) return;
+  const toolCallId = `${run.id}-call-1`;
+  const meta = { 'x.ai/tool': xaiTool('run_terminal_command') };
+  const rawInput = { variant: 'Bash', command: w.command ?? 'ls', description: 'run', is_background: false };
+  update(child, 'tool_call', { toolCallId, title: 'run_terminal_command', rawInput, _meta: meta });
+  const ask = async () => {
+    const answer = await agentRequest('session/request_permission', {
+      sessionId: session.id,
+      toolCall: { toolCallId, kind: 'execute', title: 'run', rawInput, _meta: meta },
+      options: PERMISSION_OPTIONS,
+      _meta: {
+        ...(session.guard === null ? {} : { hookAsk: { hookName: session.guard } }),
+        'x.ai/requester': { sessionId: child.id, label: agent.label, runId: run.id, cwd: child.cwd },
+      },
+    });
+    const outcome = answer?.outcome;
+    const optionId = outcome?.outcome === 'selected' ? outcome.optionId : null;
+    record({ kind: 'child-answer', runId: run.id, toolCallId, answer: optionId });
+    return optionId === 'allow-once' || optionId === 'always-allow';
+  };
+  let allowed = true;
+  if (w.ask !== false && w.askAfterEnd !== true) {
+    allowed = await ask();
+    if (run.stopped) return;
+  }
+  if (w.askAfterEnd !== true)
+    update(child, 'tool_call_update', { toolCallId, status: allowed ? 'completed' : 'failed' });
+  if (!(await runGate(run, w.completeOn, w.completeAfterMs))) return;
+  agent.state = 'done';
+  agent.tokens = 1200;
+  agent.durationMs = Date.now() - run.startedAt;
+  update(
+    session,
+    'subagent_finished',
+    {
+      subagent_id: agent.id,
+      child_session_id: agent.child,
+      status: 'completed',
+      duration_ms: agent.durationMs,
+      tokens_used: agent.tokens,
+    },
+    true,
+  );
+  run.status = w.status ?? 'complete';
+  run.lastEvent = 'run_finished';
+  if (run.status === 'complete') run.phase = run.phases.length - 1;
+  if (run.status === 'failed') run.pauseMessage = w.error ?? 'The script failed.';
+  workflowUpdate(run);
+  if (w.askAfterEnd === true) {
+    const late = await ask();
+    update(child, 'tool_call_update', { toolCallId, status: late ? 'completed' : 'failed' });
+  }
+  if (w.wake === false) return;
+  await wakeTurn(session, `workflow-completed-${run.id}-${run.revision}`, w);
+}
+
+/** The agent's own turn after a run ended: a hidden prompt, an answer, then its end line (`session/cancel` ends it). */
+async function wakeTurn(session, promptId, w) {
+  let cancel = () => {};
+  let wasCancelled = false;
+  const cancelled = new Promise((resolve) => {
+    cancel = () => {
+      wasCancelled = true;
+      resolve(true);
+    };
+  });
+  session.wakeTurn = { cancel };
+  wakePrompt(session, 'A workflow finished. Read its report.', w.wakeEcho === true);
+  update(session, 'agent_message_chunk', { content: { type: 'text', text: 'The report is ready.' } });
+  if (w.wakeAsk === true) {
+    const toolCallId = `${promptId}-ask`;
+    const meta = { 'x.ai/tool': xaiTool('run_terminal_command') };
+    const rawInput = { variant: 'Bash', command: 'pwd', description: 'run', is_background: false };
+    update(session, 'tool_call', { toolCallId, title: 'run_terminal_command', rawInput, _meta: meta });
+    const answer = await Promise.race([
+      agentRequest('session/request_permission', {
+        sessionId: session.id,
+        toolCall: { toolCallId, kind: 'execute', title: 'run', rawInput, _meta: meta },
+        options: PERMISSION_OPTIONS,
+        ...(session.guard === null ? {} : { _meta: { hookAsk: { hookName: session.guard } } }),
+      }),
+      cancelled,
+    ]);
+    record({ kind: 'wake-answer', answer: answer === true ? 'cancelled-turn' : (answer?.outcome ?? null) });
+  }
+  if (!wasCancelled) {
+    await Promise.race([
+      (async () => {
+        if (typeof w.wakeEndOn === 'string') while (!existsSync(w.wakeEndOn) && !wasCancelled) await sleep(10);
+        else if (typeof w.wakeEndAfterMs === 'number') await sleep(w.wakeEndAfterMs);
+      })(),
+      cancelled,
+    ]);
+  }
+  session.wakeTurn = null;
+  update(
+    session,
+    'turn_completed',
+    {
+      prompt_id: promptId,
+      stop_reason: wasCancelled ? 'cancelled' : 'end_turn',
+      usage: { inputTokens: 1, outputTokens: 1, modelCalls: 1 },
+      elapsed_ms: 10,
+    },
+    true,
+  );
+}
+
+/** `x.ai/workflows/stop`: an active run is cancelled with no wake; any other answer is a rejection. */
+async function stopRun(id, params) {
+  const sessionId = params?.sessionId;
+  const runId = params?.runId;
+  if (typeof sessionId !== 'string' || sessionId.trim() === '' || typeof runId !== 'string' || runId.trim() === '')
+    return replyError(id, -32602, 'Invalid params');
+  if (!sessions.has(sessionId)) return replyError(id, -32602, 'Invalid params', `unknown session id: ${sessionId}`);
+  record({ kind: 'stop', runId });
+  const run = runs.get(runId);
+  if (typeof run?.stopOn === 'string') while (!existsSync(run.stopOn)) await sleep(10);
+  if (run === undefined || run.session.id !== sessionId)
+    return reply(id, { outcome: 'rejected', code: 'workflow_control_unknown_run', detail: `no run ${runId}` });
+  if (run.status !== 'active')
+    return reply(id, { outcome: 'rejected', code: 'workflow_control_not_applicable', detail: run.status });
+  run.stopped = true;
+  run.status = 'cancelled';
+  run.lastEvent = 'run_stopped';
+  for (const a of run.agents) if (a.state === 'running') a.state = 'cancelled';
+  reply(id, { outcome: 'stopped', runId: run.id, name: run.name });
+  workflowUpdate(run);
+}
+
+async function streamText(session, kind, text, chunk, delayMs, totalTokens) {
   const size = chunk ?? text.length;
+  const meta = totalTokens === undefined ? {} : { totalTokens };
   for (let i = 0; i < text.length; i += size) {
     if (session.turn.cancelled) return;
-    update(session, kind, { content: { type: 'text', text: text.slice(i, i + size) } });
+    update(session, kind, { content: { type: 'text', text: text.slice(i, i + size) } }, false, meta);
     if (delayMs) await sleep(delayMs);
   }
 }
@@ -560,11 +829,61 @@ async function runPrompt(id, params) {
       });
       continue;
     }
+    // As the agent's auto compaction (`run_compact_only`): started, then completed or failed after `ms` (`none`: no end
+    // update, as when the agent dies); Stop during it sends cancelled and ends the turn.
+    if (step.compact !== undefined) {
+      const c = step.compact;
+      const percentage = c.percentage ?? 85;
+      update(
+        session,
+        'auto_compact_started',
+        {
+          tokens_used: c.tokensBefore ?? 222_822,
+          context_window: c.window ?? 262_144,
+          percentage,
+          reason: `Context window ${percentage}% full`,
+        },
+        true,
+      );
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, c.ms ?? 0);
+        session.turn.wake = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+      });
+      if (session.turn === null) return;
+      if (session.turn.cancelled) {
+        update(session, 'auto_compact_cancelled', { reason: 'user_cancelled' }, true);
+        return endCancelled(id, session, 'MidTurnAbort');
+      }
+      if (c.outcome === 'none') continue;
+      if (c.outcome === 'failed')
+        update(
+          session,
+          'auto_compact_failed',
+          { error: c.error ?? "it'll retry on the next turn, or start a new session using /new.\nstream idle timeout" },
+          true,
+        );
+      else
+        update(
+          session,
+          'auto_compact_completed',
+          {
+            tokens_before: c.tokensBefore ?? 222_822,
+            tokens_after: c.tokensAfter ?? 31_204,
+            elapsed_ms: c.ms ?? 0,
+            summary_preview: null,
+          },
+          true,
+        );
+      continue;
+    }
     if (step.exit !== undefined) process.exit(step.exit);
     if (step.thought !== undefined)
-      await streamText(session, 'agent_thought_chunk', step.thought, step.chunk, step.delayMs);
+      await streamText(session, 'agent_thought_chunk', step.thought, step.chunk, step.delayMs, step.totalTokens);
     else if (step.text !== undefined)
-      await streamText(session, 'agent_message_chunk', step.text, step.chunk, step.delayMs);
+      await streamText(session, 'agent_message_chunk', step.text, step.chunk, step.delayMs, step.totalTokens);
     else if (step.webCall !== undefined) {
       const call = step.webCall;
       const toolCallId = call.id ?? `toolu_${n}`;
@@ -822,6 +1141,8 @@ async function runPrompt(id, params) {
         status: t.status ?? 'completed',
         content: [{ type: 'content', content: { type: 'text', text: t.output ?? '' } }],
       });
+    } else if (step.workflow !== undefined) {
+      startWorkflow(session, step.workflow, n);
     } else if (step.plan !== undefined) {
       update(session, 'plan', { entries: step.plan });
     } else if (step.modelChanged !== undefined) {

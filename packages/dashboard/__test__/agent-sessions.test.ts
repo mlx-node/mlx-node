@@ -234,6 +234,11 @@ describe('AgentSessionsReader.list', () => {
 });
 
 describe('AgentSessionsReader.detail', () => {
+  it('carries the last _meta.totalTokens of updates.jsonl as the context use, absent when no line has one', () => {
+    expect(reader().detail(P)!.contextUsed).toBe(2371);
+    expect(reader().detail(M)!).not.toHaveProperty('contextUsed');
+  });
+
   it('links subagent children from meta.json, across cwd folders', () => {
     const detail = reader().detail(P)!;
     expect(detail.session.subagents).toEqual([

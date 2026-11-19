@@ -68,7 +68,7 @@ import type { RerankerFamilyOptions, RerankerModel } from '@mlx-node/rerank/type
 import type { AudioModel } from '../audio-registry.js';
 import type { AudioServiceOptions } from '../audio-service.js';
 import type { ServerHealth } from '../health.js';
-import { readWarmupReport } from '../native-progress.js';
+import { readResidency, readWarmupReport } from '../native-progress.js';
 import { resolveRerankLimits, type RerankServiceOptions } from '../rerank-service.js';
 import type { HostKind } from '../runtime-trace.js';
 import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance } from '../server.js';
@@ -241,6 +241,15 @@ export interface InferenceHostOptions {
    * see it. Omitted ⇒ 0.5.
    */
   decodeShare?: number;
+  /**
+   * Int8 activations (`--activations`) for qwen3_5 / qwen3_5_moe loads:
+   * `'auto'` lets the paged attention over an int8 pool score int8 queries for
+   * rows at position 7,168 or later on M5 and later; `'bf16'` keeps every query
+   * bf16. Other families never see it. Omitted ⇒ the load default: `'auto'`
+   * for a qwen3_5 load with a DFlash2 draft, `'bf16'` for a qwen3_5 load with
+   * none and for qwen3_5_moe.
+   */
+  activations?: 'auto' | 'bf16';
   /** See `ServerConfig.thinkingTokenBudget`. */
   thinkingTokenBudget?: number;
   /** See `ServerConfig.thinkingCycleGuard`. */
@@ -502,6 +511,8 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     port: requestedPort,
     host: bindHost,
     resolveModel: resolveHttpModel,
+    bindLoadedModel: (name: string): boolean =>
+      acceptingHttpModelLoads && (ctrlRef.current?.bindLoadedAlias?.(name) ?? false),
     listModels: () => ctrlRef.current!.listModels(),
     idleReleaseMs: idleReleaseSeconds * 1000,
     releaseWeights: () => chatRef.current!.releaseAll!(),
@@ -560,6 +571,9 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       ...(opts.decodeShare !== undefined && familyDataFor(entry.modelType)?.acceptsDecodeShare === true
         ? { decodeShare: opts.decodeShare }
         : {}),
+      ...(opts.activations !== undefined && familyDataFor(entry.modelType)?.acceptsActivations === true
+        ? { activations: opts.activations }
+        : {}),
       ...(familyDataFor(entry.modelType)?.acceptsCacheDisk === true
         ? {
             ...(opts.cacheDisk !== undefined ? { cacheDisk: opts.cacheDisk } : {}),
@@ -575,6 +589,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
           capability: 'chat',
           path: resolvedPath,
           warmupOf: readWarmupReport,
+          residencyOf: readResidency,
         },
         () => (Object.keys(options).length === 0 ? loadModelFn(resolvedPath) : loadModelFn(resolvedPath, options)),
       );
@@ -595,8 +610,13 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
       ...(opts.cacheDisk !== undefined ? { cacheDisk: opts.cacheDisk } : {}),
     },
   );
-  const chatController = makeSwapController(models, server.registry, loadModelPagedAware, boundEntry.name, (name) =>
-    estimates.get(name),
+  const chatController = makeSwapController(
+    models,
+    server.registry,
+    loadModelPagedAware,
+    boundEntry.name,
+    (name) => estimates.get(name),
+    (entry) => familyDataFor(entry.modelType)?.loadsAlone === true,
   );
   chatRef.current = chatController;
   const audioLoader = opts.loadAudioModel ?? loadAudioModel;
@@ -861,8 +881,8 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
  * The native load-free estimate of an entry's family: qwen4_exp has its own
  * memory plan (a streamed expert store), so the qwen3_5 estimator never prices
  * it. Every qwen4_exp turn (AR or MTP) takes its one window, which is the
- * estimate. qwen4_exp takes `kvFormat`, `maxMemoryBytes`, `maxContextTokens`
- * and `cacheDisk`: the load sets its state staging aside only while its SSD
+ * estimate. qwen4_exp takes `draftModelPath`, `kvFormat`, `maxMemoryBytes`,
+ * `maxContextTokens` and `cacheDisk`: the load sets its state staging aside only while its SSD
  * cache is on, so the estimate must decide that as the load does.
  */
 export function nativeContextEstimate(
@@ -872,6 +892,7 @@ export function nativeContextEstimate(
   return async (path, modelType, options) => {
     if (modelType !== 'qwen4_exp') return qwen35(path, modelType, options);
     const qwen4Options = {
+      ...(options?.draftModelPath != null ? { draftModelPath: options.draftModelPath } : {}),
       ...(options?.kvFormat !== undefined ? { kvFormat: options.kvFormat } : {}),
       ...(options?.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
       ...(options?.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),

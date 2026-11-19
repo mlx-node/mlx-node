@@ -1,4 +1,5 @@
 import type { LoadableModel } from '@mlx-node/lm';
+import { MODEL_FAMILY_DATA, familyDataFor } from '@mlx-node/lm/family-data';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import {
@@ -8,6 +9,7 @@ import {
 } from '../../../packages/server/src/host/capability-models.js';
 import type { DiscoveredModel } from '../../../packages/server/src/host/discover.js';
 import { makeSwapController } from '../../../packages/server/src/host/swap.js';
+import { ModelWorkCoordinator } from '../../../packages/server/src/model-work-coordinator.js';
 import { ModelRegistry } from '../../../packages/server/src/registry.js';
 
 interface FakeRegistry {
@@ -504,5 +506,385 @@ describe('makeSwapController', () => {
     await ctrl.resolveModel('a');
     expect(events).toEqual(['close /fake/a', 'closed /fake/a', 'load /fake/a']);
     for (const left of deadlines) expect(left).toBeGreaterThan(5000);
+  });
+});
+
+describe('bindLoadedAlias', () => {
+  /** Loads `/fake/b` only once `openB` is called. */
+  function gatedLoader(): {
+    loader: ReturnType<typeof vi.fn<(path: string) => Promise<LoadableModel>>>;
+    openB: () => void;
+  } {
+    let openB!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      openB = resolve;
+    });
+    const loader = vi.fn(async (path: string) => {
+      if (path === '/fake/b') await gate;
+      return { marker: path } as unknown as LoadableModel;
+    });
+    return { loader, openB };
+  }
+
+  it('binds an unknown name to the loaded model with no load', async () => {
+    const reg = fakeRegistry();
+    const loader = vi.fn(async (path: string) => ({ marker: path }) as unknown as LoadableModel);
+    const ctrl = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, loader, 'a');
+    await ctrl.resolveModel('a');
+
+    expect(ctrl.bindLoadedAlias!('mlx-local')).toBe(true);
+    expect(reg.getAny('mlx-local')).toBe(reg.getAny('a'));
+    expect(ctrl.bindLoadedAlias!('b')).toBe(false);
+    expect(loader).toHaveBeenCalledTimes(1);
+  });
+
+  // Mutation: the residency guard removed from `bindLoadedAlias` → red.
+  it('binds nothing before the first load and after an unload', async () => {
+    const reg = fakeRegistry();
+    const loader = vi.fn(async (path: string) => ({ marker: path }) as unknown as LoadableModel);
+    const ctrl = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, loader, 'a');
+    expect(ctrl.bindLoadedAlias!('mlx-local')).toBe(false);
+    await ctrl.resolveModel('a');
+    await ctrl.disposeAll!();
+    expect(ctrl.bindLoadedAlias!('mlx-local')).toBe(false);
+    expect(reg.list()).toEqual([]);
+  });
+
+  // Mutation: `bindLoadedAlias` does not add the name to the alias set → red.
+  it('a bound alias follows the next swap', async () => {
+    const reg = fakeRegistry();
+    const loader = vi.fn(async (path: string) => ({ marker: path }) as unknown as LoadableModel);
+    const ctrl = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, loader, 'a');
+    await ctrl.resolveModel('a');
+    expect(ctrl.bindLoadedAlias!('mlx-local')).toBe(true);
+
+    await ctrl.resolveModel('b');
+    expect(reg.getAny('mlx-local')).toEqual({ marker: '/fake/b' });
+  });
+
+  // Mutation: `bindLoadedAlias` ignores `pending` → red.
+  it('binds nothing while a swap or an unload is in progress', async () => {
+    const reg = fakeRegistry();
+    const { loader, openB } = gatedLoader();
+    const ctrl = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, loader, 'a');
+    await ctrl.resolveModel('a');
+
+    const swap = ctrl.resolveModel('b');
+    expect(ctrl.bindLoadedAlias!('mlx-local')).toBe(false);
+    openB();
+    await swap;
+    expect(ctrl.bindLoadedAlias!('mlx-local')).toBe(true);
+    expect(reg.getAny('mlx-local')).toEqual({ marker: '/fake/b' });
+
+    const unload = ctrl.disposeAll!();
+    expect(ctrl.bindLoadedAlias!('other-alias')).toBe(false);
+    await unload;
+    expect(reg.list()).toEqual([]);
+  });
+
+  // Mutation: `withCapabilityModels` forwards in 'single' residency → red.
+  it('the capability wrapper forwards unknown names only, and never under single residency', async () => {
+    for (const residency of ['capability', 'single'] as const) {
+      const reg = fakeRegistry();
+      const loader = vi.fn(async (path: string) => ({ marker: path }) as unknown as LoadableModel);
+      const chat = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, loader, 'a');
+      const ctrl = withCapabilityModels([chatCapability(chat, reg as unknown as ModelRegistry)], residency);
+      await ctrl.resolveModel('a');
+      expect(ctrl.bindLoadedAlias!('b')).toBe(false);
+      expect(ctrl.bindLoadedAlias!('mlx-local')).toBe(residency === 'capability');
+    }
+  });
+});
+
+describe('makeSwapController, a target that loads alone', () => {
+  interface Stub {
+    path: string;
+    disposed: boolean;
+    chatSessionStart: () => void;
+    chatStreamSessionStart: () => void;
+    dispose: () => Promise<void>;
+  }
+
+  function stub(path: string, events: string[]): Stub {
+    const model: Stub = {
+      path,
+      disposed: false,
+      chatSessionStart: vi.fn(),
+      chatStreamSessionStart: vi.fn(),
+      dispose: async () => {
+        events.push(`dispose ${path}`);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        model.disposed = true;
+        events.push(`disposed ${path}`);
+      },
+    };
+    return model;
+  }
+
+  /** `old` then `flash` (which loads alone) with the alias `mlx-local` bound on `old`. */
+  async function setup(opts: { fail?: (path: string) => boolean; alone?: (name: string) => boolean } = {}) {
+    const registry = new ModelRegistry();
+    const events: string[] = [];
+    const models = new Map<string, Stub>();
+    const seen: Array<{ path: string; local: unknown; old: unknown }> = [];
+    const asked: string[] = [];
+    const loader = vi.fn(async (path: string) => {
+      seen.push({ path, local: registry.getAny('mlx-local'), old: registry.getAny('old') });
+      events.push(`load ${path}`);
+      if (opts.fail?.(path) === true) throw new Error(`refusing to load ${path}`);
+      const model = stub(path, events);
+      models.set(path, model);
+      return model as unknown as LoadableModel;
+    });
+    const ctrl = makeSwapController(
+      discovered(['flash', 'old', 'other']),
+      registry,
+      loader,
+      'old',
+      undefined,
+      (entry) => {
+        asked.push(entry.name);
+        return (opts.alone ?? ((name) => name === 'flash'))(entry.name);
+      },
+    );
+    await ctrl.resolveModel('old');
+    await ctrl.resolveModel('mlx-local');
+    seen.length = 0;
+    events.length = 0;
+    return { registry, events, models, seen, asked, loader, ctrl, old: models.get('/fake/old')! };
+  }
+
+  // MUTATION: skip the wait for `settleModelDisposals` -> the loader runs before the dispose resolved -> red.
+  it('disposes the idle old model and every alias, and waits for it, before the load', async () => {
+    const { registry, events, seen, ctrl, old } = await setup();
+    await ctrl.resolveModel('flash');
+    expect(seen).toEqual([{ path: '/fake/flash', local: undefined, old: undefined }]);
+    expect(events).toEqual(['dispose /fake/old', 'disposed /fake/old', 'load /fake/flash']);
+    expect(old.disposed).toBe(true);
+    expect(registry.getAny('flash')).toBeDefined();
+  });
+
+  // MUTATION: the carried aliases are not bound to the new model -> `mlx-local` is unregistered -> red.
+  it('binds every carried alias to the new model after that load', async () => {
+    const { registry, models, ctrl, loader } = await setup();
+    await ctrl.resolveModel('flash');
+    expect(registry.getAny('mlx-local')).toBe(models.get('/fake/flash'));
+    await ctrl.resolveModel('mlx-local');
+    expect(loader.mock.calls.map(([path]) => path)).toEqual(['/fake/old', '/fake/flash']);
+  });
+
+  // MUTATION: `bindLoadedAlias` ignores `pending` -> the name binds to the old model the swap disposes -> red.
+  it('binds no new name while the swap runs, then binds it to the new model', async () => {
+    const { registry, events, models, ctrl, loader } = await setup();
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    let started!: () => void;
+    const loading = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    loader.mockImplementationOnce(async (path: string) => {
+      events.push(`load ${path}`);
+      started();
+      await gate;
+      const model = stub(path, events);
+      models.set(path, model);
+      return model as unknown as LoadableModel;
+    });
+    const swap = ctrl.resolveModel('flash');
+    expect(ctrl.bindLoadedAlias!('claude-haiku')).toBe(false);
+    await loading;
+    expect(events).toEqual(['dispose /fake/old', 'disposed /fake/old', 'load /fake/flash']);
+    expect(ctrl.bindLoadedAlias!('claude-haiku')).toBe(false);
+    expect(registry.getAny('claude-haiku')).toBeUndefined();
+    open();
+    await swap;
+    expect(registry.getAny('claude-haiku')).toBeUndefined();
+    expect(ctrl.bindLoadedAlias!('claude-haiku')).toBe(true);
+    expect(registry.getAny('claude-haiku')).toBe(models.get('/fake/flash'));
+  });
+
+  // MUTATION: the selection moves to the target before the load -> the next alias request loads the target -> red.
+  it('leaves nothing resident when the load fails, and the next alias request loads the old entry again', async () => {
+    let failing = true;
+    const { registry, events, ctrl, loader } = await setup({ fail: (path) => failing && path === '/fake/flash' });
+    await expect(ctrl.resolveModel('flash')).rejects.toThrow('refusing to load');
+    expect(events).toEqual(['dispose /fake/old', 'disposed /fake/old', 'load /fake/flash']);
+    expect(registry.list()).toEqual([]);
+    expect(registry.getAny('mlx-local')).toBeUndefined();
+    failing = false;
+    await ctrl.resolveModel('mlx-local');
+    expect(loader.mock.calls.map(([path]) => path)).toEqual(['/fake/old', '/fake/flash', '/fake/old']);
+    expect(registry.getAny('old')).toBeDefined();
+    expect(registry.getAny('mlx-local')).toBe(registry.getAny('old'));
+  });
+
+  // MUTATION: the busy check is removed -> the loader sees the alias gone -> red.
+  it.each(['dispatch lease', 'persist retention'] as const)(
+    'keeps the aliases on the old model through the load while it holds a %s, then disposes it at the release',
+    async (hold) => {
+      const { registry, events, models, seen, ctrl, old } = await setup();
+      const release =
+        hold === 'dispatch lease'
+          ? (() => {
+              const lease = registry.acquireDispatchLease('mlx-local')!;
+              return () => registry.releaseDispatchLease(lease.model);
+            })()
+          : (() => {
+              const model = registry.getAny('mlx-local') as Parameters<ModelRegistry['retainBinding']>[0];
+              registry.retainBinding(model);
+              return () => registry.releaseBinding(model);
+            })();
+      await ctrl.resolveModel('flash');
+      expect(seen).toEqual([{ path: '/fake/flash', local: old, old: undefined }]);
+      expect(events).toEqual(['load /fake/flash']);
+      expect(old.disposed).toBe(false);
+      expect(registry.getAny('mlx-local')).toBe(models.get('/fake/flash'));
+      release();
+      await registry.settleModelDisposals();
+      expect(old.disposed).toBe(true);
+    },
+  );
+
+  // MUTATION: the predicate is taken as always true -> the loader sees the alias gone -> red.
+  it('keeps the aliases on the old model until a target that does not load alone has loaded, then disposes it', async () => {
+    const { events, models, seen, ctrl, old, registry } = await setup();
+    await ctrl.resolveModel('other');
+    expect(seen).toEqual([{ path: '/fake/other', local: old, old: undefined }]);
+    expect(events).toEqual(['load /fake/other', 'dispose /fake/old', 'disposed /fake/old']);
+    expect(registry.getAny('mlx-local')).toBe(models.get('/fake/other'));
+  });
+
+  it('asks nothing and disposes nothing on a first load or a load of the same model', async () => {
+    const { events, asked, ctrl, registry, old } = await setup();
+    expect(asked).toEqual([]);
+    await ctrl.resolveModel('old');
+    expect(events).toEqual([]);
+    expect(old.disposed).toBe(false);
+    await ctrl.releaseAll!();
+    events.length = 0;
+    await ctrl.resolveModel('mlx-local');
+    expect(asked).toEqual([]);
+    expect(events).toEqual(['load /fake/old']);
+    expect(registry.getAny('mlx-local')).toBe(registry.getAny('old'));
+  });
+
+  it('flags qwen4_exp alone among the families', () => {
+    const alone = MODEL_FAMILY_DATA.map((family) => family.id).filter((id) => familyDataFor(id)?.loadsAlone === true);
+    expect(alone).toEqual(['qwen4_exp']);
+  });
+});
+
+describe('makeSwapController, a request resolved just before a switch to a target that loads alone', () => {
+  interface Stub {
+    path: string;
+    disposed: boolean;
+    chatSessionStart: () => void;
+    chatStreamSessionStart: () => void;
+    dispose: () => Promise<void>;
+  }
+
+  const later = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 10));
+
+  /** The host's wiring: a real registry with the coordinator attached; `old` resident unless `cold`. */
+  async function setup(cold: boolean) {
+    const registry = new ModelRegistry();
+    const coordinator = new ModelWorkCoordinator();
+    registry.setModelLoadAdmissionCoordinator(coordinator);
+    const models = new Map<string, Stub>();
+    const seen: Array<{ path: string; alias: unknown }> = [];
+    const loader = vi.fn(async (path: string) => {
+      seen.push({ path, alias: registry.getAny('claude-haiku') ?? registry.getAny('mlx-local') });
+      const model: Stub = {
+        path,
+        disposed: false,
+        chatSessionStart: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        dispose: async () => {
+          model.disposed = true;
+        },
+      };
+      models.set(path, model);
+      return model as unknown as LoadableModel;
+    });
+    const ctrl = makeSwapController(
+      discovered(['flash', 'old']),
+      registry,
+      loader,
+      'old',
+      undefined,
+      (entry) => entry.name === 'flash',
+    );
+    if (!cold) {
+      await ctrl.resolveModel('old');
+      await ctrl.resolveModel('mlx-local');
+    }
+    seen.length = 0;
+    const load = (name: string): Promise<void> => coordinator.withModelLoad(() => ctrl.resolveModel(name), name);
+    return { registry, coordinator, models, seen, ctrl, load };
+  }
+
+  /** The lease the request takes: a live model, held until `release`. */
+  function lease(registry: ModelRegistry, name: string): { model: Stub; release: () => void } {
+    const held = registry.acquireDispatchLease(name);
+    expect(held, `${name} resolves to a model`).toBeDefined();
+    const model = held!.model as unknown as Stub;
+    expect(model.disposed).toBe(false);
+    return { model, release: () => registry.releaseDispatchLease(held!.model) };
+  }
+
+  // MUTATION swap-no-permit: the pre-dispatch permits are not counted -> the alias is gone -> red.
+  it('cold start: an alias request holds its permit past the resolve, then the switch is queued', async () => {
+    const { registry, coordinator, models, seen, load } = await setup(true);
+    const request = (async () => {
+      const admission = coordinator.beginRequestLoadAdmission('claude-haiku');
+      await load('claude-haiku');
+      await later();
+      const held = lease(registry, 'claude-haiku');
+      admission.release();
+      return held;
+    })();
+    const swap = load('flash');
+    const held = await request;
+    await swap;
+    held.release();
+    expect(seen).toEqual([
+      { path: '/fake/old', alias: undefined },
+      { path: '/fake/flash', alias: models.get('/fake/old') },
+    ]);
+    expect(registry.getAny('claude-haiku')).toBe(models.get('/fake/flash'));
+  });
+
+  // MUTATION swap-no-permit -> red.
+  it('old resident: a bound alias request takes its permit and the switch comes in the same tick', async () => {
+    const { registry, models, seen, load } = await setup(false);
+    const request = (async () => {
+      const admission = registry.getSessionRegistry('mlx-local')!.beginPreDispatchAdmission();
+      await later();
+      const held = lease(registry, 'mlx-local');
+      admission.release();
+      return held;
+    })();
+    const swap = load('flash');
+    const held = await request;
+    await swap;
+    held.release();
+    expect(seen).toEqual([{ path: '/fake/flash', alias: models.get('/fake/old') }]);
+  });
+
+  // MUTATION swap-no-yield: the switch decides before the resolved request resumes -> red.
+  it('old resident, no coordinator: a new alias request takes its lease as it resumes, then the switch', async () => {
+    const { registry, models, seen, ctrl } = await setup(false);
+    const request = (async () => {
+      await ctrl.resolveModel('claude-haiku');
+      return lease(registry, 'claude-haiku');
+    })();
+    const swap = ctrl.resolveModel('flash');
+    const held = await request;
+    expect(held.model).toBe(models.get('/fake/old'));
+    await swap;
+    held.release();
+    expect(seen).toEqual([{ path: '/fake/flash', alias: models.get('/fake/old') }]);
   });
 });

@@ -60,7 +60,7 @@ export interface AutoInput {
   interaction: PermissionInteraction;
   /** This start's guard hook name; null in Chat. */
   guardHook: string | null;
-  /** A helper agent may work in another folder in this session. */
+  /** The request is a helper's whose folder is not the Work folder. */
   elsewhere: boolean;
   facts: AutoFacts;
   /** Calls Auto allowed in this turn since the user's last allow. */

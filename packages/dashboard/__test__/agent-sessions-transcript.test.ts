@@ -14,7 +14,7 @@ import {
 } from '../src/agent-sessions/transcript.js';
 import type { TranscriptEntry } from '../src/agent-sessions/types.js';
 import { redactEntry } from '../src/chat/redact.js';
-import { HIDDEN_TEXT, WOKEN_T, wokenParentText } from './helpers/woken-turn.js';
+import { HIDDEN_TEXT, WOKEN_PHASES, WOKEN_REPORT, WOKEN_RUN, WOKEN_T, wokenParentText } from './helpers/woken-turn.js';
 
 const SESSIONS = fileURLToPath(new URL('./fixtures/grok-sessions/home/sessions', import.meta.url));
 const PARENT = `${SESSIONS}/%2FUsers%2Fdev%2Fproj/01a20000-0000-7000-8000-00000000000a/updates.jsonl`;
@@ -784,9 +784,96 @@ describe('parseUpdates: wake prompts', () => {
       hidden('woke', 5),
     ];
     const parsed = parseUpdates(`${lines.join('\n')}\n`);
-    expect(parsed.transcript.map((e) => e.kind)).toEqual(['user', 'turn-end', 'wake']);
-    expect(parsed.transcript[2]).toMatchObject({ cause: 'unknown' });
+    expect(parsed.transcript.map((e) => e.kind)).toEqual(['user', 'turn-end', 'workflow', 'wake']);
+    expect(parsed.transcript[3]).toMatchObject({ cause: 'unknown' });
     expect(parsed.transcript[0]).toMatchObject({ kind: 'user', text: 'typed' });
+  });
+});
+
+describe('parseUpdates: workflow runs', () => {
+  type Run = Extract<TranscriptEntry, { kind: 'workflow' }>;
+  const runs = (entries: readonly TranscriptEntry[]): Run[] => entries.filter((e): e is Run => e.kind === 'workflow');
+  const line = (runId: string, revision: number, status: string, n: number, extra: object = {}) =>
+    xai({ sessionUpdate: 'workflow_updated', run_id: runId, name: 'deep-research', status, revision, ...extra }, n);
+
+  it('a woken session holds one entry for its run, in the turn that started it, with the last revision and the report', () => {
+    const parsed = parseUpdates(wokenParentText());
+    const found = runs(parsed.transcript);
+    expect(found).toHaveLength(1);
+    const run = found[0]!;
+    expect(parsed.transcript.indexOf(run)).toBeLessThan(parsed.transcript.findIndex((e) => e.kind === 'turn-end'));
+    expect(run).toMatchObject({
+      kind: 'workflow',
+      ts: WOKEN_T + 60_702,
+      updatedTs: WOKEN_T + 2_680_142,
+      runId: WOKEN_RUN,
+      revision: 30,
+      name: 'deep-research',
+      status: 'complete',
+      currentPhase: null,
+      agentBudget: 128,
+      agentsUsed: 8,
+      report: WOKEN_REPORT,
+    });
+    expect(run.phases).toEqual(WOKEN_PHASES.map((title) => ({ title, state: 'done' })));
+    expect(run.agents).toHaveLength(8);
+    expect(run.agents[0]).toEqual({
+      agentId: 'sa-plan',
+      label: 'Plan',
+      phase: null,
+      state: 'done',
+      tokens: 40_000,
+      durationMs: 227_364 - 60_750,
+    });
+    expect(run.truncated).toBeUndefined();
+    expect(run.pauseMessage).toBeUndefined();
+  });
+
+  it('a lower or equal revision changes nothing; each run has its own entry', () => {
+    const parsed = parseUpdates(
+      `${[
+        line('wf_a', 2, 'active', 1, { pause_message: 'held' }),
+        line('wf_b', 1, 'active', 2),
+        line('wf_a', 1, 'complete', 3, { result_summary: 'old' }),
+        line('wf_a', 2, 'failed', 4),
+        line('wf_a', 5, 'user_paused', 5, { pause_message: 'Paused by the user' }),
+        line('wf_a', 6, 'cancelled', 6),
+        line('wf_x', Number.NaN, 'active', 7),
+      ].join('\n')}\n`,
+    );
+    const found = runs(parsed.transcript);
+    expect(found.map((r) => [r.runId, r.revision, r.status])).toEqual([
+      ['wf_a', 6, 'cancelled'],
+      ['wf_b', 1, 'active'],
+    ]);
+    expect(found[0]!.report).toBeUndefined();
+    expect(found[0]!.pauseMessage).toBeUndefined();
+    expect(found[0]!.ts).toBe(1791643279001);
+    expect(found[0]!.updatedTs).toBe(1791643279006);
+  });
+
+  it('live: the first update pushes the entry, a higher revision sets it in place, a lower one sends nothing', () => {
+    const reducer = new TranscriptReducer({ now: () => 1 });
+    const live = (revision: number, status: string, extra: object = {}) =>
+      reducer.apply({
+        xai: true,
+        update: { sessionUpdate: 'workflow_updated', run_id: 'wf_1', name: 'n', status, revision, ...extra },
+        meta: undefined,
+      });
+    expect(live(1, 'active').map((o) => o.op)).toEqual(['push']);
+    const set = live(3, 'complete', { result_summary: 'Done.' });
+    expect(set).toMatchObject([{ op: 'set', index: 0, entry: { kind: 'workflow', revision: 3, report: 'Done.' } }]);
+    expect(live(2, 'active')).toEqual([]);
+  });
+
+  it('a report longer than 16 KB is cut and marked; redaction drops a key cut at its end', () => {
+    const key = 'sk-SECRET-0123456789';
+    const report = `${'r'.repeat(MAX_FIELD_CHARS - 5)}${key}`;
+    const run = runs(parseUpdates(`${line('wf_1', 1, 'complete', 1, { result_summary: report })}\n`).transcript)[0]!;
+    expect(run.report).toHaveLength(MAX_FIELD_CHARS);
+    expect(run.truncated).toBe(true);
+    const shown = redactEntry(run, [key]) as Run;
+    expect(shown.report).not.toContain(key.slice(0, 5));
   });
 });
 

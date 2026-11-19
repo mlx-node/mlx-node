@@ -16,6 +16,7 @@ export const ACP_TIMEOUTS = {
   'session/set_model': 10_000,
   '_x.ai/session/rename': 10_000,
   '_x.ai/session/delete': 10_000,
+  '_x.ai/workflows/stop': 10_000,
 } as const;
 
 /** The 100th line that is not JSON is a protocol error. */
