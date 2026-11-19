@@ -26,6 +26,8 @@ pub mod weights;
 mod tests_config;
 #[cfg(test)]
 mod tests_model;
+#[cfg(all(test, target_os = "macos"))]
+mod tests_pool;
 #[cfg(test)]
 mod tests_rows;
 #[cfg(test)]

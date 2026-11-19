@@ -148,9 +148,10 @@ pub struct PageLayout {
     /// `[num_kv_heads, head_size/x, block_size, x]`, V
     /// `[num_kv_heads, head_size, block_size]`.
     pub values_token_major: bool,
-    /// Pooled index keys per block and layer, bf16 `[index_rows,
-    /// index_dimension]` (Splash `Layout::indexDimension`, the index plane
-    /// of `PageStorage::indexOffset`). 0: no index plane.
+    /// Pooled index keys per block and layer, `[index_rows,
+    /// index_dimension]` 2-byte elements of the pool's index dtype (Splash
+    /// `Layout::indexDimension`, the index plane of
+    /// `PageStorage::indexOffset`). 0: no index plane.
     pub index_rows: u32,
     pub index_dimension: u32,
 }
@@ -233,8 +234,8 @@ struct LayerPlanes {
     key: Buffer,
     value: Buffer,
     scales: Option<(Buffer, Buffer)>,
-    /// bf16 `[num_blocks, index_rows, index_dimension]` pooled index keys of
-    /// a [`PageLayout`] with an index plane.
+    /// `[num_blocks, index_rows, index_dimension]` pooled index keys of a
+    /// [`PageLayout`] with an index plane, in the pool's index dtype.
     index: Option<Buffer>,
 }
 
@@ -422,6 +423,9 @@ pub struct LayerKVPool {
     /// Page order and index plane, fixed at construction.
     layout: PageLayout,
 
+    /// Element dtype of the index plane: `BFloat16` or `Float16`.
+    index_dtype: MetalDtype,
+
     /// Bumped by every [`Self::grow_to`] or [`Self::shrink_to`] that swapped a layer. Consumers that cache
     /// per-layer MLX array views ([`Self::key_cache_array_raw`] /
     /// [`Self::value_cache_array_raw`]) compare against this to detect that
@@ -535,6 +539,22 @@ impl LayerKVPool {
     /// The pool's page layout.
     pub fn layout(&self) -> PageLayout {
         self.layout
+    }
+
+    /// Element dtype of the pool's index plane.
+    pub fn index_dtype(&self) -> MetalDtype {
+        self.index_dtype
+    }
+
+    /// An index plane holds 2-byte bf16 or f16 elements
+    /// ([`PageLayout::index_bytes`]).
+    fn check_index_dtype(index_dtype: MetalDtype) -> Result<(), String> {
+        match index_dtype {
+            MetalDtype::BFloat16 | MetalDtype::Float16 => Ok(()),
+            other => Err(format!(
+                "LayerKVPool::new: a {other:?} index plane is not supported (bf16 or f16)"
+            )),
+        }
     }
 
     /// Refuse an entry point that reads or writes the vLLM page as host
@@ -726,15 +746,35 @@ impl LayerKVPool {
         )
     }
 
-    /// [`Self::new`] with `layout`'s page order and index plane. Only the
-    /// `PagedKVWrite` store and the readers that know the layout touch such
-    /// a pool; host transfers and the raw kernels refuse it.
+    /// [`Self::new`] with `layout`'s page order and a bf16 index plane. Only
+    /// the `PagedKVWrite` store and the readers that know the layout touch
+    /// such a pool; host transfers and the raw kernels refuse it.
     pub fn new_with_layout(
         config: PagedAttentionConfig,
         num_blocks: u32,
         max_num_blocks: u32,
         cache_dtype: MetalDtype,
         layout: PageLayout,
+    ) -> Result<Self, String> {
+        Self::new_with_index_dtype(
+            config,
+            num_blocks,
+            max_num_blocks,
+            cache_dtype,
+            layout,
+            MetalDtype::BFloat16,
+        )
+    }
+
+    /// [`Self::new_with_layout`] with an `index_dtype` index plane
+    /// (`BFloat16` or `Float16`).
+    pub fn new_with_index_dtype(
+        config: PagedAttentionConfig,
+        num_blocks: u32,
+        max_num_blocks: u32,
+        cache_dtype: MetalDtype,
+        layout: PageLayout,
+        index_dtype: MetalDtype,
     ) -> Result<Self, String> {
         static CPU_ACCESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let cpu_access = *CPU_ACCESS
@@ -745,6 +785,7 @@ impl LayerKVPool {
             max_num_blocks,
             cache_dtype,
             layout,
+            index_dtype,
             cpu_access,
         )
     }
@@ -774,6 +815,7 @@ impl LayerKVPool {
             max_num_blocks,
             cache_dtype,
             PageLayout::default(),
+            MetalDtype::BFloat16,
             cpu_access,
         )
     }
@@ -784,9 +826,11 @@ impl LayerKVPool {
         max_num_blocks: u32,
         cache_dtype: MetalDtype,
         layout: PageLayout,
+        index_dtype: MetalDtype,
         _cpu_access: bool,
     ) -> Result<Self, String> {
         config.validate()?;
+        Self::check_index_dtype(index_dtype)?;
         if num_blocks == 0 {
             return Err("LayerKVPool::new: num_blocks must be > 0".to_string());
         }
@@ -848,6 +892,7 @@ impl LayerKVPool {
                 max_num_blocks,
                 cache_dtype,
                 layout,
+                index_dtype,
                 generation: AtomicU64::new(0),
                 restore_identity: std::sync::Arc::new(()),
                 inner: RwLock::new(PoolInner { layers, num_blocks }),
@@ -869,6 +914,7 @@ impl LayerKVPool {
                 max_num_blocks,
                 cache_dtype,
                 layout,
+                index_dtype,
                 generation: AtomicU64::new(0),
                 restore_identity: std::sync::Arc::new(()),
             })
@@ -980,6 +1026,7 @@ impl LayerKVPool {
                 max_num_blocks: num_blocks,
                 cache_dtype,
                 layout: PageLayout::default(),
+                index_dtype: MetalDtype::BFloat16,
                 generation: AtomicU64::new(0),
                 restore_identity: std::sync::Arc::new(()),
                 inner: RwLock::new(PoolInner { layers, num_blocks }),
@@ -996,6 +1043,7 @@ impl LayerKVPool {
                 max_num_blocks: num_blocks,
                 cache_dtype,
                 layout: PageLayout::default(),
+                index_dtype: MetalDtype::BFloat16,
                 generation: AtomicU64::new(0),
                 restore_identity: std::sync::Arc::new(()),
             })
@@ -1057,6 +1105,7 @@ impl LayerKVPool {
                 max_num_blocks: num_blocks,
                 cache_dtype,
                 layout: PageLayout::default(),
+                index_dtype: MetalDtype::BFloat16,
                 generation: AtomicU64::new(0),
                 restore_identity: std::sync::Arc::new(()),
                 inner: RwLock::new(PoolInner {
@@ -1076,6 +1125,7 @@ impl LayerKVPool {
                 max_num_blocks: num_blocks,
                 cache_dtype,
                 layout: PageLayout::default(),
+                index_dtype: MetalDtype::BFloat16,
                 generation: AtomicU64::new(0),
                 restore_identity: std::sync::Arc::new(()),
             })
@@ -1799,10 +1849,10 @@ impl LayerKVPool {
         Ok(arr)
     }
 
-    /// Wrap the index plane of `layer_idx` as a zero-copy bf16 view
-    /// `[num_blocks, index_rows, index_dimension]` (Splash
-    /// `indexer_index_keys`). `Err` for a pool without an index plane.
-    /// Ownership as [`Self::key_cache_array_raw`].
+    /// Wrap the index plane of `layer_idx` as a zero-copy view
+    /// `[num_blocks, index_rows, index_dimension]` in the pool's index dtype
+    /// (Splash `indexer_index_keys`). `Err` for a pool without an index
+    /// plane. Ownership as [`Self::key_cache_array_raw`].
     #[cfg(target_os = "macos")]
     pub fn index_array_raw(&self, layer_idx: u32) -> Result<*mut mlx_sys::mlx_array, String> {
         use crate::metal::is_metal_extraction_supported;
@@ -1828,13 +1878,14 @@ impl LayerKVPool {
             self.layout.index_rows as i64,
             self.layout.index_dimension as i64,
         ];
-        // SAFETY: as `key_cache_array_raw`; code 3 is `BridgeDType::BFLOAT16`.
+        let dtype_code = bridge_dtype_code(self.index_dtype)?;
+        // SAFETY: as `key_cache_array_raw`.
         let arr = unsafe {
             mlx_sys::mlx_array_from_metal_buffer_view(
                 buffer.as_ptr() as *mut _,
                 dims.as_ptr(),
                 dims.len(),
-                3,
+                dtype_code,
             )
         };
         if arr.is_null() {
@@ -5884,6 +5935,212 @@ mod zero_fill_tests {
             LayerPlanes::zero_all(state, &pool.inner_read().layers, &bytes, "zero_fill_tests")
                 .unwrap();
             assert_eq!(nonzero(&pool, &ids), 0, "{dtype:?}: filled planes");
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod split_latent_tests {
+    use super::*;
+
+    const LAYERS: u32 = 12;
+    const BS: usize = 32;
+    const HALF: usize = 288;
+    const INDEX_ROWS: usize = 8;
+    const INDEX_DIM: usize = 128;
+    const PLANE: usize = BS * HALF * 2;
+    const INDEX: usize = INDEX_ROWS * INDEX_DIM * 2;
+
+    /// The Hy4 pool: the 576-wide latent row of 12 indexed layers split over
+    /// the K and V planes, one KV head of 288 (`pool-layout.json`).
+    fn hy4_config(num_layers: u32) -> PagedAttentionConfig {
+        PagedAttentionConfig {
+            block_size: BS as u32,
+            gpu_memory_mb: 256,
+            head_size: HALF as u32,
+            num_kv_heads: 1,
+            num_layers,
+            max_seq_len: Some(1024),
+            max_batch_size: Some(4),
+        }
+    }
+
+    fn hy4_layout() -> PageLayout {
+        PageLayout {
+            values_token_major: true,
+            index_rows: INDEX_ROWS as u32,
+            index_dimension: INDEX_DIM as u32,
+        }
+    }
+
+    fn hy4_pool(num_layers: u32, blocks: u32, max_blocks: u32) -> Option<LayerKVPool> {
+        crate::metal::MetalState::get().ok()?;
+        Some(
+            LayerKVPool::new_with_index_dtype(
+                hy4_config(num_layers),
+                blocks,
+                max_blocks,
+                MetalDtype::Float16,
+                hy4_layout(),
+                MetalDtype::Float16,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Shape and dtype code of an MLX view; the view is deleted.
+    fn shape_and_code(raw: *mut mlx_sys::mlx_array) -> (Vec<i64>, i32) {
+        assert!(!raw.is_null());
+        unsafe {
+            let ndim = mlx_sys::mlx_array_ndim(raw);
+            let mut dims = vec![0i64; ndim];
+            mlx_sys::mlx_array_shape(raw, dims.as_mut_ptr());
+            let code = mlx_sys::mlx_array_dtype(raw);
+            mlx_sys::mlx_array_delete(raw);
+            (dims, code)
+        }
+    }
+
+    fn upload(block: u32, payload: &[BlockLayerBytes]) -> BlockUpload<'_> {
+        (
+            block,
+            payload
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect(),
+        )
+    }
+
+    /// Every pool built without an index dtype keeps the bf16 index plane and
+    /// the byte counts it had: the vLLM page, and the Flash Next page in bf16
+    /// and int8 (H 4, D 256, block 16, index 4 x 128, 2 layers).
+    /// Mutation: `new_with_layout` passes f16 → red.
+    #[test]
+    fn existing_layouts_keep_a_bf16_index_plane() {
+        if crate::metal::MetalState::get().is_err() {
+            return;
+        }
+        let config = PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: 256,
+            head_size: 256,
+            num_kv_heads: 4,
+            num_layers: 2,
+            max_seq_len: Some(256),
+            max_batch_size: Some(1),
+        };
+        let plain = LayerKVPool::new(config.clone(), 2, 2, MetalDtype::BFloat16).unwrap();
+        assert_eq!(plain.index_dtype(), MetalDtype::BFloat16);
+        assert_eq!(plain.bytes_per_block(), Ok(2 * 2 * 32_768));
+        let flash_next = PageLayout {
+            values_token_major: true,
+            index_rows: 4,
+            index_dimension: 128,
+        };
+        for (dtype, per_layer) in [
+            (MetalDtype::BFloat16, 2 * 32_768 + 1_024),
+            (MetalDtype::Int8, 2 * (16_384 + 256) + 1_024),
+        ] {
+            let pool =
+                LayerKVPool::new_with_layout(config.clone(), 2, 2, dtype, flash_next).unwrap();
+            assert_eq!(pool.index_dtype(), MetalDtype::BFloat16, "{dtype:?}");
+            assert_eq!(pool.bytes_per_block(), Ok(2 * per_layer), "{dtype:?}");
+            let (dims, code) = shape_and_code(pool.index_array_raw(0).unwrap());
+            assert_eq!((dims, code), (vec![2, 4, 128], 3), "{dtype:?}");
+        }
+    }
+
+    /// The Hy4 page is 466,944 B over 12 layers: K and V planes of 32 x 288
+    /// f16 (18,432 B each) and an f16 index plane of 8 x 128 (2,048 B); its
+    /// views are token-major f16 and the index view is f16.
+    /// Mutation: `index_array_raw` keeps code 3 → red.
+    #[test]
+    fn split_latent_page_bytes_and_views() {
+        let Some(pool) = hy4_pool(LAYERS, 3, 6) else {
+            return;
+        };
+        assert_eq!(pool.index_dtype(), MetalDtype::Float16);
+        assert_eq!(pool.bytes_per_block(), Ok(466_944));
+        assert_eq!(
+            pool.block_blob_bytes(),
+            Ok((PLANE as u64, (PLANE + INDEX) as u64))
+        );
+        assert_eq!(hy4_layout().index_bytes(), INDEX as u64);
+        assert!(pool.grow_to(6).unwrap());
+        assert_eq!(pool.total_bytes(), 6 * 466_944);
+        for layer in [0, LAYERS - 1] {
+            for (raw, want) in [
+                (
+                    pool.key_cache_array_raw(layer).unwrap(),
+                    vec![6, 1, 32, 288],
+                ),
+                (
+                    pool.value_cache_array_raw(layer).unwrap(),
+                    vec![6, 1, 32, 288],
+                ),
+                (pool.index_array_raw(layer).unwrap(), vec![6, 8, 128]),
+            ] {
+                assert_eq!(shape_and_code(raw), (want, 2), "layer {layer}");
+            }
+        }
+    }
+
+    /// An index plane is bf16 or f16; any other dtype is refused before a
+    /// buffer is allocated.
+    #[test]
+    fn index_plane_dtype_is_two_bytes() {
+        if crate::metal::MetalState::get().is_err() {
+            return;
+        }
+        for dtype in [MetalDtype::Int8, MetalDtype::Float32] {
+            assert!(
+                LayerKVPool::new_with_index_dtype(
+                    hy4_config(1),
+                    1,
+                    1,
+                    MetalDtype::Float16,
+                    hy4_layout(),
+                    dtype,
+                )
+                .is_err(),
+                "{dtype:?}"
+            );
+        }
+    }
+
+    /// A Hy4 page crosses the host whole (the cold blob): the key side is the
+    /// K plane, the value side the V plane then the f16 index slot; a write
+    /// then a read of every layer gives each plane's bytes back, the index
+    /// view holds the index slot, and a grow keeps them.
+    /// Mutation: the index slot sits at offset 0 of the value blob → red.
+    #[test]
+    fn split_latent_pages_cross_the_host() {
+        let Some(pool) = hy4_pool(2, 3, 4) else {
+            return;
+        };
+        let side = |layer: usize, which: usize, len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|i| ((i * 13 + layer * 37 + which * 101) % 251) as u8)
+                .collect()
+        };
+        let payload: Vec<BlockLayerBytes> = (0..2)
+            .map(|layer| (side(layer, 0, PLANE), side(layer, 1, PLANE + INDEX)))
+            .collect();
+        pool.write_blocks_all_layers(&[upload(1, &payload)])
+            .unwrap();
+        assert_eq!(pool.read_block_all_layers(1).unwrap(), payload);
+        assert!(pool.grow_to(4).unwrap());
+        assert_eq!(pool.read_block_all_layers(1).unwrap(), payload);
+        for (layer, (_, values)) in payload.iter().enumerate() {
+            let raw = pool.index_array_raw(layer as u32).unwrap();
+            let plane = unsafe {
+                let data = mlx_sys::mlx_array_data_ptr(raw) as *const u8;
+                assert!(!data.is_null(), "a Shared pool view has host data");
+                let plane = std::slice::from_raw_parts(data.add(INDEX), INDEX).to_vec();
+                mlx_sys::mlx_array_delete(raw);
+                plane
+            };
+            assert_eq!(plane, &values[PLANE..], "layer {layer} index plane");
         }
     }
 }

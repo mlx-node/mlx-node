@@ -18,7 +18,8 @@ pub struct PagedAttentionConfig {
     /// Default: 4096 (4GB)
     pub gpu_memory_mb: u32,
 
-    /// Head size (must match model: 64, 80, 96, 112, 120, 128, 192, or 256)
+    /// Head size (must match model: 32, 64, 80, 96, 112, 120, 128, 192, 256,
+    /// 288 or 512)
     pub head_size: u32,
 
     /// Number of KV heads (for GQA, typically < num_query_heads)
@@ -48,7 +49,7 @@ impl PagedAttentionConfig {
         }
 
         // Validate head size
-        let valid_head_sizes = [32, 64, 80, 96, 112, 120, 128, 192, 256, 512];
+        let valid_head_sizes = [32, 64, 80, 96, 112, 120, 128, 192, 256, 288, 512];
         if !valid_head_sizes.contains(&self.head_size) {
             return Err(format!(
                 "Invalid head_size: {}. Must be one of {:?}.",
@@ -175,6 +176,42 @@ mod tests {
 
         // Valid again
         assert!(config.validate().is_ok());
+    }
+
+    /// Every head size accepted before 288 still is, 288 (the Hy4 latent
+    /// half row) is accepted, and its neighbours are not.
+    /// Mutation: 288 left out of the list → red.
+    #[test]
+    fn head_sizes_accepted() {
+        let mut config = PagedAttentionConfig::default();
+        for head_size in [32, 64, 80, 96, 112, 120, 128, 192, 256, 288, 512] {
+            config.head_size = head_size;
+            assert!(config.validate().is_ok(), "head_size {head_size}");
+        }
+        for head_size in [0, 100, 144, 280, 296, 576, 1024] {
+            config.head_size = head_size;
+            assert!(config.validate().is_err(), "head_size {head_size}");
+        }
+    }
+
+    /// The Hy4 pool (12 layers, 1 KV head, head 288, f16, block 32) is
+    /// 442,368 B per block before its index plane, and a 256K sequence
+    /// needs 3,456 MiB of K/V (`tests/fixtures/hy-v4-flash/pool-layout.json`).
+    #[test]
+    fn hy4_split_latent_sizing() {
+        assert_eq!(
+            bytes_per_block(12, 1, 288, 32, MetalDtype::Float16),
+            Ok(442_368)
+        );
+        let mb = PagedAttentionConfig::memory_mb_for_one_full_sequence(
+            262_144,
+            32,
+            288,
+            1,
+            12,
+            MetalDtype::Float16,
+        );
+        assert_eq!(mb, 3_456);
     }
 
     #[test]

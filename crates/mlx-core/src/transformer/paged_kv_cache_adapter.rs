@@ -4194,8 +4194,8 @@ impl PagedKVCacheAdapter {
         Ok((key, value))
     }
 
-    /// The index plane of `layer_idx` as a fresh bf16 view, `None` for a
-    /// pool without one.
+    /// The index plane of `layer_idx` as a fresh view in the pool's index
+    /// dtype, `None` for a pool without one.
     #[cfg(target_os = "macos")]
     fn raw_index_array(&self, layer_idx: u32) -> Result<Option<MxArray>, String> {
         if self.layer_kv_pool.layout().index_rows == 0 {
@@ -8863,7 +8863,7 @@ impl PagedKVCacheAdapter {
             .collect::<Result<Vec<_>, _>>()?;
         let slots = MxArray::from_int32(&slots, &[i64::from(count)]).map_err(|e| e.to_string())?;
         let rows = rows
-            .astype(crate::array::DType::BFloat16)
+            .astype(metal_io_dtype(self.layer_kv_pool.index_dtype())?)
             .map_err(|e| e.to_string())?;
         self.native_pool_arrays_for_layer(layer_idx)?;
         let idx = layer_idx as usize;
@@ -8894,8 +8894,8 @@ impl PagedKVCacheAdapter {
     }
 
     /// The pooled keys of the active request's first `blocks` complete index
-    /// blocks of `layer_idx`, `[blocks, index_dimension]` bf16, from the
-    /// index plane as last written.
+    /// blocks of `layer_idx`, `[blocks, index_dimension]` in the pool's index
+    /// dtype, from the index plane as last written.
     #[cfg(target_os = "macos")]
     pub fn index_rows(&self, layer_idx: u32, blocks: u32) -> Result<MxArray, String> {
         let layout = self.layer_kv_pool.layout();

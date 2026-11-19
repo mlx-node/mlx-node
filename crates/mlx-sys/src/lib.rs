@@ -2398,9 +2398,10 @@ unsafe extern "C-unwind" {
         out: *mut *mut mlx_array,
     ) -> bool;
 
-    // Store bf16 `rows` `[n, dim]` into a page pool's bf16 index plane at
-    // plane rows `slots` (int32 `[n]`), in place; `out` is the plane handle
-    // to adopt. False without Metal or on a contract violation.
+    // Store `rows` `[n, dim]` into a page pool's bf16 or f16 index plane of
+    // the same dtype at plane rows `slots` (int32 `[n]`), in place; `out` is
+    // the plane handle to adopt. False without Metal or on a contract
+    // violation.
     pub fn mlx_paged_index_store(
         plane: *mut mlx_array,
         rows: *mut mlx_array,
