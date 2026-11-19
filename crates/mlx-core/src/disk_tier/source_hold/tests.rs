@@ -249,3 +249,63 @@ fn only_a_persistent_open_holds_a_free_source() {
     assert!(tier.with_source(|_| ()).is_none());
     assert!(!absent.exists(), "a source not on disk is not made");
 }
+
+/// A source another process locks after this open scanned the root and
+/// before its hold is not held, and it is not on this tier's list of idle
+/// caches either: once that process lets the lock go, this tier's measure
+/// (own objects + source past the limit) leaves the source.
+#[test]
+fn a_source_locked_between_the_scan_and_the_hold_stays() {
+    let root = Root::new("raced");
+    let store: u64 = 1 << 20;
+    let source = plant(&root.cache(), SOURCE, store, DAY);
+    let held = std::cell::RefCell::new(None);
+    let tier = open_disk_tier_with_source(
+        &root.options(true, store * 13 / 10),
+        || identity(OWN),
+        || {
+            let Taken::Lock(lock) = take_lock(&source) else {
+                panic!("the source's lock");
+            };
+            *held.borrow_mut() = Some(lock);
+            identity(SOURCE)
+        },
+        160,
+    )
+    .expect("a persistent tier");
+    assert!(tier.persistent);
+    assert!(tier.with_source(|_| ()).is_none(), "someone holds it");
+    assert!(
+        held.borrow_mut().take().is_some(),
+        "the other holder lets it go"
+    );
+
+    write_state(&tier, (store / 2) as usize);
+    assert!(tier.manager.total_bytes() + store > tier.limit);
+    tier.measure();
+    assert!(source.is_dir(), "this tier's measure leaves the source");
+}
+
+/// A source directory with no lock file is not held and nobody holds it: it
+/// stays an idle cache, so this tier's measure removes it past the limit.
+#[test]
+fn a_source_with_no_lock_stays_an_idle_cache() {
+    let root = Root::new("lockless");
+    let store: u64 = 1 << 20;
+    let source = plant(&root.cache(), SOURCE, store, DAY);
+    std::fs::remove_file(source.join(LOCK_FILE)).expect("the lock file");
+    let tier = open_disk_tier_with_source(
+        &root.options(true, store * 13 / 10),
+        || identity(OWN),
+        || identity(SOURCE),
+        160,
+    )
+    .expect("a persistent tier");
+    assert!(tier.persistent);
+    assert!(tier.with_source(|_| ()).is_none(), "no lock, no hold");
+
+    write_state(&tier, (store / 2) as usize);
+    assert!(tier.manager.total_bytes() + store > tier.limit);
+    tier.measure();
+    assert!(!source.is_dir(), "an idle cache past the limit goes");
+}

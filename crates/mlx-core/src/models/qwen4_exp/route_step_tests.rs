@@ -291,6 +291,7 @@ pub(super) fn deep_moe_shape_fixture() -> &'static Path {
 fn write_moe_shape_fixture(file: &str, repeat: usize) -> PathBuf {
     const PREFIX: &str = "qwen4-moe-shape-";
     let root = std::env::temp_dir();
+    #[cfg(unix)]
     for entry in std::fs::read_dir(&root).into_iter().flatten().flatten() {
         let name = entry.file_name();
         let Some(pid) = name

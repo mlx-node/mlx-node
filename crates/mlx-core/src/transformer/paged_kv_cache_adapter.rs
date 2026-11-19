@@ -1568,8 +1568,9 @@ impl PagedKVCacheAdapter {
     /// ` planes-route:<id>` when attached planes change the
     /// projections' bits. A state written under one never restores under
     /// another. The query mode is not part of it: queries are never stored,
-    /// and both modes write the same pages (Splash's namespace names no
-    /// mode, `RuntimeResources`).
+    /// and both modes write the same page layout, but rows past the int8
+    /// query start hold other values (Splash's namespace names no mode,
+    /// `RuntimeResources`).
     pub(crate) fn cache_identity(&self) -> String {
         let mut identity = format!("{:?}", self.layer_kv_pool.cache_dtype());
         let ktm = self.layer_kv_pool.layout().keys_token_major;

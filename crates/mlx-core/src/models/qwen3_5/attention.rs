@@ -1317,15 +1317,28 @@ impl Qwen3_5Attention {
     /// Q/gate, K and V of a wave `[N, T, H]`, each lane's rows with the bits
     /// [`Self::project_mixer`] gives that lane alone: a packed block-order
     /// Q/gate takes one `forward_lanes` per projection (the mixed dispatch
-    /// keeps the standalone projections' bits); any other layout runs
-    /// `project_mixer` per lane.
+    /// keeps the standalone projections' bits); any other layout, and a
+    /// K-quant Tiled64 projection off the lane tier (its 8-row `forward` is
+    /// not the mixed dispatch's tile), runs `project_mixer` per lane.
     fn project_mixer_lanes(
         &self,
         x: &MxArray,
         lanes: i64,
         seq_len: i64,
     ) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
-        if self.q_gate_block_t.is_some() || !self.q_proj.has_q_gate_block_layout() {
+        let hidden = x.shape_at(2)?;
+        let off_tier = |projection: &LinearProj| -> Result<bool> {
+            Ok(
+                matches!(projection, LinearProj::Quantized(q) if q.is_kquant_tiled())
+                    && !projection.lane_tier_holds(hidden)?,
+            )
+        };
+        let mixer_off_tier = match &self.kv_proj {
+            Some((merged, _)) => off_tier(&self.q_proj)? || off_tier(merged)?,
+            None => off_tier(&self.q_proj)? || off_tier(&self.k_proj)? || off_tier(&self.v_proj)?,
+        };
+        if self.q_gate_block_t.is_some() || !self.q_proj.has_q_gate_block_layout() || mixer_off_tier
+        {
             let mut parts: [Vec<MxArray>; 4] = Default::default();
             for lane in 0..lanes {
                 let x_lane = x.slice_axis(0, lane, lane + 1)?;

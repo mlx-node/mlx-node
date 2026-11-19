@@ -467,6 +467,79 @@ fn wave_attention_equals_each_lane_alone_bitwise() -> Result<()> {
     Ok(())
 }
 
+/// A mixer at hidden 4096 whose merged k|v is a Q4_K `[2048, 4096]`: the
+/// 8-row call of that shape is not the lane tier's route, while the mixer
+/// alone takes the mixed dispatch. The wave then runs each lane's own
+/// `project_mixer` (no `forward_lanes` route) and each lane's Q, gate, K and
+/// V are the bits that lane gets alone.
+#[test]
+fn a_mixer_off_the_lane_tier_projects_each_lane_as_alone() -> Result<()> {
+    if crate::test_support::paged_prefill_unsupported(
+        "a_mixer_off_the_lane_tier_projects_each_lane_as_alone",
+    ) {
+        return Ok(());
+    }
+    const HIDDEN_4K: i64 = 4096;
+    const HEADS_16: i64 = 16;
+    let mut cfg = cfg();
+    cfg.hidden_size = HIDDEN_4K as i32;
+    cfg.num_heads = HEADS_16 as i32;
+    let seed = 700;
+    let mut attn = Qwen3_5Attention::new(&cfg)?;
+    attn.set_quantized_q_proj(projection(Q5K, 2 * HEADS_16 * HEAD_DIM, HIDDEN_4K, seed)?);
+    attn.set_quantized_k_proj(projection(Q4K, KV_HEADS * HEAD_DIM, HIDDEN_4K, seed + 1)?);
+    attn.set_quantized_v_proj(projection(Q4K, KV_HEADS * HEAD_DIM, HIDDEN_4K, seed + 2)?);
+    attn.set_quantized_o_proj(projection(Q6K, HIDDEN_4K, HEADS_16 * HEAD_DIM, seed + 3)?);
+    attn.set_q_norm_weight(&bf16_input(&[HEAD_DIM], seed + 4)?, DType::BFloat16)?;
+    attn.set_k_norm_weight(&bf16_input(&[HEAD_DIM], seed + 5)?, DType::BFloat16)?;
+    attn.finalize_q_gate_block()?;
+    attn.finalize_kv_proj()?;
+    let (merged, _) = attn
+        .kv_proj
+        .as_ref()
+        .ok_or_else(|| Error::from_reason("the Q4_K k|v did not merge"))?;
+    assert_eq!(merged.packed_out_features()?, 2 * KV_HEADS * HEAD_DIM);
+    if !attn.q_proj.lane_tier_holds(HIDDEN_4K)? {
+        eprintln!("SKIP: this device has no lane tier");
+        return Ok(());
+    }
+    assert!(
+        !merged.lane_tier_holds(HIDDEN_4K)?,
+        "the Q4_K [2048, 4096] k|v does not hold the lane tier"
+    );
+    let xs = [
+        bf16_input(&[1, ROWS, HIDDEN_4K], seed + 6)?,
+        bf16_input(&[1, ROWS, HIDDEN_4K], seed + 7)?,
+    ];
+    assert!(
+        mixed_projection_forward(&xs[0], &[&attn.q_proj, merged])?.is_some(),
+        "alone, the mixer takes the mixed dispatch"
+    );
+    let mut alone = Vec::new();
+    for x in &xs {
+        let (q, g, k, v) = attn.project_mixer(x, 1, ROWS)?;
+        alone.push([bits(&q)?, bits(&g)?, bits(&k)?, bits(&v)?]);
+    }
+    let x = MxArray::concatenate_many(xs.iter().collect(), Some(0))?;
+    let before = LANE_ROUTES.with(|c| c.get());
+    let (q, g, k, v) = attn.project_mixer_lanes(&x, 2, ROWS)?;
+    let after = LANE_ROUTES.with(|c| c.get());
+    for (lane, alone) in alone.iter().enumerate() {
+        let i = lane as i64;
+        for (part, (wave, alone)) in ["q", "gate", "k", "v"]
+            .iter()
+            .zip([&q, &g, &k, &v].into_iter().zip(alone))
+        {
+            assert!(
+                bits(&wave.slice_axis(0, i, i + 1)?)? == *alone,
+                "lane {lane}: its {part} differs from the lane alone"
+            );
+        }
+    }
+    assert_eq!(after, before, "the wave runs each lane's own project_mixer");
+    Ok(())
+}
+
 /// A wave of N lanes launches the in-place verify kernel N times per layer
 /// (each lane's own verify plan) and no prefill launch. Mutation: the
 /// wave takes the stacked ragged route, varlen V2 → red.

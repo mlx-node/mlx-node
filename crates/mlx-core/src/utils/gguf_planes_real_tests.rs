@@ -234,7 +234,7 @@ fn native_rows(
     header: &crate::utils::gguf::GgufFile,
     t: &PlanesTensor,
 ) -> Result<Vec<u8>> {
-    use std::os::unix::fs::FileExt;
+    use crate::utils::gguf_read::ReadAt;
     let mut out = Vec::new();
     for (name, _) in &t.sources {
         let info = header

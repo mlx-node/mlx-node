@@ -486,15 +486,13 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 .filter_map(|slot| slot.as_ref()?.as_ref().ok())
                 .map(SampledRows::records)
                 .collect::<Vec<_>>();
-            // A failed eval fails every queued lane.
+            // A failed eval fails every lane of the step, as above.
             if !queued.is_empty()
                 && let Err(error) =
                     MxArray::eval_arrays_with_context(&queued, "scheduled_verify_sampled_rows")
             {
                 for slot in &mut sampled {
-                    if matches!(slot, Some(Ok(_))) {
-                        *slot = Some(Err(Error::from_reason(error.reason.clone())));
-                    }
+                    *slot = Some(Err(Error::from_reason(error.reason.clone())));
                 }
             }
             for (verify, slot) in verify_rows.iter().zip(&sampled) {

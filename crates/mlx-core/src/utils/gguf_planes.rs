@@ -680,7 +680,8 @@ pub(crate) fn load_line(line: String) {
 pub(crate) static LOAD_LINES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// The plan a load of `header` makes on `device`: [`plan_planes`] when the
-/// load has a DFlash2 draft, is not CLEF and reads one GGUF file, every
+/// load has a DFlash2 draft, is not CLEF and reads one GGUF file whose
+/// tensor data is 4-byte aligned (the planes writer's band offsets), every
 /// tensor on `load`'s walk; on the product walk only the tensors at the
 /// Tiled64 route's K splits ([`PlanesPlan::keep_tiled_splits`]).
 pub(crate) fn plan_for_load(
@@ -696,6 +697,9 @@ pub(crate) fn plan_for_load(
     }
     if load.files != 1 {
         return PlanesPlan::none("load", "a split GGUF");
+    }
+    if !header.alignment.is_multiple_of(4) {
+        return PlanesPlan::none("load", "tensor data not 4-byte aligned");
     }
     let mut plan = plan_planes(header, device);
     plan.walk = load.walk;
@@ -1280,12 +1284,30 @@ mod tests {
         }
     }
 
+    /// A GGUF whose tensor data alignment is not a multiple of 4 bytes
+    /// plans nothing on either walk: the planes writer reads its bands from
+    /// 4-byte offsets. At alignment 4 the spread walk plans the full plan.
+    #[test]
+    fn an_alignment_off_four_bytes_plans_nothing() {
+        let mut header = fixture_header();
+        header.alignment = 2;
+        for load in [PlanesLoad::of_load(true, false, 1), app_load(Walk::Spread)] {
+            let plan = plan_for_load(&header, &app_machine(), &load);
+            assert!(plan.tensors.is_empty(), "{:?}: alignment 2", load.walk);
+            assert_eq!(plan.left_out.len(), 1, "{:?}: one reason", load.walk);
+        }
+        header.alignment = 4;
+        let plan = plan_for_load(&header, &app_machine(), &app_load(Walk::Spread));
+        assert_eq!(plan.tensors.len(), 164, "alignment 4");
+    }
+
     /// A load plans on the product walk in both activations modes: the walk
     /// is off on every tensor and the plan adds nothing to the store
     /// identity; the 27B app load keeps 164 tensors. The spread walk (tests
     /// only) keeps the law's walk and
     /// adds the planes id of the plan.
     /// Mutation walk-spread (a load takes the spread walk) → red.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_load_takes_the_product_walk_and_adds_no_identity_part() {
         let header = fixture_header();
@@ -1309,6 +1331,7 @@ mod tests {
     /// A planned tensor whose source the import does not read in whole
     /// 64-row bands leaves the plan with its reason; a merged gate|up leaves
     /// when either half is not banded.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_tensor_not_read_in_bands_leaves_the_plan() {
         let header = fixture_header();
@@ -1347,6 +1370,7 @@ mod tests {
     /// with its reason. On 40 cores the plan of record stays whole; on 48,
     /// 64 and 80 cores every kept tensor splits as Tiled64 does.
     /// Mutation split-check-off → red.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_product_walk_keeps_only_the_tiled64_splits() {
         let header = fixture_header();
@@ -1416,6 +1440,7 @@ mod tests {
     /// half of a pair never runs): an up whose source is not banded drops
     /// the layer's gate too, named.
     /// Mutation pair-split → red.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_gate_up_pair_leaves_the_plan_together() {
         let plan = plan_for_load(&fixture_header(), &app_machine(), &app_load(Walk::Product));

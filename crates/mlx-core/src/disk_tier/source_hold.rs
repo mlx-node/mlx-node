@@ -76,13 +76,22 @@ pub(crate) fn open_disk_tier_with_source(
         .then(|| open_tier(options, identity, state_bytes, &caches))
         .flatten();
     if let (Some(tier), Some(root)) = (tier.as_ref().filter(|tier| tier.persistent), root)
-        && let Some(hold) = source().and_then(|source| hold_source(&root, source, &tier.namespace))
+        && let Some(source) = source()
     {
-        caches.retain(|cache| cache.path != hold.dir);
-        *tier
-            .source
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hold);
+        let dir = root.join(&source.namespace);
+        let own = source.namespace == tier.namespace;
+        let held = hold_source(&root, source, &tier.namespace);
+        // A source another process locked after the scan is not idle
+        // either; one with no lock stays in the list and ages out.
+        if !own && !matches!(held, Held::Not) {
+            caches.retain(|cache| cache.path != dir);
+        }
+        if let Held::Mine(hold) = held {
+            *tier
+                .source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hold);
+        }
     }
     let mut others = remove_stale(caches);
     if let Some(tier) = tier.as_ref().filter(|tier| tier.persistent) {
@@ -97,25 +106,37 @@ pub(crate) fn open_disk_tier_with_source(
     tier
 }
 
-/// The source namespace `identity` names under `root`, its lock taken and
-/// its time set to now; `None` when it is this tier's own, is no directory
-/// of this user, has no lock, or someone holds it.
 #[cfg(unix)]
-fn hold_source(root: &Path, identity: PersistentIdentity, own: &str) -> Option<SourceHold> {
+enum Held {
+    Mine(SourceHold),
+    /// Someone else holds its lock.
+    Other,
+    Not,
+}
+
+/// The source namespace `identity` names under `root`, its lock taken and
+/// its time set to now; `Not` when it is this tier's own, is no directory
+/// of this user, or has no lock.
+#[cfg(unix)]
+fn hold_source(root: &Path, identity: PersistentIdentity, own: &str) -> Held {
     if identity.namespace == own || !namespace_name(&identity.namespace) {
-        return None;
+        return Held::Not;
     }
     let dir = root.join(&identity.namespace);
-    let meta = fs::symlink_metadata(&dir).ok()?;
+    let Ok(meta) = fs::symlink_metadata(&dir) else {
+        return Held::Not;
+    };
     if !meta.is_dir() || !owned_by_me(&meta) {
-        return None;
+        return Held::Not;
     }
-    let Taken::Lock(lock) = take_lock(&dir) else {
-        return None;
+    let lock = match take_lock(&dir) {
+        Taken::Lock(lock) => lock,
+        Taken::Held => return Held::Other,
+        Taken::NoLock => return Held::Not,
     };
     let _ = lock.set_modified(SystemTime::now());
     let (bytes, _) = usage(&dir);
-    Some(SourceHold {
+    Held::Mine(SourceHold {
         dir,
         identity,
         bytes,

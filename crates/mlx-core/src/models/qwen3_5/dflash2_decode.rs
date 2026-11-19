@@ -11911,6 +11911,78 @@ pub(crate) mod paged_dflash2_tests {
             Ok(())
         }
 
+        /// A greedy lane and a sampled lane on the device rows verify in one
+        /// step whose sampled-rows eval fails. MLX throws a failed command's
+        /// error once, so both turns fail with that error: the greedy lane
+        /// commits and streams no token read from that step's logits.
+        #[test]
+        fn a_failed_sampled_rows_eval_fails_the_greedy_lane_of_the_step() -> Result<()> {
+            if skip("a_failed_sampled_rows_eval_fails_the_greedy_lane_of_the_step") {
+                return Ok(());
+            }
+            use crate::engine::dspark_turn::TEST_SAMPLED_ROWS;
+            // A failed command that is not out of memory: the step's other
+            // rows complete, no model reset fails them.
+            const TIMEOUT: &str = "[METAL] Command buffer execution failed: Caused GPU Timeout \
+                                   Error (00000002:kIOGPUCommandBufferCallbackErrorTimeout)";
+            assert!(!crate::engine::governor::is_gpu_out_of_memory(TIMEOUT));
+            let _ctx = StreamContext::new(Stream::generation());
+            let seed = 0x5_8350;
+            let [(_, first), (_, second)] = lane_prompts();
+            let mut state = scheduler_on(tiny_paged_int8_dflash_inner(seed))?;
+            let (a_cmd, mut a_reply, _) = start_cmd("a", &first, 40, |_| {})?;
+            let (b_cmd, mut b_reply, _) = start_cmd("b", &second, 40, |config| {
+                config.temperature = Some(1.0);
+                config.top_p = Some(0.95);
+                config.top_k = Some(20);
+            })?;
+            let generated = |state: &mut State, owner: &str| {
+                state
+                    .owner_sequences
+                    .get(owner)
+                    .copied()
+                    .and_then(|seq| state.turn_mut(seq))
+                    .map_or(0, |turn| turn.payload.generated_tokens.len())
+            };
+            TEST_SAMPLED_ROWS.with(|c| c.set(0));
+            let (mut a, mut b) = (None, None);
+            let mut armed = None;
+            run(&mut state, vec![a_cmd, b_cmd], false, |state, _| {
+                take(&mut a_reply, &mut a);
+                take(&mut b_reply, &mut b);
+                if armed.is_none()
+                    && state.inner.dflash2_states.seq_lanes.len() == 2
+                    && generated(state, "a") > 0
+                    && generated(state, "b") > 0
+                    && TEST_SAMPLED_ROWS.with(|c| c.get()) > 0
+                {
+                    armed = Some(crate::array::fail_native_call_at(
+                        "scheduled_verify_sampled_rows",
+                        TIMEOUT,
+                    ));
+                }
+                Ok(a.is_some() && b.is_some())
+            })?;
+            assert!(armed.is_some(), "the two lanes decoded together");
+            for (owner, reply) in [("a", a), ("b", b)] {
+                let error = match reply.expect("a reply") {
+                    Ok(result) => panic!(
+                        "{owner}: the turn went on past the failed step: {} tokens",
+                        result.num_tokens
+                    ),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.reason.contains("scheduled_verify_sampled_rows")
+                        && error.reason.contains(TIMEOUT),
+                    "{owner}: {}",
+                    error.reason
+                );
+            }
+            clean(&state, "failed sampled rows");
+            Ok(())
+        }
+
         /// Two streamed sessions (the app streams) on two lanes: each
         /// terminal chunk carries its whole turn's text.
         #[test]

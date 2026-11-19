@@ -186,3 +186,65 @@ fn a_state_on_a_part_page_is_taken_back_and_resumes_with_its_image_keys() {
         "only a 32-token block has a 16-row part page"
     );
 }
+
+fn part_lineage<'a>(tokens: &'a [u32], keys: &'a [Vec<u64>], rows: usize) -> Lineage<'a> {
+    Lineage {
+        tokens: &tokens[..rows],
+        extra_keys: keys,
+        salt: 4,
+    }
+}
+
+/// Two states on the same 80 rows whose image keys differ only on the part
+/// page are two states: both are taken back, and a prompt with each page's
+/// keys resumes on its own state. A second state with the same page keys is
+/// refused.
+#[test]
+fn part_page_states_with_other_page_image_keys_are_both_taken_back() {
+    let tokens: Vec<u32> = (0..200).collect();
+    let first: [Vec<u64>; 3] = [Vec::new(), vec![7, 1, 9, 3], vec![7, 1, 5, 2]];
+    let second: [Vec<u64>; 3] = [Vec::new(), vec![7, 1, 9, 3], vec![7, 1, 6, 2]];
+    let mut store = Store::new(32);
+    let a = store
+        .adopt_disk_on_part_page(
+            part_lineage(&tokens, &first, 80),
+            160,
+            StateClass::Ordinary,
+            copy(1),
+            11,
+        )
+        .expect("the first state");
+    let b = store
+        .adopt_disk_on_part_page(
+            part_lineage(&tokens, &second, 80),
+            160,
+            StateClass::Ordinary,
+            copy(2),
+            12,
+        )
+        .expect("a state whose part page has other image keys");
+    assert!(a != b);
+    for (keys, id) in [(&first, a), (&second, b)] {
+        assert_eq!(
+            store
+                .lookup(part_lineage(&tokens, keys, 200))
+                .map(|hit| (hit.id, hit.depth)),
+            Some((id, 80)),
+            "page keys {:?}",
+            keys[2]
+        );
+    }
+    assert!(
+        store
+            .adopt_disk_on_part_page(
+                part_lineage(&tokens, &second, 80),
+                160,
+                StateClass::Ordinary,
+                copy(3),
+                1
+            )
+            .is_err(),
+        "one state on the same rows and page keys"
+    );
+    assert_eq!(store.bytes().entries, 2);
+}

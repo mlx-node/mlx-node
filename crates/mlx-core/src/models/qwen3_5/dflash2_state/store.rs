@@ -559,7 +559,11 @@ impl<S: StateBytes> HybridStateStore<S> {
         next.is_some()
     }
 
+    /// The entry on `key`'s rows. No chain hash covers a part page's image
+    /// keys, so a part-page key also needs that page's keys equal.
     fn entry_on(&self, key: &PromptKey<'_>) -> Option<EntryId> {
+        let blocks = key.chain.len();
+        let part_page = !key.tokens.len().is_multiple_of(key.block_size as usize);
         self.entries
             .iter()
             .find(|old| {
@@ -567,6 +571,8 @@ impl<S: StateBytes> HybridStateStore<S> {
                     && old.block_size == key.block_size
                     && old.chain == key.chain
                     && old.tokens[..] == key.tokens[..]
+                    && (!part_page
+                        || keys_at(&old.extra_keys, blocks) == keys_at(key.extra_keys, blocks))
             })
             .map(Entry::id)
     }
