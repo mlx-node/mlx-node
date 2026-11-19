@@ -80,9 +80,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-#[cfg(any(target_os = "macos", test))]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "macos", test))]
 use mlx_paged_attn::PagedAttentionConfig;
@@ -100,17 +98,19 @@ use super::paged_metadata_cache::{
 // aux-prefix latch helpers) lives in the sibling `cold_tier` module. These
 // re-exports keep `paged_kv_cache_adapter::ColdTierContext` & friends
 // resolving for the model families — zero API change.
-pub(crate) use super::cold_tier::PagedRestoreTicket;
 use super::cold_tier::{self, ColdTierWalk};
+pub(crate) use super::cold_tier::{
+    ChainPrefetch, ChainPrefetchPoll, ChainPrefetchStart, PagedRestoreTicket,
+};
 pub use super::cold_tier::{
     ColdCaptureBudget, ColdCaptureOutcome, ColdCaptureStop, ColdContextBacking, ColdTierContext,
 };
+pub use mlx_paged_attn::RestoreUploadBudget;
 
 use crate::array::{DType, MxArray};
 #[cfg(target_os = "macos")]
-use crate::inference_trace::{
-    elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
-};
+use crate::inference_trace::elapsed_ms;
+use crate::inference_trace::{enabled as inference_trace_enabled, write as write_inference_trace};
 
 /// What a turn's prepare books past the prefix it reuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -642,6 +642,19 @@ fn device_pages_per_split() -> u32 {
     })
 }
 
+/// The position from which a query row of this device scores INT8 codes
+/// over INT8 pages (`prefill_plan::int8_query_from`); `None` where it never
+/// does.
+#[cfg(target_os = "macos")]
+fn device_int8_query_from() -> Option<u32> {
+    static FROM: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *FROM.get_or_init(|| {
+        // SAFETY: nullary FFI query.
+        let gpu_gen = unsafe { mlx_sys::mlx_gpu_architecture_gen() };
+        mlx_paged_attn::prefill_plan::int8_query_from(gpu_gen)
+    })
+}
+
 /// Whether this GPU builds the in-place prefill attention pipelines, asked
 /// once per process.
 #[cfg(target_os = "macos")]
@@ -837,6 +850,13 @@ pub(crate) enum PagedRestorePoll {
         bytes_restored: u64,
         wait: Duration,
     },
+}
+
+/// What a landed [`ChainPrefetch`] tells the next armed lookup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LandedStateChain {
+    depth: usize,
+    restored_blocks: usize,
 }
 
 /// Process-local Metal/MLX memory counters captured once for a prefill chunk.
@@ -1057,6 +1077,10 @@ pub struct PagedKVCacheAdapter {
     /// The last prepare's prefix ends in KV blocks a disk state's restore
     /// brought back: only that state's GDN cell backs it.
     state_restored: bool,
+    /// A [`ChainPrefetch`] already brought the armed state's chain back:
+    /// the next lookup armed at that depth runs hot only and reports these
+    /// blocks as restored. Taken by that lookup, as `state_restore` is.
+    landed_state_chain: Option<LandedStateChain>,
 
     /// Auxiliary state the last prefix lookup restored, for the caller to
     /// install before it resumes from the cached prefix. Always `None` unless
@@ -1166,6 +1190,27 @@ pub struct PagedKVCacheAdapter {
     /// `RuntimeArenas` `AttentionPartials` / `AttentionStatistics`).
     #[cfg(target_os = "macos")]
     prefill_workspace: Option<MxArray>,
+
+    /// The load's int8 activations (Splash `--activations`): with `Auto`,
+    /// a query row over INT8 pages at or past `int8_queries_from` scores
+    /// INT8 codes. Constructed `Bf16`; a model's load sets its own.
+    /// Not part of [`Self::cache_identity`].
+    activations: crate::transformer::Activations,
+    /// The planes id of a load whose planes change the projections' bits
+    /// (the spread walk); `None` keeps the identity of a load without planes.
+    planes_route: Option<String>,
+
+    /// In-place prefill / verify launches of this adapter by query format:
+    /// bf16 queries, INT8 queries (`q8q`).
+    tile_query_launches: [u64; 2],
+
+    /// Decode-family query rows of this adapter by query format: bf16
+    /// queries, INT8 codes.
+    decode_query_rows: [u64; 2],
+
+    /// Test-only: the position rule's threshold in place of the device's.
+    #[cfg(test)]
+    int8_query_threshold: Option<u32>,
 
     /// Optional hook invoked once per pool grow or shrink with the pool's
     /// new total K/V bytes (all layers, both sides). The cache-limit pool
@@ -1423,6 +1468,7 @@ impl PagedKVCacheAdapter {
             suppress_cold_restore_once: false,
             state_restore: None,
             state_restored: false,
+            landed_state_chain: None,
             restored_sidecar: None,
             aux_prefix_unbacked: false,
             cold_capture: ColdCaptureOutcome::default(),
@@ -1435,6 +1481,12 @@ impl PagedKVCacheAdapter {
             native_pool_arrays: (0..num_layers).map(|_| None).collect(),
             #[cfg(target_os = "macos")]
             prefill_workspace: None,
+            activations: crate::transformer::Activations::Bf16,
+            planes_route: None,
+            tile_query_launches: [0; 2],
+            decode_query_rows: [0; 2],
+            #[cfg(test)]
+            int8_query_threshold: None,
             pool_growth_notifier: None,
             extent_growth_blocks: None,
             extent_runway_blocks: 0,
@@ -1468,6 +1520,140 @@ impl PagedKVCacheAdapter {
     /// Probe every later growth against the memory plan's ceiling.
     pub(crate) fn set_memory_ceiling(&mut self, ceiling_bytes: u64) {
         self.memory_ceiling = Some(ceiling_bytes);
+    }
+
+    /// The load's int8 activations (Splash `--activations`).
+    pub(crate) fn set_activations(&mut self, activations: crate::transformer::Activations) {
+        self.activations = activations;
+    }
+
+    /// The position from which this adapter's query rows score INT8 codes,
+    /// the same in every pass and launch (`prefill_plan::int8_query_from`):
+    /// activations `Auto` over an INT8 pool of a head dimension the tile
+    /// compiles, on a device that scores them. `None` keeps every query
+    /// bf16.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn int8_queries_from(&self) -> Option<u32> {
+        if self.activations != crate::transformer::Activations::Auto
+            || self.layer_kv_pool.cache_dtype() != mlx_paged_attn::metal::MetalDtype::Int8
+            || !matches!(self.layer_kv_pool.config().head_size, 128 | 256)
+        {
+            return None;
+        }
+        let from = device_int8_query_from()?;
+        #[cfg(test)]
+        if let Some(threshold) = self.int8_query_threshold {
+            return Some(threshold);
+        }
+        Some(from)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn int8_queries_from(&self) -> Option<u32> {
+        None
+    }
+
+    pub(crate) fn int8_queries_active(&self) -> bool {
+        self.int8_queries_from().is_some()
+    }
+
+    /// The planes id the load's attached planes add to the identity.
+    pub(crate) fn set_planes_route(&mut self, route: Option<String>) {
+        self.planes_route = route;
+    }
+
+    /// The pool's dtype as a persistent cache identity names it (`Int8`),
+    /// then ` ktm` on a page with token-major keys (its blocks have the
+    /// bytes of a 32-token vLLM page in another order), then
+    /// ` planes-route:<id>` when attached planes change the
+    /// projections' bits. A state written under one never restores under
+    /// another. The query mode is not part of it: queries are never stored,
+    /// and both modes write the same pages (Splash's namespace names no
+    /// mode, `RuntimeResources`).
+    pub(crate) fn cache_identity(&self) -> String {
+        let mut identity = format!("{:?}", self.layer_kv_pool.cache_dtype());
+        let ktm = self.layer_kv_pool.layout().keys_token_major;
+        if ktm {
+            identity.push_str(" ktm");
+        }
+        if let Some(route) = self.planes_route.as_deref() {
+            identity = format!("{identity} {route}");
+        }
+        identity
+    }
+
+    /// Test-only: the position rule's threshold, where the rule is on.
+    #[cfg(test)]
+    pub(crate) fn set_int8_query_threshold(&mut self, from: u32) {
+        self.int8_query_threshold = Some(from);
+    }
+
+    /// In-place prefill / verify launches so far: `[bf16 queries, INT8
+    /// queries]`.
+    pub(crate) fn tile_query_launches(&self) -> [u64; 2] {
+        self.tile_query_launches
+    }
+
+    /// Decode-family query rows so far: `[bf16 queries, INT8 codes]`.
+    pub(crate) fn decode_query_rows(&self) -> [u64; 2] {
+        self.decode_query_rows
+    }
+
+    /// The INT8 queries of a decode-family read by the position rule: the
+    /// rows of `queries` `[R, Hq, D]` at KV indices `positions` at or past
+    /// `int8_queries_from` score the tile's codes and score scale, the
+    /// others keep their queries and `scale`. Returns the queries to read
+    /// and the rows' score scales, `None` when no row reaches the
+    /// threshold (no code kernel; the read is the bf16-query one).
+    #[cfg(target_os = "macos")]
+    fn decode_queries(
+        &mut self,
+        queries: &MxArray,
+        positions: &[u32],
+        scale: f32,
+    ) -> Result<(MxArray, Option<MxArray>), String> {
+        let rows = positions.len() as u64;
+        let Some(from) = self.int8_queries_from() else {
+            self.decode_query_rows[0] += rows;
+            return Ok((queries.clone(), None));
+        };
+        let coded = positions.iter().filter(|&&p| p >= from).count() as u64;
+        self.decode_query_rows[0] += rows - coded;
+        self.decode_query_rows[1] += coded;
+        if coded == 0 {
+            return Ok((queries.clone(), None));
+        }
+        let positions = positions
+            .iter()
+            .map(|&p| i32::try_from(p).map_err(|_| format!("query position {p} exceeds i32")))
+            .collect::<Result<Vec<i32>, String>>()?;
+        let positions = MxArray::from_int32(&positions, &[positions.len() as i64])
+            .map_err(|e| format!("query codes: positions: {e}"))?;
+        let mut codes = std::ptr::null_mut();
+        let mut score_scales = std::ptr::null_mut();
+        // SAFETY: both inputs are live arrays; the out pointers are written
+        // only on success.
+        let ok = unsafe {
+            mlx_sys::mlx_paged_query_codes_forward(
+                queries.as_raw_ptr(),
+                positions.as_raw_ptr(),
+                from,
+                scale,
+                &mut codes,
+                &mut score_scales,
+            )
+        };
+        if !ok || codes.is_null() || score_scales.is_null() {
+            return Err(format!(
+                "query codes: the op refused {} rows (from {from})",
+                positions.size().unwrap_or(0)
+            ));
+        }
+        let codes = MxArray::from_handle(codes, "paged_query_codes")
+            .map_err(|e| format!("query codes: {e}"))?;
+        let score_scales = MxArray::from_handle(score_scales, "paged_query_score_scales")
+            .map_err(|e| format!("query codes: {e}"))?;
+        Ok((codes, Some(score_scales)))
     }
 
     /// Admit every later growth through the memory governor (Splash
@@ -2019,6 +2205,7 @@ impl PagedKVCacheAdapter {
                         lookup_tokens,
                         cached_prefix_len as usize,
                         cache_salt,
+                        cold_tier::ColdBacking::Sidecar(None),
                         |_| Some(extra_keys),
                         |full_blocks| {
                             mlx_paged_attn::chain_hashes(
@@ -2080,15 +2267,18 @@ impl PagedKVCacheAdapter {
         result
     }
 
-    /// Poll and, once ready, commit one scheduler-owned restore ticket.
+    /// Poll and, once ready, commit one scheduler-owned restore ticket. Its
+    /// uploads take chunks from `budget`.
     pub(crate) fn poll_restore(
         &mut self,
         restore: &mut PagedRestoreTicket,
+        budget: &mut RestoreUploadBudget,
     ) -> Result<PagedRestorePoll, String> {
         let Some(batch) = restore.job.poll_upload(
             &self.layer_kv_pool,
             restore.reserved.as_deref().unwrap_or_default(),
             &restore.identities,
+            budget,
         ) else {
             return Ok(PagedRestorePoll::Pending);
         };
@@ -2102,6 +2292,7 @@ impl PagedKVCacheAdapter {
                 .manager,
         );
         let reserved = restore.reserved.take().unwrap_or_default();
+        let limit = restore.hot_cached_blocks + reserved.len();
         let committed = manager.commit_restore_batch(
             &self.layer_kv_pool,
             &self.allocator,
@@ -2109,6 +2300,16 @@ impl PagedKVCacheAdapter {
             reserved,
             &restore.identities,
             wait,
+        );
+        cold_tier::trace_cold_restore_batch(
+            committed.as_ref().map_or(0, |commit| commit.blocks.len()),
+            restore.hot_cached_blocks,
+            limit,
+            committed.as_ref().map_or(0, |commit| commit.adopted),
+            restore.job.stats(),
+            wait,
+            committed.is_some(),
+            false,
         );
         let (blocks, bytes_restored) = committed
             .map(|commit| (commit.blocks, commit.bytes_restored))
@@ -2171,6 +2372,234 @@ impl PagedKVCacheAdapter {
             bytes_restored,
             wait,
         })
+    }
+
+    /// Start bringing a disk state's KV chain back beside other turns, with
+    /// no file read on the model thread: pin the hot leading blocks of
+    /// `prompt_tokens[..max_cache_hit_tokens]`, grow the pool for the rest
+    /// (under the caller's claim, as the synchronous prepare grows it), hold
+    /// the chain's files and `state_key` on the tier, reserve every
+    /// destination and start the reader. The chain is the blocks below
+    /// `depth`, every one on the tier. Touches no request state.
+    ///
+    /// Anything but `Started` leaves nothing behind.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_chain_prefetch(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_cache_hit_tokens: u32,
+        depth: usize,
+        keys: PrefixKeys<'_>,
+        cache_salt: u64,
+        state_key: Option<mlx_paged_attn::ColdCacheKey>,
+    ) -> ChainPrefetchStart {
+        let Some(cold) = self.cold_tier.as_ref().filter(|cold| cold.state_only()) else {
+            return ChainPrefetchStart::Unavailable;
+        };
+        let manager = Arc::clone(&cold.manager);
+        let block_size = self.block_size;
+        let bs = block_size as usize;
+        if bs == 0 || self.suppress_cold_restore_once {
+            return ChainPrefetchStart::Unavailable;
+        }
+        let lookup_len = usize::try_from(max_cache_hit_tokens)
+            .unwrap_or(usize::MAX)
+            .min(prompt_tokens.len());
+        if depth > lookup_len {
+            return ChainPrefetchStart::Unavailable;
+        }
+        let lookup_tokens = &prompt_tokens[..lookup_len];
+        let state_hold = state_key.map(|key| manager.hold_keys(vec![key]));
+        // The landing's lookup reads a part page's fragment after the chain:
+        // it stays on the tier until then.
+        let part_hold = self
+            .cold_tier
+            .as_ref()
+            .filter(|_| self.layer_kv_pool.layout().keys_token_major)
+            .and_then(|cold| {
+                ColdTierWalk {
+                    cold,
+                    pool: &self.layer_kv_pool,
+                    allocator: &self.allocator,
+                    block_size,
+                    held: 0,
+                }
+                .part_page_key(lookup_tokens, depth, cache_salt, |index| keys.get(index))
+            })
+            .map(|key| manager.hold_keys(vec![key]));
+        let (hot, hot_tokens) = self.allocator_guard().find_longest_cache_hit_with_keys(
+            lookup_tokens,
+            block_size,
+            keys,
+            cache_salt,
+        );
+        let pins = Arc::clone(&self.allocator);
+        let release = move |blocks: Vec<Arc<PhysicalBlock>>| {
+            let mut allocator = pins.lock().unwrap_or_else(|e| e.into_inner());
+            for block in blocks {
+                allocator.free(block);
+            }
+        };
+        let restorable = (depth / bs).saturating_sub(hot.len());
+        if restorable == 0 {
+            release(hot);
+            return ChainPrefetchStart::Hot;
+        }
+        if self.admission.is_some() {
+            let restorable = u32::try_from(restorable).unwrap_or(u32::MAX);
+            let held = self.held_blocks();
+            let shortfall =
+                self.grow_shortfall(&self.allocator_guard(), restorable.saturating_add(held));
+            if shortfall > 0 {
+                self.try_grow_pool(shortfall);
+            }
+        }
+        let pending = self.cold_tier.as_ref().and_then(|cold| {
+            ColdTierWalk {
+                cold,
+                pool: &self.layer_kv_pool,
+                allocator: &self.allocator,
+                block_size,
+                held: self.held_blocks(),
+            }
+            .begin_restore_extend(
+                lookup_tokens,
+                hot_tokens,
+                cache_salt,
+                cold_tier::ColdBacking::State { depth },
+                |index| keys.get(index),
+                |full_blocks| {
+                    keys.chain_hashes(&lookup_tokens[..full_blocks * bs], block_size, cache_salt)
+                },
+            )
+        });
+        let Some(pending) = pending else {
+            let blocks = u32::try_from(restorable).unwrap_or(u32::MAX);
+            let room = self
+                .allocator_guard()
+                .can_allocate(blocks.saturating_add(self.held_blocks()));
+            release(hot);
+            return if room {
+                ChainPrefetchStart::Unavailable
+            } else {
+                ChainPrefetchStart::Refused { blocks }
+            };
+        };
+        ChainPrefetchStart::Started(Box::new(ChainPrefetch {
+            depth,
+            hot,
+            job: pending.job,
+            reserved: Some(pending.reserved),
+            identities: pending.identities,
+            committed: None,
+            bytes_restored: 0,
+            failed: false,
+            base: pending.base,
+            limit: pending.limit,
+            retried: false,
+            allocator: Arc::clone(&self.allocator),
+            _holds: pending
+                .hold
+                .into_iter()
+                .chain(state_hold)
+                .chain(part_hold)
+                .collect(),
+        }))
+    }
+
+    /// Records `blocks` a disk restore's destinations lacked for `seq_id`,
+    /// as a refused reservation the ledger frees for.
+    pub(crate) fn refuse_restore(&self, seq_id: SeqId, blocks: u32) {
+        self.refuse(seq_id, blocks);
+    }
+
+    /// Upload what the prefetch's reader has ready, within `budget`, and
+    /// once the read is whole publish the chain all at once. A landed
+    /// prefetch keeps the chain pinned until it drops; drop it only after
+    /// the landing's lookup took the chain.
+    pub(crate) fn poll_chain_prefetch(
+        &self,
+        prefetch: &mut ChainPrefetch,
+        budget: &mut RestoreUploadBudget,
+    ) -> ChainPrefetchPoll {
+        if let Some(committed) = prefetch.committed.as_ref() {
+            return ChainPrefetchPoll::Landed {
+                blocks: committed.len(),
+                bytes_restored: prefetch.bytes_restored,
+            };
+        }
+        if prefetch.failed {
+            return ChainPrefetchPoll::Failed;
+        }
+        let Some(batch) = prefetch.job.poll_upload(
+            &self.layer_kv_pool,
+            prefetch.reserved.as_deref().unwrap_or_default(),
+            &prefetch.identities,
+            budget,
+        ) else {
+            return ChainPrefetchPoll::Pending;
+        };
+        let wait = prefetch.job.elapsed();
+        let reserved = prefetch.reserved.take().unwrap_or_default();
+        let committed = self.cold_tier.as_ref().and_then(|cold| {
+            cold.manager.commit_restore_batch(
+                &self.layer_kv_pool,
+                &self.allocator,
+                batch,
+                reserved,
+                &prefetch.identities,
+                wait,
+            )
+        });
+        cold_tier::trace_cold_restore_batch(
+            committed.as_ref().map_or(0, |commit| commit.blocks.len()),
+            prefetch.base,
+            prefetch.limit,
+            committed.as_ref().map_or(0, |commit| commit.adopted),
+            prefetch.job.stats(),
+            wait,
+            committed.is_some(),
+            prefetch.retried,
+        );
+        match committed {
+            Some(commit) => {
+                let blocks = commit.blocks.len();
+                prefetch.bytes_restored = commit.bytes_restored;
+                prefetch.committed = Some(commit.blocks);
+                ChainPrefetchPoll::Landed {
+                    blocks,
+                    bytes_restored: commit.bytes_restored,
+                }
+            }
+            None => {
+                prefetch.failed = true;
+                ChainPrefetchPoll::Failed
+            }
+        }
+    }
+
+    /// The next lookup armed at `prefetch`'s depth takes its landed chain
+    /// hot (no grow, no synchronous walk) and reports it as a disk state's
+    /// restore. Arm it right before that turn's prepare, with the turn's
+    /// request active; a prefetch that has not landed arms nothing.
+    pub(crate) fn arm_landed_chain(&mut self, prefetch: &ChainPrefetch) {
+        self.landed_state_chain = prefetch
+            .committed
+            .as_ref()
+            .map(|committed| LandedStateChain {
+                depth: prefetch.depth,
+                restored_blocks: committed.len(),
+            });
+    }
+
+    /// Drops an armed landed chain no lookup took.
+    pub(crate) fn disarm_landed_chain(&mut self) {
+        self.landed_state_chain = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn landed_chain_armed(&self) -> bool {
+        self.landed_state_chain.is_some()
     }
 
     /// Per-block-extra-keys variant of
@@ -2298,6 +2727,7 @@ impl PagedKVCacheAdapter {
         self.state_restored = false;
         if let Err(error) = self.activate_request(seq_id) {
             self.state_restore = None;
+            self.landed_state_chain = None;
             return Err(error);
         }
         let result = self.prepare_turn_inner_mutating(
@@ -2312,6 +2742,7 @@ impl PagedKVCacheAdapter {
             booking,
         );
         self.state_restore = None;
+        self.landed_state_chain = None;
         if result.is_err() {
             // Prefix lookup attaches cache-owned block references before suffix
             // allocation. A later allocation failure must not leave those
@@ -2617,6 +3048,7 @@ impl PagedKVCacheAdapter {
         // immediately-following request is suppressed.
         let suppress_cold_restore = std::mem::take(&mut self.suppress_cold_restore_once);
         let state_restore = self.state_restore.take();
+        let landed_state_chain = self.landed_state_chain.take();
         self.state_restored = false;
         if self.block_table.is_none() {
             return Err(format!("{op} called before reset_for_new_request"));
@@ -2676,7 +3108,17 @@ impl PagedKVCacheAdapter {
             .is_some_and(ColdTierContext::state_only);
         let restore_cold = restore_cold && (!state_only || state_restore.is_some());
         let mut cold_restored_blocks = 0;
-        if restore_cold
+        let landed_state_chain = landed_state_chain
+            .filter(|chain| restore_cold && state_only && state_restore == Some(chain.depth));
+        if let Some(chain) = landed_state_chain {
+            // Beside other turns the chain came back before this lookup:
+            // no pool grow and no synchronous walk here. A hot chain short
+            // of the state's depth resumes nowhere near it.
+            if blocks.len() >= chain.depth / self.block_size.max(1) as usize {
+                cold_restored_blocks = chain.restored_blocks;
+                self.state_restored = cold_restored_blocks > 0;
+            }
+        } else if restore_cold
             && !suppress_cold_restore
             && self.cold_tier.is_some()
             && self.admission.is_some()
@@ -2695,8 +3137,19 @@ impl PagedKVCacheAdapter {
                 self.try_grow_pool(shortfall);
             }
         }
+        // A state on a part page (a 16-token store's chat moved into a
+        // keys-token-major pool) ends half a page past its chain.
+        let part_page_depth = state_restore.filter(|&depth| {
+            restore_cold
+                && !suppress_cold_restore
+                && state_only
+                && depth <= lookup_len
+                && self.layer_kv_pool.layout().keys_token_major
+                && depth % self.block_size.max(1) as usize == self.block_size as usize / 2
+        });
         if restore_cold
             && !suppress_cold_restore
+            && landed_state_chain.is_none()
             && let Some(cold) = self.cold_tier.as_ref()
         {
             let state_depth = state_restore.filter(|_| state_only);
@@ -2759,14 +3212,93 @@ impl PagedKVCacheAdapter {
         block_table.set_num_tokens(self.request_tokens.len() as u32);
 
         self.prefix_lookup_done = true;
+        if let Some(depth) = part_page_depth
+            && blocks.len() == depth / self.block_size.max(1) as usize
+            && cached_tokens == blocks.len() * self.block_size as usize
+            && self.restore_part_page(lookup_tokens, depth, keys, cache_salt)?
+        {
+            cold_restored_blocks += 1;
+            self.state_restored = true;
+        }
         // The prefix above may include blocks the HOT cache served, which the
         // cold walk's reconcile-down never sees. Latch the outstanding
         // auxiliary-state obligation; see the `aux_prefix_unbacked` field doc.
         self.aux_prefix_unbacked = self.aux_prefix_state_missing(cold_restored_blocks);
         Ok(CachedPrefix {
             blocks,
-            cached_token_count,
+            cached_token_count: self.cached_token_count,
         })
+    }
+
+    /// The active request holds exactly the whole pages below `depth`, and
+    /// `depth` ends half a page past them: ONE block more takes the rows up
+    /// to `depth` from the state's fragment on the tier (the other half
+    /// zero), and the request stands at `depth`. That block is the
+    /// request's alone. Nothing publishes it while it holds less than a
+    /// page: two requests that restore the same state each take their own,
+    /// and each writes its own rows past `depth` into it. Once the request
+    /// fills it, it is a block like any other (registered with the
+    /// request's full blocks, copied to the tier under a later state).
+    ///
+    /// `Ok(false)`: the fragment did not come back; the request stays at
+    /// its whole pages. `Err`: the pool has no block for it.
+    fn restore_part_page(
+        &mut self,
+        lookup_tokens: &[u32],
+        depth: usize,
+        keys: PrefixKeys<'_>,
+        cache_salt: u64,
+    ) -> Result<bool, String> {
+        let bs = self.block_size as usize;
+        let pages = depth.checked_div(bs).unwrap_or(0);
+        let Some(tokens) = lookup_tokens.get(pages * bs..depth) else {
+            return Ok(false);
+        };
+        let Some(layers) = self.cold_tier.as_ref().and_then(|cold| {
+            let walk = ColdTierWalk {
+                cold,
+                pool: &self.layer_kv_pool,
+                allocator: &self.allocator,
+                block_size: self.block_size,
+                held: self.held_blocks(),
+            };
+            let key = walk.part_page_key(lookup_tokens, depth, cache_salt, |i| keys.get(i))?;
+            walk.load_part_page(key, tokens)
+        }) else {
+            return Ok(false);
+        };
+        let depth_tokens =
+            u32::try_from(depth).map_err(|_| "a part page past u32 tokens".to_string())?;
+        self.ensure_blocks_for_total_tokens(depth_tokens)?;
+        let block = self
+            .block_table
+            .as_ref()
+            .and_then(|table| table.blocks().get(pages))
+            .cloned()
+            .ok_or_else(|| "a part page without its block".to_string())?;
+        if block.get_ref_count() != 1 {
+            return Err(format!(
+                "a part page's block {} is not the request's alone",
+                block.block_id
+            ));
+        }
+        let layer_bytes: Vec<(&[u8], &[u8])> = layers
+            .iter()
+            .map(|(keys, values)| (keys.as_slice(), values.as_slice()))
+            .collect();
+        if self
+            .layer_kv_pool
+            .write_block_all_layers(block.block_id, &layer_bytes)
+            .is_err()
+        {
+            return Ok(false);
+        }
+        if let Some(table) = self.block_table.as_mut() {
+            table.set_num_tokens(depth_tokens);
+        }
+        self.request_tokens.extend_from_slice(tokens);
+        self.cached_token_count = depth_tokens;
+        Ok(true)
     }
 
     /// Per-block-extra_keys variant of [`Self::find_cached_prefix`].
@@ -2906,17 +3438,27 @@ impl PagedKVCacheAdapter {
                 "context_length_exceeded: requested {total_tokens} tokens, paged cache capacity is {capacity} tokens"
             ));
         }
-        self.block_table.as_ref().ok_or_else(|| {
-            "allocate_suffix_blocks called before reset_for_new_request".to_string()
-        })?;
+        let have = self
+            .block_table
+            .as_ref()
+            .ok_or_else(|| {
+                "allocate_suffix_blocks called before reset_for_new_request".to_string()
+            })?
+            .num_blocks() as u32;
 
-        // Tokens that need fresh blocks = total_tokens - cached prefix tokens.
         let cached = self.cached_token_count;
         if total_tokens <= cached {
             return Ok(0);
         }
-        let suffix_tokens = total_tokens - cached;
-        let needed_blocks = suffix_tokens.div_ceil(self.block_size);
+        // The cached rows end inside the table's last block (a part-page
+        // restore): that block's free rows take the first suffix rows.
+        let ends_inside =
+            !cached.is_multiple_of(self.block_size) && have == cached.div_ceil(self.block_size);
+        let needed_blocks = if ends_inside {
+            total_tokens.div_ceil(self.block_size).saturating_sub(have)
+        } else {
+            (total_tokens - cached).div_ceil(self.block_size)
+        };
         if needed_blocks == 0 {
             return Ok(0);
         }
@@ -3162,6 +3704,7 @@ impl PagedKVCacheAdapter {
         if self.growth_hold {
             return false;
         }
+        let started = Instant::now();
         // Serialize the whole probe → grow → notify sequence process-wide
         // (see crate::cache_limit::pool_growth_lock). Scope-drop releases
         // the guard on every exit path, including the decline/failure
@@ -3222,7 +3765,7 @@ impl PagedKVCacheAdapter {
             };
             let mut grew = false;
             let admitted = admission.admit_grow(bytes, &mut || {
-                grew = self.grow_pool_to(&mut guard, current, new_num_blocks)?;
+                grew = self.grow_pool_to(&mut guard, current, new_num_blocks, started)?;
                 Ok(grew)
             });
             return admitted && grew;
@@ -3264,7 +3807,7 @@ impl PagedKVCacheAdapter {
                 return false;
             }
         }
-        match self.grow_pool_to(&mut guard, current, new_num_blocks) {
+        match self.grow_pool_to(&mut guard, current, new_num_blocks, started) {
             Ok(grew) => grew,
             Err(e) => {
                 tracing::warn!(target: "mlx_core::paged_kv", "{e}");
@@ -3287,13 +3830,16 @@ impl PagedKVCacheAdapter {
     /// Grows the pool and its allocator (`guard`) from `current` to
     /// `new_num_blocks`, then notifies the new total. `Ok(false)` when
     /// nothing allocatable appeared; `Err` when the grow failed, a layer's
-    /// new buffers refused (layers grown before stay larger).
+    /// new buffers refused (layers grown before stay larger). `started` is
+    /// when the grow's flush and GPU drain began, for the trace.
     fn grow_pool_to(
         &mut self,
         guard: &mut std::sync::MutexGuard<'_, BlockAllocator>,
         current: u32,
         new_num_blocks: u32,
+        started: Instant,
     ) -> Result<bool, String> {
+        let grow_started = Instant::now();
         let old_total_bytes = self.layer_kv_pool.total_bytes();
         // This adapter's cached per-layer views retain the pre-grow buffers;
         // dropped after the grow, each old layer would outlive its swap and
@@ -3339,6 +3885,18 @@ impl PagedKVCacheAdapter {
             old_total_bytes as f64 / (1024.0 * 1024.0),
             new_total_bytes as f64 / (1024.0 * 1024.0),
         );
+        if inference_trace_enabled() {
+            write_inference_trace(format_args!(
+                "[MLX_TRACE] paged pool_grow blocks_before={} blocks_after={} old_mib={:.2} new_mib={:.2} drain_ms={:.3} grow_ms={:.3} ms={:.3}",
+                current,
+                new_num_blocks,
+                old_total_bytes as f64 / (1024.0 * 1024.0),
+                new_total_bytes as f64 / (1024.0 * 1024.0),
+                grow_started.duration_since(started).as_secs_f64() * 1000.0,
+                grow_started.elapsed().as_secs_f64() * 1000.0,
+                started.elapsed().as_secs_f64() * 1000.0,
+            ));
+        }
         Ok(true)
     }
 
@@ -3998,6 +4556,30 @@ impl PagedKVCacheAdapter {
         Ok(())
     }
 
+    /// [`Self::record_placeholder_token`] for `rows` rows at once: the
+    /// DFlash2 verify books its rows before its device ids reach the host.
+    pub(crate) fn record_placeholder_tokens(&mut self, rows: usize) -> Result<(), String> {
+        self.record_tokens(&vec![u32::MAX; rows])
+    }
+
+    /// [`Self::patch_last_recorded_token`] for the last `tokens.len()`
+    /// records, which must all be placeholders.
+    pub(crate) fn patch_last_recorded_tokens(&mut self, tokens: &[u32]) -> Result<(), String> {
+        let len = self.request_tokens.len();
+        if tokens.is_empty() || tokens.len() > len {
+            return Err(format!(
+                "patch_last_recorded_tokens: {} ids for {len} recorded tokens",
+                tokens.len()
+            ));
+        }
+        let tail = &mut self.request_tokens[len - tokens.len()..];
+        if tail.iter().any(|&id| id != u32::MAX) {
+            return Err("patch_last_recorded_tokens: tail is not a placeholder record".to_string());
+        }
+        tail.copy_from_slice(tokens);
+        Ok(())
+    }
+
     /// Roll back the most recent `n` tokens from `request_tokens` and
     /// `block_table.num_tokens`. Used by the C++ compiled-paged dispatcher
     /// when a forward step fails after `record_tokens` has already advanced
@@ -4520,6 +5102,47 @@ impl PagedKVCacheAdapter {
         Ok(())
     }
 
+    /// The lazy pool arrays of `layer_idx`'s unevaluated native writes on the
+    /// live pool, as eval roots; empty when it has none.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn pending_pool_write_arrays(&self, layer_idx: u32) -> Vec<MxArray> {
+        let generation = self.layer_kv_pool.generation();
+        match self.native_pool_arrays.get(layer_idx as usize) {
+            Some(Some(state)) if state.dirty && state.generation == generation => {
+                let mut arrays = vec![
+                    state.key.clone(),
+                    state.value.clone(),
+                    state.k_scale.clone(),
+                    state.v_scale.clone(),
+                ];
+                arrays.extend(state.index.clone());
+                arrays
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn pending_pool_write_arrays(&self, _layer_idx: u32) -> Vec<MxArray> {
+        Vec::new()
+    }
+
+    /// Whether every pool array `layer_idx` holds is evaluated.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn pool_writes_evaluated(&self, layer_idx: u32) -> bool {
+        let ready =
+            |array: &MxArray| unsafe { mlx_sys::mlx_array_is_available(array.as_raw_ptr()) };
+        match self.native_pool_arrays.get(layer_idx as usize) {
+            Some(Some(state)) => {
+                ready(&state.key)
+                    && ready(&state.value)
+                    && ready(&state.k_scale)
+                    && ready(&state.v_scale)
+            }
+            _ => true,
+        }
+    }
+
     /// Write a chunk of K/V tokens into the layer's paged Metal buffers
     /// via the `reshape_and_cache` kernel.
     ///
@@ -4808,6 +5431,13 @@ impl PagedKVCacheAdapter {
         let mut out_v_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
         let mut out_k_scale: *mut mlx_sys::mlx_array = std::ptr::null_mut();
         let mut out_v_scale: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        // The factory evaluates `max(slot_mapping)` when the mapping is not on
+        // the host (mlx_paged_ops.cpp `paged_kv_write`).
+        #[cfg(test)]
+        crate::array::host_waits::end(crate::array::host_waits::begin(
+            "paged_kv_write slot-range eval",
+            &[slot_mapping.as_raw_ptr()],
+        ));
         let ok = unsafe {
             mlx_sys::mlx_paged_kv_write_forward(
                 pool.key.as_raw_ptr(),
@@ -5551,6 +6181,19 @@ impl PagedKVCacheAdapter {
             max_context_len,
             q_meta.shape[1] as u32,
         );
+        let positions = seq_ids
+            .iter()
+            .map(|&seq_id| {
+                self.block_table_for(seq_id)
+                    .and_then(|table| table.num_tokens().checked_sub(1))
+                    .ok_or_else(|| {
+                        format!(
+                            "gather_kv_for_decode_graph_batched: sequence {seq_id} has no recorded token"
+                        )
+                    })
+            })
+            .collect::<Result<Vec<u32>, String>>()?;
+        let (queries, score_scales) = self.decode_queries(queries, &positions, scale)?;
         let k_pool = self.key_pool_array(layer_idx)?;
         let v_pool = self.value_pool_array(layer_idx)?;
         let k_scale = self.k_scale_array(layer_idx)?;
@@ -5575,6 +6218,9 @@ impl PagedKVCacheAdapter {
                 self.kv_dtype_raw()?,
                 route_hint as u8,
                 grouped_stripes,
+                score_scales
+                    .as_ref()
+                    .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
             )
         };
         if raw.is_null() {
@@ -5665,6 +6311,13 @@ impl PagedKVCacheAdapter {
             ));
         }
 
+        let positions: Vec<u32> = rows
+            .iter()
+            .flat_map(|row| {
+                (0..row.query_len).map(move |offset| row.first_logical_position + offset)
+            })
+            .collect();
+        let (queries, score_scales) = self.decode_queries(queries, &positions, scale)?;
         let PoolLayerArrays {
             key: k_pool,
             value: v_pool,
@@ -5690,6 +6343,9 @@ impl PagedKVCacheAdapter {
                 self.layer_kv_pool.config().num_kv_heads as i32,
                 self.layer_kv_pool.config().head_size as i32,
                 self.kv_dtype_raw()?,
+                score_scales
+                    .as_ref()
+                    .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
             )
         };
         if raw.is_null() {
@@ -5798,6 +6454,12 @@ impl PagedKVCacheAdapter {
             self.current_token_count(),
             num_query_heads,
         );
+        let position = self
+            .block_table
+            .as_ref()
+            .and_then(|table| table.num_tokens().checked_sub(1))
+            .ok_or_else(|| "gather_kv_for_decode_graph: no recorded token".to_string())?;
+        let (queries, score_scales) = self.decode_queries(queries, &[position], scale)?;
         let k_pool = self.key_pool_array(layer_idx)?;
         let v_pool = self.value_pool_array(layer_idx)?;
         let k_scale = self.k_scale_array(layer_idx)?;
@@ -5824,6 +6486,9 @@ impl PagedKVCacheAdapter {
                 kv_dtype_raw,
                 route_hint as u8,
                 grouped_stripes,
+                score_scales
+                    .as_ref()
+                    .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
             )
         };
         if raw.is_null() {
@@ -6020,10 +6685,10 @@ impl PagedKVCacheAdapter {
 
     /// Build and cache a compact one-dimensional physical block-ID array for
     /// `required_tokens` logical positions of the active request, starting at
-    /// `first_block`. Both graph-native prefill paths consume this
-    /// representation: varlen attention reshapes it to one block-table row,
-    /// while SDPA gathering uses it directly as the `take(axis=0)` index
-    /// vector.
+    /// `first_block`; SDPA gathering uses it as the `take(axis=0)` index
+    /// vector. It evaluates, so varlen attention builds its block-table row
+    /// on the host instead of from this array (an eval here would wait for a
+    /// verify's queued draft).
     ///
     /// The cache and its compute live in [`PagedMetadataCache`]; this
     /// wrapper only gathers the adapter-side inputs.
@@ -6167,6 +6832,8 @@ impl PagedKVCacheAdapter {
 
         let (block_table, seq_lens, cu_seqlens_q, block_count, _) =
             self.varlen_prefill_attention_inputs(cached_prefix_len, query_len)?;
+        let positions: Vec<u32> = (cached_prefix_len..total_context).collect();
+        let (queries, score_scales) = self.decode_queries(queries, &positions, scale)?;
         let PoolLayerArrays {
             key: k_pool,
             value: v_pool,
@@ -6200,6 +6867,9 @@ impl PagedKVCacheAdapter {
                 self.layer_kv_pool.config().num_kv_heads as i32,
                 expected_head_size as i32,
                 kv_dtype_raw,
+                score_scales
+                    .as_ref()
+                    .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
             )
         };
         if raw.is_null() {
@@ -6287,6 +6957,8 @@ impl PagedKVCacheAdapter {
     /// and `addVerify`): `queries` `[rows, Hq, D]` at positions
     /// `[committed, committed + rows)`; returns `[rows, Hq, D]` bf16. Every
     /// launch writes the adapter's one workspace, sized by the pass's bound.
+    /// Rows at or past `int8_queries_from` score INT8 codes: a chunk that
+    /// holds rows on both sides runs as two launches, one per side.
     #[cfg(target_os = "macos")]
     pub(crate) fn paged_prefill_attention(
         &mut self,
@@ -6296,7 +6968,6 @@ impl PagedKVCacheAdapter {
         pass: mlx_paged_attn::prefill_plan::Pass,
         scale: f32,
     ) -> Result<MxArray, String> {
-        use mlx_paged_attn::prefill_plan;
         if self.sliding_window != 0 {
             return Err(format!(
                 "paged_prefill_attention: refusing a sliding group (sliding_window = {}); \
@@ -6317,6 +6988,54 @@ impl PagedKVCacheAdapter {
         if self.portable_prefill() {
             return self.portable_prefill_attention(layer_idx, queries, committed, scale);
         }
+        let rows = queries
+            .shape_at(0)
+            .map_err(|e| format!("paged_prefill_attention: {e}"))?;
+        let rows = u32::try_from(rows)
+            .map_err(|_| format!("paged_prefill_attention: invalid rows {rows}"))?;
+        let pieces =
+            mlx_paged_attn::prefill_plan::tile_pieces(committed, rows, self.int8_queries_from());
+        if let [(_, _, int8_queries)] = pieces[..] {
+            return self.paged_prefill_launch(
+                layer_idx,
+                queries,
+                committed,
+                pass,
+                scale,
+                int8_queries,
+            );
+        }
+        let mut outputs = Vec::with_capacity(pieces.len());
+        for (first, piece_rows, int8_queries) in pieces {
+            let start = i64::from(first - committed);
+            let part = queries
+                .slice_axis(0, start, start + i64::from(piece_rows))
+                .map_err(|e| format!("paged_prefill_attention: query rows: {e}"))?;
+            outputs.push(self.paged_prefill_launch(
+                layer_idx,
+                &part,
+                first,
+                pass,
+                scale,
+                int8_queries,
+            )?);
+        }
+        MxArray::concatenate_many(outputs.iter().collect(), Some(0))
+            .map_err(|e| format!("paged_prefill_attention: concatenate: {e}"))
+    }
+
+    /// One tile launch of rows on one side of the position rule.
+    #[cfg(target_os = "macos")]
+    fn paged_prefill_launch(
+        &mut self,
+        layer_idx: u32,
+        queries: &MxArray,
+        committed: u32,
+        pass: mlx_paged_attn::prefill_plan::Pass,
+        scale: f32,
+        int8_queries: bool,
+    ) -> Result<MxArray, String> {
+        use mlx_paged_attn::prefill_plan;
         let q_meta = KvTensorMeta::from_array(queries, "prefill_queries")?;
         if q_meta.ndim != 3 || q_meta.shape.len() < 3 {
             return Err(format!(
@@ -6384,6 +7103,7 @@ impl PagedKVCacheAdapter {
                 num_kv_heads as i32,
                 head_size as i32,
                 kv_dtype_raw,
+                int8_queries,
                 scale,
                 &mut attention,
                 &mut workspace_out,
@@ -6392,9 +7112,11 @@ impl PagedKVCacheAdapter {
         if !ok || attention.is_null() || workspace_out.is_null() {
             return Err(format!(
                 "paged_prefill_attention: the op refused layer {layer_idx} (rows {rows}, \
-                 committed {committed}, splits {splits}, pass {pass:?})"
+                 committed {committed}, splits {splits}, pass {pass:?}, int8 queries \
+                 {int8_queries})"
             ));
         }
+        self.tile_query_launches[usize::from(int8_queries)] += 1;
         let attention = MxArray::from_handle(attention, "paged_prefill_attention")
             .map_err(|e| format!("paged_prefill_attention: {e}"))?;
         let workspace = MxArray::from_handle(workspace_out, "paged_prefill_workspace")
@@ -6516,12 +7238,13 @@ impl PagedKVCacheAdapter {
         if first_token >= total_context {
             return Err("dense K/V range must contain at least one token".to_string());
         }
-        if self.layer_kv_pool.layout().values_token_major {
-            return Err(
-                "gather_kv_for_prefill_sdpa: a token-major page is read by its model's own \
-                 page gathers"
-                    .to_string(),
-            );
+        let vllm_page = self.layer_kv_pool.layout().is_vllm();
+        if !vllm_page {
+            return Err(format!(
+                "gather_kv_for_prefill_sdpa: a {:?} page is read by its model's own page \
+                 gathers",
+                self.layer_kv_pool.layout()
+            ));
         }
         if (layer_idx as usize) >= self.layer_kv_pool.num_layers() {
             return Err(format!(
@@ -10932,6 +11655,372 @@ mod tests {
         ));
         drop(state_only);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Eight 8-token blocks of a 64-token prompt on a cold tier, written by
+    /// a `KvOnly` capture, and a builder of fresh `StateOnly` adapters over
+    /// it (one process restart each).
+    #[cfg(target_os = "macos")]
+    struct StateChainFixture {
+        root: std::path::PathBuf,
+        tokens: Vec<u32>,
+        fingerprint: mlx_paged_attn::ColdCacheFingerprint,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl StateChainFixture {
+        fn make_config() -> PagedAttentionConfig {
+            PagedAttentionConfig {
+                block_size: 8,
+                gpu_memory_mb: 256,
+                head_size: 64,
+                num_kv_heads: 1,
+                num_layers: 2,
+                max_seq_len: Some(64),
+                max_batch_size: Some(1),
+            }
+        }
+
+        fn new(name: &str) -> Option<Self> {
+            use mlx_paged_attn::metal::MetalDtype;
+
+            let pool = match LayerKVPool::new(Self::make_config(), 8, 8, MetalDtype::BFloat16) {
+                Ok(pool) => Arc::new(pool),
+                Err(e) if e.contains("No Metal device found") => return None,
+                Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+            };
+            let tokens: Vec<u32> = (0..64u32).map(|i| 300 + i * 11).collect();
+            let fingerprint = mlx_paged_attn::ColdCacheFingerprint::from_components([
+                b"qwen35-chain-prefetch".as_slice(),
+            ]);
+            let root = std::env::temp_dir().join(format!(
+                "mlx-adapter-{name}-{}-{}",
+                std::process::id(),
+                Instant::now().elapsed().as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let mut capture = PagedKVCacheAdapter::new(new_allocator(8, 8), pool, 8)
+                .expect("capture adapter ctor");
+            let manager =
+                Arc::new(open_test_cold_cache(root.clone()).expect("temp-dir cold cache opens"));
+            capture.set_cold_tier(ColdTierContext {
+                manager: Arc::clone(&manager),
+                fingerprint,
+                backing: ColdContextBacking::KvOnly,
+            });
+            capture.reset_for_new_request(0).unwrap();
+            capture.allocate_suffix_blocks(64).unwrap();
+            capture.record_tokens(&tokens).unwrap();
+            assert_eq!(capture.register_full_blocks_for_reuse(&[], 0).unwrap(), 8);
+            assert!(manager.drain(std::time::Duration::from_secs(10)));
+            Some(Self {
+                root,
+                tokens,
+                fingerprint,
+            })
+        }
+
+        fn key(&self, index: usize) -> mlx_paged_attn::ColdCacheKey {
+            let mut parent = None;
+            let mut key = None;
+            for block in 0..=index {
+                let next = mlx_paged_attn::ColdCacheKey::chain(
+                    mlx_paged_attn::ColdGroup::Kv,
+                    self.fingerprint,
+                    parent,
+                    &self.tokens[block * 8..(block + 1) * 8],
+                    &[],
+                    0,
+                    block,
+                );
+                parent = Some(next);
+                key = Some(next);
+            }
+            key.expect("index 0 or more")
+        }
+
+        /// A `StateOnly` adapter on a fresh pool whose first `hot_blocks`
+        /// blocks are hot (cache-only), as a warm-up would leave them.
+        fn adapter(&self) -> (PagedKVCacheAdapter, Arc<mlx_paged_attn::ColdCacheManager>) {
+            use mlx_paged_attn::metal::MetalDtype;
+
+            let pool = Arc::new(
+                LayerKVPool::new(Self::make_config(), 8, 8, MetalDtype::BFloat16).unwrap(),
+            );
+            let manager =
+                Arc::new(open_test_cold_cache(self.root.clone()).expect("reopen cold cache"));
+            let mut adapter = PagedKVCacheAdapter::new(new_allocator(8, 8), pool, 8)
+                .expect("restore adapter ctor");
+            adapter.set_cold_tier(ColdTierContext {
+                manager: Arc::clone(&manager),
+                fingerprint: self.fingerprint,
+                backing: ColdContextBacking::StateOnly,
+            });
+            adapter.reset_for_new_request(9).unwrap();
+            adapter.allocate_suffix_blocks(16).unwrap();
+            adapter.record_tokens(&self.tokens[..16]).unwrap();
+            assert_eq!(adapter.register_full_blocks_for_reuse(&[], 0).unwrap(), 2);
+            adapter.release_request().unwrap();
+            (adapter, manager)
+        }
+
+        fn hot_tokens(&self, adapter: &PagedKVCacheAdapter) -> usize {
+            let mut allocator = adapter.allocator_guard();
+            let (blocks, cached) = allocator.find_longest_cache_hit(&self.tokens[..63], 8, &[], 0);
+            for block in blocks {
+                allocator.free(block);
+            }
+            cached
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for StateChainFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// A state chain read beside other turns publishes nothing while it
+    /// is open: a lookup of the same tokens hits only the hot base, however
+    /// many chunks are uploaded. After the commit the whole chain is hot, and
+    /// the landing's armed lookup takes it with no walk and reports it as a
+    /// disk state's restore.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_state_chain_prefetch_publishes_nothing_until_it_lands() {
+        let Some(fixture) = StateChainFixture::new("prefetch-publish") else {
+            return;
+        };
+        let (mut adapter, manager) = fixture.adapter();
+        assert_eq!(
+            fixture.hot_tokens(&adapter),
+            16,
+            "the hot base is two blocks"
+        );
+        mlx_paged_attn::set_restore_chunk_bytes_for_test(Some(1));
+        let prefetch = adapter.begin_chain_prefetch(
+            &fixture.tokens,
+            63,
+            56,
+            PrefixKeys::Uniform(&[]),
+            0,
+            None,
+        );
+        mlx_paged_attn::set_restore_chunk_bytes_for_test(None);
+        let mut prefetch = prefetch
+            .started()
+            .expect("the state's chain is on the tier");
+        assert_eq!(prefetch.reserved_blocks(), 5, "blocks 2..7 are reserved");
+        assert_eq!(adapter.allocator_guard().num_free_blocks(), 1);
+        let hits_before = manager.stats().hits;
+        let mut pending_polls = 0;
+        let landed = loop {
+            match adapter.poll_chain_prefetch(&mut prefetch, &mut RestoreUploadBudget::chunks(1)) {
+                ChainPrefetchPoll::Pending => {
+                    if prefetch.stats().uploaded_blocks > 0 {
+                        pending_polls += 1;
+                    }
+                    assert_eq!(
+                        fixture.hot_tokens(&adapter),
+                        16,
+                        "an open prefetch publishes no block ({} uploaded)",
+                        prefetch.stats().uploaded_blocks
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                other => break other,
+            }
+        };
+        assert!(
+            pending_polls >= 4,
+            "a cap of one chunk landed five chunks in steps"
+        );
+        assert!(
+            matches!(landed, ChainPrefetchPoll::Landed { blocks: 5, .. }),
+            "{landed:?}"
+        );
+        assert_eq!(manager.stats().hits - hits_before, 5);
+        assert_eq!(prefetch.restored_blocks(), 5);
+        assert_eq!(
+            fixture.hot_tokens(&adapter),
+            56,
+            "the commit publishes the chain"
+        );
+
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.arm_state_restore(56);
+        adapter.arm_landed_chain(&prefetch);
+        let hits_landed = manager.stats().hits;
+        let prefix = adapter
+            .find_cached_prefix(&fixture.tokens, &[], 0, false)
+            .unwrap();
+        assert_eq!(prefix.cached_token_count, 56);
+        assert!(
+            adapter.state_restored(),
+            "the landed chain is a disk state's restore"
+        );
+        assert!(
+            adapter.aux_prefix_unbacked,
+            "its GDN half is owed, as after the walk"
+        );
+        assert_eq!(
+            manager.stats().hits,
+            hits_landed,
+            "the landing walks nothing"
+        );
+        drop(prefetch);
+        adapter.release_request().unwrap();
+        assert_eq!(fixture.hot_tokens(&adapter), 56);
+    }
+
+    /// A prefetch holds its state's object on the tier while it lives and
+    /// lets go of it when it drops.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_state_chain_prefetch_holds_its_state_object() {
+        let Some(fixture) = StateChainFixture::new("prefetch-state-hold") else {
+            return;
+        };
+        let (mut adapter, manager) = fixture.adapter();
+        let state = fixture.key(7);
+        let prefetch = adapter
+            .begin_chain_prefetch(
+                &fixture.tokens,
+                63,
+                56,
+                PrefixKeys::Uniform(&[]),
+                0,
+                Some(state),
+            )
+            .started()
+            .expect("the chain is on the tier");
+        assert!(
+            manager.is_held_for_test(&state),
+            "the state's object is held while the prefetch lives"
+        );
+        drop(prefetch);
+        assert!(!manager.is_held_for_test(&state), "and let go with it");
+    }
+
+    /// A state shallower than the tier's chain brings back only the blocks
+    /// below it: blocks 5 and 6 stay on the tier, unreserved and
+    /// unpublished.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_state_chain_prefetch_stops_at_the_state_depth() {
+        let Some(fixture) = StateChainFixture::new("prefetch-depth") else {
+            return;
+        };
+        let (mut adapter, _manager) = fixture.adapter();
+        let mut prefetch = adapter
+            .begin_chain_prefetch(&fixture.tokens, 63, 40, PrefixKeys::Uniform(&[]), 0, None)
+            .started()
+            .expect("the chain is on the tier");
+        assert_eq!(prefetch.reserved_blocks(), 3, "blocks 2..4 are reserved");
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(
+            adapter.poll_chain_prefetch(&mut prefetch, &mut RestoreUploadBudget::per_pass()),
+            ChainPrefetchPoll::Landed { .. }
+        ) {
+            assert!(Instant::now() < deadline, "the prefetch lands");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(prefetch.restored_blocks(), 3);
+        assert_eq!(
+            fixture.hot_tokens(&adapter),
+            40,
+            "nothing past the state is published"
+        );
+        drop(prefetch);
+    }
+
+    /// A state whose chain misses one block on the tier starts no
+    /// prefetch and leaves the pool as it was.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_state_chain_with_a_missing_block_starts_no_prefetch() {
+        let Some(fixture) = StateChainFixture::new("prefetch-missing") else {
+            return;
+        };
+        let missing = fixture.key(4);
+        let (mut adapter, manager) = fixture.adapter();
+        assert!(manager.remove(&missing), "block 4 leaves the tier");
+        let free_before = adapter.allocator_guard().num_free_blocks();
+        let prefetch = adapter.begin_chain_prefetch(
+            &fixture.tokens,
+            63,
+            56,
+            PrefixKeys::Uniform(&[]),
+            0,
+            None,
+        );
+        assert!(
+            matches!(prefetch, ChainPrefetchStart::Unavailable),
+            "a chain with a hole starts no read"
+        );
+        assert_eq!(adapter.allocator_guard().num_free_blocks(), free_before);
+        assert_eq!(fixture.hot_tokens(&adapter), 16);
+        let mut allocator = adapter.allocator_guard();
+        let (hot, _) = allocator.find_longest_cache_hit(&fixture.tokens[..63], 8, &[], 0);
+        assert!(
+            hot.iter().all(|block| block.get_ref_count() == 2),
+            "no pin is left: only the cache and this lookup hold the hot base"
+        );
+        for block in hot {
+            allocator.free(block);
+        }
+    }
+
+    /// Dropping a prefetch gives back every reserved block and every pin,
+    /// before it lands and after.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_dropped_prefetch_frees_its_blocks_and_pins() {
+        let Some(fixture) = StateChainFixture::new("prefetch-drop") else {
+            return;
+        };
+        for land in [false, true] {
+            let (mut adapter, _manager) = fixture.adapter();
+            let free_before = adapter.allocator_guard().num_free_blocks();
+            let takeable_before = adapter.allocator_guard().free_or_evictable_blocks();
+            let mut prefetch = adapter
+                .begin_chain_prefetch(&fixture.tokens, 63, 56, PrefixKeys::Uniform(&[]), 0, None)
+                .started()
+                .expect("the chain is on the tier");
+            let pins: Vec<Arc<PhysicalBlock>> = prefetch.hot.iter().map(Arc::clone).collect();
+            assert!(pins.iter().all(|block| block.get_ref_count() == 2));
+            if land {
+                let deadline = Instant::now() + std::time::Duration::from_secs(10);
+                while !matches!(
+                    adapter
+                        .poll_chain_prefetch(&mut prefetch, &mut RestoreUploadBudget::per_pass()),
+                    ChainPrefetchPoll::Landed { .. }
+                ) {
+                    assert!(Instant::now() < deadline, "the prefetch lands");
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            drop(prefetch);
+            assert!(
+                pins.iter().all(|block| block.get_ref_count() == 1),
+                "land={land}: the hot base is cache-only again"
+            );
+            let allocator = adapter.allocator_guard();
+            if land {
+                assert_eq!(
+                    allocator.free_or_evictable_blocks(),
+                    takeable_before,
+                    "the landed chain stays cached, held by nobody"
+                );
+            } else {
+                assert_eq!(
+                    allocator.num_free_blocks(),
+                    free_before,
+                    "reserved blocks are free"
+                );
+            }
+        }
     }
 
     /// Geometry of the auxiliary state the reconcile-down test persists.
@@ -16201,6 +17290,7 @@ mod tests {
                     meta["kv_dtype"].as_u64().unwrap() as u8,
                     route,
                     if route == 3 { stripes } else { 0 },
+                    std::ptr::null_mut(),
                 )
             };
             MxArray::from_handle(ptr, "capture_replay").unwrap()

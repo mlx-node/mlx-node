@@ -148,6 +148,12 @@ pub struct PageLayout {
     /// `[num_kv_heads, head_size/x, block_size, x]`, V
     /// `[num_kv_heads, head_size, block_size]`.
     pub values_token_major: bool,
+    /// K rows token-major `[num_kv_heads, block_size, head_size]` with V
+    /// dimension-major `[num_kv_heads, head_size, block_size]` (the Splash
+    /// dense page: `splash_kv_key_element`, `splash_kv_value_element`). An
+    /// int8 page of 32 tokens only; never set with `values_token_major`,
+    /// whose K is token-major already.
+    pub keys_token_major: bool,
     /// Pooled index keys per block and layer, bf16 `[index_rows,
     /// index_dimension]` (Splash `Layout::indexDimension`, the index plane
     /// of `PageStorage::indexOffset`). 0: no index plane.
@@ -159,6 +165,11 @@ impl PageLayout {
     /// Bytes of one block's index slot in one layer.
     pub fn index_bytes(&self) -> u64 {
         u64::from(self.index_rows) * u64::from(self.index_dimension) * 2
+    }
+
+    /// The vLLM page every raw kernel and host blob reads.
+    pub fn is_vllm(&self) -> bool {
+        *self == PageLayout::default()
     }
 }
 
@@ -542,7 +553,7 @@ impl LayerKVPool {
     /// neither (Splash `SlotFormat` version 1 carries such a page).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn require_vllm_page(&self, context: &str) -> Result<(), String> {
-        if self.layout != PageLayout::default() {
+        if !self.layout.is_vllm() {
             return Err(format!(
                 "{context}: a {:?} page has no host blob or raw kernel",
                 self.layout
@@ -805,6 +816,19 @@ impl LayerKVPool {
             return Err(format!(
                 "LayerKVPool::new: index plane {} x {} does not divide a {}-token block",
                 layout.index_rows, layout.index_dimension, config.block_size
+            ));
+        }
+        if layout.keys_token_major
+            && (layout.values_token_major
+                || layout.index_rows > 0
+                || cache_dtype != MetalDtype::Int8
+                || config.block_size != 32)
+        {
+            return Err(format!(
+                "LayerKVPool::new: a keys-token-major page is an int8 32-token page with \
+                 dimension-major values and no index plane; got {layout:?}, {cache_dtype:?}, \
+                 block_size {}",
+                config.block_size
             ));
         }
 
@@ -1844,9 +1868,9 @@ impl LayerKVPool {
     }
 
     /// The K view shape: [`Self::key_cache_shape`], or `[num_blocks,
-    /// num_kv_heads, block_size, head_size]` for a token-major page.
+    /// num_kv_heads, block_size, head_size]` for a page with token-major K.
     pub fn key_view_shape(&self) -> Result<Vec<i64>, String> {
-        if self.layout.values_token_major {
+        if self.layout.values_token_major || self.layout.keys_token_major {
             return Ok(self.token_major_shape().to_vec());
         }
         let x = self.cache_pack_factor()?;
@@ -5413,6 +5437,7 @@ mod int8_tests {
             values_token_major: true,
             index_rows: 4,
             index_dimension: 128,
+            ..PageLayout::default()
         };
         let pool =
             LayerKVPool::new_with_layout(int8_config(2), 3, 6, MetalDtype::Int8, layout).unwrap();
@@ -5491,6 +5516,7 @@ mod int8_tests {
             values_token_major: true,
             index_rows: 4,
             index_dimension: 128,
+            ..PageLayout::default()
         };
         let index = 4 * 128 * 2;
         let pool =
@@ -5887,3 +5913,6 @@ mod zero_fill_tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod ktm_tests;

@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,7 @@ use mlx_paged_attn::{
 use crate::array::DType;
 use crate::array::memory::WeightsResident;
 use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard, ShardIdentity};
+use crate::disk_tier::source_hold::open_disk_tier_with_source;
 use crate::disk_tier::{
     CacheNamespace, DiskTier, DiskTierOptions, DraftNamespace, PersistentIdentity, cache_namespace,
     open_disk_tier, state_geometry,
@@ -31,8 +33,11 @@ use crate::transformer::paged_kv_cache_adapter::{
     ColdContextBacking, ColdTierContext, PagedKVCacheAdapter,
 };
 
+use super::migrate::part_page_keys;
 use super::paged::{DFlash2States, PagedAnchor};
-use super::store::{DiskCopy, Entry, EntryId, HybridStateStore, Lineage, StateBytes, StateClass};
+use super::store::{
+    DiskCopy, Entry, EntryId, HybridStateStore, Lineage, PART_PAGE_ROWS, StateBytes, StateClass,
+};
 use super::write_behind::WriteBehind;
 
 /// The model's state tier: one per model, so one state write in flight.
@@ -62,6 +67,8 @@ pub(crate) struct StateDisk {
     published_landing: u32,
     pub(crate) counters: DiskCounters,
     pub(crate) write_behind: WriteBehind,
+    /// Parked restores whose state read waits for the staging buffer.
+    read_waiters: Arc<AtomicU32>,
     /// The state writes that landed, in landing order.
     #[cfg(test)]
     pub(crate) landed_states: Vec<ColdCacheKey>,
@@ -127,6 +134,7 @@ impl StateDisk {
             published_landing: 0,
             counters: DiskCounters::default(),
             write_behind,
+            read_waiters: Arc::new(AtomicU32::new(0)),
             #[cfg(test)]
             landed_states: Vec::new(),
         })
@@ -155,6 +163,20 @@ impl StateDisk {
         self.pending.is_some()
     }
 
+    /// The staging buffer for a state write; none while a parked restore's
+    /// state read waits for it (reads before writes, Splash `SlotFile`).
+    fn staging_for_write(&mut self) -> Option<Vec<u8>> {
+        if self.read_waiters.load(Ordering::Acquire) > 0 {
+            return None;
+        }
+        self.staging.take()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_waiters(&self) -> u32 {
+        self.read_waiters.load(Ordering::Acquire)
+    }
+
     /// Only a persistent tier makes room for a copy ahead (Splash
     /// `Cache::persist`); a reclaim's write always does.
     fn persist_room(&self) -> MakeRoom {
@@ -175,11 +197,15 @@ impl StateDisk {
     }
 
     /// The key of `entry`'s state object: the state group's chain over its
-    /// blocks.
+    /// blocks, chained once more over the rows of its part page.
     fn state_key<S>(&self, entry: &Entry<S>) -> Option<ColdCacheKey> {
-        chain_keys(ColdGroup::DFlash2State, self.tier.state_fingerprint, entry)
-            .last()
-            .copied()
+        let (whole, part) = part_page_keys(
+            ColdGroup::DFlash2State,
+            self.tier.state_fingerprint,
+            lineage_of(entry),
+            entry.block_size(),
+        );
+        part.or_else(|| whole.last().copied())
     }
 
     /// Every block of `entry`'s chain is on the tier.
@@ -229,16 +255,15 @@ fn chain_keys<S>(
     fingerprint: mlx_paged_attn::ColdCacheFingerprint,
     entry: &Entry<S>,
 ) -> Vec<ColdCacheKey> {
-    lineage_keys(
-        group,
-        fingerprint,
-        Lineage {
-            tokens: entry.tokens(),
-            extra_keys: entry.extra_keys(),
-            salt: entry.salt(),
-        },
-        entry.block_size(),
-    )
+    lineage_keys(group, fingerprint, lineage_of(entry), entry.block_size())
+}
+
+fn lineage_of<S>(entry: &Entry<S>) -> Lineage<'_> {
+    Lineage {
+        tokens: entry.tokens(),
+        extra_keys: entry.extra_keys(),
+        salt: entry.salt(),
+    }
 }
 
 pub(crate) fn lineage_keys(
@@ -384,7 +409,7 @@ pub(crate) fn stage<T: DFlash2Target>(
     ) else {
         return Staged::Refused;
     };
-    let Some(mut staging) = disk.staging.take() else {
+    let Some(mut staging) = disk.staging_for_write() else {
         return Staged::Busy;
     };
     let cell = (disk.spans[0] as usize).min(staging.len());
@@ -773,7 +798,12 @@ pub(crate) fn tick<T: DFlash2Target>(target: &mut T, tick: Tick) -> bool {
             .and_then(|adapter| adapter.bytes_per_block().ok())
             .unwrap_or(0);
         let demand = copy_demand_bytes(governor, now, command_pages, page_bytes);
-        let claim_waiting = governor.ledger(|ledger| ledger.claim_waiting());
+        let read_waiting = target
+            .dflash2_states()
+            .disk
+            .as_ref()
+            .is_some_and(|disk| disk.read_waiters.load(Ordering::Acquire) > 0);
+        let claim_waiting = governor.ledger(|ledger| ledger.claim_waiting()) || read_waiting;
         progressed |= super::write_behind::run(target, now, demand, claim_waiting);
         if let Some(guard) = target.memory_registration() {
             let states = target.dflash2_states();
@@ -1005,7 +1035,7 @@ pub(crate) fn publish_from_lane<T: DFlash2Target>(
     let Some(disk) = disk.as_mut() else {
         return Ok(None);
     };
-    let (Some(layout), Some(mut staging)) = (disk.layout(row), disk.staging.take()) else {
+    let (Some(layout), Some(mut staging)) = (disk.layout(row), disk.staging_for_write()) else {
         return Ok(None);
     };
     let cell = (disk.spans[0] as usize).min(staging.len());
@@ -1086,6 +1116,66 @@ pub(crate) fn hold_staging(states: &mut DFlash2States) -> Option<Vec<u8>> {
     states.disk.as_mut()?.staging.take()
 }
 
+/// Gives back a buffer [`hold_staging`] took.
+#[cfg(test)]
+pub(crate) fn return_staging(states: &mut DFlash2States, staging: Vec<u8>) {
+    if let Some(disk) = states.disk.as_mut() {
+        disk.staging = Some(staging);
+    }
+}
+
+/// The key of `id`'s state object on the tier: its disk copy's, else the
+/// key a write gives it.
+pub(crate) fn state_object_key(states: &DFlash2States, id: EntryId) -> Option<ColdCacheKey> {
+    let disk = states.disk.as_ref()?;
+    let entry = states.store.get(id)?;
+    entry
+        .disk()
+        .map(|copy| copy.key)
+        .or_else(|| disk.state_key(entry))
+}
+
+/// The staging buffer is free now, the writer's landings taken first; a
+/// state read started now does not wait. True without a tier.
+pub(crate) fn staging_free<T: DFlash2Target>(target: &mut T) -> bool {
+    if target.dflash2_states().disk.is_none() {
+        return true;
+    }
+    tick(target, Tick::Poll);
+    target
+        .dflash2_states()
+        .disk
+        .as_ref()
+        .is_none_or(|disk| disk.staging.is_some())
+}
+
+/// A parked restore whose state read waits for the staging buffer; while
+/// one lives, the write-behind copies nothing.
+pub(crate) struct ReadWait(Arc<AtomicU32>);
+
+impl Drop for ReadWait {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn read_wait(states: &DFlash2States) -> Option<ReadWait> {
+    let waiters = &states.disk.as_ref()?.read_waiters;
+    waiters.fetch_add(1, Ordering::AcqRel);
+    Some(ReadWait(Arc::clone(waiters)))
+}
+
+#[cfg(test)]
+thread_local! {
+    static STATE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only: the state reads this thread started.
+#[cfg(test)]
+pub(crate) fn state_reads() -> u64 {
+    STATE_READS.with(std::cell::Cell::get)
+}
+
 /// The object a disk copy of `id` holds, read back through the staging
 /// buffer's shape.
 #[cfg(test)]
@@ -1156,23 +1246,37 @@ pub(crate) fn discard_state<T: DFlash2Target>(target: &mut T, id: EntryId) {
 
 /// A turn can resume on `id`: a RAM copy, or a disk copy whose object is on
 /// the tier or on its way there and whose chain comes back whole, its
-/// leading blocks resident and every block past them on the tier.
+/// leading blocks resident and every block past them on the tier. The rows
+/// of a part page are in no block: with either copy the state's fragment is
+/// on the tier.
 pub(crate) fn restorable<T: DFlash2Target>(target: &T, id: EntryId) -> bool {
     let states = target.dflash2_states();
     let Some(entry) = states.store.get(id) else {
         return false;
     };
-    if entry.ram().is_some() {
+    let on_part_page = !entry.depth().is_multiple_of(entry.block_size() as usize);
+    if entry.ram().is_some() && !on_part_page {
         return true;
     }
-    let (Some(disk), Some(adapter), Some(copy)) = (
-        states.disk.as_ref(),
-        target.paged_adapter_ref(),
-        entry.disk(),
-    ) else {
+    let (Some(disk), Some(adapter)) = (states.disk.as_ref(), target.paged_adapter_ref()) else {
         return false;
     };
     let manager = &disk.tier.manager;
+    let (chain, fragment) = part_page_keys(
+        ColdGroup::Kv,
+        disk.tier.kv_fingerprint,
+        lineage_of(entry),
+        entry.block_size(),
+    );
+    if fragment.is_some_and(|key| !manager.contains_in(&key, ColdGroup::Kv)) {
+        return false;
+    }
+    if entry.ram().is_some() {
+        return true;
+    }
+    let Some(copy) = entry.disk() else {
+        return false;
+    };
     if copy.landed && !manager.contains_in(&copy.key, ColdGroup::DFlash2State) {
         return false;
     }
@@ -1181,12 +1285,10 @@ pub(crate) fn restorable<T: DFlash2Target>(target: &T, id: EntryId) -> bool {
         .iter()
         .take_while(|&&hash| adapter.prefix_cached(hash))
         .count();
-    chain_keys(ColdGroup::Kv, disk.tier.kv_fingerprint, entry)
-        .get(resident..)
-        .is_some_and(|keys| {
-            keys.iter()
-                .all(|key| manager.contains_in(key, ColdGroup::Kv))
-        })
+    chain.get(resident..).is_some_and(|keys| {
+        keys.iter()
+            .all(|key| manager.contains_in(key, ColdGroup::Kv))
+    })
 }
 
 /// Takes the writer's landings until the write in flight hands the staging
@@ -1238,6 +1340,8 @@ pub(crate) fn read_state<T: DFlash2Target>(
     id: EntryId,
     window: Option<&mut DraftContextWindow>,
 ) -> Option<Vec<Qwen3_5LayerCache>> {
+    #[cfg(test)]
+    STATE_READS.with(|reads| reads.set(reads.get() + 1));
     let deadline = Instant::now()
         + Duration::from_secs_f64(crate::engine::governor::wait::RESOURCE_WAIT_SECONDS);
     if !wait_for_staging(target, deadline) {
@@ -1302,6 +1406,11 @@ pub(crate) fn promotion_skipped(states: &mut DFlash2States) {
 /// `Cache::adopt` → `fitDiskLimit`). An object that does not come back
 /// stays on the tier for its quota to take.
 pub(crate) fn adopt_all<T: DFlash2Target>(target: &mut T) -> u64 {
+    // A fragment is 16 rows of a page with token-major keys: only a pool of
+    // that page takes one.
+    let part_pages = target
+        .paged_adapter_ref()
+        .is_some_and(|adapter| adapter.layer_kv_pool().layout().keys_token_major);
     let DFlash2States { store, disk, .. } = target.dflash2_states_mut();
     let Some(disk) = disk.as_mut() else {
         return 0;
@@ -1312,10 +1421,11 @@ pub(crate) fn adopt_all<T: DFlash2Target>(target: &mut T) -> u64 {
     let cached_bytes = disk.spans.iter().sum();
     let window_slots = disk.window_slots;
     let tier = Arc::clone(&disk.tier);
-    let adopted = adopt_states(store, &tier, &disk.spans, &disk.geometry, |label| {
+    let copy = |label: &ColdStateLabel| {
         let row = u32::try_from(label.tokens.len()).ok()?;
         Some((cached_bytes, row - row.min(window_slots)))
-    });
+    };
+    let adopted = adopt_states_on(store, &tier, &disk.spans, &disk.geometry, part_pages, copy);
     disk.counters.adopted += adopted;
     adopted
 }
@@ -1329,6 +1439,21 @@ pub(crate) fn adopt_states<S: StateBytes>(
     tier: &DiskTier,
     spans: &[u64],
     geometry: &str,
+    copy: impl FnMut(&ColdStateLabel) -> Option<(u64, u32)>,
+) -> u64 {
+    adopt_states_on(store, tier, spans, geometry, false, copy)
+}
+
+/// [`adopt_states`]; with `part_pages` a state the move of a 16-token store
+/// left on a part page comes back too: its rows are whole blocks and
+/// [`PART_PAGE_ROWS`] more, its key is chained once more over those rows,
+/// and the fragment that holds them is on the tier with its whole chain.
+pub(crate) fn adopt_states_on<S: StateBytes>(
+    store: &mut HybridStateStore<S>,
+    tier: &DiskTier,
+    spans: &[u64],
+    geometry: &str,
+    part_pages: bool,
     mut copy: impl FnMut(&ColdStateLabel) -> Option<(u64, u32)>,
 ) -> u64 {
     let block_size = store.block_size();
@@ -1348,18 +1473,28 @@ pub(crate) fn adopt_states<S: StateBytes>(
             extra_keys: &label.extra_keys,
             salt: label.salt,
         };
-        let own = lineage_keys(
+        let (own, own_part) = part_page_keys(
             ColdGroup::DFlash2State,
             tier.state_fingerprint,
             lineage,
             block_size,
         );
-        let chain = lineage_keys(ColdGroup::Kv, tier.kv_fingerprint, lineage, block_size);
+        let (chain, fragment) =
+            part_page_keys(ColdGroup::Kv, tier.kv_fingerprint, lineage, block_size);
+        let on_part_page = own_part.is_some();
+        let own_key = if on_part_page {
+            own_part
+                .filter(|_| part_pages && own.len() * block_size as usize + PART_PAGE_ROWS == depth)
+        } else {
+            own.last()
+                .copied()
+                .filter(|_| own.len() * block_size as usize == depth)
+        };
         if layout.spans != spans
             || layout.geometry != geometry
-            || own.len() * block_size as usize != depth
-            || own.last() != Some(&key)
+            || own_key != Some(key)
             || missing_keys(tier, &chain) > 0
+            || fragment.is_some_and(|fragment| !manager.contains_in(&fragment, ColdGroup::Kv))
         {
             continue;
         }
@@ -1381,10 +1516,12 @@ pub(crate) fn adopt_states<S: StateBytes>(
         } else {
             StateClass::Ordinary
         };
-        if store
-            .adopt_disk(lineage, cached_bytes, class, copy, label.last_used)
-            .is_ok()
-        {
+        let taken = if on_part_page {
+            store.adopt_disk_on_part_page(lineage, cached_bytes, class, copy, label.last_used)
+        } else {
+            store.adopt_disk(lineage, cached_bytes, class, copy, label.last_used)
+        };
+        if taken.is_ok() {
             newest = newest.max(label.last_used);
             adopted += 1;
         }
@@ -1571,72 +1708,19 @@ pub(crate) fn open_state_disk(
     let draft_geometry = draft.map(|draft| (draft.namespace_geometry(), draft.context_width()));
     let geometry_text = state_geometry(geometry.namespace_gdn(), draft_geometry);
     let pool = load.adapter.layer_kv_pool();
-    let cache_dtype = format!("{:?}", pool.cache_dtype());
-    let identity = || {
-        let target = crate::cold_tier::build_model_fingerprint(
-            load.family,
-            load.files,
-            Some(&load.config_json),
-            &crate::cold_tier::ColdTierGeometry {
-                block_size: pool.block_size() as u64,
-                num_layers: pool.num_layers() as u64,
-                num_kv_heads: pool.config().num_kv_heads as u64,
-                head_size: pool.config().head_size as u64,
-                cache_dtype: cache_dtype.clone(),
-            },
-            load.weights,
-        )?;
-        let draft_fingerprint = match load.draft.as_ref() {
-            Some(draft) => {
-                let mut components = vec![b"dflash2-draft\0".to_vec()];
-                crate::cold_tier::push_dir_identity(draft.files.dir, &mut components)?;
-                components.push(std::fs::read(draft.files.dir.join("config.json")).ok()?);
-                Some(mlx_paged_attn::ColdCacheFingerprint::from_components(
-                    components.iter().map(Vec::as_slice),
-                ))
-            }
-            None => None,
-        };
-        let changed = if !load.guard.stable_after_fingerprint() {
-            Some(load.files.label().to_string())
-        } else {
-            load.draft
-                .as_ref()
-                .filter(|draft| !draft.files.stable_after_fingerprint())
-                .map(|draft| draft.files.dir.display().to_string())
-        };
-        if let Some(changed) = changed {
-            tracing::warn!(
-                "{changed}: the model directory changed during load; the SSD cache keeps \
-                 temporary files"
-            );
-            return None;
-        }
-        let (namespace, state) = cache_namespace(&CacheNamespace {
-            target,
-            draft: draft_fingerprint
-                .zip(draft)
-                .map(|(fingerprint, draft)| DraftNamespace {
-                    fingerprint,
-                    geometry: draft.namespace_geometry(),
-                    context_width: draft.context_width(),
-                }),
-            kv: (
-                pool.block_size(),
-                pool.num_layers() as u32,
-                pool.config().num_kv_heads,
-                pool.config().head_size,
-                &cache_dtype,
-            ),
-            gdn: geometry.namespace_gdn(),
-        });
-        Some(PersistentIdentity {
-            namespace,
-            state,
-            kv: target,
-        })
+    let cache_dtype = load.adapter.cache_identity();
+    let identity = || tier_identity(load, pool.block_size(), &cache_dtype);
+    let moves = pool.layout().keys_token_major;
+    let tier = if moves {
+        open_disk_tier_with_source(
+            options,
+            identity,
+            || super::migrate::source_identity(load),
+            state_bytes,
+        )?
+    } else {
+        open_disk_tier(options, identity, state_bytes)?
     };
-    let tier = open_disk_tier(options, identity, state_bytes)?;
     let block_bytes = mlx_paged_attn::block_object_bytes(pool);
     let context = state_context(&tier);
     let window_slots = match draft {
@@ -1651,8 +1735,126 @@ pub(crate) fn open_state_disk(
         geometry_text,
         block_bytes,
     )?;
+    if moves {
+        move_held_source(&disk, pool);
+    }
     disk.wake_model_on_landing(model);
     Some((context, disk))
+}
+
+/// Moves the source store `disk`'s tier holds into it (the move of
+/// [`super::migrate::move_source`]) and prints what it did; nothing when the
+/// tier holds none.
+fn move_held_source(disk: &StateDisk, pool: &mlx_paged_attn::LayerKVPool) {
+    let Some(source_bytes) = disk.tier.with_source(|hold| hold.bytes) else {
+        return;
+    };
+    let config = pool.config();
+    let Some(source_layout) =
+        super::migrate::source_layout(config.num_layers, config.num_kv_heads, config.head_size)
+    else {
+        return;
+    };
+    let started = Instant::now();
+    let moved = super::migrate::move_source::move_source(
+        &disk.tier,
+        &super::migrate::move_source::MoveShape {
+            spans: &disk.spans,
+            geometry: &disk.geometry,
+            source_layout,
+        },
+    );
+    crate::utils::gguf_planes::load_line(format!(
+        "Qwen3.5 state store move: source_bytes={} states={} pages={} fragments={} refused={} \
+         unreadable={} dropped={} held_back={} stopped={} source_removed={} wall_ms={}",
+        source_bytes,
+        moved.states,
+        moved.pages,
+        moved.fragments,
+        moved.refused,
+        moved.unreadable,
+        moved.dropped,
+        moved.held_back,
+        moved.stopped,
+        moved.source_removed,
+        started.elapsed().as_millis(),
+    ));
+}
+
+/// The persistent identity [`open_state_disk`] keys `load`'s tier by when
+/// its pool has `block_size` pages and the cache identity text
+/// `cache_identity`: the same namespace, state and KV fingerprints, from the
+/// same files, config bytes and geometry.
+pub(crate) fn tier_identity(
+    load: &TierLoad<'_>,
+    block_size: u32,
+    cache_identity: &str,
+) -> Option<PersistentIdentity> {
+    let geometry = gdn_sidecar::geometry(load.dense, load.activation)?;
+    let draft = load.draft.as_ref().map(|draft| &draft.model.config);
+    let pool = load.adapter.layer_kv_pool();
+    let target = crate::cold_tier::build_model_fingerprint(
+        load.family,
+        load.files,
+        Some(&load.config_json),
+        &crate::cold_tier::ColdTierGeometry {
+            block_size: u64::from(block_size),
+            num_layers: pool.num_layers() as u64,
+            num_kv_heads: u64::from(pool.config().num_kv_heads),
+            head_size: u64::from(pool.config().head_size),
+            cache_dtype: cache_identity.to_string(),
+        },
+        load.weights,
+    )?;
+    let draft_fingerprint = match load.draft.as_ref() {
+        Some(draft) => {
+            let mut components = vec![b"dflash2-draft\0".to_vec()];
+            crate::cold_tier::push_dir_identity(draft.files.dir, &mut components)?;
+            components.push(std::fs::read(draft.files.dir.join("config.json")).ok()?);
+            Some(mlx_paged_attn::ColdCacheFingerprint::from_components(
+                components.iter().map(Vec::as_slice),
+            ))
+        }
+        None => None,
+    };
+    let changed = if !load.guard.stable_after_fingerprint() {
+        Some(load.files.label().to_string())
+    } else {
+        load.draft
+            .as_ref()
+            .filter(|draft| !draft.files.stable_after_fingerprint())
+            .map(|draft| draft.files.dir.display().to_string())
+    };
+    if let Some(changed) = changed {
+        tracing::warn!(
+            "{changed}: the model directory changed during load; the SSD cache keeps \
+             temporary files"
+        );
+        return None;
+    }
+    let (namespace, state) = cache_namespace(&CacheNamespace {
+        target,
+        draft: draft_fingerprint
+            .zip(draft)
+            .map(|(fingerprint, draft)| DraftNamespace {
+                fingerprint,
+                geometry: draft.namespace_geometry(),
+                context_width: draft.context_width(),
+            }),
+        kv: (
+            block_size,
+            pool.num_layers() as u32,
+            pool.config().num_kv_heads,
+            pool.config().head_size,
+            cache_identity,
+        ),
+        gdn: geometry.namespace_gdn(),
+    });
+    Some(PersistentIdentity {
+        namespace,
+        state,
+        kv: target,
+    })
 }
 
 /// The adapter's view of a state tier: Splash keeps no per-turn KV on disk,
@@ -1665,5 +1867,7 @@ pub(crate) fn state_context(tier: &DiskTier) -> ColdTierContext {
     }
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod part_page_tests;
 #[cfg(test)]
 pub(crate) mod tests;

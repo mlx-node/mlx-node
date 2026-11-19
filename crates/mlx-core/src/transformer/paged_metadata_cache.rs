@@ -469,10 +469,10 @@ impl PagedMetadataCache {
 
     /// Build and cache a compact one-dimensional physical block-ID array
     /// for `required_tokens` logical positions of the active request,
-    /// starting at `first_block`. Both graph-native prefill paths consume
-    /// this representation: varlen attention reshapes it to one block-table
-    /// row, while SDPA gathering uses it directly as the `take(axis=0)`
-    /// index vector.
+    /// starting at `first_block`; SDPA gathering uses it as the
+    /// `take(axis=0)` index vector. It evaluates, so varlen attention
+    /// builds its block-table row on the host instead of from this array
+    /// (an eval here would wait for a verify's queued draft).
     pub(crate) fn compact_prefill_block_ids(
         &mut self,
         block_table: Option<&SequenceBlockTable>,
@@ -508,40 +508,13 @@ impl PagedMetadataCache {
             return Ok((cache.block_ids.clone(), cache.block_count));
         }
 
-        let end_block = required_tokens.div_ceil(block_size) as usize;
-        let blocks = block_table
-            .blocks()
-            .get(first_block as usize..end_block)
-            .ok_or_else(|| "compact prefill: block range exceeds recorded capacity".to_string())?;
-        let block_ids: Vec<i32> = blocks.iter().map(|block| block.block_id as i32).collect();
-        if block_ids.is_empty() {
-            return Err("compact prefill: active request has no allocated blocks".to_string());
-        }
-        let block_count = u32::try_from(block_ids.len()).map_err(|_| {
-            format!(
-                "compact prefill: too many blocks for i32 shape: {}",
-                block_ids.len()
-            )
-        })?;
-        for (idx, &block_id) in block_ids.iter().enumerate() {
-            if block_id < 0 || block_id as u32 >= pool_block_count {
-                return Err(format!(
-                    "compact prefill: block_table[{idx}]={block_id} out of range for \
-                     pool block count {pool_block_count}"
-                ));
-            }
-        }
-        let capacity = block_count
-            .checked_mul(block_size)
-            .ok_or_else(|| "compact prefill block capacity overflow".to_string())?;
-        if required_tokens.saturating_sub(first_block * block_size) > capacity {
-            return Err(format!(
-                "compact prefill: required token count {required_tokens} exceeds block \
-                 table capacity {block_count} * {} = {capacity}",
-                block_size
-            ));
-        }
-
+        let (block_ids, block_count) = compact_prefill_block_id_list(
+            block_table,
+            required_tokens,
+            first_block,
+            block_size,
+            pool_block_count,
+        )?;
         let block_ids_arr = MxArray::from_int32(&block_ids, &[block_count as i64])
             .map_err(|e| format!("compact prefill block IDs: {e}"))?;
         MxArray::eval_arrays(&[&block_ids_arr])
@@ -565,7 +538,9 @@ impl PagedMetadataCache {
     /// sequence. The block table has shape `[1, block_count]`, `seq_lens`
     /// contains the complete context length after the chunk, and
     /// `cu_seqlens_q=[0,q_len]` assigns every query row to that one
-    /// sequence.
+    /// sequence. All three are built on the host in their final shape, so
+    /// building them never evaluates (an eval waits for every queued
+    /// command: a verify's draft and early layers).
     pub(crate) fn varlen_prefill_attention_inputs(
         &mut self,
         block_table: Option<&SequenceBlockTable>,
@@ -611,22 +586,43 @@ impl PagedMetadataCache {
             ));
         }
 
-        let (block_ids, block_count) = self.compact_prefill_block_ids(
-            block_table,
-            total_context,
-            0,
-            block_size,
-            pool_block_count,
-        )?;
-        let block_table = block_ids
-            .reshape(&[1, block_count as i64])
-            .map_err(|e| format!("varlen prefill block_table reshape: {e}"))?;
+        #[cfg(test)]
+        let reshaped = RESHAPED_BLOCK_TABLE.with(Cell::get);
+        #[cfg(not(test))]
+        let reshaped = false;
+        let (block_table, block_count) = if reshaped {
+            let (block_ids, block_count) = self.compact_prefill_block_ids(
+                block_table,
+                total_context,
+                0,
+                block_size,
+                pool_block_count,
+            )?;
+            let block_table = block_ids
+                .reshape(&[1, block_count as i64])
+                .map_err(|e| format!("varlen prefill block_table reshape: {e}"))?;
+            MxArray::eval_arrays(&[&block_table])
+                .map_err(|e| format!("varlen prefill metadata eval: {e}"))?;
+            (block_table, block_count)
+        } else {
+            let block_table = block_table.ok_or_else(|| {
+                "varlen prefill requested before reset_for_new_request".to_string()
+            })?;
+            let (block_ids, block_count) = compact_prefill_block_id_list(
+                block_table,
+                total_context,
+                0,
+                block_size,
+                pool_block_count,
+            )?;
+            let block_table = MxArray::from_int32(&block_ids, &[1, block_count as i64])
+                .map_err(|e| format!("varlen prefill block_table: {e}"))?;
+            (block_table, block_count)
+        };
         let seq_lens = MxArray::from_int32(&[total_context as i32], &[1])
             .map_err(|e| format!("varlen prefill seq_lens: {e}"))?;
         let cu_seqlens_q = MxArray::from_int32(&[0, query_len as i32], &[2])
             .map_err(|e| format!("varlen prefill cu_seqlens_q: {e}"))?;
-        MxArray::eval_arrays(&[&block_table, &seq_lens, &cu_seqlens_q])
-            .map_err(|e| format!("varlen prefill metadata eval: {e}"))?;
 
         self.request.varlen_prefill_inputs_cache = Some(VarlenPrefillInputsCache {
             token_count: recorded,
@@ -955,6 +951,60 @@ impl RaggedPagedInputsCache {
     }
 }
 
+/// The physical block IDs of the active request's logical positions
+/// `[first_block * block_size, required_tokens)`, each checked against the
+/// pool, and their count.
+fn compact_prefill_block_id_list(
+    block_table: &SequenceBlockTable,
+    required_tokens: u32,
+    first_block: u32,
+    block_size: u32,
+    pool_block_count: u32,
+) -> Result<(Vec<i32>, u32), String> {
+    let end_block = required_tokens.div_ceil(block_size) as usize;
+    let blocks = block_table
+        .blocks()
+        .get(first_block as usize..end_block)
+        .ok_or_else(|| "compact prefill: block range exceeds recorded capacity".to_string())?;
+    let block_ids: Vec<i32> = blocks.iter().map(|block| block.block_id as i32).collect();
+    if block_ids.is_empty() {
+        return Err("compact prefill: active request has no allocated blocks".to_string());
+    }
+    let block_count = u32::try_from(block_ids.len()).map_err(|_| {
+        format!(
+            "compact prefill: too many blocks for i32 shape: {}",
+            block_ids.len()
+        )
+    })?;
+    for (idx, &block_id) in block_ids.iter().enumerate() {
+        if block_id < 0 || block_id as u32 >= pool_block_count {
+            return Err(format!(
+                "compact prefill: block_table[{idx}]={block_id} out of range for \
+                 pool block count {pool_block_count}"
+            ));
+        }
+    }
+    let capacity = block_count
+        .checked_mul(block_size)
+        .ok_or_else(|| "compact prefill block capacity overflow".to_string())?;
+    if required_tokens.saturating_sub(first_block * block_size) > capacity {
+        return Err(format!(
+            "compact prefill: required token count {required_tokens} exceeds block \
+             table capacity {block_count} * {} = {capacity}",
+            block_size
+        ));
+    }
+    Ok((block_ids, block_count))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Builds the varlen block table as a lazy reshape of the compact IDs,
+    /// evaluated at once, on this thread, in place of the host-shaped
+    /// table.
+    pub(crate) static RESHAPED_BLOCK_TABLE: Cell<bool> = const { Cell::new(false) };
+}
+
 /// Capture the process-local memory bounds used by the prefill/decode
 /// planning caches.
 ///
@@ -999,5 +1049,65 @@ pub(crate) fn probe_prefill_memory_snapshot(pool: &LayerKVPool) -> PagedPrefillM
         metal_recommended_working_set_bytes: metal.map(|(recommended, _)| recommended),
         metal_current_allocated_bytes: metal.map(|(_, current)| current),
         paged_pool_allocated_bytes,
+    }
+}
+
+#[cfg(test)]
+mod host_table_tests {
+    use std::sync::Arc;
+
+    use mlx_paged_attn::{PhysicalBlock, SequenceBlockTable};
+
+    use super::PagedMetadataCache;
+
+    /// A request of 5 blocks of 16 tokens (ids 7, 3, 9, 1, 12), 70 tokens
+    /// recorded.
+    fn table() -> SequenceBlockTable {
+        let mut table = SequenceBlockTable::new(1, 16);
+        for id in [7, 3, 9, 1, 12] {
+            table.add_block(Arc::new(PhysicalBlock::new(id)));
+        }
+        table.set_num_tokens(70);
+        table
+    }
+
+    /// The varlen block table is built on the host as `[1, n]`, already on
+    /// the host (no op over it to evaluate), and covers every block the
+    /// chunk's rows reach; an ID outside the pool is refused.
+    /// Mutations, each → red: the table leaves out the chunk's rows; an ID
+    /// outside the pool passes.
+    #[test]
+    fn the_host_table_holds_the_rows_and_refuses_an_id_outside_the_pool() {
+        let table = table();
+        let mut cache = PagedMetadataCache::default();
+        // 62 committed + 8 verify rows: blocks 0..=4 (row 69 is in block 4).
+        let (block_table, seq_lens, cu_seqlens_q, count, total) = cache
+            .varlen_prefill_attention_inputs(Some(&table), 62, 8, 16, 13)
+            .expect("inputs");
+        assert_eq!((count, total), (5, 70));
+        for array in [&block_table, &seq_lens, &cu_seqlens_q] {
+            // SAFETY: a live array handle.
+            assert!(
+                unsafe { mlx_sys::mlx_array_is_available(array.as_raw_ptr()) },
+                "a metadata array is not on the host"
+            );
+        }
+        assert_eq!(block_table.shape().expect("shape").to_vec(), vec![1, 5]);
+        assert_eq!(
+            block_table.to_int32().expect("ids").to_vec(),
+            vec![7, 3, 9, 1, 12]
+        );
+        assert_eq!(seq_lens.to_int32().expect("lens").to_vec(), vec![70]);
+        assert_eq!(cu_seqlens_q.to_int32().expect("cu").to_vec(), vec![0, 8]);
+
+        let mut cache = PagedMetadataCache::default();
+        let error = cache
+            .varlen_prefill_attention_inputs(Some(&table), 62, 8, 16, 12)
+            .err()
+            .expect("id 12 is outside a 12-block pool");
+        assert!(
+            error.contains("block_table[4]=12 out of range for pool block count 12"),
+            "{error}"
+        );
     }
 }

@@ -241,6 +241,7 @@ fn varlen(pool: &Pool, q: &Owned, rows: usize) -> Owned {
             pool.kv as i32,
             D as i32,
             pool.format.code(),
+            std::ptr::null_mut(),
         )
     });
     assert!(!out.0.is_null(), "varlen factory refused");
@@ -272,6 +273,7 @@ fn prefill(pool: &Pool, q: &Owned, rows: usize) -> Owned {
             pool.kv as i32,
             D as i32,
             pool.format.code(),
+            false,
             1.0 / (D as f32).sqrt(),
             &mut attention,
             &mut workspace_out,

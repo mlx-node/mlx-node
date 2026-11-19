@@ -2,6 +2,7 @@
 //! targets.
 
 pub(crate) mod disk;
+pub(crate) mod migrate;
 pub(crate) mod paged;
 pub(crate) mod plan;
 pub mod replay;

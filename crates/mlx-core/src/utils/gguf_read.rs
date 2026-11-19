@@ -213,6 +213,125 @@ pub(crate) fn plan_reads(
     Ok(windows)
 }
 
+/// One positional read into a batch's buffer at `buf_off`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BatchRead {
+    pub file_off: u64,
+    pub len: usize,
+    pub buf_off: usize,
+}
+
+/// Reads that land in one staging buffer of `len` bytes, and the bands they
+/// hold (`src_off` is the band's offset in that buffer).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Batch {
+    pub len: usize,
+    pub reads: Vec<BatchRead>,
+    pub bands: Vec<Band>,
+}
+
+impl From<Window> for Batch {
+    fn from(window: Window) -> Self {
+        Self {
+            len: window.len,
+            reads: vec![BatchRead {
+                file_off: window.file_off,
+                len: window.len,
+                buf_off: 0,
+            }],
+            bands: window.bands,
+        }
+    }
+}
+
+/// `bytes` bytes of the file at `off` that hold `rows` rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Span {
+    pub off: u64,
+    pub bytes: u64,
+    pub rows: usize,
+}
+
+/// Reads of exactly `spans`: each span rounded out to `ALIGN` (the end
+/// clamped to `file_len`); spans whose rounded ranges touch or overlap share
+/// one read, so no byte between two spans that share no page is read. Reads
+/// go in offset order, each at an `ALIGN` offset of its batch, into batches
+/// of at most `batch_bytes`. Each span is one band of its batch: `tensor` is
+/// the span's index, `row0` 0.
+pub(crate) fn plan_ranges(spans: &[Span], file_len: u64, batch_bytes: usize) -> Result<Vec<Batch>> {
+    let limit = batch_bytes as u64;
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    order.sort_by_key(|&i| spans[i].off);
+    let mut reads: Vec<(u64, u64, Vec<usize>)> = Vec::new();
+    for index in order {
+        let span = spans[index];
+        let end = span
+            .off
+            .checked_add(span.bytes)
+            .filter(|&end| span.bytes > 0 && end <= file_len)
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "GGUF range of {} bytes at {} is empty or ends past the file ({file_len} bytes)",
+                    span.bytes, span.off
+                ))
+            })?;
+        let lo = floor_align(span.off);
+        let hi = ceil_align(end)
+            .ok_or_else(|| Error::from_reason("GGUF range end overflows u64"))?
+            .min(file_len);
+        if hi - lo > limit {
+            return Err(Error::from_reason(format!(
+                "GGUF range of {} bytes at {} does not fit a {batch_bytes}-byte batch",
+                span.bytes, span.off
+            )));
+        }
+        match reads.last_mut() {
+            Some((start, stop, members)) if lo <= *stop && hi.max(*stop) - *start <= limit => {
+                *stop = hi.max(*stop);
+                members.push(index);
+            }
+            _ => reads.push((lo, hi, vec![index])),
+        }
+    }
+    let mut batches: Vec<Batch> = Vec::new();
+    for (start, stop, members) in reads {
+        let len = (stop - start) as usize;
+        let fits = batches.last().is_some_and(|batch| {
+            ceil_align(batch.len as u64).is_some_and(|at| at + stop - start <= limit)
+        });
+        if !fits {
+            batches.push(Batch {
+                len: 0,
+                reads: Vec::new(),
+                bands: Vec::new(),
+            });
+        }
+        let batch = batches
+            .last_mut()
+            .ok_or_else(|| Error::from_reason("GGUF range batch disappeared"))?;
+        let buf_off = ceil_align(batch.len as u64)
+            .ok_or_else(|| Error::from_reason("GGUF batch offset overflows u64"))?
+            as usize;
+        for index in members {
+            let span = spans[index];
+            batch.bands.push(Band {
+                tensor: index,
+                row0: 0,
+                rows: span.rows,
+                src_off: buf_off + (span.off - start) as usize,
+                bytes: span.bytes as usize,
+            });
+        }
+        batch.reads.push(BatchRead {
+            file_off: start,
+            len,
+            buf_off,
+        });
+        batch.len = buf_off + len;
+    }
+    Ok(batches)
+}
+
 pub(crate) trait ReadAt: Send + Sync {
     fn read_exact_at(&self, buf: &mut [u8], off: u64) -> std::io::Result<()>;
 }
@@ -334,6 +453,8 @@ struct Shared {
     state: Mutex<State>,
     changed: Condvar,
     stop: AtomicBool,
+    #[cfg(test)]
+    submitted: std::sync::atomic::AtomicU64,
 }
 
 impl Shared {
@@ -342,13 +463,20 @@ impl Shared {
     }
 }
 
+/// The queue of positional reads that a reader's workers serve, split into
+/// chunks; a ticket ends when every chunk queued under it has.
+pub(crate) struct ReadQueue {
+    shared: Arc<Shared>,
+    path: PathBuf,
+    chunk: usize,
+}
+
 /// Parallel positional reads into caller-owned buffers. Workers live in the
 /// caller's thread scope, so a buffer handed to `submit` must outlive that
 /// scope or be waited on before it is freed.
 pub(crate) struct Reader<'s> {
-    shared: Arc<Shared>,
-    path: &'s Path,
-    chunk: usize,
+    queue: ReadQueue,
+    scope: std::marker::PhantomData<&'s ()>,
 }
 
 #[cfg(test)]
@@ -367,16 +495,11 @@ impl<'s> Reader<'s> {
     ) -> Self {
         // Keep the owner live during startup so a spawn panic closes earlier workers.
         let reader = Self {
-            shared: Arc::new(Shared {
-                state: Mutex::new(State::default()),
-                changed: Condvar::new(),
-                stop: AtomicBool::new(false),
-            }),
-            path,
-            chunk: chunk.max(1),
+            queue: ReadQueue::new(path, chunk),
+            scope: std::marker::PhantomData,
         };
         for _index in 0..threads.max(1) {
-            let shared = Arc::clone(&reader.shared);
+            let shared = Arc::clone(&reader.queue.shared);
             #[cfg(test)]
             if READER_SPAWN_FAILURE_AT.with(|failure| failure.get()) == Some(_index) {
                 panic!("injected Reader spawn failure");
@@ -384,6 +507,132 @@ impl<'s> Reader<'s> {
             scope.spawn(move || worker(&shared, src, path));
         }
         reader
+    }
+}
+
+impl std::ops::Deref for Reader<'_> {
+    type Target = ReadQueue;
+
+    fn deref(&self) -> &ReadQueue {
+        &self.queue
+    }
+}
+
+impl Drop for Reader<'_> {
+    fn drop(&mut self) {
+        self.queue.close();
+    }
+}
+
+/// A reader whose workers live as long as it does: one source, reads queued
+/// by any number of callers in turn. A buffer handed to `submit` must stay
+/// alive until its ticket is waited on or `recover` returns.
+pub(crate) struct ReaderPool {
+    queue: ReadQueue,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    next_ticket: u64,
+}
+
+impl ReaderPool {
+    /// `Self` exists before the first spawn: a failed spawn drops it and
+    /// `Drop` closes and joins the workers already running.
+    pub(crate) fn start(
+        src: Arc<dyn ReadAt>,
+        path: &Path,
+        threads: usize,
+        chunk: usize,
+    ) -> std::io::Result<Self> {
+        let mut pool = Self {
+            queue: ReadQueue::new(path, chunk),
+            workers: Vec::with_capacity(threads.max(1)),
+            next_ticket: 0,
+        };
+        for _ in 0..threads.max(1) {
+            let shared = Arc::clone(&pool.queue.shared);
+            let src = Arc::clone(&src);
+            let path = path.to_path_buf();
+            let worker_handle = std::thread::Builder::new()
+                .name("mlx-gguf-reader".into())
+                .spawn(move || worker(&shared, &*src, &path))?;
+            pool.workers.push(worker_handle);
+        }
+        Ok(pool)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn threads(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// `count` tickets no earlier caller used; returns the first.
+    pub(crate) fn tickets(&mut self, count: usize) -> u64 {
+        let first = self.next_ticket;
+        self.next_ticket += count as u64;
+        first
+    }
+
+    /// After a failed or abandoned caller: drop its queued reads, wait for
+    /// the reads a worker still runs (they write the caller's buffers), and
+    /// serve reads again.
+    pub(crate) fn recover(&self) {
+        let shared = &self.queue.shared;
+        let mut state = shared.lock();
+        state.drain();
+        while state.in_flight > 0 {
+            state = shared
+                .changed
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        state.tickets.clear();
+        state.first_error = None;
+        shared.stop.store(false, Ordering::Release);
+    }
+}
+
+impl std::ops::Deref for ReaderPool {
+    type Target = ReadQueue;
+
+    fn deref(&self) -> &ReadQueue {
+        &self.queue
+    }
+}
+
+impl Drop for ReaderPool {
+    fn drop(&mut self) {
+        self.queue.close();
+        for worker_handle in self.workers.drain(..) {
+            let _ = worker_handle.join();
+        }
+    }
+}
+
+impl ReadQueue {
+    fn new(path: &Path, chunk: usize) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                state: Mutex::new(State::default()),
+                changed: Condvar::new(),
+                stop: AtomicBool::new(false),
+                #[cfg(test)]
+                submitted: std::sync::atomic::AtomicU64::new(0),
+            }),
+            path: path.to_path_buf(),
+            chunk: chunk.max(1),
+        }
+    }
+
+    /// Bytes every `submit` so far queued for reading.
+    #[cfg(test)]
+    pub(crate) fn submitted_bytes(&self) -> u64 {
+        self.shared.submitted.load(Ordering::Relaxed)
+    }
+
+    /// Stop every read and let the workers return once the queue is empty.
+    fn close(&self) {
+        self.stop();
+        self.shared.lock().closed = true;
+        self.shared.changed.notify_all();
     }
 
     pub(crate) fn submit(&self, ticket: u64, dst: SendPtr<u8>, dst_len: usize, file_off: u64) {
@@ -393,6 +642,10 @@ impl<'s> Reader<'s> {
             entry.skipped = true;
             return;
         }
+        #[cfg(test)]
+        self.shared
+            .submitted
+            .fetch_add(dst_len as u64, Ordering::Relaxed);
         let mut chunks = 0usize;
         let mut done = 0usize;
         while done < dst_len {
@@ -484,14 +737,6 @@ impl<'s> Reader<'s> {
     pub(crate) fn stop(&self) {
         self.shared.stop.store(true, Ordering::Release);
         self.shared.lock().drain();
-        self.shared.changed.notify_all();
-    }
-}
-
-impl Drop for Reader<'_> {
-    fn drop(&mut self) {
-        self.stop();
-        self.shared.lock().closed = true;
         self.shared.changed.notify_all();
     }
 }
@@ -820,6 +1065,119 @@ mod tests {
             );
         }
         assert_eq!(windows.last().map(|w| w.file_off + w.len as u64), Some(len));
+    }
+
+    /// Every band names its span's first byte, lies inside one read of its
+    /// batch, and no read or batch passes its limits.
+    fn check_ranges(spans: &[Span], file_len: u64, batch_bytes: usize) -> Vec<Batch> {
+        let batches = plan_ranges(spans, file_len, batch_bytes).unwrap();
+        let mut seen = vec![0usize; spans.len()];
+        for batch in &batches {
+            assert!(batch.len <= batch_bytes, "{batch:?}");
+            for read in &batch.reads {
+                assert_eq!(read.file_off % ALIGN, 0, "{read:?}");
+                assert_eq!(read.buf_off as u64 % ALIGN, 0, "{read:?}");
+                assert!(read.buf_off + read.len <= batch.len, "{read:?}");
+            }
+            for band in &batch.bands {
+                let span = spans[band.tensor];
+                seen[band.tensor] += 1;
+                assert_eq!((band.bytes as u64, band.rows), (span.bytes, span.rows));
+                let read = batch
+                    .reads
+                    .iter()
+                    .find(|r| {
+                        band.src_off >= r.buf_off && band.src_off + band.bytes <= r.buf_off + r.len
+                    })
+                    .unwrap_or_else(|| panic!("band {band:?} lies in no read of {batch:?}"));
+                assert_eq!(
+                    read.file_off + (band.src_off - read.buf_off) as u64,
+                    span.off,
+                    "band {band:?} does not start at its span's first byte"
+                );
+            }
+        }
+        assert!(
+            seen.iter().all(|&n| n == 1),
+            "each span is one band: {seen:?}"
+        );
+        batches
+    }
+
+    /// Two 1 MiB ranges 5 MiB apart are two reads of at most their rounded
+    /// bytes; two ranges that share a 16 KiB page are one read; a band starts
+    /// at its range's first byte wherever its read begins; batches stay at
+    /// their size and split only between reads.
+    /// MUTATION: merge ranges within 8 MiB -> one read of 6+ MiB -> red.
+    #[test]
+    fn ranges_merge_only_when_they_touch() {
+        const MIB: u64 = 1 << 20;
+        let file_len = 64 * MIB + 123;
+        let apart = [
+            Span {
+                off: 6 * MIB + 100,
+                bytes: MIB,
+                rows: 4,
+            },
+            Span {
+                off: 100,
+                bytes: MIB,
+                rows: 4,
+            },
+        ];
+        let batches = check_ranges(&apart, file_len, 64 << 20);
+        let reads: Vec<&BatchRead> = batches.iter().flat_map(|b| &b.reads).collect();
+        assert_eq!(reads.len(), 2, "{batches:?}");
+        let read_bytes: u64 = reads.iter().map(|r| r.len as u64).sum();
+        assert!(read_bytes <= 2 * MIB + 2 * ALIGN, "{read_bytes} bytes read");
+
+        let sharing = [
+            Span {
+                off: 3 * ALIGN + 1000,
+                bytes: 20_000,
+                rows: 2,
+            },
+            Span {
+                off: 3 * ALIGN + 21_000,
+                bytes: 30_000,
+                rows: 3,
+            },
+        ];
+        let batches = check_ranges(&sharing, file_len, 64 << 20);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].reads.len(), 1, "{batches:?}");
+        assert_eq!(batches[0].reads[0].file_off, 3 * ALIGN);
+
+        // Nine 921,600-byte experts back to back (a page shared by each
+        // pair) and one at the end of the file: batches of 4 MiB.
+        let mut spans: Vec<Span> = (0..9)
+            .map(|i| Span {
+                off: 7 * ALIGN + 77 + i * 921_600,
+                bytes: 921_600,
+                rows: 640,
+            })
+            .collect();
+        spans.push(Span {
+            off: file_len - 5_000,
+            bytes: 5_000,
+            rows: 1,
+        });
+        let batches = check_ranges(&spans, file_len, 4 << 20);
+        assert!(batches.len() >= 2, "{batches:?}");
+        let last = batches.last().unwrap().reads.last().unwrap();
+        assert_eq!(last.file_off + last.len as u64, file_len);
+        let too_long = [Span {
+            off: 0,
+            bytes: (4 << 20) + 1,
+            rows: 1,
+        }];
+        assert!(plan_ranges(&too_long, file_len, 4 << 20).is_err());
+        let past_end = [Span {
+            off: file_len - 10,
+            bytes: 11,
+            rows: 1,
+        }];
+        assert!(plan_ranges(&past_end, file_len, 4 << 20).is_err());
     }
 
     struct Bytes(Vec<u8>);

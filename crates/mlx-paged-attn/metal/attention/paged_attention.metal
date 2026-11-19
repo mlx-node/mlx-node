@@ -728,6 +728,8 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     // softmax / V reduction). When sliding_window == 0 the kernel falls
     // back to the original full-context behaviour.
     const constant int &sliding_window [[buffer(18)]],
+    const device float *score_scales [[buffer(21)]],
+    const constant int &has_score_scales [[buffer(22)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -779,6 +781,11 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   const int kv_head_idx = head_idx / num_queries_per_kv;
   // FORKED: Use template parameter instead of function constant
   const float alibi_slope = !USE_ALIBI ? 0.f : alibi_slopes[head_idx];
+  // INT8 query codes carry their row's score scale (paged_query_codes).
+  const float score_scale =
+      is_char<CACHE_T>() && has_score_scales
+          ? score_scales[seq_idx * num_heads + head_idx]
+          : scale;
 
   // A vector type to store a part of a key or a query.
   // The vector size is configured in such a way that the threads in a thread
@@ -876,7 +883,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
         qk *= k_scale[(physical_block_number * num_kv_heads + kv_head_idx) *
                           BLOCK_SIZE +
                       physical_block_offset];
-        qk *= scale;
+        qk *= score_scale;
       } else {
         qk = scale * Qk_dot<T, THREAD_GROUP_SIZE>::dot(
                          q_vecs[thread_group_offset], k_vecs);
@@ -1807,6 +1814,8 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
     const constant int &sliding_window [[buffer(18)]],
     device const int32_t *cu_seqlens_q [[buffer(19)]],  // [num_seqs + 1]
     const constant int &num_seqs [[buffer(20)]],
+    const device float *score_scales [[buffer(21)]],
+    const constant int &has_score_scales [[buffer(22)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -1882,6 +1891,11 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
   const int num_queries_per_kv = num_heads / num_kv_heads;
   const int kv_head_idx = head_idx / num_queries_per_kv;
   const float alibi_slope = !USE_ALIBI ? 0.f : alibi_slopes[head_idx];
+  // INT8 query codes carry their row's score scale (paged_query_codes).
+  const float score_scale =
+      is_char<CACHE_T>() && has_score_scales
+          ? score_scales[q_token_idx * num_heads + head_idx]
+          : scale;
 
   constexpr int VEC_SIZE = MAX(16 / (THREAD_GROUP_SIZE * sizeof(T)), 1);
   using K_vec = typename Vec<T, VEC_SIZE>::Type;
@@ -1952,7 +1966,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
         qk *= k_scale[(physical_block_number * num_kv_heads + kv_head_idx) *
                           BLOCK_SIZE +
                       physical_block_offset];
-        qk *= scale;
+        qk *= score_scale;
       } else {
         qk = scale * Qk_dot<T, THREAD_GROUP_SIZE>::dot(
                          q_vecs[thread_group_offset], k_vecs);
@@ -2355,6 +2369,8 @@ template <typename T, int HEAD_SIZE, int NUM_THREADS, int NUM_SIMD_LANES,
       const constant int &kv_block_stride [[buffer(16)]],                      \
       const constant int &kv_head_stride [[buffer(17)]],                       \
       const constant int &sliding_window [[buffer(18)]],                       \
+      const device float *score_scales [[buffer(21)]],                         \
+      const constant int &has_score_scales [[buffer(22)]],                     \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
@@ -2530,6 +2546,8 @@ instantiate_paged_attention_v2(half, half, 32);
       const constant int &sliding_window [[buffer(18)]],                       \
       device const int32_t *cu_seqlens_q [[buffer(19)]],                       \
       const constant int &num_seqs [[buffer(20)]],                             \
+      const device float *score_scales [[buffer(21)]],                         \
+      const constant int &has_score_scales [[buffer(22)]],                     \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
@@ -2757,6 +2775,8 @@ template <int HEAD_SIZE>
     const constant int &kv_block_stride [[buffer(16)]],
     const constant int &kv_head_stride [[buffer(17)]],
     const constant int &sliding_window [[buffer(18)]],
+    const device float *score_scales [[buffer(21)]],
+    const constant int &has_score_scales [[buffer(22)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
@@ -2788,6 +2808,10 @@ template <int HEAD_SIZE>
   const int q_token_idx = q_pos_in_seq;
   const device bfloat16_t *q_ptr =
       q + q_token_idx * q_stride + head_idx * HEAD_SIZE;
+  // INT8 query codes carry their row's score scale (paged_query_codes).
+  const float score_scale =
+      has_score_scales ? score_scales[q_token_idx * num_heads + head_idx]
+                       : scale;
 
   float acc[OUTPUTS_PER_LANE];
 #pragma unroll
@@ -2839,7 +2863,7 @@ template <int HEAD_SIZE>
     // Splash splash_attention_page_softmax: the key scale, then Scale.
     float score = partial + simd_shuffle_xor(partial, 1);
     score *= k_scale[scale_base + token_in_block];
-    score *= scale;
+    score *= score_scale;
     if (softcapping != 1.0f) {
       score = precise::tanh(score / softcapping) * softcapping;
     }
@@ -2964,6 +2988,8 @@ template <int HEAD_SIZE>
       const constant int &kv_block_stride [[buffer(16)]],                     \
       const constant int &kv_head_stride [[buffer(17)]],                      \
       const constant int &sliding_window [[buffer(18)]],                      \
+      const device float *score_scales [[buffer(21)]],                        \
+      const constant int &has_score_scales [[buffer(22)]],                    \
       threadgroup char *shared_mem [[threadgroup(0)]],                        \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],    \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                  \
@@ -2998,6 +3024,8 @@ template <int HEAD_SIZE>
       const constant int &sliding_window [[buffer(18)]],                      \
       device const int32_t *cu_seqlens_q [[buffer(19)]],                      \
       const constant int &num_seqs [[buffer(20)]],                            \
+      const device float *score_scales [[buffer(21)]],                        \
+      const constant int &has_score_scales [[buffer(22)]],                    \
       threadgroup char *shared_mem [[threadgroup(0)]],                        \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],    \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                  \
@@ -3066,6 +3094,8 @@ template [[host_name("paged_attention_grouped_int8_hs256_bs16_striped")]]
     const constant int &kv_block_stride [[buffer(16)]],
     const constant int &kv_head_stride [[buffer(17)]],
     const constant int &sliding_window [[buffer(18)]],
+    const device float *score_scales [[buffer(21)]],
+    const constant int &has_score_scales [[buffer(22)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
@@ -3084,3 +3114,4 @@ template [[host_name("paged_attention_grouped_int8_hs256_striped_reduce")]]
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
     uint3 thread_position_in_threadgroup [[thread_position_in_threadgroup]],
     uint3 threads_per_threadgroup [[threads_per_threadgroup]]);
+#include "paged_attention_ktm.h"
