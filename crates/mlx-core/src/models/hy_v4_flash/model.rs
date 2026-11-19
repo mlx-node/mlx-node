@@ -4,11 +4,11 @@
 //! ids ─► token_embd rows ─► hc copies ─► 42 × Block ─► hc_head ─► rms·output_norm = h_trunk ─► output ─► logits
 //! ```
 //!
-//! A step runs layer by layer over the rows of one or more owners
-//! (`OwnerRows`): decode rows of any number of sequences, or one sequence's
-//! prefill slice, which is never fused with other rows. Decode rows take
-//! the HC head and the vocab head one row per call, so an owner's rows give
-//! the same bits alone and among others (see `block.rs`, `moe.rs`).
+//! A step runs layer by layer over the rows of one or more owners (a
+//! `Wave`): decode rows of any number of sequences, or one sequence's
+//! prefill slice, which is never fused with other rows. Ops group as
+//! `batch.rs` lists them, so an owner's rows give the same bits alone and
+//! among others. `step` runs flat sessions; `wave` runs any `Owners`.
 //!
 //! A `Session` is one sequence; its latent and pooled buffers are written
 //! in place, so a session is never cloned: snapshots are lengths plus
@@ -17,7 +17,8 @@
 
 use napi::{Error, Result};
 
-use super::block::{Block, EngramIn, LayerState, OwnerLayer};
+use super::batch::{Core, Group, Op, Owners, Wave, group};
+use super::block::{Block, EngramIn, LayerState};
 use super::cache::{LayerCache, WindowRing};
 use super::config::HyV4FlashConfig;
 use super::engram::{Hasher, keeps};
@@ -119,6 +120,50 @@ pub struct OwnerRows<'a> {
     pub sess: &'a mut Session,
     pub ids: &'a [u32],
     pub want: Want,
+}
+
+/// `Owners` over flat sessions; the sessions' tokens are appended by
+/// `Model::step` after the wave.
+struct FlatOwners<'s, 'a> {
+    owners: &'s mut [OwnerRows<'a>],
+}
+
+impl Owners for FlatOwners<'_, '_> {
+    fn count(&self) -> usize {
+        self.owners.len()
+    }
+
+    fn ids(&self, owner: usize) -> &[u32] {
+        match self.owners.get(owner) {
+            Some(o) => o.ids,
+            None => &[],
+        }
+    }
+
+    fn history(&self, owner: usize) -> &[u32] {
+        match self.owners.get(owner) {
+            Some(o) => o.sess.tokens(),
+            None => &[],
+        }
+    }
+
+    fn want(&self, owner: usize) -> Want {
+        self.owners.get(owner).map_or(Want::STATE, |o| o.want)
+    }
+
+    fn core(&mut self, owner: usize, call: Core<'_>) -> Result<MxArray> {
+        let l = call.blk.layer();
+        let st = self
+            .owners
+            .get_mut(owner)
+            .ok_or_else(|| bad(format!("owner {owner} of the wave")))?
+            .sess
+            .layers
+            .get_mut(l)
+            .ok_or_else(|| bad(format!("session without layer {l}")))?;
+        call.blk
+            .core_flat(call.w, call.p, call.start, st, call.kind)
+    }
 }
 
 /// f32 logits `[s, vocab]` of `x [s, d]`: each row is `head_logits` of
@@ -391,6 +436,21 @@ pub struct Model {
     table: Box<dyn EngramRows>,
 }
 
+/// Refuses an empty call or one past the session's context.
+fn check_room(o: &OwnerRows<'_>) -> Result<()> {
+    let (n, start) = (o.ids.len(), o.sess.tokens.len());
+    if n == 0 {
+        return Err(bad("empty call"));
+    }
+    if start + n > o.sess.cap {
+        return Err(bad(format!(
+            "{start} + {n} tokens exceed the context of {}",
+            o.sess.cap
+        )));
+    }
+    Ok(())
+}
+
 fn want_dims(d: &Dense, rows: usize, cols: usize, what: &str) -> Result<()> {
     let got = (d.shape_at(0)?, d.shape_at(1)?);
     if got != (rows as i64, cols as i64) {
@@ -518,87 +578,84 @@ impl Model {
         cancel: Option<&dyn Fn(usize) -> bool>,
         trace: Option<&mut Trace>,
     ) -> Result<Vec<Output>> {
-        if owners.is_empty() {
-            return Err(bad("a step without owners"));
-        }
-        if kind == RowKind::Prefill && owners.len() != 1 {
-            return Err(bad(format!(
-                "a prefill slice runs alone, not with {} owners",
-                owners.len()
-            )));
-        }
         if owners.iter().any(|o| {
             o.sess.layers.len() != self.blocks.len() || o.sess.kpool != self.cfg.indexer.kpool
         }) {
             return Err(bad("a session belongs to another model"));
         }
-        let marks: Vec<Mark> = owners.iter().map(|o| o.sess.mark()).collect();
-        let out = self.run(owners, kind, cancel, trace);
-        if let Err(e) = &out {
-            let lost: Vec<String> = owners
-                .iter_mut()
-                .zip(&marks)
-                .filter_map(|(o, m)| o.sess.restore(m).err().map(|r| r.reason))
-                .collect();
-            if !lost.is_empty() {
-                return Err(bad(format!(
-                    "{}; sessions could not be restored: {}",
-                    e.reason,
-                    lost.join("; ")
-                )));
-            }
-        }
-        out
-    }
-
-    fn check_call(&self, o: &OwnerRows<'_>) -> Result<()> {
-        let (n, start) = (o.ids.len(), o.sess.tokens.len());
-        if n == 0 {
-            return Err(bad("empty call"));
-        }
-        if start + n > o.sess.cap {
-            return Err(bad(format!(
-                "{start} + {n} tokens exceed the context of {}",
-                o.sess.cap
-            )));
-        }
-        if let Some(id) = o.ids.iter().find(|&&id| id as usize >= self.cfg.vocab_size) {
-            return Err(bad(format!(
-                "token id {id} outside the vocab of {}",
-                self.cfg.vocab_size
-            )));
-        }
-        Ok(())
-    }
-
-    fn run(
-        &self,
-        owners: &mut [OwnerRows<'_>],
-        kind: RowKind,
-        cancel: Option<&dyn Fn(usize) -> bool>,
-        mut trace: Option<&mut Trace>,
-    ) -> Result<Vec<Output>> {
         for o in owners.iter() {
-            self.check_call(o)?;
+            check_room(o)?;
         }
         let spans: Vec<(usize, usize)> = owners
             .iter()
             .map(|o| (o.sess.tokens.len(), o.ids.len()))
             .collect();
-        let total: usize = spans.iter().map(|s| s.1).sum();
+        let wave = Wave::new(kind, &spans, None)?;
+        let marks: Vec<Mark> = owners.iter().map(|o| o.sess.mark()).collect();
+        let out = self.wave(
+            &mut FlatOwners {
+                owners: &mut *owners,
+            },
+            &wave,
+            cancel,
+            trace,
+        );
+        match &out {
+            Ok(_) => {
+                for o in owners.iter_mut() {
+                    let sess = &mut *o.sess;
+                    sess.calls += 1;
+                    sess.written
+                        .extend(std::iter::repeat_n(sess.calls, o.ids.len()));
+                    sess.tokens.extend_from_slice(o.ids);
+                }
+            }
+            Err(e) => {
+                let lost: Vec<String> = owners
+                    .iter_mut()
+                    .zip(&marks)
+                    .filter_map(|(o, m)| o.sess.restore(m).err().map(|r| r.reason))
+                    .collect();
+                if !lost.is_empty() {
+                    return Err(bad(format!(
+                        "{}; sessions could not be restored: {}",
+                        e.reason,
+                        lost.join("; ")
+                    )));
+                }
+            }
+        }
+        out
+    }
+
+    /// Runs the rows of `wave` layer by layer, owner `i`'s ids from
+    /// `owners.ids(i)` at its span's start, its attention state through
+    /// `owners.core`. `cancel(layer)` is asked before each layer. On error
+    /// the caller puts every owner's state back; on success the caller
+    /// records the owners' new tokens. One output per owner, in order.
+    pub fn wave(
+        &self,
+        owners: &mut dyn Owners,
+        wave: &Wave,
+        cancel: Option<&dyn Fn(usize) -> bool>,
+        mut trace: Option<&mut Trace>,
+    ) -> Result<Vec<Output>> {
+        self.check_wave(owners, wave)?;
+        let total = wave.rows();
         let mut ids = Vec::with_capacity(total);
         let mut keep = Vec::with_capacity(total);
         let mut rows = Vec::new();
         let tp = prof_start();
-        for o in owners.iter() {
+        for i in 0..wave.owners() {
+            let call = owners.ids(i);
             rows.extend(call_engram_rows(
                 &self.hasher,
                 self.cfg.engram.max_ngram - 1,
-                &o.sess.tokens,
-                o.ids,
+                owners.history(i),
+                call,
             )?);
-            keep.extend(keeps(o.ids, self.cfg.engram.pad_token_id));
-            ids.extend_from_slice(o.ids);
+            keep.extend(keeps(call, self.cfg.engram.pad_token_id));
+            ids.extend_from_slice(call);
         }
         prof_end(Phase::Engram, tp, &[])?;
         if let Some(t) = trace.as_deref_mut() {
@@ -626,27 +683,11 @@ impl Model {
                 }
                 None => None,
             };
-            let mut layer = owners
-                .iter_mut()
-                .zip(&spans)
-                .map(|(o, &(start, n))| {
-                    let state = o
-                        .sess
-                        .layers
-                        .get_mut(l)
-                        .ok_or_else(|| bad(format!("session without layer {l}")))?;
-                    Ok(OwnerLayer {
-                        start,
-                        rows: n,
-                        state,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
             let engram = table_rows.as_deref().map(|r| EngramIn {
                 rows: r,
                 keep: &keep,
             });
-            let (y, routes) = blk.forward(&w.layers()[l], &x, &mut layer, engram, kind)?;
+            let (y, routes) = blk.forward(&w.layers()[l], &x, wave, owners, engram)?;
             MxArray::eval_arrays_with_context(&[&y], "hy_v4_flash layer")?;
             x = y;
             if let Some(t) = trace.as_deref_mut() {
@@ -657,15 +698,40 @@ impl Model {
             }
         }
         let tp = prof_start();
-        let outs = self.heads(&x, owners, &spans, kind)?;
+        let outs = self.heads(&x, owners, wave)?;
         prof_end(Phase::Head, tp, &[])?;
-        for (o, &(_, n)) in owners.iter_mut().zip(&spans) {
-            let sess = &mut *o.sess;
-            sess.calls += 1;
-            sess.written.extend(std::iter::repeat_n(sess.calls, n));
-            sess.tokens.extend_from_slice(o.ids);
-        }
         Ok(outs)
+    }
+
+    /// Refuses a wave whose owners do not match it: count, rows, starts
+    /// (each owner's history is as long as its start) and vocab ids.
+    fn check_wave(&self, owners: &dyn Owners, wave: &Wave) -> Result<()> {
+        if owners.count() != wave.owners() {
+            return Err(bad(format!(
+                "{} owners for a wave of {}",
+                owners.count(),
+                wave.owners()
+            )));
+        }
+        for (i, s) in wave.spans().iter().enumerate() {
+            let (ids, history) = (owners.ids(i), owners.history(i));
+            if ids.len() != s.rows || history.len() != s.start {
+                return Err(bad(format!(
+                    "owner {i}: {} ids after {} tokens for {} rows at {}",
+                    ids.len(),
+                    history.len(),
+                    s.rows,
+                    s.start
+                )));
+            }
+            if let Some(id) = ids.iter().find(|&&id| id as usize >= self.cfg.vocab_size) {
+                return Err(bad(format!(
+                    "token id {id} outside the vocab of {}",
+                    self.cfg.vocab_size
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// `rms(hc_head(x))·output_norm` of the streams `x [r, hc, d]`.
@@ -679,35 +745,21 @@ impl Model {
         )
     }
 
-    /// `trunk_out` one row per call for decode rows.
+    /// `trunk_out` as `Op::TrunkOut` groups for `kind`.
     fn trunk_rows(&self, x: &MxArray, kind: RowKind) -> Result<MxArray> {
-        match kind {
-            RowKind::Decode => per_row(x, |r| self.trunk_out(r)),
-            RowKind::Prefill => self.trunk_out(x),
+        match group(Op::TrunkOut, kind) {
+            Group::Row => per_row(x, |r| self.trunk_out(r)),
+            Group::Fused | Group::Owner => self.trunk_out(x),
         }
     }
 
     /// Every owner's outputs from its rows of `x [r, hc, d]`, evaluated
     /// together.
-    fn heads(
-        &self,
-        x: &MxArray,
-        owners: &[OwnerRows<'_>],
-        spans: &[(usize, usize)],
-        kind: RowKind,
-    ) -> Result<Vec<Output>> {
-        let (hc, d) = (x.shape_at(1)?, x.shape_at(2)?);
-        let mut outs = Vec::with_capacity(owners.len());
-        let mut lo = 0i64;
-        for (o, &(_, n)) in owners.iter().zip(spans) {
-            let hi = lo + n as i64;
-            let xo = if owners.len() == 1 {
-                x.clone()
-            } else {
-                x.slice(&[lo, 0, 0], &[hi, hc, d])?
-            };
-            outs.push(self.head(&xo, o.want, kind)?);
-            lo = hi;
+    fn heads(&self, x: &MxArray, owners: &dyn Owners, wave: &Wave) -> Result<Vec<Output>> {
+        let mut outs = Vec::with_capacity(wave.owners());
+        for i in 0..wave.owners() {
+            let xo = wave.owner_rows(x, i)?;
+            outs.push(self.head(&xo, owners.want(i), wave.kind())?);
         }
         let live: Vec<&MxArray> = outs
             .iter()
@@ -735,9 +787,9 @@ impl Model {
                     Some(h) => h.clone(),
                     None => self.trunk_rows(x, kind)?,
                 };
-                Some(match kind {
-                    RowKind::Decode => head_rows(&h, head)?,
-                    RowKind::Prefill => head_logits(&h, head)?,
+                Some(match group(Op::VocabHead, kind) {
+                    Group::Row => head_rows(&h, head)?,
+                    Group::Fused | Group::Owner => head_logits(&h, head)?,
                 })
             }
             Logits::Last => {

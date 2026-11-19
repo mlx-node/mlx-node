@@ -21,15 +21,18 @@
 //!
 //! | op | decode rows | prefill slice |
 //! |---|---|---|
-//! | Q8 matrices (`qlinear`) | all rows in one call, 1 row padded to 2 | all rows |
-//! | f32 router | one call per row | all rows |
-//! | routed experts | one bank `prepare` over the union, victims | one `prepare`, staging |
+//! | Q8 matrices (`qlinear`) | all rows in one call, padded to `MIN_Q8_ROWS` | all rows |
+//! | f32 router (`Op::Router`) | one call per row, one readback for all rows | all rows |
+//! | routed experts | one bank `prepare` over the union, victims | one `prepare` per chunk, staging |
+//!
+//! Decode rows are one chunk, never split by `chunk`.
 
 use std::sync::Arc;
 
 use napi::{Error, Result};
 
 use super::bank::{KqBank, Prepared};
+use super::batch::{Group, MIN_Q8_ROWS, Op, group};
 use super::config::{HyV4FlashConfig, MoeConfig};
 use super::ops::{route, router_scores};
 use super::stats::{Phase, prof_end, prof_start};
@@ -66,16 +69,21 @@ impl RowKind {
     }
 }
 
-/// `linear` where a 1-row `x` through a Q8 (`Dense::Qmm`) matrix runs as
-/// `[x; 0]` and keeps row 0: MLX routes M = 1 to `qmv` and M >= 2 to
-/// `qmv_wide` (`backend/metal/quantized.cpp`), so a row alone and the same
-/// row among others take the same kernel.
+/// `linear` where an `x` of fewer than `MIN_Q8_ROWS` rows through a Q8
+/// (`Dense::Qmm`) matrix runs padded with zero rows and keeps its own:
+/// MLX routes M = 1 to `qmv` and M >= 2 to `qmv_wide`
+/// (`backend/metal/quantized.cpp`), so a row alone and the same row among
+/// others take the same kernel.
 pub fn qlinear(x: &MxArray, w: &Dense) -> Result<MxArray> {
-    if !matches!(w, Dense::Qmm { .. }) || x.ndim()? != 2 || x.shape_at(0)? != 1 {
+    if !matches!(w, Dense::Qmm { .. }) || x.ndim()? != 2 {
         return linear(x, w);
     }
-    let y = linear(&x.pad(&[0, 1, 0, 0], 0.0)?, w)?;
-    y.slice(&[0, 0], &[1, y.shape_at(1)?])
+    let n = x.shape_at(0)?;
+    if n == 0 || n >= MIN_Q8_ROWS {
+        return linear(x, w);
+    }
+    let y = linear(&x.pad(&[0, (MIN_Q8_ROWS - n) as i32, 0, 0], 0.0)?, w)?;
+    y.slice(&[0, 0], &[n, y.shape_at(1)?])
 }
 
 /// `f(row)` for every row of `x [n, ..]`, concatenated on axis 0.
@@ -449,9 +457,9 @@ impl Moe {
         kind: RowKind,
     ) -> Result<(MxArray, Routes)> {
         let tp = prof_start();
-        let scores = match kind {
-            RowKind::Decode => per_row(x, |r| router_scores(r, &w.router))?,
-            RowKind::Prefill => router_scores(x, &w.router)?,
+        let scores = match group(Op::Router, kind) {
+            Group::Row => per_row(x, |r| router_scores(r, &w.router))?,
+            Group::Fused | Group::Owner => router_scores(x, &w.router)?,
         };
         let (ids, weights) = route(&scores, self.bias.as_deref(), &self.moe)?;
         prof_end(Phase::Router, tp, &[])?;
@@ -656,7 +664,8 @@ impl LayerFfn {
     /// `forward` from the parts, `chunk` rows per expert step; every chunk
     /// is evaluated before the next starts when there is more than one.
     /// Every chunk runs as `kind`, so a short last prefill chunk never
-    /// evicts the bank's cache.
+    /// evicts the bank's cache. Decode rows are one chunk (one router
+    /// readback, one bank `prepare`), refused past `chunk` rows.
     pub fn forward_chunked(
         &self,
         ffn: &Ffn,
@@ -678,6 +687,12 @@ impl LayerFfn {
         };
         if chunk == 0 {
             return Err(bad("chunk of 0 rows"));
+        }
+        if kind == RowKind::Decode && n > chunk {
+            return Err(bad(format!(
+                "layer {}: {n} decode rows past one chunk of {chunk}",
+                self.layer
+            )));
         }
         let x = rms_norm(&h.astype(DType::Float32)?, norm, self.eps)?;
         let parts = chunks(n, chunk);

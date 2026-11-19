@@ -4,6 +4,7 @@
 
 pub mod attention;
 pub mod bank;
+pub mod batch;
 pub mod block;
 pub mod cache;
 pub mod chat;
@@ -29,6 +30,8 @@ pub mod stats;
 pub mod store;
 pub mod weights;
 
+#[cfg(test)]
+mod tests_batch;
 #[cfg(test)]
 mod tests_chat;
 #[cfg(test)]
