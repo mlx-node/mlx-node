@@ -71,3 +71,11 @@ pub use config::{
     Attn, DEFAULT_CONTEXT_CAP, HcConfig, HyV4FlashConfig, IndexerConfig, LayerConfig, MlaConfig,
     MoeConfig,
 };
+
+/// True f32 GEMMs on the calling thread, as `Model::new` sets for the model
+/// thread. Component tests that never build a `Model` call it: on NAX GPUs a
+/// thread that keeps MLX's default runs f32 GEMMs with M > 1 in TF32.
+#[cfg(test)]
+pub(crate) fn exact_f32() {
+    crate::array::set_thread_tf32(Some(false));
+}

@@ -402,6 +402,7 @@ fn real_resident_bytes_match_the_oracle() {
 #[test]
 #[ignore = "needs HY4_DIR with the real GGUF shards and the GPU"]
 fn real_dense_load_matches_the_oracle() {
+    crate::models::hy_v4_flash::exact_f32();
     let s = real_scan();
     let want = fixture("resident.json");
     let shards = ShardSet::open(&s.paths).unwrap();

@@ -329,6 +329,7 @@ fn cell_sets(idx: &MxArray) -> Vec<Vec<i32>> {
 
 #[test]
 fn pool_rope_and_scores_match_ops_fixture() {
+    crate::models::hy_v4_flash::exact_f32();
     let o = fixture("ops.json");
     let k = &o["kpool_pool_score"];
     let dm = &k["dims"];
@@ -852,6 +853,7 @@ fn attn_weights(g: &Geometry, seed: u64) -> AttnWeights {
 
 #[test]
 fn indexed_layer_past_top_k_gives_the_same_rows_for_every_split() {
+    crate::models::hy_v4_flash::exact_f32();
     let ag = attn_geometry();
     let aw = attn_weights(&ag, 61);
     let mla = Mla::new(ag.clone(), &aw).unwrap();

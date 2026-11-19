@@ -431,6 +431,7 @@ fn run_split(
 }
 
 fn check_layer(attn: Attn, seed: u64) {
+    crate::models::hy_v4_flash::exact_f32();
     let g = geometry(attn);
     let (w, rw) = weights(&g, seed);
     let mla = Mla::new(g.clone(), &w).unwrap();
@@ -459,6 +460,7 @@ fn indexed_layer_matches_reference_for_every_split() {
 
 #[test]
 fn truncate_then_replay_equals_the_first_pass() {
+    crate::models::hy_v4_flash::exact_f32();
     for attn in [Attn::Sliding, Attn::Indexed] {
         let g = geometry(attn);
         let (w, rw) = weights(&g, 23);
@@ -605,6 +607,7 @@ fn latent_buf_writes_rows_and_truncates_by_length() {
 
 #[test]
 fn gather_core_matches_host_softmax_with_sinks() {
+    crate::models::hy_v4_flash::exact_f32();
     let (s, h, d, n, kmax, vw) = (5usize, 2usize, 6usize, 7usize, 4usize, 4usize);
     let mut r = Rng(31);
     let q = r.vec(s * h * d, 1.5);

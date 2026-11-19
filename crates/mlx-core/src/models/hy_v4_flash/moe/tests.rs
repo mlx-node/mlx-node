@@ -475,6 +475,7 @@ fn chunks_cover_the_rows() {
 /// f64 reference on the dequantized experts, with the clamp active.
 #[test]
 fn resident_moe_matches_reference() {
+    crate::models::hy_v4_flash::exact_f32();
     let mut rng = Rng::new(3);
     let m = moe_cfg(8, 3, 128, 64);
     let c = ffn_cfg(96, m.clone(), 0.75);
@@ -515,6 +516,7 @@ fn resident_moe_matches_reference() {
 /// noise: the dense matmuls see other row counts).
 #[test]
 fn chunked_forward_matches_one_call() {
+    crate::models::hy_v4_flash::exact_f32();
     let mut rng = Rng::new(5);
     let m = moe_cfg(8, 3, 128, 64);
     let c = ffn_cfg(96, m.clone(), 0.75);
@@ -556,6 +558,7 @@ fn chunked_forward_matches_one_call() {
 /// expert limit.
 #[test]
 fn dense_ffn_matches_reference_without_clamp() {
+    crate::models::hy_v4_flash::exact_f32();
     let mut rng = Rng::new(9);
     let (d, ff) = (64usize, 80usize);
     let c = FfnConfig {
@@ -798,6 +801,7 @@ impl Drop for Temp {
 /// loader-repacked experts; the decode row's routes are the prefill's.
 #[test]
 fn bank_moe_matches_dequantized_experts() {
+    crate::models::hy_v4_flash::exact_f32();
     let mut rng = Rng::new(21);
     let m = moe_cfg(6, 2, 512, 256);
     let c = ffn_cfg(128, m.clone(), 0.5);
@@ -961,6 +965,7 @@ fn prefill_tail_chunk_leaves_the_cache() {
 /// prefill's (one bank `prepare` over the rows' union either way).
 #[test]
 fn decode_wave_takes_victims_at_any_row_count() {
+    crate::models::hy_v4_flash::exact_f32();
     let mut rng = Rng::new(29);
     let m = moe_cfg(6, 2, 512, 256);
     let c = ffn_cfg(128, m.clone(), 0.5);
@@ -1116,6 +1121,7 @@ fn real_expert(shards: &ShardSet, loc: &Located, e: u32) -> Mat {
 #[test]
 #[ignore = "needs HY4_DIR with the real GGUF shards and the GPU"]
 fn real_layer_ffn_matches_dequantized_reference() {
+    crate::models::hy_v4_flash::exact_f32();
     let scan = real_scan();
     let shards = Arc::new(ShardSet::open(&scan.paths).unwrap());
     let cfg = &scan.cfg;

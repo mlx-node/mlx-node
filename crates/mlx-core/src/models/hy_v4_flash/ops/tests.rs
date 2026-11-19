@@ -102,6 +102,7 @@ fn norm_eps(o: &Value) -> f32 {
 
 #[test]
 fn hc_mix_matches_the_oracle() {
+    crate::models::hy_v4_flash::exact_f32();
     let all = ops();
     let o = &all["hc_mix"];
     let (hc, d) = (4, 16);
@@ -164,6 +165,7 @@ fn hc_post_identity_matches_the_oracle() {
 
 #[test]
 fn hc_head_matches_the_oracle() {
+    crate::models::hy_v4_flash::exact_f32();
     let all = ops();
     let o = &all["hc_head"];
     let x = hc_x(&all);
@@ -226,6 +228,7 @@ fn route_host_refuses_bad_sizes() {
 /// f32 sigmoid; the readback path then picks the oracle ids.
 #[test]
 fn router_scores_and_route_match_the_oracle() {
+    crate::models::hy_v4_flash::exact_f32();
     let o = &ops()["router"];
     let m = moe(o);
     let n = m.n_experts;
@@ -266,6 +269,7 @@ fn engram_weights(o: &Value) -> EngramWeights {
 
 #[test]
 fn engram_block_matches_the_oracle() {
+    crate::models::hy_v4_flash::exact_f32();
     let o = &ops()["engram_block"];
     assert_eq!(o["eps"].as_f64().unwrap() as f32, ENGRAM_EPS);
     let w = engram_weights(o);
