@@ -29,6 +29,7 @@ import {
 } from '../errors.js';
 import type { IdleSweeper } from '../idle-sweeper.js';
 import { withAdmissionControlledInference } from '../inference-admission.js';
+import { visibleAnswerText } from '../mappers/anthropic-response.js';
 import { withoutReasoningClose } from '../mappers/reasoning-close.js';
 import { mapRequest, reconstructMessagesFromChain, stringifyStoredInputMessages } from '../mappers/request.js';
 import {
@@ -37,6 +38,7 @@ import {
   computeOutputText,
   genId,
   mapFinishReasonToStatus,
+  requestAllowsToolUse,
 } from '../mappers/response.js';
 import {
   type ModelLoadAdmission,
@@ -231,6 +233,7 @@ export function __setServerBootIdForTesting(id: string): void {
  */
 interface NonStreamingHandlerOutcome {
   response: ResponseObject;
+  suppressedToolCalls: boolean;
 }
 
 async function handleNonStreaming(
@@ -242,7 +245,9 @@ async function handleNonStreaming(
   visibility: TransportVisibility,
   serverTiming?: ServerTimingForUsage,
 ): Promise<NonStreamingHandlerOutcome> {
-  const response = buildResponseObject(result, req, responseId, previousResponseId);
+  const allowToolUse = requestAllowsToolUse(req);
+  const shown = allowToolUse ? result : { ...result, text: visibleAnswerText(result, false) };
+  const response = buildResponseObject(shown, req, responseId, previousResponseId);
   mergeTimingUsageExtensions(
     response.usage,
     result.performance,
@@ -261,7 +266,7 @@ async function handleNonStreaming(
   // callback (proving the kernel accepted the chunk) so the adopt
   // gate refuses to cache the session under an unreachable responseId.
   await endJson(res, stringifyStrictJson(response), visibility);
-  return { response };
+  return { response, suppressedToolCalls: !allowToolUse && result.toolCalls.some((t) => t.status === 'ok') };
 }
 
 // ---------------------------------------------------------------------------
@@ -350,6 +355,7 @@ interface StreamingHandlerOutcome {
    * zero). Remains `undefined` on any non-success path.
    */
   cachedTokens: number | undefined;
+  suppressedToolCalls: boolean;
 }
 
 async function handleStreamingNative(
@@ -451,6 +457,8 @@ async function handleStreamingNativeWithAbort(
   let hasClosedReasoning = false;
   let suppressedMessageIndex = -1;
   const tagBuffer = new ToolCallTagBuffer();
+  const allowToolUse = requestAllowsToolUse(req);
+  let suppressedToolCalls = false;
 
   // Terminal response is captured in the done branch but emitted AFTER
   // the loop drains — `wasCommitted()` only reads authoritative
@@ -562,7 +570,10 @@ async function handleStreamingNativeWithAbort(
         // Use the final event's parsed text (markup-stripped) as the authoritative content.
         // If the parsed text is empty and there are tool calls, skip the message item entirely
         // (matching the non-streaming buildOutputItems behavior).
-        let finalText = event.text;
+        const parsedToolCalls = event.toolCalls.filter((t) => t.status === 'ok');
+        suppressedToolCalls = !allowToolUse && parsedToolCalls.length > 0;
+        const okToolCalls = allowToolUse ? parsedToolCalls : [];
+        let finalText = allowToolUse ? event.text : visibleAnswerText(event, false);
         // Leading whitespace that already reached the wire stays in the
         // done text — a later tool call may have trimmed it from
         // `final.text`, but emitted bytes can't be un-sent and the delta
@@ -570,7 +581,7 @@ async function handleStreamingNativeWithAbort(
         if (emittedLeadingWs && !finalText.startsWith(emittedLeadingWs)) {
           finalText = emittedLeadingWs + finalText;
         }
-        const hasToolCalls = event.toolCalls.some((t) => t.status === 'ok');
+        const hasToolCalls = okToolCalls.length > 0;
         const skipMessageItem = !finalText && hasToolCalls;
 
         // Recovery: if tool-call suppression was triggered but the final event has no
@@ -700,8 +711,10 @@ async function handleStreamingNativeWithAbort(
         }
 
         // Recovery: text was never emitted during streaming but final has text
-        // (possible if all text arrived in the final event only)
-        if (!hasEmittedMessage && finalText && !skipMessageItem) {
+        // (possible if all text arrived in the final event only). An empty
+        // message item stands in when no other item exists: cold replay
+        // rebuilds a turn only from its items.
+        if (!hasEmittedMessage && (finalText || (!hasEmittedReasoning && !hasToolCalls))) {
           hasEmittedMessage = true;
           // Nothing reached the wire yet — emit the authoritative text once.
           // When it still carries the parked leading whitespace those bytes
@@ -728,12 +741,14 @@ async function handleStreamingNativeWithAbort(
             part: textPart,
           });
           messageText = finalText;
-          writeSSEEvent(res, 'response.output_text.delta', {
-            item_id: messageItemId,
-            output_index: miIndex,
-            content_index: 0,
-            delta: finalText,
-          });
+          if (finalText) {
+            writeSSEEvent(res, 'response.output_text.delta', {
+              item_id: messageItemId,
+              output_index: miIndex,
+              content_index: 0,
+              delta: finalText,
+            });
+          }
         }
 
         if (hasEmittedMessage && messageText !== finalText) {
@@ -819,7 +834,7 @@ async function handleStreamingNativeWithAbort(
         // Collect function_call items but defer SSE emission until
         // after the commit gate — otherwise clients can see completed
         // tool calls from a turn the session later refuses to commit.
-        for (const tc of event.toolCalls.filter((t) => t.status === 'ok')) {
+        for (const tc of okToolCalls) {
           const callId = tc.id ?? genId('call_');
           const fcItem: FunctionCallOutputItem = {
             id: genId('fc_'),
@@ -1094,7 +1109,7 @@ async function handleStreamingNativeWithAbort(
       // adopt under an unseen responseId.
       await flushTerminalSSE(res, 'response.completed', { response: terminal }, visibility);
       endSSE(res);
-      return { terminalToPersist: terminal, failureMode: null, cachedTokens };
+      return { terminalToPersist: terminal, failureMode: null, cachedTokens, suppressedToolCalls };
     }
   }
 
@@ -1196,7 +1211,7 @@ async function handleStreamingNativeWithAbort(
   // the failure path but returned verbatim to keep the type shape
   // uniform — consumers already treat a non-null `failureMode` as the
   // authoritative "do not use these numbers" signal.
-  return { terminalToPersist: null, failureMode: reason, cachedTokens };
+  return { terminalToPersist: null, failureMode: reason, cachedTokens, suppressedToolCalls };
 }
 
 // ---------------------------------------------------------------------------
@@ -2988,6 +3003,8 @@ export async function handleCreateResponse(
             // branches on `responseMode` to choose the clean-up shape
             // (JSON error, SSE `error` frame, or socket destroy).
             let handlerError: Error | null = null;
+            // The session keeps the calls the response dropped; a warm lease would hold unresolved calls.
+            let suppressedToolCalls = false;
 
             if (mappedBody.stream) {
               const outcome = await runSessionStreaming(
@@ -3012,6 +3029,7 @@ export async function handleCreateResponse(
                   serverTiming,
                 );
                 streamFailureMode = handlerOutcome.failureMode;
+                suppressedToolCalls = handlerOutcome.suppressedToolCalls;
                 if (handlerOutcome.terminalToPersist != null && store && body.store !== false) {
                   // Initiate the write SYNCHRONOUSLY inside the mutex so
                   // the pending-write tracker observes it before the
@@ -3288,6 +3306,7 @@ export async function handleCreateResponse(
                   visibility,
                   serverTiming,
                 );
+                suppressedToolCalls = handlerOutcome.suppressedToolCalls;
                 if (store && body.store !== false) {
                   // Same in-lock-initiate / off-lock-await split as the
                   // streaming branch. The non-streaming handler only
@@ -3535,7 +3554,12 @@ export async function handleCreateResponse(
             // `failureMode === null` is the sole signal that the
             // stream path completed cleanly and the adopted session
             // is genuinely reachable via the responseId.
-            if (committed && (handlerError == null || safeToSuppress) && streamFailureMode === null) {
+            if (
+              committed &&
+              (handlerError == null || safeToSuppress) &&
+              streamFailureMode === null &&
+              !suppressedToolCalls
+            ) {
               // Adopt under the SAME `effectivePromptCacheKey` that was
               // used for `getOrCreate` above — not the raw
               // `promptCacheKey` from the request body. When a request
