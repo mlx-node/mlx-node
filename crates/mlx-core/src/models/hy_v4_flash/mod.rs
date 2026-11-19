@@ -6,6 +6,7 @@ pub mod attention;
 pub mod bank;
 pub mod block;
 pub mod cache;
+pub mod chat;
 pub mod config;
 pub mod engram;
 pub mod f8;
@@ -25,6 +26,8 @@ pub mod stats;
 pub mod store;
 pub mod weights;
 
+#[cfg(test)]
+mod tests_chat;
 #[cfg(test)]
 mod tests_config;
 #[cfg(test)]

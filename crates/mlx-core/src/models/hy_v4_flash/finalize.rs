@@ -300,10 +300,6 @@ fn head(s: &str) -> &str {
     &s[..end]
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "called by the Hy4 chat backend's finalize_turn")
-)]
 pub(crate) fn finalize(args: FinalizeArgs<'_>, tags: &Hy4Tags) -> Result<ChatResult> {
     finalize_chat_result_with(
         args,

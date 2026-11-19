@@ -1,0 +1,776 @@
+//! Chat backend: one flat whole-turn sequence on its own model thread.
+//!
+//! ```text
+//! verify  ─► Conv::verify: longest reusable prefix (sequence cut │ ladder entry) ─► plan
+//! prefill ─► store lease (begin_turn) ─► Driver chunks on the grid ─► last-row logits
+//!            cancelled: the finished chunks stay, the fail-closed reset keeps them
+//! decode  ─► one row per step (RowKind::Decode)
+//! save    ─► history = the sequence's tokens, a Turn ladder entry
+//! end     ─► store lease released (end_turn) when the cancel flag is cleared
+//! ```
+//!
+//! The admission picks the context and the prefill chunk at load; every turn
+//! re-admits at its start and holds a wired lease bounded by it.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
+use std::cell::Cell;
+use std::ops::Range;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
+
+use napi::{Error, Result};
+use napi_derive::napi;
+
+use super::finalize::{self, Hy4Tags};
+use super::ladder::{Kind, Ladder};
+use super::model::Session;
+use super::moe::RowKind;
+use super::prefill::{Driver, Grid, Plan, Prefilled, Runner, Seq};
+use super::stats::{self, Counters, Line};
+use super::store::{Options, Store};
+use crate::array::MxArray;
+use crate::engine::backend::{
+    ChatBackend, DecodeStep, FinalizeArgs, ResetScope, SaveStateArgs, TurnSetup,
+};
+use crate::engine::model_command::{ModelCommand, handle_model_command};
+use crate::engine::params::{
+    ChatParams, ModelGenerationDefaults, ThinkingPolicy, apply_generation_defaults,
+    extract_chat_params,
+};
+use crate::engine::types::{ChatConfig, ChatResult};
+use crate::model_thread::{LoopControl, ModelThread};
+use crate::models::deepseek_v41::chat::{gguf_tokenizer, shard_paths};
+use crate::moe_stream::budget::Admission;
+use crate::stream::{Stream, StreamContext};
+use crate::tokenizer::Qwen3Tokenizer;
+
+pub const LABEL: &str = "HyV4Flash";
+/// `<｜hy_end｜>`: the only stop id (`generation_config.json` `eos_token_id`).
+pub const EOS: u32 = 120_025;
+/// `<｜hy_start｜>`, the opening of every turn.
+pub const HY_START: u32 = 120_000;
+/// Deepest MTP draft a request may ask for.
+pub const MTP_DEPTH_MAX: usize = 3;
+pub const TEMPERATURE: f64 = 0.9;
+pub const TOP_P: f64 = 1.0;
+/// The engine's fail-closed arms key on this exact reason.
+pub const PREFILL_CANCELLED: &str = "prefill cancelled";
+
+fn bad(msg: impl std::fmt::Display) -> Error {
+    Error::from_reason(format!("hy_v4_flash: {msg}"))
+}
+
+/// `generation_config.json`: sampled at T 0.9, top_p 1.0, no top_k.
+pub fn generation_defaults() -> ModelGenerationDefaults {
+    ModelGenerationDefaults {
+        temperature: Some(TEMPERATURE),
+        top_p: Some(TOP_P),
+        do_sample: Some(true),
+        ..ModelGenerationDefaults::default()
+    }
+}
+
+/// The request over the model defaults; MTP depth at most `MTP_DEPTH_MAX`,
+/// never adaptive.
+pub(crate) fn resolve(config: &ChatConfig, defaults: &ModelGenerationDefaults) -> ChatParams {
+    let mut config = config.clone();
+    apply_generation_defaults(&mut config, defaults);
+    let mut params = extract_chat_params(&config);
+    params.mtp_depth = params.mtp_depth.min(MTP_DEPTH_MAX);
+    params.mtp_adaptive_depth = false;
+    params
+}
+
+/// The GGUF's `tokenizer.ggml.eos_token_id` must be `EOS`.
+pub fn check_eos(gguf_eos: u32) -> Result<u32> {
+    if gguf_eos != EOS {
+        return Err(bad(format!(
+            "tokenizer.ggml.eos_token_id is {gguf_eos}, expected {EOS}"
+        )));
+    }
+    Ok(EOS)
+}
+
+/// Ids of `<｜hy_start｜>assistant`: the assistant opening the replay row
+/// sits before.
+pub fn assistant_open(tok: &Qwen3Tokenizer) -> Result<Vec<u32>> {
+    let start = tok
+        .id_to_token(HY_START)
+        .filter(|t| t.starts_with("<｜hy_start") && t.ends_with("｜>"))
+        .ok_or_else(|| bad(format!("token {HY_START} is not <｜hy_start｜>")))?;
+    let ids = tok.encode_sync(&format!("{start}assistant"), Some(false))?;
+    match ids.first() {
+        Some(&HY_START) if ids.len() > 1 => Ok(ids),
+        _ => Err(bad(format!("{start}assistant encodes as {ids:?}"))),
+    }
+}
+
+/// One conversation's sequence, its RAM ladder, the saved history and the
+/// reuse plan `verify` made for the next prefill.
+pub struct Conv<S: Seq> {
+    seq: S,
+    ladder: Ladder<S::Snap>,
+    saved: Vec<u32>,
+    plan: Cell<Option<Plan>>,
+    /// A cancelled prefill left the sequence at a chunk end: the reset that
+    /// follows inside the same turn keeps it.
+    kept: bool,
+}
+
+impl<S: Seq> Conv<S> {
+    pub fn new(seq: S) -> Self {
+        Self {
+            seq,
+            ladder: Ladder::new(),
+            saved: Vec::new(),
+            plan: Cell::new(None),
+            kept: false,
+        }
+    }
+
+    pub fn seq(&self) -> &S {
+        &self.seq
+    }
+
+    pub fn seq_mut(&mut self) -> &mut S {
+        &mut self.seq
+    }
+
+    pub fn ladder(&self) -> &Ladder<S::Snap> {
+        &self.ladder
+    }
+
+    /// The committed history (`cached_token_history`).
+    pub fn history(&self) -> &[u32] {
+        &self.saved
+    }
+
+    pub fn kept(&self) -> bool {
+        self.kept
+    }
+
+    /// Starts over on `seq`: nothing is kept.
+    pub fn replace(&mut self, seq: S) {
+        *self = Self::new(seq);
+    }
+
+    /// Rows of `tokens` the next prefill does not run again (`reuse` false:
+    /// none); always below `tokens.len()`.
+    pub fn verify<R: Runner<S>>(
+        &self,
+        runner: &R,
+        grid: &Grid,
+        tokens: &[u32],
+        reuse: bool,
+    ) -> usize {
+        let driver = Driver {
+            runner,
+            grid,
+            hidden: false,
+        };
+        let plan = driver.plan(&self.seq, &self.ladder, tokens, reuse);
+        let rows = plan.reuse();
+        self.plan.set(Some(plan));
+        rows
+    }
+
+    /// Runs `tokens` (the prompt past the verified rows, or past the
+    /// sequence) in chunks. A cancel keeps the finished chunks and fails
+    /// with `PREFILL_CANCELLED`. `on_chunk` sees each finished chunk's rows.
+    pub fn prefill<R: Runner<S>>(
+        &mut self,
+        runner: &R,
+        grid: &Grid,
+        tokens: &[u32],
+        cancel: &dyn Fn(usize) -> bool,
+        on_chunk: &mut dyn FnMut(Range<usize>),
+    ) -> Result<R::Out> {
+        let driver = Driver {
+            runner,
+            grid,
+            hidden: false,
+        };
+        let plan = self.plan.take();
+        self.kept = false;
+        self.saved.clear();
+        let out = driver.prefill(
+            &mut self.seq,
+            &mut self.ladder,
+            plan,
+            tokens,
+            cancel,
+            &mut |rows: Range<usize>, _: &R::Out| {
+                on_chunk(rows);
+                Ok(())
+            },
+        );
+        match out {
+            Ok(Prefilled::Done { out, .. }) => Ok(out),
+            Ok(Prefilled::Cancelled { .. }) => {
+                self.kept = true;
+                Err(Error::from_reason(PREFILL_CANCELLED))
+            }
+            Err(_) if cancel(0) => Err(Error::from_reason(PREFILL_CANCELLED)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// End of a turn: with `reuse` the sequence is the history and gets a
+    /// Turn entry; without, the conversation is dropped.
+    pub fn save(&mut self, reuse: bool) -> Result<()> {
+        self.kept = false;
+        self.plan.set(None);
+        if !reuse {
+            return self.clear();
+        }
+        self.saved.clear();
+        self.saved.extend_from_slice(self.seq.tokens());
+        if !self.seq.is_empty() {
+            self.ladder.put(Kind::Turn, self.seq.snap());
+        }
+        Ok(())
+    }
+
+    /// `PrefixMiss` drops the history only (the prefill settles the
+    /// sequence); `Command` drops everything, except the chunks a cancelled
+    /// prefill of this turn kept.
+    pub(crate) fn reset(&mut self, scope: ResetScope) -> Result<()> {
+        self.saved.clear();
+        match scope {
+            ResetScope::PrefixMiss => Ok(()),
+            ResetScope::Command if self.kept => {
+                self.kept = false;
+                self.plan.set(None);
+                Ok(())
+            }
+            ResetScope::Command => {
+                self.plan.set(None);
+                self.clear()
+            }
+        }
+    }
+
+    /// The turn is over: a later reset drops everything.
+    pub fn turn_over(&mut self) {
+        self.kept = false;
+    }
+
+    fn clear(&mut self) -> Result<()> {
+        self.saved.clear();
+        self.ladder.clear();
+        self.seq.truncate(0)
+    }
+}
+
+/// Admission and bank state as of the last turn edge (host values only).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Residency {
+    pub admission: Option<Admission>,
+    pub cache_slots: [usize; 2],
+    /// Bank pages resident after the last turn made the bank volatile: a
+    /// second live wired lease (another model's turn) keeps them wired.
+    pub bank_resident: u64,
+    pub switches: u32,
+    pub in_turn: bool,
+    /// The last saved turn: its rendered prompt ids and generated ids.
+    pub turn_ids: Option<(Vec<u32>, Vec<u32>)>,
+}
+
+/// One turn's clocks and counters for the `MLX_HY4_STATS` lines.
+struct TurnStats {
+    t0: Instant,
+    c0: Counters,
+    swap0: Option<u64>,
+    level_min: Option<u64>,
+    prompt: usize,
+    ttft_s: f64,
+    decode_s: Vec<f64>,
+}
+
+pub(crate) struct Inner {
+    pub(crate) store: Store,
+    conv: Conv<Session>,
+    grid: Grid,
+    tokenizer: Arc<Qwen3Tokenizer>,
+    tags: Hy4Tags,
+    defaults: ModelGenerationDefaults,
+    cancel: Option<Arc<AtomicBool>>,
+    in_turn: bool,
+    residency: Arc<Mutex<Residency>>,
+    turn_stats: Option<TurnStats>,
+}
+
+impl Inner {
+    /// Every shard of `path`, the admission from the environment, one lane.
+    pub(crate) fn load(
+        path: &Path,
+        max_context: Option<usize>,
+        residency: Arc<Mutex<Residency>>,
+    ) -> Result<Self> {
+        let paths = shard_paths(path)?;
+        let (tokenizer, eos) = gguf_tokenizer(&paths[0])?;
+        check_eos(eos)?;
+        let store = Store::open(&paths, &Options::from_env(max_context, true)?)?;
+        Self::new(store, tokenizer, residency)
+    }
+
+    pub(crate) fn new(
+        store: Store,
+        tokenizer: Qwen3Tokenizer,
+        residency: Arc<Mutex<Residency>>,
+    ) -> Result<Self> {
+        let tags = Hy4Tags::from_tokenizer(&tokenizer)?;
+        let grid = Grid::new(store.chunk, assistant_open(&tokenizer)?)?;
+        let sess = store.model.new_session(store.ctx)?;
+        let mut inner = Self {
+            store,
+            conv: Conv::new(sess),
+            grid,
+            tokenizer: Arc::new(tokenizer),
+            tags,
+            defaults: generation_defaults(),
+            cancel: None,
+            in_turn: false,
+            residency,
+            turn_stats: None,
+        };
+        inner.publish(None);
+        Ok(inner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn conv(&self) -> &Conv<Session> {
+        &self.conv
+    }
+
+    /// The last saved turn's (prompt ids, generated ids).
+    #[cfg(test)]
+    pub(crate) fn turn_ids(&self) -> Option<(Vec<u32>, Vec<u32>)> {
+        self.residency().turn_ids.clone()
+    }
+
+    fn residency(&self) -> std::sync::MutexGuard<'_, Residency> {
+        self.residency
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn publish(&mut self, bank_resident: Option<u64>) {
+        let admission = self.store.admission();
+        let switches = self.store.lease.switches().len() as u32;
+        let cache_slots = self.store.cache_slots();
+        let in_turn = self.in_turn;
+        let mut r = self.residency();
+        r.admission = admission;
+        r.switches = switches;
+        r.cache_slots = cache_slots;
+        r.in_turn = in_turn;
+        if let Some(b) = bank_resident {
+            r.bank_resident = b;
+        }
+    }
+
+    fn begin(&mut self) -> Result<()> {
+        if !self.in_turn {
+            self.store.begin_turn(self.conv.seq().nbytes() as u64)?;
+            self.in_turn = true;
+            self.publish(None);
+        }
+        Ok(())
+    }
+
+    fn end(&mut self) {
+        if !self.in_turn {
+            return;
+        }
+        self.in_turn = false;
+        {
+            let _ctx = StreamContext::new(Stream::generation());
+            if let Err(e) = self.store.end_turn() {
+                tracing::warn!("hy_v4_flash end of turn: {e}");
+            }
+        }
+        let resident = self.store.bank.resident_bytes().unwrap_or(0);
+        self.publish(Some(resident));
+    }
+
+    /// A new empty sequence in place of the conversation.
+    fn fresh(&mut self, why: &Error) {
+        tracing::warn!("hy_v4_flash: {}; starting a new sequence", why.reason);
+        match self.store.model.new_session(self.store.ctx) {
+            Ok(s) => self.conv.replace(s),
+            Err(e) => tracing::warn!("hy_v4_flash new sequence: {}", e.reason),
+        }
+    }
+
+    fn start_stats(&mut self, prompt: usize) {
+        self.turn_stats = std::env::var_os(stats::STATS_ENV).map(|_| TurnStats {
+            t0: Instant::now(),
+            c0: Counters::now(&self.store.bank, &self.store.table),
+            swap0: stats::host_pressure().1,
+            level_min: None,
+            prompt,
+            ttft_s: 0.0,
+            decode_s: Vec::new(),
+        });
+    }
+
+    /// With `MLX_HY4_STATS` set: evaluates the call's logits (timing) and
+    /// appends one stats line for the turn so far.
+    fn emit_stats(&mut self, logits: &MxArray, prefill: bool, t_call: Instant) {
+        let Some(ts) = self.turn_stats.as_mut() else {
+            return;
+        };
+        logits.eval();
+        if prefill {
+            ts.ttft_s = ts.t0.elapsed().as_secs_f64();
+        } else {
+            ts.decode_s.push(t_call.elapsed().as_secs_f64());
+        }
+        let (lvl, swap) = stats::host_pressure();
+        ts.level_min = match (ts.level_min, lvl) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let (_, peak, _) = stats::rusage();
+        let line = Line {
+            stage: "chat",
+            prompt_tok: ts.prompt,
+            gen_tok: 1 + ts.decode_s.len(),
+            ttft_s: ts.ttft_s,
+            decode_s: &ts.decode_s,
+            counters: Counters::now(&self.store.bank, &self.store.table).since(&ts.c0),
+            wall_s: ts.t0.elapsed().as_secs_f64(),
+            cache_slots: self.store.cache_slots(),
+            ctx: self.store.ctx,
+            chunk: self.grid.chunk(),
+            peak_footprint: peak,
+            mlx_cache_bytes: crate::array::get_cache_memory(),
+            swapout_delta: swap.zip(ts.swap0).map_or(0, |(a, b)| a as i64 - b as i64),
+            memstatus_min: ts.level_min,
+        };
+        if let Err(e) = stats::emit(&line.json()) {
+            tracing::warn!("hy_v4_flash stats: {e}");
+        }
+    }
+}
+
+pub(crate) struct Step<'a>(&'a mut Inner);
+
+impl DecodeStep for Step<'_> {
+    fn forward(&mut self, ids: &MxArray) -> Result<(MxArray, bool)> {
+        let token = ids.item_at_int32(0)? as u32;
+        self.forward_with_token(ids, token)
+    }
+
+    fn forward_with_token(&mut self, _ids: &MxArray, token: u32) -> Result<(MxArray, bool)> {
+        let t = Instant::now();
+        let inner = &mut *self.0;
+        let logits = inner.store.model.forward_last(
+            inner.conv.seq_mut(),
+            &[token],
+            RowKind::Decode,
+            None,
+        )?;
+        inner.emit_stats(&logits, false, t);
+        Ok((logits, false))
+    }
+}
+
+impl ChatBackend for Inner {
+    fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
+        Ok(Arc::clone(&self.tokenizer))
+    }
+
+    fn family_name(&self) -> &'static str {
+        "hy_v4_flash"
+    }
+
+    fn session_eos_id(&self, _tok: &Qwen3Tokenizer) -> Result<u32> {
+        Ok(EOS)
+    }
+
+    fn policy(&self) -> ThinkingPolicy {
+        ThinkingPolicy::TemplateHonoring
+    }
+
+    fn generation_defaults(&self) -> Option<&ModelGenerationDefaults> {
+        Some(&self.defaults)
+    }
+
+    fn resolve_params(&self, config: &ChatConfig) -> ChatParams {
+        resolve(config, &self.defaults)
+    }
+
+    fn cached_token_history(&self) -> &[u32] {
+        self.conv.history()
+    }
+
+    fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
+        finalize::finalize(args, &self.tags)
+    }
+
+    fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
+        if let Err(e) = self.conv.reset(scope) {
+            self.fresh(&e);
+        }
+        Ok(())
+    }
+
+    /// The longest prefix the sequence or a ladder entry still holds, below
+    /// the prompt's end; the prefill takes the plan made here.
+    fn verify_cache_prefix(&self, tokens: &[u32], reuse: bool) -> usize {
+        self.conv
+            .verify(&self.store.model, &self.grid, tokens, reuse)
+    }
+
+    fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
+        self.residency().turn_ids =
+            Some((args.save_tokens.to_vec(), args.generated_tokens.to_vec()));
+        if let Err(e) = self.conv.save(args.reuse_cache) {
+            self.fresh(&e);
+        }
+    }
+
+    fn eval_caches(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// The admitted context: `Model::forward` refuses past it.
+    fn context_token_limit(&self) -> Option<usize> {
+        Some(self.store.ctx)
+    }
+
+    /// `None`: the store holds a lease bounded by the admission instead
+    /// (`fixed + cache`, taken in `Store::begin_turn`).
+    fn wired_limit_bytes(&self) -> Option<usize> {
+        None
+    }
+
+    fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        let ending = flag.is_none();
+        self.cancel = flag;
+        if ending {
+            self.end();
+            self.conv.turn_over();
+        }
+    }
+
+    fn prefill(&mut self, tokens: &[u32], stream: Stream) -> Result<MxArray> {
+        self.start_stats(tokens.len());
+        let t0 = Instant::now();
+        self.begin()?;
+        let _ctx = StreamContext::new(stream);
+        let flag = self.cancel.clone();
+        let cancel = move |_: usize| flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed));
+        let total = tokens.len();
+        let mut ran = 0usize;
+        let mut on_chunk = |rows: Range<usize>| {
+            ran += rows.len();
+            let done = u32::try_from(ran.min(total)).unwrap_or(u32::MAX);
+            crate::engine::progress::with_turn_progress(|p| p.prefill_advanced(done));
+        };
+        let out = self.conv.prefill(
+            &self.store.model,
+            &self.grid,
+            tokens,
+            &cancel,
+            &mut on_chunk,
+        )?;
+        let logits = out
+            .logits
+            .ok_or_else(|| bad("the prefill returned no logits"))?;
+        self.emit_stats(&logits, true, t0);
+        Ok(logits)
+    }
+
+    type Decode<'a>
+        = Step<'a>
+    where
+        Self: 'a;
+
+    fn begin_decode(&mut self, _turn: &TurnSetup<'_>) -> Result<Step<'_>> {
+        Ok(Step(self))
+    }
+}
+
+#[napi(object)]
+#[derive(Default)]
+pub struct HyV4FlashLoadOptions {
+    /// Context token limit (`--max-context`): the admission budgets for at
+    /// most this many tokens (and at most 262,144).
+    pub max_context_tokens: Option<i64>,
+}
+
+/// The last saved turn of the session (prompt and output ids).
+#[napi(object)]
+pub struct HyV4FlashTurnTokenIds {
+    /// The rendered prompt the turn was given (whole conversation).
+    pub prompt_ids: Vec<u32>,
+    /// The generated ids, the stop token included when one ended the turn.
+    pub output_ids: Vec<u32>,
+}
+
+#[napi(object)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HyV4FlashContextLimits {
+    /// The context the load's admission budgets for.
+    pub effective_window_tokens: u32,
+    pub trained_window_tokens: u32,
+    /// Rows of one prefill chunk.
+    pub prefill_chunk_tokens: u32,
+}
+
+/// The load-time and latest per-turn admission, and the expert bank.
+#[napi(object)]
+pub struct HyV4FlashResidencyInfo {
+    pub dense_bytes: f64,
+    pub physical_bytes: Option<f64>,
+    /// Other processes' (and other models') bytes at the last admission.
+    pub others_bytes: Option<f64>,
+    /// Fixed working set: dense, staging, KV and compute at the context
+    /// limit, I/O buffers, driver and MLX pool reserves.
+    pub fixed_bytes: Option<f64>,
+    /// Expert cache slots of both classes.
+    pub expert_cache_slots: u32,
+    /// Expert cache slots per class (Q6_K down, Q4_K down).
+    pub expert_cache_slots_by_class: Vec<u32>,
+    pub expert_cache_bytes: Option<f64>,
+    pub staging_layers: Option<u32>,
+    /// Bounded wired-limit request of each turn (`fixed + cache`).
+    pub wired_limit_bytes: Option<f64>,
+    /// Bank pages still resident after the last turn made the bank volatile;
+    /// non-zero while another live wired lease keeps them wired.
+    pub bank_resident_after_turn_bytes: f64,
+    pub bank_switches: u32,
+    pub in_turn: bool,
+}
+
+/// Hy4-flash (GGUF `hy_v4_flash`) with SSD-streamed routed experts:
+/// text-only chat, one sequence at a time, on one owned model thread.
+#[napi]
+pub struct HyV4FlashModel {
+    thread: ModelThread<ModelCommand>,
+    limits: HyV4FlashContextLimits,
+    dense_bytes: u64,
+    residency: Arc<Mutex<Residency>>,
+}
+
+#[napi]
+impl HyV4FlashModel {
+    /// `model_path`: any shard of the split GGUF, its directory, or a
+    /// single-file GGUF.
+    #[napi]
+    pub async fn load(model_path: String, options: Option<HyV4FlashLoadOptions>) -> Result<Self> {
+        let options = options.unwrap_or_default();
+        let max_context =
+            crate::nn::rope_scaling::max_context_option(LABEL, options.max_context_tokens)?
+                .map(|t| t as usize);
+        let residency = Arc::new(Mutex::new(Residency::default()));
+        let shared = Arc::clone(&residency);
+        let (thread, ready) = ModelThread::spawn_with_scheduler(
+            move || {
+                let inner = Inner::load(Path::new(&model_path), max_context, shared)?;
+                let s = &inner.store;
+                let limits = HyV4FlashContextLimits {
+                    effective_window_tokens: u32::try_from(s.ctx).unwrap_or(u32::MAX),
+                    trained_window_tokens: u32::try_from(s.model.cfg().context_length)
+                        .unwrap_or(u32::MAX),
+                    prefill_chunk_tokens: u32::try_from(s.chunk).unwrap_or(u32::MAX),
+                };
+                let dense = s.dense_bytes;
+                Ok((inner, (limits, dense)))
+            },
+            |inner: &mut Inner, rx| match rx.blocking_recv() {
+                Some(cmd) => {
+                    handle_model_command(inner, cmd);
+                    LoopControl::Continue
+                }
+                None => LoopControl::Break,
+            },
+        );
+        let (limits, dense) = ready
+            .await
+            .map_err(|e| Error::from_reason(e.to_string()))??;
+        Ok(Self {
+            thread,
+            limits,
+            dense_bytes: dense,
+            residency,
+        })
+    }
+
+    /// Frees the weights, the bank and the sequence now: the model thread
+    /// drops them and exits; every later call fails.
+    #[napi]
+    pub async fn dispose(&self) -> Result<()> {
+        self.thread.dispose().await
+    }
+
+    #[napi]
+    pub fn context_limits(&self) -> HyV4FlashContextLimits {
+        self.limits.clone()
+    }
+
+    #[napi]
+    pub fn max_concurrent_sequences(&self) -> u32 {
+        1
+    }
+
+    #[napi]
+    pub fn has_block_paged_cache(&self) -> bool {
+        false
+    }
+
+    /// Prompt and generated ids of the last completed turn, if any.
+    #[napi]
+    pub fn last_turn_token_ids(&self) -> Option<HyV4FlashTurnTokenIds> {
+        let r = self
+            .residency
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        r.turn_ids.as_ref().map(|(p, o)| HyV4FlashTurnTokenIds {
+            prompt_ids: p.clone(),
+            output_ids: o.clone(),
+        })
+    }
+
+    #[napi]
+    pub fn residency_info(&self) -> HyV4FlashResidencyInfo {
+        let r = self
+            .residency
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let a = r.admission;
+        let slots = r.cache_slots;
+        HyV4FlashResidencyInfo {
+            dense_bytes: self.dense_bytes as f64,
+            physical_bytes: a.map(|a| a.physical as f64),
+            others_bytes: a.map(|a| a.others as f64),
+            fixed_bytes: a.map(|a| a.fixed as f64),
+            expert_cache_slots: u32::try_from(slots[0] + slots[1]).unwrap_or(u32::MAX),
+            expert_cache_slots_by_class: slots
+                .iter()
+                .map(|&n| u32::try_from(n).unwrap_or(u32::MAX))
+                .collect(),
+            expert_cache_bytes: a.map(|a| a.cache_bytes() as f64),
+            staging_layers: a.map(|a| a.staging_layers as u32),
+            wired_limit_bytes: a.map(|a| a.wired_limit() as f64),
+            bank_resident_after_turn_bytes: r.bank_resident as f64,
+            bank_switches: r.switches,
+            in_turn: r.in_turn,
+        }
+    }
+}
+
+crate::models::chat_napi::chat_napi_surface! {
+    class: HyV4FlashModel,
+    thread_cmd: crate::engine::model_command::ModelCommand,
+    thread: direct,
+    image_guard: text_only,
+    ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+    ts_stream_continue_tool: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+}
