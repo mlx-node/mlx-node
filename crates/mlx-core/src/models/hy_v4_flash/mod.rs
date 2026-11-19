@@ -16,12 +16,15 @@ pub mod indexer;
 pub mod ladder;
 pub mod model;
 pub mod moe;
+pub mod mtp;
+pub mod mtp_weights;
 pub mod ops;
 pub mod paged;
 pub mod prefill;
 pub mod rows;
 pub mod scan;
 pub mod sparse;
+pub mod spec;
 pub mod stats;
 pub mod store;
 pub mod weights;
@@ -32,6 +35,8 @@ mod tests_chat;
 mod tests_config;
 #[cfg(test)]
 mod tests_model;
+#[cfg(test)]
+mod tests_mtp;
 #[cfg(test)]
 mod tests_paged;
 #[cfg(all(test, target_os = "macos"))]

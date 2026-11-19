@@ -4,7 +4,8 @@
 //! verify  ─► Conv::verify: longest reusable prefix (sequence cut │ ladder entry) ─► plan
 //! prefill ─► store lease (begin_turn) ─► Driver chunks on the grid ─► last-row logits
 //!            cancelled: the finished chunks stay, the fail-closed reset keeps them
-//! decode  ─► one row per step (RowKind::Decode)
+//! decode  ─► one row per step (RowKind::Decode), or an MTP turn (`spec.rs`)
+//!            with the MTP layer, each trunk row closes the draft row before it
 //! save    ─► history = the sequence's tokens, a Turn ladder entry
 //! end     ─► store lease released (end_turn) when the cancel flag is cleared
 //! ```
@@ -25,20 +26,22 @@ use napi_derive::napi;
 
 use super::finalize::{self, Hy4Tags};
 use super::ladder::{Kind, Ladder};
-use super::model::Session;
-use super::moe::RowKind;
+use super::mtp::{LagRunner, Lagged, MtpLayer};
 use super::prefill::{Driver, Grid, Plan, Prefilled, Runner, Seq};
+use super::spec;
 use super::stats::{self, Counters, Line};
 use super::store::{Options, Store};
 use crate::array::MxArray;
 use crate::engine::backend::{
-    ChatBackend, DecodeStep, FinalizeArgs, ResetScope, SaveStateArgs, TurnSetup,
+    ChatBackend, DecodeStep, FinalizeArgs, MtpBackend, MtpTurnSetup, ResetScope, SaveStateArgs,
+    TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::model_command::{ModelCommand, handle_model_command};
 use crate::engine::params::{
     ChatParams, ModelGenerationDefaults, ThinkingPolicy, apply_generation_defaults,
     extract_chat_params,
 };
+use crate::engine::plan::ExecutionPlan;
 use crate::engine::types::{ChatConfig, ChatResult};
 use crate::model_thread::{LoopControl, ModelThread};
 use crate::models::deepseek_v41::chat::{gguf_tokenizer, shard_paths};
@@ -291,7 +294,8 @@ struct TurnStats {
 
 pub(crate) struct Inner {
     pub(crate) store: Store,
-    conv: Conv<Session>,
+    mtp: Option<MtpLayer>,
+    conv: Conv<Lagged>,
     grid: Grid,
     tokenizer: Arc<Qwen3Tokenizer>,
     tags: Hy4Tags,
@@ -312,21 +316,30 @@ impl Inner {
         let paths = shard_paths(path)?;
         let (tokenizer, eos) = gguf_tokenizer(&paths[0])?;
         check_eos(eos)?;
-        let store = Store::open(&paths, &Options::from_env(max_context, true)?)?;
-        Self::new(store, tokenizer, residency)
+        let mut store = Store::open(&paths, &Options::from_env(max_context, true)?)?;
+        let mtp = if store.mtp {
+            let m = MtpLayer::load(&paths, &store.model)?;
+            store.dense_bytes += m.bytes();
+            Some(m)
+        } else {
+            None
+        };
+        Self::new(store, mtp, tokenizer, residency)
     }
 
     pub(crate) fn new(
         store: Store,
+        mtp: Option<MtpLayer>,
         tokenizer: Qwen3Tokenizer,
         residency: Arc<Mutex<Residency>>,
     ) -> Result<Self> {
         let tags = Hy4Tags::from_tokenizer(&tokenizer)?;
         let grid = Grid::new(store.chunk, assistant_open(&tokenizer)?)?;
-        let sess = store.model.new_session(store.ctx)?;
+        let seq = new_seq(&store, mtp.as_ref())?;
         let mut inner = Self {
             store,
-            conv: Conv::new(sess),
+            mtp,
+            conv: Conv::new(seq),
             grid,
             tokenizer: Arc::new(tokenizer),
             tags,
@@ -341,7 +354,7 @@ impl Inner {
     }
 
     #[cfg(test)]
-    pub(crate) fn conv(&self) -> &Conv<Session> {
+    pub(crate) fn conv(&self) -> &Conv<Lagged> {
         &self.conv
     }
 
@@ -399,7 +412,7 @@ impl Inner {
     /// A new empty sequence in place of the conversation.
     fn fresh(&mut self, why: &Error) {
         tracing::warn!("hy_v4_flash: {}; starting a new sequence", why.reason);
-        match self.store.model.new_session(self.store.ctx) {
+        match new_seq(&self.store, self.mtp.as_ref()) {
             Ok(s) => self.conv.replace(s),
             Err(e) => tracing::warn!("hy_v4_flash new sequence: {}", e.reason),
         }
@@ -468,12 +481,11 @@ impl DecodeStep for Step<'_> {
     fn forward_with_token(&mut self, _ids: &MxArray, token: u32) -> Result<(MxArray, bool)> {
         let t = Instant::now();
         let inner = &mut *self.0;
-        let logits = inner.store.model.forward_last(
-            inner.conv.seq_mut(),
-            &[token],
-            RowKind::Decode,
-            None,
-        )?;
+        let (logits, _) =
+            inner
+                .conv
+                .seq_mut()
+                .step(&inner.store.model, inner.mtp.as_ref(), token)?;
         inner.emit_stats(&logits, false, t);
         Ok((logits, false))
     }
@@ -500,8 +512,13 @@ impl ChatBackend for Inner {
         Some(&self.defaults)
     }
 
+    /// MTP is on unless the request turns it off.
     fn resolve_params(&self, config: &ChatConfig) -> ChatParams {
-        resolve(config, &self.defaults)
+        let mut p = resolve(config, &self.defaults);
+        if config.enable_mtp.is_none() {
+            p.enable_mtp = self.mtp.is_some();
+        }
+        p
     }
 
     fn cached_token_history(&self) -> &[u32] {
@@ -522,14 +539,22 @@ impl ChatBackend for Inner {
     /// The longest prefix the sequence or a ladder entry still holds, below
     /// the prompt's end; the prefill takes the plan made here.
     fn verify_cache_prefix(&self, tokens: &[u32], reuse: bool) -> usize {
-        self.conv
-            .verify(&self.store.model, &self.grid, tokens, reuse)
+        let runner = LagRunner {
+            model: &self.store.model,
+            mtp: self.mtp.as_ref(),
+        };
+        self.conv.verify(&runner, &self.grid, tokens, reuse)
     }
 
     fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
         self.residency().turn_ids =
             Some((args.save_tokens.to_vec(), args.generated_tokens.to_vec()));
-        if let Err(e) = self.conv.save(args.reuse_cache) {
+        let saved = self
+            .conv
+            .seq_mut()
+            .settle()
+            .and_then(|()| self.conv.save(args.reuse_cache));
+        if let Err(e) = saved {
             self.fresh(&e);
         }
     }
@@ -572,13 +597,13 @@ impl ChatBackend for Inner {
             let done = u32::try_from(ran.min(total)).unwrap_or(u32::MAX);
             crate::engine::progress::with_turn_progress(|p| p.prefill_advanced(done));
         };
-        let out = self.conv.prefill(
-            &self.store.model,
-            &self.grid,
-            tokens,
-            &cancel,
-            &mut on_chunk,
-        )?;
+        let runner = LagRunner {
+            model: &self.store.model,
+            mtp: self.mtp.as_ref(),
+        };
+        let out = self
+            .conv
+            .prefill(&runner, &self.grid, tokens, &cancel, &mut on_chunk)?;
         let logits = out
             .logits
             .ok_or_else(|| bad("the prefill returned no logits"))?;
@@ -594,6 +619,39 @@ impl ChatBackend for Inner {
     fn begin_decode(&mut self, _turn: &TurnSetup<'_>) -> Result<Step<'_>> {
         Ok(Step(self))
     }
+
+    fn execution_plan(&self) -> ExecutionPlan {
+        ExecutionPlan {
+            speculative: self.mtp.as_ref().map(|_| spec::PLAN),
+            ..ExecutionPlan::TEXT_ONLY
+        }
+    }
+
+    fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        spec::run_turn(self, args)
+    }
+}
+
+impl MtpBackend for Inner {
+    type MtpDecode<'a>
+        = spec::Stepper<'a>
+    where
+        Self: 'a;
+
+    fn begin_mtp_decode(&mut self, _setup: &MtpTurnSetup<'_>) -> Result<spec::Stepper<'_>> {
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| bad("an MTP turn without the MTP layer"))?;
+        spec::Stepper::begin(&self.store.model, mtp, self.conv.seq_mut())
+    }
+}
+
+/// An empty sequence of the admitted context, with a draft when the MTP
+/// layer is loaded.
+fn new_seq(store: &Store, mtp: Option<&MtpLayer>) -> Result<Lagged> {
+    let trunk = store.model.new_session(store.ctx)?;
+    Ok(Lagged::new(trunk, mtp.map(|m| m.new_draft(store.ctx))))
 }
 
 #[napi(object)]
