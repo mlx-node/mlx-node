@@ -299,6 +299,11 @@ fn real_two_owners_in_one_wave_equal_alone() {
         let logits = inner
             .paged_prefill(&p[cached..], &prefix, Stream::generation())
             .unwrap();
+        assert_eq!(
+            logits.ndim().unwrap(),
+            1,
+            "paged_prefill logits are [vocab]"
+        );
         greedy(&logits.reshape(&[1, 1, -1]).unwrap())[0]
     };
     let mut alone = Vec::new();

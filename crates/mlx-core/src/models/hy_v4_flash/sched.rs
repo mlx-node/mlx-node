@@ -1285,8 +1285,8 @@ impl Inner {
     }
 
     /// Prefill of `tokens` at the end of `seq`'s cell, in chunks ending at
-    /// its turn's grid ends; the last chunk's last-row logits with
-    /// `logits`. A cancel fails with `PREFILL_CANCELLED`.
+    /// its turn's grid ends; the last chunk's last-row logits `[vocab]`
+    /// with `logits`. A cancel fails with `PREFILL_CANCELLED`.
     fn prefill_rows(
         &mut self,
         seq: SeqId,
@@ -1343,7 +1343,7 @@ impl Inner {
             out = outs.into_iter().next().and_then(|o| o.logits);
             from = end;
         }
-        Ok(out)
+        out.map(|l| l.reshape(&[-1])).transpose()
     }
 
     /// At a prompt state row of a publishing turn: registers `seq`'s blocks
