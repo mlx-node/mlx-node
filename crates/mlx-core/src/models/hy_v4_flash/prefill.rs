@@ -59,6 +59,9 @@ pub trait Seq {
 
     /// Goes back to `s`; refused when its rows were rewritten since.
     fn restore(&mut self, s: &Self::Snap) -> Result<()>;
+
+    /// Whether `restore(s)` would succeed.
+    fn can_restore(&self, s: &Self::Snap) -> bool;
 }
 
 /// Runs prefill chunks on a `Seq`.
@@ -110,6 +113,10 @@ impl Seq for Session {
 
     fn restore(&mut self, s: &Mark) -> Result<()> {
         Session::restore(self, s)
+    }
+
+    fn can_restore(&self, s: &Mark) -> bool {
+        Session::can_restore(self, s)
     }
 }
 
@@ -403,7 +410,8 @@ impl<R> Driver<'_, R> {
         } else {
             0
         };
-        direct.max(ladder.deepest(limit, seq.len()).unwrap_or(0))
+        let restorable = ladder.deepest_where(limit, seq.len(), |s| seq.can_restore(s));
+        direct.max(restorable.unwrap_or(0))
     }
 
     /// Runs `tokens` (the prompt past `plan`'s reuse point, or past the

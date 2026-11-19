@@ -133,6 +133,21 @@ impl<S: Snapshot> Ladder<S> {
             .find(|&l| l <= top)
     }
 
+    /// `deepest` among the entries `ok` accepts.
+    pub fn deepest_where(
+        &self,
+        limit: usize,
+        held: usize,
+        ok: impl Fn(&S) -> bool,
+    ) -> Option<usize> {
+        let top = limit.min(held);
+        self.entries
+            .iter()
+            .rev()
+            .find(|e| e.snap.len() <= top && ok(&e.snap))
+            .map(|e| e.snap.len())
+    }
+
     pub fn remove(&mut self, len: usize) {
         if let Ok(i) = self.find(len) {
             self.entries.remove(i);

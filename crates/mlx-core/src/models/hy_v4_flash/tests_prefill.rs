@@ -125,6 +125,14 @@ impl Seq for Fake {
         self.written.truncate(s.len);
         Ok(())
     }
+
+    fn can_restore(&self, s: &Snap) -> bool {
+        let last = s
+            .len
+            .checked_sub(1)
+            .and_then(|i| self.written.get(i).copied());
+        s.len <= self.tokens.len() && last == s.stamp && !self.refuse.contains(&s.len)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -668,8 +676,8 @@ fn reuse_points() {
     assert_eq!(off.reuse(), 0);
 }
 
-/// A promised point refused at prefill falls to a deeper one and runs the
-/// rows between.
+/// A promised point refused at prefill falls to an earlier one and runs
+/// the rows between; points the sequence already refuses are not promised.
 #[test]
 fn a_refused_point_recomputes_from_a_deeper_one() {
     let g = grid(8192);
@@ -694,7 +702,8 @@ fn a_refused_point_recomputes_from_a_deeper_one() {
     seq.push(&[1, 2, 3, 4, 5, 6]);
     let all = FakeRunner::default();
     let pl = plan(&all, &g, &seq, &ladder, &p);
-    let run = prefill(&all, &g, &mut seq, &mut ladder, Some(pl), &tail);
+    assert_eq!(pl.reuse(), 0);
+    let run = prefill(&all, &g, &mut seq, &mut ladder, Some(pl), &p);
     assert_eq!(done_from(&run.out), 0);
     assert_eq!(all.rows().first(), Some(&(0..8192)));
     assert_eq!(seq.tokens, p);

@@ -3465,7 +3465,7 @@
  "notes": [
   "the MTP layer runs per owner (draft rows of one owner), so its shapes do not bind row_cap; mtp_min_limit_info_only lists them under the plan form (BF16 -> affine-8 g32)",
   "gen 13/14 run qmv for every M < limit (affine qmv_wide off): there M = 1 and M = 2 use the same kernel",
-  "an MLX_QMM_SPLITK_MIN_M below 5 gives row_cap < 4: then 4 decode lanes do not fit one wave and the engine loop makes the last lanes wait (P5 decides whether LANES also takes min(row_cap))",
+  "an MLX_QMM_SPLITK_MIN_M below 5 gives row_cap < 4: then 4 decode lanes do not fit one wave and the engine loop makes the last lanes wait (whether LANES also takes min(row_cap) is the scheduler backend's call)",
   "qmv_quad (K 64 / 128) matches no trunk Qmm shape"
  ]
 }

@@ -17,8 +17,9 @@
 //!
 //! Lanes (sequences decoded together) share one KV allowance sized for the
 //! admitted context; each lane past the first is charged its floor
-//! (`lane_floor`). The load admits `min(LANES_MAX, MLX_SCHED_MAX_NUM_SEQS)`
-//! lanes, fewer when only fewer fit. A decode wave holds at most `row_cap`
+//! (`lane_floor`). The context and chunk are picked for one lane; the load
+//! then admits `min(LANES_MAX, MLX_SCHED_MAX_NUM_SEQS)` lanes at them, fewer
+//! when only fewer fit, so lanes never shrink the window or the chunk grid. A decode wave holds at most `row_cap`
 //! rows (`row_cap`), the rows its Q8 matrices take through `qmv_wide`.
 //!
 //! A turn is `begin_turn` .. `end_turn` (`Lease`): the start re-admits at the
@@ -152,6 +153,20 @@ pub fn plan_lanes<T>(want: usize, mut admit: impl FnMut(usize) -> Result<T>) -> 
             }
         }
     }
+}
+
+/// The most lanes up to `want` admitted (`admit(lanes)`) at the context and
+/// chunk of `one`, the one-lane pick.
+pub fn lanes_at(
+    one: Pick,
+    want: usize,
+    mut admit: impl FnMut(usize) -> Result<Admission>,
+) -> (usize, Pick) {
+    plan_lanes(want, |n| match n {
+        1 => Ok(one),
+        _ => admit(n).map(|admission| Pick { admission, ..one }),
+    })
+    .unwrap_or((1, one))
 }
 
 /// MLX's `get_qmv_batch_limit(D, O)` (`backend/metal/quantized.cpp`) on the
@@ -745,17 +760,16 @@ impl Store {
             (Some(l), _) => {
                 let (h, ws) = host_reading()?;
                 // nothing of this model exists yet: every byte in use is others'
-                let (lanes, p) = plan_lanes(opts.lanes, |n| {
-                    pick(
-                        &lane_profile(&one_lane, n, floor),
-                        &base,
-                        max_ctx,
-                        l,
-                        &h,
-                        &Own::default(),
-                        ws,
-                    )
-                })?;
+                let own = Own::default();
+                let one = pick(&one_lane, &base, max_ctx, l, &h, &own, ws)?;
+                let at = ModelSize {
+                    ctx: one.ctx as u64,
+                    ..base
+                };
+                let (lanes, p) = lanes_at(one, opts.lanes, |n| {
+                    let lp = lane_profile(&one_lane, n, floor);
+                    admit_with(&lp, &at, one.chunk as u64, l, &h, &own, ws)
+                });
                 tracing::info!(
                     "hy_v4_flash admission at load: {lanes} lanes, context {}, chunk {}, \
                      wave rows {row_cap}: {}",

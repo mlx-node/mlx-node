@@ -23,6 +23,7 @@ use napi::{Error, Result};
 
 use super::cache::{LatentBuf, WINDOW_SLACK};
 use super::config::{Attn, HyV4FlashConfig};
+use super::moe::{RowKind, per_row, qlinear};
 use super::weights::IndexerWeights;
 use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::attention::{linear, rms_norm};
@@ -638,6 +639,7 @@ pub struct Indexing<'a> {
     pub indexer: &'a Indexer,
     pub weights: &'a IndexerWeights,
     pub state: &'a mut IndexerState,
+    pub kind: RowKind,
 }
 
 /// `Indexing` of a paged sequence.
@@ -645,6 +647,18 @@ pub struct PagedIndexing<'a> {
     pub indexer: &'a Indexer,
     pub weights: &'a IndexerWeights,
     pub state: &'a mut PagedIndexerState,
+    pub kind: RowKind,
+}
+
+/// The rows of one call at positions `start..start + n`: `x [n, dim]`
+/// (`rms(h)·attn_norm`) and `qr [n, q_lora]`. Decode rows take the f32 head
+/// weights one row per call, so a row's picks do not depend on the others.
+#[derive(Clone, Copy)]
+pub struct Call<'a> {
+    pub x: &'a MxArray,
+    pub qr: &'a MxArray,
+    pub start: usize,
+    pub kind: RowKind,
 }
 
 /// The indexer of one layer; the weights stay in `Resident`.
@@ -708,7 +722,7 @@ impl Indexer {
     /// `rms(attn_k·x)·k_norm` `[n, d]` f32.
     pub fn tok_k(&self, w: &IndexerWeights, x: &MxArray) -> Result<MxArray> {
         rms_norm(
-            &linear(&x.astype(DType::Float32)?, &w.attn_k)?,
+            &qlinear(&x.astype(DType::Float32)?, &w.attn_k)?,
             &w.k_norm,
             self.g.eps,
         )
@@ -736,7 +750,7 @@ impl Indexer {
     /// Roped index queries `[r, H, d]` of `qr [r, q_lora]` at `positions`.
     pub fn queries(&self, w: &IndexerWeights, qr: &MxArray, positions: &[u64]) -> Result<MxArray> {
         let r = qr.shape_at(0)?;
-        let q = linear(&qr.astype(DType::Float32)?, &w.q_b)?.reshape(&[
+        let q = qlinear(&qr.astype(DType::Float32)?, &w.q_b)?.reshape(&[
             r,
             self.g.n_heads as i64,
             self.g.head_dim as i64,
@@ -744,9 +758,15 @@ impl Indexer {
         self.rope(&q, positions)
     }
 
-    /// Head weights `proj·x · (H·d)^-½` `[r, H]`.
-    pub fn head_weights(&self, w: &IndexerWeights, x: &MxArray) -> Result<MxArray> {
-        linear(&x.astype(DType::Float32)?, &w.proj)?.mul_scalar(f64::from(self.g.weight_scale))
+    /// Head weights `proj·x · (H·d)^-½` `[r, H]`; decode rows one per call.
+    pub fn head_weights(&self, w: &IndexerWeights, x: &MxArray, kind: RowKind) -> Result<MxArray> {
+        let one = |r: &MxArray| {
+            linear(&r.astype(DType::Float32)?, &w.proj)?.mul_scalar(f64::from(self.g.weight_scale))
+        };
+        match kind {
+            RowKind::Decode => per_row(x, one),
+            RowKind::Prefill => one(x),
+        }
     }
 
     /// Pools the groups the call `x [n, dim]` at `start` closes and carries
@@ -804,29 +824,21 @@ impl Indexer {
         tail.push(&tok)
     }
 
-    /// Index rows `[n, plan.kmax]` i32 (`-1` = no cell) of the call `x`/`qr`
-    /// at `start`, after `update` of the same call.
-    pub fn cells(
-        &self,
-        w: &IndexerWeights,
-        x: &MxArray,
-        qr: &MxArray,
-        start: usize,
-        st: &IndexerState,
-    ) -> Result<MxArray> {
-        self.cells_in(w, x, qr, start, &st.pooled, &st.tail)
+    /// Index rows `[n, plan.kmax]` i32 (`-1` = no cell) of `call`, after
+    /// `update` of the same call.
+    pub fn cells(&self, w: &IndexerWeights, call: Call<'_>, st: &IndexerState) -> Result<MxArray> {
+        self.cells_in(w, call, &st.pooled, &st.tail)
     }
 
     fn cells_in<P: PooledKeys>(
         &self,
         w: &IndexerWeights,
-        x: &MxArray,
-        qr: &MxArray,
-        start: usize,
+        call: Call<'_>,
         pooled: &P,
         tail: &TokTail,
     ) -> Result<MxArray> {
-        let n = x.shape_at(0)? as usize;
+        let start = call.start;
+        let n = call.x.shape_at(0)? as usize;
         let plan = self.g.plan(start, n);
         if tail.len != start + n || pooled.groups() != plan.cols {
             return Err(bad(format!(
@@ -847,7 +859,7 @@ impl Indexer {
         }
         if !plan.sparse.is_empty() {
             let keys = pooled.read(plan.cols)?.astype(DType::Float32)?;
-            parts.push(self.sparse_cells(w, x, qr, start, &plan, &keys)?);
+            parts.push(self.sparse_cells(w, call, &plan, &keys)?);
         }
         match parts.len() {
             1 => Ok(parts.swap_remove(0)),
@@ -859,13 +871,12 @@ impl Indexer {
     fn sparse_cells(
         &self,
         w: &IndexerWeights,
-        x: &MxArray,
-        qr: &MxArray,
-        start: usize,
+        call: Call<'_>,
         plan: &CallPlan,
         keys: &MxArray,
     ) -> Result<MxArray> {
         let g = &self.g;
+        let start = call.start;
         let rows = |a: &MxArray, r: &Range<usize>| -> Result<MxArray> {
             a.slice(
                 &[(r.start - start) as i64, 0],
@@ -874,8 +885,8 @@ impl Indexer {
         };
         let sp = &plan.sparse;
         let pos: Vec<u64> = sp.clone().map(|t| t as u64).collect();
-        let q = self.queries(w, &rows(qr, sp)?, &pos)?;
-        let hw = self.head_weights(w, &rows(x, sp)?)?;
+        let q = self.queries(w, &rows(call.qr, sp)?, &pos)?;
+        let hw = self.head_weights(w, &rows(call.x, sp)?, call.kind)?;
         let to_i32 = |v: usize| i32::try_from(v).map_err(|_| bad(format!("{v} exceeds i32")));
         let visible = sp
             .clone()
@@ -924,12 +935,10 @@ impl Indexer {
     pub fn select(
         &self,
         w: &IndexerWeights,
-        x: &MxArray,
-        qr: &MxArray,
-        start: usize,
+        call: Call<'_>,
         st: &mut IndexerState,
     ) -> Result<MxArray> {
-        self.select_in(w, x, qr, start, &mut st.pooled, &mut st.tail)
+        self.select_in(w, call, &mut st.pooled, &mut st.tail)
     }
 
     /// `select` for a paged sequence: the pooled keys go to and come from
@@ -937,9 +946,7 @@ impl Indexer {
     pub fn select_paged(
         &self,
         w: &IndexerWeights,
-        x: &MxArray,
-        qr: &MxArray,
-        start: usize,
+        call: Call<'_>,
         st: &mut PagedIndexerState,
         adapter: &mut PagedKVCacheAdapter,
     ) -> Result<MxArray> {
@@ -948,22 +955,20 @@ impl Indexer {
             layer: st.layer,
             groups: &mut st.groups,
         };
-        self.select_in(w, x, qr, start, &mut keys, &mut st.tail)
+        self.select_in(w, call, &mut keys, &mut st.tail)
     }
 
     fn select_in<P: PooledKeys>(
         &self,
         w: &IndexerWeights,
-        x: &MxArray,
-        qr: &MxArray,
-        start: usize,
+        call: Call<'_>,
         pooled: &mut P,
         tail: &mut TokTail,
     ) -> Result<MxArray> {
         let mark = IndexerMark { tail: tail.clone() };
         let out = self
-            .update_in(w, x, start, pooled, tail)
-            .and_then(|()| self.cells_in(w, x, qr, start, pooled, tail));
+            .update_in(w, call.x, call.start, pooled, tail)
+            .and_then(|()| self.cells_in(w, call, pooled, tail));
         if out.is_err() {
             restore_in(pooled, tail, mark)?;
         }

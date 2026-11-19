@@ -10,9 +10,10 @@
 //!
 //! A step runs the rows of one or more owners (sequences) at once: the
 //! Engram block, the HC streams and the FFN over all rows, the attention
-//! per owner on its own cache. Decode rows take the HC mixes one row per
-//! call (f32 matmuls round by row count), so a row's bits do not depend on
-//! the other owners.
+//! per owner on its own cache. Decode rows take the HC mixes and the
+//! indexer head weights one row per call (f32 matmuls round by row count),
+//! and every Q8 matrix sees at least two rows (`qlinear`), so a row's bits
+//! do not depend on the other rows.
 
 use napi::{Error, Result};
 
@@ -208,7 +209,7 @@ impl Block {
         };
 
         let (g, h) = self.mix(&x, hc_attn, kind)?;
-        let a = self.attend(w, &h, owners)?;
+        let a = self.attend(w, &h, owners, kind)?;
         let x = post(&a, &x, &g.post)?;
 
         let (g, h) = self.mix(&x, hc_ffn, kind)?;
@@ -223,6 +224,7 @@ impl Block {
         w: &LayerWeights,
         h: &MxArray,
         owners: &mut [OwnerLayer<'_>],
+        kind: RowKind,
     ) -> Result<MxArray> {
         let dim = h.shape_at(1)?;
         let single = owners.len() == 1;
@@ -241,6 +243,7 @@ impl Block {
                     indexer,
                     weights,
                     state,
+                    kind,
                 }),
                 (None, None, None) => None,
                 _ => {

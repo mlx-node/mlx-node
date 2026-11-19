@@ -407,6 +407,6 @@
   "per_token_pool = 12 x (576 x 2 + 128 x 2 / 4) = 12 x 1,216; the MTP layer's 1,216 B/token stays request-owned in 32-row segments (E5), not in the pool",
   "per_token_flat_kv_mtp_on = pool + mtp + u32 id = HY/store.rs kv_per_token(cfg, true) (15,812)",
   "page_layout_index_bytes uses PageLayout::index_bytes (rows x dim x 2): the x2 holds for f16 too",
-  "head_size 288 is not in PA/config.rs:51 today: P1 adds it"
+  "head_size 288 is in the PA/config.rs:51 list for this pool"
  ]
 }

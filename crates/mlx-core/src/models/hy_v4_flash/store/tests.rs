@@ -400,6 +400,67 @@ fn plan_lanes_steps_down_to_what_fits() {
     assert_eq!(plan_lanes(3, fits(0)).unwrap_err().reason, "1 lanes");
 }
 
+/// Lanes are fitted at the one-lane context and chunk: for every lane
+/// floor the load keeps the one-lane pick's window and chunk and takes the
+/// most lanes that admit there; with the ladder run per lane count some
+/// floors would shrink the window or the chunk.
+#[test]
+fn lanes_keep_the_one_lane_window_and_chunk() {
+    let f = fixture("admission-addons.json");
+    let inputs = &f["inputs"];
+    let v = &f["variants"]["mtp_on"];
+    let p = profile(u(&v["kv_per_ctx"]));
+    let b = base(inputs, v);
+    let max_ctx = u(&inputs["max_context"]) as usize;
+    let (h, ws) = host(inputs, 50 * G);
+    let (l, own) = (Limits::default(), Own::default());
+    let one = pick(&p, &b, max_ctx, &l, &h, &own, ws).unwrap();
+    let at = ModelSize {
+        ctx: one.ctx as u64,
+        ..b
+    };
+    let mut shrunk = 0;
+    for quarter in 1..=160u64 {
+        let floor = quarter * G / 4;
+        let admit = |n: usize| {
+            admit_with(
+                &lane_profile(&p, n, floor),
+                &at,
+                one.chunk as u64,
+                &l,
+                &h,
+                &own,
+                ws,
+            )
+        };
+        let (lanes, got) = lanes_at(one, LANES_MAX, admit);
+        assert_eq!((got.ctx, got.chunk), (one.ctx, one.chunk), "floor {floor}");
+        let most = (1..=LANES_MAX)
+            .rev()
+            .find(|&n| n == 1 || admit(n).is_ok())
+            .unwrap();
+        assert_eq!(lanes, most, "floor {floor}");
+        if lanes > 1 {
+            assert_eq!(got.admission, admit(lanes).unwrap(), "floor {floor}");
+        } else {
+            assert_eq!(got.admission, one.admission, "floor {floor}");
+        }
+        if let Ok(ladder) = pick(
+            &lane_profile(&p, LANES_MAX, floor),
+            &b,
+            max_ctx,
+            &l,
+            &h,
+            &own,
+            ws,
+        ) && (ladder.ctx, ladder.chunk) != (one.ctx, one.chunk)
+        {
+            shrunk += 1;
+        }
+    }
+    assert!(shrunk > 0, "no floor shrinks the window or the chunk");
+}
+
 #[test]
 fn cache_split_follows_the_layer_counts() {
     let c = Classes {

@@ -1,6 +1,6 @@
 //! MTP head: held sizes against `mtp-tensors.json`, the prefill lag
 //! schedule, a lens model of the stepper's lengths over whole cycles at
-//! depth 1..3, the K/V blocks and seeds; real (`HY4_DIR`): the held layer
+//! depth 1..3, the K/V buffer and seeds; real (`HY4_DIR`): the held layer
 //! size and a greedy MTP turn against the AR turn.
 
 use std::path::PathBuf;
@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 use serde_json::Value;
 
 use super::cache::WINDOW_SLACK;
-use super::mtp::{BLOCK_ROWS, Blocks, Lag, SEEDS, Seeds, lag};
+use super::mtp::{KvRows, Lag, SEEDS, Seeds, lag};
 use super::mtp_weights::{Held, held, held_bytes};
 use super::spec::{LOOKAHEAD_MAX, commit_row, cycle_rows, unemitted_keep, verify_keep};
 use crate::array::MxArray;
@@ -289,27 +289,40 @@ fn read(x: &MxArray, n: usize) -> Vec<f32> {
         .to_vec()
 }
 
-/// Writes across block edges read back in order; cuts drop whole blocks
-/// and rewrites land in place; a deep cut shrinks the last block.
+/// Writes past the buffer move the rows to one of twice the rows (a
+/// multiple of 32, at most the cap) and read back in order; a draft read is the buffer itself; a
+/// rollback rewrites in place; a deep cut shrinks it and a cut to 0 frees it.
 #[test]
-fn blocks_write_cut_and_rewrite() {
-    let mut b = Blocks::new(4);
+fn kv_rows_grow_cut_and_rewrite() {
+    let mut b = KvRows::new(4, 300);
+    let mut caps = Vec::new();
     let mut at = 0;
     for n in [1, 31, 40, 5, 200] {
         b.write(&rows(n, at), at).unwrap();
         at += n;
+        caps.push(b.capacity());
     }
+    assert_eq!(caps, vec![32, 32, 96, 96, 288]);
     assert_eq!(b.len(), at);
-    assert!(b.block_rows().iter().all(|r| r % BLOCK_ROWS == 0));
-    assert_eq!(read(&b.joined().unwrap(), at), read(&rows(at, 0), at));
+    assert_eq!(read(b.rows().unwrap(), at), read(&rows(at, 0), at));
+    assert!(b.write(&rows(24, at), at).is_err());
+    assert_eq!(b.len(), at);
+
+    b.truncate(at - 3).unwrap();
+    assert_eq!(b.capacity(), 288);
+    b.write(&rows(3, at - 3), at - 3).unwrap();
+    assert_eq!(read(b.rows().unwrap(), at), read(&rows(at, 0), at));
+
     b.truncate(70).unwrap();
-    assert_eq!(b.capacity(), b.block_rows().iter().sum::<usize>());
-    b.write(&rows(3, 70), 70).unwrap();
-    assert_eq!(read(&b.joined().unwrap(), 73), read(&rows(73, 0), 73));
-    b.truncate(32).unwrap();
-    assert!(b.capacity() >= 32);
+    assert_eq!(b.capacity(), 288);
+    b.truncate(40).unwrap();
+    assert_eq!(b.capacity(), 128);
+    assert_eq!(b.rows().unwrap().shape_at(0).unwrap(), 128);
+    b.write(&rows(3, 40), 40).unwrap();
+    assert_eq!(read(b.rows().unwrap(), 43), read(&rows(43, 0), 43));
     b.truncate(0).unwrap();
-    assert_eq!(b.capacity(), 0);
+    assert_eq!((b.capacity(), b.nbytes()), (0, 0));
+    assert!(b.rows().is_err());
     assert!(b.write(&rows(1, 0), 1).is_err());
 }
 

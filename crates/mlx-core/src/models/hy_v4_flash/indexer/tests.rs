@@ -8,6 +8,16 @@ use crate::models::hy_v4_flash::attention::{Geometry, Mla};
 use crate::models::hy_v4_flash::cache::LayerCache;
 use crate::models::hy_v4_flash::weights::AttnWeights;
 
+/// A prefill call of `x`/`qr` at `start`.
+fn prefill<'a>(x: &'a MxArray, qr: &'a MxArray, start: usize) -> Call<'a> {
+    Call {
+        x,
+        qr,
+        start,
+        kind: RowKind::Prefill,
+    }
+}
+
 fn fixture(name: &str) -> Value {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/hy-v4-flash")
@@ -648,7 +658,7 @@ fn select_split(
     let mut at = 0;
     for &n in sizes {
         let (x, qr) = (rows_of(&xs[at..at + n]), rows_of(&qrs[at..at + n]));
-        let idx = ix.select(w, &x, &qr, start + at, st).unwrap();
+        let idx = ix.select(w, prefill(&x, &qr, start + at), st).unwrap();
         assert_eq!(idx.shape_at(0).unwrap() as usize, n);
         assert_eq!(
             idx.shape_at(1).unwrap() as usize,
@@ -733,14 +743,14 @@ fn truncate_and_restore_keep_the_picks() {
     let before = (st.len(), st.pooled_len(), st.open(), st.held());
     let x = rows_of(&xs[..1]);
     let qr = rows_of(&qrs[..1]);
-    assert!(ix.select(&w, &x, &qr, 5, &mut st).is_err());
+    assert!(ix.select(&w, prefill(&x, &qr, 5), &mut st).is_err());
     assert_eq!((st.len(), st.pooled_len(), st.open(), st.held()), before);
 
     let mut short = IndexerState::new(9, &g);
     select_split(&ix, &w, &mut short, &xs[..6], &qrs[..6], 0, &[6]);
     let before = (short.len(), short.pooled_len(), short.open(), short.held());
     let (x, qr) = (rows_of(&xs[6..12]), rows_of(&qrs[6..12]));
-    assert!(ix.select(&w, &x, &qr, 6, &mut short).is_err());
+    assert!(ix.select(&w, prefill(&x, &qr, 6), &mut short).is_err());
     assert_eq!(
         (short.len(), short.pooled_len(), short.open(), short.held()),
         before
@@ -839,6 +849,7 @@ fn indexed_layer_past_top_k_gives_the_same_rows_for_every_split() {
                         indexer: &ix,
                         weights: &w,
                         state: &mut st,
+                        kind: RowKind::Prefill,
                     }),
                 )
                 .unwrap();
@@ -951,6 +962,7 @@ mod paged {
                         indexer: &c.ix,
                         weights: &c.w,
                         state: &mut st,
+                        kind: RowKind::Prefill,
                     }),
                 )
                 .unwrap();
@@ -984,6 +996,7 @@ mod paged {
                 indexer: &c.ix,
                 weights: &c.w,
                 state: st,
+                kind: RowKind::Prefill,
             },
         )
     }
@@ -1060,4 +1073,29 @@ mod paged {
         paged_call(&c, &mut adapter, &mut st, &fresh, 30, 6).unwrap();
         assert_eq!((st.len(), st.pooled_len()), (36, 9));
     }
+}
+
+/// Decode rows take the head weights one row per call: each row of a
+/// 3-row decode call is that row's 1-row call bit for bit; a prefill call
+/// is one matmul over its rows.
+#[test]
+fn decode_head_weights_run_per_row() {
+    let g = small();
+    let (w, _) = indexer_weights(&g, 5);
+    let ix = Indexer::new(g.clone(), &w).unwrap();
+    let xs = inputs(3, D, 17);
+    let all = read(&ix.head_weights(&w, &rows_of(&xs), RowKind::Decode).unwrap());
+    let h = g.n_heads;
+    for (i, x) in xs.iter().enumerate() {
+        let one = read(
+            &ix.head_weights(&w, &rows_of(std::slice::from_ref(x)), RowKind::Prefill)
+                .unwrap(),
+        );
+        assert_eq!(all[i * h..(i + 1) * h], one[..], "row {i}");
+    }
+    let pre = read(
+        &ix.head_weights(&w, &rows_of(&xs), RowKind::Prefill)
+            .unwrap(),
+    );
+    assert_eq!(pre.len(), 3 * h);
 }

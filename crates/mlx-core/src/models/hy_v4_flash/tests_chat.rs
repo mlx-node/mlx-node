@@ -104,6 +104,14 @@ impl Seq for Fake {
         }
         self.truncate(s.len)
     }
+
+    fn can_restore(&self, s: &Snap) -> bool {
+        let last = s
+            .len
+            .checked_sub(1)
+            .and_then(|i| self.written.get(i).copied());
+        s.len <= self.tokens.len() && last == s.last
+    }
 }
 
 /// Records the rows of every chunk; `stop_after` chunks run before the

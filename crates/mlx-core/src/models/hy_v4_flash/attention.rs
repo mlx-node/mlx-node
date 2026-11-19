@@ -18,13 +18,14 @@ use napi::{Error, Result};
 
 use super::cache::{LatentBuf, LayerCache, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
-use super::indexer::{Indexing, PagedIndexing};
+use super::indexer::{Call, Indexing, PagedIndexing};
+use super::moe::qlinear;
 use super::paged::{SlotMap, planes, write_latent};
 use super::sparse::{KeyRows, gather_sink_attention, gather_sink_attention_rows};
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::AttnWeights;
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::attention::{linear, rms_norm};
+use crate::models::deepseek_v41::attention::rms_norm;
 use crate::models::deepseek_v41::ops::{apply_partial_rope, inv_freqs, rope_tables};
 use crate::models::deepseek_v41::store::{Dense, Weight};
 use crate::nn::Activations;
@@ -94,8 +95,12 @@ pub fn window_rows(start: usize, n: usize, first: usize, window: usize) -> Vec<i
 }
 
 /// `x [g, s, k] · W_iᵀ` for the `g` row groups `W_i` of `w [g·r, k]`
-/// -> `[g, s, r]`.
+/// -> `[g, s, r]`. A Q8 `w` takes one row as two, as `qlinear` does.
 fn grouped_mm_t(w: &Dense, x: &MxArray, g: i64) -> Result<MxArray> {
+    if matches!(w, Dense::Qmm { .. }) && x.shape_at(1)? == 1 {
+        let y = grouped_mm_t(w, &x.pad(&[0, 0, 0, 1, 0, 0], 0.0)?, g)?;
+        return y.slice(&[0, 0, 0], &[y.shape_at(0)?, 1, y.shape_at(2)?]);
+    }
     if let Some(y) = w.grouped_qmm_t(x, g)? {
         return Ok(y);
     }
@@ -186,8 +191,8 @@ impl Mla {
         let (cos, sin) = rope_tables(&self.inv, &pos)?;
 
         let x = rms_norm(&h.astype(DType::Float32)?, &w.norm, g.eps)?;
-        let qr = rms_norm(&linear(&x, &w.q_a)?, &w.q_a_norm, g.eps)?;
-        let q = linear(&qr, &w.q_b)?.reshape(&[n, heads, qk])?;
+        let qr = rms_norm(&qlinear(&x, &w.q_a)?, &w.q_a_norm, g.eps)?;
+        let q = qlinear(&qr, &w.q_b)?.reshape(&[n, heads, qk])?;
         let q = apply_partial_rope(&q, rd, &cos, &sin, false)?;
         let q_nope = q
             .slice(&[0, 0, 0], &[n, heads, nope])?
@@ -196,7 +201,7 @@ impl Mla {
         let q_abs = grouped_mm_t(&w.k_b, &q_nope, heads)?.transpose(Some(&[1, 0, 2]))?;
         let q = MxArray::concatenate(&q_abs, &q_pe, -1)?;
 
-        let ckv = linear(&x, &w.kv_a)?;
+        let ckv = qlinear(&x, &w.kv_a)?;
         let kv = rms_norm(&ckv.slice(&[0, 0], &[n, kv_lora])?, &w.kv_a_norm, g.eps)?;
         let k_pe = apply_partial_rope(
             &ckv.slice(&[0, kv_lora], &[n, kv_lora + rd])?,
@@ -218,8 +223,8 @@ impl Mla {
         let o = grouped_mm_t(&w.v_b, &o_lat.transpose(Some(&[1, 0, 2]))?, heads)?
             .transpose(Some(&[1, 0, 2]))?
             .reshape(&[n, width])?;
-        let gate = Activations::sigmoid(&linear(x, &w.gate)?)?;
-        let y = linear(&o.mul(&gate)?, &w.output)?;
+        let gate = Activations::sigmoid(&qlinear(x, &w.gate)?)?;
+        let y = qlinear(&o.mul(&gate)?, &w.output)?;
         rms_norm(&y, &w.post_norm, g.eps)
     }
 
@@ -310,9 +315,13 @@ impl Mla {
         let out = buf.write(&p.kv, start).and_then(|()| {
             prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr])?;
             let tp = prof_start();
-            let idx = ix
-                .indexer
-                .select(ix.weights, &p.x, &p.qr, start, ix.state)?;
+            let call = Call {
+                x: &p.x,
+                qr: &p.qr,
+                start,
+                kind: ix.kind,
+            };
+            let idx = ix.indexer.select(ix.weights, call, ix.state)?;
             prof_end(Phase::Indexer, tp, &[&idx])?;
             let tp = prof_start();
             let o = gather_sink_attention(
@@ -359,9 +368,15 @@ impl Mla {
         let out = write_latent(pool.adapter, layer, &p.kv, base, pool.floor).and_then(|()| {
             prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr])?;
             let tp = prof_start();
-            let idx =
-                ix.indexer
-                    .select_paged(ix.weights, &p.x, &p.qr, start, ix.state, pool.adapter)?;
+            let call = Call {
+                x: &p.x,
+                qr: &p.qr,
+                start,
+                kind: ix.kind,
+            };
+            let idx = ix
+                .indexer
+                .select_paged(ix.weights, call, ix.state, pool.adapter)?;
             prof_end(Phase::Indexer, tp, &[&idx])?;
             let tp = prof_start();
             let slots = pool.slots.slots(pool.adapter, &idx)?;

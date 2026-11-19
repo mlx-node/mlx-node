@@ -6,6 +6,7 @@ use super::*;
 use crate::models::deepseek_v41::ops::rope_angle;
 use crate::models::hy_v4_flash::cache::{LatentBuf, LayerCache, WINDOW_SLACK, WindowRing};
 use crate::models::hy_v4_flash::indexer::{Indexer, IndexerGeometry, IndexerState, Indexing};
+use crate::models::hy_v4_flash::moe::RowKind;
 use crate::models::hy_v4_flash::sparse::gather_sink_attention_in;
 use crate::models::hy_v4_flash::weights::IndexerWeights;
 
@@ -386,6 +387,7 @@ impl Layer {
             indexer: &*i,
             weights: &*iw,
             state: s,
+            kind: RowKind::Prefill,
         });
         mla.forward(w, h, start, &mut self.cache, ix)
     }
@@ -686,4 +688,94 @@ fn gather_core_refuses_mismatched_shapes() {
     assert!(gather_sink_attention(&q, &narrow, &idx, 4, &sinks, 1.0).is_err());
     let sinks3 = MxArray::zeros(&[3], None).unwrap();
     assert!(gather_sink_attention(&q, &k, &idx, 4, &sinks3, 1.0).is_err());
+}
+
+/// Affine-8 g32 codes (`Dense::Qmm`) of `v [rows, cols]`.
+fn qmm(v: &[f32], rows: usize, cols: usize) -> Dense {
+    let q = crate::models::hy_v4_flash::moe::AffineProj::quantize(&arr(v, &[1, rows, cols]), 32, 8)
+        .unwrap();
+    let sq = |a: &MxArray| {
+        a.reshape(&[a.shape_at(1).unwrap(), a.shape_at(2).unwrap()])
+            .unwrap()
+    };
+    Dense::Qmm {
+        w: sq(&q.w),
+        scales: sq(&q.s).astype(DType::Float32).unwrap(),
+        biases: sq(&q.b).astype(DType::Float32).unwrap(),
+    }
+}
+
+/// With Q8 projections (`k_b`, `v_b` grouped), a row alone projects and
+/// finishes to the bits of the same row in a 3-row call: every Q8 matrix
+/// sees at least two rows, so both run `qmv_wide`.
+#[test]
+fn q8_projections_of_a_row_do_not_depend_on_the_call() {
+    let g = Geometry {
+        attn: Attn::Indexed,
+        n_heads: 2,
+        kv_lora: 32,
+        nope: 32,
+        rope_dim: 32,
+        head_v: 16,
+        eps: 1e-5,
+        scale: 1.0 / 8f32.sqrt(),
+        rope_theta: 1e7,
+        window: 4,
+    };
+    let (dim, q_lora) = (64, 64);
+    let (h, l, v) = (g.n_heads, g.kv_lora, g.head_v);
+    let mut r = Rng(71);
+    let mat = |r: &mut Rng, rows: usize, cols: usize| {
+        qmm(&r.vec(rows * cols, 1.5 / (cols as f32).sqrt()), rows, cols)
+    };
+    let norm = |r: &mut Rng, n: usize| {
+        let v: Vec<f32> = r.vec(n, 0.5).into_iter().map(|x| 1.0 + x).collect();
+        arr(&v, &[n])
+    };
+    let w = AttnWeights {
+        norm: norm(&mut r, dim),
+        sinks: arr(&r.vec(h, 1.0), &[h]),
+        q_a: mat(&mut r, q_lora, dim),
+        q_a_norm: norm(&mut r, q_lora),
+        q_b: mat(&mut r, h * g.head_qk(), q_lora),
+        kv_a: mat(&mut r, g.row(), dim),
+        kv_a_norm: norm(&mut r, l),
+        k_b: mat(&mut r, h * l, g.nope),
+        v_b: mat(&mut r, h * v, l),
+        output: mat(&mut r, dim, h * v),
+        gate: mat(&mut r, h * v, dim),
+        post_norm: norm(&mut r, dim),
+    };
+    let mla = Mla::new(g, &w).unwrap();
+    let hs = r.vec(3 * dim, 2.0);
+    let lat = r.vec(3 * h * l, 1.0);
+    let start = 9;
+    let all = mla.project(&w, &arr(&hs, &[3, dim]), start).unwrap();
+    let out = mla.finish(&w, &all.x, &arr(&lat, &[3, h, l])).unwrap();
+    let row = |a: &MxArray, i: usize| {
+        let v = read(a);
+        let per = v.len() / 3;
+        v[i * per..(i + 1) * per].to_vec()
+    };
+    for i in 0..3 {
+        let one = mla
+            .project(&w, &arr(&hs[i * dim..(i + 1) * dim], &[1, dim]), start + i)
+            .unwrap();
+        for (what, a, b) in [
+            ("x", &all.x, &one.x),
+            ("qr", &all.qr, &one.qr),
+            ("q", &all.q, &one.q),
+            ("kv", &all.kv, &one.kv),
+        ] {
+            assert_eq!(row(a, i), read(b), "row {i} {what}");
+        }
+        let fo = mla
+            .finish(
+                &w,
+                &one.x,
+                &arr(&lat[i * h * l..(i + 1) * h * l], &[1, h, l]),
+            )
+            .unwrap();
+        assert_eq!(row(&out, i), read(&fo), "row {i} finish");
+    }
 }

@@ -15,9 +15,9 @@
 //! count from MTP row 0; the attention RoPE runs at `p + 1`, the position
 //! llama gives the row (scores depend on differences only).
 //!
-//! The K/V rows grow in 32-row blocks (`Blocks`), never one buffer of the
-//! whole context. A settled sequence (`Lagged`) holds `trunk - 1` MTP rows
-//! and the seed `h_trunk(trunk - 1)`.
+//! The K/V rows live in one buffer that grows with them (`KvRows`), never
+//! one sized for the whole context up front. A settled sequence (`Lagged`)
+//! holds `trunk - 1` MTP rows and the seed `h_trunk(trunk - 1)`.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::VecDeque;
@@ -27,7 +27,7 @@ use napi::{Error, Result};
 
 use super::attention::{Geometry, Mla};
 use super::cache::ROW_DTYPE;
-use super::indexer::{Indexer, IndexerGeometry, IndexerMark, IndexerState};
+use super::indexer::{Call, Indexer, IndexerGeometry, IndexerMark, IndexerState};
 use super::ladder::Snapshot;
 use super::model::{Mark, Model, Output, Session, Want, head_rows};
 use super::moe::{ExpertSource, FfnConfig, LayerFfn, RowKind, qlinear};
@@ -38,16 +38,14 @@ use super::sparse::gather_sink_attention;
 use super::weights::{LayerWeights, NextnWeights, Residual};
 use crate::array::{DType, MxArray};
 use crate::cache_limit::CacheLimitGuard;
-use crate::models::deepseek_v41::attention::{linear, rms_norm};
+use crate::models::deepseek_v41::attention::rms_norm;
 use crate::models::deepseek_v41::ops::{apply_partial_rope, inv_freqs, rope_tables};
 use crate::models::deepseek_v41::store::Dense;
 use crate::moe_stream::io::ShardSet;
 use crate::nn::Embedding;
 
-/// Rows of one K/V block.
-pub const BLOCK_ROWS: usize = 32;
-/// Blocks past this many are joined into one.
-const MERGE_AT: usize = 64;
+/// The K/V buffer's rows are a multiple of this.
+const BLOCK_ROWS: usize = 32;
 /// Trunk output rows kept as seeds: a rollback of up to `WINDOW_SLACK` rows
 /// still finds the seed of the row it lands on.
 pub const SEEDS: usize = 8;
@@ -94,22 +92,27 @@ fn rows_of(x: &MxArray, width: i64) -> Result<usize> {
     }
 }
 
-/// f16 K/V rows in blocks of a multiple of `BLOCK_ROWS` rows, written in
-/// place; the block holding row `len` is the last one. Rows past `len` are
-/// dead. A block array must have exactly one handle (this struct).
-pub struct Blocks {
+/// f16 K/V rows in one buffer written in place; rows past `len` are dead.
+/// A write past the buffer moves the rows to one of twice the rows (a
+/// multiple of `BLOCK_ROWS`, at most `cap`); a cut that leaves a quarter or
+/// less live moves them to one of twice the live rows. The array must have
+/// exactly one handle (this struct): a second one turns every in-place
+/// write into a copy of the whole buffer.
+pub struct KvRows {
     width: i64,
-    blocks: Vec<MxArray>,
-    rows: Vec<usize>,
+    cap: usize,
+    buf: Option<MxArray>,
+    held: usize,
     len: usize,
 }
 
-impl Blocks {
-    pub fn new(width: i64) -> Self {
+impl KvRows {
+    pub fn new(width: i64, cap: usize) -> Self {
         Self {
             width,
-            blocks: Vec::new(),
-            rows: Vec::new(),
+            cap,
+            buf: None,
+            held: 0,
             len: 0,
         }
     }
@@ -122,21 +125,32 @@ impl Blocks {
         self.len == 0
     }
 
-    /// Rows the blocks hold, live or dead.
+    /// Rows the buffer holds, live or dead.
     pub fn capacity(&self) -> usize {
-        self.rows.iter().sum()
+        self.held
     }
 
-    pub fn block_rows(&self) -> &[usize] {
-        &self.rows
+    /// The buffer `[capacity, width]`; rows `0..len` are live. A caller must
+    /// not keep the handle (or a view of it) past its call.
+    pub fn rows(&self) -> Result<&MxArray> {
+        self.buf
+            .as_ref()
+            .ok_or_else(|| bad("K/V read before the first write"))
     }
 
-    fn push_block(&mut self, rows: usize) -> Result<()> {
-        let r = i64::try_from(rows).map_err(|_| bad("block rows exceed i64"))?;
-        let b = MxArray::zeros(&[r, self.width], Some(ROW_DTYPE))?;
-        MxArray::eval_arrays_with_context(&[&b], "hy_v4_flash MTP block alloc")?;
-        self.blocks.push(b);
-        self.rows.push(rows);
+    /// Moves the live rows to a buffer of `rows` rows (`>= len`).
+    fn resize(&mut self, rows: usize) -> Result<()> {
+        let r = i64::try_from(rows).map_err(|_| bad("K/V rows exceed i64"))?;
+        let mut b = MxArray::zeros(&[r, self.width], Some(ROW_DTYPE))?;
+        if self.len > 0
+            && let Some(old) = &self.buf
+        {
+            let live = old.slice(&[0, 0], &[self.len as i64, self.width])?;
+            b.slice_assign_axis_inplace(0, 0, self.len as i64, &live)?;
+        }
+        MxArray::eval_arrays_with_context(&[&b], "hy_v4_flash MTP K/V resize")?;
+        self.buf = Some(b);
+        self.held = rows;
         Ok(())
     }
 
@@ -146,57 +160,25 @@ impl Blocks {
             return Err(bad(format!("K/V write at {start}, {} rows held", self.len)));
         }
         let n = rows_of(kv, self.width)?;
+        let end = start + n;
+        if end > self.cap {
+            return Err(bad(format!(
+                "K/V write to {end} past the {} rows a draft holds",
+                self.cap
+            )));
+        }
         let kv = kv.astype(ROW_DTYPE)?;
-        let first = self.blocks.len().saturating_sub(1);
-        let mut done = 0;
-        while done < n {
-            let cap = self.capacity();
-            let at = self.len + done;
-            if at == cap {
-                self.push_block(round_up(n - done))?;
-            }
-            let i = self.blocks.len() - 1;
-            let base = self.capacity() - self.rows[i];
-            let off = at - base;
-            let take = (n - done).min(self.rows[i] - off);
-            let part = if take == n {
-                kv.clone()
-            } else {
-                kv.slice(&[done as i64, 0], &[(done + take) as i64, self.width])?
-            };
-            self.blocks[i].slice_assign_axis_inplace(0, off as i64, (off + take) as i64, &part)?;
-            done += take;
+        if end > self.held {
+            self.resize(round_up(end).max(2 * self.held).min(self.cap))?;
         }
-        let touched: Vec<&MxArray> = self.blocks[first..].iter().collect();
-        MxArray::eval_arrays_with_context(&touched, "hy_v4_flash MTP K/V write")?;
-        self.len += n;
-        if self.blocks.len() > MERGE_AT {
-            self.merge()?;
-        }
+        let buf = self.buf.as_mut().ok_or_else(|| bad("K/V buffer missing"))?;
+        buf.slice_assign_axis_inplace(0, start as i64, end as i64, &kv)?;
+        MxArray::eval_arrays_with_context(&[&*buf], "hy_v4_flash MTP K/V write")?;
+        self.len = end;
         Ok(())
     }
 
-    fn merge(&mut self) -> Result<()> {
-        let all = MxArray::concatenate_many(self.blocks.iter().collect(), Some(0))?;
-        MxArray::eval_arrays_with_context(&[&all], "hy_v4_flash MTP K/V merge")?;
-        let rows = self.capacity();
-        self.blocks = vec![all];
-        self.rows = vec![rows];
-        Ok(())
-    }
-
-    /// Every block joined `[capacity, width]`; rows `0..len` are live. A
-    /// caller must not keep the handle past its call.
-    pub fn joined(&self) -> Result<MxArray> {
-        match self.blocks.as_slice() {
-            [] => Err(bad("K/V read before the first write")),
-            [b] => Ok(b.clone()),
-            all => MxArray::concatenate_many(all.iter().collect(), Some(0)),
-        }
-    }
-
-    /// Forgets the rows past `len`: blocks wholly past it go, a last block
-    /// with more than two blocks of dead rows is cut to its live rows.
+    /// Forgets the rows past `len`; a cut to 0 frees the buffer.
     pub fn truncate(&mut self, len: usize) -> Result<()> {
         if len > self.len {
             return Err(bad(format!(
@@ -204,38 +186,21 @@ impl Blocks {
                 self.len
             )));
         }
-        while let Some(&r) = self.rows.last() {
-            if self.capacity() - r < len {
-                break;
-            }
-            self.blocks.pop();
-            self.rows.pop();
-        }
         self.len = len;
-        self.shrink_last()
-    }
-
-    fn shrink_last(&mut self) -> Result<()> {
-        let (Some(last), Some(&r)) = (self.blocks.last(), self.rows.last()) else {
-            return Ok(());
-        };
-        let base = self.capacity() - r;
-        let keep = round_up(self.len - base);
-        if r - keep <= 2 * BLOCK_ROWS || keep == 0 {
+        if len == 0 {
+            self.buf = None;
+            self.held = 0;
             return Ok(());
         }
-        let cut = last
-            .slice(&[0, 0], &[keep as i64, self.width])?
-            .deep_copy()?;
-        MxArray::eval_arrays_with_context(&[&cut], "hy_v4_flash MTP K/V shrink")?;
-        let i = self.blocks.len() - 1;
-        self.blocks[i] = cut;
-        self.rows[i] = keep;
+        let keep = round_up(len);
+        if 4 * keep <= self.held {
+            self.resize((2 * keep).min(self.cap))?;
+        }
         Ok(())
     }
 
     pub fn nbytes(&self) -> usize {
-        self.blocks.iter().map(MxArray::nbytes).sum()
+        self.buf.as_ref().map_or(0, MxArray::nbytes)
     }
 }
 
@@ -294,7 +259,7 @@ impl Seeds {
 
 /// One sequence's MTP state: its K/V rows, its indexer and the seeds.
 pub struct Draft {
-    kv: Blocks,
+    kv: KvRows,
     index: IndexerState,
     seeds: Seeds,
     kpool: usize,
@@ -323,7 +288,7 @@ impl Draft {
         self.cap
     }
 
-    pub fn blocks(&self) -> &Blocks {
+    pub fn kv(&self) -> &KvRows {
         &self.kv
     }
 
@@ -509,7 +474,7 @@ impl MtpLayer {
         let g = self.indexer.geometry();
         let cap = cap + DRAFT_SLACK;
         Draft {
-            kv: Blocks::new(self.mla.geometry().row() as i64),
+            kv: KvRows::new(self.mla.geometry().row() as i64, cap),
             index: IndexerState::new(cap, g),
             seeds: Seeds::default(),
             kpool: g.kpool,
@@ -542,7 +507,7 @@ impl MtpLayer {
         let pos: Vec<u64> = (at + 1..at + 1 + m as usize).map(|p| p as u64).collect();
         let (cos, sin) = rope_tables(&self.inv, &pos)?;
         let xn = rms_norm(&x.astype(DType::Float32)?, &w.norm, g.eps)?;
-        let ckv = linear(&xn, &w.kv_a)?;
+        let ckv = qlinear(&xn, &w.kv_a)?;
         let kv = rms_norm(&ckv.slice(&[0, 0], &[m, kv_lora])?, &w.kv_a_norm, g.eps)?;
         let k_pe = apply_partial_rope(
             &ckv.slice(&[0, kv_lora], &[m, kv_lora + rd])?,
@@ -612,9 +577,15 @@ impl MtpLayer {
         let w = &self.w.attn;
         let p = self.mla.project(w, &x, at + 1)?;
         let mark = d.index.mark();
+        let call = Call {
+            x: &p.x,
+            qr: &p.qr,
+            start: at,
+            kind: RowKind::Decode,
+        };
         let idx = self
             .indexer
-            .select(self.indexer_weights()?, &p.x, &p.qr, at, &mut d.index)?;
+            .select(self.indexer_weights()?, call, &mut d.index)?;
         if let Err(e) = d.kv.write(&p.kv, at) {
             d.index.restore(mark)?;
             return Err(e);
@@ -638,10 +609,7 @@ impl MtpLayer {
     ) -> Result<(MxArray, MxArray)> {
         let g = self.mla.geometry();
         let w = &self.w.attn;
-        let o = {
-            let keys = d.kv.joined()?;
-            gather_sink_attention(q, &keys, idx, g.kv_lora as i64, &w.sinks, g.scale)?
-        };
+        let o = gather_sink_attention(q, d.kv.rows()?, idx, g.kv_lora as i64, &w.sinks, g.scale)?;
         let x = x.add(&self.mla.finish(w, xn, &o)?)?;
         let (f, _) = self.ffn.forward(&self.w, &x, RowKind::Decode)?;
         let x = x.add(&f)?;
@@ -983,6 +951,15 @@ impl Seq for Lagged {
             });
         }
         Ok(())
+    }
+
+    fn can_restore(&self, s: &LagMark) -> bool {
+        let draft = match (&self.draft, &s.draft) {
+            (None, DraftSnap::Off) => true,
+            (Some(d), DraftSnap::At(dm)) => d.can_restore(dm),
+            _ => false,
+        };
+        draft && self.trunk.can_restore(&s.trunk)
     }
 }
 

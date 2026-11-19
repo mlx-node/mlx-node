@@ -263,6 +263,36 @@ impl Session {
     /// Refused, with nothing changed, when a position below `m`'s length was
     /// rewritten since `m` was taken.
     pub fn restore(&mut self, m: &Mark) -> Result<()> {
+        self.fits(m)?;
+        for (st, lm) in self.layers.iter_mut().zip(&m.layers) {
+            if let (
+                Some(ix),
+                LayerMark::Latent {
+                    index: Some(im), ..
+                },
+            ) = (st.index.as_mut(), lm)
+            {
+                ix.restore(im.clone())?;
+            }
+        }
+        for (st, lm) in self.layers.iter_mut().zip(&m.layers) {
+            match (&mut st.cache, lm) {
+                (LayerCache::Window(r), LayerMark::Window(saved)) => *r = saved.clone(),
+                (LayerCache::Latent(b), LayerMark::Latent { len, .. }) => b.truncate(*len)?,
+                _ => return Err(bad("layer kinds changed during restore")),
+            }
+        }
+        self.tokens.truncate(m.len);
+        self.written.truncate(m.len);
+        Ok(())
+    }
+
+    /// Whether `restore(m)` would succeed.
+    pub fn can_restore(&self, m: &Mark) -> bool {
+        self.fits(m).is_ok()
+    }
+
+    fn fits(&self, m: &Mark) -> Result<()> {
         if m.layers.len() != self.layers.len() || m.len > self.tokens.len() {
             return Err(bad(format!(
                 "mark of {} positions / {} layers for a session of {} / {}",
@@ -294,26 +324,6 @@ impl Session {
                 return Err(bad(format!("layer {l}: the mark is not of this session")));
             }
         }
-        for (st, lm) in self.layers.iter_mut().zip(&m.layers) {
-            if let (
-                Some(ix),
-                LayerMark::Latent {
-                    index: Some(im), ..
-                },
-            ) = (st.index.as_mut(), lm)
-            {
-                ix.restore(im.clone())?;
-            }
-        }
-        for (st, lm) in self.layers.iter_mut().zip(&m.layers) {
-            match (&mut st.cache, lm) {
-                (LayerCache::Window(r), LayerMark::Window(saved)) => *r = saved.clone(),
-                (LayerCache::Latent(b), LayerMark::Latent { len, .. }) => b.truncate(*len)?,
-                _ => return Err(bad("layer kinds changed during restore")),
-            }
-        }
-        self.tokens.truncate(m.len);
-        self.written.truncate(m.len);
         Ok(())
     }
 
