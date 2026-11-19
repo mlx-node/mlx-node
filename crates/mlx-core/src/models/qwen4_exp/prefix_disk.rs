@@ -76,8 +76,8 @@ pub(super) const QUEUE_BYTES: u64 = 128 << 20;
 pub(super) struct Telemetry {
     pub(super) states: AtomicU64,
     pub(super) state_bytes: AtomicU64,
-    pub(super) published: AtomicU64,
-    pub(super) restored: AtomicU64,
+    /// The store's counters at its last sync.
+    counters: Mutex<super::prefix_state::Counters>,
     /// 0 off, 1 persistent, 2 temporary.
     pub(super) disk_enabled: AtomicU64,
     /// States waiting for their write, the one in flight included.
@@ -110,10 +110,18 @@ impl Telemetry {
             .count();
         self.states.store(in_memory as u64, Ordering::Relaxed);
         self.state_bytes.store(bytes.state_bytes, Ordering::Relaxed);
-        self.published
-            .store(states.counters.published, Ordering::Relaxed);
-        self.restored
-            .store(states.counters.restored, Ordering::Relaxed);
+        *self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = states.counters;
+    }
+
+    /// The store's counters at its last sync.
+    pub(super) fn counters(&self) -> super::prefix_state::Counters {
+        *self
+            .counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn bump(counter: &AtomicU64) {

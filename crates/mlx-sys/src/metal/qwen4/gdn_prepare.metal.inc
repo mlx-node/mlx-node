@@ -7,6 +7,7 @@ R"(
     #pragma clang fp contract(off)
     #pragma clang fp reassociate(off)
     const uint token = thread_position_in_grid.z;
+    const uint tokens = uint(qkv_shape[1]);
     const uint vec = thread_position_in_grid.y;
     const uint lane = thread_index_in_simdgroup;
     constexpr uint W = 10240;
@@ -28,7 +29,7 @@ R"(
         squared += values[i] * values[i];
         if (token == 0) {
             for (uint row = 0; row < 3; ++row) {
-                uint source = TOKENS + row;
+                uint source = tokens + row;
                 next_history[row * W + ch] = source < 3
                     ? history[source * history_strides[0] + ch * history_strides[1]]
                     : qkv[(source - 3) * qkv_strides[1] + ch * qkv_strides[2]];

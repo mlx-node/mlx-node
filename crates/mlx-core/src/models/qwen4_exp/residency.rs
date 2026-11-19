@@ -214,16 +214,35 @@ impl Weight {
             let scales = view(scales)?;
             let biases = self.biases.as_ref().map(view).transpose()?;
             let mode = std::ffi::CString::new(self.mode.as_str()).map_err(err)?;
+            // MLX runs sorted rows through its batched kernel from 16 rows
+            // and 4 rows per bank expert, else through a per-row GEMV that
+            // rounds differently; a slot piece of a window must keep the
+            // window's kernel, so a sorted call pads up to that floor.
+            let rows = indices.size()? as i64;
+            let floor = (4 * experts as i64).max(16);
+            let padded = if sorted && rows > 0 && rows < floor && x.shape_at(0)? == rows {
+                let shape = x.shape()?;
+                let mut pad = shape.to_vec();
+                pad[0] = floor - rows;
+                let x = MxArray::concatenate(x, &MxArray::zeros(&pad, Some(x.dtype()?))?, 0)?;
+                let last = indices.slice_axis(0, rows - 1, rows)?;
+                let indices =
+                    MxArray::concatenate(indices, &last.broadcast_to(&[floor - rows])?, 0)?;
+                Some((x, indices))
+            } else {
+                None
+            };
+            let (x_in, indices_in) = padded.as_ref().map_or((x, indices), |(x, i)| (x, i));
             let out = unsafe {
                 mlx_sys::mlx_gather_qmm(
-                    x.as_raw_ptr(),
+                    x_in.as_raw_ptr(),
                     w.as_raw_ptr(),
                     scales.as_raw_ptr(),
                     biases
                         .as_ref()
                         .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
                     std::ptr::null_mut(),
-                    indices.as_raw_ptr(),
+                    indices_in.as_raw_ptr(),
                     true,
                     self.group,
                     self.bits,
@@ -232,6 +251,11 @@ impl Weight {
                 )
             };
             let out = MxArray::from_handle(out, "Qwen4 resident gather")?;
+            let out = if padded.is_some() {
+                out.slice_axis(0, 0, rows)?
+            } else {
+                out
+            };
             if self.mode == "affine" {
                 out.astype(x.dtype()?)
             } else {
