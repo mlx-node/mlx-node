@@ -4,6 +4,7 @@
 
 pub mod attention;
 pub mod bank;
+pub mod block;
 pub mod cache;
 pub mod config;
 pub mod engram;
@@ -11,6 +12,7 @@ pub mod f8;
 pub mod finalize;
 pub mod header;
 pub mod indexer;
+pub mod model;
 pub mod moe;
 pub mod ops;
 pub mod rows;
@@ -20,6 +22,8 @@ pub mod weights;
 
 #[cfg(test)]
 mod tests_config;
+#[cfg(test)]
+mod tests_model;
 #[cfg(test)]
 mod tests_rows;
 #[cfg(test)]
