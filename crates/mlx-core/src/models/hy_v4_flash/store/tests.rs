@@ -273,6 +273,133 @@ fn readmission_counts_the_session_kv_as_own() {
     ));
 }
 
+/// Two staging layers charge 2 x 1024 slots at the larger slot (8.89
+/// GiB), at least what the bank allocates (2 x 512 slots per class).
+#[test]
+fn staging_charge_is_two_full_layers() {
+    let f = fixture("admission-addons.json");
+    let inputs = &f["inputs"];
+    let v = &f["variants"]["mtp_on"];
+    let m = ModelSize {
+        ctx: 262_144,
+        ..base(inputs, v)
+    };
+    let t = Terms::with(&profile(u(&v["kv_per_ctx"])), &m, u(&inputs["ws"]), 8192);
+    assert_eq!(t.staging_layer * 2, 9_550_430_208);
+    let adm = fixture("admission.json");
+    let bank = 2 * 512 * (u(&adm["inputs"]["slot_a"]) + u(&adm["inputs"]["slot_b"]));
+    assert_eq!(bank, 8_965_324_800);
+    assert!(t.staging_layer * 2 >= bank);
+}
+
+/// MLX's qmv batch limit per generation, size letter and shape class.
+#[test]
+fn qmv_batch_limit_follows_mlx() {
+    let cases = [
+        ("applegpu_g17s", [33, 25, 13]),
+        ("applegpu_g17g", [33, 25, 13]),
+        ("applegpu_g17d", [32, 18, 12]),
+        ("applegpu_g16s", [13, 15, 13]),
+        ("applegpu_g15s", [13, 15, 13]),
+        ("applegpu_g15d", [32, 18, 12]),
+        ("applegpu_g14s", [14, 10, 6]),
+        ("applegpu_g13s", [14, 10, 7]),
+        ("applegpu_g13g", [14, 10, 6]),
+        ("applegpu_g13d", [32, 18, 12]),
+        ("applegpu_g12s", [18, 12, 10]),
+        ("", [18, 12, 10]),
+    ];
+    for (arch, want) in cases {
+        let got =
+            [(2048, 2048), (4096, 1024), (3072, 8192)].map(|(k, n)| qmv_batch_limit(arch, k, n));
+        assert_eq!(got, want, "{arch}");
+    }
+    assert_eq!(qmv_batch_limit("applegpu_g17s", 2049, 16), 25);
+    assert_eq!(qmv_batch_limit("applegpu_g17s", 16, 4097), 13);
+}
+
+/// Hy4's shape classes (small k_b / v_b, medium kv_a, large gate): 12 rows
+/// on M3-M5 Max, 11 on an Ultra, 5-6 on M1/M2; the env sets every limit.
+#[test]
+fn row_cap_is_one_below_the_smallest_limit() {
+    let shapes = [
+        (192, 512),
+        (512, 256),
+        (3072, 576),
+        (3072, 8192),
+        (1536, 15_360),
+    ];
+    for (arch, want) in [
+        ("applegpu_g17s", 12),
+        ("applegpu_g16s", 12),
+        ("applegpu_g15s", 12),
+        ("applegpu_g17d", 11),
+        ("applegpu_g15d", 11),
+        ("applegpu_g14s", 5),
+        ("applegpu_g13s", 6),
+    ] {
+        assert_eq!(row_cap(arch, None, &shapes).unwrap(), want, "{arch}");
+    }
+    assert_eq!(row_cap("applegpu_g17s", Some(4), &shapes).unwrap(), 3);
+    assert_eq!(row_cap("applegpu_g17s", Some(1), &shapes).unwrap(), 0);
+    assert!(row_cap("applegpu_g17s", None, &[]).is_err());
+}
+
+#[test]
+fn splitk_env_reads_like_atoi() {
+    for (raw, want) in [
+        (None, None),
+        (Some("8"), Some(8)),
+        (Some("  12x"), Some(12)),
+        (Some("+3"), Some(3)),
+        (Some("-3"), None),
+        (Some("0"), None),
+        (Some("abc"), None),
+        (Some(""), None),
+        (Some("99999999999"), None),
+    ] {
+        assert_eq!(splitk_min_m(raw), want, "{raw:?}");
+    }
+}
+
+/// Each lane past the first adds its floor to the KV base, nothing else.
+#[test]
+fn lanes_charge_their_floor() {
+    let cfg = crate::models::hy_v4_flash::tests_model::tiny_cfg();
+    let floor = lane_floor(&cfg, false);
+    assert_eq!(floor, 2 * 11 * 24 * 2 + 2 * 6 * 16 * 4 + 32 * 4);
+    let p = profile(15_812);
+    assert_eq!(lane_profile(&p, 1, floor), p);
+    assert_eq!(lane_profile(&p, 0, floor), p);
+    let four = lane_profile(&p, 4, floor);
+    assert_eq!(four.kv_base, p.kv_base + 3 * floor);
+    assert_eq!(
+        Profile {
+            kv_base: p.kv_base,
+            ..four
+        },
+        p
+    );
+}
+
+/// The most lanes that admit win; one lane's refusal is the error.
+#[test]
+fn plan_lanes_steps_down_to_what_fits() {
+    let fits = |max: usize| {
+        move |n: usize| {
+            if n <= max {
+                Ok(n * 10)
+            } else {
+                Err(Error::from_reason(format!("{n} lanes")))
+            }
+        }
+    };
+    assert_eq!(plan_lanes(4, fits(4)).unwrap(), (4, 40));
+    assert_eq!(plan_lanes(4, fits(2)).unwrap(), (2, 20));
+    assert_eq!(plan_lanes(0, fits(4)).unwrap(), (1, 10));
+    assert_eq!(plan_lanes(3, fits(0)).unwrap_err().reason, "1 lanes");
+}
+
 #[test]
 fn cache_split_follows_the_layer_counts() {
     let c = Classes {
@@ -357,6 +484,37 @@ fn real_sizes_match_the_oracle() {
     assert_eq!(kv_per_token(&s.cfg, false), u(&pf["kv_per_ctx_mtp_off"]));
 }
 
+/// Real headers (CPU): the lane floor with the MTP layer and the Q8
+/// shapes the row cap is taken over.
+#[test]
+#[ignore = "needs HY4_DIR with the real GGUF shards"]
+fn real_lane_floor_and_wave_shapes() {
+    let s = real_scan();
+    assert_eq!(
+        lane_floor(&s.cfg, true),
+        30 * 515 * 576 * 2 + 13 * 6 * 128 * 4 + 3072 * 4
+    );
+    assert_eq!(
+        lane_floor(&s.cfg, false),
+        30 * 515 * 576 * 2 + 12 * 6 * 128 * 4 + 3072 * 4
+    );
+    let shapes = q8_shapes(&s, true).unwrap();
+    for want in [
+        (192, 512),
+        (512, 256),
+        (3072, 576),
+        (3072, 16_384),
+        (1536, 15_360),
+        (13_824, 3072),
+        (6144, 3072),
+    ] {
+        assert!(shapes.contains(&want), "{want:?} in {shapes:?}");
+    }
+    assert!(!q8_shapes(&s, false).unwrap().contains(&(6144, 3072)));
+    assert_eq!(row_cap("applegpu_g17s", None, &shapes).unwrap(), 12);
+    assert_eq!(row_cap("applegpu_g15d", None, &shapes).unwrap(), 11);
+}
+
 #[test]
 #[ignore = "needs HY4_DIR with the real GGUF shards and the GPU"]
 fn real_store_admits_at_load() {
@@ -367,11 +525,13 @@ fn real_store_admits_at_load() {
         max_context: None,
         mtp: true,
         chunk_cap: None,
+        lanes: LANES_MAX,
         plan: CachePlan::AdmitWith(Limits::default()),
     };
     let st = Store::open(&s.paths, &opts).unwrap();
     TEST_HOST.with(|c| c.set(None));
-    assert_eq!((st.ctx, st.chunk), (262_144, 8192));
+    assert_eq!((st.ctx, st.chunk, st.lanes), (262_144, 8192, LANES_MAX));
+    assert!(st.row_cap >= 2, "row cap {}", st.row_cap);
     let a = st.admission().unwrap();
     assert_eq!(st.cache_slots(), st.sizes.classes.split(a.cache_bytes()));
     assert_eq!(st.bank.staging_layers() as u64, a.staging_layers);

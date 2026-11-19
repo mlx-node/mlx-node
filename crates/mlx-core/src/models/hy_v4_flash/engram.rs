@@ -1,20 +1,25 @@
 //! Engram block (llama.cpp PR #32517 `build_engram`), f32 math: a token's
 //! F8 table rows -> per-row RMS · `lookup_norm` -> `engram_kv` + `kv_b`
 //! -> one key per HC stream and one value; stream c gains
-//! `rms(value) · pre_gamma · (gate_c + hc_scale_c)`. Text only: no token is
-//! masked (the GGUF token map covers every id).
+//! `rms(value) · pre_gamma · (gate_c + hc_scale_c)`. Positions holding
+//! the pad, image or video id get no delta (HF `build_engram_inputs`,
+//! `modeling_hy_v4_flash.py:1894-1898`, applied at `:800`); they still
+//! hash into the n-grams of the positions after them.
 
 use napi::{Error, Result};
 
+use super::moe::qlinear;
 use super::weights::EngramWeights;
 use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::EngramConfig;
-use crate::models::deepseek_v41::attention::linear;
 use crate::models::deepseek_v41::engram_hash::EngramHasher;
 use crate::nn::Activations;
 
 /// `HY_V4_FLASH_ENGRAM_EPS` (f32 machine epsilon, 2^-23).
 pub const ENGRAM_EPS: f32 = f32::EPSILON;
+/// HF `image_token_id` / `video_token_id` (`config.json`; no GGUF key).
+pub const IMAGE_TOKEN: u32 = 120_120;
+pub const VIDEO_TOKEN: u32 = 120_124;
 /// Floor of `|dot|` under the gate's square root.
 const DOT_FLOOR: f64 = 1e-6;
 
@@ -71,7 +76,7 @@ pub fn key_value(r: &MxArray, w: &EngramWeights) -> Result<MxArray> {
             w.kv.shape_at(0)?
         )));
     }
-    linear(&r.astype(DType::Float32)?, &w.kv)?
+    qlinear(&r.astype(DType::Float32)?, &w.kv)?
         .reshape(&[n, heads, d])?
         .add(&w.kv_b.astype(DType::Float32)?)
 }
@@ -99,9 +104,18 @@ pub fn signal(value: &MxArray, pre_gamma: &MxArray) -> Result<MxArray> {
     rms(value)?.mul(&pre_gamma.astype(DType::Float32)?)
 }
 
+/// Whether each id's position gets the Engram delta: not the Engram pad
+/// id (`engram.pad_token_id`), the image or the video id.
+pub fn keeps(ids: &[u32], pad: usize) -> Vec<bool> {
+    ids.iter()
+        .map(|&t| t as usize != pad && t != IMAGE_TOKEN && t != VIDEO_TOKEN)
+        .collect()
+}
+
 /// x `[n, hc, d]` plus this layer's Engram delta from its table rows
-/// `[n, cols, head_dim]`; in x's dtype.
-pub fn forward(x: &MxArray, rows: &[f32], w: &EngramWeights) -> Result<MxArray> {
+/// `[n, cols, head_dim]` on the rows `keep` marks (the others stay x);
+/// in x's dtype.
+pub fn forward(x: &MxArray, rows: &[f32], keep: &[bool], w: &EngramWeights) -> Result<MxArray> {
     let &[n, hc, d] = dims(x)?.as_slice() else {
         return Err(bad(format!(
             "streams must be [n, hc, d], got {:?}",
@@ -123,6 +137,12 @@ pub fn forward(x: &MxArray, rows: &[f32], w: &EngramWeights) -> Result<MxArray> 
             dims(&w.kv_b)?
         )));
     }
+    if keep.len() as i64 != n {
+        return Err(bad(format!(
+            "{} mask entries for {n} positions",
+            keep.len()
+        )));
+    }
     let kv = key_value(&normed_rows(rows, n, w)?, w)?;
     let key = kv.slice(&[0, 0, 0], &[n, hc, d])?;
     let value = kv.slice(&[0, hc, 0], &[n, hc + 1, d])?.reshape(&[n, d])?;
@@ -132,7 +152,16 @@ pub fn forward(x: &MxArray, rows: &[f32], w: &EngramWeights) -> Result<MxArray> 
         .reshape(&[n, hc, 1])?
         .add(&w.hc_scale.astype(DType::Float32)?)?;
     let s = signal(&value, &w.pre_gamma)?.reshape(&[n, 1, d])?;
-    xf.add(&s.mul(&scale)?)?.astype(x.dtype()?)
+    let y = xf.add(&s.mul(&scale)?)?;
+    let y = if keep.iter().all(|&k| k) {
+        y
+    } else {
+        let mask: Vec<u8> = keep.iter().map(|&k| u8::from(k)).collect();
+        MxArray::from_uint8(&mask, &[n, 1, 1])?
+            .not_equal(&MxArray::from_uint8(&[0], &[1])?)?
+            .where_(&y, &xf)?
+    };
+    y.astype(x.dtype()?)
 }
 
 /// Row ids of the n-gram hash for one call, hashing only the ids the

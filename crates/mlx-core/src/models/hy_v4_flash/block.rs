@@ -7,6 +7,12 @@
 //! ```
 //!
 //! Each sublayer reduces the streams with the `pre` of its own mix.
+//!
+//! A step runs the rows of one or more owners (sequences) at once: the
+//! Engram block, the HC streams and the FFN over all rows, the attention
+//! per owner on its own cache. Decode rows take the HC mixes one row per
+//! call (f32 matmuls round by row count), so a row's bits do not depend on
+//! the other owners.
 
 use napi::{Error, Result};
 
@@ -15,7 +21,7 @@ use super::cache::LayerCache;
 use super::config::{Attn, HcConfig, HyV4FlashConfig};
 use super::engram;
 use super::indexer::{Indexer, IndexerGeometry, IndexerState, Indexing};
-use super::moe::{ExpertSource, FfnConfig, LayerFfn, Routes};
+use super::moe::{ExpertSource, FfnConfig, LayerFfn, Routes, RowKind};
 use super::ops::{HcGates, hc_mix, hc_post_identity, hc_reduce};
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{HcWeights, LayerWeights, Residual};
@@ -45,6 +51,22 @@ impl LayerState {
     pub fn nbytes(&self) -> usize {
         self.cache.nbytes() + self.index.as_ref().map_or(0, IndexerState::nbytes)
     }
+}
+
+/// One owner's rows of a layer step: positions `start..start + rows` and
+/// its state of this layer. Owners' rows follow each other in the step.
+pub struct OwnerLayer<'a> {
+    pub start: usize,
+    pub rows: usize,
+    pub state: &'a mut LayerState,
+}
+
+/// Engram inputs of a step's rows: table rows `[n, cols, head_dim]` and
+/// which rows get the delta (`engram::keeps`).
+#[derive(Clone, Copy)]
+pub struct EngramIn<'a> {
+    pub rows: &'a [f32],
+    pub keep: &'a [bool],
 }
 
 /// One trunk layer; the weights stay in the model's weight set.
@@ -139,18 +161,18 @@ impl Block {
         }
     }
 
-    /// The streams `x [n, hc, d]` (f32) after this layer, for positions
-    /// `start..start + n`; `rows` = this layer's Engram table rows `[n,
-    /// cols, head_dim]` (Engram layers only). Appends the call to `st`; on
-    /// error the attention state holds what it held before, the caller
-    /// restores the rest.
+    /// The streams `x [n, hc, d]` (f32) after this layer for the rows of
+    /// `owners` (their `rows` sum to `n`); `engram` is required on an
+    /// Engram layer and refused elsewhere. Appends each owner's rows to its
+    /// state; on error an owner's attention state holds what it held
+    /// before that owner's call, the caller restores the rest.
     pub fn forward(
         &self,
         w: &LayerWeights,
         x: &MxArray,
-        start: usize,
-        st: &mut LayerState,
-        rows: Option<&[f32]>,
+        owners: &mut [OwnerLayer<'_>],
+        engram: Option<EngramIn<'_>>,
+        kind: RowKind,
     ) -> Result<(MxArray, Option<Routes>)> {
         let Residual::Hc {
             attn: hc_attn,
@@ -159,10 +181,18 @@ impl Block {
         else {
             return Err(bad(format!("layer {}: no HC weights", self.layer)));
         };
-        let x = match (self.engram, &w.engram, rows) {
-            (Some(_), Some(ew), Some(r)) => {
+        let n = x.shape_at(0)?;
+        if owners.is_empty() || owners.iter().map(|o| o.rows as i64).sum::<i64>() != n {
+            return Err(bad(format!(
+                "layer {}: {} owners for {n} rows",
+                self.layer,
+                owners.len()
+            )));
+        }
+        let x = match (self.engram, &w.engram, engram) {
+            (Some(_), Some(ew), Some(e)) => {
                 let tp = prof_start();
-                let y = engram::forward(x, r, ew)?;
+                let y = engram::forward(x, e.rows, e.keep, ew)?;
                 prof_end(Phase::Engram, tp, &[&y])?;
                 y
             }
@@ -177,36 +207,89 @@ impl Block {
             }
         };
 
-        let (g, h) = self.mix(&x, hc_attn)?;
-        let index = match (&self.indexer, &w.indexer, st.index.as_mut()) {
-            (Some(indexer), Some(weights), Some(state)) => Some(Indexing {
-                indexer,
-                weights,
-                state,
-            }),
-            (None, None, None) => None,
-            _ => {
-                return Err(bad(format!(
-                    "layer {}: indexer, its weights and its state do not match",
-                    self.layer
-                )));
-            }
-        };
-        let a = self.mla.forward(&w.attn, &h, start, &mut st.cache, index)?;
+        let (g, h) = self.mix(&x, hc_attn, kind)?;
+        let a = self.attend(w, &h, owners)?;
         let x = post(&a, &x, &g.post)?;
 
-        let (g, h) = self.mix(&x, hc_ffn)?;
-        let (f, routes) = self.ffn.forward(w, &h)?;
+        let (g, h) = self.mix(&x, hc_ffn, kind)?;
+        let (f, routes) = self.ffn.forward(w, &h, kind)?;
         Ok((post(&f, &x, &g.post)?, routes))
     }
 
+    /// The attention sublayer output `[n, dim]` for `h [n, dim]`, one call
+    /// per owner on its rows.
+    fn attend(
+        &self,
+        w: &LayerWeights,
+        h: &MxArray,
+        owners: &mut [OwnerLayer<'_>],
+    ) -> Result<MxArray> {
+        let dim = h.shape_at(1)?;
+        let single = owners.len() == 1;
+        let mut outs = Vec::with_capacity(owners.len());
+        let mut lo = 0i64;
+        for o in owners.iter_mut() {
+            let hi = lo + o.rows as i64;
+            let ho = if single {
+                h.clone()
+            } else {
+                h.slice(&[lo, 0], &[hi, dim])?
+            };
+            let st = &mut *o.state;
+            let index = match (&self.indexer, &w.indexer, st.index.as_mut()) {
+                (Some(indexer), Some(weights), Some(state)) => Some(Indexing {
+                    indexer,
+                    weights,
+                    state,
+                }),
+                (None, None, None) => None,
+                _ => {
+                    return Err(bad(format!(
+                        "layer {}: indexer, its weights and its state do not match",
+                        self.layer
+                    )));
+                }
+            };
+            outs.push(
+                self.mla
+                    .forward(&w.attn, &ho, o.start, &mut st.cache, index)?,
+            );
+            lo = hi;
+        }
+        match outs.len() {
+            1 => Ok(outs.swap_remove(0)),
+            _ => MxArray::concatenate_many(outs.iter().collect(), Some(0)),
+        }
+    }
+
     /// A sublayer's gates and its reduced input, under the HC clock.
-    fn mix(&self, x: &MxArray, hw: &HcWeights) -> Result<(HcGates, MxArray)> {
+    fn mix(&self, x: &MxArray, hw: &HcWeights, kind: RowKind) -> Result<(HcGates, MxArray)> {
         let tp = prof_start();
-        let g = hc_mix(x, hw, self.eps, &self.hc)?;
+        let g = match kind {
+            RowKind::Prefill => hc_mix(x, hw, self.eps, &self.hc)?,
+            RowKind::Decode => self.mix_per_row(x, hw)?,
+        };
         let h = hc_reduce(x, &g.pre)?;
         prof_end(Phase::Hc, tp, &[&g.post, &h])?;
         Ok((g, h))
+    }
+
+    fn mix_per_row(&self, x: &MxArray, hw: &HcWeights) -> Result<HcGates> {
+        let n = x.shape_at(0)?;
+        if n == 1 {
+            return hc_mix(x, hw, self.eps, &self.hc);
+        }
+        let (mut pre, mut post) = (Vec::new(), Vec::new());
+        for r in 0..n {
+            let row = x.slice(&[r, 0, 0], &[r + 1, x.shape_at(1)?, x.shape_at(2)?])?;
+            let g = hc_mix(&row, hw, self.eps, &self.hc)?;
+            pre.push(g.pre);
+            post.push(g.post);
+        }
+        Ok(HcGates {
+            pre: MxArray::concatenate_many(pre.iter().collect(), Some(0))?,
+            post: MxArray::concatenate_many(post.iter().collect(), Some(0))?,
+        })
     }
 }
 

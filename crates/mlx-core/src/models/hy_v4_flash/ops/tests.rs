@@ -6,7 +6,8 @@ use super::*;
 use crate::models::deepseek_v41::EngramConfig;
 use crate::models::deepseek_v41::engram_hash::EngramHasher;
 use crate::models::hy_v4_flash::engram::{
-    self, ENGRAM_EPS, Hasher, key_value, normed_rows, signal, stream_dot, stream_gate,
+    self, ENGRAM_EPS, Hasher, IMAGE_TOKEN, VIDEO_TOKEN, keeps, key_value, normed_rows, signal,
+    stream_dot, stream_gate,
 };
 use crate::models::hy_v4_flash::scan::Scan;
 use crate::models::hy_v4_flash::weights::EngramWeights;
@@ -295,10 +296,67 @@ fn engram_block_matches_the_oracle() {
         &flat(&o["signal"]),
         "signal",
     );
-    let out = engram::forward(&x, &rows, &w).unwrap();
+    let out = engram::forward(&x, &rows, &[true, true], &w).unwrap();
     assert_eq!(shape(&out), [n, hc, d]);
     assert_eq!(out.dtype().unwrap(), DType::Float32);
     assert_close(&read(&out), &flat(&o["out"]), "out");
+}
+
+/// A masked row keeps its streams bit for bit; the kept row is the
+/// unmasked call's row.
+#[test]
+fn engram_mask_leaves_masked_rows() {
+    let o = &ops()["engram_block"];
+    let w = engram_weights(o);
+    let x = arr(&o["x"], &[2, 4, 8]);
+    let rows = f32s(&o["rows"]);
+    let all = read(&engram::forward(&x, &rows, &[true, true], &w).unwrap());
+    let xs = read(&x);
+    let half = xs.len() / 2;
+    for (keep, kept) in [([true, false], 0), ([false, true], 1)] {
+        let got = read(&engram::forward(&x, &rows, &keep, &w).unwrap());
+        let (k, m) = (kept * half, (1 - kept) * half);
+        assert_eq!(got[k..k + half], all[k..k + half], "{keep:?}: kept row");
+        assert_eq!(got[m..m + half], xs[m..m + half], "{keep:?}: masked row");
+    }
+    let none = read(&engram::forward(&x, &rows, &[false, false], &w).unwrap());
+    assert_eq!(none, xs, "every row masked");
+    assert!(
+        engram::forward(&x, &rows, &[true], &w).is_err(),
+        "short mask"
+    );
+}
+
+/// The fixture's per-position mask: pad 120002, image 120120 and video
+/// 120124 get no delta; ids >= 120818 and specials do.
+#[test]
+fn engram_keeps_matches_the_oracle_mask() {
+    let want = fixture("engram-hash.json");
+    let pad = want["pad_token_id"].as_u64().unwrap() as usize;
+    assert_eq!(pad, 120_002);
+    assert_eq!(
+        (IMAGE_TOKEN, VIDEO_TOKEN),
+        (
+            want["image_token_id"].as_u64().unwrap() as u32,
+            want["video_token_id"].as_u64().unwrap() as u32
+        )
+    );
+    let mut masked = 0;
+    for s in want["sequences"].as_array().unwrap() {
+        let tokens = u32s(&s["tokens"]);
+        let mask: Vec<bool> = s["engram_mask"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b.as_bool().unwrap())
+            .collect();
+        assert_eq!(keeps(&tokens, pad), mask, "{}", s["name"]);
+        masked += mask.iter().filter(|&&k| !k).count();
+    }
+    assert!(
+        masked >= 4,
+        "the oracle masks pad, image and video positions"
+    );
 }
 
 /// A dot of exactly 0 gates with sign +1: σ(+√1e-6), not 0.5.
@@ -318,12 +376,16 @@ fn engram_forward_refuses_bad_shapes() {
     let w = engram_weights(o);
     let x = arr(&o["x"], &[2, 4, 8]);
     let rows = f32s(&o["rows"]);
-    assert!(engram::forward(&x, &rows[1..], &w).is_err(), "short rows");
-    assert!(engram::forward(&x, &[], &w).is_err(), "no rows");
+    let keep = [true, true];
+    assert!(
+        engram::forward(&x, &rows[1..], &keep, &w).is_err(),
+        "short rows"
+    );
+    assert!(engram::forward(&x, &[], &keep, &w).is_err(), "no rows");
     let x3 = x.slice(&[0, 0, 0], &[2, 3, 8]).unwrap();
-    assert!(engram::forward(&x3, &rows, &w).is_err(), "3 streams");
+    assert!(engram::forward(&x3, &rows, &keep, &w).is_err(), "3 streams");
     let x2 = x.reshape(&[2, 32]).unwrap();
-    assert!(engram::forward(&x2, &rows, &w).is_err(), "rank 2");
+    assert!(engram::forward(&x2, &rows, &keep, &w).is_err(), "rank 2");
 }
 
 /// Small vocab, chunks of 8 rows: the chunked BF16 head equals one f32

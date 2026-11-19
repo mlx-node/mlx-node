@@ -15,6 +15,15 @@
 //! and are added in f32 in that order, so a row's bits do not depend on the
 //! other rows, the slots or the call split. Routed experts come from the
 //! class bank (trunk layers) or from resident affine codes (the MTP layer).
+//!
+//! The rows of one call are one sequence's prefill slice or decode rows of
+//! one or more sequences (`RowKind`, given by the caller):
+//!
+//! | op | decode rows | prefill slice |
+//! |---|---|---|
+//! | Q8 matrices (`qlinear`) | all rows in one call, 1 row padded to 2 | all rows |
+//! | f32 router | one call per row | all rows |
+//! | routed experts | one bank `prepare` over the union, victims | one `prepare`, staging |
 
 use std::sync::Arc;
 
@@ -29,7 +38,6 @@ use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::attention::{linear, rms_norm};
 use crate::models::deepseek_v41::ops::swiglu;
 use crate::models::deepseek_v41::store::Dense;
-use crate::moe_stream::cache::decode_step;
 
 /// FFN rows per chunk: the routed scratch is `rows x k x (2 ff + latent)`.
 pub const FFN_CHUNK_ROWS: usize = 256;
@@ -40,6 +48,52 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 
 fn dims(a: &MxArray) -> Result<Vec<i64>> {
     Ok(a.shape()?.as_ref().to_vec())
+}
+
+/// What the rows of a call are; the bank's victim / staging choice follows
+/// it, never the row count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    /// Next-token or verify rows of one or more sequences.
+    Decode,
+    /// One sequence's prefill slice.
+    Prefill,
+}
+
+impl RowKind {
+    pub fn is_decode(self) -> bool {
+        self == Self::Decode
+    }
+}
+
+/// `linear` where a 1-row `x` through a Q8 (`Dense::Qmm`) matrix runs as
+/// `[x; 0]` and keeps row 0: MLX routes M = 1 to `qmv` and M >= 2 to
+/// `qmv_wide` (`backend/metal/quantized.cpp`), so a row alone and the same
+/// row among others take the same kernel.
+pub fn qlinear(x: &MxArray, w: &Dense) -> Result<MxArray> {
+    if !matches!(w, Dense::Qmm { .. }) || x.ndim()? != 2 || x.shape_at(0)? != 1 {
+        return linear(x, w);
+    }
+    let y = linear(&x.pad(&[0, 1, 0, 0], 0.0)?, w)?;
+    y.slice(&[0, 0], &[1, y.shape_at(1)?])
+}
+
+/// `f(row)` for every row of `x [n, ..]`, concatenated on axis 0.
+pub fn per_row(x: &MxArray, f: impl Fn(&MxArray) -> Result<MxArray>) -> Result<MxArray> {
+    let shape = dims(x)?;
+    let n = shape.first().copied().unwrap_or(0);
+    if n == 1 {
+        return f(x);
+    }
+    let mut stop = shape.clone();
+    let mut start = vec![0; shape.len()];
+    let mut outs = Vec::with_capacity(n.max(0) as usize);
+    for r in 0..n {
+        start[0] = r;
+        stop[0] = r + 1;
+        outs.push(f(&x.slice(&start, &stop)?)?);
+    }
+    MxArray::concatenate_many(outs.iter().collect(), Some(0))
 }
 
 /// What one layer's FFN runs with.
@@ -319,9 +373,9 @@ fn want2(w: &Dense, rows: usize, cols: usize, what: &str) -> Result<()> {
 
 /// `down(silu(gate·x)·(up·x))` in f32, no clamp.
 fn mlp(x: &MxArray, gate: &Dense, up: &Dense, down: &Dense) -> Result<MxArray> {
-    let g = linear(x, gate)?;
-    let u = linear(x, up)?;
-    linear(&swiglu(&g, &u, 0.0, None, DType::Float32)?, down)
+    let g = qlinear(x, gate)?;
+    let u = qlinear(x, up)?;
+    qlinear(&swiglu(&g, &u, 0.0, None, DType::Float32)?, down)
 }
 
 struct Moe {
@@ -386,17 +440,19 @@ impl Moe {
     }
 
     /// `x [rows, dim]` f32 (after `ffn_norm`) -> the FFN output before
-    /// `post_ffw_norm`, and the routes. `decode`: the whole call is one
-    /// decode step (bank cache victims) rather than a prefill (staging).
+    /// `post_ffw_norm`, and the routes.
     fn forward(
         &self,
         layer: usize,
         w: &MoeWeights,
         x: &MxArray,
-        decode: bool,
+        kind: RowKind,
     ) -> Result<(MxArray, Routes)> {
         let tp = prof_start();
-        let scores = router_scores(x, &w.router)?;
+        let scores = match kind {
+            RowKind::Decode => per_row(x, |r| router_scores(r, &w.router))?,
+            RowKind::Prefill => router_scores(x, &w.router)?,
+        };
         let (ids, weights) = route(&scores, self.bias.as_deref(), &self.moe)?;
         prof_end(Phase::Router, tp, &[])?;
         let routes = Routes {
@@ -405,11 +461,11 @@ impl Moe {
             weights,
         };
         let tp = prof_start();
-        let z = linear(x, &w.routed_down)?;
+        let z = qlinear(x, &w.routed_down)?;
         prof_end(Phase::Routed, tp, &[&z])?;
-        let r = self.routed(layer, &z, &routes, decode)?;
+        let r = self.routed(layer, &z, &routes, kind)?;
         let tp = prof_start();
-        let up = linear(&r, &w.routed_up)?;
+        let up = qlinear(&r, &w.routed_up)?;
         prof_end(Phase::Routed, tp, &[&up])?;
         let tp = prof_start();
         let f = up.add(&mlp(x, &w.shared_gate, &w.shared_up, &w.shared_down)?)?;
@@ -417,8 +473,9 @@ impl Moe {
         Ok((f, routes))
     }
 
-    /// `z [rows, latent]` -> `Σ w_e · expert_e(z)` `[rows, latent]` f32.
-    fn routed(&self, layer: usize, z: &MxArray, routes: &Routes, decode: bool) -> Result<MxArray> {
+    /// `z [rows, latent]` -> `Σ w_e · expert_e(z)` `[rows, latent]` f32;
+    /// the bank prepares the union of the rows' experts once.
+    fn routed(&self, layer: usize, z: &MxArray, routes: &Routes, kind: RowKind) -> Result<MxArray> {
         let rows = z.shape_at(0)?;
         let n = self.moe.n_experts as u32;
         if routes.k != self.moe.n_used
@@ -446,7 +503,7 @@ impl Moe {
             ExpertSource::Bank(bank) => {
                 let (used, uses) = distinct_uses(&ids);
                 let tp = prof_start();
-                let p = bank.prepare(layer, &used, &uses, decode)?;
+                let p = bank.prepare(layer, &used, &uses, kind.is_decode())?;
                 prof_end(Phase::Fill, tp, &[])?;
                 bank.assert_slots(&p);
                 let tp = prof_start();
@@ -509,7 +566,7 @@ impl Moe {
     }
 }
 
-enum Kind {
+enum FfnKind {
     Dense,
     Moe(Box<Moe>),
 }
@@ -519,7 +576,7 @@ pub struct LayerFfn {
     layer: usize,
     dim: usize,
     eps: f32,
-    kind: Kind,
+    kind: FfnKind,
 }
 
 impl LayerFfn {
@@ -540,10 +597,10 @@ impl LayerFfn {
                         c.dense_ff
                     )));
                 }
-                Kind::Dense
+                FfnKind::Dense
             }
             (Ffn::Moe(m), Some(src)) if !c.dense => {
-                Kind::Moe(Box::new(Moe::new(c, layer, m, src)?))
+                FfnKind::Moe(Box::new(Moe::new(c, layer, m, src)?))
             }
             (Ffn::Mlp { .. }, Some(_)) => {
                 return Err(bad(format!(
@@ -575,19 +632,31 @@ impl LayerFfn {
     }
 
     pub fn is_moe(&self) -> bool {
-        matches!(self.kind, Kind::Moe(_))
+        matches!(self.kind, FfnKind::Moe(_))
     }
 
     /// The sublayer output `[n, dim]` f32 for `h [n, dim]` (the HC-reduced
     /// stream, before `ffn_norm`), and the routes of a MoE layer.
-    pub fn forward(&self, w: &LayerWeights, h: &MxArray) -> Result<(MxArray, Option<Routes>)> {
-        self.forward_chunked(&w.ffn, &w.ffn_norm, &w.post_ffw_norm, h, FFN_CHUNK_ROWS)
+    pub fn forward(
+        &self,
+        w: &LayerWeights,
+        h: &MxArray,
+        kind: RowKind,
+    ) -> Result<(MxArray, Option<Routes>)> {
+        self.forward_chunked(
+            &w.ffn,
+            &w.ffn_norm,
+            &w.post_ffw_norm,
+            h,
+            FFN_CHUNK_ROWS,
+            kind,
+        )
     }
 
     /// `forward` from the parts, `chunk` rows per expert step; every chunk
-    /// is evaluated before the next starts when there is more than one. A
-    /// call of more than one row is a prefill in every chunk, so a short
-    /// last chunk never evicts the bank's cache.
+    /// is evaluated before the next starts when there is more than one.
+    /// Every chunk runs as `kind`, so a short last prefill chunk never
+    /// evicts the bank's cache.
     pub fn forward_chunked(
         &self,
         ffn: &Ffn,
@@ -595,6 +664,7 @@ impl LayerFfn {
         post_norm: &MxArray,
         h: &MxArray,
         chunk: usize,
+        kind: RowKind,
     ) -> Result<(MxArray, Option<Routes>)> {
         let shape = dims(h)?;
         let n = match shape.as_slice() {
@@ -610,11 +680,10 @@ impl LayerFfn {
             return Err(bad("chunk of 0 rows"));
         }
         let x = rms_norm(&h.astype(DType::Float32)?, norm, self.eps)?;
-        let decode = decode_step(n);
         let parts = chunks(n, chunk);
         let mut routes = match &self.kind {
-            Kind::Dense => None,
-            Kind::Moe(m) => Some(Routes {
+            FfnKind::Dense => None,
+            FfnKind::Moe(m) => Some(Routes {
                 k: m.moe.n_used,
                 ids: Vec::new(),
                 weights: Vec::new(),
@@ -628,14 +697,14 @@ impl LayerFfn {
                 x.slice(&[lo as i64, 0], &[hi as i64, self.dim as i64])?
             };
             let f = match (&self.kind, ffn) {
-                (Kind::Dense, Ffn::Mlp { gate, up, down }) => {
+                (FfnKind::Dense, Ffn::Mlp { gate, up, down }) => {
                     let tp = prof_start();
                     let f = mlp(&xc, gate, up, down)?;
                     prof_end(Phase::Shared, tp, &[&f])?;
                     f
                 }
-                (Kind::Moe(m), Ffn::Moe(mw)) => {
-                    let (f, r) = m.forward(self.layer, mw, &xc, decode)?;
+                (FfnKind::Moe(m), Ffn::Moe(mw)) => {
+                    let (f, r) = m.forward(self.layer, mw, &xc, kind)?;
                     if let Some(all) = routes.as_mut() {
                         all.append(r);
                     }

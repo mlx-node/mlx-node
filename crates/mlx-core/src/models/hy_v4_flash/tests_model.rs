@@ -13,8 +13,10 @@ use super::config::{
     Attn, HcConfig, HyV4FlashConfig, IndexerConfig, LayerConfig, MlaConfig, MoeConfig,
 };
 use super::engram::Hasher;
-use super::model::{Logits, Model, Output, Session, Trace, TrunkWeights, Want, call_engram_rows};
-use super::moe::ExpertSource;
+use super::model::{
+    Logits, Model, Output, OwnerRows, Session, Trace, TrunkWeights, Want, call_engram_rows,
+};
+use super::moe::{ExpertSource, RowKind};
 use super::ops::head_logits;
 use super::rows::{F8Table, ResidentF8Table};
 use super::scan::{ExpertClass, ExpertLayer, Located, Scan};
@@ -139,7 +141,7 @@ fn engram_cfg() -> EngramConfig {
     }
 }
 
-fn tiny_cfg() -> HyV4FlashConfig {
+pub(super) fn tiny_cfg() -> HyV4FlashConfig {
     let layers = KINDS
         .iter()
         .enumerate()
@@ -470,10 +472,14 @@ fn tiny_bank(cfg: &HyV4FlashConfig, seed: u64) -> (Arc<KqBank>, Temp) {
 }
 
 fn fixture() -> Fixture {
+    fixture_with_table(13)
+}
+
+fn fixture_with_table(table_seed: u64) -> Fixture {
     let cfg = tiny_cfg();
     let (bank, dir) = tiny_bank(&cfg, 7);
     let weights = tiny_weights(&cfg, 11);
-    let table = engram_table(&cfg.engram, 13);
+    let table = engram_table(&cfg.engram, table_seed);
     let b = Arc::clone(&bank);
     let model = Model::new(
         cfg,
@@ -502,8 +508,20 @@ fn run_split(model: &Model, ids: &[u32], cuts: &[usize]) -> (Vec<Vec<f32>>, Vec<
     let mut at = 0;
     for &n in cuts {
         let mut t = Trace::default();
+        let kind = if n == 1 && at > 0 {
+            RowKind::Decode
+        } else {
+            RowKind::Prefill
+        };
         let out = model
-            .forward(&mut sess, &ids[at..at + n], Want::ALL, None, Some(&mut t))
+            .forward(
+                &mut sess,
+                &ids[at..at + n],
+                kind,
+                Want::ALL,
+                None,
+                Some(&mut t),
+            )
             .unwrap();
         let v = read(out.logits.as_ref().unwrap());
         rows.extend(v.chunks(V).map(<[f32]>::to_vec));
@@ -532,8 +550,202 @@ fn assert_close(got: &[Vec<f32>], want: &[Vec<f32>], what: &str) {
 
 fn decode(model: &Model, sess: &mut Session, ids: &[u32]) -> Vec<Vec<f32>> {
     ids.iter()
-        .map(|&id| read(&model.forward_last(sess, &[id], None).unwrap()))
+        .map(|&id| {
+            read(
+                &model
+                    .forward_last(sess, &[id], RowKind::Decode, None)
+                    .unwrap(),
+            )
+        })
         .collect()
+}
+
+fn prefilled(model: &Model, ids: &[u32]) -> Session {
+    let mut s = model.new_session(CTX).unwrap();
+    model
+        .forward(&mut s, ids, RowKind::Prefill, Want::STATE, None, None)
+        .unwrap();
+    s
+}
+
+/// Route ids per layer (empty on the dense one) of a traced step.
+fn routes_of(t: &Trace) -> Vec<Vec<u32>> {
+    t.routes
+        .iter()
+        .map(|r| r.as_ref().map_or_else(Vec::new, |r| r.ids.clone()))
+        .collect()
+}
+
+fn logit_rows(x: &MxArray) -> Vec<Vec<f32>> {
+    read(x).chunks(V).map(<[f32]>::to_vec).collect()
+}
+
+/// A decode wave of three owners (one with two verify rows) gives each
+/// owner the logits and routes of its rows run alone, and advances every
+/// session by its own rows.
+#[test]
+fn decode_wave_matches_each_owner_alone() {
+    let f = fixture();
+    let prompts: Vec<Vec<u32>> = [(5u64, 9usize), (6, 14), (8, 20)]
+        .iter()
+        .map(|&(seed, n)| Rng::new(seed).ids(n))
+        .collect();
+    let next: [&[u32]; 3] = [&[7], &[3, 41], &[60]];
+    let alone: Vec<(Vec<Vec<f32>>, Vec<Vec<u32>>)> = prompts
+        .iter()
+        .zip(next)
+        .map(|(p, ids)| {
+            let mut s = prefilled(&f.model, p);
+            let mut t = Trace::default();
+            let out = f
+                .model
+                .forward(&mut s, ids, RowKind::Decode, Want::ALL, None, Some(&mut t))
+                .unwrap();
+            (logit_rows(out.logits.as_ref().unwrap()), routes_of(&t))
+        })
+        .collect();
+    let mut sessions: Vec<Session> = prompts.iter().map(|p| prefilled(&f.model, p)).collect();
+    let mut t = Trace::default();
+    let outs = {
+        let mut owners: Vec<OwnerRows<'_>> = sessions
+            .iter_mut()
+            .zip(next)
+            .map(|(sess, ids)| OwnerRows {
+                sess,
+                ids,
+                want: Want::ALL,
+            })
+            .collect();
+        f.model
+            .step(&mut owners, RowKind::Decode, None, Some(&mut t))
+            .unwrap()
+    };
+    assert_eq!(outs.len(), 3);
+    let wave = routes_of(&t);
+    let k = f.model.cfg().moe.n_used;
+    let mut row = 0;
+    for (i, ((want, want_routes), out)) in alone.iter().zip(&outs).enumerate() {
+        let n = next[i].len();
+        assert_close(
+            &logit_rows(out.logits.as_ref().unwrap()),
+            want,
+            &format!("owner {i}"),
+        );
+        for (l, r) in wave.iter().enumerate() {
+            if !r.is_empty() {
+                assert_eq!(
+                    r[row * k..(row + n) * k],
+                    want_routes[l][..],
+                    "owner {i} layer {l}"
+                );
+            }
+        }
+        assert_eq!(sessions[i].len(), prompts[i].len() + n);
+        assert_eq!(&sessions[i].tokens()[prompts[i].len()..], next[i]);
+        row += n;
+    }
+}
+
+/// A prefill with two owners, a bad id in one owner and a cancel mid-wave
+/// are refused and leave both sessions; the wave then runs as if they never
+/// happened.
+#[test]
+fn refused_waves_leave_every_session() {
+    let f = fixture();
+    let (pa, pb) = (Rng::new(5).ids(12), Rng::new(6).ids(10));
+    let mut a = prefilled(&f.model, &pa);
+    let mut b = prefilled(&f.model, &pb);
+    let step = |a: &mut Session,
+                b: &mut Session,
+                ids: [&[u32]; 2],
+                kind: RowKind,
+                cancel: Option<&dyn Fn(usize) -> bool>| {
+        let mut owners = [
+            OwnerRows {
+                sess: a,
+                ids: ids[0],
+                want: Want::LAST,
+            },
+            OwnerRows {
+                sess: b,
+                ids: ids[1],
+                want: Want::LAST,
+            },
+        ];
+        f.model.step(&mut owners, kind, cancel, None).map(|outs| {
+            outs.iter()
+                .map(|o| read(o.logits.as_ref().unwrap()))
+                .collect::<Vec<_>>()
+        })
+    };
+    let lens = |s: &Session| {
+        (
+            s.len(),
+            s.layers().iter().map(|st| st.len()).collect::<Vec<_>>(),
+        )
+    };
+    let (la, lb) = (lens(&a), lens(&b));
+    assert!(
+        step(
+            &mut a,
+            &mut b,
+            [&[1, 2][..], &[3][..]],
+            RowKind::Prefill,
+            None
+        )
+        .is_err()
+    );
+    assert!(
+        step(
+            &mut a,
+            &mut b,
+            [&[1][..], &[V as u32][..]],
+            RowKind::Decode,
+            None
+        )
+        .is_err()
+    );
+    let at_two = |l: usize| l == 2;
+    assert!(
+        step(
+            &mut a,
+            &mut b,
+            [&[1][..], &[3][..]],
+            RowKind::Decode,
+            Some(&at_two)
+        )
+        .is_err()
+    );
+    assert_eq!((lens(&a), lens(&b)), (la, lb));
+    let got = step(&mut a, &mut b, [&[1][..], &[3][..]], RowKind::Decode, None).unwrap();
+    for (i, (p, id)) in [(&pa, 1u32), (&pb, 3)].into_iter().enumerate() {
+        let mut s = prefilled(&f.model, p);
+        let want = read(
+            &f.model
+                .forward_last(&mut s, &[id], RowKind::Decode, None)
+                .unwrap(),
+        );
+        assert_close(&[got[i].clone()], &[want], &format!("owner {i}"));
+    }
+}
+
+/// Pad positions get no Engram delta: a pad-only prompt's logits do not
+/// depend on the Engram table, a text prompt's do.
+#[test]
+fn pad_positions_ignore_the_engram_table() {
+    let (f13, f17) = (fixture_with_table(13), fixture_with_table(17));
+    let run = |f: &Fixture, ids: &[u32]| {
+        let mut s = f.model.new_session(CTX).unwrap();
+        read(
+            &f.model
+                .forward_last(&mut s, ids, RowKind::Prefill, None)
+                .unwrap(),
+        )
+    };
+    let pads = [(V - 1) as u32; 5];
+    assert_eq!(run(&f13, &pads), run(&f17, &pads));
+    let text = [3u32, 17, 40, 2, 61];
+    assert_ne!(run(&f13, &text), run(&f17, &text));
 }
 
 #[test]
@@ -579,7 +791,11 @@ fn last_row_and_hidden_rows() {
     let (all, _) = run_split(&f.model, &ids, &[24]);
 
     let mut a = f.model.new_session(CTX).unwrap();
-    let last = read(&f.model.forward_last(&mut a, &ids, None).unwrap());
+    let last = read(
+        &f.model
+            .forward_last(&mut a, &ids, RowKind::Prefill, None)
+            .unwrap(),
+    );
     assert_close(std::slice::from_ref(&last), &all[23..], "last row");
 
     let mut b = f.model.new_session(CTX).unwrap();
@@ -588,6 +804,7 @@ fn last_row_and_hidden_rows() {
         .forward(
             &mut b,
             &ids,
+            RowKind::Prefill,
             Want {
                 logits: Logits::Last,
                 hidden: true,
@@ -610,7 +827,14 @@ fn last_row_and_hidden_rows() {
     let mut c = f.model.new_session(CTX).unwrap();
     let Output { logits, hidden } = f
         .model
-        .forward(&mut c, &ids[..20], Want::STATE, None, None)
+        .forward(
+            &mut c,
+            &ids[..20],
+            RowKind::Prefill,
+            Want::STATE,
+            None,
+            None,
+        )
         .unwrap();
     assert!(logits.is_none() && hidden.is_none());
     assert_eq!(c.len(), 20);
@@ -623,16 +847,24 @@ fn failed_call_leaves_the_session() {
     let f = fixture();
     let ids = prompt();
     let mut clean = f.model.new_session(CTX).unwrap();
-    f.model.forward_last(&mut clean, &ids[..20], None).unwrap();
-    let want = read(&f.model.forward_last(&mut clean, &ids[20..], None).unwrap());
+    f.model
+        .forward_last(&mut clean, &ids[..20], RowKind::Prefill, None)
+        .unwrap();
+    let want = read(
+        &f.model
+            .forward_last(&mut clean, &ids[20..], RowKind::Prefill, None)
+            .unwrap(),
+    );
 
     let mut sess = f.model.new_session(CTX).unwrap();
-    f.model.forward_last(&mut sess, &ids[..20], None).unwrap();
+    f.model
+        .forward_last(&mut sess, &ids[..20], RowKind::Prefill, None)
+        .unwrap();
     for stop in [0usize, 1, 2, 3] {
         let cancel = move |l: usize| l == stop;
         assert!(
             f.model
-                .forward_last(&mut sess, &ids[20..], Some(&cancel))
+                .forward_last(&mut sess, &ids[20..], RowKind::Prefill, Some(&cancel))
                 .is_err(),
             "cancel at layer {stop}"
         );
@@ -642,12 +874,28 @@ fn failed_call_leaves_the_session() {
             "layer lens after cancel at {stop}"
         );
     }
-    assert!(f.model.forward_last(&mut sess, &[V as u32], None).is_err());
-    assert!(f.model.forward_last(&mut sess, &[], None).is_err());
+    assert!(
+        f.model
+            .forward_last(&mut sess, &[V as u32], RowKind::Decode, None)
+            .is_err()
+    );
+    assert!(
+        f.model
+            .forward_last(&mut sess, &[], RowKind::Prefill, None)
+            .is_err()
+    );
     let past = vec![1u32; CTX - 19];
-    assert!(f.model.forward_last(&mut sess, &past, None).is_err());
+    assert!(
+        f.model
+            .forward_last(&mut sess, &past, RowKind::Prefill, None)
+            .is_err()
+    );
     assert_eq!(sess.len(), 20);
-    let got = read(&f.model.forward_last(&mut sess, &ids[20..], None).unwrap());
+    let got = read(
+        &f.model
+            .forward_last(&mut sess, &ids[20..], RowKind::Prefill, None)
+            .unwrap(),
+    );
     assert_eq!(got, want, "a failed call changed the next call");
 }
 
@@ -656,7 +904,9 @@ fn mark_restore_replays_exactly() {
     let f = fixture();
     let ids = prompt();
     let mut sess = f.model.new_session(CTX).unwrap();
-    f.model.forward_last(&mut sess, &ids[..14], None).unwrap();
+    f.model
+        .forward_last(&mut sess, &ids[..14], RowKind::Prefill, None)
+        .unwrap();
     let mark = sess.mark();
     assert_eq!(mark.len(), 14);
     let first = decode(&f.model, &mut sess, &ids[14..]);
@@ -677,7 +927,9 @@ fn restore_refuses_a_rewritten_mark() {
     let f = fixture();
     let ids = prompt();
     let mut sess = f.model.new_session(CTX).unwrap();
-    f.model.forward_last(&mut sess, &ids[..14], None).unwrap();
+    f.model
+        .forward_last(&mut sess, &ids[..14], RowKind::Prefill, None)
+        .unwrap();
     let early = sess.mark();
     decode(&f.model, &mut sess, &ids[14..]);
     let late = sess.mark();
@@ -700,11 +952,17 @@ fn profiled_call_times_every_trunk_phase() {
     let f = fixture();
     let ids = prompt();
     let mut plain = f.model.new_session(CTX).unwrap();
-    let want = read(&f.model.forward_last(&mut plain, &ids, None).unwrap());
+    let want = read(
+        &f.model
+            .forward_last(&mut plain, &ids, RowKind::Prefill, None)
+            .unwrap(),
+    );
     let before = phase_seconds();
     set_profiling(true);
     let mut sess = f.model.new_session(CTX).unwrap();
-    let got = f.model.forward_last(&mut sess, &ids, None);
+    let got = f
+        .model
+        .forward_last(&mut sess, &ids, RowKind::Prefill, None);
     set_profiling(false);
     let after = phase_seconds();
     assert_close(&[read(&got.unwrap())], &[want], "profiled logits");
@@ -720,7 +978,9 @@ fn truncate_within_the_slack_replays_exactly() {
     let f = fixture();
     let ids = prompt();
     let mut sess = f.model.new_session(CTX).unwrap();
-    f.model.forward_last(&mut sess, &ids[..20], None).unwrap();
+    f.model
+        .forward_last(&mut sess, &ids[..20], RowKind::Prefill, None)
+        .unwrap();
     let first = decode(&f.model, &mut sess, &ids[20..]);
 
     sess.truncate(21).unwrap();
@@ -733,7 +993,9 @@ fn truncate_within_the_slack_replays_exactly() {
     assert_eq!(sess.len(), 24);
     assert!(sess.layers().iter().all(|st| st.len() == 24));
     let mut clean = f.model.new_session(CTX).unwrap();
-    f.model.forward_last(&mut clean, &ids[..20], None).unwrap();
+    f.model
+        .forward_last(&mut clean, &ids[..20], RowKind::Prefill, None)
+        .unwrap();
     decode(&f.model, &mut clean, &ids[20..]);
     let next = [3u32];
     assert_eq!(
@@ -746,8 +1008,16 @@ fn truncate_within_the_slack_replays_exactly() {
     assert!(sess.is_empty());
     let mut fresh = f.model.new_session(CTX).unwrap();
     assert_eq!(
-        read(&f.model.forward_last(&mut sess, &ids, None).unwrap()),
-        read(&f.model.forward_last(&mut fresh, &ids, None).unwrap()),
+        read(
+            &f.model
+                .forward_last(&mut sess, &ids, RowKind::Prefill, None)
+                .unwrap()
+        ),
+        read(
+            &f.model
+                .forward_last(&mut fresh, &ids, RowKind::Prefill, None)
+                .unwrap()
+        ),
         "reuse of the buffers after truncate(0)"
     );
 }
@@ -839,7 +1109,7 @@ fn real_trunk_forward_last() {
     let mut a = model.new_session(64).unwrap();
     let all = read(
         model
-            .forward(&mut a, &ids, Want::ALL, None, None)
+            .forward(&mut a, &ids, RowKind::Prefill, Want::ALL, None, None)
             .unwrap()
             .logits
             .as_ref()
@@ -848,7 +1118,11 @@ fn real_trunk_forward_last() {
     assert!(all.iter().all(|v| v.is_finite()), "non-finite logits");
     let rows: Vec<Vec<f32>> = all.chunks(vocab).map(<[f32]>::to_vec).collect();
     let mut b2 = model.new_session(64).unwrap();
-    let last = read(&model.forward_last(&mut b2, &ids, None).unwrap());
+    let last = read(
+        &model
+            .forward_last(&mut b2, &ids, RowKind::Prefill, None)
+            .unwrap(),
+    );
     let tol = |w: f32| 2e-3 + 2e-3 * w.abs();
     assert!(
         last.iter()

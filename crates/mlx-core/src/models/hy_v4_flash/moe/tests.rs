@@ -486,7 +486,14 @@ fn resident_moe_matches_reference() {
     assert!(layer.is_moe());
     let hs = inputs(&mut rng, 16, c.dim);
     let got = layer
-        .forward_chunked(&ffn, &norm, &post, &rows_arr(&hs), FFN_CHUNK_ROWS)
+        .forward_chunked(
+            &ffn,
+            &norm,
+            &post,
+            &rows_arr(&hs),
+            FFN_CHUNK_ROWS,
+            RowKind::Prefill,
+        )
         .unwrap();
     let checked = check_moe(
         &c,
@@ -516,8 +523,12 @@ fn chunked_forward_matches_one_call() {
     let ffn = Ffn::Moe(w);
     let layer = LayerFfn::new(&c, 1, &ffn, Some(ExpertSource::Resident(experts))).unwrap();
     let h = rows_arr(&inputs(&mut rng, 16, c.dim));
-    let (one, r1) = layer.forward_chunked(&ffn, &norm, &post, &h, 256).unwrap();
-    let (split, r5) = layer.forward_chunked(&ffn, &norm, &post, &h, 5).unwrap();
+    let (one, r1) = layer
+        .forward_chunked(&ffn, &norm, &post, &h, 256, RowKind::Prefill)
+        .unwrap();
+    let (split, r5) = layer
+        .forward_chunked(&ffn, &norm, &post, &h, 5, RowKind::Prefill)
+        .unwrap();
     let (r1, r5) = (r1.unwrap(), r5.unwrap());
     assert_eq!(r1.ids, r5.ids);
     for (a, b) in r1.weights.iter().zip(&r5.weights) {
@@ -535,6 +546,7 @@ fn chunked_forward_matches_one_call() {
             &post,
             &h.slice(&[7, 0], &[8, c.dim as i64]).unwrap(),
             256,
+            RowKind::Prefill,
         )
         .unwrap();
     assert_eq!(single.1.unwrap().ids, r1.ids[7 * m.n_used..8 * m.n_used]);
@@ -570,7 +582,14 @@ fn dense_ffn_matches_reference_without_clamp() {
     assert!(!layer.is_moe());
     let hs = inputs(&mut rng, 6, d);
     let (y, routes) = layer
-        .forward_chunked(&ffn, &norm, &post, &rows_arr(&hs), FFN_CHUNK_ROWS)
+        .forward_chunked(
+            &ffn,
+            &norm,
+            &post,
+            &rows_arr(&hs),
+            FFN_CHUNK_ROWS,
+            RowKind::Prefill,
+        )
         .unwrap();
     assert!(routes.is_none());
     let (nh, ph) = (host(&norm), host(&post));
@@ -635,12 +654,20 @@ fn ffn_refuses_mismatched_weights() {
     let layer = LayerFfn::new(&c, 1, &moe, src(&mut rng)).unwrap();
     let norm = vector(vec![1.0; 96]);
     let h = rows_arr(&inputs(&mut rng, 2, 96));
-    assert!(layer.forward_chunked(&mlp, &norm, &norm, &h, 256).is_err());
-    assert!(layer.forward_chunked(&moe, &norm, &norm, &h, 0).is_err());
+    assert!(
+        layer
+            .forward_chunked(&mlp, &norm, &norm, &h, 256, RowKind::Prefill)
+            .is_err()
+    );
+    assert!(
+        layer
+            .forward_chunked(&moe, &norm, &norm, &h, 0, RowKind::Prefill)
+            .is_err()
+    );
     let narrow = rows_arr(&inputs(&mut rng, 2, 95));
     assert!(
         layer
-            .forward_chunked(&moe, &norm, &norm, &narrow, 256)
+            .forward_chunked(&moe, &norm, &norm, &narrow, 256, RowKind::Prefill)
             .is_err()
     );
 }
@@ -817,7 +844,14 @@ fn bank_moe_matches_dequantized_experts() {
             LayerFfn::new(&c, il, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
         let hs = inputs(&mut rng, 16, c.dim);
         let got = layer
-            .forward_chunked(&ffn, &norm, &post, &rows_arr(&hs), FFN_CHUNK_ROWS)
+            .forward_chunked(
+                &ffn,
+                &norm,
+                &post,
+                &rows_arr(&hs),
+                FFN_CHUNK_ROWS,
+                RowKind::Prefill,
+            )
             .unwrap();
         let what = format!("bank layer {il}");
         check_moe(
@@ -831,7 +865,14 @@ fn bank_moe_matches_dequantized_experts() {
             &what,
         );
         let one = layer
-            .forward_chunked(&ffn, &norm, &post, &rows_arr(&hs[3..4]), FFN_CHUNK_ROWS)
+            .forward_chunked(
+                &ffn,
+                &norm,
+                &post,
+                &rows_arr(&hs[3..4]),
+                FFN_CHUNK_ROWS,
+                RowKind::Decode,
+            )
             .unwrap();
         check_moe(
             &c,
@@ -896,15 +937,133 @@ fn prefill_tail_chunk_leaves_the_cache() {
     let hs = inputs(&mut rng, 6, c.dim);
     let hits = || bank.stats().iter().map(|s| s.hits).sum::<usize>();
     layer
-        .forward_chunked(&ffn, &norm, &post, &rows_arr(&hs), 5)
+        .forward_chunked(&ffn, &norm, &post, &rows_arr(&hs), 5, RowKind::Prefill)
         .unwrap();
     bank.end_turn().unwrap();
     let before = hits();
     layer
-        .forward_chunked(&ffn, &norm, &post, &rows_arr(&hs[5..6]), FFN_CHUNK_ROWS)
+        .forward_chunked(
+            &ffn,
+            &norm,
+            &post,
+            &rows_arr(&hs[5..6]),
+            FFN_CHUNK_ROWS,
+            RowKind::Decode,
+        )
         .unwrap();
     bank.end_turn().unwrap();
     assert_eq!(hits(), before, "the prefill's 1-row chunk filled the cache");
+}
+
+/// The kind, not the row count, picks the bank path: a 3-row prefill
+/// twice leaves the 1-slot cache empty, the same 3 rows as a decode wave
+/// take victims and hit on the next wave. Routes and outputs are the
+/// prefill's (one bank `prepare` over the rows' union either way).
+#[test]
+fn decode_wave_takes_victims_at_any_row_count() {
+    let mut rng = Rng::new(29);
+    let m = moe_cfg(6, 2, 512, 256);
+    let c = ffn_cfg(128, m.clone(), 0.5);
+    let mut file = rng.bytes(1000);
+    let experts = vec![
+        None,
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            1,
+            ExpertClass::Q6kDown,
+            &mut file,
+        )),
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            2,
+            ExpertClass::Q4kDown,
+            &mut file,
+        )),
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            3,
+            ExpertClass::Q6kDown,
+            &mut file,
+        )),
+    ];
+    let dir = Temp::new();
+    let path = dir.0.join("data.bin");
+    std::fs::write(&path, &file).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+    let bank = Arc::new(KqBank::new(pool, &m, &experts, [1, 1], 1).unwrap());
+    let (w, norm, post) = moe_weights(&mut rng, &c, 64);
+    let ffn = Ffn::Moe(w);
+    let layer = LayerFfn::new(&c, 1, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
+    let h = rows_arr(&inputs(&mut rng, 3, c.dim));
+    let hits = || bank.stats().iter().map(|s| s.hits).sum::<usize>();
+    let run = |kind: RowKind| {
+        let out = layer
+            .forward_chunked(&ffn, &norm, &post, &h, FFN_CHUNK_ROWS, kind)
+            .unwrap();
+        bank.end_turn().unwrap();
+        out
+    };
+    let (pre, pre_routes) = run(RowKind::Prefill);
+    run(RowKind::Prefill);
+    assert_eq!(hits(), 0, "a 3-row prefill filled the cache");
+    let (dec, dec_routes) = run(RowKind::Decode);
+    run(RowKind::Decode);
+    assert!(hits() > 0, "a 3-row decode wave took no victims");
+    assert_eq!(dec_routes.unwrap().ids, pre_routes.unwrap().ids);
+    let want: Vec<Vec<f64>> = read(&pre)
+        .chunks_exact(c.dim)
+        .map(|r| r.iter().map(|&v| f64::from(v)).collect())
+        .collect();
+    assert_rows(&read(&dec), &want, 1e-5, "decode wave vs prefill");
+}
+
+/// A 1-row `qlinear` through a Q8 matrix is row 0 of the 2-row call of
+/// `[x; 0]` bit for bit, and each row of a 3-row call equals that row
+/// padded alone (`qmv_wide` at every M in 2..limit); f32 matrices are not
+/// padded.
+#[test]
+fn qlinear_pads_one_q8_row() {
+    let mut rng = Rng::new(31);
+    let (k, n) = (256usize, 64usize);
+    let w = MxArray::from_float32(&rng.vec(n * k, 0.1), &[n as i64, k as i64]).unwrap();
+    let q = AffineProj::quantize(&w.reshape(&[1, n as i64, k as i64]).unwrap(), 32, 8).unwrap();
+    let sq = |a: &MxArray| {
+        a.reshape(&[a.shape_at(1).unwrap(), a.shape_at(2).unwrap()])
+            .unwrap()
+    };
+    let dense = Dense::Qmm {
+        w: sq(&q.w),
+        scales: sq(&q.s).astype(DType::Float32).unwrap(),
+        biases: sq(&q.b).astype(DType::Float32).unwrap(),
+    };
+    let rows: Vec<Vec<f32>> = (0..3).map(|_| rng.vec(k, 1.0)).collect();
+    let alone: Vec<Vec<f32>> = rows
+        .iter()
+        .map(|r| read(&qlinear(&rows_arr(std::slice::from_ref(r)), &dense).unwrap()))
+        .collect();
+    let mut padded = rows[0].clone();
+    padded.extend(std::iter::repeat_n(0.0, k));
+    let two = read(
+        &linear(
+            &MxArray::from_float32(&padded, &[2, k as i64]).unwrap(),
+            &dense,
+        )
+        .unwrap(),
+    );
+    assert_eq!(alone[0], two[..n], "padded row 0");
+    let three = read(&qlinear(&rows_arr(&rows), &dense).unwrap());
+    for (i, a) in alone.iter().enumerate() {
+        assert_eq!(three[i * n..(i + 1) * n], a[..], "row {i} of 3 vs alone");
+    }
+    let f = Dense::Array(w);
+    let x = rows_arr(&rows[..1]);
+    assert_eq!(
+        read(&qlinear(&x, &f).unwrap()),
+        read(&linear(&x, &f).unwrap())
+    );
 }
 
 fn real_scan() -> Scan {
@@ -988,7 +1147,14 @@ fn real_layer_ffn_matches_dequantized_reference() {
             LayerFfn::new(&c, il, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
         let hs = inputs(&mut rng, 16, cfg.dim);
         let got = layer
-            .forward_chunked(&ffn, &norm, &post, &rows_arr(&hs), FFN_CHUNK_ROWS)
+            .forward_chunked(
+                &ffn,
+                &norm,
+                &post,
+                &rows_arr(&hs),
+                FFN_CHUNK_ROWS,
+                RowKind::Prefill,
+            )
             .unwrap();
         assert!(
             read(&got.0).iter().all(|v| v.is_finite()),
@@ -1026,7 +1192,14 @@ fn real_layer_ffn_matches_dequantized_reference() {
     let layer = LayerFfn::new(&c, 0, &ffn, None).unwrap();
     let hs = inputs(&mut rng, 16, cfg.dim);
     let (y, _) = layer
-        .forward_chunked(&ffn, &norm, &post, &rows_arr(&hs), FFN_CHUNK_ROWS)
+        .forward_chunked(
+            &ffn,
+            &norm,
+            &post,
+            &rows_arr(&hs),
+            FFN_CHUNK_ROWS,
+            RowKind::Prefill,
+        )
         .unwrap();
     let (nh, ph) = (host(&norm), host(&post));
     let want: Vec<Vec<f64>> = as_f64(&hs)

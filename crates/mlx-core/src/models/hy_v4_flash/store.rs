@@ -11,6 +11,16 @@
 //! cache bytes -> class slots in proportion to the classes' layers
 //! ```
 //!
+//! A staging layer is charged 1024 slots (512 per class) at the larger
+//! slot: 2 layers = 2 x 1024 x 4,663,296 B = 8.89 GiB, above the 8.35 GiB
+//! the bank allocates.
+//!
+//! Lanes (sequences decoded together) share one KV allowance sized for the
+//! admitted context; each lane past the first is charged its floor
+//! (`lane_floor`). The load admits `min(LANES_MAX, MLX_SCHED_MAX_NUM_SEQS)`
+//! lanes, fewer when only fewer fit. A decode wave holds at most `row_cap`
+//! rows (`row_cap`), the rows its Q8 matrices take through `qmv_wide`.
+//!
 //! A turn is `begin_turn` .. `end_turn` (`Lease`): the start re-admits at the
 //! same context and chunk and may drop the bank to staging-only or rebuild
 //! it, then holds a wired-limit lease of fixed + cache bytes until the end,
@@ -22,6 +32,7 @@ use std::time::Instant;
 use napi::{Error, Result};
 
 use super::bank::{CLASSES, ClassLayout, KqBank, slot_bytes};
+use super::cache::WINDOW_SLACK;
 use super::config::{Attn, HyV4FlashConfig};
 use super::model::Model;
 use super::moe::ExpertSource;
@@ -47,6 +58,10 @@ pub const MTP_ENV: &str = "MLX_HY4_MTP";
 pub const CHUNKS: [usize; 3] = [8192, 4096, 2048];
 /// The context ladder's floor.
 pub const MIN_CONTEXT: usize = 16_384;
+/// Most lanes a load admits.
+pub const LANES_MAX: usize = 4;
+/// Overrides MLX's qmv batch limit for every shape (`quantized.cpp`).
+pub const SPLITK_ENV: &str = "MLX_QMM_SPLITK_MIN_M";
 const CHUNK_ALIGN: usize = 256;
 
 const MIB: u64 = 1 << 20;
@@ -95,6 +110,166 @@ pub fn kv_per_token(cfg: &HyV4FlashConfig, mtp: bool) -> u64 {
     let dim = cfg.indexer.head_dim as u64;
     let kpool = cfg.indexer.kpool.max(1) as u64;
     n * row * 2 + n * dim * 2 / kpool + 4
+}
+
+/// `profile` with `lanes - 1` lane floors added to the KV base.
+pub fn lane_profile(p: &Profile, lanes: usize, floor: u64) -> Profile {
+    Profile {
+        kv_base: p.kv_base + lanes.saturating_sub(1) as u64 * floor,
+        ..*p
+    }
+}
+
+/// Bytes a lane holds beside the shared KV allowance: the f16 window ring
+/// (`window + WINDOW_SLACK` rows) of every sliding layer, the f32 indexer
+/// tail (`kpool - 1 + WINDOW_SLACK` rows) of every indexed layer (the MTP
+/// layer's with `mtp`) and one f32 seed row.
+pub fn lane_floor(cfg: &HyV4FlashConfig, mtp: bool) -> u64 {
+    let layers = if mtp { &cfg.layers[..] } else { cfg.trunk() };
+    let count = |a: Attn| layers.iter().filter(|l| l.attn == a).count() as u64;
+    let windows =
+        count(Attn::Sliding) * (cfg.window + WINDOW_SLACK) as u64 * cfg.mla.kv_row() as u64 * 2;
+    let tail = (cfg.indexer.kpool.saturating_sub(1) + WINDOW_SLACK) as u64;
+    let tails = count(Attn::Indexed) * tail * cfg.indexer.head_dim as u64 * 4;
+    windows + tails + cfg.dim as u64 * 4
+}
+
+/// The most lanes up to `want` (at least 1) whose admission `admit(lanes)`
+/// passes, with that admission; one lane's refusal otherwise.
+pub fn plan_lanes<T>(want: usize, mut admit: impl FnMut(usize) -> Result<T>) -> Result<(usize, T)> {
+    let mut lanes = want.max(1);
+    loop {
+        match admit(lanes) {
+            Ok(t) => return Ok((lanes, t)),
+            Err(e) if lanes == 1 => return Err(e),
+            Err(e) => {
+                tracing::info!(
+                    "hy_v4_flash admission refused {lanes} lanes ({}); trying {}",
+                    e.reason,
+                    lanes - 1
+                );
+                lanes -= 1;
+            }
+        }
+    }
+}
+
+/// MLX's `get_qmv_batch_limit(D, O)` (`backend/metal/quantized.cpp`) on the
+/// Metal architecture `arch` (`applegpu_g16s`: generation from the two
+/// digits before the size letter, as `metal/device.cpp`): from this many
+/// rows a transposed `quantized_matmul` of `k` inputs and `n` outputs
+/// leaves the matvec kernels.
+pub fn qmv_batch_limit(arch: &str, k: usize, n: usize) -> usize {
+    let b = arch.as_bytes();
+    let digit = |back: usize| {
+        b.len()
+            .checked_sub(back)
+            .and_then(|i| b.get(i))
+            .filter(|c| c.is_ascii_digit())
+            .map_or(0, |c| usize::from(c - b'0'))
+    };
+    let generation = if b.len() >= 3 {
+        digit(3) * 10 + digit(2)
+    } else {
+        0
+    };
+    let size = b.last().copied().unwrap_or(0);
+    let class = if k <= 2048 && n <= 2048 {
+        0
+    } else if k <= 4096 && n <= 4096 {
+        1
+    } else {
+        2
+    };
+    let table: [usize; 3] = if generation >= 17 && size != b'd' {
+        [33, 25, 13]
+    } else if generation >= 15 && size != b'd' {
+        [13, 15, 13]
+    } else if size == b'd' {
+        [32, 18, 12]
+    } else if generation >= 13 {
+        [
+            14,
+            10,
+            if generation == 13 && size == b's' {
+                7
+            } else {
+                6
+            },
+        ]
+    } else {
+        [18, 12, 10]
+    };
+    table[class]
+}
+
+/// `MLX_QMM_SPLITK_MIN_M` read as MLX does (`std::atoi`, used when > 0).
+pub fn splitk_min_m(raw: Option<&str>) -> Option<usize> {
+    let s = raw?.trim_start();
+    let (neg, rest) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let end = rest
+        .bytes()
+        .position(|c| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let v = rest[..end].parse::<i32>().ok()?;
+    (!neg && v > 0).then_some(v as usize)
+}
+
+/// `(inputs, outputs)` of every matrix the model runs through
+/// `quantized_matmul`: Q8_0 held as `Dense::Qmm` (a rank-3 tensor per head
+/// group), and with `mtp` the MTP layer's BF16 matrices, held the same way.
+pub fn q8_shapes(scan: &Scan, mtp: bool) -> Result<Vec<(usize, usize)>> {
+    let mut shapes = Vec::new();
+    for (role, held) in [(Role::Dense, Form::Qmm), (Role::Mtp, Form::Bf16)] {
+        if role == Role::Mtp && !mtp {
+            continue;
+        }
+        for (_, loc) in scan.with_role(role) {
+            if let [k, n, ..] = loc.info.dims[..]
+                && form(role, &loc.info)? == held
+            {
+                shapes.push((k as usize, n as usize));
+            }
+        }
+    }
+    shapes.sort_unstable();
+    shapes.dedup();
+    Ok(shapes)
+}
+
+/// Rows a decode wave may hold: one below the smallest qmv batch limit of
+/// `shapes` on `arch` (`splitk` overrides every limit), so every Q8 call of
+/// 2..=cap rows runs `qmv_wide` on the generations that have it. Below 2
+/// no wave fits.
+pub fn row_cap(arch: &str, splitk: Option<usize>, shapes: &[(usize, usize)]) -> Result<usize> {
+    shapes
+        .iter()
+        .map(|&(k, n)| splitk.unwrap_or_else(|| qmv_batch_limit(arch, k, n)))
+        .min()
+        .map(|m| m.saturating_sub(1))
+        .ok_or_else(|| bad("no Q8 matrix to size the wave by"))
+}
+
+/// The Metal architecture name MLX's kernels route by (it honours
+/// `MLX_METAL_GPU_ARCH`).
+fn routing_arch() -> Result<String> {
+    let mut buf = [0 as std::ffi::c_char; 64];
+    // SAFETY: `buf` is writable for its length; the bridge writes a
+    // NUL-terminated name into it or returns false.
+    let ok = unsafe { mlx_sys::mlx_test_metal_architecture(false, buf.as_mut_ptr(), buf.len()) };
+    if !ok {
+        return Err(bad("no Metal architecture name"));
+    }
+    let name: Vec<u8> = buf
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    String::from_utf8(name).map_err(|e| bad(format!("Metal architecture name: {e}")))
 }
 
 /// Resident bytes of the MTP layer as it is held: routed experts affine-4
@@ -302,16 +477,26 @@ pub struct Options {
     /// Charge the MTP layer (when the file has one).
     pub mtp: bool,
     pub chunk_cap: Option<usize>,
+    /// Lanes wanted; the admission may give fewer.
+    pub lanes: usize,
     pub plan: CachePlan,
 }
 
 impl Options {
-    pub fn from_env(max_context: Option<usize>) -> Result<Self> {
+    /// `serial`: one sequence at a time (`MLX_SERVE_FORCE_SERIAL` at load),
+    /// else `min(LANES_MAX, MLX_SCHED_MAX_NUM_SEQS)` lanes.
+    pub fn from_env(max_context: Option<usize>, serial: bool) -> Result<Self> {
         let mtp = std::env::var(MTP_ENV).ok().is_none_or(|v| v.trim() != "0");
+        let lanes = if serial {
+            1
+        } else {
+            crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for(LANES_MAX)
+        };
         Ok(Self {
             max_context,
             mtp,
             chunk_cap: chunk_cap(std::env::var(CHUNK_ENV).ok().as_deref())?,
+            lanes,
             plan: CachePlan::Admit,
         })
     }
@@ -522,6 +707,10 @@ pub struct Store {
     pub ctx: usize,
     /// Rows of one prefill chunk.
     pub chunk: usize,
+    /// Sequences the admission charged.
+    pub lanes: usize,
+    /// Rows a decode wave may hold (`row_cap`); below 2 no wave fits.
+    pub row_cap: usize,
     /// The MTP layer is charged.
     pub mtp: bool,
     /// Seconds to allocate the bank at load (no page touched yet).
@@ -536,37 +725,74 @@ impl Store {
         let sizes = Sizes::of(&scan)?;
         let mtp = opts.mtp && scan.mtp.is_some();
         let max_ctx = scan.cfg.max_context(opts.max_context)?;
-        let profile = profile(kv_per_token(&scan.cfg, mtp));
+        let row_cap = row_cap(
+            &routing_arch()?,
+            splitk_min_m(std::env::var(SPLITK_ENV).ok().as_deref()),
+            &q8_shapes(&scan, mtp)?,
+        )?;
+        let floor = lane_floor(&scan.cfg, mtp);
+        let one_lane = profile(kv_per_token(&scan.cfg, mtp));
         let base = sizes.model(mtp, max_ctx);
         let limits = match &opts.plan {
-            CachePlan::Admit => Some(Limits::from_env_with(&profile)?),
+            CachePlan::Admit => Some(Limits::from_env_with(&one_lane)?),
             #[cfg(test)]
             CachePlan::AdmitWith(l) => Some(*l),
             #[cfg(test)]
             CachePlan::Off | CachePlan::Slots { .. } => None,
         };
         let smallest = CHUNKS[CHUNKS.len() - 1];
-        let (ctx, admitted, cache, staging, admission) = match (&limits, &opts.plan) {
+        let (lanes, ctx, admitted, cache, staging, admission) = match (&limits, &opts.plan) {
             (Some(l), _) => {
                 let (h, ws) = host_reading()?;
                 // nothing of this model exists yet: every byte in use is others'
-                let p = pick(&profile, &base, max_ctx, l, &h, &Own::default(), ws)?;
+                let (lanes, p) = plan_lanes(opts.lanes, |n| {
+                    pick(
+                        &lane_profile(&one_lane, n, floor),
+                        &base,
+                        max_ctx,
+                        l,
+                        &h,
+                        &Own::default(),
+                        ws,
+                    )
+                })?;
                 tracing::info!(
-                    "hy_v4_flash admission at load: context {}, chunk {}: {}",
+                    "hy_v4_flash admission at load: {lanes} lanes, context {}, chunk {}, \
+                     wave rows {row_cap}: {}",
                     p.ctx,
                     p.chunk,
                     p.admission
                 );
                 let a = p.admission;
                 let cache = sizes.classes.split(a.cache_bytes());
-                (p.ctx, p.chunk, cache, a.staging_layers as usize, Some(a))
+                (
+                    lanes,
+                    p.ctx,
+                    p.chunk,
+                    cache,
+                    a.staging_layers as usize,
+                    Some(a),
+                )
             }
             #[cfg(test)]
-            (None, CachePlan::Slots { cache, staging }) => {
-                (max_ctx, smallest.min(max_ctx), *cache, *staging, None)
-            }
-            _ => (max_ctx, smallest.min(max_ctx), [0, 0], 1, None),
+            (None, CachePlan::Slots { cache, staging }) => (
+                opts.lanes.max(1),
+                max_ctx,
+                smallest.min(max_ctx),
+                *cache,
+                *staging,
+                None,
+            ),
+            _ => (
+                opts.lanes.max(1),
+                max_ctx,
+                smallest.min(max_ctx),
+                [0, 0],
+                1,
+                None,
+            ),
         };
+        let profile = lane_profile(&one_lane, lanes, floor);
         // the re-admission charges the rows the load admitted, the env only
         // lowers the chunk the driver runs
         let rows = admitted as u64;
@@ -619,6 +845,8 @@ impl Store {
             profile,
             ctx,
             chunk,
+            lanes,
+            row_cap,
             mtp,
             bank_alloc_s,
             lease,
