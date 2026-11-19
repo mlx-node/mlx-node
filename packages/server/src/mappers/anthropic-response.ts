@@ -197,13 +197,106 @@ export function containsToolCallMarkup(rawText: string): boolean {
     rawText.includes('<tool_call') ||
     rawText.includes('</tool_call') ||
     rawText.includes('<|tool_call') ||
-    rawText.includes('<tool_call|>')
+    rawText.includes('<tool_call|>') ||
+    rawText.includes('｜DSML｜')
   );
+}
+
+interface Markup {
+  start: number;
+  end: number;
+  close: string | null;
+  value: readonly [string, string] | null;
+}
+
+function isHy4SuffixChar(ch: string): boolean {
+  return ch !== '<' && ch !== '>' && !isWhitespace(ch);
+}
+
+function nextHy4Tag(
+  text: string,
+  from: number,
+  name: string,
+  closing: boolean,
+): { start: number; end: number; suffix: string } | null {
+  const head = `${closing ? '</' : '<'}${name}:`;
+  for (let at = text.indexOf(head, from); at >= 0; at = text.indexOf(head, at + 1)) {
+    let i = at + head.length;
+    while (i < text.length && isHy4SuffixChar(text[i]!)) i++;
+    if (i > at + head.length && text[i] === '>') {
+      return { start: at, end: i + 1, suffix: text.slice(at + head.length - 1, i) };
+    }
+  }
+  return null;
+}
+
+const HY4_TAG_NAMES = ['tool_calls', 'tool_call', 'arg_key', 'arg_value'] as const;
+
+function nextHy4Markup(text: string, from: number): Markup | null {
+  let next: Markup | null = null;
+  for (const name of HY4_TAG_NAMES) {
+    for (const closing of [false, true]) {
+      const tag = nextHy4Tag(text, from, name, closing);
+      if (tag === null || (next !== null && tag.start >= next.start)) continue;
+      const call = name === 'tool_calls' || name === 'tool_call';
+      next = {
+        start: tag.start,
+        end: tag.end,
+        close: closing ? null : `</${name}${tag.suffix}>`,
+        value: !closing && call ? [`<arg_value${tag.suffix}>`, `</arg_value${tag.suffix}>`] : null,
+      };
+    }
+  }
+  return next;
+}
+
+const DSML_VALUE = ['<｜DSML｜ parameter ', '</｜DSML｜ parameter>'] as const;
+
+const DSML_MARKUP: readonly { head: string; close: string | null; value: readonly [string, string] | null }[] = [
+  { head: '<｜DSML｜ calls>', close: '</｜DSML｜ calls>', value: DSML_VALUE },
+  { head: '<｜DSML｜ invoke ', close: '</｜DSML｜ invoke>', value: DSML_VALUE },
+  { head: '<｜DSML｜ parameter ', close: '</｜DSML｜ parameter>', value: null },
+  { head: '</｜DSML｜ calls>', close: null, value: null },
+  { head: '</｜DSML｜ invoke>', close: null, value: null },
+  { head: '</｜DSML｜ parameter>', close: null, value: null },
+];
+
+function nextDsmlMarkup(text: string, from: number): Markup | null {
+  let next: Markup | null = null;
+  for (const markup of DSML_MARKUP) {
+    const at = text.indexOf(markup.head, from);
+    if (at < 0 || (next !== null && at >= next.start)) continue;
+    next = { start: at, end: at + markup.head.length, close: markup.close, value: markup.value };
+  }
+  return next;
+}
+
+/** The offset after the first `close` outside a value, or the text's end. */
+function blockEnd(text: string, from: number, close: string, value: readonly [string, string] | null): number {
+  let at = from;
+  for (;;) {
+    const end = text.indexOf(close, at);
+    const open = value === null ? -1 : text.indexOf(value[0], at);
+    if (value === null || open < 0 || (end >= 0 && end < open)) return end < 0 ? text.length : end + close.length;
+    const valueEnd = text.indexOf(value[1], open + value[0].length);
+    if (valueEnd < 0) return text.length;
+    at = valueEnd + value[1].length;
+  }
+}
+
+function withoutMarkup(text: string, next: (text: string, from: number) => Markup | null): string {
+  let out = '';
+  let from = 0;
+  for (let markup = next(text, 0); markup !== null; markup = next(text, from)) {
+    out += text.slice(from, markup.start);
+    from = markup.close === null ? markup.end : blockEnd(text, markup.end, markup.close, markup.value);
+  }
+  return out + text.slice(from);
 }
 
 export function recoverSuppressedToolCallText(rawText: string): string {
   return (
-    rawText
+    withoutMarkup(withoutMarkup(rawText, nextHy4Markup), nextDsmlMarkup)
       .replace(/<\|channel>[\s\S]*?(?:<channel\|>|$)/g, '')
       .replace(/<channel\|>/g, '')
       .replace(/<\|tool_call>[\s\S]*?(?:<tool_call\|>|$)/g, '')
