@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use napi::Result;
 use serde_json::Value;
@@ -6,7 +7,9 @@ use serde_json::Value;
 use super::f8::{decode, decode_f8_rows, is_nan_code};
 use super::rows::{EngramRows, F8Table, ResidentF8Table, prove_f8_extent};
 use super::scan::{ENGRAM_TABLE, Located, Scan};
+use super::store::unchanged_since_open;
 use crate::models::deepseek_v41::EngramConfig;
+use crate::moe_stream::io::ShardSet;
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 
 const HD: usize = 64;
@@ -304,6 +307,50 @@ fn file_table_refuses_a_bad_size_or_header() {
     let mut short = cfg();
     short.head_offsets.truncate(7);
     err(open(&codes, &table_loc(), &short));
+}
+
+/// The table reads its own shard of the load's shard set, keeps the bytes
+/// of the inode the load opened, and the load sees an atomic replace.
+#[test]
+fn file_table_reads_the_load_shard_set() {
+    let tmp = Temp::new();
+    let codes = table_codes(19);
+    let first = tmp.0.join("first.gguf");
+    std::fs::write(&first, vec![0x3Cu8; 70_000]).unwrap();
+    let path = tmp.shard(&codes);
+    let shards = Arc::new(ShardSet::open(&[&first, &path]).unwrap());
+    let loc = Located {
+        shard: 1,
+        ..table_loc()
+    };
+    let t = F8Table::open_in(Arc::clone(&shards), &loc, &cfg()).unwrap();
+    let ids = layer_ids(1);
+    assert_eq!(
+        to_bits(&t.rows(1, &ids).unwrap()),
+        expect_rows(&codes, &ids)
+    );
+    unchanged_since_open(&shards).unwrap();
+
+    let next = tmp.0.join("next.gguf");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let at = (DATA_OFFSET + REL_OFFSET) as usize;
+    bytes[at..].copy_from_slice(&table_codes(23));
+    std::fs::write(&next, bytes).unwrap();
+    std::fs::rename(&next, &path).unwrap();
+    let msg = err(unchanged_since_open(&shards));
+    assert!(msg.contains("retry the load"), "{msg}");
+    assert_eq!(
+        to_bits(&t.rows(1, &ids).unwrap()),
+        expect_rows(&codes, &ids)
+    );
+    err(F8Table::open_in(
+        shards,
+        &Located {
+            shard: 2,
+            ..table_loc()
+        },
+        &cfg(),
+    ));
 }
 
 #[test]

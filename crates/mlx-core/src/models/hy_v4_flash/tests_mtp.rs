@@ -349,7 +349,7 @@ fn real_held_layer_matches_the_fixture() {
     let paths = crate::models::deepseek_v41::chat::shard_paths(&hy4_dir()).unwrap();
     let opts = super::store::Options::from_env(Some(16_384), true).unwrap();
     let store = super::store::Store::open(&paths, &opts).unwrap();
-    let m = super::mtp::MtpLayer::load(&paths, &store.model).unwrap();
+    let m = super::mtp::MtpLayer::load(&store.scan, &store.shards, &store.model).unwrap();
     assert_eq!(
         m.bytes(),
         fixture()["totals"]["plan_bytes"].as_u64().unwrap()

@@ -788,6 +788,10 @@ pub struct Store {
     pub model: Model,
     pub bank: Arc<KqBank>,
     pub table: Arc<F8Table>,
+    /// The headers the load read and the one descriptor per shard every
+    /// reader of the load goes through.
+    pub scan: Scan,
+    pub shards: Arc<ShardSet>,
     /// GGUF bytes of the resident tensors read at load.
     pub dense_read: u64,
     /// Bytes of the resident arrays.
@@ -900,7 +904,11 @@ impl Store {
         let built = (|| -> Result<_> {
             let resident = Resident::load(&scan, &shards)?;
             let (read, bytes) = (resident.read, resident.bytes);
-            let table = Arc::new(F8Table::open(&scan)?);
+            let table = Arc::new(F8Table::open_in(
+                Arc::clone(&shards),
+                &scan.engram_table,
+                &scan.cfg.engram,
+            )?);
             let b = Arc::clone(&bank);
             let model = Model::new(
                 scan.cfg.clone(),
@@ -925,6 +933,8 @@ impl Store {
             model,
             bank,
             table,
+            scan,
+            shards,
             dense_read,
             dense_bytes,
             sizes,
@@ -943,6 +953,11 @@ impl Store {
 
     pub fn admission(&self) -> Option<Admission> {
         self.lease.admission()
+    }
+
+    /// Fails when a shard was replaced or changed since the load opened it.
+    pub fn files_unchanged(&self) -> Result<()> {
+        unchanged_since_open(&self.shards)
     }
 
     /// The memory governor's limit for this model: the working set every
@@ -973,6 +988,15 @@ impl Store {
     pub fn recheck(&self, kv: u64) -> Result<bool> {
         self.lease.recheck(&self.bank, self.dense_bytes, kv)
     }
+}
+
+pub(crate) fn unchanged_since_open(shards: &ShardSet) -> Result<()> {
+    shards.recheck().map_err(|e| {
+        Error::from_reason(format!(
+            "Hy4 load: {}; the GGUF changed during the load; retry the load",
+            e.reason
+        ))
+    })
 }
 
 #[cfg(test)]

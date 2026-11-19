@@ -1,6 +1,6 @@
 //! Engram table rows (F8_E4M3, `head_dim` bytes per row) read by `pread`
-//! from the table's own shard (`F_NOCACHE` + `F_RDAHEAD 0`; never mapped,
-//! never a Metal buffer). A call reads each distinct row once, as a 16
+//! through the load's one shard set (`F_NOCACHE` + `F_RDAHEAD 0`; never
+//! mapped, never a Metal buffer). A call reads each distinct row once, as a 16
 //! KiB-aligned window, on up to 8 threads (decode) or 32 (prefill).
 //!
 //! The file says type 43, which mlx-node parses as MXFP8. The table is read
@@ -8,13 +8,17 @@
 //! `rows · head_dim`; the MXFP8 size (`rows · head_dim / 32 · 33`) and any
 //! other size are refused.
 
+#[cfg(test)]
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use napi::{Error, Result};
 
 use super::f8::decode_f8_rows;
-use super::scan::{ENGRAM_TABLE, Located, Scan};
+#[cfg(test)]
+use super::scan::Scan;
+use super::scan::{ENGRAM_TABLE, Located};
 use crate::models::deepseek_v41::EngramConfig;
 use crate::moe_stream::io::{AlignedBuf, Extent, ShardSet};
 use crate::utils::gguf::GgufTensorType;
@@ -109,7 +113,8 @@ impl Columns {
 
 /// The real table, read by row from its shard.
 pub struct F8Table {
-    shard: ShardSet,
+    shards: Arc<ShardSet>,
+    shard: usize,
     /// File offset of row 0.
     base: u64,
     file_len: u64,
@@ -120,23 +125,40 @@ pub struct F8Table {
 }
 
 impl F8Table {
+    #[cfg(test)]
     pub fn open(scan: &Scan) -> Result<Self> {
-        let loc = &scan.engram_table;
-        let path = scan
-            .paths
-            .get(loc.shard)
-            .ok_or_else(|| bad(format!("no path for shard {}", loc.shard)))?;
-        Self::open_at(path, loc, &scan.cfg.engram)
+        Self::open_in(
+            Arc::new(ShardSet::open(&scan.paths)?),
+            &scan.engram_table,
+            &scan.cfg.engram,
+        )
     }
 
     /// `loc` is `per_layer_token_embd.weight` in the shard at `path`.
+    #[cfg(test)]
     pub(crate) fn open_at(path: &Path, loc: &Located, cfg: &EngramConfig) -> Result<Self> {
+        Self::on_shard(Arc::new(ShardSet::open(&[path])?), 0, loc, cfg)
+    }
+
+    /// `loc` is `per_layer_token_embd.weight` in shard `loc.shard` of
+    /// `shards`, the descriptors every other reader of the load uses.
+    pub fn open_in(shards: Arc<ShardSet>, loc: &Located, cfg: &EngramConfig) -> Result<Self> {
+        Self::on_shard(shards, loc.shard, loc, cfg)
+    }
+
+    fn on_shard(
+        shards: Arc<ShardSet>,
+        shard: usize,
+        loc: &Located,
+        cfg: &EngramConfig,
+    ) -> Result<Self> {
         let n_rows = table_rows(loc, cfg)?;
         let columns = Columns::new(cfg, n_rows)?;
-        let shard = ShardSet::open(&[path])?;
-        let file_len = shard
-            .file(0)
-            .ok_or_else(|| bad("table shard did not open"))?
+        let (file, path) = shards
+            .file(shard)
+            .zip(shards.path(shard))
+            .ok_or_else(|| bad(format!("no shard {shard} of {}", shards.len())))?;
+        let file_len = file
             .metadata()
             .map_err(|e| bad(format!("stat '{}': {e}", path.display())))?
             .len();
@@ -150,6 +172,7 @@ impl F8Table {
         prove_f8_extent(extent, n_rows, cfg.head_dim)
             .map_err(|e| bad(format!("'{}': {}", path.display(), e.reason)))?;
         Ok(Self {
+            shards,
             shard,
             base,
             file_len,
@@ -224,11 +247,11 @@ impl F8Table {
         let mut bytes = 0;
         for (&r, o) in rows.iter().zip(out.chunks_mut(hd)) {
             let e = Extent {
-                shard: 0,
+                shard: self.shard,
                 offset: self.base + u64::from(r) * hd as u64,
                 len: hd as u64,
             };
-            let codes = self.shard.read_aligned(e, &mut buf)?;
+            let codes = self.shards.read_aligned(e, &mut buf)?;
             decode_f8_rows(codes, o).map_err(|err| bad(format!("row {r}: {}", err.reason)))?;
             bytes += window_len(e, self.file_len);
         }

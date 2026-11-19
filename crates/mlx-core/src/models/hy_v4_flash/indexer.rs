@@ -876,7 +876,8 @@ impl Indexer {
     }
 
     /// Pools the groups the call `x [n, dim]` at `start` closes and carries
-    /// its open rows; `start` must equal `st.len()`.
+    /// its open rows; `start` must equal `st.len()`. On error `st` holds
+    /// what it held before.
     pub fn update(
         &self,
         w: &IndexerWeights,
@@ -884,7 +885,12 @@ impl Indexer {
         start: usize,
         st: &mut IndexerState,
     ) -> Result<()> {
-        self.update_in(w, x, start, &mut st.pooled, &mut st.tail)
+        let mark = st.mark();
+        let out = self.update_in(w, x, start, &mut st.pooled, &mut st.tail);
+        if out.is_err() {
+            st.restore(mark)?;
+        }
+        out
     }
 
     fn update_in<P: PooledKeys>(

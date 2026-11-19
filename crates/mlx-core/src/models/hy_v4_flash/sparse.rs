@@ -153,20 +153,36 @@ fn gather_rows_in(
     let neg_inf = MxArray::from_float32(&[f32::NEG_INFINITY], &[1])?;
     let floor = MxArray::from_float32(&[MAX_FLOOR], &[1])?;
     let zero = MxArray::from_int32(&[0], &[1])?;
+    let zf = MxArray::from_float32(&[0.0], &[1])?;
     let sink = sinks.astype(DType::Float32)?.reshape(&[1, h, 1])?;
     let mut outs = Vec::new();
     let mut lo = 0;
     while lo < s {
         let hi = (lo + rows).min(s);
-        let c = hi - lo;
-        let ic = idx.slice(&[lo, 0], &[hi, kmax])?;
+        let mut ic = idx.slice(&[lo, 0], &[hi, kmax])?;
+        let mut qc = q.slice(&[lo, 0, 0], &[hi, h, d])?.astype(DType::Float32)?;
+        // a 1-row chunk would take split-K (matmul.cpp:972), which rounds a
+        // row unlike the same row of a taller chunk; pad it with a keyless row
+        let pad = hi - lo == 1;
+        if pad {
+            let none = MxArray::from_int32(&vec![-1; kmax as usize], &[1, kmax])?;
+            ic = MxArray::concatenate(&ic, &none, 0)?;
+            let zq = MxArray::zeros(&[1, h, d], Some(DType::Float32))?;
+            qc = MxArray::concatenate(&qc, &zq, 0)?;
+        }
+        let c = if pad { 2 } else { hi - lo };
         let gid = ic.maximum(&zero)?.reshape(&[c * kmax])?;
-        let valid = ic.greater_equal(&zero)?.reshape(&[c, 1, kmax])?;
-        let g = keys
-            .gather(&gid)?
-            .astype(DType::Float32)?
-            .reshape(&[c, kmax, d])?;
-        let qc = q.slice(&[lo, 0, 0], &[hi, h, d])?.astype(DType::Float32)?;
+        let listed = ic.greater_equal(&zero)?;
+        let valid = listed.reshape(&[c, 1, kmax])?;
+        // unlisted ids read slot 0, which may hold another request's
+        // non-finite row; zero it so `0 · NaN` never reaches the output
+        let g = listed.reshape(&[c, kmax, 1])?.where_(
+            &keys
+                .gather(&gid)?
+                .astype(DType::Float32)?
+                .reshape(&[c, kmax, d])?,
+            &zf,
+        )?;
         let sc = qc.matmul(&g.transpose(Some(&[0, 2, 1]))?)?;
         let sc = valid.where_(&sc, &neg_inf)?.mul_scalar(f64::from(scale))?;
         let m = sc.max(Some(&[-1]), Some(true))?.maximum(&floor)?;
@@ -174,6 +190,11 @@ fn gather_rows_in(
         let den = p.sum(Some(&[-1]), Some(true))?.add(&sink.sub(&m)?.exp()?)?;
         let v = g.slice(&[0, 0, 0], &[c, kmax, v_width])?;
         let o = p.matmul(&v)?.div(&den)?;
+        let o = if pad {
+            o.slice(&[0, 0, 0], &[1, h, v_width])?
+        } else {
+            o
+        };
         super::stats::eval(&[&o], "hy_v4_flash sparse attention chunk")?;
         outs.push(o);
         lo = hi;

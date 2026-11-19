@@ -762,6 +762,34 @@ fn truncate_and_restore_keep_the_picks() {
     assert_eq!(got, want, "from empty");
 }
 
+/// A flat `update` that fails after it pooled a group (the tail step)
+/// leaves the state as it was, and the same call then succeeds.
+#[test]
+fn a_failed_update_keeps_the_indexer_state() {
+    let g = small();
+    let (w, _) = indexer_weights(&g, 47);
+    let ix = Indexer::new(g.clone(), &w).unwrap();
+    let xs = inputs(12, D, 21);
+    let mut st = IndexerState::new(32, &g);
+    ix.update(&w, &rows_of(&xs[..8]), 0, &mut st).unwrap();
+    assert_eq!(
+        (st.len(), st.pooled_len(), st.held()),
+        (8, 2, g.kpool - 1 + WINDOW_SLACK)
+    );
+    let good = st.tail.clone();
+    let held = st.held();
+    st.tail.rows = Some(arr(
+        &vec![0.0; held * (g.head_dim - 1)],
+        &[held, g.head_dim - 1],
+    ));
+    let before = (st.len(), st.pooled_len(), st.held());
+    assert!(ix.update(&w, &rows_of(&xs[8..12]), 8, &mut st).is_err());
+    assert_eq!((st.len(), st.pooled_len(), st.held()), before);
+    st.tail = good;
+    ix.update(&w, &rows_of(&xs[8..12]), 8, &mut st).unwrap();
+    assert_eq!((st.len(), st.pooled_len()), (12, 3));
+}
+
 #[test]
 fn indexer_refuses_mismatched_weights() {
     let g = small();

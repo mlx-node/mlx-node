@@ -388,12 +388,13 @@ impl Inner {
         };
         let mut store = Store::open(&paths, &opts)?;
         let mtp = if store.mtp {
-            let m = MtpLayer::load(&paths, &store.model)?;
+            let m = MtpLayer::load(&store.scan, &store.shards, &store.model)?;
             store.dense_bytes += m.bytes();
             Some(m)
         } else {
             None
         };
+        store.files_unchanged()?;
         let mut inner = Self::new(store, mtp, tokenizer, residency)?;
         let disk = tier.and_then(|t| {
             persist::open(

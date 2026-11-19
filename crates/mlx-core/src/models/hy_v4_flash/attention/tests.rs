@@ -674,6 +674,89 @@ fn gather_core_matches_host_softmax_with_sinks() {
     }
 }
 
+fn bits(x: &MxArray) -> Vec<u32> {
+    read(x).iter().map(|v| v.to_bits()).collect()
+}
+
+/// A query row gives the same bits alone as inside a call of 2..4 rows, at
+/// the real sliding (64 heads, 512 keys) and indexed (32 heads, 2048 keys)
+/// sizes.
+#[test]
+fn gather_core_row_bits_do_not_depend_on_the_call_height() {
+    for (h, kmax) in [(64usize, 512usize), (32, 2048)] {
+        let (s, d, vw, n) = (4usize, 576usize, 512i64, kmax + 5);
+        let mut r = Rng(53 + h as u64);
+        let q = arr(&r.vec(s * h * d, 1.5), &[s, h, d]);
+        let keys = arr(&r.vec(n * d, 1.5), &[n, d])
+            .astype(DType::Float16)
+            .unwrap();
+        let sinks = arr(&r.vec(h, 1.0), &[h]);
+        let idx: Vec<i32> = (0..s * kmax)
+            .map(|i| {
+                let (row, j) = (i / kmax, i % kmax);
+                if j + row >= kmax {
+                    -1
+                } else {
+                    ((j + 3 * row) % n) as i32
+                }
+            })
+            .collect();
+        let ia = MxArray::from_int32(&idx, &[s as i64, kmax as i64]).unwrap();
+        let scale = 1.0 / (d as f32).sqrt();
+        let (hi, di, ki) = (h as i64, d as i64, kmax as i64);
+        let call = |lo: i64, rows: i64| {
+            let qs = q.slice(&[lo, 0, 0], &[lo + rows, hi, di]).unwrap();
+            let is = ia.slice(&[lo, 0], &[lo + rows, ki]).unwrap();
+            bits(&gather_sink_attention(&qs, &keys, &is, vw, &sinks, scale).unwrap())
+        };
+        let per = h * vw as usize;
+        let alone: Vec<Vec<u32>> = (0..s as i64).map(|j| call(j, 1)).collect();
+        for rows in 2..=s {
+            let all = call(0, rows as i64);
+            for (j, want) in alone.iter().enumerate().take(rows) {
+                assert!(
+                    all[j * per..(j + 1) * per] == want[..],
+                    "h {h} kmax {kmax}: row {j} of {rows} differs from the row alone"
+                );
+            }
+        }
+    }
+}
+
+/// An unlisted id reads key row 0; a non-finite row there leaves the
+/// output finite and bit-equal to the run with that row zeroed.
+#[test]
+fn gather_core_ignores_a_non_finite_unlisted_row() {
+    let (s, h, d, n, kmax, vw) = (3usize, 2usize, 6usize, 7usize, 4usize, 4i64);
+    let mut r = Rng(59);
+    let qa = arr(&r.vec(s * h * d, 1.5), &[s, h, d]);
+    let mut keys = r.vec(n * d, 1.5);
+    let sa = arr(&r.vec(h, 1.0), &[h]);
+    let idx: Vec<i32> = vec![
+        3, -1, 2, 6, //
+        -1, -1, -1, -1, //
+        5, 4, -1, 1,
+    ];
+    let ia = MxArray::from_int32(&idx, &[s as i64, kmax as i64]).unwrap();
+    let run = |keys: &[f32]| {
+        let ka = arr(keys, &[n, d]).astype(DType::Float16).unwrap();
+        bits(&gather_sink_attention(&qa, &ka, &ia, vw, &sa, 0.37).unwrap())
+    };
+    keys[..d].fill(0.0);
+    let want = run(&keys);
+    keys[..d].copy_from_slice(&[
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NAN,
+        1.0,
+        2.0,
+    ]);
+    let got = run(&keys);
+    assert!(got.iter().all(|&b| f32::from_bits(b).is_finite()));
+    assert_eq!(got, want);
+}
+
 #[test]
 fn gather_core_refuses_mismatched_shapes() {
     let q = MxArray::zeros(&[2, 2, 6], None).unwrap();

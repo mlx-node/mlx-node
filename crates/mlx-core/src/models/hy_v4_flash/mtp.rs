@@ -21,7 +21,6 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
 
 use napi::{Error, Result};
 
@@ -465,12 +464,11 @@ fn draft_embedding(token_embd: &Dense, vocab: usize, dim: usize) -> Result<Embed
 }
 
 impl MtpLayer {
-    /// Reads blk.{n_layers} of the shards `paths` and builds the layer
-    /// beside `model`. Model thread only.
-    pub fn load(paths: &[PathBuf], model: &Model) -> Result<Self> {
-        let scan = Scan::open(paths)?;
-        let shards = ShardSet::open(&scan.paths)?;
-        let w = mtp_weights::load(&scan, &shards)?;
+    /// Reads blk.{n_layers} through the headers and descriptors the trunk
+    /// was loaded with and builds the layer beside `model`. Model thread
+    /// only.
+    pub fn load(scan: &Scan, shards: &ShardSet, model: &Model) -> Result<Self> {
+        let w = mtp_weights::load(scan, shards)?;
         let tok = model.weights().token_embd();
         Self::new(model.cfg(), w, tok)
     }
@@ -617,9 +615,9 @@ impl MtpLayer {
         let e = model.weights().token_embd().rows(&tok)?;
         let x = self.eh(&e, h)?;
         let (xn, kv) = self.latent(&x, at)?;
+        let iw = self.indexer_weights()?;
         let mark = d.index.mark();
-        self.indexer
-            .update(self.indexer_weights()?, &xn, at, &mut d.index)?;
+        self.indexer.update(iw, &xn, at, &mut d.index)?;
         if let Err(e) = d.kv.write(&kv, at) {
             d.index.restore(mark)?;
             return Err(e);
