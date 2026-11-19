@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vite-plus/test';
 
-import { catalogBuildLabel, hasUpdate, modelBlurb } from '../ui/src/lib/catalog.js';
+import { catalogBuildLabel, hasUpdate, modelBlurb, offeredOnHost } from '../ui/src/lib/catalog.js';
 
 describe('catalogBuildLabel', () => {
   it('takes the build from the first starred glob', () => {
@@ -62,5 +62,26 @@ describe('hasUpdate', () => {
     const sidecar = { ...base, assetsRepo: 'org/base', localAssetsRepo: 'org/base', localAssetsRevision: 's1' };
     expect(hasUpdate(sidecar, new Map([['org/base', 's1']]))).toBe(false);
     expect(hasUpdate(sidecar, new Map([['org/base', 's2']]))).toBe(true);
+  });
+});
+
+describe('offeredOnHost', () => {
+  const GIB = 2 ** 30;
+  const host = (gib: number) => ({ totalMemBytes: gib * GIB, diskFreeBytes: null });
+
+  it('offers an entry without a floor on any host, and before the host is known', () => {
+    expect(offeredOnHost({}, host(8))).toBe(true);
+    expect(offeredOnHost({}, undefined)).toBe(true);
+  });
+
+  it('never offers a hidden entry', () => {
+    expect(offeredOnHost({ hidden: true }, host(512))).toBe(false);
+  });
+
+  it('offers an entry with a floor only once the host meets it', () => {
+    expect(offeredOnHost({ minMemoryGb: 39 }, undefined)).toBe(false);
+    expect(offeredOnHost({ minMemoryGb: 39 }, { totalMemBytes: 39 * GIB - 1, diskFreeBytes: null })).toBe(false);
+    expect(offeredOnHost({ minMemoryGb: 39 }, host(39))).toBe(true);
+    expect(offeredOnHost({ minMemoryGb: 39 }, host(128))).toBe(true);
   });
 });

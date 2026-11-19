@@ -37,6 +37,8 @@ export interface CatalogItem {
   description: string;
   isDefault?: boolean;
   hidden?: boolean;
+  /** Physical RAM in GiB the model's load needs at least; the page leaves the entry out below it. */
+  minMemoryGb?: number;
   slug: string;
   /** A dashboard-owned (completion-marker) install of this model is present. */
   installed: boolean;

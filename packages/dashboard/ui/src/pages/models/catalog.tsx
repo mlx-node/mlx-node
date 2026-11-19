@@ -23,14 +23,14 @@ const GIB = 2 ** 30;
 
 /** The one note a catalog card or an onboarding choice shows about room on this Mac, or null. */
 export function hostNote(
-  item: Pick<CatalogItem, 'sizeGb' | 'present'>,
+  item: Pick<CatalogItem, 'sizeGb' | 'present' | 'minMemoryGb'>,
   host: ModelsResponse['host'] | undefined,
 ): string | null {
   if (host === undefined) return null;
   if (!item.present && host.diskFreeBytes !== null && item.sizeGb * GB > host.diskFreeBytes) {
     return `Needs about ${item.sizeGb} GB. ${formatBytes(host.diskFreeBytes)} is free on this disk.`;
   }
-  if (item.sizeGb * GIB > host.totalMemBytes) {
+  if (item.minMemoryGb === undefined && item.sizeGb * GIB > host.totalMemBytes) {
     return `Weights are larger than this Mac's memory (${formatBytes(host.totalMemBytes)}).`;
   }
   return null;
