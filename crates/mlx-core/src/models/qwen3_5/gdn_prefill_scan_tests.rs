@@ -69,6 +69,7 @@ fn on_kernel<T>(head: bool, f: impl FnOnce() -> T) -> T {
 
 fn launches() -> bool {
     super::gated_delta::tests::fused_prefill_launches()
+        && on_kernel(true, super::gated_delta::tests::fused_prefill_launches)
 }
 
 /// Production views of one window: pre-norm q/k/v split out of the conv row,

@@ -3184,8 +3184,9 @@ unsafe extern "C" {
     /// `candidate_probabilities` `[D, C]` f32. The output is `[R, 4]` f32, one
     /// record per row: the draft token's target probability, its draft
     /// probability, the row's drawn token (-1: none) and its kept count.
-    /// Returns 1 when constructed, 0 when not taken (no Metal, or a shape,
-    /// dtype or `top_k` outside 1..=256), -1 on an invalid argument.
+    /// Returns 1 when constructed, 0 when not taken (no Metal, a GPU the
+    /// kernels do not launch on, or a shape, dtype or `top_k` outside
+    /// 1..=256), -1 on an invalid argument.
     pub fn mlx_dflash2_sampled_rows(
         logits: *mut mlx_array,
         uniforms: *mut mlx_array,
@@ -3198,6 +3199,9 @@ unsafe extern "C" {
         min_p: f32,
         output: *mut *mut mlx_array,
     ) -> i32;
+    /// Whether [`mlx_dflash2_sampled_rows`] launches on this GPU: an Apple
+    /// GPU family whose row pipelines hold the kernels' threadgroups.
+    pub fn mlx_dflash2_sampled_rows_supported() -> bool;
     pub fn mlx_splash_moe_available() -> bool;
     /// Test-only real Metal encoder scheduling and resource-accounting regression.
     pub fn mlx_test_sparse_input_budget_encoder() -> bool;

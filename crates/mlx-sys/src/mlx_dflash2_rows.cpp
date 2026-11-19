@@ -27,10 +27,46 @@ constexpr float kGreedyTemperature = 1e-6f;
 constexpr int kMaximumVocabulary = 1 << 24;
 constexpr int kMaximumRows = 64;
 
+#ifdef MLX_NODE_METAL_ENABLED
+bool fits(metal::Device& device, MTL::ComputePipelineState* pipeline,
+          NS::UInteger threads) {
+  return pipeline->threadExecutionWidth() == 32 &&
+      pipeline->maxTotalThreadsPerThreadgroup() >= threads &&
+      pipeline->staticThreadgroupMemoryLength() <=
+          device.mtl_device()->maxThreadgroupMemoryLength();
+}
+#endif
+
+// A GPU of no Apple family (a hosted VM GPU) runs these kernels and returns
+// zero records.
+bool launches() {
+#ifdef MLX_NODE_METAL_ENABLED
+  static const bool launch = [] {
+    try {
+      if (!is_available(Device::gpu)) return false;
+      auto& device = metal::device(Device::gpu);
+      if (!device.mtl_device()->supportsFamily(MTL::GPUFamilyApple7)) return false;
+      return fits(device, fast::paged::get_prebuilt_kernel(
+                              device, "dflash2_rows", "mass", "dflash2_rows_mass"),
+                  DFLASH2_ROWS_SHARD_THREADS) &&
+          fits(device, fast::paged::get_prebuilt_kernel(
+                           device, "dflash2_rows", "select", "dflash2_rows_select"),
+               DFLASH2_ROWS_THREADS);
+    } catch (const std::exception& e) {
+      mlx_trace_native_error("dflash2_sampled_rows", e.what());
+      return false;
+    }
+  }();
+  return launch;
+#else
+  return false;
+#endif
+}
+
 bool available() {
 #ifdef MLX_NODE_METAL_ENABLED
   return !detail::in_grad_tracing() && default_device() == Device::gpu &&
-      is_available(Device::gpu);
+      launches();
 #else
   return false;
 #endif
@@ -132,12 +168,17 @@ class Dflash2SampledRows : public fast::Custom {
 }  // namespace mlx::core::dflash2_rows
 
 
-// 1: constructed; 0: not taken (no Metal, or a shape, dtype or top_k outside
-// the kernels' contract); -1: invalid argument or construction error. The
-// output is `[rows, 4]` f32, one record per row: the draft token's target
-// probability, its draft probability, the row's drawn token (-1: none) and
-// the count of the tokens the row keeps. `draft_ids`, `candidate_ids` and
-// `candidate_probabilities` are null for a cycle with no drafted row.
+extern "C" bool mlx_dflash2_sampled_rows_supported() {
+  return mlx::core::dflash2_rows::launches();
+}
+
+// 1: constructed; 0: not taken (no Metal, a GPU the kernels do not launch on,
+// or a shape, dtype or top_k outside the kernels' contract); -1: invalid
+// argument or construction error. The output is `[rows, 4]` f32, one record
+// per row: the draft token's target probability, its draft probability, the
+// row's drawn token (-1: none) and the count of the tokens the row keeps.
+// `draft_ids`, `candidate_ids` and `candidate_probabilities` are null for a
+// cycle with no drafted row.
 extern "C" int mlx_dflash2_sampled_rows(
     mlx_array* logits, mlx_array* uniforms, mlx_array* draft_ids,
     mlx_array* candidate_ids, mlx_array* candidate_probabilities,

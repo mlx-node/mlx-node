@@ -309,16 +309,19 @@ fn the_sampler_keeps_its_law() -> Result<()> {
         ("host", all[0].1, Accept::Host, 0u64),
         ("host", all[0].1, Accept::Host, 1),
     ];
-    for (name, config) in &all {
-        if crate::engine::dspark_turn::sampled_rows_take(&params(config)) {
-            arms.push((*name, *config, Accept::DeviceRows, 0));
+    if !crate::test_support::apple_gpu_family_absent("the_sampler_keeps_its_law: device rows arms")
+    {
+        for (name, config) in &all {
+            if crate::engine::dspark_turn::sampled_rows_take(&params(config)) {
+                arms.push((*name, *config, Accept::DeviceRows, 0));
+            }
         }
+        assert!(
+            arms.len() >= 4,
+            "the device rows take the top-k presets: {} arms",
+            arms.len()
+        );
     }
-    assert!(
-        arms.len() >= 4,
-        "the device rows take the top-k presets: {} arms",
-        arms.len()
-    );
     for (tag, config, accept, state) in arms {
         let tag = format!("{tag} {accept:?}");
         let mut pool = (0.0f64, 0usize);

@@ -331,7 +331,11 @@ fn cases() -> Vec<Case> {
 
 #[test]
 fn device_rows_keep_the_tokens_the_filter_chain_keeps() -> Result<()> {
-    if !metal() {
+    if !metal()
+        || crate::test_support::apple_gpu_family_absent(
+            "device_rows_keep_the_tokens_the_filter_chain_keeps",
+        )
+    {
         return Ok(());
     }
     for case in cases() {
@@ -397,7 +401,11 @@ fn device_rows_keep_the_tokens_the_filter_chain_keeps() -> Result<()> {
 
 #[test]
 fn a_tie_keeps_smaller_ids_at_the_top_k_edge_and_larger_ids_at_the_top_p_edge() -> Result<()> {
-    if !metal() {
+    if !metal()
+        || crate::test_support::apple_gpu_family_absent(
+            "a_tie_keeps_smaller_ids_at_the_top_k_edge_and_larger_ids_at_the_top_p_edge",
+        )
+    {
         return Ok(());
     }
     let (row, _, ties) = tie_at_top_k(30);
@@ -451,7 +459,11 @@ fn top(p: &[f32], count: usize) -> Vec<usize> {
 
 #[test]
 fn device_rows_draw_by_inverse_cdf_and_correct_from_the_residual() -> Result<()> {
-    if !metal() {
+    if !metal()
+        || crate::test_support::apple_gpu_family_absent(
+            "device_rows_draw_by_inverse_cdf_and_correct_from_the_residual",
+        )
+    {
         return Ok(());
     }
     let vocab = 4_096;
@@ -605,6 +617,11 @@ fn a_turn_outside_the_kernels_list_keeps_the_filter_chain() -> Result<()> {
             "{name}: the rng is untouched"
         );
     }
+    if crate::test_support::apple_gpu_family_absent(
+        "a_turn_outside_the_kernels_list_keeps_the_filter_chain: the taken turn",
+    ) {
+        return Ok(());
+    }
     let taken = params(config(0.6, 20, 0.95, 0.0));
     assert!(sampled_rows_take(&taken));
     let mut rng = StdRng::seed_from_u64(1);
@@ -615,6 +632,40 @@ fn a_turn_outside_the_kernels_list_keeps_the_filter_chain() -> Result<()> {
     assert_eq!(accepted, 0);
     assert!(chain(&row, config(0.6, 20, 0.95, 0.0))?[token as usize] > 0.0);
     assert_eq!(TEST_SAMPLED_ROWS.with(|c| c.get()), before + 1);
+    Ok(())
+}
+
+/// A GPU of no Apple family declines the device rows and its turn keeps the
+/// filter chain; every Apple GPU family takes them.
+#[test]
+fn the_device_rows_take_a_turn_only_on_a_gpu_that_launches_them() -> Result<()> {
+    if !metal() {
+        return Ok(());
+    }
+    use rand::RngExt;
+    let p = params(config(0.6, 20, 0.95, 0.0));
+    // SAFETY: nullary predicate that catches internally.
+    let lacks = unsafe { mlx_sys::mlx_test_gpu_lacks_apple_family() };
+    assert_eq!(
+        sampled_rows_take(&p),
+        !lacks,
+        "no Apple GPU family: {lacks}"
+    );
+    if !lacks {
+        return Ok(());
+    }
+    let vocab = 256;
+    let logits = MxArray::from_float32(&peaked(vocab, 3, 9), &[1, 1, vocab as i64])?;
+    let mut rng = StdRng::seed_from_u64(1);
+    let before = TEST_SAMPLED_ROWS.with(|c| c.get());
+    let proposal = host_proposal(vocab, &[], &[])?;
+    assert!(submit_sampled_rows(&logits, &proposal, &p, &mut rng)?.is_none());
+    assert_eq!(TEST_SAMPLED_ROWS.with(|c| c.get()), before);
+    assert_eq!(
+        rng.random::<u64>(),
+        StdRng::seed_from_u64(1).random::<u64>(),
+        "the rng is untouched"
+    );
     Ok(())
 }
 
@@ -728,7 +779,11 @@ fn rows_law(draws: usize, seed: u64, call: Call, planted: Planted) -> Result<(f6
 /// row; three planted sampler defects break it. `MLX_TEST_SAMPLED_DRAWS` sets the count.
 #[test]
 fn device_rows_keep_the_target_law_through_the_whole_turn_and_the_lane() -> Result<()> {
-    if !metal() {
+    if !metal()
+        || crate::test_support::apple_gpu_family_absent(
+            "device_rows_keep_the_target_law_through_the_whole_turn_and_the_lane",
+        )
+    {
         return Ok(());
     }
     let draws = std::env::var("MLX_TEST_SAMPLED_DRAWS")

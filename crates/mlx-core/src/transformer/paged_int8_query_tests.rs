@@ -240,6 +240,19 @@ const GOLDEN: &[u64] = &[
 /// Mutation off-ignored: the adapter ignores activations bf16 → red.
 #[test]
 fn bf16_query_tile_keeps_its_bits() {
+    const TEST: &str = "bf16_query_tile_keeps_its_bits";
+    if crate::test_support::paged_prefill_unsupported(TEST) {
+        return;
+    }
+    // SAFETY: nullary FFI queries; the adapter's `device_pages_per_split`.
+    let pages = mlx_paged_attn::prefill_plan::pages_per_split(
+        unsafe { mlx_sys::mlx_gpu_architecture_gen() },
+        u32::try_from(unsafe { mlx_sys::mlx_gpu_reported_core_count() }).unwrap_or(0),
+    );
+    if pages != 32 {
+        eprintln!("skipping {TEST}: {pages} pages per split; the hashes hold for 32");
+        return;
+    }
     let mut hashes = Vec::new();
     for &(label, dtype, kv, group, d, bs, tokens, cases) in GOLDEN_POOLS {
         let Some((mut adapter, _)) = filled(dtype, kv, d, bs, tokens, false) else {
@@ -886,6 +899,11 @@ const GOLDEN_DECODE: &[u64] = &[
 /// varlen prefill piece, on the 27B and 35B geometries.
 #[test]
 fn decode_kernels_keep_their_bits_without_score_scales() {
+    if crate::test_support::apple_gpu_family_absent(
+        "decode_kernels_keep_their_bits_without_score_scales",
+    ) {
+        return;
+    }
     let mut hashes = Vec::new();
     for &(label, kv, group, lengths, reads) in DECODE_FIXTURES {
         let Some(mut adapter) = filled_sequences(MetalDtype::Int8, kv, 256, lengths) else {

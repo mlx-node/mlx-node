@@ -426,7 +426,8 @@ thread_local! {
 }
 
 /// Whether the device rows take a turn with these parameters: sampled, no
-/// penalty, `top_k` within the kernels' list, mlx-node's filter order, Metal.
+/// penalty, `top_k` within the kernels' list, mlx-node's filter order, a GPU
+/// that launches the kernels.
 pub(crate) fn sampled_rows_take(p: &ChatParams) -> bool {
     let config = p.sampling_config.unwrap_or_default();
     !sampling::is_greedy_temperature(config.temperature.unwrap_or(1.0))
@@ -435,7 +436,7 @@ pub(crate) fn sampled_rows_take(p: &ChatParams) -> bool {
         && p.frequency_penalty == 0.0
         && (1..=SAMPLED_ROWS_MAX_TOP_K).contains(&config.top_k.unwrap_or(0))
         && sampling::default_filter_order()
-        && unsafe { mlx_sys::mlx_metal_is_available() }
+        && unsafe { mlx_sys::mlx_dflash2_sampled_rows_supported() }
 }
 
 /// A cycle's target rows, queued on the device: one record per verify row
@@ -3530,7 +3531,11 @@ mod tests {
     /// every other cycle keeps the filter chain.
     #[test]
     fn sampled_cycles_take_the_device_rows_only_for_a_stepper_that_asks() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            || crate::test_support::apple_gpu_family_absent(
+                "sampled_cycles_take_the_device_rows_only_for_a_stepper_that_asks",
+            )
+        {
             return;
         }
         let turn = |asks: bool, device: bool, params: ChatParams| {
@@ -3627,7 +3632,11 @@ mod tests {
     /// same draws.
     #[test]
     fn a_thinking_cut_on_the_device_rows_lands_where_the_filter_chain_puts_it() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            || crate::test_support::apple_gpu_family_absent(
+                "a_thinking_cut_on_the_device_rows_lands_where_the_filter_chain_puts_it",
+            )
+        {
             return;
         }
         let end = [8u32, 10, 9];
