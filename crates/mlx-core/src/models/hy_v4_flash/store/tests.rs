@@ -605,6 +605,7 @@ fn real_store_admits_at_load() {
         chunk_cap: None,
         lanes: LANES_MAX,
         plan: CachePlan::AdmitWith(Limits::default()),
+        max_memory: None,
     };
     let st = Store::open(&s.paths, &opts).unwrap();
     TEST_HOST.with(|c| c.set(None));
@@ -786,4 +787,11 @@ fn lease_without_admission_only_flips_the_bank() {
     lease.end_turn(&bank).unwrap();
     assert!(!bank.in_turn());
     assert!(lease.switches().is_empty());
+}
+
+#[test]
+fn max_memory_caps_the_working_set_only_below_it() {
+    assert_eq!(capped_ws(100 * G, None), 100 * G);
+    assert_eq!(capped_ws(100 * G, Some(64 * G)), 64 * G);
+    assert_eq!(capped_ws(100 * G, Some(200 * G)), 100 * G);
 }

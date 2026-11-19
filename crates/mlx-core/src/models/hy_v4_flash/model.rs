@@ -185,7 +185,7 @@ pub fn head_rows(x: &MxArray, head: &Dense) -> Result<MxArray> {
         let hi = (lo + HEAD_CHUNK).min(vocab);
         let wt = head.row_range(lo, hi)?.f32()?.transpose(Some(&[1, 0]))?;
         let p = per_row(&xf, |r| r.matmul(&wt))?;
-        MxArray::eval_arrays_with_context(&[&p], "hy_v4_flash head chunk")?;
+        super::stats::eval(&[&p], "hy_v4_flash head chunk")?;
         parts.push(p);
         lo = hi;
     }
@@ -788,7 +788,7 @@ impl Model {
                 keep: &keep,
             });
             let (y, routes) = blk.forward(&w.layers()[l], &x, wave, owners, engram)?;
-            MxArray::eval_arrays_with_context(&[&y], "hy_v4_flash layer")?;
+            super::stats::eval(&[&y], "hy_v4_flash layer")?;
             x = y;
             if let Some(t) = trace.as_deref_mut() {
                 t.routes.push(routes);
@@ -866,7 +866,7 @@ impl Model {
             .flat_map(|o| o.logits.iter().chain(o.hidden.iter()))
             .collect();
         if !live.is_empty() {
-            MxArray::eval_arrays_with_context(&live, "hy_v4_flash head")?;
+            super::stats::eval(&live, "hy_v4_flash head")?;
         }
         Ok(outs)
     }

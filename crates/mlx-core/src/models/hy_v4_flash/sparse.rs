@@ -174,7 +174,7 @@ fn gather_rows_in(
         let den = p.sum(Some(&[-1]), Some(true))?.add(&sink.sub(&m)?.exp()?)?;
         let v = g.slice(&[0, 0, 0], &[c, kmax, v_width])?;
         let o = p.matmul(&v)?.div(&den)?;
-        MxArray::eval_arrays_with_context(&[&o], "hy_v4_flash sparse attention chunk")?;
+        super::stats::eval(&[&o], "hy_v4_flash sparse attention chunk")?;
         outs.push(o);
         lo = hi;
     }

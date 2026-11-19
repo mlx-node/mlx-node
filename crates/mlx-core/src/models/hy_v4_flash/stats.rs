@@ -2,6 +2,7 @@
 //! expert bank's and the Engram table's counters, and the phase split of a
 //! forward (off unless `set_profiling(true)`).
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,6 +12,7 @@ use serde_json::{Value, json};
 
 use super::bank::{KqBank, KqStats};
 use super::rows::F8Table;
+use super::store::LANES_MAX;
 use crate::array::MxArray;
 pub use crate::models::deepseek_v41::stats::{host_pressure, rusage};
 
@@ -183,6 +185,170 @@ impl Counters {
             engram_ns: d(self.engram_ns, before.engram_ns),
             staging_layers: self.staging_layers,
         }
+    }
+}
+
+/// Wave rows the histogram tells apart; its last bucket also takes every
+/// wider wave.
+pub const WAVE_ROWS: usize = 12;
+
+static EVALS: AtomicU64 = AtomicU64::new(0);
+
+/// Evaluates `outs`: one counted host sync of a forward.
+pub fn eval(outs: &[&MxArray], what: &str) -> napi::Result<()> {
+    EVALS.fetch_add(1, Ordering::Relaxed);
+    MxArray::eval_arrays_with_context(outs, what)
+}
+
+/// A host read of a forward, which waits for the GPU as an eval does.
+pub fn synced() {
+    EVALS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Host syncs of every forward so far (monotonic, process-wide).
+pub fn evals() -> u64 {
+    EVALS.load(Ordering::Relaxed)
+}
+
+/// One decode wave, as [`WaveLog::record`] takes it.
+#[derive(Clone, Debug)]
+pub struct WaveSample<'a> {
+    /// Each owner's sequence and rows, in wave order.
+    pub owners: &'a [(u32, usize)],
+    /// Routed experts one row picks over the streamed layers.
+    pub picks_per_row: u64,
+    /// The bank's and the table's counters over the wave.
+    pub counters: Counters,
+    pub evals: u64,
+    pub secs: f64,
+}
+
+impl WaveSample<'_> {
+    pub fn rows(&self) -> usize {
+        self.owners.iter().map(|&(_, r)| r).sum()
+    }
+
+    /// The stats file's line of the wave.
+    pub fn json(&self) -> Value {
+        let c = &self.counters;
+        let rows = self.rows() as u64;
+        json!({
+            "stage": "wave",
+            "owners": self.owners.len(),
+            "rows": rows,
+            "union_experts": c.uses,
+            "row_experts": rows * self.picks_per_row,
+            "served_rate": served_rate(c.uses, c.fill_slots),
+            "miss_bytes": c.fill_bytes,
+            "engram_bytes": c.engram_bytes,
+            "read_gbps": c.fill_bytes as f64 / 1e9 / (c.fill_ns as f64 * 1e-9).max(1e-9),
+            "evals": self.evals,
+            "wave_ms": self.secs * 1e3,
+        })
+    }
+}
+
+/// Share of `uses` served without a read (0 without a use).
+pub fn served_rate(uses: u64, reads: u64) -> f64 {
+    if uses == 0 {
+        0.0
+    } else {
+        uses.saturating_sub(reads) as f64 / uses as f64
+    }
+}
+
+/// Decode-wave counters since load.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Waves {
+    pub decode: u64,
+    /// Waves by rows: `[i]` holds the waves of `i + 1` rows.
+    pub rows: [u64; WAVE_ROWS],
+    /// Distinct experts per layer step, summed (the bank's uses).
+    pub union_experts: u64,
+    /// Rows times the routed experts each row picks.
+    pub row_experts: u64,
+    pub miss_bytes: u64,
+    /// Wave rows kept: one emitted token each.
+    pub tokens: u64,
+    pub evals: u64,
+    /// By owners in the wave (`[n - 1]`): expert uses, and the uses served
+    /// without a read.
+    pub lane_uses: [u64; LANES_MAX],
+    pub lane_served: [u64; LANES_MAX],
+    /// Prefill slices run while another scheduled turn was open.
+    pub prefill_stall_ns: u64,
+}
+
+impl Waves {
+    pub fn miss_bytes_per_token(&self) -> f64 {
+        self.miss_bytes as f64 / self.tokens.max(1) as f64
+    }
+
+    pub fn evals_per_wave(&self) -> f64 {
+        self.evals as f64 / self.decode.max(1) as f64
+    }
+
+    /// `[n - 1]`: the share of the uses of waves of `n` owners served
+    /// without a read.
+    pub fn hit_rate_by_lanes(&self) -> [f64; LANES_MAX] {
+        std::array::from_fn(|i| {
+            served_rate(
+                self.lane_uses[i],
+                self.lane_uses[i].saturating_sub(self.lane_served[i]),
+            )
+        })
+    }
+}
+
+/// [`Waves`] and the rows each owner's last decode wave wrote that a cut
+/// may still take back (a verify's rejected rows, the unemitted tail).
+#[derive(Debug, Default)]
+pub struct WaveLog {
+    pub waves: Waves,
+    open: HashMap<u32, usize>,
+}
+
+impl WaveLog {
+    pub fn record(&mut self, s: &WaveSample) {
+        let w = &mut self.waves;
+        let c = &s.counters;
+        let rows = s.rows();
+        w.decode += 1;
+        w.rows[rows.clamp(1, WAVE_ROWS) - 1] += 1;
+        w.union_experts += c.uses;
+        w.row_experts += rows as u64 * s.picks_per_row;
+        w.miss_bytes += c.fill_bytes;
+        w.tokens += rows as u64;
+        w.evals += s.evals;
+        let lane = s.owners.len().clamp(1, LANES_MAX) - 1;
+        w.lane_uses[lane] += c.uses;
+        w.lane_served[lane] += c.uses.saturating_sub(c.fill_slots);
+        for &(seq, r) in s.owners {
+            self.open.insert(seq, r);
+        }
+    }
+
+    /// `seq` lost its top `rows` rows: those of its last wave among them
+    /// emitted no token.
+    pub fn cut(&mut self, seq: u32, rows: usize) {
+        let Some(open) = self.open.get_mut(&seq) else {
+            return;
+        };
+        let back = rows.min(*open);
+        *open -= back;
+        self.waves.tokens = self.waves.tokens.saturating_sub(back as u64);
+    }
+
+    pub fn stalled(&mut self, ns: u64) {
+        self.waves.prefill_stall_ns += ns;
+    }
+
+    pub fn forget(&mut self, seq: u32) {
+        self.open.remove(&seq);
+    }
+
+    pub fn clear_open(&mut self) {
+        self.open.clear();
     }
 }
 

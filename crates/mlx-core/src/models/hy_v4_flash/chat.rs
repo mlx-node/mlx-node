@@ -37,7 +37,7 @@ use super::persist_writer::{Closer, Telemetry};
 use super::prefill::{Driver, Grid, Plan, Prefilled, Runner, Seq};
 use super::sched::{self, Paged, pass_keys};
 use super::spec;
-use super::stats::{self, Counters, Line};
+use super::stats::{self, Counters, Line, WaveLog, Waves};
 use super::store::{Options, Store};
 use crate::array::MxArray;
 use crate::disk_tier::{DiskTierOptions, TierHandle};
@@ -53,6 +53,7 @@ use crate::engine::params::{
 };
 use crate::engine::plan::{ExecutionPlan, PagedAttentionPlan};
 use crate::engine::types::{ChatConfig, ChatResult};
+use crate::engine::warmup::WarmupReport;
 use crate::model_thread::{LoopControl, ModelThread};
 use crate::models::deepseek_v41::chat::{gguf_tokenizer, shard_paths};
 use crate::moe_stream::budget::Admission;
@@ -298,6 +299,12 @@ pub(crate) struct Residency {
     pub bank_resident: u64,
     pub switches: u32,
     pub in_turn: bool,
+    /// The bank's and the Engram table's counters since load.
+    pub counters: Counters,
+    pub waves: Waves,
+    /// The stored states: `[with a RAM copy, their bytes, published,
+    /// restored]`.
+    pub prefix: [u64; 4],
     /// The last saved turn: its rendered prompt ids and generated ids.
     pub turn_ids: Option<(Vec<u32>, Vec<u32>)>,
 }
@@ -331,6 +338,8 @@ pub(crate) struct Inner {
     /// or without a disk.
     pub(super) flat: Option<FlatTier>,
     pub(super) telemetry: Arc<Telemetry>,
+    /// The paged mode's decode waves.
+    pub(super) waves: WaveLog,
 }
 
 impl Drop for Inner {
@@ -351,23 +360,29 @@ impl Inner {
         max_context: Option<usize>,
         residency: Arc<Mutex<Residency>>,
     ) -> Result<Self> {
-        Self::open(path, max_context, residency, true, None)
+        Self::open(path, max_context, None, residency, true, None).map(|(inner, _)| inner)
     }
 
     /// `load` in flat mode with `serial`, else in paged mode when the wave
     /// row cap holds a padded Q8 call; the stored states on the disk tier of
-    /// `tier`.
+    /// `tier`, which a paged load gets back to attach after its warm-up;
+    /// every admission within `max_memory`.
     pub(crate) fn open(
         path: &Path,
         max_context: Option<usize>,
+        max_memory: Option<u64>,
         residency: Arc<Mutex<Residency>>,
         serial: bool,
         tier: Option<&DiskTierOptions>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, Option<Disk>)> {
         let paths = shard_paths(path)?;
         let (tokenizer, eos) = gguf_tokenizer(&paths[0])?;
         check_eos(eos)?;
-        let mut store = Store::open(&paths, &Options::from_env(max_context, serial)?)?;
+        let opts = Options {
+            max_memory,
+            ..Options::from_env(max_context, serial)?
+        };
+        let mut store = Store::open(&paths, &opts)?;
         let mtp = if store.mtp {
             let m = MtpLayer::load(&paths, &store.model)?;
             store.dense_bytes += m.bytes();
@@ -385,8 +400,9 @@ impl Inner {
                 Arc::clone(&inner.telemetry),
             )
         });
-        sched::attach(&mut inner, serial, disk)?;
-        Ok(inner)
+        let held = sched::attach(&mut inner, serial, disk)?;
+        inner.publish(None);
+        Ok((inner, held))
     }
 
     pub(crate) fn new(
@@ -413,6 +429,7 @@ impl Inner {
             paged: None,
             flat: None,
             telemetry: Arc::new(Telemetry::default()),
+            waves: WaveLog::default(),
         };
         inner.publish(None);
         Ok(inner)
@@ -469,6 +486,7 @@ impl Inner {
         });
         match filled {
             Some((seq, keys)) => {
+                f.restored();
                 self.conv.replace(seq);
                 Ok((Some(keys), None))
             }
@@ -501,16 +519,26 @@ impl Inner {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn publish(&mut self, bank_resident: Option<u64>) {
+    pub(super) fn publish(&mut self, bank_resident: Option<u64>) {
         let admission = self.store.admission();
         let switches = self.store.lease.switches().len() as u32;
         let cache_slots = self.store.cache_slots();
         let in_turn = self.in_turn;
+        let counters = Counters::now(&self.store.bank, &self.store.table);
+        let waves = self.waves.waves;
+        let prefix = match (&self.paged, &self.flat) {
+            (Some(p), _) => p.counts(),
+            (None, Some(f)) => f.counts(),
+            (None, None) => [0; 4],
+        };
         let mut r = self.residency();
         r.admission = admission;
         r.switches = switches;
         r.cache_slots = cache_slots;
         r.in_turn = in_turn;
+        r.counters = counters;
+        r.waves = waves;
+        r.prefix = prefix;
         if let Some(b) = bank_resident {
             r.bank_resident = b;
         }
@@ -887,6 +915,10 @@ pub struct HyV4FlashLoadOptions {
     /// Context token limit (`--max-context`): the admission budgets for at
     /// most this many tokens (and at most 262,144).
     pub max_context_tokens: Option<i64>,
+    /// The Metal memory budget (`--max-memory`): every admission, at load
+    /// and at each turn, sizes the expert cache within it, and the memory
+    /// governor's limit for this model is it.
+    pub max_memory_bytes: Option<i64>,
     /// SSD cache for the stored states (`--max-cache-disk`): `'auto'` (the
     /// default: up to 32 GiB, a quarter of the volume's room), a byte count,
     /// or `'0'`, which turns the SSD cache off.
@@ -912,13 +944,16 @@ pub struct HyV4FlashTurnTokenIds {
 }
 
 #[napi(object)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct HyV4FlashContextLimits {
     /// The context the load's admission budgets for.
     pub effective_window_tokens: u32,
     pub trained_window_tokens: u32,
     /// Rows of one prefill chunk.
     pub prefill_chunk_tokens: u32,
+    /// The model's `modelId` in `memoryGovernorStatus().scheduler`; a
+    /// flat-mode load does not register.
+    pub governor_model_id: Option<f64>,
 }
 
 /// The load-time and latest per-turn admission, and the expert bank.
@@ -944,6 +979,63 @@ pub struct HyV4FlashResidencyInfo {
     pub bank_resident_after_turn_bytes: f64,
     pub bank_switches: u32,
     pub in_turn: bool,
+    /// Routed expert uses since load served without a read (cache hits and
+    /// still-valid staging copies), and the experts read into slots.
+    pub slot_hits: f64,
+    pub slot_misses: f64,
+    /// Bytes read from the GGUF shards since load: expert fills and Engram
+    /// rows; the page cache may serve part of them.
+    pub checkpoint_bytes_read: f64,
+    pub engram_bytes_read: f64,
+    /// Stored prefix states with a RAM copy, and their bytes.
+    pub prefix_states: f64,
+    pub prefix_state_bytes: f64,
+    /// States published since load, and turns that resumed from one.
+    pub prefix_published: f64,
+    pub prefix_restored: f64,
+    /// The stored states' disk tier is open and takes writes.
+    pub prefix_disk_enabled: bool,
+    /// States waiting for their disk write, the one in flight included.
+    pub prefix_disk_waiting: f64,
+    /// States written whose whole chain is on disk.
+    pub prefix_disk_durable: f64,
+    /// Waiting states not written: their conversation went on.
+    pub prefix_disk_unneeded: f64,
+    /// States not written or dropped (chain incomplete, room, a failed
+    /// write, a closed cache), and copies the writer refused.
+    pub prefix_disk_refused: f64,
+    /// States read back from disk into memory.
+    pub prefix_disk_restored: f64,
+    /// States a persistent cache took back at load: on disk only until a
+    /// turn reads one back.
+    pub prefix_disk_adopted: f64,
+    /// States removed from disk: their chain was not there.
+    pub prefix_disk_dropped_chain: f64,
+    /// Block and segment copies waiting for the writer.
+    pub prefix_disk_owed_blocks: f64,
+    /// Bytes of states written.
+    pub prefix_disk_state_bytes_written: f64,
+    /// Paged mode: decode and verify waves since load.
+    pub decode_waves: f64,
+    /// Waves by rows: `[i]` counts the waves of `i + 1` rows, the last
+    /// entry also every wider wave.
+    pub wave_rows: Vec<f64>,
+    /// Distinct experts per layer step of the waves, summed, and the rows
+    /// times the routed experts each row picks: their ratio is the share
+    /// of picks the lanes shared.
+    pub union_experts: f64,
+    pub row_experts: f64,
+    /// Wave rows kept (one emitted token each).
+    pub wave_tokens: f64,
+    /// Expert bytes the waves read per kept row.
+    pub miss_bytes_per_token: f64,
+    /// `[n - 1]`: the share of expert uses served without a read in waves
+    /// of `n` owners.
+    pub hit_rate_by_lanes: Vec<f64>,
+    /// Host syncs (evals and router reads) per wave.
+    pub evals_per_wave: f64,
+    /// Milliseconds of prefill slices run while another scheduled turn was open.
+    pub prefill_chunk_stall_ms: f64,
 }
 
 /// The model thread's state: the flat whole-turn backend or the shared
@@ -969,6 +1061,7 @@ pub struct HyV4FlashModel {
     closer: Option<std::sync::Weak<Closer>>,
     state_tier: TierHandle,
     telemetry: Arc<Telemetry>,
+    warmup: Option<WarmupReport>,
 }
 
 #[napi]
@@ -977,10 +1070,14 @@ impl HyV4FlashModel {
     /// single-file GGUF.
     #[napi]
     pub async fn load(model_path: String, options: Option<HyV4FlashLoadOptions>) -> Result<Self> {
+        let progress = crate::engine::load_progress::begin(&model_path);
+        let cell = progress.cell();
         let options = options.unwrap_or_default();
         let max_context =
             crate::nn::rope_scaling::max_context_option(LABEL, options.max_context_tokens)?
                 .map(|t| t as usize);
+        let max_memory =
+            crate::models::qwen3_5::load_plan::max_memory_option(LABEL, options.max_memory_bytes)?;
         let env = std::env::var(crate::cold_tier::PERSIST_PAGED_CACHE_ENV).ok();
         let (tier, disk) = persist::disk_plan(
             LABEL,
@@ -995,26 +1092,46 @@ impl HyV4FlashModel {
         let (thread, ready) = ModelThread::spawn_with_scheduler(
             move || {
                 let tier = disk.then_some(&tier);
-                let inner = Inner::open(Path::new(&model_path), max_context, shared, serial, tier)?;
+                let (inner, held) = Inner::open(
+                    Path::new(&model_path),
+                    max_context,
+                    max_memory,
+                    shared,
+                    serial,
+                    tier,
+                )?;
                 let s = &inner.store;
+                let governor = inner.paged.as_ref().map(|p| p.governor.model_id());
                 let limits = HyV4FlashContextLimits {
                     effective_window_tokens: u32::try_from(s.ctx).unwrap_or(u32::MAX),
                     trained_window_tokens: u32::try_from(s.model.cfg().context_length)
                         .unwrap_or(u32::MAX),
                     prefill_chunk_tokens: u32::try_from(s.chunk).unwrap_or(u32::MAX),
+                    governor_model_id: governor.map(|id| id as f64),
                 };
                 let dense = s.dense_bytes;
                 let lanes = inner.paged.as_ref().map(|p| p.lanes);
-                let closer = inner.disk().map(Disk::closer);
-                let state_tier = inner.disk().map(Disk::tier_handle).unwrap_or_default();
+                let tier_disk = held.as_ref().or(inner.disk());
+                let closer = tier_disk.map(Disk::closer);
+                let state_tier = tier_disk.map(Disk::tier_handle).unwrap_or_default();
                 let telemetry = Arc::clone(&inner.telemetry);
-                let engine = match lanes {
-                    Some(_) => Engine::Paged(Box::new(HybridSchedulerState::new(inner)?)),
-                    None => Engine::Flat(Box::new(inner)),
+                let (engine, warmup) = match lanes {
+                    Some(_) => {
+                        let (mut state, warmup) =
+                            crate::engine::warmup::serving_scheduler(inner, &cell, true)?;
+                        if let Some(disk) = held {
+                            sched::attach_disk(&mut state.inner, disk);
+                            state.inner.publish(None);
+                        }
+                        (Engine::Paged(Box::new(state)), warmup)
+                    }
+                    None => (Engine::Flat(Box::new(inner)), None),
                 };
                 Ok((
                     engine,
-                    (limits, dense, lanes, closer, state_tier, telemetry),
+                    (
+                        limits, dense, lanes, closer, state_tier, telemetry, warmup, governor,
+                    ),
                 ))
             },
             |engine: &mut Engine, rx| match engine {
@@ -1032,9 +1149,13 @@ impl HyV4FlashModel {
                 },
             },
         );
-        let (limits, dense, lanes, closer, state_tier, telemetry) = ready
+        let (limits, dense, lanes, closer, state_tier, telemetry, warmup, governor) = ready
             .await
             .map_err(|e| Error::from_reason(e.to_string()))??;
+        drop(progress);
+        if let (Some(sender), Some(model)) = (thread.cmd_sender(), governor) {
+            crate::engine::model_command::register_memory_waker(model, &sender);
+        }
         if let (Some(sender), Some(c)) = (
             thread.cmd_sender(),
             closer.as_ref().and_then(std::sync::Weak::upgrade),
@@ -1056,7 +1177,15 @@ impl HyV4FlashModel {
             closer,
             state_tier,
             telemetry,
+            warmup,
         })
+    }
+
+    /// What the load's warm-up did; `null` for a flat-mode load, which runs
+    /// none.
+    #[napi(getter)]
+    pub fn warmup(&self) -> Option<WarmupReport> {
+        self.warmup.clone()
     }
 
     /// Closes the stored states' SSD cache at a clean stop: on a persistent
@@ -1147,6 +1276,8 @@ impl HyV4FlashModel {
             .unwrap_or_else(PoisonError::into_inner);
         let a = r.admission;
         let slots = r.cache_slots;
+        let (c, w, t) = (&r.counters, &r.waves, &*self.telemetry);
+        let load = |n: &std::sync::atomic::AtomicU64| n.load(Ordering::Relaxed) as f64;
         HyV4FlashResidencyInfo {
             dense_bytes: self.dense_bytes as f64,
             physical_bytes: a.map(|a| a.physical as f64),
@@ -1163,6 +1294,33 @@ impl HyV4FlashModel {
             bank_resident_after_turn_bytes: r.bank_resident as f64,
             bank_switches: r.switches,
             in_turn: r.in_turn,
+            slot_hits: c.uses.saturating_sub(c.fill_slots) as f64,
+            slot_misses: c.fill_slots as f64,
+            checkpoint_bytes_read: (c.fill_bytes + c.engram_bytes) as f64,
+            engram_bytes_read: c.engram_bytes as f64,
+            prefix_states: r.prefix[0] as f64,
+            prefix_state_bytes: r.prefix[1] as f64,
+            prefix_published: r.prefix[2] as f64,
+            prefix_restored: r.prefix[3] as f64,
+            prefix_disk_enabled: t.mode(&self.state_tier) != 0,
+            prefix_disk_waiting: load(&t.waiting),
+            prefix_disk_durable: load(&t.durable),
+            prefix_disk_unneeded: load(&t.unneeded),
+            prefix_disk_refused: load(&t.refused),
+            prefix_disk_restored: load(&t.disk_restored),
+            prefix_disk_adopted: load(&t.adopted),
+            prefix_disk_dropped_chain: load(&t.dropped_chain),
+            prefix_disk_owed_blocks: load(&t.owed),
+            prefix_disk_state_bytes_written: load(&t.state_bytes_written),
+            decode_waves: w.decode as f64,
+            wave_rows: w.rows.iter().map(|&n| n as f64).collect(),
+            union_experts: w.union_experts as f64,
+            row_experts: w.row_experts as f64,
+            wave_tokens: w.tokens as f64,
+            miss_bytes_per_token: w.miss_bytes_per_token(),
+            hit_rate_by_lanes: w.hit_rate_by_lanes().to_vec(),
+            evals_per_wave: w.evals_per_wave(),
+            prefill_chunk_stall_ms: w.prefill_stall_ns as f64 * 1e-6,
         }
     }
 }

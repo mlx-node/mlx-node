@@ -25,6 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use rand::Rng;
 
@@ -44,11 +45,14 @@ use super::persist::{Disk, FlatTier, PoolBlocks, Read, SEGMENT_BOUND};
 use super::prefill::{BLOCK_ROWS, Grid};
 use super::prefix_state::{Key, States, Turn, prompt_keys, turn_keys};
 use super::spec::{self, LOOKAHEAD_MAX};
+use super::stats::{self, Counters, WaveSample};
 use super::store::{LADDER_BYTES, Store, kv_per_token, lane_bytes};
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{PoolCacheLimitGuard, coordinator};
 use crate::engine::backend::{DsparkProposal, PagedBackend, PagedPrefix, PagedSpeculativeArgs};
-use crate::engine::governor::governor::MemoryAccounts;
+use crate::engine::governor::governor::{
+    Governor, MemoryAccounts, ModelGuard, ModelRegistration, start_under_growth_lock,
+};
 use crate::engine::hybrid_scheduler::{
     HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, NoRestoreTicket,
     ScheduledStateCapacity, ScheduledVerifyCommit, ScheduledVerifyRow, SchedulerOwnerContext,
@@ -219,6 +223,11 @@ pub struct Busy {
 impl Busy {
     pub fn is_live(&self) -> bool {
         self.live
+    }
+
+    /// A scheduled turn other than `seq` is open.
+    pub fn others_open(&self, seq: SeqId) -> bool {
+        self.open.iter().any(|&s| s != seq)
     }
 
     fn join_or_begin(&mut self) -> Edge {
@@ -460,6 +469,8 @@ pub struct Paged {
     /// Each owner's keys of its cell's whole blocks, as its turns wrote them.
     pub lines: HashMap<SeqId, Vec<Vec<u64>>>,
     _pool: PoolCacheLimitGuard,
+    /// The model's registration with the memory governor.
+    pub(crate) governor: ModelGuard<'static>,
 }
 
 impl Drop for Paged {
@@ -481,14 +492,33 @@ impl Drop for Paged {
 impl Paged {
     /// The pool for `store`'s admitted context (one partial block per lane
     /// on top), allocated whole at load.
+    /// The model registers with the memory governor, which admits the pool
+    /// as the start's runway.
     pub fn open(store: &Store) -> Result<Self> {
         let cfg = store.model.cfg();
         let g = PageGeometry::of(cfg)?;
         let lanes = lanes(store.lanes, store.row_cap);
         let blocks = store.ctx.div_ceil(BLOCK as usize) + lanes + 1;
         let blocks = u32::try_from(blocks).map_err(|_| bad("pool blocks exceed u32"))?;
-        let adapter = create(&g, store.ctx, blocks, blocks, u64::MAX)?;
-        let pool = coordinator().register_pool(block_bytes(&adapter));
+        let page = g.block_bytes()?;
+        let registration = ModelRegistration {
+            model_id: crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER
+                .fetch_add(1, Ordering::Relaxed),
+            hard_budget: store.hard_budget(),
+            untracked: 0,
+            page_bytes: page,
+        };
+        crate::array::memory::synchronize_and_clear_cache();
+        let gov: &'static Governor = crate::engine::governor::governor();
+        let (governor, (adapter, pool)) = start_under_growth_lock(gov, || {
+            gov.load_pool(registration, u64::from(blocks) * page, || {
+                let adapter =
+                    create(&g, store.ctx, blocks, blocks, u64::MAX).map_err(|e| e.reason)?;
+                let pool = coordinator().register_pool(block_bytes(&adapter));
+                Ok((adapter, pool))
+            })
+            .map_err(Error::from_reason)
+        })?;
         Ok(Self {
             adapter,
             owners: Owners::new(),
@@ -505,6 +535,7 @@ impl Paged {
             disk: None,
             lines: HashMap::new(),
             _pool: pool,
+            governor,
         })
     }
 
@@ -534,6 +565,16 @@ impl Paged {
         disk.step(states.store_mut(), &mut PoolBlocks(adapter))
     }
 
+    /// `[states with a RAM copy, their bytes, published, restored]`.
+    pub fn counts(&self) -> [u64; 4] {
+        [
+            self.states.ram_len() as u64,
+            self.states.held_bytes(),
+            self.published,
+            self.restored,
+        ]
+    }
+
     /// Bytes of the pool's blocks.
     pub fn pool_bytes(&self) -> u64 {
         block_bytes(&self.adapter)
@@ -557,6 +598,48 @@ fn block_bytes(adapter: &PagedKVCacheAdapter) -> u64 {
         .block_telemetry()
         .map_or(0, |t| u64::from(t.total_blocks));
     blocks * adapter.bytes_per_block().unwrap_or(0)
+}
+
+/// Routed experts one row picks over the trunk's streamed layers.
+fn picks_per_row(store: &Store) -> u64 {
+    let cfg = store.model.cfg();
+    let layers = cfg.trunk().iter().filter(|l| !l.dense_ffn).count();
+    (cfg.moe.n_used * layers) as u64
+}
+
+/// A decode wave's counters at its start.
+struct WaveClock {
+    counters: Counters,
+    evals: u64,
+    t0: Instant,
+}
+
+impl WaveClock {
+    fn start(store: &Store) -> Self {
+        Self {
+            counters: Counters::now(&store.bank, &store.table),
+            evals: stats::evals(),
+            t0: Instant::now(),
+        }
+    }
+
+    /// The wave of `rows` into `waves`, and its line into the stats file.
+    fn record(self, store: &Store, rows: &[Rows<'_>], waves: &mut stats::WaveLog) {
+        let owners: Vec<(SeqId, usize)> = rows.iter().map(|r| (r.seq, r.ids.len())).collect();
+        let sample = WaveSample {
+            owners: &owners,
+            picks_per_row: picks_per_row(store),
+            counters: Counters::now(&store.bank, &store.table).since(&self.counters),
+            evals: stats::evals().saturating_sub(self.evals),
+            secs: self.t0.elapsed().as_secs_f64(),
+        };
+        waves.record(&sample);
+        if std::env::var_os(stats::STATS_ENV).is_some()
+            && let Err(e) = stats::emit(&sample.json())
+        {
+            tracing::warn!("hy_v4_flash stats: {e}");
+        }
+    }
 }
 
 /// An empty owner cell, with an empty draft when the MTP layer is loaded.
@@ -980,15 +1063,33 @@ impl Inner {
         kind: RowKind,
         cancel: Option<&dyn Fn(usize) -> bool>,
     ) -> Result<Vec<Output>> {
+        let out = self.wave_once(rows, kind, cancel);
+        if kind.is_decode() {
+            self.publish(None);
+        }
+        out
+    }
+
+    fn wave_once(
+        &mut self,
+        rows: &[Rows<'_>],
+        kind: RowKind,
+        cancel: Option<&dyn Fn(usize) -> bool>,
+    ) -> Result<Vec<Output>> {
         let mut seen = HashSet::new();
         if rows.is_empty() || rows.iter().any(|r| !seen.insert(r.seq) || r.ids.is_empty()) {
             return Err(bad("a step needs distinct owners, each with rows"));
         }
         let Inner {
-            store, mtp, paged, ..
+            store,
+            mtp,
+            paged,
+            waves,
+            ..
         } = self;
         let p = paged.as_mut().ok_or_else(no_pool)?;
         let was = p.owners.active();
+        let clock = kind.is_decode().then(|| WaveClock::start(store));
         let mut fresh = Vec::with_capacity(rows.len());
         for r in rows {
             fresh.push(if p.owners.contains(r.seq) {
@@ -1037,6 +1138,9 @@ impl Inner {
             for r in rows {
                 hold_turn_state(p, r.seq);
             }
+        }
+        if let (Ok(_), Some(clock)) = (&out, clock) {
+            clock.record(store, rows, waves);
         }
         if let Some(seq) = was
             && p.owners.contains(seq)
@@ -1483,6 +1587,7 @@ impl Inner {
         p.adapter
             .release_request_and_purge_prefix_cache()
             .map_err(bad)?;
+        self.waves.clear_open();
         Ok(())
     }
 
@@ -1727,6 +1832,9 @@ impl Inner {
             Err(_) => lose(p, seq, was == Some(seq)),
         }
         reactivate(p, was)?;
+        if cut.is_ok() {
+            self.waves.cut(seq, held - len);
+        }
         cut
     }
 
@@ -2136,6 +2244,7 @@ impl HybridSchedulerBackend for Inner {
         if p.adapter.block_table_for(seq).is_some() {
             p.adapter.release_request_for(seq).map_err(bad)?;
         }
+        self.waves.forget(seq);
         Ok(())
     }
 
@@ -2195,6 +2304,21 @@ impl HybridSchedulerBackend for Inner {
             states: p.state_bytes(),
             embeddings: 0,
         })
+    }
+
+    fn memory_model(&self) -> u64 {
+        self.paged.as_ref().map_or(0, |p| p.governor.model_id())
+    }
+
+    fn memory_governor(&self) -> Option<&'static Governor> {
+        self.paged.as_ref().map(|p| p.governor.governor())
+    }
+
+    /// Owner cells and RAM states: a load's warm-up must leave none.
+    fn retained_state_entries(&self) -> usize {
+        self.paged
+            .as_ref()
+            .map_or(0, |p| p.owners.len() + p.states.ram_len())
     }
 
     fn scheduled_state_capacity(&self) -> Option<ScheduledStateCapacity> {
@@ -2311,7 +2435,14 @@ impl HybridSchedulerBackend for Inner {
             )));
         }
         let _ctx = StreamContext::new(stream);
-        self.prefill_rows(seq, &source[start..end], end == source.len())
+        let beside = self.paged()?.busy.others_open(seq);
+        let t0 = Instant::now();
+        let out = self.prefill_rows(seq, &source[start..end], end == source.len());
+        if beside {
+            self.waves
+                .stalled(u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        }
+        out
     }
 
     fn replace_cached_token_history(&mut self, history: Vec<u32>) {
@@ -2426,17 +2557,25 @@ impl HybridSchedulerBackend for Inner {
 /// Loads in paged mode get their pool.
 /// The paged mode with `serial` off and a wave row cap that holds a padded
 /// call, else the flat mode; `disk` serves the mode's stored states.
-pub(crate) fn attach(inner: &mut Inner, serial: bool, disk: Option<Disk>) -> Result<()> {
+/// The mode's pool or the flat states over `disk`; a paged load hands its
+/// disk back for [`attach_disk`] once its warm-up ran.
+pub(crate) fn attach(inner: &mut Inner, serial: bool, disk: Option<Disk>) -> Result<Option<Disk>> {
     if paged_mode(serial, inner.store.row_cap) {
-        let mut p = Paged::open(&inner.store)?;
-        if let Some(disk) = disk
-            && let Err(e) = p.attach_disk(disk)
-        {
-            tracing::warn!("hy_v4_flash: stored states stay in memory: {}", e.reason);
-        }
-        inner.paged = Some(p);
-    } else if let Some(disk) = disk {
+        inner.paged = Some(Paged::open(&inner.store)?);
+        return Ok(disk);
+    }
+    if let Some(disk) = disk {
         inner.flat = Some(FlatTier::new(disk, inner.store.model.cfg().indexer.kpool));
     }
-    Ok(())
+    Ok(None)
+}
+
+/// The paged pool's blocks and RAM states over `disk`, a persistent tier's
+/// states taken back.
+pub(crate) fn attach_disk(inner: &mut Inner, disk: Disk) {
+    if let Some(p) = inner.paged.as_mut()
+        && let Err(e) = p.attach_disk(disk)
+    {
+        tracing::warn!("hy_v4_flash: stored states stay in memory: {}", e.reason);
+    }
 }

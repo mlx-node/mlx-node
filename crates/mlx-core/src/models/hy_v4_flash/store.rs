@@ -515,6 +515,9 @@ pub struct Options {
     /// Lanes wanted; the admission may give fewer.
     pub lanes: usize,
     pub plan: CachePlan,
+    /// The load option `maxMemoryBytes`: the admission's budget stays
+    /// within it.
+    pub max_memory: Option<u64>,
 }
 
 impl Options {
@@ -533,6 +536,7 @@ impl Options {
             chunk_cap: chunk_cap(std::env::var(CHUNK_ENV).ok().as_deref())?,
             lanes,
             plan: CachePlan::Admit,
+            max_memory: None,
         })
     }
 }
@@ -545,14 +549,20 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// Host memory and the Metal working set for an admission.
-fn host_reading() -> Result<(HostMemory, u64)> {
+/// The working set an admission may fill: `ws`, at most `max_memory`.
+pub fn capped_ws(ws: u64, max_memory: Option<u64>) -> u64 {
+    max_memory.map_or(ws, |m| m.min(ws))
+}
+
+/// Host memory and the Metal working set for an admission, capped at
+/// `max_memory`.
+fn host_reading(max_memory: Option<u64>) -> Result<(HostMemory, u64)> {
     #[cfg(test)]
-    if let Some(r) = TEST_HOST.with(std::cell::Cell::get) {
-        return Ok(r);
+    if let Some((h, ws)) = TEST_HOST.with(std::cell::Cell::get) {
+        return Ok((h, capped_ws(ws, max_memory)));
     }
     let h = host_memory().ok_or_else(|| bad("no host memory reading for admission"))?;
-    Ok((h, working_set()))
+    Ok((h, capped_ws(working_set(), max_memory)))
 }
 
 /// This model's bytes inside `host_used`: resident arrays, the sessions'
@@ -591,6 +601,7 @@ pub struct Lease {
     classes: Classes,
     /// `None`: no admission (tests).
     limits: Option<Limits>,
+    max_memory: Option<u64>,
     turn: Mutex<TurnState>,
 }
 
@@ -612,6 +623,7 @@ impl Lease {
             rows,
             classes,
             limits,
+            max_memory: None,
             turn: Mutex::new(TurnState {
                 admission,
                 wired: None,
@@ -620,6 +632,12 @@ impl Lease {
                 lost: false,
             }),
         }
+    }
+
+    /// Re-admissions stay within `max_memory` too.
+    pub fn with_max_memory(mut self, max_memory: Option<u64>) -> Self {
+        self.max_memory = max_memory;
+        self
     }
 
     fn turn(&self) -> MutexGuard<'_, TurnState> {
@@ -667,7 +685,7 @@ impl Lease {
             // and counted as own
             bank.begin_turn()?;
             let next = (|| {
-                let (h, ws) = host_reading()?;
+                let (h, ws) = host_reading(self.max_memory)?;
                 let o = own(bank, dense, kv)?;
                 match readmit_with(
                     &self.profile,
@@ -720,7 +738,7 @@ impl Lease {
         if t.wired.is_none() {
             return Ok(false);
         }
-        let (h, ws) = host_reading()?;
+        let (h, ws) = host_reading(self.max_memory)?;
         let o = own(bank, dense, kv)?;
         let next = match readmit_with(
             &self.profile,
@@ -789,6 +807,8 @@ pub struct Store {
     pub mtp: bool,
     /// Seconds to allocate the bank at load (no page touched yet).
     pub bank_alloc_s: f64,
+    /// The load option `maxMemoryBytes`.
+    pub max_memory: Option<u64>,
     pub lease: Lease,
 }
 
@@ -821,7 +841,7 @@ impl Store {
         let smallest = CHUNKS[CHUNKS.len() - 1];
         let (lanes, ctx, admitted, cache, staging, admission) = match (&limits, &opts.plan) {
             (Some(l), _) => {
-                let (h, ws) = host_reading()?;
+                let (h, ws) = host_reading(opts.max_memory)?;
                 // nothing of this model exists yet: every byte in use is others'
                 let own = Own::default();
                 let one = pick(&one_lane, &base, max_ctx, l, &h, &own, ws)?;
@@ -899,7 +919,8 @@ impl Store {
                 return Err(e);
             }
         };
-        let lease = Lease::new(profile, size, rows, sizes.classes, limits, admission, &bank);
+        let lease = Lease::new(profile, size, rows, sizes.classes, limits, admission, &bank)
+            .with_max_memory(opts.max_memory);
         Ok(Self {
             model,
             bank,
@@ -915,12 +936,19 @@ impl Store {
             row_cap,
             mtp,
             bank_alloc_s,
+            max_memory: opts.max_memory,
             lease,
         })
     }
 
     pub fn admission(&self) -> Option<Admission> {
         self.lease.admission()
+    }
+
+    /// The memory governor's limit for this model: the working set every
+    /// admission fills at most.
+    pub fn hard_budget(&self) -> u64 {
+        capped_ws(working_set(), self.max_memory)
     }
 
     pub fn cache_slots(&self) -> [usize; 2] {

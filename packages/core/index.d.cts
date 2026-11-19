@@ -658,6 +658,11 @@ export declare class HyV4FlashModel {
    */
   static load(modelPath: string, options?: HyV4FlashLoadOptions | undefined | null): Promise<HyV4FlashModel>;
   /**
+   * What the load's warm-up did; `null` for a flat-mode load, which runs
+   * none.
+   */
+  get warmup(): WarmupReport | null;
+  /**
    * Closes the stored states' SSD cache at a clean stop: on a persistent
    * cache it asks the model thread to write the waiting states, the
    * newest first, then drains every copy, until `deadlineMs`
@@ -4731,6 +4736,11 @@ export interface HyV4FlashContextLimits {
   trainedWindowTokens: number;
   /** Rows of one prefill chunk. */
   prefillChunkTokens: number;
+  /**
+   * The model's `modelId` in `memoryGovernorStatus().scheduler`; a
+   * flat-mode load does not register.
+   */
+  governorModelId?: number;
 }
 
 export interface HyV4FlashLoadOptions {
@@ -4739,6 +4749,12 @@ export interface HyV4FlashLoadOptions {
    * most this many tokens (and at most 262,144).
    */
   maxContextTokens?: number;
+  /**
+   * The Metal memory budget (`--max-memory`): every admission, at load
+   * and at each turn, sizes the expert cache within it, and the memory
+   * governor's limit for this model is it.
+   */
+  maxMemoryBytes?: number;
   /**
    * SSD cache for the stored states (`--max-cache-disk`): `'auto'` (the
    * default: up to 32 GiB, a quarter of the volume's room), a byte count,
@@ -4786,6 +4802,77 @@ export interface HyV4FlashResidencyInfo {
   bankResidentAfterTurnBytes: number;
   bankSwitches: number;
   inTurn: boolean;
+  /**
+   * Routed expert uses since load served without a read (cache hits and
+   * still-valid staging copies), and the experts read into slots.
+   */
+  slotHits: number;
+  slotMisses: number;
+  /**
+   * Bytes read from the GGUF shards since load: expert fills and Engram
+   * rows; the page cache may serve part of them.
+   */
+  checkpointBytesRead: number;
+  engramBytesRead: number;
+  /** Stored prefix states with a RAM copy, and their bytes. */
+  prefixStates: number;
+  prefixStateBytes: number;
+  /** States published since load, and turns that resumed from one. */
+  prefixPublished: number;
+  prefixRestored: number;
+  /** The stored states' disk tier is open and takes writes. */
+  prefixDiskEnabled: boolean;
+  /** States waiting for their disk write, the one in flight included. */
+  prefixDiskWaiting: number;
+  /** States written whose whole chain is on disk. */
+  prefixDiskDurable: number;
+  /** Waiting states not written: their conversation went on. */
+  prefixDiskUnneeded: number;
+  /**
+   * States not written or dropped (chain incomplete, room, a failed
+   * write, a closed cache), and copies the writer refused.
+   */
+  prefixDiskRefused: number;
+  /** States read back from disk into memory. */
+  prefixDiskRestored: number;
+  /**
+   * States a persistent cache took back at load: on disk only until a
+   * turn reads one back.
+   */
+  prefixDiskAdopted: number;
+  /** States removed from disk: their chain was not there. */
+  prefixDiskDroppedChain: number;
+  /** Block and segment copies waiting for the writer. */
+  prefixDiskOwedBlocks: number;
+  /** Bytes of states written. */
+  prefixDiskStateBytesWritten: number;
+  /** Paged mode: decode and verify waves since load. */
+  decodeWaves: number;
+  /**
+   * Waves by rows: `[i]` counts the waves of `i + 1` rows, the last
+   * entry also every wider wave.
+   */
+  waveRows: Array<number>;
+  /**
+   * Distinct experts per layer step of the waves, summed, and the rows
+   * times the routed experts each row picks: their ratio is the share
+   * of picks the lanes shared.
+   */
+  unionExperts: number;
+  rowExperts: number;
+  /** Wave rows kept (one emitted token each). */
+  waveTokens: number;
+  /** Expert bytes the waves read per kept row. */
+  missBytesPerToken: number;
+  /**
+   * `[n - 1]`: the share of expert uses served without a read in waves
+   * of `n` owners.
+   */
+  hitRateByLanes: Array<number>;
+  /** Host syncs (evals and router reads) per wave. */
+  evalsPerWave: number;
+  /** Milliseconds of prefill slices run while another scheduled turn was open. */
+  prefillChunkStallMs: number;
 }
 
 /** The last saved turn of the session (prompt and output ids). */

@@ -366,7 +366,7 @@ impl TokTail {
             None => new,
         }
         .deep_copy()?;
-        MxArray::eval_arrays_with_context(&[&rows], "hy_v4_flash indexer tail")?;
+        super::stats::eval(&[&rows], "hy_v4_flash indexer tail")?;
         self.rows = Some(rows);
         self.held = hold;
         self.len += n;
@@ -393,7 +393,7 @@ impl TokTail {
             (_, 0) => None,
             (Some(r), k) => {
                 let r = r.slice(&[0, 0], &[k as i64, self.width])?.deep_copy()?;
-                MxArray::eval_arrays_with_context(&[&r], "hy_v4_flash indexer tail")?;
+                super::stats::eval(&[&r], "hy_v4_flash indexer tail")?;
                 Some(r)
             }
             (None, _) => return Err(bad("tok_k rows missing")),
@@ -993,7 +993,7 @@ impl Indexer {
             let tail = MxArray::from_int32(&tails[lo * slots..hi * slots], &[c, slots as i64])?;
             let idx = MxArray::concatenate(&group_cells(&ids, g.kpool)?, &tail, 1)?;
             if per < total {
-                MxArray::eval_arrays_with_context(&[&idx], "hy_v4_flash indexer pick")?;
+                super::stats::eval(&[&idx], "hy_v4_flash indexer pick")?;
             }
             outs.push(idx);
             lo = hi;

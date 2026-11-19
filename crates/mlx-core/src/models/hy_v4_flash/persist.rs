@@ -1731,6 +1731,9 @@ pub struct FlatTier {
     kpool: usize,
     found: RefCell<Option<Found>>,
     turn: Option<FlatTurn>,
+    /// States published since load, and read back into a sequence.
+    published: u64,
+    restored: u64,
 }
 
 impl FlatTier {
@@ -1745,6 +1748,8 @@ impl FlatTier {
             kpool,
             found: RefCell::new(None),
             turn: None,
+            published: 0,
+            restored: 0,
         };
         tier.disk.adopt(tier.states.store_mut());
         tier
@@ -1990,6 +1995,7 @@ impl FlatTier {
                 return;
             }
         };
+        self.published += 1;
         let replay = (kind != super::ladder::Kind::Checkpoint).then_some(id);
         self.disk.drops(self.states.dropped());
         let draft = self.states.get(id).and_then(|s| s.draft.as_ref());
@@ -1997,6 +2003,21 @@ impl FlatTier {
             .published(self.states.store(), FLAT_SEQ, row, draft, replay);
         self.disk
             .top_up(FLAT_SEQ, &mut FlatBlocks::new(seq, self.disk.page()));
+    }
+
+    /// A stored state was read back into the sequence.
+    pub fn restored(&mut self) {
+        self.restored += 1;
+    }
+
+    /// `[states with a RAM copy, their bytes, published, restored]`.
+    pub fn counts(&self) -> [u64; 4] {
+        [
+            self.states.ram_len() as u64,
+            self.states.held_bytes(),
+            self.published,
+            self.restored,
+        ]
     }
 
     /// The disk's pass over the sequence's rows.

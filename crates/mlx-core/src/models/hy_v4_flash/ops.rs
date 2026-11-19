@@ -213,6 +213,7 @@ pub fn route(
             moe.n_experts
         )));
     }
+    super::stats::synced();
     let s = scores.astype(DType::Float32)?.to_float32()?;
     route_host(s.as_ref(), bias, moe)
 }
@@ -240,7 +241,7 @@ pub fn head_logits_chunked(x: &MxArray, head: &Dense, chunk: i64) -> Result<MxAr
         let hi = (lo + chunk).min(vocab);
         let w = head.row_range(lo, hi)?.f32()?;
         let p = xf.matmul(&w.transpose(Some(&[1, 0]))?)?;
-        MxArray::eval_arrays_with_context(&[&p], "hy_v4_flash head chunk")?;
+        super::stats::eval(&[&p], "hy_v4_flash head chunk")?;
         parts.push(p);
         lo = hi;
     }

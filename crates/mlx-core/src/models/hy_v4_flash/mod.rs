@@ -50,10 +50,10 @@ mod tests_mtp;
 mod tests_owner;
 #[cfg(test)]
 mod tests_paged;
-#[cfg(all(test, target_os = "macos"))]
-mod tests_pool;
 #[cfg(test)]
 mod tests_persist;
+#[cfg(all(test, target_os = "macos"))]
+mod tests_pool;
 #[cfg(test)]
 mod tests_prefill;
 #[cfg(test)]

@@ -538,7 +538,7 @@ impl Moe {
         let out = self.combine(z, &idx, w, |pi, x, i| p.arrays[pi].gather(x, i, false))?;
         // a later step may refill or evict these slots: no lazy gather may
         // outlive this call
-        MxArray::eval_arrays_with_context(&[&out], "hy_v4_flash routed experts")?;
+        super::stats::eval(&[&out], "hy_v4_flash routed experts")?;
         Ok(out)
     }
 
@@ -734,7 +734,7 @@ impl LayerFfn {
             };
             let y = rms_norm(&f, post_norm, self.eps)?;
             if parts.len() > 1 {
-                MxArray::eval_arrays_with_context(&[&y], "hy_v4_flash ffn chunk")?;
+                super::stats::eval(&[&y], "hy_v4_flash ffn chunk")?;
             }
             outs.push(y);
         }

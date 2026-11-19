@@ -262,9 +262,15 @@ fn real_two_owners_in_one_wave_equal_alone() {
     use crate::stream::Stream;
 
     const STEPS: usize = 8;
-    let mut inner =
-        super::chat::Inner::open(&hy4_dir(), Some(16_384), Default::default(), false, None)
-            .unwrap();
+    let (mut inner, _) = super::chat::Inner::open(
+        &hy4_dir(),
+        Some(16_384),
+        None,
+        Default::default(),
+        false,
+        None,
+    )
+    .unwrap();
     assert!(inner.paged_adapter().is_some());
     let tok = inner.tokenizer().unwrap();
     let prompts: Vec<Vec<u32>> = ["The capital of France is", "List three prime numbers:"]

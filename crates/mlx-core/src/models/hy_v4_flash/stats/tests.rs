@@ -159,3 +159,111 @@ fn phase_names_are_distinct() {
     assert_eq!(phase_seconds().len(), PHASES.len());
     assert!(PHASES.iter().enumerate().all(|(i, &p)| p as usize == i));
 }
+
+fn wave_counters(uses: u64, reads: u64) -> Counters {
+    Counters {
+        uses,
+        fill_slots: reads,
+        fill_bytes: reads * 1_000_000,
+        fill_ns: reads * 1_000_000,
+        engram_bytes: 64,
+        ..Counters::default()
+    }
+}
+
+fn wave<'a>(owners: &'a [(u32, usize)], uses: u64, reads: u64, evals: u64) -> WaveSample<'a> {
+    WaveSample {
+        owners,
+        picks_per_row: 8 * 41,
+        counters: wave_counters(uses, reads),
+        evals,
+        secs: 0.25,
+    }
+}
+
+#[test]
+fn waves_count_rows_union_and_lanes() {
+    let mut log = WaveLog::default();
+    log.record(&wave(&[(1, 1)], 300, 60, 54));
+    log.record(&wave(&[(1, 1), (2, 1)], 500, 50, 108));
+    log.record(&wave(&[(1, 4), (2, 4), (3, 4), (4, 4)], 900, 90, 216));
+    let w = log.waves;
+    assert_eq!(w.decode, 3);
+    // rows 1, 2 and 16 (the last bucket takes the wave past 12)
+    let mut hist = [0; WAVE_ROWS];
+    hist[0] = 1;
+    hist[1] = 1;
+    hist[WAVE_ROWS - 1] = 1;
+    assert_eq!(w.rows, hist);
+    assert_eq!(w.union_experts, 1_700);
+    assert_eq!(w.row_experts, 19 * 8 * 41);
+    assert_eq!(w.miss_bytes, 200_000_000);
+    assert_eq!(w.tokens, 19);
+    assert!((w.evals_per_wave() - 126.0).abs() < 1e-9);
+    let by = w.hit_rate_by_lanes();
+    assert!((by[0] - 0.8).abs() < 1e-9, "{by:?}");
+    assert!((by[1] - 0.9).abs() < 1e-9, "{by:?}");
+    assert_eq!(by[2], 0.0);
+    assert!((by[3] - 0.9).abs() < 1e-9, "{by:?}");
+    assert!((w.miss_bytes_per_token() - 200_000_000.0 / 19.0).abs() < 1e-6);
+}
+
+#[test]
+fn cuts_take_back_only_the_last_wave_rows() {
+    let mut log = WaveLog::default();
+    log.record(&wave(&[(7, 1)], 10, 1, 1));
+    log.record(&wave(&[(7, 4), (8, 1)], 10, 1, 1));
+    assert_eq!(log.waves.tokens, 6);
+    // a verify of 4 rows keeps 2: two rows emitted no token
+    log.cut(7, 2);
+    assert_eq!(log.waves.tokens, 4);
+    // a regenerate cut deeper than the wave takes back only its rest
+    log.cut(7, 50);
+    assert_eq!(log.waves.tokens, 2);
+    log.cut(7, 1);
+    assert_eq!(log.waves.tokens, 2);
+    // an owner with no wave, and a forgotten one, take nothing back
+    log.cut(9, 3);
+    log.forget(8);
+    log.cut(8, 1);
+    assert_eq!(log.waves.tokens, 2);
+    log.stalled(5);
+    log.stalled(7);
+    assert_eq!(log.waves.prefill_stall_ns, 12);
+}
+
+#[test]
+fn empty_waves_read_zero() {
+    let w = Waves::default();
+    assert_eq!(w.miss_bytes_per_token(), 0.0);
+    assert_eq!(w.evals_per_wave(), 0.0);
+    assert_eq!(w.hit_rate_by_lanes(), [0.0; LANES_MAX]);
+    assert_eq!(served_rate(0, 0), 0.0);
+    assert_eq!(served_rate(4, 9), 0.0);
+}
+
+#[test]
+fn wave_line_fields() {
+    let owners = [(1, 1), (2, 3)];
+    let v = wave(&owners, 400, 100, 60).json();
+    assert_eq!(v["stage"], "wave");
+    assert_eq!(v["owners"], 2);
+    assert_eq!(v["rows"], 4);
+    assert_eq!(v["union_experts"], 400);
+    assert_eq!(v["row_experts"], 4 * 8 * 41);
+    assert_eq!(v["miss_bytes"], 100_000_000u64);
+    assert_eq!(v["engram_bytes"], 64);
+    assert_eq!(v["evals"], 60);
+    let f = |k: &str| v[k].as_f64().unwrap_or_else(|| panic!("{k}: {}", v[k]));
+    assert!((f("served_rate") - 0.75).abs() < 1e-9);
+    assert!((f("read_gbps") - 1.0).abs() < 1e-9);
+    assert!((f("wave_ms") - 250.0).abs() < 1e-9);
+}
+
+#[test]
+fn counted_syncs_move_the_counter() {
+    let before = evals();
+    synced();
+    synced();
+    assert!(evals() >= before + 2);
+}
