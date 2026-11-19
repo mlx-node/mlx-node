@@ -233,7 +233,7 @@ fn real_scheduled_mtp_greedy_equals_ar_alone() {
     use crate::stream::Stream;
 
     const STEPS: usize = 12;
-    let mut inner = Inner::open(&hy4_dir(), Some(16_384), Default::default(), false).unwrap();
+    let mut inner = Inner::open(&hy4_dir(), Some(16_384), Default::default(), false, None).unwrap();
     assert!(inner.supports_scheduled_speculation());
     let row_cap = inner.paged().unwrap().row_cap;
     let tok = inner.tokenizer().unwrap();

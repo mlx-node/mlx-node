@@ -25,6 +25,7 @@ use super::engram::{Hasher, keeps};
 use super::indexer::{IndexerMark, IndexerState};
 use super::moe::{ExpertSource, Routes, RowKind, per_row, qlinear};
 use super::ops::{HEAD_CHUNK, hc_head, head_logits};
+use super::prefix_state::StateLayer;
 use super::rows::EngramRows;
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{HcWeights, LayerWeights, Resident};
@@ -245,6 +246,24 @@ impl Mark {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+
+    /// Each trunk layer's part outside the latent and pooled buffers at
+    /// the mark: a sliding layer's ring, an indexed layer's `tok_k` tail.
+    pub fn state_layers(&self) -> Result<Vec<StateLayer>> {
+        self.layers
+            .iter()
+            .enumerate()
+            .map(|(l, m)| match m {
+                LayerMark::Window(r) => Ok(StateLayer::Window(r.clone())),
+                LayerMark::Latent {
+                    index: Some(im), ..
+                } => Ok(StateLayer::Tail(im.tail().clone())),
+                LayerMark::Latent { index: None, .. } => Err(bad(format!(
+                    "layer {l}: an indexed layer without an indexer"
+                ))),
+            })
+            .collect()
+    }
 }
 
 /// One sequence's state: its token ids and every layer's attention state.
@@ -335,6 +354,87 @@ impl Session {
     /// Whether `restore(m)` would succeed.
     pub fn can_restore(&self, m: &Mark) -> bool {
         self.fits(m).is_ok()
+    }
+
+    /// Fills an empty session with the `tokens` of a stored state: every
+    /// sliding layer gets its ring of `layers`, every indexed layer (in
+    /// trunk order) its latent rows `latent[i] [b, width]`, its pooled keys
+    /// `pooled[i] [b / kpool, d]` and its tail. On error the session stays
+    /// empty.
+    pub fn fill(
+        &mut self,
+        tokens: &[u32],
+        layers: &[StateLayer],
+        latent: &[MxArray],
+        pooled: &[MxArray],
+    ) -> Result<()> {
+        let b = tokens.len();
+        if !self.tokens.is_empty() || b == 0 || b > self.cap {
+            return Err(bad(format!(
+                "a fill of {b} positions into a session of {} (context {})",
+                self.tokens.len(),
+                self.cap
+            )));
+        }
+        if layers.len() != self.layers.len() {
+            return Err(bad(format!(
+                "a state of {} layers for a trunk of {}",
+                layers.len(),
+                self.layers.len()
+            )));
+        }
+        let out = self.fill_layers(b, layers, latent, pooled);
+        if out.is_err() {
+            for st in &mut self.layers {
+                let _ = st.cache.truncate(0);
+                if let Some(ix) = st.index.as_mut() {
+                    let _ = ix.truncate(0);
+                }
+            }
+            return out;
+        }
+        self.calls += 1;
+        self.tokens.extend_from_slice(tokens);
+        self.written = vec![self.calls; b];
+        Ok(())
+    }
+
+    fn fill_layers(
+        &mut self,
+        b: usize,
+        layers: &[StateLayer],
+        latent: &[MxArray],
+        pooled: &[MxArray],
+    ) -> Result<()> {
+        let mut at = 0;
+        for (l, (st, part)) in self.layers.iter_mut().zip(layers).enumerate() {
+            match (&mut st.cache, st.index.as_mut(), part) {
+                (LayerCache::Window(r), None, StateLayer::Window(s)) if s.len() == b => {
+                    *r = s.clone();
+                }
+                (LayerCache::Latent(buf), Some(ix), StateLayer::Tail(t)) if t.len() == b => {
+                    let (rows, keys) = match (latent.get(at), pooled.get(at)) {
+                        (Some(r), Some(k)) => (r, k),
+                        _ => return Err(bad(format!("layer {l}: no latent rows to fill"))),
+                    };
+                    at += 1;
+                    if rows.shape_at(0)? as usize != b {
+                        return Err(bad(format!("layer {l}: latent rows for another row")));
+                    }
+                    buf.write(rows, 0)?;
+                    let keys = (keys.shape_at(0)? > 0).then_some(keys);
+                    ix.fill(keys, t.clone())?;
+                }
+                _ => return Err(bad(format!("layer {l}: the state is not of this model"))),
+            }
+        }
+        if at != latent.len() || at != pooled.len() {
+            return Err(bad(format!(
+                "{} latent row sets for {at} indexed layers",
+                latent.len()
+            )));
+        }
+        Ok(())
     }
 
     fn fits(&self, m: &Mark) -> Result<()> {

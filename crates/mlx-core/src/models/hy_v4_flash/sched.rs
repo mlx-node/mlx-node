@@ -14,6 +14,9 @@
 //! fail  ─► a step past the window slack restores the cell's mark; a shorter one truncates
 //! admit ─► live cell continues │ RAM state + cached chain resumes │ cold
 //! preempt ─► blocks back unpublished, cell dropped; the replay resumes from a stored state
+//! close ─► the turn state T (newest block row a decode step held) publishes under write-path keys
+//! disk  ─► admission reads the deepest stored state of the prompt back (the adapter's cold walk
+//!          restores its blocks); every drive pass and decode step runs the tier's pass
 //! MTP   ─► reserve (decode row of each lane) ─► propose (drafts in lane order, up to
 //!          row_cap, the last lanes cut) ─► verify: one wave, every lane's rows ─► commit:
 //!          pool rows and cell cut to start + keep (the wave already wrote the MTP rows)
@@ -31,13 +34,15 @@ use super::attention::PagedPool;
 use super::batch::{Core, MIN_Q8_ROWS, Owners as WaveOwners, Wave};
 use super::chat::{Inner, PREFILL_CANCELLED};
 use super::indexer::PagedIndexing;
+use super::ladder::Kind;
 use super::model::{Logits, Model, Output, Want};
 use super::moe::RowKind;
 use super::mtp::{MtpLayer, lag_chunk};
 use super::owner::{CellLayer, OwnerCell, Owners};
 use super::paged::{BLOCK, PageGeometry, SlotMap, create};
+use super::persist::{Disk, FlatTier, PoolBlocks, Read, SEGMENT_BOUND};
 use super::prefill::{BLOCK_ROWS, Grid};
-use super::prefix_state::{Key, States, Turn};
+use super::prefix_state::{Key, States, Turn, prompt_keys, turn_keys};
 use super::spec::{self, LOOKAHEAD_MAX};
 use super::store::{LADDER_BYTES, Store, kv_per_token, lane_bytes};
 use crate::array::{DType, MxArray};
@@ -54,6 +59,7 @@ use crate::engine::paged_epilogue::FinalTokenPolicy;
 use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
 use crate::engine::params::ChatParams;
 use crate::engine::scheduler::{PreemptionMode, StepPlan};
+use crate::models::qwen3_5::gdn_checkpoint_store::compute_paged_prefix_block_hashes;
 use crate::stream::{Stream, StreamContext};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 
@@ -70,6 +76,14 @@ fn no_pool() -> Error {
 
 fn no_mtp() -> Error {
     bad("the load has no MTP layer")
+}
+
+/// How an admission of `len` tokens looks the pool up: never without a
+/// stored state at `row` (a KV-only cold prefix has no state to resume
+/// with), and never past its row: `(skip_lookup, max_hit)`.
+pub fn lookup_bounds(row: Option<usize>, len: usize) -> (bool, u32) {
+    let max = row.unwrap_or(len.saturating_sub(1));
+    (row.is_none(), u32::try_from(max).unwrap_or(u32::MAX))
 }
 
 /// Whether a load runs in paged mode: not forced serial and a wave row cap
@@ -340,12 +354,15 @@ pub fn preempt<R: Requests>(pool: &mut R, seq: SeqId) -> Result<()> {
 /// One admitted turn's prompt and how it publishes.
 pub struct TurnPlan {
     pub prompt: Vec<u32>,
+    /// Per-block extra keys of the prompt as this turn writes it
+    /// (`prompt_keys`).
     pub keys: Vec<Vec<u64>>,
     pub salt: u64,
-    /// A cold or state-resumed prefill writes what a cold prefill writes:
-    /// its state rows publish.
+    /// Its state rows and its turn state publish.
     pub publish: bool,
     pub turn: Turn,
+    /// The write-path keys' seed of this turn.
+    pub nonce: u64,
 }
 
 /// The rows of one verify wave: one decode row per lane that reserved,
@@ -438,7 +455,27 @@ pub struct Paged {
     pub published: u64,
     pub restored: u64,
     pub spec: Spec,
+    /// The stored states' disk tier; `None` when it is off.
+    pub disk: Option<Disk>,
+    /// Each owner's keys of its cell's whole blocks, as its turns wrote them.
+    pub lines: HashMap<SeqId, Vec<Vec<u64>>>,
     _pool: PoolCacheLimitGuard,
+}
+
+impl Drop for Paged {
+    /// A dispose writes the waiting states and drains the copies within one
+    /// bound before the tier closes.
+    fn drop(&mut self) {
+        let Paged {
+            disk,
+            states,
+            adapter,
+            ..
+        } = self;
+        if let Some(disk) = disk.as_mut() {
+            disk.dispose(states.store_mut(), &mut PoolBlocks(adapter));
+        }
+    }
 }
 
 impl Paged {
@@ -465,8 +502,36 @@ impl Paged {
             published: 0,
             restored: 0,
             spec: Spec::default(),
+            disk: None,
+            lines: HashMap::new(),
             _pool: pool,
         })
+    }
+
+    /// Hands the pool's blocks and the RAM states to `disk` and takes back
+    /// what a persistent tier holds.
+    pub fn attach_disk(&mut self, disk: Disk) -> Result<u64> {
+        disk.attach(&mut self.adapter)?;
+        let mut disk = disk;
+        let adopted = disk.adopt(self.states.store_mut());
+        self.disk = Some(disk);
+        Ok(adopted)
+    }
+
+    /// The disk's landings, and at most every few steps its due states and
+    /// block copies. True when a write landed.
+    pub fn top_up_disk(&mut self) -> bool {
+        let Paged {
+            disk,
+            states,
+            adapter,
+            ..
+        } = self;
+        let Some(disk) = disk.as_mut() else {
+            return false;
+        };
+        disk.drops(states.dropped());
+        disk.step(states.store_mut(), &mut PoolBlocks(adapter))
     }
 
     /// Bytes of the pool's blocks.
@@ -474,9 +539,11 @@ impl Paged {
         block_bytes(&self.adapter)
     }
 
-    /// Bytes outside the pool: owner cells and RAM states.
+    /// Bytes outside the pool: owner cells, RAM states and the turn states
+    /// the open turns hold.
     pub fn state_bytes(&self) -> u64 {
-        self.owners.bytes() + self.states.held_bytes()
+        let held: u64 = self.turns.values().map(|t| t.turn.held_bytes()).sum();
+        self.owners.bytes() + self.states.held_bytes() + held
     }
 
     fn live_tokens(&self, seq: SeqId) -> &[u32] {
@@ -671,6 +738,186 @@ impl Run<'_> {
     }
 }
 
+/// The disk learns of `seq`'s state `id` at `row` (a replay state when
+/// `replay`) and copies out what it owes.
+fn disk_published(p: &mut Paged, seq: SeqId, row: usize, id: u64, replay: Option<u64>) {
+    let Paged {
+        disk,
+        states,
+        adapter,
+        ..
+    } = p;
+    let Some(disk) = disk.as_mut() else {
+        return;
+    };
+    disk.drops(states.dropped());
+    let draft = states.get(id).and_then(|s| s.draft.as_ref());
+    disk.published(states.store(), seq, row, draft, replay);
+    disk.top_up(seq, &mut PoolBlocks(adapter));
+}
+
+/// `seq`'s lineage `tokens[..row]` keyed by `keys` owes the disk its
+/// chain from now on.
+fn disk_start(p: &mut Paged, seq: SeqId, tokens: &[u32], keys: &[Vec<u64>], salt: u64, row: usize) {
+    let Some(disk) = p.disk.as_mut() else {
+        return;
+    };
+    let blocks = row / BLOCK_ROWS;
+    if blocks == 0 || keys.len() < blocks || tokens.len() < row {
+        return;
+    }
+    let hot = compute_paged_prefix_block_hashes(
+        tokens,
+        row as u32,
+        BLOCK_ROWS as u32,
+        &keys[..blocks],
+        salt,
+    )
+    .unwrap_or_default();
+    disk.start(seq, &tokens[..row], keys, &hot, salt);
+}
+
+/// `seq`'s turn ended: its turn state publishes under write-path keys, its
+/// blocks below registered under them, and the owner keeps the keys of its
+/// cell's whole blocks for its next turn.
+fn publish_turn(p: &mut Paged, seq: SeqId, plan: &mut TurnPlan) {
+    let Some(kv_end) = p.owners.get(seq).map(OwnerCell::len) else {
+        return;
+    };
+    let tokens = p.live_tokens(seq).to_vec();
+    if tokens.len() != kv_end {
+        return;
+    }
+    let keys = turn_keys(&tokens, &plan.keys, kv_end, plan.nonce);
+    p.lines.insert(seq, keys.clone());
+    let Some((at, state)) = plan.turn.close(kv_end) else {
+        return;
+    };
+    let (row, salt) = (at.row, plan.salt);
+    let blocks = row / BLOCK_ROWS;
+    if keys.len() < blocks {
+        return;
+    }
+    if let Err(e) = Requests::register(&mut p.adapter, seq, row, &keys[..blocks], salt) {
+        tracing::warn!("hy_v4_flash turn state blocks below {row}: {}", e.reason);
+        return;
+    }
+    let key = Key {
+        tokens: &tokens[..row],
+        keys: &keys[..blocks],
+        salt,
+    };
+    match p.states.publish(key, state, Kind::Turn) {
+        Ok(Some(id)) => {
+            p.published += 1;
+            disk_start(p, seq, &tokens, &keys, salt, row);
+            disk_published(p, seq, row, id, Some(id));
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("hy_v4_flash turn state at {row}: {}", e.reason),
+    }
+}
+
+/// The deepest state on disk only that `prompt` resumes from past `hit`,
+/// whose chain is whole, read back and given its RAM copy; two at most are
+/// tried, one that does not read back going with its object. `None`
+/// keeps `hit`.
+fn resume_from_disk(
+    p: &mut Paged,
+    prompt: Key<'_>,
+    hit: Option<(u64, usize)>,
+) -> Option<(u64, usize)> {
+    let floor = hit.map_or(0, |h| h.1);
+    let found = p.states.disk_only_above(prompt, floor);
+    for (id, row) in found.into_iter().take(2) {
+        let (key, extra) = {
+            let entry = p.states.store().get(id)?;
+            (entry.disk()?.key, entry.extra_keys().to_vec())
+        };
+        let Paged {
+            disk,
+            states,
+            adapter,
+            ..
+        } = &mut *p;
+        let disk = disk.as_mut()?;
+        let segments = disk.chain_whole(prompt.tokens, &extra, prompt.salt, row, &|h| {
+            adapter.prefix_cached(h)
+        });
+        let Some(segments) = segments else {
+            disk.discard(states.store_mut(), id);
+            continue;
+        };
+        match disk.read_state(
+            states.store_mut(),
+            key,
+            row,
+            &extra,
+            &segments,
+            SEGMENT_BOUND,
+        ) {
+            Read::State(s) => {
+                if !states.promote(id, s) {
+                    return None;
+                }
+                tracing::debug!(
+                    row,
+                    prompt = prompt.tokens.len(),
+                    "hy_v4_flash: read a stored state back from disk"
+                );
+                return Some((id, row));
+            }
+            Read::Busy => return None,
+            Read::Failed => {
+                states.store_mut().remove(id);
+            }
+        }
+    }
+    None
+}
+
+/// `seq` is about to be cut to `len`: its turn state past `len` goes, its
+/// stored states past `len` go unless their chain stays cached, and the
+/// disk stops copying blocks it no longer holds.
+fn forget_above(p: &mut Paged, seq: SeqId, len: usize) {
+    let Paged {
+        adapter,
+        states,
+        turns,
+        disk,
+        ..
+    } = p;
+    if let Some(plan) = turns.get_mut(&seq) {
+        plan.turn.cut(len);
+        if let Some(tokens) = adapter.request_tokens_for(seq) {
+            let adapter = &*adapter;
+            states.cut(tokens, plan.salt, len, &|h| adapter.prefix_cached(h));
+        }
+    }
+    if let Some(disk) = disk.as_mut() {
+        disk.cut(seq, len);
+    }
+}
+
+/// A publishing turn of `seq` whose cell stands at a block row keeps the
+/// cell's state there as its turn state candidate.
+fn hold_turn_state(p: &mut Paged, seq: SeqId) {
+    let Some(plan) = p.turns.get_mut(&seq).filter(|t| t.publish) else {
+        return;
+    };
+    let Some(cell) = p.owners.get_mut(seq) else {
+        return;
+    };
+    if cell.is_empty() || !cell.len().is_multiple_of(BLOCK_ROWS) {
+        return;
+    }
+    match cell.state() {
+        Ok(Some(s)) => plan.turn.hold(s),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("hy_v4_flash turn state of owner {seq}: {}", e.reason),
+    }
+}
+
 /// Drops `seq`'s request, cell and plans after a step it cannot go back
 /// from; `active` when it was the active owner.
 fn lose(p: &mut Paged, seq: SeqId, active: bool) {
@@ -678,6 +925,10 @@ fn lose(p: &mut Paged, seq: SeqId, active: bool) {
     let _ = p.adapter.release_request_for(seq);
     p.owners.release(seq);
     p.turns.remove(&seq);
+    p.lines.remove(&seq);
+    if let Some(disk) = p.disk.as_mut() {
+        disk.close(seq);
+    }
     p.spec.open.remove(&seq);
     if active {
         p.saved.clear();
@@ -781,6 +1032,11 @@ impl Inner {
         }
         for seq in lost {
             lose(p, seq, was == Some(seq));
+        }
+        if out.is_ok() && kind == RowKind::Decode {
+            for r in rows {
+                hold_turn_state(p, r.seq);
+            }
         }
         if let Some(seq) = was
             && p.owners.contains(seq)
@@ -974,7 +1230,11 @@ impl Inner {
             salt: plan.salt,
         };
         match p.states.publish(key, state, kind) {
-            Ok(Some(_)) => p.published += 1,
+            Ok(Some(id)) => {
+                p.published += 1;
+                let replay = (kind != Kind::Checkpoint).then_some(id);
+                disk_published(p, seq, row, id, replay);
+            }
             Ok(None) => {}
             Err(e) => tracing::warn!("hy_v4_flash state at {row}: {}", e.reason),
         }
@@ -1013,7 +1273,9 @@ impl Inner {
     }
 
     /// Admission of `tokens` on the active owner: the live cell continues,
-    /// or a RAM state with a cached chain resumes, or the prompt is cold.
+    /// or a stored state resumes (RAM with a cached chain, else read back
+    /// from disk, its blocks restored by the adapter's cold walk), or the
+    /// prompt is cold. The turn's keys say how it writes its blocks.
     fn prime(&mut self, tokens: &[u32], reuse: bool, salt: u64) -> Result<Prefix> {
         let seq = self.paged()?.owners.active().unwrap_or(0);
         self.activate_paged_seq(seq)?;
@@ -1031,10 +1293,13 @@ impl Inner {
         };
         if !warm {
             self.fresh_row(seq)?;
-            self.paged_mut()?.saved.clear();
+            let p = self.paged_mut()?;
+            p.saved.clear();
+            p.lines.remove(&seq);
         }
         let ends = self.grid.ends(0, tokens);
-        let keys = pass_keys(tokens, &ends, self.grid.chunk());
+        let pass = pass_keys(tokens, &ends, self.grid.chunk());
+        let nonce = rand::random::<u64>();
         let Inner {
             store,
             mtp,
@@ -1043,21 +1308,38 @@ impl Inner {
             ..
         } = self;
         let p = paged.as_mut().ok_or_else(no_pool)?;
+        let prompt = Key {
+            tokens,
+            keys: &pass,
+            salt,
+        };
         let hit = if reuse && !warm {
             let adapter = &p.adapter;
             p.states.prune(&|h| adapter.prefix_cached(h));
-            p.states.lookup(
-                Key {
-                    tokens,
-                    keys: &keys,
-                    salt,
-                },
-                &|h| adapter.prefix_cached(h),
-            )
+            p.states.lookup(prompt, &|h| adapter.prefix_cached(h))
         } else {
             None
         };
-        let max_hit = hit.map_or(tokens.len().saturating_sub(1), |h| h.1);
+        let skip_disk = p.disk.as_mut().is_some_and(Disk::take_skip);
+        let mut from_disk = None;
+        let hit = if reuse && !warm && !skip_disk && p.disk.is_some() {
+            match resume_from_disk(p, prompt, hit) {
+                Some(deeper) => {
+                    from_disk = Some(deeper.0);
+                    Some(deeper)
+                }
+                None => hit,
+            }
+        } else {
+            hit
+        };
+        let (from, line) = match hit {
+            Some((id, row)) => (row, p.states.keys_of(id).unwrap_or_default()),
+            None if warm => (cell_len, p.lines.get(&seq).cloned().unwrap_or_default()),
+            None => (0, Vec::new()),
+        };
+        let keys = prompt_keys(tokens, from, &line, &pass, ends.contains(&from), nonce);
+        let (skip_lookup, max_hit) = lookup_bounds(hit.map(|h| h.1), tokens.len());
         let plan = p
             .adapter
             .prepare_turn_per_block_with_max_cache_hit_tokens(
@@ -1067,12 +1349,15 @@ impl Inner {
                 warm,
                 &keys,
                 salt,
-                hit.is_none(),
-                u32::try_from(max_hit).unwrap_or(u32::MAX),
+                skip_lookup,
+                max_hit,
             )
             .map_err(bad)?;
         let expected = hit.map_or(if warm { cell_len } else { 0 }, |h| h.1);
         let cached = if plan.cached_prefix_len as usize != expected {
+            if let Some(id) = from_disk {
+                p.states.store_mut().drop_ram(id);
+            }
             p.adapter.reset_for_new_request(seq).map_err(bad)?;
             p.adapter
                 .allocate_suffix_blocks(tokens.len() as u32)
@@ -1095,14 +1380,25 @@ impl Inner {
         } else {
             expected
         };
+        let (keys, from) = if cached == from {
+            (keys, from)
+        } else {
+            (prompt_keys(tokens, 0, &[], &pass, true, nonce), 0)
+        };
+        let turn = Turn::new(grid, cached, tokens);
+        let last = turn.rows().last().map_or(0, |r| r.row);
+        if reuse && last > from {
+            disk_start(p, seq, tokens, &keys, salt, last);
+        }
         p.turns.insert(
             seq,
             TurnPlan {
                 prompt: tokens.to_vec(),
                 keys,
                 salt,
-                publish: reuse && !warm,
-                turn: Turn::new(grid, cached, tokens),
+                publish: reuse,
+                turn,
+                nonce,
             },
         );
         Ok(Prefix {
@@ -1111,12 +1407,33 @@ impl Inner {
         })
     }
 
-    /// The active owner's turn is over: its plan goes.
-    fn close_turn(&mut self) {
-        if let Some(p) = self.paged.as_mut()
-            && let Some(seq) = p.owners.active()
-        {
-            p.turns.remove(&seq);
+    /// The active owner's turn is over: with `reuse` its turn state
+    /// publishes under write-path keys and the owner keeps the keys of its
+    /// cell's blocks; its plan goes.
+    fn close_turn(&mut self, reuse: bool) {
+        let Some(p) = self.paged.as_mut() else {
+            return;
+        };
+        let Some(seq) = p.owners.active() else {
+            return;
+        };
+        let Some(mut plan) = p.turns.remove(&seq) else {
+            return;
+        };
+        if reuse && plan.publish {
+            publish_turn(p, seq, &mut plan);
+        }
+        if let Some(disk) = p.disk.as_mut() {
+            disk.close(seq);
+        }
+        let Paged {
+            disk,
+            states,
+            adapter,
+            ..
+        } = p;
+        if let Some(disk) = disk.as_mut() {
+            disk.step_now(states.store_mut(), &mut PoolBlocks(adapter));
         }
     }
 
@@ -1128,6 +1445,7 @@ impl Inner {
         if let Some(p) = self.paged.as_mut() {
             let _ = p.adapter.release_request_for(seq);
             p.turns.remove(&seq);
+            p.lines.remove(&seq);
             p.saved.clear();
         }
         if let Err(e) = self.fresh_row(seq) {
@@ -1145,6 +1463,7 @@ impl Inner {
             p.saved.clear();
             if let Some(seq) = p.owners.active() {
                 p.turns.remove(&seq);
+                p.lines.remove(&seq);
                 self.fresh_row(seq)?;
             }
             return Ok(());
@@ -1154,8 +1473,12 @@ impl Inner {
             p.adapter.release_request_for(seq).map_err(bad)?;
         }
         p.owners.clear();
-        p.states.clear();
+        p.states.reset(p.disk.is_some());
+        if let Some(disk) = p.disk.as_mut() {
+            disk.reset();
+        }
         p.turns.clear();
+        p.lines.clear();
         p.saved.clear();
         p.adapter
             .release_request_and_purge_prefix_cache()
@@ -1392,6 +1715,7 @@ impl Inner {
                 "owner {seq}: a cut to {len} of {held} pool rows and a cell of {cell}"
             )))
         } else {
+            forget_above(p, seq, len);
             Self::cut_rows(p, seq, held - len, len)
         };
         match &cut {
@@ -1604,7 +1928,7 @@ impl PagedBackend for Inner {
     /// wrote are not what a cold prefill writes. States published during
     /// the prefill stay.
     fn finalize_paged_turn(&mut self, reuse: bool, _: u64) {
-        self.close_turn();
+        self.close_turn(reuse);
         let Some(p) = self.paged.as_mut() else {
             return;
         };
@@ -1791,15 +2115,32 @@ impl HybridSchedulerBackend for Inner {
         self.busy_edge(edge);
     }
 
+    /// The turn's plan stays for its finalize, which publishes its turn
+    /// state, or its abort or release, which drop it.
     fn scheduled_turn_closed(&mut self, seq: SeqId) {
         let edge = match self.paged.as_mut() {
-            Some(p) => {
-                p.turns.remove(&seq);
-                p.busy.closed(seq)
-            }
+            Some(p) => p.busy.closed(seq),
             None => return,
         };
         self.busy_edge(edge);
+    }
+
+    fn release_scheduled_cache(&mut self, seq: SeqId) -> Result<()> {
+        let Some(p) = self.paged.as_mut() else {
+            return Ok(());
+        };
+        p.turns.remove(&seq);
+        if let Some(disk) = p.disk.as_mut() {
+            disk.close(seq);
+        }
+        if p.adapter.block_table_for(seq).is_some() {
+            p.adapter.release_request_for(seq).map_err(bad)?;
+        }
+        Ok(())
+    }
+
+    fn tick_state_disk(&mut self, _: crate::models::qwen3_5::dflash2_state::disk::Tick) -> bool {
+        self.paged.as_mut().is_some_and(Paged::top_up_disk)
     }
 
     fn scheduler_prefill_slice_tokens(&self) -> u32 {
@@ -1919,6 +2260,10 @@ impl HybridSchedulerBackend for Inner {
     fn preempt_scheduled_cache(&mut self, seq: SeqId, _: u64, _: PreemptionMode) -> Result<()> {
         let p = self.paged_mut()?;
         p.turns.remove(&seq);
+        p.lines.remove(&seq);
+        if let Some(disk) = p.disk.as_mut() {
+            disk.close(seq);
+        }
         preempt(&mut p.adapter, seq)
     }
 
@@ -1927,14 +2272,24 @@ impl HybridSchedulerBackend for Inner {
             return;
         };
         p.turns.remove(&seq);
+        p.lines.remove(&seq);
+        if let Some(disk) = p.disk.as_mut() {
+            disk.close(seq);
+        }
         if p.owners.active() == Some(seq) {
             p.saved.clear();
         }
         p.owners.release(seq);
     }
 
+    /// The wave, then the disk's pass (Flash Next `top_up_disk` after a
+    /// batched step).
     fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
-        self.decode_rows(rows)
+        let out = self.decode_rows(rows);
+        if let Some(p) = self.paged.as_mut() {
+            p.top_up_disk();
+        }
+        out
     }
 
     fn run_scheduled_prefill_slice(
@@ -2069,9 +2424,19 @@ impl HybridSchedulerBackend for Inner {
 }
 
 /// Loads in paged mode get their pool.
-pub(crate) fn attach(inner: &mut Inner, serial: bool) -> Result<()> {
+/// The paged mode with `serial` off and a wave row cap that holds a padded
+/// call, else the flat mode; `disk` serves the mode's stored states.
+pub(crate) fn attach(inner: &mut Inner, serial: bool, disk: Option<Disk>) -> Result<()> {
     if paged_mode(serial, inner.store.row_cap) {
-        inner.paged = Some(Paged::open(&inner.store)?);
+        let mut p = Paged::open(&inner.store)?;
+        if let Some(disk) = disk
+            && let Err(e) = p.attach_disk(disk)
+        {
+            tracing::warn!("hy_v4_flash: stored states stay in memory: {}", e.reason);
+        }
+        inner.paged = Some(p);
+    } else if let Some(disk) = disk {
+        inner.flat = Some(FlatTier::new(disk, inner.store.model.cfg().indexer.kpool));
     }
     Ok(())
 }

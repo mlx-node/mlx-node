@@ -22,6 +22,9 @@ pub mod mtp_weights;
 pub mod ops;
 pub mod owner;
 pub mod paged;
+pub(crate) mod persist;
+pub(crate) mod persist_codec;
+pub(crate) mod persist_writer;
 pub mod prefill;
 pub mod prefix_state;
 pub mod rows;
@@ -49,6 +52,8 @@ mod tests_owner;
 mod tests_paged;
 #[cfg(all(test, target_os = "macos"))]
 mod tests_pool;
+#[cfg(test)]
+mod tests_persist;
 #[cfg(test)]
 mod tests_prefill;
 #[cfg(test)]

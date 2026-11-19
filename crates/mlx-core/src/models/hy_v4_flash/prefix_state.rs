@@ -11,6 +11,9 @@
 //! rows              P (block row before the generation prompt), every 8,192 below 32,768,
 //!                   every 32,768 from there (all on the chunk grid), T (block row below the turn's KV end)
 //! RAM               the newest RAM_STATES copies; a cut below a state drops it unless its blocks stay cached
+//! keys              a block's extra keys say how it was written: a cold prefill's pass key, else a
+//!                   write-path key (decode rows, a prefill from a row no cold prefill cuts at) that no
+//!                   cold prefill computes, so only the writing lineage resumes from it
 //! ```
 
 use std::collections::HashSet;
@@ -24,7 +27,7 @@ use super::ladder::{Kind, RAM_STATES};
 use super::prefill::{BLOCK_ROWS, Grid, StateRow, turn_row};
 use crate::array::MxArray;
 use crate::models::qwen3_5::dflash2_state::store::{
-    HybridStateStore, Lineage, StateBytes, StateClass,
+    Entry, HybridStateStore, Lineage, StateBytes, StateClass,
 };
 
 fn bad(msg: impl std::fmt::Display) -> Error {
@@ -130,7 +133,7 @@ impl Stored for PrefixState {
 }
 
 /// A state as the store keeps it.
-struct Held<S>(S);
+pub struct Held<S>(pub S);
 
 impl<S: Stored> StateBytes for Held<S> {
     fn state_bytes(&self) -> u64 {
@@ -193,6 +196,11 @@ impl Turn {
         self.held.as_ref().map(|h| h.row)
     }
 
+    /// Bytes the held candidate keeps alive.
+    pub fn held_bytes(&self) -> u64 {
+        self.held.as_ref().map_or(0, Stored::bytes)
+    }
+
     /// The sequence was cut to `len`: a held state past it goes.
     pub fn cut(&mut self, len: usize) {
         if self.held.as_ref().is_some_and(|h| h.row > len) {
@@ -250,6 +258,8 @@ impl<'a> Key<'a> {
 pub struct States<S = PrefixState> {
     store: HybridStateStore<Held<S>>,
     ram_cap: usize,
+    /// States memory dropped, their disk copy not durable.
+    dropped: u64,
 }
 
 impl<S: Stored> Default for States<S> {
@@ -268,7 +278,21 @@ impl<S: Stored> States<S> {
         Self {
             store: HybridStateStore::new(BLOCK_ROWS as u32),
             ram_cap: cap.max(1),
+            dropped: 0,
         }
+    }
+
+    pub(crate) fn store(&self) -> &HybridStateStore<Held<S>> {
+        &self.store
+    }
+
+    pub(crate) fn store_mut(&mut self) -> &mut HybridStateStore<Held<S>> {
+        &mut self.store
+    }
+
+    /// States memory dropped so far without a durable disk copy.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
     }
 
     /// States with a RAM copy.
@@ -322,17 +346,13 @@ impl<S: Stored> States<S> {
             .map(|e| e.id())
     }
 
-    /// Gives up the RAM copy of `id`: a state whose disk copy landed keeps
-    /// it alone, any other goes.
+    /// Gives up the RAM copy of `id`: a state whose disk copy and chain
+    /// landed keeps it alone, any other goes.
     fn evict(&mut self, id: u64) {
-        let durable = self
-            .store
-            .get(id)
-            .is_some_and(|e| e.disk().is_some_and(|d| d.landed));
-        if durable {
+        if self.store.get(id).is_some_and(durable) {
             self.store.drop_ram(id);
-        } else {
-            self.store.remove(id);
+        } else if self.store.remove(id) {
+            self.dropped += 1;
         }
     }
 
@@ -351,7 +371,8 @@ impl<S: Stored> States<S> {
 
     /// Publishes `state` at the end of `lineage` (whole blocks). The oldest
     /// RAM copy goes when `RAM_STATES` are held; `None` when every held one
-    /// is in use. A state already on that block is reused.
+    /// is in use. A state already on that block is reused; one there on
+    /// disk only takes this copy as its RAM copy.
     pub fn publish(&mut self, key: Key<'_>, state: S, kind: Kind) -> Result<Option<u64>> {
         let lineage = key.lineage();
         if lineage.tokens.is_empty() || !lineage.tokens.len().is_multiple_of(BLOCK_ROWS) {
@@ -361,8 +382,8 @@ impl<S: Stored> States<S> {
             )));
         }
         let (_, there) = self.store.locate(lineage);
-        let adds = there.is_none_or(|id| self.store.get(id).is_some_and(|e| e.ram().is_none()));
-        if adds {
+        let disk_only = there.filter(|&id| self.store.get(id).is_some_and(|e| e.ram().is_none()));
+        if there.is_none() || disk_only.is_some() {
             while self.ram_len() >= self.ram_cap {
                 match self.victim() {
                     Some(id) => self.evict(id),
@@ -370,27 +391,81 @@ impl<S: Stored> States<S> {
                 }
             }
         }
+        if let Some(id) = disk_only
+            && self.store.get(id).is_some()
+        {
+            self.store.promote(id, Held(state));
+            self.store.reuse(id, kind == Kind::Checkpoint);
+            return Ok(Some(id));
+        }
         let ins = self.store.insert(lineage, Held(state), class_of(kind))?;
         Ok(Some(ins.id))
     }
 
-    /// The deepest state with a RAM copy whose lineage is a strict prefix of
-    /// `prompt` and every block of whose chain `cached` holds: `(id, row)`.
+    /// The deepest state with a RAM copy that `prompt` resumes from
+    /// ([`resumes`]) and every block of whose chain `cached` holds:
+    /// `(id, row)`.
     pub fn lookup(&self, prompt: Key<'_>, cached: &dyn Fn(u64) -> bool) -> Option<(u64, usize)> {
-        let prompt = prompt.lineage();
-        let mut hit = self.store.lookup(prompt)?;
-        loop {
-            let usable = self
-                .store
-                .get(hit.id)
-                .is_some_and(|e| e.ram().is_some() && e.chain().iter().all(|&h| cached(h)));
-            if usable {
-                return Some((hit.id, hit.depth));
-            }
-            hit = self
-                .store
-                .lookup_within(prompt, hit.depth.checked_sub(1)?)?;
+        self.store
+            .entries()
+            .filter(|e| {
+                e.ram().is_some() && resumes(e, prompt) && e.chain().iter().all(|&h| cached(h))
+            })
+            .max_by_key(|e| (e.depth(), e.last_used()))
+            .map(|e| (e.id(), e.depth()))
+    }
+
+    /// The states on disk only that `prompt` resumes from, deeper than
+    /// `floor`, the deepest first.
+    pub fn disk_only_above(&self, prompt: Key<'_>, floor: usize) -> Vec<(u64, usize)> {
+        let mut out: Vec<(u64, usize, u64)> = self
+            .store
+            .entries()
+            .filter(|e| e.ram().is_none() && e.depth() > floor && resumes(e, prompt))
+            .map(|e| (e.id(), e.depth(), e.last_used()))
+            .collect();
+        out.sort_unstable_by_key(|e| std::cmp::Reverse((e.1, e.2)));
+        out.into_iter().map(|(id, row, _)| (id, row)).collect()
+    }
+
+    /// Gives disk-only `id` its RAM copy `state` back, the oldest RAM copy
+    /// going first when `RAM_STATES` are held; false when it is gone, holds
+    /// one, or every held one is in use.
+    pub fn promote(&mut self, id: u64, state: S) -> bool {
+        if self.store.get(id).is_none_or(|e| e.ram().is_some()) {
+            return false;
         }
+        while self.ram_len() >= self.ram_cap {
+            match self.victim() {
+                Some(v) if v != id => self.evict(v),
+                _ => return false,
+            }
+        }
+        self.store.promote(id, Held(state))
+    }
+
+    /// Drops the RAM copy of every state whose disk copy and chain landed.
+    pub fn drop_durable_ram(&mut self) {
+        let ids: Vec<u64> = self
+            .store
+            .entries()
+            .filter(|e| e.ram().is_some() && durable(e) && !self.store.in_use(e.mark()))
+            .map(|e| e.id())
+            .collect();
+        for id in ids {
+            self.store.drop_ram(id);
+        }
+    }
+
+    /// The extra keys of `id`'s blocks, one list per whole block.
+    pub fn keys_of(&self, id: u64) -> Option<Vec<Vec<u64>>> {
+        let e = self.store.get(id)?;
+        let blocks = e.depth() / BLOCK_ROWS;
+        Some(
+            (0..blocks)
+                .map(|i| e.extra_keys().get(i).cloned().unwrap_or_default())
+                .collect(),
+        )
     }
 
     /// The RAM copy of `id`.
@@ -440,4 +515,112 @@ impl<S: Stored> States<S> {
     pub fn clear(&mut self) {
         self.store.clear();
     }
+
+    /// A command reset: every RAM copy goes; a state durable on disk stays
+    /// there alone when `keep_durable`.
+    pub fn reset(&mut self, keep_durable: bool) {
+        if !keep_durable {
+            self.store.clear();
+            return;
+        }
+        let entries: Vec<(u64, bool)> =
+            self.store.entries().map(|e| (e.id(), durable(e))).collect();
+        for (id, kept) in entries {
+            if kept {
+                self.store.drop_ram(id);
+            } else {
+                self.store.remove(id);
+            }
+        }
+    }
+}
+
+/// A landed disk copy whose whole chain landed too.
+pub(crate) fn durable<S>(e: &Entry<S>) -> bool {
+    e.disk().is_some_and(|d| d.landed && !d.chain_owed)
+}
+
+/// Whether a prompt resumes from `e`: the same salt, a strict prefix of
+/// its tokens, and either write-path keys (the lineage that wrote them) or
+/// the prompt's own keys on every block below.
+pub(crate) fn resumes<S>(e: &Entry<S>, prompt: Key<'_>) -> bool {
+    let depth = e.depth();
+    depth > 0
+        && depth < prompt.tokens.len()
+        && e.salt() == prompt.salt
+        && prompt.tokens[..depth] == *e.tokens()
+        && (any_written(e.extra_keys()) || agrees(e.extra_keys(), prompt.keys, depth / BLOCK_ROWS))
+}
+
+fn agrees(a: &[Vec<u64>], b: &[Vec<u64>], blocks: usize) -> bool {
+    (0..blocks).all(|i| block_key(a, i) == block_key(b, i))
+}
+
+fn block_key(keys: &[Vec<u64>], i: usize) -> &[u64] {
+    keys.get(i).map_or(&[][..], Vec::as_slice)
+}
+
+/// The first extra key of a block a cold prefill never writes.
+pub const WRITE_TAG: u64 = 0x6879_345f_7772_6974;
+
+/// Whether one block's extra keys are a write-path key.
+pub fn is_written(key: &[u64]) -> bool {
+    matches!(key, [WRITE_TAG, _])
+}
+
+/// Whether any block of `keys` is a write-path block.
+pub fn any_written(keys: &[Vec<u64>]) -> bool {
+    keys.iter().any(|k| is_written(k))
+}
+
+/// The write-path key of block `i` of `tokens`, written by the turn of
+/// `nonce`.
+pub fn written_key(tokens: &[u32], i: usize, nonce: u64) -> Vec<u64> {
+    let rows = &tokens[i * BLOCK_ROWS..(i + 1) * BLOCK_ROWS];
+    vec![
+        WRITE_TAG,
+        mlx_paged_attn::hash_tokens(rows, nonce, &[i as u64]),
+    ]
+}
+
+/// Per-block extra keys of `prompt` prefilled from row `from` on top of
+/// rows whose whole blocks carry `line`: blocks below `from / 32` keep
+/// `line`; where `from` is a cold chunk end of the prompt (`cold_end`, or
+/// 0) the rest are the cold prefill's pass keys `pass`, else write-path
+/// keys of `nonce` for every whole block from the one holding `from`.
+/// Blocks `line` misses below `from` get write-path keys too.
+pub fn prompt_keys(
+    prompt: &[u32],
+    from: usize,
+    line: &[Vec<u64>],
+    pass: &[Vec<u64>],
+    cold_end: bool,
+    nonce: u64,
+) -> Vec<Vec<u64>> {
+    let below = from / BLOCK_ROWS;
+    let mut keys: Vec<Vec<u64>> = (0..below)
+        .map(|i| match line.get(i) {
+            Some(k) if !k.is_empty() => k.clone(),
+            _ => written_key(prompt, i, nonce),
+        })
+        .collect();
+    if from == 0 || cold_end {
+        keys.extend(pass.iter().skip(below).cloned());
+    } else {
+        keys.extend((below..prompt.len() / BLOCK_ROWS).map(|i| written_key(prompt, i, nonce)));
+    }
+    keys
+}
+
+/// The keys of the whole blocks of `tokens` below `row` at a turn's end:
+/// the prompt's `keys`, then write-path keys of `nonce` for every block they
+/// do not cover (the prompt's last chunk and the decode rows).
+pub fn turn_keys(tokens: &[u32], keys: &[Vec<u64>], row: usize, nonce: u64) -> Vec<Vec<u64>> {
+    let blocks = row.min(tokens.len()) / BLOCK_ROWS;
+    (0..blocks)
+        .map(|i| match keys.get(i) {
+            Some(k) if !k.is_empty() => k.clone(),
+            _ => written_key(tokens, i, nonce),
+        })
+        .collect()
 }

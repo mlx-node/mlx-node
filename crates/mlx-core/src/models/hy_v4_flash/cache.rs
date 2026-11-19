@@ -56,6 +56,41 @@ impl WindowRing {
         }
     }
 
+    /// A ring of `len` positions holding `rows [held, width]` (f16), the
+    /// rows of its last `held` positions. Refused past `window + slack`
+    /// rows, past `len`, or below a window of rows (all of `len` when
+    /// shorter).
+    pub fn of_rows(
+        window: usize,
+        slack: usize,
+        width: i64,
+        rows: Option<MxArray>,
+        len: usize,
+    ) -> Result<Self> {
+        let held = match &rows {
+            None => 0,
+            Some(r) => rows_of(r, width, "window rows")?,
+        };
+        if held > window + slack || held > len || held < len.min(window) {
+            return Err(bad(format!(
+                "a ring of {len} positions with {held} rows (window {window}, slack {slack})"
+            )));
+        }
+        Ok(Self {
+            window,
+            keep: window + slack,
+            width,
+            rows: rows.map(|r| r.astype(ROW_DTYPE)).transpose()?,
+            held,
+            len,
+        })
+    }
+
+    /// The held rows `[kept, width]` f16.
+    pub fn rows(&self) -> Option<&MxArray> {
+        self.rows.as_ref()
+    }
+
     /// Positions appended so far.
     pub fn len(&self) -> usize {
         self.len

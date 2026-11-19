@@ -32,7 +32,9 @@ use super::ladder::Snapshot;
 use super::model::{Mark, Model, Output, Session, Want, head_rows};
 use super::moe::{ExpertSource, FfnConfig, LayerFfn, RowKind, qlinear};
 use super::mtp_weights::{self, MtpWeights};
+use super::owner::fill_draft;
 use super::prefill::{Runner, Seq, index_keeps, session_keeps};
+use super::prefix_state::PrefixState;
 use super::scan::Scan;
 use super::sparse::gather_sink_attention;
 use super::weights::{LayerWeights, NextnWeights, Residual};
@@ -272,6 +274,27 @@ pub struct DraftMark {
     len: usize,
     index: IndexerMark,
     seed: Option<(usize, MxArray)>,
+}
+
+impl DraftMark {
+    /// MTP rows held at the mark.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The indexer tail at the mark.
+    pub fn tail(&self) -> &TokTail {
+        self.index.tail()
+    }
+
+    /// `h_trunk(len)`, the seed of the next MTP row.
+    pub fn seed(&self) -> Option<&MxArray> {
+        self.seed.as_ref().map(|(_, h)| h)
+    }
 }
 
 impl Draft {
@@ -670,6 +693,8 @@ impl MtpLayer {
 pub struct Lagged {
     trunk: Session,
     draft: Option<Draft>,
+    /// The newest point a decode step left at a block row.
+    held: Option<LagMark>,
 }
 
 #[derive(Clone)]
@@ -693,9 +718,73 @@ impl Snapshot for LagMark {
     }
 }
 
+impl LagMark {
+    pub fn trunk(&self) -> &Mark {
+        &self.trunk
+    }
+
+    /// The draft at the mark: `Ok(None)` without an MTP layer; an error
+    /// when it was not settled there.
+    pub fn draft(&self) -> Result<Option<&DraftMark>> {
+        match &self.draft {
+            DraftSnap::Off => Ok(None),
+            DraftSnap::At(m) => Ok(Some(m)),
+            DraftSnap::Unsettled => Err(bad("a mark taken while the draft was not settled")),
+        }
+    }
+}
+
 impl Lagged {
     pub fn new(trunk: Session, draft: Option<Draft>) -> Self {
-        Self { trunk, draft }
+        Self {
+            trunk,
+            draft,
+            held: None,
+        }
+    }
+
+    /// The newest point a decode step left at a block row, while the
+    /// sequence still holds it.
+    pub fn held(&self) -> Option<&LagMark> {
+        self.held.as_ref().filter(|m| self.can_restore(m))
+    }
+
+    /// Forgets a held point past `len`.
+    fn drop_held_above(&mut self, len: usize) {
+        if self.held.as_ref().is_some_and(|m| m.len() > len) {
+            self.held = None;
+        }
+    }
+
+    /// Fills an empty sequence with a stored state of `tokens`: the trunk
+    /// from `state`'s layers and the indexed layers' `latent` / `pooled`
+    /// rows, the draft from its MTP part. On error the sequence is empty.
+    pub fn fill(
+        &mut self,
+        tokens: &[u32],
+        state: &PrefixState,
+        latent: &[MxArray],
+        pooled: &[MxArray],
+    ) -> Result<()> {
+        if state.row != tokens.len() {
+            return Err(bad(format!(
+                "a state at row {} for {} tokens",
+                state.row,
+                tokens.len()
+            )));
+        }
+        match (&self.draft, &state.draft) {
+            (None, None) | (Some(_), Some(_)) => {}
+            _ => return Err(Self::mismatch()),
+        }
+        self.trunk.fill(tokens, &state.layers, latent, pooled)?;
+        if let (Some(d), Some(ds)) = (self.draft.as_mut(), &state.draft)
+            && let Err(e) = fill_draft(d, ds)
+        {
+            self.trunk.truncate(0)?;
+            return Err(e);
+        }
+        Ok(())
     }
 
     pub fn trunk(&self) -> &Session {
@@ -840,6 +929,9 @@ impl Lagged {
         let (m, d) = match (mtp, self.draft.as_mut()) {
             (None, None) => {
                 let l = model.forward_last(&mut self.trunk, &[token], RowKind::Decode, None)?;
+                if self.trunk.len().is_multiple_of(BLOCK_ROWS) {
+                    self.held = Some(self.snap());
+                }
                 return Ok((l, None));
             }
             (Some(m), Some(d)) => (m, d),
@@ -886,10 +978,14 @@ impl Lagged {
                 return Err(e);
             }
         }
+        if self.trunk.len().is_multiple_of(BLOCK_ROWS) {
+            self.held = Some(self.snap());
+        }
         Ok((logits, Some(h)))
     }
 
     fn clear(&mut self) -> Result<()> {
+        self.held = None;
         self.trunk.truncate(0)?;
         if let Some(d) = self.draft.as_mut() {
             d.cut(0)?;
@@ -961,6 +1057,7 @@ impl Seq for Lagged {
             d.cut(keep)?;
             d.seeds.cut(len);
         }
+        self.drop_held_above(len);
         Ok(())
     }
 
@@ -976,6 +1073,7 @@ impl Seq for Lagged {
     }
 
     fn restore(&mut self, s: &LagMark) -> Result<()> {
+        self.drop_held_above(s.len());
         let dm = match (&self.draft, &s.draft) {
             (None, DraftSnap::Off) => return self.trunk.restore(&s.trunk),
             (Some(d), DraftSnap::At(dm)) if d.can_restore(dm) => dm,

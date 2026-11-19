@@ -10,6 +10,8 @@
 //! decode  ─► one row per step (RowKind::Decode), or an MTP turn (`spec.rs`)
 //!            with the MTP layer, each trunk row closes the draft row before it
 //! save    ─► history = the sequence's tokens, a Turn ladder entry
+//! disk    ─► flat: the prompt's states and the turn state publish to the stored states
+//!            (`persist.rs`); a prompt past the ladder's reach reads a stored state back
 //! end     ─► store lease released (end_turn) when the cancel flag is cleared
 //! ```
 //!
@@ -30,12 +32,15 @@ use napi_derive::napi;
 use super::finalize::{self, Hy4Tags};
 use super::ladder::{Kind, Ladder};
 use super::mtp::{LagRunner, Lagged, MtpLayer};
+use super::persist::{self, Disk, FlatTier, Restored};
+use super::persist_writer::{Closer, Telemetry};
 use super::prefill::{Driver, Grid, Plan, Prefilled, Runner, Seq};
-use super::sched::{self, Paged};
+use super::sched::{self, Paged, pass_keys};
 use super::spec;
 use super::stats::{self, Counters, Line};
 use super::store::{Options, Store};
 use crate::array::MxArray;
+use crate::disk_tier::{DiskTierOptions, TierHandle};
 use crate::engine::backend::{
     ChatBackend, DecodeStep, FinalizeArgs, MtpBackend, MtpTurnSetup, ResetScope, SaveStateArgs,
     TurnOutput, TurnSetup, WholeTurnArgs,
@@ -125,6 +130,8 @@ pub struct Conv<S: Seq> {
     /// A cancelled prefill left the sequence at a chunk end: the reset that
     /// follows inside the same turn keeps it.
     kept: bool,
+    /// The row the last prefill started at.
+    from: usize,
 }
 
 impl<S: Seq> Conv<S> {
@@ -135,7 +142,13 @@ impl<S: Seq> Conv<S> {
             saved: Vec::new(),
             plan: Cell::new(None),
             kept: false,
+            from: 0,
         }
+    }
+
+    /// The row the last finished prefill started at.
+    pub fn prefilled_from(&self) -> usize {
+        self.from
     }
 
     pub fn seq(&self) -> &S {
@@ -215,7 +228,10 @@ impl<S: Seq> Conv<S> {
             },
         );
         match out {
-            Ok(Prefilled::Done { out, .. }) => Ok(out),
+            Ok(Prefilled::Done { out, from }) => {
+                self.from = from;
+                Ok(out)
+            }
             Ok(Prefilled::Cancelled { .. }) => {
                 self.kept = true;
                 Err(Error::from_reason(PREFILL_CANCELLED))
@@ -311,6 +327,20 @@ pub(crate) struct Inner {
     turn_stats: Option<TurnStats>,
     /// The paged mode's pool and owners; `None` in flat mode.
     pub(super) paged: Option<Paged>,
+    /// The flat mode's stored states and their disk; `None` in paged mode
+    /// or without a disk.
+    pub(super) flat: Option<FlatTier>,
+    pub(super) telemetry: Arc<Telemetry>,
+}
+
+impl Drop for Inner {
+    /// A dispose writes the waiting states and drains the copies within one
+    /// bound before the tier closes.
+    fn drop(&mut self) {
+        if let Some(f) = self.flat.as_mut() {
+            f.dispose(self.conv.seq());
+        }
+    }
 }
 
 impl Inner {
@@ -321,16 +351,18 @@ impl Inner {
         max_context: Option<usize>,
         residency: Arc<Mutex<Residency>>,
     ) -> Result<Self> {
-        Self::open(path, max_context, residency, true)
+        Self::open(path, max_context, residency, true, None)
     }
 
     /// `load` in flat mode with `serial`, else in paged mode when the wave
-    /// row cap holds a padded Q8 call.
+    /// row cap holds a padded Q8 call; the stored states on the disk tier of
+    /// `tier`.
     pub(crate) fn open(
         path: &Path,
         max_context: Option<usize>,
         residency: Arc<Mutex<Residency>>,
         serial: bool,
+        tier: Option<&DiskTierOptions>,
     ) -> Result<Self> {
         let paths = shard_paths(path)?;
         let (tokenizer, eos) = gguf_tokenizer(&paths[0])?;
@@ -344,7 +376,16 @@ impl Inner {
             None
         };
         let mut inner = Self::new(store, mtp, tokenizer, residency)?;
-        sched::attach(&mut inner, serial)?;
+        let disk = tier.and_then(|t| {
+            persist::open(
+                t,
+                &paths,
+                inner.store.model.cfg(),
+                inner.mtp.is_some(),
+                Arc::clone(&inner.telemetry),
+            )
+        });
+        sched::attach(&mut inner, serial, disk)?;
         Ok(inner)
     }
 
@@ -370,6 +411,8 @@ impl Inner {
             residency,
             turn_stats: None,
             paged: None,
+            flat: None,
+            telemetry: Arc::new(Telemetry::default()),
         };
         inner.publish(None);
         Ok(inner)
@@ -384,6 +427,72 @@ impl Inner {
     #[cfg(test)]
     pub(crate) fn turn_ids(&self) -> Option<(Vec<u32>, Vec<u32>)> {
         self.residency().turn_ids.clone()
+    }
+
+    /// The stored states' disk tier of either mode.
+    fn disk(&self) -> Option<&Disk> {
+        match (&self.paged, &self.flat) {
+            (Some(p), _) => p.disk.as_ref(),
+            (None, Some(f)) => Some(&f.disk),
+            (None, None) => None,
+        }
+    }
+
+    /// The flat disk's pass over the sequence's rows.
+    fn flat_tick(&mut self) {
+        if let Some(f) = self.flat.as_mut() {
+            f.tick(self.conv.seq());
+        }
+    }
+
+    /// A found stored state of the prompt `tokens` ends read back into a
+    /// new sequence, its blocks' keys returned; on a failed read the
+    /// sequence starts over and the whole prompt comes back to prefill.
+    fn flat_restore(
+        &mut self,
+        tokens: &[u32],
+    ) -> Result<(Option<Vec<Vec<u64>>>, Option<Vec<u32>>)> {
+        let Some(f) = self.flat.as_mut() else {
+            return Ok((None, None));
+        };
+        let Some((_, prompt)) = f.found_prompt(tokens) else {
+            return Ok((None, None));
+        };
+        let filled = f.restore().and_then(|(row, keys, r)| {
+            match filled_seq(&self.store, self.mtp.as_ref(), &prompt[..row], &r) {
+                Ok(seq) => Some((seq, keys)),
+                Err(e) => {
+                    tracing::warn!("hy_v4_flash stored state at {row}: {}", e.reason);
+                    None
+                }
+            }
+        });
+        match filled {
+            Some((seq, keys)) => {
+                self.conv.replace(seq);
+                Ok((Some(keys), None))
+            }
+            None => {
+                f.forget();
+                self.conv.replace(new_seq(&self.store, self.mtp.as_ref())?);
+                Ok((None, Some(prompt)))
+            }
+        }
+    }
+
+    /// After a prefill: the flat turn's keys from the row it started at,
+    /// and the prompt's state rows published.
+    fn flat_publish(&mut self, line: Option<Vec<Vec<u64>>>) {
+        let Some(f) = self.flat.as_mut() else {
+            return;
+        };
+        let from = self.conv.prefilled_from();
+        let prompt = self.conv.seq().tokens();
+        let ends = self.grid.ends(0, prompt);
+        let pass = pass_keys(prompt, &ends, self.grid.chunk());
+        f.begin_turn(prompt, from, line, &pass, from == 0 || ends.contains(&from));
+        let rows = self.grid.states(from, prompt);
+        f.publish_prompt(self.conv.seq(), self.conv.ladder(), &rows);
     }
 
     fn residency(&self) -> std::sync::MutexGuard<'_, Residency> {
@@ -440,6 +549,9 @@ impl Inner {
     /// A new empty sequence in place of the conversation.
     fn fresh(&mut self, why: &Error) {
         tracing::warn!("hy_v4_flash: {}; starting a new sequence", why.reason);
+        if let Some(f) = self.flat.as_mut() {
+            f.forget();
+        }
         match new_seq(&self.store, self.mtp.as_ref()) {
             Ok(s) => self.conv.replace(s),
             Err(e) => tracing::warn!("hy_v4_flash new sequence: {}", e.reason),
@@ -514,6 +626,7 @@ impl DecodeStep for Step<'_> {
                 .conv
                 .seq_mut()
                 .step(&inner.store.model, inner.mtp.as_ref(), token)?;
+        inner.flat_tick();
         inner.emit_stats(&logits, false, t);
         Ok((logits, false))
     }
@@ -546,6 +659,9 @@ impl ChatBackend for Inner {
         if config.enable_mtp.is_none() {
             p.enable_mtp = self.mtp.is_some();
         }
+        if let Some(f) = &self.flat {
+            f.set_salt(p.cache_salt);
+        }
         p
     }
 
@@ -564,6 +680,11 @@ impl ChatBackend for Inner {
         if self.paged.is_some() {
             return self.paged_reset(matches!(scope, ResetScope::Command));
         }
+        if matches!(scope, ResetScope::Command)
+            && let Some(f) = self.flat.as_mut()
+        {
+            f.reset();
+        }
         if let Err(e) = self.conv.reset(scope) {
             self.fresh(&e);
         }
@@ -580,7 +701,17 @@ impl ChatBackend for Inner {
             model: &self.store.model,
             mtp: self.mtp.as_ref(),
         };
-        self.conv.verify(&runner, &self.grid, tokens, reuse)
+        let rows = self.conv.verify(&runner, &self.grid, tokens, reuse);
+        let Some(f) = &self.flat else {
+            return rows;
+        };
+        if !reuse {
+            f.clear_found();
+            return rows;
+        }
+        let ends = self.grid.ends(0, tokens);
+        let pass = pass_keys(tokens, &ends, self.grid.chunk());
+        rows.max(f.find(tokens, &pass, rows))
     }
 
     fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
@@ -596,6 +727,14 @@ impl ChatBackend for Inner {
             .and_then(|()| self.conv.save(args.reuse_cache));
         if let Err(e) = saved {
             self.fresh(&e);
+            return;
+        }
+        if let Some(f) = self.flat.as_mut() {
+            if args.reuse_cache {
+                f.publish_turn(self.conv.seq());
+            } else {
+                f.forget();
+            }
         }
     }
 
@@ -625,6 +764,9 @@ impl ChatBackend for Inner {
         if ending {
             self.end();
             self.conv.turn_over();
+            if let Some(f) = self.flat.as_mut() {
+                f.end_turn(self.conv.seq());
+            }
         }
     }
 
@@ -635,6 +777,8 @@ impl ChatBackend for Inner {
         let _ctx = StreamContext::new(stream);
         let flag = self.cancel.clone();
         let cancel = move |_: usize| flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed));
+        let (line, whole) = self.flat_restore(tokens)?;
+        let tokens = whole.as_deref().unwrap_or(tokens);
         let total = tokens.len();
         let mut ran = 0usize;
         let mut on_chunk = |rows: Range<usize>| {
@@ -648,7 +792,17 @@ impl ChatBackend for Inner {
         };
         let out = self
             .conv
-            .prefill(&runner, &self.grid, tokens, &cancel, &mut on_chunk)?;
+            .prefill(&runner, &self.grid, tokens, &cancel, &mut on_chunk);
+        let out = match out {
+            Ok(out) => out,
+            Err(e) => {
+                if let Some(f) = self.flat.as_mut() {
+                    f.forget();
+                }
+                return Err(e);
+            }
+        };
+        self.flat_publish(line);
         let logits = out
             .logits
             .ok_or_else(|| bad("the prefill returned no logits"))?;
@@ -715,12 +869,37 @@ fn new_seq(store: &Store, mtp: Option<&MtpLayer>) -> Result<Lagged> {
     Ok(Lagged::new(trunk, mtp.map(|m| m.new_draft(store.ctx))))
 }
 
+/// A new sequence holding the stored state `r` of `tokens`.
+fn filled_seq(
+    store: &Store,
+    mtp: Option<&MtpLayer>,
+    tokens: &[u32],
+    r: &Restored,
+) -> Result<Lagged> {
+    let mut seq = new_seq(store, mtp)?;
+    seq.fill(tokens, &r.state, &r.latent, &r.pooled)?;
+    Ok(seq)
+}
+
 #[napi(object)]
 #[derive(Default)]
 pub struct HyV4FlashLoadOptions {
     /// Context token limit (`--max-context`): the admission budgets for at
     /// most this many tokens (and at most 262,144).
     pub max_context_tokens: Option<i64>,
+    /// SSD cache for the stored states (`--max-cache-disk`): `'auto'` (the
+    /// default: up to 32 GiB, a quarter of the volume's room), a byte count,
+    /// or `'0'`, which turns the SSD cache off.
+    pub cache_disk: Option<String>,
+    /// The paged KV disk cache switch every family shares (`--no-persist-cache`):
+    /// keep the stored states on SSD across restarts in a directory of the
+    /// model's own under `cacheDir`; off, the cache is temporary: a directory
+    /// under the temp root that takes copies only while memory drops states,
+    /// removed at the stop. Unset ⇒ `MLX_PERSIST_PAGED_CACHE`, else off.
+    pub persist_paged_cache: Option<bool>,
+    /// The persistent cache's root (`--cache-dir`), default
+    /// `~/.mlx-node/cache/prefix-cache`; needs `persistPagedCache`.
+    pub cache_dir: Option<String>,
 }
 
 /// The last saved turn of the session (prompt and output ids).
@@ -786,6 +965,10 @@ pub struct HyV4FlashModel {
     residency: Arc<Mutex<Residency>>,
     paged: bool,
     lanes: usize,
+    /// Weak: the tier goes with the model thread's state.
+    closer: Option<std::sync::Weak<Closer>>,
+    state_tier: TierHandle,
+    telemetry: Arc<Telemetry>,
 }
 
 #[napi]
@@ -798,12 +981,21 @@ impl HyV4FlashModel {
         let max_context =
             crate::nn::rope_scaling::max_context_option(LABEL, options.max_context_tokens)?
                 .map(|t| t as usize);
+        let env = std::env::var(crate::cold_tier::PERSIST_PAGED_CACHE_ENV).ok();
+        let (tier, disk) = persist::disk_plan(
+            LABEL,
+            options.cache_disk.as_deref(),
+            options.persist_paged_cache,
+            options.cache_dir.clone(),
+            env.as_deref(),
+        )?;
         let residency = Arc::new(Mutex::new(Residency::default()));
         let shared = Arc::clone(&residency);
         let serial = HybridSchedulerState::<Inner>::force_serial();
         let (thread, ready) = ModelThread::spawn_with_scheduler(
             move || {
-                let inner = Inner::open(Path::new(&model_path), max_context, shared, serial)?;
+                let tier = disk.then_some(&tier);
+                let inner = Inner::open(Path::new(&model_path), max_context, shared, serial, tier)?;
                 let s = &inner.store;
                 let limits = HyV4FlashContextLimits {
                     effective_window_tokens: u32::try_from(s.ctx).unwrap_or(u32::MAX),
@@ -813,15 +1005,25 @@ impl HyV4FlashModel {
                 };
                 let dense = s.dense_bytes;
                 let lanes = inner.paged.as_ref().map(|p| p.lanes);
+                let closer = inner.disk().map(Disk::closer);
+                let state_tier = inner.disk().map(Disk::tier_handle).unwrap_or_default();
+                let telemetry = Arc::clone(&inner.telemetry);
                 let engine = match lanes {
                     Some(_) => Engine::Paged(Box::new(HybridSchedulerState::new(inner)?)),
                     None => Engine::Flat(Box::new(inner)),
                 };
-                Ok((engine, (limits, dense, lanes)))
+                Ok((
+                    engine,
+                    (limits, dense, lanes, closer, state_tier, telemetry),
+                ))
             },
             |engine: &mut Engine, rx| match engine {
                 Engine::Paged(state) => state.drive(rx),
                 Engine::Flat(inner) => match rx.blocking_recv() {
+                    Some(ModelCommand::MemoryControl) => {
+                        inner.flat_tick();
+                        LoopControl::Continue
+                    }
                     Some(cmd) => {
                         handle_model_command(&mut **inner, cmd);
                         LoopControl::Continue
@@ -830,9 +1032,20 @@ impl HyV4FlashModel {
                 },
             },
         );
-        let (limits, dense, lanes) = ready
+        let (limits, dense, lanes, closer, state_tier, telemetry) = ready
             .await
             .map_err(|e| Error::from_reason(e.to_string()))??;
+        if let (Some(sender), Some(c)) = (
+            thread.cmd_sender(),
+            closer.as_ref().and_then(std::sync::Weak::upgrade),
+        ) {
+            let sender = sender.downgrade();
+            c.set_wake(Arc::new(move || {
+                if let Some(sender) = sender.upgrade() {
+                    let _ = sender.send(ModelCommand::MemoryControl);
+                }
+            }));
+        }
         Ok(Self {
             thread,
             limits,
@@ -840,7 +1053,52 @@ impl HyV4FlashModel {
             residency,
             paged: lanes.is_some(),
             lanes: lanes.unwrap_or(1),
+            closer,
+            state_tier,
+            telemetry,
         })
+    }
+
+    /// Closes the stored states' SSD cache at a clean stop: on a persistent
+    /// cache it asks the model thread to write the waiting states, the
+    /// newest first, then drains every copy, until `deadlineMs`
+    /// (milliseconds on `Date.now()`'s clock, so models closed in turn share
+    /// one deadline); a temporary cache is removed. The model thread gets
+    /// all of the time but the last second (at most half of it). The cache
+    /// takes no write and removes nothing afterwards. Resolves true only
+    /// when no state was left waiting and every copy and write landed by
+    /// the deadline; true without a cache, or after `dispose`, which closed
+    /// it. A call while another close runs gets that close's outcome.
+    #[napi]
+    pub async fn close_cache(&self, deadline_ms: f64) -> Result<bool> {
+        let Some(closer) = self.closer.as_ref().and_then(std::sync::Weak::upgrade) else {
+            return Ok(true);
+        };
+        let deadline = crate::models::qwen3_5::dflash2_state::disk::instant_at(deadline_ms);
+        napi::bindgen_prelude::spawn_blocking(move || closer.close(deadline))
+            .await
+            .map_err(|e| Error::from_reason(format!("{LABEL} closeCache: {e}")))
+    }
+
+    /// The stored states' SSD cache: `'persistent'` or `'temp'` while it is
+    /// open, `'off'` without one, after `closeCache`, and once a write failed
+    /// for anything but room (it takes no write after).
+    #[napi(ts_return_type = "'persistent' | 'temp' | 'off'")]
+    pub fn state_tier_mode(&self) -> String {
+        match self.telemetry.mode(&self.state_tier) {
+            1 => "persistent",
+            2 => "temp",
+            _ => "off",
+        }
+        .to_string()
+    }
+
+    /// The directory name of the stored states' open persistent SSD cache
+    /// under its cache root, read from the cache itself; null without one,
+    /// for a temporary cache, and after `closeCache` or `dispose`.
+    #[napi]
+    pub fn state_tier_namespace(&self) -> Option<String> {
+        self.state_tier.namespace()
     }
 
     /// Frees the weights, the bank and the sequence now: the model thread

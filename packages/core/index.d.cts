@@ -658,6 +658,31 @@ export declare class HyV4FlashModel {
    */
   static load(modelPath: string, options?: HyV4FlashLoadOptions | undefined | null): Promise<HyV4FlashModel>;
   /**
+   * Closes the stored states' SSD cache at a clean stop: on a persistent
+   * cache it asks the model thread to write the waiting states, the
+   * newest first, then drains every copy, until `deadlineMs`
+   * (milliseconds on `Date.now()`'s clock, so models closed in turn share
+   * one deadline); a temporary cache is removed. The model thread gets
+   * all of the time but the last second (at most half of it). The cache
+   * takes no write and removes nothing afterwards. Resolves true only
+   * when no state was left waiting and every copy and write landed by
+   * the deadline; true without a cache, or after `dispose`, which closed
+   * it. A call while another close runs gets that close's outcome.
+   */
+  closeCache(deadlineMs: number): Promise<boolean>;
+  /**
+   * The stored states' SSD cache: `'persistent'` or `'temp'` while it is
+   * open, `'off'` without one, after `closeCache`, and once a write failed
+   * for anything but room (it takes no write after).
+   */
+  stateTierMode(): 'persistent' | 'temp' | 'off';
+  /**
+   * The directory name of the stored states' open persistent SSD cache
+   * under its cache root, read from the cache itself; null without one,
+   * for a temporary cache, and after `closeCache` or `dispose`.
+   */
+  stateTierNamespace(): string | null;
+  /**
    * Frees the weights, the bank and the sequence now: the model thread
    * drops them and exits; every later call fails.
    */
@@ -4714,6 +4739,25 @@ export interface HyV4FlashLoadOptions {
    * most this many tokens (and at most 262,144).
    */
   maxContextTokens?: number;
+  /**
+   * SSD cache for the stored states (`--max-cache-disk`): `'auto'` (the
+   * default: up to 32 GiB, a quarter of the volume's room), a byte count,
+   * or `'0'`, which turns the SSD cache off.
+   */
+  cacheDisk?: string;
+  /**
+   * The paged KV disk cache switch every family shares (`--no-persist-cache`):
+   * keep the stored states on SSD across restarts in a directory of the
+   * model's own under `cacheDir`; off, the cache is temporary: a directory
+   * under the temp root that takes copies only while memory drops states,
+   * removed at the stop. Unset ⇒ `MLX_PERSIST_PAGED_CACHE`, else off.
+   */
+  persistPagedCache?: boolean;
+  /**
+   * The persistent cache's root (`--cache-dir`), default
+   * `~/.mlx-node/cache/prefix-cache`; needs `persistPagedCache`.
+   */
+  cacheDir?: string;
 }
 
 /** The load-time and latest per-turn admission, and the expert bank. */

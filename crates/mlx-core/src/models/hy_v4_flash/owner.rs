@@ -24,7 +24,7 @@ use napi::{Error, Result};
 
 use super::cache::{WINDOW_SLACK, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
-use super::indexer::{IndexerGeometry, IndexerMark, PagedIndexerState};
+use super::indexer::{IndexerGeometry, IndexerMark, PagedIndexerState, TokTail};
 use super::mtp::{Draft, DraftMark};
 use super::paged::pool_layers;
 use super::prefill::{BLOCK_ROWS, index_keeps, window_keeps};
@@ -446,22 +446,45 @@ impl OwnerCell {
         if d.len() != m || d.index().len() != m || d.index().pooled_len() != m / self.kpool {
             return Ok(None);
         }
-        let per = BLOCK_ROWS / self.kpool;
-        let full = m / BLOCK_ROWS;
+        let tail = d.index().tail().clone();
+        draft_state_at(d, m, self.kpool, &mut self.segments, tail, seed).map(Some)
+    }
+}
+
+/// The MTP part of a state whose draft settled at `m` rows: segments of
+/// the whole 32-row blocks below `m` (the ones `shared` still holds are
+/// reused, the rest copied and recorded there), the open rows past them,
+/// `tail` and `seed`. `d` must hold at least `m` rows and their closed
+/// groups.
+pub fn draft_state_at(
+    d: &Draft,
+    m: usize,
+    kpool: usize,
+    shared: &mut Vec<Weak<Segment>>,
+    tail: TokTail,
+    seed: MxArray,
+) -> Result<DraftState> {
+    if d.len() < m || d.index().pooled_len() < m / kpool || tail.len() != m {
+        return Err(bad(format!(
+            "a draft of {} rows and {} groups for a state of {m} rows",
+            d.len(),
+            d.index().pooled_len()
+        )));
+    }
+    let per = BLOCK_ROWS / kpool;
+    let full = m / BLOCK_ROWS;
+    let rows = |a: &MxArray, w: i64, lo: usize, hi: usize| -> Result<MxArray> {
+        a.slice(&[lo as i64, 0], &[hi as i64, w])?.deep_copy()
+    };
+    let mut segments: Vec<Arc<Segment>> =
+        shared.iter().take(full).map_while(Weak::upgrade).collect();
+    let mut fresh = Vec::new();
+    let mut open = None;
+    if m > 0 {
         let kv = d.kv().rows()?;
         let width = kv.shape_at(1)?;
         let pooled = d.index().pooled_rows()?;
         let pw = pooled.shape_at(1)?;
-        let rows = |a: &MxArray, w: i64, lo: usize, hi: usize| -> Result<MxArray> {
-            a.slice(&[lo as i64, 0], &[hi as i64, w])?.deep_copy()
-        };
-        let mut segments: Vec<Arc<Segment>> = self
-            .segments
-            .iter()
-            .take(full)
-            .map_while(Weak::upgrade)
-            .collect();
-        let mut fresh = Vec::new();
         for s in segments.len()..full {
             fresh.push(Segment {
                 kv: rows(kv, width, s * BLOCK_ROWS, (s + 1) * BLOCK_ROWS)?,
@@ -469,35 +492,32 @@ impl OwnerCell {
             });
         }
         let first = full * BLOCK_ROWS;
-        let open = if m > first {
-            let closed = m / self.kpool;
-            Some(OpenRows {
+        if m > first {
+            let closed = m / kpool;
+            open = Some(OpenRows {
                 kv: rows(kv, width, first, m)?,
                 pooled: (closed > full * per)
                     .then(|| rows(pooled, pw, full * per, closed))
                     .transpose()?,
-            })
-        } else {
-            None
-        };
-        let mut live: Vec<&MxArray> = fresh.iter().flat_map(|s| [&s.kv, &s.pooled]).collect();
-        if let Some(o) = &open {
-            live.push(&o.kv);
-            live.extend(o.pooled.iter());
+            });
         }
-        if !live.is_empty() {
-            MxArray::eval_arrays_with_context(&live, "hy_v4_flash owner state")?;
-        }
-        let tail = d.index().tail().clone();
-        segments.extend(fresh.into_iter().map(Arc::new));
-        self.segments = segments.iter().map(Arc::downgrade).collect();
-        Ok(Some(DraftState {
-            segments,
-            open,
-            tail,
-            seed,
-        }))
     }
+    let mut live: Vec<&MxArray> = fresh.iter().flat_map(|s| [&s.kv, &s.pooled]).collect();
+    if let Some(o) = &open {
+        live.push(&o.kv);
+        live.extend(o.pooled.iter());
+    }
+    if !live.is_empty() {
+        MxArray::eval_arrays_with_context(&live, "hy_v4_flash owner state")?;
+    }
+    segments.extend(fresh.into_iter().map(Arc::new));
+    *shared = segments.iter().map(Arc::downgrade).collect();
+    Ok(DraftState {
+        segments,
+        open,
+        tail,
+        seed,
+    })
 }
 
 /// `parts` joined on rows; `None` when there are none.
@@ -510,7 +530,7 @@ fn join(parts: Vec<&MxArray>) -> Result<Option<MxArray>> {
 }
 
 /// Fills the empty draft `d` with the MTP rows of `ds`.
-fn fill_draft(d: &mut Draft, ds: &DraftState) -> Result<()> {
+pub fn fill_draft(d: &mut Draft, ds: &DraftState) -> Result<()> {
     let mut kv: Vec<&MxArray> = ds.segments.iter().map(|s| &s.kv).collect();
     let mut pooled: Vec<&MxArray> = ds.segments.iter().map(|s| &s.pooled).collect();
     if let Some(o) = &ds.open {
