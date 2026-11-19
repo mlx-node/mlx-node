@@ -61,8 +61,9 @@ fn argmax(row: &[f32]) -> usize {
 }
 
 /// `HY4_REF_CASES` (a JSON list of `{name, messages, tools?,
-/// add_generation_prompt?, reasoning_effort?}`; with an effort the request
-/// render the engine uses) rendered with the GGUF template and encoded
+/// add_generation_prompt?, reasoning_effort?, preserve_thinking?}`; with an
+/// effort the request render the engine uses, and `preserve_thinking: true`
+/// the one an engine session uses) rendered with the GGUF template and encoded
 /// as the engine encodes a prompt: `<name>.txt` and `<name>.i32` (int32 LE)
 /// in `HY4_REF_PROMPTS`.
 #[test]
@@ -92,7 +93,11 @@ fn real_render_cases() {
                     reasoning_effort: Some(effort.to_string()),
                     ..Default::default()
                 };
-                tok.render_chat_template_with_config(&messages, agp, &cfg, false)
+                let preserve = c
+                    .get("preserve_thinking")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                tok.render_chat_template_with_config(&messages, agp, &cfg, preserve)
             }
             None => {
                 tok.render_chat_template_sync(&messages, Some(agp), tools.as_deref(), None, false)
