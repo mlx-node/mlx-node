@@ -65,8 +65,32 @@ describe('recoverSuppressedToolCallText: Hy4-flash', () => {
         const raw = `${hy4Block(x, `see </tool_calls:${x}> here`)}after`;
         expect(recoverSuppressedToolCallText(raw)).toBe('after');
       });
+
+      it('removes the leading empty think pair the model writes again', () => {
+        expect(recoverSuppressedToolCallText(`<think:${x}>\n</think:${x}>\n${hy4Block(x)}`)).toBe('');
+        expect(recoverSuppressedToolCallText(` <think:${x}></think:${x}>\n\nAnswer ${hy4Block(x)}`)).toBe('Answer ');
+        expect(recoverSuppressedToolCallText(`<think:${x}>plan</think:${x}>${hy4Block(x)}`)).toBe(
+          `<think:${x}>plan</think:${x}>`,
+        );
+        expect(recoverSuppressedToolCallText(`a <think:${x}></think:${x}> b`)).toBe(`a <think:${x}></think:${x}> b`);
+      });
     });
   }
+
+  it('the empty think pair needs one suffix', () => {
+    const raw = '<think:6124c78e></think:opensource>x';
+    expect(recoverSuppressedToolCallText(raw)).toBe(raw);
+  });
+
+  it('stray tags until the length stop are removed in linear time', () => {
+    const x = '6124c78e';
+    const strays = `</arg_value:${x}>`.repeat(200_000);
+    const badHeads = '<tool_call: x '.repeat(100_000);
+    const started = performance.now();
+    expect(recoverSuppressedToolCallText(`${hy4Block(x)}${strays}`)).toBe('');
+    expect(recoverSuppressedToolCallText(`${badHeads}${strays}`)).toBe(badHeads);
+    expect(performance.now() - started).toBeLessThan(5_000);
+  });
 
   it('keeps text that is not a Hy4 tag', () => {
     for (const raw of ['use <tool_calls: x> here', '<tool_calls:a b>', '<tool_calls:>', 'a <tool_calls b']) {
@@ -99,6 +123,17 @@ describe('recoverSuppressedToolCallText: DeepSeek V4.1 DSML', () => {
     expect(recoverSuppressedToolCallText('a </｜DSML｜ calls> b </｜DSML｜ invoke> c </｜DSML｜ parameter> d')).toBe(
       'a  b  c  d',
     );
+  });
+
+  it('stray tags and value-free blocks are removed in linear time', () => {
+    const strays = '</｜DSML｜ invoke>'.repeat(200_000);
+    const invokes = '<｜DSML｜ invoke name="f"></｜DSML｜ invoke>'.repeat(100_000);
+    const started = performance.now();
+    expect(recoverSuppressedToolCallText(`${dsmlBlock()}${strays}`)).toBe('');
+    expect(
+      recoverSuppressedToolCallText(`${invokes}<｜DSML｜ parameter name="q" string="true">v</｜DSML｜ parameter>`),
+    ).toBe('');
+    expect(performance.now() - started).toBeLessThan(5_000);
   });
 
   it('a parameter value holding the block close does not end the block', () => {
@@ -148,6 +183,12 @@ describe('visibleAnswerText with tool use not allowed', () => {
       expect(
         visibleAnswerText({ text: '', rawText: `${hy4Block(x)}\nThe forecast follows.`, toolCalls: [call] }, false),
       ).toBe('\nThe forecast follows.');
+      expect(
+        visibleAnswerText(
+          { text: '', rawText: `<think:${x}>\n</think:${x}>\n${hy4Block(x)}`, toolCalls: [call] },
+          false,
+        ),
+      ).toBe('');
       const result = {
         text: '',
         rawText: hy4Block(x),

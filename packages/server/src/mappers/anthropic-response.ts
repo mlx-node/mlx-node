@@ -209,34 +209,82 @@ interface Markup {
   value: readonly [string, string] | null;
 }
 
+type Scanner = (from: number) => Markup | null;
+
+/**
+ * Keeps the last hit of each search; the scans run once per stray tag, so a
+ * fresh search each time is quadratic in the text length.
+ */
+function memoized<T extends { start: number }>(find: (from: number) => T | null): (from: number) => T | null {
+  let searchedFrom = Number.POSITIVE_INFINITY;
+  let hit: T | null = null;
+  return (from) => {
+    if (from < searchedFrom || (hit !== null && hit.start < from)) {
+      hit = find(from);
+      searchedFrom = from;
+    }
+    return hit;
+  };
+}
+
+class TextSearch {
+  private readonly needles = new Map<string, (from: number) => { start: number } | null>();
+
+  constructor(readonly text: string) {}
+
+  indexOf(needle: string, from: number): number {
+    let find = this.needles.get(needle);
+    if (find === undefined) {
+      find = memoized((at) => {
+        const start = this.text.indexOf(needle, at);
+        return start < 0 ? null : { start };
+      });
+      this.needles.set(needle, find);
+    }
+    return find(from)?.start ?? -1;
+  }
+}
+
 function isHy4SuffixChar(ch: string): boolean {
   return ch !== '<' && ch !== '>' && !isWhitespace(ch);
 }
 
-function nextHy4Tag(
-  text: string,
-  from: number,
-  name: string,
-  closing: boolean,
-): { start: number; end: number; suffix: string } | null {
-  const head = `${closing ? '</' : '<'}${name}:`;
+interface Hy4Tag {
+  start: number;
+  end: number;
+  suffix: string;
+}
+
+/** The `<name:X>` tag whose `head` (`<name:`) is at `at`, or null. */
+function hy4TagAt(text: string, at: number, head: string): Hy4Tag | null {
+  if (!text.startsWith(head, at)) return null;
+  let i = at + head.length;
+  while (i < text.length && isHy4SuffixChar(text[i]!)) i++;
+  if (i === at + head.length || text[i] !== '>') return null;
+  return { start: at, end: i + 1, suffix: text.slice(at + head.length - 1, i) };
+}
+
+function nextHy4Tag(text: string, from: number, head: string): Hy4Tag | null {
   for (let at = text.indexOf(head, from); at >= 0; at = text.indexOf(head, at + 1)) {
-    let i = at + head.length;
-    while (i < text.length && isHy4SuffixChar(text[i]!)) i++;
-    if (i > at + head.length && text[i] === '>') {
-      return { start: at, end: i + 1, suffix: text.slice(at + head.length - 1, i) };
-    }
+    const tag = hy4TagAt(text, at, head);
+    if (tag !== null) return tag;
   }
   return null;
 }
 
 const HY4_TAG_NAMES = ['tool_calls', 'tool_call', 'arg_key', 'arg_value'] as const;
 
-function nextHy4Markup(text: string, from: number): Markup | null {
-  let next: Markup | null = null;
-  for (const name of HY4_TAG_NAMES) {
-    for (const closing of [false, true]) {
-      const tag = nextHy4Tag(text, from, name, closing);
+function hy4Scanner(search: TextSearch): Scanner {
+  const heads = HY4_TAG_NAMES.flatMap((name) =>
+    [false, true].map((closing) => {
+      const head = `${closing ? '</' : '<'}${name}:`;
+      return { name, closing, next: memoized((from) => nextHy4Tag(search.text, from, head)) };
+    }),
+  );
+  return (from) => {
+    let next: Markup | null = null;
+    for (const { name, closing, next: nextTag } of heads) {
+      const tag = nextTag(from);
       if (tag === null || (next !== null && tag.start >= next.start)) continue;
       const call = name === 'tool_calls' || name === 'tool_call';
       next = {
@@ -246,8 +294,26 @@ function nextHy4Markup(text: string, from: number): Markup | null {
         value: !closing && call ? [`<arg_value${tag.suffix}>`, `</arg_value${tag.suffix}>`] : null,
       };
     }
-  }
-  return next;
+    return next;
+  };
+}
+
+/**
+ * `text` without a leading empty `<think:X></think:X>`: the `no_think` prompt's
+ * own pair, which the model writes again (native `strip_empty_think`).
+ */
+function withoutLeadingEmptyHy4Think(text: string): string {
+  let at = 0;
+  while (at < text.length && isWhitespace(text[at]!)) at++;
+  const open = hy4TagAt(text, at, '<think:');
+  if (open === null) return text;
+  at = open.end;
+  while (at < text.length && isWhitespace(text[at]!)) at++;
+  const close = `</think${open.suffix}>`;
+  if (!text.startsWith(close, at)) return text;
+  at += close.length;
+  while (at < text.length && isWhitespace(text[at]!)) at++;
+  return text.slice(at);
 }
 
 const DSML_VALUE = ['<｜DSML｜ parameter ', '</｜DSML｜ parameter>'] as const;
@@ -261,42 +327,47 @@ const DSML_MARKUP: readonly { head: string; close: string | null; value: readonl
   { head: '</｜DSML｜ parameter>', close: null, value: null },
 ];
 
-function nextDsmlMarkup(text: string, from: number): Markup | null {
-  let next: Markup | null = null;
-  for (const markup of DSML_MARKUP) {
-    const at = text.indexOf(markup.head, from);
-    if (at < 0 || (next !== null && at >= next.start)) continue;
-    next = { start: at, end: at + markup.head.length, close: markup.close, value: markup.value };
-  }
-  return next;
+function dsmlScanner(search: TextSearch): Scanner {
+  return (from) => {
+    let next: Markup | null = null;
+    for (const markup of DSML_MARKUP) {
+      const at = search.indexOf(markup.head, from);
+      if (at < 0 || (next !== null && at >= next.start)) continue;
+      next = { start: at, end: at + markup.head.length, close: markup.close, value: markup.value };
+    }
+    return next;
+  };
 }
 
 /** The offset after the first `close` outside a value, or the text's end. */
-function blockEnd(text: string, from: number, close: string, value: readonly [string, string] | null): number {
+function blockEnd(search: TextSearch, from: number, close: string, value: readonly [string, string] | null): number {
+  const length = search.text.length;
   let at = from;
   for (;;) {
-    const end = text.indexOf(close, at);
-    const open = value === null ? -1 : text.indexOf(value[0], at);
-    if (value === null || open < 0 || (end >= 0 && end < open)) return end < 0 ? text.length : end + close.length;
-    const valueEnd = text.indexOf(value[1], open + value[0].length);
-    if (valueEnd < 0) return text.length;
+    const end = search.indexOf(close, at);
+    const open = value === null ? -1 : search.indexOf(value[0], at);
+    if (value === null || open < 0 || (end >= 0 && end < open)) return end < 0 ? length : end + close.length;
+    const valueEnd = search.indexOf(value[1], open + value[0].length);
+    if (valueEnd < 0) return length;
     at = valueEnd + value[1].length;
   }
 }
 
-function withoutMarkup(text: string, next: (text: string, from: number) => Markup | null): string {
+function withoutMarkup(text: string, scanner: (search: TextSearch) => Scanner): string {
+  const search = new TextSearch(text);
+  const next = scanner(search);
   let out = '';
   let from = 0;
-  for (let markup = next(text, 0); markup !== null; markup = next(text, from)) {
+  for (let markup = next(0); markup !== null; markup = next(from)) {
     out += text.slice(from, markup.start);
-    from = markup.close === null ? markup.end : blockEnd(text, markup.end, markup.close, markup.value);
+    from = markup.close === null ? markup.end : blockEnd(search, markup.end, markup.close, markup.value);
   }
   return out + text.slice(from);
 }
 
 export function recoverSuppressedToolCallText(rawText: string): string {
   return (
-    withoutMarkup(withoutMarkup(rawText, nextHy4Markup), nextDsmlMarkup)
+    withoutMarkup(withoutMarkup(withoutLeadingEmptyHy4Think(rawText), hy4Scanner), dsmlScanner)
       .replace(/<\|channel>[\s\S]*?(?:<channel\|>|$)/g, '')
       .replace(/<channel\|>/g, '')
       .replace(/<\|tool_call>[\s\S]*?(?:<tool_call\|>|$)/g, '')
