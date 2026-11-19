@@ -3,6 +3,7 @@
 //! Engram table stored as GGUF type 43).
 
 pub mod attention;
+pub mod bank;
 pub mod cache;
 pub mod config;
 pub mod engram;
