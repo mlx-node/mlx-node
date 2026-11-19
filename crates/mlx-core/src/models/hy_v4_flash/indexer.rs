@@ -601,6 +601,39 @@ impl IndexerState {
         Ok(())
     }
 
+    /// Appends the pooled keys `[k, d]` of the next closed groups to a state
+    /// being filled, which has seen no position yet.
+    pub fn append_pooled(&mut self, pooled: &MxArray) -> Result<()> {
+        if !self.is_empty() {
+            return Err(bad("fill of an indexer that holds positions"));
+        }
+        if pooled.shape_at(0)? > 0 {
+            let at = self.pooled.len();
+            self.pooled.write(pooled, at)?;
+        }
+        Ok(())
+    }
+
+    /// Ends a fill by [`Self::append_pooled`]: `tail` must close exactly
+    /// the groups appended.
+    pub fn close_fill(&mut self, tail: TokTail) -> Result<()> {
+        if !self.is_empty() {
+            return Err(bad("fill of an indexer that holds positions"));
+        }
+        if (tail.kpool, tail.width) != (self.tail.kpool, self.tail.width) {
+            return Err(bad("fill with a tail of another indexer"));
+        }
+        let k = self.pooled.len();
+        if tail.len / tail.kpool != k {
+            return Err(bad(format!(
+                "a tail of {} positions over {k} pooled groups",
+                tail.len
+            )));
+        }
+        self.tail = tail;
+        Ok(())
+    }
+
     /// Drops the positions past `len`. Refused when the open rows of `len`
     /// are no longer held.
     pub fn truncate(&mut self, len: usize) -> Result<()> {

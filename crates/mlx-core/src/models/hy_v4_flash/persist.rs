@@ -47,6 +47,7 @@ use super::prefill::{BLOCK_ROWS, StateRow, turn_row};
 use super::prefix_state::{
     DraftState, Held, Key, PrefixState, Segment, States, durable, prompt_keys, resumes, turn_keys,
 };
+use crate::array::MxArray;
 use crate::disk_tier::{DiskTier, DiskTierOptions, PersistentIdentity, TierHandle};
 use crate::models::qwen3_5::dflash2_state::disk::{adopt_states, label_of, lineage_keys};
 use crate::models::qwen3_5::dflash2_state::store::{DiskCopy, EntryId, HybridStateStore, Lineage};
@@ -70,8 +71,9 @@ const GIVE_UP: Duration = Duration::from_secs(10);
 const STEP_TOP_UP: Duration = Duration::from_millis(250);
 /// Host copies of blocks and segments waiting for the writer.
 pub const QUEUE_BYTES: u64 = 128 << 20;
-/// Blocks a flat copy reads from the GPU at once.
-const FLAT_RUN: usize = 32;
+/// Blocks a flat copy reads from the GPU, or a flat restore from disk, at
+/// once.
+pub const FLAT_RUN: usize = 32;
 /// The identity text's first line; a change of any format below bumps it.
 pub const TAG: &str = "hy4-prefix-v1";
 
@@ -1218,7 +1220,7 @@ impl Disk {
         };
         if self.manager.contains_in(&key, ColdGroup::DFlash2State) {
             store.set_disk(id, Some(copy(true)));
-            self.owed.push(owed);
+            self.owed.push(Owed { bytes: 0, ..owed });
             return Written::OnTier;
         }
         let Some(mut payload) = self.lane.staging.take() else {
@@ -1501,10 +1503,7 @@ impl Disk {
         })();
         self.lane.staging = Some(staging);
         match read {
-            Some(state) if state.row == row => {
-                Telemetry::bump(&self.telemetry.disk_restored);
-                Read::State(state)
-            }
+            Some(state) if state.row == row => Read::State(state),
             _ => {
                 self.remove_object(&key);
                 Telemetry::bump(&self.telemetry.dropped_chain);
@@ -1513,52 +1512,110 @@ impl Disk {
         }
     }
 
+    /// A state read back has landed in its sequence or cell.
+    pub fn restored(&self) {
+        Telemetry::bump(&self.telemetry.disk_restored);
+    }
+
     /// The KV blocks of the first `row` rows of `tokens` (keyed by `keys`
-    /// and `salt`) read back: per indexed layer, the latent rows
-    /// `[row, 2·half]` and the pooled keys `[row / kpool, d]` f16. `None`
-    /// when a block does not read back.
-    pub fn read_blocks(
-        &self,
-        tokens: &[u32],
+    /// and `salt`), read back a run at a time. `None` when the chain does
+    /// not cover `row`.
+    pub fn block_runs<'a>(
+        &'a self,
+        tokens: &'a [u32],
         keys: &[Vec<u64>],
         salt: u64,
         row: usize,
-    ) -> Option<(Vec<crate::array::MxArray>, Vec<crate::array::MxArray>)> {
+    ) -> Option<BlockRuns<'a>> {
         let n = row / BLOCK_ROWS;
         let padded: Vec<Vec<u64>> = (0..n)
             .map(|i| keys.get(i).cloned().unwrap_or_default())
             .collect();
         let cold = chain(ColdGroup::Kv, self.fingerprint, tokens, &padded, salt, n);
-        if cold.len() != n {
-            return None;
+        (cold.len() == n).then(|| BlockRuns {
+            disk: self,
+            tokens,
+            cold,
+            next: 0,
+            failed: false,
+            scratch: vec![(Vec::new(), Vec::new()); self.page.layers as usize],
+        })
+    }
+}
+
+/// A stored state's KV blocks, `FLAT_RUN` at a time: per indexed layer the
+/// latent rows `[32·b, 2·half]` and the pooled keys `[b·index_rows, d]`,
+/// f16. A restore holds one run, never the whole chain.
+pub struct BlockRuns<'a> {
+    disk: &'a Disk,
+    tokens: &'a [u32],
+    cold: Vec<ColdCacheKey>,
+    next: usize,
+    failed: bool,
+    scratch: Vec<(Vec<u16>, Vec<u16>)>,
+}
+
+impl BlockRuns<'_> {
+    /// A block did not read back.
+    pub fn failed(&self) -> bool {
+        self.failed
+    }
+
+    fn read(&mut self, first: usize, blocks: usize) -> Option<Vec<(MxArray, MxArray)>> {
+        let d = self.disk;
+        let layers = d.page.layers as usize;
+        for (rows, keys) in &mut self.scratch {
+            rows.clear();
+            keys.clear();
         }
-        let layers = self.page.layers as usize;
-        let mut latent: Vec<Vec<u16>> = vec![Vec::new(); layers];
-        let mut pooled: Vec<Vec<u16>> = vec![Vec::new(); layers];
-        for (i, key) in cold.iter().enumerate() {
-            let block = self.manager.load(*key, self.fingerprint)?;
-            if block.layout != self.layout
-                || block.tokens[..] != tokens[i * BLOCK_ROWS..(i + 1) * BLOCK_ROWS]
+        let chain = self.cold.get(first..first + blocks)?;
+        for (i, key) in chain.iter().enumerate() {
+            let at = (first + i) * BLOCK_ROWS;
+            let tokens = self.tokens.get(at..at + BLOCK_ROWS)?;
+            let block = d.manager.load(*key, d.fingerprint)?;
+            if block.layout != d.layout
+                || block.tokens[..] != *tokens
                 || block.layers.len() != layers
             {
                 return None;
             }
-            for (l, layer) in block.layers.iter().enumerate() {
-                let (rows, keys) = super::persist_codec::join_block(layer, &self.page)?;
-                latent[l].extend_from_slice(&rows);
-                pooled[l].extend_from_slice(&keys);
+            for ((rows, keys), layer) in self.scratch.iter_mut().zip(&block.layers) {
+                let (r, k) = super::persist_codec::join_block(layer, &d.page)?;
+                rows.extend_from_slice(&r);
+                keys.extend_from_slice(&k);
             }
         }
-        let width = 2 * i64::from(self.page.half);
-        let groups = (n * self.page.index_rows as usize) as i64;
-        let dim = i64::from(self.page.index_dim);
-        let mut lat = Vec::with_capacity(layers);
-        let mut pool = Vec::with_capacity(layers);
-        for (rows, keys) in latent.into_iter().zip(pooled) {
-            lat.push(crate::array::MxArray::from_float16(&rows, &[row as i64, width]).ok()?);
-            pool.push(crate::array::MxArray::from_float16(&keys, &[groups, dim]).ok()?);
+        let lines = (blocks * BLOCK_ROWS) as i64;
+        let width = 2 * i64::from(d.page.half);
+        let groups = (blocks * d.page.index_rows as usize) as i64;
+        let dim = i64::from(d.page.index_dim);
+        self.scratch
+            .iter()
+            .map(|(rows, keys)| {
+                Some((
+                    MxArray::from_float16(rows, &[lines, width]).ok()?,
+                    MxArray::from_float16(keys, &[groups, dim]).ok()?,
+                ))
+            })
+            .collect()
+    }
+}
+
+impl Iterator for BlockRuns<'_> {
+    type Item = Vec<(MxArray, MxArray)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let left = self.cold.len().saturating_sub(self.next);
+        if left == 0 || self.failed {
+            return None;
         }
-        Some((lat, pool))
+        let blocks = FLAT_RUN.min(left);
+        let run = self.read(self.next, blocks);
+        match run {
+            Some(_) => self.next += blocks,
+            None => self.failed = true,
+        }
+        run
     }
 }
 
@@ -1709,13 +1766,6 @@ struct FlatTurn {
     from: usize,
 }
 
-/// What a read back gave the flat sequence.
-pub struct Restored {
-    pub state: PrefixState,
-    pub latent: Vec<crate::array::MxArray>,
-    pub pooled: Vec<crate::array::MxArray>,
-}
-
 /// The flat mode's stored states over its one sequence, and their disk:
 /// the sequence's latent and pooled rows are the blocks' source; a prompt
 /// deeper than the ladder reaches resumes from a stored state read back.
@@ -1813,17 +1863,22 @@ impl FlatTier {
             .then(|| (f.row, f.prompt.clone()))
     }
 
-    /// Reads the found state and its blocks back; `None` when it does not
-    /// come back (it goes with its object).
-    pub fn restore(&mut self) -> Option<(usize, Vec<Vec<u64>>, Restored)> {
+    /// Reads the found state back and `fill`s a new sequence from it and
+    /// its blocks; `None` when it does not come back (a state or block that
+    /// does not read back goes with its object).
+    pub fn restore(
+        &mut self,
+        fill: impl FnOnce(usize, &PrefixState, &mut BlockRuns<'_>) -> Result<Lagged>,
+    ) -> Option<(Lagged, Vec<Vec<u64>>)> {
         let Found { id, row, prompt } = self.found.borrow_mut().take()?;
         let (key, extra) = {
             let e = self.states.store().get(id)?;
             (e.disk()?.key, e.extra_keys().to_vec())
         };
+        let salt = self.salt.get();
         let Some(segments) = self
             .disk
-            .chain_whole(&prompt, &extra, self.salt.get(), row, &|_| false)
+            .chain_whole(&prompt, &extra, salt, row, &|_| false)
         else {
             self.disk.discard(self.states.store_mut(), id);
             return None;
@@ -1843,27 +1898,31 @@ impl FlatTier {
                 return None;
             }
         };
-        let Some((latent, pooled)) = self.disk.read_blocks(&prompt, &extra, self.salt.get(), row)
-        else {
+        let Some(mut runs) = self.disk.block_runs(&prompt, &extra, salt, row) else {
             self.disk.discard(self.states.store_mut(), id);
             return None;
         };
+        let filled = fill(row, &state, &mut runs);
+        let failed = runs.failed();
+        let seq = match filled {
+            Ok(seq) => seq,
+            Err(e) => {
+                tracing::warn!("hy_v4_flash stored state at {row}: {}", e.reason);
+                if failed {
+                    self.disk.discard(self.states.store_mut(), id);
+                }
+                return None;
+            }
+        };
         self.states.touch(id);
+        self.disk.restored();
         self.segments = state.draft.as_ref().map_or_else(Vec::new, |d| {
             d.segments.iter().map(Arc::downgrade).collect()
         });
         let keys = (0..row / BLOCK_ROWS)
             .map(|i| extra.get(i).cloned().unwrap_or_default())
             .collect();
-        Some((
-            row,
-            keys,
-            Restored {
-                state,
-                latent,
-                pooled,
-            },
-        ))
+        Some((seq, keys))
     }
 
     /// A prefill of `prompt` from `from` starts: rows past `from` are

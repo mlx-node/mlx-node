@@ -12,8 +12,8 @@ use mlx_paged_attn::{ColdCacheBlock, ColdCacheFingerprint, ColdGroup, ColdObject
 use super::ladder::Kind;
 use super::paged::PageGeometry;
 use super::persist::{
-    Disk, Identity, MINIMUM_ROWS, chain, disk_plan, fingerprint, identity_text, segment_key,
-    segments_at,
+    Disk, FLAT_RUN, Identity, MINIMUM_ROWS, chain, disk_plan, fingerprint, identity_text,
+    segment_key, segments_at,
 };
 use super::persist_codec::{StateShape, block_layout, join_block, split_block};
 use super::persist_writer::Telemetry;
@@ -319,6 +319,94 @@ fn a_block_round_trips_through_a_temporary_tier() {
         assert_eq!(a.keys, b.keys);
         assert_eq!(a.values, b.values);
     }
+    drop(disk);
+}
+
+/// A flat restore reads a chain back a run at a time, rows and pooled keys
+/// in chain order, and a block missing from the tier ends the runs as a
+/// failure. Needs Metal for the arrays.
+#[test]
+fn block_runs_read_a_chain_back_in_runs() {
+    let root = Temp::new();
+    let options = DiskTierOptions {
+        temp_root: Some(root.0.clone()),
+        ..DiskTierOptions::from_load(Some(&(1u64 << 30).to_string()), false, None).unwrap()
+    };
+    let shape = StateShape::of(&super::tests_model::tiny_cfg(), false).unwrap();
+    let tier = open_disk_tier(&options, || None, shape.span_bytes()).unwrap();
+    let manager = Arc::clone(&tier.manager);
+    let fp = tier.state_fingerprint;
+    let disk = Disk::open(tier, Arc::new(Telemetry::default()), shape, PAGE).unwrap();
+    let half = PAGE.half as usize;
+    let pooled_len = (PAGE.index_rows * PAGE.index_dim) as usize;
+    let n = FLAT_RUN + 1;
+    let t = tokens(n * BLOCK_ROWS);
+    let keys = chain(ColdGroup::Kv, fp, &t, &[], 0, n);
+    let bit = |b: usize, l: usize, i: usize| 0x3C00 | ((b * 131 + l * 17 + i) % 1024) as u16;
+    for (b, &key) in keys.iter().enumerate() {
+        let layers = (0..PAGE.layers as usize)
+            .map(|l| {
+                let latent: Vec<u16> = (0..BLOCK_ROWS * 2 * half).map(|i| bit(b, l, i)).collect();
+                let pooled: Vec<u16> = (0..pooled_len).map(|i| bit(b, l, i + 7)).collect();
+                split_block(&latent, &pooled, half)
+            })
+            .collect();
+        let block = ColdCacheBlock {
+            key,
+            fingerprint: fp,
+            tokens: t[b * BLOCK_ROWS..(b + 1) * BLOCK_ROWS].to_vec(),
+            layout: block_layout(&PAGE),
+            layers,
+        };
+        let left = manager
+            .offer(
+                ColdObject::Block(block),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        assert!(left.is_none());
+    }
+    assert!(manager.drain(Duration::from_secs(5)));
+    let mut runs = disk.block_runs(&t, &[], 0, n * BLOCK_ROWS).unwrap();
+    let read: Vec<_> = runs.by_ref().collect();
+    assert!(!runs.failed());
+    assert_eq!(read.len(), 2);
+    let mut first = 0;
+    for run in &read {
+        assert_eq!(run.len(), PAGE.layers as usize);
+        let blocks = run[0].0.shape_at(0).unwrap() as usize / BLOCK_ROWS;
+        for (l, (rows, pooled)) in run.iter().enumerate() {
+            assert_eq!(rows.shape_at(1).unwrap(), 2 * half as i64);
+            let rows = rows.to_uint16_native().unwrap();
+            let pooled = pooled.to_uint16_native().unwrap();
+            for b in 0..blocks {
+                let at = b * BLOCK_ROWS * 2 * half;
+                let want: Vec<u16> = (0..BLOCK_ROWS * 2 * half)
+                    .map(|i| bit(first + b, l, i))
+                    .collect();
+                assert_eq!(
+                    rows[at..at + want.len()],
+                    want[..],
+                    "block {} layer {l}",
+                    first + b
+                );
+                let at = b * pooled_len;
+                let want: Vec<u16> = (0..pooled_len).map(|i| bit(first + b, l, i + 7)).collect();
+                assert_eq!(
+                    pooled[at..at + pooled_len],
+                    want[..],
+                    "block {} layer {l}",
+                    first + b
+                );
+            }
+        }
+        first += blocks;
+    }
+    assert_eq!(first, n);
+    assert!(manager.remove(&keys[FLAT_RUN]));
+    let mut runs = disk.block_runs(&t, &[], 0, n * BLOCK_ROWS).unwrap();
+    assert_eq!(runs.by_ref().count(), 1);
+    assert!(runs.failed());
     drop(disk);
 }
 

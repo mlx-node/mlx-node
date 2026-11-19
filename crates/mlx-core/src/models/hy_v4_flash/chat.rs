@@ -32,9 +32,10 @@ use napi_derive::napi;
 use super::finalize::{self, Hy4Tags};
 use super::ladder::{Kind, Ladder};
 use super::mtp::{LagRunner, Lagged, MtpLayer};
-use super::persist::{self, Disk, FlatTier, Restored};
+use super::persist::{self, BlockRuns, Disk, FlatTier};
 use super::persist_writer::{Closer, Telemetry};
 use super::prefill::{Driver, Grid, Plan, Prefilled, Runner, Seq};
+use super::prefix_state::PrefixState;
 use super::sched::{self, Paged, pass_keys};
 use super::spec;
 use super::stats::{self, Counters, Line, WaveLog, Waves};
@@ -340,6 +341,9 @@ pub(crate) struct Inner {
     pub(super) telemetry: Arc<Telemetry>,
     /// The paged mode's decode waves.
     pub(super) waves: WaveLog,
+    /// The bank's counters when serving began; `residencyInfo` counts from
+    /// here.
+    pub(super) served_from: Counters,
 }
 
 impl Drop for Inner {
@@ -430,6 +434,7 @@ impl Inner {
             flat: None,
             telemetry: Arc::new(Telemetry::default()),
             waves: WaveLog::default(),
+            served_from: Counters::default(),
         };
         inner.publish(None);
         Ok(inner)
@@ -475,15 +480,9 @@ impl Inner {
         let Some((_, prompt)) = f.found_prompt(tokens) else {
             return Ok((None, None));
         };
-        let filled = f.restore().and_then(|(row, keys, r)| {
-            match filled_seq(&self.store, self.mtp.as_ref(), &prompt[..row], &r) {
-                Ok(seq) => Some((seq, keys)),
-                Err(e) => {
-                    tracing::warn!("hy_v4_flash stored state at {row}: {}", e.reason);
-                    None
-                }
-            }
-        });
+        let (store, mtp) = (&self.store, self.mtp.as_ref());
+        let filled =
+            f.restore(|row, state, runs| filled_seq(store, mtp, &prompt[..row], state, runs));
         match filled {
             Some((seq, keys)) => {
                 f.restored();
@@ -524,7 +523,7 @@ impl Inner {
         let switches = self.store.lease.switches().len() as u32;
         let cache_slots = self.store.cache_slots();
         let in_turn = self.in_turn;
-        let counters = Counters::now(&self.store.bank, &self.store.table);
+        let counters = Counters::now(&self.store.bank, &self.store.table).since(&self.served_from);
         let waves = self.waves.waves;
         let prefix = match (&self.paged, &self.flat) {
             (Some(p), _) => p.counts(),
@@ -897,15 +896,17 @@ fn new_seq(store: &Store, mtp: Option<&MtpLayer>) -> Result<Lagged> {
     Ok(Lagged::new(trunk, mtp.map(|m| m.new_draft(store.ctx))))
 }
 
-/// A new sequence holding the stored state `r` of `tokens`.
+/// A new sequence holding the stored `state` of `tokens`, its blocks read
+/// from `runs`.
 fn filled_seq(
     store: &Store,
     mtp: Option<&MtpLayer>,
     tokens: &[u32],
-    r: &Restored,
+    state: &PrefixState,
+    runs: &mut BlockRuns<'_>,
 ) -> Result<Lagged> {
     let mut seq = new_seq(store, mtp)?;
-    seq.fill(tokens, &r.state, &r.latent, &r.pooled)?;
+    seq.fill(tokens, state, runs)?;
     Ok(seq)
 }
 
@@ -1004,7 +1005,7 @@ pub struct HyV4FlashResidencyInfo {
     /// States not written or dropped (chain incomplete, room, a failed
     /// write, a closed cache), and copies the writer refused.
     pub prefix_disk_refused: f64,
-    /// States read back from disk into memory.
+    /// Turns that resumed from a state read back from disk.
     pub prefix_disk_restored: f64,
     /// States a persistent cache took back at load: on disk only until a
     /// turn reads one back.
@@ -1119,10 +1120,7 @@ impl HyV4FlashModel {
                     Some(_) => {
                         let (mut state, warmup) =
                             crate::engine::warmup::serving_scheduler(inner, &cell, true)?;
-                        if let Some(disk) = held {
-                            sched::attach_disk(&mut state.inner, disk);
-                            state.inner.publish(None);
-                        }
+                        sched::serve(&mut state.inner, held);
                         (Engine::Paged(Box::new(state)), warmup)
                     }
                     None => (Engine::Flat(Box::new(inner)), None),

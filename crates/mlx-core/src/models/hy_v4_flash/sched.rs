@@ -1480,6 +1480,11 @@ impl Inner {
             p.owners.activate(seq, || Ok(cell))?;
             p.states.touch(id);
             p.restored += 1;
+            if from_disk == Some(id)
+                && let Some(disk) = p.disk.as_ref()
+            {
+                disk.restored();
+            }
             depth
         } else {
             expected
@@ -2558,7 +2563,7 @@ impl HybridSchedulerBackend for Inner {
 /// The paged mode with `serial` off and a wave row cap that holds a padded
 /// call, else the flat mode; `disk` serves the mode's stored states.
 /// The mode's pool or the flat states over `disk`; a paged load hands its
-/// disk back for [`attach_disk`] once its warm-up ran.
+/// disk back for [`serve`] once its warm-up ran.
 pub(crate) fn attach(inner: &mut Inner, serial: bool, disk: Option<Disk>) -> Result<Option<Disk>> {
     if paged_mode(serial, inner.store.row_cap) {
         inner.paged = Some(Paged::open(&inner.store)?);
@@ -2570,12 +2575,36 @@ pub(crate) fn attach(inner: &mut Inner, serial: bool, disk: Option<Disk>) -> Res
     Ok(None)
 }
 
-/// The paged pool's blocks and RAM states over `disk`, a persistent tier's
-/// states taken back.
-pub(crate) fn attach_disk(inner: &mut Inner, disk: Disk) {
-    if let Some(p) = inner.paged.as_mut()
-        && let Err(e) = p.attach_disk(disk)
-    {
-        tracing::warn!("hy_v4_flash: stored states stay in memory: {}", e.reason);
+/// The paged load after its warm-up: the counters start over, the pool's
+/// blocks and RAM states go over `held`, a persistent tier's states taken
+/// back.
+pub(crate) fn serve(inner: &mut Inner, held: Option<Disk>) {
+    inner.waves = stats::WaveLog::default();
+    inner.served_from = Counters::now(&inner.store.bank, &inner.store.table);
+    if let Some(p) = inner.paged.as_mut() {
+        p.published = 0;
+        p.restored = 0;
+        if let Err(e) = spend_cold_skip(&mut p.adapter) {
+            tracing::warn!("hy_v4_flash: {}", e.reason);
+        }
+        if let Some(disk) = held
+            && let Err(e) = p.attach_disk(disk)
+        {
+            tracing::warn!("hy_v4_flash: stored states stay in memory: {}", e.reason);
+        }
     }
+    inner.publish(None);
+}
+
+/// The warm-up's command reset armed the adapter to skip its next cold
+/// restore, which would drop the first stored state read back from disk:
+/// one empty lookup with no request live takes that skip.
+fn spend_cold_skip(adapter: &mut PagedKVCacheAdapter) -> Result<()> {
+    if !adapter.live_seq_ids().is_empty() {
+        return Ok(());
+    }
+    adapter.begin_request(0).map_err(bad)?;
+    let looked = adapter.find_cached_prefix_per_block(&[], &[], 0, true);
+    adapter.release_request_for(0).map_err(bad)?;
+    looked.map(|_| ()).map_err(bad)
 }

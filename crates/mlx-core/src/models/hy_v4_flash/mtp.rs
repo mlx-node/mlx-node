@@ -757,14 +757,13 @@ impl Lagged {
     }
 
     /// Fills an empty sequence with a stored state of `tokens`: the trunk
-    /// from `state`'s layers and the indexed layers' `latent` / `pooled`
-    /// rows, the draft from its MTP part. On error the sequence is empty.
+    /// from `state`'s layers and the indexed layers' rows of `runs`, the
+    /// draft from its MTP part. On error the sequence is empty.
     pub fn fill(
         &mut self,
         tokens: &[u32],
         state: &PrefixState,
-        latent: &[MxArray],
-        pooled: &[MxArray],
+        runs: &mut dyn Iterator<Item = Vec<(MxArray, MxArray)>>,
     ) -> Result<()> {
         if state.row != tokens.len() {
             return Err(bad(format!(
@@ -777,7 +776,7 @@ impl Lagged {
             (None, None) | (Some(_), Some(_)) => {}
             _ => return Err(Self::mismatch()),
         }
-        self.trunk.fill(tokens, &state.layers, latent, pooled)?;
+        self.trunk.fill(tokens, &state.layers, runs)?;
         if let (Some(d), Some(ds)) = (self.draft.as_mut(), &state.draft)
             && let Err(e) = fill_draft(d, ds)
         {

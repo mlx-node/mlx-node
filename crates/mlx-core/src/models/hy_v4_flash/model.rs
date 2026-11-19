@@ -19,7 +19,7 @@ use napi::{Error, Result};
 
 use super::batch::{Core, Group, Op, Owners, Wave, group};
 use super::block::{Block, EngramIn, LayerState};
-use super::cache::{LayerCache, WindowRing};
+use super::cache::{LatentBuf, LayerCache, WindowRing};
 use super::config::HyV4FlashConfig;
 use super::engram::{Hasher, keeps};
 use super::indexer::{IndexerMark, IndexerState};
@@ -211,6 +211,14 @@ pub fn call_engram_rows(
     hasher.call_rows(&ctx, k)
 }
 
+/// The latent rows and the indexer of indexed layer `l`.
+fn latent_of(st: &mut LayerState, l: usize) -> Result<(&mut LatentBuf, &mut IndexerState)> {
+    match (&mut st.cache, st.index.as_mut()) {
+        (LayerCache::Latent(buf), Some(ix)) => Ok((buf, ix)),
+        _ => Err(bad(format!("layer {l} is not indexed"))),
+    }
+}
+
 /// Whether `IndexerState::truncate(len)` keeps the open `tok_k` rows it
 /// needs (the refusal rule of `indexer.rs` `truncate`).
 fn index_keeps(st: &IndexerState, len: usize, kpool: usize) -> bool {
@@ -358,15 +366,14 @@ impl Session {
 
     /// Fills an empty session with the `tokens` of a stored state: every
     /// sliding layer gets its ring of `layers`, every indexed layer (in
-    /// trunk order) its latent rows `latent[i] [b, width]`, its pooled keys
-    /// `pooled[i] [b / kpool, d]` and its tail. On error the session stays
-    /// empty.
+    /// trunk order) its latent rows and pooled keys from `runs`, one
+    /// `(rows [n, width], keys [n / kpool, d])` per indexed layer each, and
+    /// its tail. On error the session stays empty.
     pub fn fill(
         &mut self,
         tokens: &[u32],
         layers: &[StateLayer],
-        latent: &[MxArray],
-        pooled: &[MxArray],
+        runs: &mut dyn Iterator<Item = Vec<(MxArray, MxArray)>>,
     ) -> Result<()> {
         let b = tokens.len();
         if !self.tokens.is_empty() || b == 0 || b > self.cap {
@@ -383,7 +390,7 @@ impl Session {
                 self.layers.len()
             )));
         }
-        let out = self.fill_layers(b, layers, latent, pooled);
+        let out = self.fill_layers(b, layers, runs);
         if out.is_err() {
             for st in &mut self.layers {
                 let _ = st.cache.truncate(0);
@@ -403,36 +410,44 @@ impl Session {
         &mut self,
         b: usize,
         layers: &[StateLayer],
-        latent: &[MxArray],
-        pooled: &[MxArray],
+        runs: &mut dyn Iterator<Item = Vec<(MxArray, MxArray)>>,
     ) -> Result<()> {
-        let mut at = 0;
+        let mut indexed = Vec::new();
         for (l, (st, part)) in self.layers.iter_mut().zip(layers).enumerate() {
-            match (&mut st.cache, st.index.as_mut(), part) {
+            match (&mut st.cache, st.index.as_ref(), part) {
                 (LayerCache::Window(r), None, StateLayer::Window(s)) if s.len() == b => {
                     *r = s.clone();
                 }
-                (LayerCache::Latent(buf), Some(ix), StateLayer::Tail(t)) if t.len() == b => {
-                    let (rows, keys) = match (latent.get(at), pooled.get(at)) {
-                        (Some(r), Some(k)) => (r, k),
-                        _ => return Err(bad(format!("layer {l}: no latent rows to fill"))),
-                    };
-                    at += 1;
-                    if rows.shape_at(0)? as usize != b {
-                        return Err(bad(format!("layer {l}: latent rows for another row")));
-                    }
-                    buf.write(rows, 0)?;
-                    let keys = (keys.shape_at(0)? > 0).then_some(keys);
-                    ix.fill(keys, t.clone())?;
+                (LayerCache::Latent(_), Some(_), StateLayer::Tail(t)) if t.len() == b => {
+                    indexed.push((l, t));
                 }
                 _ => return Err(bad(format!("layer {l}: the state is not of this model"))),
             }
         }
-        if at != latent.len() || at != pooled.len() {
-            return Err(bad(format!(
-                "{} latent row sets for {at} indexed layers",
-                latent.len()
-            )));
+        for run in runs {
+            if run.len() != indexed.len() {
+                return Err(bad(format!(
+                    "{} latent row sets for {} indexed layers",
+                    run.len(),
+                    indexed.len()
+                )));
+            }
+            for (&(l, _), (rows, keys)) in indexed.iter().zip(&run) {
+                let (buf, ix) = latent_of(&mut self.layers[l], l)?;
+                let at = buf.len();
+                buf.write(rows, at)?;
+                ix.append_pooled(keys)?;
+            }
+        }
+        for (l, t) in indexed {
+            let (buf, ix) = latent_of(&mut self.layers[l], l)?;
+            if buf.len() != b {
+                return Err(bad(format!(
+                    "layer {l}: latent rows end at {} of {b}",
+                    buf.len()
+                )));
+            }
+            ix.close_fill(t.clone())?;
         }
         Ok(())
     }

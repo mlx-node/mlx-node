@@ -416,8 +416,9 @@ and `residencyInfo().prefixDisk*` are its readers. What differs:
   layout, so either mode can read what the other wrote.
 - Restore: in paged mode the adapter's cold walk restores blocks only below a
   stored state's row, never a KV-only prefix. In flat mode a prompt past the
-  RAM ladder's reach reads the deepest stored state of the prompt back, with
-  its blocks into the latent and pooled rows.
+  RAM ladder's reach reads the deepest stored state of the prompt back, its
+  blocks 32 at a time straight into the latent and pooled rows, so a restore
+  holds one run of host copies (about 15 MB), not the whole chain.
 - The turn state at the end of a paged turn publishes under write-path keys,
   so only the same conversation hits it, on disk as in RAM.
 - Size: a block is 466,944 bytes (14,592 per token), so a 256K conversation
@@ -426,7 +427,10 @@ and `residencyInfo().prefixDisk*` are its readers. What differs:
   Next namespaces sooner.
 - The proof is the same: `stateTier: "persistent"` on the turn's trace row,
   then `prefixDiskAdopted > 0` and `prefixDiskRestored > 0` after a restart.
-  The restart gate on real weights has not run yet.
+  `prefixDiskRestored` counts a state only once its blocks landed, and the
+  first matching turn after the load restores: the load warm-up's reset does
+  not make it prefill. The `residencyInfo()` counters start after the
+  warm-up. The restart gate on real weights has not run yet.
 
 The allowlist is enforced **natively**, not only in the agent:
 `cold_tier::resolve_persist_cold` consults `cold_restore_supported(model_type)`

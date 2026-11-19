@@ -4833,7 +4833,7 @@ export interface HyV4FlashResidencyInfo {
    * write, a closed cache), and copies the writer refused.
    */
   prefixDiskRefused: number;
-  /** States read back from disk into memory. */
+  /** Turns that resumed from a state read back from disk. */
   prefixDiskRestored: number;
   /**
    * States a persistent cache took back at load: on disk only until a
