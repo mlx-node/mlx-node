@@ -383,6 +383,22 @@ fn lanes_charge_their_floor() {
     );
 }
 
+/// A lane past the first with the MTP layer also holds its draft's pooled
+/// keys for the whole context (f16, one row per group).
+/// Mutation: `lane_bytes` returns `lane_floor` → red.
+#[test]
+fn lane_bytes_price_the_draft_pooled_keys() {
+    let cfg = crate::models::hy_v4_flash::tests_model::tiny_cfg();
+    for ctx in [0, 64, 262_144] {
+        assert_eq!(lane_bytes(&cfg, false, ctx), lane_floor(&cfg, false));
+        assert_eq!(
+            lane_bytes(&cfg, true, ctx),
+            lane_floor(&cfg, true) + (ctx / 4) as u64 * 16 * 2,
+            "ctx {ctx}"
+        );
+    }
+}
+
 /// The most lanes that admit win; one lane's refusal is the error.
 #[test]
 fn plan_lanes_steps_down_to_what_fits() {

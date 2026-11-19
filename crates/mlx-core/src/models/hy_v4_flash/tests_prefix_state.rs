@@ -229,6 +229,25 @@ fn lookup_takes_the_deepest_cached_prefix() {
     assert_eq!(st.ram_len(), 0);
 }
 
+/// A reclaim gives up RAM copies in eviction order (checkpoints first, then
+/// the least recently used) only until the shortfall is free.
+/// Mutation: `reclaim` clears every state → red.
+#[test]
+fn reclaim_frees_the_shortfall_only() {
+    let mut st = States::<Fake>::new();
+    for n in 1..=4 {
+        publish(&mut st, &lineage(n, 1), Kind::Prompt, 100 * u64::from(n)).unwrap();
+    }
+    assert_eq!(st.held_bytes(), 1000);
+    assert_eq!(st.reclaim(0), 0);
+    assert_eq!(st.reclaim(150), 300);
+    assert_eq!(st.ram_len(), 2);
+    assert_eq!(st.held_bytes(), 700);
+    assert_eq!(st.reclaim(10_000), 700);
+    assert_eq!(st.ram_len(), 0);
+    assert_eq!(st.reclaim(1), 0);
+}
+
 /// Shared parts count once in the held bytes; off-block rows are refused.
 #[test]
 fn held_bytes_count_shared_parts_once() {

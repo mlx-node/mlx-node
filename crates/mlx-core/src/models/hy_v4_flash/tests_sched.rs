@@ -13,7 +13,7 @@ use super::chat::{MTP_DEPTH_MAX, generation_defaults, resolve};
 use super::prefill::{BLOCK_ROWS, Grid, NEAR_EVERY};
 use super::sched::{
     Busy, Edge, Requests, SafePoint, lanes, napi_concurrency, paged_mode, pass_keys, preempt,
-    prefill_ends,
+    prefill_ends, slice_breaks,
 };
 use crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for;
 use crate::engine::types::ChatConfig;
@@ -87,6 +87,29 @@ fn prefill_ends_are_grid_ends_and_state_rows() {
             .collect::<Vec<_>>()
     );
     assert!(prefill_ends(&g, &p, 19_999, 0).is_none());
+}
+
+/// The engine's slice ends are the turn's grid ends for its prompt; any
+/// other prompt (or none) is cut at every chunk multiple past the cached
+/// rows, never at the cached row itself.
+/// Mutation: `slice_breaks` ignores `prompt` → red.
+#[test]
+fn slice_breaks_follow_the_turn_grid_else_the_chunk() {
+    let g = grid(2048);
+    let p = prompt(20_000, 19_000);
+    assert_eq!(
+        slice_breaks(&g, Some(&p), 20_000, 0),
+        prefill_ends(&g, &p, 20_000, 0).unwrap()
+    );
+    assert_eq!(
+        slice_breaks(&g, Some(&p), 20_000, 8192),
+        prefill_ends(&g, &p, 20_000, 8192).unwrap()
+    );
+    let chunked: Vec<u32> = (1..=9).map(|k| k * 2048).collect();
+    assert_eq!(slice_breaks(&g, Some(&p), 19_999, 0), chunked);
+    assert_eq!(slice_breaks(&g, None, 20_000, 0), chunked);
+    assert_eq!(slice_breaks(&g, None, 20_000, 4096), chunked[2..].to_vec());
+    assert_eq!(slice_breaks(&g, None, 5000, 4500), Vec::<u32>::new());
 }
 
 /// A block's key is the chunk that wrote it: equal for two prompts that

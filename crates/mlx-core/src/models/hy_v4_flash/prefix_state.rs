@@ -336,6 +336,19 @@ impl<S: Stored> States<S> {
         }
     }
 
+    /// Gives up RAM copies in eviction order until `shortfall` bytes are
+    /// free or none is left to give; the bytes freed.
+    pub fn reclaim(&mut self, shortfall: u64) -> u64 {
+        let before = self.held_bytes();
+        while before.saturating_sub(self.held_bytes()) < shortfall {
+            let Some(id) = self.victim() else {
+                break;
+            };
+            self.evict(id);
+        }
+        before.saturating_sub(self.held_bytes())
+    }
+
     /// Publishes `state` at the end of `lineage` (whole blocks). The oldest
     /// RAM copy goes when `RAM_STATES` are held; `None` when every held one
     /// is in use. A state already on that block is reused.

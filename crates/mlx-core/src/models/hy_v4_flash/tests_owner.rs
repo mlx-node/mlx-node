@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use super::cache::WINDOW_SLACK;
 use super::config::{Attn, HyV4FlashConfig};
 use super::indexer::{IndexerGeometry, PagedIndexerState, TokTail};
 use super::mtp::Draft;
@@ -186,8 +187,9 @@ fn states_need_a_block_row_and_a_settled_draft() {
 /// A state at row 64 with the MTP layer: one seed row, one segment shared
 /// by every state of the cell, 31 open rows; a cell made from it holds the
 /// same lengths and MTP rows, and the seed of row 63 only. Two states held
-/// count the segment once.
-/// Mutation: `draft_state` copies segments on every call → red (ptr_eq).
+/// count the segment once; the cell holds none of it.
+/// Mutation: `draft_state` copies segments on every call → red (ptr_eq);
+/// the cell keeps a strong segment → red (strong count, cell bytes).
 #[test]
 fn state_round_trip_with_the_draft() {
     let cfg = tiny_cfg();
@@ -196,12 +198,15 @@ fn state_round_trip_with_the_draft() {
     let mut cell = OwnerCell::new(&cfg, Some(draft(&cfg))).unwrap();
     grow(&cfg, &mut cell, &history);
     settle(&cfg, cell.draft_mut().unwrap(), 63);
+    let bare = cell.nbytes();
     let s = cell.state().unwrap().unwrap();
     let again = cell.state().unwrap().unwrap();
+    assert_eq!(cell.nbytes(), bare);
     let (d, d2) = (s.draft.as_ref().unwrap(), again.draft.as_ref().unwrap());
     assert_eq!(d.seed.shape().unwrap().as_ref(), &[1, cfg.dim as i64]);
     assert_eq!(d.segments.len(), 1);
     assert!(Arc::ptr_eq(&d.segments[0], &d2.segments[0]));
+    assert_eq!(Arc::strong_count(&d.segments[0]), 2);
     assert_eq!(d.rows().unwrap(), 63);
     assert_eq!(d.tail.len(), 63);
     assert!(s.layers.iter().all(|l| match l {
@@ -237,4 +242,44 @@ fn state_round_trip_with_the_draft() {
     st.publish(Key::text(&other, 1), again, super::ladder::Kind::Prompt)
         .unwrap();
     assert_eq!(st.held_bytes(), b1 + b2 - seg);
+}
+
+/// A step past the window slack cannot be truncated away: with the mark
+/// taken before it, a failed step and a cut back to its start both restore
+/// the cell (lengths, held rows, recent ids, draft); a step a truncate can
+/// drop holds no mark.
+/// Mutation: `hold_mark` keeps no mark → red; `rewind` ignores the mark →
+/// red.
+#[test]
+fn a_step_past_the_slack_goes_back_to_its_mark() {
+    let cfg = tiny_cfg();
+    let history = ids(28, 10);
+    let mut cell = OwnerCell::new(&cfg, Some(draft(&cfg))).unwrap();
+    grow(&cfg, &mut cell, &history[..20]);
+    settle(&cfg, cell.draft_mut().unwrap(), 19);
+    let before = (lens(&cell), cell.recent().to_vec(), cell.len());
+
+    cell.hold_mark(8);
+    grow(&cfg, &mut cell, &history[20..]);
+    assert!(cell.rewind(20, &history));
+    assert_eq!((lens(&cell), cell.recent().to_vec(), cell.len()), before);
+    assert_eq!(cell.draft().unwrap().len(), 19);
+    assert!(cell.draft().unwrap().seed(19).is_some());
+
+    cell.hold_mark(8);
+    grow(&cfg, &mut cell, &history[20..]);
+    cell.truncate(20, &history).unwrap();
+    assert_eq!((lens(&cell), cell.recent().to_vec(), cell.len()), before);
+
+    cell.hold_mark(8);
+    grow(&cfg, &mut cell, &history[20..]);
+    cell.drop_mark();
+    assert!(cell.truncate(20, &history).is_err());
+    assert!(!cell.rewind(20, &history));
+
+    let mut plain = OwnerCell::new(&cfg, None).unwrap();
+    grow(&cfg, &mut plain, &history[..20]);
+    plain.hold_mark(WINDOW_SLACK);
+    grow(&cfg, &mut plain, &history[20..28]);
+    assert!(plain.truncate(20, &history).is_err());
 }

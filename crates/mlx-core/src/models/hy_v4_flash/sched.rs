@@ -8,8 +8,10 @@
 //!          quota at the next safe point; last close = end_turn (promote, volatile, lease off)
 //! step  ─► safe point (promote staged copies, seed reset, readmit every READMIT_EVERY steps)
 //!       ─► wave: record rows, slot maps, `Model::wave` (Q8 fused, cores per owner), MTP lag
-//! slice ─► prefill chunks on the grid ends (C multiples + state rows); a state row of a
+//! slice ─► one slice per step beside the decode rows, outside the engine's row budget,
+//!          ending at the turn's grid ends (C multiples + state rows); a state row of a
 //!          cold-equivalent turn registers its blocks and publishes the owner's state
+//! fail  ─► a step past the window slack restores the cell's mark; a shorter one truncates
 //! admit ─► live cell continues │ RAM state + cached chain resumes │ cold
 //! preempt ─► blocks back unpublished, cell dropped; the replay resumes from a stored state
 //! MTP   ─► reserve (decode row of each lane) ─► propose (drafts in lane order, up to
@@ -37,19 +39,21 @@ use super::paged::{BLOCK, PageGeometry, SlotMap, create};
 use super::prefill::{BLOCK_ROWS, Grid};
 use super::prefix_state::{Key, States, Turn};
 use super::spec::{self, LOOKAHEAD_MAX};
-use super::store::{LADDER_BYTES, Store, kv_per_token, lane_floor};
+use super::store::{LADDER_BYTES, Store, kv_per_token, lane_bytes};
 use crate::array::{DType, MxArray};
+use crate::cache_limit::{PoolCacheLimitGuard, coordinator};
 use crate::engine::backend::{DsparkProposal, PagedBackend, PagedPrefix, PagedSpeculativeArgs};
 use crate::engine::governor::governor::MemoryAccounts;
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridStepExecutor, NoRestoreTicket, ScheduledStateCapacity,
-    ScheduledVerifyCommit, ScheduledVerifyRow, SchedulerOwnerContext, scheduler_max_num_seqs_for,
+    HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, NoRestoreTicket,
+    ScheduledStateCapacity, ScheduledVerifyCommit, ScheduledVerifyRow, SchedulerOwnerContext,
+    StepClaims, scheduler_max_num_seqs_for,
 };
 use crate::engine::mtp_turn::{MtpTurnArgs, run_mtp_turn, turn_lookahead_rows};
 use crate::engine::paged_epilogue::FinalTokenPolicy;
 use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
 use crate::engine::params::ChatParams;
-use crate::engine::scheduler::PreemptionMode;
+use crate::engine::scheduler::{PreemptionMode, StepPlan};
 use crate::stream::{Stream, StreamContext};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 
@@ -105,6 +109,27 @@ pub fn prefill_ends(
     grid.ends(cached as usize, prompt)
         .into_iter()
         .map(|e| u32::try_from(e).ok())
+        .collect()
+}
+
+/// The engine's pinned slice ends of a prompt of `prompt_tokens` past
+/// `cached`: `prompt`'s grid ends when it is that prompt, else every
+/// multiple of `grid`'s chunk.
+pub fn slice_breaks(
+    grid: &Grid,
+    prompt: Option<&[u32]>,
+    prompt_tokens: u32,
+    cached: u32,
+) -> Vec<u32> {
+    if let Some(ends) = prompt.and_then(|p| prefill_ends(grid, p, prompt_tokens, cached)) {
+        return ends;
+    }
+    let chunk = grid.chunk().max(1) as u64;
+    let (from, to) = (u64::from(cached), u64::from(prompt_tokens));
+    (from / chunk + 1..)
+        .map(|k| k * chunk)
+        .take_while(|&e| e < to)
+        .filter_map(|e| u32::try_from(e).ok())
         .collect()
 }
 
@@ -413,6 +438,7 @@ pub struct Paged {
     pub published: u64,
     pub restored: u64,
     pub spec: Spec,
+    _pool: PoolCacheLimitGuard,
 }
 
 impl Paged {
@@ -425,6 +451,7 @@ impl Paged {
         let blocks = store.ctx.div_ceil(BLOCK as usize) + lanes + 1;
         let blocks = u32::try_from(blocks).map_err(|_| bad("pool blocks exceed u32"))?;
         let adapter = create(&g, store.ctx, blocks, blocks, u64::MAX)?;
+        let pool = coordinator().register_pool(block_bytes(&adapter));
         Ok(Self {
             adapter,
             owners: Owners::new(),
@@ -438,16 +465,13 @@ impl Paged {
             published: 0,
             restored: 0,
             spec: Spec::default(),
+            _pool: pool,
         })
     }
 
     /// Bytes of the pool's blocks.
     pub fn pool_bytes(&self) -> u64 {
-        let blocks = self
-            .adapter
-            .block_telemetry()
-            .map_or(0, |t| u64::from(t.total_blocks));
-        blocks * self.adapter.bytes_per_block().unwrap_or(0)
+        block_bytes(&self.adapter)
     }
 
     /// Bytes outside the pool: owner cells and RAM states.
@@ -458,6 +482,14 @@ impl Paged {
     fn live_tokens(&self, seq: SeqId) -> &[u32] {
         self.adapter.request_tokens_for(seq).unwrap_or(&[])
     }
+}
+
+/// Bytes of `adapter`'s blocks.
+fn block_bytes(adapter: &PagedKVCacheAdapter) -> u64 {
+    let blocks = adapter
+        .block_telemetry()
+        .map_or(0, |t| u64::from(t.total_blocks));
+    blocks * adapter.bytes_per_block().unwrap_or(0)
 }
 
 /// An empty owner cell, with an empty draft when the MTP layer is loaded.
@@ -639,19 +671,6 @@ impl Run<'_> {
     }
 }
 
-/// Puts every trunk part of `cell` back to `len` positions after a failed
-/// step; false when a part no longer holds them (the cell is lost).
-fn rewind(cell: &mut OwnerCell, len: usize, history: &[u32]) -> bool {
-    if cell.len() > len {
-        return cell.truncate(len, history).is_ok();
-    }
-    cell.layers_mut().iter_mut().all(|p| match p {
-        CellLayer::Window(r) if r.len() > len => r.truncate(len).is_ok(),
-        CellLayer::Index(ix) if ix.len() > len => ix.truncate(len).is_ok(),
-        _ => true,
-    })
-}
-
 /// Drops `seq`'s request, cell and plans after a step it cannot go back
 /// from; `active` when it was the active owner.
 fn lose(p: &mut Paged, seq: SeqId, active: bool) {
@@ -703,7 +722,7 @@ impl Inner {
 
     /// Runs one step over `rows` (distinct owners) with the cells out of the
     /// table. On error every owner goes back to its start; an owner whose
-    /// cell cannot is released.
+    /// cell cannot is released. A verify owner keeps its mark until its cut.
     fn wave_rows(
         &mut self,
         rows: &[Rows<'_>],
@@ -719,12 +738,21 @@ impl Inner {
         } = self;
         let p = paged.as_mut().ok_or_else(no_pool)?;
         let was = p.owners.active();
-        let mut cells = Vec::with_capacity(rows.len());
+        let mut fresh = Vec::with_capacity(rows.len());
         for r in rows {
-            let cell = match p.owners.take(r.seq) {
+            fresh.push(if p.owners.contains(r.seq) {
+                None
+            } else {
+                Some(new_cell(store, mtp.as_ref())?)
+            });
+        }
+        let mut cells = Vec::with_capacity(rows.len());
+        for (r, made) in rows.iter().zip(fresh) {
+            let mut cell = match made.or_else(|| p.owners.take(r.seq)) {
                 Some(c) => c,
-                None => new_cell(store, mtp.as_ref())?,
+                None => return Err(bad(format!("owner {} lost its cell", r.seq))),
             };
+            cell.hold_mark(r.ids.len());
             cells.push(cell);
         }
         let starts: Vec<usize> = cells.iter().map(OwnerCell::len).collect();
@@ -742,10 +770,12 @@ impl Inner {
             if out.is_err() {
                 let n = r.ids.len() as u32;
                 let back = i >= recorded || p.adapter.rollback_last_tokens_for(r.seq, n).is_ok();
-                if !back || !rewind(&mut cell, starts[i], p.live_tokens(r.seq)) {
+                if !back || !cell.rewind(starts[i], p.live_tokens(r.seq)) {
                     lost.push(r.seq);
                     continue;
                 }
+            } else if kind == RowKind::Prefill {
+                cell.drop_mark();
             }
             p.owners.put(r.seq, cell)?;
         }
@@ -762,10 +792,21 @@ impl Inner {
         out
     }
 
-    /// Bank and admission work due before the next step of a busy period.
-    fn safe_point(&mut self) {
+    /// Bank and admission work due before the next step of a busy period:
+    /// a period whose start was refused starts now or fails the step.
+    fn safe_point(&mut self) -> Result<()> {
+        let unleased = self
+            .paged
+            .as_ref()
+            .is_some_and(|p| p.busy.is_live() && !self.in_turn);
+        if unleased {
+            self.begin()?;
+            if let Some(p) = self.paged.as_mut() {
+                p.safe.begun();
+            }
+        }
         let Some(p) = self.paged.as_mut() else {
-            return;
+            return Ok(());
         };
         let due = p.safe.step();
         let kv = p.pool_bytes() + p.state_bytes();
@@ -777,6 +818,7 @@ impl Inner {
         {
             tracing::warn!("hy_v4_flash re-admission check: {}", e.reason);
         }
+        Ok(())
     }
 
     /// Applies a busy-period edge: the lease at a begin and an end, a seed
@@ -868,7 +910,7 @@ impl Inner {
         let mut out = None;
         let mut from = base;
         for end in ends {
-            self.safe_point();
+            self.safe_point()?;
             if cancelled(&self.cancel) {
                 return Err(Error::from_reason(PREFILL_CANCELLED));
             }
@@ -944,7 +986,7 @@ impl Inner {
         if rows.len() > lanes {
             return Err(bad(format!("{} decode rows for {lanes} lanes", rows.len())));
         }
-        self.safe_point();
+        self.safe_point()?;
         let ids: Vec<[u32; 1]> = rows.iter().map(|&(_, t)| [t]).collect();
         let wave: Vec<Rows<'_>> = rows
             .iter()
@@ -1159,14 +1201,17 @@ impl Inner {
             .map(|p| p.pool_bytes() + p.state_bytes())
     }
 
-    /// Bytes outside the pool the admission charged for: every lane's floor,
-    /// the RAM states, and the MTP rows of the admitted context.
+    /// Bytes outside the pool the admission charged for: every lane's
+    /// floor and draft keys, the RAM states, and the MTP rows of the
+    /// admitted context.
     fn state_budget(&self) -> u64 {
         let cfg = self.store.model.cfg();
         let mtp = self.mtp.is_some();
         let lanes = self.paged.as_ref().map_or(1, |p| p.lanes) as u64;
         let mtp_row = kv_per_token(cfg, mtp).saturating_sub(kv_per_token(cfg, false));
-        lanes * lane_floor(cfg, mtp) + LADDER_BYTES + mtp_row * self.store.ctx as u64
+        lanes * lane_bytes(cfg, mtp, self.store.ctx)
+            + LADDER_BYTES
+            + mtp_row * self.store.ctx as u64
     }
 
     /// MTP rows `tokens` adds to a sequence.
@@ -1318,7 +1363,7 @@ impl Inner {
                 rows.len()
             )));
         }
-        self.safe_point();
+        self.safe_point()?;
         for &(seq, _) in rows {
             self.settle(seq)?;
         }
@@ -1337,6 +1382,9 @@ impl Inner {
         let held = p.adapter.request_tokens_for(seq).map_or(0, <[u32]>::len);
         let cell = p.owners.get(seq).map_or(0, OwnerCell::len);
         if held == len && cell == len {
+            if let Some(c) = p.owners.get_mut(seq) {
+                c.drop_mark();
+            }
             return Ok(());
         }
         let cut = if held != cell || len > held {
@@ -1346,8 +1394,13 @@ impl Inner {
         } else {
             Self::cut_rows(p, seq, held - len, len)
         };
-        if cut.is_err() {
-            lose(p, seq, was == Some(seq));
+        match &cut {
+            Ok(()) => {
+                if let Some(c) = p.owners.get_mut(seq) {
+                    c.drop_mark();
+                }
+            }
+            Err(_) => lose(p, seq, was == Some(seq)),
         }
         reactivate(p, was)?;
         cut
@@ -1753,15 +1806,31 @@ impl HybridSchedulerBackend for Inner {
         u32::try_from(self.grid.chunk()).unwrap_or(u32::MAX)
     }
 
-    /// A turn's slices end where a cold prefill of its prompt cuts.
-    fn scheduler_prefill_ends(
-        &self,
-        seq: SeqId,
-        prompt_tokens: u32,
-        cached_prefix: u32,
-    ) -> Option<Vec<u32>> {
-        let plan = self.paged.as_ref()?.turns.get(&seq)?;
-        prefill_ends(&self.grid, &plan.prompt, prompt_tokens, cached_prefix)
+    /// A prefill slice is one chunk a cold prefill of the prompt runs (C
+    /// rows on its grid), outside the engine's step row budget, whatever
+    /// rows the decoding lanes take.
+    fn scheduler_whole_prompt_prefill(&self, _: u32, _: u32) -> bool {
+        self.paged.is_some()
+    }
+
+    /// The slice ends of the active owner's turn: the engine reads them
+    /// right after `prime_prefix_state` ran on that owner.
+    fn extra_prefill_breaks(&self, prompt_tokens: u32, cached_prefix: u32) -> Vec<u32> {
+        let prompt = self.paged.as_ref().and_then(|p| {
+            p.owners
+                .active()
+                .and_then(|seq| p.turns.get(&seq))
+                .map(|t| t.prompt.as_slice())
+        });
+        slice_breaks(&self.grid, prompt, prompt_tokens, cached_prefix)
+    }
+
+    /// A step's rows open the next verify wave.
+    fn claim_step_rows(state: &mut HybridSchedulerState<Self>, plan: &StepPlan) -> StepClaims {
+        if let Some(p) = state.inner.paged.as_mut() {
+            p.spec.budget.close();
+        }
+        StepClaims::granted(plan)
     }
 
     fn scheduler_books_on_demand(&self) -> bool {
@@ -1795,16 +1864,12 @@ impl HybridSchedulerBackend for Inner {
         })
     }
 
-    /// The RAM states go first: owner cells outrank them.
-    fn reclaim_for_scheduled_state(&mut self, _shortfall: u64) -> bool {
-        let Some(p) = self.paged.as_mut() else {
-            return false;
-        };
-        if p.states.held_bytes() == 0 {
-            return false;
-        }
-        p.states.clear();
-        true
+    /// RAM states toward the shortfall, in eviction order: owner cells
+    /// outrank them.
+    fn reclaim_for_scheduled_state(&mut self, shortfall: u64) -> bool {
+        self.paged
+            .as_mut()
+            .is_some_and(|p| p.states.reclaim(shortfall) > 0)
     }
 
     fn scheduled_state_candidate_bytes(&self, seq: SeqId, tokens: u32, _: bool) -> u64 {
@@ -1816,7 +1881,7 @@ impl HybridSchedulerBackend for Inner {
         let floor = if p.owners.contains(seq) {
             0
         } else {
-            lane_floor(cfg, self.mtp.is_some())
+            lane_bytes(cfg, self.mtp.is_some(), self.store.ctx)
         };
         floor + self.draft_bytes(u64::from(tokens).saturating_sub(held))
     }

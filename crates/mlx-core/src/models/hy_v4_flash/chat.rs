@@ -306,7 +306,7 @@ pub(crate) struct Inner {
     tags: Hy4Tags,
     defaults: ModelGenerationDefaults,
     pub(super) cancel: Option<Arc<AtomicBool>>,
-    in_turn: bool,
+    pub(super) in_turn: bool,
     residency: Arc<Mutex<Residency>>,
     turn_stats: Option<TurnStats>,
     /// The paged mode's pool and owners; `None` in flat mode.

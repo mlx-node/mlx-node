@@ -16,10 +16,11 @@
 //! the bank allocates.
 //!
 //! Lanes (sequences decoded together) share one KV allowance sized for the
-//! admitted context; each lane past the first is charged its floor
-//! (`lane_floor`). The context and chunk are picked for one lane; the load
-//! then admits `min(LANES_MAX, MLX_SCHED_MAX_NUM_SEQS)` lanes at them, fewer
-//! when only fewer fit, so lanes never shrink the window or the chunk grid. A decode wave holds at most `row_cap`
+//! admitted context; each lane past the first is charged its floor and its
+//! draft's pooled keys (`lane_bytes`). The context and chunk are picked for
+//! one lane; the load then admits `min(LANES_MAX, MLX_SCHED_MAX_NUM_SEQS,
+//! row_cap)` lanes at them (one when no wave fits), fewer when only fewer
+//! fit, so lanes never shrink the window or the chunk grid. A decode wave holds at most `row_cap`
 //! rows (`row_cap`), the rows its Q8 matrices take through `qmv_wide`.
 //!
 //! A turn is `begin_turn` .. `end_turn` (`Lease`): the start re-admits at the
@@ -140,6 +141,18 @@ pub fn lane_floor(cfg: &HyV4FlashConfig, mtp: bool) -> u64 {
         0
     };
     windows + tails + seeds
+}
+
+/// `lane_floor` and, with `mtp`, the pooled index keys of the draft's MTP
+/// layer for `ctx` positions, which its first write allocates whole: what
+/// one lane past the first adds beside the shared KV allowance.
+pub fn lane_bytes(cfg: &HyV4FlashConfig, mtp: bool, ctx: usize) -> u64 {
+    let pooled = if mtp {
+        (ctx / cfg.indexer.kpool.max(1)) as u64 * cfg.indexer.head_dim as u64 * 2
+    } else {
+        0
+    };
+    lane_floor(cfg, mtp) + pooled
 }
 
 /// The most lanes up to `want` (at least 1) whose admission `admit(lanes)`
@@ -791,7 +804,11 @@ impl Store {
             splitk_min_m(std::env::var(SPLITK_ENV).ok().as_deref()),
             &q8_shapes(&scan, mtp)?,
         )?;
-        let floor = lane_floor(&scan.cfg, mtp);
+        let want = if super::sched::paged_mode(false, row_cap) {
+            super::sched::lanes(opts.lanes, row_cap)
+        } else {
+            1
+        };
         let one_lane = profile(kv_per_token(&scan.cfg, mtp));
         let base = sizes.model(mtp, max_ctx);
         let limits = match &opts.plan {
@@ -812,7 +829,8 @@ impl Store {
                     ctx: one.ctx as u64,
                     ..base
                 };
-                let (lanes, p) = lanes_at(one, opts.lanes, |n| {
+                let floor = lane_bytes(&scan.cfg, mtp, one.ctx);
+                let (lanes, p) = lanes_at(one, want, |n| {
                     let lp = lane_profile(&one_lane, n, floor);
                     admit_with(&lp, &at, one.chunk as u64, l, &h, &own, ws)
                 });
@@ -835,24 +853,12 @@ impl Store {
                 )
             }
             #[cfg(test)]
-            (None, CachePlan::Slots { cache, staging }) => (
-                opts.lanes.max(1),
-                max_ctx,
-                smallest.min(max_ctx),
-                *cache,
-                *staging,
-                None,
-            ),
-            _ => (
-                opts.lanes.max(1),
-                max_ctx,
-                smallest.min(max_ctx),
-                [0, 0],
-                1,
-                None,
-            ),
+            (None, CachePlan::Slots { cache, staging }) => {
+                (want, max_ctx, smallest.min(max_ctx), *cache, *staging, None)
+            }
+            _ => (want, max_ctx, smallest.min(max_ctx), [0, 0], 1, None),
         };
-        let profile = lane_profile(&one_lane, lanes, floor);
+        let profile = lane_profile(&one_lane, lanes, lane_bytes(&scan.cfg, mtp, ctx));
         // the re-admission charges the rows the load admitted, the env only
         // lowers the chunk the driver runs
         let rows = admitted as u64;

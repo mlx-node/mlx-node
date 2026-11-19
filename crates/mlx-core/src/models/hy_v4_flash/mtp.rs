@@ -363,7 +363,7 @@ impl Draft {
         self.kv.truncate(len)
     }
 
-    fn mark(&self, trunk: usize) -> Option<DraftMark> {
+    pub(super) fn mark(&self, trunk: usize) -> Option<DraftMark> {
         let len = trunk.checked_sub(1);
         let seed = match len {
             Some(at) => Some((at, self.seeds.get(at)?.clone())),
@@ -376,13 +376,13 @@ impl Draft {
         })
     }
 
-    fn can_restore(&self, m: &DraftMark) -> bool {
+    pub(super) fn can_restore(&self, m: &DraftMark) -> bool {
         m.len <= self.len()
             && m.index.len() == m.len
             && m.len / self.kpool.max(1) <= self.index.pooled_len()
     }
 
-    fn restore(&mut self, m: &DraftMark) -> Result<()> {
+    pub(super) fn restore(&mut self, m: &DraftMark) -> Result<()> {
         self.index.restore(m.index.clone())?;
         self.kv.truncate(m.len)?;
         self.seeds.clear();

@@ -10,19 +10,22 @@
 //!
 //! A swap moves a cell out of the table and back (`take` / `put`), never a
 //! copy. `state` copies the cell at a block row into a `PrefixState`; the
-//! MTP rows of whole 32-row segments are copied once per cell and shared by
-//! every state taken from it.
+//! MTP rows of whole 32-row segments are copied once and shared by every
+//! state taken from the cell while one of them holds the copy (the cell
+//! itself holds none). A step of more rows than a truncate can drop runs
+//! with a mark of the cell, and its failure or a cut back to its start
+//! goes back to the mark.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use napi::{Error, Result};
 
 use super::cache::{WINDOW_SLACK, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
-use super::indexer::{IndexerGeometry, PagedIndexerState};
-use super::mtp::Draft;
+use super::indexer::{IndexerGeometry, IndexerMark, PagedIndexerState};
+use super::mtp::{Draft, DraftMark};
 use super::paged::pool_layers;
 use super::prefill::{BLOCK_ROWS, index_keeps, window_keeps};
 use super::prefix_state::{DraftState, OpenRows, PrefixState, Segment, StateLayer};
@@ -86,6 +89,20 @@ fn layers_of(cfg: &HyV4FlashConfig) -> Result<Vec<CellLayer>> {
         .collect()
 }
 
+/// One trunk layer's part of a mark.
+enum LayerMark {
+    Window(WindowRing),
+    Index(IndexerMark),
+}
+
+/// A cell as it stood before a step.
+struct CellMark {
+    len: usize,
+    recent: Vec<u32>,
+    layers: Vec<LayerMark>,
+    draft: Option<DraftMark>,
+}
+
 /// One paged sequence's cell.
 pub struct OwnerCell {
     layers: Vec<CellLayer>,
@@ -94,7 +111,8 @@ pub struct OwnerCell {
     back: usize,
     kpool: usize,
     len: usize,
-    segments: Vec<Arc<Segment>>,
+    segments: Vec<Weak<Segment>>,
+    mark: Option<CellMark>,
 }
 
 impl OwnerCell {
@@ -117,6 +135,7 @@ impl OwnerCell {
             kpool,
             len: 0,
             segments: Vec::new(),
+            mark: None,
         })
     }
 
@@ -160,7 +179,7 @@ impl OwnerCell {
             (None, None) => {}
             (Some(d), Some(ds)) => {
                 fill_draft(d, ds)?;
-                cell.segments = ds.segments.clone();
+                cell.segments = ds.segments.iter().map(Arc::downgrade).collect();
             }
             _ => return Err(bad("a state and a cell that differ in the MTP layer")),
         }
@@ -202,14 +221,90 @@ impl OwnerCell {
         &self.recent
     }
 
-    /// Bytes the cell holds, its copied MTP segments included.
+    /// Bytes the cell holds (the MTP segments of its states are theirs).
     pub fn nbytes(&self) -> u64 {
         let layers: usize = self.layers.iter().map(CellLayer::nbytes).sum();
-        let segments: usize = self.segments.iter().map(|s| s.nbytes()).sum();
         (layers
             + self.draft.as_ref().map_or(0, Draft::nbytes)
-            + segments
             + self.recent.len() * std::mem::size_of::<u32>()) as u64
+    }
+
+    /// Marks the cell before a step of `rows` rows: a step past the window
+    /// slack cannot be truncated away, so its failure or a cut back to the
+    /// mark restores it. A shorter step holds no mark; neither does a cell
+    /// whose draft is not settled at its length.
+    pub fn hold_mark(&mut self, rows: usize) {
+        self.mark = if rows > WINDOW_SLACK {
+            self.snapshot()
+        } else {
+            None
+        };
+    }
+
+    pub fn drop_mark(&mut self) {
+        self.mark = None;
+    }
+
+    fn snapshot(&self) -> Option<CellMark> {
+        let draft = match &self.draft {
+            Some(d) => Some(d.mark(self.len)?),
+            None => None,
+        };
+        let layers = self
+            .layers
+            .iter()
+            .map(|p| match p {
+                CellLayer::Window(r) => LayerMark::Window(r.clone()),
+                CellLayer::Index(ix) => LayerMark::Index(ix.mark()),
+            })
+            .collect();
+        Some(CellMark {
+            len: self.len,
+            recent: self.recent.clone(),
+            layers,
+            draft,
+        })
+    }
+
+    fn restore_mark(&mut self, m: CellMark) -> Result<()> {
+        if m.layers.len() != self.layers.len() {
+            return Err(bad("a mark of another trunk"));
+        }
+        match (self.draft.as_mut(), &m.draft) {
+            (None, None) => {}
+            (Some(d), Some(dm)) if d.can_restore(dm) => d.restore(dm)?,
+            _ => return Err(bad(format!("the draft cannot go back to {}", m.len))),
+        }
+        for (l, (p, lm)) in self.layers.iter_mut().zip(m.layers).enumerate() {
+            match (p, lm) {
+                (CellLayer::Window(r), LayerMark::Window(s)) => *r = s,
+                (CellLayer::Index(ix), LayerMark::Index(im)) => ix.restore(im)?,
+                _ => return Err(bad(format!("layer {l}: a mark of another kind"))),
+            }
+        }
+        self.segments.truncate(m.len.saturating_sub(1) / BLOCK_ROWS);
+        self.len = m.len;
+        self.recent = m.recent;
+        Ok(())
+    }
+
+    /// Puts every trunk part back to `len` positions after a failed step
+    /// (its mark when it holds one there); false when a part no longer
+    /// holds them.
+    pub fn rewind(&mut self, len: usize, history: &[u32]) -> bool {
+        if let Some(m) = self.mark.take()
+            && m.len == len
+        {
+            return self.restore_mark(m).is_ok();
+        }
+        if self.len > len {
+            return self.truncate(len, history).is_ok();
+        }
+        self.layers.iter_mut().all(|p| match p {
+            CellLayer::Window(r) if r.len() > len => r.truncate(len).is_ok(),
+            CellLayer::Index(ix) if ix.len() > len => ix.truncate(len).is_ok(),
+            _ => true,
+        })
     }
 
     /// Records a step that appended `ids` to every trunk layer.
@@ -266,7 +361,8 @@ impl OwnerCell {
     }
 
     /// Drops the positions past `len`; `history` holds the sequence's token
-    /// ids (at least `len`). A refusal changes nothing.
+    /// ids (at least `len`). A cut to the mark restores it; any other
+    /// refusal changes nothing.
     pub fn truncate(&mut self, len: usize, history: &[u32]) -> Result<()> {
         if history.len() < len {
             return Err(bad(format!(
@@ -274,8 +370,12 @@ impl OwnerCell {
                 history.len()
             )));
         }
+        let mark = self.mark.take();
         if len == self.len {
             return Ok(());
+        }
+        if let Some(m) = mark.filter(|m| m.len == len) {
+            return self.restore_mark(m);
         }
         if !self.can_truncate(len) {
             return Err(bad(format!(
@@ -355,9 +455,14 @@ impl OwnerCell {
         let rows = |a: &MxArray, w: i64, lo: usize, hi: usize| -> Result<MxArray> {
             a.slice(&[lo as i64, 0], &[hi as i64, w])?.deep_copy()
         };
-        self.segments.truncate(full);
+        let mut segments: Vec<Arc<Segment>> = self
+            .segments
+            .iter()
+            .take(full)
+            .map_while(Weak::upgrade)
+            .collect();
         let mut fresh = Vec::new();
-        for s in self.segments.len()..full {
+        for s in segments.len()..full {
             fresh.push(Segment {
                 kv: rows(kv, width, s * BLOCK_ROWS, (s + 1) * BLOCK_ROWS)?,
                 pooled: rows(pooled, pw, s * per, (s + 1) * per)?,
@@ -384,9 +489,10 @@ impl OwnerCell {
             MxArray::eval_arrays_with_context(&live, "hy_v4_flash owner state")?;
         }
         let tail = d.index().tail().clone();
-        self.segments.extend(fresh.into_iter().map(Arc::new));
+        segments.extend(fresh.into_iter().map(Arc::new));
+        self.segments = segments.iter().map(Arc::downgrade).collect();
         Ok(Some(DraftState {
-            segments: self.segments.clone(),
+            segments,
             open,
             tail,
             seed,
