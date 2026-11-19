@@ -12,10 +12,12 @@ pub mod f8;
 pub mod finalize;
 pub mod header;
 pub mod indexer;
+pub mod ladder;
 pub mod model;
 pub mod moe;
 pub mod ops;
 pub mod paged;
+pub mod prefill;
 pub mod rows;
 pub mod scan;
 pub mod sparse;
@@ -31,6 +33,8 @@ mod tests_model;
 mod tests_paged;
 #[cfg(all(test, target_os = "macos"))]
 mod tests_pool;
+#[cfg(test)]
+mod tests_prefill;
 #[cfg(test)]
 mod tests_rows;
 #[cfg(test)]
