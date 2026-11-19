@@ -43,6 +43,48 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The streamed classes, in bank index order.
 pub const CLASSES: [ExpertClass; 2] = [ExpertClass::Q6kDown, ExpertClass::Q4kDown];
 
+/// [`KqBank::residency`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Residency {
+    pub resident: u64,
+    /// Resident bytes of the banks the kernel holds volatile or empty.
+    pub volatile: u64,
+}
+
+/// Whether the kernel holds `b`'s pages volatile or empty (`None` without a
+/// reading).
+#[cfg(target_os = "macos")]
+fn kernel_volatile(b: &PurgeableBank) -> Option<bool> {
+    const VM_PURGABLE_GET_STATE: libc::c_int = 1;
+    const VM_PURGABLE_STATE_MASK: libc::c_int = 3;
+    const VM_PURGABLE_NONVOLATILE: libc::c_int = 0;
+    unsafe extern "C" {
+        static mach_task_self_: libc::mach_port_t;
+        fn vm_purgable_control(
+            task: libc::mach_port_t,
+            address: libc::uintptr_t,
+            control: libc::c_int,
+            state: *mut libc::c_int,
+        ) -> libc::kern_return_t;
+    }
+    let mut state: libc::c_int = 0;
+    // SAFETY: a query on this task's own live mapping; `state` is writable.
+    let kr = unsafe {
+        vm_purgable_control(
+            mach_task_self_,
+            b.data_ptr().0 as libc::uintptr_t,
+            VM_PURGABLE_GET_STATE,
+            &mut state,
+        )
+    };
+    (kr == libc::KERN_SUCCESS).then_some(state & VM_PURGABLE_STATE_MASK != VM_PURGABLE_NONVOLATILE)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kernel_volatile(_: &PurgeableBank) -> Option<bool> {
+    None
+}
+
 pub fn class_index(class: ExpertClass) -> Option<usize> {
     CLASSES.iter().position(|&c| c == class)
 }
@@ -833,6 +875,27 @@ impl KqBank {
             }
         }
         Ok(n)
+    }
+
+    /// Bytes of every bank resident in RAM now, and of those the bytes of
+    /// banks the kernel holds volatile or empty, which the host counts
+    /// purgeable. The kernel can still hold a bank volatile right after
+    /// Metal made it non-volatile (measured at a turn start: 55.5 GB
+    /// purgeable, the banks' 54.9 GB plus the usual 0.5). Without a kernel
+    /// reading a bank is volatile outside a turn.
+    pub fn residency(&self) -> Result<Residency> {
+        let g = lock(&self.inner);
+        let mut r = Residency::default();
+        for p in g.classes.iter().flat_map(|c| &c.proj) {
+            for b in p.banks() {
+                let n = b.resident_bytes()?;
+                r.resident += n;
+                if kernel_volatile(b).unwrap_or(!g.in_turn) {
+                    r.volatile += n;
+                }
+            }
+        }
+        Ok(r)
     }
 
     /// Per class index.

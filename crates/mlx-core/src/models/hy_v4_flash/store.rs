@@ -24,17 +24,18 @@
 //! rows (`row_cap`), the rows its Q8 matrices take through `qmv_wide`.
 //!
 //! A turn is `begin_turn` .. `end_turn` (`Lease`): the start re-admits at the
-//! same context and chunk and may drop the bank to staging-only or rebuild
-//! it, then holds a wired-limit lease of fixed + cache bytes until the end,
-//! when the bank becomes volatile. A re-admission inside the turn (`recheck`)
-//! switches a warm bank only when the host has no room for it.
+//! same context and chunk and may shrink the bank to what the host admits or
+//! rebuild it, then holds a wired-limit lease of fixed + cache bytes until
+//! the end, when the bank becomes volatile. A re-admission inside the turn
+//! (`recheck`) shrinks the bank the same way but does not grow one that
+//! holds cache slots.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
 use napi::{Error, Result};
 
-use super::bank::{CLASSES, ClassLayout, KqBank, slot_bytes};
+use super::bank::{CLASSES, ClassLayout, KqBank, Residency, slot_bytes};
 use super::cache::WINDOW_SLACK;
 use super::config::{Attn, HyV4FlashConfig};
 use super::model::Model;
@@ -548,9 +549,9 @@ thread_local! {
     /// real one.
     pub(super) static TEST_HOST: std::cell::Cell<Option<(HostMemory, u64)>> =
         const { std::cell::Cell::new(None) };
-    /// The process footprint the re-admission sees on this thread instead of
-    /// the real one.
-    pub(super) static TEST_FOOTPRINT: std::cell::Cell<Option<u64>> =
+    /// The MLX free pool the re-admission sees on this thread instead of the
+    /// real one.
+    pub(super) static TEST_POOL: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -570,75 +571,81 @@ fn host_reading(max_memory: Option<u64>) -> Result<(HostMemory, u64)> {
     Ok((h, capped_ws(working_set(), max_memory)))
 }
 
-/// This process's physical footprint (0 without a reading).
-fn footprint() -> u64 {
+/// The MLX free-buffer pool (process-wide).
+fn free_pool() -> u64 {
     #[cfg(test)]
-    if let Some(f) = TEST_FOOTPRINT.with(std::cell::Cell::get) {
+    if let Some(f) = TEST_POOL.with(std::cell::Cell::get) {
         return f;
     }
-    crate::models::deepseek_v41::stats::rusage().0
-}
-
-/// The bytes `a` charges for this model's buffers beside its dense arrays,
-/// KV and bank: scratch, reads, driver and the shared pool.
-pub fn transient_charge(a: &Admission) -> u64 {
-    let t = &a.terms;
-    t.compute + t.io + t.driver + t.pool
+    crate::array::get_cache_memory() as u64
 }
 
 /// This model's bytes inside `host_used`: resident arrays, the sessions'
 /// buffers `kv` (made at their first write and kept, already charged in
-/// `fixed`), the bank's resident pages (volatile between turns) and the
-/// process footprint past those (scratch, the MLX free pool, read buffers)
-/// up to `charge` ([`transient_charge`]). Footprint past the charge, and
-/// other models of this process inside it, stay in `others`: held bytes
-/// past live then still mean the host has no room. With the host reading
-/// `h` settled for the bank ([`settled`]).
-pub fn own(
-    bank: &KqBank,
-    dense: u64,
-    kv: u64,
-    charge: u64,
-    h: HostMemory,
-) -> Result<(HostMemory, Own)> {
-    let resident = bank.resident_bytes()?;
-    let in_turn = bank.in_turn();
-    Ok((
-        settled(h, resident, in_turn),
-        own_of(dense, kv, resident, in_turn, footprint(), charge),
+/// `fixed`), the bank's resident pages (volatile between turns) and the MLX
+/// free pool up to `pool`, the pool term the admission charges, so those
+/// bytes are charged once whichever model of the process freed them.
+/// Scratch and the rest of the process footprint stay in `others`: the
+/// process-wide counters also hold other loaded models (conservative).
+pub fn own(bank: &KqBank, dense: u64, kv: u64, pool: u64) -> Result<Own> {
+    Ok(own_of(
+        dense,
+        kv,
+        bank.residency()?.resident,
+        bank.in_turn(),
+        free_pool(),
+        pool,
     ))
 }
 
-/// `h` with the non-volatile bank's `resident` pages out of its purgeable
-/// count. The host keeps counting a bank purgeable for a while after it
-/// turned non-volatile (measured at a turn start: 55.5 GB purgeable, the
-/// bank's 54.9 GB plus the usual 0.5), and `host_used` subtracts purgeable
-/// pages from the anonymous ones: other processes' pages vanished and the
-/// turn start grew the bank past the host. Other processes' volatile pages
-/// up to `resident` count as used (conservative).
-pub fn settled(h: HostMemory, resident: u64, in_turn: bool) -> HostMemory {
+/// A host reading for a re-admission of this model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reading {
+    /// [`settled`] for the bank.
+    pub host: HostMemory,
+    /// The host with every resident page of a turn's bank out of the
+    /// purgeable count: other processes' volatile pages up to the bank's
+    /// size count as used. Growth and the size of a shrink are read on it,
+    /// so a purgeable count that still holds the bank without the kernel
+    /// saying so never grows the bank.
+    pub wary: HostMemory,
+    pub own: Own,
+}
+
+/// [`own`] and the host reading `h` for a re-admission.
+pub fn reading(bank: &KqBank, dense: u64, kv: u64, pool: u64, h: HostMemory) -> Result<Reading> {
+    let r = bank.residency()?;
+    let in_turn = bank.in_turn();
+    let all = Residency {
+        volatile: r.resident,
+        ..r
+    };
+    Ok(Reading {
+        host: settled(h, r, in_turn),
+        wary: settled(h, all, in_turn),
+        own: own_of(dense, kv, r.resident, in_turn, free_pool(), pool),
+    })
+}
+
+/// `h` with the pages of a turn's bank that the kernel still holds volatile
+/// out of its purgeable count: the turn counts them as own, and `host_used`
+/// leaves purgeable pages out (from the anonymous ones, so with the bank
+/// wired other processes' pages vanished, with it anonymous the bank did).
+pub fn settled(h: HostMemory, bank: Residency, in_turn: bool) -> HostMemory {
     if !in_turn {
         return h;
     }
     HostMemory {
-        purgeable: h.purgeable.saturating_sub(resident),
+        purgeable: h.purgeable.saturating_sub(bank.volatile),
         ..h
     }
 }
 
 /// [`own`] from its parts.
-pub fn own_of(
-    dense: u64,
-    kv: u64,
-    resident: u64,
-    in_turn: bool,
-    footprint: u64,
-    charge: u64,
-) -> Own {
-    let counted = dense + kv + resident;
+pub fn own_of(dense: u64, kv: u64, resident: u64, in_turn: bool, free_pool: u64, pool: u64) -> Own {
     Own {
-        active: counted + footprint.saturating_sub(counted).min(charge),
-        pool: 0,
+        active: dense + kv + resident,
+        pool: free_pool.min(pool),
         volatile: if in_turn { 0 } else { resident },
     }
 }
@@ -747,23 +754,22 @@ impl Lease {
             bank.begin_turn()?;
             let next = (|| {
                 let (h, ws) = host_reading(self.max_memory)?;
-                let (h, o) = own(bank, dense, kv, transient_charge(&cur), h)?;
-                match readmit_with(
-                    &self.profile,
-                    &cur,
-                    &self.size,
-                    self.rows,
-                    limits,
-                    &h,
-                    &o,
-                    ws,
-                )? {
-                    Turn::Keep if !t.lost => Ok(cur),
-                    Turn::Keep => {
-                        self.switch(&mut t, bank, &cur)?;
-                        Ok(cur)
-                    }
-                    Turn::StagingOnly(a) | Turn::Rebuild(a) => {
+                let r = reading(bank, dense, kv, cur.terms.pool, h)?;
+                let turn = self.readmit(&cur, limits, &r, ws)?;
+                let now = || {
+                    admit_with(
+                        &self.profile,
+                        &self.size,
+                        self.rows,
+                        limits,
+                        &r.wary,
+                        &r.own,
+                        ws,
+                    )
+                };
+                match next_bank(turn, &cur, t.lost, false, now)? {
+                    None => Ok(cur),
+                    Some(a) => {
                         self.switch(&mut t, bank, &a)?;
                         tracing::info!("hy_v4_flash re-admission: {a}");
                         Ok(a)
@@ -788,12 +794,9 @@ impl Lease {
     }
 
     /// Inside a turn (between two evaluated steps): the turn start's
-    /// re-admission again, for a host that changed since. A warm bank the
-    /// re-admission has no room for switches only when the host has less
-    /// than the reserve available ([`pressed`]), to what the host admits now
-    /// (staging only when that admits no cache); room that came back waits
-    /// for the next turn start unless the bank holds no cache. `true` when
-    /// it switched; `false` outside a turn or without an admission.
+    /// re-admission again, for a host that changed since ([`next_bank`]).
+    /// `true` when it switched; `false` outside a turn or without an
+    /// admission.
     pub fn recheck(&self, bank: &KqBank, dense: u64, kv: u64) -> Result<bool> {
         let mut t = self.turn();
         let (Some(limits), Some(cur)) = (&self.limits, t.admission) else {
@@ -803,20 +806,20 @@ impl Lease {
             return Ok(false);
         }
         let (h, ws) = host_reading(self.max_memory)?;
-        let (h, o) = own(bank, dense, kv, transient_charge(&cur), h)?;
-        let turn = readmit_with(
-            &self.profile,
-            &cur,
-            &self.size,
-            self.rows,
-            limits,
-            &h,
-            &o,
-            ws,
-        )?;
-        let next = match switch_in_turn(turn, &cur, t.lost, pressed(&h, limits), || {
-            admit_with(&self.profile, &self.size, self.rows, limits, &h, &o, ws)
-        })? {
+        let r = reading(bank, dense, kv, cur.terms.pool, h)?;
+        let turn = self.readmit(&cur, limits, &r, ws)?;
+        let now = || {
+            admit_with(
+                &self.profile,
+                &self.size,
+                self.rows,
+                limits,
+                &r.wary,
+                &r.own,
+                ws,
+            )
+        };
+        let next = match next_bank(turn, &cur, t.lost, true, now)? {
             Some(a) => a,
             None => return Ok(false),
         };
@@ -831,6 +834,23 @@ impl Lease {
         Ok(true)
     }
 
+    /// The re-admission of `cur` on `r.host` ([`wary_growth`]).
+    fn readmit(&self, cur: &Admission, limits: &Limits, r: &Reading, ws: u64) -> Result<Turn> {
+        let at = |h: &HostMemory| {
+            readmit_with(
+                &self.profile,
+                cur,
+                &self.size,
+                self.rows,
+                limits,
+                h,
+                &r.own,
+                ws,
+            )
+        };
+        Ok(wary_growth(at(&r.host)?, || at(&r.wary)))
+    }
+
     /// Turn end (after the turn's last eval): release the wired lease, make
     /// the bank volatile.
     pub fn end_turn(&self, bank: &KqBank) -> Result<()> {
@@ -841,30 +861,36 @@ impl Lease {
     }
 }
 
-/// The host has less than `limits.reserve` available. The admission
-/// charges the bytes this model may take (`fixed + cache`), mostly more
-/// than it holds, so its "no room" alone leaves the host with room.
-pub fn pressed(h: &HostMemory, limits: &Limits) -> bool {
-    h.physical.saturating_sub(h.non_reclaimable()) < limits.reserve
+/// `turn` with a rebuild kept unless the wary reading rebuilds too, at its
+/// size.
+pub fn wary_growth(turn: Turn, wary: impl FnOnce() -> Result<Turn>) -> Turn {
+    match turn {
+        Turn::Rebuild(_) => match wary() {
+            Ok(Turn::Rebuild(a)) => Turn::Rebuild(a),
+            _ => Turn::Keep,
+        },
+        t => t,
+    }
 }
 
-/// What a re-admission inside a turn does with the bank: `None` keeps it.
-/// A switch empties the cache, so a warm one is switched only for a
-/// `pressed` host the re-admission has no room for, to what `now` admits.
-pub fn switch_in_turn(
+/// The bank a re-admission's `turn` switches to (`None` keeps it). A bank
+/// the host has no room for (`StagingOnly`) shrinks to what the host
+/// admits now, `now` (on the wary reading), staging only when that admits
+/// no cache. Growth that
+/// would empty a bank holding cache slots waits for a turn start when
+/// `in_turn`.
+pub fn next_bank(
     turn: Turn,
     cur: &Admission,
     lost: bool,
-    pressed: bool,
+    in_turn: bool,
     now: impl FnOnce() -> Result<Admission>,
 ) -> Result<Option<Admission>> {
-    let warm = cur.cache_slots > 0 && !lost;
     Ok(match turn {
         Turn::Keep if lost => Some(*cur),
         Turn::Keep => None,
-        Turn::Rebuild(_) if warm => None,
+        Turn::Rebuild(_) if in_turn && cur.cache_slots > 0 && !lost => None,
         Turn::Rebuild(a) => Some(a),
-        Turn::StagingOnly(_) if warm && !pressed => None,
         Turn::StagingOnly(s) => {
             let a = now()?;
             Some(if a.cache_slots > 0 { a } else { s })
@@ -1069,9 +1095,8 @@ impl Store {
 
     /// `kv`: bytes of every live session (`Session::nbytes`).
     pub fn own(&self, kv: u64) -> Result<Own> {
-        let charge = self.admission().as_ref().map_or(0, transient_charge);
-        let (h, _) = host_reading(self.max_memory)?;
-        Ok(own(&self.bank, self.dense_bytes, kv, charge, h)?.1)
+        let pool = self.admission().map_or(0, |a| a.terms.pool);
+        own(&self.bank, self.dense_bytes, kv, pool)
     }
 
     /// `kv`: bytes of every live session (`Session::nbytes`).
