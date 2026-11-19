@@ -119,11 +119,12 @@ fn top1_agree(a: &[f32], b: &[f32], vocab: usize) -> f64 {
 }
 
 /// The top-1 bound of a case: 98 %, or 1 % under llama's agreement with its
-/// own second run when that is lower. Near ties flip on rounding alone; llama
-/// against itself (an eval-callback split, nothing else changed) reached
-/// 97.8 % on r2-en.
+/// own second run when that is lower, never under 96 %. Near ties flip on
+/// rounding alone; llama against itself (an eval-callback split, nothing else
+/// changed) reached 97.8 % on r2-en, its lowest case. The 96 % limit keeps a
+/// broken or mismatched second run from lowering the gate.
 fn top1_bound(floor: Option<f64>) -> f64 {
-    floor.map_or(0.98, |f| (f - 0.01).min(0.98))
+    floor.map_or(0.98, |f| (f - 0.01).clamp(0.96, 0.98))
 }
 
 /// For each `HY4_REF_NAMES` case: the ids `<HY4_REF_PROMPTS>/<name>.i32`
@@ -428,6 +429,7 @@ fn top1_bound_follows_llamas_own_floor() {
     assert_eq!(top1_bound(None), 0.98);
     assert_eq!(top1_bound(Some(1.0)), 0.98);
     assert!((top1_bound(Some(0.9784)) - 0.9684).abs() < 1e-12);
+    assert_eq!(top1_bound(Some(0.5)), 0.96);
     let (a, b) = ([0.0f32, 1.0, 1.0, 0.0], [0.0f32, 1.0, 0.0, 1.0]);
     assert_eq!(top1_agree(&a, &b, 2), 0.5);
 }
