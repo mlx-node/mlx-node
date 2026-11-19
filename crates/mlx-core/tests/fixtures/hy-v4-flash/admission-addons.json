@@ -1,0 +1,3854 @@
+{
+ "inputs": {
+  "physical": 137438953472,
+  "ws": 96000000000,
+  "ws_note": "UNVERIFIED (U3)",
+  "reserve": 12884901888,
+  "own": 0,
+  "slot": 4663296,
+  "n_experts": 1024,
+  "staging_layer": 4775215104,
+  "dense_trunk": 9162262836,
+  "dense_mtp_plan": 2189929600,
+  "contexts": [
+   16384,
+   32768,
+   65536,
+   131072,
+   262144
+  ],
+  "chunk_rows": [
+   8192,
+   4096,
+   2048
+  ],
+  "others_gib": [
+   20,
+   50,
+   80
+  ],
+  "ladder_others_gib": [
+   20,
+   50,
+   80,
+   82,
+   84,
+   86,
+   88,
+   90
+  ],
+  "max_context": 262144,
+  "min_context": 16384
+ },
+ "profile": {
+  "source": "PLAN-addons §1.6-1.7; DS constants budget.rs:25-47 are placeholders until R-11",
+  "KV_BASE": 10485760,
+  "kv_fixed_ladder": 157286400,
+  "kv_per_ctx_mtp_on": 15812,
+  "kv_per_ctx_mtp_off": 14596,
+  "COMPUTE_BASE": 1134024803,
+  "COMPUTE_PER_ROW": 772038,
+  "compute_fixed": 1342177280,
+  "compute_per_ctx": 128,
+  "IO_BASE": 268435456,
+  "IO_PER_ROW": 40960,
+  "io_fixed": 167772160,
+  "POOL": 2147483648,
+  "DRIVER_MIN": 4294967296,
+  "SECOND_STAGING_MIN_CACHE": 18253611008
+ },
+ "formula": "kv = x1.2(KV_BASE + kv_fixed_ladder + kv_per_ctx*ctx); compute = x1.2(COMPUTE_BASE + COMPUTE_PER_ROW*C + compute_fixed + compute_per_ctx*ctx); io = IO_BASE + IO_PER_ROW*C + io_fixed; x1.2(b) = b + b/5 (integer); fixed(L) = dense + L*n_experts*slot + kv + compute + io + max(4 GiB, ws/20) + pool; budget = min(physical - others - reserve, ws); refuse if fixed(1) > budget; L = 2 if fixed(2) + cache1 <= budget or budget - fixed(2) >= 17 GiB; cache = floor((budget - fixed(L))/slot)*slot",
+ "c_rule": "walk ctx from max_context halving down to min_context; at a ctx take the largest C in {8192, 4096, 2048} admitted with cache >= SECOND_STAGING_MIN_CACHE, else 2048 if admitted, else halve ctx; none at min_context = load fails",
+ "variants": {
+  "mtp_on": {
+   "dense": 11352192436,
+   "kv_per_ctx": 15812,
+   "rows": [
+    {
+     "ctx": 16384,
+     "chunk_rows": 8192,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 512203161,
+      "compute": 10563401437,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.47702636662870646,
+      "compute": 9.837934223003685,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 34922247722,
+     "staging_layers": 2,
+     "fixed": 39697462826,
+     "cache_slots": 12073,
+     "cache_bytes": 56299972608,
+     "wired_limit": 95997435434,
+     "bound": "WorkingSet",
+     "fixed_gib": 36.97114328481257,
+     "cache_gib": 52.43343544006348,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 8192,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 512203161,
+      "compute": 10563401437,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.47702636662870646,
+      "compute": 9.837934223003685,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 34922247722,
+     "staging_layers": 2,
+     "fixed": 39697462826,
+     "cache_slots": 6684,
+     "cache_bytes": 31169470464,
+     "wired_limit": 70866933290,
+     "bound": "Live",
+     "fixed_gib": 36.97114328481257,
+     "cache_gib": 29.028831481933594,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 8192,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 512203161,
+      "compute": 10563401437,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.47702636662870646,
+      "compute": 9.837934223003685,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 34922247722,
+     "staging_layers": 1,
+     "fixed": 34922247722,
+     "cache_slots": 800,
+     "cache_bytes": 3730636800,
+     "wired_limit": 38652884522,
+     "bound": "Live",
+     "fixed_gib": 32.52387765981257,
+     "cache_gib": 3.47442626953125,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 4096,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 512203161,
+      "compute": 6768680259,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.47702636662870646,
+      "compute": 6.303824725560844,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 30959754384,
+     "staging_layers": 2,
+     "fixed": 35734969488,
+     "cache_slots": 12923,
+     "cache_bytes": 60263774208,
+     "wired_limit": 95998743696,
+     "bound": "WorkingSet",
+     "fixed_gib": 33.28078378736973,
+     "cache_gib": 56.12501335144043,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 4096,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 512203161,
+      "compute": 6768680259,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.47702636662870646,
+      "compute": 6.303824725560844,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 30959754384,
+     "staging_layers": 2,
+     "fixed": 35734969488,
+     "cache_slots": 7533,
+     "cache_bytes": 35128608768,
+     "wired_limit": 70863578256,
+     "bound": "Live",
+     "fixed_gib": 33.28078378736973,
+     "cache_gib": 32.71606636047363,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 4096,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 512203161,
+      "compute": 6768680259,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.47702636662870646,
+      "compute": 6.303824725560844,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 30959754384,
+     "staging_layers": 1,
+     "fixed": 30959754384,
+     "cache_slots": 1650,
+     "cache_bytes": 7694438400,
+     "wired_limit": 38654192784,
+     "bound": "Live",
+     "fixed_gib": 28.833518162369728,
+     "cache_gib": 7.166004180908203,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 2048,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 512203161,
+      "compute": 4871319670,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.47702636662870646,
+      "compute": 4.536769976839423,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 28978507715,
+     "staging_layers": 2,
+     "fixed": 33753722819,
+     "cache_slots": 13348,
+     "cache_bytes": 62245675008,
+     "wired_limit": 95999397827,
+     "bound": "WorkingSet",
+     "fixed_gib": 31.435604038648307,
+     "cache_gib": 57.970802307128906,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 2048,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 512203161,
+      "compute": 4871319670,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.47702636662870646,
+      "compute": 4.536769976839423,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 28978507715,
+     "staging_layers": 2,
+     "fixed": 33753722819,
+     "cache_slots": 7958,
+     "cache_bytes": 37110509568,
+     "wired_limit": 70864232387,
+     "bound": "Live",
+     "fixed_gib": 31.435604038648307,
+     "cache_gib": 34.56185531616211,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 2048,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 512203161,
+      "compute": 4871319670,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.47702636662870646,
+      "compute": 4.536769976839423,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 28978507715,
+     "staging_layers": 1,
+     "fixed": 28978507715,
+     "cache_slots": 2074,
+     "cache_bytes": 9671675904,
+     "wired_limit": 38650183619,
+     "bound": "Live",
+     "fixed_gib": 26.988338413648307,
+     "cache_gib": 9.007450103759766,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 8192,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 823079731,
+      "compute": 10565918019,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.7665527341887355,
+      "compute": 9.840277972631156,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 35235640874,
+     "staging_layers": 2,
+     "fixed": 40010855978,
+     "cache_slots": 12006,
+     "cache_bytes": 55987531776,
+     "wired_limit": 95998387754,
+     "bound": "WorkingSet",
+     "fixed_gib": 37.26301340200007,
+     "cache_gib": 52.142452239990234,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 8192,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 823079731,
+      "compute": 10565918019,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.7665527341887355,
+      "compute": 9.840277972631156,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 35235640874,
+     "staging_layers": 2,
+     "fixed": 40010855978,
+     "cache_slots": 6616,
+     "cache_bytes": 30852366336,
+     "wired_limit": 70863222314,
+     "bound": "Live",
+     "fixed_gib": 37.26301340200007,
+     "cache_gib": 28.733505249023438,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 8192,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 823079731,
+      "compute": 10565918019,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.7665527341887355,
+      "compute": 9.840277972631156,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 35235640874,
+     "staging_layers": 1,
+     "fixed": 35235640874,
+     "cache_slots": 733,
+     "cache_bytes": 3418195968,
+     "wired_limit": 38653836842,
+     "bound": "Live",
+     "fixed_gib": 32.81574777700007,
+     "cache_gib": 3.183443069458008,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 4096,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 823079731,
+      "compute": 6771196842,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.7665527341887355,
+      "compute": 6.3061684761196375,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 31273147537,
+     "staging_layers": 2,
+     "fixed": 36048362641,
+     "cache_slots": 12856,
+     "cache_bytes": 59951333376,
+     "wired_limit": 95999696017,
+     "bound": "WorkingSet",
+     "fixed_gib": 33.57265390548855,
+     "cache_gib": 55.83403015136719,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 4096,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 823079731,
+      "compute": 6771196842,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.7665527341887355,
+      "compute": 6.3061684761196375,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 31273147537,
+     "staging_layers": 2,
+     "fixed": 36048362641,
+     "cache_slots": 7466,
+     "cache_bytes": 34816167936,
+     "wired_limit": 70864530577,
+     "bound": "Live",
+     "fixed_gib": 33.57265390548855,
+     "cache_gib": 32.42508316040039,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 4096,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 823079731,
+      "compute": 6771196842,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.7665527341887355,
+      "compute": 6.3061684761196375,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 31273147537,
+     "staging_layers": 1,
+     "fixed": 31273147537,
+     "cache_slots": 1582,
+     "cache_bytes": 7377334272,
+     "wired_limit": 38650481809,
+     "bound": "Live",
+     "fixed_gib": 29.12538828048855,
+     "cache_gib": 6.870677947998047,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 2048,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 823079731,
+      "compute": 4873836253,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.7665527341887355,
+      "compute": 4.539113727398217,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 29291900868,
+     "staging_layers": 2,
+     "fixed": 34067115972,
+     "cache_slots": 13280,
+     "cache_bytes": 61928570880,
+     "wired_limit": 95995686852,
+     "bound": "WorkingSet",
+     "fixed_gib": 31.72747415676713,
+     "cache_gib": 57.67547607421875,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 2048,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 823079731,
+      "compute": 4873836253,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.7665527341887355,
+      "compute": 4.539113727398217,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 29291900868,
+     "staging_layers": 2,
+     "fixed": 34067115972,
+     "cache_slots": 7891,
+     "cache_bytes": 36798068736,
+     "wired_limit": 70865184708,
+     "bound": "Live",
+     "fixed_gib": 31.72747415676713,
+     "cache_gib": 34.27087211608887,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 2048,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 823079731,
+      "compute": 4873836253,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 0.7665527341887355,
+      "compute": 4.539113727398217,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 29291900868,
+     "staging_layers": 1,
+     "fixed": 29291900868,
+     "cache_slots": 2007,
+     "cache_bytes": 9359235072,
+     "wired_limit": 38651135940,
+     "bound": "Live",
+     "fixed_gib": 27.28020853176713,
+     "cache_gib": 8.716466903686523,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 8192,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 1444832870,
+      "compute": 10570951184,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 1.345605468377471,
+      "compute": 9.844965472817421,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 35862427178,
+     "staging_layers": 2,
+     "fixed": 40637642282,
+     "cache_slots": 11871,
+     "cache_bytes": 55357986816,
+     "wired_limit": 95995629098,
+     "bound": "WorkingSet",
+     "fixed_gib": 37.84675363637507,
+     "cache_gib": 51.556142807006836,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 8192,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 1444832870,
+      "compute": 10570951184,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 1.345605468377471,
+      "compute": 9.844965472817421,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 35862427178,
+     "staging_layers": 2,
+     "fixed": 40637642282,
+     "cache_slots": 6482,
+     "cache_bytes": 30227484672,
+     "wired_limit": 70865126954,
+     "bound": "Live",
+     "fixed_gib": 37.84675363637507,
+     "cache_gib": 28.151538848876953,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 8192,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 1444832870,
+      "compute": 10570951184,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 1.345605468377471,
+      "compute": 9.844965472817421,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 35862427178,
+     "staging_layers": 1,
+     "fixed": 35862427178,
+     "cache_slots": 598,
+     "cache_bytes": 2788651008,
+     "wired_limit": 38651078186,
+     "bound": "Live",
+     "fixed_gib": 33.39948801137507,
+     "cache_gib": 2.5971336364746094,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 4096,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 1444832870,
+      "compute": 6776230006,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 1.345605468377471,
+      "compute": 6.310855975374579,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 31899933840,
+     "staging_layers": 2,
+     "fixed": 36675148944,
+     "cache_slots": 12721,
+     "cache_bytes": 59321788416,
+     "wired_limit": 95996937360,
+     "bound": "WorkingSet",
+     "fixed_gib": 34.15639413893223,
+     "cache_gib": 55.24772071838379,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 4096,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 1444832870,
+      "compute": 6776230006,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 1.345605468377471,
+      "compute": 6.310855975374579,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 31899933840,
+     "staging_layers": 2,
+     "fixed": 36675148944,
+     "cache_slots": 7332,
+     "cache_bytes": 34191286272,
+     "wired_limit": 70866435216,
+     "bound": "Live",
+     "fixed_gib": 34.15639413893223,
+     "cache_gib": 31.843116760253906,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 4096,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 1444832870,
+      "compute": 6776230006,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 1.345605468377471,
+      "compute": 6.310855975374579,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 31899933840,
+     "staging_layers": 1,
+     "fixed": 31899933840,
+     "cache_slots": 1448,
+     "cache_bytes": 6752452608,
+     "wired_limit": 38652386448,
+     "bound": "Live",
+     "fixed_gib": 29.709128513932228,
+     "cache_gib": 6.2887115478515625,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 2048,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 1444832870,
+      "compute": 4878869418,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 1.345605468377471,
+      "compute": 4.543801227584481,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 29918687172,
+     "staging_layers": 2,
+     "fixed": 34693902276,
+     "cache_slots": 13146,
+     "cache_bytes": 61303689216,
+     "wired_limit": 95997591492,
+     "bound": "WorkingSet",
+     "fixed_gib": 32.31121439114213,
+     "cache_gib": 57.093509674072266,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 2048,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 1444832870,
+      "compute": 4878869418,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 1.345605468377471,
+      "compute": 4.543801227584481,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 29918687172,
+     "staging_layers": 2,
+     "fixed": 34693902276,
+     "cache_slots": 7756,
+     "cache_bytes": 36168523776,
+     "wired_limit": 70862426052,
+     "bound": "Live",
+     "fixed_gib": 32.31121439114213,
+     "cache_gib": 33.68456268310547,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 2048,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 1444832870,
+      "compute": 4878869418,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 1.345605468377471,
+      "compute": 4.543801227584481,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 29918687172,
+     "staging_layers": 1,
+     "fixed": 29918687172,
+     "cache_slots": 1873,
+     "cache_bytes": 8734353408,
+     "wired_limit": 38653040580,
+     "bound": "Live",
+     "fixed_gib": 27.86394876614213,
+     "cache_gib": 8.134500503540039,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 8192,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 2688339148,
+      "compute": 10581017514,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 2.503710936754942,
+      "compute": 9.85434047318995,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 37115999786,
+     "staging_layers": 2,
+     "fixed": 41891214890,
+     "cache_slots": 11603,
+     "cache_bytes": 54108223488,
+     "wired_limit": 95999438378,
+     "bound": "WorkingSet",
+     "fixed_gib": 39.01423410512507,
+     "cache_gib": 50.39221000671387,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 8192,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 2688339148,
+      "compute": 10581017514,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 2.503710936754942,
+      "compute": 9.85434047318995,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 37115999786,
+     "staging_layers": 2,
+     "fixed": 41891214890,
+     "cache_slots": 6213,
+     "cache_bytes": 28973058048,
+     "wired_limit": 70864272938,
+     "bound": "Live",
+     "fixed_gib": 39.01423410512507,
+     "cache_gib": 26.98326301574707,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 8192,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 2688339148,
+      "compute": 10581017514,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 2.503710936754942,
+      "compute": 9.85434047318995,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 37115999786,
+     "staging_layers": 1,
+     "fixed": 37115999786,
+     "cache_slots": 329,
+     "cache_bytes": 1534224384,
+     "wired_limit": 38650224170,
+     "bound": "Live",
+     "fixed_gib": 34.56696848012507,
+     "cache_gib": 1.4288578033447266,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 4096,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 2688339148,
+      "compute": 6786296336,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 2.503710936754942,
+      "compute": 6.3202309757471085,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 33153506448,
+     "staging_layers": 2,
+     "fixed": 37928721552,
+     "cache_slots": 12452,
+     "cache_bytes": 58067361792,
+     "wired_limit": 95996083344,
+     "bound": "WorkingSet",
+     "fixed_gib": 35.32387460768223,
+     "cache_gib": 54.079444885253906,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 4096,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 2688339148,
+      "compute": 6786296336,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 2.503710936754942,
+      "compute": 6.3202309757471085,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 33153506448,
+     "staging_layers": 2,
+     "fixed": 37928721552,
+     "cache_slots": 7063,
+     "cache_bytes": 32936859648,
+     "wired_limit": 70865581200,
+     "bound": "Live",
+     "fixed_gib": 35.32387460768223,
+     "cache_gib": 30.674840927124023,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 4096,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 2688339148,
+      "compute": 6786296336,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 2.503710936754942,
+      "compute": 6.3202309757471085,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 33153506448,
+     "staging_layers": 1,
+     "fixed": 33153506448,
+     "cache_slots": 1179,
+     "cache_bytes": 5498025984,
+     "wired_limit": 38651532432,
+     "bound": "Live",
+     "fixed_gib": 30.876608982682228,
+     "cache_gib": 5.12043571472168,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 2048,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 2688339148,
+      "compute": 4888935747,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 2.503710936754942,
+      "compute": 4.553176227025688,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 31172259779,
+     "staging_layers": 2,
+     "fixed": 35947474883,
+     "cache_slots": 12877,
+     "cache_bytes": 60049262592,
+     "wired_limit": 95996737475,
+     "bound": "WorkingSet",
+     "fixed_gib": 33.47869485896081,
+     "cache_gib": 55.92523384094238,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 2048,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 2688339148,
+      "compute": 4888935747,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 2.503710936754942,
+      "compute": 4.553176227025688,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 31172259779,
+     "staging_layers": 2,
+     "fixed": 35947474883,
+     "cache_slots": 7488,
+     "cache_bytes": 34918760448,
+     "wired_limit": 70866235331,
+     "bound": "Live",
+     "fixed_gib": 33.47869485896081,
+     "cache_gib": 32.5206298828125,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 2048,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 2688339148,
+      "compute": 4888935747,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 2.503710936754942,
+      "compute": 4.553176227025688,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 31172259779,
+     "staging_layers": 1,
+     "fixed": 31172259779,
+     "cache_slots": 1604,
+     "cache_bytes": 7479926784,
+     "wired_limit": 38652186563,
+     "bound": "Live",
+     "fixed_gib": 29.031429233960807,
+     "cache_gib": 6.966224670410156,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 8192,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 5175351705,
+      "compute": 10601150173,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 4.8199218744412065,
+      "compute": 9.873090473003685,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 39623145002,
+     "staging_layers": 2,
+     "fixed": 44398360106,
+     "cache_slots": 11065,
+     "cache_bytes": 51599370240,
+     "wired_limit": 95997730346,
+     "bound": "WorkingSet",
+     "fixed_gib": 41.34919504262507,
+     "cache_gib": 48.0556583404541,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 8192,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 5175351705,
+      "compute": 10601150173,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 4.8199218744412065,
+      "compute": 9.873090473003685,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 39623145002,
+     "staging_layers": 2,
+     "fixed": 44398360106,
+     "cache_slots": 5675,
+     "cache_bytes": 26464204800,
+     "wired_limit": 70862564906,
+     "bound": "Live",
+     "fixed_gib": 41.34919504262507,
+     "cache_gib": 24.646711349487305,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 8192,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 5175351705,
+      "compute": 10601150173,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 4.8199218744412065,
+      "compute": 9.873090473003685,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": true,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 39623145002,
+     "fixed1_gib": 36.90192941762507,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 4096,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 5175351705,
+      "compute": 6806428995,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 4.8199218744412065,
+      "compute": 6.338980975560844,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 35660651664,
+     "staging_layers": 2,
+     "fixed": 40435866768,
+     "cache_slots": 11915,
+     "cache_bytes": 55563171840,
+     "wired_limit": 95999038608,
+     "bound": "WorkingSet",
+     "fixed_gib": 37.65883554518223,
+     "cache_gib": 51.747236251831055,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 4096,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 5175351705,
+      "compute": 6806428995,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 4.8199218744412065,
+      "compute": 6.338980975560844,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 35660651664,
+     "staging_layers": 2,
+     "fixed": 40435866768,
+     "cache_slots": 6525,
+     "cache_bytes": 30428006400,
+     "wired_limit": 70863873168,
+     "bound": "Live",
+     "fixed_gib": 37.65883554518223,
+     "cache_gib": 28.338289260864258,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 4096,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 5175351705,
+      "compute": 6806428995,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 4.8199218744412065,
+      "compute": 6.338980975560844,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 35660651664,
+     "staging_layers": 1,
+     "fixed": 35660651664,
+     "cache_slots": 642,
+     "cache_bytes": 2993836032,
+     "wired_limit": 38654487696,
+     "bound": "Live",
+     "fixed_gib": 33.21156992018223,
+     "cache_gib": 2.788227081298828,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 2048,
+     "others_gib": 20,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 5175351705,
+      "compute": 4909068406,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 4.8199218744412065,
+      "compute": 4.571926226839423,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 33679404995,
+     "staging_layers": 2,
+     "fixed": 38454620099,
+     "cache_slots": 12340,
+     "cache_bytes": 57545072640,
+     "wired_limit": 95999692739,
+     "bound": "WorkingSet",
+     "fixed_gib": 35.81365579646081,
+     "cache_gib": 53.59302520751953,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 2048,
+     "others_gib": 50,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 5175351705,
+      "compute": 4909068406,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 4.8199218744412065,
+      "compute": 4.571926226839423,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 33679404995,
+     "staging_layers": 2,
+     "fixed": 38454620099,
+     "cache_slots": 6950,
+     "cache_bytes": 32409907200,
+     "wired_limit": 70864527299,
+     "bound": "Live",
+     "fixed_gib": 35.81365579646081,
+     "cache_gib": 30.184078216552734,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 2048,
+     "others_gib": 80,
+     "terms": {
+      "dense": 11352192436,
+      "staging_layer": 4775215104,
+      "kv": 5175351705,
+      "compute": 4909068406,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 10.57255308702588,
+      "staging_layer": 4.447265625,
+      "kv": 4.8199218744412065,
+      "compute": 4.571926226839423,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 33679404995,
+     "staging_layers": 1,
+     "fixed": 33679404995,
+     "cache_slots": 1066,
+     "cache_bytes": 4971073536,
+     "wired_limit": 38650478531,
+     "bound": "Live",
+     "fixed_gib": 31.366390171460807,
+     "cache_gib": 4.629673004150391,
+     "budget_gib": 36.0
+    }
+   ],
+   "pick": {
+    "20": {
+     "admitted": true,
+     "ctx": 262144,
+     "chunk_rows": 8192,
+     "cache_bytes": 51599370240,
+     "cache_gib": 48.0556583404541,
+     "staging_layers": 2,
+     "wired_limit": 95997730346,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": 8192,
+       "per_chunk": {
+        "8192": 48.0557,
+        "4096": 51.7472,
+        "2048": 53.593
+       }
+      }
+     ]
+    },
+    "50": {
+     "admitted": true,
+     "ctx": 262144,
+     "chunk_rows": 8192,
+     "cache_bytes": 26464204800,
+     "cache_gib": 24.646711349487305,
+     "staging_layers": 2,
+     "wired_limit": 70862564906,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": 8192,
+       "per_chunk": {
+        "8192": 24.6467,
+        "4096": 28.3383,
+        "2048": 30.1841
+       }
+      }
+     ]
+    },
+    "80": {
+     "admitted": true,
+     "ctx": 262144,
+     "chunk_rows": 2048,
+     "cache_bytes": 4971073536,
+     "cache_gib": 4.629673004150391,
+     "staging_layers": 1,
+     "wired_limit": 38650478531,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": 2048,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": 2.7882,
+        "2048": 4.6297
+       }
+      }
+     ]
+    },
+    "82": {
+     "admitted": true,
+     "ctx": 262144,
+     "chunk_rows": 2048,
+     "cache_bytes": 2825957376,
+     "cache_gib": 2.631877899169922,
+     "staging_layers": 1,
+     "wired_limit": 36505362371,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": 2048,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": 0.7861,
+        "2048": 2.6319
+       }
+      }
+     ]
+    },
+    "84": {
+     "admitted": true,
+     "ctx": 262144,
+     "chunk_rows": 2048,
+     "cache_bytes": 676177920,
+     "cache_gib": 0.6297397613525391,
+     "staging_layers": 1,
+     "wired_limit": 34355582915,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": 2048,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": 0.6297
+       }
+      }
+     ]
+    },
+    "86": {
+     "admitted": true,
+     "ctx": 131072,
+     "chunk_rows": 2048,
+     "cache_bytes": 1039915008,
+     "cache_gib": 0.9684963226318359,
+     "staging_layers": 1,
+     "wired_limit": 32212174787,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": null,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": "refused"
+       }
+      },
+      {
+       "ctx": 131072,
+       "chunk_rows": 2048,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": 0.9685
+       }
+      }
+     ]
+    },
+    "88": {
+     "admitted": true,
+     "ctx": 65536,
+     "chunk_rows": 2048,
+     "cache_bytes": 144562176,
+     "cache_gib": 0.13463401794433594,
+     "staging_layers": 1,
+     "wired_limit": 30063249348,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": null,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": "refused"
+       }
+      },
+      {
+       "ctx": 131072,
+       "chunk_rows": null,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": "refused"
+       }
+      },
+      {
+       "ctx": 65536,
+       "chunk_rows": 2048,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": 0.1346
+       }
+      }
+     ]
+    },
+    "90": {
+     "admitted": false,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": null,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": "refused"
+       }
+      },
+      {
+       "ctx": 131072,
+       "chunk_rows": null,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": "refused"
+       }
+      },
+      {
+       "ctx": 65536,
+       "chunk_rows": null,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": "refused"
+       }
+      },
+      {
+       "ctx": 32768,
+       "chunk_rows": null,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": "refused"
+       }
+      },
+      {
+       "ctx": 16384,
+       "chunk_rows": null,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": "refused"
+       }
+      }
+     ]
+    }
+   }
+  },
+  "mtp_off": {
+   "dense": 9162262836,
+   "kv_per_ctx": 14596,
+   "rows": [
+    {
+     "ctx": 16384,
+     "chunk_rows": 8192,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 488295628,
+      "compute": 10563401437,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.45476074144244194,
+      "compute": 9.837934223003685,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 32708410589,
+     "staging_layers": 2,
+     "fixed": 37483625693,
+     "cache_slots": 12548,
+     "cache_bytes": 58515038208,
+     "wired_limit": 95998663901,
+     "bound": "WorkingSet",
+     "fixed_gib": 34.90934678632766,
+     "cache_gib": 54.496376037597656,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 8192,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 488295628,
+      "compute": 10563401437,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.45476074144244194,
+      "compute": 9.837934223003685,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 32708410589,
+     "staging_layers": 2,
+     "fixed": 37483625693,
+     "cache_slots": 7158,
+     "cache_bytes": 33379872768,
+     "wired_limit": 70863498461,
+     "bound": "Live",
+     "fixed_gib": 34.90934678632766,
+     "cache_gib": 31.08742904663086,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 8192,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 488295628,
+      "compute": 10563401437,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.45476074144244194,
+      "compute": 9.837934223003685,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 32708410589,
+     "staging_layers": 1,
+     "fixed": 32708410589,
+     "cache_slots": 1275,
+     "cache_bytes": 5945702400,
+     "wired_limit": 38654112989,
+     "bound": "Live",
+     "fixed_gib": 30.46208116132766,
+     "cache_gib": 5.53736686706543,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 4096,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 488295628,
+      "compute": 6768680259,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.45476074144244194,
+      "compute": 6.303824725560844,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 28745917251,
+     "staging_layers": 2,
+     "fixed": 33521132355,
+     "cache_slots": 13398,
+     "cache_bytes": 62478839808,
+     "wired_limit": 95999972163,
+     "bound": "WorkingSet",
+     "fixed_gib": 31.21898728888482,
+     "cache_gib": 58.18795394897461,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 4096,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 488295628,
+      "compute": 6768680259,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.45476074144244194,
+      "compute": 6.303824725560844,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 28745917251,
+     "staging_layers": 2,
+     "fixed": 33521132355,
+     "cache_slots": 8008,
+     "cache_bytes": 37343674368,
+     "wired_limit": 70864806723,
+     "bound": "Live",
+     "fixed_gib": 31.21898728888482,
+     "cache_gib": 34.77900695800781,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 4096,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 488295628,
+      "compute": 6768680259,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.45476074144244194,
+      "compute": 6.303824725560844,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 28745917251,
+     "staging_layers": 1,
+     "fixed": 28745917251,
+     "cache_slots": 2124,
+     "cache_bytes": 9904840704,
+     "wired_limit": 38650757955,
+     "bound": "Live",
+     "fixed_gib": 26.77172166388482,
+     "cache_gib": 9.224601745605469,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 2048,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 488295628,
+      "compute": 4871319670,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.45476074144244194,
+      "compute": 4.536769976839423,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 26764670582,
+     "staging_layers": 2,
+     "fixed": 31539885686,
+     "cache_slots": 13822,
+     "cache_bytes": 64456077312,
+     "wired_limit": 95995962998,
+     "bound": "WorkingSet",
+     "fixed_gib": 29.373807540163398,
+     "cache_gib": 60.02939987182617,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 2048,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 488295628,
+      "compute": 4871319670,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.45476074144244194,
+      "compute": 4.536769976839423,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 26764670582,
+     "staging_layers": 2,
+     "fixed": 31539885686,
+     "cache_slots": 8433,
+     "cache_bytes": 39325575168,
+     "wired_limit": 70865460854,
+     "bound": "Live",
+     "fixed_gib": 29.373807540163398,
+     "cache_gib": 36.62479591369629,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 16384,
+     "chunk_rows": 2048,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 488295628,
+      "compute": 4871319670,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.45476074144244194,
+      "compute": 4.536769976839423,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 26764670582,
+     "staging_layers": 1,
+     "fixed": 26764670582,
+     "cache_slots": 2549,
+     "cache_bytes": 11886741504,
+     "wired_limit": 38651412086,
+     "bound": "Live",
+     "fixed_gib": 24.926541915163398,
+     "cache_gib": 11.070390701293945,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 8192,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 775264665,
+      "compute": 10565918019,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.7220214838162065,
+      "compute": 9.840277972631156,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 32997896208,
+     "staging_layers": 2,
+     "fixed": 37773111312,
+     "cache_slots": 12486,
+     "cache_bytes": 58225913856,
+     "wired_limit": 95999025168,
+     "bound": "WorkingSet",
+     "fixed_gib": 35.178951278328896,
+     "cache_gib": 54.227108001708984,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 8192,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 775264665,
+      "compute": 10565918019,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.7220214838162065,
+      "compute": 9.840277972631156,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 32997896208,
+     "staging_layers": 2,
+     "fixed": 37773111312,
+     "cache_slots": 7096,
+     "cache_bytes": 33090748416,
+     "wired_limit": 70863859728,
+     "bound": "Live",
+     "fixed_gib": 35.178951278328896,
+     "cache_gib": 30.818161010742188,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 8192,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 775264665,
+      "compute": 10565918019,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.7220214838162065,
+      "compute": 9.840277972631156,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 32997896208,
+     "staging_layers": 1,
+     "fixed": 32997896208,
+     "cache_slots": 1213,
+     "cache_bytes": 5656578048,
+     "wired_limit": 38654474256,
+     "bound": "Live",
+     "fixed_gib": 30.731685653328896,
+     "cache_gib": 5.268098831176758,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 4096,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 775264665,
+      "compute": 6771196842,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.7220214838162065,
+      "compute": 6.3061684761196375,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 29035402871,
+     "staging_layers": 2,
+     "fixed": 33810617975,
+     "cache_slots": 13335,
+     "cache_bytes": 62185052160,
+     "wired_limit": 95995670135,
+     "bound": "WorkingSet",
+     "fixed_gib": 31.488591781817377,
+     "cache_gib": 57.91434288024902,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 4096,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 775264665,
+      "compute": 6771196842,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.7220214838162065,
+      "compute": 6.3061684761196375,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 29035402871,
+     "staging_layers": 2,
+     "fixed": 33810617975,
+     "cache_slots": 7946,
+     "cache_bytes": 37054550016,
+     "wired_limit": 70865167991,
+     "bound": "Live",
+     "fixed_gib": 31.488591781817377,
+     "cache_gib": 34.50973892211914,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 4096,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 775264665,
+      "compute": 6771196842,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.7220214838162065,
+      "compute": 6.3061684761196375,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 29035402871,
+     "staging_layers": 1,
+     "fixed": 29035402871,
+     "cache_slots": 2062,
+     "cache_bytes": 9615716352,
+     "wired_limit": 38651119223,
+     "bound": "Live",
+     "fixed_gib": 27.041326156817377,
+     "cache_gib": 8.955333709716797,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 2048,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 775264665,
+      "compute": 4873836253,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.7220214838162065,
+      "compute": 4.539113727398217,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 27054156202,
+     "staging_layers": 2,
+     "fixed": 31829371306,
+     "cache_slots": 13760,
+     "cache_bytes": 64166952960,
+     "wired_limit": 95996324266,
+     "bound": "WorkingSet",
+     "fixed_gib": 29.643412033095956,
+     "cache_gib": 59.7601318359375,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 2048,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 775264665,
+      "compute": 4873836253,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.7220214838162065,
+      "compute": 4.539113727398217,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 27054156202,
+     "staging_layers": 2,
+     "fixed": 31829371306,
+     "cache_slots": 8371,
+     "cache_bytes": 39036450816,
+     "wired_limit": 70865822122,
+     "bound": "Live",
+     "fixed_gib": 29.643412033095956,
+     "cache_gib": 36.35552787780762,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 32768,
+     "chunk_rows": 2048,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 775264665,
+      "compute": 4873836253,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 0.7220214838162065,
+      "compute": 4.539113727398217,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 27054156202,
+     "staging_layers": 1,
+     "fixed": 27054156202,
+     "cache_slots": 2487,
+     "cache_bytes": 11597617152,
+     "wired_limit": 38651773354,
+     "bound": "Live",
+     "fixed_gib": 25.196146408095956,
+     "cache_gib": 10.801122665405273,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 8192,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 10570951184,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 9.844965472817421,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 33576867447,
+     "staging_layers": 2,
+     "fixed": 38352082551,
+     "cache_slots": 12362,
+     "cache_bytes": 57647665152,
+     "wired_limit": 95999747703,
+     "bound": "WorkingSet",
+     "fixed_gib": 35.71816026326269,
+     "cache_gib": 53.68857192993164,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 8192,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 10570951184,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 9.844965472817421,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 33576867447,
+     "staging_layers": 2,
+     "fixed": 38352082551,
+     "cache_slots": 6972,
+     "cache_bytes": 32512499712,
+     "wired_limit": 70864582263,
+     "bound": "Live",
+     "fixed_gib": 35.71816026326269,
+     "cache_gib": 30.279624938964844,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 8192,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 10570951184,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 9.844965472817421,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 33576867447,
+     "staging_layers": 1,
+     "fixed": 33576867447,
+     "cache_slots": 1088,
+     "cache_bytes": 5073666048,
+     "wired_limit": 38650533495,
+     "bound": "Live",
+     "fixed_gib": 31.27089463826269,
+     "cache_gib": 4.7252197265625,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 4096,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 6776230006,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 6.310855975374579,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 29614374109,
+     "staging_layers": 2,
+     "fixed": 34389589213,
+     "cache_slots": 13211,
+     "cache_bytes": 61606803456,
+     "wired_limit": 95996392669,
+     "bound": "WorkingSet",
+     "fixed_gib": 32.02780076581985,
+     "cache_gib": 57.37580680847168,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 4096,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 6776230006,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 6.310855975374579,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 29614374109,
+     "staging_layers": 2,
+     "fixed": 34389589213,
+     "cache_slots": 7822,
+     "cache_bytes": 36476301312,
+     "wired_limit": 70865890525,
+     "bound": "Live",
+     "fixed_gib": 32.02780076581985,
+     "cache_gib": 33.9712028503418,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 4096,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 6776230006,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 6.310855975374579,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 29614374109,
+     "staging_layers": 1,
+     "fixed": 29614374109,
+     "cache_slots": 1938,
+     "cache_bytes": 9037467648,
+     "wired_limit": 38651841757,
+     "bound": "Live",
+     "fixed_gib": 27.580535140819848,
+     "cache_gib": 8.416797637939453,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 2048,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 4878869418,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 4.543801227584481,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 27633127441,
+     "staging_layers": 2,
+     "fixed": 32408342545,
+     "cache_slots": 13636,
+     "cache_bytes": 63588704256,
+     "wired_limit": 95997046801,
+     "bound": "WorkingSet",
+     "fixed_gib": 30.18262101802975,
+     "cache_gib": 59.221595764160156,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 2048,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 4878869418,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 4.543801227584481,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 27633127441,
+     "staging_layers": 2,
+     "fixed": 32408342545,
+     "cache_slots": 8247,
+     "cache_bytes": 38458202112,
+     "wired_limit": 70866544657,
+     "bound": "Live",
+     "fixed_gib": 30.18262101802975,
+     "cache_gib": 35.81699180603027,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 2048,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 4878869418,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 4.543801227584481,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 27633127441,
+     "staging_layers": 1,
+     "fixed": 27633127441,
+     "cache_slots": 2363,
+     "cache_bytes": 11019368448,
+     "wired_limit": 38652495889,
+     "bound": "Live",
+     "fixed_gib": 25.73535539302975,
+     "cache_gib": 10.26258659362793,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 8192,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 2497078886,
+      "compute": 10581017514,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 2.325585937127471,
+      "compute": 9.85434047318995,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 34734809924,
+     "staging_layers": 2,
+     "fixed": 39510025028,
+     "cache_slots": 12113,
+     "cache_bytes": 56486504448,
+     "wired_limit": 95996529476,
+     "bound": "WorkingSet",
+     "fixed_gib": 36.796578232198954,
+     "cache_gib": 52.60715675354004,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 8192,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 2497078886,
+      "compute": 10581017514,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 2.325585937127471,
+      "compute": 9.85434047318995,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 34734809924,
+     "staging_layers": 2,
+     "fixed": 39510025028,
+     "cache_slots": 6724,
+     "cache_bytes": 31356002304,
+     "wired_limit": 70866027332,
+     "bound": "Live",
+     "fixed_gib": 36.796578232198954,
+     "cache_gib": 29.202552795410156,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 8192,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 2497078886,
+      "compute": 10581017514,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 2.325585937127471,
+      "compute": 9.85434047318995,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 34734809924,
+     "staging_layers": 1,
+     "fixed": 34734809924,
+     "cache_slots": 840,
+     "cache_bytes": 3917168640,
+     "wired_limit": 38651978564,
+     "bound": "Live",
+     "fixed_gib": 32.349312607198954,
+     "cache_gib": 3.6481475830078125,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 4096,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 2497078886,
+      "compute": 6786296336,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 2.325585937127471,
+      "compute": 6.3202309757471085,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 30772316586,
+     "staging_layers": 2,
+     "fixed": 35547531690,
+     "cache_slots": 12963,
+     "cache_bytes": 60450306048,
+     "wired_limit": 95997837738,
+     "bound": "WorkingSet",
+     "fixed_gib": 33.10621873475611,
+     "cache_gib": 56.29873466491699,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 4096,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 2497078886,
+      "compute": 6786296336,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 2.325585937127471,
+      "compute": 6.3202309757471085,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 30772316586,
+     "staging_layers": 2,
+     "fixed": 35547531690,
+     "cache_slots": 7573,
+     "cache_bytes": 35315140608,
+     "wired_limit": 70862672298,
+     "bound": "Live",
+     "fixed_gib": 33.10621873475611,
+     "cache_gib": 32.889787673950195,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 4096,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 2497078886,
+      "compute": 6786296336,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 2.325585937127471,
+      "compute": 6.3202309757471085,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 30772316586,
+     "staging_layers": 1,
+     "fixed": 30772316586,
+     "cache_slots": 1690,
+     "cache_bytes": 7880970240,
+     "wired_limit": 38653286826,
+     "bound": "Live",
+     "fixed_gib": 28.658953109756112,
+     "cache_gib": 7.339725494384766,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 2048,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 2497078886,
+      "compute": 4888935747,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 2.325585937127471,
+      "compute": 4.553176227025688,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 28791069917,
+     "staging_layers": 2,
+     "fixed": 33566285021,
+     "cache_slots": 13388,
+     "cache_bytes": 62432206848,
+     "wired_limit": 95998491869,
+     "bound": "WorkingSet",
+     "fixed_gib": 31.26103898603469,
+     "cache_gib": 58.14452362060547,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 2048,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 2497078886,
+      "compute": 4888935747,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 2.325585937127471,
+      "compute": 4.553176227025688,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 28791069917,
+     "staging_layers": 2,
+     "fixed": 33566285021,
+     "cache_slots": 7998,
+     "cache_bytes": 37297041408,
+     "wired_limit": 70863326429,
+     "bound": "Live",
+     "fixed_gib": 31.26103898603469,
+     "cache_gib": 34.73557662963867,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 2048,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 2497078886,
+      "compute": 4888935747,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 2.325585937127471,
+      "compute": 4.553176227025688,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 28791069917,
+     "staging_layers": 1,
+     "fixed": 28791069917,
+     "cache_slots": 2115,
+     "cache_bytes": 9862871040,
+     "wired_limit": 38653940957,
+     "bound": "Live",
+     "fixed_gib": 26.81377336103469,
+     "cache_gib": 9.185514450073242,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 8192,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 4792831180,
+      "compute": 10601150173,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 4.463671874254942,
+      "compute": 9.873090473003685,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 37050694877,
+     "staging_layers": 2,
+     "fixed": 41825909981,
+     "cache_slots": 11617,
+     "cache_bytes": 54173509632,
+     "wired_limit": 95999419613,
+     "bound": "WorkingSet",
+     "fixed_gib": 38.95341416914016,
+     "cache_gib": 50.453012466430664,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 8192,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 4792831180,
+      "compute": 10601150173,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 4.463671874254942,
+      "compute": 9.873090473003685,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 37050694877,
+     "staging_layers": 2,
+     "fixed": 41825909981,
+     "cache_slots": 6227,
+     "cache_bytes": 29038344192,
+     "wired_limit": 70864254173,
+     "bound": "Live",
+     "fixed_gib": 38.95341416914016,
+     "cache_gib": 27.044065475463867,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 8192,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 4792831180,
+      "compute": 10601150173,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 4.463671874254942,
+      "compute": 9.873090473003685,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 37050694877,
+     "staging_layers": 1,
+     "fixed": 37050694877,
+     "cache_slots": 343,
+     "cache_bytes": 1599510528,
+     "wired_limit": 38650205405,
+     "bound": "Live",
+     "fixed_gib": 34.50614854414016,
+     "cache_gib": 1.4896602630615234,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 4096,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 4792831180,
+      "compute": 6806428995,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 4.463671874254942,
+      "compute": 6.338980975560844,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 33088201539,
+     "staging_layers": 2,
+     "fixed": 37863416643,
+     "cache_slots": 12466,
+     "cache_bytes": 58132647936,
+     "wired_limit": 95996064579,
+     "bound": "WorkingSet",
+     "fixed_gib": 35.26305467169732,
+     "cache_gib": 54.1402473449707,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 4096,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 4792831180,
+      "compute": 6806428995,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 4.463671874254942,
+      "compute": 6.338980975560844,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 33088201539,
+     "staging_layers": 2,
+     "fixed": 37863416643,
+     "cache_slots": 7077,
+     "cache_bytes": 33002145792,
+     "wired_limit": 70865562435,
+     "bound": "Live",
+     "fixed_gib": 35.26305467169732,
+     "cache_gib": 30.73564338684082,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 4096,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 4792831180,
+      "compute": 6806428995,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 4.463671874254942,
+      "compute": 6.338980975560844,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 33088201539,
+     "staging_layers": 1,
+     "fixed": 33088201539,
+     "cache_slots": 1193,
+     "cache_bytes": 5563312128,
+     "wired_limit": 38651513667,
+     "bound": "Live",
+     "fixed_gib": 30.81578904669732,
+     "cache_gib": 5.181238174438477,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 2048,
+     "others_gib": 20,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 4792831180,
+      "compute": 4909068406,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 4.463671874254942,
+      "compute": 4.571926226839423,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 31106954870,
+     "staging_layers": 2,
+     "fixed": 35882169974,
+     "cache_slots": 12891,
+     "cache_bytes": 60114548736,
+     "wired_limit": 95996718710,
+     "bound": "WorkingSet",
+     "fixed_gib": 33.4178749229759,
+     "cache_gib": 55.98603630065918,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 2048,
+     "others_gib": 50,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 4792831180,
+      "compute": 4909068406,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 4.463671874254942,
+      "compute": 4.571926226839423,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 31106954870,
+     "staging_layers": 2,
+     "fixed": 35882169974,
+     "cache_slots": 7502,
+     "cache_bytes": 34984046592,
+     "wired_limit": 70866216566,
+     "bound": "Live",
+     "fixed_gib": 33.4178749229759,
+     "cache_gib": 32.5814323425293,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 262144,
+     "chunk_rows": 2048,
+     "others_gib": 80,
+     "terms": {
+      "dense": 9162262836,
+      "staging_layer": 4775215104,
+      "kv": 4792831180,
+      "compute": 4909068406,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 8.533022213727236,
+      "staging_layer": 4.447265625,
+      "kv": 4.463671874254942,
+      "compute": 4.571926226839423,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 31106954870,
+     "staging_layers": 1,
+     "fixed": 31106954870,
+     "cache_slots": 1618,
+     "cache_bytes": 7545212928,
+     "wired_limit": 38652167798,
+     "bound": "Live",
+     "fixed_gib": 28.970609297975898,
+     "cache_gib": 7.027027130126953,
+     "budget_gib": 36.0
+    }
+   ],
+   "pick": {
+    "20": {
+     "admitted": true,
+     "ctx": 262144,
+     "chunk_rows": 8192,
+     "cache_bytes": 54173509632,
+     "cache_gib": 50.453012466430664,
+     "staging_layers": 2,
+     "wired_limit": 95999419613,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": 8192,
+       "per_chunk": {
+        "8192": 50.453,
+        "4096": 54.1402,
+        "2048": 55.986
+       }
+      }
+     ]
+    },
+    "50": {
+     "admitted": true,
+     "ctx": 262144,
+     "chunk_rows": 8192,
+     "cache_bytes": 29038344192,
+     "cache_gib": 27.044065475463867,
+     "staging_layers": 2,
+     "wired_limit": 70864254173,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": 8192,
+       "per_chunk": {
+        "8192": 27.0441,
+        "4096": 30.7356,
+        "2048": 32.5814
+       }
+      }
+     ]
+    },
+    "80": {
+     "admitted": true,
+     "ctx": 262144,
+     "chunk_rows": 2048,
+     "cache_bytes": 7545212928,
+     "cache_gib": 7.027027130126953,
+     "staging_layers": 1,
+     "wired_limit": 38652167798,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": 2048,
+       "per_chunk": {
+        "8192": 1.4897,
+        "4096": 5.1812,
+        "2048": 7.027
+       }
+      }
+     ]
+    },
+    "82": {
+     "admitted": true,
+     "ctx": 262144,
+     "chunk_rows": 2048,
+     "cache_bytes": 5400096768,
+     "cache_gib": 5.029232025146484,
+     "staging_layers": 1,
+     "wired_limit": 36507051638,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": 2048,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": 3.1834,
+        "2048": 5.0292
+       }
+      }
+     ]
+    },
+    "84": {
+     "admitted": true,
+     "ctx": 262144,
+     "chunk_rows": 2048,
+     "cache_bytes": 3250317312,
+     "cache_gib": 3.0270938873291016,
+     "staging_layers": 1,
+     "wired_limit": 34357272182,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": 2048,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": 1.1813,
+        "2048": 3.0271
+       }
+      }
+     ]
+    },
+    "86": {
+     "admitted": true,
+     "ctx": 262144,
+     "chunk_rows": 2048,
+     "cache_bytes": 1105201152,
+     "cache_gib": 1.0292987823486328,
+     "staging_layers": 1,
+     "wired_limit": 32212156022,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": 2048,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": 1.0293
+       }
+      }
+     ]
+    },
+    "88": {
+     "admitted": true,
+     "ctx": 131072,
+     "chunk_rows": 2048,
+     "cache_bytes": 1273079808,
+     "cache_gib": 1.185647964477539,
+     "staging_layers": 1,
+     "wired_limit": 30064149725,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": null,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": "refused"
+       }
+      },
+      {
+       "ctx": 131072,
+       "chunk_rows": 2048,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": 1.1856
+       }
+      }
+     ]
+    },
+    "90": {
+     "admitted": true,
+     "ctx": 65536,
+     "chunk_rows": 2048,
+     "cache_bytes": 279797760,
+     "cache_gib": 0.26058197021484375,
+     "staging_layers": 1,
+     "wired_limit": 27912925201,
+     "steps": [
+      {
+       "ctx": 262144,
+       "chunk_rows": null,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": "refused"
+       }
+      },
+      {
+       "ctx": 131072,
+       "chunk_rows": null,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": "refused"
+       }
+      },
+      {
+       "ctx": 65536,
+       "chunk_rows": 2048,
+       "per_chunk": {
+        "8192": "refused",
+        "4096": "refused",
+        "2048": 0.2606
+       }
+      }
+     ]
+    }
+   }
+  }
+ },
+ "plan_table_reproduction": [
+  {
+   "C": 2048,
+   "others": 20,
+   "plan": {
+    "fixed": 35.81,
+    "layers": 2,
+    "cache": 53.6
+   },
+   "script": {
+    "fixed": 35.81,
+    "layers": 2,
+    "cache": 53.6
+   },
+   "equal": true
+  },
+  {
+   "C": 2048,
+   "others": 50,
+   "plan": {
+    "fixed": 35.81,
+    "layers": 2,
+    "cache": 30.19
+   },
+   "script": {
+    "fixed": 35.81,
+    "layers": 2,
+    "cache": 30.19
+   },
+   "equal": true
+  },
+  {
+   "C": 2048,
+   "others": 80,
+   "plan": {
+    "fixed": 31.36,
+    "layers": 1,
+    "cache": 4.64
+   },
+   "script": {
+    "fixed": 31.36,
+    "layers": 1,
+    "cache": 4.64
+   },
+   "equal": true
+  },
+  {
+   "C": 4096,
+   "others": 20,
+   "plan": {
+    "fixed": 37.66,
+    "layers": 2,
+    "cache": 51.75
+   },
+   "script": {
+    "fixed": 37.66,
+    "layers": 2,
+    "cache": 51.75
+   },
+   "equal": true
+  },
+  {
+   "C": 4096,
+   "others": 50,
+   "plan": {
+    "fixed": 37.66,
+    "layers": 2,
+    "cache": 28.34
+   },
+   "script": {
+    "fixed": 37.66,
+    "layers": 2,
+    "cache": 28.34
+   },
+   "equal": true
+  },
+  {
+   "C": 4096,
+   "others": 80,
+   "plan": {
+    "fixed": 33.21,
+    "layers": 1,
+    "cache": 2.79
+   },
+   "script": {
+    "fixed": 33.21,
+    "layers": 1,
+    "cache": 2.79
+   },
+   "equal": true
+  },
+  {
+   "C": 8192,
+   "others": 20,
+   "plan": {
+    "fixed": 41.35,
+    "layers": 2,
+    "cache": 48.06
+   },
+   "script": {
+    "fixed": 41.35,
+    "layers": 2,
+    "cache": 48.06
+   },
+   "equal": true
+  },
+  {
+   "C": 8192,
+   "others": 50,
+   "plan": {
+    "fixed": 41.35,
+    "layers": 2,
+    "cache": 24.65
+   },
+   "script": {
+    "fixed": 41.35,
+    "layers": 2,
+    "cache": 24.65
+   },
+   "equal": true
+  },
+  {
+   "C": 8192,
+   "others": 80,
+   "plan": {
+    "refused": true,
+    "fixed1": 36.9,
+    "budget": 36.0
+   },
+   "script": {
+    "refused": true,
+    "fixed1": 36.9,
+    "budget": 36.0
+   },
+   "equal": true
+  }
+ ]
+}
