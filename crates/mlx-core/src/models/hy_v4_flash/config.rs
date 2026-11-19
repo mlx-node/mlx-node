@@ -11,7 +11,8 @@ use crate::utils::gguf::{GgufFile, GgufMetaValue};
 pub const ARCH: &str = "hy_v4_flash";
 /// llama.cpp `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID`.
 const GATING_SIGMOID: usize = 2;
-/// Context cap the runtime uses unless the caller passes another one.
+/// Most tokens one sequence may hold; the file and the load option can only
+/// lower it.
 pub const DEFAULT_CONTEXT_CAP: usize = 262_144;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +101,7 @@ pub struct HyV4FlashConfig {
     /// Trunk layers, then the MTP layers.
     pub layers: Vec<LayerConfig>,
     pub vocab_size: usize,
-    /// The file's maximum; the runtime limit is `context_limit(cap)`.
+    /// The trained maximum; the runtime limit is `max_context`.
     pub context_length: usize,
     pub dim: usize,
     pub dense_ff: usize,
@@ -275,6 +276,10 @@ impl HyV4FlashConfig {
         if window == 0 || rope_theta <= 0.0 || rope_theta_swa <= 0.0 {
             return Err(bad("sliding_window and rope bases must be > 0"));
         }
+        let context_length = m.usize("context_length")?;
+        if context_length == 0 {
+            return Err(bad("context_length is 0"));
+        }
         let layers = layers(
             &m,
             n_layers,
@@ -288,7 +293,7 @@ impl HyV4FlashConfig {
             n_layers,
             layers,
             vocab_size,
-            context_length: m.usize("context_length")?,
+            context_length,
             dim,
             dense_ff: m.usize("feed_forward_length")?,
             n_dense_lead,
@@ -317,12 +322,16 @@ impl HyV4FlashConfig {
         &self.layers[self.n_layers..]
     }
 
-    /// Tokens one sequence may hold under the runtime `cap`.
-    pub fn context_limit(&self, cap: usize) -> Result<usize> {
-        if cap == 0 {
-            return Err(bad("context cap is 0"));
+    /// Tokens one sequence may hold: the least of `context_length`,
+    /// `DEFAULT_CONTEXT_CAP` and the load option `maxContextTokens`.
+    pub fn max_context(&self, requested: Option<usize>) -> Result<usize> {
+        if requested == Some(0) {
+            return Err(bad("maxContextTokens is 0"));
         }
-        Ok(cap.min(self.context_length))
+        Ok(self
+            .context_length
+            .min(DEFAULT_CONTEXT_CAP)
+            .min(requested.unwrap_or(usize::MAX)))
     }
 }
 

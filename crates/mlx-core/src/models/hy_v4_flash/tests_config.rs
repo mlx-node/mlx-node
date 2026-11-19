@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use super::config::{Attn, DEFAULT_CONTEXT_CAP};
 use super::header::{self, Header};
-use super::scan::{ENGRAM_TABLE, ExpertClass, Role, Scan};
+use super::scan::{ENGRAM_TABLE, ExpertClass, MtpLayer, Role, Scan};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 
 #[derive(Clone)]
@@ -421,16 +421,94 @@ fn tiny_fixture_scans() {
     );
     assert_eq!(s.engram_table.info.dims, [32, 36]);
     assert_eq!(s.tensors.len(), tiny_tensors().len());
+
+    let mtp_bytes: u64 = tiny_tensors()
+        .into_iter()
+        .filter(|t| t.0.starts_with(&format!("blk.{N_TRUNK}.")))
+        .map(|(name, dims, tensor_type)| {
+            GgufTensorInfo {
+                name,
+                n_dims: dims.len() as u32,
+                dims,
+                tensor_type,
+                offset: 0,
+            }
+            .data_size()
+            .unwrap()
+        })
+        .sum();
+    assert!(mtp_bytes > 0);
+    assert_eq!(
+        s.mtp,
+        Some(MtpLayer {
+            layer: N_TRUNK,
+            bytes: mtp_bytes,
+        })
+    );
+    assert_eq!(s.mtp_experts().map(|e| e.class), Some(ExpertClass::Bf16));
+    assert_eq!(s.trunk_experts().len(), N_TRUNK);
+}
+
+/// The same file written as by a converter run with `--no-mtp`.
+fn without_mtp() -> Fixture {
+    let mut f = tiny();
+    f.set_arch("block_count", Kv::U32(N_TRUNK as u32));
+    f.remove_arch("nextn_predict_layers");
+    f.set_arch(
+        "attention.head_count",
+        Kv::I32s((0..N_TRUNK).map(|il| heads(il) as i32).collect()),
+    );
+    f.set_arch(
+        "attention.sliding_window_pattern",
+        Kv::Bools((0..N_TRUNK).map(|il| !indexed(il)).collect()),
+    );
+    f.set_arch("swiglu_clamp_exp", Kv::F32s(vec![10.0; N_TRUNK]));
+    let prefix = format!("blk.{N_TRUNK}.");
+    f.tensors.retain(|t| !t.0.starts_with(&prefix));
+    f
 }
 
 #[test]
-fn context_limit_is_the_runtime_cap_up_to_the_file() {
+fn a_file_without_the_mtp_layer_scans_without_it() {
+    let s = without_mtp().scan().unwrap();
+    assert_eq!((s.cfg.n_layers, s.cfg.layers.len()), (N_TRUNK, N_TRUNK));
+    assert!(s.cfg.mtp().is_empty());
+    assert_eq!(s.mtp, None);
+    assert!(s.mtp_experts().is_none());
+    assert_eq!(s.trunk_experts().len(), N_TRUNK);
+    assert_eq!(s.with_role(Role::Mtp).count(), 0);
+
+    let mut f = without_mtp();
+    f.tensors.extend(
+        tiny_tensors()
+            .into_iter()
+            .filter(|t| t.0.starts_with(&format!("blk.{N_TRUNK}."))),
+    );
+    assert!(err(&f).contains("is not part of the hy_v4_flash layout"));
+}
+
+#[test]
+fn max_context_is_the_least_of_file_cap_and_option() {
     let s = tiny().scan().unwrap();
     assert_eq!(s.cfg.context_length, 1 << 20);
-    assert_eq!(s.cfg.context_limit(DEFAULT_CONTEXT_CAP).unwrap(), 262_144);
-    assert_eq!(s.cfg.context_limit(1 << 21).unwrap(), 1 << 20);
-    assert_eq!(s.cfg.context_limit(4096).unwrap(), 4096);
-    assert!(s.cfg.context_limit(0).is_err());
+    assert_eq!(DEFAULT_CONTEXT_CAP, 262_144);
+    assert_eq!(s.cfg.max_context(None).unwrap(), 262_144);
+    assert_eq!(s.cfg.max_context(Some(1 << 21)).unwrap(), 262_144);
+    assert_eq!(s.cfg.max_context(Some(262_145)).unwrap(), 262_144);
+    assert_eq!(s.cfg.max_context(Some(100_000)).unwrap(), 100_000);
+    assert_eq!(s.cfg.max_context(Some(4096)).unwrap(), 4096);
+    assert!(s.cfg.max_context(Some(0)).is_err());
+
+    let mut f = tiny();
+    f.set_arch("context_length", Kv::U32(32_768));
+    let c = f.scan().unwrap().cfg;
+    assert_eq!(c.max_context(None).unwrap(), 32_768);
+    assert_eq!(c.max_context(Some(1 << 20)).unwrap(), 32_768);
+    assert_eq!(c.max_context(Some(16_384)).unwrap(), 16_384);
+
+    let mut f = tiny();
+    f.set_arch("context_length", Kv::U32(0));
+    assert!(err(&f).contains("context_length is 0"));
 }
 
 #[test]
@@ -487,6 +565,30 @@ fn unsupported_metadata_is_refused() {
             "two MTP layers",
             Box::new(|f| f.set_arch("nextn_predict_layers", Kv::U32(2))),
             "MTP layers",
+        ),
+        (
+            "no head count for the MTP layer",
+            Box::new(|f| {
+                f.set_arch(
+                    "attention.head_count",
+                    Kv::I32s((0..N_TRUNK).map(|il| heads(il) as i32).collect()),
+                )
+            }),
+            "attention.head_count has 4 entries, need 5",
+        ),
+        (
+            "MTP layer with no heads",
+            Box::new(|f| {
+                f.set_arch(
+                    "attention.head_count",
+                    Kv::I32s(
+                        (0..=N_TRUNK)
+                            .map(|il| if il == N_TRUNK { 0 } else { heads(il) as i32 })
+                            .collect(),
+                    ),
+                )
+            }),
+            "layer 4: head_count is 0",
         ),
         (
             "no pattern",
@@ -703,10 +805,31 @@ fn real_headers_match_the_oracle_config() {
     );
     let ws = d["indexer_weight_scale"].as_f64().unwrap();
     assert!((f64::from(c.indexer.weight_scale()) - ws).abs() <= ws * 1e-6);
+    assert_eq!(c.max_context(None).unwrap(), n_ctx_target(d));
     assert_eq!(
-        c.context_limit(DEFAULT_CONTEXT_CAP).unwrap(),
-        n_ctx_target(d)
+        c.context_length,
+        d["context_length_gguf"].as_u64().unwrap() as usize
     );
+
+    let mtp = s.mtp.as_ref().unwrap();
+    assert_eq!(mtp.layer, c.n_layers);
+    assert_eq!(mtp.bytes, REAL_MTP_BYTES);
+    let prefix = format!("blk.{}.", mtp.layer);
+    let mut span = (u64::MAX, 0u64);
+    for (name, e) in &s.tensors {
+        if name.starts_with(&prefix) {
+            assert_eq!(e.loc.shard, 0, "{name}");
+            let at = e.loc.abs_offset().unwrap();
+            span = (
+                span.0.min(at),
+                span.1.max(at + e.loc.info.data_size().unwrap()),
+            );
+        }
+    }
+    assert_eq!(span.1 - span.0, REAL_MTP_BYTES);
+    assert_eq!(s.mtp_experts().unwrap().class, ExpertClass::Bf16);
+    assert_eq!(c.mtp()[0].n_heads, 32);
+    assert_eq!(c.mtp()[0].attn, Attn::Indexed);
 
     for (il, w) in want["layers"].as_array().unwrap().iter().enumerate() {
         let l = &c.layers[il];
@@ -776,6 +899,8 @@ fn real_headers_match_the_oracle_config() {
         e["table_type_id"].as_u64().unwrap() as u32
     );
 }
+
+const REAL_MTP_BYTES: u64 = 7_486_176_384;
 
 fn n_ctx_target(d: &Value) -> usize {
     d["context_target_v1"].as_u64().unwrap() as usize

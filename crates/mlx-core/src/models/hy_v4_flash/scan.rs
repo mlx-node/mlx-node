@@ -66,6 +66,15 @@ pub struct ExpertLayer {
     pub down: Located,
 }
 
+/// The MTP layer `blk.{layer}`: scanned with the file, never a trunk layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MtpLayer {
+    /// Index into `cfg.layers` and `Scan::experts`.
+    pub layer: usize,
+    /// Stored bytes of every `blk.{layer}.*` tensor, routed experts included.
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub role: Role,
@@ -79,6 +88,8 @@ pub struct Scan {
     /// One per layer (trunk then MTP); `None` on dense-FFN layers.
     pub experts: Vec<Option<ExpertLayer>>,
     pub engram_table: Located,
+    /// `None` when the file has no `nextn_predict_layers`.
+    pub mtp: Option<MtpLayer>,
 }
 
 impl Scan {
@@ -91,6 +102,17 @@ impl Scan {
 
     pub fn opt(&self, name: &str) -> Option<&Located> {
         self.tensors.get(name).map(|e| &e.loc)
+    }
+
+    pub fn trunk_experts(&self) -> &[Option<ExpertLayer>] {
+        &self.experts[..self.cfg.n_layers]
+    }
+
+    pub fn mtp_experts(&self) -> Option<&ExpertLayer> {
+        self.mtp
+            .as_ref()
+            .and_then(|m| self.experts.get(m.layer))
+            .and_then(Option::as_ref)
     }
 
     pub fn with_role(&self, role: Role) -> impl Iterator<Item = (&str, &Located)> {
@@ -361,13 +383,32 @@ fn classify(
     let experts = (0..cfg.layers.len())
         .map(|il| expert_layer(&cfg, &tensors, il))
         .collect::<Result<Vec<_>>>()?;
+    let mtp = mtp_layer(&cfg, &tensors)?;
     Ok(Scan {
         paths,
         cfg,
         tensors,
         experts,
         engram_table,
+        mtp,
     })
+}
+
+fn mtp_layer(cfg: &HyV4FlashConfig, tensors: &HashMap<String, Entry>) -> Result<Option<MtpLayer>> {
+    if cfg.mtp().is_empty() {
+        return Ok(None);
+    }
+    let layer = cfg.n_layers;
+    let prefix = format!("blk.{layer}.");
+    let mut bytes = 0u64;
+    for (name, e) in tensors {
+        if name.starts_with(&prefix) {
+            bytes = bytes
+                .checked_add(e.loc.info.data_size()?)
+                .ok_or_else(|| bad("MTP layer size overflows u64"))?;
+        }
+    }
+    Ok(Some(MtpLayer { layer, bytes }))
 }
 
 /// Type 43 is parsed as MXFP8; whether it is F8_E4M3 is decided by the row
