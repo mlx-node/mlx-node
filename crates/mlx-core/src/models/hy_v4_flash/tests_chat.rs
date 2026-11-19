@@ -390,6 +390,57 @@ fn save_without_reuse_and_command_reset_drop_the_conversation() {
     assert_eq!(conv.verify(&runner, &grid(), &p, true), 0);
 }
 
+/// `turn` under the cache salt `salt`, as `Inner` runs it: the verify
+/// reuses rows of the same salt only, the prefill drops another salt's.
+fn salted_turn(
+    conv: &mut Conv<Fake>,
+    runner: &FakeRunner,
+    salt: u64,
+    prompt: &[u32],
+    generated: &[u32],
+) -> usize {
+    let hit = conv.verify(runner, &grid(), prompt, conv.reuses(salt));
+    let tail = if hit > 0 && hit < prompt.len() {
+        &prompt[hit..]
+    } else {
+        conv.reset(ResetScope::PrefixMiss).unwrap();
+        prompt
+    };
+    conv.own(salt).unwrap();
+    prefill(conv, runner, tail).0.unwrap();
+    conv.seq_mut().push(generated);
+    conv.save(true).unwrap();
+    hit
+}
+
+/// A turn of another cache salt reuses no row or ladder entry of the
+/// sequence, even on a shared prefix, and runs from row 0; the first salt
+/// then finds none of the other salt's rows either.
+#[test]
+fn another_salt_reuses_no_rows() {
+    let runner = FakeRunner::default();
+    let mut conv = Conv::new(Fake::new(CAP));
+    let p1 = prompt_of(40, 3);
+    assert_eq!(salted_turn(&mut conv, &runner, 7, &p1, &[5]), 0);
+    let mut p2 = conv.history().to_vec();
+    p2.extend([8, 9]);
+
+    runner.clear();
+    assert_eq!(salted_turn(&mut conv, &runner, 11, &p2, &[4]), 0);
+    assert_eq!(runner.rows(), vec![0..32, 32..43]);
+    assert!(conv.ladder().lens().iter().all(|&l| l <= conv.seq().len()));
+
+    runner.clear();
+    assert_eq!(salted_turn(&mut conv, &runner, 7, &p1, &[5]), 0);
+    assert_eq!(runner.rows(), vec![0..32, 32..40]);
+
+    runner.clear();
+    let mut p3 = conv.history().to_vec();
+    p3.extend([2, 3]);
+    assert_eq!(salted_turn(&mut conv, &runner, 7, &p3, &[1]), 41);
+    assert_eq!(runner.rows(), vec![41..43]);
+}
+
 fn hy4_dir() -> PathBuf {
     PathBuf::from(std::env::var("HY4_DIR").expect("HY4_DIR = directory of the two Hy4 shards"))
 }

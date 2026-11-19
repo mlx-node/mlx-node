@@ -134,6 +134,8 @@ pub struct Conv<S: Seq> {
     kept: bool,
     /// The row the last prefill started at.
     from: usize,
+    /// The cache salt of the turns that built the rows held.
+    salt: u64,
 }
 
 impl<S: Seq> Conv<S> {
@@ -145,6 +147,7 @@ impl<S: Seq> Conv<S> {
             plan: Cell::new(None),
             kept: false,
             from: 0,
+            salt: 0,
         }
     }
 
@@ -174,9 +177,27 @@ impl<S: Seq> Conv<S> {
         self.kept
     }
 
-    /// Starts over on `seq`: nothing is kept.
-    pub fn replace(&mut self, seq: S) {
+    /// Starts over on `seq`, rows of the cache salt `salt`: nothing else
+    /// is kept.
+    pub fn replace(&mut self, seq: S, salt: u64) {
         *self = Self::new(seq);
+        self.salt = salt;
+    }
+
+    /// Whether the rows held were built under `salt`: another salt reuses
+    /// none of them.
+    pub fn reuses(&self, salt: u64) -> bool {
+        self.salt == salt
+    }
+
+    /// The next prefill runs under `salt`: rows another salt built go.
+    pub fn own(&mut self, salt: u64) -> Result<()> {
+        if self.salt == salt {
+            return Ok(());
+        }
+        self.salt = salt;
+        self.kept = false;
+        self.clear()
     }
 
     /// Rows of `tokens` the next prefill does not run again (`reuse` false:
@@ -344,6 +365,8 @@ pub(crate) struct Inner {
     /// The bank's counters when serving began; `residencyInfo` counts from
     /// here.
     pub(super) served_from: Counters,
+    /// The cache salt of the turn about to verify.
+    turn_salt: Cell<u64>,
 }
 
 impl Drop for Inner {
@@ -436,6 +459,7 @@ impl Inner {
             telemetry: Arc::new(Telemetry::default()),
             waves: WaveLog::default(),
             served_from: Counters::default(),
+            turn_salt: Cell::new(0),
         };
         inner.publish(None);
         Ok(inner)
@@ -487,12 +511,13 @@ impl Inner {
         match filled {
             Some((seq, keys)) => {
                 f.restored();
-                self.conv.replace(seq);
+                self.conv.replace(seq, self.turn_salt.get());
                 Ok((Some(keys), None))
             }
             None => {
                 f.forget();
-                self.conv.replace(new_seq(&self.store, self.mtp.as_ref())?);
+                let seq = new_seq(&self.store, self.mtp.as_ref())?;
+                self.conv.replace(seq, self.turn_salt.get());
                 Ok((None, Some(prompt)))
             }
         }
@@ -581,7 +606,7 @@ impl Inner {
             f.forget();
         }
         match new_seq(&self.store, self.mtp.as_ref()) {
-            Ok(s) => self.conv.replace(s),
+            Ok(s) => self.conv.replace(s, self.turn_salt.get()),
             Err(e) => tracing::warn!("hy_v4_flash new sequence: {}", e.reason),
         }
     }
@@ -687,6 +712,7 @@ impl ChatBackend for Inner {
         if config.enable_mtp.is_none() {
             p.enable_mtp = self.mtp.is_some();
         }
+        self.turn_salt.set(p.cache_salt);
         if let Some(f) = &self.flat {
             f.set_salt(p.cache_salt);
         }
@@ -729,7 +755,8 @@ impl ChatBackend for Inner {
             model: &self.store.model,
             mtp: self.mtp.as_ref(),
         };
-        let rows = self.conv.verify(&runner, &self.grid, tokens, reuse);
+        let ram = reuse && self.conv.reuses(self.turn_salt.get());
+        let rows = self.conv.verify(&runner, &self.grid, tokens, ram);
         let Some(f) = &self.flat else {
             return rows;
         };
@@ -806,6 +833,9 @@ impl ChatBackend for Inner {
         let flag = self.cancel.clone();
         let cancel = move |_: usize| flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed));
         let (line, whole) = self.flat_restore(tokens)?;
+        if let Err(e) = self.conv.own(self.turn_salt.get()) {
+            self.fresh(&e);
+        }
         let tokens = whole.as_deref().unwrap_or(tokens);
         let total = tokens.len();
         let mut ran = 0usize;

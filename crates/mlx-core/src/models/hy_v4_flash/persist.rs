@@ -1267,11 +1267,25 @@ impl Disk {
         }
     }
 
+    /// Blocks and segments the cursors still owe.
+    fn owed_items(&self) -> usize {
+        self.cursors
+            .values()
+            .filter(|cursor| !cursor.broken)
+            .map(|cursor| {
+                let target = (cursor.registered / BLOCK_ROWS).min(cursor.cold.len());
+                target.saturating_sub(cursor.blocks)
+                    + cursor.pending.len().saturating_sub(cursor.segments)
+            })
+            .sum()
+    }
+
     /// A clean stop on a persistent tier: every waiting point, newest first,
-    /// due or not, in use or not, is written, then every copy goes to the
-    /// writer and the writer drains, until `deadline`. A temporary tier
-    /// keeps nothing. False when a point still waits or a copy or write did
-    /// not land by then.
+    /// due or not, in use or not, is written, every block and segment the
+    /// cursors owe is copied a queue window at a time, then every copy goes
+    /// to the writer and the writer drains, until `deadline`. A temporary
+    /// tier keeps nothing. False when a point still waits, a chain is not
+    /// whole on disk, or a copy or write did not land or was refused.
     pub(crate) fn flush_points(
         &mut self,
         store: &mut Store,
@@ -1280,10 +1294,14 @@ impl Disk {
     ) -> bool {
         let mut complete = true;
         if self.persistent {
+            let refused = self.telemetry.refused.load(Ordering::Relaxed);
             loop {
                 self.take_landings(store);
                 self.judge_owed(store, Instant::now());
+                let room = self.parker.lock().item_bytes < QUEUE_BYTES;
+                let before = self.owed_items();
                 self.top_up_all(source);
+                let after = self.owed_items();
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     break;
@@ -1299,7 +1317,11 @@ impl Disk {
                     continue;
                 }
                 let Some(point) = self.points.back().copied() else {
-                    break;
+                    if after == 0 || (room && after >= before) {
+                        break;
+                    }
+                    std::thread::sleep(left.min(Duration::from_millis(10)));
+                    continue;
                 };
                 if !self.wanted(store, point.id) {
                     self.points.pop_back();
@@ -1325,7 +1347,13 @@ impl Disk {
             self.take_landings(store);
             self.judge_owed(store, Instant::now());
             self.sync_waiting();
-            complete = self.points.is_empty() && self.lane.pending.is_none() && handed && drained;
+            complete = self.points.is_empty()
+                && self.lane.pending.is_none()
+                && handed
+                && drained
+                && self.owed.is_empty()
+                && self.owed_items() == 0
+                && self.telemetry.refused.load(Ordering::Relaxed) == refused;
         }
         let mut slot = self.parker.lock();
         slot.points_flushed = Some(complete);

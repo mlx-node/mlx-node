@@ -13,7 +13,7 @@ use super::chat::{MTP_DEPTH_MAX, generation_defaults, resolve};
 use super::prefill::{BLOCK_ROWS, Grid, NEAR_EVERY};
 use super::sched::{
     Busy, Edge, Requests, SafePoint, lanes, napi_concurrency, paged_mode, pass_keys, preempt,
-    prefill_ends, slice_breaks,
+    prefill_ends, readmit, slice_breaks,
 };
 use crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for;
 use crate::engine::types::ChatConfig;
@@ -183,6 +183,21 @@ fn safe_point_resets_seeds_after_a_join_and_rate_limits_readmit() {
     s.begun();
     let after = s.step();
     assert!(!after.seed_reset && !after.readmit);
+}
+
+/// A refused re-admission ends the lease and fails the step with its
+/// reason; a kept or switched one leaves the lease alone.
+#[test]
+fn a_refused_readmission_ends_the_lease_and_fails_the_step() {
+    let mut ended = false;
+    let refused = readmit(Err(napi::Error::from_reason("no room")), || ended = true);
+    assert_eq!(refused.unwrap_err().reason, "no room");
+    assert!(ended);
+    for checked in [Ok(false), Ok(true)] {
+        let mut ended = false;
+        readmit(checked, || ended = true).unwrap();
+        assert!(!ended);
+    }
 }
 
 #[derive(Default)]

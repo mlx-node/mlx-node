@@ -67,6 +67,35 @@ fn only_the_last_lanes_lose_drafts() {
     }
 }
 
+/// The pool rows a step's lanes reserve fit the wave row cap: every anchor
+/// first, then drafts in plan order, so an early lane's draft never takes
+/// the rows a later lane's anchor needs; a lane's grant stays within what it
+/// reserved; a lane outside the plan reserves what it asks.
+#[test]
+fn reserved_rows_fit_the_row_cap_before_any_proposal() {
+    let mut b = WaveBudget::default();
+    let plan: Vec<(SeqId, usize)> = (1..=4).map(|s| (s, 2)).collect();
+    b.plan(&plan, 5);
+    let rows: Vec<usize> = (1..=4).map(|s| b.rows_for(s, 2)).collect();
+    assert_eq!(rows, vec![2, 1, 1, 1]);
+    assert!(rows.iter().sum::<usize>() <= 5);
+    for (s, &r) in (1..=4).zip(&rows) {
+        b.reserved_rows(s, r);
+    }
+    let g: Vec<usize> = (1..=4).map(|s| b.grant(s, 1, 5)).collect();
+    assert_eq!(g, vec![1, 0, 0, 0]);
+    assert!(b.rows() <= 5);
+
+    b.close();
+    let plan: Vec<(SeqId, usize)> = (1..=4).map(|s| (s, 4)).collect();
+    b.plan(&plan, 12);
+    let rows: Vec<usize> = (1..=4).map(|s| b.rows_for(s, 4)).collect();
+    assert_eq!(rows, vec![4, 4, 3, 1]);
+    b.reserved_rows(1, 1);
+    assert_eq!(b.grant(1, 3, 12), 0, "a retry with the anchor alone");
+    assert_eq!(b.rows_for(9, 4), 4);
+}
+
 /// A reserve after a proposal opens the next wave; a retry reserve of a
 /// lane before any proposal counts it once.
 #[test]

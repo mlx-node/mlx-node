@@ -7,13 +7,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mlx_paged_attn::{ColdCacheBlock, ColdCacheFingerprint, ColdGroup, ColdObject, hash_tokens};
+use mlx_paged_attn::{
+    ColdCacheBlock, ColdCacheFingerprint, ColdGroup, ColdLayerBlock, ColdObject, hash_tokens,
+};
 
 use super::ladder::Kind;
 use super::paged::PageGeometry;
 use super::persist::{
-    Disk, FLAT_RUN, Identity, MINIMUM_ROWS, chain, disk_plan, fingerprint, identity_text,
-    segment_key, segments_at,
+    Blocks, Disk, FLAT_RUN, Identity, MINIMUM_ROWS, QUEUE_BYTES, chain, disk_plan, fingerprint,
+    identity_text, segment_key, segments_at,
 };
 use super::persist_codec::{StateShape, block_layout, join_block, split_block};
 use super::persist_writer::Telemetry;
@@ -23,7 +25,7 @@ use super::prefix_state::{
     written_key,
 };
 use super::sched::lookup_bounds;
-use crate::disk_tier::{CacheDisk, DiskTierOptions, open_disk_tier};
+use crate::disk_tier::{CacheDisk, DiskTierOptions, PersistentIdentity, open_disk_tier};
 
 const PAGE: PageGeometry = PageGeometry {
     layers: 12,
@@ -540,4 +542,82 @@ fn pool_blobs_are_split_block_of_the_rows() {
             "block {b}: V plane and index plane"
         );
     }
+}
+
+/// Every block a step asks for, made from its index.
+struct NumberedBlocks;
+
+impl NumberedBlocks {
+    fn layers(i: usize) -> Vec<ColdLayerBlock> {
+        let half = PAGE.half as usize;
+        (0..PAGE.layers as usize)
+            .map(|l| {
+                let latent: Vec<u16> = (0..BLOCK_ROWS * 2 * half)
+                    .map(|r| ((i * 31 + l * 7 + r) % 4096) as u16)
+                    .collect();
+                let pooled = vec![(i + l) as u16; (PAGE.index_rows * PAGE.index_dim) as usize];
+                split_block(&latent, &pooled, half)
+            })
+            .collect()
+    }
+}
+
+impl Blocks for NumberedBlocks {
+    fn begin(&mut self, _: &[u32]) -> bool {
+        true
+    }
+
+    fn block(&mut self, i: usize, _: u64) -> Option<Vec<ColdLayerBlock>> {
+        Some(Self::layers(i))
+    }
+}
+
+/// A clean stop on a persistent tier copies a chain longer than one host
+/// queue window a window at a time: every block is on disk when it
+/// reports success.
+#[test]
+fn a_clean_stop_copies_every_block_past_the_queue_window() {
+    let root = Temp::new();
+    std::fs::create_dir_all(root.0.join("tmp")).unwrap();
+    let options = DiskTierOptions {
+        cache_disk: CacheDisk::Bytes(2 << 30),
+        persistent: true,
+        cache_dir: Some(root.0.join("cache")),
+        temp_root: Some(root.0.join("tmp")),
+    };
+    let shape = StateShape::of(&super::tests_model::tiny_cfg(), false).unwrap();
+    let identity = || {
+        let fp = ColdCacheFingerprint::from_components([b"hy4-flush-window".as_slice()]);
+        Some(PersistentIdentity {
+            namespace: "0123456789abcdef0123456789abcdef".to_string(),
+            state: fp,
+            kv: fp,
+        })
+    };
+    let tier = open_disk_tier(&options, identity, shape.span_bytes()).unwrap();
+    assert!(tier.persistent);
+    let manager = Arc::clone(&tier.manager);
+    let fp = tier.state_fingerprint;
+    let mut disk = Disk::open(tier, Arc::new(Telemetry::default()), shape, PAGE).unwrap();
+    let block: u64 = NumberedBlocks::layers(0)
+        .iter()
+        .map(|l| (l.keys.len() + l.values.len()) as u64)
+        .sum();
+    let n = (QUEUE_BYTES / block) as usize + 3;
+    let t = tokens(n * BLOCK_ROWS);
+    let keys = vec![Vec::new(); n];
+    let hot = vec![0u64; n];
+    let mut states = States::<PrefixState>::with_cap(4);
+    disk.start(1, &t, &keys, &hot, 0);
+    disk.published(states.store_mut(), 1, n * BLOCK_ROWS, None, None);
+    let flushed = disk.flush_points(
+        states.store_mut(),
+        &mut NumberedBlocks,
+        Instant::now() + Duration::from_secs(120),
+    );
+    let cold = chain(ColdGroup::Kv, fp, &t, &keys, 0, n);
+    let missing = cold.iter().filter(|k| !manager.contains(k)).count();
+    assert_eq!(missing, 0, "{missing} of {n} blocks not on disk");
+    assert!(flushed);
+    drop(disk);
 }

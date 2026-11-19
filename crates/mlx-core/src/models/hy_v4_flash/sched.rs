@@ -62,7 +62,7 @@ use crate::engine::mtp_turn::{MtpTurnArgs, run_mtp_turn, turn_lookahead_rows};
 use crate::engine::paged_epilogue::FinalTokenPolicy;
 use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
 use crate::engine::params::ChatParams;
-use crate::engine::scheduler::{PreemptionMode, StepPlan};
+use crate::engine::scheduler::{PreemptionMode, StepKind, StepPlan};
 use crate::models::qwen3_5::gdn_checkpoint_store::compute_paged_prefix_block_hashes;
 use crate::stream::{Stream, StreamContext};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
@@ -374,6 +374,20 @@ pub struct TurnPlan {
     pub nonce: u64,
 }
 
+/// A refused re-admission inside a busy period `end`s its lease and fails
+/// the step; the next step starts the period over through the turn start's
+/// admission.
+pub fn readmit(checked: Result<bool>, end: impl FnOnce()) -> Result<()> {
+    match checked {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            tracing::warn!("hy_v4_flash re-admission refused: {}", e.reason);
+            end();
+            Err(e)
+        }
+    }
+}
+
 /// The rows of one verify wave: one decode row per lane that reserved,
 /// then drafts in proposal order while rows are left under `row_cap`, so
 /// the last lanes lose their drafts first. A reserve after a proposal
@@ -383,9 +397,33 @@ pub struct WaveBudget {
     lanes: HashSet<SeqId>,
     drafts: usize,
     proposing: bool,
+    /// Drafts each decode row of the planned step may reserve pool rows
+    /// for: every anchor first, then drafts in plan order under the row cap.
+    allow: HashMap<SeqId, usize>,
+    /// Rows each lane of the wave reserved.
+    held: HashMap<SeqId, usize>,
 }
 
 impl WaveBudget {
+    /// The planned step's decode rows `(seq, tokens)` under `row_cap`.
+    pub fn plan(&mut self, rows: &[(SeqId, usize)], row_cap: usize) {
+        self.allow.clear();
+        let mut left = row_cap.saturating_sub(rows.len());
+        for &(seq, tokens) in rows {
+            let n = tokens.saturating_sub(1).min(left);
+            left -= n;
+            self.allow.insert(seq, n);
+        }
+    }
+
+    /// Rows `seq` reserves of the `queries` it asks: its anchor and the
+    /// drafts its plan allows.
+    pub fn rows_for(&self, seq: SeqId, queries: usize) -> usize {
+        self.allow
+            .get(&seq)
+            .map_or(queries, |&n| queries.min(n + 1))
+    }
+
     /// `seq` holds a decode row of the wave being planned.
     pub fn reserved(&mut self, seq: SeqId) {
         if self.proposing {
@@ -394,10 +432,20 @@ impl WaveBudget {
         self.lanes.insert(seq);
     }
 
-    /// Drafts `seq` may propose, at most `cap`.
+    /// `seq` reserved `rows` pool rows for the wave being planned.
+    pub fn reserved_rows(&mut self, seq: SeqId, rows: usize) {
+        self.reserved(seq);
+        self.held.insert(seq, rows);
+    }
+
+    /// Drafts `seq` may propose, at most `cap` and the rows it reserved.
     pub fn grant(&mut self, seq: SeqId, cap: usize, row_cap: usize) -> usize {
         self.proposing = true;
         self.lanes.insert(seq);
+        let cap = self
+            .held
+            .get(&seq)
+            .map_or(cap, |&rows| cap.min(rows.saturating_sub(1)));
         let left = row_cap.saturating_sub(self.lanes.len() + self.drafts);
         let n = cap.min(left);
         self.drafts += n;
@@ -412,6 +460,7 @@ impl WaveBudget {
     /// The wave ran (or was dropped).
     pub fn close(&mut self) {
         self.lanes.clear();
+        self.held.clear();
         self.drafts = 0;
         self.proposing = false;
     }
@@ -1173,12 +1222,11 @@ impl Inner {
         if let Err(e) = self.store.bank.safe_point(due.seed_reset) {
             tracing::warn!("hy_v4_flash safe point: {}", e.reason);
         }
-        if due.readmit
-            && let Err(e) = self.store.recheck(kv)
-        {
-            tracing::warn!("hy_v4_flash re-admission check: {}", e.reason);
+        if !due.readmit {
+            return Ok(());
         }
-        Ok(())
+        let checked = self.store.recheck(kv);
+        readmit(checked, || self.end())
     }
 
     /// Applies a busy-period edge: the lease at a begin and an end, a seed
@@ -2172,9 +2220,10 @@ impl HybridSchedulerBackend for Inner {
     }
 
     fn reserve_scheduled_speculation(&mut self, seq: SeqId, queries: usize) -> Result<bool> {
-        let fits = self.reserve_rows(seq, queries)?;
+        let rows = self.paged()?.spec.budget.rows_for(seq, queries);
+        let fits = self.reserve_rows(seq, rows)?;
         if fits {
-            self.paged_mut()?.spec.budget.reserved(seq);
+            self.paged_mut()?.spec.budget.reserved_rows(seq, rows);
         }
         Ok(fits)
     }
@@ -2284,6 +2333,14 @@ impl HybridSchedulerBackend for Inner {
     fn claim_step_rows(state: &mut HybridSchedulerState<Self>, plan: &StepPlan) -> StepClaims {
         if let Some(p) = state.inner.paged.as_mut() {
             p.spec.budget.close();
+            let decode: Vec<(SeqId, usize)> = plan
+                .rows
+                .iter()
+                .filter(|r| r.kind == StepKind::Decode)
+                .map(|r| (r.seq_id, r.num_tokens as usize))
+                .collect();
+            let row_cap = p.row_cap;
+            p.spec.budget.plan(&decode, row_cap);
         }
         StepClaims::granted(plan)
     }
