@@ -288,7 +288,7 @@ interface ModelFamilyDataBase {
   /**
    * Native `load` accepts `LoadModelOptions.cacheDisk` and `cacheDir`
    * (`--max-cache-disk`, `--cache-dir`): its stored states (DFlash2 states,
-   * Flash Next prefix states) get the model's own SSD tier (Splash
+   * Flash Next and Hy4-flash prefix states) get the model's own SSD tier (Splash
    * `openDiskTier`), persistent under the paged KV disk cache switch
    * (`MLX_PERSIST_PAGED_CACHE`), else temporary.
    */
@@ -545,7 +545,9 @@ export const MODEL_FAMILY_DATA = [
     id: 'hy_v4_flash',
     kind: 'loadable',
     match: { rawModelTypes: ['hy_v4_flash'] },
+    acceptsMaxMemory: true,
     acceptsMaxContext: true,
+    acceptsCacheDisk: true,
     /** The template and tokenizer live inside the GGUF; the native side enforces the context limit. */
     streamOpts: { recordModelPath: false },
     ggufArchitectures: ['hy_v4_flash'],

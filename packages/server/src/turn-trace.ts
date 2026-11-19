@@ -293,8 +293,8 @@ export interface TurnTraceDeps {
   sidecarStats?: () => ColdSidecarStats | undefined;
   /**
    * The SSD state tier's mode over the loaded models. Default: the wrapped
-   * model's own `stateTierMode()` where it has one (`qwen4_exp`, which the
-   * governor does not see), else the native addon's governor status.
+   * model's own `stateTierMode()` where it has one (`qwen4_exp`, `hy_v4_flash`,
+   * whose tiers the governor does not see), else the native addon's governor status.
    */
   stateTierMode?: () => string | undefined;
   /** Clock for `ts`, `durationMs`, and the trace filename. Default: `Date.now`. */
@@ -640,7 +640,7 @@ export class TurnTraceModel implements SessionCapableModel {
   }
 
   /**
-   * The wrapped model's own state tier reader (`qwen4_exp`'s `stateTierMode()`),
+   * The wrapped model's own state tier reader (`qwen4_exp`'s and `hy_v4_flash`'s `stateTierMode()`),
    * else the governor's, which only Qwen3.5 publishes to.
    */
   private modelStateTierMode(): () => string | undefined {

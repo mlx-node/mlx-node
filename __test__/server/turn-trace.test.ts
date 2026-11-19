@@ -1032,6 +1032,31 @@ describe('TurnTraceModel', () => {
     expect(lines[1]).toMatchObject({ modelType: 'qwen4_exp', coldEnabled: false, stateTier: 'temp' });
   });
 
+  // Hy4-flash's stored states sit in its own tier too; the governor it
+  // registers with never publishes that tier's mode.
+  // Mutation: leave `hy_v4_flash` out of `COLD_TIER_STATE_FAMILIES` → red.
+  // Mutation: read the governor instead of the model's method → red.
+  it('a hy_v4_flash turn records its model tier', async () => {
+    for (const mode of ['persistent', 'temp', 'off']) {
+      const inner = Object.assign(makeInner(), { stateTierMode: () => mode });
+      await new TurnTraceModel(
+        inner,
+        deps({
+          identity: { modelId: 'hy4', modelType: 'hy_v4_flash', contextWindow: 4096 },
+          coldStats: () => coldStats({ enabled: false, root: '' }),
+          stateTierMode: undefined,
+        }),
+      ).chatSessionStart([]);
+    }
+
+    const lines = readTraceLines(dir);
+    expect(lines.map((line) => [line.modelType, line.coldEnabled, line.stateTier])).toEqual([
+      ['hy_v4_flash', false, 'persistent'],
+      ['hy_v4_flash', false, 'temp'],
+      ['hy_v4_flash', false, 'off'],
+    ]);
+  });
+
   it('reports concurrency and concurrencyPeak for overlapping turns', async () => {
     const gates: Array<() => void> = [];
     const inner = makeInner({

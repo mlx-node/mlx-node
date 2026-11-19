@@ -86,8 +86,9 @@ export interface LoadModelOptions {
    * Metal memory budget in bytes for `qwen3_5`, `qwen3_5_moe` and `qwen4_exp`
    * targets (`--max-memory`). It can only lower the automatic budget the
    * load's memory plan derives from the working set; the plan sizes the KV
-   * pool and the windows from it (and for `qwen4_exp` the expert store). Other
-   * model families reject it.
+   * pool and the windows from it (and for `qwen4_exp` the expert store).
+   * `hy_v4_flash` sizes its expert cache within it. Other model families
+   * reject it.
    */
   maxMemoryBytes?: number;
   /**
@@ -110,7 +111,8 @@ export interface LoadModelOptions {
    * (`--max-cache-disk`): `'auto'` (the default), a decimal byte count, or
    * `'0'` (off). Whether it survives a restart is the paged KV disk cache
    * switch every family reads, `MLX_PERSIST_PAGED_CACHE`; off, the tier is
-   * temporary. Other model families reject it, as they do `cacheDir`.
+   * temporary. `hy_v4_flash` takes it for its stored states, with the same
+   * switch. Other model families reject it, as they do `cacheDir`.
    */
   cacheDisk?: string;
   /** The persistent tier's root (`--cache-dir`); needs the switch on. */
@@ -161,7 +163,19 @@ function qwen4ExpLoadOptions(options: LoadModelOptions | undefined): Qwen4ExpLoa
 }
 
 function hyV4FlashLoadOptions(options: LoadModelOptions | undefined): HyV4FlashLoadOptions | null {
-  return options?.maxContextTokens === undefined ? null : { maxContextTokens: options.maxContextTokens };
+  if (
+    options?.maxMemoryBytes === undefined &&
+    options?.maxContextTokens === undefined &&
+    options?.cacheDisk === undefined &&
+    options?.cacheDir === undefined
+  )
+    return null;
+  return {
+    ...(options.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
+    ...(options.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
+    ...(options.cacheDisk !== undefined ? { cacheDisk: options.cacheDisk } : {}),
+    ...(options.cacheDir !== undefined ? { cacheDir: options.cacheDir } : {}),
+  };
 }
 
 type NativeModelClass = abstract new (...args: never[]) => object;
@@ -314,7 +328,7 @@ function dispatchLoad(
   }
   if (options?.maxMemoryBytes !== undefined && requireFamilyData(modelType).acceptsMaxMemory !== true) {
     throw new Error(
-      `maxMemoryBytes (Metal memory budget) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
+      `maxMemoryBytes (Metal memory budget) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp and hy_v4_flash models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
@@ -335,7 +349,7 @@ function dispatchLoad(
     requireFamilyData(modelType).acceptsCacheDisk !== true
   ) {
     throw new Error(
-      `cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
+      `cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5, qwen3_5_moe, qwen4_exp and hy_v4_flash models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }

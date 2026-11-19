@@ -113,6 +113,11 @@ describe('Flash Next stored states on disk', () => {
     expect(COLD_TIER_STATE_FAMILIES.has('qwen4_exp')).toBe(true);
   });
 
+  it('hy_v4_flash keeps its states in its own tier', () => {
+    expect(COLD_TIER_RESTORE_FAMILIES.has('hy_v4_flash')).toBe(false);
+    expect(COLD_TIER_STATE_FAMILIES.has('hy_v4_flash')).toBe(true);
+  });
+
   it('is on by default for every host', () => {
     expect(resolvePersistPagedCache(host, {})).toBe(true);
   });
