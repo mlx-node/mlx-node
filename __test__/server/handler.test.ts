@@ -960,6 +960,31 @@ describe('createHandler', () => {
       expect(parsed.error.message).toContain('tool_call_id');
     });
 
+    // vLLM `ResponsesRequest.check_tool_usage`.
+    it.each([
+      {
+        name: 'a named function that matches no tool',
+        extra: { tools: RESPONSE_TOOLS, tool_choice: { type: 'function', name: 'nope' } },
+      },
+      { name: "'required' with no tools", extra: { tool_choice: 'required' } },
+    ])('returns 400 for tool_choice $name', async ({ extra }) => {
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi.fn();
+      registry.register('test-model', { ...createMockModel(), chatSessionStart } as unknown as SessionCapableModel);
+      const handler = createHandler(registry);
+      const req = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'Hello', ...extra });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(400);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.error.type).toBe('invalid_request_error');
+      expect(parsed.error.param).toBe('tool_choice');
+      expect(chatSessionStart).not.toHaveBeenCalled();
+    });
+
     it('returns 400 when max_output_tokens is zero', async () => {
       const registry = new ModelRegistry();
       registry.register('test-model', createMockModel());

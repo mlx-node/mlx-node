@@ -79,6 +79,7 @@ import type { IdleSweeper } from '../idle-sweeper.js';
 import { withAdmissionControlledInference } from '../inference-admission.js';
 import { canonicalizeSystemForCacheKey, mapAnthropicRequest } from '../mappers/anthropic-request.js';
 import {
+  anthropicRequestAllowsToolUse,
   buildAnthropicResponse,
   buildContentBlockDelta,
   buildContentBlockStart,
@@ -141,12 +142,8 @@ import type { AnthropicMessagesRequest } from '../types-anthropic.js';
 const MESSAGES_WARM_SLOT_ID = '__msg_warm__';
 const CLAUDE_CODE_TITLE_MAX_TOKENS = 128;
 
-function requestAllowsToolUse(body: AnthropicMessagesRequest): boolean {
-  return Array.isArray(body.tools) && body.tools.length > 0;
-}
-
 function hasSuppressedToolCalls(result: Pick<ChatResult, 'toolCalls'>, body: AnthropicMessagesRequest): boolean {
-  return !requestAllowsToolUse(body) && result.toolCalls.some((t) => t.status === 'ok');
+  return !anthropicRequestAllowsToolUse(body) && result.toolCalls.some((t) => t.status === 'ok');
 }
 
 function applyOutputTokenLimit(config: ChatConfig, limit: number | undefined): ChatConfig {
@@ -188,7 +185,7 @@ function hasTitleJsonSchema(schema: unknown): boolean {
 }
 
 function isClaudeCodeTitleGenerationRequest(body: AnthropicMessagesRequest): boolean {
-  if (requestAllowsToolUse(body)) return false;
+  if (Array.isArray(body.tools) && body.tools.length > 0) return false;
   const format = body.output_config?.format;
   if (format?.type !== 'json_schema' || !hasTitleJsonSchema(format.schema)) return false;
 
@@ -279,7 +276,7 @@ async function handleNonStreaming(
   // left untouched. With no match `responseResult` stays `result` (full text
   // retained — `flush()` releases any held incomplete partial as normal text),
   // so behavior is byte-identical to a request without `stop_sequences`.
-  const visibleText = visibleAnswerText(result, requestAllowsToolUse(body));
+  const visibleText = visibleAnswerText(result, anthropicRequestAllowsToolUse(body));
 
   let matchedStopSequence: string | null = null;
   let responseResult = result;
@@ -310,7 +307,7 @@ async function handleNonStreaming(
     body,
     messageId,
     result.performance,
-    requestAllowsToolUse(body),
+    anthropicRequestAllowsToolUse(body),
     serverTiming,
     matchedStopSequence,
     outputClampedToContext,
@@ -486,7 +483,7 @@ async function handleStreamingNativeWithAbort(
   let terminalPerformance: PerformanceMetrics | undefined;
   let terminalPrefill: MeasuredPrefill | undefined;
   let terminalErrorMessage: string | null = null;
-  const allowToolUse = requestAllowsToolUse(body);
+  const allowToolUse = anthropicRequestAllowsToolUse(body);
   let suppressedToolCalls = false;
 
   // `thrownError` sticks on a generator throw. The outer abort tracker remains

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 import {
+  anthropicRequestAllowsToolUse,
   anthropicToolUseIdToInternal,
   buildAnthropicResponse,
   buildContentBlockDelta,
@@ -1052,5 +1053,22 @@ describe('visibleAnswerText nameless calls', () => {
         true,
       ),
     ).toBe(`BEFORE ${block} MID STOP AFTER`);
+  });
+});
+
+// vLLM `_convert_tool_choice` maps `none` to chat 'none'; `keeps_tool_calls`
+// keeps calls only for 'auto' with tools, 'required' or a named tool.
+describe('anthropicRequestAllowsToolUse', () => {
+  const tools = [{ name: 'f', input_schema: {} }];
+  it.each([
+    { name: 'no tools', body: {}, allowed: false },
+    { name: 'empty tools', body: { tools: [] }, allowed: false },
+    { name: "tool_choice 'none'", body: { tools, tool_choice: { type: 'none' as const } }, allowed: false },
+    { name: 'tools', body: { tools }, allowed: true },
+    { name: "tool_choice 'auto'", body: { tools, tool_choice: { type: 'auto' as const } }, allowed: true },
+    { name: "tool_choice 'any'", body: { tools, tool_choice: { type: 'any' as const } }, allowed: true },
+    { name: 'named tool', body: { tools, tool_choice: { type: 'tool' as const, name: 'f' } }, allowed: true },
+  ])('$name', ({ body, allowed }) => {
+    expect(anthropicRequestAllowsToolUse(body)).toBe(allowed);
   });
 });

@@ -863,7 +863,16 @@ describe('handleCreateMessage', () => {
       expect(toolBlock.input).toEqual({ location: 'San Francisco' });
     });
 
-    it('does not emit tool_use blocks or parsed tool markup when request has no tools', async () => {
+    it.each([
+      { name: 'request has no tools', extra: {} },
+      {
+        name: "tool_choice is 'none'",
+        extra: {
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+          tool_choice: { type: 'none' as const },
+        },
+      },
+    ])('does not emit tool_use blocks or parsed tool markup when $name', async ({ extra }) => {
       const registry = new ModelRegistry();
       const mockModel = createMockModel(
         makeChatResult({
@@ -894,6 +903,7 @@ describe('handleCreateMessage', () => {
           model: 'test-model',
           messages: [{ role: 'user', content: 'What is the weather?' }],
           max_tokens: 100,
+          ...extra,
         },
         registry,
       );
@@ -1820,7 +1830,16 @@ describe('handleCreateMessage', () => {
       expect(toolStarts).toHaveLength(1);
     });
 
-    it('suppresses parsed tool_call markup when request has no tools', async () => {
+    it.each([
+      { name: 'request has no tools', extra: {} },
+      {
+        name: "tool_choice is 'none'",
+        extra: {
+          tools: [{ name: 'search', input_schema: { type: 'object', properties: {} } }],
+          tool_choice: { type: 'none' as const },
+        },
+      },
+    ])('suppresses parsed tool_call markup when $name', async ({ extra }) => {
       const registry = new ModelRegistry();
       const streamEvents = [
         { text: '<tool_call>', done: false, isReasoning: false },
@@ -1855,6 +1874,7 @@ describe('handleCreateMessage', () => {
           messages: [{ role: 'user', content: 'Search' }],
           max_tokens: 100,
           stream: true,
+          ...extra,
         },
         registry,
       );

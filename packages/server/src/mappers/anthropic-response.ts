@@ -100,6 +100,14 @@ export function mapStopReason(
 }
 
 /**
+ * vLLM maps Messages `none` to chat `tool_choice: 'none'`, and
+ * `keeps_tool_calls` drops the calls of `none` or of a request with no tools.
+ */
+export function anthropicRequestAllowsToolUse(body: Pick<AnthropicMessagesRequest, 'tools' | 'tool_choice'>): boolean {
+  return Array.isArray(body.tools) && body.tools.length > 0 && body.tool_choice?.type !== 'none';
+}
+
+/**
  * The answer text a response shows: the parsed text, or the raw text after
  * the reasoning without the markup of tool calls the request did not allow
  * (vLLM: the content after the reasoning, tool blocks removed), with the raw block of each call

@@ -993,6 +993,22 @@ describe('mapAnthropicRequest', () => {
     expect(config.tools![0].function.name).toBe('B');
   });
 
+  it('tool_choice type=none still sends all tools (vLLM keeps them in the prompt)', () => {
+    const { config } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [{ role: 'user', content: 'Hello' }],
+      tool_choice: { type: 'none' },
+      tools: [
+        { name: 'A', input_schema: {} },
+        { name: 'B', input_schema: {} },
+      ],
+    });
+
+    expect(config.tools).toHaveLength(2);
+    expect(config.reasoningEffort).toBeUndefined();
+  });
+
   it('regression: tool_choice type=auto sends all tools', () => {
     // Pin the auto branch — the rejection logic for `type=tool` MUST NOT
     // affect `type=auto`, which should continue to forward every tool.

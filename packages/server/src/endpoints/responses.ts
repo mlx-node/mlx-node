@@ -31,7 +31,12 @@ import type { IdleSweeper } from '../idle-sweeper.js';
 import { withAdmissionControlledInference } from '../inference-admission.js';
 import { visibleAnswerText } from '../mappers/anthropic-response.js';
 import { withoutReasoningClose } from '../mappers/reasoning-close.js';
-import { mapRequest, reconstructMessagesFromChain, stringifyStoredInputMessages } from '../mappers/request.js';
+import {
+  mapRequest,
+  reconstructMessagesFromChain,
+  stringifyStoredInputMessages,
+  validateToolChoice,
+} from '../mappers/request.js';
 import {
   buildPartialResponse,
   buildResponseObject,
@@ -1725,6 +1730,13 @@ export async function handleCreateResponse(
       `Field "max_output_tokens" must be an integer between 1 and ${MAX_OUTPUT_TOKENS}`,
       'max_output_tokens',
     );
+    return;
+  }
+
+  try {
+    validateToolChoice(body);
+  } catch (err) {
+    sendBadRequest(res, err instanceof Error ? err.message : 'Invalid tool_choice', 'tool_choice');
     return;
   }
 
