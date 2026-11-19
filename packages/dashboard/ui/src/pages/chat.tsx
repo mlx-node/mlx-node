@@ -543,7 +543,15 @@ export default function Chat(): ReactElement {
   const stopRun = useCallback(
     async (runId: string): Promise<void> => {
       if (conversationId === null) return;
-      await mutate('POST', `${conversationPath(conversationId)}/runs/${encodeURIComponent(runId)}/stop`);
+      try {
+        await mutate('POST', `${conversationPath(conversationId)}/runs/${encodeURIComponent(runId)}/stop`);
+      } catch (err) {
+        // A run that is not live is reported by the confirmation alone.
+        if (!(err instanceof DashboardApiError && err.code === 'E_NOT_FOUND')) {
+          toast.error(CHAT.run.stopError, err instanceof Error ? { description: err.message } : undefined);
+        }
+        throw err;
+      }
     },
     [conversationId],
   );

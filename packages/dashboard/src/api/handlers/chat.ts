@@ -99,7 +99,10 @@ export function handleChatCancel(ctx: MainApiContext, req: ApiRequest): Promise<
   });
 }
 
-/** `POST /api/chat/conversations/:id/runs/:runId/stop`: Stop run. 404 `No such run.` when the run is not live. */
+/**
+ * `POST /api/chat/conversations/:id/runs/:runId/stop`: Stop run. 404 `No such run.` when the run is not live, 409 when
+ * the agent rejects the stop, 503 when its reply does not come.
+ */
 export function handleChatStopRun(ctx: MainApiContext, req: ApiRequest): Promise<unknown> {
   return guarded('chat', () => {
     const id = idParam(req.params.id);

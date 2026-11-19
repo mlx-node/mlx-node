@@ -246,7 +246,9 @@ prefill groups of two or more windows report `groupPasses` and
 `prefillFillCalls`, `prefillFillMicros`, `prefillFillReadBytes`,
 `prefillSlotMisses`, `prefillCheckpointBytesRead` and `prefillRouteReplays`
 are the share of each that prefill passes moved, so a turn's delta of
-`prefillFillMicros` is its prefill's fill time. The live decoded-row counters are
+`prefillFillMicros` is its prefill's fill time. A turn trace row's delta is the
+model-wide advance since the previous row: with turns that overlap it can hold
+another turn's counts, and the rows still sum to the counters. The live decoded-row counters are
 `decodedRowLookups`, `decodedRowMisses`, `decodedRowHitRate`,
 `decodedRowEvictions`, `decodedRowEvictedBytes`, plus `prefetchedRows` /
 `lateRows` (imports the reader threads had ready versus rows the model thread

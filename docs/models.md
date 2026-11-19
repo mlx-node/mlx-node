@@ -488,7 +488,8 @@ qwen3_5_moe load `'bf16'`.
 The SSD state tier has one identity for both modes: its namespace and KV
 fingerprint name the pool `Int8` under `'auto'` and `'bf16'` alike (as
 Splash's namespace names no mode). Queries are never stored and both modes
-write the same pages, so a state written in one mode restores in the other,
+write pages of one layout (past 7,168 their values differ, as the queries that
+fed them differ), so a state written in one mode restores in the other,
 and the stores older builds wrote (bf16 queries, `Int8`) restore under the
 `'auto'` default with no cold prefill. A restored chat then runs its new rows
 past 7,168 with int8 queries over KV that bf16 queries wrote: other bits

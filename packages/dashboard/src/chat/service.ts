@@ -541,9 +541,10 @@ export class ChatService {
   /** Work: the user's Stop of one workflow run. */
   async stopRun(id: string, runId: string): Promise<Record<string, never>> {
     const conversation = await this.known(id);
-    if (conversation.info.mode !== 'work' || !(await this.hosts.work.stopRun(id, runId))) {
-      throw ApiError.notFound('No such run.');
-    }
+    const stop = conversation.info.mode === 'work' ? await this.hosts.work.stopRun(id, runId) : 'not-live';
+    if (stop === 'not-live') throw ApiError.notFound('No such run.');
+    if (stop === 'rejected') throw ApiError.conflict('The run could not be stopped.');
+    if (stop === 'failed') throw ApiError.unavailable('The agent could not be reached.');
     return {};
   }
 

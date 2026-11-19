@@ -93,6 +93,8 @@ export type ColdDeltaField = (typeof COLD_DELTA_FIELDS)[number];
  * gate admitted but the host could not take before any bank dropped. `draftOneRowCycles` counts drafted cycles at one
  * row (the draft proposed, the verify took the anchor alone), which `mtpCycles` leaves out. `laneSteps` counts decode
  * steps that ran the rows of 2-4 scheduled turns in one pass. A model without `residencyInfo()` writes none of them.
+ * A row's delta is the model-wide advance since the previous row: with turns that overlap it can hold another turn's
+ * counts, and the rows still sum to the counters.
  */
 export const RESIDENCY_DELTA_FIELDS = [
   'slotHits',

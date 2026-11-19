@@ -621,6 +621,32 @@ describe('Work: workflow runs', () => {
     expect(byRole(document.body, 'dialog')!.textContent).toContain(CHAT.run.stopError);
   });
 
+  it('a stop that fails after the card went to Stopping… shows a toast; the card runs again', async () => {
+    const error = vi.spyOn(toast, 'error');
+    const held = deferred(STUB_FAILURE);
+    await open('/chat?c=p-run-fail', (text) => text.includes(RUN_TITLE), {
+      routes: { [`POST /chat/conversations/p-run-fail/runs/${RUN_ID}/stop`]: held.body },
+      conversations: {
+        'p-run-fail': sync('p-run-fail', {
+          entries: runEntries,
+          turn: null,
+          runs: [{ runId: RUN_ID, stopping: false }],
+        }),
+      },
+    });
+    click(button(CHAT.run.stop, runCard()!));
+    await waitFor(() => byRole(document.body, 'dialog') !== null);
+    click(button(CHAT.run.stop, byRole(document.body, 'dialog')!));
+    await waitFor(() => writes().length === 1);
+    act(() => api!.emitChat('p-run-fail', { type: 'runs', seq: 1, runs: [{ runId: RUN_ID, stopping: true }] }));
+    await waitFor(() => runStatus() === CHAT.run.stopping);
+    act(() => api!.emitChat('p-run-fail', { type: 'runs', seq: 2, runs: [{ runId: RUN_ID, stopping: false }] }));
+    await waitFor(() => runStatus() === CHAT.run.status.active);
+    held.release();
+    await waitFor(() => error.mock.calls.length === 1);
+    expect(error.mock.calls[0]![0]).toBe(CHAT.run.stopError);
+  });
+
   it('a wake turn shows Stop like any turn, and Stop cancels it', async () => {
     await open('/chat?c=p-wake', (text) => text.includes(RUN_TITLE), {
       routes: { '/chat/conversations/p-wake/cancel': {} },

@@ -831,8 +831,8 @@ describe('workflow runs', () => {
         expect(fake.host.isWorking(id)).toBe(true);
         await expect(fake.host.deleteSession(id, fake.project)).rejects.toMatchObject({ code: 'conversation-busy' });
         await expect(fake.host.setModel(id, 'qwen3.5-9b')).rejects.toMatchObject({ code: 'conversation-busy' });
-        expect(await fake.host.stopRun(id, 'wf_other')).toBe(false);
-        expect(await fake.host.stopRun(id, 'wf_1')).toBe(true);
+        expect(await fake.host.stopRun(id, 'wf_other')).toBe('not-live');
+        expect(await fake.host.stopRun(id, 'wf_1')).toBe('stopped');
         expect(fake.events.closed.at(-1)).toEqual({ sessionId: id, id: card.id, reason: 'cancelled' });
         expect(asked(fake, '_x.ai/workflows/stop').map((m) => m.params)).toEqual([{ sessionId: id, runId: 'wf_1' }]);
         await until(() => fake.host.runs(id).length === 0);
@@ -985,7 +985,7 @@ describe('workflow runs', () => {
         expect(marks.map((m) => m.toolCallId)).toEqual(['toolu_1']);
         expect(fake.events.interactions).toEqual([]);
         writeFileSync(stopGate, '');
-        expect(await stopped).toBe(true);
+        expect(await stopped).toBe('stopped');
         await until(() => fake.host.runs(id).length === 0);
         expect(fake.host.cancel(id)).toBe(true);
         expect((await turn.done).outcome).toBe('cancelled');

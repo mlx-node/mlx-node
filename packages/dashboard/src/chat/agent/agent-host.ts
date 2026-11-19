@@ -125,6 +125,10 @@ import { applyWebResult, readWebToolResult } from './web-results.js';
 export const AGENT_IDLE_STOP_MS = 600_000;
 /** Chat only: a Work turn has no time limit. The time the agent compacts the conversation is not counted. */
 export const CHAT_TURN_MAX_MS = 600_000;
+
+/** The end of a Stop run: `failed` when the reply did not come or did not read. */
+export type RunStop = 'stopped' | 'rejected' | 'failed' | 'not-live';
+
 /** After `session/cancel` the prompt reply must come inside this, else the agent broke the protocol. */
 export const CANCEL_REPLY_MS = 5_000;
 /** Chat guard: how long to wait for `server_status ready` of `mlx_web` after the session reply. */
@@ -715,15 +719,15 @@ export class AgentHost {
   }
 
   /**
-   * Work: the user's Stop of one workflow run, through `_x.ai/workflows/stop`. False when the run is not live. Its open
-   * cards are answered `cancelled` at once; the run leaves on its terminal `workflow_updated`, and a rejected or failed
-   * stop gives it back.
+   * Work: the user's Stop of one workflow run, through `_x.ai/workflows/stop`. `not-live` when the run is not live. Its
+   * open cards are answered `cancelled` at once; the run leaves on its terminal `workflow_updated`, and a rejected or
+   * failed stop gives it back.
    */
-  async stopRun(sessionId: string, runId: string): Promise<boolean> {
+  async stopRun(sessionId: string, runId: string): Promise<RunStop> {
     const session = this.sessions.get(sessionId);
     const run = session?.runs.get(runId);
     const running = this.running;
-    if (session === undefined || run === undefined || running === null) return false;
+    if (session === undefined || run === undefined || running === null) return 'not-live';
     run.stopping = true;
     this.closeOwned(session, (o) => o.kind === 'run' && o.runId === runId, 'cancelled');
     this.emitRuns(session);
@@ -735,11 +739,10 @@ export class AgentHost {
     } catch {
       outcome = null;
     }
-    if (outcome !== 'stopped' && session.runs.get(runId) === run) {
-      run.stopping = false;
-      this.emitRuns(session);
-    }
-    return true;
+    if (outcome === 'stopped' || session.runs.get(runId) !== run) return 'stopped';
+    run.stopping = false;
+    this.emitRuns(session);
+    return outcome ?? 'failed';
   }
 
   private stopAllRuns(): void {
@@ -1960,7 +1963,10 @@ export class AgentHost {
     if (line.xai) {
       const compaction = readCompaction(line.update);
       if (compaction !== null) this.onCompaction(session, compaction);
-      else if (line.update.sessionUpdate === 'turn_completed') this.endCompaction(session);
+      else if (line.update.sessionUpdate === 'turn_completed') {
+        if (turn !== null) this.resumeCap(session, turn);
+        this.endCompaction(session);
+      }
       const workflow = readWorkflowUpdate(line.update);
       if (workflow !== null) this.onWorkflow(session, workflow);
       const child = this.mode === 'work' ? readSpawnedChild(line.update) : null;

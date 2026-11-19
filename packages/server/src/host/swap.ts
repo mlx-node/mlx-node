@@ -7,7 +7,8 @@
  * instance, disposing it and waiting for native resource release before loading
  * the new one. A target that loads alone (`loadsAlone`) also drops the old
  * model's aliases first when the old model is idle, so its load reads live
- * memory with the old weights gone.
+ * memory with the old weights gone if the old model has `dispose()`. A model
+ * without it is freed by garbage collection, which this wait does not cover.
  */
 
 import type { LoadableModel, SessionCapableModel, DecisionModel } from '@mlx-node/lm';

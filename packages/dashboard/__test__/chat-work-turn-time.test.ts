@@ -166,4 +166,30 @@ describe('a Chat turn', () => {
       expect((await turn.done).outcome).toBe('turn-timeout');
     });
   }, 20_000);
+
+  it('a turn_completed line that ends an open compaction gives the cap back', async () => {
+    const unclosed = (scenario: Json): void => {
+      scenario.prompts = [
+        {
+          match: '',
+          steps: [
+            { text: 'Working on it', chunk: 5 },
+            { compact: { outcome: 'none' } },
+            { turnCompleted: {} },
+            { sleepMs: 20_000 },
+            { end: { stopReason: 'end_turn' } },
+          ],
+        },
+      ];
+    };
+    await withHost('cancel', { mode: 'chat', mutate: unclosed }, async (fake) => {
+      const { sessionId } = await fake.host.createSession({ modelId: MODEL });
+      const turn = await running(fake, sessionId);
+      await until(() => fake.events.updates.some((u) => u.line.update.sessionUpdate === 'turn_completed'), 5_000);
+      expect(fake.host.compaction(sessionId)).toBeNull();
+      vi.advanceTimersByTime(CHAT_TURN_MAX_MS + 1);
+      const ended = await Promise.race([turn.done, new Promise((resolve) => setTimeout(() => resolve(null), 3_000))]);
+      expect(ended).toMatchObject({ outcome: 'turn-timeout' });
+    });
+  }, 20_000);
 });

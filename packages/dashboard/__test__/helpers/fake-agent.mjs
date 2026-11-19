@@ -543,9 +543,9 @@ async function runGate(run, path, ms) {
 // path, else a delay): the helper's shell call and its permission request with `x.ai/requester` (`childOn`/`childAfterMs`),
 // the helper's end and the terminal `workflow_updated` with `result_summary` (`completeOn`/`completeAfterMs`), then the
 // wake turn (`wakeEndOn`/`wakeEndAfterMs` holds its end line). `_x.ai/workflows/stop` ends the run at any gate
-// (`stopOn` holds the stop until its file exists). `askAfterEnd`: the helper asks only after the terminal update, as a
-// late ask of a run that has ended. A `complete` run reaches its last phase first; `failed` keeps its phase and sends
-// `pause_message`.
+// (`stopOn` holds the stop until its file exists; `stopRejects` answers every stop as rejected). `askAfterEnd`: the
+// helper asks only after the terminal update, as a late ask of a run that has ended. A `complete` run reaches its last
+// phase first; `failed` keeps its phase and sends `pause_message`.
 function startWorkflow(session, w, n) {
   const run = {
     id: w.runId ?? `wf_${n}`,
@@ -563,6 +563,7 @@ function startWorkflow(session, w, n) {
     startedAt: Date.now(),
     stopped: false,
     stopOn: w.stopOn ?? null,
+    stopRejects: w.stopRejects === true,
     pauseMessage: null,
   };
   runs.set(run.id, run);
@@ -719,7 +720,7 @@ async function stopRun(id, params) {
   if (typeof run?.stopOn === 'string') while (!existsSync(run.stopOn)) await sleep(10);
   if (run === undefined || run.session.id !== sessionId)
     return reply(id, { outcome: 'rejected', code: 'workflow_control_unknown_run', detail: `no run ${runId}` });
-  if (run.status !== 'active')
+  if (run.status !== 'active' || run.stopRejects)
     return reply(id, { outcome: 'rejected', code: 'workflow_control_not_applicable', detail: run.status });
   run.stopped = true;
   run.status = 'cancelled';

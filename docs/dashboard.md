@@ -581,7 +581,9 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   the agent still says is `active` but the host no longer holds (the agent stopped, the app restarted) reads "Ended
   early". **Stop run** (only while the host holds the run and it is `active`) asks "Stop this workflow? Its helpers
   stop now." with Stop run / Keep running, then sends `POST /api/chat/conversations/:id/runs/:runId/stop`; the card
-  reads Stopping… until the run's last update, and no wake turn follows a stopped run. The composer's Stop stops the
+  reads Stopping… until the run's last update, and no wake turn follows a stopped run. A stop the agent rejects, or
+  that gets no reply, fails the call (409 "The run could not be stopped.", or 503), gives the card back to running and
+  shows the toast "Could not stop the run". The composer's Stop stops the
   turn only, a typed one or a wake, never a run. During a run: a typed prompt is allowed, the model picker and Delete
   are off ("A workflow runs here. Stop it first."), Rename stays on, Unload waits, the agent's idle stop and a config
   restart wait for the run's end (a config restart also waits for the wake that follows a run's end, or for the idle
@@ -1293,22 +1295,22 @@ runs), not through the session routes.
 
 ### Chat routes
 
-| Route                                           | Method | Thread    | Purpose                                                                                                                               |
-| ----------------------------------------------- | ------ | --------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `/api/chat/state`                               | GET    | transport | `ChatHostState`: inference, the load, the models in memory, models, agent binary, both modes, providers, active turns, mode picks     |
-| `/api/chat/conversations`                       | GET    | worker    | `?mode=chat\|work` → `{conversations: ConversationRow[]}`                                                                             |
-| `/api/chat/conversations`                       | POST   | transport | `{mode, text, modelId?, cwd?, draft?}` → 201 `{conversation, turnId}`; starts the first turn; `draft` (Work) applies its picked mode  |
-| `/api/chat/conversations/:id/prompt`            | POST   | transport | `{text}` → 202 `{turnId}`                                                                                                             |
-| `/api/chat/conversations/:id/cancel`            | POST   | transport | → `{cancelled}`                                                                                                                       |
-| `/api/chat/conversations/:id/runs/:runId/stop`  | POST   | transport | no body → `{}`; Stop run of one live workflow run; 404 "No such run." when the host does not hold it                                  |
-| `/api/chat/conversations/:id/interactions/:iid` | POST   | transport | `{optionId}` or `{decision, feedback?}`; Work only, 404 for a Chat conversation                                                       |
-| `/api/chat/conversations/:id/permission-mode`   | POST   | transport | `{mode, up}` → `{mode}`; Work only; 409 `card-open` or `mode-changed`; 503 if a line write fails: see [Chat and Work](#chat-and-work) |
-| `/api/chat/drafts/:draft/permission-mode`       | POST   | transport | `{mode, up, cwd?, temp?}` → `{mode}`; the New Work screen's pick; `up: true` needs `cwd`; 409 `mode-changed` or `temp-unnamed`        |
-| `/api/chat/work/hooks`                          | GET    | transport | `?cwd=` → `{userHooks}`; the folder rule of create first                                                                              |
-| `/api/chat/conversations/:id`                   | PATCH  | transport | `{title}` or `{modelId}` → `ConversationInfo`                                                                                         |
-| `/api/chat/conversations/:id`                   | DELETE | transport | → `{}`; open streams end with `gone`                                                                                                  |
-| `/api/chat/agent`                               | POST   | transport | `{action: 'restart', mode?}` or `{action: 'install'}` → `ChatHostState`                                                               |
-| `/api/chat/engine/unload`                       | POST   | transport | no body → `{unloaded: string[]}`; 409 `engine-busy` while an answer, a workflow or a load runs                                        |
+| Route                                           | Method | Thread    | Purpose                                                                                                                                                                     |
+| ----------------------------------------------- | ------ | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/api/chat/state`                               | GET    | transport | `ChatHostState`: inference, the load, the models in memory, models, agent binary, both modes, providers, active turns, mode picks                                           |
+| `/api/chat/conversations`                       | GET    | worker    | `?mode=chat\|work` → `{conversations: ConversationRow[]}`                                                                                                                   |
+| `/api/chat/conversations`                       | POST   | transport | `{mode, text, modelId?, cwd?, draft?}` → 201 `{conversation, turnId}`; starts the first turn; `draft` (Work) applies its picked mode                                        |
+| `/api/chat/conversations/:id/prompt`            | POST   | transport | `{text}` → 202 `{turnId}`                                                                                                                                                   |
+| `/api/chat/conversations/:id/cancel`            | POST   | transport | → `{cancelled}`                                                                                                                                                             |
+| `/api/chat/conversations/:id/runs/:runId/stop`  | POST   | transport | no body → `{}`; Stop run of one live workflow run; 404 "No such run." when the host does not hold it; 409 when the agent rejects the stop, 503 when its reply does not come |
+| `/api/chat/conversations/:id/interactions/:iid` | POST   | transport | `{optionId}` or `{decision, feedback?}`; Work only, 404 for a Chat conversation                                                                                             |
+| `/api/chat/conversations/:id/permission-mode`   | POST   | transport | `{mode, up}` → `{mode}`; Work only; 409 `card-open` or `mode-changed`; 503 if a line write fails: see [Chat and Work](#chat-and-work)                                       |
+| `/api/chat/drafts/:draft/permission-mode`       | POST   | transport | `{mode, up, cwd?, temp?}` → `{mode}`; the New Work screen's pick; `up: true` needs `cwd`; 409 `mode-changed` or `temp-unnamed`                                              |
+| `/api/chat/work/hooks`                          | GET    | transport | `?cwd=` → `{userHooks}`; the folder rule of create first                                                                                                                    |
+| `/api/chat/conversations/:id`                   | PATCH  | transport | `{title}` or `{modelId}` → `ConversationInfo`                                                                                                                               |
+| `/api/chat/conversations/:id`                   | DELETE | transport | → `{}`; open streams end with `gone`                                                                                                                                        |
+| `/api/chat/agent`                               | POST   | transport | `{action: 'restart', mode?}` or `{action: 'install'}` → `ChatHostState`                                                                                                     |
+| `/api/chat/engine/unload`                       | POST   | transport | no body → `{unloaded: string[]}`; 409 `engine-busy` while an answer, a workflow or a load runs                                                                              |
 
 Bodies hold exactly the listed fields: any other field (`_meta`, `mcpServers`, `pluginDirs`, `env`, …) is 400. Text is
 1–100,000 characters (413 above); text whose first non-space character is `/` is 400 with `reason: 'slash-text'` and

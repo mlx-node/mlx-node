@@ -443,7 +443,7 @@ describe.skipIf(BIN === undefined)('Work workflows on the real agent', () => {
       const runId = xaiUpdates(wire, 'workflow_updated')[0]!.run_id as string;
       await until(() => sleepers().length > 0, 10_000).catch(() => {});
       notes.sleepersBeforeStop = sleepers();
-      expect(await fake.host.stopRun(id, runId)).toBe(true);
+      expect(await fake.host.stopRun(id, runId)).toBe('stopped');
       const request = wire.in.find((m) => m.method === '_x.ai/workflows/stop')!;
       await until(() => wire.out.some((m) => m.id === request.id && m.method === undefined), 10_000);
       const reply = wire.out.find((m) => m.id === request.id && m.method === undefined)!;

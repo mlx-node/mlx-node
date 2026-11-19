@@ -1644,6 +1644,37 @@ describe('Chat service — a Work workflow run', () => {
     }
   }, 20_000);
 
+  it('a stop the agent rejects fails the call and gives the run back', async () => {
+    const flags = mkdtempSync(join(tmpdir(), 'mlx-wf-'));
+    try {
+      await withWork(
+        'work-workflow-run',
+        async (fake, project) => {
+          const svc = fake.service;
+          const { conversation } = await svc.create({ mode: 'work', text: 'research', cwd: project });
+          const id = conversation.id;
+          const page = new Page(svc, id);
+          await until(() => interactionsOf(page).length === 1, 5_000);
+          await svc.answer(id, interactionsOf(page)[0]!.id, { optionId: 'allow-once' });
+          await until(() => page.lastOutcome() !== undefined, 5_000);
+          const runs = (): unknown[] => page.events.flatMap((e) => (e.type === 'runs' ? [e.runs] : []));
+          expect(runs()).toEqual([[{ runId: 'wf_1', stopping: false }]]);
+          const error = await apiError(svc.stopRun(id, 'wf_1'));
+          expect([error.code, error.message]).toEqual(['E_CONFLICT', 'The run could not be stopped.']);
+          expect(runs()).toEqual([
+            [{ runId: 'wf_1', stopping: false }],
+            [{ runId: 'wf_1', stopping: true }],
+            [{ runId: 'wf_1', stopping: false }],
+          ]);
+          page.detach();
+        },
+        { mutate: workflow({ childOn: join(flags, 'child'), stopRejects: true }) },
+      );
+    } finally {
+      rmSync(flags, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it('Stop run of a Chat conversation is 404', async () => {
     await withService(async (fake) => {
       const { conversation } = await fake.service.create({ mode: 'chat', text: 'hello' });
