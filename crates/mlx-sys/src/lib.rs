@@ -2042,6 +2042,20 @@ unsafe extern "C-unwind" {
         sorted_indices: bool,
     ) -> *mut mlx_array;
 
+    /// Row-major K-quant experts: `x [..B, 1, K]` through `w[rhs_indices].T`
+    /// with `rhs_indices [..B]` ascending, on the sorted-rhs kernel at every
+    /// row and expert count (one fixed tile).
+    pub fn mlx_kquant_gather_qmm_sorted(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        rhs_indices: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+    ) -> *mut mlx_array;
+
     /// TEST-ONLY: per-thread K-quant kernel-family counters. Enabling or
     /// disabling resets this thread's counts.
     pub fn mlx_test_kquant_counting(enable: bool);

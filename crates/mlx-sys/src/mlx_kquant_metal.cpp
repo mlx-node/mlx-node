@@ -1239,7 +1239,7 @@ void gather_qvm(const Operands &o, const array &lhs_indices,
 void gather_qmm_rhs(const array &x_, const array &w_, const array &scales_,
                     const array &biases_, const array &indices_, array &out,
                     bool transpose, Mode mode, int M, int N, int K,
-                    metal::Device &d, const Stream &s) {
+                    bool fixed_tile, metal::Device &d, const Stream &s) {
   array indices = ensure_row_contiguous(indices_, s);
   auto broadcast_with_indices = [&s, &indices](const array &x) {
     if (x.size() / x.shape(-2) / x.shape(-1) == indices.size()) {
@@ -1266,7 +1266,9 @@ void gather_qmm_rhs(const array &x_, const array &w_, const array &scales_,
       K % 64 == 0 && (env::enable_tf32() || x.dtype() != float32)) {
     const int E = w.size() / w.shape(-1) / w.shape(-2);
     const auto &tile =
-        kernels::kRhsNaxTiles[M / E < kernels::kRhsNaxWideRows ? 0 : 1];
+        kernels::kRhsNaxTiles[fixed_tile || M / E < kernels::kRhsNaxWideRows
+                                  ? 0
+                                  : 1];
     array offsets = gather_mm_offsets(indices, E, M, d, s);
     auto kernel = get_kernel(d, "gather_qmm_rhs_nax_nt",
                              kernels::gather_qmm_rhs_nax(mode, x.dtype(), tile),
@@ -1542,9 +1544,9 @@ void KQuantGatherQMM::eval_gpu(const std::vector<array> &inputs, array &out) {
 
   // x and w are both walked in order, so the matmuls batch up and reuse the
   // loads of each expert's weights.
-  if (M == 1 && B >= 16 && right_sorted_ && B / E >= 4) {
+  if (M == 1 && right_sorted_ && (rhs_any_rows_ || (B >= 16 && B / E >= 4))) {
     gather_qmm_rhs(x, w, scales, biases, rhs_indices, out, transpose_, mode_,
-                   x.size() / K, N, K, d, s);
+                   x.size() / K, N, K, rhs_any_rows_, d, s);
     return;
   }
 

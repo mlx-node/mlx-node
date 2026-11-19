@@ -833,8 +833,8 @@ fn real_slot_gather_equals_whole_tensor_gather() {
             let row = |v: &[u32]| -> Vec<u32> { (0..3).flat_map(|_| v.iter().copied()).collect() };
             let by_slot = MxArray::from_uint32(&row(&p.slots[..]), &[3, 3]).unwrap();
             let by_id = MxArray::from_uint32(&row(&experts[..]), &[3, 3]).unwrap();
-            let got = p.arrays[pi].gather(&x, &by_slot, false).unwrap();
-            let want = whole.gather(&x, &by_id, false).unwrap();
+            let got = p.arrays[pi].gather(&x, &by_slot).unwrap();
+            let want = whole.gather(&x, &by_id).unwrap();
             let (got, want) = (
                 got.to_float32().unwrap().to_vec(),
                 want.to_float32().unwrap().to_vec(),

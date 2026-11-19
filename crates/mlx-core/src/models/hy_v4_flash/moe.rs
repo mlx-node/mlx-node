@@ -12,9 +12,13 @@
 //! ```
 //!
 //! Each row's expert outputs stay apart (`[rows, k, latent]`, ascending id)
-//! and are added in f32 in that order, so a row's bits do not depend on the
-//! other rows, the slots or the call split. Routed experts come from the
-//! class bank (trunk layers) or from resident affine codes (the MTP layer).
+//! and are summed over `k` in one f32 reduce whose order depends on `k`
+//! only, so a row's bits do not depend on the other rows, the slots or the
+//! call split. Routed experts come from the class bank (trunk layers) or
+//! from resident affine codes (the MTP layer). A prefill slice through the
+//! bank runs its (row, expert) pairs sorted by slot through the sorted-rhs
+//! kernel (each slot's weights read once per run of rows); decode rows and
+//! resident experts take one matvec per pair.
 //!
 //! The rows of one call are one sequence's prefill slice or decode rows of
 //! one or more sequences (`RowKind`, given by the caller):
@@ -23,7 +27,7 @@
 //! |---|---|---|
 //! | Q8 matrices (`qlinear`) | all rows in one call, padded to `MIN_Q8_ROWS` | all rows |
 //! | f32 router (`Op::Router`) | one call per row, one readback for all rows | all rows |
-//! | routed experts | one bank `prepare` over the union, victims | one `prepare` per chunk, staging |
+//! | routed experts | one bank `prepare` over the union, victims; one matvec per (row, expert) | one `prepare` per chunk, staging; pairs sorted by slot |
 //!
 //! Decode rows are one chunk, never split by `chunk`.
 
@@ -505,8 +509,7 @@ impl Moe {
         match &self.experts {
             ExpertSource::Resident(a) => {
                 let tp = prof_start();
-                let idx = MxArray::from_uint32(&ids, &[rows, routes.k as i64])?;
-                let y = self.combine(z, &idx, &w, |p, x, i| a.gather(p, x, i))?;
+                let y = self.combine(z, &ids, &w, false, |p, x, i| a.gather(p, x, i))?;
                 prof_end(Phase::Routed, tp, &[&y])?;
                 Ok(y)
             }
@@ -517,7 +520,7 @@ impl Moe {
                 prof_end(Phase::Fill, tp, &[])?;
                 bank.assert_slots(&p);
                 let tp = prof_start();
-                let out = self.banked(z, &ids, &w, &p);
+                let out = self.banked(z, &ids, &w, &p, kind);
                 if out.is_ok() {
                     bank.done(&p);
                 }
@@ -527,8 +530,14 @@ impl Moe {
         }
     }
 
-    fn banked(&self, z: &MxArray, ids: &[u32], w: &[f32], p: &Prepared) -> Result<MxArray> {
-        let rows = z.shape_at(0)?;
+    fn banked(
+        &self,
+        z: &MxArray,
+        ids: &[u32],
+        w: &[f32],
+        p: &Prepared,
+        kind: RowKind,
+    ) -> Result<MxArray> {
         let slots = ids
             .iter()
             .map(|&e| {
@@ -536,43 +545,71 @@ impl Moe {
                     .ok_or_else(|| bad(format!("expert {e} not prepared")))
             })
             .collect::<Result<Vec<u32>>>()?;
-        let idx = MxArray::from_uint32(&slots, &[rows, self.moe.n_used as i64])?;
-        let out = self.combine(z, &idx, w, |pi, x, i| p.arrays[pi].gather(x, i, false))?;
+        let sorted = !kind.is_decode();
+        let out = self.combine(z, &slots, w, sorted, |pi, x, i| {
+            let a = &p.arrays[pi];
+            if sorted {
+                a.gather_sorted(x, i)
+            } else {
+                a.gather(x, i)
+            }
+        })?;
         // a later step may refill or evict these slots: no lazy gather may
         // outlive this call
         super::stats::eval(&[&out], "hy_v4_flash routed experts")?;
         Ok(out)
     }
 
-    /// The expert math over `idx [rows, k]` (columns in ascending expert
-    /// id, weights `w` in the same order) with `gather(projection, x, idx)`.
+    /// The expert math over `idx` (`[rows, k]` row-major, each row's
+    /// columns in ascending expert id, weights `w` in the same order) with
+    /// `gather(projection, x, idx)`. `sorted`: the pairs run ordered by
+    /// `idx` (stable), as `x [rows·k, 1, d]` and `idx [rows·k]`, and are put
+    /// back in row order before the sum.
     fn combine(
         &self,
         z: &MxArray,
-        idx: &MxArray,
+        idx: &[u32],
         w: &[f32],
+        sorted: bool,
         gather: impl Fn(usize, &MxArray, &MxArray) -> Result<MxArray>,
     ) -> Result<MxArray> {
         let (rows, latent) = (z.shape_at(0)?, z.shape_at(1)?);
         let k = self.moe.n_used as i64;
-        let ze = z.reshape(&[rows, 1, 1, latent])?;
-        let g = gather(0, &ze, idx)?;
-        let u = gather(1, &ze, idx)?;
-        let a = swiglu(&g, &u, self.limit, None, DType::Float32)?;
-        let wt = MxArray::from_float32(w, &[rows, k, 1, 1])?;
-        let d = gather(2, &a, idx)?
-            .astype(DType::Float32)?
-            .mul(&wt)?
-            .reshape(&[rows, k, latent])?;
-        let col = |j: i64| -> Result<MxArray> {
-            d.slice(&[0, j, 0], &[rows, j + 1, latent])?
-                .reshape(&[rows, latent])
+        let d = if sorted {
+            let pairs = (rows * k) as usize;
+            let mut order: Vec<u32> = (0..pairs as u32).collect();
+            order.sort_by_key(|&i| idx[i as usize]);
+            let mut back = vec![0u32; pairs];
+            for (at, &i) in order.iter().enumerate() {
+                back[i as usize] = at as u32;
+            }
+            let row: Vec<u32> = order.iter().map(|&i| i / k as u32).collect();
+            let slot: Vec<u32> = order.iter().map(|&i| idx[i as usize]).collect();
+            let ws: Vec<f32> = order.iter().map(|&i| w[i as usize]).collect();
+            let n = pairs as i64;
+            let x = z
+                .take(&MxArray::from_uint32(&row, &[n])?, 0)?
+                .reshape(&[n, 1, latent])?;
+            let i = MxArray::from_uint32(&slot, &[n])?;
+            let g = gather(0, &x, &i)?;
+            let u = gather(1, &x, &i)?;
+            let a = swiglu(&g, &u, self.limit, None, DType::Float32)?;
+            gather(2, &a, &i)?
+                .astype(DType::Float32)?
+                .mul(&MxArray::from_float32(&ws, &[n, 1, 1])?)?
+                .reshape(&[n, latent])?
+                .take(&MxArray::from_uint32(&back, &[n])?, 0)?
+        } else {
+            let i = MxArray::from_uint32(idx, &[rows, k])?;
+            let ze = z.reshape(&[rows, 1, 1, latent])?;
+            let g = gather(0, &ze, &i)?;
+            let u = gather(1, &ze, &i)?;
+            let a = swiglu(&g, &u, self.limit, None, DType::Float32)?;
+            gather(2, &a, &i)?
+                .astype(DType::Float32)?
+                .mul(&MxArray::from_float32(w, &[rows, k, 1, 1])?)?
         };
-        let mut y = col(0)?;
-        for j in 1..k {
-            y = y.add(&col(j)?)?;
-        }
-        Ok(y)
+        d.reshape(&[rows, k, latent])?.sum(Some(&[1]), Some(false))
     }
 }
 

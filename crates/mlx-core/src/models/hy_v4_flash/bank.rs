@@ -577,8 +577,9 @@ pub struct ProjArrays {
 
 impl ProjArrays {
     /// `x [rows, 1, 1, k]` (or `[rows, n, 1, k]`) through the bank slots
-    /// `slots [rows, n]` (uint32) -> `[rows, n, 1, out]`.
-    pub fn gather(&self, x: &MxArray, slots: &MxArray, sorted: bool) -> Result<MxArray> {
+    /// `slots [rows, n]` (uint32) -> `[rows, n, 1, out]`, one matvec per
+    /// (row, slot).
+    pub fn gather(&self, x: &MxArray, slots: &MxArray) -> Result<MxArray> {
         let mode = CString::new(self.format.mlx_mode()).map_err(|e| bad(e.to_string()))?;
         // SAFETY: every handle is a live array owned by the caller for the
         // call; the bridge returns a new array or null on error.
@@ -594,10 +595,32 @@ impl ProjArrays {
                 self.format.group_size() as i32,
                 self.format.bits() as i32,
                 mode.as_ptr(),
-                sorted,
+                false,
             )
         };
         MxArray::from_handle(h, "hy_v4_flash gather_qmm")
+    }
+
+    /// `x [b, 1, k]` through the ascending bank slots `slots [b]` (uint32)
+    /// -> `[b, 1, out]`: the sorted-rhs kernel, which reads a slot's weights
+    /// once per run of rows on it.
+    pub fn gather_sorted(&self, x: &MxArray, slots: &MxArray) -> Result<MxArray> {
+        let mode = CString::new(self.format.mlx_mode()).map_err(|e| bad(e.to_string()))?;
+        // SAFETY: every handle is a live array owned by the caller for the
+        // call; the bridge returns a new array or null on error.
+        let h = unsafe {
+            mlx_sys::mlx_kquant_gather_qmm_sorted(
+                x.as_raw_ptr(),
+                self.w.as_raw_ptr(),
+                self.s.as_raw_ptr(),
+                self.b.as_raw_ptr(),
+                slots.as_raw_ptr(),
+                self.format.group_size() as i32,
+                self.format.bits() as i32,
+                mode.as_ptr(),
+            )
+        };
+        MxArray::from_handle(h, "hy_v4_flash sorted gather_qmm")
     }
 }
 

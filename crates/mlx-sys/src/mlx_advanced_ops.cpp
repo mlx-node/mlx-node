@@ -1451,4 +1451,41 @@ mlx_array* mlx_gather_qmm(
     }
 }
 
+// K-quant row-major experts only: x [..B, 1, K] through w[rhs_indices].T,
+// rhs_indices [..B] ascending (kquant::gather_qmm_sorted_rhs).
+mlx_array* mlx_kquant_gather_qmm_sorted(
+    mlx_array* x,
+    mlx_array* w,
+    mlx_array* scales,
+    mlx_array* biases,
+    mlx_array* rhs_indices,
+    int group_size,
+    int bits,
+    const char* mode
+) {
+    try {
+        std::string mode_str(mode ? mode : "");
+        auto layout = mlx::core::kquant::parse_mode_layout(mode_str);
+        auto kmode = mlx::core::kquant::parse_mode(mode_str);
+        if (!layout || !kmode || layout->layout != mlx::core::kquant::Layout::RowMajor) {
+            throw std::invalid_argument(
+                "[gather_qmm_sorted] needs a row-major K-quant mode, got '" + mode_str + "'.");
+        }
+        if (biases == nullptr) {
+            throw std::invalid_argument("[gather_qmm_sorted] K-quant needs biases.");
+        }
+        auto result = mlx::core::kquant::gather_qmm_sorted_rhs(
+            *reinterpret_cast<mlx::core::array*>(x),
+            *reinterpret_cast<mlx::core::array*>(w),
+            *reinterpret_cast<mlx::core::array*>(scales),
+            *reinterpret_cast<mlx::core::array*>(biases),
+            *reinterpret_cast<mlx::core::array*>(rhs_indices),
+            std::optional<int>(group_size), std::optional<int>(bits), *kmode);
+        return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_kquant_gather_qmm_sorted error: " << e.what() << std::endl;
+        return nullptr;
+    }
+}
+
 }  // extern "C"

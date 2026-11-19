@@ -1025,6 +1025,131 @@ fn decode_wave_takes_victims_at_any_row_count() {
     assert_rows(&read(&dec), &want, 1e-5, "decode wave vs prefill");
 }
 
+/// A prefill slice through the bank runs on the sorted-rhs kernel, and a
+/// row's routed output there is bit for bit the same alone, among other rows
+/// (runs that straddle 16-row tiles, aligned and unaligned pair counts) and
+/// in any row order; decode rows (one matvec per pair) agree to rounding.
+#[test]
+fn sorted_prefill_rows_do_not_depend_on_their_neighbours() {
+    crate::models::hy_v4_flash::exact_f32();
+    let mut rng = Rng::new(31);
+    let m = moe_cfg(6, 2, 512, 256);
+    let c = ffn_cfg(128, m.clone(), 0.5);
+    let mut file = rng.bytes(1000);
+    let experts = vec![
+        None,
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            1,
+            ExpertClass::Q6kDown,
+            &mut file,
+        )),
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            2,
+            ExpertClass::Q4kDown,
+            &mut file,
+        )),
+    ];
+    let dir = Temp::new();
+    let path = dir.0.join("data.bin");
+    std::fs::write(&path, &file).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+    let bank = Arc::new(KqBank::new(pool, &m, &experts, [4, 4], 1).unwrap());
+    let rows = 40usize;
+    let k = m.n_used;
+    let z: Vec<f32> = rng.vec(rows * m.latent, 1.0);
+    let mut ids = Vec::with_capacity(rows * k);
+    let mut weights = Vec::with_capacity(rows * k);
+    for _ in 0..rows {
+        let a = (rng.step() % m.n_experts as u64) as u32;
+        let b = (a + 1 + (rng.step() % (m.n_experts as u64 - 1)) as u32) % m.n_experts as u32;
+        ids.extend([b, a]);
+        weights.extend([0.25 + rng.next().abs(), 0.25 + rng.next().abs()]);
+    }
+    let routes = Routes { k, ids, weights };
+    let sub = |rs: &[usize]| -> (MxArray, Routes) {
+        let zs: Vec<f32> = rs
+            .iter()
+            .flat_map(|&r| z[r * m.latent..(r + 1) * m.latent].iter().copied())
+            .collect();
+        let pick = |v: &[u32]| -> Vec<u32> {
+            rs.iter()
+                .flat_map(|&r| v[r * k..(r + 1) * k].iter().copied())
+                .collect()
+        };
+        let w: Vec<f32> = rs
+            .iter()
+            .flat_map(|&r| routes.weights[r * k..(r + 1) * k].iter().copied())
+            .collect();
+        (
+            MxArray::from_float32(&zs, &[rs.len() as i64, m.latent as i64]).unwrap(),
+            Routes {
+                k,
+                ids: pick(&routes.ids),
+                weights: w,
+            },
+        )
+    };
+    let bits = |v: Vec<f32>| v.into_iter().map(f32::to_bits).collect::<Vec<u32>>();
+    for il in [1usize, 2] {
+        let (w, _, _) = moe_weights(&mut rng, &c, 64);
+        let ffn = Ffn::Moe(w);
+        let layer =
+            LayerFfn::new(&c, il, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
+        let FfnKind::Moe(moe) = &layer.kind else {
+            panic!("layer {il} is not MoE")
+        };
+        let run = |rs: &[usize], kind: RowKind| -> Vec<Vec<u32>> {
+            let (zs, r) = sub(rs);
+            let y = moe.routed(il, &zs, &r, kind).unwrap();
+            bank.end_turn().unwrap();
+            bits(read(&y))
+                .chunks_exact(m.latent)
+                .map(<[u32]>::to_vec)
+                .collect()
+        };
+        let all: Vec<usize> = (0..rows).collect();
+        // SAFETY: test-only counters of this thread.
+        unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+        let full = run(&all, RowKind::Prefill);
+        let rhs = unsafe { mlx_sys::mlx_test_kquant_family_count(c"gather_qmm_rhs_nt".as_ptr()) };
+        unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+        assert_eq!(
+            rhs, 3,
+            "layer {il}: the prefill did not take the sorted-rhs kernel"
+        );
+        for (r, want) in full.iter().enumerate() {
+            assert_eq!(
+                &run(&[r], RowKind::Prefill)[0],
+                want,
+                "layer {il} row {r} alone"
+            );
+        }
+        for rs in [
+            (5..21).collect::<Vec<_>>(),
+            (3..14).collect(),
+            (0..rows).rev().collect(),
+        ] {
+            for (got, &r) in run(&rs, RowKind::Prefill).iter().zip(&rs) {
+                assert_eq!(got, &full[r], "layer {il} row {r} among {rs:?}");
+            }
+        }
+        let want: Vec<Vec<f64>> = full
+            .iter()
+            .map(|r| r.iter().map(|&b| f64::from(f32::from_bits(b))).collect())
+            .collect();
+        let dec: Vec<f32> = run(&all, RowKind::Decode)
+            .into_iter()
+            .flatten()
+            .map(f32::from_bits)
+            .collect();
+        assert_rows(&dec, &want, 1e-5, "decode vs sorted prefill");
+    }
+}
+
 /// A 1-row `qlinear` through a Q8 matrix is row 0 of the 2-row call of
 /// `[x; 0]` bit for bit, and each row of a 3-row call equals that row
 /// padded alone (`qmv_wide` at every M in 2..limit); f32 matrices are not
