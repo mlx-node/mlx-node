@@ -18,6 +18,8 @@ pub mod ops;
 pub mod rows;
 pub mod scan;
 pub mod sparse;
+pub mod stats;
+pub mod store;
 pub mod weights;
 
 #[cfg(test)]
