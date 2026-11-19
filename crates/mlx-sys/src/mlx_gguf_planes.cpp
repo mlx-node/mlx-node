@@ -890,6 +890,10 @@ bool mlx_test_gguf_planes_gpu_seconds(mlx_array* const* outs, size_t n, double* 
 // TEST-ONLY: this thread's fault (gguf_planes::testing::Mutation), 0 = none.
 void mlx_test_gguf_planes_mutation(int32_t mutation) { gguf_planes::testing::mutation = mutation; }
 
+// TEST-ONLY: the metallib the decode primitives built next on this thread take their kernels from; null or empty
+// for the prebuilt paged_attn.metallib.
+void mlx_test_gguf_planes_library(const char* path) { gguf_planes::testing::library = path ? path : ""; }
+
 // TEST-ONLY: the path of gguf_planes_test.metallib, which holds the test-only kernels, for every thread.
 void mlx_test_gguf_planes_test_library(const char* path) {
   std::lock_guard<std::mutex> lock(gguf_planes::test_library_mutex);

@@ -3593,6 +3593,9 @@ unsafe extern "C" {
     ) -> bool;
     /// TEST-ONLY: this thread's planes fault, 0 = none.
     pub fn mlx_test_gguf_planes_mutation(mutation: i32);
+    /// TEST-ONLY: the metallib the decode primitives built next on this
+    /// thread take their kernels from; null for the prebuilt one.
+    pub fn mlx_test_gguf_planes_library(path: *const std::ffi::c_char);
     /// TEST-ONLY: the path of `gguf_planes_test.metallib` for every thread
     /// (see [`gguf_planes_use_test_library`]).
     pub fn mlx_test_gguf_planes_test_library(path: *const std::ffi::c_char);
