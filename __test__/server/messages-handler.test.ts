@@ -7817,7 +7817,10 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
   // Splash cuts the raw output at a stop (`CallbackStreamer._emit`) before
   // `StreamingToolCallProjector` reads a nameless opening as text, so the block
   // keeps its place in the answer. Mutation: append the nameless blocks after the
-  // text (skip the in-place placement) → red (AFTER leaks past the stop).
+  // text (skip the in-place placement) → red (AFTER leaks past the stop). The
+  // mocks carry the native shape: `rawText` with the reasoning, which quotes the
+  // block, and `publicRawText` after it. Mutation: place in `rawText` → red (the
+  // quoted copy is found first and the block goes after the text).
   describe('a nameless call keeps its place in the answer', () => {
     const block = '<tool_call>\n<function=>\n<parameter=q>\nxSTOPy\n</parameter>\n</function>\n</tool_call>';
     const nameless = {
@@ -7854,10 +7857,13 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
       };
       const registry = new ModelRegistry();
       const mock = createMockRes();
+      const publicRawText = `\n\n${raw}`;
+      const quoted = toolCalls.find((call) => call.status === 'missing_name')?.rawContent ?? '';
+      const rawText = `<think>see ${quoted}</think>${publicRawText}`;
       if (!stream) {
         registry.register(
           'test-model',
-          createMockModel(makeChatResult({ text: cleaned, rawText: raw, toolCalls, finishReason: 'stop' })),
+          createMockModel(makeChatResult({ text: cleaned, rawText, publicRawText, toolCalls, finishReason: 'stop' })),
         );
         await handleCreateMessage(mock.res, request, registry);
         const parsed = JSON.parse(mock.getBody());
@@ -7886,7 +7892,8 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
             numTokens: 16,
             promptTokens: 8,
             reasoningTokens: 0,
-            rawText: raw,
+            rawText,
+            publicRawText,
           },
         ]),
       );
