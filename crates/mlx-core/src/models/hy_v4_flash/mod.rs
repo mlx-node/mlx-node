@@ -43,6 +43,8 @@ mod tests_chat;
 #[cfg(test)]
 mod tests_config;
 #[cfg(test)]
+mod tests_llama;
+#[cfg(test)]
 mod tests_model;
 #[cfg(test)]
 mod tests_mtp;
