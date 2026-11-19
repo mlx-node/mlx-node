@@ -113,6 +113,10 @@ pub struct Trace {
     /// Keep each layer's output streams `[n, hc, d]` in `out`.
     pub keep_out: bool,
     pub out: Vec<MxArray>,
+    /// Layer `l`'s input streams `[n, hc, d]` replaced by `inputs[l]` when
+    /// it is `Some`.
+    #[cfg(test)]
+    pub inputs: Vec<Option<MxArray>>,
 }
 
 /// One owner's part of a step: `ids` appended to `sess`, and what the step
@@ -802,6 +806,10 @@ impl Model {
                 rows: r,
                 keep: &keep,
             });
+            #[cfg(test)]
+            if let Some(Some(xi)) = trace.as_deref().and_then(|t| t.inputs.get(l)) {
+                x = xi.clone();
+            }
             let (y, routes) = blk.forward(&w.layers()[l], &x, wave, owners, engram)?;
             super::stats::eval(&[&y], "hy_v4_flash layer")?;
             x = y;

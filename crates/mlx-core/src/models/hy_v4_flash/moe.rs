@@ -462,6 +462,8 @@ impl Moe {
             Group::Fused | Group::Owner => router_scores(x, &w.router)?,
         };
         let (ids, weights) = route(&scores, self.bias.as_deref(), &self.moe)?;
+        #[cfg(test)]
+        let (ids, weights) = forced::apply(layer, &scores, ids, weights, &self.moe)?;
         prof_end(Phase::Router, tp, &[])?;
         let routes = Routes {
             k: self.moe.n_used,
@@ -743,6 +745,68 @@ impl LayerFfn {
             _ => MxArray::concatenate_many(outs.iter().collect(), Some(0))?,
         };
         Ok((y, routes))
+    }
+}
+
+/// Test hook: per layer, the expert ids every row must take (`[rows, k]`),
+/// their weights from this build's own scores.
+#[cfg(test)]
+pub mod forced {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    use napi::Result;
+
+    use super::bad;
+    use crate::array::{DType, MxArray};
+    use crate::models::deepseek_v41::ops::route_select;
+    use crate::models::hy_v4_flash::config::MoeConfig;
+
+    thread_local! {
+        static FORCED: RefCell<HashMap<usize, Vec<u32>>> = RefCell::new(HashMap::new());
+    }
+
+    /// Runs `f` with layer `l`'s routes forced to `routes[l]` on this thread.
+    pub fn with<R>(routes: HashMap<usize, Vec<u32>>, f: impl FnOnce() -> R) -> R {
+        FORCED.with(|c| *c.borrow_mut() = routes);
+        let r = f();
+        FORCED.with(|c| c.borrow_mut().clear());
+        r
+    }
+
+    pub(super) fn apply(
+        layer: usize,
+        scores: &MxArray,
+        ids: Vec<u32>,
+        weights: Vec<f32>,
+        moe: &MoeConfig,
+    ) -> Result<(Vec<u32>, Vec<f32>)> {
+        let Some(want) = FORCED.with(|c| c.borrow().get(&layer).cloned()) else {
+            return Ok((ids, weights));
+        };
+        if want.len() != ids.len() {
+            return Err(bad(format!(
+                "layer {layer}: {} forced ids for {} routed",
+                want.len(),
+                ids.len()
+            )));
+        }
+        let (n, k) = (moe.n_experts, moe.n_used);
+        let s = scores.astype(DType::Float32)?.to_float32()?.to_vec();
+        let mut biased = vec![0.0f32; s.len()];
+        for (r, row) in want.chunks_exact(k).enumerate() {
+            for &e in row {
+                biased[r * n + e as usize] = 1.0 + s[r * n + e as usize];
+            }
+        }
+        Ok(route_select(
+            &biased,
+            &s,
+            n,
+            k,
+            moe.route_scale,
+            moe.norm_topk,
+        ))
     }
 }
 

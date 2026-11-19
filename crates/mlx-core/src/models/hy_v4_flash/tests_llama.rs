@@ -107,11 +107,32 @@ fn real_render_cases() {
     }
 }
 
+/// Top-1 agreement of two `[rows, vocab]` logit sets.
+fn top1_agree(a: &[f32], b: &[f32], vocab: usize) -> f64 {
+    let rows = a.len() / vocab;
+    let same = a
+        .chunks(vocab)
+        .zip(b.chunks(vocab))
+        .filter(|(x, y)| argmax(x) == argmax(y))
+        .count();
+    same as f64 / rows as f64
+}
+
+/// The top-1 bound of a case: 98 %, or 1 % under llama's agreement with its
+/// own second run when that is lower. Near ties flip on rounding alone; llama
+/// against itself (an eval-callback split, nothing else changed) reached
+/// 97.8 % on r2-en.
+fn top1_bound(floor: Option<f64>) -> f64 {
+    floor.map_or(0.98, |f| (f - 0.01).min(0.98))
+}
+
 /// For each `HY4_REF_NAMES` case: the ids `<HY4_REF_PROMPTS>/<name>.i32`
 /// through the flat trunk in calls of 512 rows, every row's logits against
 /// llama's `<HY4_LLAMA_LOGITS>/<name>/logits.f32`. Writes the logits and
 /// per-position top-1 and KL(llama || ours) to `HY4_REF_OUT`. Passes at
-/// top-1 >= 98 % and mean KL <= 0.02 per case.
+/// mean KL <= 0.02 and top-1 >= `top1_bound` per case, the floor read from
+/// `<HY4_LLAMA_FLOOR_LOGITS>/<name>/logits.f32` (a second llama run of the
+/// same ids) when that variable is set.
 #[test]
 #[ignore = "needs HY4_DIR with the real GGUF shards, stored llama logits and the GPU"]
 fn real_teacher_forced_logits_match_llama() {
@@ -127,6 +148,9 @@ fn real_teacher_forced_logits_match_llama() {
         .filter(|s| !s.is_empty())
         .collect();
     assert!(!names.is_empty());
+    let floors = std::env::var("HY4_LLAMA_FLOOR_LOGITS")
+        .ok()
+        .map(PathBuf::from);
 
     let t0 = std::time::Instant::now();
     let store = Store::open(&paths, &Options::from_env(Some(8192), true).unwrap()).unwrap();
@@ -171,6 +195,12 @@ fn real_teacher_forced_logits_match_llama() {
             rows.push(json!({"pos": i, "kl": kl, "llama_top1": tw, "mlx_top1": tg,
                              "llama_top1_p": lw[tw].exp(), "mlx_p_of_llama_top1": lg[tw].exp()}));
         }
+        let floor = floors.as_ref().map(|d| {
+            let f = read_f32(&d.join(name).join("logits.f32"));
+            assert_eq!(f.len(), want.len(), "{name}: floor rows");
+            top1_agree(&want, &f, vocab)
+        });
+        let bound = top1_bound(floor);
         let n = ids.len() as f64;
         let top1 = agree as f64 / n;
         let mean = kls.iter().sum::<f64>() / n;
@@ -179,14 +209,15 @@ fn real_teacher_forced_logits_match_llama() {
             .enumerate()
             .fold((0, 0.0f64), |m, (i, &k)| if k > m.1 { (i, k) } else { m });
         let summary = json!({"name": name, "tokens": ids.len(), "seconds": secs,
-            "top1_agree": top1, "mean_kl": mean, "max_kl": max, "max_kl_pos": max_pos});
+            "top1_agree": top1, "llama_self_top1": floor, "top1_bound": bound,
+            "mean_kl": mean, "max_kl": max, "max_kl_pos": max_pos});
         println!("{summary}");
         std::fs::write(
             out.join(format!("{name}.stats.json")),
             serde_json::to_string_pretty(&json!({"summary": summary, "rows": rows})).unwrap(),
         )
         .unwrap();
-        if top1 < 0.98 || mean > 0.02 {
+        if top1 < bound || mean > 0.02 {
             failed.push(summary);
         }
     }
@@ -248,4 +279,155 @@ fn real_layer_outputs() {
         &logits.to_float32().unwrap(),
     );
     println!("{name}: {} tokens, {} layers", ids.len(), trace.out.len());
+}
+
+/// llama's `index.tsv` (`call name op type ne0.. file`) in `dir`: tensor
+/// name -> its file.
+fn llama_index(dir: &Path) -> std::collections::HashMap<String, PathBuf> {
+    let text = std::fs::read_to_string(dir.join("index.tsv")).unwrap();
+    text.lines()
+        .skip(1)
+        .map(|line| {
+            let f: Vec<&str> = line.split('\t').collect();
+            (f[1].to_string(), dir.join(f[8]))
+        })
+        .collect()
+}
+
+/// Mean over rows of `|a - b| / |b|`, `d` values per row (one position's
+/// streams).
+fn mean_row_rel(a: &[f32], b: &[f32], d: usize) -> f64 {
+    let rows = b.len() / d;
+    let sum: f64 = a
+        .chunks(d)
+        .zip(b.chunks(d))
+        .map(|(x, y)| {
+            let (mut e, mut n) = (0.0f64, 0.0f64);
+            for (&p, &q) in x.iter().zip(y) {
+                e += (p as f64 - q as f64).powi(2);
+                n += (q as f64).powi(2);
+            }
+            (e / n).sqrt()
+        })
+        .sum();
+    sum / rows as f64
+}
+
+/// `real_layer_outputs` with llama's tensors put in: `HY4_LLAMA_TENSORS`
+/// holds llama's `l_out-<l>` and `HY4_LLAMA_ROUTES` its `ffn_moe_topk-<l>`
+/// for the same ids. Three runs, each layer's output written as
+/// `<name>.<run>-l_out-<l>.f32`: `inject` (every layer reads llama's
+/// previous layer output), `inject_forced` (and takes llama's experts),
+/// `forced` (our own chain on llama's experts, also its logits). Passes when
+/// every `inject` layer is within a mean row error of 0.5 % of llama's: a
+/// near-tie expert flip moves a few rows, a wrong op moves them all. The
+/// routes file comes from another llama run, whose own near ties can land
+/// on other experts than the `l_out` run's.
+#[test]
+#[ignore = "needs HY4_DIR with the real GGUF shards, stored llama tensors and the GPU"]
+fn real_layer_outputs_on_llama_inputs() {
+    let paths = shard_paths(&env_path("HY4_DIR")).unwrap();
+    let name = std::env::var("HY4_REF_NAMES").expect("HY4_REF_NAMES is not set");
+    let ids = read_i32(&env_path("HY4_REF_PROMPTS").join(format!("{name}.i32")));
+    assert!(!ids.is_empty() && ids.len() <= CHUNK);
+    let out = env_path("HY4_REF_OUT");
+    std::fs::create_dir_all(&out).unwrap();
+    let tensors = llama_index(&env_path("HY4_LLAMA_TENSORS"));
+    let topk = llama_index(&env_path("HY4_LLAMA_ROUTES"));
+    let store = Store::open(&paths, &Options::from_env(Some(8192), true).unwrap()).unwrap();
+    let cfg = store.model.cfg();
+    let (n, hc, d) = (ids.len() as i64, cfg.hc.count as i64, cfg.dim as i64);
+    let inputs: Vec<Option<crate::array::MxArray>> = (0..cfg.n_layers)
+        .map(|l| {
+            (l > 0).then(|| {
+                let v = read_f32(&tensors[&format!("l_out-{}", l - 1)]);
+                assert_eq!(v.len() as i64, n * hc * d, "llama l_out-{}", l - 1);
+                crate::array::MxArray::from_float32(&v, &[n, hc, d]).unwrap()
+            })
+        })
+        .collect();
+    let routes: std::collections::HashMap<usize, Vec<u32>> = topk
+        .iter()
+        .filter_map(|(k, p)| {
+            let l: usize = k.strip_prefix("ffn_moe_topk-")?.parse().ok()?;
+            Some((l, read_f32(p).iter().map(|&e| e as u32).collect()))
+        })
+        .collect();
+    assert!(!routes.is_empty(), "no ffn_moe_topk tensors");
+
+    let mut worst = (0usize, 0.0f64);
+    for run in ["inject", "inject_forced", "forced"] {
+        let mut trace = super::model::Trace {
+            keep_out: true,
+            inputs: if run == "forced" {
+                Vec::new()
+            } else {
+                inputs.clone()
+            },
+            ..Default::default()
+        };
+        let forced = if run == "inject" {
+            Default::default()
+        } else {
+            routes.clone()
+        };
+        let o = super::moe::forced::with(forced, || {
+            let mut sess = store.model.new_session(store.ctx).unwrap();
+            store.begin_turn(0).unwrap();
+            let o = store
+                .model
+                .forward(
+                    &mut sess,
+                    &ids,
+                    RowKind::Prefill,
+                    Want::ALL,
+                    None,
+                    Some(&mut trace),
+                )
+                .unwrap();
+            store.end_turn().unwrap();
+            o
+        });
+        for (l, x) in trace.out.iter().enumerate() {
+            let v = x
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec();
+            if run == "inject" {
+                let rel = mean_row_rel(
+                    &v,
+                    &read_f32(&tensors[&format!("l_out-{l}")]),
+                    (hc * d) as usize,
+                );
+                println!("{name} inject layer {l}: mean row rel {rel:.5}");
+                if rel > worst.1 {
+                    worst = (l, rel);
+                }
+            }
+            write_f32(&out.join(format!("{name}.{run}-l_out-{l}.f32")), &v);
+        }
+        let logits = o.logits.unwrap().astype(DType::Float32).unwrap();
+        write_f32(
+            &out.join(format!("{name}.{run}-logits.f32")),
+            &logits.to_float32().unwrap(),
+        );
+        println!("{name} {run}: {} layers", trace.out.len());
+    }
+    assert!(
+        worst.1 <= 0.005,
+        "layer {} on llama's input: mean row rel {:.5} > 0.005",
+        worst.0,
+        worst.1
+    );
+}
+
+#[test]
+fn top1_bound_follows_llamas_own_floor() {
+    assert_eq!(top1_bound(None), 0.98);
+    assert_eq!(top1_bound(Some(1.0)), 0.98);
+    assert!((top1_bound(Some(0.9784)) - 0.9684).abs() < 1e-12);
+    let (a, b) = ([0.0f32, 1.0, 1.0, 0.0], [0.0f32, 1.0, 0.0, 1.0]);
+    assert_eq!(top1_agree(&a, &b, 2), 0.5);
 }
