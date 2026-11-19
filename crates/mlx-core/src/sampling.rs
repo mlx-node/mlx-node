@@ -99,6 +99,12 @@ fn sampler_parity_mode() -> SamplerParityMode {
     })
 }
 
+/// Whether the sampler filters in mlx-node's own order (top_k, top_p, min_p
+/// on the temperature-1 distribution), not the MTPLX parity order.
+pub(crate) fn default_filter_order() -> bool {
+    sampler_parity_mode() == SamplerParityMode::Current
+}
+
 /// Owned sparse probability distribution used by stochastic MTP acceptance.
 ///
 /// The support is intentionally tiny (`top_k`, typically 20), so linear scans
@@ -183,6 +189,11 @@ impl SparseDistribution {
             probs: &self.probs,
             vocab_size: self.vocab_size,
         }
+    }
+
+    /// The candidates and their probabilities, in the order lookups scan them.
+    pub(crate) fn candidates(&self) -> (&[i32], &[f64]) {
+        (&self.token_ids, &self.probs)
     }
 }
 
@@ -1224,6 +1235,16 @@ fn sample_residual_distribution<R: Rng + ?Sized>(
     residual: &MxArray,
     rng: &mut R,
 ) -> Result<i32> {
+    let selected = residual_draw_array(target, residual, rng)?;
+    Ok(materialize_draft_tokens(&[selected])?[0])
+}
+
+/// The lazy token [`sample_residual_distribution`] draws.
+pub(crate) fn residual_draw_array<R: Rng + ?Sized>(
+    target: &MxArray,
+    residual: &MxArray,
+    rng: &mut R,
+) -> Result<MxArray> {
     let total = residual.sum(None, None)?;
     let valid = total
         .isfinite()?
@@ -1231,8 +1252,7 @@ fn sample_residual_distribution<R: Rng + ?Sized>(
     let normalized = residual.div(&total)?;
     let sampled = sample_dense_distribution_array(&normalized, rng)?;
     let fallback = target.argmax(0, None)?.astype(DType::Int32)?;
-    let selected = valid.where_(&sampled, &fallback)?;
-    Ok(materialize_draft_tokens(&[selected])?[0])
+    valid.where_(&sampled, &fallback)
 }
 
 /// Shared context for penalty functions: validates inputs, slices to recent tokens,

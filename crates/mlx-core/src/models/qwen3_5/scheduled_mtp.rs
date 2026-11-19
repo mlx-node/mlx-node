@@ -342,6 +342,7 @@ pub(crate) trait ScheduledMtpTarget: Sized {
             Ok(DsparkProposal {
                 draft_ids,
                 device_draft_ids: None,
+                device_draft_sparse: None,
                 draft_dists: distributions,
                 draft_sparse_dists: Vec::new(),
                 keep_probabilities: None,
@@ -362,7 +363,7 @@ pub(crate) trait ScheduledMtpTarget: Sized {
 /// Attention metadata is transactional here; recurrent state is committed by
 /// MtpVerify only after all attention tickets close. Durable GDN/SSD snapshots
 /// remain in the existing turn epilogue, as on the whole-turn native MTP path.
-struct MtpCache<'a>(Option<&'a mut PagedKVCacheAdapter>);
+pub(crate) struct MtpCache<'a>(pub(crate) Option<&'a mut PagedKVCacheAdapter>);
 impl MtpCache<'_> {
     fn adapter(&mut self) -> std::result::Result<&mut PagedKVCacheAdapter, String> {
         self.0

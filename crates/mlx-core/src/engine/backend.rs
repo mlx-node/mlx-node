@@ -1880,6 +1880,42 @@ pub(crate) trait DsparkBackend: ChatBackend {
     fn begin_dspark_decode(&mut self, block_size: usize) -> Result<Self::DsparkDecode<'_>>;
 }
 
+/// The selector rows a device draw used, one per proposal: candidate ids
+/// `[L, K]` i32 and their probabilities `[L, K]` f32.
+pub(crate) struct DeviceSparseRows {
+    pub ids: MxArray,
+    pub probs: MxArray,
+    pub vocab_size: usize,
+}
+
+impl DeviceSparseRows {
+    fn truncate(&mut self, len: usize) -> Result<()> {
+        self.ids = self.ids.slice_axis(0, 0, len as i64)?;
+        self.probs = self.probs.slice_axis(0, 0, len as i64)?;
+        Ok(())
+    }
+
+    /// Host rows; forces the draft.
+    pub(crate) fn host(self) -> Result<Vec<crate::sampling::SparseDistribution>> {
+        let rows = usize::try_from(self.ids.shape_at(0)?)
+            .map_err(|_| Error::from_reason("device sparse rows: bad row count"))?;
+        let width = usize::try_from(self.ids.shape_at(1)?)
+            .map_err(|_| Error::from_reason("device sparse rows: bad width"))?;
+        let ids = self.ids.to_int32()?;
+        let probs = self.probs.to_float32()?;
+        (0..rows)
+            .map(|row| {
+                let span = row * width..(row + 1) * width;
+                crate::sampling::SparseDistribution::from_parts(
+                    ids[span.clone()].to_vec(),
+                    probs[span].iter().map(|&p| f64::from(p)).collect(),
+                    self.vocab_size,
+                )
+            })
+            .collect()
+    }
+}
+
 /// One cycle's drafted block from [`DsparkStepper::propose`].
 pub(crate) struct DsparkProposal {
     /// `L <= max_len` proposed token ids. The stepper may return FEWER than
@@ -1895,6 +1931,9 @@ pub(crate) struct DsparkProposal {
     /// the consuming verify graph has been forced (the device array shares
     /// that graph's roots, so the read is then a plain copy, not a sync).
     pub device_draft_ids: Option<MxArray>,
+    /// The sparse rows a device-sampled `device_draft_ids` was drawn from.
+    /// [`Self::materialize_draft_ids`] moves them into `draft_sparse_dists`.
+    pub device_draft_sparse: Option<DeviceSparseRows>,
     /// Per-position f32 `[vocab]` proposal-density rows `q_i` — the
     /// distribution `draft_ids[i]` was actually drawn from, consumed by
     /// `sampling::accept_with_residual` on the sampled accept path. EMPTY
@@ -1942,6 +1981,14 @@ impl DsparkProposal {
         };
         let host = ids.to_int32()?;
         self.draft_ids = host.as_ref().to_vec();
+        if let Some(rows) = self.device_draft_sparse.take() {
+            self.draft_sparse_dists = rows.host()?;
+        }
+        if self.draft_ids.iter().any(|&id| id < 0) {
+            return Err(Error::from_reason(
+                "device draft has no positive probability mass",
+            ));
+        }
         Ok(())
     }
 
@@ -1983,6 +2030,11 @@ impl DsparkProposal {
                     }
                 }
             }
+        }
+        if let Some(rows) = self.device_draft_sparse.as_mut()
+            && rows.truncate(len).is_err()
+        {
+            self.device_draft_sparse = None;
         }
         self.draft_dists.truncate(len);
         self.draft_sparse_dists.truncate(len);
@@ -2135,6 +2187,14 @@ pub(crate) trait DsparkStepper {
         self.verify(&ids)
     }
 
+    /// Whether the target rows of this stepper's sampled, unpenalized cycles
+    /// come from the device row kernels
+    /// ([`crate::engine::dspark_turn::submit_sampled_rows`]). Every other
+    /// stepper keeps the filter chain.
+    fn device_sampled_rows(&self) -> bool {
+        false
+    }
+
     /// Optional device-selected live prefix inside a fixed physical verify block.
     /// Read only after logits are evaluated. The engine caps accepted drafts to
     /// rows-1, while rollback still receives the full physical write count.
@@ -2260,6 +2320,7 @@ mod tests {
         DsparkProposal {
             draft_ids,
             device_draft_ids: None,
+            device_draft_sparse: None,
             draft_dists: Vec::new(),
             draft_sparse_dists: Vec::new(),
             keep_probabilities: None,

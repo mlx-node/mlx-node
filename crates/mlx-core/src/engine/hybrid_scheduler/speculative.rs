@@ -1,7 +1,10 @@
 //! One packed verifier wave, followed by independent owner commits and emission.
 use super::*;
 use engine::backend::DsparkProposal;
-use engine::dspark_turn::{CycleStop, accept_dspark_proposal, clamp_dspark_cycle};
+use engine::dspark_timeline::{self as timeline, Mark};
+use engine::dspark_turn::{
+    CycleStop, SampledRows, accept_dspark_proposal, clamp_dspark_cycle, submit_sampled_rows,
+};
 use engine::penalties::ThinkingCut;
 use engine::scheduler::SpeculativeRowResult;
 
@@ -18,6 +21,7 @@ fn empty_proposal() -> DsparkProposal {
     DsparkProposal {
         draft_ids: Vec::new(),
         device_draft_ids: None,
+        device_draft_sparse: None,
         draft_dists: Vec::new(),
         draft_sparse_dists: Vec::new(),
         keep_probabilities: None,
@@ -85,6 +89,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 .position(|turn| turn.seq_id == row.seq_id)
                 .ok_or_else(|| Error::from_reason("scheduled verifier lost its owner"))?;
             let turn = &mut running[turn_index];
+            timeline::lane_cycle_start(row.seq_id, turn.token_history.len());
             let Some(&anchor) = turn.token_history.last() else {
                 results.push((
                     plan_index,
@@ -135,6 +140,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 if seed.terminal || seed.at_length {
                     turn.payload.profiler.snapshot_memory_after();
                     turn.payload.profiler.report();
+                    timeline::end_lane(row.seq_id);
                     results.push((
                         plan_index,
                         RowStepResult {
@@ -148,6 +154,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                             finished: true,
                             allocation_blocked: false,
                             prefill_micros: 0,
+                            prefill_in_flight: false,
                         },
                     ));
                     continue;
@@ -157,6 +164,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 turn.payload.finish_reason = "cancelled".into();
                 turn.payload.profiler.snapshot_memory_after();
                 turn.payload.profiler.report();
+                timeline::end_lane(row.seq_id);
                 results.push((
                     plan_index,
                     RowStepResult {
@@ -170,10 +178,12 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                         finished: true,
                         allocation_blocked: false,
                         prefill_micros: 0,
+                        prefill_in_flight: false,
                     },
                 ));
                 continue;
             }
+            timeline::lane_mark(row.seq_id, Mark::StopChecks);
             let max_new = turn.payload.params.max_new_tokens.max(0) as usize;
             let remaining = max_new.saturating_sub(turn.payload.generated_tokens.len());
             let mut cap = if turn.payload.scheduled_speculation.is_some() {
@@ -197,7 +207,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     }
                 });
             match reserve {
-                Ok(true) => {}
+                Ok(true) => timeline::lane_mark(row.seq_id, Mark::Plan),
                 Ok(false) => {
                     results.push((plan_index, Self::blocked(row)));
                     continue;
@@ -281,7 +291,8 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             let turn = &mut running[item.turn_index];
             let row = &plan.rows[item.plan_index];
             let proposal = if item.cap > 0 && !zero_probe {
-                match turn.payload.scheduled_speculation.as_mut() {
+                let _focus = timeline::focus_lane(row.seq_id);
+                let proposal = match turn.payload.scheduled_speculation.as_mut() {
                     Some(rng) => self.inner.propose_scheduled(
                         row.seq_id,
                         item.anchor,
@@ -293,7 +304,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     None => Err(Error::from_reason(
                         "scheduled speculation state missing for capped row",
                     )),
-                }
+                };
+                timeline::lane_mark(row.seq_id, Mark::DraftSubmit);
+                proposal
             } else {
                 Ok(empty_proposal())
             };
@@ -384,6 +397,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         for item in &work {
             let turn = &running[item.turn_index];
             let row = &plan.rows[item.plan_index];
+            timeline::lane_mark(row.seq_id, Mark::DraftPost);
             let mut tokens = Vec::with_capacity(item.proposal.draft_ids.len() + 1);
             tokens.push(item.anchor);
             tokens.extend(item.proposal.draft_ids.iter().map(|&token| token as u32));
@@ -432,6 +446,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         let greedy_tokens = if greedy {
             logits.argmax(-1, None).ok().map(|tokens| {
                 MxArray::eval_arrays_with_context(&[&tokens], "scheduled_verify_greedy")?;
+                for row in &verify_rows {
+                    timeline::lane_mark(row.seq_id, Mark::VerifyWait);
+                }
                 (0..verify_rows.iter().map(|row| row.tokens.len()).sum())
                     .map(|i| tokens.item_at_int32(i))
                     .collect::<Result<Vec<_>>>()
@@ -444,59 +461,108 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         } else {
             0
         };
+        // The wave's sampled lanes queue their target rows, each with its
+        // own rng, and one eval forces them all.
+        let mut sampled: Vec<Option<Result<SampledRows>>> = work.iter().map(|_| None).collect();
+        let rows_route = self.inner.scheduled_sampled_rows();
+        if greedy_tokens.is_none() && rows_route {
+            let mut offset = 0i64;
+            for ((item, verify), slot) in work.iter().zip(&verify_rows).zip(&mut sampled) {
+                let end = offset + verify.tokens.len() as i64;
+                let payload = &mut running[item.turn_index].payload;
+                let rng = payload.scheduled_speculation.as_mut();
+                if let Some(rng) = rng {
+                    *slot = logits
+                        .slice_axis(0, offset, end)
+                        .and_then(|rows| {
+                            submit_sampled_rows(&rows, &item.proposal, &payload.params, rng)
+                        })
+                        .transpose();
+                }
+                offset = end;
+            }
+            let queued = sampled
+                .iter()
+                .filter_map(|slot| slot.as_ref()?.as_ref().ok())
+                .map(SampledRows::records)
+                .collect::<Vec<_>>();
+            // A failed eval fails every queued lane.
+            if !queued.is_empty()
+                && let Err(error) =
+                    MxArray::eval_arrays_with_context(&queued, "scheduled_verify_sampled_rows")
+            {
+                for slot in &mut sampled {
+                    if matches!(slot, Some(Ok(_))) {
+                        *slot = Some(Err(Error::from_reason(error.reason.clone())));
+                    }
+                }
+            }
+            for (verify, slot) in verify_rows.iter().zip(&sampled) {
+                if slot.is_some() {
+                    timeline::lane_mark(verify.seq_id, Mark::VerifyWait);
+                }
+            }
+        }
         let mut decisions = Vec::with_capacity(work.len());
         let mut commits = Vec::with_capacity(work.len());
         let mut offset = 0i64;
-        for (item, verify) in work.iter_mut().zip(&verify_rows) {
+        for ((item, verify), rows) in work.iter_mut().zip(&verify_rows).zip(sampled) {
             let turn = &mut running[item.turn_index];
             let end = offset + verify.tokens.len() as i64;
-            let accepted = logits
-                .slice_axis(0, offset, end)
-                .and_then(|row| row.transpose(Some(&[1, 0, 2])))
-                .and_then(|row| {
-                    if let Some(tokens) = greedy_tokens.as_ref() {
-                        let tokens = tokens
-                            .as_ref()
-                            .map_err(|error| Error::from_reason(error.reason.clone()))?;
-                        let mut target = tokens[offset as usize..end as usize].to_vec();
-                        if let Some(forced) = item
-                            .cut
-                            .as_ref()
-                            .map(|c| c.targets(&item.proposal.draft_ids))
-                        {
-                            for (row, token) in target.iter_mut().enumerate() {
-                                if let Some(end) = forced.at(row) {
-                                    *token = end as i32;
+            let focus = timeline::focus_lane(verify.seq_id);
+            let accepted = if let Some(rows) = rows {
+                rows.and_then(|rows| rows.accept(&mut item.proposal, item.cut.as_ref()))
+            } else {
+                logits
+                    .slice_axis(0, offset, end)
+                    .and_then(|row| row.transpose(Some(&[1, 0, 2])))
+                    .and_then(|row| {
+                        if let Some(tokens) = greedy_tokens.as_ref() {
+                            let tokens = tokens
+                                .as_ref()
+                                .map_err(|error| Error::from_reason(error.reason.clone()))?;
+                            let mut target = tokens[offset as usize..end as usize].to_vec();
+                            if let Some(forced) = item
+                                .cut
+                                .as_ref()
+                                .map(|c| c.targets(&item.proposal.draft_ids))
+                            {
+                                for (row, token) in target.iter_mut().enumerate() {
+                                    if let Some(end) = forced.at(row) {
+                                        *token = end as i32;
+                                    }
                                 }
                             }
+                            let mut count = 0;
+                            while count < item.proposal.draft_ids.len()
+                                && target[count] == item.proposal.draft_ids[count]
+                            {
+                                count += 1;
+                            }
+                            Ok((count, target[count] as u32))
+                        } else if let Some(rng) = turn.payload.scheduled_speculation.as_mut() {
+                            accept_dspark_proposal(
+                                &row,
+                                &mut item.proposal,
+                                &turn.token_history,
+                                &turn.payload.params,
+                                rng,
+                                item.cut.as_ref(),
+                            )
+                        } else {
+                            accept_dspark_proposal(
+                                &row,
+                                &mut item.proposal,
+                                &turn.token_history,
+                                &turn.payload.params,
+                                &mut rand::rng(),
+                                item.cut.as_ref(),
+                            )
                         }
-                        let mut count = 0;
-                        while count < item.proposal.draft_ids.len()
-                            && target[count] == item.proposal.draft_ids[count]
-                        {
-                            count += 1;
-                        }
-                        Ok((count, target[count] as u32))
-                    } else if let Some(rng) = turn.payload.scheduled_speculation.as_mut() {
-                        accept_dspark_proposal(
-                            &row,
-                            &mut item.proposal,
-                            &turn.token_history,
-                            &turn.payload.params,
-                            rng,
-                            item.cut.as_ref(),
-                        )
-                    } else {
-                        accept_dspark_proposal(
-                            &row,
-                            &mut item.proposal,
-                            &turn.token_history,
-                            &turn.payload.params,
-                            &mut rand::rng(),
-                            item.cut.as_ref(),
-                        )
-                    }
-                });
+                    })
+            };
+            drop(focus);
+            timeline::lane_mark(verify.seq_id, Mark::Accept);
             offset = end;
             let decision = accepted.map(|(count, boundary)| {
                 let mut tokens = item.proposal.draft_ids[..count]
@@ -521,6 +587,13 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     },
                 );
                 tokens.truncate(clamp.emit_count);
+                timeline::lane_counts(
+                    verify.seq_id,
+                    item.proposal.draft_ids.len(),
+                    count,
+                    clamp.emit_count,
+                );
+                timeline::lane_mark(verify.seq_id, Mark::StopClamp);
                 (tokens, clamp, count)
             });
             commits.push(ScheduledVerifyCommit {
@@ -611,6 +684,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     .profiler
                     .record_mtp_cycle(drafted - replaced, accepted_count.saturating_sub(replaced));
             }
+            timeline::lane_mark(turn.seq_id, Mark::PostCommit);
             for (index, &token) in tokens.iter().enumerate() {
                 turn.payload.generated_tokens.push(token);
                 turn.payload.profiler.step();
@@ -631,6 +705,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             if !tokens.is_empty() {
                 turn.payload.clock.token_event();
             }
+            timeline::lane_mark(turn.seq_id, Mark::Emit);
             let finished = clamp.stop.is_some()
                 || turn.payload.generated_tokens.len()
                     >= turn.payload.params.max_new_tokens.max(0) as usize;
@@ -646,6 +721,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             if finished {
                 turn.payload.profiler.snapshot_memory_after();
                 turn.payload.profiler.report();
+                timeline::end_lane(turn.seq_id);
             }
             results.push((
                 item.plan_index,
@@ -660,6 +736,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     finished,
                     allocation_blocked: false,
                     prefill_micros: 0,
+                    prefill_in_flight: false,
                 },
             ));
         }
@@ -747,11 +824,23 @@ pub(super) mod tests {
         speculative: bool,
         cancel: Arc<AtomicBool>,
     ) -> TurnState<ScheduledTurn<B::PrefixState>> {
+        request_reusing(inner, seq, prompt, speculative, cancel, false)
+    }
+
+    /// [`request`] whose prompt reuses the cache when `reuse`.
+    pub(in crate::engine::hybrid_scheduler) fn request_reusing<B: HybridSchedulerBackend>(
+        inner: &mut B,
+        seq: u32,
+        prompt: Vec<u32>,
+        speculative: bool,
+        cancel: Arc<AtomicBool>,
+        reuse: bool,
+    ) -> TurnState<ScheduledTurn<B::PrefixState>> {
         let config = tiny_turn_config(Some(3), 20);
         let params = inner.resolve_params(&config);
         let thinking = inner.thinking_setup(&config);
         let prefix = match inner
-            .prepare_scheduled_prefix(seq, &prompt, &[], false, 0, 8)
+            .prepare_scheduled_prefix(seq, &prompt, &[], reuse, 0, 8)
             .unwrap()
         {
             ScheduledPrefixAdmission::Ready(prefix) => prefix,
@@ -782,7 +871,7 @@ pub(super) mod tests {
             prompt_tokens: prompt.clone(),
             prefix,
             is_delta: false,
-            reuse_cache: false,
+            reuse_cache: reuse,
             response: ScheduledReply::Sync(reply),
             generated_tokens: Vec::new(),
             finish_reason: "length".into(),
@@ -811,9 +900,16 @@ pub(super) mod tests {
             requested_tokens,
             claim: None,
             cell: None,
+            draft_lane: None,
             clock: Default::default(),
         };
-        let mut turn = TurnState::new(seq, prompt, 0, Vec::new(), Some(cancel), payload).unwrap();
+        let cached = if reuse {
+            payload.prefix.effective_cached_prefix_len() as u32
+        } else {
+            0
+        };
+        let mut turn =
+            TurnState::new(seq, prompt, cached, Vec::new(), Some(cancel), payload).unwrap();
         turn.decode_draft_allowance = if speculative { 3 } else { 0 };
         turn
     }
@@ -1709,6 +1805,7 @@ pub(super) mod tests {
             }],
             contended: false,
             leader_cut: None,
+            prefill_pass_ms: None,
         };
         let claims = state.claim_rows_in_order(&plan);
         let denial = claims.grants[0].expect("the draft growth is refused");
@@ -1768,6 +1865,7 @@ pub(super) mod tests {
             }],
             contended: false,
             leader_cut: None,
+            prefill_pass_ms: None,
         };
         let claims = state.claim_rows_in_order(&plan);
         let denial = claims.grants[0].expect("the draft growth is refused");

@@ -1,13 +1,96 @@
-// Mixed Q4_K/Q5_K/Q6_K target projections in one dispatch.
+// Mixed target projections in one dispatch: Q4_K/Q5_K/Q6_K
+// (mixed_projection_m8) and, with IQ4_XS / IQ4_NL tiles and Q8_0 affine
+// rows, mixed_projection_m8_joined.
 // The tile body below is the existing Splash-derived kquant_qmm_m8_nax
 // arithmetic, preserving its per-segment split order and BF16 boundary.
+// The Q8_0 rows are affine_qmv_wide_mixed_q8g32's per-thread loop
+// (affine_mixed/affine_qmv_wide_mixed.metal, MLX's qmv_wide), statement for
+// statement: any change of sum order breaks bit identity with that call.
 // See THIRD_PARTY_NOTICES for Apache-2.0 provenance.
 #pragma clang fp reassociate(off)
 #include "mlx/backend/metal/kernels/utils.h"
 #include "../kquant/kquant_m8_nax.h"
 #include "abi.h"
 
-template <int group_size, int bits, int super_ratio, bool has_min>
+// One qmv_wide threadgroup of an 8-bit group-32 affine segment: vecs rows
+// of x, 8 output columns. `local` = tile.y * x_tiles + tile.x, the grid of
+// mlx_affine_mixed_qmm.cpp's qmv_wide.
+template <int vecs_per_tg>
+METAL_FUNC void mixed_projection_a8g32(
+    const device uint32_t* w, const device float* scales, const device float* biases,
+    const device bfloat* x, device bfloat* y,
+    int in_vec_size, int out_vec_size, int M, uint local, uint x_tiles,
+    uint simd_gid, uint simd_lid) {
+  constexpr int group_size = 32;
+  constexpr int bits = 8;
+  constexpr int k_lanes = 8;
+  constexpr int num_simdgroups = 2;
+  constexpr int results_per_simdgroup = 32 / k_lanes;
+  constexpr int sub = 8;
+  const uint2 tid(local % x_tiles, local / x_tiles);
+
+  const short k_lane = simd_lid % k_lanes;
+  const short sg_row = simd_lid / k_lanes;
+
+  const int out_row = tid.y * (results_per_simdgroup * num_simdgroups) +
+      results_per_simdgroup * simd_gid + sg_row;
+  const int vec0 = tid.x * vecs_per_tg;
+
+  const int row = min(out_row, out_vec_size - 1);
+
+  const int in_vec_size_w = in_vec_size * bits / 8;
+  const int in_vec_size_g = in_vec_size / group_size;
+  const device uint8_t* wrow = (const device uint8_t*)w + row * in_vec_size_w;
+  const device float* srow = scales + row * in_vec_size_g;
+  const device float* brow = biases + row * in_vec_size_g;
+
+  const device bfloat* xv[vecs_per_tg];
+  for (int v = 0; v < vecs_per_tg; v++) {
+    xv[v] = x + min(vec0 + v, M - 1) * in_vec_size;
+  }
+
+  float result[vecs_per_tg] = {0};
+
+  for (int g = k_lane; g < in_vec_size_g; g += k_lanes) {
+    float scale = srow[g];
+    float bias = brow[g];
+#pragma unroll
+    for (int sc = 0; sc < group_size / sub; sc++) {
+      const int k0 = g * group_size + sc * sub;
+      const device uint8_t* wc = wrow + k0 * bits / 8;
+      float w_dq[sub];
+      for (int i = 0; i < sub; i++) {
+        w_dq[i] = scale * wc[i] + bias;
+      }
+#pragma unroll
+      for (int v = 0; v < vecs_per_tg; v++) {
+        const device bfloat* xc = xv[v] + k0;
+        float acc = 0;
+#pragma unroll
+        for (int i = 0; i < sub; i++) {
+          acc += static_cast<float>(xc[i]) * w_dq[i];
+        }
+        result[v] += acc;
+      }
+    }
+  }
+
+  for (int v = 0; v < vecs_per_tg; v++) {
+    result[v] += simd_shuffle_down(result[v], 4);
+    result[v] += simd_shuffle_down(result[v], 2);
+    result[v] += simd_shuffle_down(result[v], 1);
+  }
+
+  if (k_lane == 0 && out_row < out_vec_size) {
+    for (int v = 0; v < vecs_per_tg; v++) {
+      if (vec0 + v < M) {
+        y[(vec0 + v) * out_vec_size + out_row] = static_cast<bfloat>(result[v]);
+      }
+    }
+  }
+}
+
+template <int group_size, int bits, int super_ratio, bool has_min, int kind>
 METAL_FUNC void mixed_projection_tile(
     const device uint32_t* w, const device uint8_t* scales, const device half* biases,
     device bfloat16_t* x, device bfloat16_t* y,
@@ -17,7 +100,7 @@ METAL_FUNC void mixed_projection_tile(
     threadgroup half* stage, threadgroup bfloat16_t* astage, threadgroup half2* tl,
     threadgroup uint64_t* grid64, threadgroup uint32_t* grid32, threadgroup uint& arrival) {
   using T = bfloat16_t;
-  constexpr int rows = 8, kind = KQ_LINEAR, scale_shift = 0;
+  constexpr int rows = 8, scale_shift = 0;
   constexpr bool tiled = true;
   using namespace kq_m8;
   constexpr ushort kRows = rows;
@@ -173,6 +256,7 @@ METAL_FUNC void mixed_projection_tile(
   split_release(counters + group.x, tid);
 }
 
+template <bool joined>
 [[kernel, max_total_threads_per_threadgroup(64)]] void mixed_projection_m8(
     device bfloat16_t* x [[buffer(0)]],
     const device uint32_t* w0 [[buffer(1)]], const device uint8_t* s0 [[buffer(2)]], const device half* b0 [[buffer(3)]],
@@ -186,12 +270,27 @@ METAL_FUNC void mixed_projection_tile(
   using namespace kq_m8;
   threadgroup half stage[2 * 2 * kStage];
   threadgroup bfloat16_t astage[2 * 8 * kStep];
-  threadgroup half2 tl[1];
+  threadgroup half2 tl[joined ? kTableEntries : 1];
   threadgroup uint64_t grid64[1];
   threadgroup uint32_t grid32[1];
   threadgroup uint arrival;
   const uint segment = group < p.group_end[0] ? 0 : group < p.group_end[1] ? 1 : 2;
   const uint local = group - (segment ? p.group_end[segment - 1] : 0);
+  if constexpr (joined) {
+    if (p.format[segment] == kMixedA8G32) {
+      const device uint32_t* w = segment == 0 ? w0 : segment == 1 ? w1 : w2;
+      const device uint8_t* s = segment == 0 ? s0 : segment == 1 ? s1 : s2;
+      const device half* b = segment == 0 ? b0 : segment == 1 ? b1 : b2;
+      device bfloat16_t* y = segment == 0 ? y0 : segment == 1 ? y1 : y2;
+      const uint vecs = p.vectors[segment];
+      const uint x_tiles = (8 + vecs - 1) / vecs;
+#define ROWS(V) mixed_projection_a8g32<V>(w, (const device float*)s, (const device float*)b, (const device bfloat*)x, (device bfloat*)y, p.input_size, p.columns[segment], 8, local, x_tiles, sg, lane)
+      if (vecs == 8) ROWS(8);
+      else ROWS(4);
+#undef ROWS
+      return;
+    }
+  }
   const uint tiles = p.columns[segment] / 64;
   const uint2 tile(local % tiles, local / tiles);
   const device uint32_t* w = segment == 0 ? w0 : segment == 1 ? w1 : w2;
@@ -201,9 +300,18 @@ METAL_FUNC void mixed_projection_tile(
   // Do not offset dummy bindings when every segment has a single split.
   auto part = partials + (p.splits[segment] > 1 ? p.partial_offset[segment] : 0);
   auto counter = counters + (p.splits[segment] > 1 ? p.counter_offset[segment] : 0);
-#define RUN(G, B, S, MIN) mixed_projection_tile<G, B, S, MIN>(w, s, b, x, y, part, counter, p.input_size, p.columns[segment], p.splits[segment], 8, p.spread, tile, lane, sg, stage, astage, tl, grid64, grid32, arrival)
-  if (p.bits[segment] == 4) RUN(32, 4, 8, true);
-  else if (p.bits[segment] == 5) RUN(32, 5, 8, true);
-  else RUN(16, 6, 16, false);
+#define RUN(G, B, S, MIN, KIND) mixed_projection_tile<G, B, S, MIN, KIND>(w, s, b, x, y, part, counter, p.input_size, p.columns[segment], p.splits[segment], 8, p.spread, tile, lane, sg, stage, astage, tl, grid64, grid32, arrival)
+  if (p.format[segment] == kMixedQ4K) RUN(32, 4, 8, true, KQ_LINEAR);
+  else if (p.format[segment] == kMixedQ5K) RUN(32, 5, 8, true, KQ_LINEAR);
+  else if constexpr (!joined) RUN(16, 6, 16, false, KQ_LINEAR);
+  else if (p.format[segment] == kMixedQ6K) RUN(16, 6, 16, false, KQ_LINEAR);
+  else if (p.format[segment] == kMixedIQ4XS) RUN(32, 4, 8, false, KQ_CODEBOOK);
+  else RUN(32, 4, 1, false, KQ_CODEBOOK);
 #undef RUN
 }
+
+// Host names: mlx_mixed_projection.cpp's kernel_names().
+template [[host_name("mixed_projection_m8")]] [[kernel]]
+decltype(mixed_projection_m8<false>) mixed_projection_m8<false>;
+template [[host_name("mixed_projection_m8_joined")]] [[kernel]]
+decltype(mixed_projection_m8<true>) mixed_projection_m8<true>;

@@ -208,8 +208,9 @@ impl SpeculativePlan {
     ///
     /// A backend declares scheduled support only when it provides owned
     /// per-request draft state, ragged target verification and transactional
-    /// span commits. Gemma DSpark, Muse DFlash and Qwen native MTP implement
-    /// this contract. Backends borrowing whole-model state remain barriers.
+    /// span commits. Gemma DSpark, Muse DFlash, Qwen native MTP and dense
+    /// Qwen3.8 DFlash2 implement this contract. Backends borrowing
+    /// whole-model state remain barriers.
     /// Cache layout and streaming support are separate admission constraints.
     pub const fn lane(self, supports_scheduled: bool) -> SpeculativeLane {
         if supports_scheduled && self.supports_paged_attention {

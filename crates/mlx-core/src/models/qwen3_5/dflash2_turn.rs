@@ -115,6 +115,11 @@ pub(crate) trait DFlash2Target: ChatBackend {
     fn decode_row_expert_bytes(&self) -> u64 {
         0
     }
+    /// The lane buffers prefill units held between their passes keep out
+    /// of the states' maps.
+    fn held_prefill_bytes(&self) -> u64 {
+        0
+    }
     /// Embedding output dtype: what an unallocated BF16 cache will hold.
     fn embedding_dtype(&self) -> Result<DType>;
     fn paged_adapter_ref(&self) -> Option<&PagedKVCacheAdapter>;
@@ -1960,6 +1965,57 @@ impl<'a> DraftTapSink<'a> {
     pub(crate) fn into_parts(self) -> (DFlash2ContextCache, Option<DraftContextWindow>) {
         (self.context, self.lane)
     }
+
+    /// The sink without its draft, held between the passes of a unit while
+    /// the draft serves verify waves.
+    pub(crate) fn detach(self) -> DetachedDraftTapSink {
+        DetachedDraftTapSink {
+            context: self.context,
+            kv_from: self.kv_from,
+            spans: self.spans,
+            lane: self.lane,
+            tap_layers: self.tap_layers,
+            captures: self.captures,
+            armed: self.armed,
+            window: self.window,
+            linear: self.linear,
+        }
+    }
+
+    /// The sink `detached` with `draft` again.
+    pub(crate) fn attach(draft: &'a DFlash2Model, detached: DetachedDraftTapSink) -> Self {
+        Self {
+            draft,
+            context: detached.context,
+            kv_from: detached.kv_from,
+            spans: detached.spans,
+            lane: detached.lane,
+            tap_layers: detached.tap_layers,
+            captures: detached.captures,
+            armed: detached.armed,
+            window: detached.window,
+            linear: detached.linear,
+        }
+    }
+}
+
+/// A [`DraftTapSink`] without its draft.
+pub(crate) struct DetachedDraftTapSink {
+    context: DFlash2ContextCache,
+    kv_from: usize,
+    spans: Vec<CaptureSpan>,
+    lane: Option<DraftContextWindow>,
+    tap_layers: Vec<usize>,
+    captures: Vec<usize>,
+    armed: Option<usize>,
+    window: Option<(usize, DraftContextWindow)>,
+    linear: Option<(usize, Vec<super::layer_cache::Qwen3_5LayerCache>)>,
+}
+
+impl DetachedDraftTapSink {
+    pub(crate) fn into_parts(self) -> (DFlash2ContextCache, Option<DraftContextWindow>) {
+        (self.context, self.lane)
+    }
 }
 
 impl crate::models::qwen3_5::paged_forward::PrefillTapSink for DraftTapSink<'_> {
@@ -2040,16 +2096,10 @@ impl crate::models::qwen3_5::paged_forward::PrefillTapSink for DraftTapSink<'_> 
             .append_projected(projected, &chunk[kv - first_row..])
     }
 
-    fn eval(&self) -> Result<()> {
-        let mut arrays = Vec::new();
-        self.context.collect_arrays(&mut arrays);
+    fn collect_arrays<'a>(&'a self, out: &mut Vec<&'a MxArray>) {
+        self.context.collect_arrays(out);
         if let Some(lane) = &self.lane {
-            lane.collect_arrays(&mut arrays);
-        }
-        if arrays.is_empty() {
-            Ok(())
-        } else {
-            MxArray::eval_arrays(&arrays)
+            lane.collect_arrays(out);
         }
     }
 
@@ -2134,9 +2184,7 @@ impl crate::models::qwen3_5::paged_forward::PrefillTapSink for LaneStateSink {
         Ok(())
     }
 
-    fn eval(&self) -> Result<()> {
-        Ok(())
-    }
+    fn collect_arrays<'a>(&'a self, _out: &mut Vec<&'a MxArray>) {}
 
     fn capture_rows(&self) -> &[usize] {
         &self.captures
@@ -2413,9 +2461,29 @@ fn scheduled_state_hit<T: DFlash2Target>(
     None
 }
 
+/// The rows of `tokens` a scheduled start resumes at: the depth of the
+/// deepest stored state below its last token whose chain comes back whole,
+/// what [`scheduled_state_hit`] takes, read only (Splash's `Engine` ranks a
+/// queued request by a cache probe). Nothing is discarded, read or marked.
+pub(crate) fn stored_resume_depth<T: DFlash2Target>(
+    target: &T,
+    tokens: &[u32],
+    cache_salt: u64,
+) -> u32 {
+    target
+        .dflash2_states()
+        .store
+        .deepest_accepted_within(
+            Lineage::text(tokens, cache_salt),
+            tokens.len().saturating_sub(1),
+            |id| disk::restorable(target, id),
+        )
+        .and_then(|hit| u32::try_from(hit.depth).ok())
+        .unwrap_or(0)
+}
+
 /// Splash `Engine::admit` → `configureDraftStatePlan` for a scheduled
-/// request on a draft load, which decodes autoregressively (the scheduler
-/// never speculates on a draft load): it resumes only at a stored state's
+/// request on a draft load, speculative or not: it resumes only at a stored state's
 /// block, else from 0 with its KV hit as the junction (Splash
 /// `Cache::lookup`), and its lane's context window is the state's
 /// (Splash `QwenStateStorage::restore`), kept on its sequence for its
@@ -2512,9 +2580,11 @@ pub(crate) fn keep_drawable_points<T: DFlash2Target>(
 /// Splash `publishReachedStateBoundaries` for one prefill slice, rows
 /// `[cached, end)` of `tokens`, of a scheduled request on a draft load:
 /// its chunks reach the lane's points with the context window the same
-/// forward's taps fill, continued from the sequence's window. The request
-/// decodes autoregressively, so no draft ring takes rows. `take_draft` and
-/// `give_draft` move the draft off the model for the slice.
+/// forward's taps fill, continued from the sequence's window. A sequence
+/// with a decode lane advances the lane's draft ring as a whole turn's
+/// tapped prefill does ([`lane_ring_at`] places it at `cached` first); one
+/// without decodes autoregressively and no ring takes rows. `take_draft`
+/// and `give_draft` move the draft off the model for the slice.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn scheduled_draft_prefill<T, L, R>(
     target: &mut T,
@@ -2552,25 +2622,329 @@ where
         Some(lane) => lane,
         None => states.idle_lane.take_window(&config)?,
     };
+    let mut decode = states.seq_lanes.remove(&seq);
     let Some(model) = take_draft(target) else {
-        target.dflash2_states_mut().seq_windows.insert(seq, lane);
+        let states = target.dflash2_states_mut();
+        states.seq_windows.insert(seq, lane);
+        if let Some(decode) = decode {
+            states.seq_lanes.insert(seq, decode);
+        }
         return Err(Error::from_reason(
             "a scheduled prefill lost its DFlash2 draft",
         ));
     };
-    let ring = DFlash2ContextCache::new(&model.config);
-    let prefilled = DraftTapSink::new(&model, ring, lane, tokens, cached, &plan, &captures)
-        .map(DraftTapSink::without_ring)
+    let ring = match decode.as_mut() {
+        Some(decode) => {
+            let ring = std::mem::replace(&mut decode.ring, DFlash2ContextCache::new(&config));
+            lane_ring_at(&model, ring, &lane, tokens, cached, &plan).map(|ring| (ring, true))
+        }
+        None => Ok((DFlash2ContextCache::new(&model.config), false)),
+    };
+    let prefilled = ring
+        .and_then(|(ring, keeps)| {
+            DraftTapSink::new(&model, ring, lane, tokens, cached, &plan, &captures)
+                .map(|sink| if keeps { sink } else { sink.without_ring() })
+        })
         .and_then(|mut sink| {
             let prefilled = prefill(&mut LanePrefill(&mut *target), &mut sink);
-            let (_, lane) = sink.into_parts();
+            let (ring, lane) = sink.into_parts();
+            let states = target.dflash2_states_mut();
             if let Some(lane) = lane {
-                target.dflash2_states_mut().seq_windows.insert(seq, lane);
+                states.seq_windows.insert(seq, lane);
+            }
+            if let Some(decode) = decode.as_mut() {
+                decode.next_position = ring.logical_len();
+                decode.ring = ring;
             }
             prefilled
         });
+    if let Some(decode) = decode {
+        target.dflash2_states_mut().seq_lanes.insert(seq, decode);
+    }
     give_draft(target, model);
     prefilled
+}
+
+/// A scheduled request's prefill unit on a draft load held between its
+/// passes (Splash `PassCommand`): [`scheduled_draft_prefill`]'s sink without
+/// its draft, the decode lane it took out of the states, and the driver.
+pub(crate) struct ScheduledDraftRun {
+    seq: u32,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    sink: Option<DetachedDraftTapSink>,
+    decode: Option<super::dflash2_state::paged::DraftLane>,
+    pub(crate) driver: crate::models::qwen3_5::paged_forward::PrefillDriver,
+}
+
+impl ScheduledDraftRun {
+    /// What the run holds: the ring and window in its sink, its decode lane
+    /// and the driver's launch in flight.
+    pub(crate) fn held_bytes(&self) -> u64 {
+        let sink = self.sink.as_ref().map_or(0, |sink| {
+            sink.context
+                .buffer_bytes()
+                .saturating_add(sink.lane.as_ref().map_or(0, DraftContextWindow::nbytes))
+        });
+        sink.saturating_add(
+            self.decode
+                .as_ref()
+                .map_or(0, super::dflash2_state::paged::DraftLane::held_bytes),
+        )
+        .saturating_add(self.driver.held_bytes())
+    }
+
+    /// The run holds the sequence's decode lane.
+    pub(crate) fn holds_decode_lane(&self) -> bool {
+        self.decode.is_some()
+    }
+}
+
+/// Begins the unit `[cached, end)` of `tokens` as
+/// [`scheduled_draft_prefill`] does, held as a run: its breaks, plan, lane
+/// window, decode lane and ring, and the driver.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn begin_scheduled_draft_run<T>(
+    target: &mut T,
+    tokens: &[u32],
+    cached: usize,
+    end: usize,
+    chunk_rows: i32,
+    prefix_primed: bool,
+    rope_deltas: i32,
+    rates: crate::models::qwen3_5::paged_forward::PassRates,
+    take_draft: impl FnOnce(&mut T) -> Option<DFlash2Model>,
+    give_draft: impl FnOnce(&mut T, DFlash2Model),
+) -> Result<ScheduledDraftRun>
+where
+    T: DFlash2Target
+        + crate::models::qwen3_5::paged_forward::PrefillTarget<
+            crate::models::qwen3_5::decoder_layer::DecoderLayer,
+        >,
+{
+    let seq = target.lane_seq();
+    let config = target
+        .dflash2()
+        .ok_or_else(|| Error::from_reason("a draft lane prefill without a draft"))?
+        .config
+        .clone();
+    let captures = lane_command_breaks(target, cached, end, chunk_rows);
+    let mut plan = target
+        .dflash2_states()
+        .turns
+        .get(&seq)
+        .map(|turn| turn.plan.clone())
+        .unwrap_or_default();
+    plan.boundaries
+        .retain(|point| point.tokens as usize > cached);
+    let states = target.dflash2_states_mut();
+    let lane = match states.seq_windows.remove(&seq) {
+        Some(lane) => lane,
+        None => states.idle_lane.take_window(&config)?,
+    };
+    let mut decode = states.seq_lanes.remove(&seq);
+    let Some(model) = take_draft(target) else {
+        let states = target.dflash2_states_mut();
+        states.seq_windows.insert(seq, lane);
+        if let Some(decode) = decode {
+            states.seq_lanes.insert(seq, decode);
+        }
+        return Err(Error::from_reason(
+            "a scheduled prefill lost its DFlash2 draft",
+        ));
+    };
+    let ring = match decode.as_mut() {
+        Some(decode) => {
+            let ring = std::mem::replace(&mut decode.ring, DFlash2ContextCache::new(&config));
+            lane_ring_at(&model, ring, &lane, tokens, cached, &plan).map(|ring| (ring, true))
+        }
+        None => Ok((DFlash2ContextCache::new(&model.config), false)),
+    };
+    let sink = ring.and_then(|(ring, keeps)| {
+        DraftTapSink::new(&model, ring, lane, tokens, cached, &plan, &captures)
+            .map(|sink| if keeps { sink } else { sink.without_ring() })
+    });
+    let begun = sink.map(|sink| {
+        let driver = crate::models::qwen3_5::paged_forward::PrefillDriver::new(
+            tokens,
+            &tokens[cached..end],
+            cached as u32,
+            prefix_primed,
+            &mut LanePrefill(&mut *target),
+            chunk_rows,
+            rope_deltas,
+            Some(&sink),
+            rates,
+            crate::models::qwen3_5::paged_forward::unit_end_output(end, tokens.len()),
+        );
+        (driver, sink.detach())
+    });
+    give_draft(target, model);
+    match begun {
+        Ok((Ok(driver), sink)) => Ok(ScheduledDraftRun {
+            seq,
+            start: cached,
+            end,
+            sink: Some(sink),
+            decode,
+            driver,
+        }),
+        Ok((Err(error), sink)) => {
+            settle_scheduled_draft_run(target, seq, sink, decode);
+            Err(error)
+        }
+        Err(error) => {
+            if let Some(decode) = decode {
+                target.dflash2_states_mut().seq_lanes.insert(seq, decode);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// One pass of `run` (to its end without `budget_ms`), its sink with the
+/// draft for the pass; the draft is back on the model after it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_scheduled_draft_pass<T>(
+    target: &mut T,
+    run: &mut ScheduledDraftRun,
+    embed: &crate::nn::Embedding,
+    layer_kinds: &[crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind],
+    turn_cancel: Option<&std::sync::atomic::AtomicBool>,
+    budget_ms: Option<f64>,
+    take_draft: impl FnOnce(&mut T) -> Option<DFlash2Model>,
+    give_draft: impl FnOnce(&mut T, DFlash2Model),
+) -> Result<crate::models::qwen3_5::paged_forward::PrefillProgress>
+where
+    T: DFlash2Target
+        + crate::models::qwen3_5::paged_forward::PrefillTarget<
+            crate::models::qwen3_5::decoder_layer::DecoderLayer,
+        >,
+{
+    let detached = run
+        .sink
+        .take()
+        .ok_or_else(|| Error::from_reason("a scheduled prefill run lost its sink"))?;
+    let Some(model) = take_draft(target) else {
+        run.sink = Some(detached);
+        return Err(Error::from_reason(
+            "a scheduled prefill lost its DFlash2 draft",
+        ));
+    };
+    let mut sink = DraftTapSink::attach(&model, detached);
+    let progress = run.driver.run(
+        embed,
+        &mut LanePrefill(&mut *target),
+        layer_kinds,
+        turn_cancel,
+        Some(&mut sink),
+        budget_ms,
+    );
+    run.sink = Some(sink.detach());
+    give_draft(target, model);
+    progress
+}
+
+/// Ends `run`: a launch in flight goes back to its start (its booked rows
+/// and the GDN cells as they were before it); then the lane window and the
+/// ring go back to the sequence, as a slice that failed leaves them.
+/// Without `rollback` (the request is gone) only the lane window and the
+/// ring go back.
+pub(crate) fn end_scheduled_draft_run<T>(
+    target: &mut T,
+    mut run: ScheduledDraftRun,
+    rollback: bool,
+) -> Result<()>
+where
+    T: DFlash2Target
+        + crate::models::qwen3_5::paged_forward::PrefillTarget<
+            crate::models::qwen3_5::decoder_layer::DecoderLayer,
+        >,
+{
+    let seq = run.seq;
+    let mut rolled = Ok(());
+    if let Some(rows) = run.driver.in_flight_rows().filter(|_| rollback) {
+        let cells = run.driver.take_launch_start_cells();
+        rolled = target.parts().and_then(|parts| {
+            parts
+                .adapter
+                .rollback_last_tokens(rows)
+                .map_err(Error::from_reason)?;
+            if let Some(cells) = cells {
+                for (slot, cell) in parts.caches.iter_mut().zip(cells) {
+                    *slot = cell;
+                }
+            }
+            Ok(())
+        });
+    }
+    match run.sink.take() {
+        Some(sink) => settle_scheduled_draft_run(target, seq, sink, run.decode.take()),
+        None => {
+            if let Some(decode) = run.decode.take() {
+                target.dflash2_states_mut().seq_lanes.insert(seq, decode);
+            }
+        }
+    }
+    rolled
+}
+
+fn settle_scheduled_draft_run<T: DFlash2Target>(
+    target: &mut T,
+    seq: u32,
+    sink: DetachedDraftTapSink,
+    mut decode: Option<super::dflash2_state::paged::DraftLane>,
+) {
+    let (ring, lane) = sink.into_parts();
+    let states = target.dflash2_states_mut();
+    if let Some(lane) = lane {
+        states.seq_windows.insert(seq, lane);
+    }
+    if let Some(mut decode) = decode.take() {
+        decode.next_position = ring.logical_len();
+        decode.ring = ring;
+        states.seq_lanes.insert(seq, decode);
+    }
+}
+
+/// The draft ring of a scheduled sequence's decode lane, placed at `cached`
+/// for a prefill slice from there: as it is when it ends there, else
+/// rebuilt there as a whole turn's restore does (Splash
+/// `QwenStateStorage::restore`): projected again from the sequence's
+/// context window `window` when the turn's first point lies within a draft
+/// window of `cached` (`restoresDraftState`) and the window ends at
+/// `cached`, else empty at `cached`.
+fn lane_ring_at(
+    model: &DFlash2Model,
+    mut ring: DFlash2ContextCache,
+    window: &DraftContextWindow,
+    tokens: &[u32],
+    cached: usize,
+    plan: &StatePlan,
+) -> Result<DFlash2ContextCache> {
+    let depth =
+        u32::try_from(cached).map_err(|_| Error::from_reason("DFlash2 prefix exceeds u32 rows"))?;
+    if u32::try_from(ring.logical_len()).ok() == Some(depth) {
+        return Ok(ring);
+    }
+    let end = u32::try_from(tokens.len())
+        .map_err(|_| Error::from_reason("DFlash2 prompt exceeds u32 tokens"))?;
+    let restores = depth != 0 && depth < end && window.end() == depth && {
+        let points: Vec<u32> = plan.boundaries.iter().map(|point| point.tokens).collect();
+        plan_draft_context(
+            depth,
+            end,
+            &points,
+            u32::try_from(model.config.sliding_window).unwrap_or(u32::MAX),
+        )?
+        .restores_draft_state
+    };
+    if restores {
+        return DFlash2ContextCache::restore(ring, model, window, &tokens[..cached]);
+    }
+    ring.reset();
+    ring.record_only(&tokens[..cached])?;
+    Ok(ring)
 }
 
 /// Splash `reserveCaptures` over one prefill command of the lane's turn,
@@ -3558,7 +3932,8 @@ pub(crate) fn record_chunk_claimed<T: DFlash2Target>(target: &mut T, chunk: &[u3
 /// The model's accounts on the governor's books: its KV pool; its states
 /// (parked DFlash2 states, GDN ladder and history entries, the live
 /// scheduled GDN cells, `gdn_cells`, the idle lane's draft ring and window,
-/// and the scheduled sequences' windows); its image features.
+/// the scheduled sequences' windows, and their decode lanes' rings and
+/// second cells); its image features.
 pub(crate) fn memory_accounts<T: DFlash2Target>(
     target: &T,
     gdn_cells: u64,
@@ -3590,6 +3965,11 @@ pub(crate) fn memory_accounts<T: DFlash2Target>(
                 .values()
                 .fold(0u64, |sum, window| sum.saturating_add(window.nbytes())),
         );
+    let lanes = states
+        .seq_lanes
+        .values()
+        .fold(0u64, |sum, lane| sum.saturating_add(lane.held_bytes()))
+        .saturating_add(target.held_prefill_bytes());
     crate::engine::governor::governor::MemoryAccounts {
         kv,
         states: states
@@ -3598,7 +3978,8 @@ pub(crate) fn memory_accounts<T: DFlash2Target>(
             .state_bytes
             .saturating_add(gdn)
             .saturating_add(gdn_cells)
-            .saturating_add(idle),
+            .saturating_add(idle)
+            .saturating_add(lanes),
         embeddings: crate::vision::qwen::cache::vision_cache_bytes(target.vision_cache()),
     }
 }

@@ -13,12 +13,22 @@ use super::int8_gemm;
 /// Execute independently quantized mixer projections in one Metal dispatch.
 /// The native M=8 tile, split counts and projection boundaries stay unchanged;
 /// unsupported shapes, formats, training and devices keep their original path.
+/// Tiled64 Q4_K / Q5_K / Q6_K / IQ4_XS / IQ4_NL segments run their standalone
+/// 8-row tile; a Q8_0 segment (MLX affine 8-bit group 32 with F32 sidecars)
+/// runs the per-thread loop of its standalone `AffineMixedQmm` qmv_wide call.
 /// Set MLX_MIXED_PROJECTION=0 before loading a model for an unfused comparison.
 pub(crate) fn mixed_projection_forward(
     x: &MxArray,
     projections: &[&LinearProj],
 ) -> Result<Option<Vec<MxArray>>> {
     use crate::array::DType;
+    // `MixedProjectionFormat` (mlx-sys `metal/mixed_projection/abi.h`).
+    const Q4K: u32 = 4;
+    const Q5K: u32 = 5;
+    const Q6K: u32 = 6;
+    const A8G32: u32 = 8;
+    const IQ4XS: u32 = 20;
+    const IQ4NL: u32 = 21;
     if !(2..=3).contains(&projections.len()) || x.dtype()? != DType::BFloat16 {
         return Ok(None);
     }
@@ -27,7 +37,7 @@ pub(crate) fn mixed_projection_forward(
         return Ok(None);
     }
     let mut inputs = vec![x.as_raw_ptr()];
-    let mut bits = Vec::with_capacity(projections.len());
+    let mut formats = Vec::with_capacity(projections.len());
     for projection in projections {
         let LinearProj::Quantized(q) = projection else {
             return Ok(None);
@@ -37,15 +47,23 @@ pub(crate) fn mixed_projection_forward(
         if q.bias.is_some() || q.hadamard.is_some() || q.input_amax.is_some() {
             return Ok(None);
         }
-        let expected = match q.mode.as_str() {
-            "q4k@t64" => (4, 32),
-            "q5k@t64" => (5, 32),
-            "q6k@t64" => (6, 16),
+        let format = match (q.mode.as_str(), q.bits, q.group_size) {
+            ("q4k@t64", 4, 32) => Q4K,
+            ("q5k@t64", 5, 32) => Q5K,
+            ("q6k@t64", 6, 16) => Q6K,
+            ("iq4xs@t64", 4, 32) => IQ4XS,
+            ("iq4nl@t64", 4, 32) => IQ4NL,
+            // `forward`'s route to `mlx_quantized_matmul_affine_bf16`.
+            (DEFAULT_QUANT_MODE, 8, 32)
+                if q.scales.dtype()? == DType::Float32
+                    && q.biases.as_ref().map(|b| b.dtype()).transpose()?
+                        == Some(DType::Float32)
+                    && crate::engine::persistence::compiled_forward_backend_available() =>
+            {
+                A8G32
+            }
             _ => return Ok(None),
         };
-        if (q.bits, q.group_size) != expected {
-            return Ok(None);
-        }
         let Some(biases) = &q.biases else {
             return Ok(None);
         };
@@ -54,14 +72,14 @@ pub(crate) fn mixed_projection_forward(
             q.scales.as_raw_ptr(),
             biases.as_raw_ptr(),
         ]);
-        bits.push(q.bits as u32);
+        formats.push(format);
     }
     let mut outputs = vec![std::ptr::null_mut(); projections.len()];
     let status = unsafe {
         sys::mlx_mixed_projection(
             inputs.as_ptr(),
             inputs.len(),
-            bits.as_ptr(),
+            formats.as_ptr(),
             projections.len() as u32,
             outputs.as_mut_ptr(),
         )
@@ -117,6 +135,150 @@ pub(crate) struct PreparedSg8 {
     pub sums: MxArray,
 }
 
+// `forward_lanes` routes taken on this thread: (lane tier calls, per-lane
+// fallbacks).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LANE_ROUTES: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+fn count_lane_route(tier: bool) {
+    #[cfg(test)]
+    LANE_ROUTES.with(|c| {
+        let (t, p) = c.get();
+        c.set(if tier { (t + 1, p) } else { (t, p + 1) });
+    });
+    #[cfg(not(test))]
+    let _ = tier;
+}
+
+/// `[lanes, rows, K]` → `[lanes, rows, N]`, `forward` once per lane.
+fn forward_per_lane(x: &MxArray, forward: impl Fn(&MxArray) -> Result<MxArray>) -> Result<MxArray> {
+    let lanes = x.shape_at(0)?;
+    if lanes == 1 {
+        return forward(x);
+    }
+    count_lane_route(false);
+    let outs = (0..lanes)
+        .map(|i| forward(&x.slice_axis(0, i, i + 1)?))
+        .collect::<Result<Vec<_>>>()?;
+    MxArray::concatenate_many(outs.iter().collect(), Some(0))
+}
+
+/// What the store of a Tiled64 K-quant GEMM applies to its operand `aux`
+/// (shaped as the output), as `mlx_kquant.h` `StoreEpilogue`: `aux + y`, or
+/// `sigmoid(aux) * aux * y` with the gate as `aux`. Both give the bits of
+/// the separate ops they replace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StoreEpilogue {
+    Residual = 1,
+    Swiglu = 2,
+}
+
+/// The residual a mixer output projection adds; the result then holds the
+/// whole hidden state.
+#[derive(Clone, Copy)]
+pub(crate) enum MixerResidual<'a> {
+    /// Added after the projection, or by the source mixer kernel.
+    Source(&'a MxArray),
+    /// Added in the projection's GEMM store where its shape takes the
+    /// epilogue GEMM, else after it (the dense prefill).
+    Store(&'a MxArray),
+    /// Added in the store of the projection's planes `_r` kernel at a
+    /// DFlash2 verify's rows, else after the projection.
+    Verify(&'a MxArray),
+}
+
+// Planes GEMM calls on this thread; the DFlash2 lane trace counts them per
+// verify.
+thread_local! {
+    static PLANES_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn planes_calls() -> u64 {
+    PLANES_CALLS.with(std::cell::Cell::get)
+}
+
+// Test switch: the verify forms leave the planes and run the plain quantized ops.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PLANES_ROUTE_OFF: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn planes_route_off() -> bool {
+    #[cfg(test)]
+    {
+        PLANES_ROUTE_OFF.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+/// The lanes of one DFlash2 verify wave, `[lanes, 8, K]` bf16, as the rows
+/// of one planes call: 2 lanes = 16 rows, 4 lanes = 32 rows, 3 lanes = 32
+/// rows with one zero block of 8 rows after the lanes. Each lane's rows are
+/// the bits of its own 8-row call.
+#[derive(Clone, Copy)]
+pub(crate) struct WaveRows {
+    lanes: i64,
+    rows: i64,
+}
+
+impl WaveRows {
+    /// `x` `[lanes, 8, K]` bf16 of 2-4 lanes; `None` otherwise.
+    pub(crate) fn of(x: &MxArray) -> Result<Option<Self>> {
+        if x.ndim()? != 3 || x.dtype()? != crate::array::DType::BFloat16 {
+            return Ok(None);
+        }
+        let lanes = x.shape_at(0)?;
+        let ok = x.shape_at(1)? == i64::from(crate::utils::gguf_planes::TILE_ROWS)
+            && (2..=4).contains(&lanes);
+        Ok(ok.then(|| Self::of_lanes(lanes)))
+    }
+
+    /// The call of `lanes` lanes (2-4).
+    pub(crate) fn of_lanes(lanes: i64) -> Self {
+        let tile = i64::from(crate::utils::gguf_planes::TILE_ROWS);
+        Self {
+            lanes,
+            rows: if lanes == 3 { 4 * tile } else { lanes * tile },
+        }
+    }
+
+    pub(crate) fn rows(&self) -> i64 {
+        self.rows
+    }
+
+    /// `a` `[lanes, 8, C]` as the call's `[rows, C]` operand.
+    pub(crate) fn stack(&self, a: &MxArray) -> Result<MxArray> {
+        let c = a.shape_at(a.ndim()? - 1)?;
+        let held = self.lanes * i64::from(crate::utils::gguf_planes::TILE_ROWS);
+        let flat = a.reshape(&[held, c])?;
+        if held == self.rows {
+            return Ok(flat);
+        }
+        let pad = MxArray::zeros(&[self.rows - held, c], Some(a.dtype()?))?;
+        let parts = [flat, pad];
+        MxArray::concatenate_many(parts.iter().collect(), Some(0))
+    }
+
+    /// The call's `[rows, C]` output as `[lanes, 8, C]`, pad rows dropped.
+    pub(crate) fn unstack(&self, y: &MxArray) -> Result<MxArray> {
+        let tile = i64::from(crate::utils::gguf_planes::TILE_ROWS);
+        let held = self.lanes * tile;
+        let y = if held == self.rows {
+            y.clone()
+        } else {
+            y.slice_axis(0, 0, held)?
+        };
+        y.reshape(&[self.lanes, tile, -1])
+    }
+}
+
 /// A linear projection that can be either standard or quantized.
 ///
 /// Shared between attention, GatedDeltaNet, and SparseMoeBlock.
@@ -167,17 +329,90 @@ impl LinearProj {
         &self,
         x: &MxArray,
         prepared: Option<&PreparedSg8>,
-        residual: Option<&MxArray>,
+        residual: Option<MixerResidual<'_>>,
     ) -> Result<MxArray> {
-        if let (Self::Quantized(q), Some(residual)) = (self, residual)
-            && let Some(hidden) = q.try_source_mixer_q4(x, residual)?
+        let residual = match residual {
+            None => return self.forward_prepared_sg8(x, prepared),
+            Some(MixerResidual::Source(residual)) => {
+                if let Self::Quantized(q) = self
+                    && let Some(hidden) = q.try_source_mixer_q4(x, residual)?
+                {
+                    return Ok(hidden);
+                }
+                residual
+            }
+            Some(MixerResidual::Store(residual)) => {
+                // Prepared operands select their own kernel.
+                if !(prepared.is_some() && self.supports_prepared_sg8())
+                    && let Self::Quantized(q) = self
+                    && let Some(hidden) =
+                        q.try_store_epilogue(x, residual, StoreEpilogue::Residual)?
+                {
+                    return Ok(hidden);
+                }
+                residual
+            }
+            Some(MixerResidual::Verify(residual)) => {
+                // Prepared operands select their own kernel.
+                if !(prepared.is_some() && self.supports_prepared_sg8())
+                    && let Self::Quantized(q) = self
+                    && let Some(hidden) = q.forward_verify_residual(x, residual)?
+                {
+                    return Ok(hidden);
+                }
+                residual
+            }
+        };
+        let delta = self.forward_prepared_sg8(x, prepared)?;
+        residual.add(&delta)
+    }
+
+    /// Whether a DFlash2 verify's `rows` rows reach this projection's planes
+    /// `_r` kernel ([`MixerResidual::Verify`]).
+    pub(crate) fn verify_residual_route(&self, rows: i64) -> bool {
+        matches!(self, LinearProj::Quantized(q)
+            if q.verify_planes(rows, crate::utils::gguf_planes::Kernel::Residual).is_some())
+    }
+
+    /// Whether a verify wave of `lanes` lanes reaches this projection's
+    /// planes `_r` kernel ([`Self::forward_verify_lanes_mixer`]); one lane
+    /// as [`Self::verify_residual_route`].
+    pub(crate) fn verify_lanes_residual_route(&self, lanes: i64) -> bool {
+        let tile = i64::from(crate::utils::gguf_planes::TILE_ROWS);
+        match lanes {
+            1 => self.verify_residual_route(tile),
+            2..=4 => matches!(self, LinearProj::Quantized(q)
+                if q.verify_planes(WaveRows::of_lanes(lanes).rows(),
+                    crate::utils::gguf_planes::Kernel::Residual).is_some()),
+            _ => false,
+        }
+    }
+
+    /// A verify wave's mixer output with its residual, `x` `[lanes, 8, K]`
+    /// and `residual` `[lanes, 8, N]`: one planes `_r` call over the lanes,
+    /// else `residual + forward_lanes(x)`; one lane as
+    /// [`MixerResidual::Verify`]. Always the whole hidden state.
+    pub(crate) fn forward_verify_lanes_mixer(
+        &self,
+        x: &MxArray,
+        residual: &MxArray,
+    ) -> Result<MxArray> {
+        if x.shape_at(0)? == 1 {
+            return self.forward_mixer_output(x, None, Some(MixerResidual::Verify(residual)));
+        }
+        if let LinearProj::Quantized(q) = self
+            && let Some(hidden) = q.forward_verify_lanes_residual(x, residual)?
         {
             return Ok(hidden);
         }
-        let delta = self.forward_prepared_sg8(x, prepared)?;
-        match residual {
-            Some(residual) => residual.add(&delta),
-            None => Ok(delta),
+        residual.add(&self.forward_lanes(x)?)
+    }
+
+    /// Whether `rows` rows of `k` inputs take the store-epilogue GEMM.
+    pub(crate) fn store_epilogue_route(&self, rows: i64, k: i64) -> Result<bool> {
+        match self {
+            LinearProj::Quantized(q) => q.store_epilogue_route(rows, k),
+            LinearProj::Standard(_) => Ok(false),
         }
     }
 
@@ -222,6 +457,25 @@ impl LinearProj {
                 }
                 l.forward(x)
             }
+        }
+    }
+
+    /// `x` `[lanes, rows, K]`: each lane's rows get the bits `forward` gives
+    /// them alone. A plain Tiled64 K-quant takes one 16/32-row tier call for
+    /// 2-4 lanes of 8 rows; every other projection runs once per lane.
+    pub fn forward_lanes(&self, x: &MxArray) -> Result<MxArray> {
+        match self {
+            LinearProj::Quantized(q) if !q.source_head => q.forward_lanes(x),
+            _ => forward_per_lane(x, |lane| self.forward(lane)),
+        }
+    }
+
+    /// Whether [`Self::forward_lanes`] of `k`-wide bf16 lanes takes the lane
+    /// tier on this device.
+    pub fn lane_tier_holds(&self, k: i64) -> Result<bool> {
+        match self {
+            LinearProj::Quantized(q) if !q.source_head => q.lane_tier_holds(k),
+            _ => Ok(false),
         }
     }
 
@@ -372,6 +626,35 @@ impl LinearProj {
     pub(crate) fn has_hadamard(&self) -> bool {
         matches!(self, LinearProj::Quantized(ql) if ql.has_hadamard())
     }
+
+    /// See [`QuantizedLinear::attach_planes`]; a dense projection takes none.
+    pub(crate) fn attach_planes(
+        &mut self,
+        array: MxArray,
+        tensor: crate::utils::gguf_planes::PlanesTensor,
+    ) -> Result<()> {
+        match self {
+            LinearProj::Quantized(ql) => ql.attach_planes(array, tensor),
+            LinearProj::Standard(_) => Err(Error::from_reason(format!(
+                "planes {} cannot attach to a dense projection",
+                tensor.key
+            ))),
+        }
+    }
+
+    pub(crate) fn planes(&self) -> Option<&AttachedPlanes> {
+        match self {
+            LinearProj::Quantized(ql) => ql.planes(),
+            LinearProj::Standard(_) => None,
+        }
+    }
+
+    pub(crate) fn detach_planes(&mut self) -> Option<Box<AttachedPlanes>> {
+        match self {
+            LinearProj::Quantized(ql) => ql.detach_planes(),
+            LinearProj::Standard(_) => None,
+        }
+    }
 }
 
 /// An MLP that can be either standard or quantized.
@@ -412,6 +695,228 @@ impl MLPVariant {
         Activations::swiglu_compiled(&gate, &up)
     }
 
+    /// `gate`, then `up` with the SwiGLU in its GEMM store, where every
+    /// projection that gives the gate's bits takes the epilogue GEMM: the
+    /// merged GEMM and its gate rows run the same kernel only there. `None`
+    /// leaves the separate ops.
+    fn swiglu_store(
+        x: &MxArray,
+        gate_proj: &QuantizedLinear,
+        up_proj: &QuantizedLinear,
+        gate_up: &Option<Box<(QuantizedLinear, i64)>>,
+    ) -> Result<Option<MxArray>> {
+        let ndim = x.ndim()?;
+        if ndim == 0 {
+            return Ok(None);
+        }
+        let k = x.shape_at(ndim - 1)?;
+        if k <= 0 {
+            return Ok(None);
+        }
+        let rows = x.size()? as i64 / k;
+        if !up_proj.store_epilogue_route(rows, k)? {
+            return Ok(None);
+        }
+        if let Some(pair) = gate_up
+            && !(pair.0.store_epilogue_route(rows, k)?
+                && gate_proj.store_epilogue_route(rows, k)?)
+        {
+            return Ok(None);
+        }
+        let gate = gate_proj.forward(x)?;
+        up_proj.try_store_epilogue(x, &gate, StoreEpilogue::Swiglu)
+    }
+
+    /// `residual + forward(x)`, with the SwiGLU and the residual add in the
+    /// K-quant GEMM stores where the shapes take the epilogue GEMM (the dense
+    /// prefill); the separate ops elsewhere. Same bits either way.
+    pub(crate) fn forward_store_residual(
+        &self,
+        x: &MxArray,
+        residual: &MxArray,
+    ) -> Result<MxArray> {
+        let MLPVariant::Quantized {
+            gate_proj,
+            up_proj,
+            down_proj,
+            gate_up,
+        } = self
+        else {
+            return residual.add(&self.forward(x)?);
+        };
+        let activated = match Self::swiglu_store(x, gate_proj, up_proj, gate_up)? {
+            Some(activated) => activated,
+            None => Self::quantized_activated(x, gate_proj, up_proj, gate_up)?,
+        };
+        match down_proj.try_store_epilogue(&activated, residual, StoreEpilogue::Residual)? {
+            Some(hidden) => Ok(hidden),
+            None => residual.add(&down_proj.forward(&activated)?),
+        }
+    }
+
+    /// The SwiGLU activation of a DFlash2 verify's rows on the planes: a
+    /// merged gate|up in one pass (`_gate_up`) or as one `_a` split as
+    /// [`Self::quantized_activated`] splits it, an unmerged pair as `_a`
+    /// then `_g`. `None` when the planes do not take these rows.
+    fn planes_activated(
+        x: &MxArray,
+        gate_proj: &QuantizedLinear,
+        up_proj: &QuantizedLinear,
+        gate_up: &Option<Box<(QuantizedLinear, i64)>>,
+    ) -> Result<Option<MxArray>> {
+        let Some((x2, lead)) = verify_rows(x)? else {
+            return Ok(None);
+        };
+        Self::planes_activated_rows(&x2, gate_proj, up_proj, gate_up.as_deref())?
+            .map(|a| a.reshape(&with_last(&lead, -1)))
+            .transpose()
+    }
+
+    /// [`Self::planes_activated`] of the 2-D planes operand `x2` `[rows,
+    /// K]` (8 rows of one lane or a [`WaveRows`] call); returns `[rows, N]`.
+    fn planes_activated_rows(
+        x2: &MxArray,
+        gate_proj: &QuantizedLinear,
+        up_proj: &QuantizedLinear,
+        gate_up: Option<&(QuantizedLinear, i64)>,
+    ) -> Result<Option<MxArray>> {
+        use crate::utils::gguf_planes::Kernel;
+        let rows = x2.shape_at(0)?;
+        if let Some((merged, split)) = gate_up {
+            if let Some(p) = merged.verify_planes_at(x2, Kernel::GateUp)? {
+                return p.matmul(x2, None, 0).map(Some);
+            }
+            if let Some(p) = merged.verify_planes_at(x2, Kernel::Plain)? {
+                let combined = p.matmul(x2, None, 0)?;
+                let gu = combined.split_sections(&[*split], 1)?;
+                return Activations::swiglu_compiled(&gu[0], &gu[1]).map(Some);
+            }
+            return Ok(None);
+        }
+        match (
+            gate_proj.verify_planes(rows, Kernel::Plain),
+            up_proj.verify_planes(rows, Kernel::Gate),
+        ) {
+            (Some(g), Some(u)) if g.tensor.k == u.tensor.k && g.tensor.rows == u.tensor.rows => {
+                if !gate_proj.verify_operand(x2)? {
+                    return Ok(None);
+                }
+                let gate = g.matmul(x2, None, 0)?;
+                u.matmul(x2, Some(&gate), 2).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The SwiGLU activation of a verify wave's lanes `x` `[lanes, 8, K]`
+    /// as [`Self::forward_lanes`] computes it, `[lanes, 8, N]`.
+    fn lanes_activated(
+        x: &MxArray,
+        gate_proj: &QuantizedLinear,
+        up_proj: &QuantizedLinear,
+        gate_up: &Option<Box<(QuantizedLinear, i64)>>,
+    ) -> Result<MxArray> {
+        if let Some(pair) = gate_up {
+            let (merged, split) = &**pair;
+            let combined = merged.forward_lanes(x)?;
+            let last = combined.ndim()? as i32 - 1;
+            let gu = combined.split_sections(&[*split], last)?;
+            return Activations::swiglu_compiled(&gu[0], &gu[1]);
+        }
+        let gate = gate_proj.forward_lanes(x)?;
+        let up = up_proj.forward_lanes(x)?;
+        Activations::swiglu_compiled(&gate, &up)
+    }
+
+    /// `residual + forward_lanes(x)` for a DFlash2 verify wave, `x` and
+    /// `residual` `[lanes, 8, H]`: each projection with planes runs one
+    /// planes call over the lanes' [`WaveRows`] (the down projection adds
+    /// `residual` in its `_r` store); every other projection runs as in
+    /// [`Self::forward_lanes`], with its bits. One lane runs
+    /// [`Self::forward_verify`].
+    pub(crate) fn forward_verify_lanes(&self, x: &MxArray, residual: &MxArray) -> Result<MxArray> {
+        if x.shape_at(0)? == 1 {
+            return self.forward_verify(x, residual);
+        }
+        let MLPVariant::Quantized {
+            gate_proj,
+            up_proj,
+            down_proj,
+            gate_up,
+        } = self
+        else {
+            return residual.add(&self.forward_lanes(x)?);
+        };
+        if let Some(wave) = WaveRows::of(x)? {
+            let x2 = wave.stack(x)?;
+            if let Some(a2) =
+                Self::planes_activated_rows(&x2, gate_proj, up_proj, gate_up.as_deref())?
+            {
+                if let Some(hidden) =
+                    down_proj.verify_lanes_residual_stacked(&wave, &a2, residual)?
+                {
+                    return Ok(hidden);
+                }
+                return residual.add(&down_proj.forward_lanes(&wave.unstack(&a2)?)?);
+            }
+        }
+        let activated = Self::lanes_activated(x, gate_proj, up_proj, gate_up)?;
+        match down_proj.forward_verify_lanes_residual(&activated, residual)? {
+            Some(hidden) => Ok(hidden),
+            None => residual.add(&down_proj.forward_lanes(&activated)?),
+        }
+    }
+
+    /// Whether every projection of [`Self::forward_verify_lanes`] on
+    /// `hidden`-wide lanes runs once over the lanes on this device: on its
+    /// attached planes, or on the lane tier.
+    pub fn wave_ready(&self, hidden: i64) -> Result<bool> {
+        let MLPVariant::Quantized {
+            gate_proj,
+            up_proj,
+            down_proj,
+            gate_up,
+        } = self
+        else {
+            return Ok(false);
+        };
+        let ready = |q: &QuantizedLinear, k: i64| -> Result<bool> {
+            Ok(q.planes().is_some() || q.lane_tier_holds(k)?)
+        };
+        let (gate_up_ready, intermediate) = match gate_up {
+            Some(pair) => (ready(&pair.0, hidden)?, pair.1),
+            None => (
+                ready(gate_proj, hidden)? && ready(up_proj, hidden)?,
+                gate_proj.get_weight().shape_at(0)?,
+            ),
+        };
+        Ok(gate_up_ready && ready(down_proj, intermediate)?)
+    }
+
+    /// `residual + forward(x)` for a DFlash2 verify: the projections with
+    /// planes run their planes kernels (the down projection adds `residual`
+    /// in its `_r` store); every other projection runs as in
+    /// [`Self::forward`], with its bits.
+    pub(crate) fn forward_verify(&self, x: &MxArray, residual: &MxArray) -> Result<MxArray> {
+        let MLPVariant::Quantized {
+            gate_proj,
+            up_proj,
+            down_proj,
+            gate_up,
+        } = self
+        else {
+            return residual.add(&self.forward(x)?);
+        };
+        let activated = match Self::planes_activated(x, gate_proj, up_proj, gate_up)? {
+            Some(activated) => activated,
+            None => Self::quantized_activated(x, gate_proj, up_proj, gate_up)?,
+        };
+        match down_proj.forward_verify_residual(&activated, residual)? {
+            Some(hidden) => Ok(hidden),
+            None => residual.add(&down_proj.forward(&activated)?),
+        }
+    }
+
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
         match self {
             MLPVariant::Standard(mlp) => mlp.forward(x),
@@ -425,6 +930,60 @@ impl MLPVariant {
                 down_proj.forward(&activated)
             }
         }
+    }
+
+    /// `x` `[lanes, rows, K]`: each lane's rows get the bits `forward` gives
+    /// them alone. Every projection goes through `forward_lanes`; SwiGLU is
+    /// row-wise and runs stacked.
+    pub fn forward_lanes(&self, x: &MxArray) -> Result<MxArray> {
+        let lanes = x.shape_at(0)?;
+        if lanes == 1 {
+            return self.forward(x);
+        }
+        match self {
+            MLPVariant::Standard(_) => forward_per_lane(x, |lane| self.forward(lane)),
+            MLPVariant::Quantized {
+                gate_proj,
+                up_proj,
+                down_proj,
+                gate_up,
+            } => {
+                let activated = if let Some(pair) = gate_up {
+                    let (merged, split) = &**pair;
+                    let combined = merged.forward_lanes(x)?;
+                    let last = combined.ndim()? as i32 - 1;
+                    let gu = combined.split_sections(&[*split], last)?;
+                    Activations::swiglu_compiled(&gu[0], &gu[1])?
+                } else {
+                    let gate = gate_proj.forward_lanes(x)?;
+                    let up = up_proj.forward_lanes(x)?;
+                    Activations::swiglu_compiled(&gate, &up)?
+                };
+                down_proj.forward_lanes(&activated)
+            }
+        }
+    }
+
+    /// Whether every projection of [`Self::forward_lanes`] on `hidden`-wide
+    /// bf16 lanes takes the lane tier on this device.
+    pub fn lane_tier_holds(&self, hidden: i64) -> Result<bool> {
+        let MLPVariant::Quantized {
+            gate_proj,
+            up_proj,
+            down_proj,
+            gate_up,
+        } = self
+        else {
+            return Ok(false);
+        };
+        let (gate_up_hold, intermediate) = match gate_up {
+            Some(pair) => (pair.0.lane_tier_holds(hidden)?, pair.1),
+            None => (
+                gate_proj.lane_tier_holds(hidden)? && up_proj.lane_tier_holds(hidden)?,
+                gate_proj.get_weight().shape_at(0)?,
+            ),
+        };
+        Ok(gate_up_hold && down_proj.lane_tier_holds(intermediate)?)
     }
 
     pub fn get_gate_proj_weight(&self) -> MxArray {
@@ -528,6 +1087,82 @@ impl MLPVariant {
                 }
                 Ok(())
             }
+        }
+    }
+
+    /// Attach the planes of a planned gate|up, gate, up or down tensor: a
+    /// merged gate|up to the row-merged projection, a gate or up only to an
+    /// unmerged pair (merged slice views carry none).
+    pub(crate) fn attach_planes(
+        &mut self,
+        array: MxArray,
+        tensor: crate::utils::gguf_planes::PlanesTensor,
+    ) -> Result<()> {
+        use crate::utils::gguf_planes::Role;
+        let MLPVariant::Quantized {
+            gate_proj,
+            up_proj,
+            down_proj,
+            gate_up,
+        } = self
+        else {
+            return Err(Error::from_reason(format!(
+                "planes {} cannot attach to a dense MLP",
+                tensor.key
+            )));
+        };
+        match (tensor.role, gate_up.as_mut()) {
+            (Role::GateUp, Some(pair)) => pair.0.attach_planes(array, tensor),
+            (Role::Gate, None) => gate_proj.attach_planes(array, tensor),
+            (Role::Up, None) => up_proj.attach_planes(array, tensor),
+            (Role::Down, _) => down_proj.attach_planes(array, tensor),
+            (role, merged) => Err(Error::from_reason(format!(
+                "planes {} of role {role:?} do not fit this MLP (gate|up merged: {})",
+                tensor.key,
+                merged.is_some()
+            ))),
+        }
+    }
+
+    /// Every projection of this MLP that holds planes.
+    pub(crate) fn planes(&self) -> Vec<&AttachedPlanes> {
+        match self {
+            MLPVariant::Standard(_) => Vec::new(),
+            MLPVariant::Quantized {
+                gate_proj,
+                up_proj,
+                down_proj,
+                gate_up,
+            } => [
+                gate_up.as_ref().and_then(|pair| pair.0.planes()),
+                gate_proj.planes(),
+                up_proj.planes(),
+                down_proj.planes(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        }
+    }
+
+    pub(crate) fn detach_planes(&mut self) -> Vec<AttachedPlanes> {
+        match self {
+            MLPVariant::Standard(_) => Vec::new(),
+            MLPVariant::Quantized {
+                gate_proj,
+                up_proj,
+                down_proj,
+                gate_up,
+            } => [
+                gate_up.as_mut().and_then(|pair| pair.0.detach_planes()),
+                gate_proj.detach_planes(),
+                up_proj.detach_planes(),
+                down_proj.detach_planes(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|planes| *planes)
+            .collect(),
         }
     }
 
@@ -1110,6 +1745,100 @@ pub struct QuantizedLinear {
     // Set only after the MoE loader validates and installs the complete head.
     // Immutable thereafter; compiled closures share this same projection.
     source_head: bool,
+    // Splash weight planes of the same rows (`attach_planes`). Every change of
+    // the packed arrays drops them: stale planes would compute another layer.
+    planes: Option<Box<AttachedPlanes>>,
+}
+
+/// One projection's planes and the planned tensor they were written for.
+pub(crate) struct AttachedPlanes {
+    pub array: MxArray,
+    pub tensor: crate::utils::gguf_planes::PlanesTensor,
+}
+
+impl AttachedPlanes {
+    /// `x` `[rows, k]` bf16 times these planes at the plan's splits and walk:
+    /// `epilogue` 0 plain, 1 plus `aux` `[rows, n]`, 2 swiglu of the gate
+    /// `aux` and this up projection; a merged `_gate_up` tensor gives the
+    /// swiglu of its two halves.
+    fn matmul(&self, x: &MxArray, aux: Option<&MxArray>, epilogue: u32) -> Result<MxArray> {
+        use crate::utils::gguf_planes::Kernel;
+        let t = &self.tensor;
+        let spread = u32::from(t.walk);
+        // SAFETY: live handles; the primitive checks the operands' shapes.
+        let handle = unsafe {
+            if t.kernel == Kernel::GateUp {
+                sys::mlx_gguf_planes_gate_up(
+                    x.as_raw_ptr(),
+                    self.array.as_raw_ptr(),
+                    t.format,
+                    t.rows / 2,
+                    t.k,
+                    t.splits,
+                    spread,
+                )
+            } else {
+                sys::mlx_gguf_planes_matmul(
+                    x.as_raw_ptr(),
+                    self.array.as_raw_ptr(),
+                    aux.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+                    t.format,
+                    t.rows,
+                    t.k,
+                    epilogue,
+                    t.splits,
+                    spread,
+                )
+            }
+        };
+        PLANES_CALLS.with(|calls| calls.set(calls.get() + 1));
+        MxArray::from_handle(handle, "gguf planes matmul")
+    }
+}
+
+/// `x` as the 2-D `[rows, k]` operand of a planes call when it holds one
+/// DFlash2 verify's bf16 rows, with its leading shape.
+fn verify_rows(x: &MxArray) -> Result<Option<(MxArray, Vec<i64>)>> {
+    let ndim = x.ndim()?;
+    if ndim < 2 || x.dtype()? != crate::array::DType::BFloat16 {
+        return Ok(None);
+    }
+    let shape = x.shape()?.to_vec();
+    let k = shape[ndim as usize - 1];
+    if k <= 0 {
+        return Ok(None);
+    }
+    let rows = x.size()? as i64 / k;
+    if rows != i64::from(crate::utils::gguf_planes::TILE_ROWS) {
+        return Ok(None);
+    }
+    Ok(Some((x.reshape(&[rows, k])?, shape)))
+}
+
+/// `lead` with its last dimension replaced by `last`.
+fn with_last(lead: &[i64], last: i64) -> Vec<i64> {
+    let mut shape = lead.to_vec();
+    if let Some(end) = shape.last_mut() {
+        *end = last;
+    }
+    shape
+}
+
+/// The planes format of a Tiled64 K-quant base mode.
+fn planes_format_of_mode(base: &str) -> Option<u32> {
+    use crate::utils::gguf_planes::{
+        FMT_IQ3S, FMT_IQ4NL, FMT_IQ4XS, FMT_Q3K, FMT_Q4K, FMT_Q5K, FMT_Q6K,
+    };
+    Some(match base {
+        "q4k" => FMT_Q4K,
+        "iq4xs" => FMT_IQ4XS,
+        "iq4nl" => FMT_IQ4NL,
+        "q5k" => FMT_Q5K,
+        "q6k" => FMT_Q6K,
+        "q3k" => FMT_Q3K,
+        "iq3s" => FMT_IQ3S,
+        _ => return None,
+    })
 }
 
 /// Routing observability for the sym8 forward (unit-test scope only):
@@ -1158,6 +1887,7 @@ impl QuantizedLinear {
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
             source_head: false,
+            planes: None,
         }
     }
 
@@ -1215,6 +1945,7 @@ impl QuantizedLinear {
     }
 
     fn tile_kquant_layout_impl(&mut self, pad_rows: bool, affine_shape_rule: bool) -> Result<bool> {
+        self.planes = None;
         use crate::models::quant_dispatch::{
             KQUANT_TILE_ROWS, KQUANT_TILED_SUFFIX, kquant_affine_mode_params,
             kquant_affine_tiled_shape, kquant_mode_params_for_scales, kquant_tile_rows,
@@ -1354,6 +2085,7 @@ impl QuantizedLinear {
         if self.mode != DEFAULT_QUANT_MODE {
             return Ok(());
         }
+        self.planes = None;
         if self.scales.dtype()? == crate::array::DType::Float16 {
             self.scales = self.scales.astype(target)?;
         }
@@ -1502,6 +2234,7 @@ impl QuantizedLinear {
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
             source_head: false,
+            planes: None,
         }))
     }
 
@@ -1571,6 +2304,7 @@ impl QuantizedLinear {
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
             source_head: false,
+            planes: None,
         })
     }
 
@@ -1598,6 +2332,7 @@ impl QuantizedLinear {
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
             source_head: false,
+            planes: None,
         }
     }
 
@@ -1662,6 +2397,7 @@ impl QuantizedLinear {
             }
         }
         self.hadamard = transform;
+        self.planes = None;
         Ok(self)
     }
 
@@ -1696,6 +2432,7 @@ impl QuantizedLinear {
             )));
         }
         self.hadamard = Some(transform);
+        self.planes = None;
         Ok(self)
     }
 
@@ -1722,6 +2459,7 @@ impl QuantizedLinear {
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
             source_head: false,
+            planes: None,
         }
     }
 
@@ -1808,6 +2546,7 @@ impl QuantizedLinear {
         self.biases = Some(quant_biases);
         self.bias = bias;
         self.output_layout = QuantizedOutputLayout::QGateBlock;
+        self.planes = None;
         Ok(true)
     }
 
@@ -1873,6 +2612,83 @@ impl QuantizedLinear {
         (self.mode == MXFP8_MODE || self.mode == DEFAULT_QUANT_MODE)
             && self.bits == 8
             && self.group_size == 32
+    }
+
+    /// No transform, linear bias, activation quantizer or output permutation:
+    /// the projection is the bare packed GEMM the store epilogue extends.
+    fn store_epilogue_plain(&self) -> bool {
+        self.biases.is_some()
+            && self.bias.is_none()
+            && self.hadamard.is_none()
+            && self.input_amax.is_none()
+            && self.fp8_dequant_weight.is_none()
+            && self.s_w.is_none()
+            && self.output_layout == QuantizedOutputLayout::Native
+            && !self.source_head
+    }
+
+    /// Whether `rows` bfloat16 rows of `k` inputs take the store-epilogue
+    /// GEMM: [`forward`](Self::forward) would run the Tiled64 tensor-op GEMM
+    /// of a mode that has the epilogue kernels.
+    pub(crate) fn store_epilogue_route(&self, rows: i64, k: i64) -> Result<bool> {
+        if !self.store_epilogue_plain() {
+            return Ok(false);
+        }
+        let shape = self.weight.shape()?;
+        let (Ok(m), Ok(n), Ok(k)) = (
+            i32::try_from(rows),
+            i32::try_from(shape.first().copied().unwrap_or(0)),
+            i32::try_from(k),
+        ) else {
+            return Ok(false);
+        };
+        let mode = CString::new(self.mode.as_str())
+            .map_err(|e| Error::from_reason(format!("Invalid mode string: {e}")))?;
+        // SAFETY: a NUL-terminated mode and plain integers.
+        Ok(shape.len() == 2
+            && unsafe { sys::mlx_kquant_store_epilogue_route(mode.as_ptr(), m, n, k) })
+    }
+
+    /// `forward(x)` with `epilogue` applied to `aux` in the GEMM store, or
+    /// `None` when the operands do not take the epilogue GEMM.
+    pub(crate) fn try_store_epilogue(
+        &self,
+        x: &MxArray,
+        aux: &MxArray,
+        epilogue: StoreEpilogue,
+    ) -> Result<Option<MxArray>> {
+        if !self.store_epilogue_plain() {
+            return Ok(None);
+        }
+        let Some(biases) = self.biases.as_ref() else {
+            return Ok(None);
+        };
+        let mode = CString::new(self.mode.as_str())
+            .map_err(|e| Error::from_reason(format!("Invalid mode string: {e}")))?;
+        let mut output = std::ptr::null_mut();
+        // SAFETY: live array handles, a NUL-terminated mode and an out slot.
+        let status = unsafe {
+            sys::mlx_kquant_matmul_epilogue(
+                x.handle.0,
+                self.weight.handle.0,
+                self.scales.handle.0,
+                biases.handle.0,
+                aux.handle.0,
+                mode.as_ptr(),
+                epilogue as i32,
+                &mut output,
+            )
+        };
+        match status {
+            1 => Ok(Some(MxArray::from_handle(
+                output,
+                "kquant_matmul_epilogue",
+            )?)),
+            0 => Ok(None),
+            _ => Err(Error::from_reason(
+                "K-quant store epilogue construction failed",
+            )),
+        }
     }
 
     fn supports_prepared_sg8(&self) -> bool {
@@ -2202,8 +3018,94 @@ impl QuantizedLinear {
         Ok(result)
     }
 
+    /// Whether `forward_lanes` of `[lanes, rows, K]` takes the lane tier:
+    /// 2-4 bf16 lanes of 8 rows on a plain Tiled64 K-quant whose 8-row
+    /// `forward` is the 8-row tensor-op tier on this device. The offsets are
+    /// known at eval only: rows the 8-row tier refuses there (a byte offset
+    /// not divisible by 8) run one 8-row call per lane inside the primitive.
+    pub fn wave_exact(&self, lanes: i64, rows: i64, x: &MxArray) -> Result<bool> {
+        if rows != 8 || !(2..=4).contains(&lanes) || x.dtype()? != crate::array::DType::BFloat16 {
+            return Ok(false);
+        }
+        self.lane_tier_holds(x.shape_at(2)?)
+    }
+
+    /// Whether this projection of `k`-wide bf16 rows takes the lane tier for
+    /// 2-4 lanes of 8 rows on this device (the projection half of
+    /// [`Self::wave_exact`]).
+    pub fn lane_tier_holds(&self, k: i64) -> Result<bool> {
+        if self.bias.is_some()
+            || self.biases.is_none()
+            || self.hadamard.is_some()
+            || self.input_amax.is_some()
+            || self.fp8_dequant_weight.is_some()
+            || self.s_w.is_some()
+            || self.source_head
+            || self.weight.ndim()? != 2
+        {
+            return Ok(false);
+        }
+        let Some(base) = self
+            .mode
+            .strip_suffix(crate::models::quant_dispatch::KQUANT_TILED_SUFFIX)
+        else {
+            return Ok(false);
+        };
+        if crate::utils::gguf_kquant::KQuantFormat::from_mlx_mode(base).is_none() {
+            return Ok(false);
+        }
+        let (Ok(n), Ok(k)) = (i32::try_from(self.weight.shape_at(0)?), i32::try_from(k)) else {
+            return Ok(false);
+        };
+        let mode = CString::new(self.mode.as_str())
+            .map_err(|e| Error::from_reason(format!("Invalid mode string: {e}")))?;
+        Ok(unsafe { sys::mlx_kquant_lane_tier_available(mode.as_ptr(), self.bits, n, k) })
+    }
+
+    /// `x` `[lanes, rows, K]` → `[lanes, rows, N]`; each lane's rows carry
+    /// the bits `forward` gives that lane alone. The lane is the 8-row block
+    /// of the `[lanes * rows, K]` stack: when `x` is not row-contiguous the
+    /// stack is a copy, and a lane's `forward` on its own strided view may
+    /// take another route.
+    pub fn forward_lanes(&self, x: &MxArray) -> Result<MxArray> {
+        let shape = x.shape()?;
+        let &[lanes, rows, k] = shape.as_ref() else {
+            return Err(Error::from_reason(format!(
+                "forward_lanes takes [lanes, rows, K], got {:?}",
+                shape.as_ref()
+            )));
+        };
+        if lanes == 1 {
+            return self.forward(x);
+        }
+        if !self.wave_exact(lanes, rows, x)? {
+            return forward_per_lane(x, |lane| self.forward(lane));
+        }
+        count_lane_route(true);
+        let stacked = x.reshape(&[lanes * rows, k])?;
+        let mode = CString::new(self.mode.as_str())
+            .map_err(|e| Error::from_reason(format!("Invalid mode string: {e}")))?;
+        let biases = self
+            .biases
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("lane tier needs the K-quant sidecars"))?;
+        let handle = unsafe {
+            sys::mlx_quantized_matmul_lane_tier(
+                stacked.handle.0,
+                self.weight.handle.0,
+                self.scales.handle.0,
+                biases.handle.0,
+                self.group_size,
+                self.bits,
+                mode.as_ptr(),
+            )
+        };
+        MxArray::from_handle(handle, "quantized_matmul_lane_tier")?.reshape(&[lanes, rows, -1])
+    }
+
     pub fn set_weight(&mut self, weight: MxArray) {
         self.weight = weight;
+        self.planes = None;
         if self.mode == FP8_E4M3_MODE {
             // This infallible legacy mutator cannot validate/rebuild the plain
             // FP8 pair. Invalidate the reconstruction so forward fails loud
@@ -2214,6 +3116,7 @@ impl QuantizedLinear {
 
     pub fn set_scales(&mut self, scales: MxArray) {
         self.scales = scales;
+        self.planes = None;
         if self.mode == FP8_E4M3_MODE {
             self.fp8_dequant_weight = None;
         }
@@ -2221,6 +3124,184 @@ impl QuantizedLinear {
 
     pub fn set_bias(&mut self, bias: Option<MxArray>) {
         self.bias = bias;
+        self.planes = None;
+    }
+
+    /// Install `array`, the planes `tensor` plans for these rows. Only a
+    /// plain Tiled64 K-quant projection of the tensor's format and `[rows,
+    /// k]` shape, with no linear bias, takes them, and only an array of the
+    /// planned bytes.
+    pub(crate) fn attach_planes(
+        &mut self,
+        array: MxArray,
+        tensor: crate::utils::gguf_planes::PlanesTensor,
+    ) -> Result<()> {
+        let refuse = |why: &str| -> Result<()> {
+            Err(Error::from_reason(format!(
+                "planes {} cannot attach to this projection: {why}",
+                tensor.key
+            )))
+        };
+        let (base, tiled) = crate::models::quant_dispatch::split_kquant_layout(&self.mode);
+        if !tiled {
+            return refuse("not Tiled64");
+        }
+        if planes_format_of_mode(base) != Some(tensor.format) {
+            return refuse(&format!(
+                "mode {base} is not planes format {}",
+                tensor.format
+            ));
+        }
+        if self.source_head
+            || self.bias.is_some()
+            || self.biases.is_none()
+            || self.hadamard.is_some()
+            || self.s_w.is_some()
+            || self.fp8_dequant_weight.is_some()
+            || self.output_layout != QuantizedOutputLayout::Native
+        {
+            return refuse("not a plain K-quant projection");
+        }
+        let shape = self.weight.shape()?.to_vec();
+        let code_bits: i64 = match self.weight.dtype()? {
+            crate::array::DType::Uint32 => 32,
+            crate::array::DType::Uint8 => 8,
+            other => return refuse(&format!("packed weight dtype {other:?}")),
+        };
+        let bits = i64::from(self.bits);
+        let rows_cols = match shape.as_slice() {
+            [rows, cols] if bits > 0 && (cols * code_bits) % bits == 0 => {
+                Some((*rows, cols * code_bits / bits))
+            }
+            _ => None,
+        };
+        if rows_cols != Some((i64::from(tensor.rows), i64::from(tensor.k))) {
+            return refuse(&format!(
+                "packed shape {:?} is not [{}, {}]",
+                shape, tensor.rows, tensor.k
+            ));
+        }
+        if array.dtype()? != crate::array::DType::Uint8
+            || array.shape()?.to_vec() != [tensor.bytes as i64]
+        {
+            return refuse(&format!("the array is not {} planes bytes", tensor.bytes));
+        }
+        self.planes = Some(Box::new(AttachedPlanes { array, tensor }));
+        Ok(())
+    }
+
+    pub(crate) fn planes(&self) -> Option<&AttachedPlanes> {
+        self.planes.as_deref()
+    }
+
+    /// Drop the planes; their bytes return once nothing else holds them.
+    pub(crate) fn detach_planes(&mut self) -> Option<Box<AttachedPlanes>> {
+        self.planes.take()
+    }
+
+    /// The planes a DFlash2 verify's `rows` rows run on through `kernel`: 8
+    /// rows of one lane, or the 16 / 32 rows of a [`WaveRows`] call.
+    fn verify_planes(
+        &self,
+        rows: i64,
+        kernel: crate::utils::gguf_planes::Kernel,
+    ) -> Option<&AttachedPlanes> {
+        let tile = i64::from(crate::utils::gguf_planes::TILE_ROWS);
+        self.planes.as_deref().filter(|p| {
+            p.tensor.kernel == kernel
+                && (rows == tile || rows == 2 * tile || rows == 4 * tile)
+                && !planes_route_off()
+        })
+    }
+
+    /// [`Self::verify_planes`] for the 2-D operand `x`.
+    fn verify_planes_at(
+        &self,
+        x: &MxArray,
+        kernel: crate::utils::gguf_planes::Kernel,
+    ) -> Result<Option<&AttachedPlanes>> {
+        if !self.verify_operand(x)? {
+            return Ok(None);
+        }
+        Ok(self.verify_planes(x.shape_at(0)?, kernel))
+    }
+
+    /// Whether the 2-D `x` has the planes' inputs.
+    fn verify_operand(&self, x: &MxArray) -> Result<bool> {
+        Ok(match self.planes.as_deref() {
+            Some(p) => x.ndim()? == 2 && x.shape_at(1)? == i64::from(p.tensor.k),
+            None => false,
+        })
+    }
+
+    /// `residual + forward(x)` through the planes `_r` kernel when `x` holds
+    /// one DFlash2 verify's bf16 rows and the planes take them; `None`
+    /// otherwise.
+    pub(crate) fn forward_verify_residual(
+        &self,
+        x: &MxArray,
+        residual: &MxArray,
+    ) -> Result<Option<MxArray>> {
+        let Some((x2, _)) = verify_rows(x)? else {
+            return Ok(None);
+        };
+        let Some(p) = self.verify_planes_at(&x2, crate::utils::gguf_planes::Kernel::Residual)?
+        else {
+            return Ok(None);
+        };
+        let rows = x2.shape_at(0)?;
+        let n = i64::from(p.tensor.rows);
+        if residual.dtype()? != crate::array::DType::BFloat16 || residual.size()? as i64 != rows * n
+        {
+            return Ok(None);
+        }
+        let shape = residual.shape()?.to_vec();
+        if shape.last() != Some(&n) {
+            return Ok(None);
+        }
+        let r2 = residual.reshape(&[rows, n])?;
+        let hidden = p.matmul(&x2, Some(&r2), 1)?;
+        hidden.reshape(&shape).map(Some)
+    }
+
+    /// [`Self::forward_verify_residual`] of a verify wave's lanes `x`
+    /// `[lanes, 8, K]` and `residual` `[lanes, 8, N]`: one `_r` call over the
+    /// [`WaveRows`]; `None` when the planes do not take them.
+    pub(crate) fn forward_verify_lanes_residual(
+        &self,
+        x: &MxArray,
+        residual: &MxArray,
+    ) -> Result<Option<MxArray>> {
+        let Some(wave) = WaveRows::of(x)? else {
+            return Ok(None);
+        };
+        let x2 = wave.stack(x)?;
+        self.verify_lanes_residual_stacked(&wave, &x2, residual)
+    }
+
+    /// The `_r` call of [`Self::forward_verify_lanes_residual`] on the
+    /// stacked operand `x2` `[rows, K]`; returns `[lanes, 8, N]`.
+    fn verify_lanes_residual_stacked(
+        &self,
+        wave: &WaveRows,
+        x2: &MxArray,
+        residual: &MxArray,
+    ) -> Result<Option<MxArray>> {
+        let Some(p) = self.verify_planes_at(x2, crate::utils::gguf_planes::Kernel::Residual)?
+        else {
+            return Ok(None);
+        };
+        let n = i64::from(p.tensor.rows);
+        if residual.dtype()? != crate::array::DType::BFloat16
+            || residual.ndim()? != 3
+            || residual.shape_at(0)? != wave.lanes
+            || residual.shape_at(1)? != i64::from(crate::utils::gguf_planes::TILE_ROWS)
+            || residual.shape_at(2)? != n
+        {
+            return Ok(None);
+        }
+        let hidden = p.matmul(x2, Some(&wave.stack(residual)?), 1)?;
+        wave.unstack(&hidden).map(Some)
     }
 
     pub fn get_weight(&self) -> &MxArray {
@@ -5859,7 +6940,7 @@ mod source_mixer_fallback_tests {
                 Ok(vec![projection.forward_mixer_output(
                     &a[0],
                     None,
-                    Some(&a[1]),
+                    Some(MixerResidual::Source(&a[1])),
                 )?])
             };
             let got = crate::compiled_graph::invoke_compiled_graph(
@@ -5889,3 +6970,11 @@ mod source_mixer_fallback_tests {
 #[cfg(test)]
 #[path = "source_head_tests.rs"]
 mod source_head_tests;
+
+#[cfg(test)]
+#[path = "quantized_linear_lane_tier_tests.rs"]
+mod lane_tier_tests;
+
+#[cfg(test)]
+#[path = "quantized_linear_gguf_planes_tests.rs"]
+mod gguf_planes_tests;
