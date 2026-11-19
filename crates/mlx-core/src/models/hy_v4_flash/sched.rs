@@ -1,0 +1,1461 @@
+//! The paged mode: Hy4 on the shared continuous-batching scheduler, as Flash
+//! Next (`qwen4_exp/paged.rs`), with no `ScheduledDraftVerify`.
+//!
+//! ```text
+//! load  ─► MLX_SERVE_FORCE_SERIAL=1 or row_cap < 2 ─► flat mode (whole turn, `chat.rs`)
+//!       └► else paged mode: pool of the indexed layers + owner cells, LANES = min(lanes, row_cap)
+//! open  ─► busy period: first open = bank begin_turn + wired lease; later opens reset the seed
+//!          quota at the next safe point; last close = end_turn (promote, volatile, lease off)
+//! step  ─► safe point (promote staged copies, seed reset, readmit every READMIT_EVERY steps)
+//!       ─► wave: record rows, slot maps, `Model::wave` (Q8 fused, cores per owner), MTP lag
+//! slice ─► prefill chunks on the grid ends (C multiples + state rows); a state row of a
+//!          cold-equivalent turn registers its blocks and publishes the owner's state
+//! admit ─► live cell continues │ RAM state + cached chain resumes │ cold
+//! preempt ─► blocks back unpublished, cell dropped; the replay resumes from a stored state
+//! ```
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
+
+use napi::{Error, Result};
+
+use super::attention::PagedPool;
+use super::batch::{Core, MIN_Q8_ROWS, Owners as WaveOwners, Wave};
+use super::chat::{Inner, PREFILL_CANCELLED};
+use super::indexer::PagedIndexing;
+use super::model::{Logits, Model, Output, Want};
+use super::moe::RowKind;
+use super::mtp::{MtpLayer, lag_chunk};
+use super::owner::{CellLayer, OwnerCell, Owners};
+use super::paged::{BLOCK, PageGeometry, SlotMap, create};
+use super::prefill::{BLOCK_ROWS, Grid};
+use super::prefix_state::{Key, States, Turn};
+use super::store::{LADDER_BYTES, Store, kv_per_token, lane_floor};
+use crate::array::MxArray;
+use crate::engine::backend::{PagedBackend, PagedPrefix};
+use crate::engine::governor::governor::MemoryAccounts;
+use crate::engine::hybrid_scheduler::{
+    HybridSchedulerBackend, HybridStepExecutor, NoRestoreTicket, ScheduledStateCapacity,
+    SchedulerOwnerContext, scheduler_max_num_seqs_for,
+};
+use crate::engine::paged_epilogue::FinalTokenPolicy;
+use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
+use crate::engine::scheduler::PreemptionMode;
+use crate::stream::{Stream, StreamContext};
+use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
+
+/// Steps of one busy period between two re-admission checks.
+pub const READMIT_EVERY: u32 = 128;
+
+fn bad(msg: impl std::fmt::Display) -> Error {
+    Error::from_reason(format!("Hy4 scheduler: {msg}"))
+}
+
+fn no_pool() -> Error {
+    bad("the load runs in flat mode: no paged pool")
+}
+
+/// Whether a load runs in paged mode: not forced serial and a wave row cap
+/// that holds a padded Q8 call.
+pub fn paged_mode(serial: bool, row_cap: usize) -> bool {
+    !serial && row_cap >= MIN_Q8_ROWS as usize
+}
+
+/// Sequences the scheduler runs at once: the admitted lanes, at most the
+/// decode rows one wave holds.
+pub fn lanes(admitted: usize, row_cap: usize) -> usize {
+    admitted.min(row_cap).max(1)
+}
+
+/// `maxConcurrentSequences`: 1 under `MLX_SERVE_FORCE_SERIAL`, else the
+/// engine's cap over `lanes`.
+pub fn napi_concurrency(serial: bool, lanes: usize) -> u32 {
+    if serial {
+        1
+    } else {
+        u32::try_from(scheduler_max_num_seqs_for(lanes)).unwrap_or(u32::MAX)
+    }
+}
+
+/// Prefill slice ends of `prompt` past `cached`: the grid's chunk ends, the
+/// prompt's state rows among them; `None` when `prompt_tokens` is not the
+/// prompt's length.
+pub fn prefill_ends(
+    grid: &Grid,
+    prompt: &[u32],
+    prompt_tokens: u32,
+    cached: u32,
+) -> Option<Vec<u32>> {
+    if prompt.len() != prompt_tokens as usize {
+        return None;
+    }
+    grid.ends(cached as usize, prompt)
+        .into_iter()
+        .map(|e| u32::try_from(e).ok())
+        .collect()
+}
+
+/// Per-block extra keys of `tokens` chunked at `ends` (from row 0): block
+/// `i` carries the hash of the chunk that wrote it (its tokens, its start
+/// and end, the grid and the ends inside it), so a cached block matches
+/// only one written by the same chunk over the same tokens. Blocks of the
+/// last chunk get none. Flash Next's `pass_keys`.
+pub fn pass_keys(tokens: &[u32], ends: &[usize], grid: usize) -> Vec<Vec<u64>> {
+    let Some(&last) = ends.last() else {
+        return Vec::new();
+    };
+    let mut keys = Vec::new();
+    let mut before = 0;
+    let mut after = 0;
+    let mut memo: Option<(usize, usize, u64)> = None;
+    for block in 0.. {
+        let (low, high) = (block * BLOCK_ROWS, (block + 1) * BLOCK_ROWS);
+        while ends.get(before).is_some_and(|&end| end <= low) {
+            before += 1;
+        }
+        while ends.get(after).is_some_and(|&end| end < high) {
+            after += 1;
+        }
+        let Some(&end) = ends.get(after) else {
+            break;
+        };
+        if end == last {
+            break;
+        }
+        let start = before.checked_sub(1).map_or(0, |i| ends[i]);
+        let key = match memo {
+            Some((s, e, key)) if s == start && e == end => key,
+            _ => {
+                let mut extra = vec![grid as u64, start as u64, end as u64];
+                extra.extend(
+                    ends[before..after]
+                        .iter()
+                        .filter(|&&row| row > start && row < end)
+                        .map(|&row| row as u64),
+                );
+                let key = mlx_paged_attn::hash_tokens(&tokens[start..end], 0, &extra);
+                memo = Some((start, end, key));
+                key
+            }
+        };
+        keys.push(vec![key]);
+    }
+    keys
+}
+
+/// What a turn edge does to the busy period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Edge {
+    /// The first open turn: the period begins.
+    Begin,
+    /// A turn joined a running period.
+    Join,
+    /// The last turn closed: the period ends.
+    End,
+    None,
+}
+
+/// The turns open on the scheduler and the exclusive lane: one busy period
+/// from the first open to the last close.
+#[derive(Debug, Default)]
+pub struct Busy {
+    open: HashSet<SeqId>,
+    exclusive: bool,
+    live: bool,
+}
+
+impl Busy {
+    pub fn is_live(&self) -> bool {
+        self.live
+    }
+
+    fn join_or_begin(&mut self) -> Edge {
+        if self.live {
+            Edge::Join
+        } else {
+            self.live = true;
+            Edge::Begin
+        }
+    }
+
+    fn settle(&mut self) -> Edge {
+        if self.live && self.open.is_empty() && !self.exclusive {
+            self.live = false;
+            Edge::End
+        } else {
+            Edge::None
+        }
+    }
+
+    /// The scheduler admitted `seq`.
+    pub fn opened(&mut self, seq: SeqId) -> Edge {
+        if self.open.insert(seq) {
+            self.join_or_begin()
+        } else {
+            Edge::None
+        }
+    }
+
+    /// `seq`'s scheduled turn ended.
+    pub fn closed(&mut self, seq: SeqId) -> Edge {
+        self.open.remove(&seq);
+        self.settle()
+    }
+
+    /// A turn's cancel flag was set (`Some`) or cleared: with no scheduled
+    /// turn open, a set flag is an exclusive turn.
+    pub fn flag(&mut self, set: bool) -> Edge {
+        if !set {
+            self.exclusive = false;
+            return self.settle();
+        }
+        if self.open.is_empty() && !self.exclusive {
+            self.exclusive = true;
+            return self.join_or_begin();
+        }
+        Edge::None
+    }
+}
+
+/// What a safe point runs before the next step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Due {
+    pub seed_reset: bool,
+    pub readmit: bool,
+}
+
+/// The work due at the start of each step of a busy period: a seed reset
+/// once a turn joined, a re-admission every `every` steps.
+#[derive(Debug)]
+pub struct SafePoint {
+    seed_reset: bool,
+    steps: u32,
+    every: u32,
+}
+
+impl SafePoint {
+    pub fn new(every: u32) -> Self {
+        Self {
+            seed_reset: false,
+            steps: 0,
+            every: every.max(1),
+        }
+    }
+
+    /// A busy period began (the bank's turn start reset the seeds).
+    pub fn begun(&mut self) {
+        self.seed_reset = false;
+        self.steps = 0;
+    }
+
+    /// A turn joined the running period.
+    pub fn joined(&mut self) {
+        self.seed_reset = true;
+    }
+
+    /// The next step starts.
+    pub fn step(&mut self) -> Due {
+        self.steps = self.steps.wrapping_add(1);
+        Due {
+            seed_reset: std::mem::take(&mut self.seed_reset),
+            readmit: self.steps.is_multiple_of(self.every),
+        }
+    }
+}
+
+/// The pool operations the hooks take, so their order is testable without
+/// Metal.
+pub trait Requests {
+    /// Whether `seq` holds a request.
+    fn holds(&self, seq: SeqId) -> bool;
+    fn release(&mut self, seq: SeqId) -> Result<()>;
+    /// Registers `seq`'s full blocks below `upto` in the prefix cache.
+    fn register(&mut self, seq: SeqId, upto: usize, keys: &[Vec<u64>], salt: u64) -> Result<()>;
+}
+
+impl Requests for PagedKVCacheAdapter {
+    fn holds(&self, seq: SeqId) -> bool {
+        self.block_table_for(seq).is_some()
+    }
+
+    fn release(&mut self, seq: SeqId) -> Result<()> {
+        self.release_request_for(seq).map(|_| ()).map_err(bad)
+    }
+
+    fn register(&mut self, seq: SeqId, upto: usize, keys: &[Vec<u64>], salt: u64) -> Result<()> {
+        self.activate_request(seq).map_err(bad)?;
+        self.register_committed_blocks(upto, keys, salt)
+            .map_err(bad)
+    }
+}
+
+/// A preempted turn's blocks go back without publication: its rows past
+/// the last stored state include decode rows, which are not what a cold
+/// prefill writes.
+pub fn preempt<R: Requests>(pool: &mut R, seq: SeqId) -> Result<()> {
+    if pool.holds(seq) {
+        pool.release(seq)?;
+    }
+    Ok(())
+}
+
+/// One admitted turn's prompt and how it publishes.
+pub struct TurnPlan {
+    pub prompt: Vec<u32>,
+    pub keys: Vec<Vec<u64>>,
+    pub salt: u64,
+    /// A cold or state-resumed prefill writes what a cold prefill writes:
+    /// its state rows publish.
+    pub publish: bool,
+    pub turn: Turn,
+}
+
+/// The paged mode of a load.
+pub struct Paged {
+    pub adapter: PagedKVCacheAdapter,
+    pub owners: Owners,
+    /// The active owner's committed history.
+    pub saved: Vec<u32>,
+    pub turns: HashMap<SeqId, TurnPlan>,
+    pub states: States,
+    pub busy: Busy,
+    pub safe: SafePoint,
+    pub lanes: usize,
+    pub row_cap: usize,
+    pub published: u64,
+    pub restored: u64,
+}
+
+impl Paged {
+    /// The pool for `store`'s admitted context (one partial block per lane
+    /// on top), allocated whole at load.
+    pub fn open(store: &Store) -> Result<Self> {
+        let cfg = store.model.cfg();
+        let g = PageGeometry::of(cfg)?;
+        let lanes = lanes(store.lanes, store.row_cap);
+        let blocks = store.ctx.div_ceil(BLOCK as usize) + lanes + 1;
+        let blocks = u32::try_from(blocks).map_err(|_| bad("pool blocks exceed u32"))?;
+        let adapter = create(&g, store.ctx, blocks, blocks, u64::MAX)?;
+        Ok(Self {
+            adapter,
+            owners: Owners::new(),
+            saved: Vec::new(),
+            turns: HashMap::new(),
+            states: States::new(),
+            busy: Busy::default(),
+            safe: SafePoint::new(READMIT_EVERY),
+            lanes,
+            row_cap: store.row_cap,
+            published: 0,
+            restored: 0,
+        })
+    }
+
+    /// Bytes of the pool's blocks.
+    pub fn pool_bytes(&self) -> u64 {
+        let blocks = self
+            .adapter
+            .block_telemetry()
+            .map_or(0, |t| u64::from(t.total_blocks));
+        blocks * self.adapter.bytes_per_block().unwrap_or(0)
+    }
+
+    /// Bytes outside the pool: owner cells and RAM states.
+    pub fn state_bytes(&self) -> u64 {
+        self.owners.bytes() + self.states.held_bytes()
+    }
+
+    fn live_tokens(&self, seq: SeqId) -> &[u32] {
+        self.adapter.request_tokens_for(seq).unwrap_or(&[])
+    }
+}
+
+/// An empty owner cell, with an empty draft when the MTP layer is loaded.
+fn new_cell(store: &Store, mtp: Option<&MtpLayer>) -> Result<OwnerCell> {
+    OwnerCell::new(store.model.cfg(), mtp.map(|m| m.new_draft(store.ctx)))
+}
+
+/// One owner's rows of a step.
+pub struct Rows<'a> {
+    pub seq: SeqId,
+    pub ids: &'a [u32],
+    pub logits: Logits,
+}
+
+/// The wave's owners: their taken cells, the pool, their slot maps.
+struct PagedOwners<'a> {
+    adapter: &'a mut PagedKVCacheAdapter,
+    rows: &'a [Rows<'a>],
+    cells: &'a mut [OwnerCell],
+    starts: &'a [usize],
+    maps: &'a [SlotMap],
+}
+
+impl WaveOwners for PagedOwners<'_> {
+    fn count(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn ids(&self, owner: usize) -> &[u32] {
+        self.rows.get(owner).map_or(&[], |r| r.ids)
+    }
+
+    fn history(&self, owner: usize) -> &[u32] {
+        let (Some(r), Some(&start)) = (self.rows.get(owner), self.starts.get(owner)) else {
+            return &[];
+        };
+        let t = self.adapter.request_tokens_for(r.seq).unwrap_or(&[]);
+        &t[..start.min(t.len())]
+    }
+
+    fn want(&self, owner: usize) -> Want {
+        match (self.rows.get(owner), self.cells.get(owner)) {
+            (Some(r), Some(c)) => Want {
+                logits: r.logits,
+                hidden: c.draft().is_some(),
+            },
+            _ => Want::STATE,
+        }
+    }
+
+    fn core(&mut self, owner: usize, call: Core<'_>) -> Result<MxArray> {
+        let seq = self
+            .rows
+            .get(owner)
+            .map(|r| r.seq)
+            .ok_or_else(|| bad(format!("owner {owner} of the wave")))?;
+        let map = self
+            .maps
+            .get(owner)
+            .ok_or_else(|| bad(format!("no slot map for owner {owner}")))?;
+        let l = call.blk.layer();
+        let part = self
+            .cells
+            .get_mut(owner)
+            .and_then(|c| c.layers_mut().get_mut(l))
+            .ok_or_else(|| bad(format!("owner {owner} has no layer {l}")))?;
+        let mla = call.blk.mla();
+        match part {
+            CellLayer::Window(ring) => mla.core_sliding(&call.w.attn, call.p, call.start, ring),
+            CellLayer::Index(state) => {
+                let (Some(indexer), Some(weights)) = (call.blk.indexer(), call.w.indexer.as_ref())
+                else {
+                    return Err(bad(format!(
+                        "layer {l}: an indexed cell on a layer without one"
+                    )));
+                };
+                self.adapter.activate_request(seq).map_err(bad)?;
+                let floor = u32::try_from(call.start).map_err(|_| bad("position exceeds u32"))?;
+                let mut pool = PagedPool {
+                    adapter: &mut *self.adapter,
+                    floor,
+                    slots: map,
+                };
+                let mut ix = PagedIndexing {
+                    indexer,
+                    weights,
+                    state,
+                    kind: call.kind,
+                };
+                mla.core_indexed_paged(&call.w.attn, call.p, call.start, &mut pool, &mut ix)
+            }
+        }
+    }
+}
+
+/// One step's fixed inputs.
+struct Run<'a> {
+    model: &'a Model,
+    mtp: Option<&'a MtpLayer>,
+    kind: RowKind,
+    row_cap: usize,
+    cancel: Option<&'a dyn Fn(usize) -> bool>,
+}
+
+impl Run<'_> {
+    /// Records every owner's ids, runs the wave and the MTP rows it closes,
+    /// advances the cells. `recorded` counts the owners whose ids the pool
+    /// recorded (the caller rolls them back on error).
+    fn step(
+        &self,
+        adapter: &mut PagedKVCacheAdapter,
+        rows: &[Rows<'_>],
+        cells: &mut [OwnerCell],
+        starts: &[usize],
+        recorded: &mut usize,
+    ) -> Result<Vec<Output>> {
+        for (r, &start) in rows.iter().zip(starts) {
+            adapter.activate_request(r.seq).map_err(bad)?;
+            if adapter.request_tokens().len() != start {
+                return Err(bad(format!(
+                    "owner {}: the pool holds {} rows, its cell {start}",
+                    r.seq,
+                    adapter.request_tokens().len()
+                )));
+            }
+            adapter.record_tokens(r.ids).map_err(bad)?;
+            *recorded += 1;
+        }
+        let mut maps = Vec::with_capacity(rows.len());
+        for r in rows {
+            adapter.activate_request(r.seq).map_err(bad)?;
+            maps.push(SlotMap::of(adapter)?);
+        }
+        let spans: Vec<(usize, usize)> = rows
+            .iter()
+            .zip(starts)
+            .map(|(r, &s)| (s, r.ids.len()))
+            .collect();
+        let cap = (self.kind == RowKind::Decode).then_some(self.row_cap);
+        let wave = Wave::new(self.kind, &spans, cap)?;
+        let outs = self.model.wave(
+            &mut PagedOwners {
+                adapter: &mut *adapter,
+                rows,
+                cells: &mut *cells,
+                starts,
+                maps: &maps,
+            },
+            &wave,
+            self.cancel,
+            None,
+        )?;
+        adapter.eval_pending_pool_writes().map_err(bad)?;
+        for (cell, r) in cells.iter_mut().zip(rows) {
+            cell.advance(r.ids)?;
+        }
+        if let Some(m) = self.mtp {
+            for ((cell, r), (out, &start)) in
+                cells.iter_mut().zip(rows).zip(outs.iter().zip(starts))
+            {
+                let Some(d) = cell.draft_mut() else {
+                    continue;
+                };
+                if d.len() + 1 != start.max(1) {
+                    return Err(bad(format!(
+                        "owner {}: {} draft rows for a step at {start}",
+                        r.seq,
+                        d.len()
+                    )));
+                }
+                let h = out
+                    .hidden
+                    .as_ref()
+                    .ok_or_else(|| bad("the wave returned no hidden rows"))?;
+                lag_chunk(m, self.model, d, start, r.ids, h)?;
+            }
+        }
+        Ok(outs)
+    }
+}
+
+/// Puts every trunk part of `cell` back to `len` positions after a failed
+/// step; false when a part no longer holds them (the cell is lost).
+fn rewind(cell: &mut OwnerCell, len: usize, history: &[u32]) -> bool {
+    if cell.len() > len {
+        return cell.truncate(len, history).is_ok();
+    }
+    cell.layers_mut().iter_mut().all(|p| match p {
+        CellLayer::Window(r) if r.len() > len => r.truncate(len).is_ok(),
+        CellLayer::Index(ix) if ix.len() > len => ix.truncate(len).is_ok(),
+        _ => true,
+    })
+}
+
+/// The flag's cancel read, per layer and per chunk.
+fn cancelled(flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> bool {
+    flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
+}
+
+impl Inner {
+    pub(crate) fn paged(&self) -> Result<&Paged> {
+        self.paged.as_ref().ok_or_else(no_pool)
+    }
+
+    pub(crate) fn paged_mut(&mut self) -> Result<&mut Paged> {
+        self.paged.as_mut().ok_or_else(no_pool)
+    }
+
+    /// Runs one step over `rows` (distinct owners) with the cells out of the
+    /// table. On error every owner goes back to its start; an owner whose
+    /// cell cannot is released.
+    fn wave_rows(
+        &mut self,
+        rows: &[Rows<'_>],
+        kind: RowKind,
+        cancel: Option<&dyn Fn(usize) -> bool>,
+    ) -> Result<Vec<Output>> {
+        let mut seen = HashSet::new();
+        if rows.is_empty() || rows.iter().any(|r| !seen.insert(r.seq) || r.ids.is_empty()) {
+            return Err(bad("a step needs distinct owners, each with rows"));
+        }
+        let Inner {
+            store, mtp, paged, ..
+        } = self;
+        let p = paged.as_mut().ok_or_else(no_pool)?;
+        let was = p.owners.active();
+        let mut cells = Vec::with_capacity(rows.len());
+        for r in rows {
+            let cell = match p.owners.take(r.seq) {
+                Some(c) => c,
+                None => new_cell(store, mtp.as_ref())?,
+            };
+            cells.push(cell);
+        }
+        let starts: Vec<usize> = cells.iter().map(OwnerCell::len).collect();
+        let run = Run {
+            model: &store.model,
+            mtp: mtp.as_ref(),
+            kind,
+            row_cap: p.row_cap,
+            cancel,
+        };
+        let mut recorded = 0;
+        let out = run.step(&mut p.adapter, rows, &mut cells, &starts, &mut recorded);
+        let mut lost = Vec::new();
+        for (i, (r, mut cell)) in rows.iter().zip(cells).enumerate() {
+            if out.is_err() {
+                let n = r.ids.len() as u32;
+                let back = i >= recorded || p.adapter.rollback_last_tokens_for(r.seq, n).is_ok();
+                if !back || !rewind(&mut cell, starts[i], p.live_tokens(r.seq)) {
+                    lost.push(r.seq);
+                    continue;
+                }
+            }
+            p.owners.put(r.seq, cell)?;
+        }
+        for seq in lost {
+            tracing::warn!("hy_v4_flash: owner {seq} lost its cell in a failed step");
+            let _ = p.adapter.release_request_for(seq);
+            p.turns.remove(&seq);
+            if was == Some(seq) {
+                p.saved.clear();
+            }
+        }
+        if let Some(seq) = was
+            && p.owners.contains(seq)
+        {
+            p.owners
+                .activate(seq, || Err(bad("the active cell vanished")))?;
+            p.adapter.activate_request(seq).map_err(bad)?;
+        }
+        out
+    }
+
+    /// Bank and admission work due before the next step of a busy period.
+    fn safe_point(&mut self) {
+        let Some(p) = self.paged.as_mut() else {
+            return;
+        };
+        let due = p.safe.step();
+        let kv = p.pool_bytes() + p.state_bytes();
+        if let Err(e) = self.store.bank.safe_point(due.seed_reset) {
+            tracing::warn!("hy_v4_flash safe point: {}", e.reason);
+        }
+        if due.readmit
+            && let Err(e) = self.store.recheck(kv)
+        {
+            tracing::warn!("hy_v4_flash re-admission check: {}", e.reason);
+        }
+    }
+
+    /// Applies a busy-period edge: the lease at a begin and an end, a seed
+    /// reset at the next safe point after a join.
+    fn busy_edge(&mut self, edge: Edge) {
+        match edge {
+            Edge::Begin => {
+                if let Err(e) = self.begin() {
+                    tracing::warn!("hy_v4_flash busy period start: {}", e.reason);
+                }
+                if let Some(p) = self.paged.as_mut() {
+                    p.safe.begun();
+                }
+            }
+            Edge::Join => {
+                if let Some(p) = self.paged.as_mut() {
+                    p.safe.joined();
+                }
+            }
+            Edge::End => self.end(),
+            Edge::None => {}
+        }
+    }
+
+    /// The paged mode's cancel flag edge (`set_turn_cancel_flag`).
+    pub(crate) fn paged_flag(&mut self, set: bool) {
+        let edge = match self.paged.as_mut() {
+            Some(p) => p.busy.flag(set),
+            None => return,
+        };
+        self.busy_edge(edge);
+    }
+
+    /// Makes `seq` the active owner (a new one gets an empty cell).
+    fn activate_row(&mut self, seq: SeqId) -> Result<()> {
+        let Inner {
+            store, mtp, paged, ..
+        } = self;
+        let p = paged.as_mut().ok_or_else(no_pool)?;
+        if p.owners.active() != Some(seq) || !p.owners.contains(seq) {
+            p.owners.activate(seq, || new_cell(store, mtp.as_ref()))?;
+            p.saved = p.live_tokens(seq).to_vec();
+        }
+        Ok(())
+    }
+
+    /// `seq`'s cell replaced by an empty one.
+    fn fresh_row(&mut self, seq: SeqId) -> Result<()> {
+        let Inner {
+            store, mtp, paged, ..
+        } = self;
+        let p = paged.as_mut().ok_or_else(no_pool)?;
+        p.owners.release(seq);
+        p.owners.activate(seq, || new_cell(store, mtp.as_ref()))?;
+        Ok(())
+    }
+
+    /// Prefill of `tokens` at the end of `seq`'s cell, in chunks ending at
+    /// its turn's grid ends; the last chunk's last-row logits with
+    /// `logits`. A cancel fails with `PREFILL_CANCELLED`.
+    fn prefill_rows(
+        &mut self,
+        seq: SeqId,
+        tokens: &[u32],
+        logits: bool,
+    ) -> Result<Option<MxArray>> {
+        let (base, ends) = {
+            let p = self.paged()?;
+            let base = p.owners.get(seq).map_or(0, OwnerCell::len);
+            let stop = base + tokens.len();
+            let mut ends: Vec<usize> = match p.turns.get(&seq) {
+                Some(t) if t.prompt.len() >= stop && t.prompt[base..stop] == *tokens => self
+                    .grid
+                    .ends(base, &t.prompt)
+                    .into_iter()
+                    .filter(|&e| e < stop)
+                    .collect(),
+                _ => (1..)
+                    .map(|k| (base / self.grid.chunk() + k) * self.grid.chunk())
+                    .take_while(|&e| e < stop)
+                    .collect(),
+            };
+            ends.push(stop);
+            (base, ends)
+        };
+        let flag = self.cancel.clone();
+        let check = move |_: usize| cancelled(&flag);
+        let layer_cancel: &dyn Fn(usize) -> bool = &check;
+        let mut out = None;
+        let mut from = base;
+        for end in ends {
+            self.safe_point();
+            if cancelled(&self.cancel) {
+                return Err(Error::from_reason(PREFILL_CANCELLED));
+            }
+            let last = end == base + tokens.len();
+            let rows = [Rows {
+                seq,
+                ids: &tokens[from - base..end - base],
+                logits: if last && logits {
+                    Logits::Last
+                } else {
+                    Logits::None
+                },
+            }];
+            let outs = match self.wave_rows(&rows, RowKind::Prefill, Some(layer_cancel)) {
+                Ok(o) => o,
+                Err(_) if cancelled(&self.cancel) => {
+                    return Err(Error::from_reason(PREFILL_CANCELLED));
+                }
+                Err(e) => return Err(e),
+            };
+            self.publish_at(seq, end);
+            out = outs.into_iter().next().and_then(|o| o.logits);
+            from = end;
+        }
+        Ok(out)
+    }
+
+    /// At a prompt state row of a publishing turn: registers `seq`'s blocks
+    /// below `row` and publishes its cell there. A refusal costs reuse only.
+    fn publish_at(&mut self, seq: SeqId, row: usize) {
+        let Some(p) = self.paged.as_mut() else {
+            return;
+        };
+        let Some(plan) = p.turns.get(&seq) else {
+            return;
+        };
+        let Some(kind) = plan.publish.then(|| plan.turn.prompt_kind(row)).flatten() else {
+            return;
+        };
+        let blocks = row / BLOCK_ROWS;
+        if plan.keys.len() < blocks || plan.prompt.len() < row {
+            return;
+        }
+        let state = match p.owners.get_mut(seq).map(OwnerCell::state) {
+            Some(Ok(Some(s))) => s,
+            Some(Err(e)) => {
+                tracing::warn!("hy_v4_flash state at {row}: {}", e.reason);
+                return;
+            }
+            _ => return,
+        };
+        if let Err(e) =
+            Requests::register(&mut p.adapter, seq, row, &plan.keys[..blocks], plan.salt)
+        {
+            tracing::warn!("hy_v4_flash blocks below {row}: {}", e.reason);
+            return;
+        }
+        let key = Key {
+            tokens: &plan.prompt[..row],
+            keys: &plan.keys[..blocks],
+            salt: plan.salt,
+        };
+        match p.states.publish(key, state, kind) {
+            Ok(Some(_)) => p.published += 1,
+            Ok(None) => {}
+            Err(e) => tracing::warn!("hy_v4_flash state at {row}: {}", e.reason),
+        }
+    }
+
+    /// One decode row per owner; logits `[rows, 1, vocab]`.
+    fn decode_rows(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        let lanes = self.paged()?.lanes;
+        if rows.len() > lanes {
+            return Err(bad(format!("{} decode rows for {lanes} lanes", rows.len())));
+        }
+        self.safe_point();
+        let ids: Vec<[u32; 1]> = rows.iter().map(|&(_, t)| [t]).collect();
+        let wave: Vec<Rows<'_>> = rows
+            .iter()
+            .zip(&ids)
+            .map(|(&(seq, _), id)| Rows {
+                seq,
+                ids: id,
+                logits: Logits::Last,
+            })
+            .collect();
+        let outs = self.wave_rows(&wave, RowKind::Decode, None)?;
+        let mut logits = Vec::with_capacity(outs.len());
+        for o in outs {
+            let l = o
+                .logits
+                .ok_or_else(|| bad("a decode row returned no logits"))?;
+            let v = l.shape_at(1)?;
+            logits.push(l.reshape(&[1, 1, v])?);
+        }
+        match logits.len() {
+            1 => Ok(logits.swap_remove(0)),
+            _ => MxArray::concatenate_many(logits.iter().collect(), Some(0)),
+        }
+    }
+
+    /// Admission of `tokens` on the active owner: the live cell continues,
+    /// or a RAM state with a cached chain resumes, or the prompt is cold.
+    fn prime(&mut self, tokens: &[u32], reuse: bool, salt: u64) -> Result<Prefix> {
+        let seq = self.paged()?.owners.active().unwrap_or(0);
+        self.activate_paged_seq(seq)?;
+        let (warm, cell_len) = {
+            let p = self.paged_mut()?;
+            p.turns.remove(&seq);
+            let live = p.live_tokens(seq);
+            let cell_len = p.owners.get(seq).map_or(0, OwnerCell::len);
+            let warm = reuse
+                && cell_len > 0
+                && live.len() == cell_len
+                && tokens.len() > cell_len
+                && tokens.starts_with(live);
+            (warm, cell_len)
+        };
+        if !warm {
+            self.fresh_row(seq)?;
+            self.paged_mut()?.saved.clear();
+        }
+        let ends = self.grid.ends(0, tokens);
+        let keys = pass_keys(tokens, &ends, self.grid.chunk());
+        let Inner {
+            store,
+            mtp,
+            paged,
+            grid,
+            ..
+        } = self;
+        let p = paged.as_mut().ok_or_else(no_pool)?;
+        let hit = if reuse && !warm {
+            let adapter = &p.adapter;
+            p.states.prune(&|h| adapter.prefix_cached(h));
+            p.states.lookup(
+                Key {
+                    tokens,
+                    keys: &keys,
+                    salt,
+                },
+                &|h| adapter.prefix_cached(h),
+            )
+        } else {
+            None
+        };
+        let max_hit = hit.map_or(tokens.len().saturating_sub(1), |h| h.1);
+        let plan = p
+            .adapter
+            .prepare_turn_per_block_with_max_cache_hit_tokens(
+                seq,
+                tokens,
+                tokens.len() as u32,
+                warm,
+                &keys,
+                salt,
+                hit.is_none(),
+                u32::try_from(max_hit).unwrap_or(u32::MAX),
+            )
+            .map_err(bad)?;
+        let expected = hit.map_or(if warm { cell_len } else { 0 }, |h| h.1);
+        let cached = if plan.cached_prefix_len as usize != expected {
+            p.adapter.reset_for_new_request(seq).map_err(bad)?;
+            p.adapter
+                .allocate_suffix_blocks(tokens.len() as u32)
+                .map_err(bad)?;
+            p.owners.release(seq);
+            p.owners.activate(seq, || new_cell(store, mtp.as_ref()))?;
+            0
+        } else if let Some((id, depth)) = hit {
+            let state = p
+                .states
+                .get(id)
+                .ok_or_else(|| bad("a stored state vanished at restore"))?;
+            let draft = mtp.as_ref().map(|m| m.new_draft(store.ctx));
+            let cell = OwnerCell::from_state(store.model.cfg(), state, &tokens[..depth], draft)?;
+            p.owners.release(seq);
+            p.owners.activate(seq, || Ok(cell))?;
+            p.states.touch(id);
+            p.restored += 1;
+            depth
+        } else {
+            expected
+        };
+        p.turns.insert(
+            seq,
+            TurnPlan {
+                prompt: tokens.to_vec(),
+                keys,
+                salt,
+                publish: reuse && !warm,
+                turn: Turn::new(grid, cached, tokens),
+            },
+        );
+        Ok(Prefix {
+            cached,
+            suffix: tokens.len() - cached,
+        })
+    }
+
+    /// The active owner's turn is over: its plan goes.
+    fn close_turn(&mut self) {
+        if let Some(p) = self.paged.as_mut()
+            && let Some(seq) = p.owners.active()
+        {
+            p.turns.remove(&seq);
+        }
+    }
+
+    /// The active owner: an empty cell, no history, its request released.
+    fn drop_active(&mut self) {
+        let Some(seq) = self.paged.as_ref().and_then(|p| p.owners.active()) else {
+            return;
+        };
+        if let Some(p) = self.paged.as_mut() {
+            let _ = p.adapter.release_request_for(seq);
+            p.turns.remove(&seq);
+            p.saved.clear();
+        }
+        if let Err(e) = self.fresh_row(seq) {
+            tracing::warn!("hy_v4_flash owner {seq}: {}", e.reason);
+        }
+    }
+
+    /// `reset_caches` in paged mode: a command drops every owner, state and
+    /// cached block; a prefix miss drops the active owner's history.
+    pub(crate) fn paged_reset(&mut self, command: bool) -> Result<()> {
+        if !command {
+            let Some(p) = self.paged.as_mut() else {
+                return Ok(());
+            };
+            p.saved.clear();
+            if let Some(seq) = p.owners.active() {
+                p.turns.remove(&seq);
+                self.fresh_row(seq)?;
+            }
+            return Ok(());
+        }
+        let p = self.paged_mut()?;
+        for seq in p.adapter.live_seq_ids() {
+            p.adapter.release_request_for(seq).map_err(bad)?;
+        }
+        p.owners.clear();
+        p.states.clear();
+        p.turns.clear();
+        p.saved.clear();
+        p.adapter
+            .release_request_and_purge_prefix_cache()
+            .map_err(bad)?;
+        Ok(())
+    }
+
+    /// `verify_cache_prefix` in paged mode: the saved history when the
+    /// active owner still holds exactly it and the prompt extends it.
+    pub(crate) fn paged_verify(&self, tokens: &[u32], reuse: bool) -> usize {
+        let Some(p) = self.paged.as_ref() else {
+            return 0;
+        };
+        let h = &p.saved;
+        let live = p.owners.active().map_or(&[][..], |s| p.live_tokens(s));
+        if reuse
+            && !h.is_empty()
+            && live == h.as_slice()
+            && tokens.len() > h.len()
+            && tokens.starts_with(h)
+        {
+            h.len()
+        } else {
+            0
+        }
+    }
+
+    /// An exclusive turn's owner, refused when every lane holds another.
+    fn activate_exclusive_seq(&mut self, seq: SeqId) -> Result<()> {
+        let p = self.paged()?;
+        if !p.owners.contains(seq) && p.owners.len() >= p.lanes {
+            return Err(bad(
+                "every lane holds an owner; releaseCacheOwner or resetCaches before adding another session",
+            ));
+        }
+        self.activate_paged_seq(seq)
+    }
+
+    /// Mode-independent bytes of the sequences' caches.
+    pub(crate) fn paged_kv_bytes(&self) -> Option<u64> {
+        self.paged
+            .as_ref()
+            .map(|p| p.pool_bytes() + p.state_bytes())
+    }
+
+    /// Bytes outside the pool the admission charged for: every lane's floor,
+    /// the RAM states, and the MTP rows of the admitted context.
+    fn state_budget(&self) -> u64 {
+        let cfg = self.store.model.cfg();
+        let mtp = self.mtp.is_some();
+        let lanes = self.paged.as_ref().map_or(1, |p| p.lanes) as u64;
+        let mtp_row = kv_per_token(cfg, mtp).saturating_sub(kv_per_token(cfg, false));
+        lanes * lane_floor(cfg, mtp) + LADDER_BYTES + mtp_row * self.store.ctx as u64
+    }
+
+    /// MTP rows `tokens` adds to a sequence.
+    fn draft_bytes(&self, tokens: u64) -> u64 {
+        let cfg = self.store.model.cfg();
+        let mtp = self.mtp.is_some();
+        kv_per_token(cfg, mtp).saturating_sub(kv_per_token(cfg, false)) * tokens
+    }
+}
+
+pub struct Prefix {
+    pub cached: usize,
+    pub suffix: usize,
+}
+
+impl PagedPrefix for Prefix {
+    fn effective_cached_prefix_len(&self) -> usize {
+        self.cached
+    }
+
+    fn suffix_len(&self) -> usize {
+        self.suffix
+    }
+}
+
+/// The exclusive lane's decode step of the active owner.
+pub(crate) struct PagedStep<'a>(&'a mut Inner);
+
+impl PagedStepModel for PagedStep<'_> {
+    const EVAL: EvalPolicy = EvalPolicy::AsyncTokenAndForcedLogits;
+    /// The cells hold only forwarded rows: a replayed step would desync the
+    /// history `save_paged_history` publishes.
+    const FINAL_TOKEN_POLICY: FinalTokenPolicy = FinalTokenPolicy::AlwaysDrop;
+
+    fn paged_step(&mut self, token: u32) -> Result<MxArray> {
+        let seq = self
+            .0
+            .paged()?
+            .owners
+            .active()
+            .ok_or_else(|| bad("a decode step without an active owner"))?;
+        self.0.decode_rows(&[(seq, token)])
+    }
+}
+
+impl PagedBackend for Inner {
+    type PagedDecode<'a> = PagedStepper<PagedStep<'a>>;
+    type PrefixState = Prefix;
+
+    fn prime_prefix_state(
+        &mut self,
+        tokens: &[u32],
+        reuse: bool,
+        _: usize,
+        _: &[u64],
+        salt: u64,
+    ) -> Result<Prefix> {
+        self.prime(tokens, reuse, salt)
+    }
+
+    fn paged_prefill(&mut self, tokens: &[u32], _: &Prefix, stream: Stream) -> Result<MxArray> {
+        let _ctx = StreamContext::new(stream);
+        let seq = self
+            .paged()?
+            .owners
+            .active()
+            .ok_or_else(|| bad("a prefill without an active owner"))?;
+        self.prefill_rows(seq, tokens, true)?
+            .ok_or_else(|| bad("the prefill returned no logits"))
+    }
+
+    fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
+        Ok(PagedStepper(PagedStep(self)))
+    }
+
+    /// The owner stays live without publishing its blocks: rows a decode
+    /// wrote are not what a cold prefill writes. States published during
+    /// the prefill stay.
+    fn finalize_paged_turn(&mut self, reuse: bool, _: u64) {
+        self.close_turn();
+        let Some(p) = self.paged.as_mut() else {
+            return;
+        };
+        let kept = if reuse {
+            p.adapter.finalize_turn_keep_live_no_prefix()
+        } else {
+            p.adapter.release_request().map(|_| ())
+        };
+        if kept.is_err() {
+            self.drop_active();
+        }
+    }
+
+    fn save_paged_history(&mut self, _: &[u32], _: &[u32], _: bool, reuse: bool) -> Result<()> {
+        if reuse {
+            let p = self.paged_mut()?;
+            p.saved = p.adapter.request_tokens().to_vec();
+        } else {
+            self.drop_active();
+        }
+        Ok(())
+    }
+
+    fn abort_paged_turn(&mut self) {
+        self.drop_active();
+    }
+}
+
+impl HybridSchedulerBackend for Inner {
+    type FamilyCommand = std::convert::Infallible;
+    type RestoreTicket = NoRestoreTicket;
+    type OwnerState = Vec<u32>;
+    type StepExecutor<'a> = HybridStepExecutor<'a, Self>;
+    const SCHEDULER_NAME: &'static str = "hy_v4_flash";
+
+    fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter> {
+        self.paged.as_ref().map(|p| &p.adapter)
+    }
+
+    fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter> {
+        self.paged.as_mut().map(|p| &mut p.adapter)
+    }
+
+    fn ownerless_session_in_owner_tables(&self) -> bool {
+        true
+    }
+
+    fn scheduler_capacity(&self) -> usize {
+        self.paged.as_ref().map_or(1, |p| p.lanes)
+    }
+
+    fn scheduled_turn_opened(&mut self, seq: SeqId) {
+        let edge = match self.paged.as_mut() {
+            Some(p) => p.busy.opened(seq),
+            None => return,
+        };
+        self.busy_edge(edge);
+    }
+
+    fn scheduled_turn_closed(&mut self, seq: SeqId) {
+        let edge = match self.paged.as_mut() {
+            Some(p) => {
+                p.turns.remove(&seq);
+                p.busy.closed(seq)
+            }
+            None => return,
+        };
+        self.busy_edge(edge);
+    }
+
+    fn scheduler_prefill_slice_tokens(&self) -> u32 {
+        u32::try_from(self.grid.chunk()).unwrap_or(u32::MAX)
+    }
+
+    /// A turn's slices end where a cold prefill of its prompt cuts.
+    fn scheduler_prefill_ends(
+        &self,
+        seq: SeqId,
+        prompt_tokens: u32,
+        cached_prefix: u32,
+    ) -> Option<Vec<u32>> {
+        let plan = self.paged.as_ref()?.turns.get(&seq)?;
+        prefill_ends(&self.grid, &plan.prompt, prompt_tokens, cached_prefix)
+    }
+
+    fn scheduler_books_on_demand(&self) -> bool {
+        true
+    }
+
+    fn planned_turn_window(&self, _speculative: bool) -> Option<u32> {
+        self.paged
+            .as_ref()
+            .and_then(|_| u32::try_from(self.store.ctx).ok())
+    }
+
+    fn max_position_embeddings(&self) -> i32 {
+        i32::try_from(self.store.ctx).unwrap_or(i32::MAX)
+    }
+
+    fn memory_accounts(&self) -> Option<MemoryAccounts> {
+        let p = self.paged.as_ref()?;
+        Some(MemoryAccounts {
+            kv: p.pool_bytes(),
+            states: p.state_bytes(),
+            embeddings: 0,
+        })
+    }
+
+    fn scheduled_state_capacity(&self) -> Option<ScheduledStateCapacity> {
+        let p = self.paged.as_ref()?;
+        Some(ScheduledStateCapacity {
+            budget: self.state_budget(),
+            held: p.state_bytes(),
+        })
+    }
+
+    /// The RAM states go first: owner cells outrank them.
+    fn reclaim_for_scheduled_state(&mut self, _shortfall: u64) -> bool {
+        let Some(p) = self.paged.as_mut() else {
+            return false;
+        };
+        if p.states.held_bytes() == 0 {
+            return false;
+        }
+        p.states.clear();
+        true
+    }
+
+    fn scheduled_state_candidate_bytes(&self, seq: SeqId, tokens: u32, _: bool) -> u64 {
+        let Some(p) = self.paged.as_ref() else {
+            return 0;
+        };
+        let cfg = self.store.model.cfg();
+        let held = p.owners.get(seq).map_or(0, OwnerCell::len) as u64;
+        let floor = if p.owners.contains(seq) {
+            0
+        } else {
+            lane_floor(cfg, self.mtp.is_some())
+        };
+        floor + self.draft_bytes(u64::from(tokens).saturating_sub(held))
+    }
+
+    fn scheduled_state_held_bytes(&self, seq: SeqId) -> u64 {
+        self.paged.as_ref().map_or(0, |p| p.owners.held_bytes(seq))
+    }
+
+    fn has_scheduled_recurrent(&self, seq: SeqId) -> bool {
+        self.paged.as_ref().is_some_and(|p| p.owners.contains(seq))
+    }
+
+    fn activate_scheduled_recurrent(&mut self, seq: SeqId) -> Result<()> {
+        self.activate_row(seq)
+    }
+
+    fn activate_paged_seq(&mut self, seq: SeqId) -> Result<()> {
+        self.activate_row(seq)?;
+        let p = self.paged_mut()?;
+        if p.adapter.block_table_for(seq).is_some() {
+            p.adapter.activate_request(seq)
+        } else {
+            p.adapter.begin_request(seq)
+        }
+        .map_err(bad)
+    }
+
+    fn park_active_scheduled_recurrent(&mut self) -> Result<()> {
+        if let Some(p) = self.paged.as_mut() {
+            p.owners.park();
+        }
+        Ok(())
+    }
+
+    fn preempt_scheduled_cache(&mut self, seq: SeqId, _: u64, _: PreemptionMode) -> Result<()> {
+        let p = self.paged_mut()?;
+        p.turns.remove(&seq);
+        preempt(&mut p.adapter, seq)
+    }
+
+    fn release_scheduled_recurrent_for(&mut self, seq: SeqId) {
+        let Some(p) = self.paged.as_mut() else {
+            return;
+        };
+        p.turns.remove(&seq);
+        if p.owners.active() == Some(seq) {
+            p.saved.clear();
+        }
+        p.owners.release(seq);
+    }
+
+    fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        self.decode_rows(rows)
+    }
+
+    fn run_scheduled_prefill_slice(
+        &mut self,
+        seq: SeqId,
+        source: &[u32],
+        _: &Prefix,
+        start: usize,
+        end: usize,
+        stream: Stream,
+        _: bool,
+    ) -> Result<Option<MxArray>> {
+        self.activate_paged_seq(seq)?;
+        let held = self.paged()?.owners.get(seq).map_or(0, OwnerCell::len);
+        if held != start || end > source.len() || start >= end {
+            return Err(bad(format!(
+                "slice {start}..{end} of {} on a cell of {held}",
+                source.len()
+            )));
+        }
+        let _ctx = StreamContext::new(stream);
+        self.prefill_rows(seq, &source[start..end], end == source.len())
+    }
+
+    fn replace_cached_token_history(&mut self, history: Vec<u32>) {
+        if let Some(p) = self.paged.as_mut() {
+            p.saved = history;
+        }
+    }
+
+    fn install_owner_state(&mut self, seq: SeqId, state: &Vec<u32>) {
+        let _ = self.activate_row(seq);
+        self.replace_cached_token_history(state.clone());
+    }
+
+    fn owner_tokens(state: &Vec<u32>) -> &[u32] {
+        state
+    }
+
+    fn capture_owner_state(&mut self, _: SeqId) -> Vec<u32> {
+        self.paged
+            .as_ref()
+            .map_or_else(Vec::new, |p| p.saved.clone())
+    }
+
+    fn build_scheduled_prefix(
+        &self,
+        _: &Prefix,
+        cached: usize,
+        suffix: usize,
+        _: Vec<u32>,
+        _: bool,
+    ) -> Prefix {
+        Prefix { cached, suffix }
+    }
+
+    /// A whole turn on its owner's cell, landing in the owner tables as a
+    /// scheduled one does (Flash Next).
+    fn execute_chat_barrier(
+        &mut self,
+        command: crate::engine::cmd::ChatCmd,
+        owners: SchedulerOwnerContext<'_, Vec<u32>>,
+    ) {
+        use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
+        let owner = match &command {
+            ChatCmd::SessionStart { config, .. }
+            | ChatCmd::SessionContinue { config, .. }
+            | ChatCmd::SessionContinueTool { config, .. }
+            | ChatCmd::StreamSessionStart { config, .. }
+            | ChatCmd::StreamSessionContinue { config, .. }
+            | ChatCmd::StreamSessionContinueTool { config, .. } => {
+                Some(config.cache_owner_id.clone().unwrap_or_default())
+            }
+            _ => None,
+        };
+        let Some(owner) = owner else {
+            handle_chat_cmd(self, command);
+            return;
+        };
+        let seq = *owners
+            .owner_sequences
+            .entry(owner.clone())
+            .or_insert_with(|| {
+                let seq = *owners.next_seq_id;
+                *owners.next_seq_id += 1;
+                seq
+            });
+        if let Err(error) = self.activate_exclusive_seq(seq) {
+            match command {
+                ChatCmd::SessionStart { reply, .. }
+                | ChatCmd::SessionContinue { reply, .. }
+                | ChatCmd::SessionContinueTool { reply, .. } => {
+                    let _ = reply.send(Err(error));
+                }
+                ChatCmd::StreamSessionStart { stream_tx, .. }
+                | ChatCmd::StreamSessionContinue { stream_tx, .. }
+                | ChatCmd::StreamSessionContinueTool { stream_tx, .. } => {
+                    crate::engine::backend::ChunkSink::send(&stream_tx, Err(error));
+                }
+                _ => {}
+            }
+            owners.owner_sequences.remove(&owner);
+            owners.owner_states.remove(&owner);
+            return;
+        }
+        handle_chat_cmd(self, command);
+        let saved = self
+            .paged
+            .as_ref()
+            .map(|p| p.saved.clone())
+            .unwrap_or_default();
+        if saved.is_empty() {
+            // A turn that failed before the paged abort, or ran without
+            // reuse, has no frontier and holds no owner slot.
+            if let Some(p) = self.paged.as_mut() {
+                let _ = p.adapter.release_request_for(seq);
+            }
+            self.release_scheduled_recurrent_for(seq);
+            owners.owner_sequences.remove(&owner);
+            owners.owner_states.remove(&owner);
+        } else {
+            owners.owner_states.insert(owner, saved);
+            if let Some(p) = self.paged.as_mut() {
+                p.owners.park();
+            }
+        }
+    }
+
+    fn step_executor(&mut self) -> Self::StepExecutor<'_> {
+        HybridStepExecutor::new(self)
+    }
+}
+
+/// Loads in paged mode get their pool.
+pub(crate) fn attach(inner: &mut Inner, serial: bool) -> Result<()> {
+    if paged_mode(serial, inner.store.row_cap) {
+        inner.paged = Some(Paged::open(&inner.store)?);
+    }
+    Ok(())
+}

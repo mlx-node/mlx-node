@@ -901,7 +901,7 @@ impl Lagged {
 
 /// The MTP rows a prefill chunk of `ids` at `start` closes, from the
 /// chunk's trunk outputs `h [n, d]`; the chunk's last rows become seeds.
-fn lag_chunk(
+pub fn lag_chunk(
     m: &MtpLayer,
     model: &Model,
     d: &mut Draft,

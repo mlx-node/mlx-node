@@ -647,7 +647,9 @@ export declare class HarrierModel {
 
 /**
  * Hy4-flash (GGUF `hy_v4_flash`) with SSD-streamed routed experts:
- * text-only chat, one sequence at a time, on one owned model thread.
+ * text-only chat on one owned model thread. Sequences of different cache
+ * owners run together on the shared scheduler over a paged pool, unless
+ * `MLX_SERVE_FORCE_SERIAL=1` at load keeps one whole turn at a time.
  */
 export declare class HyV4FlashModel {
   /**
@@ -661,7 +663,12 @@ export declare class HyV4FlashModel {
    */
   dispose(): Promise<void>;
   contextLimits(): HyV4FlashContextLimits;
+  /**
+   * 1 under `MLX_SERVE_FORCE_SERIAL` (read per call) or in flat mode,
+   * else the scheduler's lanes.
+   */
   maxConcurrentSequences(): number;
+  /** Whether the load runs in paged mode (fixed at load). */
   hasBlockPagedCache(): boolean;
   /** Prompt and generated ids of the last completed turn, if any. */
   lastTurnTokenIds(): HyV4FlashTurnTokenIds | null;

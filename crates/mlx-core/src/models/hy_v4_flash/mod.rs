@@ -26,6 +26,7 @@ pub mod prefill;
 pub mod prefix_state;
 pub mod rows;
 pub mod scan;
+pub mod sched;
 pub mod sparse;
 pub mod spec;
 pub mod stats;
@@ -54,6 +55,8 @@ mod tests_prefill;
 mod tests_prefix_state;
 #[cfg(test)]
 mod tests_rows;
+#[cfg(test)]
+mod tests_sched;
 #[cfg(test)]
 mod tests_weights;
 

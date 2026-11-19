@@ -882,6 +882,20 @@ impl KqBank {
             return Ok(());
         }
         crate::array::synchronize();
+        self.promote(&mut g)?;
+        g.in_turn = false;
+        for p in g.classes.iter().flat_map(|c| &c.proj) {
+            for b in p.banks() {
+                b.set_purgeable(PurgeableState::Volatile)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Staging copies served since the last promote move into cache slots
+    /// (the GPU is drained). The copies made.
+    fn promote(&self, g: &mut Inner) -> Result<usize> {
+        let mut total_moved = 0;
         for (ci, c) in g.classes.iter_mut().enumerate() {
             let t0 = Instant::now();
             c.dir.complete_all();
@@ -895,14 +909,28 @@ impl KqBank {
                 st[ci].promoted += moved.len();
                 st[ci].promote_ns += t0.elapsed().as_nanos() as u64;
             }
+            total_moved += moved.len();
         }
-        g.in_turn = false;
-        for p in g.classes.iter().flat_map(|c| &c.proj) {
-            for b in p.banks() {
-                b.set_purgeable(PurgeableState::Volatile)?;
+        Ok(total_moved)
+    }
+
+    /// Between two steps of one busy period, after every step so far was
+    /// evaluated: the staging copies served so far move into cache slots as
+    /// at a turn end, then with `seed_reset` the seed quota starts over as
+    /// at a turn start. The banks stay non-volatile. The copies made.
+    pub fn safe_point(&self, seed_reset: bool) -> Result<usize> {
+        let mut g = lock(&self.inner);
+        if !g.in_turn {
+            return Ok(0);
+        }
+        crate::array::synchronize();
+        let moved = self.promote(&mut g)?;
+        if seed_reset {
+            for c in &mut g.classes {
+                c.dir.new_turn();
             }
         }
-        Ok(())
+        Ok(moved)
     }
 
     /// Drops the banks and allocates new ones with `staging` staging layers

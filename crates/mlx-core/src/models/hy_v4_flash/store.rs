@@ -69,7 +69,7 @@ const CHUNK_ALIGN: usize = 256;
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 /// RAM ladder entries (window clones and tails).
-const LADDER_BYTES: u64 = 150 * MIB;
+pub const LADDER_BYTES: u64 = 150 * MIB;
 /// Gathered keys of the sparse attention core.
 const SPARSE_BYTES: u64 = GIB;
 /// Indexer score sub-chunks.
@@ -695,6 +695,45 @@ impl Lease {
         Ok(())
     }
 
+    /// Inside a turn (between two evaluated steps): the turn start's
+    /// re-admission again, for a host that changed since. A changed
+    /// admission switches the bank and the wired lease. `true` when it
+    /// switched; `false` outside a turn or without an admission.
+    pub fn recheck(&self, bank: &KqBank, dense: u64, kv: u64) -> Result<bool> {
+        let mut t = self.turn();
+        let (Some(limits), Some(cur)) = (&self.limits, t.admission) else {
+            return Ok(false);
+        };
+        if t.wired.is_none() {
+            return Ok(false);
+        }
+        let (h, ws) = host_reading()?;
+        let o = own(bank, dense, kv)?;
+        let next = match readmit_with(
+            &self.profile,
+            &cur,
+            &self.size,
+            self.rows,
+            limits,
+            &h,
+            &o,
+            ws,
+        )? {
+            Turn::Keep if !t.lost => return Ok(false),
+            Turn::Keep => cur,
+            Turn::StagingOnly(a) | Turn::Rebuild(a) => a,
+        };
+        crate::array::synchronize();
+        self.switch(&mut t, bank, &next)?;
+        tracing::info!("hy_v4_flash re-admission inside a turn: {next}");
+        t.admission = Some(next);
+        t.wired = Some(WiredLimitContext::bounded(
+            usize::try_from(next.wired_limit()).unwrap_or(usize::MAX),
+            Vec::new(),
+        ));
+        Ok(true)
+    }
+
     /// Turn end (after the turn's last eval): release the wired lease, make
     /// the bank volatile.
     pub fn end_turn(&self, bank: &KqBank) -> Result<()> {
@@ -894,6 +933,11 @@ impl Store {
 
     pub fn end_turn(&self) -> Result<()> {
         self.lease.end_turn(&self.bank)
+    }
+
+    /// `kv`: bytes of every live session (`Session::nbytes`).
+    pub fn recheck(&self, kv: u64) -> Result<bool> {
+        self.lease.recheck(&self.bank, self.dense_bytes, kv)
     }
 }
 

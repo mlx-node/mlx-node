@@ -1,4 +1,7 @@
-//! Chat backend: one flat whole-turn sequence on its own model thread.
+//! Chat backend on one model thread, in one of two modes fixed at load:
+//! flat (`MLX_SERVE_FORCE_SERIAL=1`, or no wave row cap): one whole-turn
+//! sequence, as below; paged: the shared scheduler over owner cells and the
+//! paged pool (`sched.rs`).
 //!
 //! ```text
 //! verify  ─► Conv::verify: longest reusable prefix (sequence cut │ ladder entry) ─► plan
@@ -28,6 +31,7 @@ use super::finalize::{self, Hy4Tags};
 use super::ladder::{Kind, Ladder};
 use super::mtp::{LagRunner, Lagged, MtpLayer};
 use super::prefill::{Driver, Grid, Plan, Prefilled, Runner, Seq};
+use super::sched::{self, Paged};
 use super::spec;
 use super::stats::{self, Counters, Line};
 use super::store::{Options, Store};
@@ -36,12 +40,13 @@ use crate::engine::backend::{
     ChatBackend, DecodeStep, FinalizeArgs, MtpBackend, MtpTurnSetup, ResetScope, SaveStateArgs,
     TurnOutput, TurnSetup, WholeTurnArgs,
 };
+use crate::engine::hybrid_scheduler::HybridSchedulerState;
 use crate::engine::model_command::{ModelCommand, handle_model_command};
 use crate::engine::params::{
     ChatParams, ModelGenerationDefaults, ThinkingPolicy, apply_generation_defaults,
     extract_chat_params,
 };
-use crate::engine::plan::ExecutionPlan;
+use crate::engine::plan::{ExecutionPlan, PagedAttentionPlan};
 use crate::engine::types::{ChatConfig, ChatResult};
 use crate::model_thread::{LoopControl, ModelThread};
 use crate::models::deepseek_v41::chat::{gguf_tokenizer, shard_paths};
@@ -294,29 +299,43 @@ struct TurnStats {
 
 pub(crate) struct Inner {
     pub(crate) store: Store,
-    mtp: Option<MtpLayer>,
+    pub(super) mtp: Option<MtpLayer>,
     conv: Conv<Lagged>,
-    grid: Grid,
+    pub(super) grid: Grid,
     tokenizer: Arc<Qwen3Tokenizer>,
     tags: Hy4Tags,
     defaults: ModelGenerationDefaults,
-    cancel: Option<Arc<AtomicBool>>,
+    pub(super) cancel: Option<Arc<AtomicBool>>,
     in_turn: bool,
     residency: Arc<Mutex<Residency>>,
     turn_stats: Option<TurnStats>,
+    /// The paged mode's pool and owners; `None` in flat mode.
+    pub(super) paged: Option<Paged>,
 }
 
 impl Inner {
-    /// Every shard of `path`, the admission from the environment, one lane.
+    /// Every shard of `path`, the admission from the environment, flat mode.
+    #[cfg(test)]
     pub(crate) fn load(
         path: &Path,
         max_context: Option<usize>,
         residency: Arc<Mutex<Residency>>,
     ) -> Result<Self> {
+        Self::open(path, max_context, residency, true)
+    }
+
+    /// `load` in flat mode with `serial`, else in paged mode when the wave
+    /// row cap holds a padded Q8 call.
+    pub(crate) fn open(
+        path: &Path,
+        max_context: Option<usize>,
+        residency: Arc<Mutex<Residency>>,
+        serial: bool,
+    ) -> Result<Self> {
         let paths = shard_paths(path)?;
         let (tokenizer, eos) = gguf_tokenizer(&paths[0])?;
         check_eos(eos)?;
-        let mut store = Store::open(&paths, &Options::from_env(max_context, true)?)?;
+        let mut store = Store::open(&paths, &Options::from_env(max_context, serial)?)?;
         let mtp = if store.mtp {
             let m = MtpLayer::load(&paths, &store.model)?;
             store.dense_bytes += m.bytes();
@@ -324,7 +343,9 @@ impl Inner {
         } else {
             None
         };
-        Self::new(store, mtp, tokenizer, residency)
+        let mut inner = Self::new(store, mtp, tokenizer, residency)?;
+        sched::attach(&mut inner, serial)?;
+        Ok(inner)
     }
 
     pub(crate) fn new(
@@ -348,6 +369,7 @@ impl Inner {
             in_turn: false,
             residency,
             turn_stats: None,
+            paged: None,
         };
         inner.publish(None);
         Ok(inner)
@@ -385,16 +407,22 @@ impl Inner {
         }
     }
 
-    fn begin(&mut self) -> Result<()> {
+    /// Bytes of every live sequence's cache.
+    fn kv_bytes(&self) -> u64 {
+        self.paged_kv_bytes()
+            .unwrap_or_else(|| self.conv.seq().nbytes() as u64)
+    }
+
+    pub(super) fn begin(&mut self) -> Result<()> {
         if !self.in_turn {
-            self.store.begin_turn(self.conv.seq().nbytes() as u64)?;
+            self.store.begin_turn(self.kv_bytes())?;
             self.in_turn = true;
             self.publish(None);
         }
         Ok(())
     }
 
-    fn end(&mut self) {
+    pub(super) fn end(&mut self) {
         if !self.in_turn {
             return;
         }
@@ -522,7 +550,10 @@ impl ChatBackend for Inner {
     }
 
     fn cached_token_history(&self) -> &[u32] {
-        self.conv.history()
+        match &self.paged {
+            Some(p) => &p.saved,
+            None => self.conv.history(),
+        }
     }
 
     fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
@@ -530,6 +561,9 @@ impl ChatBackend for Inner {
     }
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
+        if self.paged.is_some() {
+            return self.paged_reset(matches!(scope, ResetScope::Command));
+        }
         if let Err(e) = self.conv.reset(scope) {
             self.fresh(&e);
         }
@@ -539,6 +573,9 @@ impl ChatBackend for Inner {
     /// The longest prefix the sequence or a ladder entry still holds, below
     /// the prompt's end; the prefill takes the plan made here.
     fn verify_cache_prefix(&self, tokens: &[u32], reuse: bool) -> usize {
+        if self.paged.is_some() {
+            return self.paged_verify(tokens, reuse);
+        }
         let runner = LagRunner {
             model: &self.store.model,
             mtp: self.mtp.as_ref(),
@@ -549,6 +586,9 @@ impl ChatBackend for Inner {
     fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
         self.residency().turn_ids =
             Some((args.save_tokens.to_vec(), args.generated_tokens.to_vec()));
+        if self.paged.is_some() {
+            return;
+        }
         let saved = self
             .conv
             .seq_mut()
@@ -576,6 +616,11 @@ impl ChatBackend for Inner {
 
     fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
         let ending = flag.is_none();
+        if self.paged.is_some() {
+            self.cancel = flag;
+            self.paged_flag(!ending);
+            return;
+        }
         self.cancel = flag;
         if ending {
             self.end();
@@ -621,10 +666,22 @@ impl ChatBackend for Inner {
     }
 
     fn execution_plan(&self) -> ExecutionPlan {
+        if self.paged.is_some() {
+            return ExecutionPlan {
+                paged_attention: Some(PagedAttentionPlan {
+                    supports_delta: true,
+                }),
+                ..ExecutionPlan::TEXT_ONLY
+            };
+        }
         ExecutionPlan {
             speculative: self.mtp.as_ref().map(|_| spec::PLAN),
             ..ExecutionPlan::TEXT_ONLY
         }
+    }
+
+    fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        crate::engine::paged_turn::run_paged_turn(self, args)
     }
 
     fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
@@ -706,14 +763,25 @@ pub struct HyV4FlashResidencyInfo {
     pub in_turn: bool,
 }
 
+/// The model thread's state: the flat whole-turn backend or the shared
+/// scheduler over the paged mode.
+enum Engine {
+    Flat(Box<Inner>),
+    Paged(Box<HybridSchedulerState<Inner>>),
+}
+
 /// Hy4-flash (GGUF `hy_v4_flash`) with SSD-streamed routed experts:
-/// text-only chat, one sequence at a time, on one owned model thread.
+/// text-only chat on one owned model thread. Sequences of different cache
+/// owners run together on the shared scheduler over a paged pool, unless
+/// `MLX_SERVE_FORCE_SERIAL=1` at load keeps one whole turn at a time.
 #[napi]
 pub struct HyV4FlashModel {
     thread: ModelThread<ModelCommand>,
     limits: HyV4FlashContextLimits,
     dense_bytes: u64,
     residency: Arc<Mutex<Residency>>,
+    paged: bool,
+    lanes: usize,
 }
 
 #[napi]
@@ -728,9 +796,10 @@ impl HyV4FlashModel {
                 .map(|t| t as usize);
         let residency = Arc::new(Mutex::new(Residency::default()));
         let shared = Arc::clone(&residency);
+        let serial = HybridSchedulerState::<Inner>::force_serial();
         let (thread, ready) = ModelThread::spawn_with_scheduler(
             move || {
-                let inner = Inner::load(Path::new(&model_path), max_context, shared)?;
+                let inner = Inner::open(Path::new(&model_path), max_context, shared, serial)?;
                 let s = &inner.store;
                 let limits = HyV4FlashContextLimits {
                     effective_window_tokens: u32::try_from(s.ctx).unwrap_or(u32::MAX),
@@ -739,17 +808,25 @@ impl HyV4FlashModel {
                     prefill_chunk_tokens: u32::try_from(s.chunk).unwrap_or(u32::MAX),
                 };
                 let dense = s.dense_bytes;
-                Ok((inner, (limits, dense)))
+                let lanes = inner.paged.as_ref().map(|p| p.lanes);
+                let engine = match lanes {
+                    Some(_) => Engine::Paged(Box::new(HybridSchedulerState::new(inner)?)),
+                    None => Engine::Flat(Box::new(inner)),
+                };
+                Ok((engine, (limits, dense, lanes)))
             },
-            |inner: &mut Inner, rx| match rx.blocking_recv() {
-                Some(cmd) => {
-                    handle_model_command(inner, cmd);
-                    LoopControl::Continue
-                }
-                None => LoopControl::Break,
+            |engine: &mut Engine, rx| match engine {
+                Engine::Paged(state) => state.drive(rx),
+                Engine::Flat(inner) => match rx.blocking_recv() {
+                    Some(cmd) => {
+                        handle_model_command(&mut **inner, cmd);
+                        LoopControl::Continue
+                    }
+                    None => LoopControl::Break,
+                },
             },
         );
-        let (limits, dense) = ready
+        let (limits, dense, lanes) = ready
             .await
             .map_err(|e| Error::from_reason(e.to_string()))??;
         Ok(Self {
@@ -757,6 +834,8 @@ impl HyV4FlashModel {
             limits,
             dense_bytes: dense,
             residency,
+            paged: lanes.is_some(),
+            lanes: lanes.unwrap_or(1),
         })
     }
 
@@ -772,14 +851,17 @@ impl HyV4FlashModel {
         self.limits.clone()
     }
 
+    /// 1 under `MLX_SERVE_FORCE_SERIAL` (read per call) or in flat mode,
+    /// else the scheduler's lanes.
     #[napi]
     pub fn max_concurrent_sequences(&self) -> u32 {
-        1
+        sched::napi_concurrency(HybridSchedulerState::<Inner>::force_serial(), self.lanes)
     }
 
+    /// Whether the load runs in paged mode (fixed at load).
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
-        false
+        self.paged
     }
 
     /// Prompt and generated ids of the last completed turn, if any.
