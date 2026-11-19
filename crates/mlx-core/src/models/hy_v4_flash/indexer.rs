@@ -29,6 +29,7 @@ use crate::models::deepseek_v41::attention::{linear, rms_norm};
 use crate::models::deepseek_v41::indexer::INDEX_CHUNK_BYTES;
 use crate::models::deepseek_v41::ops::{apply_partial_rope, inv_freqs, rope_tables};
 use crate::models::deepseek_v41::store::Dense;
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 indexer: {msg}"))
@@ -250,18 +251,133 @@ pub fn scores(q: &MxArray, w: &MxArray, keys: &MxArray) -> Result<MxArray> {
         .sum(Some(&[1]), Some(false))
 }
 
+/// `tok_k` rows of positions `len - held .. len` (the open group and up to
+/// `WINDOW_SLACK` positions before it), f32, a fresh array.
 #[derive(Clone)]
-struct Tail {
-    /// `tok_k` of positions `len - held .. len`, f32, a fresh array.
+pub struct TokTail {
+    kpool: usize,
+    width: i64,
+    keep: usize,
     rows: Option<MxArray>,
     held: usize,
     len: usize,
 }
 
-/// The lengths and open rows of an `IndexerState`, to go back to later.
+impl TokTail {
+    fn new(g: &IndexerGeometry) -> Self {
+        Self {
+            kpool: g.kpool,
+            width: g.head_dim as i64,
+            keep: g.kpool - 1 + WINDOW_SLACK,
+            rows: None,
+            held: 0,
+            len: 0,
+        }
+    }
+
+    /// Positions seen.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// `tok_k` rows held now.
+    pub fn held(&self) -> usize {
+        self.held
+    }
+
+    /// Most `tok_k` rows ever held.
+    pub fn keep(&self) -> usize {
+        self.keep
+    }
+
+    fn nbytes(&self) -> usize {
+        self.rows.as_ref().map_or(0, MxArray::nbytes)
+    }
+
+    /// Positions of the open group when `groups` groups are pooled.
+    fn open(&self, groups: usize) -> Range<usize> {
+        self.kpool * groups..self.len
+    }
+
+    /// The last `n` held rows (`n <= held`).
+    fn last_rows(&self, n: usize) -> Result<Option<MxArray>> {
+        if n == 0 {
+            return Ok(None);
+        }
+        let held = self.held;
+        if n > held {
+            return Err(bad(format!("{n} open rows needed, {held} held")));
+        }
+        let r = self
+            .rows
+            .as_ref()
+            .ok_or_else(|| bad("tok_k rows missing"))?;
+        Ok(Some(r.slice(
+            &[(held - n) as i64, 0],
+            &[held as i64, self.width],
+        )?))
+    }
+
+    /// Appends `tok [n, d]` (positions `len..len + n`).
+    fn push(&mut self, tok: &MxArray) -> Result<()> {
+        let n = tok.shape_at(0)? as usize;
+        let hold = (self.held + n).min(self.keep);
+        let from_tok = hold.min(n);
+        let new = tok.slice(&[(n - from_tok) as i64, 0], &[n as i64, self.width])?;
+        let rows = match self.last_rows(hold - from_tok)? {
+            Some(old) => MxArray::concatenate(&old, &new, 0)?,
+            None => new,
+        }
+        .deep_copy()?;
+        MxArray::eval_arrays_with_context(&[&rows], "hy_v4_flash indexer tail")?;
+        self.rows = Some(rows);
+        self.held = hold;
+        self.len += n;
+        Ok(())
+    }
+
+    /// This tail cut to `len` positions. Refused when the open rows of
+    /// `len` are no longer held.
+    fn truncated(&self, len: usize) -> Result<Self> {
+        let now = self.len;
+        if len > now {
+            return Err(bad(format!("truncate to {len}, {now} positions held")));
+        }
+        let closed = len / self.kpool;
+        let first = now - self.held;
+        if len > closed * self.kpool && closed * self.kpool < first {
+            return Err(bad(format!(
+                "truncate {now} -> {len} needs tok_k from {}, held from {first}",
+                closed * self.kpool
+            )));
+        }
+        let keep = len.saturating_sub(first);
+        let rows = match (&self.rows, keep) {
+            (_, 0) => None,
+            (Some(r), k) => {
+                let r = r.slice(&[0, 0], &[k as i64, self.width])?.deep_copy()?;
+                MxArray::eval_arrays_with_context(&[&r], "hy_v4_flash indexer tail")?;
+                Some(r)
+            }
+            (None, _) => return Err(bad("tok_k rows missing")),
+        };
+        Ok(Self {
+            rows,
+            held: keep,
+            len,
+            ..*self
+        })
+    }
+}
+
+/// The lengths and open rows of an indexer state, to go back to later.
 #[derive(Clone)]
 pub struct IndexerMark {
-    tail: Tail,
+    tail: TokTail,
 }
 
 impl IndexerMark {
@@ -272,32 +388,110 @@ impl IndexerMark {
     pub fn is_empty(&self) -> bool {
         self.tail.len == 0
     }
+
+    /// The groups pooled at the mark; refused past the `pooled` groups held.
+    fn groups(&self, pooled: usize) -> Result<usize> {
+        let closed = self.tail.len / self.tail.kpool;
+        if closed > pooled {
+            return Err(bad(format!(
+                "restore to {} positions, {pooled} groups pooled",
+                self.tail.len
+            )));
+        }
+        Ok(closed)
+    }
+}
+
+/// The pooled keys of the closed groups, in group order.
+trait PooledKeys {
+    fn groups(&self) -> usize;
+    /// Writes `keys [k, d]` f32 as groups `first..first + k`; `first` must
+    /// equal `groups()`.
+    fn store(&mut self, keys: &MxArray, first: usize) -> Result<()>;
+    /// Groups `0..k`, `[k, d]` f16.
+    fn read(&self, k: usize) -> Result<MxArray>;
+    /// Forgets the groups past `k` (`k <= groups()`).
+    fn cut(&mut self, k: usize) -> Result<()>;
+}
+
+impl PooledKeys for LatentBuf {
+    fn groups(&self) -> usize {
+        self.len()
+    }
+
+    fn store(&mut self, keys: &MxArray, first: usize) -> Result<()> {
+        self.write(keys, first)
+    }
+
+    fn read(&self, k: usize) -> Result<MxArray> {
+        self.rows()?.slice(&[0, 0], &[k as i64, self.width()])
+    }
+
+    fn cut(&mut self, k: usize) -> Result<()> {
+        self.truncate(k)
+    }
+}
+
+/// A paged sequence's pooled keys: the index plane of pool layer `layer`
+/// of the adapter's active request.
+struct PlaneKeys<'a> {
+    adapter: &'a mut PagedKVCacheAdapter,
+    layer: u32,
+    groups: &'a mut usize,
+}
+
+impl PooledKeys for PlaneKeys<'_> {
+    fn groups(&self) -> usize {
+        *self.groups
+    }
+
+    fn store(&mut self, keys: &MxArray, first: usize) -> Result<()> {
+        if first != *self.groups {
+            return Err(bad(format!(
+                "index plane write at group {first}, {} pooled",
+                self.groups
+            )));
+        }
+        let k = keys.shape_at(0)? as usize;
+        let at = u32::try_from(first).map_err(|_| bad("group id exceeds u32"))?;
+        self.adapter
+            .store_index_rows(self.layer, keys, at)
+            .map_err(bad)?;
+        *self.groups += k;
+        Ok(())
+    }
+
+    fn read(&self, k: usize) -> Result<MxArray> {
+        let k = u32::try_from(k).map_err(|_| bad("group count exceeds u32"))?;
+        self.adapter.index_rows(self.layer, k).map_err(bad)
+    }
+
+    fn cut(&mut self, k: usize) -> Result<()> {
+        if k > *self.groups {
+            return Err(bad(format!(
+                "index plane cut to {k} groups, {} pooled",
+                self.groups
+            )));
+        }
+        *self.groups = k;
+        Ok(())
+    }
 }
 
 /// Per-sequence indexer state of one layer: pooled keys of the closed
 /// groups (one f16 `[cap / kpool, d]` buffer written in place) and the
-/// `tok_k` rows of the last `kpool - 1 + WINDOW_SLACK` positions.
+/// `tok_k` tail.
 pub struct IndexerState {
-    kpool: usize,
-    width: i64,
-    keep: usize,
     pooled: LatentBuf,
-    tail: Tail,
+    tail: TokTail,
 }
 
 impl IndexerState {
     /// Empty state for a context of `cap` positions.
     pub fn new(cap: usize, g: &IndexerGeometry) -> Self {
         Self {
-            kpool: g.kpool,
-            width: g.head_dim as i64,
-            keep: g.kpool - 1 + WINDOW_SLACK,
             pooled: LatentBuf::new(cap / g.kpool, g.head_dim as i64),
-            tail: Tail {
-                rows: None,
-                held: 0,
-                len: 0,
-            },
+            tail: TokTail::new(g),
         }
     }
 
@@ -307,7 +501,7 @@ impl IndexerState {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tail.len == 0
+        self.tail.is_empty()
     }
 
     /// Closed groups (pooled rows live).
@@ -323,7 +517,7 @@ impl IndexerState {
 
     /// Positions of the open group.
     pub fn open(&self) -> Range<usize> {
-        self.kpool * self.pooled.len()..self.tail.len
+        self.tail.open(self.pooled.len())
     }
 
     /// `tok_k` rows held.
@@ -340,15 +534,79 @@ impl IndexerState {
     /// Goes back to `m`; the pooled rows below `m`'s closed groups must not
     /// have been rewritten since.
     pub fn restore(&mut self, m: IndexerMark) -> Result<()> {
-        let closed = m.tail.len / self.kpool;
-        if closed > self.pooled.len() {
-            return Err(bad(format!(
-                "restore to {} positions, {} groups pooled",
-                m.tail.len,
-                self.pooled.len()
-            )));
+        restore_in(&mut self.pooled, &mut self.tail, m)
+    }
+
+    /// Drops the positions past `len`. Refused when the open rows of `len`
+    /// are no longer held.
+    pub fn truncate(&mut self, len: usize) -> Result<()> {
+        let tail = self.tail.truncated(len)?;
+        self.pooled.truncate(len / tail.kpool)?;
+        self.tail = tail;
+        Ok(())
+    }
+
+    pub fn nbytes(&self) -> usize {
+        self.pooled.nbytes() + self.tail.nbytes()
+    }
+}
+
+/// Per-sequence indexer state of one layer of a paged sequence: the pooled
+/// keys live in the index plane of pool layer `layer` (8 groups per 32-row
+/// block), so only the count and the `tok_k` tail are held here.
+pub struct PagedIndexerState {
+    layer: u32,
+    groups: usize,
+    tail: TokTail,
+}
+
+impl PagedIndexerState {
+    pub fn new(layer: u32, g: &IndexerGeometry) -> Self {
+        Self {
+            layer,
+            groups: 0,
+            tail: TokTail::new(g),
         }
-        self.pooled.truncate(closed)?;
+    }
+
+    /// The pool layer.
+    pub fn layer(&self) -> u32 {
+        self.layer
+    }
+
+    /// Positions seen.
+    pub fn len(&self) -> usize {
+        self.tail.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tail.is_empty()
+    }
+
+    /// Closed groups (index plane rows live).
+    pub fn pooled_len(&self) -> usize {
+        self.groups
+    }
+
+    /// Positions of the open group.
+    pub fn open(&self) -> Range<usize> {
+        self.tail.open(self.groups)
+    }
+
+    pub fn tail(&self) -> &TokTail {
+        &self.tail
+    }
+
+    pub fn mark(&self) -> IndexerMark {
+        IndexerMark {
+            tail: self.tail.clone(),
+        }
+    }
+
+    /// Goes back to `m`; the index plane rows below `m`'s closed groups must
+    /// not have been rewritten since.
+    pub fn restore(&mut self, m: IndexerMark) -> Result<()> {
+        self.groups = m.groups(self.groups)?;
         self.tail = m.tail;
         Ok(())
     }
@@ -356,83 +614,23 @@ impl IndexerState {
     /// Drops the positions past `len`. Refused when the open rows of `len`
     /// are no longer held.
     pub fn truncate(&mut self, len: usize) -> Result<()> {
-        let now = self.tail.len;
-        if len > now {
-            return Err(bad(format!("truncate to {len}, {now} positions held")));
-        }
-        if len == now {
-            return Ok(());
-        }
-        let closed = len / self.kpool;
-        let first = now - self.tail.held;
-        if len > closed * self.kpool && closed * self.kpool < first {
-            return Err(bad(format!(
-                "truncate {now} -> {len} needs tok_k from {}, held from {first}",
-                closed * self.kpool
-            )));
-        }
-        let keep = len.saturating_sub(first);
-        let rows = match (&self.tail.rows, keep) {
-            (_, 0) => None,
-            (Some(r), k) => {
-                let r = r.slice(&[0, 0], &[k as i64, self.width])?.deep_copy()?;
-                MxArray::eval_arrays_with_context(&[&r], "hy_v4_flash indexer tail")?;
-                Some(r)
-            }
-            (None, _) => return Err(bad("tok_k rows missing")),
-        };
-        self.pooled.truncate(closed)?;
-        self.tail = Tail {
-            rows,
-            held: keep,
-            len,
-        };
+        let tail = self.tail.truncated(len)?;
+        self.groups = len / tail.kpool;
+        self.tail = tail;
         Ok(())
     }
 
+    /// Bytes held outside the pool.
     pub fn nbytes(&self) -> usize {
-        self.pooled.nbytes() + self.tail.rows.as_ref().map_or(0, MxArray::nbytes)
+        self.tail.nbytes()
     }
+}
 
-    /// The last `n` held rows (`n <= held`).
-    fn last_rows(&self, n: usize) -> Result<Option<MxArray>> {
-        if n == 0 {
-            return Ok(None);
-        }
-        let held = self.tail.held;
-        if n > held {
-            return Err(bad(format!("{n} open rows needed, {held} held")));
-        }
-        let r = self
-            .tail
-            .rows
-            .as_ref()
-            .ok_or_else(|| bad("tok_k rows missing"))?;
-        Ok(Some(r.slice(
-            &[(held - n) as i64, 0],
-            &[held as i64, self.width],
-        )?))
-    }
-
-    /// Appends `tok [n, d]` (positions `len..len + n`) to the held rows.
-    fn push_tail(&mut self, tok: &MxArray) -> Result<()> {
-        let n = tok.shape_at(0)? as usize;
-        let hold = (self.tail.held + n).min(self.keep);
-        let from_tok = hold.min(n);
-        let new = tok.slice(&[(n - from_tok) as i64, 0], &[n as i64, self.width])?;
-        let rows = match self.last_rows(hold - from_tok)? {
-            Some(old) => MxArray::concatenate(&old, &new, 0)?,
-            None => new,
-        }
-        .deep_copy()?;
-        MxArray::eval_arrays_with_context(&[&rows], "hy_v4_flash indexer tail")?;
-        self.tail = Tail {
-            rows: Some(rows),
-            held: hold,
-            len: self.tail.len + n,
-        };
-        Ok(())
-    }
+fn restore_in<P: PooledKeys>(pooled: &mut P, tail: &mut TokTail, m: IndexerMark) -> Result<()> {
+    let closed = m.groups(pooled.groups())?;
+    pooled.cut(closed)?;
+    *tail = m.tail;
+    Ok(())
 }
 
 /// What an indexed layer needs besides its attention weights.
@@ -440,6 +638,13 @@ pub struct Indexing<'a> {
     pub indexer: &'a Indexer,
     pub weights: &'a IndexerWeights,
     pub state: &'a mut IndexerState,
+}
+
+/// `Indexing` of a paged sequence.
+pub struct PagedIndexing<'a> {
+    pub indexer: &'a Indexer,
+    pub weights: &'a IndexerWeights,
+    pub state: &'a mut PagedIndexerState,
 }
 
 /// The indexer of one layer; the weights stay in `Resident`.
@@ -553,20 +758,31 @@ impl Indexer {
         start: usize,
         st: &mut IndexerState,
     ) -> Result<()> {
+        self.update_in(w, x, start, &mut st.pooled, &mut st.tail)
+    }
+
+    fn update_in<P: PooledKeys>(
+        &self,
+        w: &IndexerWeights,
+        x: &MxArray,
+        start: usize,
+        pooled: &mut P,
+        tail: &mut TokTail,
+    ) -> Result<()> {
         let n = x.shape_at(0)? as usize;
-        if n == 0 || start != st.len() || st.kpool != self.g.kpool {
+        if n == 0 || start != tail.len || tail.kpool != self.g.kpool {
             return Err(bad(format!(
                 "update of {n} rows at {start}, {} positions held",
-                st.len()
+                tail.len
             )));
         }
         let kp = self.g.kpool;
         let plan = self.g.plan(start, n);
-        if st.pooled.len() != plan.groups.start || st.open() != plan.open_in {
+        let open = tail.open(pooled.groups());
+        if pooled.groups() != plan.groups.start || open != plan.open_in {
             return Err(bad(format!(
-                "state holds {} groups and open {:?}, the call needs {:?} and {:?}",
-                st.pooled.len(),
-                st.open(),
+                "state holds {} groups and open {open:?}, the call needs {:?} and {:?}",
+                pooled.groups(),
                 plan.groups,
                 plan.open_in
             )));
@@ -574,7 +790,7 @@ impl Indexer {
         let tok = self.tok_k(w, x)?;
         if !plan.groups.is_empty() {
             let d = self.g.head_dim as i64;
-            let all = match st.last_rows(plan.open_in.len())? {
+            let all = match tail.last_rows(plan.open_in.len())? {
                 Some(open) => MxArray::concatenate(&open, &tok, 0)?,
                 None => tok.clone(),
             };
@@ -583,9 +799,9 @@ impl Indexer {
                 .slice(&[0, 0], &[(k * kp) as i64, d])?
                 .reshape(&[k as i64, kp as i64, d])?;
             let keys = self.pool(w, &grp, plan.groups.start)?;
-            st.pooled.write(&keys, plan.groups.start)?;
+            pooled.store(&keys, plan.groups.start)?;
         }
-        st.push_tail(&tok)
+        tail.push(&tok)
     }
 
     /// Index rows `[n, plan.kmax]` i32 (`-1` = no cell) of the call `x`/`qr`
@@ -598,14 +814,26 @@ impl Indexer {
         start: usize,
         st: &IndexerState,
     ) -> Result<MxArray> {
+        self.cells_in(w, x, qr, start, &st.pooled, &st.tail)
+    }
+
+    fn cells_in<P: PooledKeys>(
+        &self,
+        w: &IndexerWeights,
+        x: &MxArray,
+        qr: &MxArray,
+        start: usize,
+        pooled: &P,
+        tail: &TokTail,
+    ) -> Result<MxArray> {
         let n = x.shape_at(0)? as usize;
         let plan = self.g.plan(start, n);
-        if st.len() != start + n || st.pooled.len() != plan.cols {
+        if tail.len != start + n || pooled.groups() != plan.cols {
             return Err(bad(format!(
                 "cells of [{start}, {}) with {} positions and {} groups",
                 start + n,
-                st.len(),
-                st.pooled.len()
+                tail.len,
+                pooled.groups()
             )));
         }
         let width = plan.kmax;
@@ -618,7 +846,8 @@ impl Indexer {
             )?);
         }
         if !plan.sparse.is_empty() {
-            parts.push(self.sparse_cells(w, x, qr, start, &plan, st)?);
+            let keys = pooled.read(plan.cols)?.astype(DType::Float32)?;
+            parts.push(self.sparse_cells(w, x, qr, start, &plan, &keys)?);
         }
         match parts.len() {
             1 => Ok(parts.swap_remove(0)),
@@ -626,6 +855,7 @@ impl Indexer {
         }
     }
 
+    /// The picks of the scored rows over `keys [plan.cols, d]` f32.
     fn sparse_cells(
         &self,
         w: &IndexerWeights,
@@ -633,7 +863,7 @@ impl Indexer {
         qr: &MxArray,
         start: usize,
         plan: &CallPlan,
-        st: &IndexerState,
+        keys: &MxArray,
     ) -> Result<MxArray> {
         let g = &self.g;
         let rows = |a: &MxArray, r: &Range<usize>| -> Result<MxArray> {
@@ -646,11 +876,6 @@ impl Indexer {
         let pos: Vec<u64> = sp.clone().map(|t| t as u64).collect();
         let q = self.queries(w, &rows(qr, sp)?, &pos)?;
         let hw = self.head_weights(w, &rows(x, sp)?)?;
-        let keys = st
-            .pooled
-            .rows()?
-            .slice(&[0, 0], &[plan.cols as i64, g.head_dim as i64])?
-            .astype(DType::Float32)?;
         let to_i32 = |v: usize| i32::try_from(v).map_err(|_| bad(format!("{v} exceeds i32")));
         let visible = sp
             .clone()
@@ -679,7 +904,7 @@ impl Indexer {
             let c = (hi - lo) as i64;
             let qc = q.slice(&[lo as i64, 0, 0], &[hi as i64, h, d])?;
             let wc = hw.slice(&[lo as i64, 0], &[hi as i64, h])?;
-            let sc = scores(&qc, &wc, &keys)?;
+            let sc = scores(&qc, &wc, keys)?;
             let ids = pick_groups(&sc, &visible[lo..hi], g.n_top)?;
             let tail = MxArray::from_int32(&tails[lo * slots..hi * slots], &[c, slots as i64])?;
             let idx = MxArray::concatenate(&group_cells(&ids, g.kpool)?, &tail, 1)?;
@@ -704,12 +929,43 @@ impl Indexer {
         start: usize,
         st: &mut IndexerState,
     ) -> Result<MxArray> {
-        let mark = st.mark();
+        self.select_in(w, x, qr, start, &mut st.pooled, &mut st.tail)
+    }
+
+    /// `select` for a paged sequence: the pooled keys go to and come from
+    /// the index plane of the adapter's active request.
+    pub fn select_paged(
+        &self,
+        w: &IndexerWeights,
+        x: &MxArray,
+        qr: &MxArray,
+        start: usize,
+        st: &mut PagedIndexerState,
+        adapter: &mut PagedKVCacheAdapter,
+    ) -> Result<MxArray> {
+        let mut keys = PlaneKeys {
+            adapter,
+            layer: st.layer,
+            groups: &mut st.groups,
+        };
+        self.select_in(w, x, qr, start, &mut keys, &mut st.tail)
+    }
+
+    fn select_in<P: PooledKeys>(
+        &self,
+        w: &IndexerWeights,
+        x: &MxArray,
+        qr: &MxArray,
+        start: usize,
+        pooled: &mut P,
+        tail: &mut TokTail,
+    ) -> Result<MxArray> {
+        let mark = IndexerMark { tail: tail.clone() };
         let out = self
-            .update(w, x, start, st)
-            .and_then(|()| self.cells(w, x, qr, start, st));
+            .update_in(w, x, start, pooled, tail)
+            .and_then(|()| self.cells_in(w, x, qr, start, pooled, tail));
         if out.is_err() {
-            st.restore(mark)?;
+            restore_in(pooled, tail, mark)?;
         }
         out
     }

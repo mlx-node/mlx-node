@@ -858,3 +858,206 @@ fn indexed_layer_past_top_k_gives_the_same_rows_for_every_split() {
         }
     }
 }
+
+/// `attn_geometry` with a 64-column latent row: planes of 32, a pool head
+/// size.
+fn wide_geometry() -> Geometry {
+    Geometry {
+        kv_lora: 60,
+        ..attn_geometry()
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod paged {
+    use super::*;
+    use crate::models::hy_v4_flash::attention::PagedPool;
+    use crate::models::hy_v4_flash::paged::{PageGeometry, SlotMap, create};
+    use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+
+    const OWNER: u32 = 1;
+    const OTHER: u32 = 9;
+    const N: usize = 40;
+
+    struct Case {
+        ag: Geometry,
+        aw: AttnWeights,
+        mla: Mla,
+        g: IndexerGeometry,
+        w: IndexerWeights,
+        ix: Indexer,
+        hs: Vec<Vec<f32>>,
+    }
+
+    fn case() -> Case {
+        let ag = wide_geometry();
+        let aw = attn_weights(&ag, 71);
+        let mla = Mla::new(ag.clone(), &aw).unwrap();
+        let g = small();
+        let (w, _) = indexer_weights(&g, 72);
+        let ix = Indexer::new(g.clone(), &w).unwrap();
+        let hs = inputs(N, D, 73);
+        Case {
+            ag,
+            aw,
+            mla,
+            g,
+            w,
+            ix,
+            hs,
+        }
+    }
+
+    /// A one-layer pool of this case's page, `None` without Metal.
+    fn pool(c: &Case) -> Option<PagedKVCacheAdapter> {
+        let pg = PageGeometry {
+            layers: 1,
+            half: (c.ag.row() / 2) as u32,
+            index_rows: (32 / c.g.kpool) as u32,
+            index_dim: c.g.head_dim as u32,
+        };
+        match create(&pg, 1024, 8, 8, u64::MAX) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("skipping Hy4 paged indexer test: {e}");
+                None
+            }
+        }
+    }
+
+    fn bits(x: &MxArray) -> Vec<u32> {
+        x.to_float32()
+            .unwrap()
+            .as_ref()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    fn flat(c: &Case, sizes: &[usize]) -> (Vec<u32>, Vec<u16>) {
+        let mut cache = LayerCache::new(Attn::Indexed, c.ag.window, 64, c.ag.row() as i64);
+        let mut st = IndexerState::new(64, &c.g);
+        let mut out = Vec::new();
+        let mut at = 0;
+        for &k in sizes {
+            let y = c
+                .mla
+                .forward(
+                    &c.aw,
+                    &rows_of(&c.hs[at..at + k]),
+                    at,
+                    &mut cache,
+                    Some(Indexing {
+                        indexer: &c.ix,
+                        weights: &c.w,
+                        state: &mut st,
+                    }),
+                )
+                .unwrap();
+            out.extend(bits(&y));
+            at += k;
+        }
+        let pooled = st.pooled_rows().unwrap().to_uint16_native().unwrap()
+            [..st.pooled_len() * c.g.head_dim]
+            .to_vec();
+        (out, pooled)
+    }
+
+    fn paged_call(
+        c: &Case,
+        adapter: &mut PagedKVCacheAdapter,
+        st: &mut PagedIndexerState,
+        slots: &SlotMap,
+        at: usize,
+        k: usize,
+    ) -> Result<MxArray> {
+        c.mla.forward_indexed_paged(
+            &c.aw,
+            &rows_of(&c.hs[at..at + k]),
+            at,
+            PagedPool {
+                adapter,
+                floor: at as u32,
+                slots,
+            },
+            PagedIndexing {
+                indexer: &c.ix,
+                weights: &c.w,
+                state: st,
+            },
+        )
+    }
+
+    /// `OWNER`'s rows in calls of `sizes`, with a page of `OTHER` taken
+    /// before its first and its second call.
+    fn paged(c: &Case, adapter: &mut PagedKVCacheAdapter, sizes: &[usize]) -> (Vec<u32>, Vec<u16>) {
+        let mut st = PagedIndexerState::new(0, &c.g);
+        let mut out = Vec::new();
+        let mut at = 0;
+        for (i, &k) in sizes.iter().enumerate() {
+            if i < 2 {
+                adapter.record_tokens_for(OTHER, &[3; 32]).unwrap();
+            }
+            adapter.record_tokens_for(OWNER, &vec![3; k]).unwrap();
+            let slots = SlotMap::of(adapter).unwrap();
+            let y = paged_call(c, adapter, &mut st, &slots, at, k).unwrap();
+            out.extend(bits(&y));
+            at += k;
+        }
+        assert_eq!((st.len(), st.pooled_len()), (N, N / c.g.kpool));
+        let pooled = adapter
+            .index_rows(0, st.pooled_len() as u32)
+            .unwrap()
+            .to_uint16_native()
+            .unwrap();
+        (out, pooled)
+    }
+
+    /// One indexed layer over the paged pool (half rows in two planes,
+    /// pooled keys in the f16 index plane, scattered pages, rows past
+    /// `top_k` scored) gives the flat layer's outputs and pooled keys bit for
+    /// bit, for every split.
+    /// Mutation: the slot map ignores the block table (slot = row) → red.
+    #[test]
+    fn paged_indexed_layer_equals_the_flat_layer_bit_for_bit() {
+        let c = case();
+        for sizes in [vec![N], vec![12, 12, 16], vec![1; N], vec![5, 7, 1, 27]] {
+            let Some(mut adapter) = pool(&c) else {
+                return;
+            };
+            let (want, want_pooled) = flat(&c, &sizes);
+            let (got, got_pooled) = paged(&c, &mut adapter, &sizes);
+            assert_eq!(adapter.active_seq_id(), Some(OWNER));
+            assert_ne!(adapter.block_table().unwrap().block_ids(), vec![0, 1]);
+            assert_eq!(got.len(), N * D, "split {sizes:?}");
+            assert!(got == want, "split {sizes:?} outputs differ");
+            assert_eq!(got_pooled, want_pooled, "split {sizes:?} pooled keys");
+        }
+    }
+
+    /// A call whose slot map was built on older pages fails after its
+    /// indexer update and leaves the indexer state as it was; the same call
+    /// with a fresh map then succeeds.
+    /// Mutation: no restore on error → the retry is refused → red.
+    #[test]
+    fn a_failed_paged_call_keeps_the_indexer_state() {
+        let c = case();
+        let Some(mut adapter) = pool(&c) else {
+            return;
+        };
+        let mut st = PagedIndexerState::new(0, &c.g);
+        adapter.record_tokens_for(OWNER, &[3; 30]).unwrap();
+        let slots = SlotMap::of(&adapter).unwrap();
+        paged_call(&c, &mut adapter, &mut st, &slots, 0, 30).unwrap();
+        adapter.record_tokens_for(OWNER, &[3; 6]).unwrap();
+        let before = (st.len(), st.pooled_len(), st.open(), st.tail().held());
+        assert!(paged_call(&c, &mut adapter, &mut st, &slots, 30, 6).is_err());
+        assert_eq!(
+            (st.len(), st.pooled_len(), st.open(), st.tail().held()),
+            before
+        );
+        let fresh = SlotMap::of(&adapter).unwrap();
+        paged_call(&c, &mut adapter, &mut st, &fresh, 30, 6).unwrap();
+        assert_eq!((st.len(), st.pooled_len()), (36, 9));
+    }
+}

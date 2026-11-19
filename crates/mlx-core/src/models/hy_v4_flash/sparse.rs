@@ -38,6 +38,41 @@ pub fn chunk_rows(per_row: usize, budget: usize) -> usize {
     (budget / per_row.max(1)).clamp(1, MAX_CHUNK_ROWS)
 }
 
+/// The cached rows a query gathers from.
+#[derive(Clone, Copy)]
+pub enum KeyRows<'a> {
+    /// `[n, d]` rows, read by row id.
+    Whole(&'a MxArray),
+    /// Each row split over two planes `[n, d0]` and `[n, d - d0]` (the paged
+    /// pool's K and V planes), read by slot id and joined.
+    Split(&'a MxArray, &'a MxArray),
+}
+
+impl KeyRows<'_> {
+    fn width(&self) -> Result<i64> {
+        match self {
+            Self::Whole(k) => match dims(k)?.as_slice() {
+                &[_, d] => Ok(d),
+                s => Err(bad(format!("keys {s:?} must be [n, d]"))),
+            },
+            Self::Split(k, v) => match (dims(k)?.as_slice(), dims(v)?.as_slice()) {
+                (&[n, a], &[m, b]) if n == m => Ok(a + b),
+                (a, b) => Err(bad(format!(
+                    "key planes {a:?} and {b:?} must be [n, d0], [n, d1]"
+                ))),
+            },
+        }
+    }
+
+    /// The rows listed by `gid [r]`, `[r, d]` in the cache dtype.
+    fn gather(&self, gid: &MxArray) -> Result<MxArray> {
+        match self {
+            Self::Whole(k) => k.take(gid, 0),
+            Self::Split(k, v) => MxArray::concatenate(&k.take(gid, 0)?, &v.take(gid, 0)?, 1),
+        }
+    }
+}
+
 /// `q [s, h, d]` attends the rows of `keys [n, d]` listed by `idx [s, kmax]`
 /// (i32, `-1` = no key); out `[s, h, v_width]` f32. `sinks [h]`.
 pub fn gather_sink_attention(
@@ -51,11 +86,37 @@ pub fn gather_sink_attention(
     gather_sink_attention_in(q, keys, idx, v_width, sinks, scale, SPARSE_CHUNK_BYTES)
 }
 
-/// `gather_sink_attention` with an explicit chunk budget. Every chunk is
-/// evaluated before the next one is built.
+/// `gather_sink_attention` over `keys` from either source; `idx` lists row
+/// ids of `Whole` rows or slot ids of `Split` planes.
+pub fn gather_sink_attention_rows(
+    q: &MxArray,
+    keys: KeyRows<'_>,
+    idx: &MxArray,
+    v_width: i64,
+    sinks: &MxArray,
+    scale: f32,
+) -> Result<MxArray> {
+    gather_rows_in(q, keys, idx, v_width, sinks, scale, SPARSE_CHUNK_BYTES)
+}
+
+/// `gather_sink_attention` with an explicit chunk budget.
 pub(crate) fn gather_sink_attention_in(
     q: &MxArray,
     keys: &MxArray,
+    idx: &MxArray,
+    v_width: i64,
+    sinks: &MxArray,
+    scale: f32,
+    budget: usize,
+) -> Result<MxArray> {
+    gather_rows_in(q, KeyRows::Whole(keys), idx, v_width, sinks, scale, budget)
+}
+
+/// The core of every entry above. Every chunk is evaluated before the next
+/// one is built.
+fn gather_rows_in(
+    q: &MxArray,
+    keys: KeyRows<'_>,
     idx: &MxArray,
     v_width: i64,
     sinks: &MxArray,
@@ -68,9 +129,9 @@ pub(crate) fn gather_sink_attention_in(
             dims(q)?
         )));
     };
-    let kd = dims(keys)?;
-    if kd.len() != 2 || kd[1] != d {
-        return Err(bad(format!("keys {kd:?} for queries of width {d}")));
+    let kd = keys.width()?;
+    if kd != d {
+        return Err(bad(format!("keys of width {kd} for queries of width {d}")));
     }
     let &[is, kmax] = dims(idx)?.as_slice() else {
         return Err(bad(format!(
@@ -102,7 +163,7 @@ pub(crate) fn gather_sink_attention_in(
         let gid = ic.maximum(&zero)?.reshape(&[c * kmax])?;
         let valid = ic.greater_equal(&zero)?.reshape(&[c, 1, kmax])?;
         let g = keys
-            .take(&gid, 0)?
+            .gather(&gid)?
             .astype(DType::Float32)?
             .reshape(&[c, kmax, d])?;
         let qc = q.slice(&[lo, 0, 0], &[hi, h, d])?.astype(DType::Float32)?;

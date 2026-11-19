@@ -18,8 +18,9 @@ use napi::{Error, Result};
 
 use super::cache::{LatentBuf, LayerCache, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
-use super::indexer::Indexing;
-use super::sparse::gather_sink_attention;
+use super::indexer::{Indexing, PagedIndexing};
+use super::paged::{SlotMap, planes, write_latent};
+use super::sparse::{KeyRows, gather_sink_attention, gather_sink_attention_rows};
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::AttnWeights;
 use crate::array::{DType, MxArray};
@@ -27,6 +28,7 @@ use crate::models::deepseek_v41::attention::{linear, rms_norm};
 use crate::models::deepseek_v41::ops::{apply_partial_rope, inv_freqs, rope_tables};
 use crate::models::deepseek_v41::store::{Dense, Weight};
 use crate::nn::Activations;
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 attention: {msg}"))
@@ -113,6 +115,16 @@ pub struct Projected {
     pub q: MxArray,
     /// Latent rows `[n, kv_lora + rope]` f32, before the cache's f16 cast.
     pub kv: MxArray,
+}
+
+/// The paged pool for one call of the adapter's active request.
+pub struct PagedPool<'a> {
+    pub adapter: &'a mut PagedKVCacheAdapter,
+    /// Tokens recorded before this pass; no write reaches below them.
+    pub floor: u32,
+    /// The active request's pages, mapped after the call's rows were
+    /// recorded.
+    pub slots: &'a SlotMap,
 }
 
 /// The attention of one layer; the weights stay in `Resident`.
@@ -318,6 +330,54 @@ impl Mla {
             if buf.len() > start {
                 buf.truncate(start)?;
             }
+            ix.state.restore(mark)?;
+        }
+        out
+    }
+
+    /// `forward_indexed` of a paged sequence: the call's latent rows go to
+    /// the pool layer of `ix.state` as two half rows, its pooled keys to that
+    /// layer's index plane, and the attention reads both planes by slot id.
+    /// On error the indexer state holds what it held before; the pool rows
+    /// of the call stay dead until written again.
+    pub fn forward_indexed_paged(
+        &self,
+        w: &AttnWeights,
+        h: &MxArray,
+        start: usize,
+        pool: PagedPool<'_>,
+        ix: PagedIndexing<'_>,
+    ) -> Result<MxArray> {
+        if self.g.attn != Attn::Indexed {
+            return Err(bad("sliding layer given the paged pool"));
+        }
+        let layer = ix.state.layer();
+        let base = u32::try_from(start).map_err(|_| bad("position exceeds u32"))?;
+        let tp = prof_start();
+        let p = self.project(w, h, start)?;
+        let mark = ix.state.mark();
+        let out = write_latent(pool.adapter, layer, &p.kv, base, pool.floor).and_then(|()| {
+            prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr])?;
+            let tp = prof_start();
+            let idx =
+                ix.indexer
+                    .select_paged(ix.weights, &p.x, &p.qr, start, ix.state, pool.adapter)?;
+            prof_end(Phase::Indexer, tp, &[&idx])?;
+            let tp = prof_start();
+            let slots = pool.slots.slots(pool.adapter, &idx)?;
+            let (k, v) = planes(pool.adapter, layer)?;
+            let o = gather_sink_attention_rows(
+                &p.q,
+                KeyRows::Split(&k, &v),
+                &slots,
+                self.g.kv_lora as i64,
+                &w.sinks,
+                self.g.scale,
+            )?;
+            prof_end(Phase::Sparse, tp, &[&o])?;
+            self.finish_timed(w, &p.x, &o)
+        });
+        if out.is_err() {
             ix.state.restore(mark)?;
         }
         out
