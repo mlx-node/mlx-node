@@ -402,8 +402,7 @@ export function buildAnthropicContent(
   const okToolCalls = stopMatched || !allowToolUse ? [] : parsedToolCalls;
   const text = stopMatched ? result.text : visibleAnswerText(result, allowToolUse);
 
-  // Emit a text block unless tool calls exist and there is no text.
-  if (text || okToolCalls.length === 0) {
+  if (text) {
     content.push({ type: 'text', text });
   }
 
@@ -418,6 +417,11 @@ export function buildAnthropicContent(
       name: tc.name,
       input: parseArguments(tc.arguments),
     });
+  }
+
+  // vLLM `messages_full_converter`: one empty text block only when no other block exists.
+  if (content.length === 0) {
+    content.push({ type: 'text', text: '' });
   }
 
   return content;

@@ -644,12 +644,13 @@ async function handleStreamingNativeWithAbort(
           // Open a text block for non-whitespace content, for a stop-truncated
           // prefix (so the streamed body equals the non-streaming one), or for
           // pure native `finalText` recovery (mirrors emitting recovered text
-          // verbatim). A stop-matched turn always opens a text block — empty if
-          // the stop consumed all visible output — so the reconstructed content
-          // matches the non-streaming `[{type:'text', text:''}]`. Whitespace-only
-          // released held content opens no block.
+          // verbatim). A stop that consumed all visible output opens an empty
+          // text block only when no thinking block was sent, as the
+          // non-streaming content does. Whitespace-only released held content
+          // opens no block.
           const openTextBlock =
-            matchedStopSequence !== null || (body.length > 0 && (body.trim().length > 0 || !prependParked));
+            (matchedStopSequence !== null && (body.length > 0 || !hasEmittedThinking)) ||
+            (body.length > 0 && (body.trim().length > 0 || !prependParked));
           if (openTextBlock) {
             hasEmittedText = true;
             writeSSEEvent(

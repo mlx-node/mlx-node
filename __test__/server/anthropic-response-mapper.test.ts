@@ -154,16 +154,7 @@ describe('buildAnthropicResponse', () => {
     const response = buildAnthropicResponse(result, baseReq, 'msg_no_tools', undefined, false);
 
     expect(response.stop_reason).toBe('end_turn');
-    expect(response.content).toHaveLength(2);
-    expect(response.content[0]).toEqual({
-      type: 'thinking',
-      thinking: 'I should inspect files.',
-      signature: '',
-    });
-    expect(response.content[1]).toEqual({
-      type: 'text',
-      text: '',
-    });
+    expect(response.content).toEqual([{ type: 'thinking', thinking: 'I should inspect files.', signature: '' }]);
   });
 
   it('degrades to an empty input object for structurally malformed arguments', () => {
@@ -450,6 +441,45 @@ describe('buildAnthropicResponse', () => {
     expect(response.content.every((b) => b.type !== 'text')).toBe(true);
     expect(response.content).toHaveLength(1);
     expect(response.content[0].type).toBe('tool_use');
+  });
+
+  // vLLM `messages_full_converter`: a text block only for non-empty content;
+  // one empty text block only when no other block exists.
+  it.each([
+    {
+      name: 'thinking and no text',
+      result: { text: '', thinking: 'plan' },
+      stop: null,
+      blocks: [{ type: 'thinking', thinking: 'plan', signature: '' }],
+    },
+    {
+      name: 'a stop that consumed all text after thinking',
+      result: { text: '', thinking: 'plan' },
+      stop: 'HALT',
+      blocks: [{ type: 'thinking', thinking: 'plan', signature: '' }],
+    },
+    { name: 'nothing at all', result: { text: '' }, stop: null, blocks: [{ type: 'text', text: '' }] },
+    { name: 'a stop that consumed all text', result: { text: '' }, stop: 'HALT', blocks: [{ type: 'text', text: '' }] },
+    {
+      name: 'whitespace text after thinking',
+      result: { text: '\n', thinking: 'plan' },
+      stop: null,
+      blocks: [
+        { type: 'thinking', thinking: 'plan', signature: '' },
+        { type: 'text', text: '\n' },
+      ],
+    },
+  ])('content blocks for $name', ({ result, stop, blocks }) => {
+    const response = buildAnthropicResponse(
+      makeChatResult(result),
+      baseReq,
+      'msg_blocks',
+      undefined,
+      true,
+      undefined,
+      stop,
+    );
+    expect(response.content).toEqual(blocks);
   });
 
   it('skips tool calls with status !== "ok"', () => {

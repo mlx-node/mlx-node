@@ -1524,7 +1524,7 @@ describe('handleCreateMessage', () => {
       const { res, getBody } = createMockRes();
       await handleCreateMessage(res, request, registry);
       const parsed = JSON.parse(getBody());
-      expect(parsed.content.filter((b: any) => b.type === 'text').map((b: any) => b.text)).toEqual(['']);
+      expect(parsed.content.map((b: any) => b.type as string)).toEqual(['thinking']);
     });
 
     it('emits thinking + text with correct content block indices', async () => {
@@ -3301,6 +3301,51 @@ describe('handleCreateMessage', () => {
       const msgDelta = events.find((e) => e.event === 'message_delta');
       expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
       expect((msgDelta!.data['delta'] as any).stop_sequence).toBe('HALT');
+    });
+
+    // vLLM `messages_full_converter` adds the empty text block only when no other
+    // block exists. Mutation: open the empty block whenever a stop matched → red.
+    it('streaming: a stop that consumes all text after thinking opens no text block', async () => {
+      const registry = new ModelRegistry();
+      registry.register(
+        'test-model',
+        createMockStreamModel([
+          { text: 'plan', done: false, isReasoning: true },
+          { text: 'STOPhello', done: false, isReasoning: false },
+          {
+            text: 'STOPhello',
+            done: true,
+            finishReason: 'stop',
+            toolCalls: [],
+            thinking: 'plan',
+            numTokens: 5,
+            promptTokens: 3,
+            reasoningTokens: 1,
+            rawText: 'plan</think>STOPhello',
+          },
+        ]),
+      );
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stream: true,
+          stop_sequences: ['STOP'],
+        },
+        registry,
+      );
+
+      const events = parseSSE(getBody());
+      const starts = events
+        .filter((e) => e.event === 'content_block_start')
+        .map((e) => (e.data['content_block'] as any).type as string);
+      expect(starts).toEqual(['thinking']);
+      const msgDelta = events.find((e) => e.event === 'message_delta');
+      expect((msgDelta!.data['delta'] as any).stop_reason).toBe('stop_sequence');
     });
 
     it('streaming: opens an empty text block when a stop sequence consumes all visible output', async () => {
