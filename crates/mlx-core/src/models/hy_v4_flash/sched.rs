@@ -12,11 +12,16 @@
 //!          cold-equivalent turn registers its blocks and publishes the owner's state
 //! admit ─► live cell continues │ RAM state + cached chain resumes │ cold
 //! preempt ─► blocks back unpublished, cell dropped; the replay resumes from a stored state
+//! MTP   ─► reserve (decode row of each lane) ─► propose (drafts in lane order, up to
+//!          row_cap, the last lanes cut) ─► verify: one wave, every lane's rows ─► commit:
+//!          pool rows and cell cut to start + keep (the wave already wrote the MTP rows)
 //! ```
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+
+use rand::Rng;
 
 use napi::{Error, Result};
 
@@ -31,16 +36,19 @@ use super::owner::{CellLayer, OwnerCell, Owners};
 use super::paged::{BLOCK, PageGeometry, SlotMap, create};
 use super::prefill::{BLOCK_ROWS, Grid};
 use super::prefix_state::{Key, States, Turn};
+use super::spec::{self, LOOKAHEAD_MAX};
 use super::store::{LADDER_BYTES, Store, kv_per_token, lane_floor};
-use crate::array::MxArray;
-use crate::engine::backend::{PagedBackend, PagedPrefix};
+use crate::array::{DType, MxArray};
+use crate::engine::backend::{DsparkProposal, PagedBackend, PagedPrefix, PagedSpeculativeArgs};
 use crate::engine::governor::governor::MemoryAccounts;
 use crate::engine::hybrid_scheduler::{
     HybridSchedulerBackend, HybridStepExecutor, NoRestoreTicket, ScheduledStateCapacity,
-    SchedulerOwnerContext, scheduler_max_num_seqs_for,
+    ScheduledVerifyCommit, ScheduledVerifyRow, SchedulerOwnerContext, scheduler_max_num_seqs_for,
 };
+use crate::engine::mtp_turn::{MtpTurnArgs, run_mtp_turn, turn_lookahead_rows};
 use crate::engine::paged_epilogue::FinalTokenPolicy;
 use crate::engine::paged_stepper::{EvalPolicy, PagedStepModel, PagedStepper};
+use crate::engine::params::ChatParams;
 use crate::engine::scheduler::PreemptionMode;
 use crate::stream::{Stream, StreamContext};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
@@ -54,6 +62,10 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 
 fn no_pool() -> Error {
     bad("the load runs in flat mode: no paged pool")
+}
+
+fn no_mtp() -> Error {
+    bad("the load has no MTP layer")
 }
 
 /// Whether a load runs in paged mode: not forced serial and a wave row cap
@@ -311,6 +323,81 @@ pub struct TurnPlan {
     pub turn: Turn,
 }
 
+/// The rows of one verify wave: one decode row per lane that reserved,
+/// then drafts in proposal order while rows are left under `row_cap`, so
+/// the last lanes lose their drafts first. A reserve after a proposal
+/// starts the next wave.
+#[derive(Debug, Default)]
+pub struct WaveBudget {
+    lanes: HashSet<SeqId>,
+    drafts: usize,
+    proposing: bool,
+}
+
+impl WaveBudget {
+    /// `seq` holds a decode row of the wave being planned.
+    pub fn reserved(&mut self, seq: SeqId) {
+        if self.proposing {
+            self.close();
+        }
+        self.lanes.insert(seq);
+    }
+
+    /// Drafts `seq` may propose, at most `cap`.
+    pub fn grant(&mut self, seq: SeqId, cap: usize, row_cap: usize) -> usize {
+        self.proposing = true;
+        self.lanes.insert(seq);
+        let left = row_cap.saturating_sub(self.lanes.len() + self.drafts);
+        let n = cap.min(left);
+        self.drafts += n;
+        n
+    }
+
+    /// Rows the wave holds so far.
+    pub fn rows(&self) -> usize {
+        self.lanes.len() + self.drafts
+    }
+
+    /// The wave ran (or was dropped).
+    pub fn close(&mut self) {
+        self.lanes.clear();
+        self.drafts = 0;
+        self.proposing = false;
+    }
+}
+
+/// One owner's verify rows, held in the pool and its cell until the commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Open {
+    pub start: usize,
+    pub rows: usize,
+}
+
+/// The cell length a commit keeping `keep` rows of `open` leaves.
+pub fn commit_len(open: Open, keep: usize) -> Result<usize> {
+    if keep > open.rows {
+        return Err(bad(format!(
+            "a commit of {keep} rows of a verify of {}",
+            open.rows
+        )));
+    }
+    Ok(open.start + keep)
+}
+
+/// Whether `rows` more rows fit an owner of `len` positions: one cut must
+/// be able to drop all but the anchor, one wave must hold them, and the
+/// context must.
+pub fn rows_fit(rows: usize, len: usize, ctx: usize, row_cap: usize) -> bool {
+    rows > 0 && rows <= LOOKAHEAD_MAX.min(row_cap) && len + rows <= ctx
+}
+
+/// The paged mode's MTP: the verify being planned and the open ones.
+#[derive(Debug, Default)]
+pub struct Spec {
+    pub budget: WaveBudget,
+    pub open: HashMap<SeqId, Open>,
+}
+
 /// The paged mode of a load.
 pub struct Paged {
     pub adapter: PagedKVCacheAdapter,
@@ -325,6 +412,7 @@ pub struct Paged {
     pub row_cap: usize,
     pub published: u64,
     pub restored: u64,
+    pub spec: Spec,
 }
 
 impl Paged {
@@ -349,6 +437,7 @@ impl Paged {
             row_cap: store.row_cap,
             published: 0,
             restored: 0,
+            spec: Spec::default(),
         })
     }
 
@@ -563,6 +652,41 @@ fn rewind(cell: &mut OwnerCell, len: usize, history: &[u32]) -> bool {
     })
 }
 
+/// Drops `seq`'s request, cell and plans after a step it cannot go back
+/// from; `active` when it was the active owner.
+fn lose(p: &mut Paged, seq: SeqId, active: bool) {
+    tracing::warn!("hy_v4_flash: owner {seq} lost its cell in a failed step");
+    let _ = p.adapter.release_request_for(seq);
+    p.owners.release(seq);
+    p.turns.remove(&seq);
+    p.spec.open.remove(&seq);
+    if active {
+        p.saved.clear();
+    }
+}
+
+/// Makes `was` the active owner again in the table and the pool.
+fn reactivate(p: &mut Paged, was: Option<SeqId>) -> Result<()> {
+    if let Some(seq) = was
+        && p.owners.contains(seq)
+    {
+        p.owners
+            .activate(seq, || Err(bad("the active cell vanished")))?;
+        p.adapter.activate_request(seq).map_err(bad)?;
+    }
+    Ok(())
+}
+
+fn empty_proposal() -> DsparkProposal {
+    DsparkProposal {
+        draft_ids: Vec::new(),
+        device_draft_ids: None,
+        draft_dists: Vec::new(),
+        draft_sparse_dists: Vec::new(),
+        keep_probabilities: None,
+    }
+}
+
 /// The flag's cancel read, per layer and per chunk.
 fn cancelled(flag: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> bool {
     flag.as_ref().is_some_and(|f| f.load(Ordering::Relaxed))
@@ -626,12 +750,7 @@ impl Inner {
             p.owners.put(r.seq, cell)?;
         }
         for seq in lost {
-            tracing::warn!("hy_v4_flash: owner {seq} lost its cell in a failed step");
-            let _ = p.adapter.release_request_for(seq);
-            p.turns.remove(&seq);
-            if was == Some(seq) {
-                p.saved.clear();
-            }
+            lose(p, seq, was == Some(seq));
         }
         if let Some(seq) = was
             && p.owners.contains(seq)
@@ -1058,6 +1177,311 @@ impl Inner {
     }
 }
 
+impl Inner {
+    /// Positions `seq`'s cell holds (0 without one).
+    pub(super) fn owner_len(&self, seq: SeqId) -> usize {
+        self.paged
+            .as_ref()
+            .and_then(|p| p.owners.get(seq))
+            .map_or(0, OwnerCell::len)
+    }
+
+    /// `seq`'s draft cut to the rows below its last trunk row: the drafts
+    /// of a proposal go, the exact rows stay.
+    pub(super) fn settle(&mut self, seq: SeqId) -> Result<()> {
+        let p = self.paged_mut()?;
+        let Some(cell) = p.owners.get_mut(seq) else {
+            return Ok(());
+        };
+        let keep = cell.len().saturating_sub(1);
+        match cell.draft_mut() {
+            Some(d) if d.len() > keep => d.cut(keep),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether `seq` stands settled at `position`: a cell of that length
+    /// whose draft holds the rows below it and the seed of its last row.
+    fn settled_at(&self, seq: SeqId, position: usize) -> bool {
+        let Some(cell) = self.paged.as_ref().and_then(|p| p.owners.get(seq)) else {
+            return position == 0;
+        };
+        let Some(d) = cell.draft() else {
+            return false;
+        };
+        cell.len() == position
+            && match position.checked_sub(1) {
+                Some(last) => d.len() == last && d.seed(last).is_some(),
+                None => d.is_empty(),
+            }
+    }
+
+    /// One draft row at the end of `seq`'s draft from `h` and `emb`.
+    pub(super) fn draft_row(
+        &mut self,
+        seq: SeqId,
+        h: &MxArray,
+        emb: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        let Inner {
+            store, mtp, paged, ..
+        } = self;
+        let m = mtp.as_ref().ok_or_else(no_mtp)?;
+        let p = paged.as_mut().ok_or_else(no_pool)?;
+        let d = p
+            .owners
+            .get_mut(seq)
+            .and_then(OwnerCell::draft_mut)
+            .ok_or_else(|| bad(format!("owner {seq} has no draft")))?;
+        m.draft(&store.model, d, h, emb)
+    }
+
+    /// `n` drafts after `anchor` on `seq`'s settled draft, drawn as the
+    /// target samples; the draft is settled again after.
+    fn propose(
+        &mut self,
+        seq: SeqId,
+        anchor: u32,
+        n: usize,
+        params: &ChatParams,
+        rng: &mut dyn Rng,
+    ) -> Result<DsparkProposal> {
+        if n == 0 {
+            return Ok(empty_proposal());
+        }
+        self.settle(seq)?;
+        let last = self
+            .owner_len(seq)
+            .checked_sub(1)
+            .ok_or_else(|| bad(format!("owner {seq} proposes on an empty cell")))?;
+        let seed = self
+            .paged()?
+            .owners
+            .get(seq)
+            .and_then(OwnerCell::draft)
+            .and_then(|d| d.seed(last))
+            .cloned()
+            .ok_or_else(|| bad(format!("owner {seq} has no seed for row {last}")))?;
+        let drawn = self.draw(seq, seed, anchor, n, params, rng);
+        let settled = self.settle(seq);
+        let out = drawn?;
+        settled.map(|()| out)
+    }
+
+    fn draw(
+        &mut self,
+        seq: SeqId,
+        mut h: MxArray,
+        mut token: u32,
+        n: usize,
+        params: &ChatParams,
+        rng: &mut dyn Rng,
+    ) -> Result<DsparkProposal> {
+        let mut out = empty_proposal();
+        let target = params.sampling_config.unwrap_or_default();
+        let greedy = crate::sampling::is_greedy_temperature(target.temperature.unwrap_or(1.0));
+        let cfg = crate::models::qwen3_5::mtp_decode::mtp_draft_sampling_config(target);
+        for _ in 0..n {
+            let tok = MxArray::from_uint32(&[token], &[1])?;
+            let emb = self.store.model.weights().token_embd().rows(&tok)?;
+            let (next, logits) = self.draft_row(seq, &h, &emb)?;
+            let logits = logits.reshape(&[-1])?;
+            let id = if greedy {
+                logits.argmax(-1, None)?.astype(DType::Int32)?
+            } else {
+                let dist = crate::sampling::sampling_distribution(&logits, Some(cfg))?
+                    .astype(DType::Float32)?;
+                let id = crate::sampling::sample_dense_distribution_array(&dist, &mut *rng)?;
+                out.draft_dists.push(dist);
+                id
+            };
+            MxArray::eval_arrays_with_context(&[&id], "hy_v4_flash MTP proposal")?;
+            let id = id.item_at_int32(0)?;
+            token = u32::try_from(id).map_err(|_| bad(format!("draft id {id}")))?;
+            out.draft_ids.push(id);
+            h = next;
+        }
+        Ok(out)
+    }
+
+    /// One decode wave of `rows` (distinct owners) on settled drafts: every
+    /// owner's trunk rows and the MTP rows they close.
+    pub(super) fn mtp_wave(
+        &mut self,
+        rows: &[(SeqId, &[u32])],
+        logits: Logits,
+    ) -> Result<Vec<Output>> {
+        let lanes = self.paged()?.lanes;
+        if rows.len() > lanes {
+            return Err(bad(format!(
+                "{} owners in a wave for {lanes} lanes",
+                rows.len()
+            )));
+        }
+        self.safe_point();
+        for &(seq, _) in rows {
+            self.settle(seq)?;
+        }
+        let wave: Vec<Rows<'_>> = rows
+            .iter()
+            .map(|&(seq, ids)| Rows { seq, ids, logits })
+            .collect();
+        self.wave_rows(&wave, RowKind::Decode, None)
+    }
+
+    /// `seq`'s pool rows and cell cut to `len`; an owner that cannot go
+    /// there is dropped.
+    pub(super) fn cut_owner(&mut self, seq: SeqId, len: usize) -> Result<()> {
+        let p = self.paged_mut()?;
+        let was = p.owners.active();
+        let held = p.adapter.request_tokens_for(seq).map_or(0, <[u32]>::len);
+        let cell = p.owners.get(seq).map_or(0, OwnerCell::len);
+        if held == len && cell == len {
+            return Ok(());
+        }
+        let cut = if held != cell || len > held {
+            Err(bad(format!(
+                "owner {seq}: a cut to {len} of {held} pool rows and a cell of {cell}"
+            )))
+        } else {
+            Self::cut_rows(p, seq, held - len, len)
+        };
+        if cut.is_err() {
+            lose(p, seq, was == Some(seq));
+        }
+        reactivate(p, was)?;
+        cut
+    }
+
+    fn cut_rows(p: &mut Paged, seq: SeqId, back: usize, len: usize) -> Result<()> {
+        let back = u32::try_from(back).map_err(|_| bad("rows exceed u32"))?;
+        p.adapter.rollback_last_tokens_for(seq, back).map_err(bad)?;
+        let history = p.adapter.request_tokens_for(seq).unwrap_or(&[]);
+        match p.owners.get_mut(seq) {
+            Some(c) => c.truncate(len, history),
+            None => Err(bad(format!("owner {seq} has no cell"))),
+        }
+    }
+
+    /// Reserves `rows` more pool rows for `seq`; false when they do not
+    /// fit (`rows_fit`) or the pool refuses.
+    pub(super) fn reserve_rows(&mut self, seq: SeqId, rows: usize) -> Result<bool> {
+        self.activate_paged_seq(seq)?;
+        let len = self.owner_len(seq);
+        let ctx = self.store.ctx;
+        let p = self.paged_mut()?;
+        if !rows_fit(rows, len, ctx, p.row_cap) {
+            return Ok(false);
+        }
+        let rows = u32::try_from(rows).map_err(|_| bad("rows exceed u32"))?;
+        Ok(p.adapter.reserve_rows(rows).is_ok())
+    }
+
+    /// The scheduled verify: every row in one wave, logits
+    /// `[rows, 1, vocab]` in row order; each owner's rows stay open until
+    /// its commit.
+    fn verify_scheduled(&mut self, rows: &[ScheduledVerifyRow]) -> Result<MxArray> {
+        let p = self.paged_mut()?;
+        p.spec.budget.close();
+        if !p.spec.open.is_empty() {
+            return Err(bad("a verify while another is open"));
+        }
+        let mut spans = Vec::with_capacity(rows.len());
+        for r in rows {
+            let start = self.owner_len(r.seq_id);
+            if r.tokens.is_empty()
+                || r.tokens.len() > LOOKAHEAD_MAX
+                || r.first_position as usize != start
+            {
+                return Err(bad(format!(
+                    "owner {}: {} verify rows at {} on a cell of {start}",
+                    r.seq_id,
+                    r.tokens.len(),
+                    r.first_position
+                )));
+            }
+            spans.push((r.seq_id, r.tokens.as_slice()));
+        }
+        let outs = self.mtp_wave(&spans, Logits::All)?;
+        let joined = join_logits(outs, rows);
+        let p = self.paged_mut()?;
+        for r in rows {
+            p.spec.open.insert(
+                r.seq_id,
+                Open {
+                    start: r.first_position as usize,
+                    rows: r.tokens.len(),
+                },
+            );
+        }
+        if joined.is_err() {
+            for r in rows {
+                let _ = self.close_verify(r.seq_id, 0);
+            }
+        }
+        joined
+    }
+
+    /// Closes `seq`'s open verify keeping `keep` rows.
+    fn close_verify(&mut self, seq: SeqId, keep: usize) -> Result<()> {
+        let open = self
+            .paged_mut()?
+            .spec
+            .open
+            .remove(&seq)
+            .ok_or_else(|| bad(format!("owner {seq} commits with no open verify")))?;
+        let len = match commit_len(open, keep) {
+            Ok(len) => len,
+            Err(e) => {
+                let _ = self.cut_owner(seq, open.start);
+                return Err(e);
+            }
+        };
+        self.cut_owner(seq, len)
+    }
+
+    fn commit_scheduled(&mut self, rows: &[ScheduledVerifyCommit]) -> Vec<Result<()>> {
+        let out = rows
+            .iter()
+            .map(|c| self.close_verify(c.seq_id, c.keep))
+            .collect();
+        let left: Vec<SeqId> = self
+            .paged
+            .as_ref()
+            .map(|p| p.spec.open.keys().copied().collect())
+            .unwrap_or_default();
+        for seq in left {
+            let _ = self.close_verify(seq, 0);
+        }
+        out
+    }
+}
+
+/// The verify's per-owner logits `[n, vocab]` as `[rows, 1, vocab]`.
+fn join_logits(outs: Vec<Output>, rows: &[ScheduledVerifyRow]) -> Result<MxArray> {
+    let mut parts = Vec::with_capacity(outs.len());
+    for (o, r) in outs.into_iter().zip(rows) {
+        let l = o
+            .logits
+            .ok_or_else(|| bad("a verify row returned no logits"))?;
+        if l.shape_at(0)? as usize != r.tokens.len() {
+            return Err(bad(format!(
+                "owner {}: {} logits rows for {} verify rows",
+                r.seq_id,
+                l.shape_at(0)?,
+                r.tokens.len()
+            )));
+        }
+        parts.push(l);
+    }
+    let all = match parts.len() {
+        0 => return Err(bad("a verify of no rows")),
+        1 => parts.swap_remove(0),
+        _ => MxArray::concatenate_many(parts.iter().collect(), Some(0))?,
+    };
+    all.expand_dims(1)
+}
+
 pub struct Prefix {
     pub cached: usize,
     pub suffix: usize,
@@ -1154,6 +1578,73 @@ impl PagedBackend for Inner {
     fn abort_paged_turn(&mut self) {
         self.drop_active();
     }
+
+    /// An exclusive MTP turn on the active owner, its first cycle's rows
+    /// reserved; false (AR) when they do not fit.
+    fn admit_paged_speculative_decode(&mut self, params: &ChatParams) -> Result<bool> {
+        if self.mtp.is_none() {
+            return Ok(false);
+        }
+        let seq = self
+            .paged()?
+            .owners
+            .active()
+            .ok_or_else(|| bad("an MTP turn without an active owner"))?;
+        self.settle(seq)?;
+        if !self.settled_at(seq, self.owner_len(seq)) {
+            return Ok(false);
+        }
+        self.reserve_rows(seq, turn_lookahead_rows(spec::PAGED_PLAN, params))
+    }
+
+    fn run_paged_speculative_decode(
+        &mut self,
+        args: PagedSpeculativeArgs<'_, '_, '_>,
+    ) -> Result<()> {
+        let PagedSpeculativeArgs {
+            y,
+            params,
+            reasoning_tracker,
+            profiler,
+            max_new_tokens,
+            eos_id,
+            generated_tokens,
+            token_history,
+            finish_reason,
+            first_token_instant,
+            report_perf,
+            generation_stream,
+            cancel_flag,
+            streaming,
+            ..
+        } = args;
+        MxArray::async_eval_arrays(&[&y]);
+        let mut rng = rand::rng();
+        run_mtp_turn(
+            self,
+            &mut rng,
+            MtpTurnArgs {
+                y,
+                depth: params.mtp_depth,
+                params,
+                reasoning_tracker,
+                profiler,
+                max_new_tokens,
+                eos_id,
+                generated_tokens,
+                token_history,
+                finish_reason,
+                first_token_instant,
+                report_perf,
+                generation_stream,
+                prompt_hidden: None,
+                prompt_hidden_ids: None,
+                cancel_flag,
+            },
+            streaming,
+        )
+        .map(drop)
+    }
 }
 
 impl HybridSchedulerBackend for Inner {
@@ -1173,6 +1664,66 @@ impl HybridSchedulerBackend for Inner {
 
     fn ownerless_session_in_owner_tables(&self) -> bool {
         true
+    }
+
+    fn supports_scheduled_speculation(&self) -> bool {
+        self.paged.is_some() && self.mtp.is_some()
+    }
+
+    /// The owner speculates from its prefill when its draft stands settled
+    /// at `position` (a new cell at row 0, a live or resumed one at its end).
+    fn begin_scheduled_speculation(&mut self, seq: SeqId, position: u32) -> Result<bool> {
+        if !self.supports_scheduled_speculation() {
+            return Ok(false);
+        }
+        self.activate_row(seq)?;
+        self.settle(seq)?;
+        Ok(self.settled_at(seq, position as usize))
+    }
+
+    fn reserve_scheduled_speculation(&mut self, seq: SeqId, queries: usize) -> Result<bool> {
+        let fits = self.reserve_rows(seq, queries)?;
+        if fits {
+            self.paged_mut()?.spec.budget.reserved(seq);
+        }
+        Ok(fits)
+    }
+
+    fn propose_scheduled(
+        &mut self,
+        seq: SeqId,
+        anchor: u32,
+        cap: usize,
+        params: &ChatParams,
+        rng: &mut dyn Rng,
+        _confidence: bool,
+    ) -> Result<DsparkProposal> {
+        let p = self.paged_mut()?;
+        let row_cap = p.row_cap;
+        let n = p.spec.budget.grant(seq, cap, row_cap);
+        self.propose(seq, anchor, n, params, rng)
+    }
+
+    fn run_scheduled_verify(&mut self, rows: &[ScheduledVerifyRow]) -> Result<MxArray> {
+        self.verify_scheduled(rows)
+    }
+
+    fn commit_scheduled_verify(
+        &mut self,
+        rows: &[ScheduledVerifyCommit],
+    ) -> Result<Vec<Result<()>>> {
+        Ok(self.commit_scheduled(rows))
+    }
+
+    /// An open verify of `seq` goes back to its start.
+    fn release_scheduled_speculation(&mut self, seq: SeqId) {
+        let open = self
+            .paged
+            .as_ref()
+            .is_some_and(|p| p.spec.open.contains_key(&seq));
+        if open && let Err(e) = self.close_verify(seq, 0) {
+            tracing::warn!("hy_v4_flash owner {seq}: {}", e.reason);
+        }
     }
 
     fn scheduler_capacity(&self) -> usize {

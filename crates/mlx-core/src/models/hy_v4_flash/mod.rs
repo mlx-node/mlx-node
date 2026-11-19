@@ -58,6 +58,8 @@ mod tests_rows;
 #[cfg(test)]
 mod tests_sched;
 #[cfg(test)]
+mod tests_sched_mtp;
+#[cfg(test)]
 mod tests_weights;
 
 pub use config::{

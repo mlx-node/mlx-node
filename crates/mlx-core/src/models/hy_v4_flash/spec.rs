@@ -1,6 +1,9 @@
-//! Flat speculative decode with the MTP head: the engine's `run_mtp_turn`
-//! drives `Stepper`; `run_turn` is the whole turn around it (verify,
-//! chunked prefill, first sample, MTP loop, save, finalize, stream).
+//! Speculative decode with the MTP head: the engine's `run_mtp_turn`
+//! drives `Stepper` (flat: one `Lagged` sequence; paged: the active owner
+//! of an exclusive turn, `Paged`); `run_turn` is the flat whole turn around
+//! it (verify, chunked prefill, first sample, MTP loop, save, finalize,
+//! stream). Scheduled turns use the propose / verify / commit hooks of
+//! `sched.rs` instead.
 //!
 //! ```text
 //! Step A  forward y at p        draft row p-1 closed first when missing (seed, y)
@@ -11,7 +14,9 @@
 //! ```
 //!
 //! Every trunk state is a set of lengths with `WINDOW_SLACK` rows of window
-//! and indexer slack, so a rejected draft is a truncation.
+//! and indexer slack, so a rejected draft is a truncation. In paged mode a
+//! wave writes the MTP rows its trunk rows close, so a commit only checks
+//! and the rollback's cut leaves the exact rows.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::sync::Arc;
@@ -20,6 +25,7 @@ use std::time::Instant;
 use napi::{Error, Result};
 
 use super::cache::WINDOW_SLACK;
+use super::chat::Inner;
 use super::model::{Logits, Model, Want};
 use super::moe::RowKind;
 use super::mtp::{Draft, Lagged, MtpLayer, Seeds};
@@ -37,6 +43,7 @@ use crate::engine::{ReasoningTracker, apply_all_penalties, compute_performance_m
 use crate::models::qwen3_5::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
 use crate::nn::Embedding;
 use crate::stream::{Stream, WiredLimitContext};
+use crate::transformer::paged_kv_cache_adapter::SeqId;
 
 /// Most trunk rows one cycle may add past the snapshot: the anchor plus
 /// `WINDOW_SLACK` drafts, all of which a rejection must be able to cut.
@@ -49,6 +56,12 @@ pub(crate) const PLAN: SpeculativePlan = SpeculativePlan {
     supported_context_media: MediaCapabilities::NONE,
     supports_paged_attention: false,
     supports_streaming: true,
+};
+
+/// The paged MTP plan: verify on the pool, so the scheduled lane.
+pub(crate) const PAGED_PLAN: SpeculativePlan = SpeculativePlan {
+    supports_paged_attention: true,
+    ..PLAN
 };
 
 fn bad(msg: impl std::fmt::Display) -> Error {
@@ -125,7 +138,7 @@ fn commit_hiddens(
 /// The per-turn MTP stepper over one `Lagged` sequence. `committed` counts
 /// the draft rows that pair trunk outputs with committed tokens; rows past
 /// it are drafts of this cycle.
-pub(crate) struct Stepper<'a> {
+pub(crate) struct Flat<'a> {
     model: &'a Model,
     mtp: &'a MtpLayer,
     seq: &'a mut Lagged,
@@ -135,9 +148,9 @@ pub(crate) struct Stepper<'a> {
     err: Option<Error>,
 }
 
-impl<'a> Stepper<'a> {
+impl<'a> Flat<'a> {
     /// A stepper on a settled sequence (`trunk - 1` draft rows).
-    pub(crate) fn begin(model: &'a Model, mtp: &'a MtpLayer, seq: &'a mut Lagged) -> Result<Self> {
+    fn begin(model: &'a Model, mtp: &'a MtpLayer, seq: &'a mut Lagged) -> Result<Self> {
         let trunk = seq.len();
         let draft = seq
             .draft()
@@ -187,7 +200,7 @@ impl<'a> Stepper<'a> {
     }
 }
 
-impl MtpStepper for Stepper<'_> {
+impl MtpStepper for Flat<'_> {
     fn embedding(&self) -> &Embedding {
         &self.embedding
     }
@@ -370,6 +383,385 @@ impl MtpStepper for Stepper<'_> {
 
     fn into_desynced(self) -> bool {
         false
+    }
+}
+
+/// The per-turn MTP stepper of an exclusive paged turn over the active
+/// owner. Each trunk forward is a one-owner wave, which also writes the MTP
+/// rows it closes; draft rows past the trunk's last row are this cycle's
+/// and go before the next wave.
+pub(crate) struct Paged<'a> {
+    inner: &'a mut Inner,
+    seq: SeqId,
+    embedding: Embedding,
+    snap: Option<usize>,
+    err: Option<Error>,
+}
+
+impl<'a> Paged<'a> {
+    fn begin(inner: &'a mut Inner) -> Result<Self> {
+        let embedding = inner
+            .mtp
+            .as_ref()
+            .ok_or_else(|| bad("an MTP turn without the MTP layer"))?
+            .embedding()
+            .clone();
+        let seq = inner
+            .paged()?
+            .owners
+            .active()
+            .ok_or_else(|| bad("a paged MTP turn without an active owner"))?;
+        if inner.owner_len(seq) == 0 {
+            return Err(bad("a paged MTP turn on an empty cell"));
+        }
+        inner.settle(seq)?;
+        Ok(Self {
+            inner,
+            seq,
+            embedding,
+            snap: None,
+            err: None,
+        })
+    }
+
+    fn stash(&mut self, r: Result<()>) {
+        if let Err(e) = r
+            && self.err.is_none()
+        {
+            self.err = Some(e);
+        }
+    }
+
+    /// One wave of `ids` with `logits`: `(logits, hidden)` of its rows.
+    fn wave(&mut self, ids: &[u32], logits: Logits) -> Result<(MxArray, MxArray)> {
+        let out = self
+            .inner
+            .mtp_wave(&[(self.seq, ids)], logits)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| bad("the wave returned no owner"))?;
+        out.logits
+            .zip(out.hidden)
+            .ok_or_else(|| bad("the wave returned no logits or hiddens"))
+    }
+}
+
+impl MtpStepper for Paged<'_> {
+    fn embedding(&self) -> &Embedding {
+        &self.embedding
+    }
+
+    fn committed_history_active(&self) -> bool {
+        true
+    }
+
+    fn profiler_relabel(&self) -> Option<&'static str> {
+        Some("hy4_mtp")
+    }
+
+    fn forward_with_hidden(
+        &mut self,
+        ids: &MxArray,
+        _embedding: &Embedding,
+    ) -> Result<(MxArray, MxArray, bool)> {
+        let token = ids.item_at_int32(0)? as u32;
+        let (logits, hidden) = self.wave(&[token], Logits::Last)?;
+        Ok((logits, hidden, false))
+    }
+
+    fn draft_step(&mut self, prev_h: &MxArray, prev_emb: &MxArray) -> Result<(MxArray, MxArray)> {
+        self.inner.draft_row(self.seq, prev_h, prev_emb)
+    }
+
+    fn verify_step(
+        &mut self,
+        ids: &[u32],
+        _embedding: &Embedding,
+        depth: usize,
+    ) -> Result<MtpVerifyOutput> {
+        if ids.len() != depth + 1 || ids.len() > LOOKAHEAD_MAX {
+            return Err(bad(format!("{} verify ids at depth {depth}", ids.len())));
+        }
+        let start = self.inner.owner_len(self.seq);
+        let (logits, hidden) = self.wave(ids, Logits::All)?;
+        let shaped = verify_output(&logits, &hidden, ids.len() as i64);
+        if shaped.is_err() {
+            let _ = self.inner.cut_owner(self.seq, start);
+        }
+        shaped
+    }
+
+    fn snapshot_main_linear(&mut self) {
+        self.snap = Some(self.inner.owner_len(self.seq));
+    }
+
+    fn rollback(&mut self, accepted_drafts: usize, depth: usize) {
+        if self.err.is_some() {
+            return;
+        }
+        let r = match self.snap {
+            Some(snap) if accepted_drafts <= depth => self
+                .inner
+                .cut_owner(self.seq, verify_keep(snap, accepted_drafts)),
+            Some(_) => Err(bad(format!("{accepted_drafts} accepted of {depth} drafts"))),
+            None => Err(bad("rollback without a snapshot")),
+        };
+        self.stash(r);
+    }
+
+    fn restore_and_replay_main(&mut self, _accepted: &[u32], _embedding: &Embedding) -> Result<()> {
+        match self.err.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// The verify wave already wrote the exact MTP rows of every verify
+    /// row; the rollback's cut keeps the committed ones.
+    fn commit_mtp(
+        &mut self,
+        _anchor: MtpCommitAnchor,
+        _seed_h: &MxArray,
+        _verify_hiddens: &MxArray,
+        committed_ids: &[u32],
+        _k_accepted: usize,
+        _embedding: &Embedding,
+    ) -> Result<()> {
+        if self.snap.is_none() || committed_ids.is_empty() {
+            return Err(bad("a commit without a snapshot or ids"));
+        }
+        Ok(())
+    }
+
+    fn begin_cycle(&mut self, _chained_anchor: bool) {
+        let r = self.inner.settle(self.seq);
+        self.stash(r);
+    }
+
+    /// `Ok(false)` past the slack, the row cap or the context: the engine
+    /// decodes the token AR instead.
+    fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
+        self.inner.reserve_rows(self.seq, rows)
+    }
+
+    fn eval_step(&self, token: &MxArray, logits: &MxArray, budget_forced: bool) {
+        if budget_forced {
+            MxArray::async_eval_arrays(&[token, logits]);
+        } else {
+            MxArray::async_eval_arrays(&[token]);
+        }
+    }
+
+    fn eval_step_with_chained_hidden(&self, token: &MxArray, chained_h: &MxArray) {
+        MxArray::async_eval_arrays(&[token, chained_h]);
+    }
+
+    fn rollback_unemitted(&mut self, unemitted: usize) {
+        let keep = unemitted_keep(self.inner.owner_len(self.seq), unemitted);
+        let r = self.inner.cut_owner(self.seq, keep);
+        self.stash(r);
+    }
+
+    fn frontier(&self) -> Option<SpecFrontier> {
+        Some(SpecFrontier {
+            attn_tokens: self.inner.owner_len(self.seq) as u64,
+            recurrent_tokens: None,
+        })
+    }
+
+    fn take_replay_error(&mut self) -> Option<Error> {
+        self.err.take()
+    }
+
+    fn into_desynced(self) -> bool {
+        false
+    }
+}
+
+/// A verify's `logits [n, vocab]` and `hidden [n, d]` as one owner's
+/// `[1, n, ..]`.
+fn verify_output(logits: &MxArray, hidden: &MxArray, n: i64) -> Result<MtpVerifyOutput> {
+    let (v, d) = (logits.shape_at(1)?, hidden.shape_at(1)?);
+    Ok(MtpVerifyOutput {
+        logits: logits.reshape(&[1, n, v])?,
+        hiddens: hidden.reshape(&[1, n, d])?,
+    })
+}
+
+/// The MTP stepper of a turn: flat or paged, by the load's mode.
+pub(crate) enum Stepper<'a> {
+    Flat(Flat<'a>),
+    Paged(Paged<'a>),
+}
+
+impl<'a> Stepper<'a> {
+    /// A flat stepper on a settled sequence (`trunk - 1` draft rows).
+    pub(crate) fn begin(model: &'a Model, mtp: &'a MtpLayer, seq: &'a mut Lagged) -> Result<Self> {
+        Flat::begin(model, mtp, seq).map(Self::Flat)
+    }
+
+    /// A paged stepper on `inner`'s active owner.
+    pub(crate) fn paged(inner: &'a mut Inner) -> Result<Self> {
+        Paged::begin(inner).map(Self::Paged)
+    }
+}
+
+impl MtpStepper for Stepper<'_> {
+    fn embedding(&self) -> &Embedding {
+        match self {
+            Self::Flat(s) => s.embedding(),
+            Self::Paged(s) => s.embedding(),
+        }
+    }
+
+    fn committed_history_active(&self) -> bool {
+        match self {
+            Self::Flat(s) => s.committed_history_active(),
+            Self::Paged(s) => s.committed_history_active(),
+        }
+    }
+
+    fn profiler_relabel(&self) -> Option<&'static str> {
+        match self {
+            Self::Flat(s) => s.profiler_relabel(),
+            Self::Paged(s) => s.profiler_relabel(),
+        }
+    }
+
+    fn forward_with_hidden(
+        &mut self,
+        ids: &MxArray,
+        embedding: &Embedding,
+    ) -> Result<(MxArray, MxArray, bool)> {
+        match self {
+            Self::Flat(s) => s.forward_with_hidden(ids, embedding),
+            Self::Paged(s) => s.forward_with_hidden(ids, embedding),
+        }
+    }
+
+    fn draft_step(&mut self, prev_h: &MxArray, prev_emb: &MxArray) -> Result<(MxArray, MxArray)> {
+        match self {
+            Self::Flat(s) => s.draft_step(prev_h, prev_emb),
+            Self::Paged(s) => s.draft_step(prev_h, prev_emb),
+        }
+    }
+
+    fn verify_step(
+        &mut self,
+        ids: &[u32],
+        embedding: &Embedding,
+        depth: usize,
+    ) -> Result<MtpVerifyOutput> {
+        match self {
+            Self::Flat(s) => s.verify_step(ids, embedding, depth),
+            Self::Paged(s) => s.verify_step(ids, embedding, depth),
+        }
+    }
+
+    fn snapshot_main_linear(&mut self) {
+        match self {
+            Self::Flat(s) => s.snapshot_main_linear(),
+            Self::Paged(s) => s.snapshot_main_linear(),
+        }
+    }
+
+    fn rollback(&mut self, accepted_drafts: usize, depth: usize) {
+        match self {
+            Self::Flat(s) => s.rollback(accepted_drafts, depth),
+            Self::Paged(s) => s.rollback(accepted_drafts, depth),
+        }
+    }
+
+    fn restore_and_replay_main(&mut self, accepted: &[u32], embedding: &Embedding) -> Result<()> {
+        match self {
+            Self::Flat(s) => s.restore_and_replay_main(accepted, embedding),
+            Self::Paged(s) => s.restore_and_replay_main(accepted, embedding),
+        }
+    }
+
+    fn commit_mtp(
+        &mut self,
+        anchor: MtpCommitAnchor,
+        seed_h: &MxArray,
+        verify_hiddens: &MxArray,
+        committed_ids: &[u32],
+        k_accepted: usize,
+        embedding: &Embedding,
+    ) -> Result<()> {
+        match self {
+            Self::Flat(s) => s.commit_mtp(
+                anchor,
+                seed_h,
+                verify_hiddens,
+                committed_ids,
+                k_accepted,
+                embedding,
+            ),
+            Self::Paged(s) => s.commit_mtp(
+                anchor,
+                seed_h,
+                verify_hiddens,
+                committed_ids,
+                k_accepted,
+                embedding,
+            ),
+        }
+    }
+
+    fn begin_cycle(&mut self, chained_anchor: bool) {
+        match self {
+            Self::Flat(s) => s.begin_cycle(chained_anchor),
+            Self::Paged(s) => s.begin_cycle(chained_anchor),
+        }
+    }
+
+    fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
+        match self {
+            Self::Flat(s) => s.reserve_cycle_lookahead(rows),
+            Self::Paged(s) => s.reserve_cycle_lookahead(rows),
+        }
+    }
+
+    fn eval_step(&self, token: &MxArray, logits: &MxArray, budget_forced: bool) {
+        match self {
+            Self::Flat(s) => s.eval_step(token, logits, budget_forced),
+            Self::Paged(s) => s.eval_step(token, logits, budget_forced),
+        }
+    }
+
+    fn eval_step_with_chained_hidden(&self, token: &MxArray, chained_h: &MxArray) {
+        match self {
+            Self::Flat(s) => s.eval_step_with_chained_hidden(token, chained_h),
+            Self::Paged(s) => s.eval_step_with_chained_hidden(token, chained_h),
+        }
+    }
+
+    fn rollback_unemitted(&mut self, unemitted: usize) {
+        match self {
+            Self::Flat(s) => s.rollback_unemitted(unemitted),
+            Self::Paged(s) => s.rollback_unemitted(unemitted),
+        }
+    }
+
+    fn frontier(&self) -> Option<SpecFrontier> {
+        match self {
+            Self::Flat(s) => s.frontier(),
+            Self::Paged(s) => s.frontier(),
+        }
+    }
+
+    fn take_replay_error(&mut self) -> Option<Error> {
+        match self {
+            Self::Flat(s) => s.take_replay_error(),
+            Self::Paged(s) => s.take_replay_error(),
+        }
+    }
+
+    fn into_desynced(self) -> bool {
+        match self {
+            Self::Flat(s) => s.into_desynced(),
+            Self::Paged(s) => s.into_desynced(),
+        }
     }
 }
 

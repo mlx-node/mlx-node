@@ -671,6 +671,7 @@ impl ChatBackend for Inner {
                 paged_attention: Some(PagedAttentionPlan {
                     supports_delta: true,
                 }),
+                speculative: self.mtp.as_ref().map(|_| spec::PAGED_PLAN),
                 ..ExecutionPlan::TEXT_ONLY
             };
         }
@@ -696,6 +697,9 @@ impl MtpBackend for Inner {
         Self: 'a;
 
     fn begin_mtp_decode(&mut self, _setup: &MtpTurnSetup<'_>) -> Result<spec::Stepper<'_>> {
+        if self.paged.is_some() {
+            return spec::Stepper::paged(self);
+        }
         let mtp = self
             .mtp
             .as_ref()
