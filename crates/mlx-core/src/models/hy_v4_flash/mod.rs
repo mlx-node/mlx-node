@@ -20,8 +20,10 @@ pub mod moe;
 pub mod mtp;
 pub mod mtp_weights;
 pub mod ops;
+pub mod owner;
 pub mod paged;
 pub mod prefill;
+pub mod prefix_state;
 pub mod rows;
 pub mod scan;
 pub mod sparse;
@@ -41,11 +43,15 @@ mod tests_model;
 #[cfg(test)]
 mod tests_mtp;
 #[cfg(test)]
+mod tests_owner;
+#[cfg(test)]
 mod tests_paged;
 #[cfg(all(test, target_os = "macos"))]
 mod tests_pool;
 #[cfg(test)]
 mod tests_prefill;
+#[cfg(test)]
+mod tests_prefix_state;
 #[cfg(test)]
 mod tests_rows;
 #[cfg(test)]

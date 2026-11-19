@@ -37,6 +37,7 @@ use super::cache::WINDOW_SLACK;
 use super::config::{Attn, HyV4FlashConfig};
 use super::model::Model;
 use super::moe::ExpertSource;
+use super::mtp::SEEDS;
 use super::rows::{EngramRows, F8Table};
 use super::scan::{Role, Scan};
 use super::weights::{Form, Resident, form, resident_bytes, role_resident};
@@ -124,7 +125,8 @@ pub fn lane_profile(p: &Profile, lanes: usize, floor: u64) -> Profile {
 /// Bytes a lane holds beside the shared KV allowance: the f16 window ring
 /// (`window + WINDOW_SLACK` rows) of every sliding layer, the f32 indexer
 /// tail (`kpool - 1 + WINDOW_SLACK` rows) of every indexed layer (the MTP
-/// layer's with `mtp`) and one f32 seed row.
+/// layer's with `mtp`) and, with `mtp`, the `SEEDS` f32 seed rows of the
+/// live draft.
 pub fn lane_floor(cfg: &HyV4FlashConfig, mtp: bool) -> u64 {
     let layers = if mtp { &cfg.layers[..] } else { cfg.trunk() };
     let count = |a: Attn| layers.iter().filter(|l| l.attn == a).count() as u64;
@@ -132,7 +134,12 @@ pub fn lane_floor(cfg: &HyV4FlashConfig, mtp: bool) -> u64 {
         count(Attn::Sliding) * (cfg.window + WINDOW_SLACK) as u64 * cfg.mla.kv_row() as u64 * 2;
     let tail = (cfg.indexer.kpool.saturating_sub(1) + WINDOW_SLACK) as u64;
     let tails = count(Attn::Indexed) * tail * cfg.indexer.head_dim as u64 * 4;
-    windows + tails + cfg.dim as u64 * 4
+    let seeds = if mtp {
+        SEEDS as u64 * cfg.dim as u64 * 4
+    } else {
+        0
+    };
+    windows + tails + seeds
 }
 
 /// The most lanes up to `want` (at least 1) whose admission `admit(lanes)`

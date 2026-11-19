@@ -367,7 +367,8 @@ fn splitk_env_reads_like_atoi() {
 fn lanes_charge_their_floor() {
     let cfg = crate::models::hy_v4_flash::tests_model::tiny_cfg();
     let floor = lane_floor(&cfg, false);
-    assert_eq!(floor, 2 * 11 * 24 * 2 + 2 * 6 * 16 * 4 + 32 * 4);
+    assert_eq!(floor, 2 * 11 * 24 * 2 + 2 * 6 * 16 * 4);
+    assert_eq!(lane_floor(&cfg, true) - floor, SEEDS as u64 * 32 * 4);
     let p = profile(15_812);
     assert_eq!(lane_profile(&p, 1, floor), p);
     assert_eq!(lane_profile(&p, 0, floor), p);
@@ -553,11 +554,11 @@ fn real_lane_floor_and_wave_shapes() {
     let s = real_scan();
     assert_eq!(
         lane_floor(&s.cfg, true),
-        30 * 515 * 576 * 2 + 13 * 6 * 128 * 4 + 3072 * 4
+        30 * 515 * 576 * 2 + 13 * 6 * 128 * 4 + 8 * 3072 * 4
     );
     assert_eq!(
         lane_floor(&s.cfg, false),
-        30 * 515 * 576 * 2 + 12 * 6 * 128 * 4 + 3072 * 4
+        30 * 515 * 576 * 2 + 12 * 6 * 128 * 4
     );
     let shapes = q8_shapes(&s, true).unwrap();
     for want in [

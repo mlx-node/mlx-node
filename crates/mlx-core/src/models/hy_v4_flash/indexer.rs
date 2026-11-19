@@ -295,7 +295,39 @@ impl TokTail {
         self.keep
     }
 
-    fn nbytes(&self) -> usize {
+    /// A tail of `len` positions holding `rows [held, d]` (f32), the
+    /// `tok_k` rows of its last `held` positions. Refused past `keep` rows,
+    /// past `len`, or without the open group's rows.
+    pub fn of_rows(g: &IndexerGeometry, rows: Option<MxArray>, len: usize) -> Result<Self> {
+        let mut t = Self::new(g);
+        let held = match &rows {
+            None => 0,
+            Some(r) => match r.shape()?.as_ref() {
+                &[n, w] if w == t.width && n > 0 => n as usize,
+                s => {
+                    return Err(bad(format!("tail rows {s:?}, need [n > 0, {}]", t.width)));
+                }
+            },
+        };
+        let open = len % t.kpool;
+        if held > t.keep || held > len || held < open {
+            return Err(bad(format!(
+                "a tail of {len} positions with {held} rows (keep {}, open {open})",
+                t.keep
+            )));
+        }
+        t.rows = rows.map(|r| r.astype(DType::Float32)).transpose()?;
+        t.held = held;
+        t.len = len;
+        Ok(t)
+    }
+
+    /// The held rows `[held, d]` f32.
+    pub fn rows(&self) -> Option<&MxArray> {
+        self.rows.as_ref()
+    }
+
+    pub fn nbytes(&self) -> usize {
         self.rows.as_ref().map_or(0, MxArray::nbytes)
     }
 
@@ -388,6 +420,10 @@ impl IndexerMark {
 
     pub fn is_empty(&self) -> bool {
         self.tail.len == 0
+    }
+
+    pub fn tail(&self) -> &TokTail {
+        &self.tail
     }
 
     /// The groups pooled at the mark; refused past the `pooled` groups held.
@@ -526,6 +562,10 @@ impl IndexerState {
         self.tail.held
     }
 
+    pub fn tail(&self) -> &TokTail {
+        &self.tail
+    }
+
     pub fn mark(&self) -> IndexerMark {
         IndexerMark {
             tail: self.tail.clone(),
@@ -536,6 +576,29 @@ impl IndexerState {
     /// have been rewritten since.
     pub fn restore(&mut self, m: IndexerMark) -> Result<()> {
         restore_in(&mut self.pooled, &mut self.tail, m)
+    }
+
+    /// Fills an empty state: the pooled keys `[k, d]` of groups `0..k`
+    /// (none when `k = 0`) and `tail`, which must close exactly `k` groups.
+    pub fn fill(&mut self, pooled: Option<&MxArray>, tail: TokTail) -> Result<()> {
+        if !self.is_empty() || !self.pooled.is_empty() {
+            return Err(bad("fill of an indexer that holds positions"));
+        }
+        if (tail.kpool, tail.width) != (self.tail.kpool, self.tail.width) {
+            return Err(bad("fill with a tail of another indexer"));
+        }
+        let k = pooled.map(|p| p.shape_at(0)).transpose()?.unwrap_or(0) as usize;
+        if tail.len / tail.kpool != k {
+            return Err(bad(format!(
+                "a tail of {} positions over {k} pooled groups",
+                tail.len
+            )));
+        }
+        if let Some(p) = pooled {
+            self.pooled.write(p, 0)?;
+        }
+        self.tail = tail;
+        Ok(())
     }
 
     /// Drops the positions past `len`. Refused when the open rows of `len`
@@ -567,6 +630,16 @@ impl PagedIndexerState {
             layer,
             groups: 0,
             tail: TokTail::new(g),
+        }
+    }
+
+    /// The state at `tail.len()` positions with every closed group in the
+    /// index plane.
+    pub fn at(layer: u32, tail: TokTail) -> Self {
+        Self {
+            layer,
+            groups: tail.len / tail.kpool,
+            tail,
         }
     }
 

@@ -27,7 +27,7 @@ use napi::{Error, Result};
 
 use super::attention::{Geometry, Mla};
 use super::cache::ROW_DTYPE;
-use super::indexer::{Call, Indexer, IndexerGeometry, IndexerMark, IndexerState};
+use super::indexer::{Call, Indexer, IndexerGeometry, IndexerMark, IndexerState, TokTail};
 use super::ladder::Snapshot;
 use super::model::{Mark, Model, Output, Session, Want, head_rows};
 use super::moe::{ExpertSource, FfnConfig, LayerFfn, RowKind, qlinear};
@@ -275,9 +275,58 @@ pub struct DraftMark {
 }
 
 impl Draft {
+    /// An empty draft of latent rows `row` wide for a sequence of at most
+    /// `cap` trunk positions.
+    pub fn new(row: i64, g: &IndexerGeometry, cap: usize) -> Self {
+        let cap = cap + DRAFT_SLACK;
+        Self {
+            kv: KvRows::new(row, cap),
+            index: IndexerState::new(cap, g),
+            seeds: Seeds::default(),
+            kpool: g.kpool,
+            cap,
+        }
+    }
+
     /// MTP rows held.
     pub fn len(&self) -> usize {
         self.kv.len()
+    }
+
+    pub fn index(&self) -> &IndexerState {
+        &self.index
+    }
+
+    /// Fills an empty draft with `m` settled rows: K/V `kv [m, row]` (none
+    /// when `m = 0`), the pooled keys of their closed groups, the indexer
+    /// tail of `m` positions and the seed `h_trunk(m)` (`[1, d]` f32). On
+    /// error the draft stays empty.
+    pub fn fill(
+        &mut self,
+        kv: Option<&MxArray>,
+        pooled: Option<&MxArray>,
+        tail: TokTail,
+        seed: MxArray,
+    ) -> Result<()> {
+        if !self.is_empty() || !self.index.is_empty() || self.seeds.nbytes() > 0 {
+            return Err(bad("fill of a draft that holds rows"));
+        }
+        let m = kv.map(|k| k.shape_at(0)).transpose()?.unwrap_or(0) as usize;
+        if tail.len() != m {
+            return Err(bad(format!(
+                "{m} K/V rows with an indexer tail of {}",
+                tail.len()
+            )));
+        }
+        self.index.fill(pooled, tail)?;
+        if let Some(k) = kv
+            && let Err(e) = self.kv.write(k, 0)
+        {
+            self.index.truncate(0)?;
+            return Err(e);
+        }
+        self.seeds.extend(vec![(m, seed)]);
+        Ok(())
     }
 
     pub fn is_empty(&self) -> bool {
@@ -471,15 +520,11 @@ impl MtpLayer {
 
     /// An empty draft for a sequence of at most `cap` trunk positions.
     pub fn new_draft(&self, cap: usize) -> Draft {
-        let g = self.indexer.geometry();
-        let cap = cap + DRAFT_SLACK;
-        Draft {
-            kv: KvRows::new(self.mla.geometry().row() as i64, cap),
-            index: IndexerState::new(cap, g),
-            seeds: Seeds::default(),
-            kpool: g.kpool,
+        Draft::new(
+            self.mla.geometry().row() as i64,
+            self.indexer.geometry(),
             cap,
-        }
+        )
     }
 
     fn nextn(&self) -> Result<&NextnWeights> {
