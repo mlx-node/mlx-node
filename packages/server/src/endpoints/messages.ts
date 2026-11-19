@@ -91,6 +91,7 @@ import {
   mapStopReason,
   visibleAnswerText,
 } from '../mappers/anthropic-response.js';
+import { withoutReasoningClose } from '../mappers/reasoning-close.js';
 import { genId } from '../mappers/response.js';
 import { withNestedArguments } from '../mappers/tool-arguments.js';
 import type { TurnBudgetFrom } from '../metrics-trace.js';
@@ -772,7 +773,7 @@ async function handleStreamingNativeWithAbort(
       // Delta event
       if (event.isReasoning) {
         if (!emitReasoning) continue;
-        const deltaText = event.text.replace(/<\/think>/g, '');
+        const deltaText = withoutReasoningClose(event.text);
         if (!deltaText) continue;
 
         if (!hasEmittedThinking) {
@@ -1094,6 +1095,7 @@ async function collectStoppedTurn(
         reasoningTokens: event.reasoningTokens,
         finishReason: event.finishReason,
         rawText: event.rawText !== '' ? event.rawText : text,
+        publicRawText: event.publicRawText,
         cachedTokens: event.cachedTokens ?? 0,
         performance: event.performance,
       };

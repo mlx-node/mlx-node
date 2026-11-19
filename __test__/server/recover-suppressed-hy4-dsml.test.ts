@@ -179,19 +179,22 @@ describe('visibleAnswerText with tool use not allowed', () => {
   for (const x of ['6124c78e', 'opensource']) {
     it(`a Hy4 :${x} turn shows no markup`, () => {
       const call = { ...ok, rawContent: hy4Call(x) };
-      expect(visibleAnswerText({ text: '', rawText: hy4Block(x), toolCalls: [call] }, false)).toBe('');
+      expect(visibleAnswerText({ text: '', publicRawText: hy4Block(x), toolCalls: [call] }, false)).toBe('');
       expect(
-        visibleAnswerText({ text: '', rawText: `${hy4Block(x)}\nThe forecast follows.`, toolCalls: [call] }, false),
+        visibleAnswerText(
+          { text: '', publicRawText: `${hy4Block(x)}\nThe forecast follows.`, toolCalls: [call] },
+          false,
+        ),
       ).toBe('\nThe forecast follows.');
       expect(
         visibleAnswerText(
-          { text: '', rawText: `<think:${x}>\n</think:${x}>\n${hy4Block(x)}`, toolCalls: [call] },
+          { text: '', publicRawText: `<think:${x}>\n</think:${x}>\n${hy4Block(x)}`, toolCalls: [call] },
           false,
         ),
       ).toBe('');
       const result = {
         text: '',
-        rawText: hy4Block(x),
+        publicRawText: hy4Block(x),
         toolCalls: [call],
         thinking: null,
         finishReason: 'tool_calls',
@@ -203,8 +206,71 @@ describe('visibleAnswerText with tool use not allowed', () => {
   it('a DSML turn reaches the recovery and shows no markup', () => {
     expect(containsToolCallMarkup(dsmlBlock())).toBe(true);
     const call = { ...ok, name: 'lookup', rawContent: '' };
-    expect(visibleAnswerText({ text: '', rawText: `${dsmlBlock()}\ntrailing`, toolCalls: [call] }, false)).toBe(
+    expect(visibleAnswerText({ text: '', publicRawText: `${dsmlBlock()}\ntrailing`, toolCalls: [call] }, false)).toBe(
       '\ntrailing',
     );
   });
+});
+
+// vLLM builds the text from the content after the reasoning, tool blocks
+// removed. `before` is the old recovery from `rawText`, which held the
+// reasoning and its close. Mutation: recover from `rawText` again → red.
+describe('the answer never holds the reasoning', () => {
+  const ok = { id: 'call_1', name: 'get_weather', arguments: { city: 'Paris' }, status: 'ok', rawContent: '' };
+  const qwenBlock = '<tool_call>\n{"name":"get_weather","arguments":{"city":"Paris"}}\n</tool_call>';
+  const lfm2Block = '<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>';
+  const gemmaCall = '<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>';
+  const rows: { family: string; rawText: string; publicRawText?: string; before: string; after: string }[] = [
+    {
+      family: 'Qwen3.5',
+      rawText: `plan\n</think>\n\n${qwenBlock}`,
+      publicRawText: `\n\n${qwenBlock}`,
+      before: 'plan\n</think>\n\n',
+      after: '\n\n',
+    },
+    {
+      family: 'LFM2',
+      rawText: `plan</think>\n${lfm2Block}`,
+      publicRawText: `\n${lfm2Block}`,
+      before: 'plan</think>\n',
+      after: '\n',
+    },
+    ...['6124c78e', 'opensource'].map((x) => ({
+      family: `Hy4 :${x}`,
+      rawText: `plan</think:${x}>\n${hy4Block(x)}`,
+      publicRawText: `\n${hy4Block(x)}`,
+      before: `plan</think:${x}>\n`,
+      after: '\n',
+    })),
+    {
+      family: 'Hy4 thinking off',
+      rawText: `<think:6124c78e>\n</think:6124c78e>\n${hy4Block('6124c78e')}`,
+      publicRawText: `<think:6124c78e>\n</think:6124c78e>\n${hy4Block('6124c78e')}`,
+      before: '',
+      after: '',
+    },
+    {
+      family: 'DSML',
+      rawText: `plan</think>\n\n${dsmlBlock()}`,
+      publicRawText: `\n\n${dsmlBlock()}`,
+      before: 'plan</think>\n\n',
+      after: '\n\n',
+    },
+    { family: 'Gemma4 prompted channel', rawText: `plan<channel|>${gemmaCall}<turn|>`, before: 'plan', after: '' },
+    {
+      family: 'Gemma4 model-opened channel',
+      rawText: `<|channel>thought\nplan<channel|>${gemmaCall}`,
+      before: '',
+      after: '',
+    },
+    { family: 'Gemma4 bare label', rawText: `thought\nplan${gemmaCall}`, before: 'thought\nplan', after: '' },
+  ];
+  for (const row of rows) {
+    it(row.family, () => {
+      expect(recoverSuppressedToolCallText(row.rawText)).toBe(row.before);
+      const result = { text: '', rawText: row.rawText, publicRawText: row.publicRawText, toolCalls: [ok] };
+      expect(visibleAnswerText(result, false)).toBe(row.after);
+      expect(visibleAnswerText({ ...result, text: 'shown' }, false)).toBe('shown');
+    });
+  }
 });

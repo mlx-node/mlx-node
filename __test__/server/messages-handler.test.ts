@@ -150,6 +150,7 @@ function createMockModel(result: ChatResult = makeChatResult()): SessionCapableM
       promptTokens: result.promptTokens,
       reasoningTokens: result.reasoningTokens,
       rawText: result.rawText,
+      publicRawText: result.publicRawText,
     };
   }
   return {
@@ -1424,6 +1425,56 @@ describe('handleCreateMessage', () => {
           (event.data['content_block'] as Record<string, unknown> | undefined)?.['type'] === 'thinking',
       );
       expect(thinkingStart).toBeUndefined();
+    });
+
+    // vLLM `hy_v4_reasoning_parser` drops the close from the reasoning.
+    // Mutation: strip only `</think>` from the deltas → red.
+    it('a Hy4 turn with no tools streams no close tag and no reasoning as text', async () => {
+      const x = ':6124c78e';
+      const block =
+        `<tool_calls${x}><tool_call${x}>get_weather` +
+        `<arg_key${x}>city</arg_key${x}><arg_value${x}>Paris</arg_value${x}>` +
+        `</tool_call${x}></tool_calls${x}>`;
+      const registry = new ModelRegistry();
+      const streamEvents = [
+        { text: 'plan', done: false, isReasoning: true },
+        { text: `</think${x}>`, done: false, isReasoning: true },
+        { text: '\n', done: false, isReasoning: false },
+        { text: block, done: false, isReasoning: false },
+        {
+          text: '',
+          done: true,
+          finishReason: 'tool_calls',
+          toolCalls: [{ status: 'ok', id: 'call_x', name: 'get_weather', arguments: '{"city":"Paris"}' }],
+          thinking: 'plan',
+          numTokens: 12,
+          promptTokens: 4,
+          reasoningTokens: 2,
+          rawText: `plan</think${x}>\n${block}`,
+          publicRawText: `\n${block}`,
+        },
+      ];
+      registry.register('test-model', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        { model: 'test-model', messages: [{ role: 'user', content: 'go' }], max_tokens: 100, stream: true },
+        registry,
+      );
+
+      const deltas = parseSSE(getBody())
+        .filter((e) => e.event === 'content_block_delta')
+        .map((e) => e.data['delta'] as any);
+      const thinking = deltas.filter((d) => d.type === 'thinking_delta').map((d) => d.thinking as string);
+      expect(thinking.join('')).toBe('plan');
+      const text = deltas
+        .filter((d) => d.type === 'text_delta')
+        .map((d) => d.text as string)
+        .join('');
+      expect(text).not.toContain('plan');
+      expect(text).not.toContain('</think');
+      expect(text).not.toContain('tool_call');
     });
 
     it('emits thinking + text with correct content block indices', async () => {
@@ -2974,7 +3025,7 @@ describe('handleCreateMessage', () => {
     it('non-streaming: honors a stop sequence inside recovered suppressed-tool text', async () => {
       // BUG B: the request disallows tools, but the native parser still
       // produced a tool call and `result.text` is empty, so
-      // `buildAnthropicContent` emits `recoverSuppressedToolCallText(rawText)`
+      // `buildAnthropicContent` emits `recoverSuppressedToolCallText(publicRawText)`
       // as the visible text. The stop scan must run over THAT recovered text,
       // not the empty `result.text` — otherwise a stop inside it leaks with
       // `stop_reason: end_turn`.
@@ -2983,6 +3034,7 @@ describe('handleCreateMessage', () => {
         makeChatResult({
           text: '',
           rawText: 'Sure STOP <tool_call>{"name":"get_weather","arguments":{}}</tool_call>',
+          publicRawText: 'Sure STOP <tool_call>{"name":"get_weather","arguments":{}}</tool_call>',
           finishReason: 'stop',
           toolCalls: [
             {
@@ -3018,6 +3070,47 @@ describe('handleCreateMessage', () => {
       expect(textBlock.text).toBe('Sure ');
       expect(parsed.stop_reason).toBe('stop_sequence');
       expect(parsed.stop_sequence).toBe('STOP');
+    });
+
+    // vLLM: the text is the content after the reasoning. Mutation: recover
+    // from `rawText` → red (`plan\n</think>` in the text).
+    it('non-streaming: a stop in recovered text holds no reasoning', async () => {
+      const block = '<tool_call>\n{"name":"get_weather","arguments":{}}\n</tool_call>';
+      const registry = new ModelRegistry();
+      const mockModel = createMockModel(
+        makeChatResult({
+          text: '',
+          thinking: 'plan',
+          rawText: `plan\n</think>\n\nSure STOP ${block}`,
+          publicRawText: `\n\nSure STOP ${block}`,
+          finishReason: 'stop',
+          toolCalls: [{ status: 'ok', id: 'call_x', name: 'get_weather', arguments: '{}' } as ToolCallResult],
+          numTokens: 12,
+          promptTokens: 6,
+        }),
+      );
+      registry.register('test-model', mockModel);
+      const { res, getStatus, getBody } = createMockRes();
+
+      await handleCreateMessage(
+        res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'go' }],
+          max_tokens: 100,
+          stop_sequences: ['STOP'],
+        },
+        registry,
+      );
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody());
+      expect(parsed.content.some((b: any) => b.type === 'tool_use')).toBe(false);
+      const textBlock = parsed.content.find((b: any) => b.type === 'text');
+      expect(textBlock.text).not.toContain('plan');
+      expect(textBlock.text).not.toContain('</think>');
+      expect(textBlock.text.trimStart()).toBe('Sure ');
+      expect(parsed.stop_reason).toBe('stop_sequence');
     });
 
     it('non-streaming: keeps a trailing incomplete partial when no stop completes', async () => {

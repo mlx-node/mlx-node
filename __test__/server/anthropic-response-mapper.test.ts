@@ -973,13 +973,27 @@ describe('visibleAnswerText nameless calls', () => {
   const block = '<tool_call>\n<function=>\n</function>\n</tool_call>';
   const nameless = { id: 'n', name: '', arguments: {}, status: 'missing_name', rawContent: block };
 
-  it('places the block after the reasoning and before the prose', () => {
-    const rawText = `plan\n</think>\n\n${block}\nAFTER`;
-    expect(visibleAnswerText({ text: 'AFTER', rawText, toolCalls: [nameless] }, true)).toBe(`${block}\nAFTER`);
+  it('places the block before the prose', () => {
+    const publicRawText = `\n\n${block}\nAFTER`;
+    expect(visibleAnswerText({ text: 'AFTER', publicRawText, toolCalls: [nameless] }, true)).toBe(`${block}\nAFTER`);
+  });
+
+  // Mutation: place in `rawText` → red (`AFTER${block}`).
+  it('a reasoning that quotes the block does not move it', () => {
+    const result = {
+      text: 'AFTER',
+      rawText: `see ${block}</think>\n\n${block}\nAFTER`,
+      publicRawText: `\n\n${block}\nAFTER`,
+      toolCalls: [nameless],
+    };
+    expect(visibleAnswerText(result, true)).toBe(`${block}\nAFTER`);
   });
 
   it('appends a block it cannot find in the raw text', () => {
-    expect(visibleAnswerText({ text: 'AFTER', rawText: 'AFTER', toolCalls: [nameless] }, true)).toBe(`AFTER${block}`);
+    expect(visibleAnswerText({ text: 'AFTER', publicRawText: 'AFTER', toolCalls: [nameless] }, true)).toBe(
+      `AFTER${block}`,
+    );
+    expect(visibleAnswerText({ text: 'AFTER', toolCalls: [nameless] }, true)).toBe(`AFTER${block}`);
   });
 
   // The native parser strips a `<tool_call>` block it cannot read without
@@ -992,7 +1006,7 @@ describe('visibleAnswerText nameless calls', () => {
       visibleAnswerText(
         {
           text: 'BEFORE  AFTER  TAIL',
-          rawText: `BEFORE ${stopBlock} AFTER ${unknown} TAIL`,
+          publicRawText: `BEFORE ${stopBlock} AFTER ${unknown} TAIL`,
           toolCalls: [{ ...nameless, rawContent: stopBlock }],
         },
         true,
@@ -1000,7 +1014,11 @@ describe('visibleAnswerText nameless calls', () => {
     ).toBe(`BEFORE ${stopBlock} AFTER  TAIL`);
     expect(
       visibleAnswerText(
-        { text: 'BEFORE  MID STOP AFTER', rawText: `BEFORE ${block} MID STOP AFTER ${unknown}`, toolCalls: [nameless] },
+        {
+          text: 'BEFORE  MID STOP AFTER',
+          publicRawText: `BEFORE ${block} MID STOP AFTER ${unknown}`,
+          toolCalls: [nameless],
+        },
         true,
       ),
     ).toBe(`BEFORE ${block} MID STOP AFTER`);

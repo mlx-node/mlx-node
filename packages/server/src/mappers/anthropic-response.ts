@@ -25,6 +25,7 @@ import type {
   AnthropicStopReason,
   MlxProgress,
 } from '../types-anthropic.js';
+import { hy4TagAt, type Hy4Tag } from './reasoning-close.js';
 import { genId } from './response.js';
 
 function parseArguments(args: Record<string, unknown> | string): Record<string, unknown> {
@@ -99,28 +100,32 @@ export function mapStopReason(
 }
 
 /**
- * The answer text a response shows: the parsed text, or the recovered markup
- * of tool calls the request did not allow, with the raw block of each call
+ * The answer text a response shows: the parsed text, or the raw text after
+ * the reasoning without the markup of tool calls the request did not allow
+ * (vLLM: the content after the reasoning, tool blocks removed), with the raw block of each call
  * that names no function read as text where the model wrote it (Splash
  * `StreamingToolCallProjector._begin_call`). Splash cuts the raw output at a
  * stop (`CallbackStreamer._emit`) before the projector reads it, so the block
  * must keep its place for the stop search to cut what follows it.
  */
 export function visibleAnswerText(
-  result: Pick<ChatResult, 'text' | 'rawText' | 'toolCalls'>,
+  result: Pick<ChatResult, 'text' | 'publicRawText' | 'toolCalls'>,
   allowToolUse: boolean,
 ): string {
+  // Never `rawText`: it holds the reasoning and its close tag. With no
+  // `publicRawText` (Gemma4) the parsed text is the answer without markup.
+  const answerRaw = result.publicRawText ?? result.text;
   const text =
     !allowToolUse &&
     result.text.length === 0 &&
     result.toolCalls.some((t) => t.status === 'ok') &&
-    containsToolCallMarkup(result.rawText)
-      ? recoverSuppressedToolCallText(result.rawText)
+    containsToolCallMarkup(answerRaw)
+      ? recoverSuppressedToolCallText(answerRaw)
       : result.text;
   if (!result.toolCalls.some((call) => call.status === 'missing_name')) return text;
-  const placed = withNamelessCallsInPlace(text, result.rawText, result.toolCalls);
+  const placed = withNamelessCallsInPlace(text, answerRaw, result.toolCalls);
   if (placed !== null) return placed;
-  // The blocks cannot be placed in `rawText`: they go after the text.
+  // The blocks cannot be placed in the raw text: they go after the text.
   let nameless = '';
   for (const call of result.toolCalls) {
     if (call.status === 'missing_name') nameless += call.rawContent;
@@ -133,10 +138,10 @@ function isWhitespace(ch: string): boolean {
 }
 
 /**
- * `text` with each nameless call's block put back at its place in `rawText`,
- * or null when `text` is not `rawText` without the `<tool_call>` blocks,
- * trimmed and cut after the reasoning (the native finalize), or a nameless
- * block falls before the text starts.
+ * `text` with each nameless call's block put back at its place in `rawText`
+ * (the raw text after the reasoning), or null when `text` is not `rawText`
+ * without the `<tool_call>` blocks, trimmed, or a nameless block falls before
+ * the text starts.
  */
 function withNamelessCallsInPlace(text: string, rawText: string, calls: ChatResult['toolCalls']): string | null {
   let stripped = '';
@@ -243,25 +248,6 @@ class TextSearch {
     }
     return find(from)?.start ?? -1;
   }
-}
-
-function isHy4SuffixChar(ch: string): boolean {
-  return ch !== '<' && ch !== '>' && !isWhitespace(ch);
-}
-
-interface Hy4Tag {
-  start: number;
-  end: number;
-  suffix: string;
-}
-
-/** The `<name:X>` tag whose `head` (`<name:`) is at `at`, or null. */
-function hy4TagAt(text: string, at: number, head: string): Hy4Tag | null {
-  if (!text.startsWith(head, at)) return null;
-  let i = at + head.length;
-  while (i < text.length && isHy4SuffixChar(text[i]!)) i++;
-  if (i === at + head.length || text[i] !== '>') return null;
-  return { start: at, end: i + 1, suffix: text.slice(at + head.length - 1, i) };
 }
 
 function nextHy4Tag(text: string, from: number, head: string): Hy4Tag | null {

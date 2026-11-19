@@ -29,6 +29,7 @@ import {
 } from '../errors.js';
 import type { IdleSweeper } from '../idle-sweeper.js';
 import { withAdmissionControlledInference } from '../inference-admission.js';
+import { withoutReasoningClose } from '../mappers/reasoning-close.js';
 import { mapRequest, reconstructMessagesFromChain, stringifyStoredInputMessages } from '../mappers/request.js';
 import {
   buildPartialResponse,
@@ -876,9 +877,8 @@ async function handleStreamingNativeWithAbort(
 
       // Delta event
       if (event.isReasoning) {
-        // Filter out </think> tag from reasoning deltas
-        const deltaText = event.text.replace(/<\/think>/g, '');
-        if (!deltaText) continue; // Skip empty deltas (e.g., just the </think> token)
+        const deltaText = withoutReasoningClose(event.text);
+        if (!deltaText) continue;
 
         if (!hasEmittedReasoning) {
           // First reasoning chunk -- add reasoning item
