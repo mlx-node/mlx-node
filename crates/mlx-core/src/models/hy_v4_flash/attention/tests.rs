@@ -5,7 +5,9 @@ use serde_json::Value;
 use super::*;
 use crate::models::deepseek_v41::ops::rope_angle;
 use crate::models::hy_v4_flash::cache::{LatentBuf, LayerCache, WINDOW_SLACK, WindowRing};
+use crate::models::hy_v4_flash::indexer::{Indexer, IndexerGeometry, IndexerState, Indexing};
 use crate::models::hy_v4_flash::sparse::gather_sink_attention_in;
+use crate::models::hy_v4_flash::weights::IndexerWeights;
 
 fn ops() -> Value {
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hy-v4-flash/ops.json");
@@ -81,22 +83,6 @@ fn window_rows_at_510_to_513() {
     assert_eq!(two[512..].to_vec(), window_rows(512, 1, 0, 512));
 }
 
-#[test]
-fn causal_rows_list_every_earlier_cell() {
-    let idx = causal_rows(2, 3);
-    assert_eq!(idx, vec![0, 1, 2, -1, -1, 0, 1, 2, 3, -1, 0, 1, 2, 3, 4]);
-    assert_eq!(causal_rows(0, 1), vec![0]);
-}
-
-#[test]
-fn dense_reach_ends_below_top_k() {
-    assert!(check_dense_reach(0, 2048, 2048).is_ok());
-    assert!(check_dense_reach(2047, 1, 2048).is_ok());
-    assert!(check_dense_reach(2047, 2, 2048).is_err());
-    assert!(check_dense_reach(2048, 1, 2048).is_err());
-    assert!(check_dense_reach(0, 0, 2048).is_err());
-}
-
 struct Rng(u64);
 
 impl Rng {
@@ -129,7 +115,6 @@ fn geometry(attn: Attn) -> Geometry {
             Attn::Indexed => 1e7,
         },
         window: 4,
-        top_k: 16,
     }
 }
 
@@ -332,15 +317,100 @@ fn assert_rows(got: &[f32], want: &[Vec<f64>], what: &str) {
     }
 }
 
-fn cache_for(g: &Geometry, cap: usize) -> LayerCache {
-    LayerCache::new(g.attn, g.window, cap, g.row() as i64)
+/// An indexer whose `n_top` (3 groups of 4) keeps every query of up to 16
+/// tokens dense.
+fn dense_indexer(seed: u64) -> (Indexer, IndexerWeights, IndexerGeometry) {
+    let ig = IndexerGeometry {
+        n_heads: 2,
+        head_dim: 8,
+        rope_dim: 4,
+        kpool: 4,
+        n_top: 3,
+        select_tail: true,
+        eps: 1e-5,
+        weight_scale: 0.25,
+        rope_theta: 1e7,
+    };
+    let mut r = Rng(seed);
+    let (h, d, kp) = (ig.n_heads, ig.head_dim, ig.kpool);
+    let iw = IndexerWeights {
+        attn_k: dense(&r.vec(d * D, 0.5), d, D),
+        k_norm: arr(&r.vec(d, 0.5), &[d]),
+        q_b: dense(&r.vec(h * d * Q_LORA, 0.5), h * d, Q_LORA),
+        proj: dense(&r.vec(h * D, 0.5), h, D),
+        compressor_value: arr(&r.vec(d * d, 0.5), &[d, d]),
+        compressor_gate: arr(&r.vec(d * d, 0.5), &[d, d]),
+        compressor_ape: arr(&r.vec(kp * d, 0.5), &[kp, d]),
+        compressor_norm: arr(&r.vec(d, 0.5), &[d]),
+    };
+    let ix = Indexer::new(ig.clone(), &iw).unwrap();
+    (ix, iw, ig)
+}
+
+/// One layer's state: the attention cache and, for an indexed layer, its
+/// indexer.
+struct Layer {
+    cache: LayerCache,
+    index: Option<(Indexer, IndexerWeights, IndexerState)>,
+}
+
+impl Layer {
+    fn len(&self) -> usize {
+        self.cache.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+    }
+
+    fn index_len(&self) -> Option<usize> {
+        self.index.as_ref().map(|(_, _, s)| s.len())
+    }
+
+    fn truncate(&mut self, len: usize) -> Result<()> {
+        self.cache.truncate(len)?;
+        if let Some((_, _, s)) = self.index.as_mut() {
+            s.truncate(len)?;
+        }
+        Ok(())
+    }
+
+    fn forward(
+        &mut self,
+        mla: &Mla,
+        w: &AttnWeights,
+        h: &MxArray,
+        start: usize,
+    ) -> Result<MxArray> {
+        let ix = self.index.as_mut().map(|(i, iw, s)| Indexing {
+            indexer: &*i,
+            weights: &*iw,
+            state: s,
+        });
+        mla.forward(w, h, start, &mut self.cache, ix)
+    }
+}
+
+fn cache_for(g: &Geometry, cap: usize) -> Layer {
+    let index = match g.attn {
+        Attn::Sliding => None,
+        Attn::Indexed => {
+            let (ix, iw, ig) = dense_indexer(0x51);
+            let st = IndexerState::new(cap, &ig);
+            Some((ix, iw, st))
+        }
+    };
+    Layer {
+        cache: LayerCache::new(g.attn, g.window, cap, g.row() as i64),
+        index,
+    }
 }
 
 /// Runs `hs` through one layer in calls of the given sizes.
 fn run_split(
     mla: &Mla,
     w: &AttnWeights,
-    cache: &mut LayerCache,
+    cache: &mut Layer,
     hs: &[Vec<f32>],
     start: usize,
     sizes: &[usize],
@@ -348,8 +418,8 @@ fn run_split(
     let mut out = Vec::new();
     let mut at = 0;
     for &n in sizes {
-        let y = mla
-            .forward(w, &rows_arr(&hs[at..at + n]), start + at, cache)
+        let y = cache
+            .forward(mla, w, &rows_arr(&hs[at..at + n]), start + at)
             .unwrap();
         out.extend(read(&y));
         at += n;
@@ -369,6 +439,9 @@ fn check_layer(attn: Attn, seed: u64) {
         let got = run_split(&mla, &w, &mut cache, &hs, 0, &sizes);
         assert_rows(&got, &want, &format!("{attn:?} split {sizes:?}"));
         assert_eq!(cache.len(), 9);
+        if attn == Attn::Indexed {
+            assert_eq!(cache.index_len(), Some(9));
+        }
     }
 }
 
@@ -414,18 +487,21 @@ fn sliding_ring_refuses_a_truncate_past_its_slack() {
 }
 
 #[test]
-fn indexed_layer_refuses_queries_at_top_k_and_keeps_its_cache() {
-    let mut g = geometry(Attn::Indexed);
-    g.top_k = 8;
+fn indexed_layer_needs_its_indexer_and_keeps_its_cache() {
+    let g = geometry(Attn::Indexed);
     let (w, _) = weights(&g, 9);
     let mla = Mla::new(g.clone(), &w).unwrap();
     let hs = inputs(9, 2);
-    let mut cache = cache_for(&g, 16);
-    assert!(mla.forward(&w, &rows_arr(&hs), 0, &mut cache).is_err());
+    let mut cache = LayerCache::new(g.attn, g.window, 16, g.row() as i64);
+    assert!(
+        mla.forward(&w, &rows_arr(&hs), 0, &mut cache, None)
+            .is_err()
+    );
     assert_eq!(cache.len(), 0);
-    run_split(&mla, &w, &mut cache, &hs[..8], 0, &[8]);
-    assert!(mla.forward(&w, &rows_arr(&hs[8..]), 8, &mut cache).is_err());
-    assert_eq!(cache.len(), 8);
+    let mut layer = cache_for(&g, 16);
+    run_split(&mla, &w, &mut layer, &hs[..8], 0, &[8]);
+    assert!(layer.forward(&mla, &w, &rows_arr(&hs[8..]), 7).is_err());
+    assert_eq!((layer.len(), layer.index_len()), (8, Some(8)));
 }
 
 #[test]
@@ -435,8 +511,8 @@ fn indexed_layer_refuses_a_call_past_the_context() {
     let mla = Mla::new(g.clone(), &w).unwrap();
     let hs = inputs(6, 4);
     let mut cache = cache_for(&g, 5);
-    assert!(mla.forward(&w, &rows_arr(&hs), 0, &mut cache).is_err());
-    assert_eq!(cache.len(), 0);
+    assert!(cache.forward(&mla, &w, &rows_arr(&hs), 0).is_err());
+    assert_eq!((cache.len(), cache.index_len()), (0, Some(0)));
 }
 
 #[test]
@@ -446,7 +522,7 @@ fn forward_refuses_the_other_cache_kind() {
     let mla = Mla::new(g.clone(), &w).unwrap();
     let mut cache = LayerCache::new(Attn::Indexed, g.window, 16, g.row() as i64);
     assert!(
-        mla.forward(&w, &rows_arr(&inputs(1, 1)), 0, &mut cache)
+        mla.forward(&w, &rows_arr(&inputs(1, 1)), 0, &mut cache, None)
             .is_err()
     );
 }

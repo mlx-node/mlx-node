@@ -9,6 +9,7 @@ pub mod engram;
 pub mod f8;
 pub mod finalize;
 pub mod header;
+pub mod indexer;
 pub mod ops;
 pub mod rows;
 pub mod scan;

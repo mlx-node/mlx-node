@@ -12,13 +12,13 @@
 //! RoPE rotates consecutive pairs (`LLAMA_ROPE_TYPE_NORM`) with the layer's
 //! base; scale `1/√key_length_mla`; the sink is a softmax denominator term.
 //! Sliding layers attend the last `window` rows incl. self; indexed layers
-//! attend every earlier row while each query is below `top_k` (past that the
-//! k-pool indexer picks the cells, which this module does not do).
+//! attend the cells the k-pool indexer picks (`indexer.rs`).
 
 use napi::{Error, Result};
 
 use super::cache::{LatentBuf, LayerCache, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
+use super::indexer::Indexing;
 use super::sparse::gather_sink_attention;
 use super::weights::AttnWeights;
 use crate::array::{DType, MxArray};
@@ -44,7 +44,6 @@ pub struct Geometry {
     pub scale: f32,
     pub rope_theta: f32,
     pub window: usize,
-    pub top_k: usize,
 }
 
 impl Geometry {
@@ -65,7 +64,6 @@ impl Geometry {
             scale: cfg.mla.scale,
             rope_theta: l.rope_theta,
             window: cfg.window,
-            top_k: cfg.indexer.top_k,
         })
     }
 
@@ -90,34 +88,6 @@ pub fn window_rows(start: usize, n: usize, first: usize, window: usize) -> Vec<i
         idx.extend(std::iter::repeat_n(-1, window - (p + 1 - lo)));
     }
     idx
-}
-
-/// Every earlier cell of each query `start..start + n`: row `p` lists
-/// `0..=p`, padded with `-1` to `start + n` slots.
-pub fn causal_rows(start: usize, n: usize) -> Vec<i32> {
-    let kmax = start + n;
-    let mut idx = Vec::with_capacity(n * kmax);
-    for p in start..start + n {
-        idx.extend((0..=p).map(|k| k as i32));
-        idx.extend(std::iter::repeat_n(-1, kmax - p - 1));
-    }
-    idx
-}
-
-/// Refuses an indexed-layer call whose last query is at or past `top_k`
-/// (those queries need the indexer's cell pick).
-pub fn check_dense_reach(start: usize, n: usize, top_k: usize) -> Result<()> {
-    if n == 0 {
-        return Err(bad("indexed call with no rows"));
-    }
-    let last = start + n - 1;
-    if last >= top_k {
-        return Err(bad(format!(
-            "indexed layer: position {last} needs the k-pool indexer (dense up to {})",
-            top_k - 1
-        )));
-    }
-    Ok(())
 }
 
 /// `x [g, s, k] · W_iᵀ` for the `g` row groups `W_i` of `w [g·r, k]`
@@ -168,7 +138,6 @@ impl Mla {
             || g.rope_dim == 0
             || !g.rope_dim.is_multiple_of(2)
             || g.window == 0
-            || g.top_k == 0
         {
             return Err(bad(format!("degenerate geometry {g:?}")));
         }
@@ -243,18 +212,30 @@ impl Mla {
 
     /// The sublayer output for `h [n, dim]` (the HC-reduced stream, before
     /// `attn_norm`) at positions `start..start + n`; appends this call's
-    /// rows to `cache`. On error `cache` holds what it held before.
+    /// rows to `cache` (and to the indexer state of an indexed layer, which
+    /// needs `index`). On error both hold what they held before.
     pub fn forward(
         &self,
         w: &AttnWeights,
         h: &MxArray,
         start: usize,
         cache: &mut LayerCache,
+        index: Option<Indexing<'_>>,
     ) -> Result<MxArray> {
-        match (self.g.attn, cache) {
-            (Attn::Sliding, LayerCache::Window(ring)) => self.forward_sliding(w, h, start, ring),
-            (Attn::Indexed, LayerCache::Latent(buf)) => self.forward_indexed(w, h, start, buf),
-            (attn, _) => Err(bad(format!("{attn:?} layer given the other cache kind"))),
+        match (self.g.attn, cache, index) {
+            (Attn::Sliding, LayerCache::Window(ring), None) => {
+                self.forward_sliding(w, h, start, ring)
+            }
+            (Attn::Indexed, LayerCache::Latent(buf), Some(ix)) => {
+                self.forward_indexed(w, h, start, buf, ix)
+            }
+            (Attn::Indexed, LayerCache::Latent(_), None) => {
+                Err(bad("indexed layer called without its indexer"))
+            }
+            (Attn::Sliding, LayerCache::Window(_), Some(_)) => {
+                Err(bad("sliding layer given an indexer"))
+            }
+            (attn, _, _) => Err(bad(format!("{attn:?} layer given the other cache kind"))),
         }
     }
 
@@ -296,12 +277,14 @@ impl Mla {
         h: &MxArray,
         start: usize,
         buf: &mut LatentBuf,
+        ix: Indexing<'_>,
     ) -> Result<MxArray> {
-        let n = h.shape_at(0)? as usize;
-        check_dense_reach(start, n, self.g.top_k)?;
         let p = self.project(w, h, start)?;
+        let mark = ix.state.mark();
         let out = buf.write(&p.kv, start).and_then(|()| {
-            let idx = MxArray::from_int32(&causal_rows(start, n), &[n as i64, (start + n) as i64])?;
+            let idx = ix
+                .indexer
+                .select(ix.weights, &p.x, &p.qr, start, ix.state)?;
             let o = gather_sink_attention(
                 &p.q,
                 buf.rows()?,
@@ -312,8 +295,11 @@ impl Mla {
             )?;
             self.finish(w, &p.x, &o)
         });
-        if out.is_err() && buf.len() > start {
-            buf.truncate(start)?;
+        if out.is_err() {
+            if buf.len() > start {
+                buf.truncate(start)?;
+            }
+            ix.state.restore(mark)?;
         }
         out
     }
