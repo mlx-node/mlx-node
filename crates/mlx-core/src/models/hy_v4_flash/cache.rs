@@ -20,6 +20,34 @@ pub const WINDOW_SLACK: usize = 3;
 /// Cache dtype of every latent row.
 pub const ROW_DTYPE: DType = DType::Float16;
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ROW_DTYPE: std::cell::Cell<DType> = const { std::cell::Cell::new(ROW_DTYPE) };
+}
+
+#[cfg(not(test))]
+fn row_dtype() -> DType {
+    ROW_DTYPE
+}
+
+#[cfg(test)]
+fn row_dtype() -> DType {
+    TEST_ROW_DTYPE.with(std::cell::Cell::get)
+}
+
+/// Runs `f` with this thread's flat caches storing rows as `dtype`.
+#[cfg(test)]
+pub fn with_row_dtype<R>(dtype: DType, f: impl FnOnce() -> R) -> R {
+    struct Reset(DType);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_ROW_DTYPE.with(|d| d.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_ROW_DTYPE.with(|d| d.replace(dtype)));
+    f()
+}
+
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 attention cache: {msg}"))
 }
@@ -80,7 +108,7 @@ impl WindowRing {
             window,
             keep: window + slack,
             width,
-            rows: rows.map(|r| r.astype(ROW_DTYPE)).transpose()?,
+            rows: rows.map(|r| r.astype(row_dtype())).transpose()?,
             held,
             len,
         })
@@ -120,7 +148,7 @@ impl WindowRing {
             )));
         }
         let n = rows_of(kv, self.width, "window append")?;
-        let kv = kv.astype(ROW_DTYPE)?;
+        let kv = kv.astype(row_dtype())?;
         let kept = self.kept();
         let keys = match &self.rows {
             Some(r) => MxArray::concatenate(r, &kv, 0)?,
@@ -245,10 +273,10 @@ impl LatentBuf {
                 self.cap
             )));
         }
-        let rows = kv.astype(ROW_DTYPE)?;
+        let rows = kv.astype(row_dtype())?;
         if self.buf.is_none() {
             let cap = i64::try_from(self.cap).map_err(|_| bad("context exceeds i64"))?;
-            let b = MxArray::zeros(&[cap, self.width], Some(ROW_DTYPE))?;
+            let b = MxArray::zeros(&[cap, self.width], Some(row_dtype()))?;
             MxArray::eval_arrays_with_context(&[&b], "hy_v4_flash latent alloc")?;
             self.buf = Some(b);
         }

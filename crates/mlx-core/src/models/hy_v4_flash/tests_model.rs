@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::bank::{KqBank, class_types, geometry};
+use super::cache::with_row_dtype;
 use super::config::{
     Attn, HcConfig, HyV4FlashConfig, IndexerConfig, LayerConfig, MlaConfig, MoeConfig,
 };
@@ -538,11 +539,16 @@ fn run_split(model: &Model, ids: &[u32], cuts: &[usize]) -> (Vec<Vec<f32>>, Vec<
 }
 
 fn assert_close(got: &[Vec<f32>], want: &[Vec<f32>], what: &str) {
+    assert_within(got, want, what, 1e-4, 1e-4);
+}
+
+/// `|a - b| <= abs + rel · |b|` for every logit.
+fn assert_within(got: &[Vec<f32>], want: &[Vec<f32>], what: &str, abs: f32, rel: f32) {
     assert_eq!(got.len(), want.len(), "{what}: rows");
     for (t, (g, w)) in got.iter().zip(want).enumerate() {
         for (j, (&a, &b)) in g.iter().zip(w).enumerate() {
             assert!(a.is_finite(), "{what}: row {t} col {j} not finite");
-            let tol = 1e-4 + 1e-4 * b.abs();
+            let tol = abs + rel * b.abs();
             assert!((a - b).abs() <= tol, "{what}: row {t} col {j}: {a} vs {b}");
         }
     }
@@ -759,29 +765,39 @@ fn engram_rows_hash_only_the_reach() {
     }
 }
 
+/// The f32 matmuls of a call round by its row count. With f32 cache rows
+/// the splits stay within the f32 bound; with the f16 rows a latent value
+/// near an f16 midpoint rounds one f16 step the other way, so the bound is
+/// two f16 steps at |x| < 2.
 #[test]
 fn split_calls_match_one_call() {
     let f = fixture();
     let ids = prompt();
-    let (want, want_routes) = run_split(&f.model, &ids, &[24]);
     let decode_after = |k: usize| -> Vec<usize> {
         std::iter::once(k)
             .chain(std::iter::repeat_n(1, 24 - k))
             .collect()
     };
-    for cuts in [
+    let patterns = [
         decode_after(12),
         decode_after(1),
         vec![7, 9, 8],
         vec![16, 8],
         vec![8, 1, 15],
         vec![3, 5, 4, 12],
-    ] {
-        let (got, routes) = run_split(&f.model, &ids, &cuts);
-        let what = format!("cuts {cuts:?}");
-        assert_close(&got, &want, &what);
-        assert_eq!(routes, want_routes, "{what}: routes");
-    }
+    ];
+    let check = |rows: &str, abs: f32, rel: f32| {
+        let (want, want_routes) = run_split(&f.model, &ids, &[24]);
+        for cuts in &patterns {
+            let (got, routes) = run_split(&f.model, &ids, cuts);
+            let what = format!("{rows} rows, cuts {cuts:?}");
+            assert_within(&got, &want, &what, abs, rel);
+            assert_eq!(routes, want_routes, "{what}: routes");
+        }
+    };
+    with_row_dtype(DType::Float32, || check("f32", 1e-4, 1e-4));
+    let f16_step = 2f32.powi(-10);
+    check("f16", 2.0 * f16_step, f16_step);
 }
 
 #[test]
