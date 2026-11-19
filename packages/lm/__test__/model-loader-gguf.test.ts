@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import {
   DeepseekV41Model,
   detectModelType,
+  HyV4FlashModel,
   loadModel,
   MuseGlimmerModel,
   Qwen35Model,
@@ -142,7 +143,7 @@ describe('standalone GGUF model detection', () => {
     expect(flashNextSpy).toHaveBeenLastCalledWith(flashNext.modelPath, { maxContextTokens: 102_400 });
     const other = await writeStandaloneGguf('deepseek41');
     await expect(loadModel(other.modelPath, { maxContextTokens: 102_400 })).rejects.toThrow(
-      'maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp',
+      'maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp and hy_v4_flash',
     );
   });
 
@@ -179,6 +180,34 @@ describe('standalone GGUF model detection', () => {
     await expect(loadModel(modelPath)).resolves.toBe(loaded);
     expect(loadSpy).toHaveBeenLastCalledWith(modelPath);
     await expect(loadModel(modelPath, { draftModelPath: '/draft' })).rejects.toThrow('only supported by gemma4');
+  });
+
+  // Mutation: drop `maxContextTokens` from `hyV4FlashLoadOptions` → red.
+  // Mutation: drop `acceptsMaxContext` from the hy_v4_flash row → red.
+  it('detects Hy4-flash GGUF and passes it maxContextTokens alone', async () => {
+    const { modelPath } = await writeStandaloneGguf('hy_v4_flash');
+    expect(await detectModelType(modelPath)).toBe('hy_v4_flash');
+    const loaded = {} as HyV4FlashModel;
+    const loadSpy = vi.spyOn(HyV4FlashModel, 'load').mockResolvedValue(loaded);
+    await expect(loadModel(modelPath)).resolves.toBe(loaded);
+    expect(loadSpy).toHaveBeenLastCalledWith(modelPath, null);
+    await loadModel(modelPath, { maxContextTokens: 131_072 });
+    expect(loadSpy).toHaveBeenLastCalledWith(modelPath, { maxContextTokens: 131_072 });
+  });
+
+  it.each([
+    [{ maxMemoryBytes: 1_024 }, 'maxMemoryBytes (Metal memory budget) is only supported by'],
+    [{ cacheDisk: '0' }, 'cacheDisk and cacheDir (the SSD state tier) are only supported by'],
+    [{ cacheDir: '/var/cache/mlx' }, 'cacheDisk and cacheDir (the SSD state tier) are only supported by'],
+    [{ kvFormat: 'int8' as const }, 'kvFormat (K/V cache format) is only supported by'],
+    [{ decodeShare: 0.5 }, 'decodeShare (decode time owed per unit of prefill time) is only supported by'],
+    [{ draftModelPath: '/draft' }, 'draftModelPath (speculative-decoding draft) is only supported by'],
+    [{ auxiliaryModelPath: '/matching/hf' }, 'auxiliaryModelPath is only supported by qwen4_exp'],
+  ])('rejects %j for Hy4-flash before the native load', async (options, message) => {
+    const { modelPath } = await writeStandaloneGguf('hy_v4_flash');
+    const loadSpy = vi.spyOn(HyV4FlashModel, 'load').mockResolvedValue({} as HyV4FlashModel);
+    await expect(loadModel(modelPath, options)).rejects.toThrow(message);
+    expect(loadSpy).not.toHaveBeenCalled();
   });
 
   it('detects Qwen3.8-Flash-Next as its own architecture', async () => {

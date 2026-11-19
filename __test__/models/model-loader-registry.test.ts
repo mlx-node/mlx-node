@@ -25,6 +25,7 @@ const RAW_MODEL_TYPE_ALIASES = {
   qwen3_5_moe: ['qwen3_5_moe'],
   qwen4_exp: ['qwen4_exp', 'qwen4_exp_text'],
   deepseek_v41: ['deepseek_v41'],
+  hy_v4_flash: ['hy_v4_flash'],
   lfm2: ['lfm2'],
   lfm2_moe: ['lfm2_moe'],
   nemotron_h: ['nemotron_h'],

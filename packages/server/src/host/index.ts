@@ -208,7 +208,8 @@ export interface InferenceHostOptions {
   /**
    * Context token limit (`--max-context`) for qwen3_5 / qwen3_5_moe /
    * qwen4_exp loads: every turn holds at most this many tokens, past the
-   * native window with YaRN, and a load whose plan holds fewer fails. Other
+   * native window with YaRN, and a load whose plan holds fewer fails.
+   * hy_v4_flash takes it too, capped at 262,144 with no YaRN. Other
    * families never see it. Omitted ⇒ the window the plan holds.
    */
   maxContextTokens?: number;

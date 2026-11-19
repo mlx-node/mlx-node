@@ -8,6 +8,7 @@ import {
   Gemma4Model as NativeGemma4Model,
   ggufArchitecture,
   HarrierModel,
+  HyV4FlashModel as NativeHyV4FlashModel,
   JinaRerankerModel,
   XlmRobertaRerankerModel,
   K2HorizonModel as NativeK2HorizonModel,
@@ -19,6 +20,7 @@ import {
   Qwen35Model as NativeQwen35Model,
   Qwen35MoeModel as NativeQwen35MoeModel,
   Qwen4ExpModel as NativeQwen4ExpModel,
+  type HyV4FlashLoadOptions,
   type Qwen35LoadOptions,
   type Qwen4ExpLoadOptions,
 } from '@mlx-node/core';
@@ -31,6 +33,7 @@ import { detectModelType as detectLocalModelType } from '../model-detection.js';
 import {
   DeepseekV41Model,
   Gemma4Model,
+  HyV4FlashModel,
   K2HorizonModel,
   Lfm2Model,
   MuseGlimmerModel,
@@ -92,7 +95,8 @@ export interface LoadModelOptions {
    * (`--max-context`), 1 to 1,010,000: every turn holds at most this many
    * tokens, and the load fails when its memory plan holds fewer. Past the
    * native window the target's RoPE takes YaRN, which is static and changes
-   * answers at every length. Other model families reject it.
+   * answers at every length. `hy_v4_flash` takes it too, capped at 262,144
+   * with no YaRN. Other model families reject it.
    */
   maxContextTokens?: number;
   /**
@@ -154,6 +158,10 @@ function qwen4ExpLoadOptions(options: LoadModelOptions | undefined): Qwen4ExpLoa
     ...(options.cacheDisk !== undefined ? { cacheDisk: options.cacheDisk } : {}),
     ...(options.cacheDir !== undefined ? { cacheDir: options.cacheDir } : {}),
   };
+}
+
+function hyV4FlashLoadOptions(options: LoadModelOptions | undefined): HyV4FlashLoadOptions | null {
+  return options?.maxContextTokens === undefined ? null : { maxContextTokens: options.maxContextTokens };
 }
 
 type NativeModelClass = abstract new (...args: never[]) => object;
@@ -223,6 +231,11 @@ const LOADER_BINDINGS = {
   deepseek_v41: {
     load: (modelPath: string) => DeepseekV41Model.load(modelPath),
     nativeModelClass: NativeDeepseekV41Model,
+  },
+  hy_v4_flash: {
+    load: (modelPath: string, options?: LoadModelOptions) =>
+      HyV4FlashModel.load(modelPath, hyV4FlashLoadOptions(options)),
+    nativeModelClass: NativeHyV4FlashModel,
   },
   lfm2: {
     load: (modelPath: string) => Lfm2Model.load(modelPath),
@@ -307,7 +320,7 @@ function dispatchLoad(
   }
   if (options?.maxContextTokens !== undefined && requireFamilyData(modelType).acceptsMaxContext !== true) {
     throw new Error(
-      `maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe and qwen4_exp models; ` +
+      `maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp and hy_v4_flash models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
