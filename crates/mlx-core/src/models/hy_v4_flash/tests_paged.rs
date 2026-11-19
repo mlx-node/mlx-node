@@ -220,10 +220,11 @@ mod pool {
         };
         match create(&g, 4096, pages, pages, u64::MAX) {
             Ok(a) => Some(a),
-            Err(e) => {
+            Err(e) if crate::test_support::metal_device_absent(&e.to_string()) => {
                 eprintln!("skipping Hy4 paged test: {e}");
                 None
             }
+            Err(e) => panic!("Hy4 paged pool: {e}"),
         }
     }
 

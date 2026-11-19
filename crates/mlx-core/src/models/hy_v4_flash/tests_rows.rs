@@ -357,7 +357,7 @@ fn file_table_reads_the_load_shard_set() {
 fn nan_code_in_a_read_row_is_refused_by_row() {
     let tmp = Temp::new();
     let mut codes = table_codes(13);
-    let bad_row = cfg().head_offsets[2] as usize + 7;
+    let bad_row = cfg().head_offsets[2] as usize + 5;
     codes[bad_row * HD + 5] = 0xFF;
     let t = F8Table::open_at(&tmp.shard(&codes), &table_loc(), &cfg()).unwrap();
     let ids = layer_ids(0);

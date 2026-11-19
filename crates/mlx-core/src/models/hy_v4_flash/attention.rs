@@ -457,13 +457,14 @@ impl Mla {
         mut ix: Indexing<'_>,
     ) -> Result<MxArray> {
         let p = self.project_timed(w, h, &positions(h, start)?)?;
+        let held = buf.len();
         let mark = ix.state.mark();
         let out = self
             .core_indexed(w, &p, start, buf, &mut ix)
             .and_then(|o| self.finish_timed(w, &p.x, &o));
         if out.is_err() {
-            if buf.len() > start {
-                buf.truncate(start)?;
+            if buf.len() > held {
+                buf.truncate(held)?;
             }
             ix.state.restore(mark)?;
         }

@@ -60,10 +60,11 @@ fn pool(num_layers: u32) -> Option<Arc<LayerKVPool>> {
         MetalDtype::Float16,
     ) {
         Ok(pool) => Some(Arc::new(pool)),
-        Err(error) => {
+        Err(error) if crate::test_support::metal_device_absent(&error.to_string()) => {
             eprintln!("skipping Hy4 pool test: {error}");
             None
         }
+        Err(error) => panic!("Hy4 pool: {error}"),
     }
 }
 
