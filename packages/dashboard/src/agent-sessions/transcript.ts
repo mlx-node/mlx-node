@@ -459,7 +459,13 @@ export class TranscriptReducer {
 
   /** Start from entries read earlier (a cold conversation's disk transcript); live ops index after them. */
   seed(entries: readonly TranscriptEntry[], turns: readonly TurnMetric[], contextUsed: number | null = null): void {
-    for (const entry of entries) this.add({ ...entry });
+    for (const entry of entries) {
+      const copy = { ...entry };
+      this.add(copy);
+      if (copy.kind !== 'workflow') continue;
+      const known = this.runEntries.get(copy.runId);
+      if (known === undefined || copy.revision > known.revision) this.runEntries.set(copy.runId, copy);
+    }
     for (const turn of turns) this.turns.push({ ...turn });
     this.contextUsed = contextUsed;
     for (let i = entries.length - 1; i >= 0; i--) {

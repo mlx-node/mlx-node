@@ -866,6 +866,33 @@ describe('parseUpdates: workflow runs', () => {
     expect(live(2, 'active')).toEqual([]);
   });
 
+  it('seeded: a run read from disk is set in place by a higher revision, a lower one sends nothing', () => {
+    const disk = parseUpdates(
+      `${[user('go', 0), line('wf_1', 1, 'user_paused', 1, { pause_message: 'Paused by the user' })].join('\n')}\n`,
+    );
+    const reducer = new TranscriptReducer({ now: () => 1 });
+    reducer.seed(disk.transcript, disk.turns);
+    const live = (revision: number, status: string, extra: object = {}) =>
+      reducer.apply({
+        xai: true,
+        update: {
+          sessionUpdate: 'workflow_updated',
+          run_id: 'wf_1',
+          name: 'deep-research',
+          status,
+          revision,
+          ...extra,
+        },
+        meta: undefined,
+      });
+    const set = live(2, 'complete', { result_summary: 'Done.' });
+    expect(set).toMatchObject([{ op: 'set', index: 1, entry: { kind: 'workflow', revision: 2, report: 'Done.' } }]);
+    expect(live(1, 'active')).toEqual([]);
+    const found = runs(reducer.snapshot().entries);
+    expect(found.map((r) => [r.runId, r.revision, r.status, r.report])).toEqual([['wf_1', 2, 'complete', 'Done.']]);
+    expect(found[0]!.pauseMessage).toBeUndefined();
+  });
+
   it('a report longer than 16 KB is cut and marked; redaction drops a key cut at its end', () => {
     const key = 'sk-SECRET-0123456789';
     const report = `${'r'.repeat(MAX_FIELD_CHARS - 5)}${key}`;
