@@ -1,0 +1,1911 @@
+{
+ "source": "PLAN-parity §3.1-3.3; 12-vllm-dmax.md §7.3 (lanes = min(4, MLX_SCHED_MAX_NUM_SEQS, memory plan)); admission port = s0b_admission_addons.py (budget.rs:260-332, own = 0)",
+ "inputs": {
+  "dense": 11352192436,
+  "slot": 4663296,
+  "kv_per_ctx": 15812,
+  "physical": 137438953472,
+  "ws": 96000000000,
+  "ws_note": "UNVERIFIED (U3)",
+  "reserve": 12884901888,
+  "kv_base": 10485760,
+  "flat_ladder_kv": 157286400,
+  "contexts": [
+   16384,
+   32768,
+   65536,
+   131072,
+   262144
+  ],
+  "others_gib": [
+   20,
+   50,
+   80
+  ]
+ },
+ "lane_floor": {
+  "parts": {
+   "windows": 17798400,
+   "tok_k_ring": 39936,
+   "mtp_open_segment": 38912,
+   "seed_h_trunk": 12288,
+   "engram_carry_ids": 8,
+   "step_rows": 1544076
+  },
+  "bytes": 19433620,
+  "rules": {
+   "windows": "30 S-layers x (512 + WINDOW_SLACK 3) x 576 x f16 (HY/cache.rs:19, :48-52)",
+   "tok_k_ring": "13 indexed layers (12 trunk + MTP) x (kpool - 1 + WINDOW_SLACK) rows x 128 x f32 (HY/indexer.rs:279-294)",
+   "mtp_open_segment": "one 32-row MTP segment (latent 576 f16 + pooled 8 x 128 f16): its unused rows; the used rows are in MTP(W)",
+   "seed_h_trunk": "ONE row h_trunk(s-1), 3072 f32 (PA §2.4, verify F11)",
+   "engram_carry_ids": "last 2 token ids (Engram)",
+   "step_rows": "(1 + default depth 1) x COMPUTE_PER_ROW (MS/budget.rs:36)"
+  },
+  "cap_sized_buffers": [],
+  "rejected_flash_next_seed": {
+   "rule": "(MAX_PREFILL_CHUNK + 1) rows (Q4/memory.rs:777-783) at C 8192",
+   "bytes": 100675584
+  }
+ },
+ "state_span": {
+  "sections": [
+   {
+    "name": "windows",
+    "offset": 0,
+    "bytes": 17694720
+   },
+   {
+    "name": "mtp_latent_tail",
+    "offset": 17694720,
+    "bytes": 35712
+   },
+   {
+    "name": "mtp_pooled_tail",
+    "offset": 17730432,
+    "bytes": 1792
+   },
+   {
+    "name": "mtp_tok_k_tail",
+    "offset": 17732224,
+    "bytes": 1536
+   },
+   {
+    "name": "seed_h_trunk",
+    "offset": 17733760,
+    "bytes": 12288
+   },
+   {
+    "name": "engram_carry_ids",
+    "offset": 17746048,
+    "bytes": 8
+   },
+   {
+    "name": "lens",
+    "offset": 17746056,
+    "bytes": 64
+   }
+  ],
+  "bytes": 17746120,
+  "ram_states": 8,
+  "ram_bytes": 141968960,
+  "rules": {
+   "windows": "rows b-512 .. b-1 of the 30 S-layers (PLAN-parity §2.3)",
+   "mtp_*": "MTP lags one row: at block row b it holds rows 0 .. b-2, so the open segment has 31 rows, 7 closed groups in it and 3 open tok_k rows",
+   "trunk tails": "empty at block rows (32 % 4 = 0): no trunk latent/pooled/tok_k tail"
+  }
+ },
+ "kv_rules": {
+  "flat": "x1.2(KV_BASE + 150 MiB ladder + kv_per_ctx*W)  (HY/store.rs profile)",
+  "shared": "x1.2(KV_BASE + 8 x state_span + kv_per_ctx*W + (N-1) x lane_floor); W = admitted context = total rows over all live lanes",
+  "mtp_latentbuf_per_owner": "shared + (N-1) x 1,216 x W (verify F10: one [cap,576] MTP LatentBuf per owner; rejected)",
+  "per_lane_window": "x1.2(KV_BASE + 150 MiB + N x kv_per_ctx x W) (Qwen3.5 rule; rejected, E8)"
+ },
+ "c_rule": "walk ctx from max_context halving down to min_context; at a ctx take the largest C in {8192, 4096, 2048} admitted with cache >= SECOND_STAGING_MIN_CACHE, else 2048 if admitted, else halve ctx; none at min_context = load fails",
+ "memory_plan_rule": "largest N in 1..4 whose shared admission admits the same context as N = 1",
+ "table": [
+  {
+   "max_ctx": 16384,
+   "others_gib": 20,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 512203161,
+    "staging_layers": 2,
+    "cache_bytes": 56299972608,
+    "cache_gib": 52.4334,
+    "wired_limit": 95997435434
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 493822233,
+    "staging_layers": 2,
+    "cache_bytes": 56318625792,
+    "cache_gib": 52.4508,
+    "wired_limit": 95997707690
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 517142577,
+    "staging_layers": 2,
+    "cache_bytes": 56295309312,
+    "cache_gib": 52.4291,
+    "wired_limit": 95997711554
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 540462921,
+    "staging_layers": 2,
+    "cache_bytes": 56271992832,
+    "cache_gib": 52.4074,
+    "wired_limit": 95997715418
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 563783265,
+    "staging_layers": 2,
+    "cache_bytes": 56248676352,
+    "cache_gib": 52.3857,
+    "wired_limit": 95997719282
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 635505864,
+    "staging_layers": 2,
+    "cache_bytes": 56178726912,
+    "cache_gib": 52.3205,
+    "wired_limit": 95999492441
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 1444832870,
+    "staging_layers": 2,
+    "cache_bytes": 55367313408,
+    "cache_gib": 51.5648,
+    "wired_limit": 95997405943
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 16384,
+   "others_gib": 50,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 512203161,
+    "staging_layers": 2,
+    "cache_bytes": 31169470464,
+    "cache_gib": 29.0288,
+    "wired_limit": 70866933290
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 493822233,
+    "staging_layers": 2,
+    "cache_bytes": 31183460352,
+    "cache_gib": 29.0419,
+    "wired_limit": 70862542250
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 517142577,
+    "staging_layers": 2,
+    "cache_bytes": 31160143872,
+    "cache_gib": 29.0201,
+    "wired_limit": 70862546114
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 540462921,
+    "staging_layers": 2,
+    "cache_bytes": 31136827392,
+    "cache_gib": 28.9984,
+    "wired_limit": 70862549978
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 563783265,
+    "staging_layers": 2,
+    "cache_bytes": 31113510912,
+    "cache_gib": 28.9767,
+    "wired_limit": 70862553842
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 635505864,
+    "staging_layers": 2,
+    "cache_bytes": 31043561472,
+    "cache_gib": 28.9116,
+    "wired_limit": 70864327001
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 8192,
+    "kv": 1444832870,
+    "staging_layers": 2,
+    "cache_bytes": 30236811264,
+    "cache_gib": 28.1602,
+    "wired_limit": 70866903799
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 16384,
+   "others_gib": 80,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 2048,
+    "kv": 512203161,
+    "staging_layers": 1,
+    "cache_bytes": 9671675904,
+    "cache_gib": 9.0075,
+    "wired_limit": 38650183619
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 2048,
+    "kv": 493822233,
+    "staging_layers": 1,
+    "cache_bytes": 9690329088,
+    "cache_gib": 9.0248,
+    "wired_limit": 38650455875
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 2048,
+    "kv": 517142577,
+    "staging_layers": 1,
+    "cache_bytes": 9667012608,
+    "cache_gib": 9.0031,
+    "wired_limit": 38650459739
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 2048,
+    "kv": 540462921,
+    "staging_layers": 1,
+    "cache_bytes": 9643696128,
+    "cache_gib": 8.9814,
+    "wired_limit": 38650463603
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 2048,
+    "kv": 563783265,
+    "staging_layers": 1,
+    "cache_bytes": 9620379648,
+    "cache_gib": 8.9597,
+    "wired_limit": 38650467467
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 2048,
+    "kv": 635505864,
+    "staging_layers": 1,
+    "cache_bytes": 9550430208,
+    "cache_gib": 8.8945,
+    "wired_limit": 38652240626
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 16384,
+    "chunk_rows": 2048,
+    "kv": 1444832870,
+    "staging_layers": 1,
+    "cache_bytes": 8739016704,
+    "cache_gib": 8.1388,
+    "wired_limit": 38650154128
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 32768,
+   "others_gib": 20,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 823079731,
+    "staging_layers": 2,
+    "cache_bytes": 55987531776,
+    "cache_gib": 52.1425,
+    "wired_limit": 95998387754
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 804698803,
+    "staging_layers": 2,
+    "cache_bytes": 56006184960,
+    "cache_gib": 52.1598,
+    "wired_limit": 95998660010
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 828019147,
+    "staging_layers": 2,
+    "cache_bytes": 55982868480,
+    "cache_gib": 52.1381,
+    "wired_limit": 95998663874
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 851339491,
+    "staging_layers": 2,
+    "cache_bytes": 55959552000,
+    "cache_gib": 52.1164,
+    "wired_limit": 95998667738
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 874659835,
+    "staging_layers": 2,
+    "cache_bytes": 55936235520,
+    "cache_gib": 52.0947,
+    "wired_limit": 95998671602
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 1018105032,
+    "staging_layers": 2,
+    "cache_bytes": 55791673344,
+    "cache_gib": 51.96,
+    "wired_limit": 95997554623
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 2688339148,
+    "staging_layers": 2,
+    "cache_bytes": 54122213376,
+    "cache_gib": 50.4052,
+    "wired_limit": 95998328771
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 32768,
+   "others_gib": 50,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 823079731,
+    "staging_layers": 2,
+    "cache_bytes": 30852366336,
+    "cache_gib": 28.7335,
+    "wired_limit": 70863222314
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 804698803,
+    "staging_layers": 2,
+    "cache_bytes": 30871019520,
+    "cache_gib": 28.7509,
+    "wired_limit": 70863494570
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 828019147,
+    "staging_layers": 2,
+    "cache_bytes": 30847703040,
+    "cache_gib": 28.7292,
+    "wired_limit": 70863498434
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 851339491,
+    "staging_layers": 2,
+    "cache_bytes": 30824386560,
+    "cache_gib": 28.7074,
+    "wired_limit": 70863502298
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 874659835,
+    "staging_layers": 2,
+    "cache_bytes": 30801070080,
+    "cache_gib": 28.6857,
+    "wired_limit": 70863506162
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 1018105032,
+    "staging_layers": 2,
+    "cache_bytes": 30656507904,
+    "cache_gib": 28.5511,
+    "wired_limit": 70862389183
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 8192,
+    "kv": 2688339148,
+    "staging_layers": 2,
+    "cache_bytes": 28987047936,
+    "cache_gib": 26.9963,
+    "wired_limit": 70863163331
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 32768,
+   "others_gib": 80,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 2048,
+    "kv": 823079731,
+    "staging_layers": 1,
+    "cache_bytes": 9359235072,
+    "cache_gib": 8.7165,
+    "wired_limit": 38651135940
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 2048,
+    "kv": 804698803,
+    "staging_layers": 1,
+    "cache_bytes": 9377888256,
+    "cache_gib": 8.7338,
+    "wired_limit": 38651408196
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 2048,
+    "kv": 828019147,
+    "staging_layers": 1,
+    "cache_bytes": 9354571776,
+    "cache_gib": 8.7121,
+    "wired_limit": 38651412060
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 2048,
+    "kv": 851339491,
+    "staging_layers": 1,
+    "cache_bytes": 9331255296,
+    "cache_gib": 8.6904,
+    "wired_limit": 38651415924
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 2048,
+    "kv": 874659835,
+    "staging_layers": 1,
+    "cache_bytes": 9307938816,
+    "cache_gib": 8.6687,
+    "wired_limit": 38651419788
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 2048,
+    "kv": 1018105032,
+    "staging_layers": 1,
+    "cache_bytes": 9163376640,
+    "cache_gib": 8.5341,
+    "wired_limit": 38650302809
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 32768,
+    "chunk_rows": 2048,
+    "kv": 2688339148,
+    "staging_layers": 1,
+    "cache_bytes": 7493916672,
+    "cache_gib": 6.9793,
+    "wired_limit": 38651076957
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 65536,
+   "others_gib": 20,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 1444832870,
+    "staging_layers": 2,
+    "cache_bytes": 55357986816,
+    "cache_gib": 51.5561,
+    "wired_limit": 95995629098
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 1426451942,
+    "staging_layers": 2,
+    "cache_bytes": 55376640000,
+    "cache_gib": 51.5735,
+    "wired_limit": 95995901354
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 1449772286,
+    "staging_layers": 2,
+    "cache_bytes": 55353323520,
+    "cache_gib": 51.5518,
+    "wired_limit": 95995905218
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 1473092630,
+    "staging_layers": 2,
+    "cache_bytes": 55330007040,
+    "cache_gib": 51.5301,
+    "wired_limit": 95995909082
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 1496412974,
+    "staging_layers": 2,
+    "cache_bytes": 55306690560,
+    "cache_gib": 51.5084,
+    "wired_limit": 95995912946
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 1783303368,
+    "staging_layers": 2,
+    "cache_bytes": 55022229504,
+    "cache_gib": 51.2434,
+    "wired_limit": 95998342284
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 5175351705,
+    "staging_layers": 2,
+    "cache_bytes": 51627350016,
+    "cache_gib": 48.0817,
+    "wired_limit": 95995511133
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 65536,
+   "others_gib": 50,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 1444832870,
+    "staging_layers": 2,
+    "cache_bytes": 30227484672,
+    "cache_gib": 28.1515,
+    "wired_limit": 70865126954
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 1426451942,
+    "staging_layers": 2,
+    "cache_bytes": 30246137856,
+    "cache_gib": 28.1689,
+    "wired_limit": 70865399210
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 1449772286,
+    "staging_layers": 2,
+    "cache_bytes": 30222821376,
+    "cache_gib": 28.1472,
+    "wired_limit": 70865403074
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 1473092630,
+    "staging_layers": 2,
+    "cache_bytes": 30199504896,
+    "cache_gib": 28.1255,
+    "wired_limit": 70865406938
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 1496412974,
+    "staging_layers": 2,
+    "cache_bytes": 30176188416,
+    "cache_gib": 28.1038,
+    "wired_limit": 70865410802
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 1783303368,
+    "staging_layers": 2,
+    "cache_bytes": 29887064064,
+    "cache_gib": 27.8345,
+    "wired_limit": 70863176844
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 8192,
+    "kv": 5175351705,
+    "staging_layers": 2,
+    "cache_bytes": 26496847872,
+    "cache_gib": 24.6771,
+    "wired_limit": 70865008989
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 65536,
+   "others_gib": 80,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 2048,
+    "kv": 1444832870,
+    "staging_layers": 1,
+    "cache_bytes": 8734353408,
+    "cache_gib": 8.1345,
+    "wired_limit": 38653040580
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 2048,
+    "kv": 1426451942,
+    "staging_layers": 1,
+    "cache_bytes": 8753006592,
+    "cache_gib": 8.1519,
+    "wired_limit": 38653312836
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 2048,
+    "kv": 1449772286,
+    "staging_layers": 1,
+    "cache_bytes": 8729690112,
+    "cache_gib": 8.1302,
+    "wired_limit": 38653316700
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 2048,
+    "kv": 1473092630,
+    "staging_layers": 1,
+    "cache_bytes": 8706373632,
+    "cache_gib": 8.1084,
+    "wired_limit": 38653320564
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 2048,
+    "kv": 1496412974,
+    "staging_layers": 1,
+    "cache_bytes": 8683057152,
+    "cache_gib": 8.0867,
+    "wired_limit": 38653324428
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 2048,
+    "kv": 1783303368,
+    "staging_layers": 1,
+    "cache_bytes": 8393932800,
+    "cache_gib": 7.8175,
+    "wired_limit": 38651090470
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 65536,
+    "chunk_rows": 2048,
+    "kv": 5175351705,
+    "staging_layers": 1,
+    "cache_bytes": 5003716608,
+    "cache_gib": 4.6601,
+    "wired_limit": 38652922615
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 131072,
+   "others_gib": 20,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 2688339148,
+    "staging_layers": 2,
+    "cache_bytes": 54108223488,
+    "cache_gib": 50.3922,
+    "wired_limit": 95999438378
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 2669958220,
+    "staging_layers": 2,
+    "cache_bytes": 54126876672,
+    "cache_gib": 50.4096,
+    "wired_limit": 95999710634
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 2693278564,
+    "staging_layers": 2,
+    "cache_bytes": 54103560192,
+    "cache_gib": 50.3879,
+    "wired_limit": 95999714498
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 2716598908,
+    "staging_layers": 2,
+    "cache_bytes": 54080243712,
+    "cache_gib": 50.3662,
+    "wired_limit": 95999718362
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 2739919252,
+    "staging_layers": 2,
+    "cache_bytes": 54056927232,
+    "cache_gib": 50.3444,
+    "wired_limit": 95999722226
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 3313700040,
+    "staging_layers": 2,
+    "cache_bytes": 53483341824,
+    "cache_gib": 49.8102,
+    "wired_limit": 95999917606
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 10149376819,
+    "staging_layers": 2,
+    "cache_bytes": 46646949888,
+    "cache_gib": 43.4434,
+    "wired_limit": 95999202449
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 131072,
+   "others_gib": 50,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 2688339148,
+    "staging_layers": 2,
+    "cache_bytes": 28973058048,
+    "cache_gib": 26.9833,
+    "wired_limit": 70864272938
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 2669958220,
+    "staging_layers": 2,
+    "cache_bytes": 28991711232,
+    "cache_gib": 27.0006,
+    "wired_limit": 70864545194
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 2693278564,
+    "staging_layers": 2,
+    "cache_bytes": 28968394752,
+    "cache_gib": 26.9789,
+    "wired_limit": 70864549058
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 2716598908,
+    "staging_layers": 2,
+    "cache_bytes": 28945078272,
+    "cache_gib": 26.9572,
+    "wired_limit": 70864552922
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 2739919252,
+    "staging_layers": 2,
+    "cache_bytes": 28921761792,
+    "cache_gib": 26.9355,
+    "wired_limit": 70864556786
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 3313700040,
+    "staging_layers": 2,
+    "cache_bytes": 28348176384,
+    "cache_gib": 26.4013,
+    "wired_limit": 70864752166
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 8192,
+    "kv": 10149376819,
+    "staging_layers": 2,
+    "cache_bytes": 21511784448,
+    "cache_gib": 20.0344,
+    "wired_limit": 70864037009
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 131072,
+   "others_gib": 80,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 2048,
+    "kv": 2688339148,
+    "staging_layers": 1,
+    "cache_bytes": 7479926784,
+    "cache_gib": 6.9662,
+    "wired_limit": 38652186563
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 2048,
+    "kv": 2669958220,
+    "staging_layers": 1,
+    "cache_bytes": 7498579968,
+    "cache_gib": 6.9836,
+    "wired_limit": 38652458819
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 2048,
+    "kv": 2693278564,
+    "staging_layers": 1,
+    "cache_bytes": 7475263488,
+    "cache_gib": 6.9619,
+    "wired_limit": 38652462683
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 2048,
+    "kv": 2716598908,
+    "staging_layers": 1,
+    "cache_bytes": 7451947008,
+    "cache_gib": 6.9402,
+    "wired_limit": 38652466547
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 2048,
+    "kv": 2739919252,
+    "staging_layers": 1,
+    "cache_bytes": 7428630528,
+    "cache_gib": 6.9185,
+    "wired_limit": 38652470411
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 2048,
+    "kv": 3313700040,
+    "staging_layers": 1,
+    "cache_bytes": 6855045120,
+    "cache_gib": 6.3843,
+    "wired_limit": 38652665791
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 2048,
+    "kv": 10149376819,
+    "staging_layers": 1,
+    "cache_bytes": 18653184,
+    "cache_gib": 0.0174,
+    "wired_limit": 38651950634
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 262144,
+   "others_gib": 20,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 8192,
+    "kv": 5175351705,
+    "staging_layers": 2,
+    "cache_bytes": 51599370240,
+    "cache_gib": 48.0557,
+    "wired_limit": 95997730346
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 8192,
+    "kv": 5156970777,
+    "staging_layers": 2,
+    "cache_bytes": 51618023424,
+    "cache_gib": 48.073,
+    "wired_limit": 95998002602
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 8192,
+    "kv": 5180291121,
+    "staging_layers": 2,
+    "cache_bytes": 51594706944,
+    "cache_gib": 48.0513,
+    "wired_limit": 95998006466
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 8192,
+    "kv": 5203611465,
+    "staging_layers": 2,
+    "cache_bytes": 51571390464,
+    "cache_gib": 48.0296,
+    "wired_limit": 95998010330
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 8192,
+    "kv": 5226931809,
+    "staging_layers": 2,
+    "cache_bytes": 51548073984,
+    "cache_gib": 48.0079,
+    "wired_limit": 95998014194
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 8192,
+    "kv": 6374493384,
+    "staging_layers": 2,
+    "cache_bytes": 50400903168,
+    "cache_gib": 46.9395,
+    "wired_limit": 95998404953
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 8192,
+    "kv": 20097427046,
+    "staging_layers": 2,
+    "cache_bytes": 36676823040,
+    "cache_gib": 34.158,
+    "wired_limit": 95997258487
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 262144,
+   "others_gib": 50,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 8192,
+    "kv": 5175351705,
+    "staging_layers": 2,
+    "cache_bytes": 26464204800,
+    "cache_gib": 24.6467,
+    "wired_limit": 70862564906
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 8192,
+    "kv": 5156970777,
+    "staging_layers": 2,
+    "cache_bytes": 26482857984,
+    "cache_gib": 24.6641,
+    "wired_limit": 70862837162
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 8192,
+    "kv": 5180291121,
+    "staging_layers": 2,
+    "cache_bytes": 26459541504,
+    "cache_gib": 24.6424,
+    "wired_limit": 70862841026
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 8192,
+    "kv": 5203611465,
+    "staging_layers": 2,
+    "cache_bytes": 26436225024,
+    "cache_gib": 24.6207,
+    "wired_limit": 70862844890
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 8192,
+    "kv": 5226931809,
+    "staging_layers": 2,
+    "cache_bytes": 26412908544,
+    "cache_gib": 24.5989,
+    "wired_limit": 70862848754
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 8192,
+    "kv": 6374493384,
+    "staging_layers": 2,
+    "cache_bytes": 25265737728,
+    "cache_gib": 23.5306,
+    "wired_limit": 70863239513
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 4096,
+    "kv": 20097427046,
+    "staging_layers": 1,
+    "cache_bytes": 20280674304,
+    "cache_gib": 18.8878,
+    "wired_limit": 70863401309
+   },
+   "memory_plan_lanes": 4
+  },
+  {
+   "max_ctx": 262144,
+   "others_gib": 80,
+   "flat_n1": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 2048,
+    "kv": 5175351705,
+    "staging_layers": 1,
+    "cache_bytes": 4971073536,
+    "cache_gib": 4.6297,
+    "wired_limit": 38650478531
+   },
+   "shared_n1": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 2048,
+    "kv": 5156970777,
+    "staging_layers": 1,
+    "cache_bytes": 4989726720,
+    "cache_gib": 4.647,
+    "wired_limit": 38650750787
+   },
+   "shared_n2": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 2048,
+    "kv": 5180291121,
+    "staging_layers": 1,
+    "cache_bytes": 4966410240,
+    "cache_gib": 4.6253,
+    "wired_limit": 38650754651
+   },
+   "shared_n3": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 2048,
+    "kv": 5203611465,
+    "staging_layers": 1,
+    "cache_bytes": 4943093760,
+    "cache_gib": 4.6036,
+    "wired_limit": 38650758515
+   },
+   "shared_n4": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 2048,
+    "kv": 5226931809,
+    "staging_layers": 1,
+    "cache_bytes": 4919777280,
+    "cache_gib": 4.5819,
+    "wired_limit": 38650762379
+   },
+   "mtp_latentbuf_per_owner_n4": {
+    "admitted": true,
+    "ctx": 262144,
+    "chunk_rows": 2048,
+    "kv": 6374493384,
+    "staging_layers": 1,
+    "cache_bytes": 3772606464,
+    "cache_gib": 3.5135,
+    "wired_limit": 38651153138
+   },
+   "per_lane_window_n4": {
+    "admitted": true,
+    "ctx": 131072,
+    "chunk_rows": 2048,
+    "kv": 10149376819,
+    "staging_layers": 1,
+    "cache_bytes": 18653184,
+    "cache_gib": 0.0174,
+    "wired_limit": 38651950634
+   },
+   "memory_plan_lanes": 4
+  }
+ ],
+ "flat_equals_admission_addons_256k": [
+  {
+   "others_gib": 20,
+   "chunk_rows": 8192,
+   "cache_bytes": 51599370240,
+   "admission_addons_cache_bytes": 51599370240,
+   "equal": true
+  },
+  {
+   "others_gib": 50,
+   "chunk_rows": 8192,
+   "cache_bytes": 26464204800,
+   "admission_addons_cache_bytes": 26464204800,
+   "equal": true
+  },
+  {
+   "others_gib": 80,
+   "chunk_rows": 2048,
+   "cache_bytes": 4971073536,
+   "admission_addons_cache_bytes": 4971073536,
+   "equal": true
+  }
+ ],
+ "plan_table_comparison": {
+  "tolerance_gib": 0.04,
+  "why_not_exact": "plan cells came from PA's float script (dense 8.532 GiB, cache not floored to slots) and a shared kv without KV_BASE at 15,808 B/token; these rows use exact bytes",
+  "max_abs_diff_gib": 0.0348,
+  "rows": [
+   {
+    "rule": "flat_n1",
+    "ctx": 16384,
+    "others_gib": 20,
+    "plan_gib": 52.44,
+    "got_gib": 52.4334,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "flat_n1",
+    "ctx": 16384,
+    "others_gib": 50,
+    "plan_gib": 29.03,
+    "got_gib": 29.0288,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "flat_n1",
+    "ctx": 16384,
+    "others_gib": 80,
+    "plan_gib": 9.01,
+    "got_gib": 9.0075,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "flat_n1",
+    "ctx": 65536,
+    "others_gib": 20,
+    "plan_gib": 51.56,
+    "got_gib": 51.5561,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "flat_n1",
+    "ctx": 65536,
+    "others_gib": 50,
+    "plan_gib": 28.16,
+    "got_gib": 28.1515,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "flat_n1",
+    "ctx": 65536,
+    "others_gib": 80,
+    "plan_gib": 8.14,
+    "got_gib": 8.1345,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "flat_n1",
+    "ctx": 262144,
+    "others_gib": 20,
+    "plan_gib": 48.06,
+    "got_gib": 48.0557,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "flat_n1",
+    "ctx": 262144,
+    "others_gib": 50,
+    "plan_gib": 24.65,
+    "got_gib": 24.6467,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "flat_n1",
+    "ctx": 262144,
+    "others_gib": 80,
+    "plan_gib": 4.64,
+    "got_gib": 4.6297,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n1",
+    "ctx": 16384,
+    "others_gib": 20,
+    "plan_gib": 52.47,
+    "got_gib": 52.4508,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n1",
+    "ctx": 16384,
+    "others_gib": 50,
+    "plan_gib": 29.06,
+    "got_gib": 29.0419,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n1",
+    "ctx": 16384,
+    "others_gib": 80,
+    "plan_gib": 9.04,
+    "got_gib": 9.0248,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n1",
+    "ctx": 65536,
+    "others_gib": 20,
+    "plan_gib": 51.59,
+    "got_gib": 51.5735,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n1",
+    "ctx": 65536,
+    "others_gib": 50,
+    "plan_gib": 28.19,
+    "got_gib": 28.1689,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n1",
+    "ctx": 65536,
+    "others_gib": 80,
+    "plan_gib": 8.17,
+    "got_gib": 8.1519,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n1",
+    "ctx": 262144,
+    "others_gib": 20,
+    "plan_gib": 48.09,
+    "got_gib": 48.073,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n1",
+    "ctx": 262144,
+    "others_gib": 50,
+    "plan_gib": 24.68,
+    "got_gib": 24.6641,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n1",
+    "ctx": 262144,
+    "others_gib": 80,
+    "plan_gib": 4.67,
+    "got_gib": 4.647,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n4",
+    "ctx": 16384,
+    "others_gib": 20,
+    "plan_gib": 52.4,
+    "got_gib": 52.3857,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n4",
+    "ctx": 16384,
+    "others_gib": 50,
+    "plan_gib": 28.99,
+    "got_gib": 28.9767,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n4",
+    "ctx": 16384,
+    "others_gib": 80,
+    "plan_gib": 8.98,
+    "got_gib": 8.9597,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n4",
+    "ctx": 65536,
+    "others_gib": 20,
+    "plan_gib": 51.53,
+    "got_gib": 51.5084,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n4",
+    "ctx": 65536,
+    "others_gib": 50,
+    "plan_gib": 28.12,
+    "got_gib": 28.1038,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n4",
+    "ctx": 65536,
+    "others_gib": 80,
+    "plan_gib": 8.1,
+    "got_gib": 8.0867,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n4",
+    "ctx": 262144,
+    "others_gib": 20,
+    "plan_gib": 48.02,
+    "got_gib": 48.0079,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n4",
+    "ctx": 262144,
+    "others_gib": 50,
+    "plan_gib": 24.62,
+    "got_gib": 24.5989,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "shared_n4",
+    "ctx": 262144,
+    "others_gib": 80,
+    "plan_gib": 4.6,
+    "got_gib": 4.5819,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "mtp_latentbuf_per_owner_n4",
+    "ctx": 16384,
+    "others_gib": 20,
+    "plan_gib": 52.33,
+    "got_gib": 52.3205,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "mtp_latentbuf_per_owner_n4",
+    "ctx": 16384,
+    "others_gib": 50,
+    "plan_gib": 28.93,
+    "got_gib": 28.9116,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "mtp_latentbuf_per_owner_n4",
+    "ctx": 16384,
+    "others_gib": 80,
+    "plan_gib": 8.91,
+    "got_gib": 8.8945,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "mtp_latentbuf_per_owner_n4",
+    "ctx": 65536,
+    "others_gib": 20,
+    "plan_gib": 51.26,
+    "got_gib": 51.2434,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "mtp_latentbuf_per_owner_n4",
+    "ctx": 65536,
+    "others_gib": 50,
+    "plan_gib": 27.85,
+    "got_gib": 27.8345,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "mtp_latentbuf_per_owner_n4",
+    "ctx": 65536,
+    "others_gib": 80,
+    "plan_gib": 7.83,
+    "got_gib": 7.8175,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "mtp_latentbuf_per_owner_n4",
+    "ctx": 262144,
+    "others_gib": 20,
+    "plan_gib": 46.96,
+    "got_gib": 46.9395,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "mtp_latentbuf_per_owner_n4",
+    "ctx": 262144,
+    "others_gib": 50,
+    "plan_gib": 23.55,
+    "got_gib": 23.5306,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "mtp_latentbuf_per_owner_n4",
+    "ctx": 262144,
+    "others_gib": 80,
+    "plan_gib": 3.53,
+    "got_gib": 3.5135,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "per_lane_window_n4",
+    "ctx": 16384,
+    "others_gib": 20,
+    "plan_gib": 51.53,
+    "got_gib": 51.5648,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "per_lane_window_n4",
+    "ctx": 16384,
+    "others_gib": 50,
+    "plan_gib": 28.13,
+    "got_gib": 28.1602,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "per_lane_window_n4",
+    "ctx": 16384,
+    "others_gib": 80,
+    "plan_gib": 8.11,
+    "got_gib": 8.1388,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "per_lane_window_n4",
+    "ctx": 65536,
+    "others_gib": 20,
+    "plan_gib": 48.05,
+    "got_gib": 48.0817,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "per_lane_window_n4",
+    "ctx": 65536,
+    "others_gib": 50,
+    "plan_gib": 24.65,
+    "got_gib": 24.6771,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "per_lane_window_n4",
+    "ctx": 65536,
+    "others_gib": 80,
+    "plan_gib": 4.63,
+    "got_gib": 4.6601,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   },
+   {
+    "rule": "per_lane_window_n4",
+    "ctx": 262144,
+    "others_gib": 20,
+    "plan_gib": 34.13,
+    "got_gib": 34.158,
+    "chunk_rows": 8192,
+    "within_tolerance": true
+   },
+   {
+    "rule": "per_lane_window_n4",
+    "ctx": 262144,
+    "others_gib": 50,
+    "plan_gib": 18.86,
+    "got_gib": 18.8878,
+    "chunk_rows": 4096,
+    "within_tolerance": true
+   },
+   {
+    "rule": "per_lane_window_n4",
+    "ctx": 262144,
+    "others_gib": 80,
+    "plan_gib": null,
+    "got_gib": null,
+    "chunk_rows": 2048,
+    "within_tolerance": true
+   }
+  ],
+  "all_within": true
+ },
+ "lanes_rule": "LANES = min(4, sched_cap, memory_plan_lanes); 1 under MLX_SERVE_FORCE_SERIAL (flat mode); sched_cap = MLX_SCHED_MAX_NUM_SEQS parsed as usize, 0 / unparsable -> 8, then min 32 (EN/hybrid_scheduler.rs:627-639)",
+ "lanes_cases": [
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": null,
+   "sched_cap": 8,
+   "memory_plan_lanes": 4,
+   "lanes": 4
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": null,
+   "sched_cap": 8,
+   "memory_plan_lanes": 3,
+   "lanes": 3
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": null,
+   "sched_cap": 8,
+   "memory_plan_lanes": 1,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "",
+   "sched_cap": 8,
+   "memory_plan_lanes": 4,
+   "lanes": 4
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "",
+   "sched_cap": 8,
+   "memory_plan_lanes": 3,
+   "lanes": 3
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "",
+   "sched_cap": 8,
+   "memory_plan_lanes": 1,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "0",
+   "sched_cap": 8,
+   "memory_plan_lanes": 4,
+   "lanes": 4
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "0",
+   "sched_cap": 8,
+   "memory_plan_lanes": 3,
+   "lanes": 3
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "0",
+   "sched_cap": 8,
+   "memory_plan_lanes": 1,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "1",
+   "sched_cap": 1,
+   "memory_plan_lanes": 4,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "1",
+   "sched_cap": 1,
+   "memory_plan_lanes": 3,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "1",
+   "sched_cap": 1,
+   "memory_plan_lanes": 1,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "2",
+   "sched_cap": 2,
+   "memory_plan_lanes": 4,
+   "lanes": 2
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "2",
+   "sched_cap": 2,
+   "memory_plan_lanes": 3,
+   "lanes": 2
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "2",
+   "sched_cap": 2,
+   "memory_plan_lanes": 1,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "3",
+   "sched_cap": 3,
+   "memory_plan_lanes": 4,
+   "lanes": 3
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "3",
+   "sched_cap": 3,
+   "memory_plan_lanes": 3,
+   "lanes": 3
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "3",
+   "sched_cap": 3,
+   "memory_plan_lanes": 1,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "4",
+   "sched_cap": 4,
+   "memory_plan_lanes": 4,
+   "lanes": 4
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "4",
+   "sched_cap": 4,
+   "memory_plan_lanes": 3,
+   "lanes": 3
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "4",
+   "sched_cap": 4,
+   "memory_plan_lanes": 1,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "+3",
+   "sched_cap": 3,
+   "memory_plan_lanes": 4,
+   "lanes": 3
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "+3",
+   "sched_cap": 3,
+   "memory_plan_lanes": 3,
+   "lanes": 3
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "+3",
+   "sched_cap": 3,
+   "memory_plan_lanes": 1,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": " 3",
+   "sched_cap": 8,
+   "memory_plan_lanes": 4,
+   "lanes": 4
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": " 3",
+   "sched_cap": 8,
+   "memory_plan_lanes": 3,
+   "lanes": 3
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": " 3",
+   "sched_cap": 8,
+   "memory_plan_lanes": 1,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "8",
+   "sched_cap": 8,
+   "memory_plan_lanes": 4,
+   "lanes": 4
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "8",
+   "sched_cap": 8,
+   "memory_plan_lanes": 3,
+   "lanes": 3
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "8",
+   "sched_cap": 8,
+   "memory_plan_lanes": 1,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "100",
+   "sched_cap": 32,
+   "memory_plan_lanes": 4,
+   "lanes": 4
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "100",
+   "sched_cap": 32,
+   "memory_plan_lanes": 3,
+   "lanes": 3
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "100",
+   "sched_cap": 32,
+   "memory_plan_lanes": 1,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "abc",
+   "sched_cap": 8,
+   "memory_plan_lanes": 4,
+   "lanes": 4
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "abc",
+   "sched_cap": 8,
+   "memory_plan_lanes": 3,
+   "lanes": 3
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "abc",
+   "sched_cap": 8,
+   "memory_plan_lanes": 1,
+   "lanes": 1
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "-2",
+   "sched_cap": 8,
+   "memory_plan_lanes": 4,
+   "lanes": 4
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "-2",
+   "sched_cap": 8,
+   "memory_plan_lanes": 3,
+   "lanes": 3
+  },
+  {
+   "MLX_SCHED_MAX_NUM_SEQS": "-2",
+   "sched_cap": 8,
+   "memory_plan_lanes": 1,
+   "lanes": 1
+  }
+ ],
+ "force_serial_lanes": 1,
+ "notes": [
+  "the flat profile has no explicit term for lane 1's own windows (17.8 MB); shared charges only lanes 2..N; kept as in the plan",
+  "step_rows in lane_floor follow PLAN-parity §3.1 (2 x 0.7 MB); a wave never exceeds row_cap rows and prefill slices are never fused with decode rows, so the per-chunk compute term already covers them",
+  "shared keeps the 4 B u32 id per token (kv_per_ctx = 15,812, = flat); 11-verify-perf-mem used 15,808 and left KV_BASE out (<= 0.02 GiB)"
+ ]
+}
