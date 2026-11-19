@@ -26,7 +26,8 @@
 //! A turn is `begin_turn` .. `end_turn` (`Lease`): the start re-admits at the
 //! same context and chunk and may drop the bank to staging-only or rebuild
 //! it, then holds a wired-limit lease of fixed + cache bytes until the end,
-//! when the bank becomes volatile.
+//! when the bank becomes volatile. A re-admission inside the turn (`recheck`)
+//! switches a warm bank only when the host has no room for it.
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
@@ -547,6 +548,10 @@ thread_local! {
     /// real one.
     pub(super) static TEST_HOST: std::cell::Cell<Option<(HostMemory, u64)>> =
         const { std::cell::Cell::new(None) };
+    /// The process footprint the re-admission sees on this thread instead of
+    /// the real one.
+    pub(super) static TEST_FOOTPRINT: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// The working set an admission may fill: `ws`, at most `max_memory`.
@@ -565,18 +570,74 @@ fn host_reading(max_memory: Option<u64>) -> Result<(HostMemory, u64)> {
     Ok((h, capped_ws(working_set(), max_memory)))
 }
 
+/// This process's physical footprint (0 without a reading).
+fn footprint() -> u64 {
+    #[cfg(test)]
+    if let Some(f) = TEST_FOOTPRINT.with(std::cell::Cell::get) {
+        return f;
+    }
+    crate::models::deepseek_v41::stats::rusage().0
+}
+
+/// The bytes `a` charges for this model's buffers beside its dense arrays,
+/// KV and bank: scratch, reads, driver and the shared pool.
+pub fn transient_charge(a: &Admission) -> u64 {
+    let t = &a.terms;
+    t.compute + t.io + t.driver + t.pool
+}
+
 /// This model's bytes inside `host_used`: resident arrays, the sessions'
 /// buffers `kv` (made at their first write and kept, already charged in
-/// `fixed`) and the bank's resident pages (volatile between turns).
-/// Scratch and the shared pool stay in `others` (conservative).
-pub fn own(bank: &KqBank, dense: u64, kv: u64) -> Result<Own> {
-    Ok(own_of(dense, kv, bank.resident_bytes()?, bank.in_turn()))
+/// `fixed`), the bank's resident pages (volatile between turns) and the
+/// process footprint past those (scratch, the MLX free pool, read buffers)
+/// up to `charge` ([`transient_charge`]). Footprint past the charge, and
+/// other models of this process inside it, stay in `others`: held bytes
+/// past live then still mean the host has no room. With the host reading
+/// `h` settled for the bank ([`settled`]).
+pub fn own(
+    bank: &KqBank,
+    dense: u64,
+    kv: u64,
+    charge: u64,
+    h: HostMemory,
+) -> Result<(HostMemory, Own)> {
+    let resident = bank.resident_bytes()?;
+    let in_turn = bank.in_turn();
+    Ok((
+        settled(h, resident, in_turn),
+        own_of(dense, kv, resident, in_turn, footprint(), charge),
+    ))
+}
+
+/// `h` with the non-volatile bank's `resident` pages out of its purgeable
+/// count. The host keeps counting a bank purgeable for a while after it
+/// turned non-volatile (measured at a turn start: 55.5 GB purgeable, the
+/// bank's 54.9 GB plus the usual 0.5), and `host_used` subtracts purgeable
+/// pages from the anonymous ones: other processes' pages vanished and the
+/// turn start grew the bank past the host. Other processes' volatile pages
+/// up to `resident` count as used (conservative).
+pub fn settled(h: HostMemory, resident: u64, in_turn: bool) -> HostMemory {
+    if !in_turn {
+        return h;
+    }
+    HostMemory {
+        purgeable: h.purgeable.saturating_sub(resident),
+        ..h
+    }
 }
 
 /// [`own`] from its parts.
-pub fn own_of(dense: u64, kv: u64, resident: u64, in_turn: bool) -> Own {
+pub fn own_of(
+    dense: u64,
+    kv: u64,
+    resident: u64,
+    in_turn: bool,
+    footprint: u64,
+    charge: u64,
+) -> Own {
+    let counted = dense + kv + resident;
     Own {
-        active: dense + kv + resident,
+        active: counted + footprint.saturating_sub(counted).min(charge),
         pool: 0,
         volatile: if in_turn { 0 } else { resident },
     }
@@ -686,7 +747,7 @@ impl Lease {
             bank.begin_turn()?;
             let next = (|| {
                 let (h, ws) = host_reading(self.max_memory)?;
-                let o = own(bank, dense, kv)?;
+                let (h, o) = own(bank, dense, kv, transient_charge(&cur), h)?;
                 match readmit_with(
                     &self.profile,
                     &cur,
@@ -727,9 +788,12 @@ impl Lease {
     }
 
     /// Inside a turn (between two evaluated steps): the turn start's
-    /// re-admission again, for a host that changed since. A changed
-    /// admission switches the bank and the wired lease. `true` when it
-    /// switched; `false` outside a turn or without an admission.
+    /// re-admission again, for a host that changed since. A warm bank the
+    /// re-admission has no room for switches only when the host has less
+    /// than the reserve available ([`pressed`]), to what the host admits now
+    /// (staging only when that admits no cache); room that came back waits
+    /// for the next turn start unless the bank holds no cache. `true` when
+    /// it switched; `false` outside a turn or without an admission.
     pub fn recheck(&self, bank: &KqBank, dense: u64, kv: u64) -> Result<bool> {
         let mut t = self.turn();
         let (Some(limits), Some(cur)) = (&self.limits, t.admission) else {
@@ -739,8 +803,8 @@ impl Lease {
             return Ok(false);
         }
         let (h, ws) = host_reading(self.max_memory)?;
-        let o = own(bank, dense, kv)?;
-        let next = match readmit_with(
+        let (h, o) = own(bank, dense, kv, transient_charge(&cur), h)?;
+        let turn = readmit_with(
             &self.profile,
             &cur,
             &self.size,
@@ -749,10 +813,12 @@ impl Lease {
             &h,
             &o,
             ws,
-        )? {
-            Turn::Keep if !t.lost => return Ok(false),
-            Turn::Keep => cur,
-            Turn::StagingOnly(a) | Turn::Rebuild(a) => a,
+        )?;
+        let next = match switch_in_turn(turn, &cur, t.lost, pressed(&h, limits), || {
+            admit_with(&self.profile, &self.size, self.rows, limits, &h, &o, ws)
+        })? {
+            Some(a) => a,
+            None => return Ok(false),
         };
         crate::array::synchronize();
         self.switch(&mut t, bank, &next)?;
@@ -773,6 +839,37 @@ impl Lease {
         t.wired = None;
         bank.end_turn()
     }
+}
+
+/// The host has less than `limits.reserve` available. The admission
+/// charges the bytes this model may take (`fixed + cache`), mostly more
+/// than it holds, so its "no room" alone leaves the host with room.
+pub fn pressed(h: &HostMemory, limits: &Limits) -> bool {
+    h.physical.saturating_sub(h.non_reclaimable()) < limits.reserve
+}
+
+/// What a re-admission inside a turn does with the bank: `None` keeps it.
+/// A switch empties the cache, so a warm one is switched only for a
+/// `pressed` host the re-admission has no room for, to what `now` admits.
+pub fn switch_in_turn(
+    turn: Turn,
+    cur: &Admission,
+    lost: bool,
+    pressed: bool,
+    now: impl FnOnce() -> Result<Admission>,
+) -> Result<Option<Admission>> {
+    let warm = cur.cache_slots > 0 && !lost;
+    Ok(match turn {
+        Turn::Keep if lost => Some(*cur),
+        Turn::Keep => None,
+        Turn::Rebuild(_) if warm => None,
+        Turn::Rebuild(a) => Some(a),
+        Turn::StagingOnly(_) if warm && !pressed => None,
+        Turn::StagingOnly(s) => {
+            let a = now()?;
+            Some(if a.cache_slots > 0 { a } else { s })
+        }
+    })
 }
 
 /// Engram rows through a table the store keeps for its read counters.
@@ -972,7 +1069,9 @@ impl Store {
 
     /// `kv`: bytes of every live session (`Session::nbytes`).
     pub fn own(&self, kv: u64) -> Result<Own> {
-        own(&self.bank, self.dense_bytes, kv)
+        let charge = self.admission().as_ref().map_or(0, transient_charge);
+        let (h, _) = host_reading(self.max_memory)?;
+        Ok(own(&self.bank, self.dense_bytes, kv, charge, h)?.1)
     }
 
     /// `kv`: bytes of every live session (`Session::nbytes`).

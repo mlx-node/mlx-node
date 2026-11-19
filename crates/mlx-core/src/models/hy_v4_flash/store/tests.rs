@@ -266,15 +266,292 @@ fn readmission_counts_the_session_kv_as_own() {
         )
         .unwrap()
     };
-    assert_eq!(turn(own_of(b.dense, kv, 0, true)), Turn::Keep);
+    assert_eq!(turn(own_of(b.dense, kv, 0, true, 0, 0)), Turn::Keep);
     assert!(matches!(
-        turn(own_of(b.dense, 0, 0, true)),
+        turn(own_of(b.dense, 0, 0, true, 0, 0)),
         Turn::StagingOnly(_)
     ));
 }
 
-/// Two staging layers charge 2 x 1024 slots at the larger slot (8.89
-/// GiB), at least what the bank allocates (2 x 512 slots per class).
+/// Inside a turn of a load bound by live memory, this process's buffers
+/// past its dense arrays, KV and bank (scratch, the free pool, reads) are
+/// its own up to what the admission charges for them, so they keep the
+/// bank; read as others' they dropped it to staging only. Footprint past
+/// the charge is others'.
+#[test]
+fn readmission_counts_charged_transients_as_own() {
+    let f = fixture("admission-addons.json");
+    let inputs = &f["inputs"];
+    let v = &f["variants"]["mtp_on"];
+    let p = profile(u(&v["kv_per_ctx"]));
+    let b = base(inputs, v);
+    let others = 50 * G;
+    let (h0, ws) = host(inputs, others);
+    let max_ctx = u(&inputs["max_context"]) as usize;
+    let load = pick(
+        &p,
+        &b,
+        max_ctx,
+        &Limits::default(),
+        &h0,
+        &Own::default(),
+        ws,
+    )
+    .unwrap();
+    assert_eq!(load.admission.bound, Bound::Live);
+    let m = ModelSize {
+        ctx: load.ctx as u64,
+        ..b
+    };
+    let a = load.admission;
+    let charge = transient_charge(&a);
+    assert_eq!(
+        charge,
+        a.terms.compute + a.terms.io + a.terms.driver + a.terms.pool
+    );
+    let scratch = 3 * G;
+    assert!(scratch > crate::moe_stream::budget::KEEP_SLACK && scratch < charge);
+    let resident = a.cache_bytes();
+    let counted = b.dense + resident;
+    let h1 = HostMemory {
+        wired: others + counted + scratch,
+        ..h0
+    };
+    let turn = |own: Own| {
+        readmit_with(
+            &p,
+            &a,
+            &m,
+            load.chunk as u64,
+            &Limits::default(),
+            &h1,
+            &own,
+            ws,
+        )
+        .unwrap()
+    };
+    let fp = counted + scratch;
+    assert_eq!(
+        turn(own_of(b.dense, 0, resident, true, fp, charge)),
+        Turn::Keep
+    );
+    assert!(matches!(
+        turn(own_of(b.dense, 0, resident, true, fp, 0)),
+        Turn::StagingOnly(_)
+    ));
+    let over = HostMemory {
+        wired: others + counted + charge + scratch,
+        ..h0
+    };
+    let fp = counted + charge + scratch;
+    assert!(matches!(
+        readmit_with(
+            &p,
+            &a,
+            &m,
+            load.chunk as u64,
+            &Limits::default(),
+            &over,
+            &own_of(b.dense, 0, resident, true, fp, charge),
+            ws
+        )
+        .unwrap(),
+        Turn::StagingOnly(_)
+    ));
+    let o = own_of(b.dense, 0, resident, true, fp, charge);
+    assert_eq!(o.bytes(), counted + charge);
+    assert_eq!(
+        own_of(b.dense, 0, resident, true, 0, charge).bytes(),
+        counted
+    );
+    assert_eq!(
+        own_of(b.dense, 0, resident, false, fp, charge).volatile,
+        resident
+    );
+}
+
+/// A turn start whose host still counts the non-volatile bank purgeable
+/// keeps the bank: `host_used` subtracts purgeable pages from the anonymous
+/// ones, so others' pages vanished (bank wired) or the bank did (bank
+/// anonymous), and the bank grew past the host. Measured readings, GB.
+#[test]
+fn readmission_settles_a_bank_counted_purgeable() {
+    let gb = |x: f64| (x * 1e9) as u64;
+    let hm = |wired, anonymous, purgeable| HostMemory {
+        physical: gb(137.44),
+        free: 0,
+        file: 0,
+        anonymous: gb(anonymous),
+        purgeable: gb(purgeable),
+        wired: gb(wired),
+        compressor: gb(5.17),
+    };
+    let resident = gb(54.94);
+    let normal = hm(79.75, 20.22, 0.47);
+    let wired = hm(79.66, 20.15, 55.47);
+    let anon = hm(8.94, 90.61, 55.47);
+    let used = |h: HostMemory| settled(h, resident, true).non_reclaimable() as f64 / 1e9;
+    assert!((wired.non_reclaimable() as f64 / 1e9 - 84.84).abs() < 0.05);
+    assert!((anon.non_reclaimable() as f64 / 1e9 - 49.25).abs() < 0.05);
+    for h in [wired, anon] {
+        assert!(
+            (used(h) - used(normal)).abs() < 1.0,
+            "{} vs {}",
+            used(h),
+            used(normal)
+        );
+    }
+    assert_eq!(
+        used(normal),
+        (normal.non_reclaimable() + gb(0.47)) as f64 / 1e9
+    );
+    assert_eq!(settled(wired, resident, false), wired);
+
+    let f = fixture("admission-addons.json");
+    let inputs = &f["inputs"];
+    let v = &f["variants"]["mtp_on"];
+    let p = profile(u(&v["kv_per_ctx"]));
+    let b = base(inputs, v);
+    let others = 50 * G;
+    let (h0, ws) = host(inputs, others);
+    let max_ctx = u(&inputs["max_context"]) as usize;
+    let load = pick(
+        &p,
+        &b,
+        max_ctx,
+        &Limits::default(),
+        &h0,
+        &Own::default(),
+        ws,
+    )
+    .unwrap();
+    let a = load.admission;
+    let m = ModelSize {
+        ctx: load.ctx as u64,
+        ..b
+    };
+    let resident = a.cache_bytes();
+    assert!(resident > crate::moe_stream::budget::GROW_MIN);
+    let lagging = HostMemory {
+        wired: others - 20 * G + b.dense,
+        anonymous: 20 * G + resident,
+        purgeable: resident,
+        ..h0
+    };
+    let o = own_of(
+        b.dense,
+        0,
+        resident,
+        true,
+        b.dense + resident,
+        transient_charge(&a),
+    );
+    let turn = |h: &HostMemory| {
+        readmit_with(&p, &a, &m, load.chunk as u64, &Limits::default(), h, &o, ws).unwrap()
+    };
+    assert!(matches!(turn(&lagging), Turn::Rebuild(_)));
+    assert_eq!(turn(&settled(lagging, resident, true)), Turn::Keep);
+}
+
+/// Inside a turn a warm cache is kept unless the re-admission has no room
+/// for it and the host is pressed, then rebuilt at what the host admits
+/// now; growth waits for a turn start unless the bank holds no cache.
+#[test]
+fn in_turn_switches_a_warm_cache_only_for_a_pressed_host() {
+    let f = fixture("admission-addons.json");
+    let inputs = &f["inputs"];
+    let v = &f["variants"]["mtp_on"];
+    let p = profile(u(&v["kv_per_ctx"]));
+    let b = base(inputs, v);
+    let (h0, ws) = host(inputs, 50 * G);
+    let max_ctx = u(&inputs["max_context"]) as usize;
+    let a = pick(
+        &p,
+        &b,
+        max_ctx,
+        &Limits::default(),
+        &h0,
+        &Own::default(),
+        ws,
+    )
+    .unwrap()
+    .admission;
+    assert!(a.cache_slots > 0);
+    let smaller = Admission {
+        cache_slots: a.cache_slots / 2,
+        ..a
+    };
+    let staging = Admission {
+        staging_layers: 1,
+        fixed: a.terms.fixed(1),
+        cache_slots: 0,
+        ..a
+    };
+    let never = || -> Result<Admission> { panic!("no reading needed") };
+    for pressed in [false, true] {
+        assert_eq!(
+            switch_in_turn(Turn::Keep, &a, false, pressed, never).unwrap(),
+            None
+        );
+        assert_eq!(
+            switch_in_turn(Turn::Keep, &a, true, pressed, never).unwrap(),
+            Some(a)
+        );
+        assert_eq!(
+            switch_in_turn(Turn::Rebuild(smaller), &a, false, pressed, never).unwrap(),
+            None
+        );
+        assert_eq!(
+            switch_in_turn(Turn::Rebuild(a), &staging, false, pressed, never).unwrap(),
+            Some(a)
+        );
+        assert_eq!(
+            switch_in_turn(Turn::Rebuild(a), &smaller, true, pressed, never).unwrap(),
+            Some(a)
+        );
+    }
+    assert_eq!(
+        switch_in_turn(Turn::StagingOnly(staging), &a, false, false, never).unwrap(),
+        None
+    );
+    assert_eq!(
+        switch_in_turn(Turn::StagingOnly(staging), &a, true, false, || Ok(smaller)).unwrap(),
+        Some(smaller)
+    );
+    assert_eq!(
+        switch_in_turn(Turn::StagingOnly(staging), &a, false, true, || Ok(smaller)).unwrap(),
+        Some(smaller)
+    );
+    assert_eq!(
+        switch_in_turn(Turn::StagingOnly(staging), &a, false, true, || Ok(staging)).unwrap(),
+        Some(staging)
+    );
+}
+
+/// Pressed: less than the reserve available (measured AR C32 reading at
+/// its in-turn switch: 30.5 GB available, not pressed).
+#[test]
+fn pressed_is_less_than_the_reserve_available() {
+    let l = Limits::default();
+    let h = |nr: u64| HostMemory {
+        physical: 128 * G,
+        wired: nr,
+        ..Default::default()
+    };
+    assert!(!pressed(&h(128 * G - l.reserve), &l));
+    assert!(pressed(&h(128 * G - l.reserve + 1), &l));
+    let measured = HostMemory {
+        physical: 137_438_953_472,
+        free: 14_520_000_000,
+        file: 15_600_000_000,
+        anonymous: 21_140_000_000,
+        purgeable: 0,
+        wired: 80_640_000_000,
+        compressor: 5_140_000_000,
+    };
+    assert!(!pressed(&measured, &l));
+}
+
 #[test]
 fn staging_charge_is_two_full_layers() {
     let f = fixture("admission-addons.json");
@@ -767,6 +1044,67 @@ fn lease_rebuilds_keeps_and_refuses() {
     assert!(e.contains("vs budget"), "{e}");
     assert!(!lease.in_turn() && !bank.in_turn());
     assert_eq!(lease.admission().unwrap(), a);
+}
+
+/// Inside a turn of a load bound by live memory the lease keeps the warm
+/// bank while the process's own transients grow past the slack within
+/// their charge (others' bytes as large switch it), and keeps it when room
+/// comes back.
+#[test]
+fn lease_recheck_keeps_a_warm_bank_for_own_transients() {
+    let (_, c0, _d0) = tiny_bank([0, 0], 1);
+    let slot = c0.slot[0].max(c0.slot[1]);
+    let (bank, classes, _dir) = tiny_bank(c0.split(64 * slot), 1);
+    let p = profile(100);
+    let size = ModelSize {
+        dense: 0,
+        slot,
+        n_experts: 8,
+        ctx: 1024,
+    };
+    let rows = 1024;
+    let limits = Limits::default();
+    let ws = 48 * G;
+    let one = Terms::with(&p, &size, ws, rows).fixed(1);
+    let others = 10 * G;
+    let host = |wired| HostMemory {
+        physical: limits.reserve + others + one + 64 * size.slot,
+        wired,
+        ..Default::default()
+    };
+    let loaded = admit_with(&p, &size, rows, &limits, &host(others), &Own::default(), ws).unwrap();
+    assert_eq!((loaded.bound, loaded.cache_slots), (Bound::Live, 64));
+    let lease = Lease::new(p, size, rows, classes, Some(limits), Some(loaded), &bank);
+    bank.end_turn().unwrap();
+    TEST_HOST.with(|c| c.set(Some((host(others), ws))));
+    TEST_FOOTPRINT.with(|c| c.set(Some(0)));
+    lease.begin_turn(&bank, 0, 0).unwrap();
+    let switched = lease.switches().len();
+    assert_eq!(lease.admission().unwrap(), loaded);
+    let resident = bank.resident_bytes().unwrap();
+    let scratch = 3 * G;
+    assert!(scratch > crate::moe_stream::budget::KEEP_SLACK);
+    assert!(scratch < transient_charge(&loaded));
+    let turn_host = host(others + resident + scratch);
+    let readmit = |fp: u64| {
+        let o = own_of(0, 0, resident, true, fp, transient_charge(&loaded));
+        readmit_with(&p, &loaded, &size, rows, &limits, &turn_host, &o, ws)
+    };
+    assert_eq!(readmit(resident + scratch).unwrap(), Turn::Keep);
+    assert!(readmit(resident).is_err());
+    TEST_HOST.with(|c| c.set(Some((turn_host, ws))));
+    TEST_FOOTPRINT.with(|c| c.set(Some(resident + scratch)));
+    assert!(!lease.recheck(&bank, 0, 0).unwrap());
+    TEST_HOST.with(|c| c.set(Some((host(resident), ws))));
+    TEST_FOOTPRINT.with(|c| c.set(Some(resident)));
+    assert!(!lease.recheck(&bank, 0, 0).unwrap());
+    TEST_HOST.with(|c| c.set(None));
+    TEST_FOOTPRINT.with(|c| c.set(None));
+    assert_eq!(lease.admission().unwrap(), loaded);
+    assert_eq!(lease.switches().len(), switched);
+    assert_eq!(bank.cache_slots(), classes.split(loaded.cache_bytes()));
+    assert!(lease.in_turn() && bank.in_turn());
+    lease.end_turn(&bank).unwrap();
 }
 
 /// Without limits the lease never re-admits or switches.
