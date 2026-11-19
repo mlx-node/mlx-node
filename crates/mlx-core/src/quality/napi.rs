@@ -41,23 +41,39 @@ async fn run_on_model(
     model_path: &str,
     request: EvalRequest,
     kv_format: Option<&str>,
+    activations: Option<&str>,
 ) -> Result<EvalOutcome> {
     let format = kv_format
         .map(|value| crate::transformer::KvFormat::parse(Some(value)))
         .transpose()
         .map_err(|message| Error::from_reason(format!("mlx eval: {message}")))?;
+    let activations = |moe: bool| {
+        crate::transformer::Activations::parse(
+            activations,
+            crate::models::qwen3_5::load_plan::default_activations(moe, false),
+        )
+        .map_err(|message| Error::from_reason(format!("mlx eval: {message}")))
+    };
     match read_model_type(model_path)?.as_str() {
         "qwen3_5" => {
-            let model =
-                crate::models::qwen3_5::persistence::load_for_tool(model_path, format).await?;
+            let model = crate::models::qwen3_5::persistence::load_for_tool(
+                model_path,
+                format,
+                activations(false)?,
+            )
+            .await?;
             crate::model_thread::send_and_await(&model.thread, |reply| {
                 Qwen35FamilyCommand::EvalTeacherForced { request, reply }
             })
             .await
         }
         "qwen3_5_moe" => {
-            let model =
-                crate::models::qwen3_5_moe::persistence::load_for_tool(model_path, format).await?;
+            let model = crate::models::qwen3_5_moe::persistence::load_for_tool(
+                model_path,
+                format,
+                activations(true)?,
+            )
+            .await?;
             crate::model_thread::send_and_await(&model.thread, |reply| {
                 Qwen35MoeFamilyCommand::EvalTeacherForced { request, reply }
             })
@@ -138,6 +154,9 @@ pub async fn capture_teacher_logits(
             cache_dir: PathBuf::from(cache_dir),
         },
         None,
+        // The reference keeps every query bf16 (Splash `--activations bf16`,
+        // the precision opt-out for evaluations).
+        Some("bf16"),
     )
     .await?;
 
@@ -160,13 +179,19 @@ pub async fn capture_teacher_logits(
 ///
 /// `kv_format` (`"int8"` / `"bf16"`; unset = the load default) selects the Qwen dense or MoE
 /// candidate's flat K/V cache format, so the int8 cache can be scored against
-/// the same teacher cache as the BF16 one.
+/// the same teacher cache as the BF16 one. `activations` (`"auto"` /
+/// `"bf16"`; unset = the default of a load with no draft: bf16) is the
+/// load's int8 activations (`--activations`).
+/// `depth_edges` (strictly increasing positions; unset = none) splits the
+/// report's `depth` buckets.
 #[napi]
 pub async fn score_against_teacher(
     model_path: String,
     cache_dir: String,
     logit_chunk: u32,
     kv_format: Option<String>,
+    activations: Option<String>,
+    depth_edges: Option<Vec<u32>>,
 ) -> Result<EvalReport> {
     let _lock = eval_guard()
         .try_lock()
@@ -180,8 +205,10 @@ pub async fn score_against_teacher(
             cache_dir: PathBuf::from(cache_dir),
             logit_chunk,
             identity,
+            depth_edges: depth_edges.unwrap_or_default(),
         },
         kv_format.as_deref(),
+        activations.as_deref(),
     )
     .await?;
 

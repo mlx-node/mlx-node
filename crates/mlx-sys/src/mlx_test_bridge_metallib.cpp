@@ -18,6 +18,10 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+namespace mlx::core::mixed_projection {
+const std::vector<std::string>& kernel_names();
+}
 #endif
 
 // True on a Metal device of no Apple GPU family (a hosted VM GPU): its
@@ -38,8 +42,8 @@ extern "C" bool mlx_test_gpu_lacks_apple_family() {
 #endif
 }
 
-// `family` is "segmented_sdpa", "affine_mixed", "splash_moe" or
-// "paged_prefill". `counts` receives {names the
+// `family` is "segmented_sdpa", "affine_mixed", "mixed_projection",
+// "splash_moe" or "paged_prefill". `counts` receives {names the
 // dispatcher can request, the family's functions in the library, pipelines
 // built}. `report` receives "missing <name>" / "unexpected <name>" lines.
 // `build_pipelines` also builds every pipeline the dispatcher can build (each
@@ -95,6 +99,15 @@ extern "C" bool mlx_test_bridge_metallib_check(const char *family,
           ++built;
         }
         return built;
+      };
+    } else if (std::strcmp(family, "mixed_projection") == 0) {
+      prefix = "mixed_projection_";
+      names = mixed_projection::kernel_names();
+      build = [&d, &names] {
+        if (!metal::is_nax_available()) return int64_t(0);
+        for (const auto& name : names)
+          fast::paged::get_prebuilt_kernel(d, "mixed_projection", "m8", name);
+        return int64_t(names.size());
       };
     } else if (std::strcmp(family, "splash_moe") == 0) {
       prefix = "splash_moe_";

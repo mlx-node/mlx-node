@@ -123,7 +123,9 @@ pub fn capture_chunk(logits: &MxArray, targets: &MxArray, top_k: i64) -> Result<
     // `argpartition(V - k)` puts the k largest entries last, in no particular
     // order — order does not matter, the KL is a sum over the support.
     let order = logits.argpartition((vocab - k) as i32, Some(1))?;
-    let indices = order.slice_axis(1, vocab - k, vocab)?;
+    // A slice shares the `[P, V]` order's buffer; a row of captured chunks
+    // would hold `positions x vocab` ids alive until its concat.
+    let indices = order.slice_axis(1, vocab - k, vocab)?.deep_copy()?;
 
     let target_column = targets.expand_dims(1)?;
     let target_logit = logits
@@ -164,6 +166,23 @@ impl ScoreTotals {
         self.top1_matches += other.top1_matches;
     }
 
+    /// The bucket's means; a bucket no row reaches reports zero positions and
+    /// NaN means.
+    pub fn into_depth_bucket(self, from: u32, to: Option<u32>) -> EvalDepthBucket {
+        let n = self.positions as f64;
+        let mean = |sum: f64| if n > 0.0 { sum / n } else { f64::NAN };
+        EvalDepthBucket {
+            from,
+            to,
+            positions: self.positions as u32,
+            mean_nll: mean(self.nll_sum),
+            teacher_mean_nll: mean(self.teacher_nll_sum),
+            mean_kl_topk: mean(self.kl_sum),
+            top1_agreement: mean(self.top1_matches),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn into_report(
         self,
         rows: u32,
@@ -171,6 +190,8 @@ impl ScoreTotals {
         teacher_path: String,
         teacher_quantized: bool,
         kv_format: crate::transformer::KvFormat,
+        attention_query_launches: [u64; 2],
+        depth: Vec<EvalDepthBucket>,
     ) -> Result<EvalReport> {
         if self.positions == 0 {
             return Err(Error::from_reason(
@@ -181,6 +202,7 @@ impl ScoreTotals {
         let mean_nll = self.nll_sum / n;
         let teacher_mean_nll = self.teacher_nll_sum / n;
         Ok(EvalReport {
+            depth,
             rows,
             positions: self.positions as u32,
             top_k,
@@ -194,6 +216,8 @@ impl ScoreTotals {
             teacher_tail_mass: self.tail_mass_sum / n,
             top1_agreement: self.top1_matches / n,
             kv_format: kv_format.as_str().to_string(),
+            bf16_query_launches: attention_query_launches[0] as f64,
+            int8_query_launches: attention_query_launches[1] as f64,
         })
     }
 }
@@ -316,6 +340,29 @@ pub struct EvalReport {
     /// Format of the candidate's K/V cache during the scored prefill.
     #[napi(ts_type = "'int8' | 'bf16'")]
     pub kv_format: String,
+    /// Paged attention launches of the scored prefill with bf16 queries.
+    pub bf16_query_launches: f64,
+    /// Paged attention launches of the scored prefill with int8 queries
+    /// (`activations` auto over an int8 pool).
+    pub int8_query_launches: f64,
+    /// The same metrics by the scored position's depth, one bucket per
+    /// `[from, to)` of the requested edges. Position `p` is the row at KV
+    /// position `p`, whose query attends to `p + 1` keys.
+    pub depth: Vec<EvalDepthBucket>,
+}
+
+/// [`EvalReport`]'s metrics over the positions in `[from, to)`; `to` absent =
+/// no upper edge.
+#[napi(object)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalDepthBucket {
+    pub from: u32,
+    pub to: Option<u32>,
+    pub positions: u32,
+    pub mean_nll: f64,
+    pub teacher_mean_nll: f64,
+    pub mean_kl_topk: f64,
+    pub top1_agreement: f64,
 }
 
 #[cfg(test)]
@@ -368,6 +415,36 @@ mod tests {
             .unwrap()
     }
 
+    /// A captured chunk keeps only its `[P, K]` support alive, not the `[P, V]`
+    /// partition it was cut from: a 100K-token row is 390 chunks of 256
+    /// positions, and a 248K vocabulary's ids are 254 MB a chunk.
+    /// Mutation: `capture_chunk` keeps the slice view of the order → red.
+    #[test]
+    fn a_captured_chunk_does_not_hold_the_full_vocabulary_alive() {
+        const P: i64 = 64;
+        const V: i64 = 65_536;
+        let values: Vec<f32> = (0..P * V)
+            .map(|i| ((i * 7919) % 104_729) as f32 * 1e-4)
+            .collect();
+        let targets = MxArray::from_uint32(&vec![3u32; P as usize], &[P]).unwrap();
+        crate::array::synchronize_and_clear_cache();
+        let before = crate::array::get_active_memory();
+        let chunk = {
+            let logits = MxArray::from_float32(&values, &[P, V]).unwrap();
+            let chunk = capture_chunk(&logits, &targets, 8).unwrap();
+            chunk.eval().unwrap();
+            chunk
+        };
+        crate::array::synchronize_and_clear_cache();
+        let held = crate::array::get_active_memory() - before;
+        let full = (P * V * 4) as f64;
+        assert!(
+            held < full / 8.0,
+            "a [{P}, 8] capture holds {held} bytes; the [{P}, {V}] order is {full}"
+        );
+        assert_eq!(chunk.support().unwrap(), 8);
+    }
+
     /// THE gating property: a checkpoint scored against a reference captured
     /// from ITSELF has zero divergence. Asserted EXACTLY — every KL term is
     /// `p_v * (x - x)` on bit-identical inputs, so any tolerance here would be
@@ -397,6 +474,8 @@ mod tests {
                 "self".to_string(),
                 false,
                 crate::transformer::KvFormat::Bf16,
+                [0, 0],
+                Vec::new(),
             )
             .unwrap();
         assert_eq!(report.mean_kl_topk, 0.0);
@@ -555,6 +634,8 @@ mod tests {
                 "oracle".to_string(),
                 false,
                 crate::transformer::KvFormat::Bf16,
+                [0, 0],
+                Vec::new(),
             )
             .unwrap();
 

@@ -265,6 +265,7 @@ pub async fn calibrate_activation_amax_raw(
             let model = crate::models::qwen3_5::persistence::load_for_tool(
                 &model_path,
                 Some(crate::transformer::KvFormat::Bf16),
+                crate::transformer::Activations::Bf16,
             )
             .await?;
             prefill_and_persist(&model_path, || async {
@@ -286,6 +287,7 @@ pub async fn calibrate_activation_amax_raw(
             let model = crate::models::qwen3_5_moe::persistence::load_for_tool(
                 &model_path,
                 Some(crate::transformer::KvFormat::Bf16),
+                crate::transformer::Activations::Bf16,
             )
             .await?;
             prefill_and_persist(&model_path, || async {

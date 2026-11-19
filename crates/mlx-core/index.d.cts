@@ -1654,10 +1654,10 @@ export declare class Qwen35Model {
    */
   hasBlockPagedCache(): boolean;
   /**
-   * Native admission width for plain text AR turns. Installed vision and
-   * MTP modules do not disable text batching: requests that actually carry
-   * media or set `enable_mtp=true` are routed through the ordered exclusive
-   * lane by the scheduler.
+   * Native admission width for text turns. Installed vision, MTP and
+   * DFlash2 modules do not disable text batching: requests that carry
+   * media, or set `enable_mtp=true` where the scheduler cannot draft, are
+   * routed through the ordered exclusive lane by the scheduler.
    */
   maxConcurrentSequences(): number;
   /**
@@ -2456,6 +2456,10 @@ export declare class Qwen4ExpModel {
   expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
   residencyInfo(): Qwen4ExpResidencyInfo;
   modelAssetsPath(): string;
+  /**
+   * The MTP head or a DFlash2 draft is attached: a turn that asks for
+   * speculation (`enableMtp`) can run its cycle.
+   */
   hasMtpWeights(): boolean;
   /**
    * SSD-backed draft and verification work is opt-in; head availability
@@ -3873,6 +3877,20 @@ export declare function estimateQwen4ExpContextWindow(
 ): Promise<Qwen4ExpContextEstimate | null>;
 
 /**
+ * [`EvalReport`]'s metrics over the positions in `[from, to)`; `to` absent =
+ * no upper edge.
+ */
+export interface EvalDepthBucket {
+  from: number;
+  to?: number;
+  positions: number;
+  meanNll: number;
+  teacherMeanNll: number;
+  meanKlTopk: number;
+  top1Agreement: number;
+}
+
+/**
  * Teacher-forced quality of one checkpoint against a cached reference.
  *
  * `mean_nll`, `perplexity` and `top1_agreement` are EXACT full-vocab numbers.
@@ -3900,6 +3918,19 @@ export interface EvalReport {
   top1Agreement: number;
   /** Format of the candidate's K/V cache during the scored prefill. */
   kvFormat: 'int8' | 'bf16';
+  /** Paged attention launches of the scored prefill with bf16 queries. */
+  bf16QueryLaunches: number;
+  /**
+   * Paged attention launches of the scored prefill with int8 queries
+   * (`activations` auto over an int8 pool).
+   */
+  int8QueryLaunches: number;
+  /**
+   * The same metrics by the scored position's depth, one bucket per
+   * `[from, to)` of the requested edges. Position `p` is the row at KV
+   * position `p`, whose query attends to `p + 1` keys.
+   */
+  depth: Array<EvalDepthBucket>;
 }
 
 export interface ForeignConversionOptions {
@@ -5614,6 +5645,13 @@ export interface Qwen35ContextLimits {
   /** Format of the K/V a turn on `effective_window_tokens` writes. */
   kvFormat: 'int8' | 'bf16';
   /**
+   * Queries of the paged attention over the pool: `'int8'` when rows from
+   * KV position 7,168 on score int8 query codes (the load's activations
+   * `'auto'` over an int8 pool on a GPU that scores int8 queries), else
+   * `'bf16'`.
+   */
+  attentionQueries: 'int8' | 'bf16';
+  /**
    * The model's `modelId` in `memoryGovernorStatus().scheduler`; unset
    * when the load registered no pool with the memory governor.
    */
@@ -5635,6 +5673,16 @@ export interface Qwen35LoadOptions {
    * load fails.
    */
   kvFormat?: 'int8' | 'bf16' | undefined;
+  /**
+   * Int8 activations (`--activations`, Splash's): `'auto'` lets the
+   * paged attention over an int8 pool, on Apple10 GPUs (M5) and later,
+   * score int8 query codes for every query row at KV position 7,168 or
+   * later, in prefill, verify and decode alike; `'bf16'` keeps every
+   * query bf16. Unset: `'auto'` for a qwen3_5 load with a DFlash2 draft,
+   * `'bf16'` for a qwen3_5 load with none and for qwen3_5_moe.
+   * Both modes read and write one persistent state cache.
+   */
+  activations?: 'auto' | 'bf16' | undefined;
   /**
    * Metal memory budget in bytes (`--max-memory`): it can only lower the
    * automatic budget the load's memory plan derives from the working set.
@@ -5992,6 +6040,13 @@ export interface Qwen4ExpLoadOptions {
   /** Original matching HF checkpoint containing MTP/vision omitted by GGUF. */
   auxiliaryModelPath?: string;
   /**
+   * A DFlash2 draft checkpoint directory (`DFlash2DraftModel`) for this
+   * target. The load fails when the draft does not serve the model. A
+   * turn that asks for speculation (`enableMtp`) runs the draft's cycle
+   * when it starts alone on a whole store whose banks are filled.
+   */
+  draftModelPath?: string;
+  /**
    * The Metal memory budget (`--max-memory`) the memory plan sizes the
    * stores, the pool and the windows within.
    */
@@ -6076,7 +6131,55 @@ export interface Qwen4ExpResidencyInfo {
    * residency was chosen.
    */
   liveNonReclaimableBytes: number;
-  /** Present when the full-bank load gate selected partial direct slots. */
+  /**
+   * The host read behind `liveNonReclaimableBytes`: wired + compressor +
+   * anonymous - purgeable. All 0 without a host read.
+   */
+  hostWiredBytes: number;
+  hostCompressorBytes: number;
+  hostAnonymousBytes: number;
+  hostPurgeableBytes: number;
+  /**
+   * What the plan holds beside the experts (fixed weights, draft banks,
+   * row cache, KV allowance, state staging) when residency was chosen.
+   */
+  anonymousNeedBytes: number;
+  /** This process's MLX active plus cache bytes when residency was chosen. */
+  selfMlxBytes: number;
+  /**
+   * Times since load a store the host gate refused at load moved up to
+   * whole banks after a turn, the host having room by then.
+   */
+  residencyPromotions: number;
+  /**
+   * Times since load the gate admitted such a move but the host could not
+   * take its growth (the whole banks less the partial banks, plus a
+   * layer's staging), so the store stayed partial with every slot kept.
+   */
+  residencyPromotionRefusals: number;
+  /**
+   * Drafted cycles since load whose rows the rule set to one: the draft
+   * proposed and the verify took the anchor alone. The speculative cycle
+   * counts (`mtpCycles`) leave these out.
+   */
+  draftOneRowCycles: number;
+  /**
+   * Decode steps since load that ran the rows of 2-4 scheduled turns in
+   * one pass (the lane step); a turn decoding alone adds none.
+   */
+  laneSteps: number;
+  /**
+   * Where the routed experts live: every one in a direct bank, partial
+   * slots because the host refused the whole bank set or because the
+   * store plan streams them, or per-row imports.
+   */
+  residency: 'direct' | 'host-gate' | 'store-plan' | 'rows';
+  /** Routed experts per layer in the checkpoint. */
+  expertCount: number;
+  /**
+   * Present when the experts take partial slots: the host gate's or the
+   * store plan's reason.
+   */
   fallbackReason?: string;
   /**
    * Token/PLE rows asked of the decoded-row LRU since load, and the ones
@@ -6108,10 +6211,52 @@ export interface Qwen4ExpResidencyInfo {
    */
   checkpointBytesRead: number;
   /**
-   * Decode tokens and prefill windows replayed after a tentative device
-   * route missed the slots.
+   * Replay passes after a tentative device route missed the slots: each
+   * pass a decode token runs again from its missed layer (on device or
+   * host routes; one token can run several) and each prefill window.
    */
   routeReplays: number;
+  /**
+   * Decode tokens that ran a tentative device-route pass, and those of
+   * them whose routes missed the slots.
+   */
+  routeTries: number;
+  routeMissTokens: number;
+  /**
+   * Decode layers replays ran again on device routes after reading the
+   * missed experts, and those they ran again on host routes.
+   */
+  replayedLayers: number;
+  hostTailLayers: number;
+  /** Times the route guard sent decode tokens to host routes. */
+  routeGuardTrips: number;
+  /**
+   * Slot fills since load, the wall time inside them in microseconds, and
+   * the bytes they asked of the checkpoint files (each wanted range
+   * rounded out to 16 KiB pages, a page two ranges share read once, no
+   * bytes between two ranges).
+   */
+  fillCalls: number;
+  fillMicros: number;
+  fillReadBytes: number;
+  /**
+   * The share of `fillCalls`, `fillMicros`, `fillReadBytes`,
+   * `slotMisses`, `checkpointBytesRead` and `routeReplays` that prefill
+   * passes moved since load; decode fills and MTP verification passes are
+   * not in them.
+   */
+  prefillFillCalls: number;
+  prefillFillMicros: number;
+  prefillFillReadBytes: number;
+  prefillSlotMisses: number;
+  prefillCheckpointBytesRead: number;
+  prefillRouteReplays: number;
+  /**
+   * Layer-major prefill groups of two or more windows since load, and the
+   * windows they ran.
+   */
+  groupPasses: number;
+  groupWindows: number;
   /**
    * Stored prefix states with a RAM copy, and the bytes of every stored
    * state.
@@ -6121,6 +6266,37 @@ export interface Qwen4ExpResidencyInfo {
   /** States published since load, and turns that resumed from one. */
   prefixPublished: number;
   prefixRestored: number;
+  /**
+   * Points not published since load, by reason (a disk read-back the
+   * room or live check refuses counts too): the room the plan leaves for
+   * states had none even after the oldest went; the host's free memory or
+   * MLX's active ceiling had none; the blocks below the point did not
+   * register; a pass a cold prefill does not run came before it; a load
+   * with the MTP head had no draft history there.
+   */
+  prefixRefusedRoom: number;
+  prefixRefusedLive: number;
+  prefixRefusedRegister: number;
+  prefixRefusedOffGrid: number;
+  prefixRefusedDraft: number;
+  /**
+   * Text turns that planned no point since load: the request asked for no
+   * reuse; or no block-aligned row lies past the resume row before the
+   * prompt's last token.
+   */
+  prefixSkippedReuseOff: number;
+  prefixSkippedNoPoints: number;
+  /**
+   * Turns that ended before their replay point was reached: a pass ran
+   * past it, or the turn was cancelled, failed or reset first.
+   */
+  prefixMissedReplay: number;
+  /**
+   * States dropped since load because a block of their chain left the
+   * prefix cache, and because memory gave up their RAM copy.
+   */
+  prefixDroppedKv: number;
+  prefixDroppedMemory: number;
   /** The stored states' disk tier is open and takes writes. */
   prefixDiskEnabled: boolean;
   /** States waiting for their disk write, the one in flight included. */
@@ -6312,13 +6488,19 @@ export interface SchedulerStats {
  *
  * `kv_format` (`"int8"` / `"bf16"`; unset = the load default) selects the Qwen dense or MoE
  * candidate's flat K/V cache format, so the int8 cache can be scored against
- * the same teacher cache as the BF16 one.
+ * the same teacher cache as the BF16 one. `activations` (`"auto"` /
+ * `"bf16"`; unset = the default of a load with no draft: bf16) is the
+ * load's int8 activations (`--activations`).
+ * `depth_edges` (strictly increasing positions; unset = none) splits the
+ * report's `depth` buckets.
  */
 export declare function scoreAgainstTeacher(
   modelPath: string,
   cacheDir: string,
   logitChunk: number,
   kvFormat?: string | undefined | null,
+  activations?: string | undefined | null,
+  depthEdges?: Array<number> | undefined | null,
 ): Promise<EvalReport>;
 
 /** Enable or disable profiling globally. */

@@ -56,6 +56,12 @@ pub use memory::{
 
 #[cfg(test)]
 pub(crate) use data::fail_native_call_at;
+#[cfg(test)]
+pub(crate) use data::host_waits;
+#[cfg(test)]
+pub(crate) use data::take_waited_evals;
+#[cfg(test)]
+pub(crate) use data::unready_id_reads;
 
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;

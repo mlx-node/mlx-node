@@ -15,6 +15,9 @@ pub(crate) mod gguf_gpu;
 pub(crate) mod gguf_import;
 pub mod gguf_kquant;
 pub(crate) mod gguf_plan;
+pub(crate) mod gguf_planes;
+#[cfg(test)]
+mod gguf_planes_real_tests;
 pub(crate) mod gguf_read;
 pub(crate) mod gguf_source;
 #[cfg(test)]

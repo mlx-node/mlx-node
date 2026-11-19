@@ -126,6 +126,12 @@ pub(crate) struct ImportProbe {
     /// `(tensor name, byte offset in the tensor, bit)` flipped in the staged
     /// bytes after the read, before any repack.
     pub flip: Option<(String, usize, u8)>,
+    /// The planes the import also writes from the staged bands.
+    pub planes: Option<crate::utils::gguf_planes::PlanesPlan>,
+    /// Armed: the next Tiled64 GPU band of 128 rows or more is written 64
+    /// rows down, its last 64 rows dropped.
+    #[cfg(test)]
+    pub band_shift: AtomicBool,
 }
 
 impl ImportProbe {
@@ -140,6 +146,18 @@ impl ImportProbe {
 
     fn alloc(&self, bytes: usize) {
         self.max_alloc_bytes.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn shifted(&self, layout: OutLayout, row0: usize, rows: usize) -> (usize, usize) {
+        if layout == OutLayout::Tiled64
+            && rows >= 128
+            && self.band_shift.swap(false, Ordering::Relaxed)
+        {
+            (row0 + 64, rows - 64)
+        } else {
+            (row0, rows)
+        }
     }
 }
 
@@ -269,6 +287,7 @@ struct ImportGuard<'p> {
     gpu: bool,
     consuming: bool,
     probe: &'p ImportProbe,
+    planes: Option<crate::utils::gguf_planes::PlanesWriter>,
 }
 
 impl Drop for ImportGuard<'_> {
@@ -284,6 +303,7 @@ impl Drop for ImportGuard<'_> {
         self.probe.freed.store(true, Ordering::Release);
         self.slots.clear();
         self.states.clear();
+        self.planes.take();
         self.probe.event(ImportEvent::Freed);
         clear_cache();
         self.probe.event(ImportEvent::CacheCleared);
@@ -836,6 +856,18 @@ fn read_gguf_tensors_consuming(
         gpu: gpu_tensors > 0,
         consuming: consumer.is_some(),
         probe,
+        planes: match &probe.planes {
+            Some(_) if consumer.is_some() => {
+                return Err(Error::from_reason("a consuming import writes no planes"));
+            }
+            Some(plan) => Some(crate::utils::gguf_planes::PlanesWriter::new(
+                header,
+                plan,
+                |i| routes[i].row_multiple() == 64,
+                &bands,
+            )?),
+            None => None,
+        },
     };
     let slot_len = windows.iter().map(|w| w.len).max().unwrap_or(0);
     for _ in 0..cfg.slots.max(1).min(windows.len()) {
@@ -892,6 +924,9 @@ fn read_gguf_tensors_consuming(
     let mut ple_shards = None;
     for (t, state) in header.tensors.iter().zip(std::mem::take(&mut guard.states)) {
         collect_tensor(t, state.dst, &mut map, &mut ple_shards)?;
+    }
+    if let Some(writer) = guard.planes.take() {
+        map.extend(writer.finish()?);
     }
     drop(guard);
     if let Some(secs) = timing.first_gib_secs {
@@ -1026,14 +1061,17 @@ impl Run<'_, '_, '_> {
                     let current = dst.take().ok_or_else(|| {
                         Error::from_reason(format!("GGUF tensor '{}' lost its arrays", t.name))
                     })?;
+                    let (row0, rows) = (band.row0, band.rows);
+                    #[cfg(test)]
+                    let (row0, rows) = self.probe.shifted(layout, row0, rows);
                     let next = gpu_repack_band(
                         &staging,
                         band.src_off as u64,
                         kind,
                         layout,
                         u32_of(ptrs.k, t)?,
-                        u32_of(band.row0, t)?,
-                        u32_of(band.rows, t)?,
+                        u32_of(row0, t)?,
+                        u32_of(rows, t)?,
                         current,
                     )?;
                     outputs.push(next.weight.clone());
@@ -1138,6 +1176,12 @@ impl Run<'_, '_, '_> {
                         t.name
                     )));
                 }
+            }
+            if let Some(writer) = self.guard.planes.as_mut()
+                && let Some(planes) =
+                    writer.band(&staging, band.tensor, band.src_off, band.row0, band.rows)?
+            {
+                outputs.push(planes);
             }
             let state = &mut self.guard.states[band.tensor];
             state.bands_left -= 1;
@@ -1495,6 +1539,9 @@ pub(crate) struct PreloadInput {
     /// Read the companion (gemma: media on; muse: draft present).
     pub load_companion: bool,
     pub opts: ImportOptions,
+    /// The planes the main file's import also writes; never on a streamed
+    /// (CLEF) load.
+    pub planes: Option<crate::utils::gguf_planes::PlanesPlan>,
     /// Test hook: `(tensor name, byte offset, bit)` flipped in the main file's
     /// staged bytes.
     #[cfg(test)]
@@ -1513,6 +1560,7 @@ impl PreloadInput {
             companion,
             load_companion,
             opts,
+            planes: None,
             #[cfg(test)]
             flip: None,
         }
@@ -1543,6 +1591,9 @@ pub(crate) struct GgufPreload {
     pub clef_head: Option<(HashMap<String, MxArray>, serde_json::Value)>,
     /// Row shards of the plan's `ple_shard` tensor (absent from `main`).
     pub ple_shards: Option<(Vec<MxArray>, usize)>,
+    /// The planes of `PreloadInput::planes`, by planes key (absent from
+    /// `main`).
+    pub planes: HashMap<String, MxArray>,
     #[cfg(test)]
     pub identity: GgufIdentity,
     pub stats: LoadStats,
@@ -1608,6 +1659,7 @@ impl GgufPreload {
         let mode = split_page_cache_mode(mode, &set.main, physical_memory());
 
         let main_probe = ImportProbe {
+            planes: input.planes.clone(),
             #[cfg(test)]
             flip: input.flip.clone(),
             ..ImportProbe::default()
@@ -1680,6 +1732,14 @@ impl GgufPreload {
                 raw_ple_shards = raw.ple_shards;
             }
         }
+        let mut planes = HashMap::new();
+        for t in input.planes.iter().flat_map(|plan| &plan.tensors) {
+            let array = raw_map.remove(&t.key).ok_or_else(|| {
+                Error::from_reason(format!("GGUF planes {} were not written", t.key))
+            })?;
+            planes.insert(t.key.clone(), array);
+        }
+        eval_lazy(planes.values())?;
         let ImportedWeights {
             weights: mut main,
             clef_head,
@@ -1742,6 +1802,7 @@ impl GgufPreload {
             companion: companion_map,
             clef_head,
             ple_shards,
+            planes,
             #[cfg(test)]
             identity: input.identity(),
             stats,
