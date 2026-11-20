@@ -364,14 +364,13 @@ fn readmission_counts_the_free_pool_up_to_its_term() {
 }
 
 /// A turn start whose host still counts the bank purgeable after Metal made
-/// it non-volatile (measured readings, GB): the kernel still holds its pages
-/// volatile, and `host_used` leaves purgeable pages out (from the anonymous
-/// ones), so others' pages vanished (bank wired) or the bank did (bank
-/// anonymous) and the bank grew past the host. Settled for the pages the
-/// kernel lists, others read as at a normal turn start; other processes'
-/// volatile pages stay reclaimable.
+/// it non-volatile (measured readings, GB): `host_used` leaves purgeable
+/// pages out (from the anonymous ones), so others' pages vanished (bank
+/// wired) or the bank did (bank anonymous) and the bank grew past the host.
+/// Settled for the bank pages still counted, others read as at a normal
+/// turn start; other processes' volatile pages stay reclaimable.
 #[test]
-fn readmission_settles_the_pages_the_kernel_holds_volatile() {
+fn readmission_settles_the_bank_pages_still_counted_purgeable() {
     let gb = |x: f64| (x * 1e9) as u64;
     let hm = |wired, anonymous, purgeable| HostMemory {
         physical: gb(137.44),
@@ -524,33 +523,198 @@ fn next_bank_shrinks_to_what_the_host_admits() {
     };
     let never = || -> Result<Admission> { panic!("no reading needed") };
     for in_turn in [false, true] {
-        let next =
-            |turn, cur: &Admission, lost| next_bank(turn, cur, lost, in_turn, never).unwrap();
+        let next = |turn, cur: &Admission, lost| next_bank(turn, cur, lost, in_turn, never);
         assert_eq!(next(Turn::Keep, &a, false), None);
         assert_eq!(next(Turn::Keep, &a, true), Some(a));
         assert_eq!(next(Turn::Rebuild(a), &staging, false), Some(a));
         assert_eq!(next(Turn::Rebuild(a), &smaller, true), Some(a));
         assert_eq!(
-            next_bank(Turn::Rebuild(a), &smaller, false, in_turn, never).unwrap(),
+            next_bank(Turn::Rebuild(a), &smaller, false, in_turn, never),
             (!in_turn).then_some(a)
         );
         for lost in [false, true] {
             assert_eq!(
                 next_bank(Turn::StagingOnly(staging), &a, lost, in_turn, || Ok(
                     smaller
-                ))
-                .unwrap(),
+                )),
                 Some(smaller)
             );
             assert_eq!(
                 next_bank(Turn::StagingOnly(staging), &a, lost, in_turn, || Ok(
                     staging
-                ))
-                .unwrap(),
+                )),
                 Some(staging)
             );
         }
     }
+}
+
+/// The wary reading counts others' volatile pages as used, so it can refuse
+/// even the staging layer the host reading admitted: the turn (and every
+/// lane's step inside one) then runs staging only instead of failing.
+#[test]
+fn next_bank_runs_staging_only_when_the_wary_reading_refuses() {
+    let f = fixture("admission-addons.json");
+    let inputs = &f["inputs"];
+    let v = &f["variants"]["mtp_on"];
+    let p = profile(u(&v["kv_per_ctx"]));
+    let b = base(inputs, v);
+    let (h0, ws) = host(inputs, 50 * G);
+    let max_ctx = u(&inputs["max_context"]) as usize;
+    let load = pick(
+        &p,
+        &b,
+        max_ctx,
+        &Limits::default(),
+        &h0,
+        &Own::default(),
+        ws,
+    )
+    .unwrap();
+    let a = load.admission;
+    let m = ModelSize {
+        ctx: load.ctx as u64,
+        ..b
+    };
+    let resident = a.cache_bytes();
+    let one = a.terms.fixed(1);
+    // others' volatile pages the size of the bank; the host admits one
+    // staging layer, the wary reading (the bank resident, those pages used)
+    // not even that
+    let o = own_of(b.dense, 0, resident, true, 0, 0);
+    let room = one + G;
+    let h = HostMemory {
+        wired: h0.physical - Limits::default().reserve - room + b.dense,
+        anonymous: 2 * resident,
+        purgeable: resident,
+        ..h0
+    };
+    let all = Residency {
+        resident,
+        volatile: resident,
+    };
+    let at = |h: &HostMemory| admit_with(&p, &m, load.chunk as u64, &Limits::default(), h, &o, ws);
+    let host_turn = readmit_with(
+        &p,
+        &a,
+        &m,
+        load.chunk as u64,
+        &Limits::default(),
+        &h,
+        &o,
+        ws,
+    )
+    .unwrap();
+    let Turn::StagingOnly(s) = host_turn else {
+        panic!("{host_turn:?}");
+    };
+    assert_eq!((s.cache_slots, s.staging_layers), (0, 1));
+    let e = at(&settled(h, all, true)).unwrap_err().reason;
+    assert!(e.contains("vs budget"), "{e}");
+    for in_turn in [false, true] {
+        assert_eq!(
+            next_bank(host_turn, &a, false, in_turn, || at(&settled(h, all, true))),
+            Some(s)
+        );
+    }
+}
+
+/// A turn start's flip to non-volatile can leave the bank in the host's
+/// purgeable count (measured, GB: 55.47 right after the flip, the bank's
+/// 54.94 plus the usual 0.5; 0.3-0.5 at every in-turn reading). The count
+/// before the flip tells the bank's share from others' volatile pages.
+#[test]
+fn flip_lag_reads_the_bank_left_in_the_count() {
+    let gb = |x: f64| (x * 1e9) as u64;
+    let bank = gb(54.94);
+    let before = gb(0.47) + bank;
+    assert_eq!(flip_lag(before, gb(55.47), bank), bank);
+    assert_eq!(flip_lag(before, gb(0.47), bank), 0);
+    assert_eq!(flip_lag(before, gb(0.40), bank), 0);
+    assert_eq!(flip_lag(before, gb(0.60), bank), gb(0.60) - gb(0.47));
+    assert_eq!(flip_lag(before, gb(30.47), bank), gb(30.47) - gb(0.47));
+    assert_eq!(flip_lag(gb(10.0), gb(55.47), bank), 0);
+    assert_eq!(flip_lag(gb(0.47), gb(0.47), 0), 0);
+}
+
+/// The shrink at a turn start reads the host with the bank the flip left in
+/// the purgeable count taken out: a stale count no longer hides others that
+/// grew past the slack, and others' own volatile pages stay reclaimable, so
+/// a host with room keeps a warm bank (the wary reading would empty it).
+#[test]
+fn turn_start_shrink_reads_the_flip_lag() {
+    let f = fixture("admission-addons.json");
+    let inputs = &f["inputs"];
+    let v = &f["variants"]["mtp_on"];
+    let p = profile(u(&v["kv_per_ctx"]));
+    let b = base(inputs, v);
+    let others = 50 * G;
+    let (h0, ws) = host(inputs, others);
+    let max_ctx = u(&inputs["max_context"]) as usize;
+    let load = pick(
+        &p,
+        &b,
+        max_ctx,
+        &Limits::default(),
+        &h0,
+        &Own::default(),
+        ws,
+    )
+    .unwrap();
+    let a = load.admission;
+    assert_eq!(a.bound, Bound::Live);
+    let m = ModelSize {
+        ctx: load.ctx as u64,
+        ..b
+    };
+    let resident = a.cache_bytes();
+    let slack = crate::moe_stream::budget::KEEP_SLACK;
+    assert!(resident > 2 * slack);
+    let o = own_of(b.dense, 0, resident, true, 0, 0);
+    let turn = |h: &HostMemory, volatile: u64| {
+        let h = settled(*h, Residency { resident, volatile }, true);
+        readmit_with(
+            &p,
+            &a,
+            &m,
+            load.chunk as u64,
+            &Limits::default(),
+            &h,
+            &o,
+            ws,
+        )
+        .unwrap()
+    };
+    // bank anonymous, 20 GiB of others' anonymous pages, the count still
+    // holding the bank after the flip
+    let stale = |grown: u64| HostMemory {
+        wired: others + grown - 20 * G + b.dense,
+        anonymous: 20 * G + resident,
+        purgeable: resident,
+        ..h0
+    };
+    let before = resident;
+    for grown in [0, slack + 2 * G] {
+        let h = stale(grown);
+        let lag = flip_lag(before, h.purgeable, resident);
+        assert_eq!(lag, resident);
+        assert!(!matches!(turn(&h, 0), Turn::StagingOnly(_)));
+        let read = turn(&h, lag);
+        assert_eq!(matches!(read, Turn::StagingOnly(_)), grown > 0, "{read:?}");
+    }
+    // a current count holding others' volatile pages the size of the slack
+    // and more: no lag, the bank stays
+    let foreign = 3 * slack;
+    let h = HostMemory {
+        wired: others - 20 * G + b.dense,
+        anonymous: 20 * G + foreign + resident,
+        purgeable: foreign,
+        ..h0
+    };
+    let lag = flip_lag(foreign + resident, h.purgeable, resident);
+    assert_eq!(lag, 0);
+    assert_eq!(turn(&h, lag), Turn::Keep);
+    assert!(matches!(turn(&h, resident), Turn::StagingOnly(_)));
 }
 
 #[test]
@@ -1116,6 +1280,85 @@ fn lease_recheck_keeps_for_the_pool_and_shrinks_for_others() {
     assert_eq!(bank.cache_slots(), classes.split(a.cache_bytes()));
     assert_eq!(lease.switches().len(), 1);
     assert!(lease.in_turn() && bank.in_turn());
+    lease.end_turn(&bank).unwrap();
+}
+
+/// A turn start reads the purgeable count before and after its flip: with
+/// the count current (others' volatile pages the bank's size) the warm bank
+/// stays; with the bank left in it, the same reading after the flip finds
+/// others past the slack and shrinks the bank. The admission prices 64 MiB
+/// slots over the tiny bank's real ones.
+#[test]
+fn lease_turn_start_takes_the_flip_lag_out() {
+    let s = 64 << 20;
+    let classes = Classes {
+        layers: [1, 2],
+        slot: [s, s],
+    };
+    let p = profile(100);
+    let size = ModelSize {
+        dense: 0,
+        slot: s,
+        n_experts: 8,
+        ctx: 1024,
+    };
+    let rows = 1024;
+    let limits = Limits::default();
+    let ws = 96 * G;
+    let one = Terms::with(&p, &size, ws, rows).fixed(1);
+    let others = 10 * G;
+    let physical = limits.reserve + others + one + 64 * s;
+    let loaded = admit_with(
+        &p,
+        &size,
+        rows,
+        &limits,
+        &HostMemory {
+            physical,
+            wired: others,
+            ..Default::default()
+        },
+        &Own::default(),
+        ws,
+    )
+    .unwrap();
+    assert_eq!(loaded.bound, Bound::Live);
+    let (bank, _, _dir) = tiny_bank(
+        classes.split(loaded.cache_bytes()),
+        loaded.staging_layers as usize,
+    );
+    let lease = Lease::new(p, size, rows, classes, Some(limits), Some(loaded), &bank);
+    bank.touch();
+    bank.end_turn().unwrap();
+    let r = bank.residency().unwrap();
+    assert!(r.resident > 0 && r.volatile == r.resident, "{r:?}");
+    // others read exactly at the edge the held bank shrinks past once the
+    // bank's pages count as used
+    let held = loaded.fixed + loaded.cache_bytes();
+    let edge = physical - limits.reserve + crate::moe_stream::budget::KEEP_SLACK - held;
+    let h = HostMemory {
+        physical,
+        wired: edge + 1,
+        anonymous: r.resident,
+        purgeable: r.resident,
+        ..Default::default()
+    };
+    TEST_HOST.with(|c| c.set(Some((h, ws))));
+    TEST_POOL.with(|c| c.set(Some(0)));
+    TEST_BEFORE_FLIP.with(|c| c.set(Some(2 * r.resident)));
+    lease.begin_turn(&bank, 0, 0).unwrap();
+    assert_eq!(lease.admission().unwrap(), loaded);
+    assert!(lease.switches().is_empty());
+    lease.end_turn(&bank).unwrap();
+    assert_eq!(bank.residency().unwrap(), r);
+    TEST_BEFORE_FLIP.with(|c| c.set(Some(r.resident)));
+    lease.begin_turn(&bank, 0, 0).unwrap();
+    TEST_HOST.with(|c| c.set(None));
+    TEST_POOL.with(|c| c.set(None));
+    TEST_BEFORE_FLIP.with(|c| c.set(None));
+    let a = lease.admission().unwrap();
+    assert!(a.cache_slots < loaded.cache_slots, "{a}");
+    assert_eq!(lease.switches().len(), 1);
     lease.end_turn(&bank).unwrap();
 }
 

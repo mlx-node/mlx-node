@@ -553,6 +553,10 @@ thread_local! {
     /// real one.
     pub(super) static TEST_POOL: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
+    /// The host's purgeable count a turn start reads before its flip to
+    /// non-volatile on this thread instead of the real one.
+    pub(super) static TEST_BEFORE_FLIP: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// The working set an admission may fill: `ws`, at most `max_memory`.
@@ -569,6 +573,15 @@ fn host_reading(max_memory: Option<u64>) -> Result<(HostMemory, u64)> {
     }
     let h = host_memory().ok_or_else(|| bad("no host memory reading for admission"))?;
     Ok((h, capped_ws(working_set(), max_memory)))
+}
+
+/// The host's purgeable count right before a turn start's flip.
+fn purgeable_before_flip(max_memory: Option<u64>) -> Result<u64> {
+    #[cfg(test)]
+    if let Some(p) = TEST_BEFORE_FLIP.with(std::cell::Cell::get) {
+        return Ok(p);
+    }
+    Ok(host_reading(max_memory)?.0.purgeable)
 }
 
 /// The MLX free-buffer pool (process-wide).
@@ -612,25 +625,53 @@ pub struct Reading {
     pub own: Own,
 }
 
-/// [`own`] and the host reading `h` for a re-admission.
-pub fn reading(bank: &KqBank, dense: u64, kv: u64, pool: u64, h: HostMemory) -> Result<Reading> {
+/// [`own`] and the host reading `h` for a re-admission. `lag`: bank bytes
+/// the turn start's flip left in the purgeable count ([`flip_lag`]; 0
+/// inside a turn).
+pub fn reading(
+    bank: &KqBank,
+    dense: u64,
+    kv: u64,
+    pool: u64,
+    h: HostMemory,
+    lag: u64,
+) -> Result<Reading> {
     let r = bank.residency()?;
     let in_turn = bank.in_turn();
+    let counted = Residency {
+        volatile: r.volatile.saturating_add(lag).min(r.resident),
+        ..r
+    };
     let all = Residency {
         volatile: r.resident,
         ..r
     };
     Ok(Reading {
-        host: settled(h, r, in_turn),
+        host: settled(h, counted, in_turn),
         wary: settled(h, all, in_turn),
         own: own_of(dense, kv, r.resident, in_turn, free_pool(), pool),
     })
 }
 
-/// `h` with the pages of a turn's bank that the kernel still holds volatile
-/// out of its purgeable count: the turn counts them as own, and `host_used`
-/// leaves purgeable pages out (from the anonymous ones, so with the bank
-/// wired other processes' pages vanished, with it anonymous the bank did).
+/// Bank bytes a turn start's flip to non-volatile left in the host's
+/// purgeable count (measured: 55.5 GB right after the flip, the bank's
+/// 54.9 plus the usual 0.5, with every in-turn reading at 0.3-0.5). The
+/// count `before` the flip held the `volatile` bank bytes it took out, so
+/// what `after` holds past `before - volatile`, up to `volatile`, is the
+/// bank's; others' pages that turned volatile in between count as used, at
+/// most what they freed. A count below `volatile` did not hold the bank: 0.
+pub fn flip_lag(before: u64, after: u64, volatile: u64) -> u64 {
+    if before < volatile {
+        return 0;
+    }
+    after.saturating_sub(before - volatile).min(volatile)
+}
+
+/// `h` with the pages of a turn's bank the host still counts purgeable
+/// (`bank.volatile`) out of that count: the turn counts them as own, and
+/// `host_used` leaves purgeable pages out (from the anonymous ones, so with
+/// the bank wired other processes' pages vanished, with it anonymous the
+/// bank did).
 pub fn settled(h: HostMemory, bank: Residency, in_turn: bool) -> HostMemory {
     if !in_turn {
         return h;
@@ -749,12 +790,15 @@ impl Lease {
             && t.wired.is_none()
         {
             let cur = t.admission.ok_or_else(|| bad("no admission"))?;
+            let before = purgeable_before_flip(self.max_memory)?;
+            let flipped = bank.residency()?.volatile;
             // non-volatile first: its resident pages are then in `host_used`
             // and counted as own
             bank.begin_turn()?;
             let next = (|| {
                 let (h, ws) = host_reading(self.max_memory)?;
-                let r = reading(bank, dense, kv, cur.terms.pool, h)?;
+                let lag = flip_lag(before, h.purgeable, flipped);
+                let r = reading(bank, dense, kv, cur.terms.pool, h, lag)?;
                 let turn = self.readmit(&cur, limits, &r, ws)?;
                 let now = || {
                     admit_with(
@@ -767,7 +811,7 @@ impl Lease {
                         ws,
                     )
                 };
-                match next_bank(turn, &cur, t.lost, false, now)? {
+                match next_bank(turn, &cur, t.lost, false, now) {
                     None => Ok(cur),
                     Some(a) => {
                         self.switch(&mut t, bank, &a)?;
@@ -806,7 +850,7 @@ impl Lease {
             return Ok(false);
         }
         let (h, ws) = host_reading(self.max_memory)?;
-        let r = reading(bank, dense, kv, cur.terms.pool, h)?;
+        let r = reading(bank, dense, kv, cur.terms.pool, h, 0)?;
         let turn = self.readmit(&cur, limits, &r, ws)?;
         let now = || {
             admit_with(
@@ -819,7 +863,7 @@ impl Lease {
                 ws,
             )
         };
-        let next = match next_bank(turn, &cur, t.lost, true, now)? {
+        let next = match next_bank(turn, &cur, t.lost, true, now) {
             Some(a) => a,
             None => return Ok(false),
         };
@@ -876,26 +920,25 @@ pub fn wary_growth(turn: Turn, wary: impl FnOnce() -> Result<Turn>) -> Turn {
 /// The bank a re-admission's `turn` switches to (`None` keeps it). A bank
 /// the host has no room for (`StagingOnly`) shrinks to what the host
 /// admits now, `now` (on the wary reading), staging only when that admits
-/// no cache. Growth that
-/// would empty a bank holding cache slots waits for a turn start when
-/// `in_turn`.
+/// no cache or refuses. Growth that would empty a bank holding cache slots
+/// waits for a turn start when `in_turn`.
 pub fn next_bank(
     turn: Turn,
     cur: &Admission,
     lost: bool,
     in_turn: bool,
     now: impl FnOnce() -> Result<Admission>,
-) -> Result<Option<Admission>> {
-    Ok(match turn {
+) -> Option<Admission> {
+    match turn {
         Turn::Keep if lost => Some(*cur),
         Turn::Keep => None,
         Turn::Rebuild(_) if in_turn && cur.cache_slots > 0 && !lost => None,
         Turn::Rebuild(a) => Some(a),
-        Turn::StagingOnly(s) => {
-            let a = now()?;
-            Some(if a.cache_slots > 0 { a } else { s })
-        }
-    })
+        Turn::StagingOnly(s) => Some(match now() {
+            Ok(a) if a.cache_slots > 0 => a,
+            _ => s,
+        }),
+    }
 }
 
 /// Engram rows through a table the store keeps for its read counters.

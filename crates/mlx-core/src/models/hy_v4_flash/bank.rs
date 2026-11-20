@@ -902,10 +902,8 @@ impl KqBank {
 
     /// Bytes of every bank resident in RAM now, and of those the bytes of
     /// banks the kernel holds volatile or empty, which the host counts
-    /// purgeable. The kernel can still hold a bank volatile right after
-    /// Metal made it non-volatile (measured at a turn start: 55.5 GB
-    /// purgeable, the banks' 54.9 GB plus the usual 0.5). Without a kernel
-    /// reading a bank is volatile outside a turn.
+    /// purgeable. Without a kernel reading a bank is volatile outside a
+    /// turn.
     pub fn residency(&self) -> Result<Residency> {
         let g = lock(&self.inner);
         let mut r = Residency::default();
@@ -919,6 +917,21 @@ impl KqBank {
             }
         }
         Ok(r)
+    }
+
+    /// Writes zeros over every bank so each of its pages is resident.
+    #[cfg(test)]
+    pub(crate) fn touch(&self) {
+        let g = lock(&self.inner);
+        for b in g
+            .classes
+            .iter()
+            .flat_map(|c| &c.proj)
+            .flat_map(ProjBank::banks)
+        {
+            // SAFETY: the whole of a live bank, no GPU work in flight (tests).
+            unsafe { std::ptr::write_bytes(b.data_ptr().0, 0, b.nbytes()) };
+        }
     }
 
     /// Per class index.
