@@ -4,12 +4,24 @@
 //! allowed because every request explicitly uses text-only plain AR:
 //! `QWEN35_STAGE2_MODEL_PATH=/abs/qwen3.5-text cargo test -p mlx-core --test qwen3_5_concurrent_batched_parity -- --ignored --nocapture`
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::future::join_all;
 use mlx_core::engine::types::{ChatConfig, ChatResult};
 use mlx_core::models::qwen3_5::persistence::load_with_thread;
 use mlx_core::tokenizer::ChatMessage;
+
+/// Served context cap for the cloned test checkpoint.
+///
+/// The native 262,144 context window of Qwen3.5-0.8B bf16 + MTP is memory-bound
+/// to a single lane on 7 GB CI VMs (`working_set ≈ 4.67 GiB`), because
+/// `evaluate_qwen35_plan` never trades window for lanes. Capping
+/// `max_position_embeddings` to 8,192 keeps the full capped window across
+/// `lanes >= 2` on 7 GB runners while still scaling up to 4/8 lanes on larger
+/// machines.
+const TEST_MAX_POSITION_EMBEDDINGS: u32 = 8_192;
 
 /// Both gates flip the process env `MLX_SERVE_FORCE_SERIAL`; they must not
 /// run at once.
@@ -20,6 +32,78 @@ fn model_path() -> Option<PathBuf> {
     let path = PathBuf::from(path);
     assert!(path.exists(), "QWEN35_STAGE2_MODEL_PATH does not exist");
     Some(path)
+}
+
+/// RAII-cleaned checkpoint clone that symlinks weights and writes a modified
+/// `config.json` with a capped `max_position_embeddings` and no explicit
+/// `paged_cache_memory_mb` override.
+struct CappedCheckpointDir(PathBuf);
+
+impl CappedCheckpointDir {
+    fn from_checkpoint(src: &Path, label: &str) -> Self {
+        let src = fs::canonicalize(src).expect("canonicalize checkpoint dir");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dst = std::env::temp_dir().join(format!(
+            "mlx-qwen35-parity-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        if dst.exists() {
+            let _ = fs::remove_dir_all(&dst);
+        }
+        fs::create_dir_all(&dst).expect("create capped checkpoint dir");
+        let guard = Self(dst);
+
+        for entry in fs::read_dir(&src).expect("read checkpoint dir") {
+            let entry = entry.expect("checkpoint dir entry");
+            let from = entry.path();
+            let to = guard.0.join(entry.file_name());
+            if entry.file_name() == "config.json" {
+                let raw = fs::read_to_string(&from).expect("read config.json");
+                let mut cfg: serde_json::Value =
+                    serde_json::from_str(&raw).expect("parse config.json");
+                if let Some(obj) = cfg.as_object_mut() {
+                    obj.insert(
+                        "max_position_embeddings".to_string(),
+                        serde_json::Value::from(TEST_MAX_POSITION_EMBEDDINGS),
+                    );
+                    obj.remove("paged_cache_memory_mb");
+                    if let Some(text_cfg) =
+                        obj.get_mut("text_config").and_then(|v| v.as_object_mut())
+                    {
+                        text_cfg.insert(
+                            "max_position_embeddings".to_string(),
+                            serde_json::Value::from(TEST_MAX_POSITION_EMBEDDINGS),
+                        );
+                        text_cfg.remove("paged_cache_memory_mb");
+                    }
+                }
+                let pretty = serde_json::to_string_pretty(&cfg).expect("serialize config.json");
+                fs::write(&to, pretty).expect("write capped config.json");
+            } else {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&from, &to).expect("symlink checkpoint asset");
+                #[cfg(not(unix))]
+                if from.is_file() {
+                    fs::copy(&from, &to).expect("copy checkpoint asset");
+                }
+            }
+        }
+
+        guard
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for CappedCheckpointDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 fn user_message(content: &str) -> ChatMessage {
@@ -80,7 +164,8 @@ async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
         return;
     };
     let _env = ENV_GATE.lock().await;
-    let model = load_with_thread(&path.to_string_lossy(), None, None)
+    let capped = CappedCheckpointDir::from_checkpoint(&path, "asymmetric");
+    let model = load_with_thread(&capped.path().to_string_lossy(), None, None)
         .await
         .expect("load qwen3.5");
     assert!(model.has_block_paged_cache(), "gate requires paged Qwen3.5");
@@ -88,29 +173,38 @@ async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
     // and only the oracle turns run whole-turn.
     unsafe { std::env::set_var("MLX_SERVE_FORCE_SERIAL", "1") };
 
+    // Use asymmetric decode lengths large enough that even if `batch-0` arrives
+    // ahead of `batch-1` and charges `decode_debt_ms` on its solo prefill,
+    // `batch-0` still has plenty of decode steps left to overlap with `batch-1`
+    // while finishing well before it.
     let cases = [
-        ("Explain briefly why the sky appears blue.", 7),
-        ("Explain briefly why ice floats on water.", 15),
+        ("Explain briefly why the sky appears blue.", 32),
+        ("Explain briefly why ice floats on water.", 48),
         ("Name three common primary colors.", 9),
     ];
     let mut serial = Vec::new();
     for (index, (prompt, max_tokens)) in cases.iter().enumerate() {
-        serial.push(
-            model
-                .chat_session_start(
-                    vec![user_message(prompt)],
-                    Some(config(&format!("serial-{index}"), *max_tokens)),
-                )
-                .await
-                .expect("serial oracle"),
+        let turn = model
+            .chat_session_start(
+                vec![user_message(prompt)],
+                Some(config(&format!("serial-{index}"), *max_tokens)),
+            )
+            .await
+            .expect("serial oracle");
+        eprintln!(
+            "asymmetric serial[{index}]: num_tokens={} finish_reason={}",
+            turn.num_tokens, turn.finish_reason
         );
+        serial.push(turn);
         model.reset_caches().await.expect("reset serial oracle");
     }
 
     unsafe { std::env::remove_var("MLX_SERVE_FORCE_SERIAL") };
+    let lanes = model.max_concurrent_sequences();
+    eprintln!("asymmetric planned lanes: {lanes}");
     assert!(
-        model.max_concurrent_sequences() >= 2,
-        "a paged checkpoint advertises the scheduled lane by default"
+        lanes >= 2,
+        "a paged checkpoint advertises at least 2 scheduled lanes, got {lanes}"
     );
     let batched = join_all(
         cases[..2]
@@ -141,6 +235,10 @@ async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
     assert_same(&serial[2], &third, cases[2].0);
 
     let stats = model.scheduler_stats().await.expect("scheduler stats");
+    eprintln!(
+        "asymmetric max_batch_occupancy: {}",
+        stats.max_batch_occupancy
+    );
     assert!(
         stats.max_batch_occupancy >= 2,
         "expected a genuine N=2 hybrid decode, got {}",
@@ -184,13 +282,17 @@ async fn waves_of_one_two_four_and_eight_match_serial() {
         return;
     };
     let _env = ENV_GATE.lock().await;
-    let model = load_with_thread(&path.to_string_lossy(), None, None)
+    let capped = CappedCheckpointDir::from_checkpoint(&path, "waves");
+    let model = load_with_thread(&capped.path().to_string_lossy(), None, None)
         .await
         .expect("load qwen3.5");
     assert!(model.has_block_paged_cache(), "gate requires paged Qwen3.5");
     let lanes = model.max_concurrent_sequences();
     eprintln!("planned lanes: {lanes}");
-    assert!((1..=8).contains(&lanes));
+    assert!(
+        (2..=8).contains(&lanes),
+        "expected 2..=8 planned lanes with capped context, got {lanes}"
+    );
     let modes: &[bool] = if model.has_mtp_weights() {
         &[false, true]
     } else {
@@ -202,19 +304,24 @@ async fn waves_of_one_two_four_and_eight_match_serial() {
         unsafe { std::env::set_var("MLX_SERVE_FORCE_SERIAL", "1") };
         let mut serial = Vec::new();
         for (index, (prompt, max_tokens)) in WAVE_PROMPTS.iter().enumerate() {
-            serial.push(
-                model
-                    .chat_session_start(
-                        vec![user_message(prompt)],
-                        Some(config_with(
-                            &format!("serial-{mtp}-{index}"),
-                            *max_tokens,
-                            mtp,
-                        )),
-                    )
-                    .await
-                    .expect("serial oracle"),
-            );
+            let turn = model
+                .chat_session_start(
+                    vec![user_message(prompt)],
+                    Some(config_with(
+                        &format!("serial-{mtp}-{index}"),
+                        *max_tokens,
+                        mtp,
+                    )),
+                )
+                .await
+                .expect("serial oracle");
+            if !mtp {
+                eprintln!(
+                    "wave serial[{index}] (max={max_tokens}): num_tokens={} finish_reason={}",
+                    turn.num_tokens, turn.finish_reason
+                );
+            }
+            serial.push(turn);
             model.reset_caches().await.expect("reset serial oracle");
         }
         unsafe { std::env::remove_var("MLX_SERVE_FORCE_SERIAL") };

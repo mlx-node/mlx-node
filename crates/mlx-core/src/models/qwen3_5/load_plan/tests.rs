@@ -2693,3 +2693,79 @@ fn the_pool_page_rule_takes_the_token_major_page_only_on_its_load() {
         assert_eq!(got, want, "{label}");
     }
 }
+
+/// On a 7 GB macOS CI runner (`working_set = 5,010,305,024` B) with the
+/// 0.8B bf16 + MTP checkpoint and automatic SSD state staging, the native
+/// 262,144 context window is memory-bound at one lane so `evaluate_qwen35_plan`
+/// refuses a second lane to preserve the one-lane window. Capping
+/// `max_position_embeddings` to a smaller served window lets both lanes hold
+/// the full capped window and grants `lanes == 2` even with worst-case active
+/// weights (~2,000 MiB including the vision tower).
+#[test]
+fn small_runner_0_8b_mtp_grants_two_lanes_when_context_is_capped() {
+    const CI_7GB_WORKING_SET: u64 = 5_010_305_024;
+    let make_0_8b = |max_pos: i32| {
+        let mut config = shaped_config(1024, 24, 8, 2, 3584, 16, 16, true);
+        config.max_position_embeddings = max_pos;
+        config.rope_scaling = Some(
+            RopeScaling::served_for("Qwen3.5", max_pos as u32, RopeScaling::default(), None)
+                .unwrap(),
+        );
+        config
+    };
+
+    for active_mib in [1_666u64, 2_000u64] {
+        let native = make_0_8b(262_144);
+        let native_plan = shaped_disk_plan(
+            &native,
+            active_mib * MIB,
+            CI_7GB_WORKING_SET,
+            true,
+            2,
+            0,
+            Some(CacheDisk::Auto),
+        )
+        .expect("0.8B native fits 1 lane on 7 GB runner");
+        let native_pool = native_plan.pool.expect("pool plan");
+        println!(
+            "CI_7GB active={active_mib}MiB max_pos=262144: lanes={} window={} max_blocks={} staging={}",
+            native_pool.lanes,
+            native_pool.lane.window.maximum(),
+            native_pool.max_blocks,
+            native_plan.footprint.state_staging_bytes
+        );
+        assert_eq!(
+            native_pool.lanes, 1,
+            "active={active_mib}MiB at 262144 is memory-bound at 1 lane"
+        );
+        assert!(native_pool.lane.window.maximum() < 262_144);
+
+        for cap in [16_384i32, 8_192i32] {
+            let capped = make_0_8b(cap);
+            let plan = shaped_disk_plan(
+                &capped,
+                active_mib * MIB,
+                CI_7GB_WORKING_SET,
+                true,
+                2,
+                0,
+                Some(CacheDisk::Auto),
+            )
+            .expect("0.8B capped fits on 7 GB runner");
+            let pool = plan.pool.expect("pool plan");
+            println!(
+                "CI_7GB active={active_mib}MiB max_pos={cap}: lanes={} window={} max_blocks={} extent_pages={} staging={}",
+                pool.lanes,
+                pool.lane.window.maximum(),
+                pool.max_blocks,
+                pool.lane.extent_pages,
+                plan.footprint.state_staging_bytes
+            );
+            assert_eq!(
+                pool.lanes, 2,
+                "active={active_mib}MiB at max_pos={cap} should grant 2 lanes"
+            );
+            assert_eq!(pool.lane.window.maximum(), cap as u32);
+        }
+    }
+}
