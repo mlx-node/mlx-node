@@ -112,8 +112,8 @@ pub(crate) fn gather_sink_attention_in(
     gather_rows_in(q, KeyRows::Whole(keys), idx, v_width, sinks, scale, budget)
 }
 
-/// The core of every entry above. Every chunk is evaluated before the next
-/// one is built.
+/// The core of every entry above. With more than one chunk, every chunk is
+/// evaluated before the next one is built.
 fn gather_rows_in(
     q: &MxArray,
     keys: KeyRows<'_>,
@@ -195,7 +195,9 @@ fn gather_rows_in(
         } else {
             o
         };
-        super::stats::eval(&[&o], "hy_v4_flash sparse attention chunk")?;
+        if rows < s {
+            super::stats::eval(&[&o], "hy_v4_flash sparse attention chunk")?;
+        }
         outs.push(o);
         lo = hi;
     }

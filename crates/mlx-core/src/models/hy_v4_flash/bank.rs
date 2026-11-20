@@ -12,6 +12,12 @@
 //! read of the step is in; `prepare` returns only when no read it queued is
 //! in flight.
 //!
+//! Gathers stay lazy after `prepare`. A step's slots stay pinned until the
+//! caller settles its epoch (`settle` after a host read that descends from
+//! the step's gathers, `settle_all` after a wave's last eval): a cache slot
+//! is a victim only once its last use settled, and a staging slot whose
+//! last use has not settled is refilled only after a drain of the GPU.
+//!
 //! Between turns the banks are `Volatile`; the first use of a turn makes
 //! them `NonVolatile` again and, when Metal emptied a class's banks, forgets
 //! that class's tags and cache entries before a gather can read the slots.
@@ -267,6 +273,8 @@ pub struct Plan {
     /// `(expert, cache slot)` copied from its staging slot, which holds it.
     pub copies: Vec<(u32, u32)>,
     pub hits: usize,
+    /// A staging slot in `staging` is still used by an unsettled step.
+    pub drain: bool,
 }
 
 impl Plan {
@@ -282,6 +290,8 @@ pub struct Directory {
     n_layers: usize,
     n_experts: usize,
     tags: Vec<Option<(usize, u32)>>,
+    /// Per staging slot: epoch of the last step that uses it.
+    stage_use: Vec<u64>,
     cache: Cache,
 }
 
@@ -306,6 +316,7 @@ impl Directory {
             n_layers,
             n_experts,
             tags: vec![None; staging * n_experts],
+            stage_use: vec![0; staging * n_experts],
             cache: Cache::lru(cache_slots, n_layers, n_experts),
         })
     }
@@ -366,7 +377,8 @@ impl Directory {
     /// Hits in place; with `decode`, misses into cache victims (a miss whose
     /// staging slot holds it is served from there); a prefill seed whose
     /// staging copy is valid is copied, never read twice; the rest into
-    /// staging slots that do not hold them. Call `check_step` first.
+    /// staging slots that do not hold them. Every staging slot the step uses
+    /// is stamped with its epoch. Call `check_step` first.
     pub fn plan(&mut self, layer: usize, experts: &[u32], uses: &[u32], decode: bool) -> Plan {
         let (n, staging_n) = (self.n_experts, self.staging);
         let stage = |e: u32| (layer % staging_n) * n + e as usize;
@@ -395,10 +407,13 @@ impl Directory {
                     base + c
                 }
                 Source::Staging => {
+                    let s = stage(e);
                     if !valid {
                         plan.staging.push(e);
+                        plan.drain |= self.stage_use[s] > self.cache.completed();
                     }
-                    stage(e) as u32
+                    self.stage_use[s] = epoch;
+                    s as u32
                 }
             });
         }
@@ -451,9 +466,10 @@ impl Directory {
         self.cache.new_turn();
     }
 
-    /// Every slot's contents are gone.
+    /// Every slot's contents are gone (no GPU work in flight).
     pub fn clear(&mut self) {
         self.tags.fill(None);
+        self.stage_use.fill(0);
         self.cache.clear();
     }
 
@@ -685,7 +701,6 @@ pub struct Prepared {
     pub experts: Vec<u32>,
     pub slots: Vec<u32>,
     pub arrays: [ProjArrays; 3],
-    pub epoch: u64,
 }
 
 impl Prepared {
@@ -712,6 +727,8 @@ pub struct KqStats {
     /// Staging copies moved into cache slots (no read).
     pub promoted: usize,
     pub promote_ns: u64,
+    /// Steps that drained the GPU before a staging refill.
+    pub drains: usize,
 }
 
 struct ProjBank {
@@ -754,7 +771,7 @@ fn alloc(geo: &[ProjGeo; 3], slots: usize) -> Result<Vec<ProjBank>> {
         // SAFETY: the three banks hold `slots * rows` rows of `g`'s K-quant
         // arrays and live as long as `dst` (both in `ProjBank`); slots are
         // written only by reads that `prepare` waits for under the bank lock,
-        // after the GPU is drained.
+        // into slots no unfinished gather reads.
         let dst = unsafe { SlotDst::new(ptrs, g.format, g.rows) }?;
         out.push(ProjBank { w, s, b, dst });
     }
@@ -762,7 +779,8 @@ fn alloc(geo: &[ProjGeo; 3], slots: usize) -> Result<Vec<ProjBank>> {
 }
 
 /// Copies bank slot `from` into slot `to` in every projection. The caller
-/// holds the bank lock and the GPU is idle on both slots.
+/// holds the bank lock, `from` holds its expert and no unfinished gather
+/// reads `to`.
 fn copy_slot(proj: &[ProjBank], total: usize, from: u32, to: u32) -> Result<()> {
     let (from, to) = (from as usize, to as usize);
     if from >= total || to >= total || from == to {
@@ -772,8 +790,9 @@ fn copy_slot(proj: &[ProjBank], total: usize, from: u32, to: u32) -> Result<()> 
         for b in p.banks() {
             let sb = b.nbytes() / total;
             // SAFETY: both ranges lie inside the bank (`from`, `to` < total,
-            // `sb` = one slot's bytes) and do not overlap (from != to); no GPU
-            // work or read touches them and the bank is non-volatile.
+            // `sb` = one slot's bytes) and do not overlap (from != to); no read
+            // writes them, no GPU work writes either or reads `to`, and the
+            // bank is non-volatile.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     b.data_ptr().0.add(from * sb),
@@ -1133,10 +1152,9 @@ impl KqBank {
     }
 
     /// Slots for one layer step's distinct, sorted `experts` (`uses[i]` =
-    /// rows using `experts[i]`, may be empty). Drains the GPU before any CPU
-    /// write and returns once every read is in. Graphs built on the returned
-    /// arrays must be evaluated, then `done`, before a later step may evict
-    /// their slots.
+    /// rows using `experts[i]`, may be empty); returns once every read is
+    /// in. The slots stay pinned until the step is settled (`settle` /
+    /// `settle_all`): only then may a later step evict or refill them.
     pub fn prepare(
         &self,
         layer: usize,
@@ -1160,8 +1178,6 @@ impl KqBank {
         let c = &mut g.classes[ci];
         let plan = c.dir.plan(local, experts, uses, decode);
         if !plan.copies.is_empty() {
-            crate::array::synchronize();
-            c.dir.complete_all();
             let t0 = Instant::now();
             let total = c.dir.total_slots();
             let base = c.dir.base();
@@ -1190,13 +1206,17 @@ impl KqBank {
                     return Err(err);
                 }
             };
-            crate::array::synchronize();
-            c.dir.complete_all();
+            if plan.drain {
+                crate::array::synchronize();
+                c.dir.complete(plan.epoch - 1);
+            }
             c.dir.untag(local, &plan);
             // SAFETY: every slot read is untagged (staging) or an unmapped
             // victim (cache), so no gather is handed it until the reads are
-            // in; the GPU is drained, the slots of one step are distinct, and
-            // the ticket is waited before the bank lock is released.
+            // in; no unfinished gather reads it (a victim's last use settled,
+            // a busy staging slot drained above), the slots of one step are
+            // distinct, and the ticket is waited before the bank lock is
+            // released.
             let out = unsafe { self.pool.submit(reads, Priority::High) }.and_then(|t| t.wait());
             match out {
                 Ok(s) => io = s,
@@ -1212,6 +1232,7 @@ impl KqBank {
             let s = &mut st[ci];
             s.uses += experts.len();
             s.hits += plan.hits;
+            s.drains += usize::from(plan.drain);
             if plan.reads() > 0 {
                 s.fills += 1;
                 s.slots += plan.reads();
@@ -1227,15 +1248,31 @@ impl KqBank {
             experts: experts.to_vec(),
             slots: plan.slots,
             arrays,
-            epoch: plan.epoch,
         })
     }
 
-    /// The gathers of `p`'s step (and every earlier one of its class) are
-    /// evaluated.
-    pub fn done(&self, p: &Prepared) {
-        if let Some(ci) = class_index(p.class) {
-            lock(&self.inner).classes[ci].dir.complete(p.epoch);
+    /// Per class: the epoch of the last step planned so far.
+    pub fn issued(&self) -> [u64; 2] {
+        let g = lock(&self.inner);
+        [
+            g.classes[0].dir.cache().epoch(),
+            g.classes[1].dir.cache().epoch(),
+        ]
+    }
+
+    /// The GPU finished every gather of the steps up to `issued` (taken
+    /// before a host read that waits for them).
+    pub fn settle(&self, issued: [u64; 2]) {
+        let mut g = lock(&self.inner);
+        for (c, e) in g.classes.iter_mut().zip(issued) {
+            c.dir.complete(e);
+        }
+    }
+
+    /// The GPU finished every gather planned so far.
+    pub fn settle_all(&self) {
+        for c in &mut lock(&self.inner).classes {
+            c.dir.complete_all();
         }
     }
 

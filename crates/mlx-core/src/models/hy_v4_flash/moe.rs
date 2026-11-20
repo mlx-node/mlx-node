@@ -465,7 +465,16 @@ impl Moe {
             Group::Row => per_row(x, |r| router_scores(r, &w.router))?,
             Group::Fused | Group::Owner => router_scores(x, &w.router)?,
         };
+        let bank = match &self.experts {
+            ExpertSource::Bank(b) => Some((b, b.issued())),
+            ExpertSource::Resident(_) => None,
+        };
         let (ids, weights) = route(&scores, self.bias.as_deref(), &self.moe)?;
+        // every gather planned before this read feeds `x` through the
+        // residual stream, or was evaluated with its FFN chunk: it finished
+        if let Some((b, issued)) = bank {
+            b.settle(issued);
+        }
         #[cfg(test)]
         let (ids, weights) = forced::apply(layer, &scores, ids, weights, &self.moe)?;
         prof_end(Phase::Router, tp, &[])?;
@@ -520,12 +529,9 @@ impl Moe {
                 prof_end(Phase::Fill, tp, &[])?;
                 bank.assert_slots(&p);
                 let tp = prof_start();
-                let out = self.banked(z, &ids, &w, &p, kind);
-                if out.is_ok() {
-                    bank.done(&p);
-                }
-                prof_end(Phase::Routed, tp, &[])?;
-                out
+                let out = self.banked(z, &ids, &w, &p, kind)?;
+                prof_end(Phase::Routed, tp, &[&out])?;
+                Ok(out)
             }
         }
     }
@@ -546,18 +552,14 @@ impl Moe {
             })
             .collect::<Result<Vec<u32>>>()?;
         let sorted = !kind.is_decode();
-        let out = self.combine(z, &slots, w, sorted, |pi, x, i| {
+        self.combine(z, &slots, w, sorted, |pi, x, i| {
             let a = &p.arrays[pi];
             if sorted {
                 a.gather_sorted(x, i)
             } else {
                 a.gather(x, i)
             }
-        })?;
-        // a later step may refill or evict these slots: no lazy gather may
-        // outlive this call
-        super::stats::eval(&[&out], "hy_v4_flash routed experts")?;
-        Ok(out)
+        })
     }
 
     /// The expert math over `idx` (`[rows, k]` row-major, each row's
@@ -704,7 +706,9 @@ impl LayerFfn {
     /// is evaluated before the next starts when there is more than one.
     /// Every chunk runs as `kind`, so a short last prefill chunk never
     /// evicts the bank's cache. Decode rows are one chunk (one router
-    /// readback, one bank `prepare`), refused past `chunk` rows.
+    /// readback, one bank `prepare`), refused past `chunk` rows. Through a
+    /// bank the output reads its slots lazily: the next router read of the
+    /// bank's users must descend from it, or it must be evaluated first.
     pub fn forward_chunked(
         &self,
         ffn: &Ffn,

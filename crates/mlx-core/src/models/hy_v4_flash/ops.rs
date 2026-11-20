@@ -15,6 +15,9 @@ use crate::nn::Activations;
 /// Vocab rows per f32 head chunk (16384 x 3072 f32 = 192 MiB).
 pub const HEAD_CHUNK: i64 = 16384;
 
+/// Calls of at most this many rows evaluate two head chunks per eval.
+pub const HEAD_PAIR_ROWS: i64 = 4;
+
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 ops: {msg}"))
 }
@@ -200,7 +203,8 @@ pub fn route_host(
     ))
 }
 
-/// `route_host` on scores read back from the GPU (one sync).
+/// `route_host` on scores read back from the GPU (one sync, which also
+/// evaluates what `stats::defer` holds).
 pub fn route(
     scores: &MxArray,
     bias: Option<&[f32]>,
@@ -213,8 +217,9 @@ pub fn route(
             moe.n_experts
         )));
     }
-    super::stats::synced();
-    let s = scores.astype(DType::Float32)?.to_float32()?;
+    let s = scores.astype(DType::Float32)?;
+    super::stats::eval(&[&s], "hy_v4_flash router")?;
+    let s = s.to_float32()?;
     route_host(s.as_ref(), bias, moe)
 }
 
@@ -224,8 +229,7 @@ pub fn head_logits(x: &MxArray, head: &Dense) -> Result<MxArray> {
 }
 
 /// f32 logits of `x [s, d]`. A `Qmm` head is one `quantized_matmul`; any
-/// other head is cast to f32 `chunk` vocab rows at a time, each chunk
-/// evaluated before the next is cast, so one f32 chunk is alive at a time.
+/// other head is cast to f32 `chunk` vocab rows at a time (`head_chunks`).
 pub fn head_logits_chunked(x: &MxArray, head: &Dense, chunk: i64) -> Result<MxArray> {
     if chunk <= 0 {
         return Err(bad(format!("head chunk {chunk} must be > 0")));
@@ -234,15 +238,36 @@ pub fn head_logits_chunked(x: &MxArray, head: &Dense, chunk: i64) -> Result<MxAr
     if let Dense::Qmm { .. } = head {
         return head.mm_t(&xf);
     }
+    head_chunks(head, chunk, xf.shape_at(0)?, |w| {
+        xf.matmul(&w.transpose(Some(&[1, 0]))?)
+    })
+}
+
+/// `part(f32 rows lo..hi of head)` per `chunk` vocab rows, concatenated
+/// on axis 1. The parts are evaluated as they come, two per eval for calls
+/// of at most `HEAD_PAIR_ROWS` rows, so at most two f32 chunks are alive.
+pub fn head_chunks(
+    head: &Dense,
+    chunk: i64,
+    rows: i64,
+    part: impl Fn(&MxArray) -> Result<MxArray>,
+) -> Result<MxArray> {
+    if chunk <= 0 {
+        return Err(bad(format!("head chunk {chunk} must be > 0")));
+    }
+    let per = if rows <= HEAD_PAIR_ROWS { 2 } else { 1 };
     let vocab = head.shape_at(0)?;
     let mut parts = Vec::new();
     let mut lo = 0;
     while lo < vocab {
         let hi = (lo + chunk).min(vocab);
-        let w = head.row_range(lo, hi)?.f32()?;
-        let p = xf.matmul(&w.transpose(Some(&[1, 0]))?)?;
-        super::stats::eval(&[&p], "hy_v4_flash head chunk")?;
-        parts.push(p);
+        parts.push(part(&head.row_range(lo, hi)?.f32()?)?);
+        let n = parts.len();
+        if n % per == 0 || hi == vocab {
+            let open = if n % per == 0 { per } else { n % per };
+            let live: Vec<&MxArray> = parts[n - open..].iter().collect();
+            super::stats::eval(&live, "hy_v4_flash head chunk")?;
+        }
         lo = hi;
     }
     match parts.len() {

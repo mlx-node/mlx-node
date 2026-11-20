@@ -2,6 +2,7 @@
 //! expert bank's and the Engram table's counters, and the phase split of a
 //! forward (off unless `set_profiling(true)`).
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Write;
@@ -194,15 +195,68 @@ pub const WAVE_ROWS: usize = 12;
 
 static EVALS: AtomicU64 = AtomicU64::new(0);
 
-/// Evaluates `outs`: one counted host sync of a forward.
-pub fn eval(outs: &[&MxArray], what: &str) -> napi::Result<()> {
-    EVALS.fetch_add(1, Ordering::Relaxed);
-    MxArray::eval_arrays_with_context(outs, what)
+thread_local! {
+    static DEFERRED: RefCell<Vec<MxArray>> = const { RefCell::new(Vec::new()) };
+    static DEFER_SCOPES: Cell<usize> = const { Cell::new(0) };
 }
 
-/// A host read of a forward, which waits for the GPU as an eval does.
-pub fn synced() {
+/// Evaluates `outs` and every array [`defer`] holds, in one call: one
+/// counted host sync of a forward.
+pub fn eval(outs: &[&MxArray], what: &str) -> napi::Result<()> {
     EVALS.fetch_add(1, Ordering::Relaxed);
+    let held = DEFERRED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    if held.is_empty() {
+        return MxArray::eval_arrays_with_context(outs, what);
+    }
+    let all: Vec<&MxArray> = outs.iter().copied().chain(held.iter()).collect();
+    MxArray::eval_arrays_with_context(&all, what)
+}
+
+/// Inside a [`DeferScope`], `a` is evaluated by the next [`eval`] or
+/// [`flush`] of this thread; outside one, now.
+pub fn defer(a: &MxArray, what: &str) -> napi::Result<()> {
+    if DEFER_SCOPES.with(Cell::get) == 0 {
+        return eval(&[a], what);
+    }
+    DEFERRED.with(|d| d.borrow_mut().push(a.clone()));
+    Ok(())
+}
+
+/// Evaluates what [`defer`] holds (no sync when it holds nothing).
+pub fn flush(what: &str) -> napi::Result<()> {
+    if DEFERRED.with(|d| d.borrow().is_empty()) {
+        return Ok(());
+    }
+    eval(&[], what)
+}
+
+/// Arrays [`defer`] holds on this thread.
+pub fn deferred() -> usize {
+    DEFERRED.with(|d| d.borrow().len())
+}
+
+/// While alive, [`defer`] holds arrays; the last scope to drop forgets
+/// whatever is still held (a failed step's state is put back anyway).
+pub struct DeferScope(());
+
+impl DeferScope {
+    pub fn enter() -> Self {
+        DEFER_SCOPES.with(|n| n.set(n.get() + 1));
+        Self(())
+    }
+}
+
+impl Drop for DeferScope {
+    fn drop(&mut self) {
+        let left = DEFER_SCOPES.with(|n| {
+            let v = n.get().saturating_sub(1);
+            n.set(v);
+            v
+        });
+        if left == 0 {
+            DEFERRED.with(|d| d.borrow_mut().clear());
+        }
+    }
 }
 
 /// Host syncs of every forward so far (monotonic, process-wide).

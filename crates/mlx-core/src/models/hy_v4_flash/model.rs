@@ -15,8 +15,11 @@
 //! window clones (`Mark`), and a failed or cancelled step puts every owner
 //! back at its start.
 
+use std::sync::Arc;
+
 use napi::{Error, Result};
 
+use super::bank::KqBank;
 use super::batch::{Core, Group, Op, Owners, Wave, group};
 use super::block::{Block, EngramIn, LayerState};
 use super::cache::{LatentBuf, LayerCache, WindowRing};
@@ -24,14 +27,14 @@ use super::config::HyV4FlashConfig;
 use super::engram::{Hasher, keeps};
 use super::indexer::{IndexerMark, IndexerState};
 use super::moe::{ExpertSource, Routes, RowKind, per_row, qlinear};
-use super::ops::{HEAD_CHUNK, hc_head, head_logits};
+use super::ops::{HEAD_CHUNK, hc_head, head_chunks, head_logits};
 use super::prefix_state::StateLayer;
 use super::rows::EngramRows;
-use super::stats::{Phase, prof_end, prof_start};
+use super::stats::{DeferScope, Phase, prof_end, prof_start};
 use super::weights::{HcWeights, LayerWeights, Resident};
 use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::attention::rms_norm;
-use crate::models::deepseek_v41::store::{Dense, Weight};
+use crate::models::deepseek_v41::store::Dense;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 model: {msg}"))
@@ -182,22 +185,10 @@ pub fn head_rows(x: &MxArray, head: &Dense) -> Result<MxArray> {
     if xf.shape_at(0)? == 1 {
         return head_logits(&xf, head);
     }
-    let vocab = head.shape_at(0)?;
-    let mut parts = Vec::new();
-    let mut lo = 0;
-    while lo < vocab {
-        let hi = (lo + HEAD_CHUNK).min(vocab);
-        let wt = head.row_range(lo, hi)?.f32()?.transpose(Some(&[1, 0]))?;
-        let p = per_row(&xf, |r| r.matmul(&wt))?;
-        super::stats::eval(&[&p], "hy_v4_flash head chunk")?;
-        parts.push(p);
-        lo = hi;
-    }
-    match parts.len() {
-        0 => Err(bad("head has no vocab rows")),
-        1 => Ok(parts.swap_remove(0)),
-        _ => MxArray::concatenate_many(parts.iter().collect(), Some(1)),
-    }
+    head_chunks(head, HEAD_CHUNK, xf.shape_at(0)?, |w| {
+        let wt = w.transpose(Some(&[1, 0]))?;
+        per_row(&xf, |r| r.matmul(&wt))
+    })
 }
 
 /// Engram table rows `[pos][layer][col]` of the call `ids` after `history`,
@@ -553,6 +544,8 @@ pub struct Model {
     blocks: Vec<Block>,
     hasher: Hasher,
     table: Box<dyn EngramRows>,
+    /// The distinct banks the blocks gather from.
+    banks: Vec<Arc<KqBank>>,
 }
 
 /// Refuses an empty call or one past the session's context.
@@ -601,6 +594,7 @@ impl Model {
         }
         want_dims(weights.token_embd(), cfg.vocab_size, cfg.dim, "token_embd")?;
         want_dims(weights.output(), cfg.vocab_size, cfg.dim, "output")?;
+        let mut banks: Vec<Arc<KqBank>> = Vec::new();
         let blocks = layers
             .iter()
             .enumerate()
@@ -610,6 +604,11 @@ impl Model {
                 } else {
                     Some(experts(l)?)
                 };
+                if let Some(ExpertSource::Bank(b)) = &src
+                    && !banks.iter().any(|k| Arc::ptr_eq(k, b))
+                {
+                    banks.push(Arc::clone(b));
+                }
                 Block::new(&cfg, l, w, src)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -620,6 +619,7 @@ impl Model {
             blocks,
             hasher,
             table,
+            banks,
         })
     }
 
@@ -752,7 +752,31 @@ impl Model {
     /// `owners.core`. `cancel(layer)` is asked before each layer. On error
     /// the caller puts every owner's state back; on success the caller
     /// records the owners' new tokens. One output per owner, in order.
+    /// A decode wave commits each layer without waiting and syncs only at
+    /// its router reads and its head; on return no GPU work of the wave
+    /// is in flight and every bank step it planned is settled.
     pub fn wave(
+        &self,
+        owners: &mut dyn Owners,
+        wave: &Wave,
+        cancel: Option<&dyn Fn(usize) -> bool>,
+        trace: Option<&mut Trace>,
+    ) -> Result<Vec<Output>> {
+        let scope = DeferScope::enter();
+        let out = self.wave_layers(owners, wave, cancel, trace);
+        if out.is_err() {
+            crate::array::synchronize();
+        }
+        // the head eval waited for every gather (each one feeds the final
+        // streams); a failed wave was drained above
+        for b in &self.banks {
+            b.settle_all();
+        }
+        drop(scope);
+        out
+    }
+
+    fn wave_layers(
         &self,
         owners: &mut dyn Owners,
         wave: &Wave,
@@ -811,7 +835,10 @@ impl Model {
                 x = xi.clone();
             }
             let (y, routes) = blk.forward(&w.layers()[l], &x, wave, owners, engram)?;
-            super::stats::eval(&[&y], "hy_v4_flash layer")?;
+            match wave.kind() {
+                RowKind::Prefill => super::stats::eval(&[&y], "hy_v4_flash layer")?,
+                RowKind::Decode => MxArray::async_eval_arrays(&[&y]),
+            }
             x = y;
             if let Some(t) = trace.as_deref_mut() {
                 t.routes.push(routes);
@@ -877,20 +904,20 @@ impl Model {
     }
 
     /// Every owner's outputs from its rows of `x [r, hc, d]`, evaluated
-    /// together.
+    /// together with `x` and what `stats::defer` holds.
     fn heads(&self, x: &MxArray, owners: &dyn Owners, wave: &Wave) -> Result<Vec<Output>> {
         let mut outs = Vec::with_capacity(wave.owners());
         for i in 0..wave.owners() {
             let xo = wave.owner_rows(x, i)?;
             outs.push(self.head(&xo, owners.want(i), wave.kind())?);
         }
-        let live: Vec<&MxArray> = outs
-            .iter()
-            .flat_map(|o| o.logits.iter().chain(o.hidden.iter()))
+        let live: Vec<&MxArray> = std::iter::once(x)
+            .chain(
+                outs.iter()
+                    .flat_map(|o| o.logits.iter().chain(o.hidden.iter())),
+            )
             .collect();
-        if !live.is_empty() {
-            super::stats::eval(&live, "hy_v4_flash head")?;
-        }
+        super::stats::eval(&live, "hy_v4_flash head")?;
         Ok(outs)
     }
 

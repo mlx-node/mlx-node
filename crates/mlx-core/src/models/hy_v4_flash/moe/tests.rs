@@ -1008,6 +1008,7 @@ fn decode_wave_takes_victims_at_any_row_count() {
         let out = layer
             .forward_chunked(&ffn, &norm, &post, &h, FFN_CHUNK_ROWS, kind)
             .unwrap();
+        MxArray::eval_arrays(&[&out.0]).unwrap();
         bank.end_turn().unwrap();
         out
     };
@@ -1104,12 +1105,9 @@ fn sorted_prefill_rows_do_not_depend_on_their_neighbours() {
         };
         let run = |rs: &[usize], kind: RowKind| -> Vec<Vec<u32>> {
             let (zs, r) = sub(rs);
-            let y = moe.routed(il, &zs, &r, kind).unwrap();
+            let y = bits(read(&moe.routed(il, &zs, &r, kind).unwrap()));
             bank.end_turn().unwrap();
-            bits(read(&y))
-                .chunks_exact(m.latent)
-                .map(<[u32]>::to_vec)
-                .collect()
+            y.chunks_exact(m.latent).map(<[u32]>::to_vec).collect()
         };
         let all: Vec<usize> = (0..rows).collect();
         // SAFETY: test-only counters of this thread.

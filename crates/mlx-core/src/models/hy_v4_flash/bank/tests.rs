@@ -380,6 +380,68 @@ fn promote_moves_decode_staging_copies() {
     d.cache().check().unwrap();
 }
 
+/// A cache slot whose step has not settled is never a victim: the next
+/// layer's misses go to staging until that step settles.
+#[test]
+fn an_unsettled_slot_is_never_a_victim() {
+    let mut d = Directory::new(1, 2, 8, 2).unwrap();
+    let p = d.plan(0, &[1, 2], &[], true);
+    assert_eq!(p.victims.len(), 2);
+    d.untag(0, &p);
+    d.publish(0, &p);
+    let q = d.plan(1, &[3, 4], &[], true);
+    assert!(q.victims.is_empty() && q.copies.is_empty());
+    assert_eq!(q.staging, vec![3, 4]);
+    assert!(!q.drain);
+    d.untag(1, &q);
+    d.publish(1, &q);
+    d.complete(p.epoch);
+    let r = d.plan(1, &[5, 6], &[], true);
+    assert_eq!(r.victims.len(), 2);
+    let mut got = r.slots.clone();
+    let mut was = p.slots.clone();
+    got.sort_unstable();
+    was.sort_unstable();
+    assert_eq!(got, was, "the settled step's slots, and only those");
+    d.untag(1, &r);
+    d.publish(1, &r);
+    // r is unsettled: a miss of layer 0 finds no victim
+    let s = d.plan(0, &[7], &[], true);
+    assert!(s.victims.is_empty());
+    assert_eq!(s.staging, vec![7]);
+    d.cache().check().unwrap();
+}
+
+/// A staging slot whose last step has not settled is never refilled
+/// without a drain: the plan says so, and says nothing once it settled.
+#[test]
+fn a_staging_refill_of_an_unsettled_slot_drains() {
+    let mut d = Directory::new(1, 2, 8, 0).unwrap();
+    let p = d.plan(0, &[2, 5], &[], false);
+    assert_eq!(p.staging, vec![2, 5]);
+    assert!(!p.drain, "nothing used the slots yet");
+    d.untag(0, &p);
+    d.publish(0, &p);
+    // a hit on a valid staging copy reads nothing and drains nothing
+    let h = d.plan(0, &[5], &[], false);
+    assert_eq!((h.reads(), h.drain), (0, false));
+    let q = d.plan(1, &[2], &[], false);
+    assert_eq!(q.staging, vec![2]);
+    assert!(q.drain, "slot 2 is still used by an unsettled step");
+    d.complete(q.epoch - 1);
+    d.untag(1, &q);
+    d.publish(1, &q);
+    let r = d.plan(0, &[2], &[], false);
+    assert!(r.drain, "q itself is unsettled");
+    d.complete(r.epoch - 1);
+    let s = d.plan(0, &[3], &[], false);
+    assert!(!s.drain, "slot 3 was never used");
+    d.complete_all();
+    let t = d.plan(1, &[5], &[], false);
+    assert_eq!(t.staging, vec![5]);
+    assert!(!t.drain, "every use of slot 5 settled");
+}
+
 #[test]
 fn step_checks_refuse_bad_input() {
     let d = Directory::new(1, 2, 8, 0).unwrap();
@@ -707,21 +769,21 @@ fn bank_serves_both_classes_across_turns() {
     assert_eq!(p.class, ExpertClass::Q6kDown);
     bank.assert_slots(&p);
     check_prepared(&file, &m, l1, &p);
-    bank.done(&p);
+    bank.settle_all();
     assert_eq!(bank.stats()[0].slots, 2);
     let h = bank.prepare(1, &[0, 3], &[], true).unwrap();
     assert_eq!(h.slots, p.slots);
     assert_eq!(bank.stats()[0].hits, 2);
-    bank.done(&h);
+    bank.settle_all();
     let e = bank.prepare(3, &[5], &[], true).unwrap();
     bank.assert_slots(&e);
     check_prepared(&file, &m, experts[3].as_ref().unwrap(), &e);
-    bank.done(&e);
+    bank.settle_all();
     let b = bank.prepare(2, &[1, 2, 5], &[1, 4, 1], false).unwrap();
     assert_eq!(b.class, ExpertClass::Q4kDown);
     bank.assert_slots(&b);
     check_prepared(&file, &m, experts[2].as_ref().unwrap(), &b);
-    bank.done(&b);
+    bank.settle_all();
     assert_eq!(bank.stats()[1].slots, 3);
     assert!(bank.prepare(0, &[1], &[], true).is_err());
     assert!(bank.prepare(1, &[3, 1], &[], true).is_err());
@@ -731,7 +793,7 @@ fn bank_serves_both_classes_across_turns() {
     let again = bank.prepare(1, &[3], &[], true).unwrap();
     bank.assert_slots(&again);
     check_prepared(&file, &m, l1, &again);
-    bank.done(&again);
+    bank.settle_all();
     bank.end_turn().unwrap();
     assert!(bank.rebuild([0, 0], 2).is_err());
     drop((p, h, e, b, again));
@@ -741,6 +803,37 @@ fn bank_serves_both_classes_across_turns() {
     let r = bank.prepare(3, &[0, 5], &[], false).unwrap();
     bank.assert_slots(&r);
     check_prepared(&file, &m, experts[3].as_ref().unwrap(), &r);
+}
+
+/// Metal banks: a staging refill drains the GPU only while a step that
+/// used the slot is unsettled, the drained step reads its own bytes, and
+/// settling lets the next refill go without a drain.
+#[test]
+fn bank_drains_only_for_an_unsettled_staging_slot() {
+    use crate::array::memory::TEST_SYNCHRONIZE_CALLS;
+    let (_dir, path, m, experts, file) = bank_fixture();
+    let bank = KqBank::new(pool_over(&path, 4), &m, &experts, [0, 0], 1).unwrap();
+    let syncs = || TEST_SYNCHRONIZE_CALLS.with(std::cell::Cell::get);
+    let at = syncs();
+    let a = bank.prepare(1, &[0, 3], &[], false).unwrap();
+    check_prepared(&file, &m, experts[1].as_ref().unwrap(), &a);
+    assert_eq!(syncs(), at, "a first fill drains nothing");
+    let issued = bank.issued();
+    let b = bank.prepare(3, &[0], &[], false).unwrap();
+    assert_eq!(syncs(), at + 1, "slot 0 was used by the unsettled step");
+    assert_eq!(bank.stats()[0].drains, 1);
+    bank.assert_slots(&b);
+    check_prepared(&file, &m, experts[3].as_ref().unwrap(), &b);
+    bank.settle(issued);
+    let c = bank.prepare(1, &[3], &[], false).unwrap();
+    assert_eq!(c.slots, a.slots[1..]);
+    assert_eq!(syncs(), at + 1, "a valid staging copy reads nothing");
+    bank.settle_all();
+    let d = bank.prepare(1, &[0], &[], false).unwrap();
+    check_prepared(&file, &m, experts[1].as_ref().unwrap(), &d);
+    assert_eq!(syncs(), at + 1, "every use of slot 0 settled");
+    assert_eq!(bank.stats()[0].drains, 1);
+    bank.end_turn().unwrap();
 }
 
 fn real_scan() -> Scan {
@@ -868,7 +961,7 @@ fn real_slot_gather_equals_whole_tensor_gather() {
                 "layer {il} proj {pi}"
             );
         }
-        bank.done(&p);
+        bank.settle_all();
     }
     bank.end_turn().unwrap();
 }

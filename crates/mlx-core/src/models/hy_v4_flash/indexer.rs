@@ -366,7 +366,7 @@ impl TokTail {
             None => new,
         }
         .deep_copy()?;
-        super::stats::eval(&[&rows], "hy_v4_flash indexer tail")?;
+        super::stats::defer(&rows, "hy_v4_flash indexer tail")?;
         self.rows = Some(rows);
         self.held = hold;
         self.len += n;
@@ -393,7 +393,7 @@ impl TokTail {
             (_, 0) => None,
             (Some(r), k) => {
                 let r = r.slice(&[0, 0], &[k as i64, self.width])?.deep_copy()?;
-                super::stats::eval(&[&r], "hy_v4_flash indexer tail")?;
+                super::stats::defer(&r, "hy_v4_flash indexer tail")?;
                 Some(r)
             }
             (None, _) => return Err(bad("tok_k rows missing")),

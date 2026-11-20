@@ -12,6 +12,7 @@ fn class(fills: usize, slots: usize, uses: usize, hits: usize) -> KqStats {
         hits,
         promoted: hits / 2,
         promote_ns: 7,
+        drains: 0,
     }
 }
 
@@ -263,7 +264,40 @@ fn wave_line_fields() {
 #[test]
 fn counted_syncs_move_the_counter() {
     let before = evals();
-    synced();
-    synced();
-    assert!(evals() >= before + 2);
+    let a = MxArray::from_float32(&[1.0], &[1]).unwrap();
+    eval(&[&a], "test").unwrap();
+    flush("test").unwrap();
+    assert!(evals() > before);
+}
+
+/// Inside a scope a deferred array waits for the next eval, which counts
+/// once; outside one it is evaluated at once; the last scope forgets what
+/// is left.
+#[test]
+fn deferred_arrays_ride_the_next_eval() {
+    let x = MxArray::from_float32(&[1.0, 2.0], &[2]).unwrap();
+    let a = x.add(&x).unwrap();
+    defer(&a, "test").unwrap();
+    assert_eq!(deferred(), 0);
+    {
+        let _s = DeferScope::enter();
+        let b = x.mul(&x).unwrap();
+        defer(&b, "test").unwrap();
+        {
+            let _inner = DeferScope::enter();
+            defer(&a, "test").unwrap();
+        }
+        assert_eq!(deferred(), 2);
+        let before = evals();
+        let c = x.sub(&x).unwrap();
+        eval(&[&c], "test").unwrap();
+        assert_eq!(deferred(), 0);
+        assert!(evals() > before);
+        assert_eq!(b.to_float32().unwrap().to_vec(), vec![1.0, 4.0]);
+        defer(&b, "test").unwrap();
+        flush("test").unwrap();
+        assert_eq!(deferred(), 0);
+        defer(&b, "test").unwrap();
+    }
+    assert_eq!(deferred(), 0);
 }

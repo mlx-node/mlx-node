@@ -300,6 +300,11 @@ impl Cache {
         self.epoch
     }
 
+    /// Every epoch up to this one has finished on the GPU.
+    pub fn completed(&self) -> u64 {
+        self.completed
+    }
+
     fn unmap(&mut self, slot: u32) {
         if let Some((l, e)) = self.occ[slot as usize].take() {
             let k = self.key(l as usize, e);
