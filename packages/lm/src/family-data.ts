@@ -563,6 +563,7 @@ export const MODEL_FAMILY_DATA = [
     kind: 'loadable',
     match: { rawModelTypes: ['hy_v4_flash'] },
     acceptsMaxMemory: true,
+    loadsAlone: true,
     acceptsMaxContext: true,
     acceptsCacheDisk: true,
     /** The template and tokenizer live inside the GGUF; the native side enforces the context limit. */

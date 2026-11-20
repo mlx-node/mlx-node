@@ -1074,6 +1074,258 @@ fn new_refuses_mismatched_weights() {
     bank.end_turn().unwrap();
 }
 
+fn qmm(v: &[f32], rows: usize, cols: usize) -> Dense {
+    let q = super::moe::AffineProj::quantize(&arr(v, &[1, rows, cols]), 32, 8).unwrap();
+    let sq = |a: &MxArray| {
+        a.reshape(&[a.shape_at(1).unwrap(), a.shape_at(2).unwrap()])
+            .unwrap()
+    };
+    Dense::Qmm {
+        w: sq(&q.w),
+        scales: sq(&q.s).astype(DType::Float32).unwrap(),
+        biases: sq(&q.b).astype(DType::Float32).unwrap(),
+    }
+}
+
+fn qmat(r: &mut Rng, rows: usize, cols: usize) -> Dense {
+    qmm(&r.vec(rows * cols, 1.5 / (cols as f32).sqrt()), rows, cols)
+}
+
+fn q8_bf16_head_fixture() -> Fixture {
+    const QD: usize = 32;
+    let mut cfg = tiny_cfg();
+    cfg.dense_ff = QD;
+    cfg.mla = MlaConfig {
+        q_lora_rank: QD,
+        kv_lora_rank: QD,
+        qk_nope_dim: QD,
+        rope_dim: ROPE,
+        head_dim_qk: QD + ROPE,
+        head_dim_v: QD,
+        scale: ((QD + ROPE) as f32).sqrt().recip(),
+    };
+    let (bank, dir) = tiny_bank(&cfg, 29);
+    let mut r = Rng::new(31);
+    let m = &cfg.moe;
+    let layers = cfg
+        .layers
+        .iter()
+        .map(|l| {
+            let h = l.n_heads;
+            let attn = AttnWeights {
+                norm: norm(&mut r, QD),
+                sinks: small(&mut r, &[h], 1.0),
+                q_a: qmat(&mut r, QD, QD),
+                q_a_norm: norm(&mut r, QD),
+                q_b: qmat(&mut r, h * (QD + ROPE), QD),
+                kv_a: qmat(&mut r, QD + ROPE, QD),
+                kv_a_norm: norm(&mut r, QD),
+                k_b: qmat(&mut r, h * QD, QD),
+                v_b: qmat(&mut r, h * QD, QD),
+                output: qmat(&mut r, QD, h * QD),
+                gate: qmat(&mut r, h * QD, QD),
+                post_norm: norm(&mut r, QD),
+            };
+            let indexer = (l.attn == Attn::Indexed).then(|| IndexerWeights {
+                attn_k: qmat(&mut r, IDX_DIM, QD),
+                k_norm: norm(&mut r, IDX_DIM),
+                q_b: qmat(&mut r, IDX_HEADS * IDX_DIM, QD),
+                proj: qmat(&mut r, IDX_HEADS, QD),
+                compressor_value: small(&mut r, &[IDX_DIM, IDX_DIM], 0.25),
+                compressor_gate: small(&mut r, &[IDX_DIM, IDX_DIM], 0.25),
+                compressor_ape: small(&mut r, &[cfg.indexer.kpool, IDX_DIM], 0.5),
+                compressor_norm: norm(&mut r, IDX_DIM),
+            });
+            let engram = l.engram.map(|_| {
+                let cols = cfg.engram.n_cols();
+                EngramWeights {
+                    kv: qmat(&mut r, (HC + 1) * QD, cols * cfg.engram.head_dim),
+                    kv_b: small(&mut r, &[HC + 1, QD], 0.2),
+                    gate: small(&mut r, &[HC, QD], 1.0),
+                    lookup_norm: small(&mut r, &[cols, cfg.engram.head_dim], 1.0),
+                    pre_gamma: norm(&mut r, QD),
+                    hc_scale: small(&mut r, &[HC, QD], 0.5),
+                }
+            });
+            let ffn = if l.dense_ffn {
+                Ffn::Mlp {
+                    gate: qmat(&mut r, QD, QD),
+                    up: qmat(&mut r, QD, QD),
+                    down: qmat(&mut r, QD, QD),
+                }
+            } else {
+                Ffn::Moe(MoeWeights {
+                    router: mat(&mut r, m.n_experts, QD),
+                    router_bias: Some(small(&mut r, &[m.n_experts], 0.1)),
+                    routed_down: qmat(&mut r, m.latent, QD),
+                    routed_up: qmat(&mut r, QD, m.latent),
+                    shared_gate: qmat(&mut r, QD, QD),
+                    shared_up: qmat(&mut r, QD, QD),
+                    shared_down: qmat(&mut r, QD, QD),
+                })
+            };
+            LayerWeights {
+                attn,
+                indexer,
+                engram,
+                residual: Residual::Hc {
+                    attn: hc_weights(&mut r, 2 * HC, 2),
+                    ffn: hc_weights(&mut r, 2 * HC, 2),
+                },
+                ffn_norm: norm(&mut r, QD),
+                post_ffw_norm: norm(&mut r, QD),
+                ffn,
+            }
+        })
+        .collect();
+    let output = arr(&r.vec(V * QD, 1.5 / (QD as f32).sqrt()), &[V, QD])
+        .astype(DType::BFloat16)
+        .unwrap();
+    let weights = Tiny {
+        token_embd: mat(&mut r, V, QD),
+        output: Dense::Array(output),
+        output_norm: norm(&mut r, QD),
+        output_hc: hc_weights(&mut r, HC, 1),
+        layers,
+    };
+    let table = engram_table(&cfg.engram, 37);
+    let b = Arc::clone(&bank);
+    let model = Model::new(
+        cfg,
+        Box::new(weights),
+        move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
+        Box::new(table),
+    )
+    .unwrap();
+    Fixture {
+        model,
+        bank,
+        _dir: dir,
+    }
+}
+
+fn bits(x: &MxArray) -> Vec<u32> {
+    read(x).into_iter().map(f32::to_bits).collect()
+}
+
+#[test]
+fn batched_bf16_head_four_owner_decode_wave_matches_alone_bitwise() {
+    use super::stats;
+
+    let f = q8_bf16_head_fixture();
+    let prompts: Vec<Vec<u32>> = [(5u64, 9usize), (6, 14), (8, 18), (9, 22)]
+        .iter()
+        .map(|&(seed, n)| Rng::new(seed).ids(n))
+        .collect();
+
+    // 4-owner Want::LAST decode wave vs each owner alone.
+    let single: [&[u32]; 4] = [&[7], &[3], &[41], &[60]];
+    let mut evals_1 = 0u64;
+    let alone_last: Vec<Vec<u32>> = prompts
+        .iter()
+        .zip(single)
+        .enumerate()
+        .map(|(i, (p, ids))| {
+            let mut s = prefilled(&f.model, p);
+            let before = stats::thread_evals();
+            let out = f
+                .model
+                .forward(&mut s, ids, RowKind::Decode, Want::LAST, None, None)
+                .unwrap();
+            if i == 0 {
+                evals_1 = stats::thread_evals() - before;
+            }
+            bits(out.logits.as_ref().unwrap())
+        })
+        .collect();
+
+    let mut sessions: Vec<Session> = prompts.iter().map(|p| prefilled(&f.model, p)).collect();
+    let before = stats::thread_evals();
+    let outs = {
+        let mut owners: Vec<OwnerRows<'_>> = sessions
+            .iter_mut()
+            .zip(single)
+            .map(|(sess, ids)| OwnerRows {
+                sess,
+                ids,
+                want: Want::LAST,
+            })
+            .collect();
+        f.model
+            .step(&mut owners, RowKind::Decode, None, None)
+            .unwrap()
+    };
+    let evals_4 = stats::thread_evals() - before;
+    assert_eq!(
+        evals_4, evals_1,
+        "4-owner BF16-head decode wave must use the same eval count as 1-owner"
+    );
+    for (i, (want, out)) in alone_last.iter().zip(&outs).enumerate() {
+        assert_eq!(
+            bits(out.logits.as_ref().unwrap()),
+            *want,
+            "Want::LAST owner {i} logits must match alone bitwise"
+        );
+        assert!(out.hidden.is_none());
+    }
+
+    // Mixed wants across 4 owners (including multi-row verify and hidden reuse).
+    let mixed_ids: [&[u32]; 4] = [&[11], &[12, 13], &[14], &[15, 16]];
+    let mixed_wants: [Want; 4] = [
+        Want::LAST,
+        Want::ALL,
+        Want::STATE,
+        Want {
+            logits: Logits::Last,
+            hidden: true,
+        },
+    ];
+    let alone_mixed: Vec<(Option<Vec<u32>>, Option<Vec<u32>>)> = prompts
+        .iter()
+        .zip(mixed_ids)
+        .zip(mixed_wants)
+        .map(|((p, ids), want)| {
+            let mut s = prefilled(&f.model, p);
+            let out = f
+                .model
+                .forward(&mut s, ids, RowKind::Decode, want, None, None)
+                .unwrap();
+            (out.logits.as_ref().map(bits), out.hidden.as_ref().map(bits))
+        })
+        .collect();
+
+    let mut sessions: Vec<Session> = prompts.iter().map(|p| prefilled(&f.model, p)).collect();
+    let before = stats::thread_evals();
+    let outs = {
+        let mut owners: Vec<OwnerRows<'_>> = sessions
+            .iter_mut()
+            .zip(mixed_ids)
+            .zip(mixed_wants)
+            .map(|((sess, ids), want)| OwnerRows { sess, ids, want })
+            .collect();
+        f.model
+            .step(&mut owners, RowKind::Decode, None, None)
+            .unwrap()
+    };
+    let evals_mixed = stats::thread_evals() - before;
+    assert_eq!(
+        evals_mixed, evals_1,
+        "mixed-wants 4-owner decode wave must use the same eval count as 1-owner"
+    );
+    for (i, ((want_l, want_h), out)) in alone_mixed.iter().zip(&outs).enumerate() {
+        assert_eq!(
+            out.logits.as_ref().map(bits),
+            *want_l,
+            "mixed owner {i} logits"
+        );
+        assert_eq!(
+            out.hidden.as_ref().map(bits),
+            *want_h,
+            "mixed owner {i} hidden"
+        );
+    }
+}
+
 /// A 16-token prompt through the real trunk: finite logits, the last row
 /// equal to the all-rows call, and (with `HY4_LLAMA_TOP1` = a JSON file
 /// `{"ids": [..16], "top1": [..16]}` of stored llama.cpp rows) the argmax

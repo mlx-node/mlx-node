@@ -339,6 +339,74 @@ fn seeds_keep_the_last_rows_by_position() {
     assert_eq!(read(s.get(110).unwrap(), 1), read(&rows(1, 50), 1));
 }
 
+#[test]
+fn kv_rows_and_seeds_defer_in_scope_and_stay_bit_identical_after_rollback() {
+    use super::stats::{self, DeferScope};
+
+    let kv_bits =
+        |x: &MxArray, n: usize| -> Vec<u32> { read(x, n).into_iter().map(f32::to_bits).collect() };
+
+    let mut kv = KvRows::new(4, 128);
+    // Initial write outside DeferScope performs the synchronous buffer resize.
+    kv.write(&rows(4, 0), 0).unwrap();
+
+    let mut seeds = Seeds::default();
+    let want_kv = kv_bits(&rows(7, 0), 7);
+    let want_seed_10 = kv_bits(&rows(1, 10), 1);
+    let want_seed_11 = kv_bits(&rows(1, 11), 1);
+
+    {
+        let _scope = DeferScope::enter();
+        assert_eq!(stats::deferred(), 0);
+        let evals_before = stats::thread_evals();
+
+        kv.write(&rows(3, 4), 4).unwrap();
+        assert_eq!(stats::deferred(), 1);
+        assert_eq!(stats::thread_evals(), evals_before);
+
+        let copied = Seeds::copies(&rows(4, 8), 8).unwrap();
+        assert_eq!(copied.len(), 4);
+        assert_eq!(stats::deferred(), 1 + copied.len());
+        assert_eq!(stats::thread_evals(), evals_before);
+        seeds.extend(copied);
+
+        stats::flush("test mtp defer flush").unwrap();
+        assert_eq!(stats::deferred(), 0);
+        assert_eq!(stats::thread_evals(), evals_before + 1);
+    }
+
+    assert_eq!(kv_bits(kv.rows().unwrap(), 7), want_kv);
+    assert_eq!(kv_bits(seeds.get(10).unwrap(), 1), want_seed_10);
+    assert_eq!(kv_bits(seeds.get(11).unwrap(), 1), want_seed_11);
+
+    // An unflushed scope clears deferred arrays on drop; rollback + rewrite stays bit-identical.
+    {
+        let _scope = DeferScope::enter();
+        kv.write(&rows(2, 7).mul_scalar(99.0).unwrap(), 7).unwrap();
+        assert_eq!(stats::deferred(), 1);
+        kv.truncate(4).unwrap();
+    }
+    assert_eq!(stats::deferred(), 0);
+    seeds.cut(10);
+
+    {
+        let _scope = DeferScope::enter();
+        let evals_before = stats::thread_evals();
+        kv.write(&rows(3, 4), 4).unwrap();
+        let copied = Seeds::copies(&rows(2, 10), 10).unwrap();
+        assert_eq!(stats::deferred(), 1 + copied.len());
+        assert_eq!(stats::thread_evals(), evals_before);
+        seeds.extend(copied);
+        stats::flush("test mtp rollback rewrite").unwrap();
+        assert_eq!(stats::deferred(), 0);
+        assert_eq!(stats::thread_evals(), evals_before + 1);
+    }
+
+    assert_eq!(kv_bits(kv.rows().unwrap(), 7), want_kv);
+    assert_eq!(kv_bits(seeds.get(10).unwrap(), 1), want_seed_10);
+    assert_eq!(kv_bits(seeds.get(11).unwrap(), 1), want_seed_11);
+}
+
 fn hy4_dir() -> PathBuf {
     PathBuf::from(std::env::var("HY4_DIR").expect("HY4_DIR = directory of the two Hy4 shards"))
 }

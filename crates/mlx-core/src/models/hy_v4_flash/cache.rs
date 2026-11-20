@@ -152,15 +152,23 @@ impl WindowRing {
         let kept = self.kept();
         let keys = match &self.rows {
             Some(r) => MxArray::concatenate(r, &kv, 0)?,
-            None => kv,
+            None => kv.clone(),
         };
         let total = kept + n;
         let hold = total.min(self.keep);
-        // an independent copy: a slice view would pin the whole chunk's buffer
-        let rows = keys
-            .slice(&[(total - hold) as i64, 0], &[total as i64, self.width])?
-            .deep_copy()?;
-        MxArray::eval_arrays_with_context(&[&rows], "hy_v4_flash window ring")?;
+        let rows = if total <= self.keep {
+            keys.clone()
+        } else if n >= self.keep {
+            // deep copy cuts lineage from a large prefill buffer
+            kv.slice(&[(n - hold) as i64, 0], &[n as i64, self.width])?
+                .deep_copy()?
+        } else if total - hold <= WINDOW_SLACK + 1 {
+            keys.slice(&[(total - hold) as i64, 0], &[total as i64, self.width])?
+        } else {
+            keys.slice(&[(total - hold) as i64, 0], &[total as i64, self.width])?
+                .deep_copy()?
+        };
+        super::stats::defer(&rows, "hy_v4_flash window ring")?;
         self.rows = Some(rows);
         self.held = hold;
         self.len = start + n;
@@ -194,13 +202,19 @@ impl WindowRing {
                 self.len
             )));
         }
-        let rows = self
+        let slice = self
             .rows
             .as_ref()
             .ok_or_else(|| bad("window rows missing"))?
-            .slice(&[0, 0], &[left as i64, self.width])?
-            .deep_copy()?;
-        MxArray::eval_arrays_with_context(&[&rows], "hy_v4_flash window ring")?;
+            .slice(&[0, 0], &[left as i64, self.width])?;
+        let rows = if drop <= WINDOW_SLACK + 1 {
+            // cut_owner calls truncate outside DeferScope; avoid a copy and sync
+            slice
+        } else {
+            let rows = slice.deep_copy()?;
+            super::stats::defer(&rows, "hy_v4_flash window ring")?;
+            rows
+        };
         self.rows = Some(rows);
         self.held = left;
         self.len = len;
@@ -285,7 +299,7 @@ impl LatentBuf {
             .as_mut()
             .ok_or_else(|| bad("latent buffer missing"))?;
         buf.slice_assign_axis_inplace(0, start as i64, end as i64, &rows)?;
-        MxArray::eval_arrays_with_context(&[&*buf], "hy_v4_flash latent write")?;
+        super::stats::defer(&*buf, "hy_v4_flash latent write")?;
         self.len = end;
         Ok(())
     }

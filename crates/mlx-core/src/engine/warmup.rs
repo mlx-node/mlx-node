@@ -170,6 +170,33 @@ impl WarmupPlan {
         Self::new(lanes, slice_rows, inner.supports_scheduled_speculation())
     }
 
+    pub(crate) fn minimal_for_backend<B: HybridSchedulerBackend>(
+        inner: &B,
+        slice_rows: u32,
+    ) -> Self {
+        let lanes = Self::lanes(
+            inner.scheduler_capacity(),
+            HybridSchedulerState::<B>::force_serial(),
+        );
+        Self::minimal(lanes, slice_rows, inner.supports_scheduled_speculation())
+    }
+
+    pub(crate) fn minimal(lanes: u32, slice_rows: u32, speculative: bool) -> Self {
+        let mut steps = vec![Step::MaxPrefill, Step::RestoreCopy];
+        steps.extend((2..=lanes).map(Step::Widen));
+        if speculative {
+            steps.push(Step::Speculative {
+                width: 1,
+                drafts: SHORT_DRAFTS,
+            });
+        }
+        Self {
+            lanes,
+            slice_rows,
+            steps,
+        }
+    }
+
     /// The granted lanes; one when every turn runs whole.
     pub(crate) fn lanes(capacity: usize, force_serial: bool) -> u32 {
         if force_serial {
@@ -432,7 +459,25 @@ pub(crate) fn serving_scheduler<B: HybridSchedulerBackend>(
     if !warm || !inner.scheduler_cache_available() {
         return Ok((HybridSchedulerState::new(inner)?, None));
     }
-    let warmed = run(inner, progress)?;
+    finish_serving_scheduler(run(inner, progress)?)
+}
+
+pub(crate) fn serving_scheduler_minimal<B: HybridSchedulerBackend>(
+    inner: B,
+    progress: &LoadProgressCell,
+    warm: bool,
+    slice_rows: u32,
+) -> Result<(HybridSchedulerState<B>, Option<WarmupReport>)> {
+    if !warm || !inner.scheduler_cache_available() {
+        return Ok((HybridSchedulerState::new(inner)?, None));
+    }
+    let plan = WarmupPlan::minimal_for_backend(&inner, slice_rows);
+    finish_serving_scheduler(run_plan(inner, progress, plan)?)
+}
+
+fn finish_serving_scheduler<B: HybridSchedulerBackend>(
+    warmed: Warmed<B>,
+) -> Result<(HybridSchedulerState<B>, Option<WarmupReport>)> {
     let report = &warmed.report;
     tracing::info!(
         target: "mlx_core::inference",
@@ -478,9 +523,18 @@ enum Attempt<B> {
 /// failure (the host or the Metal driver, 30 s); otherwise it fails the
 /// load.
 pub(crate) fn run_with<B: HybridSchedulerBackend>(
-    mut inner: B,
+    inner: B,
     progress: &LoadProgressCell,
     slice_rows: u32,
+) -> Result<Warmed<B>> {
+    let plan = WarmupPlan::for_backend(&inner, slice_rows);
+    run_plan(inner, progress, plan)
+}
+
+pub(crate) fn run_plan<B: HybridSchedulerBackend>(
+    mut inner: B,
+    progress: &LoadProgressCell,
+    plan: WarmupPlan,
 ) -> Result<Warmed<B>> {
     let started = Instant::now();
     let _start = StartScope::enter();
@@ -490,7 +544,7 @@ pub(crate) fn run_with<B: HybridSchedulerBackend>(
     let mut next_seq_id: SeqId = 1;
     let mut reset = 0;
     loop {
-        match attempt(inner, progress, slice_rows, next_seq_id)? {
+        match attempt(inner, progress, &plan, next_seq_id)? {
             Attempt::Warmed(mut warmed) => {
                 warmed.report.reset = warmed.report.reset.max(reset);
                 let pipelines_after = crate::engine::pipeline_counter::read();
@@ -545,10 +599,9 @@ pub(crate) fn run_with<B: HybridSchedulerBackend>(
 fn attempt<B: HybridSchedulerBackend>(
     mut inner: B,
     progress: &LoadProgressCell,
-    slice_rows: u32,
+    plan: &WarmupPlan,
     next_seq_id: SeqId,
 ) -> Result<Attempt<B>> {
-    let plan = WarmupPlan::for_backend(&inner, slice_rows);
     progress.begin_kernels(plan.steps.len() as u32);
     let attached = Snapshot::take(&inner);
     let held_tier = inner.hold_state_tier();
@@ -565,7 +618,7 @@ fn attempt<B: HybridSchedulerBackend>(
         idle,
         live: Vec::new(),
         progress,
-        plan: &plan,
+        plan,
         block_size,
         vocab,
         salt: format!("warmup-{:016x}", rand::random::<u64>()),
@@ -714,7 +767,6 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
             self.widen(width)?;
             self.done();
         }
-        self.cancel_oldest()?;
         let narrow: Vec<u32> = self
             .plan
             .steps
@@ -724,6 +776,9 @@ impl<B: HybridSchedulerBackend> Run<'_, B> {
                 _ => None,
             })
             .collect();
+        if !narrow.is_empty() {
+            self.cancel_oldest()?;
+        }
         for width in narrow {
             if !self.narrow(width)? {
                 self.skip(Step::Narrow(width));

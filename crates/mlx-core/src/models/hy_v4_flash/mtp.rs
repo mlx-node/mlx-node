@@ -174,7 +174,7 @@ impl KvRows {
         }
         let buf = self.buf.as_mut().ok_or_else(|| bad("K/V buffer missing"))?;
         buf.slice_assign_axis_inplace(0, start as i64, end as i64, &kv)?;
-        MxArray::eval_arrays_with_context(&[&*buf], "hy_v4_flash MTP K/V write")?;
+        super::stats::defer(&*buf, "hy_v4_flash MTP K/V write")?;
         self.len = end;
         Ok(())
     }
@@ -225,7 +225,7 @@ impl Seeds {
             out.push((start + r, row));
         }
         let live: Vec<&MxArray> = out.iter().map(|(_, a)| a).collect();
-        MxArray::eval_arrays_with_context(&live, "hy_v4_flash MTP seed")?;
+        super::stats::defer_many(&live, "hy_v4_flash MTP seed")?;
         Ok(out)
     }
 
@@ -635,6 +635,7 @@ impl MtpLayer {
         h: &MxArray,
         emb: &MxArray,
     ) -> Result<(MxArray, MxArray)> {
+        let _scope = super::stats::DeferScope::enter();
         let at = d.len();
         if at >= d.cap {
             return Err(bad(format!("draft row {at} past the {} rows held", d.cap)));
@@ -681,7 +682,7 @@ impl MtpLayer {
         let x = x.add(&f)?;
         let h = rms_norm(&x, &self.nextn()?.shared_head_norm, self.eps)?;
         let logits = head_rows(&h, model.weights().output())?;
-        MxArray::eval_arrays_with_context(&[&h, &logits], "hy_v4_flash MTP draft")?;
+        super::stats::flush("hy_v4_flash MTP draft")?;
         Ok((h.reshape(&[1, 1, self.dim])?, logits))
     }
 }
@@ -899,7 +900,16 @@ impl Lagged {
             .hidden
             .take()
             .ok_or_else(|| bad("the trunk returned no hidden rows"))?;
-        if let Err(e) = lag_chunk(m, model, d, start, ids, &h) {
+        let draft_mark = d.mark(start);
+        let lagged = {
+            let _scope = super::stats::DeferScope::enter();
+            lag_chunk(m, model, d, start, ids, &h)
+                .and_then(|()| super::stats::flush("hy_v4_flash MTP lag"))
+        };
+        if let Err(e) = lagged {
+            if let Some(dm) = draft_mark {
+                let _ = d.restore(&dm);
+            }
             return Err(match self.trunk.restore(&mark) {
                 Ok(()) => e,
                 Err(r) => bad(format!(
@@ -941,7 +951,15 @@ impl Lagged {
                 .seed(at)
                 .cloned()
                 .ok_or_else(|| bad(format!("no seed for trunk row {at}")))?;
-            m.commit(model, d, &seed, &[token])?;
+            let committed = {
+                let _scope = super::stats::DeferScope::enter();
+                m.commit(model, d, &seed, &[token])
+                    .and_then(|()| super::stats::flush("hy_v4_flash MTP lag"))
+            };
+            if let Err(e) = committed {
+                let _ = d.cut(at);
+                return Err(e);
+            }
         } else if at != p {
             return Err(bad(format!("a decode row at {p} with {at} draft rows")));
         }

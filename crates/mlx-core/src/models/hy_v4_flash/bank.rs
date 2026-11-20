@@ -55,6 +55,17 @@ pub const BAND_BYTES: u64 = 512 << 10;
 /// The streamed classes, in bank index order.
 pub const CLASSES: [ExpertClass; 2] = [ExpertClass::Q6kDown, ExpertClass::Q4kDown];
 
+/// Half-life of LFU-decay expert cache scores, in decode tokens.
+pub const LFU_HALF_LIFE_TOKENS: f64 = 256.0;
+
+fn use_lru_policy() -> bool {
+    std::env::var("MLX_HY4_CACHE_POLICY").is_ok_and(|v| v.eq_ignore_ascii_case("lru"))
+}
+
+fn lfu_half_life(n_layers: usize, n_used: usize) -> f64 {
+    (LFU_HALF_LIFE_TOKENS * (n_layers.max(1) * n_used.max(1)) as f64).max(1.0)
+}
+
 /// [`KqBank::residency`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Residency {
@@ -296,16 +307,11 @@ pub struct Directory {
 }
 
 impl Directory {
-    /// `staging` = 1 or 2 staging layers.
-    pub fn new(
-        staging: usize,
-        n_layers: usize,
-        n_experts: usize,
-        cache_slots: usize,
-    ) -> Result<Self> {
+    fn with_cache(staging: usize, n_layers: usize, n_experts: usize, cache: Cache) -> Result<Self> {
         if !(1..=2).contains(&staging) {
             return Err(bad(format!("{staging} staging layers (1 or 2)")));
         }
+        let cache_slots = cache.slots();
         if n_experts == 0 || u32::try_from(staging * n_experts + cache_slots).is_err() {
             return Err(bad(format!(
                 "{staging} x {n_experts} staging + {cache_slots} cache slots"
@@ -317,8 +323,51 @@ impl Directory {
             n_experts,
             tags: vec![None; staging * n_experts],
             stage_use: vec![0; staging * n_experts],
-            cache: Cache::lru(cache_slots, n_layers, n_experts),
+            cache,
         })
+    }
+
+    /// `staging` = 1 or 2 staging layers.
+    pub fn new(
+        staging: usize,
+        n_layers: usize,
+        n_experts: usize,
+        cache_slots: usize,
+    ) -> Result<Self> {
+        Self::with_cache(
+            staging,
+            n_layers,
+            n_experts,
+            Cache::lru(cache_slots, n_layers, n_experts),
+        )
+    }
+
+    /// `staging` = 1 or 2 staging layers; uses LFU-decay unless
+    /// `MLX_HY4_CACHE_POLICY=lru`.
+    pub fn new_with_lfu(
+        staging: usize,
+        n_layers: usize,
+        n_experts: usize,
+        cache_slots: usize,
+        half_life_uses: f64,
+    ) -> Result<Self> {
+        if !half_life_uses.is_finite() || half_life_uses <= 0.0 {
+            return Err(bad(format!("LFU half-life {half_life_uses}")));
+        }
+        let cache = if use_lru_policy() {
+            Cache::lru(cache_slots, n_layers, n_experts)
+        } else {
+            Cache::lfu_decay(cache_slots, n_layers, n_experts, half_life_uses)
+        };
+        Self::with_cache(staging, n_layers, n_experts, cache)
+    }
+
+    pub fn has_staged(&self) -> bool {
+        self.cache.has_staged()
+    }
+
+    pub fn has_unsettled(&self) -> bool {
+        self.cache.completed() < self.cache.epoch()
     }
 
     pub fn staging_layers(&self) -> usize {
@@ -850,6 +899,7 @@ struct Inner {
 pub struct KqBank {
     pool: IoPool,
     n_experts: usize,
+    n_used: usize,
     layout: ClassLayout,
     inner: Mutex<Inner>,
     stats: Mutex<[KqStats; 2]>,
@@ -886,7 +936,13 @@ impl KqBank {
                     None => Err(bad(format!("layer {il} has no experts"))),
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let dir = Directory::new(staging, layers.len(), n, cache_slots[ci])?;
+            let dir = Directory::new_with_lfu(
+                staging,
+                layers.len(),
+                n,
+                cache_slots[ci],
+                lfu_half_life(layers.len(), moe.n_used),
+            )?;
             let proj = if layers.is_empty() {
                 Vec::new()
             } else {
@@ -903,6 +959,7 @@ impl KqBank {
         Ok(Self {
             pool,
             n_experts: n,
+            n_used: moe.n_used,
             layout,
             inner: Mutex::new(Inner {
                 classes: banks,
@@ -1094,8 +1151,15 @@ impl KqBank {
         if !g.in_turn {
             return Ok(0);
         }
-        crate::array::synchronize();
-        let moved = self.promote(&mut g)?;
+        let any_staged = g.classes.iter().any(|c| c.dir.has_staged());
+        let moved = if any_staged {
+            if g.classes.iter().any(|c| c.dir.has_unsettled()) {
+                crate::array::synchronize();
+            }
+            self.promote(&mut g)?
+        } else {
+            0
+        };
         if seed_reset {
             for c in &mut g.classes {
                 c.dir.new_turn();
@@ -1117,11 +1181,12 @@ impl KqBank {
             if c.tensors.is_empty() && cache_slots[ci] > 0 {
                 return Err(bad(format!("{:?} has no layers but cache slots", c.class)));
             }
-            dirs.push(Directory::new(
+            dirs.push(Directory::new_with_lfu(
                 staging,
                 c.tensors.len(),
                 n,
                 cache_slots[ci],
+                lfu_half_life(c.tensors.len(), self.n_used),
             )?);
         }
         let inner = &mut *g;

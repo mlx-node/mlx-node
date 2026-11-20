@@ -292,19 +292,35 @@ impl OwnerCell {
     /// (its mark when it holds one there); false when a part no longer
     /// holds them.
     pub fn rewind(&mut self, len: usize, history: &[u32]) -> bool {
-        if let Some(m) = self.mark.take()
+        let ok = if let Some(m) = self.mark.take()
             && m.len == len
         {
-            return self.restore_mark(m).is_ok();
+            self.restore_mark(m).is_ok()
+        } else if self.len > len {
+            self.truncate(len, history).is_ok()
+        } else {
+            self.layers.iter_mut().all(|p| match p {
+                CellLayer::Window(r) if r.len() > len => r.truncate(len).is_ok(),
+                CellLayer::Index(ix) if ix.len() > len => ix.truncate(len).is_ok(),
+                _ => true,
+            })
+        };
+        if ok {
+            let live: Vec<&MxArray> = self
+                .layers
+                .iter()
+                .filter_map(|p| match p {
+                    CellLayer::Window(r) => r.rows(),
+                    CellLayer::Index(_) => None,
+                })
+                .collect();
+            if !live.is_empty()
+                && MxArray::eval_arrays_with_context(&live, "hy_v4_flash window rewind").is_err()
+            {
+                return false;
+            }
         }
-        if self.len > len {
-            return self.truncate(len, history).is_ok();
-        }
-        self.layers.iter_mut().all(|p| match p {
-            CellLayer::Window(r) if r.len() > len => r.truncate(len).is_ok(),
-            CellLayer::Index(ix) if ix.len() > len => ix.truncate(len).is_ok(),
-            _ => true,
-        })
+        ok
     }
 
     /// Records a step that appended `ids` to every trunk layer.

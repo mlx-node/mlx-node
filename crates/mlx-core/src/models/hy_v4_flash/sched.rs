@@ -846,6 +846,7 @@ impl Run<'_> {
             cell.advance(r.ids)?;
         }
         if let Some(m) = self.mtp {
+            let _scope = stats::DeferScope::enter();
             for ((cell, r), (out, &start)) in
                 cells.iter_mut().zip(rows).zip(outs.iter().zip(starts))
             {
@@ -865,6 +866,7 @@ impl Run<'_> {
                     .ok_or_else(|| bad("the wave returned no hidden rows"))?;
                 lag_chunk(m, self.model, d, start, r.ids, h)?;
             }
+            stats::flush("hy_v4_flash MTP lag")?;
         }
         Ok(outs)
     }
@@ -1219,13 +1221,13 @@ impl Inner {
             return Ok(());
         };
         let due = p.safe.step();
-        let kv = p.pool_bytes() + p.state_bytes();
         if let Err(e) = self.store.bank.safe_point(due.seed_reset) {
             tracing::warn!("hy_v4_flash safe point: {}", e.reason);
         }
         if !due.readmit {
             return Ok(());
         }
+        let kv = p.pool_bytes() + p.state_bytes();
         let checked = self.store.recheck(kv);
         readmit(checked, || self.end())
     }
@@ -1808,21 +1810,31 @@ impl Inner {
         let target = params.sampling_config.unwrap_or_default();
         let greedy = crate::sampling::is_greedy_temperature(target.temperature.unwrap_or(1.0));
         let cfg = crate::models::qwen3_5::mtp_decode::mtp_draft_sampling_config(target);
-        for _ in 0..n {
+        for step in 0..n {
             let tok = MxArray::from_uint32(&[token], &[1])?;
             let emb = self.store.model.weights().token_embd().rows(&tok)?;
             let (next, logits) = self.draft_row(seq, &h, &emb)?;
             let logits = logits.reshape(&[-1])?;
-            let id = if greedy {
-                logits.argmax(-1, None)?.astype(DType::Int32)?
+            let (id, dist) = if greedy {
+                (logits.argmax(-1, None)?.astype(DType::Int32)?, None)
             } else {
                 let dist = crate::sampling::sampling_distribution(&logits, Some(cfg))?
                     .astype(DType::Float32)?;
                 let id = crate::sampling::sample_dense_distribution_array(&dist, &mut *rng)?;
-                out.draft_dists.push(dist);
-                id
+                (id, Some(dist))
             };
-            MxArray::eval_arrays_with_context(&[&id], "hy_v4_flash MTP proposal")?;
+            let mut eval_targets: Vec<&MxArray> = Vec::with_capacity(3);
+            eval_targets.push(&id);
+            if let Some(d) = dist.as_ref() {
+                eval_targets.push(d);
+            }
+            if step + 1 < n {
+                eval_targets.push(&next);
+            }
+            stats::eval(&eval_targets, "hy_v4_flash MTP proposal")?;
+            if let Some(d) = dist {
+                out.draft_dists.push(d);
+            }
             let id = id.item_at_int32(0)?;
             token = u32::try_from(id).map_err(|_| bad(format!("draft id {id}")))?;
             out.draft_ids.push(id);

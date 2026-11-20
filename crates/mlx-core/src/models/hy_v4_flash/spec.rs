@@ -323,7 +323,15 @@ impl MtpStepper for Flat<'_> {
         let (model, mtp, keep) = (self.model, self.mtp, self.committed);
         let d = self.draft_mut()?;
         d.cut(keep)?;
-        mtp.commit(model, d, &hs, committed_ids)?;
+        let committed = {
+            let _scope = super::stats::DeferScope::enter();
+            mtp.commit(model, d, &hs, committed_ids)
+                .and_then(|()| super::stats::flush("hy_v4_flash MTP commit"))
+        };
+        if let Err(e) = committed {
+            let _ = d.cut(keep);
+            return Err(e);
+        }
         let rows = d.len();
         self.committed = rows;
         Ok(())

@@ -906,10 +906,82 @@ impl Model {
     /// Every owner's outputs from its rows of `x [r, hc, d]`, evaluated
     /// together with `x` and what `stats::defer` holds.
     fn heads(&self, x: &MxArray, owners: &dyn Owners, wave: &Wave) -> Result<Vec<Output>> {
-        let mut outs = Vec::with_capacity(wave.owners());
-        for i in 0..wave.owners() {
+        let kind = wave.kind();
+        let n_owners = wave.owners();
+        let mut outs = Vec::with_capacity(n_owners);
+        let mut logit_hs: Vec<MxArray> = Vec::new();
+        let mut logit_spans: Vec<(usize, i64, i64)> = Vec::new();
+        let mut row_off = 0i64;
+        for i in 0..n_owners {
             let xo = wave.owner_rows(x, i)?;
-            outs.push(self.head(&xo, owners.want(i), wave.kind())?);
+            let want = owners.want(i);
+            let hidden = if want.hidden {
+                Some(self.trunk_rows(&xo, kind)?)
+            } else {
+                None
+            };
+            let h = match want.logits {
+                Logits::None => None,
+                Logits::All => Some(match &hidden {
+                    Some(h) => h.clone(),
+                    None => self.trunk_rows(&xo, kind)?,
+                }),
+                Logits::Last => {
+                    let n = xo.shape_at(0)?;
+                    // In Prefill with n > 1, hidden used a multi-row matmul whose rounding
+                    // differs from a 1-row matmul, so compute the last row alone.
+                    let h = match &hidden {
+                        Some(h) if n == 1 => h.clone(),
+                        Some(h) if kind == RowKind::Decode => {
+                            h.slice(&[n - 1, 0], &[n, h.shape_at(1)?])?
+                        }
+                        _ => {
+                            let (hc, d) = (xo.shape_at(1)?, xo.shape_at(2)?);
+                            let last = if n == 1 {
+                                xo
+                            } else {
+                                xo.slice(&[n - 1, 0, 0], &[n, hc, d])?
+                            };
+                            self.trunk_out(&last)?
+                        }
+                    };
+                    Some(h)
+                }
+            };
+            if let Some(h) = h {
+                let rows = h.shape_at(0)?;
+                logit_spans.push((i, row_off, rows));
+                row_off += rows;
+                logit_hs.push(h);
+            }
+            outs.push(Output {
+                logits: None,
+                hidden,
+            });
+        }
+        if !logit_hs.is_empty() {
+            let head = self.weights.output();
+            let all_h = if logit_hs.len() == 1 {
+                logit_hs.swap_remove(0)
+            } else {
+                MxArray::concatenate_many(logit_hs.iter().collect(), Some(0))?
+            };
+            let all_logits = if group(Op::VocabHead, kind) != Group::Row
+                && n_owners == 1
+                && owners.want(0).logits == Logits::All
+            {
+                head_logits(&all_h, head)?
+            } else {
+                head_rows(&all_h, head)?
+            };
+            if logit_spans.len() == 1 {
+                outs[logit_spans[0].0].logits = Some(all_logits);
+            } else {
+                let vocab = all_logits.shape_at(1)?;
+                for &(owner, lo, rows) in &logit_spans {
+                    outs[owner].logits = Some(all_logits.slice(&[lo, 0], &[lo + rows, vocab])?);
+                }
+            }
         }
         let live: Vec<&MxArray> = std::iter::once(x)
             .chain(
@@ -919,36 +991,5 @@ impl Model {
             .collect();
         super::stats::eval(&live, "hy_v4_flash head")?;
         Ok(outs)
-    }
-
-    /// One owner's outputs. Last-row logits come from the last row's
-    /// streams alone, so they do not depend on `want.hidden` or `kind`.
-    fn head(&self, x: &MxArray, want: Want, kind: RowKind) -> Result<Output> {
-        let head = self.weights.output();
-        let hidden = if want.hidden {
-            Some(self.trunk_rows(x, kind)?)
-        } else {
-            None
-        };
-        let logits = match want.logits {
-            Logits::None => None,
-            Logits::All => {
-                let h = match &hidden {
-                    Some(h) => h.clone(),
-                    None => self.trunk_rows(x, kind)?,
-                };
-                Some(match group(Op::VocabHead, kind) {
-                    Group::Row => head_rows(&h, head)?,
-                    Group::Fused | Group::Owner => head_logits(&h, head)?,
-                })
-            }
-            Logits::Last => {
-                let n = x.shape_at(0)?;
-                let (hc, d) = (x.shape_at(1)?, x.shape_at(2)?);
-                let last = x.slice(&[n - 1, 0, 0], &[n, hc, d])?;
-                Some(head_rows(&self.trunk_out(&last)?, head)?)
-            }
-        };
-        Ok(Output { logits, hidden })
     }
 }

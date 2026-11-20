@@ -72,6 +72,9 @@ pub const TEMPERATURE: f64 = 0.9;
 pub const TOP_P: f64 = 1.0;
 /// The engine's fail-closed arms key on this exact reason.
 pub const PREFILL_CANCELLED: &str = "prefill cancelled";
+/// Warmup prefill length: splits at replay row 64 into 64 + 32 rows so both
+/// `qmm_t` and ragged/small paths compile.
+const HY4_WARMUP_SLICE_ROWS: u32 = 96;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("hy_v4_flash: {msg}"))
@@ -1149,8 +1152,12 @@ impl HyV4FlashModel {
                 let telemetry = Arc::clone(&inner.telemetry);
                 let (engine, warmup) = match lanes {
                     Some(_) => {
-                        let (mut state, warmup) =
-                            crate::engine::warmup::serving_scheduler(inner, &cell, true)?;
+                        let (mut state, warmup) = crate::engine::warmup::serving_scheduler_minimal(
+                            inner,
+                            &cell,
+                            true,
+                            HY4_WARMUP_SLICE_ROWS,
+                        )?;
                         sched::serve(&mut state.inner, held);
                         (Engine::Paged(Box::new(state)), warmup)
                     }

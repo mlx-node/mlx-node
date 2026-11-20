@@ -583,6 +583,70 @@ fn window_ring_keeps_window_plus_slack() {
 }
 
 #[test]
+fn window_ring_defers_appends_and_truncates_within_slack_without_eval() {
+    use crate::models::hy_v4_flash::stats::{self, DeferScope};
+
+    let mut ring = WindowRing::new(4, WINDOW_SLACK, 2);
+    let mut latent = LatentBuf::new(16, 2);
+    // One-time buffer alloc happens outside the scope.
+    latent.write(&positions(0..1, 2), 0).unwrap();
+
+    {
+        let _scope = DeferScope::enter();
+        assert_eq!(stats::deferred(), 0);
+        let before_evals = stats::thread_evals();
+
+        // total <= keep (0 extra copy, deferred)
+        ring.append(&positions(0..5, 2), 0).unwrap();
+        assert_eq!(stats::deferred(), 1);
+        assert_eq!(stats::thread_evals(), before_evals);
+
+        // total - hold <= WINDOW_SLACK + 1 (slice view, deferred)
+        ring.append(&positions(5..8, 2), 5).unwrap();
+        assert_eq!(stats::deferred(), 2);
+        assert_eq!(stats::thread_evals(), before_evals);
+
+        // n >= keep (deep_copy cuts lineage, deferred)
+        ring.append(&positions(8..16, 2), 8).unwrap();
+        assert_eq!(stats::deferred(), 3);
+        assert_eq!(stats::thread_evals(), before_evals);
+
+        // LatentBuf write defers without eval
+        latent.write(&positions(1..3, 2), 1).unwrap();
+        assert_eq!(stats::deferred(), 4);
+        assert_eq!(stats::thread_evals(), before_evals);
+
+        stats::flush("test window flush").unwrap();
+        assert_eq!(stats::deferred(), 0);
+        assert_eq!(stats::thread_evals(), before_evals + 1);
+    }
+
+    // Outside DeferScope: truncate with drop <= WINDOW_SLACK triggers 0 evals
+    // and keeps snapshots independent with exact rollback contents.
+    let snap = ring.clone();
+    let want_snap = first_col(snap.rows().unwrap(), 2);
+    assert_eq!(want_snap, (9..16).map(|p| p as f32).collect::<Vec<_>>());
+
+    let before_evals = stats::thread_evals();
+    ring.truncate(16 - WINDOW_SLACK).unwrap();
+    assert_eq!(stats::thread_evals(), before_evals);
+    assert_eq!((ring.len(), ring.kept()), (13, 4));
+    assert_eq!(first_col(ring.rows().unwrap(), 2), vec![9., 10., 11., 12.]);
+
+    let replacement = positions(13..14, 2).mul_scalar(10.0).unwrap();
+    let (keys, first) = ring.append(&replacement, 13).unwrap();
+    assert_eq!(
+        (first, first_col(&keys, 2)),
+        (9, vec![9., 10., 11., 12., 130.])
+    );
+    assert_eq!(first_col(snap.rows().unwrap(), 2), want_snap);
+    assert_eq!(
+        first_col(latent.rows().unwrap(), 2)[..3].to_vec(),
+        vec![0., 1., 2.]
+    );
+}
+
+#[test]
 fn latent_buf_writes_rows_and_truncates_by_length() {
     let mut buf = LatentBuf::new(6, 2);
     assert!(buf.rows().is_err());

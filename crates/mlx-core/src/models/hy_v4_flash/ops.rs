@@ -16,7 +16,7 @@ use crate::nn::Activations;
 pub const HEAD_CHUNK: i64 = 16384;
 
 /// Calls of at most this many rows evaluate two head chunks per eval.
-pub const HEAD_PAIR_ROWS: i64 = 4;
+pub const HEAD_PAIR_ROWS: i64 = 16;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 ops: {msg}"))

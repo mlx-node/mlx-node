@@ -198,12 +198,16 @@ static EVALS: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static DEFERRED: RefCell<Vec<MxArray>> = const { RefCell::new(Vec::new()) };
     static DEFER_SCOPES: Cell<usize> = const { Cell::new(0) };
+    #[cfg(test)]
+    static THREAD_EVALS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Evaluates `outs` and every array [`defer`] holds, in one call: one
 /// counted host sync of a forward.
 pub fn eval(outs: &[&MxArray], what: &str) -> napi::Result<()> {
     EVALS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(test)]
+    THREAD_EVALS.with(|n| n.set(n.get() + 1));
     let held = DEFERRED.with(|d| std::mem::take(&mut *d.borrow_mut()));
     if held.is_empty() {
         return MxArray::eval_arrays_with_context(outs, what);
@@ -219,6 +223,22 @@ pub fn defer(a: &MxArray, what: &str) -> napi::Result<()> {
         return eval(&[a], what);
     }
     DEFERRED.with(|d| d.borrow_mut().push(a.clone()));
+    Ok(())
+}
+
+/// Inside a [`DeferScope`], `outs` are evaluated by the next [`eval`] or
+/// [`flush`] of this thread; outside one, now.
+pub fn defer_many(outs: &[&MxArray], what: &str) -> napi::Result<()> {
+    if outs.is_empty() {
+        return Ok(());
+    }
+    if DEFER_SCOPES.with(Cell::get) == 0 {
+        return eval(outs, what);
+    }
+    DEFERRED.with(|d| {
+        let mut held = d.borrow_mut();
+        held.extend(outs.iter().map(|a| (*a).clone()));
+    });
     Ok(())
 }
 
@@ -262,6 +282,11 @@ impl Drop for DeferScope {
 /// Host syncs of every forward so far (monotonic, process-wide).
 pub fn evals() -> u64 {
     EVALS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn thread_evals() -> u64 {
+    THREAD_EVALS.with(Cell::get)
 }
 
 /// One decode wave, as [`WaveLog::record`] takes it.

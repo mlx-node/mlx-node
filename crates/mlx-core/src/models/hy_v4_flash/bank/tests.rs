@@ -836,6 +836,91 @@ fn bank_drains_only_for_an_unsettled_staging_slot() {
     bank.end_turn().unwrap();
 }
 
+#[test]
+fn safe_point_syncs_only_when_staged_copies_are_unsettled() {
+    use crate::array::memory::TEST_SYNCHRONIZE_CALLS;
+    let (_dir, path, m, experts, _file) = bank_fixture();
+    let bank = KqBank::new(pool_over(&path, 4), &m, &experts, [2, 1], 1).unwrap();
+    let syncs = || TEST_SYNCHRONIZE_CALLS.with(std::cell::Cell::get);
+
+    // Nothing staged yet.
+    let at = syncs();
+    assert_eq!(bank.safe_point(false).unwrap(), 0);
+    assert_eq!(syncs(), at, "empty safe_point must not synchronize");
+
+    // Unsettled decode miss into cache victim (nothing staged).
+    let _v = bank.prepare(1, &[0], &[], true).unwrap();
+    let at = syncs();
+    assert_eq!(bank.safe_point(false).unwrap(), 0);
+    assert_eq!(
+        syncs(),
+        at,
+        "unsettled non-staged step must not synchronize"
+    );
+    bank.settle_all();
+
+    // Prefill class 0 (2 layers, 2 cache slots -> quota 1/layer): expert 1 seeds cache,
+    // expert 2 lands in staging. Decode then serves expert 2 from staging.
+    let _p1 = bank.prepare(1, &[1, 2], &[2, 1], false).unwrap();
+    bank.settle_all();
+    let _d1 = bank.prepare(1, &[2], &[], true).unwrap();
+    bank.settle_all();
+    let at = syncs();
+    assert_eq!(bank.safe_point(false).unwrap(), 1);
+    assert_eq!(syncs(), at, "settled staged copy must not synchronize");
+
+    // Quota spent for layer 1 this turn: prefill stages expert 4; decode serves it
+    // from staging without settling, so safe_point must synchronize before promote.
+    let _p2 = bank.prepare(1, &[4], &[], false).unwrap();
+    bank.settle_all();
+    let _d2 = bank.prepare(1, &[4], &[], true).unwrap();
+    let at = syncs();
+    assert_eq!(bank.safe_point(false).unwrap(), 1);
+    assert_eq!(syncs(), at + 1, "unsettled staged copy must synchronize");
+
+    // Subsequent safe_point with seed_reset still skips sync when nothing is staged.
+    let at = syncs();
+    assert_eq!(bank.safe_point(true).unwrap(), 0);
+    assert_eq!(syncs(), at);
+
+    bank.end_turn().unwrap();
+}
+
+#[test]
+fn lfu_directory_keeps_frequent_expert_over_recent_one_hit() {
+    let mut d = Directory::new_with_lfu(1, 1, 8, 2, 100.0).unwrap();
+    let p0 = d.plan(0, &[0], &[], true);
+    d.untag(0, &p0);
+    d.publish(0, &p0);
+    d.complete(p0.epoch);
+    for _ in 0..5 {
+        let h = d.plan(0, &[0], &[], true);
+        assert_eq!(h.hits, 1);
+        d.complete(h.epoch);
+    }
+    // More recently inserted one-hit expert.
+    let p1 = d.plan(0, &[1], &[], true);
+    d.untag(0, &p1);
+    d.publish(0, &p1);
+    d.complete(p1.epoch);
+
+    let p2 = d.plan(0, &[2], &[], true);
+    d.untag(0, &p2);
+    d.publish(0, &p2);
+    d.complete(p2.epoch);
+
+    assert!(
+        d.cache().lookup(0, 0).is_some(),
+        "repeatedly hit expert should stay cached"
+    );
+    assert!(
+        d.cache().lookup(0, 1).is_none(),
+        "recent one-hit expert should be evicted first"
+    );
+    assert!(d.cache().lookup(0, 2).is_some());
+    d.cache().check().unwrap();
+}
+
 fn real_scan() -> Scan {
     let dir = std::env::var("HY4_DIR").expect("HY4_DIR = directory of the two Hy4 shards");
     let paths = crate::models::deepseek_v41::chat::shard_paths(Path::new(&dir)).unwrap();

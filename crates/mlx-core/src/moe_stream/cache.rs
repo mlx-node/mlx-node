@@ -171,6 +171,7 @@ pub struct Cache {
     /// staging this turn (0 = none).
     staged_at: Vec<u64>,
     staged_tick: u64,
+    staged_pending: bool,
 }
 
 impl Cache {
@@ -188,13 +189,19 @@ impl Cache {
             seeded: vec![0; n_layers],
             staged_at: vec![0; n_layers * n_experts],
             staged_tick: 0,
+            staged_pending: false,
         }
+    }
+
+    pub fn has_staged(&self) -> bool {
+        self.staged_pending
     }
 
     /// A new turn: every layer's prefill seeding quota is full again.
     pub fn new_turn(&mut self) {
         self.seeded.fill(0);
         self.staged_at.fill(0);
+        self.staged_pending = false;
     }
 
     /// Turn end (all GPU work complete): every `(layer, e)` this turn
@@ -212,6 +219,7 @@ impl Cache {
             .map(|(k, &t)| (t, k))
             .collect();
         self.staged_at.fill(0);
+        self.staged_pending = false;
         let mut out = Vec::new();
         if self.occ.is_empty() || used.is_empty() {
             return out;
@@ -369,6 +377,7 @@ impl Cache {
                 let k = self.key(layer, wanted[i]);
                 self.staged_tick += 1;
                 self.staged_at[k] = self.staged_tick;
+                self.staged_pending = true;
             } else {
                 miss.push(i);
             }
@@ -448,6 +457,8 @@ impl Cache {
             self.unmap(s);
         }
         self.free = (0..self.occ.len() as u32).rev().collect();
+        self.staged_at.fill(0);
+        self.staged_pending = false;
     }
 
     /// `dir` and `occ` are inverse maps; free slots hold nothing and are
