@@ -5,13 +5,15 @@
 //! |---|---|
 //! | Q8_0 `token_embd` | `Dense::Q8` codes + f16 scales (row gathers) |
 //! | Q8_0 indexer compressor matrices | f32 array |
-//! | other Q8_0 | `Dense::Qmm` (f32 scales, bias `-128·s`) |
+//! | other Q8_0 | `Dense::SymQ8` codes + f16 scales (derived bias `-128·s`) |
 //! | F32 | f32 array |
 //! | BF16 (`output`, the MTP layer) | bf16 array (MTP compressor: f32) |
 //!
 //! Tensors of rank 3 (`attn_k_b` `[H, kv_lora, nope]`, `attn_v_b`
 //! `[H, v, kv_lora]`) are held as 2-D `[H·rows, k]`, the layout
 //! `Dense::grouped_qmm_t(x, H)` splits back into heads.
+
+use std::ffi::CString;
 
 use napi::{Error, Result};
 
@@ -20,7 +22,7 @@ use super::scan::{Located, Role, Scan};
 use crate::array::alloc::OutLayout;
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
-use crate::models::deepseek_v41::store::Dense;
+use crate::models::deepseek_v41::store::Weight;
 use crate::moe_stream::io::{AlignedBuf, Extent, ShardSet};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 use crate::utils::gguf_cpu_repack::decode_affine_band_into;
@@ -39,12 +41,199 @@ fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 weights: {msg}"))
 }
 
+/// A dense weight:
+/// - `Array`: plain f32 or bf16 array
+/// - `Q8`: Q8_0 codes (`[rows, k / 4]` u32) + f16 scales (`[rows, k / 32]` f16) for row gathers
+/// - `SymQ8`: symmetric Q8_0 codes + f16 scales with derived `-128 * scale` bias (34 B / 32 weights)
+/// - `Qmm`: affine-8 codes + explicit scales and biases (e.g. MTP requantized BF16)
+pub enum Dense {
+    Array(MxArray),
+    Q8 {
+        w: MxArray,
+        scales: MxArray,
+    },
+    SymQ8 {
+        w: MxArray,
+        scales: MxArray,
+    },
+    Qmm {
+        w: MxArray,
+        scales: MxArray,
+        biases: MxArray,
+    },
+}
+
+impl From<MxArray> for Dense {
+    fn from(a: MxArray) -> Self {
+        Self::Array(a)
+    }
+}
+
+fn sym_q8_f32_scales_biases(scales: &MxArray) -> Result<(MxArray, MxArray)> {
+    let s = scales.astype(DType::Float32)?;
+    let b = s.mul_scalar(-128.0)?;
+    Ok((s, b))
+}
+
+fn dequant_q8(w: &MxArray, scales: &MxArray) -> Result<MxArray> {
+    let (s, b) = sym_q8_f32_scales_biases(scales)?;
+    dequant_affine8(w, &s, &b)
+}
+
+fn dequant_affine8(w: &MxArray, s: &MxArray, b: &MxArray) -> Result<MxArray> {
+    let mode = CString::new("affine").map_err(|e| bad(e.to_string()))?;
+    // SAFETY: live arrays for the call; the bridge returns a new array or null.
+    let h = unsafe {
+        mlx_sys::mlx_dequantize(
+            w.as_raw_ptr(),
+            s.as_raw_ptr(),
+            b.as_raw_ptr(),
+            32,
+            8,
+            -1,
+            mode.as_ptr(),
+        )
+    };
+    MxArray::from_handle(h, "hy_v4_flash q8_0 dequantize")
+}
+
+fn qmm_t(x: &MxArray, w: &MxArray, s: &MxArray, b: &MxArray) -> Result<MxArray> {
+    let mode = CString::new("affine").map_err(|e| bad(e.to_string()))?;
+    // SAFETY: live arrays for the call; the bridge returns a new array or null.
+    let h = unsafe {
+        mlx_sys::mlx_quantized_matmul(
+            x.as_raw_ptr(),
+            w.as_raw_ptr(),
+            s.as_raw_ptr(),
+            b.as_raw_ptr(),
+            true,
+            32,
+            8,
+            mode.as_ptr(),
+        )
+    };
+    MxArray::from_handle(h, "hy_v4_flash q8_0 quantized_matmul")
+}
+
+impl Weight for Dense {
+    fn f32(&self) -> Result<MxArray> {
+        match self {
+            Self::Array(a) => a.astype(DType::Float32),
+            Self::Q8 { w, scales } | Self::SymQ8 { w, scales } => dequant_q8(w, scales),
+            Self::Qmm { w, scales, biases } => dequant_affine8(w, scales, biases),
+        }
+    }
+
+    fn mm_t(&self, x: &MxArray) -> Result<MxArray> {
+        match self {
+            Self::SymQ8 { w, scales } => {
+                let (s, b) = sym_q8_f32_scales_biases(scales)?;
+                qmm_t(x, w, &s, &b)
+            }
+            Self::Qmm { w, scales, biases } => qmm_t(x, w, scales, biases),
+            Self::Array(_) | Self::Q8 { .. } => x.matmul(&self.f32()?.transpose(Some(&[1, 0]))?),
+        }
+    }
+}
+
+impl Dense {
+    pub fn array(self) -> Result<MxArray> {
+        match self {
+            Self::Array(a) => Ok(a),
+            Self::Q8 { .. } | Self::SymQ8 { .. } | Self::Qmm { .. } => {
+                Err(bad("Q8_0 tensor where an f32 array is expected"))
+            }
+        }
+    }
+
+    pub fn is_qmm(&self) -> bool {
+        matches!(self, Self::SymQ8 { .. } | Self::Qmm { .. })
+    }
+
+    /// `(w, scales, biases)` for quantized matmul weights (`biases == None` for `SymQ8`).
+    pub fn qmm_parts(&self) -> Option<(&MxArray, &MxArray, Option<&MxArray>)> {
+        match self {
+            Self::SymQ8 { w, scales } => Some((w, scales, None)),
+            Self::Qmm { w, scales, biases } => Some((w, scales, Some(biases))),
+            Self::Array(_) | Self::Q8 { .. } => None,
+        }
+    }
+
+    pub fn shape_at(&self, axis: u32) -> Result<i64> {
+        match self {
+            Self::Array(a) => a.shape_at(axis),
+            Self::Q8 { w, scales } | Self::SymQ8 { w, scales } | Self::Qmm { w, scales, .. }
+                if axis + 1 == w.ndim()? =>
+            {
+                Ok(scales.shape_at(axis)? * 32)
+            }
+            Self::Q8 { w, .. } | Self::SymQ8 { w, .. } | Self::Qmm { w, .. } => w.shape_at(axis),
+        }
+    }
+
+    pub fn rows(&self, idx: &MxArray) -> Result<MxArray> {
+        match self {
+            Self::Array(a) => a.take(idx, 0),
+            Self::Q8 { w, scales } | Self::SymQ8 { w, scales } => {
+                dequant_q8(&w.take(idx, 0)?, &scales.take(idx, 0)?)
+            }
+            Self::Qmm { w, scales, biases } => dequant_affine8(
+                &w.take(idx, 0)?,
+                &scales.take(idx, 0)?,
+                &biases.take(idx, 0)?,
+            ),
+        }
+    }
+
+    pub fn row_range(&self, lo: i64, hi: i64) -> Result<Dense> {
+        let cut = |a: &MxArray| a.slice(&[lo, 0], &[hi, a.shape_at(1)?]);
+        Ok(match self {
+            Self::Array(a) => Self::Array(cut(a)?),
+            Self::Q8 { w, scales } => Self::Q8 {
+                w: cut(w)?,
+                scales: cut(scales)?,
+            },
+            Self::SymQ8 { w, scales } => Self::SymQ8 {
+                w: cut(w)?,
+                scales: cut(scales)?,
+            },
+            Self::Qmm { w, scales, biases } => Self::Qmm {
+                w: cut(w)?,
+                scales: cut(scales)?,
+                biases: cut(biases)?,
+            },
+        })
+    }
+
+    pub fn grouped_qmm_t(&self, x: &MxArray, g: i64) -> Result<Option<MxArray>> {
+        let r = |a: &MxArray| a.reshape(&[g, a.shape_at(0)? / g, a.shape_at(1)?]);
+        match self {
+            Self::SymQ8 { w, scales } => {
+                let (s, b) = sym_q8_f32_scales_biases(scales)?;
+                Ok(Some(qmm_t(x, &r(w)?, &r(&s)?, &r(&b)?)?))
+            }
+            Self::Qmm { w, scales, biases } => {
+                Ok(Some(qmm_t(x, &r(w)?, &r(scales)?, &r(biases)?)?))
+            }
+            Self::Array(_) | Self::Q8 { .. } => Ok(None),
+        }
+    }
+
+    pub fn nbytes(&self) -> usize {
+        match self {
+            Self::Array(a) => a.nbytes(),
+            Self::Q8 { w, scales } | Self::SymQ8 { w, scales } => w.nbytes() + scales.nbytes(),
+            Self::Qmm { w, scales, biases } => w.nbytes() + scales.nbytes() + biases.nbytes(),
+        }
+    }
+}
+
 /// What one resident tensor becomes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Form {
     /// Q8_0 as affine-8 codes + f16 scales (`Dense::Q8`).
     Codes,
-    /// Q8_0 as affine-8 codes + f32 scales and biases (`Dense::Qmm`).
+    /// Q8_0 as symmetric affine-8 codes + f16 scales (`Dense::SymQ8`).
     Qmm,
     /// An f32 array from F32, Q8_0 or BF16 data.
     F32,
@@ -88,8 +277,7 @@ pub fn form(role: Role, info: &GgufTensorInfo) -> Result<Form> {
 pub fn resident_bytes(role: Role, info: &GgufTensorInfo) -> Result<u64> {
     let n = info.num_elements()?;
     let r = match form(role, info)? {
-        Form::Codes => n.checked_add(n / 16),
-        Form::Qmm => n.checked_add(n / 4),
+        Form::Codes | Form::Qmm => n.checked_add(n / 16),
         Form::F32 => n.checked_mul(4),
         Form::Bf16 => n.checked_mul(2),
     };
@@ -258,18 +446,11 @@ fn q8_dense(info: &GgufTensorInfo, raw: &[u8], form: Form) -> Result<Dense> {
         a.reshape(&[rows, a.shape_at(nd.saturating_sub(1))?])
     };
     let (w, scales) = (fold(&dst.weight)?, fold(&scales)?);
+    MxArray::eval_arrays_with_context(&[&w, &scales], "hy_v4_flash q8 codes")?;
     if form == Form::Codes {
-        MxArray::eval_arrays_with_context(&[&w, &scales], "hy_v4_flash q8 codes")?;
         return Ok(Dense::Q8 { w, scales });
     }
-    let s = scales.astype(DType::Float32)?;
-    let b = s.mul_scalar(-128.0)?;
-    MxArray::eval_arrays_with_context(&[&w, &s, &b], "hy_v4_flash q8 scales")?;
-    Ok(Dense::Qmm {
-        w,
-        scales: s,
-        biases: b,
-    })
+    Ok(Dense::SymQ8 { w, scales })
 }
 
 /// One tensor's GGUF bytes as `form`. Model thread only (`alloc_uninit`).
@@ -420,36 +601,49 @@ impl HcWeights {
     }
 }
 
-/// Concatenates 2-D `Dense::Qmm` matrices along axis 0 into a single backing
-/// allocation and returns `(fused, zero_copy_views)` so resident RAM stays 1.00x.
-/// Returns `None` if fewer than 2 parts or any part is not a matching 2-D `Qmm`.
+/// Concatenates 2-D `Dense::SymQ8` or `Dense::Qmm` matrices along axis 0 into
+/// a single backing allocation and returns `(fused, zero_copy_views)` so
+/// resident RAM stays 1.00x. Returns `None` if fewer than 2 parts or any part
+/// does not match the others' variant, rank, width, or dtypes.
 pub(crate) fn fuse_qmm_rows(parts: &[&Dense]) -> Result<Option<(Dense, Vec<Dense>)>> {
     if parts.len() < 2 {
         return Ok(None);
     }
+    let sym = matches!(parts[0], Dense::SymQ8 { .. });
     let mut ws = Vec::with_capacity(parts.len());
     let mut ss = Vec::with_capacity(parts.len());
-    let mut bs = Vec::with_capacity(parts.len());
+    let mut bs = Vec::with_capacity(if sym { 0 } else { parts.len() });
     let mut rows = Vec::with_capacity(parts.len());
-    let mut expected: Option<(i64, i64, i64, DType, DType, DType)> = None;
+    let mut expected: Option<(i64, i64, Option<i64>, DType, DType, Option<DType>)> = None;
     for part in parts {
-        let Dense::Qmm { w, scales, biases } = part else {
-            return Ok(None);
+        let (w, scales, biases) = match (sym, part) {
+            (true, Dense::SymQ8 { w, scales }) => (w, scales, None),
+            (false, Dense::Qmm { w, scales, biases }) => (w, scales, Some(biases)),
+            _ => return Ok(None),
         };
-        if w.ndim()? != 2 || scales.ndim()? != 2 || biases.ndim()? != 2 {
+        if w.ndim()? != 2 || scales.ndim()? != 2 {
             return Ok(None);
         }
         let r = w.shape_at(0)?;
-        if r <= 0 || scales.shape_at(0)? != r || biases.shape_at(0)? != r {
+        if r <= 0 || scales.shape_at(0)? != r {
             return Ok(None);
         }
+        let (b_col, b_dt) = match biases {
+            Some(b) => {
+                if b.ndim()? != 2 || b.shape_at(0)? != r {
+                    return Ok(None);
+                }
+                (Some(b.shape_at(1)?), Some(b.dtype()?))
+            }
+            None => (None, None),
+        };
         let sig = (
             w.shape_at(1)?,
             scales.shape_at(1)?,
-            biases.shape_at(1)?,
+            b_col,
             w.dtype()?,
             scales.dtype()?,
-            biases.dtype()?,
+            b_dt,
         );
         match expected {
             None => expected = Some(sig),
@@ -458,17 +652,24 @@ pub(crate) fn fuse_qmm_rows(parts: &[&Dense]) -> Result<Option<(Dense, Vec<Dense
         }
         ws.push(w);
         ss.push(scales);
-        bs.push(biases);
+        if let Some(b) = biases {
+            bs.push(b);
+        }
         rows.push(r);
     }
     let w = MxArray::concatenate_many(ws, Some(0))?;
     let s = MxArray::concatenate_many(ss, Some(0))?;
-    let b = MxArray::concatenate_many(bs, Some(0))?;
-    MxArray::eval_arrays_with_context(&[&w, &s, &b], "hy_v4_flash fuse qmm")?;
-    let fused = Dense::Qmm {
-        w,
-        scales: s,
-        biases: b,
+    let fused = if sym {
+        MxArray::eval_arrays_with_context(&[&w, &s], "hy_v4_flash fuse sym q8")?;
+        Dense::SymQ8 { w, scales: s }
+    } else {
+        let b = MxArray::concatenate_many(bs, Some(0))?;
+        MxArray::eval_arrays_with_context(&[&w, &s, &b], "hy_v4_flash fuse qmm")?;
+        Dense::Qmm {
+            w,
+            scales: s,
+            biases: b,
+        }
     };
     let mut views = Vec::with_capacity(rows.len());
     let mut lo = 0i64;

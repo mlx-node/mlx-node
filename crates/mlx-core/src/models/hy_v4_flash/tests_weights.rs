@@ -5,11 +5,11 @@ use serde_json::Value;
 
 use super::scan::{Role, Scan};
 use super::weights::{
-    Form, OUTPUT, Resident, Residual, TOKEN_EMBD, bf16_into_f32, dense_from_raw, form, held_shape,
-    le_f32_into, le_u16_into, q8_0_into_f32, resident_bytes, role_resident,
+    Dense, Form, OUTPUT, Resident, Residual, TOKEN_EMBD, bf16_into_f32, dense_from_raw, form,
+    held_shape, le_f32_into, le_u16_into, q8_0_into_f32, resident_bytes, role_resident,
 };
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::store::{Dense, Weight};
+use crate::models::deepseek_v41::store::Weight;
 use crate::moe_stream::io::ShardSet;
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 
@@ -170,7 +170,7 @@ fn forms_follow_role_and_type() {
 fn resident_bytes_follow_the_form() {
     use GgufTensorType::{BF16, F32, Q8_0};
     let cases: [(&str, &[u64], GgufTensorType, u64); 5] = [
-        ("blk.0.attn_q_a.weight", &[64, 4], Q8_0, 256 + 64),
+        ("blk.0.attn_q_a.weight", &[64, 4], Q8_0, 256 + 16),
         (TOKEN_EMBD, &[64, 4], Q8_0, 256 + 16),
         (
             "blk.0.indexer_compressor_gate.weight",
@@ -226,7 +226,8 @@ fn rank_three_q8_qmm_groups_by_head() {
     );
     let raw = q8_0_raw(k * rows * h);
     let d = dense_from_raw(&i, &raw, Form::Qmm).unwrap();
-    assert!(matches!(d, Dense::Qmm { .. }));
+    assert!(matches!(d, Dense::SymQ8 { .. }));
+    assert_eq!(d.nbytes() as u64, resident_bytes(Role::Dense, &i).unwrap());
     assert_eq!(d.shape_at(0).unwrap(), (h * rows) as i64);
     assert_eq!(d.shape_at(1).unwrap(), k as i64);
     let mut exact = vec![0f32; k * rows * h];
@@ -548,5 +549,252 @@ fn fuse_qmm_rows_matches_separate_qlinear_bit_for_bit() {
             bits(&yc),
             "M={m} view 2"
         );
+    }
+}
+
+fn make_sym_q8(rows: usize, k: usize, seed: u64) -> Dense {
+    let n = rows * k;
+    let mut raw = Vec::with_capacity(n / 32 * 34);
+    let vals = lcg(seed, n);
+    let scale_norm = 1.0 / (k as f32).sqrt();
+    for blk in vals.as_chunks::<32>().0 {
+        let amax = blk
+            .iter()
+            .map(|v| (v * scale_norm).abs())
+            .fold(0.0f32, f32::max);
+        let d = half::f16::from_f32((amax / 127.0).max(1e-6));
+        let df = d.to_f32();
+        raw.extend(d.to_bits().to_le_bytes());
+        for &v in blk {
+            let q = ((v * scale_norm) / df).round().clamp(-127.0, 127.0) as i8;
+            raw.extend(q.to_le_bytes());
+        }
+    }
+    let inf = info("w", &[k as u64, rows as u64], GgufTensorType::Q8_0);
+    dense_from_raw(&inf, &raw, Form::Qmm).unwrap()
+}
+
+fn sym_to_explicit_qmm(d: &Dense) -> Dense {
+    let Dense::SymQ8 { w, scales } = d else {
+        panic!("expected SymQ8");
+    };
+    let s = scales.astype(DType::Float32).unwrap();
+    let b = s.mul_scalar(-128.0).unwrap();
+    MxArray::eval_arrays_with_context(&[w, &s, &b], "test explicit qmm").unwrap();
+    Dense::Qmm {
+        w: w.clone(),
+        scales: s,
+        biases: b,
+    }
+}
+
+#[test]
+fn sym_q8_decode_row_invariant_and_matches_f32_ref() {
+    use super::attention::grouped_mm_t_mgh;
+    use super::moe::qlinear;
+
+    crate::models::hy_v4_flash::exact_f32();
+
+    // Dense SymQ8: M = 1..=16 row-invariance, bit-identical to explicit F32 Qmm, <= 1e-5 vs F32 ref.
+    let (k, n) = (256usize, 96usize);
+    let sym = make_sym_q8(n, k, 701);
+    assert!(matches!(sym, Dense::SymQ8 { .. }));
+    assert_eq!(sym.nbytes(), n * k + (n * k) / 16);
+    let qmm = sym_to_explicit_qmm(&sym);
+    assert_eq!(qmm.nbytes(), n * k + (n * k) / 4);
+
+    let wf = sym.f32().unwrap();
+    let wt = wf.transpose(Some(&[1, 0])).unwrap();
+    let all_xs = lcg(702, 16 * k);
+    let mut single_bits = Vec::with_capacity(16);
+    for r in 0..16 {
+        let xr = MxArray::from_float32(&all_xs[r * k..(r + 1) * k], &[1, k as i64]).unwrap();
+        let y_sym = read(&qlinear(&xr, &sym).unwrap());
+        let y_qmm = read(&qlinear(&xr, &qmm).unwrap());
+        assert_eq!(bits(&y_sym), bits(&y_qmm), "M=1 row {r} SymQ8 vs Qmm");
+        let y_ref = read(&xr.matmul(&wt).unwrap());
+        let max_abs = y_sym
+            .iter()
+            .zip(&y_ref)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs <= 1e-5, "M=1 row {r} max_abs {max_abs:e}");
+        single_bits.push(bits(&y_sym));
+    }
+    for m in 2..=16usize {
+        let xm = MxArray::from_float32(&all_xs[..m * k], &[m as i64, k as i64]).unwrap();
+        let ym = read(&qlinear(&xm, &sym).unwrap());
+        let ym_qmm = read(&qlinear(&xm, &qmm).unwrap());
+        assert_eq!(bits(&ym), bits(&ym_qmm), "M={m} SymQ8 vs Qmm");
+        for (r, want) in single_bits.iter().enumerate().take(m) {
+            assert_eq!(&bits(&ym[r * n..(r + 1) * n]), want, "M={m} row {r}");
+        }
+    }
+
+    // Grouped SymQ8: M = 1..=16 row-invariance and <= 1e-5 vs F32 ref.
+    let (g, gk, gn) = (4usize, 192usize, 64usize);
+    let gsym = make_sym_q8(g * gn, gk, 703);
+    let gqmm = sym_to_explicit_qmm(&gsym);
+    let gwf = gsym
+        .f32()
+        .unwrap()
+        .reshape(&[g as i64, gn as i64, gk as i64])
+        .unwrap()
+        .transpose(Some(&[0, 2, 1]))
+        .unwrap();
+    let gxs = lcg(704, 16 * g * gk);
+    let mut g_single_bits = Vec::with_capacity(16);
+    for r in 0..16 {
+        let xr = MxArray::from_float32(
+            &gxs[r * g * gk..(r + 1) * g * gk],
+            &[1, g as i64, gk as i64],
+        )
+        .unwrap();
+        let y_sym = read(&grouped_mm_t_mgh(&gsym, &xr, g as i64).unwrap());
+        let y_qmm = read(&grouped_mm_t_mgh(&gqmm, &xr, g as i64).unwrap());
+        assert_eq!(bits(&y_sym), bits(&y_qmm), "grouped M=1 row {r}");
+        let y_ref = read(
+            &xr.transpose(Some(&[1, 0, 2]))
+                .unwrap()
+                .matmul(&gwf)
+                .unwrap()
+                .transpose(Some(&[1, 0, 2]))
+                .unwrap(),
+        );
+        let max_abs = y_sym
+            .iter()
+            .zip(&y_ref)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs <= 1e-5, "grouped M=1 row {r} max_abs {max_abs:e}");
+        g_single_bits.push(bits(&y_sym));
+    }
+    for m in 2..=16usize {
+        let xm =
+            MxArray::from_float32(&gxs[..m * g * gk], &[m as i64, g as i64, gk as i64]).unwrap();
+        let ym = read(&grouped_mm_t_mgh(&gsym, &xm, g as i64).unwrap());
+        for (r, want) in g_single_bits.iter().enumerate().take(m) {
+            assert_eq!(
+                &bits(&ym[r * g * gn..(r + 1) * g * gn]),
+                want,
+                "grouped M={m} row {r}"
+            );
+        }
+    }
+}
+
+#[test]
+fn q8_dense_prefill_nax_parity() {
+    use super::moe::{qlinear, with_prefill_q8_nax};
+
+    crate::models::hy_v4_flash::exact_f32();
+
+    // Cover M in {17, 45, 64, 77, 256, 2048} and K in {192, 512, 1024, 3072, 16384},
+    // including unaligned M and unaligned N.
+    let cases: [(usize, usize, usize); 11] = [
+        (17, 64, 48),
+        (45, 192, 96),
+        (77, 512, 128),
+        (64, 192, 128),
+        (64, 512, 96),
+        (256, 1024, 256),
+        (256, 3072, 192),
+        (2048, 512, 128),
+        (2048, 3072, 256),
+        (64, 16384, 128),
+        (256, 16384, 64),
+    ];
+    for (ci, &(m, k, n)) in cases.iter().enumerate() {
+        let sym = make_sym_q8(n, k, 800 + ci as u64 * 17);
+        let qmm = sym_to_explicit_qmm(&sym);
+        let xs = lcg(900 + ci as u64 * 19, m * k);
+        let x = MxArray::from_float32(&xs, &[m as i64, k as i64]).unwrap();
+
+        let wf = sym.f32().unwrap();
+        let y_ref = read(&x.matmul(&wf.transpose(Some(&[1, 0])).unwrap()).unwrap());
+
+        let y_nax = with_prefill_q8_nax(true, || read(&qlinear(&x, &sym).unwrap()));
+        let rel_sym = rel_l2(&y_nax, &y_ref);
+        assert!(
+            rel_sym < 1e-3,
+            "dense prefill SymQ8 M={m} K={k} N={n}: rel_l2={rel_sym:e}"
+        );
+
+        let y_qmm = with_prefill_q8_nax(true, || read(&qlinear(&x, &qmm).unwrap()));
+        let rel_qmm = rel_l2(&y_qmm, &y_ref);
+        assert!(
+            rel_qmm < 1e-3,
+            "dense prefill Qmm M={m} K={k} N={n}: rel_l2={rel_qmm:e}"
+        );
+
+        if m == 64 && k == 192 {
+            let y_fb = with_prefill_q8_nax(false, || read(&qlinear(&x, &sym).unwrap()));
+            let rel_fb = rel_l2(&y_fb, &y_ref);
+            assert!(
+                rel_fb < 1e-4,
+                "fallback M={m} K={k} N={n}: rel_l2={rel_fb:e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn q8_grouped_prefill_nax_parity() {
+    use super::attention::grouped_mm_t_mgh;
+    use super::moe::with_prefill_q8_nax;
+
+    crate::models::hy_v4_flash::exact_f32();
+
+    // k_b (K=192, N=512) and v_b (K=512, N=256) across M = 17, 64, 256, 2048.
+    let cases: [(usize, usize, usize, usize); 7] = [
+        (17, 4, 192, 512),
+        (64, 4, 192, 512),
+        (256, 4, 192, 512),
+        (2048, 2, 192, 512),
+        (64, 4, 512, 256),
+        (256, 4, 512, 256),
+        (2048, 2, 512, 256),
+    ];
+    for (ci, &(m, g, k, n)) in cases.iter().enumerate() {
+        let sym = make_sym_q8(g * n, k, 1000 + ci as u64 * 23);
+        let qmm = sym_to_explicit_qmm(&sym);
+        let xs = lcg(1100 + ci as u64 * 29, m * g * k);
+        let x = MxArray::from_float32(&xs, &[m as i64, g as i64, k as i64]).unwrap();
+
+        let wf = sym
+            .f32()
+            .unwrap()
+            .reshape(&[g as i64, n as i64, k as i64])
+            .unwrap()
+            .transpose(Some(&[0, 2, 1]))
+            .unwrap();
+        let y_ref = read(
+            &x.transpose(Some(&[1, 0, 2]))
+                .unwrap()
+                .matmul(&wf)
+                .unwrap()
+                .transpose(Some(&[1, 0, 2]))
+                .unwrap(),
+        );
+
+        let y_sym = with_prefill_q8_nax(true, || {
+            read(&grouped_mm_t_mgh(&sym, &x, g as i64).unwrap())
+        });
+        let rel_sym = rel_l2(&y_sym, &y_ref);
+        assert!(
+            rel_sym < 1e-3,
+            "grouped prefill SymQ8 M={m} G={g} K={k} N={n}: rel_l2={rel_sym:e}"
+        );
+
+        if m == 64 {
+            let y_qmm = with_prefill_q8_nax(true, || {
+                read(&grouped_mm_t_mgh(&qmm, &x, g as i64).unwrap())
+            });
+            let rel_qmm = rel_l2(&y_qmm, &y_ref);
+            assert!(
+                rel_qmm < 1e-3,
+                "grouped prefill Qmm M={m} G={g} K={k} N={n}: rel_l2={rel_qmm:e}"
+            );
+        }
     }
 }

@@ -75,36 +75,43 @@ for (int k_idx = int(simd_gid); k_idx < KMAX; k_idx += BN) {
 
   float kreg[V_PER_LANE];
   float rreg[R_PER_LANE];
-  if (SPLIT) {
+  if constexpr (SPLIT) {
     const size_t base = size_t(slot) * size_t(HALF);
-    if (int(simd_lid) < K_LANES) {
-      const size_t v_off = base + size_t(simd_lid) * size_t(V_PER_LANE);
-      for (int j = 0; j < V_PER_LANE; ++j) {
-        kreg[j] = float(k0[v_off + size_t(j)]);
-      }
-    } else {
-      const size_t v_off =
-          base + size_t(int(simd_lid) - K_LANES) * size_t(V_PER_LANE);
-      for (int j = 0; j < V_PER_LANE; ++j) {
-        kreg[j] = float(k1[v_off + size_t(j)]);
-      }
+    const device half4* kp = (int(simd_lid) < K_LANES)
+        ? reinterpret_cast<const device half4*>(
+              k0 + base + size_t(simd_lid) * size_t(V_PER_LANE))
+        : reinterpret_cast<const device half4*>(
+              k1 + base + size_t(int(simd_lid) - K_LANES) * size_t(V_PER_LANE));
+#pragma unroll
+    for (int g = 0; g < V_PER_LANE / 4; ++g) {
+      const float4 vf = float4(kp[g]);
+      kreg[g * 4 + 0] = vf.x;
+      kreg[g * 4 + 1] = vf.y;
+      kreg[g * 4 + 2] = vf.z;
+      kreg[g * 4 + 3] = vf.w;
     }
     const size_t r_off =
         base + size_t(D_V - HALF) + size_t(simd_lid) * size_t(R_PER_LANE);
-    for (int j = 0; j < R_PER_LANE; ++j) {
-      rreg[j] = float(k1[r_off + size_t(j)]);
-    }
+    const float2 rf = float2(*reinterpret_cast<const device half2*>(k1 + r_off));
+    rreg[0] = rf.x;
+    rreg[1] = rf.y;
   } else {
     const size_t base = size_t(slot) * size_t(D_K);
-    const size_t v_off = base + size_t(simd_lid) * size_t(V_PER_LANE);
-    for (int j = 0; j < V_PER_LANE; ++j) {
-      kreg[j] = float(k0[v_off + size_t(j)]);
+    const device half4* kp = reinterpret_cast<const device half4*>(
+        k0 + base + size_t(simd_lid) * size_t(V_PER_LANE));
+#pragma unroll
+    for (int g = 0; g < V_PER_LANE / 4; ++g) {
+      const float4 vf = float4(kp[g]);
+      kreg[g * 4 + 0] = vf.x;
+      kreg[g * 4 + 1] = vf.y;
+      kreg[g * 4 + 2] = vf.z;
+      kreg[g * 4 + 3] = vf.w;
     }
     const size_t r_off =
         base + size_t(D_V) + size_t(simd_lid) * size_t(R_PER_LANE);
-    for (int j = 0; j < R_PER_LANE; ++j) {
-      rreg[j] = float(k0[r_off + size_t(j)]);
-    }
+    const float2 rf = float2(*reinterpret_cast<const device half2*>(k0 + r_off));
+    rreg[0] = rf.x;
+    rreg[1] = rf.y;
   }
 
   for (int h = 0; h < HEADS; ++h) {

@@ -1,26 +1,26 @@
 {
- "rules": "token_embd Q8_0 -> q8 codes n + n/16; other Q8_0 -> Qmm n + n/4 (u8 codes + f32 scale + f32 bias per 32); indexer_compressor_{value,gate} -> f32 n*4; F32/BF16 as stored (DS/store.rs:96-126, plan S3). Routed experts and the Engram table are not resident.",
+ "rules": "token_embd Q8_0 -> q8 codes n + n/16; other Q8_0 -> SymQ8 n + n/16 (u8 codes + f16 scale per 32, derived -128*s bias); indexer_compressor_{value,gate} -> f32 n*4; F32/BF16 as stored. Routed experts and the Engram table are not resident.",
  "trunk_dense": {
   "by_category": {
    "attention_kb_vb": {
     "tensors": 84,
     "file_bytes": 561512448,
-    "resident_bytes": 660602880
+    "resident_bytes": 561512448
    },
    "attention_mats": {
     "tensors": 210,
     "file_bytes": 4711440384,
-    "resident_bytes": 5542871040
+    "resident_bytes": 4711440384
    },
    "dense_ffn": {
     "tensors": 3,
     "file_bytes": 135364608,
-    "resident_bytes": 159252480
+    "resident_bytes": 135364608
    },
    "engram_small": {
     "tensors": 24,
     "file_bytes": 100982784,
-    "resident_bytes": 118677504
+    "resident_bytes": 100982784
    },
    "hc_head": {
     "tensors": 3,
@@ -35,12 +35,12 @@
    "indexer": {
     "tensors": 96,
     "file_bytes": 34566144,
-    "resident_bytes": 41324544
+    "resident_bytes": 35721216
    },
    "latent_proj": {
     "tensors": 82,
     "file_bytes": 411107328,
-    "resident_bytes": 483655680
+    "resident_bytes": 411107328
    },
    "norms": {
     "tensors": 253,
@@ -60,7 +60,7 @@
    "shared_expert": {
     "tensors": 123,
     "file_bytes": 616660992,
-    "resident_bytes": 725483520
+    "resident_bytes": 616660992
    },
    "sinks": {
     "tensors": 42,
@@ -97,14 +97,14 @@
    "qmm_affine8": {
     "tensors": 530,
     "file_bytes": 6568108032,
-    "resident_bytes": 7727185920
+    "resident_bytes": 6568108032
    }
   },
   "tensors": 1256,
   "file_bytes": 8002029876,
   "file_gib": 7.452471066266298,
-  "resident_bytes": 9162262836,
-  "resident_gib": 8.533022213727236
+  "resident_bytes": 8003184948,
+  "resident_gib": 7.453546825796366
  },
  "routed_experts_trunk": {
   "file_bytes": 89492815872,

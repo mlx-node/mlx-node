@@ -8,7 +8,7 @@
   "slot": 4663296,
   "n_experts": 1024,
   "staging_layer": 4775215104,
-  "dense_trunk": 9162262836,
+  "dense_trunk": 8003184948,
   "dense_mtp_plan": 2189929600,
   "contexts": [
    16384,
@@ -41,7 +41,7 @@
   "min_context": 16384
  },
  "profile": {
-  "source": "PLAN-addons §1.6-1.7; DS constants budget.rs:25-47 are placeholders until R-11",
+  "source": "PLAN-addons \u00a71.6-1.7; DS constants budget.rs:25-47 are placeholders until R-11",
   "KV_BASE": 10485760,
   "kv_fixed_ladder": 157286400,
   "kv_per_ctx_mtp_on": 15812,
@@ -61,7 +61,7 @@
  "c_rule": "walk ctx from max_context halving down to min_context; at a ctx take the largest C in {8192, 4096, 2048} admitted with cache >= SECOND_STAGING_MIN_CACHE, else 2048 if admitted, else halve ctx; none at min_context = load fails",
  "variants": {
   "mtp_on": {
-   "dense": 11352192436,
+   "dense": 10193114548,
    "kv_per_ctx": 15812,
    "rows": [
     {
@@ -69,7 +69,7 @@
      "chunk_rows": 8192,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 512203161,
       "compute": 10563401437,
@@ -78,7 +78,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.47702636662870646,
       "compute": 9.837934223003685,
@@ -89,15 +89,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 34922247722,
+     "fixed1": 33763169834,
      "staging_layers": 2,
-     "fixed": 39697462826,
-     "cache_slots": 12073,
-     "cache_bytes": 56299972608,
-     "wired_limit": 95997435434,
+     "fixed": 38538384938,
+     "cache_slots": 12322,
+     "cache_bytes": 57461133312,
+     "wired_limit": 95999518250,
      "bound": "WorkingSet",
-     "fixed_gib": 36.97114328481257,
-     "cache_gib": 52.43343544006348,
+     "fixed_gib": 35.89166788198054,
+     "cache_gib": 53.51485061645508,
      "budget_gib": 89.40696716308594
     },
     {
@@ -105,7 +105,7 @@
      "chunk_rows": 8192,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 512203161,
       "compute": 10563401437,
@@ -114,7 +114,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.47702636662870646,
       "compute": 9.837934223003685,
@@ -125,15 +125,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 34922247722,
+     "fixed1": 33763169834,
      "staging_layers": 2,
-     "fixed": 39697462826,
-     "cache_slots": 6684,
-     "cache_bytes": 31169470464,
-     "wired_limit": 70866933290,
+     "fixed": 38538384938,
+     "cache_slots": 6932,
+     "cache_bytes": 32325967872,
+     "wired_limit": 70864352810,
      "bound": "Live",
-     "fixed_gib": 36.97114328481257,
-     "cache_gib": 29.028831481933594,
+     "fixed_gib": 35.89166788198054,
+     "cache_gib": 30.10590362548828,
      "budget_gib": 66.0
     },
     {
@@ -141,7 +141,7 @@
      "chunk_rows": 8192,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 512203161,
       "compute": 10563401437,
@@ -150,7 +150,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.47702636662870646,
       "compute": 9.837934223003685,
@@ -161,15 +161,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 34922247722,
+     "fixed1": 33763169834,
      "staging_layers": 1,
-     "fixed": 34922247722,
-     "cache_slots": 800,
-     "cache_bytes": 3730636800,
-     "wired_limit": 38652884522,
+     "fixed": 33763169834,
+     "cache_slots": 1048,
+     "cache_bytes": 4887134208,
+     "wired_limit": 38650304042,
      "bound": "Live",
-     "fixed_gib": 32.52387765981257,
-     "cache_gib": 3.47442626953125,
+     "fixed_gib": 31.44440225698054,
+     "cache_gib": 4.5514984130859375,
      "budget_gib": 36.0
     },
     {
@@ -177,7 +177,7 @@
      "chunk_rows": 4096,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 512203161,
       "compute": 6768680259,
@@ -186,7 +186,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.47702636662870646,
       "compute": 6.303824725560844,
@@ -197,15 +197,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 30959754384,
+     "fixed1": 29800676496,
      "staging_layers": 2,
-     "fixed": 35734969488,
-     "cache_slots": 12923,
-     "cache_bytes": 60263774208,
-     "wired_limit": 95998743696,
+     "fixed": 34575891600,
+     "cache_slots": 13171,
+     "cache_bytes": 61420271616,
+     "wired_limit": 95996163216,
      "bound": "WorkingSet",
-     "fixed_gib": 33.28078378736973,
-     "cache_gib": 56.12501335144043,
+     "fixed_gib": 32.2013083845377,
+     "cache_gib": 57.20208549499512,
      "budget_gib": 89.40696716308594
     },
     {
@@ -213,7 +213,7 @@
      "chunk_rows": 4096,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 512203161,
       "compute": 6768680259,
@@ -222,7 +222,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.47702636662870646,
       "compute": 6.303824725560844,
@@ -233,15 +233,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 30959754384,
+     "fixed1": 29800676496,
      "staging_layers": 2,
-     "fixed": 35734969488,
-     "cache_slots": 7533,
-     "cache_bytes": 35128608768,
-     "wired_limit": 70863578256,
+     "fixed": 34575891600,
+     "cache_slots": 7782,
+     "cache_bytes": 36289769472,
+     "wired_limit": 70865661072,
      "bound": "Live",
-     "fixed_gib": 33.28078378736973,
-     "cache_gib": 32.71606636047363,
+     "fixed_gib": 32.2013083845377,
+     "cache_gib": 33.797481536865234,
      "budget_gib": 66.0
     },
     {
@@ -249,7 +249,7 @@
      "chunk_rows": 4096,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 512203161,
       "compute": 6768680259,
@@ -258,7 +258,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.47702636662870646,
       "compute": 6.303824725560844,
@@ -269,15 +269,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 30959754384,
+     "fixed1": 29800676496,
      "staging_layers": 1,
-     "fixed": 30959754384,
-     "cache_slots": 1650,
-     "cache_bytes": 7694438400,
-     "wired_limit": 38654192784,
+     "fixed": 29800676496,
+     "cache_slots": 1898,
+     "cache_bytes": 8850935808,
+     "wired_limit": 38651612304,
      "bound": "Live",
-     "fixed_gib": 28.833518162369728,
-     "cache_gib": 7.166004180908203,
+     "fixed_gib": 27.754042759537697,
+     "cache_gib": 8.24307632446289,
      "budget_gib": 36.0
     },
     {
@@ -285,7 +285,7 @@
      "chunk_rows": 2048,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 512203161,
       "compute": 4871319670,
@@ -294,7 +294,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.47702636662870646,
       "compute": 4.536769976839423,
@@ -305,15 +305,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 28978507715,
+     "fixed1": 27819429827,
      "staging_layers": 2,
-     "fixed": 33753722819,
-     "cache_slots": 13348,
-     "cache_bytes": 62245675008,
-     "wired_limit": 95999397827,
+     "fixed": 32594644931,
+     "cache_slots": 13596,
+     "cache_bytes": 63402172416,
+     "wired_limit": 95996817347,
      "bound": "WorkingSet",
-     "fixed_gib": 31.435604038648307,
-     "cache_gib": 57.970802307128906,
+     "fixed_gib": 30.356128635816276,
+     "cache_gib": 59.047874450683594,
      "budget_gib": 89.40696716308594
     },
     {
@@ -321,7 +321,7 @@
      "chunk_rows": 2048,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 512203161,
       "compute": 4871319670,
@@ -330,7 +330,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.47702636662870646,
       "compute": 4.536769976839423,
@@ -341,15 +341,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 28978507715,
+     "fixed1": 27819429827,
      "staging_layers": 2,
-     "fixed": 33753722819,
-     "cache_slots": 7958,
-     "cache_bytes": 37110509568,
-     "wired_limit": 70864232387,
+     "fixed": 32594644931,
+     "cache_slots": 8207,
+     "cache_bytes": 38271670272,
+     "wired_limit": 70866315203,
      "bound": "Live",
-     "fixed_gib": 31.435604038648307,
-     "cache_gib": 34.56185531616211,
+     "fixed_gib": 30.356128635816276,
+     "cache_gib": 35.64327049255371,
      "budget_gib": 66.0
     },
     {
@@ -357,7 +357,7 @@
      "chunk_rows": 2048,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 512203161,
       "compute": 4871319670,
@@ -366,7 +366,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.47702636662870646,
       "compute": 4.536769976839423,
@@ -377,15 +377,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 28978507715,
+     "fixed1": 27819429827,
      "staging_layers": 1,
-     "fixed": 28978507715,
-     "cache_slots": 2074,
-     "cache_bytes": 9671675904,
-     "wired_limit": 38650183619,
+     "fixed": 27819429827,
+     "cache_slots": 2323,
+     "cache_bytes": 10832836608,
+     "wired_limit": 38652266435,
      "bound": "Live",
-     "fixed_gib": 26.988338413648307,
-     "cache_gib": 9.007450103759766,
+     "fixed_gib": 25.908863010816276,
+     "cache_gib": 10.088865280151367,
      "budget_gib": 36.0
     },
     {
@@ -393,7 +393,7 @@
      "chunk_rows": 8192,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 823079731,
       "compute": 10565918019,
@@ -402,7 +402,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.7665527341887355,
       "compute": 9.840277972631156,
@@ -413,15 +413,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 35235640874,
+     "fixed1": 34076562986,
      "staging_layers": 2,
-     "fixed": 40010855978,
-     "cache_slots": 12006,
-     "cache_bytes": 55987531776,
-     "wired_limit": 95998387754,
+     "fixed": 38851778090,
+     "cache_slots": 12254,
+     "cache_bytes": 57144029184,
+     "wired_limit": 95995807274,
      "bound": "WorkingSet",
-     "fixed_gib": 37.26301340200007,
-     "cache_gib": 52.142452239990234,
+     "fixed_gib": 36.18353799916804,
+     "cache_gib": 53.21952438354492,
      "budget_gib": 89.40696716308594
     },
     {
@@ -429,7 +429,7 @@
      "chunk_rows": 8192,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 823079731,
       "compute": 10565918019,
@@ -438,7 +438,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.7665527341887355,
       "compute": 9.840277972631156,
@@ -449,15 +449,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 35235640874,
+     "fixed1": 34076562986,
      "staging_layers": 2,
-     "fixed": 40010855978,
-     "cache_slots": 6616,
-     "cache_bytes": 30852366336,
-     "wired_limit": 70863222314,
+     "fixed": 38851778090,
+     "cache_slots": 6865,
+     "cache_bytes": 32013527040,
+     "wired_limit": 70865305130,
      "bound": "Live",
-     "fixed_gib": 37.26301340200007,
-     "cache_gib": 28.733505249023438,
+     "fixed_gib": 36.18353799916804,
+     "cache_gib": 29.81492042541504,
      "budget_gib": 66.0
     },
     {
@@ -465,7 +465,7 @@
      "chunk_rows": 8192,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 823079731,
       "compute": 10565918019,
@@ -474,7 +474,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.7665527341887355,
       "compute": 9.840277972631156,
@@ -485,15 +485,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 35235640874,
+     "fixed1": 34076562986,
      "staging_layers": 1,
-     "fixed": 35235640874,
-     "cache_slots": 733,
-     "cache_bytes": 3418195968,
-     "wired_limit": 38653836842,
+     "fixed": 34076562986,
+     "cache_slots": 981,
+     "cache_bytes": 4574693376,
+     "wired_limit": 38651256362,
      "bound": "Live",
-     "fixed_gib": 32.81574777700007,
-     "cache_gib": 3.183443069458008,
+     "fixed_gib": 31.73627237416804,
+     "cache_gib": 4.260515213012695,
      "budget_gib": 36.0
     },
     {
@@ -501,7 +501,7 @@
      "chunk_rows": 4096,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 823079731,
       "compute": 6771196842,
@@ -510,7 +510,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.7665527341887355,
       "compute": 6.3061684761196375,
@@ -521,15 +521,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 31273147537,
+     "fixed1": 30114069649,
      "staging_layers": 2,
-     "fixed": 36048362641,
-     "cache_slots": 12856,
-     "cache_bytes": 59951333376,
-     "wired_limit": 95999696017,
+     "fixed": 34889284753,
+     "cache_slots": 13104,
+     "cache_bytes": 61107830784,
+     "wired_limit": 95997115537,
      "bound": "WorkingSet",
-     "fixed_gib": 33.57265390548855,
-     "cache_gib": 55.83403015136719,
+     "fixed_gib": 32.49317850265652,
+     "cache_gib": 56.911102294921875,
      "budget_gib": 89.40696716308594
     },
     {
@@ -537,7 +537,7 @@
      "chunk_rows": 4096,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 823079731,
       "compute": 6771196842,
@@ -546,7 +546,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.7665527341887355,
       "compute": 6.3061684761196375,
@@ -557,15 +557,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 31273147537,
+     "fixed1": 30114069649,
      "staging_layers": 2,
-     "fixed": 36048362641,
-     "cache_slots": 7466,
-     "cache_bytes": 34816167936,
-     "wired_limit": 70864530577,
+     "fixed": 34889284753,
+     "cache_slots": 7715,
+     "cache_bytes": 35977328640,
+     "wired_limit": 70866613393,
      "bound": "Live",
-     "fixed_gib": 33.57265390548855,
-     "cache_gib": 32.42508316040039,
+     "fixed_gib": 32.49317850265652,
+     "cache_gib": 33.50649833679199,
      "budget_gib": 66.0
     },
     {
@@ -573,7 +573,7 @@
      "chunk_rows": 4096,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 823079731,
       "compute": 6771196842,
@@ -582,7 +582,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.7665527341887355,
       "compute": 6.3061684761196375,
@@ -593,15 +593,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 31273147537,
+     "fixed1": 30114069649,
      "staging_layers": 1,
-     "fixed": 31273147537,
-     "cache_slots": 1582,
-     "cache_bytes": 7377334272,
-     "wired_limit": 38650481809,
+     "fixed": 30114069649,
+     "cache_slots": 1831,
+     "cache_bytes": 8538494976,
+     "wired_limit": 38652564625,
      "bound": "Live",
-     "fixed_gib": 29.12538828048855,
-     "cache_gib": 6.870677947998047,
+     "fixed_gib": 28.04591287765652,
+     "cache_gib": 7.952093124389648,
      "budget_gib": 36.0
     },
     {
@@ -609,7 +609,7 @@
      "chunk_rows": 2048,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 823079731,
       "compute": 4873836253,
@@ -618,7 +618,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.7665527341887355,
       "compute": 4.539113727398217,
@@ -629,15 +629,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 29291900868,
+     "fixed1": 28132822980,
      "staging_layers": 2,
-     "fixed": 34067115972,
-     "cache_slots": 13280,
-     "cache_bytes": 61928570880,
-     "wired_limit": 95995686852,
+     "fixed": 32908038084,
+     "cache_slots": 13529,
+     "cache_bytes": 63089731584,
+     "wired_limit": 95997769668,
      "bound": "WorkingSet",
-     "fixed_gib": 31.72747415676713,
-     "cache_gib": 57.67547607421875,
+     "fixed_gib": 30.6479987539351,
+     "cache_gib": 58.75689125061035,
      "budget_gib": 89.40696716308594
     },
     {
@@ -645,7 +645,7 @@
      "chunk_rows": 2048,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 823079731,
       "compute": 4873836253,
@@ -654,7 +654,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.7665527341887355,
       "compute": 4.539113727398217,
@@ -665,15 +665,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 29291900868,
+     "fixed1": 28132822980,
      "staging_layers": 2,
-     "fixed": 34067115972,
-     "cache_slots": 7891,
-     "cache_bytes": 36798068736,
-     "wired_limit": 70865184708,
+     "fixed": 32908038084,
+     "cache_slots": 8139,
+     "cache_bytes": 37954566144,
+     "wired_limit": 70862604228,
      "bound": "Live",
-     "fixed_gib": 31.72747415676713,
-     "cache_gib": 34.27087211608887,
+     "fixed_gib": 30.6479987539351,
+     "cache_gib": 35.347944259643555,
      "budget_gib": 66.0
     },
     {
@@ -681,7 +681,7 @@
      "chunk_rows": 2048,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 823079731,
       "compute": 4873836253,
@@ -690,7 +690,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 0.7665527341887355,
       "compute": 4.539113727398217,
@@ -701,15 +701,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 29291900868,
+     "fixed1": 28132822980,
      "staging_layers": 1,
-     "fixed": 29291900868,
-     "cache_slots": 2007,
-     "cache_bytes": 9359235072,
-     "wired_limit": 38651135940,
+     "fixed": 28132822980,
+     "cache_slots": 2256,
+     "cache_bytes": 10520395776,
+     "wired_limit": 38653218756,
      "bound": "Live",
-     "fixed_gib": 27.28020853176713,
-     "cache_gib": 8.716466903686523,
+     "fixed_gib": 26.2007331289351,
+     "cache_gib": 9.797882080078125,
      "budget_gib": 36.0
     },
     {
@@ -717,7 +717,7 @@
      "chunk_rows": 8192,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 1444832870,
       "compute": 10570951184,
@@ -726,7 +726,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 1.345605468377471,
       "compute": 9.844965472817421,
@@ -737,15 +737,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 35862427178,
+     "fixed1": 34703349290,
      "staging_layers": 2,
-     "fixed": 40637642282,
-     "cache_slots": 11871,
-     "cache_bytes": 55357986816,
-     "wired_limit": 95995629098,
+     "fixed": 39478564394,
+     "cache_slots": 12120,
+     "cache_bytes": 56519147520,
+     "wired_limit": 95997711914,
      "bound": "WorkingSet",
-     "fixed_gib": 37.84675363637507,
-     "cache_gib": 51.556142807006836,
+     "fixed_gib": 36.76727823354304,
+     "cache_gib": 52.63755798339844,
      "budget_gib": 89.40696716308594
     },
     {
@@ -753,7 +753,7 @@
      "chunk_rows": 8192,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 1444832870,
       "compute": 10570951184,
@@ -762,7 +762,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 1.345605468377471,
       "compute": 9.844965472817421,
@@ -773,15 +773,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 35862427178,
+     "fixed1": 34703349290,
      "staging_layers": 2,
-     "fixed": 40637642282,
-     "cache_slots": 6482,
-     "cache_bytes": 30227484672,
-     "wired_limit": 70865126954,
+     "fixed": 39478564394,
+     "cache_slots": 6730,
+     "cache_bytes": 31383982080,
+     "wired_limit": 70862546474,
      "bound": "Live",
-     "fixed_gib": 37.84675363637507,
-     "cache_gib": 28.151538848876953,
+     "fixed_gib": 36.76727823354304,
+     "cache_gib": 29.22861099243164,
      "budget_gib": 66.0
     },
     {
@@ -789,7 +789,7 @@
      "chunk_rows": 8192,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 1444832870,
       "compute": 10570951184,
@@ -798,7 +798,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 1.345605468377471,
       "compute": 9.844965472817421,
@@ -809,15 +809,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 35862427178,
+     "fixed1": 34703349290,
      "staging_layers": 1,
-     "fixed": 35862427178,
-     "cache_slots": 598,
-     "cache_bytes": 2788651008,
-     "wired_limit": 38651078186,
+     "fixed": 34703349290,
+     "cache_slots": 847,
+     "cache_bytes": 3949811712,
+     "wired_limit": 38653161002,
      "bound": "Live",
-     "fixed_gib": 33.39948801137507,
-     "cache_gib": 2.5971336364746094,
+     "fixed_gib": 32.32001260854304,
+     "cache_gib": 3.678548812866211,
      "budget_gib": 36.0
     },
     {
@@ -825,7 +825,7 @@
      "chunk_rows": 4096,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 1444832870,
       "compute": 6776230006,
@@ -834,7 +834,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 1.345605468377471,
       "compute": 6.310855975374579,
@@ -845,15 +845,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 31899933840,
+     "fixed1": 30740855952,
      "staging_layers": 2,
-     "fixed": 36675148944,
-     "cache_slots": 12721,
-     "cache_bytes": 59321788416,
-     "wired_limit": 95996937360,
+     "fixed": 35516071056,
+     "cache_slots": 12970,
+     "cache_bytes": 60482949120,
+     "wired_limit": 95999020176,
      "bound": "WorkingSet",
-     "fixed_gib": 34.15639413893223,
-     "cache_gib": 55.24772071838379,
+     "fixed_gib": 33.0769187361002,
+     "cache_gib": 56.32913589477539,
      "budget_gib": 89.40696716308594
     },
     {
@@ -861,7 +861,7 @@
      "chunk_rows": 4096,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 1444832870,
       "compute": 6776230006,
@@ -870,7 +870,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 1.345605468377471,
       "compute": 6.310855975374579,
@@ -881,15 +881,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 31899933840,
+     "fixed1": 30740855952,
      "staging_layers": 2,
-     "fixed": 36675148944,
-     "cache_slots": 7332,
-     "cache_bytes": 34191286272,
-     "wired_limit": 70866435216,
+     "fixed": 35516071056,
+     "cache_slots": 7580,
+     "cache_bytes": 35347783680,
+     "wired_limit": 70863854736,
      "bound": "Live",
-     "fixed_gib": 34.15639413893223,
-     "cache_gib": 31.843116760253906,
+     "fixed_gib": 33.0769187361002,
+     "cache_gib": 32.920188903808594,
      "budget_gib": 66.0
     },
     {
@@ -897,7 +897,7 @@
      "chunk_rows": 4096,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 1444832870,
       "compute": 6776230006,
@@ -906,7 +906,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 1.345605468377471,
       "compute": 6.310855975374579,
@@ -917,15 +917,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 31899933840,
+     "fixed1": 30740855952,
      "staging_layers": 1,
-     "fixed": 31899933840,
-     "cache_slots": 1448,
-     "cache_bytes": 6752452608,
-     "wired_limit": 38652386448,
+     "fixed": 30740855952,
+     "cache_slots": 1697,
+     "cache_bytes": 7913613312,
+     "wired_limit": 38654469264,
      "bound": "Live",
-     "fixed_gib": 29.709128513932228,
-     "cache_gib": 6.2887115478515625,
+     "fixed_gib": 28.629653111100197,
+     "cache_gib": 7.370126724243164,
      "budget_gib": 36.0
     },
     {
@@ -933,7 +933,7 @@
      "chunk_rows": 2048,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 1444832870,
       "compute": 4878869418,
@@ -942,7 +942,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 1.345605468377471,
       "compute": 4.543801227584481,
@@ -953,15 +953,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 29918687172,
+     "fixed1": 28759609284,
      "staging_layers": 2,
-     "fixed": 34693902276,
-     "cache_slots": 13146,
-     "cache_bytes": 61303689216,
-     "wired_limit": 95997591492,
+     "fixed": 33534824388,
+     "cache_slots": 13395,
+     "cache_bytes": 62464849920,
+     "wired_limit": 95999674308,
      "bound": "WorkingSet",
-     "fixed_gib": 32.31121439114213,
-     "cache_gib": 57.093509674072266,
+     "fixed_gib": 31.2317389883101,
+     "cache_gib": 58.17492485046387,
      "budget_gib": 89.40696716308594
     },
     {
@@ -969,7 +969,7 @@
      "chunk_rows": 2048,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 1444832870,
       "compute": 4878869418,
@@ -978,7 +978,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 1.345605468377471,
       "compute": 4.543801227584481,
@@ -989,15 +989,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 29918687172,
+     "fixed1": 28759609284,
      "staging_layers": 2,
-     "fixed": 34693902276,
-     "cache_slots": 7756,
-     "cache_bytes": 36168523776,
-     "wired_limit": 70862426052,
+     "fixed": 33534824388,
+     "cache_slots": 8005,
+     "cache_bytes": 37329684480,
+     "wired_limit": 70864508868,
      "bound": "Live",
-     "fixed_gib": 32.31121439114213,
-     "cache_gib": 33.68456268310547,
+     "fixed_gib": 31.2317389883101,
+     "cache_gib": 34.76597785949707,
      "budget_gib": 66.0
     },
     {
@@ -1005,7 +1005,7 @@
      "chunk_rows": 2048,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 1444832870,
       "compute": 4878869418,
@@ -1014,7 +1014,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 1.345605468377471,
       "compute": 4.543801227584481,
@@ -1025,15 +1025,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 29918687172,
+     "fixed1": 28759609284,
      "staging_layers": 1,
-     "fixed": 29918687172,
-     "cache_slots": 1873,
-     "cache_bytes": 8734353408,
-     "wired_limit": 38653040580,
+     "fixed": 28759609284,
+     "cache_slots": 2121,
+     "cache_bytes": 9890850816,
+     "wired_limit": 38650460100,
      "bound": "Live",
-     "fixed_gib": 27.86394876614213,
-     "cache_gib": 8.134500503540039,
+     "fixed_gib": 26.7844733633101,
+     "cache_gib": 9.211572647094727,
      "budget_gib": 36.0
     },
     {
@@ -1041,7 +1041,7 @@
      "chunk_rows": 8192,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 2688339148,
       "compute": 10581017514,
@@ -1050,7 +1050,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 2.503710936754942,
       "compute": 9.85434047318995,
@@ -1061,15 +1061,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 37115999786,
+     "fixed1": 35956921898,
      "staging_layers": 2,
-     "fixed": 41891214890,
-     "cache_slots": 11603,
-     "cache_bytes": 54108223488,
-     "wired_limit": 95999438378,
+     "fixed": 40732137002,
+     "cache_slots": 11851,
+     "cache_bytes": 55264720896,
+     "wired_limit": 95996857898,
      "bound": "WorkingSet",
-     "fixed_gib": 39.01423410512507,
-     "cache_gib": 50.39221000671387,
+     "fixed_gib": 37.93475870229304,
+     "cache_gib": 51.469282150268555,
      "budget_gib": 89.40696716308594
     },
     {
@@ -1077,7 +1077,7 @@
      "chunk_rows": 8192,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 2688339148,
       "compute": 10581017514,
@@ -1086,7 +1086,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 2.503710936754942,
       "compute": 9.85434047318995,
@@ -1097,15 +1097,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 37115999786,
+     "fixed1": 35956921898,
      "staging_layers": 2,
-     "fixed": 41891214890,
-     "cache_slots": 6213,
-     "cache_bytes": 28973058048,
-     "wired_limit": 70864272938,
+     "fixed": 40732137002,
+     "cache_slots": 6462,
+     "cache_bytes": 30134218752,
+     "wired_limit": 70866355754,
      "bound": "Live",
-     "fixed_gib": 39.01423410512507,
-     "cache_gib": 26.98326301574707,
+     "fixed_gib": 37.93475870229304,
+     "cache_gib": 28.064678192138672,
      "budget_gib": 66.0
     },
     {
@@ -1113,7 +1113,7 @@
      "chunk_rows": 8192,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 2688339148,
       "compute": 10581017514,
@@ -1122,7 +1122,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 2.503710936754942,
       "compute": 9.85434047318995,
@@ -1133,15 +1133,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 37115999786,
+     "fixed1": 35956921898,
      "staging_layers": 1,
-     "fixed": 37115999786,
-     "cache_slots": 329,
-     "cache_bytes": 1534224384,
-     "wired_limit": 38650224170,
+     "fixed": 35956921898,
+     "cache_slots": 578,
+     "cache_bytes": 2695385088,
+     "wired_limit": 38652306986,
      "bound": "Live",
-     "fixed_gib": 34.56696848012507,
-     "cache_gib": 1.4288578033447266,
+     "fixed_gib": 33.48749307729304,
+     "cache_gib": 2.510272979736328,
      "budget_gib": 36.0
     },
     {
@@ -1149,7 +1149,7 @@
      "chunk_rows": 4096,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 2688339148,
       "compute": 6786296336,
@@ -1158,7 +1158,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 2.503710936754942,
       "compute": 6.3202309757471085,
@@ -1169,15 +1169,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 33153506448,
+     "fixed1": 31994428560,
      "staging_layers": 2,
-     "fixed": 37928721552,
-     "cache_slots": 12452,
-     "cache_bytes": 58067361792,
-     "wired_limit": 95996083344,
+     "fixed": 36769643664,
+     "cache_slots": 12701,
+     "cache_bytes": 59228522496,
+     "wired_limit": 95998166160,
      "bound": "WorkingSet",
-     "fixed_gib": 35.32387460768223,
-     "cache_gib": 54.079444885253906,
+     "fixed_gib": 34.2443992048502,
+     "cache_gib": 55.16086006164551,
      "budget_gib": 89.40696716308594
     },
     {
@@ -1185,7 +1185,7 @@
      "chunk_rows": 4096,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 2688339148,
       "compute": 6786296336,
@@ -1194,7 +1194,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 2.503710936754942,
       "compute": 6.3202309757471085,
@@ -1205,15 +1205,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 33153506448,
+     "fixed1": 31994428560,
      "staging_layers": 2,
-     "fixed": 37928721552,
-     "cache_slots": 7063,
-     "cache_bytes": 32936859648,
-     "wired_limit": 70865581200,
+     "fixed": 36769643664,
+     "cache_slots": 7311,
+     "cache_bytes": 34093357056,
+     "wired_limit": 70863000720,
      "bound": "Live",
-     "fixed_gib": 35.32387460768223,
-     "cache_gib": 30.674840927124023,
+     "fixed_gib": 34.2443992048502,
+     "cache_gib": 31.75191307067871,
      "budget_gib": 66.0
     },
     {
@@ -1221,7 +1221,7 @@
      "chunk_rows": 4096,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 2688339148,
       "compute": 6786296336,
@@ -1230,7 +1230,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 2.503710936754942,
       "compute": 6.3202309757471085,
@@ -1241,15 +1241,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 33153506448,
+     "fixed1": 31994428560,
      "staging_layers": 1,
-     "fixed": 33153506448,
-     "cache_slots": 1179,
-     "cache_bytes": 5498025984,
-     "wired_limit": 38651532432,
+     "fixed": 31994428560,
+     "cache_slots": 1428,
+     "cache_bytes": 6659186688,
+     "wired_limit": 38653615248,
      "bound": "Live",
-     "fixed_gib": 30.876608982682228,
-     "cache_gib": 5.12043571472168,
+     "fixed_gib": 29.797133579850197,
+     "cache_gib": 6.201850891113281,
      "budget_gib": 36.0
     },
     {
@@ -1257,7 +1257,7 @@
      "chunk_rows": 2048,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 2688339148,
       "compute": 4888935747,
@@ -1266,7 +1266,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 2.503710936754942,
       "compute": 4.553176227025688,
@@ -1277,15 +1277,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 31172259779,
+     "fixed1": 30013181891,
      "staging_layers": 2,
-     "fixed": 35947474883,
-     "cache_slots": 12877,
-     "cache_bytes": 60049262592,
-     "wired_limit": 95996737475,
+     "fixed": 34788396995,
+     "cache_slots": 13126,
+     "cache_bytes": 61210423296,
+     "wired_limit": 95998820291,
      "bound": "WorkingSet",
-     "fixed_gib": 33.47869485896081,
-     "cache_gib": 55.92523384094238,
+     "fixed_gib": 32.399219456128776,
+     "cache_gib": 57.006649017333984,
      "budget_gib": 89.40696716308594
     },
     {
@@ -1293,7 +1293,7 @@
      "chunk_rows": 2048,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 2688339148,
       "compute": 4888935747,
@@ -1302,7 +1302,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 2.503710936754942,
       "compute": 4.553176227025688,
@@ -1313,15 +1313,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 31172259779,
+     "fixed1": 30013181891,
      "staging_layers": 2,
-     "fixed": 35947474883,
-     "cache_slots": 7488,
-     "cache_bytes": 34918760448,
-     "wired_limit": 70866235331,
+     "fixed": 34788396995,
+     "cache_slots": 7736,
+     "cache_bytes": 36075257856,
+     "wired_limit": 70863654851,
      "bound": "Live",
-     "fixed_gib": 33.47869485896081,
-     "cache_gib": 32.5206298828125,
+     "fixed_gib": 32.399219456128776,
+     "cache_gib": 33.59770202636719,
      "budget_gib": 66.0
     },
     {
@@ -1329,7 +1329,7 @@
      "chunk_rows": 2048,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 2688339148,
       "compute": 4888935747,
@@ -1338,7 +1338,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 2.503710936754942,
       "compute": 4.553176227025688,
@@ -1349,15 +1349,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 31172259779,
+     "fixed1": 30013181891,
      "staging_layers": 1,
-     "fixed": 31172259779,
-     "cache_slots": 1604,
-     "cache_bytes": 7479926784,
-     "wired_limit": 38652186563,
+     "fixed": 30013181891,
+     "cache_slots": 1853,
+     "cache_bytes": 8641087488,
+     "wired_limit": 38654269379,
      "bound": "Live",
-     "fixed_gib": 29.031429233960807,
-     "cache_gib": 6.966224670410156,
+     "fixed_gib": 27.951953831128776,
+     "cache_gib": 8.047639846801758,
      "budget_gib": 36.0
     },
     {
@@ -1365,7 +1365,7 @@
      "chunk_rows": 8192,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 5175351705,
       "compute": 10601150173,
@@ -1374,7 +1374,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 4.8199218744412065,
       "compute": 9.873090473003685,
@@ -1385,15 +1385,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 39623145002,
+     "fixed1": 38464067114,
      "staging_layers": 2,
-     "fixed": 44398360106,
-     "cache_slots": 11065,
-     "cache_bytes": 51599370240,
-     "wired_limit": 95997730346,
+     "fixed": 43239282218,
+     "cache_slots": 11314,
+     "cache_bytes": 52760530944,
+     "wired_limit": 95999813162,
      "bound": "WorkingSet",
-     "fixed_gib": 41.34919504262507,
-     "cache_gib": 48.0556583404541,
+     "fixed_gib": 40.26971963979304,
+     "cache_gib": 49.1370735168457,
      "budget_gib": 89.40696716308594
     },
     {
@@ -1401,7 +1401,7 @@
      "chunk_rows": 8192,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 5175351705,
       "compute": 10601150173,
@@ -1410,7 +1410,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 4.8199218744412065,
       "compute": 9.873090473003685,
@@ -1421,15 +1421,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 39623145002,
+     "fixed1": 38464067114,
      "staging_layers": 2,
-     "fixed": 44398360106,
-     "cache_slots": 5675,
-     "cache_bytes": 26464204800,
-     "wired_limit": 70862564906,
+     "fixed": 43239282218,
+     "cache_slots": 5924,
+     "cache_bytes": 27625365504,
+     "wired_limit": 70864647722,
      "bound": "Live",
-     "fixed_gib": 41.34919504262507,
-     "cache_gib": 24.646711349487305,
+     "fixed_gib": 40.26971963979304,
+     "cache_gib": 25.728126525878906,
      "budget_gib": 66.0
     },
     {
@@ -1437,7 +1437,7 @@
      "chunk_rows": 8192,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 5175351705,
       "compute": 10601150173,
@@ -1446,7 +1446,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 4.8199218744412065,
       "compute": 9.873090473003685,
@@ -1454,11 +1454,18 @@
       "driver": 4.470348358154297,
       "pool": 2.0
      },
-     "refused": true,
+     "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 39623145002,
-     "fixed1_gib": 36.90192941762507,
+     "fixed1": 38464067114,
+     "staging_layers": 1,
+     "fixed": 38464067114,
+     "cache_slots": 40,
+     "cache_bytes": 186531840,
+     "wired_limit": 38650598954,
+     "bound": "Live",
+     "fixed_gib": 35.82245401479304,
+     "cache_gib": 0.1737213134765625,
      "budget_gib": 36.0
     },
     {
@@ -1466,7 +1473,7 @@
      "chunk_rows": 4096,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 5175351705,
       "compute": 6806428995,
@@ -1475,7 +1482,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 4.8199218744412065,
       "compute": 6.338980975560844,
@@ -1486,15 +1493,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 35660651664,
+     "fixed1": 34501573776,
      "staging_layers": 2,
-     "fixed": 40435866768,
-     "cache_slots": 11915,
-     "cache_bytes": 55563171840,
-     "wired_limit": 95999038608,
+     "fixed": 39276788880,
+     "cache_slots": 12163,
+     "cache_bytes": 56719669248,
+     "wired_limit": 95996458128,
      "bound": "WorkingSet",
-     "fixed_gib": 37.65883554518223,
-     "cache_gib": 51.747236251831055,
+     "fixed_gib": 36.5793601423502,
+     "cache_gib": 52.82430839538574,
      "budget_gib": 89.40696716308594
     },
     {
@@ -1502,7 +1509,7 @@
      "chunk_rows": 4096,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 5175351705,
       "compute": 6806428995,
@@ -1511,7 +1518,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 4.8199218744412065,
       "compute": 6.338980975560844,
@@ -1522,15 +1529,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 35660651664,
+     "fixed1": 34501573776,
      "staging_layers": 2,
-     "fixed": 40435866768,
-     "cache_slots": 6525,
-     "cache_bytes": 30428006400,
-     "wired_limit": 70863873168,
+     "fixed": 39276788880,
+     "cache_slots": 6774,
+     "cache_bytes": 31589167104,
+     "wired_limit": 70865955984,
      "bound": "Live",
-     "fixed_gib": 37.65883554518223,
-     "cache_gib": 28.338289260864258,
+     "fixed_gib": 36.5793601423502,
+     "cache_gib": 29.41970443725586,
      "budget_gib": 66.0
     },
     {
@@ -1538,7 +1545,7 @@
      "chunk_rows": 4096,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 5175351705,
       "compute": 6806428995,
@@ -1547,7 +1554,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 4.8199218744412065,
       "compute": 6.338980975560844,
@@ -1558,15 +1565,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 35660651664,
+     "fixed1": 34501573776,
      "staging_layers": 1,
-     "fixed": 35660651664,
-     "cache_slots": 642,
-     "cache_bytes": 2993836032,
-     "wired_limit": 38654487696,
+     "fixed": 34501573776,
+     "cache_slots": 890,
+     "cache_bytes": 4150333440,
+     "wired_limit": 38651907216,
      "bound": "Live",
-     "fixed_gib": 33.21156992018223,
-     "cache_gib": 2.788227081298828,
+     "fixed_gib": 32.1320945173502,
+     "cache_gib": 3.8652992248535156,
      "budget_gib": 36.0
     },
     {
@@ -1574,7 +1581,7 @@
      "chunk_rows": 2048,
      "others_gib": 20,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 5175351705,
       "compute": 4909068406,
@@ -1583,7 +1590,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 4.8199218744412065,
       "compute": 4.571926226839423,
@@ -1594,15 +1601,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 33679404995,
+     "fixed1": 32520327107,
      "staging_layers": 2,
-     "fixed": 38454620099,
-     "cache_slots": 12340,
-     "cache_bytes": 57545072640,
-     "wired_limit": 95999692739,
+     "fixed": 37295542211,
+     "cache_slots": 12588,
+     "cache_bytes": 58701570048,
+     "wired_limit": 95997112259,
      "bound": "WorkingSet",
-     "fixed_gib": 35.81365579646081,
-     "cache_gib": 53.59302520751953,
+     "fixed_gib": 34.734180393628776,
+     "cache_gib": 54.67009735107422,
      "budget_gib": 89.40696716308594
     },
     {
@@ -1610,7 +1617,7 @@
      "chunk_rows": 2048,
      "others_gib": 50,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 5175351705,
       "compute": 4909068406,
@@ -1619,7 +1626,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 4.8199218744412065,
       "compute": 4.571926226839423,
@@ -1630,15 +1637,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 33679404995,
+     "fixed1": 32520327107,
      "staging_layers": 2,
-     "fixed": 38454620099,
-     "cache_slots": 6950,
-     "cache_bytes": 32409907200,
-     "wired_limit": 70864527299,
+     "fixed": 37295542211,
+     "cache_slots": 7199,
+     "cache_bytes": 33571067904,
+     "wired_limit": 70866610115,
      "bound": "Live",
-     "fixed_gib": 35.81365579646081,
-     "cache_gib": 30.184078216552734,
+     "fixed_gib": 34.734180393628776,
+     "cache_gib": 31.265493392944336,
      "budget_gib": 66.0
     },
     {
@@ -1646,7 +1653,7 @@
      "chunk_rows": 2048,
      "others_gib": 80,
      "terms": {
-      "dense": 11352192436,
+      "dense": 10193114548,
       "staging_layer": 4775215104,
       "kv": 5175351705,
       "compute": 4909068406,
@@ -1655,7 +1662,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 10.57255308702588,
+      "dense": 9.49307768419385,
       "staging_layer": 4.447265625,
       "kv": 4.8199218744412065,
       "compute": 4.571926226839423,
@@ -1666,15 +1673,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 33679404995,
+     "fixed1": 32520327107,
      "staging_layers": 1,
-     "fixed": 33679404995,
-     "cache_slots": 1066,
-     "cache_bytes": 4971073536,
-     "wired_limit": 38650478531,
+     "fixed": 32520327107,
+     "cache_slots": 1315,
+     "cache_bytes": 6132234240,
+     "wired_limit": 38652561347,
      "bound": "Live",
-     "fixed_gib": 31.366390171460807,
-     "cache_gib": 4.629673004150391,
+     "fixed_gib": 30.286914768628776,
+     "cache_gib": 5.711088180541992,
      "budget_gib": 36.0
     }
    ],
@@ -1683,18 +1690,19 @@
      "admitted": true,
      "ctx": 262144,
      "chunk_rows": 8192,
-     "cache_bytes": 51599370240,
-     "cache_gib": 48.0556583404541,
+     "cache_bytes": 52760530944,
+     "cache_gib": 49.1370735168457,
      "staging_layers": 2,
-     "wired_limit": 95997730346,
+     "wired_limit": 95999813162,
+     "bound": "WorkingSet",
      "steps": [
       {
        "ctx": 262144,
        "chunk_rows": 8192,
        "per_chunk": {
-        "8192": 48.0557,
-        "4096": 51.7472,
-        "2048": 53.593
+        "8192": 49.1371,
+        "4096": 52.8243,
+        "2048": 54.6701
        }
       }
      ]
@@ -1703,18 +1711,19 @@
      "admitted": true,
      "ctx": 262144,
      "chunk_rows": 8192,
-     "cache_bytes": 26464204800,
-     "cache_gib": 24.646711349487305,
+     "cache_bytes": 27625365504,
+     "cache_gib": 25.728126525878906,
      "staging_layers": 2,
-     "wired_limit": 70862564906,
+     "wired_limit": 70864647722,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
        "chunk_rows": 8192,
        "per_chunk": {
-        "8192": 24.6467,
-        "4096": 28.3383,
-        "2048": 30.1841
+        "8192": 25.7281,
+        "4096": 29.4197,
+        "2048": 31.2655
        }
       }
      ]
@@ -1723,18 +1732,19 @@
      "admitted": true,
      "ctx": 262144,
      "chunk_rows": 2048,
-     "cache_bytes": 4971073536,
-     "cache_gib": 4.629673004150391,
+     "cache_bytes": 6132234240,
+     "cache_gib": 5.711088180541992,
      "staging_layers": 1,
-     "wired_limit": 38650478531,
+     "wired_limit": 38652561347,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
        "chunk_rows": 2048,
        "per_chunk": {
-        "8192": "refused",
-        "4096": 2.7882,
-        "2048": 4.6297
+        "8192": 0.1737,
+        "4096": 3.8653,
+        "2048": 5.7111
        }
       }
      ]
@@ -1743,18 +1753,19 @@
      "admitted": true,
      "ctx": 262144,
      "chunk_rows": 2048,
-     "cache_bytes": 2825957376,
-     "cache_gib": 2.631877899169922,
+     "cache_bytes": 3982454784,
+     "cache_gib": 3.7089500427246094,
      "staging_layers": 1,
-     "wired_limit": 36505362371,
+     "wired_limit": 36502781891,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
        "chunk_rows": 2048,
        "per_chunk": {
         "8192": "refused",
-        "4096": 0.7861,
-        "2048": 2.6319
+        "4096": 1.8675,
+        "2048": 3.709
        }
       }
      ]
@@ -1763,10 +1774,11 @@
      "admitted": true,
      "ctx": 262144,
      "chunk_rows": 2048,
-     "cache_bytes": 676177920,
-     "cache_gib": 0.6297397613525391,
+     "cache_bytes": 1837338624,
+     "cache_gib": 1.7111549377441406,
      "staging_layers": 1,
-     "wired_limit": 34355582915,
+     "wired_limit": 34357665731,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
@@ -1774,7 +1786,7 @@
        "per_chunk": {
         "8192": "refused",
         "4096": "refused",
-        "2048": 0.6297
+        "2048": 1.7112
        }
       }
      ]
@@ -1783,10 +1795,11 @@
      "admitted": true,
      "ctx": 131072,
      "chunk_rows": 2048,
-     "cache_bytes": 1039915008,
-     "cache_gib": 0.9684963226318359,
+     "cache_bytes": 2196412416,
+     "cache_gib": 2.0455684661865234,
      "staging_layers": 1,
-     "wired_limit": 32212174787,
+     "wired_limit": 32209594307,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
@@ -1802,20 +1815,21 @@
        "chunk_rows": 2048,
        "per_chunk": {
         "8192": "refused",
-        "4096": "refused",
-        "2048": 0.9685
+        "4096": 0.1998,
+        "2048": 2.0456
        }
       }
      ]
     },
     "88": {
      "admitted": true,
-     "ctx": 65536,
+     "ctx": 131072,
      "chunk_rows": 2048,
-     "cache_bytes": 144562176,
-     "cache_gib": 0.13463401794433594,
+     "cache_bytes": 51296256,
+     "cache_gib": 0.04777336120605469,
      "staging_layers": 1,
-     "wired_limit": 30063249348,
+     "wired_limit": 30064478147,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
@@ -1828,26 +1842,24 @@
       },
       {
        "ctx": 131072,
-       "chunk_rows": null,
-       "per_chunk": {
-        "8192": "refused",
-        "4096": "refused",
-        "2048": "refused"
-       }
-      },
-      {
-       "ctx": 65536,
        "chunk_rows": 2048,
        "per_chunk": {
         "8192": "refused",
         "4096": "refused",
-        "2048": 0.1346
+        "2048": 0.0478
        }
       }
      ]
     },
     "90": {
-     "admitted": false,
+     "admitted": true,
+     "ctx": 16384,
+     "chunk_rows": 2048,
+     "cache_bytes": 93265920,
+     "cache_gib": 0.08686065673828125,
+     "staging_layers": 1,
+     "wired_limit": 27912695747,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
@@ -1887,11 +1899,11 @@
       },
       {
        "ctx": 16384,
-       "chunk_rows": null,
+       "chunk_rows": 2048,
        "per_chunk": {
         "8192": "refused",
         "4096": "refused",
-        "2048": "refused"
+        "2048": 0.0869
        }
       }
      ]
@@ -1899,7 +1911,7 @@
    }
   },
   "mtp_off": {
-   "dense": 9162262836,
+   "dense": 8003184948,
    "kv_per_ctx": 14596,
    "rows": [
     {
@@ -1907,7 +1919,7 @@
      "chunk_rows": 8192,
      "others_gib": 20,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 488295628,
       "compute": 10563401437,
@@ -1916,7 +1928,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.45476074144244194,
       "compute": 9.837934223003685,
@@ -1927,15 +1939,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 32708410589,
+     "fixed1": 31549332701,
      "staging_layers": 2,
-     "fixed": 37483625693,
-     "cache_slots": 12548,
-     "cache_bytes": 58515038208,
-     "wired_limit": 95998663901,
+     "fixed": 36324547805,
+     "cache_slots": 12796,
+     "cache_bytes": 59671535616,
+     "wired_limit": 95996083421,
      "bound": "WorkingSet",
-     "fixed_gib": 34.90934678632766,
-     "cache_gib": 54.496376037597656,
+     "fixed_gib": 33.82987138349563,
+     "cache_gib": 55.573448181152344,
      "budget_gib": 89.40696716308594
     },
     {
@@ -1943,7 +1955,7 @@
      "chunk_rows": 8192,
      "others_gib": 50,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 488295628,
       "compute": 10563401437,
@@ -1952,7 +1964,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.45476074144244194,
       "compute": 9.837934223003685,
@@ -1963,15 +1975,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 32708410589,
+     "fixed1": 31549332701,
      "staging_layers": 2,
-     "fixed": 37483625693,
-     "cache_slots": 7158,
-     "cache_bytes": 33379872768,
-     "wired_limit": 70863498461,
+     "fixed": 36324547805,
+     "cache_slots": 7407,
+     "cache_bytes": 34541033472,
+     "wired_limit": 70865581277,
      "bound": "Live",
-     "fixed_gib": 34.90934678632766,
-     "cache_gib": 31.08742904663086,
+     "fixed_gib": 33.82987138349563,
+     "cache_gib": 32.16884422302246,
      "budget_gib": 66.0
     },
     {
@@ -1979,7 +1991,7 @@
      "chunk_rows": 8192,
      "others_gib": 80,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 488295628,
       "compute": 10563401437,
@@ -1988,7 +2000,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.45476074144244194,
       "compute": 9.837934223003685,
@@ -1999,15 +2011,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 32708410589,
+     "fixed1": 31549332701,
      "staging_layers": 1,
-     "fixed": 32708410589,
-     "cache_slots": 1275,
-     "cache_bytes": 5945702400,
-     "wired_limit": 38654112989,
+     "fixed": 31549332701,
+     "cache_slots": 1523,
+     "cache_bytes": 7102199808,
+     "wired_limit": 38651532509,
      "bound": "Live",
-     "fixed_gib": 30.46208116132766,
-     "cache_gib": 5.53736686706543,
+     "fixed_gib": 29.38260575849563,
+     "cache_gib": 6.614439010620117,
      "budget_gib": 36.0
     },
     {
@@ -2015,7 +2027,7 @@
      "chunk_rows": 4096,
      "others_gib": 20,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 488295628,
       "compute": 6768680259,
@@ -2024,7 +2036,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.45476074144244194,
       "compute": 6.303824725560844,
@@ -2035,15 +2047,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 28745917251,
+     "fixed1": 27586839363,
      "staging_layers": 2,
-     "fixed": 33521132355,
-     "cache_slots": 13398,
-     "cache_bytes": 62478839808,
-     "wired_limit": 95999972163,
+     "fixed": 32362054467,
+     "cache_slots": 13646,
+     "cache_bytes": 63635337216,
+     "wired_limit": 95997391683,
      "bound": "WorkingSet",
-     "fixed_gib": 31.21898728888482,
-     "cache_gib": 58.18795394897461,
+     "fixed_gib": 30.139511886052787,
+     "cache_gib": 59.2650260925293,
      "budget_gib": 89.40696716308594
     },
     {
@@ -2051,7 +2063,7 @@
      "chunk_rows": 4096,
      "others_gib": 50,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 488295628,
       "compute": 6768680259,
@@ -2060,7 +2072,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.45476074144244194,
       "compute": 6.303824725560844,
@@ -2071,15 +2083,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 28745917251,
+     "fixed1": 27586839363,
      "staging_layers": 2,
-     "fixed": 33521132355,
-     "cache_slots": 8008,
-     "cache_bytes": 37343674368,
-     "wired_limit": 70864806723,
+     "fixed": 32362054467,
+     "cache_slots": 8257,
+     "cache_bytes": 38504835072,
+     "wired_limit": 70866889539,
      "bound": "Live",
-     "fixed_gib": 31.21898728888482,
-     "cache_gib": 34.77900695800781,
+     "fixed_gib": 30.139511886052787,
+     "cache_gib": 35.860422134399414,
      "budget_gib": 66.0
     },
     {
@@ -2087,7 +2099,7 @@
      "chunk_rows": 4096,
      "others_gib": 80,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 488295628,
       "compute": 6768680259,
@@ -2096,7 +2108,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.45476074144244194,
       "compute": 6.303824725560844,
@@ -2107,15 +2119,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 28745917251,
+     "fixed1": 27586839363,
      "staging_layers": 1,
-     "fixed": 28745917251,
-     "cache_slots": 2124,
-     "cache_bytes": 9904840704,
-     "wired_limit": 38650757955,
+     "fixed": 27586839363,
+     "cache_slots": 2373,
+     "cache_bytes": 11066001408,
+     "wired_limit": 38652840771,
      "bound": "Live",
-     "fixed_gib": 26.77172166388482,
-     "cache_gib": 9.224601745605469,
+     "fixed_gib": 25.692246261052787,
+     "cache_gib": 10.30601692199707,
      "budget_gib": 36.0
     },
     {
@@ -2123,7 +2135,7 @@
      "chunk_rows": 2048,
      "others_gib": 20,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 488295628,
       "compute": 4871319670,
@@ -2132,7 +2144,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.45476074144244194,
       "compute": 4.536769976839423,
@@ -2143,15 +2155,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 26764670582,
+     "fixed1": 25605592694,
      "staging_layers": 2,
-     "fixed": 31539885686,
-     "cache_slots": 13822,
-     "cache_bytes": 64456077312,
-     "wired_limit": 95995962998,
+     "fixed": 30380807798,
+     "cache_slots": 14071,
+     "cache_bytes": 65617238016,
+     "wired_limit": 95998045814,
      "bound": "WorkingSet",
-     "fixed_gib": 29.373807540163398,
-     "cache_gib": 60.02939987182617,
+     "fixed_gib": 28.294332137331367,
+     "cache_gib": 61.11081504821777,
      "budget_gib": 89.40696716308594
     },
     {
@@ -2159,7 +2171,7 @@
      "chunk_rows": 2048,
      "others_gib": 50,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 488295628,
       "compute": 4871319670,
@@ -2168,7 +2180,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.45476074144244194,
       "compute": 4.536769976839423,
@@ -2179,15 +2191,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 26764670582,
+     "fixed1": 25605592694,
      "staging_layers": 2,
-     "fixed": 31539885686,
-     "cache_slots": 8433,
-     "cache_bytes": 39325575168,
-     "wired_limit": 70865460854,
+     "fixed": 30380807798,
+     "cache_slots": 8681,
+     "cache_bytes": 40482072576,
+     "wired_limit": 70862880374,
      "bound": "Live",
-     "fixed_gib": 29.373807540163398,
-     "cache_gib": 36.62479591369629,
+     "fixed_gib": 28.294332137331367,
+     "cache_gib": 37.70186805725098,
      "budget_gib": 66.0
     },
     {
@@ -2195,7 +2207,7 @@
      "chunk_rows": 2048,
      "others_gib": 80,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 488295628,
       "compute": 4871319670,
@@ -2204,7 +2216,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.45476074144244194,
       "compute": 4.536769976839423,
@@ -2215,15 +2227,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 26764670582,
+     "fixed1": 25605592694,
      "staging_layers": 1,
-     "fixed": 26764670582,
-     "cache_slots": 2549,
-     "cache_bytes": 11886741504,
-     "wired_limit": 38651412086,
+     "fixed": 25605592694,
+     "cache_slots": 2798,
+     "cache_bytes": 13047902208,
+     "wired_limit": 38653494902,
      "bound": "Live",
-     "fixed_gib": 24.926541915163398,
-     "cache_gib": 11.070390701293945,
+     "fixed_gib": 23.847066512331367,
+     "cache_gib": 12.151805877685547,
      "budget_gib": 36.0
     },
     {
@@ -2231,7 +2243,7 @@
      "chunk_rows": 8192,
      "others_gib": 20,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 775264665,
       "compute": 10565918019,
@@ -2240,7 +2252,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.7220214838162065,
       "compute": 9.840277972631156,
@@ -2251,15 +2263,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 32997896208,
+     "fixed1": 31838818320,
      "staging_layers": 2,
-     "fixed": 37773111312,
-     "cache_slots": 12486,
-     "cache_bytes": 58225913856,
-     "wired_limit": 95999025168,
+     "fixed": 36614033424,
+     "cache_slots": 12734,
+     "cache_bytes": 59382411264,
+     "wired_limit": 95996444688,
      "bound": "WorkingSet",
-     "fixed_gib": 35.178951278328896,
-     "cache_gib": 54.227108001708984,
+     "fixed_gib": 34.099475875496864,
+     "cache_gib": 55.30418014526367,
      "budget_gib": 89.40696716308594
     },
     {
@@ -2267,7 +2279,7 @@
      "chunk_rows": 8192,
      "others_gib": 50,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 775264665,
       "compute": 10565918019,
@@ -2276,7 +2288,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.7220214838162065,
       "compute": 9.840277972631156,
@@ -2287,15 +2299,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 32997896208,
+     "fixed1": 31838818320,
      "staging_layers": 2,
-     "fixed": 37773111312,
-     "cache_slots": 7096,
-     "cache_bytes": 33090748416,
-     "wired_limit": 70863859728,
+     "fixed": 36614033424,
+     "cache_slots": 7345,
+     "cache_bytes": 34251909120,
+     "wired_limit": 70865942544,
      "bound": "Live",
-     "fixed_gib": 35.178951278328896,
-     "cache_gib": 30.818161010742188,
+     "fixed_gib": 34.099475875496864,
+     "cache_gib": 31.89957618713379,
      "budget_gib": 66.0
     },
     {
@@ -2303,7 +2315,7 @@
      "chunk_rows": 8192,
      "others_gib": 80,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 775264665,
       "compute": 10565918019,
@@ -2312,7 +2324,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.7220214838162065,
       "compute": 9.840277972631156,
@@ -2323,15 +2335,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 32997896208,
+     "fixed1": 31838818320,
      "staging_layers": 1,
-     "fixed": 32997896208,
-     "cache_slots": 1213,
-     "cache_bytes": 5656578048,
-     "wired_limit": 38654474256,
+     "fixed": 31838818320,
+     "cache_slots": 1461,
+     "cache_bytes": 6813075456,
+     "wired_limit": 38651893776,
      "bound": "Live",
-     "fixed_gib": 30.731685653328896,
-     "cache_gib": 5.268098831176758,
+     "fixed_gib": 29.652210250496864,
+     "cache_gib": 6.345170974731445,
      "budget_gib": 36.0
     },
     {
@@ -2339,7 +2351,7 @@
      "chunk_rows": 4096,
      "others_gib": 20,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 775264665,
       "compute": 6771196842,
@@ -2348,7 +2360,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.7220214838162065,
       "compute": 6.3061684761196375,
@@ -2359,15 +2371,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 29035402871,
+     "fixed1": 27876324983,
      "staging_layers": 2,
-     "fixed": 33810617975,
-     "cache_slots": 13335,
-     "cache_bytes": 62185052160,
-     "wired_limit": 95995670135,
+     "fixed": 32651540087,
+     "cache_slots": 13584,
+     "cache_bytes": 63346212864,
+     "wired_limit": 95997752951,
      "bound": "WorkingSet",
-     "fixed_gib": 31.488591781817377,
-     "cache_gib": 57.91434288024902,
+     "fixed_gib": 30.409116378985345,
+     "cache_gib": 58.995758056640625,
      "budget_gib": 89.40696716308594
     },
     {
@@ -2375,7 +2387,7 @@
      "chunk_rows": 4096,
      "others_gib": 50,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 775264665,
       "compute": 6771196842,
@@ -2384,7 +2396,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.7220214838162065,
       "compute": 6.3061684761196375,
@@ -2395,15 +2407,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 29035402871,
+     "fixed1": 27876324983,
      "staging_layers": 2,
-     "fixed": 33810617975,
-     "cache_slots": 7946,
-     "cache_bytes": 37054550016,
-     "wired_limit": 70865167991,
+     "fixed": 32651540087,
+     "cache_slots": 8194,
+     "cache_bytes": 38211047424,
+     "wired_limit": 70862587511,
      "bound": "Live",
-     "fixed_gib": 31.488591781817377,
-     "cache_gib": 34.50973892211914,
+     "fixed_gib": 30.409116378985345,
+     "cache_gib": 35.58681106567383,
      "budget_gib": 66.0
     },
     {
@@ -2411,7 +2423,7 @@
      "chunk_rows": 4096,
      "others_gib": 80,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 775264665,
       "compute": 6771196842,
@@ -2420,7 +2432,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.7220214838162065,
       "compute": 6.3061684761196375,
@@ -2431,15 +2443,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 29035402871,
+     "fixed1": 27876324983,
      "staging_layers": 1,
-     "fixed": 29035402871,
-     "cache_slots": 2062,
-     "cache_bytes": 9615716352,
-     "wired_limit": 38651119223,
+     "fixed": 27876324983,
+     "cache_slots": 2311,
+     "cache_bytes": 10776877056,
+     "wired_limit": 38653202039,
      "bound": "Live",
-     "fixed_gib": 27.041326156817377,
-     "cache_gib": 8.955333709716797,
+     "fixed_gib": 25.961850753985345,
+     "cache_gib": 10.036748886108398,
      "budget_gib": 36.0
     },
     {
@@ -2447,7 +2459,7 @@
      "chunk_rows": 2048,
      "others_gib": 20,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 775264665,
       "compute": 4873836253,
@@ -2456,7 +2468,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.7220214838162065,
       "compute": 4.539113727398217,
@@ -2467,15 +2479,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 27054156202,
+     "fixed1": 25895078314,
      "staging_layers": 2,
-     "fixed": 31829371306,
-     "cache_slots": 13760,
-     "cache_bytes": 64166952960,
-     "wired_limit": 95996324266,
+     "fixed": 30670293418,
+     "cache_slots": 14009,
+     "cache_bytes": 65328113664,
+     "wired_limit": 95998407082,
      "bound": "WorkingSet",
-     "fixed_gib": 29.643412033095956,
-     "cache_gib": 59.7601318359375,
+     "fixed_gib": 28.563936630263925,
+     "cache_gib": 60.8415470123291,
      "budget_gib": 89.40696716308594
     },
     {
@@ -2483,7 +2495,7 @@
      "chunk_rows": 2048,
      "others_gib": 50,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 775264665,
       "compute": 4873836253,
@@ -2492,7 +2504,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.7220214838162065,
       "compute": 4.539113727398217,
@@ -2503,15 +2515,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 27054156202,
+     "fixed1": 25895078314,
      "staging_layers": 2,
-     "fixed": 31829371306,
-     "cache_slots": 8371,
-     "cache_bytes": 39036450816,
-     "wired_limit": 70865822122,
+     "fixed": 30670293418,
+     "cache_slots": 8619,
+     "cache_bytes": 40192948224,
+     "wired_limit": 70863241642,
      "bound": "Live",
-     "fixed_gib": 29.643412033095956,
-     "cache_gib": 36.35552787780762,
+     "fixed_gib": 28.563936630263925,
+     "cache_gib": 37.432600021362305,
      "budget_gib": 66.0
     },
     {
@@ -2519,7 +2531,7 @@
      "chunk_rows": 2048,
      "others_gib": 80,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 775264665,
       "compute": 4873836253,
@@ -2528,7 +2540,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 0.7220214838162065,
       "compute": 4.539113727398217,
@@ -2539,15 +2551,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 27054156202,
+     "fixed1": 25895078314,
      "staging_layers": 1,
-     "fixed": 27054156202,
-     "cache_slots": 2487,
-     "cache_bytes": 11597617152,
-     "wired_limit": 38651773354,
+     "fixed": 25895078314,
+     "cache_slots": 2736,
+     "cache_bytes": 12758777856,
+     "wired_limit": 38653856170,
      "bound": "Live",
-     "fixed_gib": 25.196146408095956,
-     "cache_gib": 10.801122665405273,
+     "fixed_gib": 24.116671005263925,
+     "cache_gib": 11.882537841796875,
      "budget_gib": 36.0
     },
     {
@@ -2555,7 +2567,7 @@
      "chunk_rows": 8192,
      "others_gib": 20,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 1349202739,
       "compute": 10570951184,
@@ -2564,7 +2576,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 1.2565429685637355,
       "compute": 9.844965472817421,
@@ -2575,35 +2587,359 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 33576867447,
+     "fixed1": 32417789559,
      "staging_layers": 2,
-     "fixed": 38352082551,
+     "fixed": 37193004663,
+     "cache_slots": 12610,
+     "cache_bytes": 58804162560,
+     "wired_limit": 95997167223,
+     "bound": "WorkingSet",
+     "fixed_gib": 34.63868486043066,
+     "cache_gib": 54.76564407348633,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 8192,
+     "others_gib": 50,
+     "terms": {
+      "dense": 8003184948,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 10570951184,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 7.4535468108952045,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 9.844965472817421,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 32417789559,
+     "staging_layers": 2,
+     "fixed": 37193004663,
+     "cache_slots": 7221,
+     "cache_bytes": 33673660416,
+     "wired_limit": 70866665079,
+     "bound": "Live",
+     "fixed_gib": 34.63868486043066,
+     "cache_gib": 31.361040115356445,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 8192,
+     "others_gib": 80,
+     "terms": {
+      "dense": 8003184948,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 10570951184,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 7.4535468108952045,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 9.844965472817421,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 32417789559,
+     "staging_layers": 1,
+     "fixed": 32417789559,
+     "cache_slots": 1337,
+     "cache_bytes": 6234826752,
+     "wired_limit": 38652616311,
+     "bound": "Live",
+     "fixed_gib": 30.191419235430658,
+     "cache_gib": 5.806634902954102,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 4096,
+     "others_gib": 20,
+     "terms": {
+      "dense": 8003184948,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 6776230006,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 7.4535468108952045,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 6.310855975374579,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 28455296221,
+     "staging_layers": 2,
+     "fixed": 33230511325,
+     "cache_slots": 13460,
+     "cache_bytes": 62767964160,
+     "wired_limit": 95998475485,
+     "bound": "WorkingSet",
+     "fixed_gib": 30.948325362987816,
+     "cache_gib": 58.45722198486328,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 4096,
+     "others_gib": 50,
+     "terms": {
+      "dense": 8003184948,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 6776230006,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 7.4535468108952045,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 6.310855975374579,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 28455296221,
+     "staging_layers": 2,
+     "fixed": 33230511325,
+     "cache_slots": 8070,
+     "cache_bytes": 37632798720,
+     "wired_limit": 70863310045,
+     "bound": "Live",
+     "fixed_gib": 30.948325362987816,
+     "cache_gib": 35.048274993896484,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 4096,
+     "others_gib": 80,
+     "terms": {
+      "dense": 8003184948,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 6776230006,
+      "io": 603979776,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 7.4535468108952045,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 6.310855975374579,
+      "io": 0.5625,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 28455296221,
+     "staging_layers": 1,
+     "fixed": 28455296221,
+     "cache_slots": 2187,
+     "cache_bytes": 10198628352,
+     "wired_limit": 38653924573,
+     "bound": "Live",
+     "fixed_gib": 26.501059737987816,
+     "cache_gib": 9.498212814331055,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 2048,
+     "others_gib": 20,
+     "terms": {
+      "dense": 8003184948,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 4878869418,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 7.4535468108952045,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 4.543801227584481,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 26474049553,
+     "staging_layers": 2,
+     "fixed": 31249264657,
+     "cache_slots": 13885,
+     "cache_bytes": 64749864960,
+     "wired_limit": 95999129617,
+     "bound": "WorkingSet",
+     "fixed_gib": 29.103145615197718,
+     "cache_gib": 60.30301094055176,
+     "budget_gib": 89.40696716308594
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 2048,
+     "others_gib": 50,
+     "terms": {
+      "dense": 8003184948,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 4878869418,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 7.4535468108952045,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 4.543801227584481,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 70866960384,
+     "budget": 70866960384,
+     "fixed1": 26474049553,
+     "staging_layers": 2,
+     "fixed": 31249264657,
+     "cache_slots": 8495,
+     "cache_bytes": 39614699520,
+     "wired_limit": 70863964177,
+     "bound": "Live",
+     "fixed_gib": 29.103145615197718,
+     "cache_gib": 36.89406394958496,
+     "budget_gib": 66.0
+    },
+    {
+     "ctx": 65536,
+     "chunk_rows": 2048,
+     "others_gib": 80,
+     "terms": {
+      "dense": 8003184948,
+      "staging_layer": 4775215104,
+      "kv": 1349202739,
+      "compute": 4878869418,
+      "io": 520093696,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 7.4535468108952045,
+      "staging_layer": 4.447265625,
+      "kv": 1.2565429685637355,
+      "compute": 4.543801227584481,
+      "io": 0.484375,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 38654705664,
+     "budget": 38654705664,
+     "fixed1": 26474049553,
+     "staging_layers": 1,
+     "fixed": 26474049553,
+     "cache_slots": 2612,
+     "cache_bytes": 12180529152,
+     "wired_limit": 38654578705,
+     "bound": "Live",
+     "fixed_gib": 24.655879990197718,
+     "cache_gib": 11.344001770019531,
+     "budget_gib": 36.0
+    },
+    {
+     "ctx": 131072,
+     "chunk_rows": 8192,
+     "others_gib": 20,
+     "terms": {
+      "dense": 8003184948,
+      "staging_layer": 4775215104,
+      "kv": 2497078886,
+      "compute": 10581017514,
+      "io": 771751936,
+      "driver": 4800000000,
+      "pool": 2147483648
+     },
+     "terms_gib": {
+      "dense": 7.4535468108952045,
+      "staging_layer": 4.447265625,
+      "kv": 2.325585937127471,
+      "compute": 9.85434047318995,
+      "io": 0.71875,
+      "driver": 4.470348358154297,
+      "pool": 2.0
+     },
+     "refused": false,
+     "live": 103079215104,
+     "budget": 96000000000,
+     "fixed1": 33575732036,
+     "staging_layers": 2,
+     "fixed": 38350947140,
      "cache_slots": 12362,
      "cache_bytes": 57647665152,
-     "wired_limit": 95999747703,
+     "wired_limit": 95998612292,
      "bound": "WorkingSet",
-     "fixed_gib": 35.71816026326269,
+     "fixed_gib": 35.71710282936692,
      "cache_gib": 53.68857192993164,
      "budget_gib": 89.40696716308594
     },
     {
-     "ctx": 65536,
+     "ctx": 131072,
      "chunk_rows": 8192,
      "others_gib": 50,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
-      "kv": 1349202739,
-      "compute": 10570951184,
+      "kv": 2497078886,
+      "compute": 10581017514,
       "io": 771751936,
       "driver": 4800000000,
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
-      "kv": 1.2565429685637355,
-      "compute": 9.844965472817421,
+      "kv": 2.325585937127471,
+      "compute": 9.85434047318995,
       "io": 0.71875,
       "driver": 4.470348358154297,
       "pool": 2.0
@@ -2611,35 +2947,35 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 33576867447,
+     "fixed1": 33575732036,
      "staging_layers": 2,
-     "fixed": 38352082551,
+     "fixed": 38350947140,
      "cache_slots": 6972,
      "cache_bytes": 32512499712,
-     "wired_limit": 70864582263,
+     "wired_limit": 70863446852,
      "bound": "Live",
-     "fixed_gib": 35.71816026326269,
+     "fixed_gib": 35.71710282936692,
      "cache_gib": 30.279624938964844,
      "budget_gib": 66.0
     },
     {
-     "ctx": 65536,
+     "ctx": 131072,
      "chunk_rows": 8192,
      "others_gib": 80,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
-      "kv": 1349202739,
-      "compute": 10570951184,
+      "kv": 2497078886,
+      "compute": 10581017514,
       "io": 771751936,
       "driver": 4800000000,
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
-      "kv": 1.2565429685637355,
-      "compute": 9.844965472817421,
+      "kv": 2.325585937127471,
+      "compute": 9.85434047318995,
       "io": 0.71875,
       "driver": 4.470348358154297,
       "pool": 2.0
@@ -2647,35 +2983,35 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 33576867447,
+     "fixed1": 33575732036,
      "staging_layers": 1,
-     "fixed": 33576867447,
-     "cache_slots": 1088,
-     "cache_bytes": 5073666048,
-     "wired_limit": 38650533495,
+     "fixed": 33575732036,
+     "cache_slots": 1089,
+     "cache_bytes": 5078329344,
+     "wired_limit": 38654061380,
      "bound": "Live",
-     "fixed_gib": 31.27089463826269,
-     "cache_gib": 4.7252197265625,
+     "fixed_gib": 31.269837204366922,
+     "cache_gib": 4.729562759399414,
      "budget_gib": 36.0
     },
     {
-     "ctx": 65536,
+     "ctx": 131072,
      "chunk_rows": 4096,
      "others_gib": 20,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
-      "kv": 1349202739,
-      "compute": 6776230006,
+      "kv": 2497078886,
+      "compute": 6786296336,
       "io": 603979776,
       "driver": 4800000000,
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
-      "kv": 1.2565429685637355,
-      "compute": 6.310855975374579,
+      "kv": 2.325585937127471,
+      "compute": 6.3202309757471085,
       "io": 0.5625,
       "driver": 4.470348358154297,
       "pool": 2.0
@@ -2683,35 +3019,35 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 29614374109,
+     "fixed1": 29613238698,
      "staging_layers": 2,
-     "fixed": 34389589213,
-     "cache_slots": 13211,
-     "cache_bytes": 61606803456,
-     "wired_limit": 95996392669,
+     "fixed": 34388453802,
+     "cache_slots": 13212,
+     "cache_bytes": 61611466752,
+     "wired_limit": 95999920554,
      "bound": "WorkingSet",
-     "fixed_gib": 32.02780076581985,
-     "cache_gib": 57.37580680847168,
+     "fixed_gib": 32.02674333192408,
+     "cache_gib": 57.380149841308594,
      "budget_gib": 89.40696716308594
     },
     {
-     "ctx": 65536,
+     "ctx": 131072,
      "chunk_rows": 4096,
      "others_gib": 50,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
-      "kv": 1349202739,
-      "compute": 6776230006,
+      "kv": 2497078886,
+      "compute": 6786296336,
       "io": 603979776,
       "driver": 4800000000,
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
-      "kv": 1.2565429685637355,
-      "compute": 6.310855975374579,
+      "kv": 2.325585937127471,
+      "compute": 6.3202309757471085,
       "io": 0.5625,
       "driver": 4.470348358154297,
       "pool": 2.0
@@ -2719,35 +3055,35 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 29614374109,
+     "fixed1": 29613238698,
      "staging_layers": 2,
-     "fixed": 34389589213,
+     "fixed": 34388453802,
      "cache_slots": 7822,
      "cache_bytes": 36476301312,
-     "wired_limit": 70865890525,
+     "wired_limit": 70864755114,
      "bound": "Live",
-     "fixed_gib": 32.02780076581985,
+     "fixed_gib": 32.02674333192408,
      "cache_gib": 33.9712028503418,
      "budget_gib": 66.0
     },
     {
-     "ctx": 65536,
+     "ctx": 131072,
      "chunk_rows": 4096,
      "others_gib": 80,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
-      "kv": 1349202739,
-      "compute": 6776230006,
+      "kv": 2497078886,
+      "compute": 6786296336,
       "io": 603979776,
       "driver": 4800000000,
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
-      "kv": 1.2565429685637355,
-      "compute": 6.310855975374579,
+      "kv": 2.325585937127471,
+      "compute": 6.3202309757471085,
       "io": 0.5625,
       "driver": 4.470348358154297,
       "pool": 2.0
@@ -2755,35 +3091,35 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 29614374109,
+     "fixed1": 29613238698,
      "staging_layers": 1,
-     "fixed": 29614374109,
+     "fixed": 29613238698,
      "cache_slots": 1938,
      "cache_bytes": 9037467648,
-     "wired_limit": 38651841757,
+     "wired_limit": 38650706346,
      "bound": "Live",
-     "fixed_gib": 27.580535140819848,
+     "fixed_gib": 27.57947770692408,
      "cache_gib": 8.416797637939453,
      "budget_gib": 36.0
     },
     {
-     "ctx": 65536,
+     "ctx": 131072,
      "chunk_rows": 2048,
      "others_gib": 20,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
-      "kv": 1349202739,
-      "compute": 4878869418,
+      "kv": 2497078886,
+      "compute": 4888935747,
       "io": 520093696,
       "driver": 4800000000,
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
-      "kv": 1.2565429685637355,
-      "compute": 4.543801227584481,
+      "kv": 2.325585937127471,
+      "compute": 4.553176227025688,
       "io": 0.484375,
       "driver": 4.470348358154297,
       "pool": 2.0
@@ -2791,35 +3127,35 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 27633127441,
+     "fixed1": 27631992029,
      "staging_layers": 2,
-     "fixed": 32408342545,
+     "fixed": 32407207133,
      "cache_slots": 13636,
      "cache_bytes": 63588704256,
-     "wired_limit": 95997046801,
+     "wired_limit": 95995911389,
      "bound": "WorkingSet",
-     "fixed_gib": 30.18262101802975,
+     "fixed_gib": 30.18156358320266,
      "cache_gib": 59.221595764160156,
      "budget_gib": 89.40696716308594
     },
     {
-     "ctx": 65536,
+     "ctx": 131072,
      "chunk_rows": 2048,
      "others_gib": 50,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
-      "kv": 1349202739,
-      "compute": 4878869418,
+      "kv": 2497078886,
+      "compute": 4888935747,
       "io": 520093696,
       "driver": 4800000000,
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
-      "kv": 1.2565429685637355,
-      "compute": 4.543801227584481,
+      "kv": 2.325585937127471,
+      "compute": 4.553176227025688,
       "io": 0.484375,
       "driver": 4.470348358154297,
       "pool": 2.0
@@ -2827,35 +3163,35 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 27633127441,
+     "fixed1": 27631992029,
      "staging_layers": 2,
-     "fixed": 32408342545,
+     "fixed": 32407207133,
      "cache_slots": 8247,
      "cache_bytes": 38458202112,
-     "wired_limit": 70866544657,
+     "wired_limit": 70865409245,
      "bound": "Live",
-     "fixed_gib": 30.18262101802975,
+     "fixed_gib": 30.18156358320266,
      "cache_gib": 35.81699180603027,
      "budget_gib": 66.0
     },
     {
-     "ctx": 65536,
+     "ctx": 131072,
      "chunk_rows": 2048,
      "others_gib": 80,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
-      "kv": 1349202739,
-      "compute": 4878869418,
+      "kv": 2497078886,
+      "compute": 4888935747,
       "io": 520093696,
       "driver": 4800000000,
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
-      "kv": 1.2565429685637355,
-      "compute": 4.543801227584481,
+      "kv": 2.325585937127471,
+      "compute": 4.553176227025688,
       "io": 0.484375,
       "driver": 4.470348358154297,
       "pool": 2.0
@@ -2863,347 +3199,23 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 27633127441,
+     "fixed1": 27631992029,
      "staging_layers": 1,
-     "fixed": 27633127441,
+     "fixed": 27631992029,
      "cache_slots": 2363,
      "cache_bytes": 11019368448,
-     "wired_limit": 38652495889,
+     "wired_limit": 38651360477,
      "bound": "Live",
-     "fixed_gib": 25.73535539302975,
+     "fixed_gib": 25.73429795820266,
      "cache_gib": 10.26258659362793,
      "budget_gib": 36.0
     },
     {
-     "ctx": 131072,
-     "chunk_rows": 8192,
-     "others_gib": 20,
-     "terms": {
-      "dense": 9162262836,
-      "staging_layer": 4775215104,
-      "kv": 2497078886,
-      "compute": 10581017514,
-      "io": 771751936,
-      "driver": 4800000000,
-      "pool": 2147483648
-     },
-     "terms_gib": {
-      "dense": 8.533022213727236,
-      "staging_layer": 4.447265625,
-      "kv": 2.325585937127471,
-      "compute": 9.85434047318995,
-      "io": 0.71875,
-      "driver": 4.470348358154297,
-      "pool": 2.0
-     },
-     "refused": false,
-     "live": 103079215104,
-     "budget": 96000000000,
-     "fixed1": 34734809924,
-     "staging_layers": 2,
-     "fixed": 39510025028,
-     "cache_slots": 12113,
-     "cache_bytes": 56486504448,
-     "wired_limit": 95996529476,
-     "bound": "WorkingSet",
-     "fixed_gib": 36.796578232198954,
-     "cache_gib": 52.60715675354004,
-     "budget_gib": 89.40696716308594
-    },
-    {
-     "ctx": 131072,
-     "chunk_rows": 8192,
-     "others_gib": 50,
-     "terms": {
-      "dense": 9162262836,
-      "staging_layer": 4775215104,
-      "kv": 2497078886,
-      "compute": 10581017514,
-      "io": 771751936,
-      "driver": 4800000000,
-      "pool": 2147483648
-     },
-     "terms_gib": {
-      "dense": 8.533022213727236,
-      "staging_layer": 4.447265625,
-      "kv": 2.325585937127471,
-      "compute": 9.85434047318995,
-      "io": 0.71875,
-      "driver": 4.470348358154297,
-      "pool": 2.0
-     },
-     "refused": false,
-     "live": 70866960384,
-     "budget": 70866960384,
-     "fixed1": 34734809924,
-     "staging_layers": 2,
-     "fixed": 39510025028,
-     "cache_slots": 6724,
-     "cache_bytes": 31356002304,
-     "wired_limit": 70866027332,
-     "bound": "Live",
-     "fixed_gib": 36.796578232198954,
-     "cache_gib": 29.202552795410156,
-     "budget_gib": 66.0
-    },
-    {
-     "ctx": 131072,
-     "chunk_rows": 8192,
-     "others_gib": 80,
-     "terms": {
-      "dense": 9162262836,
-      "staging_layer": 4775215104,
-      "kv": 2497078886,
-      "compute": 10581017514,
-      "io": 771751936,
-      "driver": 4800000000,
-      "pool": 2147483648
-     },
-     "terms_gib": {
-      "dense": 8.533022213727236,
-      "staging_layer": 4.447265625,
-      "kv": 2.325585937127471,
-      "compute": 9.85434047318995,
-      "io": 0.71875,
-      "driver": 4.470348358154297,
-      "pool": 2.0
-     },
-     "refused": false,
-     "live": 38654705664,
-     "budget": 38654705664,
-     "fixed1": 34734809924,
-     "staging_layers": 1,
-     "fixed": 34734809924,
-     "cache_slots": 840,
-     "cache_bytes": 3917168640,
-     "wired_limit": 38651978564,
-     "bound": "Live",
-     "fixed_gib": 32.349312607198954,
-     "cache_gib": 3.6481475830078125,
-     "budget_gib": 36.0
-    },
-    {
-     "ctx": 131072,
-     "chunk_rows": 4096,
-     "others_gib": 20,
-     "terms": {
-      "dense": 9162262836,
-      "staging_layer": 4775215104,
-      "kv": 2497078886,
-      "compute": 6786296336,
-      "io": 603979776,
-      "driver": 4800000000,
-      "pool": 2147483648
-     },
-     "terms_gib": {
-      "dense": 8.533022213727236,
-      "staging_layer": 4.447265625,
-      "kv": 2.325585937127471,
-      "compute": 6.3202309757471085,
-      "io": 0.5625,
-      "driver": 4.470348358154297,
-      "pool": 2.0
-     },
-     "refused": false,
-     "live": 103079215104,
-     "budget": 96000000000,
-     "fixed1": 30772316586,
-     "staging_layers": 2,
-     "fixed": 35547531690,
-     "cache_slots": 12963,
-     "cache_bytes": 60450306048,
-     "wired_limit": 95997837738,
-     "bound": "WorkingSet",
-     "fixed_gib": 33.10621873475611,
-     "cache_gib": 56.29873466491699,
-     "budget_gib": 89.40696716308594
-    },
-    {
-     "ctx": 131072,
-     "chunk_rows": 4096,
-     "others_gib": 50,
-     "terms": {
-      "dense": 9162262836,
-      "staging_layer": 4775215104,
-      "kv": 2497078886,
-      "compute": 6786296336,
-      "io": 603979776,
-      "driver": 4800000000,
-      "pool": 2147483648
-     },
-     "terms_gib": {
-      "dense": 8.533022213727236,
-      "staging_layer": 4.447265625,
-      "kv": 2.325585937127471,
-      "compute": 6.3202309757471085,
-      "io": 0.5625,
-      "driver": 4.470348358154297,
-      "pool": 2.0
-     },
-     "refused": false,
-     "live": 70866960384,
-     "budget": 70866960384,
-     "fixed1": 30772316586,
-     "staging_layers": 2,
-     "fixed": 35547531690,
-     "cache_slots": 7573,
-     "cache_bytes": 35315140608,
-     "wired_limit": 70862672298,
-     "bound": "Live",
-     "fixed_gib": 33.10621873475611,
-     "cache_gib": 32.889787673950195,
-     "budget_gib": 66.0
-    },
-    {
-     "ctx": 131072,
-     "chunk_rows": 4096,
-     "others_gib": 80,
-     "terms": {
-      "dense": 9162262836,
-      "staging_layer": 4775215104,
-      "kv": 2497078886,
-      "compute": 6786296336,
-      "io": 603979776,
-      "driver": 4800000000,
-      "pool": 2147483648
-     },
-     "terms_gib": {
-      "dense": 8.533022213727236,
-      "staging_layer": 4.447265625,
-      "kv": 2.325585937127471,
-      "compute": 6.3202309757471085,
-      "io": 0.5625,
-      "driver": 4.470348358154297,
-      "pool": 2.0
-     },
-     "refused": false,
-     "live": 38654705664,
-     "budget": 38654705664,
-     "fixed1": 30772316586,
-     "staging_layers": 1,
-     "fixed": 30772316586,
-     "cache_slots": 1690,
-     "cache_bytes": 7880970240,
-     "wired_limit": 38653286826,
-     "bound": "Live",
-     "fixed_gib": 28.658953109756112,
-     "cache_gib": 7.339725494384766,
-     "budget_gib": 36.0
-    },
-    {
-     "ctx": 131072,
-     "chunk_rows": 2048,
-     "others_gib": 20,
-     "terms": {
-      "dense": 9162262836,
-      "staging_layer": 4775215104,
-      "kv": 2497078886,
-      "compute": 4888935747,
-      "io": 520093696,
-      "driver": 4800000000,
-      "pool": 2147483648
-     },
-     "terms_gib": {
-      "dense": 8.533022213727236,
-      "staging_layer": 4.447265625,
-      "kv": 2.325585937127471,
-      "compute": 4.553176227025688,
-      "io": 0.484375,
-      "driver": 4.470348358154297,
-      "pool": 2.0
-     },
-     "refused": false,
-     "live": 103079215104,
-     "budget": 96000000000,
-     "fixed1": 28791069917,
-     "staging_layers": 2,
-     "fixed": 33566285021,
-     "cache_slots": 13388,
-     "cache_bytes": 62432206848,
-     "wired_limit": 95998491869,
-     "bound": "WorkingSet",
-     "fixed_gib": 31.26103898603469,
-     "cache_gib": 58.14452362060547,
-     "budget_gib": 89.40696716308594
-    },
-    {
-     "ctx": 131072,
-     "chunk_rows": 2048,
-     "others_gib": 50,
-     "terms": {
-      "dense": 9162262836,
-      "staging_layer": 4775215104,
-      "kv": 2497078886,
-      "compute": 4888935747,
-      "io": 520093696,
-      "driver": 4800000000,
-      "pool": 2147483648
-     },
-     "terms_gib": {
-      "dense": 8.533022213727236,
-      "staging_layer": 4.447265625,
-      "kv": 2.325585937127471,
-      "compute": 4.553176227025688,
-      "io": 0.484375,
-      "driver": 4.470348358154297,
-      "pool": 2.0
-     },
-     "refused": false,
-     "live": 70866960384,
-     "budget": 70866960384,
-     "fixed1": 28791069917,
-     "staging_layers": 2,
-     "fixed": 33566285021,
-     "cache_slots": 7998,
-     "cache_bytes": 37297041408,
-     "wired_limit": 70863326429,
-     "bound": "Live",
-     "fixed_gib": 31.26103898603469,
-     "cache_gib": 34.73557662963867,
-     "budget_gib": 66.0
-    },
-    {
-     "ctx": 131072,
-     "chunk_rows": 2048,
-     "others_gib": 80,
-     "terms": {
-      "dense": 9162262836,
-      "staging_layer": 4775215104,
-      "kv": 2497078886,
-      "compute": 4888935747,
-      "io": 520093696,
-      "driver": 4800000000,
-      "pool": 2147483648
-     },
-     "terms_gib": {
-      "dense": 8.533022213727236,
-      "staging_layer": 4.447265625,
-      "kv": 2.325585937127471,
-      "compute": 4.553176227025688,
-      "io": 0.484375,
-      "driver": 4.470348358154297,
-      "pool": 2.0
-     },
-     "refused": false,
-     "live": 38654705664,
-     "budget": 38654705664,
-     "fixed1": 28791069917,
-     "staging_layers": 1,
-     "fixed": 28791069917,
-     "cache_slots": 2115,
-     "cache_bytes": 9862871040,
-     "wired_limit": 38653940957,
-     "bound": "Live",
-     "fixed_gib": 26.81377336103469,
-     "cache_gib": 9.185514450073242,
-     "budget_gib": 36.0
-    },
-    {
      "ctx": 262144,
      "chunk_rows": 8192,
      "others_gib": 20,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 4792831180,
       "compute": 10601150173,
@@ -3212,7 +3224,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 4.463671874254942,
       "compute": 9.873090473003685,
@@ -3223,15 +3235,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 37050694877,
+     "fixed1": 35891616989,
      "staging_layers": 2,
-     "fixed": 41825909981,
-     "cache_slots": 11617,
-     "cache_bytes": 54173509632,
-     "wired_limit": 95999419613,
+     "fixed": 40666832093,
+     "cache_slots": 11865,
+     "cache_bytes": 55330007040,
+     "wired_limit": 95996839133,
      "bound": "WorkingSet",
-     "fixed_gib": 38.95341416914016,
-     "cache_gib": 50.453012466430664,
+     "fixed_gib": 37.87393876630813,
+     "cache_gib": 51.53008460998535,
      "budget_gib": 89.40696716308594
     },
     {
@@ -3239,7 +3251,7 @@
      "chunk_rows": 8192,
      "others_gib": 50,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 4792831180,
       "compute": 10601150173,
@@ -3248,7 +3260,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 4.463671874254942,
       "compute": 9.873090473003685,
@@ -3259,15 +3271,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 37050694877,
+     "fixed1": 35891616989,
      "staging_layers": 2,
-     "fixed": 41825909981,
-     "cache_slots": 6227,
-     "cache_bytes": 29038344192,
-     "wired_limit": 70864254173,
+     "fixed": 40666832093,
+     "cache_slots": 6476,
+     "cache_bytes": 30199504896,
+     "wired_limit": 70866336989,
      "bound": "Live",
-     "fixed_gib": 38.95341416914016,
-     "cache_gib": 27.044065475463867,
+     "fixed_gib": 37.87393876630813,
+     "cache_gib": 28.12548065185547,
      "budget_gib": 66.0
     },
     {
@@ -3275,7 +3287,7 @@
      "chunk_rows": 8192,
      "others_gib": 80,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 4792831180,
       "compute": 10601150173,
@@ -3284,7 +3296,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 4.463671874254942,
       "compute": 9.873090473003685,
@@ -3295,15 +3307,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 37050694877,
+     "fixed1": 35891616989,
      "staging_layers": 1,
-     "fixed": 37050694877,
-     "cache_slots": 343,
-     "cache_bytes": 1599510528,
-     "wired_limit": 38650205405,
+     "fixed": 35891616989,
+     "cache_slots": 592,
+     "cache_bytes": 2760671232,
+     "wired_limit": 38652288221,
      "bound": "Live",
-     "fixed_gib": 34.50614854414016,
-     "cache_gib": 1.4896602630615234,
+     "fixed_gib": 33.42667314130813,
+     "cache_gib": 2.571075439453125,
      "budget_gib": 36.0
     },
     {
@@ -3311,7 +3323,7 @@
      "chunk_rows": 4096,
      "others_gib": 20,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 4792831180,
       "compute": 6806428995,
@@ -3320,7 +3332,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 4.463671874254942,
       "compute": 6.338980975560844,
@@ -3331,15 +3343,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 33088201539,
+     "fixed1": 31929123651,
      "staging_layers": 2,
-     "fixed": 37863416643,
-     "cache_slots": 12466,
-     "cache_bytes": 58132647936,
-     "wired_limit": 95996064579,
+     "fixed": 36704338755,
+     "cache_slots": 12715,
+     "cache_bytes": 59293808640,
+     "wired_limit": 95998147395,
      "bound": "WorkingSet",
-     "fixed_gib": 35.26305467169732,
-     "cache_gib": 54.1402473449707,
+     "fixed_gib": 34.18357926886529,
+     "cache_gib": 55.221662521362305,
      "budget_gib": 89.40696716308594
     },
     {
@@ -3347,7 +3359,7 @@
      "chunk_rows": 4096,
      "others_gib": 50,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 4792831180,
       "compute": 6806428995,
@@ -3356,7 +3368,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 4.463671874254942,
       "compute": 6.338980975560844,
@@ -3367,15 +3379,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 33088201539,
+     "fixed1": 31929123651,
      "staging_layers": 2,
-     "fixed": 37863416643,
-     "cache_slots": 7077,
-     "cache_bytes": 33002145792,
-     "wired_limit": 70865562435,
+     "fixed": 36704338755,
+     "cache_slots": 7325,
+     "cache_bytes": 34158643200,
+     "wired_limit": 70862981955,
      "bound": "Live",
-     "fixed_gib": 35.26305467169732,
-     "cache_gib": 30.73564338684082,
+     "fixed_gib": 34.18357926886529,
+     "cache_gib": 31.812715530395508,
      "budget_gib": 66.0
     },
     {
@@ -3383,7 +3395,7 @@
      "chunk_rows": 4096,
      "others_gib": 80,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 4792831180,
       "compute": 6806428995,
@@ -3392,7 +3404,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 4.463671874254942,
       "compute": 6.338980975560844,
@@ -3403,15 +3415,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 33088201539,
+     "fixed1": 31929123651,
      "staging_layers": 1,
-     "fixed": 33088201539,
-     "cache_slots": 1193,
-     "cache_bytes": 5563312128,
-     "wired_limit": 38651513667,
+     "fixed": 31929123651,
+     "cache_slots": 1442,
+     "cache_bytes": 6724472832,
+     "wired_limit": 38653596483,
      "bound": "Live",
-     "fixed_gib": 30.81578904669732,
-     "cache_gib": 5.181238174438477,
+     "fixed_gib": 29.736313643865287,
+     "cache_gib": 6.262653350830078,
      "budget_gib": 36.0
     },
     {
@@ -3419,7 +3431,7 @@
      "chunk_rows": 2048,
      "others_gib": 20,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 4792831180,
       "compute": 4909068406,
@@ -3428,7 +3440,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 4.463671874254942,
       "compute": 4.571926226839423,
@@ -3439,15 +3451,15 @@
      "refused": false,
      "live": 103079215104,
      "budget": 96000000000,
-     "fixed1": 31106954870,
+     "fixed1": 29947876982,
      "staging_layers": 2,
-     "fixed": 35882169974,
-     "cache_slots": 12891,
-     "cache_bytes": 60114548736,
-     "wired_limit": 95996718710,
+     "fixed": 34723092086,
+     "cache_slots": 13140,
+     "cache_bytes": 61275709440,
+     "wired_limit": 95998801526,
      "bound": "WorkingSet",
-     "fixed_gib": 33.4178749229759,
-     "cache_gib": 55.98603630065918,
+     "fixed_gib": 32.33839952014387,
+     "cache_gib": 57.06745147705078,
      "budget_gib": 89.40696716308594
     },
     {
@@ -3455,7 +3467,7 @@
      "chunk_rows": 2048,
      "others_gib": 50,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 4792831180,
       "compute": 4909068406,
@@ -3464,7 +3476,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 4.463671874254942,
       "compute": 4.571926226839423,
@@ -3475,15 +3487,15 @@
      "refused": false,
      "live": 70866960384,
      "budget": 70866960384,
-     "fixed1": 31106954870,
+     "fixed1": 29947876982,
      "staging_layers": 2,
-     "fixed": 35882169974,
-     "cache_slots": 7502,
-     "cache_bytes": 34984046592,
-     "wired_limit": 70866216566,
+     "fixed": 34723092086,
+     "cache_slots": 7750,
+     "cache_bytes": 36140544000,
+     "wired_limit": 70863636086,
      "bound": "Live",
-     "fixed_gib": 33.4178749229759,
-     "cache_gib": 32.5814323425293,
+     "fixed_gib": 32.33839952014387,
+     "cache_gib": 33.658504486083984,
      "budget_gib": 66.0
     },
     {
@@ -3491,7 +3503,7 @@
      "chunk_rows": 2048,
      "others_gib": 80,
      "terms": {
-      "dense": 9162262836,
+      "dense": 8003184948,
       "staging_layer": 4775215104,
       "kv": 4792831180,
       "compute": 4909068406,
@@ -3500,7 +3512,7 @@
       "pool": 2147483648
      },
      "terms_gib": {
-      "dense": 8.533022213727236,
+      "dense": 7.4535468108952045,
       "staging_layer": 4.447265625,
       "kv": 4.463671874254942,
       "compute": 4.571926226839423,
@@ -3511,15 +3523,15 @@
      "refused": false,
      "live": 38654705664,
      "budget": 38654705664,
-     "fixed1": 31106954870,
+     "fixed1": 29947876982,
      "staging_layers": 1,
-     "fixed": 31106954870,
-     "cache_slots": 1618,
-     "cache_bytes": 7545212928,
-     "wired_limit": 38652167798,
+     "fixed": 29947876982,
+     "cache_slots": 1867,
+     "cache_bytes": 8706373632,
+     "wired_limit": 38654250614,
      "bound": "Live",
-     "fixed_gib": 28.970609297975898,
-     "cache_gib": 7.027027130126953,
+     "fixed_gib": 27.891133895143867,
+     "cache_gib": 8.108442306518555,
      "budget_gib": 36.0
     }
    ],
@@ -3528,18 +3540,19 @@
      "admitted": true,
      "ctx": 262144,
      "chunk_rows": 8192,
-     "cache_bytes": 54173509632,
-     "cache_gib": 50.453012466430664,
+     "cache_bytes": 55330007040,
+     "cache_gib": 51.53008460998535,
      "staging_layers": 2,
-     "wired_limit": 95999419613,
+     "wired_limit": 95996839133,
+     "bound": "WorkingSet",
      "steps": [
       {
        "ctx": 262144,
        "chunk_rows": 8192,
        "per_chunk": {
-        "8192": 50.453,
-        "4096": 54.1402,
-        "2048": 55.986
+        "8192": 51.5301,
+        "4096": 55.2217,
+        "2048": 57.0675
        }
       }
      ]
@@ -3548,18 +3561,19 @@
      "admitted": true,
      "ctx": 262144,
      "chunk_rows": 8192,
-     "cache_bytes": 29038344192,
-     "cache_gib": 27.044065475463867,
+     "cache_bytes": 30199504896,
+     "cache_gib": 28.12548065185547,
      "staging_layers": 2,
-     "wired_limit": 70864254173,
+     "wired_limit": 70866336989,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
        "chunk_rows": 8192,
        "per_chunk": {
-        "8192": 27.0441,
-        "4096": 30.7356,
-        "2048": 32.5814
+        "8192": 28.1255,
+        "4096": 31.8127,
+        "2048": 33.6585
        }
       }
      ]
@@ -3568,18 +3582,19 @@
      "admitted": true,
      "ctx": 262144,
      "chunk_rows": 2048,
-     "cache_bytes": 7545212928,
-     "cache_gib": 7.027027130126953,
+     "cache_bytes": 8706373632,
+     "cache_gib": 8.108442306518555,
      "staging_layers": 1,
-     "wired_limit": 38652167798,
+     "wired_limit": 38654250614,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
        "chunk_rows": 2048,
        "per_chunk": {
-        "8192": 1.4897,
-        "4096": 5.1812,
-        "2048": 7.027
+        "8192": 2.5711,
+        "4096": 6.2627,
+        "2048": 8.1084
        }
       }
      ]
@@ -3588,18 +3603,19 @@
      "admitted": true,
      "ctx": 262144,
      "chunk_rows": 2048,
-     "cache_bytes": 5400096768,
-     "cache_gib": 5.029232025146484,
+     "cache_bytes": 6556594176,
+     "cache_gib": 6.106304168701172,
      "staging_layers": 1,
-     "wired_limit": 36507051638,
+     "wired_limit": 36504471158,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
        "chunk_rows": 2048,
        "per_chunk": {
-        "8192": "refused",
-        "4096": 3.1834,
-        "2048": 5.0292
+        "8192": 0.5733,
+        "4096": 4.2605,
+        "2048": 6.1063
        }
       }
      ]
@@ -3608,18 +3624,19 @@
      "admitted": true,
      "ctx": 262144,
      "chunk_rows": 2048,
-     "cache_bytes": 3250317312,
-     "cache_gib": 3.0270938873291016,
+     "cache_bytes": 4411478016,
+     "cache_gib": 4.108509063720703,
      "staging_layers": 1,
-     "wired_limit": 34357272182,
+     "wired_limit": 34359354998,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
        "chunk_rows": 2048,
        "per_chunk": {
         "8192": "refused",
-        "4096": 1.1813,
-        "2048": 3.0271
+        "4096": 2.2627,
+        "2048": 4.1085
        }
       }
      ]
@@ -3628,59 +3645,53 @@
      "admitted": true,
      "ctx": 262144,
      "chunk_rows": 2048,
-     "cache_bytes": 1105201152,
-     "cache_gib": 1.0292987823486328,
+     "cache_bytes": 2261698560,
+     "cache_gib": 2.1063709259033203,
      "staging_layers": 1,
-     "wired_limit": 32212156022,
+     "wired_limit": 32209575542,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
        "chunk_rows": 2048,
        "per_chunk": {
         "8192": "refused",
-        "4096": "refused",
-        "2048": 1.0293
+        "4096": 0.2606,
+        "2048": 2.1064
        }
       }
      ]
     },
     "88": {
      "admitted": true,
-     "ctx": 131072,
+     "ctx": 262144,
      "chunk_rows": 2048,
-     "cache_bytes": 1273079808,
-     "cache_gib": 1.185647964477539,
+     "cache_bytes": 116582400,
+     "cache_gib": 0.10857582092285156,
      "staging_layers": 1,
-     "wired_limit": 30064149725,
+     "wired_limit": 30064459382,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
-       "chunk_rows": null,
-       "per_chunk": {
-        "8192": "refused",
-        "4096": "refused",
-        "2048": "refused"
-       }
-      },
-      {
-       "ctx": 131072,
        "chunk_rows": 2048,
        "per_chunk": {
         "8192": "refused",
         "4096": "refused",
-        "2048": 1.1856
+        "2048": 0.1086
        }
       }
      ]
     },
     "90": {
      "admitted": true,
-     "ctx": 65536,
+     "ctx": 131072,
      "chunk_rows": 2048,
-     "cache_bytes": 279797760,
-     "cache_gib": 0.26058197021484375,
+     "cache_bytes": 284461056,
+     "cache_gib": 0.2649250030517578,
      "staging_layers": 1,
-     "wired_limit": 27912925201,
+     "wired_limit": 27916453085,
+     "bound": "Live",
      "steps": [
       {
        "ctx": 262144,
@@ -3693,20 +3704,11 @@
       },
       {
        "ctx": 131072,
-       "chunk_rows": null,
-       "per_chunk": {
-        "8192": "refused",
-        "4096": "refused",
-        "2048": "refused"
-       }
-      },
-      {
-       "ctx": 65536,
        "chunk_rows": 2048,
        "per_chunk": {
         "8192": "refused",
         "4096": "refused",
-        "2048": 0.2606
+        "2048": 0.2649
        }
       }
      ]

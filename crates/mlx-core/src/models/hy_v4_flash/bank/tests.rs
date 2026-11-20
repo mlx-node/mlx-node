@@ -922,6 +922,51 @@ fn lfu_directory_keeps_frequent_expert_over_recent_one_hit() {
 }
 
 #[test]
+fn default_bank_uses_lru_policy() {
+    if use_lfu_policy() {
+        return;
+    }
+    let (_dir, path, m, experts, _file) = bank_fixture();
+    let bank = KqBank::new(pool_over(&path, 4), &m, &experts, [2, 0], 1).unwrap();
+    let _ = bank.prepare(1, &[0], &[], true).unwrap();
+    bank.settle_all();
+    for _ in 0..5 {
+        let _ = bank.prepare(1, &[0], &[], true).unwrap();
+        bank.settle_all();
+    }
+    // Insert a one-hit expert more recently than expert 0.
+    let _ = bank.prepare(1, &[1], &[], true).unwrap();
+    bank.settle_all();
+    // Third distinct expert evicts LRU (expert 0), keeping recent expert 1.
+    let _ = bank.prepare(1, &[2], &[], true).unwrap();
+    bank.settle_all();
+    let g = lock(&bank.inner);
+    let cache = g.classes[0].dir.cache();
+    assert!(
+        cache.lookup(0, 0).is_none(),
+        "default LRU policy must evict least-recently-used expert 0"
+    );
+    assert!(
+        cache.lookup(0, 1).is_some(),
+        "default LRU policy must keep more recently used expert 1"
+    );
+    assert!(cache.lookup(0, 2).is_some());
+    drop(g);
+    bank.end_turn().unwrap();
+}
+
+#[test]
+fn sorted_slot_bounds_counts_exact_bm32_tiles() {
+    assert_eq!(sorted_slot_bounds(&[]), (0, 0));
+    assert_eq!(sorted_slot_bounds(&[7]), (1, 8));
+    let mut s = vec![3u32; 32];
+    s.extend(std::iter::repeat_n(10u32, 33));
+    s.push(200);
+    // 32 -> 1 tile, 33 -> 2 tiles, 1 -> 1 tile => 4 tiles; max_slot + 1 = 201.
+    assert_eq!(sorted_slot_bounds(&s), (4, 201));
+}
+
+#[test]
 fn split_step_publish_abandon_and_drop_on_error() {
     let (_dir, path, m, experts, file) = bank_fixture();
     let bank = KqBank::new(pool_over(&path, 4), &m, &experts, [4, 2], 1).unwrap();

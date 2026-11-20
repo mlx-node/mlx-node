@@ -60,8 +60,8 @@ pub const CLASSES: [ExpertClass; 2] = [ExpertClass::Q6kDown, ExpertClass::Q4kDow
 /// Half-life of LFU-decay expert cache scores, in decode tokens.
 pub const LFU_HALF_LIFE_TOKENS: f64 = 256.0;
 
-fn use_lru_policy() -> bool {
-    std::env::var("MLX_HY4_CACHE_POLICY").is_ok_and(|v| v.eq_ignore_ascii_case("lru"))
+fn use_lfu_policy() -> bool {
+    std::env::var("MLX_HY4_CACHE_POLICY").is_ok_and(|v| v.eq_ignore_ascii_case("lfu"))
 }
 
 fn prefill_nax_enabled() -> bool {
@@ -70,6 +70,26 @@ fn prefill_nax_enabled() -> bool {
 
 fn lfu_half_life(n_layers: usize, n_used: usize) -> f64 {
     (LFU_HALF_LIFE_TOKENS * (n_layers.max(1) * n_used.max(1)) as f64).max(1.0)
+}
+
+fn make_directory(
+    staging: usize,
+    n_layers: usize,
+    n_experts: usize,
+    cache_slots: usize,
+    n_used: usize,
+) -> Result<Directory> {
+    if use_lfu_policy() {
+        Directory::new_with_lfu(
+            staging,
+            n_layers,
+            n_experts,
+            cache_slots,
+            lfu_half_life(n_layers, n_used),
+        )
+    } else {
+        Directory::new(staging, n_layers, n_experts, cache_slots)
+    }
 }
 
 /// [`KqBank::residency`].
@@ -348,8 +368,7 @@ impl Directory {
         )
     }
 
-    /// `staging` = 1 or 2 staging layers; uses LFU-decay unless
-    /// `MLX_HY4_CACHE_POLICY=lru`.
+    /// `staging` = 1 or 2 staging layers with LFU-decay eviction.
     pub fn new_with_lfu(
         staging: usize,
         n_layers: usize,
@@ -360,11 +379,7 @@ impl Directory {
         if !half_life_uses.is_finite() || half_life_uses <= 0.0 {
             return Err(bad(format!("LFU half-life {half_life_uses}")));
         }
-        let cache = if use_lru_policy() {
-            Cache::lru(cache_slots, n_layers, n_experts)
-        } else {
-            Cache::lfu_decay(cache_slots, n_layers, n_experts, half_life_uses)
-        };
+        let cache = Cache::lfu_decay(cache_slots, n_layers, n_experts, half_life_uses);
         Self::with_cache(staging, n_layers, n_experts, cache)
     }
 
@@ -690,6 +705,32 @@ impl SlotDst {
     }
 }
 
+/// Exact BM=32 tile count and upper slot bound (`max_slot + 1`) for an
+/// ascending slice of bank slot ids.
+pub fn sorted_slot_bounds(sorted_slots: &[u32]) -> (i32, i32) {
+    if sorted_slots.is_empty() {
+        return (0, 0);
+    }
+    const BM: usize = 32;
+    let mut tiles = 0usize;
+    let mut run = 0usize;
+    let mut prev = sorted_slots[0];
+    for &s in sorted_slots {
+        debug_assert!(s >= prev, "sorted_slot_bounds requires ascending slots");
+        if s == prev {
+            run += 1;
+        } else {
+            tiles += run.div_ceil(BM);
+            prev = s;
+            run = 1;
+        }
+    }
+    tiles += run.div_ceil(BM);
+    let max_group = (prev as usize + 1).min(i32::MAX as usize) as i32;
+    let y_tiles = tiles.min(i32::MAX as usize) as i32;
+    (y_tiles, max_group)
+}
+
 /// One projection's bank arrays and their K-quant mode.
 #[derive(Clone)]
 pub struct ProjArrays {
@@ -750,6 +791,18 @@ impl ProjArrays {
     /// Like `gather_sorted`, enabling per-op TF32 NAX on F32 activations
     /// unless `MLX_HY4_PREFILL_NAX=0`.
     pub fn gather_sorted_nax(&self, x: &MxArray, slots: &MxArray) -> Result<MxArray> {
+        self.gather_sorted_nax_bounded(x, slots, 0, 0)
+    }
+
+    /// Like `gather_sorted_nax`, bounding the NAX grid and offset scan using
+    /// CPU-known `max_y_tiles` (for fixed BM=32) and `max_group` (`max_slot + 1`).
+    pub fn gather_sorted_nax_bounded(
+        &self,
+        x: &MxArray,
+        slots: &MxArray,
+        max_y_tiles: i32,
+        max_group: i32,
+    ) -> Result<MxArray> {
         if !prefill_nax_enabled() {
             return self.gather_sorted(x, slots);
         }
@@ -766,6 +819,8 @@ impl ProjArrays {
                 self.format.group_size() as i32,
                 self.format.bits() as i32,
                 mode.as_ptr(),
+                max_y_tiles,
+                max_group,
             )
         };
         MxArray::from_handle(h, "hy_v4_flash sorted gather_qmm nax")
@@ -1206,13 +1261,7 @@ impl KqBank {
                     None => Err(bad(format!("layer {il} has no experts"))),
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let dir = Directory::new_with_lfu(
-                staging,
-                layers.len(),
-                n,
-                cache_slots[ci],
-                lfu_half_life(layers.len(), moe.n_used),
-            )?;
+            let dir = make_directory(staging, layers.len(), n, cache_slots[ci], moe.n_used)?;
             let proj = if layers.is_empty() {
                 Vec::new()
             } else {
@@ -1544,12 +1593,12 @@ impl KqBank {
             if c.tensors.is_empty() && cache_slots[ci] > 0 {
                 return Err(bad(format!("{:?} has no layers but cache slots", c.class)));
             }
-            dirs.push(Directory::new_with_lfu(
+            dirs.push(make_directory(
                 staging,
                 c.tensors.len(),
                 n,
                 cache_slots[ci],
-                lfu_half_life(c.tensors.len(), self.n_used),
+                self.n_used,
             )?);
         }
         let inner = &mut *g;

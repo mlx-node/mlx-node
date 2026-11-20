@@ -6,9 +6,9 @@ use super::batch::{Group, MIN_Q8_ROWS, OPS, Op, Span, Wave, decode_group, group}
 use super::cache::{WINDOW_SLACK, WindowRing};
 use super::config::Attn;
 use super::moe::{AffineProj, FFN_CHUNK_ROWS, RowKind, qlinear};
-use super::weights::AttnWeights;
+use super::weights::{AttnWeights, Dense};
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::store::{Dense, Weight};
+use crate::models::deepseek_v41::store::Weight;
 
 #[test]
 fn decode_groups_follow_the_op_table() {

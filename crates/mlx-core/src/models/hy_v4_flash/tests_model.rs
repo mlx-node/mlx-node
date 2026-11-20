@@ -23,12 +23,11 @@ use super::rows::{F8Table, ResidentF8Table};
 use super::scan::{ExpertClass, ExpertLayer, Located, Scan};
 use super::stats::{PHASES, Phase, phase_seconds, set_profiling};
 use super::weights::{
-    AttnWeights, EngramWeights, Ffn, HcWeights, IndexerWeights, LayerWeights, MoeWeights, Resident,
-    Residual,
+    AttnWeights, Dense, EngramWeights, Ffn, HcWeights, IndexerWeights, LayerWeights, MoeWeights,
+    Resident, Residual,
 };
 use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::EngramConfig;
-use crate::models::deepseek_v41::store::Dense;
 use crate::moe_stream::io::{IoPool, ShardSet};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 use crate::utils::gguf_kquant::KQuantFormat;

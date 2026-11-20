@@ -24,15 +24,15 @@ use super::batch::{MIN_Q8_ROWS, Wave};
 use super::cache::{LatentBuf, LayerCache, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
 use super::indexer::{Call, Indexing, PagedIndexing};
-use super::moe::qlinear;
+use super::moe::{prefill_q8_grouped_nax_enabled, qlinear};
 use super::ops::{fast_rope, rms_norm, rope_inv_freqs};
 use super::paged::{SlotMap, planes, write_latent};
 use super::sparse::{KeyRows, gather_sink_attention, gather_sink_attention_rows};
 use super::stats::{Phase, prof_end, prof_start};
-use super::weights::AttnWeights;
+use super::weights::{AttnWeights, Dense};
 use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::ops::inv_freqs;
-use crate::models::deepseek_v41::store::{Dense, Weight};
+use crate::models::deepseek_v41::store::Weight;
 use crate::nn::Activations;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
@@ -108,7 +108,7 @@ pub fn window_rows(start: usize, n: usize, first: usize, window: usize) -> Vec<i
 /// with zero rows, as `qlinear` does.
 fn grouped_mm_t(w: &Dense, x: &MxArray, g: i64) -> Result<MxArray> {
     let s = x.shape_at(1)?;
-    if matches!(w, Dense::Qmm { .. }) && s < MIN_Q8_ROWS {
+    if w.is_qmm() && s < MIN_Q8_ROWS {
         let y = grouped_mm_t(
             w,
             &x.pad(&[0, 0, 0, (MIN_Q8_ROWS - s) as i32, 0, 0], 0.0)?,
@@ -126,34 +126,52 @@ fn grouped_mm_t(w: &Dense, x: &MxArray, g: i64) -> Result<MxArray> {
 }
 
 /// `x_mgh [m, g, k] · W_iᵀ` for the `g` row groups `W_i` of `w [g·r, k]`
-/// -> `[m, g, r]`, using the row-invariant Metal kernel directly for Q8 decode.
+/// -> `[m, g, r]`, using the row-invariant Metal kernel for Q8 decode and the
+/// NAX tensor-op kernel directly on `[m, g, k]` for Q8 prefill.
 pub(crate) fn grouped_mm_t_mgh(w: &Dense, x_mgh: &MxArray, g: i64) -> Result<MxArray> {
     let m = x_mgh.shape_at(0)?;
-    if let Dense::Qmm {
-        w: qw,
-        scales,
-        biases,
-    } = w
-        && (1..=16).contains(&m)
+    if let Some((qw, scales, biases)) = w.qmm_parts()
         && x_mgh.ndim()? == 3
         && x_mgh.shape_at(1)? == g
     {
-        let xf = if x_mgh.dtype()? == DType::Float32 {
-            x_mgh.clone()
-        } else {
-            x_mgh.astype(DType::Float32)?
-        };
-        // SAFETY: all handles are live arrays owned by this call.
-        let h = unsafe {
-            mlx_sys::mlx_hy4_q8_grouped_decode(
-                xf.as_raw_ptr(),
-                qw.as_raw_ptr(),
-                scales.as_raw_ptr(),
-                biases.as_raw_ptr(),
-            )
-        };
-        if !h.is_null() {
-            return MxArray::from_handle(h, "hy_v4_flash q8_grouped_decode");
+        if (1..=16).contains(&m) {
+            let xf = if x_mgh.dtype()? == DType::Float32 {
+                x_mgh.clone()
+            } else {
+                x_mgh.astype(DType::Float32)?
+            };
+            let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+            // SAFETY: all handles are live arrays owned by this call.
+            let h = unsafe {
+                mlx_sys::mlx_hy4_q8_grouped_decode(
+                    xf.as_raw_ptr(),
+                    qw.as_raw_ptr(),
+                    scales.as_raw_ptr(),
+                    biases_ptr,
+                )
+            };
+            if !h.is_null() {
+                return MxArray::from_handle(h, "hy_v4_flash q8_grouped_decode");
+            }
+        } else if m > 16 && prefill_q8_grouped_nax_enabled() {
+            let xf = if x_mgh.dtype()? == DType::Float32 {
+                x_mgh.clone()
+            } else {
+                x_mgh.astype(DType::Float32)?
+            };
+            let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+            // SAFETY: all handles are live arrays owned by this call.
+            let h = unsafe {
+                mlx_sys::mlx_hy4_q8_grouped_prefill(
+                    xf.as_raw_ptr(),
+                    qw.as_raw_ptr(),
+                    scales.as_raw_ptr(),
+                    biases_ptr,
+                )
+            };
+            if !h.is_null() {
+                return MxArray::from_handle(h, "hy_v4_flash q8_grouped_prefill");
+            }
         }
     }
     grouped_mm_t(w, &x_mgh.transpose(Some(&[1, 0, 2]))?, g)?.transpose(Some(&[1, 0, 2]))

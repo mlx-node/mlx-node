@@ -31,9 +31,8 @@ use super::ops::{HEAD_CHUNK, hc_head, head_chunks, head_logits, rms_norm, try_bf
 use super::prefix_state::StateLayer;
 use super::rows::{EngramRows, PrefetchHandle};
 use super::stats::{DeferScope, Phase, prof_end, prof_start};
-use super::weights::{HcWeights, LayerWeights, Resident};
+use super::weights::{Dense, HcWeights, LayerWeights, Resident};
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::store::Dense;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 model: {msg}"))
@@ -178,7 +177,7 @@ impl Owners for FlatOwners<'_, '_> {
 /// is one `qlinear` call.
 pub fn head_rows(x: &MxArray, head: &Dense) -> Result<MxArray> {
     let xf = x.astype(DType::Float32)?;
-    if let Dense::Qmm { .. } = head {
+    if head.is_qmm() {
         return qlinear(&xf, head);
     }
     if let Dense::Array(w) = head

@@ -16,12 +16,11 @@ use napi::{Error, Result};
 use super::moe::{AffineExperts, AffineProj};
 use super::scan::{ExpertClass, Located, Role, Scan};
 use super::weights::{
-    AttnWeights, Ffn, Form, IndexerWeights, LayerWeights, MoeWeights, NextnWeights, Reader,
+    AttnWeights, Dense, Ffn, Form, IndexerWeights, LayerWeights, MoeWeights, NextnWeights, Reader,
     Residual, dense_from_raw,
 };
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
-use crate::models::deepseek_v41::store::Dense;
 use crate::moe_stream::io::{AlignedBuf, Extent, ShardSet};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 

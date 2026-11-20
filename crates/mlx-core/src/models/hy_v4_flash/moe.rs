@@ -35,15 +35,14 @@ use std::sync::Arc;
 
 use napi::{Error, Result};
 
-use super::bank::{KqBank, Prepared};
+use super::bank::{KqBank, Prepared, sorted_slot_bounds};
 use super::batch::{Group, MIN_Q8_ROWS, Op, group};
 use super::config::{HyV4FlashConfig, MoeConfig};
 use super::ops::{rms_norm, route, router_scores};
 use super::stats::{Phase, prof_end, prof_start};
-use super::weights::{Ffn, LayerWeights, MoeWeights};
+use super::weights::{Dense, Ffn, LayerWeights, MoeWeights};
 use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::attention::linear;
-use crate::models::deepseek_v41::store::Dense;
 use crate::nn::Activations;
 use crate::utils::gguf_kquant::KQuantFormat;
 
@@ -63,6 +62,50 @@ pub fn prefill_ffn_chunk_rows() -> usize {
 #[cfg(test)]
 thread_local! {
     static TEST_SUBGROUP_EXPERTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_SPLIT_M1: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_PREFILL_Q8_NAX: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn prefill_q8_nax_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_PREFILL_Q8_NAX.with(std::cell::Cell::get) {
+        return v;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MLX_HY4_PREFILL_Q8_NAX").as_deref() != Ok("0"))
+}
+
+/// Grouped MLA Q8 projections (`k_b`, `v_b`) stay in exact f32 during prefill
+/// by default so TF32 rounding does not perturb pre-softmax attention scores;
+/// opt in with `MLX_HY4_PREFILL_Q8_GROUPED_NAX=1`.
+pub(crate) fn prefill_q8_grouped_nax_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = TEST_PREFILL_Q8_NAX.with(std::cell::Cell::get) {
+        return v;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("MLX_HY4_PREFILL_Q8_GROUPED_NAX").as_deref() == Ok("1"))
+}
+
+#[cfg(test)]
+pub(crate) fn with_prefill_q8_nax<T>(enabled: bool, f: impl FnOnce() -> T) -> T {
+    let prev = TEST_PREFILL_Q8_NAX.with(|c| c.replace(Some(enabled)));
+    struct Reset(Option<bool>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_PREFILL_Q8_NAX.with(|c| c.set(self.0));
+        }
+    }
+    let _reset = Reset(prev);
+    f()
+}
+
+fn split_m1_enabled() -> bool {
+    #[cfg(test)]
+    if TEST_SPLIT_M1.with(std::cell::Cell::get) {
+        return true;
+    }
+    std::env::var("MLX_HY4_SPLIT_M1").as_deref() == Ok("1")
 }
 
 fn prefill_subgroup_experts() -> usize {
@@ -118,15 +161,12 @@ impl RowKind {
     }
 }
 
-/// `linear` using the row-invariant Q8 Metal kernel for 1..=16 decode rows,
-/// falling back to `MIN_Q8_ROWS` zero-padding only when the kernel rejects
-/// the input (non-Metal or unsupported shape).
+/// `linear` using the row-invariant Q8 Metal kernel for 1..=16 decode rows
+/// and the NAX tensor-op Q8 kernel for `M > 16` prefill rows, falling back to
+/// MLX `quantized_matmul` (with `MIN_Q8_ROWS` padding when needed) on
+/// unsupported shapes or non-Metal/non-NAX devices.
 pub fn qlinear(x: &MxArray, w: &Dense) -> Result<MxArray> {
-    if let Dense::Qmm {
-        w: qw,
-        scales,
-        biases,
-    } = w
+    if let Some((qw, scales, biases)) = w.qmm_parts()
         && x.ndim()? == 2
     {
         let n = x.shape_at(0)?;
@@ -136,17 +176,37 @@ pub fn qlinear(x: &MxArray, w: &Dense) -> Result<MxArray> {
             } else {
                 x.astype(DType::Float32)?
             };
+            let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
             // SAFETY: all handles are live arrays owned by this call.
             let h = unsafe {
                 mlx_sys::mlx_hy4_q8_dense_decode(
                     xf.as_raw_ptr(),
                     qw.as_raw_ptr(),
                     scales.as_raw_ptr(),
-                    biases.as_raw_ptr(),
+                    biases_ptr,
                 )
             };
             if !h.is_null() {
                 return MxArray::from_handle(h, "hy_v4_flash q8_dense_decode");
+            }
+        } else if n > 16 && prefill_q8_nax_enabled() {
+            let xf = if x.dtype()? == DType::Float32 {
+                x.clone()
+            } else {
+                x.astype(DType::Float32)?
+            };
+            let biases_ptr = biases.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+            // SAFETY: all handles are live arrays owned by this call.
+            let h = unsafe {
+                mlx_sys::mlx_hy4_q8_dense_prefill(
+                    xf.as_raw_ptr(),
+                    qw.as_raw_ptr(),
+                    scales.as_raw_ptr(),
+                    biases_ptr,
+                )
+            };
+            if !h.is_null() {
+                return MxArray::from_handle(h, "hy_v4_flash q8_dense_prefill");
             }
         }
         if n > 0 && n < MIN_Q8_ROWS {
@@ -573,7 +633,7 @@ impl Moe {
         }
         let (rows, dim) = (x.shape_at(0)? as usize, x.shape_at(1)?);
         let mut seen = vec![false; self.moe.n_experts];
-        for (lo, hi) in chunks(rows, FFN_CHUNK_ROWS) {
+        for (lo, hi) in chunks(rows, prefill_ffn_chunk_rows()) {
             let xc = if lo == 0 && hi == rows {
                 x.clone()
             } else {
@@ -623,7 +683,9 @@ impl Moe {
             ids,
             weights,
         };
+        let rows = x.shape_at(0)?;
         if kind.is_decode()
+            && (rows >= 2 || split_m1_enabled())
             && let ExpertSource::Bank(bank) = &self.experts
             && bank.split()
         {
@@ -918,12 +980,13 @@ impl Moe {
                 }
             }
             let m = total as i64;
+            let (y_tiles, max_group) = sorted_slot_bounds(&slot);
             let x = z
                 .take(&MxArray::from_uint32(&row, &[m])?, 0)?
                 .reshape(&[m, 1, latent])?;
             let si = MxArray::from_uint32(&slot, &[m])?;
-            let g = p.arrays[0].gather_sorted_nax(&x, &si)?;
-            let u = p.arrays[1].gather_sorted_nax(&x, &si)?;
+            let g = p.arrays[0].gather_sorted_nax_bounded(&x, &si, y_tiles, max_group)?;
+            let u = p.arrays[1].gather_sorted_nax_bounded(&x, &si, y_tiles, max_group)?;
             let g = if g.dtype()? == DType::Float32 {
                 g
             } else {
@@ -936,7 +999,7 @@ impl Moe {
             };
             let a = Activations::swiglu_clamped_compiled(&g, &u, self.limit)?;
             let d_g = p.arrays[2]
-                .gather_sorted_nax(&a, &si)?
+                .gather_sorted_nax_bounded(&a, &si, y_tiles, max_group)?
                 .astype(DType::Float32)?
                 .mul(&MxArray::from_float32(&ws, &[m, 1, 1])?)?
                 .reshape(&[m, latent])?;
@@ -1116,10 +1179,17 @@ impl Moe {
         if !sorted && let Some(out) = self.kq_routed_decode(z, &slots, w, p)? {
             return Ok(out);
         }
+        let (y_tiles, max_group) = if sorted {
+            let mut sorted_slots = slots.clone();
+            sorted_slots.sort_unstable();
+            sorted_slot_bounds(&sorted_slots)
+        } else {
+            (0, 0)
+        };
         self.combine(z, &slots, w, sorted, |pi, x, i| {
             let a = &p.arrays[pi];
             if sorted {
-                a.gather_sorted_nax(x, i)
+                a.gather_sorted_nax_bounded(x, i, y_tiles, max_group)
             } else {
                 a.gather(x, i)
             }

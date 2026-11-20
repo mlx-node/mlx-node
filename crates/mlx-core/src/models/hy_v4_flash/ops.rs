@@ -1,15 +1,15 @@
 //! Hy4 small ops, all math in f32 (llama.cpp PR #32517 graph):
-//! hyper-connection mix / post / head with no comb term, the sigmoid router
-//! on DS `route_select`, and the vocab head in row chunks.
+//! hyper-connection mix / post / head with no comb term, the sigmoid router,
+//! and the vocab head in row chunks.
 
 use napi::{Error, Result};
 
 use super::config::{HcConfig, MoeConfig};
-use super::weights::HcWeights;
+use super::weights::{Dense, HcWeights};
 use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::attention::linear;
-use crate::models::deepseek_v41::ops::{hc_pre, route_select};
-use crate::models::deepseek_v41::store::{Dense, Weight};
+use crate::models::deepseek_v41::ops::hc_pre;
+use crate::models::deepseek_v41::store::Weight;
 use crate::nn::Activations;
 
 /// Vocab rows per f32 head chunk (16384 x 3072 f32 = 192 MiB).
@@ -441,6 +441,101 @@ pub fn router_scores(x: &MxArray, router: &Dense) -> Result<MxArray> {
     Activations::sigmoid(&linear(&x.astype(DType::Float32)?, router)?)
 }
 
+fn route_rows(
+    scores: &[f32],
+    bias: Option<&[f32]>,
+    n: usize,
+    k: usize,
+    route_scale: f32,
+    norm: bool,
+    out_ids: &mut [u32],
+    out_weights: &mut [f32],
+) {
+    let cmp = |a: &(f32, u32), b: &(f32, u32)| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1));
+    let mut pairs: Vec<(f32, u32)> = Vec::with_capacity(n);
+    for ((row_scores, row_ids), row_weights) in scores
+        .chunks_exact(n)
+        .zip(out_ids.chunks_exact_mut(k))
+        .zip(out_weights.chunks_exact_mut(k))
+    {
+        pairs.clear();
+        match bias {
+            Some(b) => pairs.extend(
+                row_scores
+                    .iter()
+                    .zip(b)
+                    .enumerate()
+                    .map(|(e, (&s, &bi))| (s + bi, e as u32)),
+            ),
+            None => pairs.extend(row_scores.iter().enumerate().map(|(e, &s)| (s, e as u32))),
+        }
+        if k < n {
+            pairs.select_nth_unstable_by(k - 1, cmp);
+        }
+        let top = &mut pairs[..k];
+        top.sort_unstable_by(cmp);
+        let sum = top
+            .iter()
+            .fold(0.0f32, |a, &(_, e)| a + row_scores[e as usize])
+            + 1e-20;
+        for (j, &(_, e)) in top.iter().enumerate() {
+            let x = row_scores[e as usize];
+            row_ids[j] = e;
+            row_weights[j] = (if norm && k > 1 { x / sum } else { x }) * route_scale;
+        }
+    }
+}
+
+/// O(N) per-row top-k selection matching `deepseek_v41::ops::route_select`
+/// bit-for-bit, parallelized across rows when `rows >= 256`.
+pub fn route_select_fast(
+    scores: &[f32],
+    bias: Option<&[f32]>,
+    n: usize,
+    k: usize,
+    route_scale: f32,
+    norm: bool,
+) -> (Vec<u32>, Vec<f32>) {
+    let rows = scores.len() / n;
+    if rows == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let mut ids = vec![0u32; rows * k];
+    let mut weights = vec![0.0f32; rows * k];
+    if rows < 256 {
+        route_rows(
+            scores,
+            bias,
+            n,
+            k,
+            route_scale,
+            norm,
+            &mut ids,
+            &mut weights,
+        );
+        return (ids, weights);
+    }
+    let threads = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(8)
+        .min(8)
+        .min(rows / 32)
+        .max(1);
+    let chunk_rows = rows.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for ((sc, id), wt) in scores
+            .chunks(chunk_rows * n)
+            .zip(ids.chunks_mut(chunk_rows * k))
+            .zip(weights.chunks_mut(chunk_rows * k))
+        {
+            scope.spawn(move || {
+                route_rows(sc, bias, n, k, route_scale, norm, id, wt);
+            });
+        }
+    });
+    (ids, weights)
+}
+
 /// Top `n_used` experts per row by `score + bias` (ties to the lowest id),
 /// weights from the unbiased scores `/ (Σ + 1e-20) · route_scale`.
 /// Row-major `scores [rows, n_experts]`; `[rows, n_used]` ids and weights.
@@ -457,20 +552,14 @@ pub fn route_host(
             moe.n_used
         )));
     }
-    let biased: Vec<f32> = match bias {
-        None => scores.to_vec(),
-        Some(b) if b.len() == n => scores
-            .iter()
-            .zip(b.iter().cycle())
-            .map(|(&s, &e)| s + e)
-            .collect(),
-        Some(b) => {
-            return Err(bad(format!("router bias has {} entries for {n}", b.len())));
-        }
-    };
-    Ok(route_select(
-        &biased,
+    if let Some(b) = bias
+        && b.len() != n
+    {
+        return Err(bad(format!("router bias has {} entries for {n}", b.len())));
+    }
+    Ok(route_select_fast(
         scores,
+        bias,
         n,
         moe.n_used,
         moe.route_scale,
@@ -529,7 +618,7 @@ pub fn head_logits_chunked(x: &MxArray, head: &Dense, chunk: i64) -> Result<MxAr
         return Err(bad(format!("head chunk {chunk} must be > 0")));
     }
     let xf = x.astype(DType::Float32)?;
-    if let Dense::Qmm { .. } = head {
+    if head.is_qmm() {
         return head.mm_t(&xf);
     }
     if let Dense::Array(w) = head

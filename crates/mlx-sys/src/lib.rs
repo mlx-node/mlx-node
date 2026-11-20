@@ -2125,6 +2125,8 @@ unsafe extern "C-unwind" {
 
     /// Same as [`mlx_kquant_gather_qmm_sorted`] with per-op TF32 NAX enabled
     /// on F32 activations without mutating thread-local TF32 state.
+    /// `max_y_tiles > 0` caps grid.y for the fixed BM=32 tile; `max_group > 0`
+    /// caps `num_groups` to `max_slot + 1` (0 = full `w.shape(0)`).
     pub fn mlx_kquant_gather_qmm_sorted_nax(
         x: *mut mlx_array,
         w: *mut mlx_array,
@@ -2134,6 +2136,8 @@ unsafe extern "C-unwind" {
         group_size: i32,
         bits: i32,
         mode: *const std::os::raw::c_char,
+        max_y_tiles: i32,
+        max_group: i32,
     ) -> *mut mlx_array;
 
     /// TEST-ONLY: per-thread K-quant kernel-family counters. Enabling or
@@ -3450,6 +3454,20 @@ unsafe extern "C" {
     ) -> *mut mlx_array;
 
     pub fn mlx_hy4_q8_grouped_decode(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_q8_dense_prefill(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_q8_grouped_prefill(
         x: *mut mlx_array,
         w: *mut mlx_array,
         scales: *mut mlx_array,

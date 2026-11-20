@@ -254,6 +254,67 @@ fn router_scores_and_route_match_the_oracle() {
     assert!(route(&logits.reshape(&[3, 2, 256]).unwrap(), None, &m).is_err());
 }
 
+#[test]
+fn route_select_fast_matches_deepseek_route_select_bitwise() {
+    use crate::models::deepseek_v41::ops::route_select as ds_route_select;
+
+    let n = 512usize;
+    let bias = det_f32(901, n, 0.25);
+
+    for &rows in &[1usize, 2, 16, 2048] {
+        let mut scores = det_f32(1000 + rows as u64, rows * n, 2.0);
+        // Inject exact ties, negative values, and -0.0 / +0.0 on row 0 (and last row).
+        for target_row in [0usize, rows - 1] {
+            let base = target_row * n;
+            for j in 100..124 {
+                scores[base + j] = -0.375;
+            }
+            scores[base + 124] = -0.0;
+            scores[base + 125] = 0.0;
+            for j in 200..210 {
+                scores[base + j] = 1.5;
+            }
+        }
+
+        let configs: &[(usize, bool, Option<&[f32]>, f32)] = if rows == 2048 {
+            &[(16, true, Some(bias.as_slice()), 2.5)]
+        } else {
+            &[
+                (16, true, Some(bias.as_slice()), 2.5),
+                (16, true, None, 1.0),
+                (16, false, Some(bias.as_slice()), 0.5),
+                (1, true, Some(bias.as_slice()), 1.0),
+                (2, true, None, 1.75),
+            ]
+        };
+
+        for &(k, norm, b, scale) in configs {
+            let biased: Vec<f32> = match b {
+                Some(bv) => scores
+                    .iter()
+                    .zip(bv.iter().cycle())
+                    .map(|(&s, &bi)| s + bi)
+                    .collect(),
+                None => scores.clone(),
+            };
+            let (want_ids, want_w) = ds_route_select(&biased, &scores, n, k, scale, norm);
+            let (got_ids, got_w) = route_select_fast(&scores, b, n, k, scale, norm);
+            assert_eq!(
+                got_ids,
+                want_ids,
+                "ids mismatch rows={rows} k={k} norm={norm} bias={}",
+                b.is_some()
+            );
+            assert_eq!(
+                to_bits(&got_w),
+                to_bits(&want_w),
+                "weights bits mismatch rows={rows} k={k} norm={norm} bias={}",
+                b.is_some()
+            );
+        }
+    }
+}
+
 fn engram_weights(o: &Value) -> EngramWeights {
     let dim = |k: &str| o["dims"][k].as_i64().unwrap();
     let (hc, d, cols, hd) = (dim("hc"), dim("d"), dim("n_cols"), dim("head_dim"));

@@ -37,11 +37,11 @@ use super::prefill::{Runner, Seq, index_keeps, session_keeps};
 use super::prefix_state::PrefixState;
 use super::scan::Scan;
 use super::sparse::gather_sink_attention;
+use super::weights::Dense;
 use super::weights::{LayerWeights, NextnWeights, Residual};
 use crate::array::{DType, MxArray};
 use crate::cache_limit::CacheLimitGuard;
 use crate::models::deepseek_v41::ops::inv_freqs;
-use crate::models::deepseek_v41::store::Dense;
 use crate::moe_stream::io::ShardSet;
 use crate::nn::Embedding;
 
@@ -445,7 +445,7 @@ fn draft_embedding(token_embd: &Dense, vocab: usize, dim: usize) -> Result<Embed
     );
     match token_embd {
         Dense::Array(a) => Embedding::from_weight(a),
-        Dense::Q8 { w, scales } => {
+        Dense::Q8 { w, scales } | Dense::SymQ8 { w, scales } => {
             let b = scales
                 .astype(DType::Float32)?
                 .mul_scalar(-128.0)?

@@ -25,12 +25,11 @@ use super::cache::{LatentBuf, WINDOW_SLACK};
 use super::config::{Attn, HyV4FlashConfig};
 use super::moe::{RowKind, per_row, qlinear};
 use super::ops::{fast_partial_rope_tail, rms_norm, rope_inv_freqs};
-use super::weights::IndexerWeights;
+use super::weights::{Dense, IndexerWeights};
 use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::attention::linear;
 use crate::models::deepseek_v41::indexer::INDEX_CHUNK_BYTES;
 use crate::models::deepseek_v41::ops::inv_freqs;
-use crate::models::deepseek_v41::store::Dense;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
@@ -867,7 +866,7 @@ impl Indexer {
     /// Head weights `proj·x · (H·d)^-½` `[r, H]`; decode rows one per call.
     pub fn head_weights(&self, w: &IndexerWeights, x: &MxArray, kind: RowKind) -> Result<MxArray> {
         let one = |r: &MxArray| {
-            linear(&r.astype(DType::Float32)?, &w.proj)?.mul_scalar(f64::from(self.g.weight_scale))
+            qlinear(&r.astype(DType::Float32)?, &w.proj)?.mul_scalar(f64::from(self.g.weight_scale))
         };
         match kind {
             RowKind::Decode => per_row(x, one),

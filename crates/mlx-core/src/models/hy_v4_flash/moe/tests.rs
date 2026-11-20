@@ -1226,9 +1226,10 @@ fn bits(x: &MxArray) -> Vec<u32> {
     read(x).into_iter().map(f32::to_bits).collect()
 }
 
-/// Split-step decode (`split=true`) matches `split=false` bit-for-bit on both
-/// 1-row and 4-row waves with mixed resident/missing experts (so both ready
-/// and late passes run and reassemble in ascending expert-id order).
+/// Split-step decode (`split=true`) skips `rows == 1` by default (taking it
+/// only with `TEST_SPLIT_M1` / `MLX_HY4_SPLIT_M1=1`), runs on `rows >= 2`,
+/// and matches `split=false` bit-for-bit on both 1-row and 4-row waves with
+/// mixed resident/missing experts.
 #[test]
 fn split_decode_matches_unsplit_bitwise_for_single_and_multi_row() {
     crate::models::hy_v4_flash::exact_f32();
@@ -1255,7 +1256,9 @@ fn split_decode_matches_unsplit_bitwise_for_single_and_multi_row() {
     let ffn = Ffn::Moe(w);
     let layer = LayerFfn::new(&c, 1, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
 
-    for rows in [1usize, 4] {
+    for (rows, force_m1, expect_split) in
+        [(1usize, false, false), (1, true, true), (4, false, true)]
+    {
         let h = rows_arr(&inputs(&mut rng, rows, c.dim));
         // Reference with split = false.
         bank.set_split(false);
@@ -1279,20 +1282,36 @@ fn split_decode_matches_unsplit_bitwise_for_single_and_multi_row() {
         let steps_before = bank.stats()[0].split_steps;
         let mixed_before = bank.stats()[0].split_mixed;
 
-        let (got, got_r) = layer
-            .forward_chunked(&ffn, &norm, &post, &h, FFN_CHUNK_ROWS, RowKind::Decode)
-            .unwrap();
+        TEST_SPLIT_M1.with(|cell| cell.set(force_m1));
+        let res = layer.forward_chunked(&ffn, &norm, &post, &h, FFN_CHUNK_ROWS, RowKind::Decode);
+        TEST_SPLIT_M1.with(|cell| cell.set(false));
+        let (got, got_r) = res.unwrap();
         let got_bits = bits(&got);
         bank.settle_all();
 
         assert_eq!(got_r.unwrap().ids, want_ids, "rows={rows} routes");
-        assert_eq!(got_bits, want_bits, "rows={rows} split=true vs split=false");
-        assert_eq!(bank.stats()[0].split_steps, steps_before + 1, "rows={rows}");
-        if !warm_half.is_empty() {
+        assert_eq!(
+            got_bits, want_bits,
+            "rows={rows} force_m1={force_m1} split=true vs split=false"
+        );
+        if expect_split {
             assert_eq!(
-                bank.stats()[0].split_mixed,
-                mixed_before + 1,
-                "rows={rows} mixed ready+late"
+                bank.stats()[0].split_steps,
+                steps_before + 1,
+                "rows={rows} force_m1={force_m1}"
+            );
+            if !warm_half.is_empty() {
+                assert_eq!(
+                    bank.stats()[0].split_mixed,
+                    mixed_before + 1,
+                    "rows={rows} force_m1={force_m1} mixed ready+late"
+                );
+            }
+        } else {
+            assert_eq!(
+                bank.stats()[0].split_steps,
+                steps_before,
+                "rows={rows} must skip split-step by default"
             );
         }
     }
@@ -1481,6 +1500,73 @@ fn gather_sorted_nax_matches_gather_sorted_q4k_and_q6k() {
         );
     }
 
+    bank.end_turn().unwrap();
+}
+
+#[test]
+fn gather_sorted_nax_bounded_matches_unbounded_bitwise() {
+    crate::models::hy_v4_flash::exact_f32();
+    let mut rng = Rng::new(79);
+    let m = moe_cfg(64, 2, 512, 256);
+    let mut file = rng.bytes(256);
+    let experts = vec![
+        None,
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            1,
+            ExpertClass::Q6kDown,
+            &mut file,
+        )),
+    ];
+    let dir = Temp::new();
+    let path = dir.0.join("data.bin");
+    std::fs::write(&path, &file).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+    // 64 staging + 64 cache = 128 total bank slots; activate only 5 sparse experts.
+    let bank = KqBank::new(pool, &m, &experts, [64, 0], 1).unwrap();
+
+    // Warm 3 sparse experts into cache slots (high slot indices >= 64) and leave 2 in staging.
+    let _ = bank.prepare(1, &[5, 29, 61], &[], true).unwrap();
+    bank.settle_all();
+    let active = [0u32, 5, 29, 48, 61];
+    let counts = [1usize, 31, 32, 33, 65];
+    let p = bank
+        .prepare(1, &active, &[1, 31, 32, 33, 65], false)
+        .unwrap();
+
+    let mut slot_counts: Vec<(u32, usize)> = active
+        .iter()
+        .zip(counts)
+        .map(|(&e, c)| (p.slot(e).unwrap(), c))
+        .collect();
+    slot_counts.sort_unstable_by_key(|&(s, _)| s);
+    let mut slots = Vec::new();
+    for &(s, c) in &slot_counts {
+        slots.extend(std::iter::repeat_n(s, c));
+    }
+    let rows = slots.len();
+    let (y_tiles, max_group) = sorted_slot_bounds(&slots);
+    // 1->1, 31->1, 32->1, 33->2, 65->3 => total 8 BM=32 tiles.
+    assert_eq!(y_tiles, 8);
+    assert_eq!(max_group, slot_counts.last().unwrap().0 as i32 + 1);
+
+    let si = MxArray::from_uint32(&slots, &[rows as i64]).unwrap();
+    for (proj_idx, k_dim, label) in [(0usize, m.latent, "Q4_K"), (2usize, m.ff, "Q6_K")] {
+        let x = MxArray::from_float32(&rng.vec(rows * k_dim, 1.0), &[rows as i64, 1, k_dim as i64])
+            .unwrap();
+        let unbounded = bits(&p.arrays[proj_idx].gather_sorted_nax(&x, &si).unwrap());
+        let bounded = bits(
+            &p.arrays[proj_idx]
+                .gather_sorted_nax_bounded(&x, &si, y_tiles, max_group)
+                .unwrap(),
+        );
+        assert_eq!(
+            bounded, unbounded,
+            "{label} bounded NAX must match unbounded NAX bit-for-bit"
+        );
+    }
+    bank.settle_all();
     bank.end_turn().unwrap();
 }
 
