@@ -181,6 +181,20 @@ impl Block {
         engram: Option<EngramIn<'_>>,
         next: Option<(&Block, &LayerWeights)>,
     ) -> Result<(MxArray, Option<Routes>)> {
+        self.forward_traced(w, x, wave, owners, engram, next, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_traced(
+        &self,
+        w: &LayerWeights,
+        x: &MxArray,
+        wave: &Wave,
+        owners: &mut dyn Owners,
+        engram: Option<EngramIn<'_>>,
+        next: Option<(&Block, &LayerWeights)>,
+        need_routes: bool,
+    ) -> Result<(MxArray, Option<Routes>)> {
         let Residual::Hc {
             attn: hc_attn,
             ffn: hc_ffn,
@@ -225,7 +239,7 @@ impl Block {
         if let Some((next_blk, next_w)) = next {
             next_blk.prefetch_from(next_w, &h)?;
         }
-        let (f, routes) = self.ffn.forward(w, &h, kind)?;
+        let (f, routes) = self.ffn.forward_traced(w, &h, kind, need_routes)?;
         self.end_layer();
         Ok((post(&f, &x, &post_ffn)?, routes))
     }

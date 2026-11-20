@@ -436,9 +436,69 @@ pub fn hc_head(x: &MxArray, w: &HcWeights, norm_eps: f32, hc_eps: f32) -> Result
     hc_reduce(x, &hc_head_pre(x, w, norm_eps, hc_eps)?)
 }
 
+/// Raw router matmul logits `x · gate_inpᵀ` in f32, `[rows, n_experts]`.
+pub fn router_logits(x: &MxArray, router: &Dense) -> Result<MxArray> {
+    linear(&x.astype(DType::Float32)?, router)
+}
+
 /// Router scores `σ(x · gate_inpᵀ)` in f32, `[rows, n_experts]`.
 pub fn router_scores(x: &MxArray, router: &Dense) -> Result<MxArray> {
-    Activations::sigmoid(&linear(&x.astype(DType::Float32)?, router)?)
+    Activations::sigmoid(&router_logits(x, router)?)
+}
+
+/// Fused GPU sigmoid + bias + top-k + ascending-id sort + renormalization.
+/// Returns `(ids [rows, k] u32, weights [rows, k] f32)` in ascending expert ID
+/// order per row, or `Ok(None)` when Metal or the shape is unsupported.
+pub fn router_topk_gpu(
+    logits: &MxArray,
+    bias: Option<&MxArray>,
+    moe: &MoeConfig,
+) -> Result<Option<(MxArray, MxArray)>> {
+    if logits.ndim()? != 2 || logits.shape_at(1)? != moe.n_experts as i64 {
+        return Err(bad(format!(
+            "router logits {:?} for {} experts",
+            dims(logits)?,
+            moe.n_experts
+        )));
+    }
+    if moe.n_used == 0 || moe.n_used > moe.n_experts {
+        return Err(bad(format!(
+            "router: {} experts, {} used",
+            moe.n_experts, moe.n_used
+        )));
+    }
+    let lf = as_f32(logits)?;
+    let bf = match bias {
+        Some(b) => {
+            check_len(b, moe.n_experts as i64, "router bias")?;
+            Some(as_f32(b)?)
+        }
+        None => None,
+    };
+    let bias_ptr = bf
+        .as_ref()
+        .map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+    let mut out_ids = std::ptr::null_mut();
+    let mut out_weights = std::ptr::null_mut();
+    // SAFETY: input handles are live for the call; out pointers receive new arrays on true.
+    let ok = unsafe {
+        mlx_sys::mlx_hy4_router_topk(
+            lf.as_raw_ptr(),
+            bias_ptr,
+            moe.route_scale,
+            1e-20,
+            moe.n_used as i32,
+            moe.norm_topk,
+            &mut out_ids,
+            &mut out_weights,
+        )
+    };
+    if !ok {
+        return Ok(None);
+    }
+    let ids = MxArray::from_handle(out_ids, "hy_v4_flash router_topk ids")?;
+    let weights = MxArray::from_handle(out_weights, "hy_v4_flash router_topk weights")?;
+    Ok(Some((ids, weights)))
 }
 
 fn route_rows(

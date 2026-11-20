@@ -1159,6 +1159,106 @@ fn prefill_subgroups_last_use_order_and_drop_on_error() {
     bank.end_turn().unwrap();
 }
 
+#[test]
+fn direct_bank_background_fill_matches_streamed_prepare_bit_for_bit() {
+    let (_dir, path, m, experts, file) = bank_fixture();
+    let streamed = KqBank::new(pool_over(&path, 4), &m, &experts, [2, 1], 1).unwrap();
+    let direct = KqBank::new_direct(pool_over(&path, 4), &m, &experts).unwrap();
+    assert!(!streamed.is_direct());
+    assert!(direct.is_direct());
+    assert_eq!(direct.staging_layers(), 0);
+    assert_eq!(direct.cache_slots(), [2 * m.n_experts, m.n_experts]);
+    let [sa, sb] = direct.slot_bytes();
+    assert_eq!(
+        direct.nbytes(),
+        (2 * m.n_experts as u64) * sa + (m.n_experts as u64) * sb
+    );
+    assert!(streamed.direct_layer(1).unwrap().is_none());
+    assert!(direct.direct_layer(0).is_err());
+    assert!(direct.rebuild([0, 0], 1).is_err());
+
+    let all_experts: Vec<u32> = (0..m.n_experts as u32).collect();
+    for il in [1usize, 2, 3] {
+        let l = experts[il].as_ref().unwrap();
+        let geo = geometry(&m, l.class).unwrap();
+        let dir_arrays = direct.direct_layer(il).unwrap().expect("direct arrays");
+        let sp = streamed.prepare(il, &all_experts, &[], false).unwrap();
+        for pi in 0..3 {
+            for (&e, &s) in sp.experts.iter().zip(&sp.slots) {
+                assert_eq!(
+                    bank_slot(&dir_arrays[pi], geo[pi], e),
+                    bank_slot(&sp.arrays[pi], geo[pi], s),
+                    "layer {il} proj {pi} expert {e}"
+                );
+            }
+        }
+        streamed.settle_all();
+    }
+    direct.wait_direct_fill().unwrap();
+    assert!(direct.direct_fill_complete());
+
+    // prepare / prepare_split / plan_prefill_subgroups work with identity mapping and 0 misses.
+    let (ps, pending) = direct
+        .prepare_split(1, &[0, 3, 5], &[1, 2, 1], true)
+        .unwrap();
+    assert!(pending.is_none());
+    assert!(ps.reading.is_empty());
+    assert_eq!(ps.slots, vec![0, 3, 5]);
+    direct.assert_slots(&ps);
+    check_prepared(&file, &m, experts[1].as_ref().unwrap(), &ps);
+
+    let (pg, g0, mut sg) = direct
+        .plan_prefill_subgroups(2, &[1, 2, 4], &[1, 1, 1], &[4, 2, 1], 2)
+        .unwrap();
+    assert_eq!(g0, vec![1, 2, 4]);
+    assert_eq!(pg.slots, vec![1, 2, 4]);
+    assert!(sg.next_subgroup().unwrap().is_none());
+    direct.assert_slots(&pg);
+    check_prepared(&file, &m, experts[2].as_ref().unwrap(), &pg);
+
+    let st = direct.stats();
+    assert!(st[0].hits > 0 && st[0].hits == st[0].uses);
+    assert!(st[1].hits > 0 && st[1].hits == st[1].uses);
+    assert_eq!(st[0].slots, 0);
+    assert_eq!(st[1].slots, 0);
+
+    // Direct banks remain NonVolatile across end_turn / begin_turn.
+    assert_eq!(direct.safe_point(true).unwrap(), 0);
+    direct.end_turn().unwrap();
+    assert!(!direct.in_turn());
+    let res = direct.residency().unwrap();
+    assert!(res.resident > 0);
+    assert_eq!(res.volatile, 0, "direct banks must never flip to Volatile");
+    assert!(!direct.begin_turn().unwrap());
+    assert!(direct.in_turn());
+    streamed.end_turn().unwrap();
+}
+
+#[test]
+fn direct_bank_drop_mid_fill_and_io_error_propagate_cleanly() {
+    let (_dir, path, m, experts, _file) = bank_fixture();
+    // Slow reads so Drop cancels and joins the background fill thread mid-fill.
+    let shards = Arc::new(ShardSet::open(&[path.as_path()]).unwrap());
+    shards.delay_ms.store(15, Ordering::Relaxed);
+    let pool = IoPool::new(Arc::clone(&shards), 2).unwrap();
+    let bank = KqBank::new_direct(pool, &m, &experts).unwrap();
+    assert!(!bank.direct_fill_complete());
+    drop(bank);
+
+    // Truncated file fails background fill and wakes waiters with an error.
+    let shards = Arc::new(ShardSet::open(&[path.as_path()]).unwrap());
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(1024)
+        .unwrap();
+    let pool = IoPool::new(shards, 2).unwrap();
+    let bank = KqBank::new_direct(pool, &m, &experts).unwrap();
+    assert!(bank.direct_layer(1).is_err());
+    assert!(bank.wait_direct_fill().is_err());
+}
+
 fn real_scan() -> Scan {
     let dir = std::env::var("HY4_DIR").expect("HY4_DIR = directory of the two Hy4 shards");
     let paths = crate::models::deepseek_v41::chat::shard_paths(Path::new(&dir)).unwrap();

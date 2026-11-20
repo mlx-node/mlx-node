@@ -2285,3 +2285,155 @@ fn real_layer_ffn_matches_dequantized_reference() {
         .collect();
     assert_rows(&read(&y), &want, 2e-3, "real dense blk.0");
 }
+
+#[test]
+fn kq_routed_decode_dedup_is_bit_identical_to_single_row() {
+    crate::models::hy_v4_flash::exact_f32();
+    let (k_dim, m_dim, top, n_experts) = (512usize, 512usize, 4usize, 8usize);
+    for (class, seed) in [
+        (ExpertClass::Q4kDown, 131u64),
+        (ExpertClass::Q6kDown, 137u64),
+    ] {
+        let mut rng = Rng::new(seed);
+        let m = moe_cfg(n_experts, top, m_dim, k_dim);
+        let mut file = rng.bytes(128);
+        let experts = vec![None, Some(kquant_layer(&mut rng, &m, 1, class, &mut file))];
+        let dir = Temp::new();
+        let path = dir.0.join("data.bin");
+        std::fs::write(&path, &file).unwrap();
+        let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+        let cache = match class {
+            ExpertClass::Q6kDown => [n_experts, 0],
+            ExpertClass::Q4kDown => [0, n_experts],
+            ExpertClass::Bf16 => unreachable!(),
+        };
+        let bank = Arc::new(KqBank::new(pool, &m, &experts, cache, 1).unwrap());
+        let all_experts: Vec<u32> = (0..n_experts as u32).collect();
+        let p = bank.prepare(1, &all_experts, &[], true).unwrap();
+
+        let max_rows = 12usize;
+        let z_all = MxArray::from_float32(
+            &rng.vec(max_rows * k_dim, 2.5),
+            &[max_rows as i64, k_dim as i64],
+        )
+        .unwrap();
+
+        // Heavy slot sharing across rows: slot 0 appears on all 12 rows (> MAX_MATCH=8),
+        // slot 1 on even rows, slots 2..7 mixed.
+        let mut all_slots = Vec::with_capacity(max_rows * top);
+        let mut all_ws = Vec::with_capacity(max_rows * top);
+        for r in 0..max_rows {
+            let s0 = p.slot(0).unwrap();
+            let s1 = p.slot(if r % 2 == 0 { 1 } else { 2 }).unwrap();
+            let s2 = p.slot((3 + (r % 3)) as u32).unwrap();
+            let s3 = p.slot((6 + (r % 2)) as u32).unwrap();
+            let mut row_s = [s0, s1, s2, s3];
+            row_s.sort_unstable();
+            all_slots.extend_from_slice(&row_s);
+            for _ in 0..top {
+                all_ws.push(0.15 + 0.5 * rng.next().abs());
+            }
+        }
+
+        for limit in [10.0f32, 0.0f32] {
+            let c = ffn_cfg(64, m.clone(), limit);
+            let (w, _, _) = moe_weights(&mut rng, &c, 32);
+            let ffn = Ffn::Moe(w);
+            let layer =
+                LayerFfn::new(&c, 1, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
+            let FfnKind::Moe(moe) = &layer.kind else {
+                panic!("expected MoE");
+            };
+
+            // ROWS = 1 baseline for every row (DEDUP = false).
+            let mut single_bits = Vec::with_capacity(max_rows);
+            for r in 0..max_rows {
+                let zr = z_all
+                    .slice(&[r as i64, 0], &[r as i64 + 1, k_dim as i64])
+                    .unwrap();
+                let out1 = moe
+                    .kq_routed_decode(
+                        &zr,
+                        &all_slots[r * top..(r + 1) * top],
+                        &all_ws[r * top..(r + 1) * top],
+                        &p,
+                    )
+                    .unwrap()
+                    .unwrap();
+                single_bits.push(bits(&out1));
+            }
+
+            // ROWS = 2, 4, 8, 12 (DEDUP = true, including > 8 duplicates on slot 0).
+            for &rows in &[2usize, 4, 8, 12] {
+                let zm = z_all.slice(&[0, 0], &[rows as i64, k_dim as i64]).unwrap();
+                let outm = moe
+                    .kq_routed_decode(&zm, &all_slots[..rows * top], &all_ws[..rows * top], &p)
+                    .unwrap()
+                    .unwrap();
+                let mb = bits(&outm);
+                for r in 0..rows {
+                    assert_eq!(
+                        &mb[r * k_dim..(r + 1) * k_dim],
+                        single_bits[r].as_slice(),
+                        "{class:?} limit={limit} rows={rows} row={r} dedup must be bit-identical to ROWS=1"
+                    );
+                }
+            }
+        }
+        bank.settle_all();
+        bank.end_turn().unwrap();
+    }
+}
+
+#[test]
+fn resident_decode_gpu_router_matches_host_router_bitwise_without_eval() {
+    crate::models::hy_v4_flash::exact_f32();
+    let mut rng = Rng::new(151);
+    let m = moe_cfg(16, 4, 128, 64);
+    let c = ffn_cfg(96, m.clone(), 0.75);
+    let (w, norm, post) = moe_weights(&mut rng, &c, 32);
+    let (experts, _) = affine_experts(&mut rng, &m);
+    let ffn = Ffn::Moe(w);
+    let layer = LayerFfn::new(&c, 1, &ffn, Some(ExpertSource::Resident(experts))).unwrap();
+
+    for &rows in &[1usize, 2, 4] {
+        let h = rows_arr(&inputs(&mut rng, rows, c.dim));
+        let (want, want_r) = layer
+            .forward_chunked_traced(
+                &ffn,
+                &norm,
+                &post,
+                &h,
+                FFN_CHUNK_ROWS,
+                RowKind::Decode,
+                true,
+            )
+            .unwrap();
+        assert!(want_r.is_some());
+        let want_bits = bits(&want);
+
+        let before = super::super::stats::thread_evals();
+        let (got, got_r) = layer
+            .forward_chunked_traced(
+                &ffn,
+                &norm,
+                &post,
+                &h,
+                FFN_CHUNK_ROWS,
+                RowKind::Decode,
+                false,
+            )
+            .unwrap();
+        let after = super::super::stats::thread_evals();
+        assert!(got_r.is_none());
+        assert_eq!(
+            after, before,
+            "resident decode GPU router must perform 0 host evals (rows={rows})"
+        );
+        assert_eq!(
+            bits(&got),
+            want_bits,
+            "resident decode GPU router vs host router (rows={rows})"
+        );
+    }
+}

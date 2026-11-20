@@ -679,7 +679,9 @@ impl MtpLayer {
                 .mla
                 .finish_with_gate(w, &p.x, p.gate_lin.as_ref(), &o)?,
         )?;
-        let (f, _) = self.ffn.forward(&self.w, &x, RowKind::Decode)?;
+        let (f, _) = self
+            .ffn
+            .forward_traced(&self.w, &x, RowKind::Decode, false)?;
         let x = x.add(&f)?;
         let h = rms_norm(&x, &self.nextn()?.shared_head_norm, self.eps)?;
         let logits = head_rows(&h, model.weights().output())?;

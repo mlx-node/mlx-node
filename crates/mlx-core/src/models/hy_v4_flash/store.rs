@@ -47,7 +47,8 @@ use super::weights::{Form, Resident, form, resident_bytes, role_resident};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
 use crate::models::deepseek_v41::store::POOL_LIMIT;
 use crate::moe_stream::budget::{
-    Admission, DSV41, Limits, ModelSize, Own, Profile, Turn, admit_with, readmit_with, working_set,
+    Admission, Bound, DSV41, Limits, ModelSize, Own, Profile, Terms, Turn, admit_with,
+    readmit_with, working_set,
 };
 use crate::moe_stream::io::{DEFAULT_THREADS, IoPool, ShardSet};
 use crate::stream::WiredLimitContext;
@@ -55,6 +56,8 @@ use crate::utils::host::{HostMemory, host_memory};
 
 pub const CACHE_ENV: &str = "MLX_HY4_EXPERT_CACHE_GB";
 pub const RESERVE_ENV: &str = "MLX_HY4_ADMIT_RESERVE_GB";
+/// Direct full-expert residency switch: `0`/`false`, `1`/`true`, or unset/`auto`.
+pub const DIRECT_ENV: &str = "MLX_HY4_DIRECT";
 /// Lowers the admitted prefill chunk (a multiple of 256).
 pub const CHUNK_ENV: &str = "MLX_HY4_PREFILL_CHUNK";
 /// `0` leaves the MTP layer out of the admission.
@@ -71,10 +74,16 @@ const CHUNK_ALIGN: usize = 256;
 
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
+/// Headroom reserved for other processes when evaluating direct full-expert residency.
+pub const DIRECT_MARGIN: u64 = 4 * GIB;
+/// Prefill scratch allowance beside KV in direct full-expert residency.
+pub const DIRECT_SCRATCH_BYTES: u64 = 2 * GIB;
 /// RAM ladder entries (window clones and tails).
 pub const LADDER_BYTES: u64 = 150 * MIB;
+const HY4_COMPUTE_BASE: u64 = 512 * MIB;
+const HY4_COMPUTE_PER_ROW: u64 = 320 * 1024;
 /// Gathered keys of the sparse attention core.
-const SPARSE_BYTES: u64 = GIB;
+const SPARSE_BYTES: u64 = 256 * MIB;
 /// Indexer score sub-chunks.
 const INDEX_BYTES: u64 = 256 * MIB;
 /// Per context token: index ids and scores of a prefill chunk.
@@ -86,15 +95,13 @@ fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 store: {msg}"))
 }
 
-/// Hy4's admission constants at `kv_per_ctx` KV bytes per token. The
-/// compute and io base and per-row terms are DS V4.1's measured values:
-/// UNVERIFIED for Hy4 until its prefill peaks are measured.
+/// Hy4's admission constants at `kv_per_ctx` KV bytes per token.
 pub fn profile(kv_per_ctx: u64) -> Profile {
     Profile {
         cache_env: CACHE_ENV,
         reserve_env: RESERVE_ENV,
-        compute_base: DSV41.compute_base,
-        compute_per_row: DSV41.compute_per_row,
+        compute_base: HY4_COMPUTE_BASE,
+        compute_per_row: HY4_COMPUTE_PER_ROW,
         compute_fixed: SPARSE_BYTES + INDEX_BYTES,
         compute_per_ctx: COMPUTE_PER_CTX,
         kv_base: DSV41.kv_base + LADDER_BYTES,
@@ -482,6 +489,110 @@ impl Sizes {
             ctx: ctx as u64,
         }
     }
+
+    /// Exact MLX bytes of all trunk MoE layers held directly (`n_experts` slots per layer).
+    pub fn direct_expert_bytes(&self) -> u64 {
+        let n = self.n_experts as u64;
+        self.classes.layers[0] as u64 * n * self.classes.slot[0]
+            + self.classes.layers[1] as u64 * n * self.classes.slot[1]
+    }
+
+    /// Total routed experts per class across all trunk MoE layers.
+    pub fn total_experts(&self) -> [usize; 2] {
+        [
+            self.classes.layers[0] * self.n_experts,
+            self.classes.layers[1] * self.n_experts,
+        ]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DirectMode {
+    Off,
+    On,
+    #[default]
+    Auto,
+}
+
+/// Parses `MLX_HY4_DIRECT`: `0`/`false` disables direct residency, `1`/`true`
+/// requests it, unset/blank/`auto` enables it when host memory admits it.
+pub fn direct_mode(raw: Option<&str>) -> Result<DirectMode> {
+    let Some(v) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DirectMode::Auto);
+    };
+    if v.eq_ignore_ascii_case("auto") {
+        Ok(DirectMode::Auto)
+    } else if v == "1" || v.eq_ignore_ascii_case("true") {
+        Ok(DirectMode::On)
+    } else if v == "0" || v.eq_ignore_ascii_case("false") {
+        Ok(DirectMode::Off)
+    } else {
+        Err(bad(format!(
+            "{DIRECT_ENV}={v:?}: expected auto, 1/true, or 0/false"
+        )))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectDecision {
+    pub admitted: bool,
+    pub available: u64,
+    pub budget: u64,
+    pub dense_bytes: u64,
+    pub direct_expert_bytes: u64,
+    pub kv_and_scratch: u64,
+    pub need: u64,
+    pub physical: u64,
+    pub host_used: u64,
+    pub others: u64,
+}
+
+pub fn direct_kv_and_scratch(kv_allowance_initial: u64) -> u64 {
+    kv_allowance_initial.saturating_add(DIRECT_SCRATCH_BYTES)
+}
+
+/// Caps the Metal wired-limit request at `working_set()` so macOS never
+/// rejects or aborts when direct residency exceeds the Metal working set.
+pub fn direct_wired_limit(wired_want: u64, ws: u64) -> u64 {
+    wired_want.min(ws)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn direct_gate(
+    mode: DirectMode,
+    host: &HostMemory,
+    own: &Own,
+    dense_bytes: u64,
+    direct_expert_bytes: u64,
+    kv_allowance_initial: u64,
+    max_memory: Option<u64>,
+    cache_cap: Option<u64>,
+) -> DirectDecision {
+    let host_used = host.non_reclaimable();
+    let others = host_used.saturating_sub(own.bytes());
+    let available = host
+        .physical
+        .saturating_sub(others)
+        .saturating_sub(DIRECT_MARGIN);
+    let budget = max_memory.map_or(available, |m| available.min(m));
+    let kv_and_scratch = direct_kv_and_scratch(kv_allowance_initial);
+    let need = dense_bytes
+        .saturating_add(direct_expert_bytes)
+        .saturating_add(kv_and_scratch);
+    let cache_ok = cache_cap.is_none_or(|cap| cap >= direct_expert_bytes);
+    let admitted = mode != DirectMode::Off && direct_expert_bytes > 0 && cache_ok && budget >= need;
+    DirectDecision {
+        admitted,
+        available,
+        budget,
+        dense_bytes,
+        direct_expert_bytes,
+        kv_and_scratch,
+        need,
+        physical: host.physical,
+        host_used,
+        others,
+    }
 }
 
 /// The admitted context, prefill chunk and admission.
@@ -586,6 +697,7 @@ pub struct Options {
     /// The load option `maxMemoryBytes`: the admission's budget stays
     /// within it.
     pub max_memory: Option<u64>,
+    pub direct: DirectMode,
 }
 
 impl Options {
@@ -605,6 +717,7 @@ impl Options {
             lanes,
             plan: CachePlan::Admit,
             max_memory: None,
+            direct: direct_mode(std::env::var(DIRECT_ENV).ok().as_deref())?,
         })
     }
 }
@@ -834,6 +947,18 @@ impl Lease {
         self.turn().wired.is_some()
     }
 
+    pub fn wired_limit(&self, bank: &KqBank) -> Option<u64> {
+        let a = self.turn().admission?;
+        if bank.is_direct() {
+            Some(direct_wired_limit(
+                a.fixed.saturating_add(bank.nbytes()),
+                a.ws,
+            ))
+        } else {
+            Some(a.wired_limit())
+        }
+    }
+
     fn switch(&self, t: &mut TurnState, bank: &KqBank, a: &Admission) -> Result<()> {
         let t0 = Instant::now();
         let slots = self.classes.split(a.cache_bytes());
@@ -854,6 +979,20 @@ impl Lease {
     /// when the fixed working set alone no longer fits.
     pub fn begin_turn(&self, bank: &KqBank, dense: u64, kv: u64) -> Result<()> {
         let mut t = self.turn();
+        if bank.is_direct() {
+            if self.limits.is_some()
+                && t.wired.is_none()
+                && let Some(a) = t.admission
+            {
+                let wired_bytes = direct_wired_limit(a.fixed.saturating_add(bank.nbytes()), a.ws);
+                t.wired = Some(WiredLimitContext::bounded(
+                    usize::try_from(wired_bytes).unwrap_or(usize::MAX),
+                    Vec::new(),
+                ));
+            }
+            bank.begin_turn()?;
+            return Ok(());
+        }
         if let Some(limits) = &self.limits
             && t.wired.is_none()
         {
@@ -910,6 +1049,9 @@ impl Lease {
     /// `true` when it switched; `false` outside a turn or without an
     /// admission.
     pub fn recheck(&self, bank: &KqBank, dense: u64, kv: u64) -> Result<bool> {
+        if bank.is_direct() {
+            return Ok(false);
+        }
         let mut t = self.turn();
         let (Some(limits), Some(cur)) = (&self.limits, t.admission) else {
             return Ok(false);
@@ -1055,6 +1197,8 @@ pub struct Store {
     pub bank_alloc_s: f64,
     /// The load option `maxMemoryBytes`.
     pub max_memory: Option<u64>,
+    /// Host budget when direct full-expert residency was admitted.
+    pub direct_budget: Option<u64>,
     pub lease: Lease,
 }
 
@@ -1085,44 +1229,147 @@ impl Store {
             CachePlan::Off | CachePlan::Slots { .. } => None,
         };
         let smallest = CHUNKS[CHUNKS.len() - 1];
-        let (lanes, ctx, admitted, cache, staging, admission) = match (&limits, &opts.plan) {
+        let (lanes, ctx, admitted, cache, staging, admission, direct_budget) = match (
+            &limits, &opts.plan,
+        ) {
             (Some(l), _) => {
                 let (h, ws) = host_reading(opts.max_memory)?;
                 // nothing of this model exists yet: every byte in use is others'
                 let own = Own::default();
-                let one = pick(&one_lane, &base, max_ctx, l, &h, &own, ws)?;
-                let at = ModelSize {
-                    ctx: one.ctx as u64,
-                    ..base
-                };
-                let floor = lane_bytes(&scan.cfg, mtp, one.ctx);
-                let (lanes, p) = lanes_at(one, want, |n| {
-                    let lp = lane_profile(&one_lane, n, floor);
-                    admit_with(&lp, &at, one.chunk as u64, l, &h, &own, ws)
-                });
-                tracing::info!(
-                    "hy_v4_flash admission at load: {lanes} lanes, context {}, chunk {}, \
-                     wave rows {row_cap}: {}",
-                    p.ctx,
-                    p.chunk,
-                    p.admission
+                let direct_expert_bytes = sizes.direct_expert_bytes();
+                let kv_initial = one_lane.kv_base + one_lane.kv_per_ctx * max_ctx as u64;
+                let gate = direct_gate(
+                    opts.direct,
+                    &h,
+                    &own,
+                    base.dense,
+                    direct_expert_bytes,
+                    kv_initial,
+                    opts.max_memory,
+                    l.cache_cap,
                 );
-                let a = p.admission;
-                let cache = sizes.classes.split(a.cache_bytes());
-                (
-                    lanes,
-                    p.ctx,
-                    p.chunk,
-                    cache,
-                    a.staging_layers as usize,
-                    Some(a),
-                )
+                if gate.admitted {
+                    let ctx = max_ctx;
+                    let chunk = CHUNKS[0].min(ctx);
+                    let floor = lane_bytes(&scan.cfg, mtp, ctx);
+                    let lanes = (1..=want)
+                        .rev()
+                        .find(|&n| {
+                            n == 1
+                                || gate.need.saturating_add(n.saturating_sub(1) as u64 * floor)
+                                    <= gate.budget
+                        })
+                        .unwrap_or(1);
+                    let extra_lanes = lanes.saturating_sub(1) as u64 * floor;
+                    let kv_scratch = gate.kv_and_scratch.saturating_add(extra_lanes);
+                    let direct_fixed = gate.dense_bytes.saturating_add(kv_scratch);
+                    let total_slots = sizes.total_experts();
+                    let wired_cap =
+                        direct_wired_limit(direct_fixed.saturating_add(direct_expert_bytes), ws);
+                    let a = Admission {
+                        physical: gate.physical,
+                        host_used: gate.host_used,
+                        own: 0,
+                        others: gate.others,
+                        reserve: DIRECT_MARGIN,
+                        live: gate.available,
+                        ws,
+                        terms: Terms {
+                            dense: gate.dense_bytes,
+                            staging_layer: 0,
+                            kv: kv_initial.saturating_add(extra_lanes),
+                            compute: DIRECT_SCRATCH_BYTES,
+                            io: 0,
+                            driver: 0,
+                            pool: 0,
+                        },
+                        staging_layers: 0,
+                        fixed: direct_fixed,
+                        slot: base.slot,
+                        cache_slots: (total_slots[0] + total_slots[1]) as u64,
+                        bound: if opts.max_memory.is_some_and(|m| m < gate.available) {
+                            Bound::Env
+                        } else {
+                            Bound::Live
+                        },
+                    };
+                    tracing::info!(
+                        "hy_v4_flash direct residency at load: {lanes} lanes, context {ctx}, \
+                             chunk {chunk}, wave rows {row_cap}: dense {:.2} GiB + direct experts \
+                             {:.2} GiB ({} slots) + kv/scratch {:.2} GiB vs available {:.2} GiB \
+                             (others {:.2} GiB, margin {:.0} GiB); wired cap {:.2} GiB",
+                        gate.dense_bytes as f64 / GIB as f64,
+                        direct_expert_bytes as f64 / GIB as f64,
+                        total_slots[0] + total_slots[1],
+                        kv_scratch as f64 / GIB as f64,
+                        gate.available as f64 / GIB as f64,
+                        gate.others as f64 / GIB as f64,
+                        DIRECT_MARGIN as f64 / GIB as f64,
+                        wired_cap as f64 / GIB as f64,
+                    );
+                    (
+                        lanes,
+                        ctx,
+                        chunk,
+                        total_slots,
+                        0,
+                        Some(a),
+                        Some(gate.budget),
+                    )
+                } else {
+                    if opts.direct == DirectMode::On {
+                        tracing::warn!(
+                            "hy_v4_flash direct residency refused (need {:.2} GiB vs budget \
+                                 {:.2} GiB, available {:.2} GiB, others {:.2} GiB, cache cap {:?}); \
+                                 falling back to partial streaming",
+                            gate.need as f64 / GIB as f64,
+                            gate.budget as f64 / GIB as f64,
+                            gate.available as f64 / GIB as f64,
+                            gate.others as f64 / GIB as f64,
+                            l.cache_cap,
+                        );
+                    }
+                    let one = pick(&one_lane, &base, max_ctx, l, &h, &own, ws)?;
+                    let at = ModelSize {
+                        ctx: one.ctx as u64,
+                        ..base
+                    };
+                    let floor = lane_bytes(&scan.cfg, mtp, one.ctx);
+                    let (lanes, p) = lanes_at(one, want, |n| {
+                        let lp = lane_profile(&one_lane, n, floor);
+                        admit_with(&lp, &at, one.chunk as u64, l, &h, &own, ws)
+                    });
+                    tracing::info!(
+                        "hy_v4_flash admission at load: {lanes} lanes, context {}, chunk {}, \
+                             wave rows {row_cap}: {}",
+                        p.ctx,
+                        p.chunk,
+                        p.admission
+                    );
+                    let a = p.admission;
+                    let cache = sizes.classes.split(a.cache_bytes());
+                    (
+                        lanes,
+                        p.ctx,
+                        p.chunk,
+                        cache,
+                        a.staging_layers as usize,
+                        Some(a),
+                        None,
+                    )
+                }
             }
             #[cfg(test)]
-            (None, CachePlan::Slots { cache, staging }) => {
-                (want, max_ctx, smallest.min(max_ctx), *cache, *staging, None)
-            }
-            _ => (want, max_ctx, smallest.min(max_ctx), [0, 0], 1, None),
+            (None, CachePlan::Slots { cache, staging }) => (
+                want,
+                max_ctx,
+                smallest.min(max_ctx),
+                *cache,
+                *staging,
+                None,
+                None,
+            ),
+            _ => (want, max_ctx, smallest.min(max_ctx), [0, 0], 1, None, None),
         };
         let profile = lane_profile(&one_lane, lanes, lane_bytes(&scan.cfg, mtp, ctx));
         // the re-admission charges the rows the load admitted, the env only
@@ -1135,13 +1382,21 @@ impl Store {
         };
         let shards = Arc::new(ShardSet::open(&scan.paths)?);
         let t_bank = Instant::now();
-        let bank = Arc::new(KqBank::new(
-            IoPool::new(Arc::clone(&shards), DEFAULT_THREADS)?,
-            &scan.cfg.moe,
-            scan.trunk_experts(),
-            cache,
-            staging,
-        )?);
+        let bank = if direct_budget.is_some() {
+            Arc::new(KqBank::new_direct(
+                IoPool::new(Arc::clone(&shards), DEFAULT_THREADS)?,
+                &scan.cfg.moe,
+                scan.trunk_experts(),
+            )?)
+        } else {
+            Arc::new(KqBank::new(
+                IoPool::new(Arc::clone(&shards), DEFAULT_THREADS)?,
+                &scan.cfg.moe,
+                scan.trunk_experts(),
+                cache,
+                staging,
+            )?)
+        };
         let bank_alloc_s = t_bank.elapsed().as_secs_f64();
         let built = (|| -> Result<_> {
             let resident = Resident::load(&scan, &shards)?;
@@ -1189,12 +1444,21 @@ impl Store {
             mtp,
             bank_alloc_s,
             max_memory: opts.max_memory,
+            direct_budget,
             lease,
         })
     }
 
+    pub fn is_direct(&self) -> bool {
+        self.bank.is_direct()
+    }
+
     pub fn admission(&self) -> Option<Admission> {
         self.lease.admission()
+    }
+
+    pub fn wired_limit(&self) -> Option<u64> {
+        self.lease.wired_limit(&self.bank)
     }
 
     /// Fails when a shard was replaced or changed since the load opened it.
@@ -1202,10 +1466,11 @@ impl Store {
         unchanged_since_open(&self.shards)
     }
 
-    /// The memory governor's limit for this model: the working set every
-    /// admission fills at most.
+    /// The memory governor's limit for this model: direct host budget when
+    /// direct residency is active, otherwise the capped Metal working set.
     pub fn hard_budget(&self) -> u64 {
-        capped_ws(working_set(), self.max_memory)
+        self.direct_budget
+            .unwrap_or_else(|| capped_ws(working_set(), self.max_memory))
     }
 
     pub fn cache_slots(&self) -> [usize; 2] {

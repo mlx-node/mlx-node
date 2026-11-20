@@ -3547,6 +3547,17 @@ unsafe extern "C" {
         weights: *mut mlx_array,
         inverse: *mut mlx_array,
     ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_router_topk(
+        logits: *mut mlx_array,
+        bias: *mut mlx_array,
+        scale: f32,
+        eps: f32,
+        k: i32,
+        norm: bool,
+        out_ids: *mut *mut mlx_array,
+        out_weights: *mut *mut mlx_array,
+    ) -> bool;
 }
 
 unsafe extern "C-unwind" {

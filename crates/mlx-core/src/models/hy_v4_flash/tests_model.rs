@@ -1432,6 +1432,175 @@ fn prefill_with_prefetch_matches_without_prefetch_bitwise() {
     bank.end_turn().unwrap();
 }
 
+/// Direct-mode model decode wave vs partial-mode model decode wave:
+/// bit-identical outputs on single-owner, multi-row verify, and 4-owner waves,
+/// and exactly 1 eval (the final head sync) per decode step in direct mode.
+/// Direct prefill also matches partial-mode prefill bit-for-bit.
+#[test]
+fn direct_mode_decode_wave_matches_partial_bitwise_with_single_eval() {
+    use super::stats;
+
+    let cfg = tiny_cfg();
+    let mut r = Rng::new(7);
+    let mut file = r.bytes(1000);
+    let experts: Vec<Option<ExpertLayer>> = CLASSES
+        .iter()
+        .enumerate()
+        .map(|(il, c)| c.map(|c| kquant_layer(&mut r, &cfg.moe, il, c, &mut file)))
+        .collect();
+    let dir = Temp::new();
+    let path = dir.0.join("experts.bin");
+    std::fs::write(&path, &file).unwrap();
+
+    let make_model = |direct: bool| {
+        let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+        let bank = if direct {
+            Arc::new(KqBank::new_direct(pool, &cfg.moe, &experts).unwrap())
+        } else {
+            Arc::new(KqBank::new(pool, &cfg.moe, &experts, [4, 4], 1).unwrap())
+        };
+        let weights = tiny_weights(&cfg, 11);
+        let table = engram_table(&cfg.engram, 13);
+        let b = Arc::clone(&bank);
+        let model = Model::new(
+            cfg.clone(),
+            Box::new(weights),
+            move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
+            Box::new(table),
+        )
+        .unwrap();
+        (model, bank)
+    };
+
+    let (partial_model, partial_bank) = make_model(false);
+    let (direct_model, direct_bank) = make_model(true);
+    direct_bank.wait_direct_fill().unwrap();
+    assert!(!partial_model.bank_is_direct());
+    assert!(direct_model.bank_is_direct());
+
+    let prompts: Vec<Vec<u32>> = [(5u64, 9usize), (6, 14), (8, 18), (9, 22)]
+        .iter()
+        .map(|&(seed, n)| Rng::new(seed).ids(n))
+        .collect();
+
+    // Direct prefill matches partial prefill bit-for-bit.
+    let mut p_sess_0 = partial_model.new_session(CTX).unwrap();
+    let mut d_sess_0 = direct_model.new_session(CTX).unwrap();
+    let p_pre = partial_model
+        .forward(
+            &mut p_sess_0,
+            &prompts[0],
+            RowKind::Prefill,
+            Want::LAST,
+            None,
+            None,
+        )
+        .unwrap();
+    let d_pre = direct_model
+        .forward(
+            &mut d_sess_0,
+            &prompts[0],
+            RowKind::Prefill,
+            Want::LAST,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        bits(d_pre.logits.as_ref().unwrap()),
+        bits(p_pre.logits.as_ref().unwrap()),
+        "direct prefill must match partial prefill bitwise"
+    );
+
+    // 1-row decode: bit-identical and evals == 1 in direct mode.
+    let p_evals_before = stats::thread_evals();
+    let p_dec1 = partial_model
+        .forward(&mut p_sess_0, &[7], RowKind::Decode, Want::LAST, None, None)
+        .unwrap();
+    let p_evals_1 = stats::thread_evals() - p_evals_before;
+    assert!(p_evals_1 > 1, "partial mode must sync on router reads");
+
+    let d_evals_before = stats::thread_evals();
+    let d_dec1 = direct_model
+        .forward(&mut d_sess_0, &[7], RowKind::Decode, Want::LAST, None, None)
+        .unwrap();
+    let d_evals_1 = stats::thread_evals() - d_evals_before;
+    assert_eq!(
+        d_evals_1, 1,
+        "direct mode 1-row decode must use exactly 1 eval (head sync only), got {d_evals_1}"
+    );
+    assert_eq!(
+        bits(d_dec1.logits.as_ref().unwrap()),
+        bits(p_dec1.logits.as_ref().unwrap()),
+        "direct mode 1-row decode must match partial mode bitwise"
+    );
+
+    // Multi-owner + verify2 decode wave (6 total rows across 4 owners): bit-identical and evals == 1.
+    let mut p_sessions: Vec<Session> = prompts
+        .iter()
+        .map(|p| prefilled(&partial_model, p))
+        .collect();
+    let mut d_sessions: Vec<Session> = prompts
+        .iter()
+        .map(|p| prefilled(&direct_model, p))
+        .collect();
+    let wave_ids: [&[u32]; 4] = [&[11], &[12, 13], &[14], &[15, 16]];
+    let wave_wants: [Want; 4] = [
+        Want::LAST,
+        Want::ALL,
+        Want::LAST,
+        Want {
+            logits: Logits::All,
+            hidden: true,
+        },
+    ];
+
+    let p_outs = {
+        let mut owners: Vec<OwnerRows<'_>> = p_sessions
+            .iter_mut()
+            .zip(wave_ids)
+            .zip(wave_wants)
+            .map(|((sess, ids), want)| OwnerRows { sess, ids, want })
+            .collect();
+        partial_model
+            .step(&mut owners, RowKind::Decode, None, None)
+            .unwrap()
+    };
+
+    let d_evals_before = stats::thread_evals();
+    let d_outs = {
+        let mut owners: Vec<OwnerRows<'_>> = d_sessions
+            .iter_mut()
+            .zip(wave_ids)
+            .zip(wave_wants)
+            .map(|((sess, ids), want)| OwnerRows { sess, ids, want })
+            .collect();
+        direct_model
+            .step(&mut owners, RowKind::Decode, None, None)
+            .unwrap()
+    };
+    let d_evals_wave = stats::thread_evals() - d_evals_before;
+    assert_eq!(
+        d_evals_wave, 1,
+        "direct mode multi-owner decode wave must use exactly 1 eval, got {d_evals_wave}"
+    );
+    for (i, (po, do_)) in p_outs.iter().zip(&d_outs).enumerate() {
+        assert_eq!(
+            do_.logits.as_ref().map(bits),
+            po.logits.as_ref().map(bits),
+            "direct vs partial wave owner {i} logits"
+        );
+        assert_eq!(
+            do_.hidden.as_ref().map(bits),
+            po.hidden.as_ref().map(bits),
+            "direct vs partial wave owner {i} hidden"
+        );
+    }
+
+    partial_bank.end_turn().unwrap();
+    direct_bank.end_turn().unwrap();
+}
+
 /// A 16-token prompt through the real trunk: finite logits, the last row
 /// equal to the all-rows call, and (with `HY4_LLAMA_TOP1` = a JSON file
 /// `{"ids": [..16], "top1": [..16]}` of stored llama.cpp rows) the argmax

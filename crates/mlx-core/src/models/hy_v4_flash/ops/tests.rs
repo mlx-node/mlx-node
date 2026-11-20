@@ -1059,3 +1059,140 @@ fn bf16_lm_head_row_invariance_and_f32_parity() {
         }
     }
 }
+
+#[test]
+fn router_topk_gpu_matches_route_select_fast_and_is_row_invariant() {
+    crate::models::hy_v4_flash::exact_f32();
+    let e = 512usize;
+    let k = 16usize;
+    let bias_v = det_f32(1201, e, 0.25);
+    let bias_arr = MxArray::from_float32(&bias_v, &[e as i64]).unwrap();
+
+    let max_m = 256usize;
+    let mut logits_v = det_f32(1202, max_m * e, 4.0);
+    // Inject exact ties, large negative logits, zeros, and NaN on sampled rows.
+    for &r in &[0usize, 1, 3, 15, 255] {
+        let base = r * e;
+        for j in 50..74 {
+            logits_v[base + j] = -0.625;
+        }
+        for j in 200..220 {
+            logits_v[base + j] = 2.25;
+        }
+        logits_v[base + 300] = -40.0;
+        logits_v[base + 301] = 0.0;
+    }
+    let logits_all = MxArray::from_float32(&logits_v, &[max_m as i64, e as i64]).unwrap();
+
+    for &(has_bias, norm_topk, scale) in &[
+        (true, true, 2.5f32),
+        (false, true, 1.0f32),
+        (true, false, 0.75f32),
+    ] {
+        let cfg = MoeConfig {
+            n_experts: e,
+            n_used: k,
+            n_shared: 1,
+            ff: 1536,
+            latent: 1536,
+            route_scale: scale,
+            norm_topk,
+        };
+        let b_opt = has_bias.then_some(&bias_arr);
+        let b_slice = has_bias.then_some(bias_v.as_slice());
+
+        // Single-row baselines for strict row invariance on rows 0..16.
+        let mut single_ids = Vec::with_capacity(16);
+        let mut single_w_bits = Vec::with_capacity(16);
+        for r in 0..16i64 {
+            let row = logits_all.slice(&[r, 0], &[r + 1, e as i64]).unwrap();
+            let Some((gi, gw)) = router_topk_gpu(&row, b_opt, &cfg).unwrap() else {
+                return;
+            };
+            single_ids.push(gi.to_uint32().unwrap().to_vec());
+            single_w_bits.push(to_bits(&read(&gw)));
+        }
+
+        for &m in &[1usize, 2, 4, 16, 256] {
+            let lm = logits_all.slice(&[0, 0], &[m as i64, e as i64]).unwrap();
+            let (gi, gw) = router_topk_gpu(&lm, b_opt, &cfg).unwrap().unwrap();
+            assert_eq!(shape(&gi), [m as i64, k as i64]);
+            assert_eq!(shape(&gw), [m as i64, k as i64]);
+            assert_eq!(gi.dtype().unwrap(), DType::Uint32);
+            assert_eq!(gw.dtype().unwrap(), DType::Float32);
+            let got_ids = gi.to_uint32().unwrap().to_vec();
+            let got_w = read(&gw);
+
+            // Reference: MLX sigmoid + host route_select_fast sorted ascending by id.
+            let scores = read(&Activations::sigmoid(&lm).unwrap());
+            let (ref_ids_rank, ref_w_rank) =
+                route_select_fast(&scores, b_slice, e, k, scale, norm_topk);
+            let mut want_ids = Vec::with_capacity(m * k);
+            let mut want_w = Vec::with_capacity(m * k);
+            for r in 0..m {
+                let mut pairs: Vec<(u32, f32)> = ref_ids_rank[r * k..(r + 1) * k]
+                    .iter()
+                    .copied()
+                    .zip(ref_w_rank[r * k..(r + 1) * k].iter().copied())
+                    .collect();
+                pairs.sort_by_key(|p| p.0);
+                want_ids.extend(pairs.iter().map(|p| p.0));
+                want_w.extend(pairs.iter().map(|p| p.1));
+            }
+
+            assert_eq!(
+                got_ids, want_ids,
+                "router_topk ids mismatch M={m} bias={has_bias} norm={norm_topk}"
+            );
+            let max_abs = got_w
+                .iter()
+                .zip(&want_w)
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= 1e-6,
+                "router_topk weights M={m} bias={has_bias} norm={norm_topk}: max_abs={max_abs:e}"
+            );
+
+            // Strict row invariance: rows 0..min(m, 16) bit-identical to M=1.
+            for r in 0..m.min(16) {
+                assert_eq!(
+                    &got_ids[r * k..(r + 1) * k],
+                    single_ids[r].as_slice(),
+                    "router_topk ids invariance M={m} row={r}"
+                );
+                assert_eq!(
+                    to_bits(&got_w[r * k..(r + 1) * k]),
+                    single_w_bits[r],
+                    "router_topk weights invariance M={m} row={r}"
+                );
+            }
+        }
+    }
+
+    // Verify E=1024 (2nd MAX_E bucket) and NaN safety.
+    let e_big = 1024usize;
+    let mut big_logits = det_f32(1299, 2 * e_big, 3.0);
+    big_logits[7] = f32::NAN;
+    big_logits[e_big + 513] = f32::NAN;
+    let cfg_big = MoeConfig {
+        n_experts: e_big,
+        n_used: 16,
+        n_shared: 1,
+        ff: 1536,
+        latent: 1536,
+        route_scale: 1.0,
+        norm_topk: true,
+    };
+    let big_arr = MxArray::from_float32(&big_logits, &[2, e_big as i64]).unwrap();
+    if let Some((gi, gw)) = router_topk_gpu(&big_arr, None, &cfg_big).unwrap() {
+        let ids = gi.to_uint32().unwrap().to_vec();
+        let ws = read(&gw);
+        assert!(ws.iter().all(|v| v.is_finite()));
+        assert!(!ids[..16].contains(&7));
+        assert!(!ids[16..].contains(&513));
+        for row in ids.as_chunks::<16>().0 {
+            assert!(row.windows(2).all(|w| w[0] < w[1]));
+        }
+    }
+}

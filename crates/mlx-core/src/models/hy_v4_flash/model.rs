@@ -638,6 +638,10 @@ impl Model {
         &self.blocks
     }
 
+    pub fn bank_is_direct(&self) -> bool {
+        !self.banks.is_empty() && self.banks.iter().all(|b| b.is_direct())
+    }
+
     /// An empty sequence of at most `cap` positions (the admitted context);
     /// its indexed-layer buffers are made at the first write and kept. A new
     /// conversation reuses a session through `truncate(0)`: a second live
@@ -845,11 +849,15 @@ impl Model {
             if let Some(Some(xi)) = trace.as_deref().and_then(|t| t.inputs.get(l)) {
                 x = xi.clone();
             }
-            let next = (wave.kind() == RowKind::Prefill
+            let need_routes = trace.is_some();
+            let direct = self.bank_is_direct();
+            let next = (!direct
+                && wave.kind() == RowKind::Prefill
                 && total >= super::block::READ_AHEAD_MIN_ROWS
                 && l + 1 < self.blocks.len())
             .then(|| (&self.blocks[l + 1], &w.layers()[l + 1]));
-            let (y, routes) = blk.forward(&w.layers()[l], &x, wave, owners, engram, next)?;
+            let (y, routes) =
+                blk.forward_traced(&w.layers()[l], &x, wave, owners, engram, next, need_routes)?;
             match wave.kind() {
                 RowKind::Prefill => {
                     super::stats::eval(&[&y], "hy_v4_flash layer")?;
@@ -857,7 +865,11 @@ impl Model {
                         b.settle_all();
                     }
                 }
-                RowKind::Decode => MxArray::async_eval_arrays(&[&y]),
+                RowKind::Decode => {
+                    if !direct || (l >= 2 && (l - 2).is_multiple_of(3)) {
+                        MxArray::async_eval_arrays(&[&y]);
+                    }
+                }
             }
             x = y;
             if let Some(t) = trace.as_deref_mut() {

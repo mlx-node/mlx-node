@@ -37,10 +37,10 @@ use napi::{Error, Result};
 
 #[cfg(test)]
 use super::bank::sorted_slot_bounds;
-use super::bank::{KqBank, Prepared};
+use super::bank::{KqBank, Prepared, ProjArrays};
 use super::batch::{Group, MIN_Q8_ROWS, Op, group};
 use super::config::{HyV4FlashConfig, MoeConfig};
-use super::ops::{rms_norm, route, router_scores};
+use super::ops::{rms_norm, route, router_logits, router_scores, router_topk_gpu};
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{Dense, Ffn, LayerWeights, MoeWeights};
 use crate::array::{DType, MxArray};
@@ -590,6 +590,7 @@ struct Moe {
     moe: MoeConfig,
     limit: f32,
     bias: Option<Vec<f32>>,
+    bias_gpu: Option<MxArray>,
     experts: ExpertSource,
 }
 
@@ -610,17 +611,22 @@ impl Moe {
         if let Some(fused) = &w.down_shared_gu {
             want2(fused, m.latent + 2 * sff, c.dim, "ffn_down_shared_gu")?;
         }
-        let bias = match &w.router_bias {
-            None => None,
+        let (bias, bias_gpu) = match &w.router_bias {
+            None => (None, None),
             Some(b) => {
-                let v = b.astype(DType::Float32)?.to_float32()?.to_vec();
+                let bf = if b.dtype()? == DType::Float32 {
+                    b.clone()
+                } else {
+                    b.astype(DType::Float32)?
+                };
+                let v = bf.to_float32()?.to_vec();
                 if v.len() != n {
                     return Err(bad(format!(
                         "exp_probs_b has {} entries for {n} experts",
                         v.len()
                     )));
                 }
-                Some(v)
+                (Some(v), Some(bf))
             }
         };
         match &experts {
@@ -646,6 +652,7 @@ impl Moe {
             moe: m.clone(),
             limit: c.swiglu_limit,
             bias,
+            bias_gpu,
             experts,
         })
     }
@@ -704,20 +711,150 @@ impl Moe {
         bank.prefetch_layer(layer, &want)
     }
 
+    fn finish_with_shared(
+        &self,
+        w: &MoeWeights,
+        x: &MxArray,
+        r: &MxArray,
+        shared_gu: Option<(MxArray, MxArray)>,
+    ) -> Result<MxArray> {
+        let tp = prof_start();
+        let up = qlinear(r, &w.routed_up)?;
+        prof_end(Phase::Routed, tp, &[&up])?;
+        let tp = prof_start();
+        let shared = match shared_gu {
+            Some((sg, su)) => qlinear(&Activations::swiglu_compiled(&sg, &su)?, &w.shared_down)?,
+            None => mlp(x, &w.shared_gate, &w.shared_up, &w.shared_down, None)?,
+        };
+        let f = up.add(&shared)?;
+        prof_end(Phase::Shared, tp, &[&f])?;
+        Ok(f)
+    }
+
     /// `x [rows, dim]` f32 (after `ffn_norm`) -> the FFN output before
-    /// `post_ffw_norm`, and the routes.
+    /// `post_ffw_norm`, and the routes when `need_routes` is set.
     fn forward(
         &self,
         layer: usize,
         w: &MoeWeights,
         x: &MxArray,
         kind: RowKind,
-    ) -> Result<(MxArray, Routes)> {
+        need_routes: bool,
+    ) -> Result<(MxArray, Option<Routes>)> {
+        let use_gpu_route = !need_routes && {
+            #[cfg(test)]
+            {
+                !forced::is_active(layer)
+            }
+            #[cfg(not(test))]
+            {
+                true
+            }
+        };
+
+        if use_gpu_route {
+            match &self.experts {
+                ExpertSource::Bank(bank) if bank.is_direct() => {
+                    let tp = prof_start();
+                    let r_logits = match group(Op::Router, kind) {
+                        Group::Row => per_row(x, |r| router_logits(r, &w.router))?,
+                        Group::Fused | Group::Owner => router_logits(x, &w.router)?,
+                    };
+                    if let Some((gpu_ids, gpu_weights)) =
+                        router_topk_gpu(&r_logits, self.bias_gpu.as_ref(), &self.moe)?
+                    {
+                        if kind.is_decode() {
+                            prof_end(Phase::Router, tp, &[&gpu_ids, &gpu_weights])?;
+                            let tp_fill = prof_start();
+                            let arrays = bank.direct_layer(layer)?.ok_or_else(|| {
+                                bad(format!("layer {layer}: direct bank missing"))
+                            })?;
+                            prof_end(Phase::Fill, tp_fill, &[])?;
+                            let (z, shared_gu) = self.down_and_shared_gu(w, x)?;
+                            let tp_r = prof_start();
+                            let r = match self.kq_routed_decode_gpu(
+                                &z,
+                                &gpu_ids,
+                                &gpu_weights,
+                                &arrays,
+                            )? {
+                                Some(r) => r,
+                                None => {
+                                    self.combine_gpu(&z, &gpu_ids, &gpu_weights, |pi, xi, idx| {
+                                        arrays[pi].gather(xi, idx)
+                                    })?
+                                }
+                            };
+                            prof_end(Phase::Routed, tp_r, &[&r])?;
+                            let f = self.finish_with_shared(w, x, &r, shared_gu)?;
+                            return Ok((f, None));
+                        }
+                        super::stats::eval(&[&gpu_ids], "hy_v4_flash router_topk")?;
+                        let ids_asc = gpu_ids.to_uint32()?;
+                        prof_end(Phase::Router, tp, &[])?;
+                        let tp_fill = prof_start();
+                        let arrays = bank
+                            .direct_layer(layer)?
+                            .ok_or_else(|| bad(format!("layer {layer}: direct bank missing")))?;
+                        prof_end(Phase::Fill, tp_fill, &[])?;
+                        let (z, shared_gu) = self.down_and_shared_gu(w, x)?;
+                        let tp_r = prof_start();
+                        let r = self.direct_prefill_sorted(
+                            &z,
+                            ids_asc.as_ref(),
+                            &gpu_weights,
+                            &arrays,
+                        )?;
+                        prof_end(Phase::Routed, tp_r, &[&r])?;
+                        let f = self.finish_with_shared(w, x, &r, shared_gu)?;
+                        return Ok((f, None));
+                    }
+                    let scores = Activations::sigmoid(&r_logits)?;
+                    return self.forward_host_routed(layer, w, x, kind, tp, scores);
+                }
+                ExpertSource::Resident(a) if kind.is_decode() => {
+                    let tp = prof_start();
+                    let r_logits = match group(Op::Router, kind) {
+                        Group::Row => per_row(x, |r| router_logits(r, &w.router))?,
+                        Group::Fused | Group::Owner => router_logits(x, &w.router)?,
+                    };
+                    if let Some((gpu_ids, gpu_weights)) =
+                        router_topk_gpu(&r_logits, self.bias_gpu.as_ref(), &self.moe)?
+                    {
+                        prof_end(Phase::Router, tp, &[&gpu_ids, &gpu_weights])?;
+                        let (z, shared_gu) = self.down_and_shared_gu(w, x)?;
+                        let tp_r = prof_start();
+                        let r = self.combine_gpu(&z, &gpu_ids, &gpu_weights, |pi, xi, idx| {
+                            a.gather(pi, xi, idx)
+                        })?;
+                        prof_end(Phase::Routed, tp_r, &[&r])?;
+                        let f = self.finish_with_shared(w, x, &r, shared_gu)?;
+                        return Ok((f, None));
+                    }
+                    let scores = Activations::sigmoid(&r_logits)?;
+                    return self.forward_host_routed(layer, w, x, kind, tp, scores);
+                }
+                _ => {}
+            }
+        }
+
         let tp = prof_start();
         let scores = match group(Op::Router, kind) {
             Group::Row => per_row(x, |r| router_scores(r, &w.router))?,
             Group::Fused | Group::Owner => router_scores(x, &w.router)?,
         };
+        self.forward_host_routed(layer, w, x, kind, tp, scores)
+    }
+
+    fn forward_host_routed(
+        &self,
+        layer: usize,
+        w: &MoeWeights,
+        x: &MxArray,
+        kind: RowKind,
+        tp: Option<std::time::Instant>,
+        scores: MxArray,
+    ) -> Result<(MxArray, Option<Routes>)> {
         let bank = match &self.experts {
             ExpertSource::Bank(b) => Some((b, b.issued())),
             ExpertSource::Resident(_) => None,
@@ -743,21 +880,12 @@ impl Moe {
             && bank.split()
         {
             let f = self.forward_split(layer, w, x, &routes, bank)?;
-            return Ok((f, routes));
+            return Ok((f, Some(routes)));
         }
         let (z, shared_gu) = self.down_and_shared_gu(w, x)?;
         let r = self.routed(layer, &z, &routes, kind)?;
-        let tp = prof_start();
-        let up = qlinear(&r, &w.routed_up)?;
-        prof_end(Phase::Routed, tp, &[&up])?;
-        let tp = prof_start();
-        let shared = match shared_gu {
-            Some((sg, su)) => qlinear(&Activations::swiglu_compiled(&sg, &su)?, &w.shared_down)?,
-            None => mlp(x, &w.shared_gate, &w.shared_up, &w.shared_down, None)?,
-        };
-        let f = up.add(&shared)?;
-        prof_end(Phase::Shared, tp, &[&f])?;
-        Ok((f, routes))
+        let f = self.finish_with_shared(w, x, &r, shared_gu)?;
+        Ok((f, Some(routes)))
     }
 
     fn forward_split(
@@ -1077,6 +1205,7 @@ impl Moe {
         Ok(out)
     }
 
+    #[cfg(test)]
     fn kq_prefill_indirect_gu(
         &self,
         z: &MxArray,
@@ -1084,9 +1213,19 @@ impl Moe {
         tiles: &[u32],
         p: &Prepared,
     ) -> Result<Option<MxArray>> {
+        self.kq_prefill_indirect_gu_arrays(z, token_rows, tiles, &p.arrays)
+    }
+
+    fn kq_prefill_indirect_gu_arrays(
+        &self,
+        z: &MxArray,
+        token_rows: &[u32],
+        tiles: &[u32],
+        arrays: &[ProjArrays; 3],
+    ) -> Result<Option<MxArray>> {
         if !prefill_indirect_gu_enabled()
-            || p.arrays[0].format != KQuantFormat::Q4K
-            || p.arrays[1].format != KQuantFormat::Q4K
+            || arrays[0].format != KQuantFormat::Q4K
+            || arrays[1].format != KQuantFormat::Q4K
             || token_rows.is_empty()
             || tiles.is_empty()
             || !tiles.len().is_multiple_of(3)
@@ -1100,7 +1239,7 @@ impl Moe {
         };
         let tr = MxArray::from_uint32(token_rows, &[token_rows.len() as i64])?;
         let tl = MxArray::from_uint32(tiles, &[(tiles.len() / 3) as i64, 3])?;
-        let [g, u, _] = &p.arrays;
+        let [g, u, _] = arrays;
         // SAFETY: all handles are live arrays owned by this call.
         let h = unsafe {
             mlx_sys::mlx_hy4_kq_prefill_indirect_gu(
@@ -1132,16 +1271,31 @@ impl Moe {
         rows: i64,
         k: i64,
     ) -> Result<Option<MxArray>> {
+        let wa = MxArray::from_float32(weights, &[rows, k])?;
+        Self::kq_sorted_combine_gpu(down, &wa, inverse, rows, k)
+    }
+
+    fn kq_sorted_combine_gpu(
+        down: &MxArray,
+        weights: &MxArray,
+        inverse: &[u32],
+        rows: i64,
+        k: i64,
+    ) -> Result<Option<MxArray>> {
         let df = if down.dtype()? == DType::Float32 {
             down.clone()
         } else {
             down.astype(DType::Float32)?
         };
-        let wa = MxArray::from_float32(weights, &[rows, k])?;
+        let wf = if weights.dtype()? == DType::Float32 {
+            weights.clone()
+        } else {
+            weights.astype(DType::Float32)?
+        };
         let ia = MxArray::from_uint32(inverse, &[rows, k])?;
         // SAFETY: all handles are live arrays owned by this call.
         let h = unsafe {
-            mlx_sys::mlx_hy4_kq_sorted_combine(df.as_raw_ptr(), wa.as_raw_ptr(), ia.as_raw_ptr())
+            mlx_sys::mlx_hy4_kq_sorted_combine(df.as_raw_ptr(), wf.as_raw_ptr(), ia.as_raw_ptr())
         };
         if h.is_null() {
             return Ok(None);
@@ -1161,6 +1315,16 @@ impl Moe {
         slot: &[u32],
         p: &Prepared,
     ) -> Result<MxArray> {
+        self.prefill_sorted_down_arrays(z, row, slot, &p.arrays)
+    }
+
+    fn prefill_sorted_down_arrays(
+        &self,
+        z: &MxArray,
+        row: &[u32],
+        slot: &[u32],
+        arrays: &[ProjArrays; 3],
+    ) -> Result<MxArray> {
         let latent = z.shape_at(1)?;
         let m = slot.len() as i64;
         let tiles = build_prefill_tiles(slot);
@@ -1169,14 +1333,14 @@ impl Moe {
             .last()
             .map_or(0, |&s| (s as usize + 1).min(i32::MAX as usize) as i32);
         let si = MxArray::from_uint32(slot, &[m])?;
-        let a = match self.kq_prefill_indirect_gu(z, row, &tiles, p)? {
+        let a = match self.kq_prefill_indirect_gu_arrays(z, row, &tiles, arrays)? {
             Some(a2d) => a2d.reshape(&[m, 1, self.moe.ff as i64])?,
             None => {
                 let x = z
                     .take(&MxArray::from_uint32(row, &[m])?, 0)?
                     .reshape(&[m, 1, latent])?;
-                let g = p.arrays[0].gather_sorted_nax_bounded(&x, &si, y_tiles, max_group)?;
-                let u = p.arrays[1].gather_sorted_nax_bounded(&x, &si, y_tiles, max_group)?;
+                let g = arrays[0].gather_sorted_nax_bounded(&x, &si, y_tiles, max_group)?;
+                let u = arrays[1].gather_sorted_nax_bounded(&x, &si, y_tiles, max_group)?;
                 let g = if g.dtype()? == DType::Float32 {
                     g
                 } else {
@@ -1190,10 +1354,58 @@ impl Moe {
                 Activations::swiglu_clamped_compiled(&g, &u, self.limit)?
             }
         };
-        p.arrays[2]
+        arrays[2]
             .gather_sorted_nax_bounded(&a, &si, y_tiles, max_group)?
             .astype(DType::Float32)?
             .reshape(&[m, latent])
+    }
+
+    fn direct_prefill_sorted(
+        &self,
+        z: &MxArray,
+        ids_asc: &[u32],
+        gpu_weights: &MxArray,
+        arrays: &[ProjArrays; 3],
+    ) -> Result<MxArray> {
+        let (rows, latent) = (z.shape_at(0)?, z.shape_at(1)?);
+        let k = self.moe.n_used;
+        let n_experts = self.moe.n_experts;
+        let pairs = (rows as usize) * k;
+        if ids_asc.len() != pairs || ids_asc.iter().any(|&e| e as usize >= n_experts) {
+            return Err(bad(format!(
+                "direct prefill routes: {} ids for {rows} rows x {k} ({n_experts} experts)",
+                ids_asc.len()
+            )));
+        }
+        // Stable O(pairs + E) counting sort by expert id (slot_id == expert_id in direct mode).
+        let mut counts = vec![0usize; n_experts];
+        for &e in ids_asc {
+            counts[e as usize] += 1;
+        }
+        let mut offsets = vec![0usize; n_experts];
+        let mut total = 0usize;
+        for (e, &c) in counts.iter().enumerate() {
+            offsets[e] = total;
+            total += c;
+        }
+        let mut back = vec![0u32; pairs];
+        let mut row = vec![0u32; pairs];
+        let mut slot = vec![0u32; pairs];
+        for (pair_idx, &e) in ids_asc.iter().enumerate() {
+            let pos = offsets[e as usize];
+            offsets[e as usize] = pos + 1;
+            back[pair_idx] = pos as u32;
+            row[pos] = (pair_idx / k) as u32;
+            slot[pos] = e;
+        }
+        let d = self.prefill_sorted_down_arrays(z, &row, &slot, arrays)?;
+        if let Some(out) = Self::kq_sorted_combine_gpu(&d, gpu_weights, &back, rows, k as i64)? {
+            return Ok(out);
+        }
+        d.take(&MxArray::from_uint32(&back, &[pairs as i64])?, 0)?
+            .reshape(&[rows, k as i64, latent])?
+            .mul(&gpu_weights.reshape(&[rows, k as i64, 1])?)?
+            .sum(Some(&[1]), Some(false))
     }
 
     fn banked_prefill_sorted(
@@ -1224,46 +1436,43 @@ impl Moe {
             .sum(Some(&[1]), Some(false))
     }
 
-    fn kq_down_bits(p: &Prepared) -> Option<i32> {
-        if p.arrays[0].format != KQuantFormat::Q4K || p.arrays[1].format != KQuantFormat::Q4K {
+    fn kq_down_bits_arrays(arrays: &[ProjArrays; 3]) -> Option<i32> {
+        if arrays[0].format != KQuantFormat::Q4K || arrays[1].format != KQuantFormat::Q4K {
             return None;
         }
-        match p.arrays[2].format {
+        match arrays[2].format {
             KQuantFormat::Q4K => Some(4),
             KQuantFormat::Q6K => Some(6),
             _ => None,
         }
     }
 
-    fn kq_routed_decode(
+    fn kq_down_bits(p: &Prepared) -> Option<i32> {
+        Self::kq_down_bits_arrays(&p.arrays)
+    }
+
+    fn kq_routed_decode_gpu(
         &self,
         z: &MxArray,
-        slots: &[u32],
-        weights: &[f32],
-        p: &Prepared,
+        slots: &MxArray,
+        weights: &MxArray,
+        arrays: &[ProjArrays; 3],
     ) -> Result<Option<MxArray>> {
-        let Some(down_bits) = Self::kq_down_bits(p) else {
+        let Some(down_bits) = Self::kq_down_bits_arrays(arrays) else {
             return Ok(None);
         };
-        let rows = z.shape_at(0)?;
-        let k = self.moe.n_used as i64;
-        if slots.len() != (rows * k) as usize || weights.len() != slots.len() {
-            return Ok(None);
-        }
         let zf = if z.dtype()? == DType::Float32 {
             z.clone()
         } else {
             z.astype(DType::Float32)?
         };
-        let sid = MxArray::from_uint32(slots, &[rows, k])?;
-        let sw = MxArray::from_float32(weights, &[rows, k])?;
-        let [g, u, d] = &p.arrays;
+        let [g, u, d] = arrays;
         // SAFETY: all handles are live arrays owned by this call.
         let h = unsafe {
             mlx_sys::mlx_hy4_kq_routed_decode(
                 zf.as_raw_ptr(),
-                sid.as_raw_ptr(),
-                sw.as_raw_ptr(),
+                slots.as_raw_ptr(),
+                weights.as_raw_ptr(),
                 g.w.as_raw_ptr(),
                 g.s.as_raw_ptr(),
                 g.b.as_raw_ptr(),
@@ -1284,6 +1493,53 @@ impl Moe {
             h,
             "hy_v4_flash kq_routed_decode",
         )?))
+    }
+
+    fn kq_routed_decode(
+        &self,
+        z: &MxArray,
+        slots: &[u32],
+        weights: &[f32],
+        p: &Prepared,
+    ) -> Result<Option<MxArray>> {
+        let rows = z.shape_at(0)?;
+        let k = self.moe.n_used as i64;
+        if slots.len() != (rows * k) as usize || weights.len() != slots.len() {
+            return Ok(None);
+        }
+        let sid = MxArray::from_uint32(slots, &[rows, k])?;
+        let sw = MxArray::from_float32(weights, &[rows, k])?;
+        self.kq_routed_decode_gpu(z, &sid, &sw, &p.arrays)
+    }
+
+    fn combine_gpu(
+        &self,
+        z: &MxArray,
+        idx: &MxArray,
+        weights: &MxArray,
+        gather: impl Fn(usize, &MxArray, &MxArray) -> Result<MxArray>,
+    ) -> Result<MxArray> {
+        let (rows, latent) = (z.shape_at(0)?, z.shape_at(1)?);
+        let k = self.moe.n_used as i64;
+        let ze = z.reshape(&[rows, 1, 1, latent])?;
+        let g = gather(0, &ze, idx)?;
+        let u = gather(1, &ze, idx)?;
+        let g = if g.dtype()? == DType::Float32 {
+            g
+        } else {
+            g.astype(DType::Float32)?
+        };
+        let u = if u.dtype()? == DType::Float32 {
+            u
+        } else {
+            u.astype(DType::Float32)?
+        };
+        let a = Activations::swiglu_clamped_compiled(&g, &u, self.limit)?;
+        gather(2, &a, idx)?
+            .astype(DType::Float32)?
+            .mul(&weights.reshape(&[rows, k, 1, 1])?)?
+            .reshape(&[rows, k, latent])?
+            .sum(Some(&[1]), Some(false))
     }
 
     fn kq_routed_subset(
@@ -1549,11 +1805,29 @@ impl LayerFfn {
         h: &MxArray,
         kind: RowKind,
     ) -> Result<(MxArray, Option<Routes>)> {
+        self.forward_traced(w, h, kind, true)
+    }
+
+    pub fn forward_traced(
+        &self,
+        w: &LayerWeights,
+        h: &MxArray,
+        kind: RowKind,
+        need_routes: bool,
+    ) -> Result<(MxArray, Option<Routes>)> {
         let chunk = match kind {
             RowKind::Prefill => prefill_ffn_chunk_rows(),
             RowKind::Decode => FFN_CHUNK_ROWS,
         };
-        self.forward_chunked(&w.ffn, &w.ffn_norm, &w.post_ffw_norm, h, chunk, kind)
+        self.forward_chunked_traced(
+            &w.ffn,
+            &w.ffn_norm,
+            &w.post_ffw_norm,
+            h,
+            chunk,
+            kind,
+            need_routes,
+        )
     }
 
     /// `forward` from the parts, `chunk` rows per expert step; every chunk
@@ -1571,6 +1845,20 @@ impl LayerFfn {
         h: &MxArray,
         chunk: usize,
         kind: RowKind,
+    ) -> Result<(MxArray, Option<Routes>)> {
+        self.forward_chunked_traced(ffn, norm, post_norm, h, chunk, kind, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_chunked_traced(
+        &self,
+        ffn: &Ffn,
+        norm: &MxArray,
+        post_norm: &MxArray,
+        h: &MxArray,
+        chunk: usize,
+        kind: RowKind,
+        need_routes: bool,
     ) -> Result<(MxArray, Option<Routes>)> {
         let shape = dims(h)?;
         let n = match shape.as_slice() {
@@ -1593,13 +1881,17 @@ impl LayerFfn {
         }
         let x = rms_norm(&h.astype(DType::Float32)?, norm, self.eps)?;
         let parts = chunks(n, chunk);
-        let mut routes = match &self.kind {
-            FfnKind::Dense => None,
-            FfnKind::Moe(m) => Some(Routes {
-                k: m.moe.n_used,
-                ids: Vec::new(),
-                weights: Vec::new(),
-            }),
+        let mut routes = if need_routes {
+            match &self.kind {
+                FfnKind::Dense => None,
+                FfnKind::Moe(m) => Some(Routes {
+                    k: m.moe.n_used,
+                    ids: Vec::new(),
+                    weights: Vec::new(),
+                }),
+            }
+        } else {
+            None
         };
         let mut outs = Vec::with_capacity(parts.len());
         for &(lo, hi) in &parts {
@@ -1624,8 +1916,8 @@ impl LayerFfn {
                     f
                 }
                 (FfnKind::Moe(m), Ffn::Moe(mw)) => {
-                    let (f, r) = m.forward(self.layer, mw, &xc, kind)?;
-                    if let Some(all) = routes.as_mut() {
+                    let (f, r) = m.forward(self.layer, mw, &xc, kind, need_routes)?;
+                    if let (Some(all), Some(r)) = (routes.as_mut(), r) {
                         all.append(r);
                     }
                     f
@@ -1675,6 +1967,10 @@ pub mod forced {
         let r = f();
         FORCED.with(|c| c.borrow_mut().clear());
         r
+    }
+
+    pub(super) fn is_active(layer: usize) -> bool {
+        FORCED.with(|c| c.borrow().contains_key(&layer))
     }
 
     pub(super) fn apply(

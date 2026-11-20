@@ -1219,6 +1219,9 @@ impl Inner {
                 p.safe.begun();
             }
         }
+        if self.store.bank.is_direct() {
+            return Ok(());
+        }
         let Some(p) = self.paged.as_mut() else {
             return Ok(());
         };

@@ -319,6 +319,9 @@ impl<S: Seq> Conv<S> {
 pub(crate) struct Residency {
     pub admission: Option<Admission>,
     pub cache_slots: [usize; 2],
+    pub expert_cache_bytes: Option<u64>,
+    pub staging_layers: Option<u32>,
+    pub wired_limit_bytes: Option<u64>,
     /// Bank pages resident after the last turn made the bank volatile: a
     /// second live wired lease (another model's turn) keeps them wired.
     pub bank_resident: u64,
@@ -551,6 +554,20 @@ impl Inner {
         let admission = self.store.admission();
         let switches = self.store.lease.switches().len() as u32;
         let cache_slots = self.store.cache_slots();
+        let (expert_cache_bytes, staging_layers, wired_limit_bytes) = if self.store.bank.is_direct()
+        {
+            (
+                Some(self.store.bank.nbytes()),
+                Some(0),
+                self.store.wired_limit(),
+            )
+        } else {
+            (
+                admission.map(|a| a.cache_bytes()),
+                admission.map(|a| a.staging_layers as u32),
+                admission.map(|a| a.wired_limit()),
+            )
+        };
         let in_turn = self.in_turn;
         let counters = Counters::now(&self.store.bank, &self.store.table).since(&self.served_from);
         let waves = self.waves.waves;
@@ -563,6 +580,9 @@ impl Inner {
         r.admission = admission;
         r.switches = switches;
         r.cache_slots = cache_slots;
+        r.expert_cache_bytes = expert_cache_bytes;
+        r.staging_layers = staging_layers;
+        r.wired_limit_bytes = wired_limit_bytes;
         r.in_turn = in_turn;
         r.counters = counters;
         r.waves = waves;
@@ -1324,9 +1344,9 @@ impl HyV4FlashModel {
                 .iter()
                 .map(|&n| u32::try_from(n).unwrap_or(u32::MAX))
                 .collect(),
-            expert_cache_bytes: a.map(|a| a.cache_bytes() as f64),
-            staging_layers: a.map(|a| a.staging_layers as u32),
-            wired_limit_bytes: a.map(|a| a.wired_limit() as f64),
+            expert_cache_bytes: r.expert_cache_bytes.map(|b| b as f64),
+            staging_layers: r.staging_layers,
+            wired_limit_bytes: r.wired_limit_bytes.map(|b| b as f64),
             bank_resident_after_turn_bytes: r.bank_resident as f64,
             bank_switches: r.switches,
             in_turn: r.in_turn,

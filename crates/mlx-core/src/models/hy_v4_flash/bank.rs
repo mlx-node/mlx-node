@@ -24,8 +24,9 @@
 
 use std::collections::VecDeque;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use napi::{Error, Result};
@@ -1219,14 +1220,255 @@ impl Drop for Inner {
     }
 }
 
+const DIRECT_FILL_BATCH_EXPERTS: usize = 32;
+
+struct DirectFillProgress {
+    filled_layers: usize,
+    error: Option<String>,
+    stopped: bool,
+}
+
+struct DirectFillState {
+    mu: Mutex<DirectFillProgress>,
+    cv: Condvar,
+}
+
+struct DirectFillHandle {
+    stop: Arc<AtomicBool>,
+    state: Arc<DirectFillState>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl Drop for DirectFillHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        {
+            let mut st = lock(&self.state.mu);
+            st.stopped = true;
+            self.state.cv.notify_all();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+struct DirectLayerJob {
+    layer: usize,
+    tensors: [Arc<Located>; 3],
+    dsts: [SlotDst; 3],
+    ready: Arc<AtomicBool>,
+}
+
+struct DirectLayer {
+    ci: usize,
+    class: ExpertClass,
+    proj: [ProjBank; 3],
+    arrays: [ProjArrays; 3],
+    ready: Arc<AtomicBool>,
+}
+
+struct DirectBank {
+    // Declared before `layers` so Drop cancels and joins the fill thread
+    // before any direct PurgeableBank buffer is released.
+    fill: DirectFillHandle,
+    layers: Vec<DirectLayer>,
+    layer_to_idx: Vec<Option<usize>>,
+    uses: [AtomicUsize; 2],
+    slot_bytes: [u64; 2],
+    cache_slots: [usize; 2],
+    in_turn: AtomicBool,
+}
+
+fn run_direct_fill(
+    pool: Arc<IoPool>,
+    n_experts: usize,
+    jobs: Vec<DirectLayerJob>,
+    stop: Arc<AtomicBool>,
+    state: Arc<DirectFillState>,
+) {
+    struct ExitGuard {
+        done: bool,
+        stop: Arc<AtomicBool>,
+        state: Arc<DirectFillState>,
+    }
+    impl Drop for ExitGuard {
+        fn drop(&mut self) {
+            if !self.done {
+                let mut st = lock(&self.state.mu);
+                if self.stop.load(Ordering::Acquire) {
+                    st.stopped = true;
+                } else if st.error.is_none() {
+                    st.error = Some("direct expert fill thread exited unexpectedly".into());
+                }
+                self.state.cv.notify_all();
+            }
+        }
+    }
+    let mut guard = ExitGuard {
+        done: false,
+        stop: Arc::clone(&stop),
+        state: Arc::clone(&state),
+    };
+    let total_layers = jobs.len();
+    let t_all = Instant::now();
+    for job in jobs {
+        if stop.load(Ordering::Acquire) {
+            let mut st = lock(&state.mu);
+            st.stopped = true;
+            state.cv.notify_all();
+            guard.done = true;
+            return;
+        }
+        for e0 in (0..n_experts).step_by(DIRECT_FILL_BATCH_EXPERTS) {
+            if stop.load(Ordering::Acquire) {
+                let mut st = lock(&state.mu);
+                st.stopped = true;
+                state.cv.notify_all();
+                guard.done = true;
+                return;
+            }
+            let e1 = (e0 + DIRECT_FILL_BATCH_EXPERTS).min(n_experts);
+            let mut reads = Vec::with_capacity((e1 - e0) * 12);
+            for e in e0..e1 {
+                for (t, dst) in job.tensors.iter().zip(&job.dsts) {
+                    match dst.reads(t, e as u32, e) {
+                        Ok(r) => reads.extend(r),
+                        Err(err) => {
+                            let mut st = lock(&state.mu);
+                            st.error =
+                                Some(format!("layer {} expert {e}: {}", job.layer, err.reason));
+                            state.cv.notify_all();
+                            guard.done = true;
+                            return;
+                        }
+                    }
+                }
+            }
+            // SAFETY: `DirectFillHandle::drop` joins this thread before
+            // `DirectBank::layers` frees any `PurgeableBank`. Each batch writes
+            // disjoint slots `e0..e1` before `job.ready` publishes with Release.
+            let ticket = match unsafe { pool.submit(reads, Priority::Low) } {
+                Ok(t) => t,
+                Err(err) => {
+                    let mut st = lock(&state.mu);
+                    st.error = Some(format!("layer {}: {}", job.layer, err.reason));
+                    state.cv.notify_all();
+                    guard.done = true;
+                    return;
+                }
+            };
+            if let Err(err) = ticket.wait() {
+                let mut st = lock(&state.mu);
+                if stop.load(Ordering::Acquire) {
+                    st.stopped = true;
+                } else {
+                    st.error = Some(format!("layer {}: {}", job.layer, err.reason));
+                }
+                state.cv.notify_all();
+                guard.done = true;
+                return;
+            }
+        }
+        let mut st = lock(&state.mu);
+        job.ready.store(true, Ordering::Release);
+        st.filled_layers += 1;
+        state.cv.notify_all();
+    }
+    tracing::info!(
+        "hy_v4_flash direct expert fill completed {total_layers} layers ({n_experts} experts/layer) in {:.2} s",
+        t_all.elapsed().as_secs_f64()
+    );
+    guard.done = true;
+}
+
+impl DirectBank {
+    fn wait_layer(&self, layer: usize) -> Result<&DirectLayer> {
+        let idx = self
+            .layer_to_idx
+            .get(layer)
+            .copied()
+            .flatten()
+            .ok_or_else(|| bad(format!("layer {layer} has no direct experts")))?;
+        let dl = &self.layers[idx];
+        if dl.ready.load(Ordering::Acquire) {
+            return Ok(dl);
+        }
+        let mut st = lock(&self.fill.state.mu);
+        loop {
+            if dl.ready.load(Ordering::Acquire) {
+                return Ok(dl);
+            }
+            if let Some(err) = &st.error {
+                return Err(bad(err.clone()));
+            }
+            if st.stopped {
+                return Err(bad("direct expert fill was stopped"));
+            }
+            st = self
+                .fill
+                .state
+                .cv
+                .wait(st)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn wait_all(&self) -> Result<()> {
+        let total = self.layers.len();
+        let mut st = lock(&self.fill.state.mu);
+        loop {
+            if st.filled_layers >= total {
+                return Ok(());
+            }
+            if let Some(err) = &st.error {
+                return Err(bad(err.clone()));
+            }
+            if st.stopped {
+                return Err(bad("direct expert fill was stopped"));
+            }
+            st = self
+                .fill
+                .state
+                .cv
+                .wait(st)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn fill_complete(&self) -> bool {
+        lock(&self.fill.state.mu).filled_layers >= self.layers.len()
+    }
+}
+
+fn check_direct_step(n_experts: usize, experts: &[u32], uses: &[u32]) -> Result<()> {
+    if let Some(&e) = experts.iter().find(|&&e| e as usize >= n_experts) {
+        return Err(bad(format!("expert {e} of {n_experts}")));
+    }
+    if experts.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(bad("experts must be sorted and distinct"));
+    }
+    if !uses.is_empty() && uses.len() != experts.len() {
+        return Err(bad(format!(
+            "{} use counts for {} experts",
+            uses.len(),
+            experts.len()
+        )));
+    }
+    Ok(())
+}
+
 pub struct KqBank {
-    pool: IoPool,
+    // Declared before `pool` so direct fill and streamed in-flight reads
+    // finish before `pool` shuts down and before any PurgeableBank frees.
+    direct: Option<DirectBank>,
+    inner: Mutex<Inner>,
+    pool: Arc<IoPool>,
     n_experts: usize,
     n_used: usize,
     layout: ClassLayout,
     split: AtomicBool,
     prefetch: AtomicBool,
-    inner: Mutex<Inner>,
     stats: Mutex<[KqStats; 2]>,
 }
 
@@ -1276,12 +1518,7 @@ impl KqBank {
             });
         }
         Ok(Self {
-            pool,
-            n_experts: n,
-            n_used: moe.n_used,
-            layout,
-            split: AtomicBool::new(true),
-            prefetch: AtomicBool::new(true),
+            direct: None,
             inner: Mutex::new(Inner {
                 ahead: [Vec::new(), Vec::new()],
                 inflight: Vec::new(),
@@ -1290,8 +1527,158 @@ impl KqBank {
                 in_turn: true,
                 retired: Vec::new(),
             }),
+            pool: Arc::new(pool),
+            n_experts: n,
+            n_used: moe.n_used,
+            layout,
+            split: AtomicBool::new(true),
+            prefetch: AtomicBool::new(true),
             stats: Mutex::new([KqStats::default(); 2]),
         })
+    }
+
+    /// Direct full-expert residency: allocates one NonVolatile `[n_experts, ...]`
+    /// bank per MoE layer (`slot_id == expert_id`) and fills all layers in
+    /// ascending layer order on a background thread using `pool`.
+    pub fn new_direct(
+        pool: IoPool,
+        moe: &MoeConfig,
+        experts: &[Option<ExpertLayer>],
+    ) -> Result<Self> {
+        let n = moe.n_experts;
+        if n == 0 || u32::try_from(n).is_err() {
+            return Err(bad(format!("invalid direct expert count {n}")));
+        }
+        let classes: Vec<Option<ExpertClass>> = experts
+            .iter()
+            .map(|l| l.as_ref().map(|l| l.class))
+            .collect();
+        let layout = ClassLayout::new(&classes)?;
+        let geos = [geometry(moe, CLASSES[0])?, geometry(moe, CLASSES[1])?];
+        let slot_bytes = [
+            geos[0].iter().map(ProjGeo::slot_bytes).sum(),
+            geos[1].iter().map(ProjGeo::slot_bytes).sum(),
+        ];
+        let cache_slots = [layout.layers[0].len() * n, layout.layers[1].len() * n];
+        let n_moe_layers = layout.layers[0].len() + layout.layers[1].len();
+        let mut layers = Vec::with_capacity(n_moe_layers);
+        let mut jobs = Vec::with_capacity(n_moe_layers);
+        let mut layer_to_idx = vec![None; experts.len()];
+        for (il, opt) in experts.iter().enumerate() {
+            let Some(expert_layer) = opt else {
+                continue;
+            };
+            let (ci, _) = layout.of_layer[il]
+                .ok_or_else(|| bad(format!("layer {il} missing from class layout")))?;
+            let class = CLASSES[ci];
+            let geo = &geos[ci];
+            let tensors = check_layer(il, expert_layer, class, geo, n)?;
+            let proj_vec = alloc(geo, n)?;
+            let proj: [ProjBank; 3] = proj_vec
+                .try_into()
+                .map_err(|_| bad("expected 3 expert projections"))?;
+            let arrays = [proj[0].arrays(), proj[1].arrays(), proj[2].arrays()];
+            let dsts = [proj[0].dst, proj[1].dst, proj[2].dst];
+            let ready = Arc::new(AtomicBool::new(false));
+            let idx = layers.len();
+            layer_to_idx[il] = Some(idx);
+            layers.push(DirectLayer {
+                ci,
+                class,
+                proj,
+                arrays,
+                ready: Arc::clone(&ready),
+            });
+            jobs.push(DirectLayerJob {
+                layer: il,
+                tensors,
+                dsts,
+                ready,
+            });
+        }
+        let pool = Arc::new(pool);
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(DirectFillState {
+            mu: Mutex::new(DirectFillProgress {
+                filled_layers: 0,
+                error: None,
+                stopped: false,
+            }),
+            cv: Condvar::new(),
+        });
+        let worker = if jobs.is_empty() {
+            None
+        } else {
+            let p = Arc::clone(&pool);
+            let s = Arc::clone(&stop);
+            let st = Arc::clone(&state);
+            Some(
+                std::thread::Builder::new()
+                    .name("hy4-direct-fill".into())
+                    .spawn(move || run_direct_fill(p, n, jobs, s, st))
+                    .map_err(|e| bad(format!("spawn direct fill thread: {e}")))?,
+            )
+        };
+        let direct = DirectBank {
+            fill: DirectFillHandle {
+                stop,
+                state,
+                worker,
+            },
+            layers,
+            layer_to_idx,
+            uses: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            slot_bytes,
+            cache_slots,
+            in_turn: AtomicBool::new(true),
+        };
+        Ok(Self {
+            direct: Some(direct),
+            inner: Mutex::new(Inner {
+                ahead: [Vec::new(), Vec::new()],
+                inflight: Vec::new(),
+                ahead_left: [Vec::new(), Vec::new()],
+                classes: Vec::new(),
+                in_turn: true,
+                retired: Vec::new(),
+            }),
+            pool,
+            n_experts: n,
+            n_used: moe.n_used,
+            layout,
+            split: AtomicBool::new(true),
+            prefetch: AtomicBool::new(true),
+            stats: Mutex::new([KqStats::default(); 2]),
+        })
+    }
+
+    pub fn is_direct(&self) -> bool {
+        self.direct.is_some()
+    }
+
+    /// In direct mode, waits until `layer` has finished filling and returns its
+    /// `[ProjArrays; 3]` (`slot_id == expert_id`) without taking the bank lock.
+    /// Returns `Ok(None)` in streamed mode.
+    pub fn direct_layer(&self, layer: usize) -> Result<Option<[ProjArrays; 3]>> {
+        let Some(direct) = &self.direct else {
+            return Ok(None);
+        };
+        let dl = direct.wait_layer(layer)?;
+        direct.uses[dl.ci].fetch_add(self.n_used, Ordering::Relaxed);
+        Ok(Some(dl.arrays.clone()))
+    }
+
+    /// Whether the background direct fill has populated every MoE layer.
+    pub fn direct_fill_complete(&self) -> bool {
+        self.direct.as_ref().is_some_and(DirectBank::fill_complete)
+    }
+
+    /// Blocks until the background direct fill finishes all layers (no-op in streamed mode).
+    pub fn wait_direct_fill(&self) -> Result<()> {
+        match &self.direct {
+            Some(direct) => direct.wait_all(),
+            None => Ok(()),
+        }
     }
 
     pub fn split(&self) -> bool {
@@ -1311,6 +1698,9 @@ impl KqBank {
     }
 
     pub fn reads_in_flight(&self) -> usize {
+        if self.direct.is_some() {
+            return 0;
+        }
         lock(&self.inner)
             .inflight
             .iter()
@@ -1336,6 +1726,9 @@ impl KqBank {
     }
 
     pub fn cache_slots(&self) -> [usize; 2] {
+        if let Some(direct) = &self.direct {
+            return direct.cache_slots;
+        }
         let g = lock(&self.inner);
         [
             g.classes[0].dir.cache().slots(),
@@ -1344,11 +1737,17 @@ impl KqBank {
     }
 
     pub fn staging_layers(&self) -> usize {
+        if self.direct.is_some() {
+            return 0;
+        }
         lock(&self.inner).classes[0].dir.staging_layers()
     }
 
     /// Per class: bank bytes of one expert.
     pub fn slot_bytes(&self) -> [u64; 2] {
+        if let Some(direct) = &self.direct {
+            return direct.slot_bytes;
+        }
         let g = lock(&self.inner);
         let one = |c: &ClassBank| c.geo.iter().map(ProjGeo::slot_bytes).sum();
         [one(&g.classes[0]), one(&g.classes[1])]
@@ -1356,6 +1755,15 @@ impl KqBank {
 
     /// Bytes of every bank.
     pub fn nbytes(&self) -> u64 {
+        if let Some(direct) = &self.direct {
+            return direct
+                .layers
+                .iter()
+                .flat_map(|l| &l.proj)
+                .flat_map(ProjBank::banks)
+                .map(|b| b.nbytes() as u64)
+                .sum();
+        }
         lock(&self.inner)
             .classes
             .iter()
@@ -1367,6 +1775,15 @@ impl KqBank {
 
     /// Bytes of every bank resident in RAM now.
     pub fn resident_bytes(&self) -> Result<u64> {
+        if let Some(direct) = &self.direct {
+            let mut n = 0;
+            for p in direct.layers.iter().flat_map(|l| &l.proj) {
+                for b in p.banks() {
+                    n += b.resident_bytes()?;
+                }
+            }
+            return Ok(n);
+        }
         let g = lock(&self.inner);
         let mut n = 0;
         for p in g.classes.iter().flat_map(|c| &c.proj) {
@@ -1382,6 +1799,19 @@ impl KqBank {
     /// purgeable. Without a kernel reading a bank is volatile outside a
     /// turn.
     pub fn residency(&self) -> Result<Residency> {
+        if let Some(direct) = &self.direct {
+            let mut r = Residency::default();
+            for p in direct.layers.iter().flat_map(|l| &l.proj) {
+                for b in p.banks() {
+                    let n = b.resident_bytes()?;
+                    r.resident += n;
+                    if kernel_volatile(b).unwrap_or(false) {
+                        r.volatile += n;
+                    }
+                }
+            }
+            return Ok(r);
+        }
         let g = lock(&self.inner);
         let mut r = Residency::default();
         for p in g.classes.iter().flat_map(|c| &c.proj) {
@@ -1399,6 +1829,10 @@ impl KqBank {
     /// Writes zeros over every bank so each of its pages is resident.
     #[cfg(test)]
     pub(crate) fn touch(&self) {
+        if let Some(direct) = &self.direct {
+            let _ = direct.wait_all();
+            return;
+        }
         let g = lock(&self.inner);
         for b in g
             .classes
@@ -1413,7 +1847,15 @@ impl KqBank {
 
     /// Per class index.
     pub fn stats(&self) -> [KqStats; 2] {
-        *lock(&self.stats)
+        let mut out = *lock(&self.stats);
+        if let Some(direct) = &self.direct {
+            for (ci, s) in out.iter_mut().enumerate() {
+                let u = direct.uses[ci].load(Ordering::Relaxed);
+                s.uses += u;
+                s.hits += u;
+            }
+        }
+        out
     }
 
     fn begin(&self, g: &mut Inner) -> Result<bool> {
@@ -1437,12 +1879,19 @@ impl KqBank {
     }
 
     pub fn in_turn(&self) -> bool {
+        if let Some(direct) = &self.direct {
+            return direct.in_turn.load(Ordering::Acquire);
+        }
         lock(&self.inner).in_turn
     }
 
     /// Makes the banks `NonVolatile` for a turn. Returns whether Metal had
     /// discarded any of them (that class's tags and cache are forgotten).
     pub fn begin_turn(&self) -> Result<bool> {
+        if let Some(direct) = &self.direct {
+            direct.in_turn.store(true, Ordering::Release);
+            return Ok(false);
+        }
         let mut g = lock(&self.inner);
         if g.in_turn {
             return Ok(false);
@@ -1514,6 +1963,13 @@ impl KqBank {
     /// After the turn's last eval: staging copies served this turn move into
     /// cache slots, then the banks become `Volatile`.
     pub fn end_turn(&self) -> Result<()> {
+        if let Some(direct) = &self.direct {
+            if direct.in_turn.swap(false, Ordering::AcqRel) {
+                crate::array::synchronize();
+            }
+            // Direct banks remain NonVolatile until KqBank drops.
+            return Ok(());
+        }
         let mut g = lock(&self.inner);
         if !g.in_turn {
             return Ok(());
@@ -1557,6 +2013,9 @@ impl KqBank {
     /// at a turn end, then with `seed_reset` the seed quota starts over as
     /// at a turn start. The banks stay non-volatile. The copies made.
     pub fn safe_point(&self, seed_reset: bool) -> Result<usize> {
+        if self.direct.is_some() {
+            return Ok(0);
+        }
         let mut g = lock(&self.inner);
         if !g.in_turn {
             return Ok(0);
@@ -1584,6 +2043,9 @@ impl KqBank {
     /// gone from MLX (refuses while any array still holds one; the bank then
     /// has no slots until a rebuild succeeds).
     pub fn rebuild(&self, cache_slots: [usize; 2], staging: usize) -> Result<()> {
+        if self.direct.is_some() {
+            return Err(bad("direct expert bank cannot be rebuilt"));
+        }
         let mut g = lock(&self.inner);
         crate::array::synchronize();
         self.settle_all_ahead(&mut g);
@@ -1657,6 +2119,22 @@ impl KqBank {
         uses: &[u32],
         decode: bool,
     ) -> Result<(Prepared, Option<Pending<'_>>)> {
+        if let Some(direct) = &self.direct {
+            check_direct_step(self.n_experts, experts, uses)?;
+            let dl = direct.wait_layer(layer)?;
+            direct.uses[dl.ci].fetch_add(experts.len(), Ordering::Relaxed);
+            return Ok((
+                Prepared {
+                    layer,
+                    class: dl.class,
+                    experts: experts.to_vec(),
+                    slots: experts.to_vec(),
+                    arrays: dl.arrays.clone(),
+                    reading: Vec::new(),
+                },
+                None,
+            ));
+        }
         let (ci, local) = self
             .layout
             .of_layer
@@ -1792,6 +2270,29 @@ impl KqBank {
         last_use_order: &[u32],
         subgroup_experts: usize,
     ) -> Result<(Prepared, Vec<u32>, PrefillSubgroups<'_>)> {
+        if let Some(direct) = &self.direct {
+            check_direct_step(self.n_experts, used, uses)?;
+            let dl = direct.wait_layer(layer)?;
+            direct.uses[dl.ci].fetch_add(used.len(), Ordering::Relaxed);
+            return Ok((
+                Prepared {
+                    layer,
+                    class: dl.class,
+                    experts: used.to_vec(),
+                    slots: used.to_vec(),
+                    arrays: dl.arrays.clone(),
+                    reading: Vec::new(),
+                },
+                used.to_vec(),
+                PrefillSubgroups {
+                    bank: self,
+                    ci: dl.ci,
+                    local: 0,
+                    active: None,
+                    queued: VecDeque::new(),
+                },
+            ));
+        }
         let (ci, local) = self
             .layout
             .of_layer
@@ -1937,7 +2438,7 @@ impl KqBank {
     /// Reads `layer`'s predicted `experts` (sorted, distinct) into its staging
     /// half at low priority when the bank has at least two staging layers.
     pub fn prefetch_layer(&self, layer: usize, experts: &[u32]) -> Result<usize> {
-        if !self.prefetch() {
+        if self.direct.is_some() || !self.prefetch() {
             return Ok(0);
         }
         let (ci, local) = self
@@ -2011,6 +2512,9 @@ impl KqBank {
 
     /// Counts unused prefetched experts for `layer` once every step of it ran.
     pub fn end_layer(&self, layer: usize) {
+        if self.direct.is_some() {
+            return;
+        }
         let Some((ci, local)) = self.layout.of_layer.get(layer).copied().flatten() else {
             return;
         };
@@ -2029,6 +2533,9 @@ impl KqBank {
 
     /// Per class: the epoch of the last step planned so far.
     pub fn issued(&self) -> [u64; 2] {
+        if self.direct.is_some() {
+            return [0, 0];
+        }
         let g = lock(&self.inner);
         [
             g.classes[0].dir.cache().epoch(),
@@ -2039,6 +2546,9 @@ impl KqBank {
     /// The GPU finished every gather of the steps up to `issued` (taken
     /// before a host read that waits for them).
     pub fn settle(&self, issued: [u64; 2]) {
+        if self.direct.is_some() {
+            return;
+        }
         let mut g = lock(&self.inner);
         for (c, e) in g.classes.iter_mut().zip(issued) {
             c.dir.complete(e);
@@ -2047,6 +2557,9 @@ impl KqBank {
 
     /// The GPU finished every gather planned so far.
     pub fn settle_all(&self) {
+        if self.direct.is_some() {
+            return;
+        }
         for c in &mut lock(&self.inner).classes {
             c.dir.complete_all();
         }
@@ -2066,6 +2579,24 @@ impl KqBank {
 
     /// `assert_slots` restricted to `experts`.
     pub fn assert_experts_slots(&self, p: &Prepared, experts: &[u32]) {
+        if let Some(direct) = &self.direct {
+            let idx = direct.layer_to_idx.get(p.layer).copied().flatten();
+            assert!(
+                idx.is_some_and(|i| direct.layers[i].ready.load(Ordering::Acquire)),
+                "Hy4 expert bank: direct gather of layer {} before fill completed",
+                p.layer
+            );
+            let stale = experts.iter().find_map(|&e| {
+                let s = p.slot(e)?;
+                (s != e || e as usize >= self.n_experts).then_some((e, s))
+            });
+            assert!(
+                stale.is_none(),
+                "Hy4 expert bank: direct gather of layer {} on non-identity slot {stale:?}",
+                p.layer
+            );
+            return;
+        }
         let stale = self
             .layout
             .of_layer
@@ -2088,6 +2619,27 @@ impl KqBank {
     }
 
     fn assert_slots_where(&self, p: &Prepared, check: impl Fn(u32) -> bool) {
+        if let Some(direct) = &self.direct {
+            let idx = direct.layer_to_idx.get(p.layer).copied().flatten();
+            assert!(
+                idx.is_some_and(|i| direct.layers[i].ready.load(Ordering::Acquire)),
+                "Hy4 expert bank: direct gather of layer {} before fill completed",
+                p.layer
+            );
+            let stale = p
+                .experts
+                .iter()
+                .zip(&p.slots)
+                .filter(|&(&e, _)| check(e))
+                .find(|&(&e, &s)| s != e || e as usize >= self.n_experts)
+                .map(|(&e, &s)| (e, s));
+            assert!(
+                stale.is_none(),
+                "Hy4 expert bank: direct gather of layer {} on non-identity slot {stale:?}",
+                p.layer
+            );
+            return;
+        }
         let stale = self
             .layout
             .of_layer
@@ -2113,6 +2665,9 @@ impl KqBank {
 
     #[cfg(test)]
     pub(crate) fn test_check_caches(&self) {
+        if self.direct.is_some() {
+            return;
+        }
         let g = lock(&self.inner);
         for c in &g.classes {
             c.dir.cache().check().unwrap();
@@ -2121,6 +2676,9 @@ impl KqBank {
 
     #[cfg(test)]
     pub(crate) fn test_forget_where(&self, f: impl Fn(usize, u32) -> bool) {
+        if self.direct.is_some() {
+            return;
+        }
         let mut g = lock(&self.inner);
         crate::array::synchronize();
         self.settle_all_ahead(&mut g);

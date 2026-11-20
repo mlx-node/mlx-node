@@ -29,6 +29,7 @@ enum Hy4KernelId : int {
   kKernelMlaPrefillNax = 11,
   kKernelKqPrefillIndirectGu = 12,
   kKernelKqSortedCombine = 13,
+  kKernelRouterTopk = 14,
 };
 
 struct CachedPrimKey {
@@ -168,6 +169,23 @@ struct Float3KeyHash {
     return size_t(h);
   }
 };
+
+array cached_f32_pair(float a, float b) {
+  const uint64_t key =
+      (uint64_t(float_bits(a)) << 32) | uint64_t(float_bits(b));
+  static std::mutex mutex;
+  static std::unordered_map<uint64_t, array> cache;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (auto it = cache.find(key); it != cache.end()) {
+    return it->second;
+  }
+  const float vals[2] = {a, b};
+  array arr(vals, {2}, mlx::core::float32);
+  if (cache.size() < 64) {
+    cache.emplace(key, arr);
+  }
+  return arr;
+}
 
 array cached_f32_triple(float a, float b, float c) {
   const Float3Key key{float_bits(a), float_bits(b), float_bits(c)};
@@ -396,8 +414,8 @@ const mlx::core::fast::CustomKernelFunction &hy4_kq_gate_up_kernel() {
       R"METAL(
       const uint assign = threadgroup_position_in_grid.z;
       if (assign >= uint(slots_shape[0])) return;
-      hy4_kq_gate_up_swiglu_impl<FAST>(
-          x, row_ids[assign], slots[assign], wg, sg, bg, wu, su, bu, limit[0], out,
+      hy4_kq_gate_up_swiglu_impl<FAST, DEDUP>(
+          x, row_ids, slots, wg, sg, bg, wu, su, bu, limit[0], out,
           x_shape[0], slots_shape[0], x_shape[1], wg_shape[1], wg_shape[0],
           assign, threadgroup_position_in_grid.y,
           simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
@@ -456,6 +474,14 @@ const mlx::core::fast::CustomKernelFunction &hy4_kq_sorted_combine_kernel() {
   static auto kernel = mlx::core::fast::metal_kernel(
       "hy4_kq_sorted_combine", {"down", "weights", "inverse"}, {"out"},
 #include "metal/hy4/kq_sorted_combine.metal.inc"
+  );
+  return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction &hy4_router_topk_kernel() {
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "hy4_router_topk", {"logits", "bias", "params"}, {"ids", "weights"},
+#include "metal/hy4/router_topk.metal.inc"
   );
   return kernel;
 }
@@ -1269,6 +1295,9 @@ mlx_array *mlx_hy4_kq_routed_decode(mlx_array *x, mlx_array *slots,
 
     array slots_flat = reshape(slc, {n_assign});
     const bool fast_gu = (m % 8 == 0) && (k % 512 == 0);
+    const bool dedup = (rows >= 2) && (n_assign <= 128);
+    const uint64_t gu_tmpl =
+        uint64_t(fast_gu ? 1 : 0) | (uint64_t(dedup ? 1 : 0) << 1);
     const auto stream = default_stream(Device::gpu);
     const std::tuple<int, int, int> gu_grid{32, ((m + 7) / 8) * 2, n_assign};
     const std::tuple<int, int, int> gu_tg{32, 2, 1};
@@ -1277,11 +1306,12 @@ mlx_array *mlx_hy4_kq_routed_decode(mlx_array *x, mlx_array *slots,
     const std::vector<Shape> gu_out_shapes{{n_assign, m}};
     const std::vector<Dtype> out_dtypes{mlx::core::float32};
     auto hidden = dispatch_cached_kernel(
-        kKernelKqGateUp, stream, gu_grid, gu_tg, uint64_t(fast_gu ? 1 : 0),
-        gu_inputs, gu_out_shapes, out_dtypes, [&] {
+        kKernelKqGateUp, stream, gu_grid, gu_tg, gu_tmpl, gu_inputs,
+        gu_out_shapes, out_dtypes, [&] {
           return hy4_kq_gate_up_kernel()(
               gu_inputs, gu_out_shapes, out_dtypes, gu_grid, gu_tg,
-              {{"FAST", fast_gu}}, std::nullopt, false, stream);
+              {{"FAST", fast_gu}, {"DEDUP", dedup}}, std::nullopt, false,
+              stream);
         })[0];
 
     const bool fast_d = (h % 4 == 0) && (m % 512 == 0);
@@ -1404,6 +1434,9 @@ mlx_array *mlx_hy4_kq_routed_subset(mlx_array *x, mlx_array *row_ids,
     array bdc = ensure_contiguous_aligned(bda, 1);
 
     const bool fast_gu = (m % 8 == 0) && (k % 512 == 0);
+    const bool dedup = (rows >= 2) && (n_assign <= 128);
+    const uint64_t gu_tmpl =
+        uint64_t(fast_gu ? 1 : 0) | (uint64_t(dedup ? 1 : 0) << 1);
     const auto stream = default_stream(Device::gpu);
     const std::tuple<int, int, int> gu_grid{32, ((m + 7) / 8) * 2, n_assign};
     const std::tuple<int, int, int> gu_tg{32, 2, 1};
@@ -1412,11 +1445,12 @@ mlx_array *mlx_hy4_kq_routed_subset(mlx_array *x, mlx_array *row_ids,
     const std::vector<Shape> gu_out_shapes{{n_assign, m}};
     const std::vector<Dtype> out_dtypes{mlx::core::float32};
     auto hidden = dispatch_cached_kernel(
-        kKernelKqGateUp, stream, gu_grid, gu_tg, uint64_t(fast_gu ? 1 : 0),
-        gu_inputs, gu_out_shapes, out_dtypes, [&] {
+        kKernelKqGateUp, stream, gu_grid, gu_tg, gu_tmpl, gu_inputs,
+        gu_out_shapes, out_dtypes, [&] {
           return hy4_kq_gate_up_kernel()(
               gu_inputs, gu_out_shapes, out_dtypes, gu_grid, gu_tg,
-              {{"FAST", fast_gu}}, std::nullopt, false, stream);
+              {{"FAST", fast_gu}, {"DEDUP", dedup}}, std::nullopt, false,
+              stream);
         })[0];
 
     const bool fast_d = (h % 4 == 0) && (m % 512 == 0);
@@ -1880,6 +1914,86 @@ mlx_array *mlx_hy4_kq_sorted_combine(mlx_array *down, mlx_array *weights,
   (void)weights;
   (void)inverse;
   return nullptr;
+#endif
+}
+
+bool mlx_hy4_router_topk(mlx_array *logits, mlx_array *bias, float scale,
+                         float eps, int k, bool norm, mlx_array **out_ids,
+                         mlx_array **out_weights) {
+  if (out_ids)
+    *out_ids = nullptr;
+  if (out_weights)
+    *out_weights = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!mlx::core::metal::is_available() ||
+        !(default_device() == Device::gpu)) {
+      return false;
+    }
+    if (!logits || !out_ids || !out_weights || !std::isfinite(scale) ||
+        !std::isfinite(eps)) {
+      return false;
+    }
+    const auto &la = *reinterpret_cast<array *>(logits);
+    if (la.ndim() != 2 || la.dtype() != mlx::core::float32) {
+      return false;
+    }
+    const int m = la.shape(0);
+    const int e = la.shape(1);
+    if (m < 1 || e < 1 || e > 1024 || k < 1 || k > 32 || k > e) {
+      return false;
+    }
+    const bool has_bias = (bias != nullptr);
+    array bc = cached_f32_scalar(0.0f);
+    if (has_bias) {
+      const auto &ba = *reinterpret_cast<array *>(bias);
+      if (ba.ndim() != 1 || ba.dtype() != mlx::core::float32 ||
+          ba.shape(0) != e) {
+        return false;
+      }
+      bc = ensure_contiguous_aligned(ba, 1);
+    }
+    array lc = ensure_contiguous_aligned(la, 1);
+    array params = cached_f32_pair(scale, eps);
+
+    const int max_e = (e <= 512) ? 512 : 1024;
+    const auto stream = default_stream(Device::gpu);
+    const std::tuple<int, int, int> grid{128, m, 1};
+    const std::tuple<int, int, int> tg{128, 1, 1};
+    const uint64_t tmpl_key = uint64_t(k) | (uint64_t(max_e) << 8) |
+                              (uint64_t(has_bias ? 1 : 0) << 20) |
+                              (uint64_t(norm ? 1 : 0) << 21);
+    const std::vector<array> inputs{lc, bc, params};
+    const std::vector<Shape> out_shapes{{m, k}, {m, k}};
+    const std::vector<Dtype> out_dtypes{mlx::core::uint32, mlx::core::float32};
+    auto res = dispatch_cached_kernel(
+        kKernelRouterTopk, stream, grid, tg, tmpl_key, inputs, out_shapes,
+        out_dtypes, [&] {
+          return hy4_router_topk_kernel()(
+              inputs, out_shapes, out_dtypes, grid, tg,
+              {{"K", k},
+               {"MAX_E", max_e},
+               {"HAS_BIAS", has_bias},
+               {"NORM", norm}},
+              std::nullopt, false, stream);
+        });
+    auto ids = std::make_unique<array>(std::move(res[0]));
+    auto w = std::make_unique<array>(std::move(res[1]));
+    *out_ids = reinterpret_cast<mlx_array *>(ids.release());
+    *out_weights = reinterpret_cast<mlx_array *>(w.release());
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Hy4 router_topk: " << e.what() << std::endl;
+    return false;
+  }
+#else
+  (void)logits;
+  (void)bias;
+  (void)scale;
+  (void)eps;
+  (void)k;
+  (void)norm;
+  return false;
 #endif
 }
 

@@ -1048,6 +1048,7 @@ fn real_store_admits_at_load() {
         lanes: LANES_MAX,
         plan: CachePlan::AdmitWith(Limits::default()),
         max_memory: None,
+        direct: DirectMode::Off,
     };
     let st = Store::open(&s.paths, &opts).unwrap();
     TEST_HOST.with(|c| c.set(None));
@@ -1387,4 +1388,274 @@ fn max_memory_caps_the_working_set_only_below_it() {
     assert_eq!(capped_ws(100 * G, None), 100 * G);
     assert_eq!(capped_ws(100 * G, Some(64 * G)), 64 * G);
     assert_eq!(capped_ws(100 * G, Some(200 * G)), 100 * G);
+}
+
+#[test]
+fn direct_env_values() {
+    assert_eq!(direct_mode(None).unwrap(), DirectMode::Auto);
+    assert_eq!(direct_mode(Some("")).unwrap(), DirectMode::Auto);
+    assert_eq!(direct_mode(Some("  ")).unwrap(), DirectMode::Auto);
+    assert_eq!(direct_mode(Some("auto")).unwrap(), DirectMode::Auto);
+    assert_eq!(direct_mode(Some("AUTO")).unwrap(), DirectMode::Auto);
+    assert_eq!(direct_mode(Some("1")).unwrap(), DirectMode::On);
+    assert_eq!(direct_mode(Some("true")).unwrap(), DirectMode::On);
+    assert_eq!(direct_mode(Some("TRUE")).unwrap(), DirectMode::On);
+    assert_eq!(direct_mode(Some("0")).unwrap(), DirectMode::Off);
+    assert_eq!(direct_mode(Some("false")).unwrap(), DirectMode::Off);
+    assert_eq!(direct_mode(Some("FALSE")).unwrap(), DirectMode::Off);
+    for bad in ["2", "yes", "no", "maybe"] {
+        let e = direct_mode(Some(bad)).unwrap_err().reason;
+        assert!(e.contains(DIRECT_ENV), "{bad}: {e}");
+    }
+}
+
+#[test]
+fn direct_gate_admits_quiet_and_falls_back_when_busy_or_disabled() {
+    let sizes = Sizes {
+        dense_trunk: 8_003_184_948,
+        dense_mtp: 2_189_929_600,
+        classes: Classes {
+            layers: [19, 22],
+            slot: [4_663_296, 4_091_904],
+        },
+        n_experts: 512,
+    };
+    let direct_bytes = sizes.direct_expert_bytes();
+    assert_eq!(direct_bytes, 91_455_750_144);
+    assert_eq!(sizes.total_experts(), [9_728, 11_264]);
+
+    let dense_mtp = sizes.dense_trunk + sizes.dense_mtp;
+    let kv_initial = profile(15_812).kv_base + 15_812 * 262_144;
+    let quiet = HostMemory {
+        physical: 128 * G,
+        wired: 20 * G,
+        ..Default::default()
+    };
+    let d_auto = direct_gate(
+        DirectMode::Auto,
+        &quiet,
+        &Own::default(),
+        dense_mtp,
+        direct_bytes,
+        kv_initial,
+        None,
+        None,
+    );
+    assert!(d_auto.admitted, "quiet 128 GiB host must admit direct mode");
+    assert_eq!(d_auto.available, 128 * G - 20 * G - DIRECT_MARGIN);
+    assert_eq!(d_auto.kv_and_scratch, kv_initial + DIRECT_SCRATCH_BYTES);
+
+    let d_on = direct_gate(
+        DirectMode::On,
+        &quiet,
+        &Own::default(),
+        dense_mtp,
+        direct_bytes,
+        kv_initial,
+        None,
+        None,
+    );
+    assert!(d_on.admitted);
+
+    // MLX_HY4_DIRECT=0 disables direct residency even on a quiet host.
+    let d_off = direct_gate(
+        DirectMode::Off,
+        &quiet,
+        &Own::default(),
+        dense_mtp,
+        direct_bytes,
+        kv_initial,
+        None,
+        None,
+    );
+    assert!(!d_off.admitted);
+
+    // Busy host falls back cleanly to partial streaming.
+    let busy = HostMemory {
+        physical: 128 * G,
+        wired: 45 * G,
+        ..Default::default()
+    };
+    assert!(
+        !direct_gate(
+            DirectMode::Auto,
+            &busy,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            kv_initial,
+            None,
+            None,
+        )
+        .admitted
+    );
+    assert!(
+        !direct_gate(
+            DirectMode::On,
+            &busy,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            kv_initial,
+            None,
+            None,
+        )
+        .admitted
+    );
+
+    // max_memory_bytes or cache_cap below requirement disallows direct mode.
+    assert!(
+        !direct_gate(
+            DirectMode::Auto,
+            &quiet,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            kv_initial,
+            Some(96 * G),
+            None,
+        )
+        .admitted
+    );
+    assert!(
+        !direct_gate(
+            DirectMode::Auto,
+            &quiet,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            kv_initial,
+            None,
+            Some(direct_bytes - 1),
+        )
+        .admitted
+    );
+    assert!(
+        direct_gate(
+            DirectMode::Auto,
+            &quiet,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            kv_initial,
+            None,
+            Some(direct_bytes),
+        )
+        .admitted
+    );
+
+    // Wired limit request is always capped at working_set().
+    let ws = 96_000_000_000;
+    assert_eq!(direct_wired_limit(d_auto.need, ws), ws);
+    assert_eq!(direct_wired_limit(50 * G, ws), 50 * G);
+}
+
+#[test]
+fn lease_direct_bank_never_shrinks_or_flips_volatile() {
+    let m = moe();
+    let mut experts = Vec::new();
+    let mut off = 0u64;
+    for (il, class) in [
+        (0, ExpertClass::Q6kDown),
+        (1, ExpertClass::Q4kDown),
+        (2, ExpertClass::Q4kDown),
+    ] {
+        let mut l = layer(&m, il, class);
+        let geo = geometry(&m, class).unwrap();
+        for (p, loc) in [&mut l.gate, &mut l.up, &mut l.down]
+            .into_iter()
+            .enumerate()
+        {
+            loc.data_offset = off;
+            off += geo[p].file_bytes() * m.n_experts as u64;
+        }
+        experts.push(Some(l));
+    }
+    let dir = std::env::temp_dir().join(format!("hy4-store-direct-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let _tmp = Temp(dir.clone());
+    let path = dir.join("experts.bin");
+    std::fs::write(&path, vec![0u8; off as usize]).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 2).unwrap();
+    let bank = KqBank::new_direct(pool, &m, &experts).unwrap();
+    bank.wait_direct_fill().unwrap();
+
+    let classes = Classes {
+        layers: [1, 2],
+        slot: bank.slot_bytes(),
+    };
+    let p = profile(100);
+    let size = ModelSize {
+        dense: 0,
+        slot: classes.slot[0].max(classes.slot[1]),
+        n_experts: 8,
+        ctx: 1024,
+    };
+    let ws = 64 * G;
+    let direct_adm = Admission {
+        physical: 128 * G,
+        host_used: 20 * G,
+        own: 0,
+        others: 20 * G,
+        reserve: DIRECT_MARGIN,
+        live: 104 * G,
+        ws,
+        terms: Terms {
+            dense: 10 * G,
+            staging_layer: 0,
+            kv: 4 * G,
+            compute: DIRECT_SCRATCH_BYTES,
+            io: 0,
+            driver: 0,
+            pool: 0,
+        },
+        staging_layers: 0,
+        fixed: 80 * G,
+        slot: size.slot,
+        cache_slots: 12,
+        bound: Bound::Live,
+    };
+    let lease = Lease::new(
+        p,
+        size,
+        1024,
+        classes,
+        Some(Limits::default()),
+        Some(direct_adm),
+        &bank,
+    );
+    // Wired limit must be capped at ws even though fixed + bank.nbytes() > ws.
+    assert_eq!(lease.wired_limit(&bank), Some(ws));
+
+    // Spiked host memory must NOT shrink, rebuild, or fail a direct bank.
+    let busy = (
+        HostMemory {
+            physical: 128 * G,
+            wired: 125 * G,
+            ..Default::default()
+        },
+        ws,
+    );
+    TEST_HOST.with(|c| c.set(Some(busy)));
+    lease.begin_turn(&bank, 10 * G, 4 * G).unwrap();
+    assert!(lease.in_turn() && bank.in_turn());
+    assert!(!lease.recheck(&bank, 10 * G, 4 * G).unwrap());
+    assert!(lease.switches().is_empty());
+
+    // end_turn releases wired lease but NEVER flips direct banks to Volatile.
+    lease.end_turn(&bank).unwrap();
+    assert!(!lease.in_turn() && !bank.in_turn());
+    let r = bank.residency().unwrap();
+    assert!(r.resident > 0);
+    assert_eq!(
+        r.volatile, 0,
+        "direct banks must stay NonVolatile after end_turn"
+    );
+
+    // Second turn on busy host still succeeds with zero switches.
+    lease.begin_turn(&bank, 10 * G, 4 * G).unwrap();
+    assert!(lease.in_turn() && bank.in_turn());
+    assert!(lease.switches().is_empty());
+    lease.end_turn(&bank).unwrap();
+    TEST_HOST.with(|c| c.set(None));
 }
