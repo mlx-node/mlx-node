@@ -162,7 +162,7 @@ impl Loader<'_> {
     }
 
     fn attn(&mut self) -> Result<AttnWeights> {
-        Ok(AttnWeights {
+        let mut w = AttnWeights {
             norm: self.plain("attn_norm")?,
             sinks: self.plain("attn_sinks")?,
             q_a: self.dense("attn_q_a")?,
@@ -175,7 +175,11 @@ impl Loader<'_> {
             output: self.dense("attn_output")?,
             gate: self.dense("attn_gate")?,
             post_norm: self.plain("post_attention_norm")?,
-        })
+            q_kv: None,
+            q_kv_gate: None,
+        };
+        w.fuse()?;
+        Ok(w)
     }
 
     fn indexer(&mut self) -> Result<IndexerWeights> {
@@ -207,7 +211,7 @@ impl Loader<'_> {
         } else {
             None
         };
-        Ok(MoeWeights {
+        let mut w = MoeWeights {
             router: self.dense("ffn_gate_inp")?,
             router_bias,
             routed_down: self.dense("ffn_routed_down")?,
@@ -215,7 +219,10 @@ impl Loader<'_> {
             shared_gate: self.dense("ffn_gate_shexp")?,
             shared_up: self.dense("ffn_up_shexp")?,
             shared_down: self.dense("ffn_down_shexp")?,
-        })
+            down_shared_gu: None,
+        };
+        w.fuse()?;
+        Ok(w)
     }
 
     fn layer(&mut self) -> Result<LayerWeights> {
@@ -292,10 +299,7 @@ impl Loader<'_> {
 /// Reads and requantizes the MTP layer of `scan`. Model thread only.
 pub fn load(scan: &Scan, shards: &ShardSet) -> Result<MtpWeights> {
     let out = read(scan, shards);
-    if out.is_err() {
-        // the partial layer is gone; keep its buffers out of MLX's free pool
-        crate::array::clear_cache();
-    }
+    crate::array::clear_cache();
     out
 }
 

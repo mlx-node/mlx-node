@@ -27,13 +27,12 @@ use super::config::HyV4FlashConfig;
 use super::engram::{Hasher, keeps};
 use super::indexer::{IndexerMark, IndexerState};
 use super::moe::{ExpertSource, Routes, RowKind, per_row, qlinear};
-use super::ops::{HEAD_CHUNK, hc_head, head_chunks, head_logits};
+use super::ops::{HEAD_CHUNK, hc_head, head_chunks, head_logits, rms_norm};
 use super::prefix_state::StateLayer;
-use super::rows::EngramRows;
+use super::rows::{EngramRows, PrefetchHandle};
 use super::stats::{DeferScope, Phase, prof_end, prof_start};
 use super::weights::{HcWeights, LayerWeights, Resident};
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::attention::rms_norm;
 use crate::models::deepseek_v41::store::Dense;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
@@ -800,6 +799,11 @@ impl Model {
             keep.extend(keeps(call, self.cfg.engram.pad_token_id));
             ids.extend_from_slice(call);
         }
+        let n_engram = self.hasher.n_layers();
+        let mut handles: Vec<Option<PrefetchHandle>> = Vec::with_capacity(n_engram);
+        for e in 0..n_engram {
+            handles.push(self.table.prefetch(e, &self.hasher.layer_ids(&rows, e)?)?);
+        }
         prof_end(Phase::Engram, tp, &[])?;
         if let Some(t) = trace.as_deref_mut() {
             t.engram_rows = rows.clone();
@@ -820,7 +824,10 @@ impl Model {
             let table_rows = match blk.engram() {
                 Some(e) => {
                     let tp = prof_start();
-                    let r = self.table.rows(e, &self.hasher.layer_ids(&rows, e)?)?;
+                    let r = match handles.get_mut(e).and_then(Option::take) {
+                        Some(h) => self.table.take_prefetched(h)?,
+                        None => self.table.rows(e, &self.hasher.layer_ids(&rows, e)?)?,
+                    };
                     prof_end(Phase::Engram, tp, &[])?;
                     Some(r)
                 }
@@ -834,9 +841,18 @@ impl Model {
             if let Some(Some(xi)) = trace.as_deref().and_then(|t| t.inputs.get(l)) {
                 x = xi.clone();
             }
-            let (y, routes) = blk.forward(&w.layers()[l], &x, wave, owners, engram)?;
+            let next = (wave.kind() == RowKind::Prefill
+                && total >= super::block::READ_AHEAD_MIN_ROWS
+                && l + 1 < self.blocks.len())
+            .then(|| (&self.blocks[l + 1], &w.layers()[l + 1]));
+            let (y, routes) = blk.forward(&w.layers()[l], &x, wave, owners, engram, next)?;
             match wave.kind() {
-                RowKind::Prefill => super::stats::eval(&[&y], "hy_v4_flash layer")?,
+                RowKind::Prefill => {
+                    super::stats::eval(&[&y], "hy_v4_flash layer")?;
+                    for b in &self.banks {
+                        b.settle_all();
+                    }
+                }
                 RowKind::Decode => MxArray::async_eval_arrays(&[&y]),
             }
             x = y;

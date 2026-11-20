@@ -174,6 +174,8 @@ fn q8_layer() -> (Mla, AttnWeights) {
         output: mat(&mut r, DIM, h * v),
         gate: mat(&mut r, h * v, DIM),
         post_norm: norm(&mut r, DIM),
+        q_kv: None,
+        q_kv_gate: None,
     };
     let mla = Mla::new(g, &w).unwrap();
     (mla, w)

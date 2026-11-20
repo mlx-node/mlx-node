@@ -253,6 +253,8 @@ fn attn_weights(r: &mut Rng, h: usize) -> AttnWeights {
         output: mat(r, D, h * HEAD_V),
         gate: mat(r, h * HEAD_V, D),
         post_norm: norm(r, D),
+        q_kv: None,
+        q_kv_gate: None,
     }
 }
 
@@ -293,6 +295,7 @@ fn tiny_weights(cfg: &HyV4FlashConfig, seed: u64) -> Tiny {
                     gate: mat(&mut r, DENSE_FF, D),
                     up: mat(&mut r, DENSE_FF, D),
                     down: mat(&mut r, D, DENSE_FF),
+                    gate_up: None,
                 }
             } else {
                 Ffn::Moe(MoeWeights {
@@ -303,6 +306,7 @@ fn tiny_weights(cfg: &HyV4FlashConfig, seed: u64) -> Tiny {
                     shared_gate: mat(&mut r, SHARED_FF, D),
                     shared_up: mat(&mut r, SHARED_FF, D),
                     shared_down: mat(&mut r, D, SHARED_FF),
+                    down_shared_gu: None,
                 })
             };
             LayerWeights {
@@ -1125,6 +1129,8 @@ fn q8_bf16_head_fixture() -> Fixture {
                 output: qmat(&mut r, QD, h * QD),
                 gate: qmat(&mut r, h * QD, QD),
                 post_norm: norm(&mut r, QD),
+                q_kv: None,
+                q_kv_gate: None,
             };
             let indexer = (l.attn == Attn::Indexed).then(|| IndexerWeights {
                 attn_k: qmat(&mut r, IDX_DIM, QD),
@@ -1152,6 +1158,7 @@ fn q8_bf16_head_fixture() -> Fixture {
                     gate: qmat(&mut r, QD, QD),
                     up: qmat(&mut r, QD, QD),
                     down: qmat(&mut r, QD, QD),
+                    gate_up: None,
                 }
             } else {
                 Ffn::Moe(MoeWeights {
@@ -1162,6 +1169,7 @@ fn q8_bf16_head_fixture() -> Fixture {
                     shared_gate: qmat(&mut r, QD, QD),
                     shared_up: qmat(&mut r, QD, QD),
                     shared_down: qmat(&mut r, QD, QD),
+                    down_shared_gu: None,
                 })
             };
             LayerWeights {
@@ -1324,6 +1332,91 @@ fn batched_bf16_head_four_owner_decode_wave_matches_alone_bitwise() {
             "mixed owner {i} hidden"
         );
     }
+}
+
+/// Prefill with read-ahead (`prefetch=true`, 2 staging layers, >= 256 rows)
+/// matches `prefetch=false` bit-for-bit and records `prefetch_slots > 0`.
+#[test]
+fn prefill_with_prefetch_matches_without_prefetch_bitwise() {
+    let mut cfg = tiny_cfg();
+    cfg.context_length = 300;
+    let mut r = Rng::new(7);
+    let mut file = r.bytes(1000);
+    let experts: Vec<Option<ExpertLayer>> = CLASSES
+        .iter()
+        .enumerate()
+        .map(|(il, c)| c.map(|c| kquant_layer(&mut r, &cfg.moe, il, c, &mut file)))
+        .collect();
+    let dir = Temp::new();
+    let path = dir.0.join("experts.bin");
+    std::fs::write(&path, &file).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+    let bank = Arc::new(KqBank::new(pool, &cfg.moe, &experts, [4, 4], 2).unwrap());
+    let weights = tiny_weights(&cfg, 11);
+    let table = engram_table(&cfg.engram, 13);
+    let b = Arc::clone(&bank);
+    let model = Model::new(
+        cfg.clone(),
+        Box::new(weights),
+        move |_| Ok(ExpertSource::Bank(Arc::clone(&b))),
+        Box::new(table),
+    )
+    .unwrap();
+
+    let ids = Rng::new(53).ids(super::block::READ_AHEAD_MIN_ROWS);
+
+    bank.set_prefetch(false);
+    bank.test_forget_where(|_, _| true);
+    let mut s_off = model.new_session(300).unwrap();
+    let mut t_off = Trace::default();
+    let out_off = model
+        .forward(
+            &mut s_off,
+            &ids,
+            RowKind::Prefill,
+            Want::LAST,
+            None,
+            Some(&mut t_off),
+        )
+        .unwrap();
+    let want_bits = bits(out_off.logits.as_ref().unwrap());
+    assert_eq!(
+        bank.stats().iter().map(|s| s.prefetch_slots).sum::<usize>(),
+        0
+    );
+
+    bank.end_turn().unwrap();
+    bank.set_prefetch(true);
+    bank.test_forget_where(|_, _| true);
+    let mut s_on = model.new_session(300).unwrap();
+    let mut t_on = Trace::default();
+    let out_on = model
+        .forward(
+            &mut s_on,
+            &ids,
+            RowKind::Prefill,
+            Want::LAST,
+            None,
+            Some(&mut t_on),
+        )
+        .unwrap();
+    let got_bits = bits(out_on.logits.as_ref().unwrap());
+
+    assert_eq!(
+        got_bits, want_bits,
+        "prefetch=true vs prefetch=false logits"
+    );
+    assert_eq!(
+        routes_of(&t_on),
+        routes_of(&t_off),
+        "prefetch=true vs prefetch=false routes"
+    );
+    let st = bank.stats();
+    assert!(
+        st[0].prefetch_slots > 0 && st[1].prefetch_slots > 0,
+        "both classes must record prefetch_slots > 0, got {st:?}"
+    );
+    bank.end_turn().unwrap();
 }
 
 /// A 16-token prompt through the real trunk: finite logits, the last row

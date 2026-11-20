@@ -40,14 +40,7 @@ fn dims2(a: &MxArray, what: &str) -> Result<[i64; 2]> {
 
 /// `x · rsqrt(mean(x²) + eps)` over the last axis, in f32.
 fn rms(x: &MxArray) -> Result<MxArray> {
-    let xf = x.astype(DType::Float32)?;
-    let r = xf
-        .square()?
-        .mean(Some(&[-1]), Some(true))?
-        .add_scalar(f64::from(ENGRAM_EPS))?
-        .sqrt()?
-        .reciprocal()?;
-    xf.mul(&r)
+    super::ops::rms_norm_unweighted(&x.astype(DType::Float32)?, ENGRAM_EPS)
 }
 
 /// Table rows `[n, cols, head_dim]` (row-major f32) -> `rms(row) ·
@@ -101,7 +94,7 @@ pub fn stream_gate(dot: &MxArray) -> Result<MxArray> {
 
 /// `rms(value) · pre_gamma`: value `[n, d]`.
 pub fn signal(value: &MxArray, pre_gamma: &MxArray) -> Result<MxArray> {
-    rms(value)?.mul(&pre_gamma.astype(DType::Float32)?)
+    super::ops::rms_norm(&value.astype(DType::Float32)?, pre_gamma, ENGRAM_EPS)
 }
 
 /// Whether each id's position gets the Engram delta: not the Engram pad

@@ -1,11 +1,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use napi::Result;
 use serde_json::Value;
 
 use super::f8::{decode, decode_f8_rows, is_nan_code};
-use super::rows::{EngramRows, F8Table, ResidentF8Table, prove_f8_extent};
+use super::rows::{
+    DEFAULT_ENGRAM_CACHE_MB, DEFAULT_ENGRAM_THREADS, EngramRows, F8RowCache, F8Table,
+    MAX_COALESCE_BYTES, PageSpan, ResidentF8Table, coalesce_spans, parse_cache_mb, prove_f8_extent,
+};
 use super::scan::{ENGRAM_TABLE, Located, Scan};
 use super::store::unchanged_since_open;
 use crate::models::deepseek_v41::EngramConfig;
@@ -444,4 +449,361 @@ fn real_rows_match_the_oracle() {
     assert_eq!(to_bits(&got[(cols - 1) * 96..]), by_row[&last]);
     ids[0] = last as u32;
     err(t.rows(0, &ids));
+}
+
+#[test]
+fn coalesce_spans_merges_across_16k_straddling_and_splits_at_max_bytes() {
+    const P: u64 = 16 << 10;
+    assert!(coalesce_spans(&[], 0, HD, 1 << 20).is_empty());
+
+    // Row 0 at 16300..16364 ([0, 16K)), row 1 at 16364..16428 straddles 16K ([0, 32K)),
+    // row 2 at 16428..16492 ([16K, 32K)) -> all coalesce into [0, 32K) even when unsorted/duped.
+    let base = DATA_OFFSET + REL_OFFSET;
+    let file_len = base + 512 * 1024;
+    let spans = coalesce_spans(&[2, 0, 1, 2, 0], base, HD, file_len);
+    assert_eq!(
+        spans,
+        vec![PageSpan {
+            start: 0,
+            end: 2 * P,
+            rows: vec![0, 1, 2],
+        }]
+    );
+
+    // Adjacent pages merge (next_start == cur_end), gap >= 1 page splits.
+    let rows_per_page = (P / HD as u64) as u32;
+    let r_p0 = 0;
+    let r_p1 = rows_per_page;
+    let r_p3 = 3 * rows_per_page;
+    let spans = coalesce_spans(&[r_p3, r_p1, r_p0], 0, HD, 8 * P);
+    assert_eq!(
+        spans,
+        vec![
+            PageSpan {
+                start: 0,
+                end: 2 * P,
+                rows: vec![r_p0, r_p1],
+            },
+            PageSpan {
+                start: 3 * P,
+                end: 4 * P,
+                rows: vec![r_p3],
+            },
+        ]
+    );
+
+    // 17 consecutive 16 KiB pages (272 KiB > MAX_COALESCE_BYTES = 256 KiB) split into 256 KiB + 16 KiB.
+    let pages_17: Vec<u32> = (0..17).map(|p| p * rows_per_page).collect();
+    let spans = coalesce_spans(&pages_17, 0, HD, 32 * P);
+    assert_eq!(spans.len(), 2);
+    assert_eq!((spans[0].start, spans[0].end), (0, MAX_COALESCE_BYTES));
+    assert_eq!(spans[0].rows.len(), 16);
+    assert_eq!(
+        (spans[1].start, spans[1].end),
+        (MAX_COALESCE_BYTES, MAX_COALESCE_BYTES + P)
+    );
+    assert_eq!(spans[1].rows, vec![16 * rows_per_page]);
+
+    // A row straddling the 256 KiB boundary starts a new span so neither exceeds MAX_COALESCE_BYTES.
+    let straddle_base = 20u64;
+    let straddle_row = ((MAX_COALESCE_BYTES - straddle_base) / HD as u64) as u32;
+    let straddle_off = straddle_base + u64::from(straddle_row) * HD as u64;
+    assert!(straddle_off < MAX_COALESCE_BYTES && straddle_off + HD as u64 > MAX_COALESCE_BYTES);
+    let mut ids_with_straddle: Vec<u32> = (0..16).map(|p| p * rows_per_page).collect();
+    ids_with_straddle.push(straddle_row);
+    let spans = coalesce_spans(&ids_with_straddle, straddle_base, HD, 32 * P);
+    assert_eq!(spans.len(), 2);
+    assert_eq!((spans[0].start, spans[0].end), (0, MAX_COALESCE_BYTES));
+    assert_eq!(
+        (spans[1].start, spans[1].end),
+        (MAX_COALESCE_BYTES - P, MAX_COALESCE_BYTES + P)
+    );
+    assert_eq!(spans[1].rows, vec![straddle_row]);
+
+    // EOF clipping on a partial trailing page.
+    let eof = 2 * P + 500;
+    let last_row = ((eof - HD as u64) / HD as u64) as u32;
+    let spans = coalesce_spans(&[last_row], 0, HD, eof);
+    assert_eq!(
+        spans,
+        vec![PageSpan {
+            start: 2 * P,
+            end: eof,
+            rows: vec![last_row],
+        }]
+    );
+
+    // Real F8Table with cache disabled counts coalesced bytes, not per-row 16 KiB windows.
+    let tmp = Temp::new();
+    let codes = table_codes(31);
+    let path = tmp.shard(&codes);
+    let shards = Arc::new(ShardSet::open(&[&path]).unwrap());
+    let t = F8Table::open_with_options(shards, 0, &table_loc(), &cfg(), 4, 0).unwrap();
+    let got = t.read_rows(&[0, 1, 2]).unwrap();
+    assert_eq!(to_bits(&got), expect_rows(&codes, &[0, 1, 2]));
+    let (bytes, _) = t.read_stats();
+    assert_eq!(bytes, 2 * P);
+}
+
+#[test]
+fn f8_row_cache_lru_hits_eviction_and_zero_capacity() {
+    assert_eq!(parse_cache_mb(None).unwrap(), DEFAULT_ENGRAM_CACHE_MB);
+    assert_eq!(parse_cache_mb(Some("")).unwrap(), DEFAULT_ENGRAM_CACHE_MB);
+    assert_eq!(parse_cache_mb(Some("  ")).unwrap(), DEFAULT_ENGRAM_CACHE_MB);
+    assert_eq!(parse_cache_mb(Some("0")).unwrap(), 0);
+    assert_eq!(parse_cache_mb(Some("64")).unwrap(), 64);
+    assert!(parse_cache_mb(Some("-1")).is_err());
+    assert!(parse_cache_mb(Some("abc")).is_err());
+
+    // Default 64 MiB at head_dim = 96 fits 524,288 rows inside IO_FIXED.
+    let default_cache = F8RowCache::from_budget_bytes(DEFAULT_ENGRAM_CACHE_MB << 20, 96);
+    assert_eq!(default_cache.capacity(), 524_288);
+
+    // Capacity 0 disables caching completely.
+    let mut disabled = F8RowCache::from_budget_bytes(0, 4);
+    assert_eq!(disabled.capacity(), 0);
+    disabled.insert(7, &[1, 2, 3, 4]);
+    assert_eq!(disabled.len(), 0);
+    assert!(disabled.get(7).is_none());
+
+    // Capacity 1 edge case.
+    let mut one = F8RowCache::new(1, 4);
+    one.insert(10, &[1, 1, 1, 1]);
+    assert_eq!(one.get(10), Some(&[1, 1, 1, 1][..]));
+    one.insert(20, &[2, 2, 2, 2]);
+    assert_eq!(one.len(), 1);
+    assert!(!one.contains(10));
+    assert_eq!(one.get(20), Some(&[2, 2, 2, 2][..]));
+
+    // Capacity 3 LRU order: insert 1, 2, 3 -> touch 1 -> insert 4 evicts 2.
+    let mut lru = F8RowCache::new(3, 4);
+    lru.insert(1, &[10, 11, 12, 13]);
+    lru.insert(2, &[20, 21, 22, 23]);
+    lru.insert(3, &[30, 31, 32, 33]);
+    assert_eq!(lru.len(), 3);
+    assert_eq!(lru.get(1), Some(&[10, 11, 12, 13][..]));
+    lru.insert(4, &[40, 41, 42, 43]);
+    assert_eq!(lru.len(), 3);
+    assert!(!lru.contains(2));
+    assert!(lru.contains(1) && lru.contains(3) && lru.contains(4));
+
+    // Re-inserting existing key 3 promotes it without growing len; inserting 5 evicts 1.
+    lru.insert(3, &[30, 31, 32, 33]);
+    assert_eq!(lru.len(), 3);
+    lru.insert(5, &[50, 51, 52, 53]);
+    assert_eq!(lru.len(), 3);
+    assert!(!lru.contains(1));
+    assert_eq!(lru.get(3), Some(&[30, 31, 32, 33][..]));
+    assert_eq!(lru.get(4), Some(&[40, 41, 42, 43][..]));
+    assert_eq!(lru.get(5), Some(&[50, 51, 52, 53][..]));
+}
+
+#[test]
+fn f8_table_lru_hits_eviction_nan_rejection_and_zero_capacity() {
+    let tmp = Temp::new();
+    let mut codes = table_codes(41);
+    let bad_row = 90u32;
+    codes[bad_row as usize * HD + 7] = 0x7F;
+    let path = tmp.shard(&codes);
+
+    // Hits serve from cache with 0 additional disk bytes; LRU evicts oldest untouched row.
+    let shards = Arc::new(ShardSet::open(&[&path]).unwrap());
+    let t = F8Table::open_with_options(shards, 0, &table_loc(), &cfg(), 4, 4).unwrap();
+    let r0123 = t.read_rows(&[0, 1, 2, 3]).unwrap();
+    assert_eq!(to_bits(&r0123), expect_rows(&codes, &[0, 1, 2, 3]));
+    assert_eq!(t.cache_len(), 4);
+    let (bytes_after_fill, _) = t.read_stats();
+    assert!(bytes_after_fill > 0);
+
+    // Hit on row 0 promotes it to MRU (making row 1 the LRU); 0 disk bytes added.
+    let r0 = t.read_rows(&[0]).unwrap();
+    assert_eq!(to_bits(&r0), expect_rows(&codes, &[0]));
+    assert_eq!(t.read_stats().0, bytes_after_fill);
+
+    // Miss on row 4 evicts row 1.
+    let r4 = t.read_rows(&[4]).unwrap();
+    assert_eq!(to_bits(&r4), expect_rows(&codes, &[4]));
+    assert_eq!(t.cache_len(), 4);
+    let (bytes_after_evict, _) = t.read_stats();
+    assert!(bytes_after_evict > bytes_after_fill);
+
+    // Row 0 is still cached (0 disk bytes), row 1 is a miss (disk bytes increase).
+    assert_eq!(
+        to_bits(&t.read_rows(&[0]).unwrap()),
+        expect_rows(&codes, &[0])
+    );
+    assert_eq!(t.read_stats().0, bytes_after_evict);
+    assert_eq!(
+        to_bits(&t.read_rows(&[1]).unwrap()),
+        expect_rows(&codes, &[1])
+    );
+    assert!(t.read_stats().0 > bytes_after_evict);
+
+    // NaN in any row of a batch fails with exact row + value index and inserts nothing into cache.
+    let shards_nan = Arc::new(ShardSet::open(&[&path]).unwrap());
+    let t_nan = F8Table::open_with_options(shards_nan, 0, &table_loc(), &cfg(), 4, 16).unwrap();
+    let msg = err(t_nan.read_rows(&[10, bad_row, 11]));
+    assert!(msg.contains(&format!("row {bad_row}")), "{msg}");
+    assert!(msg.contains("value 7"), "{msg}");
+    assert_eq!(t_nan.cache_len(), 0);
+    // Retrying bad_row still fails; clean rows succeed and enter cache.
+    assert!(err(t_nan.read_rows(&[bad_row])).contains("value 7"));
+    assert_eq!(t_nan.cache_len(), 0);
+    assert_eq!(
+        to_bits(&t_nan.read_rows(&[10, 11]).unwrap()),
+        expect_rows(&codes, &[10, 11])
+    );
+    assert_eq!(t_nan.cache_len(), 2);
+
+    // Capacity 0 disables cache completely: repeated reads always hit disk.
+    let shards_off = Arc::new(ShardSet::open(&[&path]).unwrap());
+    let t_off = F8Table::open_with_options(shards_off, 0, &table_loc(), &cfg(), 4, 0).unwrap();
+    assert_eq!(t_off.cache_capacity(), 0);
+    let a = t_off.read_rows(&[0, 1]).unwrap();
+    let b1 = t_off.read_stats().0;
+    assert!(b1 > 0);
+    assert_eq!(t_off.cache_len(), 0);
+    let b = t_off.read_rows(&[0, 1]).unwrap();
+    let b2 = t_off.read_stats().0;
+    assert_eq!(to_bits(&a), to_bits(&b));
+    assert!(b2 > b1);
+    assert_eq!(t_off.cache_len(), 0);
+}
+
+#[test]
+fn prefetch_take_matches_rows_cancel_drop_and_4_layer_fifo() {
+    let tmp = Temp::new();
+    let codes = table_codes(53);
+    let path = tmp.shard(&codes);
+    let t = F8Table::open_at(&path, &table_loc(), &cfg()).unwrap();
+
+    // Default EngramRows::prefetch returns None on ResidentF8Table.
+    let resident = ResidentF8Table::new(codes.clone(), &cfg()).unwrap();
+    assert!(resident.prefetch(0, &layer_ids(0)).unwrap().is_none());
+
+    // Bit-identical on both cold and warm cache, with unsorted/duplicate and sorted/unique ids.
+    for e in 0..2 {
+        let ids = layer_ids(e);
+        let h = t.prefetch(e, &ids).unwrap().expect("F8Table prefetches");
+        let prefetched = t.take_prefetched(h).unwrap();
+        let direct = t.rows(e, &ids).unwrap();
+        assert_eq!(to_bits(&prefetched), to_bits(&direct));
+        assert_eq!(to_bits(&prefetched), expect_rows(&codes, &ids));
+    }
+    let sorted_uniq = vec![0u32, 41, 80, 110];
+    let h = t.prefetch(0, &sorted_uniq).unwrap().unwrap();
+    assert_eq!(
+        to_bits(&t.take_prefetched(h).unwrap()),
+        to_bits(&t.rows(0, &sorted_uniq).unwrap())
+    );
+    assert!(t.prefetch_rows(&[]).unwrap().wait().unwrap().is_empty());
+
+    // Build a 4-Engram-layer table spanning 64 distinct 16 KiB pages (1 MiB) to test
+    // non-blocking early cancel drop and 4-layer FIFO prefetch order.
+    const P: usize = 16 << 10;
+    let rows_per_page = (P / HD) as u64;
+    let stride = 2 * rows_per_page; // 32 KiB per column so adjacent pages have a 16 KiB gap
+    let sizes_4: Vec<u64> = vec![stride; 16];
+    let mut offsets_4 = Vec::with_capacity(16);
+    let mut at = 0u64;
+    for &s in &sizes_4 {
+        offsets_4.push(at);
+        at += s;
+    }
+    let cfg_4 = EngramConfig {
+        layers: vec![1, 11, 21, 31],
+        max_ngram: 3,
+        n_heads: 2,
+        head_dim: HD,
+        multipliers: vec![1; 12],
+        head_offsets: offsets_4.clone(),
+        head_vocab_sizes: sizes_4,
+        pad_token_id: 0,
+        token_map: (0..16).collect(),
+        compressed_vocab_size: 16,
+        vocab_size: None,
+    };
+    let n_rows_4 = at;
+    let mut x = 77u64.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let codes_4: Vec<u8> = (0..n_rows_4 as usize * HD)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let c = (x >> 24) as u8;
+            if is_nan_code(c) { c ^ 1 } else { c }
+        })
+        .collect();
+    let path_4 = tmp.0.join("table4.gguf");
+    std::fs::write(&path_4, &codes_4).unwrap();
+    let loc_4 = Located {
+        shard: 0,
+        data_offset: 0,
+        info: GgufTensorInfo {
+            name: ENGRAM_TABLE.into(),
+            n_dims: 2,
+            dims: vec![HD as u64, n_rows_4],
+            tensor_type: GgufTensorType::MXFP8,
+            offset: 0,
+        },
+    };
+
+    // Early PrefetchHandle drop cancels without blocking and skips unstarted preads.
+    let cancel_shards = Arc::new(ShardSet::open(&[&path_4]).unwrap());
+    cancel_shards.delay_ms.store(20, Ordering::Relaxed);
+    let t_cancel =
+        F8Table::open_with_options(Arc::clone(&cancel_shards), 0, &loc_4, &cfg_4, 1, 0).unwrap();
+    let many_spans: Vec<u32> = (0..16).map(|c| offsets_4[c] as u32).collect();
+    let handle = t_cancel.prefetch_rows(&many_spans).unwrap();
+    let drop_t0 = Instant::now();
+    drop(handle);
+    assert!(
+        drop_t0.elapsed() < Duration::from_millis(50),
+        "dropping PrefetchHandle must not block on pending preads"
+    );
+    cancel_shards.delay_ms.store(0, Ordering::Relaxed);
+    // Drain by running one fast request after cancel; table remains completely healthy
+    // and skipped the unstarted spans of the cancelled batch.
+    let check_ids = vec![offsets_4[0] as u32];
+    let got = t_cancel.read_rows(&check_ids).unwrap();
+    assert_eq!(to_bits(&got), expect_rows(&codes_4, &check_ids));
+    assert!(
+        t_cancel.read_stats().0 < 16 * P as u64,
+        "unstarted cancelled spans should have skipped pread (read {} bytes)",
+        t_cancel.read_stats().0
+    );
+
+    // 4-layer prefetch completes in strict FIFO order on a single worker.
+    let fifo_shards = Arc::new(ShardSet::open(&[&path_4]).unwrap());
+    let t_fifo = F8Table::open_with_options(fifo_shards, 0, &loc_4, &cfg_4, 1, 0).unwrap();
+    let layer_ids_4: Vec<Vec<u32>> = (0..4)
+        .map(|e| (0..4).map(|c| offsets_4[4 * e + c] as u32).collect())
+        .collect();
+    let handles: Vec<_> = (0..4)
+        .map(|e| t_fifo.prefetch(e, &layer_ids_4[e]).unwrap().unwrap())
+        .collect();
+    let seqs: Vec<u64> = handles.iter().map(|h| h.done_seq()).collect();
+    assert_eq!(seqs, vec![1, 2, 3, 4]);
+    for (e, h) in handles.into_iter().enumerate() {
+        assert_eq!(
+            to_bits(&t_fifo.take_prefetched(h).unwrap()),
+            expect_rows(&codes_4, &layer_ids_4[e])
+        );
+    }
+
+    // Concurrent 4-layer prefetch on the full persistent pool matches rows() bit-identically.
+    let conc_shards = Arc::new(ShardSet::open(&[&path_4]).unwrap());
+    let t_conc =
+        F8Table::open_with_options(conc_shards, 0, &loc_4, &cfg_4, DEFAULT_ENGRAM_THREADS, 64)
+            .unwrap();
+    let handles: Vec<_> = (0..4)
+        .map(|e| t_conc.prefetch(e, &layer_ids_4[e]).unwrap().unwrap())
+        .collect();
+    for (e, h) in handles.into_iter().enumerate() {
+        let got = t_conc.take_prefetched(h).unwrap();
+        let want = t_conc.rows(e, &layer_ids_4[e]).unwrap();
+        assert_eq!(to_bits(&got), to_bits(&want));
+        assert_eq!(to_bits(&got), expect_rows(&codes_4, &layer_ids_4[e]));
+    }
+    assert_eq!(t_conc.cache_len(), 16);
 }

@@ -54,6 +54,152 @@ fn check_len(a: &MxArray, want: i64, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fused RMSNorm with 1-D weight `w`, computed in f32 and cast back to `x`'s dtype.
+pub fn rms_norm(x: &MxArray, w: &MxArray, eps: f32) -> Result<MxArray> {
+    if w.ndim()? != 1 {
+        return Err(bad(format!(
+            "rms_norm weight must be 1-D, got {:?}",
+            dims(w)?
+        )));
+    }
+    let dt = x.dtype()?;
+    let xf = if dt == DType::Float32 {
+        x.clone()
+    } else {
+        x.astype(DType::Float32)?
+    };
+    let wf = if w.dtype()? == DType::Float32 {
+        w.clone()
+    } else {
+        w.astype(DType::Float32)?
+    };
+    let y = crate::nn::rms_norm_scaled(&xf, &wf, eps)?;
+    if dt == DType::Float32 {
+        Ok(y)
+    } else {
+        y.astype(dt)
+    }
+}
+
+/// Fused unweighted RMSNorm, computed in f32 and cast back to `x`'s dtype.
+pub fn rms_norm_unweighted(x: &MxArray, eps: f32) -> Result<MxArray> {
+    let dt = x.dtype()?;
+    let xf = if dt == DType::Float32 {
+        x.clone()
+    } else {
+        x.astype(DType::Float32)?
+    };
+    let y = crate::nn::rms_norm_unscaled(&xf, eps)?;
+    if dt == DType::Float32 {
+        Ok(y)
+    } else {
+        y.astype(dt)
+    }
+}
+
+/// Precomputed inverse frequencies `[rd/2]` f32 for compiled precise RoPE.
+pub fn rope_inv_freqs(inv_freqs: &[f32]) -> Result<MxArray> {
+    if inv_freqs.is_empty() {
+        return Err(bad("rope_inv_freqs: empty inv_freqs"));
+    }
+    MxArray::from_float32(inv_freqs, &[inv_freqs.len() as i64])
+}
+
+/// Fused interleaved (`traditional = true`) RoPE over the entire last axis of `x`
+/// (`[n, rd]` or `[n, H, rd]`), computed in f32 with precise sin/cos and cast back
+/// to `x`'s dtype.
+pub fn fast_rope(x: &MxArray, inv_freqs: &MxArray, positions: &[u64]) -> Result<MxArray> {
+    if inv_freqs.ndim()? != 1 {
+        return Err(bad(format!(
+            "rope inv_freqs must be 1-D, got {:?}",
+            dims(inv_freqs)?
+        )));
+    }
+    let half = inv_freqs.shape_at(0)?;
+    let rd = 2 * half;
+    if rd <= 0 {
+        return Err(bad(format!("rope inv_freqs must be non-empty, got {half}")));
+    }
+    let shape = dims(x)?;
+    let n = match *shape.as_slice() {
+        [n, d] if d == rd => n,
+        [n, _, d] if d == rd => n,
+        _ => {
+            return Err(bad(format!(
+                "fast_rope expects [n, {rd}] or [n, H, {rd}], got {shape:?}"
+            )));
+        }
+    };
+    if positions.len() as i64 != n {
+        return Err(bad(format!(
+            "fast_rope got {} positions for {n} rows",
+            positions.len()
+        )));
+    }
+    if n == 0 {
+        return Ok(x.clone());
+    }
+    let pos_f32: Vec<f32> = positions
+        .iter()
+        .map(|&p| {
+            i32::try_from(p)
+                .map(|v| v as f32)
+                .map_err(|_| bad(format!("rope position {p} exceeds i32")))
+        })
+        .collect::<Result<_>>()?;
+    let dt = x.dtype()?;
+    let xf = if dt == DType::Float32 {
+        x.clone()
+    } else {
+        x.astype(DType::Float32)?
+    };
+    let pos_arr = MxArray::from_float32(&pos_f32, &[n])?;
+    let handle = unsafe {
+        mlx_sys::mlx_rope_precise_compiled(
+            xf.as_raw_ptr(),
+            pos_arr.as_raw_ptr(),
+            inv_freqs.as_raw_ptr(),
+        )
+    };
+    let rot = MxArray::from_handle(handle, "hy_v4_flash fast_rope")?;
+    if dt == DType::Float32 {
+        Ok(rot)
+    } else {
+        rot.astype(dt)
+    }
+}
+
+/// Fused RoPE on the trailing `rd` dims of `x` (`[n, d]` or `[n, H, d]`).
+pub fn fast_partial_rope_tail(
+    x: &MxArray,
+    inv_freqs: &MxArray,
+    positions: &[u64],
+) -> Result<MxArray> {
+    if inv_freqs.ndim()? != 1 {
+        return Err(bad(format!(
+            "rope inv_freqs must be 1-D, got {:?}",
+            dims(inv_freqs)?
+        )));
+    }
+    let rd = 2 * inv_freqs.shape_at(0)?;
+    let d = dims(x)?;
+    let width = *d
+        .last()
+        .ok_or_else(|| bad("fast_partial_rope_tail: scalar input"))?;
+    if rd <= 0 || rd > width {
+        return Err(bad(format!(
+            "fast_partial_rope_tail: rope dim {rd} outside 1..={width}"
+        )));
+    }
+    if rd == width {
+        return fast_rope(x, inv_freqs, positions);
+    }
+    let head = last(x, 0, width - rd)?;
+    let tail = last(x, width - rd, width)?;
+    let rot = fast_rope(&tail, inv_freqs, positions)?;
+    MxArray::concatenate(&head, &rot, -1)
+}
+
 /// `(flat · fnᵀ) · rsqrt(mean(flat²) + eps)` with `flat = x [n, hc·d]`:
 /// one RMS statistic over all streams of a row. Out `[n, fn rows]` f32.
 pub fn hc_mixes(x: &MxArray, weight: &MxArray, norm_eps: f32) -> Result<MxArray> {
@@ -65,14 +211,18 @@ pub fn hc_mixes(x: &MxArray, weight: &MxArray, norm_eps: f32) -> Result<MxArray>
         )));
     }
     let xf = x.astype(DType::Float32)?.reshape(&[n, hc * d])?;
+    let wt = weight.astype(DType::Float32)?.transpose(Some(&[1, 0]))?;
+    // Above 256 rows, scaling after the matmul avoids materializing a second [n, hc*d] tensor.
+    if n <= 256 {
+        return rms_norm_unweighted(&xf, norm_eps)?.matmul(&wt);
+    }
     let rs = xf
         .square()?
         .mean(Some(&[-1]), Some(true))?
         .add_scalar(f64::from(norm_eps))?
         .sqrt()?
         .reciprocal()?;
-    xf.matmul(&weight.astype(DType::Float32)?.transpose(Some(&[1, 0]))?)?
-        .mul(&rs)
+    xf.matmul(&wt)?.mul(&rs)
 }
 
 /// `σ(m[.., lo..lo+hc] · scale[si] + base[lo..lo+hc])`.

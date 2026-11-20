@@ -181,6 +181,8 @@ fn weights(g: &Geometry, seed: u64) -> (AttnWeights, RefW) {
         output: dense(&rw.output, D, h * v),
         gate: dense(&rw.gate, h * v, D),
         post_norm: arr(&rw.post_norm, &[D]),
+        q_kv: None,
+        q_kv_gate: None,
     };
     (w, rw)
 }
@@ -895,6 +897,8 @@ fn q8_projections_of_a_row_do_not_depend_on_the_call() {
         output: mat(&mut r, dim, h * v),
         gate: mat(&mut r, h * v, dim),
         post_norm: norm(&mut r, dim),
+        q_kv: None,
+        q_kv_gate: None,
     };
     let mla = Mla::new(g, &w).unwrap();
     let hs = r.vec(3 * dim, 2.0);

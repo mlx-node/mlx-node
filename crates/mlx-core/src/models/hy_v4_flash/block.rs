@@ -31,6 +31,9 @@ fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 block: {msg}"))
 }
 
+/// Fewest prefill rows that trigger next-layer expert read-ahead.
+pub const READ_AHEAD_MIN_ROWS: usize = 256;
+
 /// One layer's per-sequence state.
 pub struct LayerState {
     pub cache: LayerCache,
@@ -157,6 +160,14 @@ impl Block {
         }
     }
 
+    pub fn prefetch_from(&self, w: &LayerWeights, h: &MxArray) -> Result<usize> {
+        self.ffn.prefetch_from(w, h)
+    }
+
+    pub fn end_layer(&self) {
+        self.ffn.end_layer();
+    }
+
     /// The streams `x [n, hc, d]` (f32) after this layer for the rows of
     /// `wave` (`n` of them), whose owners' states take their rows through
     /// `owners`; `engram` is required on an Engram layer and refused
@@ -168,6 +179,7 @@ impl Block {
         wave: &Wave,
         owners: &mut dyn Owners,
         engram: Option<EngramIn<'_>>,
+        next: Option<(&Block, &LayerWeights)>,
     ) -> Result<(MxArray, Option<Routes>)> {
         let Residual::Hc {
             attn: hc_attn,
@@ -210,7 +222,11 @@ impl Block {
         let x = post(&a, &x, &g.post)?;
 
         let (g, h) = self.mix(&x, hc_ffn, kind)?;
+        if let Some((next_blk, next_w)) = next {
+            next_blk.prefetch_from(next_w, &h)?;
+        }
         let (f, routes) = self.ffn.forward(w, &h, kind)?;
+        self.end_layer();
         Ok((post(&f, &x, &g.post)?, routes))
     }
 
@@ -240,7 +256,8 @@ impl Block {
             1 => outs.swap_remove(0),
             _ => MxArray::concatenate_many(outs.iter().collect(), Some(0))?,
         };
-        self.mla.finish_timed(&w.attn, &p.x, &o)
+        self.mla
+            .finish_timed_with_gate(&w.attn, &p.x, p.gate_lin.as_ref(), &o)
     }
 
     /// The attention core of one owner's rows `p` at positions `start..`

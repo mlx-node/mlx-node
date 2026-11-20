@@ -466,3 +466,87 @@ fn real_dense_load_matches_the_oracle() {
             .is_err()
     );
 }
+
+#[test]
+fn fuse_qmm_rows_matches_separate_qlinear_bit_for_bit() {
+    use super::moe::qlinear;
+    use super::weights::fuse_qmm_rows;
+
+    let k = 64usize;
+    let make_qmm = |rows: usize, seed: u64| -> Dense {
+        let n = rows * k;
+        let mut raw = Vec::with_capacity(n / 32 * 34);
+        let vals = lcg(seed, n);
+        for blk in vals.as_chunks::<32>().0 {
+            let amax = blk.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let d = half::f16::from_f32((amax / 127.0).max(1e-6));
+            let df = d.to_f32();
+            raw.extend(d.to_bits().to_le_bytes());
+            for &v in blk {
+                let q = (v / df).round().clamp(-127.0, 127.0) as i8;
+                raw.extend(q.to_le_bytes());
+            }
+        }
+        let inf = info("w", &[k as u64, rows as u64], GgufTensorType::Q8_0);
+        dense_from_raw(&inf, &raw, Form::Qmm).unwrap()
+    };
+
+    let (r0, r1, r2) = (32usize, 48usize, 64usize);
+    let a = make_qmm(r0, 101);
+    let b = make_qmm(r1, 202);
+    let c = make_qmm(r2, 303);
+
+    // Non-Qmm returns None
+    let plain =
+        Dense::Array(MxArray::from_float32(&lcg(404, r0 * k), &[r0 as i64, k as i64]).unwrap());
+    assert!(fuse_qmm_rows(&[&a, &plain]).unwrap().is_none());
+    assert!(fuse_qmm_rows(&[&a]).unwrap().is_none());
+
+    let (fused, views) = fuse_qmm_rows(&[&a, &b, &c]).unwrap().unwrap();
+    assert_eq!(fused.shape_at(0).unwrap(), (r0 + r1 + r2) as i64);
+    assert_eq!(fused.shape_at(1).unwrap(), k as i64);
+    assert_eq!(views.len(), 3);
+    assert_eq!(views[0].shape_at(0).unwrap(), r0 as i64);
+    assert_eq!(views[1].shape_at(0).unwrap(), r1 as i64);
+    assert_eq!(views[2].shape_at(0).unwrap(), r2 as i64);
+
+    for m in [1usize, 2, 4, 12, 256] {
+        let xs = lcg(500 + m as u64, m * k);
+        let x = MxArray::from_float32(&xs, &[m as i64, k as i64]).unwrap();
+
+        let ya = read(&qlinear(&x, &a).unwrap());
+        let yb = read(&qlinear(&x, &b).unwrap());
+        let yc = read(&qlinear(&x, &c).unwrap());
+
+        let y_all = qlinear(&x, &fused).unwrap();
+        let (r0i, r1i, r2i) = (r0 as i64, r1 as i64, r2 as i64);
+        let fa = read(&y_all.slice(&[0, 0], &[m as i64, r0i]).unwrap());
+        let fb = read(&y_all.slice(&[0, r0i], &[m as i64, r0i + r1i]).unwrap());
+        let fc = read(
+            &y_all
+                .slice(&[0, r0i + r1i], &[m as i64, r0i + r1i + r2i])
+                .unwrap(),
+        );
+
+        assert_eq!(bits(&fa), bits(&ya), "M={m} fused slice 0");
+        assert_eq!(bits(&fb), bits(&yb), "M={m} fused slice 1");
+        assert_eq!(bits(&fc), bits(&yc), "M={m} fused slice 2");
+
+        // Zero-copy views also match original separate matrices bit-for-bit
+        assert_eq!(
+            bits(&read(&qlinear(&x, &views[0]).unwrap())),
+            bits(&ya),
+            "M={m} view 0"
+        );
+        assert_eq!(
+            bits(&read(&qlinear(&x, &views[1]).unwrap())),
+            bits(&yb),
+            "M={m} view 1"
+        );
+        assert_eq!(
+            bits(&read(&qlinear(&x, &views[2]).unwrap())),
+            bits(&yc),
+            "M={m} view 2"
+        );
+    }
+}

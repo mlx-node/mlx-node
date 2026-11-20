@@ -24,11 +24,12 @@ use napi::{Error, Result};
 use super::cache::{LatentBuf, WINDOW_SLACK};
 use super::config::{Attn, HyV4FlashConfig};
 use super::moe::{RowKind, per_row, qlinear};
+use super::ops::{fast_partial_rope_tail, rms_norm, rope_inv_freqs};
 use super::weights::IndexerWeights;
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::attention::{linear, rms_norm};
+use crate::models::deepseek_v41::attention::linear;
 use crate::models::deepseek_v41::indexer::INDEX_CHUNK_BYTES;
-use crate::models::deepseek_v41::ops::{apply_partial_rope, inv_freqs, rope_tables};
+use crate::models::deepseek_v41::ops::inv_freqs;
 use crate::models::deepseek_v41::store::Dense;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
@@ -770,7 +771,7 @@ pub struct Call<'a> {
 /// The indexer of one layer; the weights stay in `Resident`.
 pub struct Indexer {
     g: IndexerGeometry,
-    inv: Vec<f32>,
+    inv_freqs: MxArray,
 }
 
 fn want(d: &Dense, axis: u32, n: usize, what: &str) -> Result<()> {
@@ -811,8 +812,8 @@ impl Indexer {
         want_shape(&w.compressor_gate, &[d, d], "indexer_compressor_gate")?;
         want_shape(&w.compressor_ape, &[g.kpool, d], "indexer_compressor_ape")?;
         want_shape(&w.compressor_norm, &[d], "indexer_compressor_norm")?;
-        let inv = inv_freqs(g.rope_dim, g.rope_theta, None);
-        Ok(Self { g, inv })
+        let inv_freqs = rope_inv_freqs(&inv_freqs(g.rope_dim, g.rope_theta, None))?;
+        Ok(Self { g, inv_freqs })
     }
 
     pub fn geometry(&self) -> &IndexerGeometry {
@@ -821,8 +822,7 @@ impl Indexer {
 
     /// RoPE on the last `rope_dim` dims of `x [r, .., d]` at `positions`.
     pub fn rope(&self, x: &MxArray, positions: &[u64]) -> Result<MxArray> {
-        let (cos, sin) = rope_tables(&self.inv, positions)?;
-        apply_partial_rope(x, self.g.rope_dim as i64, &cos, &sin, false)
+        fast_partial_rope_tail(x, &self.inv_freqs, positions)
     }
 
     /// `rms(attn_k·x)·k_norm` `[n, d]` f32.

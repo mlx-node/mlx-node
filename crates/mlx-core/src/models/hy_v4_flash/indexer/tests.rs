@@ -848,6 +848,8 @@ fn attn_weights(g: &Geometry, seed: u64) -> AttnWeights {
         output,
         gate,
         post_norm: ones(D),
+        q_kv: None,
+        q_kv_gate: None,
     }
 }
 

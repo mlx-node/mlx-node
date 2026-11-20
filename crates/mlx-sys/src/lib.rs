@@ -105,6 +105,16 @@ unsafe extern "C-unwind" {
 
     // Shape-independent activation fusion; projection formats remain independent.
     pub fn mlx_swiglu_compiled(gate: *mut mlx_array, up: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_swiglu_clamped_compiled(
+        gate: *mut mlx_array,
+        up: *mut mlx_array,
+        limit: f32,
+    ) -> *mut mlx_array;
+    pub fn mlx_rope_precise_compiled(
+        x: *mut mlx_array,
+        pos: *mut mlx_array,
+        inv_freq: *mut mlx_array,
+    ) -> *mut mlx_array;
     pub fn mlx_sigmoid_mul_compiled(gate: *mut mlx_array, value: *mut mlx_array) -> *mut mlx_array;
 
     // Fused SwiGLU MLP forward: output = down(silu(gate(x)) * up(x))

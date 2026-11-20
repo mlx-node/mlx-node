@@ -22,7 +22,9 @@
 //! them `NonVolatile` again and, when Metal emptied a class's banks, forgets
 //! that class's tags and cache entries before a gather can read the slots.
 
+use std::collections::VecDeque;
 use std::ffi::CString;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -35,7 +37,7 @@ use crate::array::alloc::{DstPtrs, OutLayout};
 use crate::array::purgeable::{BankWatch, PurgeableBank, PurgeableState};
 use crate::array::{DType, MxArray};
 use crate::moe_stream::cache::{Cache, Source};
-use crate::moe_stream::io::{Extent, IoPool, IoStats, Priority, Read};
+use crate::moe_stream::io::{BatchWatch, Extent, IoPool, IoStats, Priority, Read, Ticket};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 use crate::utils::gguf_kquant::KQuantFormat;
 
@@ -743,18 +745,25 @@ impl ProjArrays {
 }
 
 /// Where one layer step's experts are: `slots[i]` is the bank slot of
-/// `experts[i]` in `arrays` (gate, up, down).
+/// `experts[i]` in `arrays` (gate, up, down). `reading` (sorted) lists
+/// experts whose slots are still being read and must not be gathered before
+/// their pending reads finish.
 pub struct Prepared {
     pub layer: usize,
     pub class: ExpertClass,
     pub experts: Vec<u32>,
     pub slots: Vec<u32>,
     pub arrays: [ProjArrays; 3],
+    pub reading: Vec<u32>,
 }
 
 impl Prepared {
     pub fn slot(&self, e: u32) -> Option<u32> {
         self.experts.binary_search(&e).ok().map(|i| self.slots[i])
+    }
+
+    pub fn is_reading(&self, e: u32) -> bool {
+        self.reading.binary_search(&e).is_ok()
     }
 }
 
@@ -778,6 +787,189 @@ pub struct KqStats {
     pub promote_ns: u64,
     /// Steps that drained the GPU before a staging refill.
     pub drains: usize,
+    /// Wall time the caller blocked waiting for reads.
+    pub wait_ns: u64,
+    pub split_steps: usize,
+    pub split_mixed: usize,
+    pub prefetch_slots: usize,
+    pub prefetch_unused: usize,
+}
+
+/// In-flight reads for one `prepare_split` step. Dropping unfinished blocks on
+/// the reads and abandons uncommitted victims so no IO outlives the step or
+/// leaks cache slots.
+pub struct Pending<'a> {
+    bank: &'a KqBank,
+    ci: usize,
+    local: usize,
+    plan: Plan,
+    ticket: Option<Ticket>,
+}
+
+impl Pending<'_> {
+    pub fn finish(mut self) -> Result<()> {
+        let Some(ticket) = self.ticket.take() else {
+            return Ok(());
+        };
+        let t = Instant::now();
+        let io = ticket.wait();
+        let waited = t.elapsed().as_nanos() as u64;
+        let mut g = lock(&self.bank.inner);
+        let io: IoStats = match io {
+            Ok(io) => io,
+            Err(err) => {
+                g.classes[self.ci].dir.abandon(&self.plan);
+                return Err(err);
+            }
+        };
+        g.classes[self.ci].dir.publish(self.local, &self.plan);
+        drop(g);
+        let mut st = lock(&self.bank.stats);
+        let s = &mut st[self.ci];
+        s.fills += 1;
+        s.slots += self.plan.reads();
+        s.bytes += io.bytes;
+        s.ns += io.ns;
+        s.read_ns += io.read_ns;
+        s.repack_ns += io.repack_ns;
+        s.wait_ns += waited;
+        Ok(())
+    }
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.ticket.take() {
+            drop(ticket);
+            let mut g = lock(&self.bank.inner);
+            g.classes[self.ci].dir.abandon(&self.plan);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MissTarget {
+    Staging(u32),
+    Victim(u32, u32),
+}
+
+/// Overlapped read schedule for one prefill FFN chunk's missing experts.
+/// Dropping early waits on the active read batch and releases every
+/// uncommitted cache victim so free slots never leak.
+pub struct PrefillSubgroups<'a> {
+    bank: &'a KqBank,
+    ci: usize,
+    local: usize,
+    active: Option<(Vec<MissTarget>, Ticket)>,
+    queued: VecDeque<Vec<MissTarget>>,
+}
+
+impl PrefillSubgroups<'_> {
+    /// Waits for the active subgroup's reads, publishes its slots, submits the
+    /// next subgroup at high priority, and returns the just-published experts.
+    pub fn next_subgroup(&mut self) -> Result<Option<Vec<u32>>> {
+        let Some((targets, ticket)) = self.active.take() else {
+            return Ok(None);
+        };
+        let t = Instant::now();
+        let io = ticket.wait();
+        let waited = t.elapsed().as_nanos() as u64;
+        let mut g = lock(&self.bank.inner);
+        let io: IoStats = match io {
+            Ok(io) => io,
+            Err(err) => {
+                let cache = &mut g.classes[self.ci].dir.cache;
+                release_targets(cache, &targets);
+                for group in self.queued.drain(..) {
+                    release_targets(cache, &group);
+                }
+                return Err(err);
+            }
+        };
+        let c = &mut g.classes[self.ci];
+        let mut published = Vec::with_capacity(targets.len());
+        for &tgt in &targets {
+            match tgt {
+                MissTarget::Staging(e) => {
+                    let s = c.dir.stage(self.local, e);
+                    c.dir.tags[s] = Some((self.local, e));
+                    published.push(e);
+                }
+                MissTarget::Victim(e, slot) => {
+                    c.dir.cache.commit(slot, self.local, e);
+                    published.push(e);
+                }
+            }
+        }
+        {
+            let mut st = lock(&self.bank.stats);
+            let s = &mut st[self.ci];
+            s.fills += 1;
+            s.slots += targets.len();
+            s.bytes += io.bytes;
+            s.ns += io.ns;
+            s.read_ns += io.read_ns;
+            s.repack_ns += io.repack_ns;
+            s.wait_ns += waited;
+        }
+        if let Some(next_targets) = self.queued.pop_front() {
+            let reads = match g.classes[self.ci].reads_targets(self.local, &next_targets) {
+                Ok(r) => r,
+                Err(err) => {
+                    let cache = &mut g.classes[self.ci].dir.cache;
+                    release_targets(cache, &next_targets);
+                    for group in self.queued.drain(..) {
+                        release_targets(cache, &group);
+                    }
+                    return Err(err);
+                }
+            };
+            // SAFETY: target staging slots were untagged upfront, victims are
+            // unmapped, GPU drain (if any) ran before subgroup 0, and `inflight`
+            // plus `self.active` keep the batch watched until completion.
+            let next_ticket = match unsafe { self.bank.pool.submit(reads, Priority::High) } {
+                Ok(t) => t,
+                Err(err) => {
+                    let cache = &mut g.classes[self.ci].dir.cache;
+                    release_targets(cache, &next_targets);
+                    for group in self.queued.drain(..) {
+                        release_targets(cache, &group);
+                    }
+                    return Err(err);
+                }
+            };
+            g.watch(&next_ticket);
+            self.active = Some((next_targets, next_ticket));
+        }
+        Ok(Some(published))
+    }
+}
+
+impl Drop for PrefillSubgroups<'_> {
+    fn drop(&mut self) {
+        let active_targets = self.active.take().map(|(targets, ticket)| {
+            drop(ticket);
+            targets
+        });
+        if active_targets.is_some() || !self.queued.is_empty() {
+            let mut g = lock(&self.bank.inner);
+            let cache = &mut g.classes[self.ci].dir.cache;
+            if let Some(targets) = active_targets {
+                release_targets(cache, &targets);
+            }
+            for group in self.queued.drain(..) {
+                release_targets(cache, &group);
+            }
+        }
+    }
+}
+
+fn release_targets(cache: &mut Cache, targets: &[MissTarget]) {
+    for &tgt in targets {
+        if let MissTarget::Victim(_, slot) = tgt {
+            cache.release(slot);
+        }
+    }
 }
 
 struct ProjBank {
@@ -881,6 +1073,21 @@ impl ClassBank {
         Ok(out)
     }
 
+    fn reads_targets(&self, layer: usize, targets: &[MissTarget]) -> Result<Vec<Read>> {
+        let base = self.dir.base() as usize;
+        let mut out = Vec::with_capacity(targets.len() * 12);
+        for &tgt in targets {
+            let (e, slot) = match tgt {
+                MissTarget::Staging(e) => (e, self.dir.stage(layer, e)),
+                MissTarget::Victim(e, c) => (e, base + c as usize),
+            };
+            for (t, p) in self.tensors[layer].iter().zip(&self.proj) {
+                out.extend(p.dst.reads(t, e, slot)?);
+            }
+        }
+        Ok(out)
+    }
+
     fn arrays(&self) -> Result<[ProjArrays; 3]> {
         match self.proj.as_slice() {
             [g, u, d] => Ok([g.arrays(), u.arrays(), d.arrays()]),
@@ -889,11 +1096,44 @@ impl ClassBank {
     }
 }
 
+struct Ahead {
+    local: usize,
+    experts: Vec<u32>,
+    ticket: Ticket,
+}
+
 struct Inner {
+    // Declared before `classes` so Drop waits for all in-flight reads before
+    // any PurgeableBank buffer is released.
+    ahead: [Vec<Ahead>; 2],
+    inflight: Vec<BatchWatch>,
+    ahead_left: [Vec<(usize, Vec<u32>)>; 2],
     classes: Vec<ClassBank>,
     in_turn: bool,
     /// Buffers of banks dropped by `rebuild` that an array may still hold.
     retired: Vec<BankWatch>,
+}
+
+impl Inner {
+    fn drain(&mut self) {
+        for w in self.inflight.drain(..) {
+            w.wait();
+        }
+    }
+
+    fn watch(&mut self, t: &Ticket) {
+        self.inflight.retain(|w| !w.done());
+        self.inflight.push(t.watch());
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        for list in &mut self.ahead {
+            list.clear();
+        }
+        self.drain();
+    }
 }
 
 pub struct KqBank {
@@ -901,6 +1141,8 @@ pub struct KqBank {
     n_experts: usize,
     n_used: usize,
     layout: ClassLayout,
+    split: AtomicBool,
+    prefetch: AtomicBool,
     inner: Mutex<Inner>,
     stats: Mutex<[KqStats; 2]>,
 }
@@ -961,13 +1203,42 @@ impl KqBank {
             n_experts: n,
             n_used: moe.n_used,
             layout,
+            split: AtomicBool::new(true),
+            prefetch: AtomicBool::new(true),
             inner: Mutex::new(Inner {
+                ahead: [Vec::new(), Vec::new()],
+                inflight: Vec::new(),
+                ahead_left: [Vec::new(), Vec::new()],
                 classes: banks,
                 in_turn: true,
                 retired: Vec::new(),
             }),
             stats: Mutex::new([KqStats::default(); 2]),
         })
+    }
+
+    pub fn split(&self) -> bool {
+        self.split.load(Ordering::Relaxed)
+    }
+
+    pub fn set_split(&self, on: bool) {
+        self.split.store(on, Ordering::Relaxed);
+    }
+
+    pub fn prefetch(&self) -> bool {
+        self.prefetch.load(Ordering::Relaxed)
+    }
+
+    pub fn set_prefetch(&self, on: bool) {
+        self.prefetch.store(on, Ordering::Relaxed);
+    }
+
+    pub fn reads_in_flight(&self) -> usize {
+        lock(&self.inner)
+            .inflight
+            .iter()
+            .filter(|w| !w.done())
+            .count()
     }
 
     pub fn n_experts(&self) -> usize {
@@ -1102,6 +1373,67 @@ impl KqBank {
         self.begin(&mut g)
     }
 
+    fn settle_ahead(&self, g: &mut Inner, ci: usize, pick: impl Fn(usize) -> bool) {
+        let (now, keep): (Vec<Ahead>, Vec<Ahead>) = std::mem::take(&mut g.ahead[ci])
+            .into_iter()
+            .partition(|a| pick(a.local));
+        g.ahead[ci] = keep;
+        for a in now {
+            match a.ticket.wait() {
+                Ok(io) => {
+                    let c = &mut g.classes[ci];
+                    for &e in &a.experts {
+                        let s = c.dir.stage(a.local, e);
+                        c.dir.tags[s] = Some((a.local, e));
+                    }
+                    {
+                        let mut st = lock(&self.stats);
+                        let s = &mut st[ci];
+                        s.fills += 1;
+                        s.slots += a.experts.len();
+                        s.bytes += io.bytes;
+                        s.ns += io.ns;
+                        s.read_ns += io.read_ns;
+                        s.repack_ns += io.repack_ns;
+                    }
+                    match g.ahead_left[ci].iter_mut().find(|(l, _)| *l == a.local) {
+                        Some((_, left)) => {
+                            left.extend(&a.experts);
+                            left.sort_unstable();
+                            left.dedup();
+                        }
+                        None => g.ahead_left[ci].push((a.local, a.experts)),
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "hy_v4_flash prefetch of class {ci} local layer {} failed: {err}",
+                        a.local
+                    );
+                }
+            }
+        }
+    }
+
+    fn close_ahead_locked(&self, g: &mut Inner, ci: usize, pick: impl Fn(usize) -> bool) {
+        let (done, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut g.ahead_left[ci])
+            .into_iter()
+            .partition(|(l, _)| pick(*l));
+        g.ahead_left[ci] = keep;
+        let unused: usize = done.iter().map(|(_, left)| left.len()).sum();
+        if unused > 0 {
+            lock(&self.stats)[ci].prefetch_unused += unused;
+        }
+    }
+
+    fn settle_all_ahead(&self, g: &mut Inner) {
+        for ci in 0..CLASSES.len() {
+            self.settle_ahead(g, ci, |_| true);
+            self.close_ahead_locked(g, ci, |_| true);
+        }
+        g.drain();
+    }
+
     /// After the turn's last eval: staging copies served this turn move into
     /// cache slots, then the banks become `Volatile`.
     pub fn end_turn(&self) -> Result<()> {
@@ -1110,6 +1442,7 @@ impl KqBank {
             return Ok(());
         }
         crate::array::synchronize();
+        self.settle_all_ahead(&mut g);
         self.promote(&mut g)?;
         g.in_turn = false;
         for p in g.classes.iter().flat_map(|c| &c.proj) {
@@ -1151,6 +1484,7 @@ impl KqBank {
         if !g.in_turn {
             return Ok(0);
         }
+        self.settle_all_ahead(&mut g);
         let any_staged = g.classes.iter().any(|c| c.dir.has_staged());
         let moved = if any_staged {
             if g.classes.iter().any(|c| c.dir.has_unsettled()) {
@@ -1175,6 +1509,7 @@ impl KqBank {
     pub fn rebuild(&self, cache_slots: [usize; 2], staging: usize) -> Result<()> {
         let mut g = lock(&self.inner);
         crate::array::synchronize();
+        self.settle_all_ahead(&mut g);
         let n = self.n_experts;
         let mut dirs = Vec::with_capacity(CLASSES.len());
         for (ci, c) in g.classes.iter().enumerate() {
@@ -1227,6 +1562,24 @@ impl KqBank {
         uses: &[u32],
         decode: bool,
     ) -> Result<Prepared> {
+        let (mut p, pending) = self.prepare_split(layer, experts, uses, decode)?;
+        if let Some(pending) = pending {
+            pending.finish()?;
+        }
+        p.reading.clear();
+        Ok(p)
+    }
+
+    /// Like `prepare`, but returns immediately after submitting miss reads at
+    /// high priority. `Prepared.reading` lists experts whose slots are in
+    /// flight; the caller must call `Pending::finish` before gathering them.
+    pub fn prepare_split(
+        &self,
+        layer: usize,
+        experts: &[u32],
+        uses: &[u32],
+        decode: bool,
+    ) -> Result<(Prepared, Option<Pending<'_>>)> {
         let (ci, local) = self
             .layout
             .of_layer
@@ -1239,6 +1592,23 @@ impl KqBank {
         let arrays = g.classes[ci].arrays()?;
         if !g.in_turn {
             self.begin(&mut g)?;
+        }
+        // Keep the next class-local layer's prefetch alive in the other
+        // staging half; settle this layer's own prefetch and any stale ones.
+        let t_ahead = Instant::now();
+        let had_ahead = g.ahead[ci].iter().any(|a| a.local != local + 1);
+        self.settle_ahead(&mut g, ci, |l| l != local + 1);
+        let ahead_wait = if had_ahead {
+            t_ahead.elapsed().as_nanos() as u64
+        } else {
+            0
+        };
+        g.drain();
+        self.close_ahead_locked(&mut g, ci, |l| l < local);
+        for (l, left) in g.ahead_left[ci].iter_mut() {
+            if *l == local {
+                left.retain(|e| experts.binary_search(e).is_err());
+            }
         }
         let c = &mut g.classes[ci];
         let plan = c.dir.plan(local, experts, uses, decode);
@@ -1262,7 +1632,8 @@ impl KqBank {
             st[ci].promoted += plan.copies.len();
             st[ci].promote_ns += t0.elapsed().as_nanos() as u64;
         }
-        let mut io = IoStats::default();
+        let mut reading = Vec::new();
+        let mut pending = None;
         if plan.reads() > 0 {
             let reads = match c.reads(local, &plan) {
                 Ok(r) => r,
@@ -1277,20 +1648,39 @@ impl KqBank {
             }
             c.dir.untag(local, &plan);
             // SAFETY: every slot read is untagged (staging) or an unmapped
-            // victim (cache), so no gather is handed it until the reads are
-            // in; no unfinished gather reads it (a victim's last use settled,
-            // a busy staging slot drained above), the slots of one step are
-            // distinct, and the ticket is waited before the bank lock is
-            // released.
-            let out = unsafe { self.pool.submit(reads, Priority::High) }.and_then(|t| t.wait());
-            match out {
-                Ok(s) => io = s,
+            // victim (cache); no unfinished gather reads it (victims settled,
+            // busy staging slots drained above); the batch is watched in
+            // `inflight` and owned by `Pending` whose Drop waits on it.
+            let ticket = match unsafe { self.pool.submit(reads, Priority::High) } {
+                Ok(t) => t,
                 Err(err) => {
                     c.dir.abandon(&plan);
                     return Err(err);
                 }
-            }
-            c.dir.publish(local, &plan);
+            };
+            reading = plan
+                .staging
+                .iter()
+                .copied()
+                .chain(plan.victims.iter().map(|&(e, _)| e))
+                .collect();
+            reading.sort_unstable();
+            g.watch(&ticket);
+            pending = Some(Pending {
+                bank: self,
+                ci,
+                local,
+                plan: Plan {
+                    epoch: plan.epoch,
+                    slots: Vec::new(),
+                    staging: plan.staging,
+                    victims: plan.victims,
+                    copies: Vec::new(),
+                    hits: plan.hits,
+                    drain: plan.drain,
+                },
+                ticket: Some(ticket),
+            });
         }
         {
             let mut st = lock(&self.stats);
@@ -1298,22 +1688,266 @@ impl KqBank {
             s.uses += experts.len();
             s.hits += plan.hits;
             s.drains += usize::from(plan.drain);
-            if plan.reads() > 0 {
-                s.fills += 1;
-                s.slots += plan.reads();
-                s.bytes += io.bytes;
-                s.ns += io.ns;
-                s.read_ns += io.read_ns;
-                s.repack_ns += io.repack_ns;
+            s.wait_ns += ahead_wait;
+        }
+        Ok((
+            Prepared {
+                layer,
+                class: CLASSES[ci],
+                experts: experts.to_vec(),
+                slots: plan.slots,
+                arrays,
+                reading,
+            },
+            pending,
+        ))
+    }
+
+    /// Plans one prefill FFN chunk once, executes copies and any required GPU
+    /// drain, returns resident experts (`group_0`) ready for immediate gather,
+    /// and starts reading missing experts in `subgroup_experts`-sized batches
+    /// ordered by `last_use_order`.
+    pub fn plan_prefill_subgroups(
+        &self,
+        layer: usize,
+        used: &[u32],
+        uses: &[u32],
+        last_use_order: &[u32],
+        subgroup_experts: usize,
+    ) -> Result<(Prepared, Vec<u32>, PrefillSubgroups<'_>)> {
+        let (ci, local) = self
+            .layout
+            .of_layer
+            .get(layer)
+            .copied()
+            .flatten()
+            .ok_or_else(|| bad(format!("layer {layer} has no streamed experts")))?;
+        let mut g = lock(&self.inner);
+        g.classes[ci].dir.check_step(local, used, uses)?;
+        let arrays = g.classes[ci].arrays()?;
+        if !g.in_turn {
+            self.begin(&mut g)?;
+        }
+        let t_ahead = Instant::now();
+        let had_ahead = g.ahead[ci].iter().any(|a| a.local != local + 1);
+        self.settle_ahead(&mut g, ci, |l| l != local + 1);
+        let ahead_wait = if had_ahead {
+            t_ahead.elapsed().as_nanos() as u64
+        } else {
+            0
+        };
+        g.drain();
+        self.close_ahead_locked(&mut g, ci, |l| l < local);
+        for (l, left) in g.ahead_left[ci].iter_mut() {
+            if *l == local {
+                left.retain(|e| used.binary_search(e).is_err());
             }
         }
-        Ok(Prepared {
-            layer,
-            class: CLASSES[ci],
-            experts: experts.to_vec(),
-            slots: plan.slots,
-            arrays,
-        })
+        let c = &mut g.classes[ci];
+        let plan = c.dir.plan(local, used, uses, false);
+        if !plan.copies.is_empty() {
+            let t0 = Instant::now();
+            let total = c.dir.total_slots();
+            let base = c.dir.base();
+            for &(e, slot) in &plan.copies {
+                if let Err(err) =
+                    copy_slot(&c.proj, total, c.dir.stage(local, e) as u32, base + slot)
+                {
+                    c.dir.abandon(&plan);
+                    plan.copies
+                        .iter()
+                        .for_each(|&(_, s)| c.dir.cache.release(s));
+                    return Err(err);
+                }
+            }
+            c.dir.commit_copies(local, &plan);
+            let mut st = lock(&self.stats);
+            st[ci].promoted += plan.copies.len();
+            st[ci].promote_ns += t0.elapsed().as_nanos() as u64;
+        }
+        if plan.drain {
+            crate::array::synchronize();
+            c.dir.complete(plan.epoch - 1);
+        }
+        let mut miss_kind: Vec<Option<MissTarget>> = vec![None; self.n_experts];
+        for &e in &plan.staging {
+            miss_kind[e as usize] = Some(MissTarget::Staging(e));
+        }
+        for &(e, slot) in &plan.victims {
+            miss_kind[e as usize] = Some(MissTarget::Victim(e, slot));
+        }
+        let group_0: Vec<u32> = used
+            .iter()
+            .copied()
+            .filter(|&e| miss_kind[e as usize].is_none())
+            .collect();
+        let mut ordered_misses = Vec::with_capacity(plan.reads());
+        for &e in last_use_order {
+            if let Some(tgt) = miss_kind.get_mut(e as usize).and_then(Option::take) {
+                ordered_misses.push(tgt);
+            }
+        }
+        for tgt in miss_kind.into_iter().flatten() {
+            ordered_misses.push(tgt);
+        }
+        let mut reading: Vec<u32> = plan
+            .staging
+            .iter()
+            .copied()
+            .chain(plan.victims.iter().map(|&(e, _)| e))
+            .collect();
+        reading.sort_unstable();
+
+        let cap = subgroup_experts.max(1);
+        let mut queued: VecDeque<Vec<MissTarget>> = ordered_misses
+            .chunks(cap)
+            .map(<[MissTarget]>::to_vec)
+            .collect();
+
+        let active = if let Some(first_targets) = queued.pop_front() {
+            let reads = match c.reads_targets(local, &first_targets) {
+                Ok(r) => r,
+                Err(err) => {
+                    c.dir.abandon(&plan);
+                    return Err(err);
+                }
+            };
+            c.dir.untag(local, &plan);
+            // SAFETY: every miss staging slot is untagged above, victims are
+            // unmapped, any busy staging slot drained above, and `inflight`
+            // plus `PrefillSubgroups::Drop` ensure no IO outlives this step.
+            let ticket = match unsafe { self.pool.submit(reads, Priority::High) } {
+                Ok(t) => t,
+                Err(err) => {
+                    c.dir.abandon(&plan);
+                    return Err(err);
+                }
+            };
+            g.watch(&ticket);
+            Some((first_targets, ticket))
+        } else {
+            None
+        };
+
+        {
+            let mut st = lock(&self.stats);
+            let s = &mut st[ci];
+            s.uses += used.len();
+            s.hits += plan.hits;
+            s.drains += usize::from(plan.drain);
+            s.wait_ns += ahead_wait;
+        }
+        Ok((
+            Prepared {
+                layer,
+                class: CLASSES[ci],
+                experts: used.to_vec(),
+                slots: plan.slots,
+                arrays,
+                reading,
+            },
+            group_0,
+            PrefillSubgroups {
+                bank: self,
+                ci,
+                local,
+                active,
+                queued,
+            },
+        ))
+    }
+
+    /// Reads `layer`'s predicted `experts` (sorted, distinct) into its staging
+    /// half at low priority when the bank has at least two staging layers.
+    pub fn prefetch_layer(&self, layer: usize, experts: &[u32]) -> Result<usize> {
+        if !self.prefetch() {
+            return Ok(0);
+        }
+        let (ci, local) = self
+            .layout
+            .of_layer
+            .get(layer)
+            .copied()
+            .flatten()
+            .ok_or_else(|| bad(format!("layer {layer} has no streamed experts")))?;
+        let mut g = lock(&self.inner);
+        if g.classes[ci].dir.staging_layers() < 2 {
+            return Ok(0);
+        }
+        g.classes[ci].dir.check_step(local, experts, &[])?;
+        if g.classes[ci].proj.is_empty() {
+            return Err(bad(format!(
+                "{:?}: no bank (a rebuild failed)",
+                g.classes[ci].class
+            )));
+        }
+        if !g.in_turn {
+            self.begin(&mut g)?;
+        }
+        // Keep the immediately preceding class-local layer's prefetch alive in
+        // the other staging half; settle everything else in this class.
+        self.settle_ahead(&mut g, ci, |l| l + 1 != local);
+        let c = &mut g.classes[ci];
+        let want: Vec<u32> = experts
+            .iter()
+            .copied()
+            .filter(|&e| {
+                c.dir.cache.lookup(local, e).is_none()
+                    && c.dir.tags[c.dir.stage(local, e)] != Some((local, e))
+            })
+            .collect();
+        if want.is_empty() {
+            return Ok(0);
+        }
+        let need_drain = want
+            .iter()
+            .any(|&e| c.dir.stage_use[c.dir.stage(local, e)] > c.dir.cache.completed());
+        if need_drain {
+            crate::array::synchronize();
+            c.dir.complete_all();
+        }
+        let mut reads = Vec::with_capacity(want.len() * 12);
+        for &e in &want {
+            let s = c.dir.stage(local, e);
+            for (t, p) in c.tensors[local].iter().zip(&c.proj) {
+                reads.extend(p.dst.reads(t, e, s)?);
+            }
+        }
+        for &e in &want {
+            let s = c.dir.stage(local, e);
+            c.dir.tags[s] = None;
+        }
+        // SAFETY: target staging slots are untagged, any pinned slot was
+        // drained above, and `ahead[ci]` owns the ticket until settled.
+        let ticket = unsafe { self.pool.submit(reads, Priority::Low) }?;
+        let k = want.len();
+        g.ahead[ci].push(Ahead {
+            local,
+            experts: want,
+            ticket,
+        });
+        let mut st = lock(&self.stats);
+        st[ci].prefetch_slots += k;
+        st[ci].drains += usize::from(need_drain);
+        Ok(k)
+    }
+
+    /// Counts unused prefetched experts for `layer` once every step of it ran.
+    pub fn end_layer(&self, layer: usize) {
+        let Some((ci, local)) = self.layout.of_layer.get(layer).copied().flatten() else {
+            return;
+        };
+        let mut g = lock(&self.inner);
+        self.close_ahead_locked(&mut g, ci, |l| l == local);
+    }
+
+    pub fn note_split(&self, layer: usize, mixed: bool) {
+        let Some((ci, _)) = self.layout.of_layer.get(layer).copied().flatten() else {
+            return;
+        };
+        let mut st = lock(&self.stats);
+        st[ci].split_steps += 1;
+        st[ci].split_mixed += usize::from(mixed);
     }
 
     /// Per class: the epoch of the last step planned so far.
@@ -1345,6 +1979,38 @@ impl KqBank {
     /// expert of `p.layer`: a gather on a stale slot would compute with
     /// another layer's (or discarded) weights.
     pub fn assert_slots(&self, p: &Prepared) {
+        self.assert_slots_where(p, |_| true);
+    }
+
+    /// `assert_slots` restricted to experts not in `p.reading`.
+    pub fn assert_ready_slots(&self, p: &Prepared) {
+        self.assert_slots_where(p, |e| !p.is_reading(e));
+    }
+
+    /// `assert_slots` restricted to `experts`.
+    pub fn assert_experts_slots(&self, p: &Prepared, experts: &[u32]) {
+        let stale = self
+            .layout
+            .of_layer
+            .get(p.layer)
+            .copied()
+            .flatten()
+            .and_then(|(ci, local)| {
+                let g = lock(&self.inner);
+                let dir = &g.classes[ci].dir;
+                experts.iter().find_map(|&e| {
+                    let s = p.slot(e)?;
+                    (!dir.holds(local, e, s)).then_some((e, s))
+                })
+            });
+        assert!(
+            stale.is_none(),
+            "Hy4 expert bank: gather of layer {} on stale slot {stale:?}",
+            p.layer
+        );
+    }
+
+    fn assert_slots_where(&self, p: &Prepared, check: impl Fn(u32) -> bool) {
         let stale = self
             .layout
             .of_layer
@@ -1357,6 +2023,7 @@ impl KqBank {
                 p.experts
                     .iter()
                     .zip(&p.slots)
+                    .filter(|&(&e, _)| check(e))
                     .find(|&(&e, &s)| !dir.holds(local, e, s))
                     .map(|(&e, &s)| (e, s))
             });
@@ -1365,6 +2032,42 @@ impl KqBank {
             "Hy4 expert bank: gather of layer {} on stale slot {stale:?}",
             p.layer
         );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_check_caches(&self) {
+        let g = lock(&self.inner);
+        for c in &g.classes {
+            c.dir.cache().check().unwrap();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_forget_where(&self, f: impl Fn(usize, u32) -> bool) {
+        let mut g = lock(&self.inner);
+        crate::array::synchronize();
+        self.settle_all_ahead(&mut g);
+        for (ci, c) in g.classes.iter_mut().enumerate() {
+            let layers = &self.layout.layers[ci];
+            for t in c.dir.tags.iter_mut() {
+                if let Some((local, e)) = *t
+                    && f(layers[local], e)
+                {
+                    *t = None;
+                }
+            }
+            let gone: Vec<u32> = (0..c.dir.cache.slots() as u32)
+                .filter(|&s| {
+                    c.dir
+                        .cache
+                        .occ(s)
+                        .is_some_and(|(local, e)| f(layers[local], e))
+                })
+                .collect();
+            for s in gone {
+                c.dir.cache.release(s);
+            }
+        }
     }
 }
 

@@ -25,16 +25,20 @@ use super::cache::{LatentBuf, LayerCache, WindowRing};
 use super::config::{Attn, HyV4FlashConfig};
 use super::indexer::{Call, Indexing, PagedIndexing};
 use super::moe::qlinear;
+use super::ops::{fast_rope, rms_norm, rope_inv_freqs};
 use super::paged::{SlotMap, planes, write_latent};
 use super::sparse::{KeyRows, gather_sink_attention, gather_sink_attention_rows};
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::AttnWeights;
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::attention::rms_norm;
-use crate::models::deepseek_v41::ops::{apply_partial_rope, inv_freqs, rope_tables};
+use crate::models::deepseek_v41::ops::inv_freqs;
 use crate::models::deepseek_v41::store::{Dense, Weight};
 use crate::nn::Activations;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+
+/// Above this row count `project_at` skips fusing `attn_gate` so prefill does
+/// not hold a `[n, H·head_v]` gate tensor live across sparse attention.
+const FUSED_GATE_MAX_ROWS: i64 = 256;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 attention: {msg}"))
@@ -132,6 +136,8 @@ pub struct Projected {
     pub q: MxArray,
     /// Latent rows `[n, kv_lora + rope]` f32, before the cache's f16 cast.
     pub kv: MxArray,
+    /// Precomputed `attn_gate·x` `[n, H·head_v]` f32 when fused (`n <= 256`).
+    pub gate_lin: Option<MxArray>,
 }
 
 impl Projected {
@@ -142,6 +148,11 @@ impl Projected {
             qr: wave.owner_rows(&self.qr, owner)?,
             q: wave.owner_rows(&self.q, owner)?,
             kv: wave.owner_rows(&self.kv, owner)?,
+            gate_lin: self
+                .gate_lin
+                .as_ref()
+                .map(|g| wave.owner_rows(g, owner))
+                .transpose()?,
         })
     }
 }
@@ -159,7 +170,7 @@ pub struct PagedPool<'a> {
 /// The attention of one layer; the weights stay in `Resident`.
 pub struct Mla {
     g: Geometry,
-    inv: Vec<f32>,
+    inv_freqs: MxArray,
 }
 
 fn want(d: &Dense, axis: u32, n: usize, what: &str) -> Result<()> {
@@ -192,12 +203,27 @@ impl Mla {
         want(&w.v_b, 1, g.kv_lora, "attn_v_b")?;
         want(&w.gate, 0, h * g.head_v, "attn_gate")?;
         want(&w.output, 1, h * g.head_v, "attn_output")?;
+        let q_lora = w.q_a.shape_at(0)? as usize;
+        let dim = w.q_a.shape_at(1)? as usize;
+        if let Some(q_kv) = &w.q_kv {
+            want(q_kv, 0, q_lora + g.row(), "attn_q_kv")?;
+            want(q_kv, 1, dim, "attn_q_kv")?;
+        }
+        if let Some(q_kv_gate) = &w.q_kv_gate {
+            want(
+                q_kv_gate,
+                0,
+                q_lora + g.row() + h * g.head_v,
+                "attn_q_kv_gate",
+            )?;
+            want(q_kv_gate, 1, dim, "attn_q_kv_gate")?;
+        }
         let sinks = w.sinks.shape()?.as_ref().to_vec();
         if sinks.as_slice() != [h as i64] {
             return Err(bad(format!("attn_sinks {sinks:?} for {h} heads")));
         }
-        let inv = inv_freqs(g.rope_dim, g.rope_theta, None);
-        Ok(Self { g, inv })
+        let inv_freqs = rope_inv_freqs(&inv_freqs(g.rope_dim, g.rope_theta, None))?;
+        Ok(Self { g, inv_freqs })
     }
 
     pub fn geometry(&self) -> &Geometry {
@@ -222,30 +248,57 @@ impl Mla {
         let (heads, nope, rd) = (g.n_heads as i64, g.nope as i64, g.rope_dim as i64);
         let qk = g.head_qk() as i64;
         let kv_lora = g.kv_lora as i64;
-        let (cos, sin) = rope_tables(&self.inv, positions)?;
+        let kv_row = kv_lora + rd;
+        let q_lora = w.q_a.shape_at(0)?;
 
         let x = rms_norm(&h.astype(DType::Float32)?, &w.norm, g.eps)?;
-        let qr = rms_norm(&qlinear(&x, &w.q_a)?, &w.q_a_norm, g.eps)?;
+        let (q_a_out, ckv, gate_lin) = match (n <= FUSED_GATE_MAX_ROWS, &w.q_kv_gate, &w.q_kv) {
+            (true, Some(fused), _) => {
+                let all = qlinear(&x, fused)?;
+                let total = all.shape_at(1)?;
+                (
+                    all.slice(&[0, 0], &[n, q_lora])?,
+                    all.slice(&[0, q_lora], &[n, q_lora + kv_row])?,
+                    Some(all.slice(&[0, q_lora + kv_row], &[n, total])?),
+                )
+            }
+            (false, _, Some(fused)) => {
+                let all = qlinear(&x, fused)?;
+                (
+                    all.slice(&[0, 0], &[n, q_lora])?,
+                    all.slice(&[0, q_lora], &[n, q_lora + kv_row])?,
+                    None,
+                )
+            }
+            _ => (qlinear(&x, &w.q_a)?, qlinear(&x, &w.kv_a)?, None),
+        };
+        let qr = rms_norm(&q_a_out, &w.q_a_norm, g.eps)?;
         let q = qlinear(&qr, &w.q_b)?.reshape(&[n, heads, qk])?;
-        let q = apply_partial_rope(&q, rd, &cos, &sin, false)?;
         let q_nope = q
             .slice(&[0, 0, 0], &[n, heads, nope])?
             .transpose(Some(&[1, 0, 2]))?;
-        let q_pe = q.slice(&[0, 0, nope], &[n, heads, qk])?;
+        let q_pe = fast_rope(
+            &q.slice(&[0, 0, nope], &[n, heads, qk])?,
+            &self.inv_freqs,
+            positions,
+        )?;
         let q_abs = grouped_mm_t(&w.k_b, &q_nope, heads)?.transpose(Some(&[1, 0, 2]))?;
         let q = MxArray::concatenate(&q_abs, &q_pe, -1)?;
 
-        let ckv = qlinear(&x, &w.kv_a)?;
         let kv = rms_norm(&ckv.slice(&[0, 0], &[n, kv_lora])?, &w.kv_a_norm, g.eps)?;
-        let k_pe = apply_partial_rope(
-            &ckv.slice(&[0, kv_lora], &[n, kv_lora + rd])?,
-            rd,
-            &cos,
-            &sin,
-            false,
+        let k_pe = fast_rope(
+            &ckv.slice(&[0, kv_lora], &[n, kv_row])?,
+            &self.inv_freqs,
+            positions,
         )?;
         let kv = MxArray::concatenate(&kv, &k_pe, -1)?;
-        Ok(Projected { x, qr, q, kv })
+        Ok(Projected {
+            x,
+            qr,
+            q,
+            kv,
+            gate_lin,
+        })
     }
 
     /// `project_at` under the attention-projection clock.
@@ -257,12 +310,27 @@ impl Mla {
     ) -> Result<Projected> {
         let tp = prof_start();
         let p = self.project_at(w, h, positions)?;
-        prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv])?;
+        if let Some(g) = &p.gate_lin {
+            prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv, g])?;
+        } else {
+            prof_end(Phase::AttnProj, tp, &[&p.q, &p.x, &p.qr, &p.kv])?;
+        }
         Ok(p)
     }
 
     /// `o_lat [n, H, kv_lora]` -> the sublayer output `[n, dim]` f32.
     pub fn finish(&self, w: &AttnWeights, x: &MxArray, o_lat: &MxArray) -> Result<MxArray> {
+        self.finish_with_gate(w, x, None, o_lat)
+    }
+
+    /// `finish` using a precomputed `gate_lin` when `project_at` fused `attn_gate`.
+    pub fn finish_with_gate(
+        &self,
+        w: &AttnWeights,
+        x: &MxArray,
+        gate_lin: Option<&MxArray>,
+        o_lat: &MxArray,
+    ) -> Result<MxArray> {
         let g = &self.g;
         let n = o_lat.shape_at(0)?;
         let heads = g.n_heads as i64;
@@ -270,15 +338,30 @@ impl Mla {
         let o = grouped_mm_t(&w.v_b, &o_lat.transpose(Some(&[1, 0, 2]))?, heads)?
             .transpose(Some(&[1, 0, 2]))?
             .reshape(&[n, width])?;
-        let gate = Activations::sigmoid(&qlinear(x, &w.gate)?)?;
-        let y = qlinear(&o.mul(&gate)?, &w.output)?;
+        let gate_lin = match gate_lin {
+            Some(gl) => gl.clone(),
+            None => qlinear(x, &w.gate)?,
+        };
+        let gated = Activations::sigmoid_mul_compiled(&gate_lin, &o)?;
+        let y = qlinear(&gated, &w.output)?;
         rms_norm(&y, &w.post_norm, g.eps)
     }
 
     /// `finish` under the attention-projection clock.
     pub fn finish_timed(&self, w: &AttnWeights, x: &MxArray, o_lat: &MxArray) -> Result<MxArray> {
+        self.finish_timed_with_gate(w, x, None, o_lat)
+    }
+
+    /// `finish_with_gate` under the attention-projection clock.
+    pub fn finish_timed_with_gate(
+        &self,
+        w: &AttnWeights,
+        x: &MxArray,
+        gate_lin: Option<&MxArray>,
+        o_lat: &MxArray,
+    ) -> Result<MxArray> {
         let tp = prof_start();
-        let y = self.finish(w, x, o_lat)?;
+        let y = self.finish_with_gate(w, x, gate_lin, o_lat)?;
         prof_end(Phase::AttnProj, tp, &[&y])?;
         Ok(y)
     }
@@ -441,7 +524,7 @@ impl Mla {
         let before = ring.clone();
         let out = self
             .core_sliding(w, &p, start, ring)
-            .and_then(|o| self.finish_timed(w, &p.x, &o));
+            .and_then(|o| self.finish_timed_with_gate(w, &p.x, p.gate_lin.as_ref(), &o));
         if out.is_err() {
             *ring = before;
         }
@@ -461,7 +544,7 @@ impl Mla {
         let mark = ix.state.mark();
         let out = self
             .core_indexed(w, &p, start, buf, &mut ix)
-            .and_then(|o| self.finish_timed(w, &p.x, &o));
+            .and_then(|o| self.finish_timed_with_gate(w, &p.x, p.gate_lin.as_ref(), &o));
         if out.is_err() {
             if buf.len() > held {
                 buf.truncate(held)?;
@@ -488,7 +571,7 @@ impl Mla {
         let mark = ix.state.mark();
         let out = self
             .core_indexed_paged(w, &p, start, &mut pool, &mut ix)
-            .and_then(|o| self.finish_timed(w, &p.x, &o));
+            .and_then(|o| self.finish_timed_with_gate(w, &p.x, p.gate_lin.as_ref(), &o));
         if out.is_err() {
             ix.state.restore(mark)?;
         }

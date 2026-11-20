@@ -420,6 +420,65 @@ impl HcWeights {
     }
 }
 
+/// Concatenates 2-D `Dense::Qmm` matrices along axis 0 into a single backing
+/// allocation and returns `(fused, zero_copy_views)` so resident RAM stays 1.00x.
+/// Returns `None` if fewer than 2 parts or any part is not a matching 2-D `Qmm`.
+pub(crate) fn fuse_qmm_rows(parts: &[&Dense]) -> Result<Option<(Dense, Vec<Dense>)>> {
+    if parts.len() < 2 {
+        return Ok(None);
+    }
+    let mut ws = Vec::with_capacity(parts.len());
+    let mut ss = Vec::with_capacity(parts.len());
+    let mut bs = Vec::with_capacity(parts.len());
+    let mut rows = Vec::with_capacity(parts.len());
+    let mut expected: Option<(i64, i64, i64, DType, DType, DType)> = None;
+    for part in parts {
+        let Dense::Qmm { w, scales, biases } = part else {
+            return Ok(None);
+        };
+        if w.ndim()? != 2 || scales.ndim()? != 2 || biases.ndim()? != 2 {
+            return Ok(None);
+        }
+        let r = w.shape_at(0)?;
+        if r <= 0 || scales.shape_at(0)? != r || biases.shape_at(0)? != r {
+            return Ok(None);
+        }
+        let sig = (
+            w.shape_at(1)?,
+            scales.shape_at(1)?,
+            biases.shape_at(1)?,
+            w.dtype()?,
+            scales.dtype()?,
+            biases.dtype()?,
+        );
+        match expected {
+            None => expected = Some(sig),
+            Some(prev) if prev != sig => return Ok(None),
+            _ => {}
+        }
+        ws.push(w);
+        ss.push(scales);
+        bs.push(biases);
+        rows.push(r);
+    }
+    let w = MxArray::concatenate_many(ws, Some(0))?;
+    let s = MxArray::concatenate_many(ss, Some(0))?;
+    let b = MxArray::concatenate_many(bs, Some(0))?;
+    MxArray::eval_arrays_with_context(&[&w, &s, &b], "hy_v4_flash fuse qmm")?;
+    let fused = Dense::Qmm {
+        w,
+        scales: s,
+        biases: b,
+    };
+    let mut views = Vec::with_capacity(rows.len());
+    let mut lo = 0i64;
+    for r in rows {
+        views.push(fused.row_range(lo, lo + r)?);
+        lo += r;
+    }
+    Ok(Some((fused, views)))
+}
+
 pub struct AttnWeights {
     pub norm: MxArray,
     pub sinks: MxArray,
@@ -436,11 +495,31 @@ pub struct AttnWeights {
     pub gate: Dense,
     /// GGUF `post_attention_norm` (HF `post_proj_norm`).
     pub post_norm: MxArray,
+    /// Zero-copy `row_range` view `0..q_lora+kv_row` of `q_kv_gate`.
+    pub q_kv: Option<Dense>,
+    /// Fused `[q_a; kv_a; gate]` Q8 projection.
+    pub q_kv_gate: Option<Dense>,
 }
 
 impl AttnWeights {
+    pub(crate) fn fuse(&mut self) -> Result<()> {
+        if let Some((fused, mut views)) = fuse_qmm_rows(&[&self.q_a, &self.kv_a, &self.gate])? {
+            let q_kv_rows = self.q_a.shape_at(0)? + self.kv_a.shape_at(0)?;
+            let q_kv = fused.row_range(0, q_kv_rows)?;
+            let gate = views.pop().ok_or_else(|| bad("missing gate view"))?;
+            let kv_a = views.pop().ok_or_else(|| bad("missing kv_a view"))?;
+            let q_a = views.pop().ok_or_else(|| bad("missing q_a view"))?;
+            self.q_a = q_a;
+            self.kv_a = kv_a;
+            self.gate = gate;
+            self.q_kv = Some(q_kv);
+            self.q_kv_gate = Some(fused);
+        }
+        Ok(())
+    }
+
     fn load(r: &mut Reader, il: usize) -> Result<Self> {
-        Ok(Self {
+        let mut w = Self {
             norm: r.plain(&blk(il, "attn_norm"))?,
             sinks: r.plain(&blk(il, "attn_sinks"))?,
             q_a: r.dense(&blk(il, "attn_q_a"))?,
@@ -453,7 +532,11 @@ impl AttnWeights {
             output: r.dense(&blk(il, "attn_output"))?,
             gate: r.dense(&blk(il, "attn_gate"))?,
             post_norm: r.plain(&blk(il, "post_attention_norm"))?,
-        })
+            q_kv: None,
+            q_kv_gate: None,
+        };
+        w.fuse()?;
+        Ok(w)
     }
 }
 
@@ -526,11 +609,28 @@ pub struct MoeWeights {
     pub shared_gate: Dense,
     pub shared_up: Dense,
     pub shared_down: Dense,
+    /// Fused `[routed_down; shared_gate; shared_up]` Q8 projection.
+    pub down_shared_gu: Option<Dense>,
 }
 
 impl MoeWeights {
+    pub(crate) fn fuse(&mut self) -> Result<()> {
+        if let Some((fused, mut views)) =
+            fuse_qmm_rows(&[&self.routed_down, &self.shared_gate, &self.shared_up])?
+        {
+            let shared_up = views.pop().ok_or_else(|| bad("missing shared_up view"))?;
+            let shared_gate = views.pop().ok_or_else(|| bad("missing shared_gate view"))?;
+            let routed_down = views.pop().ok_or_else(|| bad("missing routed_down view"))?;
+            self.routed_down = routed_down;
+            self.shared_gate = shared_gate;
+            self.shared_up = shared_up;
+            self.down_shared_gu = Some(fused);
+        }
+        Ok(())
+    }
+
     fn load(r: &mut Reader, il: usize) -> Result<Self> {
-        Ok(Self {
+        let mut w = Self {
             router: r.dense(&blk(il, "ffn_gate_inp"))?,
             router_bias: r.opt_plain(&format!("blk.{il}.exp_probs_b.bias"))?,
             routed_down: r.dense(&blk(il, "ffn_routed_down"))?,
@@ -538,7 +638,10 @@ impl MoeWeights {
             shared_gate: r.dense(&blk(il, "ffn_gate_shexp"))?,
             shared_up: r.dense(&blk(il, "ffn_up_shexp"))?,
             shared_down: r.dense(&blk(il, "ffn_down_shexp"))?,
-        })
+            down_shared_gu: None,
+        };
+        w.fuse()?;
+        Ok(w)
     }
 }
 
@@ -548,6 +651,7 @@ pub enum Ffn {
         gate: Dense,
         up: Dense,
         down: Dense,
+        gate_up: Option<Dense>,
     },
     Moe(MoeWeights),
 }
@@ -613,10 +717,22 @@ impl LayerWeights {
             }
         };
         let ffn = if l.dense_ffn {
+            let mut gate = r.dense(&blk(il, "ffn_gate"))?;
+            let mut up = r.dense(&blk(il, "ffn_up"))?;
+            let down = r.dense(&blk(il, "ffn_down"))?;
+            let gate_up = match fuse_qmm_rows(&[&gate, &up])? {
+                Some((fused, mut views)) => {
+                    up = views.pop().ok_or_else(|| bad("missing ffn_up view"))?;
+                    gate = views.pop().ok_or_else(|| bad("missing ffn_gate view"))?;
+                    Some(fused)
+                }
+                None => None,
+            };
             Ffn::Mlp {
-                gate: r.dense(&blk(il, "ffn_gate"))?,
-                up: r.dense(&blk(il, "ffn_up"))?,
-                down: r.dense(&blk(il, "ffn_down"))?,
+                gate,
+                up,
+                down,
+                gate_up,
             }
         } else {
             Ffn::Moe(MoeWeights::load(r, il)?)
@@ -656,10 +772,8 @@ impl Resident {
     /// Trunk tensors (`Role::Dense`). Model thread only.
     pub fn load(scan: &Scan, shards: &ShardSet) -> Result<Self> {
         let out = Self::read_trunk(scan, shards);
-        if out.is_err() {
-            // the partial set is gone; keep its buffers out of MLX's free pool
-            crate::array::clear_cache();
-        }
+        // Release pre-concat temporaries (or partial buffers on error) from MLX's free pool.
+        crate::array::clear_cache();
         out
     }
 
@@ -700,7 +814,10 @@ impl Resident {
             .collect::<Result<Vec<_>>>()
             .and_then(|m| r.check_all(Role::Mtp).map(|()| m));
         let mtp = match mtp {
-            Ok(m) => m,
+            Ok(m) => {
+                crate::array::clear_cache();
+                m
+            }
             Err(e) => {
                 crate::array::clear_cache();
                 return Err(e);

@@ -566,3 +566,218 @@ fn real_hasher_matches_the_oracle() {
     }
     check_hasher(&Hasher::new(&cfg).unwrap(), &want);
 }
+
+#[test]
+fn fast_rope_and_partial_rope_tail_match_apply_partial_rope() {
+    use crate::models::deepseek_v41::ops::{apply_partial_rope, inv_freqs, rope_tables};
+
+    let rd = 64usize;
+    let theta = 10_000.0f32;
+    let inv = inv_freqs(rd, theta, None);
+    let freqs = rope_inv_freqs(&inv).unwrap();
+
+    let det = |seed: usize, len: usize| -> Vec<f32> {
+        (0..len)
+            .map(|i| (((i * 37 + seed * 13) % 101) as f32 - 50.0) / 17.0)
+            .collect()
+    };
+
+    let cases: &[(&str, Vec<u64>)] = &[
+        ("contiguous_0", (0..6).collect()),
+        ("contiguous_off", (13..19).collect()),
+        ("strided_kpool4", (0..6).map(|g| g * 4).collect()),
+        ("multi_owner_wave", vec![9, 14, 15, 20]),
+        ("large_pos_single", vec![262_144]),
+        ("large_pos_contig", vec![262_144, 262_145]),
+        ("large_pos_strided", vec![0, 262_140, 262_144]),
+    ];
+
+    for (name, pos) in cases {
+        let n = pos.len() as i64;
+        let (cos, sin) = rope_tables(&inv, pos).unwrap();
+
+        // 2-D [n, rd]
+        let x2 = MxArray::from_float32(&det(1, pos.len() * rd), &[n, rd as i64]).unwrap();
+        let got2 = read(&fast_rope(&x2, &freqs, pos).unwrap());
+        let want2 = read(&apply_partial_rope(&x2, rd as i64, &cos, &sin, false).unwrap());
+        for (i, (&g, &w)) in got2.iter().zip(&want2).enumerate() {
+            let err = (g - w).abs();
+            let tol = 1e-5 + 1e-5 * w.abs();
+            assert!(err <= tol, "{name} 2-D[{i}]: {g} vs {w} (err {err:e})");
+        }
+
+        // Row-invariance on 2-D: each row alone matches its slice in the multi-row call bit-for-bit.
+        for (r, &p) in pos.iter().enumerate() {
+            let row_in = x2
+                .slice(&[r as i64, 0], &[r as i64 + 1, rd as i64])
+                .unwrap();
+            let single = read(&fast_rope(&row_in, &freqs, &[p]).unwrap());
+            let slice = &got2[r * rd..(r + 1) * rd];
+            let sb: Vec<u32> = single.iter().map(|v| v.to_bits()).collect();
+            let mb: Vec<u32> = slice.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(sb, mb, "{name} 2-D row {r} invariance");
+        }
+
+        // 3-D [n, H, rd]
+        let h = 4usize;
+        let x3 =
+            MxArray::from_float32(&det(2, pos.len() * h * rd), &[n, h as i64, rd as i64]).unwrap();
+        let got3 = read(&fast_rope(&x3, &freqs, pos).unwrap());
+        let want3 = read(&apply_partial_rope(&x3, rd as i64, &cos, &sin, false).unwrap());
+        for (i, (&g, &w)) in got3.iter().zip(&want3).enumerate() {
+            let err = (g - w).abs();
+            let tol = 1e-5 + 1e-5 * w.abs();
+            assert!(err <= tol, "{name} 3-D[{i}]: {g} vs {w} (err {err:e})");
+        }
+
+        // Row-invariance on 3-D
+        for (r, &p) in pos.iter().enumerate() {
+            let row_in = x3
+                .slice(&[r as i64, 0, 0], &[r as i64 + 1, h as i64, rd as i64])
+                .unwrap();
+            let single = read(&fast_rope(&row_in, &freqs, &[p]).unwrap());
+            let slice = &got3[r * h * rd..(r + 1) * h * rd];
+            let sb: Vec<u32> = single.iter().map(|v| v.to_bits()).collect();
+            let mb: Vec<u32> = slice.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(sb, mb, "{name} 3-D row {r} invariance");
+        }
+
+        // Partial tail on [n, 128] and [n, H, 128] (head 64 untouched, tail 64 rotated)
+        let d = 128usize;
+        let xt2 = MxArray::from_float32(&det(3, pos.len() * d), &[n, d as i64]).unwrap();
+        let got_t2 = read(&fast_partial_rope_tail(&xt2, &freqs, pos).unwrap());
+        let want_t2 = read(&apply_partial_rope(&xt2, rd as i64, &cos, &sin, false).unwrap());
+        for (i, (&g, &w)) in got_t2.iter().zip(&want_t2).enumerate() {
+            let err = (g - w).abs();
+            let tol = 1e-5 + 1e-5 * w.abs();
+            assert!(err <= tol, "{name} tail 2-D[{i}]: {g} vs {w} (err {err:e})");
+        }
+
+        let xt3 =
+            MxArray::from_float32(&det(4, pos.len() * h * d), &[n, h as i64, d as i64]).unwrap();
+        let got_t3 = read(&fast_partial_rope_tail(&xt3, &freqs, pos).unwrap());
+        let want_t3 = read(&apply_partial_rope(&xt3, rd as i64, &cos, &sin, false).unwrap());
+        for (i, (&g, &w)) in got_t3.iter().zip(&want_t3).enumerate() {
+            let err = (g - w).abs();
+            let tol = 1e-5 + 1e-5 * w.abs();
+            assert!(err <= tol, "{name} tail 3-D[{i}]: {g} vs {w} (err {err:e})");
+        }
+    }
+
+    // Overflowing u64 position is rejected cleanly
+    let x1 = MxArray::from_float32(&vec![1.0; rd], &[1, rd as i64]).unwrap();
+    assert!(fast_rope(&x1, &freqs, &[u64::from(u32::MAX)]).is_err());
+}
+
+#[test]
+fn rms_norm_and_unweighted_match_oracle() {
+    let eps = 1e-5f32;
+    let (rows, dim) = (5usize, 64usize);
+    let xv: Vec<f32> = (0..rows * dim)
+        .map(|i| ((i * 29 % 97) as f32 - 48.0) / 13.0)
+        .collect();
+    let wv: Vec<f32> = (0..dim).map(|i| 0.7 + (i as f32) * 0.02).collect();
+
+    let x = MxArray::from_float32(&xv, &[rows as i64, dim as i64]).unwrap();
+    let w = MxArray::from_float32(&wv, &[dim as i64]).unwrap();
+
+    let mut want_unw = Vec::with_capacity(rows * dim);
+    let mut want_w = Vec::with_capacity(rows * dim);
+    for r in 0..rows {
+        let row = &xv[r * dim..(r + 1) * dim];
+        let mean_sq = row
+            .iter()
+            .map(|&v| f64::from(v) * f64::from(v))
+            .sum::<f64>()
+            / dim as f64;
+        let inv = 1.0 / (mean_sq + f64::from(eps)).sqrt();
+        for (c, &v) in row.iter().enumerate() {
+            let u = f64::from(v) * inv;
+            want_unw.push(u);
+            want_w.push(u * f64::from(wv[c]));
+        }
+    }
+
+    let got_w = rms_norm(&x, &w, eps).unwrap();
+    assert_eq!(got_w.dtype().unwrap(), DType::Float32);
+    assert_close(&read(&got_w), &want_w, "rms_norm f32");
+
+    let got_unw = rms_norm_unweighted(&x, eps).unwrap();
+    assert_eq!(got_unw.dtype().unwrap(), DType::Float32);
+    assert_close(&read(&got_unw), &want_unw, "rms_norm_unweighted f32");
+
+    // Dtype round-trip (bf16 -> f32 -> bf16)
+    let xb = x.astype(DType::BFloat16).unwrap();
+    let wb = w.astype(DType::BFloat16).unwrap();
+    assert_eq!(
+        rms_norm(&xb, &wb, eps).unwrap().dtype().unwrap(),
+        DType::BFloat16
+    );
+    assert_eq!(
+        rms_norm_unweighted(&xb, eps).unwrap().dtype().unwrap(),
+        DType::BFloat16
+    );
+
+    // 2-D weight is rejected
+    let w2 = MxArray::from_float32(&vec![1.0; 2 * dim], &[2, dim as i64]).unwrap();
+    assert!(rms_norm(&x, &w2, eps).is_err());
+}
+
+#[test]
+fn swiglu_clamped_compiled_matches_asymmetric_clamp() {
+    let limit = 7.0f32;
+    // Covers g > L, g < -L (must NOT be lower-clamped!), |g| <= L, |u| > L, |u| <= L.
+    let gs = [-20.0f32, -8.5, -7.0, -2.0, 0.0, 2.5, 7.0, 9.5, 25.0];
+    let us = [-15.0f32, -7.5, -7.0, -3.0, 0.0, 3.0, 7.0, 8.0, 18.0];
+    let mut g_all = Vec::new();
+    let mut u_all = Vec::new();
+    for &g in &gs {
+        for &u in &us {
+            g_all.push(g);
+            u_all.push(u);
+        }
+    }
+    let n = g_all.len() as i64;
+    let ga = MxArray::from_float32(&g_all, &[1, n]).unwrap();
+    let ua = MxArray::from_float32(&u_all, &[1, n]).unwrap();
+
+    let got = read(&Activations::swiglu_clamped_compiled(&ga, &ua, limit).unwrap());
+    let want: Vec<f64> = g_all
+        .iter()
+        .zip(&u_all)
+        .map(|(&g, &u)| {
+            let gc = f64::from(g.min(limit));
+            let uc = f64::from(u.clamp(-limit, limit));
+            (1.0 / (1.0 + (-gc).exp())) * gc * uc
+        })
+        .collect();
+    assert_close(&got, &want, "swiglu_clamped_compiled");
+
+    // Verify g < -L is NOT lower-clamped: compare against a deliberately wrong symmetric clamp
+    // at g = -20, u = 3 (silu(-20)*3 ≈ -1.2e-7 vs silu(-7)*3 ≈ -0.019).
+    let neg_g = MxArray::from_float32(&[-20.0], &[1]).unwrap();
+    let pos_u = MxArray::from_float32(&[3.0], &[1]).unwrap();
+    let val = read(&Activations::swiglu_clamped_compiled(&neg_g, &pos_u, limit).unwrap())[0];
+    assert!(
+        val.abs() < 1e-4,
+        "g = -20 must not be lower-clamped to -7 (got {val})"
+    );
+
+    // limit <= 0 falls back to unclamped swiglu_compiled bit-for-bit
+    let unclamped = read(&Activations::swiglu_compiled(&ga, &ua).unwrap());
+    for l in [0.0f32, -1.0f32] {
+        let g0 = read(&Activations::swiglu_clamped_compiled(&ga, &ua, l).unwrap());
+        let b0: Vec<u32> = g0.iter().map(|v| v.to_bits()).collect();
+        let bu: Vec<u32> = unclamped.iter().map(|v| v.to_bits()).collect();
+        assert_eq!(b0, bu, "limit={l} must equal unclamped");
+    }
+
+    // Shapeless compile handles different shapes and preserves dtype
+    for dt in [DType::Float32, DType::Float16, DType::BFloat16] {
+        let g3 = ga.reshape(&[9, 9]).unwrap().astype(dt).unwrap();
+        let u3 = ua.reshape(&[9, 9]).unwrap().astype(dt).unwrap();
+        let out = Activations::swiglu_clamped_compiled(&g3, &u3, limit).unwrap();
+        assert_eq!(out.dtype().unwrap(), dt);
+        assert_eq!(shape(&out), [9, 9]);
+    }
+}

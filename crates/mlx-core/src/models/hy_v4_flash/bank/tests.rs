@@ -921,6 +921,199 @@ fn lfu_directory_keeps_frequent_expert_over_recent_one_hit() {
     d.cache().check().unwrap();
 }
 
+#[test]
+fn split_step_publish_abandon_and_drop_on_error() {
+    let (_dir, path, m, experts, file) = bank_fixture();
+    let bank = KqBank::new(pool_over(&path, 4), &m, &experts, [4, 2], 1).unwrap();
+    assert!(bank.split());
+    assert!(bank.prefetch());
+
+    // Pre-fill expert 1 into cache.
+    let warm = bank.prepare(1, &[1], &[], true).unwrap();
+    bank.assert_slots(&warm);
+    bank.settle_all();
+
+    // Mixed hit (1) + miss (3) in prepare_split.
+    let (p, pending) = bank.prepare_split(1, &[1, 3], &[], true).unwrap();
+    assert!(!p.is_reading(1));
+    assert!(p.is_reading(3));
+    assert_eq!(p.reading, vec![3]);
+    bank.assert_ready_slots(&p);
+    let pending = pending.expect("miss expert 3 must return Pending");
+    bank.note_split(1, true);
+    pending.finish().unwrap();
+    bank.assert_slots(&p);
+    check_prepared(&file, &m, experts[1].as_ref().unwrap(), &p);
+    bank.settle_all();
+    assert_eq!(bank.stats()[0].split_steps, 1);
+    assert_eq!(bank.stats()[0].split_mixed, 1);
+    assert!(bank.stats()[0].wait_ns > 0);
+    bank.test_check_caches();
+
+    // Dropping Pending without finish waits for reads and releases victims.
+    let occ_before = lock(&bank.inner).classes[0].dir.cache().occupied();
+    let (p_drop, pending_drop) = bank.prepare_split(1, &[4, 5], &[], true).unwrap();
+    assert_eq!(p_drop.reading, vec![4, 5]);
+    assert!(pending_drop.is_some());
+    drop(pending_drop);
+    assert_eq!(bank.reads_in_flight(), 0);
+    assert_eq!(
+        lock(&bank.inner).classes[0].dir.cache().occupied(),
+        occ_before
+    );
+    bank.test_check_caches();
+    bank.settle_all();
+
+    // Truncate file to trigger a real read failure on Pending::finish.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(1024)
+        .unwrap();
+    let (_p_err, pending_err) = bank.prepare_split(1, &[2, 4], &[], true).unwrap();
+    assert!(pending_err.unwrap().finish().is_err());
+    assert_eq!(
+        lock(&bank.inner).classes[0].dir.cache().occupied(),
+        occ_before
+    );
+    bank.test_check_caches();
+    bank.end_turn().unwrap();
+}
+
+#[test]
+fn two_class_interleaved_read_ahead() {
+    let (_dir, path, m, experts, file) = bank_fixture();
+    // 1 staging layer: prefetch is a no-op.
+    let single = KqBank::new(pool_over(&path, 4), &m, &experts, [0, 0], 1).unwrap();
+    assert_eq!(single.prefetch_layer(1, &[0, 2]).unwrap(), 0);
+    single.end_turn().unwrap();
+
+    // 2 staging layers: class 0 has global layers 1 (local 0) and 3 (local 1),
+    // class 1 has global layer 2 (local 0).
+    let bank = KqBank::new(pool_over(&path, 4), &m, &experts, [0, 0], 2).unwrap();
+    bank.set_prefetch(false);
+    assert_eq!(bank.prefetch_layer(1, &[0, 2]).unwrap(), 0);
+    bank.set_prefetch(true);
+
+    // Queue prefetch for layer 1 (class 0 local 0) and layer 2 (class 1 local 0).
+    assert_eq!(bank.prefetch_layer(1, &[0, 2, 5]).unwrap(), 3);
+    assert_eq!(bank.prefetch_layer(2, &[1, 4]).unwrap(), 2);
+
+    // Layer 1 uses [0, 2] (5 unused); settles class 0 local 0 while keeping class 1 local 0 alive.
+    let p1 = bank.prepare(1, &[0, 2], &[1, 1], false).unwrap();
+    bank.assert_slots(&p1);
+    check_prepared(&file, &m, experts[1].as_ref().unwrap(), &p1);
+    bank.end_layer(1);
+    bank.settle_all();
+    assert_eq!(bank.stats()[0].prefetch_slots, 3);
+    assert_eq!(bank.stats()[0].prefetch_unused, 1);
+
+    // Queue prefetch for layer 3 (class 0 local 1) into the other staging half of class 0.
+    assert_eq!(bank.prefetch_layer(3, &[0, 3]).unwrap(), 2);
+
+    // Layer 2 uses [1, 4] (all prefetched); must not disturb class 0's in-flight prefetch.
+    let slots_before_l2 = bank.stats()[1].slots;
+    let p2 = bank.prepare(2, &[1, 4], &[1, 1], false).unwrap();
+    bank.assert_slots(&p2);
+    check_prepared(&file, &m, experts[2].as_ref().unwrap(), &p2);
+    bank.end_layer(2);
+    bank.settle_all();
+    // Layer 2's 2 experts came from prefetch (no duplicate reads).
+    assert_eq!(bank.stats()[1].slots - slots_before_l2, 2);
+    assert_eq!(bank.stats()[1].prefetch_slots, 2);
+    assert_eq!(bank.stats()[1].prefetch_unused, 0);
+
+    // Layer 3 uses [0, 3, 4]: 0 and 3 were prefetched, only 4 reads now.
+    let p3 = bank.prepare(3, &[0, 3, 4], &[1, 1, 1], false).unwrap();
+    bank.assert_slots(&p3);
+    check_prepared(&file, &m, experts[3].as_ref().unwrap(), &p3);
+    bank.end_layer(3);
+    bank.settle_all();
+    assert_eq!(bank.stats()[0].prefetch_slots, 5);
+    assert_eq!(bank.stats()[0].prefetch_unused, 1);
+    assert_eq!(bank.stats()[0].slots, 6);
+    bank.test_check_caches();
+    bank.end_turn().unwrap();
+}
+
+#[test]
+fn prefill_subgroups_last_use_order_and_drop_on_error() {
+    let (_dir, path, m, experts, file) = bank_fixture();
+    // Class 0 has 2 layers (1, 3), 4 cache slots -> quota 2/layer.
+    let bank = KqBank::new(pool_over(&path, 4), &m, &experts, [4, 0], 1).unwrap();
+
+    // Warm expert 1 in cache so group_0 is non-empty.
+    let warm = bank.prepare(1, &[1], &[], true).unwrap();
+    bank.assert_slots(&warm);
+    bank.settle_all();
+
+    let used = [0u32, 1, 2, 3, 4, 5];
+    let uses = [1u32, 1, 5, 4, 2, 3];
+    let last_use = [5u32, 1, 3, 0, 4, 2];
+    let (p, group_0, mut sg) = bank
+        .plan_prefill_subgroups(1, &used, &uses, &last_use, 2)
+        .unwrap();
+    assert_eq!(group_0, vec![1]);
+    bank.assert_ready_slots(&p);
+
+    let mut got_order = Vec::new();
+    let mut batches = Vec::new();
+    while let Some(batch) = sg.next_subgroup().unwrap() {
+        bank.assert_experts_slots(&p, &batch);
+        batches.push(batch.clone());
+        got_order.extend(batch);
+    }
+    assert_eq!(got_order, vec![5, 3, 0, 4, 2]);
+    assert_eq!(batches, vec![vec![5, 3], vec![0, 4], vec![2]]);
+    bank.assert_slots(&p);
+    check_prepared(&file, &m, experts[1].as_ref().unwrap(), &p);
+    bank.settle_all();
+    bank.test_check_caches();
+
+    // Early drop on layer 3 (quota 2 victims across subgroups): dropping before
+    // draining must wait for active IO and release every uncommitted victim.
+    let occ_before = lock(&bank.inner).classes[0].dir.cache().occupied();
+    {
+        let (_p2, g0, _sg_drop) = bank
+            .plan_prefill_subgroups(
+                3,
+                &[0, 1, 2, 3, 4, 5],
+                &[6, 5, 4, 3, 2, 1],
+                &[5, 4, 3, 2, 1, 0],
+                2,
+            )
+            .unwrap();
+        assert!(g0.is_empty());
+    }
+    assert_eq!(bank.reads_in_flight(), 0);
+    assert_eq!(
+        lock(&bank.inner).classes[0].dir.cache().occupied(),
+        occ_before
+    );
+    bank.test_check_caches();
+    bank.settle_all();
+
+    // Truncated file triggers an IO error inside next_subgroup and releases all victims.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(1024)
+        .unwrap();
+    let (_p3, _g0, mut sg_err) = bank
+        .plan_prefill_subgroups(3, &[0, 1, 2, 3], &[4, 3, 2, 1], &[3, 2, 1, 0], 2)
+        .unwrap();
+    assert!(sg_err.next_subgroup().is_err());
+    drop(sg_err);
+    assert_eq!(
+        lock(&bank.inner).classes[0].dir.cache().occupied(),
+        occ_before
+    );
+    bank.test_check_caches();
+    bank.end_turn().unwrap();
+}
+
 fn real_scan() -> Scan {
     let dir = std::env::var("HY4_DIR").expect("HY4_DIR = directory of the two Hy4 shards");
     let paths = crate::models::deepseek_v41::chat::shard_paths(Path::new(&dir)).unwrap();

@@ -13,6 +13,11 @@ fn class(fills: usize, slots: usize, uses: usize, hits: usize) -> KqStats {
         promoted: hits / 2,
         promote_ns: 7,
         drains: 0,
+        wait_ns: slots as u64 * 400,
+        split_steps: fills,
+        split_mixed: fills / 2,
+        prefetch_slots: slots / 2,
+        prefetch_unused: slots / 4,
     }
 }
 
@@ -32,6 +37,11 @@ fn counters_sum_the_classes_and_subtract() {
             hits: 32,
             promoted: 16,
             promote_ns: 14,
+            wait_ns: 6_400,
+            split_steps: 5,
+            split_mixed: 2,
+            prefetch_slots: 8,
+            prefetch_unused: 3,
             engram_bytes: 512,
             engram_ns: 9,
             staging_layers: 2,
@@ -45,10 +55,15 @@ fn counters_sum_the_classes_and_subtract() {
             d.fill_slots,
             d.uses,
             d.hits,
+            d.wait_ns,
+            d.split_steps,
+            d.split_mixed,
+            d.prefetch_slots,
+            d.prefetch_unused,
             d.engram_bytes,
             d.engram_ns
         ),
-        (3, 10, 50, 25, 12, 5)
+        (3, 10, 50, 25, 4_000, 3, 2, 5, 2, 12, 5)
     );
     // the staging layers are the current value, not a difference
     assert_eq!(d.staging_layers, 2);
@@ -82,10 +97,15 @@ fn line_fields() {
         fill_slots: 10,
         fill_bytes: 4_000_000_000,
         fill_ns: 1_000_000_000,
+        wait_ns: 250_000_000,
         read_ns: 600_000_000,
         repack_ns: 300_000_000,
         uses: 40,
         hits: 30,
+        split_steps: 7,
+        split_mixed: 4,
+        prefetch_slots: 6,
+        prefetch_unused: 0,
         engram_bytes: 1_000,
         engram_ns: 500_000_000,
         staging_layers: 2,
@@ -105,9 +125,14 @@ fn line_fields() {
     close("read_gbps", 4.0);
     close("t_c_ms", (4.0 - 1.0 - 0.5) * 1e3 / 5.0);
     close("t_io_ms", 200.0);
+    close("t_io_wait_ms", 50.0);
     close("t_read_ms", 120.0);
     close("t_repack_ms", 60.0);
     close("t_engram_ms", 100.0);
+    assert_eq!(v["split_steps"], 7);
+    assert_eq!(v["split_mixed"], 4);
+    assert_eq!(v["prefetch_slots"], 6);
+    assert_eq!(v["prefetch_unused"], 0);
     assert_eq!(v["bytes_read_total"], 4_000_001_000u64);
     assert_eq!(v["cache_slots"], 410);
     assert_eq!(v["cache_slots_by_class"], json!([190, 220]));

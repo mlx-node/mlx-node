@@ -41,7 +41,7 @@ use super::config::{Attn, HyV4FlashConfig};
 use super::model::Model;
 use super::moe::ExpertSource;
 use super::mtp::SEEDS;
-use super::rows::{EngramRows, F8Table};
+use super::rows::{EngramRows, F8Table, PrefetchHandle};
 use super::scan::{Role, Scan};
 use super::weights::{Form, Resident, form, resident_bytes, role_resident};
 use crate::cache_limit::{CacheLimitGuard, coordinator};
@@ -258,7 +258,8 @@ pub fn splitk_min_m(raw: Option<&str>) -> Option<usize> {
 
 /// `(inputs, outputs)` of every matrix the model runs through
 /// `quantized_matmul`: Q8_0 held as `Dense::Qmm` (a rank-3 tensor per head
-/// group), and with `mtp` the MTP layer's BF16 matrices, held the same way.
+/// group), their load-time row-fused projections, and with `mtp` the MTP
+/// layer's BF16 matrices, held the same way.
 pub fn q8_shapes(scan: &Scan, mtp: bool) -> Result<Vec<(usize, usize)>> {
     let mut shapes = Vec::new();
     for (role, held) in [(Role::Dense, Form::Qmm), (Role::Mtp, Form::Bf16)] {
@@ -272,6 +273,71 @@ pub fn q8_shapes(scan: &Scan, mtp: bool) -> Result<Vec<(usize, usize)>> {
                 shapes.push((k as usize, n as usize));
             }
         }
+    }
+    let qmm_2d = |role: Role, held: Form, name: &str| -> Result<Option<(usize, usize)>> {
+        let Some(entry) = scan.tensors.get(name) else {
+            return Ok(None);
+        };
+        if entry.role != role {
+            return Ok(None);
+        }
+        if let [k, n] = entry.loc.info.dims[..]
+            && form(role, &entry.loc.info)? == held
+        {
+            return Ok(Some((k as usize, n as usize)));
+        }
+        Ok(None)
+    };
+    let push_fused = |shapes: &mut Vec<(usize, usize)>,
+                      role: Role,
+                      held: Form,
+                      il: usize,
+                      names: &[&str]|
+     -> Result<()> {
+        let mut k_common = None;
+        let mut n_sum = 0usize;
+        for s in names {
+            let name = format!("blk.{il}.{s}.weight");
+            let Some((k, n)) = qmm_2d(role, held, &name)? else {
+                return Ok(());
+            };
+            match k_common {
+                None => k_common = Some(k),
+                Some(prev) if prev != k => return Ok(()),
+                _ => {}
+            }
+            n_sum += n;
+        }
+        if let Some(k) = k_common {
+            shapes.push((k, n_sum));
+        }
+        Ok(())
+    };
+    for il in 0..scan.cfg.layers.len() {
+        if il >= scan.cfg.n_layers && !mtp {
+            continue;
+        }
+        let (role, held) = if il < scan.cfg.n_layers {
+            (Role::Dense, Form::Qmm)
+        } else {
+            (Role::Mtp, Form::Bf16)
+        };
+        push_fused(&mut shapes, role, held, il, &["attn_q_a", "attn_kv_a_mqa"])?;
+        push_fused(
+            &mut shapes,
+            role,
+            held,
+            il,
+            &["attn_q_a", "attn_kv_a_mqa", "attn_gate"],
+        )?;
+        push_fused(
+            &mut shapes,
+            role,
+            held,
+            il,
+            &["ffn_routed_down", "ffn_gate_shexp", "ffn_up_shexp"],
+        )?;
+        push_fused(&mut shapes, role, held, il, &["ffn_gate", "ffn_up"])?;
     }
     shapes.sort_unstable();
     shapes.dedup();
@@ -949,6 +1015,14 @@ struct TableRows(Arc<F8Table>);
 impl EngramRows for TableRows {
     fn rows(&self, layer: usize, ids: &[u32]) -> Result<Vec<f32>> {
         self.0.rows(layer, ids)
+    }
+
+    fn prefetch(&self, layer: usize, ids: &[u32]) -> Result<Option<PrefetchHandle>> {
+        self.0.prefetch(layer, ids)
+    }
+
+    fn take_prefetched(&self, handle: PrefetchHandle) -> Result<Vec<f32>> {
+        self.0.take_prefetched(handle)
     }
 }
 

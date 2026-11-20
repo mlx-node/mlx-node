@@ -38,16 +38,60 @@ use napi::{Error, Result};
 use super::bank::{KqBank, Prepared};
 use super::batch::{Group, MIN_Q8_ROWS, Op, group};
 use super::config::{HyV4FlashConfig, MoeConfig};
-use super::ops::{route, router_scores};
+use super::ops::{rms_norm, route, router_scores};
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{Ffn, LayerWeights, MoeWeights};
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::attention::{linear, rms_norm};
-use crate::models::deepseek_v41::ops::swiglu;
+use crate::models::deepseek_v41::attention::linear;
 use crate::models::deepseek_v41::store::Dense;
+use crate::nn::Activations;
 
 /// FFN rows per chunk: the routed scratch is `rows x k x (2 ff + latent)`.
 pub const FFN_CHUNK_ROWS: usize = 256;
+pub const PREFILL_FFN_CHUNK_ROWS: usize = 2048;
+const PREFILL_SUBGROUP_EXPERTS: usize = 128;
+
+pub fn prefill_ffn_chunk_rows() -> usize {
+    std::env::var("MLX_HY4_PREFILL_FFN_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.max(FFN_CHUNK_ROWS))
+        .unwrap_or(PREFILL_FFN_CHUNK_ROWS)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SUBGROUP_EXPERTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn prefill_subgroup_experts() -> usize {
+    #[cfg(test)]
+    {
+        let n = TEST_SUBGROUP_EXPERTS.with(std::cell::Cell::get);
+        if n > 0 {
+            return n;
+        }
+    }
+    PREFILL_SUBGROUP_EXPERTS
+}
+
+/// Active experts ordered ascending by their last assignment index so
+/// prompt-end experts finish newest in cache and staging.
+pub(crate) fn expert_order_last_use(ids: &[u32], n_experts: usize) -> Vec<u32> {
+    let mut last = vec![usize::MAX; n_experts];
+    for (pos, &e) in ids.iter().enumerate() {
+        if let Some(slot) = last.get_mut(e as usize) {
+            *slot = pos;
+        }
+    }
+    let mut order: Vec<u32> = last
+        .iter()
+        .enumerate()
+        .filter_map(|(e, &pos)| (pos != usize::MAX).then_some(e as u32))
+        .collect();
+    order.sort_unstable_by_key(|&e| last[e as usize]);
+    order
+}
 
 fn bad(msg: impl std::fmt::Display) -> Error {
     Error::from_reason(format!("Hy4 FFN: {msg}"))
@@ -384,10 +428,26 @@ fn want2(w: &Dense, rows: usize, cols: usize, what: &str) -> Result<()> {
 }
 
 /// `down(silu(gate·x)·(up·x))` in f32, no clamp.
-fn mlp(x: &MxArray, gate: &Dense, up: &Dense, down: &Dense) -> Result<MxArray> {
-    let g = qlinear(x, gate)?;
-    let u = qlinear(x, up)?;
-    qlinear(&swiglu(&g, &u, 0.0, None, DType::Float32)?, down)
+fn mlp(
+    x: &MxArray,
+    gate: &Dense,
+    up: &Dense,
+    down: &Dense,
+    gate_up: Option<&Dense>,
+) -> Result<MxArray> {
+    let (g, u) = match gate_up {
+        Some(fused) => {
+            let n = x.shape_at(0)?;
+            let ff = gate.shape_at(0)?;
+            let all = qlinear(x, fused)?;
+            (
+                all.slice(&[0, 0], &[n, ff])?,
+                all.slice(&[0, ff], &[n, 2 * ff])?,
+            )
+        }
+        None => (qlinear(x, gate)?, qlinear(x, up)?),
+    };
+    qlinear(&Activations::swiglu_compiled(&g, &u)?, down)
 }
 
 struct Moe {
@@ -404,13 +464,16 @@ impl Moe {
         want2(&w.router, n, c.dim, "ffn_gate_inp")?;
         want2(&w.routed_down, m.latent, c.dim, "ffn_routed_down")?;
         want2(&w.routed_up, c.dim, m.latent, "ffn_routed_up")?;
-        check_mlp(
+        let sff = check_mlp(
             &w.shared_gate,
             &w.shared_up,
             &w.shared_down,
             c.dim,
             "shared expert",
         )?;
+        if let Some(fused) = &w.down_shared_gu {
+            want2(fused, m.latent + 2 * sff, c.dim, "ffn_down_shared_gu")?;
+        }
         let bias = match &w.router_bias {
             None => None,
             Some(b) => {
@@ -451,6 +514,60 @@ impl Moe {
         })
     }
 
+    fn down_and_shared_gu(
+        &self,
+        w: &MoeWeights,
+        x: &MxArray,
+    ) -> Result<(MxArray, Option<(MxArray, MxArray)>)> {
+        match &w.down_shared_gu {
+            Some(fused) => {
+                let tp = prof_start();
+                let n = x.shape_at(0)?;
+                let lat = w.routed_down.shape_at(0)?;
+                let sff = w.shared_gate.shape_at(0)?;
+                let all = qlinear(x, fused)?;
+                let z = all.slice(&[0, 0], &[n, lat])?;
+                let sg = all.slice(&[0, lat], &[n, lat + sff])?;
+                let su = all.slice(&[0, lat + sff], &[n, lat + 2 * sff])?;
+                prof_end(Phase::Routed, tp, &[&z, &sg, &su])?;
+                Ok((z, Some((sg, su))))
+            }
+            None => {
+                let tp = prof_start();
+                let z = qlinear(x, &w.routed_down)?;
+                prof_end(Phase::Routed, tp, &[&z])?;
+                Ok((z, None))
+            }
+        }
+    }
+
+    fn prefetch_from(&self, layer: usize, w: &MoeWeights, x: &MxArray) -> Result<usize> {
+        let ExpertSource::Bank(bank) = &self.experts else {
+            return Ok(0);
+        };
+        if !bank.prefetch() || bank.staging_layers() < 2 {
+            return Ok(0);
+        }
+        let (rows, dim) = (x.shape_at(0)? as usize, x.shape_at(1)?);
+        let mut seen = vec![false; self.moe.n_experts];
+        for (lo, hi) in chunks(rows, FFN_CHUNK_ROWS) {
+            let xc = if lo == 0 && hi == rows {
+                x.clone()
+            } else {
+                x.slice(&[lo as i64, 0], &[hi as i64, dim])?
+            };
+            let scores = router_scores(&xc, &w.router)?;
+            let (ids, _) = route(&scores, self.bias.as_deref(), &self.moe)?;
+            for e in ids {
+                seen[e as usize] = true;
+            }
+        }
+        let want: Vec<u32> = (0..self.moe.n_experts as u32)
+            .filter(|&e| seen[e as usize])
+            .collect();
+        bank.prefetch_layer(layer, &want)
+    }
+
     /// `x [rows, dim]` f32 (after `ffn_norm`) -> the FFN output before
     /// `post_ffw_norm`, and the routes.
     fn forward(
@@ -483,17 +600,164 @@ impl Moe {
             ids,
             weights,
         };
-        let tp = prof_start();
-        let z = qlinear(x, &w.routed_down)?;
-        prof_end(Phase::Routed, tp, &[&z])?;
+        if kind.is_decode()
+            && let ExpertSource::Bank(bank) = &self.experts
+            && bank.split()
+        {
+            let f = self.forward_split(layer, w, x, &routes, bank)?;
+            return Ok((f, routes));
+        }
+        let (z, shared_gu) = self.down_and_shared_gu(w, x)?;
         let r = self.routed(layer, &z, &routes, kind)?;
         let tp = prof_start();
         let up = qlinear(&r, &w.routed_up)?;
         prof_end(Phase::Routed, tp, &[&up])?;
         let tp = prof_start();
-        let f = up.add(&mlp(x, &w.shared_gate, &w.shared_up, &w.shared_down)?)?;
+        let shared = match shared_gu {
+            Some((sg, su)) => qlinear(&Activations::swiglu_compiled(&sg, &su)?, &w.shared_down)?,
+            None => mlp(x, &w.shared_gate, &w.shared_up, &w.shared_down, None)?,
+        };
+        let f = up.add(&shared)?;
         prof_end(Phase::Shared, tp, &[&f])?;
         Ok((f, routes))
+    }
+
+    fn forward_split(
+        &self,
+        layer: usize,
+        w: &MoeWeights,
+        x: &MxArray,
+        routes: &Routes,
+        bank: &KqBank,
+    ) -> Result<MxArray> {
+        let rows = x.shape_at(0)?;
+        let k = self.moe.n_used;
+        let n = self.moe.n_experts as u32;
+        if routes.k != k
+            || routes.ids.len() != routes.weights.len()
+            || routes.ids.len() != routes.rows() * routes.k
+            || routes.rows() as i64 != rows
+            || routes.ids.iter().any(|&e| e >= n)
+        {
+            return Err(bad(format!(
+                "routes for {} rows x {} do not fit {rows} rows x {k}",
+                routes.rows(),
+                routes.k
+            )));
+        }
+        let (ids_asc, w_asc) = routes.by_expert();
+        let (used, uses) = distinct_uses(&ids_asc);
+        let tp = prof_start();
+        let (p, pending) = bank.prepare_split(layer, &used, &uses, true)?;
+        prof_end(Phase::Fill, tp, &[])?;
+
+        let (z, shared_gu) = self.down_and_shared_gu(w, x)?;
+        let tp_sh = prof_start();
+        let shared = match shared_gu {
+            Some((sg, su)) => qlinear(&Activations::swiglu_compiled(&sg, &su)?, &w.shared_down)?,
+            None => mlp(x, &w.shared_gate, &w.shared_up, &w.shared_down, None)?,
+        };
+        prof_end(Phase::Shared, tp_sh, &[&shared])?;
+
+        let latent = z.shape_at(1)?;
+        let pairs = (rows as usize) * k;
+        let (ready, late): (Vec<usize>, Vec<usize>) =
+            (0..pairs).partition(|&idx| !p.is_reading(ids_asc[idx]));
+
+        let pass = |sub: &[usize]| -> Result<Option<MxArray>> {
+            if sub.is_empty() {
+                return Ok(None);
+            }
+            let m = sub.len() as i64;
+            let slot_ids = sub
+                .iter()
+                .map(|&idx| {
+                    p.slot(ids_asc[idx])
+                        .ok_or_else(|| bad(format!("expert {} not prepared", ids_asc[idx])))
+                })
+                .collect::<Result<Vec<u32>>>()?;
+            let ws: Vec<f32> = sub.iter().map(|&idx| w_asc[idx]).collect();
+            let (ze, sid, sw) = if rows == 1 {
+                (
+                    z.reshape(&[1, 1, 1, latent])?,
+                    MxArray::from_uint32(&slot_ids, &[1, m])?,
+                    MxArray::from_float32(&ws, &[1, m, 1, 1])?,
+                )
+            } else {
+                let row_ids: Vec<u32> = sub.iter().map(|&idx| (idx / k) as u32).collect();
+                (
+                    z.take(&MxArray::from_uint32(&row_ids, &[m])?, 0)?
+                        .reshape(&[m, 1, 1, latent])?,
+                    MxArray::from_uint32(&slot_ids, &[m, 1])?,
+                    MxArray::from_float32(&ws, &[m, 1, 1, 1])?,
+                )
+            };
+            let g = p.arrays[0].gather(&ze, &sid)?;
+            let u = p.arrays[1].gather(&ze, &sid)?;
+            let g = if g.dtype()? == DType::Float32 {
+                g
+            } else {
+                g.astype(DType::Float32)?
+            };
+            let u = if u.dtype()? == DType::Float32 {
+                u
+            } else {
+                u.astype(DType::Float32)?
+            };
+            let a = Activations::swiglu_clamped_compiled(&g, &u, self.limit)?;
+            let d = p.arrays[2]
+                .gather(&a, &sid)?
+                .astype(DType::Float32)?
+                .mul(&sw)?
+                .reshape(&[m, latent])?;
+            Ok(Some(d))
+        };
+
+        let tp = prof_start();
+        bank.assert_ready_slots(&p);
+        let out_ready = pass(&ready)?;
+        match &out_ready {
+            Some(r) => prof_end(Phase::Routed, tp, &[r])?,
+            None => prof_end(Phase::Routed, tp, &[])?,
+        }
+
+        if let Some(pending) = pending {
+            let mut first: Vec<&MxArray> = vec![&shared];
+            if let Some(ref r) = out_ready {
+                first.push(r);
+            }
+            MxArray::async_eval_arrays(&first);
+            bank.note_split(layer, out_ready.is_some());
+            let tp = prof_start();
+            pending.finish()?;
+            prof_end(Phase::Fill, tp, &[])?;
+        }
+
+        let tp = prof_start();
+        bank.assert_slots(&p);
+        let out_late = pass(&late)?;
+        let flat = match (out_ready, out_late) {
+            (Some(r), None) => r,
+            (None, Some(l)) => l,
+            (Some(r), Some(l)) => {
+                let mut back = vec![0u32; pairs];
+                for (at, &idx) in ready.iter().chain(&late).enumerate() {
+                    back[idx] = at as u32;
+                }
+                MxArray::concatenate_many(vec![&r, &l], Some(0))?
+                    .take(&MxArray::from_uint32(&back, &[pairs as i64])?, 0)?
+            }
+            (None, None) => return Err(bad("split step produced no routed pairs")),
+        };
+        let r = flat
+            .reshape(&[rows, k as i64, latent])?
+            .sum(Some(&[1]), Some(false))?;
+        let up = qlinear(&r, &w.routed_up)?;
+        prof_end(Phase::Routed, tp, &[&up])?;
+        let tp = prof_start();
+        let f = up.add(&shared)?;
+        prof_end(Phase::Shared, tp, &[&f])?;
+        Ok(f)
     }
 
     /// `z [rows, latent]` -> `Σ w_e · expert_e(z)` `[rows, latent]` f32;
@@ -524,6 +788,11 @@ impl Moe {
             }
             ExpertSource::Bank(bank) => {
                 let (used, uses) = distinct_uses(&ids);
+                let sub = prefill_subgroup_experts();
+                if kind == RowKind::Prefill && used.len() > sub {
+                    return self
+                        .routed_prefill_subgrouped(layer, z, &ids, &w, &used, &uses, bank, sub);
+                }
                 let tp = prof_start();
                 let p = bank.prepare(layer, &used, &uses, kind.is_decode())?;
                 prof_end(Phase::Fill, tp, &[])?;
@@ -534,6 +803,135 @@ impl Moe {
                 Ok(out)
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn routed_prefill_subgrouped(
+        &self,
+        layer: usize,
+        z: &MxArray,
+        ids: &[u32],
+        w: &[f32],
+        used: &[u32],
+        uses: &[u32],
+        bank: &KqBank,
+        subgroup_experts: usize,
+    ) -> Result<MxArray> {
+        let (rows, latent) = (z.shape_at(0)?, z.shape_at(1)?);
+        let k = self.moe.n_used;
+        let pairs = (rows as usize) * k;
+        let last_use = expert_order_last_use(ids, self.moe.n_experts);
+
+        let mut by_expert: Vec<Vec<u32>> = vec![Vec::new(); self.moe.n_experts];
+        for (idx, &e) in ids.iter().enumerate() {
+            by_expert[e as usize].push(idx as u32);
+        }
+
+        let tp = prof_start();
+        let (p, group_0, mut subgroups) =
+            bank.plan_prefill_subgroups(layer, used, uses, &last_use, subgroup_experts)?;
+        prof_end(Phase::Fill, tp, &[])?;
+
+        let mut parts: Vec<MxArray> = Vec::new();
+        let mut back = vec![0u32; pairs];
+        let mut offset = 0u32;
+
+        let mut run_group = |group_experts: &[u32]| -> Result<Option<MxArray>> {
+            if group_experts.is_empty() {
+                return Ok(None);
+            }
+            let mut by_slot: Vec<(u32, u32)> = group_experts
+                .iter()
+                .map(|&e| {
+                    p.slot(e)
+                        .map(|s| (s, e))
+                        .ok_or_else(|| bad(format!("expert {e} not prepared")))
+                })
+                .collect::<Result<_>>()?;
+            by_slot.sort_unstable_by_key(|&(s, _)| s);
+
+            let total: usize = by_slot
+                .iter()
+                .map(|&(_, e)| by_expert[e as usize].len())
+                .sum();
+            if total == 0 {
+                return Ok(None);
+            }
+            let mut row = Vec::with_capacity(total);
+            let mut slot = Vec::with_capacity(total);
+            let mut ws = Vec::with_capacity(total);
+            for (s, e) in by_slot {
+                for &pair_idx in &by_expert[e as usize] {
+                    back[pair_idx as usize] = offset;
+                    offset += 1;
+                    row.push(pair_idx / k as u32);
+                    slot.push(s);
+                    ws.push(w[pair_idx as usize]);
+                }
+            }
+            let m = total as i64;
+            let x = z
+                .take(&MxArray::from_uint32(&row, &[m])?, 0)?
+                .reshape(&[m, 1, latent])?;
+            let si = MxArray::from_uint32(&slot, &[m])?;
+            let g = p.arrays[0].gather_sorted(&x, &si)?;
+            let u = p.arrays[1].gather_sorted(&x, &si)?;
+            let g = if g.dtype()? == DType::Float32 {
+                g
+            } else {
+                g.astype(DType::Float32)?
+            };
+            let u = if u.dtype()? == DType::Float32 {
+                u
+            } else {
+                u.astype(DType::Float32)?
+            };
+            let a = Activations::swiglu_clamped_compiled(&g, &u, self.limit)?;
+            let d_g = p.arrays[2]
+                .gather_sorted(&a, &si)?
+                .astype(DType::Float32)?
+                .mul(&MxArray::from_float32(&ws, &[m, 1, 1])?)?
+                .reshape(&[m, latent])?;
+            MxArray::async_eval_arrays(&[&d_g]);
+            Ok(Some(d_g))
+        };
+
+        if !group_0.is_empty() {
+            bank.assert_ready_slots(&p);
+            let tp = prof_start();
+            if let Some(d_g) = run_group(&group_0)? {
+                prof_end(Phase::Routed, tp, &[&d_g])?;
+                parts.push(d_g);
+            }
+        }
+        loop {
+            let tp = prof_start();
+            let next = subgroups.next_subgroup()?;
+            prof_end(Phase::Fill, tp, &[])?;
+            let Some(group_experts) = next else {
+                break;
+            };
+            bank.assert_experts_slots(&p, &group_experts);
+            let tp = prof_start();
+            if let Some(d_g) = run_group(&group_experts)? {
+                prof_end(Phase::Routed, tp, &[&d_g])?;
+                parts.push(d_g);
+            }
+        }
+        bank.assert_slots(&p);
+
+        let tp = prof_start();
+        let all = match parts.len() {
+            0 => return Err(bad("prefill subgroups produced no pairs")),
+            1 => parts.swap_remove(0),
+            _ => MxArray::concatenate_many(parts.iter().collect(), Some(0))?,
+        };
+        let out = all
+            .take(&MxArray::from_uint32(&back, &[pairs as i64])?, 0)?
+            .reshape(&[rows, k as i64, latent])?
+            .sum(Some(&[1]), Some(false))?;
+        prof_end(Phase::Routed, tp, &[&out])?;
+        Ok(out)
     }
 
     fn banked(
@@ -595,7 +993,17 @@ impl Moe {
             let i = MxArray::from_uint32(&slot, &[n])?;
             let g = gather(0, &x, &i)?;
             let u = gather(1, &x, &i)?;
-            let a = swiglu(&g, &u, self.limit, None, DType::Float32)?;
+            let g = if g.dtype()? == DType::Float32 {
+                g
+            } else {
+                g.astype(DType::Float32)?
+            };
+            let u = if u.dtype()? == DType::Float32 {
+                u
+            } else {
+                u.astype(DType::Float32)?
+            };
+            let a = Activations::swiglu_clamped_compiled(&g, &u, self.limit)?;
             gather(2, &a, &i)?
                 .astype(DType::Float32)?
                 .mul(&MxArray::from_float32(&ws, &[n, 1, 1])?)?
@@ -606,7 +1014,17 @@ impl Moe {
             let ze = z.reshape(&[rows, 1, 1, latent])?;
             let g = gather(0, &ze, &i)?;
             let u = gather(1, &ze, &i)?;
-            let a = swiglu(&g, &u, self.limit, None, DType::Float32)?;
+            let g = if g.dtype()? == DType::Float32 {
+                g
+            } else {
+                g.astype(DType::Float32)?
+            };
+            let u = if u.dtype()? == DType::Float32 {
+                u
+            } else {
+                u.astype(DType::Float32)?
+            };
+            let a = Activations::swiglu_clamped_compiled(&g, &u, self.limit)?;
             gather(2, &a, &i)?
                 .astype(DType::Float32)?
                 .mul(&MxArray::from_float32(w, &[rows, k, 1, 1])?)?
@@ -638,13 +1056,24 @@ impl LayerFfn {
         experts: Option<ExpertSource>,
     ) -> Result<Self> {
         let kind = match (w, experts) {
-            (Ffn::Mlp { gate, up, down }, None) if c.dense => {
+            (
+                Ffn::Mlp {
+                    gate,
+                    up,
+                    down,
+                    gate_up,
+                },
+                None,
+            ) if c.dense => {
                 let ff = check_mlp(gate, up, down, c.dim, "dense FFN")?;
                 if ff != c.dense_ff {
                     return Err(bad(format!(
                         "layer {layer}: dense FFN width {ff}, config {}",
                         c.dense_ff
                     )));
+                }
+                if let Some(fused) = gate_up {
+                    want2(fused, 2 * ff, c.dim, "dense FFN gate_up")?;
                 }
                 FfnKind::Dense
             }
@@ -684,6 +1113,30 @@ impl LayerFfn {
         matches!(self.kind, FfnKind::Moe(_))
     }
 
+    /// Predicts and queues routed experts for this layer from `h [n, dim]`
+    /// (the preceding layer's HC-reduced FFN input).
+    pub fn prefetch_from(&self, w: &LayerWeights, h: &MxArray) -> Result<usize> {
+        let (FfnKind::Moe(m), Ffn::Moe(mw)) = (&self.kind, &w.ffn) else {
+            return Ok(0);
+        };
+        let ExpertSource::Bank(bank) = &m.experts else {
+            return Ok(0);
+        };
+        if !bank.prefetch() || bank.staging_layers() < 2 {
+            return Ok(0);
+        }
+        let x = rms_norm(&h.astype(DType::Float32)?, &w.ffn_norm, self.eps)?;
+        m.prefetch_from(self.layer, mw, &x)
+    }
+
+    pub fn end_layer(&self) {
+        if let FfnKind::Moe(m) = &self.kind
+            && let ExpertSource::Bank(bank) = &m.experts
+        {
+            bank.end_layer(self.layer);
+        }
+    }
+
     /// The sublayer output `[n, dim]` f32 for `h [n, dim]` (the HC-reduced
     /// stream, before `ffn_norm`), and the routes of a MoE layer.
     pub fn forward(
@@ -692,14 +1145,11 @@ impl LayerFfn {
         h: &MxArray,
         kind: RowKind,
     ) -> Result<(MxArray, Option<Routes>)> {
-        self.forward_chunked(
-            &w.ffn,
-            &w.ffn_norm,
-            &w.post_ffw_norm,
-            h,
-            FFN_CHUNK_ROWS,
-            kind,
-        )
+        let chunk = match kind {
+            RowKind::Prefill => prefill_ffn_chunk_rows(),
+            RowKind::Decode => FFN_CHUNK_ROWS,
+        };
+        self.forward_chunked(&w.ffn, &w.ffn_norm, &w.post_ffw_norm, h, chunk, kind)
     }
 
     /// `forward` from the parts, `chunk` rows per expert step; every chunk
@@ -755,9 +1205,17 @@ impl LayerFfn {
                 x.slice(&[lo as i64, 0], &[hi as i64, self.dim as i64])?
             };
             let f = match (&self.kind, ffn) {
-                (FfnKind::Dense, Ffn::Mlp { gate, up, down }) => {
+                (
+                    FfnKind::Dense,
+                    Ffn::Mlp {
+                        gate,
+                        up,
+                        down,
+                        gate_up,
+                    },
+                ) => {
                     let tp = prof_start();
-                    let f = mlp(&xc, gate, up, down)?;
+                    let f = mlp(&xc, gate, up, down, gate_up.as_ref())?;
                     prof_end(Phase::Shared, tp, &[&f])?;
                     f
                 }

@@ -24,13 +24,14 @@ use std::collections::VecDeque;
 
 use napi::{Error, Result};
 
-use super::attention::{Geometry, Mla};
+use super::attention::{Geometry, Mla, Projected};
 use super::cache::ROW_DTYPE;
 use super::indexer::{Call, Indexer, IndexerGeometry, IndexerMark, IndexerState, TokTail};
 use super::ladder::Snapshot;
 use super::model::{Mark, Model, Output, Session, Want, head_rows};
 use super::moe::{ExpertSource, FfnConfig, LayerFfn, RowKind, qlinear};
 use super::mtp_weights::{self, MtpWeights};
+use super::ops::{fast_rope, rms_norm, rope_inv_freqs};
 use super::owner::fill_draft;
 use super::prefill::{Runner, Seq, index_keeps, session_keeps};
 use super::prefix_state::PrefixState;
@@ -39,8 +40,7 @@ use super::sparse::gather_sink_attention;
 use super::weights::{LayerWeights, NextnWeights, Residual};
 use crate::array::{DType, MxArray};
 use crate::cache_limit::CacheLimitGuard;
-use crate::models::deepseek_v41::attention::rms_norm;
-use crate::models::deepseek_v41::ops::{apply_partial_rope, inv_freqs, rope_tables};
+use crate::models::deepseek_v41::ops::inv_freqs;
 use crate::models::deepseek_v41::store::Dense;
 use crate::moe_stream::io::ShardSet;
 use crate::nn::Embedding;
@@ -429,7 +429,7 @@ pub struct MtpLayer {
     indexer: Indexer,
     ffn: LayerFfn,
     /// MLA RoPE inverse frequencies (the commit path's own K rows).
-    inv: Vec<f32>,
+    inv_freqs: MxArray,
     /// `token_embd` as a packed embedding: the draft inputs.
     embedding: Embedding,
     bytes: u64,
@@ -501,7 +501,7 @@ impl MtpLayer {
             .as_ref()
             .ok_or_else(|| bad("the MTP layer has no indexer weights"))?;
         let g = Geometry::of(cfg, layer)?;
-        let inv = inv_freqs(g.rope_dim, g.rope_theta, None);
+        let inv_freqs = rope_inv_freqs(&inv_freqs(g.rope_dim, g.rope_theta, None))?;
         let indexer = Indexer::new(IndexerGeometry::of(cfg, layer)?, iw)?;
         let mla = Mla::new(g, &w.attn)?;
         let ffn = LayerFfn::new(
@@ -519,7 +519,7 @@ impl MtpLayer {
             mla,
             indexer,
             ffn,
-            inv,
+            inv_freqs,
             embedding,
             bytes,
             _guard: guard,
@@ -571,16 +571,13 @@ impl MtpLayer {
         let m = x.shape_at(0)?;
         let (kv_lora, rd) = (g.kv_lora as i64, g.rope_dim as i64);
         let pos: Vec<u64> = (at + 1..at + 1 + m as usize).map(|p| p as u64).collect();
-        let (cos, sin) = rope_tables(&self.inv, &pos)?;
         let xn = rms_norm(&x.astype(DType::Float32)?, &w.norm, g.eps)?;
         let ckv = qlinear(&xn, &w.kv_a)?;
         let kv = rms_norm(&ckv.slice(&[0, 0], &[m, kv_lora])?, &w.kv_a_norm, g.eps)?;
-        let k_pe = apply_partial_rope(
+        let k_pe = fast_rope(
             &ckv.slice(&[0, kv_lora], &[m, kv_lora + rd])?,
-            rd,
-            &cos,
-            &sin,
-            false,
+            &self.inv_freqs,
+            &pos,
         )?;
         Ok((xn, MxArray::concatenate(&kv, &k_pe, -1)?))
     }
@@ -657,7 +654,7 @@ impl MtpLayer {
             d.index.restore(mark)?;
             return Err(e);
         }
-        let out = self.finish_draft(model, d, &x, &p.q, &p.x, &idx);
+        let out = self.finish_draft(model, d, &x, &p, &idx);
         if out.is_err() {
             d.kv.truncate(at)?;
             d.index.restore(mark)?;
@@ -670,14 +667,18 @@ impl MtpLayer {
         model: &Model,
         d: &Draft,
         x: &MxArray,
-        q: &MxArray,
-        xn: &MxArray,
+        p: &Projected,
         idx: &MxArray,
     ) -> Result<(MxArray, MxArray)> {
         let g = self.mla.geometry();
         let w = &self.w.attn;
-        let o = gather_sink_attention(q, d.kv.rows()?, idx, g.kv_lora as i64, &w.sinks, g.scale)?;
-        let x = x.add(&self.mla.finish(w, xn, &o)?)?;
+        let o =
+            gather_sink_attention(&p.q, d.kv.rows()?, idx, g.kv_lora as i64, &w.sinks, g.scale)?;
+        let x = x.add(
+            &self
+                .mla
+                .finish_with_gate(w, &p.x, p.gate_lin.as_ref(), &o)?,
+        )?;
         let (f, _) = self.ffn.forward(&self.w, &x, RowKind::Decode)?;
         let x = x.add(&f)?;
         let h = rms_norm(&x, &self.nextn()?.shared_head_norm, self.eps)?;

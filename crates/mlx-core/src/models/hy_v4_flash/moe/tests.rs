@@ -346,6 +346,7 @@ fn moe_weights(rng: &mut Rng, c: &FfnConfig, sff: usize) -> (MoeWeights, MxArray
         shared_gate: dense(rng.vec(sff * d, sd), sff, d),
         shared_up: dense(rng.vec(sff * d, sd), sff, d),
         shared_down: dense(rng.vec(d * sff, 1.0 / (sff as f32).sqrt()), d, sff),
+        down_shared_gu: None,
     };
     let norm = vector(rng.vec(d, 0.3).into_iter().map(|v| 1.0 + v).collect());
     let post = vector(rng.vec(d, 0.3).into_iter().map(|v| 1.0 + v).collect());
@@ -578,6 +579,7 @@ fn dense_ffn_matches_reference_without_clamp() {
         gate: dense(gate, ff, d),
         up: dense(up, ff, d),
         down: dense(down, d, ff),
+        gate_up: None,
     };
     let norm = vector(rng.vec(d, 0.2).into_iter().map(|v| 1.0 + v).collect());
     let post = vector(rng.vec(d, 0.2).into_iter().map(|v| 1.0 + v).collect());
@@ -623,6 +625,7 @@ fn ffn_refuses_mismatched_weights() {
         gate: dense(rng.vec(40 * 96, 0.1), 40, 96),
         up: dense(rng.vec(40 * 96, 0.1), 40, 96),
         down: dense(rng.vec(96 * 40, 0.1), 96, 40),
+        gate_up: None,
     };
     let src = |rng: &mut Rng| Some(ExpertSource::Resident(affine_experts(rng, &m).0));
     assert!(LayerFfn::new(&c, 1, &moe, None).is_err());
@@ -1194,6 +1197,186 @@ fn qlinear_pads_one_q8_row() {
     );
 }
 
+fn bits(x: &MxArray) -> Vec<u32> {
+    read(x).into_iter().map(f32::to_bits).collect()
+}
+
+/// Split-step decode (`split=true`) matches `split=false` bit-for-bit on both
+/// 1-row and 4-row waves with mixed resident/missing experts (so both ready
+/// and late passes run and reassemble in ascending expert-id order).
+#[test]
+fn split_decode_matches_unsplit_bitwise_for_single_and_multi_row() {
+    crate::models::hy_v4_flash::exact_f32();
+    let mut rng = Rng::new(41);
+    let m = moe_cfg(8, 2, 512, 256);
+    let c = ffn_cfg(64, m.clone(), 0.5);
+    let mut file = rng.bytes(1000);
+    let experts = vec![
+        None,
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            1,
+            ExpertClass::Q6kDown,
+            &mut file,
+        )),
+    ];
+    let dir = Temp::new();
+    let path = dir.0.join("data.bin");
+    std::fs::write(&path, &file).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+    let bank = Arc::new(KqBank::new(pool, &m, &experts, [8, 0], 1).unwrap());
+    let (w, norm, post) = moe_weights(&mut rng, &c, 32);
+    let ffn = Ffn::Moe(w);
+    let layer = LayerFfn::new(&c, 1, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
+
+    for rows in [1usize, 4] {
+        let h = rows_arr(&inputs(&mut rng, rows, c.dim));
+        // Reference with split = false.
+        bank.set_split(false);
+        bank.test_forget_where(|_, _| true);
+        let (want, want_r) = layer
+            .forward_chunked(&ffn, &norm, &post, &h, FFN_CHUNK_ROWS, RowKind::Decode)
+            .unwrap();
+        let want_bits = bits(&want);
+        let want_ids = want_r.unwrap().ids;
+        bank.settle_all();
+
+        // Warm half the active experts so split = true runs a mixed ready + late step.
+        bank.set_split(true);
+        bank.test_forget_where(|_, _| true);
+        let (used, _) = distinct_uses(&want_ids);
+        let warm_half = &used[..used.len() / 2];
+        if !warm_half.is_empty() {
+            let _ = bank.prepare(1, warm_half, &[], true).unwrap();
+            bank.settle_all();
+        }
+        let steps_before = bank.stats()[0].split_steps;
+        let mixed_before = bank.stats()[0].split_mixed;
+
+        let (got, got_r) = layer
+            .forward_chunked(&ffn, &norm, &post, &h, FFN_CHUNK_ROWS, RowKind::Decode)
+            .unwrap();
+        let got_bits = bits(&got);
+        bank.settle_all();
+
+        assert_eq!(got_r.unwrap().ids, want_ids, "rows={rows} routes");
+        assert_eq!(got_bits, want_bits, "rows={rows} split=true vs split=false");
+        assert_eq!(bank.stats()[0].split_steps, steps_before + 1, "rows={rows}");
+        if !warm_half.is_empty() {
+            assert_eq!(
+                bank.stats()[0].split_mixed,
+                mixed_before + 1,
+                "rows={rows} mixed ready+late"
+            );
+        }
+    }
+    bank.end_turn().unwrap();
+}
+
+/// 2048-row prefill with sub-grouping (`used.len() > PREFILL_SUBGROUP_EXPERTS`)
+/// across mixed resident + missing experts is bit-exact (`to_bits()`) against
+/// 256-row ungrouped chunks.
+#[test]
+fn prefill_2048_subgrouped_matches_256_ungrouped_bitwise() {
+    crate::models::hy_v4_flash::exact_f32();
+    let mut rng = Rng::new(43);
+    let m = moe_cfg(180, 2, 256, 256);
+    let c = ffn_cfg(32, m.clone(), 0.5);
+    let mut file = rng.bytes(1000);
+    let experts = vec![
+        None,
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            1,
+            ExpertClass::Q6kDown,
+            &mut file,
+        )),
+    ];
+    let dir = Temp::new();
+    let path = dir.0.join("data.bin");
+    std::fs::write(&path, &file).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+    let bank = Arc::new(KqBank::new(pool, &m, &experts, [48, 0], 1).unwrap());
+    let (w, _, _) = moe_weights(&mut rng, &c, 32);
+    let ffn = Ffn::Moe(w);
+    let layer = LayerFfn::new(&c, 1, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
+    let FfnKind::Moe(moe) = &layer.kind else {
+        panic!("layer 1 is not MoE");
+    };
+
+    let rows = PREFILL_FFN_CHUNK_ROWS;
+    let k = m.n_used;
+    let z_vec = rng.vec(rows * m.latent, 0.75);
+    let mut ids = Vec::with_capacity(rows * k);
+    let mut weights = Vec::with_capacity(rows * k);
+    for r in 0..rows {
+        let a = ((r * 7 + (rng.step() as usize % 5)) % m.n_experts) as u32;
+        let b = (a + 1 + (rng.step() % (m.n_experts as u64 - 1)) as u32) % m.n_experts as u32;
+        ids.extend([b, a]);
+        weights.extend([0.3 + rng.next().abs(), 0.3 + rng.next().abs()]);
+    }
+    let (used, _) = distinct_uses(&ids);
+    assert!(
+        used.len() > PREFILL_SUBGROUP_EXPERTS,
+        "test must exceed PREFILL_SUBGROUP_EXPERTS (got {})",
+        used.len()
+    );
+
+    // Reference: 256-row ungrouped chunks.
+    TEST_SUBGROUP_EXPERTS.with(|cell| cell.set(usize::MAX));
+    let mut want_bits = Vec::with_capacity(rows * m.latent);
+    for (lo, hi) in chunks(rows, FFN_CHUNK_ROWS) {
+        let zc = MxArray::from_float32(
+            &z_vec[lo * m.latent..hi * m.latent],
+            &[(hi - lo) as i64, m.latent as i64],
+        )
+        .unwrap();
+        let rc = Routes {
+            k,
+            ids: ids[lo * k..hi * k].to_vec(),
+            weights: weights[lo * k..hi * k].to_vec(),
+        };
+        let yc = moe.routed(1, &zc, &rc, RowKind::Prefill).unwrap();
+        want_bits.extend(bits(&yc));
+        bank.settle_all();
+    }
+    TEST_SUBGROUP_EXPERTS.with(|cell| cell.set(0));
+
+    // Sub-grouped 2048-row call with mixed resident (32 warmed in cache) and missing experts.
+    bank.end_turn().unwrap();
+    bank.test_forget_where(|_, _| true);
+    let warm: Vec<u32> = (0..32).collect();
+    let _ = bank.prepare(1, &warm, &[], true).unwrap();
+    bank.settle_all();
+
+    let z_all = MxArray::from_float32(&z_vec, &[rows as i64, m.latent as i64]).unwrap();
+    let r_all = Routes { k, ids, weights };
+    let fills_before = bank.stats()[0].fills;
+    let got = moe.routed(1, &z_all, &r_all, RowKind::Prefill).unwrap();
+    let got_bits = bits(&got);
+    bank.settle_all();
+
+    assert_eq!(
+        got_bits, want_bits,
+        "2048-row sub-grouped prefill must match 256-row ungrouped bit-for-bit"
+    );
+    assert!(
+        bank.stats()[0].fills >= fills_before + 2,
+        "sub-grouping must issue multiple read subgroups"
+    );
+    bank.test_check_caches();
+    bank.end_turn().unwrap();
+}
+
+#[test]
+fn expert_order_last_use_orders_by_final_assignment() {
+    let order = expert_order_last_use(&[3, 1, 2, 1, 0, 3], 5);
+    // Last positions: 2 -> 2, 1 -> 3, 0 -> 4, 3 -> 5.
+    assert_eq!(order, vec![2, 1, 0, 3]);
+}
+
 fn real_scan() -> Scan {
     let dir = std::env::var("HY4_DIR").expect("HY4_DIR = directory of the two Hy4 shards");
     let paths = crate::models::deepseek_v41::chat::shard_paths(Path::new(&dir)).unwrap();
@@ -1266,6 +1449,7 @@ fn real_layer_ffn_matches_dequantized_reference() {
             shared_gate: reader.dense(&name(il, "ffn_gate_shexp")).unwrap(),
             shared_up: reader.dense(&name(il, "ffn_up_shexp")).unwrap(),
             shared_down: reader.dense(&name(il, "ffn_down_shexp")).unwrap(),
+            down_shared_gu: None,
         };
         let norm = reader.plain(&name(il, "ffn_norm")).unwrap();
         let post = reader.plain(&name(il, "post_ffw_norm")).unwrap();
@@ -1317,7 +1501,12 @@ fn real_layer_ffn_matches_dequantized_reference() {
     let (gm, um, dm) = (Mat::of(&gate), Mat::of(&up), Mat::of(&down));
     let norm = reader.plain(&name(0, "ffn_norm")).unwrap();
     let post = reader.plain(&name(0, "post_ffw_norm")).unwrap();
-    let ffn = Ffn::Mlp { gate, up, down };
+    let ffn = Ffn::Mlp {
+        gate,
+        up,
+        down,
+        gate_up: None,
+    };
     let layer = LayerFfn::new(&c, 0, &ffn, None).unwrap();
     let hs = inputs(&mut rng, 16, cfg.dim);
     let (y, _) = layer

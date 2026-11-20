@@ -136,6 +136,11 @@ pub struct Counters {
     pub hits: u64,
     pub promoted: u64,
     pub promote_ns: u64,
+    pub wait_ns: u64,
+    pub split_steps: u64,
+    pub split_mixed: u64,
+    pub prefetch_slots: u64,
+    pub prefetch_unused: u64,
     pub engram_bytes: u64,
     pub engram_ns: u64,
     pub staging_layers: u64,
@@ -161,6 +166,11 @@ impl Counters {
             c.hits += s.hits as u64;
             c.promoted += s.promoted as u64;
             c.promote_ns += s.promote_ns;
+            c.wait_ns += s.wait_ns;
+            c.split_steps += s.split_steps as u64;
+            c.split_mixed += s.split_mixed as u64;
+            c.prefetch_slots += s.prefetch_slots as u64;
+            c.prefetch_unused += s.prefetch_unused as u64;
         }
         c
     }
@@ -182,6 +192,11 @@ impl Counters {
             hits: d(self.hits, before.hits),
             promoted: d(self.promoted, before.promoted),
             promote_ns: d(self.promote_ns, before.promote_ns),
+            wait_ns: d(self.wait_ns, before.wait_ns),
+            split_steps: d(self.split_steps, before.split_steps),
+            split_mixed: d(self.split_mixed, before.split_mixed),
+            prefetch_slots: d(self.prefetch_slots, before.prefetch_slots),
+            prefetch_unused: d(self.prefetch_unused, before.prefetch_unused),
             engram_bytes: d(self.engram_bytes, before.engram_bytes),
             engram_ns: d(self.engram_ns, before.engram_ns),
             staging_layers: self.staging_layers,
@@ -472,15 +487,20 @@ impl Line<'_> {
             "decode_tok_s_median": if med > 0.0 { 1.0 / med } else { 0.0 },
             "hit_rate_uses": c.hits as f64 / uses,
             // every use served without a read (cache hits and still-valid
-            // staging copies)
-            "hit_rate_bytes": 1.0 - c.fill_slots as f64 / uses,
+            // staging copies); unused prefetches are excluded from uses
+            "hit_rate_bytes": 1.0 - c.fill_slots.saturating_sub(c.prefetch_unused) as f64 / uses,
             "miss_gb_per_tok": c.fill_bytes as f64 / 1e9 / toks,
             "read_gbps": c.fill_bytes as f64 / 1e9 / io_s.max(1e-9),
             "t_c_ms": (self.wall_s - io_s - eng_s) * 1e3 / toks,
             "t_io_ms": io_s * 1e3 / toks,
+            "t_io_wait_ms": c.wait_ns as f64 * 1e-6 / toks,
             "t_read_ms": c.read_ns as f64 * 1e-6 / toks,
             "t_repack_ms": c.repack_ns as f64 * 1e-6 / toks,
             "t_engram_ms": eng_s * 1e3 / toks,
+            "split_steps": c.split_steps,
+            "split_mixed": c.split_mixed,
+            "prefetch_slots": c.prefetch_slots,
+            "prefetch_unused": c.prefetch_unused,
             "promoted": c.promoted,
             "bytes_read_total": c.fill_bytes + c.engram_bytes,
             "engram_bytes": c.engram_bytes,
