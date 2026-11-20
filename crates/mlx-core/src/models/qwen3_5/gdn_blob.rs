@@ -295,6 +295,7 @@ fn settle_kernel_tape(
         v: v.clone(),
         g: g.clone(),
         beta: beta.clone(),
+        tiled_heads,
     })
 }
 
@@ -392,6 +393,7 @@ pub(crate) mod trace {
                         v: t.kernel.v.clone(),
                         g: t.kernel.g.clone(),
                         beta: t.kernel.beta.clone(),
+                        tiled_heads: trace.tiled,
                     },
                     qkv: t.qkv.clone(),
                     conv_kernel_dim: 4,
@@ -560,6 +562,7 @@ mod tests {
                     v: rand_bf16(&[1, window, hv, dv]),
                     g: gate(DType::Float32),
                     beta: gate(DType::BFloat16),
+                    tiled_heads: hk != hv,
                 },
                 qkv: rand_bf16(&[1, window, width]),
                 conv_kernel_dim: 4,
@@ -649,6 +652,7 @@ mod tests {
                                 v: t.kernel.v.slice_axis(1, 0, 4).unwrap(),
                                 g: t.kernel.g.slice_axis(1, 0, 4).unwrap(),
                                 beta: t.kernel.beta.slice_axis(1, 0, 4).unwrap(),
+                                tiled_heads: t.kernel.tiled_heads,
                             },
                             qkv: t.qkv.slice_axis(1, 0, 4).unwrap(),
                             conv_kernel_dim: 4,
@@ -702,6 +706,7 @@ mod tests {
                             v: t.kernel.v.clone(),
                             g: t.kernel.g.clone(),
                             beta: t.kernel.beta.clone(),
+                            tiled_heads: tiled,
                         },
                         qkv: t.qkv.clone(),
                         conv_kernel_dim: 4,

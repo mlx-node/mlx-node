@@ -20,6 +20,9 @@
 #include "mlx/backend/metal/jit/includes.h"
 #include "mlx/fast_primitives.h"
 #include "mlx_test_counters.h"
+#elif defined(MLX_NODE_CUDA_ENABLED)
+#include "mlx_cuda_ops.h"
+#include "mlx/primitives.h"
 #endif
 
 namespace {
@@ -384,7 +387,7 @@ extern "C" bool mlx_kv_store_batched_available() {
 extern "C" bool mlx_kv_store_rows(int32_t tensors, mlx_array* const* dst,
                                   mlx_array* const* src,
                                   const int32_t* offsets, mlx_array** out) {
-  for (int i = 0; out && i < tensors && i <= kMaxTensors; ++i) out[i] = nullptr;
+  for (int i = 0; out && i < tensors && i < kMaxTensors; ++i) out[i] = nullptr;
 #ifdef MLX_NODE_METAL_ENABLED
   try {
     expect(dst && src && out && offsets && tensors >= 1 &&
@@ -437,6 +440,141 @@ extern "C" bool mlx_kv_store_rows(int32_t tensors, mlx_array* const* dst,
     return true;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "mlx_kv_store_rows: %s\n", e.what());
+    return false;
+  }
+#elif defined(MLX_NODE_CUDA_ENABLED)
+  try {
+    using namespace mlx::core;
+    if (!dst || !src || !out || !offsets || tensors < 1 || tensors > kMaxTensors ||
+        default_device() != Device::gpu) {
+      return false;
+    }
+    static constexpr char kKvStoreRowsCudaSrc[] =
+#include "cuda/kv_store_rows.cu.inc"
+        ;
+    class KvStoreRowsCuda final : public Primitive {
+     public:
+      KvStoreRowsCuda(Stream stream, std::vector<int> offsets)
+          : Primitive(stream), offsets_(std::move(offsets)) {}
+
+      void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+        throw std::runtime_error("KvStoreRowsCuda requires CUDA");
+      }
+
+      void eval_gpu(const std::vector<array>& inputs,
+                    std::vector<array>& outputs) override {
+        const int n = static_cast<int>(offsets_.size());
+        auto& encoder = cu::get_command_encoder(stream());
+        auto kernel = cu::jit_kernel(
+            encoder.device(), kKvStoreRowsCudaSrc, "mlx_node_kv_store_rows_cuda");
+        for (int i = 0; i < n; ++i) {
+          const auto& d = inputs[i];
+          const auto& s = inputs[n + i];
+          auto& o = outputs[i];
+          const int nd = s.ndim();
+          const int B = s.shape(0);
+          const int H = s.shape(1);
+          const int rows = s.shape(2);
+          const int D = nd == 4 ? s.shape(3) : 1;
+          const int itemsize = static_cast<int>(s.itemsize());
+          if (d.ndim() != nd || (nd != 3 && nd != 4) || d.dtype() != s.dtype() ||
+              (itemsize != 1 && itemsize != 2 && itemsize != 4) ||
+              d.shape(0) != B || d.shape(1) != H ||
+              (nd == 4 && d.shape(3) != D) ||
+              offsets_[i] < 0 || int64_t(offsets_[i]) + rows > d.shape(2)) {
+            throw std::invalid_argument("KvStoreRowsCuda: replay shape or bounds mismatch");
+          }
+          o.copy_shared_buffer(d);
+          const int64_t total = static_cast<int64_t>(B) * H * rows * D;
+          if (total <= 0) {
+            continue;
+          }
+          // Do NOT call encoder.set_input_array(d): `o` aliases `d` and
+          // set_output_array(o) already tracks buffer dependency without
+          // inflating bytes_in_graph_ by the entire preallocated KV buffer.
+          encoder.set_input_array(s);
+          encoder.set_output_array(o);
+          cu::KernelArgs args;
+          args.append(o);
+          args.append(s);
+          args.append<int32_t>(B);
+          args.append<int32_t>(H);
+          args.append<int32_t>(rows);
+          args.append<int32_t>(D);
+          args.append<int32_t>(itemsize);
+          args.append<int32_t>(offsets_[i]);
+          args.append<int64_t>(d.strides(0));
+          args.append<int64_t>(d.strides(1));
+          args.append<int64_t>(d.strides(2));
+          args.append<int64_t>(nd == 4 ? d.strides(3) : 0);
+          args.append<int64_t>(s.strides(0));
+          args.append<int64_t>(s.strides(1));
+          args.append<int64_t>(s.strides(2));
+          args.append<int64_t>(nd == 4 ? s.strides(3) : 0);
+          const uint32_t grid = static_cast<uint32_t>((total + 255) / 256);
+          encoder.add_kernel_node_raw(
+              kernel, dim3(grid), dim3(256), {}, 0, args.args());
+        }
+      }
+
+      DEFINE_NAME(KvStoreRowsCuda)
+      bool is_equivalent(const Primitive& other) const override {
+        const auto* rhs = dynamic_cast<const KvStoreRowsCuda*>(&other);
+        return rhs && rhs->offsets_ == offsets_;
+      }
+      std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+        const int n = static_cast<int>(offsets_.size());
+        std::vector<Shape> shapes;
+        shapes.reserve(n);
+        for (int i = 0; i < n; ++i) {
+          shapes.push_back(inputs[i].shape());
+        }
+        return shapes;
+      }
+
+     private:
+      std::vector<int> offsets_;
+    };
+
+    std::vector<array> inputs;
+    std::vector<Shape> shapes;
+    std::vector<Dtype> dtypes;
+    inputs.reserve(tensors * 2);
+    shapes.reserve(tensors);
+    dtypes.reserve(tensors);
+    for (int i = 0; i < tensors; ++i) {
+      if (!dst[i] || !src[i] || offsets[i] < 0) {
+        return false;
+      }
+      const auto& d = *reinterpret_cast<array*>(dst[i]);
+      const auto& s = *reinterpret_cast<array*>(src[i]);
+      const int itemsize = static_cast<int>(s.itemsize());
+      if (d.ndim() != s.ndim() || (d.ndim() != 3 && d.ndim() != 4) ||
+          d.dtype() != s.dtype() ||
+          (itemsize != 1 && itemsize != 2 && itemsize != 4) ||
+          d.shape(0) != s.shape(0) || d.shape(1) != s.shape(1) ||
+          (d.ndim() == 4 && d.shape(3) != s.shape(3)) ||
+          int64_t(offsets[i]) + s.shape(2) > d.shape(2)) {
+        return false;
+      }
+      inputs.push_back(d);
+      shapes.push_back(d.shape());
+      dtypes.push_back(d.dtype());
+    }
+    for (int i = 0; i < tensors; ++i) {
+      inputs.push_back(*reinterpret_cast<array*>(src[i]));
+    }
+    auto stream = default_stream(Device::gpu);
+    auto primitive = std::make_shared<KvStoreRowsCuda>(
+        stream, std::vector<int>(offsets, offsets + tensors));
+    auto outputs = array::make_arrays(std::move(shapes), std::move(dtypes),
+                                      primitive, std::move(inputs));
+    for (int i = 0; i < tensors; ++i) {
+      out[i] = reinterpret_cast<mlx_array*>(new array(std::move(outputs[i])));
+    }
+    return true;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "mlx_kv_store_rows (cuda): %s\n", e.what());
     return false;
   }
 #else

@@ -912,12 +912,14 @@ pub(crate) fn estimate_qwen35_load(
         qwen35_no_pool_format(label, format)?;
         None
     };
-    if draft.is_some() && pool.is_none() {
+    if input.moe && draft.is_some() && pool.is_none() {
         return Err(Error::from_reason(format!(
-            "{label} DFlash2 runs on the block-paged KV pool, which this load has none of (it \
+            "{label} MoE DFlash2 runs on the block-paged KV pool, which this load has none of (it \
              needs Metal); load without the companion (autoLoadDraft: false)"
         )));
     }
+    // Dense off-Metal loads use the eager flat DFlash2 lane and plan only the
+    // resident target and draft weights. MoE keeps its Metal pool requirement.
     let served = config.served_context_tokens();
     let cap = input.max_context.unwrap_or(served);
     let Some(mut live) = live_memory() else {

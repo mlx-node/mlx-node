@@ -113,6 +113,13 @@ extern "C" bool mlx_qwen4_gdn_prepare(mlx_array *qkv, mlx_array *a,
   for (int i = 0; i < 6; ++i)
     outputs[i] = nullptr;
   try {
+#ifndef MLX_NODE_METAL_ENABLED
+    return false;
+#endif
+    if (!mlx::core::metal::is_available() ||
+        mlx::core::default_device() != mlx::core::Device::gpu) {
+      return false;
+    }
     std::vector<array> in;
     for (auto *p : {qkv, a, b, conv, history, scale, dt}) {
       if (!p)

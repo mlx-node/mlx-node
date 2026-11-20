@@ -9,14 +9,13 @@ const CHUNK_THRESHOLD: i64 = 64;
 /// CUDA ops-path selection. Metal always uses the per-step kernel when supported.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GdnKernel {
-    /// Use CUDA chunk-parallel ops for eligible prefill calls.
+    /// Use the supported CUDA recurrent kernel, with generic ops as fallback.
     Auto,
     /// Force the per-step recurrence.
     ForcePerStep,
-    /// Force the device-agnostic chunk-parallel ops path (`gated_delta_chunked_ops`).
-    /// This is the default on the CUDA ops path (where the Metal kernels are absent);
-    /// `MLX_GDN_KERNEL=perstep` reverts it for same-binary A/B. No effect on Metal,
-    /// whose production path takes the `use_kernel=true` per-step kernel.
+    /// Force the device-agnostic chunk-parallel ops path (`gated_delta_chunked_ops`)
+    /// for same-binary A/B. No effect on Metal, whose production path takes the
+    /// `use_kernel=true` per-step kernel.
     ForceChunkedOps,
 }
 
@@ -151,6 +150,27 @@ fn gated_delta_kernel(
     state: &MxArray,
     mask: Option<&MxArray>,
 ) -> Result<(MxArray, MxArray)> {
+    if crate::accelerator::cuda_ops_available() && mask.is_none() {
+        let num_k_heads = q.shape_at(2)?;
+        let num_v_heads = v.shape_at(2)?;
+        let (q, k) = if num_k_heads != num_v_heads {
+            if num_k_heads <= 0 || num_v_heads % num_k_heads != 0 {
+                return Err(Error::from_reason(
+                    "CUDA gated delta requires divisible GQA head counts",
+                ));
+            }
+            let repeat = num_v_heads / num_k_heads;
+            (
+                MxArray::tile(q, &[1, 1, repeat as i32, 1])?,
+                MxArray::tile(k, &[1, 1, repeat as i32, 1])?,
+            )
+        } else {
+            (q.clone(), k.clone())
+        };
+        let out_dtype = v.dtype()?;
+        let (y, state) = gated_delta_cuda(&q, &k, v, g, beta, state)?;
+        return Ok((y.astype(out_dtype)?, state));
+    }
     let mut out_y: *mut sys::mlx_array = std::ptr::null_mut();
     let mut out_state: *mut sys::mlx_array = std::ptr::null_mut();
 
@@ -210,36 +230,22 @@ pub(crate) fn gated_delta_fused_step(
     beta: &MxArray,
     state: &MxArray,
     tail: &GdnTail<'_>,
+    tiled_heads: bool,
 ) -> Result<(MxArray, MxArray)> {
-    let mut out: *mut sys::mlx_array = std::ptr::null_mut();
-    let mut out_state: *mut sys::mlx_array = std::ptr::null_mut();
-    let ok = unsafe {
-        sys::mlx_gdn_fused_step(
-            q.as_raw_ptr(),
-            k.as_raw_ptr(),
-            v.as_raw_ptr(),
-            g.as_raw_ptr(),
-            beta.as_raw_ptr(),
-            state.as_raw_ptr(),
-            tail.z.as_raw_ptr(),
-            tail.norm_weight.as_raw_ptr(),
-            tail.eps,
-            tail.state_dst
-                .map(MxArray::as_raw_ptr)
-                .unwrap_or(std::ptr::null_mut()),
-            &mut out,
-            &mut out_state,
-        )
-    };
-    if !ok {
-        return Err(Error::from_reason(
-            "Fused GDN step kernel declined (check stderr for details)",
-        ));
-    }
-    Ok((
-        MxArray::from_handle(out, "gdn_fused_step:out")?,
-        MxArray::from_handle(out_state, "gdn_fused_step:state")?,
-    ))
+    crate::kernels::gdn::fused_step(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        tail.z,
+        tail.norm_weight,
+        tail.eps,
+        tiled_heads,
+        tail.state_dst,
+    )?
+    .ok_or_else(|| Error::from_reason("Fused GDN step kernel declined (check stderr for details)"))
 }
 
 /// The `gdn_prepare` inputs of one window: the post-mask pre-conv `qkv`
@@ -406,6 +412,7 @@ fn gated_delta_fused_complete_impl(
             v: take(4, "gdn_fused_complete:v")?,
             g: take(5, "gdn_fused_complete:decay")?,
             beta: take(6, "gdn_fused_complete:beta")?,
+            tiled_heads: pending.is_none_or(|(_, tiled)| tiled),
         },
         history: take(7, "gdn_fused_complete:history")?,
         raw: if deferred {
@@ -417,50 +424,6 @@ fn gated_delta_fused_complete_impl(
             None
         },
     })
-}
-
-/// Fused accepted-prefix replay for the eager-MTP GDN tape.
-///
-/// ONE Metal dispatch replays `accepted_steps` tokens of the recorded verify
-/// window from `start_state`, rounding the recurrent state through its own
-/// dtype after every token (identity for the production f32 state) —
-/// bit-identical to chaining [`gated_delta_kernel`] at T=1. The recurrent
-/// update never reads `q`, so the kernel omits it.
-///
-/// Shapes:
-///   k: [B, S, Hk, Dk], v: [B, S, Hv, Dv]  (`S` = recorded window length)
-///   g: [B, S, Hv] (post-`exp`, f32), beta: [B, S, Hv] (post-sigmoid)
-///   state: [B, Hv, Dv, Dk]  (f32)
-///
-/// Returns the carried state `[B, Hv, Dv, Dk]` after `accepted_steps` tokens.
-fn gated_delta_replay(
-    k: &MxArray,
-    v: &MxArray,
-    g: &MxArray,
-    beta: &MxArray,
-    state: &MxArray,
-    accepted_steps: i32,
-) -> Result<MxArray> {
-    let window_stride = k.shape_at(1)? as i32;
-    let mut out_state: *mut sys::mlx_array = std::ptr::null_mut();
-    let ok = unsafe {
-        sys::mlx_gated_delta_replay(
-            k.as_raw_ptr(),
-            v.as_raw_ptr(),
-            g.as_raw_ptr(),
-            beta.as_raw_ptr(),
-            state.as_raw_ptr(),
-            accepted_steps,
-            window_stride,
-            &mut out_state,
-        )
-    };
-    if !ok {
-        return Err(Error::from_reason(
-            "Fused gated delta replay kernel failed (check stderr for details)",
-        ));
-    }
-    MxArray::from_handle(out_state, "gated_delta_replay:state")
 }
 
 /// Per-step GDN recurrence record for the eager MTP tape replay.
@@ -478,9 +441,9 @@ fn gated_delta_replay(
 /// equals this replay at full accept (`ar_chain_matches_windowed_kernel_f32`).
 #[derive(Clone)]
 pub(crate) struct GdnKernelTape {
-    /// Queries `[B, T, Hk, Dk]` (expanded or compact tiled, RMS-norm-scaled).
+    /// Queries `[B, T, Hk, Dk]` (expanded or compact tiled/grouped, RMS-norm-scaled).
     pub q: MxArray,
-    /// Keys `[B, T, Hk, Dk]` (expanded or compact tiled, RMS-norm-scaled).
+    /// Keys `[B, T, Hk, Dk]` (expanded or compact tiled/grouped, RMS-norm-scaled).
     pub k: MxArray,
     /// Values `[B, T, Hv, Dv]`.
     pub v: MxArray,
@@ -488,6 +451,8 @@ pub(crate) struct GdnKernelTape {
     pub g: MxArray,
     /// Beta `[B, T, Hv]` (post-sigmoid).
     pub beta: MxArray,
+    /// Head mapping when `Hk < Hv`: `true` => tiled (`hv % Hk`), `false` => grouped (`hv / (Hv / Hk)`).
+    pub tiled_heads: bool,
 }
 
 impl GdnKernelTape {
@@ -514,19 +479,60 @@ impl GdnKernelTape {
         if accepted_steps == 0 {
             return Ok(start_state.clone());
         }
-        if let Ok(state) = gated_delta_replay(
+        if let Some(state) = crate::kernels::gdn::replay(
             &self.k,
             &self.v,
             &self.g,
             &self.beta,
             start_state,
             accepted_steps as i32,
-        ) {
+            self.tiled_heads,
+        )? {
             return Ok(state);
         }
-        // Sequential fallback: per-step T=1 kernel calls threading the
-        // state, reproducing autoregressive decode bit-for-bit.
+        if crate::accelerator::cuda_ops_available()
+            && self.q.shape_at(3)? == 128
+            && self.v.shape_at(3)? == 128
+        {
+            let end = accepted_steps as i64;
+            let q_slice = self.q.slice_axis(1, 0, end)?;
+            let k_slice = self.k.slice_axis(1, 0, end)?;
+            let v_slice = self.v.slice_axis(1, 0, end)?;
+            let hk = q_slice.shape_at(2)?;
+            let hv = v_slice.shape_at(2)?;
+            let (q_exp, k_exp) = if hk != hv && hk > 0 && hv % hk == 0 {
+                let rep = (hv / hk) as i32;
+                if self.tiled_heads {
+                    (
+                        MxArray::tile(&q_slice, &[1, 1, rep, 1])?,
+                        MxArray::tile(&k_slice, &[1, 1, rep, 1])?,
+                    )
+                } else {
+                    (q_slice.repeat(rep, 2)?, k_slice.repeat(rep, 2)?)
+                }
+            } else {
+                (q_slice, k_slice)
+            };
+            match gated_delta_cuda(
+                &q_exp,
+                &k_exp,
+                &v_slice,
+                &self.g.slice_axis(1, 0, end)?,
+                &self.beta.slice_axis(1, 0, end)?,
+                start_state,
+            ) {
+                Ok((_output, state)) => return Ok(state),
+                Err(e) => eprintln!("[mlx-gdn] CUDA replay failed ({e}); using serial ops"),
+            }
+        }
+        // Sequential fallback: per-step T=1 calls threading the state. CUDA
+        // tapes recorded by the ops forward replay through its device-agnostic
+        // recurrence instead of attempting a Metal dispatch on every layer.
         let mut state = start_state.clone();
+        let batch = self.v.shape_at(0)?;
+        let num_v_heads = self.v.shape_at(2)?;
+        let k_dim = self.q.shape_at(3)?;
+        let v_dim = self.v.shape_at(3)?;
         for t in 0..accepted_steps as i64 {
             let q_t = self.q.slice_axis(1, t, t + 1)?; // [B, 1, Hk, Dk]
             let k_t = self.k.slice_axis(1, t, t + 1)?;
@@ -535,8 +541,23 @@ impl GdnKernelTape {
             let beta_t = self.beta.slice_axis(1, t, t + 1)?;
             // mask=None: the verify forward runs unmasked (same as AR decode),
             // so the replay must too.
-            let (_y, new_state) =
-                gated_delta_kernel(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, None)?;
+            let (_y, new_state) = if crate::accelerator::metal_ops_available() {
+                gated_delta_kernel(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, None)?
+            } else {
+                gated_delta_step(
+                    &q_t,
+                    &k_t,
+                    &v_t,
+                    &g_t,
+                    &beta_t,
+                    &state,
+                    None,
+                    batch,
+                    num_v_heads,
+                    k_dim,
+                    v_dim,
+                )?
+            };
             state = new_state;
         }
         Ok(state)
@@ -622,7 +643,7 @@ fn gated_delta_step(
 }
 
 /// Ops-based sequential loop fallback for the gated delta recurrence.
-fn gated_delta_ops(
+fn gated_delta_ops_serial(
     q: &MxArray,
     k: &MxArray,
     v: &MxArray,
@@ -678,6 +699,63 @@ fn gated_delta_ops(
     Ok((output, current_state))
 }
 
+fn gated_delta_cuda(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+) -> Result<(MxArray, MxArray)> {
+    let output_dtype = v.dtype()?;
+    let output_shape = v.shape()?;
+    let state_shape = state.shape()?;
+    let output_size = v.size()? as i64;
+    let state_size = state.size()? as i64;
+    let f32 = DType::Float32;
+    let handle = unsafe {
+        sys::mlx_gdn_recurrent(
+            q.astype(f32)?.as_raw_ptr(),
+            k.astype(f32)?.as_raw_ptr(),
+            v.astype(f32)?.as_raw_ptr(),
+            g.astype(f32)?.as_raw_ptr(),
+            beta.astype(f32)?.as_raw_ptr(),
+            state.astype(f32)?.as_raw_ptr(),
+        )
+    };
+    let flat = MxArray::from_handle(handle, "gdn_recurrent")?;
+    let output = flat
+        .slice_axis(0, 0, output_size)?
+        .reshape(&output_shape)?
+        .astype(output_dtype)?;
+    let state = flat
+        .slice_axis(0, output_size, output_size + state_size)?
+        .reshape(&state_shape)?;
+    Ok((output, state))
+}
+
+fn gated_delta_ops(
+    q: &MxArray,
+    k: &MxArray,
+    v: &MxArray,
+    g: &MxArray,
+    beta: &MxArray,
+    state: &MxArray,
+    mask: Option<&MxArray>,
+) -> Result<(MxArray, MxArray)> {
+    if mask.is_none()
+        && crate::accelerator::cuda_ops_available()
+        && q.shape_at(3)? == 128
+        && v.shape_at(3)? == 128
+    {
+        match gated_delta_cuda(q, k, v, g, beta, state) {
+            Ok(result) => return Ok(result),
+            Err(e) => eprintln!("[mlx-gdn] CUDA recurrence failed ({e}); using serial ops"),
+        }
+    }
+    gated_delta_ops_serial(q, k, v, g, beta, state, mask)
+}
+
 /// Stable `(I + A)^-1` for a batched strictly-lower-triangular `A` of size `l x l`
 /// (the matrix is the last two axes). `A` is nilpotent, so the inverse is the finite sum
 /// `sum_m (-A)^m`; but forming it by repeated squaring overflows f32 at `l = 64` (the
@@ -688,7 +766,7 @@ fn gated_delta_ops(
 /// so this only uses rows `< i`, already finalized). This matches the FLA / vLLM
 /// `solve_tril` reference. The `l - 1` steps are sequential but batched over all chunks,
 /// so the depth is independent of sequence length.
-fn invert_i_plus_strict_lower(a: &MxArray, l: i64) -> Result<MxArray> {
+fn invert_i_plus_strict_lower_ops(a: &MxArray, l: i64) -> Result<MxArray> {
     let f32 = DType::Float32;
     let eye = MxArray::eye(l as i32, None, None, Some(f32))?; // [L, L]
     let zeros_col = MxArray::zeros(&[l, 1], Some(f32))?;
@@ -703,6 +781,16 @@ fn invert_i_plus_strict_lower(a: &MxArray, l: i64) -> Result<MxArray> {
         m = row_mask.where_(&row_i, &m)?;
     }
     Ok(m)
+}
+
+fn invert_i_plus_strict_lower(a: &MxArray, l: i64, allow_custom_kernel: bool) -> Result<MxArray> {
+    if allow_custom_kernel
+        && l == 64
+        && let Some(out) = crate::kernels::gdn::invert64(a)?
+    {
+        return Ok(out);
+    }
+    invert_i_plus_strict_lower_ops(a, l)
 }
 
 /// Chunk-parallel port of the per-step recurrence (`gated_delta_ops`) for the CUDA
@@ -798,7 +886,7 @@ fn gated_delta_chunked_ops(
     // M = (I + A)^-1. A is strictly-lower nilpotent, but plain repeated squaring overflows
     // f32 at BT=64 (intermediate powers ~1e57); invert_i_plus_strict_lower splits into f32-safe
     // 32-blocks. See that function for the stability bound.
-    let m = invert_i_plus_strict_lower(&a, BT)?;
+    let m = invert_i_plus_strict_lower(&a, BT, true)?;
 
     // S_in-independent WY factors (parallel over all chunks).
     let u = m.matmul(&v.mul(&beta_col)?)?; // M @ (beta*v) -> [B,C,Hv,BT,Dv]
@@ -937,17 +1025,13 @@ pub(crate) fn gated_delta_update_with_tape(
     let v_dim = v.shape_at(3)?;
     let k_dim = q.shape_at(3)?;
 
-    // The fused GDN gating + per-step recurrence are `fast::metal_kernel`
-    // kernels that throw without MLX's Metal backend. On the CUDA/Linux build
-    // (`mlx_metal_is_available()` is false) route straight to the
-    // device-agnostic ops path instead of paying a per-layer-per-token
-    // throw/catch (which would also contaminate decode-perf numbers).
-    let use_kernel = use_kernel && crate::engine::persistence::compiled_forward_backend_available();
+    // Preserve the caller's `use_kernel` intent: `false` requests strictly
+    // differentiable MLX ops (autograd) on ALL backends, never routing to
+    // non-differentiable custom Metal OR CUDA kernels.
+    let allow_custom_kernel = use_kernel;
+    let use_metal_kernel = allow_custom_kernel && crate::accelerator::metal_ops_available();
 
-    // When use_kernel=false, use only ops-based paths for full differentiability (autograd).
-    // compute_g builds a standard MLX expression graph via C++ (differentiable),
-    // but the fused_gdn_gating Metal kernel and recurrence kernels are NOT differentiable.
-    if !use_kernel {
+    if !use_metal_kernel {
         let beta = Activations::sigmoid(b)?;
         // compute_g returns exp(g_log) directly — use it as the decay gate without log/exp round-trip
         let g = compute_g(a_log, a, dt_bias)?;
@@ -987,17 +1071,39 @@ pub(crate) fn gated_delta_update_with_tape(
             None => MxArray::zeros(&[batch, num_v_heads, v_dim, k_dim], Some(DType::Float32))?,
         };
 
-        // CUDA prefill: collapse the O(T) per-step recurrence into O(T/BT) chunk-serial
-        // batched matmuls (cuBLAS / tensor cores). Default on the CUDA ops path; reverts
-        // to per-step under `MLX_GDN_KERNEL=perstep`. Gated to the genuine non-Metal
-        // backend so the Mac autograd/training ops path stays byte-identical. Decode
-        // (seq < CHUNK_THRESHOLD) and masked calls always take per-step.
+        // The ops path needs the same rollback provenance as the Metal kernel.
+        // q/k are already GQA-expanded, which is what `gated_delta_step` replays.
+        if let Some(sink) = tape_sink.take() {
+            *sink = Some(GdnKernelTape {
+                q: q.clone(),
+                k: k.clone(),
+                v: v.clone(),
+                g: g.clone(),
+                beta: beta.clone(),
+                tiled_heads: false,
+            });
+        }
+
+        // Autograd (`allow_custom_kernel == false`) must stay on strictly
+        // differentiable MLX ops across all backends (Metal, CUDA, and CPU).
+        if !allow_custom_kernel {
+            return gated_delta_ops_serial(&q, &k, v, &g, &beta, &initial_state, mask);
+        }
+
+        // CUDA uses the register-resident recurrence whenever its head geometry is
+        // supported. The generic chunk-parallel path remains the fallback for other
+        // geometries and the explicit `chunked_ops` diagnostic. Metal is unchanged.
         let seq_len = q.shape_at(1)?;
         let choice = gdn_kernel_override();
-        if !crate::engine::persistence::compiled_forward_backend_available()
+        let cuda_recurrent = mask.is_none()
+            && crate::accelerator::cuda_ops_available()
+            && q.shape_at(3)? == 128
+            && v.shape_at(3)? == 128;
+        if !crate::accelerator::host_has_metal()
             && seq_len >= CHUNK_THRESHOLD
             && mask.is_none()
             && choice != GdnKernel::ForcePerStep
+            && (choice == GdnKernel::ForceChunkedOps || !cuda_recurrent)
         {
             // Log-space gate computed directly (NOT g.log()): strong decay underflows the
             // exp-space `g` to 0, and log(0) = -inf makes the chunked decay-diff inf-inf = NaN
@@ -1024,6 +1130,7 @@ pub(crate) fn gated_delta_update_with_tape(
         dt_bias,
         state,
         tiled_gqa,
+        false,
         precomputed_gates,
     )?;
 
@@ -1042,6 +1149,7 @@ pub(crate) fn gated_delta_update_with_tape(
                 v: v.clone(),
                 g: g.clone(),
                 beta: beta.clone(),
+                tiled_heads: tiled_gqa,
             });
         }
         return Ok(result);
@@ -1076,6 +1184,7 @@ fn kernel_inputs(
     dt_bias: &MxArray,
     state: Option<&MxArray>,
     tiled_gqa: bool,
+    compact_cuda: bool,
     precomputed_gates: Option<(&MxArray, &MxArray)>,
 ) -> Result<(MxArray, MxArray, MxArray, MxArray, MxArray)> {
     let batch = q.shape_at(0)?;
@@ -1085,17 +1194,23 @@ fn kernel_inputs(
     let k_dim = q.shape_at(3)?;
     let (beta, g) = match precomputed_gates {
         Some((decay, beta)) => (beta.clone(), decay.clone()),
-        None => match fused_gdn_gating(b, a, a_log, dt_bias, num_v_heads as i32) {
-            Ok((beta_flat, g_flat)) => {
-                let seq_len = b.shape_at(1)?;
-                let beta = beta_flat.reshape(&[batch, seq_len, num_v_heads])?;
-                let g = g_flat.reshape(&[batch, seq_len, num_v_heads])?;
-                (beta, g)
+        None => {
+            if crate::accelerator::cuda_ops_available() {
+                (Activations::sigmoid(b)?, compute_g(a_log, a, dt_bias)?)
+            } else {
+                match fused_gdn_gating(b, a, a_log, dt_bias, num_v_heads as i32) {
+                    Ok((beta_flat, g_flat)) => {
+                        let seq_len = b.shape_at(1)?;
+                        let beta = beta_flat.reshape(&[batch, seq_len, num_v_heads])?;
+                        let g = g_flat.reshape(&[batch, seq_len, num_v_heads])?;
+                        (beta, g)
+                    }
+                    Err(_) => (Activations::sigmoid(b)?, compute_g(a_log, a, dt_bias)?),
+                }
             }
-            Err(_) => (Activations::sigmoid(b)?, compute_g(a_log, a, dt_bias)?),
-        },
+        }
     };
-    let (q, k) = if num_v_heads != num_k_heads && !tiled_gqa {
+    let (q, k) = if num_v_heads != num_k_heads && !tiled_gqa && !compact_cuda {
         if num_k_heads == 0 {
             return Err(Error::from_reason(
                 "GatedDelta: num_k_heads is 0, cannot compute GQA repeat factor",
@@ -1150,7 +1265,8 @@ pub(crate) fn gated_delta_update_fused(
 ) -> Result<Option<(MxArray, MxArray)>> {
     if !use_kernel
         || mask.is_some()
-        || !crate::engine::persistence::compiled_forward_backend_available()
+        || (!crate::engine::persistence::compiled_forward_backend_available()
+            && !crate::accelerator::cuda_ops_available())
         || v.shape_at(3)? != 128
         || q.shape_at(3)? % 32 != 0
         || !(1..=32).contains(&v.shape_at(1)?)
@@ -1161,6 +1277,7 @@ pub(crate) fn gated_delta_update_fused(
     {
         return Ok(None);
     }
+    let compact_cuda = crate::accelerator::cuda_ops_available();
     let (q, k, g, beta, initial_state) = kernel_inputs(
         q,
         k,
@@ -1171,12 +1288,14 @@ pub(crate) fn gated_delta_update_fused(
         dt_bias,
         state,
         tiled_gqa,
+        compact_cuda,
         precomputed_gates,
     )?;
     if beta.dtype()? != DType::BFloat16 || g.dtype()? != DType::Float32 {
         return Ok(None);
     }
-    let Ok(result) = gated_delta_fused_step(&q, &k, v, &g, &beta, &initial_state, &tail) else {
+    let Ok(result) = gated_delta_fused_step(&q, &k, v, &g, &beta, &initial_state, &tail, tiled_gqa)
+    else {
         return Ok(None);
     };
     if let Some(sink) = tape_sink {
@@ -1186,6 +1305,7 @@ pub(crate) fn gated_delta_update_fused(
             v: v.clone(),
             g,
             beta,
+            tiled_heads: tiled_gqa,
         });
     }
     Ok(Some(result))
@@ -1438,6 +1558,7 @@ pub(crate) mod tests {
             g: gate(DType::Float32),
             // Production beta is model dtype (bf16) while g stays f32.
             beta: gate(DType::BFloat16),
+            tiled_heads: hk != hv,
         };
         (tape, rand_f32(&[b, hv, dv, dk]))
     }
@@ -1572,7 +1693,7 @@ pub(crate) mod tests {
     /// `maxTotalThreadsPerThreadgroup >= 8 * dv` when the pipeline is built,
     /// so the entry itself reports decline — a device limit, not test input.
     pub(crate) fn fused_step_launches() -> bool {
-        if !unsafe { sys::mlx_metal_is_available() } {
+        if !unsafe { sys::mlx_metal_is_available() } && !crate::accelerator::cuda_ops_available() {
             return false;
         }
         let z = MxArray::zeros(&[1, 1, 128], Some(DType::BFloat16)).unwrap();
@@ -1591,6 +1712,7 @@ pub(crate) mod tests {
             &MxArray::zeros(&[1, 1, 1], Some(DType::BFloat16)).unwrap(),
             &MxArray::zeros(&[1, 1, 128, 128], Some(DType::Float32)).unwrap(),
             &tail,
+            true,
         )
         .is_ok()
     }
@@ -1685,7 +1807,7 @@ pub(crate) mod tests {
                 state_dst: None,
             };
             let (out, state) = gated_delta_fused_step(
-                &tape.q, &tape.k, &tape.v, &tape.g, &tape.beta, &state0, &tail,
+                &tape.q, &tape.k, &tape.v, &tape.g, &tape.beta, &state0, &tail, true,
             )
             .unwrap();
             MxArray::eval_arrays(&[&out, &state, &out_ref, &state_ref]).unwrap();
@@ -1732,7 +1854,7 @@ pub(crate) mod tests {
             state_dst: Some(&dst),
         };
         let (out, state) = gated_delta_fused_step(
-            &tape.q, &tape.k, &tape.v, &tape.g, &tape.beta, &state0, &tail,
+            &tape.q, &tape.k, &tape.v, &tape.g, &tape.beta, &state0, &tail, true,
         )
         .unwrap();
         MxArray::eval_arrays(&[&out, &state, &state_ref]).unwrap();
@@ -1961,7 +2083,8 @@ pub(crate) mod tests {
                 state_dst: None,
             };
             let (out_ref, state_ref) =
-                gated_delta_fused_step(&p[0], &p[1], &p[2], &p[3], &p[4], &state0, &tail).unwrap();
+                gated_delta_fused_step(&p[0], &p[1], &p[2], &p[3], &p[4], &state0, &tail, true)
+                    .unwrap();
             let complete = gated_delta_fused_complete(
                 &GdnPrologue {
                     qkv: &qkv,
@@ -2015,7 +2138,7 @@ pub(crate) mod tests {
     #[test]
     #[ignore]
     fn fused_tail_bench() {
-        if !unsafe { sys::mlx_metal_is_available() }
+        if (!unsafe { sys::mlx_metal_is_available() } && !crate::accelerator::cuda_ops_available())
             || std::env::var_os("MLX_GDN_FUSED_BENCH").is_none()
         {
             return;
@@ -2060,6 +2183,7 @@ pub(crate) mod tests {
                                     eps: 1e-6,
                                     state_dst: None,
                                 },
+                                true,
                             )
                             .unwrap()
                         } else {
@@ -2176,7 +2300,7 @@ pub(crate) mod tests {
                                 .map(|&h| MxArray::from_handle(h, "prepare").unwrap())
                                 .collect();
                             let (o, s) = gated_delta_fused_step(
-                                &p[0], &p[1], &p[2], &p[3], &p[4], state0, &tail,
+                                &p[0], &p[1], &p[2], &p[3], &p[4], state0, &tail, true,
                             )
                             .unwrap();
                             outs.extend([o, s, p[5].clone()]);
@@ -2236,6 +2360,73 @@ pub(crate) mod tests {
             "per-step tape replay must equal the AR per-step loop bit-for-bit \
              (got max_abs_diff={ar_vs_replay:.6e})"
         );
+    }
+
+    #[test]
+    fn ops_forward_records_a_replayable_gqa_tape() {
+        if crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let (tape, state) = tape_and_state(1, 2, 4, 128, 128, 8);
+        let a = rand_bf16(&[1, 8, 4]);
+        let b = rand_bf16(&[1, 8, 4]);
+        let a_log = rand_f32(&[4]);
+        let dt_bias = rand_f32(&[4]);
+        let mut recorded = None;
+        let (_y, direct) = gated_delta_update_with_tape(
+            &tape.q,
+            &tape.k,
+            &tape.v,
+            &a,
+            &b,
+            &a_log,
+            &dt_bias,
+            Some(&state),
+            None,
+            true,
+            false,
+            None,
+            Some(&mut recorded),
+        )
+        .unwrap();
+        let recorded = recorded.expect("the CUDA ops forward records its recurrence inputs");
+        assert_eq!(recorded.q.shape_at(2).unwrap(), 4, "q/k are GQA-expanded");
+        let replayed = recorded.replay_recurrent_state(&state, 8).unwrap();
+        assert_eq!(max_abs_diff(&direct, &replayed), 0.0);
+    }
+
+    #[test]
+    fn ops_replay_matches_the_ops_chain_at_every_prefix() {
+        if crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let (tape, state) = tape_and_state(1, 4, 4, 32, 32, 8);
+        for steps in 0..=8usize {
+            let mut expected = state.clone();
+            for t in 0..steps as i64 {
+                let (_y, next) = gated_delta_step(
+                    &tape.q.slice_axis(1, t, t + 1).unwrap(),
+                    &tape.k.slice_axis(1, t, t + 1).unwrap(),
+                    &tape.v.slice_axis(1, t, t + 1).unwrap(),
+                    &tape.g.slice_axis(1, t, t + 1).unwrap(),
+                    &tape.beta.slice_axis(1, t, t + 1).unwrap(),
+                    &expected,
+                    None,
+                    1,
+                    4,
+                    32,
+                    32,
+                )
+                .unwrap();
+                expected = next;
+            }
+            let replayed = tape.replay_recurrent_state(&state, steps).unwrap();
+            assert_eq!(
+                max_abs_diff(&expected, &replayed),
+                0.0,
+                "CUDA replay diverged at accepted_steps={steps}"
+            );
+        }
     }
 
     /// The fused [`gated_delta_replay`] kernel must equal the sequential T=1
@@ -2346,6 +2537,103 @@ pub(crate) mod tests {
             assert!(od < 1e-2, "T={t}: output max-abs-diff {od} exceeds tol");
             assert!(sd < 1e-2, "T={t}: state max-abs-diff {sd} exceeds tol");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_recurrent_matches_serial_ops_f32() -> Result<()> {
+        if crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { sys::mlx_default_device() } != 1
+        {
+            return Ok(());
+        }
+        let f32 = DType::Float32;
+        for t in [1i64, 8, 17, 64, 65, 2048] {
+            let q = MxArray::random_normal(&[1, t, 4, 128], 0.0, 0.1, Some(f32))?;
+            let k = MxArray::random_normal(&[1, t, 4, 128], 0.0, 0.1, Some(f32))?;
+            let v = MxArray::random_normal(&[1, t, 4, 128], 0.0, 1.0, Some(f32))?;
+            let g =
+                Activations::sigmoid(&MxArray::random_normal(&[1, t, 4], 0.0, 1.0, Some(f32))?)?;
+            let beta =
+                Activations::sigmoid(&MxArray::random_normal(&[1, t, 4], 0.0, 1.0, Some(f32))?)?;
+            let state = MxArray::random_normal(&[1, 4, 128, 128], 0.0, 0.01, Some(f32))?;
+            let (expected_y, expected_state) =
+                gated_delta_ops_serial(&q, &k, &v, &g, &beta, &state, None)?;
+            let (actual_y, actual_state) = gated_delta_cuda(&q, &k, &v, &g, &beta, &state)?;
+            for (label, actual, expected) in [
+                ("output", actual_y, expected_y),
+                ("state", actual_state, expected_state),
+            ] {
+                actual.eval();
+                expected.eval();
+                let actual = actual.to_float32()?;
+                let expected = expected.to_float32()?;
+                let mut error = 0.0f64;
+                let mut reference = 0.0f64;
+                let mut max = 0.0f32;
+                for (&a, &e) in actual.iter().zip(expected.iter()) {
+                    error += f64::from(a - e).powi(2);
+                    reference += f64::from(e).powi(2);
+                    max = max.max((a - e).abs());
+                }
+                let nmse = error / reference.max(f64::MIN_POSITIVE);
+                assert!(
+                    nmse < 2e-7 && max < 5e-2,
+                    "T={t} {label}: NMSE {nmse}, max-abs-diff {max}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore]
+    fn cuda_recurrent_profile() -> Result<()> {
+        if crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { sys::mlx_default_device() } != 1
+        {
+            return Ok(());
+        }
+        let f32 = DType::Float32;
+        for t in [8i64, 1162, 2048] {
+            let q = MxArray::random_normal(&[1, t, 32, 128], 0.0, 0.1, Some(f32))?;
+            let k = MxArray::random_normal(&[1, t, 32, 128], 0.0, 0.1, Some(f32))?;
+            let v = MxArray::random_normal(&[1, t, 32, 128], 0.0, 1.0, Some(f32))?;
+            let g =
+                Activations::sigmoid(&MxArray::random_normal(&[1, t, 32], 0.0, 1.0, Some(f32))?)?;
+            let beta =
+                Activations::sigmoid(&MxArray::random_normal(&[1, t, 32], 0.0, 1.0, Some(f32))?)?;
+            let state = MxArray::zeros(&[1, 32, 128, 128], Some(f32))?;
+            let started = std::time::Instant::now();
+            let (output, state) = gated_delta_cuda(&q, &k, &v, &g, &beta, &state)?;
+            MxArray::eval_arrays_with_context(&[&output, &state], "gdn_recurrent_profile")?;
+            eprintln!("fused GDN T={t}: {:?}", started.elapsed());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_inverse64_matches_row_substitution() -> Result<()> {
+        if crate::engine::persistence::compiled_forward_backend_available()
+            || unsafe { sys::mlx_default_device() } != 1
+        {
+            return Ok(());
+        }
+        let f32 = DType::Float32;
+        let a = MxArray::random_normal(&[2, 3, 64, 64], 0.0, 0.05, Some(f32))?;
+        let idx = MxArray::arange(0.0, 64.0, None, Some(f32))?;
+        let lower = idx.reshape(&[1, 64])?.less(&idx.reshape(&[64, 1])?)?;
+        let a = lower.where_(&a, &MxArray::zeros(&[64, 64], Some(f32))?)?;
+        let actual = invert_i_plus_strict_lower(&a, 64, true)?;
+        let expected = invert_i_plus_strict_lower_ops(&a, 64)?;
+        let diff = actual
+            .sub(&expected)?
+            .abs()?
+            .reshape(&[-1])?
+            .max(Some(&[0]), Some(false))?;
+        diff.eval();
+        let max = diff.item_at_float32(0)?;
+        assert!(max < 1e-4, "CUDA inverse max-abs-diff {max}");
         Ok(())
     }
 
@@ -2608,6 +2896,7 @@ pub(crate) mod tests {
                 &dt_bias,
                 carried.then_some(&state0),
                 tiled,
+                false,
                 None,
             )
             .unwrap();
@@ -2735,9 +3024,10 @@ pub(crate) mod tests {
                     } else {
                         let q_n = crate::nn::rms_norm_scaled(q_raw, &wq, 1e-6).unwrap();
                         let k_n = crate::nn::rms_norm_scaled(k_raw, &wk, 1e-6).unwrap();
-                        let (qk, kk, g, beta, st) =
-                            kernel_inputs(&q_n, &k_n, v, a, b, &a_log, &dt_bias, None, true, None)
-                                .unwrap();
+                        let (qk, kk, g, beta, st) = kernel_inputs(
+                            &q_n, &k_n, v, a, b, &a_log, &dt_bias, None, true, false, None,
+                        )
+                        .unwrap();
                         let (y, s) = gated_delta_kernel(&qk, &kk, v, &g, &beta, &st, None).unwrap();
                         (unfused_tail(&y, z, &w, 1e-6), s)
                     };

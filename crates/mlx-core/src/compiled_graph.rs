@@ -101,11 +101,12 @@ unsafe extern "C" fn builder_trampoline(
 /// Returns `None` when the FFI reports failure (no Metal device, builder
 /// error, arity mismatch) — callers fall back to their eager path. Builder
 /// errors are returned as `Err` so genuine graph bugs surface.
-pub(crate) fn invoke_compiled_graph(
+fn invoke_compiled_graph_impl(
     fn_id: u64,
     inputs: &[&MxArray],
     n_outputs: usize,
     shapeless: bool,
+    no_fuse: bool,
     builder: &mut BuilderFn<'_>,
 ) -> Result<Option<Vec<MxArray>>> {
     let input_ptrs: Vec<*const sys::mlx_array> =
@@ -113,7 +114,7 @@ pub(crate) fn invoke_compiled_graph(
     let mut output_ptrs: Vec<*mut sys::mlx_array> = vec![std::ptr::null_mut(); n_outputs];
     let mut ctx = BuilderCtx { builder, err: None };
     let ok = unsafe {
-        sys::mlx_compiled_graph_invoke(
+        sys::mlx_compiled_graph_invoke_with_mode(
             fn_id,
             Some(builder_trampoline),
             &mut ctx as *mut BuilderCtx<'_> as *mut c_void,
@@ -122,6 +123,7 @@ pub(crate) fn invoke_compiled_graph(
             output_ptrs.as_mut_ptr(),
             output_ptrs.len(),
             shapeless,
+            no_fuse,
         )
     };
     if !ok {
@@ -142,6 +144,28 @@ pub(crate) fn invoke_compiled_graph(
         out.push(MxArray::from_handle(ptr, "compiled graph output")?);
     }
     Ok(Some(out))
+}
+
+pub(crate) fn invoke_compiled_graph(
+    fn_id: u64,
+    inputs: &[&MxArray],
+    n_outputs: usize,
+    shapeless: bool,
+    builder: &mut BuilderFn<'_>,
+) -> Result<Option<Vec<MxArray>>> {
+    invoke_compiled_graph_impl(fn_id, inputs, n_outputs, shapeless, false, builder)
+}
+
+/// Invoke with an explicit fusion mode for this graph only.
+pub(crate) fn invoke_compiled_graph_with_mode(
+    fn_id: u64,
+    inputs: &[&MxArray],
+    n_outputs: usize,
+    shapeless: bool,
+    no_fuse: bool,
+    builder: &mut BuilderFn<'_>,
+) -> Result<Option<Vec<MxArray>>> {
+    invoke_compiled_graph_impl(fn_id, inputs, n_outputs, shapeless, no_fuse, builder)
 }
 
 /// Erase every cached compiled-graph entry whose fn_id matches `value` under

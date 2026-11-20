@@ -149,6 +149,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn d256_vector_attention_matches_explicit_mask() {
+        let batch = 1i64;
+        let heads = 24i64;
+        let kv_heads = 4i64;
+        let kv_len = 1100i64;
+        let head_dim = 256i64;
+        let scale = 1.0 / (head_dim as f64).sqrt();
+        let k = MxArray::from_float32(
+            &deterministic_data((batch * kv_heads * kv_len * head_dim) as usize, 1.0),
+            &[batch, kv_heads, kv_len, head_dim],
+        )
+        .unwrap()
+        .astype(crate::array::DType::BFloat16)
+        .unwrap();
+        let v = MxArray::from_float32(
+            &deterministic_data((batch * kv_heads * kv_len * head_dim) as usize, 2.0),
+            &[batch, kv_heads, kv_len, head_dim],
+        )
+        .unwrap()
+        .astype(crate::array::DType::BFloat16)
+        .unwrap();
+
+        for q_len in [5i64, 8] {
+            let q = MxArray::from_float32(
+                &deterministic_data((batch * heads * q_len * head_dim) as usize, 0.0),
+                &[batch, heads, q_len, head_dim],
+            )
+            .unwrap()
+            .astype(crate::array::DType::BFloat16)
+            .unwrap();
+            let mask =
+                create_causal_mask(q_len as i32, Some((kv_len - q_len) as i32), None).unwrap();
+            let explicit = scaled_dot_product_attention(&q, &k, &v, scale, Some(&mask)).unwrap();
+            let vector = scaled_dot_product_attention_causal(&q, &k, &v, scale).unwrap();
+            let explicit = explicit.to_float32().unwrap();
+            let vector = vector.to_float32().unwrap();
+            assert_eq!(explicit.len(), vector.len());
+            let mut error = 0.0f64;
+            let mut reference = 0.0f64;
+            let mut max_diff = 0.0f32;
+            let mut worst = (0usize, 0.0f32, 0.0f32);
+            for (idx, (a, b)) in explicit.iter().zip(vector.iter()).enumerate() {
+                let diff = (a - b).abs();
+                error += f64::from(diff * diff);
+                reference += f64::from(b * b);
+                if diff > max_diff {
+                    max_diff = diff;
+                    worst = (idx, *a, *b);
+                }
+            }
+            let nmse = error / reference.max(f64::MIN_POSITIVE);
+            assert!(
+                nmse < 1e-5 && max_diff < 1e-2,
+                "D256 SDPA diverged from explicit mask at q_len={q_len}: NMSE={nmse}, max_diff={max_diff}, worst={worst:?}"
+            );
+        }
+    }
+
     /// The verify-block split used by `Qwen3_5Attention::forward` when
     /// `q_len * gqa > 32` overflows the fused vector kernel's threadgroup:
     /// the head chunk attends to keys truncated at `kv_len - tail`, the tail

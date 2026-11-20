@@ -1628,71 +1628,66 @@ fn main() -> io::Result<()> {
         println!("cargo:rustc-link-lib=framework=Accelerate");
         println!("cargo:rustc-link-lib=c++");
     } else if target_os == "linux" {
-        // CUDA runtime + math libs are PRIVATE deps of the static libmlx —
-        // they are not re-exported through the .a, so we must re-declare them
-        // for the final link of the .node addon. Search both the CUDA lib dir
-        // and the stubs dir (libcuda.so lives only in stubs at build time;
-        // the real driver is found at runtime via LD_LIBRARY_PATH).
-        let cuda_path = env::var("CUDA_PATH")
-            .or_else(|_| env::var("CUDA_HOME"))
-            .unwrap_or_else(|_| "/usr/local/cuda".into());
-        println!("cargo:rustc-link-search=native={cuda_path}/lib64");
-        println!("cargo:rustc-link-search=native={cuda_path}/lib64/stubs");
-        for l in [
-            "cudart", "cublas", "cublasLt", "cufft", "cusolver", "nvrtc", "cuda",
-        ] {
-            println!("cargo:rustc-link-lib=dylib={l}");
+        if build_cuda {
+            // CUDA runtime + math libs are PRIVATE deps of the static libmlx —
+            // they are not re-exported through the .a, so we must re-declare them
+            // for the final link of the .node addon. Search both the CUDA lib dir
+            // and the stubs dir (libcuda.so lives only in stubs at build time;
+            // the real driver is found at runtime via LD_LIBRARY_PATH).
+            let cuda_path = env::var("CUDA_PATH")
+                .or_else(|_| env::var("CUDA_HOME"))
+                .unwrap_or_else(|_| "/usr/local/cuda".into());
+            println!("cargo:rustc-link-search=native={cuda_path}/lib64");
+            println!("cargo:rustc-link-search=native={cuda_path}/lib64/stubs");
+            for l in [
+                "cudart", "cublas", "cublasLt", "cufft", "cusolver", "nvrtc", "cuda",
+            ] {
+                println!("cargo:rustc-link-lib=dylib={l}");
+            }
+            println!("cargo:rustc-link-lib=dylib=cudnn");
         }
-        // cuDNN: MLX 9.x uses the split cuDNN. The umbrella `cudnn` shim
-        // re-exports the sub-libraries on most installs; if the link reports
-        // unresolved cuDNN symbols, the real sub-lib names (cudnn_graph,
-        // cudnn_ops, cudnn_engines_*) are added below after verifying against
-        // the cmake link line.
-        println!("cargo:rustc-link-lib=dylib=cudnn");
         // MLX keeps its CPU backend on even for a CUDA build (some ops have no
         // CUDA path), so its CBLAS/LAPACK symbols (e.g. `cblas_dgemm`) are
-        // PRIVATE deps of static libmlx that must be re-declared for the final
-        // link. `libblas.so` provides the CBLAS interface; `liblapack.so` the
-        // LAPACK ops. (MLX's CMake found these at /usr/lib/aarch64-linux-gnu.)
-        for l in ["lapack", "blas"] {
-            println!("cargo:rustc-link-lib=dylib={l}");
-        }
-        for l in ["stdc++", "dl", "pthread"] {
+        // PRIVATE deps of static libmlx that must be re-declared for both CUDA
+        // and CPU-only Linux builds.
+        for l in ["lapack", "blas", "stdc++", "dl", "pthread"] {
             println!("cargo:rustc-link-lib=dylib={l}");
         }
     } else if target_os == "windows" {
-        let (cuda, cudnn) = windows_cuda_roots();
-        let arch = if target_arch == "aarch64" {
-            "arm64"
-        } else {
-            "x64"
-        };
-        for dir in [
-            cuda.join("lib").join(arch),
-            windows_cudnn_lib_dir(&cudnn, arch),
-        ] {
-            println!("cargo:rustc-link-search=native={}", dir.display());
-        }
         let blas = if target_arch == "aarch64" {
             "openblas"
         } else {
             "libopenblas"
         };
-        for lib in [
-            blas,
-            "cudart",
-            "cublasLt",
-            "cufft",
-            "cusolver",
-            "nvrtc",
-            "cuda",
-            "cudnn",
-            "cudnn_graph",
-            "cudnn_engines_runtime_compiled",
-            "dxgi",
-            "Psapi",
-        ] {
-            println!("cargo:rustc-link-lib=dylib={lib}");
+        println!("cargo:rustc-link-lib=dylib={blas}");
+        println!("cargo:rustc-link-lib=dylib=Psapi");
+        if build_cuda {
+            let (cuda, cudnn) = windows_cuda_roots();
+            let arch = if target_arch == "aarch64" {
+                "arm64"
+            } else {
+                "x64"
+            };
+            for dir in [
+                cuda.join("lib").join(arch),
+                windows_cudnn_lib_dir(&cudnn, arch),
+            ] {
+                println!("cargo:rustc-link-search=native={}", dir.display());
+            }
+            for lib in [
+                "cudart",
+                "cublasLt",
+                "cufft",
+                "cusolver",
+                "nvrtc",
+                "cuda",
+                "cudnn",
+                "cudnn_graph",
+                "cudnn_engines_runtime_compiled",
+                "dxgi",
+            ] {
+                println!("cargo:rustc-link-lib=dylib={lib}");
+            }
         }
     }
 

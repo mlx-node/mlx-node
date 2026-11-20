@@ -270,21 +270,18 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn execution_plan(&self) -> ExecutionPlan {
-        // Speculative turns verify on the pool; a load without one serves
-        // autoregressive turns only.
-        let speculative = if self.paged_adapter.is_none() {
-            None
-        } else if self.dflash2.is_some() {
+        let speculative = if self.dflash2.is_some() {
             Some(SpeculativePlan {
                 kind: SpeculativeKind::DraftModel,
                 supported_input_media: MediaCapabilities::NONE,
                 supported_context_media: MediaCapabilities::NONE,
-                // DFlash2 verifies on the paged pool (Splash has no flat
-                // lane); the draft blocks scheduled speculation, so the lane
-                // is Barrier.
-                supports_paged_attention: true,
+                // Metal verifies on the pool. Off Metal the cold-start eager
+                // flat lane verifies with ordinary MLX ops and cache rollback.
+                supports_paged_attention: self.paged_adapter.is_some(),
                 supports_streaming: true,
             })
+        } else if self.paged_adapter.is_none() {
+            None
         } else {
             self.has_mtp_weights().then_some(SpeculativePlan {
                 kind: SpeculativeKind::NativeMtp,
@@ -359,6 +356,21 @@ impl ChatBackend for Qwen35Inner {
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         self.paged_turn_entry(args)
             .map_err(|error| crate::models::qwen3_5::dflash2_turn::whole_turn_oom(self, error))
+    }
+
+    fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        debug_assert!(self.paged_adapter.is_none());
+        debug_assert!(args.media.is_empty());
+        if matches!(
+            args.plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel)
+        ) {
+            self.flat_dflash2_turn(args)
+        } else {
+            Err(Error::from_reason(
+                "Qwen3.5 flat speculative turn requires the external DFlash2 companion",
+            ))
+        }
     }
 
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {

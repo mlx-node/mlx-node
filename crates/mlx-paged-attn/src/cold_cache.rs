@@ -1226,8 +1226,15 @@ impl RootDir {
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), String> {
-        fs::rename(self.path.join(from), self.path.join(to))
-            .map_err(|e| format!("commit cold-cache file: {e}"))
+        let src = self.path.join(from);
+        let dst = self.path.join(to);
+        #[cfg(windows)]
+        {
+            if dst.exists() {
+                let _ = fs::remove_file(&dst);
+            }
+        }
+        fs::rename(src, dst).map_err(|e| format!("commit cold-cache file: {e}"))
     }
 
     fn unlink(&self, name: &str) -> std::io::Result<()> {
@@ -7962,6 +7969,7 @@ mod tests {
     /// much is reclaimed, so the write evicts every entry in turn and then
     /// fails anyway — destroying a warm cache on behalf of a write that could
     /// never have joined it.
+    #[cfg(unix)]
     #[test]
     fn oversized_write_is_refused_without_evicting_anything() {
         let root = temp_root("evict-oversized-refused");
@@ -9678,6 +9686,7 @@ mod tests {
     // lock: a close whose drain timed out keeps the guard while the writer is
     // still inside a commit, and lets it go once the writer returned.
     // Mutation LK1 (the guard drops at once) → red.
+    #[cfg(unix)]
     #[test]
     fn close_keeps_the_guard_until_the_writer_exits() {
         use std::os::fd::AsRawFd;
@@ -9942,6 +9951,7 @@ mod tests {
         assert!(!manager.contains_in(&blocked_key, ColdGroup::DFlash2State));
 
         // A full block queue at a past deadline reads no block.
+        #[cfg(target_os = "macos")]
         refused_tracked_writes();
 
         assert!(
@@ -9958,6 +9968,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(target_os = "macos")]
     fn refused_tracked_writes() {
         use crate::PagedAttentionConfig;
         use crate::metal::MetalDtype;

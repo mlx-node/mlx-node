@@ -219,13 +219,32 @@ impl KVCache {
         // This is O(N) instead of O(N²) concatenation!
         self.offset = next;
 
-        // Get mutable references and perform TRUE in-place updates
-        // This modifies the pre-allocated buffers directly without creating new arrays!
-        if let Some(cached_keys) = self.keys.as_mut() {
-            cached_keys.slice_assign_axis_inplace(2, prev as i64, self.offset as i64, keys)?;
+        // On CUDA, MLX's slice_update copies the whole pre-allocated cache buffer
+        // on every step; kernels::kv::store_kv_pair writes only the new rows in place.
+        let mut stored_in_place = false;
+        if crate::accelerator::cuda_ops_available()
+            && let (Some(cached_keys), Some(cached_values)) = (&self.keys, &self.values)
+            && let Some((new_k, new_v)) =
+                crate::kernels::kv::store_kv_pair(cached_keys, cached_values, keys, values, prev)?
+        {
+            self.keys = Some(new_k);
+            self.values = Some(new_v);
+            stored_in_place = true;
         }
-        if let Some(cached_values) = self.values.as_mut() {
-            cached_values.slice_assign_axis_inplace(2, prev as i64, self.offset as i64, values)?;
+        if !stored_in_place {
+            // Get mutable references and perform TRUE in-place updates
+            // This modifies the pre-allocated buffers directly without creating new arrays!
+            if let Some(cached_keys) = self.keys.as_mut() {
+                cached_keys.slice_assign_axis_inplace(2, prev as i64, self.offset as i64, keys)?;
+            }
+            if let Some(cached_values) = self.values.as_mut() {
+                cached_values.slice_assign_axis_inplace(
+                    2,
+                    prev as i64,
+                    self.offset as i64,
+                    values,
+                )?;
+            }
         }
 
         // Return slice of buffer containing valid data [0:offset]

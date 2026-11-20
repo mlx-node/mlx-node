@@ -195,6 +195,87 @@ pub(super) fn forward_pre_norm_inner(
     )
 }
 
+/// How much of the sequence an external-draft target forward must project.
+pub(crate) enum DFlash2LogitsSpan {
+    All,
+    LastRow,
+}
+
+/// Device-agnostic DFlash2 target forward. It captures the draft's residual
+/// taps and, for a verify block, the GDN tape needed to keep only accepted
+/// rows. The Metal pool path has its own fused implementation.
+pub(crate) fn forward_dflash2_eager_with_taps(
+    inner: &mut Qwen35Inner,
+    input_ids: &MxArray,
+    tap_layers: &[usize],
+    record_tape: bool,
+    logits_span: DFlash2LogitsSpan,
+) -> Result<(
+    MxArray,
+    Vec<MxArray>,
+    Vec<Option<super::super::gated_delta_net::GdnLayerTape>>,
+)> {
+    if tap_layers.is_empty() || tap_layers.iter().any(|&layer| layer >= inner.layers.len()) {
+        return Err(Error::from_reason(format!(
+            "DFlash2 target tap layers are invalid: {tap_layers:?} for {} layers",
+            inner.layers.len()
+        )));
+    }
+    if input_ids.shape_at(1)? == 0 {
+        return Err(Error::from_reason(
+            "DFlash2 target forward needs at least one token",
+        ));
+    }
+    let mut hidden = inner.embedding.forward(input_ids)?;
+    let mut taps = vec![None; tap_layers.len()];
+    let mut tape = (0..inner.layers.len()).map(|_| None).collect::<Vec<_>>();
+    for index in 0..inner.layers.len() {
+        let cache = inner.caches.as_mut().map(|caches| &mut caches[index]);
+        hidden = if record_tape {
+            let mut slot = None;
+            let hidden = inner.layers[index].forward_with_tape(
+                &hidden,
+                None,
+                cache,
+                None,
+                true,
+                Some(&mut slot),
+            )?;
+            tape[index] = slot;
+            hidden
+        } else {
+            inner.layers[index].forward(&hidden, None, cache, None, true)?
+        };
+        for (slot, &tap_layer) in tap_layers.iter().enumerate() {
+            if tap_layer == index {
+                taps[slot] = Some(hidden.clone());
+            }
+        }
+    }
+    let taps = taps
+        .into_iter()
+        .enumerate()
+        .map(|(slot, tap)| {
+            tap.ok_or_else(|| {
+                Error::from_reason(format!(
+                    "DFlash2 target tap {} at layer {} was not captured",
+                    slot, tap_layers[slot]
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let hidden = match logits_span {
+        DFlash2LogitsSpan::All => hidden,
+        DFlash2LogitsSpan::LastRow => {
+            let rows = hidden.shape_at(1)?;
+            hidden.slice_axis(1, rows - 1, rows)?
+        }
+    };
+    let normalized = inner.final_norm.forward(&hidden)?;
+    let logits = project_logits_from_hidden(&normalized, &inner.lm_head, &inner.embedding)?;
+    Ok((logits, taps, tape))
+}
+
 pub(super) fn project_logits_from_hidden(
     hidden: &MxArray,
     lm_head: &Option<LinearProj>,

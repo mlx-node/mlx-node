@@ -354,12 +354,11 @@ impl Qwen35Inner {
         }
     }
 
-    /// A DFlash2 companion verifies on the block-paged pool with the fused
-    /// GDN kernel; a load that builds no pool, or whose GDN layers that kernel
-    /// cannot run, refuses it (Splash has no flat lane, and `compiledGdn`
-    /// fails closed).
+    /// Metal verifies DFlash2 on the block-paged pool with the fused GDN
+    /// kernel, so a pool load refuses an off-contract GDN layer before its
+    /// first prefill. Off-Metal loads use the eager flat lane instead.
     pub(crate) fn require_dflash2_pool(&self) -> Result<()> {
-        if self.dflash2.is_some() {
+        if self.dflash2.is_some() && self.paged_adapter.is_some() {
             for (index, layer) in self.layers.iter().enumerate() {
                 if let crate::models::qwen3_5::decoder_layer::AttentionType::Linear(gdn) =
                     &layer.attn
@@ -372,12 +371,6 @@ impl Qwen35Inner {
                     )));
                 }
             }
-        }
-        if self.dflash2.is_some() && self.paged_adapter.is_none() {
-            return Err(Error::from_reason(
-                "Qwen3.8 DFlash2 runs on the block-paged KV pool, which this load has none \
-                 of (it needs Metal); load without the companion (autoLoadDraft: false)",
-            ));
         }
         Ok(())
     }
@@ -494,6 +487,17 @@ impl Qwen35Inner {
     /// Called once at load time after construction.
     pub(crate) fn set_gen_defaults(&mut self, defaults: crate::engine::ModelGenerationDefaults) {
         self.gen_defaults = defaults;
+    }
+
+    /// Release the dense K-quant copies a DFlash2 turn used for prefill and
+    /// verification, returning every projection to packed-only residency.
+    pub(crate) fn clear_cuda_dense_prefill(&mut self) {
+        for layer in &self.layers {
+            layer.clear_cuda_dense_prefill();
+        }
+        if let Some(lm_head) = &self.lm_head {
+            lm_head.clear_cuda_dense_prefill();
+        }
     }
 
     /// Initialize KV caches.

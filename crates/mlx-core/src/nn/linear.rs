@@ -96,6 +96,13 @@ impl Linear {
         } else if let Some(ref b) = self.bias {
             input.addmm(b, &self.weight_t, None, None)
         } else {
+            if let Some(out) = crate::kernels::linear::bf16_matmul_few(
+                input,
+                &self.weight,
+                i64::from(self.out_features),
+            )? {
+                return Ok(out);
+            }
             input.matmul(&self.weight_t)
         }
     }

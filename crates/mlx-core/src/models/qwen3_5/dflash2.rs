@@ -336,6 +336,7 @@ struct DraftExecutionPolicy {
     compile_override: Option<bool>,
     attention_override: Option<bool>,
     supported_moe: bool,
+    dense_cuda: bool,
     source_conv_requested: bool,
     source_conv_supported: bool,
 }
@@ -351,6 +352,7 @@ impl DraftExecutionPolicy {
             compile_override: compile.map(|value| value == "1"),
             attention_override: attention.map(|value| value == "1"),
             supported_moe: false,
+            dense_cuda: false,
             source_conv_requested: source_conv == Some("1"),
             source_conv_supported: false,
         }
@@ -363,6 +365,7 @@ impl DraftExecutionPolicy {
             attention_override: std::env::var_os("MLX_DFLASH2_ATTENTION_NAX")
                 .map(|value| value == "1"),
             supported_moe: false,
+            dense_cuda: false,
             source_conv_requested: std::env::var_os("MLX_DFLASH2_SOURCE_CONV")
                 .is_some_and(|value| value == "1"),
             source_conv_supported: false,
@@ -383,8 +386,14 @@ impl DraftExecutionPolicy {
         self.source_conv_requested && self.supported_moe && self.source_conv_supported
     }
 
+    fn with_dense_cuda_profile(mut self, supported: bool) -> Self {
+        self.dense_cuda = supported;
+        self
+    }
+
     fn compile_draft(self) -> bool {
-        self.compile_override.unwrap_or(self.supported_moe)
+        self.compile_override
+            .unwrap_or(self.supported_moe || self.dense_cuda)
     }
 
     fn tensor_attention(self) -> bool {
@@ -702,30 +711,21 @@ impl DFlash2Attention {
         let batch = queries.shape_at(0)?;
         let seq = queries.shape_at(2)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut tensor_op = std::ptr::null_mut();
-        let status = unsafe {
-            sys::mlx_dflash2_attention_with_policy(
-                queries.as_raw_ptr(),
-                keys.as_raw_ptr(),
-                values.as_raw_ptr(),
-                mask.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
-                scale as f32,
-                self.tensor_attention_enabled,
-                &mut tensor_op,
-            )
-        };
-        // Unsupported devices, shapes and a disabled per-model policy use
-        // the established attention path. A constructed graph's execution
-        // errors propagate; cache mutation is never retried after a failure.
-        let attended = match status {
-            1 => MxArray::from_handle(tensor_op, "dflash2 tensor-op attention")?,
-            0 => {
+        let attended = match crate::kernels::attention::sdpa_draft_masked(
+            queries,
+            keys,
+            values,
+            mask,
+            self.head_dim,
+            self.num_heads,
+            self.num_kv_heads,
+            seq,
+            scale as f32,
+            self.tensor_attention_enabled,
+        )? {
+            Some(out) => out,
+            None => {
                 scaled_dot_product_attention(queries, keys, values, scale, broadcast_mask.or(mask))?
-            }
-            _ => {
-                return Err(Error::from_reason(
-                    "DFlash2 tensor-op attention construction failed",
-                ));
             }
         }
         .transpose(Some(&[0, 2, 1, 3]))?
@@ -1106,29 +1106,19 @@ pub(crate) enum SelectorPath {
 }
 
 impl CandidateSelector {
-    /// Sharded top-16 over the vocab via `mlx_dflash2_topk16`: two Metal
-    /// dispatches instead of argpartition's full per-row merge sort. Returns
+    /// Fused top-16 over the vocab via the Metal or CUDA primitive. Returns
     /// (ids [1,L,16] i32, values [1,L,16] f32) ascending by value — the same
     /// contract the argpartition slice produces. `None` falls back to the
-    /// generic path (non-16 K, non-Metal, shape/dtype mismatch).
+    /// generic path for shape, dtype, or backend capability misses.
     fn fused_topk16(&self, logits: &MxArray) -> Option<(MxArray, MxArray)> {
-        if self.top_k != 16 || !unsafe { sys::mlx_metal_is_available() } {
+        if self.top_k != 16 {
             return None;
         }
         let shape = logits.shape().ok()?;
         if shape.len() != 3 || shape[0] != 1 {
             return None;
         }
-        let mut ids = std::ptr::null_mut();
-        let mut values = std::ptr::null_mut();
-        if !unsafe { sys::mlx_dflash2_topk16(logits.as_raw_ptr(), &mut ids, &mut values) }
-            || ids.is_null()
-            || values.is_null()
-        {
-            return None;
-        }
-        let ids = MxArray::from_handle(ids, "dflash2_topk16:ids").ok()?;
-        let values = MxArray::from_handle(values, "dflash2_topk16:values").ok()?;
+        let (ids, values) = crate::kernels::dflash2::topk16(logits)?;
         // The kernel emits f32 values (widened for the merge compare), while
         // the take_along_axis fallback returns logits.dtype(). bf16→f32 is
         // lossless, so casting back restores bit-parity: `scores`' add then
@@ -1140,22 +1130,12 @@ impl CandidateSelector {
     }
 
     /// One-dispatch version of the device-resident greedy predecessor walk.
-    /// The Metal kernel scans each selected score row in reverse with strict
+    /// The Metal/CUDA kernel scans each selected score row in reverse with strict
     /// `>`, exactly matching the lazy fallback's reversed MLX argmax: the last
     /// non-NaN maximum wins, NaNs do not win, and an all-NaN/-inf row selects
     /// the final slot. `None` keeps the existing lazy graph as the fallback.
     fn fused_greedy_path(&self, candidates: &MxArray, scores: &MxArray) -> Option<MxArray> {
-        if !unsafe { sys::mlx_metal_is_available() } {
-            return None;
-        }
-        let mut path = std::ptr::null_mut();
-        if !unsafe {
-            sys::mlx_dflash2_greedy_path(candidates.as_raw_ptr(), scores.as_raw_ptr(), &mut path)
-        } || path.is_null()
-        {
-            return None;
-        }
-        MxArray::from_handle(path, "dflash2_greedy_path").ok()
+        crate::kernels::dflash2::greedy_path(candidates, scores)
     }
 
     /// Same greedy predecessor decisions, with temperature-one confidence for
@@ -1165,25 +1145,7 @@ impl CandidateSelector {
         candidates: &MxArray,
         scores: &MxArray,
     ) -> Option<(MxArray, MxArray)> {
-        if !unsafe { sys::mlx_metal_is_available() } {
-            return None;
-        }
-        let mut path = std::ptr::null_mut();
-        let mut confidence = std::ptr::null_mut();
-        if !unsafe {
-            sys::mlx_dflash2_greedy_path_confidence(
-                candidates.as_raw_ptr(),
-                scores.as_raw_ptr(),
-                &mut path,
-                &mut confidence,
-            )
-        } {
-            return None;
-        }
-        Some((
-            MxArray::from_handle(path, "dflash2_greedy_path_confidence:path").ok()?,
-            MxArray::from_handle(confidence, "dflash2_greedy_path_confidence:confidence").ok()?,
-        ))
+        crate::kernels::dflash2::greedy_path_confidence(candidates, scores)
     }
 
     /// Original lazy device walk, retained both as the contract fallback and
@@ -1400,28 +1362,8 @@ impl CandidateSelector {
 }
 
 fn store_window_tail(window: &[MxArray], keys: &MxArray, values: &MxArray) -> Result<Vec<MxArray>> {
-    if window.len() != 4 {
-        return Err(Error::from_reason(
-            "compiled draft window expects full K/V and two views",
-        ));
-    }
-    let args = [
-        window[0].as_raw_ptr(),
-        window[1].as_raw_ptr(),
-        window[2].as_raw_ptr(),
-        window[3].as_raw_ptr(),
-        keys.as_raw_ptr(),
-        values.as_raw_ptr(),
-    ];
-    let mut out = [std::ptr::null_mut(); 4];
-    if !unsafe { sys::mlx_kv_store_window_tail(args.as_ptr(), out.as_mut_ptr()) } {
-        return Err(Error::from_reason(
-            "compiled draft KV tail-store contract failed",
-        ));
-    }
-    out.into_iter()
-        .map(|handle| MxArray::from_handle(handle, "compiled draft tail store"))
-        .collect()
+    crate::kernels::kv::store_window_tail(window, keys, values)?
+        .ok_or_else(|| Error::from_reason("compiled draft KV tail-store contract failed"))
 }
 
 /// Whether draft projections of the given row widths may be row-merged (and
@@ -1707,25 +1649,15 @@ impl DraftKvWindow {
         let (Some(buffer_keys), Some(buffer_values)) = (&self.keys, &self.values) else {
             return Err(Error::from_reason("DFlash2 draft window has no buffers"));
         };
-        let dst = [buffer_keys.as_raw_ptr(), buffer_values.as_raw_ptr()];
-        let src = [keys.as_raw_ptr(), values.as_raw_ptr()];
-        let offsets = [offset as i32; 2];
-        let mut out: [*mut sys::mlx_array; 2] = [std::ptr::null_mut(); 2];
-        // SAFETY: every pointer is a live array handle for the call; `out`
-        // receives owned handles (same buffers as `dst`) or stays null.
-        let fused = unsafe { sys::mlx_metal_is_available() }
-            && unsafe {
-                sys::mlx_kv_store_rows(
-                    2,
-                    dst.as_ptr(),
-                    src.as_ptr(),
-                    offsets.as_ptr(),
-                    out.as_mut_ptr(),
-                )
-            };
-        if fused {
-            self.keys = Some(MxArray::from_handle(out[0], "draft_kv_store:keys")?);
-            self.values = Some(MxArray::from_handle(out[1], "draft_kv_store:values")?);
+        if let Some((new_k, new_v)) = crate::kernels::kv::store_kv_pair(
+            buffer_keys,
+            buffer_values,
+            keys,
+            values,
+            offset as i32,
+        )? {
+            self.keys = Some(new_k);
+            self.values = Some(new_v);
             return Ok(());
         }
         let (Some(buffer_keys), Some(buffer_values)) = (&mut self.keys, &mut self.values) else {
@@ -2068,6 +2000,14 @@ pub(crate) struct DFlash2Model {
 }
 
 impl DFlash2Model {
+    /// Dense CUDA uses the same compiled whole-block draft as the supported
+    /// MoE profile. Metal retains the captured dense policy unchanged.
+    pub(crate) fn configure_dense_execution(&mut self) {
+        let cuda = crate::accelerator::cuda_ops_available();
+        self.invalidate_compiled();
+        self.execution_policy = self.execution_policy.with_dense_cuda_profile(cuda);
+    }
+
     /// Called only by the MoE loader after target validation and before the
     /// companion is published. Dense loaders retain the captured unset-off
     /// policy. Runtime hardware, dtype, shape and gradient guards still apply.
@@ -2377,7 +2317,6 @@ impl DFlash2Model {
         with_confidence: bool,
     ) -> Result<Option<(MxArray, Option<MxArray>)>> {
         if self.compiled.disabled.load(Ordering::Relaxed)
-            || !unsafe { sys::mlx_metal_is_available() }
             || unsafe { sys::mlx_default_device() } != 1
             || self.selector.top_k > 64
             || self.layers.is_empty()
@@ -2507,11 +2446,12 @@ impl DFlash2Model {
             };
         // Once invoked, a failure must reset the turn: an in-place primitive
         // may already have recorded writes. Never retry the same prefix eager.
-        let outputs = crate::compiled_graph::invoke_compiled_graph(
+        let outputs = crate::compiled_graph::invoke_compiled_graph_with_mode(
             fn_id,
             &inputs.iter().collect::<Vec<_>>(),
             cache_output_at + self.layers.len() * 2,
             true,
+            crate::accelerator::cuda_draft_no_fuse(),
             &mut builder,
         )?
         .ok_or_else(|| Error::from_reason("compiled draft invocation failed"))?;
@@ -3817,17 +3757,30 @@ mod tests {
     }
 
     fn direct_fused_greedy(candidates: &MxArray, scores: &MxArray) -> Option<Vec<i32>> {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        let metal = unsafe { mlx_sys::mlx_metal_is_available() };
+        let cuda = crate::accelerator::cuda_ops_available();
+        if !metal && !cuda {
             return None;
         }
         let mut path = std::ptr::null_mut();
-        assert!(unsafe {
-            mlx_sys::mlx_dflash2_greedy_path(
-                candidates.as_raw_ptr(),
-                scores.as_raw_ptr(),
-                &mut path,
-            )
-        });
+        let ok = if metal {
+            unsafe {
+                mlx_sys::mlx_dflash2_greedy_path(
+                    candidates.as_raw_ptr(),
+                    scores.as_raw_ptr(),
+                    &mut path,
+                )
+            }
+        } else {
+            unsafe {
+                mlx_sys::mlx_dflash2_greedy_path_cuda(
+                    candidates.as_raw_ptr(),
+                    scores.as_raw_ptr(),
+                    &mut path,
+                )
+            }
+        };
+        assert!(ok);
         assert!(!path.is_null());
         let path = MxArray::from_handle(path, "test dflash2 greedy path").unwrap();
         Some(path.to_int32().unwrap().as_ref().to_vec())
@@ -3850,8 +3803,10 @@ mod tests {
 
     #[test]
     fn fused_greedy_path_matches_lazy_random_and_branching_walks() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            eprintln!("skipping: fused DFlash2 greedy path requires Metal");
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
+            eprintln!("skipping: fused DFlash2 greedy path needs a supported GPU");
             return;
         }
         for top_k in [4usize, 16] {
@@ -3911,8 +3866,10 @@ mod tests {
 
     #[test]
     fn fused_greedy_path_matches_lazy_ties_infinities_signed_zero_and_nan() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            eprintln!("skipping: fused DFlash2 greedy path requires Metal");
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
+            eprintln!("skipping: fused DFlash2 greedy path needs a supported GPU");
             return;
         }
         for top_k in [4usize, 16] {
@@ -4000,8 +3957,10 @@ mod tests {
 
     #[test]
     fn fused_greedy_path_accepts_noncontiguous_views() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            eprintln!("skipping: fused DFlash2 greedy path requires Metal");
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
+            eprintln!("skipping: fused DFlash2 greedy path needs a supported GPU");
             return;
         }
         let (length, top_k) = (7usize, 16usize);
@@ -4026,6 +3985,62 @@ mod tests {
             direct_fused_greedy(&candidates, &scores).unwrap(),
             lazy_greedy(&selector, &candidates, &scores, length),
         );
+    }
+
+    #[test]
+    fn fused_greedy_confidence_matches_selected_softmax_probability() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
+            return;
+        }
+        let (length, top_k) = (7usize, 16usize);
+        let selector = test_selector(32, top_k, 4, 4);
+        let candidates = MxArray::from_int32(
+            &(0..length * top_k).map(|i| i as i32).collect::<Vec<_>>(),
+            &[1, length as i64, top_k as i64],
+        )
+        .unwrap();
+        let scores = MxArray::random_normal(
+            &[length as i64, top_k as i64, top_k as i64],
+            0.0,
+            2.0,
+            Some(DType::Float32),
+        )
+        .unwrap();
+        let score_values = scores.to_float32().unwrap().to_vec();
+        let (path, confidence) = selector
+            .fused_greedy_path_confidence(&candidates, &scores)
+            .unwrap();
+        MxArray::eval_arrays(&[&path, &confidence]).unwrap();
+        assert_eq!(
+            path.to_int32().unwrap().as_ref(),
+            lazy_greedy(&selector, &candidates, &scores, length)
+        );
+        let actual = confidence.to_float32().unwrap();
+        let mut predecessor = 0usize;
+        for position in 0..length {
+            let row = (position * top_k + predecessor) * top_k;
+            let mut selected = top_k - 1;
+            let mut best = f32::NEG_INFINITY;
+            for candidate in (0..top_k).rev() {
+                let value = score_values[row + candidate];
+                if (!best.is_nan() && value.is_nan()) || value > best {
+                    best = value;
+                    selected = candidate;
+                }
+            }
+            let normalizer = (0..top_k)
+                .map(|candidate| (score_values[row + candidate] - best).exp())
+                .sum::<f32>();
+            let expected = 1.0 / normalizer;
+            assert!(
+                (actual[position] - expected).abs() <= 2e-6 * expected.max(1.0),
+                "confidence position {position}: {} vs {expected}",
+                actual[position]
+            );
+            predecessor = selected;
+        }
     }
 
     #[test]
@@ -4067,10 +4082,12 @@ mod tests {
     /// before warmup. Alternating batches limit order/thermal bias. This prints
     /// observations and deliberately asserts no timing threshold.
     #[test]
-    #[ignore = "diagnostic Metal timing; run manually on an idle machine"]
+    #[ignore = "diagnostic GPU timing; run manually on an idle machine"]
     fn benchmark_fused_greedy_path_vs_lazy_graph() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            eprintln!("skipping: DFlash2 greedy-path benchmark requires Metal");
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
+            eprintln!("skipping: DFlash2 greedy-path benchmark needs a supported GPU");
             return;
         }
         const LENGTH: usize = 7;
@@ -4329,6 +4346,65 @@ mod tests {
                 "PASS fused topk16 parity: native scan+merge ran for {ROWS} rows, \
                  dtype={dtype:?}, vocab={vocab}"
             );
+        }
+    }
+
+    #[test]
+    fn cuda_topk16_matches_argpartition_candidate_set() {
+        if !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+        const ROWS: usize = 3;
+        const VOCAB: i64 = 257;
+        let mut data = (0..ROWS * VOCAB as usize)
+            .map(|i| -1.0 - (i % 97) as f32)
+            .collect::<Vec<_>>();
+        for row in 0..ROWS {
+            for rank in 0..16usize {
+                let token = rank * 16 + row + 1;
+                data[row * VOCAB as usize + token] = (rank + 1) as f32;
+            }
+        }
+        let logits = MxArray::from_float32(&data, &[1, ROWS as i64, VOCAB])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let mut ids = std::ptr::null_mut();
+        let mut values = std::ptr::null_mut();
+        let status =
+            unsafe { mlx_sys::mlx_dflash2_topk16_cuda(logits.as_raw_ptr(), &mut ids, &mut values) };
+        assert_eq!(status, 1);
+        let ids = MxArray::from_handle(ids, "CUDA topk16 ids").unwrap();
+        let values = MxArray::from_handle(values, "CUDA topk16 values").unwrap();
+        let ids: Vec<i32> = ids.to_int32().unwrap().as_ref().to_vec();
+        let values: Vec<f32> = values.to_float32().unwrap().as_ref().to_vec();
+        let reference = logits
+            .argpartition(-16, Some(-1))
+            .unwrap()
+            .slice_axis(2, VOCAB - 16, VOCAB)
+            .unwrap();
+        let ref_ids: Vec<i32> = reference.to_int32().unwrap().as_ref().to_vec();
+        let logits_f: Vec<f32> = logits
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .as_ref()
+            .to_vec();
+        for row in 0..ROWS {
+            let mine = &ids[row * 16..(row + 1) * 16];
+            let mine_v = &values[row * 16..(row + 1) * 16];
+            let theirs = &ref_ids[row * 16..(row + 1) * 16];
+            let mut a = mine.to_vec();
+            let mut b = theirs.to_vec();
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "row {row}: candidate sets differ");
+            assert!(mine_v.windows(2).all(|w| w[0] <= w[1]));
+            for (&id, &value) in mine.iter().zip(mine_v.iter()) {
+                assert!(id >= 0 && i64::from(id) < VOCAB);
+                assert_eq!(value, logits_f[row * VOCAB as usize + id as usize]);
+            }
         }
     }
 
@@ -5567,7 +5643,9 @@ mod tests {
 
     #[test]
     fn compiled_draft_replays_positions_windows_and_masks() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
             return;
         }
         let mut model = three_layer_tiny_draft();
@@ -5664,13 +5742,13 @@ mod tests {
             );
             for (left, right) in eager.layers.iter().zip(&compiled.layers) {
                 assert_eq!(
-                    bits(left.keys.as_ref().unwrap()),
                     bits(right.keys.as_ref().unwrap()),
+                    bits(left.keys.as_ref().unwrap()),
                     "K case {case}"
                 );
                 assert_eq!(
-                    bits(left.values.as_ref().unwrap()),
                     bits(right.values.as_ref().unwrap()),
+                    bits(left.values.as_ref().unwrap()),
                     "V case {case}"
                 );
                 assert_eq!(
@@ -5696,7 +5774,9 @@ mod tests {
 
     #[test]
     fn draft_window_tail_rejects_unrelated_view_before_any_write() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
             return;
         }
         let make = |rows| MxArray::zeros(&[1, 2, rows, 16], Some(DType::BFloat16)).unwrap();
@@ -5722,7 +5802,9 @@ mod tests {
 
     #[test]
     fn draft_window_tail_rejects_cross_aliased_blocks_before_any_write() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
             return;
         }
         let make = |rows| MxArray::zeros(&[1, 2, rows, 16], Some(DType::BFloat16)).unwrap();
@@ -5757,7 +5839,9 @@ mod tests {
 
     #[test]
     fn draft_window_tail_preserves_same_buffer_prefix_views() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        if !unsafe { mlx_sys::mlx_metal_is_available() }
+            && !crate::accelerator::cuda_ops_available()
+        {
             return;
         }
         let make = |rows| MxArray::zeros(&[1, 2, rows, 16], Some(DType::BFloat16)).unwrap();

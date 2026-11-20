@@ -374,6 +374,16 @@ pub(super) fn paged_store_attend(
 }
 
 impl Qwen3_5Attention {
+    pub(crate) fn clear_cuda_dense_prefill(&self) {
+        self.q_proj.clear_cuda_dense_prefill();
+        self.k_proj.clear_cuda_dense_prefill();
+        self.v_proj.clear_cuda_dense_prefill();
+        self.o_proj.clear_cuda_dense_prefill();
+        if let Some((merged, _)) = &self.kv_proj {
+            merged.clear_cuda_dense_prefill();
+        }
+    }
+
     pub(crate) fn validate_source_qk_weights(
         &self,
         q: &MxArray,
@@ -868,7 +878,8 @@ impl Qwen3_5Attention {
             // Splitting the query block keeps each call inside the fused
             // kernel: causal alignment follows from qL_off = kL − qL, so the
             // head chunk runs against keys truncated to kL − tail while the
-            // tail chunk sees the full cache.
+            // tail chunk sees the full cache. CUDA launches one block per
+            // query row and can verify the whole block without this split.
             let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
             let vector_dims = matches!(self.head_dim, 64 | 96 | 128 | 256);
             let tail = if (1..=32).contains(&gqa) {
@@ -876,7 +887,12 @@ impl Qwen3_5Attention {
             } else {
                 0
             };
-            if vector_dims && tail >= 1 && seq_len <= 8 && seq_len * gqa > 32 {
+            if vector_dims
+                && tail >= 1
+                && seq_len <= 8
+                && seq_len * gqa > 32
+                && !crate::accelerator::cuda_ops_available()
+            {
                 let head_len = seq_len - tail;
                 let kv_len = keys.shape_at(2)?;
                 let q_parts = queries.split_sections(&[head_len], 2)?;
@@ -907,6 +923,16 @@ impl Qwen3_5Attention {
                     self.scale as f64,
                 )?;
                 MxArray::concatenate(&out_head, &out_tail, 2)?
+            } else if let Some(out) = crate::kernels::attention::sdpa_causal_few(
+                &queries,
+                &keys,
+                &values,
+                self.head_dim as i64,
+                gqa,
+                seq_len,
+                self.scale,
+            )? {
+                out
             } else {
                 scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale as f64)?
             }

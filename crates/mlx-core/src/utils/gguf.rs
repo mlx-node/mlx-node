@@ -6791,9 +6791,7 @@ fn native_gguf_path_from_os_bytes(bytes: &[u8]) -> Option<PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        std::str::from_utf8(bytes)
-            .ok()
-            .map(|text| PathBuf::from(text))
+        std::str::from_utf8(bytes).ok().map(PathBuf::from)
     }
 }
 

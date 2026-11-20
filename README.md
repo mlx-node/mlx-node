@@ -232,7 +232,11 @@ path can crash during process shutdown on this Windows configuration.
 
 The Windows source build targets RTX Spark (`sm_121a`) by default. Qwen3-0.6B
 BF16 SafeTensors is a small inference smoke test. Paged attention and DFlash2's
-SSD cache are unavailable on Windows.
+SSD cache are unavailable on Windows. Dense Qwen3.8 DFlash2 uses its eager
+flat-cache lane with a cold full-prompt prefill on every turn. Supported K-quant
+large-prefill and DFlash2 verify projections use temporary dense weights that
+are released at turn cleanup or the first single-row decode batch; packed QMV
+handles steady-state decode.
 
 ## Packages
 

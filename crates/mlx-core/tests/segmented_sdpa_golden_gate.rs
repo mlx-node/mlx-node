@@ -17,7 +17,7 @@
 //! MLX_METAL_GPU_ARCH=applegpu_g17g cargo test ...   # base-class policy
 //! ```
 
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 
 mod golden_support;
 mod kquant_support;

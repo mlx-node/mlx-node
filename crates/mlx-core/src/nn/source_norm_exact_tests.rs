@@ -407,14 +407,14 @@ fn source_norm_splash_policy_epsilon_dtype_and_output_slots_fail_closed() {
 #[test]
 #[ignore = "exclusive serial process: temporarily selects the CPU default device"]
 fn source_norm_splash_cpu_uses_reference_without_changing_output_meaning() {
-    struct Restore(i32);
+    struct Restore(crate::stream::DeviceType);
     impl Drop for Restore {
         fn drop(&mut self) {
-            unsafe { sys::mlx_set_default_device(self.0) }
+            crate::accelerator::set_default_device(self.0);
         }
     }
-    let _restore = Restore(unsafe { sys::mlx_default_device() });
-    unsafe { sys::mlx_set_default_device(0) };
+    let _restore = Restore(crate::accelerator::default_device());
+    crate::accelerator::set_default_device(crate::stream::DeviceType::Cpu);
     let (mut norm, input, weights) = source_norm_fixture(7, 151, true);
     norm.enable_source_f32_splash().unwrap();
     let residual = input
