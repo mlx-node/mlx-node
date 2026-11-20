@@ -341,7 +341,8 @@ array gather_qmm_sorted_rhs(const array &x, const array &w,
                             const array &rhs_indices,
                             std::optional<int> group_size,
                             std::optional<int> bits, Mode mode,
-                            StreamOrDevice s = {});
+                            StreamOrDevice s = {},
+                            bool allow_tf32 = false);
 
 array dequantize(const array &w, const array &scales,
                  const std::optional<array> &biases,
@@ -452,10 +453,11 @@ class KQuantGatherQMM : public UnaryPrimitive {
 public:
   KQuantGatherQMM(Stream stream, int group_size, int bits, Mode mode,
                   bool transpose, bool left_sorted, bool right_sorted,
-                  bool rhs_any_rows = false)
+                  bool rhs_any_rows = false, bool allow_tf32 = false)
       : UnaryPrimitive(stream), group_size_(group_size), bits_(bits),
         mode_(mode), transpose_(transpose), left_sorted_(left_sorted),
-        right_sorted_(right_sorted), rhs_any_rows_(rhs_any_rows) {}
+        right_sorted_(right_sorted), rhs_any_rows_(rhs_any_rows),
+        allow_tf32_(allow_tf32) {}
 
   void eval_cpu(const std::vector<array> &inputs, array &out) override;
   void eval_gpu(const std::vector<array> &inputs, array &out) override;
@@ -472,6 +474,7 @@ private:
   bool left_sorted_;
   bool right_sorted_;
   bool rhs_any_rows_;
+  bool allow_tf32_;
 };
 
 class KQuantDequantize : public UnaryPrimitive {

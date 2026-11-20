@@ -27,7 +27,7 @@ use super::config::HyV4FlashConfig;
 use super::engram::{Hasher, keeps};
 use super::indexer::{IndexerMark, IndexerState};
 use super::moe::{ExpertSource, Routes, RowKind, per_row, qlinear};
-use super::ops::{HEAD_CHUNK, hc_head, head_chunks, head_logits, rms_norm};
+use super::ops::{HEAD_CHUNK, hc_head, head_chunks, head_logits, rms_norm, try_bf16_lm_head};
 use super::prefix_state::StateLayer;
 use super::rows::{EngramRows, PrefetchHandle};
 use super::stats::{DeferScope, Phase, prof_end, prof_start};
@@ -180,6 +180,11 @@ pub fn head_rows(x: &MxArray, head: &Dense) -> Result<MxArray> {
     let xf = x.astype(DType::Float32)?;
     if let Dense::Qmm { .. } = head {
         return qlinear(&xf, head);
+    }
+    if let Dense::Array(w) = head
+        && let Some(logits) = try_bf16_lm_head(&xf, w)?
+    {
+        return Ok(logits);
     }
     if xf.shape_at(0)? == 1 {
         return head_logits(&xf, head);
@@ -983,6 +988,7 @@ impl Model {
                 MxArray::concatenate_many(logit_hs.iter().collect(), Some(0))?
             };
             let all_logits = if group(Op::VocabHead, kind) != Group::Row
+                && kind == RowKind::Prefill
                 && n_owners == 1
                 && owners.want(0).logits == Logits::All
             {

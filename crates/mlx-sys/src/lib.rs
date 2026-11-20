@@ -2123,6 +2123,19 @@ unsafe extern "C-unwind" {
         mode: *const std::os::raw::c_char,
     ) -> *mut mlx_array;
 
+    /// Same as [`mlx_kquant_gather_qmm_sorted`] with per-op TF32 NAX enabled
+    /// on F32 activations without mutating thread-local TF32 state.
+    pub fn mlx_kquant_gather_qmm_sorted_nax(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        rhs_indices: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+    ) -> *mut mlx_array;
+
     /// TEST-ONLY: per-thread K-quant kernel-family counters. Enabling or
     /// disabling resets this thread's counts.
     pub fn mlx_test_kquant_counting(enable: bool);
@@ -3404,6 +3417,88 @@ unsafe extern "C" {
         weight: *mut mlx_array,
         scales: *mut mlx_array,
         bases: *mut mlx_array,
+    ) -> *mut mlx_array;
+}
+
+unsafe extern "C" {
+    pub fn mlx_hy4_hc_mix_reduce(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scale: *mut mlx_array,
+        base: *mut mlx_array,
+        norm_eps: f32,
+        hc_eps: f32,
+        magnitude: f32,
+        has_post: bool,
+        out_h: *mut *mut mlx_array,
+        out_post: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_hy4_hc_post_identity(
+        y: *mut mlx_array,
+        res: *mut mlx_array,
+        post: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_bf16_lm_head(x: *mut mlx_array, w: *mut mlx_array) -> *mut mlx_array;
+
+    pub fn mlx_hy4_q8_dense_decode(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_q8_grouped_decode(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_kq_routed_decode(
+        x: *mut mlx_array,
+        slots: *mut mlx_array,
+        weights: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        down_bits: i32,
+        limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_kq_routed_subset(
+        x: *mut mlx_array,
+        row_ids: *mut mlx_array,
+        slots: *mut mlx_array,
+        weights: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        down_bits: i32,
+        limit: f32,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_hy4_mla_sink_attention(
+        q: *mut mlx_array,
+        k0: *mut mlx_array,
+        k1: *mut mlx_array,
+        idx: *mut mlx_array,
+        sinks: *mut mlx_array,
+        v_width: i32,
+        scale: f32,
     ) -> *mut mlx_array;
 }
 

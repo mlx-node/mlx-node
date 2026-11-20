@@ -860,13 +860,16 @@ fn bank_moe_matches_dequantized_experts() {
                 RowKind::Prefill,
             )
             .unwrap();
+        let prefill_nax = unsafe { mlx_sys::mlx_metal_is_nax_available() }
+            && std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0");
+        let prefill_rel = if prefill_nax { 5e-3 } else { 1e-4 };
         let what = format!("bank layer {il}");
         check_moe(
             &c,
             &r,
             &hs,
             &got,
-            1e-4,
+            prefill_rel,
             true,
             |e| expert_mats(&vals, &m, e),
             &what,
@@ -1026,7 +1029,10 @@ fn decode_wave_takes_victims_at_any_row_count() {
         .chunks_exact(c.dim)
         .map(|r| r.iter().map(|&v| f64::from(v)).collect())
         .collect();
-    assert_rows(&read(&dec), &want, 1e-5, "decode wave vs prefill");
+    let prefill_nax = unsafe { mlx_sys::mlx_metal_is_nax_available() }
+        && std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0");
+    let dec_vs_pre_rel = if prefill_nax { 5e-3 } else { 1e-5 };
+    assert_rows(&read(&dec), &want, dec_vs_pre_rel, "decode wave vs prefill");
 }
 
 /// A prefill slice through the bank runs on the sorted-rhs kernel, and a
@@ -1116,11 +1122,17 @@ fn sorted_prefill_rows_do_not_depend_on_their_neighbours() {
         // SAFETY: test-only counters of this thread.
         unsafe { mlx_sys::mlx_test_kquant_counting(true) };
         let full = run(&all, RowKind::Prefill);
-        let rhs = unsafe { mlx_sys::mlx_test_kquant_family_count(c"gather_qmm_rhs_nt".as_ptr()) };
+        let nax_avail = unsafe { mlx_sys::mlx_metal_is_nax_available() }
+            && std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0");
+        let rhs_nt =
+            unsafe { mlx_sys::mlx_test_kquant_family_count(c"gather_qmm_rhs_nt".as_ptr()) };
+        let rhs_nax =
+            unsafe { mlx_sys::mlx_test_kquant_family_count(c"gather_qmm_rhs_nax_nt".as_ptr()) };
         unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+        let rhs = if nax_avail { rhs_nax } else { rhs_nt };
         assert_eq!(
             rhs, 3,
-            "layer {il}: the prefill did not take the sorted-rhs kernel"
+            "layer {il}: the prefill did not take the sorted-rhs kernel (nt={rhs_nt}, nax={rhs_nax})"
         );
         for (r, want) in full.iter().enumerate() {
             assert_eq!(
@@ -1147,14 +1159,14 @@ fn sorted_prefill_rows_do_not_depend_on_their_neighbours() {
             .flatten()
             .map(f32::from_bits)
             .collect();
-        assert_rows(&dec, &want, 1e-5, "decode vs sorted prefill");
+        let dec_rel = if nax_avail { 1e-2 } else { 1e-5 };
+        assert_rows(&dec, &want, dec_rel, "decode vs sorted prefill");
     }
 }
 
-/// A 1-row `qlinear` through a Q8 matrix is row 0 of the 2-row call of
-/// `[x; 0]` bit for bit, and each row of a 3-row call equals that row
-/// padded alone (`qmv_wide` at every M in 2..limit); f32 matrices are not
-/// padded.
+/// `qlinear` through a Q8 matrix is row-invariant across M in 1..=16 (row i of
+/// a 2- or 3-row call equals that row alone bit-for-bit) and matches `linear`
+/// to F32 rounding; f32 matrices pass straight through `linear`.
 #[test]
 fn qlinear_pads_one_q8_row() {
     let mut rng = Rng::new(31);
@@ -1177,14 +1189,27 @@ fn qlinear_pads_one_q8_row() {
         .collect();
     let mut padded = rows[0].clone();
     padded.extend(std::iter::repeat_n(0.0, k));
-    let two = read(
+    let two_q = read(
+        &qlinear(
+            &MxArray::from_float32(&padded, &[2, k as i64]).unwrap(),
+            &dense,
+        )
+        .unwrap(),
+    );
+    assert_eq!(alone[0], two_q[..n], "qlinear padded row 0 bit-exact");
+    let two_ref = read(
         &linear(
             &MxArray::from_float32(&padded, &[2, k as i64]).unwrap(),
             &dense,
         )
         .unwrap(),
     );
-    assert_eq!(alone[0], two[..n], "padded row 0");
+    for (i, (&a, &b)) in alone[0].iter().zip(&two_ref[..n]).enumerate() {
+        assert!(
+            (a - b).abs() <= 1e-5,
+            "qlinear vs linear col {i}: {a} vs {b}"
+        );
+    }
     let three = read(&qlinear(&rows_arr(&rows), &dense).unwrap());
     for (i, a) in alone.iter().enumerate() {
         assert_eq!(three[i * n..(i + 1) * n], a[..], "row {i} of 3 vs alone");
@@ -1375,6 +1400,302 @@ fn expert_order_last_use_orders_by_final_assignment() {
     let order = expert_order_last_use(&[3, 1, 2, 1, 0, 3], 5);
     // Last positions: 2 -> 2, 1 -> 3, 0 -> 4, 3 -> 5.
     assert_eq!(order, vec![2, 1, 0, 3]);
+}
+
+#[test]
+fn gather_sorted_nax_matches_gather_sorted_q4k_and_q6k() {
+    crate::models::hy_v4_flash::exact_f32();
+    let mut rng = Rng::new(77);
+    let m = moe_cfg(4, 2, 512, 256);
+    let mut file = rng.bytes(256);
+    let experts = vec![
+        None,
+        Some(kquant_layer(
+            &mut rng,
+            &m,
+            1,
+            ExpertClass::Q6kDown,
+            &mut file,
+        )),
+    ];
+    let dir = Temp::new();
+    let path = dir.0.join("data.bin");
+    std::fs::write(&path, &file).unwrap();
+    let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+    let bank = KqBank::new(pool, &m, &experts, [4, 0], 1).unwrap();
+
+    let used: Vec<u32> = (0..m.n_experts as u32).collect();
+    let uses = vec![8u32; m.n_experts];
+    let p = bank.prepare(1, &used, &uses, false).unwrap();
+
+    let rows = 32usize;
+    let mut slots: Vec<u32> = (0..rows).map(|i| p.slot((i / 8) as u32).unwrap()).collect();
+    slots.sort_unstable();
+    let si = MxArray::from_uint32(&slots, &[rows as i64]).unwrap();
+
+    // Test both Q4_K (proj 0: [512, 256]) and Q6_K (proj 2: [256, 512]).
+    for (proj_idx, k_dim, label) in [(0usize, m.latent, "Q4_K"), (2usize, m.ff, "Q6_K")] {
+        let x = MxArray::from_float32(&rng.vec(rows * k_dim, 1.0), &[rows as i64, 1, k_dim as i64])
+            .unwrap();
+        let ref_y = read(&p.arrays[proj_idx].gather_sorted(&x, &si).unwrap());
+        let nax_y = read(&p.arrays[proj_idx].gather_sorted_nax(&x, &si).unwrap());
+        assert_eq!(ref_y.len(), nax_y.len(), "{label} len");
+        let diff_sq: f64 = ref_y
+            .iter()
+            .zip(&nax_y)
+            .map(|(&a, &b)| {
+                let d = f64::from(a) - f64::from(b);
+                d * d
+            })
+            .sum();
+        let ref_sq: f64 = ref_y.iter().map(|&a| f64::from(a) * f64::from(a)).sum();
+        let rel_l2 = (diff_sq / ref_sq.max(1e-30)).sqrt();
+        assert!(
+            rel_l2 < 1e-3,
+            "{label} gather_sorted_nax vs gather_sorted rel_l2={rel_l2:e}"
+        );
+    }
+
+    // Verify per-op NAX did not mutate thread-local TF32 state.
+    let x_check = MxArray::from_float32(
+        &rng.vec(rows * m.latent, 1.0),
+        &[rows as i64, 1, m.latent as i64],
+    )
+    .unwrap();
+    unsafe { mlx_sys::mlx_test_kquant_counting(true) };
+    let _ = read(&p.arrays[0].gather_sorted(&x_check, &si).unwrap());
+    let plain_nax =
+        unsafe { mlx_sys::mlx_test_kquant_family_count(c"gather_qmm_rhs_nax_nt".as_ptr()) };
+    let _ = read(&p.arrays[0].gather_sorted_nax(&x_check, &si).unwrap());
+    let scoped_nax =
+        unsafe { mlx_sys::mlx_test_kquant_family_count(c"gather_qmm_rhs_nax_nt".as_ptr()) };
+    unsafe { mlx_sys::mlx_test_kquant_counting(false) };
+    assert_eq!(
+        plain_nax, 0,
+        "gather_sorted must stay non-NAX under exact_f32"
+    );
+    if unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+        assert_eq!(
+            scoped_nax, 1,
+            "gather_sorted_nax must dispatch NAX on NAX GPU"
+        );
+    }
+
+    bank.end_turn().unwrap();
+}
+
+#[test]
+fn kq_routed_decode_row_invariant_and_parity() {
+    crate::models::hy_v4_flash::exact_f32();
+    let configs = [
+        (
+            256usize,
+            256usize,
+            6usize,
+            2usize,
+            ExpertClass::Q4kDown,
+            51u64,
+        ),
+        (256, 256, 6, 2, ExpertClass::Q6kDown, 53),
+        (1536, 1536, 20, 16, ExpertClass::Q4kDown, 59),
+        (1536, 1536, 20, 16, ExpertClass::Q6kDown, 61),
+    ];
+    for (k_dim, ff_dim, n_experts, top, class, seed) in configs {
+        let mut rng = Rng::new(seed);
+        let m = moe_cfg(n_experts, top, ff_dim, k_dim);
+        let c = ffn_cfg(64, m.clone(), 10.0);
+        let mut file = rng.bytes(128);
+        let experts = vec![None, Some(kquant_layer(&mut rng, &m, 1, class, &mut file))];
+        let dir = Temp::new();
+        let path = dir.0.join("data.bin");
+        std::fs::write(&path, &file).unwrap();
+        let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+        let cache = match class {
+            ExpertClass::Q6kDown => [n_experts, 0],
+            ExpertClass::Q4kDown => [0, n_experts],
+            ExpertClass::Bf16 => unreachable!(),
+        };
+        let bank = Arc::new(KqBank::new(pool, &m, &experts, cache, 1).unwrap());
+        let (w, _, _) = moe_weights(&mut rng, &c, 32);
+        let ffn = Ffn::Moe(w);
+        let layer =
+            LayerFfn::new(&c, 1, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
+        let FfnKind::Moe(moe) = &layer.kind else {
+            panic!("expected MoE");
+        };
+
+        let all_e: Vec<u32> = (0..n_experts as u32).collect();
+        let p = bank
+            .prepare(1, &all_e, &vec![1u32; n_experts], true)
+            .unwrap();
+
+        if class == ExpertClass::Q6kDown {
+            let sd_i8 = p.arrays[2].s.to_int8().unwrap();
+            assert!(
+                sd_i8.iter().any(|&v| v < 0),
+                "Q6_K down bank must contain negative signed int8 sub-scales"
+            );
+        }
+
+        let max_rows = 12usize;
+        let z_all = rng.vec(max_rows * k_dim, 0.75);
+        let mut slots_all = Vec::with_capacity(max_rows * top);
+        let mut w_all = Vec::with_capacity(max_rows * top);
+        for row in 0..max_rows {
+            let mut picks: Vec<u32> = (0..top)
+                .map(|j| ((row * 3 + j) % n_experts) as u32)
+                .collect();
+            picks.sort_unstable();
+            for e in picks {
+                slots_all.push(p.slot(e).unwrap());
+                w_all.push(0.2 + 0.5 * rng.next().abs());
+            }
+        }
+
+        let alone: Vec<Vec<u32>> = (0..max_rows)
+            .map(|row| {
+                let zr = MxArray::from_float32(
+                    &z_all[row * k_dim..(row + 1) * k_dim],
+                    &[1, k_dim as i64],
+                )
+                .unwrap();
+                let sl = &slots_all[row * top..(row + 1) * top];
+                let ws = &w_all[row * top..(row + 1) * top];
+                let out = moe.kq_routed_decode(&zr, sl, ws, &p).unwrap().unwrap();
+                bits(&out)
+            })
+            .collect();
+
+        for rows in [1usize, 2, 4, 12] {
+            let zm = MxArray::from_float32(&z_all[..rows * k_dim], &[rows as i64, k_dim as i64])
+                .unwrap();
+            let sl = &slots_all[..rows * top];
+            let ws = &w_all[..rows * top];
+            let fused = moe.kq_routed_decode(&zm, sl, ws, &p).unwrap().unwrap();
+            let fused_bits = bits(&fused);
+            for row in 0..rows {
+                assert_eq!(
+                    &fused_bits[row * k_dim..(row + 1) * k_dim],
+                    &alone[row][..],
+                    "{class:?} ({k_dim},{ff_dim},top={top}) M={rows} row {row} bit-exact vs M=1"
+                );
+            }
+
+            if rows == 4 {
+                let ref_out = moe
+                    .combine(&zm, sl, ws, false, |pi, x, idx| p.arrays[pi].gather(x, idx))
+                    .unwrap();
+                let got_f = read(&fused);
+                let ref_f = read(&ref_out);
+                let max_abs = got_f
+                    .iter()
+                    .zip(&ref_f)
+                    .map(|(&a, &b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_abs <= 1e-4,
+                    "{class:?} ({k_dim},{ff_dim},top={top}) vs combine max_abs={max_abs:e}"
+                );
+
+                // Verify subset + sum(axis=1) matches fused combine bit-for-bit.
+                let row_ids: Vec<u32> = (0..rows * top).map(|i| (i / top) as u32).collect();
+                let sub = moe
+                    .kq_routed_subset(&zm, &row_ids, sl, ws, &p)
+                    .unwrap()
+                    .unwrap()
+                    .reshape(&[rows as i64, top as i64, k_dim as i64])
+                    .unwrap()
+                    .sum(Some(&[1]), Some(false))
+                    .unwrap();
+                assert_eq!(
+                    bits(&sub),
+                    fused_bits,
+                    "{class:?} ({k_dim},{ff_dim},top={top}) subset+sum vs combine bit-exact"
+                );
+            }
+        }
+        bank.end_turn().unwrap();
+    }
+}
+
+#[test]
+fn kq_routed_decode_asymmetric_clamp_boundaries() {
+    crate::models::hy_v4_flash::exact_f32();
+    for (class, seed) in [(ExpertClass::Q4kDown, 71u64), (ExpertClass::Q6kDown, 73u64)] {
+        let mut rng = Rng::new(seed);
+        let (k_dim, ff_dim, n_experts, top) = (256usize, 256usize, 4usize, 2usize);
+        let m = moe_cfg(n_experts, top, ff_dim, k_dim);
+        let mut file = rng.bytes(64);
+        let experts = vec![None, Some(kquant_layer(&mut rng, &m, 1, class, &mut file))];
+        let dir = Temp::new();
+        let path = dir.0.join("data.bin");
+        std::fs::write(&path, &file).unwrap();
+        let pool = IoPool::new(Arc::new(ShardSet::open(&[path.as_path()]).unwrap()), 4).unwrap();
+        let cache = match class {
+            ExpertClass::Q6kDown => [n_experts, 0],
+            ExpertClass::Q4kDown => [0, n_experts],
+            ExpertClass::Bf16 => unreachable!(),
+        };
+        let bank = Arc::new(KqBank::new(pool, &m, &experts, cache, 1).unwrap());
+        let all_e: Vec<u32> = (0..n_experts as u32).collect();
+        let p = bank
+            .prepare(1, &all_e, &vec![1u32; n_experts], true)
+            .unwrap();
+
+        // Large-magnitude input so gate/up pre-activations cross < -10 and > +10.
+        let rows = 4usize;
+        let z = MxArray::from_float32(&rng.vec(rows * k_dim, 6.0), &[rows as i64, k_dim as i64])
+            .unwrap();
+        let slots: Vec<u32> = (0..rows)
+            .flat_map(|r| {
+                let a = (r % n_experts) as u32;
+                let b = ((r + 1) % n_experts) as u32;
+                let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                [p.slot(lo).unwrap(), p.slot(hi).unwrap()]
+            })
+            .collect();
+        let ws: Vec<f32> = (0..rows * top)
+            .map(|_| 0.4 + 0.3 * rng.next().abs())
+            .collect();
+
+        // Confirm gate/up actually cross all asymmetric clamp boundaries.
+        let sid_2d = MxArray::from_uint32(&slots, &[rows as i64, top as i64]).unwrap();
+        let ze = z.reshape(&[rows as i64, 1, 1, k_dim as i64]).unwrap();
+        let g_raw = read(&p.arrays[0].gather(&ze, &sid_2d).unwrap());
+        let u_raw = read(&p.arrays[1].gather(&ze, &sid_2d).unwrap());
+        assert!(g_raw.iter().any(|&v| v < -10.0), "{class:?}: need g < -10");
+        assert!(g_raw.iter().any(|&v| v > 10.0), "{class:?}: need g > 10");
+        assert!(u_raw.iter().any(|&v| v < -10.0), "{class:?}: need u < -10");
+        assert!(u_raw.iter().any(|&v| v > 10.0), "{class:?}: need u > 10");
+
+        for limit in [10.0f32, 0.0f32] {
+            let c = ffn_cfg(64, m.clone(), limit);
+            let (w, _, _) = moe_weights(&mut rng, &c, 32);
+            let ffn = Ffn::Moe(w);
+            let layer =
+                LayerFfn::new(&c, 1, &ffn, Some(ExpertSource::Bank(Arc::clone(&bank)))).unwrap();
+            let FfnKind::Moe(moe) = &layer.kind else {
+                panic!("expected MoE");
+            };
+            let fused = read(&moe.kq_routed_decode(&z, &slots, &ws, &p).unwrap().unwrap());
+            let ref_out = read(
+                &moe.combine(&z, &slots, &ws, false, |pi, x, idx| {
+                    p.arrays[pi].gather(x, idx)
+                })
+                .unwrap(),
+            );
+            let max_abs = fused
+                .iter()
+                .zip(&ref_out)
+                .map(|(&a, &b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs <= 1e-4,
+                "{class:?} limit={limit}: max_abs={max_abs:e}"
+            );
+        }
+        bank.end_turn().unwrap();
+    }
 }
 
 fn real_scan() -> Scan {

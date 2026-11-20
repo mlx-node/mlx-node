@@ -45,6 +45,7 @@ use crate::array::{DType, MxArray};
 use crate::models::deepseek_v41::attention::linear;
 use crate::models::deepseek_v41::store::Dense;
 use crate::nn::Activations;
+use crate::utils::gguf_kquant::KQuantFormat;
 
 /// FFN rows per chunk: the routed scratch is `rows x k x (2 ff + latent)`.
 pub const FFN_CHUNK_ROWS: usize = 256;
@@ -117,21 +118,43 @@ impl RowKind {
     }
 }
 
-/// `linear` where an `x` of fewer than `MIN_Q8_ROWS` rows through a Q8
-/// (`Dense::Qmm`) matrix runs padded with zero rows and keeps its own:
-/// MLX routes M = 1 to `qmv` and M >= 2 to `qmv_wide`
-/// (`backend/metal/quantized.cpp`), so a row alone and the same row among
-/// others take the same kernel.
+/// `linear` using the row-invariant Q8 Metal kernel for 1..=16 decode rows,
+/// falling back to `MIN_Q8_ROWS` zero-padding only when the kernel rejects
+/// the input (non-Metal or unsupported shape).
 pub fn qlinear(x: &MxArray, w: &Dense) -> Result<MxArray> {
-    if !matches!(w, Dense::Qmm { .. }) || x.ndim()? != 2 {
-        return linear(x, w);
+    if let Dense::Qmm {
+        w: qw,
+        scales,
+        biases,
+    } = w
+        && x.ndim()? == 2
+    {
+        let n = x.shape_at(0)?;
+        if (1..=16).contains(&n) {
+            let xf = if x.dtype()? == DType::Float32 {
+                x.clone()
+            } else {
+                x.astype(DType::Float32)?
+            };
+            // SAFETY: all handles are live arrays owned by this call.
+            let h = unsafe {
+                mlx_sys::mlx_hy4_q8_dense_decode(
+                    xf.as_raw_ptr(),
+                    qw.as_raw_ptr(),
+                    scales.as_raw_ptr(),
+                    biases.as_raw_ptr(),
+                )
+            };
+            if !h.is_null() {
+                return MxArray::from_handle(h, "hy_v4_flash q8_dense_decode");
+            }
+        }
+        if n > 0 && n < MIN_Q8_ROWS {
+            let y = linear(&x.pad(&[0, (MIN_Q8_ROWS - n) as i32, 0, 0], 0.0)?, w)?;
+            return y.slice(&[0, 0], &[n, y.shape_at(1)?]);
+        }
     }
-    let n = x.shape_at(0)?;
-    if n == 0 || n >= MIN_Q8_ROWS {
-        return linear(x, w);
-    }
-    let y = linear(&x.pad(&[0, (MIN_Q8_ROWS - n) as i32, 0, 0], 0.0)?, w)?;
-    y.slice(&[0, 0], &[n, y.shape_at(1)?])
+    linear(x, w)
 }
 
 /// `f(row)` for every row of `x [n, ..]`, concatenated on axis 0.
@@ -661,6 +684,28 @@ impl Moe {
 
         let latent = z.shape_at(1)?;
         let pairs = (rows as usize) * k;
+
+        if pending.is_none() {
+            let tp = prof_start();
+            bank.assert_slots(&p);
+            let slots = ids_asc
+                .iter()
+                .map(|&e| {
+                    p.slot(e)
+                        .ok_or_else(|| bad(format!("expert {e} not prepared")))
+                })
+                .collect::<Result<Vec<u32>>>()?;
+            if let Some(r) = self.kq_routed_decode(&z, &slots, &w_asc, &p)? {
+                let up = qlinear(&r, &w.routed_up)?;
+                prof_end(Phase::Routed, tp, &[&up])?;
+                let tp = prof_start();
+                let f = up.add(&shared)?;
+                prof_end(Phase::Shared, tp, &[&f])?;
+                return Ok(f);
+            }
+            prof_end(Phase::Routed, tp, &[])?;
+        }
+
         let (ready, late): (Vec<usize>, Vec<usize>) =
             (0..pairs).partition(|&idx| !p.is_reading(ids_asc[idx]));
 
@@ -677,6 +722,10 @@ impl Moe {
                 })
                 .collect::<Result<Vec<u32>>>()?;
             let ws: Vec<f32> = sub.iter().map(|&idx| w_asc[idx]).collect();
+            let row_ids: Vec<u32> = sub.iter().map(|&idx| (idx / k) as u32).collect();
+            if let Some(d) = self.kq_routed_subset(&z, &row_ids, &slot_ids, &ws, &p)? {
+                return Ok(Some(d));
+            }
             let (ze, sid, sw) = if rows == 1 {
                 (
                     z.reshape(&[1, 1, 1, latent])?,
@@ -684,7 +733,6 @@ impl Moe {
                     MxArray::from_float32(&ws, &[1, m, 1, 1])?,
                 )
             } else {
-                let row_ids: Vec<u32> = sub.iter().map(|&idx| (idx / k) as u32).collect();
                 (
                     z.take(&MxArray::from_uint32(&row_ids, &[m])?, 0)?
                         .reshape(&[m, 1, 1, latent])?,
@@ -874,8 +922,8 @@ impl Moe {
                 .take(&MxArray::from_uint32(&row, &[m])?, 0)?
                 .reshape(&[m, 1, latent])?;
             let si = MxArray::from_uint32(&slot, &[m])?;
-            let g = p.arrays[0].gather_sorted(&x, &si)?;
-            let u = p.arrays[1].gather_sorted(&x, &si)?;
+            let g = p.arrays[0].gather_sorted_nax(&x, &si)?;
+            let u = p.arrays[1].gather_sorted_nax(&x, &si)?;
             let g = if g.dtype()? == DType::Float32 {
                 g
             } else {
@@ -888,7 +936,7 @@ impl Moe {
             };
             let a = Activations::swiglu_clamped_compiled(&g, &u, self.limit)?;
             let d_g = p.arrays[2]
-                .gather_sorted(&a, &si)?
+                .gather_sorted_nax(&a, &si)?
                 .astype(DType::Float32)?
                 .mul(&MxArray::from_float32(&ws, &[m, 1, 1])?)?
                 .reshape(&[m, latent])?;
@@ -934,6 +982,121 @@ impl Moe {
         Ok(out)
     }
 
+    fn kq_down_bits(p: &Prepared) -> Option<i32> {
+        if p.arrays[0].format != KQuantFormat::Q4K || p.arrays[1].format != KQuantFormat::Q4K {
+            return None;
+        }
+        match p.arrays[2].format {
+            KQuantFormat::Q4K => Some(4),
+            KQuantFormat::Q6K => Some(6),
+            _ => None,
+        }
+    }
+
+    fn kq_routed_decode(
+        &self,
+        z: &MxArray,
+        slots: &[u32],
+        weights: &[f32],
+        p: &Prepared,
+    ) -> Result<Option<MxArray>> {
+        let Some(down_bits) = Self::kq_down_bits(p) else {
+            return Ok(None);
+        };
+        let rows = z.shape_at(0)?;
+        let k = self.moe.n_used as i64;
+        if slots.len() != (rows * k) as usize || weights.len() != slots.len() {
+            return Ok(None);
+        }
+        let zf = if z.dtype()? == DType::Float32 {
+            z.clone()
+        } else {
+            z.astype(DType::Float32)?
+        };
+        let sid = MxArray::from_uint32(slots, &[rows, k])?;
+        let sw = MxArray::from_float32(weights, &[rows, k])?;
+        let [g, u, d] = &p.arrays;
+        // SAFETY: all handles are live arrays owned by this call.
+        let h = unsafe {
+            mlx_sys::mlx_hy4_kq_routed_decode(
+                zf.as_raw_ptr(),
+                sid.as_raw_ptr(),
+                sw.as_raw_ptr(),
+                g.w.as_raw_ptr(),
+                g.s.as_raw_ptr(),
+                g.b.as_raw_ptr(),
+                u.w.as_raw_ptr(),
+                u.s.as_raw_ptr(),
+                u.b.as_raw_ptr(),
+                d.w.as_raw_ptr(),
+                d.s.as_raw_ptr(),
+                d.b.as_raw_ptr(),
+                down_bits,
+                self.limit,
+            )
+        };
+        if h.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(MxArray::from_handle(
+            h,
+            "hy_v4_flash kq_routed_decode",
+        )?))
+    }
+
+    fn kq_routed_subset(
+        &self,
+        z: &MxArray,
+        row_ids: &[u32],
+        slots: &[u32],
+        weights: &[f32],
+        p: &Prepared,
+    ) -> Result<Option<MxArray>> {
+        let Some(down_bits) = Self::kq_down_bits(p) else {
+            return Ok(None);
+        };
+        if slots.is_empty() || row_ids.len() != slots.len() || weights.len() != slots.len() {
+            return Ok(None);
+        }
+        let m = slots.len() as i64;
+        let zf = if z.dtype()? == DType::Float32 {
+            z.clone()
+        } else {
+            z.astype(DType::Float32)?
+        };
+        let rid = MxArray::from_uint32(row_ids, &[m])?;
+        let sid = MxArray::from_uint32(slots, &[m])?;
+        let sw = MxArray::from_float32(weights, &[m])?;
+        let [g, u, d] = &p.arrays;
+        // SAFETY: all handles are live arrays owned by this call.
+        let h = unsafe {
+            mlx_sys::mlx_hy4_kq_routed_subset(
+                zf.as_raw_ptr(),
+                rid.as_raw_ptr(),
+                sid.as_raw_ptr(),
+                sw.as_raw_ptr(),
+                g.w.as_raw_ptr(),
+                g.s.as_raw_ptr(),
+                g.b.as_raw_ptr(),
+                u.w.as_raw_ptr(),
+                u.s.as_raw_ptr(),
+                u.b.as_raw_ptr(),
+                d.w.as_raw_ptr(),
+                d.s.as_raw_ptr(),
+                d.b.as_raw_ptr(),
+                down_bits,
+                self.limit,
+            )
+        };
+        if h.is_null() {
+            return Ok(None);
+        }
+        Ok(Some(MxArray::from_handle(
+            h,
+            "hy_v4_flash kq_routed_subset",
+        )?))
+    }
+
     fn banked(
         &self,
         z: &MxArray,
@@ -950,10 +1113,13 @@ impl Moe {
             })
             .collect::<Result<Vec<u32>>>()?;
         let sorted = !kind.is_decode();
+        if !sorted && let Some(out) = self.kq_routed_decode(z, &slots, w, p)? {
+            return Ok(out);
+        }
         self.combine(z, &slots, w, sorted, |pi, x, i| {
             let a = &p.arrays[pi];
             if sorted {
-                a.gather_sorted(x, i)
+                a.gather_sorted_nax(x, i)
             } else {
                 a.gather(x, i)
             }

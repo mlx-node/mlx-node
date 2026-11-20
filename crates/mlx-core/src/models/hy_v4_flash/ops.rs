@@ -54,6 +54,14 @@ fn check_len(a: &MxArray, want: i64, what: &str) -> Result<()> {
     Ok(())
 }
 
+fn as_f32(x: &MxArray) -> Result<MxArray> {
+    if x.dtype()? == DType::Float32 {
+        Ok(x.clone())
+    } else {
+        x.astype(DType::Float32)
+    }
+}
+
 /// Fused RMSNorm with 1-D weight `w`, computed in f32 and cast back to `x`'s dtype.
 pub fn rms_norm(x: &MxArray, w: &MxArray, eps: f32) -> Result<MxArray> {
     if w.ndim()? != 1 {
@@ -263,6 +271,67 @@ pub fn hc_mix(x: &MxArray, w: &HcWeights, norm_eps: f32, cfg: &HcConfig) -> Resu
     })
 }
 
+/// Fused `hc_mix` + `hc_reduce`: returns `(h [n, d], post [n, hc])` with `h`
+/// in `x`'s dtype and `post` in f32.
+pub fn hc_mix_reduce(
+    x: &MxArray,
+    w: &HcWeights,
+    norm_eps: f32,
+    cfg: &HcConfig,
+) -> Result<(MxArray, MxArray)> {
+    let [n, hc, d] = streams(x)?;
+    if hc != cfg.count as i64
+        || w.weight.ndim()? != 2
+        || w.weight.shape_at(0)? != 2 * hc
+        || w.weight.shape_at(1)? != hc * d
+    {
+        return Err(bad(format!(
+            "hc mix: {hc} streams of {d}, config {}, fn {:?}",
+            cfg.count,
+            dims(&w.weight)?
+        )));
+    }
+    check_len(&w.scale, 2, "hc scale")?;
+    check_len(&w.base, 2 * hc, "hc base")?;
+    if n > 0 {
+        let dt = x.dtype()?;
+        let xf = as_f32(x)?;
+        let wf = as_f32(&w.weight)?;
+        let sf = as_f32(&w.scale)?;
+        let bf = as_f32(&w.base)?;
+        let mut out_h = std::ptr::null_mut();
+        let mut out_post = std::ptr::null_mut();
+        // SAFETY: all input handles are live for the call; out pointers receive new arrays on true.
+        let ok = unsafe {
+            mlx_sys::mlx_hy4_hc_mix_reduce(
+                xf.as_raw_ptr(),
+                wf.as_raw_ptr(),
+                sf.as_raw_ptr(),
+                bf.as_raw_ptr(),
+                norm_eps,
+                cfg.eps,
+                cfg.magnitude,
+                true,
+                &mut out_h,
+                &mut out_post,
+            )
+        };
+        if ok {
+            let h = MxArray::from_handle(out_h, "hy_v4_flash hc_mix_reduce h")?;
+            let post = MxArray::from_handle(out_post, "hy_v4_flash hc_mix_reduce post")?;
+            let h = if dt == DType::Float32 {
+                h
+            } else {
+                h.astype(dt)?
+            };
+            return Ok((h, post));
+        }
+    }
+    let g = hc_mix(x, w, norm_eps, cfg)?;
+    let h = hc_reduce(x, &g.pre)?;
+    Ok((h, g.post))
+}
+
 /// `Σ_c pre_c · x_c`: x `[n, hc, d]`, pre `[n, hc]` -> `[n, d]` in x's dtype.
 pub fn hc_reduce(x: &MxArray, pre: &MxArray) -> Result<MxArray> {
     let [n, hc, _] = streams(x)?;
@@ -283,11 +352,27 @@ pub fn hc_post_identity(y: &MxArray, res: &MxArray, post: &MxArray) -> Result<Mx
             dims(post)?
         )));
     }
+    let dt = res.dtype()?;
+    if n > 0 {
+        let yf = as_f32(y)?;
+        let rf = as_f32(res)?;
+        let pf = as_f32(post)?;
+        // SAFETY: all input handles are live for the call; returns a new array or null.
+        let h = unsafe {
+            mlx_sys::mlx_hy4_hc_post_identity(yf.as_raw_ptr(), rf.as_raw_ptr(), pf.as_raw_ptr())
+        };
+        if !h.is_null() {
+            let out = MxArray::from_handle(h, "hy_v4_flash hc_post_identity")?;
+            return if dt == DType::Float32 {
+                Ok(out)
+            } else {
+                out.astype(dt)
+            };
+        }
+    }
     let p = post.astype(DType::Float32)?.reshape(&[n, hc, 1])?;
     let yf = y.astype(DType::Float32)?.reshape(&[n, 1, d])?;
-    res.astype(DType::Float32)?
-        .add(&p.mul(&yf)?)?
-        .astype(res.dtype()?)
+    res.astype(DType::Float32)?.add(&p.mul(&yf)?)?.astype(dt)
 }
 
 /// Head stream weights `σ(mixes · scale + base) + eps` `[n, hc]` from
@@ -308,6 +393,46 @@ pub fn hc_head_pre(x: &MxArray, w: &HcWeights, norm_eps: f32, hc_eps: f32) -> Re
 
 /// The streams collapsed for the head: `Σ_c pre_c · x_c` `[n, d]`.
 pub fn hc_head(x: &MxArray, w: &HcWeights, norm_eps: f32, hc_eps: f32) -> Result<MxArray> {
+    let [n, hc, d] = streams(x)?;
+    if w.weight.ndim()? != 2 || w.weight.shape_at(0)? != hc || w.weight.shape_at(1)? != hc * d {
+        return Err(bad(format!(
+            "hc head fn {:?} for {hc} streams of {d}",
+            dims(&w.weight)?
+        )));
+    }
+    check_len(&w.scale, 1, "hc head scale")?;
+    check_len(&w.base, hc, "hc head base")?;
+    if n > 0 {
+        let dt = x.dtype()?;
+        let xf = as_f32(x)?;
+        let wf = as_f32(&w.weight)?;
+        let sf = as_f32(&w.scale)?;
+        let bf = as_f32(&w.base)?;
+        let mut out_h = std::ptr::null_mut();
+        // SAFETY: all input handles are live for the call; out_h receives a new array on true.
+        let ok = unsafe {
+            mlx_sys::mlx_hy4_hc_mix_reduce(
+                xf.as_raw_ptr(),
+                wf.as_raw_ptr(),
+                sf.as_raw_ptr(),
+                bf.as_raw_ptr(),
+                norm_eps,
+                hc_eps,
+                0.0,
+                false,
+                &mut out_h,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok {
+            let h = MxArray::from_handle(out_h, "hy_v4_flash hc_head h")?;
+            return if dt == DType::Float32 {
+                Ok(h)
+            } else {
+                h.astype(dt)
+            };
+        }
+    }
     hc_reduce(x, &hc_head_pre(x, w, norm_eps, hc_eps)?)
 }
 
@@ -373,13 +498,32 @@ pub fn route(
     route_host(s.as_ref(), bias, moe)
 }
 
+/// Single-dispatch BF16-weight / F32-accumulation LM head for 1..=16 rows.
+pub(crate) fn try_bf16_lm_head(xf: &MxArray, w: &MxArray) -> Result<Option<MxArray>> {
+    if xf.ndim()? != 2 || w.ndim()? != 2 || w.dtype()? != DType::BFloat16 {
+        return Ok(None);
+    }
+    let rows = xf.shape_at(0)?;
+    let k = xf.shape_at(1)?;
+    if !(1..=16).contains(&rows) || k <= 0 || k % 4 != 0 || w.shape_at(1)? != k {
+        return Ok(None);
+    }
+    // SAFETY: live array handles; returns a new array or null on unsupported/non-Metal.
+    let h = unsafe { mlx_sys::mlx_hy4_bf16_lm_head(xf.as_raw_ptr(), w.as_raw_ptr()) };
+    if h.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(MxArray::from_handle(h, "hy_v4_flash bf16_lm_head")?))
+}
+
 /// f32 logits `[s, vocab]` of `x [s, d]`; see `head_logits_chunked`.
 pub fn head_logits(x: &MxArray, head: &Dense) -> Result<MxArray> {
     head_logits_chunked(x, head, HEAD_CHUNK)
 }
 
-/// f32 logits of `x [s, d]`. A `Qmm` head is one `quantized_matmul`; any
-/// other head is cast to f32 `chunk` vocab rows at a time (`head_chunks`).
+/// f32 logits of `x [s, d]`. A `Qmm` head is one `quantized_matmul`; a BF16
+/// `Dense::Array` with 1..=16 rows runs through the native BF16 LM head kernel;
+/// any other head is cast to f32 `chunk` vocab rows at a time (`head_chunks`).
 pub fn head_logits_chunked(x: &MxArray, head: &Dense, chunk: i64) -> Result<MxArray> {
     if chunk <= 0 {
         return Err(bad(format!("head chunk {chunk} must be > 0")));
@@ -387,6 +531,11 @@ pub fn head_logits_chunked(x: &MxArray, head: &Dense, chunk: i64) -> Result<MxAr
     let xf = x.astype(DType::Float32)?;
     if let Dense::Qmm { .. } = head {
         return head.mm_t(&xf);
+    }
+    if let Dense::Array(w) = head
+        && let Some(logits) = try_bf16_lm_head(&xf, w)?
+    {
+        return Ok(logits);
     }
     head_chunks(head, chunk, xf.shape_at(0)?, |w| {
         xf.matmul(&w.transpose(Some(&[1, 0]))?)

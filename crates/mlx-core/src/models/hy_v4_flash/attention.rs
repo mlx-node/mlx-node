@@ -125,6 +125,40 @@ fn grouped_mm_t(w: &Dense, x: &MxArray, g: i64) -> Result<MxArray> {
         .matmul(&wf.transpose(Some(&[0, 2, 1]))?)
 }
 
+/// `x_mgh [m, g, k] · W_iᵀ` for the `g` row groups `W_i` of `w [g·r, k]`
+/// -> `[m, g, r]`, using the row-invariant Metal kernel directly for Q8 decode.
+pub(crate) fn grouped_mm_t_mgh(w: &Dense, x_mgh: &MxArray, g: i64) -> Result<MxArray> {
+    let m = x_mgh.shape_at(0)?;
+    if let Dense::Qmm {
+        w: qw,
+        scales,
+        biases,
+    } = w
+        && (1..=16).contains(&m)
+        && x_mgh.ndim()? == 3
+        && x_mgh.shape_at(1)? == g
+    {
+        let xf = if x_mgh.dtype()? == DType::Float32 {
+            x_mgh.clone()
+        } else {
+            x_mgh.astype(DType::Float32)?
+        };
+        // SAFETY: all handles are live arrays owned by this call.
+        let h = unsafe {
+            mlx_sys::mlx_hy4_q8_grouped_decode(
+                xf.as_raw_ptr(),
+                qw.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+            )
+        };
+        if !h.is_null() {
+            return MxArray::from_handle(h, "hy_v4_flash q8_grouped_decode");
+        }
+    }
+    grouped_mm_t(w, &x_mgh.transpose(Some(&[1, 0, 2]))?, g)?.transpose(Some(&[1, 0, 2]))
+}
+
 /// One call's projections.
 #[derive(Clone)]
 pub struct Projected {
@@ -274,15 +308,13 @@ impl Mla {
         };
         let qr = rms_norm(&q_a_out, &w.q_a_norm, g.eps)?;
         let q = qlinear(&qr, &w.q_b)?.reshape(&[n, heads, qk])?;
-        let q_nope = q
-            .slice(&[0, 0, 0], &[n, heads, nope])?
-            .transpose(Some(&[1, 0, 2]))?;
+        let q_nope = q.slice(&[0, 0, 0], &[n, heads, nope])?;
         let q_pe = fast_rope(
             &q.slice(&[0, 0, nope], &[n, heads, qk])?,
             &self.inv_freqs,
             positions,
         )?;
-        let q_abs = grouped_mm_t(&w.k_b, &q_nope, heads)?.transpose(Some(&[1, 0, 2]))?;
+        let q_abs = grouped_mm_t_mgh(&w.k_b, &q_nope, heads)?;
         let q = MxArray::concatenate(&q_abs, &q_pe, -1)?;
 
         let kv = rms_norm(&ckv.slice(&[0, 0], &[n, kv_lora])?, &w.kv_a_norm, g.eps)?;
@@ -335,9 +367,7 @@ impl Mla {
         let n = o_lat.shape_at(0)?;
         let heads = g.n_heads as i64;
         let width = heads * g.head_v as i64;
-        let o = grouped_mm_t(&w.v_b, &o_lat.transpose(Some(&[1, 0, 2]))?, heads)?
-            .transpose(Some(&[1, 0, 2]))?
-            .reshape(&[n, width])?;
+        let o = grouped_mm_t_mgh(&w.v_b, o_lat, heads)?.reshape(&[n, width])?;
         let gate_lin = match gate_lin {
             Some(gl) => gl.clone(),
             None => qlinear(x, &w.gate)?,

@@ -1,27 +1,27 @@
 //! The wave's op table, its row checks, and owner rows of a wave with Q8
 //! attention projections giving each owner's bits alone.
 
-use super::attention::{Geometry, Mla};
+use super::attention::{Geometry, Mla, grouped_mm_t_mgh};
 use super::batch::{Group, MIN_Q8_ROWS, OPS, Op, Span, Wave, decode_group, group};
 use super::cache::{WINDOW_SLACK, WindowRing};
 use super::config::Attn;
-use super::moe::{AffineProj, FFN_CHUNK_ROWS, RowKind};
+use super::moe::{AffineProj, FFN_CHUNK_ROWS, RowKind, qlinear};
 use super::weights::AttnWeights;
 use crate::array::{DType, MxArray};
-use crate::models::deepseek_v41::store::Dense;
+use crate::models::deepseek_v41::store::{Dense, Weight};
 
 #[test]
 fn decode_groups_follow_the_op_table() {
     let want = [
         (Op::Engram, Group::Fused),
-        (Op::HcMix, Group::Row),
+        (Op::HcMix, Group::Fused),
         (Op::AttnQ8, Group::Fused),
         (Op::AttnCore, Group::Owner),
         (Op::Router, Group::Row),
         (Op::Experts, Group::Fused),
         (Op::FfnQ8, Group::Fused),
-        (Op::TrunkOut, Group::Row),
-        (Op::VocabHead, Group::Row),
+        (Op::TrunkOut, Group::Fused),
+        (Op::VocabHead, Group::Fused),
     ];
     assert_eq!(OPS.len(), want.len());
     for (op, (wop, g)) in OPS.iter().zip(want) {
@@ -235,5 +235,123 @@ fn q8_wave_rows_equal_each_owner_alone() {
     for (i, want) in alone.iter().enumerate() {
         assert_eq!(&read(&wave.owner_rows(&y, i).unwrap()), want, "owner {i}");
         assert_eq!(wave_rings[i].len(), alone_rings[i].len(), "owner {i} ring");
+    }
+}
+
+fn read_bits(x: &MxArray) -> Vec<u32> {
+    read(x).into_iter().map(f32::to_bits).collect()
+}
+
+fn assert_f32_close(got: &[f32], want: &[f32], rel: f64, label: &str) {
+    assert_eq!(got.len(), want.len(), "{label} len");
+    let rms = (want
+        .iter()
+        .map(|&v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        / want.len().max(1) as f64)
+        .sqrt();
+    let max_abs = got
+        .iter()
+        .zip(want)
+        .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
+        .fold(0.0f64, f64::max);
+    assert!(
+        max_abs <= rel * rms + 1e-5,
+        "{label}: max_abs={max_abs:e} rms={rms:e}"
+    );
+}
+
+#[test]
+fn q8_dense_decode_row_invariant_and_f32_parity() {
+    crate::models::hy_v4_flash::exact_f32();
+    let mut r = Rng(101);
+    let max_m = 16usize;
+    let ms = [1usize, 2, 3, 4, 5, 12, 16];
+    let shapes = [
+        (3072usize, 1024usize),
+        (3072, 576),
+        (3072, 128),
+        (1024, 16384),
+    ];
+    for (k, n) in shapes {
+        let w = qmm(&r.vec(n * k, 1.5 / (k as f32).sqrt()), n, k);
+        let x_all = r.vec(max_m * k, 1.5);
+        let alone: Vec<Vec<u32>> = (0..max_m)
+            .map(|row| {
+                let xr = arr(&x_all[row * k..(row + 1) * k], &[1, k]);
+                read_bits(&qlinear(&xr, &w).unwrap())
+            })
+            .collect();
+        let wf = w.f32().unwrap().transpose(Some(&[1, 0])).unwrap();
+        for m in ms {
+            let xm = arr(&x_all[..m * k], &[m, k]);
+            let y = qlinear(&xm, &w).unwrap();
+            let yb = read_bits(&y);
+            for row in 0..m {
+                assert_eq!(
+                    &yb[row * n..(row + 1) * n],
+                    &alone[row][..],
+                    "dense ({k},{n}) M={m} row {row} bit-exact vs M=1"
+                );
+            }
+            if m == 1 || m == 16 {
+                let y_ref = read(&xm.matmul(&wf).unwrap());
+                assert_f32_close(&read(&y), &y_ref, 1e-4, &format!("dense ({k},{n}) M={m}"));
+            }
+        }
+    }
+}
+
+#[test]
+fn q8_grouped_decode_row_invariant_and_f32_parity() {
+    crate::models::hy_v4_flash::exact_f32();
+    let mut r = Rng(103);
+    let max_m = 16usize;
+    let ms = [1usize, 2, 3, 4, 5, 12, 16];
+    let shapes = [(64usize, 192usize, 512usize), (64, 512, 256)];
+    for (g, k, n) in shapes {
+        let w = qmm(&r.vec(g * n * k, 1.5 / (k as f32).sqrt()), g * n, k);
+        let x_all = r.vec(max_m * g * k, 1.5);
+        let alone: Vec<Vec<u32>> = (0..max_m)
+            .map(|row| {
+                let xr = arr(&x_all[row * g * k..(row + 1) * g * k], &[1, g, k]);
+                read_bits(&grouped_mm_t_mgh(&w, &xr, g as i64).unwrap())
+            })
+            .collect();
+        let wf = w
+            .f32()
+            .unwrap()
+            .reshape(&[g as i64, n as i64, k as i64])
+            .unwrap()
+            .transpose(Some(&[0, 2, 1]))
+            .unwrap();
+        for m in ms {
+            let xm = arr(&x_all[..m * g * k], &[m, g, k]);
+            let y = grouped_mm_t_mgh(&w, &xm, g as i64).unwrap();
+            let yb = read_bits(&y);
+            for row in 0..m {
+                assert_eq!(
+                    &yb[row * g * n..(row + 1) * g * n],
+                    &alone[row][..],
+                    "grouped (G={g},K={k},N={n}) M={m} row {row} bit-exact vs M=1"
+                );
+            }
+            if m == 1 || m == 16 {
+                let y_ref = read(
+                    &xm.transpose(Some(&[1, 0, 2]))
+                        .unwrap()
+                        .matmul(&wf)
+                        .unwrap()
+                        .transpose(Some(&[1, 0, 2]))
+                        .unwrap(),
+                );
+                assert_f32_close(
+                    &read(&y),
+                    &y_ref,
+                    1e-4,
+                    &format!("grouped (G={g},K={k},N={n}) M={m}"),
+                );
+            }
+        }
     }
 }

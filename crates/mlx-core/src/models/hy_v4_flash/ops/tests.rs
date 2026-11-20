@@ -781,3 +781,220 @@ fn swiglu_clamped_compiled_matches_asymmetric_clamp() {
         assert_eq!(shape(&out), [9, 9]);
     }
 }
+
+fn det_f32(seed: u64, len: usize, scale: f32) -> Vec<f32> {
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    (0..len)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (((s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * scale
+        })
+        .collect()
+}
+
+fn to_bits(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+#[test]
+fn fused_hc_row_invariance_and_f32_parity() {
+    crate::models::hy_v4_flash::exact_f32();
+    let hc = 4i64;
+    let norm_eps = 1e-6f32;
+    let hc_eps = 1e-4f32;
+    let magnitude = 2.0f32;
+    let cfg = HcConfig {
+        count: hc as usize,
+        eps: hc_eps,
+        magnitude,
+    };
+
+    for &d in &[64i64, 66, 3072] {
+        let hd = (hc * d) as usize;
+        let scale_w = 1.0 / (hd as f32).sqrt();
+        let w_mix = HcWeights {
+            weight: MxArray::from_float32(
+                &det_f32(101 + d as u64, (2 * hc) as usize * hd, scale_w),
+                &[2 * hc, hc * d],
+            )
+            .unwrap(),
+            scale: MxArray::from_float32(&[0.75, 1.25], &[2]).unwrap(),
+            base: MxArray::from_float32(
+                &det_f32(201 + d as u64, (2 * hc) as usize, 0.5),
+                &[2 * hc],
+            )
+            .unwrap(),
+        };
+        let w_head = HcWeights {
+            weight: MxArray::from_float32(
+                &det_f32(301 + d as u64, hc as usize * hd, scale_w),
+                &[hc, hc * d],
+            )
+            .unwrap(),
+            scale: MxArray::from_float32(&[0.85], &[1]).unwrap(),
+            base: MxArray::from_float32(&det_f32(401 + d as u64, hc as usize, 0.5), &[hc]).unwrap(),
+        };
+
+        let max_m = 256usize;
+        let x_all_v = det_f32(501 + d as u64, max_m * hd, 1.5);
+        let y_all_v = det_f32(601 + d as u64, max_m * d as usize, 1.5);
+        let x_all = MxArray::from_float32(&x_all_v, &[max_m as i64, hc, d]).unwrap();
+        let y_all = MxArray::from_float32(&y_all_v, &[max_m as i64, d]).unwrap();
+
+        // Single-row baselines for sampled rows across every tested M.
+        let sample_rows = [0usize, 1, 3, 16, 255];
+        let mut single_h = std::collections::HashMap::new();
+        let mut single_post = std::collections::HashMap::new();
+        let mut single_head = std::collections::HashMap::new();
+        let mut single_out = std::collections::HashMap::new();
+        for &r in &sample_rows {
+            let xr = x_all
+                .slice(&[r as i64, 0, 0], &[r as i64 + 1, hc, d])
+                .unwrap();
+            let yr = y_all.slice(&[r as i64, 0], &[r as i64 + 1, d]).unwrap();
+            let (h1, p1) = hc_mix_reduce(&xr, &w_mix, norm_eps, &cfg).unwrap();
+            let head1 = hc_head(&xr, &w_head, norm_eps, hc_eps).unwrap();
+            let out1 = hc_post_identity(&yr, &xr, &p1).unwrap();
+            single_h.insert(r, to_bits(&read(&h1)));
+            single_post.insert(r, to_bits(&read(&p1)));
+            single_head.insert(r, to_bits(&read(&head1)));
+            single_out.insert(r, to_bits(&read(&out1)));
+        }
+
+        for &m in &[1usize, 2, 4, 17, 256] {
+            let xm = x_all.slice(&[0, 0, 0], &[m as i64, hc, d]).unwrap();
+            let ym = y_all.slice(&[0, 0], &[m as i64, d]).unwrap();
+            let (hm, pm) = hc_mix_reduce(&xm, &w_mix, norm_eps, &cfg).unwrap();
+            let headm = hc_head(&xm, &w_head, norm_eps, hc_eps).unwrap();
+            let outm = hc_post_identity(&ym, &xm, &pm).unwrap();
+
+            let hm_v = read(&hm);
+            let pm_v = read(&pm);
+            let headm_v = read(&headm);
+            let outm_v = read(&outm);
+
+            for &r in &sample_rows {
+                if r >= m {
+                    continue;
+                }
+                assert_eq!(
+                    to_bits(&hm_v[r * d as usize..(r + 1) * d as usize]),
+                    single_h[&r],
+                    "hc_mix_reduce h invariance d={d} M={m} row={r}"
+                );
+                assert_eq!(
+                    to_bits(&pm_v[r * hc as usize..(r + 1) * hc as usize]),
+                    single_post[&r],
+                    "hc_mix_reduce post invariance d={d} M={m} row={r}"
+                );
+                assert_eq!(
+                    to_bits(&headm_v[r * d as usize..(r + 1) * d as usize]),
+                    single_head[&r],
+                    "hc_head invariance d={d} M={m} row={r}"
+                );
+                assert_eq!(
+                    to_bits(&outm_v[r * hd..(r + 1) * hd]),
+                    single_out[&r],
+                    "hc_post_identity invariance d={d} M={m} row={r}"
+                );
+            }
+
+            if m <= 17 {
+                // F32 reference parity (pure MLX ops)
+                let ref_g = hc_mix(&xm, &w_mix, norm_eps, &cfg).unwrap();
+                let ref_h = read(&hc_reduce(&xm, &ref_g.pre).unwrap());
+                let ref_p = read(&ref_g.post);
+                let ref_head_pre = hc_head_pre(&xm, &w_head, norm_eps, hc_eps).unwrap();
+                let ref_head = read(&hc_reduce(&xm, &ref_head_pre).unwrap());
+                let p_b = pm.reshape(&[m as i64, hc, 1]).unwrap();
+                let y_b = ym.reshape(&[m as i64, 1, d]).unwrap();
+                let ref_out = read(&xm.add(&p_b.mul(&y_b).unwrap()).unwrap());
+
+                let max_err = |a: &[f32], b: &[f32]| -> f32 {
+                    a.iter()
+                        .zip(b)
+                        .map(|(&x, &y)| (x - y).abs())
+                        .fold(0.0f32, f32::max)
+                };
+                let eh = max_err(&hm_v, &ref_h);
+                let ep = max_err(&pm_v, &ref_p);
+                let ehead = max_err(&headm_v, &ref_head);
+                let eout = max_err(&outm_v, &ref_out);
+                assert!(eh <= 1e-5, "hc_mix_reduce h parity d={d} M={m}: {eh:e}");
+                assert!(ep <= 1e-5, "hc_mix_reduce post parity d={d} M={m}: {ep:e}");
+                assert!(ehead <= 1e-5, "hc_head parity d={d} M={m}: {ehead:e}");
+                assert!(
+                    eout <= 1e-5,
+                    "hc_post_identity parity d={d} M={m}: {eout:e}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn bf16_lm_head_row_invariance_and_f32_parity() {
+    crate::models::hy_v4_flash::exact_f32();
+    for &v in &[32i64, 37, 4096] {
+        for &k in &[64i64, 192, 3072] {
+            let w_f32 = det_f32(
+                701 + (v * 31 + k) as u64,
+                (v * k) as usize,
+                1.0 / (k as f32).sqrt(),
+            );
+            let w_bits: Vec<u16> = w_f32
+                .iter()
+                .map(|&val| half::bf16::from_f32(val).to_bits())
+                .collect();
+            let w_bf16 = MxArray::from_bfloat16(&w_bits, &[v, k]).unwrap();
+            let head = Dense::Array(w_bf16.clone());
+            let wt_f32 = w_bf16
+                .astype(DType::Float32)
+                .unwrap()
+                .transpose(Some(&[1, 0]))
+                .unwrap();
+
+            let x_all = MxArray::from_float32(
+                &det_f32(801 + (v * 17 + k) as u64, 16 * k as usize, 1.0),
+                &[16, k],
+            )
+            .unwrap();
+
+            let single: Vec<Vec<u32>> = (0..16i64)
+                .map(|r| {
+                    let xr = x_all.slice(&[r, 0], &[r + 1, k]).unwrap();
+                    to_bits(&read(&head_logits(&xr, &head).unwrap()))
+                })
+                .collect();
+
+            for &m in &[1i64, 2, 4, 7, 16] {
+                let xm = x_all.slice(&[0, 0], &[m, k]).unwrap();
+                let got = head_logits(&xm, &head).unwrap();
+                assert_eq!(shape(&got), [m, v]);
+                assert_eq!(got.dtype().unwrap(), DType::Float32);
+                let got_v = read(&got);
+
+                for r in 0..m as usize {
+                    assert_eq!(
+                        to_bits(&got_v[r * v as usize..(r + 1) * v as usize]),
+                        single[r],
+                        "bf16_lm_head invariance V={v} K={k} M={m} row={r}"
+                    );
+                }
+
+                let ref_v = read(&xm.matmul(&wt_f32).unwrap());
+                let max_abs = got_v
+                    .iter()
+                    .zip(&ref_v)
+                    .map(|(&a, &b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    max_abs <= 1e-4,
+                    "bf16_lm_head parity V={v} K={k} M={m}: max_abs={max_abs:e}"
+                );
+            }
+        }
+    }
+}

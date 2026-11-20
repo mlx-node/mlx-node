@@ -1276,7 +1276,8 @@ void gather_qvm(const Operands &o, const array &lhs_indices,
 void gather_qmm_rhs(const array &x_, const array &w_, const array &scales_,
                     const array &biases_, const array &indices_, array &out,
                     bool transpose, Mode mode, int M, int N, int K,
-                    bool fixed_tile, metal::Device &d, const Stream &s) {
+                    bool fixed_tile, bool allow_tf32, metal::Device &d,
+                    const Stream &s) {
   array indices = ensure_row_contiguous(indices_, s);
   auto broadcast_with_indices = [&s, &indices](const array &x) {
     if (x.size() / x.shape(-2) / x.shape(-1) == indices.size()) {
@@ -1300,7 +1301,8 @@ void gather_qmm_rhs(const array &x_, const array &w_, const array &scales_,
   // the fallback. Aligned tiles only; float32 only under tf32 as qmm does.
   if (!bridge_testing::force_gather_rhs_fallback &&
       metal::is_nax_available() && transpose && N % 64 == 0 &&
-      K % 64 == 0 && (env::enable_tf32() || x.dtype() != float32)) {
+      K % 64 == 0 &&
+      (allow_tf32 || env::enable_tf32() || x.dtype() != float32)) {
     const int E = w.size() / w.shape(-1) / w.shape(-2);
     const auto &tile =
         kernels::kRhsNaxTiles[fixed_tile || M / E < kernels::kRhsNaxWideRows
@@ -1757,7 +1759,7 @@ void KQuantGatherQMM::eval_gpu(const std::vector<array> &inputs, array &out) {
   // loads of each expert's weights.
   if (M == 1 && right_sorted_ && (rhs_any_rows_ || (B >= 16 && B / E >= 4))) {
     gather_qmm_rhs(x, w, scales, biases, rhs_indices, out, transpose_, mode_,
-                   x.size() / K, N, K, rhs_any_rows_, d, s);
+                   x.size() / K, N, K, rhs_any_rows_, allow_tf32_, d, s);
     return;
   }
 

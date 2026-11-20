@@ -7,7 +7,7 @@ use crate::models::deepseek_v41::ops::rope_angle;
 use crate::models::hy_v4_flash::cache::{LatentBuf, LayerCache, WINDOW_SLACK, WindowRing};
 use crate::models::hy_v4_flash::indexer::{Indexer, IndexerGeometry, IndexerState, Indexing};
 use crate::models::hy_v4_flash::moe::RowKind;
-use crate::models::hy_v4_flash::sparse::gather_sink_attention_in;
+use crate::models::hy_v4_flash::sparse::{gather_rows_reference, gather_sink_attention_in};
 use crate::models::hy_v4_flash::weights::IndexerWeights;
 
 fn ops() -> Value {
@@ -931,5 +931,254 @@ fn q8_projections_of_a_row_do_not_depend_on_the_call() {
             )
             .unwrap();
         assert_eq!(row(&out, i), read(&fo), "row {i} finish");
+    }
+}
+
+#[test]
+fn mla_sink_attention_matches_reference_full_geometry() {
+    crate::models::hy_v4_flash::exact_f32();
+    let (d, vw) = (576usize, 512i64);
+    let scale = 1.0 / (d as f32).sqrt();
+    for (h, kmax, seed) in [(32usize, 2048usize, 131u64), (64usize, 512usize, 137u64)] {
+        let (s, n) = (5usize, kmax + 17);
+        let mut r = Rng(seed);
+        let q = arr(&r.vec(s * h * d, 1.5), &[s, h, d]);
+        let keys = arr(&r.vec(n * d, 1.5), &[n, d])
+            .astype(DType::Float16)
+            .unwrap();
+        let mut sinks_v = r.vec(h, 2.0);
+        sinks_v[0] = -20.0;
+        sinks_v[1] = 50.0;
+        sinks_v[2] = 0.0;
+        sinks_v[h - 1] = 50.0;
+        let sinks = arr(&sinks_v, &[h]);
+
+        let mut idx = vec![-1i32; s * kmax];
+        // Row 0: full window
+        for (j, slot) in idx[..kmax].iter_mut().enumerate() {
+            *slot = ((j * 7 + 3) % n) as i32;
+        }
+        // Row 1: partial window
+        for j in 0..(kmax / 3) {
+            idx[kmax + j] = ((j * 13 + 1) % n) as i32;
+        }
+        // Row 2: duplicate indices interleaved with -1
+        for j in 0..kmax {
+            idx[2 * kmax + j] = match j % 5 {
+                0 | 1 => ((j / 5) % n) as i32,
+                2 | 3 => ((j / 5 + 42) % n) as i32,
+                _ => -1,
+            };
+        }
+        // Row 3: single listed key
+        idx[3 * kmax] = (n - 1) as i32;
+        // Row 4: keyless (all -1)
+
+        let ia = MxArray::from_int32(&idx, &[s as i64, kmax as i64]).unwrap();
+
+        #[cfg(target_os = "macos")]
+        {
+            // Confirm the fused Metal bridge handles full Hy4 geometry without falling back.
+            let raw = unsafe {
+                mlx_sys::mlx_hy4_mla_sink_attention(
+                    q.as_raw_ptr(),
+                    keys.as_raw_ptr(),
+                    std::ptr::null_mut(),
+                    ia.as_raw_ptr(),
+                    sinks.as_raw_ptr(),
+                    vw as i32,
+                    scale,
+                )
+            };
+            assert!(
+                !raw.is_null(),
+                "expected Metal kernel for H={h} kmax={kmax}"
+            );
+            drop(MxArray::from_handle(raw, "test mla probe").unwrap());
+        }
+
+        let got = read(&gather_sink_attention(&q, &keys, &ia, vw, &sinks, scale).unwrap());
+        let want = read(
+            &gather_rows_reference(&q, KeyRows::Whole(&keys), &ia, vw, &sinks, scale).unwrap(),
+        );
+        assert_eq!(got.len(), want.len());
+        let mut max_abs = 0.0f32;
+        let mut worst = (0usize, 0.0f32, 0.0f32);
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            assert!(g.is_finite(), "non-finite output for H={h} kmax={kmax}");
+            let diff = (g - w).abs();
+            if diff > max_abs {
+                max_abs = diff;
+                worst = (i, g, w);
+            }
+        }
+        assert!(
+            max_abs <= 1e-5,
+            "H={h} kmax={kmax}: max_abs={max_abs:e} > 1e-5 at (row={}, head={}, col={}) got={} want={}",
+            worst.0 / (h * vw as usize),
+            (worst.0 / vw as usize) % h,
+            worst.0 % vw as usize,
+            worst.1,
+            worst.2,
+        );
+    }
+}
+
+#[test]
+fn mla_sink_attention_keyless_row_exact_zero_with_nan_slot_zero() {
+    let (s, h, d, n, kmax, vw) = (3usize, 32usize, 576usize, 64usize, 512usize, 512i64);
+    let mut r = Rng(149);
+    let q = arr(&r.vec(s * h * d, 1.5), &[s, h, d]);
+    let mut keys_v = r.vec(n * d, 1.5);
+    let mut sinks_v = r.vec(h, 2.0);
+    sinks_v[0] = -20.0;
+    sinks_v[1] = 50.0;
+    sinks_v[2] = 0.0;
+    let sinks = arr(&sinks_v, &[h]);
+
+    let mut idx = vec![-1i32; s * kmax];
+    // Row 0: keyless (all -1)
+    // Row 1: partial valid indices excluding slot 0
+    for j in 0..37 {
+        idx[kmax + j * 2] = (1 + (j * 5) % (n - 1)) as i32;
+    }
+    // Row 2: keyless (all -1)
+    let ia = MxArray::from_int32(&idx, &[s as i64, kmax as i64]).unwrap();
+    let scale = 1.0 / (d as f32).sqrt();
+
+    let run = |kv: &[f32]| {
+        let ka = arr(kv, &[n, d]).astype(DType::Float16).unwrap();
+        let k0 = ka.slice(&[0, 0], &[n as i64, 288]).unwrap();
+        let k1 = ka.slice(&[0, 288], &[n as i64, d as i64]).unwrap();
+        let whole = bits(&gather_sink_attention(&q, &ka, &ia, vw, &sinks, scale).unwrap());
+        let split = bits(
+            &gather_sink_attention_rows(&q, KeyRows::Split(&k0, &k1), &ia, vw, &sinks, scale)
+                .unwrap(),
+        );
+        (whole, split)
+    };
+
+    keys_v[..d].fill(0.0);
+    let (want_whole, want_split) = run(&keys_v);
+    assert_eq!(want_whole, want_split);
+
+    for (c, slot_val) in keys_v[..d].iter_mut().enumerate() {
+        *slot_val = match c % 3 {
+            0 => f32::NAN,
+            1 => f32::INFINITY,
+            _ => f32::NEG_INFINITY,
+        };
+    }
+    let (got_whole, got_split) = run(&keys_v);
+    assert_eq!(got_whole, want_whole);
+    assert_eq!(got_split, want_split);
+
+    let per_row = h * vw as usize;
+    let zero_bits = 0.0f32.to_bits();
+    for keyless_row in [0usize, 2usize] {
+        assert!(
+            got_whole[keyless_row * per_row..(keyless_row + 1) * per_row]
+                .iter()
+                .all(|&b| b == zero_bits),
+            "Whole keyless row {keyless_row} must be exact 0.0f"
+        );
+        assert!(
+            got_split[keyless_row * per_row..(keyless_row + 1) * per_row]
+                .iter()
+                .all(|&b| b == zero_bits),
+            "Split keyless row {keyless_row} must be exact 0.0f"
+        );
+    }
+}
+
+#[test]
+fn mla_sink_attention_whole_vs_split_bit_identical() {
+    let (s, d, vw) = (4usize, 576usize, 512i64);
+    let scale = 1.0 / (d as f32).sqrt();
+    for (h, kmax, seed) in [(32usize, 2048usize, 151u64), (64usize, 512usize, 157u64)] {
+        let n = kmax + 11;
+        let mut r = Rng(seed);
+        let q = arr(&r.vec(s * h * d, 1.5), &[s, h, d]);
+        let keys = arr(&r.vec(n * d, 1.5), &[n, d])
+            .astype(DType::Float16)
+            .unwrap();
+        let k0 = keys.slice(&[0, 0], &[n as i64, 288]).unwrap();
+        let k1 = keys.slice(&[0, 288], &[n as i64, d as i64]).unwrap();
+        let sinks = arr(&r.vec(h, 2.0), &[h]);
+        let idx: Vec<i32> = (0..s * kmax)
+            .map(|i| {
+                let (row, j) = (i / kmax, i % kmax);
+                if (j + row) % 11 == 0 {
+                    -1
+                } else {
+                    ((j * 3 + row * 17) % n) as i32
+                }
+            })
+            .collect();
+        let ia = MxArray::from_int32(&idx, &[s as i64, kmax as i64]).unwrap();
+
+        let whole = bits(
+            &gather_sink_attention_rows(&q, KeyRows::Whole(&keys), &ia, vw, &sinks, scale).unwrap(),
+        );
+        let split = bits(
+            &gather_sink_attention_rows(&q, KeyRows::Split(&k0, &k1), &ia, vw, &sinks, scale)
+                .unwrap(),
+        );
+        assert_eq!(
+            whole, split,
+            "H={h} kmax={kmax}: Whole vs Split bits differ"
+        );
+    }
+}
+
+#[test]
+fn mla_sink_attention_strict_row_invariance_up_to_256() {
+    let (max_s, d, vw) = (256usize, 576usize, 512i64);
+    let scale = 1.0 / (d as f32).sqrt();
+    let probe_rows = [0usize, 1, 2, 3, 127, 255];
+    for (h, kmax, seed) in [(32usize, 2048usize, 163u64), (64usize, 512usize, 167u64)] {
+        let n = kmax + 9;
+        let mut r = Rng(seed);
+        let q = arr(&r.vec(max_s * h * d, 1.5), &[max_s, h, d]);
+        let keys = arr(&r.vec(n * d, 1.5), &[n, d])
+            .astype(DType::Float16)
+            .unwrap();
+        let sinks = arr(&r.vec(h, 2.0), &[h]);
+        let idx: Vec<i32> = (0..max_s * kmax)
+            .map(|i| {
+                let (row, j) = (i / kmax, i % kmax);
+                if j >= kmax - (row % 16) {
+                    -1
+                } else {
+                    ((j + row * 7) % n) as i32
+                }
+            })
+            .collect();
+        let ia = MxArray::from_int32(&idx, &[max_s as i64, kmax as i64]).unwrap();
+        let (hi, di, ki) = (h as i64, d as i64, kmax as i64);
+        let per = h * vw as usize;
+        let call = |lo: i64, rows: i64| {
+            let qs = q.slice(&[lo, 0, 0], &[lo + rows, hi, di]).unwrap();
+            let is = ia.slice(&[lo, 0], &[lo + rows, ki]).unwrap();
+            bits(&gather_sink_attention(&qs, &keys, &is, vw, &sinks, scale).unwrap())
+        };
+
+        let alone: Vec<(usize, Vec<u32>)> = probe_rows
+            .iter()
+            .map(|&row| (row, call(row as i64, 1)))
+            .collect();
+
+        for batch_s in [2usize, 4, 256] {
+            let all = call(0, batch_s as i64);
+            for (row, want) in &alone {
+                if *row < batch_s {
+                    assert_eq!(
+                        &all[*row * per..(*row + 1) * per],
+                        &want[..],
+                        "H={h} kmax={kmax}: S={batch_s} row {row} differs from S=1"
+                    );
+                }
+            }
+        }
     }
 }

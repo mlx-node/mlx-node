@@ -64,6 +64,10 @@ fn use_lru_policy() -> bool {
     std::env::var("MLX_HY4_CACHE_POLICY").is_ok_and(|v| v.eq_ignore_ascii_case("lru"))
 }
 
+fn prefill_nax_enabled() -> bool {
+    std::env::var("MLX_HY4_PREFILL_NAX").as_deref() != Ok("0")
+}
+
 fn lfu_half_life(n_layers: usize, n_used: usize) -> f64 {
     (LFU_HALF_LIFE_TOKENS * (n_layers.max(1) * n_used.max(1)) as f64).max(1.0)
 }
@@ -741,6 +745,30 @@ impl ProjArrays {
             )
         };
         MxArray::from_handle(h, "hy_v4_flash sorted gather_qmm")
+    }
+
+    /// Like `gather_sorted`, enabling per-op TF32 NAX on F32 activations
+    /// unless `MLX_HY4_PREFILL_NAX=0`.
+    pub fn gather_sorted_nax(&self, x: &MxArray, slots: &MxArray) -> Result<MxArray> {
+        if !prefill_nax_enabled() {
+            return self.gather_sorted(x, slots);
+        }
+        let mode = CString::new(self.format.mlx_mode()).map_err(|e| bad(e.to_string()))?;
+        // SAFETY: every handle is a live array owned by the caller for the
+        // call; the bridge returns a new array or null on error.
+        let h = unsafe {
+            mlx_sys::mlx_kquant_gather_qmm_sorted_nax(
+                x.as_raw_ptr(),
+                self.w.as_raw_ptr(),
+                self.s.as_raw_ptr(),
+                self.b.as_raw_ptr(),
+                slots.as_raw_ptr(),
+                self.format.group_size() as i32,
+                self.format.bits() as i32,
+                mode.as_ptr(),
+            )
+        };
+        MxArray::from_handle(h, "hy_v4_flash sorted gather_qmm nax")
     }
 }
 

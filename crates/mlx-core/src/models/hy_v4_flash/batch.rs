@@ -4,15 +4,15 @@
 //! ```text
 //! op          decode wave                                   prefill slice (one owner)
 //! Engram      fused   table rows of every row, Q8 kv         fused
-//! HcMix       row     f32 HC mixes one row per call          fused
+//! HcMix       fused   fused HC mix/reduce per row            fused
 //! AttnQ8      fused   q_a, q_b, kv_a, k_b, v_b, gate, output fused
 //! AttnCore    owner   cache write, indexer (its Q8 too),     owner
 //!                     sparse attention on the owner's rows
 //! Router      row     f32 router one row per call            fused
 //! Experts     fused   one bank prepare over the union        fused
 //! FfnQ8       fused   latent down / up, shared expert        fused
-//! TrunkOut    row     f32 HC head + norm one row per call    fused
-//! VocabHead   row     BF16 head one row per call             fused
+//! TrunkOut    fused   fused HC head + rms norm               fused
+//! VocabHead   fused   native BF16 LM head / Q8 linear        fused
 //! ```
 //!
 //! Fused Q8 calls see at least `MIN_Q8_ROWS` rows and a capped decode wave
@@ -80,9 +80,15 @@ pub const OPS: [Op; 9] = [
 /// The group of `op` in a decode wave.
 pub const fn decode_group(op: Op) -> Group {
     match op {
-        Op::Engram | Op::AttnQ8 | Op::Experts | Op::FfnQ8 => Group::Fused,
+        Op::Engram
+        | Op::HcMix
+        | Op::AttnQ8
+        | Op::Experts
+        | Op::FfnQ8
+        | Op::TrunkOut
+        | Op::VocabHead => Group::Fused,
         Op::AttnCore => Group::Owner,
-        Op::HcMix | Op::Router | Op::TrunkOut | Op::VocabHead => Group::Row,
+        Op::Router => Group::Row,
     }
 }
 

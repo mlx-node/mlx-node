@@ -22,7 +22,7 @@ use super::config::{Attn, HcConfig, HyV4FlashConfig};
 use super::engram;
 use super::indexer::{Indexer, IndexerGeometry, IndexerState, Indexing};
 use super::moe::{ExpertSource, FfnConfig, LayerFfn, Routes, RowKind};
-use super::ops::{HcGates, hc_mix, hc_post_identity, hc_reduce};
+use super::ops::{hc_mix_reduce, hc_post_identity};
 use super::stats::{Phase, prof_end, prof_start};
 use super::weights::{HcWeights, LayerWeights, Residual};
 use crate::array::MxArray;
@@ -217,17 +217,17 @@ impl Block {
             }
         };
 
-        let (g, h) = self.mix(&x, hc_attn, kind)?;
+        let (h, post_attn) = self.mix(&x, hc_attn, kind)?;
         let a = self.attend(w, &h, wave, owners)?;
-        let x = post(&a, &x, &g.post)?;
+        let x = post(&a, &x, &post_attn)?;
 
-        let (g, h) = self.mix(&x, hc_ffn, kind)?;
+        let (h, post_ffn) = self.mix(&x, hc_ffn, kind)?;
         if let Some((next_blk, next_w)) = next {
             next_blk.prefetch_from(next_w, &h)?;
         }
         let (f, routes) = self.ffn.forward(w, &h, kind)?;
         self.end_layer();
-        Ok((post(&f, &x, &g.post)?, routes))
+        Ok((post(&f, &x, &post_ffn)?, routes))
     }
 
     /// The attention sublayer output `[n, dim]` for `h [n, dim]`: the
@@ -288,34 +288,33 @@ impl Block {
         self.mla.core(&w.attn, p, start, &mut st.cache, index)
     }
 
-    /// A sublayer's gates and its reduced input, under the HC clock.
-    fn mix(&self, x: &MxArray, hw: &HcWeights, kind: RowKind) -> Result<(HcGates, MxArray)> {
+    /// A sublayer's reduced input and post gate, under the HC clock.
+    fn mix(&self, x: &MxArray, hw: &HcWeights, kind: RowKind) -> Result<(MxArray, MxArray)> {
         let tp = prof_start();
-        let g = match group(Op::HcMix, kind) {
+        let (h, post) = match group(Op::HcMix, kind) {
             Group::Row => self.mix_per_row(x, hw)?,
-            Group::Fused | Group::Owner => hc_mix(x, hw, self.eps, &self.hc)?,
+            Group::Fused | Group::Owner => hc_mix_reduce(x, hw, self.eps, &self.hc)?,
         };
-        let h = hc_reduce(x, &g.pre)?;
-        prof_end(Phase::Hc, tp, &[&g.post, &h])?;
-        Ok((g, h))
+        prof_end(Phase::Hc, tp, &[&post, &h])?;
+        Ok((h, post))
     }
 
-    fn mix_per_row(&self, x: &MxArray, hw: &HcWeights) -> Result<HcGates> {
+    fn mix_per_row(&self, x: &MxArray, hw: &HcWeights) -> Result<(MxArray, MxArray)> {
         let n = x.shape_at(0)?;
         if n == 1 {
-            return hc_mix(x, hw, self.eps, &self.hc);
+            return hc_mix_reduce(x, hw, self.eps, &self.hc);
         }
-        let (mut pre, mut post) = (Vec::new(), Vec::new());
+        let (mut hs, mut posts) = (Vec::new(), Vec::new());
         for r in 0..n {
             let row = x.slice(&[r, 0, 0], &[r + 1, x.shape_at(1)?, x.shape_at(2)?])?;
-            let g = hc_mix(&row, hw, self.eps, &self.hc)?;
-            pre.push(g.pre);
-            post.push(g.post);
+            let (h, post) = hc_mix_reduce(&row, hw, self.eps, &self.hc)?;
+            hs.push(h);
+            posts.push(post);
         }
-        Ok(HcGates {
-            pre: MxArray::concatenate_many(pre.iter().collect(), Some(0))?,
-            post: MxArray::concatenate_many(post.iter().collect(), Some(0))?,
-        })
+        Ok((
+            MxArray::concatenate_many(hs.iter().collect(), Some(0))?,
+            MxArray::concatenate_many(posts.iter().collect(), Some(0))?,
+        ))
     }
 }
 

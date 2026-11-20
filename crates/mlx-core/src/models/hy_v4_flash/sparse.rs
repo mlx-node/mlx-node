@@ -112,8 +112,8 @@ pub(crate) fn gather_sink_attention_in(
     gather_rows_in(q, KeyRows::Whole(keys), idx, v_width, sinks, scale, budget)
 }
 
-/// The core of every entry above. With more than one chunk, every chunk is
-/// evaluated before the next one is built.
+/// The core of every entry above. Uses the fused Metal kernel when geometry and
+/// dtypes match; otherwise falls back to the chunked MLX graph.
 fn gather_rows_in(
     q: &MxArray,
     keys: KeyRows<'_>,
@@ -123,6 +123,79 @@ fn gather_rows_in(
     scale: f32,
     budget: usize,
 ) -> Result<MxArray> {
+    let (s, h, d, kmax) = validate_inputs(q, keys, idx, v_width, sinks)?;
+    let idx = if idx.dtype()? == DType::Int32 {
+        idx.clone()
+    } else {
+        idx.astype(DType::Int32)?
+    };
+    if let Ok(vw) = i32::try_from(v_width) {
+        let qf = if q.dtype()? == DType::Float32 {
+            q.clone()
+        } else {
+            q.astype(DType::Float32)?
+        };
+        let sf = if sinks.dtype()? == DType::Float32 {
+            sinks.clone()
+        } else {
+            sinks.astype(DType::Float32)?
+        };
+        let (k0_ptr, k1_ptr) = match keys {
+            KeyRows::Whole(k) => (k.as_raw_ptr(), std::ptr::null_mut()),
+            KeyRows::Split(k, v) => (k.as_raw_ptr(), v.as_raw_ptr()),
+        };
+        // SAFETY: all handles are live arrays owned by this call; k1_ptr is null for Whole.
+        let handle = unsafe {
+            mlx_sys::mlx_hy4_mla_sink_attention(
+                qf.as_raw_ptr(),
+                k0_ptr,
+                k1_ptr,
+                idx.as_raw_ptr(),
+                sf.as_raw_ptr(),
+                vw,
+                scale,
+            )
+        };
+        if !handle.is_null() {
+            return MxArray::from_handle(handle, "hy_v4_flash mla_sink_attention");
+        }
+    }
+    gather_rows_mlx(q, keys, &idx, s, h, d, kmax, v_width, sinks, scale, budget)
+}
+
+#[cfg(test)]
+pub(crate) fn gather_rows_reference(
+    q: &MxArray,
+    keys: KeyRows<'_>,
+    idx: &MxArray,
+    v_width: i64,
+    sinks: &MxArray,
+    scale: f32,
+) -> Result<MxArray> {
+    let (s, h, d, kmax) = validate_inputs(q, keys, idx, v_width, sinks)?;
+    let idx = idx.astype(DType::Int32)?;
+    gather_rows_mlx(
+        q,
+        keys,
+        &idx,
+        s,
+        h,
+        d,
+        kmax,
+        v_width,
+        sinks,
+        scale,
+        SPARSE_CHUNK_BYTES,
+    )
+}
+
+fn validate_inputs(
+    q: &MxArray,
+    keys: KeyRows<'_>,
+    idx: &MxArray,
+    v_width: i64,
+    sinks: &MxArray,
+) -> Result<(i64, i64, i64, i64)> {
     let &[s, h, d] = dims(q)?.as_slice() else {
         return Err(bad(format!(
             "queries must be [s, h, d], got {:?}",
@@ -148,7 +221,23 @@ fn gather_rows_in(
     if dims(sinks)?.as_slice() != [h] {
         return Err(bad(format!("sinks {:?} for {h} heads", dims(sinks)?)));
     }
-    let idx = idx.astype(DType::Int32)?;
+    Ok((s, h, d, kmax))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gather_rows_mlx(
+    q: &MxArray,
+    keys: KeyRows<'_>,
+    idx: &MxArray,
+    s: i64,
+    h: i64,
+    d: i64,
+    kmax: i64,
+    v_width: i64,
+    sinks: &MxArray,
+    scale: f32,
+    budget: usize,
+) -> Result<MxArray> {
     let rows = chunk_rows(row_bytes(kmax as usize, h as usize, d as usize), budget) as i64;
     let neg_inf = MxArray::from_float32(&[f32::NEG_INFINITY], &[1])?;
     let floor = MxArray::from_float32(&[MAX_FLOOR], &[1])?;
