@@ -2541,6 +2541,7 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
 fn note_tail_writes(adapter: &PagedKVCacheAdapter, layer_kinds: &[Qwen3_5LayerKind]) {
     #[cfg(target_os = "macos")]
     if let Some(Qwen3_5LayerKind::FullAttentionPaged { paged_idx }) = layer_kinds.last() {
@@ -3347,7 +3348,7 @@ pub(crate) fn paged_verify_wave(
     Ok(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod wave_tests;
 
 #[cfg(test)]

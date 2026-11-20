@@ -121,20 +121,31 @@ fn replay_conv_state(
     if keep <= 0 || accepted > qkv.shape_at(1)? {
         return Err(Error::from_reason("invalid GDN convolution replay window"));
     }
-    let prefix = qkv.slice_axis(1, 0, accepted)?;
-    let input = match snapshot {
-        Some(state) => MxArray::concatenate(state, &prefix, 1)?,
-        None => {
-            let zeros = MxArray::zeros(
+    if accepted >= keep {
+        return qkv.slice_axis(1, accepted - keep, accepted);
+    }
+    if accepted == 0 {
+        return match snapshot {
+            Some(state) => Ok(state.clone()),
+            None => MxArray::zeros(
                 &[qkv.shape_at(0)?, keep, qkv.shape_at(2)?],
                 Some(qkv.dtype()?),
-            )?;
-            MxArray::concatenate(&zeros, &prefix, 1)?
+            ),
+        };
+    }
+    let prefix = qkv.slice_axis(1, 0, accepted)?;
+    let tail_keep = keep - accepted;
+    let prior_tail = match snapshot {
+        Some(state) => {
+            let state_len = state.shape_at(1)?;
+            state.slice_axis(1, state_len - tail_keep, state_len)?
         }
+        None => MxArray::zeros(
+            &[qkv.shape_at(0)?, tail_keep, qkv.shape_at(2)?],
+            Some(qkv.dtype()?),
+        )?,
     };
-    let total = input.shape_at(1)?;
-    let parts = input.split_sections(&[total - keep], 1)?;
-    Ok(parts[1].clone())
+    MxArray::concatenate(&prior_tail, &prefix, 1)
 }
 
 impl GdnLayerTape {
@@ -161,6 +172,7 @@ impl GdnLayerTape {
                 v: combine(|row| &row.kernel.v)?,
                 g: combine(|row| &row.kernel.g)?,
                 beta: combine(|row| &row.kernel.beta)?,
+                tiled_heads: first.kernel.tiled_heads,
             },
             qkv: combine(|row| &row.qkv)?,
             conv_kernel_dim: first.conv_kernel_dim,
@@ -186,6 +198,7 @@ impl GdnLayerTape {
                 v: select(&self.kernel.v)?,
                 g: select(&self.kernel.g)?,
                 beta: select(&self.kernel.beta)?,
+                tiled_heads: self.kernel.tiled_heads,
             },
             qkv: select(&self.qkv)?,
             conv_kernel_dim: self.conv_kernel_dim,
@@ -375,6 +388,26 @@ struct CompleteRun {
 }
 
 impl GatedDeltaNet {
+    pub(crate) fn clear_cuda_dense_prefill(&self) {
+        self.in_proj_qkvz.clear_cuda_dense_prefill();
+        self.in_proj_ba.clear_cuda_dense_prefill();
+        self.out_proj.clear_cuda_dense_prefill();
+        if let Some((qkv, z)) = &self.split_in_proj_qkv_z {
+            qkv.clear_cuda_dense_prefill();
+            z.clear_cuda_dense_prefill();
+        }
+        if let Some((b, a)) = &self.split_in_proj_b_a {
+            b.clear_cuda_dense_prefill();
+            a.clear_cuda_dense_prefill();
+        }
+        if let Some(merged) = &self.split_in_proj_b_a_m8 {
+            merged.clear_cuda_dense_prefill();
+        }
+        if let Some(merged) = &self.in_proj_qkvz_ba_q {
+            merged.clear_cuda_dense_prefill();
+        }
+    }
+
     pub fn new(config: &Qwen3_5Config) -> Result<Self> {
         let hidden_size = config.hidden_size;
         let num_k_heads = config.linear_num_key_heads;
@@ -926,10 +959,8 @@ impl GatedDeltaNet {
         }
 
         // Fully-fused prep: conv + SiLU + q|k|v split + q/k L2-norm + decay/beta
-        // gating in ONE Metal dispatch (`mlx_qwen4_gdn_prepare` — hardcoded to
-        // this family's 10240-wide 16k/48v×128 geometry). Keep its existing
-        // decode/verify eligibility (seq_len < 64); decay and beta feed the
-        // per-step recurrence directly, with Qwen3.5 rounding semantics below.
+        // gating in ONE GPU dispatch (`kernels::gdn::prepare` — Metal or CUDA,
+        // hardcoded to this family's 10240-wide 16k/48v×128 geometry).
         let prepared = (|| -> Option<[MxArray; 6]> {
             if batch != 1
                 || seq_len >= 64
@@ -940,7 +971,6 @@ impl GatedDeltaNet {
                 || self.num_v_heads != 48
                 || self.value_head_dim != 128
                 || !use_kernel
-                || !crate::engine::persistence::compiled_forward_backend_available()
             {
                 return None;
             }
@@ -961,34 +991,10 @@ impl GatedDeltaNet {
                 )
                 .ok()?,
             };
-            let mut outputs = [std::ptr::null_mut(); 6];
-            if unsafe {
-                // qwen3_5 semantics: mean-eps norm (rms_norm eps inside the
-                // mean) and bf16 beta — bit-faithful to the conv fallback.
-                sys::mlx_qwen4_gdn_prepare(
-                    qkv.handle.0,
-                    a.handle.0,
-                    b.handle.0,
-                    conv_w.handle.0,
-                    history.handle.0,
-                    scale.handle.0,
-                    dt.handle.0,
-                    true,
-                    true,
-                    outputs.as_mut_ptr(),
-                )
-            } {
-                Some([
-                    MxArray::from_handle(outputs[0], "gdn_prepare:q").ok()?,
-                    MxArray::from_handle(outputs[1], "gdn_prepare:k").ok()?,
-                    MxArray::from_handle(outputs[2], "gdn_prepare:v").ok()?,
-                    MxArray::from_handle(outputs[3], "gdn_prepare:decay").ok()?,
-                    MxArray::from_handle(outputs[4], "gdn_prepare:beta").ok()?,
-                    MxArray::from_handle(outputs[5], "gdn_prepare:history").ok()?,
-                ])
-            } else {
-                None
-            }
+            // qwen3_5 semantics: mean-eps norm (rms_norm eps inside the
+            // mean) and bf16 beta — bit-faithful to the conv fallback.
+            crate::kernels::gdn::prepare(&qkv, &a, &b, conv_w, &history, scale, dt, true, true)
+                .ok()?
         })();
 
         let (q, k, v, precomputed) = if let Some([pq, pk, pv, decay, beta, history]) = prepared {
@@ -3530,7 +3536,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod wave_tests;
 
 #[cfg(all(test, target_os = "macos"))]

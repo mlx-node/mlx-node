@@ -842,7 +842,10 @@ mod tests {
         for (i, part) in parts.iter().enumerate() {
             let blob = blobs.join(format!("blob{i}"));
             fs::copy(part, &blob).unwrap();
+            #[cfg(unix)]
             std::os::unix::fs::symlink(&blob, snapshot.join(TINY_NAMES[i])).unwrap();
+            #[cfg(windows)]
+            std::os::windows::fs::symlink_file(&blob, snapshot.join(TINY_NAMES[i])).unwrap();
         }
         let linked = resolve_main_parts(&snapshot.join(TINY_NAMES[0])).unwrap();
         assert_eq!(linked.len(), 3);

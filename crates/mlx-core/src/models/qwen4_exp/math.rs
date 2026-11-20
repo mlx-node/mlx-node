@@ -2226,6 +2226,7 @@ mod pass_length_tests {
     }
 
     /// One pipeline serves every pass length: a new length builds no kernel.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_new_pass_length_builds_no_pipeline() {
         const NAME: &str =

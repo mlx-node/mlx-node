@@ -415,6 +415,7 @@ fn a_planned_tensor_that_does_not_attach_fails_the_load() {
 /// them, the same load keeps the planes and names them in the identity
 /// (spread walk).
 /// Mutation guard-drop-keeps (the drop detaches nothing) → red.
+#[cfg(target_os = "macos")]
 #[test]
 fn a_guard_drop_detaches_the_planes_and_the_identity_part() {
     use super::lifecycle::PLANES_GUARD_REFUSES;

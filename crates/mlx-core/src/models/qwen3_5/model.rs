@@ -68,6 +68,7 @@ use crate::vision::qwen::prompt::{
 // `#[path]`-declared child in the family. The seams live in `model/`.
 mod chat_backend;
 mod commands;
+mod flat_dflash2;
 mod forward;
 mod gdn_prefix;
 mod lifecycle;
@@ -92,7 +93,8 @@ pub(crate) use self::commands::{Qwen35Cmd, Qwen35FamilyCommand};
 #[cfg(test)]
 use self::forward::chunked_prefill_with_size;
 pub(crate) use self::forward::{
-    PREFILL_STEP_SIZE, async_eval_layer_caches, eval_layer_caches, partition_prefill_chunks,
+    DFlash2LogitsSpan, PREFILL_STEP_SIZE, async_eval_layer_caches, eval_layer_caches,
+    forward_dflash2_eager_with_taps, partition_prefill_chunks,
 };
 use self::forward::{
     chunked_prefill, forward_inner, forward_pre_norm_inner, project_logits_from_hidden,

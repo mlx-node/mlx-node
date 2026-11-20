@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 //! Device row budgets preserve physical verifier shape across compiled replays.
 mod kquant_support;
 

@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 //! Pin-bump gate for the bridge K-quant ops (`mlx_kquant*.cpp`) on Metal and
 //! on the CPU: every case must reproduce the output digest in `tests/golden`,
 //! captured while the same cases were bit-identical to the MLX fork's own

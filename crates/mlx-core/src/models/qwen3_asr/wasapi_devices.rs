@@ -235,7 +235,7 @@ impl<T> Drop for ComPtr<T> {
     }
 }
 
-unsafe fn interface_vtable<'a, T, V>(object: &'a ComPtr<T>) -> &'a V {
+unsafe fn interface_vtable<T, V>(object: &ComPtr<T>) -> &V {
     let vtable = unsafe { object.0.as_ptr().cast::<*const V>().read() };
     unsafe { &*vtable }
 }

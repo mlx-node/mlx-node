@@ -686,7 +686,14 @@ fn cache_policy(state: &CoordState) -> CachePolicy {
             allow_decode_limit: true,
         };
     }
-    let wired = WiredLimitContext::get_max_working_set_size() as u64;
+    let wired = {
+        let metal_wired = WiredLimitContext::get_max_working_set_size() as u64;
+        if metal_wired > 0 {
+            metal_wired
+        } else {
+            crate::accelerator::caps().total_device_bytes
+        }
+    };
     let limit = compute_cache_limit(summed_weights, summed_pools, wired);
     let source = if wired == 0 {
         format!(

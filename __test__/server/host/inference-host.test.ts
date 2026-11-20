@@ -5,7 +5,7 @@ import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { LoadableModel, LoadModelOptions } from '@mlx-node/lm';
+import { supportsAutomaticDFlash2, type LoadableModel, type LoadModelOptions } from '@mlx-node/lm';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { discoverMlxModels } from '../../../packages/agent/src/models.js';
@@ -854,7 +854,9 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     await writeFile(join(draft, 'model.safetensors'), 'weights');
     await host.loadModel(name);
     expect(calls).toHaveLength(1);
-    expect(calls[0].options).toEqual(process.platform === 'darwin' ? { draftModelPath: draft } : undefined);
+    expect(calls[0].options).toEqual(
+      supportsAutomaticDFlash2(family as 'qwen3_5' | 'qwen3_5_moe') ? { draftModelPath: draft } : undefined,
+    );
     expect(calls[0].path).toBe(join(modelsDir, name));
     expect(host.health().models.resident).toEqual([name]);
   });

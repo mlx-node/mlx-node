@@ -961,11 +961,10 @@ fn dflash2_takes_the_one_pool_window() {
     assert_eq!(pool.lane.window.maximum(), 112_473);
 }
 
-/// A draft load without a pool (off Metal) is refused before any read:
-/// DFlash2 runs only on the pool. Mutation: drop the check in `estimate_qwen35_load` →
-/// red (`Ok`).
+/// A dense draft load without a pool uses the eager flat lane and returns
+/// the model's served window. MoE retains its separate Metal-pool gate.
 #[test]
-fn draft_without_a_pool_is_refused() {
+fn draft_without_a_pool_uses_the_dense_flat_lane() {
     let target = estimate_fixture_dir("draft-flat");
     let draft = estimate_fixture_dir("draft-flat-draft");
     write_27b_fixture(&target, &draft);
@@ -997,13 +996,11 @@ fn draft_without_a_pool_is_refused() {
     super::NO_METAL_POOL.with(|off| off.set(false));
     std::fs::remove_dir_all(&target).unwrap();
     std::fs::remove_dir_all(&draft).unwrap();
-    let err = estimate.expect_err("no pool for the draft");
-    assert!(
-        err.reason
-            .contains("DFlash2 runs on the block-paged KV pool"),
-        "{}",
-        err.reason
-    );
+    let estimate = estimate
+        .expect("the dense flat lane accepts the draft")
+        .expect("the live-memory estimate includes the served window");
+    assert!(estimate.window_tokens > 0);
+    assert_eq!(estimate.bound, "model");
 }
 
 /// One window for every turn: a load that can run MTP turns on

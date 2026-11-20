@@ -7,7 +7,13 @@
 // boundary aborts the host process. Production code propagates `Result`;
 // `#[cfg(test)]` code keeps unwrap/expect.
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+// Many unit-test helpers are exercised only by `#[cfg(target_os = "macos")]`
+// Metal tests. Keep full dead-code / unused-import lints on macOS and on every
+// non-test build across all platforms while keeping non-macOS test builds clean.
+#![cfg_attr(all(test, not(target_os = "macos")), allow(dead_code, unused_imports))]
 
+pub(crate) mod accelerator;
+pub use accelerator::{RuntimeCapabilities, get_runtime_capabilities};
 pub mod array;
 pub mod audio;
 pub mod autograd;
@@ -25,6 +31,7 @@ pub(crate) mod disk_tier;
 pub mod engine;
 pub mod grpo;
 pub(crate) mod inference_trace;
+pub(crate) mod kernels;
 pub mod model_thread;
 pub mod models;
 pub mod moe;

@@ -288,6 +288,117 @@ pub(crate) fn snapshot_all_mtp(caches: &[Qwen3_5LayerCache]) -> Result<Vec<Qwen3
     caches.iter().map(|c| c.snapshot()).collect()
 }
 
+/// Restore point for the off-Metal DFlash2 lane, whose full-attention K/V
+/// lives in these flat caches rather than in a paged pool.
+pub(crate) struct Qwen35FlatSnapshot {
+    layers: Vec<Qwen35FlatLayerSnapshot>,
+}
+
+enum Qwen35FlatLayerSnapshot {
+    FullAttention {
+        offset: i32,
+    },
+    Linear {
+        conv_state: Option<MxArray>,
+        recurrent_state: Option<MxArray>,
+    },
+}
+
+pub(crate) fn snapshot_flat_dflash2(caches: &[Qwen3_5LayerCache]) -> Result<Qwen35FlatSnapshot> {
+    let layers = caches
+        .iter()
+        .map(|cache| match cache {
+            Qwen3_5LayerCache::FullAttention(kv) => Ok(Qwen35FlatLayerSnapshot::FullAttention {
+                offset: kv.get_offset(),
+            }),
+            Qwen3_5LayerCache::Linear(arrays) => Ok(Qwen35FlatLayerSnapshot::Linear {
+                conv_state: arrays.get(0).cloned(),
+                recurrent_state: arrays.get(1).cloned(),
+            }),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Qwen35FlatSnapshot { layers })
+}
+
+/// Keep `steps` rows of a flat verify: trim full-attention K/V to the
+/// accepted frontier and replay each GDN layer from its pre-verify state.
+pub(crate) fn replay_flat_dflash2_snapshot_to(
+    caches: &mut [Qwen3_5LayerCache],
+    snapshot: &Qwen35FlatSnapshot,
+    tape: &[Option<super::gated_delta_net::GdnLayerTape>],
+    steps: usize,
+    context: &str,
+) -> Result<()> {
+    if caches.len() != snapshot.layers.len() || caches.len() != tape.len() {
+        return Err(Error::from_reason(format!(
+            "{context}: length mismatch (caches {}, snapshot {}, tape {})",
+            caches.len(),
+            snapshot.layers.len(),
+            tape.len(),
+        )));
+    }
+    let accepted = i32::try_from(steps)
+        .map_err(|_| Error::from_reason(format!("{context}: accepted row count exceeds i32")))?;
+    for (index, (cache, snapshot)) in caches.iter_mut().zip(&snapshot.layers).enumerate() {
+        match (cache, snapshot) {
+            (
+                Qwen3_5LayerCache::FullAttention(kv),
+                Qwen35FlatLayerSnapshot::FullAttention { offset },
+            ) => {
+                if tape[index].is_some() {
+                    return Err(Error::from_reason(format!(
+                        "{context}: full-attention layer {index} unexpectedly has a GDN tape"
+                    )));
+                }
+                let target = offset.checked_add(accepted).ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "{context}: K/V frontier overflows at layer {index}"
+                    ))
+                })?;
+                if target > kv.get_offset() {
+                    return Err(Error::from_reason(format!(
+                        "{context}: K/V frontier {target} exceeds the verified offset {} at layer {index}",
+                        kv.get_offset()
+                    )));
+                }
+                kv.trim(target);
+            }
+            (
+                Qwen3_5LayerCache::Linear(arrays),
+                Qwen35FlatLayerSnapshot::Linear {
+                    conv_state,
+                    recurrent_state,
+                },
+            ) => {
+                let layer_tape = tape[index].as_ref().ok_or_else(|| {
+                    Error::from_reason(format!("{context}: GDN layer {index} has no tape"))
+                })?;
+                if steps > layer_tape.kernel.window_len()? as usize {
+                    return Err(Error::from_reason(format!(
+                        "{context}: accepted rows {steps} exceed the GDN window at layer {index}"
+                    )));
+                }
+                layer_tape.replay_into(
+                    arrays,
+                    conv_state.as_ref(),
+                    recurrent_state.as_ref(),
+                    steps,
+                )?;
+            }
+            (cache, _) => {
+                return Err(Error::from_reason(format!(
+                    "{context}: layer {index} snapshot kind {} does not match its cache",
+                    match cache {
+                        Qwen3_5LayerCache::Linear(_) => "FullAttention",
+                        Qwen3_5LayerCache::FullAttention(_) => "Linear",
+                    }
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Restore every layer's cache from a matching slice of snapshots.
 ///
 /// Returns an error if the slice lengths differ or if any variant pair is
@@ -616,6 +727,44 @@ mod tests {
             );
         } else {
             panic!("layer 1 must still be Linear");
+        }
+    }
+
+    #[test]
+    fn flat_dflash2_replay_trims_kv_to_every_accepted_frontier() {
+        for keep in 0..=4usize {
+            let mut caches = vec![Qwen3_5LayerCache::new_full_attention()];
+            let keys = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]).unwrap();
+            let values = MxArray::from_float32(&[10.0, 20.0, 30.0, 40.0], &[1, 1, 4, 1]).unwrap();
+            if !try_eval_or_skip(&keys, "flat_dflash2_replay::prime") {
+                return;
+            }
+            caches[0]
+                .as_kv_cache_mut()
+                .unwrap()
+                .update_and_fetch(&keys, &values)
+                .unwrap();
+            let snapshot = snapshot_flat_dflash2(&caches).unwrap();
+            let drafted = MxArray::from_float32(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 4, 1]).unwrap();
+            caches[0]
+                .as_kv_cache_mut()
+                .unwrap()
+                .update_and_fetch(&drafted, &drafted)
+                .unwrap();
+            assert_eq!(caches[0].offset(), 8);
+            replay_flat_dflash2_snapshot_to(&mut caches, &snapshot, &[None], keep, "test").unwrap();
+            assert_eq!(caches[0].offset(), 4 + keep as i32);
+
+            let boundary = MxArray::from_float32(&[99.0], &[1, 1, 1, 1]).unwrap();
+            let (keys, _) = caches[0]
+                .as_kv_cache_mut()
+                .unwrap()
+                .update_and_fetch(&boundary, &boundary)
+                .unwrap();
+            let mut expected = vec![1.0, 2.0, 3.0, 4.0];
+            expected.extend((0..keep).map(|row| 5.0 + row as f32));
+            expected.push(99.0);
+            assert_eq!(vec_of(&keys), expected, "accepted rows={keep}");
         }
     }
 

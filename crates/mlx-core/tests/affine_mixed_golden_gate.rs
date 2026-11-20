@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 //! Pin-bump gate for the bridge BF16-x / F32-sidecar affine matmul
 //! (`mlx_quantized_matmul_affine_bf16`), eager and after a shapeless compile
 //! replay: every case must reproduce the output digest in `tests/golden`. The

@@ -5,6 +5,9 @@ fn draft_execution_policy_is_scoped_and_honors_explicit_overrides() {
     let moe = dense.with_moe_profile(true);
     assert!(!dense.compile_draft() && !dense.tensor_attention());
     assert!(moe.compile_draft() && moe.tensor_attention());
+    let cuda = dense.with_dense_cuda_profile(true);
+    assert!(cuda.compile_draft() && !cuda.tensor_attention());
+    assert!(!cuda.with_dense_cuda_profile(false).compile_draft());
     assert!(!moe.with_moe_profile(false).compile_draft());
     for (value, enabled) in [("0", false), ("1", true), ("true", false), ("", false)] {
         for supported in [false, true] {

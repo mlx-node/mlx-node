@@ -771,7 +771,7 @@ impl LayerKVPool {
         Self::new_inner(config, num_blocks, max_num_blocks, cache_dtype, false)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn new_inner(
         config: PagedAttentionConfig,
         num_blocks: u32,

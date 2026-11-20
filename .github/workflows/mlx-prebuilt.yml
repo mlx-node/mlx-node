@@ -438,10 +438,13 @@ jobs:
           FORCE: ${{ inputs.force_reupload == true && 'true' || 'false' }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
           $exists = $false
           $complete = $false
           $assets = @(gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name' 2>$null)
-          if ($LASTEXITCODE -eq 0) {
+          $releaseRc = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          if ($releaseRc -eq 0) {
             $exists = $true
             $complete = ($assets -contains $env:ASSET) -and ($assets -contains "$($env:ASSET).sha256")
           }
@@ -504,12 +507,15 @@ jobs:
           FORCE: ${{ inputs.force_reupload == true && 'true' || 'false' }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
           function Assert-NativeSuccess([string]$action) {
             if ($LASTEXITCODE -ne 0) { throw "$action failed with exit code $LASTEXITCODE" }
           }
           function Test-ReleaseAsset {
             $names = @(gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name' 2>$null)
-            return ($LASTEXITCODE -eq 0 -and ($names -contains $env:ASSET))
+            $rc = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            return ($rc -eq 0 -and ($names -contains $env:ASSET))
           }
           $notes = @"
           Prebuilt MLX C++ library for crates/mlx-sys — not an application release.
@@ -560,6 +566,7 @@ jobs:
           TAG: ${{ steps.meta.outputs.release_tag }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
           function Assert-NativeSuccess([string]$action) {
             if ($LASTEXITCODE -ne 0) { throw "$action failed with exit code $LASTEXITCODE" }
           }

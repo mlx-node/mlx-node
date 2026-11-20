@@ -57,7 +57,7 @@ impl CpuConvertGuard {
     pub(crate) fn enter_cpu() -> Self {
         let saved_device = unsafe { mlx_sys::mlx_default_device() };
         let saved_stream = unsafe { mlx_sys::mlx_default_stream(saved_device) };
-        unsafe { mlx_sys::mlx_set_default_device(0) };
+        crate::accelerator::set_default_device(crate::stream::DeviceType::Cpu);
         let cpu_stream = unsafe { mlx_sys::mlx_default_stream(0) };
         unsafe { mlx_sys::mlx_set_default_stream(cpu_stream) };
         Self {
@@ -70,7 +70,12 @@ impl CpuConvertGuard {
 impl Drop for CpuConvertGuard {
     fn drop(&mut self) {
         unsafe { mlx_sys::mlx_set_default_stream(self.saved_stream) };
-        unsafe { mlx_sys::mlx_set_default_device(self.saved_device) };
+        let restored = if self.saved_device == 0 {
+            crate::stream::DeviceType::Cpu
+        } else {
+            crate::stream::DeviceType::Gpu
+        };
+        crate::accelerator::set_default_device(restored);
     }
 }
 

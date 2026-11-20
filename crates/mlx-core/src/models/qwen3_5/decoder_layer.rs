@@ -82,6 +82,14 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
+    pub(crate) fn clear_cuda_dense_prefill(&self) {
+        match &self.attn {
+            AttentionType::Linear(gdn) => gdn.clear_cuda_dense_prefill(),
+            AttentionType::Full(attention) => attention.clear_cuda_dense_prefill(),
+        }
+        self.mlp.clear_cuda_dense_prefill();
+    }
+
     /// `h = x + res` + `normed = norm(h)` — one Metal dispatch via the fused
     /// add_rmsnorm kernel when the contract holds, else the separate ops.
     /// The fused kernel is bit-identical to `x.add(res)` + `norm.forward(h)`
@@ -200,7 +208,6 @@ impl DecoderLayer {
                 attn.forward(&normed, mask, kvc, position_ids)?
             }
         };
-
         // Residual + post-attention norm (fused add_rmsnorm when eligible)
         let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
         h.add(&self.mlp.forward(&normed)?)

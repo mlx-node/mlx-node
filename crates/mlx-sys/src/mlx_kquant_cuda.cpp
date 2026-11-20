@@ -1,6 +1,9 @@
+#include "mlx_common.h"
+
 #ifdef MLX_NODE_CUDA_ENABLED
 
 #include "mlx_kquant.h"
+#include "mlx_cuda_ops.h"
 
 #include "mlx/backend/cuda/jit_module.h"
 #include "mlx/backend/gpu/copy.h"
@@ -15,6 +18,10 @@ namespace {
 
 constexpr char kernel_source[] =
 #include "cuda/kquant.cu.inc"
+    ;
+
+constexpr char kquant_few_source[] =
+#include "cuda/kquant_few.cu.inc"
     ;
 
 struct ShapeInfo {
@@ -141,6 +148,102 @@ void matmul_cuda(const std::vector<array>& inputs, array& out, const Stream& str
   launch(encoder, "mlx_node_kquant_matmul", out, 4, args);
 }
 
+class KQuantFew : public UnaryPrimitive {
+public:
+  explicit KQuantFew(Stream stream, int mode, bool tiled)
+      : UnaryPrimitive(stream), mode_(mode), tiled_(tiled) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error("KQuantFew requires CUDA");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    auto& encoder = cu::get_command_encoder(stream());
+    array x = cu::ensure_row_contiguous_aligned<4>(inputs[0], stream(), encoder);
+    array w = cu::ensure_row_contiguous_aligned<16>(inputs[1], stream(), encoder);
+    array scales = cu::ensure_row_contiguous_aligned<16>(inputs[2], stream(), encoder);
+    array biases = cu::ensure_row_contiguous_aligned<4>(inputs[3], stream(), encoder);
+
+    const int M = x.shape(-2);
+    const int K = x.shape(-1);
+    const int N = w.shape(0);
+    if (M < 2 || M > 8 || N <= 0 || K < 256 || K % 256 != 0) {
+      throw std::invalid_argument("KQuantFew: unsupported replay shape");
+    }
+    const int units = K / 256;
+    array act(Shape{units * 2560}, uint8, nullptr, {});
+    act.set_data(cu::malloc_async(act.nbytes(), encoder));
+    encoder.add_temporary(act);
+
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+
+    // Bind only x -> act for quantize so weight tensors are not counted twice
+    // in CUDA Graph bytes_in_graph_.
+    encoder.set_input_array(x);
+    encoder.set_output_array(act);
+    auto quantize = cu::jit_kernel(
+        encoder.device(), kquant_few_source, "mlx_node_kquant_quantize_few");
+    cu::KernelArgs qargs;
+    qargs.append(x);
+    qargs.append(act);
+    qargs.append<int32_t>(M);
+    qargs.append<int32_t>(K);
+    encoder.add_kernel_node_raw(
+        quantize, dim3((units * 64 + 15) / 16), dim3(128), {}, 0, qargs.args());
+
+    static constexpr const char* kEntries[6][2][2] = {
+        {{"mlx_node_kquant_matmul_few<0,false,4>", "mlx_node_kquant_matmul_few<0,false,8>"},
+         {"mlx_node_kquant_matmul_few<0,true,4>",  "mlx_node_kquant_matmul_few<0,true,8>"}},
+        {{"mlx_node_kquant_matmul_few<1,false,4>", "mlx_node_kquant_matmul_few<1,false,8>"},
+         {"mlx_node_kquant_matmul_few<1,true,4>",  "mlx_node_kquant_matmul_few<1,true,8>"}},
+        {{"mlx_node_kquant_matmul_few<2,false,4>", "mlx_node_kquant_matmul_few<2,false,8>"},
+         {"mlx_node_kquant_matmul_few<2,true,4>",  "mlx_node_kquant_matmul_few<2,true,8>"}},
+        {{"mlx_node_kquant_matmul_few<3,false,4>", "mlx_node_kquant_matmul_few<3,false,8>"},
+         {"mlx_node_kquant_matmul_few<3,true,4>",  "mlx_node_kquant_matmul_few<3,true,8>"}},
+        {{"mlx_node_kquant_matmul_few<4,false,4>", "mlx_node_kquant_matmul_few<4,false,8>"},
+         {"mlx_node_kquant_matmul_few<4,true,4>",  "mlx_node_kquant_matmul_few<4,true,8>"}},
+        {{"mlx_node_kquant_matmul_few<5,false,4>", "mlx_node_kquant_matmul_few<5,false,8>"},
+         {"mlx_node_kquant_matmul_few<5,true,4>",  "mlx_node_kquant_matmul_few<5,true,8>"}},
+    };
+    const bool use_8w = (!tiled_ && mode_ != 0 && units >= 8);
+    const int num_warps = use_8w ? 8 : 4;
+    auto matmul = cu::jit_kernel(
+        encoder.device(), kquant_few_source,
+        kEntries[mode_][tiled_ ? 1 : 0][use_8w ? 1 : 0]);
+    encoder.set_input_array(w);
+    encoder.set_input_array(scales);
+    encoder.set_input_array(biases);
+    encoder.set_input_array(act);
+    encoder.set_output_array(out);
+    cu::KernelArgs args;
+    args.append(w);
+    args.append(scales);
+    args.append(biases);
+    args.append(act);
+    args.append(out);
+    args.append<int32_t>(M);
+    args.append<int32_t>(N);
+    args.append<int32_t>(K);
+    encoder.add_kernel_node_raw(
+        matmul, dim3((N + 15) / 16), dim3(32, num_warps), {}, 0, args.args());
+  }
+
+  DEFINE_NAME(KQuantFew)
+  bool is_equivalent(const Primitive& other) const override {
+    const auto* rhs = dynamic_cast<const KQuantFew*>(&other);
+    return rhs && rhs->mode_ == mode_ && rhs->tiled_ == tiled_;
+  }
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    auto shape = inputs[0].shape();
+    shape.back() = inputs[1].shape(0);
+    return {std::move(shape)};
+  }
+
+private:
+  int mode_;
+  bool tiled_;
+};
+
 } // namespace
 
 void KQuantMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
@@ -182,4 +285,85 @@ void KQuantDequantize::eval_gpu(const std::vector<array>& inputs, array& out) {
 
 } // namespace mlx::core::kquant
 
+extern "C" mlx_array* mlx_kquant_few(
+    mlx_array* x_handle, mlx_array* w_handle, mlx_array* scales_handle,
+    mlx_array* biases_handle, const char* mode_c) {
+  try {
+    using namespace mlx::core;
+    if (!x_handle || !w_handle || !scales_handle || !biases_handle || !mode_c ||
+        default_device() != Device::gpu) {
+      return nullptr;
+    }
+    const auto parsed = kquant::parse_mode_layout(mode_c);
+    if (!parsed) {
+      return nullptr;
+    }
+    const int mode = [&] {
+      switch (parsed->mode) {
+        case kquant::Mode::Q4K: return 0;
+        case kquant::Mode::Q5K: return 1;
+        case kquant::Mode::Q6K: return 2;
+        case kquant::Mode::IQ4XS: return 3;
+        case kquant::Mode::Q3K: return 4;
+        case kquant::Mode::IQ4NL: return 5;
+        default: return -1;
+      }
+    }();
+    if (mode < 0 || cu::device(Device::gpu).compute_capability_major() < 8) {
+      return nullptr;
+    }
+    const bool tiled = parsed->layout == kquant::Layout::Tiled64;
+    std::vector<array> inputs = {
+        *reinterpret_cast<array*>(x_handle), *reinterpret_cast<array*>(w_handle),
+        *reinterpret_cast<array*>(scales_handle),
+        *reinterpret_cast<array*>(biases_handle)};
+    const auto& x = inputs[0];
+    const auto& w = inputs[1];
+    const auto& scales = inputs[2];
+    const auto& biases = inputs[3];
+    if (x.dtype() != bfloat16 || !(x.ndim() == 2 || x.ndim() == 3) ||
+        (x.ndim() == 3 && x.shape(0) != 1)) {
+      return nullptr;
+    }
+    const int M = x.shape(-2);
+    const int K = x.shape(-1);
+    const int bits = mode == 1 ? 5 : (mode == 2 ? 6 : (mode == 4 ? 3 : 4));
+    const int scale_cols = (mode == 3 || mode == 5) ? K / 32 : K / 16;
+    const int bias_cols = mode == 5 ? K / 32 : ((mode == 0 || mode == 1) ? K / 128 : K / 256);
+    const Dtype scale_dtype = (mode == 0 || mode == 1) ? uint8 : int8;
+    if (M < 2 || M > 8 || K < 2048 || K % 256 != 0 ||
+        w.ndim() != 2 || w.shape(0) <= 0 || w.dtype() != uint32 ||
+        w.shape(1) != K * bits / 32 ||
+        scales.ndim() != 2 || scales.dtype() != scale_dtype ||
+        scales.shape(0) != w.shape(0) || scales.shape(1) != scale_cols ||
+        biases.ndim() != 2 || biases.dtype() != float16 ||
+        biases.shape(0) != w.shape(0) || biases.shape(1) != bias_cols ||
+        (tiled && w.shape(0) % 64 != 0)) {
+      return nullptr;
+    }
+    auto shape = x.shape();
+    shape.back() = w.shape(0);
+    auto result = array(
+        std::move(shape), bfloat16,
+        std::make_shared<kquant::KQuantFew>(
+            default_stream(Device::gpu), mode, tiled),
+        std::move(inputs));
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  } catch (const std::exception& e) {
+    std::cerr << "mlx_kquant_few error: " << e.what() << std::endl;
+  }
+  return nullptr;
+}
+
+#else
+extern "C" mlx_array* mlx_kquant_few(
+    mlx_array* x_handle, mlx_array* w_handle, mlx_array* scales_handle,
+    mlx_array* biases_handle, const char* mode_c) {
+  (void)x_handle;
+  (void)w_handle;
+  (void)scales_handle;
+  (void)biases_handle;
+  (void)mode_c;
+  return nullptr;
+}
 #endif

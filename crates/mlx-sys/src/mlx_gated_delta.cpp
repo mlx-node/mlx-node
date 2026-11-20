@@ -323,10 +323,11 @@ mlx_array* mlx_fused_compute_g(mlx_array* a_log_ptr, mlx_array* a_ptr, mlx_array
     }
 }
 
-/// Returns the GPU architecture generation number.
-/// M1=13, M2=14, M3=15, M4=16, M5=17.
+/// Returns the Apple GPU architecture generation number (Metal only).
+/// M1=13, M2=14, M3=15, M4=16, M5=17. Returns 0 off Metal.
 /// Shared by runtime capability checks and profiling.
 int32_t mlx_gpu_architecture_gen() {
+#ifdef MLX_NODE_METAL_ENABLED
     try {
         auto& info = mlx::core::gpu::device_info(0);
         auto it = info.find("architecture");
@@ -348,6 +349,9 @@ int32_t mlx_gpu_architecture_gen() {
     } catch (...) {
         return 0;
     }
+#else
+    return 0;
+#endif
 }
 
 bool mlx_gated_delta_kernel(mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g,
