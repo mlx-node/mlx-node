@@ -5494,7 +5494,8 @@ pub struct GgufConversionResult {
 
 /// HF 1017 `tokenizer.json`'s `pre_tokenizer`, verbatim: the GGUF
 /// `tokenizer.ggml.pre = "joyai-llm"` vocabulary (DeepSeek-V4.1) splits digits
-/// in runs of 3 and CJK/kana runs before the word split.
+/// in runs of 3 and CJK/kana runs before the word split. Hy4-flash's
+/// `tokenizer.ggml.pre = "hy_v4"` HF `pre_tokenizer` is the same JSON.
 const JOYAI_LLM_PRE_TOKENIZER: &str = r##"{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[一-龥぀-ゟ゠-ヿ]+"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]}"##;
 
 /// The HF `tokenizer.json` of a GGUF-embedded GPT-2 BPE vocabulary, or `None`
@@ -5561,7 +5562,7 @@ pub(crate) fn embedded_gpt2_tokenizer_json(
     }
 
     let pre_tokenizer = match metadata.get("tokenizer.ggml.pre") {
-        Some(GgufMetaValue::String(pre)) if pre == "joyai-llm" => {
+        Some(GgufMetaValue::String(pre)) if pre == "joyai-llm" || pre == "hy_v4" => {
             serde_json::from_str(JOYAI_LLM_PRE_TOKENIZER).map_err(|error| {
                 Error::from_reason(format!("joyai-llm pre-tokenizer JSON: {error}"))
             })?
@@ -18832,6 +18833,140 @@ mod tests {
             n += a.len();
         }
         println!("joyai tokenizer: {specials} special ids, 50 strings, {n} ids bitwise == HF 1017");
+    }
+
+    fn tiny_gpt2_metadata(pre: &str) -> HashMap<String, GgufMetaValue> {
+        let strings =
+            |v: &[&str]| GgufMetaValue::ArrayString(v.iter().map(|s| s.to_string()).collect());
+        HashMap::from([
+            (
+                "tokenizer.ggml.model".to_string(),
+                GgufMetaValue::String("gpt2".to_string()),
+            ),
+            (
+                "tokenizer.ggml.pre".to_string(),
+                GgufMetaValue::String(pre.to_string()),
+            ),
+            (
+                "tokenizer.ggml.tokens".to_string(),
+                strings(&["a", "b", "ab"]),
+            ),
+            (
+                "tokenizer.ggml.token_type".to_string(),
+                GgufMetaValue::ArrayI32(vec![1, 1, 1]),
+            ),
+            ("tokenizer.ggml.merges".to_string(), strings(&["a b"])),
+        ])
+    }
+
+    /// `hy_v4` gets the joyai-llm pre-tokenizer (the same HF JSON); every other
+    /// field of the synthesized tokenizer equals the joyai-llm one, and an
+    /// unknown name still gets the GPT-2 default.
+    #[test]
+    fn hy_v4_pre_tokenizer_is_joyai() {
+        let joyai: serde_json::Value = serde_json::from_str(JOYAI_LLM_PRE_TOKENIZER).unwrap();
+        let hy = embedded_gpt2_tokenizer_json(&tiny_gpt2_metadata("hy_v4"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(hy["pre_tokenizer"], joyai);
+        let ds = embedded_gpt2_tokenizer_json(&tiny_gpt2_metadata("joyai-llm"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(hy, ds);
+        let other = embedded_gpt2_tokenizer_json(&tiny_gpt2_metadata("qwen2"))
+            .unwrap()
+            .unwrap();
+        assert_ne!(other["pre_tokenizer"], joyai);
+    }
+
+    /// Real file, shard 1 KV only (F_NOCACHE): the GGUF-embedded `hy_v4`
+    /// tokenizer encodes the 50 EN/ZH/JA/code/emoji/digit/special strings of
+    /// `tests/fixtures/hy-v4-flash/tokenizer-cases.json` to the ids HF
+    /// `tokenizer.json` gives (python `tokenizers` wrote them). The GGUF's
+    /// marker rows end in `:6124c78e` where HF's end in `:opensource`, so HF
+    /// reads every text and token with that suffix swapped.
+    #[test]
+    #[ignore = "real Hy4-flash shard 1 KV; HY4_DIR, HY4_HF_TOKENIZER"]
+    fn hy4_tokenizer_matches_hf() {
+        let dir = PathBuf::from(std::env::var("HY4_DIR").unwrap());
+        let path = dir.join("Hy4-flash-Q4_K_M-00001-of-00002.gguf");
+        let file = crate::moe_stream::io::open_nocache(&path).unwrap();
+        let g = parse_gguf_reader(std::io::BufReader::new(file)).unwrap();
+        assert_eq!(
+            g.metadata
+                .get("tokenizer.ggml.pre")
+                .and_then(GgufMetaValue::as_str),
+            Some("hy_v4")
+        );
+        let ours = embedded_gpt2_tokenizer_json(&g.metadata).unwrap().unwrap();
+        let hf_path = std::env::var("HY4_HF_TOKENIZER").unwrap();
+        let hf_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&hf_path).unwrap()).unwrap();
+        assert_eq!(
+            ours["pre_tokenizer"], hf_json["pre_tokenizer"],
+            "pre_tokenizer"
+        );
+        let ours = tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&ours).unwrap()).unwrap();
+        let hf = tokenizers::Tokenizer::from_file(&hf_path).unwrap();
+        let cases: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/hy-v4-flash/tokenizer-cases.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let gguf_suffix = cases["gguf_suffix"].as_str().unwrap();
+        let hf_suffix = cases["hf_suffix"].as_str().unwrap();
+        let to_hf = |text: &str| text.replace(gguf_suffix, hf_suffix);
+        let (Some(GgufMetaValue::ArrayString(tokens)), Some(GgufMetaValue::ArrayI32(types))) = (
+            g.metadata.get("tokenizer.ggml.tokens"),
+            g.metadata.get("tokenizer.ggml.token_type"),
+        ) else {
+            panic!("tokenizer arrays");
+        };
+        let mut specials = 0;
+        for (id, (t, ty)) in tokens.iter().zip(types).enumerate() {
+            if matches!(*ty, 3 | 4) {
+                assert_eq!(ours.token_to_id(t), Some(id as u32), "special {t:?}");
+                assert_eq!(
+                    hf.token_to_id(&to_hf(t)),
+                    Some(id as u32),
+                    "HF special {t:?}"
+                );
+                specials += 1;
+            }
+        }
+        assert_eq!(ours.get_vocab_size(true), hf.get_vocab_size(true));
+        for (id, ty) in types.iter().enumerate() {
+            if *ty == 4 {
+                let ids = [id as u32];
+                assert_eq!(
+                    to_hf(&ours.decode(&ids, true).unwrap()),
+                    hf.decode(&ids, true).unwrap(),
+                    "decode {:?}",
+                    tokens[id]
+                );
+            }
+        }
+        let cases = cases["cases"].as_array().unwrap();
+        assert_eq!(cases.len(), 50);
+        let mut n = 0;
+        for c in cases {
+            let text = c["text"].as_str().unwrap();
+            let want: Vec<u32> = c["ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap() as u32)
+                .collect();
+            let a = ours.encode(text, false).unwrap().get_ids().to_vec();
+            let b = hf.encode(to_hf(text), false).unwrap().get_ids().to_vec();
+            assert_eq!(b, want, "HF (rust) vs python on {text:?}");
+            assert_eq!(a, want, "GGUF-embedded vs HF on {text:?}");
+            n += a.len();
+        }
+        println!("hy4 tokenizer: {specials} special ids, 50 strings, {n} ids bitwise == HF");
     }
 
     /// Real file, shard 1 KV only (F_NOCACHE): the Qwen3.8-Flash-Next

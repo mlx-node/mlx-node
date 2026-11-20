@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 import {
+  anthropicRequestAllowsToolUse,
   anthropicToolUseIdToInternal,
   buildAnthropicResponse,
   buildContentBlockDelta,
@@ -154,16 +155,7 @@ describe('buildAnthropicResponse', () => {
     const response = buildAnthropicResponse(result, baseReq, 'msg_no_tools', undefined, false);
 
     expect(response.stop_reason).toBe('end_turn');
-    expect(response.content).toHaveLength(2);
-    expect(response.content[0]).toEqual({
-      type: 'thinking',
-      thinking: 'I should inspect files.',
-      signature: '',
-    });
-    expect(response.content[1]).toEqual({
-      type: 'text',
-      text: '',
-    });
+    expect(response.content).toEqual([{ type: 'thinking', thinking: 'I should inspect files.', signature: '' }]);
   });
 
   it('degrades to an empty input object for structurally malformed arguments', () => {
@@ -450,6 +442,45 @@ describe('buildAnthropicResponse', () => {
     expect(response.content.every((b) => b.type !== 'text')).toBe(true);
     expect(response.content).toHaveLength(1);
     expect(response.content[0].type).toBe('tool_use');
+  });
+
+  // vLLM `messages_full_converter`: a text block only for non-empty content;
+  // one empty text block only when no other block exists.
+  it.each([
+    {
+      name: 'thinking and no text',
+      result: { text: '', thinking: 'plan' },
+      stop: null,
+      blocks: [{ type: 'thinking', thinking: 'plan', signature: '' }],
+    },
+    {
+      name: 'a stop that consumed all text after thinking',
+      result: { text: '', thinking: 'plan' },
+      stop: 'HALT',
+      blocks: [{ type: 'thinking', thinking: 'plan', signature: '' }],
+    },
+    { name: 'nothing at all', result: { text: '' }, stop: null, blocks: [{ type: 'text', text: '' }] },
+    { name: 'a stop that consumed all text', result: { text: '' }, stop: 'HALT', blocks: [{ type: 'text', text: '' }] },
+    {
+      name: 'whitespace text after thinking',
+      result: { text: '\n', thinking: 'plan' },
+      stop: null,
+      blocks: [
+        { type: 'thinking', thinking: 'plan', signature: '' },
+        { type: 'text', text: '\n' },
+      ],
+    },
+  ])('content blocks for $name', ({ result, stop, blocks }) => {
+    const response = buildAnthropicResponse(
+      makeChatResult(result),
+      baseReq,
+      'msg_blocks',
+      undefined,
+      true,
+      undefined,
+      stop,
+    );
+    expect(response.content).toEqual(blocks);
   });
 
   it('skips tool calls with status !== "ok"', () => {
@@ -973,13 +1004,27 @@ describe('visibleAnswerText nameless calls', () => {
   const block = '<tool_call>\n<function=>\n</function>\n</tool_call>';
   const nameless = { id: 'n', name: '', arguments: {}, status: 'missing_name', rawContent: block };
 
-  it('places the block after the reasoning and before the prose', () => {
-    const rawText = `plan\n</think>\n\n${block}\nAFTER`;
-    expect(visibleAnswerText({ text: 'AFTER', rawText, toolCalls: [nameless] }, true)).toBe(`${block}\nAFTER`);
+  it('places the block before the prose', () => {
+    const publicRawText = `\n\n${block}\nAFTER`;
+    expect(visibleAnswerText({ text: 'AFTER', publicRawText, toolCalls: [nameless] }, true)).toBe(`${block}\nAFTER`);
+  });
+
+  // Mutation: place in `rawText` → red (`AFTER${block}`).
+  it('a reasoning that quotes the block does not move it', () => {
+    const result = {
+      text: 'AFTER',
+      rawText: `see ${block}</think>\n\n${block}\nAFTER`,
+      publicRawText: `\n\n${block}\nAFTER`,
+      toolCalls: [nameless],
+    };
+    expect(visibleAnswerText(result, true)).toBe(`${block}\nAFTER`);
   });
 
   it('appends a block it cannot find in the raw text', () => {
-    expect(visibleAnswerText({ text: 'AFTER', rawText: 'AFTER', toolCalls: [nameless] }, true)).toBe(`AFTER${block}`);
+    expect(visibleAnswerText({ text: 'AFTER', publicRawText: 'AFTER', toolCalls: [nameless] }, true)).toBe(
+      `AFTER${block}`,
+    );
+    expect(visibleAnswerText({ text: 'AFTER', toolCalls: [nameless] }, true)).toBe(`AFTER${block}`);
   });
 
   // The native parser strips a `<tool_call>` block it cannot read without
@@ -992,7 +1037,7 @@ describe('visibleAnswerText nameless calls', () => {
       visibleAnswerText(
         {
           text: 'BEFORE  AFTER  TAIL',
-          rawText: `BEFORE ${stopBlock} AFTER ${unknown} TAIL`,
+          publicRawText: `BEFORE ${stopBlock} AFTER ${unknown} TAIL`,
           toolCalls: [{ ...nameless, rawContent: stopBlock }],
         },
         true,
@@ -1000,9 +1045,30 @@ describe('visibleAnswerText nameless calls', () => {
     ).toBe(`BEFORE ${stopBlock} AFTER  TAIL`);
     expect(
       visibleAnswerText(
-        { text: 'BEFORE  MID STOP AFTER', rawText: `BEFORE ${block} MID STOP AFTER ${unknown}`, toolCalls: [nameless] },
+        {
+          text: 'BEFORE  MID STOP AFTER',
+          publicRawText: `BEFORE ${block} MID STOP AFTER ${unknown}`,
+          toolCalls: [nameless],
+        },
         true,
       ),
     ).toBe(`BEFORE ${block} MID STOP AFTER`);
+  });
+});
+
+// vLLM `_convert_tool_choice` maps `none` to chat 'none'; `keeps_tool_calls`
+// keeps calls only for 'auto' with tools, 'required' or a named tool.
+describe('anthropicRequestAllowsToolUse', () => {
+  const tools = [{ name: 'f', input_schema: {} }];
+  it.each([
+    { name: 'no tools', body: {}, allowed: false },
+    { name: 'empty tools', body: { tools: [] }, allowed: false },
+    { name: "tool_choice 'none'", body: { tools, tool_choice: { type: 'none' as const } }, allowed: false },
+    { name: 'tools', body: { tools }, allowed: true },
+    { name: "tool_choice 'auto'", body: { tools, tool_choice: { type: 'auto' as const } }, allowed: true },
+    { name: "tool_choice 'any'", body: { tools, tool_choice: { type: 'any' as const } }, allowed: true },
+    { name: 'named tool', body: { tools, tool_choice: { type: 'tool' as const, name: 'f' } }, allowed: true },
+  ])('$name', ({ body, allowed }) => {
+    expect(anthropicRequestAllowsToolUse(body)).toBe(allowed);
   });
 });

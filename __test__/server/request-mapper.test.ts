@@ -4,7 +4,10 @@ import {
   mapRequest,
   reconstructMessagesFromChain,
   stringifyStoredInputMessages,
+  validateToolChoice,
 } from '../../packages/server/src/mappers/request.js';
+
+const WEATHER = { type: 'function' as const, name: 'get_weather' };
 
 describe('mapRequest', () => {
   it('maps a string input to a single user message', () => {
@@ -236,7 +239,7 @@ describe('mapRequest', () => {
     expect(config.tools![0].function.parameters).toBeUndefined();
   });
 
-  it('does not pass tools when tool_choice is none', () => {
+  it('passes all tools when tool_choice is none (vLLM construct_tool_dicts keeps them)', () => {
     const { config } = mapRequest({
       model: 'test-model',
       input: 'Hello',
@@ -255,7 +258,8 @@ describe('mapRequest', () => {
       ],
     });
 
-    expect(config.tools).toBeUndefined();
+    expect(config.tools).toHaveLength(1);
+    expect(config.tools![0].function.name).toBe('get_weather');
   });
 
   it('passes only the named tool when tool_choice specifies a function', () => {
@@ -345,20 +349,48 @@ describe('mapRequest', () => {
     expect(config.tools).toHaveLength(2);
   });
 
-  it('does not set tools when tool_choice function name does not match any tool', () => {
-    const { config } = mapRequest({
-      model: 'test-model',
-      input: 'Hello',
-      tool_choice: { type: 'function', name: 'nonexistent' },
-      tools: [
-        {
-          type: 'function',
-          name: 'get_weather',
-        },
-      ],
-    });
+  // vLLM `ResponsesRequest.check_tool_usage`: each of these is a 400.
+  it.each([
+    {
+      name: 'a named function that matches no tool',
+      req: { tool_choice: { type: 'function' as const, name: 'nonexistent' }, tools: [WEATHER] },
+      message: "Tool choice 'function' not found in 'tools' parameter.",
+    },
+    {
+      name: 'a named function with an empty name',
+      req: { tool_choice: { type: 'function' as const, name: '' }, tools: [WEATHER] },
+      message: "Tool choice 'function' not found in 'tools' parameter.",
+    },
+    {
+      name: 'a named function with no tools',
+      req: { tool_choice: { type: 'function' as const, name: 'get_weather' } },
+      message: "Tool choice 'function' not found in 'tools' parameter.",
+    },
+    {
+      name: "'required' with no tools",
+      req: { tool_choice: 'required' as const },
+      message: "Tool choice 'required' must be specified with 'tools' parameter.",
+    },
+    {
+      name: "'required' with empty tools",
+      req: { tool_choice: 'required' as const, tools: [] },
+      message: "Tool choice 'required' must be specified with 'tools' parameter.",
+    },
+  ])('rejects $name', ({ req, message }) => {
+    expect(() => validateToolChoice(req)).toThrow(message);
+    expect(() => mapRequest({ model: 'test-model', input: 'Hello', ...req })).toThrow(message);
+  });
 
-    expect(config.tools).toBeUndefined();
+  it.each([
+    { name: "'auto' with no tools", req: { tool_choice: 'auto' as const } },
+    { name: "'none' with no tools", req: { tool_choice: 'none' as const } },
+    { name: 'no tool_choice and no tools', req: {} },
+    {
+      name: 'a named function that matches',
+      req: { tool_choice: { type: 'function' as const, name: 'get_weather' }, tools: [WEATHER] },
+    },
+  ])('accepts $name', ({ req }) => {
+    expect(() => validateToolChoice(req)).not.toThrow();
   });
 
   describe('forced tool_choice renders without thinking', () => {

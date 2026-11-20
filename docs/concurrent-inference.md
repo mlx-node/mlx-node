@@ -19,7 +19,7 @@ model thread's PRNG in row order. The paged decode clear-cache interval is
 ## Current status
 
 - Different sessions on one eligible Qwen3, LFM2, Qwen3.5 dense/MoE, Gemma4, Muse-Glimmer,
-  or NemotronH paged model may overlap. The server admits up to the native scheduler's physical
+  NemotronH or Hy4-flash paged model may overlap. The server admits up to the native scheduler's physical
   sequence capacity, and the model thread advances them together. A single
   `ChatSession` still allows only one turn in flight.
 - Flat-cache, training, save, and reset commands stay in exclusive/barrier
@@ -40,6 +40,8 @@ model thread's PRNG in row order. The paged decode clear-cache interval is
   Muse DFlash packing is experimental (`MLX_SCHEDULED_DFLASH=1`); its default
   remains the existing flat speculative lane. Loading a draft leaves ordinary
   batched owners available on the resident target.
+  Hy4-flash text turns, AR and MTP, are scheduled by default on up to 4 lanes
+  (see "Hy4-flash lanes" below).
 - Different loaded models continue to run in parallel, one native model thread
   per model.
 
@@ -157,6 +159,62 @@ rebuilds only that sequence's slot; it never resets a peer. Batched admission
 uses fresh JS sessions while retaining the native refcounted prefix cache, so
 correctness is independent of the warm single-slot registry.
 
+### Hy4-flash lanes
+
+A Hy4-flash load picks its mode once (`models/hy_v4_flash/sched.rs`):
+
+```text
+load ─► MLX_SERVE_FORCE_SERIAL=1, or row cap < 2 ─► flat: one whole turn at a time
+     └► else paged: pool + owner cells, lanes = min(4, MLX_SCHED_MAX_NUM_SEQS, row cap, memory)
+step ─► safe point ─► one wave: decode rows, then MTP drafts up to the row cap ─► one prefill slice
+```
+
+- **Row cap.** A wave holds at most one row fewer than the smallest MLX
+  matvec batch limit of the model's Q8 matrices on this GPU
+  (`MLX_QMM_SPLITK_MIN_M` replaces every limit). Every Q8 call gets at least
+  2 rows, padded when a lane runs alone, so every call from 2 rows up to the
+  cap uses the same kernel. A row's bits are then meant not to depend on how
+  many rows share the wave.
+- **Lanes.** The admission picks the context and prefill chunk for one lane
+  first. It then grants up to `min(4, MLX_SCHED_MAX_NUM_SEQS, row cap)` lanes
+  whose floors (and their drafts' pooled keys) fit; lanes never make the
+  window or the chunk smaller. `maxConcurrentSequences()` is the granted
+  count, and 1 while `MLX_SERVE_FORCE_SERIAL` is set (read per call).
+- **Decode.** One wave runs each Q8 matrix (attention projections, latent
+  down/up, shared expert) once over every owner's rows, the attention core
+  per owner, and the f32 ops (HC mixes, router, head) one row per call, since
+  their rounding follows the row count. The FFN reads the union of the
+  experts its rows pick once; `residencyInfo()` `unionExperts` / `rowExperts`
+  shows how much the lanes shared, and `hitRateByLanes` the cache hit rate
+  by wave width.
+- **MTP.** On by default. Decode rows come first, then each lane's drafts in
+  lane order up to the row cap; the last lanes' drafts are cut. One verify
+  wave covers every lane and each lane commits by cutting its rows. Depth is
+  1 by default, at most 3, never adaptive. Greedy lanes keep the tokens they
+  get alone; a sampled lane at depth 2 or more in a full wave can differ.
+- **Prefill.** One slice of C rows (the load's prefill chunk) runs per step
+  beside the decode rows, outside the engine's 2048-token budget. Slices end
+  on the chunk grid and at the prompt's state rows, so a prompt cuts at the
+  same rows in either mode. While a long prompt prefills, each step's
+  decode rows wait for its slice; `prefillChunkStallMs` sums that time.
+- **Busy period.** The first open turn re-admits and takes the bounded wired
+  lease; the last close ends it (staged experts promoted, bank purgeable,
+  lease released). Between waves a safe point promotes staged copies and
+  re-admits every 128 steps.
+- **Shared prefixes.** A stored state at a block row and the cached blocks
+  below it let any owner whose prompt shares those rows resume there. Blocks
+  written by decode or by a prefill that started off the grid carry
+  write-path keys, so only the same conversation (next turn, regenerate,
+  fork) resumes from them.
+- **Preemption** gives the owner's blocks back unpublished and drops its
+  cell; the replay resumes from a stored state.
+- **Status.** A paged load registers with the memory governor:
+  `contextLimits().governorModelId` names its entry in `/health`
+  `memory_governor.scheduler`. A flat load does not register.
+
+The lane, MTP and overlap rules are covered by fixture tests only; no real
+weights have run them yet.
+
 ## Scheduler knobs
 
 The stable capacity knobs are read once per process. The ragged executor switch
@@ -171,7 +229,7 @@ same-binary uniform/ragged validation with separate model instances:
 | `MLX_SCHED_RAGGED_STEP`         | `0`     | Use one packed varlen Qwen3 forward for mixed prefill/decode slices.                                                                                                                                                                                                                                                                                  |
 | `MLX_LFM2_FUSED_BATCH_DECODE`   | `0`     | Opt LFM2 multi-row decode back into one fused `[N,1]` forward (default is a row-exact wave: per-row N=1 forwards, bit-identical to serial).                                                                                                                                                                                                           |
 | `MLX_PAGED_PER_SEQ_CTX`         | `unset` | Optional per-sequence **admit** cap and Qwen3/LFM2 pool-budget clip. Unset → admit `min(trained, live pool minus recurrent KV-equivalent)`. When set, Muse/Nemotron `contextLimits()` also publish that cap. Default 32768 applies only to the Qwen3/LFM2 **pool request** formula. Qwen3.5 dense/MoE ignore it: their windows are the memory plan's. |
-| `MLX_SERVE_FORCE_SERIAL`        | `0`     | Route eligible Qwen3/LFM2/Qwen3.5/Gemma4/Muse-Glimmer/NemotronH turns through the whole-turn path for A/B and rollback.                                                                                                                                                                                                                               |
+| `MLX_SERVE_FORCE_SERIAL`        | `0`     | Route eligible Qwen3/LFM2/Qwen3.5/Gemma4/Muse-Glimmer/NemotronH turns through the whole-turn path for A/B and rollback. A Hy4-flash load that sees it loads in flat mode (no pool).                                                                                                                                                                   |
 
 `MLX_SERVE_FORCE_SERIAL` is a process-start test/rollback switch, not a
 production hot-reconfiguration API. Set it before model registration; changing
@@ -365,6 +423,7 @@ Known gaps:
 ### Prefill beside a decoding lane (Qwen3.5)
 
 Qwen3.5 dense and MoE plan their prefill as Splash `Scheduler::planPrefill`.
+Hy4-flash runs one prefill chunk per step (see "Hy4-flash lanes").
 Every other family keeps the fixed 2048-token step budget.
 
 - **The unit.** A step's prefill rows together are one prefill unit, run
@@ -562,6 +621,9 @@ LFM2 executor                  ~ row-exact wave by default (N single-row
                                forwards, bit-identical to serial); fused [N,1]
                                behind MLX_LFM2_FUSED_BATCH_DECODE=1
 Gemma4 executor              ✓ one fused [N,1] hybrid decode forward
+Hy4-flash executor           ✓ one wave: each Q8 matrix in one padded call over
+                               every owner (2..row cap rows), attention cores per
+                               owner, f32 ops one row per call
 NemotronH executor           ~ fused [N,1] on a DENSE checkpoint only; any
                                quantized one (the only published checkpoint)
                                runs N serial single-row decodes instead
@@ -627,8 +689,9 @@ restored, or replayed the prompt (see
 Cross-model residual coupling is perf-class, not correctness: the process-wide
 Metal wired limit is a model-life lease for qwen3_5 / qwen3_5_moe / qwen4_exp
 (`WiredResidency` in `crates/mlx-core/src/stream.rs`, lapsing after the
-`--idle-release` time without a command) and is set/restored per turn for the
-other families; the process limit is the largest live lease,
+`--idle-release` time without a command), a bounded lease per turn for
+hy_v4_flash (in paged mode from the first open turn to the last close), and is
+set/restored per turn for the other families; the process limit is the largest live lease,
 and the flat decode path calls `clear_cache` every 256 steps, draining the
 process-wide Metal free pool (`ChatBackend::maintain_cache`; noted as
 multi-model-hostile on `handle_chat_cmd` in `engine/cmd.rs`).

@@ -1,0 +1,1015 @@
+{
+ "source": "PLAN-parity E15, §2.1 scheduler_prefill_ends, §2.3; PLAN-addons §1.5 (grid); docs/paged-cache.md Flash Next row (replay point = block row before the generation prompt)",
+ "gen_prompt": {
+  "ids": [
+   120000,
+   611,
+   10372,
+   120001,
+   120029
+  ],
+  "tokens": 5,
+  "from": "tokenizer-cases.json case: <｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6",
+  "template": "hy_start 'assistant' hy_middle think_begin (chat_template.gguf.jinja:347-353)"
+ },
+ "rules": {
+  "P": "floor((prompt_len - gen_prompt_tokens) / 32) * 32, if > start",
+  "T": "floor(kv_end / 32) * 32, kv_end = prompt_len + generated - 1 (rows with KV written); no second state when T equals an earlier state row",
+  "checkpoints": "every 8,192 rows below 32,768, every 32,768 from 32,768, in (start, P)",
+  "prefill_ends": "multiples of C in (start, prompt_len) + checkpoints + P + prompt_len",
+  "disk": "a state goes to disk only at row >= 2048 (MINIMUM_ROWS)",
+  "ram": "newest 8 states kept in RAM",
+  "mtp": "MTP lags one row: at row b it holds b - 1 rows"
+ },
+ "samples": [
+  {
+   "name": "short",
+   "prompt_len": 900,
+   "gen_prompt_tokens": 5,
+   "gen_prompt_start": 895,
+   "start": 0,
+   "chunk": 8192,
+   "generated": 200,
+   "kv_end": 1099,
+   "prefill_ends": [
+    864,
+    900
+   ],
+   "ends_off_grid": [
+    864
+   ],
+   "states": [
+    {
+     "kind": "P",
+     "row": 864,
+     "blocks_below": 27,
+     "disk": false,
+     "on_chunk_grid": false,
+     "mtp_rows": 863,
+     "full_segments": 26,
+     "open_segment_rows": 31,
+     "closed_groups": 215,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "T",
+     "row": 1088,
+     "blocks_below": 34,
+     "disk": false,
+     "on_chunk_grid": false,
+     "mtp_rows": 1087,
+     "full_segments": 33,
+     "open_segment_rows": 31,
+     "closed_groups": 271,
+     "open_tok_k_rows": 3
+    }
+   ],
+   "t_live_ring_covers": false,
+   "t_rows_past_block_row": 11,
+   "ram_kept_newest": 8
+  },
+  {
+   "name": "5k",
+   "prompt_len": 5000,
+   "gen_prompt_tokens": 5,
+   "gen_prompt_start": 4995,
+   "start": 0,
+   "chunk": 8192,
+   "generated": 300,
+   "kv_end": 5299,
+   "prefill_ends": [
+    4992,
+    5000
+   ],
+   "ends_off_grid": [
+    4992
+   ],
+   "states": [
+    {
+     "kind": "P",
+     "row": 4992,
+     "blocks_below": 156,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 4991,
+     "full_segments": 155,
+     "open_segment_rows": 31,
+     "closed_groups": 1247,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "T",
+     "row": 5280,
+     "blocks_below": 165,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 5279,
+     "full_segments": 164,
+     "open_segment_rows": 31,
+     "closed_groups": 1319,
+     "open_tok_k_rows": 3
+    }
+   ],
+   "t_live_ring_covers": false,
+   "t_rows_past_block_row": 19,
+   "ram_kept_newest": 8
+  },
+  {
+   "name": "20k_system",
+   "prompt_len": 20000,
+   "gen_prompt_tokens": 5,
+   "gen_prompt_start": 19995,
+   "start": 0,
+   "chunk": 8192,
+   "generated": 500,
+   "kv_end": 20499,
+   "prefill_ends": [
+    8192,
+    16384,
+    19968,
+    20000
+   ],
+   "ends_off_grid": [
+    19968
+   ],
+   "states": [
+    {
+     "kind": "checkpoint",
+     "row": 8192,
+     "blocks_below": 256,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 8191,
+     "full_segments": 255,
+     "open_segment_rows": 31,
+     "closed_groups": 2047,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 16384,
+     "blocks_below": 512,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 16383,
+     "full_segments": 511,
+     "open_segment_rows": 31,
+     "closed_groups": 4095,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "P",
+     "row": 19968,
+     "blocks_below": 624,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 19967,
+     "full_segments": 623,
+     "open_segment_rows": 31,
+     "closed_groups": 4991,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "T",
+     "row": 20480,
+     "blocks_below": 640,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 20479,
+     "full_segments": 639,
+     "open_segment_rows": 31,
+     "closed_groups": 5119,
+     "open_tok_k_rows": 3
+    }
+   ],
+   "t_live_ring_covers": false,
+   "t_rows_past_block_row": 19,
+   "ram_kept_newest": 8
+  },
+  {
+   "name": "40k",
+   "prompt_len": 40000,
+   "gen_prompt_tokens": 5,
+   "gen_prompt_start": 39995,
+   "start": 0,
+   "chunk": 8192,
+   "generated": 100,
+   "kv_end": 40099,
+   "prefill_ends": [
+    8192,
+    16384,
+    24576,
+    32768,
+    39968,
+    40000
+   ],
+   "ends_off_grid": [
+    39968
+   ],
+   "states": [
+    {
+     "kind": "checkpoint",
+     "row": 8192,
+     "blocks_below": 256,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 8191,
+     "full_segments": 255,
+     "open_segment_rows": 31,
+     "closed_groups": 2047,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 16384,
+     "blocks_below": 512,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 16383,
+     "full_segments": 511,
+     "open_segment_rows": 31,
+     "closed_groups": 4095,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 24576,
+     "blocks_below": 768,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 24575,
+     "full_segments": 767,
+     "open_segment_rows": 31,
+     "closed_groups": 6143,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 32768,
+     "blocks_below": 1024,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 32767,
+     "full_segments": 1023,
+     "open_segment_rows": 31,
+     "closed_groups": 8191,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "P",
+     "row": 39968,
+     "blocks_below": 1249,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 39967,
+     "full_segments": 1248,
+     "open_segment_rows": 31,
+     "closed_groups": 9991,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "T",
+     "row": 40096,
+     "blocks_below": 1253,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 40095,
+     "full_segments": 1252,
+     "open_segment_rows": 31,
+     "closed_groups": 10023,
+     "open_tok_k_rows": 3
+    }
+   ],
+   "t_live_ring_covers": true,
+   "t_rows_past_block_row": 3,
+   "ram_kept_newest": 8
+  },
+  {
+   "name": "100k",
+   "prompt_len": 100000,
+   "gen_prompt_tokens": 5,
+   "gen_prompt_start": 99995,
+   "start": 0,
+   "chunk": 8192,
+   "generated": 1000,
+   "kv_end": 100999,
+   "prefill_ends": [
+    8192,
+    16384,
+    24576,
+    32768,
+    40960,
+    49152,
+    57344,
+    65536,
+    73728,
+    81920,
+    90112,
+    98304,
+    99968,
+    100000
+   ],
+   "ends_off_grid": [
+    99968
+   ],
+   "states": [
+    {
+     "kind": "checkpoint",
+     "row": 8192,
+     "blocks_below": 256,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 8191,
+     "full_segments": 255,
+     "open_segment_rows": 31,
+     "closed_groups": 2047,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 16384,
+     "blocks_below": 512,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 16383,
+     "full_segments": 511,
+     "open_segment_rows": 31,
+     "closed_groups": 4095,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 24576,
+     "blocks_below": 768,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 24575,
+     "full_segments": 767,
+     "open_segment_rows": 31,
+     "closed_groups": 6143,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 32768,
+     "blocks_below": 1024,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 32767,
+     "full_segments": 1023,
+     "open_segment_rows": 31,
+     "closed_groups": 8191,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 65536,
+     "blocks_below": 2048,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 65535,
+     "full_segments": 2047,
+     "open_segment_rows": 31,
+     "closed_groups": 16383,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 98304,
+     "blocks_below": 3072,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 98303,
+     "full_segments": 3071,
+     "open_segment_rows": 31,
+     "closed_groups": 24575,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "P",
+     "row": 99968,
+     "blocks_below": 3124,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 99967,
+     "full_segments": 3123,
+     "open_segment_rows": 31,
+     "closed_groups": 24991,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "T",
+     "row": 100992,
+     "blocks_below": 3156,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 100991,
+     "full_segments": 3155,
+     "open_segment_rows": 31,
+     "closed_groups": 25247,
+     "open_tok_k_rows": 3
+    }
+   ],
+   "t_live_ring_covers": false,
+   "t_rows_past_block_row": 7,
+   "ram_kept_newest": 8
+  },
+  {
+   "name": "near_256k",
+   "prompt_len": 262000,
+   "gen_prompt_tokens": 5,
+   "gen_prompt_start": 261995,
+   "start": 0,
+   "chunk": 8192,
+   "generated": 100,
+   "kv_end": 262099,
+   "prefill_ends": [
+    8192,
+    16384,
+    24576,
+    32768,
+    40960,
+    49152,
+    57344,
+    65536,
+    73728,
+    81920,
+    90112,
+    98304,
+    106496,
+    114688,
+    122880,
+    131072,
+    139264,
+    147456,
+    155648,
+    163840,
+    172032,
+    180224,
+    188416,
+    196608,
+    204800,
+    212992,
+    221184,
+    229376,
+    237568,
+    245760,
+    253952,
+    261984,
+    262000
+   ],
+   "ends_off_grid": [
+    261984
+   ],
+   "states": [
+    {
+     "kind": "checkpoint",
+     "row": 8192,
+     "blocks_below": 256,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 8191,
+     "full_segments": 255,
+     "open_segment_rows": 31,
+     "closed_groups": 2047,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 16384,
+     "blocks_below": 512,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 16383,
+     "full_segments": 511,
+     "open_segment_rows": 31,
+     "closed_groups": 4095,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 24576,
+     "blocks_below": 768,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 24575,
+     "full_segments": 767,
+     "open_segment_rows": 31,
+     "closed_groups": 6143,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 32768,
+     "blocks_below": 1024,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 32767,
+     "full_segments": 1023,
+     "open_segment_rows": 31,
+     "closed_groups": 8191,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 65536,
+     "blocks_below": 2048,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 65535,
+     "full_segments": 2047,
+     "open_segment_rows": 31,
+     "closed_groups": 16383,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 98304,
+     "blocks_below": 3072,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 98303,
+     "full_segments": 3071,
+     "open_segment_rows": 31,
+     "closed_groups": 24575,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 131072,
+     "blocks_below": 4096,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 131071,
+     "full_segments": 4095,
+     "open_segment_rows": 31,
+     "closed_groups": 32767,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 163840,
+     "blocks_below": 5120,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 163839,
+     "full_segments": 5119,
+     "open_segment_rows": 31,
+     "closed_groups": 40959,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 196608,
+     "blocks_below": 6144,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 196607,
+     "full_segments": 6143,
+     "open_segment_rows": 31,
+     "closed_groups": 49151,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 229376,
+     "blocks_below": 7168,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 229375,
+     "full_segments": 7167,
+     "open_segment_rows": 31,
+     "closed_groups": 57343,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "P",
+     "row": 261984,
+     "blocks_below": 8187,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 261983,
+     "full_segments": 8186,
+     "open_segment_rows": 31,
+     "closed_groups": 65495,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "T",
+     "row": 262080,
+     "blocks_below": 8190,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 262079,
+     "full_segments": 8189,
+     "open_segment_rows": 31,
+     "closed_groups": 65519,
+     "open_tok_k_rows": 3
+    }
+   ],
+   "t_live_ring_covers": false,
+   "t_rows_past_block_row": 19,
+   "ram_kept_newest": 8
+  },
+  {
+   "name": "continue_after_restore",
+   "prompt_len": 30000,
+   "gen_prompt_tokens": 5,
+   "gen_prompt_start": 29995,
+   "start": 20480,
+   "chunk": 8192,
+   "generated": 400,
+   "kv_end": 30399,
+   "prefill_ends": [
+    24576,
+    29984,
+    30000
+   ],
+   "ends_off_grid": [
+    29984
+   ],
+   "states": [
+    {
+     "kind": "checkpoint",
+     "row": 24576,
+     "blocks_below": 768,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 24575,
+     "full_segments": 767,
+     "open_segment_rows": 31,
+     "closed_groups": 6143,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "P",
+     "row": 29984,
+     "blocks_below": 937,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 29983,
+     "full_segments": 936,
+     "open_segment_rows": 31,
+     "closed_groups": 7495,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "T",
+     "row": 30368,
+     "blocks_below": 949,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 30367,
+     "full_segments": 948,
+     "open_segment_rows": 31,
+     "closed_groups": 7591,
+     "open_tok_k_rows": 3
+    }
+   ],
+   "t_live_ring_covers": false,
+   "t_rows_past_block_row": 31,
+   "ram_kept_newest": 8
+  },
+  {
+   "name": "c2048_others80",
+   "prompt_len": 20000,
+   "gen_prompt_tokens": 5,
+   "gen_prompt_start": 19995,
+   "start": 0,
+   "chunk": 2048,
+   "generated": 64,
+   "kv_end": 20063,
+   "prefill_ends": [
+    2048,
+    4096,
+    6144,
+    8192,
+    10240,
+    12288,
+    14336,
+    16384,
+    18432,
+    19968,
+    20000
+   ],
+   "ends_off_grid": [
+    19968
+   ],
+   "states": [
+    {
+     "kind": "checkpoint",
+     "row": 8192,
+     "blocks_below": 256,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 8191,
+     "full_segments": 255,
+     "open_segment_rows": 31,
+     "closed_groups": 2047,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 16384,
+     "blocks_below": 512,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 16383,
+     "full_segments": 511,
+     "open_segment_rows": 31,
+     "closed_groups": 4095,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "P",
+     "row": 19968,
+     "blocks_below": 624,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 19967,
+     "full_segments": 623,
+     "open_segment_rows": 31,
+     "closed_groups": 4991,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "T",
+     "row": 20032,
+     "blocks_below": 626,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 20031,
+     "full_segments": 625,
+     "open_segment_rows": 31,
+     "closed_groups": 5007,
+     "open_tok_k_rows": 3
+    }
+   ],
+   "t_live_ring_covers": false,
+   "t_rows_past_block_row": 31,
+   "ram_kept_newest": 8
+  },
+  {
+   "name": "c4096",
+   "prompt_len": 50000,
+   "gen_prompt_tokens": 5,
+   "gen_prompt_start": 49995,
+   "start": 0,
+   "chunk": 4096,
+   "generated": 64,
+   "kv_end": 50063,
+   "prefill_ends": [
+    4096,
+    8192,
+    12288,
+    16384,
+    20480,
+    24576,
+    28672,
+    32768,
+    36864,
+    40960,
+    45056,
+    49152,
+    49984,
+    50000
+   ],
+   "ends_off_grid": [
+    49984
+   ],
+   "states": [
+    {
+     "kind": "checkpoint",
+     "row": 8192,
+     "blocks_below": 256,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 8191,
+     "full_segments": 255,
+     "open_segment_rows": 31,
+     "closed_groups": 2047,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 16384,
+     "blocks_below": 512,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 16383,
+     "full_segments": 511,
+     "open_segment_rows": 31,
+     "closed_groups": 4095,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 24576,
+     "blocks_below": 768,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 24575,
+     "full_segments": 767,
+     "open_segment_rows": 31,
+     "closed_groups": 6143,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "checkpoint",
+     "row": 32768,
+     "blocks_below": 1024,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 32767,
+     "full_segments": 1023,
+     "open_segment_rows": 31,
+     "closed_groups": 8191,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "P",
+     "row": 49984,
+     "blocks_below": 1562,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 49983,
+     "full_segments": 1561,
+     "open_segment_rows": 31,
+     "closed_groups": 12495,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "T",
+     "row": 50048,
+     "blocks_below": 1564,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 50047,
+     "full_segments": 1563,
+     "open_segment_rows": 31,
+     "closed_groups": 12511,
+     "open_tok_k_rows": 3
+    }
+   ],
+   "t_live_ring_covers": false,
+   "t_rows_past_block_row": 15,
+   "ram_kept_newest": 8
+  },
+  {
+   "name": "gen_start_on_block_row",
+   "prompt_len": 8197,
+   "gen_prompt_tokens": 5,
+   "gen_prompt_start": 8192,
+   "start": 0,
+   "chunk": 8192,
+   "generated": 3,
+   "kv_end": 8199,
+   "prefill_ends": [
+    8192,
+    8197
+   ],
+   "ends_off_grid": [],
+   "states": [
+    {
+     "kind": "P",
+     "row": 8192,
+     "blocks_below": 256,
+     "disk": true,
+     "on_chunk_grid": true,
+     "mtp_rows": 8191,
+     "full_segments": 255,
+     "open_segment_rows": 31,
+     "closed_groups": 2047,
+     "open_tok_k_rows": 3
+    }
+   ],
+   "t_live_ring_covers": false,
+   "t_rows_past_block_row": 7,
+   "ram_kept_newest": 8
+  },
+  {
+   "name": "t_aligned",
+   "prompt_len": 4096,
+   "gen_prompt_tokens": 5,
+   "gen_prompt_start": 4091,
+   "start": 0,
+   "chunk": 8192,
+   "generated": 2,
+   "kv_end": 4097,
+   "prefill_ends": [
+    4064,
+    4096
+   ],
+   "ends_off_grid": [
+    4064
+   ],
+   "states": [
+    {
+     "kind": "P",
+     "row": 4064,
+     "blocks_below": 127,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 4063,
+     "full_segments": 126,
+     "open_segment_rows": 31,
+     "closed_groups": 1015,
+     "open_tok_k_rows": 3
+    },
+    {
+     "kind": "T",
+     "row": 4096,
+     "blocks_below": 128,
+     "disk": true,
+     "on_chunk_grid": false,
+     "mtp_rows": 4095,
+     "full_segments": 127,
+     "open_segment_rows": 31,
+     "closed_groups": 1023,
+     "open_tok_k_rows": 3
+    }
+   ],
+   "t_live_ring_covers": true,
+   "t_rows_past_block_row": 1,
+   "ram_kept_newest": 8
+  }
+ ],
+ "cross_owner": [
+  {
+   "shared_prefix": 5000,
+   "owner_a_state_rows": [
+    8192,
+    16384,
+    24576,
+    32768,
+    59968
+   ],
+   "hit_row": 0,
+   "suffix_prefill": "from 0"
+  },
+  {
+   "shared_prefix": 8192,
+   "owner_a_state_rows": [
+    8192,
+    16384,
+    24576,
+    32768,
+    59968
+   ],
+   "hit_row": 8192,
+   "suffix_prefill": "from 8192"
+  },
+  {
+   "shared_prefix": 8200,
+   "owner_a_state_rows": [
+    8192,
+    16384,
+    24576,
+    32768,
+    59968
+   ],
+   "hit_row": 8192,
+   "suffix_prefill": "from 8192"
+  },
+  {
+   "shared_prefix": 20000,
+   "owner_a_state_rows": [
+    8192,
+    16384,
+    24576,
+    32768,
+    59968
+   ],
+   "hit_row": 16384,
+   "suffix_prefill": "from 16384"
+  },
+  {
+   "shared_prefix": 31000,
+   "owner_a_state_rows": [
+    8192,
+    16384,
+    24576,
+    32768,
+    59968
+   ],
+   "hit_row": 24576,
+   "suffix_prefill": "from 24576"
+  },
+  {
+   "shared_prefix": 40000,
+   "owner_a_state_rows": [
+    8192,
+    16384,
+    24576,
+    32768,
+    59968
+   ],
+   "hit_row": 32768,
+   "suffix_prefill": "from 32768"
+  }
+ ],
+ "notes": [
+  "P is the only off-grid slice end a cold prompt gets (one extra short slice of < C rows); checkpoint rows divide by 8,192 so they sit on the grid for C 2048 / 4096 / 8192",
+  "T: a state at the block row below kv_end needs window rows kv_end-515.. the live ring still holds only when kv_end - T <= WINDOW_SLACK (t_live_ring_covers); else the ring has dropped rows T-512.. and the T state must be taken when decode crosses that row (open for P3)"
+ ]
+}

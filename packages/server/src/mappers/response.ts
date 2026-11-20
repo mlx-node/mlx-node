@@ -29,7 +29,12 @@ export function mapFinishReasonToStatus(finishReason: string): 'completed' | 'in
   }
 }
 
-export function buildOutputItems(result: ChatResult): OutputItem[] {
+/** vLLM `check_tool_usage` + `_extract_tool_calls`: no tools or `tool_choice: 'none'` returns no calls. */
+export function requestAllowsToolUse(req: Pick<ResponsesAPIRequest, 'tools' | 'tool_choice'>): boolean {
+  return Array.isArray(req.tools) && req.tools.length > 0 && req.tool_choice !== 'none';
+}
+
+export function buildOutputItems(result: ChatResult, allowToolUse: boolean): OutputItem[] {
   const items: OutputItem[] = [];
 
   if (result.thinking) {
@@ -41,10 +46,10 @@ export function buildOutputItems(result: ChatResult): OutputItem[] {
     items.push(reasoningItem);
   }
 
-  const okToolCalls = result.toolCalls.filter((t) => t.status === 'ok');
+  const okToolCalls = allowToolUse ? result.toolCalls.filter((t) => t.status === 'ok') : [];
 
-  // Always emit a message item (possibly with empty text) unless there are tool calls and no text.
-  if (result.text || okToolCalls.length === 0) {
+  // An empty message item only when no other item exists: cold replay rebuilds a turn only from its items.
+  if (result.text || (items.length === 0 && okToolCalls.length === 0)) {
     const messageItem: MessageOutputItem = {
       id: genId('msg_'),
       type: 'message',
@@ -113,7 +118,7 @@ export function buildResponseObject(
   responseId: string,
   previousResponseId?: string,
 ): ResponseObject {
-  const output = buildOutputItems(result);
+  const output = buildOutputItems(result, requestAllowsToolUse(req));
   const status = mapFinishReasonToStatus(result.finishReason);
 
   return {

@@ -11,7 +11,7 @@ import { Alert } from '../components/arc/alert/alert';
 import { Badge } from '../components/arc/badge/badge';
 import { Button } from '../components/arc/button/button';
 import { EmptyState } from '../components/arc/empty-state/empty-state';
-import { modelBlurb } from '../lib/catalog';
+import { modelBlurb, offeredOnHost } from '../lib/catalog';
 import { dismissOnboarding } from '../lib/onboarding';
 import type { CatalogItem, CatalogResponse, ModelsResponse } from '../lib/types';
 import type { AsyncState } from '../lib/use-api';
@@ -50,7 +50,8 @@ export default function Onboarding({
 }: OnboardingProps): ReactElement {
   const navigate = useNavigate();
   const [selectedRepo, setSelectedRepo] = useState<string | null>(null);
-  const items = (catalog.data?.items ?? []).filter((item) => !item.hidden);
+  const host = models.data?.host;
+  const items = (catalog.data?.items ?? []).filter((item) => offeredOnHost(item, host));
   const activeRepo = activeRepos.find((repo) => items.some((item) => item.hfRepo === repo));
   const selected =
     items.find((item) => item.hfRepo === (activeRepo ?? selectedRepo)) ??
@@ -64,7 +65,6 @@ export default function Onboarding({
   const modelsDir = models.data?.dir;
   const canFinish =
     modelsDir !== undefined && modelsDir !== '' && !models.loading && !models.refreshing && models.error === undefined;
-  const host = models.data?.host;
 
   useEffect(() => {
     if (activeRepo !== undefined) setSelectedRepo(activeRepo);

@@ -291,8 +291,8 @@ class KvStoreWindowTail final : public fast::Custom {
 
 // The pooled index keys of complete blocks into a page pool's index plane
 // (Splash `block_indexer_pool` through `indexer_index_keys`): row r goes to
-// plane row `slots[r]` of the `[blocks * index_rows, dim]` bf16 plane, in
-// place. Inputs: plane, rows `[n, dim]`, int32 slots `[n]`. The output
+// plane row `slots[r]` of the `[blocks * index_rows, dim]` 2-byte (bf16 or
+// f16) plane, in place: the kernel copies element bits. Inputs: plane, rows `[n, dim]`, int32 slots `[n]`. The output
 // aliases the plane.
 class PagedIndexStore final : public fast::Custom {
  public:
@@ -626,10 +626,10 @@ extern "C" bool mlx_kv_store_window_tail(mlx_array* const* args, mlx_array** out
 #endif
 }
 
-// Store `rows` (bf16 `[n, dim]`) into the index plane `plane` (bf16, its
-// last axis `dim`) at plane rows `slots` (int32 `[n]`), in place. `out`
-// receives the plane handle to adopt (same buffer). False (message on
-// stderr) without Metal or on a contract violation.
+// Store `rows` (`[n, dim]`, the plane's dtype) into the index plane `plane`
+// (bf16 or f16, its last axis `dim`) at plane rows `slots` (int32 `[n]`), in
+// place. `out` receives the plane handle to adopt (same buffer). False
+// (message on stderr) without Metal or on a contract violation.
 extern "C" bool mlx_paged_index_store(mlx_array* plane, mlx_array* rows,
                                       mlx_array* slots, mlx_array** out) {
   if (out) *out = nullptr;
@@ -642,15 +642,17 @@ extern "C" bool mlx_paged_index_store(mlx_array* plane, mlx_array* rows,
     const auto r = contiguous(*reinterpret_cast<array*>(rows));
     const auto& s = *reinterpret_cast<array*>(slots);
     if (!metal::is_available() || !(default_device() == Device::gpu) ||
-        p.dtype() != bfloat16 || r.dtype() != bfloat16 || r.ndim() != 2 ||
+        (p.dtype() != bfloat16 && p.dtype() != float16) ||
+        r.dtype() != p.dtype() || r.ndim() != 2 ||
         p.ndim() < 2 || p.shape(p.ndim() - 1) != r.shape(1) || s.ndim() != 1 ||
         s.dtype() != int32 || s.shape(0) != r.shape(0) ||
         !p.flags().row_contiguous || p.offset() != 0) {
       throw std::invalid_argument(
-          "a bf16 plane, bf16 [n, dim] rows and int32 [n] slots");
+          "a bf16 or f16 plane, [n, dim] rows of its dtype and int32 [n] "
+          "slots");
     }
     auto outputs = array::make_arrays(
-        {p.shape()}, {bfloat16},
+        {p.shape()}, {p.dtype()},
         std::make_shared<PagedIndexStore>(default_stream(Device::gpu)),
         {p, r, s});
     *out = reinterpret_cast<mlx_array*>(new array(std::move(outputs[0])));

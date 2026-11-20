@@ -78,7 +78,7 @@ export interface AnthropicToolDefinition {
 }
 
 export interface AnthropicToolChoice {
-  type: 'auto' | 'any' | 'tool';
+  type: 'auto' | 'any' | 'tool' | 'none';
   name?: string;
   disable_parallel_tool_use?: boolean;
 }

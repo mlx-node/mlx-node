@@ -41,6 +41,15 @@ export type { Qwen35MoeConfig } from '@mlx-node/core';
 export { DeepseekV41Model } from './stream.js';
 export type { DeepseekV41ContextLimits, DeepseekV41ResidencyInfo, DeepseekV41TurnTokenIds } from '@mlx-node/core';
 
+// Hy4-flash (GGUF, SSD-streamed experts)
+export { HyV4FlashModel } from './stream.js';
+export type {
+  HyV4FlashContextLimits,
+  HyV4FlashLoadOptions,
+  HyV4FlashResidencyInfo,
+  HyV4FlashTurnTokenIds,
+} from '@mlx-node/core';
+
 // Nemotron H models
 //
 // The config/limits types ship alongside the class for the same reason
@@ -153,6 +162,7 @@ export {
   familyTraitsFor,
   FAMILY_ROWS,
   GEMMA4_SAMPLING_DEFAULTS,
+  HY_V4_FLASH_SAMPLING_DEFAULTS,
   K2_SAMPLING_DEFAULTS,
   launchPresetFor,
   LFM2_SAMPLING_DEFAULTS,

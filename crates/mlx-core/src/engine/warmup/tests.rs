@@ -1846,3 +1846,90 @@ fn a_host_refusal_of_a_later_required_step_is_retried() {
         assert_eq!(governor.model_books(model), books, "{refused:?}");
     }
 }
+
+#[test]
+fn serving_scheduler_minimal_runs_minimal_plan_and_preserves_state() {
+    const NAME: &str =
+        "engine::warmup::tests::serving_scheduler_minimal_runs_minimal_plan_and_preserves_state";
+    if crate::test_support::paged_prefill_unsupported(NAME)
+        || !crate::test_support::in_own_process(NAME)
+    {
+        return;
+    }
+    const MIN_SLICE: u32 = 96;
+    let inner = dense(4);
+    let plan = WarmupPlan::minimal_for_backend(&inner, MIN_SLICE);
+    assert_eq!(plan, WarmupPlan::minimal(4, MIN_SLICE, true));
+    assert_eq!(plan.steps.len(), 6, "{:?}", plan.steps);
+    assert!(plan.classes().is_empty());
+
+    let path = "/warmup/minimal";
+    let guard = load_progress::begin(path);
+    let cell = guard.cell();
+    let before = Snapshot::take(&inner);
+    let seen_steps = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hook_steps = Arc::clone(&seen_steps);
+    BEFORE_STEP.set(Some(Box::new(move |step| {
+        hook_steps.lock().unwrap().push(step);
+    })));
+    let (state, report) = serving_scheduler_minimal(inner, &cell, true, MIN_SLICE)
+        .unwrap_or_else(|error| panic!("minimal warm-up failed: {}", error.reason));
+    BEFORE_STEP.set(None);
+
+    let report = report.expect("minimal warm-up returns a WarmupReport");
+    assert_eq!(report.steps, 6);
+    assert_eq!(report.skipped, 0);
+    assert_eq!(report.reset, 0);
+    assert!(report.pipelines > 0);
+    assert!(report.peak_bytes > 0.0);
+    assert_eq!(Snapshot::take(&state.inner), before);
+
+    let seen = seen_steps.lock().unwrap().clone();
+    assert!(
+        !seen.iter().any(|s| matches!(s, Step::Class(_))),
+        "{seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|s| matches!(s, Step::Narrow(_))),
+        "{seen:?}"
+    );
+    assert_eq!(
+        seen,
+        vec![
+            Step::MaxPrefill,
+            Step::Widen(2),
+            Step::Widen(3),
+            Step::Widen(4),
+            Step::Speculative {
+                width: 1,
+                drafts: SHORT_DRAFTS,
+            },
+        ]
+    );
+
+    let read = load_progress::load_progress(path.to_string()).expect("in flight");
+    assert_eq!(
+        (read.phase.as_str(), read.steps, read.steps_done),
+        ("kernels", 6, 6)
+    );
+    assert_eq!(
+        cell.done_history.lock().unwrap().clone(),
+        vec![1, 2, 3, 4, 5, 6]
+    );
+    drop(guard);
+
+    let warmed = run_plan(dense(4), &LoadProgressCell::default(), plan)
+        .unwrap_or_else(|error| panic!("minimal run_plan failed: {}", error.reason));
+    assert!(warmed.trace.class_rows.is_empty());
+    for width in 1..=4 {
+        assert!(
+            warmed.trace.decode_widths.contains(&width),
+            "width {width} missing from {:?}",
+            warmed.trace.decode_widths
+        );
+    }
+    let (_, none_report) =
+        serving_scheduler_minimal(dense(4), &LoadProgressCell::default(), false, MIN_SLICE)
+            .expect("warm=false");
+    assert!(none_report.is_none());
+}

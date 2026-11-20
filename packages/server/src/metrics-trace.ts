@@ -330,8 +330,8 @@ export interface MetricsTraceRecord
   coldEnabled?: boolean;
   /**
    * The SSD state tier's mode at the end of a qwen3_5 / qwen3_5_moe / qwen4_exp
-   * turn: their disk cache, which {@link coldEnabled} does not see. For
-   * qwen4_exp the model's own `stateTierMode()`; for the others the most
+   * / hy_v4_flash turn: their disk cache, which {@link coldEnabled} does not see. For
+   * qwen4_exp and hy_v4_flash the model's own `stateTierMode()`; for the others the most
    * lasting mode over the engine's loaded models
    * (`memoryGovernorStatus().dflash2States.disk`). Absent for every other family.
    */

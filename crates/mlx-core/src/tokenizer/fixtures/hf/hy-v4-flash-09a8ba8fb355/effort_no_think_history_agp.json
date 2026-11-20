@@ -1,0 +1,20 @@
+{
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello, who are you?"
+    },
+    {
+      "role": "assistant",
+      "content": "I am Hy4, an assistant.",
+      "reasoning_content": "The user asks who I am. Answer briefly."
+    },
+    {
+      "role": "user",
+      "content": "What is 17 * 23?"
+    }
+  ],
+  "add_generation_prompt": true,
+  "reasoning_effort": "no_think",
+  "preserved_thinking": true
+}

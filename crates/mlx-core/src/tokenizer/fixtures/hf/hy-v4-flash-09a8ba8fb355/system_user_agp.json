@@ -1,0 +1,13 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a concise assistant. 请用中文回答。"
+    },
+    {
+      "role": "user",
+      "content": "Hello, who are you?"
+    }
+  ],
+  "add_generation_prompt": true
+}
