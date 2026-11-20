@@ -442,7 +442,9 @@ jobs:
           $exists = $false
           $complete = $false
           $assets = @(gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name' 2>$null)
-          if ($LASTEXITCODE -eq 0) {
+          $releaseRc = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          if ($releaseRc -eq 0) {
             $exists = $true
             $complete = ($assets -contains $env:ASSET) -and ($assets -contains "$($env:ASSET).sha256")
           }
@@ -511,7 +513,9 @@ jobs:
           }
           function Test-ReleaseAsset {
             $names = @(gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name' 2>$null)
-            return ($LASTEXITCODE -eq 0 -and ($names -contains $env:ASSET))
+            $rc = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            return ($rc -eq 0 -and ($names -contains $env:ASSET))
           }
           $notes = @"
           Prebuilt MLX C++ library for crates/mlx-sys — not an application release.
