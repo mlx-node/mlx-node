@@ -107,14 +107,14 @@ impl Driver {
         self.finish(owner, rx)
     }
 
-    /// A turn that asks for the draft's cycle; `at_first` reads the model
+    /// A turn that asks for the draft's cycle; `at_first` gets the model
     /// right after the turn's first proposal.
     fn drafted(
         &mut self,
         owner: &str,
         tokens: &[u32],
         max_new: i32,
-        at_first: impl FnOnce(&Inner),
+        at_first: impl FnOnce(&mut Inner),
     ) -> Said {
         let mut rx = self.send(owner, tokens, max_new, true);
         let mut steps = 0;
@@ -130,7 +130,7 @@ impl Driver {
             steps += 1;
             assert!(steps < 4096, "{owner}: no proposal");
         }
-        at_first(&self.state.inner);
+        at_first(&mut self.state.inner);
         self.finish(owner, rx)
     }
 
@@ -196,6 +196,21 @@ fn object_parts(bytes: &[u8]) -> (serde_json::Value, &[u8]) {
         serde_json::from_slice(&bytes[8..end]).unwrap(),
         &bytes[end..],
     )
+}
+
+/// The parts of a state record that the turns alone decide: its header less
+/// `last_used` and the checksum over it, and its payload. `last_used` is the
+/// store's stamp when the write goes out (`label_of` in `Disk::write`):
+/// before the turn's end restamps its replay state (`end_use`) when the turn
+/// outlasts `DELAY`, after it otherwise.
+fn record_parts(bytes: &[u8]) -> (serde_json::Value, &[u8]) {
+    let (mut header, payload) = object_parts(bytes);
+    let meta = header["__metadata__"]
+        .as_object_mut()
+        .expect("a state record's header has its metadata");
+    assert!(meta.remove("last_used").is_some(), "a recency stamp");
+    assert!(meta.remove("checksum").is_some(), "a checksum");
+    (header, payload)
 }
 
 fn concat(parts: &[&[u32]]) -> Vec<u32> {
@@ -414,8 +429,9 @@ fn rows_from_the_rule_leave_the_plain_state() {
 /// live row. Each drafted turn's row reads the persistent tier, b's context
 /// at its first proposal is the one rebuilt from its own prefill's taps,
 /// and the store after the turns holds the files of the same turns with no
-/// draft: the state records byte for byte, every block object's header and
-/// data (a block header's keys come in no fixed order, run to run). After a
+/// draft: the state records' headers but their recency stamp and its
+/// checksum, and their payloads byte for byte; every block object's header
+/// and data (a block header's keys come in no fixed order, run to run). After a
 /// restart (a new model over the same
 /// directory) a turn of the conversation restores from disk: a drafted
 /// model over either store rebuilds its context from its prefill's taps,
@@ -425,22 +441,30 @@ fn rows_from_the_rule_leave_the_plain_state() {
 /// context at its first proposal).
 /// MUTATION: a drafted model's turn does not resume its live row (it
 /// restores and publishes one more state) → red (the drafted turns' state
-/// records).
+/// records: names).
 #[test]
 fn drafted_turns_keep_the_persistent_cache() {
-    keeps_the_persistent_cache(false);
+    keeps_the_persistent_cache(false, false);
+}
+
+/// [`drafted_turns_keep_the_persistent_cache`] with a1's state written before
+/// a1's end, as a turn that outlasts the write delay writes it: its record
+/// has an older recency stamp than the plain one and is otherwise the same.
+#[test]
+fn drafted_turns_written_before_their_end_keep_the_persistent_cache() {
+    keeps_the_persistent_cache(false, true);
 }
 
 /// [`drafted_turns_keep_the_persistent_cache`] with the server's request:
 /// no depth, so the model's rule sets each verify's rows.
 #[test]
 fn drafted_turns_on_the_rows_rule_keep_the_persistent_cache() {
-    keeps_the_persistent_cache(true);
+    keeps_the_persistent_cache(true, false);
 }
 
 /// The persistent cache proof, every drafted turn at 4 rows or on the
-/// rows rule (`rule`).
-fn keeps_the_persistent_cache(rule: bool) {
+/// rows rule (`rule`); `early` writes a1's state before a1's end.
+fn keeps_the_persistent_cache(rule: bool, early: bool) {
     let _host = memory::scoped_fixture_host();
     let model = || chat_model(reuse_over(direct_inner()));
     let c = model().decoder.config.clone();
@@ -467,7 +491,12 @@ fn keeps_the_persistent_cache(rule: bool) {
     run.rule = rule;
     let handle = disk(&run.state.inner).tier_handle();
     run.force(&a1.turn.tokens);
-    let got_a1 = run.turn("a", &first, 4, true);
+    let got_a1 = if early {
+        run.state.inner.disk.as_mut().unwrap().delay = std::time::Duration::ZERO;
+        run.drafted("a", &first, 4, |inner| inner.step_disk_now())
+    } else {
+        run.turn("a", &first, 4, true)
+    };
     let mode_a1 = run.state.inner.telemetry.mode(&handle);
     let offered_a1 = run.slot().offered.len();
     let mut ruled = vec![run.slot().chosen.len()];
@@ -502,31 +531,54 @@ fn keeps_the_persistent_cache(rule: bool) {
 
     let plain_files = objects(&plain_root);
     let drafted_files = objects(&drafted_root);
-    let records = |files: &[(String, Vec<u8>)]| -> Vec<(String, Vec<u8>)> {
+    const RECORD: &str = ".dflash2_state.safetensors";
+    let names = |files: &[(String, Vec<u8>)], records: bool| -> Vec<String> {
         files
             .iter()
-            .filter(|(name, _)| name.ends_with(".dflash2_state.safetensors"))
-            .cloned()
+            .filter(|(name, _)| !records || name.ends_with(RECORD))
+            .map(|(name, _)| name.clone())
             .collect()
     };
-    let states = records(&plain_files).len();
+    if early {
+        let stamps = |files: &[(String, Vec<u8>)]| -> Vec<serde_json::Value> {
+            files
+                .iter()
+                .filter(|(name, _)| name.ends_with(RECORD))
+                .map(|(_, bytes)| object_parts(bytes).0["__metadata__"]["last_used"].clone())
+                .collect()
+        };
+        assert_ne!(
+            stamps(&drafted_files),
+            stamps(&plain_files),
+            "a1's record written before a1's end: an older stamp"
+        );
+    }
+    let states = names(&plain_files, true).len();
     assert!(states >= 1, "the plain turns wrote a state");
-    assert!(
-        records(&drafted_files) == records(&plain_files),
-        "the drafted turns' state records: names and bytes"
-    );
-    let names = |files: &[(String, Vec<u8>)]| -> Vec<String> {
-        files.iter().map(|(name, _)| name.clone()).collect()
-    };
     assert_eq!(
-        names(&drafted_files),
-        names(&plain_files),
+        names(&drafted_files, true),
+        names(&plain_files, true),
+        "the drafted turns' state records: names"
+    );
+    assert_eq!(
+        names(&drafted_files, false),
+        names(&plain_files, false),
         "the drafted turns' files: names"
     );
     for ((name, got), (_, want)) in drafted_files.iter().zip(&plain_files) {
+        let parts: fn(&[u8]) -> (serde_json::Value, &[u8]) = if name.ends_with(RECORD) {
+            record_parts
+        } else {
+            object_parts
+        };
+        let ((got_header, got_data), (want_header, want_data)) = (parts(got), parts(want));
+        assert_eq!(got_header, want_header, "{name}: the drafted turns' header");
         assert!(
-            object_parts(got) == object_parts(want),
-            "{name}: the drafted turns' header and data"
+            got_data == want_data,
+            "{name}: the drafted turns' data: first differing byte {:?}, {} and {} bytes",
+            got_data.iter().zip(want_data).position(|(a, b)| a != b),
+            got_data.len(),
+            want_data.len()
         );
     }
     eprintln!(
