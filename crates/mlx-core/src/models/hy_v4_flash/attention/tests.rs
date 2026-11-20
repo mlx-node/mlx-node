@@ -1186,6 +1186,109 @@ fn mla_sink_attention_strict_row_invariance_up_to_256() {
     }
 }
 
+#[test]
+fn mla_sink_attention_splitk_chunked_bit_identical_to_single_row() {
+    let (s, h, d, vw, kmax) = (130usize, 64usize, 576usize, 512i64, 512usize);
+    let n = kmax + 17;
+    let scale = 1.0 / (d as f32).sqrt();
+    let mut r = Rng(173);
+    let q = arr(&r.vec(s * h * d, 1.5), &[s, h, d]);
+    let keys = arr(&r.vec(n * d, 1.5), &[n, d])
+        .astype(DType::Float16)
+        .unwrap();
+    let sinks = arr(&r.vec(h, 2.0), &[h]);
+    let idx: Vec<i32> = (0..s * kmax)
+        .map(|i| {
+            let (row, j) = (i / kmax, i % kmax);
+            if j >= kmax - (row % 23) {
+                -1
+            } else {
+                ((j * 5 + row * 11) % n) as i32
+            }
+        })
+        .collect();
+    let ia = MxArray::from_int32(&idx, &[s as i64, kmax as i64]).unwrap();
+
+    let all = bits(&gather_sink_attention(&q, &keys, &ia, vw, &sinks, scale).unwrap());
+    let per = h * vw as usize;
+    let (hi, di, ki) = (h as i64, d as i64, kmax as i64);
+    for row in 0..s {
+        let qs = q
+            .slice(&[row as i64, 0, 0], &[(row + 1) as i64, hi, di])
+            .unwrap();
+        let is = ia.slice(&[row as i64, 0], &[(row + 1) as i64, ki]).unwrap();
+        let want = bits(&gather_sink_attention(&qs, &keys, &is, vw, &sinks, scale).unwrap());
+        assert_eq!(
+            &all[row * per..(row + 1) * per],
+            &want[..],
+            "S={s} kmax={kmax}: row {row} differs from S=1"
+        );
+    }
+}
+
+#[test]
+fn mla_sink_attention_splitk_invariant_to_trailing_unlisted_keys() {
+    let (d, vw) = (576usize, 512i64);
+    let scale = 1.0 / (d as f32).sqrt();
+    let cases = [
+        (32usize, 256usize, 257usize, 181u64),
+        (32, 836, 837, 191),
+        (32, 1024, 1025, 193),
+        (32, 1792, 1793, 197),
+        (32, 1800, 1801, 199),
+        (64, 128, 129, 211),
+        (64, 512, 513, 223),
+    ];
+    for (h, k_short, k_long, seed) in cases {
+        let n = k_long + 7;
+        let mut r = Rng(seed);
+        let q = arr(&r.vec(h * d, 1.5), &[1, h, d]);
+        let keys = arr(&r.vec(n * d, 1.5), &[n, d])
+            .astype(DType::Float16)
+            .unwrap();
+        let k0 = keys.slice(&[0, 0], &[n as i64, 288]).unwrap();
+        let k1 = keys.slice(&[0, 288], &[n as i64, d as i64]).unwrap();
+        let sinks = arr(&r.vec(h, 2.0), &[h]);
+
+        let short_idx: Vec<i32> = (0..k_short).map(|j| ((j * 7 + 3) % n) as i32).collect();
+        let mut long_idx = short_idx.clone();
+        long_idx.resize(k_long, -1);
+
+        let ia_short = MxArray::from_int32(&short_idx, &[1, k_short as i64]).unwrap();
+        let ia_long = MxArray::from_int32(&long_idx, &[1, k_long as i64]).unwrap();
+
+        let whole_short = bits(
+            &gather_sink_attention_rows(&q, KeyRows::Whole(&keys), &ia_short, vw, &sinks, scale)
+                .unwrap(),
+        );
+        let whole_long = bits(
+            &gather_sink_attention_rows(&q, KeyRows::Whole(&keys), &ia_long, vw, &sinks, scale)
+                .unwrap(),
+        );
+        assert_eq!(
+            whole_short, whole_long,
+            "Whole H={h}: kmax {k_short} vs padded {k_long} bits differ"
+        );
+
+        let split_short = bits(
+            &gather_sink_attention_rows(&q, KeyRows::Split(&k0, &k1), &ia_short, vw, &sinks, scale)
+                .unwrap(),
+        );
+        let split_long = bits(
+            &gather_sink_attention_rows(&q, KeyRows::Split(&k0, &k1), &ia_long, vw, &sinks, scale)
+                .unwrap(),
+        );
+        assert_eq!(
+            split_short, split_long,
+            "Split H={h}: kmax {k_short} vs padded {k_long} bits differ"
+        );
+        assert_eq!(
+            whole_short, split_short,
+            "Whole vs Split H={h} kmax={k_short}"
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn call_mla_prefill_nax(
     q: &MxArray,

@@ -170,6 +170,23 @@ struct Float3KeyHash {
   }
 };
 
+array cached_i32_pair(int a, int b) {
+  const uint64_t key =
+      (uint64_t(uint32_t(a)) << 32) | uint64_t(uint32_t(b));
+  static std::mutex mutex;
+  static std::unordered_map<uint64_t, array> cache;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (auto it = cache.find(key); it != cache.end()) {
+    return it->second;
+  }
+  const int32_t vals[2] = {int32_t(a), int32_t(b)};
+  array arr(vals, {2}, mlx::core::int32);
+  if (cache.size() < 64) {
+    cache.emplace(key, arr);
+  }
+  return arr;
+}
+
 array cached_f32_pair(float a, float b) {
   const uint64_t key =
       (uint64_t(float_bits(a)) << 32) | uint64_t(float_bits(b));
@@ -548,7 +565,7 @@ const mlx::core::fast::CustomKernelFunction &hy4_mla_sink_kernel() {
 
 const mlx::core::fast::CustomKernelFunction &hy4_mla_splitk_kernel() {
   static auto kernel = mlx::core::fast::metal_kernel(
-      "hy4_mla_decode_splitk", {"q", "k0", "k1", "idx", "scale"},
+      "hy4_mla_decode_splitk", {"q", "k0", "k1", "idx", "scale", "split_cfg"},
       {"o_part", "max_part", "sum_part"},
 #include "metal/hy4/mla_decode_splitk.metal.inc"
   );
@@ -681,9 +698,11 @@ array hy4_mla_single_pass(const array &q, const array &k0, const array &k1,
 
 std::vector<array> hy4_mla_splitk_pass1(const array &q, const array &k0,
                                         const array &k1, const array &idx,
-                                        const array &scale, int d_v, int d_rope,
-                                        bool split, int heads, int bn,
-                                        int n_splits, const Stream &stream) {
+                                        const array &scale,
+                                        const array &split_cfg, int d_v,
+                                        int d_rope, bool split, int heads,
+                                        int bn, int n_splits,
+                                        const Stream &stream) {
   const int s = q.shape(0);
   const int h = q.shape(1);
   const int tg_threads = bn * 32;
@@ -692,9 +711,8 @@ std::vector<array> hy4_mla_splitk_pass1(const array &q, const array &k0,
   const std::tuple<int, int, int> tg{tg_threads, 1, 1};
   const uint64_t tmpl_key = uint64_t(d_v) | (uint64_t(d_rope) << 16) |
                             (uint64_t(split ? 1 : 0) << 32) |
-                            (uint64_t(heads) << 36) | (uint64_t(bn) << 44) |
-                            (uint64_t(n_splits) << 52);
-  const std::vector<array> inputs{q, k0, k1, idx, scale};
+                            (uint64_t(heads) << 36) | (uint64_t(bn) << 44);
+  const std::vector<array> inputs{q, k0, k1, idx, scale, split_cfg};
   const std::vector<Shape> out_shapes{
       {s, h, n_splits, d_v}, {s, h, n_splits}, {s, h, n_splits}};
   const std::vector<Dtype> out_dtypes{
@@ -708,21 +726,20 @@ std::vector<array> hy4_mla_splitk_pass1(const array &q, const array &k0,
              {"D_ROPE", d_rope},
              {"SPLIT", split},
              {"HEADS", heads},
-             {"BN", bn},
-             {"N_SPLITS", n_splits}},
+             {"BN", bn}},
             std::nullopt, false, stream);
       });
 }
 
 array hy4_mla_splitk_merge(const array &o_part, const array &max_part,
                            const array &sum_part, const array &sinks, int d_v,
-                           int n_splits, const Stream &stream) {
+                           const Stream &stream) {
   const int s = o_part.shape(0);
   const int h = o_part.shape(1);
   const int tg_x = d_v / 4;
   const std::tuple<int, int, int> grid{tg_x, h, s};
   const std::tuple<int, int, int> tg{tg_x, 1, 1};
-  const uint64_t tmpl_key = uint64_t(d_v) | (uint64_t(n_splits) << 16);
+  const uint64_t tmpl_key = uint64_t(d_v);
   const std::vector<array> inputs{o_part, max_part, sum_part, sinks};
   const std::vector<Shape> out_shapes{{s, h, d_v}};
   const std::vector<Dtype> out_dtypes{mlx::core::float32};
@@ -730,9 +747,8 @@ array hy4_mla_splitk_merge(const array &o_part, const array &max_part,
       kKernelMlaMerge, stream, grid, tg, tmpl_key, inputs, out_shapes,
       out_dtypes, [&] {
         return hy4_mla_merge_kernel()(
-            inputs, out_shapes, out_dtypes, grid, tg,
-            {{"D_V", d_v}, {"N_SPLITS", n_splits}}, std::nullopt, false,
-            stream);
+            inputs, out_shapes, out_dtypes, grid, tg, {{"D_V", d_v}},
+            std::nullopt, false, stream);
       })[0];
 }
 
@@ -781,10 +797,10 @@ struct MlaConfig {
   int bn;
 };
 
-bool lookup_mla_config(int h, bool split, int n_splits, MlaConfig &out_cfg) {
+bool lookup_mla_config(int h, bool split, bool splitk, MlaConfig &out_cfg) {
   const uint64_t key = uint64_t(uint32_t(h)) |
                        (uint64_t(split ? 1u : 0u) << 32) |
-                       (uint64_t(uint32_t(n_splits)) << 36);
+                       (uint64_t(splitk ? 1u : 0u) << 33);
   static std::mutex mutex;
   static std::unordered_map<uint64_t, MlaConfig> cache;
   std::lock_guard<std::mutex> lock(mutex);
@@ -795,10 +811,10 @@ bool lookup_mla_config(int h, bool split, int n_splits, MlaConfig &out_cfg) {
   return false;
 }
 
-void store_mla_config(int h, bool split, int n_splits, MlaConfig cfg) {
+void store_mla_config(int h, bool split, bool splitk, MlaConfig cfg) {
   const uint64_t key = uint64_t(uint32_t(h)) |
                        (uint64_t(split ? 1u : 0u) << 32) |
-                       (uint64_t(uint32_t(n_splits)) << 36);
+                       (uint64_t(splitk ? 1u : 0u) << 33);
   static std::mutex mutex;
   static std::unordered_map<uint64_t, MlaConfig> cache;
   std::lock_guard<std::mutex> lock(mutex);
@@ -1570,22 +1586,58 @@ mlx_array *mlx_hy4_mla_sink_attention(mlx_array *q, mlx_array *k0,
     array scale_arr = cached_f32_scalar(scale);
     const auto stream = default_stream(Device::gpu);
 
-    // Split count depends only on KMAX (never S) to preserve row invariance.
-    const int n_splits = (kmax >= 1024) ? 8 : (kmax >= 256 ? 4 : 1);
+    // Fixed per-split key blocks depend only on H so trailing -1 padding in
+    // idx never shifts split boundaries or perturbs online softmax reduction.
+    const int k_split = (h >= 64) ? 128 : 256;
+    const int n_splits = std::min(8, (kmax + k_split - 1) / k_split);
+    const bool use_splitk = (n_splits > 1);
+    constexpr int kSplitKMaxChunk = 64;
+
+    auto run_splitk_chunked = [&](const MlaConfig &c,
+                                  std::optional<std::vector<array>> first_parts)
+        -> array {
+      array split_cfg = cached_i32_pair(n_splits, k_split);
+      if (s <= kSplitKMaxChunk) {
+        auto parts = first_parts.has_value()
+                         ? std::move(*first_parts)
+                         : hy4_mla_splitk_pass1(qc, k0c, k1c, idxc, scale_arr,
+                                                split_cfg, d_v, d_rope, split,
+                                                c.heads, c.bn, n_splits,
+                                                stream);
+        return hy4_mla_splitk_merge(parts[0], parts[1], parts[2], sinksc, d_v,
+                                    stream);
+      }
+      std::vector<array> strips;
+      strips.reserve(size_t((s + kSplitKMaxChunk - 1) / kSplitKMaxChunk));
+      for (int row0 = 0; row0 < s; row0 += kSplitKMaxChunk) {
+        const int row1 = std::min(row0 + kSplitKMaxChunk, s);
+        std::vector<array> parts;
+        if (row0 == 0 && first_parts.has_value()) {
+          parts = std::move(*first_parts);
+        } else {
+          array q_sub = ensure_contiguous_aligned(
+              slice(qc, {row0, 0, 0}, {row1, h, d_k}, stream), 1);
+          array idx_sub = ensure_contiguous_aligned(
+              slice(idxc, {row0, 0}, {row1, kmax}, stream), 1);
+          parts = hy4_mla_splitk_pass1(q_sub, k0c, k1c, idx_sub, scale_arr,
+                                       split_cfg, d_v, d_rope, split, c.heads,
+                                       c.bn, n_splits, stream);
+        }
+        strips.push_back(hy4_mla_splitk_merge(parts[0], parts[1], parts[2],
+                                              sinksc, d_v, stream));
+      }
+      return concatenate(strips, 0, stream);
+    };
 
     MlaConfig cfg{};
-    if (lookup_mla_config(h, split, n_splits, cfg)) {
-      if (n_splits == 1) {
+    if (lookup_mla_config(h, split, use_splitk, cfg)) {
+      if (!use_splitk) {
         auto result = hy4_mla_single_pass(qc, k0c, k1c, idxc, sinksc, scale_arr,
                                           d_v, d_rope, split, cfg.heads, cfg.bn,
                                           stream);
         return reinterpret_cast<mlx_array *>(new array(std::move(result)));
       }
-      auto parts = hy4_mla_splitk_pass1(qc, k0c, k1c, idxc, scale_arr, d_v,
-                                        d_rope, split, cfg.heads, cfg.bn,
-                                        n_splits, stream);
-      auto result = hy4_mla_splitk_merge(parts[0], parts[1], parts[2], sinksc,
-                                         d_v, n_splits, stream);
+      auto result = run_splitk_chunked(cfg, std::nullopt);
       return reinterpret_cast<mlx_array *>(new array(std::move(result)));
     }
 
@@ -1600,22 +1652,34 @@ mlx_array *mlx_hy4_mla_sink_attention(mlx_array *q, mlx_array *k0,
       if (h % cand.heads != 0) {
         continue;
       }
-      if (n_splits == 1) {
+      if (!use_splitk) {
         auto result = hy4_mla_single_pass(qc, k0c, k1c, idxc, sinksc, scale_arr,
                                           d_v, d_rope, split, cand.heads,
                                           cand.bn, stream);
         if (hy4_mla_pipeline_threads(result) >= cand.bn * 32) {
-          store_mla_config(h, split, n_splits, cand);
+          store_mla_config(h, split, false, cand);
           return reinterpret_cast<mlx_array *>(new array(std::move(result)));
         }
       } else {
-        auto parts = hy4_mla_splitk_pass1(qc, k0c, k1c, idxc, scale_arr, d_v,
-                                          d_rope, split, cand.heads, cand.bn,
-                                          n_splits, stream);
+        array split_cfg = cached_i32_pair(n_splits, k_split);
+        array q_probe =
+            (s > kSplitKMaxChunk)
+                ? ensure_contiguous_aligned(
+                      slice(qc, {0, 0, 0}, {kSplitKMaxChunk, h, d_k}, stream),
+                      1)
+                : qc;
+        array idx_probe =
+            (s > kSplitKMaxChunk)
+                ? ensure_contiguous_aligned(
+                      slice(idxc, {0, 0}, {kSplitKMaxChunk, kmax}, stream), 1)
+                : idxc;
+        auto parts = hy4_mla_splitk_pass1(q_probe, k0c, k1c, idx_probe,
+                                          scale_arr, split_cfg, d_v, d_rope,
+                                          split, cand.heads, cand.bn, n_splits,
+                                          stream);
         if (hy4_mla_pipeline_threads(parts[0]) >= cand.bn * 32) {
-          store_mla_config(h, split, n_splits, cand);
-          auto result = hy4_mla_splitk_merge(parts[0], parts[1], parts[2],
-                                             sinksc, d_v, n_splits, stream);
+          store_mla_config(h, split, true, cand);
+          auto result = run_splitk_chunked(cand, std::move(parts));
           return reinterpret_cast<mlx_array *>(new array(std::move(result)));
         }
       }

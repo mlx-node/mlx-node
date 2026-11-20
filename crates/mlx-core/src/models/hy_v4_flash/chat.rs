@@ -1178,10 +1178,14 @@ impl HyV4FlashModel {
                             true,
                             HY4_WARMUP_SLICE_ROWS,
                         )?;
+                        state.inner.store.wait_direct_fill()?;
                         sched::serve(&mut state.inner, held);
                         (Engine::Paged(Box::new(state)), warmup)
                     }
-                    None => (Engine::Flat(Box::new(inner)), None),
+                    None => {
+                        inner.store.wait_direct_fill()?;
+                        (Engine::Flat(Box::new(inner)), None)
+                    }
                 };
                 Ok((
                     engine,

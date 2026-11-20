@@ -76,8 +76,6 @@ const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 /// Headroom reserved for other processes when evaluating direct full-expert residency.
 pub const DIRECT_MARGIN: u64 = 4 * GIB;
-/// Prefill scratch allowance beside KV in direct full-expert residency.
-pub const DIRECT_SCRATCH_BYTES: u64 = 2 * GIB;
 /// RAM ladder entries (window clones and tails).
 pub const LADDER_BYTES: u64 = 150 * MIB;
 const HY4_COMPUTE_BASE: u64 = 512 * MIB;
@@ -538,17 +536,44 @@ pub struct DirectDecision {
     pub admitted: bool,
     pub available: u64,
     pub budget: u64,
+    pub margin: u64,
     pub dense_bytes: u64,
     pub direct_expert_bytes: u64,
     pub kv_and_scratch: u64,
+    pub scratch_bytes: u64,
     pub need: u64,
     pub physical: u64,
     pub host_used: u64,
     pub others: u64,
 }
 
-pub fn direct_kv_and_scratch(kv_allowance_initial: u64) -> u64 {
-    kv_allowance_initial.saturating_add(DIRECT_SCRATCH_BYTES)
+/// Parses an explicit GiB reserve override from `MLX_HY4_ADMIT_RESERVE_GB`.
+pub fn parse_reserve_override(raw: Option<&str>) -> Option<u64> {
+    let s = raw?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    match s.parse::<f64>() {
+        Ok(v) if (0.0..=1e6).contains(&v) => Some((v * GIB as f64) as u64),
+        _ => None,
+    }
+}
+
+/// Direct-mode host margin: `DIRECT_MARGIN` unless an explicit reserve override
+/// raises it.
+pub fn direct_margin(reserve_override: Option<u64>) -> u64 {
+    reserve_override.map_or(DIRECT_MARGIN, |r| DIRECT_MARGIN.max(r))
+}
+
+/// Direct-mode prefill scratch allowance at `prefill_rows` and `ctx`, using the
+/// 1.2x profile compute formula.
+pub fn direct_scratch_bytes(p: &Profile, prefill_rows: usize, ctx: usize) -> u64 {
+    let raw = p
+        .compute_base
+        .saturating_add(p.compute_per_row.saturating_mul(prefill_rows as u64))
+        .saturating_add(p.compute_fixed)
+        .saturating_add(p.compute_per_ctx.saturating_mul(ctx as u64));
+    raw.saturating_add(raw / 5)
 }
 
 /// Caps the Metal wired-limit request at `working_set()` so macOS never
@@ -565,17 +590,16 @@ pub fn direct_gate(
     dense_bytes: u64,
     direct_expert_bytes: u64,
     kv_allowance_initial: u64,
+    scratch_bytes: u64,
+    margin: u64,
     max_memory: Option<u64>,
     cache_cap: Option<u64>,
 ) -> DirectDecision {
     let host_used = host.non_reclaimable();
     let others = host_used.saturating_sub(own.bytes());
-    let available = host
-        .physical
-        .saturating_sub(others)
-        .saturating_sub(DIRECT_MARGIN);
+    let available = host.physical.saturating_sub(others).saturating_sub(margin);
     let budget = max_memory.map_or(available, |m| available.min(m));
-    let kv_and_scratch = direct_kv_and_scratch(kv_allowance_initial);
+    let kv_and_scratch = kv_allowance_initial.saturating_add(scratch_bytes);
     let need = dense_bytes
         .saturating_add(direct_expert_bytes)
         .saturating_add(kv_and_scratch);
@@ -585,14 +609,60 @@ pub fn direct_gate(
         admitted,
         available,
         budget,
+        margin,
         dense_bytes,
         direct_expert_bytes,
         kv_and_scratch,
+        scratch_bytes,
         need,
         physical: host.physical,
         host_used,
         others,
     }
+}
+
+/// Evaluates direct residency across `CHUNKS` (largest first, capped at `ctx`).
+/// Returns the largest admitted chunk and its decision, or the smallest chunk's
+/// refused decision when none fits.
+#[allow(clippy::too_many_arguments)]
+pub fn pick_direct(
+    mode: DirectMode,
+    p: &Profile,
+    ctx: usize,
+    host: &HostMemory,
+    own: &Own,
+    dense_bytes: u64,
+    direct_expert_bytes: u64,
+    kv_allowance_initial: u64,
+    reserve_override: Option<u64>,
+    max_memory: Option<u64>,
+    cache_cap: Option<u64>,
+) -> (usize, DirectDecision) {
+    let margin = direct_margin(reserve_override);
+    let eval = |chunk: usize| {
+        let rows = chunk.min(ctx);
+        let scratch = direct_scratch_bytes(p, rows, ctx);
+        let gate = direct_gate(
+            mode,
+            host,
+            own,
+            dense_bytes,
+            direct_expert_bytes,
+            kv_allowance_initial,
+            scratch,
+            margin,
+            max_memory,
+            cache_cap,
+        );
+        (rows, gate)
+    };
+    for &chunk in &CHUNKS[..CHUNKS.len() - 1] {
+        let (rows, gate) = eval(chunk);
+        if gate.admitted {
+            return (rows, gate);
+        }
+    }
+    eval(CHUNKS[CHUNKS.len() - 1])
 }
 
 /// The admitted context, prefill chunk and admission.
@@ -1221,12 +1291,20 @@ impl Store {
         };
         let one_lane = profile(kv_per_token(&scan.cfg, mtp));
         let base = sizes.model(mtp, max_ctx);
-        let limits = match &opts.plan {
-            CachePlan::Admit => Some(Limits::from_env_with(&one_lane)?),
+        let (limits, reserve_override) = match &opts.plan {
+            CachePlan::Admit => {
+                let l = Limits::from_env_with(&one_lane)?;
+                let ov =
+                    parse_reserve_override(std::env::var(one_lane.reserve_env).ok().as_deref());
+                (Some(l), ov)
+            }
             #[cfg(test)]
-            CachePlan::AdmitWith(l) => Some(*l),
+            CachePlan::AdmitWith(l) => {
+                let ov = (l.reserve != crate::moe_stream::budget::RESERVE).then_some(l.reserve);
+                (Some(*l), ov)
+            }
             #[cfg(test)]
-            CachePlan::Off | CachePlan::Slots { .. } => None,
+            CachePlan::Off | CachePlan::Slots { .. } => (None, None),
         };
         let smallest = CHUNKS[CHUNKS.len() - 1];
         let (lanes, ctx, admitted, cache, staging, admission, direct_budget) = match (
@@ -1238,19 +1316,22 @@ impl Store {
                 let own = Own::default();
                 let direct_expert_bytes = sizes.direct_expert_bytes();
                 let kv_initial = one_lane.kv_base + one_lane.kv_per_ctx * max_ctx as u64;
-                let gate = direct_gate(
+                let (direct_chunk, gate) = pick_direct(
                     opts.direct,
+                    &one_lane,
+                    max_ctx,
                     &h,
                     &own,
                     base.dense,
                     direct_expert_bytes,
                     kv_initial,
+                    reserve_override,
                     opts.max_memory,
                     l.cache_cap,
                 );
                 if gate.admitted {
                     let ctx = max_ctx;
-                    let chunk = CHUNKS[0].min(ctx);
+                    let chunk = direct_chunk;
                     let floor = lane_bytes(&scan.cfg, mtp, ctx);
                     let lanes = (1..=want)
                         .rev()
@@ -1271,14 +1352,14 @@ impl Store {
                         host_used: gate.host_used,
                         own: 0,
                         others: gate.others,
-                        reserve: DIRECT_MARGIN,
+                        reserve: gate.margin,
                         live: gate.available,
                         ws,
                         terms: Terms {
                             dense: gate.dense_bytes,
                             staging_layer: 0,
                             kv: kv_initial.saturating_add(extra_lanes),
-                            compute: DIRECT_SCRATCH_BYTES,
+                            compute: gate.scratch_bytes,
                             io: 0,
                             driver: 0,
                             pool: 0,
@@ -1297,14 +1378,14 @@ impl Store {
                         "hy_v4_flash direct residency at load: {lanes} lanes, context {ctx}, \
                              chunk {chunk}, wave rows {row_cap}: dense {:.2} GiB + direct experts \
                              {:.2} GiB ({} slots) + kv/scratch {:.2} GiB vs available {:.2} GiB \
-                             (others {:.2} GiB, margin {:.0} GiB); wired cap {:.2} GiB",
+                             (others {:.2} GiB, margin {:.2} GiB); wired cap {:.2} GiB",
                         gate.dense_bytes as f64 / GIB as f64,
                         direct_expert_bytes as f64 / GIB as f64,
                         total_slots[0] + total_slots[1],
                         kv_scratch as f64 / GIB as f64,
                         gate.available as f64 / GIB as f64,
                         gate.others as f64 / GIB as f64,
-                        DIRECT_MARGIN as f64 / GIB as f64,
+                        gate.margin as f64 / GIB as f64,
                         wired_cap as f64 / GIB as f64,
                     );
                     (
@@ -1451,6 +1532,10 @@ impl Store {
 
     pub fn is_direct(&self) -> bool {
         self.bank.is_direct()
+    }
+
+    pub fn wait_direct_fill(&self) -> Result<()> {
+        self.bank.wait_direct_fill()
     }
 
     pub fn admission(&self) -> Option<Admission> {

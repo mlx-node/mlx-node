@@ -1425,7 +1425,10 @@ fn direct_gate_admits_quiet_and_falls_back_when_busy_or_disabled() {
     assert_eq!(sizes.total_experts(), [9_728, 11_264]);
 
     let dense_mtp = sizes.dense_trunk + sizes.dense_mtp;
-    let kv_initial = profile(15_812).kv_base + 15_812 * 262_144;
+    let p = profile(15_812);
+    let ctx = 262_144usize;
+    let kv_initial = p.kv_base + p.kv_per_ctx * ctx as u64;
+    let scratch_8k = direct_scratch_bytes(&p, CHUNKS[0], ctx);
     let quiet = HostMemory {
         physical: 128 * G,
         wired: 20 * G,
@@ -1438,12 +1441,16 @@ fn direct_gate_admits_quiet_and_falls_back_when_busy_or_disabled() {
         dense_mtp,
         direct_bytes,
         kv_initial,
+        scratch_8k,
+        DIRECT_MARGIN,
         None,
         None,
     );
     assert!(d_auto.admitted, "quiet 128 GiB host must admit direct mode");
     assert_eq!(d_auto.available, 128 * G - 20 * G - DIRECT_MARGIN);
-    assert_eq!(d_auto.kv_and_scratch, kv_initial + DIRECT_SCRATCH_BYTES);
+    assert_eq!(d_auto.margin, DIRECT_MARGIN);
+    assert_eq!(d_auto.scratch_bytes, scratch_8k);
+    assert_eq!(d_auto.kv_and_scratch, kv_initial + scratch_8k);
 
     let d_on = direct_gate(
         DirectMode::On,
@@ -1452,6 +1459,8 @@ fn direct_gate_admits_quiet_and_falls_back_when_busy_or_disabled() {
         dense_mtp,
         direct_bytes,
         kv_initial,
+        scratch_8k,
+        DIRECT_MARGIN,
         None,
         None,
     );
@@ -1465,6 +1474,8 @@ fn direct_gate_admits_quiet_and_falls_back_when_busy_or_disabled() {
         dense_mtp,
         direct_bytes,
         kv_initial,
+        scratch_8k,
+        DIRECT_MARGIN,
         None,
         None,
     );
@@ -1484,6 +1495,8 @@ fn direct_gate_admits_quiet_and_falls_back_when_busy_or_disabled() {
             dense_mtp,
             direct_bytes,
             kv_initial,
+            scratch_8k,
+            DIRECT_MARGIN,
             None,
             None,
         )
@@ -1497,6 +1510,8 @@ fn direct_gate_admits_quiet_and_falls_back_when_busy_or_disabled() {
             dense_mtp,
             direct_bytes,
             kv_initial,
+            scratch_8k,
+            DIRECT_MARGIN,
             None,
             None,
         )
@@ -1512,6 +1527,8 @@ fn direct_gate_admits_quiet_and_falls_back_when_busy_or_disabled() {
             dense_mtp,
             direct_bytes,
             kv_initial,
+            scratch_8k,
+            DIRECT_MARGIN,
             Some(96 * G),
             None,
         )
@@ -1525,6 +1542,8 @@ fn direct_gate_admits_quiet_and_falls_back_when_busy_or_disabled() {
             dense_mtp,
             direct_bytes,
             kv_initial,
+            scratch_8k,
+            DIRECT_MARGIN,
             None,
             Some(direct_bytes - 1),
         )
@@ -1538,6 +1557,8 @@ fn direct_gate_admits_quiet_and_falls_back_when_busy_or_disabled() {
             dense_mtp,
             direct_bytes,
             kv_initial,
+            scratch_8k,
+            DIRECT_MARGIN,
             None,
             Some(direct_bytes),
         )
@@ -1548,6 +1569,127 @@ fn direct_gate_admits_quiet_and_falls_back_when_busy_or_disabled() {
     let ws = 96_000_000_000;
     assert_eq!(direct_wired_limit(d_auto.need, ws), ws);
     assert_eq!(direct_wired_limit(50 * G, ws), 50 * G);
+}
+
+#[test]
+fn direct_gate_respects_explicit_reserve_override_and_steps_chunk_down() {
+    assert_eq!(parse_reserve_override(None), None);
+    assert_eq!(parse_reserve_override(Some("  ")), None);
+    assert_eq!(parse_reserve_override(Some("16")), Some(16 * G));
+    assert_eq!(direct_margin(None), DIRECT_MARGIN);
+    assert_eq!(direct_margin(Some(2 * G)), DIRECT_MARGIN);
+    assert_eq!(direct_margin(Some(16 * G)), 16 * G);
+
+    let sizes = Sizes {
+        dense_trunk: 8_003_184_948,
+        dense_mtp: 2_189_929_600,
+        classes: Classes {
+            layers: [19, 22],
+            slot: [4_663_296, 4_091_904],
+        },
+        n_experts: 512,
+    };
+    let dense_mtp = sizes.dense_trunk + sizes.dense_mtp;
+    let direct_bytes = sizes.direct_expert_bytes();
+    let p = profile(15_812);
+    let ctx = 262_144usize;
+    let kv_initial = p.kv_base + p.kv_per_ctx * ctx as u64;
+    let s8 = direct_scratch_bytes(&p, 8192, ctx);
+    let s4 = direct_scratch_bytes(&p, 4096, ctx);
+    let s2 = direct_scratch_bytes(&p, 2048, ctx);
+    assert!(s8 > s4 && s4 > s2);
+
+    let fixed_base = dense_mtp + direct_bytes + kv_initial;
+    let need_8k = fixed_base + s8;
+    let need_4k = fixed_base + s4;
+    let need_2k = fixed_base + s2;
+
+    // Quiet host admits direct at 8192 when no reserve override is set.
+    let quiet = HostMemory {
+        physical: 128 * G,
+        wired: 20 * G,
+        ..Default::default()
+    };
+    let (chunk, gate) = pick_direct(
+        DirectMode::Auto,
+        &p,
+        ctx,
+        &quiet,
+        &Own::default(),
+        dense_mtp,
+        direct_bytes,
+        kv_initial,
+        None,
+        None,
+        None,
+    );
+    assert!(gate.admitted);
+    assert_eq!(chunk, 8192);
+    assert_eq!(gate.margin, DIRECT_MARGIN);
+    assert_eq!(gate.scratch_bytes, s8);
+
+    // Raising the explicit reserve override pushes available just below 2048's need
+    // and forces streamed fallback at the exact boundary.
+    let exact_reserve = quiet.physical - quiet.wired - need_2k;
+    let (chunk_ok, gate_ok) = pick_direct(
+        DirectMode::Auto,
+        &p,
+        ctx,
+        &quiet,
+        &Own::default(),
+        dense_mtp,
+        direct_bytes,
+        kv_initial,
+        Some(exact_reserve),
+        None,
+        None,
+    );
+    assert!(gate_ok.admitted);
+    assert_eq!(chunk_ok, 2048);
+    assert_eq!(gate_ok.margin, exact_reserve.max(DIRECT_MARGIN));
+
+    let (_, gate_refused) = pick_direct(
+        DirectMode::Auto,
+        &p,
+        ctx,
+        &quiet,
+        &Own::default(),
+        dense_mtp,
+        direct_bytes,
+        kv_initial,
+        Some(exact_reserve + 1),
+        None,
+        None,
+    );
+    assert!(!gate_refused.admitted);
+    assert_eq!(gate_refused.margin, (exact_reserve + 1).max(DIRECT_MARGIN));
+
+    // Tight max_memory steps direct chunk down 8192 -> 4096 -> 2048 -> streamed.
+    for (cap, want_admitted, want_chunk, want_scratch) in [
+        (need_8k, true, 8192usize, s8),
+        (need_8k - 1, true, 4096, s4),
+        (need_4k, true, 4096, s4),
+        (need_4k - 1, true, 2048, s2),
+        (need_2k, true, 2048, s2),
+        (need_2k - 1, false, 2048, s2),
+    ] {
+        let (got_chunk, got_gate) = pick_direct(
+            DirectMode::Auto,
+            &p,
+            ctx,
+            &quiet,
+            &Own::default(),
+            dense_mtp,
+            direct_bytes,
+            kv_initial,
+            None,
+            Some(cap),
+            None,
+        );
+        assert_eq!(got_gate.admitted, want_admitted, "cap={cap}");
+        assert_eq!(got_chunk, want_chunk, "cap={cap}");
+        assert_eq!(got_gate.scratch_bytes, want_scratch, "cap={cap}");
+    }
 }
 
 #[test]
@@ -1604,7 +1746,7 @@ fn lease_direct_bank_never_shrinks_or_flips_volatile() {
             dense: 10 * G,
             staging_layer: 0,
             kv: 4 * G,
-            compute: DIRECT_SCRATCH_BYTES,
+            compute: direct_scratch_bytes(&p, 1024, 1024),
             io: 0,
             driver: 0,
             pool: 0,

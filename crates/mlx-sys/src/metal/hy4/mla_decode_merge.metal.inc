@@ -4,6 +4,7 @@ constexpr float MAX_FLOOR = -1e30f;
 
 const int S = o_part_shape[0];
 const int H = o_part_shape[1];
+const int n_splits = o_part_shape[2];
 const int h = int(threadgroup_position_in_grid.y);
 const int s = int(threadgroup_position_in_grid.z);
 const int tid = int(thread_index_in_threadgroup);
@@ -12,10 +13,10 @@ if (s >= S || h >= H || tid >= D_V4) {
 }
 
 const size_t sh = size_t(s) * size_t(H) + size_t(h);
-const size_t mp_base = sh * size_t(N_SPLITS);
+const size_t mp_base = sh * size_t(n_splits);
 
 float global_max = MAX_FLOOR;
-for (int sp = 0; sp < N_SPLITS; ++sp) {
+for (int sp = 0; sp < n_splits; ++sp) {
   if (sum_part[mp_base + size_t(sp)] > 0.0f) {
     global_max = metal::max(global_max, max_part[mp_base + size_t(sp)]);
   }
@@ -23,15 +24,22 @@ for (int sp = 0; sp < N_SPLITS; ++sp) {
 
 float total_sum = 0.0f;
 float4 acc = float4(0.0f);
+bool any = false;
 const device float4* op4 = reinterpret_cast<const device float4*>(
     o_part + mp_base * size_t(D_V));
-for (int sp = 0; sp < N_SPLITS; ++sp) {
+for (int sp = 0; sp < n_splits; ++sp) {
   const float sp_sum = sum_part[mp_base + size_t(sp)];
   if (sp_sum > 0.0f) {
     const float f = metal::exp(max_part[mp_base + size_t(sp)] - global_max);
-    total_sum = metal::fma(sp_sum, f, total_sum);
-    acc = metal::fma(
-        op4[size_t(sp) * size_t(D_V4) + size_t(tid)], float4(f), acc);
+    const float4 v = op4[size_t(sp) * size_t(D_V4) + size_t(tid)];
+    if (!any) {
+      total_sum = sp_sum * f;
+      acc = v * float4(f);
+      any = true;
+    } else {
+      total_sum = metal::fma(sp_sum, f, total_sum);
+      acc = metal::fma(v, float4(f), acc);
+    }
   }
 }
 

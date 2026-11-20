@@ -1259,6 +1259,27 @@ fn direct_bank_drop_mid_fill_and_io_error_propagate_cleanly() {
     assert!(bank.wait_direct_fill().is_err());
 }
 
+#[test]
+fn direct_bank_late_layer_read_error_propagates_through_wait_direct_fill() {
+    let (_dir, path, m, experts, _file) = bank_fixture();
+    // Truncate only inside the last MoE layer (layer 3) so earlier layers fill cleanly.
+    let layer3_start = experts[3].as_ref().unwrap().gate.data_offset;
+    assert!(layer3_start > 0);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(layer3_start + 64)
+        .unwrap();
+    let shards = Arc::new(ShardSet::open(&[path.as_path()]).unwrap());
+    let pool = IoPool::new(shards, 2).unwrap();
+    let bank = KqBank::new_direct(pool, &m, &experts).unwrap();
+    assert!(bank.direct_layer(1).unwrap().is_some());
+    assert!(bank.direct_layer(2).unwrap().is_some());
+    assert!(bank.wait_direct_fill().is_err());
+    assert!(bank.direct_layer(3).is_err());
+}
+
 fn real_scan() -> Scan {
     let dir = std::env::var("HY4_DIR").expect("HY4_DIR = directory of the two Hy4 shards");
     let paths = crate::models::deepseek_v41::chat::shard_paths(Path::new(&dir)).unwrap();

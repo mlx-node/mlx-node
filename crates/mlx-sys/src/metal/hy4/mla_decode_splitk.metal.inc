@@ -15,10 +15,12 @@ const int S = q_shape[0];
 const int H = q_shape[1];
 const int KMAX = idx_shape[1];
 const int N_KEYS = k0_shape[0];
+const int n_splits = split_cfg[0];
+const int k_split = split_cfg[1];
 
 const int y_id = int(threadgroup_position_in_grid.y);
-const int head_group = y_id / N_SPLITS;
-const int sp = y_id - head_group * N_SPLITS;
+const int head_group = y_id / n_splits;
+const int sp = y_id - head_group * n_splits;
 const int s = int(threadgroup_position_in_grid.z);
 const int first_head = head_group * HEADS;
 if (s >= S || first_head >= H) {
@@ -66,9 +68,9 @@ for (int h = 0; h < HEADS; ++h) {
   sum_exp_score[h] = 0.0f;
 }
 
-const int chunk = (KMAX + N_SPLITS - 1) / N_SPLITS;
-const int k_start = sp * chunk;
-const int k_end = metal::min(k_start + chunk, KMAX);
+const int k_start = sp * k_split;
+const int k_end =
+    (sp + 1 < n_splits) ? metal::min(k_start + k_split, KMAX) : KMAX;
 
 const size_t idx_base = size_t(s) * size_t(KMAX);
 for (int k_idx = k_start + int(simd_gid); k_idx < k_end; k_idx += BN) {
@@ -168,7 +170,7 @@ for (int h = 0; h < HEADS; ++h) {
   }
 
   const size_t mp_idx =
-      (size_t(s) * size_t(H) + size_t(first_head + h)) * size_t(N_SPLITS) +
+      (size_t(s) * size_t(H) + size_t(first_head + h)) * size_t(n_splits) +
       size_t(sp);
   if (tid == 0) {
     max_part[mp_idx] = global_max;
