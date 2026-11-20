@@ -117,7 +117,7 @@ extern "C" bool mlx_qwen4_gdn_prepare(mlx_array *qkv, mlx_array *a,
     return false;
 #endif
     if (!mlx::core::metal::is_available() ||
-        mlx::core::default_device() != mlx::core::Device::gpu) {
+        !(mlx::core::default_device() == mlx::core::Device::gpu)) {
       return false;
     }
     std::vector<array> in;

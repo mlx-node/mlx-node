@@ -438,6 +438,7 @@ jobs:
           FORCE: ${{ inputs.force_reupload == true && 'true' || 'false' }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
           $exists = $false
           $complete = $false
           $assets = @(gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name' 2>$null)
@@ -504,6 +505,7 @@ jobs:
           FORCE: ${{ inputs.force_reupload == true && 'true' || 'false' }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
           function Assert-NativeSuccess([string]$action) {
             if ($LASTEXITCODE -ne 0) { throw "$action failed with exit code $LASTEXITCODE" }
           }
@@ -560,6 +562,7 @@ jobs:
           TAG: ${{ steps.meta.outputs.release_tag }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
           function Assert-NativeSuccess([string]$action) {
             if ($LASTEXITCODE -ne 0) { throw "$action failed with exit code $LASTEXITCODE" }
           }

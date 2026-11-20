@@ -120,7 +120,7 @@ static int dflash2_topk16_impl(mlx_array* logits, mlx_array** out_ids,
     return 0;
 #endif
     if (!mlx::core::metal::is_available() ||
-        mlx::core::default_device() != mlx::core::Device::gpu)
+        !(mlx::core::default_device() == mlx::core::Device::gpu))
       return 0;
     const auto& in = *reinterpret_cast<array*>(logits);
     if (in.ndim() < 2)
