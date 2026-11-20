@@ -439,6 +439,7 @@ async fn stream_session_path_keeps_ttft_flat_across_turns() {
     struct TurnSnapshot {
         ttft_ms: f64,
         prompt_tokens: u32,
+        cached_tokens: u32,
     }
 
     // --- Turn 1: chat_stream_session_start ---
@@ -449,15 +450,25 @@ async fn stream_session_path_keeps_ttft_flat_across_turns() {
         .expect("turn 1 chat_stream_session_start dispatch failed");
     let (chunks1, ttft1, done1) = drain_stream_turn(rx1).await;
     assert!(done1, "turn 1 stream didn't reach done=true");
+    assert!(
+        chunks1.iter().any(|c| {
+            !c.done && (!c.text.is_empty() || c.thinking.as_deref().is_some_and(|t| !t.is_empty()))
+        }),
+        "turn 1 stream emitted no non-empty incremental chunk before done=true"
+    );
     let final1 = chunks1.last().expect("turn 1 had no chunks");
     let turn1 = TurnSnapshot {
         ttft_ms: ttft1,
         prompt_tokens: final1.prompt_tokens.unwrap_or(0),
+        cached_tokens: final1
+            .cached_tokens
+            .expect("stream turn 1 terminal chunk missing cached_tokens"),
     };
     println!(
-        "stream turn 1 ttft={:.1}ms prompt_tokens={} chunks={}",
+        "stream turn 1 ttft={:.1}ms prompt_tokens={} cached_tokens={} chunks={}",
         turn1.ttft_ms,
         turn1.prompt_tokens,
+        turn1.cached_tokens,
         chunks1.len()
     );
 
@@ -482,16 +493,27 @@ async fn stream_session_path_keeps_ttft_flat_across_turns() {
             .expect("delta stream dispatch failed");
         let (chunks, ttft, done) = drain_stream_turn(rx).await;
         assert!(done, "turn {turn_idx} stream didn't reach done=true");
+        assert!(
+            chunks.iter().any(|c| {
+                !c.done
+                    && (!c.text.is_empty() || c.thinking.as_deref().is_some_and(|t| !t.is_empty()))
+            }),
+            "turn {turn_idx} stream emitted no non-empty incremental chunk before done=true"
+        );
         let last = chunks.last().expect("turn had no chunks");
         let finish_reason = last
             .finish_reason
             .as_deref()
             .unwrap_or("<missing>")
             .to_string();
+        let cached_tokens = last
+            .cached_tokens
+            .expect("stream delta terminal chunk missing cached_tokens");
         println!(
-            "stream turn {turn_idx} ttft={:.1}ms prompt_tokens={} num_tokens={} finish={}",
+            "stream turn {turn_idx} ttft={:.1}ms prompt_tokens={} cached_tokens={} num_tokens={} finish={}",
             ttft,
             last.prompt_tokens.unwrap_or(0),
+            cached_tokens,
             last.num_tokens.unwrap_or(0),
             finish_reason,
         );
@@ -503,6 +525,7 @@ async fn stream_session_path_keeps_ttft_flat_across_turns() {
         snapshots.push(TurnSnapshot {
             ttft_ms: ttft,
             prompt_tokens: last.prompt_tokens.unwrap_or(0),
+            cached_tokens,
         });
         user_turns.push((*next_user).to_string());
         assistant_turns.push(assistant_turn_from_chunk(last));
@@ -512,9 +535,10 @@ async fn stream_session_path_keeps_ttft_flat_across_turns() {
     assert_eq!(snapshots.len(), 4, "expected 4 stream turn snapshots");
     let turn1 = &snapshots[0];
     let turn2 = &snapshots[1];
+    let turn3 = &snapshots[2];
     let turn4 = &snapshots[3];
 
-    // 1. prompt_tokens grows across turns
+    // 1. prompt_tokens strictly grows across delta turns
     assert!(
         turn2.prompt_tokens > turn1.prompt_tokens,
         "stream delta turn 2 didn't grow prompt_tokens ({} -> {})",
@@ -522,33 +546,63 @@ async fn stream_session_path_keeps_ttft_flat_across_turns() {
         turn2.prompt_tokens
     );
     assert!(
-        turn4.prompt_tokens > turn1.prompt_tokens,
-        "stream delta turn 4 didn't grow prompt_tokens vs turn 1 ({} -> {})",
-        turn1.prompt_tokens,
+        turn3.prompt_tokens > turn2.prompt_tokens,
+        "stream delta turn 3 didn't grow prompt_tokens ({} -> {})",
+        turn2.prompt_tokens,
+        turn3.prompt_tokens
+    );
+    assert!(
+        turn4.prompt_tokens > turn3.prompt_tokens,
+        "stream delta turn 4 didn't grow prompt_tokens ({} -> {})",
+        turn3.prompt_tokens,
         turn4.prompt_tokens
     );
 
-    // 2. TTFT stays flat (<=1.5x of turn 1)
-    let bound_vs_turn1 = turn1.ttft_ms * 1.5;
+    // 2. Deterministic cache-reuse accounting (same proof as
+    //    `session_path_keeps_ttft_flat_across_turns`): wall-clock TTFT ratios
+    //    flake on shared CI runners where tiny warm-GPU times are dominated by
+    //    fixed per-turn setup and scheduling jitter rather than prefill work.
+    assert_eq!(
+        turn1.cached_tokens, 0,
+        "stream turn 1 cold-starts but reported cached_tokens={}",
+        turn1.cached_tokens
+    );
     assert!(
-        turn4.ttft_ms < bound_vs_turn1,
-        "stream delta-path TTFT regression vs turn 1: \
-         turn1={:.1}ms turn4={:.1}ms bound={:.1}ms. snapshots: {:?}",
-        turn1.ttft_ms,
-        turn4.ttft_ms,
-        bound_vs_turn1,
+        turn2.cached_tokens > 0,
+        "stream delta turn 2 reused nothing (cached_tokens=0) — cache was rebuilt. snapshots: {:?}",
+        snapshots
+    );
+    assert!(
+        turn3.cached_tokens > turn2.cached_tokens,
+        "stream delta turn 3 didn't grow its reused prefix ({} -> {}). snapshots: {:?}",
+        turn2.cached_tokens,
+        turn3.cached_tokens,
+        snapshots
+    );
+    assert!(
+        turn4.cached_tokens > turn3.cached_tokens,
+        "stream delta turn 4 didn't grow its reused prefix ({} -> {}). snapshots: {:?}",
+        turn3.cached_tokens,
+        turn4.cached_tokens,
         snapshots
     );
 
-    // 3. Turn 4 should be in the same flat-TTFT regime as turn 2
-    let bound_vs_turn2 = turn2.ttft_ms * 2.0;
+    let uncached = |t: &TurnSnapshot| t.prompt_tokens.saturating_sub(t.cached_tokens);
     assert!(
-        turn4.ttft_ms < bound_vs_turn2,
-        "stream turn 4 TTFT much slower than turn 2: \
-         turn2={:.1}ms turn4={:.1}ms bound={:.1}ms. snapshots: {:?}",
-        turn2.ttft_ms,
-        turn4.ttft_ms,
-        bound_vs_turn2,
+        uncached(turn4) < turn4.cached_tokens,
+        "stream delta turn 4 prefilled more than it reused — work is not flat: \
+         prompt={} cached={} uncached={}. snapshots: {:?}",
+        turn4.prompt_tokens,
+        turn4.cached_tokens,
+        uncached(turn4),
+        snapshots
+    );
+    assert!(
+        uncached(turn4) <= uncached(turn2) * 2,
+        "stream delta turn 4's fresh prefill ({}) ballooned vs turn 2's ({}) — TTFT \
+         would regress. snapshots: {:?}",
+        uncached(turn4),
+        uncached(turn2),
         snapshots
     );
 }
