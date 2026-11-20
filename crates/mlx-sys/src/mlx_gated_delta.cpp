@@ -329,23 +329,18 @@ mlx_array* mlx_fused_compute_g(mlx_array* a_log_ptr, mlx_array* a_ptr, mlx_array
 int32_t mlx_gpu_architecture_gen() {
 #ifdef MLX_NODE_METAL_ENABLED
     try {
-        if (!mlx::core::metal::is_available()) return 0;
         auto& info = mlx::core::gpu::device_info(0);
         auto it = info.find("architecture");
         if (it == info.end()) return 0;
         auto& arch = std::get<std::string>(it->second);
-        // Architecture string: "applegpu_g15s" -> gen=15
-        static constexpr char kPrefix[] = "applegpu_g";
-        constexpr size_t kPrefixLen = sizeof(kPrefix) - 1;
-        if (arch.size() <= kPrefixLen + 1 ||
-            arch.compare(0, kPrefixLen, kPrefix, kPrefixLen) != 0) {
-            return 0;
-        }
+        // Architecture string: "applegpu_g15s" → gen=15
+        // Gen is the 2nd/3rd-to-last chars before the size letter
+        if (arch.size() < 3) return 0;
         int gen = 0;
         // Parse digits before the last character (size letter)
         size_t i = arch.size() - 2;
         int multiplier = 1;
-        while (i >= kPrefixLen && arch[i] >= '0' && arch[i] <= '9') {
+        while (i > 0 && arch[i] >= '0' && arch[i] <= '9') {
             gen += (arch[i] - '0') * multiplier;
             multiplier *= 10;
             i--;

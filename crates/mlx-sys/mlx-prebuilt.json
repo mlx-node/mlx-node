@@ -6,6 +6,11 @@
     "aarch64-apple-darwin": {
       "file": "mlx-aarch64-apple-darwin.tar.gz",
       "sha256": "c93fb29931c5b5d16ae0227ba4722795359045be77177ed7ee0ce4596ccb53ee"
+    },
+    "aarch64-pc-windows-msvc": {
+      "file": "mlx-aarch64-pc-windows-msvc.tar.gz",
+      "sha256": "8304a60f62bcf0a61d784925c233539f584f91db8ca2a8fd1a840306d470758d",
+      "release_tag": "mlx-prebuilt-5ddc3d9e21b8-e0cab3ee"
     }
   }
 }
