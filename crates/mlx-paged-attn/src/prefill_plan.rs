@@ -164,6 +164,35 @@ pub fn pages_per_split(gpu_gen: i32, reported_cores: u32) -> u32 {
     }
 }
 
+/// Splash `KernelCalibration::of` `int8QueriesFromPages` on Apple10 and
+/// later: a split reading this many pages scores INT8 queries.
+const INT8_QUERIES_FROM_PAGES: u32 = 8;
+
+/// The token position from which a query row over INT8 pages scores INT8
+/// query codes, in every pass (prefill, verify, decode) and whatever the
+/// rows of its launch: the visible length past which a verify lane's
+/// `VERIFY_MIN_SPLITS` splits read `INT8_QUERIES_FROM_PAGES` pages each
+/// (7,168, page- and block-aligned). `None` (Splash `kNever`) on Apple9 and
+/// below, whose matrix operations share the FP32 pipe.
+pub fn int8_query_from(gpu_gen: i32) -> Option<u32> {
+    (gpu_gen >= APPLE10_GEN)
+        .then_some(VERIFY_MIN_SPLITS * (INT8_QUERIES_FROM_PAGES - 1) * PAGE_TOKENS)
+}
+
+/// The launches of `rows` rows from position `first`: `(first, rows, int8
+/// queries)`, one launch per side of `from`, so no launch holds rows on
+/// both sides.
+pub fn tile_pieces(first: u32, rows: u32, from: Option<u32>) -> Vec<(u32, u32, bool)> {
+    let end = first + rows;
+    match from {
+        Some(from) if first < from && from < end => {
+            vec![(first, from - first, false), (from, end - from, true)]
+        }
+        Some(from) => vec![(first, rows, first >= from)],
+        None => vec![(first, rows, false)],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +293,38 @@ mod tests {
         assert_eq!(pages_per_split(13, 8), 64);
         assert_eq!(pages_per_split(14, 10), 64);
         assert_eq!(pages_per_split(14, 38), 32);
+    }
+
+    /// The position rule: 7,168 = 32 verify splits of 7 pages on Apple10 and
+    /// later, never below. A launch is split at the threshold and takes one
+    /// kernel per side whatever its rows.
+    /// Mutations gt (`>` for `>=`) and rows16 (q8q iff 16 rows or more) → red.
+    #[test]
+    fn int8_queries_follow_the_row_position() {
+        assert_eq!(int8_query_from(17), Some(7_168));
+        assert_eq!(int8_query_from(18), Some(7_168));
+        for gpu_gen in [13, 14, 15, 16] {
+            assert_eq!(int8_query_from(gpu_gen), None, "gen {gpu_gen}");
+        }
+        let t = int8_query_from(17);
+        assert_eq!(tile_pieces(0, 2048, t), vec![(0, 2048, false)]);
+        assert_eq!(tile_pieces(7_104, 64, t), vec![(7_104, 64, false)]);
+        assert_eq!(tile_pieces(7_168, 64, t), vec![(7_168, 64, true)]);
+        assert_eq!(tile_pieces(7_168, 1, t), vec![(7_168, 1, true)]);
+        assert_eq!(
+            tile_pieces(7_136, 64, t),
+            vec![(7_136, 32, false), (7_168, 32, true)]
+        );
+        assert_eq!(
+            tile_pieces(7_164, 8, t),
+            vec![(7_164, 4, false), (7_168, 4, true)]
+        );
+        assert_eq!(tile_pieces(7_160, 8, t), vec![(7_160, 8, false)]);
+        assert_eq!(tile_pieces(140_000, 2048, t), vec![(140_000, 2048, true)]);
+        assert_eq!(
+            tile_pieces(140_000, 2048, None),
+            vec![(140_000, 2048, false)]
+        );
+        assert_eq!(tile_pieces(5, 3, Some(0)), vec![(5, 3, true)]);
     }
 }

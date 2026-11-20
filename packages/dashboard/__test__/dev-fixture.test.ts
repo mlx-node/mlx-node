@@ -34,6 +34,7 @@ import {
   resetHome,
   writeFixtureHome,
   writeLiveFile,
+  OTHER_SESSION,
 } from '../scripts/dev-fixture.js';
 import { AgentSessionsReader } from '../src/agent-sessions/reader.js';
 import { scanColdCache } from '../src/cache.js';
@@ -225,6 +226,47 @@ describe('dev fixture home', () => {
     const rates = new Set([0, 2_000, 4_000, 6_000].map((offset) => read(now + offset).decodeTps));
     expect(rates.size).toBeGreaterThan(1);
     expect(read(now).decodeTps).toBe(live.decodeTps);
+  });
+
+  it("MLX_DEV_FLIGHT=chat: the model busy with another session's request, then each Work conversation's queued, reading, generating", () => {
+    const summary = writeFixtureHome(home, { now });
+    const paths = fixturePaths(home);
+    mkdirSync(join(home, 'chat'), { recursive: true });
+    writeFileSync(
+      join(home, 'chat', 'conversations.json'),
+      JSON.stringify({ version: 1, work: [{ id: 'work-a', createdAt: now }] }),
+    );
+    const flight = { ...summary.live, flight: 'chat' as const, chatModels: ['qwen-chat'] };
+    const read = (at: number, process = flight) => {
+      writeLiveFile(home, process, at);
+      const live = parseLiveFile(
+        JSON.parse(readFileSync(join(paths.runtimeDir, `live-${summary.live.pid}.json`), 'utf8')),
+      )!;
+      return {
+        turns: live.turns.filter((turn) => turn.model === 'qwen-chat'),
+        queued: live.models.find((model) => model.name === 'qwen-chat')?.queued,
+      };
+    };
+    const cycle = Math.floor(now / 40_000) * 40_000;
+    const busy = read(cycle + 2_000);
+    expect(busy.turns.map((t) => [t.clientSession, t.phase])).toEqual([[OTHER_SESSION, 'prefill']]);
+    expect(busy.turns[0]!.prefillDone!).toBeLessThan(busy.turns[0]!.prefillTotal!);
+    expect(busy.queued).toBe(1);
+    expect(read(cycle + 8_000).turns.map((t) => [t.clientSession, t.phase])).toEqual([[OTHER_SESSION, 'decode']]);
+    const queued = read(cycle + 12_000);
+    expect(queued.turns.map((t) => [t.clientSession, t.phase])).toEqual([
+      [OTHER_SESSION, 'decode'],
+      ['work-a', 'queued'],
+    ]);
+    expect(queued.queued).toBe(0);
+    const reading = read(cycle + 24_000).turns.find((t) => t.clientSession === 'work-a')!;
+    expect(reading.phase).toBe('prefill');
+    expect(reading.prefillDone!).toBeGreaterThan(0);
+    expect(reading.prefillDone!).toBeLessThan(reading.prefillTotal!);
+    const writing = read(cycle + 37_000).turns.find((t) => t.clientSession === 'work-a')!;
+    expect([writing.phase, writing.generatedTokens]).toEqual(['decode', 1_920]);
+    expect(read(cycle + 39_000).turns.find((t) => t.clientSession === 'work-a')?.generatedTokens).toBe(3_200);
+    expect(read(now, { ...flight, chatModels: [] }).turns).toEqual([]);
   });
 
   it('holds seven models, two companions, a skipped folder, a cold cache and 240 cloned sessions', () => {

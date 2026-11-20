@@ -14,6 +14,11 @@ pub(crate) mod cmd;
 pub(crate) mod compiled_lock;
 pub(crate) mod decode;
 pub(crate) mod decode_tuning;
+#[cfg(test)]
+mod dspark_device_sampled_tests;
+#[cfg(test)]
+mod dspark_sampled_rows_tests;
+pub(crate) mod dspark_timeline;
 pub(crate) mod dspark_turn;
 pub(crate) mod finalize;
 pub(crate) mod gen_prompt;
@@ -35,6 +40,8 @@ pub mod pipeline_counter;
 pub(crate) mod plan;
 pub(crate) mod progress;
 pub(crate) mod recurrent_state;
+#[cfg(test)]
+mod sampler_law_tests;
 pub(crate) mod scheduled_verify;
 pub(crate) mod scheduler;
 pub(crate) mod session;

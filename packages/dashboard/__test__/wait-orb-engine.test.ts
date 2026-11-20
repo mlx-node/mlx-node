@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 import { ORB_SIZE, orbFrame, type OrbShape } from '../ui/src/components/arc-x/wait-orb/engine.js';
+import { foldFrame } from '../ui/src/components/arc-x/wait-orb/fold.js';
 
 /**
  * Dot count, then the sums of x, y, r and a · (1 − clamp(white)) at 0.6 s, from the engine of the npm package
@@ -62,5 +63,45 @@ describe('wait-orb engine', () => {
       expect(orbFrame(shape, 7.5)).toEqual(orbFrame(shape, 7.5));
       expect(orbFrame(shape, 7.5)).not.toEqual(orbFrame(shape, 7.6));
     }
+  });
+});
+
+describe('the fold orb (compaction)', () => {
+  /** Rows of a frame: the distinct y of the leaving page's dots. */
+  const spread = (seconds: number): number => {
+    const ys = foldFrame(seconds)
+      .filter((dot) => dot.z === 0)
+      .map((dot) => dot.y);
+    return Math.max(...ys) - Math.min(...ys);
+  };
+
+  it('every dot is inside the box, visible, at least 0.3 px, its ink in [0, 1]', () => {
+    for (let t = 0; t < 5; t += 0.05) {
+      for (const dot of foldFrame(t)) {
+        expect(dot.x - dot.r).toBeGreaterThanOrEqual(0);
+        expect(dot.x + dot.r).toBeLessThanOrEqual(ORB_SIZE);
+        expect(dot.y - dot.r).toBeGreaterThanOrEqual(0);
+        expect(dot.y + dot.r).toBeLessThanOrEqual(ORB_SIZE);
+        expect(dot.r).toBeGreaterThanOrEqual(0.3);
+        expect(dot.a).toBeGreaterThanOrEqual(0.02);
+        expect(dot.a).toBeLessThanOrEqual(1);
+        expect(dot.white).toBeGreaterThanOrEqual(0);
+        expect(dot.white).toBeLessThanOrEqual(1);
+      }
+    }
+  });
+
+  it('five lines squeeze into one bar, darker, then the next page fades in, in a 2.4 s loop', () => {
+    expect(spread(0)).toBeCloseTo(13.6, 4);
+    expect(spread(1.44)).toBeCloseTo(13.6 * 0.22, 4);
+    expect(spread(1.44)).toBeLessThan(spread(0.6));
+    expect(spread(0.6)).toBeLessThan(spread(0));
+    expect(foldFrame(1.44)[0]!.white).toBeLessThan(foldFrame(0)[0]!.white);
+    expect(foldFrame(0)).toHaveLength(30);
+    expect(foldFrame(2.0)).toHaveLength(60);
+    expect(foldFrame(2.0).filter((dot) => dot.z === 1)[0]!.a).toBeCloseTo((2.0 / 2.4 - 0.75) / 0.25, 6);
+    expect(foldFrame(2.4)).toEqual(foldFrame(0));
+    expect(foldFrame(7.5)).toEqual(foldFrame(7.5));
+    expect(foldFrame(0.5)).not.toEqual(foldFrame(0.6));
   });
 });

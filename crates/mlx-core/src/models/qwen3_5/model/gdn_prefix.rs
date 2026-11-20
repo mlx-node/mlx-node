@@ -1155,6 +1155,14 @@ impl Qwen35Inner {
         (self.paged_gdn_state_dirty, self.paged_mtp_gdn_invalidations)
     }
 
+    /// The history checkpoint's tokens and cells.
+    #[cfg(test)]
+    pub(crate) fn history_checkpoint_for_test(&self) -> Option<(&[u32], &[Qwen3_5LayerCache])> {
+        self.gdn_last_history_checkpoint
+            .as_ref()
+            .map(|entry| (entry.tokens.as_slice(), entry.caches.as_slice()))
+    }
+
     #[cfg(test)]
     pub(crate) fn history_stamp_for_test(&self) -> Option<u64> {
         self.gdn_last_history_checkpoint

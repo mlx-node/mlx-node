@@ -98,32 +98,47 @@ pub(crate) fn free_released_sources() {
 }
 
 /// Synchronize GPU — block until all pending GPU work completes
+#[cfg_attr(test, track_caller)]
 pub fn synchronize() {
     #[cfg(test)]
     TEST_SYNCHRONIZE_CALLS.with(|c| c.set(c.get() + 1));
+    #[cfg(test)]
+    let watch = super::data::host_waits::begin_always("synchronize");
     unsafe {
         sys::mlx_synchronize();
     }
+    #[cfg(test)]
+    super::data::host_waits::end(watch);
 }
 
 /// Synchronize and clear cache - prevents GPU timeout and memory pressure
 /// This is the recommended function for long-running training loops
 /// Internal Rust-only function - memory management is handled automatically by the trainer
+#[cfg_attr(test, track_caller)]
 pub fn synchronize_and_clear_cache() {
+    #[cfg(test)]
+    let watch = super::data::host_waits::begin_always("synchronize_and_clear_cache");
     unsafe {
         sys::mlx_synchronize();
         sys::mlx_clear_cache();
     }
+    #[cfg(test)]
+    super::data::host_waits::end(watch);
 }
 
 /// [`synchronize_and_clear_cache`] that fails on a native error. MLX throws a
 /// failed GPU command's error (e.g. Metal OOM) once, at the next
 /// synchronize, so a caller that drops it runs on what the command wrote
 /// (Splash `NativeRuntime::executionFailed`).
+#[cfg_attr(test, track_caller)]
 pub(crate) fn synchronize_and_clear_cache_checked(context: &str) -> napi::Result<()> {
     #[cfg(test)]
     super::data::arm_native_failure_at(context);
+    #[cfg(test)]
+    let watch = super::data::host_waits::begin_always("synchronize_and_clear_cache_checked");
     let synchronized = unsafe { sys::mlx_synchronize() };
+    #[cfg(test)]
+    super::data::host_waits::end(watch);
     let detail = if synchronized {
         None
     } else {

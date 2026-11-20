@@ -4,6 +4,7 @@ use crate::models::qwen4_exp::memory::{
 };
 
 const MIB: u64 = 1 << 20;
+const GIB: u64 = 1 << 30;
 /// Splash `engine_memory_plan_test` `kStudio` (M5 Max 36 GB) working set.
 const STUDIO_WORKING_SET: u64 = 30_150_672_384;
 /// Splash `kFlashNext`: the images that load and the routed experts.
@@ -59,6 +60,7 @@ pub(in crate::models::qwen4_exp) fn load_with(
         None,
         has_mtp,
         false,
+        DraftPrice::default(),
     )
     .unwrap();
     let held_back = decision.store.expert_cap_bytes + decision.store.row_cache_bytes;
@@ -70,6 +72,8 @@ pub(in crate::models::qwen4_exp) fn load_with(
         None,
         has_mtp,
         false,
+        DraftPrice::default(),
+        decision.states,
     )
     .unwrap();
     (decision, plan)
@@ -84,24 +88,27 @@ pub(in crate::models::qwen4_exp) fn int8_config() -> Config {
 
 /// The load's wiring gives the plan of the fixed input: page 811,008, the
 /// cell beside the pool, a 1,744,830,464-byte row share, a streamed store of
-/// 14,459,363,158 and a 65,536-token window in 2,080 pages from a 96-page
-/// runway. Mutation: `lane_in_pool: true` in `pool_input` → red (store
-/// 14,333,724,502).
+/// 14,459,363,158 less the three stored states it gives up, and a
+/// 65,536-token window in 2,080 pages from a 96-page runway. Mutation:
+/// `lane_in_pool: true` in `pool_input` → red (store 14,333,724,502 less
+/// the states).
 #[test]
 fn flash_next_load_plans_the_fixed_input() {
     let c = flash_next_config();
     assert_eq!(flash_next_layout(&c).page_bytes(), 811_008);
     assert_eq!(inventory().rows.all, 1_744_830_464);
     let (decision, plan) = load(false);
+    let states = states_reserve(&c, false, 65_536);
+    assert_eq!(decision.states, states);
     assert_eq!(
         decision.store,
         StorePlan {
             whole: false,
-            expert_cap_bytes: 14_459_363_158,
+            expert_cap_bytes: 14_459_363_158 - states,
             row_cache_bytes: 1_744_830_464,
         }
     );
-    assert_eq!(decision.allowance, 4_468_093_952);
+    assert_eq!(decision.allowance, 4_468_093_952 + states);
     let pool = plan.pool.unwrap();
     assert_eq!(pool.lane.window.maximum(), 65_536);
     assert_eq!((pool.runway_blocks, pool.max_blocks), (96, 2_080));
@@ -115,17 +122,18 @@ fn grown(runway: u64, extent: u64, pages: u64) -> u64 {
 
 /// On the MTP plan (one 65,536-token window) one MTP owner at the window
 /// (847,737,856 B with the 255-token lookahead) fits the state budget beside
-/// its 2,056 pages in a pool grown by 165-block extents to 2,076 blocks
+/// the stored states' reserve and its 2,056 pages in a pool grown by 165-block extents to 2,076 blocks
 /// (the plan's maximum is 2,080), and two do not; four AR rows fit at the
 /// runway. Mutation: leave the transient out
 /// of `scheduled_state_budget` → red (two owners fit).
 #[test]
 fn flash_next_scheduled_state_budget_holds_one_long_mtp_owner() {
     let c = flash_next_config();
-    let (_, plan) = load(true);
+    let (decision, plan) = load(true);
     let pool = plan.pool.unwrap();
     let window = pool.lane.window.maximum();
     assert_eq!(window, 65_536);
+    assert!(decision.states > 0);
     let row = row_state_bytes(&c);
     let owner = row + draft_state_bytes(&c, u64::from(window) + 255);
     assert_eq!(owner, 847_737_856);
@@ -144,14 +152,16 @@ fn flash_next_scheduled_state_budget_holds_one_long_mtp_owner() {
         growth_copy_bytes: total * PHYSICAL_BLOCK / 12,
     };
     let transient = memory::prefill_scratch(&c, super::super::MAX_PREFILL_CHUNK, window as usize);
-    let budget = scheduled_state_budget(plan.dynamic_budget_bytes, transient, &charge(total));
+    let budget = scheduled_state_budget(plan.dynamic_budget_bytes, transient, &charge(total))
+        - decision.states;
     assert!(owner <= budget, "one owner {owner} B, budget {budget} B");
     assert!(
         2 * owner > budget,
         "two owners {} B, budget {budget} B",
         2 * owner
     );
-    let runway = scheduled_state_budget(plan.dynamic_budget_bytes, transient, &charge(96));
+    let runway =
+        scheduled_state_budget(plan.dynamic_budget_bytes, transient, &charge(96)) - decision.states;
     assert!(
         4 * row <= runway,
         "four rows {} B, budget {runway} B",
@@ -177,6 +187,8 @@ fn replan_after_load_keeps_the_allowance() {
             None,
             false,
             false,
+            DraftPrice::default(),
+            decision.states,
         )
     };
     let unsettled = engine(held_back).unwrap();
@@ -257,6 +269,7 @@ fn estimate_is_the_load_plan() {
         None,
         false,
         false,
+        DraftPrice::default(),
     )
     .unwrap();
     assert_eq!(
@@ -276,6 +289,7 @@ fn estimate_is_the_load_plan() {
         None,
         true,
         false,
+        DraftPrice::default(),
     )
     .unwrap();
     assert_eq!(mtp.window_tokens, 65_536);
@@ -288,6 +302,7 @@ fn estimate_is_the_load_plan() {
         None,
         false,
         false,
+        DraftPrice::default(),
     )
     .unwrap();
     assert_eq!(int8.window_tokens, 65_536);
@@ -300,6 +315,7 @@ fn estimate_is_the_load_plan() {
         None,
         false,
         false,
+        DraftPrice::default(),
     )
     .unwrap();
     assert!(lower.window_tokens <= ar.window_tokens);
@@ -352,6 +368,7 @@ fn hf_experts_stream_from_the_plan() {
         None,
         false,
         false,
+        DraftPrice::default(),
     )
     .unwrap_or_else(|error| panic!("the HF store must stream: {error}"));
     assert!(!decision.store.whole);
@@ -359,7 +376,8 @@ fn hf_experts_stream_from_the_plan() {
 }
 
 /// The KV allowance follows the requested context (Splash `allowance`'s
-/// non-spill branch), so a 100K cap on the 36 GB input serves 102,400.
+/// non-spill branch), so a 100K cap on the 36 GB input serves 102,400; the
+/// stored states beside it are priced at that context.
 /// Mutation: keep `min(trained, 64K)` whatever the request → red
 /// (refused, the plan holds 65,536).
 #[test]
@@ -377,9 +395,14 @@ fn flash_next_allowance_is_the_requested_context() {
         Some(102_400),
         false,
         false,
+        DraftPrice::default(),
     )
     .unwrap();
-    assert_eq!(decision.allowance, allowance_dynamic_bytes(&[&ar], 102_400));
+    assert_eq!(decision.states, states_reserve(&c, false, 102_400));
+    assert_eq!(
+        decision.allowance,
+        allowance_dynamic_bytes(&[&ar], 102_400) + decision.states
+    );
     let estimate = estimate(
         "Qwen4Exp",
         &c,
@@ -389,6 +412,7 @@ fn flash_next_allowance_is_the_requested_context() {
         Some(102_400),
         false,
         false,
+        DraftPrice::default(),
     )
     .unwrap();
     assert_eq!(estimate.window_tokens, 102_400);
@@ -401,9 +425,14 @@ fn flash_next_allowance_is_the_requested_context() {
         None,
         false,
         false,
+        DraftPrice::default(),
     )
     .unwrap();
-    assert_eq!(unset.allowance, allowance_dynamic_bytes(&[&ar], 65_536));
+    assert_eq!(unset.states, states_reserve(&c, false, 65_536));
+    assert_eq!(
+        unset.allowance,
+        allowance_dynamic_bytes(&[&ar], 65_536) + unset.states
+    );
 }
 
 /// A context the plan cannot hold under `--max-memory` fails with Splash's
@@ -420,6 +449,7 @@ fn flash_next_context_above_the_plan_is_refused() {
         Some(131_072),
         false,
         false,
+        DraftPrice::default(),
     )
     .unwrap_err();
     assert!(
@@ -462,6 +492,7 @@ fn flash_next_400k_serves_the_yarn_window() {
         Some(409_600),
         false,
         false,
+        DraftPrice::default(),
     )
     .unwrap();
     assert_eq!(estimate.window_tokens, 409_600);
@@ -516,6 +547,7 @@ fn flash_next_pool_block_is_the_priced_page() {
                 values_token_major: true,
                 index_rows: 8,
                 index_dimension: 128,
+                ..mlx_paged_attn::PageLayout::default()
             }
         );
     }
@@ -550,7 +582,7 @@ fn flash_next_kv_format_defaults_to_int8_where_pages_serve() {
 /// The int8 page is Splash's: K/V 16,384 + 256 B of scales per tensor and
 /// the bf16 index, 423,936 B; 256-page extents and runway. The 36 GB plan
 /// keeps the 64K window in 2,304 pages and gives the bytes int8 saves to
-/// the experts (cap 15,228,690,262); the M3 Pro too. Mutation W1:
+/// the experts (cap 15,228,690,262 less the stored states); the M3 Pro too. Mutation:
 /// `flash_next_layout` keeps bf16 → red (page 811,008).
 #[test]
 fn int8_pool_window_from_the_plan() {
@@ -563,12 +595,14 @@ fn int8_pool_window_from_the_plan() {
     assert_eq!(layout.extent_pages_for(2_304), 256);
     assert_eq!(layout.runway_pages(), 256);
     let (decision, plan) = load_with(&c, false, STUDIO_WORKING_SET);
-    assert_eq!(decision.allowance, 3_698_766_848);
+    let states = states_reserve(&c, false, 65_536);
+    assert_eq!(decision.states, states);
+    assert_eq!(decision.allowance, 3_698_766_848 + states);
     assert_eq!(
         decision.store,
         StorePlan {
             whole: false,
-            expert_cap_bytes: 15_228_690_262,
+            expert_cap_bytes: 15_228_690_262 - states,
             row_cache_bytes: 1_744_830_464,
         }
     );
@@ -577,13 +611,13 @@ fn int8_pool_window_from_the_plan() {
     assert_eq!(pool.lane.window.bound(), "memory");
     assert_eq!((pool.runway_blocks, pool.max_blocks), (256, 2_304));
     let (decision, plan) = load_with(&c, false, M3_PRO_WORKING_SET);
-    assert_eq!(decision.store.expert_cap_bytes, 14_242_993_596);
+    assert_eq!(decision.store.expert_cap_bytes, 14_242_993_596 - states);
     assert_eq!(plan.pool.unwrap().lane.window.maximum(), 65_536);
 }
 
 /// The MTP draft state is the one lane's, charged once: at a fixed dynamic
 /// budget the int8 window is 66,175 (90,964 without MTP), and a load with
-/// MTP weights keeps 64K in both formats. Mutation O1: `LaneKv::Pool`
+/// MTP weights keeps 64K in both formats beside the stored states. Mutation: `LaneKv::Pool`
 /// also takes the state from the pool's KV (the state charged twice) → red
 /// (a smaller window).
 #[test]
@@ -591,13 +625,13 @@ fn mtp_state_prices_the_one_pool_window() {
     const DYNAMIC: u64 = 4_468_093_952;
     let c = int8_config();
     let transient = |window: u32| transient(&c, window);
-    let state = lane_state(&c, true);
+    let state = lane_state(&c, true, DraftPrice::default());
     let mtp = pool_input(&c, &transient, &state).plan_at(DYNAMIC);
     assert_eq!(mtp.lane.window.maximum(), 66_175);
     assert_eq!(mtp.max_blocks, 2_304);
     assert_eq!(
         mtp.lane.lane_bytes,
-        row_state_bytes(&c) + lane_state(&c, true)(66_175)
+        row_state_bytes(&c) + lane_state(&c, true, DraftPrice::default())(66_175)
     );
     let ar = pool_input(&c, &transient, &|_| 0).plan_at(DYNAMIC);
     assert_eq!((ar.lane.window.maximum(), ar.max_blocks), (90_964, 3_072));
@@ -606,8 +640,10 @@ fn mtp_state_prices_the_one_pool_window() {
         (flash_next_config(), 5_224_301_568, 13_703_155_542, 2_080),
     ] {
         let (decision, plan) = load_with(&config, true, STUDIO_WORKING_SET);
-        assert_eq!(decision.allowance, allowance);
-        assert_eq!(decision.store.expert_cap_bytes, cap);
+        let states = states_reserve(&config, true, 65_536);
+        assert_eq!(decision.states, states);
+        assert_eq!(decision.allowance, allowance + states);
+        assert_eq!(decision.store.expert_cap_bytes, cap - states);
         let pool = plan.pool.unwrap();
         assert_eq!(pool.lane.window.maximum(), 65_536);
         assert_eq!(pool.max_blocks, max_blocks);
@@ -627,10 +663,10 @@ fn the_load_plan_prices_the_lane_draft() {
     assert_eq!(memory::draft_hidden_row_bytes(&c), 20_480);
     for window in [65_536u32, 262_144] {
         assert_eq!(
-            lane_state(&c, true)(window),
+            lane_state(&c, true, DraftPrice::default())(window),
             draft_state_bytes(&c, u64::from(window)) + u64::from(window) * 64 + 20_971_520
         );
-        assert_eq!(lane_state(&c, false)(window), 0);
+        assert_eq!(lane_state(&c, false, DraftPrice::default())(window), 0);
     }
 }
 
@@ -677,6 +713,7 @@ fn the_load_plan_books_the_state_staging() {
         None,
         false,
         true,
+        DraftPrice::default(),
     )
     .unwrap();
     let held_back = decision.store.expert_cap_bytes + decision.store.row_cache_bytes;
@@ -691,6 +728,8 @@ fn the_load_plan_books_the_state_staging() {
         None,
         false,
         true,
+        DraftPrice::default(),
+        decision.states,
     )
     .unwrap();
     assert_eq!(without.footprint.state_staging_bytes, 0);
@@ -726,4 +765,493 @@ fn the_estimate_follows_the_load_switch() {
         assert!(disk(&bare), "{env:?}");
         assert!(state_staging(&c, true, disk(&bare)) > 0, "{env:?}");
     }
+}
+
+/// A logged Flash Next UD-Q4_K_XL load (409 slots): the
+/// M5 Max working set, the routed banks (`hotWeightBytes -
+/// residentBankBytes`), the resident banks, the MLX bytes live before the
+/// load (the logged weight budget less this plan without them), and a
+/// largest routed layer inside the range the logged 409 slots allow.
+const LOGGED_WORKING_SET: u64 = 115_448_725_504;
+const LOGGED_ROUTED: u64 = 78_538_342_400;
+const LOGGED_FIXED: u64 = 5_245_160_960;
+const LOGGED_ACTIVE: u64 = 7_536_640;
+const LOGGED_LARGEST_LAYER: u64 = 2_113_929_216;
+/// `maxMemoryBytes` of the logged 71G load.
+const LOGGED_71G: u64 = 76_235_669_504;
+/// The expert cap the logged 71G load ran with (`weightBudgetBytes
+/// 71,466,324,992` less the resident banks and the row cache).
+const LOGGED_71G_CAP: u64 = 64_476_333_568;
+
+fn logged_inventory() -> LoadInventory {
+    let c = int8_config();
+    LoadInventory {
+        store_fixed_bytes: LOGGED_FIXED,
+        vision_bytes: 0,
+        experts: StreamedPart {
+            all: LOGGED_ROUTED,
+            minimum: 10 * (LOGGED_ROUTED + LOGGED_LARGEST_LAYER) / 512,
+        },
+        rows: row_cache_share(&c, 6 * 64 * MIB),
+    }
+}
+
+/// The logged load's store and engine plans (int8 pages, the disk tier on, no MTP
+/// head) under `max_memory`.
+fn logged_load(max_memory: Option<u64>) -> (StoreDecision, MemoryPlan) {
+    logged_load_beside(max_memory, 0)
+}
+
+/// [`logged_load`] with `other` bytes of other MLX memory (another model's
+/// weights or pool) live in the process at load.
+fn logged_load_beside(max_memory: Option<u64>, other: u64) -> (StoreDecision, MemoryPlan) {
+    let c = int8_config();
+    let live = |active: u64| LiveMemory {
+        working_set_bytes: LOGGED_WORKING_SET,
+        active_bytes: active + other,
+        registered_pool_bytes: 0,
+    };
+    let decision = plan_store(
+        "Qwen4Exp",
+        &c,
+        &logged_inventory(),
+        live(LOGGED_ACTIVE),
+        max_memory,
+        None,
+        false,
+        true,
+        DraftPrice::default(),
+    )
+    .unwrap();
+    let held_back = decision.store.expert_cap_bytes + decision.store.row_cache_bytes;
+    let plan = plan_engine(
+        "Qwen4Exp",
+        &c,
+        live(LOGGED_ACTIVE + LOGGED_FIXED),
+        held_back,
+        max_memory,
+        false,
+        true,
+        DraftPrice::default(),
+        decision.states,
+    )
+    .unwrap();
+    (decision, plan)
+}
+
+/// Partial slots of a streamed cap (`select_direct_residency_with`: the
+/// slot bank budget of the cap over every routed byte).
+fn logged_slots(cap: u64, largest: u64) -> u64 {
+    cap * 512 / (LOGGED_ROUTED + largest)
+}
+
+/// The room a publication finds (`Inner::state_room`) with the pool at its
+/// largest, one prefill pass at the window and the one lane's row live.
+fn room(c: &Config, plan: &MemoryPlan) -> u64 {
+    let pool = plan.pool.unwrap();
+    let window = pool.lane.window.maximum();
+    memory::state_room(
+        plan.dynamic_budget_bytes,
+        memory::prefill_scratch(c, super::super::MAX_PREFILL_CHUNK, window as usize),
+        &PoolCharge {
+            total_blocks: u64::from(pool.max_blocks),
+            max_blocks: u64::from(pool.max_blocks),
+            physical_block_bytes: pool.bytes_per_block,
+            growth_copy_bytes: 0,
+        },
+        row_state_bytes(c),
+    )
+}
+
+/// Under the logged 71G bound the streamed experts take everything the
+/// allowance leaves. The plan gives three stored states of the 64K window
+/// back from them: the room a publication finds holds three, the window
+/// stays 65,536 in the same pool, and the store keeps 405 slots or more of
+/// the 409 it had at either end of the largest layer's range. The fixture is
+/// the record: without the states the cap is the logged 64,476,333,568.
+/// Mutation: `states_reserve` gives 0 → red (the room is
+/// below one state).
+#[test]
+fn a_71g_plan_leaves_room_for_three_states() {
+    let c = int8_config();
+    let (decision, plan) = logged_load(Some(LOGGED_71G));
+    let pool = plan.pool.unwrap();
+    let window = pool.lane.window.maximum();
+    let one = memory::state_bytes(&c, 65_536, super::super::MAX_PREFILL_CHUNK as u64, false)
+        + crate::models::qwen3_5::dflash2_state::store::lineage_bytes(65_536, 2_048);
+    let room = room(&c, &plan);
+    let cap = decision.store.expert_cap_bytes;
+    let largest = [1_978_444_886, LOGGED_LARGEST_LAYER, 2_175_307_445];
+    eprintln!(
+        "71G: whole {}, cap {cap} B, states {} B, allowance {} B, dynamic {} B, window {window}, \
+         pool max blocks {}, block {} B, room {room} B, one state at 65,536 {one} B, \
+         cell {} B, slots at largest {largest:?}: {:?} (cap + states: {:?})",
+        decision.store.whole,
+        decision.states,
+        decision.allowance,
+        plan.dynamic_budget_bytes,
+        pool.max_blocks,
+        pool.bytes_per_block,
+        memory::state_cell_bytes(&c),
+        largest.map(|l| logged_slots(cap, l)),
+        largest.map(|l| logged_slots(cap + decision.states, l)),
+    );
+    assert!(!decision.store.whole);
+    assert!(room >= STORED_STATES * one, "room {room} B");
+    assert_eq!(cap + decision.states, LOGGED_71G_CAP);
+    assert_eq!(decision.states, STORED_STATES * one);
+    assert_eq!(window, 65_536);
+    for largest in largest {
+        assert_eq!(logged_slots(LOGGED_71G_CAP, largest), 409);
+        assert!(logged_slots(cap, largest) >= 405, "{largest}");
+    }
+}
+
+/// One stored state of the logged load's 64K window, as a publication prices it.
+fn logged_state(c: &Config) -> u64 {
+    memory::state_bytes(c, 65_536, super::super::MAX_PREFILL_CHUNK as u64, false)
+        + crate::models::qwen3_5::dflash2_state::store::lineage_bytes(65_536, 2_048)
+}
+
+/// With no bound the logged 128 GB Mac holds every expert and the stored
+/// states beside the pool: the store is the one of the plan without states,
+/// the window stays 262,144 and the room a publication finds holds three
+/// states.
+/// Mutation: a whole store keeps the plan without
+/// states → red (states 0).
+#[test]
+fn the_unbounded_whole_store_keeps_its_store_and_holds_three_states() {
+    let c = int8_config();
+    let (decision, plan) = logged_load(None);
+    let one = logged_state(&c);
+    let base = plan_lanes(
+        "Qwen4Exp",
+        &c,
+        &logged_inventory(),
+        LiveMemory {
+            working_set_bytes: LOGGED_WORKING_SET,
+            active_bytes: LOGGED_ACTIVE,
+            registered_pool_bytes: 0,
+        },
+        None,
+        None,
+        false,
+        true,
+        DraftPrice::default(),
+        0,
+    )
+    .unwrap();
+    let room = room(&c, &plan);
+    eprintln!(
+        "unbounded: {decision:?}; dynamic {} B, window {}, room {room} B, one state {one} B",
+        plan.dynamic_budget_bytes,
+        plan.pool.unwrap().lane.window.maximum(),
+    );
+    assert!(decision.store.whole);
+    assert_eq!(decision.states, STORED_STATES * one);
+    assert_eq!(decision.store, base.store);
+    assert_eq!(decision.allowance, base.allowance + decision.states);
+    assert_eq!(plan.pool.unwrap().lane.window.maximum(), 262_144);
+    assert!(room >= STORED_STATES * one, "room {room} B");
+}
+
+/// A whole store's pool grows into all its slack, so the stored states need
+/// the reserve there too. At the first bound at which the logged plan without
+/// states holds every expert, 944 MiB above it (the plan without states had
+/// under one state's room in that band), and with no bound beside 0.125 to
+/// 6.25 GiB of other MLX memory live at load (a draft, another model), the
+/// room a publication finds holds three states of the 64K window and the
+/// window holds 64K; a store that streams for the reserve keeps 480 slots or
+/// more.
+/// Mutation: a whole store keeps the plan without
+/// states → red (room 81,395,712 B at the first bound).
+#[test]
+fn a_whole_store_with_little_slack_leaves_room_for_three_states() {
+    let c = int8_config();
+    let one = logged_state(&c);
+    let whole_without = |bound: u64| {
+        plan_lanes(
+            "Qwen4Exp",
+            &c,
+            &logged_inventory(),
+            LiveMemory {
+                working_set_bytes: LOGGED_WORKING_SET,
+                active_bytes: LOGGED_ACTIVE,
+                registered_pool_bytes: 0,
+            },
+            Some(bound),
+            None,
+            false,
+            true,
+            DraftPrice::default(),
+            0,
+        )
+        .is_ok_and(|decision| decision.store.whole)
+    };
+    let (mut low, mut high) = (LOGGED_71G, LOGGED_WORKING_SET);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        if whole_without(mid) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    let first = low;
+    assert!(whole_without(first) && !whole_without(first - 1));
+    let cases = [
+        ("first whole bound", Some(first), 0),
+        ("first whole bound + 944 MiB", Some(first + 944 * MIB), 0),
+        ("no bound, other 0.125 GiB", None, GIB / 8),
+        ("no bound, other 1.25 GiB", None, 5 * GIB / 4),
+        ("no bound, other 5.5 GiB", None, 11 * GIB / 2),
+        ("no bound, other 6.25 GiB", None, 25 * GIB / 4),
+    ];
+    for (name, bound, other) in cases {
+        let (decision, plan) = logged_load_beside(bound, other);
+        let window = plan.pool.unwrap().lane.window.maximum();
+        let room = room(&c, &plan);
+        let slots = if decision.store.whole {
+            512
+        } else {
+            logged_slots(decision.store.expert_cap_bytes, LOGGED_LARGEST_LAYER)
+        };
+        eprintln!(
+            "{name} ({bound:?} B, other {other} B): whole {}, states {} B, window {window}, \
+             room {room} B = {:.2} states, slots {slots}",
+            decision.store.whole,
+            decision.states,
+            room as f64 / one as f64
+        );
+        assert!(room >= STORED_STATES * one, "{name}: room {room} B");
+        assert!(window >= 65_536, "{name}: window {window}");
+        assert!(
+            decision.store.whole || slots >= 480,
+            "{name}: slots {slots}"
+        );
+    }
+}
+
+/// The released Flash Next DFlash2 config (`config.json` of
+/// `incoai/Qwen3.8-Flash-Next-DFlash2`), read by the checkpoint parser.
+fn flash_next_draft_config() -> DFlash2Config {
+    let dir = std::env::temp_dir().join(format!("mlx-qwen4-draft-price-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::json!({
+            "architectures": ["DFlash2DraftModel"],
+            "dflash_config": {
+                "block_size": 8, "conv_group_size": 16, "conv_kernel_size": 2,
+                "mask_token_id": 248_077, "selector_rank": 256, "selector_top_k": 16,
+                "target_layer_ids": [5, 15, 25, 35, 45]
+            },
+            "head_dim": 128, "hidden_size": 2560, "intermediate_size": 7680,
+            "is_causal": false,
+            "layer_types": [
+                "sliding_attention", "sliding_attention", "sliding_attention",
+                "sliding_attention", "sliding_attention"
+            ],
+            "max_position_embeddings": 262_144, "num_attention_heads": 32,
+            "num_hidden_layers": 5, "num_key_value_heads": 8, "num_target_layers": 48,
+            "rms_norm_eps": 1e-6, "rope_parameters": {"rope_theta": 10_000, "rope_type": "default"},
+            "sliding_window": 2048, "vocab_size": 248_320
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let config = read_dflash2_config(&dir);
+    std::fs::remove_dir_all(&dir).unwrap();
+    config.unwrap()
+}
+
+/// The released draft on the Flash Next geometry: a 42,106,880-byte K/V
+/// ring, the five tapped layers' outputs of a 1,024-row pass held until it
+/// ends (5 x 1,024 x 20,480 B) and the evaluated taps of the ring's 2,047
+/// rows and one pass kept between cycles (5 x 3,071 x 5,120 B). The lane
+/// holds them whatever the window, beside the MTP terms. On the 36 GB
+/// input the allowance grows by the lane, the streamed store gives it up,
+/// the window stays and the engine plan reports the weights; an estimate
+/// counts the weights as loaded.
+/// MUTATION: the draft priced at 0 → red (the lane).
+#[test]
+fn the_draft_is_priced_in_the_lane_and_the_plan() {
+    let c = flash_next_config();
+    let price = DraftPrice::of(&c, &flash_next_draft_config(), 547_000_000);
+    assert_eq!(price.ring, 42_106_880);
+    assert_eq!(price.pass_taps, 104_857_600);
+    assert_eq!(price.kept_taps, 78_617_600);
+    assert_eq!(price.lane(), 225_582_080, "the lane");
+    for window in [65_536u32, 262_144] {
+        assert_eq!(lane_state(&c, false, price)(window), price.lane());
+        assert_eq!(
+            lane_state(&c, true, price)(window),
+            lane_state(&c, true, DraftPrice::default())(window) + price.lane()
+        );
+    }
+    let live_at = |active: u64| LiveMemory {
+        working_set_bytes: STUDIO_WORKING_SET,
+        ..live(active)
+    };
+    let plan_of = |draft: DraftPrice| {
+        let decision = plan_store(
+            "Qwen4Exp",
+            &c,
+            &inventory(),
+            live_at(draft.weights),
+            None,
+            None,
+            false,
+            false,
+            draft,
+        )
+        .unwrap();
+        let held_back = decision.store.expert_cap_bytes + decision.store.row_cache_bytes;
+        let plan = plan_engine(
+            "Qwen4Exp",
+            &c,
+            live_at(FLASH_NEXT_LOADED + draft.weights),
+            held_back,
+            None,
+            false,
+            false,
+            draft,
+            decision.states,
+        )
+        .unwrap();
+        (decision, plan)
+    };
+    let (plain, plain_plan) = plan_of(DraftPrice::default());
+    let (drafted, drafted_plan) = plan_of(price);
+    eprintln!(
+        "draft price {price:?}: allowance {} -> {}, cap {} -> {}, max blocks {} -> {}",
+        plain.allowance,
+        drafted.allowance,
+        plain.store.expert_cap_bytes,
+        drafted.store.expert_cap_bytes,
+        plain_plan.pool.unwrap().max_blocks,
+        drafted_plan.pool.unwrap().max_blocks,
+    );
+    assert_eq!(drafted.allowance, plain.allowance + price.lane());
+    assert_eq!(drafted.states, plain.states);
+    assert!(!drafted.store.whole);
+    assert_eq!(
+        drafted.store.expert_cap_bytes + price.lane() + price.weights,
+        plain.store.expert_cap_bytes
+    );
+    assert_eq!(drafted_plan.footprint.draft_weights_bytes, price.weights);
+    assert_eq!(plain_plan.footprint.draft_weights_bytes, 0);
+    assert_eq!(drafted_plan.pool.unwrap().lane.window.maximum(), 65_536);
+    let estimate_of = |draft: DraftPrice| {
+        estimate(
+            "Qwen4Exp",
+            &c,
+            &inventory(),
+            live_at(0),
+            None,
+            Some(65_536),
+            false,
+            false,
+            draft,
+        )
+        .unwrap()
+    };
+    assert_eq!(estimate_of(price).window_tokens, 65_536);
+    let squeezed = DraftPrice {
+        weights: 24 * GIB,
+        ..price
+    };
+    assert!(
+        estimate(
+            "Qwen4Exp",
+            &c,
+            &inventory(),
+            live_at(0),
+            None,
+            Some(65_536),
+            false,
+            false,
+            squeezed
+        )
+        .is_err(),
+        "an estimate counts the draft's weights"
+    );
+}
+
+/// The pin: a load with no draft plans what it planned before the draft had
+/// a price, on every plan fixture the tests above record (the numbers are
+/// theirs): the 36 GB input with and without the MTP head, the logged load at 71G
+/// and with no bound.
+#[test]
+fn a_load_with_no_draft_plans_as_before() {
+    let c = flash_next_config();
+    let (decision, plan) = load(false);
+    let states = states_reserve(&c, false, 65_536);
+    assert_eq!(
+        (decision.store, decision.allowance, decision.states),
+        (
+            StorePlan {
+                whole: false,
+                expert_cap_bytes: 14_459_363_158 - states,
+                row_cache_bytes: 1_744_830_464,
+            },
+            4_468_093_952 + states,
+            states
+        ),
+        "36 GB, no head"
+    );
+    let pool = plan.pool.unwrap();
+    assert_eq!(
+        (
+            pool.lane.window.maximum(),
+            pool.runway_blocks,
+            pool.max_blocks
+        ),
+        (65_536, 96, 2_080),
+        "36 GB, no head: the pool"
+    );
+    assert_eq!(plan.footprint.draft_weights_bytes, 0);
+    let (_, mtp_plan) = load(true);
+    assert_eq!(
+        mtp_plan.pool.unwrap().lane.window.maximum(),
+        65_536,
+        "36 GB, head"
+    );
+    let logged = int8_config();
+    let (bounded, bounded_plan) = logged_load(Some(LOGGED_71G));
+    assert_eq!(
+        bounded.store.expert_cap_bytes + bounded.states,
+        LOGGED_71G_CAP,
+        "71G"
+    );
+    assert_eq!(bounded.states, STORED_STATES * logged_state(&logged), "71G");
+    assert_eq!(
+        bounded_plan.pool.unwrap().lane.window.maximum(),
+        65_536,
+        "71G"
+    );
+    let (whole, whole_plan) = logged_load(None);
+    assert!(whole.store.whole, "no bound");
+    assert_eq!(
+        whole_plan.pool.unwrap().lane.window.maximum(),
+        262_144,
+        "no bound"
+    );
+    for window in [65_536u32, 262_144] {
+        assert_eq!(lane_state(&c, false, DraftPrice::default())(window), 0);
+    }
+}
+
+/// A load with the MTP head and a draft fails, naming both; either alone
+/// loads.
+#[test]
+fn the_head_and_a_draft_do_not_load_together() {
+    let error = refuse_head_with_draft("Qwen4Exp", true, Some("/draft")).unwrap_err();
+    assert!(
+        error.reason.contains("/draft") && error.reason.contains("MTP head"),
+        "{}",
+        error.reason
+    );
+    assert!(refuse_head_with_draft("Qwen4Exp", true, None).is_ok());
+    assert!(refuse_head_with_draft("Qwen4Exp", false, Some("/draft")).is_ok());
 }

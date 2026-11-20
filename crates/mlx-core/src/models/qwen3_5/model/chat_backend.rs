@@ -275,8 +275,9 @@ impl ChatBackend for Qwen35Inner {
                 kind: SpeculativeKind::DraftModel,
                 supported_input_media: MediaCapabilities::NONE,
                 supported_context_media: MediaCapabilities::NONE,
-                // Metal verifies on the pool. Off Metal the cold-start eager
-                // flat lane verifies with ordinary MLX ops and cache rollback.
+                // Metal verifies on the paged pool (scheduled lanes). Off Metal
+                // the cold-start eager flat lane verifies with ordinary MLX ops
+                // and cache rollback.
                 supports_paged_attention: self.paged_adapter.is_some(),
                 supports_streaming: true,
             })

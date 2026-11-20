@@ -313,6 +313,7 @@ describe('where the shell is: every folder pwd -P prints is one the scan holds',
           tool: { name: 'run_terminal_command', namespace: 'grok_build' },
           rawInput: { command: text },
           options: [],
+          requester: null,
         };
         const facts = await autoFacts(req, place, null, { cdpath: false });
         if (!facts.placed || facts.temp !== null) continue;

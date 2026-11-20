@@ -150,7 +150,13 @@ block copy (`read_block_all_layers` / `write_blocks_all_layers`) takes it: the
 value-side blob is `V | V scales | index plane`. Every other family's pool
 stays bf16.
 There is no FP8 KV cache. `contextLimits().kvFormat` reports the pool's
-format.
+format. Over an int8 pool on M5 and later, qwen3_5 / qwen3_5_moe score int8
+queries for every row at KV position 7,168 or later, in every pass
+(`activations: 'auto'`, the default of a qwen3_5 load with a DFlash2 draft; a
+qwen3_5 load with none and qwen3_5_moe default to `'bf16'`;
+`contextLimits().attentionQueries`): see
+[models.md](models.md#int8-queries-activations-qwen3_5-and-qwen3_5_moe) for
+the rule and its cache identity.
 
 Every turn (autoregressive, vision, MTP, DFlash2) takes the pool lane's one
 window. A load with MTP heads and no draft prices the MTP state it holds at the
@@ -167,7 +173,8 @@ one-lane window holds (`docs/concurrent-inference.md`, "Qwen3.5 decode
 lanes"). A load
 with a DFlash2 draft prices the draft state (a second GDN cell and the draft's
 K/V ring, Splash `CompositeStateLayout::laneBytes`) beside the pool, never in
-it: a DFlash2 turn runs alone on the Barrier lane. Its prefill and its fixed
+it: a dense DFlash2 text turn is a scheduled lane ([concurrent-inference.md](concurrent-inference.md#dflash2-lanes-qwen35-dense)),
+and a MoE DFlash2 turn or a media turn runs alone on the Barrier lane. Its prefill and its fixed
 8-row verify read and write the pool; a load with a draft and no pool fails.
 `mlx eval` reads the pool on a paged load, the same route a served turn reads.
 
@@ -380,9 +387,13 @@ or the root limit.
   (one encoded state), allocated at the tier's open, one array's copy while
   a state is encoded, the copy queue, and the writer's queue of pages or
   draft segments behind it.
-- A restart restore reads the state and its blocks on the model thread at
-  the turn's admission, as every family's cold restore does; other lanes
-  wait for it.
+- A restart restore with no other turn admitted reads the state and its
+  blocks on the model thread at the turn's admission. Beside other turns a
+  draft load's text turn parks: the tier's reader reads the blocks, each
+  pass uploads some of them, and the turn lands on a hot chain
+  ([concurrent-inference.md](concurrent-inference.md#disk-tier-restore-beside-decoding-lanes-qwen35-dense)).
+  The no-draft load and the other families still read on the model thread,
+  and other lanes wait for it.
 - The proof that the tier persists is `stateTier: "persistent"` on the
   turn's trace row (the model's `stateTierMode()`: `persistent`, `temp` or
   `off`; `off` too once a write failed for anything but room, as the tier
@@ -798,6 +809,47 @@ persistent mode is the paged KV disk cache switch every family shares: the flag 
 
 The in-process GDN checkpoint store (`gdn_checkpoint_store`) is unchanged by the SSD
 tier: it keeps two entries per owner, five in all when the root owner is named.
+
+### 32-token pages with token-major keys (qwen3_5 draft loads)
+
+A qwen3_5 load takes Splash's attention page (32-token blocks, K token-major, V
+dimension-major, `paged_attention_tile.h`) when its pool can run the kernels for it;
+every other load keeps the vLLM page (`load_plan::pool_page`):
+
+| Load                                                                                                     | Page                        |
+| -------------------------------------------------------------------------------------------------------- | --------------------------- |
+| `paged_block_size` set in the checkpoint's config                                                        | that block, vLLM page       |
+| 24 query / 4 KV heads, head 256, int8 pool, a DFlash2 draft, a GPU that builds the in-place prefill tile | 32 tokens, keys token-major |
+| any other (no draft, bf16 pool, other heads, qwen3_5_moe, a GPU with no tile)                            | 16 tokens, vLLM page        |
+
+A draft load plans no native MTP turn (its speculative plan is the draft's), so the MTP
+weights a checkpoint ships do not change its page. The page has the bytes of a 32-token
+vLLM page in another order, so the state store identity names it: `Int8 ktm` (load line
+`Qwen3.5 state store identity: Int8 ktm`, then `Qwen3.5 KV page: block_size=32
+keys=token-major`). The host byte movers, the raw kernels, the varlen kernel and the
+dense gather refuse the page; prefill, verify and AR decode read it through their own
+entries.
+
+The first load of such a page moves the store the same load wrote on the 16-token page
+(identity `Int8`, its name computed, no directory search) into its own, before the
+states are taken back (`dflash2_state::migrate::move_source`), and prints `Qwen3.5 state
+store move: source_bytes=… states=… pages=… fragments=… refused=… unreadable=… dropped=…
+held_back=… stopped=… source_removed=… wall_ms=…`. The source is locked from the open
+on, so no quota measure or 14-day rule removes it during the move. Two 16-token objects
+become one 32-token page; a state 16 rows past its last whole page keeps those rows in a
+16-row fragment object and restores at the row it had. A source object goes only once
+its rows landed in the new store and read back; the source directory goes only when no
+state the old load takes back is left in it. A cut (crash, quit, kill) at any point
+loses no chat: the next load starts again and skips what the new store holds. A state
+past the new store's limit goes with the source, as the old load's quota would drop it.
+**A downgrade to a build without 32-token pages makes every moved chat cold** (that build reads only
+the 16-token store).
+
+What a user sees: the first load of the model after the update is longer, by one read
+and one write of the stored chats, and prints the move line; a later load moves only what is left in the source.
+The move runs inside the load, before the model serves its first turn. A load moves nothing
+when no 16-token store exists, when its tier is not persistent, or when another process
+holds the source (`disk_tier/source_hold.rs`).
 
 ### Reading the counters from JS
 

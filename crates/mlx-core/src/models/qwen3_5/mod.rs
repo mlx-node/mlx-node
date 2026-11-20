@@ -13,7 +13,11 @@ pub mod gated_delta;
 pub mod gated_delta_net;
 pub(crate) mod gdn_blob;
 pub(crate) mod gdn_checkpoint_store;
+#[cfg(all(test, target_os = "macos"))]
+mod gdn_prefill_scan_tests;
 pub(crate) mod gdn_sidecar;
+#[cfg(all(test, target_os = "macos"))]
+mod ktm_kernel_tests;
 pub mod layer_cache;
 pub(crate) mod load_plan;
 pub mod model;
@@ -21,9 +25,18 @@ pub mod mtp;
 pub(crate) mod mtp_decode;
 pub(crate) mod paged_forward;
 pub mod persistence;
+#[cfg(all(test, target_os = "macos"))]
+mod prefill_kernel_timing;
+#[cfg(all(test, target_os = "macos"))]
+mod prefill_pipeline_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod prefill_tail_tests;
 pub mod quantized_linear;
 pub mod rms_norm_gated;
+pub(crate) mod scheduled_dflash2;
 pub(crate) mod scheduled_mtp;
+#[cfg(all(test, target_os = "macos"))]
+mod store_epilogue_tests;
 pub use config::Qwen3_5Config;
 pub use model::Qwen3_5Model;
 

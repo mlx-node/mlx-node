@@ -1165,6 +1165,7 @@ unsafe extern "C-unwind" {
         kv_dtype: u8,
         route_hint: u8,
         grouped_stripes: u32,
+        score_scales: *mut mlx_array,
     ) -> *mut mlx_array;
 
     /// Emit the MLX C++ `paged_attention_varlen(...)` Custom primitive and
@@ -1190,7 +1191,26 @@ unsafe extern "C-unwind" {
         num_kv_heads: i32,
         head_size: i32,
         kv_dtype: u8,
+        score_scales: *mut mlx_array,
     ) -> *mut mlx_array;
+
+    /// The decode kernels' INT8 query codes by the paged tile's quantizer:
+    /// `q` `[rows, num_q_heads, 128 | 256]` bf16 at `positions` `[rows]`
+    /// int32 (each row's KV index). Rows at or past `from` write their codes
+    /// as bf16 integers and the tile's score scale (1/sqrt(D) literal x the
+    /// row scale) per query head; rows below copy `q` and `scale`. Writes the
+    /// lazy codes `[rows, num_q_heads, head_size]` and score scales `[rows,
+    /// num_q_heads]` f32; false on a validation error. `score_scales` of
+    /// `mlx_paged_attention_forward_with_plan` /
+    /// `mlx_paged_attention_varlen_forward` (INT8 pages, nullable) take them.
+    pub fn mlx_paged_query_codes_forward(
+        q: *mut mlx_array,
+        positions: *mut mlx_array,
+        from: u32,
+        scale: f32,
+        out_codes: *mut *mut mlx_array,
+        out_score_scales: *mut *mut mlx_array,
+    ) -> bool;
 
     /// In-place prefill / verify attention of one sequence's chunk over the
     /// block-paged pool, its rows already stored (Splash
@@ -1199,9 +1219,11 @@ unsafe extern "C-unwind" {
     /// block_size) entries; `workspace` f32 of at least the launch's
     /// partials and statistics (`mlx_paged_attn::prefill_plan`). `max_splits`
     /// is 32 for a prefill chunk (rows <= 2048) and 128 for a verify block
-    /// (rows <= 8). Writes the lazy `[rows, num_q_heads, head_size]` bf16
-    /// attention and the workspace (same buffer, ordered after this launch)
-    /// to the out pointers; false on a validation error.
+    /// (rows <= 8). `int8_queries` (INT8 pages only) takes the q8q split,
+    /// which scores INT8 query codes against the INT8 keys. Writes the lazy
+    /// `[rows, num_q_heads, head_size]` bf16 attention and the workspace
+    /// (same buffer, ordered after this launch) to the out pointers; false
+    /// on a validation error.
     #[allow(clippy::too_many_arguments)]
     pub fn mlx_paged_prefill_attention_forward(
         q: *mut mlx_array,
@@ -1219,22 +1241,30 @@ unsafe extern "C-unwind" {
         num_kv_heads: i32,
         head_size: i32,
         kv_dtype: u8,
+        int8_queries: bool,
         scale: f32,
         out_attention: *mut *mut mlx_array,
         out_workspace: *mut *mut mlx_array,
     ) -> bool;
 
-    /// True when every in-place prefill attention pipeline builds on this
-    /// GPU.
+    /// True when every in-place prefill attention pipeline this GPU runs
+    /// builds (the q8q entries only on Apple10 and later).
     pub fn mlx_paged_prefill_mpp_builds() -> bool;
 
     /// Reset/read the in-place prefill attention launch probe (counted at
     /// every dispatch). `kind` 0 counts prefill launches, 1 verify launches,
-    /// 2 calls of `mlx_paged_prefill_mpp_builds` (never reset).
+    /// 2 calls of `mlx_paged_prefill_mpp_builds` (never reset), 3 launches
+    /// of a q8q (INT8-query) split, 4 launches of a keys-token-major entry.
     pub fn mlx_paged_prefill_test_probe_reset();
     pub fn mlx_paged_prefill_test_probe_count(kind: i32) -> u64;
     pub fn mlx_paged_prefill_test_last_splits() -> u32;
     pub fn mlx_paged_prefill_test_last_max_splits() -> u32;
+
+    /// Reset/read the paged decode read probe (counted at every dispatch).
+    /// `kind` 0 counts calls over a vLLM page; launches over the
+    /// keys-token-major page: 1 striped, 2 generic, 3 v1.
+    pub fn mlx_paged_decode_test_probe_reset();
+    pub fn mlx_paged_decode_test_probe_count(kind: i32) -> u64;
 
     /// Emit the MLX C++ `paged_kv_write(...)` Custom primitive and return the
     /// lazy outputs aliasing `k_pool`, `v_pool`, `k_scale`, `v_scale` (an
@@ -1812,6 +1842,11 @@ unsafe extern "C-unwind" {
     /// when it publishes none or without Metal.
     pub fn mlx_gpu_reported_core_count() -> i32;
 
+    /// K splits of a K-quant Tiled64 call of an `[n, k]` weight on `cores`
+    /// GPU cores: one law at 8, 16, 24 and 32 rows and for every K-quant
+    /// mode. 0 without Metal.
+    pub fn mlx_kquant_tiled_splits(n: i32, k: i32, cores: i32) -> i32;
+
     /// Pure selector guard for the supported BF16 D512/BS16 GQA layouts.
     /// selector_mode: 0=disabled, 1=auto, 2=force.
     pub fn mlx_paged_grouped_d512_shape_guard_for_test(
@@ -2057,6 +2092,28 @@ unsafe extern "C-unwind" {
         bits: i32,
     ) -> *mut mlx_array;
 
+    /// Whether the Tiled64 K-quant `mode` ("q4k@t64") at `bits` takes the
+    /// 8-row tensor-op tier for an `[n, k]` weight at M = 8 on this device.
+    pub fn mlx_kquant_lane_tier_available(
+        mode: *const std::os::raw::c_char,
+        bits: i32,
+        n: i32,
+        k: i32,
+    ) -> bool;
+
+    /// `x` `[16 | 24 | 32, k]` bf16 of 8-row lanes on the 16/32-row tier: each
+    /// lane's rows get the bits of an 8-row call. Null when the projection or
+    /// `x` does not fit.
+    pub fn mlx_quantized_matmul_lane_tier(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        group_size: i32,
+        bits: i32,
+        mode: *const std::os::raw::c_char,
+    ) -> *mut mlx_array;
+
     // ============================================
     // Gather QMM (for QuantizedSwitchLinear / MoE)
     // ============================================
@@ -2107,8 +2164,9 @@ unsafe extern "C-unwind" {
     /// qmv batch limit, or `MLX_QMM_SPLITK_MIN_M`); 0 without Metal.
     pub fn mlx_test_kquant_qmv_vector_limit(k: i32, n: i32) -> i32;
     /// TEST-ONLY: checks `paged_attn.metallib` against every K-quant kernel
-    /// name the Metal dispatcher can build. `counts` (4 slots) receives base
-    /// names, NAX names, K-quant functions in the library and pipelines built;
+    /// name the Metal dispatcher and the GGUF planes primitives can build.
+    /// `counts` (5 slots) receives base names, NAX names, K-quant and `gguf_`
+    /// functions in the library, pipelines built and GGUF planes names;
     /// `report` receives "missing <name>" / "unexpected <name>" lines.
     /// `build_pipelines` also builds every pipeline this device can request.
     /// False without Metal, on error, or when `len` is too small.
@@ -2419,9 +2477,9 @@ unsafe extern "C-unwind" {
 
     // Chunked fused GDN prefill for one prompt window, any T (the prompt
     // counterpart of `mlx_gdn_fused_step`): the fused gating + q/k rms_norm
-    // + 32-row-chunked recurrence (f32 register state carries) + gated
-    // RMSNorm and z gate in ONE dispatch, bit-identical to the unfused
-    // prefill chain. `q`/`k` are the PRE-NORM conv outputs and `a`/`b` the
+    // + recurrence (16 state rows of a value head per threadgroup) + gated
+    // RMSNorm and z gate in one primitive of three dispatches, bit-identical
+    // to the unfused prefill chain. `q`/`k` are the PRE-NORM conv outputs and `a`/`b` the
     // raw gate views — all read through their row strides; `state` may be
     // null for in-kernel zero init; `tiled` selects hk = hv % Hk (tiled
     // GGUF) vs the repeat-expansion map hk = hv / (Hv / Hk). Returns false
@@ -2925,6 +2983,18 @@ unsafe extern "C" {
         out_path: *mut *mut mlx_array,
         out_confidence: *mut *mut mlx_array,
     ) -> bool;
+    /// Sampled DFlash2 predecessor walk: candidates `[1,L,K]` i32, score
+    /// tables `[L,K,K]` f32, uniforms `[L]` f32, temperature `[1]` f32.
+    /// Returns a lazy `[L]` i32 path and the `[L,K]` f32 probabilities each
+    /// position drew from, or false when the input contract is not met.
+    pub fn mlx_dflash2_sampled_path(
+        candidates: *mut mlx_array,
+        scores: *mut mlx_array,
+        uniforms: *mut mlx_array,
+        temperature: *mut mlx_array,
+        out_path: *mut *mut mlx_array,
+        out_q: *mut *mut mlx_array,
+    ) -> bool;
     /// Fused residual-add + RMSNorm: writes `h = x + res` and
     /// `normed = rms_norm(h) * w` into the out pointers. Returns false on
     /// contract violation (shape/dtype/contiguity) or kernel build failure.
@@ -3200,6 +3270,28 @@ unsafe extern "C" {
         sums: *mut mlx_array,
         output: *mut *mut mlx_array,
     ) -> i32;
+    /// `x @ w.T` on a Tiled64 K-quant weight (`mode` "<mode>@t64") with the
+    /// GEMM store applying `epilogue` to `aux` (shaped as the output):
+    /// 1 = `aux + y`, 2 = `sigmoid(aux) * aux * y`. Returns 1 with `output`
+    /// set, 0 when the operands do not take the epilogue GEMM, -1 on error.
+    pub fn mlx_kquant_matmul_epilogue(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        aux: *mut mlx_array,
+        mode: *const std::ffi::c_char,
+        epilogue: i32,
+        output: *mut *mut mlx_array,
+    ) -> i32;
+    /// Whether `m` bfloat16 rows times a Tiled64 `mode` weight of `(n, k)`
+    /// take the store-epilogue GEMM.
+    pub fn mlx_kquant_store_epilogue_route(
+        mode: *const std::ffi::c_char,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> bool;
     pub fn mlx_kquant_head_f32(
         x: *mut mlx_array,
         weight: *mut mlx_array,
@@ -3207,13 +3299,45 @@ unsafe extern "C" {
         biases: *mut mlx_array,
         output: *mut *mut mlx_array,
     ) -> i32;
+    /// One dispatch for 2-3 projections of the same 8-row bf16 `x`:
+    /// `inputs` = x, then (weight, scales, biases) per segment; `formats`
+    /// one `MixedProjectionFormat` code per segment
+    /// (`metal/mixed_projection/abi.h`). 1 = outputs built, 0 = not this
+    /// route, -1 = malformed operands.
     pub fn mlx_mixed_projection(
         inputs: *const *mut mlx_array,
         count: usize,
-        bits: *const u32,
+        formats: *const u32,
         segments: u32,
         outputs: *mut *mut mlx_array,
     ) -> i32;
+    /// Whether `MLX_MIXED_PROJECTION_GLOBAL_SPLIT=1`: the mixed dispatch splits
+    /// K by the segments' joint width, not each projection's own.
+    pub fn mlx_mixed_projection_global_split() -> bool;
+    /// The target rows of a sampled DFlash2 cycle: `logits` `[R, V]` f32,
+    /// `uniforms` `[R]` f32 and, for the `D` drafted rows (null for none),
+    /// `draft_ids` `[D]` i32, `candidate_ids` `[D, C]` i32 and
+    /// `candidate_probabilities` `[D, C]` f32. The output is `[R, 4]` f32, one
+    /// record per row: the draft token's target probability, its draft
+    /// probability, the row's drawn token (-1: none) and its kept count.
+    /// Returns 1 when constructed, 0 when not taken (no Metal, a GPU the
+    /// kernels do not launch on, or a shape, dtype or `top_k` outside
+    /// 1..=256), -1 on an invalid argument.
+    pub fn mlx_dflash2_sampled_rows(
+        logits: *mut mlx_array,
+        uniforms: *mut mlx_array,
+        draft_ids: *mut mlx_array,
+        candidate_ids: *mut mlx_array,
+        candidate_probabilities: *mut mlx_array,
+        temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        min_p: f32,
+        output: *mut *mut mlx_array,
+    ) -> i32;
+    /// Whether [`mlx_dflash2_sampled_rows`] launches on this GPU: an Apple
+    /// GPU family whose row pipelines hold the kernels' threadgroups.
+    pub fn mlx_dflash2_sampled_rows_supported() -> bool;
     pub fn mlx_splash_moe_available() -> bool;
     /// Test-only real Metal encoder scheduling and resource-accounting regression.
     pub fn mlx_test_sparse_input_budget_encoder() -> bool;
@@ -3481,4 +3605,164 @@ unsafe extern "C-unwind" {
     /// The kernel table's names, '\n'-joined; returns the length without the
     /// NUL (written only when `cap` exceeds it).
     pub fn mlx_gguf_repack_kernel_names(out: *mut std::ffi::c_char, cap: usize) -> usize;
+}
+
+// ============================================
+// GGUF planes (`mlx_gguf_planes.cpp`): Splash's GGUF decode kernels on its
+// MDGG0001 weight planes. Without Metal the kernel names and the plan law
+// still answer; everything that encodes returns null or an error.
+// ============================================
+
+/// The one-lane plan of a projection (`mlx_gguf_planes_plan`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GgufPlanesPlan {
+    /// 1 when the staged planes kernels take the projection.
+    pub staged: u32,
+    pub splits: u32,
+    /// 1 when a gate/up pair runs in one pass (`mlx_gguf_planes_gate_up`).
+    pub one_pass: u32,
+    pub spread: u32,
+    /// 1 when Splash runs this one-lane step on its 16-row tile (reported
+    /// only: the port runs one lane at 8 rows).
+    pub sixteen: u32,
+}
+
+unsafe extern "C" {
+    /// Every kernel name the planes primitives can request, '\n'-joined;
+    /// returns the length without the NUL (written only when `cap` exceeds it).
+    pub fn mlx_gguf_planes_kernel_names(out: *mut std::ffi::c_char, cap: usize) -> usize;
+    /// GGUF_FMT_* id of a GGUF tensor type; 8 when the planes do not store it.
+    pub fn mlx_gguf_planes_format_of(ggml_type: u32) -> u32;
+    /// Sixteenths of a bit per weight of a format; 0 for an unknown one.
+    pub fn mlx_gguf_planes_bits16(fmt: u32) -> u32;
+    /// Bytes of the planes of an `[n, k]` tensor (plane0, plane1, meta into
+    /// `parts`, may be null); 0 when the format or shape is not taken.
+    pub fn mlx_gguf_planes_bytes(fmt: u32, n: u64, k: u64, parts: *mut u64) -> u64;
+    /// Sixteenths of a bit per weight of a fused projection's segments.
+    pub fn mlx_gguf_planes_fused_bits16(fmts: *const u32, ns: *const u32, count: u32) -> u32;
+    /// The one-lane plan of an `[n, k]` projection; a gate/up pair names
+    /// both tensors' bits (nonzero) and whether they share one format.
+    /// `cores` 0 takes this device's (staged 0 off an Apple10 GPU with
+    /// tensor ops).
+    pub fn mlx_gguf_planes_plan(
+        n: u32,
+        k: u32,
+        bits16: u32,
+        cores: u32,
+        one_format: bool,
+        gate_bits16: u32,
+        up_bits16: u32,
+        out: *mut GgufPlanesPlan,
+    ) -> bool;
+    /// Metal, an Apple10 GPU and tensor ops.
+    pub fn mlx_gguf_planes_available() -> bool;
+    /// Builds every row tier's pipeline of one planned projection: kind 0
+    /// plain, 1 residual, 2 gate, 3 gate|up pair, 4 fused (`count` formats).
+    /// False when the OS refuses one.
+    pub fn mlx_gguf_planes_prepare(kind: u32, fmts: *const u32, count: u32) -> bool;
+    /// Rows `[row0, row0 + rows)` of an `n_total x k` tensor from `staging`
+    /// (uint8, the band's native rows from `src_offset`) into `dst` (the
+    /// tensor's uint8 planes); `*out` shares dst's buffer. 0, or nonzero with
+    /// a message in `err`.
+    pub fn mlx_gguf_planes_repack_band(
+        staging: *mut mlx_array,
+        src_offset: u64,
+        fmt: u32,
+        k: u32,
+        n_total: u32,
+        row0: u32,
+        rows: u32,
+        dst: *mut mlx_array,
+        out: *mut *mut mlx_array,
+        err: *mut std::ffi::c_char,
+        err_cap: usize,
+    ) -> i32;
+    /// `x [M, k]` bf16 (M = 8, 16, 24, 32) times the planes of `[n, k]`:
+    /// epilogue 0 plain, 1 plus residual `aux [M, n]`, 2 swiglu of gate `aux`
+    /// and this up projection. Null on invalid operands.
+    pub fn mlx_gguf_planes_matmul(
+        x: *mut mlx_array,
+        planes: *mut mlx_array,
+        aux: *mut mlx_array,
+        fmt: u32,
+        n: u32,
+        k: u32,
+        epilogue: u32,
+        splits: u32,
+        spread: u32,
+    ) -> *mut mlx_array;
+    /// Swiglu of a merged gate|up tensor (planes of `2n` rows, gate first)
+    /// in one pass: `[M, n]`.
+    pub fn mlx_gguf_planes_gate_up(
+        x: *mut mlx_array,
+        planes: *mut mlx_array,
+        fmt: u32,
+        n: u32,
+        k: u32,
+        splits: u32,
+        spread: u32,
+    ) -> *mut mlx_array;
+    /// 1 to 3 segments of any formats in one dispatch: `[M, sum n]`.
+    pub fn mlx_gguf_planes_fused(
+        x: *mut mlx_array,
+        planes: *const *mut mlx_array,
+        fmts: *const u32,
+        ns: *const u32,
+        segments: u32,
+        k: u32,
+        splits: u32,
+        spread: u32,
+    ) -> *mut mlx_array;
+    /// TEST-ONLY: the planes decoded to half `[n, k]` by the tiles' decode,
+    /// compiled in the fast-math build (`build` 0) or the epilogue build (1).
+    pub fn mlx_test_gguf_planes_dequant(
+        planes: *mut mlx_array,
+        fmt: u32,
+        n: u32,
+        k: u32,
+        build: u32,
+    ) -> *mut mlx_array;
+    /// TEST-ONLY: the GPU seconds of each of `n` arrays evaluated alone, in
+    /// order, each in one command buffer. False without Metal, on error, or
+    /// unless MLX_MAX_OPS_PER_BUFFER and MLX_MAX_MB_PER_BUFFER are 1000000 or
+    /// more.
+    pub fn mlx_test_gguf_planes_gpu_seconds(
+        outs: *const *mut mlx_array,
+        n: usize,
+        seconds: *mut f64,
+    ) -> bool;
+    /// TEST-ONLY: this thread's planes fault, 0 = none.
+    pub fn mlx_test_gguf_planes_mutation(mutation: i32);
+    /// TEST-ONLY: the metallib the decode primitives built next on this
+    /// thread take their kernels from; null for the prebuilt one.
+    pub fn mlx_test_gguf_planes_library(path: *const std::ffi::c_char);
+    /// TEST-ONLY: the path of `gguf_planes_test.metallib` for every thread
+    /// (see [`gguf_planes_use_test_library`]).
+    pub fn mlx_test_gguf_planes_test_library(path: *const std::ffi::c_char);
+    /// TEST-ONLY: `gguf_planes_test.metallib` against the test-only kernel
+    /// names: "missing"/"unexpected" lines into `report`, its function count
+    /// into `count`. False without Metal, without the path or on error.
+    pub fn mlx_test_gguf_planes_test_metallib_check(
+        count: *mut i64,
+        report: *mut std::ffi::c_char,
+        len: usize,
+    ) -> bool;
+}
+
+/// TEST-ONLY: the planes' test-only kernels (the decode checks and the fp32
+/// epilogue fault kernels), linked by build.rs beside `paged_attn.metallib`
+/// and never shipped.
+pub const GGUF_PLANES_TEST_METALLIB: &std::ffi::CStr = match std::ffi::CStr::from_bytes_with_nul(
+    concat!(env!("OUT_DIR"), "/gguf_planes_test.metallib\0").as_bytes(),
+) {
+    Ok(path) => path,
+    Err(_) => panic!("the test metallib path has an inner NUL"),
+};
+
+/// TEST-ONLY: points the planes' test kernels at
+/// [`GGUF_PLANES_TEST_METALLIB`], for every thread of this process.
+pub fn gguf_planes_use_test_library() {
+    // SAFETY: a NUL-terminated path; the bridge copies it.
+    unsafe { mlx_test_gguf_planes_test_library(GGUF_PLANES_TEST_METALLIB.as_ptr()) }
 }

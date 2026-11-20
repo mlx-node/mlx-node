@@ -63,6 +63,42 @@ impl KvFormat {
     }
 }
 
+/// Whether a load rounds activations to int8 where that is faster (Splash
+/// `--activations`, `ops::Int8Activations`). That is paged attention
+/// over INT8 pages on Apple10+ (M5): with `Auto`, a query row at KV index
+/// `p` scores INT8 query codes against the INT8 keys iff `p` is at or past
+/// `prefill_plan::int8_query_from` (7,168), in every pass alike (prefill,
+/// verify, AR decode, batched and ragged lanes, portable chunks), so a row
+/// scores the same whatever launch holds it. `Bf16` keeps every query
+/// bf16. A load that names none takes its family's default
+/// (`crate::models::qwen3_5::load_plan::default_activations`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activations {
+    Auto,
+    Bf16,
+}
+
+impl Activations {
+    /// `"auto"` / `"bf16"` (case-insensitive); `None` or empty is `absent`.
+    pub fn parse(value: Option<&str>, absent: Self) -> std::result::Result<Self, String> {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") => Ok(absent),
+            Some("auto") => Ok(Self::Auto),
+            Some("bf16") => Ok(Self::Bf16),
+            Some(other) => Err(format!(
+                "unknown activations {other:?}: expected \"auto\" or \"bf16\""
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Bf16 => "bf16",
+        }
+    }
+}
+
 /// One layer's block of new rows, for [`KVCache::store_block`].
 pub(crate) enum KvBlock {
     /// BF16 `[B, H, T, D]` rows (any strides).

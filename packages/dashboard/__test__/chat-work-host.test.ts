@@ -4,13 +4,25 @@
  * keeps, the deny when no page is left to answer, and the notice when a command prints a provider key.
  */
 
-import { mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
-import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
+import { TranscriptReducer } from '../src/agent-sessions/transcript.js';
+import { FAILURE_MESSAGES } from '../src/chat/agent/agent-host.js';
 import { WORK_GUARD_PREFIX, workGuardHookName, workGuardManifest } from '../src/chat/agent/profiles.js';
 import { REDACTED } from '../src/chat/redact.js';
 import type { PermissionInteraction, PlanInteraction } from '../src/chat/types.js';
@@ -589,4 +601,475 @@ describe('a printed key', () => {
       { providers },
     );
   });
+});
+
+describe('workflow runs', () => {
+  const gates: string[] = [];
+  afterEach(() => {
+    for (const dir of gates.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Paths in a fresh folder; the fake waits for each to exist. */
+  function gateFiles(): { child: string; complete: string; wakeEnd: string } {
+    const dir = mkdtempSync(join(tmpdir(), 'mlx-wf-gate-'));
+    gates.push(dir);
+    return { child: join(dir, 'child'), complete: join(dir, 'complete'), wakeEnd: join(dir, 'wake-end') };
+  }
+
+  /** `work-workflow-run` with the step's options merged in; `more` adds prompts after the first. */
+  function workflow(options: Json, more: Json[] = []): (scenario: Json) => void {
+    return (scenario) => {
+      const prompts = scenario.prompts as Json[];
+      const steps = prompts[0]!.steps as Json[];
+      steps[1] = { workflow: { ...(steps[1]!.workflow as Json), ...options } };
+      scenario.prompts = [{ ...prompts[0], match: 'p1' }, ...more];
+    };
+  }
+
+  /** Turn p1 to its end with the `workflow` start allowed; the run is live after it. */
+  async function startRun(fake: FakeHost, id: string): Promise<void> {
+    const turn = start(fake, id, 'p1');
+    const card = await nth(fake, 1, 'permission');
+    expect(card.toolName).toBe('workflow');
+    fake.host.answer(id, card.id, 'allow-once');
+    expect((await turn.done).outcome).toBe('completed');
+    expect(fake.host.runs(id)).toEqual([{ runId: 'wf_1', stopping: false }]);
+  }
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const asked = (fake: FakeHost, method: string) => fake.sent().filter((m) => m.method === method);
+
+  it('the idle stop waits while a run is active and while its wake turn runs; it stops the agent after both', async () => {
+    const g = gateFiles();
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        expect(fake.host.modeState()).toMatchObject({ turnsInFlight: 0, background: 1 });
+        expect(fake.host.active()).toEqual([
+          { sessionId: id, busy: false, waiting: false, stopping: false, background: true },
+        ]);
+        await sleep(600);
+        expect(fake.host.modeState().state).toBe('ready');
+        writeFileSync(g.child, '');
+        const card = await nth(fake, 2, 'permission');
+        expect(card.from).toEqual({ label: 'researcher-0', run: 'deep-research', cwd: null });
+        fake.host.answer(id, card.id, 'allow-once');
+        await until(() => fake.events.turns.some((t) => t.turn?.origin === 'wake'));
+        expect(fake.host.runs(id)).toEqual([]);
+        await sleep(600);
+        expect(fake.host.modeState()).toMatchObject({ state: 'ready', background: 1 });
+        writeFileSync(g.wakeEnd, '');
+        await until(() => fake.host.modeState().state === 'stopped', 5_000);
+        expect(fake.events.ends.map((e) => e.result.outcome)).toEqual(['completed', 'completed']);
+        expect(fake.events.cold).toEqual([[id]]);
+      },
+      { timings: { idleStopMs: 300 }, mutate: workflow({ childOn: g.child, wakeEndOn: g.wakeEnd }) },
+    );
+  }, 20_000);
+
+  it('the agent sends no live prompt for the wake: the host gives the transcript a wake row before its answer', async () => {
+    const g = gateFiles();
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        writeFileSync(g.complete, '');
+        await until(() => fake.events.ends.length === 2, 5_000);
+        const prompts = fake.events.updates.filter(
+          (u) => u.sessionId === id && u.line.update.sessionUpdate === 'user_message_chunk',
+        );
+        const mine = fake.events.updates.filter((u) => u.sessionId === id).map((u) => u.line.update);
+        const terminal = mine.find((u) => u.sessionUpdate === 'workflow_updated' && u.status === 'complete');
+        const promptId = `workflow-completed-wf_1-${String(terminal!.revision)}`;
+        expect(prompts.map((u) => u.line.update)).toEqual([
+          {
+            sessionUpdate: 'user_message_chunk',
+            content: { type: 'text', text: '' },
+            _meta: { hideFromScrollback: true, mlxWakePromptId: promptId },
+          },
+        ]);
+        expect(mine.find((u) => u.sessionUpdate === 'turn_completed' && u.prompt_id === promptId)).toBeDefined();
+        const reducer = new TranscriptReducer();
+        for (const u of fake.events.updates) if (u.sessionId === id) reducer.apply(u.line);
+        const entries = reducer.snapshot().entries;
+        const wake = entries.findIndex((e) => e.kind === 'wake');
+        expect(entries[wake]).toMatchObject({
+          kind: 'wake',
+          cause: 'workflow',
+          workflow: { name: 'deep-research', status: 'complete' },
+        });
+        expect(entries.slice(wake + 1).find((e) => e.kind === 'assistant')).toMatchObject({
+          text: 'The report is ready.',
+        });
+      },
+      { mutate: workflow({ ask: false, completeOn: g.complete, wakeEndAfterMs: 0 }) },
+    );
+  }, 20_000);
+
+  // Mutation: drop the host line's prompt id (`due` always null in startWake) → the row reads cause 'unknown'.
+  it('the wake row names its run from its first line, before the wake ends', async () => {
+    const g = gateFiles();
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        writeFileSync(g.complete, '');
+        await until(() => fake.events.turns.some((t) => t.turn?.origin === 'wake'));
+        await until(() =>
+          fake.events.updates.some((u) => u.sessionId === id && u.line.update.sessionUpdate === 'agent_message_chunk'),
+        );
+        expect(fake.events.ends).toHaveLength(1);
+        const reducer = new TranscriptReducer();
+        for (const u of fake.events.updates) if (u.sessionId === id) reducer.apply(u.line);
+        expect(reducer.snapshot().entries.filter((e) => e.kind === 'wake')).toMatchObject([
+          { kind: 'wake', cause: 'workflow', workflow: { name: 'deep-research', status: 'complete' } },
+        ]);
+        writeFileSync(g.wakeEnd, '');
+        await until(() => fake.events.ends.length === 2, 5_000);
+      },
+      { mutate: workflow({ ask: false, completeOn: g.complete, wakeEndOn: g.wakeEnd }) },
+    );
+  }, 20_000);
+
+  // Mutation: drop the reducer's merge of a hidden chunk into the host's empty wake row → two wake rows.
+  it('an agent that also sends its wake prompt live still makes one wake row, with its text', async () => {
+    const g = gateFiles();
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        writeFileSync(g.complete, '');
+        await until(() => fake.events.ends.length === 2, 5_000);
+        const prompts = fake.events.updates.filter(
+          (u) => u.sessionId === id && u.line.update.sessionUpdate === 'user_message_chunk',
+        );
+        expect(prompts.map((u) => (u.line.update.content as Json).text)).toEqual([
+          '',
+          'A workflow finished. Read its report.',
+        ]);
+        const reducer = new TranscriptReducer();
+        for (const u of fake.events.updates) if (u.sessionId === id) reducer.apply(u.line);
+        const entries = reducer.snapshot().entries;
+        expect(entries.filter((e) => e.kind === 'wake')).toMatchObject([
+          {
+            kind: 'wake',
+            cause: 'workflow',
+            workflow: { name: 'deep-research', status: 'complete' },
+            text: 'A workflow finished. Read its report.',
+          },
+        ]);
+        expect(entries.filter((e) => e.kind === 'user')).toEqual([]);
+      },
+      { mutate: workflow({ ask: false, completeOn: g.complete, wakeEndAfterMs: 0, wakeEcho: true }) },
+    );
+  }, 20_000);
+
+  it('a stale host waits for the run; a changed endpoint stops the run, and the stale restart follows', async () => {
+    const g = gateFiles();
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        fake.host.markStale();
+        await sleep(300);
+        expect(fake.host.modeState()).toMatchObject({ state: 'ready', stale: true });
+        expect(asked(fake, '_x.ai/workflows/stop')).toEqual([]);
+        fake.endpoint.current = { ...fake.endpoint.current!, url: 'http://127.0.0.1:9' };
+        await fake.host.checkEndpoint();
+        await until(() => asked(fake, '_x.ai/workflows/stop').length > 0);
+        expect(asked(fake, '_x.ai/workflows/stop').map((m) => m.params)).toEqual([{ sessionId: id, runId: 'wf_1' }]);
+        await until(() => fake.host.modeState().state === 'stopped', 5_000);
+        expect(fake.host.runs(id)).toEqual([]);
+        expect(fake.events.turns.some((t) => t.turn?.origin === 'wake')).toBe(false);
+      },
+      { mutate: workflow({ childOn: g.child }) },
+    );
+  }, 20_000);
+
+  it('the wake turn shows as a turn with origin wake; its ask is a card; Stop sends session/cancel and ends it', async () => {
+    const g = gateFiles();
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        writeFileSync(g.complete, '');
+        await until(() => fake.events.turns.some((t) => t.turn?.origin === 'wake'));
+        const wake = fake.host.turnState(id)!;
+        expect(wake).toMatchObject({ phase: 'running', wait: null, origin: 'wake' });
+        expect(fake.host.isBusy(id)).toBe(true);
+        expect(() => start(fake, id, 'p1')).toThrow(FAILURE_MESSAGES['conversation-busy']);
+        const card = await nth(fake, 2, 'permission');
+        expect([card.command, card.from]).toEqual(['pwd', undefined]);
+        expect(fake.host.cancel(id)).toBe(true);
+        expect(fake.events.closed.at(-1)).toEqual({ sessionId: id, id: card.id, reason: 'cancelled' });
+        await until(() => fake.events.ends.length === 2);
+        expect(asked(fake, 'session/cancel').map((m) => m.params)).toEqual([{ sessionId: id }]);
+        expect(fake.events.ends[1]!.result).toEqual({ turnId: wake.turnId, outcome: 'cancelled' });
+        expect(fake.host.turnState(id)).toBeNull();
+        expect(fake.host.isBusy(id)).toBe(false);
+      },
+      { mutate: workflow({ ask: false, completeOn: g.complete, wakeAsk: true }) },
+    );
+  }, 20_000);
+
+  it('Stop run: delete and model change wait for it; it sends the stop, closes the run card, and no wake follows', async () => {
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        const card = await nth(fake, 2, 'permission');
+        expect(card.from?.run).toBe('deep-research');
+        expect(fake.host.isBusy(id)).toBe(false);
+        expect(fake.host.isWorking(id)).toBe(true);
+        await expect(fake.host.deleteSession(id, fake.project)).rejects.toMatchObject({ code: 'conversation-busy' });
+        await expect(fake.host.setModel(id, 'qwen3.5-9b')).rejects.toMatchObject({ code: 'conversation-busy' });
+        expect(await fake.host.stopRun(id, 'wf_other')).toBe('not-live');
+        expect(await fake.host.stopRun(id, 'wf_1')).toBe('stopped');
+        expect(fake.events.closed.at(-1)).toEqual({ sessionId: id, id: card.id, reason: 'cancelled' });
+        expect(asked(fake, '_x.ai/workflows/stop').map((m) => m.params)).toEqual([{ sessionId: id, runId: 'wf_1' }]);
+        await until(() => fake.host.runs(id).length === 0);
+        await sleep(200);
+        expect(fake.events.turns.some((t) => t.turn?.origin === 'wake')).toBe(false);
+        expect(fake.records().find((r) => r.kind === 'child-answer')?.answer).toBeNull();
+        expect(fake.host.modeState().background).toBe(0);
+        await fake.host.deleteSession(id, fake.project);
+      },
+      { mutate: workflow({}) },
+    );
+  }, 20_000);
+
+  it('the agent gone: runs leave, their cards close, a running wake ends as agent-crashed', async () => {
+    const g = gateFiles();
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        const card = await nth(fake, 2, 'permission');
+        const pid = fake.records().find((r) => r.kind === 'start')!.pid as number;
+        process.kill(pid, 'SIGKILL');
+        await until(() => fake.host.runs(id).length === 0);
+        expect(fake.events.closed.at(-1)).toEqual({ sessionId: id, id: card.id, reason: 'cancelled' });
+        expect(fake.events.runs.at(-1)).toEqual({ sessionId: id, runs: [] });
+        expect(fake.host.modeState()).toMatchObject({ state: 'crashed', background: 0 });
+      },
+      { mutate: workflow({ wake: false }) },
+    );
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        writeFileSync(g.complete, '');
+        await until(() => fake.events.turns.some((t) => t.turn?.origin === 'wake'));
+        const pid = fake.records().find((r) => r.kind === 'start')!.pid as number;
+        process.kill(pid, 'SIGKILL');
+        await until(() => fake.events.ends.length === 2);
+        expect(fake.events.ends[1]!.result).toMatchObject({
+          outcome: 'agent-crashed',
+          failure: { code: 'agent-crashed' },
+        });
+        expect(fake.host.turnState(id)).toBeNull();
+        expect(fake.host.modeState().background).toBe(0);
+      },
+      { mutate: workflow({ ask: false, completeOn: g.complete, wakeEndOn: g.wakeEnd }) },
+    );
+  }, 20_000);
+
+  it('a helper ask after the typed turn: a card in Ask; allowed with its history line in Bypass', async () => {
+    const g = gateFiles();
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        writeFileSync(g.child, '');
+        const card = await nth(fake, 2, 'permission');
+        expect([card.command, card.from]).toEqual(['ls', { label: 'researcher-0', run: 'deep-research', cwd: null }]);
+        fake.host.answer(id, card.id, 'allow-once');
+        await until(() => fake.records().some((r) => r.kind === 'child-answer'));
+        expect(fake.records().find((r) => r.kind === 'child-answer')?.answer).toBe('allow-once');
+      },
+      { mutate: workflow({ childOn: g.child, wake: false }) },
+    );
+    const marks: unknown[] = [];
+    const allowAllGates = gateFiles();
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        const turn = start(fake, id, 'p1');
+        expect((await turn.done).outcome).toBe('completed');
+        writeFileSync(allowAllGates.child, '');
+        await until(() => fake.records().some((r) => r.kind === 'child-answer'));
+        expect(fake.records().find((r) => r.kind === 'child-answer')?.answer).toBe('allow-once');
+        expect(fake.events.interactions).toEqual([]);
+        expect(marks).toMatchObject([
+          { toolCallId: 'toolu_1' },
+          { toolCallId: 'wf_1-call-1', card: { from: { label: 'researcher-0', run: 'deep-research', cwd: null } } },
+        ]);
+      },
+      {
+        mutate: workflow({ childOn: allowAllGates.child, wake: false }),
+        permission: { modeOf: () => 'bypass', watched: () => true },
+        onModeAllowed: async (_id, mark) => {
+          marks.push(mark);
+          return true;
+        },
+      },
+    );
+  }, 20_000);
+
+  /** Prompt p2: a typed turn that stays open until Stop. */
+  const openTurn: Json = { match: 'p2', steps: [{ sleepMs: 60_000 }, { end: { stopReason: 'end_turn' } }] };
+
+  /** Bypass, with the marks of the calls it allowed. */
+  function bypass(marks: { toolCallId: string }[]): FakeHostOptions {
+    return {
+      permission: { modeOf: () => 'bypass', watched: () => true },
+      onModeAllowed: async (_id, mark) => {
+        marks.push(mark);
+        return true;
+      },
+    };
+  }
+
+  it('Bypass: a late ask of an ended run, while a typed turn is open, is answered cancelled', async () => {
+    const g = gateFiles();
+    const marks: { toolCallId: string }[] = [];
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        expect((await start(fake, id, 'p1').done).outcome).toBe('completed');
+        expect(fake.host.runs(id)).toEqual([{ runId: 'wf_1', stopping: false }]);
+        const turn = start(fake, id, 'p2');
+        await until(() => fake.host.turnState(id) !== null);
+        writeFileSync(g.complete, '');
+        await until(() => fake.records().some((r) => r.kind === 'child-answer'));
+        expect(fake.host.runs(id)).toEqual([]);
+        expect(fake.records().find((r) => r.kind === 'child-answer')?.answer).toBeNull();
+        expect(marks.map((m) => m.toolCallId)).toEqual(['toolu_1']);
+        expect(fake.events.interactions).toEqual([]);
+        expect(fake.host.cancel(id)).toBe(true);
+        expect((await turn.done).outcome).toBe('cancelled');
+      },
+      { mutate: workflow({ completeOn: g.complete, askAfterEnd: true, wake: false }, [openTurn]), ...bypass(marks) },
+    );
+  }, 20_000);
+
+  it('Bypass: an ask of a run that is stopping, while a typed turn is open, is answered cancelled', async () => {
+    const g = gateFiles();
+    const stopGate = join(dirname(g.child), 'stop');
+    const marks: { toolCallId: string }[] = [];
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        expect((await start(fake, id, 'p1').done).outcome).toBe('completed');
+        const turn = start(fake, id, 'p2');
+        await until(() => fake.host.turnState(id) !== null);
+        const stopped = fake.host.stopRun(id, 'wf_1');
+        expect(fake.host.runs(id)).toEqual([{ runId: 'wf_1', stopping: true }]);
+        writeFileSync(g.child, '');
+        await until(() => fake.records().some((r) => r.kind === 'child-answer'));
+        expect(fake.records().find((r) => r.kind === 'child-answer')?.answer).toBeNull();
+        expect(marks.map((m) => m.toolCallId)).toEqual(['toolu_1']);
+        expect(fake.events.interactions).toEqual([]);
+        writeFileSync(stopGate, '');
+        expect(await stopped).toBe('stopped');
+        await until(() => fake.host.runs(id).length === 0);
+        expect(fake.host.cancel(id)).toBe(true);
+        expect((await turn.done).outcome).toBe('cancelled');
+      },
+      {
+        mutate: workflow({ childOn: g.child, completeOn: g.complete, stopOn: stopGate, wake: false }, [openTurn]),
+        ...bypass(marks),
+      },
+    );
+  }, 20_000);
+
+  it('a stale host keeps the agent for the wake of an ended run; it restarts after the wake, or at the idle stop', async () => {
+    const g = gateFiles();
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        fake.host.markStale();
+        writeFileSync(g.complete, '');
+        await until(() => fake.events.turns.some((t) => t.turn?.origin === 'wake'));
+        expect(fake.host.modeState()).toMatchObject({ state: 'ready', stale: true });
+        writeFileSync(g.wakeEnd, '');
+        await until(() => fake.host.modeState().state === 'stopped', 5_000);
+        expect(fake.events.ends.map((e) => e.result.outcome)).toEqual(['completed', 'completed']);
+        expect(fake.host.modeState().stale).toBe(false);
+      },
+      { mutate: workflow({ ask: false, completeOn: g.complete, wakeEndOn: g.wakeEnd }) },
+    );
+    const quiet = gateFiles();
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        fake.host.markStale();
+        writeFileSync(quiet.complete, '');
+        await until(() => fake.host.runs(id).length === 0);
+        expect(fake.host.modeState()).toMatchObject({ state: 'ready', stale: true });
+        await until(() => fake.host.modeState().state === 'stopped', 5_000);
+        expect(fake.host.modeState().stale).toBe(false);
+        expect(fake.events.turns.some((t) => t.turn?.origin === 'wake')).toBe(false);
+      },
+      { timings: { idleStopMs: 300 }, mutate: workflow({ ask: false, completeOn: quiet.complete, wake: false }) },
+    );
+  }, 20_000);
+
+  it("Deny on a run helper's card during a typed turn leaves the typed turn not denied", async () => {
+    const g = gateFiles();
+    await withWork(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        const turn = start(fake, id, 'p2');
+        const own = await nth(fake, 2, 'permission');
+        expect([own.command, own.from]).toEqual(['ls', undefined]);
+        writeFileSync(g.child, '');
+        const helper = await nth(fake, 3, 'permission');
+        expect(helper.from?.label).toBe('researcher-0');
+        fake.host.answer(id, helper.id, 'reject-once');
+        await until(() => fake.records().some((r) => r.kind === 'child-answer'));
+        expect(fake.host.openInteractions(id).map((i) => i.id)).toEqual([own.id]);
+        fake.host.answer(id, own.id, 'allow-once');
+        expect((await turn.done).outcome).toBe('completed');
+      },
+      {
+        mutate: workflow({ childOn: g.child, command: 'cat a.txt', wake: false }, [
+          {
+            match: 'p2',
+            steps: [
+              {
+                permission: {
+                  toolName: 'run_terminal_command',
+                  kind: 'execute',
+                  title: 'Execute `ls`',
+                  rawInput: { variant: 'Bash', command: 'ls', description: 'list', is_background: false },
+                },
+              },
+              { end: { stopReason: 'end_turn' } },
+            ],
+          },
+        ]),
+      },
+    );
+  }, 20_000);
 });

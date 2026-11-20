@@ -9,11 +9,14 @@ import { act, createElement, type ReactElement } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+import { motionX } from '../ui/src/components/arc-x/motion/motion.js';
+import { orbFrame } from '../ui/src/components/arc-x/wait-orb/engine.js';
+import { foldFrame } from '../ui/src/components/arc-x/wait-orb/fold.js';
 import { WaitOrb, type WaitOrbState } from '../ui/src/components/arc-x/wait-orb/wait-orb.js';
 import { skipAnimations } from './render.js';
 
 const ARC_X = join(import.meta.dirname, '../ui/src/components/arc-x');
-const STATES: readonly WaitOrbState[] = ['hold', 'load', 'think'];
+const STATES: readonly WaitOrbState[] = ['hold', 'load', 'think', 'fold'];
 
 interface Mounted {
   container: HTMLElement;
@@ -167,6 +170,15 @@ describe('WaitOrb', () => {
     expect(frames).not.toHaveBeenCalled();
     expect(draws.length).toBe(STATES.length * 2);
     expect(draws.every((draw) => draw.dots > 0)).toBe(true);
+  });
+
+  it('the fold state paints the compaction shape: its still frame dot for dot', () => {
+    const { draws } = stubContext();
+    stubInView();
+    const view = mount(createElement(WaitOrb, { state: 'fold' }));
+    view.unmount();
+    expect(draws.map((draw) => draw.dots)).toEqual([foldFrame(motionX.orb.still).length]);
+    expect(draws[0]!.dots).not.toBe(orbFrame('band', motionX.orb.still).length);
   });
 
   it('with motion draws 30 times per second: ticks at 0, 10, 20, 34, 50, 67 ms are 3 draws', async () => {

@@ -28,7 +28,7 @@ import {
   sendRequestQuarantined,
 } from '../errors.js';
 import type { IdleSweeper } from '../idle-sweeper.js';
-import { withAdmissionControlledInference } from '../inference-admission.js';
+import { residentSessionRegistry, withAdmissionControlledInference } from '../inference-admission.js';
 import { mapRequest, reconstructMessagesFromChain, stringifyStoredInputMessages } from '../mappers/request.js';
 import {
   buildPartialResponse,
@@ -75,7 +75,7 @@ import {
   writeFallbackErrorSSE,
 } from '../transport-visibility.js';
 import { QUARANTINE_MESSAGE, requestFingerprint, type TurnJournal } from '../turn-journal.js';
-import type { TracedChatConfig } from '../turn-trace.js';
+import { clientSessionOf, type TracedChatConfig } from '../turn-trace.js';
 import type {
   FunctionCallOutputItem,
   MessageOutputItem,
@@ -1667,6 +1667,7 @@ export async function handleCreateResponse(
   /** Lazy-load hook. See the call site below and `ServerConfig.resolveModel`. */
   resolveModel?: (name: string) => Promise<void>,
   turnJournal?: TurnJournal,
+  bindLoadedModel?: (name: string) => boolean,
 ): Promise<void> {
   if (modelWorkCoordinator) {
     registry.setModelLoadAdmissionCoordinator(modelWorkCoordinator);
@@ -1771,7 +1772,7 @@ export async function handleCreateResponse(
   // handoff, so the unconditional release is always safe).
   let preDispatchAdmission: PreDispatchAdmission | undefined;
   let modelLoadAdmission: ModelLoadAdmission | undefined;
-  const preDispatchRegistry = registry.getSessionRegistry(body.model);
+  const preDispatchRegistry = residentSessionRegistry(registry, body.model, bindLoadedModel, modelWorkCoordinator);
   if (preDispatchRegistry) {
     try {
       preDispatchAdmission = preDispatchRegistry.beginPreDispatchAdmission();
@@ -2389,6 +2390,8 @@ export async function handleCreateResponse(
     // Stamp the requesting alias so the shared model wrapper attributes the
     // turn to the name the client used, not the binding's first registration.
     (config as TracedChatConfig).modelAlias = body.model;
+    const clientSession = clientSessionOf(httpReq?.headers);
+    if (clientSession !== undefined) (config as TracedChatConfig).clientSession = clientSession;
 
     // New-only messages (what this request added). Instructions are
     // stored separately — persisting them as input messages would

@@ -20,6 +20,12 @@
 // Queries are KV-head-major [KV][chunk_stride][G][D] (Splash Staging), so a
 // tile's fused rows form one contiguous M x D tensor. The reduce writes the
 // output token-major [rows][query heads][D].
+//
+// Over INT8 pages each split kernel also has an INT8-query entry (`q8q`,
+// Splash Int8Queries): it quantizes its tile's queries once, a scale per
+// fused row by the int8-activation rule, and scores the codes against the
+// INT8 keys, exact in int32 (|sum| < 2^22 at 256 dimensions). The decode
+// kernels read the same codes from paged_prefill_attention_query_codes.
 
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #include <metal_stdlib>
@@ -33,6 +39,10 @@ using namespace mpp::tensor_ops;
 #define PAGED_PREFILL_MAX_SPLITS 128u
 #define PAGED_PREFILL_HALF_TOKENS 16u
 #define PAGED_PREFILL_THREADS 256u
+// Lanes of one fused row in the page loop: the softmax's, eight of a page's
+// tokens each, and the query quantizer's, so each lane holds its own row's
+// query scale (Splash SplashAttentionLanesPerRow).
+#define PAGED_PREFILL_LANES_PER_ROW 4u
 
 // Mirrored by the host's PagedPrefillParams (mlx_paged_dispatch.h).
 struct PagedPrefillParams {
@@ -55,6 +65,12 @@ constexpr uint paged_prefill_tile_parts(uint group) {
 template <uint HeadDim> constexpr float paged_prefill_scale() {
   static_assert(HeadDim == 128 || HeadDim == 256, "a score scale for each compiled head dimension");
   return HeadDim == 256 ? 0.0625f : 0.08838834764831845f;
+}
+
+// The score scale of a row of INT8 query codes, in the tile and in the
+// decode kernels alike: the literal times the row scale, one product.
+template <uint HeadDim> inline float paged_int8_score_scale(float row_scale) {
+  return paged_prefill_scale<HeadDim>() * row_scale;
 }
 
 // Splash splash_prefill_attention_contract_valid; an invalid contract makes
@@ -126,13 +142,110 @@ inline uint paged_prefill_pages_per_split(uint pages, uint splits) {
   return (pages + splits - 1) / splits;
 }
 
-// Splash splash_attention_page_softmax over one 32-token page. An INT8
-// lane's eight tokens lie in one pool block; a block past the tile's visible
-// tokens is never looked up in the table, its lanes read the page's first
-// block's scales and the select masks them.
-template <uint Group, uint Rows, uint HeadDim, bool Quantized>
+// Splash int8_activations.h, the int8-activation rule:
+// - x codes as q = clamp(rint(x * (127 / m)), -127, 127), ties to even, and
+//   stands for q * s, s = m / 127, m the block's largest magnitude; both
+//   quotients are correctly rounded (precise::divide), so a host reference
+//   computes the same codes and scales bit for bit;
+// - a block whose m is 2^-100 or less codes as zeros with scale 0;
+// - a block holding an infinity or a NaN takes a NaN scale made from its
+//   bits (fast math cannot fold it); its row's scores are NaN, as in bf16.
+struct PagedInt8Block {
+  float scale;
+  float inverse;
+};
+
+inline PagedInt8Block paged_int8_activation_block(float largest) {
+  const bool coded = largest > 0x1p-100f;
+  return {coded ? precise::divide(largest, 127.0f) : 0.0f,
+          coded ? precise::divide(127.0f, largest) : 0.0f};
+}
+
+inline int4 paged_int8_activation_code(float4 x, float inverse) {
+  return int4(clamp(rint(x * inverse), -127.0f, 127.0f));
+}
+
+inline uint paged_int8_activation_bits(float value, bool finite) {
+  return finite ? as_type<uint>(value) : 0x7fc00000u;
+}
+
+// A bf16 input is found non-finite by its exponent bits: fast math may fold
+// isfinite() to true.
+inline bool paged_int8_activation_not_finite(bfloat4 value) {
+  return any((as_type<ushort4>(value) & ushort(0x7f80)) == ushort(0x7f80));
+}
+
+// INT8 codes as the tile stores them (char) and as the decode kernels read
+// them (bf16; |q| <= 127 is exact).
+template <typename Code> struct PagedInt8Codes;
+template <> struct PagedInt8Codes<int8_t> {
+  using Vec = char4;
+  static Vec of(int4 code) { return char4(code); }
+};
+template <> struct PagedInt8Codes<bfloat> {
+  using Vec = bfloat4;
+  static Vec of(int4 code) { return bfloat4(float4(code)); }
+};
+
+// Splash splash_attention_query_codes for one lane: a fused query row (one
+// row, one query head) is quantized by its four adjacent lanes, a quarter of
+// its dimensions each; two xor shuffles give the row's largest magnitude and
+// finiteness. Writes the quarter's codes and returns the row's scale (NaN
+// for a row holding an infinity or a NaN).
+template <uint HeadDim, typename Code>
+inline float paged_int8_quantize_quarter(device const bfloat *row_quarter,
+                                         device Code *codes_quarter) {
+  constexpr uint LanesPerRow = PAGED_PREFILL_LANES_PER_ROW;
+  static_assert(LanesPerRow == 4, "two xor shuffles reduce a row's four lanes");
+  constexpr uint Quarter = HeadDim / LanesPerRow;
+  device const bfloat4 *source = reinterpret_cast<device const bfloat4 *>(row_quarter);
+  float maximum = 0.0f;
+  uint finite = 1;
+#pragma unroll
+  for (uint i = 0; i < Quarter / 4; ++i) {
+    const bfloat4 query = source[i];
+    finite &= !paged_int8_activation_not_finite(query);
+    const float4 value = abs(float4(query));
+    maximum = max(maximum, max(max(value.x, value.y), max(value.z, value.w)));
+  }
+  maximum = max(maximum, simd_shuffle_xor(maximum, 1));
+  maximum = max(maximum, simd_shuffle_xor(maximum, 2));
+  finite &= simd_shuffle_xor(finite, 1);
+  finite &= simd_shuffle_xor(finite, 2);
+  const PagedInt8Block block = paged_int8_activation_block(maximum);
+  using Codes = PagedInt8Codes<Code>;
+  device typename Codes::Vec *target =
+      reinterpret_cast<device typename Codes::Vec *>(codes_quarter);
+#pragma unroll
+  for (uint i = 0; i < Quarter / 4; ++i)
+    target[i] = Codes::of(paged_int8_activation_code(float4(source[i]), block.inverse));
+  return as_type<float>(paged_int8_activation_bits(block.scale, finite != 0));
+}
+
+// The tile's M fused query rows as INT8 codes with one scale per row: each
+// of a row's four softmax lanes returns its own row's scale; lanes past
+// 4 x M return 0.
+template <uint M, uint HeadDim>
+inline float paged_prefill_query_codes(device const bfloat *queries,
+                                       device int8_t *codes, uint thread_index) {
+  constexpr uint LanesPerRow = PAGED_PREFILL_LANES_PER_ROW;
+  constexpr uint Quarter = HeadDim / LanesPerRow;
+  if (thread_index >= LanesPerRow * M)
+    return 0.0f;
+  const uint first = thread_index / LanesPerRow * HeadDim +
+                     thread_index % LanesPerRow * Quarter;
+  return paged_int8_quantize_quarter<HeadDim>(queries + first, codes + first);
+}
+
+// Splash splash_attention_page_softmax over one 32-token page: key-scaled
+// scores (fp32, or the int32 products of INT8 queries) times score_scale.
+// An INT8 lane's eight tokens lie in one pool block; a block past the tile's
+// visible tokens is never looked up in the table, its lanes read the page's
+// first block's scales and the select masks them.
+template <uint Group, uint Rows, uint HeadDim, bool Quantized, typename Score>
 inline void paged_prefill_page_softmax(
-    threadgroup const float *scores, threadgroup bfloat *probabilities,
+    threadgroup const Score *scores, float score_scale,
+    threadgroup bfloat *probabilities,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
     device const int *table, device const float *key_scales,
@@ -142,8 +255,8 @@ inline void paged_prefill_page_softmax(
   constexpr uint N = PAGED_PREFILL_PAGE_TOKENS;
   constexpr uint FusedRows = Rows * Group;
   constexpr uint TokensPerLane = 8;
-  constexpr uint LanesPerRow = N / TokensPerLane;
-  constexpr float Scale = paged_prefill_scale<HeadDim>();
+  constexpr uint LanesPerRow = PAGED_PREFILL_LANES_PER_ROW;
+  static_assert(N == LanesPerRow * TokensPerLane, "four lanes of eight tokens span one page");
   static_assert(LanesPerRow * FusedRows <= PAGED_PREFILL_THREADS,
                 "one softmax lane per thread of the 256-thread tile");
   if (thread_index >= LanesPerRow * FusedRows)
@@ -167,17 +280,17 @@ inline void paged_prefill_page_softmax(
     key_scales4 = reinterpret_cast<device const float4 *>(key_scales + slot);
     value_scales4 = reinterpret_cast<device const float4 *>(value_scales + slot);
   }
-  threadgroup const float4 *scores4 =
-      reinterpret_cast<threadgroup const float4 *>(scores + fused_row * N + column);
+  threadgroup const vec<Score, 4> *scores4 =
+      reinterpret_cast<threadgroup const vec<Score, 4> *>(scores + fused_row * N + column);
   float score[TokensPerLane];
   {
-    float4 low = scores4[0], high = scores4[1];
+    float4 low = float4(scores4[0]), high = float4(scores4[1]);
     if constexpr (Quantized) {
       low *= key_scales4[0];
       high *= key_scales4[1];
     }
-    low *= Scale;
-    high *= Scale;
+    low *= score_scale;
+    high *= score_scale;
     score[0] = low.x, score[1] = low.y, score[2] = low.z, score[3] = low.w;
     score[4] = high.x, score[5] = high.y, score[6] = high.z, score[7] = high.w;
   }
@@ -233,8 +346,10 @@ inline void paged_prefill_page_softmax(
 // Splash splash_paged_attention_tile over the pool: one tile (or part) over
 // its split's pages. Only the blocks holding the tile's visible tokens are
 // looked up and read; the K stage of a page's unread block is zero and its
-// half of PV is skipped (its probabilities are zero).
-template <uint Group, uint Rows, uint HeadDim, typename CacheElement>
+// half of PV is skipped (its probabilities are zero). With Int8Queries the
+// query codes live in the threadgroup's own partials slot, which it writes
+// only after its last page.
+template <uint Group, uint Rows, uint HeadDim, typename CacheElement, bool Int8Queries>
 inline void paged_prefill_page_loop(
     device bfloat *tile_queries, device const int *table,
     device CacheElement *key_pool, device CacheElement *value_pool,
@@ -263,19 +378,34 @@ inline void paged_prefill_page_loop(
   if (page_begin >= pages)
     return;
   const uint page_end = min(pages, page_begin + per_split);
+  static_assert(Quantized || !Int8Queries, "INT8 queries take INT8 keys");
+  using QueryElement = conditional_t<Int8Queries, int8_t, bfloat>;
+  using Score = conditional_t<Int8Queries, int, float>;
+  device QueryElement *queries;
+  float score_scale = paged_prefill_scale<HeadDim>();
+  if constexpr (Int8Queries) {
+    queries = reinterpret_cast<device int8_t *>(partials + slot * M * D);
+    score_scale = paged_int8_score_scale<HeadDim>(
+        paged_prefill_query_codes<M, HeadDim>(tile_queries, queries, thread_index));
+  } else {
+    queries = tile_queries;
+  }
   if (thread_index < M) {
     row_max[thread_index] = -INFINITY;
     row_sum[thread_index] = 0.0f;
   }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // The query codes are device writes the whole threadgroup reads.
+  threadgroup_barrier(Int8Queries ? mem_flags::mem_threadgroup | mem_flags::mem_device
+                                  : mem_flags::mem_threadgroup);
 
-  auto qt = tensor(tile_queries, dextents<int, 2>{D, M}, array<int, 2>{1, D});
-  auto st = tensor(scores, dextents<int, 2>{N, M}, array<int, 2>{1, N});
+  threadgroup Score *page_score_tile = reinterpret_cast<threadgroup Score *>(scores);
+  auto qt = tensor(queries, dextents<int, 2>{D, M}, array<int, 2>{1, D});
+  auto st = tensor(page_score_tile, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto pt = tensor(probabilities, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto kt = tensor(keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
   auto value_type = tensor(static_cast<device CacheElement *>(nullptr),
                            dextents<int, 2>{Half, D}, array<int, 2>{1, int(block_size)});
-  auto q0 = qt.slice<D, M>(0, 0);
+  auto q0 = qt.template slice<D, M>(0, 0);
   auto k0 = kt.template slice<D, N>(0, 0);
   auto p0 = pt.template slice<Half, M>(0, 0);
   auto v0 = value_type.template slice<Half, D>(0, 0);
@@ -319,14 +449,15 @@ inline void paged_prefill_page_loop(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     auto page_scores = qk.template get_destination_cooperative_tensor<
-        decltype(q0), decltype(k0), float>();
+        decltype(q0), decltype(k0), Score>();
     qk.run(q0, k0, page_scores);
-    page_scores.store(st.slice<N, M>(0, 0));
+    page_scores.store(st.template slice<N, M>(0, 0));
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    paged_prefill_page_softmax<Group, Rows, HeadDim, Quantized>(
-        scores, probabilities, row_max, row_sum, previous_scale, rescale, table,
+    paged_prefill_page_softmax<Group, Rows, HeadDim, Quantized, Score>(
+        page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale,
+        rescale, table,
         key_scales, value_scales, params, kv_head, token_start, visible_tokens,
         visible_blocks, committed_tokens, active_rows, thread_index);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -365,7 +496,7 @@ inline void paged_prefill_page_loop(
 
 // Splash splash_prefill_attention_split_phase: KV heads (and each one's
 // tile parts) vary first, then query tiles, then history splits.
-template <uint Group, uint HeadDim, typename CacheElement>
+template <uint Group, uint HeadDim, typename CacheElement, bool Int8Queries>
 inline void paged_prefill_split_phase(
     device bfloat *queries, device float *partials, device float *statistics,
     device const int *table, device CacheElement *key_pool,
@@ -383,7 +514,8 @@ inline void paged_prefill_split_phase(
       params.split_count);
   if (!tile.active || split >= tile.splits)
     return;
-  paged_prefill_page_loop<Group, PAGED_PREFILL_TILE_ROWS / Parts, HeadDim, CacheElement>(
+  paged_prefill_page_loop<Group, PAGED_PREFILL_TILE_ROWS / Parts, HeadDim, CacheElement,
+                          Int8Queries>(
       queries + tile.offset, table, key_pool, value_pool, key_scales, value_scales,
       params, kv_head, tile.first_position, tile.active_rows, tile.splits, split,
       partials, statistics, tile.first_slot + split, scores, probabilities, keys,
@@ -467,7 +599,7 @@ inline void paged_prefill_reduce_phase(device const float *partials,
       fused_row % PartM, thread_index, weights, group_values);
 }
 
-#define PAGED_PREFILL_SPLIT(Name, Group, HeadDim, CacheElement)                 \
+#define PAGED_PREFILL_SPLIT(Name, Group, HeadDim, CacheElement, Int8Queries)    \
   [[kernel, max_total_threads_per_threadgroup(256)]] void Name(                \
       device bfloat *queries [[buffer(0)]],                                    \
       device float *partials [[buffer(1)]],                                    \
@@ -490,7 +622,7 @@ inline void paged_prefill_reduce_phase(device const float *partials,
     threadgroup float row_sum[M];                                              \
     threadgroup float previous_scale[M];                                       \
     threadgroup atomic_uint rescale;                                           \
-    paged_prefill_split_phase<Group, HeadDim, CacheElement>(                   \
+    paged_prefill_split_phase<Group, HeadDim, CacheElement, Int8Queries>(      \
         queries, partials, statistics, table, key_pool, value_pool,            \
         key_scales, value_scales, params, scores, probabilities, keys,         \
         row_max, row_sum, previous_scale, &rescale, group, thread_index);      \
@@ -513,9 +645,11 @@ inline void paged_prefill_reduce_phase(device const float *partials,
 
 #define PAGED_PREFILL_INSTANCES(Group, HeadDim)                                 \
   PAGED_PREFILL_SPLIT(paged_prefill_attention_q8_split_g##Group##_d##HeadDim,   \
-                      Group, HeadDim, int8_t)                                  \
+                      Group, HeadDim, int8_t, false)                           \
+  PAGED_PREFILL_SPLIT(paged_prefill_attention_q8q_split_g##Group##_d##HeadDim,  \
+                      Group, HeadDim, int8_t, true)                            \
   PAGED_PREFILL_SPLIT(paged_prefill_attention_bf16_split_g##Group##_d##HeadDim, \
-                      Group, HeadDim, bfloat)                                  \
+                      Group, HeadDim, bfloat, false)                           \
   PAGED_PREFILL_REDUCE(paged_prefill_attention_reduce_g##Group##_d##HeadDim,    \
                        Group, HeadDim)
 
@@ -527,3 +661,61 @@ PAGED_PREFILL_INSTANCES(8, 128)
 PAGED_PREFILL_INSTANCES(8, 256)
 PAGED_PREFILL_INSTANCES(16, 128)
 PAGED_PREFILL_INSTANCES(16, 256)
+
+// Mirrored by the host's PagedQueryCodesParams (mlx_paged_dispatch.h).
+struct PagedQueryCodesParams {
+  uint rows;
+  uint query_heads;
+  uint from;
+  float scale;
+};
+
+// The decode kernels' INT8 queries, by the tile's own quantizer: queries
+// [rows][query heads][D] bf16 at `positions` (each row's KV index). A row at
+// or past `from` writes its codes as bf16 integers and, per query head, the
+// tile's score scale (1/sqrt(D) literal x the row scale); a row below keeps
+// its queries and the caller's `scale`. One fused row per four threads.
+template <uint HeadDim>
+inline void paged_query_codes_lane(device const bfloat *queries,
+                                   device const int *positions,
+                                   device bfloat *codes, device float *score_scales,
+                                   constant PagedQueryCodesParams &params,
+                                   uint thread_index) {
+  constexpr uint LanesPerRow = PAGED_PREFILL_LANES_PER_ROW;
+  constexpr uint Quarter = HeadDim / LanesPerRow;
+  const uint fused = thread_index / LanesPerRow;
+  if (fused >= params.rows * params.query_heads)
+    return;
+  const uint lane = thread_index % LanesPerRow;
+  const uint first = fused * HeadDim + lane * Quarter;
+  if (uint(positions[fused / params.query_heads]) < params.from) {
+    device const bfloat4 *source = reinterpret_cast<device const bfloat4 *>(queries + first);
+    device bfloat4 *target = reinterpret_cast<device bfloat4 *>(codes + first);
+    for (uint i = 0; i < Quarter / 4; ++i)
+      target[i] = source[i];
+    if (lane == 0)
+      score_scales[fused] = params.scale;
+    return;
+  }
+  const float score_scale = paged_int8_score_scale<HeadDim>(
+      paged_int8_quantize_quarter<HeadDim>(queries + first, codes + first));
+  if (lane == 0)
+    score_scales[fused] = score_scale;
+}
+
+#define PAGED_QUERY_CODES(HeadDim)                                              \
+  [[kernel, max_total_threads_per_threadgroup(256)]] void                      \
+      paged_prefill_attention_query_codes_d##HeadDim(                          \
+          device const bfloat *queries [[buffer(0)]],                          \
+          device const int *positions [[buffer(1)]],                           \
+          device bfloat *codes [[buffer(2)]],                                  \
+          device float *score_scales [[buffer(3)]],                            \
+          constant PagedQueryCodesParams &params [[buffer(4)]],                \
+          uint thread_index [[thread_position_in_grid]]) {                     \
+    paged_query_codes_lane<HeadDim>(queries, positions, codes, score_scales,   \
+                                    params, thread_index);                     \
+  }
+
+PAGED_QUERY_CODES(128)
+PAGED_QUERY_CODES(256)
+#include "paged_prefill_attention_ktm.h"

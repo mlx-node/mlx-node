@@ -91,6 +91,31 @@ pub(crate) struct DFlash2Config {
 }
 
 impl DFlash2Config {
+    pub(crate) fn validate_target(&self, target: DFlash2TargetShape) -> Result<()> {
+        let invalid_tap = self
+            .target_layers
+            .iter()
+            .copied()
+            .find(|&layer| layer >= target.num_layers);
+        if self.hidden_size != target.hidden_size
+            || self.vocab_size != target.vocab_size
+            || self.mask_token_id >= self.vocab_size
+            || self.target_num_layers != target.num_layers
+            || invalid_tap.is_some()
+        {
+            return Err(Error::from_reason(format!(
+                "DFlash2/target mismatch: draft hidden={} vocab={} taps={:?}; target hidden={} vocab={} layers={}",
+                self.hidden_size,
+                self.vocab_size,
+                self.target_layers,
+                target.hidden_size,
+                target.vocab_size,
+                target.num_layers,
+            )));
+        }
+        Ok(())
+    }
+
     fn from_raw(raw: RawConfig) -> Result<Self> {
         if !raw
             .architectures
@@ -1103,6 +1128,56 @@ pub(crate) enum SelectorPath {
     /// walk ran inside the lazy graph (gather + argmax per position), so no
     /// per-cycle GPU→CPU readback gates the verify block on the proposal.
     Device(MxArray),
+    /// Device-drawn sampled path `[L]` i32 with the rows it drew from.
+    Sampled {
+        ids: MxArray,
+        rows: crate::engine::backend::DeviceSparseRows,
+    },
+}
+
+/// The sampled predecessor walk on the device: candidates `[1,L,K]` i32,
+/// scores `[L,K,K]` f32, one uniform per position drawn from `rng` on the
+/// host. `None` (no Metal, contract miss) keeps the host walk.
+pub(crate) fn device_sampled_path<R: Rng + ?Sized>(
+    candidates: &MxArray,
+    scores: &MxArray,
+    vocab_size: usize,
+    temperature: f64,
+    rng: &mut R,
+) -> Option<SelectorPath> {
+    if !unsafe { sys::mlx_metal_is_available() } {
+        return None;
+    }
+    let length = candidates.shape_at(1).ok()?;
+    let width = candidates.shape_at(2).ok()?;
+    let draws: Vec<f32> = (0..length).map(|_| rng.random::<f32>()).collect();
+    let uniforms = MxArray::from_float32(&draws, &[length]).ok()?;
+    let temperature = MxArray::from_float32(&[temperature as f32], &[1]).ok()?;
+    let mut path = std::ptr::null_mut();
+    let mut q = std::ptr::null_mut();
+    if !unsafe {
+        sys::mlx_dflash2_sampled_path(
+            candidates.as_raw_ptr(),
+            scores.as_raw_ptr(),
+            uniforms.as_raw_ptr(),
+            temperature.as_raw_ptr(),
+            &mut path,
+            &mut q,
+        )
+    } {
+        return None;
+    }
+    let ids = MxArray::from_handle(path, "dflash2_sampled_path:path").ok()?;
+    let probs = MxArray::from_handle(q, "dflash2_sampled_path:q").ok()?;
+    let support = candidates.reshape(&[length, width]).ok()?;
+    Some(SelectorPath::Sampled {
+        ids,
+        rows: crate::engine::backend::DeviceSparseRows {
+            ids: support,
+            probs,
+            vocab_size,
+        },
+    })
 }
 
 impl CandidateSelector {
@@ -1259,6 +1334,13 @@ impl CandidateSelector {
                 None => self.lazy_greedy_path(&candidates, &scores, length)?,
             };
             return Ok((SelectorPath::Device(path), Vec::new()));
+        }
+        if !greedy
+            && device_path
+            && let Some(path) =
+                device_sampled_path(&candidates, &scores, self.vocab_size, temperature, rng)
+        {
+            return Ok((path, Vec::new()));
         }
 
         MxArray::eval_arrays(&[&candidates, &scores])?;
@@ -1895,7 +1977,6 @@ impl DFlash2ContextCache {
         self.layers.iter().map(DraftKvWindow::view).collect()
     }
 
-    #[cfg(test)]
     pub(crate) fn token_history(&self) -> &[u32] {
         &self.token_history
     }
@@ -1983,6 +2064,60 @@ impl Drop for CompiledDraft {
     }
 }
 
+/// What a draft must match in its target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DFlash2TargetShape {
+    pub(crate) hidden_size: usize,
+    pub(crate) vocab_size: usize,
+    pub(crate) num_layers: usize,
+}
+
+impl From<&super::config::Qwen3_5Config> for DFlash2TargetShape {
+    fn from(target: &super::config::Qwen3_5Config) -> Self {
+        Self {
+            hidden_size: target.hidden_size as usize,
+            vocab_size: target.vocab_size as usize,
+            num_layers: target.num_layers as usize,
+        }
+    }
+}
+
+/// The target's token table and vocabulary head as the draft reads them
+/// (Splash `DFlashDraft::addDecode` takes `vocabularyProjection`).
+pub(crate) trait DFlash2TargetView {
+    /// `[1, rows, hidden]`: the token rows of `block`, whose host ids are
+    /// `ids`.
+    fn embed(&mut self, block: &MxArray, ids: &[i32]) -> Result<MxArray>;
+    /// The head's logits of the draft's normed hidden rows.
+    fn logits(&mut self, hidden: &MxArray) -> Result<MxArray>;
+    /// The table and head as arrays a compiled draft may capture; `None`
+    /// keeps every proposal eager.
+    fn traced(&self) -> Option<(&Embedding, Option<&LinearProj>)>;
+}
+
+/// A Qwen3.5 target: its `Embedding` and its head, or the tied table.
+pub(crate) struct DenseTargetView<'a> {
+    pub(crate) embedding: &'a Embedding,
+    pub(crate) lm_head: Option<&'a LinearProj>,
+}
+
+impl DFlash2TargetView for DenseTargetView<'_> {
+    fn embed(&mut self, block: &MxArray, _ids: &[i32]) -> Result<MxArray> {
+        self.embedding.forward(block)
+    }
+
+    fn logits(&mut self, hidden: &MxArray) -> Result<MxArray> {
+        match self.lm_head {
+            Some(head) => head.forward_logits(hidden),
+            None => self.embedding.as_linear(hidden),
+        }
+    }
+
+    fn traced(&self) -> Option<(&Embedding, Option<&LinearProj>)> {
+        Some((self.embedding, self.lm_head))
+    }
+}
+
 pub(crate) struct DFlash2Model {
     execution_policy: DraftExecutionPolicy,
     compiled: CompiledDraft,
@@ -2050,30 +2185,8 @@ impl DFlash2Model {
         self.compiled.prepared.store(false, Ordering::Relaxed);
     }
 
-    pub(crate) fn validate_target(&self, target: &super::config::Qwen3_5Config) -> Result<()> {
-        let invalid_tap = self
-            .config
-            .target_layers
-            .iter()
-            .copied()
-            .find(|&layer| layer >= target.num_layers as usize);
-        if self.config.hidden_size != target.hidden_size as usize
-            || self.config.vocab_size != target.vocab_size as usize
-            || self.config.mask_token_id >= self.config.vocab_size
-            || self.config.target_num_layers != target.num_layers as usize
-            || invalid_tap.is_some()
-        {
-            return Err(Error::from_reason(format!(
-                "DFlash2/target mismatch: draft hidden={} vocab={} taps={:?}; target hidden={} vocab={} layers={}",
-                self.config.hidden_size,
-                self.config.vocab_size,
-                self.config.target_layers,
-                target.hidden_size,
-                target.vocab_size,
-                target.num_layers,
-            )));
-        }
-        Ok(())
+    pub(crate) fn validate_target(&self, target: impl Into<DFlash2TargetShape>) -> Result<()> {
+        self.config.validate_target(target.into())
     }
 
     pub(crate) fn fuse_context(&self, taps: &[MxArray]) -> Result<MxArray> {
@@ -2265,6 +2378,7 @@ impl DFlash2Model {
             .collect())
     }
 
+    #[cfg(test)]
     fn forward_hidden(
         &self,
         target_embedding: &Embedding,
@@ -2273,6 +2387,17 @@ impl DFlash2Model {
         context: &mut DFlash2ContextCache,
     ) -> Result<MxArray> {
         let embedded = target_embedding.forward(block_ids)?;
+        self.forward_embedded(&embedded, query_base, context)
+    }
+
+    /// The draft layers and final norm over a block's embedded rows
+    /// `[1, rows, hidden]`.
+    fn forward_embedded(
+        &self,
+        embedded: &MxArray,
+        query_base: i32,
+        context: &mut DFlash2ContextCache,
+    ) -> Result<MxArray> {
         let mut pending: Option<DraftLayerOutput> = None;
         let DFlash2ContextCache {
             layers: windows,
@@ -2284,7 +2409,7 @@ impl DFlash2Model {
             Some(window) => window.block_mask(
                 mask_memo,
                 query_base,
-                block_ids.shape_at(1)?,
+                embedded.shape_at(1)?,
                 self.config.sliding_window as i64,
             )?,
             None => None,
@@ -2292,7 +2417,7 @@ impl DFlash2Model {
         for (layer, window) in self.layers.iter().zip(windows.iter_mut()) {
             let input = match &pending {
                 Some(output) => output.as_input(),
-                None => DraftResidual::Hidden(&embedded),
+                None => DraftResidual::Hidden(embedded),
             };
             let next =
                 layer.forward(input, window, query_base, mask.as_ref(), self.merged_rows())?;
@@ -2300,7 +2425,7 @@ impl DFlash2Model {
         }
         match &pending {
             Some(output) => Ok(output.hidden_and_normalized(&self.norm)?.1),
-            None => self.norm.forward(&embedded),
+            None => self.norm.forward(embedded),
         }
     }
 
@@ -2501,11 +2626,40 @@ impl DFlash2Model {
         confidence: Option<&mut Option<MxArray>>,
         rng: &mut R,
     ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
+        self.propose_with(
+            &mut DenseTargetView {
+                embedding: target_embedding,
+                lm_head: target_lm_head,
+            },
+            context,
+            anchor,
+            max_len,
+            temperature,
+            device_path,
+            confidence,
+            rng,
+        )
+    }
+
+    /// [`Self::propose`] over any target's token table and head.
+    pub(crate) fn propose_with<R: Rng + ?Sized>(
+        &self,
+        target: &mut dyn DFlash2TargetView,
+        context: &mut DFlash2ContextCache,
+        anchor: u32,
+        max_len: usize,
+        temperature: f64,
+        device_path: bool,
+        confidence: Option<&mut Option<MxArray>>,
+        rng: &mut R,
+    ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
         let ids = parallel_query_ids(anchor, self.config.mask_token_id, max_len);
         let phase_time = std::env::var("MLX_DFLASH2_PHASE_TIME").is_ok();
         let t0 = std::time::Instant::now();
         let block = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
+        let traced = target.traced();
         let compile = device_path
+            && traced.is_some()
             && is_greedy_temperature(temperature)
             && max_len == self.config.block_size
             && unsafe { sys::mlx_default_device() } == 1
@@ -2514,7 +2668,10 @@ impl DFlash2Model {
         // pay for a new graph used once. The first full proposal runs eager
         // and is explicitly evaluated below before prepared becomes true, so
         // even a failed verification leaves materialized captured weights.
-        if compile && self.compiled.prepared.load(Ordering::Relaxed) {
+        if compile
+            && self.compiled.prepared.load(Ordering::Relaxed)
+            && let Some((target_embedding, target_lm_head)) = traced
+        {
             match self.propose_compiled(
                 target_embedding,
                 target_lm_head,
@@ -2536,15 +2693,13 @@ impl DFlash2Model {
             }
         }
         let query_base = context.logical_len;
-        let hidden = self.forward_hidden(target_embedding, &block, query_base, context)?;
+        let embedded = target.embed(&block, &ids)?;
+        let hidden = self.forward_embedded(&embedded, query_base, context)?;
         // The head runs on the whole block (anchor + proposals, 8 rows), the
         // height its K-quant M = 8 route serves, and the anchor row's logits
         // are dropped: at 7 rows the head took the per-row kernel and cost
         // more than at 8.
-        let logits = match target_lm_head {
-            Some(head) => head.forward_logits(&hidden)?,
-            None => target_embedding.as_linear(&hidden)?,
-        };
+        let logits = target.logits(&hidden)?;
         let rows = max_len as i64 + 1;
         let hidden = hidden.slice_axis(1, 1, rows)?;
         let logits = logits.slice_axis(1, 1, rows)?;
@@ -2584,6 +2739,22 @@ pub(crate) fn tiny_dflash2_model_for_stepper_test(
     target: &super::config::Qwen3_5Config,
 ) -> Result<DFlash2Model> {
     tiny_dflash2_model_with_block(target, 2)
+}
+
+/// Writes a DFlash2 checkpoint of `config` (a `config.json` value) to
+/// `dir`: random BF16 tensors of every expected shape.
+#[cfg(test)]
+pub(crate) fn write_test_checkpoint(dir: &Path, config: &serde_json::Value) -> Result<()> {
+    fs::create_dir_all(dir).map_err(|error| Error::from_reason(error.to_string()))?;
+    fs::write(dir.join("config.json"), config.to_string())
+        .map_err(|error| Error::from_reason(error.to_string()))?;
+    let parsed = read_dflash2_config(dir)?;
+    let mut tensors = HashMap::new();
+    for (name, shape) in expected_tensor_shapes(&parsed) {
+        let array = MxArray::random_normal(&shape, 0.0, 0.02, Some(DType::BFloat16))?;
+        tensors.insert(name, array);
+    }
+    crate::utils::safetensors::save_safetensors(dir.join("model.safetensors"), &mut tensors, None)
 }
 
 /// A one-layer draft geometry for window-only tests.
@@ -6000,3 +6171,7 @@ mod adaptive_budget_tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "dflash2_flash_next_tests.rs"]
+mod flash_next_tests;

@@ -30,6 +30,8 @@ std::vector<array> complete_gdn_metal(const std::vector<array> &in) {
             mlx::core::default_stream(mlx::core::Device::gpu));
 }
 
+// The row count is read from the input shape, not a template argument, so
+// one pipeline serves every pass length.
 std::vector<array> window_conv_metal(const std::vector<array> &in) {
   static auto fn = mlx::core::fast::metal_kernel(
       "qwen4_window_conv", {"x", "history", "weight"}, {"out", "next_history"},
@@ -38,8 +40,7 @@ std::vector<array> window_conv_metal(const std::vector<array> &in) {
   const int tokens = in[0].shape(1), width = in[0].shape(2);
   return fn(in, {in[0].shape(), in[1].shape()}, {in[0].dtype(), in[0].dtype()},
             {width, tokens, 1}, {256, 1, 1},
-            {{"T", in[0].dtype()}, {"W", width}, {"TOKENS", tokens}},
-            std::nullopt, false,
+            {{"T", in[0].dtype()}, {"W", width}}, std::nullopt, false,
             mlx::core::default_stream(mlx::core::Device::gpu));
 }
 
@@ -163,7 +164,7 @@ extern "C" bool mlx_qwen4_gdn_prepare(mlx_array *qkv, mlx_array *a,
                       beta_input_dtype ? x.dtype() : mlx::core::float32,
                       x.dtype()},
                      {32, 80, t}, {32, 4, 1},
-                     {{"T", x.dtype()}, {"TOKENS", t}, {"MEAN_EPS", mean_eps}},
+                     {{"T", x.dtype()}, {"MEAN_EPS", mean_eps}},
                      std::nullopt, false, mlx::core::Device::gpu);
     std::vector<std::unique_ptr<array>> owned;
     for (auto &y : result)

@@ -21,6 +21,7 @@ import { AgentSessionsReader } from '../../src/agent-sessions/reader.js';
 import type { UpdateLine } from '../../src/agent-sessions/transcript.js';
 import {
   AgentHost,
+  type AgentLaunch,
   type AgentHostListener,
   type AgentHostOptions,
   type HostTimings,
@@ -33,7 +34,15 @@ import { MemorySecretStore, type SecretStore } from '../../src/chat/providers/se
 import { ProvidersService } from '../../src/chat/providers/service.js';
 import type { ProviderSource } from '../../src/chat/providers/source.js';
 import { ChatService, type ChatServiceOptions } from '../../src/chat/service.js';
-import type { AgentModeState, ChatMode, ConversationNotice, Interaction, TurnState } from '../../src/chat/types.js';
+import type {
+  AgentModeState,
+  ChatMode,
+  CompactionState,
+  ConversationNotice,
+  Interaction,
+  RunView,
+  TurnState,
+} from '../../src/chat/types.js';
 import type { WebResult } from '../../src/chat/web/result-text.js';
 import { startFakeEngine, type EngineScript, type FakeEngine } from './fake-engine.js';
 
@@ -59,8 +68,12 @@ export interface HostEvents {
   ready: string[];
   /** Work: automatic continues written to the agent. */
   continues: Array<{ sessionId: string; n: number }>;
-  /** Every update line kind and automatic continue, in arrival order. */
+  /** Every update line kind, automatic continue, compaction start and end, turn end and cold, in arrival order. */
   timeline: string[];
+  /** Each compaction state change: the state, or null at its end. */
+  compactions: Array<{ sessionId: string; compaction: CompactionState | null }>;
+  /** Work: each change of a session's live workflow runs (the whole list). */
+  runs: Array<{ sessionId: string; runs: RunView[] }>;
 }
 
 /** An endpoint file model that is its own base, as an MLX folder with no build words in its name. */
@@ -89,8 +102,14 @@ export interface FakeHostOptions {
   tempRoots?: AgentHostOptions['tempRoots'];
   uid?: number;
   login?: string;
+  /** The host's clock (default `Date.now`). */
+  now?: () => number;
   /** Replaces the endpoint read; gets the current endpoint holder. */
   readEndpoint?: (endpoint: { current: InferenceEndpoint | null }) => Promise<InferenceEndpoint | null>;
+  /** The agent to start instead of the fake one. */
+  launch?: AgentLaunch;
+  /** Starts the engine the endpoint names instead of the fake engine (`engine` is then unused). */
+  startEngine?: () => Promise<FakeEngine>;
 }
 
 export interface FakeHost {
@@ -161,7 +180,7 @@ export async function fakeHost(name: string, options: FakeHostOptions = {}): Pro
   options.mutate?.(scenario);
   const scenarioPath = join(root, 'scenario.json');
   writeFileSync(scenarioPath, JSON.stringify(scenario));
-  const engine = await startFakeEngine(options.engine);
+  const engine = await (options.startEngine?.() ?? startFakeEngine(options.engine));
   const endpoint: { current: InferenceEndpoint | null } = {
     current: {
       version: 1,
@@ -186,18 +205,21 @@ export async function fakeHost(name: string, options: FakeHostOptions = {}): Pro
     ready: [],
     continues: [],
     timeline: [],
+    compactions: [],
+    runs: [],
   };
   const mode = options.mode ?? 'chat';
   const host = new AgentHost({
     mode,
     paths,
-    resolveLaunch: () => ({
-      command: process.execPath,
-      args: [FAKE_AGENT, scenarioPath],
-      source: 'test',
-      tag: null,
-      versionVerified: false,
-    }),
+    resolveLaunch: () =>
+      options.launch ?? {
+        command: process.execPath,
+        args: [FAKE_AGENT, scenarioPath],
+        source: 'test',
+        tag: null,
+        versionVerified: false,
+      },
     readEndpoint:
       options.readEndpoint === undefined ? async () => endpoint.current : () => options.readEndpoint!(endpoint),
     providers: options.providers ?? noProviders(),
@@ -214,6 +236,7 @@ export async function fakeHost(name: string, options: FakeHostOptions = {}): Pro
     tempRoots: options.tempRoots ?? [],
     ...(options.uid === undefined ? {} : { uid: options.uid }),
     ...(options.login === undefined ? {} : { login: options.login }),
+    ...(options.now === undefined ? {} : { now: options.now }),
     listener: {
       onSessionReady: (sessionId) => events.ready.push(sessionId),
       ...(options.onModeAllowed === undefined ? {} : { onModeAllowed: options.onModeAllowed }),
@@ -230,13 +253,24 @@ export async function fakeHost(name: string, options: FakeHostOptions = {}): Pro
       },
       onTitle: (sessionId, title) => events.titles.push({ sessionId, title }),
       onTurn: (sessionId, turn) => events.turns.push({ sessionId, turn }),
-      onTurnEnd: (sessionId, result) => events.ends.push({ sessionId, result }),
+      onTurnEnd: (sessionId, result) => {
+        events.ends.push({ sessionId, result });
+        events.timeline.push('turn end');
+      },
       onInteraction: (sessionId, interaction) => events.interactions.push({ sessionId, interaction }),
       onInteractionClosed: (sessionId, id, reason) => events.closed.push({ sessionId, id, reason }),
-      onCold: (ids) => events.cold.push(ids),
+      onCold: (ids) => {
+        events.cold.push(ids);
+        events.timeline.push('cold');
+      },
       onWebResult: (sessionId, result) => events.web.push({ sessionId, result }),
       onModel: (sessionId, modelId) => events.models.push({ sessionId, modelId }),
       onNotice: (sessionId, notice) => events.notices.push({ sessionId, notice }),
+      onCompaction: (sessionId, compaction) => {
+        events.compactions.push({ sessionId, compaction });
+        events.timeline.push(compaction === null ? 'compaction end' : 'compaction start');
+      },
+      onRuns: (sessionId, runs) => events.runs.push({ sessionId, runs }),
     },
   });
   const records = (): Json[] => {

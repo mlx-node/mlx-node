@@ -20,6 +20,8 @@ export interface InitializeFacts {
   loadSession: boolean;
   embeddedContext: boolean;
   pluginDirs: boolean;
+  /** `x.ai/workflows/stop` and the requester on child asks are in this build. */
+  workflowControl: boolean;
   agentVersion: string | null;
   /** null when `modelState.availableModels` is not an array of `{modelId: string}`. */
   models: Array<{ modelId: string; contextTokens: number | null }> | null;
@@ -52,6 +54,7 @@ export function readInitialize(result: unknown): InitializeFacts {
     loadSession: caps.loadSession === true,
     embeddedContext: prompt.embeddedContext === true,
     pluginDirs: meta['x.ai/pluginDirs'] === true,
+    workflowControl: meta['x.ai/workflowControl'] === true,
     agentVersion: str(meta.agentVersion),
     models,
   };
@@ -141,6 +144,29 @@ export interface PermissionRequest {
   options: PermissionOption[];
   /** The request's `_meta.hookAsk`: set when a `PreToolUse` hook forced this request. */
   hookAsk?: { hookName: string; reason: string | null };
+  /** `_meta["x.ai/requester"]`: the child session that asked (`sessionId` stays the parent's); null for the parent's own ask. */
+  requester: Requester | null;
+}
+
+export interface Requester {
+  sessionId: string;
+  label: string;
+  /** The workflow run of the child; null for a plain `spawn_subagent` child. */
+  runId: string | null;
+  cwd: string;
+}
+
+/** A present `x.ai/requester` of another shape is `undefined`: the request is unreadable. */
+function readRequester(value: unknown): Requester | null | undefined {
+  if (value === undefined) return null;
+  if (!isRecord(value)) return undefined;
+  const sessionId = str(value.sessionId);
+  const label = str(value.label);
+  const cwd = str(value.cwd);
+  const runId = value.runId === null ? null : str(value.runId);
+  if (sessionId === null || sessionId === '' || label === null || cwd === null || cwd === '') return undefined;
+  if (runId === '' || (runId === null && value.runId !== null)) return undefined;
+  return { sessionId, label, runId, cwd };
 }
 
 export function readPermissionRequest(params: unknown): PermissionRequest | null {
@@ -156,7 +182,10 @@ export function readPermissionRequest(params: unknown): PermissionRequest | null
   }
   const meta = metaOf(call);
   const tool = isRecord(meta['x.ai/tool']) ? meta['x.ai/tool'] : null;
-  const ask = metaOf(params).hookAsk;
+  const requestMeta = metaOf(params);
+  const requester = readRequester(requestMeta['x.ai/requester']);
+  if (requester === undefined) return null;
+  const ask = requestMeta.hookAsk;
   const hookName = isRecord(ask) ? str(ask.hookName) : null;
   return {
     sessionId,
@@ -167,6 +196,7 @@ export function readPermissionRequest(params: unknown): PermissionRequest | null
     rawInput: call.rawInput,
     options,
     ...(isRecord(ask) && hookName !== null ? { hookAsk: { hookName, reason: str(ask.reason) } } : {}),
+    requester,
   };
 }
 
@@ -203,6 +233,78 @@ export function readPromptResult(result: unknown): PromptResultFacts {
   const r = isRecord(result) ? result : {};
   const meta = metaOf(r);
   return { stopReason: str(r.stopReason), cancellationCategory: str(meta.cancellationCategory) };
+}
+
+/**
+ * The agent's compaction updates (xAI only): `started` before it summarizes older messages, then one of `completed`,
+ * `failed` or `cancelled`. A manual `/compact` sends `completed` alone. A count the agent did not send is null.
+ */
+export type CompactionUpdate =
+  | { kind: 'started'; tokensUsed: number | null; contextWindow: number | null }
+  | { kind: 'completed'; tokensBefore: number | null; tokensAfter: number | null; elapsedMs: number | null }
+  | { kind: 'failed'; error: string; retry: boolean }
+  | { kind: 'cancelled' };
+
+/** The agent's own first words of a failure it retries at the next step. */
+export const COMPACT_RETRY_TEXT = "it'll retry on the next turn";
+
+function count(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+export function readCompaction(update: Json): CompactionUpdate | null {
+  switch (update.sessionUpdate) {
+    case 'auto_compact_started':
+      return { kind: 'started', tokensUsed: count(update.tokens_used), contextWindow: count(update.context_window) };
+    case 'auto_compact_completed':
+      return {
+        kind: 'completed',
+        tokensBefore: count(update.tokens_before),
+        tokensAfter: count(update.tokens_after),
+        elapsedMs: count(update.elapsed_ms),
+      };
+    case 'auto_compact_failed': {
+      const error = str(update.error) ?? '';
+      return { kind: 'failed', error, retry: error.startsWith(COMPACT_RETRY_TEXT) };
+    }
+    case 'auto_compact_cancelled':
+      return { kind: 'cancelled' };
+    default:
+      return null;
+  }
+}
+
+export interface WorkflowUpdate {
+  runId: string;
+  revision: number;
+  name: string;
+  /** The agent's word: `active`, a paused one, `blocked`, `budget_limited` or a terminal one. */
+  status: string;
+}
+
+/** A `workflow_updated` line (xAI only) with a run id, a revision and a status; any other shape is null. */
+export function readWorkflowUpdate(update: Json): WorkflowUpdate | null {
+  if (update.sessionUpdate !== 'workflow_updated') return null;
+  const runId = str(update.run_id);
+  const revision = count(update.revision);
+  const status = str(update.status);
+  if (runId === null || runId === '' || revision === null || status === null || status === '') return null;
+  return { runId, revision, name: str(update.name) ?? '', status };
+}
+
+/** The answer to `_x.ai/workflows/stop`; any other shape is null. */
+export function readWorkflowStop(result: unknown): 'stopped' | 'rejected' | null {
+  if (!isRecord(result)) return null;
+  if (result.outcome === 'stopped') return 'stopped';
+  if (result.outcome === 'rejected') return 'rejected';
+  return null;
+}
+
+/** A `subagent_spawned` line's child session id, or null. */
+export function readSpawnedChild(update: Json): string | null {
+  if (update.sessionUpdate !== 'subagent_spawned') return null;
+  const child = str(update.child_session_id);
+  return child === null || child === '' ? null : child;
 }
 
 /** A `session_info_update` title, or null. */

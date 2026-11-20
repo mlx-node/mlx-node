@@ -5,9 +5,53 @@
  */
 
 import * as core from '@mlx-node/core';
-import type { ChatStreamProgress, LoadProgress, PipelineStats, WarmupReport } from '@mlx-node/core';
+import type {
+  ChatStreamProgress,
+  LoadProgress,
+  PipelineStats,
+  Qwen4ExpResidencyInfo,
+  WarmupReport,
+} from '@mlx-node/core';
+
+import {
+  EXPERT_RESIDENCIES,
+  RESIDENCY_DELTA_FIELDS,
+  type ExpertResidency,
+  type ResidencyDeltaField,
+} from './metrics-trace.js';
 
 export type { LoadProgress, PipelineStats, WarmupReport };
+
+/** The residency facts of a load, fixed when the load chose where the experts live. */
+export const LOAD_RESIDENCY_FIELDS = [
+  'bankBudgetBytes',
+  'liveNonReclaimableBytes',
+  'anonymousNeedBytes',
+  'hostWiredBytes',
+  'hostCompressorBytes',
+  'hostAnonymousBytes',
+  'hostPurgeableBytes',
+  'selfMlxBytes',
+] as const satisfies readonly (keyof Qwen4ExpResidencyInfo)[];
+
+export type LoadResidencyField = (typeof LOAD_RESIDENCY_FIELDS)[number];
+
+/** A validated `residencyInfo()`: the closed enum, the slot counts, and every number the records read. */
+export interface ResidencySnapshot {
+  residency: ExpertResidency;
+  /** Slots per layer, or the expert count on a direct store. */
+  expertSlots: number;
+  expertCount: number;
+  load: Record<LoadResidencyField, number>;
+  counters: Record<ResidencyDeltaField, number>;
+}
+
+/** What the heartbeat says about a model's experts. */
+export interface ExpertsLive {
+  inMemory: number;
+  total: number;
+  streaming: boolean;
+}
 
 /** Every phase a native turn reports. */
 export type TurnPhase = ChatStreamProgress['phase'];
@@ -88,6 +132,56 @@ export function readPipelineStats(): PipelineStats | null {
   } catch {
     return null;
   }
+}
+
+function nonNegative(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+/**
+ * A validated residency report, or null. Every field must be present and valid: a model whose
+ * `residencyInfo()` has another shape (DeepSeek V4.1's) gives null.
+ */
+export function residencySnapshotOf(value: unknown): ResidencySnapshot | null {
+  if (!isObj(value)) return null;
+  let residency: ExpertResidency | null = null;
+  for (const kind of EXPERT_RESIDENCIES) if (kind === value.residency) residency = kind;
+  const expertSlots = count(value.partialExpertSlots);
+  const expertCount = count(value.expertCount);
+  if (residency === null || expertSlots === null || expertCount === null || expertCount === 0) return null;
+  const load = {} as Record<LoadResidencyField, number>;
+  for (const key of LOAD_RESIDENCY_FIELDS) {
+    const field = nonNegative(value[key]);
+    if (field === null) return null;
+    load[key] = field;
+  }
+  const counters = {} as Record<ResidencyDeltaField, number>;
+  for (const key of RESIDENCY_DELTA_FIELDS) {
+    const field = nonNegative(value[key]);
+    if (field === null) return null;
+    counters[key] = field;
+  }
+  return { residency, expertSlots, expertCount, load, counters };
+}
+
+/** The `residencyInfo()` of a loaded model; null for a model without one or with another shape. */
+export function readResidency(model: unknown): ResidencySnapshot | null {
+  try {
+    if (!isObj(model)) return null;
+    const read = model.residencyInfo;
+    return typeof read === 'function' ? residencySnapshotOf(read.call(model)) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The heartbeat's experts line of a residency report. */
+export function expertsLiveOf(snapshot: ResidencySnapshot): ExpertsLive {
+  return {
+    inMemory: Math.min(snapshot.expertSlots, snapshot.expertCount),
+    total: snapshot.expertCount,
+    streaming: snapshot.residency !== 'direct',
+  };
 }
 
 /** The `warmup` getter of a loaded model; null for a model without one or a load that ran none. */

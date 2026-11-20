@@ -7,6 +7,7 @@
  * raw lines first, exactly like grok's `filter_rewind_lines`.
  */
 
+import { readCompaction } from '../chat/acp/messages.js';
 import { CONTINUE_PROMPT, type TranscriptOp } from '../chat/types.js';
 import { mcpOutputText } from './mcp-output.js';
 import type { TranscriptEntry, TurnMetric, WakeCause } from './types.js';
@@ -34,6 +35,8 @@ export interface ParsedUpdates {
    * arguments; metadata-only readers take the name from here.
    */
   toolNames: ReadonlyMap<string, string>;
+  /** The last `_meta.totalTokens` of the file: the conversation's current context in tokens; null when none. */
+  contextUsed: number | null;
 }
 
 type Json = Record<string, unknown>;
@@ -292,6 +295,12 @@ interface Notification {
   xai: boolean;
   update: Json;
   ts: number;
+  /** `_meta.totalTokens` of the line: the agent's count of the conversation's current context. */
+  contextUsed: number | null;
+}
+
+function contextOf(meta: unknown): number | null {
+  return isRecord(meta) && isUsize(meta.totalTokens) ? meta.totalTokens : null;
 }
 
 /** A stored end on the model's length limit. */
@@ -319,7 +328,12 @@ function parseLine(line: string): Notification | null {
   const meta = notification._meta;
   const agentMs = isRecord(meta) ? num(meta.agentTimestampMs) : null;
   const seconds = num(obj.timestamp);
-  return { xai, update: notification.update, ts: epochMs(agentMs ?? (seconds !== null ? seconds * 1000 : 0)) };
+  return {
+    xai,
+    update: notification.update,
+    ts: epochMs(agentMs ?? (seconds !== null ? seconds * 1000 : 0)),
+    contextUsed: contextOf(meta),
+  };
 }
 
 /** A time outside `Date`'s range (or one that overflowed to Infinity) is 0: untimed, like a missing one. */
@@ -336,6 +350,12 @@ const WAKE_PREFIXES: ReadonlyArray<readonly [string, WakeCause]> = [
   ['goal-classifier-nudge-', 'goal'],
 ];
 
+/**
+ * The `_meta` key of the app host's own wake line (the agent sends a wake's prompt to disk only): the prompt id the
+ * host expects for that wake, so the row has its cause before the wake's `turn_completed`.
+ */
+export const WAKE_PROMPT_ID = 'mlxWakePromptId';
+
 /** grok `PromptOrigin::from_prompt_id`: the prompt id prefix names what woke the agent. */
 export function wakeCause(promptId: string | null): WakeCause {
   if (promptId === null) return 'unknown';
@@ -345,6 +365,7 @@ export function wakeCause(promptId: string | null): WakeCause {
 
 type WakeEntry = Extract<TranscriptEntry, { kind: 'wake' }>;
 type SubagentEntry = Extract<TranscriptEntry, { kind: 'subagent' }>;
+type WorkflowEntry = Extract<TranscriptEntry, { kind: 'workflow' }>;
 type WorkflowRun = { name: string; status: string };
 type WorkflowState = Pick<ReadonlyMap<string, WorkflowRun>, 'get'>;
 /** Each run's state from before its first update since a wake; undefined = the run was unknown then. */
@@ -412,6 +433,7 @@ export class TranscriptReducer {
   private readonly tools = new Map<string, ToolAcc>();
   private readonly subagents = new Map<string, SubagentEntry>();
   private readonly workflows = new Map<string, WorkflowRun>();
+  private readonly runEntries = new Map<string, WorkflowEntry>();
   /** By `subagent_id`, else `child_session_id`. */
   private readonly spawnedBy = new Map<string, SubagentEntry>();
   /** `prompt_id` of the last `user_prompt_submit` hook line; null after a prompt chunk or a turn end. */
@@ -422,6 +444,7 @@ export class TranscriptReducer {
   private readonly wakeTexts = new Map<WakeEntry, string>();
   private wakeRun: { entry: WakeEntry; promptIndex: number } | null = null;
   private model: string | null = null;
+  private contextUsed: number | null = null;
   private openTurn = false;
   private turnsWithUsage = 0;
   private lastTs = 0;
@@ -435,9 +458,16 @@ export class TranscriptReducer {
   }
 
   /** Start from entries read earlier (a cold conversation's disk transcript); live ops index after them. */
-  seed(entries: readonly TranscriptEntry[], turns: readonly TurnMetric[]): void {
-    for (const entry of entries) this.add({ ...entry });
+  seed(entries: readonly TranscriptEntry[], turns: readonly TurnMetric[], contextUsed: number | null = null): void {
+    for (const entry of entries) {
+      const copy = { ...entry };
+      this.add(copy);
+      if (copy.kind !== 'workflow') continue;
+      const known = this.runEntries.get(copy.runId);
+      if (known === undefined || copy.revision > known.revision) this.runEntries.set(copy.runId, copy);
+    }
     for (const turn of turns) this.turns.push({ ...turn });
+    this.contextUsed = contextUsed;
     for (let i = entries.length - 1; i >= 0; i--) {
       const entry = entries[i]!;
       if (entry.kind === 'model') {
@@ -458,21 +488,38 @@ export class TranscriptReducer {
   /** One live line → its ops. */
   apply(line: UpdateLine): TranscriptOp[] {
     const agentMs = line.meta !== undefined ? num(line.meta.agentTimestampMs) : null;
-    return this.collect(() => this.step({ xai: line.xai, update: line.update, ts: epochMs(agentMs ?? this.now()) }));
+    return this.collect(() =>
+      this.step({
+        xai: line.xai,
+        update: line.update,
+        ts: epochMs(agentMs ?? this.now()),
+        contextUsed: contextOf(line.meta),
+      }),
+    );
   }
 
   /** The user's prompt: the agent does not echo it live, so the host pushes it when the prompt is accepted. */
   userPrompt(text: string, ts: number = this.now()): TranscriptOp[] {
     return this.collect(() =>
-      this.step({ xai: false, update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text } }, ts }),
+      this.step({
+        xai: false,
+        update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text } },
+        ts,
+        contextUsed: null,
+      }),
     );
   }
 
   /** A model switch the user made between turns. */
   modelSwitch(modelId: string, ts: number = this.now()): TranscriptOp[] {
     return this.collect(() =>
-      this.step({ xai: true, update: { sessionUpdate: 'model_changed', model_id: modelId }, ts }),
+      this.step({ xai: true, update: { sessionUpdate: 'model_changed', model_id: modelId }, ts, contextUsed: null }),
     );
+  }
+
+  /** The last `_meta.totalTokens` seen; null while no line carried one. */
+  context(): number | null {
+    return this.contextUsed;
   }
 
   snapshot(): { entries: TranscriptEntry[]; turns: TurnMetric[] } {
@@ -490,6 +537,7 @@ export class TranscriptReducer {
       retries: this.retries,
       lastTs: this.lastTs,
       toolNames: this.toolNames,
+      contextUsed: this.contextUsed,
     };
   }
 
@@ -526,6 +574,65 @@ export class TranscriptReducer {
     entry.text = cut.text;
     if (cut.truncated) entry.truncated = true;
     else delete entry.truncated;
+  }
+
+  /** The run's one entry: made at its first update with a revision, replaced in place by each higher revision. */
+  private workflowEntry(runId: string, update: Json, ts: number): void {
+    const revision = isUsize(update.revision) ? update.revision : null;
+    if (revision === null) return;
+    const existing = this.runEntries.get(runId);
+    if (existing !== undefined && revision <= existing.revision) return;
+    const entry: WorkflowEntry = existing ?? {
+      kind: 'workflow',
+      ts,
+      updatedTs: ts,
+      runId,
+      revision,
+      name: '',
+      status: '',
+      phases: [],
+      currentPhase: null,
+      agentBudget: null,
+      agentsUsed: 0,
+      agents: [],
+    };
+    entry.updatedTs = ts;
+    entry.revision = revision;
+    entry.name = str(update.name) ?? '';
+    entry.status = str(update.status) ?? '';
+    entry.phases = Array.isArray(update.phases)
+      ? update.phases.filter(isRecord).map((p) => ({ title: str(p.title) ?? '', state: str(p.state) ?? '' }))
+      : [];
+    entry.currentPhase = str(update.current_phase);
+    entry.agentBudget = isUsize(update.agent_budget) ? update.agent_budget : null;
+    entry.agentsUsed = isUsize(update.agents_used) ? update.agents_used : 0;
+    entry.agents = Array.isArray(update.agents)
+      ? update.agents.filter(isRecord).map((a) => ({
+          agentId: str(a.agent_id) ?? '',
+          label: str(a.label) ?? '',
+          phase: str(a.phase),
+          state: str(a.state) ?? '',
+          tokens: isUsize(a.tokens_used) ? a.tokens_used : 0,
+          durationMs: isUsize(a.duration_ms) ? a.duration_ms : 0,
+        }))
+      : [];
+    const pause = str(update.pause_message);
+    if (pause !== null && pause !== '') entry.pauseMessage = pause;
+    else delete entry.pauseMessage;
+    const summary = str(update.result_summary);
+    delete entry.report;
+    delete entry.truncated;
+    if (summary !== null && summary !== '') {
+      const cut = truncateField(summary);
+      entry.report = cut.text;
+      if (cut.truncated) entry.truncated = true;
+    }
+    if (existing === undefined) {
+      this.runEntries.set(runId, entry);
+      this.add(entry);
+    } else {
+      this.changed(entry);
+    }
   }
 
   private tool(update: Json, ts: number): ToolAcc | null {
@@ -565,6 +672,10 @@ export class TranscriptReducer {
   private step(n: Notification): void {
     const { update, ts } = n;
     if (ts > this.lastTs) this.lastTs = ts;
+    if (n.contextUsed !== null && n.contextUsed !== this.contextUsed) {
+      this.contextUsed = n.contextUsed;
+      this.ops?.push({ op: 'context', used: n.contextUsed });
+    }
     const tag = update.sessionUpdate;
     if (!n.xai) {
       switch (tag) {
@@ -590,8 +701,17 @@ export class TranscriptReducer {
               this.changed(run.entry);
               break;
             }
+            // The host's empty wake line, then the agent's own prompt of the same wake: one row.
+            const open = this.turnPrompt;
+            if (open !== null && open.atWake !== null && prev === open.entry && this.wakeTexts.get(open.entry) === '') {
+              if (hookId !== null) applyWake(open.entry, hookId, this.workflows, this.spawnedBy);
+              this.setWakeText(open.entry, body);
+              this.changed(open.entry);
+              this.wakeRun = promptIndex === null ? null : { entry: open.entry, promptIndex };
+              break;
+            }
             const entry: WakeEntry = { kind: 'wake', ts, cause: 'unknown', text: '' };
-            applyWake(entry, hookId, this.workflows, this.spawnedBy);
+            applyWake(entry, hookId ?? str(meta[WAKE_PROMPT_ID]), this.workflows, this.spawnedBy);
             this.setWakeText(entry, body);
             this.add(entry);
             this.wakeRun = promptIndex === null ? null : { entry, promptIndex };
@@ -743,6 +863,7 @@ export class TranscriptReducer {
         const atWake = this.turnPrompt?.atWake ?? null;
         if (atWake !== null && !atWake.has(runId)) atWake.set(runId, this.workflows.get(runId));
         this.workflows.set(runId, { name: str(update.name) ?? '', status: str(update.status) ?? '' });
+        this.workflowEntry(runId, update, ts);
         break;
       }
       case 'hook_execution':
@@ -781,6 +902,31 @@ export class TranscriptReducer {
         if (modelId === null || modelId === '') break;
         this.model = modelId;
         this.add({ kind: 'model', ts, modelId });
+        break;
+      }
+      case 'auto_compact_completed':
+      case 'auto_compact_failed':
+      case 'auto_compact_cancelled': {
+        const end = readCompaction(update);
+        if (end === null || end.kind === 'started') break;
+        if (end.kind === 'completed') {
+          // The lines after a compaction can keep the old count until the next answer: a lower count here wins now.
+          if (end.tokensAfter !== null && this.contextUsed !== null && end.tokensAfter < this.contextUsed) {
+            this.contextUsed = end.tokensAfter;
+            this.ops?.push({ op: 'context', used: end.tokensAfter });
+          }
+          this.add({
+            kind: 'compaction',
+            ts,
+            outcome: 'done',
+            ...(end.tokensBefore === null ? {} : { tokensBefore: end.tokensBefore }),
+            ...(end.tokensAfter === null ? {} : { tokensAfter: end.tokensAfter }),
+          });
+        } else if (end.kind === 'failed') {
+          this.add({ kind: 'compaction', ts, outcome: 'failed', ...(end.retry ? { retry: true as const } : {}) });
+        } else {
+          this.add({ kind: 'compaction', ts, outcome: 'stopped' });
+        }
         break;
       }
     }

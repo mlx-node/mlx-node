@@ -4,6 +4,23 @@ use super::*;
 
 // All these methods run on the dedicated model thread (synchronous, no locks).
 
+// Test seam: the pool's planes guard refuses the planes whatever the ledger
+// says.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PLANES_GUARD_REFUSES: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// One sequence's recurrent cells lent out of the model by
+/// [`Qwen35Inner::lend_scheduled_recurrent`]. Dropping it instead of
+/// returning it loses the sequence's cells.
+pub(crate) struct LentRecurrent {
+    pub(crate) seq: SeqId,
+    pub(crate) caches: Vec<Qwen3_5LayerCache>,
+    active: bool,
+}
+
 impl Qwen35Inner {
     /// Create a new Qwen35Inner with the given configuration.
     pub(crate) fn new(config: Qwen3_5Config) -> Result<Self> {
@@ -75,6 +92,9 @@ impl Qwen35Inner {
             serial_decode: None,
             dflash2_prefix,
             dflash2_states,
+            dflash2_wave_ready: false,
+            prefill_runs: std::collections::HashMap::new(),
+            prefill_pass_rates: Default::default(),
             cache_recency,
             memory_plan: None,
             memory_registration: None,
@@ -85,6 +105,8 @@ impl Qwen35Inner {
             },
             max_context: None,
             decode_share: crate::engine::scheduler::DEFAULT_DECODE_SHARE,
+            activations: crate::models::qwen3_5::load_plan::default_activations(false, false),
+            planes: None,
             caches: None,
             tokenizer: None,
             vision_encoder: None,
@@ -151,6 +173,7 @@ impl Qwen35Inner {
                 &*self,
                 recurrent,
                 self.has_mtp_weights(),
+                true,
                 None,
                 self.max_memory_bytes,
                 self.max_context,
@@ -166,18 +189,39 @@ impl Qwen35Inner {
                  cache requires at least one attention layer",
             ));
         }
-        let block_size = self.config.paged_block_size();
         let head_size = self.config.head_dim as u32;
         let num_kv_heads = self.config.num_kv_heads as u32;
         let max_seq_len = self.config.served_context_tokens();
         let format = self.config.kv_format();
+        let heads = crate::models::qwen3_5::load_plan::PoolHeads::of(&self.config);
         let cache_dtype = crate::models::qwen3_5::load_plan::qwen35_pool_cache_dtype(
             "Qwen3.5 block-paged adapter",
             format,
-            crate::models::qwen3_5::load_plan::PoolHeads::of(&self.config),
-            block_size,
+            heads,
+            self.config.paged_block_size(),
             crate::models::qwen3_5::dflash2_turn::DFlash2Target::embedding_dtype(&*self)?,
         )?;
+        let page = crate::models::qwen3_5::load_plan::pool_page(
+            &crate::models::qwen3_5::load_plan::PageInputs {
+                heads,
+                cache_dtype,
+                draft: self.dflash2.is_some(),
+                explicit_block: self.config.paged_block_size,
+                tile: crate::models::qwen3_5::load_plan::device_builds_tile(),
+            },
+        );
+        let block_size = page.block_size;
+        let layout = mlx_paged_attn::PageLayout {
+            keys_token_major: page.keys_token_major,
+            ..mlx_paged_attn::PageLayout::default()
+        };
+        if self.dflash2_states.store.block_size() != block_size {
+            self.dflash2_states = crate::models::qwen3_5::dflash2_state::paged::DFlash2States::new(
+                block_size,
+                Arc::clone(&self.cache_recency),
+            );
+            self.dflash2_prefix = PrefixTracker::new(block_size);
+        }
         let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
             attn_layer_count,
             num_kv_heads,
@@ -186,23 +230,71 @@ impl Qwen35Inner {
             cache_dtype,
         )
         .map_err(|e| Error::from_reason(format!("Qwen3.5 block-paged adapter: {e}")))?;
-        let plan = crate::models::qwen3_5::load_plan::plan_qwen35_load(
-            "Qwen3.5",
-            &*self,
-            recurrent,
-            self.has_mtp_weights(),
-            Some(crate::models::qwen3_5::load_plan::PoolGeometry {
-                format,
-                bytes_per_block,
-                block_size,
-                layers: attn_layer_count,
-                explicit_mib: self.config.paged_cache_memory_mb,
-            }),
-            self.max_memory_bytes,
-            self.max_context,
-            self.disk_options.cache_disk,
-        )?
-        .ok_or_else(|| {
+        let geometry = crate::models::qwen3_5::load_plan::PoolGeometry {
+            format,
+            bytes_per_block,
+            block_size,
+            layers: attn_layer_count,
+            explicit_mib: self.config.paged_cache_memory_mb,
+        };
+        let mtp_weights = self.has_mtp_weights();
+        let plan_now = |inner: &Self| {
+            crate::models::qwen3_5::load_plan::plan_qwen35_load(
+                "Qwen3.5",
+                inner,
+                recurrent,
+                mtp_weights,
+                true,
+                Some(geometry),
+                inner.max_memory_bytes,
+                inner.max_context,
+                inner.disk_options.cache_disk,
+            )
+        };
+        let mut plan = plan_now(self)?;
+        let planes_bytes = self.attached_planes_bytes();
+        if planes_bytes > 0
+            && let Some(with) = plan.as_ref()
+        {
+            let without = crate::models::qwen3_5::load_plan::plan_qwen35_load_freed(
+                "Qwen3.5",
+                &*self,
+                recurrent,
+                mtp_weights,
+                true,
+                Some(geometry),
+                self.max_memory_bytes,
+                self.max_context,
+                self.disk_options.cache_disk,
+                planes_bytes,
+            )
+            .and_then(|without| {
+                without.ok_or_else(|| Error::from_reason("the working set is unreadable"))
+            });
+            let kept = without.map_err(|error| error.reason).and_then(|without| {
+                crate::models::qwen3_5::load_plan::planes_ledger(planes_bytes, with, &without)
+            });
+            #[cfg(test)]
+            let kept = if PLANES_GUARD_REFUSES.with(std::cell::Cell::get) {
+                Err("refused by the test seam".to_string())
+            } else {
+                kept
+            };
+            match kept {
+                Ok(line) => {
+                    crate::utils::gguf_planes::load_line(format!("Qwen3.5 memory plan: {line}"))
+                }
+                Err(why) => {
+                    let dropped = self.detach_planes();
+                    crate::array::memory::synchronize_and_clear_cache();
+                    crate::utils::gguf_planes::load_line(format!(
+                        "Qwen3.5 GGUF planes dropped ({dropped} B): {why}"
+                    ));
+                    plan = plan_now(self)?;
+                }
+            }
+        }
+        let plan = plan.ok_or_else(|| {
             Error::from_reason(
                 "Qwen3.5 memory plan: the Metal working set is unreadable; refusing an \
                  unplanned paged pool",
@@ -243,11 +335,12 @@ impl Qwen35Inner {
                             Arc::clone(&recency),
                         ),
                     ));
-                    let pool = mlx_paged_attn::LayerKVPool::new(
+                    let pool = mlx_paged_attn::LayerKVPool::new_with_layout(
                         pa_config,
                         num_blocks,
                         max_num_blocks,
                         cache_dtype,
+                        layout,
                     )
                     .map_err(|e| format!("Failed to construct Qwen3.5 KV pool: {e}"))?;
                     let adapter = PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size)
@@ -265,23 +358,140 @@ impl Qwen35Inner {
             );
         }
         adapter.set_memory_ceiling(plan.ceiling_bytes());
+        adapter.set_activations(self.activations);
+        adapter.set_planes_route(self.attached_planes_plan().store_identity());
+        crate::utils::gguf_planes::load_line(format!(
+            "Qwen3.5 state store identity: {}",
+            adapter.cache_identity()
+        ));
+        let keys = if page.keys_token_major {
+            "token-major"
+        } else {
+            "vllm"
+        };
+        crate::utils::gguf_planes::load_line(format!(
+            "Qwen3.5 KV page: block_size={block_size} keys={keys}"
+        ));
         self.paged_adapter = Some(adapter);
         self.scheduled_recurrent
             .set_max_live_units(pool_plan.lanes as usize);
         info!(
             "Qwen3.5 paged adapter enabled after weight materialization: initial_blocks={}, \
              max_blocks={}, block_size={}, pool_window_tokens={}, trained_window_tokens={}, \
-             pool_kv_format={}",
+             pool_kv_format={}, keys={}",
             num_blocks,
             max_num_blocks,
             block_size,
             pool_plan.lane.window.maximum(),
             max_seq_len,
             format.as_str(),
+            keys,
         );
         self.memory_registration = Some(registration);
         self.memory_plan = Some(plan);
         Ok(())
+    }
+
+    /// Attach every tensor of `plan` to its projection from `arrays`, the
+    /// import's planes by key. A planned tensor that does not attach, or an
+    /// array no tensor plans, fails the load.
+    pub(crate) fn attach_planes(
+        &mut self,
+        plan: &crate::utils::gguf_planes::PlanesPlan,
+        mut arrays: HashMap<String, MxArray>,
+    ) -> Result<()> {
+        use crate::models::qwen3_5::decoder_layer::AttentionType;
+        use crate::utils::gguf_planes::Role;
+        for t in &plan.tensors {
+            let array = arrays.remove(&t.key).ok_or_else(|| {
+                Error::from_reason(format!("GGUF planes {}: no array was written", t.key))
+            })?;
+            let layer = self.layers.get_mut(t.layer as usize).ok_or_else(|| {
+                Error::from_reason(format!("GGUF planes {}: no layer {}", t.key, t.layer))
+            })?;
+            let attached = match (t.role, &mut layer.attn) {
+                (Role::GateUp | Role::Gate | Role::Up | Role::Down, _) => {
+                    layer.mlp.attach_planes(array, t.clone())
+                }
+                (Role::Out, AttentionType::Linear(gdn)) => {
+                    gdn.out_proj_mut().attach_planes(array, t.clone())
+                }
+                (Role::O, AttentionType::Full(attn)) => {
+                    attn.o_proj_mut().attach_planes(array, t.clone())
+                }
+                (role, _) => Err(Error::from_reason(format!(
+                    "planes {} of role {role:?} do not fit layer {}'s mixer",
+                    t.key, t.layer
+                ))),
+            };
+            attached
+                .map_err(|error| Error::from_reason(format!("GGUF planes: {}", error.reason)))?;
+        }
+        if let Some(key) = arrays.keys().next() {
+            return Err(Error::from_reason(format!(
+                "GGUF planes {key}: written but not planned"
+            )));
+        }
+        self.planes = (!plan.tensors.is_empty()).then(|| plan.clone());
+        Ok(())
+    }
+
+    /// Every attached planes array with its planned tensor, in layer order.
+    pub(crate) fn attached_planes(&self) -> Vec<&crate::models::quantized_linear::AttachedPlanes> {
+        use crate::models::qwen3_5::decoder_layer::AttentionType;
+        let mut out = Vec::new();
+        for layer in &self.layers {
+            out.extend(layer.mlp.planes());
+            out.extend(match &layer.attn {
+                AttentionType::Linear(gdn) => gdn.out_proj().planes(),
+                AttentionType::Full(attn) => attn.o_proj().planes(),
+            });
+        }
+        out
+    }
+
+    pub(crate) fn attached_planes_bytes(&self) -> u64 {
+        self.attached_planes()
+            .iter()
+            .map(|p| p.array.nbytes() as u64)
+            .sum()
+    }
+
+    /// The plan of what is attached now, on the load's walk: the source of
+    /// the planes part of the state store identity.
+    pub(crate) fn attached_planes_plan(&self) -> crate::utils::gguf_planes::PlanesPlan {
+        crate::utils::gguf_planes::PlanesPlan {
+            tensors: self
+                .attached_planes()
+                .into_iter()
+                .map(|p| p.tensor.clone())
+                .collect(),
+            walk: self
+                .planes
+                .as_ref()
+                .map(|plan| plan.walk)
+                .unwrap_or_default(),
+            left_out: Vec::new(),
+        }
+    }
+
+    /// Drop every projection's planes; returns their bytes.
+    pub(crate) fn detach_planes(&mut self) -> u64 {
+        use crate::models::qwen3_5::decoder_layer::AttentionType;
+        let mut bytes = 0;
+        for layer in &mut self.layers {
+            let mut dropped = layer.mlp.detach_planes();
+            dropped.extend(
+                match &mut layer.attn {
+                    AttentionType::Linear(gdn) => gdn.out_proj_mut().detach_planes(),
+                    AttentionType::Full(attn) => attn.o_proj_mut().detach_planes(),
+                }
+                .map(|planes| *planes),
+            );
+            bytes += dropped.iter().map(|p| p.array.nbytes() as u64).sum::<u64>();
+        }
+        self.planes = None;
+        bytes
     }
 
     /// Opens the load's SSD tier for its states (Splash `openDiskTier`), with
@@ -447,6 +657,9 @@ impl Qwen35Inner {
                 self.paged_context_limits(),
                 self.paged_adapter.is_some(),
                 kv_format,
+                self.paged_adapter
+                    .as_ref()
+                    .is_some_and(|adapter| adapter.int8_queries_active()),
             )
         }
     }
@@ -636,7 +849,91 @@ impl Qwen35Inner {
         self.activate_scheduled_recurrent(seq_id)
     }
 
+    /// Folds `seq_id`'s DFlash2 lane's pending rows into the sequence's
+    /// cells, active or parked; a sequence without cells has nothing to
+    /// fold. A failed fold leaves the cells behind their history, so no
+    /// live or history-keyed GDN state is reused until a recompute.
+    pub(crate) fn settle_scheduled_lane(&mut self, seq_id: SeqId) {
+        let Some(gdn) = self
+            .dflash2_states
+            .seq_lanes
+            .get_mut(&seq_id)
+            .and_then(|lane| lane.gdn.as_mut())
+        else {
+            return;
+        };
+        let caches = if self.active_scheduled_seq == Some(seq_id) {
+            self.caches.as_deref_mut()
+        } else {
+            self.scheduled_recurrent
+                .live_mut(seq_id)
+                .map(Vec::as_mut_slice)
+        };
+        let Some(caches) = caches else {
+            return;
+        };
+        if let Err(error) = gdn.settle(caches) {
+            tracing::warn!("Qwen3.5 sequence {seq_id}: DFlash2 lane settle failed: {error}");
+            self.paged_gdn_state_dirty = true;
+        }
+    }
+
+    /// Whether `seq_id`'s cells can be lent: active with its cells, or
+    /// parked.
+    pub(crate) fn can_lend_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
+        if self.active_scheduled_seq == Some(seq_id) {
+            return self.caches.is_some();
+        }
+        self.scheduled_recurrent.contains_live(seq_id)
+    }
+
+    /// `seq_id`'s cells out whole, so several sequences' cells are reachable
+    /// at once; the active sequence stays active. `None` without cells.
+    /// Every lent set goes back through [`Self::return_lent_recurrent`].
+    pub(crate) fn lend_scheduled_recurrent(&mut self, seq_id: SeqId) -> Option<LentRecurrent> {
+        if self.active_scheduled_seq == Some(seq_id) {
+            return self.caches.take().map(|caches| LentRecurrent {
+                seq: seq_id,
+                caches,
+                active: true,
+            });
+        }
+        self.scheduled_recurrent
+            .take_live(seq_id)
+            .map(|caches| LentRecurrent {
+                seq: seq_id,
+                caches,
+                active: false,
+            })
+    }
+
+    /// Puts every set of `lent` back where it was lent from; all go back
+    /// before the first failure is returned.
+    pub(crate) fn return_lent_recurrent(&mut self, lent: Vec<LentRecurrent>) -> Result<()> {
+        let bytes = self.config.recurrent_state_bytes();
+        let mut failure = None;
+        for lane in lent {
+            if lane.active {
+                self.caches = Some(lane.caches);
+                continue;
+            }
+            if let Err(error) = self
+                .scheduled_recurrent
+                .insert_live(lane.seq, bytes, lane.caches)
+            {
+                failure.get_or_insert_with(|| {
+                    Error::from_reason(format!(
+                        "Qwen3.5 sequence {}: lent recurrent state not returned: {error}",
+                        lane.seq
+                    ))
+                });
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+
     pub(super) fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
+        crate::models::qwen3_5::scheduled_dflash2::end_lane(self, seq_id);
         self.scheduled_mtp.release(seq_id);
         self.dflash2_states.end_turn(seq_id);
         if self.active_scheduled_seq == Some(seq_id) {
@@ -777,53 +1074,7 @@ impl Qwen35Inner {
         )
         .map_err(Error::from_reason)?;
 
-        let result = (|| {
-            let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
-            let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
-            let input_ids = MxArray::from_uint32(&token_ids, &[rows.len() as i64, 1])?;
-            let mut hidden_states = self.embedding.forward(&input_ids)?;
-
-            let num_layers = self.layers.len();
-            for layer_idx in 0..num_layers {
-                let kind = self.layer_kinds[layer_idx];
-                let mut gdn_cache = if matches!(
-                    kind,
-                    crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind::Linear
-                ) {
-                    Some(self.stacked_gdn_cache(&seq_ids, layer_idx)?)
-                } else {
-                    None
-                };
-                hidden_states = {
-                    let layer = unsafe { &mut *self.layers.as_mut_ptr().add(layer_idx) };
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                        Error::from_reason("Qwen3.5 paged adapter dropped during batched decode")
-                    })?;
-                    layer.forward_paged_batched(
-                        &hidden_states,
-                        kind,
-                        adapter,
-                        &planned_rows,
-                        gdn_cache.as_mut(),
-                    )?
-                };
-                if let Some(cache) = gdn_cache.as_ref() {
-                    self.scatter_gdn_cache(&seq_ids, layer_idx, cache)?;
-                }
-                crate::models::qwen3_5::paged_forward::maybe_submit_paged_decode_layer(
-                    layer_idx,
-                    num_layers,
-                    &hidden_states,
-                );
-            }
-
-            let hidden_states = self.final_norm.forward(&hidden_states)?;
-            if let Some(head) = &self.lm_head {
-                head.forward(&hidden_states)
-            } else {
-                self.embedding.as_linear(&hidden_states)
-            }
-        })();
+        let result = self.forward_recorded_decode_wave(rows, &planned_rows);
         if result.is_err() {
             // `record_decode_wave` committed every row (or the call already
             // returned), so the recorded set is the wave itself.
@@ -848,6 +1099,116 @@ impl Qwen35Inner {
             }
         }
         result
+    }
+
+    /// The `[N, 1]` decode forward over rows the pool already recorded,
+    /// each at its `planned_rows` position; every row's cells advance in
+    /// the request table.
+    fn forward_recorded_decode_wave(
+        &mut self,
+        rows: &[(SeqId, u32)],
+        planned_rows: &[(SeqId, u32)],
+    ) -> Result<MxArray> {
+        let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
+        let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
+        let input_ids = MxArray::from_uint32(&token_ids, &[rows.len() as i64, 1])?;
+        let mut hidden_states = self.embedding.forward(&input_ids)?;
+
+        let num_layers = self.layers.len();
+        for layer_idx in 0..num_layers {
+            let kind = self.layer_kinds[layer_idx];
+            let mut gdn_cache = if matches!(
+                kind,
+                crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind::Linear
+            ) {
+                Some(self.stacked_gdn_cache(&seq_ids, layer_idx)?)
+            } else {
+                None
+            };
+            hidden_states = {
+                let layer = unsafe { &mut *self.layers.as_mut_ptr().add(layer_idx) };
+                let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    Error::from_reason("Qwen3.5 paged adapter dropped during batched decode")
+                })?;
+                layer.forward_paged_batched(
+                    &hidden_states,
+                    kind,
+                    adapter,
+                    planned_rows,
+                    gdn_cache.as_mut(),
+                )?
+            };
+            if let Some(cache) = gdn_cache.as_ref() {
+                self.scatter_gdn_cache(&seq_ids, layer_idx, cache)?;
+            }
+            crate::models::qwen3_5::paged_forward::maybe_submit_paged_decode_layer(
+                layer_idx,
+                num_layers,
+                &hidden_states,
+            );
+        }
+
+        let hidden_states = self.final_norm.forward(&hidden_states)?;
+        if let Some(head) = &self.lm_head {
+            head.forward(&hidden_states)
+        } else {
+            self.embedding.as_linear(&hidden_states)
+        }
+    }
+
+    /// `seq_id`'s scheduled decode row, its `token` already recorded at
+    /// `position`: the forward its decode takes when no draft runs (a
+    /// one-row [`Self::run_paged_decode_step_batched`]), so its logits and
+    /// cells are those. Returns the logits and the cells before the
+    /// forward.
+    pub(crate) fn run_recorded_decode_row(
+        &mut self,
+        seq_id: SeqId,
+        token: u32,
+        position: u32,
+    ) -> Result<(MxArray, Vec<Qwen3_5LayerCache>)> {
+        if self.cached_rope_deltas.unwrap_or(0) != 0 {
+            return Err(Error::from_reason(
+                "Qwen3.5 batched decode does not admit image-derived M-RoPE state",
+            ));
+        }
+        self.park_active_scheduled_recurrent()?;
+        let row = [(seq_id, token)];
+        self.validate_scheduled_decode_residency(&row)?;
+        let before = self
+            .scheduled_decode_recurrent_snapshots(&row)?
+            .pop()
+            .map(|(_, cells)| cells)
+            .ok_or_else(|| {
+                Error::from_reason(format!("Qwen3.5 sequence {seq_id} has no recurrent state"))
+            })?;
+        match self.forward_recorded_decode_wave(&row, &[(seq_id, position)]) {
+            Ok(logits) => Ok((logits, before)),
+            Err(error) => {
+                self.reinstate_scheduled_recurrent(seq_id, before)?;
+                Err(error)
+            }
+        }
+    }
+
+    /// Puts `cells` back as `seq_id`'s recurrent cells, active or parked.
+    pub(crate) fn reinstate_scheduled_recurrent(
+        &mut self,
+        seq_id: SeqId,
+        cells: Vec<Qwen3_5LayerCache>,
+    ) -> Result<()> {
+        if self.active_scheduled_seq == Some(seq_id) {
+            self.caches = Some(cells);
+            return Ok(());
+        }
+        self.scheduled_recurrent
+            .insert_live(seq_id, self.config.recurrent_state_bytes(), cells)
+            .map(drop)
+            .map_err(|error| {
+                Error::from_reason(format!(
+                    "Qwen3.5 sequence {seq_id}: recurrent state not reinstated: {error}"
+                ))
+            })
     }
 
     /// Drops the live draft window: a site that moves the live request or

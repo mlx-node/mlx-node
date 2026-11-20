@@ -96,7 +96,12 @@ describe('selfCheck', () => {
   const good = {
     protocolVersion: 1,
     agentCapabilities: { loadSession: true, promptCapabilities: { embeddedContext: true } },
-    _meta: { 'x.ai/pluginDirs': true, agentVersion: '1.0.45', modelState: { availableModels: [{ modelId: 'm' }] } },
+    _meta: {
+      'x.ai/pluginDirs': true,
+      'x.ai/workflowControl': true,
+      agentVersion: '1.0.45',
+      modelState: { availableModels: [{ modelId: 'm' }] },
+    },
   };
 
   it('passes the recorded initialize reply', () => {
@@ -110,6 +115,11 @@ describe('selfCheck', () => {
       ok: false,
       row: 3,
     });
+    for (const control of [false, 'true', 1, null, undefined]) {
+      expect(selfCheck(readInitialize({ ...good, _meta: { ...good._meta, 'x.ai/workflowControl': control } }))).toEqual(
+        { ok: false, row: 6 },
+      );
+    }
     expect(selfCheck(readInitialize({ ...good, _meta: { ...good._meta, agentVersion: 1 } }))).toEqual({
       ok: false,
       row: 4,
@@ -172,6 +182,22 @@ describe('guard scenarios against the fake agent', () => {
 
   it('a self-check failure blocks the mode before any session (no-plugin-dirs)', async () => {
     const fake = await fakeHost('no-plugin-dirs');
+    try {
+      const error = await fake.host.createSession({ modelId: 'qwen3.5-4b' }).catch((e: unknown) => e);
+      expect((error as AgentHostError).code).toBe('agent-incompatible');
+      expect(fake.host.modeState().state).toBe('blocked');
+      expect(fake.sent().map((m) => m.method)).toEqual(['initialize']);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it('an agent without the workflow stop control blocks the mode before any session (row 6)', async () => {
+    const fake = await fakeHost('chat-basic', {
+      mutate: (scenario) => {
+        scenario.initialize = { ...(scenario.initialize as object), workflowControl: false };
+      },
+    });
     try {
       const error = await fake.host.createSession({ modelId: 'qwen3.5-4b' }).catch((e: unknown) => e);
       expect((error as AgentHostError).code).toBe('agent-incompatible');

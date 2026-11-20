@@ -67,6 +67,7 @@ fn score_self(inner: &mut Qwen35Inner, dir: &std::path::Path) -> Result<EvalRepo
             cache_dir: dir.to_path_buf(),
             identity: crate::quality::cache::EvalIdentity::fixture("a"),
             logit_chunk: LOGIT_CHUNK,
+            depth_edges: Vec::new(),
         },
     )? {
         EvalOutcome::Scored(report) => Ok(report),

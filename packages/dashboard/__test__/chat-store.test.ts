@@ -47,6 +47,7 @@ const SYNC: ChatSync = {
   notices: [],
   transcriptError: null,
   permissionMarks: [],
+  runs: [],
 };
 
 let stops: Array<() => void> = [];
@@ -246,6 +247,24 @@ describe('permission modes in the stores', () => {
     expect(again.permissionMarks).toEqual([UP]);
   });
 
+  it('a sync and a runs event each replace the live runs; a gap asks for a fresh sync', () => {
+    const live = { runId: 'wf_1', stopping: false };
+    const first = applyConversationEvent(null, { ...WORK, runs: [live] }) as ConversationState;
+    expect(first.runs).toEqual([live]);
+    const stopping = applyConversationEvent(first, {
+      type: 'runs',
+      seq: 1,
+      runs: [{ runId: 'wf_1', stopping: true }],
+    }) as ConversationState;
+    expect(stopping.runs).toEqual([{ runId: 'wf_1', stopping: true }]);
+    expect(first.runs).toEqual([live]);
+    const gone = applyConversationEvent(stopping, { type: 'runs', seq: 2, runs: [] }) as ConversationState;
+    expect(gone.runs).toEqual([]);
+    expect(applyConversationEvent(gone, { type: 'runs', seq: 4, runs: [live] })).toBe('resync');
+    const again = applyConversationEvent(gone, { ...WORK, seq: 5, runs: [live] }) as ConversationState;
+    expect(again.runs).toEqual([live]);
+  });
+
   it('after a reconnect to a restarted app the new sync says Ask, with its restart line', async () => {
     const first = stubApi({}, { chat: { conversations: { c1: { ...WORK, permissionMarks: [UP] } } } });
     stops.push(first);
@@ -326,6 +345,7 @@ describe('the page copies of the Chat types', () => {
     expectTypeOf<Page.ConversationNotice>().toEqualTypeOf<Server.ConversationNotice>();
     expectTypeOf<Page.TranscriptOp>().toEqualTypeOf<Server.TranscriptOp>();
     expectTypeOf<Page.TurnEnd>().toEqualTypeOf<Server.TurnEnd>();
+    expectTypeOf<Page.RunView>().toEqualTypeOf<Server.RunView>();
     expectTypeOf<Page.ConversationEvent>().toEqualTypeOf<Server.ConversationEvent>();
     expectTypeOf<Page.AgentModeState>().toEqualTypeOf<Server.AgentModeState>();
     expectTypeOf<Page.ChatHostState>().toEqualTypeOf<Server.ChatHostState>();

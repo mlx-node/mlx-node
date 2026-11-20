@@ -72,11 +72,14 @@ mod flat_dflash2;
 mod forward;
 mod gdn_prefix;
 mod lifecycle;
-pub(crate) use lifecycle::cold_tier_config_json;
+pub(crate) use lifecycle::{LentRecurrent, cold_tier_config_json};
 mod mtp;
 mod paged_backend;
+pub(crate) mod restore;
 #[cfg(test)]
 pub(crate) use paged_backend::PAGED_STEPS;
+#[cfg(test)]
+pub(crate) use restore::{AWAIT_READERS, COLD_LANDINGS, REFUSED_LANDINGS, RETRIES};
 mod paged_turn;
 pub(crate) mod scheduled_mtp;
 mod state;
@@ -183,6 +186,14 @@ pub(crate) struct Qwen35Inner {
     pub(crate) serial_decode: Option<crate::models::qwen3_5::dflash2_turn::SerialDecode>,
     pub(crate) dflash2_prefix: PrefixTracker,
     pub(crate) dflash2_states: crate::models::qwen3_5::dflash2_state::paged::DFlash2States,
+    /// Scheduled DFlash2 lanes that reach verify in one step run one verify
+    /// wave (`scheduled_dflash2::run_wave`); decided at the draft's load.
+    pub(crate) dflash2_wave_ready: bool,
+    /// Scheduled prefill units between their passes, by sequence.
+    pub(crate) prefill_runs:
+        std::collections::HashMap<u32, crate::models::qwen3_5::dflash2_turn::ScheduledDraftRun>,
+    /// The last launch's measured layer times.
+    pub(crate) prefill_pass_rates: crate::models::qwen3_5::paged_forward::PassRates,
     /// The one clock the allocator, the DFlash2 store, the GDN ladder and
     /// history entries and the scheduler's idle owners stamp with.
     pub(crate) cache_recency: Arc<mlx_paged_attn::CacheRecency>,
@@ -200,6 +211,12 @@ pub(crate) struct Qwen35Inner {
     pub(crate) max_context: Option<u32>,
     /// `--decode-share` (Splash `EngineConfig::decodeShare`).
     pub(crate) decode_share: f64,
+    /// `--activations` (Splash `Int8Activations`): the paged pool's
+    /// attention scores INT8 queries where that is faster.
+    pub(crate) activations: crate::transformer::Activations,
+    /// The GGUF planes attached to this load's projections: the attached
+    /// plan, on the product walk.
+    pub(crate) planes: Option<crate::utils::gguf_planes::PlanesPlan>,
     /// Same latch for the compiled CLEF decide backbone. Per-model state
     /// (not thread-local) so it sticks regardless of which thread runs
     /// `decide_clef`.
@@ -393,6 +410,15 @@ pub struct Qwen35LoadOptions {
     /// load fails.
     #[napi(ts_type = "'int8' | 'bf16' | undefined")]
     pub kv_format: Option<String>,
+    /// Int8 activations (`--activations`, Splash's): `'auto'` lets the
+    /// paged attention over an int8 pool, on Apple10 GPUs (M5) and later,
+    /// score int8 query codes for every query row at KV position 7,168 or
+    /// later, in prefill, verify and decode alike; `'bf16'` keeps every
+    /// query bf16. Unset: `'auto'` for a qwen3_5 load with a DFlash2 draft,
+    /// `'bf16'` for a qwen3_5 load with none and for qwen3_5_moe.
+    /// Both modes read and write one persistent state cache.
+    #[napi(ts_type = "'auto' | 'bf16' | undefined")]
+    pub activations: Option<String>,
     /// Metal memory budget in bytes (`--max-memory`): it can only lower the
     /// automatic budget the load's memory plan derives from the working set.
     #[napi(ts_type = "number | undefined")]
@@ -464,6 +490,12 @@ pub struct Qwen3_5ContextLimits {
     /// Format of the K/V a turn on `effective_window_tokens` writes.
     #[napi(ts_type = "'int8' | 'bf16'")]
     pub kv_format: String,
+    /// Queries of the paged attention over the pool: `'int8'` when rows from
+    /// KV position 7,168 on score int8 query codes (the load's activations
+    /// `'auto'` over an int8 pool on a GPU that scores int8 queries), else
+    /// `'bf16'`.
+    #[napi(ts_type = "'int8' | 'bf16'")]
+    pub attention_queries: String,
     /// The model's `modelId` in `memoryGovernorStatus().scheduler`; unset
     /// when the load registered no pool with the memory governor.
     pub governor_model_id: Option<f64>,
@@ -476,6 +508,7 @@ impl Qwen3_5ContextLimits {
         value: (u32, u32, u32, u32),
         memory_window: bool,
         kv_format: crate::transformer::KvFormat,
+        int8_queries: bool,
     ) -> Self {
         Self {
             trained_window_tokens: value.0,
@@ -485,6 +518,7 @@ impl Qwen3_5ContextLimits {
             rest_of_window_output_budget: true,
             omitted_budget_is_rest_of_window: memory_window,
             kv_format: kv_format.as_str().to_string(),
+            attention_queries: if int8_queries { "int8" } else { "bf16" }.to_string(),
             governor_model_id: None,
         }
     }
@@ -591,10 +625,10 @@ impl Qwen3_5Model {
         self.paged_active
     }
 
-    /// Native admission width for plain text AR turns. Installed vision and
-    /// MTP modules do not disable text batching: requests that actually carry
-    /// media or set `enable_mtp=true` are routed through the ordered exclusive
-    /// lane by the scheduler.
+    /// Native admission width for text turns. Installed vision, MTP and
+    /// DFlash2 modules do not disable text batching: requests that carry
+    /// media, or set `enable_mtp=true` where the scheduler cannot draft, are
+    /// routed through the ordered exclusive lane by the scheduler.
     #[napi]
     pub fn max_concurrent_sequences(&self) -> u32 {
         qwen35_max_concurrent_sequences(self.paged_active, self.scheduled_lanes)
@@ -670,6 +704,14 @@ impl Qwen3_5Model {
             .map(|value| crate::transformer::KvFormat::parse(Some(value)))
             .transpose()
             .map_err(|message| Error::from_reason(format!("Qwen3.5 load: {message}")))?;
+        let activations = crate::transformer::Activations::parse(
+            options.activations.as_deref(),
+            crate::models::qwen3_5::load_plan::default_activations(
+                false,
+                draft_model_path.is_some(),
+            ),
+        )
+        .map_err(|message| Error::from_reason(format!("Qwen3.5 load: {message}")))?;
         let max_memory_bytes = crate::models::qwen3_5::load_plan::max_memory_option(
             "Qwen3.5",
             options.max_memory_bytes,
@@ -689,6 +731,7 @@ impl Qwen3_5Model {
             &source,
             draft_model_path,
             kv_format,
+            activations,
             max_memory_bytes,
             max_context,
             decode_share,

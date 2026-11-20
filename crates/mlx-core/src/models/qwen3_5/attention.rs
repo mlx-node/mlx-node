@@ -18,7 +18,7 @@ use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
-use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
+use crate::models::quantized_linear::{LinearProj, MixerResidual, QuantizedLinear};
 
 /// Qwen3.5 full attention with gating and partial RoPE.
 ///
@@ -80,6 +80,16 @@ pub struct Qwen3_5Attention {
 static NATIVE_KV_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
 static DECODE_GATHER_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
 
+/// The queries one read took, from the adapter's `[bf16, int8]` counters
+/// before and after it.
+fn queries_taken(before: [u64; 2], after: [u64; 2]) -> &'static str {
+    match (after[0] > before[0], after[1] > before[1]) {
+        (_, false) => "bf16",
+        (false, true) => "int8",
+        (true, true) => "bf16+int8",
+    }
+}
+
 /// What a paged forward reads after storing its rows: one decode token, a
 /// prefill chunk (Splash `PagedAttention::addPrefill`) or a verify block
 /// (Splash `addVerify`, `kv::verifyAttentionSplits`).
@@ -88,6 +98,15 @@ pub(crate) enum PagedPass {
     Decode,
     Prefill,
     Verify,
+}
+
+/// One lane of [`Qwen3_5Attention::forward_paged_wave`]: its sequence, the
+/// position of its first verify row and the RoPE position of that row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PagedWaveLane {
+    pub seq: SeqId,
+    pub first_logical_position: u32,
+    pub rope_position_offset: i32,
 }
 
 /// Store a chunk's rows into the pool, then attend over the pool (Splash
@@ -107,11 +126,41 @@ pub(super) fn paged_store_attend(
     scale: f32,
     out_dtype: DType,
 ) -> Result<MxArray> {
-    let batch = queries.shape_at(0)?;
-    let seq_len = queries.shape_at(1)?;
-    let num_heads = queries.shape_at(2)?;
-    let head_dim = queries.shape_at(3)?;
+    paged_store(
+        adapter,
+        attn_layer_idx,
+        first_logical_position,
+        pass,
+        keys,
+        values,
+    )?;
+    paged_attend(
+        adapter,
+        attn_layer_idx,
+        first_logical_position,
+        pass,
+        queries,
+        scale,
+        out_dtype,
+    )
+}
+
+/// Store a chunk's K/V rows (`[B, T, Hkv, D]`) into the pool (Splash
+/// `PagedAttention::addPrefillStore`). On the native route the write is a
+/// lazy pool array the adapter holds: a caller that attends nothing after it
+/// must evaluate [`PagedKVCacheAdapter::pending_pool_write_arrays`].
+pub(super) fn paged_store(
+    adapter: &mut PagedKVCacheAdapter,
+    attn_layer_idx: u32,
+    first_logical_position: u32,
+    pass: PagedPass,
+    keys: &MxArray,
+    values: &MxArray,
+) -> Result<()> {
+    let batch = keys.shape_at(0)?;
+    let seq_len = keys.shape_at(1)?;
     let num_kv_heads = keys.shape_at(2)?;
+    let head_dim = keys.shape_at(3)?;
     let keys_paged = keys.reshape(&[batch * seq_len, num_kv_heads, head_dim])?;
     let values_paged = values.reshape(&[batch * seq_len, num_kv_heads, head_dim])?;
     let prefill = pass != PagedPass::Decode;
@@ -215,6 +264,31 @@ pub(super) fn paged_store_attend(
             "paged prefill KV write completed"
         );
     }
+    Ok(())
+}
+
+/// Attend `queries` (`[B, T, Hq, D]`) over the pool rows a [`paged_store`]
+/// of the same chunk wrote; returns `[B, T, Hq * D]` in `out_dtype`.
+fn paged_attend(
+    adapter: &mut PagedKVCacheAdapter,
+    attn_layer_idx: u32,
+    first_logical_position: u32,
+    pass: PagedPass,
+    queries: &MxArray,
+    scale: f32,
+    out_dtype: DType,
+) -> Result<MxArray> {
+    let batch = queries.shape_at(0)?;
+    let seq_len = queries.shape_at(1)?;
+    let num_heads = queries.shape_at(2)?;
+    let head_dim = queries.shape_at(3)?;
+    let prefill = pass != PagedPass::Decode;
+    let trace_enabled = inference_trace_enabled();
+    let inference_info_enabled =
+        tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
+    let inference_debug_enabled =
+        tracing::enabled!(target: "mlx_core::inference", tracing::Level::DEBUG);
+    let report_prefill = inference_info_enabled && prefill && attn_layer_idx == 0 && seq_len > 8;
 
     let attn = match pass {
         PagedPass::Prefill | PagedPass::Verify => {
@@ -229,6 +303,7 @@ pub(super) fn paged_store_attend(
             };
             let start = (trace_enabled || report_prefill).then(Instant::now);
             let queries = queries.reshape(&[seq_len, num_heads, head_dim])?;
+            let launches = adapter.tile_query_launches();
             let attn = adapter
                 .paged_prefill_attention(
                     attn_layer_idx,
@@ -238,14 +313,16 @@ pub(super) fn paged_store_attend(
                     scale,
                 )
                 .map_err(napi::Error::from_reason)?;
+            let query_kind = queries_taken(launches, adapter.tile_query_launches());
             if trace_enabled {
                 write_inference_trace(format_args!(
                     "[MLX_TRACE] qwen3.5-attn paged_prefill_attention \
-                     layer={} rows={} committed={} pass={:?} graph_ms={:.1}",
+                     layer={} rows={} committed={} pass={:?} queries={} graph_ms={:.1}",
                     attn_layer_idx,
                     seq_len,
                     first_logical_position,
                     plan_pass,
+                    query_kind,
                     start.map(elapsed_ms).unwrap_or(0.0)
                 ));
             }
@@ -257,6 +334,7 @@ pub(super) fn paged_store_attend(
                     rows = seq_len,
                     committed = first_logical_position,
                     pass = ?plan_pass,
+                    queries = query_kind,
                     graph_ms = start.map(elapsed_ms).unwrap_or(0.0),
                     "paged prefill attention graph constructed"
                 );
@@ -268,6 +346,7 @@ pub(super) fn paged_store_attend(
             // the attention read in one MLX dependency graph.
             let queries_3d = queries.reshape(&[1, num_heads, head_dim])?;
             let gather_trace_start = (trace_enabled || inference_debug_enabled).then(Instant::now);
+            let decode_rows = adapter.decode_query_rows();
             if !graph_decode_gather_enabled() {
                 let attn_3d = adapter
                     .gather_kv_for_decode(
@@ -280,9 +359,10 @@ pub(super) fn paged_store_attend(
                 if trace_enabled {
                     write_inference_trace(format_args!(
                         "[MLX_TRACE] qwen3.5-attn decode_gather_done \
-                         layer={} path=legacy total_ctx={} elapsed_ms={:.1}",
+                         layer={} path=legacy total_ctx={} queries={} elapsed_ms={:.1}",
                         attn_layer_idx,
                         adapter.current_token_count(),
+                        queries_taken(decode_rows, adapter.decode_query_rows()),
                         gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
                     ));
                 }
@@ -298,9 +378,10 @@ pub(super) fn paged_store_attend(
                         if trace_enabled {
                             write_inference_trace(format_args!(
                                 "[MLX_TRACE] qwen3.5-attn decode_gather_done \
-                                 layer={} path=graph total_ctx={} elapsed_ms={:.1}",
+                                 layer={} path=graph total_ctx={} queries={} elapsed_ms={:.1}",
                                 attn_layer_idx,
                                 adapter.current_token_count(),
+                                queries_taken(decode_rows, adapter.decode_query_rows()),
                                 gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
                             ));
                         }
@@ -665,6 +746,22 @@ impl Qwen3_5Attention {
         batch: i64,
         seq_len: i64,
     ) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+        if let Some(fused) = self.project_mixer_fused(x, batch, seq_len)? {
+            return Ok(fused);
+        }
+        let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
+        let (keys, values) = self.project_kv(x)?;
+        Ok((queries, gate, keys, values))
+    }
+
+    /// [`Self::project_mixer`]'s one-dispatch route, `None` where it does not
+    /// apply.
+    fn project_mixer_fused(
+        &self,
+        x: &MxArray,
+        batch: i64,
+        seq_len: i64,
+    ) -> Result<Option<(MxArray, MxArray, MxArray, MxArray)>> {
         if self.q_proj.has_q_gate_block_layout() {
             let fused = if let Some((merged, _)) = &self.kv_proj {
                 crate::models::quantized_linear::mixed_projection_forward(
@@ -692,12 +789,10 @@ impl Qwen3_5Attention {
                 } else {
                     (outputs[1].clone(), outputs[2].clone())
                 };
-                return Ok((queries, qg[1].clone(), keys, values));
+                return Ok(Some((queries, qg[1].clone(), keys, values)));
             }
         }
-        let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
-        let (keys, values) = self.project_kv(x)?;
-        Ok((queries, gate, keys, values))
+        Ok(None)
     }
 
     /// Merge `k_proj` + `v_proj` into one packed quantized projection when both
@@ -951,7 +1046,7 @@ impl Qwen3_5Attention {
 
         // Output projection
         self.o_proj
-            .forward_mixer_output(&gated_output, None, residual)
+            .forward_mixer_output(&gated_output, None, residual.map(MixerResidual::Source))
     }
 
     /// Forward pass routed through the block-paged KV adapter.
@@ -1002,10 +1097,161 @@ impl Qwen3_5Attention {
         rope_position_offset: i32,
         mrope_cache: &mut Option<(MxArray, MxArray)>,
     ) -> Result<MxArray> {
+        self.forward_paged_impl(
+            x,
+            adapter,
+            attn_layer_idx,
+            first_logical_position,
+            pass,
+            position_ids,
+            rope_position_offset,
+            mrope_cache,
+            None,
+        )
+    }
+
+    /// [`Self::forward_paged`] whose output projection adds `residual` in its
+    /// GEMM store where the shape takes the epilogue GEMM
+    /// ([`Self::o_proj_store_route`]); residual-inclusive output, the bits of
+    /// `residual + forward_paged(x)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_paged_store_residual(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        attn_layer_idx: u32,
+        first_logical_position: u32,
+        pass: PagedPass,
+        position_ids: Option<&MxArray>,
+        rope_position_offset: i32,
+        mrope_cache: &mut Option<(MxArray, MxArray)>,
+        residual: &MxArray,
+    ) -> Result<MxArray> {
+        self.forward_paged_impl(
+            x,
+            adapter,
+            attn_layer_idx,
+            first_logical_position,
+            pass,
+            position_ids,
+            rope_position_offset,
+            mrope_cache,
+            Some(MixerResidual::Store(residual)),
+        )
+    }
+
+    /// [`Self::forward_paged`] of a DFlash2 verify's rows whose output
+    /// projection adds `residual` in its planes `_r` store
+    /// ([`Self::o_proj_verify_route`]); residual-inclusive output.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_paged_verify_residual(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        attn_layer_idx: u32,
+        first_logical_position: u32,
+        rope_position_offset: i32,
+        residual: &MxArray,
+    ) -> Result<MxArray> {
+        self.forward_paged_impl(
+            x,
+            adapter,
+            attn_layer_idx,
+            first_logical_position,
+            PagedPass::Verify,
+            None,
+            rope_position_offset,
+            &mut None,
+            Some(MixerResidual::Verify(residual)),
+        )
+    }
+
+    /// Whether a DFlash2 verify's `rows` rows reach the output projection's
+    /// planes.
+    pub(crate) fn o_proj_verify_route(&self, rows: i64) -> bool {
+        self.o_proj.verify_residual_route(rows)
+    }
+
+    /// The output projection, where a load attaches its planes.
+    pub(crate) fn o_proj_mut(&mut self) -> &mut LinearProj {
+        &mut self.o_proj
+    }
+
+    pub(crate) fn o_proj(&self) -> &LinearProj {
+        &self.o_proj
+    }
+
+    /// Whether the output projection of `rows` rows takes the store-epilogue
+    /// GEMM.
+    pub(crate) fn o_proj_store_route(&self, rows: i64) -> Result<bool> {
+        self.o_proj
+            .store_epilogue_route(rows, (self.num_heads * self.head_dim) as i64)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_paged_impl(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        attn_layer_idx: u32,
+        first_logical_position: u32,
+        pass: PagedPass,
+        position_ids: Option<&MxArray>,
+        rope_position_offset: i32,
+        mrope_cache: &mut Option<(MxArray, MxArray)>,
+        residual: Option<MixerResidual<'_>>,
+    ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
 
         let (queries, gate, keys, values) = self.project_mixer(x, batch, seq_len)?;
+        let output = self.attend_projected(
+            &queries,
+            &keys,
+            &values,
+            adapter,
+            attn_layer_idx,
+            first_logical_position,
+            pass,
+            position_ids,
+            rope_position_offset,
+            mrope_cache,
+            x.dtype()?,
+        )?;
+
+        // Apply gate: output * sigmoid(gate) — one compiled fusion.
+        let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
+
+        // Output projection.
+        match residual {
+            Some(residual) => self
+                .o_proj
+                .forward_mixer_output(&gated_output, None, Some(residual)),
+            None => self.o_proj.forward(&gated_output),
+        }
+    }
+
+    /// The part of [`Self::forward_paged`] after the projections, for the
+    /// active sequence: QK norm, RoPE, the pool's operands, then
+    /// [`paged_store_attend`]. `queries` `[B, T, Hq, D]`, `keys` / `values`
+    /// `[B, T, Hkv * D]`; returns `[B, T, Hq * D]` in `out_dtype`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attend_projected(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        values: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        attn_layer_idx: u32,
+        first_logical_position: u32,
+        pass: PagedPass,
+        position_ids: Option<&MxArray>,
+        rope_position_offset: i32,
+        mrope_cache: &mut Option<(MxArray, MxArray)>,
+        out_dtype: DType,
+    ) -> Result<MxArray> {
+        let batch = queries.shape_at(0)?;
+        let seq_len = queries.shape_at(1)?;
         let keys = keys.reshape(&[
             batch,
             seq_len,
@@ -1020,7 +1266,7 @@ impl Qwen3_5Attention {
         ])?;
 
         // QK normalization on the last dim.
-        let queries = self.q_norm.forward(&queries)?;
+        let queries = self.q_norm.forward(queries)?;
         let keys = self.k_norm.forward(&keys)?;
 
         // RoPE: 3-row M-RoPE over `position_ids` for image-bearing prefill,
@@ -1089,14 +1335,221 @@ impl Qwen3_5Attention {
             &keys,
             &values,
             self.scale,
-            x.dtype()?,
+            out_dtype,
         )?;
+        Ok(output)
+    }
 
-        // Apply gate: output * sigmoid(gate) — one compiled fusion.
+    /// Q/gate, K and V of a wave `[N, T, H]`, each lane's rows with the bits
+    /// [`Self::project_mixer`] gives that lane alone: a packed block-order
+    /// Q/gate takes one `forward_lanes` per projection (the mixed dispatch
+    /// keeps the standalone projections' bits); any other layout, and a
+    /// K-quant Tiled64 projection off the lane tier (its 8-row `forward` is
+    /// not the mixed dispatch's tile), runs `project_mixer` per lane.
+    fn project_mixer_lanes(
+        &self,
+        x: &MxArray,
+        lanes: i64,
+        seq_len: i64,
+    ) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+        let hidden = x.shape_at(2)?;
+        let off_tier = |projection: &LinearProj| -> Result<bool> {
+            Ok(
+                matches!(projection, LinearProj::Quantized(q) if q.is_kquant_tiled())
+                    && !projection.lane_tier_holds(hidden)?,
+            )
+        };
+        let mixer_off_tier = match &self.kv_proj {
+            Some((merged, _)) => off_tier(&self.q_proj)? || off_tier(merged)?,
+            None => off_tier(&self.q_proj)? || off_tier(&self.k_proj)? || off_tier(&self.v_proj)?,
+        };
+        if self.q_gate_block_t.is_some() || !self.q_proj.has_q_gate_block_layout() || mixer_off_tier
+        {
+            let mut parts: [Vec<MxArray>; 4] = Default::default();
+            for lane in 0..lanes {
+                let x_lane = x.slice_axis(0, lane, lane + 1)?;
+                let (q, g, k, v) = self.project_mixer(&x_lane, 1, seq_len)?;
+                for (part, array) in parts.iter_mut().zip([q, g, k, v]) {
+                    part.push(array);
+                }
+            }
+            let [q, g, k, v] =
+                parts.map(|part| MxArray::concatenate_many(part.iter().collect(), Some(0)));
+            return Ok((q?, g?, k?, v?));
+        }
+        let hd = i64::from(self.num_heads * self.head_dim);
+        let qg = self.q_proj.forward_lanes(x)?.split_sections(&[hd], 2)?;
+        let queries = qg[0].reshape(&[
+            lanes,
+            seq_len,
+            i64::from(self.num_heads),
+            i64::from(self.head_dim),
+        ])?;
+        let (keys, values) = if let Some((merged, k_rows)) = &self.kv_proj {
+            let kv = merged.forward_lanes(x)?.split_sections(&[*k_rows], 2)?;
+            (kv[0].clone(), kv[1].clone())
+        } else {
+            (self.k_proj.forward_lanes(x)?, self.v_proj.forward_lanes(x)?)
+        };
+        Ok((queries, qg[1].clone(), keys, values))
+    }
+
+    /// One verify wave of this layer: `x` `[N, T, H]`, lane `i`'s rows for
+    /// `lanes[i]`, each lane's rows already recorded. Each lane's output
+    /// rows and stored K/V are the bits [`Self::forward_paged`] gives that
+    /// lane alone (`PagedPass::Verify` at its own position, its own pages
+    /// and splits): the projections run once over the stacked lanes, the
+    /// store and the attention once per lane.
+    pub fn forward_paged_wave(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        attn_layer_idx: u32,
+        lanes: &[PagedWaveLane],
+    ) -> Result<MxArray> {
+        self.forward_paged_wave_residual(x, adapter, attn_layer_idx, lanes, None)
+    }
+
+    /// [`Self::forward_paged_wave`]; with `residual` (`[N, T, H]`) the
+    /// output is the whole hidden state, the output projection adding it in
+    /// its planes `_r` store over the lanes where
+    /// [`Self::o_proj_verify_lanes_route`] holds.
+    pub(crate) fn forward_paged_wave_residual(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        attn_layer_idx: u32,
+        lanes: &[PagedWaveLane],
+        residual: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let shape = x.shape()?;
+        if lanes.is_empty()
+            || shape.as_ref().len() != 3
+            || shape[0] != lanes.len() as i64
+            || shape[1] <= 0
+        {
+            return Err(Error::from_reason(format!(
+                "Qwen3_5Attention::forward_paged_wave expects [N,T,H] for {} lanes, got {:?}",
+                lanes.len(),
+                shape.as_ref()
+            )));
+        }
+        for (i, lane) in lanes.iter().enumerate() {
+            if lanes[..i].iter().any(|peer| peer.seq == lane.seq) {
+                return Err(Error::from_reason(format!(
+                    "Qwen3_5Attention::forward_paged_wave: sequence {} is two lanes",
+                    lane.seq
+                )));
+            }
+        }
+        let batch = shape[0];
+        let seq_len = shape[1];
+        let (queries, gate, keys, values) = self.project_mixer_lanes(x, batch, seq_len)?;
+        let out_dtype = x.dtype()?;
+        let mut outputs = Vec::with_capacity(lanes.len());
+        for (i, lane) in lanes.iter().enumerate() {
+            let i = i as i64;
+            adapter
+                .activate_request(lane.seq)
+                .map_err(Error::from_reason)?;
+            outputs.push(self.attend_projected(
+                &queries.slice_axis(0, i, i + 1)?,
+                &keys.slice_axis(0, i, i + 1)?,
+                &values.slice_axis(0, i, i + 1)?,
+                adapter,
+                attn_layer_idx,
+                lane.first_logical_position,
+                PagedPass::Verify,
+                None,
+                lane.rope_position_offset,
+                &mut None,
+                out_dtype,
+            )?);
+        }
+        let output = MxArray::concatenate_many(outputs.iter().collect(), Some(0))?;
         let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
+        match residual {
+            Some(residual) => self
+                .o_proj
+                .forward_verify_lanes_mixer(&gated_output, residual),
+            None => self.o_proj.forward_lanes(&gated_output),
+        }
+    }
 
-        // Output projection.
-        self.o_proj.forward(&gated_output)
+    /// Whether a verify wave of `lanes` lanes reaches the output
+    /// projection's planes.
+    pub(crate) fn o_proj_verify_lanes_route(&self, lanes: i64) -> bool {
+        self.o_proj.verify_lanes_residual_route(lanes)
+    }
+
+    /// The K/V half of a text prefill [`Self::forward_paged`]: the same
+    /// keys and values, stored at the same rows, and nothing attended (Splash
+    /// `QwenTarget::planOutputRows`: a last layer no one reads stores only).
+    /// The fused mixer route stays when it applies: its K/V are siblings of
+    /// one dispatch, so only that route gives their bits.
+    pub(crate) fn store_paged_kv(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        attn_layer_idx: u32,
+        first_logical_position: u32,
+        rope_position_offset: i32,
+    ) -> Result<()> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+        let (keys, values) = match self.project_mixer_fused(x, batch, seq_len)? {
+            Some((_, _, keys, values)) => (keys, values),
+            None => self.project_kv(x)?,
+        };
+        let keys = keys.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values = values.reshape(&[
+            batch,
+            seq_len,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let keys = self.k_norm.forward(&keys)?;
+        let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+        let keys = self
+            .rope
+            .forward(&k_t, Some(rope_position_offset))?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+        let cache_dtype = adapter.paged_operand_dtype();
+        let keys = self.paged_attention_operand(&keys, cache_dtype)?;
+        let values = self.paged_attention_operand(&values, cache_dtype)?;
+        let (keys, values) = match cache_dtype {
+            Some(dtype) => {
+                let cast = |x: MxArray| -> Result<MxArray> {
+                    if x.dtype()? == dtype {
+                        Ok(x)
+                    } else {
+                        x.astype(dtype)
+                    }
+                };
+                (cast(keys)?, cast(values)?)
+            }
+            None if keys.dtype()? == values.dtype()? => (keys, values),
+            None => {
+                return Err(Error::from_reason(format!(
+                    "paged attention operands {:?}/{:?} need the pool's io dtype",
+                    keys.dtype()?,
+                    values.dtype()?
+                )));
+            }
+        };
+        paged_store(
+            adapter,
+            attn_layer_idx,
+            first_logical_position,
+            PagedPass::Prefill,
+            &keys,
+            &values,
+        )
     }
 
     /// Uniform-width hybrid decode and MTP verification. GDN keeps [N,T,H];
@@ -1485,6 +1938,9 @@ impl Qwen3_5Attention {
 
 #[cfg(test)]
 mod target_schedule_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+pub(super) mod wave_tests;
 
 #[cfg(test)]
 mod tests {

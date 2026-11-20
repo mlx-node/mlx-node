@@ -11,6 +11,7 @@ import {
   sendAnthropicNotImplemented,
 } from '../errors.js';
 import type { IdleSweeper } from '../idle-sweeper.js';
+import { residentSessionRegistry } from '../inference-admission.js';
 import { mapAnthropicRequest } from '../mappers/anthropic-request.js';
 import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
 import type { ModelRegistry } from '../registry.js';
@@ -29,6 +30,7 @@ export async function handleCountMessageTokens(
   idleSweeper?: IdleSweeper | null,
   resolveModel?: (name: string) => Promise<void>,
   modelWorkCoordinator?: ModelWorkCoordinator,
+  bindLoadedModel?: (name: string) => boolean,
 ): Promise<void> {
   if (body == null || typeof body !== 'object') {
     sendAnthropicBadRequest(res, 'Request body must be a JSON object');
@@ -59,7 +61,7 @@ export async function handleCountMessageTokens(
   }
 
   // The writer bracket waits for every running answer; a resident name must not take it, as in `/v1/messages`.
-  const residentRegistry = registry.getSessionRegistry(body.model);
+  const residentRegistry = residentSessionRegistry(registry, body.model, bindLoadedModel, modelWorkCoordinator);
   if (resolveModel && !residentRegistry) {
     try {
       const runResolve = () =>

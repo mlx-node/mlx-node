@@ -1737,6 +1737,7 @@ impl HybridSchedulerBackend for Lfm2Inner {
         &mut self,
         seq_id: SeqId,
         restore: &mut Self::RestoreTicket,
+        uploads: &mut crate::transformer::paged_kv_cache_adapter::RestoreUploadBudget,
         prompt_tokens: &[u32],
         owner_history: &[u32],
         _is_preemption_replay: bool,
@@ -1745,7 +1746,7 @@ impl HybridSchedulerBackend for Lfm2Inner {
             .paged_adapter
             .as_mut()
             .ok_or_else(|| Error::from_reason("LFM2 paged adapter is unavailable"))?
-            .poll_restore(restore)
+            .poll_restore(restore, uploads)
             .map_err(Error::from_reason)?;
         let PagedRestorePoll::Ready {
             plan,

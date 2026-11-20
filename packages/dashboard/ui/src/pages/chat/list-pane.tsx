@@ -53,12 +53,16 @@ function itemOf(
     mode: row.mode,
     updatedAt: row.updatedAt,
     folder: row.mode === 'work' ? row.cwd : null,
-    state: live === undefined ? 'idle' : live.waiting ? 'waiting' : live.busy ? 'running' : 'idle',
+    state: live === undefined ? 'idle' : live.waiting ? 'waiting' : live.busy || live.background ? 'running' : 'idle',
   };
 }
 
-function isBusy(id: string, active: ChatHostState['active']): boolean {
-  return active.some((entry) => entry.conversationId === id && (entry.busy || entry.waiting));
+/** Why a conversation cannot be deleted now, or null. */
+function deleteBlock(id: string, active: ChatHostState['active']): string | null {
+  const live = active.find((entry) => entry.conversationId === id);
+  if (live === undefined) return null;
+  if (live.busy || live.waiting) return CHAT.deleteBusy;
+  return live.background ? CHAT.deleteBusyRun : null;
 }
 
 /** The conversation list column: search over both workspaces, then the workspace's own list by day. */
@@ -106,13 +110,13 @@ export function ListPane(props: ListPaneProps): ReactElement {
         onOpen={props.onOpen}
         onRename={props.onRename}
         renderDelete={(item) => {
-          const busy = isBusy(item.id, active);
+          const block = deleteBlock(item.id, active);
           return (
             <ConfirmPopover
               trigger={{ kind: 'icon', label: CHAT.remove, icon: <Trash2 size={14} strokeWidth={1.75} /> }}
               align="end"
-              disabled={busy}
-              disabledReason={busy ? CHAT.deleteBusy : undefined}
+              disabled={block !== null}
+              disabledReason={block ?? undefined}
               {...deleteContent(
                 { id: item.id, title: item.title, mode: item.mode, folder: item.folder ?? null },
                 props.onDeleted,

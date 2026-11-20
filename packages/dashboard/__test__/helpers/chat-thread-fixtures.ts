@@ -410,6 +410,83 @@ export function longThread(n: number): ThreadSample {
   return { mode: 'chat', entries, turns, turn: null, lastEnd: null };
 }
 
+type RunEntry = Extract<TranscriptEntry, { kind: 'workflow' }>;
+
+export const RUN_ID = 'wf_01';
+
+/** One workflow run entry: deep-research in its second step, five helpers used of 128. */
+export function workflowRun(over: Partial<RunEntry> = {}): RunEntry {
+  return {
+    kind: 'workflow',
+    ts: T0 + 400,
+    updatedTs: T0 + 60_000,
+    runId: RUN_ID,
+    revision: 7,
+    name: 'deep-research',
+    status: 'active',
+    phases: [
+      { title: 'Plan', state: 'done' },
+      { title: 'Research', state: 'active' },
+      { title: 'Verify', state: 'pending' },
+      { title: 'Report', state: 'pending' },
+    ],
+    currentPhase: 'Research',
+    agentBudget: 128,
+    agentsUsed: 5,
+    agents: [
+      { agentId: 'a0', label: 'research-planner', phase: 'Plan', state: 'done', tokens: 10_999, durationMs: 167_000 },
+      { agentId: 'a1', label: 'researcher-0', phase: 'Research', state: 'running', tokens: 2_400, durationMs: 31_000 },
+      { agentId: 'a2', label: 'researcher-1', phase: 'Research', state: 'failed', tokens: 800, durationMs: 9_000 },
+    ],
+    ...over,
+  };
+}
+
+/** The same run, ended with its report. */
+export function finishedRun(over: Partial<RunEntry> = {}): RunEntry {
+  return workflowRun({
+    revision: 19,
+    status: 'complete',
+    phases: [
+      { title: 'Plan', state: 'done' },
+      { title: 'Research', state: 'done' },
+      { title: 'Verify', state: 'done' },
+      { title: 'Report', state: 'done' },
+    ],
+    currentPhase: 'Report',
+    agentsUsed: 8,
+    report: '# Findings\n\nThe engine runs **4 lanes** on 128 GB.\n\n- lanes give way before the context window',
+    ...over,
+  });
+}
+
+/** A Work turn that started a run: the prompt, the `workflow` call, the run card, the answer, the end. */
+export function runSample(run: RunEntry, turn: TurnState | null = null): ThreadSample {
+  return {
+    mode: 'work',
+    entries: [
+      user('Research how many lanes the engine runs'),
+      {
+        kind: 'tool',
+        ts: T0 + 200,
+        id: 'call-wf',
+        name: 'workflow',
+        title: 'workflow',
+        status: 'completed',
+        input: '{"name":"deep-research"}',
+        output: `{"run_id":"${run.runId}"}`,
+        endTs: T0 + 300,
+      },
+      run,
+      answer('The run started. I will report when it ends.', T0 + 500),
+      end('end_turn', T0 + 700),
+    ],
+    turns: [metric()],
+    turn,
+    lastEnd: null,
+  };
+}
+
 /** Every sample, for a gallery or a smoke render. */
 export const THREAD_SAMPLES: Readonly<Record<string, ThreadSample>> = {
   'cited-answer': CITED_ANSWER,
@@ -429,4 +506,6 @@ export const THREAD_SAMPLES: Readonly<Record<string, ThreadSample>> = {
   unfinished: UNFINISHED,
   'other-rows': OTHER_ROWS,
   streaming: streamingSample('Borrowing lets **you** use a value'),
+  'workflow-running': runSample(workflowRun()),
+  'workflow-done': runSample(finishedRun()),
 };

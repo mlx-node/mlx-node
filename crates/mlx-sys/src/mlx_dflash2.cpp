@@ -334,6 +334,57 @@ extern "C" bool mlx_dflash2_greedy_path_confidence(mlx_array* candidates,
   }
 }
 
+extern "C" bool mlx_dflash2_sampled_path(mlx_array* candidates,
+                                         mlx_array* scores,
+                                         mlx_array* uniforms,
+                                         mlx_array* temperature,
+                                         mlx_array** out_path,
+                                         mlx_array** out_q) {
+  if (!candidates || !scores || !uniforms || !temperature || !out_path || !out_q)
+    return false;
+  *out_path = nullptr;
+  *out_q = nullptr;
+  try {
+    const auto& candidate_ids = *reinterpret_cast<array*>(candidates);
+    const auto& score_table = *reinterpret_cast<array*>(scores);
+    const auto& draws = *reinterpret_cast<array*>(uniforms);
+    const auto& temp = *reinterpret_cast<array*>(temperature);
+    if (candidate_ids.dtype() != mlx::core::int32 ||
+        score_table.dtype() != mlx::core::float32 ||
+        draws.dtype() != mlx::core::float32 ||
+        temp.dtype() != mlx::core::float32 || candidate_ids.ndim() != 3 ||
+        score_table.ndim() != 3 || draws.ndim() != 1 || temp.size() != 1 ||
+        candidate_ids.shape(0) != 1)
+      return false;
+
+    const int length = candidate_ids.shape(1);
+    const int top_k = candidate_ids.shape(2);
+    if (length < 1 || top_k < 1 || top_k > 64 ||
+        score_table.shape(0) != length ||
+        score_table.shape(1) != top_k || score_table.shape(2) != top_k ||
+        draws.shape(0) != length)
+      return false;
+
+    static auto sampled_path = mlx::core::fast::metal_kernel(
+        "dflash2_sampled_path", {"candidates", "scores", "uniforms", "temperature"},
+        {"path", "q"},
+#include "metal/common/dflash2_sampled_path.metal.inc"
+    );
+    auto outputs = sampled_path(
+        {candidate_ids, score_table, draws, temp}, {{length}, {length, top_k}},
+        {mlx::core::int32, mlx::core::float32}, {1, 1, 1}, {1, 1, 1}, {},
+        std::nullopt, false, mlx::core::Device::gpu);
+    auto path = std::make_unique<array>(std::move(outputs[0]));
+    auto q = std::make_unique<array>(std::move(outputs[1]));
+    *out_path = reinterpret_cast<mlx_array*>(path.release());
+    *out_q = reinterpret_cast<mlx_array*>(q.release());
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "mlx_dflash2_sampled_path error: " << e.what() << std::endl;
+    return false;
+  }
+}
+
 extern "C" mlx_array* mlx_dflash2_verify_budget(mlx_array* confidence, mlx_array* parameters) {
   if (!confidence || !parameters) return nullptr;
   try {

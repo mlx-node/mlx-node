@@ -1444,7 +1444,7 @@ fn cold_dflash2_prefill_reclaims_a_marked_live_chain() -> Result<()> {
 
 /// A tiny tokenizer whose chat template ends thinking with `t13</think>`
 /// (`</think>` = 15, not special).
-fn closing_tokenizer() -> Arc<Qwen3Tokenizer> {
+pub(crate) fn closing_tokenizer() -> Arc<Qwen3Tokenizer> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(

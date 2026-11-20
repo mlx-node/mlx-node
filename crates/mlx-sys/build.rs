@@ -374,6 +374,7 @@ fn compile_paged_attn_metallib(
         "segmented_sdpa/sdpa_segmented_nax.metal",
         "affine_mixed/affine_qmv_wide_mixed.metal",
         "gguf_repack/gguf_repack.metal",
+        "sampling/dflash2_rows.metal",
     ] {
         let args = vec![
             "-x".to_string(),
@@ -387,6 +388,10 @@ fn compile_paged_attn_metallib(
             args,
         });
     }
+    // Splash's GGUF decode kernels on its MDGG0001 planes: jobs and flags from splash_gguf/metal_flags.txt.
+    let (splash_jobs, test_jobs) =
+        splash_gguf_jobs(&bridge_dir.join("splash_gguf"), mlx_dir, out_dir, &min_os);
+    jobs.extend(splash_jobs);
 
     let toolchain = [
         command_stdout(Command::new("xcrun").args(["-sdk", "macosx", "metal", "--version"])),
@@ -397,28 +402,89 @@ fn compile_paged_attn_metallib(
     .join(" | ")
     .replace('\n', " ");
     std::thread::scope(|scope| {
-        for job in &jobs {
+        for job in jobs.iter().chain(&test_jobs) {
             let toolchain = &toolchain;
             scope.spawn(move || compile_air(job, toolchain));
         }
     });
 
     let metallib_path = out_dir.join("paged_attn.metallib");
+    link_metallib(&jobs, &metallib_path);
+    // Test binaries load it through mlx_sys::GGUF_PLANES_TEST_METALLIB; the package build never copies it.
+    link_metallib(&test_jobs, &out_dir.join("gguf_planes_test.metallib"));
+
+    metallib_path
+}
+
+fn link_metallib(jobs: &[AirJob], path: &Path) {
     let mut link_cmd = Command::new("xcrun");
     link_cmd.args(["-sdk", "macosx", "metallib"]);
-    for job in &jobs {
+    for job in jobs {
         link_cmd.arg(&job.air);
     }
-    link_cmd.arg("-o").arg(&metallib_path);
+    link_cmd.arg("-o").arg(path);
     let status = link_cmd.status().expect("Failed to execute xcrun metallib");
     if !status.success() {
         panic!(
-            "Paged-attn metallib linking failed: exit code {:?}",
+            "{} linking failed: exit code {:?}",
+            path.display(),
             status.code()
         );
     }
+}
 
-    metallib_path
+/// The `.air` jobs of `splash_gguf/metal_flags.txt`: those of the shipped
+/// `paged_attn.metallib`, then those of the test-only `gguf_planes_test.metallib`.
+fn splash_gguf_jobs(
+    splash_gguf: &Path,
+    mlx_dir: &Path,
+    out_dir: &Path,
+    min_os: &str,
+) -> (Vec<AirJob>, Vec<AirJob>) {
+    let flags_path = splash_gguf.join("metal_flags.txt");
+    println!("cargo:rerun-if-changed={}", flags_path.display());
+    let text = read_build_source(&flags_path).unwrap_or_else(|error| panic!("{error}"));
+    let (mut shipped, mut test) = (Vec::new(), Vec::new());
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let (Some(library), Some(air), Some(src)) = (words.next(), words.next(), words.next())
+        else {
+            panic!(
+                "{}: `{line}` needs <library> <air> <source>",
+                flags_path.display()
+            );
+        };
+        let mut args = vec!["-x".to_string(), "metal".to_string()];
+        for word in words {
+            match word {
+                "@splash" => args.extend(["-I".to_string(), splash_gguf.display().to_string()]),
+                "@mlx" => args.extend(["-I".to_string(), mlx_dir.display().to_string()]),
+                flag => args.push(flag.to_string()),
+            }
+        }
+        args.push(min_os.to_string());
+        let job = AirJob {
+            src: splash_gguf.join(src),
+            air: out_dir.join(air),
+            args,
+        };
+        match library {
+            "paged_attn" => shipped.push(job),
+            "gguf_planes_test" => test.push(job),
+            other => panic!("{}: unknown library `{other}`", flags_path.display()),
+        }
+    }
+    if shipped.is_empty() || test.is_empty() {
+        panic!(
+            "{} names no paged_attn or no gguf_planes_test job",
+            flags_path.display()
+        );
+    }
+    (shipped, test)
 }
 
 /// Walk ancestors of `start` looking for a directory whose final name
@@ -1799,6 +1865,8 @@ fn main() -> io::Result<()> {
     }
     // Add src/ as include path for metal/{common,<family>}/*.metal.inc includes
     bridge.include(&src_dir);
+    // The host side of Splash's GGUF planes ABI (metal/abi/*.h, mlx_gguf_planes.cpp).
+    bridge.include(src_dir.join("metal").join("splash_gguf"));
 
     // Translation units that depend on Metal *by header* (raw `MTL::` types
     // or `#include mlx/backend/metal/device.h`). These do not compile on a

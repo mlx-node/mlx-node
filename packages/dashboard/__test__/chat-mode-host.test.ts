@@ -461,7 +461,7 @@ describe('Bypass', () => {
     );
   });
 
-  it('a helper start Bypass allowed: after a move to Auto each call asks (helper)', async () => {
+  it('a helper start Bypass allowed stays in the folder: after a move to Auto the next call asks (unknown-target)', async () => {
     await withModes(
       [[toolStep('spawn_subagent', { prompt: 'look', cwd: '/' })], [bashStep('ls')]],
       async (fake, m, id) => {
@@ -469,7 +469,7 @@ describe('Bypass', () => {
         m.mode = 'auto';
         const turn = start(fake, id, 'p1');
         const card = await nth(fake, 1);
-        expect(card.autoAsk).toBe('helper');
+        expect(card.autoAsk).toBe('unknown-target');
         fake.host.answer(id, card.id, 'reject-once');
         await turn.done;
       },

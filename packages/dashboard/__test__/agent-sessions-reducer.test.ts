@@ -15,6 +15,7 @@ import {
   parseUpdates,
   splitCompleteLines,
   TranscriptReducer,
+  WAKE_PROMPT_ID,
   type UpdateLine,
 } from '../src/agent-sessions/transcript.js';
 import type { TranscriptEntry, TurnMetric } from '../src/agent-sessions/types.js';
@@ -26,9 +27,14 @@ const RECORDED = join(FIXTURES, 'chat-scenarios/recorded');
 
 type Json = Record<string, unknown>;
 
-function replay(ops: readonly TranscriptOp[]): { entries: TranscriptEntry[]; turns: TurnMetric[] } {
+function replay(ops: readonly TranscriptOp[]): {
+  entries: TranscriptEntry[];
+  turns: TurnMetric[];
+  contextUsed: number | null;
+} {
   const entries: TranscriptEntry[] = [];
   const turns: TurnMetric[] = [];
+  let contextUsed: number | null = null;
   for (const op of ops) {
     if (op.op === 'push') entries.push(op.entry);
     else if (op.op === 'set') entries[op.index] = op.entry;
@@ -36,9 +42,10 @@ function replay(ops: readonly TranscriptOp[]): { entries: TranscriptEntry[]; tur
       const e = entries[op.index]!;
       if (e.kind !== 'assistant' && e.kind !== 'thinking') throw new Error(`text op on ${e.kind}`);
       entries[op.index] = { ...e, text: e.text + op.append };
-    } else turns.push(op.metric);
+    } else if (op.op === 'context') contextUsed = op.used;
+    else turns.push(op.metric);
   }
-  return { entries, turns };
+  return { entries, turns, contextUsed };
 }
 
 /** `endTs` of a text entry moves with every chunk; `text` ops do not carry it. */
@@ -244,11 +251,12 @@ describe('op stream equals the snapshot for every stored session fixture', () =>
       }
       const snap = reducer.snapshot();
       const replayed = replay(ops);
+      const parsed = parseUpdates(readFileSync(file, 'utf8'));
       expect(withoutTextEnd(replayed.entries)).toEqual(withoutTextEnd(snap.entries));
       expect(replayed.turns).toEqual(snap.turns);
-      expect(snap.entries.map((e) => e.kind)).toEqual(
-        parseUpdates(readFileSync(file, 'utf8')).transcript.map((e) => e.kind),
-      );
+      expect(snap.entries.map((e) => e.kind)).toEqual(parsed.transcript.map((e) => e.kind));
+      expect(replayed.contextUsed).toBe(reducer.context());
+      expect(parsed.contextUsed).toBe(reducer.context());
     });
   }
 });
@@ -282,5 +290,248 @@ describe('seed', () => {
       { op: 'text', index: 3, append: 'b', endTs: 9 },
     ]);
     expect(r.snapshot().entries.map((e) => e.kind)).toEqual(['user', 'assistant', 'user', 'assistant']);
+  });
+});
+
+describe('context use: params._meta.totalTokens', () => {
+  /** The shape of a real mlx-agent v0.3.3 record; the counts are those of one real turn. */
+  function line(sessionUpdate: string, totalTokens?: number): UpdateLine {
+    const update: Json = sessionUpdate.endsWith('_chunk')
+      ? { sessionUpdate, content: { type: 'text', text: 'x' } }
+      : { sessionUpdate, toolCallId: 't1', title: 'use_tool', status: 'pending' };
+    return {
+      xai: false,
+      update,
+      meta: totalTokens === undefined ? { agentTimestampMs: 5 } : { totalTokens, agentTimestampMs: 5 },
+    };
+  }
+  const TURN: Array<[string, number | undefined]> = [
+    ['user_message_chunk', undefined],
+    ['agent_thought_chunk', 535],
+    ['tool_call', 1929],
+    ['tool_call_update', 1929],
+    ['tool_call_update', 3602],
+    ['agent_thought_chunk', 11971],
+    ['agent_message_chunk', 11971],
+  ];
+
+  it('a live update with totalTokens sets the used count; one without it keeps the last value', () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    const seen: Array<number | null> = [];
+    const contextOps: TranscriptOp[] = [];
+    for (const [kind, total] of TURN) {
+      contextOps.push(...r.apply(line(kind, total)).filter((op) => op.op === 'context'));
+      seen.push(r.context());
+    }
+    expect(seen).toEqual([null, 535, 1929, 1929, 3602, 11971, 11971]);
+    expect(contextOps).toEqual([
+      { op: 'context', used: 535 },
+      { op: 'context', used: 1929 },
+      { op: 'context', used: 3602 },
+      { op: 'context', used: 11971 },
+    ]);
+    r.apply({ xai: true, update: { sessionUpdate: 'turn_completed', stop_reason: 'end_turn' }, meta: undefined });
+    r.userPrompt('next', 6);
+    r.apply(line('user_message_chunk'));
+    expect(r.context()).toBe(11971);
+  });
+
+  it('the disk reader reads the same value from the stored lines', () => {
+    const text = TURN.map(([kind, total]) => {
+      const l = line(kind, total);
+      return JSON.stringify({ timestamp: 1, method: 'session/update', params: { update: l.update, _meta: l.meta } });
+    }).join('\n');
+    expect(parseUpdates(`${text}\n`).contextUsed).toBe(11971);
+    expect(
+      parseUpdates(`${JSON.stringify({ params: { update: line('user_message_chunk').update } })}\n`).contextUsed,
+    ).toBe(null);
+  });
+
+  it('a seeded value stays until a line carries a new one, also a smaller one', () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    r.seed([], [], 11971);
+    expect(r.apply(line('agent_message_chunk'))).not.toContainEqual(expect.objectContaining({ op: 'context' }));
+    expect(r.context()).toBe(11971);
+    expect(r.apply(line('agent_message_chunk', 900))).toContainEqual({ op: 'context', used: 900 });
+    expect(r.context()).toBe(900);
+  });
+});
+
+describe('compaction marker: auto_compact_* lines', () => {
+  /** The four updates as mlx-agent v0.3.3 sends them (`extensions/notification.rs`), with its notification meta. */
+  const xai = (update: Json, at: number): UpdateLine => ({
+    xai: true,
+    update,
+    meta: { eventId: `e${at}`, agentTimestampMs: at },
+  });
+  const STARTED = {
+    sessionUpdate: 'auto_compact_started',
+    tokens_used: 222_822,
+    context_window: 262_144,
+    percentage: 85,
+    reason: 'Context window 85% full',
+  };
+  const COMPLETED = {
+    sessionUpdate: 'auto_compact_completed',
+    tokens_before: 222_822,
+    tokens_after: 31_204,
+    elapsed_ms: 1_221_000,
+    summary_preview: null,
+  };
+  const FAILED = {
+    sessionUpdate: 'auto_compact_failed',
+    error: "it'll retry on the next turn, or start a new session using /new.\nstream idle timeout after 600s",
+  };
+  const CANCELLED = { sessionUpdate: 'auto_compact_cancelled', reason: 'user_cancelled' };
+
+  it('started makes no entry; each end makes one marker where it happened', () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    expect(r.apply(xai(STARTED, 100))).toEqual([]);
+    expect(r.apply(xai(COMPLETED, 200))).toEqual([
+      {
+        op: 'push',
+        entry: { kind: 'compaction', ts: 200, outcome: 'done', tokensBefore: 222_822, tokensAfter: 31_204 },
+      },
+    ]);
+    expect(r.apply(xai(FAILED, 300))).toEqual([
+      { op: 'push', entry: { kind: 'compaction', ts: 300, outcome: 'failed', retry: true } },
+    ]);
+    expect(
+      r.apply(xai({ sessionUpdate: 'auto_compact_failed', error: 'this conversation is too large to compact.' }, 350)),
+    ).toEqual([{ op: 'push', entry: { kind: 'compaction', ts: 350, outcome: 'failed' } }]);
+    expect(r.apply(xai(CANCELLED, 400))).toEqual([
+      { op: 'push', entry: { kind: 'compaction', ts: 400, outcome: 'stopped' } },
+    ]);
+    // Manual `/compact` sends only the end, with no time.
+    expect(r.apply(xai({ sessionUpdate: 'auto_compact_completed', tokens_after: 9_000 }, 500))).toEqual([
+      { op: 'push', entry: { kind: 'compaction', ts: 500, outcome: 'done', tokensAfter: 9_000 } },
+    ]);
+    // On the ACP method it is not the agent's update.
+    expect(r.apply({ xai: false, update: COMPLETED, meta: undefined })).toEqual([]);
+  });
+
+  it('the marker is rebuilt from updates.jsonl, at its place in the turn', () => {
+    const stored = (method: string, update: Json, at: number, meta: Json = {}): string =>
+      JSON.stringify({
+        timestamp: Math.floor(at / 1000),
+        method,
+        params: { sessionId: 's', update, _meta: { eventId: `e${at}`, agentTimestampMs: at, ...meta } },
+      });
+    const text = [
+      stored('session/update', { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'go' } }, 1_000),
+      stored('session/update', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'a' } }, 2_000, {
+        totalTokens: 222_822,
+      }),
+      stored('_x.ai/session/update', STARTED, 3_000),
+      stored('_x.ai/session/update', COMPLETED, 4_000),
+      stored('session/update', { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'b' } }, 5_000, {
+        totalTokens: 31_204,
+      }),
+    ].join('\n');
+    const parsed = parseUpdates(`${text}\n`);
+    expect(parsed.transcript.map((e) => e.kind)).toEqual(['user', 'assistant', 'compaction', 'assistant']);
+    expect(parsed.transcript[2]).toEqual({
+      kind: 'compaction',
+      ts: 4_000,
+      outcome: 'done',
+      tokensBefore: 222_822,
+      tokensAfter: 31_204,
+    });
+    // The context ring drops through the existing totalTokens path: the next line after the compaction carries it.
+    expect(parsed.contextUsed).toBe(31_204);
+  });
+
+  // Mutation: drop the `tokensAfter < contextUsed` step in the reducer's auto_compact_completed case → stays 222,822.
+  it('live, the context takes a lower tokens_after at the compaction end, before any later line', () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    r.seed([], [], 222_822);
+    r.apply(xai(STARTED, 100));
+    expect(r.apply(xai(COMPLETED, 200))).toEqual([
+      { op: 'context', used: 31_204 },
+      {
+        op: 'push',
+        entry: { kind: 'compaction', ts: 200, outcome: 'done', tokensBefore: 222_822, tokensAfter: 31_204 },
+      },
+    ]);
+    expect(r.context()).toBe(31_204);
+  });
+
+  it('a tokens_after not below the known count, or with no count known, leaves the context as it is', () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    r.seed([], [], 235_939);
+    const same = { ...COMPLETED, tokens_before: 235_952, tokens_after: 235_939 };
+    expect(r.apply(xai(same, 200)).filter((op) => op.op === 'context')).toEqual([]);
+    expect(r.apply(xai({ ...same, tokens_after: 240_000 }, 300)).filter((op) => op.op === 'context')).toEqual([]);
+    expect(r.context()).toBe(235_939);
+    const fresh = new TranscriptReducer({ now: () => 5 });
+    expect(fresh.apply(xai(COMPLETED, 200)).filter((op) => op.op === 'context')).toEqual([]);
+    expect(fresh.context()).toBeNull();
+  });
+
+  it('live, a later line with totalTokens sets the context again', () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    r.seed([], [], 222_822);
+    r.apply(xai(STARTED, 100));
+    r.apply(xai(COMPLETED, 200));
+    const ops = r.apply({
+      xai: false,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x' } },
+      meta: { totalTokens: 31_580, agentTimestampMs: 300 },
+    });
+    expect(ops).toContainEqual({ op: 'context', used: 31_580 });
+    expect(r.context()).toBe(31_580);
+  });
+});
+
+describe('wake rows: the host line and the agent prompt', () => {
+  const xai = (update: Json): UpdateLine => ({ xai: true, update, meta: undefined });
+  const hidden = (text: string, meta: Json): UpdateLine => ({
+    xai: false,
+    update: {
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text },
+      _meta: { hideFromScrollback: true, ...meta },
+    },
+    meta: undefined,
+  });
+  const RUN = {
+    sessionUpdate: 'workflow_updated',
+    run_id: 'wf_1',
+    name: 'deep-research',
+    status: 'complete',
+    revision: 5,
+  };
+  const wakes = (r: TranscriptReducer) => r.snapshot().entries.filter((e) => e.kind === 'wake');
+
+  // Mutation: read no `mlxWakePromptId` in the hidden-chunk case → cause 'unknown' until turn_completed.
+  it("the host line's prompt id names the run at once", () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    r.apply(xai(RUN));
+    r.apply(hidden('', { [WAKE_PROMPT_ID]: 'workflow-completed-wf_1-5' }));
+    expect(wakes(r)).toEqual([
+      { kind: 'wake', ts: 5, cause: 'workflow', workflow: { name: 'deep-research', status: 'complete' }, text: '' },
+    ]);
+  });
+
+  // Mutation: drop the merge into the host's empty row → two wake rows.
+  it("the agent's own prompt after the host line fills that row; a later wake is a new row", () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    r.apply(xai(RUN));
+    r.apply(hidden('', { [WAKE_PROMPT_ID]: 'workflow-completed-wf_1-5' }));
+    r.apply(hidden('A workflow finished.', { promptIndex: 1 }));
+    r.apply(hidden('Read its report.', { promptIndex: 1 }));
+    expect(wakes(r)).toEqual([
+      {
+        kind: 'wake',
+        ts: 5,
+        cause: 'workflow',
+        workflow: { name: 'deep-research', status: 'complete' },
+        text: 'A workflow finished.\nRead its report.',
+      },
+    ]);
+    r.apply(xai({ sessionUpdate: 'turn_completed', prompt_id: 'workflow-completed-wf_1-5', stop_reason: 'end_turn' }));
+    r.apply(hidden('', {}));
+    r.apply(hidden('A task finished.', { promptIndex: 2 }));
+    expect(wakes(r).map((e) => e.text)).toEqual(['A workflow finished.\nRead its report.', 'A task finished.']);
   });
 });

@@ -18,7 +18,7 @@ function accessory(mode: ChatMode, active: ChatHostState['active']): ReactNode {
   if (waiting > 0) {
     return <LiveDot tone="warning" pulse size={6} label={fill(CHAT.otherWaiting, { n: waiting, mode: name })} />;
   }
-  const running = active.filter((entry) => entry.mode === mode && entry.busy).length;
+  const running = active.filter((entry) => entry.mode === mode && (entry.busy || entry.background)).length;
   if (running > 0) {
     return <LiveDot tone="success" pulse size={6} label={fill(CHAT.otherRunning, { n: running, mode: name })} />;
   }
@@ -61,8 +61,8 @@ export function NewButton({ mode, onNew }: { mode: ChatMode; onNew: () => void }
 
 export interface ThreadBarProps {
   title: string;
-  /** The open conversation; null on the New screen. */
-  open: { id: string; running: boolean; remove: ConfirmContent } | null;
+  /** The open conversation; null on the New screen. `runLive`: a workflow run holds it (rename stays on). */
+  open: { id: string; running: boolean; runLive: boolean; remove: ConfirmContent } | null;
   onRename: () => void;
   /** The New button when the list is a drawer (it sits last in the bar). */
   trailing?: ReactNode;
@@ -107,8 +107,8 @@ export function ThreadBar({ title, open, onRename, trailing, folder, permission 
           <ConfirmPopover
             trigger={{ kind: 'icon', label: CHAT.remove, icon: <Trash2 size={16} strokeWidth={1.75} /> }}
             align="end"
-            disabled={open.running}
-            disabledReason={open.running ? CHAT.deleteBusy : undefined}
+            disabled={open.running || open.runLive}
+            disabledReason={open.running ? CHAT.deleteBusy : open.runLive ? CHAT.deleteBusyRun : undefined}
             {...open.remove}
           />
         </>

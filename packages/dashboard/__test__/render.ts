@@ -99,6 +99,7 @@ export const READY_CHAT_HOST: ChatHostState = {
   loading: [],
   resident: [],
   answers: [],
+  requests: [],
   models: [hostModel('qwen3.5-4b', 32768)],
   defaultModelId: 'qwen3.5-4b',
   agent: {
@@ -110,8 +111,8 @@ export const READY_CHAT_HOST: ChatHostState = {
     install: 'idle',
   },
   modes: {
-    chat: { state: 'ready', stale: false, failure: null, agentVersion: '1.0.45', turnsInFlight: 0 },
-    work: { state: 'stopped', stale: false, failure: null, agentVersion: null, turnsInFlight: 0 },
+    chat: { state: 'ready', stale: false, failure: null, agentVersion: '1.0.45', turnsInFlight: 0, background: 0 },
+    work: { state: 'stopped', stale: false, failure: null, agentVersion: null, turnsInFlight: 0, background: 0 },
   },
   providers: { search: null, searchCheck: null, firecrawl: false, fetch: null, applyPending: false },
   active: [],

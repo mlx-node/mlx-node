@@ -5,9 +5,10 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi::bindgen_prelude::*;
 
-use super::attention::{PagedPass, Qwen3_5Attention};
+use super::attention::{PagedPass, PagedWaveLane, Qwen3_5Attention};
 use super::config::Qwen3_5Config;
 use super::gated_delta_net::GatedDeltaNet;
+use super::gdn_blob::{GdnWaveCells, gdn_wave_layer};
 use super::layer_cache::Qwen3_5LayerCache;
 use crate::models::quantized_linear::{MLPVariant, QuantizedLinear};
 
@@ -305,6 +306,116 @@ impl DecoderLayer {
         }
     }
 
+    /// [`Self::forward_paged_or_flat`] for a paged prefill chunk
+    /// (`PagedPass::Prefill`, no mask, kernels on): the mixer output
+    /// projection adds the residual in its GEMM store when its shape takes
+    /// the epilogue GEMM (else a separate add + post-attention norm), and
+    /// the MLP runs its SwiGLU and residual add in the GEMM stores where they
+    /// apply. The bits of [`Self::forward_paged_or_flat`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_paged_prefill(
+        &mut self,
+        x: &MxArray,
+        kind: Qwen3_5LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        first_logical_position: u32,
+        flat_cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+        rope_position_offset: i32,
+        mrope_cache: &mut Option<(MxArray, MxArray)>,
+    ) -> Result<MxArray> {
+        /// The mixer's output: with the residual, or the delta to add.
+        enum Mixed {
+            Hidden(MxArray),
+            Delta(MxArray),
+        }
+        let rows = x.size()? as i64 / x.shape_at(x.ndim()?.saturating_sub(1))?.max(1);
+        let normed = self.input_layernorm.forward(x)?;
+        let mixed = match (kind, &mut self.attn) {
+            (Qwen3_5LayerKind::Linear, AttentionType::Linear(gdn)) => {
+                let ac = flat_cache.and_then(|c| c.as_arrays_cache_mut());
+                if gdn.out_proj_store_route(rows)? {
+                    Mixed::Hidden(gdn.forward_store_residual(&normed, ac, true, x)?)
+                } else {
+                    Mixed::Delta(gdn.forward_with_tape(&normed, None, ac, true, None)?)
+                }
+            }
+            (Qwen3_5LayerKind::FullAttentionPaged { paged_idx }, AttentionType::Full(attn)) => {
+                if attn.o_proj_store_route(rows)? {
+                    Mixed::Hidden(attn.forward_paged_store_residual(
+                        &normed,
+                        adapter,
+                        paged_idx,
+                        first_logical_position,
+                        PagedPass::Prefill,
+                        position_ids,
+                        rope_position_offset,
+                        mrope_cache,
+                        x,
+                    )?)
+                } else {
+                    Mixed::Delta(attn.forward_paged(
+                        &normed,
+                        adapter,
+                        paged_idx,
+                        first_logical_position,
+                        PagedPass::Prefill,
+                        position_ids,
+                        rope_position_offset,
+                        mrope_cache,
+                    )?)
+                }
+            }
+            (Qwen3_5LayerKind::Linear, AttentionType::Full(_)) => {
+                return Err(Error::from_reason(
+                    "Qwen3_5DecoderLayer::forward_paged_prefill: kind=Linear applied to a \
+                     FullAttention operator",
+                ));
+            }
+            (Qwen3_5LayerKind::FullAttentionPaged { .. }, AttentionType::Linear(_)) => {
+                return Err(Error::from_reason(
+                    "Qwen3_5DecoderLayer::forward_paged_prefill: kind=FullAttentionPaged \
+                     applied to a Linear (GDN) operator",
+                ));
+            }
+        };
+        let (h, normed) = match mixed {
+            Mixed::Hidden(h) => {
+                let normed = self.post_attention_layernorm.forward(&h)?;
+                (h, normed)
+            }
+            Mixed::Delta(attn_out) => {
+                Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?
+            }
+        };
+        self.mlp.forward_store_residual(&normed, &h)
+    }
+
+    /// A text prefill chunk through a full-attention layer whose output no
+    /// one reads: input norm and the attention's K/V store, no output.
+    pub(crate) fn store_paged_kv(
+        &self,
+        x: &MxArray,
+        paged_idx: u32,
+        adapter: &mut PagedKVCacheAdapter,
+        first_logical_position: u32,
+        rope_position_offset: i32,
+    ) -> Result<()> {
+        let AttentionType::Full(attn) = &self.attn else {
+            return Err(Error::from_reason(
+                "Qwen3_5DecoderLayer::store_paged_kv: a Linear (GDN) operator stores no K/V",
+            ));
+        };
+        let normed = self.input_layernorm.forward(x)?;
+        attn.store_paged_kv(
+            &normed,
+            adapter,
+            paged_idx,
+            first_logical_position,
+            rope_position_offset,
+        )
+    }
+
     /// One uniform decode forward over independent recurrent-state rows.
     pub(crate) fn forward_paged_batched(
         &mut self,
@@ -431,6 +542,143 @@ impl DecoderLayer {
                 h.add(&self.mlp.forward(&normed)?)
             }
         }
+    }
+
+    /// [`Self::forward_paged_or_flat_with_tape`] for a DFlash2 verify
+    /// (`PagedPass::Verify`): a mixer output projection with planes adds the
+    /// residual in its `_r` store and the post-attention norm runs on that
+    /// hidden state alone; the MLP runs [`MLPVariant::forward_verify`]. A
+    /// projection without planes runs as in
+    /// [`Self::forward_paged_or_flat_with_tape`], with its bits.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_verify_with_tape(
+        &mut self,
+        x: &MxArray,
+        kind: Qwen3_5LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        first_logical_position: u32,
+        flat_cache: Option<&mut Qwen3_5LayerCache>,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+        rope_position_offset: i32,
+    ) -> Result<MxArray> {
+        /// The mixer's output: with the residual, or the delta to add.
+        enum Mixed {
+            Hidden(MxArray),
+            Delta(MxArray),
+        }
+        let rows = x.size()? as i64 / x.shape_at(x.ndim()?.saturating_sub(1))?.max(1);
+        let mixed = match (kind, &mut self.attn) {
+            (Qwen3_5LayerKind::Linear, AttentionType::Linear(gdn)) => {
+                let normed = self.input_layernorm.forward(x)?;
+                let ac = flat_cache.and_then(|c| c.as_arrays_cache_mut());
+                if gdn.out_proj_verify_route(rows) {
+                    Mixed::Hidden(gdn.forward_verify_residual_with_tape(&normed, ac, tape_sink, x)?)
+                } else {
+                    Mixed::Delta(gdn.forward_with_tape(&normed, None, ac, true, tape_sink)?)
+                }
+            }
+            (Qwen3_5LayerKind::FullAttentionPaged { paged_idx }, AttentionType::Full(attn)) => {
+                // Full-attention layers do not record a GDN tape.
+                if let Some(slot) = tape_sink {
+                    *slot = None;
+                }
+                let normed = self.input_layernorm.forward(x)?;
+                if attn.o_proj_verify_route(rows) {
+                    Mixed::Hidden(attn.forward_paged_verify_residual(
+                        &normed,
+                        adapter,
+                        paged_idx,
+                        first_logical_position,
+                        rope_position_offset,
+                        x,
+                    )?)
+                } else {
+                    Mixed::Delta(attn.forward_paged(
+                        &normed,
+                        adapter,
+                        paged_idx,
+                        first_logical_position,
+                        PagedPass::Verify,
+                        None,
+                        rope_position_offset,
+                        &mut None,
+                    )?)
+                }
+            }
+            (Qwen3_5LayerKind::Linear, AttentionType::Full(_)) => {
+                return Err(Error::from_reason(
+                    "Qwen3_5DecoderLayer::forward_verify_with_tape: kind=Linear applied to a \
+                     FullAttention operator",
+                ));
+            }
+            (Qwen3_5LayerKind::FullAttentionPaged { .. }, AttentionType::Linear(_)) => {
+                return Err(Error::from_reason(
+                    "Qwen3_5DecoderLayer::forward_verify_with_tape: kind=FullAttentionPaged \
+                     applied to a Linear (GDN) operator",
+                ));
+            }
+        };
+        let (h, normed) = match mixed {
+            Mixed::Hidden(h) => {
+                let normed = self.post_attention_layernorm.forward(&h)?;
+                (h, normed)
+            }
+            Mixed::Delta(attn_out) => {
+                Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?
+            }
+        };
+        self.mlp.forward_verify(&normed, &h)
+    }
+
+    /// One layer of a verify wave, `x` `[N, T, H]` (lane `i` = row `i`):
+    /// norms, residuals and SwiGLU stacked, the mixer through
+    /// [`gdn_wave_layer`] (blob row `row`) or
+    /// [`Qwen3_5Attention::forward_paged_wave_residual`], the MLP through
+    /// [`MLPVariant::forward_verify_lanes`]. A mixer output projection with
+    /// planes adds the residual in its `_r` store over the lanes and the
+    /// post-attention norm runs on that hidden state alone. Each lane's rows
+    /// carry the bits [`Self::forward_verify_with_tape`] gives that lane
+    /// alone.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_wave(
+        &self,
+        x: &MxArray,
+        kind: Qwen3_5LayerKind,
+        layer_idx: usize,
+        row: usize,
+        adapter: &mut PagedKVCacheAdapter,
+        attn_lanes: &[PagedWaveLane],
+        gdn_lanes: &mut [GdnWaveCells<'_>],
+    ) -> Result<MxArray> {
+        let normed = self.input_layernorm.forward(x)?;
+        let lanes = x.shape_at(0)?;
+        let (residual, mixed) = match (kind, &self.attn) {
+            (Qwen3_5LayerKind::Linear, AttentionType::Linear(gdn)) => {
+                let residual = gdn.out_proj_verify_lanes_route(lanes).then_some(x);
+                let out = gdn_wave_layer(gdn, &normed, layer_idx, row, gdn_lanes, residual)?;
+                (residual, out)
+            }
+            (Qwen3_5LayerKind::FullAttentionPaged { paged_idx }, AttentionType::Full(attn)) => {
+                let residual = attn.o_proj_verify_lanes_route(lanes).then_some(x);
+                let out = attn.forward_paged_wave_residual(
+                    &normed, adapter, paged_idx, attn_lanes, residual,
+                )?;
+                (residual, out)
+            }
+            _ => {
+                return Err(Error::from_reason(format!(
+                    "Qwen3_5DecoderLayer::forward_wave: layer {layer_idx} kind/operator mismatch"
+                )));
+            }
+        };
+        let (h, normed) = match residual {
+            Some(_) => {
+                let normed = self.post_attention_layernorm.forward(&mixed)?;
+                (mixed, normed)
+            }
+            None => Self::add_residual_norm(&self.post_attention_layernorm, x, &mixed)?,
+        };
+        self.mlp.forward_verify_lanes(&normed, &h)
     }
 
     // ========== Weight accessors ==========

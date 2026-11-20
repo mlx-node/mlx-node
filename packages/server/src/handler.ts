@@ -105,6 +105,8 @@ export interface HandlerOptions {
    * and 404s if still unresolved.
    */
   resolveModel?: (name: string) => Promise<void>;
+  /** See `ServerConfig.bindLoadedModel`. */
+  bindLoadedModel?: (name: string) => boolean;
   /**
    * Coordinates process-wide MLX work so lazy model loads / warmups do not
    * overlap live inference on another model.
@@ -241,6 +243,7 @@ export function createHandler(
           audio,
           rerank,
           unloadModels,
+          ...(options?.bindLoadedModel !== undefined ? { bindLoadedModel: options.bindLoadedModel } : {}),
           thinkingTokenBudget: options?.thinkingTokenBudget,
           thinkingCycleGuard: options?.thinkingCycleGuard,
           thinkingEndText: options?.thinkingEndText,

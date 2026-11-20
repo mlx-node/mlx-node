@@ -16,13 +16,13 @@ use std::time::{Duration, Instant};
 
 /// A cache root for the tier's namespaces and a temporary root that must
 /// stay empty.
-struct Root {
+pub(super) struct Root {
     cache: Temp,
     tmp: Temp,
 }
 
 impl Root {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             cache: Temp::new(),
             tmp: Temp::new(),
@@ -75,7 +75,7 @@ impl Root {
     }
 
     /// The one namespace directory under the cache root.
-    fn namespace(&self) -> PathBuf {
+    pub(super) fn namespace(&self) -> PathBuf {
         let mut namespaces = self.namespaces();
         assert_eq!(namespaces.len(), 1, "{namespaces:?}");
         namespaces.remove(0)
@@ -195,11 +195,11 @@ fn on_disk_as(inner: Inner, root: &Root, identity: &str) -> Inner {
     on_disk_with(inner, root, identity, (8, 0))
 }
 
-fn on_disk(inner: Inner, root: &Root) -> Inner {
+pub(super) fn on_disk(inner: Inner, root: &Root) -> Inner {
     on_disk_as(inner, root, "fixture")
 }
 
-fn disk(inner: &Inner) -> &prefix_disk::Disk {
+pub(super) fn disk(inner: &Inner) -> &prefix_disk::Disk {
     inner.disk.as_ref().unwrap()
 }
 
@@ -216,7 +216,7 @@ fn store(inner: &Inner) -> Arc<ColdCacheManager> {
 /// writes the waiting states newest first, the parker hands the copies
 /// over, the store's writer commits them. A test of the delay must not call
 /// it.
-fn settle(inner: &mut Inner) {
+pub(super) fn settle(inner: &mut Inner) {
     inner.flush_disk(Instant::now() + Duration::from_secs(20));
     assert!(store(inner).drain(Duration::from_secs(20)));
 }

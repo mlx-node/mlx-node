@@ -19,8 +19,10 @@ use crate::transformer::KvFormat;
 use super::config::Config;
 use super::memory::{
     draft_hidden_row_bytes, draft_index_bytes_per_token, draft_state_bytes, prefill_scratch,
-    row_state_bytes,
+    row_state_bytes, state_bytes,
 };
+use crate::models::qwen3_5::dflash2::{DFlash2Config, dflash2_file_bytes, read_dflash2_config};
+use crate::models::qwen3_5::dflash2_state::store::lineage_bytes;
 
 /// The Flash Next KV page (Splash `QwenHybridLayout::kvLayout`): K/V of the
 /// attention layers in the load's format and the indexer's bf16 block keys
@@ -130,21 +132,91 @@ pub(super) fn pool_input<'a>(
     }
 }
 
+/// What an attached DFlash2 draft adds to a plan. Its weights are resident
+/// before a load reads the process, so the plan finds them in the active
+/// bytes and `weights` is only reported (an estimate adds them itself).
+/// The lane holds one context (the draft follows one sequence), the layer
+/// outputs a tapped pass keeps until it ends (a drafted turn's passes are
+/// one prefill window at most: it starts only on filled banks), and the
+/// evaluated taps kept between cycles (the ring's rows and the last pass).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct DraftPrice {
+    pub weights: u64,
+    pub ring: u64,
+    pub pass_taps: u64,
+    pub kept_taps: u64,
+}
+
+impl DraftPrice {
+    pub(super) fn of(c: &Config, draft: &DFlash2Config, weights: u64) -> Self {
+        let taps = draft.target_layers.len() as u64;
+        let pass = super::MAX_PREFILL_CHUNK as u64;
+        let ring_rows = draft.sliding_window.saturating_sub(1) as u64;
+        Self {
+            weights,
+            ring: draft.kv_ring_bytes(),
+            pass_taps: taps * pass * draft_hidden_row_bytes(c),
+            kept_taps: taps * (ring_rows + pass) * c.hidden_size as u64 * 2,
+        }
+    }
+
+    /// The draft's bytes in the one lane, whatever the window.
+    pub(super) fn lane(&self) -> u64 {
+        self.ring
+            .saturating_add(self.pass_taps)
+            .saturating_add(self.kept_taps)
+    }
+
+    /// The price of the draft in `dir` for a target of config `c`, before
+    /// it loads: its checkpoint file stands for its weights.
+    pub(super) fn of_checkpoint(label: &str, c: &Config, dir: &Path) -> Result<Self> {
+        let refused = |reason: String| {
+            Error::from_reason(format!(
+                "{label}: the DFlash2 draft at {} does not serve this model: {reason}",
+                dir.display()
+            ))
+        };
+        let draft = read_dflash2_config(dir).map_err(|error| refused(error.reason))?;
+        draft
+            .validate_target(super::decoder::draft_target_shape_of(c))
+            .map_err(|error| refused(error.reason))?;
+        let weights = dflash2_file_bytes(dir).map_err(|error| refused(error.reason))?;
+        Ok(Self::of(c, &draft, weights))
+    }
+}
+
+/// A load serves one speculation source: the MTP head of its checkpoint or
+/// a DFlash2 draft.
+pub(super) fn refuse_head_with_draft(
+    label: &str,
+    has_mtp: bool,
+    draft: Option<&str>,
+) -> Result<()> {
+    match draft {
+        Some(dir) if has_mtp => Err(Error::from_reason(format!(
+            "{label}: the DFlash2 draft at {dir} cannot load beside the MTP head of this checkpoint: \
+             drop draftModelPath to use the head, or load the model without the head to use the draft"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// The lane's state besides the cell: with MTP weights, the draft history
 /// every prefill keeps for a `W`-token turn (draft K/V and indexer keys of
 /// every row, a full prefill window of hidden rows waiting) and an MTP
-/// turn's verify snapshots, which grows with `W`. The lane is one and
-/// charged once (Splash `evaluateEngineMemoryPlan`
-/// `availableForOneRequestKv`).
-pub(super) fn lane_state(c: &Config, has_mtp: bool) -> impl Fn(u32) -> u64 + '_ {
+/// turn's verify snapshots, which grows with `W`; with a DFlash2 draft,
+/// its lane. The lane is one and charged once (Splash
+/// `evaluateEngineMemoryPlan` `availableForOneRequestKv`).
+pub(super) fn lane_state(c: &Config, has_mtp: bool, draft: DraftPrice) -> impl Fn(u32) -> u64 + '_ {
     move |window| {
-        if has_mtp {
+        let mtp = if has_mtp {
             draft_state_bytes(c, u64::from(window))
                 + u64::from(window) * draft_index_bytes_per_token(c)
                 + super::MAX_PREFILL_CHUNK as u64 * draft_hidden_row_bytes(c)
         } else {
             0
-        }
+        };
+        mtp.saturating_add(draft.lane())
     }
 }
 
@@ -190,18 +262,44 @@ pub(super) struct LoadInventory {
 }
 
 /// The store plan and the dynamic budget whose lanes hold the allowance of
-/// `allowance_tokens`.
+/// `allowance_tokens` and, beside the pool, `states` bytes of stored prefix
+/// states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct StoreDecision {
     pub store: StorePlan,
     pub allowance: u64,
     pub allowance_tokens: u32,
+    pub states: u64,
+}
+
+/// The stored states a store plan leaves room for: the one lane's
+/// resume state (in use until its turn ends), the replay point the turn
+/// publishes, and the one state the disk tier writes at a time. A publication
+/// can give up neither of the first and the third; any other state is its
+/// victim.
+pub(super) const STORED_STATES: u64 = 3;
+
+/// [`STORED_STATES`] states at `tokens` rows, priced as a publication checks
+/// one (`Inner::room_for_state`): the cell, its draft part with the MTP head
+/// at the larger of its sizes over the prefill windows (linear in the rows
+/// the window drains, so at one of its ends), and its lineage.
+pub(super) fn states_reserve(c: &Config, has_mtp: bool, tokens: u32) -> u64 {
+    let rows = tokens as usize;
+    let state = |chunk: usize| state_bytes(c, rows as u64, chunk as u64, has_mtp);
+    let one = state(super::MAX_PREFILL_CHUNK)
+        .max(state(1))
+        .saturating_add(lineage_bytes(rows, rows / super::prefix_state::BLOCK_ROWS));
+    STORED_STATES.saturating_mul(one)
 }
 
 /// Splash `planStreamedMemory` for a target that cannot spill: the KV
 /// allowance of the requested context, else `min(trained,
 /// kResidentAllowanceTokens)`, on the load's one lane (with MTP weights it
-/// holds the MTP draft state) comes before the experts.
+/// holds the MTP draft state) comes before the experts. The allowance holds
+/// [`states_reserve`] of stored prefix states beside the pool as well: a
+/// streamed store takes everything the allowance leaves, and a whole store's
+/// pool grows into all its slack, so without the reserve neither leaves a
+/// state room. A whole store whose slack is under the reserve streams.
 pub(super) fn plan_store(
     label: &str,
     c: &Config,
@@ -211,14 +309,54 @@ pub(super) fn plan_store(
     max_context: Option<u32>,
     has_mtp: bool,
     disk: bool,
+    draft: DraftPrice,
+) -> Result<StoreDecision> {
+    let plan = |states: u64| {
+        plan_lanes(
+            label,
+            c,
+            inventory,
+            live,
+            max_memory,
+            max_context,
+            has_mtp,
+            disk,
+            draft,
+            states,
+        )
+    };
+    let base = plan(0)?;
+    let above = base
+        .store
+        .expert_cap_bytes
+        .saturating_sub(inventory.experts.minimum);
+    let states = states_reserve(c, has_mtp, base.allowance_tokens).min(above);
+    if states == 0 {
+        return Ok(base);
+    }
+    plan(states)
+}
+
+/// [`plan_store`] with `states` bytes beside the pool in the allowance.
+fn plan_lanes(
+    label: &str,
+    c: &Config,
+    inventory: &LoadInventory,
+    live: LiveMemory,
+    max_memory: Option<u64>,
+    max_context: Option<u32>,
+    has_mtp: bool,
+    disk: bool,
+    draft: DraftPrice,
+    states: u64,
 ) -> Result<StoreDecision> {
     let transient = |window: u32| transient(c, window);
-    let state = lane_state(c, has_mtp);
+    let state = lane_state(c, has_mtp, draft);
     let pool = pool_input(c, &transient, &state);
     let lane = |dynamic: u64| pool.plan_at(dynamic).lane.window.maximum();
     let automatic = pool.shape.trained.min(RESIDENT_ALLOWANCE_TOKENS);
     let allowance_tokens = max_context.unwrap_or(automatic);
-    let allowance = allowance_dynamic_bytes(&[&lane], allowance_tokens);
+    let allowance = allowance_dynamic_bytes(&[&lane], allowance_tokens).saturating_add(states);
     let minimum_dynamic = pool.plan_at(0).lane.minimum_bytes;
     let hard = hard_budget_bytes(
         live.working_set_bytes,
@@ -245,11 +383,14 @@ pub(super) fn plan_store(
         store,
         allowance,
         allowance_tokens,
+        states,
     })
 }
 
 /// Splash `evaluateEngineMemoryPlan` after the load: what is resident now,
-/// with `held_back` bytes of the stores and the vision tower above it.
+/// with `held_back` bytes of the stores and the vision tower above it, and
+/// the store decision's `states` held beside the pool, which the pool never
+/// grows into.
 pub(super) fn plan_engine(
     label: &str,
     c: &Config,
@@ -258,9 +399,12 @@ pub(super) fn plan_engine(
     max_memory: Option<u64>,
     has_mtp: bool,
     disk: bool,
+    draft: DraftPrice,
+    states: u64,
 ) -> Result<MemoryPlan> {
     let transient = |window: u32| transient(c, window);
-    let state = lane_state(c, has_mtp);
+    let lane = lane_state(c, has_mtp, draft);
+    let state = |window: u32| lane(window).saturating_add(states);
     let footprint = MemoryFootprint {
         working_set_bytes: live.working_set_bytes,
         max_memory_bytes: max_memory,
@@ -268,7 +412,7 @@ pub(super) fn plan_engine(
         other_pool_bytes: live.registered_pool_bytes,
         staging_bytes: 0,
         state_staging_bytes: state_staging(c, has_mtp, disk),
-        draft_weights_bytes: 0,
+        draft_weights_bytes: draft.weights,
         held_back_bytes: held_back,
         margin: crate::engine::memory_plan::Margin::Unguarded,
     };
@@ -348,7 +492,12 @@ pub(super) fn estimate(
     max_context: Option<u32>,
     has_mtp: bool,
     disk: bool,
+    draft: DraftPrice,
 ) -> Result<Qwen4ExpContextEstimate> {
+    let live = LiveMemory {
+        active_bytes: live.active_bytes.saturating_add(draft.weights),
+        ..live
+    };
     let decision = plan_store(
         label,
         c,
@@ -358,6 +507,7 @@ pub(super) fn estimate(
         max_context,
         has_mtp,
         disk,
+        draft,
     )?;
     let loaded = LiveMemory {
         active_bytes: live
@@ -370,7 +520,17 @@ pub(super) fn estimate(
         .expert_cap_bytes
         .saturating_add(decision.store.row_cache_bytes)
         .saturating_add(inventory.vision_bytes);
-    let plan = plan_engine(label, c, loaded, held_back, max_memory, has_mtp, disk)?;
+    let plan = plan_engine(
+        label,
+        c,
+        loaded,
+        held_back,
+        max_memory,
+        has_mtp,
+        disk,
+        draft,
+        decision.states,
+    )?;
     check_context(label, &plan, max_context)?;
     let pool = plan.pool.as_ref().ok_or_else(|| {
         Error::from_reason(format!("{label} memory plan: the load planned no pool"))
@@ -413,10 +573,15 @@ pub async fn estimate_qwen4_exp_context_window(
         serve_context(LABEL, &mut config, max_context)?;
         config.kv_format = resolve_kv_format(LABEL, options.kv_format.as_deref(), &config)?;
         let has_mtp = super::auxiliary::validate_mtp(&weights, &config)?;
+        refuse_head_with_draft(LABEL, has_mtp, options.draft_model_path.as_deref())?;
         let vision = super::media::Vision::metadata(&raw, &weights, &config)?.available();
         let inventory = weights.load_inventory(&config, vision)?;
         let env = std::env::var(crate::cold_tier::PERSIST_PAGED_CACHE_ENV).ok();
         let disk = super::disk_plan(LABEL, &options, env.as_deref())?.1;
+        let draft = match options.draft_model_path.as_deref() {
+            Some(dir) => DraftPrice::of_checkpoint(LABEL, &config, Path::new(dir))?,
+            None => DraftPrice::default(),
+        };
         estimate(
             LABEL,
             &config,
@@ -426,6 +591,7 @@ pub async fn estimate_qwen4_exp_context_window(
             max_context,
             has_mtp,
             disk,
+            draft,
         )
         .map(Some)
     })

@@ -63,7 +63,7 @@ fn qwen38_plan_with(
 ) -> Result<MemoryPlan, PlanError> {
     let cfg = qwen38_27b_cfg();
     assert_eq!(cfg.recurrent_state_bytes(), QWEN38_CELL);
-    let pool_transient = |window| pool_lane_transient(&cfg, None, window);
+    let pool_transient = |window| pool_lane_transient(&cfg, None, window, 1);
     let pool = PoolInput {
         shape: LaneShape {
             trained: 262_144,
@@ -387,7 +387,7 @@ fn pool_below_the_config_floor_validates() {
 fn transient_charges_the_decode_free_pool() {
     let cfg = qwen38_27b_cfg();
     let cycle = |window| pool_verify_cycle_bytes(&cfg, window);
-    let lane = |window| pool_lane_transient(&cfg, Some(QWEN38_DRAFT_TAPS), window);
+    let lane = |window| pool_lane_transient(&cfg, Some(QWEN38_DRAFT_TAPS), window, 1);
     assert_eq!(cycle(94_201), 43_188_224 + 25_886_720);
     assert_eq!(lane(94_201), 276_824_064 + 109_445_120 + 104_857_600);
     assert_eq!(cycle(512), 43_188_224 + 25_886_720);
@@ -416,7 +416,7 @@ fn verify_transient_charges_the_held_prefill_workspace() {
     assert_eq!(pool_verify_cycle_bytes(&cfg, 512), 27_787_264 + 17_252_352);
     for window in [512, 2_048, 262_144] {
         assert_eq!(
-            pool_lane_transient(&cfg, Some(QWEN38_DRAFT_TAPS), window),
+            pool_lane_transient(&cfg, Some(QWEN38_DRAFT_TAPS), window, 1),
             27_787_264 + 17_252_352 + 134_217_728 + 16_908_288 + 6_927_360,
             "window {window}"
         );
@@ -431,7 +431,7 @@ fn verify_transient_charges_the_held_prefill_workspace() {
 #[test]
 fn chunk_transient_counts_one_chunk_of_taps() {
     let cfg = qwen38_27b_cfg();
-    let lane = |taps: Option<usize>, window| pool_lane_transient(&cfg, taps, window);
+    let lane = |taps: Option<usize>, window| pool_lane_transient(&cfg, taps, window, 1);
     assert_eq!(lane(None, 2_048), 276_824_064 + 109_445_120);
     assert_eq!(
         lane(Some(QWEN38_DRAFT_TAPS), 2_048),
@@ -459,10 +459,10 @@ fn pool_attention_term_is_the_splash_workspace() {
         109_445_120
     );
     assert_eq!(pool_attention_bytes(&cfg, 8, Pass::Verify), 25_886_720);
-    let chunk = pool_lane_transient(&cfg, Some(QWEN38_DRAFT_TAPS), 2_048);
+    let chunk = pool_lane_transient(&cfg, Some(QWEN38_DRAFT_TAPS), 2_048, 1);
     for window in [4_096, 94_201, 262_144] {
         assert_eq!(
-            pool_lane_transient(&cfg, Some(QWEN38_DRAFT_TAPS), window),
+            pool_lane_transient(&cfg, Some(QWEN38_DRAFT_TAPS), window, 1),
             chunk,
             "window {window}"
         );

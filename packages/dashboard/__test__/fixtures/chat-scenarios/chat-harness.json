@@ -288,6 +288,44 @@
       ]
     },
     {
+      "match": "compact",
+      "steps": [
+        {
+          "thought": "The conversation is long.",
+          "chunk": 4,
+          "delayMs": 40
+        },
+        {
+          "text": "Let me look again.",
+          "chunk": 6,
+          "delayMs": 60
+        },
+        {
+          "compact": {
+            "ms": 45000,
+            "tokensBefore": 222822,
+            "tokensAfter": 31204
+          }
+        },
+        {
+          "text": " Done: the summary keeps what matters.",
+          "chunk": 7,
+          "totalTokens": 31204
+        },
+        {
+          "turnCompleted": {
+            "inputTokens": 900,
+            "outputTokens": 120
+          }
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    },
+    {
       "match": "slow",
       "steps": [
         {
@@ -1088,6 +1126,135 @@
           },
           {
             "text": "Nothing is running.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "compact",
+        "steps": [
+          {
+            "thought": "Read the file first.",
+            "chunk": 4,
+            "delayMs": 40
+          },
+          {
+            "tool": {
+              "toolName": "read_file",
+              "title": "Read README.md",
+              "rawInput": {
+                "path": "README.md"
+              },
+              "output": "# Demo\n"
+            }
+          },
+          {
+            "compact": {
+              "ms": 45000,
+              "tokensBefore": 222822,
+              "tokensAfter": 31204
+            }
+          },
+          {
+            "text": "The README is one heading.",
+            "chunk": 7,
+            "totalTokens": 31204
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "slow",
+        "steps": [
+          {
+            "thought": "Read the file first.",
+            "chunk": 4,
+            "delayMs": 40
+          },
+          {
+            "tool": {
+              "toolName": "read_file",
+              "title": "Read README.md",
+              "rawInput": {
+                "path": "README.md"
+              },
+              "output": "# Demo\n"
+            }
+          },
+          {
+            "sleepMs": 45000
+          },
+          {
+            "text": "The README is one heading.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "workflow",
+        "steps": [
+          {
+            "permission": {
+              "toolName": "workflow",
+              "kind": "other",
+              "title": "Run workflow deep-research",
+              "rawInput": {
+                "source": {
+                  "name": "deep-research"
+                },
+                "args": {
+                  "question": "Which files hold the lane count?",
+                  "breadth": 2
+                }
+              },
+              "output": "{\"run_id\":\"wf_1\",\"status\":\"active\"}"
+            }
+          },
+          {
+            "workflow": {
+              "runId": "wf_1",
+              "name": "deep-research",
+              "label": "researcher-0",
+              "command": "ls",
+              "childAfterMs": 3000,
+              "completeAfterMs": 8000,
+              "wakeEndAfterMs": 2000
+            }
+          },
+          {
+            "text": "The workflow runs on its own. Its report comes when it ends.",
             "chunk": 7
           },
           {

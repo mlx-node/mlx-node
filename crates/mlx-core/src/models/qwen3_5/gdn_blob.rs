@@ -15,9 +15,10 @@ use napi::bindgen_prelude::*;
 
 use crate::array::{DType, MxArray};
 
+use super::arrays_cache::ArraysCache;
 use super::dflash2::DFLASH2_VERIFY_ROWS;
 use super::gated_delta::GdnKernelTape;
-use super::gated_delta_net::GdnLayerTape;
+use super::gated_delta_net::{GatedDeltaNet, GdnLayerTape, GdnWaveLane};
 use super::layer_cache::Qwen3_5LayerCache;
 
 /// The two cells, the decoder-layer index of each blob row and the pending
@@ -157,6 +158,22 @@ impl GdnStateBlobs {
         arrays
     }
 
+    /// Bytes of the other parity's cell.
+    pub(crate) fn spare_bytes(&self) -> u64 {
+        (self.spare.0.nbytes() as u64).saturating_add(self.spare.1.nbytes() as u64)
+    }
+
+    /// Bytes of the pending tape: the last verify's whole tape.
+    pub(crate) fn pending_bytes(&self) -> u64 {
+        self.pending.as_ref().map_or(0, |pending| {
+            pending
+                .rows
+                .iter()
+                .flatten()
+                .fold(0u64, |sum, array| sum.saturating_add(array.nbytes() as u64))
+        })
+    }
+
     pub(crate) fn destinations(&self) -> &GdnDestinations {
         &self.destinations
     }
@@ -255,6 +272,33 @@ impl GdnStateBlobs {
         Ok(())
     }
 
+    /// The verify cell of blob row `row` (Splash `GdnTapeLane`): slots 0/1
+    /// the live cell `live` holds, 2/3 this lane's other cell's rows, 4..9
+    /// the pending tape and keep. The layer folds the pending rows into the
+    /// other cell and runs its window from there, so the live and other
+    /// cells are the lane's two (Splash `QwenStateStorage::swapDecodeParity`).
+    pub(crate) fn verify_cell(&self, live: &ArraysCache, row: usize) -> Result<ArraysCache> {
+        let dst = self.destinations();
+        let (Some(state), Some(conv)) = (dst.state.get(row), dst.conv.get(row)) else {
+            return Err(Error::from_reason(format!(
+                "GDN verify cell: no destination row {row}"
+            )));
+        };
+        let mut cell = ArraysCache::new(10);
+        if let Some(conv) = live.get(0) {
+            cell.set(0, conv.clone())?;
+        }
+        if let Some(state) = live.get(1) {
+            cell.set(1, state.clone())?;
+        }
+        cell.set(2, state.clone())?;
+        cell.set(3, conv.clone())?;
+        for (slot, array) in self.pending(row)?.into_iter().enumerate() {
+            cell.set(4 + slot, array.clone())?;
+        }
+        Ok(cell)
+    }
+
     /// Point every packed layer's cache slots at its blob rows.
     pub(crate) fn apply_views(&self, caches: &mut [Qwen3_5LayerCache]) -> Result<()> {
         for (row, &layer) in self.layers.iter().enumerate() {
@@ -270,6 +314,91 @@ impl GdnStateBlobs {
         }
         Ok(())
     }
+}
+
+/// The live slots after a verify of `written` (a [`GdnStateBlobs::verify_cell`]):
+/// its conv history and state, in the lane's other cell.
+pub(crate) fn adopt_verify_cell(live: &mut ArraysCache, written: &ArraysCache) -> Result<()> {
+    for index in 0..2 {
+        if let Some(array) = written.get(index) {
+            live.set(index, array.clone())?;
+        }
+    }
+    Ok(())
+}
+
+/// One lane of a verify wave: its own cache slots, its own two cells and
+/// pending tape, and its per-layer tape. A lane owns its slots outright;
+/// [`gdn_wave_layer`] refuses two lanes on one cell pair.
+pub(crate) struct GdnWaveCells<'a> {
+    pub caches: &'a mut [Qwen3_5LayerCache],
+    pub blobs: &'a GdnStateBlobs,
+    pub tape: &'a mut [Option<GdnLayerTape>],
+}
+
+/// Linear layer `layer` (blob row `row`) of a verify wave, `x` `[N, T, H]`:
+/// each lane's verify cell from its own slots and blobs, one
+/// [`GatedDeltaNet::forward_wave`], then each lane's slots and tape take its
+/// own results. On an error no lane's slots or tape change. With
+/// `residual` the output is the whole hidden state
+/// ([`GatedDeltaNet::forward_wave`]).
+pub(crate) fn gdn_wave_layer(
+    gdn: &GatedDeltaNet,
+    x: &MxArray,
+    layer: usize,
+    row: usize,
+    lanes: &mut [GdnWaveCells<'_>],
+    residual: Option<&MxArray>,
+) -> Result<MxArray> {
+    for (i, lane) in lanes.iter().enumerate() {
+        if lane.blobs.layers.get(row) != Some(&layer) || lane.tape.len() <= layer {
+            return Err(Error::from_reason(format!(
+                "GDN wave: lane {i} has no blob row {row} for layer {layer}"
+            )));
+        }
+        if lanes[..i]
+            .iter()
+            .any(|peer| std::ptr::eq(peer.blobs, lane.blobs))
+        {
+            return Err(Error::from_reason(format!(
+                "GDN wave: lane {i} shares a peer's cells"
+            )));
+        }
+    }
+    if lanes.is_empty() {
+        return Err(Error::from_reason("GDN wave: no lanes"));
+    }
+    let mut cells = Vec::with_capacity(lanes.len());
+    for (i, lane) in lanes.iter_mut().enumerate() {
+        let live = lane
+            .caches
+            .get_mut(layer)
+            .and_then(Qwen3_5LayerCache::as_arrays_cache_mut)
+            .ok_or_else(|| {
+                Error::from_reason(format!("GDN wave: lane {i} layer {layer} has no GDN slot"))
+            })?;
+        cells.push(lane.blobs.verify_cell(live, row)?);
+    }
+    let mut tapes: Vec<Option<GdnLayerTape>> = vec![None; lanes.len()];
+    let out = {
+        let mut wave: Vec<GdnWaveLane<'_>> = cells
+            .iter_mut()
+            .zip(tapes.iter_mut())
+            .map(|(cell, tape)| GdnWaveLane { cell, tape })
+            .collect();
+        gdn.forward_wave(x, &mut wave, residual)?
+    };
+    for ((lane, cell), tape) in lanes.iter_mut().zip(&cells).zip(tapes) {
+        if let Some(live) = lane
+            .caches
+            .get_mut(layer)
+            .and_then(Qwen3_5LayerCache::as_arrays_cache_mut)
+        {
+            adopt_verify_cell(live, cell)?;
+        }
+        lane.tape[layer] = tape;
+    }
+    Ok(out)
 }
 
 /// The replay tape of a pending row: `gated_delta_replay` maps value head

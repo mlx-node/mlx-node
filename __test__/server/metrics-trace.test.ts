@@ -4,7 +4,11 @@ import { basename, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { MetricsTrace, type MetricsTraceRecord } from '../../packages/server/src/metrics-trace.js';
+import {
+  MetricsTrace,
+  RESIDENCY_DELTA_FIELDS,
+  type MetricsTraceRecord,
+} from '../../packages/server/src/metrics-trace.js';
 
 /** A fixed instant so `<YYYY-MM-DD>` is deterministic (UTC). */
 const FIXED_NOW = Date.UTC(2026, 6, 21, 12, 34, 56); // 2026-07-21
@@ -114,6 +118,9 @@ describe('MetricsTrace', () => {
         mtpMeanAccepted: 1.6,
         mtpMeanDrafts: 0.6,
         mtpMeanDepth: 2,
+        mtpProposed: 6,
+        mtpAcceptedDrafts: 2,
+        mtpVerifyRows: 3,
         mtpAcceptByPos: [0.5, 0.25],
         toolCount: 4,
         toolCallCount: 2,
@@ -158,6 +165,9 @@ describe('MetricsTrace', () => {
       mtpMeanAccepted: 1.6,
       mtpMeanDrafts: 0.6,
       mtpMeanDepth: 2,
+      mtpProposed: 6,
+      mtpAcceptedDrafts: 2,
+      mtpVerifyRows: 3,
       mtpAcceptByPos: [0.5, 0.25],
       toolCount: 4,
       toolCallCount: 2,
@@ -391,6 +401,32 @@ describe('MetricsTrace', () => {
   // dashboard root can ever match, so it must be omitted — while `coldEnabled:
   // false` IS recorded, because "the tier was off" and "we do not know" are
   // different answers the Cache page reports differently.
+  // MUTATION: remove the RESIDENCY_DELTA_FIELDS loop of `record()` -> the keys are missing -> red.
+  it('writes every residency delta and the expert residency, and drops invalid values', () => {
+    const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
+    const deltas: Record<string, number> = {};
+    RESIDENCY_DELTA_FIELDS.forEach((key, i) => {
+      deltas[key] = i + 1;
+    });
+    trace.record({ ...baseRecord(), ...deltas, expertResidency: 'store-plan', expertSlots: 412 });
+    trace.record({
+      ...baseRecord({ traceId: 'trace-2' }),
+      routeTries: 'many' as unknown as number,
+      routeReplays: -1,
+      slotMisses: Number.NaN,
+      fillMicros: 2.5,
+      expertResidency: 'partial' as unknown as MetricsTraceRecord['expertResidency'],
+      expertSlots: 4.5,
+    });
+
+    const [full, invalid] = readLines(trace.currentFile()) as MetricsTraceRecord[];
+    expect(full).toMatchObject({ ...deltas, expertResidency: 'store-plan', expertSlots: 412 });
+    for (const key of ['routeTries', 'routeReplays', 'slotMisses', 'expertResidency', 'expertSlots']) {
+      expect(key in invalid!).toBe(false);
+    }
+    expect(invalid!.fillMicros).toBe(2.5);
+  });
+
   it('omits an empty coldRoot but still records coldEnabled: false', () => {
     const trace = new MetricsTrace({ dir, now: () => FIXED_NOW });
     trace.record(baseRecord({ coldRoot: '', coldEnabled: false }));

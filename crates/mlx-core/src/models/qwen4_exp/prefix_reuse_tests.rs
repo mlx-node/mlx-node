@@ -519,6 +519,46 @@ fn a_refused_publication_drops_no_stored_state() {
     assert_eq!(turn(&mut inner, 3, &fork(&a, 98, 110, 2)).0, 96);
 }
 
+/// Under a memory bound the streamed experts take everything the
+/// allowance leaves, so the room a publication finds is the stored-state
+/// reserve the store plan gives back (the lane's draft room left out). With
+/// it, turn 1 publishes its checkpoint and replay point and turn 2 resumes at
+/// the replay point; nothing is refused for room.
+/// Mutation: `states_reserve` gives 0 → red (every point
+/// refused for room, turn 2 cold).
+#[test]
+fn a_bounded_plan_publishes_on_turn_one_and_restores_on_turn_two() {
+    use crate::engine::memory_plan::MemoryPlan;
+    let _host = memory::scoped_fixture_host();
+    let mut inner = reuse_inner();
+    inner.activate_paged_seq(1).unwrap();
+    let c = Arc::clone(&inner.decoder.config);
+    let probe = u64::MAX / 4;
+    inner.memory_plan = MemoryPlan::with_dynamic(probe);
+    let lanes = probe - inner.state_room();
+    let window = inner.decoder.context_window as u32;
+    let reserve = load_plan::states_reserve(&c, inner.has_mtp, window);
+    inner.memory_plan = MemoryPlan::with_dynamic(lanes + reserve);
+    let a = prompt(100, 1);
+    assert_eq!(turn(&mut inner, 1, &a).0, 0);
+    finish(&mut inner);
+    let counters = inner.prefix_states.counters;
+    eprintln!(
+        "bounded fixture: lanes {lanes} B, reserve {reserve} B, room {} B, states {} B, \
+         published {}, refused for room {}",
+        inner.state_room(),
+        inner.prefix_states.bytes(),
+        counters.published,
+        counters.refused_room
+    );
+    assert_eq!(counters.refused_room, 0);
+    assert_eq!(depths(&inner), [(64, true), (96, false)]);
+    let (cached, _) = turn(&mut inner, 1, &fork(&a, 98, 110, 2));
+    assert_eq!(cached, 96);
+    assert_eq!(inner.prefix_states.counters.restored, 1);
+    assert_eq!(inner.prefix_states.counters.refused_room, 0);
+}
+
 /// A layer-major group ends at the deepest checkpoint and the replay point
 /// inside it: the states it publishes are the window-at-a-time ones bit for
 /// bit, and it never holds more than the cell it publishes.
@@ -992,7 +1032,7 @@ fn a_group_holds_only_whole_windows() {
             "the window halves past 64 rows: {:?}",
             turn.ends
         );
-        for run in turn.runs(0, 100, GRID) {
+        for run in turn.runs(0, 100, GRID, decoder::GroupLimit::Whole) {
             assert!(
                 run.len() == 1 || run.iter().all(|&(start, end)| end - start == GRID),
                 "a run of several passes holds whole windows only: {run:?}"
@@ -1283,4 +1323,235 @@ fn an_autoregressive_prefill_on_a_head_load_is_charged_its_draft() {
     let mut without = reuse_inner();
     without.has_mtp = false;
     assert_eq!(without.scheduled_state_candidate_bytes(1, 100, false), row);
+}
+
+/// The getter's `prefix*` reasons, by getter field, as `residencyInfo()`
+/// reads them: through the telemetry's last sync.
+fn reasons(inner: &Inner) -> [(&'static str, f64); 8] {
+    let info = Qwen4ExpResidencyInfo::default().with_prefix_counters(&inner.telemetry.counters());
+    [
+        ("refusedRoom", info.prefix_refused_room),
+        ("refusedLive", info.prefix_refused_live),
+        ("refusedRegister", info.prefix_refused_register),
+        ("refusedOffGrid", info.prefix_refused_off_grid),
+        ("refusedDraft", info.prefix_refused_draft),
+        ("skippedReuseOff", info.prefix_skipped_reuse_off),
+        ("skippedNoPoints", info.prefix_skipped_no_points),
+        ("missedReplay", info.prefix_missed_replay),
+    ]
+}
+
+/// Only reason `name` moved, by `count`.
+fn only(inner: &Inner, name: &str, count: f64) {
+    let want: Vec<_> = reasons(inner)
+        .iter()
+        .map(|&(key, _)| (key, if key == name { count } else { 0.0 }))
+        .collect();
+    assert_eq!(reasons(inner).to_vec(), want);
+}
+
+/// The getter carries every counter under its own name.
+/// Mutation: the getter swaps room and live → red.
+#[test]
+fn the_getter_names_every_prefix_counter() {
+    let c = prefix_state::Counters {
+        restored: 1,
+        published: 2,
+        retired: 3,
+        refused_room: 4,
+        refused_live: 5,
+        refused_register: 6,
+        refused_off_grid: 7,
+        refused_draft: 8,
+        skipped_reuse_off: 9,
+        skipped_no_points: 10,
+        missed_replay: 11,
+        dropped_kv: 12,
+        dropped_memory: 13,
+    };
+    let info = Qwen4ExpResidencyInfo::default().with_prefix_counters(&c);
+    assert_eq!(
+        [
+            info.prefix_restored,
+            info.prefix_published,
+            info.prefix_refused_room,
+            info.prefix_refused_live,
+            info.prefix_refused_register,
+            info.prefix_refused_off_grid,
+            info.prefix_refused_draft,
+            info.prefix_skipped_reuse_off,
+            info.prefix_skipped_no_points,
+            info.prefix_missed_replay,
+            info.prefix_dropped_kv,
+            info.prefix_dropped_memory,
+        ],
+        [
+            1.0, 2.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0
+        ]
+    );
+}
+
+/// A room the plan leaves no state in refuses every point of the turn, and
+/// the getter names the room.
+/// Mutation: the room refusal counts as live → red.
+#[test]
+fn a_state_room_with_no_room_names_the_room() {
+    let _host = memory::scoped_fixture_host();
+    let mut inner = reuse_inner();
+    inner.prefix_states.room_override = Some(0);
+    turn(&mut inner, 1, &prompt(100, 1));
+    finish(&mut inner);
+    assert_eq!(depths(&inner), []);
+    only(&inner, "refusedRoom", 3.0);
+}
+
+/// A host with no free memory refuses every point, and the getter names
+/// the live check.
+/// Mutation: the live refusal counts as room → red.
+#[test]
+fn a_host_with_no_free_memory_names_the_live_check() {
+    let _host = memory::scoped_test_host(memory::HostMemory {
+        free: 0,
+        file: 0,
+        ..memory::fixture_host()
+    });
+    let mut inner = reuse_inner();
+    turn(&mut inner, 1, &prompt(100, 1));
+    finish(&mut inner);
+    assert_eq!(depths(&inner), []);
+    only(&inner, "refusedLive", 3.0);
+}
+
+/// Blocks below the replay point that never got their chain hash refuse
+/// it; the points below stay published.
+/// Mutation: the short-chain refusal counts
+/// nothing → red.
+#[test]
+fn blocks_that_do_not_register_name_the_register() {
+    let _host = memory::scoped_fixture_host();
+    let mut inner = reuse_inner();
+    let a = prompt(100, 1);
+    inner.activate_paged_seq(1).unwrap();
+    let prefix = inner.prime_prefix_state(&a, true, 32, &[], 0).unwrap();
+    inner
+        .prefix_states
+        .turns
+        .get_mut(&1)
+        .expect("the text turn is open")
+        .chain
+        .truncate(2);
+    inner.paged_prefill(&a, &prefix, gpu()).unwrap();
+    finish(&mut inner);
+    assert_eq!(depths(&inner), [(64, true)]);
+    only(&inner, "refusedRegister", 1.0);
+}
+
+/// A scheduler slice off the grid refuses the points past it, and the
+/// getter names the grid.
+/// Mutation: the off-grid refusal counts nothing →
+/// red.
+#[test]
+fn a_slice_off_the_grid_names_the_grid() {
+    use crate::engine::hybrid_scheduler::ScheduledPrefixAdmission;
+    let _host = memory::scoped_fixture_host();
+    let mut inner = reuse_inner();
+    let a = prompt(100, 1);
+    let Ok(ScheduledPrefixAdmission::Ready(prefix)) =
+        inner.prepare_scheduled_prefix(1, &a, &[], true, 0, 32)
+    else {
+        panic!("a text prompt is admitted at once");
+    };
+    for (start, end) in [(0, 32), (32, 48), (48, 64), (64, 96), (96, 100)] {
+        inner.activate_paged_seq(1).unwrap();
+        inner
+            .run_scheduled_prefill_slice(1, &a, &prefix, start, end, gpu(), start == 0)
+            .unwrap();
+    }
+    finish(&mut inner);
+    assert_eq!(depths(&inner), [(32, true)]);
+    only(&inner, "refusedOffGrid", 2.0);
+}
+
+/// A draft owner that lost the cold run's history refuses the replay
+/// point, and the getter names the draft.
+/// Mutation: the draft refusal counts as register
+/// → red.
+#[test]
+fn a_draft_without_the_cold_history_names_the_draft() {
+    use crate::engine::hybrid_scheduler::ScheduledPrefixAdmission;
+    let _host = memory::scoped_fixture_host();
+    let mut inner = reuse_inner();
+    let a = prompt(100, 1);
+    let Ok(ScheduledPrefixAdmission::Ready(prefix)) =
+        inner.prepare_scheduled_prefix(1, &a, &[], true, 0, 32)
+    else {
+        panic!("a text prompt is admitted at once");
+    };
+    for (start, end) in [(0, 32), (32, 64), (64, 96), (96, 100)] {
+        inner.activate_paged_seq(1).unwrap();
+        inner
+            .run_scheduled_prefill_slice(1, &a, &prefix, start, end, gpu(), start == 0)
+            .unwrap();
+        if end == 64 {
+            inner.mtp.misalign(1);
+        }
+    }
+    finish(&mut inner);
+    assert_eq!(depths(&inner), [(64, true)]);
+    only(&inner, "refusedDraft", 1.0);
+}
+
+/// A text turn whose request asks for no reuse publishes nothing, and the
+/// getter names the request.
+/// Mutation: the skip counts nothing → red.
+#[test]
+fn a_request_without_reuse_names_the_request() {
+    let _host = memory::scoped_fixture_host();
+    let mut inner = reuse_inner();
+    let a = prompt(100, 1);
+    inner.activate_paged_seq(1).unwrap();
+    let prefix = inner.prime_prefix_state(&a, false, 32, &[], 0).unwrap();
+    inner.paged_prefill(&a, &prefix, gpu()).unwrap();
+    inner.finalize_paged_turn(false, 0);
+    assert_eq!(depths(&inner), []);
+    only(&inner, "skippedReuseOff", 1.0);
+}
+
+/// A prompt with no block-aligned row before its last token plans no
+/// point, and the getter names the plan.
+/// Mutation: the skip counts nothing → red.
+#[test]
+fn a_prompt_under_one_block_names_the_empty_plan() {
+    let _host = memory::scoped_fixture_host();
+    let mut inner = reuse_inner();
+    turn(&mut inner, 1, &prompt(20, 1));
+    finish(&mut inner);
+    assert_eq!(depths(&inner), []);
+    only(&inner, "skippedNoPoints", 1.0);
+}
+
+/// A turn cancelled before its replay point publishes the points behind
+/// the cancel, and the getter names the missed replay point.
+/// Mutation: the turn's end counts nothing → red.
+#[test]
+fn a_turn_cancelled_before_its_replay_point_names_the_miss() {
+    let _host = memory::scoped_fixture_host();
+    let mut inner = reuse_inner();
+    let a = prompt(100, 1);
+    let flag = Arc::new(AtomicBool::new(false));
+    inner.set_turn_cancel_flag(Some(Arc::clone(&flag)));
+    let trip = Arc::clone(&flag);
+    let mut passes = 0;
+    inner.decoder.after_pass = Some(Box::new(move |_| {
+        passes += 1;
+        if passes == 3 {
+            trip.store(true, Ordering::Release);
+        }
+    }));
+    inner.activate_paged_seq(1).unwrap();
+    let prefix = inner.prime_prefix_state(&a, true, 32, &[], 0).unwrap();
+    assert!(inner.paged_prefill(&a, &prefix, gpu()).is_err());
+    inner.abort_paged_turn();
+    assert_eq!(depths(&inner), [(64, true)]);
+    only(&inner, "missedReplay", 1.0);
 }

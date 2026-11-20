@@ -56,6 +56,7 @@ function liveFile(pid: number, extra: Partial<WriterLiveFile> = {}): WriterLiveF
         queueLimit: 32,
         pool: { at: T - 1000, blockCapacity: 100, allocatedBlocks: 10, freeBlocks: 80, reclaimableBlocks: 10 },
         stateNamespace: null,
+        experts: null,
       },
     ],
     turns: [
@@ -76,6 +77,7 @@ function liveFile(pid: number, extra: Partial<WriterLiveFile> = {}): WriterLiveF
         prefillTotal: 200,
         prefillDone: 200,
         generatedTokens: 30,
+        clientSession: 'acp-session-1',
       },
     ],
     ...extra,
@@ -271,6 +273,54 @@ describe('live: watcher', () => {
       ['busy', 'queued', 75_070, null, null],
       ['slot', 'slot', 3, 1_500, 0],
       ['prep', 'prepare', 2, 0, 4_000],
+    ]);
+  });
+
+  it("reads the session a turn's client named; an older engine, a blank or an overlong one reads as none", () => {
+    const turn = liveFile(31).turns[0]!;
+    const { clientSession: _session, ...older } = turn;
+    const turns = [
+      turn,
+      { ...older, traceId: 'older' },
+      { ...turn, traceId: 'blank', clientSession: '' },
+      { ...turn, traceId: 'long', clientSession: 'x'.repeat(129) },
+      { ...turn, traceId: 'number', clientSession: 7 },
+    ];
+    const parsed = parseLiveFile({ ...liveFile(31), turns });
+    expect(parsed?.turns.map((t) => [t.traceId, t.clientSession])).toEqual([
+      ['tr-1', 'acp-session-1'],
+      ['older', null],
+      ['blank', null],
+      ['long', null],
+      ['number', null],
+    ]);
+  });
+
+  it('reads the experts a model holds in memory; an older engine or a malformed value reads as none, the model stays', () => {
+    const model = liveFile(31).models[0]!;
+    const { experts: _experts, ...older } = model;
+    const rows = [
+      { ...model, name: 'partial', experts: { inMemory: 409, total: 512, streaming: true } },
+      { ...model, name: 'direct', experts: { inMemory: 512, total: 512, streaming: false } },
+      { ...model, name: 'rows', experts: { inMemory: 0, total: 512, streaming: true } },
+      { ...model, name: 'none', experts: null },
+      { ...older, name: 'older' },
+      { ...model, name: 'over', experts: { inMemory: 513, total: 512, streaming: true } },
+      { ...model, name: 'zero', experts: { inMemory: 0, total: 0, streaming: true } },
+      { ...model, name: 'half', experts: { inMemory: 4.5, total: 512, streaming: true } },
+      { ...model, name: 'text', experts: { inMemory: 409, total: 512, streaming: 'yes' } },
+    ];
+    const parsed = parseLiveFile({ ...liveFile(31), models: rows });
+    expect(parsed?.models.map((m) => [m.name, m.experts])).toEqual([
+      ['partial', { inMemory: 409, total: 512, streaming: true }],
+      ['direct', { inMemory: 512, total: 512, streaming: false }],
+      ['rows', { inMemory: 0, total: 512, streaming: true }],
+      ['none', null],
+      ['older', null],
+      ['over', null],
+      ['zero', null],
+      ['half', null],
+      ['text', null],
     ]);
   });
 

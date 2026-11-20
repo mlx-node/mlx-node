@@ -1969,3 +1969,315 @@ pub(super) mod rows {
         )))
     }
 }
+
+#[cfg(test)]
+mod pass_length_tests {
+    use crate::array::{DType, MxArray};
+
+    const LENGTHS: [i64; 4] = [7, 30, 448, 1024];
+
+    /// FNV-1a over every output's bits, captured from the kernels that took
+    /// the row count as a template constant, on an M5 (GPU generation 17).
+    const GOLDEN: &[(&str, i64, u64)] = &[
+        ("gdn-qwen4", 7, 0xfe150edfdd978794),
+        ("gdn-qwen35", 7, 0x27fa31557b3a9daf),
+        ("conv-10240", 7, 0x672337c677cd603c),
+        ("conv-17", 7, 0x8e499dea1a9a2bc7),
+        ("gdn-qwen4", 30, 0xe7d6215836e8c100),
+        ("gdn-qwen35", 30, 0x744f531c5db4bc1f),
+        ("conv-10240", 30, 0xb720278ad82a338b),
+        ("conv-17", 30, 0xf9a8246846de77da),
+        ("gdn-qwen4", 448, 0xf614225f1219ca08),
+        ("gdn-qwen35", 448, 0x28916257a045dd60),
+        ("conv-10240", 448, 0x5275a4b967d5997f),
+        ("conv-17", 448, 0xc09682b1cc1ba3bf),
+        ("gdn-qwen4", 1024, 0x4cd731152850a4a3),
+        ("gdn-qwen35", 1024, 0xbdae17d0365efd9d),
+        ("conv-10240", 1024, 0x899094d57fc6f0c3),
+        ("conv-17", 1024, 0x4abc164be203232d),
+    ];
+    const GOLDEN_GPU_GEN: i32 = 17;
+
+    fn input(shape: &[i64], phase: f32, dtype: DType) -> MxArray {
+        let n: i64 = shape.iter().product();
+        let values: Vec<_> = (0..n)
+            .map(|i| (i as f32 * 0.0173 + phase).sin() * 0.9 + (i as f32 * 0.31).cos() * 0.05)
+            .collect();
+        MxArray::from_float32(&values, shape)
+            .unwrap()
+            .astype(dtype)
+            .unwrap()
+    }
+
+    /// A strided view of `width` columns out of a wider last axis.
+    fn view(shape: &[i64], width: i64, phase: f32, dtype: DType) -> MxArray {
+        let mut wide = shape.to_vec();
+        let last = wide.len() - 1;
+        wide[last] = width + 64;
+        input(&wide, phase, dtype)
+            .slice_axis(last, 32, 32 + width)
+            .unwrap()
+    }
+
+    fn fnv(hash: &mut u64, bytes: impl IntoIterator<Item = u8>) {
+        for byte in bytes {
+            *hash ^= u64::from(byte);
+            *hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+
+    fn digest(outputs: &[MxArray]) -> u64 {
+        let refs: Vec<&MxArray> = outputs.iter().collect();
+        MxArray::eval_arrays(&refs).unwrap();
+        let mut hash = 0xcbf2_9ce4_8422_2325;
+        for out in outputs {
+            fnv(
+                &mut hash,
+                out.shape().unwrap().iter().flat_map(|d| d.to_le_bytes()),
+            );
+            match out.dtype().unwrap() {
+                DType::BFloat16 => fnv(
+                    &mut hash,
+                    out.to_uint16_native()
+                        .unwrap()
+                        .into_iter()
+                        .flat_map(u16::to_le_bytes),
+                ),
+                DType::Float32 => fnv(
+                    &mut hash,
+                    out.to_float32()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|v| v.to_bits().to_le_bytes()),
+                ),
+                other => panic!("unexpected output dtype {other:?}"),
+            }
+        }
+        hash
+    }
+
+    fn bits(x: &MxArray) -> Vec<u32> {
+        let f = x.astype(DType::Float32).unwrap();
+        f.to_float32()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_bits())
+            .collect()
+    }
+
+    struct Gdn {
+        conv: MxArray,
+        scale: MxArray,
+        dt: MxArray,
+        mean_eps: bool,
+        beta_input_dtype: bool,
+        gate_dtype: DType,
+    }
+
+    impl Gdn {
+        fn new(mean_eps: bool, beta_input_dtype: bool, gate_dtype: DType) -> Self {
+            Self {
+                conv: input(&[10240, 4], 0.2, DType::Float32),
+                scale: input(&[48], 0.8, DType::Float32).sub_scalar(0.5).unwrap(),
+                dt: input(&[48], 1.3, DType::Float32),
+                mean_eps,
+                beta_input_dtype,
+                gate_dtype,
+            }
+        }
+
+        fn inputs(&self, t: i64, phase: f32) -> [MxArray; 3] {
+            [
+                view(&[1, t, 10240], 10240, phase, DType::BFloat16),
+                view(&[1, t, 48], 48, phase + 0.6, self.gate_dtype),
+                view(&[1, t, 48], 48, phase + 1.0, self.gate_dtype),
+            ]
+        }
+
+        /// q, k, v, decay, beta, next history.
+        fn run(&self, [qkv, a, b]: &[MxArray; 3], history: &MxArray) -> Vec<MxArray> {
+            let mut outputs = [std::ptr::null_mut(); 6];
+            assert!(unsafe {
+                mlx_sys::mlx_qwen4_gdn_prepare(
+                    qkv.as_raw_ptr(),
+                    a.as_raw_ptr(),
+                    b.as_raw_ptr(),
+                    self.conv.as_raw_ptr(),
+                    history.as_raw_ptr(),
+                    self.scale.as_raw_ptr(),
+                    self.dt.as_raw_ptr(),
+                    self.mean_eps,
+                    self.beta_input_dtype,
+                    outputs.as_mut_ptr(),
+                )
+            });
+            outputs
+                .into_iter()
+                .map(|p| MxArray::from_handle(p, "test GDN preparation").unwrap())
+                .collect()
+        }
+    }
+
+    fn conv_run(x: &MxArray, history: &MxArray, weight: &MxArray) -> Vec<MxArray> {
+        let (mut out, mut next) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert!(unsafe {
+            mlx_sys::mlx_qwen4_window_conv(
+                x.as_raw_ptr(),
+                history.as_raw_ptr(),
+                weight.as_raw_ptr(),
+                &mut out,
+                &mut next,
+            )
+        });
+        vec![
+            MxArray::from_handle(out, "test window conv").unwrap(),
+            MxArray::from_handle(next, "test window history").unwrap(),
+        ]
+    }
+
+    /// Splitting a pass in two, the second piece starting from the first
+    /// piece's history, gives the whole pass's rows and history.
+    fn assert_split_equals_whole(
+        what: &str,
+        x: &[MxArray],
+        cut: i64,
+        history: &MxArray,
+        run: &dyn Fn(&[MxArray], &MxArray) -> Vec<MxArray>,
+    ) {
+        let t = x[0].shape_at(1).unwrap();
+        let piece = |from: i64, to: i64| -> Vec<MxArray> {
+            x.iter()
+                .map(|v| v.slice_axis(1, from, to).unwrap())
+                .collect()
+        };
+        let whole = run(x, history);
+        let first = run(&piece(0, cut), history);
+        let second = run(&piece(cut, t), first.last().unwrap());
+        let rows = whole.len() - 1;
+        for i in 0..rows {
+            let joined = MxArray::concatenate_many(vec![&first[i], &second[i]], Some(1)).unwrap();
+            assert_eq!(
+                bits(&whole[i]),
+                bits(&joined),
+                "{what}: output {i}, t={t}, cut={cut}"
+            );
+        }
+        assert_eq!(
+            bits(&whole[rows]),
+            bits(&second[rows]),
+            "{what}: next history, t={t}, cut={cut}"
+        );
+    }
+
+    /// Both pass-length kernels keep the bits they had when the row count was
+    /// a template constant, at every pass length.
+    #[test]
+    fn gdn_kernels_keep_their_bits_at_any_length() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let gdns = [
+            ("gdn-qwen4", Gdn::new(false, false, DType::Float32)),
+            ("gdn-qwen35", Gdn::new(true, true, DType::BFloat16)),
+        ];
+        // Transposed weights and offset views also exercise the primitive's
+        // contiguous-input preparation.
+        let weights = [
+            (
+                "conv-10240",
+                10240i64,
+                input(&[4, 10240], 0.7, DType::Float32),
+            ),
+            ("conv-17", 17, input(&[4, 17], 0.9, DType::Float32)),
+        ]
+        .map(|(name, width, w)| (name, width, w.transpose(None).unwrap()));
+        // Bits are pinned on the generation they were captured on; the split
+        // check below holds on every GPU.
+        if unsafe { mlx_sys::mlx_gpu_architecture_gen() } == GOLDEN_GPU_GEN {
+            let mut seen = Vec::new();
+            for t in LENGTHS {
+                for (name, gdn) in &gdns {
+                    let history = view(&[3, 10240], 10240, 2.4, DType::BFloat16);
+                    seen.push((*name, t, digest(&gdn.run(&gdn.inputs(t, 0.1), &history))));
+                }
+                for (name, width, weight) in &weights {
+                    let x = view(&[1, t, *width], *width, 0.4, DType::BFloat16);
+                    let history = view(&[3, *width], *width, 2.1, DType::BFloat16);
+                    seen.push((*name, t, digest(&conv_run(&x, &history, weight))));
+                }
+            }
+            assert_eq!(seen, GOLDEN, "kernel bits changed");
+        }
+        for t in LENGTHS {
+            for (name, gdn) in &gdns {
+                let history = view(&[3, 10240], 10240, 2.4, DType::BFloat16);
+                let run = |x: &[MxArray], h: &MxArray| {
+                    gdn.run(&[x[0].clone(), x[1].clone(), x[2].clone()], h)
+                };
+                assert_split_equals_whole(name, &gdn.inputs(t, 0.1), t / 3, &history, &run);
+            }
+            for (name, width, weight) in &weights {
+                let x = view(&[1, t, *width], *width, 0.4, DType::BFloat16);
+                let history = view(&[3, *width], *width, 2.1, DType::BFloat16);
+                let run = |x: &[MxArray], h: &MxArray| conv_run(&x[0], h, weight);
+                assert_split_equals_whole(name, &[x], t / 3, &history, &run);
+            }
+        }
+    }
+
+    /// One pipeline serves every pass length: a new length builds no kernel.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_new_pass_length_builds_no_pipeline() {
+        const NAME: &str =
+            "models::qwen4_exp::math::pass_length_tests::a_new_pass_length_builds_no_pipeline";
+        if !crate::engine::persistence::compiled_forward_backend_available()
+            || !crate::test_support::in_own_process(NAME)
+        {
+            return;
+        }
+        assert!(
+            crate::engine::pipeline_counter::install(),
+            "the counter installs in tests"
+        );
+        let gdn = Gdn::new(false, false, DType::Float32);
+        let weight = input(&[10240, 4], 0.7, DType::Float32);
+        let history = input(&[3, 10240], 2.4, DType::BFloat16);
+        let passes: Vec<_> = [7i64, 30, 448]
+            .iter()
+            .map(|&t| gdn.inputs(t, 0.1))
+            .collect();
+        for pass in &passes {
+            MxArray::eval_arrays(&pass.iter().collect::<Vec<_>>()).unwrap();
+        }
+        MxArray::eval_arrays(&[&gdn.conv, &gdn.scale, &gdn.dt, &weight, &history]).unwrap();
+        let run = |pass: &[MxArray; 3]| {
+            let mut outputs = gdn.run(pass, &history);
+            outputs.extend(conv_run(&pass[0], &history, &weight));
+            MxArray::eval_arrays(&outputs.iter().collect::<Vec<_>>()).unwrap();
+        };
+        run(&passes[0]);
+        let first = crate::engine::pipeline_counter::read().expect("installed");
+        let _ = mlx_metal::pipeline_counter::drain_serving();
+        let mut created = Vec::new();
+        for pass in &passes[1..] {
+            run(pass);
+            created.extend(
+                mlx_metal::pipeline_counter::drain_serving()
+                    .into_iter()
+                    .map(|c| c.name),
+            );
+        }
+        let after = crate::engine::pipeline_counter::read().expect("installed");
+        let per_kernel = |kernel: &str| created.iter().filter(|n| n.contains(kernel)).count();
+        assert_eq!(
+            (
+                per_kernel("qwen4_gdn_prepare"),
+                per_kernel("qwen4_window_conv"),
+                after.created_serving - first.created_serving,
+            ),
+            (0, 0, 0),
+            "pipelines built for new pass lengths: {created:?}"
+        );
+    }
+}

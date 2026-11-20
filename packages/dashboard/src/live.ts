@@ -53,6 +53,8 @@ export interface RuntimeLiveModel {
     freeBlocks: number;
     reclaimableBlocks: number;
   } | null;
+  /** Routed experts per layer held in memory; null when the model reports none or the engine is older. */
+  experts: { inMemory: number; total: number; streaming: boolean } | null;
 }
 
 export interface RuntimeLiveTurn {
@@ -76,6 +78,8 @@ export interface RuntimeLiveTurn {
   prefillTotal: number | null;
   prefillDone: number | null;
   generatedTokens: number | null;
+  /** The session the client named on the request (`x-grok-session-id`); null when it named none or the engine is older. */
+  clientSession: string | null;
 }
 
 /** One model load in flight; the step counts are null when native reports no progress for it. */
@@ -159,6 +163,7 @@ export const INGEST_COALESCE_MS = 2000;
 const LIVE_TURNS_MAX = 32;
 const LIVE_MODELS_MAX = 64;
 const LIVE_LOADS_MAX = 16;
+const CLIENT_SESSION_MAX = 128;
 
 // ---------------------------------------------------------------- parsing
 
@@ -221,6 +226,16 @@ function parsePool(value: unknown): RuntimeLiveModel['pool'] | undefined {
   return { at, blockCapacity, allocatedBlocks, freeBlocks, reclaimableBlocks };
 }
 
+function parseExperts(value: unknown): RuntimeLiveModel['experts'] {
+  if (!isObj(value) || typeof value.streaming !== 'boolean') return null;
+  const inMemory = value.inMemory;
+  const total = value.total;
+  if (typeof inMemory !== 'number' || typeof total !== 'number') return null;
+  if (!Number.isInteger(inMemory) || !Number.isInteger(total) || inMemory < 0 || total <= 0 || inMemory > total)
+    return null;
+  return { inMemory, total, streaming: value.streaming };
+}
+
 function parseColdCapture(value: unknown): RuntimeLiveFile['coldCapture'] {
   if (!isObj(value)) return null;
   const blocks = fin(value.blocks);
@@ -276,6 +291,7 @@ function parseModel(value: unknown): RuntimeLiveModel | null {
     queued,
     queueLimit,
     pool,
+    experts: parseExperts(value.experts),
   };
 }
 
@@ -318,6 +334,12 @@ function parseTurn(value: unknown): RuntimeLiveTurn | null {
     prefillTotal,
     prefillDone,
     generatedTokens,
+    clientSession:
+      typeof value.clientSession === 'string' &&
+      value.clientSession.length > 0 &&
+      value.clientSession.length <= CLIENT_SESSION_MAX
+        ? value.clientSession
+        : null,
   };
 }
 

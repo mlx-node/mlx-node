@@ -305,6 +305,7 @@ impl QwenStepExecutor<'_> {
             finished: false,
             allocation_blocked: true,
             prefill_micros: 0,
+            prefill_in_flight: false,
         }
     }
 
@@ -343,6 +344,7 @@ impl QwenStepExecutor<'_> {
             finished: true,
             allocation_blocked: false,
             prefill_micros: 0,
+            prefill_in_flight: false,
         }
     }
 
@@ -467,6 +469,7 @@ impl QwenStepExecutor<'_> {
             finished,
             allocation_blocked: false,
             prefill_micros: 0,
+            prefill_in_flight: false,
         }
     }
 
@@ -758,6 +761,7 @@ impl QwenStepExecutor<'_> {
                                     finished: false,
                                     allocation_blocked: false,
                                     prefill_micros: 0,
+                                    prefill_in_flight: false,
                                 }
                             } else if *suppress_sample {
                                 turn.payload.preemption_replay = None;
@@ -769,6 +773,7 @@ impl QwenStepExecutor<'_> {
                                     finished: false,
                                     allocation_blocked: false,
                                     prefill_micros: 0,
+                                    prefill_in_flight: false,
                                 }
                             } else {
                                 turn.payload.preemption_replay = None;
@@ -817,6 +822,7 @@ impl QwenStepExecutor<'_> {
                                         finished: true,
                                         allocation_blocked: false,
                                         prefill_micros: 0,
+                                        prefill_in_flight: false,
                                     }
                                 } else {
                                     match sampled.item_at_int32(0) {
@@ -828,6 +834,7 @@ impl QwenStepExecutor<'_> {
                                             finished: false,
                                             allocation_blocked: false,
                                             prefill_micros: 0,
+                                            prefill_in_flight: false,
                                         },
                                         Err(error) => Self::fail(turn, planned, error),
                                     }
@@ -1017,6 +1024,7 @@ impl HybridSchedulerBackend for Qwen3Inner {
         &mut self,
         seq_id: SeqId,
         restore: &mut Self::RestoreTicket,
+        uploads: &mut crate::transformer::paged_kv_cache_adapter::RestoreUploadBudget,
         _prompt_tokens: &[u32],
         _owner_history: &[u32],
         _is_preemption_replay: bool,
@@ -1025,7 +1033,7 @@ impl HybridSchedulerBackend for Qwen3Inner {
             .paged_adapter
             .as_mut()
             .ok_or_else(|| Error::from_reason("Qwen3 paged adapter is unavailable"))?
-            .poll_restore(restore)
+            .poll_restore(restore, uploads)
             .map_err(Error::from_reason)?;
         Ok(match outcome {
             PagedRestorePoll::Pending => None,
@@ -5380,6 +5388,7 @@ mod tests {
             ),
             claim: None,
             cell: None,
+            draft_lane: None,
             clock: Default::default(),
         };
         // Splitting the prefill also verifies that non-final slices leave the

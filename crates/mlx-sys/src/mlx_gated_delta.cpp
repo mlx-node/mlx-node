@@ -590,9 +590,10 @@ bool mlx_qwen4_gated_delta_kernel(mlx_array* q, mlx_array* k, mlx_array* v, mlx_
 // ---------------------------------------------------------------------------
 // Chunked fused GDN prefill (prompt-length windows, T > 32)
 //
-// One dispatch per GDN layer for a whole prompt: fused_gdn_gating + the q/k
-// rms_norm + the 4-vcol recurrence in 32-token chunks (f32 register state
-// carries across chunks) + the gated RMSNorm and z gate of gdn_fused_step.
+// One primitive per GDN layer for a whole prompt: fused_gdn_gating + the q/k
+// rms_norm (prologue), the 4-vcol recurrence with 16 state rows of a value
+// head per threadgroup (scan), the gated RMSNorm and z gate of
+// gdn_fused_step (tail).
 // Bit-identical to the unfused prefill chain (fast::metal_kernel recurrence
 // -> fast::rms_norm -> compiled swiglu). A plain fast::Custom primitive —
 // like GdnFused — so the pre-norm conv-output split views and the z/a/b
@@ -611,11 +612,14 @@ namespace {
 
 using namespace mlx::core;
 
-static const char* kGdnPrefillBody =
+static const char* kGdnPrefillHeadBody =
 #include "metal/common/gdn_fused_prefill.metal.inc"
     ;
+static const char* kGdnPrefillRowBody =
+#include "metal/common/gdn_prefill_row_scan.metal.inc"
+    ;
 
-// Mirrors `GdnPrefillParams` in the kernel source.
+// Mirrors `GdnPrefillParams` in both kernel sources.
 struct GdnPrefillParams {
   int T;
   int hk;
@@ -632,40 +636,88 @@ struct GdnPrefillParams {
   float qk_eps;
 };
 
-MTL::ComputePipelineState* gdn_prefill_pipeline(metal::Device& device, int dk,
-                                                int dv) {
-  const std::string lib_name = "mlx_node_gdn_fused_prefill_dk" +
-      std::to_string(dk) + "_dv" + std::to_string(dv);
-  auto* library = device.get_library(lib_name, [dk, dv] {
-    return std::string(metal::utils()) + "\n#define GDN_PREFILL_N_PER_T " +
-        std::to_string(dk / 32) + "\n#define GDN_PREFILL_DV " +
-        std::to_string(dv) + "\n" + kGdnPrefillBody;
-  });
-  auto* pipeline = device.get_kernel("mlx_node_gdn_fused_prefill", library);
-  if (pipeline->threadExecutionWidth() != 32 ||
-      pipeline->maxTotalThreadsPerThreadgroup() < NS::UInteger(8 * dv)) {
+// Product: state rows of a value head split over threadgroups. Head: one
+// value head per 1024-thread threadgroup, the bit reference for tests.
+enum class GdnPrefillGeometry { Rows, Head };
+
+constexpr size_t kGdnRowThreads = 128;
+constexpr size_t kGdnRowsPerGroup = 16;
+constexpr size_t kGdnRowSideThreads = 256;
+
+struct GdnPrefillPipelines {
+  MTL::ComputePipelineState* head = nullptr;
+  MTL::ComputePipelineState* prologue = nullptr;
+  MTL::ComputePipelineState* scan = nullptr;
+  MTL::ComputePipelineState* tail = nullptr;
+};
+
+MTL::ComputePipelineState* checked_pipeline(MTL::ComputePipelineState* p,
+                                            size_t threads) {
+  if (p->threadExecutionWidth() != 32 ||
+      p->maxTotalThreadsPerThreadgroup() < NS::UInteger(threads)) {
     throw std::runtime_error(
-        "gdn fused prefill cannot hold one value head per threadgroup");
+        "gdn fused prefill cannot launch its threadgroup on this GPU");
   }
-  return pipeline;
+  return p;
+}
+
+GdnPrefillPipelines gdn_prefill_pipelines(metal::Device& device,
+                                          GdnPrefillGeometry geometry, int dk,
+                                          int dv, bool bf16_scalars) {
+  GdnPrefillPipelines out;
+  if (geometry == GdnPrefillGeometry::Head) {
+    const std::string lib_name = "mlx_node_gdn_fused_prefill_dk" +
+        std::to_string(dk) + "_dv" + std::to_string(dv);
+    auto* library = device.get_library(lib_name, [dk, dv] {
+      return std::string(metal::utils()) + "\n#define GDN_PREFILL_N_PER_T " +
+          std::to_string(dk / 32) + "\n#define GDN_PREFILL_DV " +
+          std::to_string(dv) + "\n" + kGdnPrefillHeadBody;
+    });
+    out.head = checked_pipeline(
+        device.get_kernel("mlx_node_gdn_fused_prefill", library),
+        size_t(8) * size_t(dv));
+    return out;
+  }
+  auto* library = device.get_library("mlx_node_gdn_prefill_rows", [] {
+    return std::string(metal::utils()) + "\n" + kGdnPrefillRowBody;
+  });
+  out.prologue = checked_pipeline(
+      device.get_kernel(bf16_scalars
+                            ? "mlx_node_gdn_prefill_prologue_bf16_scalars"
+                            : "mlx_node_gdn_prefill_prologue",
+                        library),
+      kGdnRowSideThreads);
+  out.scan = checked_pipeline(
+      device.get_kernel("mlx_node_gdn_prefill_scan", library), kGdnRowThreads);
+  out.tail = checked_pipeline(
+      device.get_kernel("mlx_node_gdn_prefill_tail", library),
+      kGdnRowSideThreads);
+  return out;
+}
+
+size_t ceil_groups(size_t threads, size_t per_group) {
+  return (threads + per_group - 1) / per_group;
 }
 
 // Input layout: q, k, v, a, b, a_log, dt_bias, state_in, wq, wk, z, w.
 // Outputs: out [1, T, Hv * Dv] bf16, state_out [1, Hv, Dv, Dk] f32.
 class GdnFusedPrefill final : public fast::Custom {
  public:
-  GdnFusedPrefill(Stream stream, int dk, int dv, float eps, float qk_eps,
-                  bool tiled, bool has_state)
+  GdnFusedPrefill(Stream stream, GdnPrefillGeometry geometry, int dk, int dv,
+                  float eps, float qk_eps, bool tiled, bool has_state,
+                  bool bf16_scalars)
       : Custom(stream,
                [](std::vector<array>) -> std::vector<array> {
                  throw std::runtime_error("GdnFusedPrefill has no fallback");
                }),
+        geometry_(geometry),
         dk_(dk),
         dv_(dv),
         eps_(eps),
         qk_eps_(qk_eps),
         tiled_(tiled),
-        has_state_(has_state) {}
+        has_state_(has_state),
+        bf16_scalars_(bf16_scalars) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("GdnFusedPrefill requires Metal");
@@ -673,11 +725,14 @@ class GdnFusedPrefill final : public fast::Custom {
 
   void eval_gpu(const std::vector<array>& inputs,
                 std::vector<array>& outputs) override {
-    bridge_testing::record("gdn_fused_prefill");
+    bridge_testing::record(geometry_ == GdnPrefillGeometry::Rows
+                               ? "gdn_prefill_row_scan"
+                               : "gdn_prefill_head_scan");
     auto& stream = this->stream();
     auto& device = metal::device(stream.device);
     auto& encoder = metal::get_command_encoder(stream);
-    auto* pipeline = gdn_prefill_pipeline(device, dk_, dv_);
+    const auto pipelines =
+        gdn_prefill_pipelines(device, geometry_, dk_, dv_, bf16_scalars_);
 
     GdnPrefillParams params{};
     params.tiled = tiled_ ? 1 : 0;
@@ -728,17 +783,80 @@ class GdnFusedPrefill final : public fast::Custom {
     params.b_stride_t = int(inputs[4].strides(1));
     params.z_stride_t = int(inputs[z_at].strides(1));
 
-    encoder.set_compute_pipeline_state(pipeline);
-    int slot = 0;
-    for (auto& b : bound) {
-      encoder.set_input_array(b, slot++);
+    if (geometry_ == GdnPrefillGeometry::Head) {
+      encoder.set_compute_pipeline_state(pipelines.head);
+      int slot = 0;
+      for (auto& b : bound) {
+        encoder.set_input_array(b, slot++);
+      }
+      for (auto& o : outputs) {
+        encoder.set_output_array(o, slot++);
+      }
+      encoder.set_bytes(params, slot);
+      encoder.dispatch_threadgroups(MTL::Size(size_t(params.hv), 1, 1),
+                                    MTL::Size(size_t(8) * size_t(dv_), 1, 1));
+      encoder.add_temporaries(std::move(copies));
+      return;
     }
-    for (auto& o : outputs) {
-      encoder.set_output_array(o, slot++);
-    }
-    encoder.set_bytes(params, slot);
-    encoder.dispatch_threadgroups(MTL::Size(size_t(params.hv), 1, 1),
-                                  MTL::Size(size_t(8) * size_t(dv_), 1, 1));
+
+    // bound: q k v a b a_log dt_bias state_in wq wk z w
+    const size_t T = size_t(params.T);
+    const size_t Hk = size_t(params.hk);
+    const size_t Hv = size_t(params.hv);
+    auto scratch = [](Shape shape, Dtype dtype) {
+      array a(std::move(shape), dtype, nullptr, {});
+      a.set_data(allocator::malloc(a.nbytes()));
+      return a;
+    };
+    array qn = scratch(Shape{params.T, params.hk, dk_}, bfloat16);
+    array kn = scratch(Shape{params.T, params.hk, dk_}, bfloat16);
+    array g = scratch(Shape{params.T, params.hv}, float32);
+    array beta = scratch(Shape{params.T, params.hv}, bfloat16);
+    copies.insert(copies.end(), {qn, kn, g, beta});
+
+    encoder.set_compute_pipeline_state(pipelines.prologue);
+    encoder.set_input_array(bound[0], 0);
+    encoder.set_input_array(bound[1], 1);
+    encoder.set_input_array(bound[3], 2);
+    encoder.set_input_array(bound[4], 3);
+    encoder.set_input_array(bound[5], 4);
+    encoder.set_input_array(bound[6], 5);
+    encoder.set_input_array(bound[8], 6);
+    encoder.set_input_array(bound[9], 7);
+    encoder.set_output_array(qn, 8);
+    encoder.set_output_array(kn, 9);
+    encoder.set_output_array(g, 10);
+    encoder.set_output_array(beta, 11);
+    encoder.set_bytes(params, 12);
+    encoder.dispatch_threadgroups(
+        MTL::Size(ceil_groups(std::max(T * Hk * 32, T * Hv),
+                              kGdnRowSideThreads),
+                  1, 1),
+        MTL::Size(kGdnRowSideThreads, 1, 1));
+
+    encoder.set_compute_pipeline_state(pipelines.scan);
+    encoder.set_input_array(qn, 0);
+    encoder.set_input_array(kn, 1);
+    encoder.set_input_array(bound[2], 2);
+    encoder.set_input_array(g, 3);
+    encoder.set_input_array(beta, 4);
+    encoder.set_input_array(bound[7], 5);
+    encoder.set_output_array(out, 6);
+    encoder.set_output_array(outputs[1], 7);
+    encoder.set_bytes(params, 8);
+    // Grid after Splash's prefill GDN scan (splash runtime/ops/GDN.cpp:177-181).
+    encoder.dispatch_threadgroups(
+        MTL::Size(Hv * (size_t(dv_) / kGdnRowsPerGroup), 1, 1),
+        MTL::Size(kGdnRowThreads, 1, 1));
+
+    encoder.set_compute_pipeline_state(pipelines.tail);
+    encoder.set_output_array(out, 0);
+    encoder.set_input_array(bound[10], 1);
+    encoder.set_input_array(bound[11], 2);
+    encoder.set_bytes(params, 3);
+    encoder.dispatch_threadgroups(
+        MTL::Size(ceil_groups(T * Hv * 32, kGdnRowSideThreads), 1, 1),
+        MTL::Size(kGdnRowSideThreads, 1, 1));
     encoder.add_temporaries(std::move(copies));
   }
 
@@ -757,20 +875,22 @@ class GdnFusedPrefill final : public fast::Custom {
 
   bool is_equivalent(const Primitive& other) const override {
     const auto& o = static_cast<const GdnFusedPrefill&>(other);
-    return dk_ == o.dk_ && dv_ == o.dv_ && eps_ == o.eps_ &&
-        qk_eps_ == o.qk_eps_ && tiled_ == o.tiled_ &&
-        has_state_ == o.has_state_;
+    return geometry_ == o.geometry_ && dk_ == o.dk_ && dv_ == o.dv_ &&
+        eps_ == o.eps_ && qk_eps_ == o.qk_eps_ && tiled_ == o.tiled_ &&
+        has_state_ == o.has_state_ && bf16_scalars_ == o.bf16_scalars_;
   }
 
   DEFINE_NAME(GdnFusedPrefill);
 
  private:
+  GdnPrefillGeometry geometry_;
   int dk_;
   int dv_;
   float eps_;
   float qk_eps_;
   bool tiled_;
   bool has_state_;
+  bool bf16_scalars_;
 };
 
 void expect_prefill(bool ok, const char* what) {
@@ -788,9 +908,9 @@ void expect_prefill(bool ok, const char* what) {
 //   q, k   [1, T, Hk, Dk] bf16 PRE-NORM conv outputs, rows may be strided
 //   v      [1, T, Hv, Dv] bf16, rows may be strided
 //   a, b   [1, T, Hv] bf16 gate views, rows may be strided
-//   a_log, dt_bias [Hv] — bound as `float*` exactly like the fused_gdn_gating
-//     kernel's contract (production passes f32; whatever storage arrives is
-//     read the same way that kernel reads it)
+//   a_log, dt_bias [Hv], both f32 or both bf16 (a GGUF load keeps them
+//     bf16); the prologue reads each value in its storage dtype and widens it
+//     to float, as fused_gdn_gating does
 //   state  [1, Hv, Dv, Dk] f32, or null → in-kernel zero init
 //   wq, wk [Dk] bf16 folded q/k rms_norm weights (qk_norm_w_q/_k)
 //   z      [1, T, Hv * Dv] bf16, rows may be strided
@@ -803,11 +923,12 @@ void expect_prefill(bool ok, const char* what) {
 // bit-identical to the unfused chain (q/k rms_norm_scaled -> fused gating ->
 // q/k repeat or tile -> per-step kernel -> gated rms_norm -> swiglu). Returns
 // false when off-contract or without Metal; the caller runs the chain.
-extern "C" bool mlx_gdn_fused_prefill(
-    mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* a, mlx_array* b,
-    mlx_array* a_log, mlx_array* dt_bias, mlx_array* state, mlx_array* wq,
-    mlx_array* wk, mlx_array* z, mlx_array* w, float eps, float qk_eps,
-    int tiled, mlx_array** out, mlx_array** out_state) {
+static bool gdn_fused_prefill_entry(
+    bool head_reference, mlx_array* q, mlx_array* k, mlx_array* v,
+    mlx_array* a, mlx_array* b, mlx_array* a_log, mlx_array* dt_bias,
+    mlx_array* state, mlx_array* wq, mlx_array* wk, mlx_array* z,
+    mlx_array* w, float eps, float qk_eps, int tiled, mlx_array** out,
+    mlx_array** out_state) {
   if (out) *out = nullptr;
   if (out_state) *out_state = nullptr;
 #ifdef MLX_NODE_METAL_ENABLED
@@ -863,6 +984,12 @@ extern "C" bool mlx_gdn_fused_prefill(
                    "gate scalar shapes");
     expect_prefill(ala.strides(0) == 1 && dta.strides(0) == 1,
                    "gate scalar strides");
+    const bool bf16_scalars = ala.dtype() == bfloat16;
+    expect_prefill(ala.dtype() == dta.dtype() &&
+                       (bf16_scalars || ala.dtype() == float32),
+                   "a_log and dt_bias must both be f32 or both bf16");
+    expect_prefill(!(head_reference && bf16_scalars),
+                   "the head kernel reads f32 a_log / dt_bias");
     std::optional<array> state_opt;
     Shape state_shape{1, Hv, Dv, Dk};
     if (state) {
@@ -877,11 +1004,15 @@ extern "C" bool mlx_gdn_fused_prefill(
     }
     inputs.insert(inputs.end(), {wqa, wka, za, wa});
     auto stream = default_stream(Device::gpu);
-    gdn_prefill_pipeline(metal::device(stream.device), Dk, Dv);
+    const auto geometry = head_reference ? GdnPrefillGeometry::Head
+                                         : GdnPrefillGeometry::Rows;
+    gdn_prefill_pipelines(metal::device(stream.device), geometry, Dk, Dv,
+                          bf16_scalars);
     // `has_state` keys the primitive AND the input count; when absent the
     // eval binds a scratch row (never read) in place of inputs[7].
     auto primitive = std::make_shared<GdnFusedPrefill>(
-        stream, Dk, Dv, eps, qk_eps, tiled != 0, state_opt.has_value());
+        stream, geometry, Dk, Dv, eps, qk_eps, tiled != 0,
+        state_opt.has_value(), bf16_scalars);
     auto outputs = array::make_arrays(
         {Shape{1, T, Hv * Dv}, state_shape}, {bfloat16, float32}, primitive,
         std::move(inputs));
@@ -894,9 +1025,31 @@ extern "C" bool mlx_gdn_fused_prefill(
     return false;
   }
 #else
-  (void)q; (void)k; (void)v; (void)a; (void)b; (void)a_log; (void)dt_bias;
-  (void)state; (void)wq; (void)wk; (void)z; (void)w; (void)eps; (void)qk_eps;
-  (void)tiled;
+  (void)head_reference; (void)q; (void)k; (void)v; (void)a; (void)b;
+  (void)a_log; (void)dt_bias; (void)state; (void)wq; (void)wk; (void)z;
+  (void)w; (void)eps; (void)qk_eps; (void)tiled;
   return false;
 #endif
+}
+
+extern "C" bool mlx_gdn_fused_prefill(
+    mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* a, mlx_array* b,
+    mlx_array* a_log, mlx_array* dt_bias, mlx_array* state, mlx_array* wq,
+    mlx_array* wk, mlx_array* z, mlx_array* w, float eps, float qk_eps,
+    int tiled, mlx_array** out, mlx_array** out_state) {
+  return gdn_fused_prefill_entry(false, q, k, v, a, b, a_log, dt_bias, state,
+                                 wq, wk, z, w, eps, qk_eps, tiled, out,
+                                 out_state);
+}
+
+// The same entry on the one-value-head-per-threadgroup kernel: the bit
+// reference of the tests (mlx-core declares it only under cfg(test)).
+extern "C" bool mlx_gdn_fused_prefill_head_reference(
+    mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* a, mlx_array* b,
+    mlx_array* a_log, mlx_array* dt_bias, mlx_array* state, mlx_array* wq,
+    mlx_array* wk, mlx_array* z, mlx_array* w, float eps, float qk_eps,
+    int tiled, mlx_array** out, mlx_array** out_state) {
+  return gdn_fused_prefill_entry(true, q, k, v, a, b, a_log, dt_bias, state,
+                                 wq, wk, z, w, eps, qk_eps, tiled, out,
+                                 out_state);
 }

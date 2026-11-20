@@ -142,7 +142,7 @@ pub(crate) fn shaped_rows(
 
 /// Splash `splash_store_kv_row`: `clamp(rint(v * 127 / max), ±127)`,
 /// scale `max / 127`, a zero row gives 0 / 0.
-fn quantize(row: &[f32]) -> (Vec<i8>, f32) {
+pub(crate) fn quantize(row: &[f32]) -> (Vec<i8>, f32) {
     let max = row.iter().fold(0.0f32, |max, value| max.max(value.abs()));
     if max == 0.0 {
         return (vec![0; row.len()], 0.0);

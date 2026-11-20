@@ -473,6 +473,142 @@ impl Qwen35Inner {
         )
     }
 
+    /// Whether `seq`'s scheduled text prefill takes the draft-lane path of
+    /// [`Self::dense_paged_prefill`], the one that can stop between layers.
+    pub(crate) fn prefill_takes_passes(&self, seq: u32) -> bool {
+        self.dflash2.is_some()
+            && !self.scheduled_mtp.owners.contains_key(&seq)
+            && self.dflash2_states.turns.contains_key(&seq)
+            && self.cached_rope_deltas.unwrap_or(0) == 0
+    }
+
+    /// The draft-lane prefill unit `[start, end)` of the active sequence's
+    /// `prefix`: one pass within `budget_ms`, or to its end without one. A
+    /// unit with no run and no budget is the one call of
+    /// [`Self::dense_paged_prefill_unit`]. A unit short of the prompt's end
+    /// gives no logits.
+    pub(crate) fn dense_paged_prefill_pass(
+        &mut self,
+        prefix: &Qwen35PrefixState,
+        start: usize,
+        end: usize,
+        budget_ms: Option<f64>,
+    ) -> Result<crate::engine::hybrid_scheduler::ScheduledPrefillPass> {
+        use crate::engine::hybrid_scheduler::ScheduledPrefillPass;
+        let seq = self
+            .active_scheduled_seq
+            .ok_or_else(|| Error::from_reason("a prefill pass without a scheduled sequence"))?;
+        if self
+            .prefill_runs
+            .get(&seq)
+            .is_some_and(|run| (run.start, run.end) != (start, end))
+        {
+            self.end_prefill_run(seq)?;
+        }
+        let mut run = match self.prefill_runs.remove(&seq) {
+            Some(run) => run,
+            None if budget_ms.is_none() => {
+                let end_output = crate::models::qwen3_5::paged_forward::unit_end_output(
+                    end,
+                    prefix.full_tokens.len(),
+                );
+                return self
+                    .dense_paged_prefill_unit(
+                        &prefix.full_tokens[start..end],
+                        prefix,
+                        None,
+                        end_output,
+                    )
+                    .map(|(logits, _)| ScheduledPrefillPass::Done(logits));
+            }
+            None => {
+                let chunk_size = crate::models::qwen3_5::paged_forward::prefill_chunk_rows(
+                    self.cold_gdn_prefill_chunk_size(),
+                );
+                let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
+                let rates = self.prefill_pass_rates;
+                crate::models::qwen3_5::dflash2_turn::begin_scheduled_draft_run(
+                    self,
+                    &prefix.full_tokens,
+                    start,
+                    end,
+                    chunk_size,
+                    prefix.gdn_prefix_already_primed,
+                    rope_deltas,
+                    rates,
+                    |inner| inner.dflash2.take(),
+                    |inner, model| inner.dflash2 = Some(model),
+                )?
+            }
+        };
+        let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
+            self.config.num_layers as usize,
+            |i| self.config.is_linear_layer(i),
+        );
+        let embed = self.embedding.clone();
+        let turn_cancel = self.turn_cancel.clone();
+        let progress = crate::models::qwen3_5::dflash2_turn::run_scheduled_draft_pass(
+            self,
+            &mut run,
+            &embed,
+            &layer_kinds,
+            turn_cancel.as_deref(),
+            budget_ms,
+            |inner| inner.dflash2.take(),
+            |inner, model| inner.dflash2 = Some(model),
+        );
+        if budget_ms.is_some() {
+            self.prefill_pass_rates = run.driver.rates();
+        }
+        match progress {
+            Ok(crate::models::qwen3_5::paged_forward::PrefillProgress::Paused) => {
+                self.prefill_runs.insert(seq, run);
+                Ok(ScheduledPrefillPass::Paused)
+            }
+            Ok(crate::models::qwen3_5::paged_forward::PrefillProgress::Done(
+                logits,
+                checkpoints,
+            )) => {
+                crate::models::qwen3_5::dflash2_turn::end_scheduled_draft_run(self, run, true)?;
+                self.publish_dense_gdn_materialized_prefix_checkpoint(
+                    &prefix.full_tokens,
+                    prefix.cache_salt,
+                    checkpoints,
+                );
+                Ok(ScheduledPrefillPass::Done(logits))
+            }
+            Err(error) => {
+                let _ =
+                    crate::models::qwen3_5::dflash2_turn::end_scheduled_draft_run(self, run, true);
+                Err(error)
+            }
+        }
+    }
+
+    /// [`Self::end_prefill_run`] on a path that cannot fail.
+    pub(crate) fn drop_prefill_run(&mut self, seq: u32) {
+        if let Err(error) = self.end_prefill_run(seq) {
+            tracing::warn!("Qwen3.5 sequence {seq}: held prefill unit not rolled back: {error}");
+            self.paged_gdn_state_dirty = true;
+        }
+    }
+
+    /// Drops `seq`'s held prefill unit: a launch in flight goes back to its
+    /// start, the lane window and ring back to the sequence. Nothing of the
+    /// launch is registered or published.
+    pub(crate) fn end_prefill_run(&mut self, seq: u32) -> Result<()> {
+        let Some(run) = self.prefill_runs.remove(&seq) else {
+            return Ok(());
+        };
+        let active = self.active_scheduled_seq;
+        let live = self.activate_paged_seq(seq).is_ok();
+        let ended = crate::models::qwen3_5::dflash2_turn::end_scheduled_draft_run(self, run, live);
+        if let Some(active) = active.filter(|&active| active != seq) {
+            self.activate_paged_seq(active)?;
+        }
+        ended
+    }
+
     /// The paged prefill; with `draft`, the draft context advanced over the
     /// prompt from the same forward's taps. Without one, on a load without
     /// a draft, the turn's state points publish as the chunks reach them.
@@ -483,6 +619,29 @@ impl Qwen35Inner {
         draft: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
     ) -> Result<(
         MxArray,
+        Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
+    )> {
+        let (logits, draft) = self.dense_paged_prefill_unit(
+            suffix_tokens,
+            prefix,
+            draft,
+            crate::models::qwen3_5::paged_forward::ChunkOutput::Read,
+        )?;
+        let logits =
+            logits.ok_or_else(|| Error::from_reason("a read paged prefill gave no logits"))?;
+        Ok((logits, draft))
+    }
+
+    /// [`Self::dense_paged_prefill`] whose draft lane unit gives no logits
+    /// when `end_output` is unread and it stops short of the prompt's end.
+    pub(crate) fn dense_paged_prefill_unit(
+        &mut self,
+        suffix_tokens: &[u32],
+        prefix: &Qwen35PrefixState,
+        draft: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
+        end_output: crate::models::qwen3_5::paged_forward::ChunkOutput,
+    ) -> Result<(
+        Option<MxArray>,
         Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
     )> {
         // Scheduled MTP also retains the final normalized prompt row as the
@@ -580,7 +739,7 @@ impl Qwen35Inner {
                 prefix.cache_salt,
                 checkpoint,
             );
-            return Ok((logits, Some(context)));
+            return Ok((Some(logits), Some(context)));
         }
         let draft_lane = self.dflash2.is_some()
             && mtp_seq.is_none()
@@ -599,7 +758,7 @@ impl Qwen35Inner {
                     |inner| inner.dflash2.take(),
                     |inner, model| inner.dflash2 = Some(model),
                     |target, sink| {
-                        crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
+                        crate::models::qwen3_5::paged_forward::run_paged_prefill_unit(
                             &prefix.full_tokens,
                             suffix_tokens,
                             cached as u32,
@@ -611,6 +770,7 @@ impl Qwen35Inner {
                             rope_deltas,
                             turn_cancel.as_deref(),
                             Some(sink),
+                            end_output,
                         )
                     },
                 )?;
@@ -708,7 +868,7 @@ impl Qwen35Inner {
             prefix.cache_salt,
             checkpoint,
         );
-        Ok((logits, None))
+        Ok((Some(logits), None))
     }
 }
 

@@ -69,6 +69,34 @@ describe('standalone GGUF model detection', () => {
     expect(loader).toHaveBeenCalledWith(modelPath, { auxiliaryModelPath: '/matching/hf' });
   });
 
+  // Mutation: drop `draftModelPath` from `qwen4ExpLoadOptions` → red.
+  // Mutation: drop `acceptsDraftModel` from the qwen4_exp row → red (rejected).
+  it('passes a Flash Next draft to the native loader; a GGUF with no draft beside it passes none', async () => {
+    const { modelPath } = await writeStandaloneGguf('qwen4exp');
+    const loader = vi.spyOn(Qwen4ExpModel, 'load').mockResolvedValue({} as Qwen4ExpModel);
+    await loadModel(modelPath, { draftModelPath: '/flash-next-draft' });
+    expect(loader).toHaveBeenLastCalledWith(modelPath, { draftModelPath: '/flash-next-draft' });
+    await loadModel(modelPath);
+    expect(loader).toHaveBeenLastCalledWith(modelPath, null);
+  });
+
+  // Mutation: discover a Flash Next draft in `findDFlash2Draft` → red.
+  it('attaches no Flash Next draft found beside the GGUF; the option attaches it', async () => {
+    const { root, modelPath } = await writeStandaloneGguf('qwen4exp');
+    const draft = join(root, 'draft');
+    await mkdir(draft);
+    await writeFile(
+      join(draft, 'config.json'),
+      JSON.stringify({ architectures: ['DFlash2DraftModel'], hidden_size: 2560, num_target_layers: 48 }),
+    );
+    await writeFile(join(draft, 'model.safetensors'), 'weights');
+    const loader = vi.spyOn(Qwen4ExpModel, 'load').mockResolvedValue({} as Qwen4ExpModel);
+    await loadModel(modelPath);
+    expect(loader, 'no option: no draft').toHaveBeenLastCalledWith(modelPath, null);
+    await loadModel(modelPath, { draftModelPath: draft });
+    expect(loader, 'the option attaches it').toHaveBeenLastCalledWith(modelPath, { draftModelPath: draft });
+  });
+
   it('rejects Qwen4 auxiliary options for other model families', async () => {
     const { modelPath } = await writeStandaloneGguf('qwen35');
     await expect(loadModel(modelPath, { auxiliaryModelPath: '/matching/hf' })).rejects.toThrow(
@@ -84,6 +112,18 @@ describe('standalone GGUF model detection', () => {
     expect(loadSpy).toHaveBeenLastCalledWith(modelPath, { draftModelPath: undefined, kvFormat: 'int8' });
     await loadModel(modelPath, { kvFormat: 'bf16', draftModelPath: '/draft' });
     expect(loadSpy).toHaveBeenLastCalledWith(modelPath, { draftModelPath: '/draft', kvFormat: 'bf16' });
+  });
+
+  // Mutation: drop `activations` from `qwen35LoadOptions` → red.
+  it('passes activations to the dense Qwen3.5 loader; rejects it for gemma4', async () => {
+    const { modelPath } = await writeStandaloneGguf('qwen35');
+    const loadSpy = vi.spyOn(Qwen35Model, 'load').mockResolvedValue({} as Qwen35Model);
+    await loadModel(modelPath, { activations: 'auto', autoLoadDraft: false });
+    expect(loadSpy).toHaveBeenLastCalledWith(modelPath, expect.objectContaining({ activations: 'auto' }));
+    const gemma = await writeStandaloneGguf('gemma4');
+    await expect(loadModel(gemma.modelPath, { activations: 'auto' })).rejects.toThrow(
+      'only supported by qwen3_5 and qwen3_5_moe',
+    );
   });
 
   // Mutation: drop `kvFormat` from `qwen4ExpLoadOptions` → red.

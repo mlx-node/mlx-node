@@ -25,7 +25,7 @@ pub mod napi;
 pub mod runner;
 pub mod scoring;
 
-pub use scoring::EvalReport;
+pub use scoring::{EvalDepthBucket, EvalReport};
 
 /// One `mlx eval` job, as it crosses onto the model thread.
 pub enum EvalRequest {
@@ -49,6 +49,9 @@ pub enum EvalRequest {
         logit_chunk: u32,
         /// Identity of the candidate, checked against the cache's.
         identity: cache::EvalIdentity,
+        /// Strictly increasing position edges of the report's depth buckets;
+        /// empty = one bucket over every position.
+        depth_edges: Vec<u32>,
     },
 }
 

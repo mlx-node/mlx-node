@@ -104,6 +104,13 @@ const launchVisibility = createLaunchVisibility();
 let quitting = false;
 
 /**
+ * The auto-start preflight's models-dir scan, while it has not settled. A scan of
+ * a removable volume blocks inside `open()` while macOS holds a privacy prompt
+ * for the app, and the quit then waits on it forever.
+ */
+let preflightScanPending = false;
+
+/**
  * MUST run before `app.whenReady()`. Chromium reads the privileged-scheme table
  * once during startup and a later registration is accepted silently and ignored,
  * so getting this order wrong produces an `app://` that resolves but has no
@@ -183,6 +190,10 @@ function wire(): void {
       shouldRelaunch: () => launchVisibility.takeRelaunchRequest(),
       relaunch: () => app.relaunch(),
       quit: () => app.quit(),
+      exitBlocked: () => preflightScanPending,
+      // Children and settings are drained by now; SIGKILL is the one exit that
+      // does not wait for the stuck request.
+      forceExit: () => process.kill(process.pid, 'SIGKILL'),
       report: (error) => console.error('[mlx] shutdown:', error),
     }),
   );
@@ -526,6 +537,11 @@ async function bootstrap(): Promise<void> {
             },
           });
         })();
+        preflightScanPending = true;
+        const settle = (): void => {
+          preflightScanPending = false;
+        };
+        void scan.then(settle, settle);
         const models = await Promise.race([
           scan,
           new Promise<typeof TIMED_OUT>((resolve) =>

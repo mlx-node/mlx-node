@@ -1,0 +1,12 @@
+# The splash_gguf .air jobs of crates/mlx-sys/build.rs, one per line: <library> <air> <source> <flags...>.
+# <library>: paged_attn (the shipped metallib) or gguf_planes_test (test-only kernels, never shipped).
+# <source> is relative to this directory. @splash expands to -I <this directory>, @mlx to -I <the MLX source>;
+# build.rs puts `-x metal` before the flags and the deployment floor after them.
+# The flags are part of the planes route: utils/gguf_planes.rs pins a hash of this directory.
+# Decode kernels: Splash's own flags (Metal's default fast math). Residual and gate epilogues apply MLX's
+# functors and are built -fno-fast-math, as MLX's kernels are.
+paged_attn splash_gguf_linear.air metal/kernels/shared/gguf_linear.metal -std=metal4.0 -O3 @splash
+paged_attn splash_gguf_linear_epilogues.air metal/kernels/shared/gguf_linear.metal -std=metal4.0 -O3 @splash -fno-fast-math -DGGUF_PLANES_STORE_EPILOGUES=1 @mlx
+paged_attn splash_gguf_repack.air metal/kernels/shared/gguf_repack.metal -std=metal4.0 -O3 @splash
+gguf_planes_test splash_gguf_linear_test.air metal/kernels/shared/gguf_linear.metal -std=metal4.0 -O3 @splash -DGGUF_PLANES_TEST_KERNELS=1
+gguf_planes_test splash_gguf_linear_epilogues_test.air metal/kernels/shared/gguf_linear.metal -std=metal4.0 -O3 @splash -fno-fast-math -DGGUF_PLANES_STORE_EPILOGUES=1 @mlx -DGGUF_PLANES_TEST_KERNELS=1

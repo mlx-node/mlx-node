@@ -11,10 +11,12 @@ import type {
   ChatFailure,
   ChatHostEvent,
   ChatHostState,
+  CompactionState,
   ConversationEvent,
   ConversationInfo,
   ConversationNotice,
   Interaction,
+  RunView,
   TranscriptOp,
   TurnEnd,
   TurnOutcome,
@@ -37,6 +39,12 @@ export interface ConversationState {
   gone: 'deleted' | 'unknown' | null;
   /** Every permission mark of the conversation, oldest first: `sync` replaces them, `permission-mark` appends one. */
   permissionMarks: PermissionMark[];
+  /** The conversation's current context in tokens; null while unknown. */
+  contextUsed: number | null;
+  /** The agent compacts the conversation now; null when it does not. */
+  compaction: CompactionState | null;
+  /** Work: the live workflow runs the host holds; `sync` and `runs` replace the list. */
+  runs: RunView[];
 }
 
 function applyOp(entries: TranscriptEntry[], turns: TurnMetric[], op: TranscriptOp): void {
@@ -60,6 +68,8 @@ function applyOp(entries: TranscriptEntry[], turns: TurnMetric[], op: Transcript
       return;
     case 'metric':
       turns.push(op.metric);
+      return;
+    case 'context':
       return;
   }
 }
@@ -97,6 +107,9 @@ export function applyConversationEvent(
             : endOf(event.lastEnd),
       gone: null,
       permissionMarks: [...event.permissionMarks],
+      contextUsed: event.contextUsed ?? null,
+      compaction: event.compaction ?? null,
+      runs: [...event.runs],
     };
   }
   if (state === null || event.seq !== state.seq + 1) return 'resync';
@@ -105,7 +118,10 @@ export function applyConversationEvent(
     case 'ops': {
       const entries = [...state.entries];
       const turns = [...state.turns];
-      for (const op of event.ops) applyOp(entries, turns, op);
+      for (const op of event.ops) {
+        if (op.op === 'context') next.contextUsed = op.used;
+        else applyOp(entries, turns, op);
+      }
       next.entries = entries;
       next.turns = turns;
       return next;
@@ -131,6 +147,12 @@ export function applyConversationEvent(
       return next;
     case 'permission-mark':
       next.permissionMarks = [...state.permissionMarks, event.mark];
+      return next;
+    case 'compaction':
+      next.compaction = event.compaction;
+      return next;
+    case 'runs':
+      next.runs = [...event.runs];
       return next;
   }
 }

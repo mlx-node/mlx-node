@@ -285,6 +285,19 @@ const std::string& reshape_and_cache_int8_kernel_name(
   });
 }
 
+// The keys-token-major page (K `[num_blocks, num_kv_heads, block_size,
+// head_size]`, V dimension-major): `kv_int8_store_ktm.h`.
+const std::string& reshape_and_cache_int8_ktm_kernel_name(int head_size) {
+  static std::mutex mutex;
+  static std::map<int, std::string> cache;
+  return memoized_kernel_name(cache, mutex, head_size, [&] {
+    std::ostringstream os;
+    os << "reshape_and_cache_int8_kv_" << dtype_string(KvDtype::Bf16) << "_hd"
+       << head_size << "_ktm";
+    return os.str();
+  });
+}
+
 const std::string& paged_attention_v1_kernel_name(
     KvDtype io_dtype,
     KvDtype cache_dtype,
@@ -920,6 +933,87 @@ void record_grouped_route_for_test(GroupedPagedAttentionKind kind) {
   }
 }
 
+// Decode reads by page: 0 a call over a vLLM page; launches over the
+// keys-token-major page: 1 striped, 2 generic, 3 v1.
+std::atomic<uint64_t>& paged_decode_probe_counter(int kind) {
+  static std::atomic<uint64_t> counters[4] = {{0}, {0}, {0}, {0}};
+  return counters[kind];
+}
+
+void count_paged_decode(int kind) {
+  paged_decode_probe_counter(kind).fetch_add(1, std::memory_order_relaxed);
+}
+
+// paged_attention_ktm.h. The kernels walk 16-token halves of a 32-token page.
+constexpr int kKeysTokenMajorLogicalBlock = 16;
+
+enum class KeysTokenMajorKernel { Generic, Striped };
+
+struct KeysTokenMajorKernelFrom {
+  int history;
+  KeysTokenMajorKernel kernel;
+};
+
+// The kernel of one row past one partition: each entry up to the next one.
+constexpr KeysTokenMajorKernelFrom kKeysTokenMajorOneRow[] = {
+    {513, KeysTokenMajorKernel::Striped},
+};
+
+KeysTokenMajorKernel keys_token_major_one_row(int context) {
+  KeysTokenMajorKernel kernel = kKeysTokenMajorOneRow[0].kernel;
+  for (const auto& entry : kKeysTokenMajorOneRow) {
+    if (context >= entry.history) {
+      kernel = entry.kernel;
+    }
+  }
+  return kernel;
+}
+
+const std::string& keys_token_major_striped_kernel_name() {
+  static const std::string name = "paged_attention_grouped_int8_hs256_striped_ktm";
+  return name;
+}
+
+const std::string& keys_token_major_generic_kernel_name(bool partitioned) {
+  static const std::string v1 =
+      "paged_attention_bfloat16_t_cache_char_hs256_nt256_nsl32_ps0_ktm";
+  static const std::string v2 =
+      "paged_attention_bfloat16_t_cache_char_hs256_nt256_nsl32_ps512_ktm";
+  return partitioned ? v2 : v1;
+}
+
+bool keys_token_major_striped_supported(
+    mlx::core::metal::Device& device,
+    int num_q_heads,
+    int num_kv_heads) {
+  static const GroupedPipelineLimits limits = [&]() noexcept {
+    try {
+      auto* stage = load_pipeline(device, keys_token_major_striped_kernel_name());
+      auto* reduce = load_pipeline(
+          device,
+          paged_attention_grouped_reduce_kernel_name(
+              GroupedPagedAttentionKind::Qwen35D256, KvDtype::Int8));
+      if (stage != nullptr && reduce != nullptr) {
+        return GroupedPipelineLimits{
+            static_cast<size_t>(stage->maxTotalThreadsPerThreadgroup()),
+            static_cast<size_t>(reduce->maxTotalThreadsPerThreadgroup()),
+            true};
+      }
+    } catch (...) {
+    }
+    std::fprintf(
+        stderr,
+        "[mlx][warn] keys-token-major striped decode pipeline unavailable; "
+        "using its generic kernel\n");
+    return GroupedPipelineLimits{0, 0, false};
+  }();
+  return limits.available && num_kv_heads > 0 &&
+      num_q_heads % num_kv_heads == 0 &&
+      limits.stage_threads >=
+      static_cast<size_t>(32 * (num_q_heads / num_kv_heads)) &&
+      limits.reduce_threads >= 1024;
+}
+
 } // namespace
 
 extern "C" void mlx_paged_grouped_qwen35_test_probe_reset() {
@@ -936,6 +1030,20 @@ extern "C" void mlx_paged_grouped_d512_test_probe_reset() {
 
 extern "C" uint64_t mlx_paged_grouped_d512_test_probe_count() {
   return grouped_d512_test_probe_counter().load(std::memory_order_relaxed);
+}
+
+extern "C" void mlx_paged_decode_test_probe_reset() {
+  for (int kind = 0; kind < 4; ++kind) {
+    paged_decode_probe_counter(kind).store(0, std::memory_order_relaxed);
+  }
+}
+
+// The kinds of paged_decode_probe_counter.
+extern "C" uint64_t mlx_paged_decode_test_probe_count(int kind) {
+  if (kind < 0 || kind > 3) {
+    return 0;
+  }
+  return paged_decode_probe_counter(kind).load(std::memory_order_relaxed);
 }
 
 extern "C" uint32_t mlx_paged_grouped_d128_max_stripes(
@@ -1085,10 +1193,12 @@ void dispatch_reshape_and_cache(
   }
 
   if (kv_dtype == KvDtype::Int8) {
-    MTL::ComputePipelineState* pipeline =
-        load_pipeline(
-            device,
-            reshape_and_cache_int8_kernel_name(head_size, values_token_major));
+    const bool keys_token_major = !values_token_major && k_pool.ndim() == 4;
+    MTL::ComputePipelineState* pipeline = load_pipeline(
+        device,
+        keys_token_major
+            ? reshape_and_cache_int8_ktm_kernel_name(head_size)
+            : reshape_and_cache_int8_kernel_name(head_size, values_token_major));
     encoder.set_compute_pipeline_state(pipeline);
     const int32_t row_stride = num_kv_heads * head_size;
     encoder.set_input_array(new_k, 0);
@@ -1196,6 +1306,22 @@ void bind_pool_planes(
   bind_pool_plane(encoder, v_scale, 7, live_blocks);
 }
 
+// buffer(21) / buffer(22) of the int8 decode-family kernels: the rows' score
+// scales from `byte_offset`, or a flag that keeps `scale`.
+void bind_score_scales(
+    mlx::core::metal::CommandEncoder& encoder,
+    const mlx::core::array* score_scales,
+    int64_t byte_offset) {
+  if (score_scales != nullptr) {
+    encoder.set_input_array(*score_scales, 21, byte_offset);
+    encoder.set_bytes<int32_t>(1, 22);
+  } else {
+    const float unused = 0.0f;
+    encoder.set_bytes(unused, 21);
+    encoder.set_bytes<int32_t>(0, 22);
+  }
+}
+
 void dispatch_paged_attention_v1_inner(
     mlx::core::metal::CommandEncoder& encoder,
     mlx::core::metal::Device& device,
@@ -1220,7 +1346,8 @@ void dispatch_paged_attention_v1_inner(
     float softcapping,
     int sliding_window,
     KvDtype io_dtype,
-    KvDtype cache_dtype) {
+    KvDtype cache_dtype,
+    const mlx::core::array* score_scales) {
   const std::string& kernel_name = paged_attention_v1_kernel_name(
       io_dtype, cache_dtype, head_size, block_size, /*use_alibi=*/false);
   MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
@@ -1277,6 +1404,7 @@ void dispatch_paged_attention_v1_inner(
 
   // Sliding-window mask. 0 = full context (default).
   encoder.set_bytes<int32_t>(sliding_window, 18);
+  bind_score_scales(encoder, score_scales, 0);
 
   // Threadgroup memory math: same dual-purpose layout as Rust V1. The
   // buffer serves two kernel stages and is sized to the max:
@@ -1331,7 +1459,8 @@ void dispatch_paged_attention_v2_inner(
     KvDtype io_dtype,
     KvDtype cache_dtype,
     PagedAttentionRouteHint route_hint,
-    uint32_t planned_stripes) {
+    uint32_t planned_stripes,
+    const mlx::core::array* score_scales) {
   const GroupedPagedAttentionKind grouped_kind = select_grouped_paged_attention(
       io_dtype,
       cache_dtype,
@@ -1448,6 +1577,7 @@ void dispatch_paged_attention_v2_inner(
 
     // Sliding-window mask. 0 = full context (default).
     encoder.set_bytes<int32_t>(sliding_window, 18);
+    bind_score_scales(encoder, score_scales, 0);
 
     // Match MLX's long-context GQA vector geometry on the specialized path:
     // one SIMD group per query head, grouped under the KV head they share.
@@ -1532,6 +1662,238 @@ void dispatch_paged_attention_v2_inner(
   (void)stream;
 }
 
+mlx::core::array float_scratch(int64_t elements, const char* what) {
+  if (elements > std::numeric_limits<int>::max()) {
+    throw std::runtime_error(
+        std::string("[mlx_paged_dispatch] keys-token-major decode ") + what +
+        " exceeds INT_MAX");
+  }
+  mlx::core::array a(
+      mlx::core::Shape{static_cast<int>(std::max<int64_t>(elements, 1))},
+      mlx::core::float32,
+      nullptr,
+      {});
+  a.set_data(mlx::core::allocator::malloc(a.nbytes()));
+  return a;
+}
+
+// The keys-token-major page (K rank 4). A row reads with the launch it takes
+// alone, chosen by its own history only, so a lane in a wave reads the bits
+// it reads alone: up to one partition the rows share one v1 launch (v1 reads
+// each row on its own threadgroups); past it every row is its own launch.
+// No vLLM-page kernel reads this page.
+void dispatch_paged_attention_keys_token_major(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    mlx::core::array& out,
+    const mlx::core::array& q,
+    const mlx::core::array& k_pool,
+    const mlx::core::array& v_pool,
+    const mlx::core::array& block_table,
+    const mlx::core::array& seq_lens,
+    const mlx::core::array& k_scale,
+    const mlx::core::array& v_scale,
+    int num_seqs,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int block_size,
+    int max_context_len,
+    int max_blocks_per_seq,
+    int64_t live_blocks,
+    float scale,
+    float softcapping,
+    int sliding_window,
+    PagedAttentionRouteHint route_hint,
+    uint32_t planned_stripes,
+    const mlx::core::array* score_scales) {
+  const bool striped_allowed =
+      keys_token_major_striped_supported(device, num_q_heads, num_kv_heads) &&
+      route_hint == PagedAttentionRouteHint::Auto &&
+      grouped_qwen35_shape_matches(
+          grouped_qwen35_paged_attention_enabled(),
+          KvDtype::Bf16,
+          KvDtype::Int8,
+          /*num_seqs=*/1,
+          num_q_heads,
+          num_kv_heads,
+          head_size,
+          kKeysTokenMajorLogicalBlock,
+          /*query_rows=*/1,
+          std::numeric_limits<int>::max());
+  const auto row_kernel = [&](int context) {
+    const KeysTokenMajorKernel kernel = keys_token_major_one_row(context);
+    return kernel == KeysTokenMajorKernel::Striped && !striped_allowed
+        ? KeysTokenMajorKernel::Generic
+        : kernel;
+  };
+
+  const int32_t q_stride = num_q_heads * head_size;
+  const int32_t kv_block_stride = num_kv_heads * head_size * block_size;
+  const int32_t kv_head_stride = head_size * block_size;
+  const int gqa_factor = num_q_heads / num_kv_heads;
+  const float dummy_zero = 0.0f;
+  const size_t v_reduce_bytes =
+      static_cast<size_t>(kNumWarps / 2) * static_cast<size_t>(head_size) *
+      sizeof(float);
+  const size_t red_smem_bytes = 2 * static_cast<size_t>(kNumWarps) * sizeof(float);
+  const auto partitions = [](int context) {
+    return (static_cast<uint32_t>(context) + kPartitionSize - 1) / kPartitionSize;
+  };
+
+  // Row `first` of the call is row 0 of the kernel: every per-row binding
+  // starts at that row.
+  const auto bind_inputs = [&](int first, int64_t q_bytes) {
+    encoder.set_input_array(q, 3, first * q_bytes);
+    bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
+    encoder.set_bytes<int32_t>(num_kv_heads, 8);
+    encoder.set_bytes<float>(scale, 9);
+    encoder.set_bytes<float>(softcapping, 10);
+    encoder.set_input_array(
+        block_table, 11, int64_t{4} * first * max_blocks_per_seq);
+    encoder.set_input_array(seq_lens, 12, int64_t{4} * first);
+    encoder.set_bytes<int32_t>(max_blocks_per_seq, 13);
+    encoder.set_bytes(dummy_zero, 14);
+    encoder.set_bytes<int32_t>(q_stride, 15);
+    encoder.set_bytes<int32_t>(kv_block_stride, 16);
+    encoder.set_bytes<int32_t>(kv_head_stride, 17);
+    encoder.set_bytes<int32_t>(sliding_window, 18);
+    bind_score_scales(
+        encoder,
+        score_scales,
+        int64_t{4} * first * num_q_heads);
+  };
+  const int64_t q_row_bytes = static_cast<int64_t>(q_stride) * q.itemsize();
+  const int64_t out_row_bytes = static_cast<int64_t>(q_stride) * out.itemsize();
+
+  const auto encode_v1 = [&](int first, int rows, int context) {
+    encoder.set_compute_pipeline_state(load_pipeline(
+        device, keys_token_major_generic_kernel_name(false)));
+    encoder.set_bytes(dummy_zero, 0);
+    encoder.set_bytes(dummy_zero, 1);
+    encoder.set_output_array(out, 2, first * out_row_bytes);
+    bind_inputs(first, q_row_bytes);
+    encoder.set_threadgroup_memory_length(
+        std::max(static_cast<size_t>(context) * sizeof(float), v_reduce_bytes) +
+            red_smem_bytes,
+        0);
+    count_paged_decode(3);
+    encoder.dispatch_threadgroups(
+        MTL::Size::Make(
+            static_cast<size_t>(num_q_heads), static_cast<size_t>(rows), 1),
+        MTL::Size::Make(kNumThreads, 1, 1));
+  };
+
+  // One row's partials: exp sums, max logits, partial outputs.
+  struct RowPartials {
+    int row;
+    uint32_t parts;
+    bool striped;
+    mlx::core::array exp_sums;
+    mlx::core::array max_logits;
+    mlx::core::array tmp_out;
+  };
+
+  // The generic v2 or striped pass of row `p.row`, in `p.parts` partitions.
+  const auto encode_partials = [&](RowPartials& p) {
+    encoder.set_compute_pipeline_state(load_pipeline(
+        device,
+        p.striped ? keys_token_major_striped_kernel_name()
+                  : keys_token_major_generic_kernel_name(true)));
+    encoder.set_output_array(p.exp_sums, 0);
+    encoder.set_output_array(p.max_logits, 1);
+    encoder.set_output_array(p.tmp_out, 2);
+    bind_inputs(p.row, q_row_bytes);
+    if (p.striped) {
+      count_paged_decode(1);
+      encoder.dispatch_threadgroups(
+          MTL::Size::Make(
+              static_cast<size_t>(num_kv_heads), 1, static_cast<size_t>(p.parts)),
+          MTL::Size::Make(32, static_cast<size_t>(gqa_factor), 1));
+    } else {
+      encoder.set_threadgroup_memory_length(
+          std::max(static_cast<size_t>(kPartitionSize) * sizeof(float), v_reduce_bytes) +
+              red_smem_bytes,
+          0);
+      count_paged_decode(2);
+      encoder.dispatch_threadgroups(
+          MTL::Size::Make(
+              static_cast<size_t>(num_q_heads), 1, static_cast<size_t>(p.parts)),
+          MTL::Size::Make(kNumThreads, 1, 1));
+    }
+  };
+
+  const auto encode_reduce = [&](RowPartials& p) {
+    const bool striped = p.striped;
+    const int first = p.row;
+    const uint32_t parts = p.parts;
+    encoder.set_compute_pipeline_state(load_pipeline(
+        device,
+        striped ? paged_attention_grouped_reduce_kernel_name(
+                      GroupedPagedAttentionKind::Qwen35D256, KvDtype::Int8)
+                : paged_attention_v2_reduce_kernel_name(
+                      KvDtype::Bf16, KvDtype::Int8, head_size)));
+    encoder.set_output_array(out, 0, first * out_row_bytes);
+    encoder.set_input_array(p.exp_sums, 1);
+    encoder.set_input_array(p.max_logits, 2);
+    encoder.set_input_array(p.tmp_out, 3);
+    encoder.set_input_array(seq_lens, 4, int64_t{4} * first);
+    encoder.set_bytes<int32_t>(static_cast<int32_t>(parts), 5);
+    if (!striped) {
+      encoder.set_threadgroup_memory_length(
+          2 * static_cast<size_t>(parts) * sizeof(float), 0);
+    }
+    encoder.dispatch_threadgroups(
+        MTL::Size::Make(static_cast<size_t>(num_q_heads), 1, 1),
+        MTL::Size::Make(striped ? 1024 : kNumThreads, 1, 1));
+  };
+
+  if (static_cast<uint32_t>(max_context_len) <= kPartitionSize) {
+    encode_v1(0, num_seqs, max_context_len);
+    return;
+  }
+
+  const int32_t* lens = seq_lens.data<int32_t>();
+  std::vector<int> v1_rows;
+  std::vector<RowPartials> passes;
+  passes.reserve(static_cast<size_t>(num_seqs));
+  for (int row = 0; row < num_seqs; ++row) {
+    const int context = lens[row];
+    if (static_cast<uint32_t>(context) <= kPartitionSize) {
+      v1_rows.push_back(row);
+      continue;
+    }
+    const bool striped = row_kernel(context) == KeysTokenMajorKernel::Striped;
+    const uint32_t parts = !striped ? partitions(context)
+        : planned_stripes != 0      ? planned_stripes
+                                    : grouped_stripe_count(
+                                          GroupedPagedAttentionKind::Qwen35D256, context);
+    const int64_t stats = int64_t{num_q_heads} * parts;
+    // Each row owns its partials: a reduce never reads another row's pass.
+    passes.push_back(RowPartials{
+        row,
+        parts,
+        striped,
+        float_scratch(stats, "exp sums"),
+        float_scratch(stats, "max logits"),
+        float_scratch(stats * head_size, "partials")});
+  }
+  for (auto& p : passes) {
+    encode_partials(p);
+  }
+  for (const int row : v1_rows) {
+    encode_v1(row, 1, lens[row]);
+  }
+  for (auto& p : passes) {
+    encode_reduce(p);
+  }
+  for (auto& p : passes) {
+    encoder.add_temporary(std::move(p.exp_sums));
+    encoder.add_temporary(std::move(p.max_logits));
+    encoder.add_temporary(std::move(p.tmp_out));
+  }
+}
+
 } // namespace
 
 // =============================================================================
@@ -1563,7 +1925,8 @@ void dispatch_paged_attention_auto(
     int sliding_window,
     KvDtype kv_dtype,
     PagedAttentionRouteHint route_hint,
-    uint32_t grouped_stripes) {
+    uint32_t grouped_stripes,
+    const mlx::core::array* score_scales) {
   // The Metal kernel masks K positions older than
   // `context_len - sliding_window` when sliding_window > 0. Negative
   // values are illegal (only 0 is a valid "no mask" sentinel).
@@ -1591,6 +1954,38 @@ void dispatch_paged_attention_auto(
   // expects 1.0 to mean disabled. Translate.
   const float softcapping = (softcap == 0.0f) ? 1.0f : softcap;
 
+  // A rank-4 K is the keys-token-major page; the validator admits it only
+  // whole (INT8, 32-token blocks, group 6, D 256, dimension-major V).
+  if (k_pool.ndim() == 4) {
+    dispatch_paged_attention_keys_token_major(
+        encoder,
+        device,
+        out,
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        k_scale,
+        v_scale,
+        num_seqs,
+        num_q_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        max_context_len,
+        max_blocks_per_seq,
+        live_blocks,
+        scale,
+        softcapping,
+        sliding_window,
+        route_hint,
+        grouped_stripes,
+        score_scales);
+    return;
+  }
+  count_paged_decode(0);
+
   if (static_cast<uint32_t>(max_context_len) <= kPartitionSize) {
     dispatch_paged_attention_v1_inner(
         encoder,
@@ -1616,7 +2011,8 @@ void dispatch_paged_attention_auto(
         softcapping,
         sliding_window,
         io_dtype,
-        cache_dtype);
+        cache_dtype,
+        score_scales);
   } else {
     dispatch_paged_attention_v2_inner(
         encoder,
@@ -1644,7 +2040,8 @@ void dispatch_paged_attention_auto(
         io_dtype,
         cache_dtype,
         route_hint,
-        grouped_stripes);
+        grouped_stripes,
+        score_scales);
   }
 
   // Reference unused parameter so the compiler doesn't warn.
@@ -1679,7 +2076,8 @@ void dispatch_paged_attention_varlen_v1_inner(
     float softcapping,
     int sliding_window,
     KvDtype io_dtype,
-    KvDtype cache_dtype) {
+    KvDtype cache_dtype,
+    const mlx::core::array* score_scales) {
   const std::string& kernel_name = paged_attention_varlen_v1_kernel_name(
       io_dtype, cache_dtype, head_size, block_size, /*use_alibi=*/false);
   MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
@@ -1710,6 +2108,7 @@ void dispatch_paged_attention_varlen_v1_inner(
 
   encoder.set_input_array(cu_seqlens_q, 19);
   encoder.set_bytes<int32_t>(num_seqs, 20);
+  bind_score_scales(encoder, score_scales, 0);
 
   const size_t logits_bytes =
       static_cast<size_t>(max_context_len) * sizeof(float);
@@ -1758,7 +2157,8 @@ void dispatch_paged_attention_varlen_v2_inner(
     float softcapping,
     int sliding_window,
     KvDtype io_dtype,
-    KvDtype cache_dtype) {
+    KvDtype cache_dtype,
+    const mlx::core::array* score_scales) {
   const GroupedPagedAttentionKind grouped_kind = total_queries == 2
       ? select_grouped_paged_attention(
           io_dtype,
@@ -1910,6 +2310,10 @@ void dispatch_paged_attention_varlen_v2_inner(
 
       bind_cu_seqlens(19);
       encoder.set_bytes<int32_t>(num_seqs, 20);
+      bind_score_scales(
+          encoder,
+          score_scales,
+          static_cast<int64_t>(first) * num_q_heads * static_cast<int64_t>(sizeof(float)));
 
       // Keep one GQA-sized threadgroup per query row (192 threads for GQA6
       // or 256 for GQA8). Combining both q_len=2 rows would cut occupancy
@@ -2021,7 +2425,8 @@ void dispatch_paged_attention_varlen_auto(
     float scale,
     float softcap,
     int sliding_window,
-    KvDtype kv_dtype) {
+    KvDtype kv_dtype,
+    const mlx::core::array* score_scales) {
   if (sliding_window < 0) {
     std::ostringstream msg;
     msg << "[mlx_paged_dispatch] sliding_window=" << sliding_window
@@ -2070,7 +2475,8 @@ void dispatch_paged_attention_varlen_auto(
         softcapping,
         sliding_window,
         io_dtype,
-        cache_dtype);
+        cache_dtype,
+        score_scales);
   } else {
     dispatch_paged_attention_varlen_v2_inner(
         encoder,
@@ -2098,7 +2504,8 @@ void dispatch_paged_attention_varlen_auto(
         softcapping,
         sliding_window,
         io_dtype,
-        cache_dtype);
+        cache_dtype,
+        score_scales);
   }
 }
 
@@ -2121,14 +2528,35 @@ std::string paged_prefill_suffix(int group, int head_size) {
   return "_g" + std::to_string(group) + "_d" + std::to_string(head_size);
 }
 
-std::string paged_prefill_split_name(KvDtype cache_dtype, int group, int head_size) {
-  return std::string("paged_prefill_attention_") +
-      (cache_dtype == KvDtype::Int8 ? "q8" : "bf16") + "_split" +
+// Splash splitKernel: INT8 pages scored by INT8 queries take the `q8q`
+// entry.
+std::string paged_prefill_split_name(
+    KvDtype cache_dtype,
+    bool int8_queries,
+    int group,
+    int head_size) {
+  const char* format = cache_dtype == KvDtype::Int8 ? (int8_queries ? "q8q" : "q8") : "bf16";
+  return std::string("paged_prefill_attention_") + format + "_split" +
       paged_prefill_suffix(group, head_size);
+}
+
+// The keys-token-major page (paged_prefill_attention_ktm.h): INT8, one
+// 32-token block per page, heads 24/4 at D 256 only.
+std::string paged_prefill_keys_token_major_split_name(bool int8_queries) {
+  return paged_prefill_split_name(
+             KvDtype::Int8,
+             int8_queries,
+             kPagedPrefillKeysTokenMajorGroup,
+             kPagedPrefillKeysTokenMajorHeadDim) +
+      "_ktm";
 }
 
 std::string paged_prefill_reduce_name(int group, int head_size) {
   return "paged_prefill_attention_reduce" + paged_prefill_suffix(group, head_size);
+}
+
+std::string paged_query_codes_name(int head_size) {
+  return "paged_prefill_attention_query_codes_d" + std::to_string(head_size);
 }
 
 // Splash DeviceCapabilities::validationMessage: people know their chip, not
@@ -2149,7 +2577,7 @@ std::string apple_gpu_family_name(mlx::core::metal::Device& device) {
 }
 
 std::atomic<uint64_t>& paged_prefill_probe_counter(int kind) {
-  static std::atomic<uint64_t> counters[3] = {{0}, {0}, {0}};
+  static std::atomic<uint64_t> counters[5] = {{0}, {0}, {0}, {0}, {0}};
   return counters[kind];
 }
 
@@ -2177,15 +2605,26 @@ bool paged_prefill_attention_geometry(int group, int head_size) {
   return group_ok && dim_ok;
 }
 
+bool paged_prefill_keys_token_major_geometry(int group, int head_size) {
+  return group == kPagedPrefillKeysTokenMajorGroup &&
+      head_size == kPagedPrefillKeysTokenMajorHeadDim;
+}
+
 std::vector<std::string> paged_prefill_attention_kernel_names() {
   std::vector<std::string> names;
   for (int group : kPagedPrefillGroups) {
     for (int head_size : kPagedPrefillHeadDims) {
-      names.push_back(paged_prefill_split_name(KvDtype::Int8, group, head_size));
-      names.push_back(paged_prefill_split_name(KvDtype::Bf16, group, head_size));
+      names.push_back(paged_prefill_split_name(KvDtype::Int8, false, group, head_size));
+      names.push_back(paged_prefill_split_name(KvDtype::Int8, true, group, head_size));
+      names.push_back(paged_prefill_split_name(KvDtype::Bf16, false, group, head_size));
       names.push_back(paged_prefill_reduce_name(group, head_size));
     }
   }
+  for (int head_size : kPagedPrefillHeadDims) {
+    names.push_back(paged_query_codes_name(head_size));
+  }
+  names.push_back(paged_prefill_keys_token_major_split_name(false));
+  names.push_back(paged_prefill_keys_token_major_split_name(true));
   return names;
 }
 
@@ -2202,12 +2641,25 @@ MTL::ComputePipelineState* paged_prefill_pipeline(
 }
 
 int64_t build_paged_prefill_attention_pipelines(mlx::core::metal::Device& device) {
+  // Splash KernelCalibration: only Apple10 and later score INT8 queries
+  // (Apple9's matrix operations share the FP32 pipe), so no other family
+  // builds the q8q entries or the decode's query codes.
+  const bool int8_queries = paged_prefill_int8_queries_supported(device);
   int64_t built = 0;
   for (const auto& name : paged_prefill_attention_kernel_names()) {
+    if (!int8_queries &&
+        (name.find("_q8q_") != std::string::npos ||
+         name.find("_query_codes_") != std::string::npos)) {
+      continue;
+    }
     paged_prefill_pipeline(device, name);
     ++built;
   }
   return built;
+}
+
+bool paged_prefill_int8_queries_supported(mlx::core::metal::Device& device) {
+  return device.mtl_device()->supportsFamily(MTL::GPUFamilyApple10);
 }
 
 int64_t paged_prefill_workspace_floats(
@@ -2233,6 +2685,7 @@ void dispatch_paged_prefill_attention(
     int num_q_heads,
     int head_size,
     KvDtype cache_dtype,
+    bool int8_queries,
     int64_t live_blocks) {
   const int kv_heads = static_cast<int>(params.kv_heads);
   const int group = num_q_heads / kv_heads;
@@ -2241,6 +2694,9 @@ void dispatch_paged_prefill_attention(
       kPagedPrefillTileRows;
   const int64_t partial_floats = static_cast<int64_t>(tiles) * params.split_count *
       kPagedPrefillTileRows * num_q_heads * head_size;
+  // A rank-4 K is the keys-token-major page; the validator admits it only
+  // where its entry exists.
+  const bool keys_token_major = k_pool.ndim() == 4;
 
   {
     const int kind = params.max_splits == kPagedVerifyMaxSplits ? 1 : 0;
@@ -2248,11 +2704,20 @@ void dispatch_paged_prefill_attention(
     paged_prefill_probe_last_splits().store(params.split_count, std::memory_order_relaxed);
     paged_prefill_probe_last_max_splits().store(
         params.max_splits, std::memory_order_relaxed);
+    if (int8_queries) {
+      paged_prefill_probe_counter(3).fetch_add(1, std::memory_order_relaxed);
+    }
+    if (keys_token_major) {
+      paged_prefill_probe_counter(4).fetch_add(1, std::memory_order_relaxed);
+    }
   }
 
   {
-    auto* pipeline =
-        paged_prefill_pipeline(device, paged_prefill_split_name(cache_dtype, group, head_size));
+    auto* pipeline = paged_prefill_pipeline(
+        device,
+        keys_token_major
+            ? paged_prefill_keys_token_major_split_name(int8_queries)
+            : paged_prefill_split_name(cache_dtype, int8_queries, group, head_size));
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_input_array(q_staged, 0);
     encoder.set_output_array(workspace, 1);
@@ -2285,6 +2750,30 @@ void dispatch_paged_prefill_attention(
   }
 }
 
+void dispatch_paged_query_codes(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    const mlx::core::array& q,
+    const mlx::core::array& positions,
+    mlx::core::array& codes,
+    mlx::core::array& score_scales,
+    const PagedQueryCodesParams& params,
+    int head_size) {
+  auto* pipeline = paged_prefill_pipeline(device, paged_query_codes_name(head_size));
+  encoder.set_compute_pipeline_state(pipeline);
+  encoder.set_input_array(q, 0);
+  encoder.set_input_array(positions, 1);
+  encoder.set_output_array(codes, 2);
+  encoder.set_output_array(score_scales, 3);
+  encoder.set_bytes(params, 4);
+  // Four threads per (row, query head): a threadgroup holds whole rows.
+  const size_t threads =
+      static_cast<size_t>(params.rows) * params.query_heads * 4;
+  const size_t groups = (threads + kNumThreads - 1) / kNumThreads;
+  encoder.dispatch_threadgroups(
+      MTL::Size::Make(groups, 1, 1), MTL::Size::Make(kNumThreads, 1, 1));
+}
+
 } // namespace mlx::core::fast::paged
 
 extern "C" bool mlx_paged_prefill_mpp_builds() {
@@ -2305,15 +2794,18 @@ extern "C" void mlx_paged_prefill_test_probe_reset() {
   using namespace mlx::core::fast::paged;
   paged_prefill_probe_counter(0).store(0, std::memory_order_relaxed);
   paged_prefill_probe_counter(1).store(0, std::memory_order_relaxed);
+  paged_prefill_probe_counter(3).store(0, std::memory_order_relaxed);
+  paged_prefill_probe_counter(4).store(0, std::memory_order_relaxed);
   paged_prefill_probe_last_splits().store(0, std::memory_order_relaxed);
   paged_prefill_probe_last_max_splits().store(0, std::memory_order_relaxed);
 }
 
 // kind 0: prefill launches, 1: verify launches, 2: build probes (never
-// reset).
+// reset), 3: launches of a q8q (INT8-query) entry, 4: launches of a
+// keys-token-major entry.
 extern "C" uint64_t mlx_paged_prefill_test_probe_count(int kind) {
   using namespace mlx::core::fast::paged;
-  if (kind < 0 || kind > 2) {
+  if (kind < 0 || kind > 4) {
     return 0;
   }
   return paged_prefill_probe_counter(kind).load(std::memory_order_relaxed);

@@ -1,5 +1,7 @@
 use super::*;
 
+mod lane_plan;
+
 /// The runway follows the layout's `kvRunwayPages` and adds one GDN cell of
 /// blocks: bf16 27B 64 pages (2,048 tokens) + 147 = 275; int8 27B one
 /// 128-page extent (4,096 tokens) + 290 = 546; int8 35B (2 heads) one
@@ -297,6 +299,7 @@ fn estimate_matches_the_load_plan() {
             asset_dir: &target,
             moe: false,
             weight_bytes,
+            planes_bytes: 0,
             header: bf16_header(),
             draft_dir: Some(&draft),
             kv_format: None,
@@ -344,6 +347,7 @@ fn estimate_matches_the_load_plan() {
         ),
         draft: Some(DraftTerms::of(&draft_config, 1_357 * MIB)),
         mtp: false,
+        draft_lanes: false,
         lanes: crate::models::qwen3_5::load_plan::qwen35_scheduler_lanes(),
         expert_row_bytes: 0,
         state_staging_bytes: 0,
@@ -398,6 +402,7 @@ fn sym8_estimate_plans_the_pool() {
                 asset_dir: &target,
                 moe: false,
                 weight_bytes: 16_000 << 20,
+                planes_bytes: 0,
                 header: bf16_header(),
                 draft_dir: None,
                 kv_format: None,
@@ -522,6 +527,7 @@ fn estimate_27b(
             asset_dir: &target,
             moe: false,
             weight_bytes: 16_000 * MIB,
+            planes_bytes: 0,
             header: bf16_header(),
             draft_dir: Some(&draft),
             kv_format: None,
@@ -680,6 +686,7 @@ fn plan_27b_disk(
         }),
         draft: with_draft.then(|| DraftTerms::of(&draft_config, 1_357 * MIB)),
         mtp,
+        draft_lanes: false,
         lanes,
         expert_row_bytes: 0,
         state_staging_bytes: 0,
@@ -894,6 +901,7 @@ fn unplanned_estimate_refuses_what_the_load_refuses() {
                 asset_dir: &target,
                 moe: false,
                 weight_bytes: 16_000 << 20,
+                planes_bytes: 0,
                 header: bf16_header(),
                 draft_dir: None,
                 kv_format: None,
@@ -975,6 +983,7 @@ fn draft_without_a_pool_uses_the_dense_flat_lane() {
             asset_dir: &target,
             moe: false,
             weight_bytes: 1 << 30,
+            planes_bytes: 0,
             header: bf16_header(),
             draft_dir: Some(&draft),
             kv_format: None,
@@ -1104,6 +1113,7 @@ fn load_window(
         pool,
         draft: None,
         mtp,
+        draft_lanes: false,
         lanes: 8,
         expert_row_bytes: 0,
         state_staging_bytes: 0,
@@ -1182,6 +1192,7 @@ fn estimate_resolves_the_compute_dtype_like_the_load() {
                     asset_dir: &target,
                     moe: false,
                     weight_bytes: 16_000 * MIB,
+                    planes_bytes: 0,
                     header: CheckpointHeader {
                         compute: resolved,
                         mtp: HashMap::new(),
@@ -1351,6 +1362,7 @@ fn estimate_prices_mtp_only_when_the_load_enables_it() {
                 asset_dir: &target,
                 moe: false,
                 weight_bytes: 16_000 * MIB,
+                planes_bytes: 0,
                 header,
                 draft_dir: None,
                 kv_format: None,
@@ -1584,6 +1596,7 @@ fn estimate_122b_takes_the_int8_pool() {
                 asset_dir: &target,
                 moe: true,
                 weight_bytes: weight_mib * MIB,
+                planes_bytes: 0,
                 header: bf16_header(),
                 draft_dir: None,
                 kv_format,
@@ -1713,6 +1726,52 @@ fn shaped_disk_plan(
     expert_row_bytes: u64,
     cache_disk: Option<CacheDisk>,
 ) -> Result<MemoryPlan> {
+    shaped_load_plan(
+        config,
+        weights,
+        working_set,
+        mtp,
+        lanes,
+        expert_row_bytes,
+        cache_disk,
+        None,
+    )
+}
+
+/// The plan of a dense load of `config` with `draft` (its weights inside
+/// `weights`), its turns run as DFlash2 decode lanes when `draft_lanes`.
+fn shaped_draft_plan(
+    config: &Qwen3_5Config,
+    weights: u64,
+    working_set: u64,
+    lanes: u32,
+    draft: DraftTerms,
+    draft_lanes: bool,
+) -> Result<MemoryPlan> {
+    shaped_load_plan(
+        config,
+        weights,
+        working_set,
+        false,
+        lanes,
+        0,
+        None,
+        Some((draft, draft_lanes)),
+    )
+}
+
+/// [`shaped_disk_plan`] with a DFlash2 draft and whether its turns run as
+/// decode lanes.
+fn shaped_load_plan(
+    config: &Qwen3_5Config,
+    weights: u64,
+    working_set: u64,
+    mtp: bool,
+    lanes: u32,
+    expert_row_bytes: u64,
+    cache_disk: Option<CacheDisk>,
+    draft: Option<(DraftTerms, bool)>,
+) -> Result<MemoryPlan> {
     let format = config.kv_format_for(DType::BFloat16);
     let block_size = config.paged_block_size();
     let layers = config.full_attention_layer_count() as u32;
@@ -1740,8 +1799,9 @@ fn shaped_disk_plan(
             layers,
             explicit_mib: None,
         }),
-        draft: None,
+        draft: draft.map(|(draft, _)| draft),
         mtp,
+        draft_lanes: draft.is_some_and(|(_, lanes)| lanes),
         lanes,
         expert_row_bytes,
         state_staging_bytes: 0,
@@ -1801,9 +1861,13 @@ type TableModel = (&'static str, u64, fn(bool) -> (Qwen3_5Config, u64));
 /// loses its second lane to the cell and keeps its window; 9B MTP 16 and
 /// 24 GB and 27B MTP 36 GB lose 180, 2,732 and 4,096 tokens (the 27B step
 /// equals `staging_moves_the_plan_once`'s 155,641 → 151,545); 27B AR 36 GB
-/// falls 7 tokens under the trained window. Mutations: price no decode
-/// step or state past one lane → every fitting row grants its ceiling →
-/// red; the ceiling always 8 → the 64, 128 and 192 GB rows grant 8 → red.
+/// falls 7 tokens under the trained window. The 27B with its DFlash2
+/// draft (1,357 MiB) grants the same lanes whether its turns run as
+/// DFlash2 decode lanes (370,159,616 B per later lane) or not (one cell):
+/// 36 GB holds one lane at 221,177 tokens, 64 GB and up the ceiling at the
+/// full window. Mutations: price no decode step or state past one lane →
+/// every fitting row grants its ceiling → red; the ceiling always 8 → the
+/// 64, 128 and 192 GB rows grant 8 → red.
 #[test]
 fn lanes_follow_the_device() {
     let (rows, table) = lane_table(None, |_| 0);
@@ -1857,6 +1921,19 @@ fn lanes_follow_the_device() {
     disk[34] = Some((1, 262_137));
     disk[42] = Some((1, 184_313));
     assert_eq!(rows, disk, "{table}");
+
+    let (today, today_table) = draft_lane_table(false);
+    println!("{today_table}");
+    let (lanes, lanes_table) = draft_lane_table(true);
+    println!("{lanes_table}");
+    #[rustfmt::skip]
+    let drafted: Vec<LaneRow> = vec![
+        // 27B + DFlash2: 16, 24, 36, 64, 128, 192, 256, 512 GB
+        None, None, Some((1, 221_177)), Some((4, FULL)),
+        Some((4, FULL)), Some((4, FULL)), Some((8, FULL)), Some((8, FULL)),
+    ];
+    assert_eq!(today, drafted, "{today_table}");
+    assert_eq!(lanes, drafted, "{lanes_table}");
 }
 
 /// The rows of [`lanes_follow_the_device`] and their printed table, with
@@ -1883,96 +1960,165 @@ fn lane_table(
             moe_shape(&qwen35_122b_raw(), mtp)
         }),
     ];
-    let machines = [16u64, 24, 36, 64, 128, 192, 256, 512];
     let mut table = String::new();
     let mut rows: Vec<LaneRow> = Vec::new();
     for (name, weights, shape) in models {
         for mtp in [false, true] {
             let (config, expert_row_bytes) = shape(mtp);
             let mut previous = 0u32;
-            for gib in machines {
-                let physical = gib << 30;
-                let working_set = physical / 4 * 3;
-                let ceiling = qwen35_lane_ceiling(Some(physical)) as u32;
+            for gib in TABLE_MACHINES {
                 let plan = |lanes| {
                     shaped_disk_plan(
                         &config,
                         weights + held(&config),
-                        working_set,
+                        working_set_of(gib),
                         mtp,
                         lanes,
                         expert_row_bytes,
                         cache_disk,
                     )
                 };
-                let mut staging = 0u64;
-                let row = match (plan(1), plan(8), plan(ceiling)) {
-                    (Ok(single), Ok(offered), Ok(planned)) => {
-                        let one = single.pool.unwrap();
-                        let eight = offered.pool.unwrap();
-                        let pool = planned.pool.unwrap();
-                        assert_eq!(one.lanes, 1);
-                        assert!((1..=ceiling).contains(&pool.lanes));
-                        assert_eq!(
-                            pool.lane.window.maximum(),
-                            one.lane.window.maximum(),
-                            "{name} mtp={mtp} {gib} GB: lanes never cost window"
-                        );
-                        assert_eq!(
-                            pool.lanes,
-                            eight.lanes.min(ceiling),
-                            "{name} mtp={mtp} {gib} GB: the machine's ceiling keeps its lanes"
-                        );
-                        let window = pool.lane.window.maximum();
-                        let (blocks, _) = crate::engine::hybrid_scheduler::scheduled_booking(
-                            true,
-                            window - 1,
-                            1,
-                            config.paged_block_size(),
-                        );
-                        assert!(
-                            blocks <= pool.max_blocks,
-                            "{name} mtp={mtp} {gib} GB: a {} token prompt passes the max pool",
-                            window - 1
-                        );
-                        assert!(pool.lanes >= previous, "{name} mtp={mtp}: monotonic");
-                        previous = pool.lanes;
-                        if !super::super::model::Qwen35SchedulerState::force_serial()
-                            && std::env::var_os("MLX_SCHED_MAX_NUM_SEQS").is_none()
-                        {
-                            assert_eq!(
-                                crate::models::qwen3_5::model::qwen35_max_concurrent_sequences(
-                                    true, pool.lanes
-                                ),
-                                pool.lanes
-                            );
-                        }
-                        staging = planned.footprint.state_staging_bytes;
-                        Some((pool.lanes, window))
-                    }
-                    (Err(single), Err(offered), Err(planned)) => {
-                        assert_eq!(single.reason, offered.reason);
-                        assert_eq!(single.reason, planned.reason);
-                        None
-                    }
-                    (single, offered, planned) => panic!(
-                        "{name} mtp={mtp} {gib} GB: one lane {:?}, eight {:?}, ceiling {:?}",
-                        single.map(|_| ()),
-                        offered.map(|_| ()),
-                        planned.map(|_| ())
-                    ),
-                };
-                let cell = row.map_or("no load".to_string(), |(lanes, window)| {
-                    format!("{lanes} lanes, {window}, staging {staging}")
-                });
-                let _ = std::fmt::Write::write_fmt(
+                rows.push(device_row(
+                    &format!("{name} mtp={mtp}"),
+                    &config,
+                    gib,
+                    plan,
+                    &mut previous,
                     &mut table,
-                    format_args!("{name} mtp={mtp} {gib} GB: {cell}\n"),
-                );
-                rows.push(row);
+                ));
             }
         }
     }
+    (rows, table)
+}
+
+/// The machines of [`lanes_follow_the_device`], in GB of RAM.
+const TABLE_MACHINES: [u64; 8] = [16, 24, 36, 64, 128, 192, 256, 512];
+
+/// The Metal working set of a machine of `gib` GB: 3/4 of its RAM.
+fn working_set_of(gib: u64) -> u64 {
+    (gib << 30) / 4 * 3
+}
+
+/// One row of [`lanes_follow_the_device`]: the lanes and window `plan`
+/// grants on a machine of `gib` GB, checked against the one-lane plan and
+/// an offer of eight, and printed to `table` as `name`.
+fn device_row(
+    name: &str,
+    config: &Qwen3_5Config,
+    gib: u64,
+    plan: impl Fn(u32) -> Result<MemoryPlan>,
+    previous: &mut u32,
+    table: &mut String,
+) -> LaneRow {
+    let ceiling = qwen35_lane_ceiling(Some(gib << 30)) as u32;
+    let mut staging = 0u64;
+    let row = match (plan(1), plan(8), plan(ceiling)) {
+        (Ok(single), Ok(offered), Ok(planned)) => {
+            let one = single.pool.unwrap();
+            let eight = offered.pool.unwrap();
+            let pool = planned.pool.unwrap();
+            assert_eq!(one.lanes, 1);
+            assert!((1..=ceiling).contains(&pool.lanes));
+            assert_eq!(
+                pool.lane.window.maximum(),
+                one.lane.window.maximum(),
+                "{name} {gib} GB: lanes never cost window"
+            );
+            assert_eq!(
+                pool.lanes,
+                eight.lanes.min(ceiling),
+                "{name} {gib} GB: the machine's ceiling keeps its lanes"
+            );
+            let window = pool.lane.window.maximum();
+            let (blocks, _) = crate::engine::hybrid_scheduler::scheduled_booking(
+                true,
+                window - 1,
+                1,
+                config.paged_block_size(),
+            );
+            assert!(
+                blocks <= pool.max_blocks,
+                "{name} {gib} GB: a {} token prompt passes the max pool",
+                window - 1
+            );
+            assert!(pool.lanes >= *previous, "{name}: monotonic");
+            *previous = pool.lanes;
+            if !super::super::model::Qwen35SchedulerState::force_serial()
+                && std::env::var_os("MLX_SCHED_MAX_NUM_SEQS").is_none()
+            {
+                assert_eq!(
+                    crate::models::qwen3_5::model::qwen35_max_concurrent_sequences(
+                        true, pool.lanes
+                    ),
+                    pool.lanes
+                );
+            }
+            staging = planned.footprint.state_staging_bytes;
+            Some((pool.lanes, window))
+        }
+        (Err(single), Err(offered), Err(planned)) => {
+            assert_eq!(single.reason, offered.reason);
+            assert_eq!(single.reason, planned.reason);
+            None
+        }
+        (single, offered, planned) => panic!(
+            "{name} {gib} GB: one lane {:?}, eight {:?}, ceiling {:?}",
+            single.map(|_| ()),
+            offered.map(|_| ()),
+            planned.map(|_| ())
+        ),
+    };
+    let cell = row.map_or("no load".to_string(), |(lanes, window)| {
+        format!("{lanes} lanes, {window}, staging {staging}")
+    });
+    let _ = std::fmt::Write::write_fmt(table, format_args!("{name} {gib} GB: {cell}\n"));
+    row
+}
+
+/// The 27B fixture's DFlash2 draft (5 layers, 8 KV heads of 128, a
+/// 2,048-row window, hidden 5,120) with 1,357 MiB of weights.
+fn draft_27b(tag: &str) -> DraftTerms {
+    let target = estimate_fixture_dir(tag);
+    let draft = estimate_fixture_dir(&format!("{tag}-draft"));
+    write_27b_fixture(&target, &draft);
+    let config = crate::models::qwen3_5::dflash2::read_dflash2_config(&draft).unwrap();
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_dir_all(&draft).unwrap();
+    DraftTerms::of(&config, 1_357 * MIB)
+}
+
+/// The rows of [`lanes_follow_the_device`] for the 27B with its DFlash2
+/// draft (16,000 + 1,357 MiB resident), its turns run as decode lanes when
+/// `draft_lanes`, and their printed table.
+fn draft_lane_table(draft_lanes: bool) -> (Vec<LaneRow>, String) {
+    let config = shaped_config(5120, 64, 24, 4, 17408, 16, 48, false);
+    let draft = draft_27b(&format!("draft-lane-table-{draft_lanes}"));
+    let mut table = String::new();
+    let mut previous = 0u32;
+    let rows = TABLE_MACHINES
+        .into_iter()
+        .map(|gib| {
+            let plan = |lanes| {
+                shaped_draft_plan(
+                    &config,
+                    17_357 * MIB,
+                    working_set_of(gib),
+                    lanes,
+                    draft,
+                    draft_lanes,
+                )
+            };
+            device_row(
+                &format!("27B+DFlash2 lanes={draft_lanes}"),
+                &config,
+                gib,
+                plan,
+                &mut previous,
+                &mut table,
+            )
+        })
+        .collect();
     (rows, table)
 }
 
@@ -2003,7 +2149,7 @@ fn eight_lanes_price_eight_decode_steps_and_states() {
         let window = eight_pool.lane.window.maximum();
         assert_eq!(window, one_pool.lane.window.maximum());
         let one_lane =
-            crate::models::qwen3_5::dflash2_decode::pool_lane_transient(&config, None, window);
+            crate::models::qwen3_5::dflash2_decode::pool_lane_transient(&config, None, window, 1);
         assert_eq!(one_pool.lane.transient_bytes, one_lane);
         let rows = if mtp { 64 } else { 8 };
         assert_eq!(
@@ -2030,6 +2176,149 @@ fn eight_lanes_price_eight_decode_steps_and_states() {
     }
 }
 
+/// A draft load whose turns run as DFlash2 decode lanes prices each lane
+/// past the first at a GDN cell, the lane's second cell, its draft ring and
+/// context window and its pending GDN tape: on the 27B 153,944,064 x 2 +
+/// 42,106,880 + 5,898,240 + 14,266,368 = 370,159,616 B, the first lane
+/// unchanged (its cell and the 201,949,184 B draft state; its tape is in
+/// the one-lane transient). The decode step is unchanged: one lane's 8-row
+/// verify (each lane verifies in its own `[1, 8]` call), or the joint step
+/// of eight autoregressive rows when that is larger (1,653,800,960 B here,
+/// over the 262,144-token window). A draft load whose turns are not lanes
+/// keeps one cell per later lane.
+#[test]
+fn draft_lanes_price_two_cells_a_ring_and_a_window() {
+    let config = shaped_config(5120, 64, 24, 4, 17408, 16, 48, false);
+    let draft = draft_27b("draft-lanes-price");
+    let cell = 153_944_064u64;
+    assert_eq!(config.recurrent_state_bytes(), cell);
+    assert_eq!(draft.lane_bytes, 42_106_880 + 5_898_240);
+    assert_eq!(
+        crate::models::qwen3_5::dflash2_decode::gdn_pending_tape_bytes(&config),
+        14_266_368
+    );
+    let working_set = 384u64 << 30;
+    let plan = |lanes, draft_lanes| {
+        shaped_draft_plan(
+            &config,
+            17_357 * MIB,
+            working_set,
+            lanes,
+            draft,
+            draft_lanes,
+        )
+        .unwrap()
+        .pool
+        .unwrap()
+    };
+    let (one, eight) = (plan(1, true), plan(8, true));
+    assert_eq!(eight.lanes, 8);
+    assert_eq!(one.lane.lane_bytes, cell + 201_949_184);
+    assert_eq!(
+        eight.lane.lane_bytes - one.lane.lane_bytes,
+        7 * 370_159_616,
+        "each later lane: two cells, a ring, a window and a tape"
+    );
+    assert_eq!(
+        crate::models::qwen3_5::scheduled_dflash2::lane_state_bytes(
+            &config,
+            cell,
+            draft.lane_bytes
+        ),
+        370_159_616 - cell
+    );
+    assert_eq!(
+        eight.lane.transient_bytes,
+        one.lane.transient_bytes.max(pool_decode_step_bytes(
+            &config,
+            8,
+            eight.lane.window.maximum()
+        )),
+        "one lane's verify, or eight autoregressive rows"
+    );
+    assert_eq!(eight.lane.transient_bytes, 1_653_800_960);
+    assert_eq!(eight.lane.window.maximum(), one.lane.window.maximum());
+    let (plain_one, plain_eight) = (plan(1, false), plan(8, false));
+    assert_eq!(plain_one.lane.lane_bytes, one.lane.lane_bytes);
+    assert_eq!(
+        plain_eight.lane.lane_bytes - plain_one.lane.lane_bytes,
+        7 * cell
+    );
+}
+
+/// A decode step of N DFlash2 lanes holds every lane's 8-row verify until
+/// the step's commit (a verify wave stacks their activations): each lane
+/// past the first adds its rows' logits, GDN tape and one layer's scratch,
+/// on the 27B 8 x 248,320 x 4 x 2 + 64 x 8 x 25,600 x 2 + 8 x 3 x 22,528 x
+/// 2 = 43,188,224 B, to the verify side of the pool transient
+/// (246,853,632 for one lane). The tapped prefill chunk (491,126,784) stays
+/// the larger up to 6 lanes; 7 lanes price 505,982,976, 8 lanes
+/// 549,171,200. On the 35B-A3B dense view the verify side wins at every
+/// window, so every lane adds its 27,787,264 B. A plan of 8 draft lanes
+/// prices that step, or the 8-row autoregressive step when larger; a plan
+/// whose draft turns are not lanes prices one verify. Mutation: the
+/// step priced as one lane → red.
+#[test]
+fn draft_lanes_price_every_verifying_lane() {
+    use crate::models::qwen3_5::dflash2_decode::pool_verify_lane_bytes;
+    let cfg = crate::models::qwen3_5::dflash2_decode::tests::qwen38_27b_cfg();
+    let lane = pool_verify_lane_bytes(&cfg);
+    assert_eq!(
+        lane,
+        8 * 248_320 * 4 * 2 + 64 * 8 * 25_600 * 2 + 8 * 3 * 22_528 * 2
+    );
+    assert_eq!(lane, 43_188_224);
+    let verify_one: u64 = 246_853_632;
+    let chunk: u64 = 491_126_784;
+    for lanes in 1..=8u32 {
+        assert_eq!(
+            pool_lane_transient(&cfg, Some(5), 94_201, lanes),
+            chunk.max(verify_one + u64::from(lanes - 1) * lane),
+            "27B, {lanes} lanes"
+        );
+    }
+    assert_eq!(pool_lane_transient(&cfg, Some(5), 94_201, 7), 505_982_976);
+    assert_eq!(pool_lane_transient(&cfg, Some(5), 94_201, 8), 549_171_200);
+
+    let dense_view = crate::models::qwen3_5::config::Qwen3_5Config {
+        hidden_size: 2048,
+        num_layers: 40,
+        num_heads: 16,
+        num_kv_heads: 2,
+        intermediate_size: 0,
+        linear_num_value_heads: 32,
+        ..crate::models::qwen3_5::dflash2_decode::tests::qwen38_27b_cfg()
+    };
+    assert_eq!(pool_verify_lane_bytes(&dense_view), 27_787_264);
+    for window in [512, 2_048, 262_144] {
+        for lanes in 1..=4u32 {
+            assert_eq!(
+                pool_lane_transient(&dense_view, Some(5), window, lanes),
+                203_092_992 + u64::from(lanes - 1) * 27_787_264,
+                "dense view, window {window}, {lanes} lanes"
+            );
+        }
+    }
+
+    let config = shaped_config(5120, 64, 24, 4, 17408, 16, 48, false);
+    let draft = draft_27b("draft-lanes-verify-step");
+    for draft_lanes in [true, false] {
+        let pool = shaped_draft_plan(&config, 17_357 * MIB, 384 << 30, 8, draft, draft_lanes)
+            .unwrap()
+            .pool
+            .unwrap();
+        assert_eq!(pool.lanes, 8);
+        let window = pool.lane.window.maximum();
+        let verifying = if draft_lanes { 8 } else { 1 };
+        assert_eq!(
+            pool.lane.transient_bytes,
+            pool_lane_transient(&config, Some(draft.tap_layers), window, verifying)
+                .max(pool_decode_step_bytes(&config, 8, window)),
+            "draft lanes {draft_lanes}"
+        );
+    }
+}
+
 /// A MoE decode row allocates its top-k expert work past the dense view:
 /// 35B-A3B 8 x (4 x 2,048 + 3 x 512) x 2 + 3 x 512 x 2 + 256 x 6 = 160,256 B,
 /// 122B-A10B 8 x (4 x 3,072 + 3 x 1,024) x 2 + 3 x 1,024 x 2 + 256 x 6 =
@@ -2049,7 +2338,8 @@ fn moe_decode_rows_price_their_experts() {
             .unwrap()
             .lane
             .transient_bytes,
-        pool_lane_transient(&dense, None, 262_144).max(pool_decode_step_bytes(&dense, 8, 262_144))
+        pool_lane_transient(&dense, None, 262_144, 1)
+            .max(pool_decode_step_bytes(&dense, 8, 262_144))
     );
     for (name, raw, row_bytes, weights) in [
         ("35B-A3B", qwen35_35b_a3b_raw(), 160_256u64, 18_780 * MIB),
@@ -2065,7 +2355,7 @@ fn moe_decode_rows_price_their_experts() {
                 assert_eq!(pool.lanes, lanes, "{name} mtp={mtp}");
                 let window = pool.lane.window.maximum();
                 let rows = decode_step_rows(lanes, mtp);
-                let one_lane = pool_lane_transient(&config, None, window);
+                let one_lane = pool_lane_transient(&config, None, window, 1);
                 let step = pool_decode_step_bytes(&config, rows, window);
                 let experts = rows * expert;
                 println!(
@@ -2081,5 +2371,322 @@ fn moe_decode_rows_price_their_experts() {
                 assert!(step + experts > one_lane, "{name} mtp={mtp} {lanes} lanes");
             }
         }
+    }
+}
+
+/// The 27B plan on a working set of `working_set` bytes with the UD-Q4_K_XL
+/// GGUF and its DFlash2 draft resident (17,559,178,144 and 3,848,817,896 B,
+/// the files' sizes) plus `extra` weight bytes, the scheduler's lanes and
+/// DFlash2 lanes, the automatic SSD tier.
+fn plan_27b_with_weights(working_set: u64, extra: u64) -> napi::Result<MemoryPlan> {
+    const GGUF_BYTES: u64 = 17_559_178_144;
+    const DRAFT_BYTES: u64 = 3_848_817_896;
+    let target = estimate_fixture_dir("planes");
+    let draft = estimate_fixture_dir("planes-draft");
+    write_27b_fixture(&target, &draft);
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(target.join("config.json")).unwrap())
+            .unwrap();
+    let mut config = crate::models::qwen3_5::persistence::parse_config(&raw).unwrap();
+    config.rope_scaling =
+        Some(RopeScaling::served_for("Qwen3.5", 262_144, config.scaling(), None).unwrap());
+    let format = config.pin_kv_format(None, DType::BFloat16);
+    let draft_config = crate::models::qwen3_5::dflash2::read_dflash2_config(&draft).unwrap();
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_dir_all(&draft).unwrap();
+    let block_size = config.paged_block_size();
+    let bytes_per_block = mlx_paged_attn::profile::bytes_per_block(
+        16,
+        4,
+        256,
+        block_size,
+        qwen35_pool_cache_dtype(
+            "t",
+            format,
+            PoolHeads::of(&config),
+            block_size,
+            DType::BFloat16,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut lanes = LoadLanes {
+        config: &config,
+        recurrent_state_bytes: config.recurrent_state_bytes(),
+        pool: Some(PoolGeometry {
+            format,
+            bytes_per_block,
+            block_size,
+            layers: 16,
+            explicit_mib: None,
+        }),
+        draft: Some(DraftTerms::of(&draft_config, DRAFT_BYTES)),
+        mtp: false,
+        draft_lanes: true,
+        lanes: qwen35_scheduler_lanes(),
+        expert_row_bytes: 0,
+        state_staging_bytes: 0,
+    };
+    let live = LiveMemory {
+        working_set_bytes: working_set,
+        active_bytes: GGUF_BYTES + DRAFT_BYTES + extra,
+        registered_pool_bytes: 0,
+    };
+    plan_with_disk("Qwen3.5", &mut lanes, live, None, None, CacheDisk::Auto)
+}
+
+/// The planes guard on the 27B plan: on this machine's working set the
+/// planes of the plan of record keep the lanes and window and cost under 15 %
+/// of the pool, so they stay with a ledger line; on 48 and 64 GiB they cost
+/// more of the pool and leave; a plan whose lanes or window move leaves too.
+#[test]
+fn the_planes_guard_keeps_lanes_window_and_the_pool_limit() {
+    const GIB: u64 = 1 << 30;
+    let planes = 9_885_491_200u64;
+    let mut cases = vec![(48 * GIB, false), (64 * GIB, false)];
+    if let Some(here) = crate::engine::memory_plan::recommended_working_set()
+        && here >= 100 * GIB
+    {
+        cases.push((here, true));
+    }
+    for (working_set, keeps) in cases {
+        let without = plan_27b_with_weights(working_set, 0).expect("the plan without planes");
+        let with = plan_27b_with_weights(working_set, planes).expect("the plan with planes");
+        let verdict = planes_ledger(planes, &with, &without);
+        println!("PLANESGUARD working_set={working_set} {verdict:?}");
+        assert_eq!(verdict.is_ok(), keeps, "working set {working_set}");
+        if let Ok(line) = verdict {
+            assert!(
+                line.starts_with("planes 9885491200 B in the weights: pool "),
+                "{line}"
+            );
+        }
+    }
+    let base = plan_27b_with_weights(115_448_725_504, 0).expect("a plan");
+    let mut fewer_lanes = base.clone();
+    if let Some(pool) = fewer_lanes.pool.as_mut() {
+        pool.lanes -= 1;
+    }
+    assert!(
+        planes_ledger(1, &fewer_lanes, &base).is_err(),
+        "a lane less"
+    );
+    let mut no_pool = base.clone();
+    no_pool.pool = None;
+    assert!(planes_ledger(1, &no_pool, &base).is_err(), "no pool");
+    assert!(planes_ledger(1, &base, &base).is_ok(), "nothing lost");
+}
+
+/// The 27B load on this machine's working set and on 48, 64 and 96 GiB
+/// ones: with no planes plan, with the planes plan of that working set on top, and with
+/// +12.11 GB. `MEMPLAN` lines give lanes and the one window, or the refusal.
+#[test]
+fn planes_weights_keep_the_lanes_and_window() {
+    const GIB: u64 = 1 << 30;
+    let mut working_sets: Vec<u64> = vec![48 * GIB, 64 * GIB, 96 * GIB];
+    match crate::engine::memory_plan::recommended_working_set() {
+        Some(here) => working_sets.insert(0, here),
+        None => println!("MEMPLAN no working set on this device"),
+    }
+    for working_set in working_sets {
+        let device = crate::utils::gguf_planes::PlanesDevice {
+            planes: true,
+            cores: 40,
+            working_set_bytes: working_set,
+            max_memory_bytes: None,
+        };
+        let planes = crate::utils::gguf_planes::plan_planes(
+            &crate::utils::gguf_planes::fixture_header(),
+            &device,
+        )
+        .bytes();
+        for (what, extra) in [
+            ("today", 0u64),
+            ("planes_plan", planes),
+            ("plus_12.11GB", 12_113_469_440),
+        ] {
+            let plan = match plan_27b_with_weights(working_set, extra) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    println!(
+                        "MEMPLAN {what} working_set={working_set} extra={extra} refused: {}",
+                        e.reason
+                    );
+                    continue;
+                }
+            };
+            let pool = plan.pool.expect("pool lane");
+            println!(
+                "MEMPLAN {what} working_set={working_set} extra={extra} lanes={} window={} bound={} hard_budget={} dynamic={} max_blocks={}",
+                pool.lanes,
+                pool.lane.window.maximum(),
+                pool.lane.window.bound(),
+                plan.hard_budget_bytes,
+                plan.dynamic_budget_bytes,
+                pool.max_blocks
+            );
+            for line in plan.describe().lines() {
+                println!("MEMPLAN {what} working_set={working_set} | {line}");
+            }
+        }
+    }
+}
+
+/// The import guard prices the planes before the import, on the device as it
+/// is now, with the UD-Q4_K_XL GGUF and its DFlash2 draft as active bytes:
+/// on this machine's working set with nothing else resident the planes of
+/// record keep the lanes, the window and the pool limit and are admitted;
+/// with another 48 GiB model resident they would cost more than the pool
+/// limit, so the load never allocates them.
+/// Mutation admit-always → red.
+#[test]
+fn the_import_guard_admits_planes_only_with_room() {
+    const GIB: u64 = 1 << 30;
+    const GGUF_BYTES: u64 = 17_559_178_144;
+    const DRAFT_BYTES: u64 = 3_848_817_896;
+    const PLANES: u64 = 9_885_491_200;
+    let target = estimate_fixture_dir("admit");
+    let draft = estimate_fixture_dir("admit-draft");
+    write_27b_fixture(&target, &draft);
+    sparse_file(&draft.join("model.safetensors"), DRAFT_BYTES);
+    let verdict = |active: u64, planes_bytes: u64| {
+        crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| {
+            cell.set(Some(LiveMemory {
+                working_set_bytes: 115_448_725_504,
+                active_bytes: active,
+                registered_pool_bytes: 0,
+            }))
+        });
+        let verdict = admit_planes(
+            "Qwen3.5",
+            &EstimateInput {
+                asset_dir: &target,
+                moe: false,
+                weight_bytes: GGUF_BYTES,
+                planes_bytes,
+                header: bf16_header(),
+                draft_dir: Some(&draft),
+                kv_format: None,
+                max_memory_bytes: None,
+                max_context: None,
+                cache_disk: CacheDisk::Auto,
+            },
+        );
+        crate::engine::memory_plan::LIVE_MEMORY_OVERRIDE.with(|cell| cell.set(None));
+        verdict
+    };
+    let crowded = verdict(48 * GIB, PLANES);
+    let alone = verdict(0, PLANES);
+    let nothing = verdict(0, 0);
+    std::fs::remove_dir_all(&target).unwrap();
+    std::fs::remove_dir_all(&draft).unwrap();
+    println!("ADMIT crowded {crowded:?}");
+    println!("ADMIT alone {alone:?}");
+    println!("ADMIT nothing {nothing:?}");
+    assert!(
+        crowded.is_err(),
+        "planes that cost a lane, the window or the pool limit are not admitted before the import"
+    );
+    let line = alone.expect("the planes of record are admitted with nothing else resident");
+    assert!(
+        line.starts_with("planes 9885491200 B in the weights: pool "),
+        "{line}"
+    );
+    assert!(nothing.is_err(), "no planes, nothing to admit");
+}
+
+/// The page rule, every row: only a dense draft load of heads 24/4, head
+/// 256, on an int8 pool, with no `paged_block_size` and a GPU that builds
+/// the tile takes 32-token pages with keys token-major; an explicit block
+/// keeps the vLLM page of that block; every other load keeps the 16-token
+/// vLLM page (MoE's 16/2 heads among them).
+/// Mutation plain-takes-page (the rule reads no draft flag) → red.
+#[test]
+fn the_pool_page_rule_takes_the_token_major_page_only_on_its_load() {
+    use mlx_paged_attn::metal::MetalDtype;
+    let app = PageInputs {
+        heads: PoolHeads {
+            query: 24,
+            kv: 4,
+            dim: 256,
+        },
+        cache_dtype: MetalDtype::Int8,
+        draft: true,
+        explicit_block: None,
+        tile: true,
+    };
+    let heads = |query, kv, dim| PoolHeads { query, kv, dim };
+    let page = |block_size, keys_token_major| PoolPage {
+        block_size,
+        keys_token_major,
+    };
+    let rows = [
+        ("the app's draft load", app, page(32, true)),
+        (
+            "no draft",
+            PageInputs {
+                draft: false,
+                ..app
+            },
+            page(16, false),
+        ),
+        (
+            "bf16 pool",
+            PageInputs {
+                cache_dtype: MetalDtype::BFloat16,
+                ..app
+            },
+            page(16, false),
+        ),
+        (
+            "MoE heads 16/2",
+            PageInputs {
+                heads: heads(16, 2, 256),
+                ..app
+            },
+            page(16, false),
+        ),
+        (
+            "heads 24/4 of 128",
+            PageInputs {
+                heads: heads(24, 4, 128),
+                ..app
+            },
+            page(16, false),
+        ),
+        (
+            "heads 32/4",
+            PageInputs {
+                heads: heads(32, 4, 256),
+                ..app
+            },
+            page(16, false),
+        ),
+        (
+            "explicit block 16",
+            PageInputs {
+                explicit_block: Some(16),
+                ..app
+            },
+            page(16, false),
+        ),
+        (
+            "explicit block 32",
+            PageInputs {
+                explicit_block: Some(32),
+                ..app
+            },
+            page(32, false),
+        ),
+        (
+            "no tile",
+            PageInputs { tile: false, ..app },
+            page(16, false),
+        ),
+    ];
+    for (label, load, want) in rows {
+        let got = pool_page(&load);
+        println!("PAGE_RULE {label}: {got:?}");
+        assert_eq!(got, want, "{label}");
     }
 }

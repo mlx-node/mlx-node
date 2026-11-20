@@ -14182,4 +14182,27 @@ describe('POST /v1/responses trace metadata', () => {
       preDispatchMs: expect.any(Number),
     });
   });
+
+  it('stamps the session the agent named in x-grok-session-id, and none without the header', async () => {
+    const registry = new ModelRegistry();
+    const mockModel = createMockModel();
+    registry.register('test-model', mockModel);
+    const handler = createHandler(registry);
+    const send = async (headers: Record<string, string>): Promise<void> => {
+      const req = createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'Hello' });
+      req.headers = { ...req.headers, ...headers };
+      const { res, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+    };
+    await send({ 'x-grok-session-id': 'acp-1' });
+    await send({});
+    const calls = [
+      // oxlint-disable-next-line @typescript-eslint/unbound-method
+      ...(mockModel.chatSessionStart as unknown as ReturnType<typeof vi.fn>).mock.calls,
+      // oxlint-disable-next-line @typescript-eslint/unbound-method
+      ...(mockModel.chatSessionContinue as unknown as ReturnType<typeof vi.fn>).mock.calls,
+    ] as Array<[unknown, { clientSession?: string }]>;
+    expect(calls.map(([, config]) => config.clientSession)).toEqual(['acp-1', undefined]);
+  });
 });

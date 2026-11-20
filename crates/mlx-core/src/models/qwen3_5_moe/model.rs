@@ -159,6 +159,9 @@ pub(crate) struct Qwen35MoeInner {
     pub(crate) max_context: Option<u32>,
     /// `--decode-share` (Splash `EngineConfig::decodeShare`).
     pub(crate) decode_share: f64,
+    /// `--activations` (Splash `Int8Activations`): the paged pool's
+    /// attention scores INT8 queries where that is faster.
+    pub(crate) activations: crate::transformer::Activations,
     pub(crate) dflash2_verify_budget: super::verify_budget::VerifyBudget,
     pub(crate) vision_encoder: Option<Arc<QwenVisionEncoder>>,
     pub(crate) image_processor: Option<Arc<QwenImageProcessor>>,
@@ -502,6 +505,11 @@ impl Qwen3_5MoeModel {
             .map(|value| crate::transformer::KvFormat::parse(Some(value)))
             .transpose()
             .map_err(|message| Error::from_reason(format!("Qwen3.5 MoE load: {message}")))?;
+        let activations = crate::transformer::Activations::parse(
+            options.activations.as_deref(),
+            crate::models::qwen3_5::load_plan::default_activations(true, false),
+        )
+        .map_err(|message| Error::from_reason(format!("Qwen3.5 MoE load: {message}")))?;
         let max_memory_bytes = crate::models::qwen3_5::load_plan::max_memory_option(
             "Qwen3.5 MoE",
             options.max_memory_bytes,
@@ -521,6 +529,7 @@ impl Qwen3_5MoeModel {
             &source,
             draft_model_path,
             kv_format,
+            activations,
             max_memory_bytes,
             max_context,
             decode_share,
